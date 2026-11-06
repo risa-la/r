@@ -15,8 +15,6 @@
 //! replies `ERR too-long`. Everything else that breaks the grammar is
 //! [`ParseError::BadSyntax`].
 
-#![warn(missing_docs)]
-
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;

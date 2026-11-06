@@ -6,8 +6,6 @@
 //! Keywords are case-insensitive (3.5): parsing folds ASCII upper case, and
 //! `Display` writes lower case.
 
-#![warn(missing_docs)]
-
 use std::borrow::Cow;
 use std::fmt;
 use std::num::NonZeroU32;

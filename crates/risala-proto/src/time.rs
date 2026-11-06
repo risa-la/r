@@ -6,8 +6,6 @@
 //! The calendar arithmetic is written out here (proleptic Gregorian, after
 //! Howard Hinnant's `days_from_civil`), so the crate needs no date library.
 
-#![warn(missing_docs)]
-
 use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

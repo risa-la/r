@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
+ed25519.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 

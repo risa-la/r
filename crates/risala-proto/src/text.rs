@@ -5,8 +5,6 @@
 //! [`unescape`] turns wire text into display text, and [`mentions`] finds
 //! the uids a message mentions.
 
-#![warn(missing_docs)]
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 

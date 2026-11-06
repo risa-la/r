@@ -20,6 +20,7 @@ risala-proto = { path = "crates/risala-proto" }
 
 base64 = "0.23"
 ed25519-dalek = { version = "3", features = ["pem"] }
+ed25519 = { version = "3", features = ["zeroize"] }
 sha2 = "0.11"
 thiserror = "2"
 

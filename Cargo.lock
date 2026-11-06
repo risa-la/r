@@ -137,6 +137,7 @@ checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
  "pkcs8",
  "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -380,6 +381,7 @@ name = "risala-proto"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ed25519",
  "ed25519-dalek",
  "proptest",
  "sha2",
