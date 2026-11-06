@@ -4,18 +4,21 @@ struct ConversationView: View {
     @Bindable var model: ConversationViewModel
 
     var body: some View {
-        if let room = model.room {
-            conversation(for: room)
-                .id(room.id)
-                .navigationTitle(room.name)
-                .toolbarTitleDisplayMode(.inline)
-        } else {
-            ContentUnavailableView(
-                "Choose a room",
-                systemImage: "bubble.left.and.bubble.right",
-                description: Text("Select a room to view its messages.")
-            )
+        Group {
+            if let room = model.room {
+                conversation(for: room)
+                    .id(room.id)
+                    .navigationTitle(room.name)
+                    .toolbarTitleDisplayMode(.inline)
+            } else {
+                ContentUnavailableView(
+                    "Choose a room",
+                    systemImage: "bubble.left.and.bubble.right",
+                    description: Text("Select a room to view its messages.")
+                )
+            }
         }
+        .task(id: model.timelineID) { await model.observeTimeline() }
     }
 
     @ContentBuilder
@@ -38,7 +41,20 @@ struct ConversationView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding()
             }
-            MessageTimeline(messages: model.messages, sendRevision: model.sendRevision)
+            if model.timelineFailed {
+                HStack {
+                    Text("Unable to load messages.")
+                    Button("Try again") { model.retryTimeline() }
+                }
+                .padding(.horizontal)
+            }
+            MessageTimeline(
+                messages: model.messages,
+                sendRevision: model.sendRevision,
+                canLoadOlder: model.canLoadOlder,
+                isLoadingOlder: model.isLoadingOlder,
+                loadOlder: model.loadOlderMessages
+            )
         }
     }
 

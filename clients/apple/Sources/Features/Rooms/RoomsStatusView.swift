@@ -12,7 +12,7 @@ struct RoomsStatusView: View {
                 systemImage: "network.slash",
                 description: Text("Your rooms will appear when connected to a server.")
             )
-        case .loading:
+        case .idle, .loading:
             ProgressView("Loading rooms…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .failed:

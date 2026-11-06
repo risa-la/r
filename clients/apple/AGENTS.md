@@ -1,7 +1,10 @@
 # Apple client
 
-- Shared SwiftUI app for iOS 17+ and macOS 14+, built with Xcode 27.2 / Swift
+- Shared SwiftUI app for iOS 18+ and macOS 15+, built with Xcode 27.2 / Swift
   6.4.2 in Swift 6 mode. Use modern Swift where it helps; check API availability.
+- Xcode folders are synchronized: files under `Sources`, `Resources`, and `Tests`
+  join their target without project edits. Tests run hosted in the app through
+  `@testable import Risala`.
 - Keep protocol logic, persistence, and history caching in librisala. The client
   owns presentation and a thin library adapter. No demo data.
 - Use lightweight MVVM by feature: views own layout and temporary UI state;
@@ -10,8 +13,11 @@
   Keep features under `Sources/Features`, the adapter under `Sources/Client`,
   and composition under `Sources/App`. Navigation and feature models belong to
   each window; share only the library session. Preserve drafts across room switches.
-- Use `@Observable`, `@State`, and `@Bindable`; keep UI state `@MainActor`.
-  Prefer value types and checked `Sendable` boundaries over unsafe workarounds.
+- Use `@Observable`, `@State`, and `@Bindable`. The app target defaults to
+  MainActor isolation with approachable concurrency, so omit `@MainActor` there.
+  Mark adapter-boundary types `nonisolated` and `Sendable`; run blocking FFI or
+  storage work in `@concurrent` functions. Prefer value types and checked
+  `Sendable` boundaries over unsafe workarounds.
 - Prefer structured async/await, view-owned `.task` work, and cancellation-aware
   cleanup. Model distinct UI states with enums.
 - Prefer Swift Testing for unit tests and XCUITest for UI automation.

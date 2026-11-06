@@ -297,6 +297,24 @@
           }
         }
       }
+    },
+    "Unable to load messages.": {
+      "comment": "Shown above the timeline when the room's messages fail to load.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unable to load messages."
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "تعذّر تحميل الرسائل."
+          }
+        }
+      }
     }
   },
   "version": "1.0"

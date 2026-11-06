@@ -7,7 +7,7 @@
 
 <!-- Record results, including device/OS versions. Mark checks not run explicitly. -->
 
-- iOS build (minimum deployment target: iOS 17):
+- iOS build (minimum deployment target: iOS 18):
 - macOS build:
 - Runtime checks:
 

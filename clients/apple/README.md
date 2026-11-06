@@ -39,7 +39,9 @@ xcodebuild -project clients/apple/Risala.xcodeproj -scheme Risala \
   -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO test
 ```
 
-For iOS, choose an installed simulator as the test destination.
+For iOS, choose an installed simulator as the test destination and leave code
+signing enabled: the hosted tests launch the app, which the simulator requires
+to be signed (ad hoc signing needs no team).
 
 ## Testing strategy
 

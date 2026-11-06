@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 
+@testable import Risala
+
 @MainActor
 struct RoomsViewModelTests {
     @Test func noClientStaysDisconnected() async {
@@ -11,5 +13,4 @@ struct RoomsViewModelTests {
             return
         }
     }
-
 }

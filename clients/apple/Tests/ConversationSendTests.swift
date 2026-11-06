@@ -1,24 +1,27 @@
 import Foundation
 import Testing
 
+@testable import Risala
+
 @MainActor
 struct ConversationSendTests {
     private enum SendError: Error { case unavailable }
+    private let rooms = TestFixtures.rooms
 
     @Test(.timeLimit(.minutes(1)))
     func failureKeepsDraftAndAllowsRetry() async {
-        let client = SuspendedSendClient()
-        var starts = client.starts.makeAsyncIterator()
+        let client = TestChatClient(holdsSends: true)
+        var starts = client.sends.starts.makeAsyncIterator()
         let model = ConversationViewModel(client: client)
-        model.select(TestFixtures.rooms[0])
+        model.select(rooms[0])
         model.draft = "hello"
         let failed = Task { await model.sendMessage() }
         await starts.next()
         #expect(model.isSending)
         #expect(!model.canSend)
         await model.sendMessage()
-        #expect(client.calls == 1)
-        client.finish(.failure(SendError.unavailable))
+        #expect(client.sends.count == 1)
+        client.sends.finish(.failure(SendError.unavailable))
         await failed.value
         #expect(model.draft == "hello")
         #expect(model.sendFailed)
@@ -26,22 +29,20 @@ struct ConversationSendTests {
 
         let retry = Task { await model.sendMessage() }
         await starts.next()
-        client.finish(.success(()))
+        client.sends.finish(.success(()))
         await retry.value
         #expect(model.draft.isEmpty)
         #expect(!model.sendFailed)
-        #expect(model.messages.map(\.text) == ["hello"])
+        #expect(client.sent == [SentMessage(roomID: rooms[0].id, text: "hello")])
         #expect(model.sendRevision == 1)
     }
 
     @Test(.timeLimit(.minutes(1)), arguments: [false, true])
     func acceptancePreservesEditsAcrossRoomSwitches(edit: Bool) async {
-        let client = SuspendedSendClient()
-        var starts = client.starts.makeAsyncIterator()
+        let client = TestChatClient(holdsSends: true)
+        var starts = client.sends.starts.makeAsyncIterator()
         let model = ConversationViewModel(client: client)
-        let first = TestFixtures.rooms[0]
-        let second = TestFixtures.rooms[1]
-        model.select(first)
+        model.select(rooms[0])
         model.draft = "hello"
         let send = Task { await model.sendMessage() }
         await starts.next()
@@ -49,47 +50,48 @@ struct ConversationSendTests {
             model.draft = "new text"
             model.draft = "hello"
         }
-        model.select(second)
+        model.select(rooms[1])
         model.draft = "other room"
-        client.finish(.success(()))
+        // A send in progress elsewhere must not block this room's composer.
+        #expect(model.canSend)
+        client.sends.finish(.success(()))
         await send.value
         #expect(model.draft == "other room")
-        #expect(model.messages.isEmpty)
         #expect(model.sendRevision == 0)
-        model.select(first)
+        model.select(rooms[0])
         #expect(model.draft == (edit ? "hello" : ""))
-        #expect(model.messages.map(\.text) == ["hello"])
+        #expect(client.sent == [SentMessage(roomID: rooms[0].id, text: "hello")])
     }
 
     @Test(.timeLimit(.minutes(1)))
     func failureBelongsToSubmittedRoom() async {
-        let client = SuspendedSendClient()
-        var starts = client.starts.makeAsyncIterator()
+        let client = TestChatClient(holdsSends: true)
+        var starts = client.sends.starts.makeAsyncIterator()
         let model = ConversationViewModel(client: client)
-        model.select(TestFixtures.rooms[0])
+        model.select(rooms[0])
         model.draft = "hello"
         let send = Task { await model.sendMessage() }
         await starts.next()
-        model.select(TestFixtures.rooms[1])
-        client.finish(.failure(SendError.unavailable))
+        model.select(rooms[1])
+        client.sends.finish(.failure(SendError.unavailable))
         await send.value
         #expect(!model.sendFailed)
-        model.select(TestFixtures.rooms[0])
+        model.select(rooms[0])
         #expect(model.sendFailed)
         #expect(model.draft == "hello")
     }
 
     @Test(.timeLimit(.minutes(1)))
     func cancellationKeepsDraftWithoutError() async {
-        let client = SuspendedSendClient()
-        var starts = client.starts.makeAsyncIterator()
+        let client = TestChatClient(holdsSends: true)
+        var starts = client.sends.starts.makeAsyncIterator()
         let model = ConversationViewModel(client: client)
-        model.select(TestFixtures.rooms[0])
+        model.select(rooms[0])
         model.draft = "hello"
         let send = Task { await model.sendMessage() }
         await starts.next()
         send.cancel()
-        client.finish(.failure(CancellationError()))
+        client.sends.finish(.failure(CancellationError()))
         await send.value
         #expect(model.draft == "hello")
         #expect(!model.sendFailed)

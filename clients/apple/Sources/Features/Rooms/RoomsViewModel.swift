@@ -2,32 +2,37 @@ import Foundation
 import OSLog
 import Observation
 
-@MainActor
 @Observable
 final class RoomsViewModel {
-    private static let logger = Logger(subsystem: "la.risa.apple", category: "rooms")
-    private let client: any ChatClient?
-    enum State {
+    enum State: Equatable {
+        /// No library session is available.
         case disconnected
+        /// Waiting for a load to start, including after a cancelled load.
+        case idle
         case loading
         case empty
         case loaded([Room])
         case failed
     }
 
-    private(set) var state: State = .disconnected
+    private static let logger = Logger(subsystem: "la.risa.apple", category: "rooms")
+    private let client: (any ChatClient)?
+    private(set) var state: State
+
     var rooms: [Room] {
         if case .loaded(let rooms) = state { rooms } else { [] }
     }
-    init(client: any ChatClient? = nil) {
+
+    init(client: (any ChatClient)? = nil) {
         self.client = client
+        state = client == nil ? .disconnected : .idle
     }
 
     func load() async {
         guard let client else { return }
         switch state {
-        case .loading, .loaded, .empty: return
-        case .disconnected, .failed: break
+        case .disconnected, .loading, .loaded, .empty: return
+        case .idle, .failed: break
         }
         state = .loading
         do {
@@ -36,12 +41,11 @@ final class RoomsViewModel {
             state = rooms.isEmpty ? .empty : .loaded(rooms)
         } catch {
             if Task.isCancelled || error is CancellationError {
-                state = .disconnected
+                state = .idle
             } else {
                 Self.logger.error("loadRooms failed; code=\((error as NSError).code)")
                 state = .failed
             }
         }
     }
-
 }

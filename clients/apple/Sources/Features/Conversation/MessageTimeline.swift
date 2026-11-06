@@ -3,71 +3,76 @@ import SwiftUI
 struct MessageTimeline: View {
     let messages: [Message]
     let sendRevision: Int
-    @State private var visibleMessageID: Message.ID?
-    @State private var isNearBottom = true
+    let canLoadOlder: Bool
+    let isLoadingOlder: Bool
+    let loadOlder: () async -> Void
+    @State private var position = ScrollPosition(edge: .bottom)
+    @State private var edges = ScrollEdges()
     @State private var hasNewMessages = false
+    @State private var olderRequest = 0
 
     var body: some View {
-        GeometryReader { viewport in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: Layout.timelineItemSpacing) {
-                        ForEach(messages) { message in
-                            MessageRow(message: message)
-                                .id(message.id)
-                        }
-                    }
-                    .scrollTargetLayout()
+        let tolerance = Layout.timelineEdgeTolerance
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: Layout.timelineItemSpacing) {
+                if isLoadingOlder {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                }
+                ForEach(messages) { message in
+                    MessageRow(message: message)
+                }
+            }
+            .scrollTargetLayout()
+            .padding()
+        }
+        .scrollPosition($position)
+        .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
+            ScrollEdges(geometry, tolerance: tolerance)
+        } action: { previous, current in
+            edges = current
+            if current.nearBottom { hasNewMessages = false }
+            if current.nearTop, !previous.nearTop, canLoadOlder { olderRequest += 1 }
+        }
+        .onChange(of: messages.last?.id) { previous, latest in
+            // Prepending history leaves the latest ID unchanged.
+            guard latest != nil, latest != previous else { return }
+            if previous == nil || edges.nearBottom {
+                scrollToLatest()
+            } else {
+                hasNewMessages = true
+            }
+        }
+        .onChange(of: sendRevision) { scrollToLatest() }
+        .task(id: olderRequest) {
+            guard olderRequest > 0 else { return }
+            await loadOlder()
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if hasNewMessages {
+                Button("New messages", systemImage: "arrow.down") { scrollToLatest() }
+                    .buttonStyle(.borderedProminent)
                     .padding()
-                    .background {
-                        GeometryReader { content in
-                            Color.clear.preference(
-                                key: TimelineBottomKey.self,
-                                value: content.frame(in: .named("timeline")).maxY)
-                        }
-                    }
-                }
-                .coordinateSpace(name: "timeline")
-                .scrollPosition(id: $visibleMessageID, anchor: .top)
-                .onPreferenceChange(TimelineBottomKey.self) { bottom in
-                    isNearBottom = bottom <= viewport.size.height + 44
-                    if isNearBottom { hasNewMessages = false }
-                }
-                .onAppear { scrollToLatest(proxy) }
-                .onChange(of: messages.map(\.id)) { previous, current in
-                    guard let latest = current.last, latest != previous.last else { return }
-                    // Prepending history leaves the latest ID unchanged.
-                    if previous.isEmpty || isNearBottom {
-                        scrollToLatest(proxy)
-                    } else {
-                        hasNewMessages = true
-                    }
-                }
-                .onChange(of: sendRevision) { scrollToLatest(proxy) }
-                .overlay(alignment: .bottomTrailing) {
-                    if hasNewMessages {
-                        Button("New messages", systemImage: "arrow.down") {
-                            scrollToLatest(proxy)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .padding()
-                    }
-                }
             }
         }
     }
 
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        guard let latest = messages.last?.id else { return }
-        proxy.scrollTo(latest, anchor: .bottom)
+    private func scrollToLatest() {
+        position.scrollTo(edge: .bottom)
         hasNewMessages = false
     }
 }
 
-private struct TimelineBottomKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
+private nonisolated struct ScrollEdges: Equatable {
+    var nearTop = false
+    var nearBottom = true
 
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+    init() {}
+
+    init(_ geometry: ScrollGeometry, tolerance: CGFloat) {
+        let offset = geometry.contentOffset.y
+        let visibleBottom = offset + geometry.containerSize.height - geometry.contentInsets.bottom
+        nearTop = offset + geometry.contentInsets.top <= tolerance
+        nearBottom = geometry.contentSize.height - visibleBottom <= tolerance
     }
 }

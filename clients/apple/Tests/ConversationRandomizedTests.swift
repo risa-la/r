@@ -1,28 +1,34 @@
 import Foundation
 import Testing
 
+@testable import Risala
+
 @MainActor
 struct ConversationRandomizedTests {
     private let rooms = TestFixtures.rooms
 
-    @Test(arguments: RandomizedRun.seeds)
+    @Test(.timeLimit(.minutes(1)), arguments: RandomizedRun.seeds)
     func conversationActions(seed: UInt64) async {
         var run = RandomizedRun(seed: seed)
-        let client = RecordingChatClient()
+        let client = TestChatClient()
         // Shared library, separate windows; third window has no connection.
         let windows = [
             ConversationViewModel(client: client),
             ConversationViewModel(client: client),
             ConversationViewModel(),
         ]
+        // Stand-ins for each window's view-owned timeline task.
+        var observers: [Task<Void, Never>?] = [nil, nil, nil]
         var selections: [Int?] = [nil, nil, nil]
         var drafts = Array(repeating: [String](repeating: "", count: 3), count: 3)
-        var visibleMessages = Array(repeating: [String](), count: 3)
         var expectedSends: [SentMessage] = []
         let inputs = [
             "", " \n\t", "hello", "مرحبًا", "Hello عالم 👋🏽", "line 1\nسطر ٢",
             String(repeating: "ع", count: 2048),
         ]
+        defer {
+            for observer in observers { observer?.cancel() }
+        }
 
         for step in 0..<300 {
             let window = run.pick(windows.count)
@@ -33,15 +39,11 @@ struct ConversationRandomizedTests {
                 let selected: Int? = choice == 3 ? nil : choice
                 run.record("\(step): window \(window) select \(String(describing: selected))")
                 if selections[window] != selected {
-                    visibleMessages[window] =
-                        selected.map { index in
-                            window == 2
-                                ? []
-                                : expectedSends.filter { $0.roomID == rooms[index].id }.map(\.text)
-                        } ?? []
+                    selections[window] = selected
+                    model.select(selected.map { rooms[$0] })
+                    observers[window]?.cancel()
+                    observers[window] = Task { await model.observeTimeline() }
                 }
-                selections[window] = selected
-                model.select(selected.map { rooms[$0] })
             case 1:
                 let input = run.pick(inputs.count)
                 run.record("\(step): window \(window) edit input[\(input)]")
@@ -58,9 +60,6 @@ struct ConversationRandomizedTests {
                     if !text.isEmpty {
                         expectedSends.append(SentMessage(roomID: rooms[selected].id, text: text))
                         drafts[window][selected] = ""
-                        visibleMessages[window] = expectedSends.filter {
-                            $0.roomID == rooms[selected].id
-                        }.map(\.text)
                     }
                 }
                 await model.sendMessage()
@@ -73,11 +72,18 @@ struct ConversationRandomizedTests {
                 let canSend =
                     index != 2 && selected != nil
                     && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                guard windows[index].room?.id == selected.map({ rooms[$0].id }),
-                    windows[index].draft == draft,
-                    windows[index].canSend == canSend,
-                    windows[index].messages.map(\.text) == visibleMessages[index],
-                    client.sent == expectedSends
+                // Every connected window shows its room's accepted sends, whichever window sent them.
+                let visible =
+                    selected.map { room in
+                        index == 2
+                            ? [] : expectedSends.filter { $0.roomID == rooms[room].id }.map(\.text)
+                    } ?? []
+                let model = windows[index]
+                guard model.room?.id == selected.map({ rooms[$0].id }),
+                    model.draft == draft,
+                    model.canSend == canSend,
+                    client.sent == expectedSends,
+                    await eventually({ model.messages.map(\.text) == visible })
                 else {
                     run.fail("Conversation invariant failed in window \(index)")
                     return
@@ -85,5 +91,4 @@ struct ConversationRandomizedTests {
             }
         }
     }
-
 }
