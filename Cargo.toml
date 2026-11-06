@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+exclude = ["crates/risala-proto/fuzz"]
+members = [
+    "crates/risala-proto",
+    "crates/risala-server",
+    "crates/librisala",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/risa-la/r"
+authors = ["Risala developers <dev@risa.la>"]
+
+[workspace.dependencies]
+risala-proto = { path = "crates/risala-proto" }
+
+base64 = "0.23"
+ed25519-dalek = { version = "3", features = ["pem"] }
+sha2 = "0.11"
+thiserror = "2"
+
+# dev
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

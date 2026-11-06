@@ -5,9 +5,9 @@
 *.pdb
 
 # cargo-fuzz
-fuzz/artifacts/
-fuzz/corpus/
-fuzz/coverage/
+**/fuzz/artifacts/
+**/fuzz/corpus/
+**/fuzz/coverage/
 
 # Nix
 result
