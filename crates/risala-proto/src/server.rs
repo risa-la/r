@@ -1031,8 +1031,8 @@ impl OkResponse {
     }
 
     /// Adds the value `key=value`, replacing an earlier value with the same
-    /// key. Fails with `BadSyntax` if `key` is empty, contains `=` or is
-    /// not a token, or if `value` is neither empty nor a token (3.3).
+    /// key. Fails with `BadSyntax` if `key`, folded, is not `a-z 0-9 -`, or
+    /// if `value` is not a non-empty token (3.3).
     pub fn try_with(
         mut self,
         key: &str,
@@ -1043,16 +1043,17 @@ impl OkResponse {
     }
 
     /// Sets the value `key=value` in place, as [`try_with`](Self::try_with)
-    /// does. The key is folded to lower case.
+    /// does. The key is folded to lower case and must then be `a-z 0-9 -`;
+    /// the value must be a non-empty token (3.3).
     pub fn insert(&mut self, key: &str, value: impl fmt::Display) -> Result<(), ParseError> {
         let value = value.to_string();
-        if !is_token(key) || key.contains('=') {
+        let key = key.to_ascii_lowercase();
+        if !crate::line::is_option_key(&key) {
             return Err(bad("bad result key"));
         }
-        if !value.is_empty() && !is_token(&value) {
+        if !is_token(&value) {
             return Err(bad("bad result value"));
         }
-        let key = key.to_ascii_lowercase();
         match self.values.iter_mut().find(|(k, _)| *k == key) {
             Some(entry) => entry.1 = value,
             None => self.values.push((key, value)),
@@ -2226,7 +2227,8 @@ mod tests {
 
     #[test]
     fn ok_bad_values() {
-        let ok = match parse("OK seq=0 more=2 op=maybe members=-1 uid=x upload=big seq2=").line {
+        assert!("OK seq2=".parse::<ServerMessage>().is_err());
+        let ok = match parse("OK seq=0 more=2 op=maybe members=-1 uid=x upload=big seq2=x").line {
             ServerLine::Ok(ok) => ok,
             _ => panic!(),
         };
@@ -2236,7 +2238,7 @@ mod tests {
         assert!(ok.members().is_err());
         assert!(ok.uid().is_err());
         assert!(ok.upload().is_err());
-        assert_eq!(ok.value("seq2"), Some(""));
+        assert_eq!(ok.value("seq2"), Some("x"));
     }
 
     #[test]
@@ -2248,10 +2250,12 @@ mod tests {
         assert!(ok.clone().try_with("a=b", 1).is_err());
         assert!(ok.clone().try_with("", 1).is_err());
         assert!(ok.clone().try_with("a", "b c").is_err());
-        assert!(ok.insert("empty", "").is_ok());
+        assert!(ok.clone().try_with("a_b", 1).is_err());
+        assert!(ok.insert("empty", "").is_err());
+        assert!(ok.insert("x-new", "v").is_ok());
         assert_eq!(
             ServerMessage::new(ok.clone()).to_line().to_string(),
-            "OK seq=2 empty="
+            "OK seq=2 x-new=v"
         );
         assert!(ok.remove("seq"));
         assert!(!ok.remove("seq"));
