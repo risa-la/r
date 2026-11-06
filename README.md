@@ -49,7 +49,7 @@ and in what order.
 | `risalad` | Rust | The server |
 | `librisala` | Rust | The shared client library: connection, identity, sync, history cache, rooms, messages, moderation |
 | GNOME app | Rust, gtk4-rs, libadwaita | Linux client |
-| Apple app | Swift, SwiftUI | macOS and iOS client |
+| [`clients/apple`](clients/apple) | Swift, SwiftUI | macOS and iOS client |
 | Android app | Kotlin | Android client |
 
 The apps hold no protocol logic. They show what librisala gives them.
