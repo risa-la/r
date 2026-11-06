@@ -637,12 +637,18 @@ impl IpPrefix {
         self.len
     }
 
-    /// Whether `ip` is inside this prefix. An IPv4-mapped IPv6 address such
-    /// as `::ffff:203.0.113.7` counts as the IPv4 address it maps, so that a
-    /// ban works the same on a dual-stack socket.
+    /// Whether `ip` is inside this prefix. An IPv4 address and its
+    /// IPv4-mapped IPv6 form, such as `203.0.113.7` and
+    /// `::ffff:203.0.113.7`, count as the same address, in both directions,
+    /// so a ban works the same whether or not the guest came in on a
+    /// dual-stack socket.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let inside = |ip: IpAddr| IpPrefix::new(ip, self.len).is_ok_and(|p| p.addr == self.addr);
-        inside(ip) || inside(ip.to_canonical())
+        let mapped = match ip.to_canonical() {
+            IpAddr::V4(v4) => IpAddr::V6(v4.to_ipv6_mapped()),
+            v6 => v6,
+        };
+        inside(ip) || inside(ip.to_canonical()) || inside(mapped)
     }
 }
 
@@ -1114,6 +1120,23 @@ mod tests {
         assert!(!p6.contains("10.0.0.1".parse().unwrap()));
         assert_eq!(p6.prefix_len(), 32);
         assert_eq!(p6.addr(), "2001:db8::".parse::<IpAddr>().unwrap());
+    }
+
+    /// Found by Kani: a prefix over `::ffff:0:0/96` covered the mapped form
+    /// of an address but not the plain IPv4 form.
+    #[test]
+    fn ip_prefix_mapped_prefix_matches_ipv4() {
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        for prefix in ["::ffff:203.0.113.0/120", "::/1", "203.0.113.0/24"] {
+            let p: IpPrefix = prefix.parse().unwrap();
+            assert!(p.contains(mapped), "{prefix}");
+            assert_eq!(p.contains(v4), p.contains(mapped), "{prefix}");
+        }
+        let other: IpPrefix = "::ffff:198.51.100.0/120".parse().unwrap();
+        assert!(!other.contains(v4));
+        let v6: IpPrefix = "2001:db8::/32".parse().unwrap();
+        assert!(!v6.contains(v4));
     }
 
     #[test]
