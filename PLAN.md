@@ -243,19 +243,31 @@ Settled (now in SPEC.md):
      different, valid keys.
    - The welcome text is at most 512 bytes.
    - HISTORY and RELATED accept `after=0` (7.2).
+8. **Smaller gaps** (3.6, 4.1, 5.2-5.6, 6.2, 6.4, 7.4, 9.1, 10.3).
+   - The `ERR` for a line that cannot be parsed carries its `ref`, if a
+     valid one can be read.
+   - Without SNI, the greeting's `<host>` is the server's main hostname.
+   - Only SET, BAN and ROLE are used as snapshots.
+   - MSG text made only of spaces and TABs counts as empty.
+   - Deleting an already deleted message gets `ERR not-found`. Deleted
+     placeholders lose their file tags.
+   - UPLOAD's `<type>` is `type/subtype` (RFC 6838), with no parameters.
+   - SET and ADMIN SET values may be empty, as for a topic.
+   - INVITE, KICK and BAN events that reach non-members are
+     notifications, not room history.
+   - READ beyond the head sets the marker to the head.
+   - PUSH URLs are at most 512 bytes.
+   - CONNECTION's `<address>` is an IP address with an optional port.
 
 Still open:
 
-8. **Retention of 0 days.** Should `retention 0` mean "keep nothing", or
+9. **Retention of 0 days.** Should `retention 0` mean "keep nothing", or
    should the minimum stay at 1 day?
-9. **Smaller gaps:**
-   - What the greeting's `<host>` is when the client sent no SNI.
-   - What DELETE replies when the message is already deleted.
-   - READ with a seq beyond the head.
-   - LIST has no paging, which matters on a large server.
-   - INVITE, KICK and BAN events reach people who are not members of the
-     room. librisala should treat these as notifications, not as gaps in
-     that room's history.
+10. **LIST paging.** LIST has no paging, which matters on a large
+    server.
+11. **New push reasons.** NOTIFY has no rule for reasons a future
+    version adds. Gateways and apps could treat an unknown reason as
+    generic new activity.
 
 ## 6. Open decisions
 

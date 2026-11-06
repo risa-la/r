@@ -389,7 +389,9 @@ ERR <code> [<message...>]
 - **Response lines and `ref`.** Some commands return lines before their
   final response, such as the events HISTORY returns or the lines LIST
   returns. If the command had a `ref` tag, the server copies it onto
-  these lines and onto the final response.
+  these lines and onto the final response. This includes the `ERR` for a
+  command it cannot parse, as long as it can still read a valid `ref`
+  from the line's tags.
 - **Live events.** Events that a command causes, such as the event a MSG
   creates, are not part of its response. They go to every connection in
   the conversation without `ref`. The connection that sent the command
@@ -453,7 +455,8 @@ RISALA <version> <host> <nonce> [<message...>]
 ```
 
 - `<version>` is `1` for this document.
-- `<host>` is the hostname from SNI, in lower case.
+- `<host>` is the hostname from SNI, in lower case. If the client sent
+  no SNI, it is the server's own main hostname.
 - `<nonce>` is at least 16 bytes from a cryptographically secure random
   source, written in lower-case hex. It is unique to this connection.
 - `<message...>` is an optional welcome text, at most 512 bytes.
@@ -762,8 +765,8 @@ conversations.
 
 A **snapshot line** has the same form as an event but no `seq`, `t` or
 `from`. It describes current state rather than a change, like the SET
-lines after JOIN in Section 1.4. A client can apply snapshots and events
-with the same code.
+lines after JOIN in Section 1.4. Snapshots use only the verbs SET, BAN
+and ROLE. A client can apply snapshots and events with the same code.
 
 ### 5.3. Messages
 
@@ -773,7 +776,8 @@ MSG <conv> <text...>
 
 → `OK seq=<seq>`
 
-Sends a message. The text MUST NOT be empty. The sender's connection
+Sends a message. The text MUST NOT be empty. Text made only of spaces
+and TABs counts as empty. The sender's connection
 receives the message's event before the OK, so a client can match the
 two by seq.
 
@@ -824,9 +828,12 @@ open report (5.8). What else happens depends on the target:
 - Deleting an edit makes the previous version current again.
 - Deleting a reaction removes it.
 
+Deleting a message that is already deleted gets `ERR not-found`.
+
 A deleted event keeps its place in history, so there are no gaps.
 HISTORY returns it with the `deleted` tag and empty text. It keeps its
-`seq`, `t` and `from`, and any `reply`, `edit` or `react` tag:
+`seq`, `t` and `from`, and any `reply`, `edit` or `react` tag. It loses
+its `file`, `file-type` and `file-size` tags, since the file is gone:
 
 ```
 S: @seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam;reply=8810;deleted MSG #general
@@ -861,7 +868,10 @@ UPLOAD <size> <type> <name...>
 → `OK put=<url> get=<url>`
 
 Asks to upload a file of `<size>` bytes, with the media type `<type>`
-(for example `image/png`) and the file name `<name...>`. Only identities
+(for example `image/png`) and the file name `<name...>`. `<type>` is
+`type/subtype` as in [RFC6838], without parameters such as
+`;charset=utf-8`, since it is copied into the `file-type` tag. Media
+types are case-insensitive. Only identities
 can upload. Sharing a file takes three steps:
 
 1. The client sends UPLOAD. The server replies with two URLs: `put` to
@@ -1081,7 +1091,7 @@ server operators (Section 10). Only ADMIN DROP (10.4) deletes a room.
 ### 6.2. Settings
 
 ```
-SET <room> <key> <value...>
+SET <room> <key> [<value...>]
 ```
 
 → SET event, then `OK seq=<seq>`
@@ -1197,6 +1207,10 @@ BANS <room>
 
 INVITE, KICK, BAN and UNBAN reply `OK seq=<seq>`. The KICK or BAN event
 also goes to its target, before the target stops receiving the room.
+An INVITE event that reaches an invitee who is not a member, and a KICK
+or BAN event that reaches its target, are notifications. They do not
+make the receiver a member, and a client that is not a member does not
+store them as the room's history.
 For moderation across a whole server, see Section 10.
 
 ---
@@ -1337,7 +1351,8 @@ READ <conv> <seq>
 
 Sets the account's read marker for the conversation to `<seq>`.
 
-- The marker only moves forward. A lower value is ignored.
+- The marker only moves forward. A lower value is ignored. A value
+  beyond the conversation's head sets the marker to the head.
 - The server sends `READ <conv> <seq>` to the account's other connections,
   so they can update their unread counts. This line is not an event.
 - Read markers are private to the account. Nobody else sees them.
@@ -1512,7 +1527,8 @@ PUSH LIST
 ```
 
 - **`PUSH ADD`** asks the server to send pushes for this account to
-  `<url>`, an `https` URL, while this device is not connected.
+  `<url>`, an `https` URL of at most 512 bytes, while this device is not
+  connected.
   - `<tag>` is an opaque token of at most 64 bytes, chosen by the client.
     The server includes it in every push, so the app knows which server
     and account the push is about.
@@ -1683,8 +1699,9 @@ ADMIN NOTICE <message...>
 ```
 
 - **`ADMIN WHO`** sends one `CONNECTION <uid> <address> <since>` line per
-  open connection, then OK. `<address>` is the client's network address
-  and `<since>` a timestamp. A connection that has not signed in yet is
+  open connection, then OK. `<address>` is the client's IP address,
+  optionally with its port, written `203.0.113.7:51000` or
+  `[2001:db8::1]:51000`. `<since>` is a timestamp. A connection that has not signed in yet is
   shown with the uid `-`.
 - **`ADMIN DISCONNECT`** closes every connection of `<uid>`, sending
   `BYE` with the reason. The user can reconnect; ban them to stop that.
@@ -1751,7 +1768,7 @@ ADMIN UNREGISTER <uid>
 ### 10.6. Server Settings
 
 ```
-ADMIN SET <key> <value...>
+ADMIN SET <key> [<value...>]
 ```
 
 | Key | Values | Meaning |
@@ -1818,7 +1835,7 @@ allowed before GUEST, AUTH or REGISTER.
 | `LIST` | 6.1 | | yes |
 | `JOIN <room>` | 6.1 | | yes |
 | `PART <room> [<reason...>]` | 6.1 | | yes |
-| `SET <room> <key> <value...>` | 6.2 | | no |
+| `SET <room> <key> [<value...>]` | 6.2 | | no |
 | `ROLE <room> <uid> <role>` | 6.3 | | no |
 | `ROLES <room>` | 6.3 | | yes |
 | `INVITE` / `KICK` / `BAN` / `UNBAN` / `BANS` | 6.4 | | no |
@@ -1840,7 +1857,7 @@ allowed before GUEST, AUTH or REGISTER.
 | `ADMIN WHO` / `DISCONNECT <uid> [<reason...>]` / `NOTICE <message...>` | 10.3 | | no |
 | `ADMIN ROOMS` / `DROP <room> [<reason...>]` / `PURGE <uid> [hours=]` / `REPORTS` | 10.4, 5.8 | | no |
 | `ADMIN KEYS <uid>` / `ADDKEY <uid> <key> [<label...>]` / `DELKEY <uid> <key>` / `UNREGISTER <uid>` | 10.5 | | no |
-| `ADMIN SET <key> <value...>` | 10.6 | | no |
+| `ADMIN SET <key> [<value...>]` | 10.6 | | no |
 | `PING [<token>]` / `PONG <token>` | 11 | yes | yes |
 | `QUIT [<message...>]` | 11 | yes | yes |
 
@@ -1967,6 +1984,9 @@ Lines a server can send:
   August 2010.
 - [RFC6066] Eastlake 3rd, D., "Transport Layer Security (TLS)
   Extensions: Extension Definitions", RFC 6066, January 2011.
+- [RFC6838] Freed, N., Klensin, J., and T. Hansen, "Media Type
+  Specifications and Registration Procedures", BCP 13, RFC 6838,
+  January 2013.
 - [RFC6890] Cotton, M., Vegoda, L., Bonica, R., and B. Haberman,
   "Special-Purpose IP Address Registries", BCP 153, RFC 6890, April 2013.
 - [RFC7301] Friedl, S., Popov, A., Langley, A., and E. Stephan,

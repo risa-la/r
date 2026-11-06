@@ -68,181 +68,13 @@ use std::str::FromStr;
 
 use crate::auth::{PublicKey, Signature};
 use crate::error::ParseError;
-use crate::line::{Line, LineBuilder, Options, Params, Tags, is_tag_value};
+use crate::line::{Line, LineBuilder, Options, Params, Tags};
 use crate::names::{BlockTarget, Conv, Id, Identity, Name, Room, Seq, ServerBanTarget, Uid};
 use crate::types::{
-    Cid, MAX_DISPLAY_NAME, MAX_FILE_URL, MAX_REACTION, MAX_REPORT_REASON, PushTag, Ref, Relation,
-    Role, RoomSetting, ServerSetting, parse_u64, parse_yes_no,
+    Cid, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, PushTag, Ref, Relation, Role,
+    RoomSetting, ServerSetting, parse_u64, parse_yes_no,
 };
-
-// ---------------------------------------------------------------------------
-// Values used only by commands
-
-/// The value of a MSG's `file` tag: a `get` URL from UPLOAD (5.6).
-///
-/// It uses `https`, contains no `;` and is at most 512 bytes
-/// ([`MAX_FILE_URL`]), so that it fits in a tag. The scheme is matched
-/// without regard to case; the URL is otherwise kept exactly as given,
-/// since only its server can interpret it. A URL over 512 bytes is
-/// `TooLong`; anything else that breaks these rules is `BadSyntax`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct FileUrl(String);
-
-impl FileUrl {
-    /// The URL as written on the wire (5.6).
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for FileUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for FileUrl {
-    type Err = ParseError;
-
-    /// Checks the rules for `get` URLs (5.6).
-    fn from_str(s: &str) -> Result<FileUrl, ParseError> {
-        check_https(s, "a file URL is an https URL")?;
-        if !is_tag_value(s) {
-            return Err(ParseError::BadSyntax(
-                "a file URL has no space, ';' or control characters",
-            ));
-        }
-        if s.len() > MAX_FILE_URL {
-            return Err(ParseError::TooLong);
-        }
-        Ok(FileUrl(s.to_owned()))
-    }
-}
-
-impl AsRef<str> for FileUrl {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-/// The `<url>` of PUSH ADD and PUSH DEL (9.1): an `https` URL, one token.
-///
-/// The scheme is matched without regard to case; the URL is otherwise
-/// kept exactly as given. The spec sets no length limit beyond the line's
-/// (2.3).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PushUrl(String);
-
-impl PushUrl {
-    /// The URL as written on the wire (9.1).
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for PushUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for PushUrl {
-    type Err = ParseError;
-
-    /// Checks that `s` is one token starting with `https://` (9.1).
-    fn from_str(s: &str) -> Result<PushUrl, ParseError> {
-        check_https(s, "a push URL is an https URL")?;
-        if !crate::line::is_token(s) {
-            return Err(ParseError::BadSyntax("a push URL is one token"));
-        }
-        Ok(PushUrl(s.to_owned()))
-    }
-}
-
-impl AsRef<str> for PushUrl {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Checks that `s` starts with `https://`, in any case, and has something
-/// after it.
-fn check_https(s: &str, what: &'static str) -> Result<(), ParseError> {
-    match s.get(..8) {
-        Some(scheme) if scheme.eq_ignore_ascii_case("https://") && s.len() > 8 => Ok(()),
-        _ => Err(ParseError::BadSyntax(what)),
-    }
-}
-
-/// The longest type or subtype of a [`MediaType`], in bytes (RFC 6838,
-/// 4.2).
-pub const MAX_MEDIA_TYPE_PART: usize = 127;
-
-/// The `<type>` of UPLOAD (5.6): a media type such as `image/png`.
-///
-/// It is checked loosely, following the `restricted-name` of RFC 6838:
-/// `type/subtype`, where each part is 1 to 127 characters of
-/// `a-z 0-9 ! # $ & - ^ _ . +` starting with a letter or digit. Media
-/// types are case-insensitive, so parsing folds to lower case. Parameters
-/// such as `;charset=utf-8` are not allowed: the server echoes the type in
-/// the `file-type` tag (5.6), and a tag value cannot contain `;` (3.1).
-/// Whether the type is acceptable is up to the server (`ERR forbidden`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct MediaType(String);
-
-impl MediaType {
-    /// The media type as written on the wire, in lower case (5.6).
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// The top-level type, the part before the `/`, such as `image` (5.6).
-    pub fn top_level(&self) -> &str {
-        self.0.split_once('/').map_or("", |(t, _)| t)
-    }
-
-    /// The part after the `/`, such as `png` (5.6).
-    pub fn subtype(&self) -> &str {
-        self.0.split_once('/').map_or("", |(_, s)| s)
-    }
-}
-
-impl fmt::Display for MediaType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for MediaType {
-    type Err = ParseError;
-
-    /// Checks `type/subtype` as described on [`MediaType`].
-    fn from_str(s: &str) -> Result<MediaType, ParseError> {
-        fn part(p: &str) -> Result<bool, ParseError> {
-            let b = p.as_bytes();
-            let ok = b.first().is_some_and(u8::is_ascii_alphanumeric)
-                && b.iter()
-                    .all(|&c| c.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&c));
-            if !ok {
-                return Err(ParseError::BadSyntax("a media type is type/subtype"));
-            }
-            Ok(b.len() <= MAX_MEDIA_TYPE_PART)
-        }
-        let (t, sub) = s
-            .split_once('/')
-            .ok_or(ParseError::BadSyntax("a media type is type/subtype"))?;
-        if !(part(t)? & part(sub)?) {
-            return Err(ParseError::TooLong);
-        }
-        Ok(MediaType(s.to_ascii_lowercase()))
-    }
-}
-
-impl AsRef<str> for MediaType {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
+pub use crate::types::{FileUrl, MAX_MEDIA_TYPE_PART, MediaType, PushUrl};
 
 // ---------------------------------------------------------------------------
 // Request
@@ -1013,7 +845,7 @@ fn text_max(p: Params<'_>, max: usize) -> Result<String, ParseError> {
 /// Text that must not be empty (`<name...>` in a syntax line, 3.3).
 fn required_text(p: Params<'_>, what: &'static str) -> Result<String, ParseError> {
     match p.text() {
-        "" => Err(ParseError::BadSyntax(what)),
+        text if crate::text::is_blank(text) => Err(ParseError::BadSyntax(what)),
         text => Ok(text.to_owned()),
     }
 }
@@ -1675,7 +1507,7 @@ impl AdminCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{GuestAccess, RoomRetention, ServerRetention};
+    use crate::types::{GuestAccess, MAX_FILE_URL, RoomRetention, ServerRetention};
 
     const KEY: &str = "J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY=";
     const SIG: &str =
@@ -2003,7 +1835,9 @@ mod tests {
         assert!(matches!(c, Command::Msg { ref text, .. } if text == "one\\ntwo"));
         // Text keeps leading spaces after the one separator.
         assert!(matches!(cmd("MSG #a  x"), Command::Msg { ref text, .. } if text == " x"));
-        rt("MSG #a  ");
+        // Text of only spaces and TABs counts as empty (5.3).
+        is_syntax("MSG #a  ");
+        is_syntax("MSG #a  \t ");
         is_syntax("MSG #a");
         is_syntax("MSG #a ");
         is_syntax("MSG");

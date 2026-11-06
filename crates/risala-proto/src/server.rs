@@ -89,9 +89,9 @@ use crate::line::{Line, LineBuilder, Params, Tags, is_token};
 use crate::names::{BlockTarget, Conv, Domain, Id, Room, Seq, ServerBanTarget, Uid};
 use crate::time::Timestamp;
 use crate::types::{
-    InfoRole, MAX_DISPLAY_NAME, MAX_FILE_URL, MAX_REACTION, MAX_REPORT_REASON, MAX_TOPIC, Presence,
-    PushReason, PushTag, Ref, Relation, Role, RoomSetting, ServerRetention, parse_u64,
-    parse_yes_no,
+    FileUrl, InfoRole, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, MAX_TOPIC, MediaType,
+    Presence, PushReason, PushTag, PushUrl, Ref, Relation, Role, RoomSetting, ServerRetention,
+    parse_u64, parse_yes_no,
 };
 
 const fn bad(what: &'static str) -> ParseError {
@@ -390,8 +390,8 @@ pub enum ServerLine {
     },
     /// `PUSH <url> <tag>`, a response to PUSH LIST (9.1).
     Push {
-        /// The push URL, one token.
-        url: String,
+        /// The push URL, an `https` URL in one token.
+        url: PushUrl,
         /// The registration's tag.
         tag: PushTag,
     },
@@ -752,7 +752,7 @@ fn parse_response(
             ServerLine::Key { key, label }
         }
         "PUSH" => {
-            let url = p.token()?.to_owned();
+            let url = token(&mut p)?;
             let tag = token(&mut p)?;
             p.end()?;
             ServerLine::Push { url, tag }
@@ -1712,8 +1712,8 @@ impl Message {
         let file = match tag_value(tags, "file")? {
             None => None,
             Some(url) => Some(Attachment {
-                url: url.to_owned(),
-                media_type: tag_value(tags, "file-type")?.map(str::to_owned),
+                url: url.parse()?,
+                media_type: tag_value(tags, "file-type")?.map(str::parse).transpose()?,
                 size: tag_value(tags, "file-size")?.map(parse_u64).transpose()?,
             }),
         };
@@ -1730,17 +1730,19 @@ impl Message {
     }
 
     fn check(&self) -> Result<(), ParseError> {
-        if let Some(file) = &self.file {
-            if matches!(self.relation, Some(Relation::Edit(_) | Relation::React(_))) {
-                return Err(bad("a file goes only with reply"));
-            }
-            file.check()?;
+        if self.file.is_some()
+            && matches!(self.relation, Some(Relation::Edit(_) | Relation::React(_)))
+        {
+            return Err(bad("a file goes only with reply"));
         }
         if self.deleted {
             if !self.text.is_empty() {
                 return Err(bad("a deleted message has empty text"));
             }
-        } else if self.text.is_empty() {
+            if self.file.is_some() {
+                return Err(bad("a deleted message has no file"));
+            }
+        } else if crate::text::is_blank(&self.text) {
             return Err(bad("a message has text"));
         } else if matches!(self.relation, Some(Relation::React(_))) {
             limit(&self.text, MAX_REACTION)?;
@@ -1775,21 +1777,11 @@ impl Message {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Attachment {
     /// The `get` URL: `https`, at most 512 bytes, no `;` or spaces.
-    pub url: String,
+    pub url: FileUrl,
     /// The media type the server stored, from `file-type`, if sent.
-    pub media_type: Option<String>,
+    pub media_type: Option<MediaType>,
     /// The size in bytes the server stored, from `file-size`, if sent.
     pub size: Option<u64>,
-}
-
-impl Attachment {
-    fn check(&self) -> Result<(), ParseError> {
-        let scheme = self.url.get(..8);
-        if !scheme.is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
-            return Err(bad("a file URL uses https"));
-        }
-        limit(&self.url, MAX_FILE_URL)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1926,6 +1918,15 @@ impl FromStr for Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleted_message_has_no_file_and_blank_text_is_empty() {
+        let url = "https://files.example.org/f/k3JxR8vN2qYd6hWaP0tZcE/cat.png";
+        let line = format!("@seq=5;t={T};from=~sam;file={url};deleted MSG #general");
+        assert!(line.parse::<ServerMessage>().is_err());
+        let line = format!("@seq=5;t={T};from=~sam MSG #general  \t");
+        assert!(line.parse::<ServerMessage>().is_err());
+    }
     use crate::types::yes_no;
 
     const T: &str = "2026-11-06T15:40:58.120Z";
@@ -2564,8 +2565,11 @@ mod tests {
             "@seq=8815;t={T};from=alice@example.org;file={url};file-type=image/png;file-size=48213 MSG #general look at this"
         ));
         let file = msg_of(&e).file.as_ref().unwrap();
-        assert_eq!(file.url, url);
-        assert_eq!(file.media_type.as_deref(), Some("image/png"));
+        assert_eq!(file.url.as_str(), url);
+        assert_eq!(
+            file.media_type.as_ref().map(MediaType::as_str),
+            Some("image/png")
+        );
         assert_eq!(file.size, Some(48213));
         // Metadata is optional; reply is allowed.
         let e = event(&format!(
@@ -2802,7 +2806,7 @@ mod tests {
         syntax("KEY J/Kmupu");
         let m = round_trip("PUSH https://push.app.example/n/3f9c x7Hq2");
         assert!(
-            matches!(&m.line, ServerLine::Push { url, .. } if url == "https://push.app.example/n/3f9c")
+            matches!(&m.line, ServerLine::Push { url, .. } if url.as_str() == "https://push.app.example/n/3f9c")
         );
         syntax("PUSH https://push.app.example/n/3f9c");
         syntax("PUSH https://push.app.example/n/3f9c a b");
