@@ -8,6 +8,8 @@
 use std::collections::VecDeque;
 
 use crate::error::ParseError;
+use crate::line::find_ref;
+use crate::types::Ref;
 
 /// The longest line a client may send, in bytes, including the LF (2.3).
 pub const MAX_CLIENT_LINE: usize = 8192;
@@ -79,7 +81,8 @@ pub struct LineDecoder {
     max_len: usize,
     partial: Vec<u8>,
     discarding: bool,
-    ready: VecDeque<Result<String, ParseError>>,
+    /// Each finished line, and for a bad line the `ref` tag read from it.
+    ready: VecDeque<(Result<String, ParseError>, Option<Ref>)>,
 }
 
 impl LineDecoder {
@@ -110,9 +113,10 @@ impl LineDecoder {
                     if self.partial.len() + data.len() >= self.max_len {
                         // Even an LF right after these bytes would be over
                         // the limit.
+                        let r = self.prefix_ref(data, false);
                         self.partial.clear();
                         self.discarding = true;
-                        self.ready.push_back(Err(ParseError::TooLong));
+                        self.ready.push_back((Err(ParseError::TooLong), r));
                     } else {
                         self.partial.extend_from_slice(data);
                     }
@@ -127,26 +131,49 @@ impl LineDecoder {
                 continue;
             }
             if self.partial.len() + segment.len() + 1 > self.max_len {
+                let r = self.prefix_ref(segment, true);
                 self.partial.clear();
-                self.ready.push_back(Err(ParseError::TooLong));
+                self.ready.push_back((Err(ParseError::TooLong), r));
                 continue;
             }
-            let line = if self.partial.is_empty() {
+            let entry = if self.partial.is_empty() {
                 decode(segment)
             } else {
                 self.partial.extend_from_slice(segment);
-                let line = decode(&self.partial);
+                let entry = decode(&self.partial);
                 self.partial.clear();
-                line
+                entry
             };
-            self.ready.push_back(line);
+            self.ready.push_back(entry);
         }
     }
 
     /// Takes the next complete line, without its line ending, or the
     /// error for a bad line. Returns `None` when more bytes are needed.
     pub fn next_line(&mut self) -> Option<Result<String, ParseError>> {
+        self.ready.pop_front().map(|(line, _)| line)
+    }
+
+    /// Like [`next_line`](Self::next_line), but a bad line also comes with
+    /// its `ref` tag, if one could be read from its first bytes (3.6). A
+    /// server copies it onto the `ERR` it sends. Good lines come with
+    /// `None`; read their `ref` from the parsed line.
+    pub fn next_line_with_ref(&mut self) -> Option<(Result<String, ParseError>, Option<Ref>)> {
         self.ready.pop_front()
+    }
+
+    /// The `ref` of a line that is too long: the bytes held so far
+    /// followed by `more`. `complete` says whether `more` ends the line.
+    fn prefix_ref(&self, more: &[u8], complete: bool) -> Option<Ref> {
+        if self.partial.is_empty() {
+            find_ref(more, complete)
+        } else if self.partial.first() == Some(&b'@') {
+            let mut bytes = self.partial.clone();
+            bytes.extend_from_slice(more);
+            find_ref(&bytes, complete)
+        } else {
+            None
+        }
     }
 
     /// The number of bytes held for the unfinished line. Always less than
@@ -162,17 +189,51 @@ impl LineDecoder {
     }
 }
 
-/// Decodes one line's bytes, LF already removed.
-fn decode(bytes: &[u8]) -> Result<String, ParseError> {
+/// Decodes one line's bytes, LF already removed. A bad line comes with
+/// the `ref` read from it, if any.
+fn decode(bytes: &[u8]) -> (Result<String, ParseError>, Option<Ref>) {
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-    let line = std::str::from_utf8(bytes).map_err(|_| ParseError::InvalidUtf8)?;
-    check_line(line)?;
-    Ok(line.to_owned())
+    let result = std::str::from_utf8(bytes)
+        .map_err(|_| ParseError::InvalidUtf8)
+        .and_then(|line| check_line(line).map(|()| line.to_owned()));
+    match result {
+        Ok(line) => (Ok(line), None),
+        Err(e) => (Err(e), find_ref(bytes, true)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bad_lines_keep_their_ref() {
+        let mut d = LineDecoder::new(32);
+        d.push(b"@ref=7 MSG #a hi\x01\n@ref=8 OK\n@ref=9 \xff\n");
+        let (line, r) = d.next_line_with_ref().unwrap();
+        assert_eq!(line, Err(ParseError::ControlChar));
+        assert_eq!(r.unwrap().as_str(), "7");
+        // Good lines carry their ref in the line itself.
+        assert_eq!(d.next_line_with_ref(), Some((Ok("@ref=8 OK".into()), None)));
+        let (line, r) = d.next_line_with_ref().unwrap();
+        assert_eq!(line, Err(ParseError::InvalidUtf8));
+        assert_eq!(r.unwrap().as_str(), "9");
+
+        // Too long, in one push and split over several.
+        let long = format!("@ref=10 MSG #a {}\n", "x".repeat(40));
+        let mut d = LineDecoder::new(32);
+        d.push(long.as_bytes());
+        let (line, r) = d.next_line_with_ref().unwrap();
+        assert_eq!(line, Err(ParseError::TooLong));
+        assert_eq!(r.unwrap().as_str(), "10");
+        let mut d = LineDecoder::new(32);
+        for chunk in long.as_bytes().chunks(5) {
+            d.push(chunk);
+        }
+        let (line, r) = d.next_line_with_ref().unwrap();
+        assert_eq!(line, Err(ParseError::TooLong));
+        assert_eq!(r.unwrap().as_str(), "10");
+    }
 
     fn drain(d: &mut LineDecoder) -> Vec<Result<String, ParseError>> {
         std::iter::from_fn(|| d.next_line()).collect()

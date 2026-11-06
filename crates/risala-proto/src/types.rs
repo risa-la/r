@@ -12,7 +12,7 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use crate::error::ParseError;
-use crate::line::{is_tag_value, is_token};
+use crate::line::{is_tag_value, is_tag_value_char, is_token};
 use crate::names::Seq;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,8 @@ pub const MAX_DISPLAY_NAME: usize = 128;
 pub const MAX_FILE_URL: usize = 512;
 /// The longest PUSH ADD `<tag>`, in bytes (9.1).
 pub const MAX_PUSH_TAG: usize = 64;
+/// The longest NOTIFY `<reason>`, in characters (9.3).
+pub const MAX_PUSH_REASON: usize = 32;
 /// The longest PUSH ADD `<url>`, in bytes (9.1).
 pub const MAX_PUSH_URL: usize = 512;
 /// The longest welcome text, in bytes (4.1, 10.6).
@@ -41,6 +43,9 @@ pub const MAX_WELCOME: usize = 512;
 /// The number of events HISTORY and RELATED return when `limit` is not
 /// given (7.2, 7.3).
 pub const DEFAULT_LIMIT: u64 = 50;
+/// The number of rooms LIST and ADMIN ROOMS return when `limit` is not
+/// given (6.1, 10.4).
+pub const DEFAULT_LIST_LIMIT: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // Numbers and yes/no
@@ -222,7 +227,8 @@ keywords! {
 pub enum NotifyReason {
     /// A reason this crate knows.
     Known(PushReason),
-    /// Any other reason: one token, folded to lower case.
+    /// Any other reason: 1 to 32 characters of `a-z 0-9 -`, folded to
+    /// lower case (9.3).
     Other(String),
 }
 
@@ -263,13 +269,14 @@ impl FromStr for NotifyReason {
         if let Ok(reason) = s.parse::<PushReason>() {
             return Ok(NotifyReason::Known(reason));
         }
-        if !is_token(s) {
-            return Err(ParseError::BadSyntax("a push reason is one token"));
+        let lower = s.to_ascii_lowercase();
+        if !crate::line::is_option_key(&lower) {
+            return Err(ParseError::BadSyntax("a push reason is a-z, 0-9 and '-'"));
         }
-        if s.len() > MAX_TAG_TOKEN {
+        if lower.len() > MAX_PUSH_REASON {
             return Err(ParseError::TooLong);
         }
-        Ok(NotifyReason::Other(s.to_ascii_lowercase()))
+        Ok(NotifyReason::Other(lower))
     }
 }
 
@@ -542,11 +549,6 @@ impl FromStr for Relation {
 // ---------------------------------------------------------------------------
 // Tokens
 
-/// `%x21-3A / %x3C-7E / UTF8-nonascii`, a character of a tag value (3.1).
-fn is_tag_value_char(c: char) -> bool {
-    !c.is_ascii() || (('\x21'..='\x7e').contains(&c) && c != ';')
-}
-
 /// Checks a tag value of at most `MAX_TAG_TOKEN` bytes.
 fn tag_token(s: &str) -> Result<(), ParseError> {
     if s.is_empty() || !s.chars().all(is_tag_value_char) {
@@ -656,7 +658,7 @@ fn write_setting(f: &mut fmt::Formatter<'_>, key: &str, value: &str) -> fmt::Res
     }
 }
 
-/// A room setting, as in `SET <room> <key> <value...>` (6.2).
+/// A room setting, as in `SET <room> <key> [<value...>]` (6.2).
 ///
 /// Unknown keys are kept in [`RoomSetting::Other`], so that a server can
 /// reply `ERR not-supported` rather than `ERR bad-syntax`. A known key with
@@ -691,9 +693,11 @@ impl RoomSetting {
         Ok(match key.as_str() {
             "topic" if value.len() > MAX_TOPIC => return Err(ParseError::TooLong),
             "topic" => RoomSetting::Topic(value.to_owned()),
-            "public" => RoomSetting::Public(parse_yes_no(value)?),
-            "guests" => RoomSetting::Guests(value.parse()?),
-            "retention" => RoomSetting::Retention(value.parse()?),
+            // Keyword values ignore trailing spaces (6.2), which are easy
+            // to type by hand.
+            "public" => RoomSetting::Public(parse_yes_no(value.trim_end_matches(' '))?),
+            "guests" => RoomSetting::Guests(value.trim_end_matches(' ').parse()?),
+            "retention" => RoomSetting::Retention(value.trim_end_matches(' ').parse()?),
             _ => RoomSetting::Other {
                 key,
                 value: value.to_owned(),
@@ -746,7 +750,7 @@ impl FromStr for RoomSetting {
     }
 }
 
-/// A server setting, as in `ADMIN SET <key> <value...>` (10.6).
+/// A server setting, as in `ADMIN SET <key> [<value...>]` (10.6).
 ///
 /// Unknown keys are kept in [`ServerSetting::Other`], so that a server can
 /// reply `ERR not-supported`. A known key with a bad value is a syntax
@@ -779,18 +783,20 @@ impl ServerSetting {
     /// is kept exactly as given.
     pub fn parse(key: &str, value: &str) -> Result<ServerSetting, ParseError> {
         let key = keyword_token(key, "a setting key is one token")?;
+        // Keyword values ignore trailing spaces (10.6); text values do not.
+        let keyword = value.trim_end_matches(' ');
         Ok(match key.as_str() {
-            "guests" => ServerSetting::Guests(parse_yes_no(value)?),
-            "registration" if value.eq_ignore_ascii_case("open") => {
+            "guests" => ServerSetting::Guests(parse_yes_no(keyword)?),
+            "registration" if keyword.eq_ignore_ascii_case("open") => {
                 ServerSetting::Registration(true)
             }
-            "registration" if value.eq_ignore_ascii_case("closed") => {
+            "registration" if keyword.eq_ignore_ascii_case("closed") => {
                 ServerSetting::Registration(false)
             }
             "registration" => {
                 return Err(ParseError::BadSyntax("registration is open or closed"));
             }
-            "retention" => ServerSetting::Retention(value.parse()?),
+            "retention" => ServerSetting::Retention(keyword.parse()?),
             "welcome" if value.len() > MAX_WELCOME => return Err(ParseError::TooLong),
             "welcome" => ServerSetting::Welcome(value.to_owned()),
             _ => ServerSetting::Other {
@@ -1023,6 +1029,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyword_settings_ignore_trailing_spaces() {
+        assert_eq!(
+            RoomSetting::parse("public", "yes  "),
+            Ok(RoomSetting::Public(true))
+        );
+        assert_eq!(
+            ServerSetting::parse("registration", "closed "),
+            Ok(ServerSetting::Registration(false))
+        );
+        // Text keeps its spaces.
+        assert_eq!(
+            RoomSetting::parse("topic", "hi "),
+            Ok(RoomSetting::Topic("hi ".into()))
+        );
+        assert!(RoomSetting::parse("public", " yes").is_err());
+    }
+
+    #[test]
     fn notify_reasons() {
         assert_eq!(
             "Mention".parse::<NotifyReason>(),
@@ -1033,6 +1057,11 @@ mod tests {
         assert_eq!(other.to_string(), "invite");
         assert_eq!(other.known(), None);
         assert!("a b".parse::<NotifyReason>().is_err());
+        assert!("a_b".parse::<NotifyReason>().is_err());
+        assert_eq!(
+            "a".repeat(33).parse::<NotifyReason>(),
+            Err(ParseError::TooLong)
+        );
         assert!("".parse::<NotifyReason>().is_err());
     }
 
@@ -1348,7 +1377,6 @@ mod tests {
         for (key, value) in [
             ("public", "maybe"),
             ("public", ""),
-            ("public", "yes "),
             ("guests", "all"),
             ("retention", "0"),
             ("retention", "forever"),

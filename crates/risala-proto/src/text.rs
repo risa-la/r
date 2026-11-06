@@ -44,10 +44,12 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-/// Whether text counts as empty: it has nothing but spaces and TABs (5.3).
-/// MSG text, for example, must not be blank.
-pub fn is_blank(text: &str) -> bool {
-    text.bytes().all(|b| b == b' ' || b == b'\t')
+/// Whether escaped MSG text counts as empty (5.3): once unescaped, it has
+/// nothing but spaces, TABs and line breaks.
+pub fn is_blank(escaped: &str) -> bool {
+    unescape(escaped)
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\n'))
 }
 
 /// Unescapes a text parameter for display (3.4).

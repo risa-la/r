@@ -27,10 +27,10 @@
 //!
 //! - **Arity (3.3).** Too few or too many tokens, an unknown option or a
 //!   repeated option is `BadSyntax`. An unknown verb is
-//!   [`ParseError::UnknownVerb`], carrying the verb in upper case. An
-//!   unknown or missing subcommand of a known verb (`KEY FOO`, `ADMIN`) is
-//!   `BadSyntax`, since the verb itself is known and only its parameters
-//!   are wrong.
+//!   [`ParseError::UnknownVerb`], carrying the verb in upper case. So is
+//!   an unknown subcommand of a known verb (`KEY FOO`), carried as
+//!   `"KEY FOO"`, so the server replies `ERR unknown-command` (3.8). A
+//!   missing subcommand (`ADMIN` alone) is `BadSyntax`.
 //! - **Tags (3.2).** `ref` applies to every command. MSG also reads
 //!   `reply`, `edit`, `react`, `file` and `cid` (5.3, 5.6, 7.6). Every
 //!   other tag is ignored, including those MSG tags on other commands. A
@@ -42,10 +42,9 @@
 //! - **Optional text** (`[<reason...>]`, `[<label...>]`, `[<name...>]`,
 //!   `[<message...>]`) is a `String` that is empty when absent, so
 //!   `PART #r` and `PART #r ` parse equal. Required text (`<text...>`,
-//!   `<name...>`, `<message...>`) must not be empty (`BadSyntax`), except
-//!   for the value of SET and ADMIN SET, which may be empty because a
-//!   topic or welcome message may be (6.2, 10.6). Only the empty string
-//!   counts as empty: `MSG #r  ` has the text `" "`.
+//!   `<name...>`, `<message...>`) must not be empty (`BadSyntax`). MSG
+//!   text also must not be blank: only spaces, TABs and line breaks once
+//!   unescaped (5.3), so `MSG #r  ` is `BadSyntax`.
 //! - **Names fold (3.5).** Rooms, uids, roles, subcommands, option keys
 //!   and keyword values are case-insensitive and are written back in
 //!   lower case. Verbs and subcommands are written in upper case.
@@ -137,16 +136,13 @@ impl Request {
     ///
     /// # Panics
     ///
-    /// Never for a request from [`Request::parse`]: every value in it was
-    /// read from a valid line, and every token and tag comes from a type
-    /// that checks itself. A request built by hand can hold a string that
-    /// no line can carry, and then this panics. That is a text field
-    /// (including a [`RoomSetting`] or [`ServerSetting`] value) with a
-    /// control character other than TAB, a setting key or PING/PONG token
-    /// that is not one token, or a PING/PONG token that is empty. Make
-    /// text with [`text::escape`](crate::text::escape), or use
-    /// [`try_to_line`](Self::try_to_line) or
-    /// [`validate`](Self::validate) for such requests.
+    /// Never for a request from [`Request::parse`]. A request built by
+    /// hand panics if [`try_to_line`](Self::try_to_line) would fail: for
+    /// example text with a control character other than TAB, an empty MSG
+    /// text, a value over a limit, or a setting that is not in canonical
+    /// form. Make text with [`text::escape`](crate::text::escape), and use
+    /// [`try_to_line`](Self::try_to_line) for requests whose values were
+    /// not checked, as librisala's FFI layer must.
     pub fn to_line(&self) -> Line {
         self.try_to_line()
             .expect("a parsed request's values all fit in a line")
@@ -154,28 +150,31 @@ impl Request {
 
     /// Writes the request as a line, like [`to_line`](Self::to_line), but
     /// returns an error instead of panicking when a hand-built request
-    /// holds a string that no line can carry.
+    /// cannot be sent as it is.
+    ///
+    /// The line it returns always parses back to an equal request: it is
+    /// written, then parsed again from its string form and compared. So
+    /// every rule of [`Request::parse`] holds, including length limits and
+    /// the MSG tag rules, and the values are in canonical form (for
+    /// example, a [`RoomSetting::Other`] whose key is a known one fails).
     pub fn try_to_line(&self) -> Result<Line, ParseError> {
         let mut b = Line::builder(self.command.verb());
         if let Some(r) = &self.ref_ {
             b.tag("ref", r);
         }
         self.command.write(&mut b);
-        b.build()
-    }
-
-    /// Checks a request built by hand: it serialises, and parsing the
-    /// result gives back the same request. So every rule of
-    /// [`Request::parse`] holds, including length limits and the MSG tag
-    /// rules, and the values are in canonical form (for example, a
-    /// [`RoomSetting::Other`] whose key is a known one fails).
-    pub fn validate(&self) -> Result<(), ParseError> {
-        let line = self.try_to_line()?;
-        if Request::parse(&line)? == *self {
-            Ok(())
+        let line = b.build()?;
+        if Request::parse(&Line::parse(&line.to_string())?)? == *self {
+            Ok(line)
         } else {
             Err(ParseError::BadSyntax("request is not in canonical form"))
         }
+    }
+
+    /// Checks a request built by hand, as
+    /// [`try_to_line`](Self::try_to_line) does.
+    pub fn validate(&self) -> Result<(), ParseError> {
+        self.try_to_line().map(drop)
     }
 }
 
@@ -339,7 +338,7 @@ pub enum Command {
         /// Why, escaped. May be empty.
         reason: String,
     },
-    /// `SET <room> <key> <value...>` (6.2): change a room setting.
+    /// `SET <room> <key> [<value...>]` (6.2): change a room setting.
     ///
     /// Unknown keys are kept in [`RoomSetting::Other`], so that a server
     /// can reply `ERR not-supported`. A known key with a bad value is
@@ -632,7 +631,7 @@ pub enum AdminCommand {
         /// The identity.
         uid: Uid,
     },
-    /// `ADMIN SET <key> <value...>` (10.6): change a server setting.
+    /// `ADMIN SET <key> [<value...>]` (10.6): change a server setting.
     ///
     /// Unknown keys are kept in [`ServerSetting::Other`]; a known key with
     /// a bad value is `BadSyntax`.
@@ -847,7 +846,7 @@ fn text_max(p: Params<'_>, max: usize) -> Result<String, ParseError> {
 /// Text that must not be empty (`<name...>` in a syntax line, 3.3).
 fn required_text(p: Params<'_>, what: &'static str) -> Result<String, ParseError> {
     match p.text() {
-        text if crate::text::is_blank(text) => Err(ParseError::BadSyntax(what)),
+        "" => Err(ParseError::BadSyntax(what)),
         text => Ok(text.to_owned()),
     }
 }
@@ -1102,7 +1101,11 @@ impl Command {
 /// `MSG <conv> <text...>` and its tags (5.3, 5.6, 7.6).
 fn parse_msg(tags: &Tags, mut p: Params<'_>) -> Result<Command, ParseError> {
     let conv = tok(&mut p)?;
-    let text = required_text(p, "MSG text must not be empty")?;
+    let text = p.text();
+    if crate::text::is_blank(text) {
+        return Err(ParseError::BadSyntax("MSG text must not be empty"));
+    }
+    let text = text.to_owned();
 
     let mut relation = None;
     for key in Relation::KEYS {
@@ -1138,12 +1141,18 @@ fn subcommand(p: &mut Params<'_>) -> Result<String, ParseError> {
     Ok(p.token()?.to_ascii_uppercase())
 }
 
-const UNKNOWN_SUBCOMMAND: ParseError = ParseError::BadSyntax("unknown subcommand");
+/// An unknown subcommand of a known verb, such as `KEY FOO`, is an unknown
+/// command (3.8), so a client can tell a newer subcommand the server lacks
+/// from a mistake in a known one.
+fn unknown_subcommand(verb: &str, word: &str) -> ParseError {
+    ParseError::UnknownVerb(format!("{verb} {word}"))
+}
 
 impl KeyCommand {
     /// Parses the parameters after `KEY` (4.7).
     fn parse(mut p: Params<'_>) -> Result<KeyCommand, ParseError> {
-        Ok(match subcommand(&mut p)?.as_str() {
+        let word = subcommand(&mut p)?;
+        Ok(match word.as_str() {
             "LIST" => {
                 p.end()?;
                 KeyCommand::List
@@ -1156,7 +1165,7 @@ impl KeyCommand {
                 }
             }
             "DEL" => KeyCommand::Del { key: last(p)? },
-            _ => return Err(UNKNOWN_SUBCOMMAND),
+            _ => return Err(unknown_subcommand("KEY", &word)),
         })
     }
 }
@@ -1164,7 +1173,8 @@ impl KeyCommand {
 impl PushCommand {
     /// Parses the parameters after `PUSH` (9.1).
     fn parse(mut p: Params<'_>) -> Result<PushCommand, ParseError> {
-        Ok(match subcommand(&mut p)?.as_str() {
+        let word = subcommand(&mut p)?;
+        Ok(match word.as_str() {
             "ADD" => {
                 let url = tok(&mut p)?;
                 let tag = last(p)?;
@@ -1175,7 +1185,7 @@ impl PushCommand {
                 p.end()?;
                 PushCommand::List
             }
-            _ => return Err(UNKNOWN_SUBCOMMAND),
+            _ => return Err(unknown_subcommand("PUSH", &word)),
         })
     }
 }
@@ -1183,7 +1193,8 @@ impl PushCommand {
 impl AdminCommand {
     /// Parses the parameters after `ADMIN` (Section 10).
     fn parse(mut p: Params<'_>) -> Result<AdminCommand, ParseError> {
-        Ok(match subcommand(&mut p)?.as_str() {
+        let word = subcommand(&mut p)?;
+        Ok(match word.as_str() {
             // 10.1
             "OPS" => {
                 p.end()?;
@@ -1262,7 +1273,7 @@ impl AdminCommand {
                 let key = p.token()?;
                 AdminCommand::Set(ServerSetting::parse(key, p.text())?)
             }
-            _ => return Err(UNKNOWN_SUBCOMMAND),
+            _ => return Err(unknown_subcommand("ADMIN", &word)),
         })
     }
 }
@@ -1821,7 +1832,10 @@ mod tests {
             Command::Key(KeyCommand::Del { key: key() })
         );
         is_syntax("KEY");
-        is_syntax("KEY FOO");
+        assert_eq!(
+            "KEY foo".parse::<Request>(),
+            Err(ParseError::UnknownVerb("KEY FOO".into()))
+        );
         is_syntax("KEY LIST x");
         is_syntax("KEY ADD");
         is_syntax("KEY DEL");
@@ -1882,6 +1896,8 @@ mod tests {
         assert!(matches!(cmd("MSG #a  x"), Command::Msg { ref text, .. } if text == " x"));
         // Text of only spaces and TABs counts as empty (5.3).
         is_syntax("MSG #a  ");
+        is_syntax("MSG #a \\n\\n \\n");
+        rt("MSG #a \\\\n");
         is_syntax("MSG #a  \t ");
         is_syntax("MSG #a");
         is_syntax("MSG #a ");
@@ -2333,7 +2349,10 @@ mod tests {
         is_syntax("PUSH DEL");
         is_syntax("PUSH LIST x");
         is_syntax("PUSH");
-        is_syntax("PUSH FOO");
+        assert_eq!(
+            "PUSH foo".parse::<Request>(),
+            Err(ParseError::UnknownVerb("PUSH FOO".into()))
+        );
     }
 
     // ---- 10. Administration ----
@@ -2352,7 +2371,10 @@ mod tests {
         is_syntax("ADMIN OP");
         is_syntax("ADMIN DEOP a@example.org b@example.org");
         is_syntax("ADMIN");
-        is_syntax("ADMIN FOO");
+        assert_eq!(
+            "ADMIN foo".parse::<Request>(),
+            Err(ParseError::UnknownVerb("ADMIN FOO".into()))
+        );
     }
 
     #[test]
@@ -2516,11 +2538,24 @@ mod tests {
             file: None,
             cid: None,
         });
-        assert_eq!(empty_msg.to_line().to_string(), "MSG #a");
         assert!(matches!(
-            empty_msg.validate(),
+            empty_msg.try_to_line(),
             Err(ParseError::BadSyntax(_))
         ));
+        assert!(empty_msg.validate().is_err());
+
+        let c1_ref = Request {
+            ref_: None,
+            command: Command::Msg {
+                conv: Conv::Room(room("#a")),
+                text: "hi".into(),
+                relation: None,
+                file: Some("https://f.example/x".parse().unwrap()),
+                cid: None,
+            },
+        };
+        assert_eq!(c1_ref.validate(), Ok(()));
+        assert!("https://f.example/\u{85}".parse::<FileUrl>().is_err());
 
         let not_canonical = Request::new(Command::Set {
             room: room("#a"),

@@ -50,8 +50,8 @@
 //!   accepted too. Text starts after exactly one space following the
 //!   last token read, and the verb counts as a token, so `NOTICE  hi` has
 //!   the text ` hi`. A line must not start with a space.
-//! - **Option keys** are folded to lower case. They may contain any token
-//!   character except `=`; their values may contain `=` and may be empty.
+//! - **Option keys** are folded to lower case and must then be
+//!   `a-z 0-9 -`. Values are non-empty tokens and may contain `=` (3.3).
 //!   The typed layers decide which keys and values they accept.
 
 use std::borrow::Cow;
@@ -75,14 +75,50 @@ pub fn is_option_key(key: &str) -> bool {
     is_tag_key(key)
 }
 
+/// Reads the `ref` tag from a whole line that may not parse, such as one
+/// with a bad verb or a control character (3.6). `line` is the line's
+/// bytes without the LF. Returns `None` if the line has no tags, or no
+/// `ref` that is a valid [`Ref`](crate::types::Ref).
+///
+/// A server copies this `ref` onto the `ERR` for a line it cannot parse.
+pub fn read_ref(line: &[u8]) -> Option<crate::types::Ref> {
+    find_ref(line, true)
+}
+
+/// Looks for `ref=<value>` in the tag part of `bytes`. If `complete` is
+/// false, `bytes` may stop in the middle of a tag, so a value that runs
+/// to the end of `bytes` is not trusted.
+pub(crate) fn find_ref(bytes: &[u8], complete: bool) -> Option<crate::types::Ref> {
+    let tags = bytes.strip_prefix(b"@")?;
+    let (tags, ended) = match tags.iter().position(|&b| b == b' ') {
+        Some(space) => (&tags[..space], true),
+        None => (tags, complete),
+    };
+    let mut parts = tags.split(|&b| b == b';').peekable();
+    while let Some(part) = parts.next() {
+        let is_last = parts.peek().is_none();
+        if let Some(value) = part.strip_prefix(b"ref=") {
+            if is_last && !ended {
+                return None;
+            }
+            return std::str::from_utf8(value).ok()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Whether `c` may appear in a tag value (3.1): %x21-3A, %x3C-7E or
+/// non-ASCII other than the C1 controls (2.3).
+pub fn is_tag_value_char(c: char) -> bool {
+    matches!(c, '\u{21}'..='\u{3A}' | '\u{3C}'..='\u{7E}')
+        || (!c.is_ascii() && !is_forbidden_control(c))
+}
+
 /// Whether `value` is a valid tag value (3.1): one or more characters
-/// from %x21-3A, %x3C-7E or non-ASCII. So no space, no `;`, no control
-/// characters, but `=` is allowed.
+/// for which [`is_tag_value_char`] holds. So no space, no `;`, no control
+/// characters (C1 included), but `=` is allowed.
 pub fn is_tag_value(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|c| matches!(c, '\u{21}'..='\u{3A}' | '\u{3C}'..='\u{7E}') || !c.is_ascii())
+    !value.is_empty() && value.chars().all(is_tag_value_char)
 }
 
 /// Whether `verb` is a valid verb: `1*ALPHA` (3.1).
@@ -124,13 +160,15 @@ impl Tags {
     /// case), an empty or bad value, or a repeated key.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         let mut tags = Tags::new();
+        // A set keeps the repeat check linear on lines with many tags.
+        let mut seen = std::collections::HashSet::new();
         for tag in s.split(';') {
             let (key, value) = match tag.split_once('=') {
                 Some((key, value)) => (key, Some(value)),
                 None => (tag, None),
             };
             check_tag(key, value)?;
-            if tags.has(key) {
+            if !seen.insert(key) {
                 return Err(ParseError::BadSyntax("repeated tag"));
             }
             tags.entries
@@ -455,6 +493,8 @@ impl<'a> Params<'a> {
     /// value, a repeated key or a TAB.
     pub fn options(mut self) -> Result<Options, ParseError> {
         let mut options = Options::default();
+        // A set keeps the repeat check linear on lines with many options.
+        let mut seen = std::collections::HashSet::new();
         while let Some(token) = self.opt_token()? {
             let (key, value) = token
                 .split_once('=')
@@ -469,7 +509,7 @@ impl<'a> Params<'a> {
             if value.is_empty() {
                 return Err(ParseError::BadSyntax("empty option value"));
             }
-            if options.get(&key).is_some() {
+            if !seen.insert(key.clone()) {
                 return Err(ParseError::BadSyntax("repeated option"));
             }
             options.entries.push((key, value.to_owned()));
@@ -912,6 +952,31 @@ mod tests {
         assert_eq!(line.raw_params(), "");
         assert_eq!(line.to_string(), "LIST");
         assert_eq!(line, Line::parse("LIST").unwrap());
+    }
+
+    #[test]
+    fn read_ref_from_bad_lines() {
+        let r = |s: &[u8]| read_ref(s).map(|r| r.as_str().to_owned());
+        assert_eq!(r(b"@ref=7 9abc"), Some("7".into()));
+        assert_eq!(r(b"@x=1;ref=a-b;Bad=1 PING"), Some("a-b".into()));
+        assert_eq!(r(b"@ref=7 MSG #a hi\x01"), Some("7".into()));
+        assert_eq!(r(b"@ref=7"), Some("7".into()));
+        assert_eq!(r(b"@ref=a;b PING"), Some("a".into()));
+        assert_eq!(r(b"@ref= PING"), None);
+        assert_eq!(r(b"@ref=\xff PING"), None);
+        assert_eq!(r(b"ref=7 PING"), None);
+        assert_eq!(r(b"PING @ref=7"), None);
+        // A prefix of a long line: a value that runs to the end may be cut.
+        assert_eq!(find_ref(b"@ref=12", false), None);
+        assert_eq!(find_ref(b"@ref=12;x", false).unwrap().as_str(), "12");
+    }
+
+    #[test]
+    fn tag_values_reject_c1() {
+        assert!(!is_tag_value("a\u{85}"));
+        assert!(is_tag_value("a\u{a0}"));
+        assert!(Line::builder("PING").tag("x", "\u{85}").build().is_err());
+        assert!(Tags::new().insert("x", Some("\u{9f}")).is_err());
     }
 
     #[test]

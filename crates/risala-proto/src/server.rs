@@ -89,9 +89,9 @@ use crate::line::{Line, LineBuilder, Params, Tags, is_token};
 use crate::names::{BlockTarget, Conv, Domain, Id, Room, Seq, ServerBanTarget, Uid};
 use crate::time::Timestamp;
 use crate::types::{
-    FileUrl, InfoRole, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, MAX_TOPIC, MediaType,
-    NotifyReason, Presence, PushTag, PushUrl, Ref, Relation, Role, RoomSetting, ServerRetention,
-    parse_u64, parse_yes_no,
+    FileUrl, InfoRole, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, MAX_TOPIC, MAX_WELCOME,
+    MediaType, NotifyReason, Presence, PushTag, PushUrl, Ref, Relation, Role, RoomSetting,
+    ServerRetention, parse_u64, parse_yes_no, yes_no,
 };
 
 const fn bad(what: &'static str) -> ParseError {
@@ -229,7 +229,24 @@ impl ServerMessage {
     /// valid: what [`parse`](Self::parse) would reject, such as a bad
     /// token, a control character in text, a missing tag or a value over a
     /// limit.
+    ///
+    /// The line it returns always parses back to an equal message. It is
+    /// written, then parsed again from its string form and compared, so
+    /// values that are valid but not canonical, such as
+    /// `RoomSetting::Other` with the key `topic` or `ErrorCode::Other`
+    /// holding a known code, fail too.
     pub fn try_to_line(&self) -> Result<Line, ParseError> {
+        let line = self.write_line()?;
+        let reparsed = ServerMessage::parse(&Line::parse(&line.to_string())?)?;
+        if reparsed == *self {
+            Ok(line)
+        } else {
+            Err(bad("the message is not in canonical form"))
+        }
+    }
+
+    /// Writes the line without checking that it parses back.
+    fn write_line(&self) -> Result<Line, ParseError> {
         if let ServerLine::Unknown(line) = &self.line {
             let mut tags = Tags::new();
             if let Some(ref_) = &self.ref_ {
@@ -911,6 +928,7 @@ impl Greeting {
         let host = token(&mut p)?;
         let nonce = token(&mut p)?;
         let message = p.text().to_owned();
+        limit(&message, MAX_WELCOME)?;
         Ok(Greeting {
             version,
             host,
@@ -1219,6 +1237,100 @@ impl OkResponse {
     pub fn upload(&self) -> Result<Option<Upload>, ParseError> {
         self.typed("upload", str::parse)
     }
+
+    /// `get=` as a [`FileUrl`], ready for MSG's `file` tag (5.6).
+    pub fn get_file_url(&self) -> Result<Option<FileUrl>, ParseError> {
+        self.typed("get", str::parse)
+    }
+
+    // Typed setters, one per result value, so the server writes each in
+    // its spec form (`more=1`, `joined=yes`). They cannot fail: every
+    // value is a valid token.
+
+    /// Adds `seq=` (5.3).
+    pub fn with_seq(self, seq: Seq) -> OkResponse {
+        self.with("seq", seq)
+    }
+
+    /// Adds `id=` (5.1, 5.8).
+    pub fn with_id(self, id: &Id) -> OkResponse {
+        self.with("id", id)
+    }
+
+    /// Adds `head=` (6.1, 6.2).
+    pub fn with_head(self, head: Seq) -> OkResponse {
+        self.with("head", head)
+    }
+
+    /// Adds `more=0` or `more=1` (6.1, 7.2, 7.3).
+    pub fn with_more(self, more: bool) -> OkResponse {
+        self.with("more", if more { "1" } else { "0" })
+    }
+
+    /// Adds `uid=` (4.2, 4.5, 4.6).
+    pub fn with_uid(self, uid: &Uid) -> OkResponse {
+        self.with("uid", uid)
+    }
+
+    /// Adds `op=yes` or `op=no` (4.5).
+    pub fn with_op(self, op: bool) -> OkResponse {
+        self.with("op", yes_no(op))
+    }
+
+    /// Adds `members=` (6.2).
+    pub fn with_members(self, members: u64) -> OkResponse {
+        self.with("members", members)
+    }
+
+    /// Adds `role=` (6.2).
+    pub fn with_role(self, role: InfoRole) -> OkResponse {
+        self.with("role", role)
+    }
+
+    /// Adds `joined=yes` or `joined=no` (6.2).
+    pub fn with_joined(self, joined: bool) -> OkResponse {
+        self.with("joined", yes_no(joined))
+    }
+
+    /// Adds `put=` and `get=` (5.6). `put` must be one token.
+    pub fn with_upload_urls(self, put: &str, get: &FileUrl) -> Result<OkResponse, ParseError> {
+        Ok(self.try_with("put", put)?.with("get", get))
+    }
+
+    /// Adds `deleted=` (10.4).
+    pub fn with_deleted(self, deleted: u64) -> OkResponse {
+        self.with("deleted", deleted)
+    }
+
+    /// Adds `version=` (8.5).
+    pub fn with_version(self, version: u32) -> OkResponse {
+        self.with("version", version)
+    }
+
+    /// Adds `guests=yes` or `guests=no` (8.5).
+    pub fn with_guests(self, guests: bool) -> OkResponse {
+        self.with("guests", yes_no(guests))
+    }
+
+    /// Adds `register=` (8.5).
+    pub fn with_register(self, register: &Register) -> OkResponse {
+        self.with("register", register)
+    }
+
+    /// Adds `retention=` (8.5).
+    pub fn with_retention(self, retention: ServerRetention) -> OkResponse {
+        self.with("retention", retention)
+    }
+
+    /// Adds `push=yes` or `push=no` (8.5).
+    pub fn with_push(self, push: bool) -> OkResponse {
+        self.with("push", yes_no(push))
+    }
+
+    /// Adds `upload=` (5.6, 8.5).
+    pub fn with_upload(self, upload: Upload) -> OkResponse {
+        self.with("upload", upload)
+    }
 }
 
 /// The `register=` value of INFO (8.5): the server's identity domain
@@ -1495,7 +1607,7 @@ pub enum EventBody {
         /// Who was unbanned.
         uid: Uid,
     },
-    /// `SET <room> <key> <value...>`: a setting changed (6.2). Also a
+    /// `SET <room> <key> [<value...>]`: a setting changed (6.2). Also a
     /// snapshot, after JOIN and in response to `INFO <room>`.
     Set {
         /// The room.
@@ -1929,7 +2041,6 @@ mod tests {
         let line = format!("@seq=5;t={T};from=~sam MSG #general  \t");
         assert!(line.parse::<ServerMessage>().is_err());
     }
-    use crate::types::yes_no;
 
     const T: &str = "2026-11-06T15:40:58.120Z";
 
@@ -2242,6 +2353,88 @@ mod tests {
         assert!(ok.uid().is_err());
         assert!(ok.upload().is_err());
         assert_eq!(ok.value("seq2"), Some("x"));
+    }
+
+    #[test]
+    fn ok_typed_setters_match_getters() {
+        let ok = OkResponse::new()
+            .with_more(true)
+            .with_joined(false)
+            .with_op(true)
+            .with_seq(Seq::new(5).unwrap())
+            .with_role(InfoRole(None))
+            .with_upload(Upload::MaxBytes(10));
+        assert_eq!(
+            ServerMessage::new(ok.clone()).to_line().to_string(),
+            "OK more=1 joined=no op=yes seq=5 role=none upload=10"
+        );
+        assert_eq!(ok.more(), Ok(Some(true)));
+        assert_eq!(ok.joined(), Ok(Some(false)));
+        assert_eq!(ok.op(), Ok(Some(true)));
+        let get: FileUrl = "https://f.example/f/x".parse().unwrap();
+        let ok = OkResponse::new()
+            .with_upload_urls("https://f.example/u/y", &get)
+            .unwrap();
+        assert_eq!(ok.get_file_url(), Ok(Some(get)));
+        assert!(
+            OkResponse::new()
+                .with_upload_urls("a b", &ok.get_file_url().unwrap().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hand_built_lines_must_be_canonical() {
+        let set = |setting| {
+            ServerMessage::new(Event {
+                meta: None,
+                body: EventBody::Set {
+                    room: "#a".parse().unwrap(),
+                    setting,
+                },
+            })
+        };
+        assert!(
+            set(RoomSetting::Other {
+                key: "topic".into(),
+                value: "x".repeat(600)
+            })
+            .try_to_line()
+            .is_err()
+        );
+        assert!(
+            set(RoomSetting::Other {
+                key: "public".into(),
+                value: "maybe".into()
+            })
+            .try_to_line()
+            .is_err()
+        );
+        assert!(
+            set(RoomSetting::Other {
+                key: "x-new".into(),
+                value: "1".into()
+            })
+            .try_to_line()
+            .is_ok()
+        );
+        let err = |code| {
+            ServerMessage::new(ServerLine::Err(ErrResponse {
+                code,
+                retry: None,
+                message: String::new(),
+            }))
+        };
+        assert!(
+            err(ErrorCode::Other("bad-syntax".into()))
+                .try_to_line()
+                .is_err()
+        );
+        assert!(
+            err(ErrorCode::Other("slow-down".into()))
+                .try_to_line()
+                .is_ok()
+        );
     }
 
     #[test]
