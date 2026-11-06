@@ -63,8 +63,19 @@ There is no browser client, by design.
 The development environment is a Nix flake (using flake-parts):
 
 ```
-nix develop      # Rust toolchain, SQLite, OpenSSL, GTK 4, libadwaita
-nix fmt          # format Nix files
+nix develop          # Rust toolchain, SQLite, OpenSSL, GTK 4, libadwaita
+nix fmt              # format Nix files
+nix build .#risalad  # build the server into ./result
+nix flake check      # fmt, clippy, tests, REUSE and Nix formatting, as CI runs them
+```
+
+Inside `nix develop`, the usual cargo commands work:
+
+```
+cargo build
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all
 ```
 
 ## Trying a server by hand
