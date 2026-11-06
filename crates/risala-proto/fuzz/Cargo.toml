@@ -1,0 +1,59 @@
+[package]
+name = "risala-proto-fuzz"
+description = "cargo-fuzz targets for risala-proto"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+risala-proto = { path = ".." }
+
+# Its own workspace, so the main one (which excludes this directory) never
+# builds it, and it keeps its own Cargo.lock.
+[workspace]
+members = ["."]
+
+# Bytes into LineDecoder, then Line::parse (2.3, 3.1).
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+# Text into KeyFile::parse (4.4).
+[[bin]]
+name = "keyfile"
+path = "fuzz_targets/keyfile.rs"
+test = false
+doc = false
+bench = false
+
+# Strings into every name, value and key FromStr (3.4, 3.5).
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false
+
+# Lines into command::Request::parse (4-11).
+[[bin]]
+name = "client"
+path = "fuzz_targets/client.rs"
+test = false
+doc = false
+bench = false
+
+# Lines into server::ServerMessage::parse (4-11).
+[[bin]]
+name = "server"
+path = "fuzz_targets/server.rs"
+test = false
+doc = false
+bench = false
