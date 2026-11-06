@@ -229,9 +229,26 @@ Settled (now in SPEC.md):
    also what they would type to reply. This works whoever `from` is, so
    ADMIN PURGE in direct conversations is no longer a problem.
 
+7. **Grammar details found while writing risala-proto** (3.1-3.7, 4.1,
+   4.4, 5.5, 10.6).
+   - Lines may not contain C1 control characters (U+0080 to U+009F).
+   - A lone `@` with no tags is allowed.
+   - Option keys and values now have a grammar, and options may not
+     repeat.
+   - Spaces after the last token of a verb with no text are ignored.
+   - Names and rooms cannot end with `.`. A domain's last label cannot
+     be all digits, so IP addresses are not domains.
+   - A value that is only too long gets `too-long`, not `bad-syntax`.
+   - Key files over 64 KiB mean no keys. The 64-key limit counts only
+     different, valid keys.
+   - The welcome text is at most 512 bytes.
+   - HISTORY and RELATED accept `after=0` (7.2).
+
 Still open:
 
-7. **Smaller gaps:**
+8. **Retention of 0 days.** Should `retention 0` mean "keep nothing", or
+   should the minimum stay at 1 day?
+9. **Smaller gaps:**
    - What the greeting's `<host>` is when the client sent no SNI.
    - What DELETE replies when the message is already deleted.
    - READ with a seq beyond the head.

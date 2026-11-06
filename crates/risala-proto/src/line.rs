@@ -69,6 +69,12 @@ pub fn is_tag_key(key: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether `key` is a valid option key after folding:
+/// `1*( a-z / DIGIT / "-" )` (3.3). The same characters as a tag key.
+pub fn is_option_key(key: &str) -> bool {
+    is_tag_key(key)
+}
+
 /// Whether `value` is a valid tag value (3.1): one or more characters
 /// from %x21-3A, %x3C-7E or non-ASCII. So no space, no `;`, no control
 /// characters, but `=` is allowed.
@@ -271,7 +277,10 @@ impl Line {
             let (raw_tags, after) = after_at
                 .split_once(' ')
                 .ok_or(ParseError::BadSyntax("missing verb"))?;
-            tags = Tags::parse(raw_tags)?;
+            // A lone `@` carries no tags (3.2).
+            if !raw_tags.is_empty() {
+                tags = Tags::parse(raw_tags)?;
+            }
             rest = after.trim_start_matches(' ');
             if rest.is_empty() {
                 return Err(ParseError::BadSyntax("missing verb"));
@@ -440,8 +449,10 @@ impl<'a> Params<'a> {
     }
 
     /// Reads the remaining tokens as options (3.3), each `key=value`.
-    /// Keys are folded to lower case. Fails with `BadSyntax` on a token
-    /// without `=`, an empty key, a repeated key or a TAB.
+    /// Keys are folded to lower case and must then be `a-z 0-9 -`. The
+    /// value is everything after the first `=` and must not be empty.
+    /// Fails with `BadSyntax` on a token without `=`, a bad key, an empty
+    /// value, a repeated key or a TAB.
     pub fn options(mut self) -> Result<Options, ParseError> {
         let mut options = Options::default();
         while let Some(token) = self.opt_token()? {
@@ -452,6 +463,12 @@ impl<'a> Params<'a> {
                 return Err(ParseError::BadSyntax("empty option key"));
             }
             let key = key.to_ascii_lowercase();
+            if !is_option_key(&key) {
+                return Err(ParseError::BadSyntax("bad option key"));
+            }
+            if value.is_empty() {
+                return Err(ParseError::BadSyntax("empty option value"));
+            }
             if options.get(&key).is_some() {
                 return Err(ParseError::BadSyntax("repeated option"));
             }
@@ -617,18 +634,18 @@ impl LineBuilder {
         self
     }
 
-    /// Adds option `key=value` (3.3). The key must be non-empty, without
-    /// `=`, and is written in lower case. Both must be token characters;
-    /// the value may be empty. Options cannot be mixed with text.
+    /// Adds option `key=value` (3.3). The key is written in lower case and
+    /// must then be `a-z 0-9 -`. The value must be a non-empty token.
+    /// Options cannot be mixed with text.
     pub fn option(&mut self, key: &str, value: impl fmt::Display) -> &mut Self {
         let value = value.to_string();
         if self.stage > Stage::Options {
             return self.fail(ParseError::BadSyntax("option after text"));
         }
-        if !is_token(key) || key.contains('=') {
+        if !is_option_key(&key.to_ascii_lowercase()) {
             return self.fail(ParseError::BadSyntax("bad option key"));
         }
-        if !value.is_empty() && !is_token(&value) {
+        if !is_token(&value) {
             return self.fail(ParseError::BadSyntax("bad option value"));
         }
         self.stage = Stage::Options;
@@ -898,6 +915,15 @@ mod tests {
     }
 
     #[test]
+    fn lone_at_has_no_tags() {
+        for s in ["@ MSG #a hi", "@   MSG #a hi"] {
+            let line = Line::parse(s).unwrap();
+            assert!(line.tags().is_empty(), "{s:?}");
+            assert_eq!(line.to_string(), "MSG #a hi");
+        }
+    }
+
+    #[test]
     fn parse_errors() {
         let cases: &[(&str, ParseError)] = &[
             ("", bad("empty line")),
@@ -908,7 +934,6 @@ mod tests {
             ("@ref=7", bad("missing verb")),
             ("@ref=7 ", bad("missing verb")),
             ("@ref=7   ", bad("missing verb")),
-            ("@ MSG", bad("bad tag key")),
             ("@ref= MSG", bad("bad tag value")),
             ("@REF=7 MSG", bad("bad tag key")),
             ("@ref=1;ref=2 MSG", bad("repeated tag")),
@@ -1086,12 +1111,12 @@ mod tests {
     #[test]
     fn options_fold_keys_and_keep_values() {
         let line =
-            Line::parse("OK PUT=https://f.example.org/u?a=b Get=X  head=8812 note=").unwrap();
+            Line::parse("OK PUT=https://f.example.org/u?a=b Get=X  head=8812 x-y=1").unwrap();
         let o = line.params().options().unwrap();
         assert_eq!(o.get("put"), Some("https://f.example.org/u?a=b"));
         assert_eq!(o.get("get"), Some("X"));
         assert_eq!(o.get("head"), Some("8812"));
-        assert_eq!(o.get("note"), Some(""));
+        assert_eq!(o.get("x-y"), Some("1"));
         assert_eq!(o.get("PUT"), None);
     }
 
@@ -1110,6 +1135,9 @@ mod tests {
             ("OK seq", "expected an option"),
             ("OK seq=1 more", "expected an option"),
             ("OK =1", "empty option key"),
+            ("OK note=", "empty option value"),
+            ("OK se_q=1", "bad option key"),
+            ("OK é=1", "bad option key"),
             ("OK seq=1 seq=2", "repeated option"),
             ("OK seq=1 SEQ=2", "repeated option"),
             ("OK seq=1\tmore=1", "TAB between tokens"),
@@ -1165,10 +1193,9 @@ mod tests {
             .token("#general")
             .option("AFTER", 8811)
             .option("limit", 2)
-            .option("x", "")
             .build()
             .unwrap();
-        assert_eq!(line.to_string(), "HISTORY #general after=8811 limit=2 x=");
+        assert_eq!(line.to_string(), "HISTORY #general after=8811 limit=2");
         let line = Line::builder("OK")
             .option("put", "https://x/?a=b")
             .build()
@@ -1243,6 +1270,8 @@ mod tests {
         check(Line::builder("OK").option("", 1), bad("bad option key"));
         check(Line::builder("OK").option("a=b", 1), bad("bad option key"));
         check(Line::builder("OK").option("a b", 1), bad("bad option key"));
+        check(Line::builder("OK").option("a_b", 1), bad("bad option key"));
+        check(Line::builder("OK").option("a", ""), bad("bad option value"));
         check(
             Line::builder("OK").option("a", "x y"),
             bad("bad option value"),

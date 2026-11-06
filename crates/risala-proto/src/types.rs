@@ -33,6 +33,8 @@ pub const MAX_DISPLAY_NAME: usize = 128;
 pub const MAX_FILE_URL: usize = 512;
 /// The longest PUSH ADD `<tag>`, in bytes (9.1).
 pub const MAX_PUSH_TAG: usize = 64;
+/// The longest welcome text, in bytes (4.1, 10.6).
+pub const MAX_WELCOME: usize = 512;
 /// The number of events HISTORY and RELATED return when `limit` is not
 /// given (7.2, 7.3).
 pub const DEFAULT_LIMIT: u64 = 50;
@@ -727,6 +729,7 @@ impl ServerSetting {
                 return Err(ParseError::BadSyntax("registration is open or closed"));
             }
             "retention" => ServerSetting::Retention(value.parse()?),
+            "welcome" if value.len() > MAX_WELCOME => return Err(ParseError::TooLong),
             "welcome" => ServerSetting::Welcome(value.to_owned()),
             _ => ServerSetting::Other {
                 key,

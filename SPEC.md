@@ -219,8 +219,8 @@ After the TLS handshake, both sides exchange lines.
   A CR (%x0D) directly before the LF is removed. Senders SHOULD end
   lines with LF alone. `openssl s_client` does this by default.
 - **Characters.** Lines MUST be valid UTF-8 [RFC3629]. They MUST NOT
-  contain control characters (%x00-08, %x0A-1F, %x7F) apart from TAB
-  (%x09) and the line ending itself.
+  contain control characters (%x00-08, %x0A-1F, %x7F and U+0080 to
+  U+009F) apart from TAB (%x09) and the line ending itself.
 - **Length.** A line from a client MUST NOT be longer than 8192 bytes
   including the LF. A line from a server MUST NOT be longer than 16384
   bytes. The difference leaves room for the tags a server adds when it
@@ -239,7 +239,7 @@ After the TLS handshake, both sides exchange lines.
 
 ```abnf
 line       = [ tags SP ] verb [ SP params ] [ CR ] LF
-tags       = "@" tag *( ";" tag )
+tags       = "@" [ tag *( ";" tag ) ]
 tag        = tag-key [ "=" tag-value ]
 tag-key    = 1*( %x61-7A / DIGIT / "-" )        ; a-z 0-9 -
 tag-value  = 1*( %x21-3A / %x3C-7E / UTF8-nonascii )
@@ -261,6 +261,8 @@ the target of a reply or reaction, and the id that matches a response to
 its command.
 
 - The order of tags does not matter. A line MUST NOT repeat a tag key.
+- A lone `@` carries no tags. Receivers MUST accept it, and senders
+  SHOULD leave it out.
 - Receivers MUST ignore tags they do not understand.
 - From a client command, a server copies only `reply`, `edit`, `react`
   and `file` onto the event the command causes.
@@ -290,6 +292,7 @@ Each verb defines its own parameters. There are three kinds:
 - A **token** is one or more characters other than space and TAB.
 - An **option** is a token of the form `key=value`. Options come after a
   verb's tokens, in any order, and are optional unless stated otherwise.
+  A command MUST NOT repeat an option.
 - **Text** is the rest of the line after the space that follows the last
   token. It may contain spaces and may be empty. When it is empty, that
   space may be left out.
@@ -300,7 +303,17 @@ always last, so no quoting is needed.
 Senders MUST separate tokens with exactly one space. Receivers SHOULD
 accept runs of spaces between tokens. Once all tokens are read, text
 starts after exactly one space, so any further leading spaces belong to
-the text.
+the text. For a verb that takes no text, receivers ignore spaces after
+the last token, so `LIST ` means `LIST`.
+
+```abnf
+option     = option-key "=" option-value
+option-key = 1*( %x61-7A / DIGIT / "-" )        ; a-z 0-9 -
+option-value = 1*( %x21-7E / UTF8-nonascii )    ; any token, "=" allowed
+```
+
+Option keys are case-insensitive, like verbs. An option's value ends at
+the next space, so values such as URLs may contain `=`.
 
 A server MUST reply `ERR bad-syntax` to a command that has too few or
 too many tokens, or that has an option the server does not know.
@@ -330,14 +343,14 @@ conventions such as `code` and *emphasis*.
 ### 3.5. Names
 
 ```abnf
-name       = alnum *31( alnum / "." / "_" / "-" )
+name       = alnum [ *30( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]
 alnum      = %x61-7A / DIGIT                    ; a-z 0-9
 guest      = "~" name
 identity   = name "@" domain
 domain     = label 1*( "." label )              ; A-labels [RFC5890]
 label      = alnum [ *61( alnum / "-" ) alnum ]
 uid        = guest / identity
-room       = "#" alnum *63( alnum / "." / "_" / "-" )
+room       = "#" alnum [ *62( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]
 conv       = room / uid
 seq        = %x31-39 *18DIGIT                   ; 1 to 2^63-1
 id         = 1*64( alnum / "-" / "_" )          ; conversation or report id
@@ -349,6 +362,10 @@ timestamp  = full-date "T" time-hour ":" time-minute ":"
   (Section 4.2) or an identity such as `alice@example.org` (4.3).
 - A **conv** names a conversation. It is either a room, or the other
   person in a direct conversation (5.1).
+- Names and rooms never end with `.`, so a full stop after one in a
+  sentence is never part of it.
+- A domain is at most 253 characters long, and its last label MUST NOT
+  be all digits. So an IP address is never a domain.
 - Names are case-insensitive. Servers fold ASCII upper-case letters in
   commands to lower case, and always send names in lower case.
 - Display names (8.2) are separate free text. They are not names in the
@@ -403,6 +420,9 @@ S: @ref=7 OK more=1
 | `rate-limited` | Too many requests. The `retry` tag says when to try again |
 | `internal` | Something went wrong on the server |
 
+A name, room or other value that follows its grammar except for being
+too long gets `too-long`, not `bad-syntax`.
+
 Clients MUST treat an unknown code as a general failure.
 
 ### 3.8. Extending the Protocol
@@ -436,7 +456,7 @@ RISALA <version> <host> <nonce> [<message...>]
 - `<host>` is the hostname from SNI, in lower case.
 - `<nonce>` is at least 16 bytes from a cryptographically secure random
   source, written in lower-case hex. It is unique to this connection.
-- `<message...>` is an optional welcome text.
+- `<message...>` is an optional welcome text, at most 512 bytes.
 
 A new connection is not yet a guest or an identity. Until it becomes
 one, the server accepts only INFO, GUEST, AUTH, REGISTER, PING, PONG and
@@ -518,8 +538,11 @@ When a server fetches a key file:
   certificate authorities.
 - It MUST NOT follow redirects. Only a 200 response counts. Any other
   response means the identity has no keys.
-- It MUST stop after 10 seconds or 64 KiB. It MUST ignore keys after the
-  64th.
+- It MUST stop after 10 seconds or 64 KiB. A file that is larger, or
+  that does not arrive in time, means the identity has no keys.
+- It MUST use at most 64 keys: the first 64 different, valid `ed25519`
+  keys in the file. Repeated keys, malformed lines and ignored lines do
+  not count toward the 64.
 - It MUST NOT connect to loopback, private, link-local or other
   special-purpose addresses [RFC6890] unless its operator has configured
   it to. Users choose the domain, so without this rule they could make
@@ -816,8 +839,9 @@ reach copies that people have already made.
 
 A mention is `@` followed by a uid, for example `@alice@example.org` or
 `@~sam`. The `@` must be at the start of the text or follow whitespace,
-after unescaping. The mention is the longest uid that follows the `@`,
-except that a trailing `.` is not part of it.
+after unescaping. The mention is the longest uid that follows the `@`.
+Uids never end with `.` (3.5), so in `thanks @~sam.` the mention is
+`~sam`.
 
 Servers use mentions to decide when to send push notifications (Section
 9). Clients SHOULD highlight mentions of the user. They SHOULD also let
@@ -1244,6 +1268,8 @@ HISTORY <conv> [after=<seq>] [before=<seq>] [limit=<n>]
   `more=1` means there are older events before the first one returned.
 - **`limit`** defaults to 50. A server MAY return fewer events than
   asked for. `more` says whether there are more.
+- `after` may be `0`, which a client with nothing stored uses to read
+  from the start (7.1). `before` and `limit` are at least 1.
 
 You may read the history of:
 
@@ -1733,7 +1759,7 @@ ADMIN SET <key> <value...>
 | `guests` | `yes` or `no` | Whether guests may connect |
 | `registration` | `open` or `closed` | Whether REGISTER is accepted |
 | `retention` | a number of days, or `forever` | The server's retention period (7.5) |
-| `welcome` | any text | The message in the greeting (4.1) |
+| `welcome` | any text up to 512 bytes | The message in the greeting (4.1) |
 
 - Changes take effect immediately and show in INFO (8.5).
 - Shortening `retention` also applies to events already stored.

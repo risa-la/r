@@ -16,10 +16,13 @@ pub const MAX_CLIENT_LINE: usize = 8192;
 pub const MAX_SERVER_LINE: usize = 16384;
 
 /// Whether `c` is a control character forbidden in a line (2.3): %x00-08,
-/// %x0A-1F and %x7F. TAB (%x09) is allowed. Characters from U+0080 up,
-/// including the C1 range, are not checked, as 2.3 lists only these bytes.
+/// %x0A-1F, %x7F and the C1 controls U+0080 to U+009F. TAB (%x09) is
+/// allowed.
 pub fn is_forbidden_control(c: char) -> bool {
-    matches!(c, '\u{00}'..='\u{08}' | '\u{0A}'..='\u{1F}' | '\u{7F}')
+    matches!(
+        c,
+        '\u{00}'..='\u{08}' | '\u{0A}'..='\u{1F}' | '\u{7F}'..='\u{9F}'
+    )
 }
 
 /// Checks the characters of one line, without its line ending (2.3).
@@ -279,8 +282,13 @@ mod tests {
             decode_all(100, "MSG #a \tمرحبا 👋\n".as_bytes()),
             vec![ok("MSG #a \tمرحبا 👋")]
         );
-        // C1 controls are not in the list of 2.3.
-        assert_eq!(decode_all(100, "a\u{85}\n".as_bytes()), vec![ok("a\u{85}")]);
+        // U+00A0 is the first character after the C1 controls.
+        assert_eq!(decode_all(100, "a\u{a0}\n".as_bytes()), vec![ok("a\u{a0}")]);
+        // C1 controls are forbidden (2.3).
+        assert_eq!(
+            decode_all(100, "a\u{85}\n".as_bytes()),
+            vec![Err(ParseError::ControlChar)]
+        );
     }
 
     #[test]
@@ -434,7 +442,9 @@ mod tests {
         assert_eq!(check_line("\u{7f}"), Err(ParseError::ControlChar));
         assert!(!is_forbidden_control('\t'));
         assert!(!is_forbidden_control(' '));
-        assert!(!is_forbidden_control('\u{80}'));
+        assert!(is_forbidden_control('\u{80}'));
+        assert!(is_forbidden_control('\u{9f}'));
+        assert!(!is_forbidden_control('\u{a0}'));
     }
 
     #[test]

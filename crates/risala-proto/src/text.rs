@@ -16,14 +16,12 @@ use crate::names::{MAX_UID_LEN, Uid, is_valid_uid};
 /// - A line break becomes `\n`. LF, CRLF and a lone CR each count as one
 ///   line break, so text pasted from any platform keeps its lines.
 /// - TAB is kept, since lines may contain it (2.3).
-/// - Every other control character (U+0000 to U+001F and U+007F) is
-///   dropped. Lines must not contain them (2.3), and none of them has a
-///   meaning in chat text. Dropping them also removes terminal escape
-///   sequence introducers from pasted text.
+/// - Every other control character (U+0000 to U+001F, U+007F and the C1
+///   controls U+0080 to U+009F) is dropped. Lines must not contain them
+///   (2.3), and none of them has a meaning in chat text. Dropping them
+///   also removes terminal escape sequence introducers from pasted text.
 ///
-/// The result is always valid inside a line. Characters outside ASCII,
-/// including the C1 controls U+0080 to U+009F, are kept as they are: lines
-/// allow them, and what to show for them is up to the client.
+/// The result is always valid inside a line.
 ///
 /// For any input without dropped control characters and with LF line
 /// breaks, `unescape(&escape(s)) == s`.
@@ -39,7 +37,7 @@ pub fn escape(s: &str) -> String {
                 out.push_str("\\n");
             }
             '\t' => out.push('\t'),
-            c if c.is_ascii_control() => {}
+            c if crate::frame::is_forbidden_control(c) => {}
             c => out.push(c),
         }
     }
@@ -91,18 +89,15 @@ fn is_uid_char(b: u8) -> bool {
 /// `escaped` is a text parameter as on the wire; it is unescaped first. A
 /// mention is `@` at the start of the text or after whitespace (any
 /// Unicode white space, including an escaped line break), followed by a
-/// uid. The mention is the longest uid that follows the `@`, without any
-/// trailing `.` characters. Names are folded to lower case.
+/// uid. The mention is the longest uid that follows the `@`. Uids never
+/// end with `.` (3.5), so full stops after a mention are not part of it.
+/// Names are folded to lower case.
 ///
 /// - `@alice@example.org.` mentions `alice@example.org`
 /// - `@alice@example.org's` mentions `alice@example.org`
 /// - `@~sam,` and `@~sam...` mention `~sam`
 /// - `@Bob@Example.NET` mentions `bob@example.net`
 /// - `@alice`, `@alice@localhost` and `mail@example.org` mention nobody
-///
-/// Only the domain of an identity cannot end with `.`, so the trailing
-/// `.` rule only ever shortens guest names: `~sam.` is a valid guest, but
-/// `@~sam.` mentions `~sam`.
 pub fn mentions(escaped: &str) -> Vec<Uid> {
     let text = unescape(escaped);
     let mut found = Vec::new();
@@ -163,7 +158,7 @@ mod tests {
         assert_eq!(escape("\x1b[31mred\x1b[0m"), "[31mred[0m");
         assert_eq!(escape("nul\0del\x7fbell\x07"), "nuldelbell");
         assert_eq!(escape("عائشة 👋"), "عائشة 👋");
-        assert_eq!(escape("c1\u{85}\u{9b}"), "c1\u{85}\u{9b}");
+        assert_eq!(escape("c1\u{85}\u{9b}\u{a0}"), "c1\u{a0}");
         assert_eq!(escape("  leading"), "  leading");
     }
 

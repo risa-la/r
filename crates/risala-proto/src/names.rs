@@ -55,8 +55,9 @@ fn is_name_char(b: u8) -> bool {
     is_alnum(b) || matches!(b, b'.' | b'_' | b'-')
 }
 
-/// `alnum *N( alnum / "." / "_" / "-" )`, the shape shared by `name` and the
-/// part of `room` after `#`.
+/// `alnum [ *N( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]`, the
+/// shape shared by `name` and the part of `room` after `#`. It never ends
+/// with `.` (3.5).
 fn name_shape(s: &[u8], max: usize) -> Shape {
     match s.first() {
         None => Err("empty name"),
@@ -64,6 +65,7 @@ fn name_shape(s: &[u8], max: usize) -> Shape {
         _ if !s.iter().all(|&b| is_name_char(b)) => {
             Err("a name may contain only a-z, 0-9, '.', '_' and '-'")
         }
+        _ if s.ends_with(b".") => Err("a name must not end with '.'"),
         _ => Ok(s.len() <= max),
     }
 }
@@ -83,16 +85,22 @@ fn label_shape(s: &[u8]) -> Shape {
     }
 }
 
-/// `domain = label 1*( "." label )`, at most 253 characters.
+/// `domain = label 1*( "." label )`, at most 253 characters, and the last
+/// label is not all digits, so an IP address is never a domain (3.5).
 fn domain_shape(s: &[u8]) -> Shape {
     let mut labels = 0;
     let mut fits = s.len() <= MAX_DOMAIN_LEN;
+    let mut last: &[u8] = &[];
     for label in s.split(|&b| b == b'.') {
         fits &= label_shape(label)?;
         labels += 1;
+        last = label;
     }
     if labels < 2 {
         return Err("a domain needs at least two labels");
+    }
+    if last.iter().all(u8::is_ascii_digit) {
+        return Err("a domain's last label must not be all digits");
     }
     Ok(fits)
 }
@@ -117,7 +125,7 @@ fn uid_shape(s: &[u8]) -> Shape {
     }
 }
 
-/// `room = "#" alnum *63( alnum / "." / "_" / "-" )`.
+/// `room = "#" alnum [ *62( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]`.
 fn room_shape(s: &[u8]) -> Shape {
     let rest = s.strip_prefix(b"#").ok_or("a room starts with '#'")?;
     name_shape(rest, MAX_ROOM_LEN - 1)
@@ -773,13 +781,13 @@ mod tests {
 
     #[test]
     fn name_grammar() {
-        for s in ["a", "0", "sam", "a.b_c-d", "a-", "a.", "9lives", "a__"] {
+        for s in ["a", "0", "sam", "a.b_c-d", "a-", "a_", "9lives", "a__"] {
             assert_eq!(ok::<Name>(s), s);
         }
         assert_eq!(ok::<Name>(&"a".repeat(32)), "a".repeat(32));
         too_long::<Name>(&"a".repeat(33));
         for s in [
-            "", "-a", ".a", "_a", "a b", "a@b", "a~", "a#", "é", "a/b", "a+",
+            "", "-a", ".a", "_a", "a b", "a@b", "a~", "a#", "é", "a/b", "a+", "a.", "a..",
         ] {
             syntax::<Name>(s);
         }
@@ -811,7 +819,8 @@ mod tests {
             "chat.example.org",
             "xn--mgbh0fb.example",
             "a-b.c-d",
-            "1.2",
+            "1.2a",
+            "1.2.3.example",
             "a--b.org",
         ] {
             assert_eq!(ok::<Domain>(s), s);
@@ -836,6 +845,9 @@ mod tests {
             "a b.org",
             "exämple.org",
             "a.org.",
+            "1.2",
+            "1.2.3.4",
+            "example.123",
         ] {
             syntax::<Domain>(s);
         }
@@ -866,7 +878,7 @@ mod tests {
             "~sam",
             "alice@example.org",
             "a@b.c",
-            "~a.",
+            "~a_",
             "bob.smith@mail.example.net",
         ] {
             assert_eq!(ok::<Uid>(s), s);
@@ -885,6 +897,9 @@ mod tests {
             "~-sam",
             "alice @example.org",
             "~sam,~bob",
+            "~sam.",
+            "alice.@example.org",
+            "alice@203.0.113.7",
         ] {
             syntax::<Uid>(s);
         }
@@ -939,7 +954,17 @@ mod tests {
         assert_eq!(ok::<Room>(&r64), r64);
         too_long::<Room>(&format!("#{}", "a".repeat(65)));
         for s in [
-            "", "#", "general", "##a", "#-a", "#.a", "#a b", "#a#", "#é", "~sam",
+            "",
+            "#",
+            "general",
+            "##a",
+            "#-a",
+            "#.a",
+            "#a b",
+            "#a#",
+            "#é",
+            "~sam",
+            "#general.",
         ] {
             syntax::<Room>(s);
         }
