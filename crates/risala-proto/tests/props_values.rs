@@ -599,7 +599,7 @@ proptest! {
         topic in "[ -~]{0,40}",
         key in "[a-z][a-z0-9-]{0,10}",
         value in "[ -~]{0,20}",
-        n in any::<u64>(),
+        n in 0..=i64::MAX as u64,
     ) {
         for role in Role::ALL {
             check_canonical::<Role>(role.as_str())?;

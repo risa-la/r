@@ -265,6 +265,23 @@ Settled (now in SPEC.md):
      and reply `OK more=<0 or 1>`.
    - A NOTIFY with an unknown reason counts as new activity.
 
+10. **Found in the M1 review** (2.3, 3.1-3.8, 4.1, 4.5, 5.3, 6.2, 7.3,
+    9.3, 10.6).
+    - C1 controls are excluded from the ABNF too. The ABNF describes
+      names, option keys and keywords after folding.
+    - Numbers have a grammar: decimal, no leading zeros, at most 2^63-1.
+    - `too-long` covers names, ids, text, URLs and tag values; a number,
+      key or signature of the wrong length is `bad-syntax`.
+    - Unknown subcommands get `unknown-command`.
+    - An `OK` or `ERR` a client cannot parse still ends its command.
+    - Timestamps use upper-case `T` and `Z`, and no leap seconds.
+    - Nonces are 16 to 64 bytes. AUTH takes an identity, and only an AUTH
+      or REGISTER that parses uses up the nonce.
+    - Blank MSG text is checked after unescaping, so line breaks count.
+    - Keyword and number setting values ignore trailing spaces.
+    - RELATED accepts `after=0`, and `<first>` > `<last>` returns nothing.
+    - NOTIFY reasons are 1 to 32 characters of `a-z 0-9 -`.
+
 Nothing is open right now.
 
 ## 6. Open decisions

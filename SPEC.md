@@ -228,7 +228,9 @@ After the TLS handshake, both sides exchange lines.
 - **Bad lines.** A server that receives a line that is too long MUST
   discard everything up to the next LF and reply `ERR too-long`. A server
   that receives a line it cannot parse MUST discard it and reply
-  `ERR bad-syntax`. A client SHOULD ignore server lines it cannot parse.
+  `ERR bad-syntax`. A client SHOULD ignore server lines it cannot parse,
+  except that an `OK` or `ERR` line it cannot parse still counts as the
+  final response to its command (3.6), as a general failure.
 - **Empty lines** are ignored and get no response.
 
 ---
@@ -247,12 +249,19 @@ tag-value  = 1*( %x21-3A / %x3C-7E / UTF8-nonascii )
 verb       = 1*ALPHA                            ; case-insensitive
 params     = *( HTAB / %x20-7E / UTF8-nonascii )
                                                 ; split as in 3.3
-UTF8-nonascii = UTF8-2 / UTF8-3 / UTF8-4        ; from RFC 3629
+UTF8-nonascii = UTF8-2 / UTF8-3 / UTF8-4        ; from RFC 3629, but
+                                                ; not U+0080-009F (2.3)
 ```
 
 Verbs are case-insensitive, so `msg` and `MSG` mean the same. Servers
 send verbs in upper case. This document writes client commands in upper
-case too.
+case too. Receivers SHOULD accept runs of spaces between the tags and the
+verb, as between tokens (3.3).
+
+Tag keys are always lower case. Elsewhere, where the ABNF in this
+document lists only `a-z` for something case-insensitive, such as option
+keys, names and keywords, it describes the form after folding:
+receivers fold ASCII upper case to lower case first.
 
 ### 3.2. Tags
 
@@ -270,7 +279,7 @@ its command.
 
 | Tag | Set by | Value | Meaning |
 |---|---|---|---|
-| `ref` | client | token, at most 64 bytes | Matches a response to its command (3.6) |
+| `ref` | client | tag value, at most 64 bytes | Matches a response to its command (3.6) |
 | `seq` | server | sequence number | The event's position in its conversation (5.2) |
 | `t` | server | timestamp | When the server accepted the event or report |
 | `from` | server | uid | Who caused the event, or who made the report |
@@ -280,7 +289,7 @@ its command.
 | `file` | client | URL | A file attached to the message (5.6) |
 | `file-type` | server | media type | The attached file's media type (5.6) |
 | `file-size` | server | bytes | The attached file's size (5.6) |
-| `cid` | client | token, at most 64 bytes | Client message id for safe resending (7.6) |
+| `cid` | client | tag value, at most 64 bytes | Client message id for safe resending (7.6) |
 | `deleted` | server | none | The event's content was removed (5.4) |
 | `retry` | server | seconds | With `ERR rate-limited`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
@@ -314,6 +323,13 @@ option-value = 1*( %x21-7E / UTF8-nonascii )    ; any token, "=" allowed
 
 Option keys are case-insensitive, like verbs. An option's value ends at
 the next space, so values such as URLs may contain `=`.
+
+Numbers, such as counts, sizes, limits and numbers of days, are written
+in decimal, without a sign or leading zeros:
+
+```abnf
+number     = "0" / %x31-39 *18DIGIT             ; 0 to 2^63-1
+```
 
 A server MUST reply `ERR bad-syntax` to a command that has too few or
 too many tokens, or that has an option the server does not know.
@@ -358,6 +374,9 @@ timestamp  = full-date "T" time-hour ":" time-minute ":"
              time-second "." 3DIGIT "Z"         ; RFC 3339, UTC
 ```
 
+- Timestamps are always UTC, with milliseconds. Senders write `T` and
+  `Z` in upper case, and receivers MAY accept lower case. Seconds run
+  from 00 to 59: leap seconds are not used.
 - A **uid** identifies a user. It is either a guest such as `~sam`
   (Section 4.2) or an identity such as `alice@example.org` (4.3).
 - A **conv** names a conversation. It is either a room, or the other
@@ -422,8 +441,10 @@ S: @ref=7 OK more=1
 | `rate-limited` | Too many requests. The `retry` tag says when to try again |
 | `internal` | Something went wrong on the server |
 
-A name, room or other value that follows its grammar except for being
-too long gets `too-long`, not `bad-syntax`.
+A name, room, id, text, URL or tag value that follows its grammar except
+for being too long gets `too-long`, not `bad-syntax`. A number, key or
+signature with the wrong number of digits or characters gets
+`bad-syntax`.
 
 Clients MUST treat an unknown code as a general failure.
 
@@ -431,7 +452,9 @@ Clients MUST treat an unknown code as a general failure.
 
 - **New verbs** may be added. Servers reply `ERR unknown-command` to
   verbs they do not know, and clients ignore lines with verbs they do not
-  know.
+  know. An unknown subcommand of a known verb, such as `KEY FOO`, also
+  gets `ERR unknown-command`, so a client can tell it apart from a
+  mistake in a known one.
 - **New information on an existing verb** goes in tags. The tokens and
   text of the verbs defined here never change.
 - **New options and result values** may be added. Servers reject unknown
@@ -457,7 +480,7 @@ RISALA <version> <host> <nonce> [<message...>]
 - `<version>` is `1` for this document.
 - `<host>` is the hostname from SNI, in lower case. If the client sent
   no SNI, it is the server's own main hostname.
-- `<nonce>` is at least 16 bytes from a cryptographically secure random
+- `<nonce>` is 16 to 64 bytes from a cryptographically secure random
   source, written in lower-case hex. It is unique to this connection.
 - `<message...>` is an optional welcome text, at most 512 bytes.
 
@@ -560,10 +583,12 @@ connections that signed in with it.
 ### 4.5. Signing In
 
 ```
-AUTH <uid> <signature>
+AUTH <identity> <signature>
 ```
 
-→ `OK uid=<uid>`
+→ `OK uid=<identity>`
+
+Guests do not sign in, so a guest uid gets `ERR bad-syntax`.
 
 The client signs these bytes with its device's private key:
 
@@ -605,8 +630,8 @@ Each part of the signed bytes has a job:
 - **The nonce** stops replay.
 - **The uid** ties the signature to one identity.
 
-Any AUTH or REGISTER attempt uses up the connection's nonce, whether it
-succeeds or not. To try again, reconnect.
+Any AUTH or REGISTER command that parses uses up the connection's nonce,
+whether it succeeds or not. To try again, reconnect.
 
 ### 4.6. Registration
 
@@ -776,8 +801,8 @@ MSG <conv> <text...>
 
 → `OK seq=<seq>`
 
-Sends a message. The text MUST NOT be empty. Text made only of spaces
-and TABs counts as empty. The sender's connection
+Sends a message. The text MUST NOT be empty. Text made only of spaces,
+TABs and line breaks, once unescaped, counts as empty. The sender's connection
 receives the message's event before the OK, so a client can match the
 two by seq.
 
@@ -1124,7 +1149,9 @@ SET <room> <key> [<value...>]
   applies to events already stored.
 - `retention server`: the room follows the server's retention period.
 
-An unknown key gets `ERR not-supported`.
+Keyword and number values ignore trailing spaces, so `SET #r public yes `
+works. A topic keeps its spaces. An unknown key gets
+`ERR not-supported`.
 
 ```
 INFO <room>
@@ -1319,11 +1346,12 @@ time therefore has the messages of a page, but not necessarily their
 edits and reactions. RELATED returns them:
 
 - It returns every edit and every reaction whose target seq is between
-  `<first>` and `<last>`, inclusive.
+  `<first>` and `<last>`, inclusive. If `<first>` is greater than
+  `<last>`, it returns none.
 - Deleted edits and reactions come back as placeholders (5.4), so a
   client can remove ones it has stored.
-- **`after`** returns only events whose seq is greater than `after`.
-  `more=1` means there are more. To fetch the rest, send RELATED again
+- **`after`** returns only events whose seq is greater than `after`,
+  which may be `0`. `more=1` means there are more. To fetch the rest, send RELATED again
   with `after` set to the last seq returned.
 - **`limit`** defaults to 50, as in HISTORY.
 - The same rules about who may read apply as for HISTORY (7.2).
@@ -1603,7 +1631,8 @@ NOTIFY <tag> <reason> <unread>
 
 The body is one line in the format of Section 3, ending with LF.
 `<reason>` is `dm`, `mention`, `reply` or `read`, and `<unread>` is the
-unread count. Later versions may add reasons. A gateway forwards a
+unread count. A reason is 1 to 32 characters of `a-z`, `0-9` and `-`.
+Later versions may add reasons. A gateway forwards a
 NOTIFY with a reason it does not know unchanged, and an app treats it as
 new activity: it connects and syncs as for any other push.
 
@@ -1788,6 +1817,9 @@ ADMIN SET <key> [<value...>]
 | `retention` | a number of days, or `forever` | The server's retention period (7.5) |
 | `welcome` | any text up to 512 bytes | The message in the greeting (4.1) |
 
+As in 6.2, keyword and number values ignore trailing spaces, and the
+welcome text keeps them.
+
 - Changes take effect immediately and show in INFO (8.5).
 - Shortening `retention` also applies to events already stored.
 - Settings not listed here are left to the server's configuration.
@@ -1836,7 +1868,7 @@ allowed before GUEST, AUTH or REGISTER.
 |---|---|---|---|
 | `INFO [<room>]` | 8.5, 6.2 | without a room | yes |
 | `GUEST <name>` | 4.2 | yes | – |
-| `AUTH <uid> <signature>` | 4.5 | yes | – |
+| `AUTH <identity> <signature>` | 4.5 | yes | – |
 | `REGISTER <name> <key> <signature>` | 4.6 | yes | – |
 | `KEY LIST` / `KEY ADD <key> [<label...>]` / `KEY DEL <key>` | 4.7 | | no |
 | `UNREGISTER <uid> [purge=]` | 4.8 | | no |
@@ -1878,7 +1910,7 @@ Lines a server can send:
 | `RISALA <version> <host> <nonce> [<message...>]` | greeting | 4.1 |
 | `OK [<key>=<value> ...]` / `ERR <code> [<message...>]` | final response | 3.6 |
 | `MSG` `DELETE` `JOIN` `PART` `INVITE` `KICK` `BAN` `UNBAN` `SET` `ROLE` | events; `SET`, `BAN` and `ROLE` also as snapshots | 5.2, 6 |
-| `ROOM <room> <members> [<topic...>]` | response to LIST | 6.1 |
+| `ROOM <room> <members> [<topic...>]` | response to LIST and ADMIN ROOMS | 6.1, 10.4 |
 | `CONV <conv> <id> <head> <read>` | response to SYNC | 7.1 |
 | `MEMBER <room> <uid> <role> <presence> [<name...>]` | response to MEMBERS | 8.3 |
 | `USER <uid> <presence> [<name...>]` | response to WHOIS | 8.3 |
@@ -1886,7 +1918,7 @@ Lines a server can send:
 | `BLOCK <target>` | response to BLOCKS | 5.7 |
 | `REPORT <conv> <seq> [<reason...>]`, then the reported event | a report, live or in response to REPORTS | 5.8 |
 | `RESOLVED <id>` | a report was resolved | 5.8 |
-| `KEY <key> [<label...>]` | response to KEY LIST | 4.7 |
+| `KEY <key> [<label...>]` | response to KEY LIST and ADMIN KEYS | 4.7, 10.5 |
 | `PUSH <url> <tag>` | response to PUSH LIST | 9.1 |
 | `READ <conv> <seq>` | read marker from your other devices | 7.4 |
 | `TYPING <conv>` / `NAME [<name...>]` | not stored | 8.1, 8.2 |

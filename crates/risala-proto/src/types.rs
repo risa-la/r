@@ -52,7 +52,8 @@ pub const DEFAULT_LIST_LIMIT: u64 = 100;
 
 /// Parses a non-negative decimal number in canonical form, as used by
 /// options and results such as `limit=`, `members`, `hours=` and `size`
-/// (3.3). Only ASCII digits, and no leading zeros except for `0` itself.
+/// (3.3). Only ASCII digits, no leading zeros except for `0` itself, and
+/// at most 2^63-1.
 pub fn parse_u64(s: &str) -> Result<u64, ParseError> {
     let b = s.as_bytes();
     if b.is_empty() || !b.iter().all(u8::is_ascii_digit) {
@@ -61,8 +62,11 @@ pub fn parse_u64(s: &str) -> Result<u64, ParseError> {
     if b.len() > 1 && b[0] == b'0' {
         return Err(ParseError::BadSyntax("a number has no leading zeros"));
     }
-    s.parse()
-        .map_err(|_| ParseError::BadSyntax("number is out of range"))
+    match s.parse::<u64>() {
+        // Numbers go up to 2^63-1 (3.3), like seqs.
+        Ok(n) if n <= i64::MAX as u64 => Ok(n),
+        _ => Err(ParseError::BadSyntax("number is out of range")),
+    }
 }
 
 /// Parses a number of days, at least 1, for the `retention` settings (6.2,
@@ -1093,7 +1097,9 @@ mod tests {
     fn numbers() {
         assert_eq!(parse_u64("0"), Ok(0));
         assert_eq!(parse_u64("50"), Ok(50));
-        assert_eq!(parse_u64("18446744073709551615"), Ok(u64::MAX));
+        assert_eq!(parse_u64("9223372036854775807"), Ok(i64::MAX as u64));
+        assert!(is_syntax(parse_u64("9223372036854775808")));
+        assert!(is_syntax(parse_u64("18446744073709551615")));
         for s in [
             "",
             "00",
