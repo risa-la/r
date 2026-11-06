@@ -78,9 +78,10 @@ where
 // ---------------------------------------------------------------------------
 // Generators for 3.5
 
-/// `name = alnum *31( alnum / "." / "_" / "-" )`.
+/// `name = alnum [ *30( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]`:
+/// never ends with `.`.
 fn name() -> impl Strategy<Value = String> {
-    "[a-z0-9][a-z0-9._-]{0,31}"
+    "[a-z0-9]([a-z0-9._-]{0,30}[a-z0-9_-])?"
 }
 
 /// `label = alnum [ *61( alnum / "-" ) alnum ]`, mostly short.
@@ -92,10 +93,16 @@ fn label() -> impl Strategy<Value = String> {
     ]
 }
 
-/// `domain = label 1*( "." label )`, at most 253 characters.
+/// `domain = label 1*( "." label )`, at most 253 characters, with a last
+/// label that is not all digits.
 fn domain() -> impl Strategy<Value = String> {
-    vec(label(), 2..5)
-        .prop_map(|labels| labels.join("."))
+    (vec(label(), 1..4), "[a-z0-9-]{0,8}[a-z][a-z0-9-]{0,8}")
+        .prop_map(|(mut labels, last)| {
+            // The last label starts and ends with alnum and has a letter.
+            let last = format!("{}a", last.trim_matches('-'));
+            labels.push(last);
+            labels.join(".")
+        })
         .prop_filter("a domain has at most 253 characters", |d| d.len() <= 253)
 }
 
@@ -111,9 +118,9 @@ fn uid() -> impl Strategy<Value = String> {
     prop_oneof![guest(), identity()]
 }
 
-/// `room = "#" alnum *63( alnum / "." / "_" / "-" )`.
+/// `room = "#" alnum [ *62( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]`.
 fn room() -> impl Strategy<Value = String> {
-    "#[a-z0-9][a-z0-9._-]{0,63}"
+    "#[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9_-])?"
 }
 
 /// `id = 1*64( alnum / "-" / "_" )`.
@@ -252,8 +259,8 @@ proptest! {
     /// `ERR too-long` (3.5).
     #[test]
     fn long_names_are_too_long(
-        name in "[a-z0-9][a-z0-9._-]{32,40}",
-        room in "#[a-z0-9][a-z0-9._-]{64,70}",
+        name in "[a-z0-9][a-z0-9._-]{31,39}[a-z0-9_-]",
+        room in "#[a-z0-9][a-z0-9._-]{63,69}[a-z0-9_-]",
         id in "[a-z0-9_-]{65,70}",
         label in "[a-z0-9][a-z0-9-]{62,66}[a-z0-9]",
     ) {
@@ -451,11 +458,13 @@ fn input() -> impl Strategy<Value = String> {
 }
 
 /// What `escape` documents it keeps: CRLF, CR and LF each become one LF,
-/// TAB stays and other ASCII control characters go.
+/// TAB stays and other control characters, C1 included, go.
 fn normalise(s: &str) -> String {
     let s = s.replace("\r\n", "\n").replace('\r', "\n");
     s.chars()
-        .filter(|&c| c == '\n' || c == '\t' || !c.is_ascii_control())
+        .filter(|&c| {
+            c == '\n' || c == '\t' || !(c.is_ascii_control() || ('\u{80}'..='\u{9f}').contains(&c))
+        })
         .collect()
 }
 

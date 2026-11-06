@@ -34,19 +34,18 @@ fn config(cases: u32) -> ProptestConfig {
 // ---------------------------------------------------------------------------
 // Generators
 
-/// A character from `UTF8-nonascii` (3.1), with a few interesting ones
-/// (C1 control, no-break space, line separator, BOM, RTL, emoji) weighted
-/// up.
+/// A character from `UTF8-nonascii` (3.1) that lines allow, so not a C1
+/// control (2.3), with a few interesting ones (no-break space, line
+/// separator, BOM, RTL, emoji) weighted up.
 fn non_ascii() -> impl Strategy<Value = char> {
     prop_oneof![
         Just('é'),
-        Just('\u{85}'),
         Just('\u{a0}'),
         Just('\u{2028}'),
         Just('\u{feff}'),
         Just('م'),
         Just('👋'),
-        any::<char>().prop_filter("non-ASCII", |c| !c.is_ascii()),
+        any::<char>().prop_filter("non-ASCII, not C1", |c| !c.is_ascii() && !is_c1(*c)),
     ]
 }
 
@@ -130,14 +129,15 @@ fn token() -> impl Strategy<Value = String> {
     vec(c, 1..10).prop_map(String::from_iter)
 }
 
-/// An option key as `LineBuilder::option` takes it: a token without `=`.
+/// An option key (3.3) as `LineBuilder::option` takes it: `a-z 0-9 -`
+/// once folded, so upper case is allowed too.
 fn option_key() -> impl Strategy<Value = String> {
-    token().prop_map(|t| t.replace('=', "k"))
+    "[a-zA-Z0-9-]{1,8}"
 }
 
-/// An option value: token characters, possibly empty, `=` allowed.
+/// An option value (3.3): a non-empty token, `=` allowed.
 fn option_value() -> impl Strategy<Value = String> {
-    prop_oneof![1 => Just(String::new()), 4 => token()]
+    token()
 }
 
 /// Text (3.3): anything allowed in a line, often with leading spaces.
@@ -413,10 +413,14 @@ proptest! {
 // ---------------------------------------------------------------------------
 // LineDecoder
 
-/// The 2.3 control characters, checked on bytes. In valid UTF-8 these
-/// bytes only ever stand for themselves.
-fn is_control_byte(b: u8) -> bool {
-    matches!(b, 0x00..=0x08 | 0x0A..=0x1F | 0x7F)
+/// The C1 controls, U+0080 to U+009F (2.3).
+fn is_c1(c: char) -> bool {
+    ('\u{80}'..='\u{9f}').contains(&c)
+}
+
+/// The 2.3 control characters: %x00-08, %x0A-1F, %x7F and C1.
+fn is_control_char(c: char) -> bool {
+    matches!(c, '\u{00}'..='\u{08}' | '\u{0a}'..='\u{1f}' | '\u{7f}') || is_c1(c)
 }
 
 /// What `LineDecoder` should yield for a whole stream: the results, the
@@ -437,7 +441,7 @@ fn reference(input: &[u8], max_len: usize) -> (Vec<Result<String, ParseError>>, 
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             match std::str::from_utf8(line) {
                 Err(_) => Err(ParseError::InvalidUtf8),
-                Ok(_) if line.iter().any(|&b| is_control_byte(b)) => Err(ParseError::ControlChar),
+                Ok(s) if s.chars().any(is_control_char) => Err(ParseError::ControlChar),
                 Ok(s) => Ok(s.to_owned()),
             }
         });
