@@ -214,6 +214,65 @@ keywords! {
     error = "a push reason is dm, mention, reply or read";
 }
 
+/// The `<reason>` of a NOTIFY line as received (9.3): a [`PushReason`],
+/// or a reason from a later version of the protocol. Gateways forward a
+/// NOTIFY with an unknown reason unchanged, and apps treat it as new
+/// activity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NotifyReason {
+    /// A reason this crate knows.
+    Known(PushReason),
+    /// Any other reason: one token, folded to lower case.
+    Other(String),
+}
+
+impl NotifyReason {
+    /// The reason as written on the wire (9.3).
+    pub fn as_str(&self) -> &str {
+        match self {
+            NotifyReason::Known(reason) => reason.as_str(),
+            NotifyReason::Other(reason) => reason,
+        }
+    }
+
+    /// The known reason, if it is one.
+    pub fn known(&self) -> Option<PushReason> {
+        match self {
+            NotifyReason::Known(reason) => Some(*reason),
+            NotifyReason::Other(_) => None,
+        }
+    }
+}
+
+impl From<PushReason> for NotifyReason {
+    fn from(reason: PushReason) -> NotifyReason {
+        NotifyReason::Known(reason)
+    }
+}
+
+impl fmt::Display for NotifyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NotifyReason {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<NotifyReason, ParseError> {
+        if let Ok(reason) = s.parse::<PushReason>() {
+            return Ok(NotifyReason::Known(reason));
+        }
+        if !is_token(s) {
+            return Err(ParseError::BadSyntax("a push reason is one token"));
+        }
+        if s.len() > MAX_TAG_TOKEN {
+            return Err(ParseError::TooLong);
+        }
+        Ok(NotifyReason::Other(s.to_ascii_lowercase()))
+    }
+}
+
 /// The `role=` result of `INFO <room>` (6.2): a [`Role`], or `none` for
 /// someone who is neither a member nor holds a role. `InfoRole(None)` is
 /// `none`.
@@ -962,6 +1021,20 @@ impl AsRef<str> for MediaType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_reasons() {
+        assert_eq!(
+            "Mention".parse::<NotifyReason>(),
+            Ok(NotifyReason::Known(PushReason::Mention))
+        );
+        let other: NotifyReason = "Invite".parse().unwrap();
+        assert_eq!(other, NotifyReason::Other("invite".into()));
+        assert_eq!(other.to_string(), "invite");
+        assert_eq!(other.known(), None);
+        assert!("a b".parse::<NotifyReason>().is_err());
+        assert!("".parse::<NotifyReason>().is_err());
+    }
 
     #[test]
     fn push_url_limit() {

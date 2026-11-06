@@ -259,15 +259,13 @@ Settled (now in SPEC.md):
    - PUSH URLs are at most 512 bytes.
    - CONNECTION's `<address>` is an IP address with an optional port.
 
-Still open:
+9. **Decided later** (6.1, 6.2, 9.3, 10.4).
+   - Room retention stays at least 1 day.
+   - LIST and ADMIN ROOMS page by room name with `after=` and `limit=`,
+     and reply `OK more=<0 or 1>`.
+   - A NOTIFY with an unknown reason counts as new activity.
 
-9. **Retention of 0 days.** Should `retention 0` mean "keep nothing", or
-   should the minimum stay at 1 day?
-10. **LIST paging.** LIST has no paging, which matters on a large
-    server.
-11. **New push reasons.** NOTIFY has no rule for reasons a future
-    version adds. Gateways and apps could treat an unknown reason as
-    generic new activity.
+Nothing is open right now.
 
 ## 6. Open decisions
 

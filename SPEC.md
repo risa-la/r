@@ -1038,13 +1038,20 @@ resolve it.
 ### 6.1. Joining and Leaving
 
 ```
-LIST
+LIST [after=<room>] [limit=<n>]
 ```
 
 → one `ROOM <room> <members> [<topic...>]` line per public room (6.2),
-then `OK`
+then `OK more=<0 or 1>`
 
-`<members>` is the number of members.
+- `<members>` is the number of members.
+- Rooms come in order of name, compared byte by byte.
+- **`after`** returns only rooms whose names sort after `<room>`, which
+  need not exist. To fetch the next page, send LIST again with `after`
+  set to the last room returned.
+- **`limit`** is at least 1 and defaults to 100. A server MAY return
+  fewer rooms than asked for. `more=1` means there are more rooms after
+  the last one returned.
 
 ```
 JOIN <room>
@@ -1596,7 +1603,9 @@ NOTIFY <tag> <reason> <unread>
 
 The body is one line in the format of Section 3, ending with LF.
 `<reason>` is `dm`, `mention`, `reply` or `read`, and `<unread>` is the
-unread count.
+unread count. Later versions may add reasons. A gateway forwards a
+NOTIFY with a reason it does not know unchanged, and an app treats it as
+new activity: it connects and syncs as for any other push.
 
 When sending a push, the server:
 
@@ -1710,14 +1719,15 @@ ADMIN NOTICE <message...>
 ### 10.4. Rooms and Content
 
 ```
-ADMIN ROOMS
+ADMIN ROOMS [after=<room>] [limit=<n>]
 ADMIN DROP <room> [<reason...>]
 ADMIN PURGE <uid> [hours=<n>]
 ADMIN REPORTS
 ```
 
 - **`ADMIN ROOMS`** lists every room, private ones included, as
-  `ROOM <room> <members> [<topic...>]` lines (6.1), then OK.
+  `ROOM <room> <members> [<topic...>]` lines, then `OK more=<0 or 1>`.
+  It pages like LIST (6.1).
 - **`ADMIN DROP`** deletes a room together with all of its events and
   files. This cannot be undone.
   - Every member is removed from the room, as if kicked. The room's
@@ -1832,7 +1842,7 @@ allowed before GUEST, AUTH or REGISTER.
 | `UNREGISTER <uid> [purge=]` | 4.8 | | no |
 | `MSG <conv> <text...>` | 5.3 | | rooms only |
 | `DELETE <conv> <seq>` | 5.4 | | yes |
-| `LIST` | 6.1 | | yes |
+| `LIST [after=] [limit=]` | 6.1 | | yes |
 | `JOIN <room>` | 6.1 | | yes |
 | `PART <room> [<reason...>]` | 6.1 | | yes |
 | `SET <room> <key> [<value...>]` | 6.2 | | no |
@@ -1855,7 +1865,7 @@ allowed before GUEST, AUTH or REGISTER.
 | `ADMIN OPS` / `OP <uid>` / `DEOP <uid>` | 10.1 | | no |
 | `ADMIN BAN <target> [<reason...>]` / `UNBAN <target>` / `BANS` | 10.2 | | no |
 | `ADMIN WHO` / `DISCONNECT <uid> [<reason...>]` / `NOTICE <message...>` | 10.3 | | no |
-| `ADMIN ROOMS` / `DROP <room> [<reason...>]` / `PURGE <uid> [hours=]` / `REPORTS` | 10.4, 5.8 | | no |
+| `ADMIN ROOMS [after=] [limit=]` / `DROP <room> [<reason...>]` / `PURGE <uid> [hours=]` / `REPORTS` | 10.4, 5.8 | | no |
 | `ADMIN KEYS <uid>` / `ADDKEY <uid> <key> [<label...>]` / `DELKEY <uid> <key>` / `UNREGISTER <uid>` | 10.5 | | no |
 | `ADMIN SET <key> [<value...>]` | 10.6 | | no |
 | `PING [<token>]` / `PONG <token>` | 11 | yes | yes |

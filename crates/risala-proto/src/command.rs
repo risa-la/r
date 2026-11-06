@@ -324,8 +324,9 @@ pub enum Command {
     },
 
     // ---- 6. Rooms ----
-    /// `LIST` (6.1): list public rooms.
-    List,
+    /// `LIST [after=<room>] [limit=<n>]` (6.1): list public rooms, a page
+    /// at a time.
+    List(RoomPage),
     /// `JOIN <room>` (6.1).
     Join {
         /// The room.
@@ -585,8 +586,9 @@ pub enum AdminCommand {
         /// The message, escaped, never empty.
         message: String,
     },
-    /// `ADMIN ROOMS` (10.4): list every room.
-    Rooms,
+    /// `ADMIN ROOMS [after=<room>] [limit=<n>]` (10.4): list every room, a
+    /// page at a time.
+    Rooms(RoomPage),
     /// `ADMIN DROP <room> [<reason...>]` (10.4): delete a room.
     Drop {
         /// The room.
@@ -660,7 +662,7 @@ impl Command {
             Command::Report { .. } => "REPORT",
             Command::Reports { .. } => "REPORTS",
             Command::Resolve { .. } => "RESOLVE",
-            Command::List => "LIST",
+            Command::List(_) => "LIST",
             Command::Join { .. } => "JOIN",
             Command::Part { .. } => "PART",
             Command::Set { .. } => "SET",
@@ -724,7 +726,7 @@ impl Command {
             Command::Msg { conv, .. } => conv.is_room(),
             Command::Info { .. }
             | Command::Delete { .. }
-            | Command::List
+            | Command::List(_)
             | Command::Join { .. }
             | Command::Part { .. }
             | Command::Roles { .. }
@@ -805,7 +807,7 @@ impl AdminCommand {
             AdminCommand::Who => "WHO",
             AdminCommand::Disconnect { .. } => "DISCONNECT",
             AdminCommand::Notice { .. } => "NOTICE",
-            AdminCommand::Rooms => "ROOMS",
+            AdminCommand::Rooms(_) => "ROOMS",
             AdminCommand::Drop { .. } => "DROP",
             AdminCommand::Purge { .. } => "PURGE",
             AdminCommand::Reports => "REPORTS",
@@ -945,10 +947,7 @@ impl Command {
                 Command::Delete { conv, seq }
             }
             // 6.1
-            "LIST" => {
-                p.end()?;
-                Command::List
-            }
+            "LIST" => Command::List(RoomPage::parse(p)?),
             "JOIN" => Command::Join { room: last(p)? },
             "PART" => {
                 let room = tok(&mut p)?;
@@ -1221,10 +1220,7 @@ impl AdminCommand {
                 message: required_text(p, "ADMIN NOTICE needs a message")?,
             },
             // 10.4
-            "ROOMS" => {
-                p.end()?;
-                AdminCommand::Rooms
-            }
+            "ROOMS" => AdminCommand::Rooms(RoomPage::parse(p)?),
             "DROP" => {
                 let room = tok(&mut p)?;
                 AdminCommand::Drop {
@@ -1352,7 +1348,8 @@ impl Command {
             Command::Block { target } | Command::Unblock { target } => {
                 b.token(target);
             }
-            Command::Blocks | Command::List | Command::Sync => {}
+            Command::Blocks | Command::Sync => {}
+            Command::List(page) => page.write(b),
             Command::Reports { room }
             | Command::Join { room }
             | Command::Roles { room }
@@ -1438,6 +1435,37 @@ impl Command {
 }
 
 /// Writes `after=`, `before=` and `limit=` in that order (7.2, 7.3).
+/// The paging options of LIST and ADMIN ROOMS (6.1, 10.4).
+///
+/// Rooms come in order of name. `after` asks for the rooms whose names
+/// sort after it; the room need not exist. `limit` is at least 1.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoomPage {
+    /// Only rooms whose names sort after this one.
+    pub after: Option<Room>,
+    /// The most rooms to return. The server picks a default if `None`.
+    pub limit: Option<NonZeroU64>,
+}
+
+impl RoomPage {
+    fn parse(p: Params<'_>) -> Result<RoomPage, ParseError> {
+        let options = options(p, &["after", "limit"])?;
+        Ok(RoomPage {
+            after: options.get("after").map(str::parse).transpose()?,
+            limit: positive_opt(&options, "limit")?,
+        })
+    }
+
+    fn write(&self, b: &mut LineBuilder) {
+        if let Some(after) = &self.after {
+            b.option("after", after);
+        }
+        if let Some(limit) = self.limit {
+            b.option("limit", limit);
+        }
+    }
+}
+
 fn write_after_limit(
     b: &mut LineBuilder,
     after: Option<u64>,
@@ -1459,11 +1487,8 @@ impl AdminCommand {
     /// Adds the parameters after the subcommand word.
     fn write(&self, b: &mut LineBuilder) {
         match self {
-            AdminCommand::Ops
-            | AdminCommand::Bans
-            | AdminCommand::Who
-            | AdminCommand::Rooms
-            | AdminCommand::Reports => {}
+            AdminCommand::Ops | AdminCommand::Bans | AdminCommand::Who | AdminCommand::Reports => {}
+            AdminCommand::Rooms(page) => page.write(b),
             AdminCommand::Op { uid }
             | AdminCommand::Deop { uid }
             | AdminCommand::Keys { uid }
@@ -1638,8 +1663,28 @@ mod tests {
     }
 
     #[test]
+    fn list_paging() {
+        assert_eq!(rt("LIST").command, Command::List(RoomPage::default()));
+        let c = rt("LIST after=#general limit=20").command;
+        assert_eq!(
+            c,
+            Command::List(RoomPage {
+                after: Some(room("#general")),
+                limit: NonZeroU64::new(20),
+            })
+        );
+        canon("list limit=5 after=#General", "LIST after=#general limit=5");
+        rt("ADMIN ROOMS after=#a limit=1");
+        is_syntax("LIST limit=0");
+        is_syntax("LIST after=general");
+        is_syntax("LIST before=#a");
+        is_syntax("LIST #a");
+        is_syntax("ADMIN ROOMS limit=0");
+    }
+
+    #[test]
     fn display_and_from() {
-        let r: Request = Command::List.into();
+        let r: Request = Command::List(RoomPage::default()).into();
         assert_eq!(r.to_string(), "LIST");
         assert_eq!(Request::new(Command::Sync).ref_, None);
     }

@@ -90,7 +90,7 @@ use crate::names::{BlockTarget, Conv, Domain, Id, Room, Seq, ServerBanTarget, Ui
 use crate::time::Timestamp;
 use crate::types::{
     FileUrl, InfoRole, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, MAX_TOPIC, MediaType,
-    Presence, PushReason, PushTag, PushUrl, Ref, Relation, Role, RoomSetting, ServerRetention,
+    NotifyReason, Presence, PushTag, PushUrl, Ref, Relation, Role, RoomSetting, ServerRetention,
     parse_u64, parse_yes_no,
 };
 
@@ -1842,10 +1842,10 @@ impl Report {
 ///
 /// ```
 /// use risala_proto::server::Notify;
-/// use risala_proto::types::PushReason;
+/// use risala_proto::types::{NotifyReason, PushReason};
 ///
 /// let notify: Notify = "NOTIFY x7Hq2 mention 3\n".parse()?;
-/// assert_eq!(notify.reason, PushReason::Mention);
+/// assert_eq!(notify.reason, NotifyReason::Known(PushReason::Mention));
 /// assert_eq!(notify.to_body(), "NOTIFY x7Hq2 mention 3\n");
 /// # Ok::<(), risala_proto::error::ParseError>(())
 /// ```
@@ -1853,8 +1853,9 @@ impl Report {
 pub struct Notify {
     /// The registration's tag, chosen by the client (9.1).
     pub tag: PushTag,
-    /// Why the push was sent (9.2).
-    pub reason: PushReason,
+    /// Why the push was sent (9.2). A reason from a later version is kept
+    /// as [`NotifyReason::Other`]; apps treat it as new activity (9.3).
+    pub reason: NotifyReason,
     /// The account's unread count (9.2).
     pub unread: u64,
 }
@@ -1882,7 +1883,7 @@ impl Notify {
     pub fn to_line(&self) -> Line {
         Line::builder("NOTIFY")
             .token(&self.tag)
-            .token(self.reason)
+            .token(&self.reason)
             .token(self.unread)
             .build()
             .expect("a push tag, reason and count are tokens")
@@ -1918,6 +1919,7 @@ impl FromStr for Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PushReason;
 
     #[test]
     fn deleted_message_has_no_file_and_blank_text_is_empty() {
@@ -2962,15 +2964,19 @@ mod tests {
         for reason in PushReason::ALL {
             let s = format!("NOTIFY x7Hq2 {reason} 3");
             let n: Notify = s.parse().unwrap();
-            assert_eq!(n.reason, *reason);
+            assert_eq!(n.reason, NotifyReason::Known(*reason));
             assert_eq!(n.to_string(), s);
             assert_eq!(n.to_body(), format!("{s}\n"));
             assert_eq!(Notify::parse(&n.to_line()), Ok(n));
         }
         let n: Notify = "notify Tag-1 DM 0\r\n".parse().unwrap();
         assert_eq!(n.tag.as_str(), "Tag-1");
-        assert_eq!(n.reason, PushReason::Dm);
+        assert_eq!(n.reason, NotifyReason::Known(PushReason::Dm));
         assert_eq!(n.unread, 0);
+        // A reason from a later version is kept (9.3).
+        let later: Notify = "NOTIFY t Invite 2".parse().unwrap();
+        assert_eq!(later.reason, NotifyReason::Other("invite".into()));
+        assert_eq!(later.to_string(), "NOTIFY t invite 2");
         assert_eq!(n.to_body(), "NOTIFY Tag-1 dm 0\n");
         let n: Notify = "@x=1 NOTIFY t read 12".parse().unwrap();
         assert_eq!(n.unread, 12);
@@ -2981,7 +2987,6 @@ mod tests {
         for b in [
             "NOTIFY t dm",
             "NOTIFY t dm 1 2",
-            "NOTIFY t why 1",
             "NOTIFY t dm -1",
             "NOTIFY t dm 01",
             "NOTIFY t dm 1\n\n",
