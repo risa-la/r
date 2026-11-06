@@ -34,6 +34,9 @@ pub mod text;
 pub mod time;
 pub mod types;
 
+#[cfg(kani)]
+mod proofs;
+
 /// The protocol version this crate implements, as sent in the greeting (4.1).
 pub const PROTOCOL_VERSION: u32 = 1;
 

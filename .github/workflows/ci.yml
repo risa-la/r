@@ -15,3 +15,13 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - name: nix flake check
         run: nix flake check -L
+
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: cargo kani
+        uses: model-checking/kani-github-action@v1
+        with:
+          args: -p risala-proto -j 2 --output-format terse -Z unstable-options --harness-timeout 2m

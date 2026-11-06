@@ -1215,3 +1215,111 @@ mod tests {
         assert!(!is_valid_uid(b"~Sam"));
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn any_bytes<const N: usize>() -> ([u8; N], usize) {
+        let bytes: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        (bytes, len)
+    }
+
+    fn alnum(b: u8) -> bool {
+        b.is_ascii_digit() || (b'a'..=b'z').contains(&b)
+    }
+
+    /// `alnum [ *( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]`,
+    /// without the length limit.
+    fn spec_name(s: &[u8]) -> bool {
+        match s {
+            [] => false,
+            [a] => alnum(*a),
+            [a, mid @ .., z] => {
+                alnum(*a)
+                    && mid
+                        .iter()
+                        .all(|&b| alnum(b) || b == b'.' || b == b'_' || b == b'-')
+                    && (alnum(*z) || *z == b'_' || *z == b'-')
+            }
+        }
+    }
+
+    /// `alnum [ *( alnum / "-" ) alnum ]`, without the length limit.
+    fn spec_label(s: &[u8]) -> bool {
+        match s {
+            [] => false,
+            [a] => alnum(*a),
+            [a, mid @ .., z] => {
+                alnum(*a) && alnum(*z) && mid.iter().all(|&b| alnum(b) || b == b'-')
+            }
+        }
+    }
+
+    /// For any bytes and any limit, `name_shape` accepts the grammar, says
+    /// "too long" only for a well-formed name over the limit, and so never
+    /// accepts a name ending in `.`.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn name_shape_matches_grammar() {
+        let (b, len) = any_bytes::<6>();
+        let s = &b[..len];
+        let max: usize = kani::any();
+        match name_shape(s, max) {
+            Ok(fits) => {
+                assert!(spec_name(s));
+                assert_eq!(fits, s.len() <= max);
+                assert!(s.last() != Some(&b'.'));
+            }
+            Err(_) => {
+                assert!(!spec_name(s));
+            }
+        }
+    }
+
+    /// `label_shape` accepts the grammar of `label`. Labels this short
+    /// always fit, so it never says "too long".
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn label_shape_matches_grammar() {
+        let (b, len) = any_bytes::<6>();
+        let s = &b[..len];
+        match label_shape(s) {
+            Ok(fits) => {
+                assert!(fits && spec_label(s));
+            }
+            Err(_) => {
+                assert!(!spec_label(s));
+            }
+        }
+    }
+
+    /// `room_shape` is `"#" name`, and `id_shape` is
+    /// `1*( alnum / "-" / "_" )`.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn room_and_id_shapes_match_grammar() {
+        let (b, len) = any_bytes::<6>();
+        let s = &b[..len];
+        let room = matches!(s, [b'#', rest @ ..] if spec_name(rest));
+        match room_shape(s) {
+            Ok(fits) => {
+                assert!(fits && room);
+            }
+            Err(_) => {
+                assert!(!room);
+            }
+        }
+        let id = !s.is_empty() && s.iter().all(|&b| alnum(b) || b == b'-' || b == b'_');
+        match id_shape(s) {
+            Ok(fits) => {
+                assert!(fits && id);
+            }
+            Err(_) => {
+                assert!(!id);
+            }
+        }
+    }
+}

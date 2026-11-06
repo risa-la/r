@@ -29,6 +29,8 @@ proptest = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# Kani proofs (crates/risala-proto/src/proofs.rs) build under cfg(kani).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

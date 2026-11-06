@@ -78,6 +78,43 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
+### Model checking with Kani
+
+`risala-proto` has [Kani](https://model-checking.github.io/kani/) proofs
+in `crates/risala-proto/src/proofs.rs`, plus a few at the end of
+`time.rs` and `names.rs` that need private functions. Each proof checks
+a property for every input within small bounds: every IP prefix and
+address, every day from 1970 to 9999, every name of a few bytes. Only
+proofs that finish in under a minute are kept. CI runs them in the
+`kani` job.
+
+Kani is not in nixpkgs. Its release bundle and the nightly toolchain it
+downloads are ordinary Linux binaries, which run on NixOS through
+nix-ld. Install them somewhere outside the repository, so nothing global
+changes:
+
+```
+export CARGO_HOME=~/.cache/risala-kani/cargo
+export RUSTUP_HOME=~/.cache/risala-kani/rustup
+export KANI_HOME=~/.cache/risala-kani/kani-home
+export PATH=$CARGO_HOME/bin:$PATH
+nix shell nixpkgs#rustup -c sh -c \
+  'rustup toolchain install stable --profile minimal &&
+   cargo install --locked kani-verifier &&
+   cargo kani setup'
+```
+
+Then, with the same variables set, from the repository root:
+
+```
+cargo kani -p risala-proto -j 2 --output-format terse -Z unstable-options --harness-timeout 2m
+cargo kani -p risala-proto --harness proofs::ip_prefix_v6
+```
+
+The full run takes about two minutes. Keep `-j` small: each proof runs
+its own solver, which can use several gigabytes of memory, and an
+unbounded `-j` can overload a machine.
+
 ## Trying a server by hand
 
 [Appendix A of the spec](SPEC.md#appendix-a-using-risala-by-hand) shows

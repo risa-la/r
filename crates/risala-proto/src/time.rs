@@ -383,3 +383,46 @@ mod tests {
         assert_eq!(ts(&now.to_string()), now);
     }
 }
+
+/// Kani proofs for the calendar arithmetic. They need the private
+/// `days_from_civil` and `civil_from_days`. Run with
+/// `cargo kani -p risala-proto`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The last day number in range: 9999-12-31.
+    const MAX_DAY: i64 = (Timestamp::MAX.0 / MS_PER_DAY) as i64;
+
+    /// The length of a month, written without the code under test.
+    fn month_len(year: i64, month: i64) -> i64 {
+        const LENGTHS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = year % 400 == 0 || (year % 100 != 0 && year % 4 == 0);
+        if month == 2 && leap {
+            29
+        } else {
+            LENGTHS[(month - 1) as usize]
+        }
+    }
+
+    /// Every day number in range maps to a real date in range, and back.
+    #[kani::proof]
+    fn civil_from_days_is_valid_and_inverse() {
+        let days: i64 = kani::any();
+        kani::assume((0..=MAX_DAY).contains(&days));
+        let (y, m, d) = civil_from_days(days);
+        assert!((1970..=9999).contains(&y));
+        assert!((1..=12).contains(&m));
+        assert!(d >= 1 && d <= month_len(y, m));
+        assert_eq!(days_from_civil(y, m, d), days);
+    }
+
+    /// `days_in_month` agrees with the table above.
+    #[kani::proof]
+    fn days_in_month_matches_table() {
+        let (y, m): (i64, i64) = (kani::any(), kani::any());
+        kani::assume((1970..=9999).contains(&y));
+        kani::assume((1..=12).contains(&m));
+        assert_eq!(days_in_month(y, m), month_len(y, m));
+    }
+}
