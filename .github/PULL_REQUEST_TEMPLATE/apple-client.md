@@ -16,8 +16,8 @@
 <!-- Capture and inspect the running app's final UI on iPhone and macOS.
      Use real app state; do not add seeded data for screenshots.
      Recapture affected screens after further UI edits.
-     Upload PNGs by dropping them into GitHub's PR description editor, then
-     verify the hosted images render inline. Keep PNGs out of tracked source.
+     Attach PNGs with `gh pr create/edit --attach` or the GitHub editor.
+     Verify they render inline; keep PNGs out of tracked source.
      If upload or a runtime is unavailable, explicitly report what is pending.
      Label each image with device, OS version, and screen/state.
      Include before/after for existing screens when practical.

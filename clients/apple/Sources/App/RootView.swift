@@ -1,6 +1,9 @@
 import SwiftUI
 
 struct RootView: View {
+    #if os(iOS)
+        @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     @State private var rooms: RoomsViewModel
     @State private var conversation: ConversationViewModel
     @State private var selectedRoomID: Room.ID?
@@ -13,8 +16,10 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView {
-            RoomsView(model: rooms, selection: $selectedRoomID)
-                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
+            RoomsView(model: rooms, selection: $selectedRoomID, showsStatus: isCompact) {
+                reloadID += 1
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
         } detail: {
             detail
         }
@@ -24,33 +29,21 @@ struct RootView: View {
         .task(id: reloadID) { await rooms.load() }
     }
 
+    private var isCompact: Bool {
+        #if os(iOS)
+            horizontalSizeClass == .compact
+        #else
+            false
+        #endif
+    }
+
     @ContentBuilder
     private var detail: some View {
         switch rooms.state {
-        case .disconnected:
-            ContentUnavailableView(
-                "Not connected",
-                systemImage: "network.slash",
-                description: Text("Your rooms will appear when connected to a server.")
-            )
-        case .loading:
-            ProgressView("Loading rooms…")
-        case .failed:
-            ContentUnavailableView {
-                Label("Unable to load rooms", systemImage: "exclamationmark.triangle")
-            } description: {
-                Text("Please try again.")
-            } actions: {
-                Button("Try again") { reloadID += 1 }
-            }
-        case .empty:
-            ContentUnavailableView(
-                "No rooms",
-                systemImage: "bubble.left.and.bubble.right",
-                description: Text("Your rooms will appear here.")
-            )
         case .loaded:
             ConversationView(model: conversation)
+        default:
+            RoomsStatusView(state: rooms.state) { reloadID += 1 }
         }
     }
 }

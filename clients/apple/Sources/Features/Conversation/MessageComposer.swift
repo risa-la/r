@@ -9,19 +9,19 @@ struct MessageComposer: View {
     @FocusState private var composerFocused: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: Layout.relatedContentSpacing) {
             if sendFailed {
                 HStack {
                     Text("Unable to send message.")
                     Button("Try again") { send() }
                         .disabled(!canSend)
                 }
-                .padding(.horizontal)
             }
             HStack(alignment: .bottom) {
                 TextField("Message \(roomName)", text: $draft, axis: .vertical)
                     .font(Typography.composer)
-                    .lineLimit(1...5).textFieldStyle(.roundedBorder)
+                    .lineLimit(1...5)
+                    .textFieldStyle(.plain)
                     .accessibilityLabel("Message")
                     .focused($composerFocused)
                 Button {
@@ -33,12 +33,24 @@ struct MessageComposer: View {
                 .accessibilityLabel("Send message")
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!canSend)
-            }.padding()
+            }
         }
+        .padding()
+        .modifier(ComposerSurface())
     }
 
     private func send() {
         composerFocused = true
         onSend()
+    }
+}
+
+private struct ComposerSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26, macOS 26, *) {
+            content.glassEffect(.regular, in: .rect(cornerRadius: 24))
+        } else {
+            content.background(.regularMaterial, in: .rect(cornerRadius: 24))
+        }
     }
 }
