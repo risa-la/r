@@ -282,6 +282,19 @@ Settled (now in SPEC.md):
     - RELATED accepts `after=0`, and `<first>` > `<last>` returns nothing.
     - NOTIFY reasons are 1 to 32 characters of `a-z 0-9 -`.
 
+11. **Found by the TLA+ sync model** in `proofs/sync` (6.1, 7.1-7.3, 7.6).
+    - Clients catch up from a sync point, the seq up to which they have
+      every event, not from the newest seq stored, which can lie past a
+      gap after a dropped connection.
+    - HISTORY and RELATED reply `OK id=<id> more=<0 or 1>`, so a page
+      from a room that was dropped and created again is noticed.
+    - JOIN events carry the room id in the `id` tag, so a device that
+      still has an older room's history notices the new room.
+    - Clients store no live events for a conversation until they have
+      learned its id on the connection.
+    - A cid only matches within the conversation, by id, it was first
+      sent to.
+
 Nothing is open right now.
 
 ## 6. Open decisions

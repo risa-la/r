@@ -11,7 +11,7 @@ RISALA 1 chat.example.org 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e Welcome!
 guest sam
 OK uid=~sam
 join #general
-@seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam JOIN #general
+@seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general
 SET #general topic General chat. Be kind.
 SET #general public yes
 SET #general guests write

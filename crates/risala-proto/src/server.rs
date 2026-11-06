@@ -1565,6 +1565,9 @@ pub enum EventBody {
     Join {
         /// The room.
         room: Room,
+        /// The room's id, from the `id` tag (6.1). A device whose stored
+        /// id for the room differs discards what it has stored first.
+        id: Id,
     },
     /// `PART <room> [<reason...>]`: `from` left (6.1). A guest's automatic
     /// PART has no reason (5.2).
@@ -1649,7 +1652,7 @@ impl EventBody {
         match self {
             EventBody::Msg(msg) => msg.conv.clone(),
             EventBody::Delete { conv, .. } => conv.clone(),
-            EventBody::Join { room }
+            EventBody::Join { room, .. }
             | EventBody::Part { room, .. }
             | EventBody::Invite { room, .. }
             | EventBody::Kick { room, .. }
@@ -1681,7 +1684,8 @@ impl EventBody {
             "JOIN" => {
                 let room = token(&mut p)?;
                 p.end()?;
-                EventBody::Join { room }
+                let id = parse_tag::<Id>(tags, "id")?.ok_or(bad("a JOIN event has the id tag"))?;
+                EventBody::Join { room, id }
             }
             "PART" => {
                 let room = token(&mut p)?;
@@ -1743,8 +1747,8 @@ impl EventBody {
             EventBody::Delete { conv, seq } => {
                 b.token(conv).token(seq);
             }
-            EventBody::Join { room } => {
-                b.token(room);
+            EventBody::Join { room, id } => {
+                b.tag("id", id).token(room);
             }
             EventBody::Part { room, reason } => {
                 b.token(room).text(reason);
@@ -2108,7 +2112,9 @@ mod tests {
 
     #[test]
     fn ref_on_events_and_final_responses() {
-        let m = round_trip(&format!("@ref=7;seq=8812;t={T};from=~sam JOIN #general"));
+        let m = round_trip(&format!(
+            "@ref=7;seq=8812;t={T};from=~sam;id=k3f9q2 JOIN #general"
+        ));
         assert_eq!(m.ref_.as_ref().map(Ref::as_str), Some("7"));
         assert!(matches!(m.line, ServerLine::Event(_)));
         let m = round_trip("@ref=7 OK more=1");
@@ -2122,8 +2128,8 @@ mod tests {
     #[test]
     fn tag_order_is_canonical() {
         canonical(
-            &format!("@from=~sam;t={T};seq=8812;ref=7 JOIN #general"),
-            &format!("@ref=7;seq=8812;t={T};from=~sam JOIN #general"),
+            &format!("@from=~sam;t={T};seq=8812;id=k3f9q2;ref=7 JOIN #general"),
+            &format!("@ref=7;seq=8812;t={T};from=~sam;id=k3f9q2 JOIN #general"),
         );
         canonical(
             &format!("@deleted;reply=8810;from=~sam;t={T};seq=8813 MSG #general"),
@@ -2199,8 +2205,8 @@ mod tests {
         canonical(&format!("@seq=1;t={T};from=~sam;x-a OK"), "OK");
         // Meaningless MSG tags on other events.
         canonical(
-            &format!("@seq=1;t={T};from=~sam;reply=3;file=x;deleted JOIN #a"),
-            &format!("@seq=1;t={T};from=~sam JOIN #a"),
+            &format!("@seq=1;t={T};from=~sam;reply=3;id=a1;file=x;deleted JOIN #a"),
+            &format!("@seq=1;t={T};from=~sam;id=a1 JOIN #a"),
         );
         // Unread tag values are not checked.
         canonical("@seq=zzz NOTICE hi", "NOTICE hi");
@@ -2498,7 +2504,9 @@ mod tests {
 
     #[test]
     fn events_round_trip() {
-        let e = event(&format!("@seq=8812;t={T};from=~sam JOIN #general"));
+        let e = event(&format!(
+            "@seq=8812;t={T};from=~sam;id=k3f9q2 JOIN #general"
+        ));
         let meta = e.meta.as_ref().unwrap();
         assert_eq!(meta.seq, seq(8812));
         assert_eq!(meta.t.to_string(), T);
@@ -2506,8 +2514,15 @@ mod tests {
         assert_eq!(
             e.body,
             EventBody::Join {
-                room: room("#general")
+                room: room("#general"),
+                id: "k3f9q2".parse().unwrap(),
             }
+        );
+        // The room id is required on JOIN events (6.1).
+        assert!(
+            format!("@seq=1;t={T};from=~sam JOIN #general")
+                .parse::<ServerMessage>()
+                .is_err()
         );
         assert_eq!(e.body.conv(), Conv::Room(room("#general")));
 
@@ -2574,7 +2589,7 @@ mod tests {
     fn bad_events() {
         // Wrong arity.
         syntax(&format!("@seq=1;t={T};from=~sam JOIN"));
-        syntax(&format!("@seq=1;t={T};from=~sam JOIN #a #b"));
+        syntax(&format!("@seq=1;t={T};from=~sam;id=a1 JOIN #a #b"));
         syntax(&format!("@seq=1;t={T};from=~sam DELETE #a"));
         syntax(&format!("@seq=1;t={T};from=~sam DELETE #a 0"));
         syntax(&format!("@seq=1;t={T};from=~sam INVITE #a"));
@@ -2584,10 +2599,10 @@ mod tests {
         syntax(&format!("@seq=1;t={T};from=~sam SET #a"));
         syntax(&format!("@seq=1;t={T};from=~sam JOIN general"));
         // Bad metadata values.
-        syntax(&format!("@seq=0;t={T};from=~sam JOIN #a"));
-        syntax("@seq=1;t=yesterday;from=~sam JOIN #a");
-        syntax(&format!("@seq=1;t={T};from=sam JOIN #a"));
-        syntax(&format!("@seq;t={T};from=~sam JOIN #a"));
+        syntax(&format!("@seq=0;t={T};from=~sam;id=a1 JOIN #a"));
+        syntax("@seq=1;t=yesterday;from=~sam;id=a1 JOIN #a");
+        syntax(&format!("@seq=1;t={T};from=sam;id=a1 JOIN #a"));
+        syntax(&format!("@seq;t={T};from=~sam;id=a1 JOIN #a"));
         assert_eq!(
             err(&format!(
                 "@seq=1;t={T};from=~sam SET #a topic {}",
@@ -2658,7 +2673,10 @@ mod tests {
             ServerMessage::new(snap).to_line().to_string(),
             "ROLE #a a@b.org owner"
         );
-        let bad = ServerMessage::new(Event::snapshot(EventBody::Join { room: room("#a") }));
+        let bad = ServerMessage::new(Event::snapshot(EventBody::Join {
+            room: room("#a"),
+            id: "x1".parse().unwrap(),
+        }));
         assert!(bad.try_to_line().is_err());
     }
 

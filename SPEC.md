@@ -118,7 +118,7 @@ S: RISALA 1 chat.example.org 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e Welcome!
 C: guest sam
 S: OK uid=~sam
 C: join #general
-S: @seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam JOIN #general
+S: @seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general
 S: SET #general topic General chat. Be kind.
 S: SET #general public yes
 S: SET #general guests write
@@ -127,7 +127,7 @@ S: OK id=k3f9q2 head=8812
 C: history #general before=8812 limit=2
 S: @seq=8810;t=2026-11-06T15:30:11.004Z;from=alice@example.org MSG #general anyone around?
 S: @seq=8811;t=2026-11-06T15:31:40.950Z;from=bob@example.net MSG #general yep
-S: OK more=1
+S: OK id=k3f9q2 more=1
 C: @reply=8810 msg #general hi alice, I'm new here
 S: @seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam;reply=8810 MSG #general hi alice, I'm new here
 S: OK seq=8813
@@ -293,6 +293,7 @@ its command.
 | `deleted` | server | none | The event's content was removed (5.4) |
 | `retry` | server | seconds | With `ERR rate-limited`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
+| `id` | server | id | On a JOIN event: the room's id (6.1) |
 
 ### 3.3. Parameters
 
@@ -418,9 +419,9 @@ ERR <code> [<message...>]
 
 ```
 C: @ref=7 history #general after=8811 limit=2
-S: @ref=7;seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam JOIN #general
+S: @ref=7;seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general
 S: @ref=7;seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam;reply=8810 MSG #general hi alice, I'm new here
-S: @ref=7 OK more=1
+S: @ref=7 OK id=k3f9q2 more=1
 ```
 
 ### 3.7. Error Codes
@@ -1084,6 +1085,13 @@ JOIN <room>
 
 → JOIN event, then snapshot SET lines, then `OK id=<id> head=<seq>`
 
+Every JOIN event carries the room's id (5.1) in the `id` tag, live and in
+HISTORY. An identity's other devices also receive its JOIN, and one of
+them may still have history from an older room of the same name, for
+example one that was dropped while that device was kicked. A device that
+receives a JOIN whose `id` differs from the id it has stored for the room
+discards what it has stored, as in 7.1, before storing the event.
+
 - **The room exists and you may join it.** The server records a JOIN
   event, sends the room's settings as snapshot SET lines, and replies
   `OK id=<id> head=<seq>`, where `<id>` is the room's id (5.1) and
@@ -1271,19 +1279,33 @@ A connection receives live events for its conversations from the moment
 it signs in. So every event newer than the head that SYNC reports is
 delivered live, and nothing falls in between.
 
+For each conversation, a client keeps the id it has stored (5.1) and a
+**sync point**: the seq up to which it has every event the server still
+keeps. Events it has stored beyond the sync point, such as live events
+that arrived while it was catching up, do not move it. This matters when
+a connection drops in the middle of catching up: the newest seq stored
+can then lie past a gap, while the sync point stays before it.
+
 A client catches up like this:
 
 1. Sign in, then send SYNC.
 2. For each conversation whose `<id>` differs from the id the client has
    stored for it, the client discards what it has stored for that
-   conversation (see below).
-3. For each conversation, let L be the newest seq the client has stored.
-   If L is less than `<head>`, send `HISTORY <conv> after=L`, and repeat
-   while the response says `more=1`.
+   conversation and sets its sync point to 0 (see below).
+3. For each conversation, let L be its sync point. If L is less than
+   `<head>`, send `HISTORY <conv> after=L`, and repeat while the response
+   says `more=1`. After each page, the sync point moves to the last seq
+   in it, and on over any stored events that directly follow.
 4. If the gap is large, the client MAY instead fetch only the newest page,
-   and load older pages when the user scrolls back (7.3).
+   and load older pages when the user scrolls back (7.3). The sync point
+   then stays where it was until the gap is filled.
 5. Live events may arrive in the meantime. A duplicate has the same seq
-   as the event already received, so it can be dropped.
+   as the event already received, so it can be dropped. A live event
+   moves the sync point only if it directly follows it.
+6. A client MUST NOT store a live event for a conversation until it has
+   learned that conversation's id on this connection, from SYNC, JOIN or
+   INFO. Before then it cannot tell which room the event belongs to.
+   HISTORY returns such events later.
 
 A client MAY download the whole history of its conversations for reading
 offline. Sequence numbers make the download easy to resume.
@@ -1306,7 +1328,13 @@ correct server, but it keeps the client consistent.
 HISTORY <conv> [after=<seq>] [before=<seq>] [limit=<n>]
 ```
 
-→ events in ascending seq order, then `OK more=<0 or 1>`
+→ events in ascending seq order, then `OK id=<id> more=<0 or 1>`
+
+`<id>` is the conversation's id (5.1). A room can be dropped and created
+again while a HISTORY request is on its way (10.4), and then the events
+come from the new room. A client that gets an `id` other than the one it
+has stored for the conversation discards the page, and starts the
+conversation afresh as in 7.1.
 
 - **With `after`:** the earliest `limit` events whose seq is greater than
   `after` (and less than `before`, if it is given). `more=1` means there
@@ -1338,7 +1366,8 @@ between have expired.
 RELATED <conv> <first> <last> [after=<seq>] [limit=<n>]
 ```
 
-→ events in ascending seq order, then `OK more=<0 or 1>`
+→ events in ascending seq order, then `OK id=<id> more=<0 or 1>`, where
+`<id>` is checked as for HISTORY (7.2)
 
 An edit or reaction (5.3) has a later seq than the message it targets,
 often a much later one. A client that loads older history one page at a
@@ -1360,11 +1389,11 @@ edits and reactions. RELATED returns them:
 C: history #general before=4001 limit=2
 S: @seq=3999;t=2026-10-02T09:12:40.118Z;from=alice@example.org MSG #general lunch?
 S: @seq=4000;t=2026-10-02T09:13:02.551Z;from=bob@example.net MSG #general sure, at 12
-S: OK more=1
+S: OK id=k3f9q2 more=1
 C: related #general 3999 4000
 S: @seq=4003;t=2026-10-02T09:14:10.902Z;from=bob@example.net;edit=4000 MSG #general sure, at 12:30
 S: @seq=8790;t=2026-11-06T15:20:31.004Z;from=~sam;react=3999 MSG #general 🍕
-S: OK more=0
+S: OK id=k3f9q2 more=0
 ```
 
 A client needs RELATED only for ranges whose later events it has not all
@@ -1413,8 +1442,12 @@ To make resending safe:
 - A client MAY tag MSG with `cid=<token>`. The token is a random value
   of at least 16 characters, chosen anew for each message.
 - If the same identity has already sent a message with that cid in the
-  last 24 hours, the server MUST NOT create a new event. It replies
-  `OK seq=<seq>` with the existing message's seq.
+  last 24 hours, to the same conversation, the server MUST NOT create a
+  new event. It replies `OK seq=<seq>` with the existing message's seq.
+- "The same conversation" means the same id (5.1). After a room is
+  dropped and created again (10.4), a cid from the old room does not
+  match, so a resent message is sent to the new room. Otherwise the
+  client would be given the seq of someone else's event.
 - For guests, the server checks cids only within one connection.
 - The cid is not part of the event.
 
