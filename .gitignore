@@ -1,0 +1,63 @@
+# Rust / Cargo
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# cargo-fuzz
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+
+# Nix
+result
+result-*
+.direnv/
+.envrc.local
+
+# Local env and secrets
+.env
+.env.*
+# Test keys and certs may live under testdata/ or tests/fixtures/.
+*.key
+*.pem
+!**/testdata/**/*.pem
+!**/testdata/**/*.key
+!**/tests/fixtures/**/*.pem
+!**/tests/fixtures/**/*.key
+
+# Local runtime data (SQLite stores, WAL files)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# GNOME / Meson / Flatpak builds
+_build/
+builddir/
+.flatpak-builder/
+*.gresource
+
+# Android / Gradle (future client)
+.gradle/
+local.properties
+*.apk
+*.aab
+apps/android/**/build/
+
+# Apple / Xcode (future client)
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
