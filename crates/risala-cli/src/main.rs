@@ -164,6 +164,12 @@ fn explain<T>(e: ClientError) -> Res<T> {
             eprintln!("    risala trust {server} {fingerprint}");
             Err(Failed)
         }
+        ClientError::AlreadyTrusted { server, recorded } => {
+            eprintln!("risala: {server} is already trusted, with {recorded}.");
+            eprintln!("If its operator confirms a new certificate, remove the record first:");
+            eprintln!("    risala untrust {server}");
+            Err(Failed)
+        }
         ClientError::CertificateMismatch {
             server,
             recorded,
@@ -266,7 +272,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let account = online(ctx, &server).await?;
             let conv = within(account.join(&room)).await?;
             within(account.wait_synced()).await?;
-            let count = conv.messages(None, 1000).or_else(explain)?.messages.len();
+            let count = conv.export().or_else(explain)?.len();
             println!("joined {} ({count} events stored)", conv.name());
             Ok(())
         }
@@ -319,11 +325,25 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             text,
         } => {
             let account = pick(ctx, &server)?;
-            let connected = connect(&account).await;
+            let connected = match tokio::time::timeout(WAIT, account.connect()).await {
+                Ok(r) => r.map(drop),
+                Err(_) => Err(ClientError::NotConnected),
+            };
             let conv = account.conversation(&conversation).or_else(explain)?;
             let entry = conv.send(&text.join(" ")).await.or_else(explain)?;
-            if connected.is_err() {
-                return fail("queued; it will be sent on the next connection");
+            match connected {
+                Ok(()) => {}
+                // Connecting again will not help until the user acts.
+                Err(e) if e.is_permanent() => {
+                    let _: Res = explain(e);
+                    return fail(
+                        "queued, but it cannot be sent until that is fixed; then run risala sync",
+                    );
+                }
+                Err(e) => {
+                    eprintln!("risala: {e}");
+                    return fail("queued; it will be sent on the next connection");
+                }
             }
             let entry = within(account.wait_outbox(entry.id)).await?;
             match entry.status {
