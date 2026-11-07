@@ -518,6 +518,36 @@ fn identities_are_members_and_guests_are_not() {
 }
 
 #[test]
+fn guest_memberships_follow_joins_and_parts() {
+    let (store, key) = store_with_room();
+    let other = store.ensure_room(&room("#other"), t(0)).unwrap().key;
+    let part = || EventKind::Part {
+        reason: String::new(),
+    };
+    for (conv, who) in [(key, "~sam"), (key, "~ann"), (other, "~sam")] {
+        store.append(conv, &event(who, EventKind::Join)).unwrap();
+    }
+    store
+        .append(key, &event("alice@example.org", EventKind::Join))
+        .unwrap();
+    assert_eq!(
+        store.guest_members().unwrap(),
+        [(key, uid("~ann")), (key, uid("~sam")), (other, uid("~sam"))]
+    );
+    store.append(key, &event("~sam", part())).unwrap();
+    let kick = EventKind::Kick {
+        uid: uid("~sam"),
+        reason: String::new(),
+    };
+    store
+        .append(other, &event("alice@example.org", kick))
+        .unwrap();
+    assert_eq!(store.guest_members().unwrap(), [(key, uid("~ann"))]);
+    store.append(key, &event("~ann", part())).unwrap();
+    assert_eq!(store.guest_members().unwrap(), []);
+}
+
+#[test]
 fn settings_roles_and_bans_follow_events() {
     let (store, key) = store_with_room();
     let general = room("#general");

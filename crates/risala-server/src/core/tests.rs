@@ -1183,6 +1183,70 @@ async fn a_slow_reader_is_dropped_alone() {
 // Persistence
 
 #[tokio::test]
+async fn guests_cut_off_by_a_crash_part_at_the_next_start() {
+    // 4.2 and PLAN.md 5, item 16: the PARTs a crash kept from being
+    // stored are recorded when the server starts again, once.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("risala.db");
+    let open = |path: &std::path::Path| -> Harness {
+        let store = SqliteStore::open(path).unwrap();
+        Harness::on(config(), Arc::new(store), Duration::from_secs(120))
+    };
+    let mut h = open(&path);
+    let room: Room = "#general".parse().unwrap();
+    let (_sam, _) = h.joined("sam", "#general").await;
+    let (_ann, _) = h.joined("ann", "#general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    h.send(&bob, "part #general").await;
+    bob.lines();
+    // The crash: the hub goes away without `closed`.
+    drop(h);
+
+    let h = open(&path);
+    let key = h.store.room(&room).unwrap().unwrap().key;
+    let all = HistoryQuery {
+        after: Some(0),
+        before: None,
+        limit: 100,
+    };
+    let lines = |page: &Page| -> Vec<String> {
+        page.events
+            .iter()
+            .map(|e| format!("{} {}", e.from, e.kind.verb()))
+            .collect()
+    };
+    let page = h.store.history(key, all).unwrap();
+    assert_eq!(
+        lines(&page),
+        [
+            "~sam JOIN",
+            "~ann JOIN",
+            "~bob JOIN",
+            "~bob PART",
+            "~ann PART",
+            "~sam PART"
+        ]
+    );
+    for e in &page.events[4..] {
+        assert_eq!(
+            e.kind,
+            EventKind::Part {
+                reason: String::new()
+            }
+        );
+    }
+    // Nobody is in the room, and the next start records nothing more.
+    assert_eq!(h.hub.inner.reg().member_count(&room), 0);
+    drop(h);
+    let h = open(&path);
+    assert_eq!(h.store.history(key, all).unwrap().events.len(), 6);
+    let mut h = h;
+    let mut sam = h.guest("sam").await;
+    h.send(&sam, "join #general").await;
+    assert!(sam.lines()[0].starts_with("@seq=7;"));
+}
+
+#[tokio::test]
 async fn a_restart_keeps_rooms_ids_and_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = config();
@@ -1287,6 +1351,9 @@ impl Store for Flaky {
         now: Timestamp,
     ) -> crate::store::Result<Option<Seq>> {
         self.inner.cid_seq(c, f, cid, now)
+    }
+    fn guest_members(&self) -> crate::store::Result<Vec<(ConvKey, Uid)>> {
+        self.inner.guest_members()
     }
     fn prune_cids(&self, b: Timestamp) -> crate::store::Result<u64> {
         self.inner.prune_cids(b)

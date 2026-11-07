@@ -401,6 +401,13 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
     match &event.kind {
         EventKind::Msg { .. } => {}
         EventKind::Join => {
+            if event.from.is_guest() {
+                // Kept until the guest's PART, even across a crash (4.2).
+                tx.execute(
+                    "INSERT OR IGNORE INTO guest_members (conv, uid, since) VALUES (?, ?, ?)",
+                    params![conv, event.from.as_str(), ms(event.t)],
+                )?;
+            }
             if identity(&event.from) {
                 tx.execute(
                     "INSERT OR IGNORE INTO members (conv, uid, since) VALUES (?, ?, ?)",
@@ -414,10 +421,12 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             }
         }
         EventKind::Part { .. } => {
-            tx.execute(
+            for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
-                params![conv, event.from.as_str()],
-            )?;
+                "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
+            ] {
+                tx.execute(sql, params![conv, event.from.as_str()])?;
+            }
         }
         EventKind::Set(setting) => {
             let sql = match setting {
@@ -457,6 +466,7 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             // KICK takes the role away (6.3).
             for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
+                "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
                 "DELETE FROM roles WHERE conv = ? AND uid = ?",
             ] {
                 tx.execute(sql, params![conv, uid.as_str()])?;
@@ -467,6 +477,7 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             // invitation (6.3, 6.4).
             for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
+                "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
                 "DELETE FROM roles WHERE conv = ? AND uid = ?",
                 "DELETE FROM invites WHERE conv = ? AND uid = ?",
             ] {
@@ -726,6 +737,19 @@ impl Store for SqliteStore {
 
     fn cid_seq(&self, conv: ConvKey, from: &Uid, cid: &Cid, now: Timestamp) -> Result<Option<Seq>> {
         find_cid(&self.conn(), conv.0, from, cid, now)
+    }
+
+    fn guest_members(&self) -> Result<Vec<(ConvKey, Uid)>> {
+        self.conn()
+            .prepare_cached("SELECT conv, uid FROM guest_members ORDER BY conv, uid")?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|r| {
+                let (conv, uid) = r?;
+                Ok((ConvKey(conv), parse("guest member", &uid)?))
+            })
+            .collect()
     }
 
     fn prune_cids(&self, before: Timestamp) -> Result<u64> {

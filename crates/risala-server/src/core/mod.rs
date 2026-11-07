@@ -225,6 +225,7 @@ impl Hub {
         if let Some(before) = now.checked_sub(Duration::from_millis(store::CID_WINDOW_MS)) {
             store.prune_cids(before)?;
         }
+        part_leftover_guests(&*store, now)?;
 
         let mut reg = Registry::default();
         let mut rooms = BTreeMap::new();
@@ -253,6 +254,32 @@ impl Hub {
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
+}
+
+/// Records a PART, with no reason, for every guest still in a room when
+/// the server starts (4.2). No guest is connected yet, so these were cut
+/// off by a crash before their PARTs were stored (PLAN.md 5, item 16).
+/// Each PART also removes the stored membership, so it is recorded once.
+fn part_leftover_guests(store: &dyn Store, now: Timestamp) -> Result<(), StoreError> {
+    let leftover = store.guest_members()?;
+    if !leftover.is_empty() {
+        tracing::info!(
+            guests = leftover.len(),
+            "recording the PARTs of guests cut off by a crash"
+        );
+    }
+    for (conv, uid) in leftover {
+        let event = store::NewEvent {
+            t: now,
+            from: uid,
+            kind: store::EventKind::Part {
+                reason: String::new(),
+            },
+            cid: None,
+        };
+        store.append(conv, &event)?;
+    }
+    Ok(())
 }
 
 /// Whether `welcome` fits in a greeting (4.1).

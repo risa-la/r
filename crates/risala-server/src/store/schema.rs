@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1];
+pub const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -274,6 +274,20 @@ CREATE TABLE push_registrations (
     PRIMARY KEY (device_key, url)
 ) WITHOUT ROWID;
 CREATE INDEX push_registrations_uid ON push_registrations (uid);
+"#;
+
+/// Version 2: guests' room memberships (4.2).
+const V2: &str = r#"
+-- Guests in rooms (4.2). A guest's membership ends with its connection,
+-- with a PART. A row here outlives a crash, so that the PART can be
+-- recorded when the server starts again. Written in the transaction of the
+-- guest's JOIN or PART event.
+CREATE TABLE guest_members (
+    conv  INTEGER NOT NULL REFERENCES conversations (conv) ON DELETE CASCADE,
+    uid   TEXT NOT NULL,
+    since INTEGER NOT NULL,
+    PRIMARY KEY (conv, uid)
+) WITHOUT ROWID;
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.
