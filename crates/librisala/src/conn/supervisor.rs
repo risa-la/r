@@ -9,12 +9,11 @@ use std::time::Duration;
 use risala_proto::auth::SecretKey;
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{Identity, MAX_NAME_LEN, Name, Uid};
-use risala_proto::server::ServerMessage;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use super::error::{CloseReason, CommandError, Error};
-use super::session::{Session, SessionInfo, SessionOptions};
+use super::session::{Incoming, Session, SessionInfo, SessionOptions};
 use super::tls;
 use crate::addr::{ServerAddr, TrustStore};
 
@@ -160,8 +159,9 @@ pub enum SupervisorEvent {
         uid: Uid,
         /// The session. The supervisor keeps a handle to close it.
         session: Arc<Session>,
-        /// The session's incoming lines.
-        incoming: mpsc::Receiver<ServerMessage>,
+        /// The session's incoming queue: lines, and the replies to
+        /// commands sent with [`Session::send`], in arrival order.
+        incoming: mpsc::Receiver<Incoming>,
     },
     /// The signed-in connection closed.
     Disconnected {
@@ -286,10 +286,7 @@ impl Run {
 
     async fn run_inner(&mut self) -> Result<(), Stop> {
         if self.options.ca_verifier.is_none() {
-            match tls::platform_ca_verifier() {
-                Ok(ca) => self.options.ca_verifier = Some(ca),
-                Err(error) => return self.emit(SupervisorEvent::Failed { error }).await,
-            }
+            self.options.ca_verifier = Some(tls::platform_ca_verifier());
         }
         let mut failures: u32 = 0;
         loop {

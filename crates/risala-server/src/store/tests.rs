@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use risala_proto::names::{Conv, Room, Seq, Uid};
+use risala_proto::names::{Conv, Id, Room, Seq, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
     GuestAccess, Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting,
@@ -142,6 +142,48 @@ fn reopening_keeps_everything() {
 }
 
 #[test]
+fn commits_are_durable() {
+    // In WAL mode, synchronous=NORMAL can lose the last commits after a
+    // power failure, and their seqs would be used again (5.2).
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("risala.db")).unwrap();
+    let conn = store.conn();
+    let sync: i64 = conn
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    assert_eq!(sync, 2, "synchronous=FULL");
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    drop(conn);
+
+    // Only for filling a database quickly.
+    let sync = |store: &SqliteStore| -> i64 {
+        store
+            .conn()
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap()
+    };
+    store.set_durable(false).unwrap();
+    assert_eq!(sync(&store), 0);
+    store.set_durable(true).unwrap();
+    assert_eq!(sync(&store), 2);
+}
+
+#[test]
+fn a_database_without_wal_is_refused() {
+    // An in-memory database cannot use WAL: its journal mode stays
+    // "memory".
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let err = SqliteStore::setup(conn, true).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Setup(m) if m.contains("WAL")),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_newer_database_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("risala.db");
@@ -153,6 +195,111 @@ fn a_newer_database_is_refused() {
         SqliteStore::open(&path),
         Err(StoreError::Corrupt(_))
     ));
+}
+
+/// A migration that rebuilds `conversations`, the parent of most tables,
+/// in the usual way: a new table, the rows copied, the old one dropped and
+/// the new one renamed.
+const REBUILD_CONVERSATIONS: &str = r#"
+CREATE TABLE conversations_new (
+    conv    INTEGER PRIMARY KEY,
+    id      TEXT NOT NULL UNIQUE REFERENCES used_ids (id),
+    kind    TEXT NOT NULL CHECK (kind IN ('room', 'direct')),
+    room    TEXT UNIQUE,
+    uid_a   TEXT,
+    uid_b   TEXT,
+    head    INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0),
+    created INTEGER NOT NULL,
+    note    TEXT NOT NULL DEFAULT '',
+    UNIQUE (uid_a, uid_b)
+);
+INSERT INTO conversations_new (conv, id, kind, room, uid_a, uid_b, head, created)
+    SELECT conv, id, kind, room, uid_a, uid_b, head, created FROM conversations;
+DROP TABLE conversations;
+ALTER TABLE conversations_new RENAME TO conversations;
+"#;
+
+fn count(store: &SqliteStore, table: &str) -> i64 {
+    store
+        .conn()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn foreign_keys_on(store: &SqliteStore) -> bool {
+    store
+        .conn()
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn migrations_can_rebuild_a_parent_table() {
+    let (store, key) = store_with_room();
+    store
+        .append(key, &event("alice@example.org", EventKind::Join))
+        .unwrap();
+    store
+        .append(key, &msg("alice@example.org", 1, "hello"))
+        .unwrap();
+    let before: Vec<i64> = ["events", "event_text", "members", "room_settings"]
+        .iter()
+        .map(|table| count(&store, table))
+        .collect();
+    assert_eq!(before, [2, 1, 1, 1]);
+
+    let mut migrations = schema::MIGRATIONS.to_vec();
+    migrations.push(REBUILD_CONVERSATIONS);
+    schema::migrate_with(&mut store.conn(), &migrations).unwrap();
+
+    // The rows that refer to the rebuilt table are all still there, and
+    // foreign keys are on again.
+    let after: Vec<i64> = ["events", "event_text", "members", "room_settings"]
+        .iter()
+        .map(|table| count(&store, table))
+        .collect();
+    assert_eq!(after, before);
+    assert!(foreign_keys_on(&store));
+    let version: i64 = store
+        .conn()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, migrations.len() as i64);
+    assert_eq!(store.room(&room("#general")).unwrap().unwrap().key, key);
+    assert_eq!(
+        new_seq(store.append(key, &msg("~sam", 2, "hi")).unwrap()),
+        3
+    );
+
+    // With foreign keys on, as they were before, the same rebuild deletes
+    // every event.
+    let (store, key) = store_with_room();
+    store.append(key, &msg("~sam", 1, "hello")).unwrap();
+    store.conn().execute_batch(REBUILD_CONVERSATIONS).unwrap();
+    assert_eq!(count(&store, "events"), 0);
+}
+
+#[test]
+fn a_migration_that_breaks_foreign_keys_is_rolled_back() {
+    let (store, key) = store_with_room();
+    store.append(key, &msg("~sam", 1, "hello")).unwrap();
+    let mut migrations = schema::MIGRATIONS.to_vec();
+    migrations.push("DELETE FROM conversations;");
+    let err = schema::migrate_with(&mut store.conn(), &migrations).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Corrupt(m) if m.contains("foreign keys")),
+        "{err}"
+    );
+    assert!(foreign_keys_on(&store));
+    let version: i64 = store
+        .conn()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, schema::MIGRATIONS.len() as i64);
+    assert_eq!(count(&store, "conversations"), 1);
+    assert_eq!(count(&store, "events"), 1);
 }
 
 #[test]
@@ -280,7 +427,7 @@ fn deleted_events_are_placeholders() {
         .events
         .iter()
         .map(|e| {
-            let line = e.to_event(Conv::Room(r.room.clone()), &r.id);
+            let line = e.to_event(Conv::Room(r.room.clone()), &r.id).unwrap();
             let s = risala_proto::server::ServerMessage::new(line)
                 .to_line()
                 .to_string();
@@ -308,6 +455,38 @@ fn deleted_events_are_placeholders() {
         )
         .unwrap();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn room_events_in_a_direct_conversation_are_errors() {
+    // Only MSG and DELETE happen in direct conversations. Anything else
+    // there is bad data, and an error rather than a panic.
+    let id: Id = "abcdefghijkl".parse().unwrap();
+    let direct = Conv::Uid(uid("alice@example.org"));
+    let stored = |kind| StoredEvent {
+        seq: seq(3),
+        t: t(0),
+        from: uid("bob@example.org"),
+        kind,
+        deleted: false,
+    };
+    let message = stored(msg("bob@example.org", 0, "hi").kind);
+    assert!(message.to_event(direct.clone(), &id).is_ok());
+    assert!(
+        stored(EventKind::Delete { target: seq(1) })
+            .to_event(direct.clone(), &id)
+            .is_ok()
+    );
+    for kind in [
+        EventKind::Join,
+        EventKind::Part {
+            reason: String::new(),
+        },
+        EventKind::Set(RoomSetting::Public(true)),
+    ] {
+        let err = stored(kind).to_event(direct.clone(), &id).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+    }
 }
 
 #[test]
@@ -349,6 +528,36 @@ fn identities_are_members_and_guests_are_not() {
         .unwrap();
     let r = store.room(&general).unwrap().unwrap();
     assert_eq!(r.members, [uid("bob@example.net")]);
+}
+
+#[test]
+fn guest_memberships_follow_joins_and_parts() {
+    let (store, key) = store_with_room();
+    let other = store.ensure_room(&room("#other"), t(0)).unwrap().key;
+    let part = || EventKind::Part {
+        reason: String::new(),
+    };
+    for (conv, who) in [(key, "~sam"), (key, "~ann"), (other, "~sam")] {
+        store.append(conv, &event(who, EventKind::Join)).unwrap();
+    }
+    store
+        .append(key, &event("alice@example.org", EventKind::Join))
+        .unwrap();
+    assert_eq!(
+        store.guest_members().unwrap(),
+        [(key, uid("~ann")), (key, uid("~sam")), (other, uid("~sam"))]
+    );
+    store.append(key, &event("~sam", part())).unwrap();
+    let kick = EventKind::Kick {
+        uid: uid("~sam"),
+        reason: String::new(),
+    };
+    store
+        .append(other, &event("alice@example.org", kick))
+        .unwrap();
+    assert_eq!(store.guest_members().unwrap(), [(key, uid("~ann"))]);
+    store.append(key, &event("~ann", part())).unwrap();
+    assert_eq!(store.guest_members().unwrap(), []);
 }
 
 #[test]

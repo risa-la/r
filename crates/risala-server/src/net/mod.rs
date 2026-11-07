@@ -36,7 +36,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::config::Config;
 use crate::handler::{ConnHandle, ConnId, ConnInfo, Handler, conn_channel};
-use conn::Timers;
+use conn::{CommandRoom, Timers};
 pub use tls::Certificates;
 
 /// The most connections open at once, counting those still in their TLS
@@ -84,6 +84,8 @@ pub struct Server<H> {
     acceptor: TlsAcceptor,
     timers: Timers,
     out_queue: usize,
+    out_queue_bytes: usize,
+    room: CommandRoom,
     handshake_timeout: Duration,
     max_connections: usize,
 }
@@ -104,7 +106,13 @@ impl<H: Handler> Server<H> {
     ///
     /// With no certificates configured, this generates a self-signed one,
     /// or reuses the one generated before (see [`Certificates::load`]).
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] if the limits cannot work
+    /// (see [`Config::validate`]).
     pub fn bind(config: &Config, handler: Arc<H>) -> io::Result<Server<H>> {
+        config
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let certs = Certificates::load(config)?;
         let acceptor = TlsAcceptor::from(Arc::new(tls::server_config(&certs)?));
         let mut listeners = Vec::new();
@@ -125,7 +133,12 @@ impl<H: Handler> Server<H> {
                 idle_ping: Duration::from_secs(config.limits.idle_ping_secs),
                 ping_timeout: Duration::from_secs(config.limits.ping_timeout_secs),
             },
-            out_queue: config.limits.out_queue.max(1),
+            out_queue: config.limits.out_queue,
+            out_queue_bytes: config.limits.out_queue_bytes,
+            room: CommandRoom {
+                lines: config.limits.command_room(),
+                bytes: config.limits.command_room_bytes(),
+            },
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
         })
@@ -170,6 +183,8 @@ impl<H: Handler> Server<H> {
             acceptor: self.acceptor,
             timers: self.timers,
             out_queue: self.out_queue,
+            out_queue_bytes: self.out_queue_bytes,
+            room: self.room,
             handshake_timeout: self.handshake_timeout,
             permits: Arc::new(Semaphore::new(self.max_connections)),
             max_connections: self.max_connections,
@@ -228,6 +243,8 @@ struct Shared<H> {
     acceptor: TlsAcceptor,
     timers: Timers,
     out_queue: usize,
+    out_queue_bytes: usize,
+    room: CommandRoom,
     handshake_timeout: Duration,
     permits: Arc<Semaphore>,
     max_connections: usize,
@@ -300,7 +317,7 @@ async fn connection<H: Handler>(
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned());
     let id = ConnId(shared.next_id.fetch_add(1, Ordering::Relaxed));
-    let (handle, receiver) = conn_channel(id, shared.out_queue);
+    let (handle, receiver) = conn_channel(id, shared.out_queue, shared.out_queue_bytes);
     {
         let mut registry = shared.registry();
         if registry.shutting_down {
@@ -322,6 +339,7 @@ async fn connection<H: Handler>(
         receiver,
         shared.handler.clone(),
         shared.timers,
+        shared.room,
         stop,
     )
     .await;

@@ -37,7 +37,7 @@ use risala_proto::server::{Greeting, Host, ServerMessage};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{MAX_WELCOME, ServerRetention};
 
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::handler::{ConnHandle, ConnId, ConnInfo, Handler};
 use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 
@@ -45,6 +45,9 @@ use state::{ConnEntry, Registry, RoomEntry};
 
 /// The number of random bytes in a greeting's nonce (4.1).
 pub const NONCE_BYTES: usize = 32;
+
+/// How often [`Hub::prune_cids_every`] runs in `risalad`.
+pub const CID_PRUNE_PERIOD: Duration = Duration::from_secs(60 * 60);
 
 /// Where the hub gets the time from. Replace it in tests where timing
 /// matters.
@@ -148,8 +151,11 @@ impl Hub {
     ///
     /// This blocks while the database opens. In async code, call it from
     /// `spawn_blocking`.
+    ///
+    /// A new state directory gets mode 0700, and a warning is logged if an
+    /// existing one can be read by others (13).
     pub fn open(config: Config) -> Result<Hub, HubError> {
-        std::fs::create_dir_all(&config.state_dir).map_err(|source| HubError::Io {
+        create_state_dir(&config.state_dir).map_err(|source| HubError::Io {
             path: config.state_dir.clone(),
             source,
         })?;
@@ -186,6 +192,15 @@ impl Hub {
         clock: Arc<dyn Clock>,
         sign_in_timeout: Duration,
     ) -> Result<Hub, HubError> {
+        match config.validate() {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!("{warning}");
+                }
+            }
+            Err(ConfigError::Invalid(message)) => return Err(HubError::Config(message)),
+            Err(e) => return Err(HubError::Config(e.to_string())),
+        }
         let retention: ServerRetention = config.server.retention.parse().map_err(|e| {
             HubError::Config(format!(
                 "server.retention {:?}: {e}",
@@ -225,6 +240,7 @@ impl Hub {
         if let Some(before) = now.checked_sub(Duration::from_millis(store::CID_WINDOW_MS)) {
             store.prune_cids(before)?;
         }
+        part_leftover_guests(&*store, now)?;
 
         let mut reg = Registry::default();
         let mut rooms = BTreeMap::new();
@@ -253,6 +269,84 @@ impl Hub {
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
+
+    /// Forgets the cids of messages sent more than 24 hours ago (7.6), and
+    /// returns how many. The hub does this when it starts, and `risalad`
+    /// every [`CID_PRUNE_PERIOD`] after that.
+    pub async fn prune_cids(&self) -> Result<u64, StoreError> {
+        let window = Duration::from_millis(store::CID_WINDOW_MS);
+        let Some(before) = self.inner.now().checked_sub(window) else {
+            return Ok(0);
+        };
+        self.inner.db(move |s| s.prune_cids(before)).await
+    }
+
+    /// Runs [`prune_cids`](Self::prune_cids) every `period`, starting one
+    /// period from now, until the future is dropped. Failures are logged.
+    pub async fn prune_cids_every(self, period: Duration) {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is now; the hub pruned when it started.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            match self.prune_cids().await {
+                Ok(n) => tracing::debug!(cids = n, "forgot old cids"),
+                Err(e) => tracing::error!("forgetting old cids failed: {e}"),
+            }
+        }
+    }
+}
+
+/// Creates the state directory, and any missing parents, with mode 0700,
+/// and warns if it is open to others (13): it holds the database and the
+/// generated certificate's private key.
+fn create_state_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                dir = %dir.display(),
+                mode = format!("{:o}", mode & 0o777),
+                "the state directory is open to other users; consider chmod 700"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Records a PART, with no reason, for every guest still in a room when
+/// the server starts (4.2). No guest is connected yet, so these were cut
+/// off by a crash before their PARTs were stored (PLAN.md 5, item 16).
+/// Each PART also removes the stored membership, so it is recorded once.
+fn part_leftover_guests(store: &dyn Store, now: Timestamp) -> Result<(), StoreError> {
+    let leftover = store.guest_members()?;
+    if !leftover.is_empty() {
+        tracing::info!(
+            guests = leftover.len(),
+            "recording the PARTs of guests cut off by a crash"
+        );
+    }
+    for (conv, uid) in leftover {
+        let event = store::NewEvent {
+            t: now,
+            from: uid,
+            kind: store::EventKind::Part {
+                reason: String::new(),
+            },
+            cid: None,
+        };
+        store.append(conv, &event)?;
+    }
+    Ok(())
 }
 
 /// Whether `welcome` fits in a greeting (4.1).

@@ -356,7 +356,23 @@ Settled (now in SPEC.md):
       timer only once its LF arrives.
     - Expiry stops at the first event that is not old enough.
 
-17. **Added end-to-end encryption to v1** (draft-02: 1, 2.1, 2.3, 3.2,
+17. **Guest sessions and resuming** (4.2, 7.6, 13). Guests that
+    reconnected filled rooms with JOIN and PART pairs, and came back as
+    `~sam2`. Now GUEST's `OK` carries a secret `token`. After a guest's
+    connection closes, QUIT included, the server keeps its name and rooms
+    for at least 2 minutes. `GUEST <name> token=<token>` resumes the
+    session without recording anything, and gets a new token. cids carry
+    over to the resumed session.
+
+18. **Found while fixing the server review** (3.6, 4.2, 7.1).
+    - A server may stop reading commands while their responses go
+      unread, so a client that pipelines MUST keep reading as it writes.
+    - Guest PARTs recovered after a crash carry the restart time.
+    - SYNC stays one reply. `risalad` streams its CONV lines, waiting for
+      queue room between rooms, so a large SYNC cannot overflow a
+      connection.
+
+19. **Added end-to-end encryption to v1** (draft-02: 1, 2.1, 2.3, 3.2,
     3.7, 4.4, 4.5, 4.7, 4.8, 5, 6, 7, 9.2, 10, 12, 14, 15, App. A, B).
     - MLS [RFC9420] for direct conversations (always) and private rooms
       (opt-in at creation, with INIT). Public rooms are never encrypted.

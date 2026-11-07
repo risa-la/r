@@ -86,7 +86,7 @@ impl Harness {
     fn connect_sni(&mut self, sni: Option<&str>, capacity: usize) -> Client {
         self.next += 1;
         let id = ConnId(self.next);
-        let (handle, rx) = conn_channel(id, capacity);
+        let (handle, rx) = conn_channel(id, capacity, usize::MAX);
         self.hub.open(
             ConnInfo {
                 peer: SocketAddr::from(([203, 0, 113, 7], 51000)),
@@ -153,7 +153,7 @@ impl Client {
         self.items()
             .into_iter()
             .filter_map(|item| match item {
-                Outgoing::Line(m) => Some(*m),
+                Outgoing::Line(m) => Some(m.message().clone()),
                 Outgoing::Close { .. } => None,
             })
             .collect()
@@ -161,7 +161,7 @@ impl Client {
 
     fn items(&mut self) -> Vec<Outgoing> {
         let mut out = Vec::new();
-        while let Ok(item) = self.rx.rx.try_recv() {
+        while let Some(item) = self.rx.try_recv() {
             out.push(item);
         }
         out
@@ -352,7 +352,7 @@ async fn sign_in_timeout_closes_with_bye() {
     let mut prompt = h.connect();
     h.send(&prompt, "guest sam").await;
     assert_eq!(prompt.lines(), ["OK uid=~sam"]);
-    let item = tokio::time::timeout(Duration::from_secs(10), late.rx.rx.recv())
+    let item = tokio::time::timeout(Duration::from_secs(10), late.rx.recv())
         .await
         .expect("the connection is closed in time")
         .unwrap();
@@ -722,6 +722,23 @@ async fn msg_reaches_everyone_before_its_ok() {
 }
 
 #[tokio::test]
+async fn fan_out_shares_one_line() {
+    let mut h = Harness::new();
+    let (mut sam, _) = h.joined("sam", "#general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    sam.items();
+    h.send(&sam, "msg #general hi").await;
+    let line = |item: &Outgoing| match item {
+        Outgoing::Line(line) => line.clone(),
+        Outgoing::Close { .. } => panic!("a close"),
+    };
+    let to_sam = sam.items();
+    let to_bob = bob.items();
+    assert_eq!((to_sam.len(), to_bob.len()), (2, 1));
+    assert!(line(&to_sam[0]).ptr_eq(&line(&to_bob[0])));
+}
+
+#[tokio::test]
 async fn msg_needs_membership() {
     let mut h = Harness::new();
     let mut sam = h.guest("sam").await;
@@ -829,6 +846,83 @@ async fn a_resent_message_gets_its_seq_even_after_leaving() {
     sam.lines();
     h.send(&sam, &format!("@{cid} msg #general hi")).await;
     assert_eq!(sam.lines(), ["OK seq=2"]);
+}
+
+#[tokio::test]
+async fn a_resent_message_gets_its_seq_before_any_other_check() {
+    // The cid is checked first (7.6), so a resend gets the original seq
+    // even once the room is closed to guests, or private, and so not
+    // visible to a guest that has left it (PLAN.md 5, item 14).
+    for change in [
+        RoomSetting::Guests(GuestAccess::None),
+        RoomSetting::Guests(GuestAccess::Read),
+        RoomSetting::Public(false),
+    ] {
+        let mut h = Harness::new();
+        let (mut sam, _) = h.joined("sam", "#general").await;
+        let cid = "cid=0123456789abcdef";
+        h.send(&sam, &format!("@{cid} msg #general hi")).await;
+        assert_eq!(sam.lines().last().unwrap(), "OK seq=2");
+        h.send(&sam, "part #general").await;
+        sam.lines();
+        let room: Room = "#general".parse().unwrap();
+        let entry = h.hub.inner.room_entry(&room).unwrap();
+        entry.state.lock().await.settings.apply(&change);
+
+        h.send(&sam, &format!("@ref=1;{cid} msg #general hi")).await;
+        assert_eq!(sam.lines(), ["@ref=1 OK seq=2"], "{change:?}");
+        // A new message is refused as before.
+        h.send(&sam, "@ref=2 msg #general hi").await;
+        let refused = sam.lines();
+        assert_eq!(refused.len(), 1, "{change:?}");
+        assert!(refused[0].starts_with("@ref=2 ERR "), "{refused:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn old_cids_are_forgotten_every_hour() {
+    let h = Harness::new();
+    let room: Room = "#general".parse().unwrap();
+    let key = h.store.room(&room).unwrap().unwrap().key;
+    let alice: Uid = "alice@example.org".parse().unwrap();
+    let cid: risala_proto::types::Cid = "0123456789abcdef".parse().unwrap();
+    let event = NewEvent {
+        t: start(),
+        from: alice.clone(),
+        kind: EventKind::Msg {
+            relation: None,
+            file: None,
+            text: "hi".into(),
+        },
+        cid: Some(cid.clone()),
+    };
+    h.store.append(key, &event).unwrap();
+    // Asked as of when it was sent, so only pruning hides it.
+    let stored = || h.store.cid_seq(key, &alice, &cid, start()).unwrap();
+    assert!(stored().is_some());
+
+    let pruner = tokio::spawn(h.hub.clone().prune_cids_every(CID_PRUNE_PERIOD));
+    h.clock.advance(Duration::from_secs(25 * 60 * 60));
+    tokio::time::sleep(CID_PRUNE_PERIOD - Duration::from_secs(1)).await;
+    assert!(stored().is_some(), "pruned before the hour was up");
+    for _ in 0..1000 {
+        if stored().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(stored().is_none(), "not pruned after an hour");
+    pruner.abort();
+
+    // A cid from less than 24 hours ago stays.
+    let event = NewEvent {
+        t: h.clock.now(),
+        ..event
+    };
+    h.store.append(key, &event).unwrap();
+    assert_eq!(h.hub.prune_cids().await.unwrap(), 0);
+    let now = h.clock.now();
+    assert!(h.store.cid_seq(key, &alice, &cid, now).unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,6 +1246,140 @@ async fn a_slow_reader_is_dropped_alone() {
 // Persistence
 
 #[tokio::test]
+async fn guests_cut_off_by_a_crash_part_at_the_next_start() {
+    // 4.2 and PLAN.md 5, item 16: the PARTs a crash kept from being
+    // stored are recorded when the server starts again, once.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("risala.db");
+    let open = |path: &std::path::Path| -> Harness {
+        let store = SqliteStore::open(path).unwrap();
+        Harness::on(config(), Arc::new(store), Duration::from_secs(120))
+    };
+    let mut h = open(&path);
+    let room: Room = "#general".parse().unwrap();
+    let (_sam, _) = h.joined("sam", "#general").await;
+    let (_ann, _) = h.joined("ann", "#general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    h.send(&bob, "part #general").await;
+    bob.lines();
+    // The crash: the hub goes away without `closed`.
+    drop(h);
+
+    let h = open(&path);
+    let key = h.store.room(&room).unwrap().unwrap().key;
+    let all = HistoryQuery {
+        after: Some(0),
+        before: None,
+        limit: 100,
+    };
+    let lines = |page: &Page| -> Vec<String> {
+        page.events
+            .iter()
+            .map(|e| format!("{} {}", e.from, e.kind.verb()))
+            .collect()
+    };
+    let page = h.store.history(key, all).unwrap();
+    assert_eq!(
+        lines(&page),
+        [
+            "~sam JOIN",
+            "~ann JOIN",
+            "~bob JOIN",
+            "~bob PART",
+            "~ann PART",
+            "~sam PART"
+        ]
+    );
+    for e in &page.events[4..] {
+        assert_eq!(
+            e.kind,
+            EventKind::Part {
+                reason: String::new()
+            }
+        );
+    }
+    // Nobody is in the room, and the next start records nothing more.
+    assert_eq!(h.hub.inner.reg().member_count(&room), 0);
+    drop(h);
+    let h = open(&path);
+    assert_eq!(h.store.history(key, all).unwrap().events.len(), 6);
+    let mut h = h;
+    let mut sam = h.guest("sam").await;
+    h.send(&sam, "join #general").await;
+    assert!(sam.lines()[0].starts_with("@seq=7;"));
+}
+
+/// Runs only inside [`files_are_private_under_umask_022`], in a process
+/// with umask 022, with the directory to use in `RISALA_TEST_STATE_DIR`.
+#[cfg(unix)]
+#[test]
+fn private_files_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(base) = std::env::var_os("RISALA_TEST_STATE_DIR") else {
+        return;
+    };
+    let base = std::path::PathBuf::from(base);
+    let mode = |path: &std::path::Path| {
+        format!(
+            "{:o}",
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        )
+    };
+    // The umask is 022: a plain new file is readable by everyone.
+    let plain = base.join("plain");
+    std::fs::write(&plain, b"").unwrap();
+    assert_eq!(mode(&plain), "644");
+
+    let mut c = config();
+    c.state_dir = base.join("state").join("risala");
+    let hub = Hub::open(c.clone()).unwrap();
+    assert_eq!(mode(&c.state_dir), "700");
+    assert_eq!(mode(c.state_dir.parent().unwrap()), "700");
+    let db = c.database_path();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        assert_eq!(mode(name.as_ref()), "600", "risala.db{suffix}");
+    }
+    drop(hub);
+
+    // Files left open to others are closed to them on the next start.
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let hub = Hub::open(c).unwrap();
+    assert_eq!(mode(&db), "600");
+    drop(hub);
+}
+
+/// The state directory and the database are private whatever the umask
+/// (13). The umask belongs to the whole process, so the checks run in a
+/// child process, started through `sh` to set it.
+#[cfg(unix)]
+#[test]
+fn files_are_private_under_umask_022() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 022 && exec \"$0\" \"$@\"")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "core::tests::private_files_child",
+            "--test-threads=1",
+        ])
+        .env("RISALA_TEST_STATE_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "the child test failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    // The child ran its checks, rather than skipping them.
+    assert!(dir.path().join("plain").exists());
+}
+
+#[tokio::test]
 async fn a_restart_keeps_rooms_ids_and_history() {
     let dir = tempfile::tempdir().unwrap();
     let mut c = config();
@@ -1203,6 +1431,13 @@ async fn the_configuration_is_checked() {
     let mut c = config();
     c.hostname = "not a host".into();
     assert!(matches!(build(c), Err(HubError::Config(_))));
+    // The limits too (see Config::validate).
+    let mut c = config();
+    c.limits.out_queue = 10;
+    assert!(matches!(build(c), Err(HubError::Config(m)) if m.contains("out_queue")));
+    let mut c = config();
+    c.limits.ping_timeout_secs = 0;
+    assert!(matches!(build(c), Err(HubError::Config(m)) if m.contains("ping_timeout_secs")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1491,9 @@ impl Store for Flaky {
         now: Timestamp,
     ) -> crate::store::Result<Option<Seq>> {
         self.inner.cid_seq(c, f, cid, now)
+    }
+    fn guest_members(&self) -> crate::store::Result<Vec<(ConvKey, Uid)>> {
+        self.inner.guest_members()
     }
     fn prune_cids(&self, b: Timestamp) -> crate::store::Result<u64> {
         self.inner.prune_cids(b)

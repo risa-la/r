@@ -1,7 +1,7 @@
 //! Tests of the cache.
 
 use risala_proto::fingerprint::Fingerprint;
-use risala_proto::names::{Conv, Id, Seq, Uid};
+use risala_proto::names::{Conv, Id, Room, Seq, Uid};
 use risala_proto::server::{Event, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Relation, Role, RoomSetting};
@@ -590,4 +590,27 @@ fn outbox_entries() {
     );
     store.remove_outbox(b).unwrap();
     assert!(store.outbox_item(b).unwrap().is_none());
+}
+
+#[test]
+fn rooms_to_rejoin() {
+    let store = Store::open_in_memory().unwrap();
+    let a = store.account(&addr(), &uid("~sam")).unwrap();
+    let b = store.account(&addr(), &uid("~ann")).unwrap();
+    let general: Room = "#general".parse().unwrap();
+    let dev: Room = "#dev".parse().unwrap();
+    assert!(store.rejoin_rooms(a).unwrap().is_empty());
+    store.set_rejoin(a, &general, true).unwrap();
+    store.set_rejoin(a, &dev, true).unwrap();
+    store.set_rejoin(a, &dev, true).unwrap();
+    store.set_rejoin(b, &dev, true).unwrap();
+    assert_eq!(
+        store.rejoin_rooms(a).unwrap(),
+        [dev.clone(), general.clone()]
+    );
+    store.set_rejoin(a, &dev, false).unwrap();
+    assert_eq!(store.rejoin_rooms(a).unwrap(), [general]);
+    store.remove_account(a).unwrap();
+    assert!(store.rejoin_rooms(a).unwrap().is_empty());
+    assert_eq!(store.rejoin_rooms(b).unwrap(), [dev]);
 }
