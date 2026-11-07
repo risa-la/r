@@ -440,8 +440,12 @@ pub enum ServerLine {
         /// The message, escaped, not empty.
         message: String,
     },
-    /// `DROP <room> [<reason...>]`: an operator deleted the room (10.4).
+    /// `@id=<id> DROP <room> [<reason...>]`: an operator deleted the room
+    /// (10.4).
     Drop {
+        /// The `id` tag: the id of the room that was dropped (5.1). A
+        /// client ignores a DROP for an id it has not stored for the room.
+        id: Option<Id>,
         /// The room.
         room: Room,
         /// The reason, escaped; empty if none.
@@ -625,7 +629,10 @@ impl ServerLine {
                 }
                 b.text(message);
             }
-            ServerLine::Drop { room, reason } => {
+            ServerLine::Drop { id, room, reason } => {
+                if let Some(id) = id {
+                    b.tag("id", id);
+                }
                 b.token(room).text(reason);
             }
             ServerLine::Op { uid } => {
@@ -801,9 +808,10 @@ fn parse_response(
             }
         }
         "DROP" => {
+            let id = parse_tag(tags, "id")?;
             let room = token(&mut p)?;
             let reason = p.text().to_owned();
-            ServerLine::Drop { room, reason }
+            ServerLine::Drop { id, room, reason }
         }
         "OP" => {
             let uid = token(&mut p)?;
@@ -3112,6 +3120,8 @@ mod tests {
         );
         round_trip("DROP #general");
         round_trip("DROP #general spam haven");
+        round_trip("@id=k7x2m9q4w1z8 DROP #general spam haven");
+        syntax("@id DROP #general");
         syntax("DROP");
         round_trip("OP alice@example.org");
         syntax("OP");
