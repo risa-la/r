@@ -10,6 +10,8 @@
 //! state_dir = "/var/lib/risala"
 //! operators = ["alice@example.org"]
 //! rooms = ["#general"]
+//! identity_domain = "example.org"
+//! room_creation = "identities"
 //!
 //! [[tls.certs]]
 //! cert = "/var/lib/acme/chat.example.org/fullchain.pem"
@@ -18,7 +20,11 @@
 //! [server]
 //! welcome = "Welcome!"
 //! guests = true
+//! registration = true
 //! retention = "forever"
+//!
+//! [limits]
+//! registrations_per_hour = 5
 //!
 //! [keys]
 //! allow_private = false
@@ -32,6 +38,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use risala_proto::frame::MAX_SERVER_LINE;
+use risala_proto::names::{Domain, Identity};
 use serde::Deserialize;
 
 /// The whole configuration file.
@@ -53,6 +60,17 @@ pub struct Config {
     /// rooms (4.2), so a guests-only server needs at least one. Created at
     /// startup if missing, never deleted because they left this list.
     pub rooms: Vec<String>,
+    /// The server's identity domain (4.6): REGISTER creates identities
+    /// `<name>@<identity_domain>`, which the server hosts, and INFO reports
+    /// it (8.5). The server must then publish their key files at
+    /// `https://<identity_domain>/.well-known/risala/<name>` (4.3). Without
+    /// it, the server hosts no identities, and REGISTER and KEY get
+    /// `ERR not-supported`. Whether REGISTER is open is the server setting
+    /// `registration` (10.6), first set from `server.registration`.
+    pub identity_domain: Option<String>,
+    /// Who may create a room by joining one that does not exist (6.1).
+    /// Guests never may (4.2).
+    pub room_creation: RoomCreation,
     /// TLS certificates.
     pub tls: TlsConfig,
     /// Server settings. ADMIN SET (10.6) changes them at run time; these
@@ -109,6 +127,22 @@ pub struct HttpConfig {
     pub key_dir: Option<PathBuf>,
 }
 
+/// Who may create rooms by joining them (6.1): `room_creation` in the
+/// configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoomCreation {
+    /// Any identity. The default.
+    #[default]
+    Identities,
+    /// Only identities the server hosts (4.6), and operators.
+    Hosted,
+    /// Only the server's operators (10.1).
+    Operators,
+    /// Nobody: rooms come only from `rooms`.
+    Nobody,
+}
+
 /// TLS certificates (2.1, 2.2).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -140,6 +174,9 @@ pub struct ServerConfig {
     pub welcome: String,
     /// Whether guests may connect.
     pub guests: bool,
+    /// Whether REGISTER is open (10.6). It takes effect only with an
+    /// `identity_domain`.
+    pub registration: bool,
     /// The retention period: a number of days as a string, or `forever`.
     pub retention: String,
 }
@@ -177,6 +214,10 @@ pub struct Limits {
     pub max_page: u64,
     /// The most rooms one LIST page returns (6.1).
     pub max_list: u64,
+    /// The most identities REGISTER may create from one network address in
+    /// an hour (13, 14). IPv6 addresses count by their /64. Further
+    /// REGISTERs get `ERR rate-limited`. 0 means no limit.
+    pub registrations_per_hour: u32,
 }
 
 /// The most lines a command's response has besides a full page of events
@@ -236,6 +277,8 @@ impl Default for Config {
             state_dir: PathBuf::from("."),
             operators: Vec::new(),
             rooms: Vec::new(),
+            identity_domain: None,
+            room_creation: RoomCreation::default(),
             tls: TlsConfig::default(),
             server: ServerConfig::default(),
             limits: Limits::default(),
@@ -264,6 +307,7 @@ impl Default for ServerConfig {
         ServerConfig {
             welcome: String::new(),
             guests: true,
+            registration: false,
             retention: "forever".into(),
         }
     }
@@ -280,6 +324,7 @@ impl Default for Limits {
             out_queue_bytes: 16 * 1024 * 1024,
             max_page: 500,
             max_list: 500,
+            registrations_per_hour: 5,
         }
     }
 }
@@ -326,15 +371,25 @@ impl Config {
         toml::from_str(text)
     }
 
-    /// Checks the limits for values that cannot work: timers of zero, pages
-    /// of no lines, and queues too short for a response (see
-    /// [`Limits::command_room`]).
+    /// Checks for values that cannot work: an identity domain or operator
+    /// that is not one, timers of zero, pages of no lines, and queues too
+    /// short for a response (see [`Limits::command_room`]).
     ///
     /// Returns warnings for values that work but go against what the spec
     /// recommends, for the caller to log.
     pub fn validate(&self) -> Result<Vec<String>, ConfigError> {
         let l = &self.limits;
         let invalid = |message: String| Err(ConfigError::Invalid(message));
+        if let Some(domain) = &self.identity_domain
+            && let Err(e) = domain.parse::<Domain>()
+        {
+            return invalid(format!("identity_domain {domain:?} is not a domain: {e}"));
+        }
+        for op in &self.operators {
+            if let Err(e) = op.parse::<Identity>() {
+                return invalid(format!("operator {op:?} is not an identity: {e}"));
+            }
+        }
         for (name, value) in [
             ("sign_in_secs", l.sign_in_secs),
             ("idle_ping_secs", l.idle_ping_secs),
@@ -398,6 +453,20 @@ impl Config {
         Ok(warnings)
     }
 
+    /// The identity domain (4.6), if the server has one.
+    pub fn identity_domain(&self) -> Option<Domain> {
+        self.identity_domain.as_deref().and_then(|d| d.parse().ok())
+    }
+
+    /// The operators from the configuration (10.1), leaving out any that
+    /// are not identities (see [`validate`](Self::validate)).
+    pub fn operators(&self) -> Vec<Identity> {
+        self.operators
+            .iter()
+            .filter_map(|op| op.parse().ok())
+            .collect()
+    }
+
     /// The path of the SQLite database.
     pub fn database_path(&self) -> PathBuf {
         self.state_dir.join("risala.db")
@@ -424,6 +493,44 @@ mod tests {
         assert!(c.server.guests);
         assert_eq!(c.limits.sign_in_secs, 120);
         assert_eq!(c.limits.guest_resume_secs, 300);
+        assert_eq!(c.identity_domain, None);
+        assert!(!c.server.registration);
+        assert_eq!(c.room_creation, RoomCreation::Identities);
+        assert_eq!(c.limits.registrations_per_hour, 5);
+    }
+
+    #[test]
+    fn identity_settings() {
+        let c = Config::parse(
+            r##"
+            identity_domain = "Example.org"
+            room_creation = "operators"
+            operators = ["alice@example.org"]
+            [server]
+            registration = true
+            [limits]
+            registrations_per_hour = 0
+            "##,
+        )
+        .unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.identity_domain().unwrap().as_str(), "example.org");
+        assert_eq!(c.room_creation, RoomCreation::Operators);
+        assert!(c.server.registration);
+        assert_eq!(c.limits.registrations_per_hour, 0);
+        assert_eq!(c.operators()[0].to_string(), "alice@example.org");
+        assert!(Config::parse("room_creation = \"everyone\"").is_err());
+        for (text, what) in [
+            ("identity_domain = \"not a domain\"", "identity_domain"),
+            ("identity_domain = \"127.0.0.1\"", "identity_domain"),
+            ("operators = [\"~sam\"]", "operator"),
+            ("operators = [\"example.org\"]", "operator"),
+        ] {
+            match Config::parse(text).unwrap().validate() {
+                Err(ConfigError::Invalid(m)) => assert!(m.contains(what), "{m}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
     }
 
     #[test]

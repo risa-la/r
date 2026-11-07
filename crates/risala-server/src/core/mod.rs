@@ -264,7 +264,7 @@ impl Hub {
         }
         let defaults = ServerSettings {
             guests: config.server.guests,
-            registration: false,
+            registration: config.server.registration,
             retention,
             welcome: config.server.welcome.clone(),
         };
