@@ -1,6 +1,6 @@
 //! Strings into every `FromStr` of the name, value and key types (SPEC
-//! 2.2, 3.4, 3.5, 4.4, 4.5, 5.3, 5.7, 6.2, 10.2, 10.6), and into the text
-//! functions (3.4, 5.5).
+//! 2.2, 3.4, 3.5, 4.4, 4.5, 5.3, 5.7, 6.2, 7.2, 10.2, 10.6, 12), and into
+//! the text functions (3.4, 5.5).
 //!
 //! Whatever parses must display as a string that parses back to the same
 //! value and displays the same again.
@@ -16,14 +16,19 @@ use risala_proto::error::ErrorCode;
 use risala_proto::fingerprint::Fingerprint;
 use risala_proto::frame::check_line;
 use risala_proto::keyfile::KeyEntry;
+use risala_proto::mls::{
+    BackupBlob, Ciphertext, CommitMessage, Content, Frank, FrankKey, GroupInfo, KeyPackage,
+    RatchetTree, Welcome, is_strict_base64,
+};
 use risala_proto::names::{
     BlockTarget, Conv, Domain, Id, Identity, IpPrefix, Name, Room, Seq, ServerBanTarget, Uid,
 };
 use risala_proto::text::{escape, mentions, unescape};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
-    Cid, GuestAccess, InfoRole, Presence, PushReason, PushTag, Ref, Relation, Role, RoomRetention,
-    RoomSetting, ServerRetention, ServerSetting, parse_u64, parse_yes_no,
+    Cid, GuestAccess, HistoryMode, HistoryOnly, InfoRole, Presence, PushReason, PushTag, Ref,
+    Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting, parse_u64,
+    parse_yes_no,
 };
 
 fn round_trip<T>(s: &str)
@@ -73,6 +78,25 @@ fuzz_target!(|data: &[u8]| {
     round_trip::<RoomSetting>(s);
     round_trip::<ServerSetting>(s);
     round_trip::<ErrorCode>(s);
+    round_trip::<HistoryMode>(s);
+    round_trip::<HistoryOnly>(s);
+
+    round_trip::<KeyPackage>(s);
+    round_trip::<GroupInfo>(s);
+    round_trip::<CommitMessage>(s);
+    round_trip::<Welcome>(s);
+    round_trip::<RatchetTree>(s);
+    round_trip::<Ciphertext>(s);
+    round_trip::<Content>(s);
+    round_trip::<Frank>(s);
+    round_trip::<FrankKey>(s);
+    round_trip::<BackupBlob>(s);
+    // Strict base64 is exactly what the standard decoder accepts and
+    // encodes back unchanged.
+    if let Ok(blob) = s.parse::<KeyPackage>() {
+        assert!(is_strict_base64(s));
+        assert_eq!(KeyPackage::from_bytes(&blob.decode()).as_ref(), Ok(&blob));
+    }
 
     round_trip::<PublicKey>(s);
     round_trip::<Signature>(s);

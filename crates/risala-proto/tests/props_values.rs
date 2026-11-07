@@ -12,12 +12,14 @@ use std::str::FromStr;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
+use risala_proto::command::{Command, Request};
 use risala_proto::error::{ErrorCode, ParseError};
 use risala_proto::frame::check_line;
 use risala_proto::line::Line;
 use risala_proto::names::{
     BlockTarget, Conv, Domain, Id, Identity, IpPrefix, Name, Room, Seq, ServerBanTarget, Uid,
 };
+use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
 use risala_proto::text::{escape, mentions, unescape};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
@@ -290,6 +292,36 @@ proptest! {
         let _ = Seq::parse_or_zero(&s);
         let _ = Room::from_bare(&s);
     }
+
+    /// `GUEST <name> [token=<token>]` round-trips as a request, and its
+    /// `OK uid=~<name> token=<token>` gives both back (4.2).
+    #[test]
+    fn guest_round_trips(name in name(), token in proptest::option::of(id())) {
+        let command = Command::Guest {
+            name: name.parse()?,
+            token: token.as_deref().map(str::parse).transpose()?,
+        };
+        let request = Request::new(command.clone());
+        let line = request.to_line().to_string();
+        let expected = match &token {
+            Some(t) => format!("GUEST {name} token={t}"),
+            None => format!("GUEST {name}"),
+        };
+        prop_assert_eq!(&line, &expected);
+        let parsed = Request::parse(&line.parse::<Line>()?)?;
+        prop_assert_eq!(&parsed.command, &command);
+        prop_assert_eq!(parsed.validate(), Ok(()));
+
+        let uid: Uid = format!("~{name}").parse()?;
+        let mut ok = OkResponse::new().with_uid(&uid);
+        if let Some(t) = &token {
+            ok = ok.with_token(&t.parse()?);
+        }
+        let back: ServerMessage = ServerMessage::new(ServerLine::Ok(ok)).to_line().to_string().parse()?;
+        let ServerLine::Ok(ok) = back.line else { return Err(fail("not OK")) };
+        prop_assert_eq!(ok.uid()?, Some(uid));
+        prop_assert_eq!(ok.token()?.map(|t| t.to_string()), token);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +330,7 @@ proptest! {
 /// A slow, obvious calendar: the wire form of `ms`, counting whole years
 /// and months from 1970.
 fn naive_timestamp(ms: u64) -> String {
-    let leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let mut days = ms / 86_400_000;
     let rest = ms % 86_400_000;
     let mut year = 1970;
@@ -342,7 +374,7 @@ fn naive_timestamp(ms: u64) -> String {
 
 /// Whether the fields make a timestamp in range (3.5).
 fn naive_valid(y: u64, mo: u64, d: u64, h: u64, mi: u64, s: u64) -> bool {
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let month_len = match mo {
         2 if leap => 29,
         2 => 28,

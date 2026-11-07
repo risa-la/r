@@ -2,8 +2,25 @@
 //!
 //! [`LineDecoder`] is sans-I/O: feed it bytes as they arrive with
 //! [`LineDecoder::push`] and take lines out with
-//! [`LineDecoder::next_line`]. [`check_line`] and [`check_line_len`] apply
-//! the same rules to lines about to be sent.
+//! [`LineDecoder::next_line`]. [`check_line`], [`check_line_len`] and
+//! [`LineLimits::check`] apply the same rules to lines about to be sent.
+//!
+//! # Long lines
+//!
+//! Lines that carry MLS data or encrypted content (Section 12) may be much
+//! longer than others. From a client, a line whose verb is one of
+//! [`CLIENT_LONG_VERBS`] may be up to [`MAX_LONG_CLIENT_LINE`] bytes; from
+//! a server, one whose verb is one of [`SERVER_LONG_VERBS`] may be up to
+//! [`MAX_LONG_SERVER_LINE`]. Every other line keeps the normal limit.
+//! [`LineLimits`] holds both limits of one direction and its long verbs.
+//!
+//! The long data always comes after the verb, so the start of every line,
+//! up to the end of its verb, must fit the normal limit, tags included
+//! (2.3). The decoder reads the verb as the line arrives: until the verb
+//! has ended, the normal limit applies, and once it shows that the line
+//! is long, the long limit does. A server applies only the normal limits
+//! before a connection signs in (2.3), with [`LineLimits::uniform`], and
+//! switches with [`LineDecoder::set_limits`].
 
 use std::collections::VecDeque;
 
@@ -16,6 +33,123 @@ pub const MAX_CLIENT_LINE: usize = 8192;
 
 /// The longest line a server may send, in bytes, including the LF (2.3).
 pub const MAX_SERVER_LINE: usize = 16384;
+
+/// The longest line a client may send whose verb is one of
+/// [`CLIENT_LONG_VERBS`]: 8 MiB, including the LF (2.3).
+pub const MAX_LONG_CLIENT_LINE: usize = 8 * 1024 * 1024;
+
+/// The longest line a server may send whose verb is one of
+/// [`SERVER_LONG_VERBS`]: 8 MiB plus 16384 bytes, including the LF (2.3).
+/// The difference leaves room for the tags a server adds.
+pub const MAX_LONG_SERVER_LINE: usize = MAX_LONG_CLIENT_LINE + MAX_SERVER_LINE;
+
+/// The verbs of client lines that may be long (2.3), in upper case: the
+/// commands that carry MLS data or encrypted content.
+pub const CLIENT_LONG_VERBS: [&str; 5] = ["COMMIT", "ENC", "INIT", "KEYPKG", "REPORTENC"];
+
+/// The verbs of server lines that may be long (2.3), in upper case.
+/// Servers never send INIT.
+pub const SERVER_LONG_VERBS: [&str; 6] = [
+    "COMMIT",
+    "ENC",
+    "GROUPINFO",
+    "KEYPKG",
+    "REPORTENC",
+    "WELCOME",
+];
+
+/// The length of the longest verb in [`CLIENT_LONG_VERBS`] and
+/// [`SERVER_LONG_VERBS`]. A longer verb is never long.
+const LONGEST_LONG_VERB: usize = 9;
+
+fn contains_verb(verbs: &[&str], verb: &[u8]) -> bool {
+    verbs
+        .iter()
+        .any(|long| long.as_bytes().eq_ignore_ascii_case(verb))
+}
+
+/// The length limits of one direction of a connection (2.3), each in
+/// bytes including the LF: `normal` for most lines, `long` for lines whose
+/// verb is one of `long_verbs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LineLimits {
+    /// The limit for lines whose verb is not in `long_verbs`. Everything
+    /// up to the end of a line's verb must fit it, tags included.
+    pub normal: usize,
+    /// The limit for lines whose verb is in `long_verbs`. Never less
+    /// than `normal`.
+    pub long: usize,
+    /// The verbs of lines that may be long, in upper case, at most
+    /// nine letters each: [`CLIENT_LONG_VERBS`] or
+    /// [`SERVER_LONG_VERBS`]. Verbs are matched case-insensitively.
+    pub long_verbs: &'static [&'static str],
+}
+
+impl LineLimits {
+    /// The limits of lines from a client (2.3): what a server's decoder
+    /// applies once the connection has signed in, and what a client
+    /// checks before it sends.
+    pub const CLIENT: LineLimits = LineLimits {
+        normal: MAX_CLIENT_LINE,
+        long: MAX_LONG_CLIENT_LINE,
+        long_verbs: &CLIENT_LONG_VERBS,
+    };
+
+    /// The limits of lines from a server (2.3): what a client's decoder
+    /// applies, and what a server checks before it sends.
+    pub const SERVER: LineLimits = LineLimits {
+        normal: MAX_SERVER_LINE,
+        long: MAX_LONG_SERVER_LINE,
+        long_verbs: &SERVER_LONG_VERBS,
+    };
+
+    /// The same limit for every line, with no long verbs. A server's
+    /// decoder uses `uniform(MAX_CLIENT_LINE)` until the connection signs
+    /// in (2.3).
+    pub const fn uniform(max_len: usize) -> LineLimits {
+        LineLimits {
+            normal: max_len,
+            long: max_len,
+            long_verbs: &[],
+        }
+    }
+
+    /// Whether a line with this verb may be long (2.3). Verbs are
+    /// case-insensitive.
+    pub fn is_long_verb(&self, verb: &str) -> bool {
+        contains_verb(self.long_verbs, verb.as_bytes())
+    }
+
+    /// The limit for a line with this verb, if the line's start up to the
+    /// end of the verb fits the normal limit.
+    pub fn for_verb(&self, verb: &str) -> usize {
+        if self.is_long_verb(verb) {
+            self.long.max(self.normal)
+        } else {
+            self.normal
+        }
+    }
+
+    /// Checks that `line`, without its line ending, fits its limit once
+    /// the LF is added, judging by its verb as [`LineDecoder`] does: the
+    /// long limit applies only if the verb is long and ends within the
+    /// normal limit. Fails with [`ParseError::TooLong`].
+    pub fn check(&self, line: &str) -> Result<(), ParseError> {
+        let mut scan = VerbScan::default();
+        scan.feed(line.as_bytes());
+        scan.finish();
+        check_line_len(line, self.max_for(&scan))
+    }
+
+    /// The limit for a line whose start `scan` has read.
+    fn max_for(&self, scan: &VerbScan) -> usize {
+        if scan.is_long(self) {
+            self.long.max(self.normal)
+        } else {
+            self.normal
+        }
+    }
+}
 
 /// Whether `c` is a control character forbidden in a line (2.3): %x00-08,
 /// %x0A-1F, %x7F and the C1 controls U+0080 to U+009F. TAB (%x09) is
@@ -46,12 +180,102 @@ pub fn check_line(line: &str) -> Result<(), ParseError> {
 
 /// Checks that `line`, without its line ending, fits in `max_len` bytes
 /// once the LF is added (2.3). Pass [`MAX_CLIENT_LINE`] or
-/// [`MAX_SERVER_LINE`]. Fails with [`ParseError::TooLong`].
+/// [`MAX_SERVER_LINE`], or use [`LineLimits::check`] to take long lines
+/// into account. Fails with [`ParseError::TooLong`].
 pub fn check_line_len(line: &str, max_len: usize) -> Result<(), ParseError> {
     if line.len() < max_len {
         Ok(())
     } else {
         Err(ParseError::TooLong)
+    }
+}
+
+/// Reads the verb at the start of a line, a few bytes at a time, to tell
+/// whether the line may be long (2.3).
+///
+/// It skips the tags (`@` up to the first space) and any spaces after
+/// them, then reads letters. It stops at the first byte after the verb,
+/// or once the verb is longer than any long verb. So each byte of a line
+/// is looked at most once. It records where the verb ended, since a line
+/// is long only if its verb ends within the normal limit, and leaves the
+/// verdict to [`is_long`](Self::is_long), so that a change of limits
+/// halfway through a line applies to it.
+#[derive(Clone, Copy, Debug, Default)]
+struct VerbScan {
+    phase: Phase,
+    verb: [u8; LONGEST_LONG_VERB],
+    len: usize,
+    /// The number of bytes read so far, until the scan is done.
+    pos: usize,
+    /// The index of the byte after the verb, once the verb has ended: a
+    /// space, any other non-letter, or the end of the line.
+    end: Option<usize>,
+    /// The verb is longer than any long verb.
+    overlong: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Start,
+    Tags,
+    Gap,
+    Verb,
+}
+
+impl VerbScan {
+    fn done(&self) -> bool {
+        self.end.is_some() || self.overlong
+    }
+
+    /// Reads more bytes of the line. Does nothing once the verb has ended.
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.done() {
+                return;
+            }
+            match self.phase {
+                Phase::Start if b == b'@' => self.phase = Phase::Tags,
+                Phase::Tags if b == b' ' => self.phase = Phase::Gap,
+                Phase::Tags => {}
+                Phase::Gap if b == b' ' => {}
+                Phase::Start | Phase::Gap | Phase::Verb => {
+                    self.phase = Phase::Verb;
+                    self.verb_byte(b);
+                }
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn verb_byte(&mut self, b: u8) {
+        if !b.is_ascii_alphabetic() {
+            self.end = Some(self.pos);
+        } else if self.len == LONGEST_LONG_VERB {
+            self.overlong = true;
+        } else {
+            self.verb[self.len] = b;
+            self.len += 1;
+        }
+    }
+
+    /// Marks the end of the line: a verb still being read ends here.
+    fn finish(&mut self) {
+        if self.phase == Phase::Verb && !self.done() {
+            self.end = Some(self.pos);
+        }
+    }
+
+    /// Whether the line may be long under `limits`: its verb has ended,
+    /// within the normal limit, and is one of the long verbs. Until the
+    /// verb has ended, it may not.
+    fn is_long(&self, limits: &LineLimits) -> bool {
+        match self.end {
+            Some(end) if !self.overlong => {
+                end < limits.normal && contains_verb(limits.long_verbs, &self.verb[..self.len])
+            }
+            _ => false,
+        }
     }
 }
 
@@ -62,24 +286,30 @@ pub fn check_line_len(line: &str, max_len: usize) -> Result<(), ParseError> {
 /// - Each line is checked to be UTF-8 ([`ParseError::InvalidUtf8`]) and
 ///   free of control characters other than TAB
 ///   ([`ParseError::ControlChar`]).
-/// - A line longer than `max_len` bytes, counting its CR and LF, is
-///   reported once as [`ParseError::TooLong`] as soon as it is known to be
-///   too long, and the rest of it is discarded up to and including the
-///   next LF. The next line starts after that LF.
+/// - A line longer than its limit ([`LineLimits`]), counting its CR and
+///   LF, is reported once as [`ParseError::TooLong`] as soon as it is
+///   known to be too long, and the rest of it is discarded up to and
+///   including the next LF. The next line starts after that LF. The limit
+///   is the long one for a line whose verb is one of the limits' long
+///   verbs and ends within the normal limit, and the normal one
+///   otherwise. Until the verb has ended, the normal limit applies, so
+///   tags can never make a line long (2.3).
 /// - Empty lines are yielded as `Ok("")`. Callers ignore them, but they
 ///   still count as activity for keepalive (11).
 /// - Bytes after the last LF are kept until more data arrives. An
 ///   unfinished line at the end of the stream is not a line.
 ///
-/// Memory: the decoder never holds more than `max_len - 1` bytes of an
-/// unfinished line, including while it discards a long one. Complete
-/// lines found by [`push`](Self::push) are queued until taken with
+/// Memory: the decoder never holds more than `normal - 1` bytes of an
+/// unfinished line until its verb shows that it is long, never more than
+/// `long - 1` bytes, and none while it discards a long one. Complete lines
+/// found by [`push`](Self::push) are queued until taken with
 /// [`next_line`](Self::next_line), so a caller that pushes a bounded
 /// buffer and then drains the decoder keeps memory bounded too.
 #[derive(Debug, Clone)]
 pub struct LineDecoder {
-    max_len: usize,
+    limits: LineLimits,
     partial: Vec<u8>,
+    scan: VerbScan,
     discarding: bool,
     /// Each finished line, and for a bad line the `ref` tag read from it.
     ready: VecDeque<(Result<String, ParseError>, Option<Ref>)>,
@@ -87,20 +317,53 @@ pub struct LineDecoder {
 
 impl LineDecoder {
     /// Creates a decoder for lines of at most `max_len` bytes including
-    /// the LF: [`MAX_CLIENT_LINE`] on a server, [`MAX_SERVER_LINE`] on a
-    /// client (2.3).
+    /// the LF, whatever their verb: [`LineLimits::uniform`].
     pub fn new(max_len: usize) -> Self {
+        LineDecoder::with_limits(LineLimits::uniform(max_len))
+    }
+
+    /// Creates a decoder with these limits: [`LineLimits::CLIENT`] on a
+    /// server once the connection has signed in, [`LineLimits::SERVER`]
+    /// on a client (2.3).
+    pub fn with_limits(limits: LineLimits) -> Self {
         LineDecoder {
-            max_len,
+            limits: LineLimits {
+                long: limits.long.max(limits.normal),
+                ..limits
+            },
             partial: Vec::new(),
+            scan: VerbScan::default(),
             discarding: false,
             ready: VecDeque::new(),
         }
     }
 
-    /// The limit this decoder was created with.
+    /// Changes the limits, for example when a connection signs in (2.3).
+    /// Lines already complete keep the verdict they had. The line in
+    /// progress is judged by the new limits from the next byte on; if it
+    /// already holds more bytes than they allow, it is reported as too
+    /// long at its next byte.
+    pub fn set_limits(&mut self, limits: LineLimits) {
+        self.limits = LineLimits {
+            long: limits.long.max(limits.normal),
+            ..limits
+        };
+    }
+
+    /// The limits this decoder applies.
+    pub fn limits(&self) -> LineLimits {
+        self.limits
+    }
+
+    /// The normal limit this decoder applies, the one for lines whose verb
+    /// is not long.
     pub fn max_len(&self) -> usize {
-        self.max_len
+        self.limits.normal
+    }
+
+    /// The limit for the line in progress, as far as its verb is known.
+    fn current_max(&self) -> usize {
+        self.limits.max_for(&self.scan)
     }
 
     /// Feeds bytes from the stream. Lines they complete become available
@@ -110,11 +373,13 @@ impl LineDecoder {
             let Some(lf) = data.iter().position(|&b| b == b'\n') else {
                 // No line ending: the bytes belong to an unfinished line.
                 if !self.discarding {
-                    if self.partial.len() + data.len() >= self.max_len {
+                    self.scan.feed(data);
+                    if self.partial.len() + data.len() >= self.current_max() {
                         // Even an LF right after these bytes would be over
                         // the limit.
                         let r = self.prefix_ref(data, false);
-                        self.partial.clear();
+                        self.partial = Vec::new();
+                        self.scan = VerbScan::default();
                         self.discarding = true;
                         self.ready.push_back((Err(ParseError::TooLong), r));
                     } else {
@@ -130,9 +395,13 @@ impl LineDecoder {
                 self.discarding = false;
                 continue;
             }
-            if self.partial.len() + segment.len() + 1 > self.max_len {
+            self.scan.feed(segment);
+            self.scan.finish();
+            let max = self.limits.max_for(&self.scan);
+            self.scan = VerbScan::default();
+            if self.partial.len() + segment.len() + 1 > max {
                 let r = self.prefix_ref(segment, true);
-                self.partial.clear();
+                self.partial = Vec::new();
                 self.ready.push_back((Err(ParseError::TooLong), r));
                 continue;
             }
@@ -141,7 +410,12 @@ impl LineDecoder {
             } else {
                 self.partial.extend_from_slice(segment);
                 let entry = decode(&self.partial);
-                self.partial.clear();
+                // Let go of a long line's buffer rather than keep it.
+                if self.partial.capacity() > self.limits.normal {
+                    self.partial = Vec::new();
+                } else {
+                    self.partial.clear();
+                }
                 entry
             };
             self.ready.push_back(entry);
@@ -168,16 +442,19 @@ impl LineDecoder {
         if self.partial.is_empty() {
             find_ref(more, complete)
         } else if self.partial.first() == Some(&b'@') {
+            // The tags end at the first space; only they are searched, so
+            // copy at most the normal limit's worth.
+            let room = self.limits.normal.saturating_sub(self.partial.len());
             let mut bytes = self.partial.clone();
-            bytes.extend_from_slice(more);
-            find_ref(&bytes, complete)
+            bytes.extend_from_slice(&more[..more.len().min(room)]);
+            find_ref(&bytes, complete && more.len() <= room)
         } else {
             None
         }
     }
 
     /// The number of bytes held for the unfinished line. Always less than
-    /// `max_len`, and zero while a long line is being discarded.
+    /// the long limit, and zero while a long line is being discarded.
     pub fn pending_bytes(&self) -> usize {
         self.partial.len()
     }
@@ -490,6 +767,234 @@ mod tests {
             decode_all(0, b"ab\n\n"),
             vec![Err(ParseError::TooLong), Err(ParseError::TooLong)]
         );
+    }
+
+    #[test]
+    fn long_limits() {
+        assert_eq!(MAX_LONG_CLIENT_LINE, 8_388_608);
+        assert_eq!(MAX_LONG_SERVER_LINE, 8_388_608 + 16_384);
+        for verb in CLIENT_LONG_VERBS.iter().chain(&SERVER_LONG_VERBS) {
+            assert!(verb.len() <= LONGEST_LONG_VERB);
+            assert_eq!(verb.to_ascii_uppercase(), *verb);
+        }
+        let client = LineLimits::CLIENT;
+        let server = LineLimits::SERVER;
+        for verb in ["COMMIT", "ENC", "KEYPKG", "REPORTENC", "reportenc", "Enc"] {
+            assert!(client.is_long_verb(verb), "{verb}");
+            assert!(server.is_long_verb(verb), "{verb}");
+        }
+        // Clients send INIT; servers send GROUPINFO and WELCOME lines.
+        assert!(client.is_long_verb("INIT"));
+        assert!(!server.is_long_verb("INIT"));
+        for verb in ["GROUPINFO", "WELCOME"] {
+            assert!(!client.is_long_verb(verb));
+            assert!(server.is_long_verb(verb));
+        }
+        for verb in ["MSG", "REPORT", "ENCX", "BACKUP", ""] {
+            assert!(!client.is_long_verb(verb), "{verb}");
+            assert!(!server.is_long_verb(verb), "{verb}");
+        }
+        assert_eq!(client.for_verb("enc"), MAX_LONG_CLIENT_LINE);
+        assert_eq!(client.for_verb("MSG"), MAX_CLIENT_LINE);
+        assert_eq!(server.for_verb("COMMIT"), MAX_LONG_SERVER_LINE);
+        assert_eq!(LineLimits::uniform(10).for_verb("ENC"), 10);
+        assert!(!LineLimits::uniform(10).is_long_verb("ENC"));
+    }
+
+    /// Small limits that behave like the real ones: normal 16, long 64.
+    const SMALL: LineLimits = LineLimits {
+        normal: 16,
+        long: 64,
+        long_verbs: &CLIENT_LONG_VERBS,
+    };
+
+    fn decode_small(input: &[u8]) -> Vec<Result<String, ParseError>> {
+        let mut d = LineDecoder::with_limits(SMALL);
+        d.push(input);
+        let all = drain(&mut d);
+        // The same, a byte at a time.
+        let mut d = LineDecoder::with_limits(SMALL);
+        let mut bytewise = Vec::new();
+        for b in input {
+            d.push(std::slice::from_ref(b));
+            assert!(d.pending_bytes() < SMALL.long);
+            bytewise.extend(drain(&mut d));
+        }
+        assert_eq!(bytewise, all);
+        all
+    }
+
+    #[test]
+    fn long_verbs_get_the_long_limit() {
+        let enc = format!("ENC #r 1 {}", "A".repeat(40));
+        let msg = format!("MSG #r {}", "a".repeat(40));
+        let input = format!("{enc}\n{msg}\nPING\n");
+        assert_eq!(
+            decode_small(input.as_bytes()),
+            vec![ok(&enc), Err(ParseError::TooLong), ok("PING")]
+        );
+
+        // Case-insensitive, after tags and runs of spaces.
+        let enc = format!("@ref=1   enc #r 1 {}", "A".repeat(30));
+        assert_eq!(decode_small(format!("{enc}\n").as_bytes()), vec![ok(&enc)]);
+        let report = format!("reportenc #r 1 {}", "A".repeat(30));
+        assert_eq!(
+            decode_small(format!("{report}\n").as_bytes()),
+            vec![ok(&report)]
+        );
+
+        // A long line over the long limit.
+        let enc = format!("ENC #r 1 {}", "A".repeat(60));
+        assert_eq!(
+            decode_small(format!("{enc}\nPING\n").as_bytes()),
+            vec![Err(ParseError::TooLong), ok("PING")]
+        );
+
+        // Exactly at each limit: 15 and 63 bytes plus the LF fit.
+        let msg = format!("MSG #r {}", "a".repeat(8));
+        assert_eq!(msg.len(), 15);
+        assert_eq!(decode_small(format!("{msg}\n").as_bytes()), vec![ok(&msg)]);
+        assert_eq!(
+            decode_small(format!("{msg}a\n").as_bytes()),
+            vec![Err(ParseError::TooLong)]
+        );
+        let enc = format!("ENC #r 1 {}", "A".repeat(54));
+        assert_eq!(enc.len(), 63);
+        assert_eq!(decode_small(format!("{enc}\n").as_bytes()), vec![ok(&enc)]);
+        assert_eq!(
+            decode_small(format!("{enc}A\n").as_bytes()),
+            vec![Err(ParseError::TooLong)]
+        );
+    }
+
+    #[test]
+    fn the_verb_must_end_within_the_normal_limit() {
+        // Up to the end of the verb, the normal limit applies, tags
+        // included (2.3): 12 bytes of tags, a space and ENC end at index
+        // 16, one byte too late.
+        let tags = format!("@ref={}", "a".repeat(7));
+        assert_eq!(tags.len(), 12);
+        let late = format!("{tags} ENC #r 1 {}", "A".repeat(20));
+        assert_eq!(late.find(" #r"), Some(16));
+        assert_eq!(
+            decode_small(format!("{late}\nPING\n").as_bytes()),
+            vec![Err(ParseError::TooLong), ok("PING")]
+        );
+        assert_eq!(SMALL.check(&late), Err(ParseError::TooLong));
+        // One byte shorter, and the verb ends at index 15.
+        let early = format!("@ref=aaaaaa ENC #r 1 {}", "A".repeat(20));
+        assert_eq!(
+            decode_small(format!("{early}\n").as_bytes()),
+            vec![ok(&early)]
+        );
+        assert_eq!(SMALL.check(&early), Ok(()));
+        // The same with runs of spaces before the verb.
+        let spaced = format!("@ref=1{}ENC #r 1 {}", " ".repeat(10), "A".repeat(20));
+        assert_eq!(
+            decode_small(format!("{spaced}\n").as_bytes()),
+            vec![Err(ParseError::TooLong)]
+        );
+
+        // Tags longer than the normal limit are too long whatever follows,
+        // and the decoder holds no more than the normal limit of them.
+        let tags = format!("@x-big={}", "A".repeat(30));
+        let input = format!("{tags} REPORTENC #r 1\n{tags} MSG #r hi\nPING\n");
+        assert_eq!(
+            decode_small(input.as_bytes()),
+            vec![
+                Err(ParseError::TooLong),
+                Err(ParseError::TooLong),
+                ok("PING")
+            ]
+        );
+        let mut d = LineDecoder::with_limits(SMALL);
+        d.push(b"@");
+        d.push(&[b'x'; 14]);
+        assert_eq!(d.pending_bytes(), 15);
+        assert_eq!(d.next_line(), None);
+        d.push(b"x");
+        assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
+        assert_eq!(d.pending_bytes(), 0);
+
+        // A chunk that holds the end of the verb past the normal limit
+        // and the rest of a long line is still too long.
+        let mut d = LineDecoder::with_limits(SMALL);
+        d.push(late.as_bytes());
+        assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
+    }
+
+    #[test]
+    fn verbs_that_only_look_long() {
+        // A longer verb that starts with a long one, a verb that is too
+        // long to be one, a line with no verb at all, a verb that is long
+        // only from the other side, and REPORT, which is never long.
+        let cases = [
+            format!("ENCRYPT {}", "a".repeat(20)),
+            format!("REPORTENCX {}", "a".repeat(20)),
+            format!("@ref=1 {}", "a".repeat(20)),
+            format!(" ENC {}", "a".repeat(20)),
+            format!("1ENC {}", "a".repeat(20)),
+            format!("WELCOME {}", "a".repeat(20)),
+            format!("REPORT #r 1 {}", "a".repeat(20)),
+        ];
+        for line in cases {
+            assert_eq!(
+                decode_small(format!("{line}\n").as_bytes()),
+                vec![Err(ParseError::TooLong)],
+                "{line:?}"
+            );
+            assert_eq!(SMALL.check(&line), Err(ParseError::TooLong), "{line:?}");
+        }
+        // A verb alone on its line.
+        assert_eq!(decode_small(b"ENC\n"), vec![ok("ENC")]);
+        assert_eq!(SMALL.check("ENC"), Ok(()));
+    }
+
+    #[test]
+    fn limits_can_change() {
+        // A server: normal limits until sign-in, then long lines.
+        let mut d = LineDecoder::new(16);
+        let enc = format!("ENC #r 1 {}", "A".repeat(30));
+        d.push(format!("{enc}\n").as_bytes());
+        assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
+        d.set_limits(SMALL);
+        assert_eq!(d.limits(), SMALL);
+        assert_eq!(d.max_len(), 16);
+        d.push(format!("{enc}\n").as_bytes());
+        assert_eq!(d.next_line(), Some(ok(&enc)));
+
+        // The line in progress is judged by the new limits.
+        let mut d = LineDecoder::new(16);
+        d.push(b"ENC #r 1 ");
+        d.set_limits(SMALL);
+        d.push(format!("{}\n", "A".repeat(30)).as_bytes());
+        assert_eq!(
+            d.next_line(),
+            Some(Ok(format!("ENC #r 1 {}", "A".repeat(30))))
+        );
+    }
+
+    #[test]
+    fn check_by_verb() {
+        let long = format!("ENC #r 1 {}", "A".repeat(MAX_CLIENT_LINE));
+        assert_eq!(LineLimits::CLIENT.check(&long), Ok(()));
+        assert_eq!(
+            check_line_len(&long, MAX_CLIENT_LINE),
+            Err(ParseError::TooLong)
+        );
+        let msg = format!("MSG #r {}", "a".repeat(MAX_CLIENT_LINE));
+        assert_eq!(LineLimits::CLIENT.check(&msg), Err(ParseError::TooLong));
+        let report = format!("@ref=1 reportenc #r 1 {}", "x".repeat(9000));
+        assert_eq!(LineLimits::CLIENT.check(&report), Ok(()));
+        let report = format!("@ref=1 report #r 1 {}", "x".repeat(9000));
+        assert_eq!(LineLimits::CLIENT.check(&report), Err(ParseError::TooLong));
+        // Long tags before a long verb.
+        let tags = format!("@x-big={} ENC #r 1 AAAA", "A".repeat(MAX_CLIENT_LINE));
+        assert_eq!(LineLimits::CLIENT.check(&tags), Err(ParseError::TooLong));
+        // GROUPINFO lines are long only from a server.
+        let gi = format!("GROUPINFO #r 1 0 {}", "A".repeat(MAX_SERVER_LINE));
+        assert_eq!(LineLimits::SERVER.check(&gi), Ok(()));
+        assert_eq!(LineLimits::CLIENT.check(&gi), Err(ParseError::TooLong));
     }
 
     #[test]

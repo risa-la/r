@@ -113,8 +113,12 @@ fn readme_session_directions() {
         .collect();
     let dirs: Vec<Dir> = readme.iter().map(|e| e.dir).collect();
     // The greeting, `guest sam`, OK, `join #general`, the JOIN event,
-    // four SET snapshots, OK, `msg #general hello!`, the MSG event, OK.
-    assert_eq!(dirs, [S, C, S, C, S, S, S, S, S, S, C, S, S], "{readme:#?}");
+    // five SET snapshots, OK, `msg #general hello!`, the MSG event, OK.
+    assert_eq!(
+        dirs,
+        [S, C, S, C, S, S, S, S, S, S, S, C, S, S],
+        "{readme:#?}"
+    );
     assert!(readme[0].line.starts_with("RISALA 1 "));
 }
 
@@ -143,10 +147,12 @@ fn specific_examples_are_present() {
             .find(|e| e.line.contains(needle))
             .unwrap_or_else(|| panic!("no example contains {needle:?}"))
     };
-    let auth = find("AUTH alice@example.org Hk+S5Vd7");
+    let auth = find("AUTH alice@example.org 0eS7OdclGDTKyqFl");
     assert_eq!(auth.dir, Dir::Client);
     assert_eq!(auth.source, Source::Spec);
-    assert!(auth.line.ends_with("=="));
+    // A 3228-character ML-DSA-44 signature, ending in one `=` (4.5).
+    assert_eq!(auth.line.len(), "AUTH alice@example.org ".len() + 3228);
+    assert!(auth.line.ends_with("kXJzM="));
 
     let deleted = find(";deleted MSG #general");
     assert_eq!(deleted.dir, Dir::Server);
@@ -155,6 +161,12 @@ fn specific_examples_are_present() {
     assert_eq!(find("@ref=7 history").dir, Dir::Client);
     assert_eq!(find("upload 48213").dir, Dir::Client);
     assert_eq!(find("PRESENCE offline").dir, Dir::Server);
+    assert_eq!(find("SET #general e2ee no").dir, Dir::Server);
+    assert_eq!(find("init bob@example.net").dir, Dir::Client);
+    assert_eq!(find("COMMIT bob@example.net 1").dir, Dir::Server);
+    assert_eq!(find("enc bob@example.net 1").dir, Dir::Client);
+    assert_eq!(find("reportenc alice@example.org 2").dir, Dir::Client);
+    assert_eq!(find("REPORTENC alice@example.org 2").dir, Dir::Server);
 
     // Prose and shell commands inside example blocks are skipped.
     for e in &all {

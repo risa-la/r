@@ -1,7 +1,7 @@
-//! Typed server lines, server to client (SPEC 3.6, 4.1, 5-11), and the
+//! Typed server lines, server to client (SPEC 3.6, 4.1, 5-12), and the
 //! NOTIFY push body (9.3).
 //!
-//! Every line in the second table of Section 12 parses into a
+//! Every line in the second table of Section 13 parses into a
 //! [`ServerMessage`]: an envelope with the `ref` (3.6) and `report` (5.8)
 //! tags, around a [`ServerLine`]. Events and snapshots (5.2) share one
 //! type, [`Event`], whose [`meta`](Event::meta) is `None` for a snapshot.
@@ -44,9 +44,17 @@
 //!   `t`, `from`, relation, `file`, `file-size` or `retry` value is an
 //!   error, as is one of these tags without a value. `deleted` is a flag;
 //!   a value on it is ignored.
+//! - **Encrypted messages (5.4, 5.8, 12.8).** An ENC event has a `frank`
+//!   tag and a payload, unless it is `deleted`, when its payload, `frank`
+//!   and any `file` are all gone. The copy of a reported ENC event that
+//!   follows a REPORTENC line keeps its `frank` and has an empty payload;
+//!   the franking key and content are on the REPORTENC line. MLS data is
+//!   opaque: it only has to be strict base64 ([`mls`](crate::mls)).
+//! - **DROP** must carry the dropped room's `id` (10.4), as JOIN events
+//!   do (6.1), since a client ignores a DROP for another id.
 //! - **Events and snapshots (5.2).** `seq`, `t` and `from` must be all
 //!   present (an event) or all absent (a snapshot); anything in between is
-//!   `BadSyntax`. Only SET, BAN and ROLE may be snapshots (Section 12), so a
+//!   `BadSyntax`. Only SET, BAN and ROLE may be snapshots (Section 13), so a
 //!   MSG, DELETE, JOIN, PART, INVITE, KICK or UNBAN without them is
 //!   `BadSyntax`.
 //! - **Messages (5.3, 5.4, 5.6).** At most one of `reply`, `edit` and
@@ -55,6 +63,9 @@
 //!   `file` must be an `https` URL of at most 512 bytes. `file-type` and
 //!   `file-size` are optional, so a client still shows a file whose
 //!   metadata a server left out; without `file` they are ignored.
+//! - **Reports (5.8).** REPORT and REPORTENC lines are one type,
+//!   [`Report`], whose `franking` is `Some` for REPORTENC. Nothing ties a
+//!   REPORTENC line to an ENC copy, since they are separate lines.
 //! - **Length limits** stated by the spec are applied as on commands, so a
 //!   correct server never trips them: a topic (ROOM, SET) or a report
 //!   reason of 512 bytes, a display name (MEMBER, USER, NAME) of 128 and a
@@ -75,9 +86,10 @@
 //!   in canonical form serialises back byte for byte.
 //!
 //! Tags are written in this order: `ref`, `report`, then `seq`, `t`,
-//! `from`, the relation (`reply`, `edit` or `react`), `file`, `file-type`,
-//! `file-size` and `deleted`, or `retry` on ERR. This reproduces every
-//! example in the spec.
+//! `from`, the relation (`reply`, `edit` or `react`) or `frank`, `file`,
+//! `file-type`, `file-size` and `deleted`, then `id` on JOIN and DROP, or
+//! `retry` on ERR. This reproduces every example
+//! in the spec.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -86,6 +98,10 @@ use std::str::FromStr;
 use crate::auth::{Nonce, PublicKey};
 use crate::error::{ErrorCode, ParseError};
 use crate::line::{Line, LineBuilder, Params, Tags, is_token};
+use crate::mls::{
+    BackupBlob, Ciphertext, CommitMessage, Frank, Franking, GroupInfo, KeyPackage, RatchetTree,
+    Welcome,
+};
 use crate::names::{BlockTarget, Conv, Domain, Id, Room, Seq, ServerBanTarget, Uid};
 use crate::time::Timestamp;
 use crate::types::{
@@ -101,7 +117,7 @@ const fn bad(what: &'static str) -> ParseError {
 // ---------------------------------------------------------------------------
 // The envelope
 
-/// A line from the server (Section 12, second table), with the tags that
+/// A line from the server (Section 13, second table), with the tags that
 /// any line may carry (3.6, 5.8).
 ///
 /// - `ref_` is the client's `ref` tag, copied onto every response line and
@@ -147,7 +163,7 @@ impl ServerMessage {
         self
     }
 
-    /// The REPORT line of report `id` (5.8).
+    /// The REPORT or REPORTENC line of report `id` (5.8).
     pub fn report_line(id: Id, report: Report) -> ServerMessage {
         ServerMessage {
             ref_: None,
@@ -156,8 +172,9 @@ impl ServerMessage {
         }
     }
 
-    /// The copy of the reported event that follows the REPORT line of
-    /// report `id` (5.8). The event needs its `seq`, `t` and `from`.
+    /// The copy of the reported event that follows the REPORT or REPORTENC
+    /// line of report `id` (5.8). The event needs its `seq`, `t` and
+    /// `from`, and an ENC event an empty payload.
     pub fn report_copy(id: Id, event: Event) -> ServerMessage {
         ServerMessage {
             ref_: None,
@@ -166,7 +183,7 @@ impl ServerMessage {
         }
     }
 
-    /// Parses a line from the server (Section 12).
+    /// Parses a line from the server (Section 13).
     ///
     /// An unknown verb gives [`ServerLine::Unknown`] (3.8). A known verb
     /// with bad parameters or bad tags fails with `BadSyntax`, or `TooLong`
@@ -183,22 +200,21 @@ impl ServerMessage {
             "OK" => ServerLine::Ok(OkResponse::parse(params)?),
             "ERR" => ServerLine::Err(ErrResponse::parse(tags, params)?),
             "MSG" | "DELETE" | "JOIN" | "PART" | "INVITE" | "KICK" | "BAN" | "UNBAN" | "SET"
-            | "ROLE" => {
+            | "ROLE" | "ENC" | "COMMIT" => {
                 let event = Event::parse(&verb, tags, params)?;
                 if report.is_some() {
-                    if event.meta.is_none() {
-                        return Err(bad("a reported event has seq, t and from"));
-                    }
+                    event.check_copy()?;
                     ServerLine::ReportCopy(event)
                 } else {
+                    event.body.check_live()?;
                     ServerLine::Event(event)
                 }
             }
-            "REPORT" => {
+            "REPORT" | "REPORTENC" => {
                 if report.is_none() {
                     return Err(bad("a REPORT line has a report tag"));
                 }
-                ServerLine::Report(Report::parse(tags, params)?)
+                ServerLine::Report(Report::parse(verb == "REPORTENC", tags, params)?)
             }
             _ => parse_response(&verb, tags, params)?.unwrap_or_else(|| {
                 let mut rest = line.clone();
@@ -304,7 +320,7 @@ impl From<ServerLine> for ServerMessage {
 // ---------------------------------------------------------------------------
 // Lines
 
-/// One line a server can send (Section 12, second table), without the
+/// One line a server can send (Section 13, second table), without the
 /// `ref` and `report` tags, which are in [`ServerMessage`].
 ///
 /// Text fields hold escaped text (3.4) without control characters other
@@ -324,15 +340,19 @@ pub enum ServerLine {
     /// `ERR <code> [<message...>]`, a final response (3.6, 3.7).
     Err(ErrResponse),
     /// An event or a snapshot (5.2): MSG, DELETE, JOIN, PART, INVITE,
-    /// KICK, BAN, UNBAN, SET or ROLE.
+    /// KICK, BAN, UNBAN, SET, ROLE, ENC or COMMIT.
     Event(Event),
     /// The copy of a reported event that follows a [`Report`](Self::Report)
     /// line, with the same `report` tag (5.8). It always has its `seq`, `t`
     /// and `from`. Clients must not treat it as a new event in the
-    /// conversation.
+    /// conversation. A reported ENC event has an empty payload and keeps
+    /// its `frank`; its content is on the REPORTENC line
+    /// ([`Report::franking`]).
     ReportCopy(Event),
-    /// `REPORT <conv> <seq> [<reason...>]`, a report sent to its reviewers
-    /// (5.8). The [`ServerMessage::report`] tag is required.
+    /// `REPORT <conv> <seq> [<reason...>]` or
+    /// `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]`, a
+    /// report sent to its reviewers (5.8). The [`ServerMessage::report`]
+    /// tag is required.
     Report(Report),
     /// `RESOLVED <id>`: another reviewer resolved report `id` (5.8).
     Resolved {
@@ -440,12 +460,62 @@ pub enum ServerLine {
         /// The message, escaped, not empty.
         message: String,
     },
-    /// `DROP <room> [<reason...>]`: an operator deleted the room (10.4).
+    /// `@id=<id> DROP <room> [<reason...>]`: an operator deleted the room
+    /// (10.4).
     Drop {
         /// The room.
         room: Room,
+        /// The dropped room's id, from the required `id` tag. A client
+        /// ignores a DROP whose id is not the one it has stored for the
+        /// room (10.4).
+        id: Id,
         /// The reason, escaped; empty if none.
         reason: String,
+    },
+    /// `KEYPKG <uid> <keypackage>`, a response to KEYPKG GET (12.4).
+    KeyPkg {
+        /// Whose device the KeyPackage is for.
+        uid: Uid,
+        /// The KeyPackage.
+        key_package: KeyPackage,
+    },
+    /// `GROUPINFO <conv> <epoch> <seq> <groupinfo> <tree>`, a response to
+    /// GROUPINFO (12.5).
+    GroupInfo {
+        /// The conversation, named as in 5.2.
+        conv: Conv,
+        /// The group's current epoch.
+        epoch: u64,
+        /// The seq of the COMMIT event that started the epoch, or `None`
+        /// for `0`, in epoch 0.
+        seq: Option<Seq>,
+        /// The GroupInfo sent with the last commit.
+        group_info: GroupInfo,
+        /// The current ratchet tree.
+        tree: RatchetTree,
+    },
+    /// `WELCOME <conv> <id> <seq> <welcome> <tree>`: a Welcome for this
+    /// device, live or in response to WELCOME LIST (12.7).
+    Welcome {
+        /// The conversation, named as in 5.2.
+        conv: Conv,
+        /// The Welcome's id, for WELCOME DEL.
+        id: Id,
+        /// The seq of the COMMIT event that added the device.
+        seq: Seq,
+        /// The Welcome.
+        welcome: Welcome,
+        /// The ratchet tree of the epoch the commit started.
+        tree: RatchetTree,
+    },
+    /// `BACKUP <id> <epoch> <blob>`, a response to BACKUP GET (12.10).
+    Backup {
+        /// The conversation's id (5.1).
+        id: Id,
+        /// The epoch.
+        epoch: u64,
+        /// The encrypted history key.
+        blob: BackupBlob,
     },
     /// `OP <uid>`, a response to ADMIN OPS (10.1).
     Op {
@@ -504,7 +574,7 @@ impl ServerLine {
             ServerLine::Ok(_) => "OK",
             ServerLine::Err(_) => "ERR",
             ServerLine::Event(e) | ServerLine::ReportCopy(e) => e.body.verb(),
-            ServerLine::Report(_) => "REPORT",
+            ServerLine::Report(r) => r.verb(),
             ServerLine::Resolved { .. } => "RESOLVED",
             ServerLine::Room { .. } => "ROOM",
             ServerLine::Conv { .. } => "CONV",
@@ -519,6 +589,10 @@ impl ServerLine {
             ServerLine::Name { .. } => "NAME",
             ServerLine::Notice { .. } => "NOTICE",
             ServerLine::Drop { .. } => "DROP",
+            ServerLine::KeyPkg { .. } => "KEYPKG",
+            ServerLine::GroupInfo { .. } => "GROUPINFO",
+            ServerLine::Welcome { .. } => "WELCOME",
+            ServerLine::Backup { .. } => "BACKUP",
             ServerLine::Op { .. } => "OP",
             ServerLine::ServerBan { .. } => "SERVERBAN",
             ServerLine::Connection { .. } => "CONNECTION",
@@ -540,11 +614,12 @@ impl ServerLine {
             ServerLine::Greeting(g) => g.write(b),
             ServerLine::Ok(ok) => ok.write(b),
             ServerLine::Err(err) => err.write(b),
-            ServerLine::Event(e) => e.write(b)?,
+            ServerLine::Event(e) => {
+                e.body.check_live()?;
+                e.write(b)?;
+            }
             ServerLine::ReportCopy(e) => {
-                if e.meta.is_none() {
-                    return Err(bad("a reported event has seq, t and from"));
-                }
+                e.check_copy()?;
                 e.write(b)?;
             }
             ServerLine::Report(r) => r.write(b)?,
@@ -625,8 +700,41 @@ impl ServerLine {
                 }
                 b.text(message);
             }
-            ServerLine::Drop { room, reason } => {
-                b.token(room).text(reason);
+            ServerLine::Drop { room, id, reason } => {
+                b.tag("id", id).token(room).text(reason);
+            }
+            ServerLine::KeyPkg { uid, key_package } => {
+                b.token(uid).token(key_package);
+            }
+            ServerLine::GroupInfo {
+                conv,
+                epoch,
+                seq,
+                group_info,
+                tree,
+            } => {
+                b.token(conv).token(epoch);
+                match seq {
+                    Some(seq) => b.token(seq),
+                    None => b.token(0),
+                };
+                b.token(group_info).token(tree);
+            }
+            ServerLine::Welcome {
+                conv,
+                id,
+                seq,
+                welcome,
+                tree,
+            } => {
+                b.token(conv)
+                    .token(id)
+                    .token(seq)
+                    .token(welcome)
+                    .token(tree);
+            }
+            ServerLine::Backup { id, epoch, blob } => {
+                b.token(id).token(epoch).token(blob);
             }
             ServerLine::Op { uid } => {
                 b.token(uid);
@@ -801,9 +909,53 @@ fn parse_response(
             }
         }
         "DROP" => {
+            let id = parse_tag(tags, "id")?.ok_or(bad("a DROP line has the id tag"))?;
             let room = token(&mut p)?;
             let reason = p.text().to_owned();
-            ServerLine::Drop { room, reason }
+            ServerLine::Drop { room, id, reason }
+        }
+        "KEYPKG" => {
+            let uid = token(&mut p)?;
+            let key_package = token(&mut p)?;
+            p.end()?;
+            ServerLine::KeyPkg { uid, key_package }
+        }
+        "GROUPINFO" => {
+            let conv = token(&mut p)?;
+            let epoch = parse_u64(p.token()?)?;
+            let seq = Seq::parse_or_zero(p.token()?)?;
+            let group_info = token(&mut p)?;
+            let tree = token(&mut p)?;
+            p.end()?;
+            ServerLine::GroupInfo {
+                conv,
+                epoch,
+                seq,
+                group_info,
+                tree,
+            }
+        }
+        "WELCOME" => {
+            let conv = token(&mut p)?;
+            let id = token(&mut p)?;
+            let seq = token(&mut p)?;
+            let welcome = token(&mut p)?;
+            let tree = token(&mut p)?;
+            p.end()?;
+            ServerLine::Welcome {
+                conv,
+                id,
+                seq,
+                welcome,
+                tree,
+            }
+        }
+        "BACKUP" => {
+            let id = token(&mut p)?;
+            let epoch = parse_u64(p.token()?)?;
+            let blob = token(&mut p)?;
+            p.end()?;
+            ServerLine::Backup { id, epoch, blob }
         }
         "OP" => {
             let uid = token(&mut p)?;
@@ -1016,7 +1168,7 @@ impl AsRef<str> for Host {
 /// use risala_proto::server::OkResponse;
 ///
 /// let ok = OkResponse::new().with("id", "k3f9q2").with("head", 8812);
-/// assert_eq!(ok.head()?, Seq::new(8812));
+/// assert_eq!(ok.head()?, Some(8812));
 /// assert_eq!(ok.value("id"), Some("k3f9q2"));
 /// assert_eq!(ok.more()?, None);
 /// # Ok::<(), risala_proto::error::ParseError>(())
@@ -1132,21 +1284,22 @@ impl OkResponse {
         self.value(key).map(parse).transpose()
     }
 
-    /// `seq=`: the seq of the event a command created (5.3, 5.4, 6.2-6.4),
-    /// or of an existing message (5.3, 7.6).
+    /// `seq=`: the seq of the event a command created (5.3, 5.4, 6.2-6.4,
+    /// 12.5, 12.8), or of an existing message (5.3, 7.6).
     pub fn seq(&self) -> Result<Option<Seq>, ParseError> {
         self.typed("seq", str::parse)
     }
 
-    /// `id=`: a conversation's id from JOIN or `INFO <room>` (6.1, 6.2), or
-    /// a report's id from REPORT (5.8).
+    /// `id=`: a conversation's id from JOIN, `INFO <room>` or INIT (6.1,
+    /// 6.2, 12.5), or a report's id from REPORT (5.8).
     pub fn id(&self) -> Result<Option<Id>, ParseError> {
         self.typed("id", str::parse)
     }
 
     /// `head=`: a room's newest seq, from JOIN or `INFO <room>` (6.1, 6.2).
-    pub fn head(&self) -> Result<Option<Seq>, ParseError> {
-        self.typed("head", str::parse)
+    /// It is `0` for a room with no events yet, which only INFO can report.
+    pub fn head(&self) -> Result<Option<u64>, ParseError> {
+        self.typed("head", parse_u64)
     }
 
     /// `more=`: whether HISTORY or RELATED has more events, from `0` or `1`
@@ -1163,6 +1316,18 @@ impl OkResponse {
     /// REGISTER (4.2, 4.5, 4.6).
     pub fn uid(&self) -> Result<Option<Uid>, ParseError> {
         self.typed("uid", str::parse)
+    }
+
+    /// `token=`: the secret that resumes a guest session, from GUEST (4.2).
+    pub fn token(&self) -> Result<Option<Id>, ParseError> {
+        self.typed("token", str::parse)
+    }
+
+    /// `resumed=`: whether GUEST resumed an earlier session, rather than
+    /// starting a new one (4.2, 7.6). `None` when absent, which means a
+    /// new session.
+    pub fn resumed(&self) -> Result<Option<bool>, ParseError> {
+        self.typed("resumed", parse_yes_no)
     }
 
     /// `op=`: whether the identity is a server operator, from AUTH (4.5,
@@ -1238,6 +1403,24 @@ impl OkResponse {
         self.typed("upload", str::parse)
     }
 
+    /// `epoch=`: the group's new epoch, from INIT (always 0) and COMMIT
+    /// (12.5).
+    pub fn epoch(&self) -> Result<Option<u64>, ParseError> {
+        self.typed("epoch", parse_u64)
+    }
+
+    /// `count=`: the number of ordinary KeyPackages the server holds for
+    /// this device, from KEYPKG COUNT (12.4).
+    pub fn count(&self) -> Result<Option<u64>, ParseError> {
+        self.typed("count", parse_u64)
+    }
+
+    /// `last-resort=`: whether the server holds a last-resort KeyPackage
+    /// for this device, from KEYPKG COUNT (12.4).
+    pub fn last_resort(&self) -> Result<Option<bool>, ParseError> {
+        self.typed("last-resort", parse_yes_no)
+    }
+
     /// `get=` as a [`FileUrl`], ready for MSG's `file` tag (5.6).
     pub fn get_file_url(&self) -> Result<Option<FileUrl>, ParseError> {
         self.typed("get", str::parse)
@@ -1257,9 +1440,9 @@ impl OkResponse {
         self.with("id", id)
     }
 
-    /// Adds `head=` (6.1, 6.2).
-    pub fn with_head(self, head: Seq) -> OkResponse {
-        self.with("head", head)
+    /// Adds `head=` (6.1, 6.2): a seq, or `0` for a room with no events.
+    pub fn with_head(self, head: impl Into<u64>) -> OkResponse {
+        self.with("head", head.into())
     }
 
     /// Adds `more=0` or `more=1` (6.1, 7.2, 7.3).
@@ -1270,6 +1453,21 @@ impl OkResponse {
     /// Adds `uid=` (4.2, 4.5, 4.6).
     pub fn with_uid(self, uid: &Uid) -> OkResponse {
         self.with("uid", uid)
+    }
+
+    /// Adds `token=` (4.2).
+    pub fn with_token(self, token: &Id) -> OkResponse {
+        self.with("token", token)
+    }
+
+    /// Adds `resumed=yes` (4.2). Only a resumed session carries it, so
+    /// `false` adds nothing.
+    pub fn with_resumed(self, resumed: bool) -> OkResponse {
+        if resumed {
+            self.with("resumed", "yes")
+        } else {
+            self
+        }
     }
 
     /// Adds `op=yes` or `op=no` (4.5).
@@ -1330,6 +1528,21 @@ impl OkResponse {
     /// Adds `upload=` (5.6, 8.5).
     pub fn with_upload(self, upload: Upload) -> OkResponse {
         self.with("upload", upload)
+    }
+
+    /// Adds `epoch=` (12.5).
+    pub fn with_epoch(self, epoch: u64) -> OkResponse {
+        self.with("epoch", epoch)
+    }
+
+    /// Adds `count=` (12.4).
+    pub fn with_count(self, count: u64) -> OkResponse {
+        self.with("count", count)
+    }
+
+    /// Adds `last-resort=yes` or `last-resort=no` (12.4).
+    pub fn with_last_resort(self, last_resort: bool) -> OkResponse {
+        self.with("last-resort", yes_no(last_resort))
     }
 }
 
@@ -1508,6 +1721,20 @@ impl Event {
         self.meta.is_none()
     }
 
+    /// Checks what a reviewer's copy needs (5.8): `seq`, `t` and `from`,
+    /// and for ENC, an empty payload and no `deleted` flag.
+    fn check_copy(&self) -> Result<(), ParseError> {
+        if self.meta.is_none() {
+            return Err(bad("a reported event has seq, t and from"));
+        }
+        match &self.body {
+            EventBody::Enc(enc) if enc.deleted || enc.payload.is_some() => Err(bad(
+                "a reported ENC event has an empty payload and is not deleted",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn parse(verb: &str, tags: &Tags, p: Params<'_>) -> Result<Event, ParseError> {
         let meta = parse_meta(tags)?;
         let body = EventBody::parse(verb, tags, p)?;
@@ -1628,6 +1855,18 @@ pub enum EventBody {
         /// The role.
         role: Role,
     },
+    /// `ENC <conv> <epoch> <payload...>`, an encrypted message (12.8).
+    Enc(Encrypted),
+    /// `COMMIT <conv> <epoch> <commit>`: a commit started `epoch` (12.5).
+    /// Unlike other events, it does not repeat its command's parameters.
+    Commit {
+        /// The conversation, named as in 5.2.
+        conv: Conv,
+        /// The epoch the commit started.
+        epoch: u64,
+        /// The commit.
+        commit: CommitMessage,
+    },
 }
 
 impl EventBody {
@@ -1644,6 +1883,8 @@ impl EventBody {
             EventBody::Unban { .. } => "UNBAN",
             EventBody::Set { .. } => "SET",
             EventBody::Role { .. } => "ROLE",
+            EventBody::Enc(_) => "ENC",
+            EventBody::Commit { .. } => "COMMIT",
         }
     }
 
@@ -1651,7 +1892,9 @@ impl EventBody {
     pub fn conv(&self) -> Conv {
         match self {
             EventBody::Msg(msg) => msg.conv.clone(),
-            EventBody::Delete { conv, .. } => conv.clone(),
+            EventBody::Delete { conv, .. }
+            | EventBody::Enc(Encrypted { conv, .. })
+            | EventBody::Commit { conv, .. } => conv.clone(),
             EventBody::Join { room, .. }
             | EventBody::Part { room, .. }
             | EventBody::Invite { room, .. }
@@ -1663,8 +1906,19 @@ impl EventBody {
         }
     }
 
+    /// Checks what an event that is not a reviewer's copy needs: an ENC
+    /// event that is not deleted has a payload (12.8).
+    fn check_live(&self) -> Result<(), ParseError> {
+        match self {
+            EventBody::Enc(enc) if !enc.deleted && enc.payload.is_none() => {
+                Err(bad("an ENC event has a payload"))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Whether this verb is also sent as a snapshot: SET, BAN and ROLE
-    /// (Section 12).
+    /// (Section 13).
     pub fn can_be_snapshot(&self) -> bool {
         matches!(
             self,
@@ -1737,6 +1991,18 @@ impl EventBody {
                 p.end()?;
                 EventBody::Role { room, uid, role }
             }
+            "ENC" => EventBody::Enc(Encrypted::parse(tags, p)?),
+            "COMMIT" => {
+                let conv = token(&mut p)?;
+                let epoch = parse_u64(p.token()?)?;
+                let commit = token(&mut p)?;
+                p.end()?;
+                EventBody::Commit {
+                    conv,
+                    epoch,
+                    commit,
+                }
+            }
             _ => unreachable!("only event verbs are passed in"),
         })
     }
@@ -1768,6 +2034,14 @@ impl EventBody {
             EventBody::Role { room, uid, role } => {
                 b.token(room).token(uid).token(role);
             }
+            EventBody::Enc(enc) => enc.write(b)?,
+            EventBody::Commit {
+                conv,
+                epoch,
+                commit,
+            } => {
+                b.token(conv).token(epoch).token(commit);
+            }
         }
         Ok(())
     }
@@ -1776,6 +2050,12 @@ impl EventBody {
 impl From<Message> for EventBody {
     fn from(msg: Message) -> EventBody {
         EventBody::Msg(msg)
+    }
+}
+
+impl From<Encrypted> for EventBody {
+    fn from(enc: Encrypted) -> EventBody {
+        EventBody::Enc(enc)
     }
 }
 
@@ -1825,14 +2105,7 @@ impl Message {
                 relation = Relation::from_tag(key, tags.get(key))?;
             }
         }
-        let file = match tag_value(tags, "file")? {
-            None => None,
-            Some(url) => Some(Attachment {
-                url: url.parse()?,
-                media_type: tag_value(tags, "file-type")?.map(str::parse).transpose()?,
-                size: tag_value(tags, "file-size")?.map(parse_u64).transpose()?,
-            }),
-        };
+        let file = parse_attachment(tags)?;
         let conv = token(&mut p)?;
         let msg = Message {
             conv,
@@ -1871,15 +2144,7 @@ impl Message {
         if let Some(relation) = self.relation {
             b.tag(relation.key(), relation.seq());
         }
-        if let Some(file) = &self.file {
-            b.tag("file", &file.url);
-            if let Some(media_type) = &file.media_type {
-                b.tag("file-type", media_type);
-            }
-            if let Some(size) = file.size {
-                b.tag("file-size", size);
-            }
-        }
+        write_attachment(b, self.file.as_ref());
         if self.deleted {
             b.flag("deleted");
         }
@@ -1900,12 +2165,139 @@ pub struct Attachment {
     pub size: Option<u64>,
 }
 
+/// An ENC event (12.8), with its `frank` tag, attached file (5.6, 12.11)
+/// and `deleted` flag (5.4). Its syntax is
+/// `ENC <conv> <epoch> [<payload...>]`.
+///
+/// Invariants, checked when parsing and serialising:
+///
+/// - A deleted event is a placeholder (5.4, 12.11): no payload, no
+///   `frank` and no file.
+/// - The copy of a reported event ([`ServerLine::ReportCopy`]) is not
+///   deleted, has a `frank` and has no payload (5.8).
+/// - Any other event has a payload and a `frank`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Encrypted {
+    /// The conversation, named as in 5.2.
+    pub conv: Conv,
+    /// The epoch whose history key encrypts the message.
+    pub epoch: u64,
+    /// The encrypted message, or `None` for an empty payload: deleted, or
+    /// a reviewer's copy (5.8).
+    pub payload: Option<Ciphertext>,
+    /// The `frank` tag, the franking commitment (12.8). `None` only when
+    /// deleted.
+    pub frank: Option<Frank>,
+    /// The attached file, if any (5.6, 12.11).
+    pub file: Option<Attachment>,
+    /// The `deleted` tag: the payload was erased (5.4).
+    pub deleted: bool,
+}
+
+impl Encrypted {
+    /// A live ENC event's body, with no file.
+    pub fn new(conv: impl Into<Conv>, epoch: u64, payload: Ciphertext, frank: Frank) -> Encrypted {
+        Encrypted {
+            conv: conv.into(),
+            epoch,
+            payload: Some(payload),
+            frank: Some(frank),
+            file: None,
+            deleted: false,
+        }
+    }
+
+    /// The copy of this event that reviewers receive (5.8): the same,
+    /// without the payload.
+    pub fn for_review(&self) -> Encrypted {
+        Encrypted {
+            payload: None,
+            ..self.clone()
+        }
+    }
+
+    fn parse(tags: &Tags, mut p: Params<'_>) -> Result<Encrypted, ParseError> {
+        let conv = token(&mut p)?;
+        let epoch = parse_u64(p.token()?)?;
+        let payload = match p.text() {
+            "" => None,
+            payload => Some(payload.parse()?),
+        };
+        let enc = Encrypted {
+            conv,
+            epoch,
+            payload,
+            frank: parse_tag(tags, "frank")?,
+            file: parse_attachment(tags)?,
+            deleted: tags.has("deleted"),
+        };
+        enc.check()?;
+        Ok(enc)
+    }
+
+    /// The rules that hold for every ENC event. Whether it needs a payload
+    /// depends on whether it is a reviewer's copy, which the line decides.
+    fn check(&self) -> Result<(), ParseError> {
+        if self.deleted {
+            if self.payload.is_some() || self.frank.is_some() || self.file.is_some() {
+                return Err(bad("a deleted ENC has no payload, frank or file"));
+            }
+        } else if self.frank.is_none() {
+            return Err(bad("an ENC event has the frank tag"));
+        }
+        Ok(())
+    }
+
+    fn write(&self, b: &mut LineBuilder) -> Result<(), ParseError> {
+        self.check()?;
+        if let Some(frank) = &self.frank {
+            b.tag("frank", frank);
+        }
+        write_attachment(b, self.file.as_ref());
+        if self.deleted {
+            b.flag("deleted");
+        }
+        b.token(&self.conv).token(self.epoch);
+        if let Some(payload) = &self.payload {
+            b.text(payload.as_str());
+        }
+        Ok(())
+    }
+}
+
+/// Reads the `file`, `file-type` and `file-size` tags (5.6).
+fn parse_attachment(tags: &Tags) -> Result<Option<Attachment>, ParseError> {
+    Ok(match tag_value(tags, "file")? {
+        None => None,
+        Some(url) => Some(Attachment {
+            url: url.parse()?,
+            media_type: tag_value(tags, "file-type")?.map(str::parse).transpose()?,
+            size: tag_value(tags, "file-size")?.map(parse_u64).transpose()?,
+        }),
+    })
+}
+
+/// Writes the `file`, `file-type` and `file-size` tags (5.6).
+fn write_attachment(b: &mut LineBuilder, file: Option<&Attachment>) {
+    if let Some(file) = file {
+        b.tag("file", &file.url);
+        if let Some(media_type) = &file.media_type {
+            b.tag("file-type", media_type);
+        }
+        if let Some(size) = file.size {
+            b.tag("file-size", size);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reports
 
-/// A REPORT line, `REPORT <conv> <seq> [<reason...>]` (5.8), as sent to a
-/// report's reviewers. The report's id is the [`ServerMessage::report`]
-/// tag, and the reported event follows as a [`ServerLine::ReportCopy`].
+/// A REPORT or REPORTENC line (5.8), as sent to a report's reviewers:
+/// `REPORT <conv> <seq> [<reason...>]`, or
+/// `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]` for an ENC
+/// event. The report's id is the [`ServerMessage::report`] tag, and the
+/// reported event follows as a [`ServerLine::ReportCopy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// When the report was made, from the required `t` tag.
@@ -1917,22 +2309,46 @@ pub struct Report {
     pub conv: Conv,
     /// The reported message.
     pub seq: Seq,
+    /// For REPORTENC, the reported ENC event's franking key and decrypted
+    /// content, which reviewers decode to read the message and may check
+    /// against the copy's `frank` ([`Franking::verifies`]). `None` for
+    /// REPORT.
+    pub franking: Option<Franking>,
     /// The reason, escaped, at most 512 bytes; empty if none.
     pub reason: String,
 }
 
 impl Report {
-    fn parse(tags: &Tags, mut p: Params<'_>) -> Result<Report, ParseError> {
+    /// The verb: `REPORTENC` with [`franking`](Self::franking), `REPORT`
+    /// without.
+    pub fn verb(&self) -> &'static str {
+        if self.franking.is_some() {
+            "REPORTENC"
+        } else {
+            "REPORT"
+        }
+    }
+
+    fn parse(encrypted: bool, tags: &Tags, mut p: Params<'_>) -> Result<Report, ParseError> {
         let t = required_tag(tags, "t")?;
         let from = parse_tag(tags, "from")?;
         let conv = token(&mut p)?;
         let seq = token(&mut p)?;
+        let franking = if encrypted {
+            Some(Franking {
+                key: token(&mut p)?,
+                content: token(&mut p)?,
+            })
+        } else {
+            None
+        };
         let reason = text(p, MAX_REPORT_REASON)?;
         Ok(Report {
             t,
             from,
             conv,
             seq,
+            franking,
             reason,
         })
     }
@@ -1943,7 +2359,11 @@ impl Report {
         if let Some(from) = &self.from {
             b.tag("from", from);
         }
-        b.token(&self.conv).token(self.seq).text(&self.reason);
+        b.token(&self.conv).token(self.seq);
+        if let Some(franking) = &self.franking {
+            b.token(franking.key).token(&franking.content);
+        }
+        b.text(&self.reason);
         Ok(())
     }
 }
@@ -2035,7 +2455,20 @@ impl FromStr for Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::{Content, FrankKey};
     use crate::types::PushReason;
+
+    impl ServerLine {
+        /// The metadata of an event line.
+        fn event_meta(self) -> EventMeta {
+            match self {
+                ServerLine::Event(Event {
+                    meta: Some(meta), ..
+                }) => meta,
+                _ => panic!("not an event"),
+            }
+        }
+    }
 
     #[test]
     fn deleted_message_has_no_file_and_blank_text_is_empty() {
@@ -2270,11 +2703,24 @@ mod tests {
         assert_eq!(keys, ["id", "head", "future"]);
         assert_eq!(ok.value("future"), Some("thing"));
         assert_eq!(ok.id().unwrap().unwrap().as_str(), "k3f9q2");
-        assert_eq!(ok.head().unwrap(), Some(seq(8812)));
+        assert_eq!(ok.head().unwrap(), Some(8812));
         round_trip("OK");
         canonical("OK  SEQ=1 ", "OK seq=1");
         syntax("OK yes");
         syntax("OK seq=1 seq=2");
+    }
+
+    #[test]
+    fn ok_head_zero_is_an_empty_room() {
+        let ok = round_trip("OK id=k3f9q2 members=0 head=0 role=none joined=no");
+        let ServerLine::Ok(ok) = ok.line else {
+            panic!("not OK")
+        };
+        assert_eq!(ok.head().unwrap(), Some(0));
+        let line = |ok: OkResponse| ServerMessage::new(ServerLine::Ok(ok)).to_line().to_string();
+        assert_eq!(line(OkResponse::new().with_head(0u64)), "OK head=0");
+        assert_eq!(line(OkResponse::new().with_head(seq(7))), "OK head=7");
+        assert!(OkResponse::new().with("head", "007").head().is_err());
     }
 
     #[test]
@@ -2297,10 +2743,15 @@ mod tests {
             .with("register", "example.org")
             .with("retention", ServerRetention::Forever)
             .with("push", "no")
-            .with("upload", Upload::MaxBytes(10_000_000));
+            .with("upload", Upload::MaxBytes(10_000_000))
+            .with("token", "q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3");
         assert_eq!(ok.seq().unwrap(), Some(seq(8813)));
+        assert_eq!(
+            ok.token().unwrap().unwrap().as_str(),
+            "q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3"
+        );
         assert_eq!(ok.id().unwrap().unwrap().as_str(), "p4x8n2");
-        assert_eq!(ok.head().unwrap(), Some(seq(9)));
+        assert_eq!(ok.head().unwrap(), Some(9));
         assert_eq!(ok.more().unwrap(), Some(true));
         assert_eq!(ok.uid().unwrap(), Some(uid("alice@example.org")));
         assert_eq!(ok.op().unwrap(), Some(true));
@@ -2343,21 +2794,26 @@ mod tests {
         assert_eq!(ok.role().unwrap(), Some(InfoRole(Some(Role::Mod))));
         assert_eq!(ok.seq().unwrap(), None);
         assert_eq!(ok.more().unwrap(), None);
+        assert_eq!(ok.token().unwrap(), None);
     }
 
     #[test]
     fn ok_bad_values() {
         assert!("OK seq2=".parse::<ServerMessage>().is_err());
-        let ok = match parse("OK seq=0 more=2 op=maybe members=-1 uid=x upload=big seq2=x").line {
-            ServerLine::Ok(ok) => ok,
-            _ => panic!(),
-        };
+        let ok =
+            match parse("OK seq=0 more=2 op=maybe members=-1 uid=x upload=big seq2=x token=a.b")
+                .line
+            {
+                ServerLine::Ok(ok) => ok,
+                _ => panic!(),
+            };
         assert!(ok.seq().is_err());
         assert!(ok.more().is_err());
         assert!(ok.op().is_err());
         assert!(ok.members().is_err());
         assert!(ok.uid().is_err());
         assert!(ok.upload().is_err());
+        assert!(ok.token().is_err());
         assert_eq!(ok.value("seq2"), Some("x"));
     }
 
@@ -2377,6 +2833,21 @@ mod tests {
         assert_eq!(ok.more(), Ok(Some(true)));
         assert_eq!(ok.joined(), Ok(Some(false)));
         assert_eq!(ok.op(), Ok(Some(true)));
+        let token: Id = "k3f9q2_x-7".parse().unwrap();
+        let ok = OkResponse::new().with_uid(&uid("~sam")).with_token(&token);
+        assert_eq!(
+            ServerMessage::new(ok.clone()).to_line().to_string(),
+            "OK uid=~sam token=k3f9q2_x-7"
+        );
+        assert_eq!(ok.token(), Ok(Some(token.clone())));
+        assert_eq!(ok.resumed(), Ok(None));
+        assert_eq!(ok.clone().with_resumed(false), ok);
+        let ok = ok.with_resumed(true);
+        assert_eq!(
+            ServerMessage::new(ok.clone()).to_line().to_string(),
+            "OK uid=~sam token=k3f9q2_x-7 resumed=yes"
+        );
+        assert_eq!(ok.resumed(), Ok(Some(true)));
         let get: FileUrl = "https://f.example/f/x".parse().unwrap();
         let ok = OkResponse::new()
             .with_upload_urls("https://f.example/u/y", &get)
@@ -2849,6 +3320,42 @@ mod tests {
         };
         assert_eq!(e.meta.as_ref().unwrap().seq, seq(8816));
 
+        // REPORTENC carries the franking key and content of an ENC event.
+        let key = FrankKey::from_bytes([4; 32]);
+        let content = Content::from_bytes(b"TEXT hi\n").unwrap();
+        let line = format!(
+            "@report=w7c1m5;t={T};from=bob@example.net REPORTENC alice@example.org 2 {key} {content} harassment"
+        );
+        let m = round_trip(&line);
+        let ServerLine::Report(r) = &m.line else {
+            panic!()
+        };
+        assert_eq!(m.line.verb(), "REPORTENC");
+        let franking = r.franking.as_ref().unwrap();
+        assert_eq!(franking.key, key);
+        assert_eq!(franking.content.decode(), b"TEXT hi\n");
+        assert_eq!(r.reason, "harassment");
+        round_trip(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2 {key} {content}"
+        ));
+        syntax(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2"
+        ));
+        syntax(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2 {key}"
+        ));
+        syntax(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2 AAAA {content}"
+        ));
+        syntax(&format!(
+            "@t={T} REPORTENC alice@example.org 2 {key} {content}"
+        ));
+        // Content longer than a normal server line (2.3).
+        let long = Content::from_bytes(&[7; 20_000]).unwrap();
+        let line = format!("@report=w7c1m5;t={T} REPORTENC #a 2 {key} {long}");
+        round_trip(&line);
+        assert_eq!(crate::frame::LineLimits::SERVER.check(&line), Ok(()));
+
         // A REPORT line needs report and t; a copy needs its metadata.
         syntax(&format!("@t={T} REPORT #general 1 spam"));
         syntax("@report=p4 REPORT #general 1 spam");
@@ -2867,6 +3374,7 @@ mod tests {
             from: None,
             conv: Conv::Room(room("#a")),
             seq: seq(2),
+            franking: None,
             reason: String::new(),
         };
         let m = ServerMessage::report_line(id.clone(), report.clone());
@@ -3013,10 +3521,11 @@ mod tests {
         round_trip("BLOCK *@example.net");
         syntax("BLOCK ~sam");
         syntax("BLOCK");
-        let m = round_trip("KEY J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop");
+        let key = crate::auth::tests::PUBLIC_B64;
+        let m = round_trip(&format!("KEY {key} laptop"));
         assert!(matches!(&m.line, ServerLine::Key { label, .. } if label == "laptop"));
-        round_trip("KEY J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY=");
-        syntax("KEY J/Kmupu");
+        round_trip(&format!("KEY {key}"));
+        syntax("KEY xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp…");
         let m = round_trip("PUSH https://push.app.example/n/3f9c x7Hq2");
         assert!(
             matches!(&m.line, ServerLine::Push { url, .. } if url.as_str() == "https://push.app.example/n/3f9c")
@@ -3054,6 +3563,251 @@ mod tests {
         );
     }
 
+    /// Base64 of `n` bytes of `b`.
+    fn b64(b: u8, n: usize) -> String {
+        KeyPackage::from_bytes(&vec![b; n]).unwrap().to_string()
+    }
+
+    #[test]
+    fn mls_response_lines() {
+        let (kp, gi, tree, welcome) = (b64(1, 90), b64(2, 60), b64(3, 30), b64(4, 120));
+        let m = round_trip(&format!("@ref=3 KEYPKG bob@example.net {kp}"));
+        assert_eq!(
+            m.line,
+            ServerLine::KeyPkg {
+                uid: "bob@example.net".parse().unwrap(),
+                key_package: kp.parse().unwrap(),
+            }
+        );
+        syntax("KEYPKG bob@example.net");
+        syntax(&format!("KEYPKG bob@example.net {kp} {kp}"));
+        syntax("KEYPKG bob@example.net AAEABQABAFI…");
+
+        let m = round_trip(&format!("GROUPINFO #secret 0 0 {gi} {tree}"));
+        assert!(matches!(
+            &m.line,
+            ServerLine::GroupInfo {
+                epoch: 0,
+                seq: None,
+                ..
+            }
+        ));
+        let m = round_trip(&format!("GROUPINFO bob@example.net 7 41 {gi} {tree}"));
+        assert!(matches!(
+            &m.line,
+            ServerLine::GroupInfo { epoch: 7, seq: Some(seq), .. } if seq.get() == 41
+        ));
+        syntax(&format!("GROUPINFO #secret 0 0 {gi}"));
+        syntax(&format!("GROUPINFO #secret x 0 {gi} {tree}"));
+        syntax(&format!("GROUPINFO #secret 0 00 {gi} {tree}"));
+
+        let m = round_trip(&format!(
+            "WELCOME alice@example.org w7c1m5 1 {welcome} {tree}"
+        ));
+        assert_eq!(
+            m.line,
+            ServerLine::Welcome {
+                conv: "alice@example.org".parse().unwrap(),
+                id: "w7c1m5".parse().unwrap(),
+                seq: Seq::new(1).unwrap(),
+                welcome: welcome.parse().unwrap(),
+                tree: tree.parse().unwrap(),
+            }
+        );
+        syntax(&format!("WELCOME #secret w7c1m5 0 {welcome} {tree}"));
+        syntax(&format!("WELCOME #secret w7c1m5 1 {welcome}"));
+
+        let blob = BackupBlob::from_bytes([6; 84]);
+        let m = round_trip(&format!("@ref=9 BACKUP d7hq2klm 12 {blob}"));
+        assert_eq!(
+            m.line,
+            ServerLine::Backup {
+                id: "d7hq2klm".parse().unwrap(),
+                epoch: 12,
+                blob,
+            }
+        );
+        syntax(&format!("BACKUP d7hq2klm 12 {}", b64(6, 85)));
+        syntax("BACKUP d7hq2klm 12");
+    }
+
+    #[test]
+    fn mls_ok_values() {
+        let m = round_trip("OK id=d7hq2klm epoch=0");
+        let ServerLine::Ok(ok) = &m.line else {
+            panic!()
+        };
+        assert_eq!(ok.epoch(), Ok(Some(0)));
+        assert_eq!(ok.id().unwrap().unwrap().as_str(), "d7hq2klm");
+        let m = round_trip("OK count=3 last-resort=yes");
+        let ServerLine::Ok(ok) = &m.line else {
+            panic!()
+        };
+        assert_eq!(ok.count(), Ok(Some(3)));
+        assert_eq!(ok.last_resort(), Ok(Some(true)));
+        assert_eq!(ok.epoch(), Ok(None));
+        let built = OkResponse::new()
+            .with_count(3)
+            .with_last_resort(false)
+            .with_seq(Seq::new(1).unwrap())
+            .with_epoch(1);
+        assert_eq!(
+            ServerMessage::new(built).to_line().to_string(),
+            "OK count=3 last-resort=no seq=1 epoch=1"
+        );
+        let ok: ServerMessage = "OK epoch=x last-resort=maybe".parse().unwrap();
+        let ServerLine::Ok(ok) = &ok.line else {
+            panic!()
+        };
+        assert!(ok.epoch().is_err());
+        assert!(ok.last_resort().is_err());
+    }
+
+    #[test]
+    fn new_error_codes() {
+        for code in ["encrypted", "stale", "invalid"] {
+            let m = round_trip(&format!("ERR {code} try again"));
+            let ServerLine::Err(e) = &m.line else {
+                panic!()
+            };
+            assert!(!matches!(e.code, ErrorCode::Other(_)), "{code}");
+        }
+    }
+
+    #[test]
+    fn enc_and_commit_events() {
+        let frank = Frank::from_bytes([3; 48]);
+        let payload = b64(8, 96);
+        let commit = b64(9, 200);
+        let meta = format!("seq=2;t={T};from=alice@example.org");
+
+        let m = round_trip(&format!(
+            "@{meta};frank={frank} ENC bob@example.net 1 {payload}"
+        ));
+        let ServerLine::Event(Event {
+            body: EventBody::Enc(enc),
+            meta: Some(_),
+        }) = &m.line
+        else {
+            panic!("{m:?}")
+        };
+        assert_eq!(enc.epoch, 1);
+        assert_eq!(enc.payload.as_ref().unwrap().as_str(), payload);
+        assert_eq!(enc.conv.as_str(), "bob@example.net");
+        assert_eq!(
+            ServerLine::Event(Event::new(
+                parse(&format!("@{meta} MSG #a x"))
+                    .line
+                    .clone()
+                    .event_meta(),
+                Encrypted::new(
+                    "bob@example.net".parse::<Uid>().unwrap(),
+                    1,
+                    payload.parse().unwrap(),
+                    frank
+                )
+                .into()
+            )),
+            m.line
+        );
+
+        // With a file, and deleted.
+        let url = "https://files.example.org/f/k3JxR8vN2qYd6hWaP0tZcE/file";
+        round_trip(&format!(
+            "@{meta};frank={frank};file={url};file-type=application/octet-stream;file-size=9 ENC #secret 4 {payload}"
+        ));
+        round_trip(&format!("@{meta};deleted ENC #secret 4"));
+        // A deleted placeholder drops its frank (5.4).
+        syntax(&format!("@{meta};frank={frank};deleted ENC #secret 4"));
+        syntax(&format!("@{meta};deleted ENC #secret 4 {payload}"));
+        syntax(&format!(
+            "@{meta};frank={frank};deleted ENC #secret 4 {payload}"
+        ));
+        syntax(&format!(
+            "@{meta};frank={frank};file={url};deleted ENC #secret 4"
+        ));
+
+        // A live ENC has frank and a payload.
+        syntax(&format!("@{meta} ENC #secret 4 {payload}"));
+        syntax(&format!("@{meta};frank={frank} ENC #secret 4"));
+        syntax(&format!("@{meta};frank={frank} ENC #secret 4 {payload} x"));
+        syntax(&format!("@{meta};frank={frank} ENC #secret x {payload}"));
+        syntax(&format!("@frank={frank} ENC #secret 4 {payload}"));
+        syntax(&format!("@{meta};frank=AAAA ENC #secret 4 {payload}"));
+
+        // A report copy keeps its frank, and has no payload (5.8).
+        let copy = format!("@report=w7c1m5;{meta};frank={frank} ENC alice@example.org 1");
+        let m = round_trip(&copy);
+        assert!(m.is_report_copy());
+        let ServerLine::ReportCopy(Event {
+            body: EventBody::Enc(reported),
+            ..
+        }) = &m.line
+        else {
+            panic!("{m:?}")
+        };
+        assert_eq!(reported.frank, Some(frank));
+        assert_eq!(reported.payload, None);
+        syntax(&format!(
+            "@report=w7c1m5;{meta};frank={frank} ENC alice@example.org 1 {payload}"
+        ));
+        syntax(&format!("@report=w7c1m5;{meta} ENC alice@example.org 1"));
+        syntax(&format!(
+            "@report=w7c1m5;{meta};deleted ENC alice@example.org 1"
+        ));
+        // Not outside a report.
+        syntax(&copy.replace("report=w7c1m5;", ""));
+        // The tags of draft-02's first report copies are ignored.
+        let old = format!(
+            "@report=w7c1m5;{meta};frank={frank};frank-key=AAAA;content=A ENC alice@example.org 1"
+        );
+        assert_eq!(parse(&old), m);
+        // A reviewer's copy of a live event.
+        let live = Encrypted::new(
+            "alice@example.org".parse::<Uid>().unwrap(),
+            1,
+            payload.parse().unwrap(),
+            frank,
+        );
+        let copy_event = Event::new(
+            parse(&format!("@{meta} MSG #a x")).line.event_meta(),
+            live.for_review().into(),
+        );
+        assert_eq!(
+            ServerMessage::report_copy("w7c1m5".parse().unwrap(), copy_event)
+                .to_line()
+                .to_string(),
+            copy
+        );
+        assert!(
+            ServerMessage::report_copy(
+                "w7c1m5".parse().unwrap(),
+                Event::new(
+                    parse(&format!("@{meta} MSG #a x")).line.event_meta(),
+                    live.into(),
+                )
+            )
+            .try_to_line()
+            .is_err()
+        );
+
+        let m = round_trip(&format!("@{meta} COMMIT bob@example.net 1 {commit}"));
+        assert!(matches!(
+            &m.line,
+            ServerLine::Event(Event {
+                body: EventBody::Commit { epoch: 1, .. },
+                ..
+            })
+        ));
+        syntax(&format!("COMMIT bob@example.net 1 {commit}"));
+        syntax(&format!("@{meta} COMMIT bob@example.net 1"));
+        syntax(&format!(
+            "@{meta} COMMIT bob@example.net 1 {commit} {commit}"
+        ));
+        syntax(&format!("@{meta} COMMIT bob@example.net {commit}"));
+        syntax(&format!("@report=w7c1m5 COMMIT bob@example.net 1 {commit}"));
+    }
+
     #[test]
     fn notice_drop_op_serverban() {
         let m = round_trip("NOTICE Downtime at 22:00 UTC");
@@ -3069,9 +3823,18 @@ mod tests {
             .try_to_line()
             .is_err()
         );
-        round_trip("DROP #general");
-        round_trip("DROP #general spam haven");
-        syntax("DROP");
+        let m = round_trip("@id=k3f9q2 DROP #general");
+        assert!(matches!(&m.line, ServerLine::Drop { id, .. } if id.as_str() == "k3f9q2"));
+        round_trip("@id=k3f9q2 DROP #general spam haven");
+        canonical(
+            "@id=k3f9q2;ref=1 DROP #general",
+            "@ref=1;id=k3f9q2 DROP #general",
+        );
+        // DROP needs its id (10.4).
+        syntax("DROP #general");
+        syntax("@id DROP #general");
+        syntax("@id=k3f.9q2 DROP #general");
+        syntax("@id=k3f9q2 DROP");
         round_trip("OP alice@example.org");
         syntax("OP");
         syntax("OP a@b.org c@d.org");

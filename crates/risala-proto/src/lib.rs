@@ -1,4 +1,4 @@
-//! The risala protocol, as defined in SPEC.md (draft-01).
+//! The risala protocol, as defined in SPEC.md (draft-02).
 //!
 //! This crate has no networking and no async code. It parses and
 //! serialises lines, validates names, escapes text and builds and checks
@@ -13,11 +13,13 @@
 //! - [`names`]: uids, rooms, conversations, seqs and ids (3.5).
 //! - [`time`](mod@time): timestamps (3.5).
 //! - [`types`]: small shared values: roles, settings, presence, relations.
-//! - [`auth`]: the sign-in challenge and Ed25519 keys (4.5, App. B).
+//! - [`mls`]: MLS data, franking tags and backup blobs, as opaque values
+//!   (12).
+//! - [`auth`]: the sign-in challenge and ML-DSA-44 keys (4.5, App. B).
 //! - [`keyfile`]: key files (4.4).
 //! - [`fingerprint`]: certificate fingerprints for trust on first use (2.2).
-//! - [`command`]: typed commands, client to server (4-11).
-//! - [`server`]: typed server lines, server to client (4-11).
+//! - [`command`]: typed commands, client to server (4-12).
+//! - [`server`]: typed server lines, server to client (4-12).
 
 #![warn(missing_docs)]
 
@@ -28,6 +30,7 @@ pub mod fingerprint;
 pub mod frame;
 pub mod keyfile;
 pub mod line;
+pub mod mls;
 pub mod names;
 pub mod server;
 pub mod text;
@@ -40,8 +43,8 @@ mod proofs;
 /// The protocol version this crate implements, as sent in the greeting (4.1).
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The default TCP port (14).
+/// The default TCP port (15).
 pub const DEFAULT_PORT: u16 = 7472;
 
-/// The ALPN protocol identifier (2.1, 14).
+/// The ALPN protocol identifier (2.1, 15).
 pub const ALPN: &[u8] = b"risala/1";

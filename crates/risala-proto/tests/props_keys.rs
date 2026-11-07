@@ -1,5 +1,5 @@
-//! Property tests for keys: the sign-in challenge and Ed25519 values
-//! (SPEC 4.5, App. B), key files (4.4) and fingerprints (2.2).
+//! Property tests for keys: the sign-in challenge and ML-DSA-44 values
+//! (SPEC 4.5, App. B), key files (4.4) and fingerprints (2.2, 12.12).
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -9,8 +9,8 @@ use proptest::option;
 use proptest::prelude::*;
 use proptest::sample::Index;
 use risala_proto::auth::{
-    CHALLENGE_PREFIX, Nonce, PUBLIC_KEY_BASE64_LEN, PublicKey, SIGNATURE_BASE64_LEN, SecretKey,
-    Signature, challenge_bytes,
+    CHALLENGE_PREFIX, Nonce, PUBLIC_KEY_BASE64_LEN, PublicKey, SIGNATURE_BASE64_LEN, SIGNATURE_LEN,
+    SecretKey, Signature, challenge_bytes,
 };
 use risala_proto::error::ParseError;
 use risala_proto::fingerprint::Fingerprint;
@@ -50,7 +50,7 @@ fn pool() -> &'static [PublicKey] {
 }
 
 fn pool_key() -> impl Strategy<Value = PublicKey> {
-    (0..POOL_SIZE).prop_map(|i| pool()[i])
+    (0..POOL_SIZE).prop_map(|i| pool()[i].clone())
 }
 
 /// A label as a person might write one: printable text with spaces and
@@ -73,7 +73,7 @@ fn blanks(min: usize) -> impl Strategy<Value = String> {
 
 /// The key type, in any case.
 fn key_type() -> impl Strategy<Value = String> {
-    prop::sample::select(vec!["ed25519", "ED25519", "Ed25519", "eD25519"]).prop_map(str::to_owned)
+    prop::sample::select(vec!["mldsa44", "MLDSA44", "MlDsa44", "mLdSa44"]).prop_map(str::to_owned)
 }
 
 /// One line of a generated key file.
@@ -113,18 +113,18 @@ fn kf_line() -> impl Strategy<Value = KfLine> {
         let k = pool()[key].to_string();
         KfLine::Malformed(match how {
             0 => kt,
-            1 => format!("{kt} {}", &k[..43]),
+            1 => format!("{kt} {}", &k[..k.len() - 1]),
             2 => format!("{kt} {k}A"),
             3 => format!("{kt} {}", k.replace('=', "A")),
             4 => format!("{kt} {k} bad\u{1}label"),
-            _ => format!("{kt} {}", "A".repeat(44)),
+            _ => format!("{kt} {}", "A".repeat(PUBLIC_KEY_BASE64_LEN)),
         })
     });
     prop_oneof![
         8 => entry,
         1 => "[ \t]{0,2}#[ -~]{0,20}".prop_map(KfLine::Comment),
         1 => "[ \t]{0,3}".prop_map(KfLine::Blank),
-        1 => "(ssh-ed25519|ecdsa|ed448|ed25519x)[ \t][ -~]{0,30}".prop_map(KfLine::OtherType),
+        1 => "(ed25519|mldsa65|mldsa44x|ssh-ed25519)[ \t][ -~]{0,30}".prop_map(KfLine::OtherType),
         1 => malformed,
     ]
 }
@@ -174,7 +174,7 @@ proptest! {
         sep in blanks(1),
         kt in key_type(),
     ) {
-        let entry = KeyEntry::new(key, label.as_deref())?;
+        let entry = KeyEntry::new(key.clone(), label.as_deref())?;
         let want = label
             .as_deref()
             .map(|l| l.trim_matches([' ', '\t']))
@@ -225,7 +225,7 @@ proptest! {
                     } else if want.len() == MAX_KEYS {
                         want_skipped.push((line_no, "too many"));
                     } else {
-                        want.push(KeyEntry::new(pool()[*key], label.as_deref())?);
+                        want.push(KeyEntry::new(pool()[*key].clone(), label.as_deref())?);
                     }
                 }
                 KfLine::Comment(_) | KfLine::Blank(_) => {}
@@ -262,7 +262,7 @@ proptest! {
             vec(prop_oneof![
                 kf_line().prop_map(|l| kf_text(&l).to_owned()),
                 any::<String>(),
-                "[eEdD25519 \t\r#A-Za-z0-9+/=]{0,60}",
+                "[mMlLdDsSaA4 \t\r#A-Za-z0-9+/=]{0,60}",
             ], 0..20).prop_map(|lines| lines.join("\n")),
         ]
     ) {
@@ -273,7 +273,7 @@ proptest! {
 
 #[test]
 fn key_file_over_the_limit_is_too_long() {
-    let line = format!("ed25519 {}\n", pool()[0]);
+    let line = format!("mldsa44 {}\n", pool()[0]);
     let text = line.repeat(MAX_KEY_FILE_BYTES / line.len() + 1);
     assert!(text.len() > MAX_KEY_FILE_BYTES);
     assert_eq!(KeyFile::parse(&text), Err(ParseError::TooLong));
@@ -286,15 +286,17 @@ fn key_file_over_the_limit_is_too_long() {
 // Signing in
 
 proptest! {
-    #![proptest_config(config(48))]
+    #![proptest_config(config(24))]
 
     /// For any key, host, nonce and uid, a signed challenge verifies,
     /// also with the host and uid in another case, and stops verifying
     /// when any one byte of the signature changes, or when the host,
-    /// nonce, uid or key differ (4.5).
+    /// nonce, uid or key differ (4.5). Signatures from the hedged variant
+    /// verify too.
     #[test]
     fn sign_then_verify(
         seed in any::<[u8; 32]>(),
+        rnd in any::<[u8; 32]>(),
         host in "[a-zA-Z0-9.-]{1,40}",
         nonce in vec(any::<u8>(), 16..=64),
         uid in "[a-zA-Z0-9~@._-]{1,40}",
@@ -314,9 +316,14 @@ proptest! {
             &signature
         ));
 
+        // Deterministic: the same inputs give the same signature.
+        prop_assert_eq!(&secret.sign_challenge(&host, &nonce, &uid), &signature);
+        let hedged = secret.sign_challenge_hedged(&host, &nonce, &uid, rnd);
+        prop_assert!(public.verify_challenge(&host, &nonce, &uid, &hedged));
+
         let mut bytes = *signature.as_bytes();
-        bytes[flip.index(64)] ^= mask;
-        prop_assert!(!public.verify_challenge(&host, &nonce, &uid, &Signature::from_bytes(bytes)));
+        bytes[flip.index(SIGNATURE_LEN)] ^= mask;
+        prop_assert!(!public.verify_challenge(&host, &nonce, &uid, &Signature::from_bytes(&bytes)));
 
         let (other_host, other_uid) = (format!("{host}x"), format!("{uid}x"));
         prop_assert!(!public.verify_challenge(&other_host, &nonce, &uid, &signature));
@@ -353,7 +360,8 @@ proptest! {
         let pem = secret.to_pkcs8_pem();
         let again = SecretKey::from_pkcs8_pem(&pem)?;
         prop_assert_eq!(again.public_key(), secret.public_key());
-        prop_assert_eq!(again.to_pkcs8_pem(), pem);
+        let again_pem = again.to_pkcs8_pem();
+        prop_assert_eq!(again_pem.as_str(), pem.as_str());
     }
 }
 
@@ -365,16 +373,19 @@ proptest! {
     #[test]
     fn key_values_round_trip(
         key in pool_key(),
-        sig in vec(any::<u8>(), 64),
+        sig in vec(any::<u8>(), SIGNATURE_LEN),
         nonce in vec(any::<u8>(), 16..=64),
         hash in any::<[u8; 32]>(),
     ) {
         let s = key.to_string();
         prop_assert_eq!(s.len(), PUBLIC_KEY_BASE64_LEN);
-        prop_assert_eq!(s.parse::<PublicKey>(), Ok(key));
-        prop_assert_eq!(PublicKey::from_bytes(key.as_bytes()), Ok(key));
+        prop_assert_eq!(s.parse::<PublicKey>(), Ok(key.clone()));
+        prop_assert_eq!(&PublicKey::from_bytes(key.as_bytes()), &key);
+        let fingerprint = key.fingerprint().to_string();
+        prop_assert!(fingerprint.starts_with("sha256:"));
+        prop_assert_eq!(fingerprint.len(), 7 + 64);
 
-        let sig = Signature::from_bytes(sig.try_into().unwrap());
+        let sig = Signature::from_bytes(&sig.try_into().unwrap());
         let s = sig.to_string();
         prop_assert_eq!(s.len(), SIGNATURE_BASE64_LEN);
         prop_assert_eq!(s.parse::<Signature>(), Ok(sig));
@@ -407,8 +418,8 @@ proptest! {
     fn any_key_value_is_canonical(
         s in prop_oneof![
             any::<String>(),
-            "[A-Za-z0-9+/]{42,43}={0,2}",
-            "[A-Za-z0-9+/]{85,86}={0,2}",
+            "[A-Za-z0-9+/]{1749,1751}={0,2}",
+            "[A-Za-z0-9+/]{3225,3227}={0,2}",
             "[0-9a-fA-F]{30,130}",
             "(sha256|SHA256|sha-256):[0-9a-fA-F]{63,65}",
         ]
@@ -440,16 +451,16 @@ proptest! {
     }
 }
 
-/// Flipping any bit of one fixed signature, byte by byte, stops it
+/// Flipping a bit of one fixed signature, byte by byte, stops it
 /// verifying (4.5). The property above picks one byte per case; this
-/// covers all 64 for one key.
+/// covers all 2420 for one key.
 #[test]
 fn every_flipped_signature_byte_fails() {
     let secret = SecretKey::from_seed([7; 32]);
     let public = secret.public_key();
     let nonce = Nonce::from_bytes(&[0x5a; 16]).unwrap();
     let signature = secret.sign_challenge("chat.example.org", &nonce, "alice@example.org");
-    for i in 0..64 {
+    for i in 0..SIGNATURE_LEN {
         let mut bytes = *signature.as_bytes();
         bytes[i] ^= 0x01;
         assert!(
@@ -457,7 +468,7 @@ fn every_flipped_signature_byte_fails() {
                 "chat.example.org",
                 &nonce,
                 "alice@example.org",
-                &Signature::from_bytes(bytes)
+                &Signature::from_bytes(&bytes)
             ),
             "byte {i}"
         );

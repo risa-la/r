@@ -1,4 +1,4 @@
-//! Typed client commands (SPEC 4-11, the first table of Section 12).
+//! Typed client commands (SPEC 4-12, the first table of Section 13).
 //!
 //! A [`Request`] is one line a client sends: its optional `ref` tag (3.6)
 //! and a [`Command`]. Parse one from a [`Line`] with [`Request::parse`],
@@ -32,10 +32,23 @@
 //!   `"KEY FOO"`, so the server replies `ERR unknown-command` (3.8). A
 //!   missing subcommand (`ADMIN` alone) is `BadSyntax`.
 //! - **Tags (3.2).** `ref` applies to every command. MSG also reads
-//!   `reply`, `edit`, `react`, `file` and `cid` (5.3, 5.6, 7.6). Every
-//!   other tag is ignored, including those MSG tags on other commands. A
-//!   tag this module reads must have a valid value: a `ref` or `cid` over
-//!   64 bytes is `TooLong`, a missing or malformed value is `BadSyntax`.
+//!   `reply`, `edit`, `react`, `file` and `cid` (5.3, 5.6, 7.6), and ENC
+//!   reads `frank`, `file` and `cid` (12.8). Every other tag is ignored,
+//!   including those tags on other commands. A tag this module reads must have a valid value: a
+//!   `ref` or `cid` over 64 bytes is `TooLong`, a missing or malformed
+//!   value is `BadSyntax`.
+//! - **MLS data (Section 12)** is opaque here: KeyPackages, GroupInfo,
+//!   commits, Welcomes, ratchet trees and ENC payloads only have to be
+//!   strict base64 ([`mls`](crate::mls)). Whether they verify is for the
+//!   server's MLS library, which answers `ERR invalid`. For the same
+//!   reason an ENC without `frank`, and a payload under 48 bytes, parse:
+//!   the spec answers them with `ERR invalid`, not `ERR bad-syntax`
+//!   (3.7, 12.8). A franking commitment or key of the wrong length is
+//!   `BadSyntax` (3.7).
+//! - **Reports (5.8).** REPORT and REPORTENC are one variant,
+//!   [`Command::Report`], whose `franking` is `Some` for REPORTENC. The
+//!   franking key and content are REPORTENC's tokens, after the verb, so
+//!   that the line may be long (2.3).
 //! - **Text stays escaped (3.4).** Text parameters are kept exactly as
 //!   received. Length limits apply to that escaped form and are
 //!   `TooLong`.
@@ -53,8 +66,8 @@
 //!
 //! [`Request::to_line`] writes the canonical form: the verb (and
 //! subcommand) in upper case, single spaces, tags in the order `ref`,
-//! then the relation, then `file`, then `cid`, and options in the order
-//! the spec's syntax line lists them. Optional options are left out when
+//! then the relation or `frank`, then `file`, then `cid`, and options in the order the spec's syntax line
+//! lists them. Optional options are left out when
 //! they are absent, and so is `purge=` when it is false.
 //!
 //! The fields of [`Command`] are public, so a request built by hand can
@@ -68,10 +81,14 @@ use std::str::FromStr;
 use crate::auth::{PublicKey, Signature};
 use crate::error::ParseError;
 use crate::line::{Line, LineBuilder, Options, Params, Tags};
+use crate::mls::{
+    BackupBlob, Ciphertext, CommitMessage, Frank, Franking, GroupInfo, KeyPackage, RatchetTree,
+    Welcome,
+};
 use crate::names::{BlockTarget, Conv, Id, Identity, Name, Room, Seq, ServerBanTarget, Uid};
 use crate::types::{
-    Cid, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, PushTag, Ref, Relation, Role,
-    RoomSetting, ServerSetting, parse_u64, parse_yes_no,
+    Cid, HistoryOnly, MAX_DISPLAY_NAME, MAX_REACTION, MAX_REPORT_REASON, PushTag, Ref, Relation,
+    Role, RoomSetting, ServerSetting, parse_u64, parse_yes_no,
 };
 pub use crate::types::{FileUrl, MAX_MEDIA_TYPE_PART, MediaType, PushUrl};
 
@@ -101,7 +118,7 @@ impl Request {
         }
     }
 
-    /// Parses a client line into a typed request (3.3, Section 12).
+    /// Parses a client line into a typed request (3.3, Section 13).
     ///
     /// Errors: [`ParseError::UnknownVerb`] for a verb that is not a client
     /// command, `TooLong` for a value over a protocol limit, and
@@ -205,7 +222,7 @@ impl fmt::Display for Request {
 // ---------------------------------------------------------------------------
 // Command
 
-/// A client command: one variant per row of the first table in Section 12.
+/// A client command: one variant per row of the first table in Section 13.
 ///
 /// Optional text is an empty `String` when absent. Text is escaped, as on
 /// the wire (3.4).
@@ -218,10 +235,14 @@ pub enum Command {
         /// information (8.5), which is allowed before sign-in.
         room: Option<Room>,
     },
-    /// `GUEST <name>` (4.2): become the guest `~<name>`.
+    /// `GUEST <name> [token=<token>]` (4.2): become the guest `~<name>`,
+    /// or resume that guest's session.
     Guest {
         /// The guest name, without `~`.
         name: Name,
+        /// `token=`: the token from the `OK` of the session's last GUEST,
+        /// to resume it (4.2). A secret: never log it.
+        token: Option<Id>,
     },
     /// `AUTH <uid> <signature>` (4.5): sign in as an identity.
     ///
@@ -301,12 +322,18 @@ pub enum Command {
     },
     /// `BLOCKS` (5.7): list your blocks.
     Blocks,
-    /// `REPORT <conv> <seq> [<reason...>]` (5.8): report a message.
+    /// `REPORT <conv> <seq> [<reason...>]` or
+    /// `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]` (5.8):
+    /// report a message. REPORTENC reports an ENC event, and reveals its
+    /// content.
     Report {
         /// The conversation.
         conv: Conv,
         /// The reported message.
         seq: Seq,
+        /// For REPORTENC, the message's franking key and decrypted
+        /// content; `None` for REPORT.
+        franking: Option<Franking>,
         /// Why, escaped, at most 512 bytes ([`MAX_REPORT_REASON`]). May be
         /// empty.
         reason: String,
@@ -406,7 +433,8 @@ pub enum Command {
     // ---- 7. History and sync ----
     /// `SYNC` (7.1): list every conversation with its head.
     Sync,
-    /// `HISTORY <conv> [after=<seq>] [before=<seq>] [limit=<n>]` (7.2).
+    /// `HISTORY <conv> [after=<seq>] [before=<seq>] [limit=<n>]
+    /// [only=commit]` (7.2).
     History {
         /// The conversation.
         conv: Conv,
@@ -423,6 +451,9 @@ pub enum Command {
         /// default is 50 ([`DEFAULT_LIMIT`](crate::types::DEFAULT_LIMIT)).
         /// `limit=0` is `BadSyntax`.
         limit: Option<NonZeroU64>,
+        /// `only=commit`: only COMMIT events (7.2, 12.11). Any other value
+        /// is `BadSyntax`.
+        only: Option<HistoryOnly>,
     },
     /// `RELATED <conv> <first> <last> [after=<seq>] [limit=<n>]` (7.3):
     /// the edits and reactions of messages `<first>` to `<last>`.
@@ -475,6 +506,61 @@ pub enum Command {
     /// `PUSH ADD`, `PUSH DEL` or `PUSH LIST` (9.1).
     Push(PushCommand),
 
+    // ---- 12. End-to-end encryption ----
+    /// `KEYPKG ADD`, `KEYPKG COUNT` or `KEYPKG GET` (12.4).
+    KeyPkg(KeyPkgCommand),
+    /// `INIT <conv> <groupinfo> <tree>` (12.5): create a conversation's
+    /// group.
+    Init {
+        /// The conversation.
+        conv: Conv,
+        /// The GroupInfo of epoch 0.
+        group_info: GroupInfo,
+        /// The ratchet tree of epoch 0.
+        tree: RatchetTree,
+    },
+    /// `COMMIT <conv> <commit> <groupinfo> [<welcome>]` (12.5): change a
+    /// group.
+    Commit {
+        /// The conversation.
+        conv: Conv,
+        /// The commit.
+        commit: CommitMessage,
+        /// The GroupInfo of the new epoch.
+        group_info: GroupInfo,
+        /// The Welcome for the devices the commit adds, if it adds any.
+        welcome: Option<Welcome>,
+    },
+    /// `GROUPINFO <conv>` (12.5): fetch a group's GroupInfo and ratchet
+    /// tree.
+    GroupInfo {
+        /// The conversation.
+        conv: Conv,
+    },
+    /// `WELCOME LIST` or `WELCOME DEL` (12.7).
+    Welcome(WelcomeCommand),
+    /// `ENC <conv> <epoch> <payload...>` (12.8), with its tags: send an
+    /// encrypted message.
+    Enc {
+        /// The conversation.
+        conv: Conv,
+        /// The epoch whose history key encrypts the message, a number from
+        /// 0 to 2^63-1.
+        epoch: u64,
+        /// The encrypted message, never empty. One that decodes to fewer
+        /// than 48 bytes parses, and gets `ERR invalid` from the server.
+        payload: Ciphertext,
+        /// The `frank` tag, the franking commitment. Required by the
+        /// server, which answers its absence with `ERR invalid` (12.8).
+        frank: Option<Frank>,
+        /// The `file` tag (5.6, 12.11).
+        file: Option<FileUrl>,
+        /// The `cid` tag, for safe resending (7.6).
+        cid: Option<Cid>,
+    },
+    /// `BACKUP ADD`, `BACKUP GET` or `BACKUP DEL` (12.10).
+    Backup(BackupCommand),
+
     // ---- 10. Administration ----
     /// `ADMIN ...` (10, 5.8): operator commands.
     Admin(AdminCommand),
@@ -514,6 +600,72 @@ pub enum KeyCommand {
     Del {
         /// The key to remove.
         key: PublicKey,
+    },
+}
+
+/// The subcommands of `KEYPKG` (12.4). The subcommand word is
+/// case-insensitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPkgCommand {
+    /// `KEYPKG ADD <keypackage>`: store a KeyPackage for this device.
+    Add {
+        /// The KeyPackage.
+        key_package: KeyPackage,
+    },
+    /// `KEYPKG COUNT`: how many KeyPackages the server holds for this
+    /// device.
+    Count,
+    /// `KEYPKG GET <uid>`: a KeyPackage for each device of `uid`.
+    Get {
+        /// Whose devices. Any uid parses; a guest has no devices.
+        uid: Uid,
+    },
+}
+
+/// The subcommands of `WELCOME` (12.7). The subcommand word is
+/// case-insensitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WelcomeCommand {
+    /// `WELCOME LIST`: send every pending Welcome for this device.
+    List,
+    /// `WELCOME DEL <id>`: delete a Welcome once it is processed.
+    Del {
+        /// The Welcome's id, from its WELCOME line.
+        id: Id,
+    },
+}
+
+/// The subcommands of `BACKUP` (12.10). The subcommand word is
+/// case-insensitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupCommand {
+    /// `BACKUP ADD <id> <epoch> <blob>`: store the blob of one epoch.
+    Add {
+        /// The conversation's id (5.1).
+        id: Id,
+        /// The epoch, a number from 0 to 2^63-1.
+        epoch: u64,
+        /// The encrypted history key.
+        blob: BackupBlob,
+    },
+    /// `BACKUP GET <id> [after=<epoch>] [limit=<n>]`: fetch blobs, oldest
+    /// epoch first, a page at a time.
+    Get {
+        /// The conversation's id (5.1).
+        id: Id,
+        /// `after=`: only epochs after this one. `0` is accepted. Without
+        /// it, the page starts at the oldest epoch, so epoch 0 is included.
+        after: Option<u64>,
+        /// `limit=`: the most epochs to return blobs for, at least 1. A
+        /// page holds every blob of each epoch in it. The server's default
+        /// is 500 ([`DEFAULT_BACKUP_LIMIT`](crate::mls::DEFAULT_BACKUP_LIMIT)).
+        limit: Option<NonZeroU64>,
+    },
+    /// `BACKUP DEL [<id>]`: delete the blobs of one conversation, or all
+    /// of the identity's.
+    Del {
+        /// The conversation's id, or `None` for every blob.
+        id: Option<Id>,
     },
 }
 
@@ -639,11 +791,12 @@ pub enum AdminCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Tables (Section 12)
+// Tables (Section 13)
 
 impl Command {
     /// The verb, in upper case (3.1). Subcommands share their verb:
-    /// `KEY`, `PUSH` or `ADMIN`.
+    /// `KEY`, `PUSH`, `KEYPKG`, `WELCOME`, `BACKUP` or `ADMIN`. A
+    /// [`Report`](Self::Report) with `franking` is `REPORTENC`.
     pub fn verb(&self) -> &'static str {
         match self {
             Command::Info { .. } => "INFO",
@@ -658,7 +811,10 @@ impl Command {
             Command::Block { .. } => "BLOCK",
             Command::Unblock { .. } => "UNBLOCK",
             Command::Blocks => "BLOCKS",
-            Command::Report { .. } => "REPORT",
+            Command::Report { franking: None, .. } => "REPORT",
+            Command::Report {
+                franking: Some(_), ..
+            } => "REPORTENC",
             Command::Reports { .. } => "REPORTS",
             Command::Resolve { .. } => "RESOLVE",
             Command::List(_) => "LIST",
@@ -681,6 +837,13 @@ impl Command {
             Command::Members { .. } => "MEMBERS",
             Command::Whois { .. } => "WHOIS",
             Command::Push(_) => "PUSH",
+            Command::KeyPkg(_) => "KEYPKG",
+            Command::Init { .. } => "INIT",
+            Command::Commit { .. } => "COMMIT",
+            Command::GroupInfo { .. } => "GROUPINFO",
+            Command::Welcome(_) => "WELCOME",
+            Command::Enc { .. } => "ENC",
+            Command::Backup(_) => "BACKUP",
             Command::Admin(_) => "ADMIN",
             Command::Ping { .. } => "PING",
             Command::Pong { .. } => "PONG",
@@ -689,7 +852,7 @@ impl Command {
     }
 
     /// Whether the server accepts this command before the connection has
-    /// signed in (4.1, the "Before sign-in" column of Section 12): INFO
+    /// signed in (4.1, the "Before sign-in" column of Section 13): INFO
     /// without a room, GUEST, AUTH, REGISTER, PING, PONG and QUIT. The
     /// server replies `ERR not-authenticated` to anything else.
     pub fn allowed_before_sign_in(&self) -> bool {
@@ -716,7 +879,8 @@ impl Command {
     }
 
     /// Whether a guest may use this command (the "Guests" column of Section
-    /// 12). MSG is allowed to rooms only. The sign-in commands
+    /// 13). MSG is allowed to rooms only, and REPORT but not REPORTENC,
+    /// since guests are never in encrypted conversations. The sign-in commands
     /// ([`signs_in`](Self::signs_in)) give `false`, since a guest has
     /// already signed in. Permissions within a room (6.3) are checked
     /// separately.
@@ -736,7 +900,7 @@ impl Command {
             | Command::Name { .. }
             | Command::Members { .. }
             | Command::Whois { .. }
-            | Command::Report { .. }
+            | Command::Report { franking: None, .. }
             | Command::Ping { .. }
             | Command::Pong { .. }
             | Command::Quit { .. } => true,
@@ -749,6 +913,9 @@ impl Command {
             | Command::Block { .. }
             | Command::Unblock { .. }
             | Command::Blocks
+            | Command::Report {
+                franking: Some(_), ..
+            }
             | Command::Reports { .. }
             | Command::Resolve { .. }
             | Command::Set { .. }
@@ -760,6 +927,13 @@ impl Command {
             | Command::Bans { .. }
             | Command::Read { .. }
             | Command::Push(_)
+            | Command::KeyPkg(_)
+            | Command::Init { .. }
+            | Command::Commit { .. }
+            | Command::GroupInfo { .. }
+            | Command::Welcome(_)
+            | Command::Enc { .. }
+            | Command::Backup(_)
             | Command::Admin(_) => false,
         }
     }
@@ -778,6 +952,38 @@ impl KeyCommand {
             KeyCommand::List => "LIST",
             KeyCommand::Add { .. } => "ADD",
             KeyCommand::Del { .. } => "DEL",
+        }
+    }
+}
+
+impl KeyPkgCommand {
+    /// The subcommand word, in upper case (12.4).
+    pub fn word(&self) -> &'static str {
+        match self {
+            KeyPkgCommand::Add { .. } => "ADD",
+            KeyPkgCommand::Count => "COUNT",
+            KeyPkgCommand::Get { .. } => "GET",
+        }
+    }
+}
+
+impl WelcomeCommand {
+    /// The subcommand word, in upper case (12.7).
+    pub fn word(&self) -> &'static str {
+        match self {
+            WelcomeCommand::List => "LIST",
+            WelcomeCommand::Del { .. } => "DEL",
+        }
+    }
+}
+
+impl BackupCommand {
+    /// The subcommand word, in upper case (12.10).
+    pub fn word(&self) -> &'static str {
+        match self {
+            BackupCommand::Add { .. } => "ADD",
+            BackupCommand::Get { .. } => "GET",
+            BackupCommand::Del { .. } => "DEL",
         }
     }
 }
@@ -888,10 +1094,10 @@ fn tag_value<T: FromStr<Err = ParseError>>(
 }
 
 // ---------------------------------------------------------------------------
-// Parsing (one arm per command, in the order of Section 12)
+// Parsing (one arm per command, in the order of Section 13)
 
 impl Command {
-    /// Parses the command of a line, ignoring its `ref` (Section 12). Use
+    /// Parses the command of a line, ignoring its `ref` (Section 13). Use
     /// [`Request::parse`] to keep the `ref`.
     pub fn parse(line: &Line) -> Result<Command, ParseError> {
         let mut p = line.params();
@@ -904,7 +1110,12 @@ impl Command {
                 Command::Info { room }
             }
             // 4.2
-            "GUEST" => Command::Guest { name: last(p)? },
+            "GUEST" => {
+                let name = tok(&mut p)?;
+                let options = options(p, &["token"])?;
+                let token = options.get("token").map(str::parse).transpose()?;
+                Command::Guest { name, token }
+            }
             // 4.5
             "AUTH" => {
                 let identity = tok(&mut p)?;
@@ -1008,12 +1219,13 @@ impl Command {
             // 7.2
             "HISTORY" => {
                 let conv = tok(&mut p)?;
-                let options = options(p, &["after", "before", "limit"])?;
+                let options = options(p, &["after", "before", "limit", "only"])?;
                 Command::History {
                     conv,
                     after: after_opt(&options)?,
                     before: options.get("before").map(str::parse).transpose()?,
                     limit: positive_opt(&options, "limit")?,
+                    only: options.get("only").map(str::parse).transpose()?,
                 }
             }
             // 7.3
@@ -1064,12 +1276,21 @@ impl Command {
                 Command::Blocks
             }
             // 5.8
-            "REPORT" => {
+            "REPORT" | "REPORTENC" => {
                 let conv = tok(&mut p)?;
                 let seq = tok(&mut p)?;
+                let franking = if verb == "REPORTENC" {
+                    Some(Franking {
+                        key: tok(&mut p)?,
+                        content: tok(&mut p)?,
+                    })
+                } else {
+                    None
+                };
                 Command::Report {
                     conv,
                     seq,
+                    franking,
                     reason: text_max(p, MAX_REPORT_REASON)?,
                 }
             }
@@ -1077,6 +1298,39 @@ impl Command {
             "RESOLVE" => Command::Resolve { id: last(p)? },
             // 9.1
             "PUSH" => Command::Push(PushCommand::parse(p)?),
+            // 12.4
+            "KEYPKG" => Command::KeyPkg(KeyPkgCommand::parse(p)?),
+            // 12.5
+            "INIT" => {
+                let conv = tok(&mut p)?;
+                let group_info = tok(&mut p)?;
+                let tree = last(p)?;
+                Command::Init {
+                    conv,
+                    group_info,
+                    tree,
+                }
+            }
+            "COMMIT" => {
+                let conv = tok(&mut p)?;
+                let commit = tok(&mut p)?;
+                let group_info = tok(&mut p)?;
+                let welcome = p.opt_token()?.map(str::parse).transpose()?;
+                p.end()?;
+                Command::Commit {
+                    conv,
+                    commit,
+                    group_info,
+                    welcome,
+                }
+            }
+            "GROUPINFO" => Command::GroupInfo { conv: last(p)? },
+            // 12.7
+            "WELCOME" => Command::Welcome(WelcomeCommand::parse(p)?),
+            // 12.8
+            "ENC" => parse_enc(line.tags(), p)?,
+            // 12.10
+            "BACKUP" => Command::Backup(BackupCommand::parse(p)?),
             // 10
             "ADMIN" => Command::Admin(AdminCommand::parse(p)?),
             // 11
@@ -1136,6 +1390,24 @@ fn parse_msg(tags: &Tags, mut p: Params<'_>) -> Result<Command, ParseError> {
     })
 }
 
+/// `ENC <conv> <epoch> <payload...>` and its tags (12.8).
+fn parse_enc(tags: &Tags, mut p: Params<'_>) -> Result<Command, ParseError> {
+    let conv = tok(&mut p)?;
+    let epoch = parse_u64(p.token()?)?;
+    let payload = match p.text() {
+        "" => return Err(ParseError::BadSyntax("ENC needs a payload")),
+        payload => payload.parse()?,
+    };
+    Ok(Command::Enc {
+        conv,
+        epoch,
+        payload,
+        frank: tag_value(tags, "frank", "frank needs a value")?,
+        file: tag_value(tags, "file", "file needs a URL")?,
+        cid: tag_value(tags, "cid", "cid needs a value")?,
+    })
+}
+
 /// Reads a subcommand word, upper case.
 fn subcommand(p: &mut Params<'_>) -> Result<String, ParseError> {
     Ok(p.token()?.to_ascii_uppercase())
@@ -1166,6 +1438,69 @@ impl KeyCommand {
             }
             "DEL" => KeyCommand::Del { key: last(p)? },
             _ => return Err(unknown_subcommand("KEY", &word)),
+        })
+    }
+}
+
+impl KeyPkgCommand {
+    /// Parses the parameters after `KEYPKG` (12.4).
+    fn parse(mut p: Params<'_>) -> Result<KeyPkgCommand, ParseError> {
+        let word = subcommand(&mut p)?;
+        Ok(match word.as_str() {
+            "ADD" => KeyPkgCommand::Add {
+                key_package: last(p)?,
+            },
+            "COUNT" => {
+                p.end()?;
+                KeyPkgCommand::Count
+            }
+            "GET" => KeyPkgCommand::Get { uid: last(p)? },
+            _ => return Err(unknown_subcommand("KEYPKG", &word)),
+        })
+    }
+}
+
+impl WelcomeCommand {
+    /// Parses the parameters after `WELCOME` (12.7).
+    fn parse(mut p: Params<'_>) -> Result<WelcomeCommand, ParseError> {
+        let word = subcommand(&mut p)?;
+        Ok(match word.as_str() {
+            "LIST" => {
+                p.end()?;
+                WelcomeCommand::List
+            }
+            "DEL" => WelcomeCommand::Del { id: last(p)? },
+            _ => return Err(unknown_subcommand("WELCOME", &word)),
+        })
+    }
+}
+
+impl BackupCommand {
+    /// Parses the parameters after `BACKUP` (12.10).
+    fn parse(mut p: Params<'_>) -> Result<BackupCommand, ParseError> {
+        let word = subcommand(&mut p)?;
+        Ok(match word.as_str() {
+            "ADD" => {
+                let id = tok(&mut p)?;
+                let epoch = parse_u64(p.token()?)?;
+                let blob = last(p)?;
+                BackupCommand::Add { id, epoch, blob }
+            }
+            "GET" => {
+                let id = tok(&mut p)?;
+                let options = options(p, &["after", "limit"])?;
+                BackupCommand::Get {
+                    id,
+                    after: options.get("after").map(parse_u64).transpose()?,
+                    limit: positive_opt(&options, "limit")?,
+                }
+            }
+            "DEL" => {
+                let id = p.opt_token()?.map(str::parse).transpose()?;
+                p.end()?;
+                BackupCommand::Del { id }
+            }
+            _ => return Err(unknown_subcommand("BACKUP", &word)),
         })
     }
 }
@@ -1291,8 +1626,11 @@ impl Command {
                     b.token(room);
                 }
             }
-            Command::Guest { name } => {
+            Command::Guest { name, token } => {
                 b.token(name);
+                if let Some(token) = token {
+                    b.option("token", token);
+                }
             }
             Command::Auth {
                 identity,
@@ -1346,8 +1684,17 @@ impl Command {
             Command::Delete { conv, seq } | Command::Read { conv, seq } => {
                 b.token(conv).token(seq);
             }
-            Command::Report { conv, seq, reason } => {
-                b.token(conv).token(seq).text(reason);
+            Command::Report {
+                conv,
+                seq,
+                franking,
+                reason,
+            } => {
+                b.token(conv).token(seq);
+                if let Some(franking) = franking {
+                    b.token(franking.key).token(&franking.content);
+                }
+                b.text(reason);
             }
             Command::Upload {
                 size,
@@ -1391,9 +1738,13 @@ impl Command {
                 after,
                 before,
                 limit,
+                only,
             } => {
                 b.token(conv);
                 write_after_limit(b, *after, *before, *limit);
+                if let Some(only) = only {
+                    b.option("only", only);
+                }
             }
             Command::Related {
                 conv,
@@ -1424,6 +1775,84 @@ impl Command {
                         b.token(url);
                     }
                     PushCommand::List => {}
+                }
+            }
+            Command::KeyPkg(sub) => {
+                b.token(sub.word());
+                match sub {
+                    KeyPkgCommand::Add { key_package } => {
+                        b.token(key_package);
+                    }
+                    KeyPkgCommand::Count => {}
+                    KeyPkgCommand::Get { uid } => {
+                        b.token(uid);
+                    }
+                }
+            }
+            Command::Init {
+                conv,
+                group_info,
+                tree,
+            } => {
+                b.token(conv).token(group_info).token(tree);
+            }
+            Command::Commit {
+                conv,
+                commit,
+                group_info,
+                welcome,
+            } => {
+                b.token(conv).token(commit).token(group_info);
+                if let Some(welcome) = welcome {
+                    b.token(welcome);
+                }
+            }
+            Command::GroupInfo { conv } => {
+                b.token(conv);
+            }
+            Command::Welcome(sub) => {
+                b.token(sub.word());
+                match sub {
+                    WelcomeCommand::List => {}
+                    WelcomeCommand::Del { id } => {
+                        b.token(id);
+                    }
+                }
+            }
+            Command::Enc {
+                conv,
+                epoch,
+                payload,
+                frank,
+                file,
+                cid,
+            } => {
+                if let Some(frank) = frank {
+                    b.tag("frank", frank);
+                }
+                if let Some(file) = file {
+                    b.tag("file", file);
+                }
+                if let Some(cid) = cid {
+                    b.tag("cid", cid);
+                }
+                b.token(conv).token(epoch).text(payload.as_str());
+            }
+            Command::Backup(sub) => {
+                b.token(sub.word());
+                match sub {
+                    BackupCommand::Add { id, epoch, blob } => {
+                        b.token(id).token(epoch).token(blob);
+                    }
+                    BackupCommand::Get { id, after, limit } => {
+                        b.token(id);
+                        write_after_limit(b, *after, None, *limit);
+                    }
+                    BackupCommand::Del { id } => {
+                        if let Some(id) = id {
+                            b.token(id);
+                        }
+                    }
                 }
             }
             Command::Admin(sub) => {
@@ -1543,11 +1972,12 @@ impl AdminCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::{Content, FrankKey};
     use crate::types::{GuestAccess, MAX_FILE_URL, RoomRetention, ServerRetention};
 
-    const KEY: &str = "J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY=";
-    const SIG: &str =
-        "Hk+S5Vd7ciW57dRNS3AhcvZkYNLmj+kkgJUxOYvCrbEQSBk0UDdH+cSBXF6YvCSU85FRVPaURwsQdbV/SAK0CQ==";
+    /// The Appendix B public key and signature.
+    const KEY: &str = crate::auth::tests::PUBLIC_B64;
+    const SIG: &str = crate::auth::tests::SIGNATURE;
     const URL: &str = "https://files.example.org/f/k3JxR8vN2qYd6hWaP0tZcE/cat.png";
 
     fn req(s: &str) -> Request {
@@ -1769,11 +2199,24 @@ mod tests {
         assert_eq!(
             c,
             Command::Guest {
-                name: "sam".parse().unwrap()
+                name: "sam".parse().unwrap(),
+                token: None,
+            }
+        );
+        let c = canon("guest sam TOKEN=Ab-9_x", "GUEST sam token=ab-9_x").command;
+        assert_eq!(
+            c,
+            Command::Guest {
+                name: "sam".parse().unwrap(),
+                token: Some("ab-9_x".parse().unwrap()),
             }
         );
         is_syntax("GUEST");
         is_syntax("GUEST sam extra");
+        is_syntax("GUEST sam token=");
+        is_syntax("GUEST sam token=a.b");
+        is_syntax("GUEST sam other=1");
+        is_syntax("GUEST token=abc");
         is_syntax("GUEST ~sam");
         is_too_long(&format!("GUEST {}", "a".repeat(33)));
     }
@@ -2047,7 +2490,8 @@ mod tests {
             Command::Report {
                 conv: Conv::Room(room("#a")),
                 seq: seq(8816),
-                reason: "spam".into()
+                franking: None,
+                reason: "spam".into(),
             }
         );
         canon("REPORT #a 8816 ", "REPORT #a 8816");
@@ -2057,6 +2501,58 @@ mod tests {
         is_too_long(&format!("REPORT #a 1 {ok}r"));
         is_syntax("REPORT #a");
         is_syntax("REPORT #a x");
+        // The tags of draft-02's first REPORT are ignored like any other.
+        assert_eq!(
+            cmd("@frank-key=AAAA;content=A REPORT #a 1"),
+            cmd("REPORT #a 1")
+        );
+    }
+
+    #[test]
+    fn report_of_an_enc_event() {
+        let key = FrankKey::from_bytes([9; 32]);
+        let content = Content::from_bytes(b"TEXT see you at 12\n").unwrap();
+        let franking = Franking {
+            key,
+            content: content.clone(),
+        };
+        let line = format!("REPORTENC alice@example.org 2 {key} {content} harassment");
+        let request = rt(&line);
+        assert_eq!(
+            request.command,
+            Command::Report {
+                conv: Conv::Uid(uid("alice@example.org")),
+                seq: seq(2),
+                franking: Some(franking.clone()),
+                reason: "harassment".into(),
+            }
+        );
+        assert_eq!(request.command.verb(), "REPORTENC");
+        assert!(!request.command.allowed_for_guests());
+        canon(
+            &format!("@ref=4 reportenc Alice@Example.org 2 {key} {content} "),
+            &format!("@ref=4 REPORTENC alice@example.org 2 {key} {content}"),
+        );
+        // A reason of up to 512 bytes follows the content.
+        let ok = "r".repeat(MAX_REPORT_REASON);
+        rt(&format!("REPORTENC #a 1 {key} {content} {ok}"));
+        is_too_long(&format!("REPORTENC #a 1 {key} {content} {ok}r"));
+        // The key and content are required, and must be valid base64 of
+        // the right length (3.7).
+        is_syntax("REPORTENC #a 2");
+        is_syntax(&format!("REPORTENC #a 2 {key}"));
+        is_syntax(&format!("REPORTENC #a 2 AAAA {content}"));
+        is_syntax(&format!(
+            "REPORTENC #a 2 {}A {content}",
+            &key.to_string()[..43]
+        ));
+        is_syntax(&format!("REPORTENC #a 2 {key} {}", &content.as_str()[1..]));
+        is_syntax(&format!("REPORTENC #a 2 {key} A…"));
+        // Content longer than a normal line, as 2.3 allows for REPORTENC.
+        let long = Content::from_bytes(&[7; 12_000]).unwrap();
+        let line = format!("REPORTENC #a 2 {key} {long} spam");
+        rt(&line);
+        assert_eq!(crate::frame::LineLimits::CLIENT.check(&line), Ok(()));
     }
 
     #[test]
@@ -2216,7 +2712,8 @@ mod tests {
                 conv: Conv::Room(room("#general")),
                 after: None,
                 before: Some(seq(8812)),
-                limit: Some(nz(2))
+                limit: Some(nz(2)),
+                only: None,
             }
         );
         assert_eq!(
@@ -2225,7 +2722,8 @@ mod tests {
                 conv: Conv::Room(room("#a")),
                 after: None,
                 before: None,
-                limit: None
+                limit: None,
+                only: None,
             }
         );
         // after=0: a client with nothing stored (7.1).
@@ -2250,6 +2748,249 @@ mod tests {
         is_syntax("HISTORY #a around=5");
         is_syntax("HISTORY #a 5");
         is_syntax("HISTORY");
+
+        // only=commit (7.2, 12.11), written last.
+        assert!(matches!(
+            canon(
+                "HISTORY bob@example.net ONLY=Commit after=3",
+                "HISTORY bob@example.net after=3 only=commit"
+            )
+            .command,
+            Command::History {
+                only: Some(HistoryOnly::Commit),
+                ..
+            }
+        ));
+        is_syntax("HISTORY #a only=enc");
+        is_syntax("HISTORY #a only=");
+    }
+
+    // ---- 12. End-to-end encryption ----
+
+    /// Base64 of `n` bytes of `b`.
+    fn b64(b: u8, n: usize) -> String {
+        KeyPackage::from_bytes(&vec![b; n]).unwrap().to_string()
+    }
+
+    #[test]
+    fn keypkg() {
+        let kp = b64(1, 300);
+        assert_eq!(
+            canon(&format!("keypkg add {kp}"), &format!("KEYPKG ADD {kp}")).command,
+            Command::KeyPkg(KeyPkgCommand::Add {
+                key_package: kp.parse().unwrap()
+            })
+        );
+        assert_eq!(
+            canon("keypkg Count", "KEYPKG COUNT").command,
+            Command::KeyPkg(KeyPkgCommand::Count)
+        );
+        assert_eq!(
+            canon("KEYPKG GET Bob@Example.net", "KEYPKG GET bob@example.net").command,
+            Command::KeyPkg(KeyPkgCommand::Get {
+                uid: uid("bob@example.net")
+            })
+        );
+        is_syntax("KEYPKG");
+        is_syntax("KEYPKG ADD");
+        is_syntax(&format!("KEYPKG ADD {kp} {kp}"));
+        is_syntax("KEYPKG ADD AAEABA…");
+        is_syntax("KEYPKG ADD AAE");
+        is_syntax("KEYPKG COUNT x");
+        is_syntax("KEYPKG GET");
+        is_syntax("KEYPKG GET #a");
+        assert_eq!(
+            "keypkg drop".parse::<Request>(),
+            Err(ParseError::UnknownVerb("KEYPKG DROP".into()))
+        );
+        assert!(!cmd("KEYPKG COUNT").allowed_for_guests());
+        assert!(!cmd("KEYPKG COUNT").allowed_before_sign_in());
+    }
+
+    #[test]
+    fn init_commit_groupinfo() {
+        let (gi, tree, commit, welcome) = (b64(2, 90), b64(3, 60), b64(4, 120), b64(5, 30));
+        assert_eq!(
+            canon(
+                &format!("init Bob@example.net {gi} {tree}"),
+                &format!("INIT bob@example.net {gi} {tree}")
+            )
+            .command,
+            Command::Init {
+                conv: Conv::Uid(uid("bob@example.net")),
+                group_info: gi.parse().unwrap(),
+                tree: tree.parse().unwrap(),
+            }
+        );
+        rt(&format!("INIT #secret {gi} {tree}"));
+        is_syntax(&format!("INIT #secret {gi}"));
+        is_syntax(&format!("INIT #secret {gi} {tree} {tree}"));
+        is_syntax(&format!("INIT #secret {gi} x"));
+
+        assert_eq!(
+            rt(&format!("COMMIT #secret {commit} {gi} {welcome}")).command,
+            Command::Commit {
+                conv: Conv::Room(room("#secret")),
+                commit: commit.parse().unwrap(),
+                group_info: gi.parse().unwrap(),
+                welcome: Some(welcome.parse().unwrap()),
+            }
+        );
+        assert!(matches!(
+            canon(
+                &format!("commit #secret {commit} {gi} "),
+                &format!("COMMIT #secret {commit} {gi}")
+            )
+            .command,
+            Command::Commit { welcome: None, .. }
+        ));
+        is_syntax(&format!("COMMIT #secret {commit}"));
+        is_syntax(&format!("COMMIT #secret {commit} {gi} {welcome} {welcome}"));
+        is_syntax(&format!("COMMIT #secret {commit} {gi} welcome=x"));
+
+        assert_eq!(
+            canon("groupinfo #Secret", "GROUPINFO #secret").command,
+            Command::GroupInfo {
+                conv: Conv::Room(room("#secret"))
+            }
+        );
+        is_syntax("GROUPINFO");
+        is_syntax("GROUPINFO #a #b");
+
+        // MLS data may be far longer than a normal line (2.3).
+        let big = b64(6, 100_000);
+        rt(&format!("COMMIT #secret {commit} {big} {big}"));
+        for c in ["INIT #a x y", "COMMIT #a x y", "GROUPINFO #a"] {
+            assert!(!cmd(&c.replace('x', &gi).replace('y', &tree)).allowed_for_guests());
+        }
+    }
+
+    #[test]
+    fn welcome() {
+        assert_eq!(
+            canon("welcome list", "WELCOME LIST").command,
+            Command::Welcome(WelcomeCommand::List)
+        );
+        assert_eq!(
+            canon("welcome del W7c1m5", "WELCOME DEL w7c1m5").command,
+            Command::Welcome(WelcomeCommand::Del {
+                id: "w7c1m5".parse().unwrap()
+            })
+        );
+        is_syntax("WELCOME");
+        is_syntax("WELCOME LIST x");
+        is_syntax("WELCOME DEL");
+        is_syntax("WELCOME DEL a.b");
+        assert!(matches!(err("WELCOME GET"), ParseError::UnknownVerb(_)));
+    }
+
+    #[test]
+    fn enc() {
+        let payload = b64(8, 96);
+        let frank = Frank::from_bytes([3; 48]);
+        let line = format!("@frank={frank};cid=q2r8sv0alm3nb7xk ENC bob@example.net 1 {payload}");
+        assert_eq!(
+            rt(&line).command,
+            Command::Enc {
+                conv: Conv::Uid(uid("bob@example.net")),
+                epoch: 1,
+                payload: payload.parse().unwrap(),
+                frank: Some(frank),
+                file: None,
+                cid: Some("q2r8sv0alm3nb7xk".parse().unwrap()),
+            }
+        );
+        // Tag order: ref, frank, file, cid.
+        canon(
+            &format!("@cid=q2r8sv0alm3nb7xk;file={URL};ref=9;frank={frank} enc #a 0 {payload}"),
+            &format!("@ref=9;frank={frank};file={URL};cid=q2r8sv0alm3nb7xk ENC #a 0 {payload}"),
+        );
+        // A missing frank and a short payload parse: the server answers
+        // them with ERR invalid (12.8).
+        let short = b64(8, 3);
+        let c = rt(&format!("ENC #a 0 {short}")).command;
+        let Command::Enc {
+            frank: no_frank,
+            payload: short,
+            ..
+        } = c
+        else {
+            panic!()
+        };
+        assert_eq!(no_frank, None);
+        assert!(!short.is_long_enough());
+        // MSG tags are not read on ENC.
+        assert_eq!(
+            req(&format!(
+                "@reply=4;frank={frank} ENC #a 0 {payload}",
+                frank = Frank::from_bytes([1; 48])
+            )),
+            req(&format!(
+                "@frank={} ENC #a 0 {payload}",
+                Frank::from_bytes([1; 48])
+            ))
+        );
+        // The payload is the text: not empty, base64, nothing after it.
+        is_syntax("ENC #a 0");
+        is_syntax("ENC #a 0 ");
+        is_syntax(&format!("ENC #a 0  {payload}"));
+        is_syntax(&format!("ENC #a 0 {payload} x"));
+        is_syntax(&format!("ENC #a x {payload}"));
+        is_syntax(&format!("ENC #a 01 {payload}"));
+        is_syntax(&format!("ENC #a {payload}"));
+        is_syntax(&format!("@frank=AAAA ENC #a 0 {payload}"));
+        is_syntax(&format!("@frank ENC #a 0 {payload}"));
+        is_too_long(&format!(
+            "@frank={frank};cid={} ENC #a 0 {payload}",
+            "c".repeat(65)
+        ));
+        assert!(!cmd(&format!("ENC #a 0 {payload}")).allowed_for_guests());
+    }
+
+    #[test]
+    fn backup() {
+        let blob = BackupBlob::from_bytes([5; 84]);
+        assert_eq!(
+            canon(
+                &format!("backup add D7hq2klm 3 {blob}"),
+                &format!("BACKUP ADD d7hq2klm 3 {blob}")
+            )
+            .command,
+            Command::Backup(BackupCommand::Add {
+                id: "d7hq2klm".parse().unwrap(),
+                epoch: 3,
+                blob,
+            })
+        );
+        assert_eq!(
+            canon(
+                "backup get d7hq2klm Limit=10 after=0",
+                "BACKUP GET d7hq2klm after=0 limit=10"
+            )
+            .command,
+            Command::Backup(BackupCommand::Get {
+                id: "d7hq2klm".parse().unwrap(),
+                after: Some(0),
+                limit: Some(nz(10)),
+            })
+        );
+        rt("BACKUP GET d7hq2klm");
+        assert_eq!(
+            rt("BACKUP DEL").command,
+            Command::Backup(BackupCommand::Del { id: None })
+        );
+        rt("BACKUP DEL d7hq2klm");
+        is_syntax("BACKUP");
+        is_syntax("BACKUP ADD d7hq2klm 3");
+        is_syntax(&format!("BACKUP ADD d7hq2klm x {blob}"));
+        is_syntax(&format!("BACKUP ADD d7hq2klm 3 {}", b64(5, 83)));
+        is_syntax(&format!("BACKUP ADD d7hq2klm 3 {blob} x"));
+        is_syntax("BACKUP GET d7hq2klm limit=0");
+        is_syntax("BACKUP GET d7hq2klm before=3");
+        is_syntax("BACKUP GET");
+        is_syntax("BACKUP DEL a b");
+        is_too_long(&format!("BACKUP DEL {}", "a".repeat(65)));
+        assert!(matches!(err("BACKUP LIST"), ParseError::UnknownVerb(_)));
     }
 
     #[test]

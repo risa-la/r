@@ -4,7 +4,7 @@
 //! keys or a key twice, and every kept entry's line parses back as the
 //! same entry, alone or as a whole file.
 //!
-//! A fuzzer almost never guesses a valid 44-character Ed25519 key, so
+//! A fuzzer never guesses a valid 1752-character ML-DSA-44 key, so
 //! `$` followed by any byte is replaced with one of 80 real keys (more
 //! than `MAX_KEYS`). That lets it reach valid, duplicate and surplus keys.
 

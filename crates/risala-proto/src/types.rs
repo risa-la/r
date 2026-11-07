@@ -201,6 +201,37 @@ impl GuestAccess {
     }
 }
 
+keywords! {
+    /// The `history` setting of an encrypted room (6.2, 12.9): whether new
+    /// members get the keys to read earlier messages.
+    pub enum HistoryMode {
+        /// `shared`: devices that add a new member also send it the
+        /// history keys of earlier epochs. The default.
+        Shared = "shared",
+        /// `joined`: new members read only what is sent after they are
+        /// added.
+        Joined = "joined",
+    }
+    error = "history is shared or joined";
+}
+
+keywords! {
+    /// The value of HISTORY's `only=` option (7.2): which events to
+    /// return.
+    pub enum HistoryOnly {
+        /// `commit`: only COMMIT events (12.11).
+        Commit = "commit",
+    }
+    error = "only is commit";
+}
+
+impl Default for HistoryMode {
+    /// `shared`, the default (6.2).
+    fn default() -> HistoryMode {
+        HistoryMode::Shared
+    }
+}
+
 impl Default for GuestAccess {
     /// `write`, the default for new rooms (6.2).
     fn default() -> GuestAccess {
@@ -217,10 +248,13 @@ keywords! {
         Mention = "mention",
         /// `reply`: a reply to one of the user's messages.
         Reply = "reply",
+        /// `message`: a message in an encrypted room, where the server
+        /// cannot see mentions or replies (9.2, 12.11).
+        Message = "message",
         /// `read`: the unread count went down.
         Read = "read",
     }
-    error = "a push reason is dm, mention, reply or read";
+    error = "a push reason is dm, mention, reply, message or read";
 }
 
 /// The `<reason>` of a NOTIFY line as received (9.3): a [`PushReason`],
@@ -677,6 +711,13 @@ pub enum RoomSetting {
     Guests(GuestAccess),
     /// `retention`: `server` or a number of days.
     Retention(RoomRetention),
+    /// `e2ee`: `yes` or `no`, whether the room is end-to-end encrypted
+    /// (12.3). Only INIT turns it on; a SET of it gets `ERR forbidden`.
+    E2ee(bool),
+    /// `history`: `shared` or `joined`, in encrypted rooms only (12.9). An
+    /// owner changes it with a COMMIT; a SET of it gets `ERR encrypted`
+    /// or `ERR forbidden` (6.2).
+    History(HistoryMode),
     /// A key this crate does not know, folded to lower case, with its value
     /// kept as escaped text.
     Other {
@@ -702,6 +743,8 @@ impl RoomSetting {
             "public" => RoomSetting::Public(parse_yes_no(value.trim_end_matches(' '))?),
             "guests" => RoomSetting::Guests(value.trim_end_matches(' ').parse()?),
             "retention" => RoomSetting::Retention(value.trim_end_matches(' ').parse()?),
+            "e2ee" => RoomSetting::E2ee(parse_yes_no(value.trim_end_matches(' '))?),
+            "history" => RoomSetting::History(value.trim_end_matches(' ').parse()?),
             _ => RoomSetting::Other {
                 key,
                 value: value.to_owned(),
@@ -716,6 +759,8 @@ impl RoomSetting {
             RoomSetting::Public(_) => "public",
             RoomSetting::Guests(_) => "guests",
             RoomSetting::Retention(_) => "retention",
+            RoomSetting::E2ee(_) => "e2ee",
+            RoomSetting::History(_) => "history",
             RoomSetting::Other { key, .. } => key,
         }
     }
@@ -727,6 +772,8 @@ impl RoomSetting {
             RoomSetting::Public(public) => Cow::Borrowed(yes_no(*public)),
             RoomSetting::Guests(guests) => Cow::Borrowed(guests.as_str()),
             RoomSetting::Retention(retention) => Cow::Owned(retention.to_string()),
+            RoomSetting::E2ee(e2ee) => Cow::Borrowed(yes_no(*e2ee)),
+            RoomSetting::History(history) => Cow::Borrowed(history.as_str()),
             RoomSetting::Other { value, .. } => Cow::Borrowed(value),
         }
     }
@@ -1166,7 +1213,7 @@ mod tests {
         for &r in PushReason::ALL {
             assert_eq!(r.to_string().parse::<PushReason>(), Ok(r));
         }
-        assert_eq!(PushReason::ALL.len(), 4);
+        assert_eq!(PushReason::ALL.len(), 5);
         assert_eq!("DM".parse::<PushReason>(), Ok(PushReason::Dm));
         assert!(is_syntax("edit".parse::<PushReason>()));
     }
@@ -1341,6 +1388,18 @@ mod tests {
                 RoomSetting::Retention(RoomRetention::Days(days(30))),
             ),
             ("public", "no", RoomSetting::Public(false)),
+            ("e2ee", "no", RoomSetting::E2ee(false)),
+            ("e2ee", "yes", RoomSetting::E2ee(true)),
+            (
+                "history",
+                "shared",
+                RoomSetting::History(HistoryMode::Shared),
+            ),
+            (
+                "history",
+                "joined",
+                RoomSetting::History(HistoryMode::Joined),
+            ),
         ];
         for (key, value, setting) in cases {
             assert_eq!(RoomSetting::parse(key, value), Ok(setting.clone()));
