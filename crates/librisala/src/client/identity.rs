@@ -63,7 +63,7 @@ fn store_error(e: KeyStoreError) -> ClientError {
 fn exists(identity: &Identity) -> ClientError {
     ClientError::keys(
         KeyErrorKind::Exists,
-        format!("{identity} already has a different device key"),
+        format!("{identity} already has a device key on this device"),
     )
 }
 
