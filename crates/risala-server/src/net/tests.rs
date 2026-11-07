@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use risala_proto::auth::Nonce;
 use risala_proto::command::{Command, Request};
 use risala_proto::fingerprint::Fingerprint;
-use risala_proto::server::{Greeting, OkResponse, ServerMessage};
+use risala_proto::server::{Greeting, OkResponse, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 use tokio::io::{
     AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, ReadHalf, WriteHalf,
@@ -44,6 +44,8 @@ struct Stub {
     overlapped: AtomicUsize,
     /// How long each command takes.
     delay: Duration,
+    /// Lines of 1 KiB each command queues before its OK.
+    lines_per_command: usize,
 }
 
 impl Stub {
@@ -87,6 +89,10 @@ impl Handler for Stub {
             tokio::time::sleep(self.delay).await;
         }
         let handle = self.handle(conn);
+        for n in 0..self.lines_per_command {
+            let message = format!("{n:04} {}", "x".repeat(1019));
+            handle.send(ServerMessage::new(ServerLine::Notice { message }));
+        }
         match &req.command {
             Command::Pong { .. } => {}
             command => {
@@ -119,6 +125,12 @@ const TIMERS: Timers = Timers {
     ping_timeout: Duration::from_secs(60),
 };
 
+/// Room for a stub's response: the OK, and a line for a PING.
+const ROOM: CommandRoom = CommandRoom {
+    lines: 2,
+    bytes: 2 * risala_proto::frame::MAX_SERVER_LINE,
+};
+
 /// One connection task, served over a pipe.
 struct Pipe {
     rd: BufReader<ReadHalf<DuplexStream>>,
@@ -130,6 +142,10 @@ struct Pipe {
 
 impl Pipe {
     fn new(stub: Arc<Stub>, out_queue: usize, pipe_bytes: usize) -> Pipe {
+        Pipe::with_room(stub, out_queue, pipe_bytes, ROOM)
+    }
+
+    fn with_room(stub: Arc<Stub>, out_queue: usize, pipe_bytes: usize, room: CommandRoom) -> Pipe {
         let (client, server) = tokio::io::duplex(pipe_bytes);
         let (handle, receiver) = conn_channel(ID, out_queue, usize::MAX);
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -145,6 +161,7 @@ impl Pipe {
             receiver,
             stub.clone(),
             TIMERS,
+            room,
             stop_rx,
         ));
         let (rd, wr) = tokio::io::split(client);
@@ -431,6 +448,74 @@ async fn slow_reader_is_killed() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn pipelined_commands_wait_for_a_slow_reader() {
+    // Each command queues 40 lines of 1 KiB and an OK, into a queue of 64
+    // lines, over a pipe that holds 64 bytes. The client sends 12 commands
+    // at once, then reads slowly. Run back to back, the commands would
+    // overflow the queue and the connection would be dropped. Instead each
+    // waits for room for its response (and a little more), which the
+    // client makes as it reads.
+    let stub = Arc::new(Stub {
+        lines_per_command: 40,
+        ..Stub::default()
+    });
+    let room = CommandRoom {
+        lines: 50,
+        bytes: 50 * 1024,
+    };
+    let mut pipe = Pipe::with_room(stub.clone(), 64, 64, room);
+    pipe.expect(GREETING).await;
+    let commands: String = (0..12).map(|i| format!("@ref={i:02} PING\n")).collect();
+    // The commands do not fit in the pipe at once, so send them while
+    // reading.
+    let Pipe { rd, wr, .. } = &mut pipe;
+    let send = async { wr.write_all(commands.as_bytes()).await.unwrap() };
+    let read = async {
+        let mut line = String::new();
+        for i in 0..12 {
+            for n in 0..40 {
+                line.clear();
+                rd.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with(&format!("NOTICE {n:04} ")), "{line}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            line.clear();
+            rd.read_line(&mut line).await.unwrap();
+            assert_eq!(line, format!("@ref={i:02} OK verb=ping\n"));
+        }
+    };
+    tokio::join!(send, read);
+    assert_eq!(stub.closed(), Vec::new());
+    assert_eq!(Pipe::commands(&stub).len(), 12);
+    pipe.wr.shutdown().await.unwrap();
+    pipe.expect_end().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_that_stops_reading_times_out_while_waiting() {
+    // While a command waits for room, the keepalive timers still run:
+    // a client that sends commands but never reads is closed in the end.
+    let stub = Arc::new(Stub {
+        lines_per_command: 40,
+        ..Stub::default()
+    });
+    let room = CommandRoom {
+        lines: 50,
+        bytes: 50 * 1024,
+    };
+    let mut pipe = Pipe::with_room(stub.clone(), 64, 64, room);
+    pipe.expect(GREETING).await;
+    let start = Instant::now();
+    pipe.send(b"PING\nPING\nPING\nPING\n").await;
+    (&mut pipe.task).await.unwrap();
+    // PING after 120 seconds, BYE 60 later, then 5 seconds to drain.
+    assert!(start.elapsed() >= TIMERS.idle_ping + TIMERS.ping_timeout);
+    assert!(start.elapsed() <= TIMERS.idle_ping + TIMERS.ping_timeout + conn::DRAIN_TIMEOUT);
+    assert!(Pipe::commands(&stub).len() < 4);
+    assert_eq!(stub.closed(), vec![ID]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn shutdown_stops_reading() {
     let stub = Stub::new();
     let (client, server) = tokio::io::duplex(4096);
@@ -448,6 +533,7 @@ async fn shutdown_stops_reading() {
         receiver,
         stub.clone(),
         TIMERS,
+        ROOM,
         stop_rx,
     ));
     let (rd, _wr) = tokio::io::split(client);

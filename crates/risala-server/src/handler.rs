@@ -364,7 +364,9 @@ impl Drop for ConnReceiver {
 ///
 /// The network layer calls [`open`](Handler::open) once the TLS handshake
 /// is done, then [`command`](Handler::command) for each parsed line,
-/// awaiting each call before it reads the next command, then
+/// awaiting each call before it reads the next command, and waiting before
+/// each until the connection's queue has room for a whole response
+/// ([`Limits::command_room`](crate::config::Limits::command_room)), then
 /// [`closed`](Handler::closed) exactly once when the connection is gone for
 /// any reason (EOF, error, timeout, kill, or after a `Close`).
 pub trait Handler: Send + Sync + 'static {

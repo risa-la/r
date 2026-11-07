@@ -42,6 +42,17 @@ pub(crate) struct Timers {
     pub ping_timeout: Duration,
 }
 
+/// The room a connection's queue must have before the next command goes
+/// to the handler: [`Limits::command_room`](crate::config::Limits::command_room)
+/// and [`command_room_bytes`](crate::config::Limits::command_room_bytes).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandRoom {
+    /// Free lines.
+    pub lines: usize,
+    /// Free bytes.
+    pub bytes: usize,
+}
+
 /// Why the reading side stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ended {
@@ -62,6 +73,7 @@ enum Ended {
 /// Calls [`Handler::open`] first and [`Handler::closed`] exactly once
 /// last, however the connection ends. `stop` turns true when the server
 /// shuts down; the caller queues the BYE.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, H>(
     stream: S,
     info: ConnInfo,
@@ -69,6 +81,7 @@ pub(crate) async fn serve<S, H>(
     receiver: ConnReceiver,
     handler: Arc<H>,
     timers: Timers,
+    room: CommandRoom,
     stop: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -79,7 +92,7 @@ pub(crate) async fn serve<S, H>(
     let mut writer = tokio::spawn(write_loop(wr, receiver));
     handler.open(info, handle.clone());
 
-    let ended = read_loop(rd, &handle, &*handler, timers, stop, &mut writer).await;
+    let ended = read_loop(rd, &handle, &*handler, timers, room, stop, &mut writer).await;
     tracing::debug!(conn = id.0, ?ended, "connection stopped reading");
     if ended != Ended::Writer {
         if ended == Ended::Eof {
@@ -100,11 +113,19 @@ pub(crate) async fn serve<S, H>(
 }
 
 /// Reads lines and handles them until the connection should stop reading.
+///
+/// Before each command goes to the handler, it waits until the queue has
+/// `room` for the command's response. So a client that sends many commands
+/// at once gets their responses as fast as it reads them, rather than
+/// being dropped as too slow when they overflow its queue. The keepalive
+/// timers still run while it waits, so a client that stops reading
+/// altogether is closed in the end.
 async fn read_loop<R, H>(
     mut rd: R,
     handle: &ConnHandle,
     handler: &H,
     timers: Timers,
+    room: CommandRoom,
     mut stop: watch::Receiver<bool>,
     writer: &mut JoinHandle<()>,
 ) -> Ended
@@ -137,6 +158,11 @@ where
                     };
                     match req {
                         Ok(req) => {
+                            if let Some(ended) =
+                                wait_for_room(handle, room, &mut keepalive, &mut stop, writer).await
+                            {
+                                return ended;
+                            }
                             let quit = matches!(req.command, Command::Quit { .. });
                             handler.command(id, req).await;
                             if quit {
@@ -156,16 +182,8 @@ where
             _ = &mut *writer => return Ended::Writer,
             _ = stop.wait_for(|stopping| *stopping) => return Ended::Shutdown,
             () = tokio::time::sleep_until(deadline) => {
-                match keepalive.expired(Instant::now()) {
-                    Some(Expired::Ping) => {
-                        handle.send(ServerMessage::new(ServerLine::Ping { token: ping_token() }));
-                    }
-                    Some(Expired::Timeout) => {
-                        tracing::debug!(conn = id.0, "ping timeout");
-                        handle.close(Some("ping timeout".into()));
-                        return Ended::Timeout;
-                    }
-                    None => {}
+                if let Some(ended) = keepalive_expired(handle, &mut keepalive) {
+                    return ended;
                 }
             }
             read = rd.read(&mut buf) => match read {
@@ -177,6 +195,52 @@ where
                 }
             },
         }
+    }
+}
+
+/// Waits until the queue has `room` for a command's response (see
+/// [`read_loop`]). Returns why the connection should stop reading instead,
+/// if it should.
+async fn wait_for_room(
+    handle: &ConnHandle,
+    room: CommandRoom,
+    keepalive: &mut Keepalive,
+    stop: &mut watch::Receiver<bool>,
+    writer: &mut JoinHandle<()>,
+) -> Option<Ended> {
+    while !handle.has_room(room.lines, room.bytes) {
+        let deadline = keepalive.deadline();
+        tokio::select! {
+            biased;
+            _ = &mut *writer => return Some(Ended::Writer),
+            _ = stop.wait_for(|stopping| *stopping) => return Some(Ended::Shutdown),
+            () = tokio::time::sleep_until(deadline) => {
+                if let Some(ended) = keepalive_expired(handle, keepalive) {
+                    return Some(ended);
+                }
+            }
+            () = handle.wait_for_room(room.lines, room.bytes) => {}
+        }
+    }
+    None
+}
+
+/// Called when the keepalive deadline may have passed: sends PING, or
+/// gives up with BYE (11).
+fn keepalive_expired(handle: &ConnHandle, keepalive: &mut Keepalive) -> Option<Ended> {
+    match keepalive.expired(Instant::now()) {
+        Some(Expired::Ping) => {
+            handle.send(ServerMessage::new(ServerLine::Ping {
+                token: ping_token(),
+            }));
+            None
+        }
+        Some(Expired::Timeout) => {
+            tracing::debug!(conn = handle.id().0, "ping timeout");
+            handle.close(Some("ping timeout".into()));
+            Some(Ended::Timeout)
+        }
+        None => None,
     }
 }
 
