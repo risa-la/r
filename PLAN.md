@@ -635,7 +635,8 @@ Open:
       - The registration rate limit counts registrations that succeeded
         or are in progress, so parallel connections cannot get around
         it (4.6, 14).
-    - Chosen while writing it up, not yet confirmed:
+    - Chosen while writing it up, and confirmed with the user on
+      2026-11-07:
       - A 200 file over 256 KiB counts as a file with no keys (removed),
         while a redirect, 401, 403, 429 or other non-404/410 status
         counts as a failed fetch (outage).
