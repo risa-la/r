@@ -1503,7 +1503,8 @@ async fn in_many_rooms() -> (Harness, Client, usize) {
     sam.lines();
     for room in &rooms {
         h.send(&sam, &format!("join {room}")).await;
-        assert_eq!(sam.lines().len(), 6);
+        // The JOIN event, five SET snapshots and the OK.
+        assert_eq!(sam.lines().len(), 7);
     }
     (h, sam, rooms.len())
 }
