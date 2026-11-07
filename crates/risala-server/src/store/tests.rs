@@ -156,6 +156,19 @@ fn commits_are_durable() {
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .unwrap();
     assert_eq!(mode, "wal");
+    drop(conn);
+
+    // Only for filling a database quickly.
+    let sync = |store: &SqliteStore| -> i64 {
+        store
+            .conn()
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap()
+    };
+    store.set_durable(false).unwrap();
+    assert_eq!(sync(&store), 0);
+    store.set_durable(true).unwrap();
+    assert_eq!(sync(&store), 2);
 }
 
 #[test]

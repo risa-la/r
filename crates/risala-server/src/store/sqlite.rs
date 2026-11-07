@@ -69,6 +69,16 @@ impl SqliteStore {
         })
     }
 
+    /// With `false`, commits are no longer flushed to disk
+    /// (`synchronous=OFF`), so a power failure can lose them. Only for
+    /// filling a database quickly, for example before a test, never for a
+    /// database a server is running on. `true` restores `synchronous=FULL`.
+    pub fn set_durable(&self, durable: bool) -> Result<()> {
+        let mode = if durable { "FULL" } else { "OFF" };
+        self.conn().pragma_update(None, "synchronous", mode)?;
+        Ok(())
+    }
+
     pub(super) fn conn(&self) -> MutexGuard<'_, Connection> {
         // A panic while holding the lock cannot leave a transaction open:
         // rusqlite rolls back when a Transaction is dropped.

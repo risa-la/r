@@ -155,6 +155,7 @@ impl TestServerBuilder {
 fn prepare_store(config: &Config, prepare: Vec<Prepare>) {
     std::fs::create_dir_all(&config.state_dir).expect("creating the state directory");
     let store = SqliteStore::open(&config.database_path()).expect("opening the database");
+    store.set_durable(false).expect("speeding up the database");
     for name in &config.rooms {
         let room: Room = name.parse().expect("a valid room name");
         store
