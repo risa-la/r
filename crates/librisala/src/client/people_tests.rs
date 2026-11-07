@@ -24,9 +24,18 @@ where
     F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    setup_n(1, script).await
+}
+
+/// [`setup`] with `conns` connections, and quick reconnects.
+async fn setup_n<F, Fut>(conns: usize, script: F) -> (Client, ScriptServer)
+where
+    F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     let cert = ServerCert::self_signed(HOST);
     let fingerprint = cert.fingerprint.to_string();
-    let server = ScriptServer::start(cert, 1, script).await;
+    let server = ScriptServer::start(cert, conns, script).await;
     let unrelated = TestCa::new();
     let client = Client::open_in_memory(ClientOptions {
         session: SessionOptions {
@@ -35,6 +44,11 @@ where
             ..SessionOptions::default()
         },
         keys: Some(Arc::new(MemoryKeyStore::default())),
+        backoff: crate::conn::Backoff {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(20),
+            stable_after: Duration::from_secs(3600),
+        },
         ..ClientOptions::default()
     })
     .unwrap();
@@ -423,4 +437,90 @@ async fn guests_cannot_block() {
         sam.conversation("bob@example.net").unwrap().members().await,
         Err(ClientError::Invalid(_))
     ));
+}
+
+#[tokio::test]
+async fn presence_shown_is_asked_again_after_a_reconnect() {
+    // 8.3: PRESENCE only reports changes, so after a reconnect the client
+    // asks MEMBERS and WHOIS again, for what the app still watches.
+    let dropped = Arc::new(tokio::sync::Notify::new());
+    let (client, server) = setup_n(2, {
+        let dropped = dropped.clone();
+        move |i, mut peer| {
+            let dropped = dropped.clone();
+            async move {
+                sign_in(&mut peer).await;
+                peer.expect("@ref=2 SYNC").await;
+                peer.expect("@ref=3 BLOCKS").await;
+                peer.send("@ref=2 OK").await;
+                peer.send("@ref=3 OK").await;
+                if i == 0 {
+                    peer.expect("@ref=4 MEMBERS #general").await;
+                    peer.send("@ref=4 MEMBER #general bob@example.net member online Bob")
+                        .await;
+                    peer.send("@ref=4 OK").await;
+                    peer.expect("@ref=5 WHOIS carol@example.com").await;
+                    peer.send("@ref=5 USER carol@example.com online").await;
+                    peer.send("@ref=5 OK").await;
+                    peer.expect("@ref=6 WHOIS dave@example.com").await;
+                    peer.send("@ref=6 USER dave@example.com online").await;
+                    peer.send("@ref=6 OK").await;
+                    // The app stops watching dave, then the connection
+                    // drops.
+                    dropped.notified().await;
+                    peer.close().await;
+                } else {
+                    // Asked again: the room and carol, not dave.
+                    peer.expect("@ref=4 MEMBERS #general").await;
+                    peer.send("@ref=4 MEMBER #general bob@example.net member offline Bob")
+                        .await;
+                    peer.send("@ref=4 OK").await;
+                    peer.expect("@ref=5 WHOIS carol@example.com").await;
+                    peer.send("@ref=5 USER carol@example.com offline").await;
+                    peer.send("@ref=5 OK").await;
+                    quit(peer).await;
+                }
+            }
+        }
+    })
+    .await;
+    let alice = client.add_identity(HOST, ALICE).unwrap();
+    let events = alice.subscribe();
+    within(alice.connect()).await.unwrap();
+    within(alice.wait_synced()).await.unwrap();
+    let general = alice.conversation("#general").unwrap();
+    assert!(alice.conversation(ALICE).unwrap().watch_members().is_err());
+    let members = general.watch_members().unwrap();
+    let carol = alice.watch_presence("carol@example.com").unwrap();
+    let dave = alice.watch_presence("dave@example.com").unwrap();
+    let presence_of = |uid: &'static str, p: Presence| {
+        move |e: &AccountEvent| match e {
+            AccountEvent::UserChanged { user } if user.uid == uid && user.presence == p => Some(()),
+            _ => None,
+        }
+    };
+    until(&events, presence_of("dave@example.com", Presence::Online)).await;
+    assert_eq!(
+        alice.user("carol@example.com").unwrap().presence,
+        Presence::Online
+    );
+    drop(dave);
+    dropped.notify_one();
+    until(&events, |e| {
+        matches!(e, AccountEvent::PresenceLost).then_some(())
+    })
+    .await;
+    until(&events, presence_of("carol@example.com", Presence::Offline)).await;
+    assert_eq!(
+        alice.user("bob@example.net").unwrap().presence,
+        Presence::Offline
+    );
+    within(alice.wait_synced()).await.unwrap();
+    members.stop();
+    members.stop();
+    drop(carol);
+    assert!(alice.shared().watching.lock().unwrap().rooms.is_empty());
+    assert!(alice.shared().watching.lock().unwrap().users.is_empty());
+    alice.disconnect().await;
+    server.done().await;
 }

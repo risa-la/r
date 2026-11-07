@@ -165,6 +165,7 @@ use crate::store::{AccountId, Store};
 use crate::sync::SyncConfig;
 
 pub use account::{Account, AccountEvents, Conversation};
+pub use people::PresenceWatch;
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,

@@ -12,7 +12,10 @@
 //!   [`Conversation::cached_members`] reads it, offline too.
 //!   [`Account::whois`] asks about one user. Presence is kept in memory
 //!   while connected, from those answers and from PRESENCE lines, and is
-//!   [`Presence::NotKnown`] otherwise.
+//!   [`Presence::NotKnown`] otherwise. PRESENCE only reports changes, so
+//!   while the app shows presence it holds a [`PresenceWatch`], from
+//!   [`Conversation::watch_members`] or [`Account::watch_presence`], and
+//!   the account asks again after each reconnect.
 //! - **Typing** (8.1). [`Conversation::set_typing`] as the user types;
 //!   [`AccountEvent::Typing`] says who else is typing.
 //! - **Blocks** (5.7). [`Account::block`], [`Account::unblock`] and
@@ -26,9 +29,11 @@
 //! [`AccountEvent::PresenceLost`] and [`AccountEvent::BlocksChanged`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use risala_proto::command::{Command, Request};
-use risala_proto::names::{BlockTarget, Conv, Uid};
+use risala_proto::names::{BlockTarget, Conv, Room, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::{escape, unescape};
 use tokio::sync::oneshot;
@@ -134,7 +139,99 @@ pub(crate) fn labels(people: &[(Uid, Option<String>)]) -> Vec<Label> {
         .collect()
 }
 
+/// Keeps the presence of a room's members, or of one user, current while
+/// it lives (8.3): the account asks MEMBERS or WHOIS when it is made, if
+/// connected, and again after each reconnect, since PRESENCE lines only
+/// report changes, and those made while disconnected are missed. The
+/// answers arrive as [`AccountEvent::UserChanged`] and
+/// [`AccountEvent::MembersChanged`].
+///
+/// Hold one while the app shows a member list or someone's presence, and
+/// drop it, or call [`stop`](Self::stop), when it no longer does. Get one
+/// from [`Conversation::watch_members`] or [`Account::watch_presence`].
+pub struct PresenceWatch {
+    shared: Arc<AccountShared>,
+    what: Watched,
+    stopped: AtomicBool,
+}
+
+enum Watched {
+    Room(Room),
+    User(Uid),
+}
+
+impl std::fmt::Debug for PresenceWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match &self.what {
+            Watched::Room(room) => room.to_string(),
+            Watched::User(uid) => uid.to_string(),
+        };
+        f.debug_tuple("PresenceWatch").field(&what).finish()
+    }
+}
+
+impl PresenceWatch {
+    fn new(shared: &Arc<AccountShared>, what: Watched) -> PresenceWatch {
+        let op = {
+            let mut watching = shared.watching.lock().expect("poisoned");
+            match &what {
+                Watched::Room(room) => {
+                    *watching.rooms.entry(room.clone()).or_default() += 1;
+                    PeopleOp::Members(room.clone())
+                }
+                Watched::User(uid) => {
+                    *watching.users.entry(uid.clone()).or_default() += 1;
+                    PeopleOp::Whois(uid.clone())
+                }
+            }
+        };
+        // Asked now if connected; nobody waits for the answer, which
+        // arrives as events. Offline, it fails quietly.
+        let (reply, _) = oneshot::channel();
+        shared.command(Cmd::People { op, reply });
+        PresenceWatch {
+            shared: shared.clone(),
+            what,
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Stops watching. Dropping it does the same.
+    pub fn stop(&self) {
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut watching = self.shared.watching.lock().expect("poisoned");
+        fn release<K: std::hash::Hash + Eq>(map: &mut HashMap<K, usize>, key: &K) {
+            if let Some(n) = map.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(key);
+                }
+            }
+        }
+        match &self.what {
+            Watched::Room(room) => release(&mut watching.rooms, room),
+            Watched::User(uid) => release(&mut watching.users, uid),
+        }
+    }
+}
+
+impl Drop for PresenceWatch {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 impl Account {
+    /// Keeps `uid`'s presence current while the returned watch lives:
+    /// WHOIS now, if connected, and again after each reconnect (8.3).
+    /// See [`PresenceWatch`].
+    pub fn watch_presence(&self, uid: &str) -> Result<PresenceWatch, ClientError> {
+        let uid = parse_uid(uid)?;
+        Ok(PresenceWatch::new(self.shared(), Watched::User(uid)))
+    }
+
     /// Sends a command about people through the account's task, and
     /// returns its response lines.
     async fn people(&self, op: PeopleOp) -> Result<Vec<ServerMessage>, ClientError> {
@@ -329,6 +426,18 @@ impl Conversation {
             Conv::Room(room) => Ok(room.clone()),
             other => Err(ClientError::Invalid(format!("{other} is not a room"))),
         }
+    }
+
+    /// Keeps the room's members and their presence current while the
+    /// returned watch lives: MEMBERS now, if connected, and again after
+    /// each reconnect (8.3). See [`PresenceWatch`]. Read the members with
+    /// [`cached_members`](Self::cached_members).
+    pub fn watch_members(&self) -> Result<PresenceWatch, ClientError> {
+        let room = self.room()?;
+        Ok(PresenceWatch::new(
+            self.account().shared(),
+            Watched::Room(room),
+        ))
     }
 
     /// Asks the server for the room's members (MEMBERS, 8.3), with their

@@ -202,6 +202,26 @@ async fn drive(
     }
 }
 
+/// The most rooms and users asked about again after a reconnect (8.3),
+/// to bound the traffic if an app watches too many.
+const MAX_REFRESH: usize = 64;
+
+/// MEMBERS for the rooms, and WHOIS for the users, whose presence the app
+/// watches (8.3), at most [`MAX_REFRESH`] in all, rooms first.
+fn watched(shared: &AccountShared) -> Vec<PeopleOp> {
+    let watching = shared.watching.lock().expect("poisoned");
+    let mut rooms: Vec<&Room> = watching.rooms.keys().collect();
+    let mut users: Vec<&Uid> = watching.users.keys().collect();
+    rooms.sort();
+    users.sort();
+    rooms
+        .into_iter()
+        .map(|r| PeopleOp::Members(r.clone()))
+        .chain(users.into_iter().map(|u| PeopleOp::Whois(u.clone())))
+        .take(MAX_REFRESH)
+        .collect()
+}
+
 /// Saves the guest session the account signed in to, so that the next
 /// connection, even from a later run of the app, can resume it (4.2).
 async fn save_guest_session(shared: &AccountShared, session: Option<(Name, Id)>) {
@@ -418,6 +438,13 @@ impl Online<'_> {
             }
         }
         first.push((Input::Start, Ctx::None));
+        // PRESENCE only reports changes, and those made while disconnected
+        // were missed: ask again about what the app shows (8.3).
+        first.extend(
+            watched(self.shared)
+                .into_iter()
+                .map(|op| (Input::People(op), Ctx::None)),
+        );
         if let Err(e) = self.feed(first).await {
             warn!(error = %e, "sync failed; reconnecting");
             return Flow::Disconnected;

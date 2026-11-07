@@ -67,7 +67,18 @@ pub(crate) struct AccountShared {
     pub typing: Mutex<Typists>,
     /// People's presence as last heard on this connection (8.3).
     pub presence: Mutex<HashMap<Uid, WirePresence>>,
+    /// Rooms and users whose presence the app shows, to ask about again
+    /// after each reconnect (8.3).
+    pub watching: Mutex<Watching>,
     next_driver: AtomicU64,
+}
+
+/// What the app watches the presence of, with how many
+/// [`PresenceWatch`](super::people::PresenceWatch)es hold each (8.3).
+#[derive(Debug, Default)]
+pub(crate) struct Watching {
+    pub rooms: HashMap<Room, usize>,
+    pub users: HashMap<Uid, usize>,
 }
 
 /// A running account task.
@@ -165,6 +176,7 @@ impl AccountShared {
             rt,
             typing: Mutex::new(Typists::default()),
             presence: Mutex::new(HashMap::new()),
+            watching: Mutex::new(Watching::default()),
             next_driver: AtomicU64::new(1),
         })
     }
