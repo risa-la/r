@@ -360,6 +360,11 @@ fn explain<T>(e: ClientError) -> Res<T> {
                         .to_owned()
                 }
                 RefusedKind::Guest => "a guest has no keys and nothing to delete".to_owned(),
+                RefusedKind::Unavailable => {
+                    "the server could not get the identity's key file to check the key; try \
+                     again later"
+                        .to_owned()
+                }
                 RefusedKind::NotRegistered => {
                     "the server did not register the identity; this device's key for it is \
                      kept in the keys directory"
@@ -1062,33 +1067,20 @@ fn pick(ctx: &Ctx, server: &str) -> Res<Account> {
 
 /// Connects an account and waits until it has signed in.
 ///
-/// librisala tries once more after an identity's first `auth-failed`
-/// (4.4), so that is waited for. If the key is still refused, this says
-/// how to publish it.
+/// If the server does not accept the device's key, this says how to
+/// publish it. `auth-failed` is final (4.5): it is not tried again.
 async fn connect(ctx: &Ctx, account: &Account) -> Res<String> {
-    let signed_in = async {
-        match account.connect().await {
-            Err(ClientError::Refused {
-                kind: RefusedKind::AuthFailed,
-                ..
-            }) => {
-                account.wait_synced().await?;
-                Ok(uid_of(account))
-            }
-            other => other,
-        }
-    };
-    let result = match tokio::time::timeout(WAIT, signed_in).await {
+    let result = match tokio::time::timeout(WAIT, account.connect()).await {
         Ok(result) => result,
         Err(_) => return fail("timed out waiting for the server"),
     };
+    let uid = account.uid();
     match result {
         Ok(uid) => Ok(uid),
         Err(ClientError::Refused {
             kind: RefusedKind::AuthFailed,
             ..
         }) => {
-            let uid = account.uid();
             eprintln!(
                 "risala: {} did not accept this device's key for {uid}.",
                 account.server()
@@ -1102,6 +1094,19 @@ async fn connect(ctx: &Ctx, account: &Account) -> Res<String> {
                 }
                 Err(e) => eprintln!("risala: {e}"),
             }
+            how_to_publish(ctx, account)?;
+            Err(Failed(ACT))
+        }
+        Err(ClientError::Refused {
+            kind: RefusedKind::KeyRemoved,
+            ..
+        }) => {
+            eprintln!(
+                "risala: {} no longer accepts this device's key for {uid}, which it accepted \
+                 before. It was most likely removed from the identity's key file.",
+                account.server()
+            );
+            eprintln!("To use this device again, add its key back:");
             how_to_publish(ctx, account)?;
             Err(Failed(ACT))
         }

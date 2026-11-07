@@ -291,9 +291,8 @@ async fn login_without_a_key_makes_one_to_publish() {
     let fake = {
         let auths = auths.clone();
         Fake::start(move |_, line| match verb(line) {
-            // Refused twice (the first try and librisala's one retry),
-            // then accepted, once the key is published.
-            "AUTH" if auths.fetch_add(1, Ordering::SeqCst) < 2 => {
+            // Refused once, then accepted, once the key is published.
+            "AUTH" if auths.fetch_add(1, Ordering::SeqCst) < 1 => {
                 vec!["ERR auth-failed no key matched".into()]
             }
             "AUTH" => vec![format!("OK uid={}", word(line, 1))],
@@ -333,7 +332,8 @@ async fn login_without_a_key_makes_one_to_publish() {
     let (_, err) = run(state, &["login", &fake.addr, "bob@example.org"], 3).await;
     assert!(err.contains("did not accept"), "{err}");
     assert!(err.contains(word(line, 1)), "{err}");
-    assert_eq!(auths.load(Ordering::SeqCst), 2);
+    // auth-failed is not tried again (4.5).
+    assert_eq!(auths.load(Ordering::SeqCst), 1);
 
     // Published: signed in, with that key.
     let (out, _) = run(state, &["login", &fake.addr, "bob@example.org"], 0).await;
