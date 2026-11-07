@@ -264,6 +264,7 @@ After the TLS handshake, both sides exchange lines.
   WELCOME may be up to 8 MiB (8388608 bytes) including the LF from a
   client, and 8 MiB plus 16384 bytes from a server. Before a connection
   has signed in, the server applies the normal limits to every line.
+  The lines inside an encrypted message have their own limits (12.8).
 - **Bad lines.** A server that receives a line that is too long MUST
   discard everything up to the next LF and reply `ERR too-long`. It MAY
   reply as soon as it knows the line is too long, before the LF arrives. A server
@@ -2182,7 +2183,16 @@ All encrypted conversations use one MLS cipher suite, `0x0052`:
 
 - The KEM is post-quantum and classical at once. Its keys stay secret as
   long as either ML-KEM-768 or X25519 holds.
-- Signatures are ML-DSA-44 alone, as for signing in (4.5).
+- Within HPKE [RFC9180], the suite uses the KEM `0x647a` (X-Wing
+  [XWING]), the KDF HKDF-SHA384 (`0x0002`) and the AEAD
+  ChaCha20-Poly1305 (`0x0003`).
+- Everywhere else MLS needs a hash or a KDF, for example in
+  ExpandWithLabel, DeriveSecret, the tree and transcript hashes and the
+  exporter, it uses SHA-384 and HKDF-SHA384 [RFC5869].
+- Signatures are ML-DSA-44 alone, as for signing in (4.5): plain
+  ML-DSA.Sign, with an empty context string and no prehash.
+- OpenMLS 0.9 calls this suite
+  `MLS_128_MLKEM768X25519_CHACHA20POLY1305_SHA384_MLDSA44`.
 - The MLS protocol version is `mls10`.
 - `<keypackage>`, `<groupinfo>`, `<commit>` and `<welcome>` in this
   section are each an MLSMessage [RFC9420] in base64 with padding
@@ -2199,12 +2209,17 @@ Credentials:
   in and to sign in MLS. The labels that MLS and Section 4.5 put in front
   of what they sign keep the two uses apart.
 - Two leaves of a group never share a signature key [RFC9420].
+- A leaf's credential and signature key never change. A commit's path
+  MUST NOT change those of the committer's leaf. A new key means a new
+  leaf: the device joins again with it, and its old leaf is removed
+  (12.6).
 - Only identities have leaves. Guests cannot take part in encrypted
   conversations.
 
 Every group carries a **conversation extension** in its group context,
-of type `0xF2A1` (Section 15). Leaves list this type in their
-capabilities, and the group lists it in its `required_capabilities`. It
+of type `0xF2A1` (Section 15). Leaves list this type, and the
+`last_resort` extension type `0x000A` [MLS-EXT], in their capabilities,
+and the group lists `0xF2A1` in its `required_capabilities`. It
 ties the group to one conversation, and holds the room's `history`
 setting (12.9):
 
@@ -2274,10 +2289,12 @@ KEYPKG GET <uid>
 - **`KEYPKG ADD`** stores a KeyPackage for this connection's device, and
   replies `OK`. The server checks that the KeyPackage uses the cipher
   suite of 12.2, that its credential is the connection's uid, that its
-  signature key is the connection's device key (4.5), that its
-  signatures verify, and that its lifetime has not ended. Otherwise it
-  replies `ERR invalid`. A server MAY limit how many KeyPackages it keeps
-  for each device (`ERR forbidden`).
+  signature key is the connection's device key (4.5), that its leaf
+  lists the conversation extension and `last_resort` in its
+  capabilities (12.2), that its signatures verify, and that its lifetime
+  is acceptable (below). Otherwise it replies `ERR invalid`. A server
+  MAY limit how many KeyPackages it keeps for each device
+  (`ERR forbidden`).
 - **`KEYPKG COUNT`** replies `OK count=<n> last-resort=<yes or no>`: the
   number of ordinary KeyPackages the server holds for this device, and
   whether it holds a last-resort one.
@@ -2300,6 +2317,22 @@ since every request uses KeyPackages up.
 
 Only identities can use KEYPKG.
 
+**Lifetimes.** A KeyPackage's lifetime is acceptable if the current time
+is within it, and it spans at most 12 weeks and one hour (7261200
+seconds from `not_before` to `not_after`). The server checks this when a
+KeyPackage is uploaded, and the server and every device check it again
+when a commit adds the KeyPackage to a group (12.5, 12.6).
+
+A leaf keeps its KeyPackage's lifetime until its device commits a fresh
+leaf (12.6), which has none [RFC9420]. So the lifetime can end while the
+leaf is still in the group. The server, and devices that join by Welcome
+or by external commit, do not check the lifetimes of leaves already in
+the group's tree. This departs from Section 7.3 of [RFC9420], which
+recommends that a client check the lifetime of every leaf it receives,
+including the leaves of a group it joins. With that check, one device
+that stayed offline for longer than its lifetime would stop everyone
+else from joining the group, until someone removed it.
+
 ### 12.5. Groups and Commits
 
 ```
@@ -2313,9 +2346,12 @@ an MLS group with a new random 32-byte group id, in which its own device
 is the only member, and whose conversation extension (12.2) names the
 conversation. It sends the group's GroupInfo for epoch 0, with the
 `external_pub` extension, and its ratchet tree. The server checks them
-as it checks commits (below), checks the conversation extension, and
-rejects a group id it has seen before (`ERR invalid`). `<id>` in the
-reply is the conversation's id (5.1).
+as it checks commits (below), as far as that applies without a commit:
+the tree has one leaf, whose signature key is the connection's device
+key, and the GroupInfo matches the tree, is signed by that leaf, and has
+`external_pub` and no `ratchet_tree`. It also checks the conversation
+extension, and rejects a group id it has seen before (`ERR invalid`).
+`<id>` in the reply is the conversation's id (5.1).
 
 - **A direct conversation** must not have a group yet (`ERR stale`). If
   the conversation does not exist, INIT starts it, under the rules of
@@ -2358,13 +2394,18 @@ all of these hold:
    the commits it missed, then makes its change again if it is still
    needed.
 2. **It is valid.** It verifies under MLS as far as someone outside the
-   group can check: its signatures, the new ratchet tree and its parent
-   hashes, and the GroupInfo, which must match the new epoch. Otherwise
-   `ERR invalid`.
+   group can check: its signatures, the lifetimes of the KeyPackages it
+   adds (12.4), the new ratchet tree and its parent hashes, and the
+   GroupInfo. The GroupInfo's group context must be the one the commit
+   produces, its confirmation tag must be the commit's, and its signer
+   must be the committer's leaf in the new epoch. Its signature must
+   verify, and it must have the `external_pub` extension and no
+   `ratchet_tree` extension. Otherwise `ERR invalid`.
 3. **The committer may change the group** (`ERR forbidden`). The
    committer's signature key is the connection's device key, and its
    identity is a participant of the direct conversation, or a member or
-   invitee of the room.
+   invitee of the room. The commit's path, if any, keeps the credential
+   and signature key of the committer's leaf (12.2).
 4. **Its proposals are allowed** (`ERR forbidden`). All proposals are
    inside the commit, by value. There are no separate proposals.
    - **Add** adds a device whose key is in its identity's key file. In a
@@ -2374,18 +2415,29 @@ all of these hold:
      invitation (12.6). If the device's key already has a leaf, the
      same commit removes that leaf.
    - **Remove** removes a leaf of the committer's own identity, a leaf
+     whose signature key the same commit adds again (see Add), a leaf
      whose key is no longer in its identity's key file, or, in a room, a
      leaf of an identity that is neither a member nor invited.
-   - **GroupContextExtensions** changes only the `history` field of the
-     conversation extension, in a room, and the committer must be an
-     owner. The server records `SET <room> history <value>` after the
-     COMMIT event.
+   - **GroupContextExtensions** is allowed only in a room, and the
+     committer must be an owner. Its extension list is the group's
+     current one, with only the `history` field of the conversation
+     extension changed. The server records `SET <room> history <value>`
+     after the COMMIT event.
    - **ExternalInit** is allowed only in an external commit. An external
-     commit may hold at most one Remove, and only of the joiner's own
-     earlier leaf (12.6).
+     commit may hold at most one Remove, and only of the leaf whose
+     signature key is the joiner's (12.6).
    - No other kinds are allowed. A device refreshes its own keys with a
      commit that has no proposals (12.6).
 5. **The group stays small enough.** A group has at most 512 leaves.
+
+The server cannot check the confirmation tag itself, or that the path's
+secrets decrypt, since both need the group's secrets. So a member can
+send a commit that the server accepts and other devices reject. Section
+12.6 says what those devices do.
+
+A client that adds many devices SHOULD split them over several commits
+of at most 256 devices each. This keeps COMMIT and WELCOME lines well
+under the limit of 2.3.
 
 After it accepts a commit, the server:
 
@@ -2394,7 +2446,9 @@ After it accepts a commit, the server:
   after the COMMIT event, with the committer as `from`
 - keeps the new GroupInfo, and the new ratchet tree, which it builds
   from the commit
-- stores the Welcome for each device the commit adds (12.7)
+- stores the Welcome for each device the commit adds (12.7), and keeps
+  the ratchet tree of the new epoch for as long as any of them is
+  pending
 
 ```
 GROUPINFO <conv>
@@ -2425,23 +2479,38 @@ external commit, it checks the whole group:
   participants, or in a conversation with yourself, to you.
 - Every leaf's key passes the key check below.
 
-A device MUST NOT join a group that fails the first two checks.
+A device MUST NOT join a group that fails the first two checks. It does
+not check the lifetimes of leaves already in the tree (12.4).
 
 **Commits.** For every commit, a device MUST reject it if it:
 
 - in a direct conversation, adds a leaf of anyone other than the
   participants, or in a conversation with yourself, of anyone else
-- changes the conversation extension other than its `history` field
+- changes the group's extensions other than the `history` field of the
+  conversation extension
+- changes the credential or signature key of the committer's leaf
 - is an external commit by an identity that had no leaf in the group
   before it, except a participant of a direct conversation
+- is an external commit that removes a leaf other than the one with the
+  joiner's signature key
 - removes a leaf for no reason the device can see: the leaf belongs to
-  the committer's own identity, its key is no longer in its identity's
-  key file, or, in a room, the conversation's events show that its
-  identity left, was kicked or banned, or declined an invitation
+  the committer's own identity, the same commit adds its signature key
+  again, its key is no longer in its identity's key file, or, in a room,
+  the conversation's events show that its identity left, was kicked or
+  banned, or declined an invitation
 
 It also applies the key check to every leaf that the commit adds or
 changes. A device that rejects a commit can no longer follow the group.
 It SHOULD warn the user, and stop sending in that conversation.
+
+A device may also fail to process a commit that passes these checks,
+because MLS itself rejects it: for example, its path secrets do not
+decrypt, or its confirmation tag is wrong, which the server cannot check
+(12.5). Such a device MAY join the group again by external commit, as a
+new device does, with the checks for joining. It then gets the history
+keys of the epochs it missed as in 12.9. A device that rejected a commit
+for one of the reasons above MUST NOT do this, since joining again would
+accept the change it rejected.
 
 **The key check.** A leaf passes if its signature key is listed in the
 key file of the identity in its credential (12.12). If the device cannot
@@ -2561,14 +2630,19 @@ WELCOME <conv> <id> <seq> <welcome> <tree>
   form of an id (3.5).
 - `<seq>` is the seq of the COMMIT event that added the device.
 - `<tree>` is the ratchet tree of the epoch the commit started. The
-  server attaches it, and the device checks it against the tree hash in
-  the Welcome.
+  server attaches it, and keeps it while any of the commit's Welcomes is
+  pending. The device checks it against the tree hash in the Welcome.
 
 The device checks the group as in 12.6, then joins it in that epoch. It
 then reads the conversation's commits after `<seq>`, once it may read
 the conversation (an invitee, once it has joined the room), and applies
-them. When it has processed the Welcome, the device deletes it with
-`WELCOME DEL <id>`, which replies `OK`.
+them.
+
+Once it has joined, the device deletes the Welcome with
+`WELCOME DEL <id>`, which replies `OK`. It SHOULD NOT delete the Welcome,
+or the private keys of the KeyPackage it was made for, before then, so
+that it can try again if joining is cut short, for example by a crash.
+It also deletes a Welcome whose group fails the checks of 12.6.
 
 A device SHOULD send `WELCOME LIST` after each sign-in. The server
 deletes the pending Welcomes of a device whose leaf has been removed, or
@@ -2590,8 +2664,10 @@ Sends an encrypted message:
 - The connection's device key MUST have a leaf in the group
   (`ERR forbidden`). Who may send is otherwise as for MSG (5.3).
 - `<payload...>` is the encrypted message in base64 with padding. It
-  MUST decode to at least 48 bytes (`ERR invalid`). The server checks
-  nothing more about it.
+  MUST decode to at least 48 bytes, the salt and the AEAD tag
+  (`ERR invalid`). This only catches payloads that cannot be messages:
+  a real one is a few kilobytes, since its signature alone is 2420
+  bytes. The server checks nothing more about it.
 - The `frank` tag is required (`ERR invalid`). It is the message's
   franking commitment in base64, which lets the content be reported
   (5.8).
@@ -2638,26 +2714,41 @@ To encrypt a message, the sender's device:
 3. Sets `sender_key_id` to the SHA-384 hash of its raw signature key.
 4. Signs: `signature` is SignWithLabel(signature key, "risala message",
    RisalaMessageTBS) [RFC9420], with the fields above and the group's id
-   and epoch.
-5. Sets `padding` to zero bytes. It SHOULD pad RisalaMessage to a
+   and epoch. So the bytes signed are a SignContent whose label is
+   `MLS 1.0 risala message`.
+5. Sets `padding` to an empty vector. It SHOULD then fill `padding` with
+   the fewest zero-valued bytes that make the encoded RisalaMessage a
    multiple of 256 bytes, so that the server learns less about lengths.
+   The length prefix of `padding` grows from one byte to two at 64
+   bytes, so this can take more than 255 bytes. Receivers ignore the
+   contents of `padding`.
 6. Picks a random 32-byte `salt`, and derives the message key:
    ExpandWithLabel(history_key, "risala message key", salt, 32)
    [RFC9420], where `history_key` is the epoch's history key (12.9).
+   This is HKDF-Expand with SHA-384, with the 48-byte history key as the
+   PRK, and the full label is `MLS 1.0 risala message key`.
 7. Encrypts RisalaMessage with ChaCha20-Poly1305 under the message key,
    with a nonce of 12 zero bytes, and RisalaMessageAAD as the associated
-   data. A message key is used only once, so a fixed nonce is safe.
+   data. A message key is used only once, so a fixed nonce is safe. The
+   ciphertext ends with the 16-byte tag.
 8. Sends `salt` followed by the ciphertext as the payload, and
-   HMAC-SHA-384(frank_key, content) [RFC2104] as the `frank` tag.
+   HMAC-SHA-384(frank_key, content) [RFC2104] as the `frank` tag, in
+   base64 with padding. The HMAC covers the bytes of `content` alone,
+   without their length prefix, and the tag is 48 bytes.
+
+Appendix B has a test vector for these steps.
 
 To decrypt an ENC event, a device:
 
 1. Checks that `<epoch>` is the epoch the group was in at the event's
    place in the conversation: the epoch of the latest COMMIT event before
-   it, or `0`.
+   it, or `0`. If retention (7.5) has removed those COMMIT events, it
+   uses the seqs it recorded for each epoch (12.9). A device that has
+   neither, for example one that restored the history key from a backup
+   (12.10), skips this step.
 2. Finds the history key of the conversation and `<epoch>`.
 3. Derives the message key from the first 32 bytes of the payload, and
-   decrypts the rest.
+   decrypts the rest, which must be exactly one RisalaMessage.
 4. Finds the sender's key. If the device was in the group in that epoch,
    it is the signature key of the leaf of `from` whose SHA-384 hash is
    `sender_key_id`. Otherwise it is a key of `from` with that hash that
@@ -2678,6 +2769,11 @@ every leaf, and MUST NOT show the content unless the signature verifies.
 The content is one or more lines in UTF-8, in the format of Section 3,
 each ending in LF. It is either a single TEXT line, or any number of KEY
 and RECOVERY lines. Devices ignore lines with verbs they do not know.
+
+The rules of 2.3 for characters apply to these lines, but its length
+limits do not. Instead, TEXT has its own limit (below), and the content
+as a whole is at most 4 MiB (4194304 bytes). A device treats larger
+content as a failure of step 3.
 
 ```
 [@<tags>] TEXT <text...>
@@ -2711,11 +2807,28 @@ history key [RFC9420]:
 history_key = MLS-Exporter("risala history", "", 48)
 ```
 
+This is the exporter of Section 8.5 of [RFC9420], with an empty context,
+where `exporter_secret` is the epoch's exporter secret:
+
+```
+history_key = ExpandWithLabel(
+                  DeriveSecret(exporter_secret, "risala history"),
+                  "exported", SHA-384(""), 48)
+```
+
+Appendix B has a test vector. MLS keeps only the current epoch's
+exporter secret, so a device derives an epoch's history key before it
+applies the commit that ends the epoch.
+
 Devices keep history keys for as long as they keep the conversation, and
 SHOULD protect them at rest as they protect their device key. With them,
 a device can decrypt any ENC event of those epochs that HISTORY returns,
 at any time. This is what lets clients download history and read it
 offline (7.1).
+
+With each history key of an epoch it was in, a device also keeps the
+signature keys of that epoch's leaves, for step 4 of decryption (12.8),
+and the seq of the COMMIT event that started the epoch, for step 1.
 
 History keys reach a device in three ways:
 
@@ -2981,6 +3094,10 @@ Lines a server can send:
 - **What the server can still do.** It can withhold, delay or reorder
   encrypted messages, and refuse commits. Devices detect replayed and
   re-pointed messages (12.8), but not ones that are withheld.
+- **Commits the server cannot fully check.** A member's device can send
+  a commit whose secrets other devices cannot decrypt (12.5). They then
+  join the group again by external commit (12.6). This lets a member
+  disrupt a conversation for a while, but not read more of it.
 - **Who can add a device.** Whoever controls an identity's key file can
   add a key, and that key's device can join every encrypted conversation
   of the identity (12.6) and read what is sent there from then on. For
@@ -3067,11 +3184,11 @@ Lines a server can send:
   `<room>` is written without its `#`. For example,
   `risala://chat.example.org/general` points to `#general`, and
   `risala://chat.example.org/general/8813` to one message in it.
-- **MLS cipher suite:** `0x0052`, for the algorithms of 12.2: X-Wing,
-  ChaCha20-Poly1305, SHA-384 and ML-DSA-44. MLS cipher suites for
-  post-quantum algorithms are not yet standardised [MLS-PQ]. This
-  document fixes the meaning of `0x0052` for risala, whatever values a
-  later standard assigns.
+- **MLS cipher suite:** `0x0052`, for the algorithms of 12.2: X-Wing
+  (HPKE KEM `0x647a`), ChaCha20-Poly1305, SHA-384 and ML-DSA-44. MLS
+  cipher suites for post-quantum algorithms are not yet standardised
+  [MLS-PQ]. This document fixes the meaning of `0x0052` for risala,
+  whatever values a later standard assigns.
 - **TLS key exchange:** X25519MLKEM768, value `0x11EC` [ECDHE-MLKEM].
 - **MLS extension type:** `0xF2A1`, from the range for private use, for
   the conversation extension (12.2).
@@ -3132,6 +3249,8 @@ Lines a server can send:
   Version 1.3", RFC 8446, August 2018.
 - [RFC8615] Nottingham, M., "Well-Known Uniform Resource Identifiers
   (URIs)", RFC 8615, May 2019.
+- [RFC9180] Barnes, R., Bhargavan, K., Lipp, B., and C. Wood, "Hybrid
+  Public Key Encryption", RFC 9180, February 2022.
 - [RFC9420] Barnes, R., Beurdouche, B., Robert, R., Millican, J., Omara,
   E., and K. Cohn-Gordon, "The Messaging Layer Security (MLS) Protocol",
   RFC 9420, July 2023.
@@ -3343,6 +3462,174 @@ The command, on one line:
 
 ```
 AUTH alice@example.org 0eS7OdclGDTKyqFlcGMJZOcRDKwNWe46pKczbvw1K6r08d/1QDbNxsCWmTMmGgolt6rEII7exIqtw+hXEXbaIenHtLLYgZcrFaL24Ef5aqSh/phIr9eh1p1NjBs/tlqycpEzZ/nXdeWH2AL7tIIq3n3DS2fnZkKHeUiL/TwzwW8hh8yO3ZibXKiQMl4AOgnXfmrgBcslOSid4JG572ssA0hWMJa4+I/vWVKWY3I++y4DexyJzU5S2uks2QwsWLJpkeA9gELCe0QnkZcqwZn8sRCk9zHCdsfVh+Thdc0eifSfxioL3LIl3wv8fO8ryjmBogWeIR009sdh5n+1SEYno/vfVK4KPUV0LqMAYgqWCPpQR16DSxtTkKabj44TvV6ejKXci4jHeQtxuih8VUpJGz+xNdOIAlm8Kjj/7ggUpu0DPiq8YA201+yvwpuYZdVhP49x3N0ltKolxJ4dyAxm6SOHiqAvCLk8ELJ9AtZdHQN0Gs1z8grfv2dAyhPzC9queHbsU9qlWW2vgZaArhZQpqk78piCTNnS9FQq3COnS/mJHcOwGLvmpirKo8lHRNh2KToTE1oZTLB1qDuCy2TaBKqwes2N5ps/ws2B1/4lzh9wYS39CO2ucDsab480ez2HRmGEyTIPhNtr0peQxnLZ31BCzkK6KNyiXY0WdiyTyg12krjtkyR4l6pbm5tT71ZzZhKrNOvjlyO3GgXXoCFuBvGQ6+J0CcbSHW1D1LgDq27D2W6lDy6YfPbDf23lMwmjFjU3m/2CIhcEk2FsXXMKL7qLuiUJW8LtucoH/uGoP/p50z9aPUTuOSGnRK3jHFaDxstPLojSouWLhNOqAfK6WDrEIwTPeEgCsrZ6aPaH7F5qbaaqVQX3WfhO82NQUeQrvS9ZeotxoI7p3lUYf1qWB6kzsrXxSa/+t1YA632Ec/dmWzgI1WTGqpmOAl5hm/uiWgLMQKkkKwdnOuMPJgc8GENjBbODESLzXCdKkQieNtoWcx5U5hMgC+tj9NiZwVMoN0ejGaRvuzXzGR7WRuLPImht5DOaIjkvkKgt1lE6Xfy2Fc9xZGUYlh2rAn1ekv01zLcuKq+KrcpuqMeyaJFK5L8dhhVwzE8lymJixGbR54mDiZLMQlLIJ3oi0OX/InK89+AJwawKmsELa3HTuYHbzXjXtryYTz5ESivyWS6vibct6187IPVec2bmZAg+Y/4Gpgxasek3zDp1c6ZyzvBz7NVqCr299gYHcbeFMAx5COyYGYKsnAASgN3ukC6qD6O+rMqWBm5e3XMYesyhpDqzqUGLPOUPeA1auS11CopxihafmFKuTBGZyOVut30xnPGJnEj/cbaw6rAkK/pR8v2Mc2lks/P18A0/+/pjqmWX8qRUUdnHRGfV3vMC2+26ZQqojExOU7bgeuWn9KSCq50D3Jsmh0xCWaPz//App1DGxtTHB/745jn39W96MdIct7ATbNnYjcOtjdI3+5RP0+1BSKptuFh6RwumXwO6rbLSNrYXvANs6By+PCH8L1anKe9Hvd2EmW9W42bHwW7TZC7fIYGaU5gvuV7YifNPElHknSyvriU+vDPkbpCjfRPXZ+6omLd8CeLwwARtLdq/KltBkrfJXhZg/DprrDZoDkIojD0qtK9hop19pPMCUEcB2pGXfCpGeWGhIVoheevb4zIH/9MHlZKaqdwDWEjSYOOxXlWGPumqNgviqRL4Om32TqtQa61bPlV3Fn56APcAD0xWvkqOme6m74sJpZm+/evB0/Tvm0fZSEvEVmgPXCfnbOj+ljhiKO9d8e4f8pEElr18tz6p0BEUfByfL9tZSjQh/XxU0Bnhdwjrwl/itp14QIQydsUq3+O7YBhGyHdDPQIMg3tVeXZNi1naOtryiYTFYll9XYfy/iw+CpjuVyiYA7aM917neTrG3XWs674YkcPOg94yEHq5fstqBqHKmKdsIJTyXWmL7gDYDTfgbWGUg9cgFQAY82ZFEOpkCVC47m3U+J3btaNPbg6itpdNTdYNy+74EQgJ2Z2snXQJE1Mkt75v80iveufZmaXYi0l4O2v3EV7StufMWLF+3Ys0JJC34IulK8xw+mbop0wsHXoLsUmAv+1rtrENYWIi2NI+2hs3OmPtB0Oh8OYfzDe90u3cexbv+Xu5iFv9CnUKFl8OpvDiIfWahA3Iym9rYftmLuYHZA/JDPElQcNRp0aSA6jjiwd1N04SUNNZHshLxHxQC6rBQxTxOXSVDiiEt9J/PD9FUs0OpvjhsnqYt9m32yEA6QSaTFRnyZ2E2T6BMLI9AnKOccmxiwgP5JqCG36W9Mdoy6egJ0J4YTyR2qX6PQ2cSM4/ek5vqPVaoWuBd6/JxM+nr2d4xVGkmr10S6txu25Z0FDXtpUD5qtaw/pSYa5SaTmbj3XI65TxyUFXPnM2xm/0mzGIUMU9EuLAZWA01BCXrzLyvkALVGCe9OGZ++XTOWJO+snQzmnwrlXEumx2YPShaP5ez4O4BYqvw+RuGZSVQWHmIFV0/JRuACRghfN3wvszaXc8c8b/h7/o9A9Vdo4pdk85TUI6FC7SvF1XvHa9oNab3akEs7kV7IiHJjrLO6PXVXvLmIgTAI81gv5PdXspoHXs2T+90UvgraPU86W8xsUCAxedWZmbpqf2dLV2ajhnNAf44hIQSoVrcTibnKAZZ5Cq+802OMtnrrcL3c/gOgCYRdvogS4LjJy7jBDElt5OTPdxRTApwt5kmsfY5N2QOjfvV9wMC/jJh6fHo+yUUzzizd7waphmuy9M3ru1MR2AQQdBw4HQgOA8Uvw4p0zL+Xi/zqRdnJBK/e3h6YW+RCkMHkFrw4LCCgRkriu7YFRPgsHk0uow8sZ7X3QcZwvKO6AfFcSP386z9ReSlzHs2jxsU6L/DVKcWFnaqztnXYgoZwiPHNQV3p2ZDpiRYBGfBleeItv/QXXOBGdB3J0j1I7j8+XrwgBx1ObwZAL2qE3MfiMdQhM2h2dU98bufk/FMc/dKqTUubjy1m3BhkGqAQlFzW9hHnIfbLv/P0uDNI2yoLzB5hk52MqMRrMcS451oN31ep7H7yr2IE8iA5xxL5bmF3asOLMhWxqZPZZWjxogLjl2gZaj6vcGHjpTVVxgYneMztbX2w8qOkFCXG1vfZOcpqyvs8MIJys9WF57iJ7K6+4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkXJzM=
+```
+
+**History keys and encrypted messages** (12.8, 12.9). This vector
+follows one message through the derivation of the history key and the
+eight steps of encrypting it. It starts from the epoch's exporter secret
+rather than from a whole MLS group, because a group's secrets depend on
+random values that this document does not fix. The step from exporter
+secret to history key is the MLS exporter, which can also be checked
+against the MLS test vectors for cipher suite 7, since that suite uses
+the same hash and KDF.
+
+The signer is the key above, using the deterministic variant of
+ML-DSA-44 as for AUTH. The random values of steps 2 and 6 are fixed, as
+bytes counting up, so every correct implementation produces exactly
+these bytes. The vector was generated with the MLS spike in the risala
+repository (`spikes/mls`, `cargo run --release -- vectors`), which also
+checks the exporter against the cipher suite 7 vectors, and each step
+against a second implementation of its primitive.
+
+Inputs, in hex:
+
+```
+exporter_secret (48 bytes):
+000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+202122232425262728292a2b2c2d2e2f
+
+group_id (32 bytes):
+404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+
+epoch: 1
+
+message_id (16 bytes):
+808182838485868788898a8b8c8d8e8f
+
+frank_key (32 bytes):
+a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+
+salt (32 bytes):
+c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf
+```
+
+The content is the reply of 12.8, 61 bytes including its LF:
+
+```
+@reply=15;target=0Jx1HkY3x9z2b5R0qWm1fA== TEXT see you at 12
+```
+
+The history key (12.9), and the DeriveSecret step on the way:
+
+```
+DeriveSecret(exporter_secret, "risala history"):
+0d81c7a79130adc8f81c42aaf57395c52332450d604544f5e34436e7c81fc423
+0fcb06c5154c001efa43ff711e597b43
+
+history_key:
+a7187b710141caab8322e9f1cc1664a78d63821d360ce6ece27bec3b03e886d5
+a87d17f40b15c365a59b238b80e568d0
+```
+
+The steps of 12.8:
+
+```
+sender_key_id, step 3:
+9dd34a4b2e6712ac7d2c679a46caaaaf875c945aefc33a78cefe1a014b9dacfa
+0f7c1460fbe5d395af0b70f54d51a994
+
+RisalaMessageTBS, step 4 (199 bytes):
+20404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e
+5f0000000000000001808182838485868788898a8b8c8d8e8f9dd34a4b2e6712
+ac7d2c679a46caaaaf875c945aefc33a78cefe1a014b9dacfa0f7c1460fbe5d3
+95af0b70f54d51a994a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6
+b7b8b9babbbcbdbebf3d407265706c793d31353b7461726765743d304a783148
+6b593378397a326235523071576d3166413d3d20544558542073656520796f75
+2061742031320a
+
+signature, step 4: 2420 bytes, SHA-256
+64033444c9e465b935808dcb6cf257b77ada5579f5fe82a40e4d0b9340939b07
+
+RisalaMessage, step 5: 2816 bytes, SHA-256
+a070ee7fdfc54f7caf69e20be49447642f49f825d705f21882723d3700287d62
+
+message key, step 6:
+34820bd2a459f65486d86ed9f9fcf984d9c8069bd2dc088affe4af93f5202e11
+
+RisalaMessageAAD, step 7 (41 bytes):
+20404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e
+5f0000000000000001
+
+payload, step 8: 2864 bytes, SHA-256
+737abc1cf8642de1064a4fee45f6732d4caa7fbe8d492079fcb61ee4713d47ff
+
+frank tag, step 8:
+83d717202ee3a882e770e8ceaa04ff715561ecd5574e6576839cb99ec98f8b96
+0277c6cc92ce07971b46e3a6935798ca
+```
+
+Before padding, RisalaMessage is 2581 bytes. Step 5 adds 234 zero bytes
+of padding, and the length prefix of `padding` grows to two bytes, which
+makes 2816, or 11 times 256.
+
+The payload, in base64 (3820 characters, wrapped at 64 like the
+signature above), and the `frank` tag as it appears on the ENC line:
+
+```
+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
+```
+
+```
+g9cXIC7jqILncOjOqgT/cVVh7NVXTmV2g5y5nsmPi5YCd8bMks4HlxtG46aTV5jK
 ```
 
 ## Appendix C. Push Gateways (Informative)
