@@ -305,6 +305,17 @@ Settled (now in SPEC.md):
     - QUIT is the last command a connection runs. Later lines are
       ignored.
 
+13. **Found while building librisala's connections** (2.2, 3.6, 4.2,
+    4.6).
+    - A client records "CA" or a pin only after the TLS handshake has
+      completed.
+    - A final response whose `ref` does not belong to the oldest open
+      command means the client SHOULD close the connection and reconnect.
+    - A guest that reconnects and gets `name-taken` for its own name
+      SHOULD try another name. librisala tries `<name>2`, `<name>3` and
+      so on.
+    - REGISTER: the client learns the identity domain from INFO first.
+
 Nothing is open right now.
 
 ## 6. Decisions

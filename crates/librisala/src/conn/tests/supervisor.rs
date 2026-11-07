@@ -53,9 +53,9 @@ async fn reconnects_and_signs_in_again() {
                 peer.send("@ref=2 OK").await;
                 peer.close().await;
             }
-            // The old connection has not gone yet: try again later.
+            // A passing failure: try again later.
             1 => {
-                peer.send("@ref=1 ERR name-taken").await;
+                peer.send("@ref=1 ERR rate-limited").await;
                 peer.expect_eof().await;
             }
             _ => {
@@ -101,7 +101,7 @@ async fn reconnects_and_signs_in_again() {
         next(&mut events).await,
         SupervisorEvent::Connected { .. }
     ));
-    // name-taken is not permanent.
+    // rate-limited is not permanent.
     let SupervisorEvent::Waiting {
         delay,
         error: Some(Error::Rejected(CommandError::Server(err))),
@@ -109,7 +109,7 @@ async fn reconnects_and_signs_in_again() {
     else {
         panic!()
     };
-    assert_eq!(err.code, ErrorCode::NameTaken);
+    assert_eq!(err.code, ErrorCode::RateLimited);
     assert!(delay >= Duration::from_millis(10) && delay <= Duration::from_millis(20));
     assert!(matches!(
         next(&mut events).await,
@@ -127,6 +127,102 @@ async fn reconnects_and_signs_in_again() {
     assert!(matches!(next(&mut events).await, SupervisorEvent::Stopped));
     assert!(events.recv().await.is_none());
     assert_eq!(session.closed().await, CloseReason::Local);
+    server.done().await;
+}
+
+#[test]
+fn guest_names_are_numbered_to_fit() {
+    let g = |s: &str| GuestSignIn(s.parse().unwrap());
+    assert_eq!(g("sam").numbered(1).as_str(), "sam");
+    assert_eq!(g("sam").numbered(2).as_str(), "sam2");
+    assert_eq!(g("sam").numbered(9).as_str(), "sam9");
+    let long = "a".repeat(32);
+    assert_eq!(
+        g(&long).numbered(2).as_str(),
+        format!("{}2", "a".repeat(31))
+    );
+    // Shortening never leaves a '.' at the end (3.5).
+    let dotted = format!("{}.b", "a".repeat(30));
+    assert_eq!(
+        g(&dotted).numbered(2).as_str(),
+        format!("{}2", "a".repeat(30))
+    );
+}
+
+#[tokio::test]
+async fn guest_name_taken_tries_numbered_names() {
+    let cert = ServerCert::self_signed("chat.test");
+    let trust = pinned(&cert).await;
+    let server = ScriptServer::start(cert, 2, |i, mut peer: Peer| async move {
+        peer.greet().await;
+        match i {
+            // The old connection has not gone yet: ~sam and ~sam2 are
+            // taken, ~sam3 is free.
+            0 => {
+                peer.expect("@ref=1 GUEST sam").await;
+                peer.send("@ref=1 ERR name-taken").await;
+                peer.expect("@ref=2 GUEST sam2").await;
+                peer.send("@ref=2 ERR name-taken").await;
+                peer.expect("@ref=3 GUEST sam3").await;
+                peer.send("@ref=3 OK uid=~sam3").await;
+                peer.close().await;
+            }
+            // Every name is taken: wait, then start again from ~sam.
+            _ => {
+                for n in 1..=GuestSignIn::MAX_NAMES {
+                    let name = if n == 1 {
+                        "sam".to_owned()
+                    } else {
+                        format!("sam{n}")
+                    };
+                    peer.expect(&format!("@ref={n} GUEST {name}")).await;
+                    peer.send(&format!("@ref={n} ERR name-taken")).await;
+                }
+                peer.expect_eof().await;
+            }
+        }
+    })
+    .await;
+    let ca = TestCa::new();
+    let (supervisor, mut events) =
+        Supervisor::spawn(chat_test(), trust, options(&ca, &server), guest(), fast());
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Connecting { .. }
+    ));
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Connected { .. }
+    ));
+    let SupervisorEvent::SignedIn { uid, .. } = next(&mut events).await else {
+        panic!()
+    };
+    assert_eq!(uid.as_str(), "~sam3");
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Disconnected { .. }
+    ));
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Waiting { .. }
+    ));
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Connecting { .. }
+    ));
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Connected { .. }
+    ));
+    let SupervisorEvent::Waiting {
+        error: Some(Error::Rejected(CommandError::Server(err))),
+        ..
+    } = next(&mut events).await
+    else {
+        panic!()
+    };
+    assert_eq!(err.code, ErrorCode::NameTaken);
+    supervisor.stop().await;
     server.done().await;
 }
 

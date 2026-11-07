@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use risala_proto::auth::SecretKey;
-use risala_proto::names::{Identity, Name, Uid};
+use risala_proto::error::ErrorCode;
+use risala_proto::names::{Identity, MAX_NAME_LEN, Name, Uid};
 use risala_proto::server::ServerMessage;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use super::error::{CloseReason, Error};
+use super::error::{CloseReason, CommandError, Error};
 use super::session::{Session, SessionInfo, SessionOptions};
 use super::tls;
 use crate::addr::{ServerAddr, TrustStore};
@@ -29,12 +30,54 @@ pub trait SignIn: Send + Sync {
 }
 
 /// Signs in as the guest `~<name>` (4.2).
+///
+/// A guest that reconnects may find its name still taken, because the
+/// server has not yet noticed that its old connection is gone (4.2). So on
+/// `name-taken` it tries `<name>2`, `<name>3` and so on, on the same
+/// connection, up to [`GuestSignIn::MAX_NAMES`] names in all. Each new
+/// connection starts again from `<name>`. The uid it got is in
+/// [`SupervisorEvent::SignedIn`].
 #[derive(Debug, Clone)]
 pub struct GuestSignIn(pub Name);
 
+impl GuestSignIn {
+    /// How many names one sign-in tries before giving up until the next
+    /// connection.
+    pub const MAX_NAMES: u32 = 9;
+
+    /// The `n`th name to try, counting from 1: `<name>` itself, then
+    /// `<name>2`, `<name>3` and so on, shortened to fit 32 characters.
+    pub fn numbered(&self, n: u32) -> Name {
+        if n <= 1 {
+            return self.0.clone();
+        }
+        let suffix = n.to_string();
+        let base = self.0.as_str();
+        let keep = base.len().min(MAX_NAME_LEN - suffix.len());
+        // Names are ASCII. A shortened name may not end with '.' (3.5),
+        // but it can end with a digit, '_' or '-' before the suffix.
+        let base = base[..keep].trim_end_matches('.');
+        format!("{base}{suffix}")
+            .parse()
+            .expect("a shortened name plus digits is a name")
+    }
+}
+
 impl SignIn for GuestSignIn {
     fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>> {
-        Box::pin(session.guest(&self.0))
+        Box::pin(async move {
+            let mut n = 1;
+            loop {
+                match session.guest(&self.numbered(n)).await {
+                    Err(Error::Rejected(CommandError::Server(e)))
+                        if e.code == ErrorCode::NameTaken && n < Self::MAX_NAMES =>
+                    {
+                        n += 1;
+                    }
+                    result => return result,
+                }
+            }
+        })
     }
 }
 

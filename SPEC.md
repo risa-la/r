@@ -204,6 +204,11 @@ server's certificate as follows:
      user SHOULD have to delete the record explicitly before trying
      again.
 
+A client records "CA" or a pin only after the TLS handshake has
+completed, which proves that the server holds the certificate's private
+key. Otherwise anyone could replay a server's public certificate to
+change the record.
+
 Recording "CA" means an attacker cannot downgrade a server that has a CA
 certificate to a trust-on-first-use prompt. A server that moves from a
 self-signed certificate to a CA-valid one is accepted under rule 1, and
@@ -406,6 +411,11 @@ ERR <code> [<message...>]
 
 - **Order.** A server handles each connection's commands in the order
   they arrive, and sends their final responses in that order.
+- **Matching.** A client matches each final response to its oldest
+  command that has none yet. If a final response carries a `ref` that
+  does not belong to that command, the client can no longer tell which
+  response belongs to which command. It SHOULD close the connection and
+  reconnect.
 - **Results.** An `OK` may carry result values as options, for example
   `OK seq=8813`. Clients MUST ignore result values they do not know.
 - **Error messages.** The `<message...>` of an ERR is for people to read.
@@ -515,7 +525,9 @@ nothing about who someone is over time. For this reason guests:
   that point the server records a PART for each of those rooms.
 
 The server replies `ERR name-taken` if a connected guest already has the
-name. It MAY also reserve names, for example the names of identities it
+name. A guest that reconnects can get this for its own name, if the
+server has not yet noticed that its old connection is gone (Section 11).
+Clients SHOULD then try another name, for example by adding a number. It MAY also reserve names, for example the names of identities it
 hosts. It MAY refuse guests entirely with `ERR forbidden`.
 
 ### 4.3. Identities
@@ -655,8 +667,8 @@ REGISTER <name> <key> <signature>
 → `OK uid=<name>@<identity domain>`
 
 This creates the identity `<name>@<identity domain>`, with `<key>` as its
-first key. The client computes `<signature>` as in Section 4.5 using that
-uid, and the server verifies it with `<key>`. This proves the client
+first key. The client learns the identity domain from INFO (8.5) first.
+It computes `<signature>` as in Section 4.5 using that uid, and the server verifies it with `<key>`. This proves the client
 holds the private key. If it succeeds, the identity exists and the
 connection is signed in as it.
 

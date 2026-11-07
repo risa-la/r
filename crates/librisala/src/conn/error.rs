@@ -72,8 +72,9 @@ impl Error {
     /// SNI, no registration, an invalid command, and a sign-in refused
     /// with `auth-failed`, `forbidden`, `not-supported`, `bad-syntax` or
     /// `unknown-command`. Everything else, including `name-taken` (a
-    /// guest's old connection may not have closed yet), `rate-limited`
-    /// and `internal`, may pass.
+    /// guest's old connection may not have closed yet, and
+    /// [`GuestSignIn`](super::GuestSignIn) has already tried other names),
+    /// `rate-limited` and `internal`, may pass.
     pub fn is_permanent(&self) -> bool {
         match self {
             Error::Trust(_)
