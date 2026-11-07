@@ -435,9 +435,10 @@ async fn blocks_are_kept_for_the_account() {
         command(&mut phone, "unblock spam@example.net").await,
         ["OK"]
     );
+    // The laptop heard of the phone's UNBLOCK, before its BLOCKS reply.
     assert_eq!(
         command(&mut alice, "blocks").await,
-        ["BLOCK *@bad.example", "OK"]
+        ["UNBLOCK spam@example.net", "BLOCK *@bad.example", "OK"]
     );
     let mut sam = server.guest("sam").await;
     assert_eq!(

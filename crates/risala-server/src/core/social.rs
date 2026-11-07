@@ -238,38 +238,67 @@ impl Inner {
         Ok(Some(OkResponse::new()))
     }
 
-    /// BLOCK (5.7). Only identities get here (13).
-    pub(super) async fn block(&self, uid: &Uid, target: BlockTarget) -> Outcome {
-        let (who, max, now) = (uid.clone(), self.config.limits.max_blocks, self.now());
-        if !self
-            .db(move |s| s.add_block(&who, &target, max, now))
-            .await?
-        {
-            return Err(fail(ErrorCode::Forbidden, "too many blocks"));
+    /// BLOCK (5.7). Only identities get here (13). The account's other
+    /// connections get `BLOCK <target>`.
+    pub(super) async fn block(&self, uid: &Uid, reply: &Reply, target: BlockTarget) -> Outcome {
+        let user = self.pin(uid);
+        let result = async {
+            let _blocks = user.blocks.lock().await;
+            let (who, max, now) = (uid.clone(), self.config.limits.max_blocks, self.now());
+            let stored = target.clone();
+            if !self
+                .db(move |s| s.add_block(&who, &stored, max, now))
+                .await?
+            {
+                return Err(fail(ErrorCode::Forbidden, "too many blocks"));
+            }
+            let line = OutLine::new(ServerMessage::new(ServerLine::Block { target }));
+            user.send_except(&line, reply.handle.id());
+            Ok(Some(OkResponse::new()))
         }
-        Ok(Some(OkResponse::new()))
+        .await;
+        self.unpin(uid, user);
+        result
     }
 
     /// UNBLOCK (5.7). Removing a block the account does not have is not an
-    /// error.
-    pub(super) async fn unblock(&self, uid: &Uid, target: BlockTarget) -> Outcome {
-        let who = uid.clone();
-        self.db(move |s| s.remove_block(&who, &target)).await?;
-        Ok(Some(OkResponse::new()))
+    /// error. The account's other connections get `UNBLOCK <target>`.
+    pub(super) async fn unblock(&self, uid: &Uid, reply: &Reply, target: BlockTarget) -> Outcome {
+        let user = self.pin(uid);
+        let result = async {
+            let _blocks = user.blocks.lock().await;
+            let (who, stored) = (uid.clone(), target.clone());
+            self.db(move |s| s.remove_block(&who, &stored)).await?;
+            let line = OutLine::new(ServerMessage::new(ServerLine::Unblock { target }));
+            user.send_except(&line, reply.handle.id());
+            Ok(Some(OkResponse::new()))
+        }
+        .await;
+        self.unpin(uid, user);
+        result
     }
 
-    /// BLOCKS (5.7): one `BLOCK <target>` line per block.
+    /// BLOCKS (5.7): one `BLOCK <target>` line per block, then `OK`, all
+    /// queued while no BLOCK or UNBLOCK line can be, so that they cover
+    /// every one sent to the connection before them.
     pub(super) async fn blocks(&self, uid: &Uid, reply: &Reply) -> Outcome {
-        let who = uid.clone();
-        let blocks = self.db(move |s| s.blocks(&who)).await?;
-        let lines = blocks
-            .into_iter()
-            .map(|target| ServerLine::Block { target })
-            .collect();
-        if !self.reply_all(reply, lines).await {
-            return Ok(None);
+        let user = self.pin(uid);
+        let result = async {
+            let _blocks = user.blocks.lock().await;
+            let who = uid.clone();
+            let blocks = self.db(move |s| s.blocks(&who)).await?;
+            let lines = blocks
+                .into_iter()
+                .map(|target| ServerLine::Block { target })
+                .collect();
+            if self.reply_all(reply, lines).await {
+                reply.line(OkResponse::new());
+            }
+            Ok(None)
         }
-        Ok(Some(OkResponse::new()))
+        .await;
+        self.unpin(uid, user);
+        result
     }
 
     /// Whether the identity `by` has blocked `uid` (5.7), by identity or by

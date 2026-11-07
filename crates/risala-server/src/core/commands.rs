@@ -310,8 +310,8 @@ impl Inner {
             Command::Name { display_name } => self.name(uid, reply, display_name).await,
             Command::Members { room } => self.members(uid, reply, &room).await,
             Command::Whois { uid: target } => self.whois(reply, target).await,
-            Command::Block { target } => self.block(uid, target).await,
-            Command::Unblock { target } => self.unblock(uid, target).await,
+            Command::Block { target } => self.block(uid, reply, target).await,
+            Command::Unblock { target } => self.unblock(uid, reply, target).await,
             Command::Blocks => self.blocks(uid, reply).await,
             // Later milestones, including `HISTORY only=commit` and the
             // rest of Section 12.

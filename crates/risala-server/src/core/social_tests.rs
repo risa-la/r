@@ -584,9 +584,18 @@ async fn blocks_are_stored_listed_and_removed() {
     h.send(&a1, "@ref=b blocks").await;
     assert_eq!(a1.lines(), ["@ref=b OK"]);
     for target in ["spam@example.net", "*@Bad.Example", "spam@example.net"] {
-        h.send(&a1, &format!("block {target}")).await;
-        assert_eq!(a1.lines(), ["OK"]);
+        h.send(&a1, &format!("@ref=x block {target}")).await;
+        assert_eq!(a1.lines(), ["@ref=x OK"]);
     }
+    // The account's other connections hear of it, line by line (5.7).
+    assert_eq!(
+        a2.lines(),
+        [
+            "BLOCK spam@example.net",
+            "BLOCK *@bad.example",
+            "BLOCK spam@example.net"
+        ]
+    );
     // A block belongs to the account, and applies to all its devices.
     h.send(&a2, "@ref=l blocks").await;
     assert_eq!(
@@ -623,8 +632,17 @@ async fn blocks_are_stored_listed_and_removed() {
     h.send(&a2, "unblock *@bad.example").await;
     h.send(&a2, "unblock nobody@example.com").await;
     assert_eq!(a2.lines(), ["OK", "OK"]);
+    assert_eq!(
+        a1.lines(),
+        ["UNBLOCK *@bad.example", "UNBLOCK nobody@example.com"]
+    );
     h.send(&a1, "blocks").await;
     assert_eq!(a1.lines(), ["BLOCK spam@example.net", "OK"]);
+    // Nobody else hears of them.
+    let mut bob = h.signed_in_as(BOB);
+    h.send(&a1, "block x@example.net").await;
+    a1.lines();
+    assert_eq!(bob.lines(), Vec::<String>::new());
 
     // Blocks change nothing in rooms (5.7).
     let mut spam = h.signed_in_as("spam@example.net");
@@ -644,6 +662,40 @@ async fn blocks_are_stored_listed_and_removed() {
         h.send(&sam, cmd).await;
         assert_eq!(sam.lines(), ["ERR forbidden not for guests"]);
     }
+}
+
+/// A BLOCKS reply covers every BLOCK and UNBLOCK line sent to the
+/// connection before it (5.7, 3.6): an UNBLOCK from another device while
+/// BLOCKS is answering comes after the whole reply, so the client never
+/// puts back a block that was lifted.
+#[tokio::test]
+async fn blocks_replies_agree_with_block_lines() {
+    let store = Arc::new(super::tests::Flaky::new());
+    let mut h = Harness::on(config(), store.clone(), timers());
+    let mut a1 = h.signed_in_as(ALICE);
+    let mut a2 = h.signed_in_as(ALICE);
+    h.send(&a1, "block spam@example.net").await;
+    a1.lines();
+    a2.lines();
+
+    store.pause.arm("blocks");
+    let (hub, id) = (h.hub.clone(), a2.id);
+    let listing = tokio::spawn(async move { hub.command(id, "blocks".parse().unwrap()).await });
+    store.pause.reached().await;
+    let (hub, id) = (h.hub.clone(), a1.id);
+    let lifting = tokio::spawn(async move {
+        hub.command(id, "unblock spam@example.net".parse().unwrap())
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    store.pause.release();
+    listing.await.unwrap();
+    lifting.await.unwrap();
+    assert_eq!(a1.lines(), ["OK"]);
+    assert_eq!(
+        a2.lines(),
+        ["BLOCK spam@example.net", "OK", "UNBLOCK spam@example.net"]
+    );
 }
 
 #[tokio::test]

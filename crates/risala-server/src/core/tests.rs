@@ -2262,7 +2262,10 @@ impl Store for Flaky {
         self.inner.remove_block(u, b)
     }
     fn blocks(&self, u: &Uid) -> crate::store::Result<Vec<risala_proto::names::BlockTarget>> {
-        self.inner.blocks(u)
+        // After reading: the list is what it was, but not yet sent.
+        let blocks = self.inner.blocks(u);
+        self.pause.at("blocks");
+        blocks
     }
 }
 

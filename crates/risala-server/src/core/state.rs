@@ -217,6 +217,10 @@ impl CidCache {
 pub(crate) struct UserEntry {
     pub(crate) uid: Uid,
     inner: Mutex<UserState>,
+    /// Held while the account's blocks change and the change is sent to
+    /// its other connections, and while BLOCKS answers, so that a BLOCKS
+    /// reply covers every BLOCK and UNBLOCK line sent before it (5.7).
+    pub(crate) blocks: tokio::sync::Mutex<()>,
 }
 
 /// See [`UserEntry`].
@@ -247,6 +251,7 @@ impl UserEntry {
         UserEntry {
             uid,
             inner: Mutex::new(UserState::default()),
+            blocks: tokio::sync::Mutex::new(()),
         }
     }
 
