@@ -62,6 +62,8 @@ pub fn fetch_options(config: &KeysConfig) -> io::Result<FetchOptions> {
         allow_private: config.allow_private,
         timeout: std::time::Duration::from_secs(config.fetch_timeout_secs),
         cache_capacity: config.cache_size,
+        // One site may take an eighth of the cache, whatever its size.
+        cache_per_site: config.cache_size / risala_keyfetch::DEFAULT_CACHE_SHARE,
         ..FetchOptions::default()
     })
 }

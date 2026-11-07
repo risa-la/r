@@ -103,9 +103,9 @@ pub const NONCE_BYTES: usize = 32;
 pub const TOKEN_LEN: usize = 32;
 
 /// How long AUTH waits for an identity's key file (4.4) before it gives
-/// up with `ERR unavailable`. A fetcher stops after 10 seconds itself;
-/// this is a backstop.
-pub const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// up with `ERR unavailable`. A fetch stops after 10 seconds itself, but
+/// may first wait as long again for its turn; this is a backstop.
+pub const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The `retry` on AUTH's `ERR unavailable` (4.5): how long a client
 /// should wait before it tries again after a key file could not be

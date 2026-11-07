@@ -672,3 +672,159 @@ async fn cache_size_is_capped() {
     assert_eq!(hits.load(Ordering::Relaxed), 4);
     assert_eq!(fetcher.cached(), 2);
 }
+
+/// A server for `slow.test`, which never answers, and `fast.test`, which
+/// does, and a fetcher with at most `overall` fetches at once and
+/// `per_domain` from one domain.
+async fn slow_and_fast(
+    overall: usize,
+    per_domain: usize,
+    timeout: Duration,
+) -> (Server, KeyFetcher) {
+    let ca = TestCa::new();
+    let server = Server::start(
+        &ca,
+        &["slow.test", "fast.test"],
+        Arc::new(|path| {
+            if path.starts_with("/.well-known/risala/slow") {
+                Reply::Hang
+            } else {
+                ok(&line(1))
+            }
+        }),
+    )
+    .await;
+    let fetcher = KeyFetcher::new(FetchOptions {
+        max_concurrent: overall,
+        max_per_domain: per_domain,
+        timeout,
+        ..options(&ca, &server, &["slow.test", "fast.test"])
+    });
+    (server, fetcher)
+}
+
+/// One slow domain cannot hold every fetch: it gets only its share of
+/// them, and the others go on (14).
+#[tokio::test]
+async fn a_slow_domain_does_not_hold_up_the_others() {
+    let (server, fetcher) = slow_and_fast(4, 2, Duration::from_secs(3)).await;
+    let mut slow = Vec::new();
+    for n in 0..8 {
+        let fetcher = fetcher.clone();
+        slow.push(tokio::spawn(async move {
+            fetcher
+                .fetch(&id(&format!("slow{n}@slow.test")), false)
+                .await
+        }));
+    }
+    // Let the slow ones take what they can.
+    while server.hits() < 2 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started = Instant::now();
+    assert_eq!(
+        fetcher.fetch(&id("alice@fast.test"), false).await,
+        Ok(vec![key(1)])
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // Only two of the slow domain's ran at once.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(server.hits(), 3);
+    for task in slow {
+        task.abort();
+    }
+}
+
+/// Waiting for a turn does not use up a fetch's time limit: it has its
+/// own, and a fetch that does not get a turn in time fails as busy,
+/// without fetching or being remembered.
+#[tokio::test]
+async fn waiting_for_a_turn_is_timed_separately() {
+    let timeout = Duration::from_millis(400);
+    let (server, fetcher) = slow_and_fast(8, 1, timeout).await;
+    let mut tasks = Vec::new();
+    for n in 0..3 {
+        let fetcher = fetcher.clone();
+        tasks.push(tokio::spawn(async move {
+            let started = Instant::now();
+            let result = fetcher
+                .fetch(&id(&format!("slow{n}@slow.test")), false)
+                .await;
+            (result, started.elapsed())
+        }));
+        // In this order.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut results = Vec::new();
+    for task in tasks {
+        results.push(task.await.unwrap());
+    }
+    // The first runs out its time; the second waits its turn, then has
+    // all of its own time; the third does not get a turn in time.
+    assert_eq!(results[0].0, Err(FetchError::Timeout));
+    assert_eq!(results[1].0, Err(FetchError::Timeout));
+    assert!(results[1].1 > timeout + timeout / 2, "{results:?}");
+    assert_eq!(results[2].0, Err(FetchError::Busy));
+    assert_eq!(server.hits(), 2);
+    // A busy fetch is not remembered: the next one tries.
+    assert_eq!(
+        fetcher.fetch(&id("slow2@slow.test"), false).await,
+        Err(FetchError::Timeout)
+    );
+    assert_eq!(server.hits(), 3);
+}
+
+/// Identities made up at one site cannot push other sites' key files out
+/// of the cache: a site that has its share makes room among its own.
+#[tokio::test]
+async fn one_site_gets_only_its_share_of_the_cache() {
+    let ca = TestCa::new();
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    let seen = hits.clone();
+    let server = Server::start(
+        &ca,
+        &["good.test", "evil.test", "a.evil.test", "b.evil.test"],
+        Arc::new(move |path| {
+            seen.lock().unwrap().push(path.to_owned());
+            ok(&line(1))
+        }),
+    )
+    .await;
+    let clock = ManualClock::new();
+    let fetcher = KeyFetcher::new(FetchOptions {
+        cache_capacity: 6,
+        cache_per_site: 2,
+        clock: clock.clone(),
+        ..options(
+            &ca,
+            &server,
+            &["good.test", "evil.test", "a.evil.test", "b.evil.test"],
+        )
+    });
+    let fetch = |who: &'static str| {
+        let fetcher = fetcher.clone();
+        async move { fetcher.fetch(&id(who), false).await.unwrap() }
+    };
+    fetch("alice@good.test").await;
+    fetch("bob@good.test").await;
+    for who in [
+        "m1@evil.test",
+        "m2@a.evil.test",
+        "m3@b.evil.test",
+        "m4@evil.test",
+        "m5@a.evil.test",
+    ] {
+        clock.advance(Duration::from_secs(1));
+        fetch(who).await;
+    }
+    // evil.test and its subdomains have two entries between them.
+    assert_eq!(fetcher.cached(), 4);
+    let before = server.hits();
+    fetch("alice@good.test").await;
+    fetch("bob@good.test").await;
+    fetch("m4@evil.test").await;
+    fetch("m5@a.evil.test").await;
+    assert_eq!(server.hits(), before);
+    fetch("m1@evil.test").await;
+    assert_eq!(server.hits(), before + 1);
+}

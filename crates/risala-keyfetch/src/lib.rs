@@ -15,7 +15,9 @@
 //!   checked on every address it connects to, which servers must use;
 //! - a cache of up to an hour, with an explicit refetch for "fetch again
 //!   once before failing";
-//! - a limit on how often any one key file is fetched (14, "Abuse").
+//! - a limit on how often any one key file is fetched (14, "Abuse"), on
+//!   how many fetches run at once, overall and per domain, and on how much
+//!   of the cache one domain may take.
 //!
 //! A fetch has one of three outcomes (4.4):
 //!
@@ -58,7 +60,7 @@ use risala_proto::keyfile::{KeyEntry, KeyFile, MAX_KEY_FILE_BYTES};
 use risala_proto::names::Identity;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use tokio_rustls::TlsConnector;
 
 pub use resolve::{BoxFuture, Resolve, StaticResolver, SystemResolver};
@@ -79,6 +81,17 @@ pub const DEFAULT_MIN_REFETCH: Duration = Duration::from_secs(10);
 
 /// The default number of fetches that may run at once.
 pub const DEFAULT_MAX_CONCURRENT: usize = 64;
+
+/// The default number of fetches from one domain that may run at once.
+pub const DEFAULT_MAX_PER_DOMAIN: usize = 4;
+
+/// The default share of the cache one site may take, as a fraction: an
+/// eighth.
+pub const DEFAULT_CACHE_SHARE: usize = 8;
+
+/// The most failed fetches logged at info level per minute. The rest are
+/// logged at debug level, and counted in the next one.
+const FAILURE_LOGS_PER_MINUTE: u32 = 10;
 
 /// What a fetch found (4.4): a key file, or a gone answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +141,10 @@ pub enum FetchError {
     /// Reading or writing the connection failed.
     #[error("reading the response: {0}")]
     Io(String),
+    /// Too many fetches were running, overall or from the domain, for this
+    /// one to start in time. Nothing was fetched.
+    #[error("too many key file fetches at once")]
+    Busy,
 }
 
 /// Where a [`KeyFetcher`] gets the time from, for its cache and rate
@@ -171,9 +188,21 @@ pub struct FetchOptions {
     /// included (14). A failed fetch is also remembered this long, so that
     /// repeated sign-ins do not fetch again and again.
     pub min_refetch: Duration,
-    /// The most fetches that run at once. Others wait, within their
-    /// timeout. At least 1.
+    /// The most fetches that run at once. Others wait, for up to
+    /// `timeout`, before their own `timeout` starts. At least 1.
     pub max_concurrent: usize,
+    /// The most fetches from one domain that run at once, so that one slow
+    /// domain cannot hold up every fetch. Others wait as above. At least
+    /// 1.
+    pub max_per_domain: usize,
+    /// The most cache entries one site may have, so that someone who makes
+    /// up identities at their own domain cannot push everyone else's key
+    /// files out of the cache. When a site has this many, its own oldest
+    /// entry makes way. A site is a domain's last two labels, or three
+    /// when the second-to-last is a short label under a two-letter
+    /// country code, as in `example.co.uk`. At least 1, and at most
+    /// `cache_capacity`.
+    pub cache_per_site: usize,
     /// Turns domains into addresses.
     pub resolver: Arc<dyn Resolve>,
     /// The time, for the cache and the rate limit.
@@ -190,6 +219,8 @@ impl Default for FetchOptions {
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             min_refetch: DEFAULT_MIN_REFETCH,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
+            max_per_domain: DEFAULT_MAX_PER_DOMAIN,
+            cache_per_site: DEFAULT_CACHE_CAPACITY / DEFAULT_CACHE_SHARE,
             resolver: Arc::new(SystemResolver),
             clock: Arc::new(SystemClock),
         }
@@ -206,6 +237,8 @@ impl fmt::Debug for FetchOptions {
             .field("cache_capacity", &self.cache_capacity)
             .field("min_refetch", &self.min_refetch)
             .field("max_concurrent", &self.max_concurrent)
+            .field("max_per_domain", &self.max_per_domain)
+            .field("cache_per_site", &self.cache_per_site)
             .finish_non_exhaustive()
     }
 }
@@ -223,29 +256,60 @@ struct Inner {
     timeout: Duration,
     cache_ttl: Duration,
     cache_capacity: usize,
+    cache_per_site: usize,
     min_refetch: Duration,
     resolver: Arc<dyn Resolve>,
     clock: Arc<dyn Clock>,
     permits: Semaphore,
+    max_per_domain: usize,
+    /// The permits of each domain that has fetches running or waiting.
+    domains: Mutex<HashMap<String, Arc<Semaphore>>>,
     cache: Mutex<Cache>,
+    failure_log: Mutex<LogLimit>,
 }
 
-/// The cache: a slot per identity.
+/// The cache: a slot per identity, and how many each site has.
 #[derive(Default)]
 struct Cache {
     slots: HashMap<Identity, Arc<Slot>>,
+    per_site: HashMap<String, usize>,
 }
 
 impl Cache {
     fn insert(&mut self, identity: &Identity) -> Arc<Slot> {
         let slot = Arc::<Slot>::default();
-        self.slots.insert(identity.clone(), slot.clone());
+        if self.slots.insert(identity.clone(), slot.clone()).is_none() {
+            *self.per_site.entry(site(identity.domain())).or_default() += 1;
+        }
         slot
     }
 
     fn remove(&mut self, identity: &Identity) {
-        self.slots.remove(identity);
+        if self.slots.remove(identity).is_some() {
+            let site = site(identity.domain());
+            if let Some(n) = self.per_site.get_mut(&site) {
+                *n -= 1;
+                if *n == 0 {
+                    self.per_site.remove(&site);
+                }
+            }
+        }
     }
+}
+
+/// The site a domain belongs to, for its share of the cache: its last two
+/// labels, or three when the second-to-last is a label of at most three
+/// letters under a two-letter country code (`example.co.uk`). This only
+/// shares the cache out; nothing else depends on it.
+fn site(domain: &str) -> String {
+    let labels: Vec<&str> = domain.rsplit('.').collect();
+    let keep = match labels.as_slice() {
+        [tld, second, _, ..] if tld.len() == 2 && second.len() <= 3 => 3,
+        _ => 2,
+    };
+    let mut site: Vec<&str> = labels.into_iter().take(keep).collect();
+    site.reverse();
+    site.join(".").to_ascii_lowercase()
 }
 
 /// One key file's place in the cache. Its lock is held while it is
@@ -307,6 +371,36 @@ impl Last {
     }
 }
 
+/// Holds failed fetches to [`FAILURE_LOGS_PER_MINUTE`] info-level log
+/// lines a minute, since anyone can make the server fetch from a host that
+/// fails.
+struct LogLimit {
+    since: Option<Instant>,
+    logged: u32,
+    held: u64,
+}
+
+impl LogLimit {
+    /// Whether to log one more at info level now, and how many were held
+    /// back since the last one that was.
+    fn take(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .since
+            .is_none_or(|since| now.saturating_duration_since(since) >= Duration::from_secs(60))
+        {
+            self.since = Some(now);
+            self.logged = 0;
+        }
+        if self.logged < FAILURE_LOGS_PER_MINUTE {
+            self.logged += 1;
+            Some(std::mem::take(&mut self.held))
+        } else {
+            self.held += 1;
+            None
+        }
+    }
+}
+
 impl fmt::Debug for KeyFetcher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyFetcher")
@@ -328,11 +422,19 @@ impl KeyFetcher {
                 timeout: options.timeout.min(FETCH_TIMEOUT),
                 cache_ttl: options.cache_ttl.min(MAX_CACHE_TTL),
                 cache_capacity,
+                cache_per_site: options.cache_per_site.clamp(1, cache_capacity),
                 min_refetch: options.min_refetch,
                 resolver: options.resolver,
                 clock: options.clock,
                 permits: Semaphore::new(options.max_concurrent.max(1)),
+                max_per_domain: options.max_per_domain.max(1),
+                domains: Mutex::new(HashMap::new()),
                 cache: Mutex::new(Cache::default()),
+                failure_log: Mutex::new(LogLimit {
+                    since: None,
+                    logged: 0,
+                    held: 0,
+                }),
             }),
         }
     }
@@ -409,8 +511,10 @@ impl KeyFetcher {
                 });
                 Ok(found)
             }
+            // Nothing was fetched, so nothing is learnt or rate-limited.
+            Err(FetchError::Busy) => Err(FetchError::Busy),
             Err(error) => {
-                tracing::info!(%identity, %error, "key file fetch failed");
+                self.log_failure(identity, &error, tried);
                 let answer = last.take().and_then(|known| known.answer);
                 *last = Some(Last {
                     answer,
@@ -419,6 +523,26 @@ impl KeyFetcher {
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// Logs a failed fetch, at info level unless too many have been
+    /// lately.
+    fn log_failure(&self, identity: &Identity, error: &FetchError, now: Instant) {
+        let held = self
+            .inner
+            .failure_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(now);
+        match held {
+            Some(0) => tracing::info!(%identity, %error, "key file fetch failed"),
+            Some(held) => tracing::info!(
+                %identity,
+                %error,
+                "key file fetch failed ({held} more failures not logged)"
+            ),
+            None => tracing::debug!(%identity, %error, "key file fetch failed"),
         }
     }
 
@@ -438,10 +562,12 @@ impl KeyFetcher {
         self.inner.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The cache slot of `identity`, made if there is none. When the cache
-    /// is full, expired entries go, then the oldest. Entries being fetched
-    /// are locked, and skipped. If no entry can go, the new slot is used
-    /// without being cached.
+    /// The cache slot of `identity`, made if there is none.
+    ///
+    /// A site that has its share of the cache makes room among its own
+    /// entries. When the whole cache is full, expired entries go, then the
+    /// oldest. Entries being fetched are locked, and skipped. If no entry
+    /// can go, the new slot is used without being cached.
     fn slot(&self, identity: &Identity) -> Arc<Slot> {
         let inner = &*self.inner;
         let mut cache = self.cache();
@@ -449,6 +575,13 @@ impl KeyFetcher {
             return slot.clone();
         }
         let now = inner.clock.now();
+        let site = site(identity.domain());
+        if cache.per_site.get(&site).copied().unwrap_or(0) >= inner.cache_per_site {
+            let own = |id: &Identity| self::site(id.domain()) == site;
+            if !self.make_room(&mut cache, now, own) {
+                return Arc::default();
+            }
+        }
         if cache.slots.len() >= inner.cache_capacity && !self.make_room(&mut cache, now, |_| true) {
             return Arc::default();
         }
@@ -496,15 +629,42 @@ impl KeyFetcher {
         true
     }
 
-    /// Fetches the key file of `identity` now, within the time limit.
+    /// Waits for a permit to fetch from `domain`, and then for one of the
+    /// overall permits, for up to the fetch timeout. The fetch's own
+    /// timeout starts after this.
+    async fn permits(&self, domain: &str) -> Result<Permits<'_>, FetchError> {
+        let inner = &*self.inner;
+        let ours = {
+            let mut domains = inner.domains.lock().unwrap_or_else(|e| e.into_inner());
+            domains
+                .entry(domain.to_ascii_lowercase())
+                .or_insert_with(|| Arc::new(Semaphore::new(inner.max_per_domain)))
+                .clone()
+        };
+        let wait = async {
+            let domain_permit = ours.clone().acquire_owned().await.ok()?;
+            let permit = inner.permits.acquire().await.ok()?;
+            Some((domain_permit, permit))
+        };
+        let permits = tokio::time::timeout(inner.timeout, wait).await;
+        let permits = Permits {
+            fetcher: self,
+            domain: domain.to_ascii_lowercase(),
+            semaphore: ours,
+            held: permits.ok().flatten(),
+        };
+        if permits.held.is_none() {
+            return Err(FetchError::Busy);
+        }
+        Ok(permits)
+    }
+
+    /// Fetches the key file of `identity` now, within the time limit,
+    /// once it has its permits.
     async fn get(&self, identity: &Identity) -> Result<Answer, FetchError> {
         let inner = &*self.inner;
+        let _permits = self.permits(identity.domain()).await?;
         let work = async {
-            let _permit = inner
-                .permits
-                .acquire()
-                .await
-                .map_err(|_| FetchError::Timeout)?;
             let domain = identity.domain();
             let path = format!("/.well-known/risala/{}", identity.name());
             let addrs = inner
@@ -586,6 +746,36 @@ impl KeyFetcher {
     }
 }
 
+/// The permits a fetch holds: one for its domain and one of the overall
+/// ones. Dropping them forgets the domain's permits once nobody else holds
+/// or waits for them.
+struct Permits<'a> {
+    fetcher: &'a KeyFetcher,
+    domain: String,
+    semaphore: Arc<Semaphore>,
+    held: Option<(OwnedSemaphorePermit, SemaphorePermit<'a>)>,
+}
+
+impl Drop for Permits<'_> {
+    fn drop(&mut self) {
+        self.held = None;
+        let mut domains = self
+            .fetcher
+            .inner
+            .domains
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The map's and this one's: nobody else holds or waits.
+        if Arc::strong_count(&self.semaphore) == 2
+            && domains
+                .get(&self.domain)
+                .is_some_and(|s| Arc::ptr_eq(s, &self.semaphore))
+        {
+            domains.remove(&self.domain);
+        }
+    }
+}
+
 /// The lines of a key file that are valid UTF-8, joined with LF. A line
 /// that is not valid UTF-8 counts as malformed and is skipped, like any
 /// other malformed line, so a stray byte does not lose the other keys
@@ -595,6 +785,39 @@ fn valid_lines(body: &[u8]) -> String {
         .filter_map(|line| std::str::from_utf8(line).ok())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn sites() {
+        assert_eq!(site("example.org"), "example.org");
+        assert_eq!(site("chat.example.org"), "example.org");
+        assert_eq!(site("a.b.Example.ORG"), "example.org");
+        assert_eq!(site("example.co.uk"), "example.co.uk");
+        assert_eq!(site("x.example.co.uk"), "example.co.uk");
+        assert_eq!(site("x.example.de"), "example.de");
+        assert_eq!(site("x.example.com.au"), "example.com.au");
+    }
+
+    #[test]
+    fn failure_logs_are_limited() {
+        let mut limit = LogLimit {
+            since: None,
+            logged: 0,
+            held: 0,
+        };
+        let t0 = Instant::now();
+        for _ in 0..FAILURE_LOGS_PER_MINUTE {
+            assert_eq!(limit.take(t0), Some(0));
+        }
+        assert_eq!(limit.take(t0), None);
+        assert_eq!(limit.take(t0 + Duration::from_secs(59)), None);
+        assert_eq!(limit.take(t0 + Duration::from_secs(60)), Some(2));
+        assert_eq!(limit.take(t0 + Duration::from_secs(61)), Some(0));
+    }
 }
 
 #[cfg(test)]
