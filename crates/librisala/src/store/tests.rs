@@ -100,6 +100,12 @@ fn trust_records() {
     );
     let other: ServerAddr = "chat.example.org:7000".parse().unwrap();
     assert_eq!(TrustStore::get(&store, &other).unwrap(), None);
+    // 2.1: the same server written another way finds the same record.
+    let shouted: ServerAddr = "Chat.Example.ORG.".parse().unwrap();
+    assert_eq!(
+        TrustStore::get(&store, &shouted).unwrap(),
+        Some(TrustRecord::Pinned(fp))
+    );
     store.forget(&a).unwrap();
     assert_eq!(TrustStore::get(&store, &a).unwrap(), None);
 }
