@@ -52,9 +52,13 @@ struct Live {
     /// does not clear them, so a server that lists a conversation in SYNC
     /// but refuses its HISTORY is not asked forever.
     failed_for: Option<Id>,
-    /// Catching up to this goal made no progress: the events in between
-    /// expired. Do not ask again until the goal moves.
-    stuck: Option<u64>,
+    /// Catching up made no progress toward a goal, knowing the
+    /// conversation reached a seq: `(known, goal)`. The events in between
+    /// expired, or the goal is a dropped live event's seq that no head
+    /// has covered yet. Do not ask again until either moves: a head
+    /// learned while the request was in flight is not covered by its
+    /// reply, so it needs a request of its own.
+    stuck: Option<(u64, u64)>,
     /// The goal for which the newest page was fetched (7.1 step 4).
     newest_for: Option<u64>,
     /// A live event was dropped while a SYNC was in flight: if the SYNC
@@ -1441,7 +1445,7 @@ impl SyncEngine {
                         let after = sync_point.max(last.map_or(0, Seq::get));
                         self.continue_fill(conv, row_id, epoch, after, (known, goal));
                     } else if !progress {
-                        self.live(conv).stuck = Some(goal);
+                        self.live(conv).stuck = Some((known, goal));
                     }
                 }
                 if slot == Slot::Auto && page == Page::Newest {
@@ -1569,7 +1573,7 @@ impl SyncEngine {
             live.download = false;
             return Ok(());
         }
-        if live.stuck == Some(goal) {
+        if live.stuck == Some((known, goal)) {
             live.download = false;
             return Ok(());
         }

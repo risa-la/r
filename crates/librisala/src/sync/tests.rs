@@ -514,6 +514,32 @@ fn expired_events_are_skipped() {
 }
 
 #[test]
+fn a_head_learned_during_an_empty_page_is_fetched() {
+    // Found by the simulation. Event 3 arrives before SYNC's reply, which
+    // was computed at head 2, so it cannot be stored and SYNC is asked
+    // again. Everything expires. The second SYNC says head 3 while
+    // HISTORY after=2 is in flight, and that page was asked for knowing
+    // only head 2, so its empty reply proves nothing about 3. One more
+    // request does.
+    let mut h = H::new(ALICE);
+    let r = h.start();
+    h.line(&bob(3));
+    h.reply(r, &["CONV #general k1 2 0"], "OK");
+    let h1 = h.expect("HISTORY #general after=0 limit=50");
+    let s2 = h.expect("SYNC");
+    h.reply(h1, &[], "OK id=k1 more=0");
+    assert_eq!(h.conv("#general").sync_point, 2);
+    let h3 = h.expect("HISTORY #general after=2 limit=50");
+    h.reply(s2, &["CONV #general k1 3 0"], "OK");
+    h.idle();
+    h.reply(h3, &[], "OK id=k1 more=0");
+    let r = h.expect("HISTORY #general after=2 limit=50");
+    h.reply(r, &[], "OK id=k1 more=0");
+    assert_eq!(h.conv("#general").sync_point, 3);
+    h.idle();
+}
+
+#[test]
 fn missing_from_sync_means_left() {
     let mut h = H::new(ALICE);
     h.joined("k1", 2);

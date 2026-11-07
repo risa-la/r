@@ -46,6 +46,14 @@ fn room(i: u8) -> Room {
     ROOMS[usize::from(i) % ROOMS.len()].parse().unwrap()
 }
 
+/// Prints what happens if `RISALA_SIM_TRACE` is set, to follow a failing
+/// case: `RISALA_SIM_TRACE=1 cargo test <test> -- --nocapture`.
+fn trace(f: impl FnOnce() -> String) {
+    if std::env::var_os("RISALA_SIM_TRACE").is_some() {
+        eprintln!("{}", f());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The server
 
@@ -585,6 +593,7 @@ impl World {
         }
         let conn = self.devices[d].conn.as_mut().unwrap();
         for o in out.send {
+            trace(|| format!("  d{d} sends #{}: {:?}", o.req.get(), o.command));
             conn.requests.push_back((o.req, o.command));
         }
     }
@@ -594,6 +603,12 @@ impl World {
     }
 
     pub(super) fn step(&mut self, action: &Action) {
+        if !matches!(
+            action,
+            Action::Flush(_) | Action::Handle(..) | Action::Deliver(_)
+        ) {
+            trace(|| format!("{action:?}"));
+        }
         match *action {
             Action::Post(r) => {
                 if let Some(inc) = self.bob_in(r) {
@@ -709,7 +724,9 @@ impl World {
                 let Some((req, command)) = conn.requests.pop_front() else {
                     return;
                 };
+                trace(|| format!("  server runs d{d} #{}: {command:?}", req.get()));
                 let reply = self.exec(d, command);
+                trace(|| format!("    -> {reply:?}"));
                 let conn = self.devices[d].conn.as_mut().unwrap();
                 if stage {
                     conn.staged = Some((req, reply));
@@ -733,6 +750,7 @@ impl World {
                 let Some(item) = conn.inbox.pop_front() else {
                     return;
                 };
+                trace(|| format!("  d{d} handles {item:?}"));
                 let out = match item {
                     Item::Line(line) => conn.engine.handle_line(&line),
                     Item::Reply(req, reply) => conn.engine.handle_reply(req, reply),
