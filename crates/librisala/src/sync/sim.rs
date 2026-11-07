@@ -172,6 +172,8 @@ pub(super) enum Action {
     // Connections.
     Connect(u8),
     Disconnect(u8),
+    /// The connection drops, and the device connects again at once.
+    Reconnect(u8),
     Handle(u8, bool),
     Flush(u8),
     Deliver(u8),
@@ -688,6 +690,10 @@ impl World {
                 let d = self.device(d);
                 self.devices[d].conn = None;
             }
+            Action::Reconnect(d) => {
+                self.step(&Action::Disconnect(d));
+                self.step(&Action::Connect(d));
+            }
             Action::Handle(d, stage) => {
                 let d = self.device(d);
                 let Some(conn) = &mut self.devices[d].conn else {
@@ -1020,6 +1026,7 @@ fn action() -> impl Strategy<Value = Action> {
         1 => Just(Action::TimePasses),
         2 => b().prop_map(Action::Connect),
         2 => b().prop_map(Action::Disconnect),
+        2 => b().prop_map(Action::Reconnect),
         8 => (b(), any::<bool>()).prop_map(|(d, s)| Action::Handle(d, s)),
         3 => b().prop_map(Action::Flush),
         12 => b().prop_map(Action::Deliver),
@@ -1057,7 +1064,7 @@ proptest! {
     fn sync_converges(
         page in 1u64..4,
         max_page in 1u64..4,
-        actions in proptest::collection::vec(action(), 0..200),
+        actions in proptest::collection::vec(action(), 0..300),
     ) {
         run(page, max_page, None, &actions);
     }
@@ -1068,7 +1075,7 @@ proptest! {
         page in 1u64..4,
         max_page in 1u64..4,
         gap in 1u64..4,
-        actions in proptest::collection::vec(action(), 0..200),
+        actions in proptest::collection::vec(action(), 0..300),
     ) {
         run(page, max_page, Some(gap), &actions);
     }
@@ -1090,4 +1097,49 @@ fn regression_seq_from_a_dropped_room() {
         Drop(0),
     ];
     run(1, 1, None, &actions);
+}
+
+/// Device 0 is offline while its room is dropped, created again and
+/// joined from device 1, and the new room grows past what device 0 has.
+/// Only SYNC's id tells the rooms apart (7.1 step 2).
+#[test]
+fn offline_while_the_room_is_recreated() {
+    use Action::*;
+    let actions = [
+        Connect(0),
+        Join(0, 0),
+        Handle(0, false),
+        Handle(0, false),
+        Deliver(0),
+        Deliver(0),
+        Deliver(0),
+        Handle(0, false),
+        Deliver(0),
+        Disconnect(0),
+        Drop(0),
+        Create(0),
+        Post(0),
+        Post(0),
+        Post(0),
+        Post(0),
+        Connect(1),
+        Join(1, 0),
+        Handle(1, false),
+        Handle(1, false),
+        Post(0),
+        Connect(0),
+    ];
+    let mut w = World::new(5, 5, None);
+    for a in &actions[..9] {
+        w.step(a);
+    }
+    // Device 0 has caught up with the first room.
+    let dev = &w.devices[0];
+    let c = dev
+        .store
+        .conversation(dev.account, &Conv::Room(room(0)))
+        .unwrap()
+        .unwrap();
+    assert_eq!((c.conv_id.unwrap().as_str(), c.sync_point), ("i0", 2));
+    run(5, 5, None, &actions);
 }

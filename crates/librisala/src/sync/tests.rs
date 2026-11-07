@@ -239,18 +239,16 @@ fn a_new_id_starts_afresh() {
     let mut h = H::new(ALICE);
     h.joined("k1", 3);
     let r = h.reconnect();
-    h.reply(r, &["CONV #general k2 1 0"], "OK");
+    // A head above what is stored, so only the id tells.
+    h.reply(r, &["CONV #general k2 4 0"], "OK");
     assert_eq!(h.seqs("#general"), Vec::<u64>::new());
     assert!(h.changes.contains(&Change::Cleared {
         conv: h.conv("#general").id
     }));
     let r = h.expect("HISTORY #general after=0 limit=50");
-    h.reply_s(
-        r,
-        &[ev(1, "from=carol@example.com;id=k2 JOIN #general")],
-        "OK id=k2 more=0",
-    );
-    assert_eq!(h.seqs("#general"), [1]);
+    let page: Vec<String> = (1..=4).map(bob).collect();
+    h.reply_s(r, &page, "OK id=k2 more=0");
+    assert_eq!(h.seqs("#general"), [1, 2, 3, 4]);
     assert_eq!(h.conv("#general").conv_id, Some("k2".parse().unwrap()));
 }
 
