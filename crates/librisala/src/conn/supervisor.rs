@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use risala_proto::auth::SecretKey;
 use risala_proto::error::ErrorCode;
-use risala_proto::names::{Identity, MAX_NAME_LEN, Name, Uid};
+use risala_proto::names::{Id, Identity, MAX_NAME_LEN, Name, Uid};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -28,30 +28,92 @@ pub trait SignIn: Send + Sync {
     fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>>;
 }
 
-/// Signs in as the guest `~<name>` (4.2).
+/// The guest session (4.2) a [`GuestSignIn`] resumes: the name it got and
+/// the token from the last `OK`. Shared, so that the app can load it from
+/// its cache before connecting and save it after each sign-in.
 ///
-/// A guest that reconnects may find its name still taken, because the
-/// server has not yet noticed that its old connection is gone (4.2). So on
-/// `name-taken` it tries `<name>2`, `<name>3` and so on, on the same
-/// connection, up to [`GuestSignIn::MAX_NAMES`] names in all. Each new
-/// connection starts again from `<name>`. The uid it got is in
+/// The token is a secret: [`Debug`](std::fmt::Debug) leaves it out.
+#[derive(Default)]
+pub struct GuestToken {
+    session: std::sync::Mutex<Option<(Name, Id)>>,
+}
+
+impl std::fmt::Debug for GuestToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestToken")
+            .field("name", &self.get().map(|(name, _)| name))
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuestToken {
+    /// A holder with `session` in it, as [`set`](Self::set) leaves it.
+    pub fn new(session: Option<(Name, Id)>) -> GuestToken {
+        GuestToken {
+            session: std::sync::Mutex::new(session),
+        }
+    }
+
+    /// The name and token of the session to resume, if any.
+    pub fn get(&self) -> Option<(Name, Id)> {
+        self.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Records the session signed in to, or forgets it.
+    pub fn set(&self, session: Option<(Name, Id)>) {
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
+    }
+}
+
+/// Signs in as the guest `~<name>` (4.2), resuming the last session when
+/// it can.
+///
+/// - If [`session`](Self::session) holds a session, it sends
+///   `GUEST <that name> token=<token>` first. The server resumes the
+///   session if it is still waiting, and otherwise ignores the token.
+/// - If that name is taken, the session has ended and someone else has
+///   the name, so it tries `<name>`, then `<name>2`, `<name>3` and so on,
+///   on the same connection, up to [`GuestSignIn::MAX_NAMES`] names in
+///   all. Each new connection starts again from the stored session.
+///
+/// Either way, the name and the new token from the `OK` go into
+/// [`session`](Self::session), and the uid is in
 /// [`SupervisorEvent::SignedIn`].
 #[derive(Debug, Clone)]
-pub struct GuestSignIn(pub Name);
+pub struct GuestSignIn {
+    /// The name the user chose, without `~`.
+    pub name: Name,
+    /// The session to resume, updated by each sign-in.
+    pub session: Arc<GuestToken>,
+}
 
 impl GuestSignIn {
     /// How many names one sign-in tries before giving up until the next
     /// connection.
     pub const MAX_NAMES: u32 = 9;
 
+    /// Signs in as `~<name>`, with no session to resume yet.
+    pub fn new(name: Name) -> GuestSignIn {
+        GuestSignIn::resuming(name, Arc::default())
+    }
+
+    /// Signs in as `~<name>`, resuming the session in `session` if there
+    /// is one.
+    pub fn resuming(name: Name, session: Arc<GuestToken>) -> GuestSignIn {
+        GuestSignIn { name, session }
+    }
+
     /// The `n`th name to try, counting from 1: `<name>` itself, then
     /// `<name>2`, `<name>3` and so on, shortened to fit 32 characters.
     pub fn numbered(&self, n: u32) -> Name {
         if n <= 1 {
-            return self.0.clone();
+            return self.name.clone();
         }
         let suffix = n.to_string();
-        let base = self.0.as_str();
+        let base = self.name.as_str();
         let keep = base.len().min(MAX_NAME_LEN - suffix.len());
         // Names are ASCII. A shortened name may not end with '.' (3.5),
         // but it can end with a digit, '_' or '-' before the suffix.
@@ -60,20 +122,47 @@ impl GuestSignIn {
             .parse()
             .expect("a shortened name plus digits is a name")
     }
+
+    /// Records the session `GUEST <name>` signed in to.
+    fn signed_in(&self, name: &Name, token: Option<Id>) {
+        self.session.set(token.map(|t| (name.clone(), t)));
+    }
+}
+
+fn name_taken(e: &Error) -> bool {
+    matches!(e, Error::Rejected(CommandError::Server(e)) if e.code == ErrorCode::NameTaken)
 }
 
 impl SignIn for GuestSignIn {
     fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>> {
         Box::pin(async move {
+            let resumed = self.session.get();
+            if let Some((name, token)) = &resumed {
+                match session.guest_session(name, Some(token)).await {
+                    Ok((uid, token)) => {
+                        self.signed_in(name, token);
+                        return Ok(uid);
+                    }
+                    Err(e) if name_taken(&e) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let tried = resumed.map(|(name, _)| name);
             let mut n = 1;
             loop {
-                match session.guest(&self.numbered(n)).await {
-                    Err(Error::Rejected(CommandError::Server(e)))
-                        if e.code == ErrorCode::NameTaken && n < Self::MAX_NAMES =>
-                    {
-                        n += 1;
+                let name = self.numbered(n);
+                if tried.as_ref() == Some(&name) && n < Self::MAX_NAMES {
+                    // Just refused.
+                    n += 1;
+                    continue;
+                }
+                match session.guest_session(&name, None).await {
+                    Err(e) if name_taken(&e) && n < Self::MAX_NAMES => n += 1,
+                    Ok((uid, token)) => {
+                        self.signed_in(&name, token);
+                        return Ok(uid);
                     }
-                    result => return result,
+                    Err(e) => return Err(e),
                 }
             }
         })

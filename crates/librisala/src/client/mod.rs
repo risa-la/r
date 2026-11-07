@@ -35,23 +35,38 @@
 //! commands with [`Session::send`](crate::conn::Session::send), and reads
 //! lines and replies from one queue, so that order is kept.
 //!
-//! # Guests and rooms after a reconnect
+//! # Guests after a reconnect
 //!
-//! Guests leave all their rooms when they disconnect (4.2). So for a
-//! guest account the client layer keeps the rooms the user joined (in the
-//! cache, [`Store::rejoin_rooms`]) and joins them again on every new
-//! connection, before SYNC, so that SYNC already lists them. A room that
-//! can no longer be joined (`not-found` or `forbidden`) is taken off the
-//! list and reported as [`Notice::RejoinFailed`]. Parting a room, or
-//! being kicked or banned from it, or its being dropped, takes it off
-//! too. Turn this off with [`ClientOptions::rejoin_guest_rooms`].
-//! Identities stay members across connections (6.1), so nothing is
-//! joined again for them.
+//! A guest's session outlives its connection for a while (4.2). The cache
+//! keeps the name and token of the session the account last signed in to
+//! ([`Store::guest_session`]), and each new connection, even from a later
+//! run of the app, sends `GUEST <name> token=<token>` to resume it. A
+//! resumed session is still in its rooms, and nothing is recorded. If the
+//! session has ended and someone else has the name, the guest signs in as
+//! `<name>2`, `<name>3` and so on, and that session's token is kept
+//! instead. The account keeps its original uid either way. Events are
+//! marked as the account's own when they are stored, by the uid of the
+//! connection, so messages sent as `~sam2` do not count as unread for the
+//! account `~sam`.
+//!
+//! A session that ended has left its rooms. So for a guest account the
+//! client layer keeps the rooms the user joined (in the cache,
+//! [`Store::rejoin_rooms`]). On each new connection it sends SYNC first,
+//! and joins again only the rooms that SYNC does not list: none after a
+//! resume, all of them after a new session. This happens before the sync
+//! engine's own SYNC, so that it lists them. A room that can no longer be
+//! joined (`not-found` or `forbidden`) is taken off the list and reported
+//! as [`Notice::RejoinFailed`]. Parting a room, or being kicked or banned
+//! from it, or its being dropped, takes it off too. Turn this off with
+//! [`ClientOptions::rejoin_guest_rooms`]. Identities stay members across
+//! connections (6.1), so nothing is joined again for them.
 //!
 //! A guest's messages that were sent but not answered when the
-//! connection dropped are not sent again: the server checks a guest's
-//! cids only within one connection (7.6). They end as
-//! [`OutboxStatus::Failed`] with `maybe_sent` set.
+//! connection dropped are not sent again. The server checks a guest's
+//! cids only within one session (7.6), and the `OK` of GUEST does not say
+//! whether the session was resumed or is new, so a resend could post the
+//! message twice. They end as [`OutboxStatus::Failed`] with `maybe_sent`
+//! set.
 //!
 //! # Blocking
 //!
@@ -101,8 +116,8 @@ pub struct ClientOptions {
     /// Sync settings: page sizes, when to fetch only the newest page, the
     /// resend window and the clock.
     pub sync: SyncConfig,
-    /// Join a guest's rooms again after each reconnect (4.2). See the
-    /// [module docs](self). On by default.
+    /// Join a guest's rooms again after a reconnect, when its session was
+    /// not resumed (4.2). See the [module docs](self). On by default.
     pub rejoin_guest_rooms: bool,
     /// Where identities' device keys are, for signing in (4.5).
     pub keys: Option<Arc<dyn KeyStore>>,

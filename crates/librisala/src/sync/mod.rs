@@ -47,7 +47,8 @@
 //! - **At most once.** Each outbox message has its own cid and is bound to
 //!   the conversation's id. It is resent after a reconnect only while that
 //!   id still matches, only by an identity (a guest's cids count only
-//!   within one connection) and only within 23 hours (7.6).
+//!   within one session, which may have ended unseen) and only within 23
+//!   hours (7.6).
 
 mod engine;
 

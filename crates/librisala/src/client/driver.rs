@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use risala_proto::names::{Conv, Room, Seq, Uid};
+use risala_proto::command::Command;
+use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::unescape;
 use risala_proto::types::Ref;
@@ -22,8 +23,8 @@ use super::types::{
 };
 use crate::addr::TrustStore;
 use crate::conn::{
-    self, End, GuestSignIn, IdentitySignIn, Incoming, Response, Session, SignIn, Supervisor,
-    SupervisorEvent,
+    self, End, GuestSignIn, GuestToken, IdentitySignIn, Incoming, Response, Session, SignIn,
+    Supervisor, SupervisorEvent,
 };
 use crate::store::{AccountId, Change, Draft, OutboxId, Store, StoreError};
 use crate::sync::{self, Notification, Outcome, Output, ReqId, SyncEngine, SyncError};
@@ -80,7 +81,21 @@ async fn drive(
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Option<oneshot::Sender<()>> {
     let server = shared.server.to_string();
-    let sign_in = match sign_in_for(shared) {
+    // A guest resumes the session it last signed in to (4.2).
+    let guest_token = if shared.is_guest() {
+        let store = shared.store.clone();
+        let account = shared.id;
+        match blocking(move || store.guest_session(account)).await {
+            Ok(session) => Some(Arc::new(GuestToken::new(session))),
+            Err(e) => {
+                warn!(error = %e, "reading the guest session");
+                Some(Arc::default())
+            }
+        }
+    } else {
+        None
+    };
+    let sign_in = match sign_in_for(shared, guest_token.clone()) {
         Ok(s) => s,
         Err(error) => {
             shared.set_state(ConnectionState::Failed { error });
@@ -105,6 +120,9 @@ async fn drive(
                     }
                     SupervisorEvent::Connected { .. } => shared.set_state(ConnectionState::SigningIn),
                     SupervisorEvent::SignedIn { uid, session, incoming } => {
+                        if let Some(token) = &guest_token {
+                            save_guest_session(shared, token.get()).await;
+                        }
                         match online(shared, uid, session.clone(), incoming, cmds).await {
                             Flow::Disconnected => session.close(),
                             Flow::Reconnect => supervisor.reconnect_now(),
@@ -149,15 +167,36 @@ async fn drive(
     }
 }
 
-/// How the account signs in: a guest by name, an identity with its key.
-fn sign_in_for(shared: &AccountShared) -> Result<Arc<dyn SignIn>, ClientError> {
+/// Saves the guest session the account signed in to, so that the next
+/// connection, even from a later run of the app, can resume it (4.2).
+async fn save_guest_session(shared: &AccountShared, session: Option<(Name, Id)>) {
+    let store = shared.store.clone();
+    let account = shared.id;
+    let saved = blocking(move || {
+        store.set_guest_session(account, session.as_ref().map(|(name, token)| (name, token)))
+    })
+    .await;
+    if let Err(e) = saved {
+        warn!(error = %e, "saving the guest session");
+    }
+}
+
+/// How the account signs in: a guest by name, resuming the session in
+/// `guest_token`, or an identity with its key.
+fn sign_in_for(
+    shared: &AccountShared,
+    guest_token: Option<Arc<GuestToken>>,
+) -> Result<Arc<dyn SignIn>, ClientError> {
     let uid = &shared.uid;
     if uid.is_guest() {
         let name = uid
             .name()
             .parse()
             .map_err(|_| ClientError::Invalid(format!("guest name {:?}", uid.name())))?;
-        return Ok(Arc::new(GuestSignIn(name)));
+        return Ok(Arc::new(GuestSignIn::resuming(
+            name,
+            guest_token.unwrap_or_default(),
+        )));
     }
     let identity = uid
         .to_identity()
@@ -269,12 +308,11 @@ impl Online<'_> {
         incoming: &mut mpsc::Receiver<Incoming>,
         cmds: &mut mpsc::UnboundedReceiver<Cmd>,
     ) -> Flow {
-        // Guests rejoin their rooms first, so that SYNC lists them (4.2).
+        // Guests rejoin the rooms their session lost first, so that SYNC
+        // lists them (4.2).
         let mut first = Vec::new();
         if self.shared.is_guest() && self.shared.options.rejoin_guest_rooms {
-            let store = self.shared.store.clone();
-            let account = self.shared.id;
-            match blocking(move || store.rejoin_rooms(account)).await {
+            match self.rooms_to_rejoin().await {
                 Ok(rooms) => {
                     for room in rooms {
                         first.push((Input::Join(room.clone()), Ctx::Rejoin(room)));
@@ -329,6 +367,38 @@ impl Online<'_> {
                 return Flow::Disconnected;
             }
         }
+    }
+
+    /// The rooms a guest joins again on this connection: those it should
+    /// be in, by [`Store::rejoin_rooms`], that a SYNC sent before anything
+    /// else does not list. After a resumed session, that is none (4.2), so
+    /// no JOIN is recorded; after a new session, it is all of them.
+    ///
+    /// If the SYNC fails, it is all of them too. That is safe: JOIN of a
+    /// room the guest is still in records nothing (6.1).
+    async fn rooms_to_rejoin(&self) -> Result<Vec<Room>, StoreError> {
+        let store = self.shared.store.clone();
+        let account = self.shared.id;
+        let mut rooms = blocking(move || store.rejoin_rooms(account)).await?;
+        if rooms.is_empty() {
+            return Ok(rooms);
+        }
+        match self.session.request(Command::Sync).await {
+            Ok(response) if response.is_ok() => {
+                let listed: HashSet<Conv> = response
+                    .lines
+                    .iter()
+                    .filter_map(|msg| match &msg.line {
+                        ServerLine::Conv { conv, .. } => Some(conv.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                rooms.retain(|room| !listed.contains(&Conv::Room(room.clone())));
+            }
+            Ok(response) => debug!(end = ?response.end, "SYNC before rejoining failed"),
+            Err(e) => debug!(error = %e, "SYNC before rejoining failed"),
+        }
+        Ok(rooms)
     }
 
     /// Turns an incoming item into engine input.

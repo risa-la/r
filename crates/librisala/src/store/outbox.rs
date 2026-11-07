@@ -61,8 +61,9 @@ pub enum FailReason {
     /// The server answered with an error.
     Rejected(ErrorCode),
     /// The connection dropped before the answer, and resending is not safe:
-    /// a guest's cids only count within one connection, and an identity's
-    /// only for 24 hours (7.6). It may or may not have been sent.
+    /// a guest's cids only count within one session, which may have ended,
+    /// and an identity's only for 24 hours (7.6). It may or may not have
+    /// been sent.
     Unconfirmed,
 }
 

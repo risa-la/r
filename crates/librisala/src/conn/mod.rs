@@ -33,7 +33,8 @@ mod tests;
 pub use error::{CloseReason, CommandError, Error, TrustError};
 pub use session::{End, Incoming, Response, Session, SessionInfo, SessionOptions};
 pub use supervisor::{
-    Backoff, BoxFuture, GuestSignIn, IdentitySignIn, SignIn, Supervisor, SupervisorEvent,
+    Backoff, BoxFuture, GuestSignIn, GuestToken, IdentitySignIn, SignIn, Supervisor,
+    SupervisorEvent,
 };
 pub use tls::{
     CaVerifier, TrustVerifier, Verified, accept_fingerprint, certificate_fingerprint,

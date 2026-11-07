@@ -244,21 +244,18 @@ async fn reads_work_offline_after_the_server_stops() {
     assert!(sam.list_rooms(None, None).await.is_err());
 }
 
-#[tokio::test]
-async fn a_guest_rejoins_its_rooms_after_a_reconnect() {
-    let server = TestServer::builder().room("#a").room("#b").start().await;
-    let proxy = Proxy::start(server.addr()).await;
-    let (client, addr) = trusting_client(&server, proxy.addr(), 50);
-    let sam = client.add_guest(&addr, "sam").unwrap();
-    let events = sam.subscribe();
-    sam.connect().await.unwrap();
-    sam.join("#a").await.unwrap();
-    sam.join("#b").await.unwrap();
-    sam.part("#b", "").await.unwrap();
-    within("sync", sam.wait_synced()).await.unwrap();
+/// The events by `uid` in `room` on the server, as verbs.
+async fn verbs_of(server: &TestServer, room: &str, uid: &str) -> Vec<String> {
+    server_history(server, room)
+        .await
+        .iter()
+        .filter(|l| l.contains(&format!(";from={uid};")) || l.contains(&format!(";from={uid} ")))
+        .map(|l| l.split(' ').nth(1).unwrap().to_owned())
+        .collect()
+}
 
-    proxy.cut();
-    // Back online, and in #a again but not #b (4.2).
+/// Waits until the account has gone offline and come back.
+async fn reconnected(events: &librisala::client::AccountEvents) {
     within("reconnect", async {
         let mut down = false;
         loop {
@@ -274,6 +271,24 @@ async fn a_guest_rejoins_its_rooms_after_a_reconnect() {
         }
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_guest_resumes_its_session_after_a_reconnect() {
+    let server = TestServer::builder().room("#a").room("#b").start().await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (client, addr) = trusting_client(&server, proxy.addr(), 50);
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    let events = sam.subscribe();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    sam.join("#b").await.unwrap();
+    sam.part("#b", "").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+
+    proxy.cut();
+    // Back online, still in #a and not #b (4.2).
+    reconnected(&events).await;
     within("sync", sam.wait_synced()).await.unwrap();
     let a = sam.conversation("#a").unwrap().info().unwrap().unwrap();
     let b = sam.conversation("#b").unwrap().info().unwrap().unwrap();
@@ -282,7 +297,10 @@ async fn a_guest_rejoins_its_rooms_after_a_reconnect() {
     let mut ann = guest_in(&server, "ann", "#a").await;
     post(&mut ann, "#a", "after the reconnect").await;
     wait_for_text(&sam.conversation("#a").unwrap(), "after the reconnect").await;
-    // No Left notice for #a: it was joined again before SYNC.
+    // The session was resumed: nothing was recorded for the reconnect.
+    assert_eq!(verbs_of(&server, "#a", "~sam").await, ["JOIN"]);
+    assert_eq!(verbs_of(&server, "#b", "~sam").await, ["JOIN", "PART"]);
+    // No Left notice for #a.
     let mut notices = Vec::new();
     while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(50), events.next()).await {
         if let AccountEvent::Notice { notice } = e {
@@ -355,6 +373,131 @@ async fn a_room_dropped_and_created_again_is_not_mixed() {
         ),
         "{entry:?}"
     );
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// A connection cut while messages come and go: the guest resumes its
+/// session, nothing is recorded for the cut, and the cache ends up with
+/// exactly the server's events (4.2, 7.1).
+#[tokio::test]
+async fn a_cut_connection_resumes_without_losing_or_repeating_anything() {
+    let server = TestServer::builder().room("#a").start().await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (client, addr) = trusting_client(&server, proxy.addr(), 5);
+    let mut ann = guest_in(&server, "ann", "#a").await;
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    let events = sam.subscribe();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+    let a = sam.conversation("#a").unwrap();
+
+    for round in 0..3 {
+        let sent = a.send(&format!("sam {round} before")).await.unwrap();
+        within("sent", sam.wait_outbox(sent.id)).await.unwrap();
+        proxy.cut();
+        // While sam is away.
+        for i in 0..7 {
+            post(&mut ann, "#a", &format!("ann {round}.{i}")).await;
+        }
+        reconnected(&events).await;
+        let sent = a.send(&format!("sam {round} after")).await.unwrap();
+        let sent = within("sent", sam.wait_outbox(sent.id)).await.unwrap();
+        assert!(matches!(sent.status, OutboxStatus::Sent { .. }), "{sent:?}");
+    }
+    within("sync", sam.wait_synced()).await.unwrap();
+    within("the cache matching the server", async {
+        while a.export().unwrap() != server_history(&server, "#a").await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let mut verbs = verbs_of(&server, "#a", "~sam").await;
+    verbs.dedup();
+    assert_eq!(verbs, ["JOIN", "MSG"]);
+    assert_eq!(verbs_of(&server, "#a", "~sam").await.len(), 1 + 6);
+    // Own messages are not unread; ann's 21 are.
+    assert_eq!(a.info().unwrap().unwrap().unread, 21);
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// A later run of the app, on the same cache, resumes the session too: it
+/// keeps the token in the cache.
+#[tokio::test]
+async fn a_new_run_of_the_app_resumes_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let server = TestServer::builder().room("#a").start().await;
+    let addr = addr_of(server.addr());
+    for run in 0..3 {
+        let client = Client::open(&path, options(50)).unwrap();
+        client
+            .accept_fingerprint(&addr, &server.fingerprint().to_string())
+            .unwrap();
+        let sam = match client.accounts().unwrap().pop() {
+            Some(sam) => sam,
+            None => client.add_guest(&addr, "sam").unwrap(),
+        };
+        assert_eq!(within("connect", sam.connect()).await.unwrap(), "~sam");
+        if run == 0 {
+            sam.join("#a").await.unwrap();
+        }
+        within("sync", sam.wait_synced()).await.unwrap();
+        let a = sam.conversation("#a").unwrap();
+        assert!(a.info().unwrap().unwrap().joined);
+        let sent = a.send(&format!("run {run}")).await.unwrap();
+        within("sent", sam.wait_outbox(sent.id)).await.unwrap();
+        // Disconnecting sends QUIT; the session waits to be resumed.
+        client.shutdown().await;
+    }
+    assert_eq!(
+        verbs_of(&server, "#a", "~sam").await,
+        ["JOIN", "MSG", "MSG", "MSG"]
+    );
+    server.stop().await;
+}
+
+/// Once the session has ended and someone else has the name, the guest
+/// signs in under a numbered name, joins its rooms again, and its own
+/// messages under that name are still not unread.
+#[tokio::test]
+async fn after_its_session_ends_a_guest_takes_a_numbered_name() {
+    let server = TestServer::builder()
+        .room("#a")
+        .guest_resume(Duration::from_millis(100))
+        .start()
+        .await;
+    let (client, addr) = trusting_client(&server, server.addr(), 50);
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+    sam.disconnect().await;
+    within("the session ending", async {
+        while verbs_of(&server, "#a", "~sam").await != ["JOIN", "PART"] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    // Someone else takes the name.
+    let mut other = guest_in(&server, "sam", "#a").await;
+    post(&mut other, "#a", "I am the new sam").await;
+    post(&mut other, "#a", "really").await;
+
+    assert_eq!(within("connect", sam.connect()).await.unwrap(), "~sam2");
+    within("sync", sam.wait_synced()).await.unwrap();
+    let a = sam.conversation("#a").unwrap();
+    assert!(a.info().unwrap().unwrap().joined);
+    assert_eq!(verbs_of(&server, "#a", "~sam2").await, ["JOIN"]);
+    let sent = a.send("I am sam, now sam2").await.unwrap();
+    within("sent", sam.wait_outbox(sent.id)).await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+    // The account is still ~sam, but its own messages are ~sam2's: only
+    // the other sam's two are unread.
+    assert_eq!(sam.uid(), "~sam");
+    assert_eq!(a.info().unwrap().unwrap().unread, 2);
     client.shutdown().await;
     server.stop().await;
 }

@@ -11,7 +11,8 @@ use super::server::{Peer, ScriptServer, ServerCert, TestCa};
 use super::{chat_test, options, store};
 use crate::addr::{TrustRecord, TrustStore};
 use crate::conn::{
-    Backoff, CloseReason, CommandError, Error, GuestSignIn, Supervisor, SupervisorEvent, TrustError,
+    Backoff, CloseReason, CommandError, Error, GuestSignIn, GuestToken, Supervisor,
+    SupervisorEvent, TrustError,
 };
 
 fn fast() -> Backoff {
@@ -23,7 +24,7 @@ fn fast() -> Backoff {
 }
 
 fn guest() -> Arc<GuestSignIn> {
-    Arc::new(GuestSignIn("sam".parse().unwrap()))
+    Arc::new(GuestSignIn::new("sam".parse().unwrap()))
 }
 
 async fn next(events: &mut mpsc::Receiver<SupervisorEvent>) -> SupervisorEvent {
@@ -132,7 +133,7 @@ async fn reconnects_and_signs_in_again() {
 
 #[test]
 fn guest_names_are_numbered_to_fit() {
-    let g = |s: &str| GuestSignIn(s.parse().unwrap());
+    let g = |s: &str| GuestSignIn::new(s.parse().unwrap());
     assert_eq!(g("sam").numbered(1).as_str(), "sam");
     assert_eq!(g("sam").numbered(2).as_str(), "sam2");
     assert_eq!(g("sam").numbered(9).as_str(), "sam9");
@@ -222,6 +223,60 @@ async fn guest_name_taken_tries_numbered_names() {
         panic!()
     };
     assert_eq!(err.code, ErrorCode::NameTaken);
+    supervisor.stop().await;
+    server.done().await;
+}
+
+#[tokio::test]
+async fn guests_resume_their_session_with_its_token() {
+    let cert = ServerCert::self_signed("chat.test");
+    let trust = pinned(&cert).await;
+    let server = ScriptServer::start(cert, 3, |i, mut peer: Peer| async move {
+        peer.greet().await;
+        match i {
+            // No session yet.
+            0 => {
+                peer.expect("@ref=1 GUEST sam").await;
+                peer.send("@ref=1 OK uid=~sam token=t1").await;
+            }
+            // Resumed: the token changes.
+            1 => {
+                peer.expect("@ref=1 GUEST sam token=t1").await;
+                peer.send("@ref=1 OK uid=~sam token=t2").await;
+            }
+            // The session ended and someone else took ~sam: numbered
+            // names, without a token, and not ~sam again.
+            _ => {
+                peer.expect("@ref=1 GUEST sam token=t2").await;
+                peer.send("@ref=1 ERR name-taken").await;
+                peer.expect("@ref=2 GUEST sam2").await;
+                peer.send("@ref=2 OK uid=~sam2 token=t3").await;
+            }
+        }
+        peer.close().await;
+    })
+    .await;
+    let ca = TestCa::new();
+    let token = Arc::new(GuestToken::default());
+    let sign_in = Arc::new(GuestSignIn::resuming("sam".parse().unwrap(), token.clone()));
+    let (supervisor, mut events) =
+        Supervisor::spawn(chat_test(), trust, options(&ca, &server), sign_in, fast());
+    let session = |name: &str, t: &str| Some((name.parse().unwrap(), t.parse().unwrap()));
+    for (uid, saved) in [
+        ("~sam", session("sam", "t1")),
+        ("~sam", session("sam", "t2")),
+        ("~sam2", session("sam2", "t3")),
+    ] {
+        loop {
+            if let SupervisorEvent::SignedIn { uid: got, .. } = next(&mut events).await {
+                assert_eq!(got.as_str(), uid);
+                break;
+            }
+        }
+        assert_eq!(token.get(), saved);
+    }
+    // The token is a secret.
+    assert!(!format!("{token:?}").contains("t3"), "{token:?}");
     supervisor.stop().await;
     server.done().await;
 }

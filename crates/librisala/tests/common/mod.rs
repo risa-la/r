@@ -101,9 +101,13 @@ pub async fn post(c: &mut TestClient, room: &str, text: &str) -> u64 {
 }
 
 /// Every event the server keeps for `room`, in canonical form, read
-/// with HISTORY by a guest that does not join.
+/// with HISTORY by a guest that does not join. Each call signs in under a
+/// new name, since a guest's name stays taken for a while after it leaves
+/// (4.2).
 pub async fn server_history(server: &TestServer, room: &str) -> Vec<String> {
-    let mut c = server.guest("checker").await;
+    static CHECKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = CHECKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut c = server.guest(&format!("checker{n}")).await;
     let mut out = Vec::new();
     let mut after = 0;
     loop {

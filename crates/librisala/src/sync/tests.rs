@@ -814,7 +814,8 @@ fn no_resending_into_a_new_room() {
 
 #[test]
 fn guests_do_not_resend() {
-    // 7.6: a guest's cids count only within one connection.
+    // 7.6: a guest's cids count only within one session, and a client cannot
+    // tell whether its session was resumed.
     let mut h = H::new("~sam");
     h.joined("k1", 3);
     let (queued, out) = h

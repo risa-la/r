@@ -11,7 +11,7 @@ use risala_proto::auth::SecretKey;
 use risala_proto::command::{Command, Request};
 use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, MAX_SERVER_LINE, check_line_len};
 use risala_proto::line::read_ref;
-use risala_proto::names::{Identity, Name, Uid};
+use risala_proto::names::{Id, Identity, Name, Uid};
 use risala_proto::server::{
     ErrResponse, Greeting, OkResponse, Register, ServerLine, ServerMessage,
 };
@@ -449,15 +449,28 @@ impl Session {
         Ok(response.into_result()?.1)
     }
 
-    /// Signs in as the guest `~<name>` (4.2).
+    /// Signs in as the guest `~<name>` (4.2), starting a new session.
     pub async fn guest(&self, name: &Name) -> Result<Uid, Error> {
+        Ok(self.guest_session(name, None).await?.0)
+    }
+
+    /// Signs in as the guest `~<name>` (4.2). With `token`, the server
+    /// resumes that guest's session if the token is its current one, and
+    /// otherwise ignores it. Returns the uid and the session's new token,
+    /// which the next resume needs. The token is a secret.
+    pub async fn guest_session(
+        &self,
+        name: &Name,
+        token: Option<&Id>,
+    ) -> Result<(Uid, Option<Id>), Error> {
         let ok = self
             .request_ok(Command::Guest {
                 name: name.clone(),
-                token: None,
+                token: token.cloned(),
             })
             .await?;
-        Ok(signed_in_uid(&ok, Uid::guest(name)))
+        let token = ok.token().ok().flatten();
+        Ok((signed_in_uid(&ok, Uid::guest(name)), token))
     }
 
     /// Signs in as `identity` with a device key listed in its key file
