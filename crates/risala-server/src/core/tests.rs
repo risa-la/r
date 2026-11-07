@@ -1258,7 +1258,9 @@ async fn a_resent_message_gets_its_seq_before_any_other_check() {
         sam.lines();
         let room: Room = "#general".parse().unwrap();
         let entry = h.hub.inner.room_entry(&room).unwrap();
-        entry.state.lock().await.settings.apply(&change);
+        let mut st = entry.lock().await;
+        st.room_info_mut().unwrap().settings.apply(&change);
+        drop(st);
 
         h.send(&sam, &format!("@ref=1;{cid} msg #general hi")).await;
         assert_eq!(sam.lines(), ["@ref=1 OK seq=2"], "{change:?}");
@@ -1711,6 +1713,56 @@ async fn a_slow_reader_is_dropped_alone() {
     );
 }
 
+/// A command that waited for a room's lock while the room was dropped
+/// (10.4) finds it gone: `not-found`, not `internal`. ADMIN DROP is M4, so
+/// the test drops the room by hand, as DROP will: under its lock, it marks
+/// it dropped, removes its members and takes it out of the index.
+#[tokio::test]
+async fn a_command_waiting_on_a_dropped_room_gets_not_found() {
+    let mut h = Harness::new();
+    let (mut sam, _) = h.joined("sam", "#general").await;
+    let room: Room = "#general".parse().unwrap();
+    let entry = h.hub.inner.room_entry(&room).unwrap();
+    let mut st = entry.clone().lock_owned().await;
+
+    let mut waiting = Vec::new();
+    for cmd in [
+        "@ref=1 msg #general hi",
+        "@ref=2 info #general",
+        "@ref=3 part #general",
+    ] {
+        let hub = h.hub.clone();
+        let id = sam.id;
+        let req = cmd.parse().unwrap();
+        waiting.push(tokio::spawn(async move { hub.command(id, req).await }));
+        // Each command waits for the gate of the one before, then the lock.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+    st.dropped = true;
+    let uids: Vec<Uid> = st.members.keys().cloned().collect();
+    for uid in uids {
+        st.remove_member(&uid);
+    }
+    h.hub.inner.rooms.write().unwrap().remove(&room);
+    drop(st);
+    for task in waiting {
+        task.await.unwrap();
+    }
+    assert_eq!(
+        sam.lines(),
+        [
+            "@ref=1 ERR not-found no such room",
+            "@ref=2 ERR not-found no such room",
+            "@ref=3 ERR not-found no such room",
+        ]
+    );
+    // The guest is in no room any more.
+    h.send(&sam, "@ref=4 sync").await;
+    assert_eq!(sam.lines(), ["@ref=4 OK"]);
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 
@@ -1768,7 +1820,8 @@ async fn guests_cut_off_by_a_crash_part_at_the_next_start() {
         );
     }
     // Nobody is in the room, and the next start records nothing more.
-    assert_eq!(h.hub.inner.reg().member_count(&room), 0);
+    let entry = h.hub.inner.room_entry(&room).unwrap();
+    assert_eq!(entry.lock().await.member_count(), 0);
     drop(h);
     let h = open(&path);
     assert_eq!(h.store.history(key, all).unwrap().events.len(), 6);

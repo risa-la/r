@@ -20,16 +20,23 @@
 //! clean shutdown ends them all, and the PARTs of any a crash cut off are
 //! recorded at the next start.
 //!
-//! # Ordering
+//! # Conversations and ordering
 //!
-//! Each room has an async lock. Appending an event to a room happens under
-//! it: the seq is assigned and the event stored in one store transaction,
-//! and then, still under the lock, the event is queued for every
-//! connection of every member. So every connection receives a room's
-//! events in seq order (5.2), and an event is sent only once it is stored,
-//! so seqs never have gaps (5.2, PLAN.md 3.2). A command queues its own
-//! final response after the events it caused, so its sender gets them
-//! first (3.6).
+//! Every conversation, a room now and a direct conversation from M5a, has
+//! an entry with an async lock ([`state::ConvEntry`]). Its members are kept
+//! there, by conversation id (5.1), so a room that is dropped and created
+//! again starts with nobody in it. Appending an event happens under the
+//! lock: the seq is assigned and the event stored in one store
+//! transaction, and then, still under the lock, the event is queued for
+//! every connection of every member. So every connection receives a
+//! conversation's events in seq order (5.2), and an event is sent only
+//! once it is stored, so seqs never have gaps (5.2, PLAN.md 3.2). A
+//! command queues its own final response after the events it caused, so
+//! its sender gets them first (3.6).
+//!
+//! Fan-out does not take the registry's lock: each member's entry
+//! ([`state::UserEntry`]) holds its connections. See [`state`] for the
+//! order the locks are taken in.
 //!
 //! Each command runs in its own task, holding its connection's gate. The
 //! clean-up after a connection closes takes the gate too, so it waits for
@@ -56,7 +63,7 @@ use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 
 use risala_proto::names::{Id, Uid};
 
-use state::{ConnEntry, GuestSession, Registry, RoomEntry};
+use state::{ConnEntry, ConvEntry, ConvState, GuestSession, Registry};
 
 /// The number of random bytes in a greeting's nonce (4.1).
 pub const NONCE_BYTES: usize = 32;
@@ -167,7 +174,10 @@ pub(crate) struct Inner {
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
     settings: RwLock<ServerSettings>,
-    rooms: RwLock<BTreeMap<Room, Arc<RoomEntry>>>,
+    /// Every room, by name. A room is added at run time only while
+    /// `create_lock` is held, so two JOINs cannot both create it.
+    rooms: RwLock<BTreeMap<Room, Arc<ConvEntry>>>,
+    create_lock: tokio::sync::Mutex<()>,
     reg: Mutex<Registry>,
     sign_in_timeout: Duration,
     guest_resume: Duration,
@@ -278,11 +288,18 @@ impl Hub {
 
         let mut reg = Registry::default();
         let mut rooms = BTreeMap::new();
-        for record in store.rooms()? {
-            for uid in &record.members {
-                reg.add_member(&record.room, uid);
+        for mut record in store.rooms()? {
+            let members = std::mem::take(&mut record.members);
+            let room = record.room.clone();
+            let entry = Arc::new(ConvEntry::new(ConvState::room(record)));
+            {
+                let mut st = entry.try_lock().expect("a new room is not locked");
+                for uid in &members {
+                    let user = reg.user(uid);
+                    st.add_member(&entry, &user);
+                }
             }
-            rooms.insert(record.room.clone(), Arc::new(RoomEntry::new(record)));
+            rooms.insert(room, entry);
         }
         tracing::info!(rooms = rooms.len(), "hub started");
 
@@ -293,6 +310,7 @@ impl Hub {
                 clock,
                 settings: RwLock::new(settings),
                 rooms: RwLock::new(rooms),
+                create_lock: tokio::sync::Mutex::new(()),
                 reg: Mutex::new(reg),
                 sign_in_timeout: timers.sign_in,
                 guest_resume: timers.guest_resume,
@@ -460,7 +478,7 @@ impl Inner {
             .clone()
     }
 
-    fn room_entry(&self, room: &Room) -> Option<Arc<RoomEntry>> {
+    fn room_entry(&self, room: &Room) -> Option<Arc<ConvEntry>> {
         self.rooms
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -529,8 +547,7 @@ impl Inner {
             ConnEntry {
                 handle,
                 info,
-                host: host.to_string(),
-                nonce,
+                nonce: Some(nonce),
                 uid: None,
                 detached: false,
                 gate: Arc::default(),
@@ -558,7 +575,7 @@ impl Inner {
         };
         let _gate = gate.lock().await;
         let mut reg = self.reg();
-        let Some(conn) = reg.conns.remove(&id) else {
+        let Some(conn) = reg.remove_conn(id) else {
             return;
         };
         if let Some(timer) = conn.sign_in_timer {
@@ -568,12 +585,6 @@ impl Inner {
         let Some(uid) = conn.uid else {
             return;
         };
-        if let Some(conns) = reg.users.get_mut(&uid) {
-            conns.retain(|c| *c != id);
-            if conns.is_empty() {
-                reg.users.remove(&uid);
-            }
-        }
         if let Some(session) = reg.sessions.get_mut(&uid)
             && session.conn == Some(id)
             && !session.ending
@@ -637,20 +648,23 @@ impl Inner {
         // a room after the first pass, but none can start after it, since
         // `may_join` is now false. So this ends.
         loop {
-            let rooms: Vec<Room> = self
+            let convs = self
                 .reg()
-                .rooms_of
+                .users
                 .get(uid)
-                .map(|r| r.iter().cloned().collect())
+                .map(|user| user.convs())
                 .unwrap_or_default();
-            if rooms.is_empty() {
+            if convs.is_empty() {
                 break;
             }
-            for room in rooms {
-                self.guest_part(&room, uid).await;
+            for conv in convs {
+                self.guest_part(conv, uid).await;
             }
         }
-        self.reg().sessions.remove(uid);
+        let mut reg = self.reg();
+        reg.sessions.remove(uid);
+        reg.release(uid);
+        drop(reg);
         tracing::debug!("guest session ended");
         true
     }
@@ -681,22 +695,16 @@ impl Inner {
             Some(_) => return Err(SignInRefused::NameTaken),
             None => None,
         };
-        if let Some(conn) = reg.conns.get_mut(&id) {
-            conn.uid = Some(uid.clone());
-            if let Some(timer) = conn.sign_in_timer.take() {
-                timer.abort();
-            }
-        }
         match resumed {
             Some(old) => {
                 if let Some(old) = old {
                     reg.detach(old, BYE_RESUMED);
                 }
-                reg.users.insert(uid.clone(), vec![id]);
+                reg.attach(id, uid, None);
                 Ok(SignIn::Resumed)
             }
             None => {
-                reg.users.insert(uid.clone(), vec![id]);
+                reg.attach(id, uid, None);
                 reg.sessions.insert(
                     uid.clone(),
                     GuestSession {

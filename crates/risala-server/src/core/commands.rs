@@ -15,7 +15,7 @@ use risala_proto::types::{
     Cid, DEFAULT_LIMIT, DEFAULT_LIST_LIMIT, FileUrl, InfoRole, Ref, Relation, Role,
 };
 
-use super::state::{Registry, RoomState};
+use super::state::{ConvEntry, ConvGuard, ConvState, RoomInfo};
 use super::{Inner, SignIn, SignInRefused, TOKEN_LEN};
 use crate::handler::{ConnHandle, ConnId, OutLine};
 use crate::store::{self, Appended, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent};
@@ -64,19 +64,24 @@ impl Reply {
 }
 
 /// The settings of a room as snapshot SET lines (5.2, 6.1, 6.2).
-fn send_settings(reply: &Reply, st: &RoomState) {
-    for setting in st.settings.to_settings() {
+fn send_settings(reply: &Reply, info: &RoomInfo) {
+    for setting in info.settings.to_settings() {
         reply.line(Event::snapshot(EventBody::Set {
-            room: st.room.clone(),
+            room: info.room.clone(),
             setting,
         }));
     }
 }
 
+/// The room part of a conversation found by room name.
+fn room_of(st: &ConvState) -> Result<&RoomInfo, Fail> {
+    st.room_info().ok_or_else(not_found)
+}
+
 /// Whether `uid` can know that the room exists: it is public, or `uid` is
 /// a member or holds a role in it. Guests cannot be invited or hold roles
 /// (4.2). M3: invitations and operators.
-fn visible(st: &RoomState, uid: &Uid, member: bool) -> bool {
+fn visible(st: &RoomInfo, uid: &Uid, member: bool) -> bool {
     member || st.settings.public || (!uid.is_guest() && st.roles.contains_key(uid))
 }
 
@@ -84,7 +89,7 @@ fn visible(st: &RoomState, uid: &Uid, member: bool) -> bool {
 /// join it when `member` is false (6.1). A room it cannot see gets
 /// `ERR not-found`, so private rooms stay hidden. A room it can see but
 /// may not enter gets `ERR forbidden` (6.1). M3: room bans.
-fn check_access(st: &RoomState, uid: &Uid, member: bool) -> Result<(), Fail> {
+fn check_access(st: &RoomInfo, uid: &Uid, member: bool) -> Result<(), Fail> {
     if !visible(st, uid, member) {
         return Err(not_found());
     }
@@ -95,7 +100,7 @@ fn check_access(st: &RoomState, uid: &Uid, member: bool) -> Result<(), Fail> {
 }
 
 /// What INFO reports as `role` (6.2, 6.3).
-fn info_role(st: &RoomState, uid: &Uid, member: bool) -> InfoRole {
+fn info_role(st: &RoomInfo, uid: &Uid, member: bool) -> InfoRole {
     match st.roles.get(uid) {
         Some(role) => InfoRole(Some(*role)),
         None if member => InfoRole(Some(Role::Member)),
@@ -250,14 +255,11 @@ impl Inner {
 
     /// INFO <room> (6.2).
     async fn info_room(&self, uid: &Uid, reply: &Reply, room: &Room) -> Outcome {
-        let entry = self.room_entry(room).ok_or_else(not_found)?;
-        let st = entry.state.lock().await;
-        let (member, members) = {
-            let reg = self.reg();
-            (reg.is_member(room, uid), reg.member_count(room))
-        };
-        check_access(&st, uid, member)?;
-        send_settings(reply, &st);
+        let st = self.lock_room(room).await?;
+        let info = room_of(&st)?;
+        let (member, members) = (st.is_member(uid), st.member_count());
+        check_access(info, uid, member)?;
+        send_settings(reply, info);
         // A room from the configuration has no events until someone joins,
         // and then reports `head=0` (6.2).
         let head = st.head.map_or(0, u64::from);
@@ -269,7 +271,7 @@ impl Inner {
         // gets before it are covered by it, and those after it are newer
         // (3.6).
         reply.line(
-            ok.with_role(info_role(&st, uid, member))
+            ok.with_role(info_role(info, uid, member))
                 .with_joined(member),
         );
         Ok(None)
@@ -292,19 +294,21 @@ impl Inner {
         let mut lines = Vec::new();
         let mut more = false;
         for entry in entries {
-            let st = entry.state.lock().await;
-            if !st.settings.public || (uid.is_guest() && !st.settings.guests.allows_read()) {
+            let st = entry.lock().await;
+            let Some(info) = st.room_info().filter(|_| !st.dropped) else {
+                continue;
+            };
+            if !info.settings.public || (uid.is_guest() && !info.settings.guests.allows_read()) {
                 continue;
             }
             if lines.len() as u64 == limit {
                 more = true;
                 break;
             }
-            let members = self.reg().member_count(&st.room);
             lines.push(ServerLine::Room {
-                room: st.room.clone(),
-                members,
-                topic: st.settings.topic.clone(),
+                room: info.room.clone(),
+                members: st.member_count(),
+                topic: info.settings.topic.clone(),
             });
         }
         for line in lines {
@@ -317,7 +321,7 @@ impl Inner {
     /// its seq as the head. Nothing is sent.
     async fn append(
         &self,
-        st: &mut RoomState,
+        st: &mut ConvState,
         event: NewEvent,
     ) -> Result<(Appended, StoredEvent), StoreError> {
         let key = st.key;
@@ -341,30 +345,45 @@ impl Inner {
         ))
     }
 
-    /// Queues a room's event for every connection of every member (5.2).
-    /// The event is already stored, so an event that cannot be shown is
-    /// only logged.
-    fn broadcast_event(reg: &Registry, st: &RoomState, event: &StoredEvent) {
-        match event.to_event(st.room.clone(), &st.id) {
-            Ok(line) => reg.broadcast(&st.room, &OutLine::new(ServerMessage::new(line))),
-            Err(e) => tracing::error!(room = %st.room, "cannot send an event: {e}"),
+    /// Queues a conversation's event for every connection of every member
+    /// (5.2). The event is already stored, so an event that cannot be
+    /// shown is only logged.
+    ///
+    /// M5a: a direct conversation's lines name the other participant, so
+    /// they are written once per receiver (5.2).
+    pub(super) fn broadcast_event(st: &ConvState, event: &StoredEvent) {
+        let Some(info) = st.room_info() else {
+            return;
+        };
+        match event.to_event(info.room.clone(), &st.id) {
+            Ok(line) => st.broadcast(&OutLine::new(ServerMessage::new(line))),
+            Err(e) => tracing::error!(room = %info.room, "cannot send an event: {e}"),
         }
+    }
+
+    /// Locks a room. A room that does not exist, or that was dropped while
+    /// this waited for its lock, is `ERR not-found` (6.1, 10.4).
+    async fn lock_room(&self, room: &Room) -> Result<ConvGuard, Fail> {
+        let entry = self.room_entry(room).ok_or_else(not_found)?;
+        let st = entry.lock_owned().await;
+        if st.dropped {
+            return Err(not_found());
+        }
+        Ok(st)
     }
 
     /// JOIN (6.1).
     async fn join(&self, uid: &Uid, reply: &Reply, room: &Room) -> Outcome {
         // M3: identities may create rooms that do not exist.
-        let entry = self.room_entry(room).ok_or_else(not_found)?;
-        let mut st = entry.state.lock().await;
-        let (member, may_join) = {
-            let reg = self.reg();
-            (reg.is_member(room, uid), reg.may_join(uid))
-        };
+        let mut guard = self.lock_room(room).await?;
+        let entry = ConvGuard::mutex(&guard).clone();
+        let st = &mut *guard;
+        let member = st.is_member(uid);
         if !member {
-            check_access(&st, uid, false)?;
+            check_access(room_of(st)?, uid, false)?;
             // A guest whose session is ending, on a connection that has
             // already been told BYE (4.2).
-            if !may_join {
+            if !self.reg().may_join(uid) {
                 return Err(fail(ErrorCode::Forbidden, "the session has ended"));
             }
             let event = NewEvent {
@@ -373,12 +392,12 @@ impl Inner {
                 kind: EventKind::Join,
                 cid: None,
             };
-            let (_, event) = self.append(&mut st, event).await?;
-            let mut reg = self.reg();
-            reg.add_member(room, uid);
-            Self::broadcast_event(&reg, &st, &event);
+            let (_, event) = self.append(st, event).await?;
+            let user = self.reg().user(uid);
+            st.add_member(&entry, &user);
+            Self::broadcast_event(st, &event);
         }
-        send_settings(reply, &st);
+        send_settings(reply, room_of(st)?);
         // A member has joined, so there is an event.
         let head = st.head.map_or(0, u64::from);
         // Queued under the room lock, so no later event of the room can
@@ -389,9 +408,8 @@ impl Inner {
 
     /// PART (6.1).
     async fn part(&self, uid: &Uid, room: &Room, reason: String) -> Outcome {
-        let entry = self.room_entry(room).ok_or_else(not_found)?;
-        let mut st = entry.state.lock().await;
-        if !self.reg().is_member(room, uid) {
+        let mut st = self.lock_room(room).await?;
+        if !st.is_member(uid) {
             return Err(fail(ErrorCode::NotFound, "not a member"));
         }
         let event = NewEvent {
@@ -401,19 +419,25 @@ impl Inner {
             cid: None,
         };
         let (_, event) = self.append(&mut st, event).await?;
-        let mut reg = self.reg();
-        Self::broadcast_event(&reg, &st, &event);
-        reg.remove_member(room, uid);
+        Self::broadcast_event(&st, &event);
+        st.remove_member(uid);
         Ok(Some(OkResponse::new()))
     }
 
-    /// A guest's automatic PART when its session ends (4.2).
-    pub(super) async fn guest_part(&self, room: &Room, uid: &Uid) {
-        let Some(entry) = self.room_entry(room) else {
-            self.reg().remove_member(room, uid);
+    /// A guest's automatic PART when its session ends (4.2): in `conv`, if
+    /// it is still a member there.
+    pub(super) async fn guest_part(&self, conv: Arc<ConvEntry>, uid: &Uid) {
+        let mut st = conv.lock_owned().await;
+        if st.dropped || !st.is_member(uid) {
+            // Not a member here any more: just make sure the user's list
+            // agrees, so that the caller's loop ends.
+            if st.remove_member(uid).is_none()
+                && let Some(user) = self.reg().users.get(uid).cloned()
+            {
+                user.lock().convs.remove(&st.conv_ref(uid));
+            }
             return;
-        };
-        let mut st = entry.state.lock().await;
+        }
         let event = NewEvent {
             t: self.now(),
             from: uid.clone(),
@@ -422,14 +446,12 @@ impl Inner {
             },
             cid: None,
         };
-        let result = self.append(&mut st, event).await;
-        let mut reg = self.reg();
-        match result {
-            Ok((_, event)) => Self::broadcast_event(&reg, &st, &event),
+        match self.append(&mut st, event).await {
+            Ok((_, event)) => Self::broadcast_event(&st, &event),
             // The guest is gone either way. No seq was used.
-            Err(e) => tracing::error!(%room, "storing a guest's PART failed: {e}"),
+            Err(e) => tracing::error!(conv = %st.id, "storing a guest's PART failed: {e}"),
         }
-        reg.remove_member(room, uid);
+        st.remove_member(uid);
     }
 
     /// MSG (5.3), in rooms.
@@ -449,8 +471,8 @@ impl Inner {
         if file.is_some() || matches!(relation, Some(Relation::Edit(_) | Relation::React(_))) {
             return Err(not_supported());
         }
-        let entry = self.room_entry(&room).ok_or_else(not_found)?;
-        let mut st = entry.state.lock().await;
+        let mut guard = self.lock_room(&room).await?;
+        let st = &mut *guard;
 
         // A message that was already sent gets its seq again (7.6), before
         // any other check: the sender may have left since, or the room may
@@ -471,16 +493,17 @@ impl Inner {
             }
         }
 
-        let member = self.reg().is_member(&room, uid);
-        check_access(&st, uid, member)?;
+        let member = st.is_member(uid);
+        let info = room_of(st)?;
+        check_access(info, uid, member)?;
         if !member {
             return Err(fail(ErrorCode::Forbidden, "join the room first"));
         }
-        if uid.is_guest() && !st.settings.guests.allows_write() {
+        if uid.is_guest() && !info.settings.guests.allows_write() {
             return Err(fail(ErrorCode::Forbidden, "guests may not send here"));
         }
         if let Some(Relation::Reply(target)) = relation {
-            self.check_target(&st, target).await?;
+            self.check_target(st, target).await?;
         }
 
         let event = NewEvent {
@@ -494,14 +517,13 @@ impl Inner {
             // Guests' cids are kept per session (7.6).
             cid: cid.clone().filter(|_| uid.is_identity()),
         };
-        let (appended, event) = self.append(&mut st, event).await?;
-        let mut reg = self.reg();
+        let (appended, event) = self.append(st, event).await?;
         match appended {
             Appended::New(seq) => {
-                Self::broadcast_event(&reg, &st, &event);
+                Self::broadcast_event(st, &event);
                 if let Some(cid) = cid
                     && uid.is_guest()
-                    && let Some(session) = reg.sessions.get_mut(uid)
+                    && let Some(session) = self.reg().sessions.get_mut(uid)
                 {
                     session.cids.insert(st.id.clone(), cid, seq, now);
                 }
@@ -515,7 +537,7 @@ impl Inner {
 
     /// Checks the target of `reply`, `edit` or `react` (5.3): a message in
     /// the same conversation, not deleted, and not an edit or a reaction.
-    async fn check_target(&self, st: &RoomState, target: Seq) -> Result<(), Fail> {
+    async fn check_target(&self, st: &ConvState, target: Seq) -> Result<(), Fail> {
         let key = st.key;
         let event = self.db(move |s| s.event(key, target)).await?;
         match event {
@@ -534,32 +556,29 @@ impl Inner {
     /// until the connection's queue has that room again. Each CONV line is
     /// still queued under its room's lock (3.6).
     async fn sync(&self, uid: &Uid, reply: &Reply) -> Outcome {
-        let rooms: Vec<Room> = self
+        let convs = self
             .reg()
-            .rooms_of
+            .users
             .get(uid)
-            .map(|r| r.iter().cloned().collect())
+            .map(|user| user.convs())
             .unwrap_or_default();
         // The network layer left room for this many lines and the OK.
         let chunk = self.config.limits.reply_lines().saturating_sub(1).max(1);
-        for (n, room) in rooms.into_iter().enumerate() {
+        for (n, conv) in convs.into_iter().enumerate() {
             if n > 0 && n % chunk == 0 && !self.wait_for_reply_room(&reply.handle).await {
                 // The connection is gone, so nobody reads the rest.
                 return Ok(None);
             }
-            let Some(entry) = self.room_entry(&room) else {
-                continue;
-            };
-            let st = entry.state.lock().await;
-            // Checked again under the room lock: a PART queued before this
-            // line means the room is no longer ours (3.6).
-            if !self.reg().is_member(&room, uid) {
+            let st = conv.lock().await;
+            // Checked again under the lock: a PART queued before this line
+            // means the conversation is no longer ours (3.6).
+            if st.dropped || !st.is_member(uid) {
                 continue;
             }
-            // A member has joined, so the room has an event.
+            // A member has joined, so the conversation has an event.
             if let Some(head) = st.head {
                 reply.line(ServerLine::Conv {
-                    conv: Conv::Room(room),
+                    conv: st.name_for(uid),
                     id: st.id.clone(),
                     head,
                     // M3: read markers for identities. Always 0 for guests.
@@ -609,11 +628,9 @@ impl Inner {
             // M3: direct conversations.
             Conv::Uid(_) => return Err(not_supported()),
         };
-        let entry = self.room_entry(&room).ok_or_else(not_found)?;
         let (key, id) = {
-            let st = entry.state.lock().await;
-            let member = self.reg().is_member(&room, uid);
-            check_access(&st, uid, member)?;
+            let st = self.lock_room(&room).await?;
+            check_access(room_of(&st)?, uid, st.is_member(uid))?;
             (st.key, st.id.clone())
         };
         let query = HistoryQuery {

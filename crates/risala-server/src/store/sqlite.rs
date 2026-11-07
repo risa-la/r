@@ -236,6 +236,20 @@ impl RoomRow {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let uids = |sql: &str, what: &str| -> Result<Vec<Uid>> {
+            conn.prepare_cached(sql)?
+                .query_map([self.conv], |row| row.get::<_, String>(0))?
+                .map(|uid| parse::<Uid>(what, &uid?))
+                .collect()
+        };
+        let invites = uids(
+            "SELECT uid FROM invites WHERE conv = ? ORDER BY uid",
+            "invitee",
+        )?;
+        let bans = uids(
+            "SELECT uid FROM room_bans WHERE conv = ? ORDER BY uid",
+            "banned uid",
+        )?;
         Ok(RoomRecord {
             key,
             room: parse("room", &self.room)?,
@@ -250,6 +264,8 @@ impl RoomRow {
             },
             members,
             roles,
+            invites,
+            bans,
         })
     }
 }

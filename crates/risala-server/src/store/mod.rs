@@ -186,6 +186,10 @@ pub struct RoomRecord {
     pub members: Vec<Uid>,
     /// The holders of `owner` and `mod`, members or not (6.3).
     pub roles: Vec<(Uid, Role)>,
+    /// The identities with an open invitation (6.4), in order.
+    pub invites: Vec<Uid>,
+    /// The identities banned from the room (6.4), in order.
+    pub bans: Vec<Uid>,
 }
 
 /// What an event says, apart from its conversation, seq, time and author.
