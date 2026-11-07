@@ -6,9 +6,11 @@
 
 mod error;
 pub mod keys;
+mod session;
 mod tls;
 
 pub use error::{CloseReason, CommandError, Error, TrustError};
+pub use session::{End, Response, Session, SessionInfo, SessionOptions};
 pub use tls::{
     CaVerifier, TrustVerifier, Verified, accept_fingerprint, certificate_fingerprint,
     crypto_provider, platform_ca_verifier, roots_ca_verifier,
