@@ -57,8 +57,8 @@ pub enum TimelineDiff {
 pub struct Timeline {
     conv: Conversation,
     state: Arc<Mutex<State>>,
-    rx: tokio::sync::Mutex<broadcast::Receiver<Arc<Batch>>>,
-    notify: Notify,
+    rx: Arc<tokio::sync::Mutex<broadcast::Receiver<Arc<Batch>>>>,
+    notify: Arc<Notify>,
 }
 
 impl std::fmt::Debug for Timeline {
@@ -101,8 +101,8 @@ impl Timeline {
         Ok(Timeline {
             conv,
             state: Arc::new(Mutex::new(state)),
-            rx: tokio::sync::Mutex::new(rx),
-            notify: Notify::new(),
+            rx: Arc::new(tokio::sync::Mutex::new(rx)),
+            notify: Arc::new(Notify::new()),
         })
     }
 
@@ -118,38 +118,53 @@ impl Timeline {
 
     /// The next changes, in order. Waits until there are some. `None` once
     /// the account has been removed.
+    ///
+    /// It is cancel-safe: if the future is dropped, as in a
+    /// `tokio::select!` loop, no change is lost; the next call returns it.
     pub async fn next(&self) -> Option<Vec<TimelineDiff>> {
         loop {
-            if let Some(diffs) = self.state.lock().expect("poisoned").pending.pop_front() {
+            if let Some(diffs) = self.pop() {
                 return Some(diffs);
             }
-            let mut rx = self.rx.lock().await;
+            let mut rx = self.rx.clone().lock_owned().await;
+            // A call dropped while applying may have queued diffs.
+            if let Some(diffs) = self.pop() {
+                return Some(diffs);
+            }
             tokio::select! {
                 r = rx.recv() => {
-                    let state = self.state.clone();
-                    let diffs = match r {
+                    let reload = match r {
                         Ok(batch) if batch.changes.is_empty() => continue,
-                        Ok(batch) => blocking(move || {
-                            state.lock().expect("poisoned").apply(&batch.changes)
-                        })
-                        .await,
-                        Err(broadcast::error::RecvError::Lagged(_)) => blocking(move || {
-                            state.lock().expect("poisoned").reload()
-                        })
-                        .await,
+                        Ok(batch) => Some(batch),
+                        Err(broadcast::error::RecvError::Lagged(_)) => None,
                         Err(broadcast::error::RecvError::Closed) => return None,
                     };
-                    match diffs {
-                        Ok(diffs) if diffs.is_empty() => {}
-                        Ok(diffs) => return Some(diffs),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "timeline: reading the cache");
+                    // The receiver goes with the work, so nothing else is
+                    // applied before it, even if this call is dropped. The
+                    // diffs are queued in the same step.
+                    let state = self.state.clone();
+                    blocking(move || {
+                        let _rx = rx;
+                        let mut st = state.lock().expect("poisoned");
+                        let diffs = match &reload {
+                            Some(batch) => st.apply(&batch.changes),
+                            None => st.reload(),
+                        };
+                        match diffs {
+                            Ok(diffs) if diffs.is_empty() => {}
+                            Ok(diffs) => st.pending.push_back(diffs),
+                            Err(e) => tracing::warn!(error = %e, "timeline: reading the cache"),
                         }
-                    }
+                    })
+                    .await;
                 }
                 () = self.notify.notified() => {}
             }
         }
+    }
+
+    fn pop(&self) -> Option<Vec<TimelineDiff>> {
+        self.state.lock().expect("poisoned").pending.pop_front()
     }
 
     /// Widens the window by up to `count` older messages from the cache.
@@ -160,18 +175,17 @@ impl Timeline {
     /// `next` too, and returns `true`.
     pub async fn paginate_back(&self, count: u32) -> Result<bool, ClientError> {
         let state = self.state.clone();
-        let (diffs, exhausted) = blocking(move || -> Result<_, StoreError> {
-            state.lock().expect("poisoned").older(count.max(1))
+        let notify = self.notify.clone();
+        let exhausted = blocking(move || -> Result<bool, StoreError> {
+            let mut st = state.lock().expect("poisoned");
+            let (diffs, exhausted) = st.older(count.max(1))?;
+            if !diffs.is_empty() {
+                st.pending.push_back(diffs);
+                notify.notify_one();
+            }
+            Ok(exhausted)
         })
         .await?;
-        if !diffs.is_empty() {
-            self.state
-                .lock()
-                .expect("poisoned")
-                .pending
-                .push_back(diffs);
-            self.notify.notify_one();
-        }
         if exhausted {
             match self.conv.load_older().await {
                 Ok(()) | Err(ClientError::NotConnected) => {}

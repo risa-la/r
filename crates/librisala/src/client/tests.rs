@@ -245,3 +245,50 @@ async fn the_timeline_pages_back_through_the_cache() {
     assert!(timeline.paginate_back(4).await.unwrap());
     assert_eq!(seqs(&timeline), (1..=10).collect::<Vec<_>>());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_timeline_loses_nothing_when_next_is_dropped() {
+    // A UI selects over the timeline and other things; a dropped next()
+    // must not lose the batch it was applying. Regression: it did.
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    let timeline = general.timeline(1000).unwrap();
+    let mut items = timeline.items();
+    let apply = |items: &mut Vec<Message>, diffs: Vec<TimelineDiff>| {
+        for diff in diffs {
+            match diff {
+                TimelineDiff::Insert { index, item } => items.insert(index as usize, item),
+                TimelineDiff::Update { index, item } => items[index as usize] = item,
+                TimelineDiff::Remove { index } => {
+                    items.remove(index as usize);
+                }
+                TimelineDiff::Reset { items: all } => *items = all,
+            }
+        }
+    };
+    for n in 1..=300u64 {
+        store_events(
+            &sam,
+            "#general",
+            "k1",
+            &[event(n, &format!("from=~ann MSG #general m{n}"))],
+        );
+        // Start next() and drop it at once, sometimes mid-apply. What it
+        // did return counts.
+        if let Ok(Some(diffs)) = tokio::time::timeout(Duration::ZERO, timeline.next()).await {
+            apply(&mut items, diffs);
+        }
+        if n % 7 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    while items.len() < 300 {
+        let diffs = tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("every change arrives")
+            .unwrap();
+        apply(&mut items, diffs);
+    }
+    assert_eq!(items, timeline.items());
+    assert_eq!(items, general.messages(None, 1000).unwrap());
+}
