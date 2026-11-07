@@ -24,13 +24,13 @@ use crate::store::{
 
 /// The time on every event: the clock does not move unless a test moves
 /// it.
-const T: &str = "2026-11-06T15:40:58.120Z";
+pub(super) const T: &str = "2026-11-06T15:40:58.120Z";
 
-fn start() -> Timestamp {
+pub(super) fn start() -> Timestamp {
     T.parse().unwrap()
 }
 
-fn config() -> Config {
+pub(super) fn config() -> Config {
     let mut c = Config::parse(
         r##"
         hostname = "chat.example.org"
@@ -45,26 +45,26 @@ fn config() -> Config {
 }
 
 /// A hub with an in-memory store and a stopped clock.
-struct Harness {
-    hub: Hub,
-    store: Arc<dyn Store>,
-    clock: Arc<ManualClock>,
-    next: u64,
+pub(super) struct Harness {
+    pub(super) hub: Hub,
+    pub(super) store: Arc<dyn Store>,
+    pub(super) clock: Arc<ManualClock>,
+    pub(super) next: u64,
 }
 
 /// One connection's end of the queue.
-struct Client {
-    id: ConnId,
-    rx: ConnReceiver,
+pub(super) struct Client {
+    pub(super) id: ConnId,
+    pub(super) rx: ConnReceiver,
 }
 
 impl Harness {
-    fn new() -> Harness {
+    pub(super) fn new() -> Harness {
         Harness::with(config(), |_| {})
     }
 
     /// A hub on `config`, after `prepare` has had a go at the store.
-    fn with(config: Config, prepare: impl FnOnce(&SqliteStore)) -> Harness {
+    pub(super) fn with(config: Config, prepare: impl FnOnce(&SqliteStore)) -> Harness {
         let store = SqliteStore::open_in_memory().unwrap();
         for room in &config.rooms {
             store.ensure_room(&room.parse().unwrap(), start()).unwrap();
@@ -73,9 +73,16 @@ impl Harness {
         Harness::on(config, Arc::new(store), timers())
     }
 
-    fn on(config: Config, store: Arc<dyn Store>, timers: Timers) -> Harness {
+    pub(super) fn on(config: Config, store: Arc<dyn Store>, timers: Timers) -> Harness {
         let clock = Arc::new(ManualClock::new(start()));
-        let hub = Hub::build(config, store.clone(), clock.clone(), timers).unwrap();
+        let hub = Hub::build(
+            config,
+            store.clone(),
+            clock.clone(),
+            timers,
+            KeyServices::default(),
+        )
+        .unwrap();
         Harness {
             hub,
             store,
@@ -84,7 +91,7 @@ impl Harness {
         }
     }
 
-    fn connect_sni(&mut self, sni: Option<&str>, capacity: usize) -> Client {
+    pub(super) fn connect_sni(&mut self, sni: Option<&str>, capacity: usize) -> Client {
         self.next += 1;
         let id = ConnId(self.next);
         let (handle, rx) = conn_channel(id, capacity, usize::MAX);
@@ -100,7 +107,7 @@ impl Harness {
     }
 
     /// A new connection, with its greeting read.
-    fn connect(&mut self) -> Client {
+    pub(super) fn connect(&mut self) -> Client {
         let mut c = self.connect_sni(Some("chat.example.org"), 4096);
         let greeting = c.lines();
         assert_eq!(greeting.len(), 1);
@@ -109,12 +116,12 @@ impl Harness {
     }
 
     /// A new connection, signed in as `~name`.
-    async fn guest(&mut self, name: &str) -> Client {
+    pub(super) async fn guest(&mut self, name: &str) -> Client {
         self.guest_token(name).await.0
     }
 
     /// A new connection, signed in as `~name`, and its session's token.
-    async fn guest_token(&mut self, name: &str) -> (Client, String) {
+    pub(super) async fn guest_token(&mut self, name: &str) -> (Client, String) {
         let mut c = self.connect();
         self.send(&c, &format!("guest {name}")).await;
         let ok = c.raw_lines();
@@ -127,7 +134,7 @@ impl Harness {
 
     /// A new connection, signed in as the identity `uid` without AUTH,
     /// for tests of what comes after signing in.
-    fn signed_in_as(&mut self, uid: &str) -> Client {
+    pub(super) fn signed_in_as(&mut self, uid: &str) -> Client {
         let c = self.connect();
         let uid: Uid = uid.parse().unwrap();
         assert!(self.hub.inner.reg().attach(c.id, &uid, None));
@@ -135,7 +142,7 @@ impl Harness {
     }
 
     /// A guest that has joined `room`. Returns the room's id.
-    async fn joined(&mut self, name: &str, room: &str) -> (Client, String) {
+    pub(super) async fn joined(&mut self, name: &str, room: &str) -> (Client, String) {
         let mut c = self.guest(name).await;
         self.send(&c, &format!("join {room}")).await;
         let lines = c.lines();
@@ -143,26 +150,26 @@ impl Harness {
         (c, id)
     }
 
-    async fn send(&self, c: &Client, line: &str) {
+    pub(super) async fn send(&self, c: &Client, line: &str) {
         let req: Request = line.parse().unwrap();
         self.hub.command(c.id, req).await;
     }
 
     /// The connection closes. A guest's session waits to be resumed.
-    async fn close(&self, c: Client) {
+    pub(super) async fn close(&self, c: Client) {
         drop(c.rx);
         self.hub.closed(c.id).await;
     }
 
     /// The connection closes, and the session of the guest `~name` ends
     /// at once, as if its resume period were over (4.2).
-    async fn leave(&self, c: Client, name: &str) {
+    pub(super) async fn leave(&self, c: Client, name: &str) {
         self.close(c).await;
         self.end(name).await;
     }
 
     /// Ends the session of the guest `~name` at once (4.2).
-    async fn end(&self, name: &str) {
+    pub(super) async fn end(&self, name: &str) {
         let uid: Uid = format!("~{name}").parse().unwrap();
         assert!(
             self.hub.end_guest_session(&uid, "bye").await,
@@ -172,14 +179,14 @@ impl Harness {
 }
 
 /// The hub's timers in most tests: a resume period of 5 minutes.
-fn timers() -> Timers {
+pub(super) fn timers() -> Timers {
     Timers::from_config(&config())
 }
 
 impl Client {
     /// Everything queued so far, as lines, with any `token=` value shown
     /// as `<token>`. A close is `<close>`, or `<close> BYE text`.
-    fn lines(&mut self) -> Vec<String> {
+    pub(super) fn lines(&mut self) -> Vec<String> {
         self.raw_lines()
             .into_iter()
             .map(|line| match line.find(" token=") {
@@ -193,7 +200,7 @@ impl Client {
     }
 
     /// Everything queued so far, as lines, as they are.
-    fn raw_lines(&mut self) -> Vec<String> {
+    pub(super) fn raw_lines(&mut self) -> Vec<String> {
         self.items()
             .into_iter()
             .map(|item| match item {
@@ -204,7 +211,7 @@ impl Client {
             .collect()
     }
 
-    fn messages(&mut self) -> Vec<ServerMessage> {
+    pub(super) fn messages(&mut self) -> Vec<ServerMessage> {
         self.items()
             .into_iter()
             .filter_map(|item| match item {
@@ -214,7 +221,7 @@ impl Client {
             .collect()
     }
 
-    fn items(&mut self) -> Vec<Outgoing> {
+    pub(super) fn items(&mut self) -> Vec<Outgoing> {
         let mut out = Vec::new();
         while let Some(item) = self.rx.try_recv() {
             out.push(item);
@@ -224,7 +231,7 @@ impl Client {
 }
 
 /// The value of `key=` in a line.
-fn value(line: &str, key: &str) -> String {
+pub(super) fn value(line: &str, key: &str) -> String {
     let start = line
         .find(&format!("{key}="))
         .unwrap_or_else(|| panic!("no {key} in {line:?}"))
@@ -234,7 +241,7 @@ fn value(line: &str, key: &str) -> String {
 }
 
 /// The snapshot after JOIN and INFO of a room with default settings.
-fn default_settings(room: &str) -> Vec<String> {
+pub(super) fn default_settings(room: &str) -> Vec<String> {
     vec![
         format!("SET {room} topic"),
         format!("SET {room} public yes"),
@@ -244,12 +251,12 @@ fn default_settings(room: &str) -> Vec<String> {
     ]
 }
 
-fn strings(v: &[&str]) -> Vec<String> {
+pub(super) fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
 /// Appends an event straight to the store, as if it had happened earlier.
-fn put(store: &SqliteStore, room: &str, from: &str, kind: EventKind) {
+pub(super) fn put(store: &SqliteStore, room: &str, from: &str, kind: EventKind) {
     let key = store.room(&room.parse().unwrap()).unwrap().unwrap().key;
     let event = NewEvent {
         t: start(),
@@ -260,7 +267,7 @@ fn put(store: &SqliteStore, room: &str, from: &str, kind: EventKind) {
     store.append(key, &event).unwrap();
 }
 
-fn set(store: &SqliteStore, room: &str, setting: RoomSetting) {
+pub(super) fn set(store: &SqliteStore, room: &str, setting: RoomSetting) {
     put(store, room, "alice@example.org", EventKind::Set(setting));
 }
 
@@ -385,27 +392,6 @@ async fn guests_can_be_turned_off() {
 }
 
 #[tokio::test]
-async fn auth_and_register_are_not_supported_yet() {
-    let mut h = Harness::new();
-    let mut c = h.connect();
-    // Valid lengths for ML-DSA-44 (4.4, 4.5), so that the lines parse.
-    let key = "A".repeat(1750) + "==";
-    let sig = "A".repeat(3227) + "=";
-    h.send(&c, &format!("auth alice@example.org {sig}")).await;
-    h.send(&c, &format!("register alice {key} {sig}")).await;
-    assert_eq!(
-        c.lines(),
-        [
-            "ERR not-supported not supported yet",
-            "ERR not-supported not supported yet"
-        ]
-    );
-    // Still not signed in.
-    h.send(&c, "guest sam").await;
-    assert_eq!(c.lines(), ["OK uid=~sam token=<token>"]);
-}
-
-#[tokio::test]
 async fn sign_in_timeout_closes_with_bye() {
     let store = SqliteStore::open_in_memory().unwrap();
     let mut h = Harness::on(
@@ -438,7 +424,7 @@ async fn sign_in_timeout_closes_with_bye() {
 
 /// Sends `guest <name> token=<token>` on a new connection. Returns the
 /// connection and what it got.
-async fn resume(h: &mut Harness, name: &str, token: &str) -> (Client, Vec<String>) {
+pub(super) async fn resume(h: &mut Harness, name: &str, token: &str) -> (Client, Vec<String>) {
     let mut c = h.connect();
     h.send(&c, &format!("guest {name} token={token}")).await;
     let lines = c.raw_lines();
@@ -446,7 +432,7 @@ async fn resume(h: &mut Harness, name: &str, token: &str) -> (Client, Vec<String
 }
 
 /// The events stored in `room`, as `<from> <verb>`.
-fn stored(h: &Harness, room: &str) -> Vec<String> {
+pub(super) fn stored(h: &Harness, room: &str) -> Vec<String> {
     let key = h.store.room(&room.parse().unwrap()).unwrap().unwrap().key;
     let all = HistoryQuery {
         after: Some(0),
@@ -464,7 +450,7 @@ fn stored(h: &Harness, room: &str) -> Vec<String> {
 
 /// Waits, in paused time, until the hub no longer has a session for
 /// `~name`.
-async fn ended(h: &Harness, name: &str) {
+pub(super) async fn ended(h: &Harness, name: &str) {
     let uid: Uid = format!("~{name}").parse().unwrap();
     for _ in 0..1000 {
         if !h.hub.guest_sessions().contains(&uid) {
@@ -1332,7 +1318,7 @@ async fn old_cids_are_forgotten_every_hour() {
 // History and sync (7.1, 7.2)
 
 /// A hub whose #general has 10 messages from ~old (seq 1 to 10).
-fn ten_messages() -> Harness {
+pub(super) fn ten_messages() -> Harness {
     let mut c = config();
     c.limits.max_page = 4;
     Harness::with(c, |s| {
@@ -1351,7 +1337,7 @@ fn ten_messages() -> Harness {
     })
 }
 
-fn msg_line(n: u64) -> String {
+pub(super) fn msg_line(n: u64) -> String {
     format!("@seq={n};t={T};from=~old MSG #general message {n}")
 }
 
@@ -1499,7 +1485,7 @@ async fn sync_lists_the_rooms_of_the_connection() {
 
 /// A guest in more rooms than its connection's queue holds lines: 400
 /// rooms, and a queue of the fewest lines the limits allow (145).
-async fn in_many_rooms() -> (Harness, Client, usize) {
+pub(super) async fn in_many_rooms() -> (Harness, Client, usize) {
     let mut c = config();
     c.limits.max_page = 1;
     c.limits.max_list = 1;
@@ -2018,7 +2004,7 @@ async fn a_restart_keeps_rooms_ids_and_history() {
 async fn the_configuration_is_checked() {
     let store = || Arc::new(SqliteStore::open_in_memory().unwrap()) as Arc<dyn Store>;
     let clock = || Arc::new(SystemClock) as Arc<dyn Clock>;
-    let build = |c: Config| Hub::build(c, store(), clock(), timers());
+    let build = |c: Config| Hub::build(c, store(), clock(), timers(), KeyServices::default());
     let mut c = config();
     c.rooms = strings(&["general"]);
     assert!(matches!(build(c), Err(HubError::Config(_))));
@@ -2252,7 +2238,7 @@ async fn the_overview_session() {
     );
 }
 
-fn seq(n: u64) -> risala_proto::names::Seq {
+pub(super) fn seq(n: u64) -> risala_proto::names::Seq {
     risala_proto::names::Seq::new(n).unwrap()
 }
 

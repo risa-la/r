@@ -1,5 +1,6 @@
 //! One function per command.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -17,14 +18,15 @@ use risala_proto::types::{
 
 use super::state::{ConvEntry, ConvGuard, ConvState, RoomInfo};
 use super::{Inner, SignIn, SignInRefused, TOKEN_LEN};
+use crate::config::RoomCreation;
 use crate::handler::{ConnHandle, ConnId, OutLine};
 use crate::store::{
-    self, Appended, Created, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent,
+    self, Appended, ConvKey, Created, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent,
 };
 
 /// Why a command failed.
 #[derive(Debug)]
-enum Fail {
+pub(super) enum Fail {
     /// An error for the client (3.7).
     Err(ErrResponse),
     /// The store failed: logged, and `ERR internal` for the client.
@@ -37,29 +39,29 @@ impl From<StoreError> for Fail {
     }
 }
 
-fn fail(code: ErrorCode, message: &str) -> Fail {
+pub(super) fn fail(code: ErrorCode, message: &str) -> Fail {
     Fail::Err(ErrResponse::new(code).with_message(message))
 }
 
-fn not_found() -> Fail {
+pub(super) fn not_found() -> Fail {
     fail(ErrorCode::NotFound, "no such room")
 }
 
-fn not_supported() -> Fail {
+pub(super) fn not_supported() -> Fail {
     fail(ErrorCode::NotSupported, "not supported yet")
 }
 
-type Outcome = Result<Option<OkResponse>, Fail>;
+pub(super) type Outcome = Result<Option<OkResponse>, Fail>;
 
 /// Sends the lines of one command's response, each with the command's
 /// `ref` (3.6).
-struct Reply {
-    handle: ConnHandle,
-    ref_: Option<Ref>,
+pub(super) struct Reply {
+    pub(super) handle: ConnHandle,
+    pub(super) ref_: Option<Ref>,
 }
 
 impl Reply {
-    fn line(&self, line: impl Into<ServerLine>) {
+    pub(super) fn line(&self, line: impl Into<ServerLine>) {
         self.handle
             .send(ServerMessage::new(line).with_ref_opt(self.ref_.clone()));
     }
@@ -80,25 +82,78 @@ fn room_of(st: &ConvState) -> Result<&RoomInfo, Fail> {
     st.room_info().ok_or_else(not_found)
 }
 
-/// Whether `uid` can know that the room exists: it is public, or `uid` is
-/// a member or holds a role in it. Guests cannot be invited or hold roles
-/// (4.2). M3: invitations and operators.
-fn visible(st: &RoomInfo, uid: &Uid, member: bool) -> bool {
-    member || st.settings.public || (!uid.is_guest() && st.roles.contains_key(uid))
+/// Who is asking about a room, as its access rules see it (6.1, 6.3).
+#[derive(Debug, Clone, Copy)]
+struct Asker<'a> {
+    uid: &'a Uid,
+    /// A member of the room right now.
+    member: bool,
+    /// A server operator (10.1).
+    operator: bool,
 }
 
-/// Checks that `uid` may read the room's history and INFO (7.2, 6.2), or
-/// join it when `member` is false (6.1). A room it cannot see gets
-/// `ERR not-found`, so private rooms stay hidden. A room it can see but
-/// may not enter gets `ERR forbidden` (6.1). M3: room bans.
-fn check_access(st: &RoomInfo, uid: &Uid, member: bool) -> Result<(), Fail> {
-    if !visible(st, uid, member) {
+/// Whether the asker can know that the room exists (6.1): it is public, or
+/// the asker is a member, holds a role or an invitation in it, or is an
+/// operator. Guests cannot be invited, hold roles or be operators (4.2).
+fn visible(info: &RoomInfo, a: Asker<'_>) -> bool {
+    a.member
+        || info.settings.public
+        || a.operator
+        || (a.uid.is_identity() && (info.roles.contains_key(a.uid) || info.invites.contains(a.uid)))
+}
+
+/// Checks that the asker may read the room: its history, INFO and
+/// RELATED (6.1, 7.2). A room it cannot see is `ERR not-found`, so private
+/// rooms stay hidden; one it can see but may not read is `ERR forbidden`.
+///
+/// Readers are members, owners and moderators even after leaving (6.3),
+/// operators (10), and anyone allowed to join a public room. Guests need
+/// the room's `guests` setting to let them in.
+fn check_read(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
+    if !visible(info, a) {
         return Err(not_found());
     }
-    if uid.is_guest() && !st.settings.guests.allows_read() {
+    if a.uid.is_guest() && !info.settings.guests.allows_read() {
         return Err(fail(ErrorCode::Forbidden, "guests may not enter this room"));
     }
-    Ok(())
+    if a.member || a.operator || info.roles.contains_key(a.uid) {
+        return Ok(());
+    }
+    if info.bans.contains(a.uid) {
+        return Err(fail(ErrorCode::Forbidden, "you are banned from this room"));
+    }
+    if info.settings.public {
+        return Ok(());
+    }
+    Err(fail(ErrorCode::Forbidden, "join the room first"))
+}
+
+/// Checks that the asker, not a member, may join the room (6.1): anyone not
+/// banned may join a public room; a private room takes an invitation or
+/// the role `owner` or `mod`; operators may join any room (6.3). Guests
+/// need the room's `guests` setting to let them in.
+///
+/// M5a: joining an encrypted room always takes an invitation.
+fn check_join(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
+    if !visible(info, a) {
+        return Err(not_found());
+    }
+    if a.uid.is_guest() && !info.settings.guests.allows_read() {
+        return Err(fail(ErrorCode::Forbidden, "guests may not enter this room"));
+    }
+    if a.operator {
+        return Ok(());
+    }
+    if info.bans.contains(a.uid) {
+        return Err(fail(ErrorCode::Forbidden, "you are banned from this room"));
+    }
+    if info.settings.public || info.roles.contains_key(a.uid) || info.invites.contains(a.uid) {
+        return Ok(());
+    }
+    Err(fail(
+        ErrorCode::Forbidden,
+        "joining this room takes an invitation",
+    ))
 }
 
 /// What INFO reports as `role` (6.2, 6.3).
@@ -107,6 +162,20 @@ fn info_role(st: &RoomInfo, uid: &Uid, member: bool) -> InfoRole {
         Some(role) => InfoRole(Some(*role)),
         None if member => InfoRole(Some(Role::Member)),
         None => InfoRole(None),
+    }
+}
+
+/// Queues a command's final response, if `outcome` has one: its `OK`, its
+/// `ERR`, or `ERR internal` for a store failure, which is logged.
+pub(super) fn respond(reply: &Reply, verb: &str, outcome: Outcome) {
+    match outcome {
+        Ok(Some(ok)) => reply.line(ok),
+        Ok(None) => {}
+        Err(Fail::Err(err)) => reply.line(err),
+        Err(Fail::Store(e)) => {
+            tracing::error!(conn = reply.handle.id().0, verb, "store failed: {e}");
+            reply.line(ErrResponse::new(ErrorCode::Internal).with_message("internal error"));
+        }
     }
 }
 
@@ -136,15 +205,8 @@ impl Inner {
             ref_: req.ref_,
         };
         let verb = req.command.verb();
-        match self.dispatch(id, uid, &reply, req.command).await {
-            Ok(Some(ok)) => reply.line(ok),
-            Ok(None) => {}
-            Err(Fail::Err(err)) => reply.line(err),
-            Err(Fail::Store(e)) => {
-                tracing::error!(conn = id.0, verb, "store failed: {e}");
-                reply.line(ErrResponse::new(ErrorCode::Internal).with_message("internal error"));
-            }
-        }
+        let outcome = self.dispatch(id, uid, &reply, req.command).await;
+        respond(&reply, verb, outcome);
     }
 
     async fn dispatch(
@@ -169,8 +231,21 @@ impl Inner {
         match (command, uid) {
             (Command::Info { room: None }, _) => Ok(Some(self.info())),
             (Command::Guest { name, token }, None) => self.guest(id, name, token),
-            // M3.
-            (Command::Auth { .. } | Command::Register { .. }, None) => Err(not_supported()),
+            (
+                Command::Auth {
+                    identity,
+                    signature,
+                },
+                None,
+            ) => self.auth(id, identity, signature).await,
+            (
+                Command::Register {
+                    name,
+                    key,
+                    signature,
+                },
+                None,
+            ) => self.register(id, name, key, signature).await,
             (Command::Ping { .. }, _) => Ok(Some(OkResponse::new())),
             (Command::Pong { .. }, _) => Ok(None),
             (Command::Quit { .. }, _) => {
@@ -186,6 +261,10 @@ impl Inner {
 
     async fn signed_in(self: &Arc<Self>, uid: &Uid, reply: &Reply, command: Command) -> Outcome {
         match command {
+            Command::Key(sub) => self.key(uid, reply, sub).await,
+            Command::Unregister { uid: target, purge } => {
+                self.unregister(uid, reply, &target, purge).await
+            }
             Command::Info { room: Some(room) } => self.info_room(uid, reply, &room).await,
             Command::List(page) => self.list(uid, reply, page).await,
             Command::Join { room } => self.join(uid, reply, &room).await,
@@ -217,7 +296,10 @@ impl Inner {
         OkResponse::new()
             .with_version(risala_proto::PROTOCOL_VERSION)
             .with_guests(settings.guests)
-            .with_register(&Register::No)
+            .with_register(&match &self.identity_domain {
+                Some(domain) => Register::Domain(domain.clone()),
+                None => Register::No,
+            })
             .with_retention(settings.retention)
             .with_push(false)
             .with_upload(Upload::No)
@@ -260,7 +342,7 @@ impl Inner {
         let st = self.lock_room(room).await?;
         let info = room_of(&st)?;
         let (member, members) = (st.is_member(uid), st.member_count());
-        check_access(info, uid, member)?;
+        check_read(info, self.asker(uid, member))?;
         send_settings(reply, info);
         // A room from the configuration has no events until someone joins,
         // and then reports `head=0` (6.2).
@@ -404,7 +486,7 @@ impl Inner {
         let st = &mut *guard;
         let member = st.is_member(uid);
         if !member {
-            check_access(room_of(st)?, uid, false)?;
+            check_join(room_of(st)?, self.asker(uid, false))?;
             // A guest whose session is ending, on a connection that has
             // already been told BYE (4.2).
             if !self.reg().may_join(uid) {
@@ -430,10 +512,27 @@ impl Inner {
         Ok(None)
     }
 
-    /// Whether `uid` may create a room by joining it (6.1). Guests never
-    /// may (4.2).
+    /// Whether `uid` may create a room by joining it (6.1), under
+    /// `room_creation`. Guests never may (4.2).
     fn may_create_room(&self, uid: &Uid) -> bool {
-        uid.is_identity()
+        if uid.is_guest() {
+            return false;
+        }
+        match self.config.room_creation {
+            RoomCreation::Identities => true,
+            RoomCreation::Hosted => self.hosts_uid(uid) || self.is_operator(uid),
+            RoomCreation::Operators => self.is_operator(uid),
+            RoomCreation::Nobody => false,
+        }
+    }
+
+    /// `uid` as the access rules of a room see it.
+    fn asker<'a>(&self, uid: &'a Uid, member: bool) -> Asker<'a> {
+        Asker {
+            uid,
+            member,
+            operator: uid.is_identity() && self.is_operator(uid),
+        }
     }
 
     /// Creates `room` for `creator`, with its JOIN as event 1, and adds it
@@ -513,9 +612,10 @@ impl Inner {
         Ok(Some(OkResponse::new()))
     }
 
-    /// A guest's automatic PART when its session ends (4.2): in `conv`, if
-    /// it is still a member there.
-    pub(super) async fn guest_part(&self, conv: Arc<ConvEntry>, uid: &Uid) {
+    /// A PART with no reason that nobody sent: a guest's when its session
+    /// ends (4.2), or an identity's when it is deleted (4.8). In `conv`,
+    /// if `uid` is still a member there.
+    pub(super) async fn auto_part(&self, conv: Arc<ConvEntry>, uid: &Uid) {
         let mut st = conv.lock_owned().await;
         if st.dropped || !st.is_member(uid) {
             // Not a member here any more: just make sure the user's list
@@ -538,7 +638,7 @@ impl Inner {
         match self.append(&mut st, event).await {
             Ok((_, event)) => Self::broadcast_event(&st, &event),
             // The guest is gone either way. No seq was used.
-            Err(e) => tracing::error!(conv = %st.id, "storing a guest's PART failed: {e}"),
+            Err(e) => tracing::error!(conv = %st.id, "storing a PART failed: {e}"),
         }
         st.remove_member(uid);
     }
@@ -584,7 +684,7 @@ impl Inner {
 
         let member = st.is_member(uid);
         let info = room_of(st)?;
-        check_access(info, uid, member)?;
+        check_read(info, self.asker(uid, member))?;
         if !member {
             return Err(fail(ErrorCode::Forbidden, "join the room first"));
         }
@@ -645,6 +745,18 @@ impl Inner {
     /// until the connection's queue has that room again. Each CONV line is
     /// still queued under its room's lock (3.6).
     async fn sync(&self, uid: &Uid, reply: &Reply) -> Outcome {
+        // Read markers are the account's, and only identities have them
+        // (7.4). Read first: a marker can only move forward, so one read
+        // a moment early is still a marker the account set.
+        let markers: HashMap<ConvKey, Seq> = if uid.is_identity() {
+            let who = uid.clone();
+            self.db(move |s| s.read_markers(&who))
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let convs = self
             .reg()
             .users
@@ -670,8 +782,9 @@ impl Inner {
                     conv: st.name_for(uid),
                     id: st.id.clone(),
                     head,
-                    // M3: read markers for identities. Always 0 for guests.
-                    read: None,
+                    // Always 0 for guests (7.1). A marker is never beyond
+                    // the head (7.4).
+                    read: markers.get(&st.key).map(|&read| read.min(head)),
                 });
             }
         }
@@ -719,7 +832,7 @@ impl Inner {
         };
         let (key, id) = {
             let st = self.lock_room(&room).await?;
-            check_access(room_of(&st)?, uid, st.is_member(uid))?;
+            check_read(room_of(&st)?, self.asker(uid, st.is_member(uid)))?;
             (st.key, st.id.clone())
         };
         let query = HistoryQuery {

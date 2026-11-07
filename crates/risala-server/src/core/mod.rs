@@ -20,6 +20,17 @@
 //! clean shutdown ends them all, and the PARTs of any a crash cut off are
 //! recorded at the next start.
 //!
+//! # Identities
+//!
+//! An identity signs in with AUTH (4.5). The hub checks the signature over
+//! this connection's SNI hostname and nonce, against the server's own
+//! records for an identity it hosts, or else against the key file it gets
+//! through a [`KeyFetcher`], with no lock held while it waits. REGISTER
+//! (4.6), KEY (4.7) and UNREGISTER (4.8) keep hosted identities' keys in
+//! the store and publish their key files through a [`KeyFilePublisher`].
+//! An identity stays a member of its rooms across connections and
+//! restarts: every connection signed in as it gets their live events.
+//!
 //! # Conversations and ordering
 //!
 //! Every conversation, a room now and a direct conversation from M5a, has
@@ -44,9 +55,12 @@
 //! stops waiting for it.
 
 mod commands;
+mod identity;
+pub mod keys;
 mod state;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::Duration;
@@ -61,8 +75,12 @@ use crate::config::{Config, ConfigError};
 use crate::handler::{ConnHandle, ConnId, ConnInfo, Handler};
 use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 
-use risala_proto::names::{Id, Uid};
+use risala_proto::names::{Domain, Id, Uid};
 
+pub use keys::{
+    FetchError, KeyFetcher, KeyFilePublisher, KeyServices, MemoryFetcher, MemoryPublisher,
+    NoFetcher, NoPublisher,
+};
 use state::{ConnEntry, ConvEntry, ConvState, GuestSession, Registry};
 
 /// The number of random bytes in a greeting's nonce (4.1).
@@ -71,6 +89,10 @@ pub const NONCE_BYTES: usize = 32;
 /// The number of random `a-z 0-9` characters in a guest's token (4.2): 32
 /// of them carry about 165 bits.
 pub const TOKEN_LEN: usize = 32;
+
+/// How long AUTH waits for an identity's key file (4.4) before it fails.
+/// A fetcher stops after 10 seconds itself; this is a backstop.
+pub const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The BYE text for a connection whose guest session was resumed on
 /// another connection (4.2).
@@ -181,6 +203,20 @@ pub(crate) struct Inner {
     reg: Mutex<Registry>,
     sign_in_timeout: Duration,
     guest_resume: Duration,
+    /// Key files: fetched for AUTH, published for hosted identities (4.4,
+    /// 4.6).
+    keys: KeyServices,
+    /// The identity domain (4.6), if the server hosts identities.
+    identity_domain: Option<Domain>,
+    /// The operators (10.1): from the configuration, and from the store.
+    operators: RwLock<BTreeSet<Uid>>,
+    /// Held while the keys of a hosted identity change and its key file is
+    /// published, so that the files are published in the order of the
+    /// changes.
+    keys_lock: tokio::sync::Mutex<()>,
+    /// When each network address registered identities in the last hour
+    /// (13), for `limits.registrations_per_hour`.
+    registrations: Mutex<HashMap<IpAddr, VecDeque<Timestamp>>>,
 }
 
 impl Hub {
@@ -193,18 +229,28 @@ impl Hub {
     /// A new state directory gets mode 0700, and a warning is logged if an
     /// existing one can be read by others (13).
     pub fn open(config: Config) -> Result<Hub, HubError> {
+        Hub::open_with_keys(config, KeyServices::default())
+    }
+
+    /// [`Hub::open`], fetching and publishing key files with `keys` (4.4,
+    /// 4.6).
+    pub fn open_with_keys(config: Config, keys: KeyServices) -> Result<Hub, HubError> {
         let timers = Timers::from_config(&config);
-        Hub::open_with(config, timers)
+        Hub::open_with(config, timers, keys)
     }
 
     /// [`Hub::open`] with timers that need not follow the configuration.
-    pub(crate) fn open_with(config: Config, timers: Timers) -> Result<Hub, HubError> {
+    pub(crate) fn open_with(
+        config: Config,
+        timers: Timers,
+        keys: KeyServices,
+    ) -> Result<Hub, HubError> {
         create_state_dir(&config.state_dir).map_err(|source| HubError::Io {
             path: config.state_dir.clone(),
             source,
         })?;
         let store = SqliteStore::open(&config.database_path())?;
-        Hub::build(config, Arc::new(store), Arc::new(SystemClock), timers)
+        Hub::build(config, Arc::new(store), Arc::new(SystemClock), timers, keys)
     }
 
     /// Starts the hub on `store`.
@@ -226,8 +272,19 @@ impl Hub {
         store: impl Store,
         clock: impl Clock,
     ) -> Result<Hub, HubError> {
+        Hub::with_services(config, store, clock, KeyServices::default())
+    }
+
+    /// [`Hub::new`] with a clock, and fetching and publishing key files
+    /// with `keys` (4.4, 4.6).
+    pub fn with_services(
+        config: Config,
+        store: impl Store,
+        clock: impl Clock,
+        keys: KeyServices,
+    ) -> Result<Hub, HubError> {
         let timers = Timers::from_config(&config);
-        Hub::build(config, Arc::new(store), Arc::new(clock), timers)
+        Hub::build(config, Arc::new(store), Arc::new(clock), timers, keys)
     }
 
     pub(crate) fn build(
@@ -235,6 +292,7 @@ impl Hub {
         store: Arc<dyn Store>,
         clock: Arc<dyn Clock>,
         timers: Timers,
+        keys: KeyServices,
     ) -> Result<Hub, HubError> {
         match config.validate() {
             Ok(warnings) => {
@@ -303,6 +361,20 @@ impl Hub {
         }
         tracing::info!(rooms = rooms.len(), "hub started");
 
+        let operators: BTreeSet<Uid> = config
+            .operators()
+            .iter()
+            .map(|op| op.to_uid())
+            .chain(store.operators()?)
+            .collect();
+        let identity_domain = config.identity_domain();
+        // The key files of hosted identities, again, in case they were
+        // lost or the publisher keeps them in memory (4.6).
+        for (uid, hosted) in store.hosted_identities()? {
+            // A failure is logged, and the next change publishes again.
+            let _ = identity::publish(&*keys.publisher, &uid, &hosted);
+        }
+
         Ok(Hub {
             inner: Arc::new(Inner {
                 config,
@@ -314,6 +386,11 @@ impl Hub {
                 reg: Mutex::new(reg),
                 sign_in_timeout: timers.sign_in,
                 guest_resume: timers.guest_resume,
+                keys,
+                identity_domain,
+                operators: RwLock::new(operators),
+                keys_lock: tokio::sync::Mutex::new(()),
+                registrations: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -658,7 +735,7 @@ impl Inner {
                 break;
             }
             for conv in convs {
-                self.guest_part(conv, uid).await;
+                self.auto_part(conv, uid).await;
             }
         }
         let mut reg = self.reg();
@@ -780,3 +857,6 @@ impl Handler for Hub {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod identity_tests;

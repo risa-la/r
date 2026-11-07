@@ -27,7 +27,7 @@ use std::sync::Arc;
 use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
-use crate::core::{BYE_SHUTDOWN, CID_PRUNE_PERIOD, Hub, HubError, Timers};
+use crate::core::{BYE_SHUTDOWN, CID_PRUNE_PERIOD, Hub, HubError, KeyServices, Timers};
 use crate::http::{self, HttpServer, KeyDir, KeyFetcher};
 use crate::net;
 
@@ -81,10 +81,26 @@ impl Daemon {
     /// [`Daemon::bind`] with timers that need not follow the
     /// configuration, for tests.
     pub(crate) async fn bind_with(config: Config, timers: Timers) -> Result<Daemon, RunError> {
+        Daemon::bind_full(config, timers, KeyServices::default()).await
+    }
+
+    /// [`Daemon::bind`], fetching and publishing key files with `keys`
+    /// (4.4, 4.6). Without them, the server fetches no key files, so only
+    /// identities it hosts can sign in.
+    pub async fn bind_with_keys(config: Config, keys: KeyServices) -> Result<Daemon, RunError> {
+        let timers = Timers::from_config(&config);
+        Daemon::bind_full(config, timers, keys).await
+    }
+
+    async fn bind_full(
+        config: Config,
+        timers: Timers,
+        keys: KeyServices,
+    ) -> Result<Daemon, RunError> {
         // Opening SQLite, reading certificates and generating a key all
         // block, so keep them off the runtime's worker threads.
         tokio::task::spawn_blocking(move || {
-            let hub = Hub::open_with(config, timers)?;
+            let hub = Hub::open_with(config, timers, keys)?;
             let server = net::Server::bind(hub.config(), Arc::new(hub.clone()))?;
             let config = hub.config();
             let key_fetcher = http::fetch::from_config(&config.keys)?;

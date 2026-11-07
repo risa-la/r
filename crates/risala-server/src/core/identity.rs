@@ -1,0 +1,627 @@
+//! Identities: AUTH (4.5), REGISTER (4.6), KEY (4.7) and UNREGISTER
+//! (4.8).
+//!
+//! None of these holds a conversation lock while it fetches a key file or
+//! checks a signature. A key file fetch has a time limit
+//! ([`KEY_FETCH_TIMEOUT`]), and holds up only the AUTH that waits for it.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use risala_proto::auth::{Nonce, PublicKey, Signature};
+use risala_proto::command::KeyCommand;
+use risala_proto::error::ErrorCode;
+use risala_proto::keyfile::{KeyEntry, MAX_KEYS};
+use risala_proto::names::{Identity, Name, Uid};
+use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
+use risala_proto::text::unescape;
+use risala_proto::time::Timestamp;
+
+use super::commands::{Fail, Outcome, Reply, fail, respond};
+use super::keys::KeyFilePublisher;
+use super::{Inner, KEY_FETCH_TIMEOUT};
+use crate::handler::ConnId;
+use crate::store::{HostedKey, KeyChange, Registered};
+
+/// The BYE text for a connection whose device key was removed (4.4, 4.7).
+pub const BYE_KEY_REMOVED: &str = "this device's key was removed";
+
+/// The BYE text for the connections of an identity that was deleted (4.8).
+pub const BYE_UNREGISTERED: &str = "identity deleted";
+
+/// The window of `limits.registrations_per_hour` (13).
+const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+fn auth_failed(message: &str) -> Fail {
+    fail(ErrorCode::AuthFailed, message)
+}
+
+/// What AUTH and REGISTER need from the connection, taken as they start.
+struct Challenge {
+    /// The greeting's nonce, unless an earlier AUTH or REGISTER used it up.
+    nonce: Option<Nonce>,
+    /// The SNI hostname, in lower case (4.5).
+    sni: Option<String>,
+    /// The client's address, for the registration limit (13).
+    peer: IpAddr,
+}
+
+/// The network a registration counts against (13): the address, or the
+/// /64 of an IPv6 address, since one host usually has a whole /64.
+fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let bits = u128::from(v6) & !((1u128 << 64) - 1);
+                IpAddr::V6(bits.into())
+            }
+        },
+    }
+}
+
+/// The key file entry for a hosted key, whose label is escaped (3.4). A
+/// label that cannot go in a key file gets `None`.
+fn key_entry(key: &HostedKey) -> KeyEntry {
+    KeyEntry::new(key.key.clone(), Some(&unescape(&key.label)))
+        .or_else(|_| KeyEntry::new(key.key.clone(), None))
+        .expect("an entry without a label is valid")
+}
+
+/// Publishes the key file of the hosted identity `uid` (4.6). Failures are
+/// logged and returned. Blocks.
+pub(super) fn publish(
+    publisher: &dyn KeyFilePublisher,
+    uid: &Uid,
+    keys: &[HostedKey],
+) -> std::io::Result<()> {
+    let Ok(name) = uid.name().parse::<Name>() else {
+        return Err(std::io::Error::other(format!("{uid} has no name")));
+    };
+    let entries: Vec<KeyEntry> = keys.iter().map(key_entry).collect();
+    let result = publisher.publish(&name, &entries);
+    if let Err(e) = &result {
+        tracing::error!(%uid, "publishing the key file failed: {e}");
+    }
+    result
+}
+
+/// The first of `keys` under which `signature` signs the challenge for
+/// `host`, `nonce` and `uid` (4.5). Runs on the blocking pool: each check
+/// is an ML-DSA verification.
+async fn verify(
+    host: String,
+    nonce: Nonce,
+    uid: Uid,
+    signature: Signature,
+    keys: Vec<PublicKey>,
+) -> Option<PublicKey> {
+    tokio::task::spawn_blocking(move || {
+        keys.into_iter()
+            .take(MAX_KEYS)
+            .find(|key| key.verify_challenge(&host, &nonce, uid.as_str(), &signature))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+impl Inner {
+    /// Whether `uid` is a server operator (10.1).
+    pub(super) fn is_operator(&self, uid: &Uid) -> bool {
+        self.operators
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(uid)
+    }
+
+    /// Whether `identity` is under this server's identity domain, so that
+    /// its keys are the server's own records (4.5, 4.6).
+    pub(super) fn hosts(&self, identity: &Identity) -> bool {
+        self.identity_domain
+            .as_ref()
+            .is_some_and(|d| d.as_str() == identity.domain())
+    }
+
+    /// Whether `uid` is an identity under this server's identity domain.
+    pub(super) fn hosts_uid(&self, uid: &Uid) -> bool {
+        uid.to_identity().is_some_and(|i| self.hosts(&i))
+    }
+
+    /// Takes the connection's nonce, using it up (4.5), with what else AUTH
+    /// and REGISTER need. `None` if the connection is gone.
+    fn take_challenge(&self, id: ConnId) -> Option<Challenge> {
+        let mut reg = self.reg();
+        let conn = reg.conns.get_mut(&id)?;
+        Some(Challenge {
+            nonce: conn.nonce.take(),
+            sni: conn.info.sni.clone(),
+            peer: conn.info.peer.ip(),
+        })
+    }
+
+    /// The host and nonce to check a signature against (4.5): the
+    /// connection's SNI hostname, since the client signs the name it
+    /// connected to, and its nonce, unless it was used up.
+    fn host_and_nonce(challenge: Challenge) -> Result<(String, Nonce), Fail> {
+        let nonce = challenge
+            .nonce
+            .ok_or_else(|| auth_failed("this connection's nonce was used up; reconnect"))?;
+        let host = challenge
+            .sni
+            .ok_or_else(|| auth_failed("connect with SNI to sign in as an identity"))?;
+        Ok((host, nonce))
+    }
+
+    /// AUTH (4.5).
+    pub(super) async fn auth(
+        self: &Arc<Self>,
+        id: ConnId,
+        identity: Identity,
+        signature: Signature,
+    ) -> Outcome {
+        let Some(challenge) = self.take_challenge(id) else {
+            return Ok(None);
+        };
+        let (host, nonce) = Self::host_and_nonce(challenge)?;
+        let uid = identity.to_uid();
+        let key = if self.hosts(&identity) {
+            let who = uid.clone();
+            let keys = self.db(move |s| s.hosted_keys(&who)).await?;
+            let keys = keys
+                .unwrap_or_default()
+                .into_iter()
+                .map(|k| k.key)
+                .collect();
+            verify(host, nonce, uid.clone(), signature, keys).await
+        } else {
+            self.verify_fetched(&identity, host, nonce, signature).await
+        };
+        let Some(key) = key else {
+            tracing::debug!(conn = id.0, "AUTH failed");
+            return Err(auth_failed("the signature did not verify"));
+        };
+        self.finish_sign_in(id, &uid, key).await
+    }
+
+    /// Checks an AUTH signature against `identity`'s key file (4.4): first
+    /// as the fetcher has it, which may be cached, then once more freshly
+    /// fetched if that fails.
+    async fn verify_fetched(
+        &self,
+        identity: &Identity,
+        host: String,
+        nonce: Nonce,
+        signature: Signature,
+    ) -> Option<PublicKey> {
+        let uid = identity.to_uid();
+        for refresh in [false, true] {
+            let fetch = self.keys.fetcher.fetch_boxed(identity, refresh);
+            let keys = match tokio::time::timeout(KEY_FETCH_TIMEOUT, fetch).await {
+                Ok(Ok(keys)) => keys,
+                Ok(Err(e)) => {
+                    tracing::debug!(%uid, refresh, "no key file: {e}");
+                    return None;
+                }
+                Err(_) => {
+                    tracing::debug!(%uid, refresh, "fetching the key file timed out");
+                    return None;
+                }
+            };
+            self.close_removed_keys(&uid, &keys);
+            let found = verify(
+                host.clone(),
+                nonce.clone(),
+                uid.clone(),
+                signature.clone(),
+                keys,
+            )
+            .await;
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    /// Signs connection `id` in as the identity `uid`, with `key` as its
+    /// device key (4.5), and records that the server knows the identity
+    /// (5.1). Replies `OK uid=<uid>`, with `op=yes` for an operator.
+    async fn finish_sign_in(&self, id: ConnId, uid: &Uid, key: PublicKey) -> Outcome {
+        if self.is_ending(uid) {
+            return Err(auth_failed("the identity is being deleted"));
+        }
+        let (who, now) = (uid.clone(), self.now());
+        self.db(move |s| s.touch_identity(&who, now)).await?;
+        {
+            let mut reg = self.reg();
+            if reg.users.get(uid).is_some_and(|u| u.lock().ending) {
+                return Err(auth_failed("the identity is being deleted"));
+            }
+            if !reg.attach(id, uid, Some(key)) {
+                // The connection closed meanwhile.
+                return Ok(None);
+            }
+        }
+        tracing::debug!(conn = id.0, "signed in as an identity");
+        let ok = OkResponse::new().with_uid(uid);
+        Ok(Some(if self.is_operator(uid) {
+            ok.with_op(true)
+        } else {
+            ok
+        }))
+    }
+
+    /// Whether the identity `uid` is being deleted (4.8).
+    fn is_ending(&self, uid: &Uid) -> bool {
+        self.reg().users.get(uid).is_some_and(|u| u.lock().ending)
+    }
+
+    /// Closes the connections of `uid` whose device key is not in `keys`
+    /// (4.4): a key file fetched for AUTH no longer lists them.
+    fn close_removed_keys(&self, uid: &Uid, keys: &[PublicKey]) {
+        self.close_keys(uid, |key| !keys.contains(key));
+    }
+
+    /// Closes the connections of `uid` signed in with a device key for
+    /// which `removed` is true, with BYE (4.4, 4.7).
+    fn close_keys(&self, uid: &Uid, removed: impl Fn(&PublicKey) -> bool) {
+        let mut reg = self.reg();
+        let Some(user) = reg.users.get(uid).cloned() else {
+            return;
+        };
+        let gone: Vec<ConnId> = user
+            .lock()
+            .conns
+            .iter()
+            .filter(|c| c.key.as_ref().is_some_and(&removed))
+            .map(|c| c.handle.id())
+            .collect();
+        drop(user);
+        for id in gone {
+            tracing::debug!(conn = id.0, "closing a connection whose key was removed");
+            reg.detach(id, BYE_KEY_REMOVED);
+        }
+    }
+
+    /// When the address `peer` may register again, in seconds, if it has
+    /// used up `limits.registrations_per_hour` (13).
+    fn registration_retry(&self, peer: IpAddr, now: Timestamp) -> Option<u64> {
+        let limit = self.config.limits.registrations_per_hour;
+        if limit == 0 {
+            return None;
+        }
+        let mut all = self.registrations.lock().unwrap_or_else(|e| e.into_inner());
+        // Forget what is older than the window, everywhere, so the map
+        // holds only the last hour's registrations.
+        all.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|t| now.saturating_duration_since(*t) >= REGISTRATION_WINDOW)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        let times = all.get(&rate_key(peer))?;
+        if times.len() < limit as usize {
+            return None;
+        }
+        let oldest = *times.front()?;
+        let waited = now.saturating_duration_since(oldest);
+        Some(REGISTRATION_WINDOW.saturating_sub(waited).as_secs().max(1))
+    }
+
+    /// Counts a registration from `peer` against its limit (13).
+    fn note_registration(&self, peer: IpAddr, now: Timestamp) {
+        if self.config.limits.registrations_per_hour == 0 {
+            return;
+        }
+        self.registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(rate_key(peer))
+            .or_default()
+            .push_back(now);
+    }
+
+    /// Publishes the key file of the hosted identity `uid` on the blocking
+    /// pool (4.6).
+    async fn publish(&self, uid: &Uid, keys: Vec<HostedKey>) -> std::io::Result<()> {
+        let publisher = self.keys.publisher.clone();
+        let uid = uid.clone();
+        tokio::task::spawn_blocking(move || publish(&*publisher, &uid, &keys))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+
+    /// Removes the key file of the hosted identity `uid` (4.8). Failures
+    /// are logged.
+    async fn unpublish(&self, uid: &Uid) {
+        let Ok(name) = uid.name().parse::<Name>() else {
+            return;
+        };
+        let publisher = self.keys.publisher.clone();
+        let result = tokio::task::spawn_blocking(move || publisher.remove(&name)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(%uid, "removing the key file failed: {e}"),
+            Err(e) => tracing::error!(%uid, "removing the key file failed: {e}"),
+        }
+    }
+
+    /// REGISTER (4.6).
+    pub(super) async fn register(
+        self: &Arc<Self>,
+        id: ConnId,
+        name: Name,
+        key: PublicKey,
+        signature: Signature,
+    ) -> Outcome {
+        // Any REGISTER that parses uses up the nonce (4.5).
+        let Some(challenge) = self.take_challenge(id) else {
+            return Ok(None);
+        };
+        let Some(domain) = self.identity_domain.clone() else {
+            return Err(fail(
+                ErrorCode::NotSupported,
+                "this server does not offer registration",
+            ));
+        };
+        if !self.settings().registration {
+            return Err(fail(ErrorCode::Forbidden, "registration is closed"));
+        }
+        let peer = challenge.peer;
+        let (host, nonce) = Self::host_and_nonce(challenge)?;
+        let now = self.now();
+        if let Some(retry) = self.registration_retry(peer, now) {
+            return Err(Fail::Err(
+                ErrResponse::new(ErrorCode::RateLimited)
+                    .with_retry(retry)
+                    .with_message("too many registrations from this address"),
+            ));
+        }
+        let uid = Identity::new(&name, &domain).to_uid();
+        // The signature proves the client holds the key (4.6).
+        if verify(host, nonce, uid.clone(), signature, vec![key.clone()])
+            .await
+            .is_none()
+        {
+            return Err(auth_failed("the signature did not verify"));
+        }
+        {
+            let _keys = self.keys_lock.lock().await;
+            let (who, first) = (uid.clone(), key.clone());
+            match self.db(move |s| s.register(&who, &first, now)).await? {
+                Registered::Done => {}
+                Registered::Taken => {
+                    return Err(fail(ErrorCode::NameTaken, "that name is registered"));
+                }
+                // A name that was unregistered stays taken (4.8, 10.5).
+                Registered::Retired => {
+                    return Err(fail(ErrorCode::NameTaken, "that name was used before"));
+                }
+            }
+            let who = uid.clone();
+            let keys = self.db(move |s| s.hosted_keys(&who)).await?;
+            if self.publish(&uid, keys.unwrap_or_default()).await.is_err() {
+                // Without a key file, nobody else can check the identity:
+                // undo it, and leave the name free.
+                let who = uid.clone();
+                self.db(move |s| s.forget_identity(&who, false, now))
+                    .await?;
+                return Err(fail(
+                    ErrorCode::Internal,
+                    "the key file could not be published",
+                ));
+            }
+        }
+        self.note_registration(peer, now);
+        tracing::info!(%uid, "identity registered");
+        self.finish_sign_in(id, &uid, key).await
+    }
+
+    /// KEY LIST, KEY ADD and KEY DEL (4.7), for hosted identities only.
+    pub(super) async fn key(&self, uid: &Uid, reply: &Reply, command: KeyCommand) -> Outcome {
+        let hosted_here = || {
+            fail(
+                ErrorCode::NotSupported,
+                "this server does not host your identity; edit your key file",
+            )
+        };
+        if !self.hosts_uid(uid) {
+            return Err(hosted_here());
+        }
+        let now = self.now();
+        match command {
+            KeyCommand::List => {
+                let who = uid.clone();
+                let keys = self
+                    .db(move |s| s.hosted_keys(&who))
+                    .await?
+                    .ok_or_else(hosted_here)?;
+                for key in keys {
+                    reply.line(ServerLine::Key {
+                        key: key.key,
+                        label: key.label,
+                    });
+                }
+                Ok(Some(OkResponse::new()))
+            }
+            KeyCommand::Add { key, label } => {
+                // The label is stored as received (3.4), and goes in the
+                // key file as plain text (4.4), so it may not hold a line
+                // break.
+                KeyEntry::new(key.clone(), Some(&unescape(&label)))
+                    .map_err(|_| fail(ErrorCode::BadSyntax, "the label cannot go in a key file"))?;
+                let _keys = self.keys_lock.lock().await;
+                let who = uid.clone();
+                let change = self
+                    .db(move |s| s.add_hosted_key(&who, &key, &label, MAX_KEYS, now))
+                    .await?;
+                match change {
+                    KeyChange::Done(keys) => self.republish(uid, keys).await,
+                    KeyChange::TooMany => Err(fail(
+                        ErrorCode::Forbidden,
+                        "an identity has at most 64 keys",
+                    )),
+                    KeyChange::NotHosted | KeyChange::NotFound | KeyChange::LastKey => {
+                        Err(hosted_here())
+                    }
+                }
+            }
+            KeyCommand::Del { key } => {
+                let _keys = self.keys_lock.lock().await;
+                let (who, gone) = (uid.clone(), key.clone());
+                let change = self.db(move |s| s.delete_hosted_key(&who, &gone)).await?;
+                match change {
+                    KeyChange::Done(keys) => {
+                        let result = self.republish(uid, keys).await;
+                        // 4.7: the connections that used the key are closed,
+                        // this one too, after its response.
+                        respond(reply, "KEY", result);
+                        self.close_keys(uid, |k| *k == key);
+                        // M5a: delete the key's KeyPackages and pending
+                        // Welcomes (4.7).
+                        Ok(None)
+                    }
+                    KeyChange::NotFound => Err(fail(ErrorCode::NotFound, "no such key")),
+                    KeyChange::LastKey => Err(fail(
+                        ErrorCode::Forbidden,
+                        "an identity's last key cannot be deleted",
+                    )),
+                    KeyChange::NotHosted | KeyChange::TooMany => Err(hosted_here()),
+                }
+            }
+        }
+    }
+
+    /// Publishes the key file after a change to its keys (4.6, 4.7). The
+    /// change is stored either way; a failure to publish is
+    /// `ERR internal`, and the next change or restart publishes again.
+    async fn republish(&self, uid: &Uid, keys: Vec<HostedKey>) -> Outcome {
+        match self.publish(uid, keys).await {
+            Ok(()) => Ok(Some(OkResponse::new())),
+            Err(_) => Err(fail(
+                ErrorCode::Internal,
+                "the change was saved, but the key file could not be published",
+            )),
+        }
+    }
+
+    /// UNREGISTER (4.8).
+    pub(super) async fn unregister(
+        self: &Arc<Self>,
+        uid: &Uid,
+        reply: &Reply,
+        target: &Uid,
+        purge: bool,
+    ) -> Outcome {
+        if target != uid {
+            return Err(fail(
+                ErrorCode::Forbidden,
+                "type your own identity to delete it",
+            ));
+        }
+        if purge {
+            // M4: purge=yes deletes every message as if by DELETE (5.4).
+            return Err(fail(
+                ErrorCode::NotSupported,
+                "purge=yes is not supported yet",
+            ));
+        }
+        // From here on, the identity may not join rooms or sign in, and
+        // its connections run no more commands. They still get the PARTs.
+        let user = {
+            let mut reg = self.reg();
+            let user = reg.user(uid);
+            let conns: Vec<ConnId> = {
+                let mut state = user.lock();
+                state.ending = true;
+                state.conns.iter().map(|c| c.handle.id()).collect()
+            };
+            for conn in conns {
+                if let Some(entry) = reg.conns.get_mut(&conn) {
+                    entry.detached = true;
+                }
+            }
+            user
+        };
+        let result = self.forget(uid, &user).await;
+        let done = result.is_ok();
+        // Close every connection, this one after its response.
+        respond(
+            reply,
+            "UNREGISTER",
+            result.map(|()| Some(OkResponse::new())),
+        );
+        {
+            let mut reg = self.reg();
+            let conns: Vec<ConnId> = user.lock().conns.iter().map(|c| c.handle.id()).collect();
+            for conn in conns {
+                reg.detach(conn, BYE_UNREGISTERED);
+            }
+            user.lock().ending = false;
+            drop(user);
+            reg.release(uid);
+        }
+        if done {
+            tracing::info!(%uid, "identity deleted");
+        }
+        Ok(None)
+    }
+
+    /// Deletes what the server keeps about `uid` (4.8): its memberships,
+    /// with a PART each, then everything stored, then its roles and
+    /// invitations in memory, and for a hosted identity its key file.
+    async fn forget(&self, uid: &Uid, user: &Arc<super::state::UserEntry>) -> Result<(), Fail> {
+        // A JOIN under way may add a room after the first pass, but none
+        // can start after it, since the user is ending. So this ends.
+        loop {
+            let convs = user.convs();
+            if convs.is_empty() {
+                break;
+            }
+            for conv in convs {
+                self.auto_part(conv, uid).await;
+            }
+        }
+        let who = uid.clone();
+        let rooms = self.db(move |s| s.rooms_with_role_or_invite(&who)).await?;
+        let hosted = self.hosts_uid(uid);
+        let now = self.now();
+        {
+            let _keys = self.keys_lock.lock().await;
+            let who = uid.clone();
+            let is_hosted = self.db(move |s| s.hosted_keys(&who)).await?.is_some() && hosted;
+            let who = uid.clone();
+            // A hosted name is never registered again (4.8, 10.5).
+            self.db(move |s| s.forget_identity(&who, is_hosted, now))
+                .await?;
+            if is_hosted {
+                self.unpublish(uid).await;
+            }
+        }
+        for room in rooms {
+            if let Some(entry) = self.room_entry(&room) {
+                let mut st = entry.lock().await;
+                if let Some(info) = st.room_info_mut() {
+                    info.roles.remove(uid);
+                    info.invites.remove(uid);
+                }
+            }
+        }
+        // Operators from the configuration stay operators (10.1).
+        let configured = self.config.operators().iter().any(|op| op.to_uid() == *uid);
+        if !configured {
+            self.operators
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(uid);
+        }
+        // M5a: KeyPackages, pending Welcomes and backups (4.8).
+        Ok(())
+    }
+}
