@@ -1543,7 +1543,12 @@ A client catches up like this:
 3. For each conversation, let L be its sync point. If L is less than
    `<head>`, send `HISTORY <conv> after=L`, and repeat while the response
    says `more=1`. After each page, the sync point moves to the last seq
-   in it, and on over any stored events that directly follow.
+   in it, and on over any stored events that directly follow. If the
+   response holds no events and says `more=0`, every event after L up to
+   the head the client knew when it sent the command has expired (7.5),
+   and the sync point moves to that head. A head learned while the
+   command was on its way is not covered by the response: if it is
+   higher, send HISTORY again.
 4. If the gap is large, the client MAY instead fetch only the newest page,
    and load older pages when the user scrolls back (7.3). The sync point
    then stays where it was until the gap is filled.
