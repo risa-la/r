@@ -71,6 +71,22 @@ pub enum ClientError {
         /// Whether retrying cannot help.
         permanent: bool,
     },
+    /// The server refused to sign in, to register, or to change the
+    /// identity's keys or delete it, or the client cannot ask it to (4.2,
+    /// 4.5-4.8). `kind` says why.
+    #[error("{message}")]
+    Refused {
+        /// Why, to show in the user's language.
+        kind: RefusedKind,
+        /// What went wrong, in English, for logs. The server's message
+        /// if it sent one.
+        message: String,
+        /// The `retry` tag of the server's `ERR`, in seconds, if it sent
+        /// one (3.2). A [`RefusedKind::Forbidden`] with it passes with
+        /// time, like a rate limit. One without it does not: closed
+        /// registration, a ban or server policy.
+        retry_after_secs: Option<u64>,
+    },
     /// The server answered `ERR` (3.7).
     #[error("{code}: {message}")]
     Server {
@@ -126,13 +142,8 @@ pub enum ConnectionErrorKind {
     Protocol,
     /// The connection closed.
     Closed,
-    /// An identity cannot sign in to a server given as an IP address,
-    /// which sends no hostname (2.1).
-    NoHostname,
     /// The sign-in nonce was used up; connecting again helps (4.5).
     NonceUsed,
-    /// The server does not offer registration (4.6).
-    NoRegistration,
     /// The client could not start its runtime.
     Runtime,
 }
@@ -144,8 +155,84 @@ pub enum KeyErrorKind {
     NoKeyStore,
     /// The key store holds no key for the identity.
     NoKey,
+    /// The identity already has a different device key, and replacing it
+    /// was not asked for.
+    Exists,
+    /// A private key to import is not a PEM PKCS#8 ML-DSA-44 key (App. A),
+    /// or a public key or key file line is not valid (4.4).
+    BadKey,
     /// The key store failed.
     Failed,
+}
+
+/// Why the server refused, or the client could not ask
+/// ([`ClientError::Refused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusedKind {
+    /// `auth-failed`: the identity's key file does not list this device's
+    /// key, or the server could not fetch the file (4.4, 4.5). For
+    /// REGISTER, the signature did not verify (4.6).
+    AuthFailed,
+    /// `name-taken`: the name is registered already (4.6), or a guest
+    /// name is in use (4.2).
+    NameTaken,
+    /// `forbidden`: registration is closed, the user or address is
+    /// banned, or server policy says no. With
+    /// [`retry_after_secs`](ClientError::Refused::retry_after_secs), a
+    /// limit that passes with time.
+    Forbidden,
+    /// `rate-limited`: too many attempts; see
+    /// [`retry_after_secs`](ClientError::Refused::retry_after_secs).
+    RateLimited,
+    /// The server does not offer registration: INFO says `register=no`,
+    /// or REGISTER got `not-supported` (4.6, 8.5).
+    NoRegistration,
+    /// An identity cannot sign in to, or register on, a server given as
+    /// an IP address, which sends no hostname (2.1, 4.5).
+    NoHostname,
+    /// The server does not host this identity, so KEY cannot change its
+    /// keys: they are in the identity's own key file (4.4, 4.7).
+    NotHosted,
+    /// The server refused to remove the identity's last key (4.7).
+    LastKey,
+    /// UNREGISTER needs the account's own uid typed out, and this one is
+    /// different (4.8).
+    WrongUid,
+    /// A guest has no keys and nothing to unregister (4.2).
+    Guest,
+    /// `not-supported`: the server does not offer this, for example
+    /// signing in as an identity at all, or UNREGISTER's `purge`.
+    NotSupported,
+}
+
+impl RefusedKind {
+    /// The kind for a sign-in, REGISTER, KEY or UNREGISTER refused with
+    /// `code`, or `None` for codes that are general failures.
+    pub(crate) fn of(code: &ErrorCode) -> Option<RefusedKind> {
+        Some(match code {
+            ErrorCode::AuthFailed => RefusedKind::AuthFailed,
+            ErrorCode::NameTaken => RefusedKind::NameTaken,
+            ErrorCode::Forbidden => RefusedKind::Forbidden,
+            ErrorCode::RateLimited => RefusedKind::RateLimited,
+            ErrorCode::NotSupported => RefusedKind::NotSupported,
+            _ => return None,
+        })
+    }
+
+    /// The error code the server sent, if it sent one.
+    fn code(self) -> Option<&'static str> {
+        Some(match self {
+            RefusedKind::AuthFailed => "auth-failed",
+            RefusedKind::NameTaken => "name-taken",
+            RefusedKind::Forbidden | RefusedKind::LastKey => "forbidden",
+            RefusedKind::RateLimited => "rate-limited",
+            RefusedKind::NotSupported | RefusedKind::NotHosted => "not-supported",
+            RefusedKind::NoRegistration
+            | RefusedKind::NoHostname
+            | RefusedKind::WrongUid
+            | RefusedKind::Guest => return None,
+        })
+    }
 }
 
 impl ConnectionErrorKind {
@@ -167,8 +254,8 @@ impl ConnectionErrorKind {
             E::Rejected(conn::CommandError::Server(_)) => ConnectionErrorKind::Protocol,
             E::Closed(_) => ConnectionErrorKind::Closed,
             E::NonceUsed => ConnectionErrorKind::NonceUsed,
-            E::NoSni => ConnectionErrorKind::NoHostname,
-            E::NoRegistration => ConnectionErrorKind::NoRegistration,
+            // These become ClientError::Refused instead.
+            E::NoSni | E::NoRegistration => ConnectionErrorKind::Protocol,
         }
     }
 }
@@ -182,10 +269,30 @@ impl ClientError {
         }
     }
 
-    /// The error code of an `ERR`, if this is one.
+    /// A refusal of this kind, with the client's own message.
+    pub(crate) fn refused(kind: RefusedKind, message: impl Into<String>) -> ClientError {
+        ClientError::Refused {
+            kind,
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
+
+    /// A key store error.
+    pub(crate) fn keys(kind: KeyErrorKind, message: impl Into<String>) -> ClientError {
+        ClientError::Keys {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The error code of an `ERR`, if this is one: a
+    /// [`Server`](Self::Server) error, or a [`Refused`](Self::Refused)
+    /// one the server sent.
     pub fn code(&self) -> Option<&str> {
         match self {
             ClientError::Server { code, .. } => Some(code),
+            ClientError::Refused { kind, .. } => kind.code(),
             _ => None,
         }
     }
@@ -202,6 +309,15 @@ impl ClientError {
             | ClientError::Keys { .. }
             | ClientError::Invalid(_) => true,
             ClientError::Connection { permanent, .. } => *permanent,
+            ClientError::Refused {
+                kind,
+                retry_after_secs,
+                ..
+            } => match kind {
+                RefusedKind::NameTaken | RefusedKind::RateLimited => false,
+                RefusedKind::Forbidden => retry_after_secs.is_none(),
+                _ => true,
+            },
             ClientError::Server { code, .. } => matches!(
                 code.as_str(),
                 "auth-failed" | "forbidden" | "not-supported" | "bad-syntax" | "unknown-command"
@@ -242,12 +358,51 @@ impl ClientError {
                 reason: ca_error.clone(),
             },
             conn::Error::Rejected(conn::CommandError::Server(err)) => ClientError::server(err),
+            conn::Error::NoSni => ClientError::refused(
+                RefusedKind::NoHostname,
+                format!(
+                    "cannot sign in as an identity to {server}: an IP address sends no hostname"
+                ),
+            ),
+            conn::Error::NoRegistration => ClientError::refused(
+                RefusedKind::NoRegistration,
+                format!("{server} offers no registration"),
+            ),
             other => ClientError::Connection {
                 kind: ConnectionErrorKind::of(other),
                 message: other.to_string(),
                 permanent: other.is_permanent(),
             },
         }
+    }
+}
+
+impl ClientError {
+    /// An error from connecting and signing in, or from REGISTER, KEY or
+    /// UNREGISTER: an `ERR` with a code of [`RefusedKind`] becomes
+    /// [`ClientError::Refused`], and the rest is as
+    /// [`from_conn`](Self::from_conn).
+    pub(crate) fn from_sign_in(server: &str, e: &conn::Error) -> ClientError {
+        match e {
+            conn::Error::Rejected(conn::CommandError::Server(err)) => {
+                ClientError::from_err(err).unwrap_or_else(|| ClientError::server(err))
+            }
+            other => ClientError::from_conn(server, other),
+        }
+    }
+
+    /// An `ERR` with a code of [`RefusedKind`], as [`ClientError::Refused`].
+    pub(crate) fn from_err(err: &risala_proto::server::ErrResponse) -> Option<ClientError> {
+        let kind = RefusedKind::of(&err.code)?;
+        let message = match unescape(&err.message) {
+            m if m.is_empty() => err.code.to_string(),
+            m => format!("{}: {m}", err.code),
+        };
+        Some(ClientError::Refused {
+            kind,
+            message,
+            retry_after_secs: err.retry,
+        })
     }
 }
 
@@ -944,4 +1099,53 @@ pub enum AccountEvent {
 /// Whether an error code means the room cannot be joined again as it is.
 pub(crate) fn is_lasting_refusal(code: &ErrorCode) -> bool {
     matches!(code, ErrorCode::NotFound | ErrorCode::Forbidden)
+}
+
+/// This device's key for an identity (4.4), as the key store holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceKey {
+    /// The identity it signs in as, such as `alice@example.org`.
+    pub identity: String,
+    /// The ML-DSA-44 public key, in base64, 1752 characters (4.4).
+    pub public_key: String,
+    /// The SHA-256 fingerprint of the public key, `sha256:...`, short
+    /// enough to compare by eye.
+    pub fingerprint: String,
+}
+
+impl DeviceKey {
+    pub(crate) fn new(identity: &str, key: &risala_proto::auth::PublicKey) -> DeviceKey {
+        DeviceKey {
+            identity: identity.to_owned(),
+            public_key: key.to_string(),
+            fingerprint: key.fingerprint().to_string(),
+        }
+    }
+}
+
+/// One key of a hosted identity, from KEY LIST (4.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyInfo {
+    /// The ML-DSA-44 public key, in base64.
+    pub public_key: String,
+    /// The label, usually the device's name, unescaped; empty if none.
+    pub label: String,
+    /// The SHA-256 fingerprint of the public key, `sha256:...`.
+    pub fingerprint: String,
+    /// Whether it is this device's key.
+    pub this_device: bool,
+}
+
+/// What [`Account::unregister`](super::Account::unregister) did (4.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unregistered {
+    /// The identity deleted.
+    pub uid: String,
+    /// Whether the server hosted the identity (4.6). Then it deleted the
+    /// identity's keys and key file, and the device key was deleted too.
+    pub hosted: bool,
+    /// Whether this device's key was deleted from the key store. It is
+    /// kept for an identity the server does not host, since the key is
+    /// still in the identity's own key file and works on other servers.
+    pub key_deleted: bool,
 }

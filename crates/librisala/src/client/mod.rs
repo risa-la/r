@@ -27,6 +27,27 @@
 //! ([`types`]), names and addresses are strings, and changes arrive
 //! through async `next()` calls rather than borrowed iterators.
 //!
+//! # Identities
+//!
+//! An identity account (4.3) signs in with this device's ML-DSA-44 key,
+//! kept in [`ClientOptions::keys`] under the identity:
+//!
+//! - **Keys.** [`Client::create_device_key`] or
+//!   [`Client::import_device_key`] (PEM, App. A), then
+//!   [`Client::key_line`] for the line a self-hosted identity publishes
+//!   in its key file at [`Client::key_file_url`] (4.4).
+//! - **Signing in.** [`Client::add_identity`], then [`Account::connect`]
+//!   (AUTH, 4.5). The first `auth-failed` of a run is tried once more
+//!   after [`ClientOptions::auth_retry`], for a key file just updated; a
+//!   second one is final.
+//! - **Registering.** [`Client::register`] (4.6).
+//! - **Hosted identities' keys.** [`Account::keys`], [`Account::add_key`]
+//!   and [`Account::remove_key`] (4.7).
+//! - **Deleting.** [`Account::unregister`] (4.8).
+//!
+//! The server's refusals are [`ClientError::Refused`] with a
+//! [`RefusedKind`], and key store failures [`ClientError::Keys`].
+//!
 //! # Order
 //!
 //! The sync engine needs every server line in the order it arrived, with
@@ -109,9 +130,12 @@
 
 mod account;
 mod driver;
+mod identity;
 mod timeline;
 pub mod types;
 
+#[cfg(test)]
+mod identity_tests;
 #[cfg(test)]
 mod tests;
 
@@ -131,9 +155,9 @@ pub use account::{Account, AccountEvents, Conversation};
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
-    ConversationPage, DEFAULT_PAGE, DisconnectKind, EventKind, FailKind, KeyErrorKind, MAX_PAGE,
-    Message, MessagePage, Notice, OutboxEntry, OutboxStatus, ReactionCount, RoomList, RoomListing,
-    ServerHello, Setting, TrustInfo,
+    ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind, FailKind, KeyErrorKind,
+    KeyInfo, MAX_PAGE, Message, MessagePage, Notice, OutboxEntry, OutboxStatus, ReactionCount,
+    RefusedKind, RoomList, RoomListing, ServerHello, Setting, TrustInfo, Unregistered,
 };
 
 use account::AccountShared;
@@ -155,6 +179,11 @@ pub struct ClientOptions {
     pub rejoin_guest_rooms: bool,
     /// Where identities' device keys are, for signing in (4.5).
     pub keys: Option<Arc<dyn KeyStore>>,
+    /// After the first `auth-failed` of an identity account's run, try
+    /// once more after this long, in case the server held a cached key
+    /// file without a key just added (4.4). `None` fails at once. Two
+    /// seconds by default.
+    pub auth_retry: Option<std::time::Duration>,
     /// The tokio runtime to run on. `None`: the runtime current when the
     /// client is made, or else one of the client's own. See the [module
     /// docs](self).
@@ -169,6 +198,7 @@ impl Default for ClientOptions {
             sync: SyncConfig::default(),
             rejoin_guest_rooms: true,
             keys: None,
+            auth_retry: Some(std::time::Duration::from_secs(2)),
             runtime: None,
         }
     }
@@ -182,6 +212,7 @@ impl std::fmt::Debug for ClientOptions {
             .field("sync", &self.sync)
             .field("rejoin_guest_rooms", &self.rejoin_guest_rooms)
             .field("keys", &self.keys.as_ref().map(|_| ".."))
+            .field("auth_retry", &self.auth_retry)
             .field("runtime", &self.runtime.as_ref().map(|_| ".."))
             .finish()
     }
@@ -358,21 +389,30 @@ impl Client {
         let name: risala_proto::names::Name = name
             .parse()
             .map_err(|_| ClientError::Invalid(format!("name {name:?}")))?;
-        self.add(server, Uid::guest(&name))
+        self.add_uid(server, Uid::guest(&name))
     }
 
     /// The account for the identity `identity` on `server` (4.3), added to
-    /// the cache if new. Signing in needs its device key in
+    /// the cache if new. It does not connect.
+    ///
+    /// Signing in needs this device's key for the identity in
     /// [`ClientOptions::keys`], stored under the identity, such as
-    /// `alice@example.org`.
+    /// `alice@example.org`: see [`create_device_key`](Self::create_device_key)
+    /// and [`import_device_key`](Self::import_device_key). The identity's
+    /// key file must list it (4.4), or for an identity the server hosts,
+    /// one of its signed-in devices must have added it
+    /// ([`Account::add_key`], 4.7). A server given as an IP address cannot
+    /// be signed in to as an identity (2.1); connecting then fails with
+    /// [`RefusedKind::NoHostname`].
     pub fn add_identity(&self, server: &str, identity: &str) -> Result<Account, ClientError> {
         let identity: Identity = identity
+            .trim()
             .parse()
             .map_err(|_| ClientError::Invalid(format!("identity {identity:?}")))?;
-        self.add(server, identity.to_uid())
+        self.add_uid(server, identity.to_uid())
     }
 
-    fn add(&self, server: &str, uid: Uid) -> Result<Account, ClientError> {
+    pub(crate) fn add_uid(&self, server: &str, uid: Uid) -> Result<Account, ClientError> {
         let server = parse_server(server)?;
         let id = self.inner.store.account(&server, &uid)?;
         Ok(self.handle(id, server, uid))

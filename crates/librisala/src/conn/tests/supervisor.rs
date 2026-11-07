@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use risala_proto::auth::SecretKey;
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
 use tokio::sync::mpsc;
@@ -11,7 +12,7 @@ use super::server::{Peer, ScriptServer, ServerCert, TestCa};
 use super::{chat_test, options, store};
 use crate::addr::{TrustRecord, TrustStore};
 use crate::conn::{
-    Backoff, CloseReason, CommandError, Error, GuestSignIn, GuestToken, Supervisor,
+    Backoff, CloseReason, CommandError, Error, GuestSignIn, GuestToken, IdentitySignIn, Supervisor,
     SupervisorEvent, TrustError,
 };
 
@@ -330,6 +331,116 @@ async fn auth_failed_is_permanent() {
         "{error:?}"
     );
     assert!(events.recv().await.is_none());
+    server.done().await;
+}
+
+#[tokio::test]
+async fn forbidden_with_retry_passes() {
+    // A forbidden with a retry tag is a limit that passes with time, so
+    // the supervisor waits at least that long and tries again.
+    let cert = ServerCert::self_signed("chat.test");
+    let trust = pinned(&cert).await;
+    let server = ScriptServer::start(cert, 2, |i, mut peer: Peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 GUEST sam").await;
+        if i == 0 {
+            peer.send("@ref=1;retry=1 ERR forbidden slow down").await;
+        } else {
+            peer.send("@ref=1 OK uid=~sam").await;
+        }
+        peer.expect_eof().await;
+    })
+    .await;
+    let ca = TestCa::new();
+    let (supervisor, mut events) =
+        Supervisor::spawn(chat_test(), trust, options(&ca, &server), guest(), fast());
+    next(&mut events).await;
+    next(&mut events).await;
+    let SupervisorEvent::Waiting {
+        delay,
+        error: Some(error),
+    } = next(&mut events).await
+    else {
+        panic!()
+    };
+    assert_eq!(error.retry_after(), Some(1));
+    assert!(!error.is_permanent());
+    assert!(delay >= Duration::from_secs(1), "{delay:?}");
+    supervisor.reconnect_now();
+    next(&mut events).await;
+    next(&mut events).await;
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::SignedIn { .. }
+    ));
+    supervisor.stop().await;
+    server.done().await;
+}
+
+/// Signs in as alice with the key of Appendix B, retrying `auth-failed`
+/// once after 10 ms.
+fn alice() -> Arc<IdentitySignIn> {
+    let key = SecretKey::from_pkcs8_pem(crate::conn::keys::tests::PEM).unwrap();
+    Arc::new(IdentitySignIn {
+        auth_retry: Some(Duration::from_millis(10)),
+        ..IdentitySignIn::new("alice@example.org".parse().unwrap(), key)
+    })
+}
+
+#[tokio::test]
+async fn auth_failed_is_retried_once_per_run_before_signing_in() {
+    // Connection 0 fails and 1 signs in. After a drop, 2 fails: the run
+    // has signed in, so that is final.
+    let cert = ServerCert::self_signed("chat.test");
+    let trust = pinned(&cert).await;
+    let server = ScriptServer::start(cert, 3, |i, mut peer: Peer| async move {
+        peer.greet().await;
+        let line = peer.recv().await.unwrap();
+        assert!(line.starts_with("@ref=1 AUTH alice@example.org "), "{line}");
+        if i == 1 {
+            peer.send("@ref=1 OK uid=alice@example.org").await;
+            peer.close().await;
+        } else {
+            peer.send("@ref=1 ERR auth-failed").await;
+            peer.expect_eof().await;
+        }
+    })
+    .await;
+    let ca = TestCa::new();
+    let (_supervisor, mut events) =
+        Supervisor::spawn(chat_test(), trust, options(&ca, &server), alice(), fast());
+    let mut seen = Vec::new();
+    loop {
+        match next(&mut events).await {
+            SupervisorEvent::Connecting { .. } => seen.push("connecting"),
+            SupervisorEvent::Connected { .. } => {}
+            SupervisorEvent::Waiting { error: Some(e), .. } => {
+                assert!(e.is_auth_failed());
+                seen.push("retry");
+            }
+            SupervisorEvent::Waiting { error: None, .. } => {}
+            SupervisorEvent::SignedIn { .. } => seen.push("signed in"),
+            SupervisorEvent::Disconnected { .. } => seen.push("dropped"),
+            SupervisorEvent::Failed { error } => {
+                assert!(error.is_auth_failed());
+                seen.push("failed");
+                break;
+            }
+            SupervisorEvent::Stopped => panic!(),
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "connecting",
+            "retry",
+            "connecting",
+            "signed in",
+            "dropped",
+            "connecting",
+            "failed"
+        ]
+    );
     server.done().await;
 }
 

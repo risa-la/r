@@ -151,12 +151,12 @@ async fn drive(
                     SupervisorEvent::Waiting { delay, error } => {
                         shared.set_state(ConnectionState::Waiting {
                             retry_in_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                            error: error.map(|e| ClientError::from_conn(&server, &e)),
+                            error: error.map(|e| ClientError::from_sign_in(&server, &e)),
                         });
                     }
                     SupervisorEvent::Failed { error } => {
                         shared.set_state(ConnectionState::Failed {
-                            error: ClientError::from_conn(&server, &error),
+                            error: ClientError::from_sign_in(&server, &error),
                         });
                         return None;
                     }
@@ -231,7 +231,11 @@ fn sign_in_for(
             kind: KeyErrorKind::NoKey,
             message: format!("no key for {identity}"),
         })?;
-    Ok(Arc::new(IdentitySignIn { identity, key }))
+    Ok(Arc::new(IdentitySignIn {
+        identity,
+        key,
+        auth_retry: shared.options.auth_retry,
+    }))
 }
 
 // ---------------------------------------------------------------------------

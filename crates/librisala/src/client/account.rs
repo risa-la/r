@@ -169,6 +169,11 @@ impl AccountShared {
         self.uid.is_guest()
     }
 
+    /// Whether the account's task is running.
+    pub fn is_running(&self) -> bool {
+        self.driver_queue().is_some()
+    }
+
     /// The running task's command queue, if a task is running.
     fn driver_queue(&self) -> Option<mpsc::UnboundedSender<Cmd>> {
         let driver = self.driver.lock().expect("poisoned");
@@ -251,6 +256,22 @@ impl Account {
     /// Where the connection is.
     pub fn state(&self) -> ConnectionState {
         self.shared.state.borrow().clone()
+    }
+
+    /// Whether the account is running: started, and not stopped or
+    /// failed for good.
+    pub(crate) fn is_running(&self) -> bool {
+        self.shared.is_running()
+    }
+
+    /// The signed-in session, for commands outside the sync engine.
+    pub(crate) fn session(&self) -> Result<Arc<Session>, ClientError> {
+        self.shared
+            .session
+            .lock()
+            .expect("poisoned")
+            .clone()
+            .ok_or(ClientError::NotConnected)
     }
 
     /// Starts keeping a connection up in the background, signing in and
@@ -450,13 +471,7 @@ impl Account {
         limit: Option<u64>,
     ) -> Result<RoomList, ClientError> {
         let after = after.map(|a| parse_room(&a)).transpose()?;
-        let session = self
-            .shared
-            .session
-            .lock()
-            .expect("poisoned")
-            .clone()
-            .ok_or(ClientError::NotConnected)?;
+        let session = self.session()?;
         let command = Command::List(RoomPage {
             after,
             limit: limit.and_then(NonZeroU64::new),

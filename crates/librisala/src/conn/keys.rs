@@ -38,6 +38,23 @@ pub fn key_line(key: &PublicKey, label: Option<&str>) -> Result<String, ParseErr
     Ok(KeyEntry::new(key.clone(), label)?.to_string())
 }
 
+/// Reads a public key given either as a key file line,
+/// `mldsa44 <key> [<label...>]` (4.4), or as the key alone in base64. The
+/// key alone may be wrapped over several lines, as Appendix B shows it.
+/// Returns the key, and the line's label if it has one.
+///
+/// This is what a user pastes from another device's "show my key" (4.7).
+pub fn parse_key_input(input: &str) -> Result<(PublicKey, Option<String>), ParseError> {
+    let input = input.trim();
+    let first = input.split([' ', '\t']).next().unwrap_or("");
+    if first.eq_ignore_ascii_case("mldsa44") {
+        let entry: KeyEntry = input.parse()?;
+        return Ok((entry.key().clone(), entry.label().map(str::to_owned)));
+    }
+    let key: String = input.split_whitespace().collect();
+    Ok((key.parse()?, None))
+}
+
 /// The AUTH command for `identity` (4.5).
 ///
 /// `sni_host` must be the hostname this client sent in SNI, not the host
@@ -370,6 +387,40 @@ pub(crate) mod tests {
         );
         assert_eq!(key_line(&key, None).unwrap(), format!("mldsa44 {PUBLIC}"));
         assert!(key_line(&key, Some("a\nb")).is_err());
+    }
+
+    #[test]
+    fn key_input() {
+        let key = appendix_b().public_key();
+        let line = format!("mldsa44 {PUBLIC} old laptop");
+        assert_eq!(
+            parse_key_input(&format!("  {line}\n")).unwrap(),
+            (key.clone(), Some("old laptop".to_owned()))
+        );
+        assert_eq!(
+            parse_key_input(&format!("MLDSA44\t{PUBLIC}")).unwrap(),
+            (key.clone(), None)
+        );
+        assert_eq!(parse_key_input(PUBLIC).unwrap(), (key.clone(), None));
+        // Wrapped at 64 characters, as in Appendix B.
+        let wrapped: Vec<&str> = PUBLIC
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        assert_eq!(
+            parse_key_input(&wrapped.join("\n")).unwrap(),
+            (key.clone(), None)
+        );
+        for bad in [
+            "",
+            "mldsa44",
+            "ssh-ed25519 AAAA",
+            "mldsa44 abc",
+            &PUBLIC[1..],
+        ] {
+            assert!(parse_key_input(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

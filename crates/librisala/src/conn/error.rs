@@ -78,11 +78,15 @@ impl Error {
     /// Permanent: every [`TrustError`], a key exchange the server does
     /// not support, an unsupported version, a missing
     /// SNI, no registration, an invalid command, and a sign-in refused
-    /// with `auth-failed`, `forbidden`, `not-supported`, `bad-syntax` or
-    /// `unknown-command`. Everything else, including `name-taken` (a
-    /// guest's old session may not have ended yet, and
-    /// [`GuestSignIn`](super::GuestSignIn) has already tried other names),
-    /// `rate-limited` and `internal`, may pass.
+    /// with `auth-failed`, `forbidden` without a `retry` tag,
+    /// `not-supported`, `bad-syntax` or `unknown-command`. Everything
+    /// else, including `name-taken` (a guest's old session may not have
+    /// ended yet, and [`GuestSignIn`](super::GuestSignIn) has already
+    /// tried other names), `rate-limited`, a `forbidden` with `retry` (a
+    /// limit that passes with time) and `internal`, may pass.
+    ///
+    /// A [`Supervisor`](super::Supervisor) may still try once more after
+    /// `auth-failed`; see [`SignIn::auth_retry`](super::SignIn::auth_retry).
     pub fn is_permanent(&self) -> bool {
         match self {
             Error::Trust(_)
@@ -92,19 +96,28 @@ impl Error {
             | Error::NoRegistration
             | Error::InvalidCommand(_)
             | Error::NoResponse => true,
-            Error::Rejected(CommandError::Server(err)) => matches!(
-                err.code,
+            Error::Rejected(CommandError::Server(err)) => match err.code {
+                ErrorCode::Forbidden => err.retry.is_none(),
                 ErrorCode::AuthFailed
-                    | ErrorCode::Forbidden
-                    | ErrorCode::NotSupported
-                    | ErrorCode::BadSyntax
-                    | ErrorCode::UnknownCommand
-            ),
+                | ErrorCode::NotSupported
+                | ErrorCode::BadSyntax
+                | ErrorCode::UnknownCommand => true,
+                _ => false,
+            },
             _ => false,
         }
     }
 
-    /// The `retry` tag of an `ERR rate-limited`, in seconds (3.2).
+    /// Whether the server answered `ERR auth-failed` (4.5).
+    pub fn is_auth_failed(&self) -> bool {
+        matches!(
+            self,
+            Error::Rejected(CommandError::Server(err)) if err.code == ErrorCode::AuthFailed
+        )
+    }
+
+    /// The `retry` tag of an `ERR`, in seconds (3.2): sent with
+    /// `rate-limited`, and with a `forbidden` that passes with time.
     pub fn retry_after(&self) -> Option<u64> {
         match self {
             Error::Rejected(CommandError::Server(err)) => err.retry,

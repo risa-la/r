@@ -11,7 +11,7 @@ use risala_proto::auth::SecretKey;
 use risala_proto::command::{Command, Request};
 use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, MAX_SERVER_LINE, check_line_len};
 use risala_proto::line::read_ref;
-use risala_proto::names::{Id, Identity, Name, Uid};
+use risala_proto::names::{Domain, Id, Identity, Name, Uid};
 use risala_proto::server::{
     ErrResponse, Greeting, OkResponse, Register, ServerLine, ServerMessage,
 };
@@ -493,19 +493,53 @@ impl Session {
     /// Creates the identity `<name>@<identity domain>` with `key` as its
     /// first key, and signs in as it (4.6).
     ///
-    /// The identity domain comes from INFO (8.5) first; a server without
-    /// registration gives [`Error::NoRegistration`]. Signs with the SNI
-    /// hostname, as [`auth`](Self::auth) does.
+    /// The identity domain comes from INFO (8.5) first, through
+    /// [`identity_domain`](Self::identity_domain). Then it is
+    /// [`register_under`](Self::register_under).
     pub async fn register(&self, name: &Name, key: &SecretKey) -> Result<Uid, Error> {
-        let sni = self.info.sni.clone().ok_or(Error::NoSni)?;
+        if self.info.sni.is_none() {
+            return Err(Error::NoSni);
+        }
+        let domain = self.identity_domain().await?;
+        self.register_under(name, &domain, key).await
+    }
+
+    /// The server's identity domain, from INFO's `register=` (4.6, 8.5).
+    /// A server without registration (`register=no`, or no value that
+    /// parses) gives [`Error::NoRegistration`].
+    pub async fn identity_domain(&self) -> Result<Domain, Error> {
         let info = self.request_ok(Command::Info { room: None }).await?;
-        let domain = match info.register() {
-            Ok(Some(Register::Domain(domain))) => domain,
-            _ => return Err(Error::NoRegistration),
+        match info.register() {
+            Ok(Some(Register::Domain(domain))) => Ok(domain),
+            _ => Err(Error::NoRegistration),
+        }
+    }
+
+    /// Sends `REGISTER <name> <key> <signature>` for the identity
+    /// `<name>@<domain>`, where `domain` is the server's identity domain
+    /// from [`identity_domain`](Self::identity_domain) (4.6).
+    ///
+    /// It signs with the SNI hostname, as [`auth`](Self::auth) does, and
+    /// fails with [`Error::NoSni`] over an IP address (2.1). A server that
+    /// answers `not-supported` offers no registration after all:
+    /// [`Error::NoRegistration`].
+    pub async fn register_under(
+        &self,
+        name: &Name,
+        domain: &Domain,
+        key: &SecretKey,
+    ) -> Result<Uid, Error> {
+        let sni = self.info.sni.as_deref().ok_or(Error::NoSni)?;
+        let command = keys::register_command(sni, &self.info.greeting.nonce, name, domain, key);
+        let ok = match self.request_ok(command).await {
+            Err(Error::Rejected(CommandError::Server(err)))
+                if err.code == risala_proto::error::ErrorCode::NotSupported =>
+            {
+                return Err(Error::NoRegistration);
+            }
+            other => other?,
         };
-        let command = keys::register_command(&sni, &self.info.greeting.nonce, name, &domain, key);
-        let ok = self.request_ok(command).await?;
-        let expected = risala_proto::names::Identity::new(name, &domain).to_uid();
+        let expected = Identity::new(name, domain).to_uid();
         Ok(signed_in_uid(&ok, expected))
     }
 
