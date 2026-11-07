@@ -6,6 +6,8 @@
 //! - [`config`]: the TOML configuration file.
 //! - [`handler`]: the interface between the network layer and the core.
 //! - [`net`]: TLS listeners, connection tasks, framing and keepalive.
+//! - [`http`]: HTTPS: fetching key files, the key file directory, and the
+//!   listener that serves hosted identities' key files.
 //! - [`core`]: the hub: sign-in, rooms, events, history and fan-out.
 //! - [`store`]: persistent storage, behind a trait, with SQLite.
 //! - [`daemon`]: the whole server, the hub behind the network layer:
@@ -18,6 +20,7 @@ pub mod config;
 pub mod core;
 pub mod daemon;
 pub mod handler;
+pub mod http;
 pub mod net;
 pub mod store;
 pub mod testing;

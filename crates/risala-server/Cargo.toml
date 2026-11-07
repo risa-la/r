@@ -18,6 +18,7 @@ path = "src/lib.rs"
 
 [dependencies]
 risala-proto.workspace = true
+risala-keyfetch.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 webpki.workspace = true

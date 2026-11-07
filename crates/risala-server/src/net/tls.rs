@@ -48,7 +48,7 @@ pub(crate) fn server_config(certs: &Certificates) -> io::Result<rustls::ServerCo
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(io::Error::other)?
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(Resolver(certs.inner.clone())));
+        .with_cert_resolver(certs.resolver());
     config.alpn_protocols = vec![risala_proto::ALPN.to_vec()];
     Ok(config)
 }
@@ -93,23 +93,46 @@ impl Certificates {
         } else {
             config.tls.certs.clone()
         };
+        let certs = Certificates::from_pairs(pairs)?;
+        if config.tls.certs.is_empty() {
+            tracing::info!(
+                host = %config.hostname,
+                fingerprint = %certs.fingerprint(),
+                "using a self-signed certificate"
+            );
+        }
+        Ok(certs)
+    }
+
+    /// Loads the certificates in `pairs`, in order: the first is the one a
+    /// client gets without SNI. The HTTPS listener uses this for its own
+    /// certificates (`http.certs`).
+    ///
+    /// Fails if `pairs` is empty, if any certificate or key cannot be read,
+    /// parsed or used, or if a key does not belong to its certificate.
+    pub fn from_pairs(pairs: Vec<CertPair>) -> io::Result<Certificates> {
+        if pairs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no certificates given",
+            ));
+        }
         let loaded = pairs
             .iter()
             .map(load_pair)
             .collect::<io::Result<Vec<_>>>()?;
-        if config.tls.certs.is_empty() {
-            tracing::info!(
-                host = %config.hostname,
-                fingerprint = %loaded[0].fingerprint,
-                "using a self-signed certificate"
-            );
-        }
         Ok(Certificates {
             inner: Arc::new(Inner {
                 pairs,
                 loaded: RwLock::new(loaded),
             }),
         })
+    }
+
+    /// Chooses among these certificates by SNI, for a rustls server
+    /// configuration other than the risala listener's (the HTTPS listener).
+    pub(crate) fn resolver(&self) -> Arc<dyn ResolvesServerCert> {
+        Arc::new(Resolver(self.inner.clone()))
     }
 
     /// The fingerprint of the first certificate, the one a client gets

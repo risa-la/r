@@ -351,7 +351,7 @@ async fn connection<H: Handler>(
 
 /// Reloads certificates whose files changed, every [`CERT_POLL`], and all
 /// of them on SIGHUP (2.2).
-async fn watch_certificates(certs: Certificates) {
+pub(crate) async fn watch_certificates(certs: Certificates) {
     let mut poll = tokio::time::interval(CERT_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     poll.tick().await;

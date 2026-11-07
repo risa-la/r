@@ -1316,6 +1316,7 @@ dependencies = [
  "getrandom 0.4.3",
  "proptest",
  "rcgen",
+ "risala-keyfetch",
  "risala-proto",
  "rusqlite",
  "rustls",

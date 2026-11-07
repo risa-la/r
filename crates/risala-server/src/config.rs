@@ -19,6 +19,13 @@
 //! welcome = "Welcome!"
 //! guests = true
 //! retention = "forever"
+//!
+//! [keys]
+//! allow_private = false
+//!
+//! [http]
+//! listen = ["[::]:443"]
+//! key_dir = "/var/lib/risala/keys"
 //! ```
 
 use std::net::SocketAddr;
@@ -53,6 +60,53 @@ pub struct Config {
     pub server: ServerConfig,
     /// Limits and timers.
     pub limits: Limits,
+    /// Fetching key files (4.4).
+    pub keys: KeysConfig,
+    /// The HTTPS listener and the key file directory (4.6).
+    pub http: HttpConfig,
+}
+
+/// Fetching key files over HTTPS (4.4), to check sign-ins (4.5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeysConfig {
+    /// Lets the server fetch key files from loopback, private, link-local
+    /// and other special-purpose addresses (RFC 6890). Off by default: users
+    /// choose the domains, and 4.4 forbids this unless the operator allows
+    /// it, so that they cannot make the server probe its own network. Turn
+    /// it on only for internal deployments and tests.
+    pub allow_private: bool,
+    /// Seconds a fetch may take, from resolving the domain to the end of
+    /// the file: 1 to 10 (4.4).
+    pub fetch_timeout_secs: u64,
+    /// The most key files kept in the cache. Each is kept for up to an hour
+    /// (4.4). At least 1.
+    pub cache_size: usize,
+    /// PEM files of CA certificates to trust besides the public ones built
+    /// in (Mozilla's). For tests and private deployments; 4.4 asks for
+    /// public CAs.
+    pub extra_roots: Vec<PathBuf>,
+}
+
+/// The HTTPS listener, which serves hosted identities' key files at
+/// `/.well-known/risala/<name>` (4.6), and the directory those files are
+/// written to (PLAN.md section 6).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpConfig {
+    /// Addresses for the HTTPS listener. Empty, the default, means no
+    /// listener: serve `key_dir` from another web server instead.
+    pub listen: Vec<SocketAddr>,
+    /// Certificates for the listener, chosen by SNI and re-read when they
+    /// change, as in `[tls]`. Empty means the same certificates as the
+    /// risala listener. Key files are fetched with the certificate checked
+    /// against public CAs (4.4), so a real deployment needs one for the
+    /// identity domain.
+    pub certs: Vec<CertPair>,
+    /// Where hosted identities' key files are written, one file per name,
+    /// so that another web server can serve them. The default is
+    /// `<state_dir>/keys`.
+    pub key_dir: Option<PathBuf>,
 }
 
 /// TLS certificates (2.1, 2.2).
@@ -185,9 +239,25 @@ impl Default for Config {
             tls: TlsConfig::default(),
             server: ServerConfig::default(),
             limits: Limits::default(),
+            keys: KeysConfig::default(),
+            http: HttpConfig::default(),
         }
     }
 }
+
+impl Default for KeysConfig {
+    fn default() -> Self {
+        KeysConfig {
+            allow_private: false,
+            fetch_timeout_secs: MAX_FETCH_TIMEOUT_SECS,
+            cache_size: 10_000,
+            extra_roots: Vec::new(),
+        }
+    }
+}
+
+/// The most seconds a key file fetch may take (4.4).
+pub const MAX_FETCH_TIMEOUT_SECS: u64 = 10;
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -301,7 +371,24 @@ impl Config {
                 l.command_room(),
             ));
         }
+        let k = &self.keys;
+        if !(1..=MAX_FETCH_TIMEOUT_SECS).contains(&k.fetch_timeout_secs) {
+            return invalid(format!(
+                "keys.fetch_timeout_secs is {}, but must be 1 to {MAX_FETCH_TIMEOUT_SECS} (4.4)",
+                k.fetch_timeout_secs
+            ));
+        }
+        if k.cache_size == 0 {
+            return invalid("keys.cache_size must be at least 1".into());
+        }
         let mut warnings = Vec::new();
+        if k.allow_private {
+            warnings.push(
+                "keys.allow_private is on: key files may be fetched from loopback and \
+                 private addresses (4.4)"
+                    .into(),
+            );
+        }
         if l.sign_in_secs < MIN_SIGN_IN_SECS {
             warnings.push(format!(
                 "limits.sign_in_secs is {}; the spec recommends at least {MIN_SIGN_IN_SECS} (4.1)",
@@ -314,6 +401,14 @@ impl Config {
     /// The path of the SQLite database.
     pub fn database_path(&self) -> PathBuf {
         self.state_dir.join("risala.db")
+    }
+
+    /// The key file directory: `http.key_dir`, or `<state_dir>/keys`.
+    pub fn key_dir(&self) -> PathBuf {
+        self.http
+            .key_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("keys"))
     }
 }
 
@@ -408,6 +503,56 @@ mod tests {
         let warnings = with(|l| l.sign_in_secs = 10).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("sign_in_secs"), "{warnings:?}");
+    }
+
+    #[test]
+    fn keys_and_http() {
+        let c = Config::default();
+        assert!(!c.keys.allow_private);
+        assert_eq!(c.keys.fetch_timeout_secs, 10);
+        assert!(c.http.listen.is_empty());
+        assert_eq!(c.key_dir(), PathBuf::from("./keys"));
+
+        let c = Config::parse(
+            r#"
+            state_dir = "/var/lib/risala"
+            [keys]
+            allow_private = true
+            fetch_timeout_secs = 5
+            cache_size = 100
+            extra_roots = ["ca.pem"]
+            [http]
+            listen = ["[::]:443"]
+            key_dir = "/srv/keys"
+            [[http.certs]]
+            cert = "a.pem"
+            key = "b.pem"
+            "#,
+        )
+        .unwrap();
+        assert!(c.keys.allow_private);
+        assert_eq!(c.keys.fetch_timeout_secs, 5);
+        assert_eq!(c.keys.cache_size, 100);
+        assert_eq!(c.keys.extra_roots, [PathBuf::from("ca.pem")]);
+        assert_eq!(c.http.listen[0].port(), 443);
+        assert_eq!(c.http.certs.len(), 1);
+        assert_eq!(c.key_dir(), PathBuf::from("/srv/keys"));
+        let warnings = c.validate().unwrap();
+        assert!(warnings[0].contains("allow_private"), "{warnings:?}");
+
+        assert!(Config::parse("[http]\nlisten = []\nbogus = 1").is_err());
+        assert!(Config::parse("[keys]\nbogus = 1").is_err());
+        let invalid = |f: fn(&mut KeysConfig), what: &str| {
+            let mut c = Config::default();
+            f(&mut c.keys);
+            match c.validate() {
+                Err(ConfigError::Invalid(m)) => assert!(m.contains(what), "{m}"),
+                other => panic!("{what}: {other:?}"),
+            }
+        };
+        invalid(|k| k.fetch_timeout_secs = 0, "fetch_timeout_secs");
+        invalid(|k| k.fetch_timeout_secs = 11, "fetch_timeout_secs");
+        invalid(|k| k.cache_size = 0, "cache_size");
     }
 
     #[test]

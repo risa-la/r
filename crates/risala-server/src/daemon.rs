@@ -28,6 +28,7 @@ use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
 use crate::core::{BYE_SHUTDOWN, CID_PRUNE_PERIOD, Hub, HubError, Timers};
+use crate::http::{self, HttpServer, KeyDir, KeyFetcher};
 use crate::net;
 
 /// An error starting or running the server.
@@ -45,17 +46,30 @@ pub enum RunError {
 
 /// A server that has opened its database, loaded its certificates and
 /// bound its listeners, but does not accept connections yet.
-#[derive(Debug)]
 pub struct Daemon {
     server: net::Server<Hub>,
     hub: Hub,
+    http: Option<HttpServer>,
+    key_dir: Arc<KeyDir>,
+    key_fetcher: Arc<dyn KeyFetcher>,
+}
+
+impl std::fmt::Debug for Daemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Daemon")
+            .field("server", &self.server)
+            .field("http", &self.http)
+            .field("key_dir", &self.key_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Daemon {
     /// Opens the database at [`Config::database_path`] (creating the state
     /// directory if needed), creates the rooms in `config.rooms`, loads or
-    /// generates the certificates (2.2) and binds every address in
-    /// `config.listen`.
+    /// generates the certificates (2.2), sets up key file fetching (4.4)
+    /// and binds every address in `config.listen`, and in `http.listen`
+    /// for the HTTPS listener.
     ///
     /// Port 0 lets the system choose; [`local_addrs`](Self::local_addrs)
     /// says what it chose.
@@ -72,7 +86,36 @@ impl Daemon {
         tokio::task::spawn_blocking(move || {
             let hub = Hub::open_with(config, timers)?;
             let server = net::Server::bind(hub.config(), Arc::new(hub.clone()))?;
-            Ok(Daemon { server, hub })
+            let config = hub.config();
+            let key_fetcher = http::fetch::from_config(&config.keys)?;
+            let key_dir = Arc::new(KeyDir::new(config.key_dir()));
+            let http = if config.http.listen.is_empty() {
+                None
+            } else if config.http.certs.is_empty() {
+                // The risala listener's certificates, which it reloads.
+                let certs = server.certificates().clone();
+                Some(HttpServer::bind(
+                    &config.http.listen,
+                    certs,
+                    false,
+                    key_dir.clone(),
+                )?)
+            } else {
+                let certs = net::Certificates::from_pairs(config.http.certs.clone())?;
+                Some(HttpServer::bind(
+                    &config.http.listen,
+                    certs,
+                    true,
+                    key_dir.clone(),
+                )?)
+            };
+            Ok(Daemon {
+                server,
+                hub,
+                http,
+                key_dir,
+                key_fetcher,
+            })
         })
         .await
         .map_err(|e| RunError::Net(std::io::Error::other(e)))?
@@ -100,6 +143,24 @@ impl Daemon {
         self.hub.config()
     }
 
+    /// The addresses the HTTPS listener listens on, in the order of
+    /// `http.listen`, with the ports the system chose. Empty when it is
+    /// off.
+    pub fn http_addrs(&self) -> &[SocketAddr] {
+        self.http.as_ref().map_or(&[], HttpServer::local_addrs)
+    }
+
+    /// The key file directory, where hosted identities' key files are
+    /// published (4.6) and which the HTTPS listener serves.
+    pub fn key_dir(&self) -> &Arc<KeyDir> {
+        &self.key_dir
+    }
+
+    /// The key file fetcher (4.4), set up from `[keys]`.
+    pub fn key_fetcher(&self) -> &Arc<dyn KeyFetcher> {
+        &self.key_fetcher
+    }
+
     /// Accepts connections until `shutdown` resolves, then says BYE to
     /// every connection (11) and returns once they have closed, or after a
     /// grace period (see [`net::Server::run`]). Then every guest session
@@ -107,11 +168,19 @@ impl Daemon {
     /// rooms (4.2) before this returns.
     ///
     /// Meanwhile, cids older than 24 hours are forgotten every
-    /// [`CID_PRUNE_PERIOD`] (7.6).
+    /// [`CID_PRUNE_PERIOD`] (7.6), and the HTTPS listener, if there is
+    /// one, serves key files. It stops when this returns.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RunError> {
         let _pruner = AbortOnDrop(tokio::spawn(
             self.hub.clone().prune_cids_every(CID_PRUNE_PERIOD),
         ));
+        let _http = self.http.map(|http| {
+            AbortOnDrop(tokio::spawn(async move {
+                if let Err(e) = http.run(std::future::pending()).await {
+                    tracing::error!(error = %e, "the HTTPS listener stopped");
+                }
+            }))
+        });
         let result = self.server.run(shutdown).await;
         // Sessions do not survive a restart (4.2): the guests waiting to
         // resume, and those whose connections just closed, leave now.

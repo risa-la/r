@@ -1,0 +1,428 @@
+//! `risalad`'s HTTPS listener (4.6, PLAN.md section 6): it serves hosted
+//! identities' key files at `/.well-known/risala/<name>`, from the
+//! [`KeyDir`].
+//!
+//! It speaks just enough HTTP/1.1 for that: one request per connection,
+//! answered and then closed. `GET` and `HEAD` of a key file get it, with
+//! `Content-Type: text/plain; charset=utf-8`. Other paths get 404 and
+//! other methods 405. Requests have a size limit and a time limit, and
+//! nothing lists the directory. [`route`] is where the upload URLs of 5.6
+//! will go.
+//!
+//! TLS is 1.3 only. Browsers and curl fetch these files too, so the key
+//! exchange groups are the usual ones (X25519MLKEM768 first, then X25519,
+//! P-256 and P-384), not the risala listener's X25519MLKEM768 alone (2.1).
+
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use risala_proto::names::Name;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
+
+use super::KeyDir;
+use crate::net::{self, Certificates};
+
+/// The path under which key files are served (4.3).
+pub const KEY_FILE_PREFIX: &str = "/.well-known/risala/";
+
+/// The most HTTPS connections open at once. Others are closed as soon as
+/// they are accepted.
+pub const MAX_HTTP_CONNECTIONS: usize = 1024;
+
+/// The most bytes of request head (request line and headers).
+pub const MAX_REQUEST_HEAD: usize = 8 * 1024;
+
+/// How long a client has for its TLS handshake, and then again for its
+/// request, and the server for its response.
+pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The HTTPS listener, bound but not yet accepting.
+pub struct HttpServer {
+    listeners: Vec<std::net::TcpListener>,
+    addrs: Vec<SocketAddr>,
+    acceptor: TlsAcceptor,
+    certs: Certificates,
+    reload: bool,
+    keys: Arc<KeyDir>,
+}
+
+impl std::fmt::Debug for HttpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpServer")
+            .field("addrs", &self.addrs)
+            .field("keys", &self.keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpServer {
+    /// Binds every address in `listen`, to serve the key files in `keys`
+    /// with `certs`, chosen by SNI. Port 0 lets the system choose.
+    ///
+    /// With `reload`, [`run`](Self::run) re-reads the certificates when
+    /// their files change and on SIGHUP, as the risala listener does with
+    /// its own. Pass `false` when sharing the risala listener's
+    /// certificates, which it already reloads.
+    pub fn bind(
+        listen: &[SocketAddr],
+        certs: Certificates,
+        reload: bool,
+        keys: Arc<KeyDir>,
+    ) -> io::Result<HttpServer> {
+        let mut config = rustls::ServerConfig::builder_with_provider(risala_keyfetch::provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(io::Error::other)?
+            .with_no_client_auth()
+            .with_cert_resolver(certs.resolver());
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut listeners = Vec::new();
+        let mut addrs = Vec::new();
+        for addr in listen {
+            let listener = std::net::TcpListener::bind(addr)?;
+            listener.set_nonblocking(true)?;
+            addrs.push(listener.local_addr()?);
+            listeners.push(listener);
+        }
+        Ok(HttpServer {
+            listeners,
+            addrs,
+            acceptor: TlsAcceptor::from(Arc::new(config)),
+            certs,
+            reload,
+            keys,
+        })
+    }
+
+    /// The addresses it listens on, with the ports the system chose.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.addrs
+    }
+
+    /// Serves until `shutdown` resolves, then drops every connection.
+    ///
+    /// Fails only if a listener cannot be registered with the runtime.
+    pub async fn run(self, shutdown: impl Future<Output = ()>) -> io::Result<()> {
+        let listeners = self
+            .listeners
+            .into_iter()
+            .map(TcpListener::from_std)
+            .collect::<io::Result<Vec<_>>>()?;
+        tracing::info!(addrs = ?self.addrs, "HTTPS listening");
+        let shared = Arc::new(Shared {
+            acceptor: self.acceptor,
+            keys: self.keys,
+            permits: Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS)),
+        });
+        let mut background = JoinSet::new();
+        for listener in listeners {
+            background.spawn(accept_loop(listener, shared.clone()));
+        }
+        if self.reload {
+            background.spawn(net::watch_certificates(self.certs));
+        }
+        shutdown.await;
+        // Dropping the set aborts the accept loops, and with them every
+        // connection they started.
+        background.shutdown().await;
+        Ok(())
+    }
+}
+
+struct Shared {
+    acceptor: TlsAcceptor,
+    keys: Arc<KeyDir>,
+    permits: Arc<Semaphore>,
+}
+
+async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+    let mut conns = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (tcp, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "HTTPS accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = shared.permits.clone().try_acquire_owned() else {
+                    tracing::warn!(%peer, "too many HTTPS connections, closing a new one");
+                    continue;
+                };
+                conns.spawn(connection(shared.clone(), tcp, peer, permit));
+            }
+            // Reap finished connections, so the set does not grow.
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+        }
+    }
+}
+
+async fn connection(
+    shared: Arc<Shared>,
+    tcp: TcpStream,
+    peer: SocketAddr,
+    _permit: OwnedSemaphorePermit,
+) {
+    let mut tls = match tokio::time::timeout(HTTP_TIMEOUT, shared.acceptor.accept(tcp)).await {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
+            tracing::debug!(%peer, error = %e, "HTTPS handshake failed");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(%peer, "HTTPS handshake timed out");
+            return;
+        }
+    };
+    let response = match tokio::time::timeout(HTTP_TIMEOUT, read_request(&mut tls)).await {
+        Ok(Ok(request)) => route(&request, &shared.keys).await,
+        Ok(Err(response)) => response,
+        Err(_) => Response::error(408, "Request Timeout"),
+    };
+    tracing::debug!(%peer, status = response.status, "HTTPS request");
+    let _ = tokio::time::timeout(HTTP_TIMEOUT, async {
+        tls.write_all(&response.to_bytes()).await?;
+        tls.shutdown().await
+    })
+    .await;
+}
+
+/// The parts of a request the listener uses.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Request {
+    pub(crate) method: String,
+    /// The path, without any query.
+    pub(crate) path: String,
+}
+
+/// Reads a request head and parses its request line. A request that
+/// cannot be served gets its error response.
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, Response> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let end = loop {
+        if let Some(end) = head_end(&head) {
+            break end;
+        }
+        if head.len() > MAX_REQUEST_HEAD {
+            return Err(Response::error(431, "Request Header Fields Too Large"));
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return Err(Response::error(400, "Bad Request")),
+            Ok(n) => head.extend_from_slice(&chunk[..n]),
+        }
+    };
+    if end > MAX_REQUEST_HEAD {
+        return Err(Response::error(431, "Request Header Fields Too Large"));
+    }
+    parse_request_line(&head[..end]).ok_or_else(|| Response::error(400, "Bad Request"))
+}
+
+/// Where the head ends: the index of the LF that ends its last line, if
+/// the blank line after it has arrived.
+fn head_end(buf: &[u8]) -> Option<usize> {
+    buf.iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == b'\n')
+        .find(|&(i, _)| {
+            matches!(
+                (buf.get(i + 1), buf.get(i + 2)),
+                (Some(b'\n'), _) | (Some(b'\r'), Some(b'\n'))
+            )
+        })
+        .map(|(i, _)| i)
+}
+
+/// Parses `METHOD SP target SP HTTP/1.x` (RFC 9112 3). Only origin-form
+/// targets (a path, then an optional query) are accepted.
+fn parse_request_line(head: &[u8]) -> Option<Request> {
+    let head = std::str::from_utf8(head).ok()?;
+    let line = head.split('\n').next()?.trim_end_matches('\r');
+    let mut parts = line.split(' ');
+    let (method, target, version) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some()
+        || method.is_empty()
+        || !method.bytes().all(|b| b.is_ascii_alphabetic())
+        || !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || !target.starts_with('/')
+    {
+        return None;
+    }
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    Some(Request {
+        method: method.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
+/// A response, always sent with `Connection: close`.
+#[derive(Debug)]
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    reason: &'static str,
+    content_type: &'static str,
+    extra: Vec<(&'static str, &'static str)>,
+    body: Vec<u8>,
+    /// For HEAD: the headers of the body, but not the body.
+    head_only: bool,
+}
+
+impl Response {
+    fn error(status: u16, reason: &'static str) -> Response {
+        Response {
+            status,
+            reason,
+            content_type: "text/plain; charset=utf-8",
+            extra: Vec::new(),
+            body: format!("{status} {reason}\n").into_bytes(),
+            head_only: false,
+        }
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+             X-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+            self.status,
+            self.reason,
+            self.content_type,
+            self.body.len()
+        );
+        for (name, value) in &self.extra {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut bytes = head.into_bytes();
+        if !self.head_only {
+            bytes.extend_from_slice(&self.body);
+        }
+        bytes
+    }
+}
+
+/// What a request asks for, by path.
+enum Route {
+    /// `/.well-known/risala/<name>` (4.3).
+    KeyFile(Name),
+    NotFound,
+}
+
+impl Route {
+    fn of(path: &str) -> Route {
+        match path.strip_prefix(KEY_FILE_PREFIX).map(str::parse::<Name>) {
+            Some(Ok(name)) => Route::KeyFile(name),
+            _ => Route::NotFound,
+        }
+    }
+}
+
+/// Answers a request.
+async fn route(request: &Request, keys: &Arc<KeyDir>) -> Response {
+    let head_only = match request.method.as_str() {
+        "GET" => false,
+        "HEAD" => true,
+        _ => {
+            let mut response = Response::error(405, "Method Not Allowed");
+            response.extra.push(("Allow", "GET, HEAD"));
+            return response;
+        }
+    };
+    let mut response = match Route::of(&request.path) {
+        Route::KeyFile(name) => key_file(name, keys).await,
+        Route::NotFound => Response::error(404, "Not Found"),
+    };
+    response.head_only = head_only;
+    response
+}
+
+/// A hosted identity's key file, or 404.
+async fn key_file(name: Name, keys: &Arc<KeyDir>) -> Response {
+    let keys = keys.clone();
+    let read = tokio::task::spawn_blocking(move || keys.read(&name)).await;
+    match read {
+        Ok(Ok(Some(body))) => Response {
+            status: 200,
+            reason: "OK",
+            content_type: "text/plain; charset=utf-8",
+            extra: Vec::new(),
+            body,
+            head_only: false,
+        },
+        Ok(Ok(None)) => Response::error(404, "Not Found"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "reading a key file");
+            Response::error(500, "Internal Server Error")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reading a key file");
+            Response::error(500, "Internal Server Error")
+        }
+    }
+}
+
+/// Lets tests drive the request handling without TLS.
+#[cfg(test)]
+pub(crate) async fn handle<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    keys: &Arc<KeyDir>,
+) {
+    let response = match read_request(stream).await {
+        Ok(request) => route(&request, keys).await,
+        Err(response) => response,
+    };
+    let _ = stream.write_all(&response.to_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_lines() {
+        let parse = |s: &str| parse_request_line(s.as_bytes());
+        assert_eq!(
+            parse("GET /.well-known/risala/alice?x=1 HTTP/1.1\r\nHost: a\r"),
+            Some(Request {
+                method: "GET".into(),
+                path: "/.well-known/risala/alice".into()
+            })
+        );
+        assert!(parse("GET / HTTP/1.0").is_some());
+        assert!(parse("GET https://a/ HTTP/1.1").is_none());
+        assert!(parse("GET / HTTP/2").is_none());
+        assert!(parse("GET  / HTTP/1.1").is_none());
+        assert!(parse("GET / HTTP/1.1 x").is_none());
+        assert!(parse("G3T / HTTP/1.1").is_none());
+        assert!(parse("").is_none());
+    }
+
+    #[test]
+    fn routes() {
+        let key_file = |p: &str| matches!(Route::of(p), Route::KeyFile(n) if n.as_str() == "alice");
+        assert!(key_file("/.well-known/risala/alice"));
+        assert!(key_file("/.well-known/risala/Alice"));
+        for path in [
+            "/",
+            "/.well-known/risala/",
+            "/.well-known/risala",
+            "/.well-known/risala/alice/",
+            "/.well-known/risala/../alice",
+            "/.well-known/risala/.alice.tmp",
+            "/.well-known/risala/%61lice",
+            "/.well-known/risala/a/b",
+            "/.well-known/other/alice",
+        ] {
+            assert!(matches!(Route::of(path), Route::NotFound), "{path}");
+        }
+    }
+}
