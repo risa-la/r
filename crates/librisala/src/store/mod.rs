@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use risala_proto::names::{Conv, Id, Seq};
+use risala_proto::names::{Conv, Id, Room, Seq};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::addr::ServerAddr;
@@ -273,6 +273,41 @@ impl Store {
                 .optional()?;
             parse(&uid.ok_or(StoreError::NotFound("account"))?, "uid")
         })
+    }
+
+    /// The rooms to join again after reconnecting, in name order. Guests
+    /// leave their rooms when they disconnect (4.2); the client layer
+    /// keeps this list for them.
+    pub fn rejoin_rooms(&self, account: AccountId) -> Result<Vec<Room>, StoreError> {
+        self.read(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT room FROM rejoin WHERE account = ?1 ORDER BY room")?;
+            let rooms = stmt
+                .query_map([account.0], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rooms.iter().map(|r| parse(r, "room")).collect()
+        })
+    }
+
+    /// Adds `room` to the rooms to join again after reconnecting, or
+    /// removes it. See [`rejoin_rooms`](Self::rejoin_rooms).
+    pub fn set_rejoin(&self, account: AccountId, room: &Room, on: bool) -> Result<(), StoreError> {
+        self.write(|tx| {
+            if on {
+                tx.conn().execute(
+                    "INSERT INTO rejoin (account, room) VALUES (?1, ?2)
+                     ON CONFLICT DO NOTHING",
+                    params![account.0, room.as_str()],
+                )?;
+            } else {
+                tx.conn().execute(
+                    "DELETE FROM rejoin WHERE account = ?1 AND room = ?2",
+                    params![account.0, room.as_str()],
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Removes an account with its conversations, history and outbox.
