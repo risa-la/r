@@ -421,6 +421,39 @@ impl Store {
         })
     }
 
+    /// The fingerprint of the device key the server last accepted for the
+    /// account (4.5), if it ever has.
+    pub fn accepted_key(&self, account: AccountId) -> Result<Option<String>, StoreError> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT accepted_key FROM accounts WHERE id = ?1",
+                    [account.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// Records that the server accepted the device key with this
+    /// fingerprint for the account. Writes only if it changed.
+    pub fn set_accepted_key(
+        &self,
+        account: AccountId,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.conn().execute(
+                "UPDATE accounts SET accepted_key = ?2
+                 WHERE id = ?1 AND accepted_key IS NOT ?2",
+                rusqlite::params![account.0, fingerprint],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Records the guest session the account signed in to, or forgets it.
     /// See [`guest_session`](Self::guest_session).
     pub fn set_guest_session(

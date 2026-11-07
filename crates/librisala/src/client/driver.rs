@@ -20,7 +20,7 @@ use super::blocking;
 use super::people::user_info;
 use super::types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, DisconnectKind, KeyErrorKind,
-    Notice, OutboxEntry, Presence, is_lasting_refusal,
+    Notice, OutboxEntry, Presence, RefusedKind, is_lasting_refusal,
 };
 use crate::addr::TrustStore;
 use crate::conn::{
@@ -100,7 +100,9 @@ async fn drive(
     // off the async workers.
     let (s, token) = (shared.clone(), guest_token.clone());
     let sign_in = blocking(&shared.rt, move || sign_in_for(&s, token)).await;
-    let sign_in = match sign_in {
+    // The fingerprint of an identity's device key, and whether the server
+    // accepted it before (4.5).
+    let (sign_in, key) = match sign_in {
         Ok(s) => s,
         Err(error) => {
             shared.set_state(ConnectionState::Failed { error });
@@ -125,6 +127,9 @@ async fn drive(
                     }
                     SupervisorEvent::Connected { .. } => shared.set_state(ConnectionState::SigningIn),
                     SupervisorEvent::SignedIn { uid, session, incoming } => {
+                        if let Some(key) = &key {
+                            note_accepted(shared, key).await;
+                        }
                         // A guest's session was resumed or is new (4.2).
                         let resumed = guest_token.as_ref().is_some_and(|t| t.resumed());
                         if let Some(token) = &guest_token {
@@ -156,9 +161,21 @@ async fn drive(
                         });
                     }
                     SupervisorEvent::Failed { error } => {
-                        shared.set_state(ConnectionState::Failed {
-                            error: ClientError::from_sign_in(&server, &error),
-                        });
+                        let mut error = ClientError::from_sign_in(&server, &error);
+                        if let (Some(key), ClientError::Refused { kind, message, .. }) =
+                            (&key, &mut error)
+                            && *kind == RefusedKind::AuthFailed
+                            && was_accepted(shared, key).await
+                        {
+                            *kind = RefusedKind::KeyRemoved;
+                            *message = format!(
+                                "{server} no longer accepts this device's key for {}, which \
+                                 it accepted before: the key was most likely removed from the \
+                                 identity's key file ({message})",
+                                shared.uid
+                            );
+                        }
+                        shared.set_state(ConnectionState::Failed { error });
                         return None;
                     }
                     SupervisorEvent::Stopped => return None,
@@ -194,22 +211,43 @@ async fn save_guest_session(shared: &AccountShared, session: Option<(Name, Id)>)
     }
 }
 
+/// Records that the server accepted the device key with fingerprint
+/// `key` (4.5).
+async fn note_accepted(shared: &AccountShared, key: &str) {
+    let (store, account, key) = (shared.store.clone(), shared.id, key.to_owned());
+    if let Err(e) = blocking(&shared.rt, move || store.set_accepted_key(account, &key)).await {
+        warn!(error = %e, "recording the accepted key");
+    }
+}
+
+/// Whether the server accepted the device key with fingerprint `key`
+/// before, on any connection so far.
+async fn was_accepted(shared: &AccountShared, key: &str) -> bool {
+    let (store, account) = (shared.store.clone(), shared.id);
+    match blocking(&shared.rt, move || store.accepted_key(account)).await {
+        Ok(accepted) => accepted.as_deref() == Some(key),
+        Err(e) => {
+            warn!(error = %e, "reading the accepted key");
+            false
+        }
+    }
+}
+
 /// How the account signs in: a guest by name, resuming the session in
-/// `guest_token`, or an identity with its key.
+/// `guest_token`, or an identity with its key. For an identity, also the
+/// fingerprint of its key.
 fn sign_in_for(
     shared: &AccountShared,
     guest_token: Option<Arc<GuestToken>>,
-) -> Result<Arc<dyn SignIn>, ClientError> {
+) -> Result<(Arc<dyn SignIn>, Option<String>), ClientError> {
     let uid = &shared.uid;
     if uid.is_guest() {
         let name = uid
             .name()
             .parse()
             .map_err(|_| ClientError::Invalid(format!("guest name {:?}", uid.name())))?;
-        return Ok(Arc::new(GuestSignIn::resuming(
-            name,
-            guest_token.unwrap_or_default(),
-        )));
+        let sign_in = GuestSignIn::resuming(name, guest_token.unwrap_or_default());
+        return Ok((Arc::new(sign_in), None));
     }
     let identity = uid
         .to_identity()
@@ -232,11 +270,11 @@ fn sign_in_for(
             kind: KeyErrorKind::NoKey,
             message: format!("no key for {identity}"),
         })?;
-    Ok(Arc::new(IdentitySignIn {
-        identity,
-        key,
-        auth_retry: shared.options.auth_retry,
-    }))
+    let fingerprint = key.public_key().fingerprint().to_string();
+    Ok((
+        Arc::new(IdentitySignIn::new(identity, key)),
+        Some(fingerprint),
+    ))
 }
 
 // ---------------------------------------------------------------------------

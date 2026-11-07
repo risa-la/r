@@ -37,9 +37,10 @@
 //!   [`Client::key_line`] for the line a self-hosted identity publishes
 //!   in its key file at [`Client::key_file_url`] (4.4).
 //! - **Signing in.** [`Client::add_identity`], then [`Account::connect`]
-//!   (AUTH, 4.5). The first `auth-failed` of a run is tried once more
-//!   after [`ClientOptions::auth_retry`], for a key file just updated; a
-//!   second one is final.
+//!   (AUTH, 4.5). `auth-failed` is final: [`RefusedKind::AuthFailed`], or
+//!   [`RefusedKind::KeyRemoved`] for a key the server accepted before.
+//!   `unavailable`, when the server could not get the key file, is tried
+//!   again with backoff: [`RefusedKind::Unavailable`].
 //! - **Registering.** [`Client::register`] (4.6).
 //! - **Hosted identities' keys.** [`Account::keys`], [`Account::add_key`]
 //!   and [`Account::remove_key`] (4.7).
@@ -192,11 +193,6 @@ pub struct ClientOptions {
     pub rejoin_guest_rooms: bool,
     /// Where identities' device keys are, for signing in (4.5).
     pub keys: Option<Arc<dyn KeyStore>>,
-    /// After the first `auth-failed` of an identity account's run, try
-    /// once more after this long, in case the server held a cached key
-    /// file without a key just added (4.4). `None` fails at once. Two
-    /// seconds by default.
-    pub auth_retry: Option<std::time::Duration>,
     /// The tokio runtime to run on. `None`: the runtime current when the
     /// client is made, or else one of the client's own. See the [module
     /// docs](self).
@@ -211,7 +207,6 @@ impl Default for ClientOptions {
             sync: SyncConfig::default(),
             rejoin_guest_rooms: true,
             keys: None,
-            auth_retry: Some(std::time::Duration::from_secs(2)),
             runtime: None,
         }
     }
@@ -225,7 +220,6 @@ impl std::fmt::Debug for ClientOptions {
             .field("sync", &self.sync)
             .field("rejoin_guest_rooms", &self.rejoin_guest_rooms)
             .field("keys", &self.keys.as_ref().map(|_| ".."))
-            .field("auth_retry", &self.auth_retry)
             .field("runtime", &self.runtime.as_ref().map(|_| ".."))
             .finish()
     }

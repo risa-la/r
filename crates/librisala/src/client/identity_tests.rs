@@ -53,7 +53,6 @@ where
             stable_after: Duration::from_secs(3600),
         },
         keys: Some(keys.clone()),
-        auth_retry: Some(Duration::from_millis(50)),
         ..ClientOptions::default()
     })
     .unwrap();
@@ -102,6 +101,16 @@ async fn quit(mut peer: Peer) {
     peer.close().await;
 }
 
+/// Waits until the account has stopped for good, and returns why.
+async fn until_failed(account: &Account, events: &AccountEvents) -> ClientError {
+    loop {
+        if let ConnectionState::Failed { error } = account.state() {
+            return error;
+        }
+        events.next().await.expect("the account's events");
+    }
+}
+
 fn refused(e: &ClientError) -> (RefusedKind, Option<u64>) {
     match e {
         ClientError::Refused {
@@ -147,8 +156,9 @@ async fn identity_signs_in_with_the_sni_host() {
 }
 
 #[tokio::test]
-async fn auth_failed_is_retried_once_then_final() {
-    let s = setup(2, |_, mut peer| async move {
+async fn auth_failed_is_final() {
+    // The same key fails the same way: no second try (4.5).
+    let s = setup(1, |_, mut peer| async move {
         greet(&mut peer).await;
         peer.expect(&auth_line(1)).await;
         peer.send("@ref=1 ERR auth-failed no key matched").await;
@@ -157,23 +167,22 @@ async fn auth_failed_is_retried_once_then_final() {
     .await;
     s.client.import_device_key(ALICE, PEM, false).await.unwrap();
     let alice = s.client.add_identity(HOST, ALICE).unwrap();
-    alice.start();
-    let err = within(alice.wait_synced()).await.unwrap_err();
+    let err = within(alice.connect()).await.unwrap_err();
     assert_eq!(refused(&err), (RefusedKind::AuthFailed, None));
     assert_eq!(err.code(), Some("auth-failed"));
     assert!(err.is_permanent());
-    assert!(matches!(alice.state(), ConnectionState::Failed { .. }));
-    // Exactly two connections: the first try and the one retry.
+    assert_eq!(alice.state(), ConnectionState::Failed { error: err });
     s.server.done().await;
 }
 
 #[tokio::test]
-async fn a_key_just_added_signs_in_on_the_retry() {
+async fn unavailable_is_tried_again() {
     let s = setup(2, |i, mut peer| async move {
         if i == 0 {
             greet(&mut peer).await;
             peer.expect(&auth_line(1)).await;
-            peer.send("@ref=1 ERR auth-failed").await;
+            peer.send("@ref=1 ERR unavailable example.org did not answer")
+                .await;
             peer.expect_eof().await;
         } else {
             signed_in(&mut peer).await;
@@ -183,9 +192,40 @@ async fn a_key_just_added_signs_in_on_the_retry() {
     .await;
     s.client.import_device_key(ALICE, PEM, false).await.unwrap();
     let alice = s.client.add_identity(HOST, ALICE).unwrap();
-    alice.start();
+    // connect() reports the first failure, which is not final: the
+    // account goes on trying.
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::Unavailable, None));
+    assert_eq!(err.code(), Some("unavailable"));
+    assert!(!err.is_permanent());
     within(alice.wait_synced()).await.unwrap();
     alice.disconnect().await;
+    s.server.done().await;
+}
+
+#[tokio::test]
+async fn a_key_refused_after_it_was_accepted_was_removed() {
+    let s = setup(2, |i, mut peer| async move {
+        if i == 0 {
+            signed_in(&mut peer).await;
+            // The server closes the connection of a removed key (4.4).
+            peer.close().await;
+        } else {
+            greet(&mut peer).await;
+            peer.expect(&auth_line(1)).await;
+            peer.send("@ref=1 ERR auth-failed").await;
+            peer.expect_eof().await;
+        }
+    })
+    .await;
+    s.client.import_device_key(ALICE, PEM, false).await.unwrap();
+    let alice = s.client.add_identity(HOST, ALICE).unwrap();
+    let events = alice.subscribe();
+    within(alice.connect()).await.unwrap();
+    let err = within(until_failed(&alice, &events)).await;
+    assert_eq!(refused(&err), (RefusedKind::KeyRemoved, None));
+    assert_eq!(err.code(), Some("auth-failed"));
+    assert!(err.is_permanent());
     s.server.done().await;
 }
 

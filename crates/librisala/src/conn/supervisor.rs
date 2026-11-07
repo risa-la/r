@@ -24,21 +24,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait SignIn: Send + Sync {
     /// Signs `session` in and returns the uid. An error that
     /// [`is_permanent`](Error::is_permanent), such as `auth-failed`,
-    /// stops the supervisor.
+    /// stops the supervisor. Others, such as `unavailable` (4.5), are
+    /// tried again with backoff, waiting at least as long as their
+    /// `retry` tag says.
     fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>>;
-
-    /// How long to wait before trying once more after `ERR auth-failed`,
-    /// or `None` to stop at once (the default).
-    ///
-    /// A [`Supervisor`] uses it at most once per run, and only before the
-    /// first successful sign-in of that run. It is for a key that was
-    /// just added: a server may still hold a cached key file without it
-    /// (4.4). Servers fetch the file again once when a signature fails,
-    /// so this retry only covers servers that do not, and key files
-    /// published moments late. A second `auth-failed` is final.
-    fn auth_retry(&self) -> Option<Duration> {
-        None
-    }
 }
 
 /// The guest session (4.2) a [`GuestSignIn`] resumes: the name it got and
@@ -198,36 +187,28 @@ impl SignIn for GuestSignIn {
 }
 
 /// Signs in as an identity with a device key (4.5).
+///
+/// `auth-failed` is final: the server checked the signature against the
+/// keys it got, and the same key fails the same way (4.5). `unavailable`
+/// means the server could not get the key file, and is tried again.
 #[derive(Debug, Clone)]
 pub struct IdentitySignIn {
     /// The identity.
     pub identity: Identity,
     /// The device key, listed in the identity's key file.
     pub key: SecretKey,
-    /// Try once more this long after the first `auth-failed` of a run
-    /// ([`SignIn::auth_retry`]). `None` stops at once.
-    pub auth_retry: Option<Duration>,
 }
 
 impl IdentitySignIn {
-    /// Signs in as `identity` with `key`, with no retry after
-    /// `auth-failed`.
+    /// Signs in as `identity` with `key`.
     pub fn new(identity: Identity, key: SecretKey) -> IdentitySignIn {
-        IdentitySignIn {
-            identity,
-            key,
-            auth_retry: None,
-        }
+        IdentitySignIn { identity, key }
     }
 }
 
 impl SignIn for IdentitySignIn {
     fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>> {
         Box::pin(session.auth(&self.identity, &self.key))
-    }
-
-    fn auth_retry(&self) -> Option<Duration> {
-        self.auth_retry
     }
 }
 
@@ -314,7 +295,8 @@ pub enum SupervisorEvent {
     },
     /// Gave up: the error cannot pass without the user (a trust error,
     /// `auth-failed` and so on; see [`Error::is_permanent`]). The
-    /// supervisor has stopped.
+    /// supervisor has stopped. Every error that is not permanent is
+    /// reported with [`Waiting`](Self::Waiting) instead, and tried again.
     Failed {
         /// The error.
         error: Error,
@@ -425,9 +407,6 @@ impl Run {
             self.options.ca_verifier = Some(tls::platform_ca_verifier_blocking().await);
         }
         let mut failures: u32 = 0;
-        // Whether this run has signed in, or used its retry after
-        // auth-failed (SignIn::auth_retry).
-        let mut auth_retry_spent = false;
         loop {
             self.emit(SupervisorEvent::Connecting { attempt: failures })
                 .await?;
@@ -442,7 +421,6 @@ impl Run {
             let mut hint = Duration::ZERO;
             match attempt {
                 Ok((session, uid)) => {
-                    auth_retry_spent = true;
                     let session = Arc::new(session);
                     let incoming = session.take_incoming().expect("a new session");
                     let started = Instant::now();
@@ -472,15 +450,10 @@ impl Run {
                     }
                 }
                 Err(e) if e.is_permanent() => {
-                    let retry = match self.sign_in.auth_retry() {
-                        Some(delay) if e.is_auth_failed() && !auth_retry_spent => delay,
-                        _ => return self.emit(SupervisorEvent::Failed { error: e }).await,
-                    };
-                    auth_retry_spent = true;
-                    failures = failures.saturating_add(1);
-                    hint = retry;
-                    error = Some(e);
+                    return self.emit(SupervisorEvent::Failed { error: e }).await;
                 }
+                // Includes `unavailable` (4.5): at least `retry`, and
+                // longer after each failure.
                 Err(e) => {
                     failures = failures.saturating_add(1);
                     hint = Duration::from_secs(e.retry_after().unwrap_or(0));

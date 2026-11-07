@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -239,6 +239,16 @@ CREATE TABLE blocks (
     PRIMARY KEY (account, target)
 ) WITHOUT ROWID;
 ALTER TABLE accounts ADD COLUMN hide_blocked INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Version 6: the device key an identity account last signed in with.
+///
+/// `accounts.accepted_key` is the fingerprint of the key the server last
+/// accepted for the account (4.5), or NULL if it never has. When the
+/// server refuses the same key later, it was most likely removed from the
+/// identity's key file, which the client tells the user plainly.
+const V6: &str = "
+ALTER TABLE accounts ADD COLUMN accepted_key TEXT;
 ";
 
 /// Brings the schema up to [`VERSION`].

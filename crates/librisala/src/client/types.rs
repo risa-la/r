@@ -189,10 +189,23 @@ pub enum KeyErrorKind {
 /// ([`ClientError::Refused`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefusedKind {
-    /// `auth-failed`: the identity's key file does not list this device's
-    /// key, or the server could not fetch the file (4.4, 4.5). For
-    /// REGISTER, the signature did not verify (4.6).
+    /// `auth-failed`: the server got the identity's keys, and this
+    /// device's key is not among them: the key file does not list it, or
+    /// is gone (4.4, 4.5). Publish the key, or add it from a device that
+    /// is signed in. Also sent when the server does not serve the name
+    /// connected to (4.5). For REGISTER, the signature did not verify
+    /// (4.6). Final: the account does not try again on its own.
     AuthFailed,
+    /// `auth-failed` for an account whose device key the server accepted
+    /// before: the key was most likely removed from the identity's key
+    /// file, from another device or by editing the file (4.4, 4.7).
+    /// Final, like [`AuthFailed`](Self::AuthFailed).
+    KeyRemoved,
+    /// `unavailable`: the server could not get the identity's key file,
+    /// so it could not check the signature (4.5). Not final: the account
+    /// tries again later, waiting at least
+    /// [`retry_after_secs`](ClientError::Refused::retry_after_secs).
+    Unavailable,
     /// `name-taken`: the name is registered already (4.6), or a guest
     /// name is in use (4.2).
     NameTaken,
@@ -237,6 +250,7 @@ impl RefusedKind {
     pub(crate) fn of(code: &ErrorCode) -> Option<RefusedKind> {
         Some(match code {
             ErrorCode::AuthFailed => RefusedKind::AuthFailed,
+            ErrorCode::Unavailable => RefusedKind::Unavailable,
             ErrorCode::NameTaken => RefusedKind::NameTaken,
             ErrorCode::Forbidden => RefusedKind::Forbidden,
             ErrorCode::RateLimited => RefusedKind::RateLimited,
@@ -248,7 +262,10 @@ impl RefusedKind {
     /// The error code the server sent, if it sent one.
     fn code(self) -> Option<&'static str> {
         Some(match self {
-            RefusedKind::AuthFailed | RefusedKind::NotRegistered => "auth-failed",
+            RefusedKind::AuthFailed | RefusedKind::KeyRemoved | RefusedKind::NotRegistered => {
+                "auth-failed"
+            }
+            RefusedKind::Unavailable => "unavailable",
             RefusedKind::NameTaken => "name-taken",
             RefusedKind::Forbidden | RefusedKind::LastKey => "forbidden",
             RefusedKind::RateLimited => "rate-limited",
@@ -328,6 +345,11 @@ impl ClientError {
     /// connection error such as a server without post-quantum key exchange
     /// (2.1), or a refused sign-in such as `auth-failed` (4.5). Meant for
     /// errors from connecting and signing in.
+    ///
+    /// An account stops exactly on the errors that are permanent, with
+    /// [`ConnectionState::Failed`], and tries again after the others, with
+    /// [`ConnectionState::Waiting`]. `unavailable` (4.5), `rate-limited`
+    /// and network failures are not permanent.
     pub fn is_permanent(&self) -> bool {
         match self {
             ClientError::UnknownCertificate { .. }
@@ -340,7 +362,9 @@ impl ClientError {
                 retry_after_secs,
                 ..
             } => match kind {
-                RefusedKind::NameTaken | RefusedKind::RateLimited => false,
+                RefusedKind::NameTaken | RefusedKind::RateLimited | RefusedKind::Unavailable => {
+                    false
+                }
                 RefusedKind::Forbidden => retry_after_secs.is_none(),
                 _ => true,
             },

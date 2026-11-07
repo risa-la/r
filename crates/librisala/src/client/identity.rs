@@ -8,13 +8,13 @@
 //!   A). [`Client::key_line`] gives the line to publish in a self-hosted
 //!   identity's key file (4.4), at [`Client::key_file_url`].
 //! - **Signing in.** [`Client::add_identity`] adds the account, and
-//!   [`Account::connect`] signs in with AUTH (4.5). If the first AUTH of a
-//!   run gets `auth-failed`, the account tries once more after
-//!   [`ClientOptions::auth_retry`](super::ClientOptions::auth_retry), in
-//!   case the server held a cached key file without a key just added
-//!   (4.4). A second `auth-failed` is final:
+//!   [`Account::connect`] signs in with AUTH (4.5). `auth-failed` is
+//!   final, since the same key fails the same way:
 //!   [`ConnectionState::Failed`](super::ConnectionState::Failed) with
-//!   [`RefusedKind::AuthFailed`].
+//!   [`RefusedKind::AuthFailed`], or [`RefusedKind::KeyRemoved`] if the
+//!   server accepted this key before. `unavailable` means the server could
+//!   not get the identity's key file, and the account tries again later
+//!   ([`RefusedKind::Unavailable`]).
 //! - **Registering.** [`Client::register`] creates `<name>@<domain>` on a
 //!   server that hosts identities, with this device's key (4.6).
 //! - **Hosted identities' keys.** [`Account::keys`],
@@ -532,7 +532,7 @@ impl Account {
     /// The server refuses to remove the last key:
     /// [`RefusedKind::LastKey`]. Removing this device's own key signs it
     /// out: the server closes its connections, and the account then
-    /// fails with [`RefusedKind::AuthFailed`].
+    /// fails with [`RefusedKind::KeyRemoved`].
     pub async fn remove_key(&self, key: &str) -> Result<(), ClientError> {
         let (key, _) = parse_public_key(key)?;
         self.key_command(KeyCommand::Del { key }).await?;

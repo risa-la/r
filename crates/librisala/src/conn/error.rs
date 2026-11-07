@@ -79,14 +79,14 @@ impl Error {
     /// not support, an unsupported version, a missing
     /// SNI, no registration, an invalid command, and a sign-in refused
     /// with `auth-failed`, `forbidden` without a `retry` tag,
-    /// `not-supported`, `bad-syntax` or `unknown-command`. Everything
-    /// else, including `name-taken` (a guest's old session may not have
-    /// ended yet, and [`GuestSignIn`](super::GuestSignIn) has already
-    /// tried other names), `rate-limited`, a `forbidden` with `retry` (a
-    /// limit that passes with time) and `internal`, may pass.
-    ///
-    /// A [`Supervisor`](super::Supervisor) may still try once more after
-    /// `auth-failed`; see [`SignIn::auth_retry`](super::SignIn::auth_retry).
+    /// `not-supported`, `bad-syntax` or `unknown-command`. `auth-failed`
+    /// means the signature did not verify against the keys the server
+    /// got, and the same key fails the same way (4.5). Everything else
+    /// may pass: `unavailable` (the server could not get the key file,
+    /// 4.5), `name-taken` (a guest's old session may not have ended yet,
+    /// and [`GuestSignIn`](super::GuestSignIn) has already tried other
+    /// names), `rate-limited`, a `forbidden` with `retry` (a limit that
+    /// passes with time) and `internal`.
     pub fn is_permanent(&self) -> bool {
         match self {
             Error::Trust(_)
@@ -117,7 +117,8 @@ impl Error {
     }
 
     /// The `retry` tag of an `ERR`, in seconds (3.2): sent with
-    /// `rate-limited`, and with a `forbidden` that passes with time.
+    /// `rate-limited` and `unavailable`, and with a `forbidden` that
+    /// passes with time.
     pub fn retry_after(&self) -> Option<u64> {
         match self {
             Error::Rejected(CommandError::Server(err)) => err.retry,

@@ -377,52 +377,68 @@ async fn forbidden_with_retry_passes() {
     server.done().await;
 }
 
-/// Signs in as alice with the key of Appendix B, retrying `auth-failed`
-/// once after 10 ms.
+/// Signs in as alice with the key of Appendix B.
 fn alice() -> Arc<IdentitySignIn> {
     let key = SecretKey::from_pkcs8_pem(crate::conn::keys::tests::PEM).unwrap();
-    Arc::new(IdentitySignIn {
-        auth_retry: Some(Duration::from_millis(10)),
-        ..IdentitySignIn::new("alice@example.org".parse().unwrap(), key)
-    })
+    Arc::new(IdentitySignIn::new(
+        "alice@example.org".parse().unwrap(),
+        key,
+    ))
 }
 
 #[tokio::test]
-async fn auth_failed_is_retried_once_per_run_before_signing_in() {
-    // Connection 0 fails and 1 signs in. After a drop, 2 fails: the run
-    // has signed in, so that is final.
+async fn unavailable_is_retried_and_auth_failed_is_final() {
+    // Connection 0 gets unavailable with retry=1, 1 signs in and drops,
+    // and 2 gets auth-failed, which is final at once (4.5).
     let cert = ServerCert::self_signed("chat.test");
     let trust = pinned(&cert).await;
     let server = ScriptServer::start(cert, 3, |i, mut peer: Peer| async move {
         peer.greet().await;
         let line = peer.recv().await.unwrap();
         assert!(line.starts_with("@ref=1 AUTH alice@example.org "), "{line}");
-        if i == 1 {
-            peer.send("@ref=1 OK uid=alice@example.org").await;
-            peer.close().await;
-        } else {
-            peer.send("@ref=1 ERR auth-failed").await;
-            peer.expect_eof().await;
+        match i {
+            0 => {
+                peer.send("@ref=1;retry=1 ERR unavailable key file unreachable")
+                    .await
+            }
+            1 => {
+                peer.send("@ref=1 OK uid=alice@example.org").await;
+                peer.close().await;
+                return;
+            }
+            _ => peer.send("@ref=1 ERR auth-failed").await,
         }
+        peer.expect_eof().await;
     })
     .await;
     let ca = TestCa::new();
-    let (_supervisor, mut events) =
+    let (supervisor, mut events) =
         Supervisor::spawn(chat_test(), trust, options(&ca, &server), alice(), fast());
     let mut seen = Vec::new();
     loop {
         match next(&mut events).await {
             SupervisorEvent::Connecting { .. } => seen.push("connecting"),
             SupervisorEvent::Connected { .. } => {}
-            SupervisorEvent::Waiting { error: Some(e), .. } => {
-                assert!(e.is_auth_failed());
-                seen.push("retry");
+            SupervisorEvent::Waiting {
+                delay,
+                error: Some(e),
+            } => {
+                let Error::Rejected(CommandError::Server(err)) = &e else {
+                    panic!("{e:?}")
+                };
+                assert_eq!(err.code, ErrorCode::Unavailable);
+                assert!(!e.is_permanent());
+                // At least as long as `retry` says.
+                assert!(delay >= Duration::from_secs(1), "{delay:?}");
+                seen.push("unavailable");
+                supervisor.reconnect_now();
             }
             SupervisorEvent::Waiting { error: None, .. } => {}
             SupervisorEvent::SignedIn { .. } => seen.push("signed in"),
             SupervisorEvent::Disconnected { .. } => seen.push("dropped"),
             SupervisorEvent::Failed { error } => {
                 assert!(error.is_auth_failed());
+                assert!(error.is_permanent());
                 seen.push("failed");
                 break;
             }
@@ -433,7 +449,7 @@ async fn auth_failed_is_retried_once_per_run_before_signing_in() {
         seen,
         [
             "connecting",
-            "retry",
+            "unavailable",
             "connecting",
             "signed in",
             "dropped",
