@@ -530,3 +530,94 @@ async fn register_refusals() {
     let (_, err) = run(state, &["register", &taken.addr, "not a name"], 2).await;
     assert!(err.contains("invalid name"), "{err}");
 }
+
+/// Whether the fake received `line`, whatever its `ref`.
+fn got(fake: &Fake, line: &str) -> bool {
+    fake.log().iter().any(|l| {
+        let l = l.split_once(' ').map_or("", |(_, l)| l);
+        let l = match l.strip_prefix('@') {
+            Some(tagged) => tagged.split_once(' ').map_or("", |(_, l)| l),
+            None => l,
+        };
+        l == line
+    })
+}
+
+#[tokio::test]
+async fn read_names_members_and_blocks() {
+    // 5.7, 7.4, 8.2, 8.3.
+    let fake = Fake::start(|_, line| match verb(line) {
+        "AUTH" => vec![format!("OK uid={}", word(line, 1))],
+        "SYNC" => vec!["CONV #general k1 3 1".into(), "OK".into()],
+        "BLOCKS" => vec!["BLOCK *@evil.example".into(), "OK".into()],
+        "HISTORY" => vec![
+            "@seq=1;t=2026-11-07T10:00:00.000Z;from=bob@example.net MSG #general one".into(),
+            "@seq=2;t=2026-11-07T10:00:01.000Z;from=bob@example.net MSG #general two".into(),
+            "@seq=3;t=2026-11-07T10:00:02.000Z;from=bob@example.net MSG #general three".into(),
+            "OK id=k1 more=0".into(),
+        ],
+        "READ" | "NAME" | "BLOCK" | "UNBLOCK" => vec!["OK".into()],
+        "MEMBERS" => vec![
+            "MEMBER #general alice@example.org owner online Alice".into(),
+            "MEMBER #general bob@example.net member offline Bob".into(),
+            "MEMBER #general bob@example.org member away Bob".into(),
+            "MEMBER #general ~sam member online".into(),
+            "OK".into(),
+        ],
+        "WHOIS" => vec!["USER bob@example.net offline Bob".into(), "OK".into()],
+        _ => vec!["ERR unknown-command".into()],
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let pem = dir.path().join("alice.pem");
+    std::fs::write(&pem, PEM).unwrap();
+    run(&state, &["trust", &fake.addr, &fake.fingerprint], 0).await;
+    let pem_arg = pem.to_str().unwrap();
+    run(
+        &state,
+        &["login", &fake.addr, "alice@example.org", "--key", pem_arg],
+        0,
+    )
+    .await;
+    let addr = fake.addr.as_str();
+
+    let (out, _) = run(&state, &["read", addr, "#general", "2"], 0).await;
+    assert_eq!(out.trim(), "#general: read up to 2, 1 unread");
+    assert!(got(&fake, "READ #general 2"), "{:?}", fake.log());
+    let (out, _) = run(&state, &["read", addr, "#general"], 0).await;
+    assert_eq!(out.trim(), "#general: read up to 3, 0 unread");
+    assert!(got(&fake, "READ #general 3"), "{:?}", fake.log());
+
+    let (out, _) = run(&state, &["name", addr, "Alice", "M"], 0).await;
+    assert_eq!(out.trim(), "display name set to Alice M");
+    assert!(got(&fake, "NAME Alice M"));
+    let (out, _) = run(&state, &["name", addr], 0).await;
+    assert_eq!(out.trim(), "display name cleared");
+    assert!(got(&fake, "NAME"));
+
+    let (out, _) = run(&state, &["members", addr, "#general"], 0).await;
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "alice@example.org owner online (Alice)",
+            "bob@example.net member offline (Bob (bob@example.net))",
+            "bob@example.org member online (Bob (bob@example.org))",
+            "~sam member online",
+        ]
+    );
+    let (out, _) = run(&state, &["whois", addr, "bob@example.net"], 0).await;
+    assert_eq!(out.trim(), "bob@example.net offline (Bob)");
+
+    let (out, _) = run(&state, &["block", addr, "troll@example.com"], 0).await;
+    assert_eq!(out.trim(), "blocked troll@example.com");
+    assert!(got(&fake, "BLOCK troll@example.com"));
+    let (out, _) = run(&state, &["unblock", addr, "troll@example.com"], 0).await;
+    assert_eq!(out.trim(), "unblocked troll@example.com");
+    let (out, err) = run(&state, &["blocks", addr, "--hide"], 0).await;
+    assert_eq!(out.trim(), "*@evil.example");
+    assert!(err.contains("hidden in rooms"), "{err}");
+    let (_, err) = run(&state, &["blocks", addr, "--show"], 0).await;
+    assert!(!err.contains("hidden"), "{err}");
+    run(&state, &["block", addr, "~sam"], 2).await;
+}

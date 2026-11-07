@@ -13,6 +13,10 @@
 //! `register` creates one on a server that hosts identities, `keys`
 //! manages a hosted identity's keys and `unregister` deletes one.
 //!
+//! People: `read` moves read markers, `name` sets the display name,
+//! `members` and `whois` show members and presence, and `block`,
+//! `unblock` and `blocks` manage blocks. `chat` shows who is typing.
+//!
 //! Exit codes: 0 done, 1 failed, 2 bad arguments, 3 needs you to act
 //! first: the server refused (a key it does not accept, a name taken,
 //! registration closed), or a certificate or key needs your decision.
@@ -25,7 +29,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use librisala::client::{
     Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, EventKind,
-    KeyErrorKind, KeyInfo, Message, OutboxStatus, RefusedKind, TimelineDiff, TrustInfo,
+    KeyErrorKind, KeyInfo, Message, OutboxStatus, Presence, RefusedKind, TimelineDiff, TrustInfo,
 };
 use librisala::conn::keys::FileKeyStore;
 
@@ -106,9 +110,43 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Chat in a room: shows messages as they arrive, and sends each line
-    /// typed. /quit leaves.
+    /// Chat in a room: shows messages as they arrive, who is typing, and
+    /// sends each line typed. /quit leaves.
     Chat { server: String, room: String },
+    /// Mark a conversation read, up to a seq or to its newest message
+    /// (7.4). Offline, it is marked here, and the server hears on the next
+    /// connection.
+    Read {
+        server: String,
+        conversation: String,
+        /// The newest seq read; the newest message if left out.
+        seq: Option<u64>,
+    },
+    /// Set your display name, or clear it with no text (8.2).
+    Name {
+        server: String,
+        /// The name; the words are joined with spaces.
+        text: Vec<String>,
+    },
+    /// List a room's members, with their roles, presence and names (8.3).
+    Members { server: String, room: String },
+    /// Show a user's presence and display name (8.3).
+    Whois { server: String, uid: String },
+    /// Block an identity, or a whole domain written *@example.net (5.7).
+    Block { server: String, target: String },
+    /// Remove a block (5.7).
+    Unblock { server: String, target: String },
+    /// List your blocks (5.7). --hide hides blocked people's messages in
+    /// rooms on this device, and --show shows them again.
+    Blocks {
+        server: String,
+        /// Hide blocked people's messages in rooms.
+        #[arg(long, conflicts_with = "show")]
+        hide: bool,
+        /// Show blocked people's messages in rooms again.
+        #[arg(long)]
+        show: bool,
+    },
     /// Register a new identity, <name>@<domain>, on a server that hosts
     /// identities, and add it as an account. Prints the uid and this device's
     /// key file line.
@@ -586,6 +624,95 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             Ok(())
         }
         Command::Chat { server, room } => chat(ctx, &server, &room).await,
+        Command::Read {
+            server,
+            conversation,
+            seq,
+        } => {
+            let account = pick(ctx, &server)?;
+            let online = match tokio::time::timeout(WAIT, account.connect()).await {
+                Ok(Ok(_)) => within(account.wait_synced()).await.is_ok(),
+                _ => false,
+            };
+            let conv = account.conversation(&conversation).or_else(explain)?;
+            if conv.info().or_else(explain)?.is_none() {
+                return fail(format!("nothing stored for {conversation}"));
+            }
+            match seq {
+                Some(seq) => within(conv.mark_read(seq)).await?,
+                None => within(conv.mark_all_read()).await?,
+            }
+            if online {
+                // Let READ go out.
+                within(account.wait_synced()).await?;
+            }
+            let info = conv.info().or_else(explain)?.expect("stored");
+            println!(
+                "{}: read up to {}, {} unread",
+                info.name, info.read, info.unread
+            );
+            if !online && !account.is_guest() {
+                eprintln!("risala: offline; the server hears on the next connection");
+            }
+            Ok(())
+        }
+        Command::Name { server, text } => {
+            let account = online(ctx, &server).await?;
+            let name = text.join(" ");
+            within(account.set_display_name(&name)).await?;
+            if name.trim().is_empty() {
+                println!("display name cleared");
+            } else {
+                println!("display name set to {}", name.trim());
+            }
+            Ok(())
+        }
+        Command::Members { server, room } => {
+            let account = online(ctx, &server).await?;
+            let conv = account.conversation(&room).or_else(explain)?;
+            for m in within(conv.members()).await? {
+                let mut line = format!("{} {} {}", m.uid, m.role, presence(m.presence));
+                if m.label != m.uid {
+                    line.push_str(&format!(" ({})", m.label));
+                }
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::Whois { server, uid } => {
+            let account = online(ctx, &server).await?;
+            let user = within(account.whois(&uid)).await?;
+            match user.display_name {
+                Some(name) => println!("{} {} ({name})", user.uid, presence(user.presence)),
+                None => println!("{} {}", user.uid, presence(user.presence)),
+            }
+            Ok(())
+        }
+        Command::Block { server, target } => {
+            let account = identity_online(ctx, &server).await?;
+            within(account.block(&target)).await?;
+            println!("blocked {}", target.trim());
+            Ok(())
+        }
+        Command::Unblock { server, target } => {
+            let account = identity_online(ctx, &server).await?;
+            within(account.unblock(&target)).await?;
+            println!("unblocked {}", target.trim());
+            Ok(())
+        }
+        Command::Blocks { server, hide, show } => {
+            let account = identity_online(ctx, &server).await?;
+            for target in within(account.blocks()).await? {
+                println!("{target}");
+            }
+            if hide || show {
+                account.set_hide_blocked(hide).or_else(explain)?;
+            }
+            if account.hides_blocked().or_else(explain)? {
+                eprintln!("risala: blocked people's messages are hidden in rooms");
+            }
+            Ok(())
+        }
         Command::Register {
             server,
             name,
@@ -848,13 +975,25 @@ fn show_key(key: &KeyInfo) -> String {
     s
 }
 
+/// How presence is shown (8.3).
+fn presence(p: Presence) -> &'static str {
+    match p {
+        Presence::Online => "online",
+        Presence::Offline => "offline",
+        Presence::NotKnown => "unknown",
+    }
+}
+
 /// The identity account on `server`, signed in.
 async fn identity_online(ctx: &Ctx, server: &str) -> Res<Account> {
     let account = pick(ctx, server)?;
     if account.is_guest() {
         return fail_with(
             USAGE,
-            format!("{} is a guest, which has no keys", account.uid()),
+            format!(
+                "{} is a guest, which has no keys and cannot block",
+                account.uid()
+            ),
         );
     }
     connect(ctx, &account).await?;
@@ -1031,7 +1170,9 @@ fn summary(c: &ConversationInfo) -> String {
 }
 
 /// The interactive line mode: messages as they arrive, each typed line
-/// sent. Lines starting with `/` are commands: `/quit`.
+/// sent. Lines starting with `/` are commands: `/quit`. Who else is typing
+/// is shown; this side sends no TYPING, since standard input arrives a
+/// whole line at a time.
 async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
     let account = online(ctx, server).await?;
     let conv = within(account.join(room)).await?;
@@ -1039,6 +1180,8 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
     for m in timeline.items() {
         println!("{}", show(&m));
     }
+    // What is shown is read (7.4).
+    let _ = conv.mark_all_read().await;
     eprintln!(
         "risala: in {} as {}; type to send, /quit to leave",
         conv.name(),
@@ -1060,6 +1203,7 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
         tokio::select! {
             diffs = timeline.next() => {
                 let Some(diffs) = diffs else { return Ok(()) };
+                let shown = !diffs.is_empty();
                 for diff in diffs {
                     match diff {
                         TimelineDiff::Insert { item, .. } | TimelineDiff::Update { item, .. } => {
@@ -1074,6 +1218,9 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
                         TimelineDiff::Remove { .. } => {}
                     }
                 }
+                if shown {
+                    let _ = conv.mark_all_read().await;
+                }
             }
             event = events.next() => {
                 use librisala::client::AccountEvent;
@@ -1084,6 +1231,16 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
                         if let OutboxStatus::Failed { reason, .. } = entry.status {
                             eprintln!("risala: not sent ({reason}): {}", entry.text);
                         }
+                    }
+                    // 8.1. Standard input is read a line at a time, so the
+                    // terminal cannot tell when the user types: nothing is
+                    // sent for that.
+                    Some(AccountEvent::Typing { conversation, uids })
+                        if conversation == conv.name() && !uids.is_empty() =>
+                    {
+                        let who = conv.labels(uids.clone()).unwrap_or(uids);
+                        let verb = if who.len() == 1 { "is" } else { "are" };
+                        eprintln!("risala: {} {verb} typing", who.join(", "));
                     }
                     Some(_) => {}
                     None => return Ok(()),
