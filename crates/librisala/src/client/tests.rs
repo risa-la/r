@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use risala_proto::names::Conv;
+use risala_proto::names::{Conv, Seq};
 use risala_proto::server::{Event, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 
@@ -494,4 +494,93 @@ fn conversation_info_has_the_topic_and_settings() {
             ("topic", "Plans\nfor now")
         ]
     );
+}
+
+#[tokio::test]
+async fn the_timeline_shows_the_outbox_until_sent() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let timeline = general.timeline(50).unwrap();
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("diffs")
+            .expect("not closed")
+    };
+
+    // Queued offline: a pending item after the stored ones.
+    let entry = general.send("hello").await.unwrap();
+    match next().await.as_slice() {
+        [TimelineDiff::Insert { index: 1, item }] => {
+            assert_eq!(item.seq, 0);
+            assert!(item.own);
+            assert_eq!(item.text.as_deref(), Some("hello"));
+            assert_eq!(item.outbox.as_ref().unwrap().status, OutboxStatus::Queued);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Sent: its event goes in among the stored ones, and the pending item
+    // goes.
+    let shared = sam.shared().clone();
+    let (account, conv) = (shared.id, "#general".parse::<Conv>().unwrap());
+    let ((), changes) = shared
+        .store
+        .write(|tx| {
+            let row = tx.conv_by_name(account, &conv)?.unwrap();
+            tx.store_event(&row, &event(2, "from=~sam MSG #general hello"))?;
+            tx.outbox_sent(crate::store::OutboxId(entry.id), Seq::new(2).unwrap())
+        })
+        .unwrap();
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events: Vec::new(),
+    });
+    match next().await.as_slice() {
+        [
+            TimelineDiff::Insert { index: 1, item },
+            TimelineDiff::Remove { index: 2 },
+        ] => assert_eq!((item.seq, item.outbox.is_none()), (2, true)),
+        other => panic!("{other:?}"),
+    }
+
+    // Failed: updated in place, until the app removes it.
+    let entry = general.send("again").await.unwrap();
+    assert!(matches!(
+        next().await.as_slice(),
+        [TimelineDiff::Insert { index: 2, .. }]
+    ));
+    let ((), changes) = shared
+        .store
+        .write(|tx| tx.outbox_failed(crate::store::OutboxId(entry.id), FailReason::Unconfirmed))
+        .unwrap();
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events: Vec::new(),
+    });
+    match next().await.as_slice() {
+        [TimelineDiff::Update { index: 2, item }] => assert!(matches!(
+            item.outbox.as_ref().unwrap().status,
+            OutboxStatus::Failed {
+                kind: FailKind::Unconfirmed,
+                ..
+            }
+        )),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(timeline.items().len(), 3);
+    sam.remove_outbox(entry.id).unwrap();
+    assert!(matches!(
+        next().await.as_slice(),
+        [TimelineDiff::Remove { index: 2 }]
+    ));
+    assert_eq!(timeline.items().len(), 2);
 }

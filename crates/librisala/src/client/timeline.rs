@@ -9,8 +9,11 @@ use tokio::sync::{Notify, broadcast};
 
 use super::account::{Batch, Conversation};
 use super::blocking;
-use super::types::{ClientError, Message};
-use crate::store::{AccountId, Change, ConvId, Store, StoreError};
+use super::types::{ClientError, Message, OutboxEntry};
+use crate::store::{
+    AccountId, Change, ConvId, OutboxId, OutboxItem, OutboxState, Store, StoreError,
+};
+use risala_proto::types::Relation;
 
 /// A change to a [`Timeline`]'s items, to apply in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,14 @@ pub enum TimelineDiff {
 /// A window on a conversation's messages, oldest first, that follows every
 /// change to the cache and reports it as [`TimelineDiff`]s.
 ///
+/// After the stored messages come the account's messages still in the
+/// outbox (7.6), queued, sending or failed, oldest first. They have seq 0
+/// and [`Message::outbox`] set. When one is sent, it is removed and its
+/// event is inserted in its place among the stored ones; when it fails, it
+/// is updated, and stays until the app removes it with
+/// [`Account::remove_outbox`](super::Account::remove_outbox). Edits and
+/// reactions in the outbox are not shown as items.
+///
 /// It starts with the newest messages in the cache. Messages that arrive
 /// later are inserted in seq order, so a page of older history that
 /// catching up stores shows up in its place. [`paginate_back`] widens the
@@ -72,11 +83,16 @@ impl std::fmt::Debug for Timeline {
 
 struct State {
     account: AccountId,
+    /// The account's uid, the sender of messages in the outbox.
+    uid: String,
     store: Store,
     conv: risala_proto::names::Conv,
     /// The conversation's row, once it is in the cache.
     row: Option<ConvId>,
+    /// Stored items, by seq.
     items: Vec<Message>,
+    /// Messages in the outbox, after the stored items, by outbox id.
+    outbox: Vec<Message>,
     /// The lowest seq in the window. `None`: every stored item is in it.
     floor: Option<u64>,
     /// Diffs from [`Timeline::paginate_back`] for [`Timeline::next`].
@@ -91,10 +107,12 @@ impl Timeline {
         let rx = shared.events.subscribe();
         let mut state = State {
             account: shared.id,
+            uid: shared.uid.to_string(),
             store: shared.store.clone(),
             conv: conv.conv().clone(),
             row: None,
             items: Vec::new(),
+            outbox: Vec::new(),
             floor: None,
             pending: VecDeque::new(),
         };
@@ -113,9 +131,9 @@ impl Timeline {
         self.conv.clone()
     }
 
-    /// The items now, oldest first.
+    /// The items now, oldest first, then the messages in the outbox.
     pub fn items(&self) -> Vec<Message> {
-        self.state.lock().expect("poisoned").items.clone()
+        self.state.lock().expect("poisoned").all()
     }
 
     /// The next changes, in order. Waits until there are some. `None` once
@@ -229,9 +247,77 @@ impl State {
         Ok(self.row)
     }
 
+    /// Every item: the stored ones, then the outbox.
+    fn all(&self) -> Vec<Message> {
+        let mut all = self.items.clone();
+        all.extend(self.outbox.iter().cloned());
+        all
+    }
+
+    /// Whether an outbox entry is shown as an item: a message or a reply
+    /// that has not been sent yet, or failed.
+    fn shows(item: &OutboxItem) -> bool {
+        !matches!(item.state, OutboxState::Sent(_))
+            && matches!(item.draft.relation, None | Some(Relation::Reply(_)))
+    }
+
+    fn load_outbox(&mut self) -> Result<(), StoreError> {
+        self.outbox = self
+            .store
+            .outbox_for(self.account, &self.conv)?
+            .into_iter()
+            .filter(State::shows)
+            .map(|item| Message::outgoing(OutboxEntry::from(item), &self.uid))
+            .collect();
+        Ok(())
+    }
+
+    /// Applies a change to an outbox entry.
+    fn outbox_changed(
+        &mut self,
+        id: OutboxId,
+        diffs: &mut Vec<TimelineDiff>,
+    ) -> Result<(), StoreError> {
+        let item = self
+            .store
+            .outbox_item(id)?
+            .filter(|i| i.account == self.account && i.conv == self.conv);
+        let at = self
+            .outbox
+            .binary_search_by_key(&id.get(), |m| m.outbox.as_ref().map_or(0, |o| o.id));
+        let base = self.items.len();
+        match (item.filter(State::shows), at) {
+            (Some(item), Ok(i)) => {
+                let m = Message::outgoing(OutboxEntry::from(item), &self.uid);
+                self.outbox[i] = m.clone();
+                diffs.push(TimelineDiff::Update {
+                    index: (base + i) as u32,
+                    item: m,
+                });
+            }
+            (Some(item), Err(i)) => {
+                let m = Message::outgoing(OutboxEntry::from(item), &self.uid);
+                self.outbox.insert(i, m.clone());
+                diffs.push(TimelineDiff::Insert {
+                    index: (base + i) as u32,
+                    item: m,
+                });
+            }
+            (None, Ok(i)) => {
+                self.outbox.remove(i);
+                diffs.push(TimelineDiff::Remove {
+                    index: (base + i) as u32,
+                });
+            }
+            (None, Err(_)) => {}
+        }
+        Ok(())
+    }
+
     fn load(&mut self, limit: u32) -> Result<(), StoreError> {
         self.items.clear();
         self.floor = None;
+        self.load_outbox()?;
         let Some(row) = self.resolve()? else {
             return Ok(());
         };
@@ -246,6 +332,7 @@ impl State {
     /// Reads the window again, after missed changes.
     fn reload(&mut self) -> Result<Vec<TimelineDiff>, StoreError> {
         self.row = None;
+        self.load_outbox()?;
         match self.resolve()? {
             Some(row) => {
                 let floor = self.floor.and_then(Seq::new);
@@ -272,9 +359,7 @@ impl State {
             }
             None => self.items.clear(),
         }
-        Ok(vec![TimelineDiff::Reset {
-            items: self.items.clone(),
-        }])
+        Ok(vec![TimelineDiff::Reset { items: self.all() }])
     }
 
     fn older(&mut self, count: u32) -> Result<(Vec<TimelineDiff>, bool), StoreError> {
@@ -309,14 +394,15 @@ impl State {
                 Change::Cleared { conv } if Some(conv) == row => {
                     self.items.clear();
                     self.floor = None;
-                    diffs.push(TimelineDiff::Reset { items: Vec::new() });
+                    diffs.push(TimelineDiff::Reset { items: self.all() });
                 }
                 Change::ConversationRemoved { conv, .. } if Some(conv) == row => {
                     self.items.clear();
                     self.floor = None;
                     self.row = None;
-                    diffs.push(TimelineDiff::Reset { items: Vec::new() });
+                    diffs.push(TimelineDiff::Reset { items: self.all() });
                 }
+                Change::Outbox { id } => self.outbox_changed(id, &mut diffs)?,
                 Change::Inserted { conv, seq } if Some(conv) == row => {
                     if self.floor.is_some_and(|f| seq.get() < f) {
                         continue;

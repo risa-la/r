@@ -146,9 +146,10 @@ async fn guest_joins_sends_and_receives() {
     assert_eq!(mine.seq, seq);
     assert_eq!(mine.text.as_deref(), Some("hello ann\nsecond line"));
 
-    // The timeline saw all of it, in order.
+    // The timeline saw all of it, in order. The message may show as
+    // pending in the outbox first.
     let mut items = timeline.items();
-    while items.len() < 5 {
+    while items.len() < 5 || items.iter().any(|m| m.outbox.is_some()) {
         let diffs = within("timeline", timeline.next()).await.unwrap();
         for diff in diffs {
             match diff {

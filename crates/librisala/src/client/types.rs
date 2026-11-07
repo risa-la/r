@@ -494,8 +494,38 @@ pub struct Message {
     pub deleted: bool,
     /// Reactions to it, in byte order.
     pub reactions: Vec<ReactionCount>,
-    /// The event as received, in canonical form.
+    /// The event as received, in canonical form. Empty for a message in
+    /// the outbox.
     pub line: String,
+    /// For a message still in the outbox (7.6), its entry: queued, sending
+    /// or failed. Then `seq` is 0, the time is when it was queued, and
+    /// `line` is empty. `None` for a stored event.
+    pub outbox: Option<OutboxEntry>,
+}
+
+impl Message {
+    /// A message in the outbox, shown as a timeline item from `uid`.
+    pub(crate) fn outgoing(entry: OutboxEntry, uid: &str) -> Message {
+        let time = risala_proto::time::Timestamp::from_unix_millis(entry.created_ms)
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        Message {
+            seq: 0,
+            time_ms: entry.created_ms,
+            time,
+            from: uid.to_owned(),
+            own: true,
+            kind: EventKind::Message,
+            text: Some(entry.text.clone()),
+            subject: None,
+            reply_to: entry.reply_to,
+            edited: false,
+            deleted: false,
+            reactions: Vec::new(),
+            line: String::new(),
+            outbox: Some(entry),
+        }
+    }
 }
 
 impl From<TimelineItem> for Message {
@@ -555,6 +585,7 @@ impl From<TimelineItem> for Message {
                 })
                 .collect(),
             line,
+            outbox: None,
         }
     }
 }
@@ -632,6 +663,8 @@ pub struct OutboxEntry {
     pub status: OutboxStatus,
     /// When it was queued, in milliseconds since the Unix epoch.
     pub created_ms: u64,
+    /// The message it replies to, if it is a reply (5.3).
+    pub reply_to: Option<u64>,
 }
 
 impl From<OutboxItem> for OutboxEntry {
@@ -666,6 +699,10 @@ impl From<OutboxItem> for OutboxEntry {
             text: unescape(&item.draft.text).into_owned(),
             status,
             created_ms: item.created.unix_millis(),
+            reply_to: match item.draft.relation {
+                Some(risala_proto::types::Relation::Reply(s)) => Some(s.get()),
+                _ => None,
+            },
         }
     }
 }
