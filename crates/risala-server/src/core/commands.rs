@@ -53,6 +53,9 @@ pub(super) fn not_supported() -> Fail {
 
 pub(super) type Outcome = Result<Option<OkResponse>, Fail>;
 
+/// The window of `limits.rooms_per_day` (6.1, 14).
+pub(super) const ROOM_CREATION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Sends the lines of one command's response, each with the command's
 /// `ref` (3.6).
 pub(super) struct Reply {
@@ -491,18 +494,26 @@ impl Inner {
             let guard = match self.lock_room(room).await {
                 Ok(guard) => guard,
                 Err(e) if !self.may_create_room(uid) => return Err(e),
-                Err(_) => match self.create_room(uid, room).await? {
-                    Some(guard) => {
-                        // The creator is its first member, and its JOIN is
-                        // event 1 (6.1).
-                        send_settings(reply, room_of(&guard)?);
-                        let head = guard.head.map_or(0, u64::from);
-                        reply.line(OkResponse::new().with_id(&guard.id).with_head(head));
-                        return Ok(None);
+                Err(_) => {
+                    // Taken now and given back if no room is made (6.1,
+                    // 14).
+                    let slot = self.room_creation_slot(uid)?;
+                    match self.create_room(uid, room).await? {
+                        Some(guard) => {
+                            if let Some(slot) = slot {
+                                slot.keep();
+                            }
+                            // The creator is its first member, and its JOIN
+                            // is event 1 (6.1).
+                            send_settings(reply, room_of(&guard)?);
+                            let head = guard.head.map_or(0, u64::from);
+                            reply.line(OkResponse::new().with_id(&guard.id).with_head(head));
+                            return Ok(None);
+                        }
+                        // Someone else created it meanwhile: join theirs.
+                        None => continue,
                     }
-                    // Someone else created it meanwhile: join theirs.
-                    None => continue,
-                },
+                }
             };
             return self.join_existing(uid, reply, guard).await;
         }
@@ -552,6 +563,25 @@ impl Inner {
             RoomCreation::Operators => self.is_operator(uid),
             RoomCreation::Nobody => false,
         }
+    }
+
+    /// One of the rooms `uid` may create today (6.1, 14), under
+    /// `limits.rooms_per_day`, or `ERR rate-limited`. Operators are not
+    /// limited, and get no slot.
+    fn room_creation_slot(&self, uid: &Uid) -> Result<Option<super::rate::Slot<'_, Uid>>, Fail> {
+        if self.is_operator(uid) {
+            return Ok(None);
+        }
+        let limit = self.config.limits.rooms_per_day;
+        self.room_creations
+            .take(uid.clone(), limit, self.now())
+            .map_err(|retry| {
+                Fail::Err(
+                    ErrResponse::new(ErrorCode::RateLimited)
+                        .with_retry(retry)
+                        .with_message("you have created too many rooms today"),
+                )
+            })
     }
 
     /// `uid` as the access rules of a room see it.

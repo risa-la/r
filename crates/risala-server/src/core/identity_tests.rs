@@ -1257,6 +1257,41 @@ async fn joining_a_new_room_creates_it() {
     assert!(sam.lines()[0].starts_with("@seq=2;"));
 }
 
+/// One identity may create only so many rooms a day (6.1, 14). Joining
+/// rooms that exist is not limited, and operators are not.
+#[tokio::test]
+async fn room_creation_is_rate_limited() {
+    let mut c = id_config();
+    c.limits.rooms_per_day = 2;
+    let mut w = World::with(c);
+    w.fetcher.set(&identity("bob@example.net"), vec![public(1)]);
+    w.fetcher.set(&identity("op@example.net"), vec![public(2)]);
+    let mut bob = w.sign_in("bob@example.net", 1).await;
+    for room in ["#one", "#two"] {
+        w.send(&bob, &format!("join {room}")).await;
+        assert!(bob.lines().last().unwrap().starts_with("OK id="));
+    }
+    w.h.clock.advance(Duration::from_secs(60 * 60));
+    w.send(&bob, "@ref=x join #three").await;
+    assert_eq!(
+        bob.lines(),
+        ["@ref=x;retry=82800 ERR rate-limited you have created too many rooms today"]
+    );
+    // Rooms that exist may still be joined.
+    w.send(&bob, "join #general").await;
+    assert!(bob.lines().last().unwrap().starts_with("OK id="));
+    // Operators are not limited.
+    let mut op = w.sign_in("op@example.net", 2).await;
+    for room in ["#a", "#b", "#c"] {
+        w.send(&op, &format!("join {room}")).await;
+        assert!(op.lines().last().unwrap().starts_with("OK id="));
+    }
+    // A day after the first, bob may create one again.
+    w.h.clock.advance(Duration::from_secs(23 * 60 * 60));
+    w.send(&bob, "join #three").await;
+    assert!(bob.lines().last().unwrap().starts_with("OK id="));
+}
+
 #[tokio::test]
 async fn room_creation_follows_the_policy() {
     for (policy, may) in [

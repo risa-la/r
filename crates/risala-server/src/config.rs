@@ -223,6 +223,11 @@ pub struct Limits {
     /// an hour (13, 14). IPv6 addresses count by their /64. Further
     /// REGISTERs get `ERR rate-limited`. 0 means no limit.
     pub registrations_per_hour: u32,
+    /// The most rooms one identity may create, by joining them, in a day
+    /// (6.1, 14), since anyone who controls a domain can make any number
+    /// of identities. Further creations get `ERR rate-limited`. Operators
+    /// are not limited. 0 means no limit.
+    pub rooms_per_day: u32,
     /// Seconds after an identity's last connection closes before the
     /// people who share a conversation with it are told it is offline
     /// (8.3: about 30). A connection that opens meanwhile cancels it, and
@@ -347,6 +352,7 @@ impl Default for Limits {
             max_page: 500,
             max_list: 500,
             registrations_per_hour: 5,
+            rooms_per_day: 10,
             presence_offline_secs: 30,
             presence_batch_ms: 1000,
             typing_interval_ms: 1000,

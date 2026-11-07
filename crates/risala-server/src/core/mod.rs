@@ -236,6 +236,9 @@ pub(crate) struct Inner {
     /// or is registering now (4.6, 14), for
     /// `limits.registrations_per_hour`.
     registrations: rate::WindowLimit<IpAddr>,
+    /// The rooms each identity created in the last day, or is creating
+    /// now (6.1, 14), for `limits.rooms_per_day`.
+    room_creations: rate::WindowLimit<Uid>,
     /// Held while presence changes are sent (8.3), so that one flush ends
     /// before the next begins.
     presence_lock: tokio::sync::Mutex<()>,
@@ -427,6 +430,7 @@ impl Hub {
                     operators: RwLock::new(operators),
                     keys_lock: tokio::sync::Mutex::new(()),
                     registrations: rate::WindowLimit::new(identity::REGISTRATION_WINDOW),
+                    room_creations: rate::WindowLimit::new(commands::ROOM_CREATION_WINDOW),
                     presence_lock: tokio::sync::Mutex::new(()),
                     names_lock: tokio::sync::Mutex::new(()),
                     typing_interval: timers.typing_interval,
