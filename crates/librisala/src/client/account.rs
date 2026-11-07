@@ -70,6 +70,9 @@ pub(crate) struct AccountShared {
     /// Rooms and users whose presence the app shows, to ask about again
     /// after each reconnect (8.3).
     pub watching: Mutex<Watching>,
+    /// Whether the account was running before an UNREGISTER whose answer
+    /// was lost (4.8), to start it again if a later try is refused.
+    pub ran_before_unregister: Mutex<Option<bool>>,
     next_driver: AtomicU64,
 }
 
@@ -177,6 +180,7 @@ impl AccountShared {
             typing: Mutex::new(Typists::default()),
             presence: Mutex::new(HashMap::new()),
             watching: Mutex::new(Watching::default()),
+            ran_before_unregister: Mutex::new(None),
             next_driver: AtomicU64::new(1),
         })
     }

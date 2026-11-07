@@ -454,6 +454,39 @@ impl Store {
         Ok(())
     }
 
+    /// Whether an UNREGISTER of the account was sent and its answer lost
+    /// (4.8): `Some(hosted)`, saying whether the server hosted the
+    /// identity, or `None`.
+    pub fn unregister_lost(&self, account: AccountId) -> Result<Option<bool>, StoreError> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT unregister_lost FROM accounts WHERE id = ?1",
+                    [account.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// Records an UNREGISTER whose answer was lost, or forgets it. See
+    /// [`unregister_lost`](Self::unregister_lost).
+    pub fn set_unregister_lost(
+        &self,
+        account: AccountId,
+        hosted: Option<bool>,
+    ) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.conn().execute(
+                "UPDATE accounts SET unregister_lost = ?2 WHERE id = ?1",
+                params![account.0, hosted],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Records the guest session the account signed in to, or forgets it.
     /// See [`guest_session`](Self::guest_session).
     pub fn set_guest_session(

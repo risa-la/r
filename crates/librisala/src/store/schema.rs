@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -266,6 +266,16 @@ const V7: &str = "
 ALTER TABLE accounts ADD COLUMN blocks_clock INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE blocks ADD COLUMN blocked INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE blocks ADD COLUMN changed INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Version 8: an UNREGISTER whose answer was lost (4.8).
+///
+/// `accounts.unregister_lost` is NULL normally. After UNREGISTER was sent
+/// and its answer lost, it is 1 if the server hosted the identity and 0 if
+/// not, until the user tries again, so that the account does not sign in
+/// on its own meanwhile, even after a restart.
+const V8: &str = "
+ALTER TABLE accounts ADD COLUMN unregister_lost INTEGER;
 ";
 
 /// Brings the schema up to [`VERSION`].

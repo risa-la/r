@@ -382,7 +382,7 @@ async fn confirm_registration(
         uid: identity.to_string(),
         message: format!(
             "REGISTER got no answer ({lost}), and {why}: whether {identity} was registered \
-             is not known. This device's key for it is kept"
+             is not known. This device's key for it is kept: sign in as it later to find out"
         ),
     };
     let session = match Session::connect(addr, trust, options).await {
@@ -535,6 +535,24 @@ impl Account {
         Ok(())
     }
 
+    /// Forgets an UNREGISTER whose answer was lost: a later one settled
+    /// it.
+    async fn forget_lost_unregister(&self) {
+        *self
+            .shared()
+            .ran_before_unregister
+            .lock()
+            .expect("poisoned") = None;
+        let (store, id) = (self.shared().store.clone(), self.id());
+        if let Err(e) = blocking(&self.shared().rt, move || {
+            store.set_unregister_lost(id, None)
+        })
+        .await
+        {
+            warn!(error = %e, "forgetting a lost UNREGISTER");
+        }
+    }
+
     /// Deletes the account's identity from the server (UNREGISTER, 4.8),
     /// then the account and its cache. `uid` must be the account's own
     /// uid, typed out by the user as a guard against mistakes; anything
@@ -550,7 +568,18 @@ impl Account {
     ///
     /// The account stops first, and the command goes on a connection of
     /// its own, so that the account cannot sign in again in between. If
-    /// UNREGISTER fails, an account that was running starts again.
+    /// the server refuses, or the command is never sent, an account that
+    /// was running starts again.
+    ///
+    /// If the connection drops after UNREGISTER is sent and before its
+    /// answer, the identity may be gone: this fails with
+    /// [`ClientError::Unconfirmed`], and the account stays stopped, so
+    /// that it does not sign in again and undo part of the request. The
+    /// cache remembers this, and [`start`](Self::start) and
+    /// [`connect`](Self::connect) refuse with
+    /// [`RefusedKind::UnregisterPending`] until it is settled. Call
+    /// `unregister` again to find out and finish: if the server then
+    /// refuses to sign in to an identity it hosted, it was deleted.
     pub async fn unregister(&self, uid: &str, purge: bool) -> Result<Unregistered, ClientError> {
         let identity = self.identity()?;
         let typed: Option<Uid> = uid.trim().parse().ok();
@@ -571,57 +600,83 @@ impl Account {
             })
             .await?
         };
-        let was_running = self.is_running();
+        // An earlier UNREGISTER whose answer was lost, if any: whether the
+        // server hosted the identity.
+        let (store, id) = (self.shared().store.clone(), self.id());
+        let lost_before = blocking(&self.shared().rt, move || store.unregister_lost(id)).await?;
+        let ran_before = *self
+            .shared()
+            .ran_before_unregister
+            .lock()
+            .expect("poisoned");
+        let was_running = ran_before.unwrap_or_else(|| self.is_running());
         self.disconnect().await;
 
         let addr = self.shared().server.clone();
         let trust: Arc<dyn TrustStore> = Arc::new(self.shared().store.clone());
         let options = self.shared().options.session.clone();
-        let result = {
+        let outcome = {
             let identity = identity.clone();
             on_runtime(&client, async move {
-                let server = addr.to_string();
-                let session = signed_in_session(&addr, trust, options, &identity, &key).await?;
-                let result = async {
-                    // KEY LIST tells whether the server hosts the identity
-                    // (4.7). INFO does not: it says register=no while
-                    // registration is closed.
-                    let hosted =
-                        match request(&server, &session, Command::Key(KeyCommand::List)).await {
-                            Ok(_) => true,
-                            Err(ClientError::Refused {
-                                kind: RefusedKind::NotHosted,
-                                ..
-                            }) => false,
-                            Err(e) => return Err(e),
-                        };
-                    let command = Command::Unregister {
-                        uid: identity.to_uid(),
-                        purge,
-                    };
-                    request(&server, &session, command).await?;
-                    Ok(hosted)
-                }
-                .await;
-                if result.is_err() {
-                    quit(&session).await;
-                }
-                // After OK the server closes the connection itself.
-                session.close();
-                result
+                Ok(unregister_on(&addr, trust, options, &identity, &key, purge).await)
             })
-            .await
+            .await?
         };
-        let hosted = match result {
-            Ok(hosted) => hosted,
-            Err(e) => {
+        let hosted = match outcome {
+            Unregistering::Done { hosted } => hosted,
+            // The identity this server hosted is gone: an earlier
+            // UNREGISTER went through.
+            Unregistering::NotSent(e)
+                if lost_before == Some(true)
+                    && matches!(
+                        e,
+                        ClientError::Refused {
+                            kind: RefusedKind::AuthFailed,
+                            ..
+                        }
+                    ) =>
+            {
+                true
+            }
+            // Still not known whether the earlier one went through: stay
+            // stopped.
+            Unregistering::NotSent(e) if lost_before.is_some() => return Err(e),
+            // Signed in, so the identity is there, and nothing was deleted.
+            Unregistering::NotSent(e) | Unregistering::Refused(e) => {
+                self.forget_lost_unregister().await;
                 if was_running {
                     self.start();
                 }
                 return Err(e);
             }
+            Unregistering::Lost { hosted, error } => {
+                let hosted = hosted || lost_before == Some(true);
+                let (store, id) = (self.shared().store.clone(), self.id());
+                blocking(&self.shared().rt, move || {
+                    store.set_unregister_lost(id, Some(hosted))
+                })
+                .await?;
+                *self
+                    .shared()
+                    .ran_before_unregister
+                    .lock()
+                    .expect("poisoned") = Some(was_running);
+                return Err(ClientError::Unconfirmed {
+                    uid: identity.to_string(),
+                    message: format!(
+                        "UNREGISTER got no answer ({error}): whether {identity} was deleted \
+                         is not known. The account is kept, stopped; unregister again to \
+                         finish"
+                    ),
+                });
+            }
         };
 
+        *self
+            .shared()
+            .ran_before_unregister
+            .lock()
+            .expect("poisoned") = None;
         client.remove_account(self).await?;
         let mut key_deleted = false;
         if hosted {
@@ -637,4 +692,73 @@ impl Account {
             key_deleted,
         })
     }
+}
+
+/// How UNREGISTER went.
+enum Unregistering {
+    /// The server answered `OK`.
+    Done { hosted: bool },
+    /// UNREGISTER was never sent: signing in or KEY LIST failed.
+    NotSent(ClientError),
+    /// The server refused UNREGISTER: nothing was deleted.
+    Refused(ClientError),
+    /// UNREGISTER was sent, and its answer lost.
+    Lost { hosted: bool, error: ClientError },
+}
+
+/// Signs in on a connection of its own, asks KEY LIST whether the server
+/// hosts the identity (4.7), and sends UNREGISTER (4.8).
+async fn unregister_on(
+    addr: &ServerAddr,
+    trust: Arc<dyn TrustStore>,
+    options: SessionOptions,
+    identity: &Identity,
+    key: &SecretKey,
+    purge: bool,
+) -> Unregistering {
+    let server = addr.to_string();
+    let session = match signed_in_session(addr, trust, options, identity, key).await {
+        Ok(session) => session,
+        Err(e) => return Unregistering::NotSent(e),
+    };
+    // KEY LIST tells whether the server hosts the identity (4.7). INFO
+    // does not: it says register=no while registration is closed.
+    let hosted = match request(&server, &session, Command::Key(KeyCommand::List)).await {
+        Ok(_) => true,
+        Err(ClientError::Refused {
+            kind: RefusedKind::NotHosted,
+            ..
+        }) => false,
+        Err(e) => {
+            quit(&session).await;
+            return Unregistering::NotSent(e);
+        }
+    };
+    let command = Command::Unregister {
+        uid: identity.to_uid(),
+        purge,
+    };
+    let outcome = match session.request(command.clone()).await {
+        Ok(response) => match response.into_result() {
+            Ok(_) => Unregistering::Done { hosted },
+            Err(CommandError::Server(err)) => Unregistering::Refused(refused(&err, &command)),
+            Err(e) => Unregistering::Lost {
+                hosted,
+                error: ClientError::from_conn(&server, &e.into()),
+            },
+        },
+        Err(e @ conn::Error::InvalidCommand(_)) => {
+            Unregistering::NotSent(ClientError::from_conn(&server, &e))
+        }
+        Err(e) => Unregistering::Lost {
+            hosted,
+            error: ClientError::from_conn(&server, &e),
+        },
+    };
+    match outcome {
+        // After OK the server closes the connection itself.
+        Unregistering::Done { .. } | Unregistering::Lost { .. } => session.close(),
+        _ => quit(&session).await,
+    }
+    outcome
 }

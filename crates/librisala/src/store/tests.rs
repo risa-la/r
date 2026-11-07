@@ -787,8 +787,8 @@ fn own_events_follow_the_connection_uid() {
 
 #[test]
 fn a_version_4_cache_with_data_migrates() {
-    // Versions 5 to 7 add names, blocks, the accepted key and the block
-    // clock. What a version 4 cache holds must come through, and work
+    // Versions 5 to 8 add names, blocks, the accepted key, the block
+    // clock and lost UNREGISTERs. What a version 4 cache holds must come through, and work
     // with them.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
@@ -843,6 +843,7 @@ fn a_version_4_cache_with_data_migrates() {
     assert!(!store.hides_blocked(account).unwrap());
     assert_eq!(store.blocks_clock(account).unwrap(), 0);
     assert_eq!(store.accepted_key(account).unwrap(), None);
+    assert_eq!(store.unregister_lost(account).unwrap(), None);
     // And they work on the old data.
     let troll: risala_proto::names::BlockTarget = "troll@example.com".parse().unwrap();
     store

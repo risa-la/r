@@ -277,6 +277,15 @@ fn sign_in_for(
     let identity = uid
         .to_identity()
         .ok_or_else(|| ClientError::Invalid(format!("uid {uid}")))?;
+    if shared.store.unregister_lost(shared.id)?.is_some() {
+        return Err(ClientError::refused(
+            RefusedKind::UnregisterPending,
+            format!(
+                "UNREGISTER of {identity} got no answer; unregister again to settle it before \
+                 signing in"
+            ),
+        ));
+    }
     let keys = shared
         .options
         .keys

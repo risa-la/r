@@ -718,6 +718,67 @@ async fn unregister_elsewhere_keeps_the_key() {
 }
 
 #[tokio::test]
+async fn a_lost_unregister_does_not_sign_in_again() {
+    // 0: the running account. 1: UNREGISTER, whose answer is lost. 2: the
+    // user tries again, and the server refuses to sign in: the identity
+    // it hosted is gone.
+    let s = setup(3, |i, mut peer| async move {
+        match i {
+            0 => {
+                signed_in(&mut peer).await;
+                quit(peer).await;
+            }
+            1 => {
+                greet(&mut peer).await;
+                peer.expect(&auth_line(1)).await;
+                peer.send(&format!("@ref=1 OK uid={ALICE}")).await;
+                peer.expect("@ref=2 KEY LIST").await;
+                peer.send(&format!("@ref=2 KEY {PUBLIC}\n@ref=2 OK")).await;
+                peer.expect(&format!("@ref=3 UNREGISTER {ALICE}")).await;
+                peer.close().await;
+            }
+            _ => {
+                greet(&mut peer).await;
+                peer.expect(&auth_line(1)).await;
+                peer.send("@ref=1 ERR auth-failed").await;
+                peer.expect_eof().await;
+            }
+        }
+    })
+    .await;
+    s.client.import_device_key(ALICE, PEM, false).await.unwrap();
+    let alice = s.client.add_identity(HOST, ALICE).unwrap();
+    within(alice.connect()).await.unwrap();
+    within(alice.wait_synced()).await.unwrap();
+
+    match within(alice.unregister(ALICE, false)).await.unwrap_err() {
+        ClientError::Unconfirmed { uid, .. } => assert_eq!(uid, ALICE),
+        other => panic!("{other:?}"),
+    }
+    // Not started again, which would sign in and undo part of it, and not
+    // by hand either, as after the app starts again.
+    assert_eq!(alice.state(), ConnectionState::Offline);
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::UnregisterPending, None));
+    assert!(err.is_permanent());
+    assert_eq!(s.client.accounts().unwrap().len(), 1);
+    assert!(s.keys.load(ALICE).unwrap().is_some());
+
+    let done = within(alice.unregister(ALICE, false)).await.unwrap();
+    assert_eq!(
+        done,
+        Unregistered {
+            uid: ALICE.into(),
+            hosted: true,
+            key_deleted: true,
+        }
+    );
+    assert!(s.client.accounts().unwrap().is_empty());
+    assert!(s.keys.load(ALICE).unwrap().is_none());
+    s.server.done().await;
+}
+
+#[tokio::test]
 async fn a_failed_unregister_starts_the_account_again() {
     let s = setup(3, |i, mut peer| async move {
         match i {

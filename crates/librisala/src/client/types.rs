@@ -247,6 +247,11 @@ pub enum RefusedKind {
     /// user to decide on; [`Client::delete_device_key`](super::Client::delete_device_key)
     /// deletes it.
     NotRegistered,
+    /// UNREGISTER of this identity was sent and its answer lost, so the
+    /// account does not sign in on its own, which could undo part of it
+    /// (4.8). Call [`Account::unregister`](super::Account::unregister)
+    /// again to settle it.
+    UnregisterPending,
 }
 
 impl RefusedKind {
@@ -276,6 +281,7 @@ impl RefusedKind {
             RefusedKind::RateLimited => "rate-limited",
             RefusedKind::NotSupported | RefusedKind::NotHosted => "not-supported",
             RefusedKind::NoRegistration
+            | RefusedKind::UnregisterPending
             | RefusedKind::NoHostname
             | RefusedKind::WrongUid
             | RefusedKind::Guest => return None,
