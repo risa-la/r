@@ -885,8 +885,9 @@ async fn login(
     let mut new_key = false;
     match pem_file {
         Some(path) => {
+            // The PEM holds the private key: wiped when dropped.
             let pem = match std::fs::read_to_string(&path) {
-                Ok(pem) => pem,
+                Ok(pem) => zeroize::Zeroizing::new(pem),
                 Err(e) => return fail(format!("reading {}: {e}", path.display())),
             };
             match within(client.import_device_key(identity, &pem, force)).await {
