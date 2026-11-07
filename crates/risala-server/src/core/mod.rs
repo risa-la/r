@@ -37,7 +37,7 @@ use risala_proto::server::{Greeting, Host, ServerMessage};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{MAX_WELCOME, ServerRetention};
 
-use crate::config::Config;
+use crate::config::{Config, ConfigError};
 use crate::handler::{ConnHandle, ConnId, ConnInfo, Handler};
 use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 
@@ -189,6 +189,15 @@ impl Hub {
         clock: Arc<dyn Clock>,
         sign_in_timeout: Duration,
     ) -> Result<Hub, HubError> {
+        match config.validate() {
+            Ok(warnings) => {
+                for warning in warnings {
+                    tracing::warn!("{warning}");
+                }
+            }
+            Err(ConfigError::Invalid(message)) => return Err(HubError::Config(message)),
+            Err(e) => return Err(HubError::Config(e.to_string())),
+        }
         let retention: ServerRetention = config.server.retention.parse().map_err(|e| {
             HubError::Config(format!(
                 "server.retention {:?}: {e}",

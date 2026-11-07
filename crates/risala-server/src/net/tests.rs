@@ -750,6 +750,16 @@ async fn unusable_certificates_fail_bind() {
     assert!(err.to_string().contains("missing.crt"), "{err}");
 }
 
+#[tokio::test]
+async fn unusable_limits_fail_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.limits.out_queue = 1;
+    let err = Server::bind(&config, Stub::new()).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("out_queue"), "{err}");
+}
+
 /// Appendix A's pipeline prints the fingerprint the server logs.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]

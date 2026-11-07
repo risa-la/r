@@ -100,13 +100,53 @@ pub struct Limits {
     /// Further seconds of silence before the server closes (11).
     pub ping_timeout_secs: u64,
     /// The most lines queued for one connection before it is dropped as
-    /// too slow.
+    /// too slow. Before it runs each command, a connection waits until its
+    /// queue has room for the command's whole response and for live events
+    /// besides ([`Limits::command_room`]), so this must be at least that.
     pub out_queue: usize,
     /// The most events one HISTORY or RELATED page returns, whatever the
     /// client asks for (7.2).
     pub max_page: u64,
     /// The most rooms one LIST page returns (6.1).
     pub max_list: u64,
+}
+
+/// The most lines a command's response has besides a full page of events
+/// (HISTORY) or rooms (LIST): the snapshot SETs of JOIN and INFO, the
+/// command's own event, and the final response.
+pub const REPLY_MARGIN: usize = 16;
+
+/// The room a connection's queue keeps for live events from other people
+/// while it holds a response of the largest size (see
+/// [`Limits::command_room`]).
+pub const FANOUT_ROOM: usize = 128;
+
+/// The least `limits.sign_in_secs` the spec recommends (4.1).
+pub const MIN_SIGN_IN_SECS: u64 = 120;
+
+impl Limits {
+    /// The most lines one command's response queues: a full HISTORY or
+    /// LIST page, plus [`REPLY_MARGIN`]. SYNC is not bounded by this: it
+    /// has a line for every conversation the user is in.
+    pub fn reply_lines(&self) -> usize {
+        let page = self.max_page.max(self.max_list);
+        usize::try_from(page)
+            .unwrap_or(usize::MAX)
+            .saturating_add(REPLY_MARGIN)
+    }
+
+    /// The free lines a connection's queue must have before the network
+    /// layer hands it its next command: room for the largest response
+    /// ([`reply_lines`](Self::reply_lines)) and [`FANOUT_ROOM`] more for
+    /// live events that arrive meanwhile.
+    ///
+    /// So a client that sends many commands at once, such as a HISTORY
+    /// for every room after SYNC, gets them answered as fast as it reads,
+    /// and is not dropped as too slow. Live events from other people still
+    /// drop a connection whose queue is full.
+    pub fn command_room(&self) -> usize {
+        self.reply_lines().saturating_add(FANOUT_ROOM)
+    }
 }
 
 impl Default for Config {
@@ -166,6 +206,9 @@ pub enum ConfigError {
         /// What went wrong.
         source: toml::de::Error,
     },
+    /// A value that parses but cannot work.
+    #[error("configuration: {0}")]
+    Invalid(String),
 }
 
 impl Config {
@@ -184,6 +227,46 @@ impl Config {
     /// Parses configuration text.
     pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
         toml::from_str(text)
+    }
+
+    /// Checks the limits for values that cannot work: timers of zero, pages
+    /// of no lines, and queues too short for a response (see
+    /// [`Limits::command_room`]).
+    ///
+    /// Returns warnings for values that work but go against what the spec
+    /// recommends, for the caller to log.
+    pub fn validate(&self) -> Result<Vec<String>, ConfigError> {
+        let l = &self.limits;
+        let invalid = |message: String| Err(ConfigError::Invalid(message));
+        for (name, value) in [
+            ("sign_in_secs", l.sign_in_secs),
+            ("idle_ping_secs", l.idle_ping_secs),
+            ("ping_timeout_secs", l.ping_timeout_secs),
+            ("max_page", l.max_page),
+            ("max_list", l.max_list),
+        ] {
+            if value == 0 {
+                return invalid(format!("limits.{name} must be at least 1"));
+            }
+        }
+        if l.out_queue < l.command_room() {
+            return invalid(format!(
+                "limits.out_queue is {}, but must be at least {}: room for the longest \
+                 response ({} lines: max_page or max_list, whichever is larger, plus \
+                 {REPLY_MARGIN}) and {FANOUT_ROOM} lines for live events",
+                l.out_queue,
+                l.command_room(),
+                l.reply_lines(),
+            ));
+        }
+        let mut warnings = Vec::new();
+        if l.sign_in_secs < MIN_SIGN_IN_SECS {
+            warnings.push(format!(
+                "limits.sign_in_secs is {}; the spec recommends at least {MIN_SIGN_IN_SECS} (4.1)",
+                l.sign_in_secs
+            ));
+        }
+        Ok(warnings)
     }
 
     /// The path of the SQLite database.
@@ -228,6 +311,52 @@ mod tests {
         assert!(!c.server.guests);
         assert_eq!(c.limits.out_queue, 8);
         assert_eq!(c.limits.idle_ping_secs, 120);
+    }
+
+    #[test]
+    fn limits_are_checked() {
+        assert_eq!(Config::default().validate().unwrap(), Vec::<String>::new());
+        let with = |f: fn(&mut Limits)| {
+            let mut c = Config::default();
+            f(&mut c.limits);
+            c.validate()
+        };
+        let invalid = |f: fn(&mut Limits), what: &str| match with(f) {
+            Err(ConfigError::Invalid(m)) => assert!(m.contains(what), "{m}"),
+            other => panic!("{what}: {other:?}"),
+        };
+        invalid(|l| l.sign_in_secs = 0, "sign_in_secs");
+        invalid(|l| l.idle_ping_secs = 0, "idle_ping_secs");
+        invalid(|l| l.ping_timeout_secs = 0, "ping_timeout_secs");
+        invalid(|l| l.max_page = 0, "max_page");
+        invalid(|l| l.max_list = 0, "max_list");
+
+        // The queue holds the longest response and room for live events.
+        let l = Limits::default();
+        assert_eq!(l.reply_lines(), 500 + REPLY_MARGIN);
+        assert_eq!(l.command_room(), 500 + REPLY_MARGIN + FANOUT_ROOM);
+        invalid(|l| l.out_queue = 8, "out_queue");
+        invalid(|l| l.max_page = 1000, "out_queue");
+        invalid(|l| l.max_list = 1000, "out_queue");
+        invalid(|l| l.max_page = u64::MAX, "out_queue");
+        assert!(
+            with(|l| {
+                l.max_page = 1000;
+                l.out_queue = 1000 + REPLY_MARGIN + FANOUT_ROOM;
+            })
+            .is_ok()
+        );
+        assert!(
+            with(|l| {
+                l.out_queue = 500 + REPLY_MARGIN + FANOUT_ROOM - 1;
+            })
+            .is_err()
+        );
+
+        // A short sign-in time works, but goes against 4.1.
+        let warnings = with(|l| l.sign_in_secs = 10).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("sign_in_secs"), "{warnings:?}");
     }
 
     #[test]

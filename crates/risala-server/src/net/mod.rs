@@ -104,7 +104,13 @@ impl<H: Handler> Server<H> {
     ///
     /// With no certificates configured, this generates a self-signed one,
     /// or reuses the one generated before (see [`Certificates::load`]).
+    ///
+    /// Fails with [`io::ErrorKind::InvalidInput`] if the limits cannot work
+    /// (see [`Config::validate`]).
     pub fn bind(config: &Config, handler: Arc<H>) -> io::Result<Server<H>> {
+        config
+            .validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let certs = Certificates::load(config)?;
         let acceptor = TlsAcceptor::from(Arc::new(tls::server_config(&certs)?));
         let mut listeners = Vec::new();
@@ -125,7 +131,7 @@ impl<H: Handler> Server<H> {
                 idle_ping: Duration::from_secs(config.limits.idle_ping_secs),
                 ping_timeout: Duration::from_secs(config.limits.ping_timeout_secs),
             },
-            out_queue: config.limits.out_queue.max(1),
+            out_queue: config.limits.out_queue,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
         })

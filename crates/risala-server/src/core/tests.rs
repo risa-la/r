@@ -1368,6 +1368,13 @@ async fn the_configuration_is_checked() {
     let mut c = config();
     c.hostname = "not a host".into();
     assert!(matches!(build(c), Err(HubError::Config(_))));
+    // The limits too (see Config::validate).
+    let mut c = config();
+    c.limits.out_queue = 10;
+    assert!(matches!(build(c), Err(HubError::Config(m)) if m.contains("out_queue")));
+    let mut c = config();
+    c.limits.ping_timeout_secs = 0;
+    assert!(matches!(build(c), Err(HubError::Config(m)) if m.contains("ping_timeout_secs")));
 }
 
 // ---------------------------------------------------------------------------
