@@ -37,5 +37,5 @@ pub use supervisor::{
 };
 pub use tls::{
     CaVerifier, TrustVerifier, Verified, accept_fingerprint, certificate_fingerprint,
-    crypto_provider, platform_ca_verifier, roots_ca_verifier,
+    crypto_provider, no_ca_verifier, platform_ca_verifier, roots_ca_verifier,
 };

@@ -286,10 +286,7 @@ impl Run {
 
     async fn run_inner(&mut self) -> Result<(), Stop> {
         if self.options.ca_verifier.is_none() {
-            match tls::platform_ca_verifier() {
-                Ok(ca) => self.options.ca_verifier = Some(ca),
-                Err(error) => return self.emit(SupervisorEvent::Failed { error }).await,
-            }
+            self.options.ca_verifier = Some(tls::platform_ca_verifier());
         }
         let mut failures: u32 = 0;
         loop {

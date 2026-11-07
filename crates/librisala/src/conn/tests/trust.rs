@@ -5,7 +5,9 @@ use risala_proto::fingerprint::Fingerprint;
 use super::server::{Peer, ScriptServer, ServerCert, TestCa};
 use super::{chat_test, connect, options, store};
 use crate::addr::TrustRecord;
-use crate::conn::{Error, Session, TrustError, Verified, accept_fingerprint};
+use crate::conn::{
+    Error, Session, SessionOptions, TrustError, Verified, accept_fingerprint, no_ca_verifier,
+};
 
 /// A server that greets and then waits for the client to go.
 async fn greeter(cert: ServerCert, conns: usize) -> ScriptServer {
@@ -342,4 +344,39 @@ fn certificate_fingerprint_reads_the_spki() {
         crate::conn::certificate_fingerprint(&bad),
         Err(TrustError::BadCertificate(_))
     ));
+}
+
+#[tokio::test]
+async fn with_no_ca_check_every_server_is_trust_on_first_use() {
+    // A system with no CA certificates: platform_ca_verifier falls back
+    // to no_ca_verifier, so a CA-issued certificate goes through trust on
+    // first use (2.2, rule 2), and a pin works. Regression: such a system
+    // could not connect at all.
+    let ca = TestCa::new();
+    let cert = ca.issue("chat.test");
+    let fp = cert.fingerprint;
+    let server = greeter(cert, 2).await;
+    let trust = store();
+    let opts = SessionOptions {
+        ca_verifier: Some(no_ca_verifier()),
+        ..options(&ca, &server)
+    };
+    let err = Session::connect(&chat_test(), trust.clone(), opts.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Trust(TrustError::Unknown { fingerprint, .. }) if *fingerprint == fp),
+        "{err:?}"
+    );
+    accept_fingerprint(&*trust, &chat_test(), fp).unwrap();
+    let session = Session::connect(&chat_test(), trust, opts).await.unwrap();
+    assert_eq!(session.info().verified.record, TrustRecord::Pinned(fp));
+    drop(session);
+    server.done().await;
+}
+
+#[test]
+fn the_platform_ca_check_can_always_be_made() {
+    // It falls back rather than failing (see above).
+    let _ = crate::conn::platform_ca_verifier();
 }

@@ -48,9 +48,68 @@ pub fn crypto_provider() -> Arc<CryptoProvider> {
 ///
 /// Making one loads the trust store, so reuse it across connections
 /// (put it in [`SessionOptions::ca_verifier`](super::SessionOptions)).
-pub fn platform_ca_verifier() -> Result<CaVerifier, Error> {
-    let v = rustls_platform_verifier::Verifier::new(crypto_provider()).map_err(Error::Tls)?;
-    Ok(Arc::new(v))
+///
+/// If the platform's check cannot be made, for example because the system
+/// has no CA certificates at all, this logs a warning and returns
+/// [`no_ca_verifier`]: no certificate is CA-valid then, and every server
+/// goes through trust on first use (2.2, rule 2).
+pub fn platform_ca_verifier() -> CaVerifier {
+    match rustls_platform_verifier::Verifier::new(crypto_provider()) {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "no CA check available; using trust on first use only");
+            no_ca_verifier()
+        }
+    }
+}
+
+/// A CA check that finds no certificate CA-valid, so that every server
+/// goes through trust on first use (2.2, rule 2).
+pub fn no_ca_verifier() -> CaVerifier {
+    Arc::new(NoCaVerifier(
+        crypto_provider().signature_verification_algorithms,
+    ))
+}
+
+/// See [`no_ca_verifier`].
+#[derive(Debug)]
+struct NoCaVerifier(WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for NoCaVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::General(
+            "no certificate authorities to check against".into(),
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
 }
 
 /// A CA check that trusts only the given roots, for tests and private
