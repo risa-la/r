@@ -1410,6 +1410,32 @@ fn sync_initialises_read_markers_and_sends_the_ones_it_missed() {
     g.idle();
 }
 
+#[test]
+fn the_higher_of_conv_and_read_lines_wins() {
+    // 3.6, 7.4: CONV's <read> covers the READ lines sent before it, and
+    // the client takes the higher of the two, whichever comes first.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 6);
+    let r = h.reconnect();
+    // A READ line before the SYNC reply, then a CONV line lower than it.
+    h.line("READ #general 4");
+    assert_eq!(h.conv("#general").read, 4);
+    h.reply(r, &["CONV #general k1 6 3"], "OK");
+    assert_eq!(h.conv("#general").read, 4);
+    // The server heard of less than this device knows: it hears again.
+    h.expect("READ #general 4");
+    // A READ line after the CONV line, lower then higher.
+    h.line("READ #general 2");
+    assert_eq!(h.conv("#general").read, 4);
+    h.line("READ #general 5");
+    assert_eq!(h.conv("#general").read, 5);
+    // And a CONV line higher than every READ line.
+    let r = h.reconnect();
+    h.reply(r, &["CONV #general k1 6 6"], "OK");
+    assert_eq!((h.conv("#general").read, h.conv("#general").unread), (6, 0));
+    h.idle();
+}
+
 // ---------------------------------------------------------------------------
 // 8.1-8.3: typing, names, members and presence
 
