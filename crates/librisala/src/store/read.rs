@@ -29,10 +29,16 @@ pub struct ConversationSummary {
     /// The read marker (7.4), 0 for none.
     pub read: u64,
     /// Messages after the read marker, not counting the account's own,
-    /// edits, reactions or deleted messages.
+    /// edits, reactions or deleted messages. Events above the sync point
+    /// that are not stored yet, as when only the newest page was fetched
+    /// (7.1 step 4), each count as one: they are not known, and most are
+    /// messages.
     pub unread: u64,
     /// The newest stored seq, if any.
     pub newest: Option<Seq>,
+    /// A room's settings (6.2), as far as stored events and snapshots
+    /// show, in key order. Empty for a direct conversation.
+    pub settings: Vec<RoomSetting>,
 }
 
 impl ConversationSummary {
@@ -64,6 +70,9 @@ pub struct TimelineItem {
     pub deleted: bool,
     /// Reactions to it (5.3), in byte order.
     pub reactions: Vec<Reaction>,
+    /// Whether the account sent it, from the connection it was stored on
+    /// (4.2).
+    pub own: bool,
 }
 
 /// The count of one reaction on a message.
@@ -95,7 +104,10 @@ const SUMMARY: &str = "
     SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
         (SELECT COUNT(*) FROM events e
          WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
-             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0),
+             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0)
+        + MAX(0, c.head - MAX(c.read, c.sync_point)
+            - (SELECT COUNT(*) FROM events e
+               WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point) AND e.seq <= c.head)),
         (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
     FROM convs c JOIN accounts a ON a.id = c.account";
 
@@ -124,6 +136,7 @@ fn finish_summary(raw: RawSummary) -> Result<ConversationSummary, StoreError> {
         read: read.max(0) as u64,
         unread: unread.max(0) as u64,
         newest: newest.map(seq).transpose()?,
+        settings: Vec::new(),
     })
 }
 
@@ -132,11 +145,40 @@ fn summaries(
     filter: &str,
     args: impl rusqlite::Params,
 ) -> Result<Vec<ConversationSummary>, StoreError> {
-    let mut stmt = conn.prepare_cached(&format!("{SUMMARY} WHERE {filter} ORDER BY c.id"))?;
+    summaries_ordered(conn, &format!("{filter} ORDER BY c.id"), args)
+}
+
+/// Summaries for `tail`: a filter, then ORDER BY and perhaps LIMIT.
+fn summaries_ordered(
+    conn: &Connection,
+    tail: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<ConversationSummary>, StoreError> {
+    let mut stmt = conn.prepare_cached(&format!("{SUMMARY} WHERE {tail}"))?;
     let rows = stmt.query_map(args, raw_summary)?;
     let mut out = Vec::new();
     for raw in rows {
         out.push(finish_summary(raw?)?);
+    }
+    for summary in &mut out {
+        summary.settings = settings(conn, summary.id)?;
+    }
+    Ok(out)
+}
+
+fn settings(conn: &Connection, conv: ConvId) -> Result<Vec<RoomSetting>, StoreError> {
+    let mut stmt =
+        conn.prepare_cached("SELECT key, value FROM room_settings WHERE conv = ?1 ORDER BY key")?;
+    let rows = stmt.query_map([conv.0], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (key, value) = row?;
+        out.push(
+            RoomSetting::parse(&key, &value)
+                .map_err(|_| StoreError::Corrupt(format!("bad setting {key}")))?,
+        );
     }
     Ok(out)
 }
@@ -165,17 +207,24 @@ fn reactions(conn: &Connection, conv: ConvId, target: i64) -> Result<Vec<Reactio
     Ok(out)
 }
 
-type RawItem = (i64, String, bool, Option<String>, Option<i64>);
+type RawItem = (i64, String, bool, Option<String>, Option<i64>, bool);
 
 const ITEM: &str = "
-    SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq
+    SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq, e.own
     FROM events e LEFT JOIN message_state m ON m.conv = e.conv AND m.seq = e.seq";
 
 /// Timeline items only: no DELETE, edit or reaction.
 const IS_ITEM: &str = "e.verb != 'DELETE' AND (e.rel IS NULL OR e.rel = 'reply')";
 
 fn raw_timeline(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
 }
 
 fn finish_timeline(
@@ -183,7 +232,7 @@ fn finish_timeline(
     conv: ConvId,
     raw: RawItem,
 ) -> Result<TimelineItem, StoreError> {
-    let (n, line, deleted, text, edit) = raw;
+    let (n, line, deleted, text, edit, own) = raw;
     let event = stored_event(&line)?;
     let meta = event
         .meta
@@ -201,6 +250,7 @@ fn finish_timeline(
         },
         edit: edit.map(seq).transpose()?,
         deleted,
+        own,
         reactions: if is_msg {
             reactions(conn, conv, n)?
         } else {
@@ -217,6 +267,48 @@ impl Store {
         account: AccountId,
     ) -> Result<Vec<ConversationSummary>, StoreError> {
         self.read(|conn| summaries(conn, "c.account = ?1", [account.0]))
+    }
+
+    /// The sync point of each of an account's conversations (7.1), by
+    /// name.
+    pub(crate) fn sync_points(
+        &self,
+        account: AccountId,
+    ) -> Result<std::collections::HashMap<Conv, u64>, StoreError> {
+        self.read(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT name, sync_point FROM convs WHERE account = ?1")?;
+            let rows = stmt.query_map([account.0], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (name, sp) = row?;
+                out.insert(parse(&name, "conversation")?, sp.max(0) as u64);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Up to `limit` conversations of an account in byte order of name,
+    /// after the name `after` if given.
+    pub fn conversations_page(
+        &self,
+        account: AccountId,
+        after: Option<&Conv>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>, StoreError> {
+        self.read(|conn| {
+            summaries_ordered(
+                conn,
+                "c.account = ?1 AND c.name > ?2 ORDER BY c.name LIMIT ?3",
+                params![
+                    account.0,
+                    after.map_or("", |c| c.as_str()),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+            )
+        })
     }
 
     /// A conversation by name.
@@ -311,23 +403,7 @@ impl Store {
 
     /// A room's settings (6.2), as far as stored events and snapshots show.
     pub fn room_settings(&self, conv: ConvId) -> Result<Vec<RoomSetting>, StoreError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT key, value FROM room_settings WHERE conv = ?1 ORDER BY key",
-            )?;
-            let rows = stmt.query_map([conv.0], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (key, value) = row?;
-                out.push(
-                    RoomSetting::parse(&key, &value)
-                        .map_err(|_| StoreError::Corrupt(format!("bad setting {key}")))?,
-                );
-            }
-            Ok(out)
-        })
+        self.read(|conn| settings(conn, conv))
     }
 
     /// A room's members, roles and bans, as far as stored events and

@@ -68,6 +68,18 @@ pub fn platform_ca_verifier() -> CaVerifier {
     }
 }
 
+/// [`platform_ca_verifier`], made on a blocking thread: loading the OS
+/// trust store reads files and may take a while, so it must stay off the
+/// async runtime's workers.
+pub(crate) async fn platform_ca_verifier_blocking() -> CaVerifier {
+    tokio::task::spawn_blocking(platform_ca_verifier)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "loading the CA check failed; using trust on first use only");
+            no_ca_verifier()
+        })
+}
+
 /// A CA check that finds no certificate CA-valid, so that every server
 /// goes through trust on first use (2.2, rule 2).
 pub fn no_ca_verifier() -> CaVerifier {

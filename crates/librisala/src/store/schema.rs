@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -199,6 +199,20 @@ ALTER TABLE events ADD COLUMN own INTEGER NOT NULL DEFAULT 0;
 UPDATE events SET own = 1 WHERE author = (
     SELECT a.uid FROM convs c JOIN accounts a ON a.id = c.account WHERE c.id = events.conv
 );
+";
+
+/// Version 4: outbox claims, so that two processes sharing the cache never
+/// send the same entry (7.6).
+///
+/// `outbox.claim` names the connection that sent an entry in `sending`:
+/// `<store instance>:<connection>`, where the store instance is random for
+/// each [`Store`](super::Store) opened. `claimed_at` is when, in Unix
+/// milliseconds. Another process leaves a claimed entry alone until its
+/// lease runs out; the same store instance knows its earlier connections
+/// are gone.
+const V4: &str = "
+ALTER TABLE outbox ADD COLUMN claim TEXT;
+ALTER TABLE outbox ADD COLUMN claimed_at INTEGER;
 ";
 
 /// Brings the schema up to [`VERSION`].

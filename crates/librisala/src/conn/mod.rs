@@ -28,7 +28,7 @@ mod supervisor;
 mod tls;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use error::{CloseReason, CommandError, Error, TrustError};
 pub use session::{End, Incoming, Response, Session, SessionInfo, SessionOptions};

@@ -275,7 +275,7 @@ impl Session {
     ) -> Result<Session, Error> {
         let ca = match &options.ca_verifier {
             Some(ca) => ca.clone(),
-            None => tls::platform_ca_verifier(),
+            None => tls::platform_ca_verifier_blocking().await,
         };
         let (stream, verified) = tls::connect(addr, &trust, ca, options.connect_to).await?;
         let (mut rd, wr) = tokio::io::split(stream);
@@ -456,21 +456,25 @@ impl Session {
 
     /// Signs in as the guest `~<name>` (4.2). With `token`, the server
     /// resumes that guest's session if the token is its current one, and
-    /// otherwise ignores it. Returns the uid and the session's new token,
-    /// which the next resume needs. The token is a secret.
+    /// otherwise ignores it. Returns the uid, the session's new token,
+    /// which the next resume needs, and whether the session was resumed
+    /// (`resumed=yes`): then its cids carry over, and unanswered messages
+    /// may be sent again (7.6). The token is a secret.
     pub async fn guest_session(
         &self,
         name: &Name,
         token: Option<&Id>,
-    ) -> Result<(Uid, Option<Id>), Error> {
+    ) -> Result<(Uid, Option<Id>, bool), Error> {
         let ok = self
             .request_ok(Command::Guest {
                 name: name.clone(),
                 token: token.cloned(),
             })
             .await?;
-        let token = ok.token().ok().flatten();
-        Ok((signed_in_uid(&ok, Uid::guest(name)), token))
+        let new_token = ok.token().ok().flatten();
+        // Only a resume can be resumed=yes; ignore it on a new session.
+        let resumed = token.is_some() && ok.resumed().ok().flatten().unwrap_or(false);
+        Ok((signed_in_uid(&ok, Uid::guest(name)), new_token, resumed))
     }
 
     /// Signs in as `identity` with a device key listed in its key file

@@ -100,8 +100,55 @@ fn trust_records() {
     );
     let other: ServerAddr = "chat.example.org:7000".parse().unwrap();
     assert_eq!(TrustStore::get(&store, &other).unwrap(), None);
+    // 2.1: the same server written another way finds the same record.
+    let shouted: ServerAddr = "Chat.Example.ORG.".parse().unwrap();
+    assert_eq!(
+        TrustStore::get(&store, &shouted).unwrap(),
+        Some(TrustRecord::Pinned(fp))
+    );
     store.forget(&a).unwrap();
     assert_eq!(TrustStore::get(&store, &a).unwrap(), None);
+}
+
+#[test]
+fn reads_do_not_wait_for_writes() {
+    // A write holds the write connection, for example while it waits for
+    // another process's lock. Reads use their own connection, and see
+    // what was committed before.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("cache.db")).unwrap();
+    let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            store
+                .write(|tx| {
+                    tx.conv_or_create(account, &room())?;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        })
+    };
+    entered.recv().unwrap();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            done_tx.send(store.conversations(account).unwrap()).unwrap();
+        });
+    }
+    // Generous: the read takes milliseconds, or never ends if it waits.
+    let seen = done
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the read waited for the write");
+    assert!(seen.is_empty(), "the write is not committed yet");
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(store.conversations(account).unwrap().len(), 1);
 }
 
 #[test]
@@ -359,7 +406,25 @@ fn a_new_id_discards_history() {
         .unwrap();
     assert!(!reset);
 
-    // A head below the newest stored seq (7.1).
+    // Events stored past the sync point do not count (7.1): another
+    // process may have stored them after the server computed the head.
+    store_all(
+        &store,
+        conv,
+        &[ev(3, "from=bob@example.net MSG #general later")],
+    );
+    let (reset, _) = store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            assert_eq!(row.sync_point, 1);
+            tx.learn_id(&mut row, &id("k1"), Some(1))
+        })
+        .unwrap();
+    assert!(!reset);
+    assert_eq!(store.export(conv).unwrap().len(), 2);
+
+    // A head below the sync point (7.1). The room is the same, so the
+    // outbox entries bound to it stay.
     let (reset, changes) = store
         .write(|tx| {
             let mut row = tx.conv(conv)?.unwrap();
@@ -369,6 +434,7 @@ fn a_new_id_discards_history() {
     assert!(reset);
     assert!(changes.contains(&Change::Cleared { conv }));
     assert!(store.export(conv).unwrap().is_empty());
+    assert_eq!(store.outbox(account).unwrap()[0].state, OutboxState::Queued);
 
     // A new id (7.1 step 2) also fails what was bound to the old one.
     store_all(
@@ -446,6 +512,49 @@ fn removing_a_room() {
         .write(|tx| tx.conv_or_create(account, &room()))
         .unwrap();
     assert_ne!(row.id, conv);
+}
+
+#[test]
+fn unread_counts_the_gap_that_is_not_stored() {
+    // 7.1 step 4: only the newest page of a long gap is stored. The rest
+    // counts as unread too, from the read marker or the sync point.
+    let (store, _account, conv) = setup();
+    let newest: Vec<Event> = (591..=600)
+        .map(|n| ev(n, "from=bob@example.net MSG #general hi"))
+        .collect();
+    store_all(&store, conv, &newest);
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.note_head(&mut row, 600)
+        })
+        .unwrap();
+    assert_eq!(store.unread(conv).unwrap(), 600);
+    let read = |n: u64| {
+        store
+            .write(|tx| {
+                let mut row = tx.conv(conv)?.unwrap();
+                tx.set_read(&mut row, n)
+            })
+            .unwrap();
+    };
+    read(500);
+    assert_eq!(store.unread(conv).unwrap(), 100);
+    read(595);
+    assert_eq!(store.unread(conv).unwrap(), 5);
+    // Below the sync point, events that are not stored have expired: they
+    // do not count.
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.raise_sync_point(&mut row, 590)
+        })
+        .unwrap();
+    assert_eq!(
+        store.conversation_by_id(conv).unwrap().unwrap().sync_point,
+        600
+    );
+    assert_eq!(store.unread(conv).unwrap(), 5);
 }
 
 #[test]
@@ -570,7 +679,7 @@ fn outbox_entries() {
 
     store
         .write(|tx| {
-            tx.outbox_sending(a, now)?;
+            tx.outbox_sending(a, &store.new_claim(), now)?;
             tx.outbox_bind(b, &id("k1"))?;
             tx.outbox_failed(
                 b,

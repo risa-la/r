@@ -4,6 +4,7 @@
 use risala_proto::error::ErrorCode;
 use risala_proto::server::{EventBody, ServerLine, ServerMessage};
 use risala_proto::text::unescape;
+use risala_proto::types::RoomSetting;
 
 use crate::addr::TrustRecord;
 use crate::conn::{self, TrustError};
@@ -47,11 +48,25 @@ pub enum ClientError {
         /// Why the certificate is not CA-valid.
         reason: String,
     },
+    /// [`Client::accept_fingerprint`](super::Client::accept_fingerprint)
+    /// was asked to trust a fingerprint, but the server already has a
+    /// different trust record (2.2). Nothing was changed. The user must
+    /// remove the record first, with
+    /// [`Client::forget_trust`](super::Client::forget_trust).
+    #[error("{server} is already trusted with {recorded}")]
+    AlreadyTrusted {
+        /// The server address.
+        server: String,
+        /// What is recorded: `CA` or a fingerprint.
+        recorded: String,
+    },
     /// Connecting or signing in failed. `permanent` is set when retrying
     /// cannot help without the user, as with `auth-failed`.
     #[error("{message}")]
     Connection {
-        /// What went wrong.
+        /// What went wrong, to show in the user's language.
+        kind: ConnectionErrorKind,
+        /// What went wrong, in English, for logs.
         message: String,
         /// Whether retrying cannot help.
         permanent: bool,
@@ -78,8 +93,84 @@ pub enum ClientError {
     #[error("cache: {0}")]
     Store(String),
     /// The key store failed, or holds no key for the identity.
-    #[error("keys: {0}")]
-    Keys(String),
+    #[error("keys: {message}")]
+    Keys {
+        /// What went wrong, to show in the user's language.
+        kind: KeyErrorKind,
+        /// What went wrong, in English, for logs.
+        message: String,
+    },
+}
+
+/// Why connecting or signing in failed ([`ClientError::Connection`]), so
+/// that apps can say it in the user's language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectionErrorKind {
+    /// The network failed: no route, refused, reset, or name resolution.
+    Network,
+    /// Connecting took too long.
+    Timeout,
+    /// TLS failed, for a reason other than the ones below.
+    Tls,
+    /// The server does not offer the post-quantum key exchange
+    /// X25519MLKEM768, which risala requires (2.1).
+    KeyExchange,
+    /// The server's certificate could not be read (2.2).
+    BadCertificate,
+    /// The trust records could not be read or written (2.2).
+    TrustStore,
+    /// The server speaks another version of the protocol (3.8).
+    UnsupportedVersion,
+    /// The server broke the protocol: a bad greeting, or an answer that
+    /// could not be read.
+    Protocol,
+    /// The connection closed.
+    Closed,
+    /// An identity cannot sign in to a server given as an IP address,
+    /// which sends no hostname (2.1).
+    NoHostname,
+    /// The sign-in nonce was used up; connecting again helps (4.5).
+    NonceUsed,
+    /// The server does not offer registration (4.6).
+    NoRegistration,
+    /// The client could not start its runtime.
+    Runtime,
+}
+
+/// Why the key store failed ([`ClientError::Keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyErrorKind {
+    /// No key store was given in the client's options.
+    NoKeyStore,
+    /// The key store holds no key for the identity.
+    NoKey,
+    /// The key store failed.
+    Failed,
+}
+
+impl ConnectionErrorKind {
+    pub(crate) fn of(e: &conn::Error) -> ConnectionErrorKind {
+        use conn::Error as E;
+        match e {
+            E::Io(_) => ConnectionErrorKind::Network,
+            E::Tls(_) => ConnectionErrorKind::Tls,
+            E::KeyExchange(_) => ConnectionErrorKind::KeyExchange,
+            E::Trust(_) => ConnectionErrorKind::BadCertificate,
+            E::TrustStore(_) => ConnectionErrorKind::TrustStore,
+            E::Timeout => ConnectionErrorKind::Timeout,
+            E::UnsupportedVersion(_) => ConnectionErrorKind::UnsupportedVersion,
+            E::BadGreeting(_)
+            | E::InvalidCommand(_)
+            | E::NoResponse
+            | E::Rejected(conn::CommandError::Unparseable(_)) => ConnectionErrorKind::Protocol,
+            // A server's ERR becomes ClientError::Server instead.
+            E::Rejected(conn::CommandError::Server(_)) => ConnectionErrorKind::Protocol,
+            E::Closed(_) => ConnectionErrorKind::Closed,
+            E::NonceUsed => ConnectionErrorKind::NonceUsed,
+            E::NoSni => ConnectionErrorKind::NoHostname,
+            E::NoRegistration => ConnectionErrorKind::NoRegistration,
+        }
+    }
 }
 
 impl ClientError {
@@ -96,6 +187,29 @@ impl ClientError {
         match self {
             ClientError::Server { code, .. } => Some(code),
             _ => None,
+        }
+    }
+
+    /// Whether connecting failed in a way that retrying cannot fix without
+    /// the user: a trust failure (2.2), a missing key, a permanent
+    /// connection error such as a server without post-quantum key exchange
+    /// (2.1), or a refused sign-in such as `auth-failed` (4.5). Meant for
+    /// errors from connecting and signing in.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            ClientError::UnknownCertificate { .. }
+            | ClientError::CertificateMismatch { .. }
+            | ClientError::Keys { .. }
+            | ClientError::Invalid(_) => true,
+            ClientError::Connection { permanent, .. } => *permanent,
+            ClientError::Server { code, .. } => matches!(
+                code.as_str(),
+                "auth-failed" | "forbidden" | "not-supported" | "bad-syntax" | "unknown-command"
+            ),
+            ClientError::AlreadyTrusted { .. }
+            | ClientError::NotConnected
+            | ClientError::NotJoined(_)
+            | ClientError::Store(_) => false,
         }
     }
 
@@ -129,6 +243,7 @@ impl ClientError {
             },
             conn::Error::Rejected(conn::CommandError::Server(err)) => ClientError::server(err),
             other => ClientError::Connection {
+                kind: ConnectionErrorKind::of(other),
                 message: other.to_string(),
                 permanent: other.is_permanent(),
             },
@@ -136,7 +251,7 @@ impl ClientError {
     }
 }
 
-fn show_record(record: &TrustRecord) -> String {
+pub(crate) fn show_record(record: &TrustRecord) -> String {
     match record {
         TrustRecord::Ca => "CA".to_owned(),
         TrustRecord::Pinned(fp) => fp.to_string(),
@@ -217,7 +332,10 @@ pub enum ConnectionState {
     },
     /// The connection closed; reconnecting.
     Disconnected {
-        /// Why it closed.
+        /// Why it closed, to show in the user's language.
+        kind: DisconnectKind,
+        /// Why it closed, in English, for logs. For
+        /// [`DisconnectKind::Server`], the server's BYE text if any.
         reason: String,
     },
     /// Waiting before the next attempt.
@@ -233,6 +351,37 @@ pub enum ConnectionState {
         /// Why.
         error: ClientError,
     },
+}
+
+/// Why a connection closed ([`ConnectionState::Disconnected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisconnectKind {
+    /// The server closed it, perhaps with BYE (11).
+    Server,
+    /// The server stopped answering PING (11).
+    PingTimeout,
+    /// The network failed.
+    Network,
+    /// The server broke the protocol.
+    Protocol,
+    /// This client fell behind reading the server's lines.
+    Overflow,
+    /// This client closed it, for example to reconnect.
+    Local,
+}
+
+impl DisconnectKind {
+    pub(crate) fn of(reason: &conn::CloseReason) -> DisconnectKind {
+        use conn::CloseReason as R;
+        match reason {
+            R::Server { .. } => DisconnectKind::Server,
+            R::PingTimeout => DisconnectKind::PingTimeout,
+            R::Io(_) => DisconnectKind::Network,
+            R::Protocol(_) => DisconnectKind::Protocol,
+            R::Overflow => DisconnectKind::Overflow,
+            R::Local => DisconnectKind::Local,
+        }
+    }
 }
 
 impl ConnectionState {
@@ -257,12 +406,28 @@ pub struct ConversationInfo {
     pub head: u64,
     /// The read marker (7.4); 0 for none.
     pub read: u64,
-    /// Messages from others after the read marker.
+    /// Messages from others after the read marker, counting events not
+    /// stored yet above the sync point.
     pub unread: u64,
     /// The newest stored seq; 0 for none.
     pub newest: u64,
     /// Whether every event up to the head is stored.
     pub caught_up: bool,
+    /// A room's topic (6.2), unescaped; empty if none or not known.
+    pub topic: String,
+    /// A room's settings (6.2) as far as the cache knows, in key order,
+    /// the topic included. Empty for a direct conversation.
+    pub settings: Vec<Setting>,
+}
+
+/// One room setting (6.2), such as `public` = `yes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    /// The key: `topic`, `public`, `guests`, `retention` or another.
+    pub key: String,
+    /// The value, unescaped: text for `topic`, otherwise a keyword or a
+    /// number, as on the wire (`yes`, `read`, `30`, `server` and so on).
+    pub value: String,
 }
 
 impl From<ConversationSummary> for ConversationInfo {
@@ -277,8 +442,63 @@ impl From<ConversationSummary> for ConversationInfo {
             read: c.read,
             unread: c.unread,
             newest: c.newest.map_or(0, |s| s.get()),
+            topic: c
+                .settings
+                .iter()
+                .find_map(|s| match s {
+                    RoomSetting::Topic(t) => Some(unescape(t).into_owned()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            settings: c
+                .settings
+                .iter()
+                .map(|s| Setting {
+                    key: s.key().to_owned(),
+                    value: unescape(&s.value()).into_owned(),
+                })
+                .collect(),
         }
     }
+}
+
+/// The most items one page of [`Conversation::messages`](super::Conversation::messages),
+/// [`Account::conversations`](super::Account::conversations), a
+/// [`Timeline`](super::Timeline)'s first window or
+/// [`Timeline::paginate_back`](super::Timeline::paginate_back) returns.
+/// Larger requests get this many.
+pub const MAX_PAGE: u32 = 200;
+
+/// The page size used when a request asks for 0 items.
+pub const DEFAULT_PAGE: u32 = 50;
+
+/// A page size within the library's bounds.
+pub(crate) fn page_size(limit: u32) -> u32 {
+    match limit {
+        0 => DEFAULT_PAGE,
+        n => n.min(MAX_PAGE),
+    }
+}
+
+/// One page of a conversation's messages from the cache, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePage {
+    /// The messages, oldest first.
+    pub messages: Vec<Message>,
+    /// The cursor for the page of older messages, if the cache has any.
+    /// It is opaque: pass it back as it is.
+    pub older: Option<String>,
+}
+
+/// One page of an account's conversations from the cache, in byte order
+/// of name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPage {
+    /// The conversations.
+    pub conversations: Vec<ConversationInfo>,
+    /// The cursor for the next page, if there are more. It is opaque: pass
+    /// it back as it is.
+    pub next: Option<String>,
 }
 
 /// What kind of event a timeline item is (5.2).
@@ -329,6 +549,10 @@ pub struct Message {
     pub time: String,
     /// Who caused it.
     pub from: String,
+    /// Whether the account sent it. A guest may have sent it under a
+    /// numbered name, such as `~sam2` for the account `~sam` (4.2), so
+    /// use this rather than comparing `from` with the account's uid.
+    pub own: bool,
     /// What kind of event it is.
     pub kind: EventKind,
     /// The text, unescaped: a message's current text after edits (empty
@@ -345,8 +569,38 @@ pub struct Message {
     pub deleted: bool,
     /// Reactions to it, in byte order.
     pub reactions: Vec<ReactionCount>,
-    /// The event as received, in canonical form.
+    /// The event as received, in canonical form. Empty for a message in
+    /// the outbox.
     pub line: String,
+    /// For a message still in the outbox (7.6), its entry: queued, sending
+    /// or failed. Then `seq` is 0, the time is when it was queued, and
+    /// `line` is empty. `None` for a stored event.
+    pub outbox: Option<OutboxEntry>,
+}
+
+impl Message {
+    /// A message in the outbox, shown as a timeline item from `uid`.
+    pub(crate) fn outgoing(entry: OutboxEntry, uid: &str) -> Message {
+        let time = risala_proto::time::Timestamp::from_unix_millis(entry.created_ms)
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        Message {
+            seq: 0,
+            time_ms: entry.created_ms,
+            time,
+            from: uid.to_owned(),
+            own: true,
+            kind: EventKind::Message,
+            text: Some(entry.text.clone()),
+            subject: None,
+            reply_to: entry.reply_to,
+            edited: false,
+            deleted: false,
+            reactions: Vec::new(),
+            line: String::new(),
+            outbox: Some(entry),
+        }
+    }
 }
 
 impl From<TimelineItem> for Message {
@@ -389,6 +643,7 @@ impl From<TimelineItem> for Message {
             time_ms: item.t.unix_millis(),
             time: item.t.to_string(),
             from: item.from.to_string(),
+            own: item.own,
             kind,
             text,
             subject,
@@ -405,6 +660,7 @@ impl From<TimelineItem> for Message {
                 })
                 .collect(),
             line,
+            outbox: None,
         }
     }
 }
@@ -428,7 +684,9 @@ pub enum OutboxStatus {
     },
     /// It will not be sent.
     Failed {
-        /// Why, for people.
+        /// Why, to show in the user's language.
+        kind: FailKind,
+        /// Why, in English, for logs.
         reason: String,
         /// The connection dropped before the answer and resending was not
         /// safe (7.6): it may or may not have been sent. Show it as
@@ -437,6 +695,24 @@ pub enum OutboxStatus {
         /// The server's error code, if it refused the message.
         code: Option<String>,
     },
+}
+
+/// Why a message in the outbox was not sent ([`OutboxStatus::Failed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailKind {
+    /// The room was dropped and created again, so it is another room now
+    /// (7.1, 7.6). Sending it there would put it in the wrong room.
+    RoomChanged,
+    /// The room was dropped (10.4).
+    Dropped,
+    /// The server refused it; the error code is in `code` (3.7).
+    Rejected,
+    /// The connection dropped before the answer, and sending it again was
+    /// not safe (7.6). It may or may not have been sent.
+    Unconfirmed,
+    /// It could not be written as a line, for example because it is too
+    /// long. It was not sent.
+    Invalid,
 }
 
 impl OutboxStatus {
@@ -462,6 +738,8 @@ pub struct OutboxEntry {
     pub status: OutboxStatus,
     /// When it was queued, in milliseconds since the Unix epoch.
     pub created_ms: u64,
+    /// The message it replies to, if it is a reply (5.3).
+    pub reply_to: Option<u64>,
 }
 
 impl From<OutboxItem> for OutboxEntry {
@@ -471,10 +749,18 @@ impl From<OutboxItem> for OutboxEntry {
             OutboxState::Sending => OutboxStatus::Sending,
             OutboxState::Sent(seq) => OutboxStatus::Sent { seq: seq.get() },
             OutboxState::Failed(why) => OutboxStatus::Failed {
+                kind: match &why {
+                    FailReason::RoomChanged => FailKind::RoomChanged,
+                    FailReason::Dropped => FailKind::Dropped,
+                    FailReason::Unconfirmed => FailKind::Unconfirmed,
+                    FailReason::Rejected(_) => FailKind::Rejected,
+                    FailReason::Invalid => FailKind::Invalid,
+                },
                 reason: match &why {
                     FailReason::RoomChanged => "the room was replaced by a new one".to_owned(),
                     FailReason::Dropped => "the room was dropped".to_owned(),
                     FailReason::Unconfirmed => "possibly not sent".to_owned(),
+                    FailReason::Invalid => "it could not be sent as it is".to_owned(),
                     FailReason::Rejected(code) => format!("refused: {code}"),
                 },
                 maybe_sent: why == FailReason::Unconfirmed,
@@ -490,6 +776,10 @@ impl From<OutboxItem> for OutboxEntry {
             text: unescape(&item.draft.text).into_owned(),
             status,
             created_ms: item.created.unix_millis(),
+            reply_to: match item.draft.relation {
+                Some(risala_proto::types::Relation::Reply(s)) => Some(s.get()),
+                _ => None,
+            },
         }
     }
 }
@@ -644,6 +934,11 @@ pub enum AccountEvent {
     /// Events were missed because they were not read in time. Read again
     /// whatever is shown.
     Lagged,
+    /// Another process sharing the cache, such as a notification
+    /// extension, wrote to it (see [`Client::check_for_external_changes`](super::Client::check_for_external_changes)).
+    /// Read again whatever is shown: the conversation list and the outbox.
+    /// [`Timeline`](super::Timeline)s reset themselves.
+    CacheChanged,
 }
 
 /// Whether an error code means the room cannot be joined again as it is.

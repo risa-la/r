@@ -35,7 +35,10 @@
 //!   the conversation whose id is stored. Ids from SYNC, JOIN (event and
 //!   OK), INFO, HISTORY and RELATED are compared with the stored one, and
 //!   a different id discards the history first (7.1, 7.2, 6.1). So does a
-//!   head below the newest stored seq (7.1). Live events are stored only
+//!   head below the sync point the conversation had when the command was
+//!   sent (7.1), which keeps the outbox: the room is the same. Events
+//!   stored past that point, by this connection or by another process
+//!   sharing the cache, do not count. Live events are stored only
 //!   once the conversation's id is known on this connection (7.1 step 6).
 //! - **Truthful sync points.** The sync point is the seq up to which every
 //!   event the server still keeps is stored. It moves over HISTORY pages
@@ -45,10 +48,14 @@
 //! - **Caught up means complete.** When a conversation has caught up, the
 //!   store holds every event the server keeps, with deletions applied.
 //! - **At most once.** Each outbox message has its own cid and is bound to
-//!   the conversation's id. It is resent after a reconnect only while that
-//!   id still matches, only by an identity (a guest's cids count only
-//!   within one session, which may have ended unseen) and only within 23
-//!   hours (7.6).
+//!   the conversation's id. Entries are picked and marked as sent in one
+//!   write transaction, with a claim naming the connection, so two
+//!   processes sharing the cache never send the same one, and neither
+//!   settles one the other still waits on. It is resent after a
+//!   reconnect only while that id still matches, only within 23 hours,
+//!   and only by an identity or by a guest whose session was resumed
+//!   ([`SyncEngine::set_resumed`]): a guest's cids count only within one
+//!   session (7.6).
 
 mod engine;
 
@@ -77,6 +84,13 @@ pub struct SyncConfig {
     /// How long after first sending it an unanswered message may be sent
     /// again. The server remembers cids for 24 hours (7.6).
     pub resend_window: Duration,
+    /// How long a message another process sharing the cache sent stays
+    /// its own to settle (7.6). Until then this engine neither sends it
+    /// again nor marks it failed, since that process may still get its
+    /// `OK`. After it, the other connection is taken to be gone. Pick it
+    /// well above how long a connection may go without an answer before
+    /// its keepalive closes it (11).
+    pub claim_lease: Duration,
     /// Where the time comes from.
     pub clock: Clock,
 }
@@ -87,6 +101,7 @@ impl Default for SyncConfig {
             page_size: risala_proto::types::DEFAULT_LIMIT,
             lazy_gap: Some(500),
             resend_window: Duration::from_secs(23 * 3600),
+            claim_lease: Duration::from_secs(300),
             clock: Clock::system(),
         }
     }
@@ -98,6 +113,7 @@ impl fmt::Debug for SyncConfig {
             .field("page_size", &self.page_size)
             .field("lazy_gap", &self.lazy_gap)
             .field("resend_window", &self.resend_window)
+            .field("claim_lease", &self.claim_lease)
             .finish_non_exhaustive()
     }
 }
@@ -177,6 +193,9 @@ pub enum Outcome {
     /// The final line could not be parsed, which counts as a general
     /// failure (2.3).
     Failed,
+    /// The command could not be written to the connection, for example
+    /// because the line would be too long, so the server never saw it.
+    NotSent,
 }
 
 /// The result of a command the UI asked for (JOIN, PART, INFO, READ).

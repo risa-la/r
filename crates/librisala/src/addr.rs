@@ -11,9 +11,11 @@ use risala_proto::fingerprint::Fingerprint;
 /// A server address: a hostname with an optional port (2.1), for example
 /// `chat.example.org` or `chat.example.org:7000`.
 ///
-/// The host is kept in lower case. It is what the client sends in SNI and
-/// signs in AUTH (4.5). An IP address is allowed, but cannot sign in as an
-/// identity (2.1).
+/// The host is normalized as 2.1 says: lower-cased, with one trailing `.`
+/// dropped, so `Chat.Example.org.` and `chat.example.org` are the same
+/// server. The normalized host is what the client sends in SNI, the key of
+/// the trust record (2.2) and what it signs in AUTH (4.5). An IP address
+/// is allowed, but cannot sign in as an identity (2.1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerAddr {
     host: String,
@@ -26,16 +28,32 @@ pub struct ServerAddr {
 pub struct BadAddr(String);
 
 impl ServerAddr {
-    /// Makes an address from a host and a port. The host is folded to lower
-    /// case.
+    /// Makes an address from a host and a port (2.1). The host is folded to
+    /// lower case and loses one trailing `.`. A name with an empty label,
+    /// such as `a..b` or `.`, is refused, and so is a host with `:` that is
+    /// not an IPv6 address.
     pub fn new(host: &str, port: u16) -> Result<ServerAddr, BadAddr> {
+        let bad = || BadAddr(host.to_owned());
         let h = host.trim_start_matches('[').trim_end_matches(']');
+        if port == 0 {
+            return Err(bad());
+        }
+        if h.contains(':') {
+            let ip: std::net::Ipv6Addr = h.parse().map_err(|_| bad())?;
+            return Ok(ServerAddr {
+                host: ip.to_string(),
+                port,
+            });
+        }
+        let h = h.strip_suffix('.').unwrap_or(h);
         let ok = !h.is_empty()
             && h.len() <= 253
+            && h.split('.')
+                .all(|label| !label.is_empty() && label.len() <= 63)
             && h.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
-        if !ok || port == 0 {
-            return Err(BadAddr(host.to_owned()));
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+        if !ok {
+            return Err(bad());
         }
         Ok(ServerAddr {
             host: h.to_ascii_lowercase(),
@@ -180,6 +198,20 @@ mod tests {
             ("127.0.0.1:7472", "127.0.0.1", 7472, "127.0.0.1"),
             ("[::1]:9000", "::1", 9000, "[::1]:9000"),
             ("::1", "::1", 7472, "[::1]"),
+            ("[0:0::1]", "::1", 7472, "[::1]"),
+            // 2.1: lower case, and one trailing dot dropped.
+            (
+                "Chat.Example.org.",
+                "chat.example.org",
+                7472,
+                "chat.example.org",
+            ),
+            (
+                "Chat.Example.org.:7000",
+                "chat.example.org",
+                7000,
+                "chat.example.org:7000",
+            ),
         ] {
             let a: ServerAddr = input.parse().unwrap();
             assert_eq!((a.host(), a.port()), (host, port), "{input}");
@@ -187,11 +219,18 @@ mod tests {
             assert_eq!(a.to_string().parse::<ServerAddr>().unwrap(), a);
         }
         assert!("127.0.0.1".parse::<ServerAddr>().unwrap().is_ip());
+        assert_eq!(
+            "Chat.Example.org.".parse::<ServerAddr>().unwrap(),
+            "chat.example.org".parse::<ServerAddr>().unwrap()
+        );
     }
 
     #[test]
     fn bad() {
-        for s in ["", ":7472", "a b", "host:0", "host:x", "[::1", "a/b"] {
+        for s in [
+            "", ":7472", "a b", "host:0", "host:x", "[::1", "a/b", ".", "a..b", ".a", "a..",
+            "[a:b]", "x:y:z",
+        ] {
             assert!(s.parse::<ServerAddr>().is_err(), "{s}");
         }
     }

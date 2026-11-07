@@ -16,9 +16,13 @@
 //! busy timeout and short `BEGIN IMMEDIATE` transactions, and the sync
 //! engine keeps no copy of persistent state in memory between calls.
 //!
-//! A [`Store`] is cheap to clone; clones share one SQLite connection. Its
-//! calls block, so async code should make them off the runtime's worker
-//! threads.
+//! A [`Store`] is cheap to clone; clones share its SQLite connections. A
+//! store on a file has two: one for writes, and one for reads. In WAL
+//! mode a reader never waits for a writer, so reads from the cache return
+//! at once even while a write waits for another process's lock. Each read
+//! sees one consistent snapshot of what was committed. A store in memory
+//! has one connection for both. Calls block, so async code should make
+//! them off the runtime's worker threads.
 
 mod events;
 mod outbox;
@@ -37,6 +41,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::addr::ServerAddr;
 use risala_proto::names::Uid;
 
+pub(crate) use outbox::Claim;
 pub use outbox::{Draft, FailReason, OutboxItem, OutboxState};
 pub use read::{ConversationSummary, Member, Reaction, TimelineItem};
 
@@ -153,6 +158,13 @@ pub enum Change {
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    /// The connection for reads, on a file. In memory, reads use `conn`.
+    reader: Option<Arc<Mutex<Connection>>>,
+    /// Random for each store opened, to tell its outbox claims from other
+    /// processes' (7.6).
+    instance: Arc<str>,
+    /// Counts the claims handed out, one per connection.
+    connections: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl fmt::Debug for Store {
@@ -165,7 +177,14 @@ impl Store {
     /// Opens the cache at `path`, creating it if needed, and brings its
     /// schema up to date.
     pub fn open(path: impl AsRef<Path>) -> Result<Store, StoreError> {
-        Store::setup(Connection::open(path)?)
+        let path = path.as_ref();
+        let mut store = Store::setup(Connection::open(path)?)?;
+        // After the writer, which has set WAL mode and the schema.
+        let reader = Connection::open(path)?;
+        reader.busy_timeout(BUSY_TIMEOUT)?;
+        reader.pragma_update(None, "query_only", "ON")?;
+        store.reader = Some(Arc::new(Mutex::new(reader)));
+        Ok(store)
     }
 
     /// A cache in memory, for tests and short-lived tools.
@@ -183,7 +202,30 @@ impl Store {
         schema::migrate(&mut conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
+            reader: None,
+            instance: outbox::new_cid()?.as_str().into(),
+            connections: Arc::default(),
         })
+    }
+
+    /// A claim for a new connection's outbox entries (7.6).
+    ///
+    /// A claim from this store instance but an earlier connection counts as
+    /// abandoned at once, so run at most one connection per account on one
+    /// store instance at a time, as [`Client`](crate::client::Client) does.
+    /// Another process opens its own instance.
+    pub(crate) fn new_claim(&self) -> Claim {
+        Claim {
+            instance: self.instance.to_string(),
+            connection: self
+                .connections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Whether `claim` was handed out by this store instance.
+    pub(crate) fn is_own_instance(&self, claim: &Claim) -> bool {
+        *claim.instance == *self.instance
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -192,12 +234,21 @@ impl Store {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Runs `f` on the connection, for reads.
+    /// Runs `f` for reads: on the read connection, in one read
+    /// transaction, so that it sees one snapshot and never waits for a
+    /// write.
     pub(crate) fn read<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        f(&self.lock())
+        let Some(reader) = &self.reader else {
+            return f(&self.lock());
+        };
+        let mut conn = reader.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     /// Runs `f` in one write transaction (`BEGIN IMMEDIATE`), and returns
@@ -213,6 +264,23 @@ impl Store {
         let out = f(&mut w)?;
         let changes = w.finish()?;
         Ok((out, changes))
+    }
+
+    /// A number that changes when another process commits a write to the
+    /// cache (SQLite's `PRAGMA data_version`). Writes through this store
+    /// and its clones do not change it. Compare it with an earlier value to
+    /// learn cheaply whether to read again what is shown.
+    ///
+    /// `None` while this store is writing; ask again later. It never
+    /// waits.
+    pub fn data_version(&self) -> Result<Option<u64>, StoreError> {
+        let conn = match self.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        let v: i64 = conn.pragma_query_value(None, "data_version", |r| r.get(0))?;
+        Ok(Some(v as u64))
     }
 
     /// The account for `uid` on `server`, created if it does not exist.

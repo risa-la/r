@@ -286,9 +286,11 @@ impl TestServer {
         client.send(&command).await.expect("sending");
         let ok = client.expect_line().await.expect("an answer to GUEST");
         let prefix = format!("OK uid=~{name} token=");
-        let new_token = ok
+        let rest = ok
             .strip_prefix(&prefix)
             .unwrap_or_else(|| panic!("answer to GUEST {name}: {ok}"));
+        // A resumed session's OK carries resumed=yes too (4.2).
+        let new_token = rest.strip_suffix(" resumed=yes").unwrap_or(rest);
         assert!(!new_token.contains(' '), "answer to GUEST {name}: {ok}");
         (client, new_token.to_owned())
     }
@@ -442,6 +444,8 @@ struct ProxyShared {
     budget: std::sync::Mutex<Option<u64>>,
     /// Links accepted so far.
     accepted: std::sync::atomic::AtomicU64,
+    /// While true, bytes from the server are held back.
+    held: tokio::sync::watch::Sender<bool>,
 }
 
 impl Proxy {
@@ -457,6 +461,7 @@ impl Proxy {
             generation: tokio::sync::watch::channel(0).0,
             budget: std::sync::Mutex::new(None),
             accepted: std::sync::atomic::AtomicU64::new(0),
+            held: tokio::sync::watch::channel(false).0,
         });
         let task = tokio::spawn(proxy_accept(listener, shared.clone()));
         Proxy { addr, shared, task }
@@ -477,6 +482,15 @@ impl Proxy {
     /// lets them run.
     pub fn cut_after(&self, bytes: Option<u64>) {
         *self.shared.budget.lock().expect("poisoned") = bytes;
+    }
+
+    /// Holds back what the server sends on every connection, open or new,
+    /// without closing them, or lets it through again. Bytes from the
+    /// client still reach the server. A [`cut`](Self::cut) while holding
+    /// drops what was held, so a test can let a command reach the server
+    /// and then cut the connection before its answer arrives.
+    pub fn hold(&self, on: bool) {
+        self.shared.held.send_replace(on);
     }
 
     /// How many connections the proxy has accepted.
@@ -501,23 +515,25 @@ async fn proxy_accept(listener: tokio::net::TcpListener, shared: std::sync::Arc<
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let budget = *shared.budget.lock().expect("poisoned");
         let cut = shared.generation.subscribe();
+        let held = shared.held.subscribe();
         let target = shared.target;
         tokio::spawn(async move {
             if let Ok(server) = tokio::net::TcpStream::connect(target).await {
-                proxy_link(client, server, budget, cut).await;
+                proxy_link(client, server, budget, cut, held).await;
             }
         });
     }
 }
 
 /// Copies bytes both ways until either side closes, the budget of bytes
-/// from the server runs out, or the proxy cuts. Dropping the sockets
-/// closes them.
+/// from the server runs out, or the proxy cuts. Bytes from the server wait
+/// while `held` is true. Dropping the sockets closes them.
 async fn proxy_link(
     client: tokio::net::TcpStream,
     server: tokio::net::TcpStream,
     mut budget: Option<u64>,
     mut cut: tokio::sync::watch::Receiver<u64>,
+    mut held: tokio::sync::watch::Receiver<bool>,
 ) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let (mut client_rd, mut client_wr) = client.into_split();
@@ -550,6 +566,9 @@ async fn proxy_link(
                 }
                 None => n,
             };
+            if held.wait_for(|h| !*h).await.is_err() {
+                return;
+            }
             if client_wr.write_all(&buf[..n]).await.is_err() {
                 return;
             }

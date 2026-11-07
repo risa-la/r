@@ -1324,6 +1324,13 @@ impl OkResponse {
         self.typed("token", str::parse)
     }
 
+    /// `resumed=`: whether GUEST resumed an earlier session, rather than
+    /// starting a new one (4.2, 7.6). `None` when absent, which means a
+    /// new session.
+    pub fn resumed(&self) -> Result<Option<bool>, ParseError> {
+        self.typed("resumed", parse_yes_no)
+    }
+
     /// `op=`: whether the identity is a server operator, from AUTH (4.5,
     /// 10.1).
     pub fn op(&self) -> Result<Option<bool>, ParseError> {
@@ -1452,6 +1459,16 @@ impl OkResponse {
     /// Adds `token=` (4.2).
     pub fn with_token(self, token: &Id) -> OkResponse {
         self.with("token", token)
+    }
+
+    /// Adds `resumed=yes` (4.2). Only a resumed session carries it, so
+    /// `false` adds nothing.
+    pub fn with_resumed(self, resumed: bool) -> OkResponse {
+        if resumed {
+            self.with("resumed", "yes")
+        } else {
+            self
+        }
     }
 
     /// Adds `op=yes` or `op=no` (4.5).
@@ -2792,7 +2809,15 @@ mod tests {
             ServerMessage::new(ok.clone()).to_line().to_string(),
             "OK uid=~sam token=k3f9q2_x-7"
         );
-        assert_eq!(ok.token(), Ok(Some(token)));
+        assert_eq!(ok.token(), Ok(Some(token.clone())));
+        assert_eq!(ok.resumed(), Ok(None));
+        assert_eq!(ok.clone().with_resumed(false), ok);
+        let ok = ok.with_resumed(true);
+        assert_eq!(
+            ServerMessage::new(ok.clone()).to_line().to_string(),
+            "OK uid=~sam token=k3f9q2_x-7 resumed=yes"
+        );
+        assert_eq!(ok.resumed(), Ok(Some(true)));
         let get: FileUrl = "https://f.example/f/x".parse().unwrap();
         let ok = OkResponse::new()
             .with_upload_urls("https://f.example/u/y", &get)

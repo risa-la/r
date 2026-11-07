@@ -65,6 +65,9 @@ pub enum FailReason {
     /// and an identity's only for 24 hours (7.6). It may or may not have
     /// been sent.
     Unconfirmed,
+    /// It could not be written as a line, for example because it is too
+    /// long, so it was never sent.
+    Invalid,
 }
 
 impl fmt::Display for FailReason {
@@ -73,6 +76,7 @@ impl fmt::Display for FailReason {
             FailReason::RoomChanged => f.write_str("room-changed"),
             FailReason::Dropped => f.write_str("dropped"),
             FailReason::Unconfirmed => f.write_str("unconfirmed"),
+            FailReason::Invalid => f.write_str("invalid"),
             FailReason::Rejected(code) => write!(f, "rejected {code}"),
         }
     }
@@ -84,10 +88,35 @@ impl FailReason {
             "room-changed" => FailReason::RoomChanged,
             "dropped" => FailReason::Dropped,
             "unconfirmed" => FailReason::Unconfirmed,
+            "invalid" => FailReason::Invalid,
             _ => match s.strip_prefix("rejected ") {
                 Some(code) => FailReason::Rejected(parse(code, "error code")?),
                 None => return Err(StoreError::Corrupt(format!("bad outbox error {s:?}"))),
             },
+        })
+    }
+}
+
+/// Who sent an outbox entry that is `sending`: one connection of one
+/// process sharing the cache (7.6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Claim {
+    /// The [`Store`] instance, random for each one opened.
+    pub instance: String,
+    /// The connection, counted within the instance.
+    pub connection: u64,
+}
+
+impl Claim {
+    fn to_sql(&self) -> String {
+        format!("{}:{}", self.instance, self.connection)
+    }
+
+    fn parse(s: &str) -> Option<Claim> {
+        let (instance, connection) = s.rsplit_once(':')?;
+        Some(Claim {
+            instance: instance.to_owned(),
+            connection: connection.parse().ok()?,
         })
     }
 }
@@ -115,11 +144,13 @@ pub struct OutboxItem {
     pub created: Timestamp,
     /// When it was first sent, if it was.
     pub first_sent: Option<Timestamp>,
+    /// Who sent it and when, while it is `sending`.
+    pub(crate) claim: Option<(Claim, Timestamp)>,
 }
 
 const OUTBOX_COLS: &str =
     "id, account, conv, conv_id, cid, text, rel, target, file_url, state, seq, error, created,
-     first_sent";
+     first_sent, claim, claimed_at";
 
 type RawItem = (
     (i64, i64, String, Option<String>, String, String),
@@ -130,7 +161,13 @@ type RawItem = (
         String,
         Option<i64>,
     ),
-    (Option<String>, i64, Option<i64>),
+    (
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+    ),
 );
 
 fn raw_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
@@ -144,7 +181,7 @@ fn raw_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
             r.get(5)?,
         ),
         (r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
-        (r.get(11)?, r.get(12)?, r.get(13)?),
+        (r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?),
     ))
 }
 
@@ -157,7 +194,7 @@ fn finish_item(raw: RawItem) -> Result<OutboxItem, StoreError> {
     let (
         (id, account, conv, conv_id, cid, text),
         (rel, target, file, state, n),
-        (error, created, first),
+        (error, created, first, claim, claimed_at),
     ) = raw;
     let relation = match (rel, target) {
         (Some(key), Some(t)) => Relation::new(&key, seq(t)?),
@@ -184,6 +221,10 @@ fn finish_item(raw: RawItem) -> Result<OutboxItem, StoreError> {
         state,
         created: time(created)?,
         first_sent: first.map(time).transpose()?,
+        claim: match (claim.as_deref().and_then(Claim::parse), claimed_at) {
+            (Some(c), Some(at)) => Some((c, time(at)?)),
+            _ => None,
+        },
     })
 }
 
@@ -272,6 +313,7 @@ impl Tx<'_> {
         )
     }
 
+    /// Sets an entry's state, and drops its claim.
     fn set_state(
         &mut self,
         id: OutboxId,
@@ -280,24 +322,31 @@ impl Tx<'_> {
         error: Option<String>,
     ) -> Result<(), StoreError> {
         self.conn().execute(
-            "UPDATE outbox SET state = ?2, seq = ?3, error = ?4 WHERE id = ?1",
+            "UPDATE outbox SET state = ?2, seq = ?3, error = ?4, claim = NULL, claimed_at = NULL
+             WHERE id = ?1",
             params![id.0, state, n.map(|s| sql(s.get())), error],
         )?;
         self.changed(Change::Outbox { id });
         Ok(())
     }
 
-    /// Marks an entry as sent and waiting for its answer.
+    /// Marks an entry as sent by `claim` and waiting for its answer. Do
+    /// this in the same transaction that read the entry, so that no other
+    /// process sends it too.
     pub(crate) fn outbox_sending(
         &mut self,
         id: OutboxId,
+        claim: &Claim,
         now: Timestamp,
     ) -> Result<(), StoreError> {
-        self.set_state(id, "sending", None, None)?;
+        let now = now.unix_millis() as i64;
         self.conn().execute(
-            "UPDATE outbox SET first_sent = COALESCE(first_sent, ?2) WHERE id = ?1",
-            params![id.0, now.unix_millis() as i64],
+            "UPDATE outbox SET state = 'sending', seq = NULL, error = NULL,
+                 first_sent = COALESCE(first_sent, ?2), claim = ?3, claimed_at = ?2
+             WHERE id = ?1",
+            params![id.0, now, claim.to_sql()],
         )?;
+        self.changed(Change::Outbox { id });
         Ok(())
     }
 

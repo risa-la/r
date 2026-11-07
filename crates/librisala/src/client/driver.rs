@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use risala_proto::command::Command;
 use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::unescape;
@@ -19,7 +18,8 @@ use tracing::{debug, warn};
 use super::account::{AccountShared, Batch, Cmd, Synced, check_draft};
 use super::blocking;
 use super::types::{
-    AccountEvent, ClientError, ConnectionState, Notice, OutboxEntry, is_lasting_refusal,
+    AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, DisconnectKind, KeyErrorKind,
+    Notice, OutboxEntry, is_lasting_refusal,
 };
 use crate::addr::TrustStore;
 use crate::conn::{
@@ -85,7 +85,7 @@ async fn drive(
     let guest_token = if shared.is_guest() {
         let store = shared.store.clone();
         let account = shared.id;
-        match blocking(move || store.guest_session(account)).await {
+        match blocking(&shared.rt, move || store.guest_session(account)).await {
             Ok(session) => Some(Arc::new(GuestToken::new(session))),
             Err(e) => {
                 warn!(error = %e, "reading the guest session");
@@ -95,7 +95,11 @@ async fn drive(
     } else {
         None
     };
-    let sign_in = match sign_in_for(shared, guest_token.clone()) {
+    // Loading a key may block (a platform key store, a file), so it runs
+    // off the async workers.
+    let (s, token) = (shared.clone(), guest_token.clone());
+    let sign_in = blocking(&shared.rt, move || sign_in_for(&s, token)).await;
+    let sign_in = match sign_in {
         Ok(s) => s,
         Err(error) => {
             shared.set_state(ConnectionState::Failed { error });
@@ -120,10 +124,12 @@ async fn drive(
                     }
                     SupervisorEvent::Connected { .. } => shared.set_state(ConnectionState::SigningIn),
                     SupervisorEvent::SignedIn { uid, session, incoming } => {
+                        // A guest's session was resumed or is new (4.2).
+                        let resumed = guest_token.as_ref().is_some_and(|t| t.resumed());
                         if let Some(token) = &guest_token {
                             save_guest_session(shared, token.get()).await;
                         }
-                        match online(shared, uid, session.clone(), incoming, cmds).await {
+                        match online(shared, uid, resumed, session.clone(), incoming, cmds).await {
                             Flow::Disconnected => session.close(),
                             Flow::Reconnect => supervisor.reconnect_now(),
                             Flow::Stop(reply) => {
@@ -134,7 +140,13 @@ async fn drive(
                         }
                     }
                     SupervisorEvent::Disconnected { reason } => {
-                        shared.set_state(ConnectionState::Disconnected { reason: reason.to_string() });
+                        shared.set_state(ConnectionState::Disconnected {
+                            kind: DisconnectKind::of(&reason),
+                            reason: match &reason {
+                                conn::CloseReason::Server { bye: Some(bye) } => unescape(bye).into_owned(),
+                                other => other.to_string(),
+                            },
+                        });
                     }
                     SupervisorEvent::Waiting { delay, error } => {
                         shared.set_state(ConnectionState::Waiting {
@@ -172,7 +184,7 @@ async fn drive(
 async fn save_guest_session(shared: &AccountShared, session: Option<(Name, Id)>) {
     let store = shared.store.clone();
     let account = shared.id;
-    let saved = blocking(move || {
+    let saved = blocking(&shared.rt, move || {
         store.set_guest_session(account, session.as_ref().map(|(name, token)| (name, token)))
     })
     .await;
@@ -205,11 +217,20 @@ fn sign_in_for(
         .options
         .keys
         .as_ref()
-        .ok_or_else(|| ClientError::Keys("no key store".into()))?;
+        .ok_or_else(|| ClientError::Keys {
+            kind: KeyErrorKind::NoKeyStore,
+            message: "no key store".into(),
+        })?;
     let key = keys
         .load(identity.as_str())
-        .map_err(|e| ClientError::Keys(e.to_string()))?
-        .ok_or_else(|| ClientError::Keys(format!("no key for {identity}")))?;
+        .map_err(|e| ClientError::Keys {
+            kind: KeyErrorKind::Failed,
+            message: e.to_string(),
+        })?
+        .ok_or_else(|| ClientError::Keys {
+            kind: KeyErrorKind::NoKey,
+            message: format!("no key for {identity}"),
+        })?;
     Ok(Arc::new(IdentitySignIn { identity, key }))
 }
 
@@ -234,6 +255,8 @@ enum Input {
 /// What to do with an input's result, on the async side.
 enum Ctx {
     None,
+    /// A NOTICE line, to report after the changes before it.
+    Notice(String),
     /// A JOIN the app asked for.
     Join(Room, Reply<()>),
     /// A JOIN after reconnecting (4.2).
@@ -247,6 +270,8 @@ enum Ctx {
 /// One signed-in connection.
 struct Online<'a> {
     shared: &'a Arc<AccountShared>,
+    /// A guest's session was resumed on this connection (4.2).
+    resumed: bool,
     session: Arc<Session>,
     engine: Option<SyncEngine>,
     /// The engine's requests in flight, by the `ref` they were sent with.
@@ -264,6 +289,7 @@ struct Online<'a> {
 async fn online(
     shared: &Arc<AccountShared>,
     uid: Uid,
+    resumed: bool,
     session: Arc<Session>,
     mut incoming: mpsc::Receiver<Incoming>,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
@@ -279,14 +305,16 @@ async fn online(
     shared.set_state(ConnectionState::Online {
         uid: uid.to_string(),
     });
-    let engine = SyncEngine::signed_in_as(
+    let mut engine = SyncEngine::signed_in_as(
         shared.store.clone(),
         shared.id,
         uid.clone(),
         shared.options.sync.clone(),
     );
+    engine.set_resumed(resumed);
     let mut on = Online {
         shared,
+        resumed,
         session,
         engine: Some(engine),
         refs: HashMap::new(),
@@ -308,11 +336,14 @@ impl Online<'_> {
         incoming: &mut mpsc::Receiver<Incoming>,
         cmds: &mut mpsc::UnboundedReceiver<Cmd>,
     ) -> Flow {
-        // Guests rejoin the rooms their session lost first, so that SYNC
-        // lists them (4.2).
+        // A guest whose session is new is in no room: it joins its rooms
+        // again first, so that SYNC lists them. A resumed session is still
+        // in them (4.2).
         let mut first = Vec::new();
-        if self.shared.is_guest() && self.shared.options.rejoin_guest_rooms {
-            match self.rooms_to_rejoin().await {
+        if self.shared.is_guest() && !self.resumed && self.shared.options.rejoin_guest_rooms {
+            let store = self.shared.store.clone();
+            let account = self.shared.id;
+            match blocking(&self.shared.rt, move || store.rejoin_rooms(account)).await {
                 Ok(rooms) => {
                     for room in rooms {
                         first.push((Input::Join(room.clone()), Ctx::Rejoin(room)));
@@ -369,53 +400,17 @@ impl Online<'_> {
         }
     }
 
-    /// The rooms a guest joins again on this connection: those it should
-    /// be in, by [`Store::rejoin_rooms`], that a SYNC sent before anything
-    /// else does not list. After a resumed session, that is none (4.2), so
-    /// no JOIN is recorded; after a new session, it is all of them.
-    ///
-    /// If the SYNC fails, it is all of them too. That is safe: JOIN of a
-    /// room the guest is still in records nothing (6.1).
-    async fn rooms_to_rejoin(&self) -> Result<Vec<Room>, StoreError> {
-        let store = self.shared.store.clone();
-        let account = self.shared.id;
-        let mut rooms = blocking(move || store.rejoin_rooms(account)).await?;
-        if rooms.is_empty() {
-            return Ok(rooms);
-        }
-        match self.session.request(Command::Sync).await {
-            Ok(response) if response.is_ok() => {
-                let listed: HashSet<Conv> = response
-                    .lines
-                    .iter()
-                    .filter_map(|msg| match &msg.line {
-                        ServerLine::Conv { conv, .. } => Some(conv.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                rooms.retain(|room| !listed.contains(&Conv::Room(room.clone())));
-            }
-            Ok(response) => debug!(end = ?response.end, "SYNC before rejoining failed"),
-            Err(e) => debug!(error = %e, "SYNC before rejoining failed"),
-        }
-        Ok(rooms)
-    }
-
     /// Turns an incoming item into engine input.
     fn take(&mut self, item: Incoming, inputs: &mut Vec<(Input, Ctx)>) {
         match item {
             Incoming::Line(msg) => {
-                if let ServerLine::Notice { message } = &msg.line {
-                    self.shared.publish(Batch {
-                        changes: Vec::new(),
-                        events: vec![AccountEvent::Notice {
-                            notice: Notice::Server {
-                                text: unescape(message).into_owned(),
-                            },
-                        }],
-                    });
-                }
-                inputs.push((Input::Line(msg), Ctx::None));
+                // A NOTICE is published in its place among the changes of
+                // the lines around it (8.4).
+                let ctx = match &msg.line {
+                    ServerLine::Notice { message } => Ctx::Notice(unescape(message).into_owned()),
+                    _ => Ctx::None,
+                };
+                inputs.push((Input::Line(msg), ctx));
             }
             Incoming::Reply { ref_, response } => match self.refs.remove(&ref_) {
                 Some(req) => inputs.push((Input::Reply(req, to_reply(response)), Ctx::None)),
@@ -436,7 +431,11 @@ impl Online<'_> {
                 // The user left: do not join it again (4.2).
                 let store = self.shared.store.clone();
                 let (account, r) = (self.shared.id, room.clone());
-                if let Err(e) = blocking(move || store.set_rejoin(account, &r, false)).await {
+                if let Err(e) = blocking(&self.shared.rt, move || {
+                    store.set_rejoin(account, &r, false)
+                })
+                .await
+                {
                     let _ = reply.send(Err(e.into()));
                     return None;
                 }
@@ -459,7 +458,7 @@ impl Online<'_> {
             let mut engine = self.engine.take().expect("the engine is here");
             let store = self.shared.store.clone();
             let account = self.shared.id;
-            let (engine, results) = blocking(move || {
+            let (engine, results) = blocking(&self.shared.rt, move || {
                 let mut results = Vec::new();
                 for input in inputs_only {
                     let result = step(&mut engine, input).map(|(out, sent)| {
@@ -513,7 +512,7 @@ impl Online<'_> {
                     warn!(error = %e, "cannot send a command");
                     let reply = sync::Reply {
                         lines: Vec::new(),
-                        outcome: Outcome::Failed,
+                        outcome: Outcome::NotSent,
                     };
                     self.synthetic.push((Input::Reply(o.req, reply), Ctx::None));
                 }
@@ -527,6 +526,11 @@ impl Online<'_> {
         let mut not_again: Vec<Room> = Vec::new();
         let mut join_again: Vec<Room> = Vec::new();
         let mut events = events;
+        if let Ctx::Notice(text) = &ctx {
+            events.push(AccountEvent::Notice {
+                notice: Notice::Server { text: text.clone() },
+            });
+        }
         for n in &out.notifications {
             match n {
                 Notification::Kicked { room, .. }
@@ -541,9 +545,13 @@ impl Online<'_> {
                 Outcome::Ok(_) => Ok(()),
                 Outcome::Err(err) => Err(ClientError::server(err)),
                 Outcome::Failed => Err(ClientError::Connection {
+                    kind: ConnectionErrorKind::Protocol,
                     message: "the server's answer could not be read".into(),
                     permanent: false,
                 }),
+                Outcome::NotSent => {
+                    Err(ClientError::Invalid("the command could not be sent".into()))
+                }
             };
             if let Some(room) = self.rejoining.remove(&done.req)
                 && let Outcome::Err(err) = &done.outcome
@@ -570,7 +578,7 @@ impl Online<'_> {
         if !not_again.is_empty() || !join_again.is_empty() {
             let store = self.shared.store.clone();
             let account = self.shared.id;
-            let written = blocking(move || -> Result<(), StoreError> {
+            let written = blocking(&self.shared.rt, move || -> Result<(), StoreError> {
                 for room in &not_again {
                     store.set_rejoin(account, room, false)?;
                 }
@@ -586,6 +594,7 @@ impl Online<'_> {
         }
 
         self.shared.publish(Batch {
+            reload: false,
             changes: out.changes,
             events,
         });
@@ -595,7 +604,7 @@ impl Online<'_> {
             self.shared.synced.send_modify(|s| s.idle = false);
         }
         match ctx {
-            Ctx::None => {}
+            Ctx::None | Ctx::Notice(_) => {}
             Ctx::Join(room, reply) => match first_req {
                 Some(req) => {
                     self.waiters.insert(req, (Some(room), reply));
@@ -660,7 +669,7 @@ fn answer_err(ctx: Ctx, e: ClientError) {
         Ctx::Send(reply) => {
             let _ = reply.send(Err(e));
         }
-        Ctx::None | Ctx::Rejoin(_) => {}
+        Ctx::None | Ctx::Notice(_) | Ctx::Rejoin(_) => {}
     }
 }
 
@@ -747,12 +756,12 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
     match cmd {
         Cmd::Send { conv, draft, reply } => {
             let s = shared.clone();
-            let result = blocking(move || queue_offline(&s, &conv, &draft)).await;
+            let result = blocking(&shared.rt, move || queue_offline(&s, &conv, &draft)).await;
             let _ = reply.send(result);
         }
         Cmd::MarkRead { conv, seq, reply } => {
             let s = shared.clone();
-            let result = blocking(move || {
+            let result = blocking(&shared.rt, move || {
                 let account = s.id;
                 let (_, changes) = s.store.write(|tx| {
                     if let Some(mut row) = tx.conv_by_name(account, &conv)? {
@@ -768,7 +777,7 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
         }
         Cmd::Part { room, reply, .. } if shared.is_guest() => {
             let s = shared.clone();
-            let result = blocking(move || {
+            let result = blocking(&shared.rt, move || {
                 s.store.set_rejoin(s.id, &room, false)?;
                 let account = s.id;
                 let (_, changes) = s.store.write(|tx| {
@@ -821,5 +830,9 @@ fn queue_offline(
 
 fn publish_changes(shared: &AccountShared, changes: Vec<Change>) {
     let events = describe_changes(&shared.store, shared.id, &changes);
-    shared.publish(Batch { changes, events });
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events,
+    });
 }

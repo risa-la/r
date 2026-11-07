@@ -15,7 +15,8 @@ use super::{
     Completed, Notification, Outcome, Outgoing, Output, Reply, ReqId, SyncConfig, SyncError,
 };
 use crate::store::{
-    AccountId, ConvId, ConvRow, Draft, FailReason, OutboxId, OutboxState, Store, StoreError, Tx,
+    AccountId, Claim, ConvId, ConvRow, Draft, FailReason, OutboxId, OutboxState, Store, StoreError,
+    Tx,
 };
 
 /// After this many failed HISTORY or RELATED requests for one
@@ -94,17 +95,23 @@ enum Pending {
     Sync {
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
+        /// The sync points when it was sent, for the head check.
+        floors: HashMap<Conv, u64>,
     },
     Join {
         room: Room,
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
+        /// The room's sync point when it was sent, for the head check.
+        floor: Option<u64>,
     },
     Part,
     Info {
         room: Room,
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
+        /// The room's sync point when it was sent, for the head check.
+        floor: Option<u64>,
     },
     Read,
     Msg {
@@ -159,6 +166,9 @@ pub struct SyncEngine {
     account: AccountId,
     me: Uid,
     guest: bool,
+    /// A guest's session was resumed on this connection (4.2), so its
+    /// cids carry over (7.6).
+    resumed: bool,
     config: SyncConfig,
     next_req: u64,
     pending: HashMap<ReqId, Pending>,
@@ -169,6 +179,8 @@ pub struct SyncEngine {
     want_sync: bool,
     /// Outbox entries sent on this connection and not answered yet.
     sending: HashSet<OutboxId>,
+    /// This connection's claim on the outbox entries it sends (7.6).
+    claim: Claim,
     /// Counts the lines and replies handled, to order them.
     ticks: u64,
     out: Output,
@@ -196,9 +208,11 @@ impl SyncEngine {
         config: SyncConfig,
     ) -> SyncEngine {
         SyncEngine {
+            claim: store.new_claim(),
             store,
             account,
             guest: me.is_guest(),
+            resumed: false,
             me,
             config,
             next_req: 1,
@@ -210,6 +224,16 @@ impl SyncEngine {
             ticks: 0,
             out: Output::default(),
         }
+    }
+
+    /// Says that this connection's guest resumed its session: GUEST's
+    /// `OK` carried `resumed=yes` (4.2). The session's cids carry over, so
+    /// messages sent on an earlier connection of the session with no `OK`
+    /// are sent again with their cids (7.6), as an identity's are. Without
+    /// it, a guest marks them as possibly not sent. Call it before
+    /// [`start`](Self::start). Identities need not.
+    pub fn set_resumed(&mut self, resumed: bool) {
+        self.resumed = resumed;
     }
 
     /// The account this engine syncs.
@@ -261,7 +285,7 @@ impl SyncEngine {
                     Ok(())
                 })?;
             }
-            ServerLine::Drop { room, id, reason } => self.on_drop(room, id, reason)?,
+            ServerLine::Drop { id, room, reason } => self.on_drop(Some(id), room, reason)?,
             _ => {}
         }
         Ok(self.finish())
@@ -276,11 +300,15 @@ impl SyncEngine {
             return Ok(self.finish());
         };
         match pending {
-            Pending::Sync { sent } => self.on_sync(req, sent, &reply)?,
-            Pending::Join { room, sent } => self.on_join(req, &room, sent, reply)?,
+            Pending::Sync { sent, floors } => self.on_sync(req, sent, &floors, &reply)?,
+            Pending::Join { room, sent, floor } => {
+                self.on_join(req, &room, (sent, floor), reply)?
+            }
             // The PART event, which comes first, did the work (6.1).
             Pending::Part => self.completed(req, reply.outcome),
-            Pending::Info { room, sent } => self.on_info(req, &room, sent, reply)?,
+            Pending::Info { room, sent, floor } => {
+                self.on_info(req, &room, (sent, floor), reply)?
+            }
             Pending::Read => self.completed(req, reply.outcome),
             Pending::Msg { outbox } => self.on_msg(outbox, reply)?,
             Pending::History {
@@ -307,11 +335,13 @@ impl SyncEngine {
     pub fn join(&mut self, room: &Room) -> Output {
         let command = Command::Join { room: room.clone() };
         let sent = self.ticks;
+        let floor = self.floor(&Conv::Room(room.clone()));
         self.issue(
             command,
             Pending::Join {
                 room: room.clone(),
                 sent,
+                floor,
             },
         );
         self.finish()
@@ -333,11 +363,13 @@ impl SyncEngine {
             room: Some(room.clone()),
         };
         let sent = self.ticks;
+        let floor = self.floor(&Conv::Room(room.clone()));
         self.issue(
             command,
             Pending::Info {
                 room: room.clone(),
                 sent,
+                floor,
             },
         );
         self.finish()
@@ -511,7 +543,18 @@ impl SyncEngine {
             return;
         }
         let sent = self.ticks;
-        self.syncing = Some(self.issue(Command::Sync, Pending::Sync { sent }));
+        // If the cache cannot be read, no head is checked.
+        let floors = self.store.sync_points(self.account).unwrap_or_default();
+        self.syncing = Some(self.issue(Command::Sync, Pending::Sync { sent, floors }));
+    }
+
+    /// The sync point of `conv` now, to check a head in the reply to a
+    /// command sent now (7.1). `None` if it is not known.
+    fn floor(&self, conv: &Conv) -> Option<u64> {
+        self.store
+            .sync_points(self.account)
+            .ok()
+            .and_then(|mut m| m.remove(conv))
     }
 
     fn live(&mut self, conv: &Conv) -> &mut Live {
@@ -549,11 +592,19 @@ impl SyncEngine {
         self.live(conv).joined_at = now;
     }
 
-    /// Whether a head in the reply to a command sent at `sent` can be
-    /// compared with the newest stored seq (7.1). Not if a live event came
-    /// since: the server may have computed the reply before that event.
-    fn head_is_fresh(&self, conv: &Conv, sent: u64) -> bool {
-        self.convs.get(conv).is_none_or(|l| l.event_at <= sent)
+    /// The sync point to check a head against (7.1), in the reply to a
+    /// command sent at `sent` when the sync point was `floor`.
+    ///
+    /// The head is compared with the sync point as it was when the command
+    /// was sent, not as it is now: since then, this connection or another
+    /// process sharing the cache may have stored newer events, which the
+    /// server may not have counted when it computed the head. Events stored
+    /// before the command was sent existed on the server before it, so a
+    /// correct server's head covers them. A live event of the conversation
+    /// since the command was sent skips the check altogether.
+    fn head_floor(&self, conv: &Conv, sent: u64, floor: Option<u64>) -> Option<u64> {
+        let fresh = self.convs.get(conv).is_none_or(|l| l.event_at <= sent);
+        floor.filter(|_| fresh)
     }
 
     /// The id of `conv` was learned on this connection.
@@ -582,11 +633,19 @@ impl SyncEngine {
 
         // 6.4: notifications, not history.
         match &event.body {
-            EventBody::Invite { room, uid } if *uid == self.me && !self.is_live(&conv) => {
+            EventBody::Invite { room, uid } if *uid == self.me => {
                 self.out.notifications.push(Notification::Invited {
                     room: room.clone(),
                     by: meta.from.clone(),
                 });
+                // Inviting a member records nothing (6.4), so the server
+                // takes the account not to be in the room. If this
+                // connection thought it was, ask SYNC.
+                if self.is_live(&conv) {
+                    self.touch_left(&conv);
+                    self.left(&conv)?;
+                    self.want_sync = true;
+                }
                 return Ok(());
             }
             EventBody::Kick { room, uid, reason } if *uid == self.me => {
@@ -699,24 +758,40 @@ impl SyncEngine {
         }
     }
 
-    fn on_drop(&mut self, room: &Room, id: &Id, reason: &str) -> Result<(), SyncError> {
+    /// DROP (10.4). One whose `id` is not the stored id is about an older
+    /// room of the same name: the stored history stays, and nothing is
+    /// reported. One with no `id` is taken to be about the stored room.
+    ///
+    /// Either way, this connection forgets the dropped id if it had
+    /// confirmed it, and replies to commands sent before the DROP may name
+    /// it, so they are out of date. Another process sharing the cache may
+    /// have stored the new room's id while this connection still had the
+    /// old one.
+    fn on_drop(&mut self, id: Option<&Id>, room: &Room, reason: &str) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
+        self.touch_left(&conv);
+        let live = self.live(&conv);
+        if id.is_none_or(|id| live.confirmed.as_ref() == Some(id)) {
+            live.confirmed = None;
+        }
         let account = self.account;
-        // A DROP for an id other than the stored one is about an older
-        // room of the same name (10.4).
-        let dropped = self.write(|tx| match tx.conv_by_name(account, &conv)? {
-            Some(row) if row.conv_id.as_ref().is_some_and(|stored| stored != id) => Ok(false),
-            Some(row) => {
-                tx.remove(&row)?;
-                Ok(true)
+        let ours = self.write(|tx| {
+            let row = tx.conv_by_name(account, &conv)?;
+            if let Some(id) = id
+                && row.as_ref().and_then(|r| r.conv_id.as_ref()) != Some(id)
+            {
+                return Ok(false);
             }
-            None => Ok(true),
+            if let Some(row) = row {
+                tx.remove(&row)?;
+            }
+            Ok(true)
         })?;
-        if !dropped {
+        if !ours {
+            debug!(%room, "DROP for another room of the same name");
             return Ok(());
         }
         self.live(&conv).confirmed = None;
-        self.touch_left(&conv);
         self.out.notifications.push(Notification::Dropped {
             room: room.clone(),
             reason: reason.to_owned(),
@@ -727,7 +802,13 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
     // Replies
 
-    fn on_sync(&mut self, req: ReqId, sent: u64, reply: &Reply) -> Result<(), SyncError> {
+    fn on_sync(
+        &mut self,
+        req: ReqId,
+        sent: u64,
+        floors: &HashMap<Conv, u64>,
+        reply: &Reply,
+    ) -> Result<(), SyncError> {
         if self.syncing == Some(req) {
             self.syncing = None;
         }
@@ -750,6 +831,7 @@ impl SyncEngine {
         }
         let account = self.account;
         let mut listed = Vec::new();
+        let mut heads = HashMap::new();
         for msg in &reply.lines {
             if let ServerLine::Conv {
                 conv,
@@ -759,14 +841,15 @@ impl SyncEngine {
             } = &msg.line
             {
                 listed.push(conv.clone());
+                heads.insert(conv.clone(), head.get());
                 if newer.contains(conv) {
                     continue;
                 }
-                let fresh = self.head_is_fresh(conv, sent);
+                let floor = self.head_floor(conv, sent, floors.get(conv).copied());
                 self.write(|tx| {
                     let mut row = tx.conv_or_create(account, conv)?;
                     // 7.1 step 2, and the head check.
-                    learn(tx, &mut row, id, Some(head.get()), fresh)?;
+                    learn(tx, &mut row, id, Some(head.get()), floor)?;
                     tx.set_joined(&mut row, true)?;
                     if let Some(read) = read {
                         tx.set_read(&mut row, read.get())?;
@@ -792,8 +875,15 @@ impl SyncEngine {
             self.live(&conv).confirmed = None;
             self.out.notifications.push(Notification::Left { conv });
         }
+        // A live event dropped while this SYNC was in flight: ask again if
+        // the SYNC did not list its conversation, or listed it with a head
+        // below the event. The server computed that head before the event,
+        // and the event may have expired by the time HISTORY asks for it,
+        // so only a new SYNC tells how far to catch up (7.1 step 6).
         for (conv, live) in &mut self.convs {
-            if std::mem::take(&mut live.recheck) && !listed.contains(conv) {
+            if std::mem::take(&mut live.recheck)
+                && heads.get(conv).is_none_or(|&head| head < live.dropped)
+            {
                 self.want_sync = true;
             }
         }
@@ -809,7 +899,7 @@ impl SyncEngine {
         &mut self,
         req: ReqId,
         room: &Room,
-        sent: u64,
+        (sent, floor): (u64, Option<u64>),
         reply: Reply,
     ) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
@@ -820,11 +910,11 @@ impl SyncEngine {
             && let Ok(Some(id)) = ok.id()
         {
             let head = ok.head().ok().flatten();
-            let fresh = self.head_is_fresh(&conv, sent);
+            let floor = self.head_floor(&conv, sent, floor);
             let account = self.account;
             self.write(|tx| {
                 let mut row = tx.conv_or_create(account, &conv)?;
-                learn(tx, &mut row, &id, head, fresh)?;
+                learn(tx, &mut row, &id, head, floor)?;
                 tx.set_joined(&mut row, true)?;
                 for msg in &reply.lines {
                     if let ServerLine::Event(e) = &msg.line
@@ -848,7 +938,7 @@ impl SyncEngine {
         &mut self,
         req: ReqId,
         room: &Room,
-        sent: u64,
+        (sent, floor): (u64, Option<u64>),
         reply: Reply,
     ) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
@@ -860,7 +950,7 @@ impl SyncEngine {
         {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
             let head = ok.head().ok().flatten();
-            let fresh = self.head_is_fresh(&conv, sent);
+            let floor = self.head_floor(&conv, sent, floor);
             let account = self.account;
             self.write(|tx| {
                 let row = if joined {
@@ -872,7 +962,7 @@ impl SyncEngine {
                     return Ok(());
                 };
                 if joined {
-                    learn(tx, &mut row, &id, head, fresh)?;
+                    learn(tx, &mut row, &id, head, floor)?;
                     tx.set_joined(&mut row, true)?;
                     for msg in &reply.lines {
                         if let ServerLine::Event(e) = &msg.line
@@ -931,6 +1021,8 @@ impl SyncEngine {
                 }
                 Outcome::Err(err) => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
                 Outcome::Failed => tx.outbox_failed(outbox, FailReason::Unconfirmed)?,
+                // Never sent, so it is not "maybe sent".
+                Outcome::NotSent => tx.outbox_failed(outbox, FailReason::Invalid)?,
             }
             Ok(None)
         })?;
@@ -1310,65 +1402,92 @@ impl SyncEngine {
 
     /// Sends every outbox entry that can be sent now, and fails those that
     /// cannot be sent safely any more.
+    ///
+    /// Picking the entries and marking them as sent is one write
+    /// transaction (`BEGIN IMMEDIATE`), so that another process sharing the
+    /// cache cannot pick them too. An entry another process's connection
+    /// sent is left to it while its claim lasts
+    /// ([`SyncConfig::claim_lease`]).
     fn flush_outbox(&mut self) -> Result<(), SyncError> {
         let account = self.account;
         let now = self.now();
         let window = self.config.resend_window;
-        let guest = self.guest;
-        let items = self.write(|tx| tx.outbox_pending(account))?;
-        for item in items {
-            if self.sending.contains(&item.id) {
-                continue;
-            }
-            if item.state == OutboxState::Sending {
-                // Sent on an earlier connection, with no answer. Only an
-                // identity's cid survives that, and only for 24 hours.
-                let fresh = item
-                    .first_sent
-                    .is_some_and(|t| now.saturating_duration_since(t) < window);
-                if guest || !fresh {
-                    self.write(|tx| tx.outbox_failed(item.id, FailReason::Unconfirmed))?;
+        let lease = self.config.claim_lease;
+        // A guest's cids count only within its session (7.6).
+        let cids_hold = !self.guest || self.resumed;
+        let claim = self.claim.clone();
+        let store = self.store.clone();
+        let in_flight = self.sending.clone();
+        let confirmed: HashMap<Conv, Id> = self
+            .convs
+            .iter()
+            .filter_map(|(c, l)| Some((c.clone(), l.confirmed.clone()?)))
+            .collect();
+        let to_send = self.write(|tx| {
+            let mut to_send = Vec::new();
+            for item in tx.outbox_pending(account)? {
+                if in_flight.contains(&item.id) {
                     continue;
                 }
-            }
-            // The id confirmed on this connection, if the store still has
-            // it: another process sharing the store may have learned that
-            // the room changed.
-            let conv = item.conv.clone();
-            let stored =
-                self.write(|tx| Ok(tx.conv_by_name(account, &conv)?.and_then(|r| r.conv_id)))?;
-            let confirmed = self
-                .convs
-                .get(&item.conv)
-                .and_then(|l| l.confirmed.clone())
-                .filter(|id| stored.as_ref() == Some(id));
-            match (&item.conv_id, confirmed) {
-                (Some(bound), Some(id)) if *bound == id => {}
-                (Some(_), Some(_)) => {
-                    // The room was dropped and created again (7.6).
-                    self.write(|tx| tx.outbox_failed(item.id, FailReason::RoomChanged))?;
-                    continue;
-                }
-                (None, Some(id)) => {
-                    self.write(|tx| tx.outbox_bind(item.id, &id))?;
-                }
-                (Some(_), None) => continue,
-                (None, None) => {
-                    // A direct conversation that has not started: its first
-                    // message starts it (5.1). Wait if it has an id now.
-                    if stored.is_some() || conv.is_room() {
+                if item.state == OutboxState::Sending {
+                    // Another process may still be waiting for its answer.
+                    if let Some((other, at)) = &item.claim
+                        && !store.is_own_instance(other)
+                        && now.saturating_duration_since(*at) < lease
+                    {
+                        continue;
+                    }
+                    // Sent on an earlier connection, with no answer. Only an
+                    // identity's cid survives that, or a resumed guest
+                    // session's, and only for 24 hours.
+                    let fresh = item
+                        .first_sent
+                        .is_some_and(|t| now.saturating_duration_since(t) < window);
+                    if !cids_hold || !fresh {
+                        tx.outbox_failed(item.id, FailReason::Unconfirmed)?;
                         continue;
                     }
                 }
+                // The id confirmed on this connection, if the store still
+                // has it: another process sharing the store may have
+                // learned that the room changed.
+                let stored = tx
+                    .conv_by_name(account, &item.conv)?
+                    .and_then(|r| r.conv_id);
+                let live = confirmed
+                    .get(&item.conv)
+                    .filter(|id| stored.as_ref() == Some(*id));
+                match (&item.conv_id, live) {
+                    (Some(bound), Some(id)) if bound == id => {}
+                    (Some(_), Some(_)) => {
+                        // The room was dropped and created again (7.6).
+                        tx.outbox_failed(item.id, FailReason::RoomChanged)?;
+                        continue;
+                    }
+                    (None, Some(id)) => tx.outbox_bind(item.id, id)?,
+                    (Some(_), None) => continue,
+                    (None, None) => {
+                        // A direct conversation that has not started: its
+                        // first message starts it (5.1). Wait if it has an
+                        // id now.
+                        if stored.is_some() || item.conv.is_room() {
+                            continue;
+                        }
+                    }
+                }
+                tx.outbox_sending(item.id, &claim, now)?;
+                to_send.push(item);
             }
+            Ok(to_send)
+        })?;
+        for item in to_send {
             let command = Command::Msg {
-                conv: item.conv.clone(),
-                text: item.draft.text.clone(),
+                conv: item.conv,
+                text: item.draft.text,
                 relation: item.draft.relation,
-                file: item.draft.file.clone(),
-                cid: Some(item.cid.clone()),
+                file: item.draft.file,
+                cid: Some(item.cid),
             };
-            self.write(|tx| tx.outbox_sending(item.id, now))?;
             self.sending.insert(item.id);
             self.issue(command, Pending::Msg { outbox: item.id });
         }
@@ -1376,16 +1495,20 @@ impl SyncEngine {
     }
 }
 
-/// Learns a conversation's id and head from a reply. The head is checked
-/// against the newest stored seq only if `fresh`.
+/// Learns a conversation's id and head from a reply (7.1). The head is
+/// checked only against `floor`, the sync point when the command was sent
+/// (see [`SyncEngine::head_floor`]), and against the sync point now, which
+/// is lower if the history was discarded since.
 fn learn(
     tx: &mut Tx<'_>,
     row: &mut ConvRow,
     id: &Id,
     head: Option<u64>,
-    fresh: bool,
+    floor: Option<u64>,
 ) -> Result<bool, StoreError> {
-    if fresh {
+    if let (Some(h), Some(f)) = (head, floor)
+        && h < f
+    {
         return tx.learn_id(row, id, head);
     }
     let reset = tx.learn_id(row, id, None)?;

@@ -490,7 +490,7 @@ async fn a_dropped_guest_resumes_without_join_or_part() {
 
     let (mut sam, ok) = resume(&mut h, "sam", &token).await;
     let new_token = value(&ok[0], "token");
-    assert_eq!(ok, [format!("OK uid=~sam token={new_token}")]);
+    assert_eq!(ok, [format!("OK uid=~sam token={new_token} resumed=yes")]);
     assert_ne!(new_token, token);
     assert_eq!(new_token.len(), TOKEN_LEN);
     // Nobody saw anything, and nothing was stored.

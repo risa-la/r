@@ -232,8 +232,13 @@ impl Inner {
                     resumed = how == SignIn::Resumed,
                     "signed in as a guest"
                 );
+                // 4.2: resumed=yes tells the guest its cids carry over,
+                // so it may resend what got no OK (7.6).
                 Ok(Some(
-                    OkResponse::new().with_uid(&uid).with_token(&new_token),
+                    OkResponse::new()
+                        .with_uid(&uid)
+                        .with_token(&new_token)
+                        .with_resumed(how == SignIn::Resumed),
                 ))
             }
             Err(SignInRefused::NameTaken) => {

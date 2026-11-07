@@ -2,15 +2,16 @@
 //! the timeline's diffs and input checks. The end-to-end tests are in
 //! `tests/client.rs` and `tests/cuts.rs`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use risala_proto::names::Conv;
+use risala_proto::names::{Conv, Seq};
 use risala_proto::server::{Event, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 
 use super::account::Batch;
 use super::*;
+use crate::store::{Draft, FailReason, Store};
 
 const SERVER: &str = "chat.example.org";
 
@@ -45,6 +46,7 @@ fn store_events(account: &Account, conv: &str, id: &str, events: &[Event]) {
         })
         .unwrap();
     shared.publish(Batch {
+        reload: false,
         changes,
         events: Vec::new(),
     });
@@ -201,7 +203,10 @@ async fn the_timeline_reports_inserts_updates_and_resets() {
     assert_eq!(item.reactions.len(), 1);
     assert!(item.reactions[0].mine);
     assert_eq!(timeline.items().len(), 3);
-    assert_eq!(timeline.items(), general.messages(None, 10).unwrap());
+    assert_eq!(
+        timeline.items(),
+        general.messages(None, 10).unwrap().messages
+    );
 
     // A new id discards the history (7.1): a reset.
     let shared = sam.shared();
@@ -217,6 +222,7 @@ async fn the_timeline_reports_inserts_updates_and_resets() {
         })
         .unwrap();
     shared.publish(Batch {
+        reload: false,
         changes,
         events: Vec::new(),
     });
@@ -290,5 +296,509 @@ async fn the_timeline_loses_nothing_when_next_is_dropped() {
         apply(&mut items, diffs);
     }
     assert_eq!(items, timeline.items());
-    assert_eq!(items, general.messages(None, 1000).unwrap());
+    assert_eq!(items, all_messages(&general));
+}
+
+/// Every message of a conversation in the cache, page by page.
+fn all_messages(conv: &Conversation) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = conv.messages(cursor, MAX_PAGE).unwrap();
+        let mut older = page.messages;
+        older.append(&mut out);
+        out = older;
+        match page.older {
+            Some(c) => cursor = Some(c),
+            None => return out,
+        }
+    }
+}
+
+#[tokio::test]
+async fn writes_from_another_process_reach_timelines() {
+    // The app and its notification extension share one cache file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let app = Client::open(&path, ClientOptions::default()).unwrap();
+    let extension = Client::open(&path, ClientOptions::default()).unwrap();
+    let sam = app.add_guest(SERVER, "sam").unwrap();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    // The app's own writes do not count.
+    assert!(!app.check_for_external_changes().unwrap());
+
+    let timeline = general.timeline(50).unwrap();
+    assert_eq!(timeline.items().len(), 1);
+    let events = sam.subscribe();
+
+    // The extension stores a message. The app hears nothing of it...
+    let other = extension.add_guest(SERVER, "sam").unwrap();
+    store_events(
+        &other,
+        "#general",
+        "k1",
+        &[event(2, "from=~bob MSG #general hi")],
+    );
+    assert_eq!(general.messages(None, 50).unwrap().messages.len(), 2);
+    // ...until it checks.
+    assert!(app.check_for_external_changes().unwrap());
+    assert!(!app.check_for_external_changes().unwrap());
+    assert_eq!(events.next().await, Some(AccountEvent::CacheChanged));
+    match timeline.next().await.unwrap().as_slice() {
+        [TimelineDiff::Reset { items }] => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[1].text.as_deref(), Some("hi"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(timeline.items().len(), 2);
+
+    // A refresh by hand does the same for one timeline.
+    store_events(
+        &other,
+        "#general",
+        "k1",
+        &[event(3, "from=~bob MSG #general again")],
+    );
+    timeline.refresh().await.unwrap();
+    match timeline.next().await.unwrap().as_slice() {
+        [TimelineDiff::Reset { items }] => assert_eq!(items.len(), 3),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn errors_carry_kinds_to_localize() {
+    use crate::conn::{CloseReason, Error};
+    let e = ClientError::from_conn("x", &Error::Timeout);
+    assert!(matches!(
+        e,
+        ClientError::Connection {
+            kind: ConnectionErrorKind::Timeout,
+            permanent: false,
+            ..
+        }
+    ));
+    let e = ClientError::from_conn(
+        "x",
+        &Error::KeyExchange(rustls::Error::General("no group".into())),
+    );
+    assert!(matches!(
+        e,
+        ClientError::Connection {
+            kind: ConnectionErrorKind::KeyExchange,
+            permanent: true,
+            ..
+        }
+    ));
+    let e = ClientError::from_conn("x", &Error::Closed(CloseReason::PingTimeout));
+    assert!(matches!(
+        e,
+        ClientError::Connection {
+            kind: ConnectionErrorKind::Closed,
+            ..
+        }
+    ));
+    assert_eq!(
+        DisconnectKind::of(&CloseReason::Server { bye: None }),
+        DisconnectKind::Server
+    );
+
+    // Outbox failures: "room changed" and "dropped" differ by kind.
+    let store = Store::open_in_memory().unwrap();
+    let server = parse_server(SERVER).unwrap();
+    let account = store.account(&server, &"~sam".parse().unwrap()).unwrap();
+    let conv: Conv = "#general".parse().unwrap();
+    for (why, kind, maybe) in [
+        (FailReason::RoomChanged, FailKind::RoomChanged, false),
+        (FailReason::Dropped, FailKind::Dropped, false),
+        (FailReason::Unconfirmed, FailKind::Unconfirmed, true),
+        (FailReason::Invalid, FailKind::Invalid, false),
+        (
+            FailReason::Rejected(risala_proto::error::ErrorCode::Forbidden),
+            FailKind::Rejected,
+            false,
+        ),
+    ] {
+        let (id, _) = store
+            .write(|tx| {
+                let id = tx.queue(account, &conv, None, &Draft::text("hi"), Timestamp::MIN)?;
+                tx.outbox_failed(id, why.clone())?;
+                Ok(id)
+            })
+            .unwrap();
+        let entry = OutboxEntry::from(store.outbox_item(id).unwrap().unwrap());
+        match entry.status {
+            OutboxStatus::Failed {
+                kind: k,
+                maybe_sent,
+                ..
+            } => assert_eq!((k, maybe_sent), (kind, maybe), "{why:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn messages_say_whether_they_are_the_accounts_own() {
+    // A guest signed in as ~sam2 (4.2): its messages are its own, and
+    // ~sam's are someone else's.
+    let sam = guest();
+    let shared = sam.shared();
+    let conv: Conv = "#general".parse().unwrap();
+    let account = shared.id;
+    shared
+        .store
+        .write(|tx| {
+            tx.signed_in_as(&"~sam2".parse().unwrap());
+            let mut row = tx.conv_or_create(account, &conv)?;
+            tx.learn_id(&mut row, &"k1".parse().unwrap(), None)?;
+            tx.store_event(&row, &event(1, "from=~sam2 MSG #general mine"))?;
+            tx.store_event(&row, &event(2, "from=~sam MSG #general theirs"))
+        })
+        .unwrap();
+    let own: Vec<(String, bool)> = sam
+        .conversation("#general")
+        .unwrap()
+        .messages(None, 10)
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|m| (m.text.unwrap(), m.own))
+        .collect();
+    assert_eq!(own, [("mine".into(), true), ("theirs".into(), false)]);
+}
+
+#[test]
+fn conversation_info_has_the_topic_and_settings() {
+    let sam = guest();
+    let shared = sam.shared();
+    let conv: Conv = "#general".parse().unwrap();
+    let account = shared.id;
+    let snapshot = |line: &str| match line.parse::<ServerMessage>().unwrap().line {
+        ServerLine::Event(e) => e,
+        other => panic!("{other:?}"),
+    };
+    shared
+        .store
+        .write(|tx| {
+            let mut row = tx.conv_or_create(account, &conv)?;
+            tx.learn_id(&mut row, &"k1".parse().unwrap(), Some(1))?;
+            tx.apply_snapshot(&row, &snapshot("SET #general topic Plans\\nfor now"))?;
+            tx.apply_snapshot(&row, &snapshot("SET #general guests write"))?;
+            tx.apply_snapshot(&row, &snapshot("SET #general public yes"))
+        })
+        .unwrap();
+    let info = sam
+        .conversation("#general")
+        .unwrap()
+        .info()
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.topic, "Plans\nfor now");
+    let settings: Vec<(&str, &str)> = info
+        .settings
+        .iter()
+        .map(|s| (s.key.as_str(), s.value.as_str()))
+        .collect();
+    assert_eq!(
+        settings,
+        [
+            ("guests", "write"),
+            ("public", "yes"),
+            ("topic", "Plans\nfor now")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_timeline_shows_the_outbox_until_sent() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let timeline = general.timeline(50).unwrap();
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("diffs")
+            .expect("not closed")
+    };
+
+    // Queued offline: a pending item after the stored ones.
+    let entry = general.send("hello").await.unwrap();
+    match next().await.as_slice() {
+        [TimelineDiff::Insert { index: 1, item }] => {
+            assert_eq!(item.seq, 0);
+            assert!(item.own);
+            assert_eq!(item.text.as_deref(), Some("hello"));
+            assert_eq!(item.outbox.as_ref().unwrap().status, OutboxStatus::Queued);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Sent: its event goes in among the stored ones, and the pending item
+    // goes.
+    let shared = sam.shared().clone();
+    let (account, conv) = (shared.id, "#general".parse::<Conv>().unwrap());
+    let ((), changes) = shared
+        .store
+        .write(|tx| {
+            let row = tx.conv_by_name(account, &conv)?.unwrap();
+            tx.store_event(&row, &event(2, "from=~sam MSG #general hello"))?;
+            tx.outbox_sent(crate::store::OutboxId(entry.id), Seq::new(2).unwrap())
+        })
+        .unwrap();
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events: Vec::new(),
+    });
+    match next().await.as_slice() {
+        [
+            TimelineDiff::Insert { index: 1, item },
+            TimelineDiff::Remove { index: 2 },
+        ] => assert_eq!((item.seq, item.outbox.is_none()), (2, true)),
+        other => panic!("{other:?}"),
+    }
+
+    // Failed: updated in place, until the app removes it.
+    let entry = general.send("again").await.unwrap();
+    assert!(matches!(
+        next().await.as_slice(),
+        [TimelineDiff::Insert { index: 2, .. }]
+    ));
+    let ((), changes) = shared
+        .store
+        .write(|tx| tx.outbox_failed(crate::store::OutboxId(entry.id), FailReason::Unconfirmed))
+        .unwrap();
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events: Vec::new(),
+    });
+    match next().await.as_slice() {
+        [TimelineDiff::Update { index: 2, item }] => assert!(matches!(
+            item.outbox.as_ref().unwrap().status,
+            OutboxStatus::Failed {
+                kind: FailKind::Unconfirmed,
+                ..
+            }
+        )),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(timeline.items().len(), 3);
+    sam.remove_outbox(entry.id).unwrap();
+    assert!(matches!(
+        next().await.as_slice(),
+        [TimelineDiff::Remove { index: 2 }]
+    ));
+    assert_eq!(timeline.items().len(), 2);
+}
+
+#[test]
+fn reads_come_in_bounded_pages() {
+    let sam = guest();
+    let events: Vec<Event> = (1..=7)
+        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
+        .collect();
+    store_events(&sam, "#general", "k1", &events);
+    store_events(&sam, "#a", "k2", &[]);
+    store_events(&sam, "#b", "k3", &[]);
+    let general = sam.conversation("#general").unwrap();
+
+    // Messages, newest page first, then older ones by cursor.
+    let mut seqs = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = general.messages(cursor, 3).unwrap();
+        assert!(page.messages.len() <= 3);
+        let mut these: Vec<u64> = page.messages.iter().map(|m| m.seq).collect();
+        these.append(&mut seqs);
+        seqs = these;
+        match page.older {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seqs, [1, 2, 3, 4, 5, 6, 7]);
+    // A full last page says there is nothing older.
+    let page = general.messages(None, 7).unwrap();
+    assert_eq!((page.messages.len(), page.older), (7, None));
+    assert!(matches!(
+        general.messages(Some("bad".into()), 3),
+        Err(ClientError::Invalid(_))
+    ));
+
+    // Conversations, by name.
+    let first = sam.conversations(None, 2).unwrap();
+    let names: Vec<&str> = first
+        .conversations
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["#a", "#b"]);
+    let rest = sam.conversations(first.next, 2).unwrap();
+    let names: Vec<&str> = rest.conversations.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!((names, rest.next), (vec!["#general"], None));
+
+    // The library caps what one page may ask for.
+    let many: Vec<Event> = (8..=8 + u64::from(MAX_PAGE))
+        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
+        .collect();
+    store_events(&sam, "#general", "k1", &many);
+    let page = general.messages(None, u32::MAX).unwrap();
+    assert_eq!(page.messages.len(), MAX_PAGE as usize);
+    assert!(page.older.is_some());
+    assert_eq!(
+        general.messages(None, 0).unwrap().messages.len(),
+        DEFAULT_PAGE as usize
+    );
+}
+
+/// A key store whose `load` blocks until released, as a platform key
+/// store waiting for the user might.
+struct SlowKeys {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl crate::conn::keys::KeyStore for SlowKeys {
+    fn load(
+        &self,
+        _id: &str,
+    ) -> Result<Option<risala_proto::auth::SecretKey>, crate::conn::keys::KeyStoreError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let released = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20))
+            .is_ok();
+        self.released
+            .store(released, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+
+    fn save(
+        &self,
+        _id: &str,
+        _key: &risala_proto::auth::SecretKey,
+    ) -> Result<(), crate::conn::keys::KeyStoreError> {
+        Ok(())
+    }
+
+    fn delete(&self, _id: &str) -> Result<(), crate::conn::keys::KeyStoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn loading_a_key_does_not_block_the_runtime() {
+    // One worker thread: if load() ran on it, the task that releases it
+    // could not run until load() gave up.
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let keys = Arc::new(SlowKeys {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+        released: Default::default(),
+    });
+    let client = Client::open_in_memory(ClientOptions {
+        keys: Some(keys.clone()),
+        ..ClientOptions::default()
+    })
+    .unwrap();
+    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
+    tokio::spawn(async move {
+        entered.await.unwrap();
+        release.send(()).unwrap();
+    });
+    let err = alice.connect().await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ClientError::Keys {
+                kind: KeyErrorKind::NoKey,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(keys.released.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_notice_comes_after_the_changes_before_it() {
+    // 8.4: a NOTICE is reported in arrival order, after what the lines
+    // before it changed, even when they arrive together.
+    use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
+    let ca = TestCa::new();
+    let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, mut peer: Peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 GUEST sam").await;
+        peer.send("@ref=1 OK uid=~sam token=t1").await;
+        peer.expect("@ref=2 SYNC").await;
+        let t = Timestamp::from_unix_millis(1_800_000_000_001).unwrap();
+        peer.send(&format!(
+            "@ref=2 CONV #general k1 1 0\n@ref=2 OK\n\
+             @seq=1;t={t};from=~ann MSG #general hi\nNOTICE maintenance soon"
+        ))
+        .await;
+        while let Some(line) = peer.recv().await {
+            if let Some(r) = line.strip_suffix(" QUIT") {
+                peer.send(&format!("{r} OK")).await;
+                break;
+            }
+        }
+        peer.close().await;
+    })
+    .await;
+    let client = Client::open_in_memory(ClientOptions {
+        session: crate::conn::SessionOptions {
+            ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
+            connect_to: Some(server.addr),
+            ..crate::conn::SessionOptions::default()
+        },
+        ..ClientOptions::default()
+    })
+    .unwrap();
+    let sam = client.add_guest("chat.test", "sam").unwrap();
+    let events = sam.subscribe();
+    sam.start();
+    let mut stored = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("events")
+            .expect("not closed");
+        match event {
+            AccountEvent::MessagesChanged { conversation } if conversation == "#general" => {
+                stored = true;
+            }
+            AccountEvent::Notice {
+                notice: Notice::Server { text },
+            } => {
+                assert_eq!(text, "maintenance soon");
+                assert!(stored, "the NOTICE came before the message before it");
+                break;
+            }
+            _ => {}
+        }
+    }
+    sam.disconnect().await;
+    server.done().await;
 }

@@ -99,3 +99,49 @@ async fn restart_with_recreates_a_dropped_room() {
     assert_ne!(id_of(&line), old);
     server.stop().await;
 }
+
+#[tokio::test]
+async fn proxy_holds_back_what_the_server_sends() {
+    let server = TestServer::builder().room("#a").start().await;
+    let proxy = Proxy::start(server.addr()).await;
+    let mut sam = guest_via(&proxy, "sam").await;
+    let mut ann = server.guest("ann").await;
+    ann.send("join #a").await.unwrap();
+    assert!(ann.expect_line().await.unwrap().ends_with(" JOIN #a"));
+
+    // Held: the command reaches the server, its answer does not reach sam.
+    proxy.hold(true);
+    sam.send("join #a").await.unwrap();
+    loop {
+        let line = ann.expect_line().await.unwrap();
+        if line.contains("from=~sam") && line.ends_with(" JOIN #a") {
+            break;
+        }
+    }
+    // Released, the answer arrives in order.
+    proxy.hold(false);
+    assert!(sam.expect_line().await.unwrap().ends_with(" JOIN #a"));
+
+    // A cut while holding drops what was held.
+    proxy.hold(true);
+    sam.send("msg #a lost answer").await.unwrap();
+    loop {
+        if ann
+            .expect_line()
+            .await
+            .unwrap()
+            .ends_with(" MSG #a lost answer")
+        {
+            break;
+        }
+    }
+    proxy.cut();
+    let rest = sam.recv_until_closed().await.unwrap_or_default();
+    assert!(
+        rest.iter()
+            .all(|l| !l.contains("MSG #a lost answer") && !l.starts_with("OK seq=")),
+        "{rest:?}"
+    );
+    proxy.hold(false);
+    server.stop().await;
+}

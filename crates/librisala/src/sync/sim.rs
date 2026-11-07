@@ -211,6 +211,7 @@ impl World {
             clock: Clock::new(move || {
                 Timestamp::from_unix_millis(c.load(Ordering::SeqCst)).unwrap()
             }),
+            ..SyncConfig::default()
         };
         let server: ServerAddr = "chat.example.org".parse().unwrap();
         let shared = Store::open_in_memory().unwrap();

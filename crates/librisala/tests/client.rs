@@ -20,6 +20,7 @@ async fn wait_for_text(conv: &librisala::client::Conversation, text: &str) {
             let found = conv
                 .messages(None, 200)
                 .unwrap()
+                .messages
                 .iter()
                 .any(|m| m.text.as_deref() == Some(text));
             if found {
@@ -61,7 +62,13 @@ async fn trust_on_first_use() {
     client.forget_trust(&addr).unwrap();
     let other = "sha256:".to_owned() + &"0".repeat(64);
     client.accept_fingerprint(&addr, &other).unwrap();
-    assert!(client.accept_fingerprint(&addr, &fp).is_err());
+    assert_eq!(
+        client.accept_fingerprint(&addr, &fp).unwrap_err(),
+        ClientError::AlreadyTrusted {
+            server: addr.clone(),
+            recorded: other.clone(),
+        }
+    );
     match sam.connect().await.unwrap_err() {
         ClientError::CertificateMismatch {
             recorded,
@@ -105,6 +112,7 @@ async fn guest_joins_sends_and_receives() {
     let texts: Vec<_> = general
         .messages(None, 50)
         .unwrap()
+        .messages
         .into_iter()
         .map(|m| (m.from, m.kind, m.text))
         .collect();
@@ -142,13 +150,14 @@ async fn guest_joins_sends_and_receives() {
             break;
         }
     }
-    let mine = general.messages(None, 50).unwrap().pop().unwrap();
+    let mine = general.messages(None, 50).unwrap().messages.pop().unwrap();
     assert_eq!(mine.seq, seq);
     assert_eq!(mine.text.as_deref(), Some("hello ann\nsecond line"));
 
-    // The timeline saw all of it, in order.
+    // The timeline saw all of it, in order. The message may show as
+    // pending in the outbox first.
     let mut items = timeline.items();
-    while items.len() < 5 {
+    while items.len() < 5 || items.iter().any(|m| m.outbox.is_some()) {
         let diffs = within("timeline", timeline.next()).await.unwrap();
         for diff in diffs {
             match diff {
@@ -161,7 +170,7 @@ async fn guest_joins_sends_and_receives() {
             }
         }
     }
-    assert_eq!(items, general.messages(None, 50).unwrap());
+    assert_eq!(items, general.messages(None, 50).unwrap().messages);
     assert_eq!(items, timeline.items());
 
     // Parting keeps the history.
@@ -169,7 +178,7 @@ async fn guest_joins_sends_and_receives() {
     within("sync", sam.wait_synced()).await.unwrap();
     let info = general.info().unwrap().unwrap();
     assert!(!info.joined);
-    assert_eq!(general.messages(None, 50).unwrap().len(), 6);
+    assert_eq!(general.messages(None, 50).unwrap().messages.len(), 6);
     client.shutdown().await;
     server.stop().await;
 }
@@ -213,7 +222,9 @@ async fn reads_work_offline_after_the_server_stops() {
     assert_eq!(accounts.len(), 1);
     let sam = &accounts[0];
     assert_eq!(sam.state(), ConnectionState::Offline);
-    let convs = sam.conversations().unwrap();
+    let page = sam.conversations(None, 0).unwrap();
+    assert_eq!(page.next, None);
+    let convs = page.conversations;
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].name, "#general");
     assert!(convs[0].caught_up);
@@ -221,6 +232,7 @@ async fn reads_work_offline_after_the_server_stops() {
     let texts: Vec<String> = general
         .messages(None, 100)
         .unwrap()
+        .messages
         .into_iter()
         .filter(|m| m.kind == EventKind::Message)
         .filter_map(|m| m.text)
@@ -229,8 +241,11 @@ async fn reads_work_offline_after_the_server_stops() {
     assert_eq!(texts, expected);
     // Paging back through the cache.
     let newest = general.messages(None, 4).unwrap();
-    let older = general.messages(Some(newest[0].seq), 4).unwrap();
-    assert_eq!(older.last().unwrap().seq + 1, newest[0].seq);
+    let older = general.messages(newest.older.clone(), 4).unwrap();
+    assert_eq!(
+        older.messages.last().unwrap().seq + 1,
+        newest.messages[0].seq
+    );
     assert_eq!(general.export().unwrap().len(), 14);
     let outbox = general.outbox().unwrap();
     assert_eq!(outbox.len(), 1);
@@ -355,7 +370,7 @@ async fn a_room_dropped_and_created_again_is_not_mixed() {
     // Only the new room's events, the same as the server's.
     assert_eq!(a.export().unwrap(), server_history(&server, "#a").await);
     assert!(
-        a.messages(None, 50).unwrap().iter().all(|m| !m
+        a.messages(None, 50).unwrap().messages.iter().all(|m| !m
             .text
             .as_deref()
             .unwrap_or("")
@@ -498,6 +513,151 @@ async fn after_its_session_ends_a_guest_takes_a_numbered_name() {
     // the other sam's two are unread.
     assert_eq!(sam.uid(), "~sam");
     assert_eq!(a.info().unwrap().unwrap().unread, 2);
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// Waits until the account's connection has closed.
+async fn disconnected(events: &librisala::client::AccountEvents) {
+    within("disconnect", async {
+        loop {
+            if let AccountEvent::State {
+                state: ConnectionState::Disconnected { .. },
+            } = events.next().await.unwrap()
+            {
+                return;
+            }
+        }
+    })
+    .await;
+}
+
+/// Sends `text` as `sam` while the proxy holds back what the server
+/// sends, waits until `ann` sees the message stored, then cuts the
+/// connection: the server has the message, and sam never got its OK.
+async fn send_and_cut_before_the_ok(
+    proxy: &Proxy,
+    sam: &librisala::client::Account,
+    events: &librisala::client::AccountEvents,
+    ann: &mut risala_server::testing::TestClient,
+    text: &str,
+) -> i64 {
+    let a = sam.conversation("#a").unwrap();
+    proxy.hold(true);
+    let entry = a.send(text).await.unwrap();
+    within("the server storing it", async {
+        loop {
+            let line = ann.expect_line().await.unwrap();
+            if line.contains("from=~sam") && line.ends_with(&format!("MSG #a {text}")) {
+                return;
+            }
+        }
+    })
+    .await;
+    let pending = sam.outbox().unwrap();
+    assert_eq!(pending[0].status, OutboxStatus::Sending, "{pending:?}");
+    proxy.cut();
+    // Only once the old connection is gone may the server's bytes flow
+    // again, so the held OK is never delivered.
+    disconnected(events).await;
+    proxy.hold(false);
+    entry.id
+}
+
+/// 4.2, 7.6: a message whose OK was lost in a cut is sent again after the
+/// session resumes, with the same cid, and the server posts it once.
+#[tokio::test]
+async fn a_resumed_guest_resends_what_got_no_ok() {
+    let server = TestServer::builder().room("#a").start().await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (client, addr) = trusting_client(&server, proxy.addr(), 50);
+    let mut ann = guest_in(&server, "ann", "#a").await;
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    let events = sam.subscribe();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+
+    let id = send_and_cut_before_the_ok(&proxy, &sam, &events, &mut ann, "only once").await;
+    let entry = within("sent", sam.wait_outbox(id)).await.unwrap();
+    let OutboxStatus::Sent { seq } = entry.status else {
+        panic!("{entry:?}")
+    };
+    within("sync", sam.wait_synced()).await.unwrap();
+    // Exactly one message, and the resume recorded nothing.
+    assert_eq!(verbs_of(&server, "#a", "~sam").await, ["JOIN", "MSG"]);
+    let a = sam.conversation("#a").unwrap();
+    let mine: Vec<u64> = a
+        .messages(None, 50)
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| m.own && m.kind == EventKind::Message)
+        .map(|m| m.seq)
+        .collect();
+    assert_eq!(mine, [seq]);
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// 4.2, 7.6: once the session has ended, its cids are gone, so a message
+/// whose OK was lost is not sent again: it may have been posted.
+#[tokio::test]
+async fn a_guest_whose_session_ended_does_not_resend() {
+    let server = TestServer::builder()
+        .room("#a")
+        .guest_resume(Duration::from_millis(100))
+        .start()
+        .await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (client, addr) = trusting_client(&server, proxy.addr(), 50);
+    let mut ann = guest_in(&server, "ann", "#a").await;
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    let events = sam.subscribe();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+
+    proxy.hold(true);
+    let a = sam.conversation("#a").unwrap();
+    let entry = a.send("maybe once").await.unwrap();
+    within("the server storing it", async {
+        loop {
+            let line = ann.expect_line().await.unwrap();
+            if line.contains("from=~sam") && line.ends_with("MSG #a maybe once") {
+                return;
+            }
+        }
+    })
+    .await;
+    proxy.cut();
+    disconnected(&events).await;
+    // The session ends before sam comes back: the server records its PART.
+    within("the session ending", async {
+        while verbs_of(&server, "#a", "~sam").await != ["JOIN", "MSG", "PART"] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    proxy.hold(false);
+
+    let entry = within("settled", sam.wait_outbox(entry.id)).await.unwrap();
+    assert!(
+        matches!(
+            entry.status,
+            OutboxStatus::Failed {
+                maybe_sent: true,
+                ..
+            }
+        ),
+        "{entry:?}"
+    );
+    within("sync", sam.wait_synced()).await.unwrap();
+    // A new session: the room was joined again, and nothing was resent.
+    assert_eq!(
+        verbs_of(&server, "#a", "~sam").await,
+        ["JOIN", "MSG", "PART", "JOIN"]
+    );
     client.shutdown().await;
     server.stop().await;
 }

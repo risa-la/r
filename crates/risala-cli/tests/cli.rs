@@ -319,3 +319,89 @@ async fn several_accounts_need_as() {
     );
     server.stop().await;
 }
+
+/// Posts `n` messages as `c`, and waits for every OK.
+async fn post_many(c: &mut TestClient, room: &str, n: usize) {
+    let lines: String = (0..n).map(|i| format!("MSG {room} m{i}\n")).collect();
+    c.send_raw(lines.as_bytes()).await.unwrap();
+    for _ in 0..n {
+        wait_line(c, "OK seq=").await;
+    }
+}
+
+#[tokio::test]
+async fn trust_conflicts_permanent_failures_and_large_rooms() {
+    use risala_server::store::{EventKind, NewEvent, Store as _};
+    let server = TestServer::builder()
+        .room("#general")
+        .prepare(|store| {
+            let key = store
+                .room(&"#general".parse().unwrap())
+                .unwrap()
+                .unwrap()
+                .key;
+            for i in 0..450 {
+                let event = NewEvent {
+                    t: librisala::proto::time::Timestamp::now(),
+                    from: "carol@example.org".parse().unwrap(),
+                    kind: EventKind::Msg {
+                        relation: None,
+                        file: None,
+                        text: format!("old {i}"),
+                    },
+                    cid: None,
+                };
+                store.append(key, &event).unwrap();
+            }
+        })
+        .start()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let addr = format!("127.0.0.1:{}", server.addr().port());
+    let fp = server.fingerprint().to_string();
+    ok(state, &["trust", &addr, &fp]).await;
+    ok(state, &["guest", &addr, "sam"]).await;
+    ok(state, &["join", &addr, "#general"]).await;
+
+    // More than 1000 events stored: join counts them all.
+    let mut ann = ann_in(&server, "#general").await;
+    post_many(&mut ann, "#general", 450).await;
+    ok(state, &["sync"]).await;
+    post_many(&mut ann, "#general", 150).await;
+    ok(state, &["sync"]).await;
+    let stored = ok(state, &["export", &addr, "#general"])
+        .await
+        .lines()
+        .count();
+    assert!(stored > 1000, "{stored}");
+    let out = ok(state, &["join", &addr, "#general"]).await;
+    assert!(
+        out.contains(&format!("({stored} events stored)")),
+        "{out}, {stored}"
+    );
+
+    // Trusting a fingerprint over another record: not an attack, just a
+    // record in the way.
+    ok(state, &["untrust", &addr]).await;
+    let other = format!("sha256:{}", "0".repeat(64));
+    ok(state, &["trust", &addr, &other]).await;
+    let out = risala(state, &["trust", &addr, &fp]).await;
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("already trusted"), "{err}");
+    assert!(err.contains(&format!("risala untrust {addr}")), "{err}");
+    assert!(
+        !err.contains("attack") && !err.contains("Presented"),
+        "{err}"
+    );
+
+    // A send that cannot connect for good does not promise the next
+    // connection will do.
+    let out = risala(state, &["send", &addr, "#general", "stuck"]).await;
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("does not match"), "{err}");
+    assert!(err.contains("cannot be sent until that is fixed"), "{err}");
+    assert!(!err.contains("next connection"), "{err}");
+}

@@ -1016,7 +1016,7 @@ async fn a_guest_resumes_after_its_connection_drops() {
 
     let (sam, ok) = guest_via(&proxy, "sam", Some(&token)).await;
     let new_token = value(&ok, "token");
-    assert_eq!(ok, format!("OK uid=~sam token={new_token}"));
+    assert_eq!(ok, format!("OK uid=~sam token={new_token} resumed=yes"));
     assert_ne!(new_token, token);
     s.add("sam", sam);
     s.play(
