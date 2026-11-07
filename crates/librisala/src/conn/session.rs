@@ -275,7 +275,7 @@ impl Session {
     ) -> Result<Session, Error> {
         let ca = match &options.ca_verifier {
             Some(ca) => ca.clone(),
-            None => tls::platform_ca_verifier(),
+            None => tls::platform_ca_verifier_blocking().await,
         };
         let (stream, verified) = tls::connect(addr, &trust, ca, options.connect_to).await?;
         let (mut rd, wr) = tokio::io::split(stream);

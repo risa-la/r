@@ -375,7 +375,7 @@ impl Run {
 
     async fn run_inner(&mut self) -> Result<(), Stop> {
         if self.options.ca_verifier.is_none() {
-            self.options.ca_verifier = Some(tls::platform_ca_verifier());
+            self.options.ca_verifier = Some(tls::platform_ca_verifier_blocking().await);
         }
         let mut failures: u32 = 0;
         loop {

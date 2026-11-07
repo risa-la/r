@@ -2,7 +2,7 @@
 //! the timeline's diffs and input checks. The end-to-end tests are in
 //! `tests/client.rs` and `tests/cuts.rs`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use risala_proto::names::{Conv, Seq};
@@ -663,4 +663,79 @@ fn reads_come_in_bounded_pages() {
         general.messages(None, 0).unwrap().messages.len(),
         DEFAULT_PAGE as usize
     );
+}
+
+/// A key store whose `load` blocks until released, as a platform key
+/// store waiting for the user might.
+struct SlowKeys {
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl crate::conn::keys::KeyStore for SlowKeys {
+    fn load(
+        &self,
+        _id: &str,
+    ) -> Result<Option<risala_proto::auth::SecretKey>, crate::conn::keys::KeyStoreError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let released = self
+            .release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20))
+            .is_ok();
+        self.released
+            .store(released, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+
+    fn save(
+        &self,
+        _id: &str,
+        _key: &risala_proto::auth::SecretKey,
+    ) -> Result<(), crate::conn::keys::KeyStoreError> {
+        Ok(())
+    }
+
+    fn delete(&self, _id: &str) -> Result<(), crate::conn::keys::KeyStoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn loading_a_key_does_not_block_the_runtime() {
+    // One worker thread: if load() ran on it, the task that releases it
+    // could not run until load() gave up.
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let keys = Arc::new(SlowKeys {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+        released: Default::default(),
+    });
+    let client = Client::open_in_memory(ClientOptions {
+        keys: Some(keys.clone()),
+        ..ClientOptions::default()
+    })
+    .unwrap();
+    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
+    tokio::spawn(async move {
+        entered.await.unwrap();
+        release.send(()).unwrap();
+    });
+    let err = alice.connect().await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ClientError::Keys {
+                kind: KeyErrorKind::NoKey,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(keys.released.load(std::sync::atomic::Ordering::SeqCst));
 }

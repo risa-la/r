@@ -96,7 +96,11 @@ async fn drive(
     } else {
         None
     };
-    let sign_in = match sign_in_for(shared, guest_token.clone()) {
+    // Loading a key may block (a platform key store, a file), so it runs
+    // off the async workers.
+    let (s, token) = (shared.clone(), guest_token.clone());
+    let sign_in = blocking(&shared.rt, move || sign_in_for(&s, token)).await;
+    let sign_in = match sign_in {
         Ok(s) => s,
         Err(error) => {
             shared.set_state(ConnectionState::Failed { error });
