@@ -40,7 +40,7 @@ risala/
 │   ├── librisala-ffi/     UniFFI bindings for Kotlin and Swift
 │   ├── risala-cli/        small terminal client and key tool built on librisala
 │   └── risala-conformance/  black-box tests that can run against any server
-├── apps/
+├── clients/
 │   ├── gnome/             Rust, gtk4-rs, libadwaita
 │   ├── apple/             Swift, SwiftUI (macOS and iOS)
 │   └── android/           Kotlin, Jetpack Compose
