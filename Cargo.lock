@@ -1275,10 +1275,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "librisala",
+ "rcgen",
  "risala-proto",
  "risala-server",
+ "rustls",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

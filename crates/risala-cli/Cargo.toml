@@ -22,6 +22,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
 risala-server = { path = "../risala-server" }
 
 [lints]

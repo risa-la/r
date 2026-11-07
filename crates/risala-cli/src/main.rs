@@ -7,6 +7,15 @@
 //! connection. A guest resumes its session on each run (4.2), so running
 //! commands one after another adds no JOIN or PART to its rooms. Once its
 //! session has ended, its rooms are joined again.
+//!
+//! Identities (4.3) sign in with this device's key, kept in `keys/` under
+//! the identity: `login` adds one (making a key or importing a PEM file),
+//! `register` creates one on a server that hosts identities, `keys`
+//! manages a hosted identity's keys and `unregister` deletes one.
+//!
+//! Exit codes: 0 done, 1 failed, 2 bad arguments, 3 needs you to act
+//! first: the server refused (a key it does not accept, a name taken,
+//! registration closed), or a certificate or key needs your decision.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,15 +25,21 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use librisala::client::{
     Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, EventKind,
-    Message, OutboxStatus, TimelineDiff, TrustInfo,
+    KeyErrorKind, KeyInfo, Message, OutboxStatus, RefusedKind, TimelineDiff, TrustInfo,
 };
-use librisala::conn::keys::{FileKeyStore, KeyStore, generate_device_key, key_line};
+use librisala::conn::keys::FileKeyStore;
 
 /// How long to wait for a server before giving up.
 const WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
-#[command(name = "risala", version, about = "A small terminal client for risala")]
+#[command(
+    name = "risala",
+    version,
+    about = "A small terminal client for risala",
+    after_help = "Exit codes: 0 done, 1 failed, 2 bad arguments, 3 needs you to act first \
+                  (the server refused, or a certificate or key needs your decision)."
+)]
 struct Cli {
     /// The state directory: cache, trust records and keys.
     #[arg(long, global = true, value_name = "DIR")]
@@ -94,6 +109,53 @@ enum Command {
     /// Chat in a room: shows messages as they arrive, and sends each line
     /// typed. /quit leaves.
     Chat { server: String, room: String },
+    /// Register a new identity, <name>@<domain>, on a server that hosts
+    /// identities, and add it as an account. Prints the uid and this device's
+    /// key file line.
+    Register {
+        server: String,
+        /// The name, the part before the @.
+        name: String,
+        /// A label for the key file line, usually the device's name.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Add an identity account, such as alice@example.org, and sign in.
+    /// Without a key for it, makes one and prints its key file line to
+    /// publish first.
+    Login {
+        server: String,
+        identity: String,
+        /// Use this private key (PEM PKCS#8 ML-DSA-44, as openssl genpkey
+        /// writes it) as the device key.
+        #[arg(long, value_name = "PEM_FILE")]
+        key: Option<PathBuf>,
+        /// Replace a different device key already stored for the identity.
+        #[arg(long)]
+        force: bool,
+        /// A label for the key file line, usually the device's name.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Manage the keys of an identity the server hosts (4.7).
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommand,
+    },
+    /// Delete your identity from a server, with what the server keeps
+    /// about it, then the account and its cache here (4.8). Type the uid
+    /// out to confirm.
+    Unregister {
+        server: String,
+        /// The identity to delete, typed out in full.
+        uid: String,
+        /// Also delete every message the identity sent.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Show the accounts, on one server or all of them, and their device
+    /// keys.
+    Whoami { server: Option<String> },
     /// Generate a device key for an identity, such as alice@example.org,
     /// and print the line to add to its key file (4.4).
     Keygen {
@@ -114,8 +176,47 @@ enum Command {
     },
 }
 
-/// A failure, already explained to the user.
-struct Failed;
+#[derive(Subcommand)]
+enum KeysCommand {
+    /// List the identity's keys.
+    List {
+        server: String,
+        /// Print each key's full key file line.
+        #[arg(long)]
+        lines: bool,
+    },
+    /// Add another device's key, so that it can sign in. Paste the line
+    /// it shows (risala keyline on that device), or its key alone.
+    Add {
+        server: String,
+        /// The key file line or key; the words are joined with spaces.
+        #[arg(required = true)]
+        key: Vec<String>,
+        /// A label for the key, usually the device's name, instead of the
+        /// line's own.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove a key, given as a key file line, a key, or a fingerprint
+    /// (sha256:...) from keys list.
+    Del {
+        server: String,
+        /// The key file line, key or fingerprint.
+        #[arg(required = true)]
+        key: Vec<String>,
+    },
+}
+
+/// A failure, already explained to the user, with the exit code.
+struct Failed(u8);
+
+/// Something failed.
+const FAILED: u8 = 1;
+/// The arguments are wrong.
+const USAGE: u8 = 2;
+/// The user must act first: the server refused, or a certificate or key
+/// needs a decision.
+const ACT: u8 = 3;
 
 type Res<T = ()> = Result<T, Failed>;
 
@@ -137,13 +238,34 @@ fn main() -> ExitCode {
         .expect("starting the runtime");
     match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(Failed) => ExitCode::FAILURE,
+        Err(Failed(code)) => ExitCode::from(code),
     }
 }
 
 fn fail<T>(message: impl std::fmt::Display) -> Res<T> {
+    fail_with(FAILED, message)
+}
+
+fn fail_with<T>(code: u8, message: impl std::fmt::Display) -> Res<T> {
     eprintln!("risala: {message}");
-    Err(Failed)
+    Err(Failed(code))
+}
+
+/// The exit code for an error.
+fn exit_code(e: &ClientError) -> u8 {
+    match e {
+        ClientError::Invalid(_)
+        | ClientError::Keys {
+            kind: KeyErrorKind::BadKey,
+            ..
+        } => USAGE,
+        ClientError::UnknownCertificate { .. }
+        | ClientError::CertificateMismatch { .. }
+        | ClientError::AlreadyTrusted { .. }
+        | ClientError::Refused { .. }
+        | ClientError::Keys { .. } => ACT,
+        _ => FAILED,
+    }
 }
 
 /// Explains a client error, with what to do about trust errors (2.2).
@@ -162,13 +284,13 @@ fn explain<T>(e: ClientError) -> Res<T> {
             eprintln!("Check it with the server's operator. If it matches, trust it with:");
             eprintln!();
             eprintln!("    risala trust {server} {fingerprint}");
-            Err(Failed)
+            Err(Failed(ACT))
         }
         ClientError::AlreadyTrusted { server, recorded } => {
             eprintln!("risala: {server} is already trusted, with {recorded}.");
             eprintln!("If its operator confirms a new certificate, remove the record first:");
             eprintln!("    risala untrust {server}");
-            Err(Failed)
+            Err(Failed(ACT))
         }
         ClientError::CertificateMismatch {
             server,
@@ -181,9 +303,32 @@ fn explain<T>(e: ClientError) -> Res<T> {
             eprintln!("Presented: {presented}");
             eprintln!("This may be an attack. If the operator confirms the change, run:");
             eprintln!("    risala untrust {server}");
-            Err(Failed)
+            Err(Failed(ACT))
         }
-        _ => fail(e),
+        ClientError::Refused {
+            kind,
+            message,
+            retry_after_secs,
+        } => {
+            let why = match kind {
+                RefusedKind::NameTaken => "that name is taken; pick another".to_owned(),
+                RefusedKind::NoRegistration => "the server does not offer registration".to_owned(),
+                RefusedKind::NoHostname => {
+                    "an identity needs the server's hostname, not an IP address (2.1)".to_owned()
+                }
+                RefusedKind::LastKey => {
+                    "the server keeps at least one key; add another before removing this one"
+                        .to_owned()
+                }
+                RefusedKind::Guest => "a guest has no keys and nothing to delete".to_owned(),
+                _ => message.clone(),
+            };
+            match retry_after_secs {
+                Some(secs) => fail_with(ACT, format!("{why}; try again in {secs} seconds")),
+                None => fail_with(ACT, why),
+            }
+        }
+        _ => fail_with(exit_code(&e), e),
     }
 }
 
@@ -204,7 +349,6 @@ fn state_dir(arg: Option<PathBuf>) -> Res<PathBuf> {
 
 struct Ctx {
     client: Client,
-    keys_dir: PathBuf,
     account: Option<String>,
 }
 
@@ -218,11 +362,7 @@ fn open(dir: &Path, account: Option<String>) -> Res<Ctx> {
         ..ClientOptions::default()
     };
     match Client::open(&dir.join("cache.db"), options) {
-        Ok(client) => Ok(Ctx {
-            client,
-            keys_dir,
-            account,
-        }),
+        Ok(client) => Ok(Ctx { client, account }),
         Err(e) => fail(format!("opening the cache in {}: {e}", dir.display())),
     }
 }
@@ -264,7 +404,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         Command::Untrust { server } => client.forget_trust(&server).or_else(explain),
         Command::Guest { server, name } => {
             let account = client.add_guest(&server, &name).or_else(explain)?;
-            let uid = connect(&account).await?;
+            let uid = connect(ctx, &account).await?;
             println!("signed in to {} as {uid}", account.server());
             Ok(())
         }
@@ -288,7 +428,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 // parting offline still stops the room being joined again.
                 let _ = tokio::time::timeout(WAIT, account.connect()).await;
             } else {
-                connect(&account).await?;
+                connect(ctx, &account).await?;
             }
             within(async {
                 match account.part(&room, &reason.join(" ")).await {
@@ -396,7 +536,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             }
             let mut failed = false;
             for account in accounts {
-                if connect(&account).await.is_err() {
+                if connect(ctx, &account).await.is_err() {
                     failed = true;
                     continue;
                 }
@@ -410,7 +550,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 }
                 account.disconnect().await;
             }
-            if failed { Err(Failed) } else { Ok(()) }
+            if failed { Err(Failed(FAILED)) } else { Ok(()) }
         }
         Command::Export {
             server,
@@ -419,12 +559,12 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         } => {
             let account = pick(ctx, &server)?;
             let conv = account.conversation(&conversation).or_else(explain)?;
-            match connect(&account).await {
+            match connect(ctx, &account).await {
                 Ok(_) => {
                     within(conv.download()).await?;
                     within(account.wait_synced()).await?;
                 }
-                Err(Failed) => eprintln!("risala: offline; exporting what the cache has"),
+                Err(Failed(_)) => eprintln!("risala: offline; exporting what the cache has"),
             }
             let lines = conv.export().or_else(explain)?;
             let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
@@ -446,65 +586,279 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             Ok(())
         }
         Command::Chat { server, room } => chat(ctx, &server, &room).await,
+        Command::Register {
+            server,
+            name,
+            label,
+        } => {
+            let account = within(client.register(&server, &name)).await?;
+            let uid = account.uid();
+            let line = client
+                .key_line(&uid, label.as_deref().unwrap_or(""))
+                .or_else(explain)?;
+            println!("{uid}");
+            println!("{line}");
+            eprintln!("risala: registered {uid} on {}", account.server());
+            eprintln!(
+                "risala: the server publishes its key file; to add another device, show its \
+                 key line there and run risala keys add {} <line> here",
+                account.server()
+            );
+            Ok(())
+        }
+        Command::Login {
+            server,
+            identity,
+            key,
+            force,
+            label,
+        } => login(ctx, &server, &identity, key, force, label.as_deref()).await,
+        Command::Keys { command } => keys(ctx, command).await,
+        Command::Unregister { server, uid, purge } => {
+            let Some(account) = client.account(&server, &uid).or_else(explain)? else {
+                return fail(format!(
+                    "no account {} on {server}; risala whoami lists them",
+                    uid.trim()
+                ));
+            };
+            let done = within(account.unregister(&uid, purge)).await?;
+            println!("deleted {} from {server}", done.uid);
+            eprintln!("risala: removed the account and its cache");
+            if done.key_deleted {
+                eprintln!("risala: deleted this device's key, which the server no longer lists");
+            } else if !done.hosted {
+                eprintln!(
+                    "risala: kept this device's key: {} is not hosted by {server}, and its \
+                     key file still lists the key",
+                    done.uid
+                );
+            }
+            Ok(())
+        }
+        Command::Whoami { server } => {
+            let accounts: Vec<Account> = match &server {
+                Some(server) => {
+                    let wanted = server_name(server)?;
+                    client
+                        .accounts()
+                        .or_else(explain)?
+                        .into_iter()
+                        .filter(|a| a.server() == wanted)
+                        .collect()
+                }
+                None => client.accounts().or_else(explain)?,
+            };
+            if accounts.is_empty() {
+                return fail(
+                    "no accounts; add one with risala guest, risala login or risala register",
+                );
+            }
+            for account in accounts {
+                let what = if account.is_guest() {
+                    "guest".to_owned()
+                } else {
+                    match account.device_key().or_else(explain)? {
+                        Some(key) => format!("key {}", key.fingerprint),
+                        None => "no device key".to_owned(),
+                    }
+                };
+                println!("{} on {} ({what})", account.uid(), account.server());
+            }
+            Ok(())
+        }
         Command::Keygen {
             identity,
             label,
             force,
         } => {
-            let keys = key_store(ctx, &identity)?;
-            match keys.load(&identity) {
-                Ok(Some(_)) if !force => {
-                    return fail(format!(
-                        "a key for {identity} exists; pass --force to replace it"
-                    ));
-                }
-                Ok(_) => {}
-                Err(e) => return fail(e),
-            }
-            let key = match generate_device_key() {
+            let key = match within(client.create_device_key(&identity, force)).await {
                 Ok(key) => key,
-                Err(e) => return fail(format!("generating a key: {e}")),
+                Err(failed) => {
+                    if !force && matches!(client.device_key(&identity), Ok(Some(_))) {
+                        eprintln!("risala: pass --force to replace it");
+                    }
+                    return Err(failed);
+                }
             };
-            if let Err(e) = keys.save(&identity, &key) {
-                return fail(e);
-            }
-            print_key_line(&key.public_key(), label.as_deref())?;
-            eprintln!("risala: add this line to the key file of {identity} (4.4)");
+            let line = client
+                .key_line(&key.identity, label.as_deref().unwrap_or(""))
+                .or_else(explain)?;
+            println!("{line}");
+            let url = client.key_file_url(&key.identity).or_else(explain)?;
+            eprintln!(
+                "risala: add this line to the key file of {} at {url} (4.4)",
+                key.identity
+            );
             Ok(())
         }
         Command::Keyline { identity, label } => {
-            let keys = key_store(ctx, &identity)?;
-            match keys.load(&identity) {
-                Ok(Some(key)) => print_key_line(&key.public_key(), label.as_deref()),
-                Ok(None) => fail(format!(
-                    "no key for {identity}; make one with risala keygen {identity}"
-                )),
-                Err(e) => fail(e),
+            match client.key_line(&identity, label.as_deref().unwrap_or("")) {
+                Ok(line) => {
+                    println!("{line}");
+                    Ok(())
+                }
+                Err(ClientError::Keys {
+                    kind: KeyErrorKind::NoKey,
+                    ..
+                }) => fail_with(
+                    ACT,
+                    format!("no key for {identity}; make one with risala keygen {identity}"),
+                ),
+                Err(e) => explain(e),
             }
         }
     }
 }
 
-fn key_store(ctx: &Ctx, identity: &str) -> Res<FileKeyStore> {
-    if identity
-        .parse::<librisala::proto::names::Identity>()
-        .is_err()
-    {
-        return fail(format!(
-            "{identity:?} is not an identity like alice@example.org"
-        ));
+/// The server address as the client shows it, or a usage error.
+fn server_name(server: &str) -> Res<String> {
+    match server.parse::<librisala::addr::ServerAddr>() {
+        Ok(addr) => Ok(addr.to_string()),
+        Err(_) => fail_with(USAGE, format!("invalid server address {server:?}")),
     }
-    Ok(FileKeyStore::new(&ctx.keys_dir))
 }
 
-fn print_key_line(key: &librisala::proto::auth::PublicKey, label: Option<&str>) -> Res {
-    match key_line(key, label) {
-        Ok(line) => {
-            println!("{line}");
+/// `risala login`: adds the identity account, with a key made or
+/// imported, and signs in unless the key is new.
+async fn login(
+    ctx: &Ctx,
+    server: &str,
+    identity: &str,
+    pem_file: Option<PathBuf>,
+    force: bool,
+    label: Option<&str>,
+) -> Res {
+    let client = &ctx.client;
+    let mut new_key = false;
+    match pem_file {
+        Some(path) => {
+            let pem = match std::fs::read_to_string(&path) {
+                Ok(pem) => pem,
+                Err(e) => return fail(format!("reading {}: {e}", path.display())),
+            };
+            match within(client.import_device_key(identity, &pem, force)).await {
+                Ok(_) => {}
+                Err(Failed(code)) => {
+                    if code == ACT {
+                        eprintln!("risala: pass --force to replace the key stored for {identity}");
+                    }
+                    return Err(Failed(code));
+                }
+            }
+        }
+        None => {
+            if client.device_key(identity).or_else(explain)?.is_none() {
+                within(client.create_device_key(identity, false)).await?;
+                new_key = true;
+            }
+        }
+    }
+    let account = client.add_identity(server, identity).or_else(explain)?;
+    if new_key {
+        let uid = account.uid();
+        println!("{}", key_line_of(ctx, &uid, label)?);
+        eprintln!("risala: made a new key for {uid} on this device.");
+        how_to_publish(ctx, &account)?;
+        eprintln!("Then sign in with:");
+        eprintln!("    risala login {} {uid}", account.server());
+        return Err(Failed(ACT));
+    }
+    let uid = connect(ctx, &account).await?;
+    println!("signed in to {} as {uid}", account.server());
+    Ok(())
+}
+
+fn key_line_of(ctx: &Ctx, uid: &str, label: Option<&str>) -> Res<String> {
+    ctx.client
+        .key_line(uid, label.unwrap_or(""))
+        .or_else(explain)
+}
+
+/// Tells the user how to get this device's key accepted.
+fn how_to_publish(ctx: &Ctx, account: &Account) -> Res {
+    let uid = account.uid();
+    let url = ctx.client.key_file_url(&uid).or_else(explain)?;
+    let server = account.server();
+    eprintln!("Before it can sign in, the identity's key file must list the key line above:");
+    eprintln!("  - add the line to {url}, or");
+    eprintln!("  - if {server} hosts {uid}, add it from a device that is signed in:");
+    eprintln!("        risala keys add {server} <the line>");
+    Ok(())
+}
+
+/// `risala keys ...`.
+async fn keys(ctx: &Ctx, command: KeysCommand) -> Res {
+    match command {
+        KeysCommand::List { server, lines } => {
+            let account = identity_online(ctx, &server).await?;
+            let keys = within(account.keys()).await?;
+            for key in &keys {
+                if lines {
+                    let line = if key.label.is_empty() {
+                        format!("mldsa44 {}", key.public_key)
+                    } else {
+                        format!("mldsa44 {} {}", key.public_key, key.label)
+                    };
+                    println!("{line}");
+                } else {
+                    println!("{}", show_key(key));
+                }
+            }
             Ok(())
         }
-        Err(e) => fail(format!("bad label: {e}")),
+        KeysCommand::Add { server, key, label } => {
+            let account = identity_online(ctx, &server).await?;
+            let added =
+                within(account.add_key(&key.join(" "), label.as_deref().unwrap_or(""))).await?;
+            println!("added {} to {}", show_key(&added), account.uid());
+            Ok(())
+        }
+        KeysCommand::Del { server, key } => {
+            let account = identity_online(ctx, &server).await?;
+            let key = key.join(" ");
+            let key = if key.trim().starts_with("sha256:") {
+                let wanted = key.trim();
+                let keys = within(account.keys()).await?;
+                match keys.into_iter().find(|k| k.fingerprint == wanted) {
+                    Some(k) => k.public_key,
+                    None => {
+                        return fail_with(USAGE, format!("{} has no key {wanted}", account.uid()));
+                    }
+                }
+            } else {
+                key
+            };
+            within(account.remove_key(&key)).await?;
+            println!("removed the key from {}", account.uid());
+            Ok(())
+        }
     }
+}
+
+/// One line for a key: its fingerprint and label.
+fn show_key(key: &KeyInfo) -> String {
+    let mut s = key.fingerprint.clone();
+    if !key.label.is_empty() {
+        s.push(' ');
+        s.push_str(&key.label);
+    }
+    if key.this_device {
+        s.push_str(" (this device)");
+    }
+    s
+}
+
+/// The identity account on `server`, signed in.
+async fn identity_online(ctx: &Ctx, server: &str) -> Res<Account> {
+    let account = pick(ctx, server)?;
+    if account.is_guest() {
+        return fail_with(
+            USAGE,
+            format!("{} is a guest, which has no keys", account.uid()),
+        );
+    }
+    connect(ctx, &account).await?;
+    Ok(account)
 }
 
 /// Waits for a server, at most [`WAIT`].
@@ -524,10 +878,7 @@ fn pick(ctx: &Ctx, server: &str) -> Res<Account> {
             None => fail(format!("no account {uid} on {server}")),
         };
     }
-    let wanted = match server.parse::<librisala::addr::ServerAddr>() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => return fail(format!("invalid server address {server:?}")),
-    };
+    let wanted = server_name(server)?;
     let mut on: Vec<Account> = client
         .accounts()
         .or_else(explain)?
@@ -536,7 +887,7 @@ fn pick(ctx: &Ctx, server: &str) -> Res<Account> {
         .collect();
     match on.len() {
         0 => fail(format!(
-            "no account on {server}; add one with risala guest {server} <name>"
+            "no account on {server}; add one with risala guest, risala login or risala register"
         )),
         1 => Ok(on.remove(0)),
         _ => {
@@ -550,14 +901,58 @@ fn pick(ctx: &Ctx, server: &str) -> Res<Account> {
 }
 
 /// Connects an account and waits until it has signed in.
-async fn connect(account: &Account) -> Res<String> {
-    within(account.connect()).await
+///
+/// librisala tries once more after an identity's first `auth-failed`
+/// (4.4), so that is waited for. If the key is still refused, this says
+/// how to publish it.
+async fn connect(ctx: &Ctx, account: &Account) -> Res<String> {
+    let signed_in = async {
+        match account.connect().await {
+            Err(ClientError::Refused {
+                kind: RefusedKind::AuthFailed,
+                ..
+            }) => {
+                account.wait_synced().await?;
+                Ok(uid_of(account))
+            }
+            other => other,
+        }
+    };
+    let result = match tokio::time::timeout(WAIT, signed_in).await {
+        Ok(result) => result,
+        Err(_) => return fail("timed out waiting for the server"),
+    };
+    match result {
+        Ok(uid) => Ok(uid),
+        Err(ClientError::Refused {
+            kind: RefusedKind::AuthFailed,
+            ..
+        }) => {
+            let uid = account.uid();
+            eprintln!(
+                "risala: {} did not accept this device's key for {uid}.",
+                account.server()
+            );
+            match ctx.client.key_line(&uid, "") {
+                Ok(line) => {
+                    eprintln!("This device's key line is:");
+                    eprintln!();
+                    eprintln!("{line}");
+                    eprintln!();
+                }
+                Err(e) => eprintln!("risala: {e}"),
+            }
+            how_to_publish(ctx, account)?;
+            Err(Failed(ACT))
+        }
+        Err(e) => explain(e),
+    }
 }
 
 /// The account on `server`, signed in.
 async fn online(ctx: &Ctx, server: &str) -> Res<Account> {
     let account = pick(ctx, server)?;
-    connect(&account).await?;
+    connect(ctx, &account).await?;
     Ok(account)
 }
 
