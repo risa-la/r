@@ -225,13 +225,14 @@ async fn people_from_end_to_end() {
 
     // 8.3.
     let members = within(general.members()).await.unwrap();
-    let shown: Vec<(&str, &str, &str, Presence)> = members
+    let shown: Vec<(&str, &str, &str, Option<&str>, Presence)> = members
         .iter()
         .map(|m| {
             (
                 m.uid.as_str(),
                 m.role.as_str(),
-                m.label.as_str(),
+                m.label.name.as_str(),
+                m.label.uid.as_deref(),
                 m.presence,
             )
         })
@@ -239,35 +240,43 @@ async fn people_from_end_to_end() {
     assert_eq!(
         shown,
         [
-            ("alice@example.org", "owner", "Alice", Presence::Online),
+            (
+                "alice@example.org",
+                "owner",
+                "Alice",
+                None,
+                Presence::Online
+            ),
             (
                 "bob@example.net",
                 "member",
-                "Bob (bob@example.net)",
+                "Bob",
+                Some("bob@example.net"),
                 Presence::Online
             ),
             (
                 "bob@example.org",
                 "mod",
-                "bob (bob@example.org)",
+                "bob",
+                Some("bob@example.org"),
                 Presence::Offline
             ),
-            ("~sam", "member", "~sam", Presence::Online),
+            ("~sam", "member", "~sam", None, Presence::Online),
         ]
     );
     let cached: Vec<String> = general
         .cached_members()
         .unwrap()
         .iter()
-        .map(|m| format!("{} {} {}", m.uid, m.role, m.label))
+        .map(|m| format!("{} {} {:?} {:?}", m.uid, m.role, m.label.name, m.label.uid))
         .collect();
     assert_eq!(
         cached,
         [
-            "alice@example.org owner Alice",
-            "bob@example.net member Bob (bob@example.net)",
-            "bob@example.org mod bob (bob@example.org)",
-            "~sam member ~sam",
+            r#"alice@example.org owner "Alice" None"#,
+            r#"bob@example.net member "Bob" Some("bob@example.net")"#,
+            r#"bob@example.org mod "bob" Some("bob@example.org")"#,
+            r#"~sam member "~sam" None"#,
         ]
     );
     let bob = until(&events, |e| match e {
@@ -317,8 +326,15 @@ async fn people_from_end_to_end() {
     assert_eq!(
         general
             .labels(vec!["bob@example.net".into(), "~sam".into(), ALICE.into()])
-            .unwrap(),
-        ["Robert", "~sam", "Alice M"]
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.name, l.uid))
+            .collect::<Vec<_>>(),
+        [
+            ("Robert".to_owned(), None),
+            ("~sam".to_owned(), None),
+            ("Alice M".to_owned(), None)
+        ]
     );
     assert!(matches!(
         alice.set_display_name(&"x".repeat(129)).await,

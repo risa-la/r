@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
 use super::account::{Account, AccountShared, Cmd, Conversation, PeopleOp, wait};
 use super::blocking;
 use super::driver::publish_changes;
-use super::types::{ClientError, MemberInfo, Presence, RefusedKind, UserInfo};
+use super::types::{ClientError, Label, MemberInfo, Presence, RefusedKind, UserInfo};
 use crate::store::StoreError;
 
 #[cfg(doc)]
@@ -55,12 +55,39 @@ fn parse_target(target: &str) -> Result<BlockTarget, ClientError> {
         .map_err(|_| ClientError::Invalid(format!("block target {target:?}")))
 }
 
+/// Whether `c` is a bidirectional text control (8.2): U+061C, U+200E,
+/// U+200F, U+202A to U+202E or U+2066 to U+2069. They can make one name
+/// look like another, or make what follows a name look like part of it.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// A display name, unescaped, as it is shown and compared (8.2): without
+/// bidirectional text controls, and with each run of white space, line
+/// breaks included, as one space, with none at either end.
+pub(crate) fn clean_name(name: &str) -> String {
+    let without: String = name.chars().filter(|&c| !is_bidi_control(c)).collect();
+    without.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// A display name as stored (escaped, `''` for none) for the API:
-/// unescaped, `None` if empty.
+/// unescaped and cleaned ([`clean_name`]), `None` if empty.
 fn shown_name(escaped: Option<&str>) -> Option<String> {
     escaped
+        .map(|n| clean_name(&unescape(n)))
         .filter(|n| !n.is_empty())
-        .map(|n| unescape(n).into_owned())
+}
+
+/// Whether a cleaned display name contains `@`, or otherwise looks like a
+/// uid (8.2): it has a full-width or small `@`, or starts with `~` as a
+/// guest's uid does.
+fn looks_like_uid(name: &str) -> bool {
+    name.contains(['@', '\u{FF20}', '\u{FE6B}'])
+        || name.starts_with(['~', '\u{FF5E}'])
+        || name.parse::<Uid>().is_ok()
 }
 
 /// What the account knows about `uid`: its name from the cache, and its
@@ -75,41 +102,33 @@ pub(crate) fn user_info(shared: &AccountShared, uid: &Uid) -> Result<UserInfo, S
     })
 }
 
-/// The label to show for each of `people`, uids with their display names,
-/// who are in one conversation (8.2):
-///
-/// - the display name, if nobody else among them has the same one;
-/// - `name (uid)` if somebody does, comparing names without case and
-///   surrounding space, or if the name looks like a different uid;
-/// - the uid, for someone with no display name.
-///
-/// Runs of white space in names, line breaks included, show as one space.
-pub(crate) fn labels(people: &[(Uid, Option<String>)]) -> Vec<String> {
-    let key = |name: &str| {
-        name.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    };
+/// The label for each of `people`, uids with their display names as
+/// [`shown_name`] gives them, who are in one conversation (8.2). The uid
+/// is shown apart from the name when someone else among them has the same
+/// name, compared ignoring case, or the name looks like a uid. Someone
+/// with no display name is shown by their uid.
+pub(crate) fn labels(people: &[(Uid, Option<String>)]) -> Vec<Label> {
+    // Names are cleaned already: compare them ignoring case.
+    let key = |name: &str| name.to_lowercase();
     let mut owners: HashMap<String, HashSet<&Uid>> = HashMap::new();
     for (uid, name) in people {
-        if let Some(name) = name.as_deref().filter(|n| !key(n).is_empty()) {
+        if let Some(name) = name.as_deref().filter(|n| !n.is_empty()) {
             owners.entry(key(name)).or_default().insert(uid);
         }
     }
     people
         .iter()
         .map(|(uid, name)| {
-            let Some(name) = name.as_deref().filter(|n| !key(n).is_empty()) else {
-                return uid.to_string();
+            let Some(name) = name.as_deref().filter(|n| !n.is_empty()) else {
+                return Label {
+                    name: uid.to_string(),
+                    uid: None,
+                };
             };
-            let shown = name.split_whitespace().collect::<Vec<_>>().join(" ");
             let shared = owners.get(&key(name)).is_some_and(|o| o.len() > 1);
-            let looks_like_other = shown.parse::<Uid>().is_ok_and(|u| u != *uid);
-            if shared || looks_like_other {
-                format!("{shown} ({uid})")
-            } else {
-                shown
+            Label {
+                name: name.to_owned(),
+                uid: (shared || looks_like_uid(name)).then(|| uid.to_string()),
             }
         })
         .collect()
@@ -334,7 +353,7 @@ impl Conversation {
                     uid: uid.to_string(),
                     role: role.as_str().to_owned(),
                     display_name: shown_name(Some(&name)),
-                    label: String::new(),
+                    label: unlabelled(),
                     presence: Presence::of(Some(&presence)),
                 });
             }
@@ -371,7 +390,7 @@ impl Conversation {
                     .as_str()
                     .to_owned(),
                 display_name: shown_name(names.get(&m.uid).map(String::as_str)),
-                label: String::new(),
+                label: unlabelled(),
                 presence: Presence::of(presence.get(&m.uid)),
             })
             .collect();
@@ -379,13 +398,14 @@ impl Conversation {
         Ok(members)
     }
 
-    /// The label to show for each of `uids`, in the same order, such as the
-    /// authors of the messages on screen (8.2): the display name, or
-    /// `name (uid)` where two people in the conversation share a name, or
-    /// the uid for someone with no name. The names compared are those of
+    /// How to show each of `uids`, in the same order, such as the authors
+    /// of the messages on screen (8.2): a [`Label`] with the display name,
+    /// and the uid to show apart from it where two people in the
+    /// conversation share a name, or the name looks like a uid. Someone
+    /// with no name is shown by their uid. The names compared are those of
     /// `uids`, the room's members in the cache and the account itself, as
     /// the cache has them. It needs no connection.
-    pub fn labels(&self, uids: Vec<String>) -> Result<Vec<String>, ClientError> {
+    pub fn labels(&self, uids: Vec<String>) -> Result<Vec<Label>, ClientError> {
         let account = self.account();
         let shared = account.shared();
         let wanted: Vec<Uid> = uids
@@ -412,7 +432,7 @@ impl Conversation {
             .map(|u| (u.clone(), shown_name(names.get(u).map(String::as_str))))
             .collect();
         let all = labels(&with_names);
-        let by_uid: HashMap<&Uid, &String> = people.iter().zip(&all).collect();
+        let by_uid: HashMap<&Uid, &Label> = people.iter().zip(&all).collect();
         Ok(wanted.iter().map(|u| by_uid[u].clone()).collect())
     }
 
@@ -434,6 +454,14 @@ impl Conversation {
     }
 }
 
+/// A label to fill in later.
+fn unlabelled() -> Label {
+    Label {
+        name: String::new(),
+        uid: None,
+    }
+}
+
 /// Fills in the members' labels, comparing their names with each other.
 fn label_members(members: &mut [MemberInfo]) {
     let people: Vec<(Uid, Option<String>)> = members
@@ -441,13 +469,16 @@ fn label_members(members: &mut [MemberInfo]) {
         .filter_map(|m| Some((m.uid.parse().ok()?, m.display_name.clone())))
         .collect();
     let shown = labels(&people);
-    let by_uid: HashMap<String, String> = people
+    let by_uid: HashMap<String, Label> = people
         .iter()
         .map(|(u, _)| u.to_string())
         .zip(shown)
         .collect();
     for m in members {
-        m.label = by_uid.get(&m.uid).cloned().unwrap_or_else(|| m.uid.clone());
+        m.label = by_uid.get(&m.uid).cloned().unwrap_or_else(|| Label {
+            name: m.uid.clone(),
+            uid: None,
+        });
     }
 }
 
@@ -459,28 +490,70 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// The names as the API has them, from escaped names.
+    fn person(u: &str, name: Option<&str>) -> (Uid, Option<String>) {
+        (uid(u), shown_name(name))
+    }
+
+    fn label(name: &str, uid: Option<&str>) -> Label {
+        Label {
+            name: name.into(),
+            uid: uid.map(Into::into),
+        }
+    }
+
     #[test]
-    fn labels_add_the_uid_when_names_clash() {
+    fn labels_show_the_uid_apart_when_names_clash() {
         let people = vec![
-            (uid("alice@example.org"), Some("Alice".to_owned())),
-            (uid("alice@evil.example"), Some(" alice ".to_owned())),
-            (uid("bob@example.net"), Some("Bob\nBuilder".to_owned())),
-            (uid("~carol"), None),
-            (uid("dave@example.com"), Some("".to_owned())),
-            (uid("eve@example.com"), Some("bob@example.net".to_owned())),
-            (uid("bob@example.net"), Some("Bob\nBuilder".to_owned())),
+            person("alice@example.org", Some("Alice")),
+            person("alice@evil.example", Some(" alice ")),
+            person("bob@example.net", Some("Bob\\nBuilder")),
+            person("~carol", None),
+            person("dave@example.com", Some("")),
+            person("eve@example.com", Some("bob@example.net")),
+            person("bob@example.net", Some("Bob\\nBuilder")),
+            person("frank@example.com", Some("~frank")),
+            person("gus@example.com", Some("gus＠example.com")),
         ];
         assert_eq!(
             labels(&people),
             [
-                "Alice (alice@example.org)",
-                "alice (alice@evil.example)",
-                "Bob Builder",
-                "~carol",
-                "dave@example.com",
-                "bob@example.net (eve@example.com)",
-                "Bob Builder",
+                label("Alice", Some("alice@example.org")),
+                label("alice", Some("alice@evil.example")),
+                label("Bob Builder", None),
+                label("~carol", None),
+                label("dave@example.com", None),
+                // A name with `@` always shows the uid, even its own.
+                label("bob@example.net", Some("eve@example.com")),
+                label("Bob Builder", None),
+                label("~frank", Some("frank@example.com")),
+                label("gus＠example.com", Some("gus@example.com")),
             ]
         );
+    }
+
+    #[test]
+    fn bidi_controls_are_removed_before_comparing() {
+        // U+202E turns the text after it around: "ecilA" shows as "Alice".
+        // Without the controls, the names are the same.
+        let people = vec![
+            person("alice@example.org", Some("Alice")),
+            person(
+                "mallory@evil.example",
+                Some("\u{202E}\u{2066}ALICE\u{2069}\u{200F}"),
+            ),
+            person("trent@example.org", Some("Tr\u{061C}ent")),
+        ];
+        assert_eq!(
+            labels(&people),
+            [
+                label("Alice", Some("alice@example.org")),
+                label("ALICE", Some("mallory@evil.example")),
+                label("Trent", None),
+            ]
+        );
+        // A name of controls alone is no name.
+        assert_eq!(shown_name(Some("\u{200E}\u{200F} ")), None);
+        assert_eq!(clean_name(" a\u{202A}b \t\n c "), "ab c");
     }
 }

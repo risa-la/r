@@ -168,7 +168,7 @@ pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
     ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind, FailKind, KeyErrorKind,
-    KeyInfo, MAX_PAGE, MemberInfo, Message, MessagePage, Notice, OutboxEntry, OutboxStatus,
+    KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice, OutboxEntry, OutboxStatus,
     Presence, ReactionCount, RefusedKind, RoomList, RoomListing, ServerHello, Setting, TrustInfo,
     Unregistered, UserInfo,
 };

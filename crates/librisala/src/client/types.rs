@@ -1178,14 +1178,35 @@ impl Presence {
     }
 }
 
+/// How to show a person (8.2): a name, and their uid as a separate
+/// element when it must be shown.
+///
+/// Anyone can call themselves anything, so show [`uid`](Self::uid) apart
+/// from the name, for example in a second line or another style, never
+/// appended to it as text, so that a name cannot pass for a uid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Label {
+    /// What to show as their name: their display name, with bidirectional
+    /// text controls removed and each run of white space shown as one
+    /// space, or their uid if they have no display name.
+    pub name: String,
+    /// Their uid, to show apart from the name, when it must be shown:
+    /// someone else in the conversation has the same name (compared as
+    /// 8.2 says), or the name contains `@` or otherwise looks like a uid.
+    /// `None` when the name is enough, and when the name is the uid.
+    pub uid: Option<String>,
+}
+
 /// What the account knows about a user (8.2, 8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInfo {
     /// Their uid.
     pub uid: String,
-    /// Their display name, unescaped. `None` if they have none, or it is
-    /// not known. Anyone can call themselves anything, so show it with
-    /// care: see [`Conversation::labels`](super::Conversation::labels).
+    /// Their display name, unescaped, with bidirectional text controls
+    /// removed and each run of white space shown as one space. `None` if
+    /// they have none, or it is not known. Anyone can call themselves
+    /// anything, so show it with care: see
+    /// [`Conversation::labels`](super::Conversation::labels).
     pub display_name: Option<String>,
     /// Whether they are connected.
     pub presence: Presence,
@@ -1198,12 +1219,12 @@ pub struct MemberInfo {
     pub uid: String,
     /// Their role (6.3): `owner`, `mod` or `member`.
     pub role: String,
-    /// Their display name, unescaped; `None` if none or not known.
+    /// Their display name, as in [`UserInfo::display_name`]; `None` if
+    /// none or not known.
     pub display_name: Option<String>,
-    /// What to show for them: their display name, with the uid added when
-    /// another member has the same name (8.2), or the uid alone. See
+    /// How to show them among the room's members (8.2). See
     /// [`Conversation::labels`](super::Conversation::labels).
-    pub label: String,
+    pub label: Label,
     /// Whether they are connected.
     pub presence: Presence,
 }

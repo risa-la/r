@@ -236,9 +236,16 @@ async fn names_members_and_presence() {
     // MEMBERS, with the uid shown where names clash (8.2).
     let general = alice.conversation("#general").unwrap();
     let members = general.members().await.unwrap();
-    let mut shown: Vec<(String, String, Presence)> = members
+    let mut shown: Vec<(String, String, Option<String>, Presence)> = members
         .iter()
-        .map(|m| (m.uid.clone(), m.label.clone(), m.presence))
+        .map(|m| {
+            (
+                m.uid.clone(),
+                m.label.name.clone(),
+                m.label.uid.clone(),
+                m.presence,
+            )
+        })
         .collect();
     shown.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(
@@ -246,12 +253,14 @@ async fn names_members_and_presence() {
         [
             (
                 "alice@chat.test".to_owned(),
-                "Bob (alice@chat.test)".to_owned(),
+                "Bob".to_owned(),
+                Some("alice@chat.test".to_owned()),
                 Presence::Online
             ),
             (
                 "bob@chat.test".to_owned(),
-                "Bob (bob@chat.test)".to_owned(),
+                "Bob".to_owned(),
+                Some("bob@chat.test".to_owned()),
                 Presence::Online
             ),
         ]
