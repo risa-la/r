@@ -18,8 +18,9 @@
 //!   one, [`accept_fingerprint`] records it.
 //! - [`Supervisor`]: reconnects with backoff, signs in again through a
 //!   [`SignIn`], and reports [`SupervisorEvent`]s.
-//! - [`keys`]: device keys, the [`KeyStore`](keys::KeyStore) trait and
-//!   the AUTH and REGISTER signing helpers.
+//! - [`keys`]: device keys, the [`KeyStore`](keys::KeyStore) trait, the
+//!   [`PlatformKeyStore`](keys::PlatformKeyStore) trait apps implement in
+//!   Swift or Kotlin, and the AUTH and REGISTER signing helpers.
 
 mod error;
 pub mod keys;

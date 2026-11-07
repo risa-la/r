@@ -191,7 +191,10 @@ pub struct ClientOptions {
     /// Join a guest's rooms again after a reconnect, when its session was
     /// not resumed (4.2). See the [module docs](self). On by default.
     pub rejoin_guest_rooms: bool,
-    /// Where identities' device keys are, for signing in (4.5).
+    /// Where identities' device keys are, for signing in (4.5). An app
+    /// implements [`PlatformKeyStore`](crate::conn::keys::PlatformKeyStore)
+    /// over its platform's store and passes it wrapped in
+    /// [`PlatformKeys`](crate::conn::keys::PlatformKeys).
     pub keys: Option<Arc<dyn KeyStore>>,
     /// The tokio runtime to run on. `None`: the runtime current when the
     /// client is made, or else one of the client's own. See the [module

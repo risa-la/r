@@ -4,8 +4,11 @@
 //!
 //! Each device has its own ML-DSA-44 key. Apps keep keys in the platform's
 //! store (Keychain, Android Keystore, libsecret) by implementing
-//! [`KeyStore`]. [`FileKeyStore`] keeps PEM files for the CLI and for
-//! Linux until libsecret support exists.
+//! [`PlatformKeyStore`], which passes a key as its 32-byte seed and so can
+//! be written in Swift or Kotlin, and handing it to the client wrapped in
+//! [`PlatformKeys`]. Rust code may implement [`KeyStore`] directly.
+//! [`FileKeyStore`] keeps PEM files for the CLI and for Linux until
+//! libsecret support exists, and [`MemoryKeyStore`] keeps keys in memory.
 
 use std::collections::HashMap;
 use std::fs;
@@ -106,6 +109,10 @@ pub enum KeyStoreError {
     /// A key file can be read by other users. Fix it with `chmod 600`.
     #[error("key file {0} can be read by other users; run chmod 600 on it")]
     InsecurePermissions(PathBuf),
+    /// The platform's store refused access, for example a locked
+    /// keychain, or the user said no.
+    #[error("key store refused access: {0}")]
+    Denied(String),
     /// The platform's store failed.
     #[error("key store: {0}")]
     Platform(String),
@@ -124,6 +131,177 @@ pub trait KeyStore: Send + Sync {
     /// Deletes the key stored under `id`. Deleting a missing key is not
     /// an error.
     fn delete(&self, id: &str) -> Result<(), KeyStoreError>;
+}
+
+/// The length of a device key's seed, the ξ of FIPS 204 (App. B).
+pub const SEED_LEN: usize = 32;
+
+/// The DER of a seed-only PKCS#8 ML-DSA-44 key before the seed (App. B),
+/// as [`SecretKey::to_pkcs8_pem`] writes it.
+const SEED_PKCS8_PREFIX: [u8; 22] = [
+    0x30, 0x34, 0x02, 0x01, 0x00, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+    0x03, 0x11, 0x04, 0x22, 0x80, 0x20,
+];
+
+/// The 32-byte seed of `key`, wiped when dropped.
+pub fn key_seed(key: &SecretKey) -> zeroize::Zeroizing<[u8; SEED_LEN]> {
+    use base64::Engine as _;
+    let pem = key.to_pkcs8_pem();
+    let body: zeroize::Zeroizing<String> =
+        zeroize::Zeroizing::new(pem.lines().filter(|l| !l.starts_with("-----")).collect());
+    let der = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(body.as_bytes())
+            .expect("to_pkcs8_pem writes base64"),
+    );
+    assert!(
+        der.len() == SEED_PKCS8_PREFIX.len() + SEED_LEN && der.starts_with(&SEED_PKCS8_PREFIX),
+        "to_pkcs8_pem writes the seed-only form"
+    );
+    let mut seed = zeroize::Zeroizing::new([0u8; SEED_LEN]);
+    seed.copy_from_slice(&der[SEED_PKCS8_PREFIX.len()..]);
+    seed
+}
+
+/// Why a [`PlatformKeyStore`] failed. Plain, with owned messages, so that
+/// Swift and Kotlin code can return one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlatformKeyError {
+    /// What is stored for the identity is not a 32-byte seed, or cannot
+    /// be read as one.
+    #[error("bad stored key: {message}")]
+    BadKey {
+        /// What went wrong, for logs.
+        message: String,
+    },
+    /// The platform refused access: a locked keychain, a user who said
+    /// no, or files other users can read.
+    #[error("access refused: {message}")]
+    Denied {
+        /// What went wrong, for logs.
+        message: String,
+    },
+    /// Anything else.
+    #[error("{message}")]
+    Failed {
+        /// What went wrong, for logs.
+        message: String,
+    },
+}
+
+/// Where an app keeps device keys (PLAN.md 3.3): Keychain on Apple
+/// platforms, an Android Keystore-wrapped key on Android, libsecret on
+/// Linux. Its shape fits a UniFFI callback interface: owned strings and
+/// bytes, no generics, and a plain error.
+///
+/// A key is its 32-byte ML-DSA-44 seed (App. B): everything else follows
+/// from it. The seed is a secret: store it encrypted or protected at rest,
+/// and wipe copies when done. Keys are found by identity, such as
+/// `alice@example.org`. A device has one key per identity, used on every
+/// server the identity signs in to and as its key in encrypted
+/// conversations (4.4, 12.2), so the server is not part of the name.
+///
+/// Wrap it in [`PlatformKeys`] for [`ClientOptions::keys`](crate::client::ClientOptions::keys).
+/// Calls may block for a moment: the client makes them off its async
+/// threads.
+pub trait PlatformKeyStore: Send + Sync {
+    /// The seed stored for `identity`, if any.
+    fn load(&self, identity: String) -> Result<Option<Vec<u8>>, PlatformKeyError>;
+    /// Stores `seed` for `identity`, replacing any other.
+    fn save(&self, identity: String, seed: Vec<u8>) -> Result<(), PlatformKeyError>;
+    /// Deletes the key stored for `identity`. Deleting a missing key is
+    /// not an error.
+    fn delete(&self, identity: String) -> Result<(), PlatformKeyError>;
+}
+
+/// A [`PlatformKeyStore`] used as a [`KeyStore`].
+#[derive(Clone)]
+pub struct PlatformKeys(pub std::sync::Arc<dyn PlatformKeyStore>);
+
+impl std::fmt::Debug for PlatformKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PlatformKeys").finish_non_exhaustive()
+    }
+}
+
+impl From<PlatformKeyError> for KeyStoreError {
+    fn from(e: PlatformKeyError) -> KeyStoreError {
+        match e {
+            PlatformKeyError::BadKey { message } => KeyStoreError::BadKey(message),
+            PlatformKeyError::Denied { message } => KeyStoreError::Denied(message),
+            PlatformKeyError::Failed { message } => KeyStoreError::Platform(message),
+        }
+    }
+}
+
+impl KeyStore for PlatformKeys {
+    fn load(&self, id: &str) -> Result<Option<SecretKey>, KeyStoreError> {
+        let Some(bytes) = self.0.load(id.to_owned())? else {
+            return Ok(None);
+        };
+        let mut bytes = zeroize::Zeroizing::new(bytes);
+        let seed: [u8; SEED_LEN] = bytes.as_slice().try_into().map_err(|_| {
+            KeyStoreError::BadKey(format!("{id}: {} bytes, not a 32-byte seed", bytes.len()))
+        })?;
+        zeroize::Zeroize::zeroize(&mut *bytes);
+        Ok(Some(SecretKey::from_seed(seed)))
+    }
+
+    fn save(&self, id: &str, key: &SecretKey) -> Result<(), KeyStoreError> {
+        let seed = key_seed(key);
+        Ok(self.0.save(id.to_owned(), seed.to_vec())?)
+    }
+
+    fn delete(&self, id: &str) -> Result<(), KeyStoreError> {
+        Ok(self.0.delete(id.to_owned())?)
+    }
+}
+
+/// A [`KeyStore`], such as [`FileKeyStore`] or [`MemoryKeyStore`], used as
+/// a [`PlatformKeyStore`]: the other way round from [`PlatformKeys`].
+#[derive(Clone)]
+pub struct AsPlatform(pub std::sync::Arc<dyn KeyStore>);
+
+impl std::fmt::Debug for AsPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AsPlatform").finish_non_exhaustive()
+    }
+}
+
+impl PlatformKeyStore for AsPlatform {
+    fn load(&self, identity: String) -> Result<Option<Vec<u8>>, PlatformKeyError> {
+        let key = self.0.load(&identity).map_err(platform_error)?;
+        Ok(key.map(|k| key_seed(&k).to_vec()))
+    }
+
+    fn save(&self, identity: String, seed: Vec<u8>) -> Result<(), PlatformKeyError> {
+        let mut seed = zeroize::Zeroizing::new(seed);
+        let bytes: [u8; SEED_LEN] =
+            seed.as_slice()
+                .try_into()
+                .map_err(|_| PlatformKeyError::BadKey {
+                    message: format!("{} bytes, not a 32-byte seed", seed.len()),
+                })?;
+        zeroize::Zeroize::zeroize(&mut *seed);
+        self.0
+            .save(&identity, &SecretKey::from_seed(bytes))
+            .map_err(platform_error)
+    }
+
+    fn delete(&self, identity: String) -> Result<(), PlatformKeyError> {
+        self.0.delete(&identity).map_err(platform_error)
+    }
+}
+
+fn platform_error(e: KeyStoreError) -> PlatformKeyError {
+    let message = e.to_string();
+    match e {
+        KeyStoreError::BadKey(_) => PlatformKeyError::BadKey { message },
+        KeyStoreError::Denied(_) | KeyStoreError::InsecurePermissions(_) => {
+            PlatformKeyError::Denied { message }
+        }
+        _ => PlatformKeyError::Failed { message },
+    }
 }
 
 /// The key stored under `id`, or a new one, generated and stored.
@@ -534,6 +712,97 @@ pub(crate) mod tests {
             );
         }
         assert!(store.path("~sam").is_ok());
+    }
+
+    #[test]
+    fn seeds_come_from_the_key() {
+        // Appendix B's seed, the 32 bytes after the PKCS#8 prefix.
+        let seed = key_seed(&appendix_b());
+        assert_eq!(seed[..4], [0xc1, 0x1f, 0xae, 0x5c]);
+        assert_eq!(
+            SecretKey::from_seed(*seed).public_key(),
+            appendix_b().public_key()
+        );
+    }
+
+    /// A platform store as an app writes it: seeds by identity.
+    #[derive(Default)]
+    struct Platform(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl PlatformKeyStore for Platform {
+        fn load(&self, identity: String) -> Result<Option<Vec<u8>>, PlatformKeyError> {
+            if identity == "locked@example.org" {
+                return Err(PlatformKeyError::Denied {
+                    message: "the keychain is locked".into(),
+                });
+            }
+            Ok(self.0.lock().unwrap().get(&identity).cloned())
+        }
+        fn save(&self, identity: String, seed: Vec<u8>) -> Result<(), PlatformKeyError> {
+            self.0.lock().unwrap().insert(identity, seed);
+            Ok(())
+        }
+        fn delete(&self, identity: String) -> Result<(), PlatformKeyError> {
+            self.0.lock().unwrap().remove(&identity);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn platform_stores_keep_seeds() {
+        let platform = std::sync::Arc::new(Platform::default());
+        let keys = PlatformKeys(platform.clone());
+        assert!(keys.load("alice@example.org").unwrap().is_none());
+        keys.save("alice@example.org", &appendix_b()).unwrap();
+        let stored = platform.0.lock().unwrap()["alice@example.org"].clone();
+        assert_eq!(stored, key_seed(&appendix_b()).to_vec());
+        let loaded = keys.load("alice@example.org").unwrap().unwrap();
+        assert_eq!(loaded.public_key(), appendix_b().public_key());
+        keys.delete("alice@example.org").unwrap();
+        assert!(keys.load("alice@example.org").unwrap().is_none());
+
+        // Errors keep their kind.
+        platform
+            .0
+            .lock()
+            .unwrap()
+            .insert("short@example.org".into(), vec![1, 2, 3]);
+        assert!(matches!(
+            keys.load("short@example.org"),
+            Err(KeyStoreError::BadKey(_))
+        ));
+        assert!(matches!(
+            keys.load("locked@example.org"),
+            Err(KeyStoreError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn rust_stores_are_platform_stores_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = AsPlatform(std::sync::Arc::new(FileKeyStore::new(dir.path())));
+        let seed = key_seed(&appendix_b()).to_vec();
+        files
+            .save("alice@example.org".into(), seed.clone())
+            .unwrap();
+        // The file is Appendix B's PEM.
+        let path = FileKeyStore::new(dir.path())
+            .path("alice@example.org")
+            .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), PEM);
+        assert_eq!(files.load("alice@example.org".into()).unwrap(), Some(seed));
+        let memory = AsPlatform(std::sync::Arc::new(MemoryKeyStore::default()));
+        assert!(matches!(
+            memory.save("x@example.org".into(), vec![0; 31]),
+            Err(PlatformKeyError::BadKey { .. })
+        ));
+        // And back again.
+        let wrapped = PlatformKeys(std::sync::Arc::new(memory));
+        wrapped.save("x@example.org", &appendix_b()).unwrap();
+        assert_eq!(
+            wrapped.load("x@example.org").unwrap().unwrap().public_key(),
+            appendix_b().public_key()
+        );
     }
 
     #[test]
