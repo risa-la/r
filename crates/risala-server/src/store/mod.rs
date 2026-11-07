@@ -145,18 +145,22 @@ impl RoomSettings {
             RoomSetting::Public(v) => self.public = *v,
             RoomSetting::Guests(v) => self.guests = *v,
             RoomSetting::Retention(v) => self.retention = *v,
-            RoomSetting::Other { .. } => {}
+            // Encrypted rooms (12) are not stored yet.
+            RoomSetting::E2ee(_) | RoomSetting::History(_) | RoomSetting::Other { .. } => {}
         }
     }
 
     /// The settings in the order of the snapshot after JOIN and INFO:
-    /// `topic`, `public`, `guests`, `retention` (1.4, 6.1, 6.2).
-    pub fn to_settings(&self) -> [RoomSetting; 4] {
+    /// `topic`, `public`, `guests`, `retention`, `e2ee` (1.4, 6.1, 6.2).
+    /// `e2ee` is always `no` until encrypted rooms (12) are supported, and
+    /// `history` exists only in encrypted rooms.
+    pub fn to_settings(&self) -> [RoomSetting; 5] {
         [
             RoomSetting::Topic(self.topic.clone()),
             RoomSetting::Public(self.public),
             RoomSetting::Guests(self.guests),
             RoomSetting::Retention(self.retention),
+            RoomSetting::E2ee(false),
         ]
     }
 }

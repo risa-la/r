@@ -195,8 +195,10 @@ impl Inner {
                 after,
                 before,
                 limit,
+                only: None,
             } => self.history(uid, reply, conv, after, before, limit).await,
-            // Later milestones.
+            // Later milestones, including `HISTORY only=commit` and the
+            // rest of Section 12.
             _ => Err(not_supported()),
         }
     }
