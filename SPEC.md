@@ -3163,6 +3163,11 @@ openssl s_client -connect chat.example.org:7472 </dev/null 2>/dev/null \
   | openssl dgst -sha256
 ```
 
+If the hash printed is
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`, the
+handshake failed and this is the hash of nothing, not a fingerprint. The
+usual cause is an OpenSSL older than 3.5.
+
 **Make a key, and print the line for your key file:**
 
 ```
