@@ -576,6 +576,11 @@ impl Inner {
         if self.room_entry(room).is_some() {
             return Ok(None);
         }
+        // An identity being deleted may not join rooms, nor own new ones
+        // (4.8).
+        if !self.reg().may_join(creator) {
+            return Err(fail(ErrorCode::Forbidden, "the identity is being deleted"));
+        }
         let now = self.now();
         let (name, uid) = (room.clone(), creator.clone());
         let created = self.db(move |s| s.create_room(&name, &uid, now)).await?;

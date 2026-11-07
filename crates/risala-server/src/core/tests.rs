@@ -2139,6 +2139,7 @@ impl Store for Flaky {
         u: &Uid,
         t: Timestamp,
     ) -> crate::store::Result<crate::store::Created> {
+        self.pause.at("create_room");
         self.inner.create_room(r, u, t)
     }
     fn rooms(&self) -> crate::store::Result<Vec<RoomRecord>> {
@@ -2231,6 +2232,7 @@ impl Store for Flaky {
         u: &Uid,
         s: Seq,
     ) -> crate::store::Result<Option<crate::store::ReadMarker>> {
+        self.pause.at("set_read_marker");
         self.inner.set_read_marker(c, u, s)
     }
     fn set_display_name(&self, u: &Uid, n: &str) -> crate::store::Result<()> {
@@ -2249,6 +2251,7 @@ impl Store for Flaky {
         m: usize,
         t: Timestamp,
     ) -> crate::store::Result<bool> {
+        self.pause.at("add_block");
         self.inner.add_block(u, b, m, t)
     }
     fn remove_block(

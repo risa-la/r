@@ -810,6 +810,87 @@ async fn auth_that_straddles_unregister() {
     assert_eq!(w.h.store.identity(&uid("bob@example.net")).unwrap(), None);
 }
 
+/// UNREGISTER on one device while another device's command is storing
+/// something for the identity: UNREGISTER waits for it, and then forgets
+/// what it stored. Here a JOIN that creates a room (which would leave the
+/// deleted identity owning it), a READ in a room it has not joined, and a
+/// BLOCK.
+#[tokio::test]
+async fn unregister_waits_for_the_other_devices() {
+    for (method, line) in [
+        ("create_room", "join #new"),
+        ("set_read_marker", "read #general 1"),
+        ("add_block", "block spam@example.net"),
+    ] {
+        let (mut w, store) = paused_world();
+        let bob = identity("bob@example.net");
+        w.fetcher.set(&bob, vec![public(1), public(2)]);
+        let mut sam = w.h.guest("sam").await;
+        w.send(&sam, "join #general").await;
+        sam.lines();
+        let mut laptop = w.sign_in("bob@example.net", 1).await;
+        let mut phone = w.sign_in("bob@example.net", 2).await;
+
+        store.pause.arm(method);
+        let busy = spawn_send(&w, &phone, line);
+        store.pause.reached().await;
+        let unregister = spawn_send(&w, &laptop, "unregister bob@example.net");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.pause.release();
+        busy.await.unwrap();
+        unregister.await.unwrap();
+        assert_eq!(
+            laptop.lines().last().unwrap(),
+            "<close> BYE identity deleted",
+            "{method}"
+        );
+        assert_eq!(
+            phone.lines().last().unwrap(),
+            "<close> BYE identity deleted",
+            "{method}"
+        );
+
+        let bob = uid("bob@example.net");
+        assert_eq!(w.h.store.identity(&bob).unwrap(), None, "{method}");
+        assert!(w.h.store.read_markers(&bob).unwrap().is_empty(), "{method}");
+        assert!(w.h.store.blocks(&bob).unwrap().is_empty(), "{method}");
+        if let Some(room) = w.h.store.room(&"#new".parse().unwrap()).unwrap() {
+            assert!(room.members.is_empty(), "{:?}", room.members);
+            assert!(room.roles.is_empty(), "{:?}", room.roles);
+        }
+        assert!(
+            w.h.store
+                .rooms_with_role_or_invite(&bob)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+/// Two devices sending UNREGISTER at once: one deletes the identity.
+#[tokio::test]
+async fn unregister_twice_at_once() {
+    let mut w = World::new();
+    let bob = identity("bob@example.net");
+    w.fetcher.set(&bob, vec![public(1), public(2)]);
+    let mut laptop = w.sign_in("bob@example.net", 1).await;
+    let mut phone = w.sign_in("bob@example.net", 2).await;
+    let a = spawn_send(&w, &laptop, "unregister bob@example.net");
+    let b = spawn_send(&w, &phone, "unregister bob@example.net");
+    a.await.unwrap();
+    b.await.unwrap();
+    // The other one either never started, its connection having been
+    // closed first, or found the identity being deleted.
+    let mut answers = [laptop.lines(), phone.lines()];
+    answers.sort();
+    let bye = "<close> BYE identity deleted";
+    assert_eq!(answers[1], ["OK", bye]);
+    assert!(
+        answers[0] == [bye] || answers[0] == ["ERR forbidden the identity is being deleted", bye],
+        "{answers:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // UNREGISTER (4.8)
 

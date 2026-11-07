@@ -560,22 +560,42 @@ impl Inner {
             ));
         }
         // From here on, the identity may not join rooms or sign in, and
-        // its connections run no more commands. They still get the PARTs.
-        let user = {
+        // its connections start no more commands. They still get the
+        // PARTs.
+        let me = reply.handle.id();
+        let (user, gates) = {
             let mut reg = self.reg();
             let user = reg.user(uid);
             let conns: Vec<ConnId> = {
                 let mut state = user.lock();
+                if state.ending {
+                    // Another device is deleting it already.
+                    return Err(fail(ErrorCode::Forbidden, "the identity is being deleted"));
+                }
                 state.ending = true;
                 state.conns.iter().map(|c| c.handle.id()).collect()
             };
+            let mut gates = Vec::new();
             for conn in conns {
                 if let Some(entry) = reg.conns.get_mut(&conn) {
                     entry.detached = true;
+                    if conn != me {
+                        gates.push(entry.gate.clone());
+                    }
                 }
             }
-            user
+            (user, gates)
         };
+        // Commands that the identity's other connections started before
+        // now run to the end first: a JOIN that creates a room, or a READ,
+        // BLOCK or MSG that stores something for the identity, must not
+        // store it after it has been forgotten. Holding their gates, this
+        // waits for them, and they start nothing new until it is done.
+        // None of them waits for anything this holds, so this ends.
+        let mut held = Vec::with_capacity(gates.len());
+        for gate in gates {
+            held.push(gate.lock_owned().await);
+        }
         let result = self.forget(uid, &user).await;
         let done = result.is_ok();
         // Close every connection, this one after its response.
@@ -597,6 +617,7 @@ impl Inner {
                 reg.users.remove(uid);
             }
         }
+        drop(held);
         if done {
             tracing::info!(%uid, "identity deleted");
         }
