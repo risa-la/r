@@ -1097,6 +1097,15 @@ impl Store for SqliteStore {
             .collect()
     }
 
+    fn read_marker(&self, conv: ConvKey, uid: &Uid) -> Result<Option<Seq>> {
+        self.conn()
+            .prepare_cached("SELECT seq FROM read_markers WHERE conv = ? AND uid = ?")?
+            .query_row(params![conv.0, uid.as_str()], |row| row.get::<_, i64>(0))
+            .optional()?
+            .map(seq)
+            .transpose()
+    }
+
     fn set_read_marker(&self, conv: ConvKey, uid: &Uid, s: Seq) -> Result<Option<ReadMarker>> {
         self.write(|tx| {
             let head: i64 = tx

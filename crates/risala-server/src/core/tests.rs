@@ -2224,7 +2224,13 @@ impl Store for Flaky {
         self.inner.operators()
     }
     fn read_markers(&self, u: &Uid) -> crate::store::Result<Vec<(ConvKey, Seq)>> {
-        self.inner.read_markers(u)
+        // After reading: the markers are what they were, but not yet sent.
+        let markers = self.inner.read_markers(u);
+        self.pause.at("read_markers");
+        markers
+    }
+    fn read_marker(&self, c: ConvKey, u: &Uid) -> crate::store::Result<Option<Seq>> {
+        self.inner.read_marker(c, u)
     }
     fn set_read_marker(
         &self,

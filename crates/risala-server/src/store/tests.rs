@@ -1097,6 +1097,9 @@ fn read_markers_only_move_forward_and_stop_at_the_head() {
         store.set_read_marker(general, &alice, seq(3)).unwrap(),
         marker(3, true)
     );
+    assert_eq!(store.read_marker(general, &alice).unwrap(), Some(seq(3)));
+    let bob = uid("bob@example.net");
+    assert_eq!(store.read_marker(general, &bob).unwrap(), None);
     assert_eq!(
         store.set_read_marker(general, &alice, seq(3)).unwrap(),
         marker(3, false)

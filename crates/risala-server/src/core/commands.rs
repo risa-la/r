@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use risala_proto::command::{Command, Request, RoomPage};
@@ -828,8 +829,11 @@ impl Inner {
     /// still queued under its room's lock (3.6).
     async fn sync(&self, uid: &Uid, reply: &Reply) -> Outcome {
         // Read markers are the account's, and only identities have them
-        // (7.4). Read first: a marker can only move forward, so one read
-        // a moment early is still a marker the account set.
+        // (7.4). They are all read at once, first. A CONV line must cover
+        // the READ lines sent before it (3.6), so a conversation whose
+        // marker moved after this has its marker read again under its
+        // lock, as the CONV line is queued.
+        let since = self.markers_moved.load(Ordering::SeqCst);
         let markers: HashMap<ConvKey, Seq> = if uid.is_identity() {
             let who = uid.clone();
             self.db(move |s| s.read_markers(&who))
@@ -860,13 +864,19 @@ impl Inner {
             }
             // A member has joined, so the conversation has an event.
             if let Some(head) = st.head {
+                let read = if uid.is_identity() && st.marker_moved > since {
+                    let (key, who) = (st.key, uid.clone());
+                    self.db(move |s| s.read_marker(key, &who)).await?
+                } else {
+                    markers.get(&st.key).copied()
+                };
                 reply.line(ServerLine::Conv {
                     conv: st.name_for(uid),
                     id: st.id.clone(),
                     head,
                     // Always 0 for guests (7.1). A marker is never beyond
                     // the head (7.4).
-                    read: markers.get(&st.key).map(|&read| read.min(head)),
+                    read: read.map(|read| read.min(head)),
                 });
             }
         }

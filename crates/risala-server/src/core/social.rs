@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{BlockTarget, Conv, Room, Seq, Uid};
@@ -31,13 +32,17 @@ impl Inner {
             // M5a: direct conversations.
             return Err(not_supported());
         };
-        let st = self.lock_room(&room).await?;
+        let mut st = self.lock_room(&room).await?;
         check_read(room_of(&st)?, self.asker(uid, st.is_member(uid)))?;
         let (key, who) = (st.key, uid.clone());
         let marker = self.db(move |s| s.set_read_marker(key, &who, seq)).await?;
         // Sent under the room's lock, so that two devices moving the marker
-        // at once cannot have their lines overtake each other.
+        // at once cannot have their lines overtake each other, and so that
+        // a CONV line agrees with them (3.6).
         if let Some(marker) = marker.filter(|m| m.moved) {
+            // After the marker is stored: a SYNC that read the markers
+            // before this reads this one again.
+            st.marker_moved = self.markers_moved.fetch_add(1, Ordering::SeqCst) + 1;
             let line = OutLine::new(ServerMessage::new(ServerLine::Read {
                 conv: st.name_for(uid),
                 seq: marker.seq,

@@ -247,6 +247,10 @@ pub(crate) struct Inner {
     names_lock: tokio::sync::Mutex<()>,
     /// `limits.typing_interval_ms` (8.1).
     typing_interval: Duration,
+    /// Counts the read markers that moved (7.4), so that SYNC can tell
+    /// which conversations' markers moved since it read them all
+    /// ([`ConvState::marker_moved`]).
+    markers_moved: AtomicU64,
 }
 
 impl Hub {
@@ -434,6 +438,7 @@ impl Hub {
                     presence_lock: tokio::sync::Mutex::new(()),
                     names_lock: tokio::sync::Mutex::new(()),
                     typing_interval: timers.typing_interval,
+                    markers_moved: AtomicU64::new(0),
                 }
             }),
         })

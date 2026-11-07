@@ -561,6 +561,9 @@ pub trait Store: Send + Sync + 'static {
     /// The read markers of the identity `uid`, by conversation.
     fn read_markers(&self, uid: &Uid) -> Result<Vec<(ConvKey, Seq)>>;
 
+    /// The read marker of the identity `uid` in one conversation.
+    fn read_marker(&self, conv: ConvKey, uid: &Uid) -> Result<Option<Seq>>;
+
     /// Moves the read marker of `uid` in a conversation forward to `seq`,
     /// or to the conversation's head if `seq` is beyond it (7.4). A lower
     /// value changes nothing. Returns the marker as it now is, and whether

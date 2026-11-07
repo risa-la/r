@@ -131,6 +131,45 @@ async fn read_markers_move_forward_and_reach_the_other_devices() {
     assert_eq!(markers[0].1.get(), 4);
 }
 
+/// The `<read>` on a CONV line covers the READ lines sent to the
+/// connection before it (3.6, 7.1): a READ from another device while SYNC
+/// is answering never arrives before a CONV line with an older marker.
+#[tokio::test]
+async fn sync_agrees_with_read_lines() {
+    let store = Arc::new(super::tests::Flaky::new());
+    store
+        .inner
+        .ensure_room(&"#general".parse().unwrap(), start())
+        .unwrap();
+    for (room, who) in [("#general", ALICE), ("#general", BOB), ("#general", CAROL)] {
+        put(&store.inner, room, who, EventKind::Join);
+    }
+    let mut h = Harness::on(config(), store.clone(), timers());
+    let mut a1 = h.signed_in_as(ALICE);
+    let mut a2 = h.signed_in_as(ALICE);
+    h.send(&a1, "read #general 1").await;
+    a1.lines();
+    a2.lines();
+
+    store.pause.arm("read_markers");
+    let (hub, id) = (h.hub.clone(), a2.id);
+    let syncing = tokio::spawn(async move { hub.command(id, "sync".parse().unwrap()).await });
+    store.pause.reached().await;
+    // SYNC has read the markers, with 1 for #general.
+    h.send(&a1, "read #general 2").await;
+    assert_eq!(a1.lines(), ["OK"]);
+    store.pause.release();
+    syncing.await.unwrap();
+    let lines = a2.lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines[0], "READ #general 2");
+    assert!(
+        lines[1].starts_with("CONV #general ") && lines[1].ends_with(" 3 2"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[2], "OK");
+}
+
 #[tokio::test]
 async fn read_markers_need_a_room_one_may_read() {
     let mut h = harness(timers());

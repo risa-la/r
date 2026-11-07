@@ -61,6 +61,11 @@ pub(crate) struct ConvState {
     pub(crate) members: BTreeMap<Uid, Arc<UserEntry>>,
     /// What kind of conversation it is.
     pub(crate) kind: ConvKind,
+    /// The value of the hub's count of read marker changes at the last
+    /// change of a marker in this conversation, or 0. SYNC reads every
+    /// marker at once, then reads one again under this lock if it moved
+    /// since (3.6, 7.1).
+    pub(crate) marker_moved: u64,
 }
 
 /// The kinds of conversation (5.1). Direct conversations come with M5a.
@@ -93,6 +98,7 @@ impl ConvState {
             head: record.head,
             dropped: false,
             members: BTreeMap::new(),
+            marker_moved: 0,
             kind: ConvKind::Room(RoomInfo {
                 room: record.room,
                 settings: record.settings,
