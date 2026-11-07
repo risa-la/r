@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use risala_proto::names::{Conv, Id, Room, Seq};
+use risala_proto::names::{Conv, Id, Name, Room, Seq};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::addr::ServerAddr;
@@ -305,6 +305,49 @@ impl Store {
                     params![account.0, room.as_str()],
                 )?;
             }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// The guest session the account last signed in to (4.2): the name it
+    /// got, which may be a numbered fallback, and the token that resumes
+    /// it. `None` if there is none. The token is a secret.
+    pub fn guest_session(&self, account: AccountId) -> Result<Option<(Name, Id)>, StoreError> {
+        self.read(|conn| {
+            let row: Option<(Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT guest_name, guest_token FROM accounts WHERE id = ?1",
+                    [account.0],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match row {
+                Some((Some(name), Some(token))) => Ok(Some((
+                    parse(&name, "guest name")?,
+                    parse(&token, "guest token")?,
+                ))),
+                _ => Ok(None),
+            }
+        })
+    }
+
+    /// Records the guest session the account signed in to, or forgets it.
+    /// See [`guest_session`](Self::guest_session).
+    pub fn set_guest_session(
+        &self,
+        account: AccountId,
+        session: Option<(&Name, &Id)>,
+    ) -> Result<(), StoreError> {
+        let (name, token) = match session {
+            Some((name, token)) => (Some(name.as_str()), Some(token.as_str())),
+            None => (None, None),
+        };
+        self.write(|tx| {
+            tx.conn().execute(
+                "UPDATE accounts SET guest_name = ?2, guest_token = ?3 WHERE id = ?1",
+                params![account.0, name, token],
+            )?;
             Ok(())
         })?;
         Ok(())

@@ -1,7 +1,7 @@
 //! Tests of the cache.
 
 use risala_proto::fingerprint::Fingerprint;
-use risala_proto::names::{Conv, Id, Room, Seq, Uid};
+use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{Event, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Relation, Role, RoomSetting};
@@ -613,4 +613,92 @@ fn rooms_to_rejoin() {
     store.remove_account(a).unwrap();
     assert!(store.rejoin_rooms(a).unwrap().is_empty());
     assert_eq!(store.rejoin_rooms(b).unwrap(), [dev]);
+}
+
+#[test]
+fn guest_sessions() {
+    let store = Store::open_in_memory().unwrap();
+    let sam = store.account(&addr(), &uid("~sam")).unwrap();
+    let ann = store.account(&addr(), &uid("~ann")).unwrap();
+    assert_eq!(store.guest_session(sam).unwrap(), None);
+    let name: Name = "sam2".parse().unwrap();
+    let token = id("q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3");
+    store.set_guest_session(sam, Some((&name, &token))).unwrap();
+    assert_eq!(
+        store.guest_session(sam).unwrap(),
+        Some((name.clone(), token.clone()))
+    );
+    assert_eq!(store.guest_session(ann).unwrap(), None);
+    store.set_guest_session(sam, None).unwrap();
+    assert_eq!(store.guest_session(sam).unwrap(), None);
+}
+
+#[test]
+fn own_events_follow_the_connection_uid() {
+    // The guest account ~sam signed in as ~sam2 (4.2): what ~sam2 sent is
+    // its own, and neither counts as unread nor as someone else's
+    // reaction. ~sam is someone else now, since the name was taken.
+    let store = Store::open_in_memory().unwrap();
+    let account = store.account(&addr(), &uid("~sam")).unwrap();
+    let events = [
+        ev(1, "from=~bob MSG #general hi"),
+        ev(2, "from=~sam2 MSG #general hello"),
+        ev(3, "from=~sam MSG #general the new holder of the name"),
+        ev(4, "from=~sam2;react=1 MSG #general 👍"),
+    ];
+    let ((conv, _), _) = store
+        .write(|tx| {
+            tx.signed_in_as(&uid("~sam2"));
+            let mut row = tx.conv_or_create(account, &room())?;
+            tx.learn_id(&mut row, &id("k1"), Some(0))?;
+            for e in &events {
+                tx.store_event(&row, e)?;
+            }
+            tx.raise_sync_point(&mut row, 0)?;
+            Ok((row.id, ()))
+        })
+        .unwrap();
+    assert_eq!(store.unread(conv).unwrap(), 2);
+    let first = store.message(conv, seq(1)).unwrap().unwrap();
+    assert_eq!(first.reactions.len(), 1, "{first:?}");
+    assert_eq!(first.reactions[0].mine, Some(seq(4)));
+
+    // Stored without the connection's uid, ~sam2 is someone else.
+    let other = store.account(&addr(), &uid("~ann")).unwrap();
+    let (conv, _) = store
+        .write(|tx| {
+            let mut row = tx.conv_or_create(other, &room())?;
+            tx.learn_id(&mut row, &id("k1"), Some(0))?;
+            Ok(row.id)
+        })
+        .unwrap();
+    store_all(&store, conv, &events);
+    assert_eq!(store.unread(conv).unwrap(), 3);
+}
+
+#[test]
+fn version_2_caches_mark_own_events_by_the_account_uid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for m in &schema::MIGRATIONS[..2] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO servers (id, addr) VALUES (1, 'chat.example.org');
+             INSERT INTO accounts (id, server, uid) VALUES (1, 1, '~sam');
+             INSERT INTO convs (id, account, name, conv_id) VALUES (1, 1, '#general', 'k1');
+             INSERT INTO events (conv, seq, t, author, verb, text, line) VALUES
+                 (1, 1, 0, '~bob', 'MSG', 'hi', '@seq=1;t=1970-01-01T00:00:00.000Z;from=~bob MSG #general hi'),
+                 (1, 2, 0, '~sam', 'MSG', 'yo', '@seq=2;t=1970-01-01T00:00:00.000Z;from=~sam MSG #general yo');",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.unread(ConvId(1)).unwrap(), 1);
+    let account = store.account(&addr(), &uid("~sam")).unwrap();
+    assert_eq!(account, AccountId(1));
+    assert_eq!(store.guest_session(account).unwrap(), None);
 }

@@ -95,7 +95,7 @@ const SUMMARY: &str = "
     SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
         (SELECT COUNT(*) FROM events e
          WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
-             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.author != a.uid),
+             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0),
         (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
     FROM convs c JOIN accounts a ON a.id = c.account";
 

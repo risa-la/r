@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use risala_proto::names::{Conv, Id};
+use risala_proto::names::{Conv, Id, Uid};
 use risala_proto::server::{Event, EventBody, ServerLine, ServerMessage};
 use risala_proto::types::Relation;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -78,6 +78,9 @@ fn finish_conv(raw: (ConvRowRaw, String, Option<String>)) -> Result<ConvRow, Sto
 pub(crate) struct Tx<'a> {
     tx: Transaction<'a>,
     changes: Vec<Change>,
+    /// The uid the connection signed in as: the events it sent are the
+    /// account's own.
+    me: Option<Uid>,
 }
 
 impl<'a> Tx<'a> {
@@ -85,12 +88,22 @@ impl<'a> Tx<'a> {
         Tx {
             tx,
             changes: Vec::new(),
+            me: None,
         }
+    }
+
+    /// Sets the uid the connection signed in as. Events stored from now on
+    /// are marked as the account's own if that uid sent them. Without it,
+    /// the account's uid decides. A guest that signed in under a fallback
+    /// name, such as `~sam2` for the account `~sam`, needs this (4.2):
+    /// then `~sam` is someone else.
+    pub(crate) fn signed_in_as(&mut self, me: &Uid) {
+        self.me = Some(me.clone());
     }
 
     /// Commits, and returns the changes made, each once, in order.
     pub(super) fn finish(self) -> Result<Vec<Change>, StoreError> {
-        let Tx { tx, changes } = self;
+        let Tx { tx, changes, .. } = self;
         tx.commit()?;
         let mut seen = HashSet::new();
         Ok(changes
@@ -433,8 +446,10 @@ impl<'a> Tx<'a> {
         let c = Columns::of(&event);
         self.tx.execute(
             "INSERT INTO events (conv, seq, t, author, verb, rel, target, deleted, text,
-                 file_url, file_type, file_size, subject, line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 file_url, file_type, file_size, subject, line, own)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?4 = COALESCE(?15, (SELECT a.uid FROM convs c
+                                     JOIN accounts a ON a.id = c.account WHERE c.id = ?1)))",
             params![
                 conv.0,
                 sql(n),
@@ -450,6 +465,7 @@ impl<'a> Tx<'a> {
                 c.file_size.map(sql),
                 c.subject,
                 line,
+                self.me.as_ref().map(Uid::as_str),
             ],
         )?;
 
@@ -745,10 +761,8 @@ impl<'a> Tx<'a> {
         self.tx.execute(
             "INSERT INTO reactions (conv, target, reaction, count, mine)
              SELECT e.conv, e.target, e.text, COUNT(DISTINCT e.author),
-                 MAX(CASE WHEN e.author = a.uid THEN e.seq END)
+                 MAX(CASE WHEN e.own THEN e.seq END)
              FROM events e
-                 JOIN convs c ON c.id = e.conv
-                 JOIN accounts a ON a.id = c.account
              WHERE e.conv = ?1 AND e.target = ?2 AND e.rel = 'react' AND e.deleted = 0
              GROUP BY e.text",
             params![conv.0, sql(n)],

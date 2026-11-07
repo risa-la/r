@@ -483,7 +483,12 @@ impl SyncEngine {
         &mut self,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T, StoreError>,
     ) -> Result<T, SyncError> {
-        let (t, changes) = self.store.write(f)?;
+        let me = &self.me;
+        let (t, changes) = self.store.write(|tx| {
+            // Events the connection sends are the account's own (4.2).
+            tx.signed_in_as(me);
+            f(tx)
+        })?;
         self.out.changes.extend(changes);
         Ok(t)
     }

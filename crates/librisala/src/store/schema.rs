@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-const MIGRATIONS: &[&str] = &[V1, V2];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -178,6 +178,27 @@ CREATE TABLE rejoin (
     room    TEXT NOT NULL,
     PRIMARY KEY (account, room)
 ) WITHOUT ROWID;
+";
+
+/// Version 3: guest sessions (4.2), and events marked as the account's own.
+///
+/// - `accounts.guest_name` and `guest_token`: the guest session the
+///   account last signed in to, by the name it got (which may be a
+///   numbered fallback such as `sam2`) and the token from its `OK`, to
+///   resume it after reconnecting. Both are NULL for identities, and for
+///   guests with no session yet.
+/// - `events.own`: 1 for an event the account sent. A guest may sign in
+///   under a fallback name, so this is decided when the event is stored,
+///   from the uid of the connection then, and not from the account's uid
+///   later. Events stored before this version, or with no connection, are
+///   marked by the account's uid.
+const V3: &str = "
+ALTER TABLE accounts ADD COLUMN guest_name TEXT;
+ALTER TABLE accounts ADD COLUMN guest_token TEXT;
+ALTER TABLE events ADD COLUMN own INTEGER NOT NULL DEFAULT 0;
+UPDATE events SET own = 1 WHERE author = (
+    SELECT a.uid FROM convs c JOIN accounts a ON a.id = c.account WHERE c.id = events.conv
+);
 ";
 
 /// Brings the schema up to [`VERSION`].
