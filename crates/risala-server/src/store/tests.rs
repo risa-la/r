@@ -1189,3 +1189,46 @@ fn blocks_are_kept_per_account_up_to_a_limit() {
         .unwrap();
     assert_eq!(store.blocks(&alice).unwrap(), [target("spam@example.net")]);
 }
+
+/// A block covers the identity, or every identity at the domain and the
+/// domains under it (5.7), and is looked up without loading the list.
+#[test]
+fn is_blocked_matches_identities_and_domains() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let alice = uid("alice@example.org");
+    for target in [
+        "spam@example.net",
+        "*@bad.example",
+        "*@deep.sub.example.com",
+    ] {
+        let target = target.parse::<BlockTarget>().unwrap();
+        assert!(store.add_block(&alice, &target, 10, t(1)).unwrap());
+    }
+    for (who, blocked) in [
+        ("spam@example.net", true),
+        ("other@example.net", false),
+        ("x@bad.example", true),
+        ("x@a.b.bad.example", true),
+        ("x@notbad.example", false),
+        ("x@bad.example.org", false),
+        ("x@deep.sub.example.com", true),
+        ("x@more.deep.sub.example.com", true),
+        ("x@sub.example.com", false),
+        ("x@example.com", false),
+        ("~spam", false),
+    ] {
+        let found = store.is_blocked(&alice, &uid(who)).unwrap();
+        assert_eq!(found, blocked, "{who}");
+        let target_covers = store
+            .blocks(&alice)
+            .unwrap()
+            .iter()
+            .any(|b| b.covers(&uid(who)));
+        assert_eq!(found, target_covers, "{who}: as BlockTarget::covers");
+    }
+    assert!(
+        !store
+            .is_blocked(&uid("bob@example.org"), &uid("spam@example.net"))
+            .unwrap()
+    );
+}

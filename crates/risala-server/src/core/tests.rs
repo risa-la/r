@@ -2283,6 +2283,9 @@ impl Store for Flaky {
     ) -> crate::store::Result<()> {
         self.inner.remove_block(u, b)
     }
+    fn is_blocked(&self, by: &Uid, u: &Uid) -> crate::store::Result<bool> {
+        self.inner.is_blocked(by, u)
+    }
     fn blocks(&self, u: &Uid) -> crate::store::Result<Vec<risala_proto::names::BlockTarget>> {
         // After reading: the list is what it was, but not yet sent.
         let blocks = self.inner.blocks(u);

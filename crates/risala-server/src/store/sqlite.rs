@@ -1205,6 +1205,29 @@ impl Store for SqliteStore {
         })
     }
 
+    fn is_blocked(&self, by: &Uid, uid: &Uid) -> Result<bool> {
+        let Some(domain) = uid.domain() else {
+            // Guests are never blocked (5.7).
+            return Ok(false);
+        };
+        // The uid, then `*@` and its domain and each one above it with at
+        // least two labels, as BlockTarget::covers matches them.
+        let mut targets = vec![uid.as_str().to_owned()];
+        let mut rest = domain;
+        while rest.contains('.') {
+            targets.push(format!("*@{rest}"));
+            rest = rest.split_once('.').map_or("", |(_, up)| up);
+        }
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached("SELECT 1 FROM blocks WHERE uid = ? AND target = ?")?;
+        for target in targets {
+            if stmt.exists(params![by.as_str(), target])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn blocks(&self, uid: &Uid) -> Result<Vec<BlockTarget>> {
         self.conn()
             .prepare_cached("SELECT target FROM blocks WHERE uid = ? ORDER BY target")?

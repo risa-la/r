@@ -599,6 +599,11 @@ pub trait Store: Send + Sync + 'static {
 
     /// The blocks of `uid`, in the byte order of their wire form.
     fn blocks(&self, uid: &Uid) -> Result<Vec<BlockTarget>>;
+
+    /// Whether `by` has a block that covers `uid` (5.7): one of `uid`
+    /// itself, or of its domain or a domain above it. Looked up by key,
+    /// without loading the list.
+    fn is_blocked(&self, by: &Uid, uid: &Uid) -> Result<bool>;
 }
 
 /// A read marker after [`Store::set_read_marker`] (7.4).

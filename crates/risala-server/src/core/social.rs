@@ -317,9 +317,8 @@ impl Inner {
         if !by.is_identity() || !uid.is_identity() {
             return Ok(false);
         }
-        let who = by.clone();
-        let blocks = self.db(move |s| s.blocks(&who)).await?;
-        Ok(blocks.iter().any(|block| block.covers(uid)))
+        let (by, uid) = (by.clone(), uid.clone());
+        self.db(move |s| s.is_blocked(&by, &uid)).await
     }
 
     /// Queues the lines of a response that may be longer than the room the
