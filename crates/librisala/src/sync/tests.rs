@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use risala_proto::command::{Command, Request};
 use risala_proto::error::ErrorCode;
-use risala_proto::names::{Conv, Seq};
+use risala_proto::names::{Conv, Seq, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
-use risala_proto::types::RoomSetting;
+use risala_proto::types::{Presence, RoomSetting};
 
 use super::*;
 use crate::addr::ServerAddr;
@@ -48,6 +48,7 @@ struct H {
     queue: VecDeque<Outgoing>,
     notes: Vec<Notification>,
     changes: Vec<Change>,
+    signals: Vec<Signal>,
     last: Output,
     /// The cache's file, for [`H::on_disk`].
     file: Option<Arc<tempfile::TempDir>>,
@@ -98,6 +99,7 @@ impl H {
             queue: VecDeque::new(),
             notes: Vec::new(),
             changes: Vec::new(),
+            signals: Vec::new(),
             last: Output::default(),
             file: None,
         }
@@ -122,6 +124,7 @@ impl H {
             queue: VecDeque::new(),
             notes: Vec::new(),
             changes: Vec::new(),
+            signals: Vec::new(),
             last: Output::default(),
         }
     }
@@ -145,6 +148,7 @@ impl H {
         self.queue.extend(out.send.iter().cloned());
         self.notes.extend(out.notifications.iter().cloned());
         self.changes.extend(out.changes.iter().cloned());
+        self.signals.extend(out.signals.iter().cloned());
         self.last = out;
     }
 
@@ -1309,6 +1313,356 @@ fn read_markers() {
     let out = g.engine.mark_read(&conv("#general"), seq(2)).unwrap();
     assert!(out.send.is_empty(), "guests keep markers locally");
     assert_eq!(g.conv("#general").read, 2);
+}
+
+#[test]
+fn a_read_marker_stops_at_the_newest_seq_known() {
+    // The server sets a marker beyond the head to the head (7.4).
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let out = h.engine.mark_read(&conv("#general"), seq(9)).unwrap();
+    h.absorb(out);
+    h.expect("READ #general 3");
+    assert_eq!(h.conv("#general").read, 3);
+    assert!(h.changes.contains(&Change::Conversation {
+        conv: h.conv("#general").id
+    }));
+    // A READ from another device moves it, and the unread count, and is
+    // reported (7.4).
+    h.line(&bob(4));
+    h.line(&bob(5));
+    assert_eq!(h.conv("#general").unread, 2);
+    h.changes.clear();
+    h.line("READ #general 4");
+    assert_eq!((h.conv("#general").read, h.conv("#general").unread), (4, 1));
+    assert_eq!(
+        h.changes,
+        [Change::Conversation {
+            conv: h.conv("#general").id
+        }]
+    );
+    // Not backwards, and nothing for a conversation not in the cache.
+    h.changes.clear();
+    h.line("READ #general 2");
+    h.line("READ #other 2");
+    assert_eq!(h.conv("#general").read, 4);
+    assert!(h.changes.is_empty());
+    h.idle();
+}
+
+#[test]
+fn sync_initialises_read_markers_and_sends_the_ones_it_missed() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 5);
+    // Read offline: the marker moved here only.
+    h.store
+        .write(|tx| {
+            let mut row = tx.conv_by_name(h.account, &conv("#general"))?.unwrap();
+            tx.mark_read(&mut row, 4)
+        })
+        .unwrap();
+    let r = h.reconnect();
+    // Another device read up to 2: ours is newer, so the server hears it.
+    h.reply(r, &["CONV #general k1 5 2"], "OK");
+    h.expect("READ #general 4");
+    assert_eq!(h.conv("#general").read, 4);
+    h.idle();
+    // SYNC's marker moves ours forward, with nothing to send back.
+    let r = h.reconnect();
+    h.reply(r, &["CONV #general k1 5 5"], "OK");
+    assert_eq!((h.conv("#general").read, h.conv("#general").unread), (5, 0));
+    h.idle();
+
+    // Guests have no markers on the server (7.1): theirs stay here.
+    let mut g = H::new("~sam");
+    g.joined("k1", 3);
+    let out = g.engine.mark_read(&conv("#general"), seq(3)).unwrap();
+    g.absorb(out);
+    let r = g.reconnect();
+    g.reply(r, &["CONV #general k1 3 0"], "OK");
+    assert_eq!(g.conv("#general").read, 3);
+    g.idle();
+}
+
+// ---------------------------------------------------------------------------
+// 8.1-8.3: typing, names, members and presence
+
+#[test]
+fn typing_repeats_every_four_seconds_while_the_user_types() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 1);
+    let general = conv("#general");
+    let out = h.engine.typing(&general);
+    h.absorb(out);
+    let r = h.expect("TYPING #general");
+    h.reply(r, &[], "OK");
+    // Calls in the next 4 seconds send nothing.
+    h.advance_clock(Duration::from_millis(3900));
+    let out = h.engine.typing(&general);
+    assert!(out.send.is_empty());
+    h.advance_clock(Duration::from_millis(100));
+    let out = h.engine.typing(&general);
+    h.absorb(out);
+    h.expect("TYPING #general");
+    // Sending a message ends it: the next keystroke says so at once.
+    let out = h.engine.send(&general, &Draft::text("hi")).unwrap().1;
+    h.absorb(out);
+    h.expect_msg("hi");
+    let out = h.engine.typing(&general);
+    h.absorb(out);
+    h.expect("TYPING #general");
+    // So does stopping.
+    h.engine.stop_typing(&general);
+    let out = h.engine.typing(&general);
+    h.absorb(out);
+    h.expect("TYPING #general");
+    // Nothing for a conversation that is not live here.
+    let out = h.engine.typing(&conv("#elsewhere"));
+    assert!(out.send.is_empty());
+}
+
+#[test]
+fn typing_and_presence_are_signals() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 1);
+    h.line("@from=bob@example.net TYPING #general");
+    // The account's own other devices are not "someone typing".
+    h.line("@from=alice@example.org TYPING #general");
+    h.line(&ev(2, "from=bob@example.net MSG #general done"));
+    // Edits, reactions and our own messages do not end anyone's typing.
+    h.line(&ev(3, "from=bob@example.net;react=2 MSG #general 👍"));
+    h.line(&ev(4, "from=alice@example.org MSG #general me too"));
+    h.line("PRESENCE offline bob@example.net,carol@example.com");
+    h.line("PRESENCE away dave@example.com");
+    let bob: Uid = "bob@example.net".parse().unwrap();
+    assert_eq!(
+        h.signals,
+        [
+            Signal::Typing {
+                conv: conv("#general"),
+                from: bob.clone()
+            },
+            Signal::Spoke {
+                conv: conv("#general"),
+                from: bob.clone()
+            },
+            Signal::Presence {
+                uid: bob,
+                presence: Presence::Offline
+            },
+            Signal::Presence {
+                uid: "carol@example.com".parse().unwrap(),
+                presence: Presence::Offline
+            },
+            Signal::Presence {
+                uid: "dave@example.com".parse().unwrap(),
+                presence: Presence::Other("away".into())
+            },
+        ]
+    );
+    h.idle();
+}
+
+#[test]
+fn display_names_are_stored() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 1);
+    let bob: Uid = "bob@example.net".parse().unwrap();
+    let carol: Uid = "carol@example.com".parse().unwrap();
+    let name = |h: &H, u: &Uid| h.store.user_name(h.account, u).unwrap();
+    assert_eq!(name(&h, &bob), None);
+    h.line(r"@from=bob@example.net NAME Bob the Builder");
+    assert_eq!(name(&h, &bob).as_deref(), Some("Bob the Builder"));
+    assert!(h.changes.contains(&Change::User {
+        account: h.account,
+        uid: bob.clone()
+    }));
+    // Cleared: known to have none.
+    h.changes.clear();
+    h.line("@from=bob@example.net NAME");
+    assert_eq!(name(&h, &bob).as_deref(), Some(""));
+    // The same again changes nothing.
+    h.line("@from=bob@example.net NAME");
+    assert_eq!(h.changes.len(), 1);
+
+    // WHOIS (8.3).
+    let out = h.engine.whois(&carol);
+    h.absorb(out);
+    let r = h.expect("WHOIS carol@example.com");
+    h.reply(r, &["USER carol@example.com online Carol"], "OK");
+    assert_eq!(name(&h, &carol).as_deref(), Some("Carol"));
+    assert_eq!(h.last.completed[0].req, r);
+    assert!(h.signals.contains(&Signal::Presence {
+        uid: carol,
+        presence: Presence::Online
+    }));
+
+    // The account's own, once the server accepts it (8.2).
+    let alice: Uid = ALICE.parse().unwrap();
+    let out = h.engine.set_name("Alice M");
+    h.absorb(out);
+    let r = h.expect("NAME Alice M");
+    h.reply(r, &[], "ERR invalid");
+    assert_eq!(name(&h, &alice), None);
+    let out = h.engine.set_name("Alice");
+    h.absorb(out);
+    let r = h.expect("NAME Alice");
+    h.reply(r, &[], "OK");
+    assert_eq!(name(&h, &alice).as_deref(), Some("Alice"));
+    h.idle();
+}
+
+#[test]
+fn members_are_stored_as_listed() {
+    let mut h = H::new(ALICE);
+    let r = h.start();
+    h.reply(r, &["CONV #general k1 2 0"], "OK");
+    let r = h.expect("HISTORY #general after=0 limit=50");
+    h.reply(
+        r,
+        &[
+            &ev(1, "from=carol@example.com;id=k1 JOIN #general"),
+            &ev(2, "from=dave@example.com;id=k1 JOIN #general"),
+        ],
+        "OK id=k1 more=0",
+    );
+    let row = h.conv("#general").id;
+    let joined = |h: &H| -> Vec<String> {
+        h.store
+            .room_members(row)
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.joined == Some(true))
+            .map(|m| format!("{} {}", m.uid, m.role.map_or("-", |r| r.as_str())))
+            .collect()
+    };
+    assert_eq!(joined(&h), ["carol@example.com -", "dave@example.com -"]);
+
+    let out = h.engine.members(&"#general".parse().unwrap()).unwrap();
+    h.absorb(out);
+    let r = h.expect("MEMBERS #general");
+    // Before the answer, Erin joins live, after the server computed it.
+    h.line(&ev(3, "from=erin@example.org;id=k1 JOIN #general"));
+    h.changes.clear();
+    h.reply(
+        r,
+        &[
+            "MEMBER #general alice@example.org owner online Alice",
+            "MEMBER #general carol@example.com member offline",
+            "MEMBER #general ~guest member online",
+            "MEMBER #other zed@example.org owner online Zed",
+        ],
+        "OK",
+    );
+    // Dave is not listed, so he left; Erin's JOIN is newer than the list.
+    assert_eq!(
+        joined(&h),
+        [
+            "alice@example.org owner",
+            "carol@example.com member",
+            "erin@example.org -",
+            "~guest member",
+        ]
+    );
+    assert!(h.changes.contains(&Change::Members { conv: row }));
+    let alice: Uid = ALICE.parse().unwrap();
+    assert_eq!(
+        h.store.user_name(h.account, &alice).unwrap().as_deref(),
+        Some("Alice")
+    );
+    // Lines for another room count for nothing.
+    let zed: Uid = "zed@example.org".parse().unwrap();
+    assert_eq!(h.store.user_name(h.account, &zed).unwrap(), None);
+    assert!(h.signals.contains(&Signal::Presence {
+        uid: "carol@example.com".parse().unwrap(),
+        presence: Presence::Offline
+    }));
+    // Events after the list count over it.
+    h.line(&ev(4, "from=carol@example.com PART #general"));
+    assert!(!joined(&h).contains(&"carol@example.com member".to_owned()));
+    h.idle();
+}
+
+#[test]
+fn members_of_a_room_started_afresh_are_not_mixed_in() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 1);
+    let out = h.engine.members(&"#general".parse().unwrap()).unwrap();
+    h.absorb(out);
+    let r = h.expect("MEMBERS #general");
+    // The room is dropped and created again before the answer.
+    h.line(&ev(1, "from=bob@example.net;id=k2 JOIN #general"));
+    h.reply(r, &["MEMBER #general bob@example.net owner online"], "OK");
+    let row = h.conv("#general").id;
+    assert!(h.store.room_members(row).unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 5.7: blocks
+
+#[test]
+fn blocks() {
+    // An identity asks BLOCKS on each connection; a guest cannot block.
+    let mut h = H::new(ALICE);
+    h.config.fetch_blocks = true;
+    let r = h.reconnect();
+    let b = h.expect("BLOCKS");
+    h.reply(r, &[], "OK");
+    h.reply(b, &["BLOCK spam@example.net", "BLOCK *@evil.example"], "OK");
+    let targets = |h: &H| -> Vec<String> {
+        h.store
+            .blocks(h.account)
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+    assert_eq!(targets(&h), ["*@evil.example", "spam@example.net"]);
+    assert!(h.changes.contains(&Change::Blocks { account: h.account }));
+    let blocked = |h: &H, u: &str| h.store.is_blocked(h.account, &u.parse().unwrap()).unwrap();
+    assert!(blocked(&h, "spam@example.net"));
+    assert!(blocked(&h, "x@mail.evil.example"));
+    assert!(!blocked(&h, "x@notevil.example"));
+    assert!(!blocked(&h, "~spam"));
+
+    // BLOCK and UNBLOCK count once the server accepts them.
+    let out = h.engine.block(&"troll@example.com".parse().unwrap());
+    h.absorb(out);
+    let r = h.expect("BLOCK troll@example.com");
+    h.reply(r, &[], "OK");
+    let out = h.engine.unblock(&"spam@example.net".parse().unwrap());
+    h.absorb(out);
+    let r = h.expect("UNBLOCK spam@example.net");
+    h.reply(r, &[], "ERR rate-limited");
+    assert_eq!(
+        targets(&h),
+        ["*@evil.example", "spam@example.net", "troll@example.com"]
+    );
+    let out = h.engine.unblock(&"spam@example.net".parse().unwrap());
+    h.absorb(out);
+    let r = h.expect("UNBLOCK spam@example.net");
+    h.reply(r, &[], "OK");
+    assert_eq!(targets(&h), ["*@evil.example", "troll@example.com"]);
+    // BLOCKS replaces the list: here, blocks removed on another device.
+    h.changes.clear();
+    let out = h.engine.blocks();
+    h.absorb(out);
+    let r = h.expect("BLOCKS");
+    h.reply(r, &["BLOCK troll@example.com"], "OK");
+    assert_eq!(targets(&h), ["troll@example.com"]);
+    // The same list again is no change.
+    h.changes.clear();
+    let out = h.engine.blocks();
+    h.absorb(out);
+    let r = h.expect("BLOCKS");
+    h.reply(r, &["BLOCK troll@example.com"], "OK");
+    assert!(h.changes.is_empty());
+    h.idle();
+
+    let mut g = H::new("~sam");
+    g.config.fetch_blocks = true;
+    g.reconnect();
+    g.idle();
 }
 
 // ---------------------------------------------------------------------------

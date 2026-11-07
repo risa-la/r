@@ -118,7 +118,10 @@ mod tests {
         assert_eq!(t.next_expiry(), Some(t0 + Duration::from_secs(7)));
         // Carol's runs out at 7 s, Bob's at 10 s.
         assert!(t.expire(t0 + Duration::from_secs(6)).is_empty());
-        assert_eq!(t.expire(t0 + Duration::from_secs(7)), std::slice::from_ref(&general));
+        assert_eq!(
+            t.expire(t0 + Duration::from_secs(7)),
+            std::slice::from_ref(&general)
+        );
         assert_eq!(t.who(&general), std::slice::from_ref(&bob));
         // Bob's message ends it at once.
         assert!(t.spoke(&general, &bob));

@@ -811,3 +811,98 @@ fn version_2_caches_mark_own_events_by_the_account_uid() {
     assert_eq!(account, AccountId(1));
     assert_eq!(store.guest_session(account).unwrap(), None);
 }
+
+#[test]
+fn blocked_people_can_be_hidden_in_rooms() {
+    // 5.7: hiding is the client's, so the messages stay stored.
+    let (store, account, conv) = setup();
+    store_all(
+        &store,
+        conv,
+        &[
+            ev(1, "from=bob@example.net MSG #general hi"),
+            ev(2, "from=spam@mail.evil.example MSG #general buy"),
+            ev(3, "from=troll@example.com MSG #general boo"),
+            ev(4, "from=troll@example.com;react=1 MSG #general 👎"),
+            ev(5, "from=alice@example.org MSG #general hello"),
+            ev(6, "from=troll@example.com;id=k1 JOIN #general"),
+        ],
+    );
+    let shown = |store: &Store| -> Vec<u64> {
+        store
+            .timeline(conv, None, 50)
+            .unwrap()
+            .iter()
+            .map(|i| i.seq.get())
+            .collect()
+    };
+    let unread = |store: &Store| store.conversation_by_id(conv).unwrap().unwrap().unread;
+    assert_eq!(shown(&store), [1, 2, 3, 5, 6]);
+    assert_eq!(unread(&store), 3);
+
+    let blocks: Vec<risala_proto::names::BlockTarget> = vec![
+        "*@evil.example".parse().unwrap(),
+        "troll@example.com".parse().unwrap(),
+    ];
+    let ((), changes) = store
+        .write(|tx| tx.set_blocks(account, &blocks).map(drop))
+        .unwrap();
+    assert_eq!(changes, [Change::Blocks { account }]);
+    // Blocking alone hides nothing.
+    assert_eq!(shown(&store), [1, 2, 3, 5, 6]);
+    assert!(!store.hides_blocked(account).unwrap());
+
+    let changes = store.set_hide_blocked(account, true).unwrap();
+    assert_eq!(changes, [Change::Blocks { account }]);
+    assert!(store.set_hide_blocked(account, true).unwrap().is_empty());
+    // Their messages are hidden, a subdomain's too, and are not unread.
+    // Their JOIN stays: only messages are hidden.
+    assert_eq!(shown(&store), [1, 5, 6]);
+    assert_eq!(store.message(conv, seq(3)).unwrap(), None);
+    assert_eq!(unread(&store), 1);
+    let troll = uid("troll@example.com");
+    assert!(store.is_hidden(account, &room(), &troll).unwrap());
+    assert!(
+        !store
+            .is_hidden(account, &"bob@example.net".parse().unwrap(), &troll)
+            .unwrap()
+    );
+
+    // Unblocking shows them again.
+    let ((), changes) = store
+        .write(|tx| tx.set_block(account, &blocks[1], false).map(drop))
+        .unwrap();
+    assert_eq!(changes, [Change::Blocks { account }]);
+    assert_eq!(shown(&store), [1, 3, 5, 6]);
+    store.set_hide_blocked(account, false).unwrap();
+    assert_eq!(shown(&store), [1, 2, 3, 5, 6]);
+    assert_eq!(store.export(conv).unwrap().len(), 6);
+}
+
+#[test]
+fn display_names() {
+    let (store, account, _) = setup();
+    let bob = uid("bob@example.net");
+    let ((), changes) = store
+        .write(|tx| tx.set_user_name(account, &bob, "Bob B").map(drop))
+        .unwrap();
+    assert_eq!(
+        changes,
+        [Change::User {
+            account,
+            uid: bob.clone()
+        }]
+    );
+    assert_eq!(
+        store
+            .user_names(account, &[bob.clone(), uid("~x")])
+            .unwrap(),
+        [(bob.clone(), "Bob B".to_owned())].into_iter().collect()
+    );
+    // Names belong to the account: another account on the server has
+    // not learned them.
+    let other = store.account(&addr(), &uid("~sam")).unwrap();
+    assert_eq!(store.user_name(other, &bob).unwrap(), None);
+    store.remove_account(account).unwrap();
+    assert_eq!(store.user_name(account, &bob).unwrap(), None);
+}

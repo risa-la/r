@@ -139,6 +139,8 @@ mod typing;
 #[cfg(test)]
 mod identity_tests;
 #[cfg(test)]
+mod people_tests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
