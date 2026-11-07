@@ -25,6 +25,7 @@ use risala_proto::names::{Conv, Id, Room, Seq, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, Role};
 
+use super::presence::PresenceBook;
 use crate::handler::{ConnHandle, ConnId, ConnInfo, OutLine};
 use crate::store::{CID_WINDOW_MS, ConvKey, RoomRecord, RoomSettings};
 
@@ -259,6 +260,16 @@ impl UserEntry {
         }
     }
 
+    /// Queues `line` for every connection signed in as the user but
+    /// `except`.
+    pub(crate) fn send_except(&self, line: &OutLine, except: ConnId) {
+        for conn in &self.lock().conns {
+            if conn.handle.id() != except {
+                conn.handle.send_line(line.clone());
+            }
+        }
+    }
+
     /// The conversations the user is a member of.
     pub(crate) fn convs(&self) -> Vec<Arc<ConvEntry>> {
         self.lock().convs.values().cloned().collect()
@@ -291,6 +302,32 @@ pub(crate) struct ConnEntry {
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
     /// The task that closes the connection if it does not sign in (4.1).
     pub(crate) sign_in_timer: Option<tokio::task::AbortHandle>,
+    /// When the connection last had a TYPING passed on, by conversation id
+    /// (8.1), for `limits.typing_interval_ms`.
+    pub(crate) typing: HashMap<Id, tokio::time::Instant>,
+}
+
+/// The most conversations a connection's TYPING times are kept for before
+/// the old ones are forgotten.
+const TYPING_CONVS: usize = 64;
+
+impl ConnEntry {
+    /// Whether a TYPING to the conversation `id` may be passed on now, at
+    /// most one per `interval` (8.1, 13). If so, it counts from now.
+    pub(crate) fn may_type(&mut self, id: &Id, interval: std::time::Duration) -> bool {
+        let now = tokio::time::Instant::now();
+        if let Some(last) = self.typing.get(id)
+            && now.saturating_duration_since(*last) < interval
+        {
+            return false;
+        }
+        if self.typing.len() >= TYPING_CONVS {
+            self.typing
+                .retain(|_, last| now.saturating_duration_since(*last) < interval);
+        }
+        self.typing.insert(id.clone(), now);
+        true
+    }
 }
 
 /// A guest's session (4.2): it starts with GUEST, moves to a new connection
@@ -314,6 +351,9 @@ pub(crate) struct GuestSession {
     /// The session is ending: its PARTs are being recorded. It still holds
     /// its name, but can no longer be resumed or join rooms.
     pub(crate) ending: bool,
+    /// The guest's display name (8.2), escaped; empty if none. It lasts as
+    /// long as the session.
+    pub(crate) display_name: String,
 }
 
 impl GuestSession {
@@ -336,6 +376,9 @@ pub(crate) struct Registry {
     /// Guest sessions (4.2), connected or waiting, by uid. A guest's name
     /// is taken for as long as it has one.
     pub(crate) sessions: HashMap<Uid, GuestSession>,
+    /// The presence of identities (8.3), which changes as their first
+    /// connection opens and their last one closes.
+    pub(crate) presence: PresenceBook,
 }
 
 impl Registry {
@@ -385,14 +428,29 @@ impl Registry {
         }
         let handle = conn.handle.clone();
         let user = self.user(uid);
-        user.lock().conns.push(UserConn { handle, key });
+        let first = {
+            let mut state = user.lock();
+            state.conns.push(UserConn { handle, key });
+            state.conns.len() == 1
+        };
+        if first && uid.is_identity() {
+            self.presence.connected(uid);
+        }
         true
     }
 
     /// Takes connection `id` away from its user, if it has one.
     fn unlink(&mut self, id: ConnId, uid: &Uid) {
         if let Some(user) = self.users.get(uid) {
-            user.lock().conns.retain(|c| c.handle.id() != id);
+            let last = {
+                let mut state = user.lock();
+                let before = state.conns.len();
+                state.conns.retain(|c| c.handle.id() != id);
+                before > 0 && state.conns.is_empty()
+            };
+            if last && uid.is_identity() {
+                self.presence.disconnected(uid);
+            }
         }
         self.release(uid);
     }

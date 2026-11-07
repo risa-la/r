@@ -78,13 +78,13 @@ fn send_settings(reply: &Reply, info: &RoomInfo) {
 }
 
 /// The room part of a conversation found by room name.
-fn room_of(st: &ConvState) -> Result<&RoomInfo, Fail> {
+pub(super) fn room_of(st: &ConvState) -> Result<&RoomInfo, Fail> {
     st.room_info().ok_or_else(not_found)
 }
 
 /// Who is asking about a room, as its access rules see it (6.1, 6.3).
 #[derive(Debug, Clone, Copy)]
-struct Asker<'a> {
+pub(super) struct Asker<'a> {
     uid: &'a Uid,
     /// A member of the room right now.
     member: bool,
@@ -109,7 +109,7 @@ fn visible(info: &RoomInfo, a: Asker<'_>) -> bool {
 /// Readers are members, owners and moderators even after leaving (6.3),
 /// operators (10), and anyone allowed to join a public room. Guests need
 /// the room's `guests` setting to let them in.
-fn check_read(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
+pub(super) fn check_read(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
     if !visible(info, a) {
         return Err(not_found());
     }
@@ -302,6 +302,14 @@ impl Inner {
                 limit,
                 only: None,
             } => self.history(uid, reply, conv, after, before, limit).await,
+            Command::Read { conv, seq } => self.read(uid, reply, conv, seq).await,
+            Command::Typing { conv } => self.typing(uid, reply, conv).await,
+            Command::Name { display_name } => self.name(uid, reply, display_name).await,
+            Command::Members { room } => self.members(uid, reply, &room).await,
+            Command::Whois { uid: target } => self.whois(reply, target).await,
+            Command::Block { target } => self.block(uid, target).await,
+            Command::Unblock { target } => self.unblock(uid, target).await,
+            Command::Blocks => self.blocks(uid, reply).await,
             // Later milestones, including `HISTORY only=commit` and the
             // rest of Section 12.
             _ => Err(not_supported()),
@@ -467,7 +475,7 @@ impl Inner {
 
     /// Locks a room. A room that does not exist, or that was dropped while
     /// this waited for its lock, is `ERR not-found` (6.1, 10.4).
-    async fn lock_room(&self, room: &Room) -> Result<ConvGuard, Fail> {
+    pub(super) async fn lock_room(&self, room: &Room) -> Result<ConvGuard, Fail> {
         let entry = self.room_entry(room).ok_or_else(not_found)?;
         let st = entry.lock_owned().await;
         if st.dropped {
@@ -547,7 +555,7 @@ impl Inner {
     }
 
     /// `uid` as the access rules of a room see it.
-    fn asker<'a>(&self, uid: &'a Uid, member: bool) -> Asker<'a> {
+    pub(super) fn asker<'a>(&self, uid: &'a Uid, member: bool) -> Asker<'a> {
         Asker {
             uid,
             member,
@@ -815,7 +823,7 @@ impl Inner {
     /// events besides, as the network layer does before each command.
     /// Returns `false` if the connection closed instead. A client that
     /// reads nothing for as long as the keepalive allows (11) is dropped.
-    async fn wait_for_reply_room(&self, handle: &ConnHandle) -> bool {
+    pub(super) async fn wait_for_reply_room(&self, handle: &ConnHandle) -> bool {
         let limits = &self.config.limits;
         let patience = Duration::from_secs(
             limits

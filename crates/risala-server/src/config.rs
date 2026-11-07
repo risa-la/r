@@ -25,6 +25,7 @@
 //!
 //! [limits]
 //! registrations_per_hour = 5
+//! presence_offline_secs = 30
 //!
 //! [keys]
 //! allow_private = false
@@ -218,6 +219,23 @@ pub struct Limits {
     /// an hour (13, 14). IPv6 addresses count by their /64. Further
     /// REGISTERs get `ERR rate-limited`. 0 means no limit.
     pub registrations_per_hour: u32,
+    /// Seconds after an identity's last connection closes before the
+    /// people who share a conversation with it are told it is offline
+    /// (8.3: about 30). A connection that opens meanwhile cancels it, and
+    /// nothing is sent. 0 reports it at once.
+    pub presence_offline_secs: u64,
+    /// Milliseconds the server collects presence changes before it sends
+    /// them, so that one PRESENCE line covers many users (8.3: up to a few
+    /// seconds). At least 1.
+    pub presence_batch_ms: u64,
+    /// The least milliseconds between two TYPING notifications one
+    /// connection sends on to a conversation (8.1, 13). Clients repeat
+    /// TYPING about every 4 seconds, so this stops only floods. Those in
+    /// between still get `OK`, but are not passed on. 0 means no limit.
+    pub typing_interval_ms: u64,
+    /// The most blocks one account may have (5.7). BLOCK beyond it gets
+    /// `ERR forbidden`.
+    pub max_blocks: usize,
 }
 
 /// The most lines a command's response has besides a full page of events
@@ -325,6 +343,10 @@ impl Default for Limits {
             max_page: 500,
             max_list: 500,
             registrations_per_hour: 5,
+            presence_offline_secs: 30,
+            presence_batch_ms: 1000,
+            typing_interval_ms: 1000,
+            max_blocks: 1000,
         }
     }
 }
@@ -396,6 +418,8 @@ impl Config {
             ("ping_timeout_secs", l.ping_timeout_secs),
             ("max_page", l.max_page),
             ("max_list", l.max_list),
+            ("presence_batch_ms", l.presence_batch_ms),
+            ("max_blocks", l.max_blocks as u64),
         ] {
             if value == 0 {
                 return invalid(format!("limits.{name} must be at least 1"));
@@ -497,6 +521,10 @@ mod tests {
         assert!(!c.server.registration);
         assert_eq!(c.room_creation, RoomCreation::Identities);
         assert_eq!(c.limits.registrations_per_hour, 5);
+        assert_eq!(c.limits.presence_offline_secs, 30);
+        assert_eq!(c.limits.presence_batch_ms, 1000);
+        assert_eq!(c.limits.typing_interval_ms, 1000);
+        assert_eq!(c.limits.max_blocks, 1000);
     }
 
     #[test]
@@ -575,6 +603,10 @@ mod tests {
         invalid(|l| l.ping_timeout_secs = 0, "ping_timeout_secs");
         invalid(|l| l.max_page = 0, "max_page");
         invalid(|l| l.max_list = 0, "max_list");
+        invalid(|l| l.presence_batch_ms = 0, "presence_batch_ms");
+        invalid(|l| l.max_blocks = 0, "max_blocks");
+        assert!(with(|l| l.presence_offline_secs = 0).is_ok());
+        assert!(with(|l| l.typing_interval_ms = 0).is_ok());
         invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");
         assert!(with(|l| l.guest_resume_secs = 120).is_ok());
 

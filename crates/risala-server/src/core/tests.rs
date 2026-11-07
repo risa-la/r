@@ -178,9 +178,14 @@ impl Harness {
     }
 }
 
-/// The hub's timers in most tests: a resume period of 5 minutes.
+/// The hub's timers in most tests: a resume period of 5 minutes, and
+/// presence changes held for a day, so that no PRESENCE line turns up in a
+/// test that is not about presence.
 pub(super) fn timers() -> Timers {
-    Timers::from_config(&config())
+    Timers {
+        presence_batch: Duration::from_secs(24 * 60 * 60),
+        ..Timers::from_config(&config())
+    }
 }
 
 impl Client {
@@ -769,10 +774,6 @@ async fn later_commands_are_not_supported() {
     let mut h = Harness::new();
     let mut c = h.guest("sam").await;
     for cmd in [
-        "typing #general",
-        "name Sam",
-        "members #general",
-        "whois ~bob",
         "roles #general",
         "delete #general 1",
         "report #general 1 spam",

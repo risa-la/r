@@ -31,6 +31,14 @@
 //! An identity stays a member of its rooms across connections and
 //! restarts: every connection signed in as it gets their live events.
 //!
+//! # Lines that are not events
+//!
+//! Read markers (7.4), typing (8.1), display names (8.2), MEMBERS and
+//! WHOIS (8.3) and blocks (5.7) are in `social`. Presence (8.3) is in
+//! `presence`: the registry notes when an identity's first connection
+//! opens and its last one closes, and changes go out in batches, with a
+//! delay before `offline`.
+//!
 //! # Conversations and ordering
 //!
 //! Every conversation, a room now and a direct conversation from M5a, has
@@ -57,6 +65,8 @@
 mod commands;
 mod identity;
 pub mod keys;
+mod presence;
+mod social;
 mod state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -81,6 +91,7 @@ pub use keys::{
     FetchError, KeyFetcher, KeyFilePublisher, KeyServices, MemoryFetcher, MemoryPublisher,
     NoFetcher, NoPublisher,
 };
+use presence::PresenceBook;
 use state::{ConnEntry, ConvEntry, ConvState, GuestSession, Registry};
 
 /// The number of random bytes in a greeting's nonce (4.1).
@@ -217,6 +228,14 @@ pub(crate) struct Inner {
     /// When each network address registered identities in the last hour
     /// (13), for `limits.registrations_per_hour`.
     registrations: Mutex<HashMap<IpAddr, VecDeque<Timestamp>>>,
+    /// Held while presence changes are sent (8.3), so that one flush ends
+    /// before the next begins.
+    presence_lock: tokio::sync::Mutex<()>,
+    /// Held while a display name is stored and sent (8.2), so that every
+    /// connection gets a user's changes in the order they were stored.
+    names_lock: tokio::sync::Mutex<()>,
+    /// `limits.typing_interval_ms` (8.1).
+    typing_interval: Duration,
 }
 
 impl Hub {
@@ -376,21 +395,28 @@ impl Hub {
         }
 
         Ok(Hub {
-            inner: Arc::new(Inner {
-                config,
-                store,
-                clock,
-                settings: RwLock::new(settings),
-                rooms: RwLock::new(rooms),
-                create_lock: tokio::sync::Mutex::new(()),
-                reg: Mutex::new(reg),
-                sign_in_timeout: timers.sign_in,
-                guest_resume: timers.guest_resume,
-                keys,
-                identity_domain,
-                operators: RwLock::new(operators),
-                keys_lock: tokio::sync::Mutex::new(()),
-                registrations: Mutex::new(HashMap::new()),
+            inner: Arc::new_cyclic(|weak| {
+                reg.presence =
+                    PresenceBook::new(weak.clone(), timers.presence_offline, timers.presence_batch);
+                Inner {
+                    config,
+                    store,
+                    clock,
+                    settings: RwLock::new(settings),
+                    rooms: RwLock::new(rooms),
+                    create_lock: tokio::sync::Mutex::new(()),
+                    reg: Mutex::new(reg),
+                    sign_in_timeout: timers.sign_in,
+                    guest_resume: timers.guest_resume,
+                    keys,
+                    identity_domain,
+                    operators: RwLock::new(operators),
+                    keys_lock: tokio::sync::Mutex::new(()),
+                    registrations: Mutex::new(HashMap::new()),
+                    presence_lock: tokio::sync::Mutex::new(()),
+                    names_lock: tokio::sync::Mutex::new(()),
+                    typing_interval: timers.typing_interval,
+                }
             }),
         })
     }
@@ -420,6 +446,15 @@ impl Hub {
         for uid in uids {
             self.inner.end_guest_session(&uid, bye).await;
         }
+    }
+
+    /// Whether the identity `by` has blocked `uid` (5.7), by identity or by
+    /// domain. Guests never block and are never blocked.
+    ///
+    /// Blocks have no effect in rooms on the server. This is the hook for
+    /// what they do: in direct conversations (M5a), and for push (M8, 9.2).
+    pub async fn is_blocked(&self, by: &Uid, uid: &Uid) -> Result<bool, StoreError> {
+        self.inner.is_blocked(by, uid).await
     }
 
     /// The names of the guests that have a session, connected or waiting,
@@ -466,13 +501,25 @@ pub(crate) struct Timers {
     pub(crate) sign_in: Duration,
     /// How long a guest session waits to be resumed (4.2).
     pub(crate) guest_resume: Duration,
+    /// How long after an identity's last connection closes it is reported
+    /// offline (8.3).
+    pub(crate) presence_offline: Duration,
+    /// How long presence changes are collected before they are sent (8.3).
+    pub(crate) presence_batch: Duration,
+    /// The least time between two TYPING one connection passes on to a
+    /// conversation (8.1).
+    pub(crate) typing_interval: Duration,
 }
 
 impl Timers {
     pub(crate) fn from_config(config: &Config) -> Timers {
+        let l = &config.limits;
         Timers {
-            sign_in: Duration::from_secs(config.limits.sign_in_secs),
-            guest_resume: Duration::from_secs(config.limits.guest_resume_secs),
+            sign_in: Duration::from_secs(l.sign_in_secs),
+            guest_resume: Duration::from_secs(l.guest_resume_secs),
+            presence_offline: Duration::from_secs(l.presence_offline_secs),
+            presence_batch: Duration::from_millis(l.presence_batch_ms),
+            typing_interval: Duration::from_millis(l.typing_interval_ms),
         }
     }
 }
@@ -629,6 +676,7 @@ impl Inner {
                 detached: false,
                 gate: Arc::default(),
                 sign_in_timer: timer,
+                typing: HashMap::new(),
             },
         );
     }
@@ -791,6 +839,7 @@ impl Inner {
                         epoch: 0,
                         expiry: None,
                         ending: false,
+                        display_name: String::new(),
                     },
                 );
                 Ok(SignIn::New)
@@ -860,3 +909,6 @@ mod tests;
 
 #[cfg(test)]
 mod identity_tests;
+
+#[cfg(test)]
+mod social_tests;
