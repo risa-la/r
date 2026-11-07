@@ -41,11 +41,6 @@ SDKs remain host dependencies. With Nix sandboxing enabled, use
 subprocess sandboxing for the Nix build user. Developer builds retain defaults.
 Build logs and toolchain metadata are installed under `nix-support/`.
 
-SweetPad supports `run --hot` for simulator and macOS iteration, but SwiftUI hot
-reload requires the Inject package and view annotations. Those are not configured
-in this app. Ordinary build/run, screenshots, and Xcode previews need no Inject
-integration. See [SweetPad's CLI documentation](https://sweetpad.hyzyla.dev/docs/cli/).
-
 ## Pull requests
 
 Use the [Apple client PR template](../../.github/PULL_REQUEST_TEMPLATE/apple-client.md).
