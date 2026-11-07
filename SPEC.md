@@ -425,6 +425,13 @@ ERR <code> [<message...>]
   these lines and onto the final response. This includes the `ERR` for a
   command it cannot parse, as long as it can still read a valid `ref`
   from the line's tags.
+- **Consistent with live events.** A line that reports the state of a
+  conversation, meaning a CONV line from SYNC or the `OK` of JOIN or
+  `INFO <room>`, agrees with the live events the connection receives.
+  Every event of that conversation sent to the connection before the
+  line is covered by it, and every event sent after it is newer. A
+  server does this by queuing the line while no event of that
+  conversation can be queued.
 - **Live events.** Events that a command causes, such as the event a MSG
   creates, are not part of its response. They go to every connection in
   the conversation without `ref`. The connection that sent the command
@@ -1334,7 +1341,10 @@ A client catches up like this:
 6. A client MUST NOT store a live event for a conversation until it has
    learned that conversation's id on this connection, from SYNC, JOIN or
    INFO. Before then it cannot tell which room the event belongs to.
-   HISTORY returns such events later.
+   HISTORY returns such events later. A live event for a conversation
+   the client has not heard of on this connection, such as the first
+   message of a new direct conversation, means it should send SYNC
+   again to learn the id, then catch up as above.
 
 A client MAY download the whole history of its conversations for reading
 offline. Sequence numbers make the download easy to resume.
@@ -1459,6 +1469,11 @@ reports (8.5). A room may set a shorter period of its own (6.2).
 Whichever period is shorter applies. So if a server later shortens its
 period below a room's, the server's period applies to that room.
 
+A server expires a conversation's events in seq order, oldest first, so
+that no event it keeps is older than one it has expired. This holds even
+if its clock moves backwards. Clients rely on it to tell expired events
+from gaps (7.1, 7.2).
+
 The sequence numbers of expired events are never reused. Files expire
 together with the messages they are attached to (5.6). Copies kept for
 open reports do not expire (5.8).
@@ -1481,7 +1496,10 @@ To make resending safe:
   dropped and created again (10.4), a cid from the old room does not
   match, so a resent message is sent to the new room. Otherwise the
   client would be given the seq of someone else's event.
-- For guests, the server checks cids only within one connection.
+- For guests, the server checks cids only within one connection. A
+  guest therefore cannot resend safely after it reconnects. Its client
+  SHOULD show a message that never got its `OK` as possibly not sent,
+  rather than send it again.
 - The cid is not part of the event.
 
 ---

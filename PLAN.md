@@ -328,6 +328,17 @@ Settled (now in SPEC.md):
       the original seq.
     - A guest's LIST leaves out rooms closed to guests.
 
+15. **Found by librisala's sync simulation** (3.6, 7.1, 7.5, 7.6).
+    - A CONV line, and the `OK` of JOIN and `INFO <room>`, agree with the
+      live events around them: earlier events of the conversation are
+      covered, later ones are newer. `risalad` queues them under the
+      room's lock.
+    - A live event for a conversation the client has no id for on this
+      connection makes it send SYNC again.
+    - Servers expire events oldest seq first.
+    - Guests cannot resend safely after reconnecting. Clients show such
+      messages as possibly not sent.
+
 Nothing is open right now.
 
 ## 6. Decisions

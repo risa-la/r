@@ -255,10 +255,14 @@ impl Inner {
             .with_id(&st.id)
             .with_members(members)
             .with_head(head);
-        Ok(Some(
+        // Queued under the room lock, so the live events this connection
+        // gets before it are covered by it, and those after it are newer
+        // (3.6).
+        reply.line(
             ok.with_role(info_role(&st, uid, member))
                 .with_joined(member),
-        ))
+        );
+        Ok(None)
     }
 
     /// LIST (6.1). A guest sees only the rooms guests may enter.
@@ -352,12 +356,12 @@ impl Inner {
             reg.broadcast(room, &Self::room_line(&st, &event));
         }
         send_settings(reply, &st);
-        let mut ok = OkResponse::new().with_id(&st.id);
         // A member has joined, so there is an event.
-        if let Some(head) = st.head {
-            ok = ok.with_head(head);
-        }
-        Ok(Some(ok))
+        let head = st.head.map_or(0, u64::from);
+        // Queued under the room lock, so no later event of the room can
+        // overtake it (3.6).
+        reply.line(OkResponse::new().with_id(&st.id).with_head(head));
+        Ok(None)
     }
 
     /// PART (6.1).
@@ -511,6 +515,11 @@ impl Inner {
                 continue;
             };
             let st = entry.state.lock().await;
+            // Checked again under the room lock: a PART queued before this
+            // line means the room is no longer ours (3.6).
+            if !self.reg().is_member(&room, uid) {
+                continue;
+            }
             // A member has joined, so the room has an event.
             if let Some(head) = st.head {
                 reply.line(ServerLine::Conv {
