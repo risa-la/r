@@ -139,7 +139,16 @@ fn summaries(
     filter: &str,
     args: impl rusqlite::Params,
 ) -> Result<Vec<ConversationSummary>, StoreError> {
-    let mut stmt = conn.prepare_cached(&format!("{SUMMARY} WHERE {filter} ORDER BY c.id"))?;
+    summaries_ordered(conn, &format!("{filter} ORDER BY c.id"), args)
+}
+
+/// Summaries for `tail`: a filter, then ORDER BY and perhaps LIMIT.
+fn summaries_ordered(
+    conn: &Connection,
+    tail: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<ConversationSummary>, StoreError> {
+    let mut stmt = conn.prepare_cached(&format!("{SUMMARY} WHERE {tail}"))?;
     let rows = stmt.query_map(args, raw_summary)?;
     let mut out = Vec::new();
     for raw in rows {
@@ -272,6 +281,27 @@ impl Store {
                 out.insert(parse(&name, "conversation")?, sp.max(0) as u64);
             }
             Ok(out)
+        })
+    }
+
+    /// Up to `limit` conversations of an account in byte order of name,
+    /// after the name `after` if given.
+    pub fn conversations_page(
+        &self,
+        account: AccountId,
+        after: Option<&Conv>,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>, StoreError> {
+        self.read(|conn| {
+            summaries_ordered(
+                conn,
+                "c.account = ?1 AND c.name > ?2 ORDER BY c.name LIMIT ?3",
+                params![
+                    account.0,
+                    after.map_or("", |c| c.as_str()),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+            )
         })
     }
 

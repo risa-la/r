@@ -16,8 +16,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use super::driver;
 use super::timeline::Timeline;
 use super::types::{
-    AccountEvent, ClientError, ConnectionState, ConversationInfo, Message, OutboxEntry, RoomList,
-    RoomListing,
+    AccountEvent, ClientError, ConnectionState, ConversationInfo, ConversationPage, Message,
+    MessagePage, OutboxEntry, RoomList, RoomListing, page_size,
 };
 use super::{Client, ClientOptions, blocking};
 use crate::addr::ServerAddr;
@@ -362,15 +362,39 @@ impl Account {
         }
     }
 
-    /// The account's conversations, from the cache.
-    pub fn conversations(&self) -> Result<Vec<ConversationInfo>, ClientError> {
-        Ok(self
-            .shared
-            .store
-            .conversations(self.shared.id)?
-            .into_iter()
-            .map(ConversationInfo::from)
-            .collect())
+    /// One page of the account's conversations from the cache, in byte
+    /// order of name. Pass `None` for the first page, then the page's
+    /// [`next`](ConversationPage::next) cursor. `limit` is capped at
+    /// [`MAX_PAGE`](super::types::MAX_PAGE); 0 asks for
+    /// [`DEFAULT_PAGE`](super::types::DEFAULT_PAGE). It needs no
+    /// connection.
+    pub fn conversations(
+        &self,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<ConversationPage, ClientError> {
+        let after = match cursor.as_deref() {
+            None => None,
+            Some(c) => Some(
+                c.strip_prefix("c:")
+                    .and_then(|name| name.parse::<Conv>().ok())
+                    .ok_or_else(|| ClientError::Invalid(format!("cursor {c:?}")))?,
+            ),
+        };
+        let limit = page_size(limit) as usize;
+        let mut page =
+            self.shared
+                .store
+                .conversations_page(self.shared.id, after.as_ref(), limit + 1)?;
+        let more = page.len() > limit;
+        page.truncate(limit);
+        let next = more
+            .then(|| page.last().map(|c| format!("c:{}", c.name)))
+            .flatten();
+        Ok(ConversationPage {
+            conversations: page.into_iter().map(ConversationInfo::from).collect(),
+            next,
+        })
     }
 
     /// A conversation by name: a room such as `#general`, or the other
@@ -598,20 +622,45 @@ impl Conversation {
             .map(ConversationInfo::from))
     }
 
-    /// Up to `limit` messages from the cache before seq `before`, or the
-    /// newest if `None`, oldest first. Page back by passing the first
-    /// one's seq.
-    pub fn messages(&self, before: Option<u64>, limit: u32) -> Result<Vec<Message>, ClientError> {
+    /// One page of messages from the cache, oldest first: the newest for
+    /// `None`, then older ones for the page's
+    /// [`older`](MessagePage::older) cursor. `limit` is capped at
+    /// [`MAX_PAGE`](super::types::MAX_PAGE); 0 asks for
+    /// [`DEFAULT_PAGE`](super::types::DEFAULT_PAGE). It needs no
+    /// connection; for older history from the server, see
+    /// [`load_older`](Self::load_older).
+    pub fn messages(&self, cursor: Option<String>, limit: u32) -> Result<MessagePage, ClientError> {
+        let before = match cursor.as_deref() {
+            None => None,
+            Some(c) => Some(
+                c.strip_prefix("m:")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .and_then(Seq::new)
+                    .ok_or_else(|| ClientError::Invalid(format!("cursor {c:?}")))?,
+            ),
+        };
         let Some(summary) = self
             .store()
             .conversation(self.account.shared.id, &self.conv)?
         else {
-            return Ok(Vec::new());
+            return Ok(MessagePage {
+                messages: Vec::new(),
+                older: None,
+            });
         };
-        let items = self
-            .store()
-            .timeline(summary.id, before.and_then(Seq::new), limit as usize)?;
-        Ok(items.into_iter().map(Message::from).collect())
+        let limit = page_size(limit) as usize;
+        let mut items = self.store().timeline(summary.id, before, limit + 1)?;
+        let more = items.len() > limit;
+        if more {
+            items.remove(0);
+        }
+        let older = more
+            .then(|| items.first().map(|i| format!("m:{}", i.seq)))
+            .flatten();
+        Ok(MessagePage {
+            messages: items.into_iter().map(Message::from).collect(),
+            older,
+        })
     }
 
     /// Every stored event, oldest first, as lines in canonical form: a
@@ -638,7 +687,8 @@ impl Conversation {
     }
 
     /// A timeline of the newest `limit` messages in the cache, which then
-    /// follows every change. See [`Timeline`].
+    /// follows every change. See [`Timeline`]. `limit` is bounded as for
+    /// [`messages`](Self::messages).
     pub fn timeline(&self, limit: u32) -> Result<Timeline, ClientError> {
         Timeline::new(self.clone(), limit)
     }

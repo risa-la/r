@@ -426,6 +426,45 @@ impl From<ConversationSummary> for ConversationInfo {
     }
 }
 
+/// The most items one page of [`Conversation::messages`](super::Conversation::messages),
+/// [`Account::conversations`](super::Account::conversations), a
+/// [`Timeline`](super::Timeline)'s first window or
+/// [`Timeline::paginate_back`](super::Timeline::paginate_back) returns.
+/// Larger requests get this many.
+pub const MAX_PAGE: u32 = 200;
+
+/// The page size used when a request asks for 0 items.
+pub const DEFAULT_PAGE: u32 = 50;
+
+/// A page size within the library's bounds.
+pub(crate) fn page_size(limit: u32) -> u32 {
+    match limit {
+        0 => DEFAULT_PAGE,
+        n => n.min(MAX_PAGE),
+    }
+}
+
+/// One page of a conversation's messages from the cache, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessagePage {
+    /// The messages, oldest first.
+    pub messages: Vec<Message>,
+    /// The cursor for the page of older messages, if the cache has any.
+    /// It is opaque: pass it back as it is.
+    pub older: Option<String>,
+}
+
+/// One page of an account's conversations from the cache, in byte order
+/// of name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationPage {
+    /// The conversations.
+    pub conversations: Vec<ConversationInfo>,
+    /// The cursor for the next page, if there are more. It is opaque: pass
+    /// it back as it is.
+    pub next: Option<String>,
+}
+
 /// What kind of event a timeline item is (5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {

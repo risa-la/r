@@ -20,6 +20,7 @@ async fn wait_for_text(conv: &librisala::client::Conversation, text: &str) {
             let found = conv
                 .messages(None, 200)
                 .unwrap()
+                .messages
                 .iter()
                 .any(|m| m.text.as_deref() == Some(text));
             if found {
@@ -105,6 +106,7 @@ async fn guest_joins_sends_and_receives() {
     let texts: Vec<_> = general
         .messages(None, 50)
         .unwrap()
+        .messages
         .into_iter()
         .map(|m| (m.from, m.kind, m.text))
         .collect();
@@ -142,7 +144,7 @@ async fn guest_joins_sends_and_receives() {
             break;
         }
     }
-    let mine = general.messages(None, 50).unwrap().pop().unwrap();
+    let mine = general.messages(None, 50).unwrap().messages.pop().unwrap();
     assert_eq!(mine.seq, seq);
     assert_eq!(mine.text.as_deref(), Some("hello ann\nsecond line"));
 
@@ -162,7 +164,7 @@ async fn guest_joins_sends_and_receives() {
             }
         }
     }
-    assert_eq!(items, general.messages(None, 50).unwrap());
+    assert_eq!(items, general.messages(None, 50).unwrap().messages);
     assert_eq!(items, timeline.items());
 
     // Parting keeps the history.
@@ -170,7 +172,7 @@ async fn guest_joins_sends_and_receives() {
     within("sync", sam.wait_synced()).await.unwrap();
     let info = general.info().unwrap().unwrap();
     assert!(!info.joined);
-    assert_eq!(general.messages(None, 50).unwrap().len(), 6);
+    assert_eq!(general.messages(None, 50).unwrap().messages.len(), 6);
     client.shutdown().await;
     server.stop().await;
 }
@@ -214,7 +216,9 @@ async fn reads_work_offline_after_the_server_stops() {
     assert_eq!(accounts.len(), 1);
     let sam = &accounts[0];
     assert_eq!(sam.state(), ConnectionState::Offline);
-    let convs = sam.conversations().unwrap();
+    let page = sam.conversations(None, 0).unwrap();
+    assert_eq!(page.next, None);
+    let convs = page.conversations;
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].name, "#general");
     assert!(convs[0].caught_up);
@@ -222,6 +226,7 @@ async fn reads_work_offline_after_the_server_stops() {
     let texts: Vec<String> = general
         .messages(None, 100)
         .unwrap()
+        .messages
         .into_iter()
         .filter(|m| m.kind == EventKind::Message)
         .filter_map(|m| m.text)
@@ -230,8 +235,11 @@ async fn reads_work_offline_after_the_server_stops() {
     assert_eq!(texts, expected);
     // Paging back through the cache.
     let newest = general.messages(None, 4).unwrap();
-    let older = general.messages(Some(newest[0].seq), 4).unwrap();
-    assert_eq!(older.last().unwrap().seq + 1, newest[0].seq);
+    let older = general.messages(newest.older.clone(), 4).unwrap();
+    assert_eq!(
+        older.messages.last().unwrap().seq + 1,
+        newest.messages[0].seq
+    );
     assert_eq!(general.export().unwrap().len(), 14);
     let outbox = general.outbox().unwrap();
     assert_eq!(outbox.len(), 1);
@@ -356,7 +364,7 @@ async fn a_room_dropped_and_created_again_is_not_mixed() {
     // Only the new room's events, the same as the server's.
     assert_eq!(a.export().unwrap(), server_history(&server, "#a").await);
     assert!(
-        a.messages(None, 50).unwrap().iter().all(|m| !m
+        a.messages(None, 50).unwrap().messages.iter().all(|m| !m
             .text
             .as_deref()
             .unwrap_or("")

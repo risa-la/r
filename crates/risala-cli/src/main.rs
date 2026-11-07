@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use librisala::client::{
-    Account, Client, ClientError, ClientOptions, ConversationInfo, EventKind, Message,
-    OutboxStatus, TimelineDiff, TrustInfo,
+    Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, EventKind,
+    Message, OutboxStatus, TimelineDiff, TrustInfo,
 };
 use librisala::conn::keys::{FileKeyStore, KeyStore, generate_device_key, key_line};
 
@@ -266,7 +266,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let account = online(ctx, &server).await?;
             let conv = within(account.join(&room)).await?;
             within(account.wait_synced()).await?;
-            let count = conv.messages(None, 1000).or_else(explain)?.len();
+            let count = conv.messages(None, 1000).or_else(explain)?.messages.len();
             println!("joined {} ({count} events stored)", conv.name());
             Ok(())
         }
@@ -345,7 +345,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let Some(info) = conv.info().or_else(explain)? else {
                 return fail(format!("nothing stored for {conversation}"));
             };
-            for m in conv.messages(None, count).or_else(explain)? {
+            for m in last_messages(&conv, count).or_else(explain)? {
                 println!("{}", show(&m));
             }
             for e in conv.outbox().or_else(explain)? {
@@ -385,7 +385,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                     continue;
                 }
                 println!("{} as {}", account.server(), account.uid());
-                for c in account.conversations().or_else(explain)? {
+                for c in all_conversations(&account).or_else(explain)? {
                     println!("  {}", summary(&c));
                 }
                 account.disconnect().await;
@@ -567,6 +567,38 @@ fn show(m: &Message) -> String {
         _ => format!("* {}", m.line),
     };
     format!("[{}] {time} {body}", m.seq)
+}
+
+/// Every conversation of an account, page by page.
+fn all_conversations(account: &Account) -> Result<Vec<ConversationInfo>, ClientError> {
+    let mut out = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = account.conversations(cursor, 0)?;
+        out.extend(page.conversations);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// The newest `count` messages of a conversation, oldest first, page by
+/// page.
+fn last_messages(conv: &Conversation, count: u32) -> Result<Vec<Message>, ClientError> {
+    let mut out: Vec<Message> = Vec::new();
+    let mut cursor = None;
+    while (out.len() as u32) < count {
+        let page = conv.messages(cursor, count - out.len() as u32)?;
+        let mut older = page.messages;
+        older.append(&mut out);
+        out = older;
+        match page.older {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 fn summary(c: &ConversationInfo) -> String {

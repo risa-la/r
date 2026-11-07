@@ -203,7 +203,10 @@ async fn the_timeline_reports_inserts_updates_and_resets() {
     assert_eq!(item.reactions.len(), 1);
     assert!(item.reactions[0].mine);
     assert_eq!(timeline.items().len(), 3);
-    assert_eq!(timeline.items(), general.messages(None, 10).unwrap());
+    assert_eq!(
+        timeline.items(),
+        general.messages(None, 10).unwrap().messages
+    );
 
     // A new id discards the history (7.1): a reset.
     let shared = sam.shared();
@@ -293,7 +296,23 @@ async fn the_timeline_loses_nothing_when_next_is_dropped() {
         apply(&mut items, diffs);
     }
     assert_eq!(items, timeline.items());
-    assert_eq!(items, general.messages(None, 1000).unwrap());
+    assert_eq!(items, all_messages(&general));
+}
+
+/// Every message of a conversation in the cache, page by page.
+fn all_messages(conv: &Conversation) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = conv.messages(cursor, MAX_PAGE).unwrap();
+        let mut older = page.messages;
+        older.append(&mut out);
+        out = older;
+        match page.older {
+            Some(c) => cursor = Some(c),
+            None => return out,
+        }
+    }
 }
 
 #[tokio::test]
@@ -326,7 +345,7 @@ async fn writes_from_another_process_reach_timelines() {
         "k1",
         &[event(2, "from=~bob MSG #general hi")],
     );
-    assert_eq!(general.messages(None, 50).unwrap().len(), 2);
+    assert_eq!(general.messages(None, 50).unwrap().messages.len(), 2);
     // ...until it checks.
     assert!(app.check_for_external_changes().unwrap());
     assert!(!app.check_for_external_changes().unwrap());
@@ -448,6 +467,7 @@ fn messages_say_whether_they_are_the_accounts_own() {
         .unwrap()
         .messages(None, 10)
         .unwrap()
+        .messages
         .into_iter()
         .map(|m| (m.text.unwrap(), m.own))
         .collect();
@@ -583,4 +603,64 @@ async fn the_timeline_shows_the_outbox_until_sent() {
         [TimelineDiff::Remove { index: 2 }]
     ));
     assert_eq!(timeline.items().len(), 2);
+}
+
+#[test]
+fn reads_come_in_bounded_pages() {
+    let sam = guest();
+    let events: Vec<Event> = (1..=7)
+        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
+        .collect();
+    store_events(&sam, "#general", "k1", &events);
+    store_events(&sam, "#a", "k2", &[]);
+    store_events(&sam, "#b", "k3", &[]);
+    let general = sam.conversation("#general").unwrap();
+
+    // Messages, newest page first, then older ones by cursor.
+    let mut seqs = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = general.messages(cursor, 3).unwrap();
+        assert!(page.messages.len() <= 3);
+        let mut these: Vec<u64> = page.messages.iter().map(|m| m.seq).collect();
+        these.append(&mut seqs);
+        seqs = these;
+        match page.older {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seqs, [1, 2, 3, 4, 5, 6, 7]);
+    // A full last page says there is nothing older.
+    let page = general.messages(None, 7).unwrap();
+    assert_eq!((page.messages.len(), page.older), (7, None));
+    assert!(matches!(
+        general.messages(Some("bad".into()), 3),
+        Err(ClientError::Invalid(_))
+    ));
+
+    // Conversations, by name.
+    let first = sam.conversations(None, 2).unwrap();
+    let names: Vec<&str> = first
+        .conversations
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["#a", "#b"]);
+    let rest = sam.conversations(first.next, 2).unwrap();
+    let names: Vec<&str> = rest.conversations.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!((names, rest.next), (vec!["#general"], None));
+
+    // The library caps what one page may ask for.
+    let many: Vec<Event> = (8..=8 + u64::from(MAX_PAGE))
+        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
+        .collect();
+    store_events(&sam, "#general", "k1", &many);
+    let page = general.messages(None, u32::MAX).unwrap();
+    assert_eq!(page.messages.len(), MAX_PAGE as usize);
+    assert!(page.older.is_some());
+    assert_eq!(
+        general.messages(None, 0).unwrap().messages.len(),
+        DEFAULT_PAGE as usize
+    );
 }

@@ -9,7 +9,7 @@ use tokio::sync::{Notify, broadcast};
 
 use super::account::{Batch, Conversation};
 use super::blocking;
-use super::types::{ClientError, Message, OutboxEntry};
+use super::types::{ClientError, Message, OutboxEntry, page_size};
 use crate::store::{
     AccountId, Change, ConvId, OutboxId, OutboxItem, OutboxState, Store, StoreError,
 };
@@ -116,7 +116,7 @@ impl Timeline {
             floor: None,
             pending: VecDeque::new(),
         };
-        state.load(limit.max(1))?;
+        state.load(page_size(limit))?;
         Ok(Timeline {
             conv,
             state: Arc::new(Mutex::new(state)),
@@ -207,7 +207,8 @@ impl Timeline {
         self.state.lock().expect("poisoned").pending.pop_front()
     }
 
-    /// Widens the window by up to `count` older messages from the cache.
+    /// Widens the window by up to `count` older messages from the cache,
+    /// at most [`MAX_PAGE`](super::types::MAX_PAGE).
     /// The diffs arrive through [`next`](Self::next).
     ///
     /// When the cache has no more, it asks the server for the page below
@@ -218,7 +219,7 @@ impl Timeline {
         let notify = self.notify.clone();
         let exhausted = blocking(&self.rt, move || -> Result<bool, StoreError> {
             let mut st = state.lock().expect("poisoned");
-            let (diffs, exhausted) = st.older(count.max(1))?;
+            let (diffs, exhausted) = st.older(page_size(count))?;
             if !diffs.is_empty() {
                 st.pending.push_back(diffs);
                 notify.notify_one();

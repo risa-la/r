@@ -128,8 +128,9 @@ pub use account::{Account, AccountEvents, Conversation};
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
-    DisconnectKind, EventKind, FailKind, KeyErrorKind, Message, Notice, OutboxEntry, OutboxStatus,
-    ReactionCount, RoomList, RoomListing, ServerHello, Setting, TrustInfo,
+    ConversationPage, DEFAULT_PAGE, DisconnectKind, EventKind, FailKind, KeyErrorKind, MAX_PAGE,
+    Message, MessagePage, Notice, OutboxEntry, OutboxStatus, ReactionCount, RoomList, RoomListing,
+    ServerHello, Setting, TrustInfo,
 };
 
 use account::AccountShared;
