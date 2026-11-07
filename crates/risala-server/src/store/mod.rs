@@ -21,6 +21,7 @@ mod sqlite;
 
 use std::fmt;
 
+use risala_proto::auth::PublicKey;
 use risala_proto::names::{Id, Room, Seq, Uid};
 use risala_proto::server::{Attachment, Event, EventBody, EventMeta, Message};
 use risala_proto::time::Timestamp;
@@ -499,6 +500,123 @@ pub trait Store: Send + Sync + 'static {
 
     /// Forgets cids older than `before` (7.6).
     fn prune_cids(&self, before: Timestamp) -> Result<u64>;
+
+    // ---- Identities (4.3-4.8, 5.1) ----
+
+    /// An identity the server knows, or `None`.
+    fn identity(&self, uid: &Uid) -> Result<Option<IdentityRecord>>;
+
+    /// Records that `uid` signed in at `now`: it is known to the server
+    /// from now on (5.1).
+    fn touch_identity(&self, uid: &Uid, now: Timestamp) -> Result<()>;
+
+    /// Creates the hosted identity `uid` with `key` as its only key (4.6),
+    /// unless the identity exists or its uid was retired (4.8, 10.5).
+    fn register(&self, uid: &Uid, key: &PublicKey, now: Timestamp) -> Result<Registered>;
+
+    /// The keys of the hosted identity `uid`, oldest first, or `None` if
+    /// the server does not host it (4.6, 4.7).
+    fn hosted_keys(&self, uid: &Uid) -> Result<Option<Vec<HostedKey>>>;
+
+    /// Every hosted identity and its keys, in uid order, for publishing
+    /// their key files (4.6).
+    fn hosted_identities(&self) -> Result<Vec<(Uid, Vec<HostedKey>)>>;
+
+    /// Adds `key` to the hosted identity `uid`, with `label` (escaped), or
+    /// changes the label of a key it has (4.7). Refuses a key beyond the
+    /// first `max`.
+    fn add_hosted_key(
+        &self,
+        uid: &Uid,
+        key: &PublicKey,
+        label: &str,
+        max: usize,
+        now: Timestamp,
+    ) -> Result<KeyChange>;
+
+    /// Removes `key` from the hosted identity `uid` (4.7), unless it is the
+    /// last key.
+    fn delete_hosted_key(&self, uid: &Uid, key: &PublicKey) -> Result<KeyChange>;
+
+    /// Deletes what the server keeps about the identity `uid` (4.8): its
+    /// record and display name, hosted keys, memberships, roles,
+    /// invitations, read markers, blocks, cids, push registrations and
+    /// operator status. Room bans stay: they belong to the rooms. With
+    /// `retire`, the uid can never be registered again (4.8, 10.5).
+    ///
+    /// Events are not touched, and nothing is recorded: the caller records
+    /// the PARTs first.
+    fn forget_identity(&self, uid: &Uid, retire: bool, now: Timestamp) -> Result<()>;
+
+    /// The rooms in which `uid` holds a role or an invitation (6.3, 6.4).
+    fn rooms_with_role_or_invite(&self, uid: &Uid) -> Result<Vec<Room>>;
+
+    /// The operators added with ADMIN OP (10.1), in order. Those from the
+    /// configuration are not stored.
+    fn operators(&self) -> Result<Vec<Uid>>;
+
+    // ---- Read markers (7.4) ----
+
+    /// The read markers of the identity `uid`, by conversation.
+    fn read_markers(&self, uid: &Uid) -> Result<Vec<(ConvKey, Seq)>>;
+
+    /// Moves the read marker of `uid` in a conversation forward to `seq`,
+    /// or to the conversation's head if `seq` is beyond it (7.4). A lower
+    /// value changes nothing. Returns the marker as it now is, or `None`
+    /// if the conversation has no events.
+    fn set_read_marker(&self, conv: ConvKey, uid: &Uid, seq: Seq) -> Result<Option<Seq>>;
+}
+
+/// An identity the server knows (5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityRecord {
+    /// The identity.
+    pub uid: Uid,
+    /// Whether the server hosts it (4.6).
+    pub hosted: bool,
+    /// Its display name (8.2), escaped; empty if none.
+    pub display_name: String,
+    /// When it first signed in or registered.
+    pub first_seen: Timestamp,
+    /// When it last signed in.
+    pub last_seen: Timestamp,
+}
+
+/// One key of a hosted identity (4.6, 4.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedKey {
+    /// The public key.
+    pub key: PublicKey,
+    /// Its label, escaped (3.4) as in `KEY ADD`; empty if none.
+    pub label: String,
+    /// When it was added.
+    pub added: Timestamp,
+}
+
+/// The result of [`Store::register`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    /// The identity was created.
+    Done,
+    /// The identity exists already.
+    Taken,
+    /// The uid was unregistered before and may not be used again (4.8).
+    Retired,
+}
+
+/// The result of [`Store::add_hosted_key`] and [`Store::delete_hosted_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyChange {
+    /// Done. These are the identity's keys now, oldest first.
+    Done(Vec<HostedKey>),
+    /// The server does not host the identity.
+    NotHosted,
+    /// The key to delete is not one of the identity's.
+    NotFound,
+    /// The key is the identity's last, and was not deleted (4.7).
+    LastKey,
+    /// The identity has as many keys as it may have.
+    TooMany,
 }
 
 /// Makes a new id of [`ID_LEN`] random characters of `a-z 0-9` (5.1). The

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use risala_proto::auth::PublicKey;
 use risala_proto::command::Request;
 use risala_proto::names::{Room, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
@@ -2104,6 +2105,58 @@ impl Store for Flaky {
     }
     fn prune_cids(&self, b: Timestamp) -> crate::store::Result<u64> {
         self.inner.prune_cids(b)
+    }
+    fn identity(&self, u: &Uid) -> crate::store::Result<Option<crate::store::IdentityRecord>> {
+        self.inner.identity(u)
+    }
+    fn touch_identity(&self, u: &Uid, t: Timestamp) -> crate::store::Result<()> {
+        self.inner.touch_identity(u, t)
+    }
+    fn register(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+        t: Timestamp,
+    ) -> crate::store::Result<crate::store::Registered> {
+        self.inner.register(u, k, t)
+    }
+    fn hosted_keys(&self, u: &Uid) -> crate::store::Result<Option<Vec<crate::store::HostedKey>>> {
+        self.inner.hosted_keys(u)
+    }
+    fn hosted_identities(&self) -> crate::store::Result<Vec<(Uid, Vec<crate::store::HostedKey>)>> {
+        self.inner.hosted_identities()
+    }
+    fn add_hosted_key(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+        l: &str,
+        m: usize,
+        t: Timestamp,
+    ) -> crate::store::Result<crate::store::KeyChange> {
+        self.inner.add_hosted_key(u, k, l, m, t)
+    }
+    fn delete_hosted_key(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+    ) -> crate::store::Result<crate::store::KeyChange> {
+        self.inner.delete_hosted_key(u, k)
+    }
+    fn forget_identity(&self, u: &Uid, r: bool, t: Timestamp) -> crate::store::Result<()> {
+        self.inner.forget_identity(u, r, t)
+    }
+    fn rooms_with_role_or_invite(&self, u: &Uid) -> crate::store::Result<Vec<Room>> {
+        self.inner.rooms_with_role_or_invite(u)
+    }
+    fn operators(&self) -> crate::store::Result<Vec<Uid>> {
+        self.inner.operators()
+    }
+    fn read_markers(&self, u: &Uid) -> crate::store::Result<Vec<(ConvKey, Seq)>> {
+        self.inner.read_markers(u)
+    }
+    fn set_read_marker(&self, c: ConvKey, u: &Uid, s: Seq) -> crate::store::Result<Option<Seq>> {
+        self.inner.set_read_marker(c, u, s)
     }
 }
 

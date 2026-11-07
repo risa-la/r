@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
+use risala_proto::auth::PublicKey;
 use risala_proto::names::{Id, Room, Seq, Uid};
 use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
@@ -14,8 +15,9 @@ use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
 use super::schema;
 use super::{
-    Appended, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, NewEvent, Page, Result,
-    RoomRecord, RoomSettings, ServerSettings, Store, StoreError, StoredEvent, random_id,
+    Appended, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, HostedKey, IdentityRecord,
+    KeyChange, NewEvent, Page, Registered, Result, RoomRecord, RoomSettings, ServerSettings, Store,
+    StoreError, StoredEvent, random_id,
 };
 
 /// How long a statement waits for another process's lock before failing.
@@ -681,6 +683,39 @@ fn is_plain(relation: &Option<Option<String>>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Identities
+
+fn hosted_keys_in(conn: &Connection, uid: &Uid) -> Result<Vec<HostedKey>> {
+    conn.prepare_cached(
+        "SELECT key, label, added FROM hosted_keys WHERE uid = ? ORDER BY added, key",
+    )?
+    .query_map([uid.as_str()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?
+    .map(|r| {
+        let (key, label, added) = r?;
+        Ok(HostedKey {
+            key: parse("hosted key", &key)?,
+            label,
+            added: time(added)?,
+        })
+    })
+    .collect()
+}
+
+fn is_hosted(conn: &Connection, uid: &Uid) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT hosted FROM identities WHERE uid = ?")?
+        .query_row([uid.as_str()], |row| row.get::<_, bool>(0))
+        .optional()?
+        .unwrap_or(false))
+}
+
+// ---------------------------------------------------------------------------
 
 impl Store for SqliteStore {
     fn load_server_settings(&self, defaults: &ServerSettings) -> Result<ServerSettings> {
@@ -857,6 +892,223 @@ impl Store for SqliteStore {
         self.write(|tx| {
             let n = tx.execute("DELETE FROM cids WHERE t < ?", [ms(before)])?;
             Ok(n as u64)
+        })
+    }
+
+    fn identity(&self, uid: &Uid) -> Result<Option<IdentityRecord>> {
+        let conn = self.conn();
+        let row = conn
+            .prepare_cached(
+                "SELECT hosted, display_name, first_seen, last_seen FROM identities WHERE uid = ?",
+            )?
+            .query_row([uid.as_str()], |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .optional()?;
+        row.map(|(hosted, display_name, first, last)| {
+            Ok(IdentityRecord {
+                uid: uid.clone(),
+                hosted,
+                display_name,
+                first_seen: time(first)?,
+                last_seen: time(last)?,
+            })
+        })
+        .transpose()
+    }
+
+    fn touch_identity(&self, uid: &Uid, now: Timestamp) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO identities (uid, first_seen, last_seen) VALUES (?1, ?2, ?2) \
+                 ON CONFLICT (uid) DO UPDATE SET last_seen = MAX(last_seen, ?2)",
+                params![uid.as_str(), ms(now)],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn register(&self, uid: &Uid, key: &PublicKey, now: Timestamp) -> Result<Registered> {
+        self.write(|tx| {
+            let retired: bool = tx
+                .prepare_cached("SELECT 1 FROM retired_names WHERE name = ?")?
+                .exists([uid.as_str()])?;
+            if retired {
+                return Ok(Registered::Retired);
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO identities (uid, hosted, first_seen, last_seen) \
+                 VALUES (?1, 1, ?2, ?2)",
+                params![uid.as_str(), ms(now)],
+            )?;
+            if inserted == 0 {
+                return Ok(Registered::Taken);
+            }
+            tx.execute(
+                "INSERT INTO hosted_keys (uid, key, label, added) VALUES (?, ?, '', ?)",
+                params![uid.as_str(), key.to_string(), ms(now)],
+            )?;
+            Ok(Registered::Done)
+        })
+    }
+
+    fn hosted_keys(&self, uid: &Uid) -> Result<Option<Vec<HostedKey>>> {
+        let conn = self.conn();
+        if !is_hosted(&conn, uid)? {
+            return Ok(None);
+        }
+        hosted_keys_in(&conn, uid).map(Some)
+    }
+
+    fn hosted_identities(&self) -> Result<Vec<(Uid, Vec<HostedKey>)>> {
+        let conn = self.conn();
+        let uids = conn
+            .prepare_cached("SELECT uid FROM identities WHERE hosted = 1 ORDER BY uid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|uid| parse::<Uid>("hosted identity", &uid?))
+            .collect::<Result<Vec<_>>>()?;
+        uids.into_iter()
+            .map(|uid| {
+                let keys = hosted_keys_in(&conn, &uid)?;
+                Ok((uid, keys))
+            })
+            .collect()
+    }
+
+    fn add_hosted_key(
+        &self,
+        uid: &Uid,
+        key: &PublicKey,
+        label: &str,
+        max: usize,
+        now: Timestamp,
+    ) -> Result<KeyChange> {
+        self.write(|tx| {
+            if !is_hosted(tx, uid)? {
+                return Ok(KeyChange::NotHosted);
+            }
+            let key = key.to_string();
+            let changed = tx.execute(
+                "UPDATE hosted_keys SET label = ? WHERE uid = ? AND key = ?",
+                params![label, uid.as_str(), key],
+            )?;
+            if changed == 0 {
+                if hosted_keys_in(tx, uid)?.len() >= max {
+                    return Ok(KeyChange::TooMany);
+                }
+                tx.execute(
+                    "INSERT INTO hosted_keys (uid, key, label, added) VALUES (?, ?, ?, ?)",
+                    params![uid.as_str(), key, label, ms(now)],
+                )?;
+            }
+            Ok(KeyChange::Done(hosted_keys_in(tx, uid)?))
+        })
+    }
+
+    fn delete_hosted_key(&self, uid: &Uid, key: &PublicKey) -> Result<KeyChange> {
+        self.write(|tx| {
+            if !is_hosted(tx, uid)? {
+                return Ok(KeyChange::NotHosted);
+            }
+            let keys = hosted_keys_in(tx, uid)?;
+            if !keys.iter().any(|k| k.key == *key) {
+                return Ok(KeyChange::NotFound);
+            }
+            if keys.len() == 1 {
+                return Ok(KeyChange::LastKey);
+            }
+            tx.execute(
+                "DELETE FROM hosted_keys WHERE uid = ? AND key = ?",
+                params![uid.as_str(), key.to_string()],
+            )?;
+            Ok(KeyChange::Done(hosted_keys_in(tx, uid)?))
+        })
+    }
+
+    fn forget_identity(&self, uid: &Uid, retire: bool, now: Timestamp) -> Result<()> {
+        self.write(|tx| {
+            for sql in [
+                // Hosted keys go with it (ON DELETE CASCADE).
+                "DELETE FROM identities WHERE uid = ?",
+                "DELETE FROM members WHERE uid = ?",
+                "DELETE FROM roles WHERE uid = ?",
+                "DELETE FROM invites WHERE uid = ?",
+                "DELETE FROM read_markers WHERE uid = ?",
+                "DELETE FROM blocks WHERE uid = ?",
+                "DELETE FROM cids WHERE author = ?",
+                "DELETE FROM push_registrations WHERE uid = ?",
+                "DELETE FROM operators WHERE uid = ?",
+            ] {
+                tx.execute(sql, [uid.as_str()])?;
+            }
+            if retire {
+                tx.execute(
+                    "INSERT OR IGNORE INTO retired_names (name, retired) VALUES (?, ?)",
+                    params![uid.as_str(), ms(now)],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn rooms_with_role_or_invite(&self, uid: &Uid) -> Result<Vec<Room>> {
+        self.conn()
+            .prepare_cached(
+                "SELECT c.room FROM conversations c WHERE c.room IS NOT NULL AND c.conv IN \
+                 (SELECT conv FROM roles WHERE uid = ?1 UNION SELECT conv FROM invites WHERE uid = ?1) \
+                 ORDER BY c.room",
+            )?
+            .query_map([uid.as_str()], |row| row.get::<_, String>(0))?
+            .map(|room| parse("room", &room?))
+            .collect()
+    }
+
+    fn operators(&self) -> Result<Vec<Uid>> {
+        self.conn()
+            .prepare_cached("SELECT uid FROM operators ORDER BY uid")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|uid| parse("operator", &uid?))
+            .collect()
+    }
+
+    fn read_markers(&self, uid: &Uid) -> Result<Vec<(ConvKey, Seq)>> {
+        self.conn()
+            .prepare_cached("SELECT conv, seq FROM read_markers WHERE uid = ? ORDER BY conv")?
+            .query_map([uid.as_str()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .map(|r| {
+                let (conv, s) = r?;
+                Ok((ConvKey(conv), seq(s)?))
+            })
+            .collect()
+    }
+
+    fn set_read_marker(&self, conv: ConvKey, uid: &Uid, s: Seq) -> Result<Option<Seq>> {
+        self.write(|tx| {
+            let head: i64 = tx
+                .prepare_cached("SELECT head FROM conversations WHERE conv = ?")?
+                .query_row([conv.0], |row| row.get(0))
+                .optional()?
+                .ok_or(StoreError::NoConversation)?;
+            let target = sql_seq(s).min(head);
+            if target >= 1 {
+                tx.execute(
+                    "INSERT INTO read_markers (conv, uid, seq) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (conv, uid) DO UPDATE SET seq = MAX(seq, ?3)",
+                    params![conv.0, uid.as_str(), target],
+                )?;
+            }
+            tx.prepare_cached("SELECT seq FROM read_markers WHERE conv = ? AND uid = ?")?
+                .query_row(params![conv.0, uid.as_str()], |row| row.get::<_, i64>(0))
+                .optional()?
+                .map(seq)
+                .transpose()
         })
     }
 }

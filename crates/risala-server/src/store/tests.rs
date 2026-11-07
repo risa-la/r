@@ -840,3 +840,221 @@ fn concurrent_appends_get_every_seq_once() {
     all.sort_unstable();
     assert_eq!(all, (1..=400).collect::<Vec<_>>());
 }
+
+// ---------------------------------------------------------------------------
+// Identities (4.3-4.8)
+
+fn key(n: u8) -> risala_proto::auth::PublicKey {
+    risala_proto::auth::SecretKey::from_seed([n; 32]).public_key()
+}
+
+#[test]
+fn signing_in_makes_an_identity_known() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let bob = uid("bob@example.net");
+    assert_eq!(store.identity(&bob).unwrap(), None);
+    store.touch_identity(&bob, t(5)).unwrap();
+    store.touch_identity(&bob, t(9)).unwrap();
+    // A clock that went back does not move last_seen back.
+    store.touch_identity(&bob, t(7)).unwrap();
+    let r = store.identity(&bob).unwrap().unwrap();
+    assert!(!r.hosted);
+    assert_eq!((r.first_seen, r.last_seen), (t(5), t(9)));
+    assert_eq!(r.display_name, "");
+    // Not hosted: no keys of its own.
+    assert_eq!(store.hosted_keys(&bob).unwrap(), None);
+    assert_eq!(
+        store.add_hosted_key(&bob, &key(1), "", 64, t(9)).unwrap(),
+        KeyChange::NotHosted
+    );
+}
+
+#[test]
+fn registering_and_managing_keys() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let alice = uid("alice@example.org");
+    assert_eq!(
+        store.register(&alice, &key(1), t(1)).unwrap(),
+        Registered::Done
+    );
+    assert_eq!(
+        store.register(&alice, &key(2), t(2)).unwrap(),
+        Registered::Taken
+    );
+    assert!(store.identity(&alice).unwrap().unwrap().hosted);
+    let keys = |store: &SqliteStore| -> Vec<(risala_proto::auth::PublicKey, String)> {
+        store
+            .hosted_keys(&alice)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|k| (k.key, k.label))
+            .collect()
+    };
+    assert_eq!(keys(&store), [(key(1), String::new())]);
+
+    // The last key cannot be deleted; an unknown one is not found.
+    assert_eq!(
+        store.delete_hosted_key(&alice, &key(1)).unwrap(),
+        KeyChange::LastKey
+    );
+    assert_eq!(
+        store.delete_hosted_key(&alice, &key(2)).unwrap(),
+        KeyChange::NotFound
+    );
+
+    let KeyChange::Done(after) = store
+        .add_hosted_key(&alice, &key(2), "phone", 3, t(2))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(after.len(), 2);
+    // Adding a key again changes its label.
+    store
+        .add_hosted_key(&alice, &key(2), "new\\sphone", 3, t(3))
+        .unwrap();
+    store.add_hosted_key(&alice, &key(3), "", 3, t(4)).unwrap();
+    assert_eq!(
+        store.add_hosted_key(&alice, &key(4), "", 3, t(5)).unwrap(),
+        KeyChange::TooMany
+    );
+    assert_eq!(
+        keys(&store),
+        [
+            (key(1), String::new()),
+            (key(2), "new\\sphone".into()),
+            (key(3), String::new())
+        ]
+    );
+    let KeyChange::Done(after) = store.delete_hosted_key(&alice, &key(1)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].key, key(2));
+    assert_eq!(
+        store.hosted_identities().unwrap(),
+        [(alice.clone(), store.hosted_keys(&alice).unwrap().unwrap())]
+    );
+}
+
+#[test]
+fn forgetting_an_identity() {
+    let (store, general) = store_with_room();
+    let alice = uid("alice@example.org");
+    let bob = uid("bob@example.net");
+    store.register(&alice, &key(1), t(0)).unwrap();
+    let other = match store.create_room(&room("#alice"), &alice, t(0)).unwrap() {
+        Created::New(r) => r,
+        Created::Exists(_) => panic!(),
+    };
+    store
+        .append(general, &event("alice@example.org", EventKind::Join))
+        .unwrap();
+    store
+        .append(
+            general,
+            &NewEvent {
+                cid: Some("0123456789abcdef".parse().unwrap()),
+                ..msg("alice@example.org", 0, "hi")
+            },
+        )
+        .unwrap();
+    store
+        .append(
+            general,
+            &event("bob@example.net", EventKind::Invite { uid: alice.clone() }),
+        )
+        .unwrap();
+    store.set_read_marker(general, &alice, seq(2)).unwrap();
+    store.set_read_marker(general, &bob, seq(2)).unwrap();
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO blocks (uid, target, t) VALUES ('alice@example.org', 'bob@example.net', 0);
+             INSERT INTO operators (uid, added) VALUES ('alice@example.org', 0);
+             INSERT INTO push_registrations (device_key, url, uid, tag, added)
+                 VALUES ('k', 'https://push.example/x', 'alice@example.org', 't', 0);",
+        )
+        .unwrap();
+    assert_eq!(
+        store.rooms_with_role_or_invite(&alice).unwrap(),
+        [room("#alice"), room("#general")]
+    );
+    assert_eq!(store.operators().unwrap(), std::slice::from_ref(&alice));
+
+    store.forget_identity(&alice, true, t(9)).unwrap();
+    assert_eq!(store.identity(&alice).unwrap(), None);
+    assert_eq!(store.hosted_keys(&alice).unwrap(), None);
+    assert_eq!(count(&store, "hosted_keys"), 0);
+    assert!(store.rooms_with_role_or_invite(&alice).unwrap().is_empty());
+    assert!(store.read_markers(&alice).unwrap().is_empty());
+    assert_eq!(store.read_markers(&bob).unwrap(), [(general, seq(2))]);
+    for table in [
+        "blocks",
+        "operators",
+        "push_registrations",
+        "cids",
+        "members",
+        "invites",
+        "roles",
+    ] {
+        assert_eq!(count(&store, table), 0, "{table}");
+    }
+    assert!(
+        store
+            .room(&room("#alice"))
+            .unwrap()
+            .unwrap()
+            .roles
+            .is_empty()
+    );
+    let _ = other;
+    // Retired: never again (4.8, 10.5).
+    assert_eq!(
+        store.register(&alice, &key(2), t(10)).unwrap(),
+        Registered::Retired
+    );
+    // Without retiring, a name may come back.
+    store
+        .register(&uid("carol@example.org"), &key(3), t(0))
+        .unwrap();
+    store
+        .forget_identity(&uid("carol@example.org"), false, t(9))
+        .unwrap();
+    assert_eq!(
+        store
+            .register(&uid("carol@example.org"), &key(3), t(10))
+            .unwrap(),
+        Registered::Done
+    );
+}
+
+#[test]
+fn read_markers_only_move_forward_and_stop_at_the_head() {
+    let (store, general) = store_with_room();
+    let alice = uid("alice@example.org");
+    // No events yet: no marker.
+    assert_eq!(
+        store.set_read_marker(general, &alice, seq(3)).unwrap(),
+        None
+    );
+    for n in 0..5 {
+        store
+            .append(general, &msg("bob@example.net", n, "x"))
+            .unwrap();
+    }
+    assert_eq!(
+        store.set_read_marker(general, &alice, seq(3)).unwrap(),
+        Some(seq(3))
+    );
+    assert_eq!(
+        store.set_read_marker(general, &alice, seq(2)).unwrap(),
+        Some(seq(3))
+    );
+    assert_eq!(
+        store.set_read_marker(general, &alice, seq(99)).unwrap(),
+        Some(seq(5))
+    );
+    assert_eq!(store.read_markers(&alice).unwrap(), [(general, seq(5))]);
+}
