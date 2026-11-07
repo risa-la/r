@@ -463,6 +463,32 @@ fn joining() {
 }
 
 #[test]
+fn info_checks_the_id() {
+    // 6.2: INFO reports the room's id, compared like the others (5.1).
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let room = "#general".parse().unwrap();
+    let out = h.engine.info(&room);
+    h.absorb(out);
+    let r = h.expect("INFO #general");
+    h.reply(
+        r,
+        &["SET #general topic now"],
+        "OK id=k1 members=2 head=3 role=member joined=yes",
+    );
+    assert_eq!(h.seqs("#general"), [1, 2, 3]);
+    h.idle();
+    // Not in the room, and it is another room by now.
+    let out = h.engine.info(&room);
+    h.absorb(out);
+    let r = h.expect("INFO #general");
+    h.reply(r, &[], "OK id=k2 members=1 head=1 role=none joined=no");
+    assert_eq!(h.seqs("#general"), Vec::<u64>::new());
+    assert!(!h.conv("#general").joined);
+    assert!(!h.engine.is_live(&conv("#general")));
+}
+
+#[test]
 fn own_join_from_another_device() {
     // 6.1: the JOIN's id differs from the stored one.
     let mut h = H::new(ALICE);
