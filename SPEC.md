@@ -847,6 +847,7 @@ reaction as a short message.
 
 Members of a room who are allowed to post (6.3) may send messages to it.
 Both participants of a direct conversation may send messages in it.
+Anyone else gets `ERR forbidden`.
 
 ### 5.4. Deleting Messages
 
@@ -1086,6 +1087,7 @@ LIST [after=<room>] [limit=<n>]
 then `OK more=<0 or 1>`
 
 - `<members>` is the number of members.
+- A guest's LIST leaves out rooms whose `guests` setting is `none`.
 - Rooms come in order of name, compared byte by byte.
 - **`after`** returns only rooms whose names sort after `<room>`, which
   need not exist. To fetch the next page, send LIST again with `after`
@@ -1124,6 +1126,13 @@ Who may join:
 - Joining a private room takes an invitation (6.4), unless you hold the
   role owner or mod in it (6.3).
 - Guests may join only rooms whose `guests` setting is not `none`.
+
+A room you cannot see, meaning a private room you are not a member of
+and hold no role or invitation in, gets `ERR not-found`, as if it did
+not exist. A room you can see but may not join, for example because you
+are banned or are a guest and its `guests` setting is `none`, gets
+`ERR forbidden`. INFO, HISTORY and RELATED follow the same rule for
+rooms you may not read.
 
 An identity stays a member across connections until it leaves. After
 signing in, it receives live events for all its rooms without joining
@@ -1356,7 +1365,8 @@ conversation afresh as in 7.1.
 
 - **With `after`:** the earliest `limit` events whose seq is greater than
   `after` (and less than `before`, if it is given). `more=1` means there
-  are more events after the last one returned.
+  are more events after the last one returned, and below `before` if it
+  is given.
 - **Without `after`:** the latest `limit` events whose seq is less than
   `before`, or the latest of all events if `before` is not given.
   `more=1` means there are older events before the first one returned.
@@ -1462,6 +1472,9 @@ To make resending safe:
 - If the same identity has already sent a message with that cid in the
   last 24 hours, to the same conversation, the server MUST NOT create a
   new event. It replies `OK seq=<seq>` with the existing message's seq.
+  It checks the cid before anything else about the message, so this
+  holds even if the sender has since left the room or the reply target
+  has been deleted.
 - "The same conversation" means the same id (5.1). After a room is
   dropped and created again (10.4), a cid from the old room does not
   match, so a resent message is sent to the new room. Otherwise the
@@ -1918,7 +1931,8 @@ reasons, such as shutting down, an idle timeout or a removed key.
 ## 12. Command Summary
 
 Commands a client can send. "Before sign-in" means the command is
-allowed before GUEST, AUTH or REGISTER.
+allowed before GUEST, AUTH or REGISTER. A guest that sends a command
+marked "no" under "Guests" gets `ERR forbidden`.
 
 | Command | Section | Before sign-in | Guests |
 |---|---|---|---|

@@ -490,10 +490,16 @@ async fn guests_cannot_join_everywhere() {
         set(s, "#readonly", RoomSetting::Guests(GuestAccess::Read));
     });
     let mut sam = h.guest("sam").await;
-    for room in ["#private", "#members", "#nowhere"] {
+    // Private rooms stay hidden; a visible room closed to guests says so.
+    for room in ["#private", "#nowhere"] {
         h.send(&sam, &format!("join {room}")).await;
         assert_eq!(sam.lines(), ["ERR not-found no such room"], "{room}");
     }
+    h.send(&sam, "join #members").await;
+    assert_eq!(
+        sam.lines(),
+        ["ERR forbidden guests may not enter this room"]
+    );
     h.send(&sam, "join #readonly").await;
     let lines = sam.lines();
     assert_eq!(
@@ -577,10 +583,21 @@ async fn closing_before_sign_in_records_nothing() {
 #[tokio::test]
 async fn list_shows_public_rooms_in_order() {
     let mut c = config();
-    c.rooms = strings(&["#b", "#a", "#c-hidden", "#d", "#a.b", "#a-b", "#general"]);
+    c.rooms = strings(&[
+        "#b",
+        "#a",
+        "#c-hidden",
+        "#c-no-guests",
+        "#d",
+        "#a.b",
+        "#a-b",
+        "#general",
+    ]);
     c.limits.max_list = 3;
     let mut h = Harness::with(c, |s| {
         set(s, "#c-hidden", RoomSetting::Public(false));
+        // Guests do not see rooms they may not enter.
+        set(s, "#c-no-guests", RoomSetting::Guests(GuestAccess::None));
         set(s, "#d", RoomSetting::Topic("the d room".into()));
     });
     let mut sam = h.guest("sam").await;
@@ -929,10 +946,15 @@ async fn history_follows_the_guest_rules() {
         set(s, "#members", RoomSetting::Guests(GuestAccess::None));
     });
     let mut sam = h.guest("sam").await;
-    for conv in ["#private", "#members", "#nowhere"] {
+    for conv in ["#private", "#nowhere"] {
         h.send(&sam, &format!("history {conv}")).await;
         assert_eq!(sam.lines(), ["ERR not-found no such room"], "{conv}");
     }
+    h.send(&sam, "history #members").await;
+    assert_eq!(
+        sam.lines(),
+        ["ERR forbidden guests may not enter this room"]
+    );
     h.send(&sam, "history bob@example.net").await;
     h.send(&sam, "history ~bob").await;
     assert_eq!(

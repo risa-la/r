@@ -72,26 +72,25 @@ fn send_settings(reply: &Reply, st: &RoomState) {
     }
 }
 
-/// Whether `uid` may join the room (6.1, 6.3), not counting bans and
-/// invitations, which come with identities in M3.
-fn may_join(st: &RoomState, uid: &Uid) -> bool {
-    if uid.is_guest() {
-        // Guests cannot be invited, so private rooms are closed to them
-        // (4.2, 6.1).
-        st.settings.public && st.settings.guests.allows_read()
-    } else {
-        // M3: room bans, invitations and operators.
-        st.settings.public || st.roles.contains_key(uid)
-    }
+/// Whether `uid` can know that the room exists: it is public, or `uid` is
+/// a member or holds a role in it. Guests cannot be invited or hold roles
+/// (4.2). M3: invitations and operators.
+fn visible(st: &RoomState, uid: &Uid, member: bool) -> bool {
+    member || st.settings.public || (!uid.is_guest() && st.roles.contains_key(uid))
 }
 
-/// Whether `uid` may read the room's history and see it in INFO (7.2,
-/// 6.2). A room `uid` may not read is `ERR not-found`.
-fn may_read(st: &RoomState, uid: &Uid, member: bool) -> bool {
-    if uid.is_guest() && !st.settings.guests.allows_read() {
-        return false;
+/// Checks that `uid` may read the room's history and INFO (7.2, 6.2), or
+/// join it when `member` is false (6.1). A room it cannot see gets
+/// `ERR not-found`, so private rooms stay hidden. A room it can see but
+/// may not enter gets `ERR forbidden` (6.1). M3: room bans.
+fn check_access(st: &RoomState, uid: &Uid, member: bool) -> Result<(), Fail> {
+    if !visible(st, uid, member) {
+        return Err(not_found());
     }
-    member || may_join(st, uid)
+    if uid.is_guest() && !st.settings.guests.allows_read() {
+        return Err(fail(ErrorCode::Forbidden, "guests may not enter this room"));
+    }
+    Ok(())
 }
 
 /// What INFO reports as `role` (6.2, 6.3).
@@ -180,7 +179,7 @@ impl Inner {
     ) -> Outcome {
         match command {
             Command::Info { room: Some(room) } => self.info_room(uid, reply, &room).await,
-            Command::List(page) => self.list(reply, page).await,
+            Command::List(page) => self.list(uid, reply, page).await,
             Command::Join { room } => self.join(uid, reply, &room).await,
             Command::Part { room, reason } => self.part(uid, &room, reason).await,
             Command::Msg {
@@ -247,9 +246,7 @@ impl Inner {
             let reg = self.reg();
             (reg.is_member(room, uid), reg.member_count(room))
         };
-        if !may_read(&st, uid, member) {
-            return Err(not_found());
-        }
+        check_access(&st, uid, member)?;
         send_settings(reply, &st);
         // A room from the configuration has no events until someone joins,
         // and then reports `head=0` (6.2).
@@ -264,8 +261,8 @@ impl Inner {
         ))
     }
 
-    /// LIST (6.1).
-    async fn list(&self, reply: &Reply, page: RoomPage) -> Outcome {
+    /// LIST (6.1). A guest sees only the rooms guests may enter.
+    async fn list(&self, uid: &Uid, reply: &Reply, page: RoomPage) -> Outcome {
         let limit = page_limit(page.limit, DEFAULT_LIST_LIMIT, self.config.limits.max_list);
         let entries: Vec<_> = {
             let rooms = self.rooms.read().unwrap_or_else(|e| e.into_inner());
@@ -282,7 +279,7 @@ impl Inner {
         let mut more = false;
         for entry in entries {
             let st = entry.state.lock().await;
-            if !st.settings.public {
+            if !st.settings.public || (uid.is_guest() && !st.settings.guests.allows_read()) {
                 continue;
             }
             if lines.len() as u64 == limit {
@@ -342,9 +339,7 @@ impl Inner {
         let mut st = entry.state.lock().await;
         let member = self.reg().is_member(room, uid);
         if !member {
-            if !may_join(&st, uid) {
-                return Err(not_found());
-            }
+            check_access(&st, uid, false)?;
             let event = NewEvent {
                 t: self.now(),
                 from: uid.clone(),
@@ -432,9 +427,7 @@ impl Inner {
         let entry = self.room_entry(&room).ok_or_else(not_found)?;
         let mut st = entry.state.lock().await;
         let member = self.reg().is_member(&room, uid);
-        if !may_read(&st, uid, member) {
-            return Err(not_found());
-        }
+        check_access(&st, uid, member)?;
 
         // A message that was already sent gets its seq again (7.6), even if
         // what would be checked below has changed since.
@@ -555,9 +548,7 @@ impl Inner {
         let (key, id) = {
             let st = entry.state.lock().await;
             let member = self.reg().is_member(&room, uid);
-            if !may_read(&st, uid, member) {
-                return Err(not_found());
-            }
+            check_access(&st, uid, member)?;
             (st.key, st.id.clone())
         };
         let query = HistoryQuery {

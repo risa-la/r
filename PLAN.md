@@ -316,6 +316,18 @@ Settled (now in SPEC.md):
       so on.
     - REGISTER: the client learns the identity domain from INFO first.
 
+14. **Found while building the server core** (5.3, 6.1, 7.2, 7.6, 12).
+    - HISTORY with `after` and `before`: `more=1` counts only events
+      below `before`.
+    - A room you cannot see gets `ERR not-found`. A room you can see but
+      may not join or read, such as a guest in a `guests none` room,
+      gets `ERR forbidden`.
+    - MSG to a room you are not a member of, and guests sending commands
+      only identities may use, get `ERR forbidden`.
+    - A resent cid is checked before anything else, so it always gets
+      the original seq.
+    - A guest's LIST leaves out rooms closed to guests.
+
 Nothing is open right now.
 
 ## 6. Decisions
