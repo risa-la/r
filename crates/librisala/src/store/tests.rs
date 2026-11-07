@@ -845,7 +845,7 @@ fn blocked_people_can_be_hidden_in_rooms() {
         "troll@example.com".parse().unwrap(),
     ];
     let ((), changes) = store
-        .write(|tx| tx.set_blocks(account, &blocks).map(drop))
+        .write(|tx| tx.apply_blocks(account, &blocks, 0).map(drop))
         .unwrap();
     assert_eq!(changes, [Change::Blocks { account }]);
     // Blocking alone hides nothing.
@@ -870,7 +870,7 @@ fn blocked_people_can_be_hidden_in_rooms() {
 
     // Unblocking shows them again.
     let ((), changes) = store
-        .write(|tx| tx.set_block(account, &blocks[1], false).map(drop))
+        .write(|tx| tx.change_block(account, &blocks[1], false).map(drop))
         .unwrap();
     assert_eq!(changes, [Change::Blocks { account }]);
     assert_eq!(shown(&store), [1, 3, 5, 6]);

@@ -142,7 +142,11 @@ enum Pending {
         target: BlockTarget,
         on: bool,
     },
-    Blocks,
+    Blocks {
+        /// The account's block clock when BLOCKS was sent: the reply
+        /// covers the blocks as they were then (5.7).
+        since: u64,
+    },
     History {
         conv: Conv,
         row: ConvId,
@@ -292,7 +296,7 @@ impl SyncEngine {
     pub fn start(&mut self) -> Result<Output, SyncError> {
         self.request_sync();
         if !self.guest && self.config.fetch_blocks {
-            self.issue(Command::Blocks, Pending::Blocks);
+            self.request_blocks()?;
         }
         self.flush_outbox()?;
         Ok(self.finish())
@@ -338,6 +342,13 @@ impl SyncEngine {
                 }
             }
             ServerLine::Drop { id, room, reason } => self.on_drop(Some(id), room, reason)?,
+            // A block made or lifted on another device of the account
+            // (5.7): one target at a time, never the whole list.
+            ServerLine::Block { target } | ServerLine::Unblock { target } if !self.guest => {
+                let on = matches!(msg.line, ServerLine::Block { .. });
+                let account = self.account;
+                self.write(|tx| tx.change_block(account, target, on))?;
+            }
             _ => {}
         }
         Ok(self.finish())
@@ -367,7 +378,7 @@ impl SyncEngine {
             Pending::Members { room, roster } => self.on_members(req, &room, roster, reply)?,
             Pending::Whois => self.on_whois(req, reply)?,
             Pending::Block { target, on } => self.on_block(req, &target, on, reply)?,
-            Pending::Blocks => self.on_blocks(req, reply)?,
+            Pending::Blocks { since } => self.on_blocks(req, since, reply)?,
             Pending::History {
                 conv,
                 row,
@@ -593,10 +604,11 @@ impl SyncEngine {
         self.finish()
     }
 
-    /// Asks for the account's blocks (5.7), which replace the stored ones.
-    pub fn blocks(&mut self) -> Output {
-        self.issue(Command::Blocks, Pending::Blocks);
-        self.finish()
+    /// Asks for the account's blocks (5.7). The reply replaces the stored
+    /// ones, except those changed since it was sent, which are newer.
+    pub fn blocks(&mut self) -> Result<Output, SyncError> {
+        self.request_blocks()?;
+        Ok(self.finish())
     }
 
     /// Loads the page of history just below the newest stored run, while
@@ -703,6 +715,13 @@ impl SyncEngine {
 
     fn completed(&mut self, req: ReqId, outcome: Outcome) {
         self.out.completed.push(Completed { req, outcome });
+    }
+
+    /// Sends BLOCKS, noting the block clock as it is now.
+    fn request_blocks(&mut self) -> Result<(), SyncError> {
+        let since = self.store.blocks_clock(self.account)?;
+        self.issue(Command::Blocks, Pending::Blocks { since });
+        Ok(())
     }
 
     fn request_sync(&mut self) {
@@ -1173,13 +1192,13 @@ impl SyncEngine {
     ) -> Result<(), SyncError> {
         if matches!(reply.outcome, Outcome::Ok(_)) {
             let account = self.account;
-            self.write(|tx| tx.set_block(account, target, on))?;
+            self.write(|tx| tx.change_block(account, target, on))?;
         }
         self.completed(req, reply.outcome);
         Ok(())
     }
 
-    fn on_blocks(&mut self, req: ReqId, reply: Reply) -> Result<(), SyncError> {
+    fn on_blocks(&mut self, req: ReqId, since: u64, reply: Reply) -> Result<(), SyncError> {
         if matches!(reply.outcome, Outcome::Ok(_)) {
             let targets: Vec<BlockTarget> = reply
                 .lines
@@ -1190,7 +1209,10 @@ impl SyncEngine {
                 })
                 .collect();
             let account = self.account;
-            self.write(|tx| tx.set_blocks(account, &targets))?;
+            // As the blocks were when BLOCKS was sent: a change since,
+            // here or in another process sharing the cache, is newer
+            // (5.7), as with heads (7.1).
+            self.write(|tx| tx.apply_blocks(account, &targets, since))?;
         }
         self.completed(req, reply.outcome);
         Ok(())

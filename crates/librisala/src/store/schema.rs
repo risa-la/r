@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -249,6 +249,23 @@ ALTER TABLE accounts ADD COLUMN hide_blocked INTEGER NOT NULL DEFAULT 0;
 /// identity's key file, which the client tells the user plainly.
 const V6: &str = "
 ALTER TABLE accounts ADD COLUMN accepted_key TEXT;
+";
+
+/// Version 7: blocks changed one at a time, so that a BLOCKS reply that
+/// is out of date cannot undo a newer change (5.7).
+///
+/// - `accounts.blocks_clock` counts the account's block changes: BLOCK and
+///   UNBLOCK accepted, and BLOCK and UNBLOCK lines from its other devices.
+///   Every process sharing the cache moves the same clock.
+/// - `blocks.changed` is the clock value of a block's last change, and
+///   `blocks.blocked` is 0 for a block lifted since the last BLOCKS. A
+///   BLOCKS reply covers the account's blocks as they were when BLOCKS
+///   was sent, so it leaves alone those changed since, as the head check
+///   of 7.1 does with events.
+const V7: &str = "
+ALTER TABLE accounts ADD COLUMN blocks_clock INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE blocks ADD COLUMN blocked INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE blocks ADD COLUMN changed INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Brings the schema up to [`VERSION`].

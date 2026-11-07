@@ -888,7 +888,7 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
             PeopleOp::Whois(uid) => engine.whois(&uid),
             PeopleOp::Block(target) => engine.block(&target),
             PeopleOp::Unblock(target) => engine.unblock(&target),
-            PeopleOp::Blocks => engine.blocks(),
+            PeopleOp::Blocks => engine.blocks()?,
         },
         Input::Resume => engine.resume_outbox()?,
     };

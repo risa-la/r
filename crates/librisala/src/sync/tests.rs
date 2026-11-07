@@ -1671,14 +1671,14 @@ fn blocks() {
     assert_eq!(targets(&h), ["*@evil.example", "troll@example.com"]);
     // BLOCKS replaces the list: here, blocks removed on another device.
     h.changes.clear();
-    let out = h.engine.blocks();
+    let out = h.engine.blocks().unwrap();
     h.absorb(out);
     let r = h.expect("BLOCKS");
     h.reply(r, &["BLOCK troll@example.com"], "OK");
     assert_eq!(targets(&h), ["troll@example.com"]);
     // The same list again is no change.
     h.changes.clear();
-    let out = h.engine.blocks();
+    let out = h.engine.blocks().unwrap();
     h.absorb(out);
     let r = h.expect("BLOCKS");
     h.reply(r, &["BLOCK troll@example.com"], "OK");
@@ -1689,6 +1689,97 @@ fn blocks() {
     g.config.fetch_blocks = true;
     g.reconnect();
     g.idle();
+}
+
+fn blocks_of(h: &H) -> Vec<String> {
+    h.store
+        .blocks(h.account)
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[test]
+fn block_lines_from_other_devices_change_one_target() {
+    // 5.7: BLOCK and UNBLOCK lines change one target each, never the
+    // whole list.
+    let mut h = H::new(ALICE);
+    let r = h.start();
+    h.reply(r, &[], "OK");
+    let out = h.engine.blocks().unwrap();
+    h.absorb(out);
+    let r = h.expect("BLOCKS");
+    h.reply(r, &["BLOCK a@example.net", "BLOCK b@example.net"], "OK");
+    h.changes.clear();
+    h.line("BLOCK c@example.net");
+    assert_eq!(
+        blocks_of(&h),
+        ["a@example.net", "b@example.net", "c@example.net"]
+    );
+    assert!(h.changes.contains(&Change::Blocks { account: h.account }));
+    h.line("UNBLOCK a@example.net");
+    assert_eq!(blocks_of(&h), ["b@example.net", "c@example.net"]);
+    // Lifting a block that is not there changes nothing.
+    h.changes.clear();
+    h.line("UNBLOCK z@example.net");
+    assert!(h.changes.is_empty());
+    // A response line is part of a reply, not a change.
+    h.line("@ref=9 BLOCK d@example.net");
+    assert_eq!(blocks_of(&h), ["b@example.net", "c@example.net"]);
+    h.idle();
+}
+
+#[test]
+fn a_blocks_reply_does_not_undo_a_newer_change() {
+    // Two processes share the cache, each with its connection (PLAN.md
+    // 3.3). A's BLOCKS is in flight while B blocks x and lifts y. The
+    // server computed A's reply before, so it lacks x and still has y.
+    // It must undo neither, though it still drops z, which another
+    // device lifted before the reply.
+    let mut a = H::new(ALICE);
+    let r = a.start();
+    a.reply(r, &[], "OK");
+    let out = a.engine.blocks().unwrap();
+    a.absorb(out);
+    let r = a.expect("BLOCKS");
+    a.reply(r, &["BLOCK y@example.net", "BLOCK z@example.net"], "OK");
+    assert_eq!(blocks_of(&a), ["y@example.net", "z@example.net"]);
+
+    let mut b = H::sharing(&a);
+    let r = b.start();
+    b.reply(r, &[], "OK");
+
+    let out = a.engine.blocks().unwrap();
+    a.absorb(out);
+    let stale = a.expect("BLOCKS");
+
+    let out = b.engine.block(&"x@example.net".parse().unwrap());
+    b.absorb(out);
+    let r = b.expect("BLOCK x@example.net");
+    b.reply(r, &[], "OK");
+    let out = b.engine.unblock(&"y@example.net".parse().unwrap());
+    b.absorb(out);
+    let r = b.expect("UNBLOCK y@example.net");
+    b.reply(r, &[], "OK");
+    assert_eq!(blocks_of(&a), ["x@example.net", "z@example.net"]);
+
+    a.reply(stale, &["BLOCK y@example.net"], "OK");
+    assert_eq!(blocks_of(&a), ["x@example.net"]);
+    // Then the server's lines for B's changes reach A, after its reply,
+    // and change nothing more.
+    a.line("BLOCK x@example.net");
+    a.line("UNBLOCK y@example.net");
+    assert_eq!(blocks_of(&a), ["x@example.net"]);
+
+    // A later BLOCKS, sent after both changes, settles everything.
+    let out = a.engine.blocks().unwrap();
+    a.absorb(out);
+    let r = a.expect("BLOCKS");
+    a.reply(r, &["BLOCK w@example.net", "BLOCK x@example.net"], "OK");
+    assert_eq!(blocks_of(&a), ["w@example.net", "x@example.net"]);
+    a.idle();
+    b.idle();
 }
 
 // ---------------------------------------------------------------------------

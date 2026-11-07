@@ -19,6 +19,7 @@ pub(super) const HIDDEN: &str = "(e.verb = 'MSG' AND e.own = 0 AND EXISTS (
     JOIN accounts ha ON ha.id = hc.account
     JOIN blocks b ON b.account = ha.id
     WHERE hc.id = e.conv AND ha.hide_blocked = 1 AND substr(hc.name, 1, 1) = '#'
+        AND b.blocked = 1
         AND (b.target = e.author
             OR (substr(b.target, 1, 2) = '*@' AND instr(e.author, '@') > 0
                 AND (substr(e.author, instr(e.author, '@') + 1) = substr(b.target, 3)
@@ -90,57 +91,76 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Replaces the account's blocks with the list BLOCKS returned (5.7).
-    /// Returns whether they changed.
-    pub(crate) fn set_blocks(
+    /// Applies the list a BLOCKS reply returned (5.7), as the blocks were
+    /// when BLOCKS was sent, at block clock `since`
+    /// ([`Store::blocks_clock`]). Blocks changed since then, by this
+    /// process or another, or by BLOCK and UNBLOCK lines, are newer than
+    /// the reply and are left alone. The others become what the reply
+    /// says. Returns whether the blocks changed.
+    pub(crate) fn apply_blocks(
         &mut self,
         account: AccountId,
         targets: &[BlockTarget],
+        since: u64,
     ) -> Result<bool, StoreError> {
-        let old: HashSet<String> = blocks_of(self.conn(), account)?
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        let new: HashSet<String> = targets.iter().map(ToString::to_string).collect();
-        if old == new {
-            return Ok(false);
-        }
-        self.conn()
-            .execute("DELETE FROM blocks WHERE account = ?1", [account.0])?;
-        for target in &new {
+        let before = blocks_of(self.conn(), account)?;
+        let listed: HashSet<String> = targets.iter().map(ToString::to_string).collect();
+        let since = super::sql(since);
+        // Rows as old as the reply: the reply says what they are now.
+        self.conn().execute(
+            "DELETE FROM blocks WHERE account = ?1 AND changed <= ?2",
+            params![account.0, since],
+        )?;
+        for target in &listed {
             self.conn().execute(
-                "INSERT INTO blocks (account, target) VALUES (?1, ?2)",
-                params![account.0, target],
+                "INSERT INTO blocks (account, target, blocked, changed) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT (account, target) DO NOTHING",
+                params![account.0, target, since],
             )?;
         }
-        self.changed(Change::Blocks { account });
-        Ok(true)
+        let changed = blocks_of(self.conn(), account)? != before;
+        if changed {
+            self.changed(Change::Blocks { account });
+        }
+        Ok(changed)
     }
 
-    /// Adds a block, or removes one (5.7). Returns whether the blocks
-    /// changed.
-    pub(crate) fn set_block(
+    /// Adds a block, or removes one (5.7): BLOCK or UNBLOCK accepted, or a
+    /// BLOCK or UNBLOCK line from the account's other devices. Moves the
+    /// account's block clock, so that a BLOCKS reply sent before does not
+    /// undo it. Returns whether the blocks changed.
+    pub(crate) fn change_block(
         &mut self,
         account: AccountId,
         target: &BlockTarget,
         on: bool,
     ) -> Result<bool, StoreError> {
         let target = target.to_string();
-        let n = if on {
-            self.conn().execute(
-                "INSERT INTO blocks (account, target) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        let was: Option<bool> = self
+            .conn()
+            .query_row(
+                "SELECT blocked FROM blocks WHERE account = ?1 AND target = ?2",
                 params![account.0, target],
-            )?
-        } else {
-            self.conn().execute(
-                "DELETE FROM blocks WHERE account = ?1 AND target = ?2",
-                params![account.0, target],
-            )?
-        };
-        if n > 0 {
+                |r| r.get(0),
+            )
+            .optional()?;
+        let clock: i64 = self.conn().query_row(
+            "UPDATE accounts SET blocks_clock = blocks_clock + 1 WHERE id = ?1
+             RETURNING blocks_clock",
+            [account.0],
+            |r| r.get(0),
+        )?;
+        self.conn().execute(
+            "INSERT INTO blocks (account, target, blocked, changed) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account, target) DO UPDATE
+                 SET blocked = excluded.blocked, changed = excluded.changed",
+            params![account.0, target, on, clock],
+        )?;
+        let changed = was.unwrap_or(false) != on;
+        if changed {
             self.changed(Change::Blocks { account });
         }
-        Ok(n > 0)
+        Ok(changed)
     }
 }
 
@@ -148,8 +168,9 @@ fn blocks_of(
     conn: &rusqlite::Connection,
     account: AccountId,
 ) -> Result<Vec<BlockTarget>, StoreError> {
-    let mut stmt =
-        conn.prepare_cached("SELECT target FROM blocks WHERE account = ?1 ORDER BY target")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT target FROM blocks WHERE account = ?1 AND blocked = 1 ORDER BY target",
+    )?;
     let rows: Vec<String> = stmt
         .query_map([account.0], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
@@ -210,6 +231,22 @@ impl Store {
     /// order.
     pub fn blocks(&self, account: AccountId) -> Result<Vec<BlockTarget>, StoreError> {
         self.read(|conn| blocks_of(conn, account))
+    }
+
+    /// The account's block clock: how many times its blocks have changed
+    /// one at a time (5.7). Read it when sending BLOCKS, for
+    /// [`Tx::apply_blocks`].
+    pub fn blocks_clock(&self, account: AccountId) -> Result<u64, StoreError> {
+        self.read(|conn| {
+            let clock: Option<i64> = conn
+                .query_row(
+                    "SELECT blocks_clock FROM accounts WHERE id = ?1",
+                    [account.0],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(clock.map_or(0, |c| c.max(0) as u64))
+        })
     }
 
     /// Whether one of the account's blocks covers `uid` (5.7).

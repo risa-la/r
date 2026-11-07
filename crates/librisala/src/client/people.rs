@@ -236,9 +236,12 @@ impl Account {
 
     /// Asks the server for the account's blocks (BLOCKS, 5.7), keeps them
     /// in the cache and returns them, in byte order. An identity also asks
-    /// on each connection, so that blocks made on its other devices are
-    /// known. Needs a connection; [`cached_blocks`](Self::cached_blocks)
-    /// does not.
+    /// on each connection, and while connected hears of blocks made or
+    /// lifted on its other devices one at a time, so the cache follows
+    /// them. Blocks changed after BLOCKS was sent, here or by another
+    /// process sharing the cache, are newer than its answer, and the cache
+    /// keeps them as they are. Needs a connection;
+    /// [`cached_blocks`](Self::cached_blocks) does not.
     pub async fn blocks(&self) -> Result<Vec<String>, ClientError> {
         self.identity_only("block")?;
         let lines = self.people(PeopleOp::Blocks).await?;
