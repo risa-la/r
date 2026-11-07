@@ -1,24 +1,6 @@
 {
   "sourceLanguage": "en",
   "strings": {
-    "Rooms": {
-      "comment": "Room list heading.",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Rooms"
-          }
-        },
-        "ar": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "الغرف"
-          }
-        }
-      }
-    },
     "Risala": {
       "comment": "Application name.",
       "extractionState": "manual",
@@ -37,24 +19,6 @@
         }
       }
     },
-    "No rooms": {
-      "comment": "Empty room list title.",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "No rooms"
-          }
-        },
-        "ar": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "لا توجد غرف"
-          }
-        }
-      }
-    },
     "Choose a room": {
       "comment": "Title when no room is selected.",
       "extractionState": "manual",
@@ -69,24 +33,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "اختر غرفة"
-          }
-        }
-      }
-    },
-    "Your rooms will appear here.": {
-      "comment": "Empty room list description.",
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Your rooms will appear here."
-          }
-        },
-        "ar": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "ستظهر غرفك هنا."
           }
         }
       }
@@ -141,40 +87,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "إرسال الرسالة"
-          }
-        }
-      }
-    },
-    "Not connected": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Not connected"
-          }
-        },
-        "ar": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "غير متصل"
-          }
-        }
-      }
-    },
-    "Your rooms will appear when connected to a server.": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Your rooms will appear when connected to a server."
-          }
-        },
-        "ar": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "ستظهر غرفك عند الاتصال بخادم."
           }
         }
       }
@@ -312,6 +224,186 @@
           "stringUnit": {
             "state": "translated",
             "value": "تعذّر تحميل الرسائل."
+          }
+        }
+      }
+    },
+    "Appearance": {
+      "comment": "Settings label for choosing light, dark, or system appearance.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Appearance"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "المظهر"
+          }
+        }
+      }
+    },
+    "System": {
+      "comment": "Appearance option that follows the system setting.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "System"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "النظام"
+          }
+        }
+      }
+    },
+    "Light": {
+      "comment": "Appearance option.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Light"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "فاتح"
+          }
+        }
+      }
+    },
+    "Dark": {
+      "comment": "Appearance option.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dark"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "داكن"
+          }
+        }
+      }
+    },
+    "Chats": {
+      "comment": "Chat list heading and breadcrumb location.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chats"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "المحادثات"
+          }
+        }
+      }
+    },
+    "No chats yet": {
+      "comment": "Empty chat list title.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No chats yet"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "لا محادثات بعد"
+          }
+        }
+      }
+    },
+    "Hudhud is holding a letter with nowhere to take it.": {
+      "comment": "Empty chat list message. Hudhud is the app's hoopoe mascot.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hudhud is holding a letter with nowhere to take it."
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "الهدهد يحمل رسالة وليس لديه مكان يأخذها إليه."
+          }
+        }
+      }
+    },
+    "Give Hudhud a job": {
+      "comment": "Empty chat list primary action; opens the command line. Hudhud is the app's hoopoe mascot.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Give Hudhud a job"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "أعطِ الهدهد مهمة"
+          }
+        }
+      }
+    },
+    "Paste invite": {
+      "comment": "Empty chat list action that joins from an invite link on the clipboard.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paste invite"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "الصق دعوة"
+          }
+        }
+      }
+    },
+    "Browse spaces": {
+      "comment": "Empty chat list action that opens the list of public spaces.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Browse spaces"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "تصفّح المساحات"
           }
         }
       }

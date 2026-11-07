@@ -11,6 +11,7 @@
           ../Sources
           ../Resources
           ../Tests
+          ../Info.plist
           ../Risala.xcodeproj/project.pbxproj
           ../Risala.xcodeproj/xcshareddata/xcschemes/Risala.xcscheme
           ../sweetpad.toml

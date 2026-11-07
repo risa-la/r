@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Keys with no INFOPLIST_KEY_ build setting. Xcode merges the generated keys in. -->
+	<!-- Bundled fonts on iOS, by file name. -->
+	<key>UIAppFonts</key>
+	<array>
+		<string>JetBrainsMono-Regular.ttf</string>
+		<string>JetBrainsMono-SemiBold.ttf</string>
+		<string>JetBrainsMono-Bold.ttf</string>
+		<string>JetBrainsMono-ExtraBold.ttf</string>
+	</array>
+	<!-- Bundled fonts on macOS: every font in Contents/Resources. -->
+	<key>ATSApplicationFontsPath</key>
+	<string>.</string>
+</dict>
+</plist>

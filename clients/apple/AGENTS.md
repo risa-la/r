@@ -42,11 +42,30 @@ Measure responsive launch and useful cached content separately in Release builds
 
 ## Design
 
-Keep typography, color, and layout roles in `Sources/Design` and reusable
-view styling in `Sources/Design/Styles`. Use these roles in feature views; keep
-feature components with their feature. Preserve native controls and semantic
-fonts/colors. Add asset-catalog colors with appearance variants when branding
-requires them; avoid fixed RGB values in views.
+Keep typography, color, and layout roles in `Sources/Design`, reusable
+view styling in `Sources/Design/Styles`, and views shared across features
+(breadcrumb, glyph, status line) in `Sources/Design/Components`. Use these roles
+in feature views; keep feature-specific components with their feature. Preserve
+native controls and semantic fonts/colors. Avoid fixed RGB values in views.
+
+The app is moving to the terminal look in the Paper file's TUI mockups: framed
+panels, JetBrains Mono, a breadcrumb heading, and a status line. Its colors live
+in `Resources/Assets.xcassets/Palette` with light and dark variants; dark values
+come from the mockups. Name colorsets by role and use Xcode's generated symbols
+(`.foregroundStyle(.textTertiary)`) rather than wrapping them; avoid names
+SwiftUI already uses, such as `selection`. Text colors must reach 4.5:1 on `Panel` in both
+appearances, so adjust a value rather than ship low-contrast text. JetBrains Mono is bundled in
+`Resources/Fonts` under OFL-1.1 (see `REUSE.toml`) and declared in `Info.plist`
+(`UIAppFonts` for iOS); to use another weight, add its file to both. Screens move to
+the terminal roles one at a time; until then they keep the hierarchical roles.
+
+## Settings
+
+Appearance follows the system unless the person picks light or dark. Preferences
+live in user defaults and are read with `@AppStorage`. macOS shows them in the
+`Settings` scene; iOS shows them in the system Settings app through
+`Resources/Settings.bundle` (iOS only, by a platform filter in the project).
+Keep the two in step: same keys, values, and English/Arabic titles.
 
 ## Accessibility and formatting
 
