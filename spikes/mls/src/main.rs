@@ -2,12 +2,15 @@
 //!
 //! `cargo run --release` runs every check and prints what happened.
 //! `cargo run --release -- storage` runs only the storage check.
+//! `cargo run --release -- vectors` prints the Appendix B test vector for
+//! history keys and ENC (see `vectors.rs`).
 
 mod common;
 mod history;
 mod libcrux_mldsa;
 mod server;
 mod storage;
+mod vectors;
 
 use std::time::Instant;
 
@@ -92,6 +95,10 @@ fn expect_err(label: &str, r: Result<server::Accepted, Err>) {
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("storage") {
         storage::run();
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("vectors") {
+        vectors::run();
         return;
     }
     check0_providers();

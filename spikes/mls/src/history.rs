@@ -54,6 +54,12 @@ pub fn sign_content(label: &str, content: &[u8]) -> Vec<u8> {
 
 /// RFC 9420 8: ExpandWithLabel with the suite's KDF (HKDF-SHA384).
 pub fn expand_with_label(secret: &[u8], label: &str, context: &[u8], len: u16) -> Vec<u8> {
+    expand_with_label_bytes(secret, label.as_bytes(), context, len)
+}
+
+/// ExpandWithLabel with a label given as bytes (the RFC 9420 test vectors
+/// use labels that are not UTF-8).
+pub fn expand_with_label_bytes(secret: &[u8], label: &[u8], context: &[u8], len: u16) -> Vec<u8> {
     #[derive(TlsSerialize, TlsSize)]
     struct KdfLabel {
         length: u16,
@@ -62,7 +68,7 @@ pub fn expand_with_label(secret: &[u8], label: &str, context: &[u8], len: u16) -
     }
     let info = KdfLabel {
         length: len,
-        label: format!("MLS 1.0 {label}").into_bytes().into(),
+        label: [b"MLS 1.0 ".as_slice(), label].concat().into(),
         context: context.to_vec().into(),
     }
     .tls_serialize_detached()
@@ -71,6 +77,18 @@ pub fn expand_with_label(secret: &[u8], label: &str, context: &[u8], len: u16) -
     let mut out = vec![0u8; len as usize];
     hk.expand(&info, &mut out).unwrap();
     out
+}
+
+/// RFC 9420 8: DeriveSecret(Secret, Label) = ExpandWithLabel(Secret, Label, "", Nh).
+pub fn derive_secret(secret: &[u8], label: &[u8]) -> Vec<u8> {
+    expand_with_label_bytes(secret, label, b"", 48)
+}
+
+/// RFC 9420 8.5: MLS-Exporter(Label, Context, Length) =
+/// ExpandWithLabel(DeriveSecret(exporter_secret, Label), "exported", Hash(Context), Length).
+pub fn mls_exporter(exporter_secret: &[u8], label: &[u8], context: &[u8], len: u16) -> Vec<u8> {
+    let derived = derive_secret(exporter_secret, label);
+    expand_with_label_bytes(&derived, b"exported", &Sha384::digest(context), len)
 }
 
 pub fn frank(frank_key: &[u8], content: &[u8]) -> Vec<u8> {
@@ -131,21 +149,59 @@ pub fn encrypt(
     content: &str,
     pad: bool,
 ) -> Sent {
-    let mut m = RisalaMessage {
+    let r = Randomness {
         message_id: rand::random(),
-        sender_key_id: Sha384::digest(&key.pk).into(),
         frank_key: rand::random(),
+        salt: rand::random(),
+    };
+    encrypt_with(key, history_key, group_id, epoch, content, pad, &r).0
+}
+
+/// The random values a sender picks in 12.8 steps 2 and 6.
+pub struct Randomness {
+    pub message_id: [u8; 16],
+    pub frank_key: [u8; 32],
+    pub salt: [u8; 32],
+}
+
+/// Everything in between, for test vectors.
+pub struct Steps {
+    pub sender_key_id: [u8; 48],
+    pub tbs: Vec<u8>,
+    pub sign_content: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub padding_len: usize,
+    pub plaintext: Vec<u8>,
+    pub aad: Vec<u8>,
+    pub message_key: Vec<u8>,
+}
+
+/// 12.8 with the random values given, so the output is reproducible.
+pub fn encrypt_with(
+    key: &DeviceKey,
+    history_key: &[u8],
+    group_id: &[u8],
+    epoch: u64,
+    content: &str,
+    pad: bool,
+    r: &Randomness,
+) -> (Sent, Steps) {
+    let mut m = RisalaMessage {
+        message_id: r.message_id,
+        sender_key_id: Sha384::digest(&key.pk).into(),
+        frank_key: r.frank_key,
         content: content.as_bytes().to_vec().into(),
         signature: VLBytes::new(vec![]),
         padding: VLBytes::new(vec![]),
     };
-    let to_sign = sign_content("risala message", &tbs(group_id, epoch, &m));
+    let tbs_bytes = tbs(group_id, epoch, &m);
+    let to_sign = sign_content("risala message", &tbs_bytes);
     m.signature = key.raw_sign(&to_sign).into();
     if pad {
         pad_to(&mut m, 256);
     }
     let pt = m.tls_serialize_detached().unwrap();
-    let salt: [u8; 32] = rand::random();
+    let salt = r.salt;
     let mk = expand_with_label(history_key, "risala message key", &salt, 32);
     let ct = ChaCha20Poly1305::new_from_slice(&mk)
         .unwrap()
@@ -159,11 +215,22 @@ pub fn encrypt(
         .unwrap();
     let mut payload = salt.to_vec();
     payload.extend_from_slice(&ct);
-    Sent {
+    let steps = Steps {
+        sender_key_id: m.sender_key_id,
+        tbs: tbs_bytes,
+        sign_content: to_sign,
+        signature: m.signature.as_slice().to_vec(),
+        padding_len: m.padding.as_slice().len(),
+        plaintext: pt.clone(),
+        aad: aad(group_id, epoch),
+        message_key: mk,
+    };
+    let sent = Sent {
         payload,
         frank: frank(&m.frank_key, content.as_bytes()),
         plaintext_len: pt.len(),
-    }
+    };
+    (sent, steps)
 }
 
 /// The decryption steps of 12.8 (steps 2-5; step 1 and 6 are the

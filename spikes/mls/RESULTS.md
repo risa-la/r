@@ -6,6 +6,7 @@ A throwaway crate, outside the workspace. Run it with:
 cd spikes/mls
 cargo run --release            # every check; full output in output.txt
 cargo run --release -- storage # only the storage check
+cargo run --release -- vectors # the SPEC.md Appendix B vector for 12.8-12.9
 ```
 
 Timings are from a release build, single-threaded, on an AMD Threadripper
@@ -17,9 +18,11 @@ PRO 5995WX. Phones will be several times slower.
 | `src/server.rs` | `KEYPKG ADD`, `INIT` and `COMMIT` checks from 12.4 and 12.5, using only `PublicGroup` |
 | `src/history.rs` | 12.8 to 12.10 as written: RisalaMessage, SignWithLabel, ExpandWithLabel, franking, backup blobs |
 | `src/libcrux_mldsa.rs` | `openmls_libcrux_crypto` with ML-DSA-44 added from `libcrux-ml-dsa` |
+| `src/vectors.rs` | The Appendix B test vector for history keys and ENC, with fixed inputs, checked against the RFC 9420 suite 7 vectors and libcrux |
 | `src/storage.rs` | `openmls_sqlite_storage` on one file shared by two connections, plus the server's `PublicGroup` |
 | `src/main.rs` | The checks |
 | `output.txt` | Output of the last full run |
+| `vectors.txt` | Output of `-- vectors` |
 
 ## Results
 

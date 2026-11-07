@@ -412,11 +412,8 @@ Open:
 - The spec example tests, which now include the new verbs, and the
   Appendix B tests, which now use ML-DSA. Both fail until risala-proto
   catches up.
-- Whether 512 devices per group and 8 MiB lines are the right limits
-  once we measure real commit and Welcome sizes.
-- Check that OpenMLS can build an external commit that removes the
-  joiner's own earlier leaf (12.6), and can take the ratchet tree out of
-  band for Welcome and external joins.
+- The size limits, and whether OpenMLS can remove the joiner's earlier
+  leaf and take the tree out of band, were settled by the spike (22).
 
 20. **Found by the librisala review** (2.1, 3.2, 6.4, 7.1, 10.4).
     - The 7.1 head check compares with the sync point, not the newest
@@ -438,6 +435,71 @@ Open:
     - `guests none` removes guests from that room only.
     - Servers SHOULD refuse a client without X25519MLKEM768 with
       `handshake_failure`.
+
+22. **Settled by the OpenMLS spike** (2.3, 12.2, 12.4-12.9, 14, 15,
+    App. B). `spikes/mls` checked OpenMLS 0.9 against Section 12 of
+    draft-02. Its report is `spikes/mls/RESULTS.md`, and changes A-Q
+    below refer to it.
+    - Decided with the user on 2026-11-07:
+      - **Crypto provider** (implementation only, not in the spec):
+        `openmls_libcrux_crypto`, plus a small wrapper that adds
+        ML-DSA-44 from `libcrux-ml-dsa`, as in
+        `spikes/mls/src/libcrux_mldsa.rs`. The binaries then carry one
+        ML-DSA, and it is formally verified. Drop the wrapper once
+        upstream supports ML-DSA.
+      - **A leaf's credential and signature key never change** (12.2,
+        12.5, 12.6; change C). OpenMLS accepts a path that changes them,
+        so the server and devices check this themselves. A new key means
+        a new leaf.
+      - **Lifetimes** (12.4, 12.6; change G). They are checked on upload
+        and when a commit adds a KeyPackage. Nobody checks the lifetimes
+        of leaves already in the tree, unlike the SHOULD in RFC 9420
+        section 7.3, because one device offline for longer than its
+        lifetime would otherwise stop everyone else from joining. Devices
+        call `skip_lifetime_validation()` when joining, and risalad keeps
+        each group as a stored `PublicGroup` instead of rebuilding it
+        from GroupInfo and tree, since `from_external` cannot skip the
+        check.
+      - **Rejoining** (12.6; change H). A device that could not process
+        a commit because MLS rejected it, not because of a risala rule,
+        MAY join again by external commit.
+      - **Splitting adds** (12.5; change Q). Clients SHOULD add at most
+        256 devices per commit. 8 MiB lines and 512 leaves stay: the
+        worst case, 511 devices added in one commit, is 80.5% of 8 MiB.
+    - Also from the spike:
+      - HPKE parameters pinned: KEM `0x647a` (X-Wing), HKDF-SHA384,
+        ChaCha20-Poly1305. OpenMLS names its X-Wing KEM `0x004D`
+        internally, but both providers pass `0x647a` to HPKE (A).
+      - Leaves list `last_resort` in their capabilities, and KEYPKG ADD
+        checks the capabilities (B).
+      - Remove allows the leaf of a key the same commit adds again (D).
+      - The joiner's earlier leaf is the one with its signature key, for
+        the server and devices alike (E).
+      - The GroupInfo checks are listed, with what the server cannot
+        check: the confirmation tag and path secrets. GroupContextExtensions
+        keeps the extension list apart from `history` (F).
+      - 12.8 is exact about padding, the `MLS 1.0 ` labels, HKDF-SHA384
+        with the history key as PRK, tag lengths and what the HMAC
+        covers. Devices keep each epoch's leaf keys and COMMIT seq, for
+        when retention has removed the COMMIT events. Content is at most
+        4 MiB, and the length limits of 2.3 do not apply to it (I-N).
+      - A device derives each history key before it applies the next
+        commit (O).
+      - The server keeps the tree while a commit's Welcomes are pending,
+        and a device deletes a Welcome only once it has joined (P).
+      - Appendix B has a test vector for the history key and ENC, from
+        `cargo run --release -- vectors` in `spikes/mls`. It starts at
+        the exporter secret, since a whole group cannot be made
+        reproducible.
+
+Open:
+
+- Confirm the maximum KeyPackage lifetime of 12 weeks and one hour
+  (12.4). RFC 9420 section 7.3 requires one. This value is OpenMLS's
+  default, so default KeyPackages pass.
+- librisala's MLS storage: `openmls_sqlite_storage` 0.3 cannot link next
+  to rusqlite 0.41. The spike recommends porting it.
+- Run `cargo audit` on the chosen crates.
 
 ## 6. Decisions
 
