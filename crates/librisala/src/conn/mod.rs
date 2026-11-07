@@ -24,6 +24,9 @@ mod session;
 mod supervisor;
 mod tls;
 
+#[cfg(test)]
+mod tests;
+
 pub use error::{CloseReason, CommandError, Error, TrustError};
 pub use session::{End, Response, Session, SessionInfo, SessionOptions};
 pub use supervisor::{
