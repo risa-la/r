@@ -11,6 +11,7 @@ use risala_proto::time::Timestamp;
 
 use super::account::Batch;
 use super::*;
+use crate::store::{Draft, FailReason, Store};
 
 const SERVER: &str = "chat.example.org";
 
@@ -350,5 +351,76 @@ async fn writes_from_another_process_reach_timelines() {
     match timeline.next().await.unwrap().as_slice() {
         [TimelineDiff::Reset { items }] => assert_eq!(items.len(), 3),
         other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn errors_carry_kinds_to_localize() {
+    use crate::conn::{CloseReason, Error};
+    let e = ClientError::from_conn("x", &Error::Timeout);
+    assert!(matches!(
+        e,
+        ClientError::Connection {
+            kind: ConnectionErrorKind::Timeout,
+            permanent: false,
+            ..
+        }
+    ));
+    let e = ClientError::from_conn(
+        "x",
+        &Error::KeyExchange(rustls::Error::General("no group".into())),
+    );
+    assert!(matches!(
+        e,
+        ClientError::Connection {
+            kind: ConnectionErrorKind::KeyExchange,
+            permanent: true,
+            ..
+        }
+    ));
+    let e = ClientError::from_conn("x", &Error::Closed(CloseReason::PingTimeout));
+    assert!(matches!(
+        e,
+        ClientError::Connection {
+            kind: ConnectionErrorKind::Closed,
+            ..
+        }
+    ));
+    assert_eq!(
+        DisconnectKind::of(&CloseReason::Server { bye: None }),
+        DisconnectKind::Server
+    );
+
+    // Outbox failures: "room changed" and "dropped" differ by kind.
+    let store = Store::open_in_memory().unwrap();
+    let server = parse_server(SERVER).unwrap();
+    let account = store.account(&server, &"~sam".parse().unwrap()).unwrap();
+    let conv: Conv = "#general".parse().unwrap();
+    for (why, kind, maybe) in [
+        (FailReason::RoomChanged, FailKind::RoomChanged, false),
+        (FailReason::Dropped, FailKind::Dropped, false),
+        (FailReason::Unconfirmed, FailKind::Unconfirmed, true),
+        (
+            FailReason::Rejected(risala_proto::error::ErrorCode::Forbidden),
+            FailKind::Rejected,
+            false,
+        ),
+    ] {
+        let (id, _) = store
+            .write(|tx| {
+                let id = tx.queue(account, &conv, None, &Draft::text("hi"), Timestamp::MIN)?;
+                tx.outbox_failed(id, why.clone())?;
+                Ok(id)
+            })
+            .unwrap();
+        let entry = OutboxEntry::from(store.outbox_item(id).unwrap().unwrap());
+        match entry.status {
+            OutboxStatus::Failed {
+                kind: k,
+                maybe_sent,
+                ..
+            } => assert_eq!((k, maybe_sent), (kind, maybe), "{why:?}"),
+            other => panic!("{other:?}"),
+        }
     }
 }

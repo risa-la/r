@@ -127,8 +127,9 @@ use crate::sync::SyncConfig;
 pub use account::{Account, AccountEvents, Conversation};
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
-    AccountEvent, ClientError, ConnectionState, ConversationInfo, EventKind, Message, Notice,
-    OutboxEntry, OutboxStatus, ReactionCount, RoomList, RoomListing, ServerHello, TrustInfo,
+    AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
+    DisconnectKind, EventKind, FailKind, KeyErrorKind, Message, Notice, OutboxEntry, OutboxStatus,
+    ReactionCount, RoomList, RoomListing, ServerHello, TrustInfo,
 };
 
 use account::AccountShared;
@@ -253,6 +254,7 @@ impl Client {
                     .enable_all()
                     .build()
                     .map_err(|e| ClientError::Connection {
+                        kind: ConnectionErrorKind::Runtime,
                         message: format!("cannot start a runtime: {e}"),
                         permanent: true,
                     })?;

@@ -51,7 +51,9 @@ pub enum ClientError {
     /// cannot help without the user, as with `auth-failed`.
     #[error("{message}")]
     Connection {
-        /// What went wrong.
+        /// What went wrong, to show in the user's language.
+        kind: ConnectionErrorKind,
+        /// What went wrong, in English, for logs.
         message: String,
         /// Whether retrying cannot help.
         permanent: bool,
@@ -78,8 +80,84 @@ pub enum ClientError {
     #[error("cache: {0}")]
     Store(String),
     /// The key store failed, or holds no key for the identity.
-    #[error("keys: {0}")]
-    Keys(String),
+    #[error("keys: {message}")]
+    Keys {
+        /// What went wrong, to show in the user's language.
+        kind: KeyErrorKind,
+        /// What went wrong, in English, for logs.
+        message: String,
+    },
+}
+
+/// Why connecting or signing in failed ([`ClientError::Connection`]), so
+/// that apps can say it in the user's language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConnectionErrorKind {
+    /// The network failed: no route, refused, reset, or name resolution.
+    Network,
+    /// Connecting took too long.
+    Timeout,
+    /// TLS failed, for a reason other than the ones below.
+    Tls,
+    /// The server does not offer the post-quantum key exchange
+    /// X25519MLKEM768, which risala requires (2.1).
+    KeyExchange,
+    /// The server's certificate could not be read (2.2).
+    BadCertificate,
+    /// The trust records could not be read or written (2.2).
+    TrustStore,
+    /// The server speaks another version of the protocol (3.8).
+    UnsupportedVersion,
+    /// The server broke the protocol: a bad greeting, or an answer that
+    /// could not be read.
+    Protocol,
+    /// The connection closed.
+    Closed,
+    /// An identity cannot sign in to a server given as an IP address,
+    /// which sends no hostname (2.1).
+    NoHostname,
+    /// The sign-in nonce was used up; connecting again helps (4.5).
+    NonceUsed,
+    /// The server does not offer registration (4.6).
+    NoRegistration,
+    /// The client could not start its runtime.
+    Runtime,
+}
+
+/// Why the key store failed ([`ClientError::Keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyErrorKind {
+    /// No key store was given in the client's options.
+    NoKeyStore,
+    /// The key store holds no key for the identity.
+    NoKey,
+    /// The key store failed.
+    Failed,
+}
+
+impl ConnectionErrorKind {
+    pub(crate) fn of(e: &conn::Error) -> ConnectionErrorKind {
+        use conn::Error as E;
+        match e {
+            E::Io(_) => ConnectionErrorKind::Network,
+            E::Tls(_) => ConnectionErrorKind::Tls,
+            E::KeyExchange(_) => ConnectionErrorKind::KeyExchange,
+            E::Trust(_) => ConnectionErrorKind::BadCertificate,
+            E::TrustStore(_) => ConnectionErrorKind::TrustStore,
+            E::Timeout => ConnectionErrorKind::Timeout,
+            E::UnsupportedVersion(_) => ConnectionErrorKind::UnsupportedVersion,
+            E::BadGreeting(_)
+            | E::InvalidCommand(_)
+            | E::NoResponse
+            | E::Rejected(conn::CommandError::Unparseable(_)) => ConnectionErrorKind::Protocol,
+            // A server's ERR becomes ClientError::Server instead.
+            E::Rejected(conn::CommandError::Server(_)) => ConnectionErrorKind::Protocol,
+            E::Closed(_) => ConnectionErrorKind::Closed,
+            E::NonceUsed => ConnectionErrorKind::NonceUsed,
+            E::NoSni => ConnectionErrorKind::NoHostname,
+            E::NoRegistration => ConnectionErrorKind::NoRegistration,
+        }
+    }
 }
 
 impl ClientError {
@@ -129,6 +207,7 @@ impl ClientError {
             },
             conn::Error::Rejected(conn::CommandError::Server(err)) => ClientError::server(err),
             other => ClientError::Connection {
+                kind: ConnectionErrorKind::of(other),
                 message: other.to_string(),
                 permanent: other.is_permanent(),
             },
@@ -217,7 +296,10 @@ pub enum ConnectionState {
     },
     /// The connection closed; reconnecting.
     Disconnected {
-        /// Why it closed.
+        /// Why it closed, to show in the user's language.
+        kind: DisconnectKind,
+        /// Why it closed, in English, for logs. For
+        /// [`DisconnectKind::Server`], the server's BYE text if any.
         reason: String,
     },
     /// Waiting before the next attempt.
@@ -233,6 +315,37 @@ pub enum ConnectionState {
         /// Why.
         error: ClientError,
     },
+}
+
+/// Why a connection closed ([`ConnectionState::Disconnected`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisconnectKind {
+    /// The server closed it, perhaps with BYE (11).
+    Server,
+    /// The server stopped answering PING (11).
+    PingTimeout,
+    /// The network failed.
+    Network,
+    /// The server broke the protocol.
+    Protocol,
+    /// This client fell behind reading the server's lines.
+    Overflow,
+    /// This client closed it, for example to reconnect.
+    Local,
+}
+
+impl DisconnectKind {
+    pub(crate) fn of(reason: &conn::CloseReason) -> DisconnectKind {
+        use conn::CloseReason as R;
+        match reason {
+            R::Server { .. } => DisconnectKind::Server,
+            R::PingTimeout => DisconnectKind::PingTimeout,
+            R::Io(_) => DisconnectKind::Network,
+            R::Protocol(_) => DisconnectKind::Protocol,
+            R::Overflow => DisconnectKind::Overflow,
+            R::Local => DisconnectKind::Local,
+        }
+    }
 }
 
 impl ConnectionState {
@@ -428,7 +541,9 @@ pub enum OutboxStatus {
     },
     /// It will not be sent.
     Failed {
-        /// Why, for people.
+        /// Why, to show in the user's language.
+        kind: FailKind,
+        /// Why, in English, for logs.
         reason: String,
         /// The connection dropped before the answer and resending was not
         /// safe (7.6): it may or may not have been sent. Show it as
@@ -437,6 +552,24 @@ pub enum OutboxStatus {
         /// The server's error code, if it refused the message.
         code: Option<String>,
     },
+}
+
+/// Why a message in the outbox was not sent ([`OutboxStatus::Failed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailKind {
+    /// The room was dropped and created again, so it is another room now
+    /// (7.1, 7.6). Sending it there would put it in the wrong room.
+    RoomChanged,
+    /// The room was dropped (10.4).
+    Dropped,
+    /// The server refused it; the error code is in `code` (3.7).
+    Rejected,
+    /// The connection dropped before the answer, and sending it again was
+    /// not safe (7.6). It may or may not have been sent.
+    Unconfirmed,
+    /// It could not be written as a line, for example because it is too
+    /// long. It was not sent.
+    Invalid,
 }
 
 impl OutboxStatus {
@@ -471,6 +604,12 @@ impl From<OutboxItem> for OutboxEntry {
             OutboxState::Sending => OutboxStatus::Sending,
             OutboxState::Sent(seq) => OutboxStatus::Sent { seq: seq.get() },
             OutboxState::Failed(why) => OutboxStatus::Failed {
+                kind: match &why {
+                    FailReason::RoomChanged => FailKind::RoomChanged,
+                    FailReason::Dropped => FailKind::Dropped,
+                    FailReason::Unconfirmed => FailKind::Unconfirmed,
+                    FailReason::Rejected(_) => FailKind::Rejected,
+                },
                 reason: match &why {
                     FailReason::RoomChanged => "the room was replaced by a new one".to_owned(),
                     FailReason::Dropped => "the room was dropped".to_owned(),

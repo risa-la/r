@@ -19,7 +19,8 @@ use tracing::{debug, warn};
 use super::account::{AccountShared, Batch, Cmd, Synced, check_draft};
 use super::blocking;
 use super::types::{
-    AccountEvent, ClientError, ConnectionState, Notice, OutboxEntry, is_lasting_refusal,
+    AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, DisconnectKind, KeyErrorKind,
+    Notice, OutboxEntry, is_lasting_refusal,
 };
 use crate::addr::TrustStore;
 use crate::conn::{
@@ -134,7 +135,13 @@ async fn drive(
                         }
                     }
                     SupervisorEvent::Disconnected { reason } => {
-                        shared.set_state(ConnectionState::Disconnected { reason: reason.to_string() });
+                        shared.set_state(ConnectionState::Disconnected {
+                            kind: DisconnectKind::of(&reason),
+                            reason: match &reason {
+                                conn::CloseReason::Server { bye: Some(bye) } => unescape(bye).into_owned(),
+                                other => other.to_string(),
+                            },
+                        });
                     }
                     SupervisorEvent::Waiting { delay, error } => {
                         shared.set_state(ConnectionState::Waiting {
@@ -205,11 +212,20 @@ fn sign_in_for(
         .options
         .keys
         .as_ref()
-        .ok_or_else(|| ClientError::Keys("no key store".into()))?;
+        .ok_or_else(|| ClientError::Keys {
+            kind: KeyErrorKind::NoKeyStore,
+            message: "no key store".into(),
+        })?;
     let key = keys
         .load(identity.as_str())
-        .map_err(|e| ClientError::Keys(e.to_string()))?
-        .ok_or_else(|| ClientError::Keys(format!("no key for {identity}")))?;
+        .map_err(|e| ClientError::Keys {
+            kind: KeyErrorKind::Failed,
+            message: e.to_string(),
+        })?
+        .ok_or_else(|| ClientError::Keys {
+            kind: KeyErrorKind::NoKey,
+            message: format!("no key for {identity}"),
+        })?;
     Ok(Arc::new(IdentitySignIn { identity, key }))
 }
 
@@ -546,6 +562,7 @@ impl Online<'_> {
                 Outcome::Ok(_) => Ok(()),
                 Outcome::Err(err) => Err(ClientError::server(err)),
                 Outcome::Failed => Err(ClientError::Connection {
+                    kind: ConnectionErrorKind::Protocol,
                     message: "the server's answer could not be read".into(),
                     permanent: false,
                 }),
