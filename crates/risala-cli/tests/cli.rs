@@ -201,8 +201,55 @@ async fn chat_shows_live_messages_and_sends_lines() {
         .await
         .unwrap();
     assert!(status.success());
-    // sam's connection is gone: the server recorded the PART (4.2).
-    wait_line(&mut ann, "from=~sam PART #general").await;
+    // sam's connection is gone, but its session waits to be resumed
+    // (4.2), so no PART is recorded.
+    let history = sam_events(&mut ann, "#general").await;
+    assert_eq!(history, ["JOIN", "MSG"]);
+    server.stop().await;
+}
+
+/// The verbs of ~sam's events in `room`, from HISTORY.
+async fn sam_events(c: &mut TestClient, room: &str) -> Vec<String> {
+    c.send(&format!("@ref=h HISTORY {room} limit=500"))
+        .await
+        .unwrap();
+    let mut verbs = Vec::new();
+    loop {
+        let line = c.expect_line().await.unwrap();
+        if line.starts_with("@ref=h OK") {
+            return verbs;
+        }
+        let by_sam = line.contains(";from=~sam ") || line.contains(";from=~sam;");
+        if line.starts_with("@ref=h;") && by_sam {
+            verbs.push(line.split(' ').nth(1).unwrap().to_owned());
+        }
+    }
+}
+
+/// Each command is a new connection, but the guest resumes its session
+/// each time (4.2), so running `risala send` again and again adds only the
+/// messages to the room: no JOIN and PART pairs.
+#[tokio::test]
+async fn sending_twice_resumes_the_guest_session() {
+    let server = TestServer::builder().room("#general").start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let addr = format!("127.0.0.1:{}", server.addr().port());
+    ok(state, &["trust", &addr, &server.fingerprint().to_string()]).await;
+    ok(state, &["guest", &addr, "sam"]).await;
+    ok(state, &["join", &addr, "#general"]).await;
+    for text in ["one", "two", "three"] {
+        let out = ok(state, &["send", &addr, "#general", text]).await;
+        assert!(out.contains("sent"), "{out}");
+    }
+    let mut ann = ann_in(&server, "#general").await;
+    let history = sam_events(&mut ann, "#general").await;
+    assert_eq!(history, ["JOIN", "MSG", "MSG", "MSG"]);
+    // Parting reaches the server, where the session is still in the room.
+    let out = ok(state, &["part", &addr, "#general"]).await;
+    assert!(out.contains("left #general"), "{out}");
+    let history = sam_events(&mut ann, "#general").await;
+    assert_eq!(history, ["JOIN", "MSG", "MSG", "MSG", "PART"]);
     server.stop().await;
 }
 

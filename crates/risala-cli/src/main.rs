@@ -4,7 +4,9 @@
 //! `$XDG_STATE_HOME/risala`, or `~/.local/state/risala`): the cache
 //! `cache.db`, with trust records, accounts, history and the outbox, and
 //! device keys under `keys/`. So `log` and `export` work with no
-//! connection, and a guest's rooms are joined again on each run.
+//! connection. A guest resumes its session on each run (4.2), so running
+//! commands one after another adds no JOIN or PART to its rooms. Once its
+//! session has ended, its rooms are joined again.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -274,12 +276,22 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             reason,
         } => {
             let account = pick(ctx, &server)?;
-            if !account.is_guest() {
+            if account.is_guest() {
+                // The guest's session may still be in the room, waiting to
+                // be resumed (4.2). If the server cannot be reached,
+                // parting offline still stops the room being joined again.
+                let _ = tokio::time::timeout(WAIT, account.connect()).await;
+            } else {
                 connect(&account).await?;
             }
-            // A guest that is offline is in no room; parting stops it
-            // being joined again.
-            within(account.part(&room, &reason.join(" "))).await?;
+            within(async {
+                match account.part(&room, &reason.join(" ")).await {
+                    // A guest whose session has ended is in no room.
+                    Err(e) if account.is_guest() && e.code() == Some("not-found") => Ok(()),
+                    result => result,
+                }
+            })
+            .await?;
             println!("left {room}");
             Ok(())
         }
