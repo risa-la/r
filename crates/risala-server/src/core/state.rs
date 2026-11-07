@@ -227,8 +227,10 @@ pub(crate) struct UserState {
     pub(crate) conns: Vec<UserConn>,
     /// The conversations the user is a member of, in name order.
     pub(crate) convs: BTreeMap<ConvRef, Arc<ConvEntry>>,
-    /// The identity is being deleted (4.8): it may not join rooms or sign
-    /// in until that is done.
+    /// The identity is being deleted, or was (4.8): it may not join rooms
+    /// or sign in. Once UNREGISTER is done, the registry forgets the entry
+    /// for good, and the next sign-in gets a new one, so this stays set
+    /// for whatever still holds the old one.
     pub(crate) ending: bool,
 }
 

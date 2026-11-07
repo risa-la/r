@@ -175,6 +175,8 @@ enum Answer {
     Keys(Result<Vec<PublicKey>, FetchError>),
     /// Never answers, like a key host that does not respond.
     Hang,
+    /// Answers with these keys once notified.
+    Held(Arc<tokio::sync::Notify>, Vec<PublicKey>),
 }
 
 #[derive(Debug, Default)]
@@ -229,6 +231,18 @@ impl MemoryFetcher {
         self.state().current.insert(identity.clone(), Answer::Hang);
     }
 
+    /// Fetching `identity`'s key file waits, from now on, until the
+    /// returned [`Notify`](tokio::sync::Notify) is notified once for each
+    /// fetch, and then lists `keys`. For tests that need something to
+    /// happen while AUTH waits for a key file.
+    pub fn hold(&self, identity: &Identity, keys: Vec<PublicKey>) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.state()
+            .current
+            .insert(identity.clone(), Answer::Held(notify.clone(), keys));
+        notify
+    }
+
     /// Fetches of `identity` without `refresh` get `keys`, as if an older
     /// copy were cached, until a fetch with `refresh`.
     pub fn set_cached(&self, identity: &Identity, keys: Vec<PublicKey>) {
@@ -268,6 +282,10 @@ impl KeyFetcher for MemoryFetcher {
         match answer {
             Answer::Keys(result) => result,
             Answer::Hang => std::future::pending().await,
+            Answer::Held(notify, keys) => {
+                notify.notified().await;
+                Ok(keys)
+            }
         }
     }
 }

@@ -696,6 +696,121 @@ async fn an_identity_has_at_most_64_keys() {
 }
 
 // ---------------------------------------------------------------------------
+// Sign-ins racing KEY DEL and UNREGISTER (4.7, 4.8)
+
+/// A world on a [`Flaky`] store, so that a test can hold a store call.
+fn paused_world() -> (World, Arc<super::tests::Flaky>) {
+    let store = Arc::new(super::tests::Flaky::new());
+    let w = World::on(id_config(), store.clone());
+    (w, store)
+}
+
+/// Sends `line` on `c` in a task of its own, so that the test can go on
+/// while it waits.
+fn spawn_send(w: &World, c: &Client, line: &str) -> tokio::task::JoinHandle<()> {
+    let (hub, id, req) = (w.h.hub.clone(), c.id, line.parse::<Request>().unwrap());
+    tokio::spawn(async move { hub.command(id, req).await })
+}
+
+/// KEY DEL while an AUTH with that key has checked the signature, but not
+/// yet signed the connection in: the connection does not stay signed in
+/// with a removed key.
+#[tokio::test]
+async fn auth_racing_key_del() {
+    let (mut w, store) = paused_world();
+    let mut laptop = w.register("alice", 0).await;
+    w.send(&laptop, &format!("key add {}", public(1))).await;
+    assert_eq!(laptop.lines(), ["OK"]);
+
+    store.pause.arm("touch_identity");
+    let (mut phone, nonce) = w.dial(Some(HOST));
+    let auth = spawn_send(&w, &phone, &auth("alice@example.org", 1, HOST, &nonce));
+    store.pause.reached().await;
+    let del = spawn_send(&w, &laptop, &format!("key del {}", public(1)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    store.pause.release();
+    auth.await.unwrap();
+    del.await.unwrap();
+
+    assert_eq!(laptop.lines(), ["OK"]);
+    let phone = phone.lines();
+    assert!(
+        phone == ["ERR auth-failed the signature did not verify"]
+            || phone
+                == [
+                    "OK uid=alice@example.org",
+                    "<close> BYE this device's key was removed"
+                ],
+        "{phone:?}"
+    );
+}
+
+/// UNREGISTER while an AUTH has checked the signature: the AUTH fails,
+/// and does not bring the deleted identity back.
+#[tokio::test]
+async fn auth_racing_unregister() {
+    let (mut w, store) = paused_world();
+    let bob = identity("bob@example.net");
+    w.fetcher.set(&bob, vec![public(1), public(2)]);
+    let mut laptop = w.sign_in("bob@example.net", 1).await;
+
+    store.pause.arm("touch_identity");
+    let (mut phone, nonce) = w.dial(Some(HOST));
+    let auth = spawn_send(&w, &phone, &auth("bob@example.net", 2, HOST, &nonce));
+    store.pause.reached().await;
+    let unregister = spawn_send(&w, &laptop, "unregister bob@example.net");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    store.pause.release();
+    auth.await.unwrap();
+    unregister.await.unwrap();
+
+    assert_eq!(laptop.lines(), ["OK", "<close> BYE identity deleted"]);
+    assert_eq!(
+        phone.lines(),
+        ["ERR auth-failed the identity is being deleted"]
+    );
+    assert_eq!(w.h.store.identity(&uid("bob@example.net")).unwrap(), None);
+
+    // Signing in afterwards starts afresh, as a new identity (4.8).
+    let mut again = w.sign_in("bob@example.net", 2).await;
+    w.send(&again, "sync").await;
+    assert_eq!(again.lines(), ["OK"]);
+    assert!(
+        w.h.store
+            .identity(&uid("bob@example.net"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// An AUTH that started before an UNREGISTER, and finishes after it, does
+/// not sign in, nor bring the identity back, even though it is no longer
+/// being deleted by then.
+#[tokio::test]
+async fn auth_that_straddles_unregister() {
+    let mut w = World::new();
+    let bob = identity("bob@example.net");
+    w.fetcher.set(&bob, vec![public(1), public(2)]);
+    let mut laptop = w.sign_in("bob@example.net", 1).await;
+
+    let fetched = w.fetcher.hold(&bob, vec![public(1), public(2)]);
+    let (mut phone, nonce) = w.dial(Some(HOST));
+    let auth = spawn_send(&w, &phone, &auth("bob@example.net", 2, HOST, &nonce));
+    while w.fetcher.calls().len() < 2 {
+        tokio::task::yield_now().await;
+    }
+    w.send(&laptop, "unregister bob@example.net").await;
+    assert_eq!(laptop.lines(), ["OK", "<close> BYE identity deleted"]);
+    fetched.notify_one();
+    auth.await.unwrap();
+    assert_eq!(
+        phone.lines(),
+        ["ERR auth-failed the identity is being deleted"]
+    );
+    assert_eq!(w.h.store.identity(&uid("bob@example.net")).unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------
 // UNREGISTER (4.8)
 
 #[tokio::test]

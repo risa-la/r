@@ -19,6 +19,7 @@ use risala_proto::text::unescape;
 
 use super::commands::{Fail, Outcome, Reply, fail, respond};
 use super::keys::KeyFilePublisher;
+use super::state::UserEntry;
 use super::{Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::ConnId;
 use crate::store::{HostedKey, KeyChange, Registered};
@@ -186,23 +187,43 @@ impl Inner {
         };
         let (host, nonce) = self.host_and_nonce(challenge)?;
         let uid = identity.to_uid();
-        let key = if self.hosts(&identity) {
-            let who = uid.clone();
-            let keys = self.db(move |s| s.hosted_keys(&who)).await?;
-            let keys = keys
-                .unwrap_or_default()
-                .into_iter()
-                .map(|k| k.key)
-                .collect();
-            verify(host, nonce, uid.clone(), signature, keys).await
-        } else {
-            self.verify_fetched(&identity, host, nonce, signature).await
-        };
-        let Some(key) = key else {
-            tracing::debug!(conn = id.0, "AUTH failed");
-            return Err(auth_failed("the signature did not verify"));
-        };
-        self.finish_sign_in(id, &uid, key).await
+        // Held from here to the end, so that an UNREGISTER that starts
+        // meanwhile marks this very entry, and the sign-in sees it (4.8).
+        let user = self.pin(&uid);
+        let result = async {
+            let key = if self.hosts(&identity) {
+                let who = uid.clone();
+                let keys = self.db(move |s| s.hosted_keys(&who)).await?;
+                let keys = keys
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|k| k.key)
+                    .collect();
+                verify(host, nonce, uid.clone(), signature, keys).await
+            } else {
+                self.verify_fetched(&identity, host, nonce, signature).await
+            };
+            let Some(key) = key else {
+                tracing::debug!(conn = id.0, "AUTH failed");
+                return Err(auth_failed("the signature did not verify"));
+            };
+            self.finish_sign_in(id, &user, key).await
+        }
+        .await;
+        self.unpin(&uid, user);
+        result
+    }
+
+    /// The entry of `uid`, made if there is none, and held until
+    /// [`unpin`](Self::unpin) so that it is not forgotten meanwhile.
+    pub(super) fn pin(&self, uid: &Uid) -> Arc<UserEntry> {
+        self.reg().user(uid)
+    }
+
+    /// Lets go of an entry from [`pin`](Self::pin).
+    pub(super) fn unpin(&self, uid: &Uid, user: Arc<UserEntry>) {
+        drop(user);
+        self.reg().release(uid);
     }
 
     /// Checks an AUTH signature against `identity`'s key file (4.4): first
@@ -245,19 +266,41 @@ impl Inner {
         None
     }
 
-    /// Signs connection `id` in as the identity `uid`, with `key` as its
-    /// device key (4.5), and records that the server knows the identity
-    /// (5.1). Replies `OK uid=<uid>`, with `op=yes` for an operator.
-    async fn finish_sign_in(&self, id: ConnId, uid: &Uid, key: PublicKey) -> Outcome {
-        if self.is_ending(uid) {
-            return Err(auth_failed("the identity is being deleted"));
+    /// Signs connection `id` in as the identity of `user`, with `key` as
+    /// its device key (4.5), and records that the server knows the
+    /// identity (5.1). Replies `OK uid=<uid>`, with `op=yes` for an
+    /// operator.
+    ///
+    /// The signature was checked without any lock held, so this checks
+    /// again, under `keys_lock`, that nothing changed meanwhile: that the
+    /// identity is not being deleted, nor was deleted since `user` was
+    /// pinned (4.8), and that a hosted identity still has `key` (4.7). KEY
+    /// DEL and UNREGISTER change keys and forget identities under the same
+    /// lock, so either they come first and this fails, or this comes first
+    /// and they find the connection signed in, and close it.
+    async fn finish_sign_in(&self, id: ConnId, user: &Arc<UserEntry>, key: PublicKey) -> Outcome {
+        let uid = &user.uid;
+        let being_deleted = || auth_failed("the identity is being deleted");
+        let _keys = self.keys_lock.lock().await;
+        if user.lock().ending {
+            return Err(being_deleted());
+        }
+        if self.hosts_uid(uid) {
+            let who = uid.clone();
+            let keys = self.db(move |s| s.hosted_keys(&who)).await?;
+            if !keys.is_some_and(|keys| keys.iter().any(|k| k.key == key)) {
+                // KEY DEL took the key away meanwhile.
+                return Err(auth_failed("the signature did not verify"));
+            }
         }
         let (who, now) = (uid.clone(), self.now());
         self.db(move |s| s.touch_identity(&who, now)).await?;
         {
             let mut reg = self.reg();
-            if reg.users.get(uid).is_some_and(|u| u.lock().ending) {
-                return Err(auth_failed("the identity is being deleted"));
+            if user.lock().ending {
+                // UNREGISTER began meanwhile. It forgets the identity,
+                // and the row touched above, once this lets go of the lock.
+                return Err(being_deleted());
             }
             if !reg.attach(id, uid, Some(key)) {
                 // The connection closed meanwhile.
@@ -271,11 +314,6 @@ impl Inner {
         } else {
             ok
         }))
-    }
-
-    /// Whether the identity `uid` is being deleted (4.8).
-    fn is_ending(&self, uid: &Uid) -> bool {
-        self.reg().users.get(uid).is_some_and(|u| u.lock().ending)
     }
 
     /// Closes the connections of `uid` whose device key is not in `keys`
@@ -406,7 +444,10 @@ impl Inner {
             slot.keep();
         }
         tracing::info!(%uid, "identity registered");
-        self.finish_sign_in(id, &uid, key).await
+        let user = self.pin(&uid);
+        let result = self.finish_sign_in(id, &user, key).await;
+        self.unpin(&uid, user);
+        result
     }
 
     /// KEY LIST, KEY ADD and KEY DEL (4.7), for hosted identities only.
@@ -549,9 +590,12 @@ impl Inner {
             for conn in conns {
                 reg.detach(conn, BYE_UNREGISTERED);
             }
-            user.lock().ending = false;
-            drop(user);
-            reg.release(uid);
+            // The entry stays marked, so that a sign-in that pinned it
+            // before now fails (4.8). The registry forgets it, so that a
+            // later sign-in starts afresh, as a new identity.
+            if reg.users.get(uid).is_some_and(|u| Arc::ptr_eq(u, &user)) {
+                reg.users.remove(uid);
+            }
         }
         if done {
             tracing::info!(%uid, "identity deleted");
@@ -562,7 +606,7 @@ impl Inner {
     /// Deletes what the server keeps about `uid` (4.8): its memberships,
     /// with a PART each, then everything stored, then its roles and
     /// invitations in memory, and for a hosted identity its key file.
-    async fn forget(&self, uid: &Uid, user: &Arc<super::state::UserEntry>) -> Result<(), Fail> {
+    async fn forget(&self, uid: &Uid, user: &Arc<UserEntry>) -> Result<(), Fail> {
         // A JOIN under way may add a room after the first pass, but none
         // can start after it, since the user is ending. So this ends.
         loop {

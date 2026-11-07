@@ -2042,10 +2042,79 @@ async fn the_configuration_is_checked() {
 // ---------------------------------------------------------------------------
 // Store failures
 
-/// A store that fails every append once `broken` is set.
-struct Flaky {
-    inner: SqliteStore,
-    broken: AtomicBool,
+/// A store that fails every append once `broken` is set, and can hold a
+/// call until a test lets it go ([`Pause`]).
+pub(super) struct Flaky {
+    pub(super) inner: SqliteStore,
+    pub(super) broken: AtomicBool,
+    pub(super) pause: Pause,
+}
+
+impl Flaky {
+    pub(super) fn new() -> Flaky {
+        Flaky {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            broken: AtomicBool::new(false),
+            pause: Pause::default(),
+        }
+    }
+}
+
+/// Holds one store call, named when armed, until the test releases it, to
+/// force two commands to interleave at that point.
+#[derive(Default)]
+pub(super) struct Pause {
+    state: std::sync::Mutex<PauseState>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PauseState {
+    armed: Option<&'static str>,
+    reached: bool,
+    released: bool,
+}
+
+impl Pause {
+    /// The next call to the store method `method` waits until
+    /// [`release`](Self::release).
+    pub(super) fn arm(&self, method: &'static str) {
+        *self.state.lock().unwrap() = PauseState {
+            armed: Some(method),
+            ..PauseState::default()
+        };
+    }
+
+    /// Called by each store method, on the blocking pool.
+    fn at(&self, method: &'static str) {
+        let mut state = self.state.lock().unwrap();
+        if state.armed != Some(method) {
+            return;
+        }
+        state.armed = None;
+        state.reached = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    /// Waits until the armed call has been made, and is held.
+    pub(super) async fn reached(&self) {
+        for _ in 0..2000 {
+            if self.state.lock().unwrap().reached {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the paused store call was never made");
+    }
+
+    /// Lets the held call go on.
+    pub(super) fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
 }
 
 impl Store for Flaky {
@@ -2109,6 +2178,7 @@ impl Store for Flaky {
         self.inner.identity(u)
     }
     fn touch_identity(&self, u: &Uid, t: Timestamp) -> crate::store::Result<()> {
+        self.pause.at("touch_identity");
         self.inner.touch_identity(u, t)
     }
     fn register(
@@ -2120,6 +2190,7 @@ impl Store for Flaky {
         self.inner.register(u, k, t)
     }
     fn hosted_keys(&self, u: &Uid) -> crate::store::Result<Option<Vec<crate::store::HostedKey>>> {
+        self.pause.at("hosted_keys");
         self.inner.hosted_keys(u)
     }
     fn hosted_identities(&self) -> crate::store::Result<Vec<(Uid, Vec<crate::store::HostedKey>)>> {
@@ -2194,10 +2265,7 @@ impl Store for Flaky {
 
 #[tokio::test]
 async fn store_failures_are_internal_errors() {
-    let store = Arc::new(Flaky {
-        inner: SqliteStore::open_in_memory().unwrap(),
-        broken: AtomicBool::new(false),
-    });
+    let store = Arc::new(Flaky::new());
     let mut h = Harness::on(config(), store.clone(), timers());
     let (mut sam, _) = h.joined("sam", "#general").await;
     let (mut bob, _) = h.joined("bob", "#general").await;
