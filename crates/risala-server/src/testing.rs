@@ -155,6 +155,7 @@ impl TestServerBuilder {
 fn prepare_store(config: &Config, prepare: Vec<Prepare>) {
     std::fs::create_dir_all(&config.state_dir).expect("creating the state directory");
     let store = SqliteStore::open(&config.database_path()).expect("opening the database");
+    store.set_durable(false).expect("speeding up the database");
     for name in &config.rooms {
         let room: Room = name.parse().expect("a valid room name");
         store
@@ -355,7 +356,10 @@ impl TempDir {
         getrandom::fill(&mut bytes).expect("random bytes");
         let name: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let path = std::env::temp_dir().join(format!("risala-test-{name}"));
-        std::fs::create_dir(&path).expect("creating a temporary directory");
+        let mut dir = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+        dir.create(&path).expect("creating a temporary directory");
         TempDir(path)
     }
 

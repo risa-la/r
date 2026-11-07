@@ -9,18 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use risala_proto::command::{Command, Request};
-use risala_proto::error::{ErrorCode, ParseError};
-use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, MAX_SERVER_LINE, check_line_len};
+use risala_proto::error::ParseError;
+use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE};
 use risala_proto::line::{Line, read_ref};
 use risala_proto::server::{ErrResponse, ServerLine, ServerMessage};
 use risala_proto::text::escape;
 use risala_proto::types::Ref;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::handler::{ConnHandle, ConnInfo, ConnReceiver, Handler, Outgoing};
+use crate::handler::{ConnHandle, ConnInfo, ConnReceiver, Handler, OutLine, Outgoing};
 
 /// How long a connection that has stopped reading commands has to send
 /// what is queued for it before it is dropped.
@@ -40,6 +40,17 @@ pub(crate) struct Timers {
     pub idle_ping: Duration,
     /// Further silence before the server sends BYE and closes.
     pub ping_timeout: Duration,
+}
+
+/// The room a connection's queue must have before the next command goes
+/// to the handler: [`Limits::command_room`](crate::config::Limits::command_room)
+/// and [`command_room_bytes`](crate::config::Limits::command_room_bytes).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandRoom {
+    /// Free lines.
+    pub lines: usize,
+    /// Free bytes.
+    pub bytes: usize,
 }
 
 /// Why the reading side stopped.
@@ -62,6 +73,7 @@ enum Ended {
 /// Calls [`Handler::open`] first and [`Handler::closed`] exactly once
 /// last, however the connection ends. `stop` turns true when the server
 /// shuts down; the caller queues the BYE.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve<S, H>(
     stream: S,
     info: ConnInfo,
@@ -69,6 +81,7 @@ pub(crate) async fn serve<S, H>(
     receiver: ConnReceiver,
     handler: Arc<H>,
     timers: Timers,
+    room: CommandRoom,
     stop: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
@@ -79,7 +92,7 @@ pub(crate) async fn serve<S, H>(
     let mut writer = tokio::spawn(write_loop(wr, receiver));
     handler.open(info, handle.clone());
 
-    let ended = read_loop(rd, &handle, &*handler, timers, stop, &mut writer).await;
+    let ended = read_loop(rd, &handle, &*handler, timers, room, stop, &mut writer).await;
     tracing::debug!(conn = id.0, ?ended, "connection stopped reading");
     if ended != Ended::Writer {
         if ended == Ended::Eof {
@@ -100,11 +113,19 @@ pub(crate) async fn serve<S, H>(
 }
 
 /// Reads lines and handles them until the connection should stop reading.
+///
+/// Before each command goes to the handler, it waits until the queue has
+/// `room` for the command's response. So a client that sends many commands
+/// at once gets their responses as fast as it reads them, rather than
+/// being dropped as too slow when they overflow its queue. The keepalive
+/// timers still run while it waits, so a client that stops reading
+/// altogether is closed in the end.
 async fn read_loop<R, H>(
     mut rd: R,
     handle: &ConnHandle,
     handler: &H,
     timers: Timers,
+    room: CommandRoom,
     mut stop: watch::Receiver<bool>,
     writer: &mut JoinHandle<()>,
 ) -> Ended
@@ -116,10 +137,16 @@ where
     let mut decoder = LineDecoder::new(MAX_CLIENT_LINE);
     let mut buf = vec![0u8; READ_BUF];
     let mut keepalive = Keepalive::new(timers, Instant::now());
+    let mut long_line = LongLine::default();
     loop {
         while let Some((line, ref_)) = decoder.next_line_with_ref() {
-            // Any line, even an empty or bad one, resets the timers (11).
-            keepalive.activity(Instant::now());
+            // Any complete line, even an empty or bad one, resets the timers
+            // (11). A line reported as too long before its end is complete
+            // only once its LF arrives (2.3).
+            let too_long = matches!(line, Err(ParseError::TooLong));
+            if long_line.taken(too_long, decoder.is_discarding()) {
+                keepalive.activity(Instant::now());
+            }
             if writer.is_finished() {
                 return Ended::Writer;
             }
@@ -137,6 +164,11 @@ where
                     };
                     match req {
                         Ok(req) => {
+                            if let Some(ended) =
+                                wait_for_room(handle, room, &mut keepalive, &mut stop, writer).await
+                            {
+                                return ended;
+                            }
                             let quit = matches!(req.command, Command::Quit { .. });
                             handler.command(id, req).await;
                             if quit {
@@ -156,27 +188,70 @@ where
             _ = &mut *writer => return Ended::Writer,
             _ = stop.wait_for(|stopping| *stopping) => return Ended::Shutdown,
             () = tokio::time::sleep_until(deadline) => {
-                match keepalive.expired(Instant::now()) {
-                    Some(Expired::Ping) => {
-                        handle.send(ServerMessage::new(ServerLine::Ping { token: ping_token() }));
-                    }
-                    Some(Expired::Timeout) => {
-                        tracing::debug!(conn = id.0, "ping timeout");
-                        handle.close(Some("ping timeout".into()));
-                        return Ended::Timeout;
-                    }
-                    None => {}
+                if let Some(ended) = keepalive_expired(handle, &mut keepalive) {
+                    return ended;
                 }
             }
             read = rd.read(&mut buf) => match read {
                 Ok(0) => return Ended::Eof,
-                Ok(n) => decoder.push(&buf[..n]),
+                Ok(n) => {
+                    decoder.push(&buf[..n]);
+                    if long_line.pushed(decoder.is_discarding()) {
+                        keepalive.activity(Instant::now());
+                    }
+                }
                 Err(e) => {
                     tracing::debug!(conn = id.0, error = %e, "read failed");
                     return Ended::Eof;
                 }
             },
         }
+    }
+}
+
+/// Waits until the queue has `room` for a command's response (see
+/// [`read_loop`]). Returns why the connection should stop reading instead,
+/// if it should.
+async fn wait_for_room(
+    handle: &ConnHandle,
+    room: CommandRoom,
+    keepalive: &mut Keepalive,
+    stop: &mut watch::Receiver<bool>,
+    writer: &mut JoinHandle<()>,
+) -> Option<Ended> {
+    while !handle.has_room(room.lines, room.bytes) {
+        let deadline = keepalive.deadline();
+        tokio::select! {
+            biased;
+            _ = &mut *writer => return Some(Ended::Writer),
+            _ = stop.wait_for(|stopping| *stopping) => return Some(Ended::Shutdown),
+            () = tokio::time::sleep_until(deadline) => {
+                if let Some(ended) = keepalive_expired(handle, keepalive) {
+                    return Some(ended);
+                }
+            }
+            () = handle.wait_for_room(room.lines, room.bytes) => {}
+        }
+    }
+    None
+}
+
+/// Called when the keepalive deadline may have passed: sends PING, or
+/// gives up with BYE (11).
+fn keepalive_expired(handle: &ConnHandle, keepalive: &mut Keepalive) -> Option<Ended> {
+    match keepalive.expired(Instant::now()) {
+        Some(Expired::Ping) => {
+            handle.send(ServerMessage::new(ServerLine::Ping {
+                token: ping_token(),
+            }));
+            None
+        }
+        Some(Expired::Timeout) => {
+            tracing::debug!(conn = handle.id().0, "ping timeout");
+            handle.close(Some("ping timeout".into()));
+            Some(Ended::Timeout)
+        }
+        None => None,
     }
 }
 
@@ -203,28 +278,24 @@ async fn write_loop<W>(mut wr: W, mut receiver: ConnReceiver)
 where
     W: AsyncWrite + Unpin,
 {
-    // `ConnReceiver::killed` borrows the whole receiver, so take the queue
-    // out to wait on both at once.
-    let mut queue = std::mem::replace(&mut receiver.rx, mpsc::channel(1).1);
     let mut out = Vec::with_capacity(4096);
     loop {
         let first = tokio::select! {
             biased;
             () = receiver.killed() => return,
-            item = queue.recv() => item,
+            item = receiver.recv() => item,
         };
         let mut close = false;
         let mut next = first;
         // Gather what is queued already into one write.
         loop {
             match next {
-                Some(Outgoing::Line(msg)) => encode(&msg, &mut out),
+                Some(Outgoing::Line(line)) => out.extend_from_slice(line.wire()),
                 Some(Outgoing::Close { bye }) => {
                     if let Some(text) = bye {
-                        encode(
-                            &ServerMessage::new(ServerLine::Bye { message: text }),
-                            &mut out,
-                        );
+                        let bye =
+                            OutLine::new(ServerMessage::new(ServerLine::Bye { message: text }));
+                        out.extend_from_slice(bye.wire());
                     }
                     close = true;
                     break;
@@ -238,9 +309,9 @@ where
             if out.len() >= WRITE_BATCH {
                 break;
             }
-            match queue.try_recv() {
-                Ok(item) => next = Some(item),
-                Err(_) => break,
+            match receiver.try_recv() {
+                Some(item) => next = Some(item),
+                None => break,
             }
         }
         let wrote = tokio::select! {
@@ -267,33 +338,44 @@ where
     }
 }
 
-/// Appends one line and its LF to `out`.
+/// Follows a line that [`LineDecoder`] reports as too long before its LF
+/// has arrived, so that the line resets the keepalive timers only when it
+/// ends (2.3, 11; PLAN.md 5, item 16).
 ///
-/// A message that cannot be written, or is too long for a server line
-/// (2.3), is a bug in the core. It is logged and dropped; if it was a
-/// final response, `ERR internal` takes its place, so the client still
-/// gets one final response per command (3.6).
-fn encode(msg: &ServerMessage, out: &mut Vec<u8>) {
-    let problem = match msg.try_to_line() {
-        Ok(line) => {
-            let text = line.to_string();
-            match check_line_len(&text, MAX_SERVER_LINE) {
-                Ok(()) => {
-                    out.extend_from_slice(text.as_bytes());
-                    out.push(b'\n');
-                    return;
-                }
-                Err(e) => e,
-            }
+/// The decoder reports such a line as soon as it is known to be too long,
+/// and then discards bytes up to and including the LF, without reporting
+/// the LF. So a `TooLong` taken while the decoder is discarding is early,
+/// and the line has ended once the decoder stops discarding, or yields
+/// anything after it.
+#[derive(Debug, Default)]
+struct LongLine {
+    /// An early `TooLong` was taken, and its LF has not been seen yet.
+    waiting: bool,
+}
+
+impl LongLine {
+    /// For each item taken from the decoder: whether a line has ended.
+    /// `too_long` says whether the item is a `TooLong` error, and
+    /// `discarding` is [`LineDecoder::is_discarding`] after taking it.
+    fn taken(&mut self, too_long: bool, discarding: bool) -> bool {
+        // While the decoder discards, the last item it holds is the
+        // `TooLong` that started the discarding. An earlier `TooLong`
+        // could look the same, but then this item follows it, and so ends
+        // the line it waits for.
+        let early = too_long && discarding;
+        let ended = !early || self.waiting;
+        self.waiting = early;
+        ended
+    }
+
+    /// After bytes are pushed into the decoder: whether they ended the line
+    /// that was reported early.
+    fn pushed(&mut self, discarding: bool) -> bool {
+        let ended = self.waiting && !discarding;
+        if ended {
+            self.waiting = false;
         }
-        Err(e) => e,
-    };
-    tracing::error!(verb = msg.line.verb(), error = %problem, "dropping a line that cannot be sent");
-    if msg.line.is_final() {
-        let err = ServerMessage::new(ErrResponse::new(ErrorCode::Internal))
-            .with_ref_opt(msg.ref_.clone());
-        out.extend_from_slice(err.to_line().to_string().as_bytes());
-        out.push(b'\n');
+        ended
     }
 }
 
@@ -378,6 +460,35 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_end_at_their_lf() {
+        fn activity(d: &mut LineDecoder, l: &mut LongLine, bytes: &[u8]) -> usize {
+            d.push(bytes);
+            let mut n = usize::from(l.pushed(d.is_discarding()));
+            while let Some((line, _)) = d.next_line_with_ref() {
+                let too_long = matches!(line, Err(ParseError::TooLong));
+                n += usize::from(l.taken(too_long, d.is_discarding()));
+            }
+            n
+        }
+        let mut d = LineDecoder::new(8);
+        let mut l = LongLine::default();
+        // Lines that end at once count at once, too long or not.
+        assert_eq!(activity(&mut d, &mut l, b"ab\n\n0123456789\n"), 3);
+        // A long line counts only when its LF arrives.
+        assert_eq!(activity(&mut d, &mut l, b"0123456789"), 0);
+        assert_eq!(activity(&mut d, &mut l, b"0123456789"), 0);
+        assert_eq!(activity(&mut d, &mut l, b"01\n"), 1);
+        assert_eq!(activity(&mut d, &mut l, b"ab\n"), 1);
+        // Its LF, and the start of another long line, in one push.
+        assert_eq!(activity(&mut d, &mut l, b"0123456789"), 0);
+        assert_eq!(activity(&mut d, &mut l, b"\n0123456789"), 1);
+        assert_eq!(activity(&mut d, &mut l, b"89\nab\n"), 2);
+        // A long line that ends, then one that does not.
+        assert_eq!(activity(&mut d, &mut l, b"0123456789\n0123456789"), 1);
+        assert_eq!(activity(&mut d, &mut l, b"\n"), 1);
+    }
+
+    #[test]
     fn ping_tokens_are_hex() {
         let a = ping_token();
         assert_eq!(a.len(), 16);
@@ -386,24 +497,5 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         );
         assert_ne!(a, ping_token());
-    }
-
-    #[test]
-    fn bad_final_responses_become_internal_errors() {
-        let mut out = Vec::new();
-        let long = ServerMessage::new(
-            ErrResponse::new(ErrorCode::NotFound).with_message("x".repeat(MAX_SERVER_LINE)),
-        )
-        .with_ref("7".parse().unwrap());
-        encode(&long, &mut out);
-        assert_eq!(out, b"@ref=7 ERR internal\n");
-
-        // A line that is not final is just dropped.
-        let mut out = Vec::new();
-        let notice = ServerMessage::new(ServerLine::Bye {
-            message: "x".repeat(MAX_SERVER_LINE),
-        });
-        encode(&notice, &mut out);
-        assert!(out.is_empty());
     }
 }

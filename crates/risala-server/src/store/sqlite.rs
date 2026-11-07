@@ -21,7 +21,8 @@ use super::{
 /// How long a statement waits for another process's lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// [`Store`] on a SQLite database, in WAL mode, with foreign keys on.
+/// [`Store`] on a SQLite database, in WAL mode with `synchronous=FULL`, so a
+/// commit survives a power failure, and with foreign keys on.
 ///
 /// It holds one connection behind a mutex, so the store's transactions run
 /// one at a time. They are all short.
@@ -32,26 +33,56 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Opens (or creates) the database at `path` and brings its schema up
-    /// to date.
+    /// to date. Fails if the database cannot use WAL mode.
+    ///
+    /// On Unix, the database and its `-wal` and `-shm` files are readable
+    /// by the server's user only (mode 0600, 13), whatever the umask:
+    /// SQLite gives the `-wal` and `-shm` files the database file's mode.
     pub fn open(path: &Path) -> Result<SqliteStore> {
-        SqliteStore::setup(Connection::open(path)?)
+        private_files(path)
+            .map_err(|e| StoreError::Setup(format!("making {} private: {e}", path.display())))?;
+        SqliteStore::setup(Connection::open(path)?, true)
     }
 
     /// A store in memory, for tests.
     pub fn open_in_memory() -> Result<SqliteStore> {
-        SqliteStore::setup(Connection::open_in_memory()?)
+        SqliteStore::setup(Connection::open_in_memory()?, false)
     }
 
-    fn setup(mut conn: Connection) -> Result<SqliteStore> {
+    pub(super) fn setup(mut conn: Connection, need_wal: bool) -> Result<SqliteStore> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        let _mode: String =
+        let mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        if need_wal && !mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::Setup(format!(
+                "the database cannot use WAL mode (journal mode is {mode:?})"
+            )));
+        }
+        // FULL, not NORMAL: in WAL mode, NORMAL can lose the last commits
+        // after a power failure, and a seq already sent would then be used
+        // again (5.2).
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let sync: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+        if sync < 2 {
+            return Err(StoreError::Setup(format!(
+                "cannot set synchronous=FULL (it is {sync})"
+            )));
+        }
         conn.pragma_update(None, "foreign_keys", "ON")?;
         schema::migrate(&mut conn)?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// With `false`, commits are no longer flushed to disk
+    /// (`synchronous=OFF`), so a power failure can lose them. Only for
+    /// filling a database quickly, for example before a test, never for a
+    /// database a server is running on. `true` restores `synchronous=FULL`.
+    pub fn set_durable(&self, durable: bool) -> Result<()> {
+        let mode = if durable { "FULL" } else { "OFF" };
+        self.conn().pragma_update(None, "synchronous", mode)?;
+        Ok(())
     }
 
     pub(super) fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -69,6 +100,43 @@ impl SqliteStore {
         tx.commit()?;
         Ok(value)
     }
+}
+
+/// Creates the database file at `path` with mode 0600 if it is missing,
+/// and takes away any access others have to it and its `-wal` and `-shm`
+/// files (13).
+#[cfg(unix)]
+fn private_files(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    // An empty file is an empty database to SQLite.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let with = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    for file in [path.to_owned(), with("-wal"), with("-shm")] {
+        let mode = match std::fs::metadata(&file) {
+            Ok(meta) => meta.permissions().mode(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if mode & 0o077 != 0 {
+            tracing::warn!(file = %file.display(), "taking away other users' access");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_files(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +454,13 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
     match &event.kind {
         EventKind::Msg { .. } => {}
         EventKind::Join => {
+            if event.from.is_guest() {
+                // Kept until the guest's PART, even across a crash (4.2).
+                tx.execute(
+                    "INSERT OR IGNORE INTO guest_members (conv, uid, since) VALUES (?, ?, ?)",
+                    params![conv, event.from.as_str(), ms(event.t)],
+                )?;
+            }
             if identity(&event.from) {
                 tx.execute(
                     "INSERT OR IGNORE INTO members (conv, uid, since) VALUES (?, ?, ?)",
@@ -399,10 +474,12 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             }
         }
         EventKind::Part { .. } => {
-            tx.execute(
+            for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
-                params![conv, event.from.as_str()],
-            )?;
+                "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
+            ] {
+                tx.execute(sql, params![conv, event.from.as_str()])?;
+            }
         }
         EventKind::Set(setting) => {
             let sql = match setting {
@@ -442,6 +519,7 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             // KICK takes the role away (6.3).
             for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
+                "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
                 "DELETE FROM roles WHERE conv = ? AND uid = ?",
             ] {
                 tx.execute(sql, params![conv, uid.as_str()])?;
@@ -452,6 +530,7 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             // invitation (6.3, 6.4).
             for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
+                "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
                 "DELETE FROM roles WHERE conv = ? AND uid = ?",
                 "DELETE FROM invites WHERE conv = ? AND uid = ?",
             ] {
@@ -711,6 +790,19 @@ impl Store for SqliteStore {
 
     fn cid_seq(&self, conv: ConvKey, from: &Uid, cid: &Cid, now: Timestamp) -> Result<Option<Seq>> {
         find_cid(&self.conn(), conv.0, from, cid, now)
+    }
+
+    fn guest_members(&self) -> Result<Vec<(ConvKey, Uid)>> {
+        self.conn()
+            .prepare_cached("SELECT conv, uid FROM guest_members ORDER BY conv, uid")?
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|r| {
+                let (conv, uid) = r?;
+                Ok((ConvKey(conv), parse("guest member", &uid)?))
+            })
+            .collect()
     }
 
     fn prune_cids(&self, before: Timestamp) -> Result<u64> {

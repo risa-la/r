@@ -8,8 +8,9 @@
 //! conversations and their ids (5.1), events (5.2), room settings (6.2),
 //! the membership of identities (6.1), roles (6.3), invitations and bans
 //! (6.4), read markers (7.4), cids (7.6) and, from M3 and M4 on, identities,
-//! blocks, reports, uploads and push registrations. Guests and their room
-//! memberships are never stored (4.2).
+//! blocks, reports, uploads and push registrations. Guests are not stored
+//! (4.2), except for which rooms they are in, so that the PARTs of guests
+//! cut off by a crash are recorded when the server starts again.
 //!
 //! Appending an event assigns the next seq, stores the event and applies
 //! what it changes (membership, settings, roles and so on) in one
@@ -47,6 +48,10 @@ pub enum StoreError {
     /// this server.
     #[error("corrupt database: {0}")]
     Corrupt(String),
+    /// The database could not be set up as the store needs, for example
+    /// in WAL mode.
+    #[error("database setup: {0}")]
+    Setup(String),
     /// The operating system's random source failed.
     #[error("random source: {0}")]
     Random(String),
@@ -172,8 +177,8 @@ pub struct RoomRecord {
     pub created: Timestamp,
     /// Its settings (6.2).
     pub settings: RoomSettings,
-    /// The identities that are members (6.1), in order. Guests are never
-    /// stored.
+    /// The identities that are members (6.1), in order. Guests are not
+    /// included (see [`Store::guest_members`]).
     pub members: Vec<Uid>,
     /// The holders of `owner` and `mod`, members or not (6.3).
     pub roles: Vec<(Uid, Role)>,
@@ -304,12 +309,18 @@ impl StoredEvent {
     /// The event as a line (5.2), for a conversation named `conv` as the
     /// receiver sees it, with id `id` for the `id` tag of JOIN (6.1). A
     /// deleted message is a placeholder: empty text and no file (5.4).
-    pub fn to_event(&self, conv: impl Into<risala_proto::names::Conv>, id: &Id) -> Event {
+    ///
+    /// Only MSG and DELETE happen in direct conversations. Any other event
+    /// there is bad data, and gives [`StoreError::Corrupt`].
+    pub fn to_event(&self, conv: impl Into<risala_proto::names::Conv>, id: &Id) -> Result<Event> {
         let conv = conv.into();
         let room = || match &conv {
-            risala_proto::names::Conv::Room(room) => room.clone(),
-            // Only MSG and DELETE happen in direct conversations.
-            risala_proto::names::Conv::Uid(_) => unreachable!("room event outside a room"),
+            risala_proto::names::Conv::Room(room) => Ok(room.clone()),
+            risala_proto::names::Conv::Uid(_) => Err(StoreError::Corrupt(format!(
+                "{} event {} in a direct conversation",
+                self.kind.verb(),
+                self.seq
+            ))),
         };
         let body = match &self.kind {
             EventKind::Msg {
@@ -332,49 +343,49 @@ impl StoredEvent {
                 seq: *target,
             },
             EventKind::Join => EventBody::Join {
-                room: room(),
+                room: room()?,
                 id: id.clone(),
             },
             EventKind::Part { reason } => EventBody::Part {
-                room: room(),
+                room: room()?,
                 reason: reason.clone(),
             },
             EventKind::Invite { uid } => EventBody::Invite {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
             },
             EventKind::Kick { uid, reason } => EventBody::Kick {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
                 reason: reason.clone(),
             },
             EventKind::Ban { uid, reason } => EventBody::Ban {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
                 reason: reason.clone(),
             },
             EventKind::Unban { uid } => EventBody::Unban {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
             },
             EventKind::Set(setting) => EventBody::Set {
-                room: room(),
+                room: room()?,
                 setting: setting.clone(),
             },
             EventKind::Role { uid, role } => EventBody::Role {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
                 role: *role,
             },
         };
-        Event::new(
+        Ok(Event::new(
             EventMeta {
                 seq: self.seq,
                 t: self.t,
                 from: self.from.clone(),
             },
             body,
-        )
+        ))
     }
 
     /// Whether this is a MSG that is not an edit or a reaction, and so may
@@ -439,8 +450,9 @@ pub trait Store: Send + Sync + 'static {
     /// Appends an event to a conversation: assigns the next seq (5.2),
     /// stores the event and applies its effects, all in one transaction.
     ///
-    /// Effects: JOIN and PART change the membership of identities (guests
-    /// are not stored); SET changes the room's settings; ROLE, INVITE, KICK,
+    /// Effects: JOIN and PART change the membership of identities, and of
+    /// guests, which is kept only so that a crash cannot lose their PARTs
+    /// (see [`guest_members`](Store::guest_members)); SET changes the room's settings; ROLE, INVITE, KICK,
     /// BAN and UNBAN change roles, invitations, bans and membership (6.3,
     /// 6.4); DELETE erases the text of its target and of the target's edits
     /// and reactions, and marks them deleted (5.4). With a matching cid
@@ -456,6 +468,11 @@ pub trait Store: Send + Sync + 'static {
     /// The seq of the message `from` sent with `cid` to the conversation
     /// within the 24 hours before `now` (7.6), if any.
     fn cid_seq(&self, conv: ConvKey, from: &Uid, cid: &Cid, now: Timestamp) -> Result<Option<Seq>>;
+
+    /// The guests that are members of a room, by the JOIN and PART events
+    /// stored (4.2). Normally a guest's PART is stored when its connection
+    /// closes, so at startup any left here were cut off by a crash.
+    fn guest_members(&self) -> Result<Vec<(ConvKey, Uid)>>;
 
     /// Forgets cids older than `before` (7.6).
     fn prune_cids(&self, before: Timestamp) -> Result<u64>;

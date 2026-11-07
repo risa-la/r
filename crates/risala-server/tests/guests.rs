@@ -671,6 +671,46 @@ async fn history_pages() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn many_pages_at_once_reach_a_slow_reader() {
+    // A client may send a HISTORY for every room at once, as librisala
+    // does after SYNC, and then read the pages at its own pace. Its
+    // queue (1024 lines) holds two pages of 500 at most, so the server
+    // must wait for the client to read before it runs the next HISTORY,
+    // rather than drop the connection as too slow.
+    const PAGES: usize = 20;
+    let text = "x".repeat(1000);
+    let server = TestServer::builder()
+        .room("#general")
+        .prepare(move |store| {
+            for _ in 0..500 {
+                put(store, "#general", "carol@example.org", common::msg(&text));
+            }
+        })
+        .start()
+        .await;
+    let mut sam = server.guest("sam").await;
+    join(&mut sam, "#general").await;
+    let commands: String = (0..PAGES)
+        .map(|i| format!("@ref=h{i} history #general limit=500\n"))
+        .collect();
+    sam.send_raw(commands.as_bytes()).await.unwrap();
+    // Long enough for the socket's buffers to fill.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for i in 0..PAGES {
+        for n in 0..500 {
+            let line = sam.expect_line().await.unwrap();
+            assert!(line.starts_with(&format!("@ref=h{i};seq=")), "{line}");
+            if n % 50 == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        let ok = sam.expect_line().await.unwrap();
+        assert!(ok.starts_with(&format!("@ref=h{i} OK ")), "{ok}");
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sync_lists_the_rooms_of_the_connection() {
     let server = TestServer::builder()
         .room("#general")
