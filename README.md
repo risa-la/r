@@ -115,11 +115,88 @@ The full run takes about two minutes. Keep `-j` small: each proof runs
 its own solver, which can use several gigabytes of memory, and an
 unbounded `-j` can overload a machine.
 
-## Trying a server by hand
+## Running a server
 
-[Appendix A of the spec](SPEC.md#appendix-a-using-risala-by-hand) shows
-how to connect, check a server's fingerprint, make a key and sign in
-with nothing but `openssl`.
+With no configuration, `risalad` is a development server. It listens on
+port 7472, keeps its database (`risala.db`) and a generated self-signed
+certificate (`selfsigned/`) in the current directory, allows guests,
+and has one room, `#general`:
+
+```
+nix run .#risalad            # or, inside nix develop:
+cargo run -p risala-server
+```
+
+For anything else, write a configuration file and pass it with
+`--config`. Every key is optional, and an empty file gives the
+development server's defaults, without `#general`. These are the main
+keys:
+
+```toml
+hostname = "chat.example.org"    # the greeting's host when a client sends no SNI
+listen = ["[::]:7472"]
+state_dir = "/var/lib/risala"    # the database, and any generated certificate
+rooms = ["#general", "#help"]    # created at startup if missing
+
+# Without [[tls.certs]], risalad generates a self-signed certificate for
+# `hostname`. Certificates are reloaded when they change on disk, and on
+# SIGHUP, without dropping connections.
+[[tls.certs]]
+cert = "/var/lib/acme/chat.example.org/fullchain.pem"
+key = "/var/lib/acme/chat.example.org/key.pem"
+
+[server]
+welcome = "Welcome!"
+guests = true
+retention = "forever"            # or a number of days
+
+[limits]
+sign_in_secs = 120
+idle_ping_secs = 120
+ping_timeout_secs = 60
+```
+
+```
+nix run .#risalad -- --config risalad.toml
+cargo run -p risala-server -- --config risalad.toml
+```
+
+`risalad` logs to standard error. `RUST_LOG` chooses what is logged
+(default `info`), for example `RUST_LOG=debug`. SIGINT and SIGTERM shut
+it down cleanly: every connection gets `BYE server shutting down`.
+
+**Connecting.** Any TLS client works. With `openssl`:
+
+```
+openssl s_client -connect localhost:7472 -quiet
+```
+
+Then type `guest sam`, `join #general` and `msg #general hello!`, as in
+the session at the top of this file.
+[Section 12 of the spec](SPEC.md#12-command-summary) lists every
+command.
+
+**Checking the fingerprint.** On start, `risalad` logs the fingerprint
+of its certificate, in a line like this:
+
+```
+INFO risalad: certificate fingerprint=sha256:51134ecc040df4f143be34b253368e3b4400d9a557868c567a4b19413b8540f2
+```
+
+A client that sees a self-signed certificate shows the same value and
+asks whether to trust it (Section 2.2 of the spec). To compute it
+yourself, from anywhere:
+
+```
+openssl s_client -connect localhost:7472 </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout \
+  | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256
+```
+
+The hex digits it prints, after `sha256:`, are the fingerprint.
+[Appendix A of the spec](SPEC.md#appendix-a-using-risala-by-hand) also
+shows how to make a key and sign in with nothing but `openssl`.
 
 ## License
 
