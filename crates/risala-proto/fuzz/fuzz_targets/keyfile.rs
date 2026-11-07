@@ -1,8 +1,9 @@
 //! Text into `KeyFile::parse` (SPEC 4.4).
 //!
 //! Parsing never fails except on size, never keeps more than `MAX_KEYS`
-//! keys or a key twice, and every kept entry's line parses back as the
-//! same entry, alone or as a whole file.
+//! keys or a key twice, never keeps a label over `MAX_KEY_LABEL` bytes,
+//! and every kept entry's line parses back as the same entry, alone or as
+//! a whole file.
 //!
 //! A fuzzer never guesses a valid 1752-character ML-DSA-44 key, so
 //! `$` followed by any byte is replaced with one of 80 real keys (more
@@ -14,7 +15,9 @@ use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
 use risala_proto::auth::SecretKey;
-use risala_proto::keyfile::{KeyEntry, KeyFile, MAX_KEY_FILE_BYTES, MAX_KEYS};
+use risala_proto::keyfile::{
+    KeyEntry, KeyFile, MAX_KEY_FILE_BYTES, MAX_KEY_LABEL, MAX_KEY_LINE_BYTES, MAX_KEYS,
+};
 
 const KEYS: usize = 80;
 
@@ -64,6 +67,8 @@ fuzz_target!(|data: &[u8]| {
         assert!(!file.keys()[..i].iter().any(|e| e.key() == entry.key()));
         let line = entry.to_string();
         assert!(!line.contains(['\n', '\r']));
+        assert!(entry.label().is_none_or(|l| l.len() <= MAX_KEY_LABEL));
+        assert!(line.len() + 2 <= MAX_KEY_LINE_BYTES);
         assert_eq!(line.parse::<KeyEntry>().as_ref(), Ok(entry), "{line:?}");
         lines.push_str(&line);
         lines.push('\n');

@@ -68,8 +68,8 @@
 //!   REPORTENC line to an ENC copy, since they are separate lines.
 //! - **Length limits** stated by the spec are applied as on commands, so a
 //!   correct server never trips them: a topic (ROOM, SET) or a report
-//!   reason of 512 bytes, a display name (MEMBER, USER, NAME) of 128 and a
-//!   reaction of 64. Longer values are `TooLong`. Other text has no limit
+//!   reason of 512 bytes, a display name (MEMBER, USER, NAME) of 128, and
+//!   a reaction or key label (KEY) of 64. Longer values are `TooLong`. Other text has no limit
 //!   beyond the line's.
 //! - **Uids.** INVITE, KICK, BAN, UNBAN, ROLE and OP take any [`Uid`], as
 //!   the commands do, even where the spec says the target is always an
@@ -97,6 +97,7 @@ use std::str::FromStr;
 
 use crate::auth::{Nonce, PublicKey};
 use crate::error::{ErrorCode, ParseError};
+use crate::keyfile::MAX_KEY_LABEL;
 use crate::line::{Line, LineBuilder, Params, Tags, is_token};
 use crate::mls::{
     BackupBlob, Ciphertext, CommitMessage, Frank, Franking, GroupInfo, KeyPackage, RatchetTree,
@@ -412,9 +413,16 @@ pub enum ServerLine {
         /// The users, at least one. Written separated by commas.
         uids: Vec<Uid>,
     },
-    /// `BLOCK <target>`, a response to BLOCKS (5.7).
+    /// `BLOCK <target>`: a response to BLOCKS, or a block made on
+    /// another of the account's connections (5.7). Not an event.
     Block {
         /// The blocked identity or domain.
+        target: BlockTarget,
+    },
+    /// `UNBLOCK <target>`: a block was lifted on another of the account's
+    /// connections (5.7). Not an event.
+    Unblock {
+        /// The identity or domain that is no longer blocked.
         target: BlockTarget,
     },
     /// `KEY <key> [<label...>]`, a response to KEY LIST (4.7) or ADMIN
@@ -422,7 +430,8 @@ pub enum ServerLine {
     Key {
         /// The public key.
         key: PublicKey,
-        /// The key's label, escaped; empty if none.
+        /// The key's label, escaped; empty if none. At most 64 bytes
+        /// ([`MAX_KEY_LABEL`]).
         label: String,
     },
     /// `PUSH <url> <tag>`, a response to PUSH LIST (9.1).
@@ -582,6 +591,7 @@ impl ServerLine {
             ServerLine::User { .. } => "USER",
             ServerLine::Presence { .. } => "PRESENCE",
             ServerLine::Block { .. } => "BLOCK",
+            ServerLine::Unblock { .. } => "UNBLOCK",
             ServerLine::Key { .. } => "KEY",
             ServerLine::Push { .. } => "PUSH",
             ServerLine::Read { .. } => "READ",
@@ -675,10 +685,11 @@ impl ServerLine {
                 let list: Vec<&str> = uids.iter().map(Uid::as_str).collect();
                 b.token(presence).token(list.join(","));
             }
-            ServerLine::Block { target } => {
+            ServerLine::Block { target } | ServerLine::Unblock { target } => {
                 b.token(target);
             }
             ServerLine::Key { key, label } => {
+                limit(label, MAX_KEY_LABEL)?;
                 b.token(key).text(label);
             }
             ServerLine::Push { url, tag } => {
@@ -871,9 +882,15 @@ fn parse_response(
             p.end()?;
             ServerLine::Block { target }
         }
+        "UNBLOCK" => {
+            let target = token(&mut p)?;
+            p.end()?;
+            ServerLine::Unblock { target }
+        }
         "KEY" => {
             let key = token(&mut p)?;
             let label = p.text().to_owned();
+            limit(&label, MAX_KEY_LABEL)?;
             ServerLine::Key { key, label }
         }
         "PUSH" => {
@@ -1612,14 +1629,15 @@ impl FromStr for Upload {
 // ERR
 
 /// `ERR <code> [<message...>]`, a failed final response (3.6, 3.7), with
-/// the `retry` tag of `ERR rate-limited` (3.2).
+/// the `retry` tag of `ERR rate-limited` or `ERR unavailable` (3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrResponse {
     /// The error code. Clients treat an unknown code as a general failure
     /// (3.7).
     pub code: ErrorCode,
     /// The `retry` tag: seconds to wait before trying again (3.2). Read on
-    /// any ERR, though the spec sends it with `rate-limited`.
+    /// any ERR, though the spec sends it only with `rate-limited` and
+    /// `unavailable`.
     pub retry: Option<u64>,
     /// The message for people, escaped; empty if none.
     pub message: String,
@@ -2959,6 +2977,11 @@ mod tests {
         syntax("ERR");
         syntax("@retry=soon ERR rate-limited");
         syntax("@retry ERR rate-limited");
+        let m = round_trip("@retry=60 ERR unavailable example.org did not answer");
+        let ServerLine::Err(e) = &m.line else {
+            panic!()
+        };
+        assert_eq!((&e.code, e.retry), (&ErrorCode::Unavailable, Some(60)));
         assert!(matches!(m.line, ServerLine::Err(_)) && m.line.is_final());
     }
 
@@ -3521,10 +3544,23 @@ mod tests {
         round_trip("BLOCK *@example.net");
         syntax("BLOCK ~sam");
         syntax("BLOCK");
+        let m = round_trip("UNBLOCK spam@example.net");
+        assert!(
+            matches!(&m.line, ServerLine::Unblock { target } if target.to_string() == "spam@example.net")
+        );
+        round_trip("UNBLOCK *@example.net");
+        syntax("UNBLOCK ~sam");
+        syntax("UNBLOCK");
+        syntax("UNBLOCK a@b.org c@d.org");
         let key = crate::auth::tests::PUBLIC_B64;
         let m = round_trip(&format!("KEY {key} laptop"));
         assert!(matches!(&m.line, ServerLine::Key { label, .. } if label == "laptop"));
         round_trip(&format!("KEY {key}"));
+        round_trip(&format!("KEY {key} {}", "l".repeat(MAX_KEY_LABEL)));
+        assert_eq!(
+            err(&format!("KEY {key} {}", "l".repeat(MAX_KEY_LABEL + 1))),
+            ParseError::TooLong
+        );
         syntax("KEY xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp…");
         let m = round_trip("PUSH https://push.app.example/n/3f9c x7Hq2");
         assert!(
@@ -3665,7 +3701,7 @@ mod tests {
 
     #[test]
     fn new_error_codes() {
-        for code in ["encrypted", "stale", "invalid"] {
+        for code in ["encrypted", "stale", "invalid", "unavailable"] {
             let m = round_trip(&format!("ERR {code} try again"));
             let ServerLine::Err(e) = &m.line else {
                 panic!()

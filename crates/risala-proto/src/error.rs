@@ -19,8 +19,13 @@ pub enum ErrorCode {
     NotAuthenticated,
     /// `already-authenticated`
     AlreadyAuthenticated,
-    /// `auth-failed`
+    /// `auth-failed`: the signature did not verify against the keys the
+    /// server got (4.5). Clients do not retry it.
     AuthFailed,
+    /// `unavailable`: the server could not get the identity's key file, so
+    /// it could not check the signature (4.5). Clients retry it with
+    /// backoff.
+    Unavailable,
     /// `name-taken`
     NameTaken,
     /// `not-found`
@@ -59,6 +64,7 @@ impl ErrorCode {
             ErrorCode::NotAuthenticated => "not-authenticated",
             ErrorCode::AlreadyAuthenticated => "already-authenticated",
             ErrorCode::AuthFailed => "auth-failed",
+            ErrorCode::Unavailable => "unavailable",
             ErrorCode::NameTaken => "name-taken",
             ErrorCode::NotFound => "not-found",
             ErrorCode::Forbidden => "forbidden",
@@ -95,6 +101,7 @@ impl FromStr for ErrorCode {
             "not-authenticated" => ErrorCode::NotAuthenticated,
             "already-authenticated" => ErrorCode::AlreadyAuthenticated,
             "auth-failed" => ErrorCode::AuthFailed,
+            "unavailable" => ErrorCode::Unavailable,
             "name-taken" => ErrorCode::NameTaken,
             "not-found" => ErrorCode::NotFound,
             "forbidden" => ErrorCode::Forbidden,
@@ -160,6 +167,7 @@ mod tests {
             "not-authenticated",
             "already-authenticated",
             "auth-failed",
+            "unavailable",
             "name-taken",
             "not-found",
             "forbidden",

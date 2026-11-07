@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::auth::PublicKey;
+use crate::auth::{PUBLIC_KEY_BASE64_LEN, PublicKey};
 use crate::error::ParseError;
 
 /// The only key type this version of the protocol defines: ML-DSA-44
@@ -28,8 +28,23 @@ pub const KEY_TYPE: &str = "mldsa44";
 pub const MAX_KEYS: usize = 64;
 
 /// The most bytes a server or device reads of a key file, 256 KiB (4.4).
-/// That is room for [`MAX_KEYS`] keys with labels.
+/// That is room for [`MAX_KEYS`] keys with labels of
+/// [`MAX_KEY_LABEL`] bytes: each such line is at most
+/// [`MAX_KEY_LINE_BYTES`], so 64 of them take 116,928 bytes.
 pub const MAX_KEY_FILE_BYTES: usize = 256 * 1024;
+
+/// The longest key label, in bytes (4.4, 4.7). In KEY ADD and ADMIN
+/// ADDKEY it counts the escaped form, as every text limit does (3.4).
+pub const MAX_KEY_LABEL: usize = 64;
+
+/// The longest key file line, in bytes, with its CRLF: `mldsa44`, a
+/// space, the 1752-character key, a space and a label of
+/// [`MAX_KEY_LABEL`] bytes, then CR LF (4.4).
+pub const MAX_KEY_LINE_BYTES: usize =
+    KEY_TYPE.len() + 1 + PUBLIC_KEY_BASE64_LEN + 1 + MAX_KEY_LABEL + 2;
+
+// 64 keys of the longest lines fit in under half a key file (4.4).
+const _: () = assert!(MAX_KEYS * MAX_KEY_LINE_BYTES < MAX_KEY_FILE_BYTES / 2);
 
 /// The URL of the key file for the identity `name@domain` (4.3).
 ///
@@ -62,14 +77,15 @@ impl KeyEntry {
     /// Spaces and tabs around the label are trimmed, and a label that is
     /// then empty becomes `None`. A label with a control character other
     /// than tab inside it, such as a line break, fails with `BadSyntax`.
-    /// The spec sets no length limit; the line limits (2.3) and
-    /// [`MAX_KEY_FILE_BYTES`] bound it in practice.
+    /// A label over [`MAX_KEY_LABEL`] bytes once trimmed fails with
+    /// `TooLong`.
     pub fn new(key: PublicKey, label: Option<&str>) -> Result<KeyEntry, ParseError> {
         let label = match label.map(|l| l.trim_matches([' ', '\t'])) {
             None | Some("") => None,
             Some(l) if l.chars().any(|c| c.is_control() && c != '\t') => {
                 return Err(ParseError::BadSyntax("label contains a control character"));
             }
+            Some(l) if l.len() > MAX_KEY_LABEL => return Err(ParseError::TooLong),
             Some(l) => Some(l.to_owned()),
         };
         Ok(KeyEntry { key, label })
@@ -134,7 +150,8 @@ pub enum SkipReason {
     OtherKeyType(String),
     /// The line starts with `mldsa44` but is not a valid key line: the
     /// key is missing, is not 1752 characters of strict base64, or the
-    /// label holds a control character.
+    /// label holds a control character or is over [`MAX_KEY_LABEL`]
+    /// bytes.
     Malformed(ParseError),
     /// The key already appeared on an earlier line. The first line's
     /// label is kept.
@@ -170,7 +187,8 @@ impl KeyFile {
     ///   ignored.
     /// - Lines with another key type are ignored.
     /// - Malformed `mldsa44` lines are ignored too, so that one bad line
-    ///   does not lock someone out of every other device.
+    ///   does not lock someone out of every other device. That includes
+    ///   a line whose label is over [`MAX_KEY_LABEL`] bytes.
     /// - A key that appears again is ignored; the first line wins.
     /// - Only the first [`MAX_KEYS`] distinct keys are kept.
     ///
@@ -316,6 +334,19 @@ mod tests {
         assert_eq!(e.label(), Some("téléphone 📱"));
 
         assert_eq!(KeyEntry::new(k.clone(), Some("  ")).unwrap().label(), None);
+
+        // At most 64 bytes, counted after trimming.
+        let ok = "é".repeat(MAX_KEY_LABEL / 2);
+        let e = KeyEntry::new(k.clone(), Some(&format!("  {ok}\t"))).unwrap();
+        assert_eq!(e.label(), Some(ok.as_str()));
+        assert_eq!(
+            KeyEntry::new(k.clone(), Some(&format!("{ok}x"))),
+            Err(ParseError::TooLong)
+        );
+        assert_eq!(
+            format!("mldsa44 {k} {ok}x").parse::<KeyEntry>(),
+            Err(ParseError::TooLong)
+        );
         assert!(KeyEntry::new(k.clone(), Some("a\nb")).is_err());
         assert!(KeyEntry::new(k, Some("a\rb")).is_err());
     }
@@ -345,8 +376,10 @@ mod tests {
              mldsa44 {laptop} laptop\r\n\
              mldsa44 {laptop} laptop again\n\
              \tMLDSA44   {phone}\t\n\
-             mldsa44 {}\n",
-            &laptop.to_string()[..1751]
+             mldsa44 {}\n\
+             mldsa44 {laptop} {}\n",
+            &laptop.to_string()[..1751],
+            "x".repeat(MAX_KEY_LABEL + 1),
         );
         let file = KeyFile::parse(&text).unwrap();
         assert_eq!(file.keys().len(), 2);
@@ -376,6 +409,7 @@ mod tests {
                     11,
                     SkipReason::Malformed(ParseError::BadSyntax("bad public key"))
                 ),
+                (12, SkipReason::Malformed(ParseError::TooLong)),
             ]
         );
     }
@@ -406,6 +440,8 @@ mod tests {
         }
         // 64 keys with labels fit well within the size limit.
         assert!(text.len() < MAX_KEY_FILE_BYTES);
+        assert_eq!(MAX_KEY_LINE_BYTES, 1827);
+        assert_eq!(MAX_KEYS * MAX_KEY_LINE_BYTES, 116_928);
         let file = KeyFile::parse(&text).unwrap();
         assert_eq!(file.keys().len(), MAX_KEYS);
         assert_eq!(file.keys()[63].label(), Some("d63"));

@@ -80,6 +80,7 @@ use std::str::FromStr;
 
 use crate::auth::{PublicKey, Signature};
 use crate::error::ParseError;
+use crate::keyfile::MAX_KEY_LABEL;
 use crate::line::{Line, LineBuilder, Options, Params, Tags};
 use crate::mls::{
     BackupBlob, Ciphertext, CommitMessage, Frank, Franking, GroupInfo, KeyPackage, RatchetTree,
@@ -593,7 +594,8 @@ pub enum KeyCommand {
     Add {
         /// The key to add.
         key: PublicKey,
-        /// A note for people, escaped. May be empty.
+        /// A note for people, escaped. May be empty. At most 64 bytes
+        /// ([`MAX_KEY_LABEL`]).
         label: String,
     },
     /// `KEY DEL <key>`: remove a key.
@@ -768,7 +770,8 @@ pub enum AdminCommand {
         uid: Uid,
         /// The key to add.
         key: PublicKey,
-        /// A note for people, escaped. May be empty.
+        /// A note for people, escaped. May be empty. At most 64 bytes
+        /// ([`MAX_KEY_LABEL`]).
         label: String,
     },
     /// `ADMIN DELKEY <uid> <key>` (10.5).
@@ -1433,7 +1436,7 @@ impl KeyCommand {
                 let key = tok(&mut p)?;
                 KeyCommand::Add {
                     key,
-                    label: p.text().to_owned(),
+                    label: text_max(p, MAX_KEY_LABEL)?,
                 }
             }
             "DEL" => KeyCommand::Del { key: last(p)? },
@@ -1594,7 +1597,7 @@ impl AdminCommand {
                 AdminCommand::AddKey {
                     uid,
                     key,
-                    label: p.text().to_owned(),
+                    label: text_max(p, MAX_KEY_LABEL)?,
                 }
             }
             "DELKEY" => {
@@ -2283,6 +2286,18 @@ mod tests {
         is_syntax("KEY ADD");
         is_syntax("KEY DEL");
         is_syntax(&format!("KEY DEL {KEY} x"));
+        // Labels are at most 64 bytes, escaped (3.4, 4.7).
+        let ok = "l".repeat(MAX_KEY_LABEL);
+        rt(&format!("KEY ADD {KEY} {ok}"));
+        is_too_long(&format!("KEY ADD {KEY} {ok}l"));
+        // `\\` is one backslash once unescaped, but the limit counts the
+        // escaped form.
+        is_too_long(&format!("KEY ADD {KEY} {}\\\\", &ok[1..]));
+        let too_long = Request::new(Command::Key(KeyCommand::Add {
+            key: key(),
+            label: format!("{ok}l"),
+        }));
+        assert_eq!(too_long.validate(), Err(ParseError::TooLong));
     }
 
     #[test]
@@ -3208,6 +3223,9 @@ mod tests {
         is_syntax("ADMIN ADDKEY alice@example.org");
         is_syntax(&format!("ADMIN DELKEY alice@example.org {KEY} x"));
         is_syntax("ADMIN UNREGISTER alice@example.org purge=yes");
+        let ok = "l".repeat(MAX_KEY_LABEL);
+        rt(&format!("ADMIN ADDKEY alice@example.org {KEY} {ok}"));
+        is_too_long(&format!("ADMIN ADDKEY alice@example.org {KEY} {ok}l"));
     }
 
     #[test]

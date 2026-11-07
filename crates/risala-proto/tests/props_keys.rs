@@ -14,7 +14,9 @@ use risala_proto::auth::{
 };
 use risala_proto::error::ParseError;
 use risala_proto::fingerprint::Fingerprint;
-use risala_proto::keyfile::{KeyEntry, KeyFile, MAX_KEY_FILE_BYTES, MAX_KEYS, SkipReason};
+use risala_proto::keyfile::{
+    KeyEntry, KeyFile, MAX_KEY_FILE_BYTES, MAX_KEY_LABEL, MAX_KEY_LINE_BYTES, MAX_KEYS, SkipReason,
+};
 
 /// Explicit case counts keep `cargo test` fast in debug builds. Set
 /// `PROPTEST_CASES` to run every property with that many cases instead.
@@ -53,17 +55,39 @@ fn pool_key() -> impl Strategy<Value = PublicKey> {
     (0..POOL_SIZE).prop_map(|i| pool()[i].clone())
 }
 
-/// A label as a person might write one: printable text with spaces and
-/// TABs, including around it. No control characters other than TAB.
-fn label() -> impl Strategy<Value = String> {
-    let c = prop_oneof![
+/// A character a person might put in a label: no control characters
+/// other than TAB.
+fn label_char() -> impl Strategy<Value = char> {
+    prop_oneof![
         2 => Just(' '),
         1 => Just('\t'),
         8 => prop::char::range('!', '~'),
         1 => prop::sample::select(vec!['é', '\u{a0}', '\u{2028}', '\u{3000}', '👋', 'م']),
         1 => any::<char>().prop_filter("not a control character", |c| !c.is_control()),
-    ];
-    vec(c, 0..20).prop_map(String::from_iter)
+    ]
+}
+
+/// The label as `KeyEntry::new` keeps it: trimmed of spaces and TABs.
+fn trimmed(label: &str) -> &str {
+    label.trim_matches([' ', '\t'])
+}
+
+/// A label as a person might write one: printable text with spaces and
+/// TABs, including around it, at most `MAX_KEY_LABEL` bytes once
+/// trimmed (4.4).
+fn label() -> impl Strategy<Value = String> {
+    vec(label_char(), 0..40)
+        .prop_map(String::from_iter)
+        .prop_filter("fits the label limit", |l| {
+            trimmed(l).len() <= MAX_KEY_LABEL
+        })
+}
+
+/// A label over `MAX_KEY_LABEL` bytes once trimmed (4.4).
+fn long_label() -> impl Strategy<Value = String> {
+    vec(label_char(), 17..100)
+        .prop_map(String::from_iter)
+        .prop_filter("over the label limit", |l| trimmed(l).len() > MAX_KEY_LABEL)
 }
 
 /// Blanks around fields, as 4.4's lenient parsing allows.
@@ -109,17 +133,19 @@ fn kf_line() -> impl Strategy<Value = KfLine> {
             line.push_str(&after);
             KfLine::Entry { key, label, line }
         });
-    let malformed = (0..POOL_SIZE, 0..6usize, key_type()).prop_map(|(key, how, kt)| {
-        let k = pool()[key].to_string();
-        KfLine::Malformed(match how {
-            0 => kt,
-            1 => format!("{kt} {}", &k[..k.len() - 1]),
-            2 => format!("{kt} {k}A"),
-            3 => format!("{kt} {}", k.replace('=', "A")),
-            4 => format!("{kt} {k} bad\u{1}label"),
-            _ => format!("{kt} {}", "A".repeat(PUBLIC_KEY_BASE64_LEN)),
-        })
-    });
+    let malformed =
+        (0..POOL_SIZE, 0..7usize, key_type(), long_label()).prop_map(|(key, how, kt, long)| {
+            let k = pool()[key].to_string();
+            KfLine::Malformed(match how {
+                0 => kt,
+                1 => format!("{kt} {}", &k[..k.len() - 1]),
+                2 => format!("{kt} {k}A"),
+                3 => format!("{kt} {}", k.replace('=', "A")),
+                4 => format!("{kt} {k} bad\u{1}label"),
+                5 => format!("{kt} {k} {long}"),
+                _ => format!("{kt} {}", "A".repeat(PUBLIC_KEY_BASE64_LEN)),
+            })
+        });
     prop_oneof![
         8 => entry,
         1 => "[ \t]{0,2}#[ -~]{0,20}".prop_map(KfLine::Comment),
@@ -148,6 +174,8 @@ fn check_key_file(file: &KeyFile) -> Result<(), TestCaseError> {
         let line = entry.to_string();
         prop_assert_eq!(line.parse::<KeyEntry>(), Ok(entry.clone()));
         prop_assert!(!line.contains(['\n', '\r']));
+        prop_assert!(entry.label().is_none_or(|l| l.len() <= MAX_KEY_LABEL));
+        prop_assert!(line.len() + 2 <= MAX_KEY_LINE_BYTES);
         lines.push_str(&line);
         lines.push('\n');
     }
@@ -175,10 +203,7 @@ proptest! {
         kt in key_type(),
     ) {
         let entry = KeyEntry::new(key.clone(), label.as_deref())?;
-        let want = label
-            .as_deref()
-            .map(|l| l.trim_matches([' ', '\t']))
-            .filter(|l| !l.is_empty());
+        let want = label.as_deref().map(trimmed).filter(|l| !l.is_empty());
         prop_assert_eq!(entry.label(), want);
         prop_assert_eq!(entry.key(), &key);
         let line = entry.to_string();
@@ -202,6 +227,18 @@ proptest! {
     ) {
         let label = format!("{a}{c}{b}");
         prop_assert!(matches!(KeyEntry::new(key, Some(&label)), Err(ParseError::BadSyntax(_))));
+    }
+
+    /// A label over 64 bytes once trimmed is `TooLong`, alone or on a key
+    /// file line, and a key file skips that line as malformed (4.4).
+    #[test]
+    fn key_entry_rejects_long_labels(key in pool_key(), label in long_label()) {
+        prop_assert_eq!(KeyEntry::new(key.clone(), Some(&label)), Err(ParseError::TooLong));
+        let line = format!("mldsa44 {key} {label}");
+        prop_assert_eq!(line.parse::<KeyEntry>(), Err(ParseError::TooLong));
+        let file = KeyFile::parse(&line)?;
+        prop_assert!(file.keys().is_empty());
+        prop_assert_eq!(&file.skipped()[0].reason, &SkipReason::Malformed(ParseError::TooLong));
     }
 
     /// A generated key file keeps exactly the first `MAX_KEYS` distinct
