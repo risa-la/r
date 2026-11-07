@@ -15,7 +15,8 @@ use super::{
     Completed, Notification, Outcome, Outgoing, Output, Reply, ReqId, SyncConfig, SyncError,
 };
 use crate::store::{
-    AccountId, ConvId, ConvRow, Draft, FailReason, OutboxId, OutboxState, Store, StoreError, Tx,
+    AccountId, Claim, ConvId, ConvRow, Draft, FailReason, OutboxId, OutboxState, Store, StoreError,
+    Tx,
 };
 
 /// After this many failed HISTORY or RELATED requests for one
@@ -175,6 +176,8 @@ pub struct SyncEngine {
     want_sync: bool,
     /// Outbox entries sent on this connection and not answered yet.
     sending: HashSet<OutboxId>,
+    /// This connection's claim on the outbox entries it sends (7.6).
+    claim: Claim,
     /// Counts the lines and replies handled, to order them.
     ticks: u64,
     out: Output,
@@ -202,6 +205,7 @@ impl SyncEngine {
         config: SyncConfig,
     ) -> SyncEngine {
         SyncEngine {
+            claim: store.new_claim(),
             store,
             account,
             guest: me.is_guest(),
@@ -1361,65 +1365,90 @@ impl SyncEngine {
 
     /// Sends every outbox entry that can be sent now, and fails those that
     /// cannot be sent safely any more.
+    ///
+    /// Picking the entries and marking them as sent is one write
+    /// transaction (`BEGIN IMMEDIATE`), so that another process sharing the
+    /// cache cannot pick them too. An entry another process's connection
+    /// sent is left to it while its claim lasts
+    /// ([`SyncConfig::claim_lease`]).
     fn flush_outbox(&mut self) -> Result<(), SyncError> {
         let account = self.account;
         let now = self.now();
         let window = self.config.resend_window;
+        let lease = self.config.claim_lease;
         let guest = self.guest;
-        let items = self.write(|tx| tx.outbox_pending(account))?;
-        for item in items {
-            if self.sending.contains(&item.id) {
-                continue;
-            }
-            if item.state == OutboxState::Sending {
-                // Sent on an earlier connection, with no answer. Only an
-                // identity's cid survives that, and only for 24 hours.
-                let fresh = item
-                    .first_sent
-                    .is_some_and(|t| now.saturating_duration_since(t) < window);
-                if guest || !fresh {
-                    self.write(|tx| tx.outbox_failed(item.id, FailReason::Unconfirmed))?;
+        let claim = self.claim.clone();
+        let store = self.store.clone();
+        let in_flight = self.sending.clone();
+        let confirmed: HashMap<Conv, Id> = self
+            .convs
+            .iter()
+            .filter_map(|(c, l)| Some((c.clone(), l.confirmed.clone()?)))
+            .collect();
+        let to_send = self.write(|tx| {
+            let mut to_send = Vec::new();
+            for item in tx.outbox_pending(account)? {
+                if in_flight.contains(&item.id) {
                     continue;
                 }
-            }
-            // The id confirmed on this connection, if the store still has
-            // it: another process sharing the store may have learned that
-            // the room changed.
-            let conv = item.conv.clone();
-            let stored =
-                self.write(|tx| Ok(tx.conv_by_name(account, &conv)?.and_then(|r| r.conv_id)))?;
-            let confirmed = self
-                .convs
-                .get(&item.conv)
-                .and_then(|l| l.confirmed.clone())
-                .filter(|id| stored.as_ref() == Some(id));
-            match (&item.conv_id, confirmed) {
-                (Some(bound), Some(id)) if *bound == id => {}
-                (Some(_), Some(_)) => {
-                    // The room was dropped and created again (7.6).
-                    self.write(|tx| tx.outbox_failed(item.id, FailReason::RoomChanged))?;
-                    continue;
-                }
-                (None, Some(id)) => {
-                    self.write(|tx| tx.outbox_bind(item.id, &id))?;
-                }
-                (Some(_), None) => continue,
-                (None, None) => {
-                    // A direct conversation that has not started: its first
-                    // message starts it (5.1). Wait if it has an id now.
-                    if stored.is_some() || conv.is_room() {
+                if item.state == OutboxState::Sending {
+                    // Another process may still be waiting for its answer.
+                    if let Some((other, at)) = &item.claim
+                        && !store.is_own_instance(other)
+                        && now.saturating_duration_since(*at) < lease
+                    {
+                        continue;
+                    }
+                    // Sent on an earlier connection, with no answer. Only an
+                    // identity's cid survives that, and only for 24 hours.
+                    let fresh = item
+                        .first_sent
+                        .is_some_and(|t| now.saturating_duration_since(t) < window);
+                    if guest || !fresh {
+                        tx.outbox_failed(item.id, FailReason::Unconfirmed)?;
                         continue;
                     }
                 }
+                // The id confirmed on this connection, if the store still
+                // has it: another process sharing the store may have
+                // learned that the room changed.
+                let stored = tx
+                    .conv_by_name(account, &item.conv)?
+                    .and_then(|r| r.conv_id);
+                let live = confirmed
+                    .get(&item.conv)
+                    .filter(|id| stored.as_ref() == Some(*id));
+                match (&item.conv_id, live) {
+                    (Some(bound), Some(id)) if bound == id => {}
+                    (Some(_), Some(_)) => {
+                        // The room was dropped and created again (7.6).
+                        tx.outbox_failed(item.id, FailReason::RoomChanged)?;
+                        continue;
+                    }
+                    (None, Some(id)) => tx.outbox_bind(item.id, id)?,
+                    (Some(_), None) => continue,
+                    (None, None) => {
+                        // A direct conversation that has not started: its
+                        // first message starts it (5.1). Wait if it has an
+                        // id now.
+                        if stored.is_some() || item.conv.is_room() {
+                            continue;
+                        }
+                    }
+                }
+                tx.outbox_sending(item.id, &claim, now)?;
+                to_send.push(item);
             }
+            Ok(to_send)
+        })?;
+        for item in to_send {
             let command = Command::Msg {
-                conv: item.conv.clone(),
-                text: item.draft.text.clone(),
+                conv: item.conv,
+                text: item.draft.text,
                 relation: item.draft.relation,
-                file: item.draft.file.clone(),
-                cid: Some(item.cid.clone()),
+                file: item.draft.file,
+                cid: Some(item.cid),
             };
-            self.write(|tx| tx.outbox_sending(item.id, now))?;
             self.sending.insert(item.id);
             self.issue(command, Pending::Msg { outbox: item.id });
         }

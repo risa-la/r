@@ -48,7 +48,10 @@
 //! - **Caught up means complete.** When a conversation has caught up, the
 //!   store holds every event the server keeps, with deletions applied.
 //! - **At most once.** Each outbox message has its own cid and is bound to
-//!   the conversation's id. It is resent after a reconnect only while that
+//!   the conversation's id. Entries are picked and marked as sent in one
+//!   write transaction, with a claim naming the connection, so two
+//!   processes sharing the cache never send the same one, and neither
+//!   settles one the other still waits on. It is resent after a reconnect only while that
 //!   id still matches, only by an identity (a guest's cids count only
 //!   within one session, which may have ended unseen) and only within 23
 //!   hours (7.6).
@@ -80,6 +83,13 @@ pub struct SyncConfig {
     /// How long after first sending it an unanswered message may be sent
     /// again. The server remembers cids for 24 hours (7.6).
     pub resend_window: Duration,
+    /// How long a message another process sharing the cache sent stays
+    /// its own to settle (7.6). Until then this engine neither sends it
+    /// again nor marks it failed, since that process may still get its
+    /// `OK`. After it, the other connection is taken to be gone. Pick it
+    /// well above how long a connection may go without an answer before
+    /// its keepalive closes it (11).
+    pub claim_lease: Duration,
     /// Where the time comes from.
     pub clock: Clock,
 }
@@ -90,6 +100,7 @@ impl Default for SyncConfig {
             page_size: risala_proto::types::DEFAULT_LIMIT,
             lazy_gap: Some(500),
             resend_window: Duration::from_secs(23 * 3600),
+            claim_lease: Duration::from_secs(300),
             clock: Clock::system(),
         }
     }
@@ -101,6 +112,7 @@ impl fmt::Debug for SyncConfig {
             .field("page_size", &self.page_size)
             .field("lazy_gap", &self.lazy_gap)
             .field("resend_window", &self.resend_window)
+            .field("claim_lease", &self.claim_lease)
             .finish_non_exhaustive()
     }
 }

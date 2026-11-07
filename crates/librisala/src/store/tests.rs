@@ -595,7 +595,7 @@ fn outbox_entries() {
 
     store
         .write(|tx| {
-            tx.outbox_sending(a, now)?;
+            tx.outbox_sending(a, &store.new_claim(), now)?;
             tx.outbox_bind(b, &id("k1"))?;
             tx.outbox_failed(
                 b,

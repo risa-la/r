@@ -49,6 +49,8 @@ struct H {
     notes: Vec<Notification>,
     changes: Vec<Change>,
     last: Output,
+    /// The cache's file, for [`H::on_disk`].
+    file: Option<Arc<tempfile::TempDir>>,
 }
 
 impl H {
@@ -56,8 +58,21 @@ impl H {
         H::with(me, None, 50)
     }
 
+    /// A harness whose cache is a file, so that [`H::sharing`] opens it
+    /// as another process would.
+    fn on_disk(me: &str) -> H {
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let mut h = H::on(store, me, None, 50);
+        h.file = Some(dir);
+        h
+    }
+
     fn with(me: &str, lazy_gap: Option<u64>, page_size: u64) -> H {
-        let store = Store::open_in_memory().unwrap();
+        H::on(Store::open_in_memory().unwrap(), me, lazy_gap, page_size)
+    }
+
+    fn on(store: Store, me: &str, lazy_gap: Option<u64>, page_size: u64) -> H {
         let server: ServerAddr = "chat.example.org".parse().unwrap();
         let account = store.account(&server, &me.parse().unwrap()).unwrap();
         let clock = Arc::new(AtomicU64::new(T0));
@@ -69,6 +84,7 @@ impl H {
             clock: Clock::new(move || {
                 Timestamp::from_unix_millis(c.load(Ordering::SeqCst)).unwrap()
             }),
+            ..SyncConfig::default()
         };
         let engine = SyncEngine::new(store.clone(), account, config.clone()).unwrap();
         H {
@@ -81,16 +97,22 @@ impl H {
             notes: Vec::new(),
             changes: Vec::new(),
             last: Output::default(),
+            file: None,
         }
     }
 
     /// Another process on the same cache and account, with its own engine
-    /// and connection, such as a notification extension (PLAN.md 3.3).
+    /// and connection, such as a notification extension (PLAN.md 3.3). It
+    /// opens the cache again if it is a file.
     fn sharing(other: &H) -> H {
-        let engine =
-            SyncEngine::new(other.store.clone(), other.account, other.config.clone()).unwrap();
+        let store = match &other.file {
+            Some(dir) => Store::open(dir.path().join("cache.db")).unwrap(),
+            None => other.store.clone(),
+        };
+        let engine = SyncEngine::new(store.clone(), other.account, other.config.clone()).unwrap();
         H {
-            store: other.store.clone(),
+            file: other.file.clone(),
+            store,
             account: other.account,
             engine,
             config: other.config.clone(),
@@ -979,6 +1001,107 @@ fn guests_do_not_resend() {
     assert_eq!(
         h.store.outbox_item(queued).unwrap().unwrap().state,
         OutboxState::Failed(FailReason::Unconfirmed)
+    );
+}
+
+#[test]
+fn two_processes_never_send_the_same_entry() {
+    // 7.6: two processes share the cache, both signed in and in the room.
+    // Picking an entry and marking it sent is one transaction, so only one
+    // of them sends it, and the other leaves it alone while it waits.
+    let mut a = H::on_disk(ALICE);
+    a.joined("k1", 3);
+    let mut b = H::sharing(&a);
+    let r = b.start();
+    b.reply(r, &["CONV #general k1 3 0"], "OK");
+    b.idle();
+    let (queued, _) = a
+        .store
+        .write(|tx| {
+            tx.queue(
+                a.account,
+                &conv("#general"),
+                Some(&"k1".parse().unwrap()),
+                &Draft::text("hello"),
+                Timestamp::MIN,
+            )
+        })
+        .unwrap();
+    let out = b.engine.resume_outbox().unwrap();
+    b.absorb(out);
+    let out = a.engine.resume_outbox().unwrap();
+    a.absorb(out);
+    let (sent, _) = b.expect_msg("hello");
+    b.idle();
+    a.idle();
+
+    // A new connection of A's does not take it over either.
+    let r = a.reconnect();
+    a.reply(r, &["CONV #general k1 3 0"], "OK");
+    a.idle();
+    let state = |h: &H| h.store.outbox_item(queued).unwrap().unwrap().state;
+    assert_eq!(state(&a), OutboxState::Sending);
+
+    // B's answer settles it.
+    b.reply(sent, &[], "OK seq=4");
+    assert_eq!(state(&a), OutboxState::Sent(seq(4)));
+}
+
+#[test]
+fn another_process_does_not_fail_a_guest_message_in_flight() {
+    // A guest cannot resend after a reconnect (7.6), but a message another
+    // process sent on its own live connection is not that process's to
+    // fail.
+    let mut a = H::on_disk("~sam");
+    a.joined("k1", 3);
+    let mut b = H::sharing(&a);
+    let r = b.start();
+    b.reply(r, &["CONV #general k1 3 0"], "OK");
+    let (queued, out) = b
+        .engine
+        .send(&conv("#general"), &Draft::text("hello"))
+        .unwrap();
+    b.absorb(out);
+    let (sent, _) = b.expect_msg("hello");
+
+    let r = a.reconnect();
+    a.reply(r, &["CONV #general k1 3 0"], "OK");
+    a.idle();
+    let state = |h: &H| h.store.outbox_item(queued).unwrap().unwrap().state;
+    assert_eq!(state(&a), OutboxState::Sending);
+    b.reply(sent, &[], "OK seq=4");
+    assert_eq!(state(&a), OutboxState::Sent(seq(4)));
+}
+
+#[test]
+fn a_claim_lapses_after_its_lease() {
+    // A process that sent an entry and went away without its answer: once
+    // the lease runs out, the entry is settled as if this process had sent
+    // it on an earlier connection. An identity sends it again (7.6).
+    let mut a = H::on_disk(ALICE);
+    a.joined("k1", 3);
+    let mut b = H::sharing(&a);
+    let r = b.start();
+    b.reply(r, &["CONV #general k1 3 0"], "OK");
+    let (queued, out) = b
+        .engine
+        .send(&conv("#general"), &Draft::text("hello"))
+        .unwrap();
+    b.absorb(out);
+    b.expect_msg("hello");
+    drop(b);
+
+    a.advance_clock(a.config.claim_lease - Duration::from_secs(1));
+    let out = a.engine.resume_outbox().unwrap();
+    a.absorb(out);
+    a.idle();
+    a.advance_clock(Duration::from_secs(1));
+    let out = a.engine.resume_outbox().unwrap();
+    a.absorb(out);
+    a.expect_msg("hello");
+    assert_eq!(
+        a.store.outbox_item(queued).unwrap().unwrap().state,
+        OutboxState::Sending
     );
 }
 

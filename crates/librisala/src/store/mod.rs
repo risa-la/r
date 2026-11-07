@@ -37,6 +37,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::addr::ServerAddr;
 use risala_proto::names::Uid;
 
+pub(crate) use outbox::Claim;
 pub use outbox::{Draft, FailReason, OutboxItem, OutboxState};
 pub use read::{ConversationSummary, Member, Reaction, TimelineItem};
 
@@ -153,6 +154,11 @@ pub enum Change {
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
+    /// Random for each store opened, to tell its outbox claims from other
+    /// processes' (7.6).
+    instance: Arc<str>,
+    /// Counts the claims handed out, one per connection.
+    connections: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl fmt::Debug for Store {
@@ -183,7 +189,24 @@ impl Store {
         schema::migrate(&mut conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
+            instance: outbox::new_cid()?.as_str().into(),
+            connections: Arc::default(),
         })
+    }
+
+    /// A claim for a new connection's outbox entries (7.6).
+    pub(crate) fn new_claim(&self) -> Claim {
+        Claim {
+            instance: self.instance.to_string(),
+            connection: self
+                .connections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Whether `claim` was handed out by this store instance.
+    pub(crate) fn is_own_instance(&self, claim: &Claim) -> bool {
+        *claim.instance == *self.instance
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
