@@ -138,7 +138,8 @@ enum Command {
     /// Remove a block (5.7).
     Unblock { server: String, target: String },
     /// List your blocks (5.7). --hide hides blocked people's messages in
-    /// rooms on this device, and --show shows them again.
+    /// rooms on this device, and --show shows them again; with either, it
+    /// works offline and lists the blocks the cache has.
     Blocks {
         server: String,
         /// Hide blocked people's messages in rooms.
@@ -716,12 +717,18 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             Ok(())
         }
         Command::Blocks { server, hide, show } => {
-            let account = identity_online(ctx, &server).await?;
-            for target in within(account.blocks()).await? {
-                println!("{target}");
-            }
-            if hide || show {
+            let account = identity(ctx, &server)?;
+            let targets = if hide || show {
+                // Hiding is this device's alone (5.7): no connection, and
+                // the blocks as the cache has them.
                 account.set_hide_blocked(hide).or_else(explain)?;
+                account.cached_blocks().or_else(explain)?
+            } else {
+                connect(ctx, &account).await?;
+                within(account.blocks()).await?
+            };
+            for target in targets {
+                println!("{target}");
             }
             if account.hides_blocked().or_else(explain)? {
                 eprintln!("risala: blocked people's messages are hidden in rooms");
@@ -970,9 +977,9 @@ async fn keys(ctx: &Ctx, command: KeysCommand) -> Res {
                 let keys = within(account.keys()).await?;
                 match keys.into_iter().find(|k| k.fingerprint == wanted) {
                     Some(k) => k.public_key,
-                    None => {
-                        return fail_with(USAGE, format!("{} has no key {wanted}", account.uid()));
-                    }
+                    // Well-formed, but not one of the keys: a failure, not
+                    // a usage error.
+                    None => return fail(format!("{} has no key {wanted}", account.uid())),
                 }
             } else {
                 key
@@ -1006,8 +1013,8 @@ fn presence(p: Presence) -> &'static str {
     }
 }
 
-/// The identity account on `server`, signed in.
-async fn identity_online(ctx: &Ctx, server: &str) -> Res<Account> {
+/// The identity account on `server`.
+fn identity(ctx: &Ctx, server: &str) -> Res<Account> {
     let account = pick(ctx, server)?;
     if account.is_guest() {
         return fail_with(
@@ -1018,6 +1025,12 @@ async fn identity_online(ctx: &Ctx, server: &str) -> Res<Account> {
             ),
         );
     }
+    Ok(account)
+}
+
+/// The identity account on `server`, signed in.
+async fn identity_online(ctx: &Ctx, server: &str) -> Res<Account> {
+    let account = identity(ctx, server)?;
     connect(ctx, &account).await?;
     Ok(account)
 }

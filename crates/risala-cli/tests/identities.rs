@@ -461,6 +461,11 @@ async fn register_manage_keys_and_unregister() {
     let (out, _) = run(state, &["keys", "list", &fake.addr, "--lines"], 0).await;
     assert!(out.contains(&format!("mldsa44 {other} phone\n")), "{out}");
 
+    // A fingerprint that is none of the keys fails (1), not a usage error.
+    let unknown = SecretKey::from_seed([8; 32]).public_key().fingerprint();
+    let (_, err) = run(state, &["keys", "del", &fake.addr, &unknown.to_string()], 1).await;
+    assert!(err.contains("has no key"), "{err}");
+
     // By fingerprint, then the last key, which the server keeps.
     let fp = other.fingerprint().to_string();
     run(state, &["keys", "del", &fake.addr, &fp], 0).await;
@@ -614,10 +619,14 @@ async fn read_names_members_and_blocks() {
     assert!(got(&fake, "BLOCK troll@example.com"));
     let (out, _) = run(&state, &["unblock", addr, "troll@example.com"], 0).await;
     assert_eq!(out.trim(), "unblocked troll@example.com");
+    // Hiding needs no connection.
+    let signed_in = |fake: &Fake| fake.log().iter().filter(|l| l.contains(" AUTH ")).count();
+    let before = signed_in(&fake);
     let (out, err) = run(&state, &["blocks", addr, "--hide"], 0).await;
     assert_eq!(out.trim(), "*@evil.example");
     assert!(err.contains("hidden in rooms"), "{err}");
     let (_, err) = run(&state, &["blocks", addr, "--show"], 0).await;
     assert!(!err.contains("hidden"), "{err}");
+    assert_eq!(signed_in(&fake), before);
     run(&state, &["block", addr, "~sam"], 2).await;
 }
