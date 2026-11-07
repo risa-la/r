@@ -8,11 +8,16 @@
 //!
 //! - [`tls`]: certificates chosen by SNI, reloading, and the generated
 //!   self-signed certificate (2.1, 2.2).
+//! - [`testing`]: a TLS client for tests, here and in other crates.
 //!
 //! Owned by task B in docs/plans/M2-M5.md.
 
 mod conn;
+pub mod testing;
 pub mod tls;
+
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::future::Future;
