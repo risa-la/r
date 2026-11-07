@@ -38,7 +38,6 @@ where
         "GET {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          User-Agent: risala-keyfetch/{}\r\n\
-         Accept: text/plain\r\n\
          Accept-Encoding: identity\r\n\
          Connection: close\r\n\
          \r\n",

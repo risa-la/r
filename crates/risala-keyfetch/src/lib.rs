@@ -213,10 +213,14 @@ struct Slot {
     last: tokio::sync::Mutex<Option<Fetched>>,
 }
 
-/// The outcome of the last fetch of a key file.
+/// What is known of a key file: the outcome of its last fetch.
 #[derive(Clone)]
 struct Fetched {
+    /// When `result` was fetched.
     at: Instant,
+    /// When a fetch was last tried. Later than `at` when a refetch failed
+    /// to reach the server and the file fetched at `at` was kept.
+    tried: Instant,
     result: Result<Arc<[KeyEntry]>, FetchError>,
 }
 
@@ -224,11 +228,27 @@ impl Fetched {
     /// Whether this may still be used without fetching again: a file for
     /// the cache's lifetime, a failure only for the rate limit's.
     fn fresh(&self, now: Instant, inner: &Inner) -> bool {
-        let age = now.saturating_duration_since(self.at);
         match self.result {
-            Ok(_) => age < inner.cache_ttl,
-            Err(_) => age < inner.min_refetch,
+            Ok(_) => now.saturating_duration_since(self.at) < inner.cache_ttl,
+            Err(_) => !self.may_retry(now, inner),
         }
+    }
+
+    /// Whether the rate limit lets the file be fetched again (14).
+    fn may_retry(&self, now: Instant, inner: &Inner) -> bool {
+        now.saturating_duration_since(self.tried) >= inner.min_refetch
+    }
+}
+
+impl FetchError {
+    /// Whether the key file's server answered: with a status other than
+    /// 200, a file over the size limit, or a response that is not HTTP.
+    /// Other errors mean it could not be reached in time.
+    pub fn is_answer(&self) -> bool {
+        matches!(
+            self,
+            FetchError::Status(_) | FetchError::TooLarge | FetchError::BadResponse(_)
+        )
     }
 }
 
@@ -269,6 +289,12 @@ impl KeyFetcher {
     /// fetched less than [`FetchOptions::min_refetch`] ago: then the last
     /// result stands. A failure is remembered for that long too.
     ///
+    /// If a refetch cannot reach the server (any error but
+    /// [`is_answer`](FetchError::is_answer)), a cached file still within
+    /// the cache's lifetime is kept and returned: the cache is there so
+    /// that people can sign in while their key file's host is down (14).
+    /// An answer, such as a 404 for a deleted file, replaces it.
+    ///
     /// Any error means the identity has no keys (4.4). An empty list means
     /// the file was fetched but has no valid key.
     pub async fn fetch(
@@ -291,19 +317,29 @@ impl KeyFetcher {
         let slot = self.slot(identity);
         let mut last = slot.last.lock().await;
         let now = inner.clock.now();
-        if let Some(fetched) = &*last {
-            let age = now.saturating_duration_since(fetched.at);
-            if age < inner.min_refetch || (!refresh && fetched.fresh(now, inner)) {
-                return fetched.result.clone();
-            }
+        if let Some(fetched) = &*last
+            && (!fetched.may_retry(now, inner) || (!refresh && fetched.fresh(now, inner)))
+        {
+            return fetched.result.clone();
         }
         let result = self.get(identity).await;
+        let tried = inner.clock.now();
         match &result {
             Ok(keys) => tracing::debug!(%identity, keys = keys.len(), "fetched key file"),
             Err(error) => tracing::info!(%identity, %error, "key file fetch failed"),
         }
+        if let (Err(error), Some(fetched)) = (&result, &mut *last)
+            && !error.is_answer()
+            && fetched.result.is_ok()
+            && fetched.fresh(tried, inner)
+        {
+            tracing::info!(%identity, "keeping the cached key file");
+            fetched.tried = tried;
+            return fetched.result.clone();
+        }
         *last = Some(Fetched {
-            at: inner.clock.now(),
+            at: tried,
+            tried,
             result: result.clone(),
         });
         result
@@ -345,10 +381,9 @@ impl KeyFetcher {
                 let Some(fetched) = &*last else {
                     return false;
                 };
-                let expired = !fetched.fresh(now, inner)
-                    && now.saturating_duration_since(fetched.at) >= inner.min_refetch;
-                if !expired && oldest.as_ref().is_none_or(|(at, _)| fetched.at < *at) {
-                    oldest = Some((fetched.at, id.clone()));
+                let expired = !fetched.fresh(now, inner) && fetched.may_retry(now, inner);
+                if !expired && oldest.as_ref().is_none_or(|(at, _)| fetched.tried < *at) {
+                    oldest = Some((fetched.tried, id.clone()));
                 }
                 !expired
             });

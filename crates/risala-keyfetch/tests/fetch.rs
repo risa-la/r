@@ -455,15 +455,21 @@ async fn changing_file() -> (
     let server = Server::start(
         &ca,
         &["example.test"],
-        Arc::new(move |path| match path {
-            "/.well-known/risala/gone" => status(404, ""),
-            _ => ok(&current.lock().unwrap()),
+        Arc::new(move |path| {
+            let current = current.lock().unwrap();
+            match (path, current.as_str()) {
+                ("/.well-known/risala/gone", _) | (_, "404") => status(404, ""),
+                (_, "hang") => Reply::Hang,
+                (_, file) => ok(file),
+            }
         }),
     )
     .await;
     let clock = ManualClock::new();
     let fetcher = KeyFetcher::new(FetchOptions {
         clock: clock.clone(),
+        // Local fetches are quick; this ends the hanging ones.
+        timeout: Duration::from_millis(300),
         ..options(&ca, &server, &["example.test"])
     });
     (server, file, clock, fetcher, ca)
@@ -510,6 +516,41 @@ async fn refetch_once_on_failure_is_rate_limited() {
     assert_eq!(fetcher.cached(), 0);
     assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1), key(2)]));
     assert_eq!(server.hits(), 3);
+}
+
+#[tokio::test]
+async fn a_cached_file_outlives_an_unreachable_host() {
+    let (server, file, clock, fetcher, _ca) = changing_file().await;
+    let alice = id("alice@example.test");
+    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
+
+    // The host stops answering. A refetch keeps the cached file.
+    *file.lock().unwrap() = "hang".into();
+    clock.advance(Duration::from_secs(30 * 60));
+    assert_eq!(fetcher.fetch(&alice, true).await, Ok(vec![key(1)]));
+    assert_eq!(server.hits(), 2);
+    // The failed attempt counts for the rate limit.
+    assert_eq!(fetcher.fetch(&alice, true).await, Ok(vec![key(1)]));
+    assert_eq!(server.hits(), 2);
+    // But the file keeps its age, and expires an hour after it was fetched.
+    clock.advance(Duration::from_secs(30 * 60));
+    assert_eq!(fetcher.fetch(&alice, false).await, Err(FetchError::Timeout));
+    assert_eq!(server.hits(), 3);
+
+    // An answer from the host replaces a cached file: here, it is gone.
+    *file.lock().unwrap() = line(1);
+    clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
+    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
+    *file.lock().unwrap() = "404".into();
+    clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
+    assert_eq!(
+        fetcher.fetch(&alice, true).await,
+        Err(FetchError::Status(404))
+    );
+    assert_eq!(
+        fetcher.fetch(&alice, false).await,
+        Err(FetchError::Status(404))
+    );
 }
 
 #[tokio::test]
