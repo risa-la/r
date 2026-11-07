@@ -184,6 +184,111 @@ fn a_newer_database_is_refused() {
     ));
 }
 
+/// A migration that rebuilds `conversations`, the parent of most tables,
+/// in the usual way: a new table, the rows copied, the old one dropped and
+/// the new one renamed.
+const REBUILD_CONVERSATIONS: &str = r#"
+CREATE TABLE conversations_new (
+    conv    INTEGER PRIMARY KEY,
+    id      TEXT NOT NULL UNIQUE REFERENCES used_ids (id),
+    kind    TEXT NOT NULL CHECK (kind IN ('room', 'direct')),
+    room    TEXT UNIQUE,
+    uid_a   TEXT,
+    uid_b   TEXT,
+    head    INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0),
+    created INTEGER NOT NULL,
+    note    TEXT NOT NULL DEFAULT '',
+    UNIQUE (uid_a, uid_b)
+);
+INSERT INTO conversations_new (conv, id, kind, room, uid_a, uid_b, head, created)
+    SELECT conv, id, kind, room, uid_a, uid_b, head, created FROM conversations;
+DROP TABLE conversations;
+ALTER TABLE conversations_new RENAME TO conversations;
+"#;
+
+fn count(store: &SqliteStore, table: &str) -> i64 {
+    store
+        .conn()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn foreign_keys_on(store: &SqliteStore) -> bool {
+    store
+        .conn()
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn migrations_can_rebuild_a_parent_table() {
+    let (store, key) = store_with_room();
+    store
+        .append(key, &event("alice@example.org", EventKind::Join))
+        .unwrap();
+    store
+        .append(key, &msg("alice@example.org", 1, "hello"))
+        .unwrap();
+    let before: Vec<i64> = ["events", "event_text", "members", "room_settings"]
+        .iter()
+        .map(|table| count(&store, table))
+        .collect();
+    assert_eq!(before, [2, 1, 1, 1]);
+
+    let mut migrations = schema::MIGRATIONS.to_vec();
+    migrations.push(REBUILD_CONVERSATIONS);
+    schema::migrate_with(&mut store.conn(), &migrations).unwrap();
+
+    // The rows that refer to the rebuilt table are all still there, and
+    // foreign keys are on again.
+    let after: Vec<i64> = ["events", "event_text", "members", "room_settings"]
+        .iter()
+        .map(|table| count(&store, table))
+        .collect();
+    assert_eq!(after, before);
+    assert!(foreign_keys_on(&store));
+    let version: i64 = store
+        .conn()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, migrations.len() as i64);
+    assert_eq!(store.room(&room("#general")).unwrap().unwrap().key, key);
+    assert_eq!(
+        new_seq(store.append(key, &msg("~sam", 2, "hi")).unwrap()),
+        3
+    );
+
+    // With foreign keys on, as they were before, the same rebuild deletes
+    // every event.
+    let (store, key) = store_with_room();
+    store.append(key, &msg("~sam", 1, "hello")).unwrap();
+    store.conn().execute_batch(REBUILD_CONVERSATIONS).unwrap();
+    assert_eq!(count(&store, "events"), 0);
+}
+
+#[test]
+fn a_migration_that_breaks_foreign_keys_is_rolled_back() {
+    let (store, key) = store_with_room();
+    store.append(key, &msg("~sam", 1, "hello")).unwrap();
+    let mut migrations = schema::MIGRATIONS.to_vec();
+    migrations.push("DELETE FROM conversations;");
+    let err = schema::migrate_with(&mut store.conn(), &migrations).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Corrupt(m) if m.contains("foreign keys")),
+        "{err}"
+    );
+    assert!(foreign_keys_on(&store));
+    let version: i64 = store
+        .conn()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, schema::MIGRATIONS.len() as i64);
+    assert_eq!(count(&store, "conversations"), 1);
+    assert_eq!(count(&store, "events"), 1);
+}
+
 #[test]
 fn append_numbers_events_from_one() {
     let (store, key) = store_with_room();

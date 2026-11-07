@@ -1,8 +1,10 @@
 //! The SQLite schema and its migrations.
 //!
 //! `PRAGMA user_version` holds the number of migrations applied. Each
-//! migration runs in its own transaction. Later milestones add migrations
-//! to the end of [`MIGRATIONS`]; they never edit one that has shipped.
+//! migration runs in its own transaction, with foreign keys off so that it
+//! may rebuild a table, and must pass `PRAGMA foreign_key_check` to commit
+//! (see [`migrate_with`]). Later milestones add migrations to the end of
+//! [`MIGRATIONS`]; they never edit one that has shipped.
 //!
 //! The first migration has the tables of the whole protocol, though M2 uses
 //! only some of them, so that M3 and M4 add behaviour rather than redo the
@@ -276,24 +278,68 @@ CREATE INDEX push_registrations_uid ON push_registrations (uid);
 
 /// Brings the database up to date. Fails if it is newer than this server.
 pub fn migrate(conn: &mut Connection) -> Result<()> {
+    migrate_with(conn, MIGRATIONS)
+}
+
+/// Applies the migrations in `migrations` that the database does not have
+/// yet.
+///
+/// Foreign keys are off while they run, so a migration can rebuild a table
+/// (create a new one, copy the rows, drop the old one, rename the new one)
+/// without the drop deleting the rows of other tables that refer to it
+/// (`ON DELETE CASCADE`). Before each migration commits,
+/// `PRAGMA foreign_key_check` must find nothing, or the migration is
+/// rolled back. Foreign keys are on again afterwards, whatever happened.
+/// SQLite ignores the `foreign_keys` pragma inside a transaction, so it is
+/// set around them.
+pub(super) fn migrate_with(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let latest = MIGRATIONS.len() as i64;
+    let latest = migrations.len() as i64;
     if version > latest {
         return Err(StoreError::Corrupt(format!(
             "database schema version {version} is newer than this server's ({latest})"
         )));
     }
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-        let tx = conn.transaction()?;
-        apply(&tx, sql, i as i64 + 1)?;
-        tx.commit()?;
-        tracing::info!(version = i + 1, "migrated database schema");
+    if version == latest {
+        return Ok(());
     }
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let result = (|| -> Result<()> {
+        for (i, sql) in migrations.iter().enumerate().skip(version as usize) {
+            let tx = conn.transaction()?;
+            apply(&tx, sql, i as i64 + 1)?;
+            tx.commit()?;
+            tracing::info!(version = i + 1, "migrated database schema");
+        }
+        Ok(())
+    })();
+    let restored = conn.pragma_update(None, "foreign_keys", "ON");
+    result?;
+    restored?;
     Ok(())
 }
 
 fn apply(tx: &Transaction<'_>, sql: &str, version: i64) -> Result<()> {
     tx.execute_batch(sql)?;
+    let problems: Vec<String> = tx
+        .prepare("PRAGMA foreign_key_check")?
+        .query_map([], |row| {
+            Ok(format!(
+                "{} row {} refers to a missing row of {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?
+                    .map_or_else(|| "?".to_owned(), |r| r.to_string()),
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .take(10)
+        .collect::<rusqlite::Result<_>>()?;
+    if !problems.is_empty() {
+        return Err(StoreError::Corrupt(format!(
+            "migration to schema version {version} breaks foreign keys: {}",
+            problems.join("; ")
+        )));
+    }
     tx.pragma_update(None, "user_version", version)?;
     Ok(())
 }
