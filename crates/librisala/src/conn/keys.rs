@@ -9,6 +9,13 @@
 //! [`PlatformKeys`]. Rust code may implement [`KeyStore`] directly.
 //! [`FileKeyStore`] keeps PEM files for the CLI and for Linux until
 //! libsecret support exists, and [`MemoryKeyStore`] keeps keys in memory.
+//!
+//! Devices do not fetch key files yet. When they do, to check the members
+//! of encrypted conversations (12.12, M5), a key counts as removed only
+//! when a fetch returns a key file (200) that does not list it, or a gone
+//! answer (404 or 410). Any other outcome, from a timeout or a DNS or TLS
+//! error to a 5xx or a redirect, is a failed fetch: it keeps the cached
+//! copy and removes nothing, however long it lasts (4.4).
 
 use std::collections::HashMap;
 use std::fs;
