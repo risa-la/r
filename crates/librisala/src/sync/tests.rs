@@ -680,6 +680,40 @@ fn notifications_are_not_history() {
         "from=bob@example.net KICK #general carol@example.com",
     ));
     assert_eq!(h.seqs("#general"), [1, 2, 3, 4]);
+    // An INVITE of someone else is history too.
+    h.line(&ev(
+        5,
+        "from=bob@example.net INVITE #general carol@example.com",
+    ));
+    assert_eq!(h.seqs("#general"), [1, 2, 3, 4, 5]);
+    assert!(h.notes.is_empty());
+}
+
+#[test]
+fn an_invite_of_a_member_is_never_history() {
+    // 6.4: inviting a member records nothing, so an INVITE of the account
+    // means the server takes it not to be in the room, even if this
+    // connection thought it was. It is a notification, and SYNC settles
+    // the membership.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    h.line(&ev(
+        4,
+        "from=bob@example.net INVITE #general alice@example.org",
+    ));
+    assert_eq!(h.seqs("#general"), [1, 2, 3]);
+    assert_eq!(
+        h.notes,
+        [Notification::Invited {
+            room: "#general".parse().unwrap(),
+            by: "bob@example.net".parse().unwrap(),
+        }]
+    );
+    assert!(!h.engine.is_live(&conv("#general")));
+    assert!(!h.conv("#general").joined);
+    let r = h.expect("SYNC");
+    h.reply(r, &[], "OK");
+    h.idle();
 }
 
 #[test]

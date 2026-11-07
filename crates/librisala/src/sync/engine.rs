@@ -615,11 +615,19 @@ impl SyncEngine {
 
         // 6.4: notifications, not history.
         match &event.body {
-            EventBody::Invite { room, uid } if *uid == self.me && !self.is_live(&conv) => {
+            EventBody::Invite { room, uid } if *uid == self.me => {
                 self.out.notifications.push(Notification::Invited {
                     room: room.clone(),
                     by: meta.from.clone(),
                 });
+                // Inviting a member records nothing (6.4), so the server
+                // takes the account not to be in the room. If this
+                // connection thought it was, ask SYNC.
+                if self.is_live(&conv) {
+                    self.touch_left(&conv);
+                    self.left(&conv)?;
+                    self.want_sync = true;
+                }
                 return Ok(());
             }
             EventBody::Kick { room, uid, reason } if *uid == self.me => {
