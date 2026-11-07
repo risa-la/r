@@ -209,6 +209,11 @@ impl Store {
     }
 
     /// A claim for a new connection's outbox entries (7.6).
+    ///
+    /// A claim from this store instance but an earlier connection counts as
+    /// abandoned at once, so run at most one connection per account on one
+    /// store instance at a time, as [`Client`](crate::client::Client) does.
+    /// Another process opens its own instance.
     pub(crate) fn new_claim(&self) -> Claim {
         Claim {
             instance: self.instance.to_string(),
