@@ -29,7 +29,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use librisala::client::{
     Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, EventKind,
-    KeyErrorKind, KeyInfo, Message, OutboxStatus, Presence, RefusedKind, TimelineDiff, TrustInfo,
+    KeyErrorKind, KeyInfo, Label, Message, OutboxStatus, Presence, RefusedKind, TimelineDiff,
+    TrustInfo,
 };
 use librisala::conn::keys::FileKeyStore;
 
@@ -681,10 +682,13 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         Command::Members { server, room } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
+            // The uid comes first on each line, so the display name
+            // follows it as it is (8.2).
             for m in within(conv.members()).await? {
                 let mut line = format!("{} {} {}", m.uid, m.role, presence(m.presence));
-                if m.label != m.uid {
-                    line.push_str(&format!(" ({})", m.label));
+                if let Some(name) = &m.display_name {
+                    line.push(' ');
+                    line.push_str(name);
                 }
                 println!("{line}");
             }
@@ -694,7 +698,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let account = online(ctx, &server).await?;
             let user = within(account.whois(&uid)).await?;
             match user.display_name {
-                Some(name) => println!("{} {} ({name})", user.uid, presence(user.presence)),
+                Some(name) => println!("{} {} {name}", user.uid, presence(user.presence)),
                 None => println!("{} {}", user.uid, presence(user.presence)),
             }
             Ok(())
@@ -1249,7 +1253,10 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
                     Some(AccountEvent::Typing { conversation, uids })
                         if conversation == conv.name() && !uids.is_empty() =>
                     {
-                        let who = conv.labels(uids.clone()).unwrap_or(uids);
+                        let who: Vec<String> = match conv.labels(uids.clone()) {
+                            Ok(labels) => labels.iter().map(show_label).collect(),
+                            Err(_) => uids,
+                        };
                         let verb = if who.len() == 1 { "is" } else { "are" };
                         eprintln!("risala: {} {verb} typing", who.join(", "));
                     }
@@ -1277,6 +1284,15 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
     let _ = tokio::time::timeout(Duration::from_secs(5), account.wait_synced()).await;
     account.disconnect().await;
     Ok(())
+}
+
+/// A person as the terminal shows them (8.2): the name, then the uid in
+/// angle brackets when it must be shown.
+fn show_label(label: &Label) -> String {
+    match &label.uid {
+        Some(uid) => format!("{} <{uid}>", label.name),
+        None => label.name.clone(),
+    }
 }
 
 fn uid_of(account: &Account) -> String {

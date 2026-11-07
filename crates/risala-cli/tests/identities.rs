@@ -600,14 +600,14 @@ async fn read_names_members_and_blocks() {
     assert_eq!(
         out.lines().collect::<Vec<_>>(),
         [
-            "alice@example.org owner online (Alice)",
-            "bob@example.net member offline (Bob (bob@example.net))",
-            "bob@example.org member online (Bob (bob@example.org))",
+            "alice@example.org owner online Alice",
+            "bob@example.net member offline Bob",
+            "bob@example.org member online Bob",
             "~sam member online",
         ]
     );
     let (out, _) = run(&state, &["whois", addr, "bob@example.net"], 0).await;
-    assert_eq!(out.trim(), "bob@example.net offline (Bob)");
+    assert_eq!(out.trim(), "bob@example.net offline Bob");
 
     let (out, _) = run(&state, &["block", addr, "troll@example.com"], 0).await;
     assert_eq!(out.trim(), "blocked troll@example.com");
