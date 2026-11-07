@@ -515,6 +515,49 @@ fn removing_a_room() {
 }
 
 #[test]
+fn unread_counts_the_gap_that_is_not_stored() {
+    // 7.1 step 4: only the newest page of a long gap is stored. The rest
+    // counts as unread too, from the read marker or the sync point.
+    let (store, _account, conv) = setup();
+    let newest: Vec<Event> = (591..=600)
+        .map(|n| ev(n, "from=bob@example.net MSG #general hi"))
+        .collect();
+    store_all(&store, conv, &newest);
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.note_head(&mut row, 600)
+        })
+        .unwrap();
+    assert_eq!(store.unread(conv).unwrap(), 600);
+    let read = |n: u64| {
+        store
+            .write(|tx| {
+                let mut row = tx.conv(conv)?.unwrap();
+                tx.set_read(&mut row, n)
+            })
+            .unwrap();
+    };
+    read(500);
+    assert_eq!(store.unread(conv).unwrap(), 100);
+    read(595);
+    assert_eq!(store.unread(conv).unwrap(), 5);
+    // Below the sync point, events that are not stored have expired: they
+    // do not count.
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.raise_sync_point(&mut row, 590)
+        })
+        .unwrap();
+    assert_eq!(
+        store.conversation_by_id(conv).unwrap().unwrap().sync_point,
+        600
+    );
+    assert_eq!(store.unread(conv).unwrap(), 5);
+}
+
+#[test]
 fn unread_and_read_markers() {
     let (store, account, conv) = setup();
     store_all(

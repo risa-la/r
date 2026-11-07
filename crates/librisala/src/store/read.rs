@@ -29,7 +29,10 @@ pub struct ConversationSummary {
     /// The read marker (7.4), 0 for none.
     pub read: u64,
     /// Messages after the read marker, not counting the account's own,
-    /// edits, reactions or deleted messages.
+    /// edits, reactions or deleted messages. Events above the sync point
+    /// that are not stored yet, as when only the newest page was fetched
+    /// (7.1 step 4), each count as one: they are not known, and most are
+    /// messages.
     pub unread: u64,
     /// The newest stored seq, if any.
     pub newest: Option<Seq>,
@@ -101,7 +104,10 @@ const SUMMARY: &str = "
     SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
         (SELECT COUNT(*) FROM events e
          WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
-             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0),
+             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0)
+        + MAX(0, c.head - MAX(c.read, c.sync_point)
+            - (SELECT COUNT(*) FROM events e
+               WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point) AND e.seq <= c.head)),
         (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
     FROM convs c JOIN accounts a ON a.id = c.account";
 
