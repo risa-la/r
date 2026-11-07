@@ -3,3 +3,5 @@
 //! device keys.
 //!
 //! Owned by task C in docs/plans/M2-M5.md.
+
+pub mod keys;
