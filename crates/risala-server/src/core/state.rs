@@ -50,12 +50,12 @@ impl RoomEntry {
     }
 }
 
-/// The most cids remembered per guest connection (7.6). Older ones are
+/// The most cids remembered per guest session (7.6). Older ones are
 /// forgotten first, so a guest cannot grow the server's memory without
 /// bound.
 const GUEST_CIDS: usize = 1024;
 
-/// A guest connection's cids (7.6): the cid and conversation id of each
+/// A guest session's cids (7.6): the cid and conversation id of each
 /// message it sent, with the message's seq.
 #[derive(Debug, Default)]
 pub(crate) struct CidCache {
@@ -98,12 +98,47 @@ pub(crate) struct ConnEntry {
     pub(crate) nonce: Nonce,
     /// Who the connection signed in as.
     pub(crate) uid: Option<Uid>,
+    /// The connection lost its guest session, to a resume on another
+    /// connection or because the session was ended (4.2). It has been
+    /// told BYE, and runs no more commands.
+    pub(crate) detached: bool,
     /// Held by each command while it runs, and by the clean-up after the
     /// connection closes, so that the clean-up never overlaps a command.
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
-    pub(crate) guest_cids: CidCache,
     /// The task that closes the connection if it does not sign in (4.1).
     pub(crate) sign_in_timer: Option<tokio::task::AbortHandle>,
+}
+
+/// A guest's session (4.2): it starts with GUEST, moves to a new connection
+/// when the guest resumes it, and ends a while after its connection
+/// closes. While it lasts, it holds the guest's name, rooms and cids.
+#[derive(Debug)]
+pub(crate) struct GuestSession {
+    /// The token that resumes the session. It lives only here, in memory:
+    /// sessions do not survive a restart, so it never needs to be stored.
+    /// Never logged.
+    pub(crate) token: Id,
+    /// The connection that has the session, or `None` while it waits to be
+    /// resumed.
+    pub(crate) conn: Option<ConnId>,
+    pub(crate) cids: CidCache,
+    /// Counts the times the session started waiting, so that a resume
+    /// period that has been cut short cannot end a later one.
+    pub(crate) epoch: u64,
+    /// The task that ends the session when its resume period is over.
+    pub(crate) expiry: Option<tokio::task::AbortHandle>,
+    /// The session is ending: its PARTs are being recorded. It still holds
+    /// its name, but can no longer be resumed or join rooms.
+    pub(crate) ending: bool,
+}
+
+impl GuestSession {
+    /// Whether `token` is the session's current token, compared in
+    /// constant time.
+    pub(crate) fn token_is(&self, token: &Id) -> bool {
+        let (a, b) = (self.token.as_str().as_bytes(), token.as_str().as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
 }
 
 /// Connections, users and room membership. Behind one plain mutex that is
@@ -114,8 +149,12 @@ pub(crate) struct ConnEntry {
 #[derive(Debug, Default)]
 pub(crate) struct Registry {
     pub(crate) conns: HashMap<ConnId, ConnEntry>,
-    /// The connections signed in as each uid. A guest has one.
+    /// The connections signed in as each uid. A guest has at most one:
+    /// none while its session waits to be resumed.
     pub(crate) users: HashMap<Uid, Vec<ConnId>>,
+    /// Guest sessions (4.2), connected or waiting, by uid. A guest's name
+    /// is taken for as long as it has one.
+    pub(crate) sessions: HashMap<Uid, GuestSession>,
     /// The members of each room: identities (also stored) and guests (only
     /// here).
     pub(crate) members: HashMap<Room, BTreeSet<Uid>>,
@@ -126,6 +165,29 @@ pub(crate) struct Registry {
 impl Registry {
     pub(crate) fn is_member(&self, room: &Room, uid: &Uid) -> bool {
         self.members.get(room).is_some_and(|m| m.contains(uid))
+    }
+
+    /// Whether `uid` is an identity, or a guest whose session is neither
+    /// over nor ending. Only then may it join a room.
+    pub(crate) fn may_join(&self, uid: &Uid) -> bool {
+        !uid.is_guest() || self.sessions.get(uid).is_some_and(|s| !s.ending)
+    }
+
+    /// Takes the guest session away from connection `id`, which is then
+    /// closed with BYE and runs no more commands (4.2).
+    pub(crate) fn detach(&mut self, id: ConnId, bye: &str) {
+        if let Some(conn) = self.conns.get_mut(&id) {
+            if let Some(uid) = conn.uid.take()
+                && let Some(conns) = self.users.get_mut(&uid)
+            {
+                conns.retain(|c| *c != id);
+                if conns.is_empty() {
+                    self.users.remove(&uid);
+                }
+            }
+            conn.detached = true;
+            conn.handle.close(Some(bye.to_owned()));
+        }
     }
 
     pub(crate) fn member_count(&self, room: &Room) -> u64 {

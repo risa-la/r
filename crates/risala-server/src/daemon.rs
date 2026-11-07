@@ -27,7 +27,7 @@ use std::sync::Arc;
 use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
-use crate::core::{CID_PRUNE_PERIOD, Hub, HubError};
+use crate::core::{BYE_SHUTDOWN, CID_PRUNE_PERIOD, Hub, HubError, Timers};
 use crate::net;
 
 /// An error starting or running the server.
@@ -60,10 +60,17 @@ impl Daemon {
     /// Port 0 lets the system choose; [`local_addrs`](Self::local_addrs)
     /// says what it chose.
     pub async fn bind(config: Config) -> Result<Daemon, RunError> {
+        let timers = Timers::from_config(&config);
+        Daemon::bind_with(config, timers).await
+    }
+
+    /// [`Daemon::bind`] with timers that need not follow the
+    /// configuration, for tests.
+    pub(crate) async fn bind_with(config: Config, timers: Timers) -> Result<Daemon, RunError> {
         // Opening SQLite, reading certificates and generating a key all
         // block, so keep them off the runtime's worker threads.
         tokio::task::spawn_blocking(move || {
-            let hub = Hub::open(config)?;
+            let hub = Hub::open_with(config, timers)?;
             let server = net::Server::bind(hub.config(), Arc::new(hub.clone()))?;
             Ok(Daemon { server, hub })
         })
@@ -95,8 +102,9 @@ impl Daemon {
 
     /// Accepts connections until `shutdown` resolves, then says BYE to
     /// every connection (11) and returns once they have closed, or after a
-    /// grace period (see [`net::Server::run`]). Guests still connected at
-    /// shutdown leave their rooms (4.2) before this returns.
+    /// grace period (see [`net::Server::run`]). Then every guest session
+    /// ends, connected or waiting to be resumed, and its guest leaves its
+    /// rooms (4.2) before this returns.
     ///
     /// Meanwhile, cids older than 24 hours are forgotten every
     /// [`CID_PRUNE_PERIOD`] (7.6).
@@ -104,7 +112,11 @@ impl Daemon {
         let _pruner = AbortOnDrop(tokio::spawn(
             self.hub.clone().prune_cids_every(CID_PRUNE_PERIOD),
         ));
-        self.server.run(shutdown).await?;
+        let result = self.server.run(shutdown).await;
+        // Sessions do not survive a restart (4.2): the guests waiting to
+        // resume, and those whose connections just closed, leave now.
+        self.hub.end_guest_sessions(BYE_SHUTDOWN).await;
+        result?;
         Ok(())
     }
 }

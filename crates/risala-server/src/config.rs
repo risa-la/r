@@ -96,6 +96,10 @@ pub struct ServerConfig {
 pub struct Limits {
     /// Seconds a new connection has to sign in (4.1: at least 120).
     pub sign_in_secs: u64,
+    /// Seconds a guest's session waits to be resumed after its connection
+    /// closes, before it ends and the guest leaves its rooms (4.2). At
+    /// least [`MIN_GUEST_RESUME_SECS`].
+    pub guest_resume_secs: u64,
     /// Seconds of silence before the server sends PING (11).
     pub idle_ping_secs: u64,
     /// Further seconds of silence before the server closes (11).
@@ -133,6 +137,9 @@ pub const FANOUT_ROOM: usize = 128;
 
 /// The least `limits.sign_in_secs` the spec recommends (4.1).
 pub const MIN_SIGN_IN_SECS: u64 = 120;
+
+/// The least `limits.guest_resume_secs` the spec allows (4.2).
+pub const MIN_GUEST_RESUME_SECS: u64 = 120;
 
 impl Limits {
     /// The most lines one command's response queues: a full HISTORY or
@@ -194,6 +201,7 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             sign_in_secs: 120,
+            guest_resume_secs: 300,
             idle_ping_secs: 120,
             ping_timeout_secs: 60,
             out_queue: 1024,
@@ -266,6 +274,12 @@ impl Config {
                 return invalid(format!("limits.{name} must be at least 1"));
             }
         }
+        if l.guest_resume_secs < MIN_GUEST_RESUME_SECS {
+            return invalid(format!(
+                "limits.guest_resume_secs is {}, but must be at least {MIN_GUEST_RESUME_SECS} (4.2)",
+                l.guest_resume_secs
+            ));
+        }
         if l.out_queue < l.command_room() {
             return invalid(format!(
                 "limits.out_queue is {}, but must be at least {}: room for the longest \
@@ -312,6 +326,7 @@ mod tests {
         assert_eq!(c.listen[0].port(), 7472);
         assert!(c.server.guests);
         assert_eq!(c.limits.sign_in_secs, 120);
+        assert_eq!(c.limits.guest_resume_secs, 300);
     }
 
     #[test]
@@ -356,6 +371,8 @@ mod tests {
         invalid(|l| l.ping_timeout_secs = 0, "ping_timeout_secs");
         invalid(|l| l.max_page = 0, "max_page");
         invalid(|l| l.max_list = 0, "max_list");
+        invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");
+        assert!(with(|l| l.guest_resume_secs = 120).is_ok());
 
         // The queue holds the longest response and room for live events.
         let l = Limits::default();

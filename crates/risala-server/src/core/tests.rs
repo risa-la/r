@@ -69,12 +69,12 @@ impl Harness {
             store.ensure_room(&room.parse().unwrap(), start()).unwrap();
         }
         prepare(&store);
-        Harness::on(config, Arc::new(store), Duration::from_secs(120))
+        Harness::on(config, Arc::new(store), timers())
     }
 
-    fn on(config: Config, store: Arc<dyn Store>, sign_in: Duration) -> Harness {
+    fn on(config: Config, store: Arc<dyn Store>, timers: Timers) -> Harness {
         let clock = Arc::new(ManualClock::new(start()));
-        let hub = Hub::build(config, store.clone(), clock.clone(), sign_in).unwrap();
+        let hub = Hub::build(config, store.clone(), clock.clone(), timers).unwrap();
         Harness {
             hub,
             store,
@@ -109,10 +109,19 @@ impl Harness {
 
     /// A new connection, signed in as `~name`.
     async fn guest(&mut self, name: &str) -> Client {
+        self.guest_token(name).await.0
+    }
+
+    /// A new connection, signed in as `~name`, and its session's token.
+    async fn guest_token(&mut self, name: &str) -> (Client, String) {
         let mut c = self.connect();
         self.send(&c, &format!("guest {name}")).await;
-        assert_eq!(c.lines(), [format!("OK uid=~{name}")]);
-        c
+        let ok = c.raw_lines();
+        assert_eq!(ok.len(), 1, "{ok:?}");
+        let token = value(&ok[0], "token");
+        assert_eq!(ok[0], format!("OK uid=~{name} token={token}"));
+        assert_eq!(token.len(), TOKEN_LEN);
+        (c, token)
     }
 
     /// A guest that has joined `room`. Returns the room's id.
@@ -129,16 +138,52 @@ impl Harness {
         self.hub.command(c.id, req).await;
     }
 
+    /// The connection closes. A guest's session waits to be resumed.
     async fn close(&self, c: Client) {
         drop(c.rx);
         self.hub.closed(c.id).await;
     }
+
+    /// The connection closes, and the session of the guest `~name` ends
+    /// at once, as if its resume period were over (4.2).
+    async fn leave(&self, c: Client, name: &str) {
+        self.close(c).await;
+        self.end(name).await;
+    }
+
+    /// Ends the session of the guest `~name` at once (4.2).
+    async fn end(&self, name: &str) {
+        let uid: Uid = format!("~{name}").parse().unwrap();
+        assert!(
+            self.hub.end_guest_session(&uid, "bye").await,
+            "no session for {uid}"
+        );
+    }
+}
+
+/// The hub's timers in most tests: a resume period of 5 minutes.
+fn timers() -> Timers {
+    Timers::from_config(&config())
 }
 
 impl Client {
-    /// Everything queued so far, as lines. A close is `<close>`, or
-    /// `<close> BYE text`.
+    /// Everything queued so far, as lines, with any `token=` value shown
+    /// as `<token>`. A close is `<close>`, or `<close> BYE text`.
     fn lines(&mut self) -> Vec<String> {
+        self.raw_lines()
+            .into_iter()
+            .map(|line| match line.find(" token=") {
+                Some(at) => {
+                    let end = line[at + 7..].find(' ').map_or(line.len(), |e| at + 7 + e);
+                    format!("{} token=<token>{}", &line[..at], &line[end..])
+                }
+                None => line,
+            })
+            .collect()
+    }
+
+    /// Everything queued so far, as lines, as they are.
+    fn raw_lines(&mut self) -> Vec<String> {
         self.items()
             .into_iter()
             .map(|item| match item {
@@ -284,7 +329,7 @@ async fn guest_signs_in_once() {
     let mut h = Harness::new();
     let mut c = h.connect();
     h.send(&c, "@ref=a GUEST Sam").await;
-    assert_eq!(c.lines(), ["@ref=a OK uid=~sam"]);
+    assert_eq!(c.lines(), ["@ref=a OK uid=~sam token=<token>"]);
     for cmd in ["guest sam", "guest other"] {
         h.send(&c, cmd).await;
         assert_eq!(
@@ -296,15 +341,19 @@ async fn guest_signs_in_once() {
 }
 
 #[tokio::test]
-async fn guest_names_are_unique_while_connected() {
+async fn guest_names_are_unique_while_a_session_lasts() {
     let mut h = Harness::new();
     let a = h.guest("sam").await;
     let mut b = h.connect();
     h.send(&b, "guest SAM").await;
     assert_eq!(b.lines(), ["ERR name-taken a guest has that name"]);
+    // Waiting to be resumed, the session still holds the name (4.2).
     h.close(a).await;
     h.send(&b, "guest sam").await;
-    assert_eq!(b.lines(), ["OK uid=~sam"]);
+    assert_eq!(b.lines(), ["ERR name-taken a guest has that name"]);
+    h.end("sam").await;
+    h.send(&b, "guest sam").await;
+    assert_eq!(b.lines(), ["OK uid=~sam token=<token>"]);
 }
 
 #[tokio::test]
@@ -341,17 +390,24 @@ async fn auth_and_register_are_not_supported_yet() {
     );
     // Still not signed in.
     h.send(&c, "guest sam").await;
-    assert_eq!(c.lines(), ["OK uid=~sam"]);
+    assert_eq!(c.lines(), ["OK uid=~sam token=<token>"]);
 }
 
 #[tokio::test]
 async fn sign_in_timeout_closes_with_bye() {
     let store = SqliteStore::open_in_memory().unwrap();
-    let mut h = Harness::on(config(), Arc::new(store), Duration::from_millis(50));
+    let mut h = Harness::on(
+        config(),
+        Arc::new(store),
+        Timers {
+            sign_in: Duration::from_millis(50),
+            ..timers()
+        },
+    );
     let mut late = h.connect();
     let mut prompt = h.connect();
     h.send(&prompt, "guest sam").await;
-    assert_eq!(prompt.lines(), ["OK uid=~sam"]);
+    assert_eq!(prompt.lines(), ["OK uid=~sam token=<token>"]);
     let item = tokio::time::timeout(Duration::from_secs(10), late.rx.recv())
         .await
         .expect("the connection is closed in time")
@@ -363,6 +419,338 @@ async fn sign_in_timeout_closes_with_bye() {
     // Well past the timeout, the guest is still connected.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(prompt.lines(), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------
+// Guest sessions (4.2, 7.6)
+
+/// Sends `guest <name> token=<token>` on a new connection. Returns the
+/// connection and what it got.
+async fn resume(h: &mut Harness, name: &str, token: &str) -> (Client, Vec<String>) {
+    let mut c = h.connect();
+    h.send(&c, &format!("guest {name} token={token}")).await;
+    let lines = c.raw_lines();
+    (c, lines)
+}
+
+/// The events stored in `room`, as `<from> <verb>`.
+fn stored(h: &Harness, room: &str) -> Vec<String> {
+    let key = h.store.room(&room.parse().unwrap()).unwrap().unwrap().key;
+    let all = HistoryQuery {
+        after: Some(0),
+        before: None,
+        limit: 1000,
+    };
+    h.store
+        .history(key, all)
+        .unwrap()
+        .events
+        .iter()
+        .map(|e| format!("{} {}", e.from, e.kind.verb()))
+        .collect()
+}
+
+/// Waits, in paused time, until the hub no longer has a session for
+/// `~name`.
+async fn ended(h: &Harness, name: &str) {
+    let uid: Uid = format!("~{name}").parse().unwrap();
+    for _ in 0..1000 {
+        if !h.hub.guest_sessions().contains(&uid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the session of {uid} did not end");
+}
+
+#[tokio::test]
+async fn a_dropped_guest_resumes_without_join_or_part() {
+    let mut c = config();
+    c.rooms = strings(&["#general", "#other"]);
+    let mut h = Harness::with(c, |_| {});
+    let (sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    h.send(&sam, "join #other").await;
+    let (mut bob, id) = h.joined("bob", "#general").await;
+    h.close(sam).await;
+
+    // While it waits, the session is still in its rooms.
+    h.send(&bob, "msg #general are you there?").await;
+    h.send(&bob, "info #general").await;
+    let lines = bob.lines();
+    assert_eq!(
+        lines[0],
+        format!("@seq=3;t={T};from=~bob MSG #general are you there?")
+    );
+    assert!(lines.last().unwrap().contains(" members=2 "), "{lines:?}");
+    h.send(&bob, "list").await;
+    assert_eq!(bob.lines()[0], "ROOM #general 2");
+
+    let (mut sam, ok) = resume(&mut h, "sam", &token).await;
+    let new_token = value(&ok[0], "token");
+    assert_eq!(ok, [format!("OK uid=~sam token={new_token}")]);
+    assert_ne!(new_token, token);
+    assert_eq!(new_token.len(), TOKEN_LEN);
+    // Nobody saw anything, and nothing was stored.
+    assert_eq!(bob.lines(), Vec::<String>::new());
+    assert_eq!(
+        stored(&h, "#general"),
+        ["~sam JOIN", "~bob JOIN", "~bob MSG"]
+    );
+    assert_eq!(stored(&h, "#other"), ["~sam JOIN"]);
+
+    // The guest catches up with SYNC and HISTORY (7.1), and gets live
+    // events again.
+    h.send(&sam, "sync").await;
+    let lines = sam.lines();
+    assert_eq!(lines[0], format!("CONV #general {id} 3 0"));
+    assert!(lines[1].starts_with("CONV #other "), "{lines:?}");
+    h.send(&sam, "history #general after=2").await;
+    assert_eq!(
+        sam.lines()[0],
+        format!("@seq=3;t={T};from=~bob MSG #general are you there?")
+    );
+    h.send(&bob, "msg #general welcome back").await;
+    assert_eq!(
+        sam.lines(),
+        [format!("@seq=4;t={T};from=~bob MSG #general welcome back")]
+    );
+    h.send(&sam, "msg #general thanks").await;
+    assert_eq!(sam.lines().last().unwrap(), "OK seq=5");
+}
+
+#[tokio::test]
+async fn a_guest_resumes_after_quit() {
+    let mut h = Harness::new();
+    let (sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    h.send(&sam, "quit going to the background").await;
+    h.close(sam).await;
+    assert_eq!(bob.lines(), Vec::<String>::new());
+
+    let (_sam, ok) = resume(&mut h, "sam", &token).await;
+    assert!(ok[0].starts_with("OK uid=~sam token="), "{ok:?}");
+    assert_eq!(bob.lines(), Vec::<String>::new());
+    assert_eq!(stored(&h, "#general"), ["~sam JOIN", "~bob JOIN"]);
+}
+
+#[tokio::test]
+async fn resuming_closes_the_old_connection() {
+    let mut h = Harness::new();
+    let (mut old, token) = h.guest_token("sam").await;
+    h.send(&old, "join #general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    old.lines();
+
+    // The old connection is still open, as when a network change leaves
+    // it hanging.
+    let (mut new, ok) = resume(&mut h, "sam", &token).await;
+    assert!(ok[0].starts_with("OK uid=~sam token="), "{ok:?}");
+    assert_eq!(old.lines(), [format!("<close> BYE {BYE_RESUMED}")]);
+    assert_eq!(bob.lines(), Vec::<String>::new());
+
+    // Events go to the new connection only, and the old one runs nothing
+    // more.
+    h.send(&bob, "msg #general hi").await;
+    assert_eq!(
+        new.lines(),
+        [format!("@seq=3;t={T};from=~bob MSG #general hi")]
+    );
+    h.send(&old, "msg #general from the old connection").await;
+    h.send(&old, "guest other").await;
+    assert_eq!(old.lines(), Vec::<String>::new());
+    // Its close does not start the resume period: the session has moved.
+    h.close(old).await;
+    h.send(&new, "msg #general still here").await;
+    assert_eq!(new.lines().last().unwrap(), "OK seq=4");
+    assert_eq!(
+        stored(&h, "#general"),
+        ["~sam JOIN", "~bob JOIN", "~bob MSG", "~sam MSG"]
+    );
+}
+
+#[tokio::test]
+async fn the_token_changes_on_every_resume() {
+    let mut h = Harness::new();
+    let (sam, first) = h.guest_token("sam").await;
+    h.close(sam).await;
+    let (sam, ok) = resume(&mut h, "sam", &first).await;
+    let second = value(&ok[0], "token");
+    h.close(sam).await;
+
+    // The old token stops working: it is ignored, so the name is taken.
+    let (mut c, ok) = resume(&mut h, "sam", &first).await;
+    assert_eq!(ok, ["ERR name-taken a guest has that name"]);
+    // So is a token of the wrong length, or of another session.
+    let (other, other_token) = h.guest_token("other").await;
+    h.send(&c, &format!("guest sam token={other_token}")).await;
+    h.send(&c, &format!("guest sam token={second}x")).await;
+    assert_eq!(
+        c.lines(),
+        [
+            "ERR name-taken a guest has that name",
+            "ERR name-taken a guest has that name"
+        ]
+    );
+    // The current one works.
+    h.send(&c, &format!("guest sam token={second}")).await;
+    let ok = c.raw_lines();
+    assert!(ok[0].starts_with("OK uid=~sam token="), "{ok:?}");
+    assert_ne!(value(&ok[0], "token"), second);
+    drop(other);
+}
+
+#[tokio::test]
+async fn a_token_for_no_session_is_ignored() {
+    let mut h = Harness::new();
+    let (sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    h.leave(sam, "sam").await;
+    // The session has ended: GUEST works as it does without a token, and
+    // starts a new session that is in no room.
+    let (mut sam, ok) = resume(&mut h, "sam", &token).await;
+    let fresh = value(&ok[0], "token");
+    assert_eq!(ok, [format!("OK uid=~sam token={fresh}")]);
+    h.send(&sam, "sync").await;
+    assert_eq!(sam.lines(), ["OK"]);
+    // A token sent with a name that has no session is ignored too.
+    let (_c, ok) = resume(&mut h, "nobody", &token).await;
+    assert!(ok[0].starts_with("OK uid=~nobody token="), "{ok:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_ends_after_its_resume_period() {
+    let mut c = config();
+    c.rooms = strings(&["#general", "#other"]);
+    let mut h = Harness::with(c, |_| {});
+    let (sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    h.send(&sam, "join #other").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    h.close(sam).await;
+
+    let wait = timers().guest_resume;
+    assert_eq!(wait, Duration::from_secs(300));
+    tokio::time::sleep(wait - Duration::from_secs(1)).await;
+    assert_eq!(bob.lines(), Vec::<String>::new());
+    assert!(h.hub.guest_sessions().contains(&"~sam".parse().unwrap()));
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ended(&h, "sam").await;
+    assert_eq!(
+        bob.lines(),
+        [format!("@seq=3;t={T};from=~sam PART #general")]
+    );
+    assert_eq!(
+        stored(&h, "#general"),
+        ["~sam JOIN", "~bob JOIN", "~sam PART"]
+    );
+    assert_eq!(stored(&h, "#other"), ["~sam JOIN", "~sam PART"]);
+    h.send(&bob, "info #general").await;
+    assert!(bob.lines().last().unwrap().contains(" members=1 "));
+    // The name is free, and the old token resumes nothing.
+    let (mut sam, ok) = resume(&mut h, "sam", &token).await;
+    assert!(ok[0].starts_with("OK uid=~sam token="), "{ok:?}");
+    h.send(&sam, "sync").await;
+    assert_eq!(sam.lines(), ["OK"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_close_starts_a_new_resume_period() {
+    let mut h = Harness::new();
+    let (sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    let wait = timers().guest_resume;
+    h.close(sam).await;
+    tokio::time::sleep(wait / 2).await;
+    let (sam, ok) = resume(&mut h, "sam", &token).await;
+    let token = value(&ok[0], "token");
+    h.close(sam).await;
+    // The first period would be over now, but the second is not.
+    tokio::time::sleep(wait / 2 + Duration::from_secs(1)).await;
+    assert!(h.hub.guest_sessions().contains(&"~sam".parse().unwrap()));
+    assert_eq!(stored(&h, "#general"), ["~sam JOIN"]);
+    tokio::time::sleep(wait / 2).await;
+    ended(&h, "sam").await;
+    assert_eq!(stored(&h, "#general"), ["~sam JOIN", "~sam PART"]);
+    let (_c, ok) = resume(&mut h, "sam", &token).await;
+    assert!(ok[0].starts_with("OK uid=~sam token="), "{ok:?}");
+}
+
+#[tokio::test]
+async fn a_resent_message_is_found_across_a_resume() {
+    let mut h = Harness::new();
+    let (sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    let cid = "cid=0123456789abcdef";
+    h.send(&sam, &format!("@{cid} msg #general did this arrive?"))
+        .await;
+    // The connection drops before the OK is read.
+    h.close(sam).await;
+    bob.lines();
+    let (mut sam, _) = resume(&mut h, "sam", &token).await;
+    h.send(
+        &sam,
+        &format!("@ref=again;{cid} msg #general did this arrive?"),
+    )
+    .await;
+    assert_eq!(sam.lines(), ["@ref=again OK seq=3"]);
+    assert_eq!(bob.lines(), Vec::<String>::new());
+    assert_eq!(
+        stored(&h, "#general"),
+        ["~sam JOIN", "~bob JOIN", "~sam MSG"]
+    );
+}
+
+#[tokio::test]
+async fn ending_a_connected_session_closes_it() {
+    // The path ADMIN DISCONNECT and bans will take (10.2, 10.3).
+    let mut h = Harness::new();
+    let (mut sam, token) = h.guest_token("sam").await;
+    h.send(&sam, "join #general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    sam.lines();
+    let uid: Uid = "~sam".parse().unwrap();
+    assert!(
+        h.hub
+            .end_guest_session(&uid, "disconnected by an operator")
+            .await
+    );
+    assert!(!h.hub.end_guest_session(&uid, "again").await);
+    assert_eq!(sam.lines(), ["<close> BYE disconnected by an operator"]);
+    assert_eq!(
+        bob.lines(),
+        [format!("@seq=3;t={T};from=~sam PART #general")]
+    );
+    // The connection runs nothing more, and its close changes nothing.
+    h.send(&sam, "join #general").await;
+    assert_eq!(sam.lines(), Vec::<String>::new());
+    h.close(sam).await;
+    assert_eq!(
+        stored(&h, "#general"),
+        ["~sam JOIN", "~bob JOIN", "~sam PART"]
+    );
+    // The token is gone with the session.
+    let (_c, ok) = resume(&mut h, "sam", &token).await;
+    assert!(ok[0].starts_with("OK uid=~sam token="), "{ok:?}");
+    assert_eq!(bob.lines(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn shutting_down_ends_every_session() {
+    let mut h = Harness::new();
+    let (sam, _) = h.joined("sam", "#general").await;
+    let (ann, _) = h.joined("ann", "#general").await;
+    h.close(sam).await;
+    h.hub.end_guest_sessions(BYE_SHUTDOWN).await;
+    assert_eq!(h.hub.guest_sessions(), Vec::<Uid>::new());
+    let mut parts = stored(&h, "#general");
+    parts.drain(..2);
+    parts.sort();
+    assert_eq!(parts, ["~ann PART", "~sam PART"]);
+    drop(ann);
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +930,7 @@ async fn part_reaches_everyone_then_stops_events() {
 }
 
 #[tokio::test]
-async fn a_closing_guest_leaves_its_rooms() {
+async fn a_guest_leaves_its_rooms_when_its_session_ends() {
     let mut c = config();
     c.rooms = strings(&["#general", "#other"]);
     let mut h = Harness::with(c, |_| {});
@@ -552,7 +940,7 @@ async fn a_closing_guest_leaves_its_rooms() {
     let (mut carol, _) = h.joined("carol", "#other").await;
     sam.lines();
     carol.lines();
-    h.close(bob).await;
+    h.leave(bob, "bob").await;
     assert_eq!(
         sam.lines(),
         [format!("@seq=3;t={T};from=~bob PART #general")]
@@ -829,8 +1217,8 @@ async fn a_resent_guest_message_is_stored_once() {
         .advance(Duration::from_millis(crate::store::CID_WINDOW_MS + 1));
     h.send(&sam, &format!("@{cid} msg #general hi")).await;
     assert_eq!(sam.lines().last().unwrap(), "OK seq=5");
-    // A guest's cids last only as long as its connection (7.6).
-    h.close(sam).await;
+    // A guest's cids last only as long as its session (7.6).
+    h.leave(sam, "sam").await;
     let (mut sam, _) = h.joined("sam", "#general").await;
     h.send(&sam, &format!("@{cid} msg #general hi")).await;
     assert_eq!(sam.lines().last().unwrap(), "OK seq=8");
@@ -1233,9 +1621,11 @@ async fn a_slow_reader_is_dropped_alone() {
         h.send(&sam, &format!("msg #general {n}")).await;
     }
     assert_eq!(sam.lines().len(), 1 + 20);
-    // The network layer notices and reports the close; the slow guest
-    // leaves.
+    // The network layer notices and reports the close. The slow guest
+    // leaves once its session ends.
     h.close(slow).await;
+    assert_eq!(sam.lines(), Vec::<String>::new());
+    h.end("slow").await;
     assert_eq!(
         sam.lines(),
         [format!("@seq=13;t={T};from=~slow PART #general")]
@@ -1253,7 +1643,7 @@ async fn guests_cut_off_by_a_crash_part_at_the_next_start() {
     let path = dir.path().join("risala.db");
     let open = |path: &std::path::Path| -> Harness {
         let store = SqliteStore::open(path).unwrap();
-        Harness::on(config(), Arc::new(store), Duration::from_secs(120))
+        Harness::on(config(), Arc::new(store), timers())
     };
     let mut h = open(&path);
     let room: Room = "#general".parse().unwrap();
@@ -1418,7 +1808,7 @@ async fn a_restart_keeps_rooms_ids_and_history() {
 async fn the_configuration_is_checked() {
     let store = || Arc::new(SqliteStore::open_in_memory().unwrap()) as Arc<dyn Store>;
     let clock = || Arc::new(SystemClock) as Arc<dyn Clock>;
-    let build = |c: Config| Hub::build(c, store(), clock(), Duration::from_secs(1));
+    let build = |c: Config| Hub::build(c, store(), clock(), timers());
     let mut c = config();
     c.rooms = strings(&["general"]);
     assert!(matches!(build(c), Err(HubError::Config(_))));
@@ -1506,7 +1896,7 @@ async fn store_failures_are_internal_errors() {
         inner: SqliteStore::open_in_memory().unwrap(),
         broken: AtomicBool::new(false),
     });
-    let mut h = Harness::on(config(), store.clone(), Duration::from_secs(120));
+    let mut h = Harness::on(config(), store.clone(), timers());
     let (mut sam, _) = h.joined("sam", "#general").await;
     let (mut bob, _) = h.joined("bob", "#general").await;
     sam.lines();
@@ -1556,7 +1946,7 @@ async fn the_overview_session() {
     assert!(greeting[0].starts_with("RISALA 1 chat.example.org "));
     assert!(greeting[0].ends_with(" Welcome!"));
     h.send(&c, "guest sam").await;
-    assert_eq!(c.lines(), ["OK uid=~sam"]);
+    assert_eq!(c.lines(), ["OK uid=~sam token=<token>"]);
     h.send(&c, "join #general").await;
     let lines = c.lines();
     let id = value(&lines[0], "id");

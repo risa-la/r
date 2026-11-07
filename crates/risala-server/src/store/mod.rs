@@ -481,14 +481,20 @@ pub trait Store: Send + Sync + 'static {
 /// Makes a new id of [`ID_LEN`] random characters of `a-z 0-9` (5.1). The
 /// caller makes sure it was never used before.
 pub fn random_id() -> Result<Id> {
+    random_id_of(ID_LEN)
+}
+
+/// Makes an id (3.5) of `len` random characters of `a-z 0-9`, each
+/// carrying log2(36), about 5.17, bits. `len` is at most 64.
+pub fn random_id_of(len: usize) -> Result<Id> {
     const ALPHABET: &[u8; 36] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut out = String::with_capacity(ID_LEN);
+    let mut out = String::with_capacity(len);
     let mut buf = [0u8; 32];
-    while out.len() < ID_LEN {
+    while out.len() < len {
         getrandom::fill(&mut buf).map_err(|e| StoreError::Random(e.to_string()))?;
         // 252 = 7 * 36: rejecting larger bytes keeps the choice uniform.
         for &b in buf.iter().filter(|&&b| b < 252) {
-            if out.len() == ID_LEN {
+            if out.len() == len {
                 break;
             }
             out.push(char::from(ALPHABET[usize::from(b % 36)]));

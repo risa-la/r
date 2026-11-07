@@ -135,7 +135,7 @@ async fn overview_session_with_guests() {
 
          sam S: RISALA 1 chat.example.org {*} Welcome!
          sam C: guest sam
-         sam S: OK uid=~sam
+         sam S: OK uid=~sam token={*}
          sam C: join #general
          sam S: @seq=5;t={*};from=~sam;id={id} JOIN #general
          sam S: SET #general topic

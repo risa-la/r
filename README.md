@@ -10,7 +10,7 @@ encryption.
 $ openssl s_client -connect chat.example.org:7472 -quiet
 RISALA 1 chat.example.org 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e Welcome!
 guest sam
-OK uid=~sam
+OK uid=~sam token=q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3
 join #general
 @seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general
 SET #general topic General chat. Be kind.
@@ -158,6 +158,7 @@ retention = "forever"            # or a number of days
 
 [limits]
 sign_in_secs = 120
+guest_resume_secs = 300          # how long a guest can resume; at least 120
 idle_ping_secs = 120
 ping_timeout_secs = 60
 ```

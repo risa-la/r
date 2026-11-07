@@ -379,7 +379,8 @@ pub trait Handler: Send + Sync + 'static {
     /// PONG, which gets none (3.6).
     fn command(&self, conn: ConnId, req: Request) -> impl Future<Output = ()> + Send;
 
-    /// The connection is gone. A guest's automatic PARTs happen here (4.2).
+    /// The connection is gone. A guest session starts waiting to be
+    /// resumed here (4.2).
     fn closed(&self, conn: ConnId) -> impl Future<Output = ()> + Send;
 }
 

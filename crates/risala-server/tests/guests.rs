@@ -14,7 +14,7 @@ use common::{Session, command, put, recv, settled, until_closed, value};
 use risala_proto::types::{GuestAccess, RoomSetting};
 use risala_server::config::Limits;
 use risala_server::store::EventKind;
-use risala_server::testing::{ClientOptions, TestClient, TestServer};
+use risala_server::testing::{ClientOptions, Proxy, TestClient, TestServer};
 
 /// A server with rooms of every kind a guest meets in M2:
 ///
@@ -66,7 +66,7 @@ async fn guest_once_free(server: &TestServer, name: &str) -> TestClient {
         let mut c = server.connect().await;
         assert!(recv(&mut c).await.starts_with("RISALA 1 "));
         let answer = command(&mut c, &format!("guest {name}")).await;
-        if answer == [format!("OK uid=~{name}")] {
+        if answer.len() == 1 && answer[0].starts_with(&format!("OK uid=~{name} token=")) {
             return c;
         }
         assert!(answer[0].starts_with("ERR name-taken"), "{answer:?}");
@@ -146,7 +146,7 @@ async fn signing_in_as_a_guest() {
          C: ping
          S: OK
          C: guest sam
-         S: OK uid=~sam
+         S: OK uid=~sam token={*}
          C: guest sam2
          S: ERR already-authenticated{..}
          other S: RISALA 1 chat.example.org {*}
@@ -155,7 +155,7 @@ async fn signing_in_as_a_guest() {
          other C: guest bad!name
          other S: ERR bad-syntax{..}
          other C: guest sam2
-         other S: OK uid=~sam2",
+         other S: OK uid=~sam2 token={*}",
     )
     .await;
     s.settled().await;
@@ -334,13 +334,14 @@ async fn join_again_part_and_come_back() {
     server.stop().await;
 }
 
-/// A guest leaves its rooms when its connection closes, however it closes
-/// (4.2), and its name is free again.
+/// A guest leaves its rooms when its session ends, a while after its
+/// connection closes, however it closes (4.2), and its name is free again.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_guest_leaves_its_rooms_when_it_disconnects() {
+async fn a_guest_leaves_its_rooms_when_its_session_ends() {
     let server = TestServer::builder()
         .room("#general")
         .room("#help")
+        .guest_resume(Duration::from_millis(200))
         .start()
         .await;
     let mut alice = server.guest("alice").await;
@@ -834,11 +835,13 @@ async fn ping_pong_and_quit() {
 }
 
 /// With short timers: a client that stays silent gets PING, then BYE, and
-/// a guest that times out leaves its rooms. One that answers stays.
+/// a guest that times out leaves its rooms once its session ends. One that
+/// answers stays.
 #[tokio::test(flavor = "multi_thread")]
 async fn silent_clients_are_pinged_then_closed() {
     let server = TestServer::builder()
         .room("#general")
+        .guest_resume(Duration::from_millis(200))
         .limits(Limits {
             idle_ping_secs: 1,
             ping_timeout_secs: 1,
@@ -959,6 +962,124 @@ async fn test_servers_clean_up() {
 }
 
 // ---------------------------------------------------------------------
+// Resuming a guest session (4.2, 7.6)
+
+/// Connects through `proxy` and sends GUEST, with a token if given.
+/// Returns the client and the answer.
+async fn guest_via(proxy: &Proxy, name: &str, token: Option<&str>) -> (TestClient, String) {
+    let mut c = TestClient::connect_with(proxy.addr(), ClientOptions::sni("chat.example.org"))
+        .await
+        .unwrap();
+    assert!(recv(&mut c).await.starts_with("RISALA 1 "));
+    let line = match token {
+        Some(token) => format!("guest {name} token={token}"),
+        None => format!("guest {name}"),
+    };
+    let answer = command(&mut c, &line).await;
+    assert_eq!(answer.len(), 1, "{answer:?}");
+    (c, answer[0].clone())
+}
+
+/// A guest whose connection drops comes back with its token: it is still
+/// in its rooms, nothing was recorded, and it catches up with SYNC and
+/// HISTORY (4.2, 7.1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_resumes_after_its_connection_drops() {
+    let server = rooms_server().await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (mut sam, ok) = guest_via(&proxy, "sam", None).await;
+    let token = value(&ok, "token");
+    let id = join(&mut sam, "#general").await;
+    let mut s = Session::new();
+    s.bind("id", &id);
+    s.add("ann", server.guest("ann").await);
+    s.add("sam", sam);
+    join(s.client("ann"), "#general").await;
+    s.play("sam S: @seq=2;t={*};from=~ann;id={id} JOIN #general")
+        .await;
+
+    proxy.cut();
+    let mut sam = s.take("sam");
+    assert_eq!(until_closed(&mut sam).await, Vec::<String>::new());
+    s.play(
+        "ann C: msg #general are you still there?
+         ann S: @seq=3;t={*};from=~ann MSG #general are you still there?
+         ann S: OK seq=3",
+    )
+    .await;
+
+    let (sam, ok) = guest_via(&proxy, "sam", Some(&token)).await;
+    let new_token = value(&ok, "token");
+    assert_eq!(ok, format!("OK uid=~sam token={new_token}"));
+    assert_ne!(new_token, token);
+    s.add("sam", sam);
+    s.play(
+        "sam C: sync
+         sam S: CONV #general {id} 3 0
+         sam S: OK
+         sam C: history #general after=2
+         sam S: @seq=3;t={*};from=~ann MSG #general are you still there?
+         sam S: OK id={id} more=0
+         sam C: msg #general I'm back
+         sam S: @seq=4;t={*};from=~sam MSG #general I'm back
+         sam S: OK seq=4
+         ann S: @seq=4;t={*};from=~sam MSG #general I'm back
+         ann C: history #general
+         ann S: @seq=1;t={*};from=~sam;id={id} JOIN #general
+         ann S: @seq=2;t={*};from=~ann;id={id} JOIN #general
+         ann S: @seq=3;t={*};from=~ann MSG #general are you still there?
+         ann S: @seq=4;t={*};from=~sam MSG #general I'm back
+         ann S: OK id={id} more=0",
+    )
+    .await;
+    // The old token no longer works.
+    let (_c, answer) = guest_via(&proxy, "sam", Some(&token)).await;
+    assert!(answer.starts_with("ERR name-taken"), "{answer}");
+    s.settled().await;
+    server.stop().await;
+}
+
+/// Resuming while the old connection is still open closes it with BYE.
+/// After QUIT, a message resent with its cid is not stored twice (7.6).
+#[tokio::test(flavor = "multi_thread")]
+async fn resuming_takes_over_the_old_connection() {
+    let server = rooms_server().await;
+    let (mut old, token) = server.guest_session("sam", None).await;
+    let id = join(&mut old, "#general").await;
+    let (new, token) = server.guest_session("sam", Some(&token)).await;
+    assert_eq!(
+        until_closed(&mut old).await,
+        ["BYE resumed on another connection"]
+    );
+    let mut s = Session::new();
+    s.bind("id", &id);
+    s.add("sam", new);
+    s.play(
+        "C: @cid=0123456789abcdef msg #general once
+         S: @seq=2;t={*};from=~sam MSG #general once
+         S: OK seq=2
+         C: quit",
+    )
+    .await;
+    let mut new = s.take("sam");
+    assert_eq!(until_closed(&mut new).await, ["OK"]);
+
+    let (sam, _) = server.guest_session("sam", Some(&token)).await;
+    s.add("sam", sam);
+    s.play(
+        "C: @ref=again;cid=0123456789abcdef msg #general once
+         S: @ref=again OK seq=2
+         C: history #general
+         S: @seq=1;t={*};from=~sam;id={id} JOIN #general
+         S: @seq=2;t={*};from=~sam MSG #general once
+         S: OK id={id} more=0",
+    )
+    .await;
+    s.settled().await;
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------
 // Restarting (5.1, 7.1)
 
 /// A restart on the same state directory keeps rooms, their ids and their
@@ -988,7 +1109,8 @@ async fn a_restart_keeps_rooms_ids_and_history() {
     server.restart().await;
     assert_eq!(server.addr(), addr);
     assert_eq!(server.fingerprint(), fingerprint);
-    // Everyone was told, and the guests left #general as they went.
+    // Everyone was told, and the guest sessions ended with the server, so
+    // the guests left #general.
     for who in ["sam", "ann"] {
         let mut c = s.take(who);
         assert_eq!(until_closed(&mut c).await, ["BYE server shutting down"]);

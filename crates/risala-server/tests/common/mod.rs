@@ -247,8 +247,8 @@ pub struct Example {
 
 impl Example {
     /// The transcript, with the values that change from run to run
-    /// replaced by patterns: times, the greeting's nonce, and the room id
-    /// `k3f9q2`, which becomes `{id}`.
+    /// replaced by patterns: times, the greeting's nonce, a guest's token,
+    /// and the room id `k3f9q2`, which becomes `{id}`.
     pub fn script(&self) -> String {
         self.lines
             .iter()
@@ -290,6 +290,12 @@ fn mask(line: &str) -> String {
         let mut parts: Vec<&str> = text.splitn(5, ' ').collect();
         parts[3] = "{*}";
         text = parts.join(" ");
+    }
+    if text.starts_with("OK uid=~") {
+        // OK uid=~<name> token=<token> (4.2). The example in SPEC.md 1.4
+        // leaves the token out.
+        let uid = text.split(' ').nth(1).unwrap_or_default();
+        text = format!("OK {uid} token={{*}}");
     }
     if let Some(tags_end) = text.strip_prefix('@').and_then(|t| t.find(' ')) {
         let tags: Vec<String> = text[1..=tags_end]

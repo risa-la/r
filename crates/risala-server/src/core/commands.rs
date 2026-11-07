@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use risala_proto::command::{Command, Request, RoomPage};
 use risala_proto::error::ErrorCode;
-use risala_proto::names::{Conv, Name, Room, Seq, Uid};
+use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{
     ErrResponse, Event, EventBody, OkResponse, Register, ServerLine, ServerMessage, Upload,
 };
@@ -14,10 +14,10 @@ use risala_proto::types::{
     Cid, DEFAULT_LIMIT, DEFAULT_LIST_LIMIT, FileUrl, InfoRole, Ref, Relation, Role,
 };
 
-use super::Inner;
 use super::state::{Registry, RoomState};
+use super::{Inner, SignIn, SignInRefused, TOKEN_LEN};
 use crate::handler::{ConnHandle, ConnId, OutLine};
-use crate::store::{Appended, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent};
+use crate::store::{self, Appended, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent};
 
 /// Why a command failed.
 #[derive(Debug)]
@@ -109,14 +109,20 @@ fn page_limit(limit: Option<NonZeroU64>, default: u64, max: u64) -> u64 {
 impl Inner {
     /// Handles one command and queues its final response.
     pub(super) async fn command(self: &Arc<Self>, id: ConnId, req: Request) {
-        let Some((handle, uid)) = self
+        let Some((handle, uid, detached)) = self
             .reg()
             .conns
             .get(&id)
-            .map(|c| (c.handle.clone(), c.uid.clone()))
+            .map(|c| (c.handle.clone(), c.uid.clone(), c.detached))
         else {
             return;
         };
+        // The connection lost its guest session and has been told BYE
+        // (4.2). Nothing it sends now is read: no line after the BYE is
+        // sent.
+        if detached {
+            return;
+        }
         let reply = Reply {
             handle,
             ref_: req.ref_,
@@ -154,7 +160,7 @@ impl Inner {
         };
         match (command, uid) {
             (Command::Info { room: None }, _) => Ok(Some(self.info())),
-            (Command::Guest { name, .. }, None) => self.guest(id, name),
+            (Command::Guest { name, token }, None) => self.guest(id, name, token),
             // M3.
             (Command::Auth { .. } | Command::Register { .. }, None) => Err(not_supported()),
             (Command::Ping { .. }, _) => Ok(Some(OkResponse::new())),
@@ -164,19 +170,13 @@ impl Inner {
                 reply.handle.close(None);
                 Ok(None)
             }
-            (command, Some(uid)) => self.signed_in(id, &uid, reply, command).await,
+            (command, Some(uid)) => self.signed_in(&uid, reply, command).await,
             // Every command allowed before sign-in is handled above.
             (_, None) => Err(fail(ErrorCode::NotAuthenticated, "sign in first")),
         }
     }
 
-    async fn signed_in(
-        self: &Arc<Self>,
-        id: ConnId,
-        uid: &Uid,
-        reply: &Reply,
-        command: Command,
-    ) -> Outcome {
+    async fn signed_in(self: &Arc<Self>, uid: &Uid, reply: &Reply, command: Command) -> Outcome {
         match command {
             Command::Info { room: Some(room) } => self.info_room(uid, reply, &room).await,
             Command::List(page) => self.list(uid, reply, page).await,
@@ -188,7 +188,7 @@ impl Inner {
                 relation,
                 file,
                 cid,
-            } => self.msg(id, uid, conv, text, relation, file, cid).await,
+            } => self.msg(uid, conv, text, relation, file, cid).await,
             Command::Sync => self.sync(uid, reply).await,
             Command::History {
                 conv,
@@ -213,29 +213,31 @@ impl Inner {
             .with_upload(Upload::No)
     }
 
-    /// GUEST (4.2).
-    fn guest(&self, id: ConnId, name: Name) -> Outcome {
+    /// GUEST (4.2): a new session, or a resumed one when `token` is the
+    /// current token of the session that holds the name. A token that
+    /// matches nothing is ignored.
+    fn guest(&self, id: ConnId, name: Name, token: Option<Id>) -> Outcome {
         if !self.settings().guests {
             return Err(fail(ErrorCode::Forbidden, "guests are not allowed"));
         }
         let uid = Uid::guest(&name);
-        let mut reg = self.reg();
-        if reg.users.contains_key(&uid) {
-            return Err(fail(ErrorCode::NameTaken, "a guest has that name"));
+        let new_token = store::random_id_of(TOKEN_LEN)?;
+        match self.sign_in_guest(id, &uid, token.as_ref(), new_token.clone()) {
+            Ok(how) => {
+                tracing::debug!(
+                    conn = id.0,
+                    resumed = how == SignIn::Resumed,
+                    "signed in as a guest"
+                );
+                Ok(Some(
+                    OkResponse::new().with_uid(&uid).with_token(&new_token),
+                ))
+            }
+            Err(SignInRefused::NameTaken) => {
+                Err(fail(ErrorCode::NameTaken, "a guest has that name"))
+            }
+            Err(SignInRefused::Gone) => Ok(None),
         }
-        let Some(conn) = reg.conns.get_mut(&id) else {
-            return Ok(None);
-        };
-        if conn.uid.is_some() {
-            return Err(fail(ErrorCode::AlreadyAuthenticated, "already signed in"));
-        }
-        conn.uid = Some(uid.clone());
-        if let Some(timer) = conn.sign_in_timer.take() {
-            timer.abort();
-        }
-        reg.users.insert(uid.clone(), vec![id]);
-        tracing::debug!(conn = id.0, "signed in as a guest");
-        Ok(Some(OkResponse::new().with_uid(&uid)))
     }
 
     /// INFO <room> (6.2).
@@ -346,9 +348,17 @@ impl Inner {
         // M3: identities may create rooms that do not exist.
         let entry = self.room_entry(room).ok_or_else(not_found)?;
         let mut st = entry.state.lock().await;
-        let member = self.reg().is_member(room, uid);
+        let (member, may_join) = {
+            let reg = self.reg();
+            (reg.is_member(room, uid), reg.may_join(uid))
+        };
         if !member {
             check_access(&st, uid, false)?;
+            // A guest whose session is ending, on a connection that has
+            // already been told BYE (4.2).
+            if !may_join {
+                return Err(fail(ErrorCode::Forbidden, "the session has ended"));
+            }
             let event = NewEvent {
                 t: self.now(),
                 from: uid.clone(),
@@ -389,7 +399,7 @@ impl Inner {
         Ok(Some(OkResponse::new()))
     }
 
-    /// A guest's automatic PART when its connection closes (4.2).
+    /// A guest's automatic PART when its session ends (4.2).
     pub(super) async fn guest_part(&self, room: &Room, uid: &Uid) {
         let Some(entry) = self.room_entry(room) else {
             self.reg().remove_member(room, uid);
@@ -415,10 +425,8 @@ impl Inner {
     }
 
     /// MSG (5.3), in rooms.
-    #[allow(clippy::too_many_arguments)]
     async fn msg(
         &self,
-        id: ConnId,
         uid: &Uid,
         conv: Conv,
         text: String,
@@ -443,9 +451,9 @@ impl Inner {
         if let Some(cid) = &cid {
             let earlier = if uid.is_guest() {
                 let reg = self.reg();
-                reg.conns
-                    .get(&id)
-                    .and_then(|c| c.guest_cids.get(&st.id, cid, now))
+                reg.sessions
+                    .get(uid)
+                    .and_then(|s| s.cids.get(&st.id, cid, now))
             } else {
                 let (key, from, cid) = (st.key, uid.clone(), cid.clone());
                 self.db(move |s| s.cid_seq(key, &from, &cid, now)).await?
@@ -475,7 +483,7 @@ impl Inner {
                 file: None,
                 text,
             },
-            // Guests' cids are kept per connection (7.6).
+            // Guests' cids are kept per session (7.6).
             cid: cid.clone().filter(|_| uid.is_identity()),
         };
         let (appended, event) = self.append(&mut st, event).await?;
@@ -485,9 +493,9 @@ impl Inner {
                 Self::broadcast_event(&reg, &st, &event);
                 if let Some(cid) = cid
                     && uid.is_guest()
-                    && let Some(conn) = reg.conns.get_mut(&id)
+                    && let Some(session) = reg.sessions.get_mut(uid)
                 {
-                    conn.guest_cids.insert(st.id.clone(), cid, seq, now);
+                    session.cids.insert(st.id.clone(), cid, seq, now);
                 }
                 Ok(Some(OkResponse::new().with_seq(seq)))
             }

@@ -198,7 +198,7 @@ fn two_openssl_sessions_chat_through_risalad() {
     let mut alice = s_client(&addr);
     alice.expect_prefix("RISALA 1 chat.example.org ");
     alice.type_line("guest alice");
-    alice.expect("OK uid=~alice");
+    alice.expect_prefix("OK uid=~alice token=");
     alice.type_line("join #general");
     let join = alice.expect_prefix("@seq=1;");
     assert!(join.contains(";from=~alice;id=") && join.ends_with(" JOIN #general"));
@@ -210,7 +210,7 @@ fn two_openssl_sessions_chat_through_risalad() {
     let mut bob = s_client(&addr);
     bob.expect_prefix("RISALA 1 chat.example.org ");
     bob.type_line("guest bob");
-    bob.expect("OK uid=~bob");
+    bob.expect_prefix("OK uid=~bob token=");
     bob.type_line("join #general");
     bob.expect_prefix("@seq=2;");
     for _ in 0..4 {
@@ -239,15 +239,14 @@ fn two_openssl_sessions_chat_through_risalad() {
     alice.expect("OK seq=4");
     assert_eq!(bob.expect_prefix("@seq=4;"), event);
 
-    // QUIT closes the connection, and bob sees alice leave (4.2).
+    // QUIT closes the connection. Alice's session waits to be resumed
+    // (4.2), so bob sees no PART: his next line is the answer to PING.
     alice.type_line("quit");
     alice.expect("OK");
     assert_eq!(alice.line(), None);
     alice.wait();
-    assert!(
-        bob.expect_prefix("@seq=5;")
-            .ends_with(";from=~alice PART #general")
-    );
+    bob.type_line("ping");
+    bob.expect("OK");
 
     // SIGTERM shuts the server down cleanly: bob gets BYE.
     let pid = server.child.id().to_string();

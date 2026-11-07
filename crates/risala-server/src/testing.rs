@@ -25,6 +25,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use risala_proto::fingerprint::Fingerprint;
 use risala_proto::names::Room;
@@ -33,13 +34,14 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, Limits};
+use crate::core::Timers;
 use crate::daemon::{Daemon, RunError};
 use crate::store::{SqliteStore, Store as _};
 
 pub use crate::net::testing::{ClientOptions, RECV_TIMEOUT, TestClient};
 
 /// How long [`TestServer::stop`] waits for the server to finish.
-const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A preparation step, run on the database before the server starts.
 type Prepare = Box<dyn FnOnce(&SqliteStore) + Send>;
@@ -57,6 +59,7 @@ type Prepare = Box<dyn FnOnce(&SqliteStore) + Send>;
 pub struct TestServerBuilder {
     config: Config,
     prepare: Vec<Prepare>,
+    guest_resume: Option<Duration>,
 }
 
 impl fmt::Debug for TestServerBuilder {
@@ -110,6 +113,15 @@ impl TestServerBuilder {
         self
     }
 
+    /// How long a guest session waits to be resumed after its connection
+    /// closes (4.2). Unlike `limits.guest_resume_secs`, this may be shorter
+    /// than the 2 minutes the spec requires, so that tests can watch
+    /// sessions end. Without it, the configuration's value is used.
+    pub fn guest_resume(mut self, wait: Duration) -> Self {
+        self.guest_resume = Some(wait);
+        self
+    }
+
     /// Changes anything else in the configuration. `listen` and
     /// `state_dir` are replaced when the server starts.
     pub fn configure(mut self, f: impl FnOnce(&mut Config)) -> Self {
@@ -140,8 +152,13 @@ impl TestServerBuilder {
                 .await
                 .expect("preparing the database");
         }
+        let mut timers = Timers::from_config(&config);
+        if let Some(wait) = self.guest_resume {
+            timers.guest_resume = wait;
+        }
         let mut server = TestServer {
             config,
+            timers,
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             fingerprint: None,
             running: None,
@@ -174,6 +191,7 @@ fn prepare_store(config: &Config, prepare: Vec<Prepare>) {
 #[derive(Debug)]
 pub struct TestServer {
     config: Config,
+    timers: Timers,
     addr: SocketAddr,
     fingerprint: Option<Fingerprint>,
     running: Option<Running>,
@@ -200,6 +218,7 @@ impl TestServer {
                 ..Config::default()
             },
             prepare: Vec::new(),
+            guest_resume: None,
         }
     }
 
@@ -249,22 +268,35 @@ impl TestServer {
     /// Connects, reads the greeting and signs in as the guest `~<name>`
     /// (4.2). The next line to read is whatever comes after `OK`.
     pub async fn guest(&self, name: &str) -> TestClient {
+        self.guest_session(name, None).await.0
+    }
+
+    /// Connects, reads the greeting and sends `GUEST <name>`, with
+    /// `token=<token>` if there is one, to start or resume a guest session
+    /// (4.2). Returns the client and the token from the `OK`. The next line
+    /// to read is whatever comes after `OK`.
+    pub async fn guest_session(&self, name: &str, token: Option<&str>) -> (TestClient, String) {
         let mut client = self.connect().await;
         let greeting = client.expect_line().await.expect("a greeting");
         assert!(greeting.starts_with("RISALA 1 "), "greeting: {greeting}");
-        client
-            .send(&format!("GUEST {name}"))
-            .await
-            .expect("sending");
+        let command = match token {
+            Some(token) => format!("GUEST {name} token={token}"),
+            None => format!("GUEST {name}"),
+        };
+        client.send(&command).await.expect("sending");
         let ok = client.expect_line().await.expect("an answer to GUEST");
-        assert_eq!(ok, format!("OK uid=~{name}"), "answer to GUEST {name}");
-        client
+        let prefix = format!("OK uid=~{name} token=");
+        let new_token = ok
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("answer to GUEST {name}: {ok}"));
+        assert!(!new_token.contains(' '), "answer to GUEST {name}: {ok}");
+        (client, new_token.to_owned())
     }
 
     /// Stops the server and starts it again on the same directory and
     /// address, as after a restart of `risalad`. Connections are closed
-    /// with `BYE server shutting down` (11), and connected guests leave
-    /// their rooms (4.2).
+    /// with `BYE server shutting down` (11), and guest sessions end, so
+    /// their guests leave their rooms (4.2).
     pub async fn restart(&mut self) {
         self.shut_down().await;
         self.launch().await;
@@ -298,7 +330,7 @@ impl TestServer {
         let mut config = self.config.clone();
         // After a restart, listen on the same port again.
         config.listen = vec![self.addr];
-        let daemon = Daemon::bind(config)
+        let daemon = Daemon::bind_with(config, self.timers)
             .await
             .expect("starting the test server");
         self.addr = daemon.local_addrs()[0];

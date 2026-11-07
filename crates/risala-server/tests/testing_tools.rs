@@ -9,16 +9,18 @@ async fn guest_via(proxy: &Proxy, name: &str) -> TestClient {
         .unwrap();
     assert!(client.expect_line().await.unwrap().starts_with("RISALA 1 "));
     client.send(&format!("GUEST {name}")).await.unwrap();
-    assert_eq!(
-        client.expect_line().await.unwrap(),
-        format!("OK uid=~{name}")
-    );
+    let ok = client.expect_line().await.unwrap();
+    assert!(ok.starts_with(&format!("OK uid=~{name} token=")), "{ok}");
     client
 }
 
 #[tokio::test]
 async fn proxy_forwards_and_cuts() {
-    let server = TestServer::builder().room("#a").start().await;
+    let server = TestServer::builder()
+        .room("#a")
+        .guest_resume(std::time::Duration::from_millis(200))
+        .start()
+        .await;
     let proxy = Proxy::start(server.addr()).await;
     let mut sam = guest_via(&proxy, "sam").await;
     sam.send("join #a").await.unwrap();
@@ -31,7 +33,8 @@ async fn proxy_forwards_and_cuts() {
     // The client sees the end of the stream, with no BYE.
     let rest = sam.recv_until_closed().await.unwrap();
     assert!(rest.iter().all(|l| !l.starts_with("BYE")), "{rest:?}");
-    // The server notices too, and records the guest's PART (4.2).
+    // The server notices too, and records the guest's PART once its
+    // session ends (4.2).
     loop {
         let line = ann.expect_line().await.unwrap();
         if line.contains("from=~sam") && line.ends_with(" PART #a") {

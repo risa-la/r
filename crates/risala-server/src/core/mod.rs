@@ -5,7 +5,20 @@
 //!
 //! The [`Hub`] owns all state, makes every check and does all fan-out.
 //! Persistent state lives in a [`Store`]; what lasts only as long as a
-//! connection (guests, their memberships and cids) lives in memory.
+//! guest session (its name, token and cids) lives in memory.
+//!
+//! # Guest sessions
+//!
+//! A guest's session (4.2) starts with GUEST and outlives its connection:
+//! when the connection closes, QUIT included, the session waits
+//! `limits.guest_resume_secs` for `GUEST <name> token=<token>` before it
+//! ends. While it waits, the guest stays a member of its rooms, and its
+//! name stays taken. A session ends in one place,
+//! [`Hub::end_guest_session`], which records a PART in each of its rooms
+//! and only then frees the name, so a new guest of the same name never
+//! meets the old one's memberships. Sessions do not survive a restart: a
+//! clean shutdown ends them all, and the PARTs of any a crash cut off are
+//! recorded at the next start.
 //!
 //! # Ordering
 //!
@@ -41,10 +54,24 @@ use crate::config::{Config, ConfigError};
 use crate::handler::{ConnHandle, ConnId, ConnInfo, Handler};
 use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 
-use state::{ConnEntry, Registry, RoomEntry};
+use risala_proto::names::{Id, Uid};
+
+use state::{ConnEntry, GuestSession, Registry, RoomEntry};
 
 /// The number of random bytes in a greeting's nonce (4.1).
 pub const NONCE_BYTES: usize = 32;
+
+/// The number of random `a-z 0-9` characters in a guest's token (4.2): 32
+/// of them carry about 165 bits.
+pub const TOKEN_LEN: usize = 32;
+
+/// The BYE text for a connection whose guest session was resumed on
+/// another connection (4.2).
+pub const BYE_RESUMED: &str = "resumed on another connection";
+
+/// The BYE text for guest sessions ended by a shutdown. Their connections
+/// have closed by then, so nobody reads it.
+pub const BYE_SHUTDOWN: &str = "server shutting down";
 
 /// How often [`Hub::prune_cids_every`] runs in `risalad`.
 pub const CID_PRUNE_PERIOD: Duration = Duration::from_secs(60 * 60);
@@ -143,6 +170,7 @@ pub(crate) struct Inner {
     rooms: RwLock<BTreeMap<Room, Arc<RoomEntry>>>,
     reg: Mutex<Registry>,
     sign_in_timeout: Duration,
+    guest_resume: Duration,
 }
 
 impl Hub {
@@ -155,12 +183,18 @@ impl Hub {
     /// A new state directory gets mode 0700, and a warning is logged if an
     /// existing one can be read by others (13).
     pub fn open(config: Config) -> Result<Hub, HubError> {
+        let timers = Timers::from_config(&config);
+        Hub::open_with(config, timers)
+    }
+
+    /// [`Hub::open`] with timers that need not follow the configuration.
+    pub(crate) fn open_with(config: Config, timers: Timers) -> Result<Hub, HubError> {
         create_state_dir(&config.state_dir).map_err(|source| HubError::Io {
             path: config.state_dir.clone(),
             source,
         })?;
         let store = SqliteStore::open(&config.database_path())?;
-        Hub::new(config, store)
+        Hub::build(config, Arc::new(store), Arc::new(SystemClock), timers)
     }
 
     /// Starts the hub on `store`.
@@ -182,15 +216,15 @@ impl Hub {
         store: impl Store,
         clock: impl Clock,
     ) -> Result<Hub, HubError> {
-        let timeout = Duration::from_secs(config.limits.sign_in_secs);
-        Hub::build(config, Arc::new(store), Arc::new(clock), timeout)
+        let timers = Timers::from_config(&config);
+        Hub::build(config, Arc::new(store), Arc::new(clock), timers)
     }
 
     pub(crate) fn build(
         config: Config,
         store: Arc<dyn Store>,
         clock: Arc<dyn Clock>,
-        sign_in_timeout: Duration,
+        timers: Timers,
     ) -> Result<Hub, HubError> {
         match config.validate() {
             Ok(warnings) => {
@@ -260,7 +294,8 @@ impl Hub {
                 settings: RwLock::new(settings),
                 rooms: RwLock::new(rooms),
                 reg: Mutex::new(reg),
-                sign_in_timeout,
+                sign_in_timeout: timers.sign_in,
+                guest_resume: timers.guest_resume,
             }),
         })
     }
@@ -268,6 +303,36 @@ impl Hub {
     /// The configuration the hub was started with.
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    /// Ends the session of the guest `uid` now (4.2), whether it is
+    /// connected or waiting to be resumed: its connection, if it has one,
+    /// is closed with `BYE <bye>`, a PART is recorded in each of its rooms,
+    /// and then its name is free. Returns `false` if there was no such
+    /// session, or it was already ending.
+    ///
+    /// ADMIN DISCONNECT (10.3) and server bans (10.2) end guest sessions
+    /// through this, once they exist (M4). A clean shutdown uses it too.
+    pub async fn end_guest_session(&self, uid: &Uid, bye: &str) -> bool {
+        self.inner.end_guest_session(uid, bye).await
+    }
+
+    /// Ends every guest session, as [`end_guest_session`](Self::end_guest_session)
+    /// does. `risalad` calls this as it shuts down, once every connection
+    /// has closed, so that the PARTs carry the time of the shutdown.
+    pub async fn end_guest_sessions(&self, bye: &str) {
+        let uids: Vec<Uid> = self.inner.reg().sessions.keys().cloned().collect();
+        for uid in uids {
+            self.inner.end_guest_session(&uid, bye).await;
+        }
+    }
+
+    /// The names of the guests that have a session, connected or waiting,
+    /// in order.
+    pub fn guest_sessions(&self) -> Vec<Uid> {
+        let mut uids: Vec<Uid> = self.inner.reg().sessions.keys().cloned().collect();
+        uids.sort();
+        uids
     }
 
     /// Forgets the cids of messages sent more than 24 hours ago (7.6), and
@@ -298,6 +363,25 @@ impl Hub {
     }
 }
 
+/// The hub's timers, which tests may shorten below what the configuration
+/// allows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timers {
+    /// How long a new connection has to sign in (4.1).
+    pub(crate) sign_in: Duration,
+    /// How long a guest session waits to be resumed (4.2).
+    pub(crate) guest_resume: Duration,
+}
+
+impl Timers {
+    pub(crate) fn from_config(config: &Config) -> Timers {
+        Timers {
+            sign_in: Duration::from_secs(config.limits.sign_in_secs),
+            guest_resume: Duration::from_secs(config.limits.guest_resume_secs),
+        }
+    }
+}
+
 /// Creates the state directory, and any missing parents, with mode 0700,
 /// and warns if it is open to others (13): it holds the database and the
 /// generated certificate's private key.
@@ -324,8 +408,10 @@ fn create_state_dir(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Records a PART, with no reason, for every guest still in a room when
-/// the server starts (4.2). No guest is connected yet, so these were cut
-/// off by a crash before their PARTs were stored (PLAN.md 5, item 16).
+/// the server starts (4.2). Sessions do not survive a restart, so these
+/// are guests whose sessions a crash cut off before their PARTs were
+/// stored, whether they were connected or waiting to be resumed (PLAN.md
+/// 5, items 16 and 17). The PARTs carry the time of the restart.
 /// Each PART also removes the stored membership, so it is recorded once.
 fn part_leftover_guests(store: &dyn Store, now: Timestamp) -> Result<(), StoreError> {
     let leftover = store.guest_members()?;
@@ -446,8 +532,8 @@ impl Inner {
                 host: host.to_string(),
                 nonce,
                 uid: None,
+                detached: false,
                 gate: Arc::default(),
-                guest_cids: Default::default(),
                 sign_in_timer: timer,
             },
         );
@@ -464,14 +550,15 @@ impl Inner {
         }
     }
 
-    /// Cleans up after a connection: a guest leaves its rooms (4.2) and
-    /// gives up its name.
+    /// Cleans up after a connection. A guest's session starts waiting to
+    /// be resumed (4.2), unless it has moved to another connection.
     async fn closed(self: Arc<Self>, id: ConnId) {
         let Some(gate) = self.reg().conns.get(&id).map(|c| c.gate.clone()) else {
             return;
         };
         let _gate = gate.lock().await;
-        let Some(conn) = self.reg().conns.remove(&id) else {
+        let mut reg = self.reg();
+        let Some(conn) = reg.conns.remove(&id) else {
             return;
         };
         if let Some(timer) = conn.sign_in_timer {
@@ -481,25 +568,168 @@ impl Inner {
         let Some(uid) = conn.uid else {
             return;
         };
-        if uid.is_guest() {
-            let rooms: Vec<Room> = self
-                .reg()
-                .rooms_of
-                .get(&uid)
-                .map(|r| r.iter().cloned().collect())
-                .unwrap_or_default();
-            for room in rooms {
-                self.guest_part(&room, &uid).await;
-            }
-        }
-        let mut reg = self.reg();
         if let Some(conns) = reg.users.get_mut(&uid) {
             conns.retain(|c| *c != id);
             if conns.is_empty() {
                 reg.users.remove(&uid);
             }
         }
+        if let Some(session) = reg.sessions.get_mut(&uid)
+            && session.conn == Some(id)
+            && !session.ending
+        {
+            session.conn = None;
+            session.epoch += 1;
+            let epoch = session.epoch;
+            let weak: Weak<Inner> = Arc::downgrade(&self);
+            let wait = self.guest_resume;
+            let expired_uid = uid.clone();
+            session.expiry = Some(
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    if let Some(inner) = weak.upgrade() {
+                        inner.resume_expired(&expired_uid, epoch).await;
+                    }
+                })
+                .abort_handle(),
+            );
+            tracing::debug!(conn = id.0, "guest session waits to be resumed");
+        }
     }
+
+    /// Ends a guest session whose resume period is over (4.2), unless it
+    /// was resumed meanwhile.
+    async fn resume_expired(&self, uid: &Uid, epoch: u64) {
+        {
+            let mut reg = self.reg();
+            let Some(session) = reg.sessions.get_mut(uid) else {
+                return;
+            };
+            if session.conn.is_some() || session.epoch != epoch || session.ending {
+                return;
+            }
+            // This task is the expiry: it must not abort itself.
+            session.expiry = None;
+        }
+        tracing::debug!("guest session not resumed in time");
+        self.end_guest_session(uid, "session ended").await;
+    }
+
+    /// See [`Hub::end_guest_session`].
+    async fn end_guest_session(&self, uid: &Uid, bye: &str) -> bool {
+        {
+            let mut reg = self.reg();
+            let Some(session) = reg.sessions.get_mut(uid) else {
+                return false;
+            };
+            if session.ending {
+                return false;
+            }
+            session.ending = true;
+            if let Some(expiry) = session.expiry.take() {
+                expiry.abort();
+            }
+            if let Some(conn) = session.conn.take() {
+                reg.detach(conn, bye);
+            }
+        }
+        // A JOIN that was under way when the session began to end may add
+        // a room after the first pass, but none can start after it, since
+        // `may_join` is now false. So this ends.
+        loop {
+            let rooms: Vec<Room> = self
+                .reg()
+                .rooms_of
+                .get(uid)
+                .map(|r| r.iter().cloned().collect())
+                .unwrap_or_default();
+            if rooms.is_empty() {
+                break;
+            }
+            for room in rooms {
+                self.guest_part(&room, uid).await;
+            }
+        }
+        self.reg().sessions.remove(uid);
+        tracing::debug!("guest session ended");
+        true
+    }
+
+    /// Starts a guest session for connection `id`, or moves the session of
+    /// `uid` to it when `token` is the session's current token (4.2).
+    /// The session's token becomes `new_token`.
+    fn sign_in_guest(
+        &self,
+        id: ConnId,
+        uid: &Uid,
+        token: Option<&Id>,
+        new_token: Id,
+    ) -> Result<SignIn, SignInRefused> {
+        let mut reg = self.reg();
+        if !reg.conns.contains_key(&id) {
+            return Err(SignInRefused::Gone);
+        }
+        let resumed = match reg.sessions.get_mut(uid) {
+            Some(session) if !session.ending && token.is_some_and(|t| session.token_is(t)) => {
+                session.token = new_token.clone();
+                session.epoch += 1;
+                if let Some(expiry) = session.expiry.take() {
+                    expiry.abort();
+                }
+                Some(session.conn.replace(id))
+            }
+            Some(_) => return Err(SignInRefused::NameTaken),
+            None => None,
+        };
+        if let Some(conn) = reg.conns.get_mut(&id) {
+            conn.uid = Some(uid.clone());
+            if let Some(timer) = conn.sign_in_timer.take() {
+                timer.abort();
+            }
+        }
+        match resumed {
+            Some(old) => {
+                if let Some(old) = old {
+                    reg.detach(old, BYE_RESUMED);
+                }
+                reg.users.insert(uid.clone(), vec![id]);
+                Ok(SignIn::Resumed)
+            }
+            None => {
+                reg.users.insert(uid.clone(), vec![id]);
+                reg.sessions.insert(
+                    uid.clone(),
+                    GuestSession {
+                        token: new_token,
+                        conn: Some(id),
+                        cids: Default::default(),
+                        epoch: 0,
+                        expiry: None,
+                        ending: false,
+                    },
+                );
+                Ok(SignIn::New)
+            }
+        }
+    }
+}
+
+/// How GUEST signed a connection in (4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignIn {
+    /// A new session.
+    New,
+    /// An existing session moved to the connection.
+    Resumed,
+}
+
+/// Why GUEST could not sign a connection in (4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignInRefused {
+    /// Another session holds the name.
+    NameTaken,
+    /// The connection has closed.
+    Gone,
 }
 
 impl Handler for Hub {
