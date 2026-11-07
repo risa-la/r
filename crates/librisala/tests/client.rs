@@ -62,7 +62,13 @@ async fn trust_on_first_use() {
     client.forget_trust(&addr).unwrap();
     let other = "sha256:".to_owned() + &"0".repeat(64);
     client.accept_fingerprint(&addr, &other).unwrap();
-    assert!(client.accept_fingerprint(&addr, &fp).is_err());
+    assert_eq!(
+        client.accept_fingerprint(&addr, &fp).unwrap_err(),
+        ClientError::AlreadyTrusted {
+            server: addr.clone(),
+            recorded: other.clone(),
+        }
+    );
     match sam.connect().await.unwrap_err() {
         ClientError::CertificateMismatch {
             recorded,

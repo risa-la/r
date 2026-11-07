@@ -48,6 +48,18 @@ pub enum ClientError {
         /// Why the certificate is not CA-valid.
         reason: String,
     },
+    /// [`Client::accept_fingerprint`](super::Client::accept_fingerprint)
+    /// was asked to trust a fingerprint, but the server already has a
+    /// different trust record (2.2). Nothing was changed. The user must
+    /// remove the record first, with
+    /// [`Client::forget_trust`](super::Client::forget_trust).
+    #[error("{server} is already trusted with {recorded}")]
+    AlreadyTrusted {
+        /// The server address.
+        server: String,
+        /// What is recorded: `CA` or a fingerprint.
+        recorded: String,
+    },
     /// Connecting or signing in failed. `permanent` is set when retrying
     /// cannot help without the user, as with `auth-failed`.
     #[error("{message}")]
@@ -178,6 +190,29 @@ impl ClientError {
         }
     }
 
+    /// Whether connecting failed in a way that retrying cannot fix without
+    /// the user: a trust failure (2.2), a missing key, a permanent
+    /// connection error such as a server without post-quantum key exchange
+    /// (2.1), or a refused sign-in such as `auth-failed` (4.5). Meant for
+    /// errors from connecting and signing in.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            ClientError::UnknownCertificate { .. }
+            | ClientError::CertificateMismatch { .. }
+            | ClientError::Keys { .. }
+            | ClientError::Invalid(_) => true,
+            ClientError::Connection { permanent, .. } => *permanent,
+            ClientError::Server { code, .. } => matches!(
+                code.as_str(),
+                "auth-failed" | "forbidden" | "not-supported" | "bad-syntax" | "unknown-command"
+            ),
+            ClientError::AlreadyTrusted { .. }
+            | ClientError::NotConnected
+            | ClientError::NotJoined(_)
+            | ClientError::Store(_) => false,
+        }
+    }
+
     /// Whether this is a trust failure the user must decide on (2.2).
     pub fn is_trust(&self) -> bool {
         matches!(
@@ -216,7 +251,7 @@ impl ClientError {
     }
 }
 
-fn show_record(record: &TrustRecord) -> String {
+pub(crate) fn show_record(record: &TrustRecord) -> String {
     match record {
         TrustRecord::Ca => "CA".to_owned(),
         TrustRecord::Pinned(fp) => fp.to_string(),

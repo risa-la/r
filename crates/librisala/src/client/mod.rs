@@ -452,16 +452,24 @@ impl Client {
 
     /// Records the fingerprint the user accepted for `server`, after
     /// [`ClientError::UnknownCertificate`] (2.2). It refuses to replace a
-    /// different record: remove that first with
-    /// [`forget_trust`](Self::forget_trust).
+    /// different record, with [`ClientError::AlreadyTrusted`]: remove that
+    /// first with [`forget_trust`](Self::forget_trust).
     pub fn accept_fingerprint(&self, server: &str, fingerprint: &str) -> Result<(), ClientError> {
         let addr = parse_server(server)?;
         let fp = fingerprint
             .trim()
             .parse()
             .map_err(|_| ClientError::Invalid(format!("fingerprint {fingerprint:?}")))?;
-        crate::conn::accept_fingerprint(&self.inner.store, &addr, fp)
-            .map_err(|e| ClientError::from_conn(&addr.to_string(), &e))
+        match crate::conn::accept_fingerprint(&self.inner.store, &addr, fp) {
+            Ok(()) => Ok(()),
+            Err(crate::conn::Error::Trust(crate::conn::TrustError::Mismatch {
+                recorded, ..
+            })) => Err(ClientError::AlreadyTrusted {
+                server: addr.to_string(),
+                recorded: types::show_record(&recorded),
+            }),
+            Err(e) => Err(ClientError::from_conn(&addr.to_string(), &e)),
+        }
     }
 
     /// Removes the trust record for `server`, as the user must do
