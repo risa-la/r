@@ -868,15 +868,49 @@ fn blocked_people_can_be_hidden_in_rooms() {
             .unwrap()
     );
 
+    // Their reactions do not count either: of the 👍 on message 1, only
+    // bob's, and the troll's 👎 and 🍕 not at all.
+    let counts = |store: &Store| -> Vec<(String, u64)> {
+        store
+            .message(conv, seq(1))
+            .unwrap()
+            .unwrap()
+            .reactions
+            .iter()
+            .map(|r| (r.reaction.clone(), r.count))
+            .collect()
+    };
+    store_all(
+        &store,
+        conv,
+        &[
+            ev(7, "from=bob@example.net;react=1 MSG #general 👍"),
+            ev(8, "from=troll@example.com;react=1 MSG #general 👍"),
+            ev(9, "from=troll@example.com;react=1 MSG #general 🍕"),
+        ],
+    );
+    assert_eq!(counts(&store), [("👍".to_owned(), 1)]);
+    store.set_hide_blocked(account, false).unwrap();
+    assert_eq!(
+        counts(&store),
+        [
+            ("🍕".to_owned(), 1),
+            ("👍".to_owned(), 2),
+            ("👎".to_owned(), 1)
+        ]
+    );
+    store.set_hide_blocked(account, true).unwrap();
+
     // Unblocking shows them again.
     let ((), changes) = store
         .write(|tx| tx.change_block(account, &blocks[1], false).map(drop))
         .unwrap();
     assert_eq!(changes, [Change::Blocks { account }]);
     assert_eq!(shown(&store), [1, 3, 5, 6]);
+    assert_eq!(counts(&store).len(), 3);
     store.set_hide_blocked(account, false).unwrap();
     assert_eq!(shown(&store), [1, 2, 3, 5, 6]);
-    assert_eq!(store.export(conv).unwrap().len(), 6);
+    assert_eq!(store.export(conv).unwrap().len(), 9);
 }
 
 #[test]

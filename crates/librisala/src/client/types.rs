@@ -738,7 +738,9 @@ pub enum EventKind {
 pub struct ReactionCount {
     /// The reaction, unescaped, usually an emoji.
     pub reaction: String,
-    /// How many people sent it.
+    /// How many people sent it. While the account hides blocked people
+    /// (5.7), their reactions do not count, and a reaction only they sent
+    /// is left out.
     pub count: u64,
     /// Whether the account is one of them.
     pub mine: bool,

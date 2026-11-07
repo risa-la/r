@@ -191,11 +191,22 @@ fn settings(conn: &Connection, conv: ConvId) -> Result<Vec<RoomSetting>, StoreEr
     Ok(out)
 }
 
+/// The reaction counts of message `target`, not counting people whose
+/// messages are hidden because they are blocked (5.7): their reactions
+/// are hidden with their messages. A reaction only they sent is left out.
 fn reactions(conn: &Connection, conv: ConvId, target: i64) -> Result<Vec<Reaction>, StoreError> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT reaction, count, mine FROM reactions WHERE conv = ?1 AND target = ?2
-         ORDER BY reaction",
-    )?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT reaction, shown, mine FROM (
+             SELECT r.reaction, r.mine, r.count - (
+                 SELECT COUNT(DISTINCT e.author) FROM events e
+                 WHERE e.conv = r.conv AND e.target = r.target AND e.rel = 'react'
+                     AND e.deleted = 0 AND e.text = r.reaction AND {HIDDEN}
+             ) AS shown
+             FROM reactions r WHERE r.conv = ?1 AND r.target = ?2
+         )
+         WHERE shown > 0
+         ORDER BY reaction"
+    ))?;
     let rows = stmt.query_map(params![conv.0, target], |r| {
         Ok((
             r.get::<_, String>(0)?,
