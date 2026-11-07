@@ -242,7 +242,7 @@ Settled (now in SPEC.md):
    - Names and rooms cannot end with `.`. A domain's last label cannot
      be all digits, so IP addresses are not domains.
    - A value that is only too long gets `too-long`, not `bad-syntax`.
-   - Key files over 64 KiB mean no keys. The 64-key limit counts only
+   - Key files over 64 KiB mean no keys (256 KiB since draft-02, for ML-DSA keys). The 64-key limit counts only
      different, valid keys.
    - The welcome text is at most 512 bytes.
    - HISTORY and RELATED accept `after=0` (7.2).
@@ -550,6 +550,14 @@ Open:
     above the head SYNC just reported, and an INVITE for your own
     account, are both reasons to SYNC again. BACKUP GET's `limit` counts
     epochs and never splits one (confirmed with the user).
+
+25. **Found while building key file fetching** (4.4). Key files are
+    fetched with TLS 1.3 only. A failed refetch keeps a cached copy when
+    the host cannot be reached, but any non-200 answer revokes it. Lines
+    that are not valid UTF-8 are malformed and ignored. The fetcher is
+    hand-written (one HTTP/1.1 GET) and trusts Mozilla's roots through
+    `webpki-root-certs`, so servers do not depend on their host's CA
+    store.
 
 ## 6. Decisions
 

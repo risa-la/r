@@ -424,9 +424,7 @@ impl KeyFetcher {
                 .await
                 .map_err(|e| FetchError::Tls(e.to_string()))?;
             let body = http::get(&mut stream, domain, &path, MAX_KEY_FILE_BYTES).await?;
-            // Labels and comments are for people: a stray byte that is not
-            // UTF-8 should not lose every key in the file.
-            let text = String::from_utf8_lossy(&body);
+            let text = valid_lines(&body);
             let file = KeyFile::parse(&text).map_err(|_| FetchError::TooLarge)?;
             Ok(Arc::from(file.into_keys()))
         };
@@ -469,5 +467,30 @@ impl KeyFetcher {
             (None, Some(ip)) => FetchError::Refused(ip),
             (None, None) => FetchError::Resolve("no addresses".into()),
         })
+    }
+}
+
+/// The lines of a key file that are valid UTF-8, joined with LF. A line
+/// that is not valid UTF-8 counts as malformed and is skipped, like any
+/// other malformed line, so a stray byte does not lose the other keys
+/// (4.4). The result is never longer than `body`.
+fn valid_lines(body: &[u8]) -> String {
+    body.split(|&b| b == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::valid_lines;
+
+    #[test]
+    fn lines_that_are_not_utf8_are_skipped() {
+        let body = b"# keys\nmldsa44 AAAA laptop\nmldsa44 BBBB \xff\xfe phone\r\nmldsa44 CCCC\n";
+        assert_eq!(
+            valid_lines(body),
+            "# keys\nmldsa44 AAAA laptop\nmldsa44 CCCC\n"
+        );
     }
 }

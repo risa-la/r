@@ -651,7 +651,8 @@ mldsa44 <key> [<label...>]
   with padding [RFC4648]. It is 1752 characters long.
 - `<label...>` is an optional note for people, usually the name of the
   device.
-- Blank lines and lines starting with `#` are ignored.
+- Blank lines and lines starting with `#` are ignored. A line that is
+  not valid UTF-8 counts as malformed, and is ignored too.
 - Lines with a key type other than `mldsa44` are ignored, so that new key
   types can be added later.
 
@@ -672,8 +673,8 @@ Servers fetch key files to check sign-ins, and devices fetch them to
 check the members of encrypted conversations (12.12). When a server or
 device fetches a key file:
 
-- It MUST use HTTPS and validate the certificate against public
-  certificate authorities.
+- It MUST use HTTPS with TLS 1.3, and validate the certificate against
+  public certificate authorities.
 - It MUST NOT follow redirects. Only a 200 response counts. Any other
   response means the identity has no keys.
 - It MUST stop after 10 seconds or 256 KiB. A file that is larger, or
@@ -688,6 +689,10 @@ device fetches a key file:
 - It MAY cache the file for up to one hour. If a signature does not
   verify against a cached file, it SHOULD fetch the file again once
   before failing, so that a newly added device works straight away.
+- If a fetch fails because no response arrives, for example a timeout
+  or a DNS or TLS error, a cached copy stays valid until its hour is
+  up. Any response other than 200 replaces it, and the identity then
+  has no keys.
 
 A server that notices a key has been removed SHOULD close the
 connections that signed in with it.
