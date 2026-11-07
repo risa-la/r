@@ -300,7 +300,10 @@ async fn connection<H: Handler>(
         result = handshake => match result {
             Ok(Ok(tls)) => tls,
             Ok(Err(e)) => {
-                tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                match tls::handshake_failure(&e) {
+                    Some(reason) => tracing::info!(%peer, reason, "TLS handshake refused"),
+                    None => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
+                }
                 return;
             }
             Err(_) => {

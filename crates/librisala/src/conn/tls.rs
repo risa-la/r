@@ -38,9 +38,9 @@ use crate::addr::{ServerAddr, TrustRecord, TrustStore, TrustStoreError};
 /// `verify_server_cert` is used; signatures are checked separately.
 pub type CaVerifier = Arc<dyn ServerCertVerifier>;
 
-/// The crypto provider librisala uses: rustls with ring.
+/// The crypto provider librisala uses: rustls with aws-lc-rs.
 pub fn crypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
 /// The platform's CA check, through `rustls-platform-verifier`: the OS

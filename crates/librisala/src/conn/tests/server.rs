@@ -34,7 +34,7 @@ impl std::fmt::Debug for ServerCert {
 
 fn signing_key(key: &KeyPair) -> Arc<dyn SigningKey> {
     let der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-    rustls::crypto::ring::sign::any_supported_type(&der).unwrap()
+    rustls::crypto::aws_lc_rs::sign::any_supported_type(&der).unwrap()
 }
 
 fn fingerprint(key: &KeyPair) -> Fingerprint {
@@ -174,7 +174,7 @@ impl ScriptServer {
         F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()

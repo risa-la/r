@@ -1,6 +1,7 @@
 //! M2's goal, by hand: two `openssl s_client` sessions chat as guests
 //! through the real `risalad` binary (Appendix A). Skipped when `openssl`
-//! is not on PATH.
+//! is not on PATH, or is older than 3.5 and so lacks X25519MLKEM768
+//! (2.1).
 
 #![cfg(unix)]
 
@@ -13,10 +14,7 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 fn have_openssl() -> bool {
-    Command::new("openssl")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    risala_server::net::testing::openssl_has_x25519mlkem768()
 }
 
 /// A child process whose output is read line by line in the background.
@@ -130,7 +128,7 @@ fn s_client(addr: &str) -> Proc {
 #[test]
 fn two_openssl_sessions_chat_through_risalad() {
     if !have_openssl() {
-        eprintln!("openssl not found, skipping");
+        eprintln!("OpenSSL 3.5 or later not found, skipping");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -185,6 +183,17 @@ fn two_openssl_sessions_chat_through_risalad() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     let hex = stdout.split_whitespace().last().unwrap();
     assert_eq!(format!("sha256:{hex}"), fingerprint);
+
+    // A client without X25519MLKEM768 is refused, and the log says why
+    // (2.1).
+    let classic = Command::new("openssl")
+        .args(["s_client", "-connect", &addr, "-groups", "X25519"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!classic.status.success(), "{classic:?}");
+    let refused = server.find("TLS handshake refused");
+    assert!(refused.contains("X25519MLKEM768"), "{refused}");
 
     let mut alice = s_client(&addr);
     alice.expect_prefix("RISALA 1 chat.example.org ");

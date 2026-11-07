@@ -720,6 +720,47 @@ async fn alpn_is_optional() {
 }
 
 #[tokio::test]
+async fn only_x25519mlkem768_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Running::start(&test_config(dir.path()));
+
+    let pq = server.client(ClientOptions::default()).await;
+    assert_eq!(pq.kx_group(), Some(rustls::NamedGroup::X25519MLKEM768));
+
+    // A client that offers only X25519 fails the handshake (2.1).
+    let classic = ClientOptions {
+        classic_kx: true,
+        ..ClientOptions::sni("localhost")
+    };
+    let err = TestClient::connect_with(server.addr, classic)
+        .await
+        .unwrap_err();
+    let tls = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<rustls::Error>())
+        .unwrap_or_else(|| panic!("{err:?}"));
+    assert_eq!(
+        *tls,
+        rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure)
+    );
+    assert_eq!(server.stub.opened().len(), 1);
+    server.shutdown().await;
+}
+
+#[test]
+fn a_refused_key_exchange_is_explained() {
+    let no_group = io::Error::other(rustls::Error::PeerIncompatible(
+        rustls::PeerIncompatible::NoKxGroupsInCommon,
+    ));
+    let reason = tls::handshake_failure(&no_group).unwrap();
+    assert!(reason.contains("X25519MLKEM768"), "{reason}");
+    let other = io::Error::other(rustls::Error::AlertReceived(
+        rustls::AlertDescription::BadCertificate,
+    ));
+    assert_eq!(tls::handshake_failure(&other), None);
+}
+
+#[tokio::test]
 async fn certificates_are_chosen_by_sni() {
     let dir = tempfile::tempdir().unwrap();
     let a = pair_in(dir.path(), "a");
@@ -861,6 +902,33 @@ async fn self_signed_certificate_is_generated_once() {
 }
 
 #[tokio::test]
+async fn a_self_signed_key_from_before_aws_lc_keeps_its_fingerprint() {
+    // A key that rcgen made with ring, as risalad did before it moved to
+    // aws-lc-rs. State dirs from then still load it, and clients' pins
+    // still hold (2.2). The fingerprint is from Appendix A's openssl
+    // commands.
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgKjoEWK82rPH2OZUt
+5lWSHVUTBekWiMHfEnsfJpUwexqhRANCAAQu+yb+cneTHqqntfe2qw2iwv5t9r4t
+ZeNUFcQGhu9zcuJFt5rUiNnQcsSatYCsYfoJsUTs6BZ38hd0xQBUM06I
+-----END PRIVATE KEY-----
+";
+    const FINGERPRINT: &str =
+        "sha256:2e04d75f37e2ac68e9743b9e9354188868e4286c7cfd377057ce442b30d0e9d1";
+    let dir = tempfile::tempdir().unwrap();
+    let paths = tls::self_signed_paths(dir.path());
+    std::fs::create_dir_all(paths.key.parent().unwrap()).unwrap();
+    std::fs::write(&paths.key, KEY).unwrap();
+
+    let running = Running::start(&test_config(dir.path()));
+    assert_eq!(running.certs.fingerprint().to_string(), FINGERPRINT);
+    assert_eq!(std::fs::read_to_string(&paths.key).unwrap(), KEY);
+    let client = running.client(ClientOptions::sni("localhost")).await;
+    assert_eq!(client.fingerprint().to_string(), FINGERPRINT);
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn unusable_certificates_fail_bind() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
@@ -883,12 +951,8 @@ async fn unusable_limits_fail_bind() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn fingerprint_matches_openssl() {
-    let have_openssl = std::process::Command::new("openssl")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !have_openssl {
-        eprintln!("openssl not found, skipping");
+    if !super::testing::openssl_has_x25519mlkem768() {
+        eprintln!("OpenSSL 3.5 or later not found, skipping");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

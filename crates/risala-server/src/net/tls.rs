@@ -17,14 +17,32 @@ use rustls::sign::CertifiedKey;
 
 use crate::config::{CertPair, Config};
 
-/// The rustls crypto provider: ring, never aws-lc-rs.
+/// The rustls crypto provider: aws-lc-rs, with X25519MLKEM768 as the only
+/// key exchange group (2.1). A client that does not offer it fails the
+/// handshake; see [`handshake_failure`].
 pub(crate) fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+    Arc::new(CryptoProvider {
+        kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    })
 }
 
-/// The server's TLS configuration (2.1): TLS 1.3 only, the ALPN
-/// `risala/1` offered (a client that offers none is still accepted), and
-/// certificates chosen by SNI from `certs`.
+/// Explains a failed handshake for the log, when the reason is one an
+/// operator should see: a client without X25519MLKEM768 (2.1), such as
+/// OpenSSL before 3.5. Returns `None` for everything else.
+pub(crate) fn handshake_failure(e: &io::Error) -> Option<&'static str> {
+    match e.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::PeerIncompatible(rustls::PeerIncompatible::NoKxGroupsInCommon) => Some(
+            "the client does not offer the key exchange X25519MLKEM768 \
+             (OpenSSL needs 3.5 or later)",
+        ),
+        _ => None,
+    }
+}
+
+/// The server's TLS configuration (2.1): TLS 1.3 only, the key exchange
+/// X25519MLKEM768 only, the ALPN `risala/1` offered (a client that offers
+/// none is still accepted), and certificates chosen by SNI from `certs`.
 pub(crate) fn server_config(certs: &Certificates) -> io::Result<rustls::ServerConfig> {
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
