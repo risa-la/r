@@ -1,0 +1,125 @@
+
+== 0. Crypto providers and suite 0x0052
+  suite MLS_128_MLKEM768X25519_CHACHA20POLY1305_SHA384_MLDSA44 = 0x0052
+  openmls_libcrux_crypto 0.4.0 supports 0x0052: Err(UnsupportedCiphersuite)
+  openmls_libcrux_crypto 0.4.0 supported list: [MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519, MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519]
+  openmls_rust_crypto 0.6.0 supports 0x0052: Ok(())
+
+== 0b. libcrux + libcrux-ml-dsa wrapper provider
+  libcrux-ml-dsa, Appendix B: key sha256 d9d69ac9b18f4275, signature sha256 eeda7aa7dd2ffa7c
+  ok   libcrux-ml-dsa and RustCrypto ml-dsa produce the same Appendix B key and signature
+  ok   libcrux-wrapped device and RustCrypto device: add, Welcome, commit back, same history key
+
+== 1. Suite 0x0052 end to end, one ML-DSA-44 key for AUTH and MLS
+  appendix B public key: 1312 bytes, sha256 d9d69ac9b18f42759e43edba0106410c07045a1edab642925b7496ea40baccdf
+  appendix B AUTH signature: 2420 bytes, sha256 eeda7aa7dd2ffa7cc2fa6683e7d8d2b94cf46716484b784d6a53b4928df58906
+  ok   deterministic ML-DSA-44 reproduces the Appendix B signature byte for byte
+  KEYPKG ADD: ordinary last_resort=false, last-resort last_resort=true
+  ok   KEYPKG ADD refuses another device's KeyPackage
+  last-resort KeyPackage without last_resort in capabilities: KEYPKG ADD -> Err(Invalid("KeyPackage: UnsupportedExtension"))
+  ok   KeyPackage signature verifies under the key-file key with our own SignWithLabel
+  ok   INIT accepted by the server (PublicGroup from GroupInfo + out-of-band tree)
+  COMMIT accepted, epoch 1
+  ok   three devices joined from one Welcome, tree given out of band (server's copy)
+  epoch 1 history key (48 bytes) on all 4 devices: 5593cd37ee361144d8d72612…
+  ok   empty commit (key refresh) accepted by server and applied by all; new history key agrees
+  ok   second commit for the same epoch: rejected with Stale("commit for epoch 2, group is at 3")
+
+== 2. Conversation extension 0xF2A1
+  extension data for room r7x2k9qp/shared: 0208723778326b39717001
+  ok   INIT naming another room: rejected with Invalid("conversation extension RisalaConversation { kind: 2, name: VLBytes { 0x723778326b397170 }, history: 1 }")
+  server PublicGroup reads: RisalaConversation { kind: 2, name: VLBytes { 0x723778326b397170 }, history: 1 }
+  ok   adding a leaf without 0xF2A1 in its capabilities: Some("The capabilities of the add proposal are insufficient for this group.")
+  invite commit accepted, server records INVITE for ["bob@example.net"]
+  GCE commit accepted; server records SET history Some(2); Bob reads RisalaConversation { kind: 2, name: VLBytes { 0x723778326b397170 }, history: 2 }
+  ok   GCE by a non-owner: rejected with Forbidden("GroupContextExtensions")
+  ok   GCE renaming the conversation: rejected with Forbidden("GCE changes more than history")
+  note OpenMLS on Bob's device processes the renaming commit without error: Ok("accepted")
+  ok   GCE that drops required_capabilities but keeps 0xF2A1: OpenMLS refuses to build it: Some("An extension in the group context extensions is not listed in the required capabilties' extension types.")
+
+== 3/4. Server-side checks of commits, and external commits
+  ok   add of a key missing from the key file: rejected with Forbidden("add bob@example.net: key not in key file")
+  ok   commit sent by a connection of another device: rejected with Forbidden("committer is not this connection's device")
+  ok   add without its Welcome: rejected with Invalid("welcome presence")
+  ok   GroupInfo of the old epoch: rejected with Invalid("GroupInfo context is not the new epoch's")
+  invite of Bob (bob1) accepted, epoch 1, INVITE for ["bob@example.net"]
+  ok   a plain member adding a non-member: rejected with Forbidden("add carol@example.com: not allowed")
+  ok   removing a member's leaf with no reason: rejected with Forbidden("remove carol@example.com: no reason")
+  ok   after KICK, Bob's removal of Carol's leaf is accepted; Carol's group sees itself removed: active=false
+  -- external commits (12.6)
+  ok   new device joined by external commit (tree out of band), epoch 4; history keys agree
+  rejoin with same key: commit proposals ["ExternalInit", "Remove"]
+  ok   the external commit removed the old leaf of the same key; leaf count stays 3
+  ok   the stale bob1 state processes it and sees itself removed: active=false
+  ok   external join by an identity without a leaf (room): rejected with Forbidden("committer may not change the group")
+  ok   Add of a key that already has a leaf, without its Remove: OpenMLS refuses to build it: Some(ProposalValidationError(DuplicateSignatureKey))
+  ok   Remove + Add of the same key in one commit: accepted by OpenMLS and the server
+  ok   direct conversation: the other participant joins by external commit with no leaf before
+
+== 4b. Expired leaf lifetimes, and credential changes by commit
+  Bob added with a KeyPackage valid for 3 s; waiting 4 s
+  server accepts a later commit with Bob's leaf expired: true
+  Carol joins by Welcome with lifetime checks on: Some(PublicGroupError(LeafNodeValidation(Lifetime(Expired { not_after: 1794046772, now: 1794046773 }))))
+  Carol retries the same Welcome: Some(NoMatchingKeyPackage) (the failed attempt deleted her KeyPackage)
+  another device of Carol, with skip_lifetime_validation(): joined=true
+  external join with lifetime checks on: Some(PublicGroupError(LeafNodeValidation(Lifetime(Expired { not_after: 1794046772, now: 1794046773 }))))
+  ... with skip_lifetime_validation(): built=true
+  server PublicGroup::from_external on this tree: Some(Invalid("from_external: LeafNodeValidation(Lifetime(Expired { not_after: 1794046772, now: 1794046773 }))"))
+  OpenMLS on Alice's device accepts Bob's commit renaming his leaf to: Ok(Some("carol@example.com"))
+  ok   the same commit at the server: rejected with Forbidden("path leaf changes identity or key")
+
+== 5. History keys and ENC payloads (12.8-12.10)
+  pad=false: RisalaMessage 2581 bytes, payload 2629 bytes (3508 base64 chars), frank tag 48 bytes
+  pad=true: RisalaMessage 2816 bytes, payload 2864 bytes (3820 base64 chars), frank tag 48 bytes
+  ok   Bob decrypts and verifies Alice's message with his own derived history key
+  ok   wrong epoch in AAD: Some("AEAD")
+  ok   `from` whose keys do not match sender_key_id: Some("no key of `from` matches sender_key_id")
+  ok   flipped ciphertext bit: Some("AEAD")
+  ok   wrong frank tag: Some("franking tag")
+  KEY line is 89 bytes; one 8 MiB ENC line holds about 70627 history keys
+  ok   backup blob is 84 bytes and opens only for its conversation id and epoch
+  ok   exporter context is part of the derivation ("" vs "x" differ)
+
+== 3 (cost) and 7 (sizes). Groups of up to 512 leaves
+  KeyPackage line: 11536 base64 chars
+  epoch 0: GroupInfo 5092 chars, tree 6684 chars
+  made 511 KeyPackages in 881.317908ms
+  add 1: 1 -> 2 leaves (+1): commit 14976 chars, welcome 5208 chars, groupinfo 5156 chars, tree 13364 chars; client build 2.48291ms, server check+merge 907.291µs
+  add 1: 2 -> 3 leaves (+1): commit 14976 chars, welcome 5208 chars, groupinfo 5156 chars, tree 20044 chars; client build 1.554769ms, server check+merge 835.735µs
+  add 97: 3 -> 100 leaves (+97): commit 1122896 chars, welcome 163932 chars, groupinfo 5156 chars, tree 668084 chars; client build 48.120514ms, server check+merge 42.063134ms
+  add 1: 100 -> 101 leaves (+1): commit 14976 chars, welcome 5208 chars, groupinfo 5156 chars, tree 674764 chars; client build 3.686252ms, server check+merge 7.410536ms
+  add 410: 101 -> 511 leaves (+410): commit 4735532 chars, welcome 681424 chars, groupinfo 5156 chars, tree 3414260 chars; client build 209.173184ms, server check+merge 197.094413ms
+  add 1: 511 -> 512 leaves (+1): commit 14976 chars, welcome 5208 chars, groupinfo 5156 chars, tree 3420940 chars; client build 11.933906ms, server check+merge 34.474329ms
+
+  | leaves before | commit | Welcome | GroupInfo | tree | WELCOME line (welcome+tree) |
+  |---|---|---|---|---|---|
+  | 1 | 14976 | 5208 | 5156 | 13364 | 18572 |
+  | 2 | 14976 | 5208 | 5156 | 20044 | 25252 |
+  | 100 | 14976 | 5208 | 5156 | 674764 | 679972 |
+  | 511 | 14976 | 5208 | 5156 | 3420940 | 3426148 |
+  (base64 characters; 8 MiB = 8388608)
+  the 410-device add commit was 4735532 chars (56.5% of 8 MiB), its Welcome 681424 chars
+  ok   a 513th leaf: rejected with Forbidden("group would have 513 leaves")
+
+  server: PublicGroup::from_external at 512 leaves (GroupInfo + tree, every leaf verified): 106.838278ms
+  member: join from Welcome + tree at 512 leaves: 101.040621ms
+  empty commit at 512 leaves: 834240 chars, GroupInfo 5156 chars; member build 23.400095ms, server check+merge 40.271316ms, other member apply 41.034022ms
+  remove 4 leaves at 512: commit 424012 chars; owner build 21.369914ms, server 35.052677ms, member apply 35.589255ms
+  GROUPINFO reply at 508 leaves: groupinfo 5156 + tree 3423020 chars
+  external rejoin at 508 leaves: commit 803952 chars; joiner build 155.114447ms, server 35.115496ms
+
+== 8. Storage (openmls_sqlite_storage 0.3, rusqlite 0.37)
+  tables it creates: ["openmls_encryption_keys", "openmls_epoch_keys_pairs", "openmls_group_data", "openmls_key_packages", "openmls_own_leaf_nodes", "openmls_proposals", "openmls_psks", "openmls_signature_keys", "openmls_sqlite_storage_migrations", "registered_vc_emulation_epochs", "sqlite_sequence", "vc_emulation_bindings", "vc_emulation_group_secrets", "vc_operation_trees", "vc_retained_key_package_material"]
+  A created the group; B loads it from the file: epoch 0
+  A merged a commit inside a transaction: epoch 1 (in tx)
+  B tries BEGIN IMMEDIATE meanwhile: Some("database is locked")
+  after rollback, the file says epoch 0: the merge was atomic
+  A committed: file epoch 1; B's in-memory MlsGroup still says epoch 0 (stale until B reloads)
+  B reloads: epoch 1
+  server: PublicGroup stored and loaded back from SQLite (2 leaves, load 232.962µs)
+  one commit adding 511 devices (1 -> 512 leaves), built and stored in 449.705508ms
+  its COMMIT line: 6752627 bytes = 80.5% of 8 MiB (commit 5899088, groupinfo 5136, welcome 848388)
+  MlsGroup::load at 512 leaves from SQLite (JSON codec): 42.204252ms
+  openmls_group_data bytes for both groups: 9336217
+  server: from_external + store at 512 leaves: 197.25659ms
+  server: PublicGroup::load at 512 leaves: 42.530881ms
