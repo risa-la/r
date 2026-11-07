@@ -44,7 +44,7 @@ builddir/
 local.properties
 *.apk
 *.aab
-apps/android/**/build/
+clients/android/**/build/
 
 # Apple / Xcode (future client)
 DerivedData/
