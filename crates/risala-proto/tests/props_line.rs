@@ -13,7 +13,8 @@ use proptest::prelude::*;
 use proptest::sample::Index;
 use risala_proto::error::ParseError;
 use risala_proto::frame::{
-    LONG_VERBS, LineDecoder, LineLimits, MAX_CLIENT_LINE, MAX_LONG_CLIENT_LINE, check_line,
+    CLIENT_LONG_VERBS, LineDecoder, LineLimits, MAX_CLIENT_LINE, MAX_LONG_CLIENT_LINE,
+    MAX_SERVER_LINE, SERVER_LONG_VERBS, check_line,
 };
 use risala_proto::line::{Line, Tags};
 
@@ -571,51 +572,56 @@ proptest! {
 // ---------------------------------------------------------------------------
 // Long lines (2.3)
 
-/// Whether a line, or the start of one, may be long, and whether that is
-/// known yet: `Some(long)` once the verb has ended, `None` before. The
-/// verb comes after the tags (`@` to the first space) and any spaces.
-fn verb_class(line: &[u8], complete: bool) -> Option<bool> {
-    let mut rest = line;
-    if rest.first() == Some(&b'@') {
-        match rest.iter().position(|&b| b == b' ') {
-            Some(space) => rest = &rest[space..],
-            None if complete => return Some(false),
-            None => return None,
-        }
-        let spaces = rest.iter().take_while(|&&b| b == b' ').count();
-        rest = &rest[spaces..];
+/// Where the verb of a line, or of the start of one, ends, and what it
+/// is: `Some((end, verb))` once the verb has ended, where `end` is the
+/// index of the byte after it; `None` before, or if there is no verb (tags
+/// without a space, or a verb longer than nine letters). The verb comes
+/// after the tags (`@` to the first space) and any spaces.
+fn verb_end(line: &[u8], complete: bool) -> Option<(usize, &[u8])> {
+    let mut start = 0;
+    if line.first() == Some(&b'@') {
+        start = line.iter().position(|&b| b == b' ')?;
+        start += line[start..].iter().take_while(|&&b| b == b' ').count();
     }
+    let rest = &line[start..];
     let letters = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
-    let verb = &rest[..letters];
-    let is_long = || {
-        LONG_VERBS
-            .iter()
-            .any(|v| v.as_bytes().eq_ignore_ascii_case(verb))
-    };
-    if letters > 9 {
-        Some(false)
-    } else if letters < rest.len() || complete {
-        Some(is_long())
-    } else {
+    if letters > 9 || (letters == rest.len() && !complete) {
         None
+    } else {
+        Some((start + letters, &rest[..letters]))
     }
 }
 
-/// [`reference`] with a long limit for lines whose verb is in
-/// `LONG_VERBS`. A line whose verb has not arrived yet may still be long.
+/// Whether a line, or the start of one, may be long under `limits`: its
+/// verb has ended within the normal limit and is a long verb (2.3).
+fn is_long(line: &[u8], complete: bool, limits: &LineLimits) -> bool {
+    verb_end(line, complete).is_some_and(|(end, verb)| {
+        end < limits.normal
+            && limits
+                .long_verbs
+                .iter()
+                .any(|v| v.as_bytes().eq_ignore_ascii_case(verb))
+    })
+}
+
+/// [`reference`] with a long limit for lines whose verb is long and ends
+/// within the normal limit. Until then, the normal limit applies.
 fn reference_long(
     input: &[u8],
     limits: LineLimits,
 ) -> (Vec<Result<String, ParseError>>, usize, bool) {
-    let limit = |class: Option<bool>| match class {
-        Some(false) => limits.normal,
-        Some(true) | None => limits.long,
+    let limit = |line: &[u8], complete: bool| {
+        if is_long(line, complete, &limits) {
+            limits.long
+        } else {
+            limits.normal
+        }
     };
     let mut parts: Vec<&[u8]> = input.split(|&b| b == b'\n').collect();
     let unfinished = parts.pop().expect("split yields at least one part");
     let mut out = Vec::new();
     for line in parts {
-        out.push(if line.len() + 1 > limit(verb_class(line, true)) {
+        out.push(if line.len() + 1 > limit(line, true) {
             Err(ParseError::TooLong)
         } else {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -626,7 +632,7 @@ fn reference_long(
             }
         });
     }
-    if !unfinished.is_empty() && unfinished.len() >= limit(verb_class(unfinished, false)) {
+    if !unfinished.is_empty() && unfinished.len() >= limit(unfinished, false) {
         out.push(Err(ParseError::TooLong));
         (out, 0, true)
     } else {
@@ -642,7 +648,8 @@ fn verb_stream() -> impl Strategy<Value = Vec<u8>> {
         1 => Just(b"\r\n".to_vec()),
         3 => prop::sample::select(vec![
             "ENC ", "enc ", "COMMIT", "groupinfo ", "REPORT ", "WelCome ", "INIT", "KEYPKG ",
-            "MSG ", "ENCX ", "GROUPINFOS ", "PING", "@", "@ref=1 ", "@content=AAAA  ", " ",
+            "reportEnc ", "MSG ", "ENCX ", "GROUPINFOS ", "REPORTENCS ", "PING", "@", "@ref=1 ",
+            "@x-tag=AAAA  ", " ",
         ])
         .prop_map(|s| s.as_bytes().to_vec()),
         4 => "[a-zA-Z0-9 ;=]{1,12}".prop_map(String::into_bytes),
@@ -652,9 +659,14 @@ fn verb_stream() -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn limits() -> impl Strategy<Value = LineLimits> {
-    (1..=24usize, 0..=40usize).prop_map(|(normal, extra)| LineLimits {
+    (1..=24usize, 0..=40usize, any::<bool>()).prop_map(|(normal, extra, client)| LineLimits {
         normal,
         long: normal + extra,
+        long_verbs: if client {
+            &CLIENT_LONG_VERBS
+        } else {
+            &SERVER_LONG_VERBS
+        },
     })
 }
 
@@ -662,8 +674,9 @@ proptest! {
     #![proptest_config(config(1024))]
 
     /// With a long limit for MLS verbs, the decoder yields what the
-    /// reference splitter does, in any chunks, and never holds more than
-    /// the long limit (2.3).
+    /// reference splitter does, in any chunks, never holds more than the
+    /// long limit, and holds no more than the normal limit until a long
+    /// verb has ended (2.3).
     #[test]
     fn long_line_decoder_matches_reference(
         input in verb_stream(),
@@ -681,6 +694,10 @@ proptest! {
             d.push(&input[start..cut]);
             start = cut;
             prop_assert!(d.pending_bytes() < limits.long, "{} pending", d.pending_bytes());
+            let line_start = input[..cut].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            if !is_long(&input[line_start..cut], false, &limits) {
+                prop_assert!(d.pending_bytes() < limits.normal.max(1), "{} pending", d.pending_bytes());
+            }
             if d.is_discarding() {
                 prop_assert_eq!(d.pending_bytes(), 0);
             }
@@ -713,9 +730,10 @@ trait ForVerbOf {
 impl ForVerbOf for LineLimits {
     /// The limit for a whole line, by the reference's verb rules.
     fn for_verb_of(&self, line: &str) -> usize {
-        match verb_class(line.as_bytes(), true) {
-            Some(true) => self.long,
-            _ => self.normal,
+        if is_long(line.as_bytes(), true, self) {
+            self.long
+        } else {
+            self.normal
         }
     }
 }
@@ -748,4 +766,46 @@ fn real_long_limit() {
     msg.resize(MAX_CLIENT_LINE, b'a');
     d.push(&msg);
     assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
+}
+
+/// With the real limits, the verb of a long line must end within the
+/// normal limit: tags can fill at most the normal limit (2.3).
+#[test]
+fn real_tags_before_a_long_verb() {
+    for (limits, verb) in [
+        (LineLimits::CLIENT, "REPORTENC"),
+        (LineLimits::SERVER, "REPORTENC"),
+        (LineLimits::SERVER, "WELCOME"),
+    ] {
+        let normal = limits.normal;
+        assert!(normal == MAX_CLIENT_LINE || normal == MAX_SERVER_LINE);
+        // `@x=` plus filler, a space and the verb, so that the byte after
+        // the verb is at index `end`.
+        let line_with_end = |end: usize| {
+            let filler = end - verb.len() - 1 - 3;
+            format!(
+                "@x={} {verb} {}\n",
+                "a".repeat(filler),
+                "A".repeat(normal * 2)
+            )
+        };
+        for (end, ok) in [(normal - 1, true), (normal, false)] {
+            let line = line_with_end(end);
+            assert_eq!(
+                line.find(&format!(" {verb} ")).unwrap() + 1 + verb.len(),
+                end
+            );
+            let mut d = LineDecoder::with_limits(limits);
+            for chunk in line.as_bytes().chunks(1000) {
+                d.push(chunk);
+                // Until the verb has ended, no more than the normal limit.
+                if d.pending_bytes() >= normal {
+                    assert!(ok);
+                }
+            }
+            assert_eq!(d.next_line().unwrap().is_ok(), ok, "{verb} ending at {end}");
+            let line = line.trim_end_matches('\n');
+            assert_eq!(limits.check(line).is_ok(), ok, "{verb} ending at {end}");
+        }
+    }
 }
