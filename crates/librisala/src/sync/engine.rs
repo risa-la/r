@@ -182,7 +182,20 @@ impl SyncEngine {
         config: SyncConfig,
     ) -> Result<SyncEngine, SyncError> {
         let me = store.account_uid(account)?;
-        Ok(SyncEngine {
+        Ok(SyncEngine::signed_in_as(store, account, me, config))
+    }
+
+    /// An engine for `account` on a connection signed in as `me`, which
+    /// may differ from the account's uid: a guest whose name was still
+    /// taken signs in as `<name>2` and so on (4.2). The engine uses `me`
+    /// to recognise the connection's own JOIN, PART, KICK and BAN events.
+    pub fn signed_in_as(
+        store: Store,
+        account: AccountId,
+        me: Uid,
+        config: SyncConfig,
+    ) -> SyncEngine {
+        SyncEngine {
             store,
             account,
             guest: me.is_guest(),
@@ -196,7 +209,7 @@ impl SyncEngine {
             sending: HashSet::new(),
             ticks: 0,
             out: Output::default(),
-        })
+        }
     }
 
     /// The account this engine syncs.
