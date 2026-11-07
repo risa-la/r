@@ -562,7 +562,8 @@ pub struct ConversationInfo {
     /// The read marker (7.4); 0 for none.
     pub read: u64,
     /// Messages from others after the read marker, counting events not
-    /// stored yet above the sync point.
+    /// stored yet above the sync point, but not messages hidden because
+    /// their author is blocked (5.7).
     pub unread: u64,
     /// The newest stored seq; 0 for none.
     pub newest: u64,

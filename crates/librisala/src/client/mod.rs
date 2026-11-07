@@ -48,6 +48,14 @@
 //! The server's refusals are [`ClientError::Refused`] with a
 //! [`RefusedKind`], and key store failures [`ClientError::Keys`].
 //!
+//! # People
+//!
+//! Read markers (7.4) move with [`Conversation::mark_read`] and
+//! [`Conversation::mark_all_read`], and follow the account's other devices.
+//! Display names, members, presence, typing and blocks (5.7, 8.1-8.3) are
+//! methods of [`Account`] and [`Conversation`], with change events: see
+//! `people.rs`, from [`Account::set_display_name`] on.
+//!
 //! # Order
 //!
 //! The sync engine needs every server line in the order it arrived, with

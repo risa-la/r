@@ -30,7 +30,7 @@ pub struct ConversationSummary {
     /// The read marker (7.4), 0 for none.
     pub read: u64,
     /// Messages after the read marker, not counting the account's own,
-    /// edits, reactions or deleted messages. Events above the sync point
+    /// edits, reactions, deleted messages or hidden ones (5.7). Events above the sync point
     /// that are not stored yet, as when only the newest page was fetched
     /// (7.1 step 4), each count as one: they are not known, and most are
     /// messages.
@@ -357,6 +357,7 @@ impl Store {
 
     /// Up to `limit` timeline items before `before` (or the newest, if
     /// `None`), oldest first. Page back by passing the first item's seq.
+    /// Messages hidden because their author is blocked (5.7) are left out.
     pub fn timeline(
         &self,
         conv: ConvId,
@@ -384,7 +385,8 @@ impl Store {
         })
     }
 
-    /// One timeline item, if it is stored and is one.
+    /// One timeline item, if it is stored and is one, and is not hidden
+    /// (5.7).
     pub fn message(&self, conv: ConvId, seq: Seq) -> Result<Option<TimelineItem>, StoreError> {
         self.read(|conn| {
             let raw = conn
