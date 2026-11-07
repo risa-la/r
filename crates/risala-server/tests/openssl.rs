@@ -1,7 +1,8 @@
-//! M2's goal, by hand: two `openssl s_client` sessions chat as guests
-//! through the real `risalad` binary (Appendix A). Skipped when `openssl`
-//! is not on PATH, or is older than 3.5 and so lacks X25519MLKEM768
-//! (2.1).
+//! risala by hand, with `openssl` (Appendix A): M2's goal, two
+//! `openssl s_client` sessions chatting as guests through the real
+//! `risalad` binary, and M3's, an identity made and signed in with openssl
+//! alone. Skipped when `openssl` is not on PATH, or is older than 3.5 and
+//! so lacks X25519MLKEM768 (2.1) and ML-DSA (4.5).
 
 #![cfg(unix)]
 
@@ -261,4 +262,103 @@ fn two_openssl_sessions_chat_through_risalad() {
     server.find("SIGTERM: shutting down");
     let status = server.wait();
     assert!(status.success(), "risalad exited with {status}");
+}
+
+/// Runs `script` with `sh -c` in `dir`, and returns its standard output.
+fn sh(dir: &std::path::Path, script: &str) -> String {
+    let out = Command::new("sh")
+        .args(["-c", script])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{script}: {out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// M3 by hand: an identity made and signed in with nothing but openssl,
+/// following Appendix A word for word: `genpkey` makes the key, the
+/// `printf` pipeline prints its key file line, and `pkeyutl` signs the
+/// challenge. The server fetches the key file from a test HTTPS server.
+#[test]
+fn an_identity_signs_in_by_hand() {
+    if !have_openssl() {
+        eprintln!("OpenSSL 3.5 or later not found, skipping");
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let server = rt.block_on(
+        risala_server::testing::TestServer::builder()
+            .key_domains(&["example.net"])
+            .room("#general")
+            .start(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+
+    // Make a key, and print the line for your key file.
+    sh(
+        dir.path(),
+        "openssl genpkey -algorithm ML-DSA-44 -out alice.pem",
+    );
+    let line = sh(
+        dir.path(),
+        "printf 'mldsa44 %s laptop\\n' \
+           \"$(openssl pkey -in alice.pem -pubout -outform der | tail -c 1312 | openssl base64 -A)\"",
+    );
+    let entry: risala_proto::keyfile::KeyEntry = line.trim_end().parse().unwrap();
+    assert_eq!(entry.label(), Some("laptop"));
+    let alice: risala_proto::names::Identity = "alice@example.net".parse().unwrap();
+    server.key_server().publish(&alice, &[entry]);
+
+    // Connect. `-servername` sends the name the server is known by in SNI,
+    // as connecting to it by name would.
+    let mut cmd = Command::new("openssl");
+    cmd.args([
+        "s_client",
+        "-connect",
+        &server.addr().to_string(),
+        "-servername",
+        server.hostname(),
+        "-quiet",
+    ]);
+    let mut c = Proc::spawn(cmd, false);
+    let greeting = c.expect_prefix(&format!("RISALA 1 {} ", server.hostname()));
+    let nonce = greeting.split(' ').nth(3).unwrap().to_owned();
+
+    // Sign in: the challenge goes in a file, and pkeyutl signs it.
+    sh(
+        dir.path(),
+        &format!(
+            "printf 'risala-auth-1\\n%s\\n%s\\n%s\\n' {} {nonce} alice@example.net > chal",
+            server.hostname()
+        ),
+    );
+    let signature = sh(
+        dir.path(),
+        "openssl pkeyutl -sign -rawin -inkey alice.pem -in chal | openssl base64 -A",
+    );
+    c.type_line(&format!("auth alice@example.net {}", signature.trim()));
+    c.expect("OK uid=alice@example.net");
+
+    // Signed in as the identity.
+    c.type_line("join #general");
+    let join = c.expect_prefix("@seq=1;");
+    assert!(join.contains(";from=alice@example.net;id="), "{join}");
+    for _ in 0..5 {
+        c.expect_prefix("SET #general ");
+    }
+    c.expect_prefix("OK id=");
+    c.type_line("name Alice");
+    c.expect("OK");
+    c.type_line("whois alice@example.net");
+    c.expect("USER alice@example.net online Alice");
+    c.expect("OK");
+    c.type_line("quit");
+    c.expect("OK");
+    assert_eq!(c.line(), None);
+    c.wait();
+    rt.block_on(server.stop());
 }
