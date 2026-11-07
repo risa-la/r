@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -288,6 +288,15 @@ CREATE TABLE guest_members (
     since INTEGER NOT NULL,
     PRIMARY KEY (conv, uid)
 ) WITHOUT ROWID;
+"#;
+
+/// Version 3: key labels are at most 64 bytes (4.4, 4.7).
+const V3: &str = r#"
+-- Before draft-02 set the limit, KEY ADD took labels up to the line
+-- limit. A longer one cannot be sent in a KEY line or written to a key
+-- file any more, so it is dropped. Labels are stored escaped, which is
+-- the form the limit counts (3.4).
+UPDATE hosted_keys SET label = '' WHERE length(CAST(label AS BLOB)) > 64;
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.

@@ -9,6 +9,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use risala_proto::auth::PublicKey;
+use risala_proto::keyfile::MAX_KEY_LABEL;
 use risala_proto::names::{BlockTarget, Id, Room, Seq, Uid};
 use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
@@ -698,7 +699,13 @@ fn hosted_keys_in(conn: &Connection, uid: &Uid) -> Result<Vec<HostedKey>> {
         ))
     })?
     .map(|r| {
-        let (key, label, added) = r?;
+        let (key, mut label, added) = r?;
+        // Migration 3 dropped longer labels, and KEY ADD refuses them, so
+        // this is only a guard: such a label cannot be sent (4.4, 4.7).
+        if label.len() > MAX_KEY_LABEL {
+            tracing::warn!(%uid, "dropping a stored key label over {MAX_KEY_LABEL} bytes");
+            label.clear();
+        }
         Ok(HostedKey {
             key: parse("hosted key", &key)?,
             label,

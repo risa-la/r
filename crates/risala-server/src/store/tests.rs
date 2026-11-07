@@ -848,6 +848,54 @@ fn key(n: u8) -> risala_proto::auth::PublicKey {
     risala_proto::auth::SecretKey::from_seed([n; 32]).public_key()
 }
 
+/// Labels over 64 bytes, which KEY ADD took before draft-02 set the
+/// limit, are dropped by migration 3, and any that turns up later is not
+/// loaded, since it cannot be sent in a KEY line (4.4, 4.7).
+#[test]
+fn key_labels_over_64_bytes_are_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("risala.db");
+    let alice = uid("alice@example.org");
+    let long = "x".repeat(65);
+    let fits = "\\s".repeat(16) + &"y".repeat(32);
+    assert_eq!(fits.len(), 64);
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        schema::migrate_with(&mut conn, &schema::MIGRATIONS[..2]).unwrap();
+        conn.execute(
+            "INSERT INTO identities (uid, hosted, first_seen, last_seen) VALUES (?, 1, 0, 0)",
+            [alice.as_str()],
+        )
+        .unwrap();
+        for (n, label) in [(1, long.as_str()), (2, fits.as_str()), (3, "phone")] {
+            conn.execute(
+                "INSERT INTO hosted_keys (uid, key, label, added) VALUES (?, ?, ?, ?)",
+                rusqlite::params![alice.as_str(), key(n).to_string(), label, n],
+            )
+            .unwrap();
+        }
+    }
+    let store = SqliteStore::open(&path).unwrap();
+    let labels = |store: &SqliteStore| -> Vec<String> {
+        store
+            .hosted_keys(&alice)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|k| k.label)
+            .collect()
+    };
+    assert_eq!(labels(&store), ["", fits.as_str(), "phone"]);
+    store
+        .conn()
+        .execute(
+            "UPDATE hosted_keys SET label = ? WHERE key = ?",
+            rusqlite::params![long, key(3).to_string()],
+        )
+        .unwrap();
+    assert_eq!(labels(&store), ["", fits.as_str(), ""]);
+}
+
 #[test]
 fn signing_in_makes_an_identity_known() {
     let store = SqliteStore::open_in_memory().unwrap();

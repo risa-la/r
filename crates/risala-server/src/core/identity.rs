@@ -12,7 +12,7 @@ use std::time::Duration;
 use risala_proto::auth::{Nonce, PublicKey, Signature};
 use risala_proto::command::KeyCommand;
 use risala_proto::error::ErrorCode;
-use risala_proto::keyfile::{KeyEntry, MAX_KEYS};
+use risala_proto::keyfile::{KeyEntry, MAX_KEY_LABEL, MAX_KEYS};
 use risala_proto::names::{Identity, Name, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
 use risala_proto::text::unescape;
@@ -481,6 +481,12 @@ impl Inner {
                 // The label is stored as received (3.4), and goes in the
                 // key file as plain text (4.4), so it may not hold a line
                 // break.
+                // The 64-byte limit (4.4, 4.7) counts the escaped label,
+                // which the parser has checked already, so a label that
+                // fails here holds a line break.
+                if label.len() > MAX_KEY_LABEL {
+                    return Err(fail(ErrorCode::TooLong, "a label is at most 64 bytes"));
+                }
                 KeyEntry::new(key.clone(), Some(&unescape(&label)))
                     .map_err(|_| fail(ErrorCode::BadSyntax, "the label cannot go in a key file"))?;
                 let _keys = self.keys_lock.lock().await;

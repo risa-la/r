@@ -207,6 +207,11 @@ async fn key_del_closes_the_device_that_used_the_key() {
     let mut phone = server.sign_in(&phone_key).await;
     let keys = command(&mut laptop, "key list").await;
     assert_eq!(keys.len(), 3, "{keys:?}");
+    // A label is at most 64 bytes (4.7).
+    let spare = TestIdentity::new("alice@example.org");
+    let long = format!("key add {} {}", spare.public_key(), "x".repeat(65));
+    let lines = command(&mut laptop, &long).await;
+    assert!(lines[0].starts_with("ERR too-long"), "{lines:?}");
 
     let lines = command(&mut laptop, &format!("key del {}", phone_key.public_key())).await;
     assert_eq!(lines, ["OK"]);
