@@ -538,7 +538,7 @@ impl Online<'_> {
                     warn!(error = %e, "cannot send a command");
                     let reply = sync::Reply {
                         lines: Vec::new(),
-                        outcome: Outcome::Failed,
+                        outcome: Outcome::NotSent,
                     };
                     self.synthetic.push((Input::Reply(o.req, reply), Ctx::None));
                 }
@@ -570,6 +570,9 @@ impl Online<'_> {
                     message: "the server's answer could not be read".into(),
                     permanent: false,
                 }),
+                Outcome::NotSent => {
+                    Err(ClientError::Invalid("the command could not be sent".into()))
+                }
             };
             if let Some(room) = self.rejoining.remove(&done.req)
                 && let Outcome::Err(err) = &done.outcome

@@ -988,6 +988,8 @@ impl SyncEngine {
                 }
                 Outcome::Err(err) => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
                 Outcome::Failed => tx.outbox_failed(outbox, FailReason::Unconfirmed)?,
+                // Never sent, so it is not "maybe sent".
+                Outcome::NotSent => tx.outbox_failed(outbox, FailReason::Invalid)?,
             }
             Ok(None)
         })?;

@@ -1106,6 +1106,39 @@ fn a_claim_lapses_after_its_lease() {
 }
 
 #[test]
+fn a_message_that_could_not_be_written_is_not_maybe_sent() {
+    // The session refused to write the MSG line, for example because it
+    // was too long: the server never saw it.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (queued, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("hello"))
+        .unwrap();
+    h.absorb(out);
+    let (r, _) = h.expect_msg("hello");
+    let out = h
+        .engine
+        .handle_reply(
+            r,
+            Reply {
+                lines: Vec::new(),
+                outcome: Outcome::NotSent,
+            },
+        )
+        .unwrap();
+    h.absorb(out);
+    assert_eq!(
+        h.store.outbox_item(queued).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::Invalid)
+    );
+    // Nor is it sent again on the next connection.
+    let r = h.reconnect();
+    h.reply(r, &["CONV #general k1 3 0"], "OK");
+    h.idle();
+}
+
+#[test]
 fn no_resending_after_a_day() {
     let mut h = H::new(ALICE);
     h.joined("k1", 3);

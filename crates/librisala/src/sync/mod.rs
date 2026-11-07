@@ -192,6 +192,9 @@ pub enum Outcome {
     /// The final line could not be parsed, which counts as a general
     /// failure (2.3).
     Failed,
+    /// The command could not be written to the connection, for example
+    /// because the line would be too long, so the server never saw it.
+    NotSent,
 }
 
 /// The result of a command the UI asked for (JOIN, PART, INFO, READ).

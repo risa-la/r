@@ -65,6 +65,9 @@ pub enum FailReason {
     /// and an identity's only for 24 hours (7.6). It may or may not have
     /// been sent.
     Unconfirmed,
+    /// It could not be written as a line, for example because it is too
+    /// long, so it was never sent.
+    Invalid,
 }
 
 impl fmt::Display for FailReason {
@@ -73,6 +76,7 @@ impl fmt::Display for FailReason {
             FailReason::RoomChanged => f.write_str("room-changed"),
             FailReason::Dropped => f.write_str("dropped"),
             FailReason::Unconfirmed => f.write_str("unconfirmed"),
+            FailReason::Invalid => f.write_str("invalid"),
             FailReason::Rejected(code) => write!(f, "rejected {code}"),
         }
     }
@@ -84,6 +88,7 @@ impl FailReason {
             "room-changed" => FailReason::RoomChanged,
             "dropped" => FailReason::Dropped,
             "unconfirmed" => FailReason::Unconfirmed,
+            "invalid" => FailReason::Invalid,
             _ => match s.strip_prefix("rejected ") {
                 Some(code) => FailReason::Rejected(parse(code, "error code")?),
                 None => return Err(StoreError::Corrupt(format!("bad outbox error {s:?}"))),

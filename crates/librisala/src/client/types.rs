@@ -719,11 +719,13 @@ impl From<OutboxItem> for OutboxEntry {
                     FailReason::Dropped => FailKind::Dropped,
                     FailReason::Unconfirmed => FailKind::Unconfirmed,
                     FailReason::Rejected(_) => FailKind::Rejected,
+                    FailReason::Invalid => FailKind::Invalid,
                 },
                 reason: match &why {
                     FailReason::RoomChanged => "the room was replaced by a new one".to_owned(),
                     FailReason::Dropped => "the room was dropped".to_owned(),
                     FailReason::Unconfirmed => "possibly not sent".to_owned(),
+                    FailReason::Invalid => "it could not be sent as it is".to_owned(),
                     FailReason::Rejected(code) => format!("refused: {code}"),
                 },
                 maybe_sent: why == FailReason::Unconfirmed,

@@ -419,6 +419,7 @@ fn errors_carry_kinds_to_localize() {
         (FailReason::RoomChanged, FailKind::RoomChanged, false),
         (FailReason::Dropped, FailKind::Dropped, false),
         (FailReason::Unconfirmed, FailKind::Unconfirmed, true),
+        (FailReason::Invalid, FailKind::Invalid, false),
         (
             FailReason::Rejected(risala_proto::error::ErrorCode::Forbidden),
             FailKind::Rejected,
