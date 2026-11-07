@@ -359,12 +359,23 @@ fn explain<T>(e: ClientError) -> Res<T> {
                         .to_owned()
                 }
                 RefusedKind::Guest => "a guest has no keys and nothing to delete".to_owned(),
+                RefusedKind::NotRegistered => {
+                    "the server did not register the identity; this device's key for it is \
+                     kept in the keys directory"
+                        .to_owned()
+                }
                 _ => message.clone(),
             };
             match retry_after_secs {
                 Some(secs) => fail_with(ACT, format!("{why}; try again in {secs} seconds")),
                 None => fail_with(ACT, why),
             }
+        }
+        ClientError::Unconfirmed { uid, message } => {
+            eprintln!("risala: {message}.");
+            eprintln!("Check later by signing in, or run the command again:");
+            eprintln!("    risala login <server> {uid}");
+            Err(Failed(FAILED))
         }
         _ => fail_with(exit_code(&e), e),
     }
