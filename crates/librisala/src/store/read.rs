@@ -7,6 +7,7 @@ use risala_proto::types::{Role, RoomSetting};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::events::stored_event;
+use super::people::HIDDEN;
 use super::{AccountId, ConvId, Store, StoreError, opt_id, parse, seq, sql};
 
 /// A conversation, for the conversation list.
@@ -100,16 +101,23 @@ pub struct Member {
     pub banned: bool,
 }
 
-const SUMMARY: &str = "
-    SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
-        (SELECT COUNT(*) FROM events e
-         WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
-             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0)
-        + MAX(0, c.head - MAX(c.read, c.sync_point)
-            - (SELECT COUNT(*) FROM events e
-               WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point) AND e.seq <= c.head)),
-        (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
-    FROM convs c JOIN accounts a ON a.id = c.account";
+/// The summary query, up to its WHERE. Hidden messages (5.7) are not
+/// unread.
+fn summary_sql() -> String {
+    format!(
+        "SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
+            (SELECT COUNT(*) FROM events e
+             WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
+                 AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0
+                 AND NOT {HIDDEN})
+            + MAX(0, c.head - MAX(c.read, c.sync_point)
+                - (SELECT COUNT(*) FROM events e
+                   WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point)
+                       AND e.seq <= c.head)),
+            (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
+        FROM convs c JOIN accounts a ON a.id = c.account"
+    )
+}
 
 type RawSummary = (
     (i64, i64, String, Option<String>, bool),
@@ -154,7 +162,7 @@ fn summaries_ordered(
     tail: &str,
     args: impl rusqlite::Params,
 ) -> Result<Vec<ConversationSummary>, StoreError> {
-    let mut stmt = conn.prepare_cached(&format!("{SUMMARY} WHERE {tail}"))?;
+    let mut stmt = conn.prepare_cached(&format!("{} WHERE {tail}", summary_sql()))?;
     let rows = stmt.query_map(args, raw_summary)?;
     let mut out = Vec::new();
     for raw in rows {
@@ -213,8 +221,11 @@ const ITEM: &str = "
     SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq, e.own
     FROM events e LEFT JOIN message_state m ON m.conv = e.conv AND m.seq = e.seq";
 
-/// Timeline items only: no DELETE, edit or reaction.
-const IS_ITEM: &str = "e.verb != 'DELETE' AND (e.rel IS NULL OR e.rel = 'reply')";
+/// Timeline items only: no DELETE, edit or reaction. Messages hidden
+/// because their author is blocked (5.7) are left out too.
+fn is_item() -> String {
+    format!("e.verb != 'DELETE' AND (e.rel IS NULL OR e.rel = 'reply') AND NOT {HIDDEN}")
+}
 
 fn raw_timeline(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
     Ok((
@@ -354,8 +365,9 @@ impl Store {
     ) -> Result<Vec<TimelineItem>, StoreError> {
         self.read(|conn| {
             let mut stmt = conn.prepare_cached(&format!(
-                "{ITEM} WHERE e.conv = ?1 AND e.seq < ?2 AND {IS_ITEM}
-                 ORDER BY e.seq DESC LIMIT ?3"
+                "{ITEM} WHERE e.conv = ?1 AND e.seq < ?2 AND {}
+                 ORDER BY e.seq DESC LIMIT ?3",
+                is_item()
             ))?;
             let before = before.map_or(i64::MAX, |s| sql(s.get()));
             let raws: Vec<RawItem> = stmt
@@ -377,7 +389,7 @@ impl Store {
         self.read(|conn| {
             let raw = conn
                 .query_row(
-                    &format!("{ITEM} WHERE e.conv = ?1 AND e.seq = ?2 AND {IS_ITEM}"),
+                    &format!("{ITEM} WHERE e.conv = ?1 AND e.seq = ?2 AND {}", is_item()),
                     params![conv.0, sql(seq.get())],
                     raw_timeline,
                 )

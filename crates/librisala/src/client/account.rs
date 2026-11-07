@@ -1,16 +1,16 @@
 //! [`Account`] and [`Conversation`] handles, and the commands they send to
 //! the account's task.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use risala_proto::command::{Command, Request, RoomPage};
-use risala_proto::names::{Conv, Room, Seq, Uid};
-use risala_proto::server::ServerLine;
+use risala_proto::names::{BlockTarget, Conv, Room, Seq, Uid};
+use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::{escape, unescape};
-use risala_proto::types::Relation;
+use risala_proto::types::{Presence as WirePresence, Relation};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use super::driver;
@@ -19,6 +19,7 @@ use super::types::{
     AccountEvent, ClientError, ConnectionState, ConversationInfo, ConversationPage, Message,
     MessagePage, OutboxEntry, RoomList, RoomListing, page_size,
 };
+use super::typing::Typists;
 use super::{Client, ClientOptions, blocking};
 use crate::addr::ServerAddr;
 use crate::conn::Session;
@@ -62,6 +63,10 @@ pub(crate) struct AccountShared {
     pub session: Mutex<Option<Arc<Session>>>,
     /// The client's runtime, where the account's tasks run.
     pub rt: tokio::runtime::Handle,
+    /// Who is typing where (8.1), while connected.
+    pub typing: Mutex<Typists>,
+    /// People's presence as last heard on this connection (8.3).
+    pub presence: Mutex<HashMap<Uid, WirePresence>>,
     next_driver: AtomicU64,
 }
 
@@ -108,10 +113,33 @@ pub(crate) enum Cmd {
         seq: Seq,
         reply: Reply<()>,
     },
+    /// The user is typing, or stopped (8.1). Nothing to answer.
+    Typing {
+        conv: Conv,
+        active: bool,
+    },
+    /// A command about people (5.7, 8.2, 8.3), answered with its response
+    /// lines once it succeeds.
+    People {
+        op: PeopleOp,
+        reply: Reply<Vec<ServerMessage>>,
+    },
     Reconnect,
     Stop {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// A command about people, sent through the sync engine so that its reply
+/// is handled in order with the lines around it.
+#[derive(Debug, Clone)]
+pub(crate) enum PeopleOp {
+    Name(String),
+    Members(Room),
+    Whois(Uid),
+    Block(BlockTarget),
+    Unblock(BlockTarget),
+    Blocks,
 }
 
 impl AccountShared {
@@ -135,6 +163,8 @@ impl AccountShared {
             driver: Mutex::new(None),
             session: Mutex::new(None),
             rt,
+            typing: Mutex::new(Typists::default()),
+            presence: Mutex::new(HashMap::new()),
             next_driver: AtomicU64::new(1),
         })
     }
@@ -184,7 +214,7 @@ impl AccountShared {
     }
 
     /// Hands a command to the task, or handles it offline if none runs.
-    fn command(self: &Arc<Self>, cmd: Cmd) {
+    pub(crate) fn command(self: &Arc<Self>, cmd: Cmd) {
         let cmd = match self.driver_queue() {
             Some(queue) => match queue.send(cmd) {
                 Ok(()) => return,
@@ -812,7 +842,9 @@ impl Conversation {
     }
 }
 
-async fn wait<T>(rx: oneshot::Receiver<Result<T, ClientError>>) -> Result<T, ClientError> {
+pub(crate) async fn wait<T>(
+    rx: oneshot::Receiver<Result<T, ClientError>>,
+) -> Result<T, ClientError> {
     rx.await.unwrap_or(Err(ClientError::NotConnected))
 }
 

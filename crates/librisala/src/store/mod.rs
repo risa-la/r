@@ -26,6 +26,7 @@
 
 mod events;
 mod outbox;
+mod people;
 mod read;
 mod schema;
 mod trust;
@@ -151,6 +152,26 @@ pub enum Change {
     Outbox {
         /// The entry.
         id: OutboxId,
+    },
+    /// Someone's display name was learned or changed (8.2). Read it with
+    /// [`Store::user_name`].
+    User {
+        /// The account that learned it.
+        account: AccountId,
+        /// Whose name it is.
+        uid: Uid,
+    },
+    /// A room's members or roles changed, from its events or from MEMBERS
+    /// (6.1, 6.3, 8.3). Read them with [`Store::room_members`].
+    Members {
+        /// The conversation.
+        conv: ConvId,
+    },
+    /// The account's blocks changed, or whether it hides blocked people
+    /// (5.7). Rooms' timelines and unread counts may change with them.
+    Blocks {
+        /// The account.
+        account: AccountId,
     },
 }
 

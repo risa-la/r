@@ -23,7 +23,17 @@
 //! - The UI asks for work with [`SyncEngine::send`],
 //!   [`SyncEngine::join`], [`SyncEngine::part`], [`SyncEngine::mark_read`],
 //!   [`SyncEngine::load_older`], [`SyncEngine::fetch`] and
-//!   [`SyncEngine::download`].
+//!   [`SyncEngine::download`]; and about people with
+//!   [`SyncEngine::typing`], [`SyncEngine::set_name`],
+//!   [`SyncEngine::members`], [`SyncEngine::whois`], [`SyncEngine::block`],
+//!   [`SyncEngine::unblock`] and [`SyncEngine::blocks`].
+//!
+//! # People
+//!
+//! Display names (8.2), room members (8.3) and blocks (5.7) are stored.
+//! Typing (8.1) and presence (8.3) are true only while connected, so they
+//! are not: the engine reports them as [`Signal`]s, and the caller keeps
+//! them in memory.
 //! - If a call fails with a store error, drop the connection and the
 //!   engine, and start again after reconnecting.
 //!
@@ -67,10 +77,11 @@ use risala_proto::command::Command;
 use risala_proto::names::{Conv, Room, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
+use risala_proto::types::Presence;
 
 use crate::store::{Change, StoreError};
 
-pub use engine::SyncEngine;
+pub use engine::{SyncEngine, TYPING_REPEAT};
 
 /// Settings for a [`SyncEngine`].
 #[derive(Clone)]
@@ -93,6 +104,10 @@ pub struct SyncConfig {
     pub claim_lease: Duration,
     /// Where the time comes from.
     pub clock: Clock,
+    /// For an identity, ask BLOCKS on each connection (5.7), so that
+    /// blocks made on the account's other devices are known. On by
+    /// default.
+    pub fetch_blocks: bool,
 }
 
 impl Default for SyncConfig {
@@ -103,6 +118,7 @@ impl Default for SyncConfig {
             resend_window: Duration::from_secs(23 * 3600),
             claim_lease: Duration::from_secs(300),
             clock: Clock::system(),
+            fetch_blocks: true,
         }
     }
 }
@@ -114,6 +130,7 @@ impl fmt::Debug for SyncConfig {
             .field("lazy_gap", &self.lazy_gap)
             .field("resend_window", &self.resend_window)
             .field("claim_lease", &self.claim_lease)
+            .field("fetch_blocks", &self.fetch_blocks)
             .finish_non_exhaustive()
     }
 }
@@ -198,7 +215,8 @@ pub enum Outcome {
     NotSent,
 }
 
-/// The result of a command the UI asked for (JOIN, PART, INFO, READ).
+/// The result of a command the UI asked for (JOIN, PART, INFO, READ, NAME,
+/// MEMBERS, WHOIS, BLOCK, UNBLOCK, BLOCKS).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completed {
     /// The request, as returned in [`Output::send`].
@@ -251,6 +269,34 @@ pub enum Notification {
     },
 }
 
+/// Something about people that the engine does not store, because it is
+/// only true while connected: typing and presence (8.1, 8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signal {
+    /// Someone is typing in a conversation (8.1). It lasts 6 seconds,
+    /// unless repeated.
+    Typing {
+        /// The conversation.
+        conv: Conv,
+        /// Who.
+        from: Uid,
+    },
+    /// Someone else's message arrived live, which ends their typing (8.1).
+    Spoke {
+        /// The conversation.
+        conv: Conv,
+        /// Who.
+        from: Uid,
+    },
+    /// A user's presence, from PRESENCE, MEMBER or USER (8.3).
+    Presence {
+        /// The user.
+        uid: Uid,
+        /// Their presence, as the server said it.
+        presence: Presence,
+    },
+}
+
 /// What a call to the engine produced.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Output {
@@ -265,6 +311,8 @@ pub struct Output {
     /// The server asked to wait before sending more messages
     /// (`rate-limited`). Call [`SyncEngine::resume_outbox`] after this long.
     pub retry_after: Option<Duration>,
+    /// Typing and presence, in the order they arrived.
+    pub signals: Vec<Signal>,
 }
 
 impl Output {

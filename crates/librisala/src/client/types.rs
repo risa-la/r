@@ -1094,6 +1094,90 @@ pub enum AccountEvent {
     /// Read again whatever is shown: the conversation list and the outbox.
     /// [`Timeline`](super::Timeline)s reset themselves.
     CacheChanged,
+    /// Who is typing in a conversation changed (8.1): someone started,
+    /// their notice ran out after 6 seconds, their message arrived, or the
+    /// connection closed. `uids` is everyone typing there now, in the order
+    /// they started; empty when nobody is.
+    Typing {
+        /// The conversation.
+        conversation: String,
+        /// Who is typing, not counting the account itself.
+        uids: Vec<String>,
+    },
+    /// Someone's display name or presence changed (8.2, 8.3).
+    UserChanged {
+        /// What is known about them now.
+        user: UserInfo,
+    },
+    /// The connection closed, so nobody's presence is known any more (8.3).
+    /// Show everyone as [`Presence::NotKnown`] until it is learned again,
+    /// from [`Conversation::members`](super::Conversation::members),
+    /// [`Account::whois`](super::Account::whois) or PRESENCE lines.
+    PresenceLost,
+    /// A room's members or their roles changed (6.1, 6.3, 8.3). Read them
+    /// again with [`Conversation::cached_members`](super::Conversation::cached_members).
+    MembersChanged {
+        /// The room.
+        conversation: String,
+    },
+    /// The account's blocks changed, or whether it hides blocked people
+    /// (5.7). While it hides them, rooms' messages and unread counts may
+    /// change: [`Timeline`](super::Timeline)s reset themselves, and the
+    /// app reads its conversation list again.
+    BlocksChanged,
+}
+
+/// Whether someone is connected (8.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Presence {
+    /// They have at least one open connection. A presence value this
+    /// library does not know also counts as online (8.3).
+    Online,
+    /// They have no open connection.
+    Offline,
+    /// Not known: the account has not learned it on this connection, or
+    /// is not connected.
+    NotKnown,
+}
+
+impl Presence {
+    pub(crate) fn of(p: Option<&risala_proto::types::Presence>) -> Presence {
+        match p {
+            None => Presence::NotKnown,
+            Some(p) if p.shows_online() => Presence::Online,
+            Some(_) => Presence::Offline,
+        }
+    }
+}
+
+/// What the account knows about a user (8.2, 8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInfo {
+    /// Their uid.
+    pub uid: String,
+    /// Their display name, unescaped. `None` if they have none, or it is
+    /// not known. Anyone can call themselves anything, so show it with
+    /// care: see [`Conversation::labels`](super::Conversation::labels).
+    pub display_name: Option<String>,
+    /// Whether they are connected.
+    pub presence: Presence,
+}
+
+/// A member of a room (8.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberInfo {
+    /// Their uid.
+    pub uid: String,
+    /// Their role (6.3): `owner`, `mod` or `member`.
+    pub role: String,
+    /// Their display name, unescaped; `None` if none or not known.
+    pub display_name: Option<String>,
+    /// What to show for them: their display name, with the uid added when
+    /// another member has the same name (8.2), or the uid alone. See
+    /// [`Conversation::labels`](super::Conversation::labels).
+    pub label: String,
+    /// Whether they are connected.
+    pub presence: Presence,
 }
 
 /// Whether an error code means the room cannot be joined again as it is.

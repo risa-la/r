@@ -82,13 +82,16 @@ fn auth_line(r: u32) -> String {
     format!("@ref={r} AUTH {ALICE} {SIGNATURE}")
 }
 
-/// Greets, expects alice's AUTH and accepts it, then answers SYNC.
+/// Greets, expects alice's AUTH and accepts it, then answers SYNC and
+/// BLOCKS (5.7), which an identity asks on each connection.
 async fn signed_in(peer: &mut Peer) {
     greet(peer).await;
     peer.expect(&auth_line(1)).await;
     peer.send(&format!("@ref=1 OK uid={ALICE}")).await;
     peer.expect("@ref=2 SYNC").await;
+    peer.expect("@ref=3 BLOCKS").await;
     peer.send("@ref=2 OK").await;
+    peer.send("@ref=3 OK").await;
 }
 
 /// Answers QUIT and closes, as a server does (11).
@@ -396,18 +399,18 @@ async fn hosted_keys() {
         let other = other_b64.clone();
         async move {
             signed_in(&mut peer).await;
-            peer.expect("@ref=3 KEY LIST").await;
+            peer.expect("@ref=4 KEY LIST").await;
             peer.send(&format!(
-                "@ref=3 KEY {PUBLIC} laptop\n@ref=3 KEY {other}\n@ref=3 OK"
+                "@ref=4 KEY {PUBLIC} laptop\n@ref=4 KEY {other}\n@ref=4 OK"
             ))
             .await;
-            peer.expect(&format!("@ref=4 KEY ADD {other} new phone"))
+            peer.expect(&format!("@ref=5 KEY ADD {other} new phone"))
                 .await;
-            peer.send("@ref=4 OK").await;
-            peer.expect(&format!("@ref=5 KEY DEL {PUBLIC}")).await;
-            peer.send("@ref=5 ERR forbidden that is the last key").await;
-            peer.expect("@ref=6 KEY LIST").await;
-            peer.send("@ref=6 ERR not-supported").await;
+            peer.send("@ref=5 OK").await;
+            peer.expect(&format!("@ref=6 KEY DEL {PUBLIC}")).await;
+            peer.send("@ref=6 ERR forbidden that is the last key").await;
+            peer.expect("@ref=7 KEY LIST").await;
+            peer.send("@ref=7 ERR not-supported").await;
             quit(peer).await;
         }
     })

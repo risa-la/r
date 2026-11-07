@@ -131,8 +131,10 @@
 mod account;
 mod driver;
 mod identity;
+mod people;
 mod timeline;
 pub mod types;
+mod typing;
 
 #[cfg(test)]
 mod identity_tests;
@@ -156,8 +158,9 @@ pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
     ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind, FailKind, KeyErrorKind,
-    KeyInfo, MAX_PAGE, Message, MessagePage, Notice, OutboxEntry, OutboxStatus, ReactionCount,
-    RefusedKind, RoomList, RoomListing, ServerHello, Setting, TrustInfo, Unregistered,
+    KeyInfo, MAX_PAGE, MemberInfo, Message, MessagePage, Notice, OutboxEntry, OutboxStatus,
+    Presence, ReactionCount, RefusedKind, RoomList, RoomListing, ServerHello, Setting, TrustInfo,
+    Unregistered, UserInfo,
 };
 
 use account::AccountShared;

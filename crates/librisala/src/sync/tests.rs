@@ -84,6 +84,8 @@ impl H {
             clock: Clock::new(move || {
                 Timestamp::from_unix_millis(c.load(Ordering::SeqCst)).unwrap()
             }),
+            // Tested on its own, in `blocks`.
+            fetch_blocks: false,
             ..SyncConfig::default()
         };
         let engine = SyncEngine::new(store.clone(), account, config.clone()).unwrap();

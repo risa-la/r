@@ -6,13 +6,14 @@ use std::time::Duration;
 
 use risala_proto::command::{Command, Request};
 use risala_proto::error::ErrorCode;
-use risala_proto::names::{Conv, Id, Room, Seq, Uid};
+use risala_proto::names::{BlockTarget, Conv, Id, Room, Seq, Uid};
 use risala_proto::server::{Event, EventBody, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
+use risala_proto::types::Relation;
 use tracing::{debug, warn};
 
 use super::{
-    Completed, Notification, Outcome, Outgoing, Output, Reply, ReqId, SyncConfig, SyncError,
+    Completed, Notification, Outcome, Outgoing, Output, Reply, ReqId, Signal, SyncConfig, SyncError,
 };
 use crate::store::{
     AccountId, Claim, ConvId, ConvRow, Draft, FailReason, OutboxId, OutboxState, Store, StoreError,
@@ -22,6 +23,10 @@ use crate::store::{
 /// After this many failed HISTORY or RELATED requests for one
 /// conversation, the engine stops trying on this connection.
 const MAX_FAILURES: u32 = 3;
+
+/// How often TYPING is repeated while the user types (8.1). A notice lasts
+/// 6 seconds.
+pub const TYPING_REPEAT: Duration = Duration::from_secs(4);
 
 /// What this connection knows about one conversation, by name. Everything
 /// lasting is in the store.
@@ -117,6 +122,23 @@ enum Pending {
     Msg {
         outbox: OutboxId,
     },
+    Typing,
+    Name {
+        /// The display name set, escaped.
+        name: String,
+    },
+    Members {
+        room: Room,
+        /// The stored room, its epoch and the newest seq known when MEMBERS
+        /// was sent, to record the list against (8.3).
+        roster: Option<(ConvId, i64, u64)>,
+    },
+    Whois,
+    Block {
+        target: BlockTarget,
+        on: bool,
+    },
+    Blocks,
     History {
         conv: Conv,
         row: ConvId,
@@ -183,6 +205,8 @@ pub struct SyncEngine {
     claim: Claim,
     /// Counts the lines and replies handled, to order them.
     ticks: u64,
+    /// When TYPING was last sent for each conversation (8.1).
+    typing_sent: HashMap<Conv, Timestamp>,
     out: Output,
 }
 
@@ -222,6 +246,7 @@ impl SyncEngine {
             want_sync: false,
             sending: HashSet::new(),
             ticks: 0,
+            typing_sent: HashMap::new(),
             out: Output::default(),
         }
     }
@@ -258,9 +283,13 @@ impl SyncEngine {
     }
 
     /// Starts syncing: sends SYNC (7.1 step 1), and settles outbox entries
-    /// left from the previous connection.
+    /// left from the previous connection. An identity also asks BLOCKS
+    /// (5.7), unless [`SyncConfig::fetch_blocks`] is off.
     pub fn start(&mut self) -> Result<Output, SyncError> {
         self.request_sync();
+        if !self.guest && self.config.fetch_blocks {
+            self.issue(Command::Blocks, Pending::Blocks);
+        }
         self.flush_outbox()?;
         Ok(self.finish())
     }
@@ -276,6 +305,7 @@ impl SyncEngine {
         }
         match &msg.line {
             ServerLine::Event(event) if event.meta.is_some() => self.on_event(event)?,
+            // Another device of the account read up to here (7.4).
             ServerLine::Read { conv, seq } => {
                 let (account, conv, seq) = (self.account, conv.clone(), seq.get());
                 self.write(|tx| {
@@ -284,6 +314,24 @@ impl SyncEngine {
                     }
                     Ok(())
                 })?;
+            }
+            ServerLine::Typing { from, conv } if *from != self.me => {
+                self.out.signals.push(Signal::Typing {
+                    conv: conv.clone(),
+                    from: from.clone(),
+                });
+            }
+            ServerLine::Name { from, name } => {
+                let account = self.account;
+                self.write(|tx| tx.set_user_name(account, from, name))?;
+            }
+            ServerLine::Presence { presence, uids } => {
+                for uid in uids {
+                    self.out.signals.push(Signal::Presence {
+                        uid: uid.clone(),
+                        presence: presence.clone(),
+                    });
+                }
             }
             ServerLine::Drop { id, room, reason } => self.on_drop(Some(id), room, reason)?,
             _ => {}
@@ -309,8 +357,13 @@ impl SyncEngine {
             Pending::Info { room, sent, floor } => {
                 self.on_info(req, &room, (sent, floor), reply)?
             }
-            Pending::Read => self.completed(req, reply.outcome),
+            Pending::Read | Pending::Typing => self.completed(req, reply.outcome),
             Pending::Msg { outbox } => self.on_msg(outbox, reply)?,
+            Pending::Name { name } => self.on_name(req, &name, reply)?,
+            Pending::Members { room, roster } => self.on_members(req, &room, roster, reply)?,
+            Pending::Whois => self.on_whois(req, reply)?,
+            Pending::Block { target, on } => self.on_block(req, &target, on, reply)?,
+            Pending::Blocks => self.on_blocks(req, reply)?,
             Pending::History {
                 conv,
                 row,
@@ -402,6 +455,8 @@ impl SyncEngine {
                 .map(Some)
         })?;
         let id = id.ok_or_else(|| SyncError::NotJoined(conv.clone()))?;
+        // A message ends typing (8.1): the next keystroke says so again.
+        self.typing_sent.remove(conv);
         self.flush_outbox()?;
         Ok((id, self.finish()))
     }
@@ -414,21 +469,130 @@ impl SyncEngine {
     }
 
     /// Moves the read marker forward (7.4), in the store and, for an
-    /// identity, on the server.
+    /// identity, on the server. A marker beyond the newest seq known stops
+    /// there, as the server's stops at the head. Guests have no markers on
+    /// the server (7.4), so for a guest it moves only in the store.
     pub fn mark_read(&mut self, conv: &Conv, seq: Seq) -> Result<Output, SyncError> {
         let account = self.account;
         let moved = self.write(|tx| match tx.conv_by_name(account, conv)? {
-            Some(mut row) => tx.set_read(&mut row, seq.get()),
-            None => Ok(false),
+            Some(mut row) => Ok(tx.mark_read(&mut row, seq.get())?.then_some(row.read)),
+            None => Ok(None),
         })?;
-        if moved && !self.guest {
+        if let Some(read) = moved.and_then(Seq::new)
+            && !self.guest
+        {
             let command = Command::Read {
                 conv: conv.clone(),
-                seq,
+                seq: read,
             };
             self.issue(command, Pending::Read);
         }
         Ok(self.finish())
+    }
+
+    /// Says that the user is typing in `conv` (8.1). Call it as the user
+    /// types: TYPING goes out at once, then at most every
+    /// [`TYPING_REPEAT`] while the calls go on. Nothing is sent for a
+    /// conversation that is not live on this connection. Sending a
+    /// message, or [`stop_typing`](Self::stop_typing), ends it.
+    pub fn typing(&mut self, conv: &Conv) -> Output {
+        let now = self.now();
+        let recent = self
+            .typing_sent
+            .get(conv)
+            .is_some_and(|at| now.saturating_duration_since(*at) < TYPING_REPEAT);
+        if !recent && self.is_live(conv) {
+            self.typing_sent.insert(conv.clone(), now);
+            self.issue(Command::Typing { conv: conv.clone() }, Pending::Typing);
+        }
+        self.finish()
+    }
+
+    /// Says that the user stopped typing in `conv`, for example by
+    /// clearing what they wrote. Nothing is sent: the others' notice runs
+    /// out (8.1). The next [`typing`](Self::typing) sends at once.
+    pub fn stop_typing(&mut self, conv: &Conv) {
+        self.typing_sent.remove(conv);
+    }
+
+    /// Sets the account's display name, escaped, or clears it if empty
+    /// (8.2). Once the server accepts it, it is stored as the account's
+    /// own name.
+    pub fn set_name(&mut self, name: &str) -> Output {
+        let command = Command::Name {
+            display_name: name.to_owned(),
+        };
+        self.issue(
+            command,
+            Pending::Name {
+                name: name.to_owned(),
+            },
+        );
+        self.finish()
+    }
+
+    /// Asks for a room's members (8.3). Their names are stored, and for a
+    /// room in the store, who is in it and their roles. Their presence
+    /// comes as [`Signal::Presence`].
+    pub fn members(&mut self, room: &Room) -> Result<Output, SyncError> {
+        let account = self.account;
+        let conv = Conv::Room(room.clone());
+        let roster = self.write(|tx| match tx.conv_by_name(account, &conv)? {
+            Some(row) => {
+                let at = row.head.max(tx.max_seq(row.id)?);
+                Ok(Some((row.id, row.epoch, at)))
+            }
+            None => Ok(None),
+        })?;
+        let command = Command::Members { room: room.clone() };
+        self.issue(
+            command,
+            Pending::Members {
+                room: room.clone(),
+                roster,
+            },
+        );
+        Ok(self.finish())
+    }
+
+    /// Asks about a user (8.3). Their name is stored; their presence comes
+    /// as [`Signal::Presence`].
+    pub fn whois(&mut self, uid: &Uid) -> Output {
+        self.issue(Command::Whois { uid: uid.clone() }, Pending::Whois);
+        self.finish()
+    }
+
+    /// Blocks an identity or a domain (5.7). Stored once the server
+    /// accepts it.
+    pub fn block(&mut self, target: &BlockTarget) -> Output {
+        let command = Command::Block {
+            target: target.clone(),
+        };
+        let pending = Pending::Block {
+            target: target.clone(),
+            on: true,
+        };
+        self.issue(command, pending);
+        self.finish()
+    }
+
+    /// Removes a block (5.7). Stored once the server accepts it.
+    pub fn unblock(&mut self, target: &BlockTarget) -> Output {
+        let command = Command::Unblock {
+            target: target.clone(),
+        };
+        let pending = Pending::Block {
+            target: target.clone(),
+            on: false,
+        };
+        self.issue(command, pending);
+        self.finish()
+    }
+
+    /// Asks for the account's blocks (5.7), which replace the stored ones.
+    pub fn blocks(&mut self) -> Output {
+        self.issue(Command::Blocks, Pending::Blocks);
+        self.finish()
     }
 
     /// Loads the page of history just below the newest stored run, while
@@ -631,6 +795,17 @@ impl SyncEngine {
         let now = self.ticks;
         self.live(&conv).event_at = now;
 
+        // 8.1: a message ends its author's typing.
+        if let EventBody::Msg(m) = &event.body
+            && matches!(m.relation, None | Some(Relation::Reply(_)))
+            && meta.from != self.me
+        {
+            self.out.signals.push(Signal::Spoke {
+                conv: conv.clone(),
+                from: meta.from.clone(),
+            });
+        }
+
         // 6.4: notifications, not history.
         match &event.body {
             EventBody::Invite { room, uid } if *uid == self.me => {
@@ -830,8 +1005,11 @@ impl SyncEngine {
             self.want_sync = true;
         }
         let account = self.account;
+        let guest = self.guest;
         let mut listed = Vec::new();
         let mut heads = HashMap::new();
+        // Read markers moved here while the server did not hear (7.4).
+        let mut unsent_reads = Vec::new();
         for msg in &reply.lines {
             if let ServerLine::Conv {
                 conv,
@@ -846,16 +1024,23 @@ impl SyncEngine {
                     continue;
                 }
                 let floor = self.head_floor(conv, sent, floors.get(conv).copied());
-                self.write(|tx| {
+                let local = self.write(|tx| {
                     let mut row = tx.conv_or_create(account, conv)?;
                     // 7.1 step 2, and the head check.
                     learn(tx, &mut row, id, Some(head.get()), floor)?;
                     tx.set_joined(&mut row, true)?;
+                    // 7.4: the account's marker, from its other devices.
                     if let Some(read) = read {
                         tx.set_read(&mut row, read.get())?;
                     }
-                    Ok(())
+                    Ok(row.read)
                 })?;
+                if !guest
+                    && local > read.map_or(0, Seq::get)
+                    && let Some(local) = Seq::new(local)
+                {
+                    unsent_reads.push((conv.clone(), local));
+                }
                 self.confirm(conv, id.clone());
             }
         }
@@ -887,12 +1072,124 @@ impl SyncEngine {
                 self.want_sync = true;
             }
         }
+        for (conv, seq) in unsent_reads {
+            self.issue(Command::Read { conv, seq }, Pending::Read);
+        }
         for conv in &listed {
             if !newer.contains(conv) {
                 self.check_fill(conv)?;
             }
         }
         self.flush_outbox()
+    }
+
+    fn on_name(&mut self, req: ReqId, name: &str, reply: Reply) -> Result<(), SyncError> {
+        if matches!(reply.outcome, Outcome::Ok(_)) {
+            let (account, me) = (self.account, self.me.clone());
+            self.write(|tx| tx.set_user_name(account, &me, name))?;
+        }
+        self.completed(req, reply.outcome);
+        Ok(())
+    }
+
+    fn on_members(
+        &mut self,
+        req: ReqId,
+        room: &Room,
+        roster: Option<(ConvId, i64, u64)>,
+        reply: Reply,
+    ) -> Result<(), SyncError> {
+        if matches!(reply.outcome, Outcome::Ok(_)) {
+            let mut members = Vec::new();
+            for msg in &reply.lines {
+                if let ServerLine::Member {
+                    room: r,
+                    uid,
+                    role,
+                    presence,
+                    name,
+                } = &msg.line
+                    && r == room
+                {
+                    members.push((uid.clone(), *role, name.clone()));
+                    self.out.signals.push(Signal::Presence {
+                        uid: uid.clone(),
+                        presence: presence.clone(),
+                    });
+                }
+            }
+            let account = self.account;
+            self.write(|tx| {
+                for (uid, _, name) in &members {
+                    tx.set_user_name(account, uid, name)?;
+                }
+                // Only for the room it was asked for: not one dropped and
+                // created again since (7.1).
+                if let Some((row, epoch, at)) = roster
+                    && tx.conv(row)?.is_some_and(|r| r.epoch == epoch)
+                {
+                    let list: Vec<_> = members.iter().map(|(u, r, _)| (u.clone(), *r)).collect();
+                    tx.set_roster(row, at, &list)?;
+                }
+                Ok(())
+            })?;
+        }
+        self.completed(req, reply.outcome);
+        Ok(())
+    }
+
+    fn on_whois(&mut self, req: ReqId, reply: Reply) -> Result<(), SyncError> {
+        if matches!(reply.outcome, Outcome::Ok(_)) {
+            let account = self.account;
+            for msg in &reply.lines {
+                if let ServerLine::User {
+                    uid,
+                    presence,
+                    name,
+                } = &msg.line
+                {
+                    self.write(|tx| tx.set_user_name(account, uid, name))?;
+                    self.out.signals.push(Signal::Presence {
+                        uid: uid.clone(),
+                        presence: presence.clone(),
+                    });
+                }
+            }
+        }
+        self.completed(req, reply.outcome);
+        Ok(())
+    }
+
+    fn on_block(
+        &mut self,
+        req: ReqId,
+        target: &BlockTarget,
+        on: bool,
+        reply: Reply,
+    ) -> Result<(), SyncError> {
+        if matches!(reply.outcome, Outcome::Ok(_)) {
+            let account = self.account;
+            self.write(|tx| tx.set_block(account, target, on))?;
+        }
+        self.completed(req, reply.outcome);
+        Ok(())
+    }
+
+    fn on_blocks(&mut self, req: ReqId, reply: Reply) -> Result<(), SyncError> {
+        if matches!(reply.outcome, Outcome::Ok(_)) {
+            let targets: Vec<BlockTarget> = reply
+                .lines
+                .iter()
+                .filter_map(|m| match &m.line {
+                    ServerLine::Block { target } => Some(target.clone()),
+                    _ => None,
+                })
+                .collect();
+            let account = self.account;
+            self.write(|tx| tx.set_blocks(account, &targets))?;
+        }
+        self.completed(req, reply.outcome);
+        Ok(())
     }
 
     fn on_join(

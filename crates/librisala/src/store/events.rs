@@ -238,6 +238,15 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
+    /// Moves the read marker forward to `read` (7.4), but no further than
+    /// the newest seq known: the reported head or the newest stored event,
+    /// as the server would (a value beyond the head sets the marker to the
+    /// head). Returns whether it moved.
+    pub(crate) fn mark_read(&mut self, row: &mut ConvRow, read: u64) -> Result<bool, StoreError> {
+        let known = row.head.max(self.max_seq(row.id)?);
+        self.set_read(row, read.min(known))
+    }
+
     /// Moves the read marker forward (7.4). A lower value is ignored.
     pub(crate) fn set_read(&mut self, row: &mut ConvRow, read: u64) -> Result<bool, StoreError> {
         if read > row.read {
@@ -543,12 +552,19 @@ impl<'a> Tx<'a> {
                     params![conv.0, setting.key(), setting.value(), sql(at)],
                 )?;
             }
-            EventBody::Join { .. } => self.member_field(conv, from, "joined", Some(true), at)?,
-            EventBody::Part { .. } => self.member_field(conv, from, "joined", Some(false), at)?,
+            EventBody::Join { .. } => {
+                self.member_field(conv, from, "joined", Some(true), at)?;
+                self.changed(Change::Members { conv });
+            }
+            EventBody::Part { .. } => {
+                self.member_field(conv, from, "joined", Some(false), at)?;
+                self.changed(Change::Members { conv });
+            }
             EventBody::Kick { uid, .. } => {
                 // KICK and BAN take the role away (6.3).
                 self.member_field(conv, uid.as_str(), "joined", Some(false), at)?;
                 self.member_role(conv, uid.as_str(), "member", at)?;
+                self.changed(Change::Members { conv });
             }
             EventBody::Ban { uid, .. } => {
                 if !from.is_empty() {
@@ -556,12 +572,14 @@ impl<'a> Tx<'a> {
                     self.member_role(conv, uid.as_str(), "member", at)?;
                 }
                 self.member_field(conv, uid.as_str(), "banned", Some(true), at)?;
+                self.changed(Change::Members { conv });
             }
             EventBody::Unban { uid, .. } => {
                 self.member_field(conv, uid.as_str(), "banned", Some(false), at)?;
             }
             EventBody::Role { uid, role, .. } => {
                 self.member_role(conv, uid.as_str(), role.as_str(), at)?;
+                self.changed(Change::Members { conv });
             }
             EventBody::Msg(_)
             | EventBody::Delete { .. }
@@ -573,7 +591,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Sets `joined` or `banned` for a member, unless a later event set it.
-    fn member_field(
+    pub(super) fn member_field(
         &mut self,
         conv: ConvId,
         uid: &str,
@@ -598,7 +616,7 @@ impl<'a> Tx<'a> {
         Ok(())
     }
 
-    fn member_role(
+    pub(super) fn member_role(
         &mut self,
         conv: ConvId,
         uid: &str,

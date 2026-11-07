@@ -15,19 +15,20 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::account::{AccountShared, Batch, Cmd, Synced, check_draft};
+use super::account::{AccountShared, Batch, Cmd, PeopleOp, Synced, check_draft};
 use super::blocking;
+use super::people::user_info;
 use super::types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, DisconnectKind, KeyErrorKind,
-    Notice, OutboxEntry, is_lasting_refusal,
+    Notice, OutboxEntry, Presence, is_lasting_refusal,
 };
 use crate::addr::TrustStore;
 use crate::conn::{
     self, End, GuestSignIn, GuestToken, IdentitySignIn, Incoming, Response, Session, SignIn,
     Supervisor, SupervisorEvent,
 };
-use crate::store::{AccountId, Change, Draft, OutboxId, Store, StoreError};
-use crate::sync::{self, Notification, Outcome, Output, ReqId, SyncEngine, SyncError};
+use crate::store::{Change, Draft, OutboxId, StoreError};
+use crate::sync::{self, Notification, Outcome, Output, ReqId, Signal, SyncEngine, SyncError};
 
 /// The most incoming items handled in one blocking step.
 const BATCH: usize = 256;
@@ -253,6 +254,9 @@ enum Input {
     LoadOlder(Conv),
     Download(Conv),
     Fetch(Conv, Seq),
+    Typing(Conv),
+    StopTyping(Conv),
+    People(PeopleOp),
     Resume,
 }
 
@@ -269,6 +273,16 @@ enum Ctx {
     Part(Reply<()>),
     Send(Reply<OutboxId>),
     Done(Reply<()>),
+    /// A command whose response lines the app waits for.
+    Lines(Reply<Vec<ServerMessage>>),
+}
+
+/// Someone waiting for a command's reply.
+enum Waiter {
+    /// A JOIN (with its room) or a PART the app asked for.
+    Done(Option<Room>, Reply<()>),
+    /// A command whose response lines the app wants.
+    Lines(Reply<Vec<ServerMessage>>),
 }
 
 /// One signed-in connection.
@@ -280,8 +294,10 @@ struct Online<'a> {
     engine: Option<SyncEngine>,
     /// The engine's requests in flight, by the `ref` they were sent with.
     refs: HashMap<Ref, ReqId>,
-    /// JOIN and PART requests the app waits on.
-    waiters: HashMap<ReqId, (Option<Room>, Reply<()>)>,
+    /// Requests the app waits on.
+    waiters: HashMap<ReqId, Waiter>,
+    /// The response lines of requests a [`Waiter::Lines`] waits on.
+    reply_lines: HashMap<ReqId, Vec<ServerMessage>>,
     /// JOINs sent after reconnecting.
     rejoining: HashMap<ReqId, Room>,
     /// Replies the session could not send a command for.
@@ -323,6 +339,7 @@ async fn online(
         engine: Some(engine),
         refs: HashMap::new(),
         waiters: HashMap::new(),
+        reply_lines: HashMap::new(),
         rejoining: HashMap::new(),
         synthetic: Vec::new(),
         resume_at: None,
@@ -330,6 +347,7 @@ async fn online(
     let flow = on.run(&mut incoming, cmds).await;
     *shared.session.lock().expect("poisoned") = None;
     shared.synced.send_modify(|s| s.idle = false);
+    forget_people(shared);
     // Waiters still open get NotConnected when dropped.
     flow
 }
@@ -369,6 +387,14 @@ impl Online<'_> {
                     None => std::future::pending().await,
                 }
             };
+            // When the next typing notice runs out (8.1).
+            let expiry = self.shared.typing.lock().expect("poisoned").next_expiry();
+            let typing_due = async move {
+                match expiry {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
             let inputs = tokio::select! {
                 biased;
                 item = incoming.recv() => {
@@ -396,6 +422,10 @@ impl Online<'_> {
                     self.resume_at = None;
                     vec![(Input::Resume, Ctx::None)]
                 }
+                () = typing_due => {
+                    expire_typing(self.shared);
+                    continue;
+                }
             };
             if let Err(e) = self.feed(inputs).await {
                 warn!(error = %e, "sync failed; reconnecting");
@@ -417,7 +447,12 @@ impl Online<'_> {
                 inputs.push((Input::Line(msg), ctx));
             }
             Incoming::Reply { ref_, response } => match self.refs.remove(&ref_) {
-                Some(req) => inputs.push((Input::Reply(req, to_reply(response)), Ctx::None)),
+                Some(req) => {
+                    if matches!(self.waiters.get(&req), Some(Waiter::Lines(_))) {
+                        self.reply_lines.insert(req, response.lines.clone());
+                    }
+                    inputs.push((Input::Reply(req, to_reply(response)), Ctx::None));
+                }
                 None => debug!(%ref_, "reply to no request of the engine"),
             },
         }
@@ -450,6 +485,12 @@ impl Online<'_> {
             Cmd::LoadOlder { conv, reply } => (Input::LoadOlder(conv), Ctx::Done(reply)),
             Cmd::Download { conv, reply } => (Input::Download(conv), Ctx::Done(reply)),
             Cmd::Fetch { conv, seq, reply } => (Input::Fetch(conv, seq), Ctx::Done(reply)),
+            Cmd::Typing { conv, active: true } => (Input::Typing(conv), Ctx::None),
+            Cmd::Typing {
+                conv,
+                active: false,
+            } => (Input::StopTyping(conv), Ctx::None),
+            Cmd::People { op, reply } => (Input::People(op), Ctx::Lines(reply)),
             Cmd::Reconnect | Cmd::Stop { .. } => return None,
         })
     }
@@ -460,13 +501,12 @@ impl Online<'_> {
         while !inputs.is_empty() {
             let (inputs_only, ctxs): (Vec<Input>, Vec<Ctx>) = inputs.into_iter().unzip();
             let mut engine = self.engine.take().expect("the engine is here");
-            let store = self.shared.store.clone();
-            let account = self.shared.id;
+            let shared = self.shared.clone();
             let (engine, results) = blocking(&self.shared.rt, move || {
                 let mut results = Vec::new();
                 for input in inputs_only {
                     let result = step(&mut engine, input).map(|(out, sent)| {
-                        let events = describe(&store, account, &out);
+                        let events = describe(&shared, &out);
                         (out, sent, events)
                     });
                     let failed = result.is_err();
@@ -543,7 +583,7 @@ impl Online<'_> {
                 _ => {}
             }
         }
-        let mut answers: Vec<(Reply<()>, Result<(), ClientError>)> = Vec::new();
+        let mut answers: Vec<Answer> = Vec::new();
         for done in out.completed {
             let result = match &done.outcome {
                 Outcome::Ok(_) => Ok(()),
@@ -569,14 +609,21 @@ impl Online<'_> {
                 });
                 not_again.push(room);
             }
-            if let Some((room, reply)) = self.waiters.remove(&done.req) {
-                if let (Some(room), Ok(())) = (room, &result)
-                    && self.shared.is_guest()
-                    && self.shared.options.rejoin_guest_rooms
-                {
-                    join_again.push(room);
+            match self.waiters.remove(&done.req) {
+                Some(Waiter::Done(room, reply)) => {
+                    if let (Some(room), Ok(())) = (room, &result)
+                        && self.shared.is_guest()
+                        && self.shared.options.rejoin_guest_rooms
+                    {
+                        join_again.push(room);
+                    }
+                    answers.push(Answer::Done(reply, result));
                 }
-                answers.push((reply, result));
+                Some(Waiter::Lines(reply)) => {
+                    let lines = self.reply_lines.remove(&done.req).unwrap_or_default();
+                    answers.push(Answer::Lines(reply, result.map(|()| lines)));
+                }
+                None => {}
             }
         }
         if !not_again.is_empty() || !join_again.is_empty() {
@@ -598,7 +645,7 @@ impl Online<'_> {
         }
 
         self.shared.publish(Batch {
-            reload: false,
+            reload: needs_reload(&out.changes),
             changes: out.changes,
             events,
         });
@@ -611,7 +658,7 @@ impl Online<'_> {
             Ctx::None | Ctx::Notice(_) => {}
             Ctx::Join(room, reply) => match first_req {
                 Some(req) => {
-                    self.waiters.insert(req, (Some(room), reply));
+                    self.waiters.insert(req, Waiter::Done(Some(room), reply));
                 }
                 None => {
                     let _ = reply.send(Err(ClientError::NotConnected));
@@ -624,7 +671,7 @@ impl Online<'_> {
             }
             Ctx::Part(reply) => match first_req {
                 Some(req) => {
-                    self.waiters.insert(req, (None, reply));
+                    self.waiters.insert(req, Waiter::Done(None, reply));
                 }
                 None => {
                     let _ = reply.send(Err(ClientError::NotConnected));
@@ -636,11 +683,138 @@ impl Online<'_> {
             Ctx::Done(reply) => {
                 let _ = reply.send(Ok(()));
             }
+            Ctx::Lines(reply) => match first_req {
+                Some(req) => {
+                    self.waiters.insert(req, Waiter::Lines(reply));
+                }
+                None => {
+                    let _ = reply.send(Err(ClientError::NotConnected));
+                }
+            },
         }
-        for (reply, result) in answers {
-            let _ = reply.send(result);
+        for answer in answers {
+            match answer {
+                Answer::Done(reply, result) => {
+                    let _ = reply.send(result);
+                }
+                Answer::Lines(reply, result) => {
+                    let _ = reply.send(result);
+                }
+            }
         }
     }
+}
+
+/// An answer for the app, sent after the changes the command caused.
+enum Answer {
+    Done(Reply<()>, Result<(), ClientError>),
+    Lines(
+        Reply<Vec<ServerMessage>>,
+        Result<Vec<ServerMessage>, ClientError>,
+    ),
+}
+
+/// Whether timelines must read everything again: the blocks changed, so
+/// messages may be hidden or shown (5.7).
+fn needs_reload(changes: &[Change]) -> bool {
+    changes.iter().any(|c| matches!(c, Change::Blocks { .. }))
+}
+
+/// Drops the typing notices that ran out (8.1), and tells subscribers.
+fn expire_typing(shared: &AccountShared) {
+    let events: Vec<AccountEvent> = {
+        let mut typing = shared.typing.lock().expect("poisoned");
+        typing
+            .expire(Instant::now())
+            .into_iter()
+            .map(|conv| typing_event(&typing, &conv))
+            .collect()
+    };
+    shared.publish(Batch {
+        reload: false,
+        changes: Vec::new(),
+        events,
+    });
+}
+
+/// The connection closed: nobody is known to be typing, and nobody's
+/// presence is known (8.1, 8.3).
+fn forget_people(shared: &AccountShared) {
+    let mut events: Vec<AccountEvent> = {
+        let mut typing = shared.typing.lock().expect("poisoned");
+        typing
+            .clear()
+            .into_iter()
+            .map(|conv| AccountEvent::Typing {
+                conversation: conv.to_string(),
+                uids: Vec::new(),
+            })
+            .collect()
+    };
+    let had_presence = {
+        let mut presence = shared.presence.lock().expect("poisoned");
+        let had = !presence.is_empty();
+        presence.clear();
+        had
+    };
+    if had_presence {
+        events.push(AccountEvent::PresenceLost);
+    }
+    shared.publish(Batch {
+        reload: false,
+        changes: Vec::new(),
+        events,
+    });
+}
+
+fn typing_event(typing: &super::typing::Typists, conv: &Conv) -> AccountEvent {
+    AccountEvent::Typing {
+        conversation: conv.to_string(),
+        uids: typing.who(conv).iter().map(ToString::to_string).collect(),
+    }
+}
+
+/// Keeps typing and presence (8.1, 8.3), and returns the events for them.
+/// Reads the cache, so it runs on a blocking thread.
+fn apply_signals(shared: &AccountShared, signals: &[Signal]) -> Vec<AccountEvent> {
+    let now = Instant::now();
+    let mut events = Vec::new();
+    for signal in signals {
+        match signal {
+            Signal::Typing { conv, from } => {
+                // Someone hidden in rooms is hidden while typing too (5.7).
+                match shared.store.is_hidden(shared.id, conv, from) {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(e) => warn!(error = %e, "reading the blocks"),
+                }
+                let mut typing = shared.typing.lock().expect("poisoned");
+                if typing.typing(conv, from, now) {
+                    events.push(typing_event(&typing, conv));
+                }
+            }
+            Signal::Spoke { conv, from } => {
+                let mut typing = shared.typing.lock().expect("poisoned");
+                if typing.spoke(conv, from) {
+                    events.push(typing_event(&typing, conv));
+                }
+            }
+            Signal::Presence { uid, presence } => {
+                let old = shared
+                    .presence
+                    .lock()
+                    .expect("poisoned")
+                    .insert(uid.clone(), presence.clone());
+                if Presence::of(old.as_ref()) != Presence::of(Some(presence)) {
+                    match user_info(shared, uid) {
+                        Ok(user) => events.push(AccountEvent::UserChanged { user }),
+                        Err(e) => warn!(error = %e, "reading a display name"),
+                    }
+                }
+            }
+        }
+    }
+    events
 }
 
 /// Runs one input through the engine. Returns its output, and the outbox
@@ -660,6 +834,19 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
         Input::LoadOlder(conv) => engine.load_older(&conv)?,
         Input::Download(conv) => engine.download(&conv)?,
         Input::Fetch(conv, seq) => engine.fetch(&conv, seq)?,
+        Input::Typing(conv) => engine.typing(&conv),
+        Input::StopTyping(conv) => {
+            engine.stop_typing(&conv);
+            Output::default()
+        }
+        Input::People(op) => match op {
+            PeopleOp::Name(name) => engine.set_name(&name),
+            PeopleOp::Members(room) => engine.members(&room)?,
+            PeopleOp::Whois(uid) => engine.whois(&uid),
+            PeopleOp::Block(target) => engine.block(&target),
+            PeopleOp::Unblock(target) => engine.unblock(&target),
+            PeopleOp::Blocks => engine.blocks(),
+        },
         Input::Resume => engine.resume_outbox()?,
     };
     Ok((out, None))
@@ -671,6 +858,9 @@ fn answer_err(ctx: Ctx, e: ClientError) {
             let _ = reply.send(Err(e));
         }
         Ctx::Send(reply) => {
+            let _ = reply.send(Err(e));
+        }
+        Ctx::Lines(reply) => {
             let _ = reply.send(Err(e));
         }
         Ctx::None | Ctx::Notice(_) | Ctx::Rejoin(_) => {}
@@ -688,17 +878,20 @@ fn to_reply(response: Response) -> sync::Reply {
     }
 }
 
-/// The subscriber events for an output: its changes, named, and its
-/// notifications. Reads the cache, so it runs on a blocking thread.
-pub(crate) fn describe(store: &Store, account: AccountId, out: &Output) -> Vec<AccountEvent> {
-    let mut events = describe_changes(store, account, &out.changes);
+/// The subscriber events for an output: its changes, named, its
+/// notifications, and typing and presence, which are kept here. Reads the
+/// cache, so it runs on a blocking thread.
+pub(crate) fn describe(shared: &AccountShared, out: &Output) -> Vec<AccountEvent> {
+    let mut events = describe_changes(shared, &out.changes);
     events.extend(out.notifications.iter().map(|n| AccountEvent::Notice {
         notice: Notice::from_sync(n),
     }));
+    events.extend(apply_signals(shared, &out.signals));
     events
 }
 
-fn describe_changes(store: &Store, _account: AccountId, changes: &[Change]) -> Vec<AccountEvent> {
+fn describe_changes(shared: &AccountShared, changes: &[Change]) -> Vec<AccountEvent> {
+    let store = &shared.store;
     let mut names = HashMap::new();
     let mut name = |conv: crate::store::ConvId| -> Option<String> {
         names
@@ -715,6 +908,8 @@ fn describe_changes(store: &Store, _account: AccountId, changes: &[Change]) -> V
     let mut events = Vec::new();
     let mut messages = HashSet::new();
     let mut convs = HashSet::new();
+    let mut members = HashSet::new();
+    let mut blocks = false;
     for change in changes {
         match change {
             Change::Inserted { conv, .. }
@@ -745,6 +940,23 @@ fn describe_changes(store: &Store, _account: AccountId, changes: &[Change]) -> V
                 Ok(None) => events.push(AccountEvent::OutboxRemoved { id: id.get() }),
                 Err(e) => warn!(error = %e, "reading an outbox entry"),
             },
+            Change::User { uid, .. } => match user_info(shared, uid) {
+                Ok(user) => events.push(AccountEvent::UserChanged { user }),
+                Err(e) => warn!(error = %e, "reading a display name"),
+            },
+            Change::Members { conv } => {
+                if let Some(n) = name(*conv)
+                    && members.insert(n.clone())
+                {
+                    events.push(AccountEvent::MembersChanged { conversation: n });
+                }
+            }
+            Change::Blocks { .. } => {
+                if !blocks {
+                    blocks = true;
+                    events.push(AccountEvent::BlocksChanged);
+                }
+            }
         }
     }
     events
@@ -769,7 +981,7 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
                 let account = s.id;
                 let (_, changes) = s.store.write(|tx| {
                     if let Some(mut row) = tx.conv_by_name(account, &conv)? {
-                        tx.set_read(&mut row, seq.get())?;
+                        tx.mark_read(&mut row, seq.get())?;
                     }
                     Ok(())
                 })?;
@@ -803,7 +1015,11 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
         | Cmd::Fetch { reply, .. } => {
             let _ = reply.send(Err(ClientError::NotConnected));
         }
-        Cmd::Reconnect => {}
+        Cmd::People { reply, .. } => {
+            let _ = reply.send(Err(ClientError::NotConnected));
+        }
+        // Nobody sees an offline user type.
+        Cmd::Typing { .. } | Cmd::Reconnect => {}
         Cmd::Stop { reply } => {
             let _ = reply.send(());
         }
@@ -832,10 +1048,10 @@ fn queue_offline(
     id.ok_or_else(|| ClientError::NotJoined(conv.to_string()))
 }
 
-fn publish_changes(shared: &AccountShared, changes: Vec<Change>) {
-    let events = describe_changes(&shared.store, shared.id, &changes);
+pub(crate) fn publish_changes(shared: &AccountShared, changes: Vec<Change>) {
+    let events = describe_changes(shared, &changes);
     shared.publish(Batch {
-        reload: false,
+        reload: needs_reload(&changes),
         changes,
         events,
     });

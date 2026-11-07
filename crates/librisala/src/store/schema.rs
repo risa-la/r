@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -213,6 +213,32 @@ UPDATE events SET own = 1 WHERE author = (
 const V4: &str = "
 ALTER TABLE outbox ADD COLUMN claim TEXT;
 ALTER TABLE outbox ADD COLUMN claimed_at INTEGER;
+";
+
+/// Version 5: display names, blocks, and hiding blocked people (5.7, 8.2,
+/// 8.3).
+///
+/// - `users`: the display names the account has learned, from MEMBER,
+///   USER and NAME lines, escaped as on the wire. A row means the name is
+///   known; `''` means the user has none. Presence is not stored: it is
+///   only true while connected.
+/// - `blocks`: the account's blocks (5.7), as written on the wire: an
+///   identity, or `*@<domain>`.
+/// - `accounts.hide_blocked`: 1 to hide blocked people's messages in rooms
+///   (5.7). The messages stay stored, so unblocking shows them again.
+const V5: &str = "
+CREATE TABLE users (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    uid     TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    PRIMARY KEY (account, uid)
+) WITHOUT ROWID;
+CREATE TABLE blocks (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    target  TEXT NOT NULL,
+    PRIMARY KEY (account, target)
+) WITHOUT ROWID;
+ALTER TABLE accounts ADD COLUMN hide_blocked INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Brings the schema up to [`VERSION`].
