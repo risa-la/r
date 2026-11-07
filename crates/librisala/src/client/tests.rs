@@ -453,3 +453,45 @@ fn messages_say_whether_they_are_the_accounts_own() {
         .collect();
     assert_eq!(own, [("mine".into(), true), ("theirs".into(), false)]);
 }
+
+#[test]
+fn conversation_info_has_the_topic_and_settings() {
+    let sam = guest();
+    let shared = sam.shared();
+    let conv: Conv = "#general".parse().unwrap();
+    let account = shared.id;
+    let snapshot = |line: &str| match line.parse::<ServerMessage>().unwrap().line {
+        ServerLine::Event(e) => e,
+        other => panic!("{other:?}"),
+    };
+    shared
+        .store
+        .write(|tx| {
+            let mut row = tx.conv_or_create(account, &conv)?;
+            tx.learn_id(&mut row, &"k1".parse().unwrap(), Some(1))?;
+            tx.apply_snapshot(&row, &snapshot("SET #general topic Plans\\nfor now"))?;
+            tx.apply_snapshot(&row, &snapshot("SET #general guests write"))?;
+            tx.apply_snapshot(&row, &snapshot("SET #general public yes"))
+        })
+        .unwrap();
+    let info = sam
+        .conversation("#general")
+        .unwrap()
+        .info()
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.topic, "Plans\nfor now");
+    let settings: Vec<(&str, &str)> = info
+        .settings
+        .iter()
+        .map(|s| (s.key.as_str(), s.value.as_str()))
+        .collect();
+    assert_eq!(
+        settings,
+        [
+            ("guests", "write"),
+            ("public", "yes"),
+            ("topic", "Plans\nfor now")
+        ]
+    );
+}

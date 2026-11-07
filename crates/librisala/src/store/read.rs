@@ -33,6 +33,9 @@ pub struct ConversationSummary {
     pub unread: u64,
     /// The newest stored seq, if any.
     pub newest: Option<Seq>,
+    /// A room's settings (6.2), as far as stored events and snapshots
+    /// show, in key order. Empty for a direct conversation.
+    pub settings: Vec<RoomSetting>,
 }
 
 impl ConversationSummary {
@@ -127,6 +130,7 @@ fn finish_summary(raw: RawSummary) -> Result<ConversationSummary, StoreError> {
         read: read.max(0) as u64,
         unread: unread.max(0) as u64,
         newest: newest.map(seq).transpose()?,
+        settings: Vec::new(),
     })
 }
 
@@ -140,6 +144,26 @@ fn summaries(
     let mut out = Vec::new();
     for raw in rows {
         out.push(finish_summary(raw?)?);
+    }
+    for summary in &mut out {
+        summary.settings = settings(conn, summary.id)?;
+    }
+    Ok(out)
+}
+
+fn settings(conn: &Connection, conv: ConvId) -> Result<Vec<RoomSetting>, StoreError> {
+    let mut stmt =
+        conn.prepare_cached("SELECT key, value FROM room_settings WHERE conv = ?1 ORDER BY key")?;
+    let rows = stmt.query_map([conv.0], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (key, value) = row?;
+        out.push(
+            RoomSetting::parse(&key, &value)
+                .map_err(|_| StoreError::Corrupt(format!("bad setting {key}")))?,
+        );
     }
     Ok(out)
 }
@@ -343,23 +367,7 @@ impl Store {
 
     /// A room's settings (6.2), as far as stored events and snapshots show.
     pub fn room_settings(&self, conv: ConvId) -> Result<Vec<RoomSetting>, StoreError> {
-        self.read(|conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT key, value FROM room_settings WHERE conv = ?1 ORDER BY key",
-            )?;
-            let rows = stmt.query_map([conv.0], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (key, value) = row?;
-                out.push(
-                    RoomSetting::parse(&key, &value)
-                        .map_err(|_| StoreError::Corrupt(format!("bad setting {key}")))?,
-                );
-            }
-            Ok(out)
-        })
+        self.read(|conn| settings(conn, conv))
     }
 
     /// A room's members, roles and bans, as far as stored events and

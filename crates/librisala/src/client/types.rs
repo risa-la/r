@@ -4,6 +4,7 @@
 use risala_proto::error::ErrorCode;
 use risala_proto::server::{EventBody, ServerLine, ServerMessage};
 use risala_proto::text::unescape;
+use risala_proto::types::RoomSetting;
 
 use crate::addr::TrustRecord;
 use crate::conn::{self, TrustError};
@@ -376,6 +377,21 @@ pub struct ConversationInfo {
     pub newest: u64,
     /// Whether every event up to the head is stored.
     pub caught_up: bool,
+    /// A room's topic (6.2), unescaped; empty if none or not known.
+    pub topic: String,
+    /// A room's settings (6.2) as far as the cache knows, in key order,
+    /// the topic included. Empty for a direct conversation.
+    pub settings: Vec<Setting>,
+}
+
+/// One room setting (6.2), such as `public` = `yes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    /// The key: `topic`, `public`, `guests`, `retention` or another.
+    pub key: String,
+    /// The value, unescaped: text for `topic`, otherwise a keyword or a
+    /// number, as on the wire (`yes`, `read`, `30`, `server` and so on).
+    pub value: String,
 }
 
 impl From<ConversationSummary> for ConversationInfo {
@@ -390,6 +406,22 @@ impl From<ConversationSummary> for ConversationInfo {
             read: c.read,
             unread: c.unread,
             newest: c.newest.map_or(0, |s| s.get()),
+            topic: c
+                .settings
+                .iter()
+                .find_map(|s| match s {
+                    RoomSetting::Topic(t) => Some(unescape(t).into_owned()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            settings: c
+                .settings
+                .iter()
+                .map(|s| Setting {
+                    key: s.key().to_owned(),
+                    value: unescape(&s.value()).into_owned(),
+                })
+                .collect(),
         }
     }
 }

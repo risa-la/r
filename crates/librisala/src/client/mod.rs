@@ -129,7 +129,7 @@ pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
     DisconnectKind, EventKind, FailKind, KeyErrorKind, Message, Notice, OutboxEntry, OutboxStatus,
-    ReactionCount, RoomList, RoomListing, ServerHello, TrustInfo,
+    ReactionCount, RoomList, RoomListing, ServerHello, Setting, TrustInfo,
 };
 
 use account::AccountShared;
