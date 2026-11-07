@@ -38,9 +38,14 @@ use crate::addr::{ServerAddr, TrustRecord, TrustStore, TrustStoreError};
 /// `verify_server_cert` is used; signatures are checked separately.
 pub type CaVerifier = Arc<dyn ServerCertVerifier>;
 
-/// The crypto provider librisala uses: rustls with aws-lc-rs.
+/// The crypto provider librisala uses: rustls with aws-lc-rs, offering
+/// X25519MLKEM768 as the only key exchange group (2.1). A server without
+/// it fails the handshake with [`Error::KeyExchange`].
 pub fn crypto_provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    Arc::new(CryptoProvider {
+        kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768],
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    })
 }
 
 /// The platform's CA check, through `rustls-platform-verifier`: the OS
@@ -385,7 +390,29 @@ fn tls_error(e: std::io::Error) -> Error {
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
     {
+        Some(tls) if is_key_exchange_failure(tls) => Error::KeyExchange(tls.clone()),
         Some(tls) => Error::Tls(tls.clone()),
         None => Error::Io(e),
     }
+}
+
+/// Whether a handshake error means the server does not do the one key
+/// exchange this client offers, X25519MLKEM768 (2.1).
+///
+/// A server with no group in common answers with a `handshake_failure`
+/// alert (some send `insufficient_security`). One that ignores the offer
+/// and picks another group anyway breaks TLS in one of the other ways
+/// listed.
+fn is_key_exchange_failure(e: &rustls::Error) -> bool {
+    use rustls::{AlertDescription as A, PeerIncompatible as I, PeerMisbehaved as M};
+    matches!(
+        e,
+        rustls::Error::AlertReceived(A::HandshakeFailure | A::InsufficientSecurity)
+            | rustls::Error::PeerIncompatible(I::NoKxGroupsInCommon)
+            | rustls::Error::PeerMisbehaved(
+                M::SelectedUnofferedKxGroup
+                    | M::IllegalHelloRetryRequestWithUnofferedNamedGroup
+                    | M::WrongGroupForKeyShare
+            )
+    )
 }

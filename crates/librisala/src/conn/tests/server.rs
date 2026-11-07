@@ -8,6 +8,8 @@ use rcgen::{
     BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
 };
 use risala_proto::fingerprint::Fingerprint;
+use rustls::NamedGroup;
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{CertifiedKey, SigningKey};
@@ -114,6 +116,8 @@ pub struct Peer {
     pub sni: Option<String>,
     /// The ALPN protocol negotiated.
     pub alpn: Option<Vec<u8>>,
+    /// The key exchange group of the handshake.
+    pub kx_group: Option<NamedGroup>,
 }
 
 impl Peer {
@@ -169,12 +173,43 @@ impl ScriptServer {
     /// connection (from 0) and its peer. Connections whose handshake
     /// fails, as when the client refuses the certificate, run no script
     /// but still count.
+    ///
+    /// The server offers every key exchange group of aws-lc-rs, as a
+    /// typical TLS server does, X25519MLKEM768 among them.
     pub async fn start<F, Fut>(cert: ServerCert, conns: usize, script: F) -> ScriptServer
     where
         F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        ScriptServer::start_with(provider, cert, conns, script).await
+    }
+
+    /// Like [`start`](Self::start), but the server knows only the classic
+    /// key exchange X25519, as one without post-quantum support (2.1).
+    pub async fn start_classic<F, Fut>(cert: ServerCert, conns: usize, script: F) -> ScriptServer
+    where
+        F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let provider = CryptoProvider {
+            kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        };
+        ScriptServer::start_with(provider, cert, conns, script).await
+    }
+
+    async fn start_with<F, Fut>(
+        provider: CryptoProvider,
+        cert: ServerCert,
+        conns: usize,
+        script: F,
+    ) -> ScriptServer
+    where
+        F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let provider = Arc::new(provider);
         let mut config = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
@@ -200,6 +235,7 @@ impl ScriptServer {
                     let peer = Peer {
                         sni: conn.server_name().map(str::to_owned),
                         alpn: conn.alpn_protocol().map(<[u8]>::to_vec),
+                        kx_group: conn.negotiated_key_exchange_group().map(|g| g.name()),
                         stream: BufReader::new(tls),
                     };
                     let script = script.clone();
