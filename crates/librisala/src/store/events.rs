@@ -249,21 +249,26 @@ impl<'a> Tx<'a> {
     }
 
     /// Compares an id the server reported with the stored one (7.1, 7.2,
-    /// 6.1), and a reported head with the newest stored seq (7.1). When
-    /// either disagrees, discards the history first. Then stores the id and
-    /// the head. Returns whether the history was discarded.
+    /// 6.1), and a reported head with the sync point (7.1). When either
+    /// disagrees, discards the history first. Then stores the id and the
+    /// head. Returns whether the history was discarded.
+    ///
+    /// Only the sync point counts for the head check, not the newest
+    /// stored seq: another process sharing the cache may have stored
+    /// events after the server computed the head (7.1). A lower head with
+    /// the same id keeps the outbox entries bound to that id, since the
+    /// room is the same.
     pub(crate) fn learn_id(
         &mut self,
         row: &mut ConvRow,
         id: &Id,
         head: Option<u64>,
     ) -> Result<bool, StoreError> {
-        let newest = self.max_seq(row.id)?;
         let reset = match &row.conv_id {
             Some(old) => old != id,
             // No id means nothing is stored, but be sure.
-            None => newest > 0,
-        } || head.is_some_and(|h| newest > h);
+            None => self.max_seq(row.id)? > 0,
+        } || head.is_some_and(|h| h < row.sync_point);
         if reset {
             self.discard(row, Some(id.clone()))?;
         } else if row.conv_id.is_none() {
@@ -278,8 +283,9 @@ impl<'a> Tx<'a> {
 
     /// Discards the conversation's history and derived state, in this
     /// transaction (7.1): the server's conversation under this name is not
-    /// the stored one. Messages in the outbox bound to the old id fail
-    /// (7.6). The new id, if known, is stored.
+    /// the stored one, or the server reported a head below the sync point.
+    /// The new id, if known, is stored. Messages in the outbox bound to the
+    /// old id fail (7.6), unless the new id is the same one.
     pub(crate) fn discard(
         &mut self,
         row: &mut ConvRow,
@@ -289,7 +295,9 @@ impl<'a> Tx<'a> {
             self.tx
                 .execute(&format!("DELETE FROM {table} WHERE conv = ?1"), [row.id.0])?;
         }
-        if let Some(old) = row.conv_id.take() {
+        if let Some(old) = row.conv_id.take()
+            && new_id.as_ref() != Some(&old)
+        {
             self.fail_bound(row.account, &row.name, &old, super::FailReason::RoomChanged)?;
         }
         row.conv_id = new_id;

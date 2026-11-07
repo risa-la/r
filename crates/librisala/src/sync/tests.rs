@@ -84,6 +84,24 @@ impl H {
         }
     }
 
+    /// Another process on the same cache and account, with its own engine
+    /// and connection, such as a notification extension (PLAN.md 3.3).
+    fn sharing(other: &H) -> H {
+        let engine =
+            SyncEngine::new(other.store.clone(), other.account, other.config.clone()).unwrap();
+        H {
+            store: other.store.clone(),
+            account: other.account,
+            engine,
+            config: other.config.clone(),
+            clock: other.clock.clone(),
+            queue: VecDeque::new(),
+            notes: Vec::new(),
+            changes: Vec::new(),
+            last: Output::default(),
+        }
+    }
+
     /// Signs in, and expects SYNC.
     fn start(&mut self) -> ReqId {
         let out = self.engine.start().unwrap();
@@ -260,6 +278,79 @@ fn a_lower_head_starts_afresh() {
     h.reply(r, &["CONV #general k1 2 0"], "OK");
     assert_eq!(h.seqs("#general"), Vec::<u64>::new());
     h.expect("HISTORY #general after=0 limit=50");
+}
+
+#[test]
+fn a_stale_head_from_another_process_keeps_history() {
+    // Two processes share the cache (7.1). A sends SYNC, and the server
+    // computes #general's head as 1. Before A reads the reply, B, on its
+    // own connection, stores seq 2 and moves the sync point to 2.
+    let mut a = H::new(ALICE);
+    a.joined("k1", 1);
+    let ra = a.reconnect();
+
+    let mut b = H::sharing(&a);
+    let rb = b.start();
+    b.reply(rb, &["CONV #general k1 2 0"], "OK");
+    let r = b.expect("HISTORY #general after=1 limit=50");
+    b.reply_s(r, &[bob(2)], "OK id=k1 more=0");
+    assert_eq!(b.conv("#general").sync_point, 2);
+    b.idle();
+    // A message the user wrote meanwhile, bound to the room.
+    let (queued, _) = a
+        .store
+        .write(|tx| {
+            tx.queue(
+                a.account,
+                &conv("#general"),
+                Some(&"k1".parse().unwrap()),
+                &Draft::text("hello"),
+                Timestamp::MIN,
+            )
+        })
+        .unwrap();
+
+    // A's SYNC reply arrives, with the head it computed before seq 2.
+    a.reply(ra, &["CONV #general k1 1 0"], "OK");
+    assert_eq!(a.seqs("#general"), [1, 2]);
+    let c = a.conv("#general");
+    assert_eq!((c.sync_point, c.head), (2, 2));
+    assert!(
+        !a.changes
+            .iter()
+            .any(|c| matches!(c, Change::Cleared { .. }))
+    );
+    a.expect_msg("hello");
+    a.idle();
+    let item = a.store.outbox_item(queued).unwrap().unwrap();
+    assert_eq!(item.state, OutboxState::Sending);
+}
+
+#[test]
+fn a_head_below_the_sync_point_keeps_the_outbox() {
+    // A head below the sync point with the same id discards the history
+    // (7.1), but the room is the same, so its outbox entries stay.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (queued, _) = h
+        .store
+        .write(|tx| {
+            tx.queue(
+                h.account,
+                &conv("#general"),
+                Some(&"k1".parse().unwrap()),
+                &Draft::text("hello"),
+                Timestamp::MIN,
+            )
+        })
+        .unwrap();
+    let r = h.reconnect();
+    h.reply(r, &["CONV #general k1 2 0"], "OK");
+    assert_eq!(h.seqs("#general"), Vec::<u64>::new());
+    h.expect("HISTORY #general after=0 limit=50");
+    h.expect_msg("hello");
+    let item = h.store.outbox_item(queued).unwrap().unwrap();
+    assert_eq!(item.state, OutboxState::Sending);
 }
 
 #[test]

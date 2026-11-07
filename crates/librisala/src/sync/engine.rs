@@ -94,17 +94,23 @@ enum Pending {
     Sync {
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
+        /// The sync points when it was sent, for the head check.
+        floors: HashMap<Conv, u64>,
     },
     Join {
         room: Room,
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
+        /// The room's sync point when it was sent, for the head check.
+        floor: Option<u64>,
     },
     Part,
     Info {
         room: Room,
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
+        /// The room's sync point when it was sent, for the head check.
+        floor: Option<u64>,
     },
     Read,
     Msg {
@@ -276,11 +282,15 @@ impl SyncEngine {
             return Ok(self.finish());
         };
         match pending {
-            Pending::Sync { sent } => self.on_sync(req, sent, &reply)?,
-            Pending::Join { room, sent } => self.on_join(req, &room, sent, reply)?,
+            Pending::Sync { sent, floors } => self.on_sync(req, sent, &floors, &reply)?,
+            Pending::Join { room, sent, floor } => {
+                self.on_join(req, &room, (sent, floor), reply)?
+            }
             // The PART event, which comes first, did the work (6.1).
             Pending::Part => self.completed(req, reply.outcome),
-            Pending::Info { room, sent } => self.on_info(req, &room, sent, reply)?,
+            Pending::Info { room, sent, floor } => {
+                self.on_info(req, &room, (sent, floor), reply)?
+            }
             Pending::Read => self.completed(req, reply.outcome),
             Pending::Msg { outbox } => self.on_msg(outbox, reply)?,
             Pending::History {
@@ -307,11 +317,13 @@ impl SyncEngine {
     pub fn join(&mut self, room: &Room) -> Output {
         let command = Command::Join { room: room.clone() };
         let sent = self.ticks;
+        let floor = self.floor(&Conv::Room(room.clone()));
         self.issue(
             command,
             Pending::Join {
                 room: room.clone(),
                 sent,
+                floor,
             },
         );
         self.finish()
@@ -333,11 +345,13 @@ impl SyncEngine {
             room: Some(room.clone()),
         };
         let sent = self.ticks;
+        let floor = self.floor(&Conv::Room(room.clone()));
         self.issue(
             command,
             Pending::Info {
                 room: room.clone(),
                 sent,
+                floor,
             },
         );
         self.finish()
@@ -511,7 +525,18 @@ impl SyncEngine {
             return;
         }
         let sent = self.ticks;
-        self.syncing = Some(self.issue(Command::Sync, Pending::Sync { sent }));
+        // If the cache cannot be read, no head is checked.
+        let floors = self.store.sync_points(self.account).unwrap_or_default();
+        self.syncing = Some(self.issue(Command::Sync, Pending::Sync { sent, floors }));
+    }
+
+    /// The sync point of `conv` now, to check a head in the reply to a
+    /// command sent now (7.1). `None` if it is not known.
+    fn floor(&self, conv: &Conv) -> Option<u64> {
+        self.store
+            .sync_points(self.account)
+            .ok()
+            .and_then(|mut m| m.remove(conv))
     }
 
     fn live(&mut self, conv: &Conv) -> &mut Live {
@@ -549,11 +574,19 @@ impl SyncEngine {
         self.live(conv).joined_at = now;
     }
 
-    /// Whether a head in the reply to a command sent at `sent` can be
-    /// compared with the newest stored seq (7.1). Not if a live event came
-    /// since: the server may have computed the reply before that event.
-    fn head_is_fresh(&self, conv: &Conv, sent: u64) -> bool {
-        self.convs.get(conv).is_none_or(|l| l.event_at <= sent)
+    /// The sync point to check a head against (7.1), in the reply to a
+    /// command sent at `sent` when the sync point was `floor`.
+    ///
+    /// The head is compared with the sync point as it was when the command
+    /// was sent, not as it is now: since then, this connection or another
+    /// process sharing the cache may have stored newer events, which the
+    /// server may not have counted when it computed the head. Events stored
+    /// before the command was sent existed on the server before it, so a
+    /// correct server's head covers them. A live event of the conversation
+    /// since the command was sent skips the check altogether.
+    fn head_floor(&self, conv: &Conv, sent: u64, floor: Option<u64>) -> Option<u64> {
+        let fresh = self.convs.get(conv).is_none_or(|l| l.event_at <= sent);
+        floor.filter(|_| fresh)
     }
 
     /// The id of `conv` was learned on this connection.
@@ -720,7 +753,13 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
     // Replies
 
-    fn on_sync(&mut self, req: ReqId, sent: u64, reply: &Reply) -> Result<(), SyncError> {
+    fn on_sync(
+        &mut self,
+        req: ReqId,
+        sent: u64,
+        floors: &HashMap<Conv, u64>,
+        reply: &Reply,
+    ) -> Result<(), SyncError> {
         if self.syncing == Some(req) {
             self.syncing = None;
         }
@@ -755,11 +794,11 @@ impl SyncEngine {
                 if newer.contains(conv) {
                     continue;
                 }
-                let fresh = self.head_is_fresh(conv, sent);
+                let floor = self.head_floor(conv, sent, floors.get(conv).copied());
                 self.write(|tx| {
                     let mut row = tx.conv_or_create(account, conv)?;
                     // 7.1 step 2, and the head check.
-                    learn(tx, &mut row, id, Some(head.get()), fresh)?;
+                    learn(tx, &mut row, id, Some(head.get()), floor)?;
                     tx.set_joined(&mut row, true)?;
                     if let Some(read) = read {
                         tx.set_read(&mut row, read.get())?;
@@ -802,7 +841,7 @@ impl SyncEngine {
         &mut self,
         req: ReqId,
         room: &Room,
-        sent: u64,
+        (sent, floor): (u64, Option<u64>),
         reply: Reply,
     ) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
@@ -813,11 +852,11 @@ impl SyncEngine {
             && let Ok(Some(id)) = ok.id()
         {
             let head = ok.head().ok().flatten();
-            let fresh = self.head_is_fresh(&conv, sent);
+            let floor = self.head_floor(&conv, sent, floor);
             let account = self.account;
             self.write(|tx| {
                 let mut row = tx.conv_or_create(account, &conv)?;
-                learn(tx, &mut row, &id, head, fresh)?;
+                learn(tx, &mut row, &id, head, floor)?;
                 tx.set_joined(&mut row, true)?;
                 for msg in &reply.lines {
                     if let ServerLine::Event(e) = &msg.line
@@ -841,7 +880,7 @@ impl SyncEngine {
         &mut self,
         req: ReqId,
         room: &Room,
-        sent: u64,
+        (sent, floor): (u64, Option<u64>),
         reply: Reply,
     ) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
@@ -853,7 +892,7 @@ impl SyncEngine {
         {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
             let head = ok.head().ok().flatten();
-            let fresh = self.head_is_fresh(&conv, sent);
+            let floor = self.head_floor(&conv, sent, floor);
             let account = self.account;
             self.write(|tx| {
                 let row = if joined {
@@ -865,7 +904,7 @@ impl SyncEngine {
                     return Ok(());
                 };
                 if joined {
-                    learn(tx, &mut row, &id, head, fresh)?;
+                    learn(tx, &mut row, &id, head, floor)?;
                     tx.set_joined(&mut row, true)?;
                     for msg in &reply.lines {
                         if let ServerLine::Event(e) = &msg.line
@@ -1367,16 +1406,20 @@ impl SyncEngine {
     }
 }
 
-/// Learns a conversation's id and head from a reply. The head is checked
-/// against the newest stored seq only if `fresh`.
+/// Learns a conversation's id and head from a reply (7.1). The head is
+/// checked only against `floor`, the sync point when the command was sent
+/// (see [`SyncEngine::head_floor`]), and against the sync point now, which
+/// is lower if the history was discarded since.
 fn learn(
     tx: &mut Tx<'_>,
     row: &mut ConvRow,
     id: &Id,
     head: Option<u64>,
-    fresh: bool,
+    floor: Option<u64>,
 ) -> Result<bool, StoreError> {
-    if fresh {
+    if let (Some(h), Some(f)) = (head, floor)
+        && h < f
+    {
         return tx.learn_id(row, id, head);
     }
     let reset = tx.learn_id(row, id, None)?;

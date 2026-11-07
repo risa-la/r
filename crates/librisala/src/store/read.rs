@@ -219,6 +219,27 @@ impl Store {
         self.read(|conn| summaries(conn, "c.account = ?1", [account.0]))
     }
 
+    /// The sync point of each of an account's conversations (7.1), by
+    /// name.
+    pub(crate) fn sync_points(
+        &self,
+        account: AccountId,
+    ) -> Result<std::collections::HashMap<Conv, u64>, StoreError> {
+        self.read(|conn| {
+            let mut stmt =
+                conn.prepare_cached("SELECT name, sync_point FROM convs WHERE account = ?1")?;
+            let rows = stmt.query_map([account.0], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (name, sp) = row?;
+                out.insert(parse(&name, "conversation")?, sp.max(0) as u64);
+            }
+            Ok(out)
+        })
+    }
+
     /// A conversation by name.
     pub fn conversation(
         &self,

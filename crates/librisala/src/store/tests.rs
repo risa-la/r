@@ -359,7 +359,25 @@ fn a_new_id_discards_history() {
         .unwrap();
     assert!(!reset);
 
-    // A head below the newest stored seq (7.1).
+    // Events stored past the sync point do not count (7.1): another
+    // process may have stored them after the server computed the head.
+    store_all(
+        &store,
+        conv,
+        &[ev(3, "from=bob@example.net MSG #general later")],
+    );
+    let (reset, _) = store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            assert_eq!(row.sync_point, 1);
+            tx.learn_id(&mut row, &id("k1"), Some(1))
+        })
+        .unwrap();
+    assert!(!reset);
+    assert_eq!(store.export(conv).unwrap().len(), 2);
+
+    // A head below the sync point (7.1). The room is the same, so the
+    // outbox entries bound to it stay.
     let (reset, changes) = store
         .write(|tx| {
             let mut row = tx.conv(conv)?.unwrap();
@@ -369,6 +387,7 @@ fn a_new_id_discards_history() {
     assert!(reset);
     assert!(changes.contains(&Change::Cleared { conv }));
     assert!(store.export(conv).unwrap().is_empty());
+    assert_eq!(store.outbox(account).unwrap()[0].state, OutboxState::Queued);
 
     // A new id (7.1 step 2) also fails what was bound to the old one.
     store_all(

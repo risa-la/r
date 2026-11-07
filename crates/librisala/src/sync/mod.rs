@@ -35,7 +35,10 @@
 //!   the conversation whose id is stored. Ids from SYNC, JOIN (event and
 //!   OK), INFO, HISTORY and RELATED are compared with the stored one, and
 //!   a different id discards the history first (7.1, 7.2, 6.1). So does a
-//!   head below the newest stored seq (7.1). Live events are stored only
+//!   head below the sync point the conversation had when the command was
+//!   sent (7.1), which keeps the outbox: the room is the same. Events
+//!   stored past that point, by this connection or by another process
+//!   sharing the cache, do not count. Live events are stored only
 //!   once the conversation's id is known on this connection (7.1 step 6).
 //! - **Truthful sync points.** The sync point is the seq up to which every
 //!   event the server still keeps is stored. It moves over HISTORY pages
