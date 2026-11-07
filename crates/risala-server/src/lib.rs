@@ -8,11 +8,18 @@
 //! - [`net`]: TLS listeners, connection tasks, framing and keepalive.
 //! - [`core`]: the hub: sign-in, rooms, events, history and fan-out.
 //! - [`store`]: persistent storage, behind a trait, with SQLite.
+//! - [`daemon`]: the whole server, the hub behind the network layer:
+//!   [`run`] and [`Daemon`].
+//! - [`testing`]: a whole server and a TLS client, for tests.
 
 #![warn(missing_docs)]
 
 pub mod config;
 pub mod core;
+pub mod daemon;
 pub mod handler;
 pub mod net;
 pub mod store;
+pub mod testing;
+
+pub use daemon::{Daemon, RunError, run};
