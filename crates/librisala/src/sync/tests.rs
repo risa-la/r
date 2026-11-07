@@ -437,6 +437,21 @@ fn a_dropped_event_past_the_head_is_fetched() {
 }
 
 #[test]
+fn a_live_event_past_a_stale_head_asks_sync_again() {
+    // Found by the simulation. The SYNC reply was computed at head 1, then
+    // event 2 arrived first and could not be stored (7.1 step 6). If
+    // events 1 and 2 expire before HISTORY asks, nothing but a new SYNC
+    // says that the head is 2.
+    let mut h = H::new(ALICE);
+    let r = h.start();
+    h.line(&bob(2));
+    h.reply(r, &["CONV #general k1 1 0"], "OK");
+    h.expect("HISTORY #general after=0 limit=50");
+    h.expect("SYNC");
+    h.idle();
+}
+
+#[test]
 fn a_new_conversation_seen_live_asks_sync() {
     // A direct conversation that starts after SYNC was answered.
     let mut h = H::new(ALICE);

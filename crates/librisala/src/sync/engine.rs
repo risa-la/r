@@ -831,6 +831,7 @@ impl SyncEngine {
         }
         let account = self.account;
         let mut listed = Vec::new();
+        let mut heads = HashMap::new();
         for msg in &reply.lines {
             if let ServerLine::Conv {
                 conv,
@@ -840,6 +841,7 @@ impl SyncEngine {
             } = &msg.line
             {
                 listed.push(conv.clone());
+                heads.insert(conv.clone(), head.get());
                 if newer.contains(conv) {
                     continue;
                 }
@@ -873,8 +875,15 @@ impl SyncEngine {
             self.live(&conv).confirmed = None;
             self.out.notifications.push(Notification::Left { conv });
         }
+        // A live event dropped while this SYNC was in flight: ask again if
+        // the SYNC did not list its conversation, or listed it with a head
+        // below the event. The server computed that head before the event,
+        // and the event may have expired by the time HISTORY asks for it,
+        // so only a new SYNC tells how far to catch up (7.1 step 6).
         for (conv, live) in &mut self.convs {
-            if std::mem::take(&mut live.recheck) && !listed.contains(conv) {
+            if std::mem::take(&mut live.recheck)
+                && heads.get(conv).is_none_or(|&head| head < live.dropped)
+            {
                 self.want_sync = true;
             }
         }
