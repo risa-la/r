@@ -202,6 +202,28 @@ async fn typing_reaches_the_other_members() {
     assert_eq!(bob.lines(), ["@from=~sam TYPING #general"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_message_lets_the_next_typing_through() {
+    let mut h = harness(timers());
+    let mut a1 = h.signed_in_as(ALICE);
+    let mut a2 = h.signed_in_as(ALICE);
+    let mut bob = h.signed_in_as(BOB);
+    bob.lines();
+    a1.lines();
+    a2.lines();
+    let line = "@from=alice@example.org TYPING #general";
+    h.send(&a1, "typing #general").await;
+    h.send(&a2, "typing #general").await;
+    assert_eq!(bob.lines(), [line, line]);
+    // The message ends the notification on every device (8.1), so typing
+    // again within the rate limit's second is passed on at once.
+    h.send(&a1, "msg #general done").await;
+    bob.lines();
+    h.send(&a1, "typing #general").await;
+    h.send(&a2, "typing #general").await;
+    assert_eq!(bob.lines(), [line, line]);
+}
+
 #[tokio::test]
 async fn typing_needs_membership_and_write_access() {
     let mut h = harness(timers());

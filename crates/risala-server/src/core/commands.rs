@@ -738,6 +738,7 @@ impl Inner {
         match appended {
             Appended::New(seq) => {
                 Self::broadcast_event(st, &event);
+                self.typing_ended(uid, &st.id);
                 if let Some(cid) = cid
                     && uid.is_guest()
                     && let Some(session) = self.reg().sessions.get_mut(uid)
@@ -749,6 +750,24 @@ impl Inner {
             // Another connection of the same identity sent the same cid
             // between the check above and now.
             Appended::Duplicate(seq) => Ok(Some(OkResponse::new().with_seq(seq))),
+        }
+    }
+
+    /// A message from `uid` ends its typing notification in the
+    /// conversation `id` (8.1), on every device: the next TYPING from any of
+    /// them is passed on at once, not held back by the rate limit.
+    fn typing_ended(&self, uid: &Uid, id: &Id) {
+        // The registry and the user's entry are never locked together here,
+        // so no lock order is imposed.
+        let Some(user) = self.reg().users.get(uid).cloned() else {
+            return;
+        };
+        let conns: Vec<ConnId> = user.lock().conns.iter().map(|c| c.handle.id()).collect();
+        let mut reg = self.reg();
+        for conn in conns {
+            if let Some(entry) = reg.conns.get_mut(&conn) {
+                entry.typing_ended(id);
+            }
         }
     }
 

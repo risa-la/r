@@ -112,7 +112,6 @@ fn unread(account: &Account) -> u64 {
 }
 
 #[tokio::test]
-#[ignore = "needs the M3 wave-2 server"]
 async fn read_markers_follow_the_account_across_devices() {
     let server = server().await;
     let alice_a = registered(&server, "alice").await;
@@ -171,7 +170,6 @@ async fn read_markers_follow_the_account_across_devices() {
 }
 
 #[tokio::test]
-#[ignore = "needs the M3 wave-2 server"]
 async fn typing_shows_on_the_other_account() {
     let server = server().await;
     let alice = registered(&server, "alice").await;
@@ -211,7 +209,6 @@ async fn typing_shows_on_the_other_account() {
 }
 
 #[tokio::test]
-#[ignore = "needs the M3 wave-2 server"]
 async fn names_members_and_presence() {
     let server = server().await;
     let alice = registered(&server, "alice").await;
@@ -278,7 +275,6 @@ async fn names_members_and_presence() {
 }
 
 #[tokio::test]
-#[ignore = "needs the M3 wave-2 server"]
 async fn blocks_reach_every_device_and_hide_messages() {
     let server = server().await;
     let alice = registered(&server, "alice").await;

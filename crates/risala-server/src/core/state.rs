@@ -328,6 +328,12 @@ impl ConnEntry {
         self.typing.insert(id.clone(), now);
         true
     }
+    /// A message to the conversation `id` ended this connection's typing
+    /// notification (8.1), so the next TYPING starts afresh and is passed
+    /// on at once.
+    pub(crate) fn typing_ended(&mut self, id: &Id) {
+        self.typing.remove(id);
+    }
 }
 
 /// A guest's session (4.2): it starts with GUEST, moves to a new connection
