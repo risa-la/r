@@ -304,6 +304,44 @@ async fn device_keys() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn key_store_failures_keep_their_kind() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let files = crate::conn::keys::FileKeyStore::new(dir.path());
+    let client = Client::open_in_memory(ClientOptions {
+        keys: Some(Arc::new(files.clone())),
+        ..ClientOptions::default()
+    })
+    .unwrap();
+    client.import_device_key(ALICE, PEM, false).await.unwrap();
+    let path = files.path(ALICE).unwrap();
+    let kind = |e: ClientError| match e {
+        ClientError::Keys { kind, .. } => kind,
+        other => panic!("{other:?}"),
+    };
+    // Others can read it: refused before anything is sent.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        kind(client.device_key(ALICE).unwrap_err()),
+        KeyErrorKind::Permissions
+    );
+    let alice = client.add_identity(HOST, ALICE).unwrap();
+    let err = within(alice.connect()).await.unwrap_err();
+    assert!(err.is_permanent());
+    assert_eq!(kind(err), KeyErrorKind::Permissions);
+    // Not a key.
+    std::fs::write(&path, "not a key").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(kind(err), KeyErrorKind::BadKey);
+    // Gone.
+    std::fs::remove_file(&path).unwrap();
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(kind(err), KeyErrorKind::NoKey);
+}
+
 #[tokio::test]
 async fn no_sign_in_as_an_identity_over_an_ip_address() {
     let keys = Arc::new(MemoryKeyStore::default());

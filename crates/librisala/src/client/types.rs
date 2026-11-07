@@ -179,9 +179,14 @@ pub enum KeyErrorKind {
     /// was not asked for.
     Exists,
     /// A private key to import is not a PEM PKCS#8 ML-DSA-44 key (App. A),
-    /// or a public key or key file line is not valid (4.4).
+    /// a public key or key file line is not valid (4.4), or the key the
+    /// store holds cannot be read as a key.
     BadKey,
-    /// The key store failed.
+    /// The key store refused access: a locked keychain, a user who said
+    /// no, or a key file that other users can read (fix it with
+    /// `chmod 600`).
+    Permissions,
+    /// The key store failed for another reason, such as I/O.
     Failed,
 }
 
@@ -304,6 +309,21 @@ impl ConnectionErrorKind {
 }
 
 impl ClientError {
+    /// A key store failure as a client error, with its kind.
+    pub(crate) fn from_key_store(e: &crate::conn::keys::KeyStoreError) -> ClientError {
+        use crate::conn::keys::KeyStoreError as E;
+        let kind = match e {
+            E::BadKey(_) => KeyErrorKind::BadKey,
+            E::InsecurePermissions(_) | E::Denied(_) => KeyErrorKind::Permissions,
+            E::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+                KeyErrorKind::Permissions
+            }
+            E::Io(io) if io.kind() == std::io::ErrorKind::NotFound => KeyErrorKind::NoKey,
+            E::BadId(_) | E::Io(_) | E::Platform(_) => KeyErrorKind::Failed,
+        };
+        ClientError::keys(kind, e.to_string())
+    }
+
     /// An `ERR` as a client error.
     pub(crate) fn server(err: &risala_proto::server::ErrResponse) -> ClientError {
         ClientError::Server {

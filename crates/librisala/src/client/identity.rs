@@ -53,11 +53,7 @@ fn parse_identity(identity: &str) -> Result<Identity, ClientError> {
 }
 
 fn store_error(e: KeyStoreError) -> ClientError {
-    let kind = match e {
-        KeyStoreError::BadKey(_) => KeyErrorKind::BadKey,
-        _ => KeyErrorKind::Failed,
-    };
-    ClientError::keys(kind, e.to_string())
+    ClientError::from_key_store(&e)
 }
 
 fn exists(identity: &Identity) -> ClientError {

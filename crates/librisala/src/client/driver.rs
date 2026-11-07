@@ -287,10 +287,7 @@ fn sign_in_for(
         })?;
     let key = keys
         .load(identity.as_str())
-        .map_err(|e| ClientError::Keys {
-            kind: KeyErrorKind::Failed,
-            message: e.to_string(),
-        })?
+        .map_err(|e| ClientError::from_key_store(&e))?
         .ok_or_else(|| ClientError::Keys {
             kind: KeyErrorKind::NoKey,
             message: format!("no key for {identity}"),
