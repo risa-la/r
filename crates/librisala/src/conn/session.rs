@@ -148,6 +148,35 @@ impl Response {
     }
 }
 
+/// What arrives on a session's incoming queue, in the order the server
+/// sent it (3.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Incoming {
+    /// A line that is not part of a response: a live event, PRESENCE,
+    /// NOTICE, READ, TYPING, DROP, BYE or a line with an unknown verb.
+    Line(ServerMessage),
+    /// The response to a command sent with [`Session::send`], placed where
+    /// its final `OK` or `ERR` arrived. Every line before it in the queue
+    /// arrived before that final line, and every line after it arrived
+    /// after.
+    Reply {
+        /// The `ref` [`Session::send`] returned for the command.
+        ref_: Ref,
+        /// The response.
+        response: Response,
+    },
+}
+
+impl Incoming {
+    /// The line, if this is not a reply.
+    pub fn into_line(self) -> Option<ServerMessage> {
+        match self {
+            Incoming::Line(msg) => Some(msg),
+            Incoming::Reply { .. } => None,
+        }
+    }
+}
+
 /// One connection to a server (2, 3.6, 4, 11).
 ///
 /// - [`connect`](Self::connect) opens TLS with the checks of 2.2 and reads
@@ -161,13 +190,18 @@ impl Response {
 ///   [`take_incoming`](Self::take_incoming), in order: live events,
 ///   PRESENCE, NOTICE, READ, TYPING, DROP, BYE and lines with unknown
 ///   verbs. Server PINGs are answered inside the session (11).
+/// - [`send`](Self::send) sends a command whose response arrives on that
+///   same queue, as an [`Incoming::Reply`] at the point its final line
+///   arrived. Use it when the order of responses relative to live lines
+///   matters, as it does for the sync engine (3.6, "Consistent with live
+///   events").
 ///
 /// Dropping the session closes the connection.
 pub struct Session {
     info: SessionInfo,
     shared: Arc<Shared>,
     out: mpsc::UnboundedSender<Outgoing>,
-    incoming: Mutex<Option<mpsc::Receiver<ServerMessage>>>,
+    incoming: Mutex<Option<mpsc::Receiver<Incoming>>>,
     closed: watch::Receiver<Option<CloseReason>>,
     stop: watch::Sender<bool>,
 }
@@ -197,8 +231,17 @@ struct Pending {
     ref_: Ref,
     lines: Vec<ServerMessage>,
     signs_in: bool,
-    /// `None` for the session's own keepalive PING.
-    reply: Option<oneshot::Sender<Result<Response, Error>>>,
+    reply: ReplyTo,
+}
+
+/// Where a command's response goes.
+enum ReplyTo {
+    /// Nowhere: the session's own keepalive PING.
+    Keepalive,
+    /// To [`Session::request`]'s future.
+    Waiter(oneshot::Sender<Result<Response, Error>>),
+    /// Onto the incoming queue, from [`Session::send`].
+    Queue,
 }
 
 enum Outgoing {
@@ -316,10 +359,11 @@ impl Session {
         self.shared.state.lock().expect("poisoned").uid.clone()
     }
 
-    /// Takes the queue of incoming lines: every server line that is not
-    /// a response to a command or a PING, in arrival order. It ends when
-    /// the connection closes. Only the first call returns it.
-    pub fn take_incoming(&self) -> Option<mpsc::Receiver<ServerMessage>> {
+    /// Takes the incoming queue: every server line that is not a response
+    /// to a command or a PING, and the responses to commands sent with
+    /// [`send`](Self::send), in arrival order. It ends when the
+    /// connection closes. Only the first call returns it.
+    pub fn take_incoming(&self) -> Option<mpsc::Receiver<Incoming>> {
         self.incoming.lock().expect("poisoned").take()
     }
 
@@ -335,51 +379,67 @@ impl Session {
     /// When it returns, every incoming line that came before the final
     /// response, such as the live event a MSG caused, is already queued.
     pub async fn request(&self, command: Command) -> Result<Response, Error> {
-        if !command.gets_response() {
-            return Err(Error::NoResponse);
-        }
-        let rx = {
-            let mut st = self.shared.state.lock().expect("poisoned");
-            if let Some(reason) = &st.closed {
-                return Err(Error::Closed(reason.clone()));
-            }
-            let uses_nonce = matches!(command, Command::Auth { .. } | Command::Register { .. });
-            if uses_nonce && st.nonce_used {
-                return Err(Error::NonceUsed);
-            }
-            let ref_: Ref = st
-                .next_ref
-                .to_string()
-                .parse()
-                .expect("a number is a valid ref");
-            let signs_in = command.signs_in();
-            let request = Request {
-                ref_: Some(ref_.clone()),
-                command,
-            };
-            let line = request
-                .try_to_line()
-                .map_err(Error::InvalidCommand)?
-                .to_string();
-            check_line_len(&line, MAX_CLIENT_LINE).map_err(Error::InvalidCommand)?;
-            let (tx, rx) = oneshot::channel();
-            if self.out.send(Outgoing::Line(line)).is_err() {
-                return Err(Error::Closed(CloseReason::Local));
-            }
-            st.next_ref += 1;
-            st.nonce_used |= uses_nonce;
-            st.pending.push_back(Pending {
-                ref_,
-                lines: Vec::new(),
-                signs_in,
-                reply: Some(tx),
-            });
-            rx
-        };
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(command, ReplyTo::Waiter(tx))?;
         match rx.await {
             Ok(result) => result,
             Err(_) => Err(Error::Closed(self.close_reason())),
         }
+    }
+
+    /// Sends a command whose response arrives on the incoming queue, as an
+    /// [`Incoming::Reply`] carrying the returned `ref`, in its place among
+    /// the other lines (3.6). Commands are written in the order of the
+    /// calls.
+    ///
+    /// It fails as [`request`](Self::request) does. If the connection
+    /// closes before the final response, no reply arrives: the queue ends
+    /// instead.
+    pub fn send(&self, command: Command) -> Result<Ref, Error> {
+        self.enqueue(command, ReplyTo::Queue)
+    }
+
+    /// Writes a command with a fresh `ref` and records where its response
+    /// goes.
+    fn enqueue(&self, command: Command, reply: ReplyTo) -> Result<Ref, Error> {
+        if !command.gets_response() {
+            return Err(Error::NoResponse);
+        }
+        let mut st = self.shared.state.lock().expect("poisoned");
+        if let Some(reason) = &st.closed {
+            return Err(Error::Closed(reason.clone()));
+        }
+        let uses_nonce = matches!(command, Command::Auth { .. } | Command::Register { .. });
+        if uses_nonce && st.nonce_used {
+            return Err(Error::NonceUsed);
+        }
+        let ref_: Ref = st
+            .next_ref
+            .to_string()
+            .parse()
+            .expect("a number is a valid ref");
+        let signs_in = command.signs_in();
+        let request = Request {
+            ref_: Some(ref_.clone()),
+            command,
+        };
+        let line = request
+            .try_to_line()
+            .map_err(Error::InvalidCommand)?
+            .to_string();
+        check_line_len(&line, MAX_CLIENT_LINE).map_err(Error::InvalidCommand)?;
+        if self.out.send(Outgoing::Line(line)).is_err() {
+            return Err(Error::Closed(CloseReason::Local));
+        }
+        st.next_ref += 1;
+        st.nonce_used |= uses_nonce;
+        st.pending.push_back(Pending {
+            ref_: ref_.clone(),
+            lines: Vec::new(),
+            signs_in,
+            reply,
+        });
+        Ok(ref_)
     }
 
     /// Sends a command and returns its `OK`, or the failure as
@@ -554,7 +614,7 @@ struct Reader<S> {
     decoder: LineDecoder,
     shared: Arc<Shared>,
     out: mpsc::UnboundedSender<Outgoing>,
-    incoming: mpsc::Sender<ServerMessage>,
+    incoming: mpsc::Sender<Incoming>,
     ping_after: Duration,
     ping_timeout: Duration,
     bye: Option<String>,
@@ -575,7 +635,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
             st.pending.drain(..).collect()
         };
         for p in pending {
-            if let Some(reply) = p.reply {
+            if let ReplyTo::Waiter(reply) = p.reply {
                 let _ = reply.send(Err(Error::Closed(reason.clone())));
             }
         }
@@ -648,7 +708,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
             ref_,
             lines: Vec::new(),
             signs_in: false,
-            reply: None,
+            reply: ReplyTo::Keepalive,
         });
         Ok(())
     }
@@ -704,7 +764,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
                 if let ServerLine::Bye { message } = &msg.line {
                     self.bye = Some(message.clone());
                 }
-                self.queue(msg)
+                self.queue(Incoming::Line(msg))
             }
         }
     }
@@ -723,7 +783,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
         Ok(())
     }
 
-    fn queue(&mut self, msg: ServerMessage) -> Result<(), CloseReason> {
+    fn queue(&mut self, msg: Incoming) -> Result<(), CloseReason> {
         match self.incoming.try_send(msg) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(CloseReason::Overflow),
@@ -755,13 +815,21 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
             st.uid = Some(uid);
         }
         drop(st);
-        if let Some(reply) = pending.reply {
-            let _ = reply.send(Ok(Response {
-                lines: pending.lines,
-                end,
-            }));
+        let response = Response {
+            lines: pending.lines,
+            end,
+        };
+        match pending.reply {
+            ReplyTo::Keepalive => Ok(()),
+            ReplyTo::Waiter(reply) => {
+                let _ = reply.send(Ok(response));
+                Ok(())
+            }
+            ReplyTo::Queue => self.queue(Incoming::Reply {
+                ref_: pending.ref_,
+                response,
+            }),
         }
-        Ok(())
     }
 }
 
