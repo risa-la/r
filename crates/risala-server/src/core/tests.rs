@@ -879,6 +879,52 @@ async fn a_resent_message_gets_its_seq_before_any_other_check() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn old_cids_are_forgotten_every_hour() {
+    let h = Harness::new();
+    let room: Room = "#general".parse().unwrap();
+    let key = h.store.room(&room).unwrap().unwrap().key;
+    let alice: Uid = "alice@example.org".parse().unwrap();
+    let cid: risala_proto::types::Cid = "0123456789abcdef".parse().unwrap();
+    let event = NewEvent {
+        t: start(),
+        from: alice.clone(),
+        kind: EventKind::Msg {
+            relation: None,
+            file: None,
+            text: "hi".into(),
+        },
+        cid: Some(cid.clone()),
+    };
+    h.store.append(key, &event).unwrap();
+    // Asked as of when it was sent, so only pruning hides it.
+    let stored = || h.store.cid_seq(key, &alice, &cid, start()).unwrap();
+    assert!(stored().is_some());
+
+    let pruner = tokio::spawn(h.hub.clone().prune_cids_every(CID_PRUNE_PERIOD));
+    h.clock.advance(Duration::from_secs(25 * 60 * 60));
+    tokio::time::sleep(CID_PRUNE_PERIOD - Duration::from_secs(1)).await;
+    assert!(stored().is_some(), "pruned before the hour was up");
+    for _ in 0..1000 {
+        if stored().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(stored().is_none(), "not pruned after an hour");
+    pruner.abort();
+
+    // A cid from less than 24 hours ago stays.
+    let event = NewEvent {
+        t: h.clock.now(),
+        ..event
+    };
+    h.store.append(key, &event).unwrap();
+    assert_eq!(h.hub.prune_cids().await.unwrap(), 0);
+    let now = h.clock.now();
+    assert!(h.store.cid_seq(key, &alice, &cid, now).unwrap().is_some());
+}
+
 // ---------------------------------------------------------------------------
 // History and sync (7.1, 7.2)
 

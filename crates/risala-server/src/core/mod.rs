@@ -46,6 +46,9 @@ use state::{ConnEntry, Registry, RoomEntry};
 /// The number of random bytes in a greeting's nonce (4.1).
 pub const NONCE_BYTES: usize = 32;
 
+/// How often [`Hub::prune_cids_every`] runs in `risalad`.
+pub const CID_PRUNE_PERIOD: Duration = Duration::from_secs(60 * 60);
+
 /// Where the hub gets the time from. Replace it in tests where timing
 /// matters.
 pub trait Clock: Send + Sync + 'static {
@@ -265,6 +268,33 @@ impl Hub {
     /// The configuration the hub was started with.
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    /// Forgets the cids of messages sent more than 24 hours ago (7.6), and
+    /// returns how many. The hub does this when it starts, and `risalad`
+    /// every [`CID_PRUNE_PERIOD`] after that.
+    pub async fn prune_cids(&self) -> Result<u64, StoreError> {
+        let window = Duration::from_millis(store::CID_WINDOW_MS);
+        let Some(before) = self.inner.now().checked_sub(window) else {
+            return Ok(0);
+        };
+        self.inner.db(move |s| s.prune_cids(before)).await
+    }
+
+    /// Runs [`prune_cids`](Self::prune_cids) every `period`, starting one
+    /// period from now, until the future is dropped. Failures are logged.
+    pub async fn prune_cids_every(self, period: Duration) {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is now; the hub pruned when it started.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            match self.prune_cids().await {
+                Ok(n) => tracing::debug!(cids = n, "forgot old cids"),
+                Err(e) => tracing::error!("forgetting old cids failed: {e}"),
+            }
+        }
     }
 }
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
-use crate::core::{Hub, HubError};
+use crate::core::{CID_PRUNE_PERIOD, Hub, HubError};
 use crate::net;
 
 /// An error starting or running the server.
@@ -97,9 +97,24 @@ impl Daemon {
     /// every connection (11) and returns once they have closed, or after a
     /// grace period (see [`net::Server::run`]). Guests still connected at
     /// shutdown leave their rooms (4.2) before this returns.
+    ///
+    /// Meanwhile, cids older than 24 hours are forgotten every
+    /// [`CID_PRUNE_PERIOD`] (7.6).
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RunError> {
+        let _pruner = AbortOnDrop(tokio::spawn(
+            self.hub.clone().prune_cids_every(CID_PRUNE_PERIOD),
+        ));
         self.server.run(shutdown).await?;
         Ok(())
+    }
+}
+
+/// Stops a background task when the daemon stops, however it stops.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
