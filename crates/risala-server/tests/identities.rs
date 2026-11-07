@@ -43,6 +43,39 @@ async fn join(client: &mut TestClient, room: &str) {
 // ---------------------------------------------------------------------------
 // Signing in (4.4-4.6)
 
+/// The relay attack of 4.5: a malicious server connects here with its own
+/// name in SNI, passes this server's nonce on to one of its users, and
+/// tries to sign in with the signature it gets back. The server refuses
+/// AUTH and REGISTER on a connection whose SNI does not name it.
+#[tokio::test]
+async fn sign_ins_are_refused_under_another_servers_name() {
+    use risala_server::testing::ClientOptions;
+
+    let server = server().await;
+    let bob = server.identity("bob@example.net");
+    let alice = TestIdentity::new("alice@example.org");
+    for register in [false, true] {
+        for who in [&bob, &alice] {
+            let mut conn = server
+                .connect_with(ClientOptions::sni("evil.example"))
+                .await;
+            let greeting = conn.expect_line().await.unwrap();
+            let nonce = greeting.split(' ').nth(3).unwrap().parse().unwrap();
+            let line = if register {
+                who.register_line("evil.example", &nonce)
+            } else {
+                who.auth_line("evil.example", &nonce)
+            };
+            conn.send(&line).await.unwrap();
+            let answer = conn.expect_line().await.unwrap();
+            assert!(answer.starts_with("ERR auth-failed"), "{answer}");
+        }
+    }
+    // The same signatures, made for this server's name, work.
+    let _bob = server.sign_in(&bob).await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn auth_with_a_fetched_key_file() {
     let server = server().await;

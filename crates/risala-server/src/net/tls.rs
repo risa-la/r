@@ -74,6 +74,9 @@ struct Inner {
 struct Loaded {
     key: Arc<CertifiedKey>,
     fingerprint: Fingerprint,
+    /// The DNS names in the certificate's subject alternative names, in
+    /// lower case, wildcard names such as `*.example.org` included.
+    names: Vec<String>,
     /// The files' modification times when last read, successfully or not.
     mtimes: [Option<SystemTime>; 2],
 }
@@ -144,6 +147,39 @@ impl Certificates {
     /// The fingerprints of every certificate, in configuration order.
     pub fn fingerprints(&self) -> Vec<Fingerprint> {
         self.read().iter().map(|l| l.fingerprint).collect()
+    }
+
+    /// The DNS names on every certificate, in configuration order and
+    /// without repeats, in lower case. Wildcard names such as
+    /// `*.example.org` are listed as they are. They follow reloads.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for name in self.read().iter().flat_map(|l| &l.names) {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+
+    /// Whether `host` is a name on one of the certificates, as they are
+    /// now, under the usual rules for certificate names: a wildcard such
+    /// as `*.example.org` covers `chat.example.org` but neither
+    /// `example.org` nor `a.chat.example.org` (RFC 6125). A trailing `.`
+    /// is ignored, and so is case.
+    ///
+    /// The hub accepts sign-ins only on connections whose SNI is its
+    /// configured hostname or such a name (4.5).
+    pub fn serves(&self, host: &str) -> bool {
+        let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        let Ok(name) = ServerName::try_from(host.as_str()) else {
+            return false;
+        };
+        // An IP address is never a name the server signs in on (2.1).
+        if !matches!(name, ServerName::DnsName(_)) {
+            return false;
+        }
+        self.read().iter().any(|l| valid_for(&l.key, &name))
     }
 
     /// Re-reads every certificate and key (2.2). A pair that fails to load
@@ -219,19 +255,34 @@ impl ResolvesServerCert for Resolver {
             .server_name()
             .and_then(|s| ServerName::try_from(s).ok())
         {
-            let chosen = loaded.iter().find(|l| {
-                l.key.end_entity_cert().is_ok_and(|der| {
-                    webpki::EndEntityCert::try_from(der)
-                        .and_then(|cert| cert.verify_is_valid_for_subject_name(&name))
-                        .is_ok()
-                })
-            });
+            let chosen = loaded.iter().find(|l| valid_for(&l.key, &name));
             if let Some(l) = chosen {
                 return Some(l.key.clone());
             }
         }
         loaded.first().map(|l| l.key.clone())
     }
+}
+
+/// Whether the end-entity certificate of `key` is valid for `name`.
+fn valid_for(key: &CertifiedKey, name: &ServerName<'_>) -> bool {
+    key.end_entity_cert().is_ok_and(|der| {
+        webpki::EndEntityCert::try_from(der)
+            .and_then(|cert| cert.verify_is_valid_for_subject_name(name))
+            .is_ok()
+    })
+}
+
+/// The DNS names in a certificate's subject alternative names, in lower
+/// case.
+fn dns_names(cert: &CertificateDer<'_>) -> Vec<String> {
+    webpki::EndEntityCert::try_from(cert)
+        .map(|cert| {
+            cert.valid_dns_names()
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn mtimes(pair: &CertPair) -> [Option<SystemTime>; 2] {
@@ -259,11 +310,13 @@ fn load_pair(pair: &CertPair) -> io::Result<Loaded> {
         return Err(invalid(&pair.cert, "no certificate in the file"));
     }
     let fingerprint = spki_fingerprint(&chain[0]).map_err(|e| invalid(&pair.cert, e))?;
+    let names = dns_names(&chain[0]);
     let key = PrivateKeyDer::from_pem_file(&pair.key).map_err(|e| invalid(&pair.key, e))?;
     let key = CertifiedKey::from_der(chain, key, &provider()).map_err(|e| invalid(&pair.key, e))?;
     Ok(Loaded {
         key: Arc::new(key),
         fingerprint,
+        names,
         mtimes,
     })
 }
@@ -330,11 +383,7 @@ fn self_signed_cert_fits(pair: &CertPair, hostname: &str) -> bool {
     let Ok(name) = ServerName::try_from(hostname) else {
         return false;
     };
-    loaded.key.end_entity_cert().is_ok_and(|der| {
-        webpki::EndEntityCert::try_from(der)
-            .and_then(|cert| cert.verify_is_valid_for_subject_name(&name))
-            .is_ok()
-    })
+    valid_for(&loaded.key, &name)
 }
 
 /// Writes a file through a temporary one and a rename, so a reader never

@@ -92,6 +92,17 @@ impl Harness {
     }
 
     pub(super) fn connect_sni(&mut self, sni: Option<&str>, capacity: usize) -> Client {
+        self.connect_info(sni, false, capacity)
+    }
+
+    /// A new connection with SNI `sni`, which the network layer found on
+    /// one of the server's certificates if `certified` (4.5).
+    pub(super) fn connect_info(
+        &mut self,
+        sni: Option<&str>,
+        certified: bool,
+        capacity: usize,
+    ) -> Client {
         self.next += 1;
         let id = ConnId(self.next);
         let (handle, rx) = conn_channel(id, capacity, usize::MAX);
@@ -99,6 +110,7 @@ impl Harness {
             ConnInfo {
                 peer: SocketAddr::from(([203, 0, 113, 7], 51000)),
                 sni: sni.map(str::to_owned),
+                sni_certified: certified,
                 since: start(),
             },
             handle,

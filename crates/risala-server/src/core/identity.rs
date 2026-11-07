@@ -43,6 +43,9 @@ struct Challenge {
     nonce: Option<Nonce>,
     /// The SNI hostname, in lower case (4.5).
     sni: Option<String>,
+    /// Whether the SNI hostname is a name on one of the server's
+    /// certificates (4.5).
+    sni_certified: bool,
     /// The client's address, for the registration limit (13).
     peer: IpAddr,
 }
@@ -138,6 +141,7 @@ impl Inner {
         Some(Challenge {
             nonce: conn.nonce.take(),
             sni: conn.info.sni.clone(),
+            sni_certified: conn.info.sni_certified,
             peer: conn.info.peer.ip(),
         })
     }
@@ -145,14 +149,30 @@ impl Inner {
     /// The host and nonce to check a signature against (4.5): the
     /// connection's SNI hostname, since the client signs the name it
     /// connected to, and its nonce, unless it was used up.
-    fn host_and_nonce(challenge: Challenge) -> Result<(String, Nonce), Fail> {
+    ///
+    /// The SNI hostname must be a name this server serves: its configured
+    /// hostname, or a name on one of its certificates (4.5, step 1).
+    /// Otherwise a server could connect here with its own name in SNI,
+    /// pass this connection's nonce on to one of its own users, and sign
+    /// in here as them with the signature it gets back (14).
+    fn host_and_nonce(&self, challenge: Challenge) -> Result<(String, Nonce), Fail> {
         let nonce = challenge
             .nonce
             .ok_or_else(|| auth_failed("this connection's nonce was used up; reconnect"))?;
         let host = challenge
             .sni
             .ok_or_else(|| auth_failed("connect with SNI to sign in as an identity"))?;
+        if !challenge.sni_certified && !self.is_hostname(&host) {
+            return Err(auth_failed("connect with this server's name in SNI"));
+        }
         Ok((host, nonce))
+    }
+
+    /// Whether `host` is the configured hostname, ignoring case and one
+    /// trailing `.` (2.1).
+    fn is_hostname(&self, host: &str) -> bool {
+        let trim = |h: &str| h.strip_suffix('.').unwrap_or(h).to_ascii_lowercase();
+        trim(host) == trim(&self.config.hostname)
     }
 
     /// AUTH (4.5).
@@ -165,7 +185,7 @@ impl Inner {
         let Some(challenge) = self.take_challenge(id) else {
             return Ok(None);
         };
-        let (host, nonce) = Self::host_and_nonce(challenge)?;
+        let (host, nonce) = self.host_and_nonce(challenge)?;
         let uid = identity.to_uid();
         let key = if self.hosts(&identity) {
             let who = uid.clone();
@@ -374,7 +394,7 @@ impl Inner {
             return Err(fail(ErrorCode::Forbidden, "registration is closed"));
         }
         let peer = challenge.peer;
-        let (host, nonce) = Self::host_and_nonce(challenge)?;
+        let (host, nonce) = self.host_and_nonce(challenge)?;
         let now = self.now();
         if let Some(retry) = self.registration_retry(peer, now) {
             return Err(Fail::Err(

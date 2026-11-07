@@ -39,6 +39,11 @@ pub struct ConnInfo {
     /// The SNI hostname the client sent, in lower case, or `None` if it sent
     /// none (2.1, 4.1).
     pub sni: Option<String>,
+    /// Whether `sni` is a name on one of the server's certificates,
+    /// wildcard names included, as they were when the handshake finished.
+    /// The hub accepts sign-ins only on connections whose SNI is its
+    /// configured hostname or such a name (4.5).
+    pub sni_certified: bool,
     /// When the TLS handshake finished.
     pub since: Timestamp,
 }

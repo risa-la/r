@@ -181,6 +181,7 @@ impl<H: Handler> Server<H> {
         let shared = Arc::new(Shared {
             handler: self.handler,
             acceptor: self.acceptor,
+            certs: self.certs.clone(),
             timers: self.timers,
             out_queue: self.out_queue,
             out_queue_bytes: self.out_queue_bytes,
@@ -241,6 +242,8 @@ impl<H: Handler> Server<H> {
 struct Shared<H> {
     handler: Arc<H>,
     acceptor: TlsAcceptor,
+    /// The certificates, to tell whether a connection's SNI names one.
+    certs: Certificates,
     timers: Timers,
     out_queue: usize,
     out_queue_bytes: usize,
@@ -330,9 +333,11 @@ async fn connection<H: Handler>(
     }
     tracing::debug!(conn = id.0, %peer, ?sni, ?alpn, "connected");
 
+    let sni_certified = sni.as_deref().is_some_and(|name| shared.certs.serves(name));
     let info = ConnInfo {
         peer,
         sni,
+        sni_certified,
         since: Timestamp::now(),
     };
     conn::serve(

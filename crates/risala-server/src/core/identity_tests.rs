@@ -277,6 +277,47 @@ async fn auth_failures() {
     );
 }
 
+/// AUTH and REGISTER work only on connections whose SNI names this
+/// server: its hostname, or a name on one of its certificates (4.5).
+/// Otherwise a server could relay this one's nonce to its own users under
+/// its own name, and sign in here with the signatures it gets back.
+#[tokio::test]
+async fn sign_ins_need_the_servers_name_in_sni() {
+    let mut w = World::new();
+    let bob = identity("bob@example.net");
+    w.fetcher.set(&bob, vec![public(1)]);
+    let refused = "ERR auth-failed connect with this server's name in SNI";
+
+    // evil.example connects here with its own name in SNI, and has bob
+    // sign the challenge for it.
+    let evil = "evil.example";
+    let mut c = w.h.connect_info(Some(evil), false, 4096);
+    let nonce: Nonce = c.lines()[0].split(' ').nth(3).unwrap().parse().unwrap();
+    w.send(&c, &auth("bob@example.net", 1, evil, &nonce)).await;
+    assert_eq!(c.lines(), [refused]);
+    // The nonce is used up all the same.
+    w.send(&c, &auth("bob@example.net", 1, HOST, &nonce)).await;
+    assert_eq!(
+        c.lines(),
+        ["ERR auth-failed this connection's nonce was used up; reconnect"]
+    );
+    let mut c = w.h.connect_info(Some(evil), false, 4096);
+    let nonce: Nonce = c.lines()[0].split(' ').nth(3).unwrap().parse().unwrap();
+    w.send(&c, &register("alice", 0, evil, &nonce)).await;
+    assert_eq!(c.lines(), [refused]);
+    assert_eq!(published(&w, "alice"), None);
+    assert_eq!(w.fetcher.calls(), []);
+
+    // The hostname in any case, with a trailing dot, and names on the
+    // certificates, which the network layer checks.
+    for (sni, certified) in [("Chat.Example.org.", false), ("other.example.org", true)] {
+        let mut c = w.h.connect_info(Some(sni), certified, 4096);
+        let nonce: Nonce = c.lines()[0].split(' ').nth(3).unwrap().parse().unwrap();
+        w.send(&c, &auth("bob@example.net", 1, sni, &nonce)).await;
+        assert_eq!(c.lines(), ["OK uid=bob@example.net"], "{sni}");
+    }
+}
+
 /// A key file that does not arrive in time fails AUTH, without holding up
 /// anyone else.
 #[tokio::test(start_paused = true)]

@@ -152,6 +152,7 @@ impl Pipe {
         let info = ConnInfo {
             peer: "127.0.0.1:50000".parse().unwrap(),
             sni: None,
+            sni_certified: false,
             since: Timestamp::now(),
         };
         let task = tokio::spawn(conn::serve(
@@ -557,6 +558,7 @@ async fn shutdown_stops_reading() {
     let info = ConnInfo {
         peer: "127.0.0.1:50000".parse().unwrap(),
         sni: None,
+        sni_certified: false,
         since: Timestamp::now(),
     };
     let task = tokio::spawn(conn::serve(
@@ -787,6 +789,66 @@ async fn certificates_are_chosen_by_sni() {
         };
         assert_eq!(server.client(options).await.fingerprint(), want, "{sni:?}");
     }
+    server.shutdown().await;
+}
+
+/// The names on the certificates, which the hub checks sign-ins against
+/// (4.5), with wildcards matched as usual, and the network layer telling
+/// the handler whether a connection's SNI is one of them.
+#[tokio::test]
+async fn certificate_names_follow_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = pair_in(dir.path(), "a");
+    let b = pair_in(dir.path(), "b");
+    write_cert(&a, &["a.test"]);
+    write_cert(&b, &["B.test", "*.b.test", "a.test"]);
+    let mut config = test_config(dir.path());
+    config.tls.certs = vec![a.clone(), b];
+    let server = Running::start(&config);
+    assert_eq!(server.certs.names(), ["a.test", "b.test", "*.b.test"]);
+    for (host, served) in [
+        ("a.test", true),
+        ("A.Test.", true),
+        ("b.test", true),
+        ("chat.b.test", true),
+        // A wildcard covers one label, and not the name it is under.
+        ("x.chat.b.test", false),
+        ("other.test", false),
+        ("127.0.0.1", false),
+        ("", false),
+    ] {
+        assert_eq!(server.certs.serves(host), served, "{host}");
+    }
+
+    for (sni, certified) in [
+        (Some("a.test"), true),
+        (Some("Chat.B.Test"), true),
+        (Some("elsewhere.test"), false),
+        (None, false),
+    ] {
+        let options = ClientOptions {
+            sni: sni.map(str::to_owned),
+            ..ClientOptions::default()
+        };
+        server.client(options).await;
+        let opened = server.stub.opened();
+        assert_eq!(opened.last().unwrap().sni_certified, certified, "{sni:?}");
+    }
+
+    // A reload changes the names.
+    write_cert(&a, &["new.test"]);
+    assert!(server.certs.reload());
+    assert!(server.certs.serves("new.test"));
+    assert!(server.certs.serves("a.test"), "still on the second");
+    write_cert(&a, &["a.test"]);
+    let b = pair_in(dir.path(), "b");
+    write_cert(&b, &["b.test"]);
+    assert!(server.certs.reload());
+    assert!(!server.certs.serves("new.test"));
+    assert!(!server.certs.serves("chat.b.test"));
+    assert_eq!(server.certs.names(), ["a.test", "b.test"]);
+    server.client(ClientOptions::sni("new.test")).await;
+    assert!(!server.stub.opened().last().unwrap().sni_certified);
     server.shutdown().await;
 }
 
