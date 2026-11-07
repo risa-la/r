@@ -559,6 +559,22 @@ Open:
     `webpki-root-certs`, so servers do not depend on their host's CA
     store.
 
+26. **Found while building identities** (4.4, 4.6-4.8, 6.2, 6.3, 8.5).
+    - INFO says `register=no` while registration is closed (confirmed
+      with the user).
+    - UNREGISTER keeps room bans and deletes invitations (confirmed).
+    - Operators may join rooms they are banned from (confirmed).
+    - Invitees may see a private room's INFO, but not its HISTORY, before
+      joining (confirmed).
+    - Retired names get `name-taken`. Registration over the limit gets
+      `rate-limited`. KEY for an identity the server does not host gets
+      `not-supported`. KEY ADD of a known key replaces its label, a label
+      with a line break is `bad-syntax`, and a 65th key is `forbidden`.
+    - Servers close devices only after fetching a key file that no longer
+      lists their key, never because a fetch failed.
+    - UNREGISTER `purge=yes` waits for DELETE in M4 and gets
+      `not-supported` until then.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

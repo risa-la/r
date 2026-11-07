@@ -435,7 +435,7 @@ async fn register_can_be_closed() {
     assert_eq!(
         c.lines(),
         [
-            "OK version=1 guests=yes register=example.org retention=forever push=no upload=no",
+            "OK version=1 guests=yes register=no retention=forever push=no upload=no",
             "ERR forbidden registration is closed",
         ]
     );
@@ -946,7 +946,8 @@ async fn who_may_read_and_join() {
     w.send(&op, "join #bob").await;
     assert!(op.lines().last().unwrap().starts_with("OK id="));
 
-    // An invitation lets Eve see it and join, but not read before.
+    // An invitation lets Eve see it, look at INFO and join, but not read
+    // its history before joining (6.2, 7.2).
     let eve_uid = uid("eve@example.net");
     let invited = eve_uid.clone();
     w.h.room_state("#bob", move |info| {
@@ -954,6 +955,12 @@ async fn who_may_read_and_join() {
     })
     .await;
     w.send(&eve, "info #bob").await;
+    let info = eve.lines();
+    assert!(
+        info.last().unwrap().ends_with(" role=none joined=no"),
+        "{info:?}"
+    );
+    w.send(&eve, "history #bob").await;
     assert_eq!(eve.lines(), ["ERR forbidden join the room first"]);
     w.send(&eve, "join #bob").await;
     assert!(eve.lines().last().unwrap().starts_with("OK id="));

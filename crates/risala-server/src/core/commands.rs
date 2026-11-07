@@ -156,6 +156,24 @@ fn check_join(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
     ))
 }
 
+/// Checks that the asker may see `INFO <room>` (6.2): anyone who may read
+/// the room, and also someone invited to it who is not banned, so their
+/// client can show what they are invited to. HISTORY stays closed to them
+/// until they join (7.2).
+fn check_info(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
+    match check_read(info, a) {
+        Err(Fail::Err(e))
+            if e.code == ErrorCode::Forbidden
+                && a.uid.is_identity()
+                && info.invites.contains(a.uid)
+                && !info.bans.contains(a.uid) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// What INFO reports as `role` (6.2, 6.3).
 fn info_role(st: &RoomInfo, uid: &Uid, member: bool) -> InfoRole {
     match st.roles.get(uid) {
@@ -296,9 +314,11 @@ impl Inner {
         OkResponse::new()
             .with_version(risala_proto::PROTOCOL_VERSION)
             .with_guests(settings.guests)
+            // `register=no` while registration is closed (8.5), so clients
+            // do not offer a sign-up that will fail.
             .with_register(&match &self.identity_domain {
-                Some(domain) => Register::Domain(domain.clone()),
-                None => Register::No,
+                Some(domain) if settings.registration => Register::Domain(domain.clone()),
+                _ => Register::No,
             })
             .with_retention(settings.retention)
             .with_push(false)
@@ -342,7 +362,7 @@ impl Inner {
         let st = self.lock_room(room).await?;
         let info = room_of(&st)?;
         let (member, members) = (st.is_member(uid), st.member_count());
-        check_read(info, self.asker(uid, member))?;
+        check_info(info, self.asker(uid, member))?;
         send_settings(reply, info);
         // A room from the configuration has no events until someone joins,
         // and then reports `head=0` (6.2).

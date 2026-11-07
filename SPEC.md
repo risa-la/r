@@ -695,7 +695,8 @@ device fetches a key file:
   has no keys.
 
 A server that notices a key has been removed SHOULD close the
-connections that signed in with it.
+connections that signed in with it. It notices this only from a key file
+it has fetched. A fetch that fails is not a reason to close anything.
 
 ### 4.5. Signing In
 
@@ -778,9 +779,12 @@ connection is signed in as it.
 Errors:
 
 - `not-supported`: this server does not offer registration.
-- `name-taken`: the name is already registered.
+- `name-taken`: the name is already registered, or was once and has been
+  retired (4.8).
 - `auth-failed`: the signature did not verify.
 - `forbidden`: for example, registration is closed.
+- `rate-limited`: too many registrations from the client's network
+  address (Section 14). The `retry` tag says when to try again.
 
 If someone loses all the keys of an identity the server hosts, an
 operator can add a new key for them with `ADMIN ADDKEY` (10.5). How the
@@ -789,7 +793,7 @@ operator checks who is asking is outside the scope of this document.
 ### 4.7. Managing Keys
 
 These commands work only for identities that the server itself hosts.
-Other people edit their key file directly.
+Other people edit their key file directly, and get `ERR not-supported`.
 
 ```
 KEY LIST
@@ -802,6 +806,10 @@ KEY DEL <key>
   public key, and the user adds it from a device that is already signed
   in. The new device then joins the identity's encrypted conversations
   (12.6).
+- `KEY ADD` of a key the identity already has replaces its label. A
+  label that holds a line break once unescaped (3.4) gets
+  `ERR bad-syntax`, since it cannot go in a key file. A key beyond the
+  64 of 4.4 gets `ERR forbidden`.
 - `KEY DEL` removes a key. The server MUST refuse to remove the last key
   (`ERR forbidden`). It SHOULD close the connections that use the
   removed key. It deletes the key's KeyPackages and pending Welcomes
@@ -821,8 +829,10 @@ otherwise). Having to type it out guards against sending UNREGISTER by
 mistake. Any identity may do this on any server.
 
 The server removes the identity from all its rooms, and deletes its
-roles, read markers, blocks, display name, cids, push registrations,
-KeyPackages, pending Welcomes and backups (Section 12). Members' devices
+roles, invitations, read markers, blocks, display name, cids, push
+registrations, KeyPackages, pending Welcomes and backups (Section 12).
+Room bans against it stay, since they belong to the rooms: otherwise
+someone banned could come back clean by unregistering. Members' devices
 remove its leaves from encrypted rooms (12.6). Then:
 
 - **With `purge=yes`,** the server also deletes every message the
@@ -1393,6 +1403,9 @@ INFO <room>
   `none` otherwise.
 - `joined` says whether you are a member right now. An owner or
   moderator who has left has `joined=no`.
+- INFO follows the reading rules of 7.2, except that someone invited to a
+  private room may see its INFO before joining, so their client can show
+  what they are invited to. HISTORY stays closed to them until they join.
 
 ### 6.3. Roles
 
@@ -1424,7 +1437,8 @@ membership:
 - Guests in a room with `guests read` cannot send messages, reactions or
   typing notifications.
 - Server operators (Section 10) have owner rights in every room, and may
-  join any room without an invitation, except an encrypted one (6.1).
+  join any room without an invitation, except an encrypted one (6.1),
+  even one they are banned from.
 
 ```
 ROLE <room> <uid> <role>
@@ -1837,7 +1851,7 @@ INFO is allowed before signing in. It returns these values:
 |---|---|
 | `version=1` | The protocol version |
 | `guests=yes` or `guests=no` | Whether guests are allowed |
-| `register=<domain>` or `register=no` | The identity domain for REGISTER, or `no` if the server offers no registration |
+| `register=<domain>` or `register=no` | The identity domain for REGISTER, or `no` if the server offers no registration or it is closed right now |
 | `retention=<days>` or `retention=forever` | How long events are kept |
 | `push=yes` or `push=no` | Whether PUSH is supported |
 | `upload=<bytes>` or `upload=no` | The largest file UPLOAD accepts, or `no` if the server offers no uploads (5.6) |
