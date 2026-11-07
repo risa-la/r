@@ -111,6 +111,47 @@ fn trust_records() {
 }
 
 #[test]
+fn reads_do_not_wait_for_writes() {
+    // A write holds the write connection, for example while it waits for
+    // another process's lock. Reads use their own connection, and see
+    // what was committed before.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("cache.db")).unwrap();
+    let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            store
+                .write(|tx| {
+                    tx.conv_or_create(account, &room())?;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        })
+    };
+    entered.recv().unwrap();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            done_tx.send(store.conversations(account).unwrap()).unwrap();
+        });
+    }
+    // Generous: the read takes milliseconds, or never ends if it waits.
+    let seen = done
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the read waited for the write");
+    assert!(seen.is_empty(), "the write is not committed yet");
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(store.conversations(account).unwrap().len(), 1);
+}
+
+#[test]
 fn schema_versions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
