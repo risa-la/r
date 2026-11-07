@@ -59,6 +59,7 @@ pub struct Timeline {
     state: Arc<Mutex<State>>,
     rx: Arc<tokio::sync::Mutex<broadcast::Receiver<Arc<Batch>>>>,
     notify: Arc<Notify>,
+    rt: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for Timeline {
@@ -103,6 +104,7 @@ impl Timeline {
             state: Arc::new(Mutex::new(state)),
             rx: Arc::new(tokio::sync::Mutex::new(rx)),
             notify: Arc::new(Notify::new()),
+            rt: shared.rt.clone(),
         })
     }
 
@@ -143,7 +145,7 @@ impl Timeline {
                     // applied before it, even if this call is dropped. The
                     // diffs are queued in the same step.
                     let state = self.state.clone();
-                    blocking(move || {
+                    blocking(&self.rt, move || {
                         let _rx = rx;
                         let mut st = state.lock().expect("poisoned");
                         let diffs = match &reload {
@@ -176,7 +178,7 @@ impl Timeline {
     pub async fn paginate_back(&self, count: u32) -> Result<bool, ClientError> {
         let state = self.state.clone();
         let notify = self.notify.clone();
-        let exhausted = blocking(move || -> Result<bool, StoreError> {
+        let exhausted = blocking(&self.rt, move || -> Result<bool, StoreError> {
             let mut st = state.lock().expect("poisoned");
             let (diffs, exhausted) = st.older(count.max(1))?;
             if !diffs.is_empty() {

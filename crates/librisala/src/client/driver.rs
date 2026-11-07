@@ -85,7 +85,7 @@ async fn drive(
     let guest_token = if shared.is_guest() {
         let store = shared.store.clone();
         let account = shared.id;
-        match blocking(move || store.guest_session(account)).await {
+        match blocking(&shared.rt, move || store.guest_session(account)).await {
             Ok(session) => Some(Arc::new(GuestToken::new(session))),
             Err(e) => {
                 warn!(error = %e, "reading the guest session");
@@ -172,7 +172,7 @@ async fn drive(
 async fn save_guest_session(shared: &AccountShared, session: Option<(Name, Id)>) {
     let store = shared.store.clone();
     let account = shared.id;
-    let saved = blocking(move || {
+    let saved = blocking(&shared.rt, move || {
         store.set_guest_session(account, session.as_ref().map(|(name, token)| (name, token)))
     })
     .await;
@@ -379,7 +379,7 @@ impl Online<'_> {
     async fn rooms_to_rejoin(&self) -> Result<Vec<Room>, StoreError> {
         let store = self.shared.store.clone();
         let account = self.shared.id;
-        let mut rooms = blocking(move || store.rejoin_rooms(account)).await?;
+        let mut rooms = blocking(&self.shared.rt, move || store.rejoin_rooms(account)).await?;
         if rooms.is_empty() {
             return Ok(rooms);
         }
@@ -436,7 +436,11 @@ impl Online<'_> {
                 // The user left: do not join it again (4.2).
                 let store = self.shared.store.clone();
                 let (account, r) = (self.shared.id, room.clone());
-                if let Err(e) = blocking(move || store.set_rejoin(account, &r, false)).await {
+                if let Err(e) = blocking(&self.shared.rt, move || {
+                    store.set_rejoin(account, &r, false)
+                })
+                .await
+                {
                     let _ = reply.send(Err(e.into()));
                     return None;
                 }
@@ -459,7 +463,7 @@ impl Online<'_> {
             let mut engine = self.engine.take().expect("the engine is here");
             let store = self.shared.store.clone();
             let account = self.shared.id;
-            let (engine, results) = blocking(move || {
+            let (engine, results) = blocking(&self.shared.rt, move || {
                 let mut results = Vec::new();
                 for input in inputs_only {
                     let result = step(&mut engine, input).map(|(out, sent)| {
@@ -570,7 +574,7 @@ impl Online<'_> {
         if !not_again.is_empty() || !join_again.is_empty() {
             let store = self.shared.store.clone();
             let account = self.shared.id;
-            let written = blocking(move || -> Result<(), StoreError> {
+            let written = blocking(&self.shared.rt, move || -> Result<(), StoreError> {
                 for room in &not_again {
                     store.set_rejoin(account, room, false)?;
                 }
@@ -747,12 +751,12 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
     match cmd {
         Cmd::Send { conv, draft, reply } => {
             let s = shared.clone();
-            let result = blocking(move || queue_offline(&s, &conv, &draft)).await;
+            let result = blocking(&shared.rt, move || queue_offline(&s, &conv, &draft)).await;
             let _ = reply.send(result);
         }
         Cmd::MarkRead { conv, seq, reply } => {
             let s = shared.clone();
-            let result = blocking(move || {
+            let result = blocking(&shared.rt, move || {
                 let account = s.id;
                 let (_, changes) = s.store.write(|tx| {
                     if let Some(mut row) = tx.conv_by_name(account, &conv)? {
@@ -768,7 +772,7 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
         }
         Cmd::Part { room, reply, .. } if shared.is_guest() => {
             let s = shared.clone();
-            let result = blocking(move || {
+            let result = blocking(&shared.rt, move || {
                 s.store.set_rejoin(s.id, &room, false)?;
                 let account = s.id;
                 let (_, changes) = s.store.write(|tx| {

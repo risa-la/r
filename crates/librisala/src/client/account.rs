@@ -58,6 +58,8 @@ pub(crate) struct AccountShared {
     pub driver: Mutex<Option<DriverHandle>>,
     /// The signed-in session, for commands outside the sync engine.
     pub session: Mutex<Option<Arc<Session>>>,
+    /// The client's runtime, where the account's tasks run.
+    pub rt: tokio::runtime::Handle,
     next_driver: AtomicU64,
 }
 
@@ -117,6 +119,7 @@ impl AccountShared {
         uid: Uid,
         store: Store,
         options: ClientOptions,
+        rt: tokio::runtime::Handle,
     ) -> Arc<AccountShared> {
         Arc::new(AccountShared {
             id,
@@ -129,6 +132,7 @@ impl AccountShared {
             events: broadcast::channel(EVENT_CAPACITY).0,
             driver: Mutex::new(None),
             session: Mutex::new(None),
+            rt,
             next_driver: AtomicU64::new(1),
         })
     }
@@ -181,7 +185,8 @@ impl AccountShared {
             None => cmd,
         };
         let shared = self.clone();
-        tokio::spawn(async move { driver::offline(&shared, cmd).await });
+        self.rt
+            .spawn(async move { driver::offline(&shared, cmd).await });
     }
 }
 
@@ -246,8 +251,8 @@ impl Account {
     }
 
     /// Starts keeping a connection up in the background, signing in and
-    /// syncing on each one. Does nothing if it is already running. Needs a
-    /// tokio runtime.
+    /// syncing on each one. Does nothing if it is already running. It runs
+    /// on the client's runtime, so this may be called from any thread.
     pub fn start(&self) {
         let mut driver = self.shared.driver.lock().expect("poisoned");
         if driver.as_ref().is_some_and(|d| !d.task.is_finished()) {
@@ -259,7 +264,10 @@ impl Account {
         // outcome of this start.
         self.shared
             .set_state(ConnectionState::Connecting { attempt: 0 });
-        let task = tokio::spawn(driver::run(self.shared.clone(), generation, rx));
+        let task = self
+            .shared
+            .rt
+            .spawn(driver::run(self.shared.clone(), generation, rx));
         *driver = Some(DriverHandle {
             generation,
             cmds,
@@ -493,7 +501,8 @@ impl Account {
         let events = self.subscribe();
         loop {
             let account = self.clone();
-            let entry = blocking(move || account.outbox_entry(id)).await?;
+            let rt = account.shared.rt.clone();
+            let entry = blocking(&rt, move || account.outbox_entry(id)).await?;
             if entry.status.is_final() {
                 return Ok(entry);
             }
@@ -679,7 +688,8 @@ impl Conversation {
         });
         let id = wait(rx).await?;
         let account = self.account.clone();
-        blocking(move || account.outbox_entry(id.get())).await
+        let rt = account.shared.rt.clone();
+        blocking(&rt, move || account.outbox_entry(id.get())).await
     }
 
     /// Moves the read marker forward to `seq` (7.4): in the cache, and on
