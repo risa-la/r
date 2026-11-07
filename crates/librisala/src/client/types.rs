@@ -644,6 +644,11 @@ pub enum AccountEvent {
     /// Events were missed because they were not read in time. Read again
     /// whatever is shown.
     Lagged,
+    /// Another process sharing the cache, such as a notification
+    /// extension, wrote to it (see [`Client::check_for_external_changes`](super::Client::check_for_external_changes)).
+    /// Read again whatever is shown: the conversation list and the outbox.
+    /// [`Timeline`](super::Timeline)s reset themselves.
+    CacheChanged,
 }
 
 /// Whether an error code means the room cannot be joined again as it is.

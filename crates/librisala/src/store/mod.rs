@@ -261,6 +261,23 @@ impl Store {
         Ok((out, changes))
     }
 
+    /// A number that changes when another process commits a write to the
+    /// cache (SQLite's `PRAGMA data_version`). Writes through this store
+    /// and its clones do not change it. Compare it with an earlier value to
+    /// learn cheaply whether to read again what is shown.
+    ///
+    /// `None` while this store is writing; ask again later. It never
+    /// waits.
+    pub fn data_version(&self) -> Result<Option<u64>, StoreError> {
+        let conn = match self.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        let v: i64 = conn.pragma_query_value(None, "data_version", |r| r.get(0))?;
+        Ok(Some(v as u64))
+    }
+
     /// The account for `uid` on `server`, created if it does not exist.
     pub fn account(&self, server: &ServerAddr, uid: &Uid) -> Result<AccountId, StoreError> {
         let (id, _) = self.write(|tx| {

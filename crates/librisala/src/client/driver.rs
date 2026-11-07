@@ -407,6 +407,7 @@ impl Online<'_> {
             Incoming::Line(msg) => {
                 if let ServerLine::Notice { message } = &msg.line {
                     self.shared.publish(Batch {
+                        reload: false,
                         changes: Vec::new(),
                         events: vec![AccountEvent::Notice {
                             notice: Notice::Server {
@@ -590,6 +591,7 @@ impl Online<'_> {
         }
 
         self.shared.publish(Batch {
+            reload: false,
             changes: out.changes,
             events,
         });
@@ -825,5 +827,9 @@ fn queue_offline(
 
 fn publish_changes(shared: &AccountShared, changes: Vec<Change>) {
     let events = describe_changes(&shared.store, shared.id, &changes);
-    shared.publish(Batch { changes, events });
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events,
+    });
 }

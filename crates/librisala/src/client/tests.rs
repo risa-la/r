@@ -45,6 +45,7 @@ fn store_events(account: &Account, conv: &str, id: &str, events: &[Event]) {
         })
         .unwrap();
     shared.publish(Batch {
+        reload: false,
         changes,
         events: Vec::new(),
     });
@@ -217,6 +218,7 @@ async fn the_timeline_reports_inserts_updates_and_resets() {
         })
         .unwrap();
     shared.publish(Batch {
+        reload: false,
         changes,
         events: Vec::new(),
     });
@@ -291,4 +293,62 @@ async fn the_timeline_loses_nothing_when_next_is_dropped() {
     }
     assert_eq!(items, timeline.items());
     assert_eq!(items, general.messages(None, 1000).unwrap());
+}
+
+#[tokio::test]
+async fn writes_from_another_process_reach_timelines() {
+    // The app and its notification extension share one cache file.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let app = Client::open(&path, ClientOptions::default()).unwrap();
+    let extension = Client::open(&path, ClientOptions::default()).unwrap();
+    let sam = app.add_guest(SERVER, "sam").unwrap();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    // The app's own writes do not count.
+    assert!(!app.check_for_external_changes().unwrap());
+
+    let timeline = general.timeline(50).unwrap();
+    assert_eq!(timeline.items().len(), 1);
+    let events = sam.subscribe();
+
+    // The extension stores a message. The app hears nothing of it...
+    let other = extension.add_guest(SERVER, "sam").unwrap();
+    store_events(
+        &other,
+        "#general",
+        "k1",
+        &[event(2, "from=~bob MSG #general hi")],
+    );
+    assert_eq!(general.messages(None, 50).unwrap().len(), 2);
+    // ...until it checks.
+    assert!(app.check_for_external_changes().unwrap());
+    assert!(!app.check_for_external_changes().unwrap());
+    assert_eq!(events.next().await, Some(AccountEvent::CacheChanged));
+    match timeline.next().await.unwrap().as_slice() {
+        [TimelineDiff::Reset { items }] => {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[1].text.as_deref(), Some("hi"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(timeline.items().len(), 2);
+
+    // A refresh by hand does the same for one timeline.
+    store_events(
+        &other,
+        "#general",
+        "k1",
+        &[event(3, "from=~bob MSG #general again")],
+    );
+    timeline.refresh().await.unwrap();
+    match timeline.next().await.unwrap().as_slice() {
+        [TimelineDiff::Reset { items }] => assert_eq!(items.len(), 3),
+        other => panic!("{other:?}"),
+    }
 }

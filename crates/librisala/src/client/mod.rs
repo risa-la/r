@@ -91,6 +91,18 @@
 //!
 //! Dropping the last handle to a client that made its own runtime stops
 //! that runtime, without waiting for its tasks.
+//!
+//! # Other processes
+//!
+//! Another process may write to the same cache, such as an iOS
+//! notification extension that syncs while the app sleeps. Subscribers
+//! and timelines hear only of this process's writes. To pick up the
+//! others', call [`Client::check_for_external_changes`] when it matters,
+//! for example when the app comes to the foreground. It is cheap, and if
+//! anything changed it resets every [`Timeline`] and sends
+//! [`AccountEvent::CacheChanged`] to subscribers, so the app reads its
+//! conversation list again. [`Timeline::refresh`] resets one timeline
+//! by hand.
 
 mod account;
 mod driver;
@@ -191,6 +203,9 @@ pub(crate) struct ClientInner {
     accounts: Mutex<HashMap<AccountId, Arc<AccountShared>>>,
     /// Where the client's tasks run.
     rt: tokio::runtime::Handle,
+    /// The cache's data version when last checked, for
+    /// [`Client::check_for_external_changes`].
+    data_version: Mutex<Option<u64>>,
     /// The runtime, if the client made its own. Declared last, so that it
     /// stops after everything else is dropped.
     _owned: Option<OwnedRuntime>,
@@ -244,12 +259,14 @@ impl Client {
                 (runtime.handle().clone(), Some(OwnedRuntime(Some(runtime))))
             }
         };
+        let data_version = store.data_version()?;
         Ok(Client {
             inner: Arc::new(ClientInner {
                 store,
                 options,
                 accounts: Mutex::new(HashMap::new()),
                 rt,
+                data_version: Mutex::new(data_version),
                 _owned: owned,
             }),
         })
@@ -258,6 +275,43 @@ impl Client {
     /// The runtime the client's tasks run on.
     pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
         &self.inner.rt
+    }
+
+    /// Checks whether another process wrote to the cache since the last
+    /// check (or since the client was made), using SQLite's
+    /// `PRAGMA data_version`. If so, every [`Timeline`] resets and every
+    /// account's subscribers get [`AccountEvent::CacheChanged`], and this
+    /// returns `true`. Writes by this client do not count. It never waits;
+    /// while this client is writing, it returns `false` and the next call
+    /// tells.
+    pub fn check_for_external_changes(&self) -> Result<bool, ClientError> {
+        let Some(now) = self.inner.store.data_version()? else {
+            return Ok(false);
+        };
+        let changed = {
+            let mut last = self.inner.data_version.lock().expect("poisoned");
+            let changed = last.is_some_and(|v| v != now);
+            *last = Some(now);
+            changed
+        };
+        if changed {
+            let accounts: Vec<Arc<AccountShared>> = self
+                .inner
+                .accounts
+                .lock()
+                .expect("poisoned")
+                .values()
+                .cloned()
+                .collect();
+            for shared in accounts {
+                shared.publish(account::Batch {
+                    changes: Vec::new(),
+                    events: vec![AccountEvent::CacheChanged],
+                    reload: true,
+                });
+            }
+        }
+        Ok(changed)
     }
 
     /// The cache.

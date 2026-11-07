@@ -34,6 +34,8 @@ const EVENT_CAPACITY: usize = 1024;
 pub(crate) struct Batch {
     pub changes: Vec<Change>,
     pub events: Vec<AccountEvent>,
+    /// Another process changed the cache: re-read everything shown.
+    pub reload: bool,
 }
 
 /// Whether the current connection has caught up.
@@ -149,6 +151,7 @@ impl AccountShared {
         });
         if changed {
             self.publish(Batch {
+                reload: false,
                 changes: Vec::new(),
                 events: vec![AccountEvent::State { state }],
             });
@@ -156,7 +159,7 @@ impl AccountShared {
     }
 
     pub fn publish(&self, batch: Batch) {
-        if !batch.changes.is_empty() || !batch.events.is_empty() {
+        if !batch.changes.is_empty() || !batch.events.is_empty() || batch.reload {
             // No receivers is fine.
             let _ = self.events.send(Arc::new(batch));
         }
@@ -480,6 +483,7 @@ impl Account {
         let entry = self.outbox_entry(id)?;
         self.shared.store.remove_outbox(OutboxId(entry.id))?;
         self.shared.publish(Batch {
+            reload: false,
             changes: vec![Change::Outbox { id: OutboxId(id) }],
             events: vec![AccountEvent::OutboxRemoved { id }],
         });
@@ -510,7 +514,7 @@ impl Account {
                 match events.next().await {
                     Some(AccountEvent::Outbox { entry }) if entry.id == id => break,
                     Some(AccountEvent::OutboxRemoved { id: gone }) if gone == id => break,
-                    Some(AccountEvent::Lagged) => break,
+                    Some(AccountEvent::Lagged | AccountEvent::CacheChanged) => break,
                     Some(_) => {}
                     None => return Err(ClientError::NotConnected),
                 }

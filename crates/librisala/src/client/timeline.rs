@@ -136,6 +136,7 @@ impl Timeline {
             tokio::select! {
                 r = rx.recv() => {
                     let reload = match r {
+                        Ok(batch) if batch.reload => None,
                         Ok(batch) if batch.changes.is_empty() => continue,
                         Ok(batch) => Some(batch),
                         Err(broadcast::error::RecvError::Lagged(_)) => None,
@@ -163,6 +164,25 @@ impl Timeline {
                 () = self.notify.notified() => {}
             }
         }
+    }
+
+    /// Reads the window again from the cache, and queues a
+    /// [`TimelineDiff::Reset`] for [`next`](Self::next). Use it after
+    /// another process wrote to the cache; see
+    /// [`Client::check_for_external_changes`](super::Client::check_for_external_changes),
+    /// which does it for every timeline.
+    pub async fn refresh(&self) -> Result<(), ClientError> {
+        let state = self.state.clone();
+        let notify = self.notify.clone();
+        blocking(&self.rt, move || -> Result<(), StoreError> {
+            let mut st = state.lock().expect("poisoned");
+            let diffs = st.reload()?;
+            st.pending.push_back(diffs);
+            notify.notify_one();
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
 
     fn pop(&self) -> Option<Vec<TimelineDiff>> {
