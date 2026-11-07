@@ -2,7 +2,7 @@
 //! through a platform trait, the key file line to publish, and the AUTH
 //! and REGISTER commands signed with them.
 //!
-//! Each device has its own Ed25519 key. Apps keep keys in the platform's
+//! Each device has its own ML-DSA-44 key. Apps keep keys in the platform's
 //! store (Keychain, Android Keystore, libsecret) by implementing
 //! [`KeyStore`]. [`FileKeyStore`] keeps PEM files for the CLI and for
 //! Linux until libsecret support exists.
@@ -29,13 +29,13 @@ pub fn generate_device_key() -> Result<SecretKey, getrandom::Error> {
     Ok(key)
 }
 
-/// The key file line for a device's key, `ed25519 <key> [<label>]`,
+/// The key file line for a device's key, `mldsa44 <key> [<label>]`,
 /// without its LF (4.4). The label is usually the device's name.
 ///
 /// Fails with `BadSyntax` if the label has a line break or another
 /// control character.
 pub fn key_line(key: &PublicKey, label: Option<&str>) -> Result<String, ParseError> {
-    Ok(KeyEntry::new(*key, label)?.to_string())
+    Ok(KeyEntry::new(key.clone(), label)?.to_string())
 }
 
 /// The AUTH command for `identity` (4.5).
@@ -83,8 +83,8 @@ pub enum KeyStoreError {
     /// Reading or writing failed.
     #[error("key store I/O: {0}")]
     Io(#[from] io::Error),
-    /// A stored key is not a PKCS#8 Ed25519 key.
-    #[error("stored key {0:?} is not a PKCS#8 Ed25519 private key")]
+    /// A stored key is not a PKCS#8 ML-DSA-44 key.
+    #[error("stored key {0:?} is not a PKCS#8 ML-DSA-44 private key")]
     BadKey(String),
     /// A key file can be read by other users. Fix it with `chmod 600`.
     #[error("key file {0} can be read by other users; run chmod 600 on it")]
@@ -149,9 +149,9 @@ impl KeyStore for MemoryKeyStore {
     }
 }
 
-/// A [`KeyStore`] of PKCS#8 PEM files in one directory, as `openssl
-/// genpkey -algorithm ed25519` writes them (App. A), one per id:
-/// `<dir>/<id>.pem`.
+/// A [`KeyStore`] of PKCS#8 PEM files in one directory, one per id:
+/// `<dir>/<id>.pem`. It reads the files `openssl genpkey -algorithm
+/// ML-DSA-44` writes (App. A), and writes the seed-only form of App. B.
 ///
 /// - On Unix the directory is created with mode 0700 and files are
 ///   written with mode 0600, through a temporary file and a rename.
@@ -258,15 +258,97 @@ impl KeyStore for FileKeyStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Appendix B.
-    const PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-        MC4CAQAwBQYDK2VwBCIEIMEfrlxZLhO+Z9yW9uhQBNMukoYV968f06bF2eoKtsuo\n\
+    pub(crate) const PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+        MDQCAQAwCwYJYIZIAWUDBAMRBCKAIMEfrlxZLhO+Z9yW9uhQBNMukoYV968f06bF\n\
+        2eoKtsuo\n\
         -----END PRIVATE KEY-----\n";
-    const SIGNATURE: &str =
-        "Hk+S5Vd7ciW57dRNS3AhcvZkYNLmj+kkgJUxOYvCrbEQSBk0UDdH+cSBXF6YvCSU85FRVPaURwsQdbV/SAK0CQ==";
+    pub(crate) const PUBLIC: &str = concat!(
+        "xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp0TNCHpsz6xf7jMhE9181WJAPmoeTW0Bn",
+        "URbEsAPsYPUiBIunfbRrvADeL/bfXGDlU5cZwg3n6zkLeUm9dx3+Jz1+ZHcuHPIB",
+        "JvZ1fJrfFwJ68vdGFxDTQo3pUBEEejtwqB3L2WXeboCtNEB/6IlKJfCr1droLXLW",
+        "nckZiRpCoJRmv4g4hxVfNP4Uubjc2Fde4NxJmV8oW0wsRRnyzCYLI4QW7MDWz3uU",
+        "EsQJ9q9okdUTb0eSfm4TQ3FMeL39/9iBQaeidHXCdrFCHSfKndH/DH3jY18Oaogz",
+        "Q6S7TlHTwPmU12VVZbPEHIJtakRF9G4DS0ps0H8T3NKipFo6BpbtwpPqLR2EAX5M",
+        "gL7FI/Jv171G5/sD3nnsJ4A5jfXwHWr6UPlIB/VtKOfXzKRYWy37Y5EaQzEirdrb",
+        "9+xRouAS9gov36hlUYxwvFIRTF1XG1L5R2453DCE6drWUGNkLSCXRloO+RvXrdvA",
+        "Qm+fmqS2OuEs9+GsEHN531Duz2yOzM4DAn+IAIeU2kLGUZy54VTZV49nBI+rPh1X",
+        "wpoqw6BPgWVAdGK5XqyZYu2X1AjM2XvnRe4vDEg7UsfYv2JWeqWbu4c7KBx8F1ZE",
+        "SHTchYKRAvWfKBOF3PWifoIXqm0wtXuqu06Mne1LqYdwxilPiJDyt745mOG6K59V",
+        "WCeXFxGqebiy5R9FBkb3OLTJXU6OVXX/iumCRAdK/dbKb7+54OholPVj/PDAH2EY",
+        "anMXrumWy7B1dTH/jgI2MpkTYgjJ3bwsidZpF9Dx2eVuscgsRrXNKbbZ5mSYbTx+",
+        "WTCEpgPDGD6K6GRBjbCg5bwz4iCqMs2+Rv55bV2vwCaJmeu9SVevrmKtk4iBTiLp",
+        "ZO+nRBIAuhNJ2ftbJ67dNt2pz5ZacqP4TxbyKaknlsLMMoYrsrq8QVid0mz+9FR7",
+        "U7La2NoCPcMcDgWWOoDKlKNGIQx23v1x/z1YsnWpi7dt9FtJxvFa8mbsrVd4kci9",
+        "h2zjIsJXrBXpBO+iWzzoxDHiI8eOXTag8yOuEQHaUVVdwxQ0r4nwZUNL34WuuED6",
+        "FDF6/TE/nfkffQVzW52PkixgxmC5OIrWNcc0GXGAdxa2p3KxwMBbfk27in3wESIM",
+        "g4CDmmfdH65prjzxG47TSEqMZHxAM5bTfNLqjUN3QRGaVd2b3BecnplFXrjyKp8a",
+        "MyDUPJNolLq4dJG/n1wby85wino837kaodjRZeYryU0RyzLgqY1UHyzmU+AMu4q7",
+        "HM+jwSvdGQXX60Q7NLxSk+ClmoO+YEDrj3ki9WSp3NWG538oiGV4EqBJi+apjuPC",
+        "aWWtNm1DILZDAOjCCOyU9TEllzsjv8heU2bVmsLe1oRfIiDBQw7/Z9ZQFUjXka1B",
+        "e/JFUyiujtH+oLJVr3clrsZWPl9bawODt/znveuHTYZHf1j7azTcCBm5JZjjW8r8",
+        "guknfhcKPKOaTQUzqpXiALNhvcSO4RRtDFyn7L4VAz7K1uHbnXKHSeMnMRjpZnMZ",
+        "QoqyhEjNllb06dD0s4xDd1wJgGmWEd2KVHnLKhwKp1ED775+034shRb2v8W+DFIp",
+        "y3hVp9PEdnc9aJwzIreZHEJymMosqXo7mZaJNM+i+oYo2daWHMQYL1sOwzOTwEK2",
+        "xewaE3w/Xkq+iY4TC++t/oNTt5BdWJrJ90PPw6arr7MbXCEkTgNElxgTC7gcwdLS",
+        "nnO/Wp68V/V/przmVp4j4g==",
+    );
+    pub(crate) const SIGNATURE: &str = concat!(
+        "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",
+        "AAAAAAAAAAAAAAAAAAAAAAkXJzM=",
+    );
 
     fn appendix_b() -> SecretKey {
         SecretKey::from_pkcs8_pem(PEM).unwrap()
@@ -284,12 +366,9 @@ mod tests {
         let key = appendix_b().public_key();
         assert_eq!(
             key_line(&key, Some("laptop")).unwrap(),
-            "ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop"
+            format!("mldsa44 {PUBLIC} laptop")
         );
-        assert_eq!(
-            key_line(&key, None).unwrap(),
-            "ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY="
-        );
+        assert_eq!(key_line(&key, None).unwrap(), format!("mldsa44 {PUBLIC}"));
         assert!(key_line(&key, Some("a\nb")).is_err());
     }
 
@@ -348,7 +427,7 @@ mod tests {
         assert!(store.load("alice@example.org").unwrap().is_none());
         store.save("alice@example.org", &appendix_b()).unwrap();
         let path = store.path("alice@example.org").unwrap();
-        // The file is what openssl genpkey writes (App. B).
+        // The file is the seed-only form of Appendix B, which openssl reads.
         assert_eq!(fs::read_to_string(&path).unwrap(), PEM);
         let loaded = store.load("alice@example.org").unwrap().unwrap();
         assert_eq!(loaded.public_key(), appendix_b().public_key());

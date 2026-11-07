@@ -539,7 +539,11 @@ impl<'a> Tx<'a> {
             EventBody::Role { uid, role, .. } => {
                 self.member_role(conv, uid.as_str(), role.as_str(), at)?;
             }
-            EventBody::Msg(_) | EventBody::Delete { .. } | EventBody::Invite { .. } => {}
+            EventBody::Msg(_)
+            | EventBody::Delete { .. }
+            | EventBody::Invite { .. }
+            | EventBody::Enc(_)
+            | EventBody::Commit { .. } => {}
         }
         Ok(())
     }
@@ -826,7 +830,12 @@ impl Columns {
             | EventBody::Ban { uid, .. }
             | EventBody::Unban { uid, .. }
             | EventBody::Role { uid, .. } => c.subject = Some(uid.as_str().to_owned()),
-            EventBody::Join { .. } | EventBody::Part { .. } | EventBody::Set { .. } => {}
+            // Encrypted conversations (12) keep only the stored line for now.
+            EventBody::Join { .. }
+            | EventBody::Part { .. }
+            | EventBody::Set { .. }
+            | EventBody::Enc(_)
+            | EventBody::Commit { .. } => {}
         }
         c
     }

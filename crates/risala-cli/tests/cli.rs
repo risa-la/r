@@ -212,12 +212,12 @@ async fn keygen_and_keyline() {
     let state = dir.path();
     let line = ok(state, &["keygen", "alice@example.org", "--label", "laptop"]).await;
     let line = line.trim();
-    assert!(line.starts_with("ed25519 "), "{line}");
+    assert!(line.starts_with("mldsa44 "), "{line}");
     assert!(line.ends_with(" laptop"), "{line}");
     let key = line.split(' ').nth(1).unwrap();
     assert_eq!(
         ok(state, &["keyline", "alice@example.org"]).await.trim(),
-        format!("ed25519 {key}")
+        format!("mldsa44 {key}")
     );
     // An existing key is kept unless asked.
     let out = risala(state, &["keygen", "alice@example.org"]).await;

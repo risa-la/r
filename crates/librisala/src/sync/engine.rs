@@ -261,7 +261,7 @@ impl SyncEngine {
                     Ok(())
                 })?;
             }
-            ServerLine::Drop { room, reason } => self.on_drop(room, reason)?,
+            ServerLine::Drop { room, id, reason } => self.on_drop(room, id, reason)?,
             _ => {}
         }
         Ok(self.finish())
@@ -694,17 +694,24 @@ impl SyncEngine {
         }
     }
 
-    fn on_drop(&mut self, room: &Room, reason: &str) -> Result<(), SyncError> {
+    fn on_drop(&mut self, room: &Room, id: &Id, reason: &str) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
+        let account = self.account;
+        // A DROP for an id other than the stored one is about an older
+        // room of the same name (10.4).
+        let dropped = self.write(|tx| match tx.conv_by_name(account, &conv)? {
+            Some(row) if row.conv_id.as_ref().is_some_and(|stored| stored != id) => Ok(false),
+            Some(row) => {
+                tx.remove(&row)?;
+                Ok(true)
+            }
+            None => Ok(true),
+        })?;
+        if !dropped {
+            return Ok(());
+        }
         self.live(&conv).confirmed = None;
         self.touch_left(&conv);
-        let account = self.account;
-        self.write(|tx| {
-            if let Some(row) = tx.conv_by_name(account, &conv)? {
-                tx.remove(&row)?;
-            }
-            Ok(())
-        })?;
         self.out.notifications.push(Notification::Dropped {
             room: room.clone(),
             reason: reason.to_owned(),
@@ -1208,6 +1215,7 @@ impl SyncEngine {
             after: Some(after),
             before: None,
             limit: NonZeroU64::new(self.config.page_size),
+            only: None,
         };
         self.issue(
             command,
@@ -1248,6 +1256,7 @@ impl SyncEngine {
             after,
             before,
             limit: NonZeroU64::new(limit),
+            only: None,
         };
         self.issue(
             command,
