@@ -251,13 +251,13 @@ impl Inner {
             return Err(not_found());
         }
         send_settings(reply, &st);
-        let mut ok = OkResponse::new().with_id(&st.id).with_members(members);
-        // SPEC GAP: a room from the configuration has no events until
-        // someone joins, so it has no seq to report as `head`. Until the
-        // spec decides, `head` is left out then.
-        if let Some(head) = st.head {
-            ok = ok.with_head(head);
-        }
+        // A room from the configuration has no events until someone joins,
+        // and then reports `head=0` (6.2).
+        let head = st.head.map_or(0, u64::from);
+        let ok = OkResponse::new()
+            .with_id(&st.id)
+            .with_members(members)
+            .with_head(head);
         Ok(Some(
             ok.with_role(info_role(&st, uid, member))
                 .with_joined(member),

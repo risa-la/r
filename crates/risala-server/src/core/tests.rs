@@ -660,13 +660,15 @@ async fn info_room_before_and_after_joining() {
         .unwrap()
         .unwrap()
         .id;
-    // No events yet, so no head (a spec gap: see info_room).
+    // No events yet, so the head is 0 (6.2).
     h.send(&sam, "@ref=i info #general").await;
     let mut want: Vec<String> = default_settings("#general")
         .iter()
         .map(|l| format!("@ref=i {l}"))
         .collect();
-    want.push(format!("@ref=i OK id={id} members=0 role=none joined=no"));
+    want.push(format!(
+        "@ref=i OK id={id} members=0 head=0 role=none joined=no"
+    ));
     assert_eq!(sam.lines(), want);
 
     h.send(&sam, "join #general").await;
