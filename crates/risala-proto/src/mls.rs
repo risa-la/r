@@ -52,8 +52,8 @@ pub const HISTORY_KEY_LEN: usize = 48;
 /// 48-byte history key with its 16-byte tag (12.10).
 pub const BACKUP_BLOB_LEN: usize = 84;
 
-/// The number of blobs BACKUP GET returns when `limit` is not given
-/// (12.10).
+/// The most epochs one page of BACKUP GET returns blobs for when `limit`
+/// is not given (12.10).
 pub const DEFAULT_BACKUP_LIMIT: u64 = 500;
 
 /// The MLS exporter label of history keys (12.9, 15).
@@ -253,8 +253,8 @@ impl Ciphertext {
 }
 
 blob_type!(
-    /// The `content` tag of a REPORT of an ENC event, and of the reported
-    /// event that reviewers receive: the message's decrypted content
+    /// The `<content>` of REPORTENC: the decrypted content of the
+    /// reported ENC event, the bytes of `content` in its RisalaMessage
     /// (5.8, 12.8).
     Content,
     "content is base64"
@@ -321,8 +321,8 @@ fixed_type!(
 );
 
 fixed_type!(
-    /// The `frank-key` tag of a REPORT of an ENC event: the message's
-    /// franking key (5.8, 12.8).
+    /// The `<frank-key>` of REPORTENC: the reported message's franking
+    /// key, `frank_key` in its RisalaMessage (5.8, 12.8).
     FrankKey,
     FRANK_KEY_LEN,
     "frank-key is 32 bytes of base64"
@@ -335,6 +335,51 @@ fixed_type!(
     BACKUP_BLOB_LEN,
     "a backup blob is 84 bytes of base64"
 );
+
+/// What REPORTENC adds to a report of an ENC event (5.8): the message's
+/// franking key and its decrypted content. The command carries them, and
+/// so does the REPORTENC line that reviewers receive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Franking {
+    /// The franking key.
+    pub key: FrankKey,
+    /// The decrypted content.
+    pub content: Content,
+}
+
+impl Franking {
+    /// Whether HMAC-SHA-384 of the decoded content bytes under the key
+    /// equals `frank`, the ENC event's franking commitment (5.8, 12.8).
+    /// The server checks this before it accepts a report, and replies
+    /// `ERR invalid` if it fails.
+    pub fn verifies(&self, frank: &Frank) -> bool {
+        let tag = hmac_sha384(self.key.as_bytes(), &self.content.decode());
+        // The commitment is public, so a plain comparison is fine.
+        tag == *frank.as_bytes()
+    }
+}
+
+/// HMAC-SHA-384 [RFC2104] of `message` under a key of at most 128 bytes,
+/// the hash's block size.
+fn hmac_sha384(key: &[u8; FRANK_KEY_LEN], message: &[u8]) -> [u8; FRANK_LEN] {
+    use sha2::{Digest as _, Sha384};
+    const BLOCK: usize = 128;
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for (i, k) in key.iter().enumerate() {
+        ipad[i] ^= k;
+        opad[i] ^= k;
+    }
+    let inner = Sha384::new()
+        .chain_update(ipad)
+        .chain_update(message)
+        .finalize();
+    Sha384::new()
+        .chain_update(opad)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
 
 impl BackupBlob {
     /// The blob's key id, the first 8 bytes (12.10).
@@ -392,6 +437,47 @@ mod tests {
         let enough = Ciphertext::from_bytes(&[1; MIN_PAYLOAD_LEN]).unwrap();
         assert!(enough.is_long_enough());
         assert_eq!(enough.as_str().len(), 64);
+    }
+
+    /// The franking test vector of Appendix B.
+    #[test]
+    fn franking_verifies() {
+        let mut key = [0u8; FRANK_KEY_LEN];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = 0xa0 + i as u8;
+        }
+        let content = b"@reply=15;target=0Jx1HkY3x9z2b5R0qWm1fA== TEXT see you at 12\n";
+        assert_eq!(content.len(), 61);
+        let hex = "83d717202ee3a882e770e8ceaa04ff715561ecd5574e6576839cb99ec98f8b96\
+                   0277c6cc92ce07971b46e3a6935798ca";
+        let mut frank = [0u8; FRANK_LEN];
+        for (i, b) in frank.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        let frank = Frank::from_bytes(frank);
+        let franking = Franking {
+            key: FrankKey::from_bytes(key),
+            content: Content::from_bytes(content).unwrap(),
+        };
+        assert!(franking.verifies(&frank));
+
+        // Another content, another key, or the base64 text instead of the
+        // decoded bytes, do not verify.
+        let other = Franking {
+            content: Content::from_bytes(b"TEXT see you at 1\n").unwrap(),
+            ..franking.clone()
+        };
+        assert!(!other.verifies(&frank));
+        let other = Franking {
+            key: FrankKey::from_bytes([0; FRANK_KEY_LEN]),
+            ..franking.clone()
+        };
+        assert!(!other.verifies(&frank));
+        let other = Franking {
+            content: Content::from_bytes(franking.content.as_str().as_bytes()).unwrap(),
+            ..franking
+        };
+        assert!(!other.verifies(&frank));
     }
 
     #[test]

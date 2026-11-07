@@ -492,14 +492,61 @@ Open:
         the exporter secret, since a whole group cannot be made
         reproducible.
 
+    - Decided with the user later on 2026-11-07 (see 23):
+      - **KeyPackage lifetime** (12.4). At most 12 weeks and one hour.
+        RFC 9420 section 7.3 requires a maximum, and this value is
+        OpenMLS's default, so default KeyPackages pass.
+      - **Restored epochs** (12.8). A device that restored a history
+        key from a backup, and so did not see that epoch live, skips
+        decryption's step 1, the check of the epoch against the COMMIT
+        events before the message.
+
 Open:
 
-- Confirm the maximum KeyPackage lifetime of 12 weeks and one hour
-  (12.4). RFC 9420 section 7.3 requires one. This value is OpenMLS's
-  default, so default KeyPackages pass.
 - librisala's MLS storage: `openmls_sqlite_storage` 0.3 cannot link next
   to rusqlite 0.41. The spike recommends porting it.
 - Run `cargo audit` on the chosen crates.
+
+23. **Found while implementing draft-02 in risala-proto** (2.3, 3.2,
+    3.7, 5.4, 5.8, 12.8, 12.10, 12.11, 13, App. A).
+    - Decided with the user on 2026-11-07:
+      - **Encrypted reports carry their data after the verb** (2.3,
+        3.2, 5.8, 12.8, 13). The franking key and content were tags on
+        REPORT, so a decoder had to allow 8 MiB of tags on every line
+        before it saw the verb. Now a separate verb,
+        `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]`,
+        reports an ENC event, and reviewers receive it with the same
+        parameters, followed by the ENC event with an empty payload and
+        its `frank` tag. REPORT of an ENC event, and REPORTENC of a MSG
+        event, get `ERR invalid`. The `frank-key` and `content` tags are
+        gone. Everything up to the end of the verb must fit the normal
+        limit, tags included, so a receiver knows from the first 8192 or
+        16384 bytes whether a line may be long.
+      - **BACKUP GET pages oldest first** (12.10). Without `after` it
+        starts at the oldest epoch, so epoch 0 is reachable, and
+        `after=<epoch>` continues after that epoch. `limit` counts
+        epochs, since an epoch may have one blob per key id and a page
+        never splits them. The reply is `OK more=<0 or 1>`.
+      - **Deleted ENC placeholders drop `frank`** (5.4, 12.11), like the
+        file tags. The copy kept for an open report keeps it.
+      - The KeyPackage lifetime and the restored-epoch rule of 22.
+    - Slips fixed:
+      - 2.3 lists long verbs per direction: servers never send INIT, and
+        clients never send long GROUPINFO or WELCOME lines.
+      - 3.7: a franking commitment or key of the wrong length, or base64
+        that is not valid, gets `bad-syntax`; a required one that is
+        missing gets `invalid`.
+      - 5.8: the franking check is HMAC-SHA-384 of the decoded content
+        bytes, not of the base64 text.
+      - 12.8: ENC events may have an empty payload (deleted placeholders
+        and reviewers' copies), so the event's syntax is
+        `ENC <conv> <epoch> [<payload...>]`. The command still needs one.
+      - 12.10: `<blob>` is base64 with padding, 112 characters.
+      - Appendix A: `openssl genpkey` writes PKCS#8 with the seed and the
+        expanded key, not Appendix B's seed-only form, and readers MUST
+        accept both. `-provparam ml-dsa.output_formats=seed-only` writes
+        the seed-only form. `pkeyutl -sign` needs `-in` for ML-DSA.
+        Checked with OpenSSL 3.5.9 (the dev shell) and 3.6.5.
 
 ## 6. Decisions
 

@@ -259,12 +259,20 @@ After the TLS handshake, both sides exchange lines.
   including the LF. A line from a server MUST NOT be longer than 16384
   bytes. The difference leaves room for the tags a server adds when it
   relays a client's text.
-- **Long lines.** Lines that carry MLS data (Section 12) may be longer.
-  A line whose verb is COMMIT, ENC, GROUPINFO, INIT, KEYPKG, REPORT or
-  WELCOME may be up to 8 MiB (8388608 bytes) including the LF from a
-  client, and 8 MiB plus 16384 bytes from a server. Before a connection
-  has signed in, the server applies the normal limits to every line.
-  The lines inside an encrypted message have their own limits (12.8).
+- **Long lines.** Lines that carry MLS data or encrypted content
+  (Section 12) may be longer:
+  - From a client, a line whose verb is COMMIT, ENC, INIT, KEYPKG or
+    REPORTENC may be up to 8 MiB (8388608 bytes) including the LF.
+  - From a server, a line whose verb is COMMIT, ENC, GROUPINFO, KEYPKG,
+    REPORTENC or WELCOME may be up to 8 MiB plus 16384 bytes.
+  - The data that makes these lines long always comes after the verb.
+    So the start of every line, up to the end of its verb, MUST fit the
+    normal limit, tags included. A receiver can then tell from the first
+    8192 or 16384 bytes whether a line may be long. A line whose verb
+    does not end within the normal limit is too long.
+  - Before a connection has signed in, the server applies the normal
+    limits to every line.
+  - The lines inside an encrypted message have their own limits (12.8).
 - **Bad lines.** A server that receives a line that is too long MUST
   discard everything up to the next LF and reply `ERR too-long`. It MAY
   reply as soon as it knows the line is too long, before the LF arrives. A server
@@ -338,8 +346,6 @@ its command.
 | `report` | server | id | The report that a line belongs to (5.8) |
 | `id` | server | id | On a JOIN event or a DROP line: the room's id (6.1, 10.4) |
 | `frank` | client | base64 | On ENC: the franking commitment (12.8) |
-| `frank-key` | client | base64 | On REPORT of an ENC event: the franking key (5.8) |
-| `content` | client | base64 | On REPORT of an ENC event: the reported content (5.8) |
 
 ### 3.3. Parameters
 
@@ -504,14 +510,16 @@ S: @ref=7 OK id=k3f9q2 more=1
 | `not-supported` | The server does not offer this feature |
 | `encrypted` | The conversation is encrypted, so this command cannot be used in it (Section 12) |
 | `stale` | The conversation's group is not in the state the command needs. Apply the newer commits, or commit pending removals, and try again (12.5, 12.6) |
-| `invalid` | MLS data or a franking commitment did not verify (Section 12) |
+| `invalid` | MLS data or a franking commitment did not verify, or a required franking commitment or key is missing (5.8, Section 12) |
 | `rate-limited` | Too many requests. The `retry` tag says when to try again |
 | `internal` | Something went wrong on the server |
 
 A name, room, id, text, URL or tag value that follows its grammar except
-for being too long gets `too-long`, not `bad-syntax`. A number, key or
-signature with the wrong number of digits or characters gets
-`bad-syntax`.
+for being too long gets `too-long`, not `bad-syntax`. A number, key,
+signature, franking commitment or franking key with the wrong number of
+digits or characters gets `bad-syntax`, and so does base64 that is not
+valid. A franking commitment or key that is required but missing gets
+`invalid` (5.8, 12.8).
 
 Clients MUST treat an unknown code as a general failure.
 
@@ -985,8 +993,11 @@ S: @seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam;reply=8810;deleted MSG #genera
 Clients SHOULD discard deleted text they have stored. Deletion cannot
 reach copies that people have already made.
 
-ENC events are deleted the same way. Since the server cannot see their
-edits and reactions, it does not delete those with them (12.11).
+ENC events are deleted the same way. The placeholder has an empty
+payload, and loses the `frank` tag as well as the file tags, since the
+content it commits to is gone. The copy kept for an open report (5.8)
+keeps its `frank` tag. The server cannot see the edits and reactions of
+an ENC event, so it does not delete those with it (12.11).
 
 ### 5.5. Mentions
 
@@ -1110,6 +1121,7 @@ someone:
 
 ```
 REPORT <conv> <seq> [<reason...>]
+REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]
 ```
 
 → `OK id=<id>`
@@ -1121,12 +1133,17 @@ Reports message `<seq>` as abusive to the people who can act on it, its
   operators
 - for a direct conversation: the server's operators
 
-Rules for REPORT:
+REPORT reports a MSG event. REPORTENC reports an ENC event, and reveals
+its content to the reviewers (below). Rules for both:
 
-- Anyone who can read the message may report it, guests included.
+- Anyone who can read the message may report it. That includes guests,
+  but only with REPORT, since guests cannot take part in encrypted
+  conversations (12.2).
 - The target MUST be a message (a MSG or ENC event, which includes edits
   and reactions) that is not deleted (`ERR not-found`). It MUST NOT be
   your own (`ERR forbidden`).
+- REPORT of an ENC event, and REPORTENC of a MSG event, get
+  `ERR invalid`.
 - `<reason...>` is free text of up to 512 bytes.
 - If the same uid reports the same message again, the server replies
   with the existing report's id.
@@ -1139,22 +1156,24 @@ it, someone could remove what they sent as soon as it is reported. The
 server SHOULD discard the copy when the report is resolved. It MAY
 close reports on its own after a time it chooses.
 
-Reviewers receive each report as two lines: a REPORT line with the same
-parameters as the command, and the reported event as it was when it
-was reported. Both carry the `report` tag with the report's id:
+Reviewers receive each report as two lines: a REPORT or REPORTENC line
+with the same parameters as the command, and the reported event as it
+was when it was reported. Both carry the `report` tag with the report's
+id:
 
 ```
 S: @report=p4x8n2;t=2026-11-06T15:44:10.230Z;from=bob@example.net REPORT #general 8816 spam
 S: @report=p4x8n2;seq=8816;t=2026-11-06T15:43:58.019Z;from=~spammer MSG #general cheap pills at …
 ```
 
-- On the REPORT line, `t` is when the report was made, and `from` is
-  the reporter.
-- Only operators see `from` on REPORT lines. Room owners and moderators
-  get the line without it, so that reporters cannot be singled out.
+- On the REPORT or REPORTENC line, `t` is when the report was made, and
+  `from` is the reporter.
+- Only operators see `from` on these lines. Room owners and moderators
+  get them without it, so that reporters cannot be singled out.
 - Both lines name a direct conversation as the reporter sees it, so
   `<conv>` is the author on both. The two participants are the reporter
-  (`from` on the REPORT line) and the author (`from` on the event).
+  (`from` on the REPORT or REPORTENC line) and the author (`from` on the
+  event).
 - The server sends the two lines to every reviewer's connections when
   the report is made.
 - The event line is a copy for review. Clients MUST NOT treat it as a
@@ -1164,20 +1183,33 @@ The server cannot read an ENC event (12.8), so a report of one reveals
 its content to the reviewers. The `frank` tag on the event makes this
 checkable:
 
-- The reporter's client adds two tags to REPORT, both in base64 with
-  padding: `frank-key`, the message's franking key, and `content`, its
-  decrypted content (12.8).
-- The server checks that HMAC-SHA-384 of `content` under `frank-key`
-  equals the event's `frank` tag. If the tags are missing or do not
-  match, it replies `ERR invalid`. Devices make the same check before
-  they show a message, so the content can only be what its author sent.
-- Reviewers receive the ENC event with an empty payload and the
-  `frank-key` and `content` tags added. They decode `content` to read
-  the message, and MAY check the commitment themselves.
+- `<frank-key>` is the message's franking key, the 32-byte `frank_key`
+  of 12.8, in base64 with padding. It is 44 characters long.
+- `<content>` is the message's decrypted content, the bytes of
+  `content` in 12.8, in base64 with padding.
+- The server decodes both, and checks that HMAC-SHA-384 [RFC2104] of the
+  content bytes under the franking key equals the event's `frank` tag.
+  If it does not, it replies `ERR invalid`. Devices make the same check
+  before they show a message (12.8), so the content can only be what
+  its author sent.
+- Reviewers receive the REPORTENC line, which carries the franking key
+  and the content, and the ENC event with an empty payload, since they
+  cannot decrypt it. The event keeps its `frank` tag. Reviewers decode
+  `<content>` to read the message, and MAY check the commitment
+  themselves.
+- The content can be long, so REPORTENC is one of the verbs that may
+  begin a long line (2.3).
 
 ```
-S: @report=w7c1m5;t=2026-11-07T10:20:41.118Z;from=bob@example.net REPORT alice@example.org 2 harassment
-S: @report=w7c1m5;seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m…;frank-key=9vQe…;content=VEVYVCBz… ENC alice@example.org 1
+C: reportenc alice@example.org 2 g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4= VEVYVCBz… harassment
+S: OK id=w7c1m5
+```
+
+The server's operators then receive:
+
+```
+S: @report=w7c1m5;t=2026-11-07T10:20:41.118Z;from=bob@example.net REPORTENC alice@example.org 2 g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4= VEVYVCBz… harassment
+S: @report=w7c1m5;seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m… ENC alice@example.org 1
 ```
 
 ```
@@ -2669,8 +2701,8 @@ Sends an encrypted message:
   a real one is a few kilobytes, since its signature alone is 2420
   bytes. The server checks nothing more about it.
 - The `frank` tag is required (`ERR invalid`). It is the message's
-  franking commitment in base64, which lets the content be reported
-  (5.8).
+  franking commitment, 48 bytes in base64 with padding (64 characters),
+  which lets the content be reported (5.8).
 - The `file` tag (5.6) and the `cid` tag (7.6) MAY be added, and work as
   for MSG.
 
@@ -2679,6 +2711,18 @@ C: @frank=hT3m…;cid=q2r8sv0alm3nb7xk enc bob@example.net 1 3qG8w…
 S: @seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m… ENC bob@example.net 1 3qG8w…
 S: OK seq=2
 ```
+
+An ENC event has the parameters of the command, but two kinds of ENC
+event have an empty payload: a deleted placeholder (5.4), which also has
+no `frank` tag, and the copy of a reported event that reviewers receive
+(5.8). So the syntax of the event is:
+
+```
+@seq=<seq>;t=<timestamp>;from=<uid>[;<tag>...] ENC <conv> <epoch> [<payload...>]
+```
+
+Every other ENC event has a payload and a `frank` tag. The command
+always needs both.
 
 The structures below use the notation of MLS [RFC9420]:
 
@@ -2884,7 +2928,8 @@ instead. Backups are optional for users. Servers MUST support them.
   gets, as a **blob**: the key id, then a random 12-byte nonce, then the
   history key encrypted with ChaCha20-Poly1305 under the backup key and
   that nonce. The associated data is the conversation's id, a space and
-  the epoch number, in ASCII. A blob is 84 bytes.
+  the epoch number, in ASCII. A blob is 84 bytes. In commands and lines,
+  `<blob>` is the blob in base64 with padding, 112 characters long.
 
 ```
 BACKUP ADD <id> <epoch> <blob>
@@ -2897,8 +2942,19 @@ BACKUP DEL [<id>]
   epoch with the same key id, it keeps the one it has and still replies
   `OK`.
 - **`BACKUP GET`** sends one `BACKUP <id> <epoch> <blob>` line per stored
-  blob, in ascending epoch order, then `OK more=<0 or 1>`. `after` and
-  `limit` work as for HISTORY (7.2), and `limit` defaults to 500.
+  blob of conversation `<id>`, oldest epoch first, then
+  `OK more=<0 or 1>`:
+  - Without `after`, it starts with the oldest blob, so epoch 0 is
+    included.
+  - With `after`, it returns only blobs of epochs greater than `after`.
+    To fetch the next page, send BACKUP GET again with `after` set to
+    the last epoch returned.
+  - **`limit`** is at least 1 and defaults to 500. It is the most epochs
+    one page returns blobs for. An epoch can have several blobs, one
+    for each key id (see BACKUP ADD), and a page always holds all of
+    them. A server MAY return fewer epochs than asked for.
+  - `more=1` means there are blobs of later epochs than the last one
+    returned.
 - **`BACKUP DEL`** deletes the blobs of conversation `<id>`, or every blob
   of the identity, and replies `OK`.
 
@@ -2926,8 +2982,9 @@ work differently:
   author of its target, a reaction longer than 64 bytes, and a second
   identical reaction from the same person to the same message.
 - **Deleting** (5.4) works on ENC events. The server erases the payload
-  and keeps a placeholder with the `deleted` tag and an empty payload.
-  It cannot find the message's edits and reactions, so it leaves them.
+  and keeps a placeholder with the `deleted` tag, an empty payload and
+  no `frank` tag. It cannot find the message's edits and reactions, so
+  it leaves them.
   A client that deletes a message SHOULD also delete the edits of it
   that it knows about, and devices hide edits and reactions whose target
   is deleted. The server does delete the attached file, which it knows
@@ -2950,8 +3007,8 @@ work differently:
   the `file` tag as in 5.6. The TEXT line carries `file-key`, the key in
   base64 with padding, and `file-type`, the file's media type. Its text
   is the caption or the file name, as for MSG.
-- **Reports** (5.8) of ENC events reveal their content to the reviewers
-  through the franking commitment.
+- **Reports** (5.8) of ENC events use REPORTENC, which reveals their
+  content to the reviewers, checked against the franking commitment.
 - **Typing, read markers, display names and presence** (Section 8) are
   not encrypted.
 - **Blocks** (5.7) work as before.
@@ -3014,6 +3071,7 @@ marked "no" under "Guests" gets `ERR forbidden`.
 | `UPLOAD <size> <type> <name...>` | 5.6 | | no |
 | `BLOCK <target>` / `UNBLOCK <target>` / `BLOCKS` | 5.7 | | no |
 | `REPORT <conv> <seq> [<reason...>]` | 5.8 | | yes |
+| `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]` | 5.8 | | no |
 | `REPORTS <room>` / `RESOLVE <id>` | 5.8 | | no |
 | `PUSH ADD <url> <tag>` / `PUSH DEL <url>` / `PUSH LIST` | 9.1 | | no |
 | `KEYPKG ADD <keypackage>` / `KEYPKG COUNT` / `KEYPKG GET <uid>` | 12.4 | | no |
@@ -3045,7 +3103,7 @@ Lines a server can send:
 | `USER <uid> <presence> [<name...>]` | response to WHOIS | 8.3 |
 | `PRESENCE <presence> <uids>` | users came online or went offline | 8.3 |
 | `BLOCK <target>` | response to BLOCKS | 5.7 |
-| `REPORT <conv> <seq> [<reason...>]`, then the reported event | a report, live or in response to REPORTS | 5.8 |
+| `REPORT <conv> <seq> [<reason...>]` or `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]`, then the reported event | a report, live or in response to REPORTS | 5.8 |
 | `RESOLVED <id>` | a report was resolved | 5.8 |
 | `KEY <key> [<label...>]` | response to KEY LIST and ADMIN KEYS | 4.7, 10.5 |
 | `PUSH <url> <tag>` | response to PUSH LIST | 9.1 |
@@ -3300,6 +3358,12 @@ printf 'mldsa44 %s laptop\n' \
   "$(openssl pkey -in alice.pem -pubout -outform der | tail -c 1312 | openssl base64 -A)"
 ```
 
+`genpkey` writes the private key in PKCS#8 with both the 32-byte seed
+and the expanded private key. Appendix B shows the shorter seed-only
+form, which `genpkey` writes if you add
+`-provparam ml-dsa.output_formats=seed-only`. Clients that read private
+keys from PEM files MUST accept both forms.
+
 **Sign in.** Copy the nonce from the server's greeting. In a second
 terminal, run:
 
@@ -3308,8 +3372,10 @@ printf 'risala-auth-1\n%s\n%s\n%s\n' chat.example.org <nonce> alice@example.org 
 openssl pkeyutl -sign -rawin -inkey alice.pem -in chal | openssl base64 -A
 ```
 
-Then type `auth alice@example.org <signature>` in the first terminal.
-Servers allow at least 120 seconds for this (4.1).
+The bytes to sign go in a file, because `pkeyutl` cannot read ML-DSA
+input from a pipe and needs `-in`. Then type
+`auth alice@example.org <signature>` in the first terminal. Servers
+allow at least 120 seconds for this (4.1).
 
 **Upload a file** (Section 5.6). Send `upload <size> <type> <name>`, then
 PUT the file to the `put` URL from the response:
