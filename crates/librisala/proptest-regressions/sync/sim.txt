@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 640673d32736ea10785f8b4cef27a1d0831cc0348621251b27988194efaab622 # shrinks to page = 1, max_page = 1, gap = 1, actions = [Connect(81), Connect(68), Handle(95, true), Join(9, 0), Handle(135, false)]
+cc 686e44b1a1a789a09ae8c1427555eb8e9a06919c4ea60f2de269becdfc2b8ed8 # shrinks to page = 1, max_page = 1, actions = [Connect(47), Join(20, 86), Connect(0), Handle(2, false), Join(8, 8), Post(0), Handle(2, false), Drop(30)]
+cc 0a5d61d88b9e3008992462cd55382250735d4b2e923cb2e878d7441f77a65537 # shrinks to page = 1, max_page = 1, gap = 1, actions = [Connect(65), Connect(139), Join(175, 47), Expire(253), Handle(199, false), Post(127), Handle(31, false), Edit(1, 0), Delete(19, 14), Expire(125)]
+cc eea67510445bd9cda5b622a1e90fddbac5c2421156c0ec9a3ce1d4aa35d7a19c # shrinks to page = 1, max_page = 1, gap = 1, actions = [Connect(176), Post(0), Handle(107, false), Part(77, 187), Connect(3), Handle(164, true), Join(129, 91), Handle(189, false)]
