@@ -529,6 +529,36 @@ async fn registrations_are_limited_per_address() {
     w.register("three", 3).await;
 }
 
+/// REGISTERs sent on several connections at once cannot get around the
+/// limit: those still in progress count too (4.6, 14).
+#[tokio::test]
+async fn parallel_registrations_are_limited_too() {
+    let mut c = id_config();
+    c.limits.registrations_per_hour = 2;
+    let mut w = World::with(c);
+    let mut conns = Vec::new();
+    let mut tasks = Vec::new();
+    for n in 1..=5u8 {
+        let (c, nonce) = w.dial(Some(HOST));
+        let line: Request = register(&format!("user{n}"), n, HOST, &nonce)
+            .parse()
+            .unwrap();
+        let (hub, id) = (w.h.hub.clone(), c.id);
+        tasks.push(tokio::spawn(async move { hub.command(id, line).await }));
+        conns.push(c);
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let answers: Vec<String> = conns.iter_mut().flat_map(|c| c.lines()).collect();
+    let ok = answers.iter().filter(|a| a.starts_with("OK uid=")).count();
+    let limited = answers
+        .iter()
+        .filter(|a| a.starts_with("@retry=3600 ERR rate-limited"))
+        .count();
+    assert_eq!((ok, limited), (2, 3), "{answers:?}");
+}
+
 /// A name that was unregistered can never be registered again (4.8, 10.5).
 #[tokio::test]
 async fn an_unregistered_name_stays_reserved() {

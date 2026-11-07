@@ -16,7 +16,6 @@ use risala_proto::keyfile::{KeyEntry, MAX_KEYS};
 use risala_proto::names::{Identity, Name, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
 use risala_proto::text::unescape;
-use risala_proto::time::Timestamp;
 
 use super::commands::{Fail, Outcome, Reply, fail, respond};
 use super::keys::KeyFilePublisher;
@@ -31,7 +30,7 @@ pub const BYE_KEY_REMOVED: &str = "this device's key was removed";
 pub const BYE_UNREGISTERED: &str = "identity deleted";
 
 /// The window of `limits.registrations_per_hour` (13).
-const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
+pub(super) const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 fn auth_failed(message: &str) -> Fail {
     fail(ErrorCode::AuthFailed, message)
@@ -306,47 +305,6 @@ impl Inner {
         }
     }
 
-    /// When the address `peer` may register again, in seconds, if it has
-    /// used up `limits.registrations_per_hour` (13).
-    fn registration_retry(&self, peer: IpAddr, now: Timestamp) -> Option<u64> {
-        let limit = self.config.limits.registrations_per_hour;
-        if limit == 0 {
-            return None;
-        }
-        let mut all = self.registrations.lock().unwrap_or_else(|e| e.into_inner());
-        // Forget what is older than the window, everywhere, so the map
-        // holds only the last hour's registrations.
-        all.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|t| now.saturating_duration_since(*t) >= REGISTRATION_WINDOW)
-            {
-                times.pop_front();
-            }
-            !times.is_empty()
-        });
-        let times = all.get(&rate_key(peer))?;
-        if times.len() < limit as usize {
-            return None;
-        }
-        let oldest = *times.front()?;
-        let waited = now.saturating_duration_since(oldest);
-        Some(REGISTRATION_WINDOW.saturating_sub(waited).as_secs().max(1))
-    }
-
-    /// Counts a registration from `peer` against its limit (13).
-    fn note_registration(&self, peer: IpAddr, now: Timestamp) {
-        if self.config.limits.registrations_per_hour == 0 {
-            return;
-        }
-        self.registrations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(rate_key(peer))
-            .or_default()
-            .push_back(now);
-    }
-
     /// Publishes the key file of the hosted identity `uid` on the blocking
     /// pool (4.6).
     async fn publish(&self, uid: &Uid, keys: Vec<HostedKey>) -> std::io::Result<()> {
@@ -396,13 +354,19 @@ impl Inner {
         let peer = challenge.peer;
         let (host, nonce) = self.host_and_nonce(challenge)?;
         let now = self.now();
-        if let Some(retry) = self.registration_retry(peer, now) {
-            return Err(Fail::Err(
-                ErrResponse::new(ErrorCode::RateLimited)
-                    .with_retry(retry)
-                    .with_message("too many registrations from this address"),
-            ));
-        }
+        // The slot is taken now and given back if this fails, so that
+        // registrations in progress count too (4.6, 14).
+        let limit = self.config.limits.registrations_per_hour;
+        let slot = self
+            .registrations
+            .take(rate_key(peer), limit, now)
+            .map_err(|retry| {
+                Fail::Err(
+                    ErrResponse::new(ErrorCode::RateLimited)
+                        .with_retry(retry)
+                        .with_message("too many registrations from this address"),
+                )
+            })?;
         let uid = Identity::new(&name, &domain).to_uid();
         // The signature proves the client holds the key (4.6).
         if verify(host, nonce, uid.clone(), signature, vec![key.clone()])
@@ -438,7 +402,9 @@ impl Inner {
                 ));
             }
         }
-        self.note_registration(peer, now);
+        if let Some(slot) = slot {
+            slot.keep();
+        }
         tracing::info!(%uid, "identity registered");
         self.finish_sign_in(id, &uid, key).await
     }

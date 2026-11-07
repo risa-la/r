@@ -66,10 +66,11 @@ mod commands;
 mod identity;
 pub mod keys;
 mod presence;
+mod rate;
 mod social;
 mod state;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
@@ -225,9 +226,10 @@ pub(crate) struct Inner {
     /// published, so that the files are published in the order of the
     /// changes.
     keys_lock: tokio::sync::Mutex<()>,
-    /// When each network address registered identities in the last hour
-    /// (13), for `limits.registrations_per_hour`.
-    registrations: Mutex<HashMap<IpAddr, VecDeque<Timestamp>>>,
+    /// The identities each network address registered in the last hour,
+    /// or is registering now (4.6, 14), for
+    /// `limits.registrations_per_hour`.
+    registrations: rate::WindowLimit<IpAddr>,
     /// Held while presence changes are sent (8.3), so that one flush ends
     /// before the next begins.
     presence_lock: tokio::sync::Mutex<()>,
@@ -412,7 +414,7 @@ impl Hub {
                     identity_domain,
                     operators: RwLock::new(operators),
                     keys_lock: tokio::sync::Mutex::new(()),
-                    registrations: Mutex::new(HashMap::new()),
+                    registrations: rate::WindowLimit::new(identity::REGISTRATION_WINDOW),
                     presence_lock: tokio::sync::Mutex::new(()),
                     names_lock: tokio::sync::Mutex::new(()),
                     typing_interval: timers.typing_interval,
