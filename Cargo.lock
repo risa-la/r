@@ -1284,6 +1284,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "risala-keyfetch"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "risala-proto",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-root-certs",
+]
+
+[[package]]
 name = "risala-proto"
 version = "0.1.0"
 dependencies = [
