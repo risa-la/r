@@ -786,6 +786,93 @@ fn own_events_follow_the_connection_uid() {
 }
 
 #[test]
+fn a_version_4_cache_with_data_migrates() {
+    // Versions 5 to 7 add names, blocks, the accepted key and the block
+    // clock. What a version 4 cache holds must come through, and work
+    // with them.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for m in &schema::MIGRATIONS[..4] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO servers (id, addr) VALUES (1, 'chat.example.org');
+             INSERT INTO trust (server, kind) VALUES (1, 'ca');
+             INSERT INTO accounts (id, server, uid) VALUES (1, 1, 'alice@example.org');
+             INSERT INTO convs (id, account, name, conv_id, sync_point, head, read, joined)
+                 VALUES (1, 1, '#general', 'k1', 3, 3, 1, 1);
+             INSERT INTO events (conv, seq, t, author, verb, text, line) VALUES
+                 (1, 1, 0, 'bob@example.net', 'MSG', 'hi',
+                  '@seq=1;t=1970-01-01T00:00:00.000Z;from=bob@example.net MSG #general hi'),
+                 (1, 2, 0, 'troll@example.com', 'MSG', 'boo',
+                  '@seq=2;t=1970-01-01T00:00:00.000Z;from=troll@example.com MSG #general boo');
+             INSERT INTO events (conv, seq, t, author, verb, rel, target, text, line) VALUES
+                 (1, 3, 0, 'troll@example.com', 'MSG', 'react', 1, 'x',
+                  '@seq=3;t=1970-01-01T00:00:00.000Z;from=troll@example.com;react=1 MSG #general x');
+             INSERT INTO message_state (conv, seq, text) VALUES (1, 1, 'hi'), (1, 2, 'boo');
+             INSERT INTO reactions (conv, target, reaction, count) VALUES (1, 1, 'x', 1);
+             INSERT INTO outbox (account, conv, conv_id, cid, text, state, created, claim,
+                                 claimed_at)
+                 VALUES (1, '#general', 'k1', 'Abcdefghijklmnopqrstu1', 'later', 'queued', 0, NULL,
+                         NULL);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
+    assert_eq!(account, AccountId(1));
+    assert_eq!(
+        TrustStore::get(&store, &addr()).unwrap(),
+        Some(TrustRecord::Ca)
+    );
+    let summary = store.conversation(account, &room()).unwrap().unwrap();
+    assert_eq!(
+        (summary.sync_point, summary.read, summary.unread),
+        (3, 1, 1)
+    );
+    assert_eq!(store.outbox(account).unwrap().len(), 1);
+    // Nothing yet of what the new versions add.
+    assert_eq!(
+        store.user_name(account, &uid("bob@example.net")).unwrap(),
+        None
+    );
+    assert!(store.blocks(account).unwrap().is_empty());
+    assert!(!store.hides_blocked(account).unwrap());
+    assert_eq!(store.blocks_clock(account).unwrap(), 0);
+    assert_eq!(store.accepted_key(account).unwrap(), None);
+    // And they work on the old data.
+    let troll: risala_proto::names::BlockTarget = "troll@example.com".parse().unwrap();
+    store
+        .write(|tx| tx.change_block(account, &troll, true).map(drop))
+        .unwrap();
+    store.set_hide_blocked(account, true).unwrap();
+    let shown: Vec<u64> = store
+        .timeline(ConvId(1), None, 50)
+        .unwrap()
+        .iter()
+        .map(|i| i.seq.get())
+        .collect();
+    assert_eq!(shown, [1]);
+    assert!(
+        store
+            .message(ConvId(1), seq(1))
+            .unwrap()
+            .unwrap()
+            .reactions
+            .is_empty()
+    );
+    assert_eq!(store.blocks_clock(account).unwrap(), 1);
+    store.set_accepted_key(account, "sha256:x").unwrap();
+    assert_eq!(
+        store.accepted_key(account).unwrap().as_deref(),
+        Some("sha256:x")
+    );
+}
+
+#[test]
 fn version_2_caches_mark_own_events_by_the_account_uid() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
