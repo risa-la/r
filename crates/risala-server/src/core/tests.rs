@@ -124,6 +124,15 @@ impl Harness {
         (c, token)
     }
 
+    /// A new connection, signed in as the identity `uid` without AUTH,
+    /// for tests of what comes after signing in.
+    fn signed_in_as(&mut self, uid: &str) -> Client {
+        let c = self.connect();
+        let uid: Uid = uid.parse().unwrap();
+        assert!(self.hub.inner.reg().attach(c.id, &uid, None));
+        c
+    }
+
     /// A guest that has joined `room`. Returns the room's id.
     async fn joined(&mut self, name: &str, room: &str) -> (Client, String) {
         let mut c = self.guest(name).await;
@@ -1713,6 +1722,74 @@ async fn a_slow_reader_is_dropped_alone() {
     );
 }
 
+/// Two identities JOIN a room that does not exist at the same time: one
+/// creates it, with its JOIN as event 1, and the other joins it (6.1).
+#[tokio::test]
+async fn racing_joins_create_a_room_once() {
+    let mut h = Harness::new();
+    let mut alice = h.signed_in_as("alice@example.org");
+    let mut bob = h.signed_in_as("bob@example.net");
+    let (a, b) = tokio::join!(
+        h.send(&alice, "@ref=a join #new"),
+        h.send(&bob, "@ref=b join #new")
+    );
+    let ((), ()) = (a, b);
+    let (a, b) = (alice.lines(), bob.lines());
+    let (first, second, first_lines, second_lines) = if a.iter().any(|l| l.starts_with("@seq=1;")) {
+        ("alice@example.org", "bob@example.net", a, b)
+    } else {
+        ("bob@example.net", "alice@example.org", b, a)
+    };
+    let id = value(first_lines.last().unwrap(), "id");
+    assert_eq!(
+        first_lines[0],
+        format!("@seq=1;t={T};from={first};id={id} JOIN #new")
+    );
+    assert!(first_lines.contains(&format!("@seq=2;t={T};from={second};id={id} JOIN #new")));
+    assert_eq!(
+        second_lines[0],
+        format!("@seq=2;t={T};from={second};id={id} JOIN #new")
+    );
+    assert_eq!(
+        second_lines.last().unwrap(),
+        &format!("@ref={} OK id={id} head=2", &second[..1])
+    );
+    // The creator is the owner (6.3); the other is a member.
+    h.send(&alice, "info #new").await;
+    h.send(&bob, "info #new").await;
+    let role = |lines: Vec<String>| value(lines.last().unwrap(), "role");
+    assert_eq!(
+        role(if first.starts_with('a') {
+            alice.lines()
+        } else {
+            bob.lines()
+        }),
+        "owner"
+    );
+    assert_eq!(
+        role(if first.starts_with('a') {
+            bob.lines()
+        } else {
+            alice.lines()
+        }),
+        "member"
+    );
+    assert_eq!(
+        stored(&h, "#new"),
+        [format!("{first} JOIN"), format!("{second} JOIN")]
+    );
+}
+
+/// Guests cannot create rooms (4.2).
+#[tokio::test]
+async fn guests_cannot_create_rooms() {
+    let mut h = Harness::new();
+    let mut sam = h.guest("sam").await;
+    h.send(&sam, "join #new").await;
+    assert_eq!(sam.lines(), ["ERR not-found no such room"]);
+    assert!(h.hub.inner.room_entry(&"#new".parse().unwrap()).is_none());
+}
+
 /// A command that waited for a room's lock while the room was dropped
 /// (10.4) finds it gone: `not-found`, not `internal`. ADMIN DROP is M4, so
 /// the test drops the room by hand, as DROP will: under its lock, it marks
@@ -1986,6 +2063,14 @@ impl Store for Flaky {
     }
     fn ensure_room(&self, r: &Room, t: Timestamp) -> crate::store::Result<RoomRecord> {
         self.inner.ensure_room(r, t)
+    }
+    fn create_room(
+        &self,
+        r: &Room,
+        u: &Uid,
+        t: Timestamp,
+    ) -> crate::store::Result<crate::store::Created> {
+        self.inner.create_room(r, u, t)
     }
     fn rooms(&self) -> crate::store::Result<Vec<RoomRecord>> {
         self.inner.rooms()

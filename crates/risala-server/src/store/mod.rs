@@ -192,6 +192,15 @@ pub struct RoomRecord {
     pub bans: Vec<Uid>,
 }
 
+/// The result of [`Store::create_room`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Created {
+    /// The room was created.
+    New(RoomRecord),
+    /// The room already existed. Nothing was changed.
+    Exists(RoomRecord),
+}
+
 /// What an event says, apart from its conversation, seq, time and author.
 ///
 /// Stored events do not name their conversation: in a direct conversation
@@ -448,6 +457,12 @@ pub trait Store: Send + Sync + 'static {
     /// owner, no events and the default settings. For the rooms of the
     /// configuration file.
     fn ensure_room(&self, room: &Room, now: Timestamp) -> Result<RoomRecord>;
+
+    /// Creates a room for `creator`, who becomes its owner and first
+    /// member: in one transaction, the room gets its id (5.1), default
+    /// settings (6.2), the role `owner` for `creator` (6.3) and its JOIN as
+    /// event 1 (6.1). A room that already exists is returned as it is.
+    fn create_room(&self, room: &Room, creator: &Uid, now: Timestamp) -> Result<Created>;
 
     /// Every room, in name order.
     fn rooms(&self) -> Result<Vec<RoomRecord>>;

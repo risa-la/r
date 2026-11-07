@@ -14,8 +14,8 @@ use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
 use super::schema;
 use super::{
-    Appended, CID_WINDOW_MS, ConvKey, EventKind, HistoryQuery, NewEvent, Page, Result, RoomRecord,
-    RoomSettings, ServerSettings, Store, StoreError, StoredEvent, random_id,
+    Appended, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, NewEvent, Page, Result,
+    RoomRecord, RoomSettings, ServerSettings, Store, StoreError, StoredEvent, random_id,
 };
 
 /// How long a statement waits for another process's lock before failing.
@@ -603,6 +603,58 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
     Ok(())
 }
 
+/// Appends an event in the transaction `tx` (see [`Store::append`]).
+fn append_in(tx: &Transaction<'_>, conv: ConvKey, event: &NewEvent) -> Result<Appended> {
+    let conv = conv.0;
+    if let Some(cid) = &event.cid
+        && let Some(earlier) = find_cid(tx, conv, &event.from, cid, event.t)?
+    {
+        return Ok(Appended::Duplicate(earlier));
+    }
+    let next: i64 = tx
+        .prepare_cached("UPDATE conversations SET head = head + 1 WHERE conv = ? RETURNING head")?
+        .query_row([conv], |row| row.get(0))
+        .optional()?
+        .ok_or(StoreError::NoConversation)?;
+    let c = columns(&event.kind);
+    tx.prepare_cached(
+        "INSERT INTO events (conv, seq, t, author, verb, relation, target, subject, arg, \
+                 file_url, file_type, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?
+    .execute(params![
+        conv,
+        next,
+        ms(event.t),
+        event.from.as_str(),
+        event.kind.verb(),
+        c.relation,
+        c.target,
+        c.subject,
+        c.arg,
+        c.file_url,
+        c.file_type,
+        c.file_size,
+    ])?;
+    if let Some(text) = c.text.as_deref().filter(|t| !t.is_empty()) {
+        tx.prepare_cached("INSERT INTO event_text (conv, seq, text) VALUES (?, ?, ?)")?
+            .execute(params![conv, next, text])?;
+    }
+    apply_effects(tx, conv, next, event)?;
+    if let Some(cid) = &event.cid {
+        tx.prepare_cached(
+            "INSERT OR REPLACE INTO cids (conv, author, cid, seq, t) VALUES (?, ?, ?, ?, ?)",
+        )?
+        .execute(params![
+            conv,
+            event.from.as_str(),
+            cid.as_str(),
+            next,
+            ms(event.t)
+        ])?;
+    }
+    Ok(Appended::New(seq(next)?))
+}
+
 /// The seq of a message sent with `cid` in the 24 hours before `now` (7.6).
 fn find_cid(
     conn: &Connection,
@@ -680,6 +732,34 @@ impl Store for SqliteStore {
         })
     }
 
+    fn create_room(&self, room: &Room, creator: &Uid, now: Timestamp) -> Result<Created> {
+        self.write(|tx| {
+            if let Some(record) = load_room(tx, room)? {
+                return Ok(Created::Exists(record));
+            }
+            let id = take_id(tx, "conversation", now)?;
+            tx.execute(
+                "INSERT INTO conversations (id, kind, room, created) VALUES (?, 'room', ?, ?)",
+                params![id.as_str(), room.as_str(), ms(now)],
+            )?;
+            let conv = tx.last_insert_rowid();
+            tx.execute("INSERT INTO room_settings (conv) VALUES (?)", [conv])?;
+            tx.execute(
+                "INSERT INTO roles (conv, uid, role) VALUES (?, ?, 'owner')",
+                params![conv, creator.as_str()],
+            )?;
+            let join = NewEvent {
+                t: now,
+                from: creator.clone(),
+                kind: EventKind::Join,
+                cid: None,
+            };
+            append_in(tx, ConvKey(conv), &join)?;
+            let record = load_room(tx, room)?.ok_or(StoreError::NoConversation)?;
+            Ok(Created::New(record))
+        })
+    }
+
     fn rooms(&self) -> Result<Vec<RoomRecord>> {
         let conn = self.conn();
         let rows = conn
@@ -694,58 +774,7 @@ impl Store for SqliteStore {
     }
 
     fn append(&self, conv: ConvKey, event: &NewEvent) -> Result<Appended> {
-        self.write(|tx| {
-            let conv = conv.0;
-            if let Some(cid) = &event.cid
-                && let Some(earlier) = find_cid(tx, conv, &event.from, cid, event.t)?
-            {
-                return Ok(Appended::Duplicate(earlier));
-            }
-            let next: i64 = tx
-                .prepare_cached(
-                    "UPDATE conversations SET head = head + 1 WHERE conv = ? RETURNING head",
-                )?
-                .query_row([conv], |row| row.get(0))
-                .optional()?
-                .ok_or(StoreError::NoConversation)?;
-            let c = columns(&event.kind);
-            tx.prepare_cached(
-                "INSERT INTO events (conv, seq, t, author, verb, relation, target, subject, arg, \
-                 file_url, file_type, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?
-            .execute(params![
-                conv,
-                next,
-                ms(event.t),
-                event.from.as_str(),
-                event.kind.verb(),
-                c.relation,
-                c.target,
-                c.subject,
-                c.arg,
-                c.file_url,
-                c.file_type,
-                c.file_size,
-            ])?;
-            if let Some(text) = c.text.as_deref().filter(|t| !t.is_empty()) {
-                tx.prepare_cached("INSERT INTO event_text (conv, seq, text) VALUES (?, ?, ?)")?
-                    .execute(params![conv, next, text])?;
-            }
-            apply_effects(tx, conv, next, event)?;
-            if let Some(cid) = &event.cid {
-                tx.prepare_cached(
-                    "INSERT OR REPLACE INTO cids (conv, author, cid, seq, t) VALUES (?, ?, ?, ?, ?)",
-                )?
-                .execute(params![
-                    conv,
-                    event.from.as_str(),
-                    cid.as_str(),
-                    next,
-                    ms(event.t)
-                ])?;
-            }
-            Ok(Appended::New(seq(next)?))
-        })
+        self.write(|tx| append_in(tx, conv, event))
     }
 
     fn event(&self, conv: ConvKey, s: Seq) -> Result<Option<StoredEvent>> {

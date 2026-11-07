@@ -115,6 +115,46 @@ fn ensure_room_creates_once() {
 }
 
 #[test]
+fn create_room_makes_the_creator_its_owner() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let alice = uid("alice@example.org");
+    let Created::New(r) = store.create_room(&room("#new"), &alice, t(3)).unwrap() else {
+        panic!("not created");
+    };
+    assert_eq!(r.room, room("#new"));
+    assert_eq!(r.head, Some(seq(1)));
+    assert_eq!(r.settings, RoomSettings::new());
+    assert_eq!(r.members, std::slice::from_ref(&alice));
+    assert_eq!(r.roles, [(alice.clone(), Role::Owner)]);
+    assert_eq!(r.created, t(3));
+    let page = store
+        .history(
+            r.key,
+            HistoryQuery {
+                after: Some(0),
+                before: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].kind, EventKind::Join);
+    assert_eq!(page.events[0].from, alice);
+    assert_eq!(page.events[0].t, t(3));
+
+    // A second creation changes nothing.
+    let bob = uid("bob@example.net");
+    let again = store.create_room(&room("#new"), &bob, t(9)).unwrap();
+    assert_eq!(again, Created::Exists(r.clone()));
+    // A room from the configuration exists too.
+    let general = store.ensure_room(&room("#general"), t(0)).unwrap();
+    assert_eq!(
+        store.create_room(&room("#general"), &bob, t(9)).unwrap(),
+        Created::Exists(general)
+    );
+}
+
+#[test]
 fn reopening_keeps_everything() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("risala.db");
@@ -618,6 +658,8 @@ fn settings_roles_and_bans_follow_events() {
     let r = store.room(&general).unwrap().unwrap();
     assert!(r.roles.is_empty());
     assert!(r.members.is_empty());
+    assert_eq!(r.bans, std::slice::from_ref(&bob));
+    assert!(r.invites.is_empty());
     let conn = store.conn();
     let reason: String = conn
         .query_row(

@@ -18,7 +18,9 @@ use risala_proto::types::{
 use super::state::{ConvEntry, ConvGuard, ConvState, RoomInfo};
 use super::{Inner, SignIn, SignInRefused, TOKEN_LEN};
 use crate::handler::{ConnHandle, ConnId, OutLine};
-use crate::store::{self, Appended, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent};
+use crate::store::{
+    self, Appended, Created, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent,
+};
 
 /// Why a command failed.
 #[derive(Debug)]
@@ -372,10 +374,32 @@ impl Inner {
         Ok(st)
     }
 
-    /// JOIN (6.1).
+    /// JOIN (6.1). A room that does not exist is created for an identity
+    /// when the server's policy allows it.
     async fn join(&self, uid: &Uid, reply: &Reply, room: &Room) -> Outcome {
-        // M3: identities may create rooms that do not exist.
-        let mut guard = self.lock_room(room).await?;
+        loop {
+            let guard = match self.lock_room(room).await {
+                Ok(guard) => guard,
+                Err(e) if !self.may_create_room(uid) => return Err(e),
+                Err(_) => match self.create_room(uid, room).await? {
+                    Some(guard) => {
+                        // The creator is its first member, and its JOIN is
+                        // event 1 (6.1).
+                        send_settings(reply, room_of(&guard)?);
+                        let head = guard.head.map_or(0, u64::from);
+                        reply.line(OkResponse::new().with_id(&guard.id).with_head(head));
+                        return Ok(None);
+                    }
+                    // Someone else created it meanwhile: join theirs.
+                    None => continue,
+                },
+            };
+            return self.join_existing(uid, reply, guard).await;
+        }
+    }
+
+    /// JOIN of a room that exists, whose lock is held.
+    async fn join_existing(&self, uid: &Uid, reply: &Reply, mut guard: ConvGuard) -> Outcome {
         let entry = ConvGuard::mutex(&guard).clone();
         let st = &mut *guard;
         let member = st.is_member(uid);
@@ -404,6 +428,71 @@ impl Inner {
         // overtake it (3.6).
         reply.line(OkResponse::new().with_id(&st.id).with_head(head));
         Ok(None)
+    }
+
+    /// Whether `uid` may create a room by joining it (6.1). Guests never
+    /// may (4.2).
+    fn may_create_room(&self, uid: &Uid) -> bool {
+        uid.is_identity()
+    }
+
+    /// Creates `room` for `creator`, with its JOIN as event 1, and adds it
+    /// to the hub (6.1). Returns the new room, locked, once the creator's
+    /// connections have its JOIN; or `None` if the room exists after all.
+    ///
+    /// Rooms are added at run time only here, under the creation lock, so
+    /// two JOINs cannot both create one. The room is locked before it is
+    /// added to the index, so nobody else's event can come before its
+    /// first.
+    async fn create_room(&self, creator: &Uid, room: &Room) -> Result<Option<ConvGuard>, Fail> {
+        let _creating = self.create_lock.lock().await;
+        if self.room_entry(room).is_some() {
+            return Ok(None);
+        }
+        let now = self.now();
+        let (name, uid) = (room.clone(), creator.clone());
+        let created = self.db(move |s| s.create_room(&name, &uid, now)).await?;
+        let (mut record, new) = match created {
+            Created::New(record) => (record, true),
+            // In the store but not in the index: cannot happen, since
+            // rooms are added to both here or at startup. Add it, and join
+            // it as it is.
+            Created::Exists(record) => {
+                tracing::warn!(%room, "a stored room was missing from the index");
+                (record, false)
+            }
+        };
+        let members = std::mem::take(&mut record.members);
+        let entry = Arc::new(ConvEntry::new(ConvState::room(record)));
+        let mut guard = entry
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Fail::Store(StoreError::Task("a new room was locked".into())))?;
+        {
+            let mut reg = self.reg();
+            for uid in &members {
+                let user = reg.user(uid);
+                guard.add_member(&entry, &user);
+            }
+        }
+        self.rooms
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(room.clone(), entry);
+        drop(_creating);
+        if !new {
+            return Ok(None);
+        }
+        tracing::info!(%room, "room created");
+        let join = StoredEvent {
+            seq: guard.head.ok_or(StoreError::NoConversation)?,
+            t: now,
+            from: creator.clone(),
+            kind: EventKind::Join,
+            deleted: false,
+        };
+        Self::broadcast_event(&guard, &join);
+        Ok(Some(guard))
     }
 
     /// PART (6.1).
