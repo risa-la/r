@@ -13,8 +13,9 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::server::{MAX_REQUEST_HEAD, handle};
-use super::{HttpServer, KeyDir, KeyFilePublisher};
+use super::{HttpServer, KeyDir};
 use crate::config::{CertPair, Config};
+use crate::core::KeyFilePublisher;
 use crate::net::Certificates;
 
 /// A test CA. Its certificates are written to a directory as PEM files.
@@ -251,9 +252,9 @@ async fn daemon_runs_the_listener() {
         Ok(vec![key(7)])
     );
     // Through the server's trait, as the hub calls it.
-    let fetcher: Arc<dyn super::KeyFetcher> = Arc::new(fetcher);
+    let fetcher = super::HttpsKeyFetcher(fetcher);
     assert_eq!(
-        fetcher.fetch(&id("alice@example.test"), true).await,
+        crate::core::KeyFetcher::fetch(&fetcher, &id("alice@example.test"), true).await,
         Ok(vec![key(7)])
     );
 

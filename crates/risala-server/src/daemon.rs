@@ -28,7 +28,7 @@ use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
 use crate::core::{BYE_SHUTDOWN, CID_PRUNE_PERIOD, Hub, HubError, KeyServices, Timers};
-use crate::http::{self, HttpServer, KeyDir, KeyFetcher};
+use crate::http::{self, HttpServer, KeyDir};
 use crate::net;
 
 /// An error starting or running the server.
@@ -51,7 +51,6 @@ pub struct Daemon {
     hub: Hub,
     http: Option<HttpServer>,
     key_dir: Arc<KeyDir>,
-    key_fetcher: Arc<dyn KeyFetcher>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -81,30 +80,36 @@ impl Daemon {
     /// [`Daemon::bind`] with timers that need not follow the
     /// configuration, for tests.
     pub(crate) async fn bind_with(config: Config, timers: Timers) -> Result<Daemon, RunError> {
-        Daemon::bind_full(config, timers, KeyServices::default()).await
+        Daemon::bind_full(config, timers, None).await
     }
 
     /// [`Daemon::bind`], fetching and publishing key files with `keys`
-    /// (4.4, 4.6). Without them, the server fetches no key files, so only
-    /// identities it hosts can sign in.
+    /// (4.4, 4.6) instead of over HTTPS and into `key_dir`, for tests.
     pub async fn bind_with_keys(config: Config, keys: KeyServices) -> Result<Daemon, RunError> {
         let timers = Timers::from_config(&config);
-        Daemon::bind_full(config, timers, keys).await
+        Daemon::bind_full(config, timers, Some(keys)).await
     }
 
+    /// Binds with `keys`, or else with key files fetched over HTTPS as
+    /// `[keys]` says (4.4) and hosted ones written to `key_dir` (4.6).
     async fn bind_full(
         config: Config,
         timers: Timers,
-        keys: KeyServices,
+        keys: Option<KeyServices>,
     ) -> Result<Daemon, RunError> {
         // Opening SQLite, reading certificates and generating a key all
         // block, so keep them off the runtime's worker threads.
         tokio::task::spawn_blocking(move || {
+            let key_dir = Arc::new(KeyDir::new(config.key_dir()));
+            let keys = match keys {
+                Some(keys) => keys,
+                None => {
+                    KeyServices::shared(http::fetch::from_config(&config.keys)?, key_dir.clone())
+                }
+            };
             let hub = Hub::open_with(config, timers, keys)?;
             let server = net::Server::bind(hub.config(), Arc::new(hub.clone()))?;
             let config = hub.config();
-            let key_fetcher = http::fetch::from_config(&config.keys)?;
-            let key_dir = Arc::new(KeyDir::new(config.key_dir()));
             let http = if config.http.listen.is_empty() {
                 None
             } else if config.http.certs.is_empty() {
@@ -130,7 +135,6 @@ impl Daemon {
                 hub,
                 http,
                 key_dir,
-                key_fetcher,
             })
         })
         .await
@@ -170,11 +174,6 @@ impl Daemon {
     /// published (4.6) and which the HTTPS listener serves.
     pub fn key_dir(&self) -> &Arc<KeyDir> {
         &self.key_dir
-    }
-
-    /// The key file fetcher (4.4), set up from `[keys]`.
-    pub fn key_fetcher(&self) -> &Arc<dyn KeyFetcher> {
-        &self.key_fetcher
     }
 
     /// Accepts connections until `shutdown` resolves, then says BYE to

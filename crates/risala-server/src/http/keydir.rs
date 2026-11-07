@@ -1,6 +1,5 @@
-//! Publishing hosted identities' key files (4.6): the
-//! [`KeyFilePublisher`] trait the hub uses, and [`KeyDir`], which writes
-//! the files to a directory.
+//! Publishing hosted identities' key files (4.6): [`KeyDir`], the hub's
+//! [`KeyFilePublisher`], which writes the files to a directory.
 //!
 //! The directory holds one file per hosted name, `<dir>/<name>`, readable
 //! by everyone (mode 0644), so an operator can serve it as
@@ -15,21 +14,7 @@ use std::sync::Mutex;
 use risala_proto::keyfile::KeyEntry;
 use risala_proto::names::Name;
 
-/// Publishes the key files of the identities the server hosts (4.6), at
-/// the URL of 4.3.
-///
-/// The calls block (they write files), so the hub calls them off the
-/// async runtime's worker threads, as it does the store.
-pub trait KeyFilePublisher: Send + Sync + 'static {
-    /// Publishes `name`'s key file with `keys`, in order, replacing the old
-    /// one (4.6, 4.7). With no keys, the file is published empty, so the
-    /// identity has no keys (10.5, ADMIN DELKEY of the last key).
-    fn publish(&self, name: &Name, keys: &[KeyEntry]) -> io::Result<()>;
-
-    /// Removes `name`'s key file (4.8, 10.5). Removing a file that does not
-    /// exist succeeds.
-    fn remove(&self, name: &Name) -> io::Result<()>;
-}
+use crate::core::KeyFilePublisher;
 
 /// Key files in a directory, `<dir>/<name>`, each replaced atomically.
 ///

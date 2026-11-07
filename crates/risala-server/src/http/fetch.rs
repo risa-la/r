@@ -1,55 +1,34 @@
-//! Fetching key files for AUTH (4.4, 4.5): the [`KeyFetcher`] trait the
-//! hub uses, and its implementation by [`risala_keyfetch`].
+//! Fetching key files for AUTH (4.4, 4.5): the hub's
+//! [`KeyFetcher`](crate::core::KeyFetcher), implemented by
+//! [`risala_keyfetch`].
 
 use std::io;
 use std::sync::Arc;
 
-use risala_keyfetch::{BoxFuture, FetchOptions};
+use risala_keyfetch::FetchOptions;
 use risala_proto::auth::PublicKey;
 use risala_proto::names::Identity;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject as _;
 
 use crate::config::KeysConfig;
+use crate::core::{FetchError, KeyFetcher};
 
-pub use risala_keyfetch::FetchError;
+/// Fetches key files over HTTPS under the rules of 4.4, for the hub's
+/// AUTH (4.5). Any failure means "no keys" for that sign-in.
+#[derive(Debug)]
+pub struct HttpsKeyFetcher(pub risala_keyfetch::KeyFetcher);
 
-/// Gets the keys of identities the server does not host, from their key
-/// files (4.4), to check AUTH (4.5).
-///
-/// The future is boxed so that the hub can hold an `Arc<dyn KeyFetcher>`,
-/// and tests a stub.
-pub trait KeyFetcher: Send + Sync + 'static {
-    /// The public keys in `identity`'s key file (4.4). Any error means the
-    /// identity has no keys.
-    ///
-    /// With `refresh`, the file is fetched again rather than taken from the
-    /// cache: 4.4 asks for this once when a signature does not verify
-    /// against a cached file. An implementation may still limit how often
-    /// one file is fetched (14).
-    fn fetch<'a>(
-        &'a self,
-        identity: &'a Identity,
+impl KeyFetcher for HttpsKeyFetcher {
+    async fn fetch(
+        &self,
+        identity: &Identity,
         refresh: bool,
-    ) -> BoxFuture<'a, Result<Vec<PublicKey>, FetchError>>;
-
-    /// Forgets any cached key file of `identity`. Does nothing by default.
-    fn invalidate(&self, identity: &Identity) {
-        let _ = identity;
-    }
-}
-
-impl KeyFetcher for risala_keyfetch::KeyFetcher {
-    fn fetch<'a>(
-        &'a self,
-        identity: &'a Identity,
-        refresh: bool,
-    ) -> BoxFuture<'a, Result<Vec<PublicKey>, FetchError>> {
-        Box::pin(risala_keyfetch::KeyFetcher::fetch(self, identity, refresh))
-    }
-
-    fn invalidate(&self, identity: &Identity) {
-        risala_keyfetch::KeyFetcher::invalidate(self, identity);
+    ) -> Result<Vec<PublicKey>, FetchError> {
+        self.0
+            .fetch(identity, refresh)
+            .await
+            .map_err(|e| FetchError::Failed(e.to_string()))
     }
 }
 
@@ -88,8 +67,8 @@ pub fn fetch_options(config: &KeysConfig) -> io::Result<FetchOptions> {
 
 /// The server's [`KeyFetcher`], set up from `config` (see
 /// [`fetch_options`]). Call it from a blocking context.
-pub fn from_config(config: &KeysConfig) -> io::Result<Arc<dyn KeyFetcher>> {
-    Ok(Arc::new(risala_keyfetch::KeyFetcher::new(fetch_options(
-        config,
-    )?)))
+pub fn from_config(config: &KeysConfig) -> io::Result<Arc<HttpsKeyFetcher>> {
+    Ok(Arc::new(HttpsKeyFetcher(risala_keyfetch::KeyFetcher::new(
+        fetch_options(config)?,
+    ))))
 }

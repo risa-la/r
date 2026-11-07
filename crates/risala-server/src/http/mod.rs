@@ -3,11 +3,12 @@
 //!
 //! Owned by task B in docs/plans/M3.md.
 //!
-//! - [`fetch`]: the [`KeyFetcher`] trait, which the hub uses to get an
-//!   identity's keys (4.5), implemented by the `risala-keyfetch` crate.
-//! - [`keydir`]: the [`KeyFilePublisher`] trait, which the hub uses to
-//!   publish hosted identities' key files (4.6), implemented by
-//!   [`KeyDir`], which writes them to a directory.
+//! - [`fetch`]: [`HttpsKeyFetcher`], the hub's
+//!   [`KeyFetcher`](crate::core::KeyFetcher) over HTTPS (4.5), built on
+//!   the `risala-keyfetch` crate.
+//! - [`keydir`]: [`KeyDir`], the hub's
+//!   [`KeyFilePublisher`](crate::core::KeyFilePublisher), which writes
+//!   hosted identities' key files to a directory (4.6).
 //! - [`server`]: [`HttpServer`], the optional HTTPS listener (`[http]` in
 //!   the configuration), which serves that directory at
 //!   `/.well-known/risala/<name>`.
@@ -19,6 +20,6 @@ pub mod server;
 #[cfg(test)]
 mod tests;
 
-pub use fetch::{FetchError, KeyFetcher};
-pub use keydir::{KeyDir, KeyFilePublisher};
+pub use fetch::HttpsKeyFetcher;
+pub use keydir::KeyDir;
 pub use server::HttpServer;
