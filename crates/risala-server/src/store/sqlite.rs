@@ -21,7 +21,8 @@ use super::{
 /// How long a statement waits for another process's lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// [`Store`] on a SQLite database, in WAL mode, with foreign keys on.
+/// [`Store`] on a SQLite database, in WAL mode with `synchronous=FULL`, so a
+/// commit survives a power failure, and with foreign keys on.
 ///
 /// It holds one connection behind a mutex, so the store's transactions run
 /// one at a time. They are all short.
@@ -32,21 +33,35 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Opens (or creates) the database at `path` and brings its schema up
-    /// to date.
+    /// to date. Fails if the database cannot use WAL mode.
     pub fn open(path: &Path) -> Result<SqliteStore> {
-        SqliteStore::setup(Connection::open(path)?)
+        SqliteStore::setup(Connection::open(path)?, true)
     }
 
     /// A store in memory, for tests.
     pub fn open_in_memory() -> Result<SqliteStore> {
-        SqliteStore::setup(Connection::open_in_memory()?)
+        SqliteStore::setup(Connection::open_in_memory()?, false)
     }
 
-    fn setup(mut conn: Connection) -> Result<SqliteStore> {
+    pub(super) fn setup(mut conn: Connection, need_wal: bool) -> Result<SqliteStore> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        let _mode: String =
+        let mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        if need_wal && !mode.eq_ignore_ascii_case("wal") {
+            return Err(StoreError::Setup(format!(
+                "the database cannot use WAL mode (journal mode is {mode:?})"
+            )));
+        }
+        // FULL, not NORMAL: in WAL mode, NORMAL can lose the last commits
+        // after a power failure, and a seq already sent would then be used
+        // again (5.2).
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let sync: i64 = conn.pragma_query_value(None, "synchronous", |row| row.get(0))?;
+        if sync < 2 {
+            return Err(StoreError::Setup(format!(
+                "cannot set synchronous=FULL (it is {sync})"
+            )));
+        }
         conn.pragma_update(None, "foreign_keys", "ON")?;
         schema::migrate(&mut conn)?;
         Ok(SqliteStore {

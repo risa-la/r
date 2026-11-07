@@ -47,6 +47,10 @@ pub enum StoreError {
     /// this server.
     #[error("corrupt database: {0}")]
     Corrupt(String),
+    /// The database could not be set up as the store needs, for example
+    /// in WAL mode.
+    #[error("database setup: {0}")]
+    Setup(String),
     /// The operating system's random source failed.
     #[error("random source: {0}")]
     Random(String),

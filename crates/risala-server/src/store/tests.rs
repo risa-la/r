@@ -142,6 +142,35 @@ fn reopening_keeps_everything() {
 }
 
 #[test]
+fn commits_are_durable() {
+    // In WAL mode, synchronous=NORMAL can lose the last commits after a
+    // power failure, and their seqs would be used again (5.2).
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(&dir.path().join("risala.db")).unwrap();
+    let conn = store.conn();
+    let sync: i64 = conn
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .unwrap();
+    assert_eq!(sync, 2, "synchronous=FULL");
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn a_database_without_wal_is_refused() {
+    // An in-memory database cannot use WAL: its journal mode stays
+    // "memory".
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let err = SqliteStore::setup(conn, true).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Setup(m) if m.contains("WAL")),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_newer_database_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("risala.db");
