@@ -209,7 +209,7 @@ fn open(dir: &Path, account: Option<String>) -> Res<Ctx> {
         keys: Some(std::sync::Arc::new(FileKeyStore::new(&keys_dir))),
         ..ClientOptions::default()
     };
-    match Client::open(dir.join("cache.db"), options) {
+    match Client::open(&dir.join("cache.db"), options) {
         Ok(client) => Ok(Ctx {
             client,
             keys_dir,

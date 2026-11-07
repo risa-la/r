@@ -107,8 +107,8 @@ impl Timeline {
     }
 
     /// The conversation.
-    pub fn conversation(&self) -> &Conversation {
-        &self.conv
+    pub fn conversation(&self) -> Conversation {
+        self.conv.clone()
     }
 
     /// The items now, oldest first.

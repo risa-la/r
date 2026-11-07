@@ -236,8 +236,8 @@ impl Account {
     }
 
     /// The client it belongs to.
-    pub fn client(&self) -> &Client {
-        &self.client
+    pub fn client(&self) -> Client {
+        self.client.clone()
     }
 
     /// Where the connection is.
@@ -565,8 +565,8 @@ impl Conversation {
     }
 
     /// The account it belongs to.
-    pub fn account(&self) -> &Account {
-        &self.account
+    pub fn account(&self) -> Account {
+        self.account.clone()
     }
 
     pub(crate) fn conv(&self) -> &Conv {

@@ -155,7 +155,7 @@ pub(crate) struct ClientInner {
 
 impl Client {
     /// Opens the cache at `path`, creating it if needed.
-    pub fn open(path: impl AsRef<Path>, options: ClientOptions) -> Result<Client, ClientError> {
+    pub fn open(path: &Path, options: ClientOptions) -> Result<Client, ClientError> {
         Ok(Client::with_store(Store::open(path)?, options))
     }
 
