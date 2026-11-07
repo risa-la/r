@@ -60,6 +60,7 @@ const V6_BLOCKS: &[([u16; 8], u8)] = &[
     ([0, 0, 0, 0, 0, 0, 0, 0], 96), // unspecified, loopback, IPv4-compatible (RFC 4291)
     ([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48), // local-use NAT64 (RFC 8215)
     ([0x100, 0, 0, 0, 0, 0, 0, 0], 64), // discard-only (RFC 6666)
+    ([0x100, 0, 0, 1, 0, 0, 0, 0], 64), // dummy IPv6 prefix (RFC 9780)
     ([0x2001, 0, 0, 0, 0, 0, 0, 0], 23), // IETF protocol assignments (RFC 2928), Teredo, ORCHID...
     ([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0], 32), // documentation (RFC 3849)
     ([0x2002, 0, 0, 0, 0, 0, 0, 0], 16), // 6to4 (RFC 3056)
@@ -171,6 +172,8 @@ mod tests {
             "64:ff9b::127.0.0.1",
             "64:ff9b:1::1",
             "100::1",
+            "100:0:0:1::1",
+            "100:0:0:1:ffff:ffff:ffff:ffff",
             "2001::1",
             "2001:2::1",
             "2001:10::1",
@@ -199,6 +202,7 @@ mod tests {
             "2001:200::1",
             "::ffff:1.1.1.1",
             "64:ff9b::1.1.1.1",
+            "100:0:0:2::1",
             "fbff::1",
         ] {
             assert!(!special(ip), "{ip} should be allowed");
