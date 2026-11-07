@@ -1,6 +1,8 @@
 //! `risalad`'s HTTPS listener (4.6, PLAN.md section 6): it serves hosted
-//! identities' key files at `/.well-known/risala/<name>`, from the
-//! [`KeyDir`].
+//! identities' key files at `/.well-known/risala/<name>`, from wherever
+//! its [`KeyFiles`] gets them. In `risalad` that is the hub's own records
+//! of the identities it hosts, so the listener serves those names and
+//! nothing else, whatever else is in `key_dir`.
 //!
 //! It speaks just enough HTTP/1.1 for that: one request per connection,
 //! answered and then closed. `GET` and `HEAD` of a key file get it, with
@@ -27,7 +29,32 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use super::KeyDir;
+use crate::core::Hub;
 use crate::net::{self, Certificates};
+
+/// Where the HTTPS listener gets the key files it serves.
+pub trait KeyFiles: Send + Sync + 'static {
+    /// The key file of `<name>@<identity domain>`, or `None` if there is
+    /// none to serve (404). Called on the blocking pool.
+    fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>>;
+}
+
+/// The key files of the identities the hub hosts, made from its records
+/// (4.6): the names it hosts, and nothing else.
+impl KeyFiles for Hub {
+    fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
+        let keys = self.hosted_key_file(name).map_err(io::Error::other)?;
+        Ok(keys.map(|keys| KeyDir::render(&keys).into_bytes()))
+    }
+}
+
+/// The files in a directory that another program writes, as a web server
+/// serving `key_dir` would. Tests use it for key servers of their own.
+impl KeyFiles for KeyDir {
+    fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
+        self.read(name)
+    }
+}
 
 /// The path under which key files are served (4.3).
 pub const KEY_FILE_PREFIX: &str = "/.well-known/risala/";
@@ -50,21 +77,20 @@ pub struct HttpServer {
     acceptor: TlsAcceptor,
     certs: Certificates,
     reload: bool,
-    keys: Arc<KeyDir>,
+    keys: Arc<dyn KeyFiles>,
 }
 
 impl std::fmt::Debug for HttpServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpServer")
             .field("addrs", &self.addrs)
-            .field("keys", &self.keys)
             .finish_non_exhaustive()
     }
 }
 
 impl HttpServer {
-    /// Binds every address in `listen`, to serve the key files in `keys`
-    /// with `certs`, chosen by SNI. Port 0 lets the system choose.
+    /// Binds every address in `listen`, to serve the key files `keys`
+    /// has with `certs`, chosen by SNI. Port 0 lets the system choose.
     ///
     /// With `reload`, [`run`](Self::run) re-reads the certificates when
     /// their files change and on SIGHUP, as the risala listener does with
@@ -74,7 +100,7 @@ impl HttpServer {
         listen: &[SocketAddr],
         certs: Certificates,
         reload: bool,
-        keys: Arc<KeyDir>,
+        keys: Arc<dyn KeyFiles>,
     ) -> io::Result<HttpServer> {
         let mut config = rustls::ServerConfig::builder_with_provider(risala_keyfetch::provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -137,7 +163,7 @@ impl HttpServer {
 
 struct Shared {
     acceptor: TlsAcceptor,
-    keys: Arc<KeyDir>,
+    keys: Arc<dyn KeyFiles>,
     permits: Arc<Semaphore>,
 }
 
@@ -326,7 +352,7 @@ impl Route {
 }
 
 /// Answers a request.
-async fn route(request: &Request, keys: &Arc<KeyDir>) -> Response {
+async fn route(request: &Request, keys: &Arc<dyn KeyFiles>) -> Response {
     let head_only = match request.method.as_str() {
         "GET" => false,
         "HEAD" => true,
@@ -345,9 +371,9 @@ async fn route(request: &Request, keys: &Arc<KeyDir>) -> Response {
 }
 
 /// A hosted identity's key file, or 404.
-async fn key_file(name: Name, keys: &Arc<KeyDir>) -> Response {
+async fn key_file(name: Name, keys: &Arc<dyn KeyFiles>) -> Response {
     let keys = keys.clone();
-    let read = tokio::task::spawn_blocking(move || keys.read(&name)).await;
+    let read = tokio::task::spawn_blocking(move || keys.key_file(&name)).await;
     match read {
         Ok(Ok(Some(body))) => Response {
             status: 200,
@@ -373,7 +399,7 @@ async fn key_file(name: Name, keys: &Arc<KeyDir>) -> Response {
 #[cfg(test)]
 pub(crate) async fn handle<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
-    keys: &Arc<KeyDir>,
+    keys: &Arc<dyn KeyFiles>,
 ) {
     let response = match read_request(stream).await {
         Ok(request) => route(&request, keys).await,

@@ -30,6 +30,14 @@ pub const BYE_KEY_REMOVED: &str = "this device's key was removed";
 /// The BYE text for the connections of an identity that was deleted (4.8).
 pub const BYE_UNREGISTERED: &str = "identity deleted";
 
+/// How long to wait before each try at removing a key file again, after
+/// the first fails (4.8). `None` marks the last try.
+const UNPUBLISH_RETRIES: [Option<Duration>; 3] = [
+    Some(Duration::from_millis(100)),
+    Some(Duration::from_secs(1)),
+    None,
+];
+
 /// The window of `limits.registrations_per_hour` (13).
 pub(super) const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
 
@@ -67,7 +75,7 @@ fn rate_key(ip: IpAddr) -> IpAddr {
 
 /// The key file entry for a hosted key, whose label is escaped (3.4). A
 /// label that cannot go in a key file gets `None`.
-fn key_entry(key: &HostedKey) -> KeyEntry {
+pub(super) fn key_entry(key: &HostedKey) -> KeyEntry {
     KeyEntry::new(key.key.clone(), Some(&unescape(&key.label)))
         .or_else(|_| KeyEntry::new(key.key.clone(), None))
         .expect("an entry without a label is valid")
@@ -353,18 +361,36 @@ impl Inner {
             .map_err(std::io::Error::other)?
     }
 
-    /// Removes the key file of the hosted identity `uid` (4.8). Failures
-    /// are logged.
+    /// Removes the key file of the hosted identity `uid` (4.8), trying
+    /// again a few times if that fails. The HTTPS listener stops serving
+    /// it at once either way, since it serves from the store, but another
+    /// web server serving `key_dir` would go on serving it, so a failure
+    /// is logged as an error, and the file is removed at the next start
+    /// ([`KeyFilePublisher::retain`]).
     async fn unpublish(&self, uid: &Uid) {
         let Ok(name) = uid.name().parse::<Name>() else {
             return;
         };
-        let publisher = self.keys.publisher.clone();
-        let result = tokio::task::spawn_blocking(move || publisher.remove(&name)).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(%uid, "removing the key file failed: {e}"),
-            Err(e) => tracing::error!(%uid, "removing the key file failed: {e}"),
+        for wait in UNPUBLISH_RETRIES {
+            let publisher = self.keys.publisher.clone();
+            let file = name.clone();
+            let result = tokio::task::spawn_blocking(move || publisher.remove(&file))
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|r| r);
+            match (result, wait) {
+                (Ok(()), _) => return,
+                (Err(e), Some(wait)) => {
+                    tracing::warn!(%uid, "removing the key file failed, trying again: {e}");
+                    tokio::time::sleep(wait).await;
+                }
+                (Err(e), None) => {
+                    tracing::error!(
+                        %uid,
+                        "removing the key file failed: {e}; it is removed at the next start"
+                    );
+                }
+            }
         }
     }
 

@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use super::TempDir;
 use crate::config::CertPair;
 use crate::core::KeyFilePublisher as _;
-use crate::http::{HttpServer, KeyDir};
+use crate::http::{HttpServer, KeyDir, KeyFiles};
 use crate::net::Certificates;
 
 /// One device of an identity, for tests: the identity and the device's
@@ -218,7 +218,7 @@ impl TestKeyServer {
                 &[SocketAddr::from(([127, 0, 0, 1], 0))],
                 certs,
                 false,
-                keys.clone(),
+                keys.clone() as Arc<dyn KeyFiles>,
             )
             .expect("binding the key server");
             let addr = server.local_addrs()[0];

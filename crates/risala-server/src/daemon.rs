@@ -119,7 +119,7 @@ impl Daemon {
                     &config.http.listen,
                     certs,
                     false,
-                    key_dir.clone(),
+                    Arc::new(hub.clone()),
                 )?)
             } else {
                 let certs = net::Certificates::from_pairs(config.http.certs.clone())?;
@@ -127,7 +127,7 @@ impl Daemon {
                     &config.http.listen,
                     certs,
                     true,
-                    key_dir.clone(),
+                    Arc::new(hub.clone()),
                 )?)
             };
             Ok(Daemon {
@@ -171,7 +171,8 @@ impl Daemon {
     }
 
     /// The key file directory, where hosted identities' key files are
-    /// published (4.6) and which the HTTPS listener serves.
+    /// published (4.6) for another web server to serve. The HTTPS
+    /// listener serves them from the hub's records instead.
     pub fn key_dir(&self) -> &Arc<KeyDir> {
         &self.key_dir
     }

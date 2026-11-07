@@ -571,6 +571,55 @@ async fn an_unregistered_name_stays_reserved() {
     assert_eq!(c.lines(), ["ERR name-taken that name was used before"]);
 }
 
+/// Removing a deleted identity's key file is tried again if it fails
+/// (4.8).
+#[tokio::test]
+async fn removing_a_key_file_is_retried() {
+    let mut w = World::new();
+    let mut c = w.register("alice", 0).await;
+    w.publisher.fail_removals(1);
+    w.send(&c, "unregister alice@example.org").await;
+    assert_eq!(c.lines(), ["OK", "<close> BYE identity deleted"]);
+    assert_eq!(published(&w, "alice"), None);
+}
+
+/// A key file whose removal failed for good is removed when the hub next
+/// starts (4.8), and the key files of hosted names stay.
+#[tokio::test]
+async fn key_files_of_names_no_longer_hosted_go_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("risala.db");
+    let publisher = Arc::new(MemoryPublisher::new());
+    let start_hub = |publisher: Arc<MemoryPublisher>| {
+        let keys = KeyServices::shared(Arc::new(MemoryFetcher::new()), publisher);
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        let clock = Arc::new(ManualClock::new(start()));
+        let hub = Hub::build(id_config(), store.clone(), clock.clone(), timers(), keys).unwrap();
+        World {
+            h: Harness {
+                hub,
+                store,
+                clock,
+                next: 0,
+            },
+            fetcher: Arc::new(MemoryFetcher::new()),
+            publisher: Arc::new(MemoryPublisher::new()),
+        }
+    };
+    let mut w = start_hub(publisher.clone());
+    w.register("alice", 0).await;
+    let mut c = w.register("bob", 1).await;
+    publisher.fail_removals(10);
+    w.send(&c, "unregister bob@example.org").await;
+    assert_eq!(c.lines(), ["OK", "<close> BYE identity deleted"]);
+    assert!(publisher.get("bob").is_some());
+    drop(w);
+    publisher.fail_removals(0);
+    let _w = start_hub(publisher.clone());
+    assert!(publisher.get("bob").is_none());
+    assert!(publisher.get("alice").is_some());
+}
+
 /// The state of [`World::register`] survives a restart, and the key files
 /// are published again when the hub starts.
 #[tokio::test]

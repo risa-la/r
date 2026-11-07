@@ -126,6 +126,57 @@ impl KeyFilePublisher for KeyDir {
             Err(e) => Err(e),
         }
     }
+
+    /// Removes the key files of names not in `hosted`. Operators may keep
+    /// other files in the directory, such as an index page, so only a
+    /// file this could have written is removed: a regular file, named as
+    /// a name is (3.5), that is not empty and holds nothing but key lines
+    /// (4.4).
+    fn retain(&self, hosted: &[Name]) -> io::Result<()> {
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry?;
+            let Some(name) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<Name>().ok())
+            else {
+                continue;
+            };
+            // A name parses case-insensitively, but a file of another case
+            // is not one this wrote.
+            if entry.file_name().to_str() != Some(name.as_str())
+                || hosted.contains(&name)
+                || !entry.file_type()?.is_file()
+            {
+                continue;
+            }
+            let path = entry.path();
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+                Err(e) => return Err(e),
+            };
+            let key_lines =
+                !text.is_empty() && text.lines().all(|line| line.parse::<KeyEntry>().is_ok());
+            if !key_lines {
+                continue;
+            }
+            fs::remove_file(&path)?;
+            removed = true;
+            tracing::info!(%name, "removed the key file of a name no longer hosted");
+        }
+        if removed {
+            sync_dir(&self.dir);
+        }
+        Ok(())
+    }
 }
 
 /// Makes a rename or removal in `dir` durable, where the platform allows.
@@ -184,6 +235,48 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(files, ["bob"]);
+    }
+
+    /// Files of names no longer hosted go, and nothing else does.
+    #[test]
+    fn retain_removes_only_stale_key_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = KeyDir::new(tmp.path());
+        let keys = [entry(1, Some("laptop")), entry(2, None)];
+        dir.publish(&name("alice"), &keys).unwrap();
+        dir.publish(&name("bob"), &keys).unwrap();
+        dir.publish(&name("carol.x"), &keys[..1]).unwrap();
+        for (file, text) in [
+            ("index.html", "<html></html>\n"),
+            ("empty", ""),
+            ("notes", "mldsa44 not-a-key\n"),
+            ("Dave", &KeyDir::render(&keys)),
+            (".eve.tmp", &KeyDir::render(&keys)),
+        ] {
+            fs::write(tmp.path().join(file), text).unwrap();
+        }
+        fs::create_dir(tmp.path().join("frank")).unwrap();
+
+        dir.retain(&[name("alice")]).unwrap();
+        let mut files: Vec<_> = fs::read_dir(dir.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            [
+                ".eve.tmp",
+                "Dave",
+                "alice",
+                "empty",
+                "frank",
+                "index.html",
+                "notes"
+            ]
+        );
+        // A directory that does not exist yet has nothing to remove.
+        KeyDir::new(tmp.path().join("none")).retain(&[]).unwrap();
     }
 
     #[cfg(unix)]

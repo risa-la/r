@@ -124,7 +124,11 @@ pub struct HttpConfig {
     pub certs: Vec<CertPair>,
     /// Where hosted identities' key files are written, one file per name,
     /// so that another web server can serve them. The default is
-    /// `<state_dir>/keys`.
+    /// `<state_dir>/keys`. It may not be the state directory, nor hold it,
+    /// nor be anywhere else inside it, since the state directory holds the
+    /// database and the private key of the generated certificate. Files in
+    /// it named like a hosted name and holding only key lines are removed
+    /// at startup if the server no longer hosts that name.
     pub key_dir: Option<PathBuf>,
 }
 
@@ -460,6 +464,23 @@ impl Config {
         if k.cache_size == 0 {
             return invalid("keys.cache_size must be at least 1".into());
         }
+        if let Some(dir) = &self.http.key_dir {
+            let (keys, state) = (lexical_absolute(dir), lexical_absolute(&self.state_dir));
+            if state.starts_with(&keys) {
+                return invalid(format!(
+                    "http.key_dir {} is the state directory or holds it: key files are \
+                     served from it, and the state directory holds the database",
+                    dir.display()
+                ));
+            }
+            if keys.starts_with(&state) && keys != state.join("keys") {
+                return invalid(format!(
+                    "http.key_dir {} is inside the state directory: leave it out to use \
+                     <state_dir>/keys, or choose a directory elsewhere",
+                    dir.display()
+                ));
+            }
+        }
         let mut warnings = Vec::new();
         if k.allow_private {
             warnings.push(
@@ -503,6 +524,25 @@ impl Config {
             .clone()
             .unwrap_or_else(|| self.state_dir.join("keys"))
     }
+}
+
+/// `path` made absolute against the current directory, with `.` and `..`
+/// resolved by its components alone. Symbolic links are not followed, so
+/// two paths through different links still look different.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -692,6 +732,67 @@ mod tests {
         invalid(|k| k.fetch_timeout_secs = 0, "fetch_timeout_secs");
         invalid(|k| k.fetch_timeout_secs = 11, "fetch_timeout_secs");
         invalid(|k| k.cache_size = 0, "cache_size");
+    }
+
+    /// The key directory is served by a web server, so it may not be or
+    /// hold the state directory, which holds the database, nor be any
+    /// other part of it but `<state_dir>/keys`.
+    #[test]
+    fn key_dir_stays_out_of_the_state_directory() {
+        let check = |state: &str, keys: Option<&str>| {
+            let mut c = Config {
+                state_dir: state.into(),
+                ..Config::default()
+            };
+            c.http.key_dir = keys.map(PathBuf::from);
+            c.validate()
+        };
+        for (state, keys) in [
+            ("/var/lib/risala", None),
+            ("/var/lib/risala", Some("/var/lib/risala/keys")),
+            ("/var/lib/risala", Some("/var/lib/risala/./keys/")),
+            ("/var/lib/risala", Some("/srv/www/.well-known/risala")),
+            ("/var/lib/risala", Some("/var/lib/risala-keys")),
+            ("state", Some("keys")),
+        ] {
+            assert!(check(state, keys).is_ok(), "{state} {keys:?}");
+        }
+        for (state, keys, what) in [
+            (
+                "/var/lib/risala",
+                "/var/lib/risala",
+                "is the state directory",
+            ),
+            (
+                "/var/lib/risala",
+                "/var/lib/risala/",
+                "is the state directory",
+            ),
+            (
+                "/var/lib/risala",
+                "/var/lib/risala/keys/..",
+                "is the state directory",
+            ),
+            ("/var/lib/risala", "/var/lib", "holds it"),
+            ("/var/lib/risala", "/", "holds it"),
+            (
+                "/var/lib/risala",
+                "/var/lib/risala/selfsigned",
+                "inside the state",
+            ),
+            (
+                "/var/lib/risala",
+                "/var/lib/risala/keys/more",
+                "inside the state",
+            ),
+            (".", ".", "is the state directory"),
+            ("state", "./state", "is the state directory"),
+        ] {
+            match check(state, Some(keys)) {
+                Err(ConfigError::Invalid(m)) => assert!(m.contains(what), "{keys}: {m}"),
+                other => panic!("{state} {keys}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -10,8 +10,8 @@
 //!   [`KeyFilePublisher`](crate::core::KeyFilePublisher), which writes
 //!   hosted identities' key files to a directory (4.6).
 //! - [`server`]: [`HttpServer`], the optional HTTPS listener (`[http]` in
-//!   the configuration), which serves that directory at
-//!   `/.well-known/risala/<name>`.
+//!   the configuration), which serves the hosted identities' key files at
+//!   `/.well-known/risala/<name>`, made from the hub's records.
 
 pub mod fetch;
 pub mod keydir;
@@ -22,4 +22,4 @@ mod tests;
 
 pub use fetch::HttpsKeyFetcher;
 pub use keydir::KeyDir;
-pub use server::HttpServer;
+pub use server::{HttpServer, KeyFiles};

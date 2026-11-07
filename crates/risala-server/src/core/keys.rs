@@ -84,6 +84,14 @@ pub trait KeyFilePublisher: Send + Sync + 'static {
     /// Removes the key file of `<name>@<identity domain>`, after UNREGISTER
     /// (4.8). Removing a file that does not exist is not an error.
     fn remove(&self, name: &Name) -> std::io::Result<()>;
+
+    /// Removes every key file but those of `hosted`, the names the server
+    /// hosts. The hub calls this when it starts, after publishing theirs,
+    /// so that a removal that failed earlier is made up for (4.8).
+    fn retain(&self, hosted: &[Name]) -> std::io::Result<()> {
+        let _ = hosted;
+        Ok(())
+    }
 }
 
 /// A [`KeyFetcher`] that has no keys for anyone: [`FetchError::Unavailable`].
@@ -294,12 +302,20 @@ impl KeyFetcher for MemoryFetcher {
 #[derive(Debug, Default)]
 pub struct MemoryPublisher {
     files: Mutex<HashMap<Name, Vec<KeyEntry>>>,
+    /// How many of the next removals fail.
+    failing_removals: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryPublisher {
     /// An empty one.
     pub fn new() -> MemoryPublisher {
         MemoryPublisher::default()
+    }
+
+    /// The next `n` removals fail, as if the file could not be deleted.
+    pub fn fail_removals(&self, n: usize) {
+        self.failing_removals
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The published key file of `name`, if there is one.
@@ -323,10 +339,25 @@ impl KeyFilePublisher for MemoryPublisher {
     }
 
     fn remove(&self, name: &Name) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let failing = self
+            .failing_removals
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if failing.is_ok() {
+            return Err(std::io::Error::other("removal failed on purpose"));
+        }
         self.files
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
+        Ok(())
+    }
+
+    fn retain(&self, hosted: &[Name]) -> std::io::Result<()> {
+        self.files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name, _| hosted.contains(name));
         Ok(())
     }
 }

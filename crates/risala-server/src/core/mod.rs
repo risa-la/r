@@ -390,10 +390,16 @@ impl Hub {
             .collect();
         let identity_domain = config.identity_domain();
         // The key files of hosted identities, again, in case they were
-        // lost or the publisher keeps them in memory (4.6).
+        // lost or the publisher keeps them in memory (4.6), and none of
+        // the names no longer hosted, in case removing one failed (4.8).
+        let mut names = Vec::new();
         for (uid, hosted) in store.hosted_identities()? {
             // A failure is logged, and the next change publishes again.
             let _ = identity::publish(&*keys.publisher, &uid, &hosted);
+            names.extend(uid.name().parse::<risala_proto::names::Name>().ok());
+        }
+        if let Err(e) = keys.publisher.retain(&names) {
+            tracing::error!("removing the key files of names no longer hosted failed: {e}");
         }
 
         Ok(Hub {
@@ -457,6 +463,21 @@ impl Hub {
     /// what they do: in direct conversations (M5a), and for push (M8, 9.2).
     pub async fn is_blocked(&self, by: &Uid, uid: &Uid) -> Result<bool, StoreError> {
         self.inner.is_blocked(by, uid).await
+    }
+
+    /// The key file of the hosted identity `<name>@<identity domain>`, from
+    /// the hub's records (4.6), or `None` if the server hosts no such
+    /// identity. This blocks while it reads the store.
+    pub fn hosted_key_file(
+        &self,
+        name: &risala_proto::names::Name,
+    ) -> Result<Option<Vec<risala_proto::keyfile::KeyEntry>>, StoreError> {
+        let Some(domain) = &self.inner.identity_domain else {
+            return Ok(None);
+        };
+        let uid = risala_proto::names::Identity::new(name, domain).to_uid();
+        let keys = self.inner.store.hosted_keys(&uid)?;
+        Ok(keys.map(|keys| keys.iter().map(identity::key_entry).collect()))
     }
 
     /// The names of the guests that have a session, connected or waiting,
