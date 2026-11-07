@@ -546,10 +546,11 @@ impl Account {
     /// `purge`, the server also deletes every message the identity sent.
     ///
     /// The server leaves the identity's rooms and deletes what it keeps
-    /// about it. If it hosts the identity, it deletes its keys and key
-    /// file too, so this device's key is deleted from the key store as
-    /// well. Otherwise the key is kept: it is still in the identity's own
-    /// key file, and works on other servers.
+    /// about it. If it hosts the identity, which KEY LIST tells first
+    /// (4.7), it deletes its keys and key file too, so this device's key
+    /// is deleted from the key store as well. Otherwise the key is kept:
+    /// the identity's own key file is not the server's to change, and the
+    /// key works on other servers.
     ///
     /// The account stops first, and the command goes on a connection of
     /// its own, so that the account cannot sign in again in between. If
@@ -586,11 +587,18 @@ impl Account {
                 let server = addr.to_string();
                 let session = signed_in_session(&addr, trust, options, &identity, &key).await?;
                 let result = async {
-                    let hosted = match session.identity_domain().await {
-                        Ok(domain) => domain.as_str() == identity.domain(),
-                        Err(conn::Error::NoRegistration) => false,
-                        Err(e) => return Err(ClientError::from_conn(&server, &e)),
-                    };
+                    // KEY LIST tells whether the server hosts the identity
+                    // (4.7). INFO does not: it says register=no while
+                    // registration is closed.
+                    let hosted =
+                        match request(&server, &session, Command::Key(KeyCommand::List)).await {
+                            Ok(_) => true,
+                            Err(ClientError::Refused {
+                                kind: RefusedKind::NotHosted,
+                                ..
+                            }) => false,
+                            Err(e) => return Err(e),
+                        };
                     let command = Command::Unregister {
                         uid: identity.to_uid(),
                         purge,

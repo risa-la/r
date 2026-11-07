@@ -575,8 +575,9 @@ async fn unregister_a_hosted_identity() {
         greet(&mut peer).await;
         peer.expect(&auth_line(1)).await;
         peer.send(&format!("@ref=1 OK uid={ALICE}")).await;
-        peer.expect("@ref=2 INFO").await;
-        peer.send("@ref=2 OK version=1 register=example.org").await;
+        peer.expect("@ref=2 KEY LIST").await;
+        peer.send(&format!("@ref=2 KEY {PUBLIC} laptop\n@ref=2 OK"))
+            .await;
         peer.expect(&format!("@ref=3 UNREGISTER {ALICE} purge=yes"))
             .await;
         peer.send("@ref=3 OK").await;
@@ -619,10 +620,9 @@ async fn unregister_elsewhere_keeps_the_key() {
         greet(&mut peer).await;
         peer.expect(&auth_line(1)).await;
         peer.send(&format!("@ref=1 OK uid={ALICE}")).await;
-        peer.expect("@ref=2 INFO").await;
-        // The server hosts another domain.
-        peer.send("@ref=2 OK version=1 register=chat.example.org")
-            .await;
+        peer.expect("@ref=2 KEY LIST").await;
+        // The server does not host alice (4.7).
+        peer.send("@ref=2 ERR not-supported").await;
         peer.expect(&format!("@ref=3 UNREGISTER {ALICE}")).await;
         peer.send("@ref=3 OK").await;
         peer.close().await;
@@ -647,8 +647,8 @@ async fn a_failed_unregister_starts_the_account_again() {
                 greet(&mut peer).await;
                 peer.expect(&auth_line(1)).await;
                 peer.send(&format!("@ref=1 OK uid={ALICE}")).await;
-                peer.expect("@ref=2 INFO").await;
-                peer.send("@ref=2 OK register=example.org").await;
+                peer.expect("@ref=2 KEY LIST").await;
+                peer.send("@ref=2 OK").await;
                 peer.expect(&format!("@ref=3 UNREGISTER {ALICE} purge=yes"))
                     .await;
                 peer.send("@ref=3 ERR not-supported purge needs DELETE")
