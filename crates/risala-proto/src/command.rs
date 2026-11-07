@@ -648,16 +648,17 @@ pub enum BackupCommand {
         /// The encrypted history key.
         blob: BackupBlob,
     },
-    /// `BACKUP GET <id> [after=<epoch>] [limit=<n>]`: fetch blobs, a page
-    /// at a time.
+    /// `BACKUP GET <id> [after=<epoch>] [limit=<n>]`: fetch blobs, oldest
+    /// epoch first, a page at a time.
     Get {
         /// The conversation's id (5.1).
         id: Id,
-        /// `after=`: only epochs after this one. `0` is accepted.
+        /// `after=`: only epochs after this one. `0` is accepted. Without
+        /// it, the page starts at the oldest epoch, so epoch 0 is included.
         after: Option<u64>,
-        /// `limit=`: the most blobs to return, at least 1. The server's
-        /// default is 500
-        /// ([`DEFAULT_BACKUP_LIMIT`](crate::mls::DEFAULT_BACKUP_LIMIT)).
+        /// `limit=`: the most epochs to return blobs for, at least 1. A
+        /// page holds every blob of each epoch in it. The server's default
+        /// is 500 ([`DEFAULT_BACKUP_LIMIT`](crate::mls::DEFAULT_BACKUP_LIMIT)).
         limit: Option<NonZeroU64>,
     },
     /// `BACKUP DEL [<id>]`: delete the blobs of one conversation, or all

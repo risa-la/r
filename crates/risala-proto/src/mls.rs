@@ -52,8 +52,8 @@ pub const HISTORY_KEY_LEN: usize = 48;
 /// 48-byte history key with its 16-byte tag (12.10).
 pub const BACKUP_BLOB_LEN: usize = 84;
 
-/// The number of blobs BACKUP GET returns when `limit` is not given
-/// (12.10).
+/// The most epochs one page of BACKUP GET returns blobs for when `limit`
+/// is not given (12.10).
 pub const DEFAULT_BACKUP_LIMIT: u64 = 500;
 
 /// The MLS exporter label of history keys (12.9, 15).
