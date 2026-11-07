@@ -44,12 +44,13 @@ Measure responsive launch and useful cached content separately in Release builds
 
 Keep typography, color, and layout roles in `Sources/Design`, reusable
 view styling in `Sources/Design/Styles`, and views shared across features
-(breadcrumb, glyph, status line) in `Sources/Design/Components`. Use these roles
+(breadcrumb, glyph, Hudhud) in `Sources/Design/Components`. Use these roles
 in feature views; keep feature-specific components with their feature. Preserve
 native controls and semantic fonts/colors. Avoid fixed RGB values in views.
 
 The app is moving to the terminal look in the Paper file's TUI mockups: framed
-panels, JetBrains Mono, a breadcrumb heading, and a status line. Its colors live
+panels, JetBrains Mono, and a breadcrumb heading. The mode shows in the composer
+prompt; there is no status line. Its colors live
 in `Resources/Assets.xcassets/Palette` with light and dark variants; dark values
 come from the mockups. Name colorsets by role and use Xcode's generated symbols
 (`.foregroundStyle(.textTertiary)`) rather than wrapping them; avoid names

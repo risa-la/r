@@ -12,7 +12,7 @@ private struct TerminalButtonStyle: ViewModifier {
             .controlSize(.large)
     }
 
-    @ViewBuilder
+    @ContentBuilder
     private func styled(_ content: Content) -> some View {
         if isPrimary {
             content.buttonStyle(.borderedProminent).tint(.ink)

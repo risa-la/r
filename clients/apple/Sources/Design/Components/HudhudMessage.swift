@@ -6,7 +6,7 @@ import SwiftUI
 struct HudhudMessage<Actions: View>: View {
     let title: Text
     let message: Text
-    @ViewBuilder let actions: Actions
+    @ContentBuilder let actions: Actions
 
     @ScaledMetric(relativeTo: .body) private var illustrationHeight = Layout.hudhudHeight
 

@@ -24,9 +24,6 @@ extension Layout {
     static let glyphSize: CGFloat = 20
     /// Rooms use a rounded square and people a circle.
     static let glyphCornerRadius: CGFloat = 6
-    static let statusLineHeight: CGFloat = 34
-    static let modeBadgeCornerRadius: CGFloat = 6
-    static let modeBadgePadding: CGFloat = 10
     /// Space above the actions in an empty or first-run state.
     static let hudhudActionsSpacing: CGFloat = 24
     /// Hudhud's height in empty and first-run states.

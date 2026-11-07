@@ -42,7 +42,7 @@ struct RoomsView: View {
     }
 
     @ContentBuilder
-    private func withBreadcrumb(@ViewBuilder _ content: () -> some View) -> some View {
+    private func withBreadcrumb(@ContentBuilder _ content: () -> some View) -> some View {
         if #available(iOS 26, macOS 26, *) {
             content().safeAreaBar(edge: .top, spacing: 0) { breadcrumb }
         } else {

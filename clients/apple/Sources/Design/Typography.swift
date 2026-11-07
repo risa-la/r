@@ -33,12 +33,6 @@ extension Typography {
     static let buttonProminent: Font = terminal.weight(.heavy)
     /// A secondary button on a terminal panel.
     static let button: Font = .custom(monoFamily, size: 12, relativeTo: .caption)
-    /// The status line under a panel.
-    static let statusLine: Font = .custom(monoFamily, size: 12, relativeTo: .caption)
-    /// The mode badge in the status line.
-    static let modeBadge: Font = statusLine.weight(.heavy)
-    /// Gesture and key hints.
-    static let hint: Font = .custom(monoFamily, size: 11, relativeTo: .caption2)
     /// The letter or symbol inside a room or person glyph.
-    static let glyph: Font = hint.weight(.bold)
+    static let glyph: Font = .custom(monoFamily, size: 11, relativeTo: .caption2).weight(.bold)
 }
