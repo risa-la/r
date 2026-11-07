@@ -19,10 +19,13 @@ authors = ["Risala developers <dev@risa.la>"]
 risala-proto = { path = "crates/risala-proto" }
 
 base64 = "0.23"
-ed25519-dalek = { version = "3", features = ["pem"] }
-ed25519 = { version = "3", features = ["zeroize"] }
+# ML-DSA (FIPS 204), RustCrypto's implementation, which is also the one
+# openmls_rust_crypto uses for the MLS cipher suite 0x0052 (SPEC 12.2).
+# No default features: risala-proto needs no RNG and reads PKCS#8 itself.
+ml-dsa = { version = "0.1.2", default-features = false, features = ["alloc", "zeroize"] }
 sha2 = "0.11"
 thiserror = "2"
+zeroize = "1"
 
 # I/O, TLS and storage (server, librisala, CLI). TLS uses ring, not
 # aws-lc-rs, so builds need no cmake and cross-compile easily.
@@ -52,3 +55,17 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# ML-DSA is slow unoptimised, and tests across the workspace sign in. Build
+# it, and the Keccak and lattice code under it, optimised in dev too.
+[profile.dev.package.ml-dsa]
+opt-level = 3
+
+[profile.dev.package.module-lattice]
+opt-level = 3
+
+[profile.dev.package.keccak]
+opt-level = 3
+
+[profile.dev.package.shake]
+opt-level = 3

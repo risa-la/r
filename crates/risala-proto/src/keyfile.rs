@@ -4,8 +4,10 @@
 //!
 //! ```text
 //! # alice@example.org
-//! ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop
+//! mldsa44 xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp… laptop
 //! ```
+//!
+//! (The key is shortened here; a real one is 1752 characters.)
 //!
 //! Parsing is lenient, as a server must be: anything it cannot use is
 //! left out, and [`KeyFile::skipped`] says what was left out and why, so
@@ -18,14 +20,16 @@ use std::str::FromStr;
 use crate::auth::PublicKey;
 use crate::error::ParseError;
 
-/// The only key type this version of the protocol defines (4.4).
-pub const KEY_TYPE: &str = "ed25519";
+/// The only key type this version of the protocol defines: ML-DSA-44
+/// (4.4).
+pub const KEY_TYPE: &str = "mldsa44";
 
 /// The most keys a server uses from one key file (4.4).
 pub const MAX_KEYS: usize = 64;
 
-/// The most bytes a server reads of a key file, 64 KiB (4.4).
-pub const MAX_KEY_FILE_BYTES: usize = 65536;
+/// The most bytes a server or device reads of a key file, 256 KiB (4.4).
+/// That is room for [`MAX_KEYS`] keys with labels.
+pub const MAX_KEY_FILE_BYTES: usize = 256 * 1024;
 
 /// The URL of the key file for the identity `name@domain` (4.3).
 ///
@@ -39,7 +43,7 @@ pub fn well_known_url(name: &str, domain: &str) -> String {
     )
 }
 
-/// One key in a key file: `ed25519 <key> [<label...>]` (4.4).
+/// One key in a key file: `mldsa44 <key> [<label...>]` (4.4).
 ///
 /// The label is free text for people, usually a device name. It never
 /// starts or ends with whitespace, is never empty (no label is `None`)
@@ -85,7 +89,7 @@ impl KeyEntry {
 impl FromStr for KeyEntry {
     type Err = ParseError;
 
-    /// Parses one `ed25519 <key> [<label...>]` line, without its line
+    /// Parses one `mldsa44 <key> [<label...>]` line, without its line
     /// ending (4.4).
     ///
     /// Spaces and tabs may separate the fields and surround the line. The
@@ -99,7 +103,7 @@ impl FromStr for KeyEntry {
             return Err(ParseError::BadSyntax("empty key file line"));
         }
         if !key_type.eq_ignore_ascii_case(KEY_TYPE) {
-            return Err(ParseError::BadSyntax("not an ed25519 key"));
+            return Err(ParseError::BadSyntax("not an mldsa44 key"));
         }
         let (key, label) = split_field(rest);
         if key.is_empty() {
@@ -124,13 +128,13 @@ impl fmt::Display for KeyEntry {
 /// Why [`KeyFile::parse`] left out a line (4.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The line has a key type other than `ed25519`. The spec says to
+    /// The line has a key type other than `mldsa44`. The spec says to
     /// ignore these quietly; they are listed so a key tool can mention
     /// them.
     OtherKeyType(String),
-    /// The line starts with `ed25519` but is not a valid key line: the
-    /// key is missing, is not 44 characters of strict base64, is not a
-    /// curve point, or the label holds a control character.
+    /// The line starts with `mldsa44` but is not a valid key line: the
+    /// key is missing, is not 1752 characters of strict base64, or the
+    /// label holds a control character.
     Malformed(ParseError),
     /// The key already appeared on an earlier line. The first line's
     /// label is kept.
@@ -148,7 +152,9 @@ pub struct Skipped {
     pub reason: SkipReason,
 }
 
-/// A parsed key file: the keys a server accepts for an identity (4.4).
+/// A parsed key file: the keys a server accepts for an identity, and
+/// that devices accept for its leaves in encrypted conversations (4.4,
+/// 12.12).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyFile {
     keys: Vec<KeyEntry>,
@@ -163,7 +169,7 @@ impl KeyFile {
     /// - Blank lines and lines whose first non-blank character is `#` are
     ///   ignored.
     /// - Lines with another key type are ignored.
-    /// - Malformed `ed25519` lines are ignored too, so that one bad line
+    /// - Malformed `mldsa44` lines are ignored too, so that one bad line
     ///   does not lock someone out of every other device.
     /// - A key that appears again is ignored; the first line wins.
     /// - Only the first [`MAX_KEYS`] distinct keys are kept.
@@ -204,7 +210,7 @@ impl KeyFile {
                 Ok(entry) if seen.contains(entry.key()) => skip(SkipReason::Duplicate),
                 Ok(_) if file.keys.len() == MAX_KEYS => skip(SkipReason::TooMany),
                 Ok(entry) => {
-                    seen.insert(*entry.key());
+                    seen.insert(entry.key().clone());
                     file.keys.push(entry);
                 }
             }
@@ -252,95 +258,100 @@ mod tests {
     use super::*;
     use crate::auth::SecretKey;
 
-    const LAPTOP: &str = "J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY=";
-    const PHONE: &str = "xOANpWbIg5OCt//dfeEit/1AngQtJJdLe4ks1mxhd5M=";
+    /// The Appendix B key, from its seed.
+    const SEED: [u8; 32] = [
+        0xc1, 0x1f, 0xae, 0x5c, 0x59, 0x2e, 0x13, 0xbe, 0x67, 0xdc, 0x96, 0xf6, 0xe8, 0x50, 0x04,
+        0xd3, 0x2e, 0x92, 0x86, 0x15, 0xf7, 0xaf, 0x1f, 0xd3, 0xa6, 0xc5, 0xd9, 0xea, 0x0a, 0xb6,
+        0xcb, 0xa8,
+    ];
 
-    fn key(s: &str) -> PublicKey {
-        s.parse().unwrap()
+    fn laptop() -> PublicKey {
+        SecretKey::from_seed(SEED).public_key()
+    }
+
+    fn phone() -> PublicKey {
+        SecretKey::from_seed([2; 32]).public_key()
     }
 
     #[test]
     fn spec_example() {
-        let text = "# alice@example.org\n\
-            ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop\n\
-            ed25519 xOANpWbIg5OCt//dfeEit/1AngQtJJdLe4ks1mxhd5M= phone\n";
-        let file = KeyFile::parse(text).unwrap();
+        let text = format!(
+            "# alice@example.org\nmldsa44 {} laptop\nmldsa44 {} phone\n",
+            laptop(),
+            phone()
+        );
+        let file = KeyFile::parse(&text).unwrap();
         assert_eq!(file.keys().len(), 2);
-        assert_eq!(file.keys()[0].key(), &key(LAPTOP));
+        assert_eq!(file.keys()[0].key(), &laptop());
         assert_eq!(file.keys()[0].label(), Some("laptop"));
-        assert_eq!(file.keys()[1].key(), &key(PHONE));
+        assert_eq!(file.keys()[1].key(), &phone());
         assert_eq!(file.keys()[1].label(), Some("phone"));
         assert!(file.skipped().is_empty());
-        assert!(file.contains(&key(PHONE)));
+        assert!(file.contains(&phone()));
         assert_eq!(file.public_keys().count(), 2);
     }
 
     #[test]
     fn appendix_b_line() {
-        let seed = [
-            0xc1, 0x1f, 0xae, 0x5c, 0x59, 0x2e, 0x13, 0xbe, 0x67, 0xdc, 0x96, 0xf6, 0xe8, 0x50,
-            0x04, 0xd3, 0x2e, 0x92, 0x86, 0x15, 0xf7, 0xaf, 0x1f, 0xd3, 0xa6, 0xc5, 0xd9, 0xea,
-            0x0a, 0xb6, 0xcb, 0xa8,
-        ];
-        let public = SecretKey::from_seed(seed).public_key();
-        let entry = KeyEntry::new(public, Some("laptop")).unwrap();
-        let line = "ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop";
-        assert_eq!(entry.to_string(), line);
+        let entry = KeyEntry::new(laptop(), Some("laptop")).unwrap();
+        let line = entry.to_string();
+        assert!(line.starts_with("mldsa44 xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp"));
+        assert!(line.ends_with("p4j4g== laptop"));
+        assert_eq!(line.len(), 8 + 1752 + 7);
         assert_eq!(line.parse::<KeyEntry>().unwrap(), entry);
     }
 
     #[test]
     fn labels() {
-        let e: KeyEntry = format!("ed25519 {LAPTOP}").parse().unwrap();
+        let k = laptop();
+        let e: KeyEntry = format!("mldsa44 {k}").parse().unwrap();
         assert_eq!(e.label(), None);
-        assert_eq!(e.to_string(), format!("ed25519 {LAPTOP}"));
+        assert_eq!(e.to_string(), format!("mldsa44 {k}"));
 
-        let e: KeyEntry = format!("ed25519\t{LAPTOP}  my  old\tlaptop  ")
-            .parse()
-            .unwrap();
+        let e: KeyEntry = format!("mldsa44\t{k}  my  old\tlaptop  ").parse().unwrap();
         assert_eq!(e.label(), Some("my  old\tlaptop"));
         assert_eq!(e.to_string().parse::<KeyEntry>().unwrap(), e);
 
-        let e: KeyEntry = format!("ed25519 {LAPTOP} téléphone 📱").parse().unwrap();
+        let e: KeyEntry = format!("mldsa44 {k} téléphone 📱").parse().unwrap();
         assert_eq!(e.label(), Some("téléphone 📱"));
 
-        assert_eq!(
-            KeyEntry::new(key(LAPTOP), Some("  ")).unwrap().label(),
-            None
-        );
-        assert!(KeyEntry::new(key(LAPTOP), Some("a\nb")).is_err());
-        assert!(KeyEntry::new(key(LAPTOP), Some("a\rb")).is_err());
+        assert_eq!(KeyEntry::new(k.clone(), Some("  ")).unwrap().label(), None);
+        assert!(KeyEntry::new(k.clone(), Some("a\nb")).is_err());
+        assert!(KeyEntry::new(k, Some("a\rb")).is_err());
     }
 
     #[test]
     fn single_line_errors() {
+        let k = laptop();
         assert!("".parse::<KeyEntry>().is_err());
         assert!("# comment".parse::<KeyEntry>().is_err());
-        assert!("ed25519".parse::<KeyEntry>().is_err());
-        assert!(format!("ssh-ed25519 {LAPTOP}").parse::<KeyEntry>().is_err());
-        assert!(format!("ED25519 {LAPTOP}").parse::<KeyEntry>().is_ok());
+        assert!("mldsa44".parse::<KeyEntry>().is_err());
+        assert!(format!("ed25519 {k}").parse::<KeyEntry>().is_err());
+        assert!(format!("mldsa65 {k}").parse::<KeyEntry>().is_err());
+        assert!(format!("MLDSA44 {k}").parse::<KeyEntry>().is_ok());
     }
 
     #[test]
     fn lenient_parsing() {
+        let (laptop, phone) = (laptop(), phone());
         let text = format!(
             "\u{feff}# keys\r\n\
              \r\n\
              \x20  \t\r\n\
              \x20 # indented comment\n\
-             ed448 AAAA future\n\
-             ed25519 notbase64 broken\n\
-             ed25519\n\
-             ed25519 {LAPTOP} laptop\r\n\
-             ed25519 {LAPTOP} laptop again\n\
-             \tED25519   {PHONE}\t\n\
-             ed25519 {}\n",
-            &LAPTOP[..43]
+             ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= old laptop\n\
+             mldsa44 notbase64 broken\n\
+             mldsa44\n\
+             mldsa44 {laptop} laptop\r\n\
+             mldsa44 {laptop} laptop again\n\
+             \tMLDSA44   {phone}\t\n\
+             mldsa44 {}\n",
+            &laptop.to_string()[..1751]
         );
         let file = KeyFile::parse(&text).unwrap();
         assert_eq!(file.keys().len(), 2);
         assert_eq!(file.keys()[0].label(), Some("laptop"));
-        assert_eq!(file.keys()[1].key(), &key(PHONE));
+        assert_eq!(file.keys()[1].key(), &phone);
         assert_eq!(file.keys()[1].label(), None);
 
         let reasons: Vec<_> = file
@@ -351,7 +362,7 @@ mod tests {
         assert_eq!(
             reasons,
             vec![
-                (5, SkipReason::OtherKeyType("ed448".into())),
+                (5, SkipReason::OtherKeyType("ed25519".into())),
                 (
                     6,
                     SkipReason::Malformed(ParseError::BadSyntax("bad public key"))
@@ -383,16 +394,18 @@ mod tests {
         for i in 0..70u8 {
             let public = SecretKey::from_seed([i; 32]).public_key();
             text.push_str(
-                &KeyEntry::new(public, Some(&format!("d{i}")))
+                &KeyEntry::new(public.clone(), Some(&format!("d{i}")))
                     .unwrap()
                     .to_string(),
             );
             text.push('\n');
             // A duplicate does not use up one of the 64.
             if i == 0 {
-                text.push_str(&format!("ed25519 {public}\n"));
+                text.push_str(&format!("mldsa44 {public}\n"));
             }
         }
+        // 64 keys with labels fit well within the size limit.
+        assert!(text.len() < MAX_KEY_FILE_BYTES);
         let file = KeyFile::parse(&text).unwrap();
         assert_eq!(file.keys().len(), MAX_KEYS);
         assert_eq!(file.keys()[63].label(), Some("d63"));
@@ -408,6 +421,7 @@ mod tests {
 
     #[test]
     fn size_limit() {
+        assert_eq!(MAX_KEY_FILE_BYTES, 262_144);
         let ok = "#".repeat(MAX_KEY_FILE_BYTES);
         assert!(KeyFile::parse(&ok).is_ok());
         let big = "#".repeat(MAX_KEY_FILE_BYTES + 1);
