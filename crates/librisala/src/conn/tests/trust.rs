@@ -291,6 +291,53 @@ async fn sni_and_alpn() {
 }
 
 #[tokio::test]
+async fn the_key_exchange_is_x25519mlkem768() {
+    // The server offers every group; the client offers only the hybrid
+    // one (2.1).
+    let ca = TestCa::new();
+    let cert = ServerCert::self_signed("chat.test");
+    let fp = cert.fingerprint;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = ScriptServer::start(cert, 1, move |_, mut peer: Peer| {
+        let tx = tx.clone();
+        async move {
+            tx.send(peer.kx_group).unwrap();
+            peer.greet().await;
+            while peer.recv().await.is_some() {}
+        }
+    })
+    .await;
+    let trust = store();
+    trust.set(&chat_test(), TrustRecord::Pinned(fp)).unwrap();
+    let session = connect(&ca, &server, &trust).await.unwrap();
+    assert_eq!(
+        rx.recv().await.unwrap(),
+        Some(rustls::NamedGroup::X25519MLKEM768)
+    );
+    drop(session);
+    server.done().await;
+}
+
+#[tokio::test]
+async fn a_server_without_post_quantum_key_exchange_is_refused() {
+    // A server that knows only X25519 has no group in common with the
+    // client. That is its own error, not a trust error, and no record is
+    // written. It holds for a server with a CA-valid certificate too.
+    let ca = TestCa::new();
+    let server = ScriptServer::start_classic(ca.issue("chat.test"), 1, |_, _| async {
+        panic!("the handshake succeeded")
+    })
+    .await;
+    let trust = store();
+    let err = connect(&ca, &server, &trust).await.unwrap_err();
+    assert!(matches!(err, Error::KeyExchange(_)), "{err:?}");
+    assert!(err.is_permanent());
+    assert!(err.to_string().contains("X25519MLKEM768"), "{err}");
+    assert_eq!(trust.get(&chat_test()).unwrap(), None);
+    server.done().await;
+}
+
+#[tokio::test]
 async fn fingerprint_matches_the_openssl_pipeline() {
     // Appendix A, run against the server.
     if std::process::Command::new("openssl")

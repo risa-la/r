@@ -171,7 +171,9 @@ cargo run -p risala-server -- --config risalad.toml
 (default `info`), for example `RUST_LOG=debug`. SIGINT and SIGTERM shut
 it down cleanly: every connection gets `BYE server shutting down`.
 
-**Connecting.** Any TLS client works. With `openssl`:
+**Connecting.** Any TLS 1.3 client with the post-quantum key exchange
+X25519MLKEM768 works (Section 2.1 of the spec), such as `openssl` 3.5 or
+later:
 
 ```
 openssl s_client -connect localhost:7472 -quiet

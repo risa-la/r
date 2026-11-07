@@ -14,7 +14,7 @@ use risala_proto::fingerprint::Fingerprint;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::{DigitallySignedStruct, NamedGroup, SignatureScheme};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -34,6 +34,10 @@ pub struct ClientOptions {
     pub sni: Option<String>,
     /// Whether to offer the ALPN `risala/1` (2.1).
     pub alpn: bool,
+    /// Offer only the classic key exchange X25519 instead of
+    /// X25519MLKEM768, as a client without post-quantum support does. The
+    /// server refuses it (2.1).
+    pub classic_kx: bool,
 }
 
 impl Default for ClientOptions {
@@ -41,6 +45,7 @@ impl Default for ClientOptions {
         ClientOptions {
             sni: None,
             alpn: true,
+            classic_kx: false,
         }
     }
 }
@@ -62,6 +67,7 @@ pub struct TestClient {
     writer: WriteHalf<TlsStream<TcpStream>>,
     fingerprint: Fingerprint,
     alpn: Option<Vec<u8>>,
+    kx_group: Option<NamedGroup>,
 }
 
 impl TestClient {
@@ -73,7 +79,13 @@ impl TestClient {
 
     /// Connects to `addr` with the given options.
     pub async fn connect_with(addr: SocketAddr, options: ClientOptions) -> io::Result<TestClient> {
-        let provider = provider();
+        let mut provider = provider();
+        if options.classic_kx {
+            provider = Arc::new(CryptoProvider {
+                kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519],
+                ..(*provider).clone()
+            });
+        }
         let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(io::Error::other)?
@@ -99,12 +111,14 @@ impl TestClient {
             .ok_or_else(|| io::Error::other("the server sent no certificate"))?;
         let fingerprint = spki_fingerprint(leaf).map_err(io::Error::other)?;
         let alpn = session.alpn_protocol().map(<[u8]>::to_vec);
+        let kx_group = session.negotiated_key_exchange_group().map(|g| g.name());
         let (rd, writer) = tokio::io::split(tls);
         Ok(TestClient {
             reader: BufReader::new(rd),
             writer,
             fingerprint,
             alpn,
+            kx_group,
         })
     }
 
@@ -116,6 +130,11 @@ impl TestClient {
     /// The ALPN protocol the server chose, if any (2.1).
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
+    }
+
+    /// The key exchange group of the handshake (2.1).
+    pub fn kx_group(&self) -> Option<NamedGroup> {
+        self.kx_group
     }
 
     /// Sends one line, adding the LF.
@@ -180,6 +199,32 @@ impl TestClient {
     pub async fn close(mut self) -> io::Result<()> {
         self.writer.shutdown().await
     }
+}
+
+/// Whether `openssl` is on PATH and is OpenSSL 3.5 or later, the first
+/// with X25519MLKEM768 (2.1). Tests that run `openssl s_client` against
+/// the server skip without it.
+pub fn openssl_has_x25519mlkem768() -> bool {
+    let Ok(out) = std::process::Command::new("openssl")
+        .arg("version")
+        .output()
+    else {
+        return false;
+    };
+    // "OpenSSL 3.6.0 1 Oct 2025 (Library: ...)"
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut words = text.split_whitespace();
+    if !out.status.success() || words.next() != Some("OpenSSL") {
+        return false;
+    }
+    let version: Vec<u32> = words
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .take(2)
+        .map_while(|n| n.parse().ok())
+        .collect();
+    version >= vec![3, 5]
 }
 
 /// Accepts any certificate, but checks handshake signatures.

@@ -19,6 +19,13 @@ pub enum Error {
     /// signature that did not verify (2.1).
     #[error("TLS failed: {0}")]
     Tls(rustls::Error),
+    /// The TLS handshake failed on the key exchange. librisala offers only
+    /// the post-quantum hybrid X25519MLKEM768, which the spec requires
+    /// (2.1), so the server most likely does not support it and needs an
+    /// upgrade. This is not about trusting the server: no certificate was
+    /// checked.
+    #[error("the server does not support the key exchange X25519MLKEM768 ({0})")]
+    KeyExchange(rustls::Error),
     /// The server's certificate was refused under 2.2. The app shows the
     /// fingerprint and lets the user decide.
     #[error(transparent)]
@@ -68,7 +75,8 @@ impl Error {
     /// such as accepting a fingerprint or fixing a key. A reconnect
     /// supervisor stops on these.
     ///
-    /// Permanent: every [`TrustError`], an unsupported version, a missing
+    /// Permanent: every [`TrustError`], a key exchange the server does
+    /// not support, an unsupported version, a missing
     /// SNI, no registration, an invalid command, and a sign-in refused
     /// with `auth-failed`, `forbidden`, `not-supported`, `bad-syntax` or
     /// `unknown-command`. Everything else, including `name-taken` (a
@@ -78,6 +86,7 @@ impl Error {
     pub fn is_permanent(&self) -> bool {
         match self {
             Error::Trust(_)
+            | Error::KeyExchange(_)
             | Error::UnsupportedVersion(_)
             | Error::NoSni
             | Error::NoRegistration
