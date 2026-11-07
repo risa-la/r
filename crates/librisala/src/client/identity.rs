@@ -29,7 +29,7 @@ use std::sync::Arc;
 use risala_proto::auth::{PublicKey, SecretKey};
 use risala_proto::command::{Command, KeyCommand};
 use risala_proto::error::ErrorCode;
-use risala_proto::keyfile::{KeyEntry, well_known_url};
+use risala_proto::keyfile::{KeyEntry, MAX_KEY_LABEL, well_known_url};
 use risala_proto::names::{Identity, Name, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::{escape, unescape};
@@ -496,7 +496,10 @@ impl Account {
     /// ADD, 4.7): usually a new device's, so that it can sign in. `key` is
     /// the key file line the new device shows ([`Client::key_line`]), or
     /// its key alone in base64. `label` names the device; if empty, the
-    /// line's own label is used. Needs a connection.
+    /// line's own label is used. It is at most 64 bytes, counted escaped
+    /// (3.4), and has no line breaks (4.4, 4.7); a longer one fails with
+    /// [`ClientError::Invalid`] before anything is sent. Needs a
+    /// connection.
     pub async fn add_key(&self, key: &str, label: &str) -> Result<KeyInfo, ClientError> {
         let (key, line_label) = parse_public_key(key)?;
         let label = match label.trim() {
@@ -507,9 +510,16 @@ impl Account {
         let entry = KeyEntry::new(key.clone(), Some(&label))
             .map_err(|_| ClientError::Invalid(format!("label {label:?}")))?;
         let label = entry.label().unwrap_or("").to_owned();
+        // KEY ADD counts the label escaped, as all text (3.4, 4.7).
+        let escaped = escape(&label);
+        if escaped.len() > MAX_KEY_LABEL {
+            return Err(ClientError::Invalid(format!(
+                "label {label:?}: over {MAX_KEY_LABEL} bytes once escaped"
+            )));
+        }
         self.key_command(KeyCommand::Add {
             key: key.clone(),
-            label: escape(&label),
+            label: escaped,
         })
         .await?;
         let mine = self.device_public_key().await?;

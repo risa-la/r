@@ -616,6 +616,16 @@ async fn hosted_keys() {
             ..
         })
     ));
+    // 64 bytes, but 65 once the backslash is escaped (3.4, 4.7).
+    let label = format!("{}\\", "x".repeat(63));
+    assert!(matches!(
+        alice.add_key(&other.to_string(), &label).await,
+        Err(ClientError::Invalid(_))
+    ));
+    assert!(matches!(
+        alice.add_key(&other.to_string(), &"x".repeat(65)).await,
+        Err(ClientError::Invalid(_))
+    ));
 
     let err = within(alice.remove_key(PUBLIC)).await.unwrap_err();
     assert_eq!(refused(&err), (RefusedKind::LastKey, None));
