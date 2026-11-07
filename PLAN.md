@@ -339,6 +339,20 @@ Settled (now in SPEC.md):
     - Guests cannot resend safely after reconnecting. Clients show such
       messages as possibly not sent.
 
+16. **Found by the server review** (2.3, 4.2, 5.3, 6.1, 6.2, 7.2, 7.5,
+    10.4, 11).
+    - Changing `guests` applies at once: `read` mutes the guests in the
+      room, and `none` removes them with a PART each.
+    - Guest PARTs missed in a crash are recorded when the server starts
+      again.
+    - Owners and moderators who left may still read a private room.
+    - MSG to a room you cannot see gets `not-found`, and PART when not a
+      member gets `not-found`.
+    - Open reports survive ADMIN DROP.
+    - `ERR too-long` may come before the LF, but the line resets the idle
+      timer only once its LF arrives.
+    - Expiry stops at the first event that is not old enough.
+
 Nothing is open right now.
 
 ## 6. Decisions

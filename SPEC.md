@@ -234,7 +234,8 @@ After the TLS handshake, both sides exchange lines.
   bytes. The difference leaves room for the tags a server adds when it
   relays a client's text.
 - **Bad lines.** A server that receives a line that is too long MUST
-  discard everything up to the next LF and reply `ERR too-long`. A server
+  discard everything up to the next LF and reply `ERR too-long`. It MAY
+  reply as soon as it knows the line is too long, before the LF arrives. A server
   that receives a line it cannot parse MUST discard it and reply
   `ERR bad-syntax`. A client SHOULD ignore server lines it cannot parse,
   except that an `OK` or `ERR` line it cannot parse still counts as the
@@ -529,7 +530,9 @@ nothing about who someone is over time. For this reason guests:
 - cannot create rooms, hold roles, be invited, set read markers, block
   anyone, upload files or register for push
 - stay members of the rooms they join only until they disconnect. At
-  that point the server records a PART for each of those rooms.
+  that point the server records a PART for each of those rooms. If the
+  server stops without recording them, for example because it crashed,
+  it MUST record them when it starts again.
 
 The server replies `ERR name-taken` if a connected guest already has the
 name. A guest that reconnects can get this for its own name, if the
@@ -856,7 +859,8 @@ reaction as a short message.
 
 Members of a room who are allowed to post (6.3) may send messages to it.
 Both participants of a direct conversation may send messages in it.
-Anyone else gets `ERR forbidden`.
+Anyone else gets `ERR forbidden`, or `ERR not-found` for a room they
+cannot see (6.1).
 
 ### 5.4. Deleting Messages
 
@@ -1155,6 +1159,7 @@ PART <room> [<reason...>]
 
 Leaves the room. Owners and moderators keep their role when they leave
 (6.3). Guests leave all their rooms automatically when they disconnect.
+PART for a room you are not a member of gets `ERR not-found`.
 
 A room goes on existing when its last member leaves. Nothing about it
 changes: its history, settings, roles, invitations and bans all stay.
@@ -1184,6 +1189,10 @@ SET <room> <key> [<value...>]
 - `guests write`: guests may also send messages. This is the default, so
   anyone can connect and talk straight away. If guests start sending
   spam, an owner can switch the room to `read`.
+- Changing `guests` applies at once to the guests already in the room.
+  Under `read` they stay but can no longer send. Under `none` the
+  server removes them, recording a PART for each as when a guest
+  disconnects (4.2).
 - `retention <days>`: events older than this many days are deleted
   (7.5). The value MUST be at least 1, and MUST NOT be longer than the
   server's own retention period (`ERR forbidden`). Shortening it also
@@ -1390,6 +1399,8 @@ conversation afresh as in 7.1.
 You may read the history of:
 
 - rooms you are a member of
+- rooms you hold the role `owner` or `mod` in, even after leaving them
+  (6.3)
 - public rooms you are allowed to join, so you can look before joining
 - your direct conversations
 
@@ -1470,8 +1481,9 @@ Whichever period is shorter applies. So if a server later shortens its
 period below a room's, the server's period applies to that room.
 
 A server expires a conversation's events in seq order, oldest first, so
-that no event it keeps is older than one it has expired. This holds even
-if its clock moves backwards. Clients rely on it to tell expired events
+that no event it keeps is older than one it has expired. It stops at the
+first event that is not old enough, even if a later event has an older
+time, which can happen if its clock moves backwards. Clients rely on it to tell expired events
 from gaps (7.1, 7.2).
 
 The sequence numbers of expired events are never reused. Files expire
@@ -1850,6 +1862,8 @@ ADMIN REPORTS
   - The room stops appearing in SYNC.
   - Clients SHOULD remove the room and the history they have stored for
     it.
+  - Open reports about the room's messages stay, with their copies,
+    until an operator resolves them (5.8).
   - The name becomes free. If anyone creates a room with it later
     (6.1), that is a new room with a new id, whose sequence numbers
     start again at 1. Clients that missed the DROP notice the new id
@@ -1927,7 +1941,7 @@ connection before a push (9.2). If another 60 seconds pass with no line
 received, the server closes the connection. Any complete line resets the
 timer, including an empty one or one the server cannot parse, so someone
 typing by hand can simply press Enter. Part of a line does not reset
-it. This lets the
+it, and a line that is too long counts once its LF arrives. This lets the
 server notice dead connections, which matters for deciding when to push.
 
 ```
