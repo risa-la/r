@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 use risala_proto::names::{Id, Room, Seq, Uid};
 use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
-use risala_proto::types::{Relation, Role, RoomSetting, ServerSetting};
+use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
 use super::schema;
 use super::{
@@ -505,6 +505,26 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
     Ok(())
 }
 
+/// The seq of a message sent with `cid` in the 24 hours before `now` (7.6).
+fn find_cid(
+    conn: &Connection,
+    conv: i64,
+    from: &Uid,
+    cid: &Cid,
+    now: Timestamp,
+) -> Result<Option<Seq>> {
+    let since = ms(now).saturating_sub(CID_WINDOW_MS as i64);
+    conn.prepare_cached(
+        "SELECT seq FROM cids WHERE conv = ? AND author = ? AND cid = ? AND t >= ?",
+    )?
+    .query_row(params![conv, from.as_str(), cid.as_str(), since], |row| {
+        row.get(0)
+    })
+    .optional()?
+    .map(seq)
+    .transpose()
+}
+
 /// Whether a stored relation column marks a plain message or a reply.
 fn is_plain(relation: &Option<Option<String>>) -> bool {
     matches!(relation, Some(None)) || matches!(relation, Some(Some(r)) if r == "reply")
@@ -578,20 +598,10 @@ impl Store for SqliteStore {
     fn append(&self, conv: ConvKey, event: &NewEvent) -> Result<Appended> {
         self.write(|tx| {
             let conv = conv.0;
-            if let Some(cid) = &event.cid {
-                let since = ms(event.t).saturating_sub(CID_WINDOW_MS as i64);
-                let earlier: Option<i64> = tx
-                    .prepare_cached(
-                        "SELECT seq FROM cids WHERE conv = ? AND author = ? AND cid = ? AND t >= ?",
-                    )?
-                    .query_row(
-                        params![conv, event.from.as_str(), cid.as_str(), since],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(earlier) = earlier {
-                    return Ok(Appended::Duplicate(seq(earlier)?));
-                }
+            if let Some(cid) = &event.cid
+                && let Some(earlier) = find_cid(tx, conv, &event.from, cid, event.t)?
+            {
+                return Ok(Appended::Duplicate(earlier));
             }
             let next: i64 = tx
                 .prepare_cached(
@@ -697,6 +707,10 @@ impl Store for SqliteStore {
             }
         }
         Ok(Page { events, more })
+    }
+
+    fn cid_seq(&self, conv: ConvKey, from: &Uid, cid: &Cid, now: Timestamp) -> Result<Option<Seq>> {
+        find_cid(&self.conn(), conv.0, from, cid, now)
     }
 
     fn prune_cids(&self, before: Timestamp) -> Result<u64> {

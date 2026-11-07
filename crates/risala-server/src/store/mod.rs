@@ -453,6 +453,10 @@ pub trait Store: Send + Sync + 'static {
     /// A page of events (7.2).
     fn history(&self, conv: ConvKey, query: HistoryQuery) -> Result<Page>;
 
+    /// The seq of the message `from` sent with `cid` to the conversation
+    /// within the 24 hours before `now` (7.6), if any.
+    fn cid_seq(&self, conv: ConvKey, from: &Uid, cid: &Cid, now: Timestamp) -> Result<Option<Seq>>;
+
     /// Forgets cids older than `before` (7.6).
     fn prune_cids(&self, before: Timestamp) -> Result<u64>;
 }
