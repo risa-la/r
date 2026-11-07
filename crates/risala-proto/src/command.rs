@@ -218,10 +218,14 @@ pub enum Command {
         /// information (8.5), which is allowed before sign-in.
         room: Option<Room>,
     },
-    /// `GUEST <name>` (4.2): become the guest `~<name>`.
+    /// `GUEST <name> [token=<token>]` (4.2): become the guest `~<name>`,
+    /// or resume that guest's session.
     Guest {
         /// The guest name, without `~`.
         name: Name,
+        /// `token=`: the token from the `OK` of the session's last GUEST,
+        /// to resume it (4.2). A secret: never log it.
+        token: Option<Id>,
     },
     /// `AUTH <uid> <signature>` (4.5): sign in as an identity.
     ///
@@ -904,7 +908,12 @@ impl Command {
                 Command::Info { room }
             }
             // 4.2
-            "GUEST" => Command::Guest { name: last(p)? },
+            "GUEST" => {
+                let name = tok(&mut p)?;
+                let options = options(p, &["token"])?;
+                let token = options.get("token").map(str::parse).transpose()?;
+                Command::Guest { name, token }
+            }
             // 4.5
             "AUTH" => {
                 let identity = tok(&mut p)?;
@@ -1291,8 +1300,11 @@ impl Command {
                     b.token(room);
                 }
             }
-            Command::Guest { name } => {
+            Command::Guest { name, token } => {
                 b.token(name);
+                if let Some(token) = token {
+                    b.option("token", token);
+                }
             }
             Command::Auth {
                 identity,
@@ -1769,11 +1781,24 @@ mod tests {
         assert_eq!(
             c,
             Command::Guest {
-                name: "sam".parse().unwrap()
+                name: "sam".parse().unwrap(),
+                token: None,
+            }
+        );
+        let c = canon("guest sam TOKEN=Ab-9_x", "GUEST sam token=ab-9_x").command;
+        assert_eq!(
+            c,
+            Command::Guest {
+                name: "sam".parse().unwrap(),
+                token: Some("ab-9_x".parse().unwrap()),
             }
         );
         is_syntax("GUEST");
         is_syntax("GUEST sam extra");
+        is_syntax("GUEST sam token=");
+        is_syntax("GUEST sam token=a.b");
+        is_syntax("GUEST sam other=1");
+        is_syntax("GUEST token=abc");
         is_syntax("GUEST ~sam");
         is_too_long(&format!("GUEST {}", "a".repeat(33)));
     }

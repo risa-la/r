@@ -452,7 +452,10 @@ impl Session {
     /// Signs in as the guest `~<name>` (4.2).
     pub async fn guest(&self, name: &Name) -> Result<Uid, Error> {
         let ok = self
-            .request_ok(Command::Guest { name: name.clone() })
+            .request_ok(Command::Guest {
+                name: name.clone(),
+                token: None,
+            })
             .await?;
         Ok(signed_in_uid(&ok, Uid::guest(name)))
     }

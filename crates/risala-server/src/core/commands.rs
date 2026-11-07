@@ -154,7 +154,7 @@ impl Inner {
         };
         match (command, uid) {
             (Command::Info { room: None }, _) => Ok(Some(self.info())),
-            (Command::Guest { name }, None) => self.guest(id, name),
+            (Command::Guest { name, .. }, None) => self.guest(id, name),
             // M3.
             (Command::Auth { .. } | Command::Register { .. }, None) => Err(not_supported()),
             (Command::Ping { .. }, _) => Ok(Some(OkResponse::new())),

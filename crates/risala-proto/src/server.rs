@@ -1166,6 +1166,11 @@ impl OkResponse {
         self.typed("uid", str::parse)
     }
 
+    /// `token=`: the secret that resumes a guest session, from GUEST (4.2).
+    pub fn token(&self) -> Result<Option<Id>, ParseError> {
+        self.typed("token", str::parse)
+    }
+
     /// `op=`: whether the identity is a server operator, from AUTH (4.5,
     /// 10.1).
     pub fn op(&self) -> Result<Option<bool>, ParseError> {
@@ -1271,6 +1276,11 @@ impl OkResponse {
     /// Adds `uid=` (4.2, 4.5, 4.6).
     pub fn with_uid(self, uid: &Uid) -> OkResponse {
         self.with("uid", uid)
+    }
+
+    /// Adds `token=` (4.2).
+    pub fn with_token(self, token: &Id) -> OkResponse {
+        self.with("token", token)
     }
 
     /// Adds `op=yes` or `op=no` (4.5).
@@ -2311,8 +2321,13 @@ mod tests {
             .with("register", "example.org")
             .with("retention", ServerRetention::Forever)
             .with("push", "no")
-            .with("upload", Upload::MaxBytes(10_000_000));
+            .with("upload", Upload::MaxBytes(10_000_000))
+            .with("token", "q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3");
         assert_eq!(ok.seq().unwrap(), Some(seq(8813)));
+        assert_eq!(
+            ok.token().unwrap().unwrap().as_str(),
+            "q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3"
+        );
         assert_eq!(ok.id().unwrap().unwrap().as_str(), "p4x8n2");
         assert_eq!(ok.head().unwrap(), Some(9));
         assert_eq!(ok.more().unwrap(), Some(true));
@@ -2357,21 +2372,26 @@ mod tests {
         assert_eq!(ok.role().unwrap(), Some(InfoRole(Some(Role::Mod))));
         assert_eq!(ok.seq().unwrap(), None);
         assert_eq!(ok.more().unwrap(), None);
+        assert_eq!(ok.token().unwrap(), None);
     }
 
     #[test]
     fn ok_bad_values() {
         assert!("OK seq2=".parse::<ServerMessage>().is_err());
-        let ok = match parse("OK seq=0 more=2 op=maybe members=-1 uid=x upload=big seq2=x").line {
-            ServerLine::Ok(ok) => ok,
-            _ => panic!(),
-        };
+        let ok =
+            match parse("OK seq=0 more=2 op=maybe members=-1 uid=x upload=big seq2=x token=a.b")
+                .line
+            {
+                ServerLine::Ok(ok) => ok,
+                _ => panic!(),
+            };
         assert!(ok.seq().is_err());
         assert!(ok.more().is_err());
         assert!(ok.op().is_err());
         assert!(ok.members().is_err());
         assert!(ok.uid().is_err());
         assert!(ok.upload().is_err());
+        assert!(ok.token().is_err());
         assert_eq!(ok.value("seq2"), Some("x"));
     }
 
@@ -2391,6 +2411,13 @@ mod tests {
         assert_eq!(ok.more(), Ok(Some(true)));
         assert_eq!(ok.joined(), Ok(Some(false)));
         assert_eq!(ok.op(), Ok(Some(true)));
+        let token: Id = "k3f9q2_x-7".parse().unwrap();
+        let ok = OkResponse::new().with_uid(&uid("~sam")).with_token(&token);
+        assert_eq!(
+            ServerMessage::new(ok.clone()).to_line().to_string(),
+            "OK uid=~sam token=k3f9q2_x-7"
+        );
+        assert_eq!(ok.token(), Ok(Some(token)));
         let get: FileUrl = "https://f.example/f/x".parse().unwrap();
         let ok = OkResponse::new()
             .with_upload_urls("https://f.example/u/y", &get)
