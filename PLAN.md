@@ -361,6 +361,14 @@ Settled (now in SPEC.md):
     session without recording anything, and gets a new token. cids carry
     over to the resumed session.
 
+18. **Found while fixing the server review** (3.6, 4.2, 7.1).
+    - A server may stop reading commands while their responses go
+      unread, so a client that pipelines MUST keep reading as it writes.
+    - Guest PARTs recovered after a crash carry the restart time.
+    - SYNC stays one reply. `risalad` streams its CONV lines, waiting for
+      queue room between rooms, so a large SYNC cannot overflow a
+      connection.
+
 Nothing is open right now.
 
 ## 6. Decisions

@@ -412,6 +412,11 @@ ERR <code> [<message...>]
 
 - **Order.** A server handles each connection's commands in the order
   they arrive, and sends their final responses in that order.
+- **Flow control.** A server MAY stop reading a connection's commands
+  while that client is not reading its responses. A client may send
+  several commands without waiting for their responses, but then it
+  MUST keep reading while it writes, or both sides can wait on each
+  other forever.
 - **Matching.** A client matches each final response to its oldest
   command that has none yet. If a final response carries a `ref` that
   does not belong to that command, the client can no longer tell which
@@ -534,8 +539,8 @@ time. For this reason guests:
 - stay members of the rooms they join only until their session ends. At
   that point the server records a PART for each of those rooms. If the
   server stops without recording them, for example because it crashed,
-  it MUST record them when it starts again. Sessions do not survive a
-  restart.
+  it MUST record them when it starts again, with the time it records
+  them as `t`. Sessions do not survive a restart.
 
 **Resuming.** The token in GUEST's `OK` lets a guest come back after its
 connection closes, for example after a network drop, or after a phone
