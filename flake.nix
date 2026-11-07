@@ -9,6 +9,8 @@
   outputs =
     inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ ./clients/apple ];
+
       systems = [
         "x86_64-linux"
         "aarch64-linux"
@@ -80,6 +82,24 @@
                 license = lib.licenses.asl20;
                 mainProgram = "risalad";
               };
+            };
+            librisala = rustPlatform.buildRustPackage {
+              pname = "librisala";
+              inherit version src cargoDeps;
+              cargoBuildFlags = [
+                "-p"
+                "librisala"
+              ];
+              cargoTestFlags = [
+                "-p"
+                "librisala"
+              ];
+              # Cargo's default install hook only installs binaries and C ABI
+              # libraries. Preserve the Rust library and its linked dependencies.
+              installPhase = ''
+                mkdir -p $out/lib
+                cp target/*/release/deps/*.rlib $out/lib/
+              '';
             };
             default = config.packages.risalad;
           };

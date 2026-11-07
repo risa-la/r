@@ -2,9 +2,10 @@
 
 - Shared SwiftUI app for iOS 18+ and macOS 15+, built with Xcode 27.2 / Swift
   6.4.2 in Swift 6 mode. Use modern Swift where it helps; check API availability.
-- Xcode folders are synchronized: files under `Sources`, `Resources`, and `Tests`
-  join their target without project edits. Tests run hosted in the app through
-  `@testable import Risala`.
+- The committed `Risala.xcodeproj` owns targets, settings, and schemes. Sources,
+  Resources, and Tests use synchronized folders; no project generation step.
+  Use the Nix-pinned SweetPad CLI for builds and tests (see `README.md`).
+  Tests run hosted in the app through `@testable import Risala`.
 - Keep protocol logic, persistence, and history caching in librisala. The client
   owns presentation and a thin library adapter. No demo data.
 - Use lightweight MVVM by feature: views own layout and temporary UI state;

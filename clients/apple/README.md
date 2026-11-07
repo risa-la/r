@@ -2,16 +2,50 @@
 
 Risala’s iOS and macOS client, built with SwiftUI.
 
-## Build
+## Build and development
+
+The committed `Risala.xcodeproj` owns targets, settings, and schemes. Sources,
+Resources, and Tests are synchronized folders. No project generator is required.
+Nix pins the upstream SweetPad CLI binary; the developer workflow has no custom
+shell or Python driver.
 
 ```sh
-xcodebuild -project clients/apple/Risala.xcodeproj -scheme Risala \
-  -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
-xcodebuild -project clients/apple/Risala.xcodeproj -scheme Risala \
-  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+nix shell .#apple-dev
+cd clients/apple
+sweetpad build --mac
+sweetpad build --destination 'generic/platform=iOS Simulator'
+sweetpad run --mac
+sweetpad test --mac -- CODE_SIGNING_ALLOWED=NO
+sweetpad build --mac -o json --non-interactive
+sweetpad app screenshot --help
 ```
 
-Run these from the repository root.
+Choose an installed simulator with `--on '<simulator name>'` for iOS runs and
+tests. SweetPad uses persistent Xcode DerivedData for incremental builds. Enter
+the Nix shell once to avoid evaluating Nix on each edit. `sweetpad.toml` supplies
+shared project, scheme, and configuration defaults; destination selection remains
+explicit. From the repository root, one-shot commands are also available:
+
+```sh
+nix run .#apple -- build -C clients/apple --mac
+nix build .#apple-macos    # Release: result/Applications/Risala.app
+nix build .#apple-ios      # Release simulator app, host architecture
+nix build .#librisala      # native Rust rlibs, not yet linked into the app
+```
+
+`default.nix` is the flake-parts module exposing Apple packages and commands.
+It builds both Release packages through SweetPad and the host Xcode.
+`toolchain.nix` records the required Xcode version/build and path; package builds
+verify that identity. These builds are cacheable but not hermetic: Xcode and the
+SDKs remain host dependencies. With Nix sandboxing enabled, use
+`--option sandbox relaxed`. Package builds are unsigned and disable Swift macro
+subprocess sandboxing for the Nix build user. Developer builds retain defaults.
+Build logs and toolchain metadata are installed under `nix-support/`.
+
+SweetPad supports `run --hot` for simulator and macOS iteration, but SwiftUI hot
+reload requires the Inject package and view annotations. Those are not configured
+in this app. Ordinary build/run, screenshots, and Xcode previews need no Inject
+integration. See [SweetPad's CLI documentation](https://sweetpad.hyzyla.dev/docs/cli/).
 
 ## Pull requests
 
