@@ -804,7 +804,6 @@ async fn later_commands_are_not_supported() {
         "blocks",
         "push list",
         "admin ops",
-        "msg bob@example.net hi",
         "kick #general ~bob",
     ] {
         h.send(&c, cmd).await;
@@ -1460,6 +1459,23 @@ async fn history_follows_the_guest_rules() {
             "ERR not-found no such conversation"
         ]
     );
+    // So does every command guests may use that names a uid as its
+    // conversation (4.2, 13). Those closed to guests stay forbidden.
+    for cmd in [
+        "msg bob@example.net hi",
+        "msg ~bob hi",
+        "delete bob@example.net 1",
+        "related ~bob 1 2",
+        "typing bob@example.net",
+        "report bob@example.net 1 spam",
+    ] {
+        h.send(&sam, cmd).await;
+        assert_eq!(sam.lines(), ["ERR not-found no such conversation"], "{cmd}");
+    }
+    for cmd in ["read bob@example.net 1", "read #general 1"] {
+        h.send(&sam, cmd).await;
+        assert_eq!(sam.lines(), ["ERR forbidden not for guests"], "{cmd}");
+    }
     // A room with no events.
     h.send(&sam, "history #empty after=0").await;
     let lines = sam.lines();

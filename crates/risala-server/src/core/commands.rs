@@ -201,6 +201,26 @@ pub(super) fn respond(reply: &Reply, verb: &str, outcome: Outcome) {
     }
 }
 
+/// Whether `command` is one that guests may use in rooms, naming a uid
+/// as its conversation: MSG, DELETE, HISTORY, RELATED, TYPING and REPORT
+/// (4.2, 13). Commands that guests may not use at all are not, so they
+/// still get `forbidden`.
+fn names_direct_for_guests(command: &Command) -> bool {
+    match command {
+        Command::Msg { conv, .. }
+        | Command::Delete { conv, .. }
+        | Command::History { conv, .. }
+        | Command::Related { conv, .. }
+        | Command::Typing { conv }
+        | Command::Report {
+            conv,
+            franking: None,
+            ..
+        } => !conv.is_room(),
+        _ => false,
+    }
+}
+
 fn page_limit(limit: Option<NonZeroU64>, default: u64, max: u64) -> u64 {
     limit.map_or(default, NonZeroU64::get).min(max).max(1)
 }
@@ -244,6 +264,11 @@ impl Inner {
             }
             Some(_) if command.signs_in() => {
                 return Err(fail(ErrorCode::AlreadyAuthenticated, "already signed in"));
+            }
+            // Guests have no direct conversations, so one named by a uid
+            // does not exist for them (4.2, 13).
+            Some(uid) if uid.is_guest() && names_direct_for_guests(&command) => {
+                return Err(fail(ErrorCode::NotFound, "no such conversation"));
             }
             Some(uid) if uid.is_guest() && !command.allowed_for_guests() => {
                 return Err(fail(ErrorCode::Forbidden, "not for guests"));
