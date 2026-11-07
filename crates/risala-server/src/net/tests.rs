@@ -131,7 +131,7 @@ struct Pipe {
 impl Pipe {
     fn new(stub: Arc<Stub>, out_queue: usize, pipe_bytes: usize) -> Pipe {
         let (client, server) = tokio::io::duplex(pipe_bytes);
-        let (handle, receiver) = conn_channel(ID, out_queue);
+        let (handle, receiver) = conn_channel(ID, out_queue, usize::MAX);
         let (stop_tx, stop_rx) = watch::channel(false);
         let info = ConnInfo {
             peer: "127.0.0.1:50000".parse().unwrap(),
@@ -434,7 +434,7 @@ async fn slow_reader_is_killed() {
 async fn shutdown_stops_reading() {
     let stub = Stub::new();
     let (client, server) = tokio::io::duplex(4096);
-    let (handle, receiver) = conn_channel(ID, 16);
+    let (handle, receiver) = conn_channel(ID, 16, usize::MAX);
     let (stop_tx, stop_rx) = watch::channel(false);
     let info = ConnInfo {
         peer: "127.0.0.1:50000".parse().unwrap(),

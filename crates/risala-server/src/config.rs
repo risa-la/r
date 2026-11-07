@@ -24,6 +24,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use risala_proto::frame::MAX_SERVER_LINE;
 use serde::Deserialize;
 
 /// The whole configuration file.
@@ -104,6 +105,15 @@ pub struct Limits {
     /// queue has room for the command's whole response and for live events
     /// besides ([`Limits::command_room`]), so this must be at least that.
     pub out_queue: usize,
+    /// The most bytes of lines queued for one connection before it is
+    /// dropped as too slow, counting each line and its LF as sent. Like
+    /// `out_queue`, it must leave room for a whole response and live
+    /// events besides, at [`MAX_SERVER_LINE`] bytes a line
+    /// ([`Limits::command_room_bytes`]).
+    ///
+    /// A line sent to many connections is kept once, so this bounds
+    /// memory from above.
+    pub out_queue_bytes: usize,
     /// The most events one HISTORY or RELATED page returns, whatever the
     /// client asks for (7.2).
     pub max_page: u64,
@@ -147,6 +157,12 @@ impl Limits {
     pub fn command_room(&self) -> usize {
         self.reply_lines().saturating_add(FANOUT_ROOM)
     }
+
+    /// [`command_room`](Self::command_room) in bytes: that many lines of
+    /// the longest a server line may be ([`MAX_SERVER_LINE`]).
+    pub fn command_room_bytes(&self) -> usize {
+        self.command_room().saturating_mul(MAX_SERVER_LINE)
+    }
 }
 
 impl Default for Config {
@@ -181,6 +197,7 @@ impl Default for Limits {
             idle_ping_secs: 120,
             ping_timeout_secs: 60,
             out_queue: 1024,
+            out_queue_bytes: 16 * 1024 * 1024,
             max_page: 500,
             max_list: 500,
         }
@@ -257,6 +274,15 @@ impl Config {
                 l.out_queue,
                 l.command_room(),
                 l.reply_lines(),
+            ));
+        }
+        if l.out_queue_bytes < l.command_room_bytes() {
+            return invalid(format!(
+                "limits.out_queue_bytes is {}, but must be at least {}: {} lines \
+                 (see limits.out_queue) of up to {MAX_SERVER_LINE} bytes",
+                l.out_queue_bytes,
+                l.command_room_bytes(),
+                l.command_room(),
             ));
         }
         let mut warnings = Vec::new();
@@ -339,10 +365,16 @@ mod tests {
         invalid(|l| l.max_page = 1000, "out_queue");
         invalid(|l| l.max_list = 1000, "out_queue");
         invalid(|l| l.max_page = u64::MAX, "out_queue");
+        assert_eq!(
+            l.command_room_bytes(),
+            (500 + REPLY_MARGIN + FANOUT_ROOM) * MAX_SERVER_LINE
+        );
+        invalid(|l| l.out_queue_bytes = 1 << 20, "out_queue_bytes");
         assert!(
             with(|l| {
                 l.max_page = 1000;
                 l.out_queue = 1000 + REPLY_MARGIN + FANOUT_ROOM;
+                l.out_queue_bytes = l.out_queue * MAX_SERVER_LINE;
             })
             .is_ok()
         );

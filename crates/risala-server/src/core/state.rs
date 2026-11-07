@@ -6,11 +6,10 @@ use std::sync::Arc;
 
 use risala_proto::auth::Nonce;
 use risala_proto::names::{Id, Room, Seq, Uid};
-use risala_proto::server::ServerMessage;
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, Role};
 
-use crate::handler::{ConnHandle, ConnId, ConnInfo};
+use crate::handler::{ConnHandle, ConnId, ConnInfo, OutLine};
 use crate::store::{CID_WINDOW_MS, ConvKey, RoomRecord, RoomSettings};
 
 /// A room the hub knows. Its state sits behind an async lock, which is
@@ -159,22 +158,23 @@ impl Registry {
         }
     }
 
-    /// Queues `msg` for every connection of every member of `room` (5.2).
-    pub(crate) fn broadcast(&self, room: &Room, msg: &ServerMessage) {
+    /// Queues `line` for every connection of every member of `room` (5.2).
+    /// The line is encoded once and shared.
+    pub(crate) fn broadcast(&self, room: &Room, line: &OutLine) {
         let Some(members) = self.members.get(room) else {
             return;
         };
         for uid in members {
-            self.send_to_user(uid, msg);
+            self.send_to_user(uid, line);
         }
     }
 
-    /// Queues `msg` for every connection signed in as `uid`.
-    pub(crate) fn send_to_user(&self, uid: &Uid, msg: &ServerMessage) {
+    /// Queues `line` for every connection signed in as `uid`.
+    pub(crate) fn send_to_user(&self, uid: &Uid, line: &OutLine) {
         for id in self.users.get(uid).into_iter().flatten() {
             if let Some(conn) = self.conns.get(id) {
                 // A full queue kills only that connection (PLAN.md 3.2).
-                conn.handle.send(msg.clone());
+                conn.handle.send_line(line.clone());
             }
         }
     }

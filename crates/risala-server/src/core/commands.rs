@@ -16,7 +16,7 @@ use risala_proto::types::{
 
 use super::Inner;
 use super::state::{Registry, RoomState};
-use crate::handler::{ConnHandle, ConnId};
+use crate::handler::{ConnHandle, ConnId, OutLine};
 use crate::store::{Appended, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent};
 
 /// Why a command failed.
@@ -336,7 +336,7 @@ impl Inner {
     /// only logged.
     fn broadcast_event(reg: &Registry, st: &RoomState, event: &StoredEvent) {
         match event.to_event(st.room.clone(), &st.id) {
-            Ok(line) => reg.broadcast(&st.room, &ServerMessage::new(line)),
+            Ok(line) => reg.broadcast(&st.room, &OutLine::new(ServerMessage::new(line))),
             Err(e) => tracing::error!(room = %st.room, "cannot send an event: {e}"),
         }
     }

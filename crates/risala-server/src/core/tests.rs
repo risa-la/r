@@ -86,7 +86,7 @@ impl Harness {
     fn connect_sni(&mut self, sni: Option<&str>, capacity: usize) -> Client {
         self.next += 1;
         let id = ConnId(self.next);
-        let (handle, rx) = conn_channel(id, capacity);
+        let (handle, rx) = conn_channel(id, capacity, usize::MAX);
         self.hub.open(
             ConnInfo {
                 peer: SocketAddr::from(([203, 0, 113, 7], 51000)),
@@ -153,7 +153,7 @@ impl Client {
         self.items()
             .into_iter()
             .filter_map(|item| match item {
-                Outgoing::Line(m) => Some(*m),
+                Outgoing::Line(m) => Some(m.message().clone()),
                 Outgoing::Close { .. } => None,
             })
             .collect()
@@ -161,7 +161,7 @@ impl Client {
 
     fn items(&mut self) -> Vec<Outgoing> {
         let mut out = Vec::new();
-        while let Ok(item) = self.rx.rx.try_recv() {
+        while let Some(item) = self.rx.try_recv() {
             out.push(item);
         }
         out
@@ -352,7 +352,7 @@ async fn sign_in_timeout_closes_with_bye() {
     let mut prompt = h.connect();
     h.send(&prompt, "guest sam").await;
     assert_eq!(prompt.lines(), ["OK uid=~sam"]);
-    let item = tokio::time::timeout(Duration::from_secs(10), late.rx.rx.recv())
+    let item = tokio::time::timeout(Duration::from_secs(10), late.rx.recv())
         .await
         .expect("the connection is closed in time")
         .unwrap();
@@ -719,6 +719,23 @@ async fn msg_reaches_everyone_before_its_ok() {
     assert_eq!(sam.lines(), [event.clone(), "@ref=m OK seq=3".into()]);
     assert_eq!(bob.lines(), [event]);
     assert_eq!(outsider.lines(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn fan_out_shares_one_line() {
+    let mut h = Harness::new();
+    let (mut sam, _) = h.joined("sam", "#general").await;
+    let (mut bob, _) = h.joined("bob", "#general").await;
+    sam.items();
+    h.send(&sam, "msg #general hi").await;
+    let line = |item: &Outgoing| match item {
+        Outgoing::Line(line) => line.clone(),
+        Outgoing::Close { .. } => panic!("a close"),
+    };
+    let to_sam = sam.items();
+    let to_bob = bob.items();
+    assert_eq!((to_sam.len(), to_bob.len()), (2, 1));
+    assert!(line(&to_sam[0]).ptr_eq(&line(&to_bob[0])));
 }
 
 #[tokio::test]

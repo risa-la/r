@@ -9,18 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use risala_proto::command::{Command, Request};
-use risala_proto::error::{ErrorCode, ParseError};
-use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, MAX_SERVER_LINE, check_line_len};
+use risala_proto::error::ParseError;
+use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE};
 use risala_proto::line::{Line, read_ref};
 use risala_proto::server::{ErrResponse, ServerLine, ServerMessage};
 use risala_proto::text::escape;
 use risala_proto::types::Ref;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::handler::{ConnHandle, ConnInfo, ConnReceiver, Handler, Outgoing};
+use crate::handler::{ConnHandle, ConnInfo, ConnReceiver, Handler, OutLine, Outgoing};
 
 /// How long a connection that has stopped reading commands has to send
 /// what is queued for it before it is dropped.
@@ -203,28 +203,24 @@ async fn write_loop<W>(mut wr: W, mut receiver: ConnReceiver)
 where
     W: AsyncWrite + Unpin,
 {
-    // `ConnReceiver::killed` borrows the whole receiver, so take the queue
-    // out to wait on both at once.
-    let mut queue = std::mem::replace(&mut receiver.rx, mpsc::channel(1).1);
     let mut out = Vec::with_capacity(4096);
     loop {
         let first = tokio::select! {
             biased;
             () = receiver.killed() => return,
-            item = queue.recv() => item,
+            item = receiver.recv() => item,
         };
         let mut close = false;
         let mut next = first;
         // Gather what is queued already into one write.
         loop {
             match next {
-                Some(Outgoing::Line(msg)) => encode(&msg, &mut out),
+                Some(Outgoing::Line(line)) => out.extend_from_slice(line.wire()),
                 Some(Outgoing::Close { bye }) => {
                     if let Some(text) = bye {
-                        encode(
-                            &ServerMessage::new(ServerLine::Bye { message: text }),
-                            &mut out,
-                        );
+                        let bye =
+                            OutLine::new(ServerMessage::new(ServerLine::Bye { message: text }));
+                        out.extend_from_slice(bye.wire());
                     }
                     close = true;
                     break;
@@ -238,9 +234,9 @@ where
             if out.len() >= WRITE_BATCH {
                 break;
             }
-            match queue.try_recv() {
-                Ok(item) => next = Some(item),
-                Err(_) => break,
+            match receiver.try_recv() {
+                Some(item) => next = Some(item),
+                None => break,
             }
         }
         let wrote = tokio::select! {
@@ -264,36 +260,6 @@ where
             }
             return;
         }
-    }
-}
-
-/// Appends one line and its LF to `out`.
-///
-/// A message that cannot be written, or is too long for a server line
-/// (2.3), is a bug in the core. It is logged and dropped; if it was a
-/// final response, `ERR internal` takes its place, so the client still
-/// gets one final response per command (3.6).
-fn encode(msg: &ServerMessage, out: &mut Vec<u8>) {
-    let problem = match msg.try_to_line() {
-        Ok(line) => {
-            let text = line.to_string();
-            match check_line_len(&text, MAX_SERVER_LINE) {
-                Ok(()) => {
-                    out.extend_from_slice(text.as_bytes());
-                    out.push(b'\n');
-                    return;
-                }
-                Err(e) => e,
-            }
-        }
-        Err(e) => e,
-    };
-    tracing::error!(verb = msg.line.verb(), error = %problem, "dropping a line that cannot be sent");
-    if msg.line.is_final() {
-        let err = ServerMessage::new(ErrResponse::new(ErrorCode::Internal))
-            .with_ref_opt(msg.ref_.clone());
-        out.extend_from_slice(err.to_line().to_string().as_bytes());
-        out.push(b'\n');
     }
 }
 
@@ -386,24 +352,5 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         );
         assert_ne!(a, ping_token());
-    }
-
-    #[test]
-    fn bad_final_responses_become_internal_errors() {
-        let mut out = Vec::new();
-        let long = ServerMessage::new(
-            ErrResponse::new(ErrorCode::NotFound).with_message("x".repeat(MAX_SERVER_LINE)),
-        )
-        .with_ref("7".parse().unwrap());
-        encode(&long, &mut out);
-        assert_eq!(out, b"@ref=7 ERR internal\n");
-
-        // A line that is not final is just dropped.
-        let mut out = Vec::new();
-        let notice = ServerMessage::new(ServerLine::Bye {
-            message: "x".repeat(MAX_SERVER_LINE),
-        });
-        encode(&notice, &mut out);
-        assert!(out.is_empty());
     }
 }

@@ -84,6 +84,7 @@ pub struct Server<H> {
     acceptor: TlsAcceptor,
     timers: Timers,
     out_queue: usize,
+    out_queue_bytes: usize,
     handshake_timeout: Duration,
     max_connections: usize,
 }
@@ -132,6 +133,7 @@ impl<H: Handler> Server<H> {
                 ping_timeout: Duration::from_secs(config.limits.ping_timeout_secs),
             },
             out_queue: config.limits.out_queue,
+            out_queue_bytes: config.limits.out_queue_bytes,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
         })
@@ -176,6 +178,7 @@ impl<H: Handler> Server<H> {
             acceptor: self.acceptor,
             timers: self.timers,
             out_queue: self.out_queue,
+            out_queue_bytes: self.out_queue_bytes,
             handshake_timeout: self.handshake_timeout,
             permits: Arc::new(Semaphore::new(self.max_connections)),
             max_connections: self.max_connections,
@@ -234,6 +237,7 @@ struct Shared<H> {
     acceptor: TlsAcceptor,
     timers: Timers,
     out_queue: usize,
+    out_queue_bytes: usize,
     handshake_timeout: Duration,
     permits: Arc<Semaphore>,
     max_connections: usize,
@@ -306,7 +310,7 @@ async fn connection<H: Handler>(
         .alpn_protocol()
         .map(|p| String::from_utf8_lossy(p).into_owned());
     let id = ConnId(shared.next_id.fetch_add(1, Ordering::Relaxed));
-    let (handle, receiver) = conn_channel(id, shared.out_queue);
+    let (handle, receiver) = conn_channel(id, shared.out_queue, shared.out_queue_bytes);
     {
         let mut registry = shared.registry();
         if registry.shutting_down {
