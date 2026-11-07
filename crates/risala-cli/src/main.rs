@@ -377,12 +377,7 @@ fn explain<T>(e: ClientError) -> Res<T> {
                 None => fail_with(ACT, why),
             }
         }
-        ClientError::Unconfirmed { uid, message } => {
-            eprintln!("risala: {message}.");
-            eprintln!("Check later by signing in, or run the command again:");
-            eprintln!("    risala login <server> {uid}");
-            Err(Failed(FAILED))
-        }
+        ClientError::Unconfirmed { message, .. } => fail(format!("{message}.")),
         _ => fail_with(exit_code(&e), e),
     }
 }
