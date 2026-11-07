@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -165,6 +165,19 @@ CREATE TABLE outbox (
     first_sent INTEGER
 );
 CREATE INDEX outbox_pending ON outbox (account, conv) WHERE state IN ('queued', 'sending');
+";
+
+/// Version 2: the rooms a guest account joins again after reconnecting.
+///
+/// Guests leave their rooms when they disconnect (4.2), so the client
+/// layer keeps the rooms the user joined here, and joins them again on
+/// each new connection. Rooms are kept by name.
+const V2: &str = "
+CREATE TABLE rejoin (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    room    TEXT NOT NULL,
+    PRIMARY KEY (account, room)
+) WITHOUT ROWID;
 ";
 
 /// Brings the schema up to [`VERSION`].

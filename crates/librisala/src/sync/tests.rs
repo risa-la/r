@@ -1029,3 +1029,41 @@ fn tlc_5_a_resent_cid_gets_someone_elses_seq() {
         OutboxState::Failed(FailReason::RoomChanged)
     );
 }
+
+// ---------------------------------------------------------------------------
+// A connection signed in under another uid than the account's
+
+#[test]
+fn a_guest_signed_in_under_a_numbered_name_knows_its_own_join() {
+    let store = Store::open_in_memory().unwrap();
+    let server: ServerAddr = "chat.example.org".parse().unwrap();
+    let account = store.account(&server, &"~sam".parse().unwrap()).unwrap();
+    let mut engine = SyncEngine::signed_in_as(
+        store.clone(),
+        account,
+        "~sam2".parse().unwrap(),
+        SyncConfig::default(),
+    );
+    assert_eq!(engine.uid().as_str(), "~sam2");
+    let out = engine.join(&"#general".parse().unwrap());
+    let join = out.send[0].req;
+    // Its own JOIN event confirms the id at once, and is stored (6.1).
+    let out = engine
+        .handle_line(&msg(&ev(1, "from=~sam2;id=k1 JOIN #general")))
+        .unwrap();
+    assert!(engine.is_live(&conv("#general")));
+    assert!(out.send.is_empty(), "{:?}", out.send);
+    engine
+        .handle_reply(join, Reply::new(vec![], msg("OK id=k1 head=1").line))
+        .unwrap();
+    let c = store
+        .conversation(account, &conv("#general"))
+        .unwrap()
+        .unwrap();
+    assert_eq!((c.sync_point, c.head, c.joined), (1, 1, true));
+    // Its own PART leaves.
+    engine
+        .handle_line(&msg(&ev(2, "from=~sam2 PART #general")))
+        .unwrap();
+    assert!(!engine.is_live(&conv("#general")));
+}

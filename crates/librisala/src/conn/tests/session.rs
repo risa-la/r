@@ -7,12 +7,12 @@ use std::time::Duration;
 use risala_proto::auth::SecretKey;
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
-use risala_proto::server::ServerLine;
+use risala_proto::server::{ServerLine, ServerMessage};
 
 use super::server::{Peer, ScriptServer, ServerCert, TestCa};
 use super::{chat_test, options, store};
 use crate::addr::{ServerAddr, TrustRecord, TrustStore};
-use crate::conn::{CloseReason, CommandError, End, Error, Session, SessionOptions};
+use crate::conn::{CloseReason, CommandError, End, Error, Incoming, Session, SessionOptions};
 
 // Appendix B.
 const PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
@@ -36,6 +36,33 @@ where
         .unwrap();
     let server = ScriptServer::start(cert, 1, script).await;
     (server, trust, TestCa::new())
+}
+
+/// The line in an incoming item that must not be a reply.
+fn line(item: Incoming) -> ServerMessage {
+    item.into_line().expect("a line, not a reply")
+}
+
+/// An incoming item as text: a line as on the wire, or `reply <ref>
+/// <final line>` with its response lines before it.
+fn show(item: Incoming) -> Vec<String> {
+    match item {
+        Incoming::Line(msg) => vec![msg.to_line().to_string()],
+        Incoming::Reply { ref_, response } => {
+            let mut out: Vec<String> = response
+                .lines
+                .iter()
+                .map(|m| format!("  {}", m.to_line()))
+                .collect();
+            let end = match response.end {
+                End::Ok(ok) => format!("{ok:?}"),
+                End::Err(err) => format!("ERR {}", err.code),
+                End::Unparseable(line) => format!("unparseable {line}"),
+            };
+            out.push(format!("reply {ref_} {end}"));
+            out
+        }
+    }
 }
 
 async fn open(
@@ -323,7 +350,7 @@ async fn responses_are_matched_with_live_events_interleaved() {
     // Everything else arrived in order, and was queued before the
     // responses returned.
     let verbs: Vec<String> = (0..3)
-        .map(|_| incoming.try_recv().unwrap().to_line().to_string())
+        .map(|_| line(incoming.try_recv().unwrap()).to_line().to_string())
         .collect();
     assert_eq!(
         verbs,
@@ -414,7 +441,7 @@ async fn server_ping_is_answered_with_pong() {
     let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let mut incoming = session.take_incoming().unwrap();
     // PINGs are not passed on.
-    let notice = incoming.recv().await.unwrap();
+    let notice = line(incoming.recv().await.unwrap());
     assert_eq!(notice.to_line().to_string(), "NOTICE done");
     drop(session);
     server.done().await;
@@ -464,7 +491,7 @@ async fn bye_then_close() {
     };
     assert!(matches!(&err, Error::Closed(r) if *r == reason), "{err:?}");
     assert_eq!(session.closed().await, reason);
-    let bye = incoming.recv().await.unwrap();
+    let bye = line(incoming.recv().await.unwrap());
     assert!(matches!(bye.line, ServerLine::Bye { .. }));
     assert!(incoming.recv().await.is_none());
     server.done().await;
@@ -584,5 +611,90 @@ async fn invalid_requests_are_not_sent() {
             .is_ok()
     );
     drop(session);
+    server.done().await;
+}
+
+#[tokio::test]
+async fn sent_replies_keep_their_place_among_live_lines() {
+    let addr = chat_test();
+    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 SYNC").await;
+        peer.expect("@ref=2 PING").await;
+        peer.expect("@ref=3 HISTORY #a after=0").await;
+        peer.send("@seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one")
+            .await;
+        peer.send("@ref=1 CONV #a k3f9q2 2 0").await;
+        peer.send("@seq=2;t=2026-11-06T15:41:04.000Z;from=~ann MSG #a two")
+            .await;
+        peer.send("@ref=1 OK").await;
+        peer.send("@seq=3;t=2026-11-06T15:41:05.000Z;from=~ann MSG #a three")
+            .await;
+        peer.send("@ref=2 OK").await;
+        peer.send("@ref=3;seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one")
+            .await;
+        peer.send("@ref=3 ERR internal").await;
+        peer.send("NOTICE done").await;
+        peer.expect_eof().await;
+    })
+    .await;
+    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
+    let mut incoming = session.take_incoming().unwrap();
+    assert_eq!(session.send(Command::Sync).unwrap().as_str(), "1");
+    // A request() in between gets its response through its future.
+    let ping = session.request(Command::Ping { token: None });
+    let history = async {
+        session.send(Command::History {
+            conv: "#a".parse().unwrap(),
+            after: Some(0),
+            before: None,
+            limit: None,
+        })
+    };
+    let (ping, history) = tokio::join!(ping, history);
+    assert!(ping.unwrap().is_ok());
+    assert_eq!(history.unwrap().as_str(), "3");
+    let mut got = Vec::new();
+    for _ in 0..6 {
+        got.extend(show(incoming.recv().await.unwrap()));
+    }
+    let ok = format!("{:?}", risala_proto::server::OkResponse::default());
+    assert_eq!(
+        got,
+        [
+            "@seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one".to_owned(),
+            "@seq=2;t=2026-11-06T15:41:04.000Z;from=~ann MSG #a two".to_owned(),
+            "  @ref=1 CONV #a k3f9q2 2 0".to_owned(),
+            format!("reply 1 {ok}"),
+            "@seq=3;t=2026-11-06T15:41:05.000Z;from=~ann MSG #a three".to_owned(),
+            "  @ref=3;seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one".to_owned(),
+            "reply 3 ERR internal".to_owned(),
+            "NOTICE done".to_owned(),
+        ]
+    );
+    drop(session);
+    // Nothing more: the queue ends with the connection.
+    assert!(incoming.recv().await.is_none());
+    server.done().await;
+}
+
+#[tokio::test]
+async fn sent_commands_without_a_reply_end_with_the_queue() {
+    let addr = chat_test();
+    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 SYNC").await;
+        peer.close().await;
+    })
+    .await;
+    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
+    let mut incoming = session.take_incoming().unwrap();
+    session.send(Command::Sync).unwrap();
+    assert!(incoming.recv().await.is_none());
+    assert!(matches!(session.send(Command::Sync), Err(Error::Closed(_))));
+    assert!(matches!(
+        session.send(Command::Pong { token: "x".into() }),
+        Err(Error::NoResponse)
+    ));
     server.done().await;
 }

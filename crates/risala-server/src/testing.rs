@@ -269,6 +269,22 @@ impl TestServer {
         self.launch().await;
     }
 
+    /// Stops the server, runs `f` while it is stopped, then starts it again
+    /// as [`restart`](Self::restart) does. `f` gets the configuration, to
+    /// change the files under [`state_dir`](Self::state_dir), for example
+    /// to remove a room from the database with SQL so that it is created
+    /// again with a new id, as after ADMIN DROP (10.4). Rooms from
+    /// [`room`](TestServerBuilder::room) that are missing are created
+    /// again when the server starts.
+    pub async fn restart_with(&mut self, f: impl FnOnce(&Config) + Send + 'static) {
+        self.shut_down().await;
+        let config = self.config.clone();
+        tokio::task::spawn_blocking(move || f(&config))
+            .await
+            .expect("changing the stopped server");
+        self.launch().await;
+    }
+
     /// Stops the server, waits until it has finished, and deletes its
     /// directory. Connections are closed with `BYE server shutting down`
     /// (11).
@@ -351,5 +367,164 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A TCP proxy in front of a server, which cuts its connections on
+/// command, for tests of dropped connections.
+///
+/// **For tests only.** It forwards bytes unchanged, so TLS runs end to end
+/// between the client and the server behind it. Cutting a connection
+/// closes both of its sockets at once, with no TLS `close_notify` and no
+/// BYE, as when a network goes away: the client sees the connection end,
+/// and the server notices and records a guest's PARTs (4.2).
+///
+/// ```no_run
+/// # async fn f() {
+/// use risala_server::testing::{Proxy, TestServer};
+///
+/// let server = TestServer::builder().room("#general").start().await;
+/// let proxy = Proxy::start(server.addr()).await;
+/// // Connect clients to proxy.addr() instead of server.addr().
+/// proxy.cut_after(Some(5000)); // Each new connection ends after 5000 bytes from the server.
+/// proxy.cut(); // Every open connection ends now.
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct Proxy {
+    addr: SocketAddr,
+    shared: std::sync::Arc<ProxyShared>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct ProxyShared {
+    target: SocketAddr,
+    /// Bumped by [`Proxy::cut`]; a link ends when it changes.
+    generation: tokio::sync::watch::Sender<u64>,
+    /// Bytes from the server after which a new link ends.
+    budget: std::sync::Mutex<Option<u64>>,
+    /// Links accepted so far.
+    accepted: std::sync::atomic::AtomicU64,
+}
+
+impl Proxy {
+    /// Starts a proxy on `127.0.0.1` with a port the system chooses,
+    /// forwarding to `target`.
+    pub async fn start(target: SocketAddr) -> Proxy {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("binding the proxy");
+        let addr = listener.local_addr().expect("the proxy's address");
+        let shared = std::sync::Arc::new(ProxyShared {
+            target,
+            generation: tokio::sync::watch::channel(0).0,
+            budget: std::sync::Mutex::new(None),
+            accepted: std::sync::atomic::AtomicU64::new(0),
+        });
+        let task = tokio::spawn(proxy_accept(listener, shared.clone()));
+        Proxy { addr, shared, task }
+    }
+
+    /// The address to connect to instead of the server's.
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Cuts every connection open now. Later connections go through.
+    pub fn cut(&self) {
+        self.shared.generation.send_modify(|g| *g += 1);
+    }
+
+    /// Makes each connection opened from now on end after the server has
+    /// sent `bytes` bytes through it, counting the TLS handshake. `None`
+    /// lets them run.
+    pub fn cut_after(&self, bytes: Option<u64>) {
+        *self.shared.budget.lock().expect("poisoned") = bytes;
+    }
+
+    /// How many connections the proxy has accepted.
+    pub fn connections(&self) -> u64 {
+        self.shared
+            .accepted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.cut();
+        self.task.abort();
+    }
+}
+
+async fn proxy_accept(listener: tokio::net::TcpListener, shared: std::sync::Arc<ProxyShared>) {
+    while let Ok((client, _)) = listener.accept().await {
+        shared
+            .accepted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let budget = *shared.budget.lock().expect("poisoned");
+        let cut = shared.generation.subscribe();
+        let target = shared.target;
+        tokio::spawn(async move {
+            if let Ok(server) = tokio::net::TcpStream::connect(target).await {
+                proxy_link(client, server, budget, cut).await;
+            }
+        });
+    }
+}
+
+/// Copies bytes both ways until either side closes, the budget of bytes
+/// from the server runs out, or the proxy cuts. Dropping the sockets
+/// closes them.
+async fn proxy_link(
+    client: tokio::net::TcpStream,
+    server: tokio::net::TcpStream,
+    mut budget: Option<u64>,
+    mut cut: tokio::sync::watch::Receiver<u64>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (mut client_rd, mut client_wr) = client.into_split();
+    let (mut server_rd, mut server_wr) = server.into_split();
+    let up = async {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            match client_rd.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if server_wr.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    let down = async {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = match server_rd.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            let n = match &mut budget {
+                Some(left) => {
+                    let n = n.min(usize::try_from(*left).unwrap_or(usize::MAX));
+                    *left -= n as u64;
+                    n
+                }
+                None => n,
+            };
+            if client_wr.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+            if budget == Some(0) {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = up => {}
+        () = down => {}
+        _ = cut.changed() => {}
     }
 }
