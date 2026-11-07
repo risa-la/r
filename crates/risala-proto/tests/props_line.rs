@@ -12,7 +12,9 @@ use proptest::option;
 use proptest::prelude::*;
 use proptest::sample::Index;
 use risala_proto::error::ParseError;
-use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, check_line};
+use risala_proto::frame::{
+    LONG_VERBS, LineDecoder, LineLimits, MAX_CLIENT_LINE, MAX_LONG_CLIENT_LINE, check_line,
+};
 use risala_proto::line::{Line, Tags};
 
 /// Explicit case counts keep `cargo test` fast in debug builds. Set
@@ -564,4 +566,186 @@ proptest! {
         prop_assert_eq!(d.pending_bytes(), pending);
         prop_assert_eq!(d.is_discarding(), discarding);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Long lines (2.3)
+
+/// Whether a line, or the start of one, may be long, and whether that is
+/// known yet: `Some(long)` once the verb has ended, `None` before. The
+/// verb comes after the tags (`@` to the first space) and any spaces.
+fn verb_class(line: &[u8], complete: bool) -> Option<bool> {
+    let mut rest = line;
+    if rest.first() == Some(&b'@') {
+        match rest.iter().position(|&b| b == b' ') {
+            Some(space) => rest = &rest[space..],
+            None if complete => return Some(false),
+            None => return None,
+        }
+        let spaces = rest.iter().take_while(|&&b| b == b' ').count();
+        rest = &rest[spaces..];
+    }
+    let letters = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    let verb = &rest[..letters];
+    let is_long = || {
+        LONG_VERBS
+            .iter()
+            .any(|v| v.as_bytes().eq_ignore_ascii_case(verb))
+    };
+    if letters > 9 {
+        Some(false)
+    } else if letters < rest.len() || complete {
+        Some(is_long())
+    } else {
+        None
+    }
+}
+
+/// [`reference`] with a long limit for lines whose verb is in
+/// `LONG_VERBS`. A line whose verb has not arrived yet may still be long.
+fn reference_long(
+    input: &[u8],
+    limits: LineLimits,
+) -> (Vec<Result<String, ParseError>>, usize, bool) {
+    let limit = |class: Option<bool>| match class {
+        Some(false) => limits.normal,
+        Some(true) | None => limits.long,
+    };
+    let mut parts: Vec<&[u8]> = input.split(|&b| b == b'\n').collect();
+    let unfinished = parts.pop().expect("split yields at least one part");
+    let mut out = Vec::new();
+    for line in parts {
+        out.push(if line.len() + 1 > limit(verb_class(line, true)) {
+            Err(ParseError::TooLong)
+        } else {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            match std::str::from_utf8(line) {
+                Err(_) => Err(ParseError::InvalidUtf8),
+                Ok(s) if s.chars().any(is_control_char) => Err(ParseError::ControlChar),
+                Ok(s) => Ok(s.to_owned()),
+            }
+        });
+    }
+    if !unfinished.is_empty() && unfinished.len() >= limit(verb_class(unfinished, false)) {
+        out.push(Err(ParseError::TooLong));
+        (out, 0, true)
+    } else {
+        (out, unfinished.len(), false)
+    }
+}
+
+/// A stream of lines that start with verbs, long and not, often after
+/// tags, with filler of any length.
+fn verb_stream() -> impl Strategy<Value = Vec<u8>> {
+    let piece = prop_oneof![
+        3 => Just(b"\n".to_vec()),
+        1 => Just(b"\r\n".to_vec()),
+        3 => prop::sample::select(vec![
+            "ENC ", "enc ", "COMMIT", "groupinfo ", "REPORT ", "WelCome ", "INIT", "KEYPKG ",
+            "MSG ", "ENCX ", "GROUPINFOS ", "PING", "@", "@ref=1 ", "@content=AAAA  ", " ",
+        ])
+        .prop_map(|s| s.as_bytes().to_vec()),
+        4 => "[a-zA-Z0-9 ;=]{1,12}".prop_map(String::into_bytes),
+        1 => any::<u8>().prop_map(|b| vec![b]),
+    ];
+    vec(piece, 0..60).prop_map(|pieces| pieces.concat())
+}
+
+fn limits() -> impl Strategy<Value = LineLimits> {
+    (1..=24usize, 0..=40usize).prop_map(|(normal, extra)| LineLimits {
+        normal,
+        long: normal + extra,
+    })
+}
+
+proptest! {
+    #![proptest_config(config(1024))]
+
+    /// With a long limit for MLS verbs, the decoder yields what the
+    /// reference splitter does, in any chunks, and never holds more than
+    /// the long limit (2.3).
+    #[test]
+    fn long_line_decoder_matches_reference(
+        input in verb_stream(),
+        limits in limits(),
+        cuts in vec(any::<Index>(), 0..8),
+        drain_each in any::<bool>(),
+    ) {
+        let mut cuts: Vec<usize> = cuts.iter().map(|i| i.index(input.len() + 1)).collect();
+        cuts.sort_unstable();
+        cuts.push(input.len());
+        let mut d = LineDecoder::with_limits(limits);
+        let mut got = Vec::new();
+        let mut start = 0;
+        for cut in cuts {
+            d.push(&input[start..cut]);
+            start = cut;
+            prop_assert!(d.pending_bytes() < limits.long, "{} pending", d.pending_bytes());
+            if d.is_discarding() {
+                prop_assert_eq!(d.pending_bytes(), 0);
+            }
+            if drain_each {
+                got.extend(std::iter::from_fn(|| d.next_line()));
+            }
+        }
+        got.extend(std::iter::from_fn(|| d.next_line()));
+        let (want, pending, discarding) = reference_long(&input, limits);
+        prop_assert_eq!(got, want);
+        prop_assert_eq!(d.pending_bytes(), pending);
+        prop_assert_eq!(d.is_discarding(), discarding);
+        prop_assert_eq!(d.limits(), limits);
+
+        // An outgoing line passes LineLimits::check exactly when the
+        // decoder would take it.
+        for line in input.split(|&b| b == b'\n') {
+            if let Ok(line) = std::str::from_utf8(line) {
+                let fits = line.len() < limits.for_verb_of(line);
+                prop_assert_eq!(limits.check(line).is_ok(), fits, "{:?}", line);
+            }
+        }
+    }
+}
+
+trait ForVerbOf {
+    fn for_verb_of(&self, line: &str) -> usize;
+}
+
+impl ForVerbOf for LineLimits {
+    /// The limit for a whole line, by the reference's verb rules.
+    fn for_verb_of(&self, line: &str) -> usize {
+        match verb_class(line.as_bytes(), true) {
+            Some(true) => self.long,
+            _ => self.normal,
+        }
+    }
+}
+
+/// A real ENC line just under, at and over the real long limit, with
+/// the normal limit for a MSG of the same length.
+#[test]
+fn real_long_limit() {
+    for (len, ok) in [
+        (MAX_LONG_CLIENT_LINE - 1, true),
+        (MAX_LONG_CLIENT_LINE, false),
+    ] {
+        let prefix = "ENC #a 0 ";
+        let mut line = prefix.as_bytes().to_vec();
+        line.resize(len, b'A');
+        line.push(b'\n');
+        let mut d = LineDecoder::with_limits(LineLimits::CLIENT);
+        for chunk in line.chunks(65536) {
+            d.push(chunk);
+            assert!(d.pending_bytes() < MAX_LONG_CLIENT_LINE);
+        }
+        let got = d.next_line().unwrap();
+        assert_eq!(got.is_ok(), ok, "{len}");
+        if let Ok(got) = got {
+            assert_eq!(got.len(), len);
+        }
+    }
+    let mut d = LineDecoder::with_limits(LineLimits::CLIENT);
+    let mut msg = b"MSG #a ".to_vec();
+    msg.resize(MAX_CLIENT_LINE, b'a');
+    d.push(&msg);
+    assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
 }
