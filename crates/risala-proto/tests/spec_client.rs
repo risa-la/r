@@ -65,9 +65,8 @@ fn every_client_example_parses() {
 #[test]
 fn shortened_values_are_expanded() {
     use common::expand_shortened;
-    // frank is 48 bytes and frank-key 32 (12.8, 5.8); other values 96.
+    // frank is 48 bytes (12.8); other values 96.
     let frank = format!("hT3m{}", "A".repeat(60));
-    let frank_key = format!("9vQe{}=", "A".repeat(39));
     let blob = |p: &str| format!("{p}{}", "A".repeat(128 - p.len()));
     assert_eq!(
         expand_shortened("@frank=hT3m…;cid=q2r8sv0alm3nb7xk enc bob@example.net 1 3qG8w…"),
@@ -76,12 +75,11 @@ fn shortened_values_are_expanded() {
             blob("3qG8w")
         )
     );
+    // REPORTENC's content, after a franking key written in full.
+    let key = "g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4=";
     assert_eq!(
-        expand_shortened("@frank-key=9vQe…;content=VEVYVCBz… ENC a@b.org 1"),
-        format!(
-            "@frank-key={frank_key};content={} ENC a@b.org 1",
-            blob("VEVYVCBz")
-        )
+        expand_shortened(&format!("reportenc a@b.org 2 {key} VEVYVCBz… spam")),
+        format!("reportenc a@b.org 2 {key} {} spam", blob("VEVYVCBz"))
     );
     // Not base64: left alone.
     assert_eq!(

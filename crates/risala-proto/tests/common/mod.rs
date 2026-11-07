@@ -74,12 +74,12 @@ impl Example {
 }
 
 /// How many bytes a shortened value in a tag with this key stands for.
-/// The spec fixes the length of `frank` (12.8) and `frank-key` (5.8);
-/// other MLS data has any length.
+/// The spec fixes the length of `frank` (12.8); other MLS data, and
+/// REPORTENC's content (5.8), have any length. Values of a fixed length
+/// in parameters, such as REPORTENC's franking key, are written in full.
 fn shortened_len(tag_key: Option<&str>) -> usize {
     match tag_key {
         Some("frank") => 48,
-        Some("frank-key") => 32,
         _ => 96,
     }
 }

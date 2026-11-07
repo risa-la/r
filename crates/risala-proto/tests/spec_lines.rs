@@ -165,7 +165,8 @@ fn specific_examples_are_present() {
     assert_eq!(find("init bob@example.net").dir, Dir::Client);
     assert_eq!(find("COMMIT bob@example.net 1").dir, Dir::Server);
     assert_eq!(find("enc bob@example.net 1").dir, Dir::Client);
-    assert_eq!(find("frank-key=").dir, Dir::Server);
+    assert_eq!(find("reportenc alice@example.org 2").dir, Dir::Client);
+    assert_eq!(find("REPORTENC alice@example.org 2").dir, Dir::Server);
 
     // Prose and shell commands inside example blocks are skipped.
     for e in &all {

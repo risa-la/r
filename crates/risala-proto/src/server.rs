@@ -45,11 +45,11 @@
 //!   error, as is one of these tags without a value. `deleted` is a flag;
 //!   a value on it is ignored.
 //! - **Encrypted messages (5.4, 5.8, 12.8).** An ENC event has a `frank`
-//!   tag and a payload, unless it is `deleted`, when both its payload and
-//!   any `file` are gone (a `frank` is kept if sent). The copy of a
-//!   reported ENC event carries `frank-key` and `content`, both or
-//!   neither, and then an empty payload. MLS data is opaque: it only has
-//!   to be strict base64 ([`mls`](crate::mls)).
+//!   tag and a payload, unless it is `deleted`, when its payload, `frank`
+//!   and any `file` are all gone. The copy of a reported ENC event that
+//!   follows a REPORTENC line keeps its `frank` and has an empty payload;
+//!   the franking key and content are on the REPORTENC line. MLS data is
+//!   opaque: it only has to be strict base64 ([`mls`](crate::mls)).
 //! - **DROP** must carry the dropped room's `id` (10.4), as JOIN events
 //!   do (6.1), since a client ignores a DROP for another id.
 //! - **Events and snapshots (5.2).** `seq`, `t` and `from` must be all
@@ -63,6 +63,9 @@
 //!   `file` must be an `https` URL of at most 512 bytes. `file-type` and
 //!   `file-size` are optional, so a client still shows a file whose
 //!   metadata a server left out; without `file` they are ignored.
+//! - **Reports (5.8).** REPORT and REPORTENC lines are one type,
+//!   [`Report`], whose `franking` is `Some` for REPORTENC. Nothing ties a
+//!   REPORTENC line to an ENC copy, since they are separate lines.
 //! - **Length limits** stated by the spec are applied as on commands, so a
 //!   correct server never trips them: a topic (ROOM, SET) or a report
 //!   reason of 512 bytes, a display name (MEMBER, USER, NAME) of 128 and a
@@ -84,8 +87,8 @@
 //!
 //! Tags are written in this order: `ref`, `report`, then `seq`, `t`,
 //! `from`, the relation (`reply`, `edit` or `react`) or `frank`, `file`,
-//! `file-type`, `file-size`, `deleted`, `frank-key` and `content`, then
-//! `id` on JOIN and DROP, or `retry` on ERR. This reproduces every example
+//! `file-type`, `file-size` and `deleted`, then `id` on JOIN and DROP, or
+//! `retry` on ERR. This reproduces every example
 //! in the spec.
 
 use std::fmt;
@@ -96,8 +99,8 @@ use crate::auth::{Nonce, PublicKey};
 use crate::error::{ErrorCode, ParseError};
 use crate::line::{Line, LineBuilder, Params, Tags, is_token};
 use crate::mls::{
-    BackupBlob, Ciphertext, CommitMessage, Content, Frank, FrankKey, GroupInfo, KeyPackage,
-    RatchetTree, Welcome,
+    BackupBlob, Ciphertext, CommitMessage, Frank, Franking, GroupInfo, KeyPackage, RatchetTree,
+    Welcome,
 };
 use crate::names::{BlockTarget, Conv, Domain, Id, Room, Seq, ServerBanTarget, Uid};
 use crate::time::Timestamp;
@@ -160,7 +163,7 @@ impl ServerMessage {
         self
     }
 
-    /// The REPORT line of report `id` (5.8).
+    /// The REPORT or REPORTENC line of report `id` (5.8).
     pub fn report_line(id: Id, report: Report) -> ServerMessage {
         ServerMessage {
             ref_: None,
@@ -169,8 +172,9 @@ impl ServerMessage {
         }
     }
 
-    /// The copy of the reported event that follows the REPORT line of
-    /// report `id` (5.8). The event needs its `seq`, `t` and `from`.
+    /// The copy of the reported event that follows the REPORT or REPORTENC
+    /// line of report `id` (5.8). The event needs its `seq`, `t` and
+    /// `from`, and an ENC event an empty payload.
     pub fn report_copy(id: Id, event: Event) -> ServerMessage {
         ServerMessage {
             ref_: None,
@@ -198,23 +202,19 @@ impl ServerMessage {
             "MSG" | "DELETE" | "JOIN" | "PART" | "INVITE" | "KICK" | "BAN" | "UNBAN" | "SET"
             | "ROLE" | "ENC" | "COMMIT" => {
                 let event = Event::parse(&verb, tags, params)?;
-                if report.is_none() && event.body.is_reported_enc() {
-                    return Err(bad("only a reported ENC has frank-key and content"));
-                }
                 if report.is_some() {
-                    if event.meta.is_none() {
-                        return Err(bad("a reported event has seq, t and from"));
-                    }
+                    event.check_copy()?;
                     ServerLine::ReportCopy(event)
                 } else {
+                    event.body.check_live()?;
                     ServerLine::Event(event)
                 }
             }
-            "REPORT" => {
+            "REPORT" | "REPORTENC" => {
                 if report.is_none() {
                     return Err(bad("a REPORT line has a report tag"));
                 }
-                ServerLine::Report(Report::parse(tags, params)?)
+                ServerLine::Report(Report::parse(verb == "REPORTENC", tags, params)?)
             }
             _ => parse_response(&verb, tags, params)?.unwrap_or_else(|| {
                 let mut rest = line.clone();
@@ -345,11 +345,14 @@ pub enum ServerLine {
     /// The copy of a reported event that follows a [`Report`](Self::Report)
     /// line, with the same `report` tag (5.8). It always has its `seq`, `t`
     /// and `from`. Clients must not treat it as a new event in the
-    /// conversation. A reported ENC event carries its decrypted content
-    /// ([`Encrypted::content`]).
+    /// conversation. A reported ENC event has an empty payload and keeps
+    /// its `frank`; its content is on the REPORTENC line
+    /// ([`Report::franking`]).
     ReportCopy(Event),
-    /// `REPORT <conv> <seq> [<reason...>]`, a report sent to its reviewers
-    /// (5.8). The [`ServerMessage::report`] tag is required.
+    /// `REPORT <conv> <seq> [<reason...>]` or
+    /// `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]`, a
+    /// report sent to its reviewers (5.8). The [`ServerMessage::report`]
+    /// tag is required.
     Report(Report),
     /// `RESOLVED <id>`: another reviewer resolved report `id` (5.8).
     Resolved {
@@ -571,7 +574,7 @@ impl ServerLine {
             ServerLine::Ok(_) => "OK",
             ServerLine::Err(_) => "ERR",
             ServerLine::Event(e) | ServerLine::ReportCopy(e) => e.body.verb(),
-            ServerLine::Report(_) => "REPORT",
+            ServerLine::Report(r) => r.verb(),
             ServerLine::Resolved { .. } => "RESOLVED",
             ServerLine::Room { .. } => "ROOM",
             ServerLine::Conv { .. } => "CONV",
@@ -612,15 +615,11 @@ impl ServerLine {
             ServerLine::Ok(ok) => ok.write(b),
             ServerLine::Err(err) => err.write(b),
             ServerLine::Event(e) => {
-                if e.body.is_reported_enc() {
-                    return Err(bad("only a reported ENC has frank-key and content"));
-                }
+                e.body.check_live()?;
                 e.write(b)?;
             }
             ServerLine::ReportCopy(e) => {
-                if e.meta.is_none() {
-                    return Err(bad("a reported event has seq, t and from"));
-                }
+                e.check_copy()?;
                 e.write(b)?;
             }
             ServerLine::Report(r) => r.write(b)?,
@@ -1705,6 +1704,20 @@ impl Event {
         self.meta.is_none()
     }
 
+    /// Checks what a reviewer's copy needs (5.8): `seq`, `t` and `from`,
+    /// and for ENC, an empty payload and no `deleted` flag.
+    fn check_copy(&self) -> Result<(), ParseError> {
+        if self.meta.is_none() {
+            return Err(bad("a reported event has seq, t and from"));
+        }
+        match &self.body {
+            EventBody::Enc(enc) if enc.deleted || enc.payload.is_some() => Err(bad(
+                "a reported ENC event has an empty payload and is not deleted",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn parse(verb: &str, tags: &Tags, p: Params<'_>) -> Result<Event, ParseError> {
         let meta = parse_meta(tags)?;
         let body = EventBody::parse(verb, tags, p)?;
@@ -1876,16 +1889,15 @@ impl EventBody {
         }
     }
 
-    /// Whether this is an ENC event with the `frank-key` and `content` of a
-    /// report copy (5.8).
-    fn is_reported_enc(&self) -> bool {
-        matches!(
-            self,
-            EventBody::Enc(Encrypted {
-                content: Some(_),
-                ..
-            })
-        )
+    /// Checks what an event that is not a reviewer's copy needs: an ENC
+    /// event that is not deleted has a payload (12.8).
+    fn check_live(&self) -> Result<(), ParseError> {
+        match self {
+            EventBody::Enc(enc) if !enc.deleted && enc.payload.is_none() => {
+                Err(bad("an ENC event has a payload"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Whether this verb is also sent as a snapshot: SET, BAN and ROLE
@@ -2137,15 +2149,15 @@ pub struct Attachment {
 }
 
 /// An ENC event (12.8), with its `frank` tag, attached file (5.6, 12.11)
-/// and `deleted` flag (5.4), and in the copy of a reported event, the
-/// `frank-key` and `content` tags (5.8).
+/// and `deleted` flag (5.4). Its syntax is
+/// `ENC <conv> <epoch> [<payload...>]`.
 ///
 /// Invariants, checked when parsing and serialising:
 ///
-/// - A deleted event is a placeholder (5.4, 12.11): no payload and no
-///   file. It may keep its `frank`.
-/// - The copy of a reported event has both `frank-key` and `content`, and
-///   no payload (5.8). Other events have neither.
+/// - A deleted event is a placeholder (5.4, 12.11): no payload, no
+///   `frank` and no file.
+/// - The copy of a reported event ([`ServerLine::ReportCopy`]) is not
+///   deleted, has a `frank` and has no payload (5.8).
 /// - Any other event has a payload and a `frank`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Encrypted {
@@ -2154,18 +2166,15 @@ pub struct Encrypted {
     /// The epoch whose history key encrypts the message.
     pub epoch: u64,
     /// The encrypted message, or `None` for an empty payload: deleted, or
-    /// a report copy whose content is in `content`.
+    /// a reviewer's copy (5.8).
     pub payload: Option<Ciphertext>,
-    /// The `frank` tag, the franking commitment (12.8).
+    /// The `frank` tag, the franking commitment (12.8). `None` only when
+    /// deleted.
     pub frank: Option<Frank>,
     /// The attached file, if any (5.6, 12.11).
     pub file: Option<Attachment>,
     /// The `deleted` tag: the payload was erased (5.4).
     pub deleted: bool,
-    /// The `frank-key` tag of a reported event (5.8).
-    pub frank_key: Option<FrankKey>,
-    /// The `content` tag of a reported event: the decrypted content (5.8).
-    pub content: Option<Content>,
 }
 
 impl Encrypted {
@@ -2178,8 +2187,15 @@ impl Encrypted {
             frank: Some(frank),
             file: None,
             deleted: false,
-            frank_key: None,
-            content: None,
+        }
+    }
+
+    /// The copy of this event that reviewers receive (5.8): the same,
+    /// without the payload.
+    pub fn for_review(&self) -> Encrypted {
+        Encrypted {
+            payload: None,
+            ..self.clone()
         }
     }
 
@@ -2197,31 +2213,20 @@ impl Encrypted {
             frank: parse_tag(tags, "frank")?,
             file: parse_attachment(tags)?,
             deleted: tags.has("deleted"),
-            frank_key: parse_tag(tags, "frank-key")?,
-            content: parse_tag(tags, "content")?,
         };
         enc.check()?;
         Ok(enc)
     }
 
+    /// The rules that hold for every ENC event. Whether it needs a payload
+    /// depends on whether it is a reviewer's copy, which the line decides.
     fn check(&self) -> Result<(), ParseError> {
-        let reported = self.content.is_some();
-        if reported != self.frank_key.is_some() {
-            return Err(bad("a reported ENC has both frank-key and content"));
-        }
         if self.deleted {
-            if self.payload.is_some() || self.file.is_some() {
-                return Err(bad("a deleted ENC has no payload or file"));
-            }
-            if reported {
-                return Err(bad("a reported ENC is not deleted"));
+            if self.payload.is_some() || self.frank.is_some() || self.file.is_some() {
+                return Err(bad("a deleted ENC has no payload, frank or file"));
             }
         } else if self.frank.is_none() {
             return Err(bad("an ENC event has the frank tag"));
-        } else if reported == self.payload.is_some() {
-            return Err(bad(
-                "an ENC event has a payload, except a reported one, which has content",
-            ));
         }
         Ok(())
     }
@@ -2234,12 +2239,6 @@ impl Encrypted {
         write_attachment(b, self.file.as_ref());
         if self.deleted {
             b.flag("deleted");
-        }
-        if let Some(frank_key) = &self.frank_key {
-            b.tag("frank-key", frank_key);
-        }
-        if let Some(content) = &self.content {
-            b.tag("content", content);
         }
         b.token(&self.conv).token(self.epoch);
         if let Some(payload) = &self.payload {
@@ -2277,9 +2276,11 @@ fn write_attachment(b: &mut LineBuilder, file: Option<&Attachment>) {
 // ---------------------------------------------------------------------------
 // Reports
 
-/// A REPORT line, `REPORT <conv> <seq> [<reason...>]` (5.8), as sent to a
-/// report's reviewers. The report's id is the [`ServerMessage::report`]
-/// tag, and the reported event follows as a [`ServerLine::ReportCopy`].
+/// A REPORT or REPORTENC line (5.8), as sent to a report's reviewers:
+/// `REPORT <conv> <seq> [<reason...>]`, or
+/// `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]` for an ENC
+/// event. The report's id is the [`ServerMessage::report`] tag, and the
+/// reported event follows as a [`ServerLine::ReportCopy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// When the report was made, from the required `t` tag.
@@ -2291,22 +2292,46 @@ pub struct Report {
     pub conv: Conv,
     /// The reported message.
     pub seq: Seq,
+    /// For REPORTENC, the reported ENC event's franking key and decrypted
+    /// content, which reviewers decode to read the message and may check
+    /// against the copy's `frank` ([`Franking::verifies`]). `None` for
+    /// REPORT.
+    pub franking: Option<Franking>,
     /// The reason, escaped, at most 512 bytes; empty if none.
     pub reason: String,
 }
 
 impl Report {
-    fn parse(tags: &Tags, mut p: Params<'_>) -> Result<Report, ParseError> {
+    /// The verb: `REPORTENC` with [`franking`](Self::franking), `REPORT`
+    /// without.
+    pub fn verb(&self) -> &'static str {
+        if self.franking.is_some() {
+            "REPORTENC"
+        } else {
+            "REPORT"
+        }
+    }
+
+    fn parse(encrypted: bool, tags: &Tags, mut p: Params<'_>) -> Result<Report, ParseError> {
         let t = required_tag(tags, "t")?;
         let from = parse_tag(tags, "from")?;
         let conv = token(&mut p)?;
         let seq = token(&mut p)?;
+        let franking = if encrypted {
+            Some(Franking {
+                key: token(&mut p)?,
+                content: token(&mut p)?,
+            })
+        } else {
+            None
+        };
         let reason = text(p, MAX_REPORT_REASON)?;
         Ok(Report {
             t,
             from,
             conv,
             seq,
+            franking,
             reason,
         })
     }
@@ -2317,7 +2342,11 @@ impl Report {
         if let Some(from) = &self.from {
             b.tag("from", from);
         }
-        b.token(&self.conv).token(self.seq).text(&self.reason);
+        b.token(&self.conv).token(self.seq);
+        if let Some(franking) = &self.franking {
+            b.token(franking.key).token(&franking.content);
+        }
+        b.text(&self.reason);
         Ok(())
     }
 }
@@ -2409,6 +2438,7 @@ impl FromStr for Notify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::{Content, FrankKey};
     use crate::types::PushReason;
 
     impl ServerLine {
@@ -3265,6 +3295,42 @@ mod tests {
         };
         assert_eq!(e.meta.as_ref().unwrap().seq, seq(8816));
 
+        // REPORTENC carries the franking key and content of an ENC event.
+        let key = FrankKey::from_bytes([4; 32]);
+        let content = Content::from_bytes(b"TEXT hi\n").unwrap();
+        let line = format!(
+            "@report=w7c1m5;t={T};from=bob@example.net REPORTENC alice@example.org 2 {key} {content} harassment"
+        );
+        let m = round_trip(&line);
+        let ServerLine::Report(r) = &m.line else {
+            panic!()
+        };
+        assert_eq!(m.line.verb(), "REPORTENC");
+        let franking = r.franking.as_ref().unwrap();
+        assert_eq!(franking.key, key);
+        assert_eq!(franking.content.decode(), b"TEXT hi\n");
+        assert_eq!(r.reason, "harassment");
+        round_trip(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2 {key} {content}"
+        ));
+        syntax(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2"
+        ));
+        syntax(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2 {key}"
+        ));
+        syntax(&format!(
+            "@report=w7c1m5;t={T} REPORTENC alice@example.org 2 AAAA {content}"
+        ));
+        syntax(&format!(
+            "@t={T} REPORTENC alice@example.org 2 {key} {content}"
+        ));
+        // Content longer than a normal server line (2.3).
+        let long = Content::from_bytes(&[7; 20_000]).unwrap();
+        let line = format!("@report=w7c1m5;t={T} REPORTENC #a 2 {key} {long}");
+        round_trip(&line);
+        assert_eq!(crate::frame::LineLimits::SERVER.check(&line), Ok(()));
+
         // A REPORT line needs report and t; a copy needs its metadata.
         syntax(&format!("@t={T} REPORT #general 1 spam"));
         syntax("@report=p4 REPORT #general 1 spam");
@@ -3283,6 +3349,7 @@ mod tests {
             from: None,
             conv: Conv::Room(room("#a")),
             seq: seq(2),
+            franking: None,
             reason: String::new(),
         };
         let m = ServerMessage::report_line(id.clone(), report.clone());
@@ -3624,8 +3691,10 @@ mod tests {
         round_trip(&format!(
             "@{meta};frank={frank};file={url};file-type=application/octet-stream;file-size=9 ENC #secret 4 {payload}"
         ));
-        round_trip(&format!("@{meta};frank={frank};deleted ENC #secret 4"));
         round_trip(&format!("@{meta};deleted ENC #secret 4"));
+        // A deleted placeholder drops its frank (5.4).
+        syntax(&format!("@{meta};frank={frank};deleted ENC #secret 4"));
+        syntax(&format!("@{meta};deleted ENC #secret 4 {payload}"));
         syntax(&format!(
             "@{meta};frank={frank};deleted ENC #secret 4 {payload}"
         ));
@@ -3641,22 +3710,61 @@ mod tests {
         syntax(&format!("@frank={frank} ENC #secret 4 {payload}"));
         syntax(&format!("@{meta};frank=AAAA ENC #secret 4 {payload}"));
 
-        // A report copy carries frank-key and content, and no payload.
-        let frank_key = FrankKey::from_bytes([4; 32]);
-        let content = Content::from_bytes(b"TEXT hi\n").unwrap();
-        let copy = format!(
-            "@report=w7c1m5;{meta};frank={frank};frank-key={frank_key};content={content} ENC alice@example.org 1"
-        );
+        // A report copy keeps its frank, and has no payload (5.8).
+        let copy = format!("@report=w7c1m5;{meta};frank={frank} ENC alice@example.org 1");
         let m = round_trip(&copy);
         assert!(m.is_report_copy());
+        let ServerLine::ReportCopy(Event {
+            body: EventBody::Enc(reported),
+            ..
+        }) = &m.line
+        else {
+            panic!("{m:?}")
+        };
+        assert_eq!(reported.frank, Some(frank));
+        assert_eq!(reported.payload, None);
         syntax(&format!(
-            "@report=w7c1m5;{meta};frank={frank};frank-key={frank_key} ENC alice@example.org 1"
+            "@report=w7c1m5;{meta};frank={frank} ENC alice@example.org 1 {payload}"
         ));
+        syntax(&format!("@report=w7c1m5;{meta} ENC alice@example.org 1"));
         syntax(&format!(
-            "@report=w7c1m5;{meta};frank={frank};frank-key={frank_key};content={content} ENC alice@example.org 1 {payload}"
+            "@report=w7c1m5;{meta};deleted ENC alice@example.org 1"
         ));
         // Not outside a report.
         syntax(&copy.replace("report=w7c1m5;", ""));
+        // The tags of draft-02's first report copies are ignored.
+        let old = format!(
+            "@report=w7c1m5;{meta};frank={frank};frank-key=AAAA;content=A ENC alice@example.org 1"
+        );
+        assert_eq!(parse(&old), m);
+        // A reviewer's copy of a live event.
+        let live = Encrypted::new(
+            "alice@example.org".parse::<Uid>().unwrap(),
+            1,
+            payload.parse().unwrap(),
+            frank,
+        );
+        let copy_event = Event::new(
+            parse(&format!("@{meta} MSG #a x")).line.event_meta(),
+            live.for_review().into(),
+        );
+        assert_eq!(
+            ServerMessage::report_copy("w7c1m5".parse().unwrap(), copy_event)
+                .to_line()
+                .to_string(),
+            copy
+        );
+        assert!(
+            ServerMessage::report_copy(
+                "w7c1m5".parse().unwrap(),
+                Event::new(
+                    parse(&format!("@{meta} MSG #a x")).line.event_meta(),
+                    live.into(),
+                )
+            )
+            .try_to_line()
+            .is_err()
+        );
 
         let m = round_trip(&format!("@{meta} COMMIT bob@example.net 1 {commit}"));
         assert!(matches!(

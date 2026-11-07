@@ -32,20 +32,23 @@
 //!   `"KEY FOO"`, so the server replies `ERR unknown-command` (3.8). A
 //!   missing subcommand (`ADMIN` alone) is `BadSyntax`.
 //! - **Tags (3.2).** `ref` applies to every command. MSG also reads
-//!   `reply`, `edit`, `react`, `file` and `cid` (5.3, 5.6, 7.6), ENC reads
-//!   `frank`, `file` and `cid` (12.8), and REPORT reads `frank-key` and
-//!   `content` (5.8). Every other tag is ignored, including those tags on
-//!   other commands. A tag this module reads must have a valid value: a
+//!   `reply`, `edit`, `react`, `file` and `cid` (5.3, 5.6, 7.6), and ENC
+//!   reads `frank`, `file` and `cid` (12.8). Every other tag is ignored,
+//!   including those tags on other commands. A tag this module reads must have a valid value: a
 //!   `ref` or `cid` over 64 bytes is `TooLong`, a missing or malformed
 //!   value is `BadSyntax`.
 //! - **MLS data (Section 12)** is opaque here: KeyPackages, GroupInfo,
 //!   commits, Welcomes, ratchet trees and ENC payloads only have to be
 //!   strict base64 ([`mls`](crate::mls)). Whether they verify is for the
 //!   server's MLS library, which answers `ERR invalid`. For the same
-//!   reason an ENC without `frank`, a payload under 48 bytes, or a
-//!   REPORT of an ENC event without `frank-key` and `content` parse: the
-//!   spec answers them with `ERR invalid`, not `ERR bad-syntax` (5.8,
-//!   12.8).
+//!   reason an ENC without `frank`, and a payload under 48 bytes, parse:
+//!   the spec answers them with `ERR invalid`, not `ERR bad-syntax`
+//!   (3.7, 12.8). A franking commitment or key of the wrong length is
+//!   `BadSyntax` (3.7).
+//! - **Reports (5.8).** REPORT and REPORTENC are one variant,
+//!   [`Command::Report`], whose `franking` is `Some` for REPORTENC. The
+//!   franking key and content are REPORTENC's tokens, after the verb, so
+//!   that the line may be long (2.3).
 //! - **Text stays escaped (3.4).** Text parameters are kept exactly as
 //!   received. Length limits apply to that escaped form and are
 //!   `TooLong`.
@@ -63,8 +66,7 @@
 //!
 //! [`Request::to_line`] writes the canonical form: the verb (and
 //! subcommand) in upper case, single spaces, tags in the order `ref`,
-//! then the relation or `frank` (or `frank-key` and `content`), then
-//! `file`, then `cid`, and options in the order the spec's syntax line
+//! then the relation or `frank`, then `file`, then `cid`, and options in the order the spec's syntax line
 //! lists them. Optional options are left out when
 //! they are absent, and so is `purge=` when it is false.
 //!
@@ -80,8 +82,8 @@ use crate::auth::{PublicKey, Signature};
 use crate::error::ParseError;
 use crate::line::{Line, LineBuilder, Options, Params, Tags};
 use crate::mls::{
-    BackupBlob, Ciphertext, CommitMessage, Content, Frank, FrankKey, GroupInfo, KeyPackage,
-    RatchetTree, Welcome,
+    BackupBlob, Ciphertext, CommitMessage, Frank, Franking, GroupInfo, KeyPackage, RatchetTree,
+    Welcome,
 };
 use crate::names::{BlockTarget, Conv, Id, Identity, Name, Room, Seq, ServerBanTarget, Uid};
 use crate::types::{
@@ -320,21 +322,21 @@ pub enum Command {
     },
     /// `BLOCKS` (5.7): list your blocks.
     Blocks,
-    /// `REPORT <conv> <seq> [<reason...>]` (5.8): report a message.
+    /// `REPORT <conv> <seq> [<reason...>]` or
+    /// `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]` (5.8):
+    /// report a message. REPORTENC reports an ENC event, and reveals its
+    /// content.
     Report {
         /// The conversation.
         conv: Conv,
         /// The reported message.
         seq: Seq,
+        /// For REPORTENC, the message's franking key and decrypted
+        /// content; `None` for REPORT.
+        franking: Option<Franking>,
         /// Why, escaped, at most 512 bytes ([`MAX_REPORT_REASON`]). May be
         /// empty.
         reason: String,
-        /// The `frank-key` tag: for an ENC event, the message's franking
-        /// key (5.8, 12.8).
-        frank_key: Option<FrankKey>,
-        /// The `content` tag: for an ENC event, the message's decrypted
-        /// content (5.8, 12.8).
-        content: Option<Content>,
     },
     /// `REPORTS <room>` (5.8): list a room's open reports.
     Reports {
@@ -792,7 +794,8 @@ pub enum AdminCommand {
 
 impl Command {
     /// The verb, in upper case (3.1). Subcommands share their verb:
-    /// `KEY`, `PUSH`, `KEYPKG`, `WELCOME`, `BACKUP` or `ADMIN`.
+    /// `KEY`, `PUSH`, `KEYPKG`, `WELCOME`, `BACKUP` or `ADMIN`. A
+    /// [`Report`](Self::Report) with `franking` is `REPORTENC`.
     pub fn verb(&self) -> &'static str {
         match self {
             Command::Info { .. } => "INFO",
@@ -807,7 +810,10 @@ impl Command {
             Command::Block { .. } => "BLOCK",
             Command::Unblock { .. } => "UNBLOCK",
             Command::Blocks => "BLOCKS",
-            Command::Report { .. } => "REPORT",
+            Command::Report { franking: None, .. } => "REPORT",
+            Command::Report {
+                franking: Some(_), ..
+            } => "REPORTENC",
             Command::Reports { .. } => "REPORTS",
             Command::Resolve { .. } => "RESOLVE",
             Command::List(_) => "LIST",
@@ -872,7 +878,8 @@ impl Command {
     }
 
     /// Whether a guest may use this command (the "Guests" column of Section
-    /// 13). MSG is allowed to rooms only. The sign-in commands
+    /// 13). MSG is allowed to rooms only, and REPORT but not REPORTENC,
+    /// since guests are never in encrypted conversations. The sign-in commands
     /// ([`signs_in`](Self::signs_in)) give `false`, since a guest has
     /// already signed in. Permissions within a room (6.3) are checked
     /// separately.
@@ -892,7 +899,7 @@ impl Command {
             | Command::Name { .. }
             | Command::Members { .. }
             | Command::Whois { .. }
-            | Command::Report { .. }
+            | Command::Report { franking: None, .. }
             | Command::Ping { .. }
             | Command::Pong { .. }
             | Command::Quit { .. } => true,
@@ -905,6 +912,9 @@ impl Command {
             | Command::Block { .. }
             | Command::Unblock { .. }
             | Command::Blocks
+            | Command::Report {
+                franking: Some(_), ..
+            }
             | Command::Reports { .. }
             | Command::Resolve { .. }
             | Command::Set { .. }
@@ -1265,18 +1275,22 @@ impl Command {
                 Command::Blocks
             }
             // 5.8
-            "REPORT" => {
-                let tags = line.tags();
-                let frank_key = tag_value(tags, "frank-key", "frank-key needs a value")?;
-                let content = tag_value(tags, "content", "content needs a value")?;
+            "REPORT" | "REPORTENC" => {
                 let conv = tok(&mut p)?;
                 let seq = tok(&mut p)?;
+                let franking = if verb == "REPORTENC" {
+                    Some(Franking {
+                        key: tok(&mut p)?,
+                        content: tok(&mut p)?,
+                    })
+                } else {
+                    None
+                };
                 Command::Report {
                     conv,
                     seq,
+                    franking,
                     reason: text_max(p, MAX_REPORT_REASON)?,
-                    frank_key,
-                    content,
                 }
             }
             "REPORTS" => Command::Reports { room: last(p)? },
@@ -1672,17 +1686,14 @@ impl Command {
             Command::Report {
                 conv,
                 seq,
+                franking,
                 reason,
-                frank_key,
-                content,
             } => {
-                if let Some(frank_key) = frank_key {
-                    b.tag("frank-key", frank_key);
+                b.token(conv).token(seq);
+                if let Some(franking) = franking {
+                    b.token(franking.key).token(&franking.content);
                 }
-                if let Some(content) = content {
-                    b.tag("content", content);
-                }
-                b.token(conv).token(seq).text(reason);
+                b.text(reason);
             }
             Command::Upload {
                 size,
@@ -1960,6 +1971,7 @@ impl AdminCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mls::{Content, FrankKey};
     use crate::types::{GuestAccess, MAX_FILE_URL, RoomRetention, ServerRetention};
 
     /// The Appendix B public key and signature.
@@ -2477,9 +2489,8 @@ mod tests {
             Command::Report {
                 conv: Conv::Room(room("#a")),
                 seq: seq(8816),
+                franking: None,
                 reason: "spam".into(),
-                frank_key: None,
-                content: None,
             }
         );
         canon("REPORT #a 8816 ", "REPORT #a 8816");
@@ -2489,41 +2500,58 @@ mod tests {
         is_too_long(&format!("REPORT #a 1 {ok}r"));
         is_syntax("REPORT #a");
         is_syntax("REPORT #a x");
+        // The tags of draft-02's first REPORT are ignored like any other.
+        assert_eq!(
+            cmd("@frank-key=AAAA;content=A REPORT #a 1"),
+            cmd("REPORT #a 1")
+        );
     }
 
     #[test]
     fn report_of_an_enc_event() {
-        let frank_key = FrankKey::from_bytes([9; 32]);
+        let key = FrankKey::from_bytes([9; 32]);
         let content = Content::from_bytes(b"TEXT see you at 12\n").unwrap();
-        let line = format!(
-            "@frank-key={frank_key};content={content} REPORT alice@example.org 2 harassment"
-        );
+        let franking = Franking {
+            key,
+            content: content.clone(),
+        };
+        let line = format!("REPORTENC alice@example.org 2 {key} {content} harassment");
+        let request = rt(&line);
         assert_eq!(
-            rt(&line).command,
+            request.command,
             Command::Report {
                 conv: Conv::Uid(uid("alice@example.org")),
                 seq: seq(2),
+                franking: Some(franking.clone()),
                 reason: "harassment".into(),
-                frank_key: Some(frank_key),
-                content: Some(content.clone()),
             }
         );
-        // Tags in another order are written in the canonical one.
+        assert_eq!(request.command.verb(), "REPORTENC");
+        assert!(!request.command.allowed_for_guests());
         canon(
-            &format!("@ref=4;content={content};frank-key={frank_key} report alice@example.org 2"),
-            &format!("@ref=4;frank-key={frank_key};content={content} REPORT alice@example.org 2"),
+            &format!("@ref=4 reportenc Alice@Example.org 2 {key} {content} "),
+            &format!("@ref=4 REPORTENC alice@example.org 2 {key} {content}"),
         );
-        // Only one of the two parses; the server answers ERR invalid.
-        rt(&format!("@content={content} REPORT #a 2"));
-        // Bad values are syntax errors.
-        is_syntax("@frank-key=AAAA REPORT #a 2");
-        is_syntax("@frank-key REPORT #a 2");
-        is_syntax("@content=A REPORT #a 2");
-        // Content longer than a normal line, as 2.3 allows for REPORT.
-        let long = Content::from_bytes(&[7; 12_000]).unwrap();
-        rt(&format!(
-            "@frank-key={frank_key};content={long} REPORT #a 2"
+        // A reason of up to 512 bytes follows the content.
+        let ok = "r".repeat(MAX_REPORT_REASON);
+        rt(&format!("REPORTENC #a 1 {key} {content} {ok}"));
+        is_too_long(&format!("REPORTENC #a 1 {key} {content} {ok}r"));
+        // The key and content are required, and must be valid base64 of
+        // the right length (3.7).
+        is_syntax("REPORTENC #a 2");
+        is_syntax(&format!("REPORTENC #a 2 {key}"));
+        is_syntax(&format!("REPORTENC #a 2 AAAA {content}"));
+        is_syntax(&format!(
+            "REPORTENC #a 2 {}A {content}",
+            &key.to_string()[..43]
         ));
+        is_syntax(&format!("REPORTENC #a 2 {key} {}", &content.as_str()[1..]));
+        is_syntax(&format!("REPORTENC #a 2 {key} A…"));
+        // Content longer than a normal line, as 2.3 allows for REPORTENC.
+        let long = Content::from_bytes(&[7; 12_000]).unwrap();
+        let line = format!("REPORTENC #a 2 {key} {long} spam");
+        rt(&line);
+        assert_eq!(crate::frame::LineLimits::CLIENT.check(&line), Ok(()));
     }
 
     #[test]

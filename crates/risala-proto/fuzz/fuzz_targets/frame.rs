@@ -60,7 +60,7 @@ fn decode(limits: LineLimits, chunks: &[&[u8]]) -> Output {
         // The bytes held are the start of a line: more than the normal
         // limit's worth only once a long verb has ended.
         let pending = &pushed[pushed.len() - d.pending_bytes()..];
-        if d.pending_bytes() >= limits.normal {
+        if !pending.is_empty() && pending.len() >= limits.normal {
             assert!(long_verb_ends(pending, &limits), "{pending:?}");
         }
         out.extend(std::iter::from_fn(|| d.next_line()));
