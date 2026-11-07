@@ -406,18 +406,23 @@ impl FileKeyStore {
 impl KeyStore for FileKeyStore {
     fn load(&self, id: &str) -> Result<Option<SecretKey>, KeyStoreError> {
         let path = self.path(id)?;
-        let pem = match fs::read_to_string(&path) {
-            Ok(pem) => pem,
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            if fs::metadata(&path)?.permissions().mode() & 0o077 != 0 {
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
                 return Err(KeyStoreError::InsecurePermissions(path));
             }
         }
+        // The PEM holds the secret: wiped when dropped. Room for all of it
+        // up front, so that growing leaves no copy behind.
+        let len = usize::try_from(file.metadata()?.len()).unwrap_or(0);
+        let mut pem = zeroize::Zeroizing::new(String::with_capacity(len.saturating_add(1)));
+        io::Read::read_to_string(&mut file, &mut pem)?;
         SecretKey::from_pkcs8_pem(&pem)
             .map(Some)
             .map_err(|_| KeyStoreError::BadKey(id.to_owned()))
