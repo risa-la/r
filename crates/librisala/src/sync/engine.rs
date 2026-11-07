@@ -57,6 +57,10 @@ struct Live {
     /// When a live line last showed the account joining, in
     /// [`SyncEngine::ticks`].
     joined_at: u64,
+    /// When a live event of the conversation was last handled, in
+    /// [`SyncEngine::ticks`]. A head in a reply to a command sent before
+    /// then may be older than the events stored.
+    event_at: u64,
     /// When a live line last showed the account leaving, or the
     /// conversation changing its id, in [`SyncEngine::ticks`].
     left_at: u64,
@@ -527,6 +531,13 @@ impl SyncEngine {
         self.live(conv).joined_at = now;
     }
 
+    /// Whether a head in the reply to a command sent at `sent` can be
+    /// compared with the newest stored seq (7.1). Not if a live event came
+    /// since: the server may have computed the reply before that event.
+    fn head_is_fresh(&self, conv: &Conv, sent: u64) -> bool {
+        self.convs.get(conv).is_none_or(|l| l.event_at <= sent)
+    }
+
     /// The id of `conv` was learned on this connection.
     fn confirm(&mut self, conv: &Conv, id: Id) {
         let live = self.live(conv);
@@ -548,6 +559,8 @@ impl SyncEngine {
         };
         let conv = event.body.conv();
         let n = meta.seq.get();
+        let now = self.ticks;
+        self.live(&conv).event_at = now;
 
         // 6.4: notifications, not history.
         match &event.body {
@@ -724,10 +737,11 @@ impl SyncEngine {
                 if newer.contains(conv) {
                     continue;
                 }
+                let fresh = self.head_is_fresh(conv, sent);
                 self.write(|tx| {
                     let mut row = tx.conv_or_create(account, conv)?;
                     // 7.1 step 2, and the head check.
-                    tx.learn_id(&mut row, id, Some(head.get()))?;
+                    learn(tx, &mut row, id, Some(head.get()), fresh)?;
                     tx.set_joined(&mut row, true)?;
                     if let Some(read) = read {
                         tx.set_read(&mut row, read.get())?;
@@ -781,10 +795,11 @@ impl SyncEngine {
             && let Ok(Some(id)) = ok.id()
         {
             let head = ok.head().ok().flatten().map(Seq::get);
+            let fresh = self.head_is_fresh(&conv, sent);
             let account = self.account;
             self.write(|tx| {
                 let mut row = tx.conv_or_create(account, &conv)?;
-                tx.learn_id(&mut row, &id, head)?;
+                learn(tx, &mut row, &id, head, fresh)?;
                 tx.set_joined(&mut row, true)?;
                 for msg in &reply.lines {
                     if let ServerLine::Event(e) = &msg.line
@@ -820,6 +835,7 @@ impl SyncEngine {
         {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
             let head = ok.head().ok().flatten().map(Seq::get);
+            let fresh = self.head_is_fresh(&conv, sent);
             let account = self.account;
             self.write(|tx| {
                 let row = if joined {
@@ -831,7 +847,7 @@ impl SyncEngine {
                     return Ok(());
                 };
                 if joined {
-                    tx.learn_id(&mut row, &id, head)?;
+                    learn(tx, &mut row, &id, head, fresh)?;
                     tx.set_joined(&mut row, true)?;
                     for msg in &reply.lines {
                         if let ServerLine::Event(e) = &msg.line
@@ -1331,6 +1347,25 @@ impl SyncEngine {
         }
         Ok(())
     }
+}
+
+/// Learns a conversation's id and head from a reply. The head is checked
+/// against the newest stored seq only if `fresh`.
+fn learn(
+    tx: &mut Tx<'_>,
+    row: &mut ConvRow,
+    id: &Id,
+    head: Option<u64>,
+    fresh: bool,
+) -> Result<bool, StoreError> {
+    if fresh {
+        return tx.learn_id(row, id, head);
+    }
+    let reset = tx.learn_id(row, id, None)?;
+    if let Some(head) = head {
+        tx.note_head(row, head)?;
+    }
+    Ok(reset)
 }
 
 /// The events of a HISTORY or RELATED reply that belong to `conv`.

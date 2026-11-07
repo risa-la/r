@@ -463,6 +463,24 @@ fn joining() {
 }
 
 #[test]
+fn a_stale_head_does_not_discard() {
+    // JOIN's OK was computed at head 5, but the server queued event 6
+    // before it. The head check of 7.1 must not discard on that.
+    let mut h = H::new(ALICE);
+    let r = h.start();
+    h.reply(r, &[], "OK");
+    let out = h.engine.join(&"#general".parse().unwrap());
+    h.absorb(out);
+    let r = h.expect("JOIN #general");
+    h.line(&ev(5, "from=alice@example.org;id=k1 JOIN #general"));
+    h.line(&bob(6));
+    h.reply(r, &[], "OK id=k1 head=5");
+    assert_eq!(h.seqs("#general"), [5, 6]);
+    h.expect("HISTORY #general after=0 limit=50");
+    h.idle();
+}
+
+#[test]
 fn info_checks_the_id() {
     // 6.2: INFO reports the room's id, compared like the others (5.1).
     let mut h = H::new(ALICE);
