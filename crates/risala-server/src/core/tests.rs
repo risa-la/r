@@ -2141,8 +2141,41 @@ impl Store for Flaky {
     fn read_markers(&self, u: &Uid) -> crate::store::Result<Vec<(ConvKey, Seq)>> {
         self.inner.read_markers(u)
     }
-    fn set_read_marker(&self, c: ConvKey, u: &Uid, s: Seq) -> crate::store::Result<Option<Seq>> {
+    fn set_read_marker(
+        &self,
+        c: ConvKey,
+        u: &Uid,
+        s: Seq,
+    ) -> crate::store::Result<Option<crate::store::ReadMarker>> {
         self.inner.set_read_marker(c, u, s)
+    }
+    fn set_display_name(&self, u: &Uid, n: &str) -> crate::store::Result<()> {
+        self.inner.set_display_name(u, n)
+    }
+    fn display_names(
+        &self,
+        u: &[Uid],
+    ) -> crate::store::Result<std::collections::HashMap<Uid, String>> {
+        self.inner.display_names(u)
+    }
+    fn add_block(
+        &self,
+        u: &Uid,
+        b: &risala_proto::names::BlockTarget,
+        m: usize,
+        t: Timestamp,
+    ) -> crate::store::Result<bool> {
+        self.inner.add_block(u, b, m, t)
+    }
+    fn remove_block(
+        &self,
+        u: &Uid,
+        b: &risala_proto::names::BlockTarget,
+    ) -> crate::store::Result<()> {
+        self.inner.remove_block(u, b)
+    }
+    fn blocks(&self, u: &Uid) -> crate::store::Result<Vec<risala_proto::names::BlockTarget>> {
+        self.inner.blocks(u)
     }
 }
 

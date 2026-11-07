@@ -19,10 +19,11 @@
 mod schema;
 mod sqlite;
 
+use std::collections::HashMap;
 use std::fmt;
 
 use risala_proto::auth::PublicKey;
-use risala_proto::names::{Id, Room, Seq, Uid};
+use risala_proto::names::{BlockTarget, Id, Room, Seq, Uid};
 use risala_proto::server::{Attachment, Event, EventBody, EventMeta, Message};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
@@ -562,9 +563,48 @@ pub trait Store: Send + Sync + 'static {
 
     /// Moves the read marker of `uid` in a conversation forward to `seq`,
     /// or to the conversation's head if `seq` is beyond it (7.4). A lower
-    /// value changes nothing. Returns the marker as it now is, or `None`
-    /// if the conversation has no events.
-    fn set_read_marker(&self, conv: ConvKey, uid: &Uid, seq: Seq) -> Result<Option<Seq>>;
+    /// value changes nothing. Returns the marker as it now is, and whether
+    /// it moved, or `None` if the conversation has no events and so no
+    /// marker.
+    fn set_read_marker(&self, conv: ConvKey, uid: &Uid, seq: Seq) -> Result<Option<ReadMarker>>;
+
+    // ---- Display names (8.2) ----
+
+    /// Sets the display name of the identity `uid`, escaped (3.4); empty
+    /// clears it. An identity the server does not know is left alone.
+    fn set_display_name(&self, uid: &Uid, name: &str) -> Result<()>;
+
+    /// The display names of those of `uids` that are known identities and
+    /// have one, escaped.
+    fn display_names(&self, uids: &[Uid]) -> Result<HashMap<Uid, String>>;
+
+    // ---- Blocks (5.7) ----
+
+    /// Adds `target` to the blocks of `uid`, unless the account already has
+    /// `max` others. Returns `false` if it has, and stored nothing. A block
+    /// the account has already is kept, and counts as done.
+    fn add_block(
+        &self,
+        uid: &Uid,
+        target: &BlockTarget,
+        max: usize,
+        now: Timestamp,
+    ) -> Result<bool>;
+
+    /// Removes `target` from the blocks of `uid`, if it is there.
+    fn remove_block(&self, uid: &Uid, target: &BlockTarget) -> Result<()>;
+
+    /// The blocks of `uid`, in the byte order of their wire form.
+    fn blocks(&self, uid: &Uid) -> Result<Vec<BlockTarget>>;
+}
+
+/// A read marker after [`Store::set_read_marker`] (7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadMarker {
+    /// The marker now.
+    pub seq: Seq,
+    /// Whether this call moved it.
+    pub moved: bool,
 }
 
 /// An identity the server knows (5.1).

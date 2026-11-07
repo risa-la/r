@@ -1,5 +1,6 @@
 //! The SQLite implementation of [`Store`].
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
@@ -8,7 +9,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use risala_proto::auth::PublicKey;
-use risala_proto::names::{Id, Room, Seq, Uid};
+use risala_proto::names::{BlockTarget, Id, Room, Seq, Uid};
 use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
@@ -16,8 +17,8 @@ use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 use super::schema;
 use super::{
     Appended, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, HostedKey, IdentityRecord,
-    KeyChange, NewEvent, Page, Registered, Result, RoomRecord, RoomSettings, ServerSettings, Store,
-    StoreError, StoredEvent, random_id,
+    KeyChange, NewEvent, Page, ReadMarker, Registered, Result, RoomRecord, RoomSettings,
+    ServerSettings, Store, StoreError, StoredEvent, random_id,
 };
 
 /// How long a statement waits for another process's lock before failing.
@@ -1089,26 +1090,110 @@ impl Store for SqliteStore {
             .collect()
     }
 
-    fn set_read_marker(&self, conv: ConvKey, uid: &Uid, s: Seq) -> Result<Option<Seq>> {
+    fn set_read_marker(&self, conv: ConvKey, uid: &Uid, s: Seq) -> Result<Option<ReadMarker>> {
         self.write(|tx| {
             let head: i64 = tx
                 .prepare_cached("SELECT head FROM conversations WHERE conv = ?")?
                 .query_row([conv.0], |row| row.get(0))
                 .optional()?
                 .ok_or(StoreError::NoConversation)?;
+            let before: Option<i64> = tx
+                .prepare_cached("SELECT seq FROM read_markers WHERE conv = ? AND uid = ?")?
+                .query_row(params![conv.0, uid.as_str()], |row| row.get(0))
+                .optional()?;
             let target = sql_seq(s).min(head);
-            if target >= 1 {
+            let now = before.unwrap_or(0).max(target);
+            if now < 1 {
+                return Ok(None);
+            }
+            let moved = before != Some(now);
+            if moved {
                 tx.execute(
                     "INSERT INTO read_markers (conv, uid, seq) VALUES (?1, ?2, ?3) \
-                     ON CONFLICT (conv, uid) DO UPDATE SET seq = MAX(seq, ?3)",
-                    params![conv.0, uid.as_str(), target],
+                     ON CONFLICT (conv, uid) DO UPDATE SET seq = ?3",
+                    params![conv.0, uid.as_str(), now],
                 )?;
             }
-            tx.prepare_cached("SELECT seq FROM read_markers WHERE conv = ? AND uid = ?")?
-                .query_row(params![conv.0, uid.as_str()], |row| row.get::<_, i64>(0))
-                .optional()?
-                .map(seq)
-                .transpose()
+            Ok(Some(ReadMarker {
+                seq: seq(now)?,
+                moved,
+            }))
         })
+    }
+
+    fn set_display_name(&self, uid: &Uid, name: &str) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE identities SET display_name = ?2 WHERE uid = ?1",
+                params![uid.as_str(), name],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn display_names(&self, uids: &[Uid]) -> Result<HashMap<Uid, String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(
+            "SELECT display_name FROM identities WHERE uid = ? AND display_name != ''",
+        )?;
+        let mut names = HashMap::new();
+        for uid in uids.iter().filter(|u| u.is_identity()) {
+            if let Some(name) = stmt
+                .query_row([uid.as_str()], |row| row.get::<_, String>(0))
+                .optional()?
+            {
+                names.insert(uid.clone(), name);
+            }
+        }
+        Ok(names)
+    }
+
+    fn add_block(
+        &self,
+        uid: &Uid,
+        target: &BlockTarget,
+        max: usize,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let target = target.to_string();
+        self.write(|tx| {
+            let exists = tx
+                .prepare_cached("SELECT 1 FROM blocks WHERE uid = ? AND target = ?")?
+                .query_row(params![uid.as_str(), target], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if exists {
+                return Ok(true);
+            }
+            let count: i64 = tx
+                .prepare_cached("SELECT COUNT(*) FROM blocks WHERE uid = ?")?
+                .query_row([uid.as_str()], |row| row.get(0))?;
+            if usize::try_from(count).unwrap_or(usize::MAX) >= max {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO blocks (uid, target, t) VALUES (?1, ?2, ?3)",
+                params![uid.as_str(), target, ms(now)],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn remove_block(&self, uid: &Uid, target: &BlockTarget) -> Result<()> {
+        self.write(|tx| {
+            tx.execute(
+                "DELETE FROM blocks WHERE uid = ? AND target = ?",
+                params![uid.as_str(), target.to_string()],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn blocks(&self, uid: &Uid) -> Result<Vec<BlockTarget>> {
+        self.conn()
+            .prepare_cached("SELECT target FROM blocks WHERE uid = ? ORDER BY target")?
+            .query_map([uid.as_str()], |row| row.get::<_, String>(0))?
+            .map(|target| parse("block", &target?))
+            .collect()
     }
 }

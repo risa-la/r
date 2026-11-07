@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use risala_proto::names::{Conv, Id, Room, Seq, Uid};
+use risala_proto::names::{BlockTarget, Conv, Id, Room, Seq, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
     GuestAccess, Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting,
@@ -1034,6 +1034,7 @@ fn forgetting_an_identity() {
 fn read_markers_only_move_forward_and_stop_at_the_head() {
     let (store, general) = store_with_room();
     let alice = uid("alice@example.org");
+    let marker = |n: u64, moved: bool| Some(ReadMarker { seq: seq(n), moved });
     // No events yet: no marker.
     assert_eq!(
         store.set_read_marker(general, &alice, seq(3)).unwrap(),
@@ -1046,15 +1047,94 @@ fn read_markers_only_move_forward_and_stop_at_the_head() {
     }
     assert_eq!(
         store.set_read_marker(general, &alice, seq(3)).unwrap(),
-        Some(seq(3))
+        marker(3, true)
+    );
+    assert_eq!(
+        store.set_read_marker(general, &alice, seq(3)).unwrap(),
+        marker(3, false)
     );
     assert_eq!(
         store.set_read_marker(general, &alice, seq(2)).unwrap(),
-        Some(seq(3))
+        marker(3, false)
     );
     assert_eq!(
         store.set_read_marker(general, &alice, seq(99)).unwrap(),
-        Some(seq(5))
+        marker(5, true)
+    );
+    assert_eq!(
+        store.set_read_marker(general, &alice, seq(99)).unwrap(),
+        marker(5, false)
     );
     assert_eq!(store.read_markers(&alice).unwrap(), [(general, seq(5))]);
+}
+
+#[test]
+fn display_names_belong_to_known_identities() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let (alice, bob) = (uid("alice@example.org"), uid("bob@example.net"));
+    store.touch_identity(&alice, t(1)).unwrap();
+    store.touch_identity(&bob, t(1)).unwrap();
+    store.set_display_name(&alice, "Alice Martin").unwrap();
+    // Unknown identities are left alone.
+    store
+        .set_display_name(&uid("carol@example.com"), "Carol")
+        .unwrap();
+    let all = [
+        alice.clone(),
+        bob.clone(),
+        uid("carol@example.com"),
+        uid("~sam"),
+    ];
+    let names = store.display_names(&all).unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[&alice], "Alice Martin");
+    assert_eq!(
+        store.identity(&alice).unwrap().unwrap().display_name,
+        "Alice Martin"
+    );
+    // Empty clears it.
+    store.set_display_name(&alice, "").unwrap();
+    assert!(store.display_names(&all).unwrap().is_empty());
+}
+
+#[test]
+fn blocks_are_kept_per_account_up_to_a_limit() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let (alice, bob) = (uid("alice@example.org"), uid("bob@example.net"));
+    let target = |s: &str| s.parse::<BlockTarget>().unwrap();
+    assert!(store.blocks(&alice).unwrap().is_empty());
+    assert!(
+        store
+            .add_block(&alice, &target("spam@example.net"), 2, t(1))
+            .unwrap()
+    );
+    assert!(
+        store
+            .add_block(&alice, &target("*@bad.example"), 2, t(1))
+            .unwrap()
+    );
+    // A third is over the limit, but one it has already counts as done.
+    assert!(
+        !store
+            .add_block(&alice, &target("x@example.com"), 2, t(1))
+            .unwrap()
+    );
+    assert!(
+        store
+            .add_block(&alice, &target("spam@example.net"), 2, t(1))
+            .unwrap()
+    );
+    assert_eq!(
+        store.blocks(&alice).unwrap(),
+        [target("*@bad.example"), target("spam@example.net")]
+    );
+    assert!(store.blocks(&bob).unwrap().is_empty());
+    store
+        .remove_block(&alice, &target("*@bad.example"))
+        .unwrap();
+    // Removing one it does not have changes nothing.
+    store
+        .remove_block(&alice, &target("*@bad.example"))
+        .unwrap();
+    assert_eq!(store.blocks(&alice).unwrap(), [target("spam@example.net")]);
 }
