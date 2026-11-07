@@ -759,10 +759,21 @@ impl SyncEngine {
     }
 
     /// DROP (10.4). One whose `id` is not the stored id is about an older
-    /// room of the same name, and is ignored. One with no `id` is taken to
-    /// be about the stored room.
+    /// room of the same name: the stored history stays, and nothing is
+    /// reported. One with no `id` is taken to be about the stored room.
+    ///
+    /// Either way, this connection forgets the dropped id if it had
+    /// confirmed it, and replies to commands sent before the DROP may name
+    /// it, so they are out of date. Another process sharing the cache may
+    /// have stored the new room's id while this connection still had the
+    /// old one.
     fn on_drop(&mut self, id: Option<&Id>, room: &Room, reason: &str) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
+        self.touch_left(&conv);
+        let live = self.live(&conv);
+        if id.is_none_or(|id| live.confirmed.as_ref() == Some(id)) {
+            live.confirmed = None;
+        }
         let account = self.account;
         let ours = self.write(|tx| {
             let row = tx.conv_by_name(account, &conv)?;
@@ -781,7 +792,6 @@ impl SyncEngine {
             return Ok(());
         }
         self.live(&conv).confirmed = None;
-        self.touch_left(&conv);
         self.out.notifications.push(Notification::Dropped {
             room: room.clone(),
             reason: reason.to_owned(),

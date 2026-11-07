@@ -783,6 +783,40 @@ fn a_drop_for_another_id_is_ignored() {
 }
 
 #[test]
+fn a_drop_for_an_older_id_still_ends_it_on_this_connection() {
+    // Found by the simulation. A sends JOIN #general; the server creates
+    // the room as k1. The room is dropped, and another device of the same
+    // identity creates it again as k2, which B, sharing the cache, stores.
+    // A's DROP of k1 leaves the stored k2 alone, but A must forget k1 and
+    // not trust its JOIN reply, computed before the DROP, which names k1.
+    let mut a = H::new(ALICE);
+    let r = a.start();
+    a.reply(r, &[], "OK");
+    let out = a.engine.join(&"#general".parse().unwrap());
+    a.absorb(out);
+    let join = a.expect("JOIN #general");
+    a.line(&ev(1, "from=alice@example.org;id=k1 JOIN #general"));
+    assert_eq!(a.conv("#general").conv_id, Some("k1".parse().unwrap()));
+
+    let mut b = H::sharing(&a);
+    let rb = b.start();
+    b.reply(rb, &[], "OK");
+    b.line(&ev(1, "from=alice@example.org;id=k2 JOIN #general"));
+    assert_eq!(a.conv("#general").conv_id, Some("k2".parse().unwrap()));
+
+    a.line("@id=k1 DROP #general");
+    assert!(!a.engine.is_live(&conv("#general")));
+    assert!(a.notes.is_empty());
+    a.line(&ev(1, "from=alice@example.org;id=k2 JOIN #general"));
+    a.reply(join, &[], "OK id=k1 head=1");
+    // The stale reply changed nothing; SYNC settles it.
+    assert_eq!(a.conv("#general").conv_id, Some("k2".parse().unwrap()));
+    a.expect("SYNC");
+    a.line(&ev(2, "from=alice@example.org PART #general"));
+    assert_eq!(a.conv("#general").conv_id, Some("k2".parse().unwrap()));
+}
+
+#[test]
 fn a_page_after_starting_afresh_is_ignored() {
     // The model's note for client authors: remember what HISTORY was asked
     // for.
