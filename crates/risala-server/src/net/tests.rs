@@ -368,6 +368,39 @@ async fn any_line_resets_the_timers() {
     assert_eq!(verbs, ["PING", "PONG"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_long_line_resets_the_timers_only_at_its_end() {
+    // `ERR too-long` comes as soon as the line is known to be too long,
+    // but the line counts as received only when its LF arrives (2.3, 11;
+    // PLAN.md 5, item 16).
+    let mut pipe = Pipe::greeted(Stub::new()).await;
+    let start = Instant::now();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let mut long = b"@ref=L PING ".to_vec();
+    long.extend(std::iter::repeat_n(
+        b'x',
+        risala_proto::frame::MAX_CLIENT_LINE,
+    ));
+    pipe.send(&long).await;
+    pipe.expect("@ref=L ERR too-long too long").await;
+    assert_eq!(start.elapsed(), Duration::from_secs(60));
+    // More of the same line, still with no LF.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    pipe.send(&[b'x'; 100]).await;
+    // Nothing complete has arrived since the greeting.
+    pipe.expect_prefix("PING ").await;
+    assert_eq!(start.elapsed(), TIMERS.idle_ping);
+
+    // The LF ends the line: both timers start again.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    pipe.send(b"xx\n").await;
+    let lf = Instant::now();
+    pipe.expect_prefix("PING ").await;
+    assert_eq!(lf.elapsed(), TIMERS.idle_ping);
+    pipe.expect("BYE ping timeout").await;
+    pipe.expect_end().await;
+}
+
 impl Pipe {
     fn commands(stub: &Stub) -> Vec<Request> {
         stub.commands.lock().unwrap().clone()

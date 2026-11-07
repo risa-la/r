@@ -137,10 +137,16 @@ where
     let mut decoder = LineDecoder::new(MAX_CLIENT_LINE);
     let mut buf = vec![0u8; READ_BUF];
     let mut keepalive = Keepalive::new(timers, Instant::now());
+    let mut long_line = LongLine::default();
     loop {
         while let Some((line, ref_)) = decoder.next_line_with_ref() {
-            // Any line, even an empty or bad one, resets the timers (11).
-            keepalive.activity(Instant::now());
+            // Any complete line, even an empty or bad one, resets the timers
+            // (11). A line reported as too long before its end is complete
+            // only once its LF arrives (2.3).
+            let too_long = matches!(line, Err(ParseError::TooLong));
+            if long_line.taken(too_long, decoder.is_discarding()) {
+                keepalive.activity(Instant::now());
+            }
             if writer.is_finished() {
                 return Ended::Writer;
             }
@@ -188,7 +194,12 @@ where
             }
             read = rd.read(&mut buf) => match read {
                 Ok(0) => return Ended::Eof,
-                Ok(n) => decoder.push(&buf[..n]),
+                Ok(n) => {
+                    decoder.push(&buf[..n]);
+                    if long_line.pushed(decoder.is_discarding()) {
+                        keepalive.activity(Instant::now());
+                    }
+                }
                 Err(e) => {
                     tracing::debug!(conn = id.0, error = %e, "read failed");
                     return Ended::Eof;
@@ -327,6 +338,47 @@ where
     }
 }
 
+/// Follows a line that [`LineDecoder`] reports as too long before its LF
+/// has arrived, so that the line resets the keepalive timers only when it
+/// ends (2.3, 11; PLAN.md 5, item 16).
+///
+/// The decoder reports such a line as soon as it is known to be too long,
+/// and then discards bytes up to and including the LF, without reporting
+/// the LF. So a `TooLong` taken while the decoder is discarding is early,
+/// and the line has ended once the decoder stops discarding, or yields
+/// anything after it.
+#[derive(Debug, Default)]
+struct LongLine {
+    /// An early `TooLong` was taken, and its LF has not been seen yet.
+    waiting: bool,
+}
+
+impl LongLine {
+    /// For each item taken from the decoder: whether a line has ended.
+    /// `too_long` says whether the item is a `TooLong` error, and
+    /// `discarding` is [`LineDecoder::is_discarding`] after taking it.
+    fn taken(&mut self, too_long: bool, discarding: bool) -> bool {
+        // While the decoder discards, the last item it holds is the
+        // `TooLong` that started the discarding. An earlier `TooLong`
+        // could look the same, but then this item follows it, and so ends
+        // the line it waits for.
+        let early = too_long && discarding;
+        let ended = !early || self.waiting;
+        self.waiting = early;
+        ended
+    }
+
+    /// After bytes are pushed into the decoder: whether they ended the line
+    /// that was reported early.
+    fn pushed(&mut self, discarding: bool) -> bool {
+        let ended = self.waiting && !discarding;
+        if ended {
+            self.waiting = false;
+        }
+        ended
+    }
+}
+
 /// What a keepalive deadline means when it passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expired {
@@ -405,6 +457,35 @@ mod tests {
         k.activity(later);
         assert_eq!(k.deadline(), later + t.idle_ping);
         assert_eq!(k.expired(later + t.idle_ping), Some(Expired::Ping));
+    }
+
+    #[test]
+    fn long_lines_end_at_their_lf() {
+        fn activity(d: &mut LineDecoder, l: &mut LongLine, bytes: &[u8]) -> usize {
+            d.push(bytes);
+            let mut n = usize::from(l.pushed(d.is_discarding()));
+            while let Some((line, _)) = d.next_line_with_ref() {
+                let too_long = matches!(line, Err(ParseError::TooLong));
+                n += usize::from(l.taken(too_long, d.is_discarding()));
+            }
+            n
+        }
+        let mut d = LineDecoder::new(8);
+        let mut l = LongLine::default();
+        // Lines that end at once count at once, too long or not.
+        assert_eq!(activity(&mut d, &mut l, b"ab\n\n0123456789\n"), 3);
+        // A long line counts only when its LF arrives.
+        assert_eq!(activity(&mut d, &mut l, b"0123456789"), 0);
+        assert_eq!(activity(&mut d, &mut l, b"0123456789"), 0);
+        assert_eq!(activity(&mut d, &mut l, b"01\n"), 1);
+        assert_eq!(activity(&mut d, &mut l, b"ab\n"), 1);
+        // Its LF, and the start of another long line, in one push.
+        assert_eq!(activity(&mut d, &mut l, b"0123456789"), 0);
+        assert_eq!(activity(&mut d, &mut l, b"\n0123456789"), 1);
+        assert_eq!(activity(&mut d, &mut l, b"89\nab\n"), 2);
+        // A long line that ends, then one that does not.
+        assert_eq!(activity(&mut d, &mut l, b"0123456789\n0123456789"), 1);
+        assert_eq!(activity(&mut d, &mut l, b"\n"), 1);
     }
 
     #[test]
