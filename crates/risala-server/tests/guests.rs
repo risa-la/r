@@ -8,6 +8,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::{Session, command, put, recv, settled, until_closed, value};
 use risala_proto::types::{GuestAccess, RoomSetting};
 use risala_server::config::Limits;
@@ -51,6 +53,26 @@ fn default_settings(who: &str, room: &str) -> String {
          {who} S: SET {room} guests write
          {who} S: SET {room} retention server"
     )
+}
+
+/// Signs in as `~<name>` once the name is free.
+///
+/// A closing guest's PARTs are recorded before its name is given up, so a
+/// client that has just seen them can still get `name-taken` for a moment
+/// (4.2). It tries again, as the spec says clients should.
+async fn guest_once_free(server: &TestServer, name: &str) -> TestClient {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut c = server.connect().await;
+        assert!(recv(&mut c).await.starts_with("RISALA 1 "));
+        let answer = command(&mut c, &format!("guest {name}")).await;
+        if answer == [format!("OK uid=~{name}")] {
+            return c;
+        }
+        assert!(answer[0].starts_with("ERR name-taken"), "{answer:?}");
+        assert!(Instant::now() < deadline, "~{name} is still taken");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Joins `room` and returns its id.
@@ -199,6 +221,70 @@ async fn two_guests_chat() {
     server.stop().await;
 }
 
+/// Three guests post at once, each sending all its lines without waiting.
+/// Everyone gets every event once, in one order with no gaps (5.2), and
+/// each poster gets its own event before its `OK` (3.6).
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_posters_see_one_order() {
+    const EACH: usize = 50;
+    let server = TestServer::builder().room("#general").start().await;
+    let mut clients = Vec::new();
+    for name in ["a", "b", "c"] {
+        let mut c = server.guest(name).await;
+        join(&mut c, "#general").await;
+        clients.push(c);
+    }
+    // Seq 1 to 3 are the JOINs. Read the JOINs of later guests first.
+    for (i, c) in clients.iter_mut().enumerate() {
+        for _ in i + 1..3 {
+            assert!(recv(c).await.ends_with(" JOIN #general"));
+        }
+    }
+    let tasks: Vec<_> = clients
+        .into_iter()
+        .zip(["a", "b", "c"])
+        .map(|(mut c, name)| {
+            tokio::spawn(async move {
+                let mut batch = String::new();
+                for n in 0..EACH {
+                    batch.push_str(&format!("msg #general {name}{n}\n"));
+                }
+                c.send_raw(batch.as_bytes()).await.unwrap();
+                // (seq, line without its time) of every event, in order.
+                let mut events = Vec::new();
+                let mut oks = 0;
+                while oks < EACH || events.len() < 3 * EACH {
+                    let line = recv(&mut c).await;
+                    if let Some(seq) = line.strip_prefix("OK seq=") {
+                        // The poster's own event came first.
+                        let seq: u64 = seq.parse().unwrap();
+                        let (last_seq, last): &(u64, String) = events.last().unwrap();
+                        assert!(*last_seq >= seq);
+                        let own = events.iter().find(|(s, _)| *s == seq).unwrap();
+                        assert!(own.1.starts_with(&format!("~{name} ")), "{own:?} {last}");
+                        oks += 1;
+                        continue;
+                    }
+                    let seq: u64 = value(&line, "seq").parse().unwrap();
+                    let text = line.split_once(' ').unwrap().1.to_owned();
+                    events.push((seq, format!("{} {text}", value(&line, "from"))));
+                }
+                settled(&mut c).await;
+                events
+            })
+        })
+        .collect();
+    let mut all = Vec::new();
+    for task in tasks {
+        all.push(task.await.unwrap());
+    }
+    let seqs: Vec<u64> = all[0].iter().map(|(s, _)| *s).collect();
+    assert_eq!(seqs, (4..4 + 3 * EACH as u64).collect::<Vec<_>>());
+    assert_eq!(all[0], all[1]);
+    assert_eq!(all[0], all[2]);
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn join_again_part_and_come_back() {
     let server = TestServer::builder().room("#general").start().await;
@@ -301,7 +387,7 @@ async fn a_guest_leaves_its_rooms_when_it_disconnects() {
 
     // The names are free again, and the PARTs are history.
     for name in ["bob", "carl", "dan"] {
-        server.guest(name).await;
+        guest_once_free(&server, name).await;
     }
     s.play(
         "alice C: history #general after=2
@@ -779,6 +865,57 @@ async fn signing_in_has_a_time_limit() {
     // A guest that signed in stays.
     settled(&mut quick).await;
     server.stop().await;
+}
+
+/// The longest line a client may send (2.3) is relayed with the server's
+/// tags. One byte more gets `too-long`, and the connection goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_longest_message_is_relayed() {
+    let server = TestServer::builder().room("#general").start().await;
+    let mut sam = server.guest("sam").await;
+    join(&mut sam, "#general").await;
+    let prefix = "msg #general ";
+    // 8192 bytes with the LF.
+    let text = "é".repeat((8191 - prefix.len()) / 2) + &"x".repeat((8191 - prefix.len()) % 2);
+    let line = format!("{prefix}{text}");
+    assert_eq!(line.len() + 1, risala_proto::frame::MAX_CLIENT_LINE);
+    let answer = command(&mut sam, &line).await;
+    assert_eq!(answer.len(), 2, "{answer:?}");
+    assert!(answer[0].ends_with(&format!(";from=~sam MSG #general {text}")));
+    assert_eq!(answer[1], "OK seq=2");
+    let answer = command(&mut sam, &format!("{line}x")).await;
+    assert!(answer[0].starts_with("ERR too-long"), "{answer:?}");
+    settled(&mut sam).await;
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------
+// The test server itself
+
+/// Stopping a test server, or dropping it, deletes its directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_servers_clean_up() {
+    let server = TestServer::start().await;
+    let dir = server.state_dir().to_owned();
+    assert!(dir.join("risala.db").exists());
+    server.stop().await;
+    assert!(!dir.exists());
+
+    let server = TestServer::start().await;
+    let dir = server.state_dir().to_owned();
+    let mut c = server.guest("sam").await;
+    drop(server);
+    // The server stops in the background, closing connections.
+    assert_eq!(until_closed(&mut c).await, ["BYE server shutting down"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dir.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} is still there",
+            dir.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // ---------------------------------------------------------------------
