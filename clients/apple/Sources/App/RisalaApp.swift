@@ -12,6 +12,11 @@ struct RisalaApp: App {
                 .preferredColorScheme(appearance.colorScheme)
                 #if os(macOS)
                     .frame(minWidth: 640, minHeight: 420)
+                    // The title bar blends into the window surface, as in the
+                    // mockups; panes carry their own breadcrumb headings.
+                    .toolbar(removing: .title)
+                    .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+                    .containerBackground(.surface, for: .window)
                 #endif
         }
         .defaultSize(width: 900, height: 600)
