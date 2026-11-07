@@ -182,8 +182,9 @@ upgrade step.
   `openssl s_client` offers it by default from OpenSSL 3.5 on.
 - The client MUST send the server's hostname using Server Name Indication
   (SNI) [RFC6066]. The server uses this name to choose its certificate.
-  The name is also what authentication is bound to (Section 4.5). A
-  client that connects to a bare IP address cannot send SNI, and so
+  The name is also what authentication is bound to, and a server
+  accepts sign-ins only on connections whose SNI names it (Section 4.5).
+  A client that connects to a bare IP address cannot send SNI, and so
   cannot sign in as an identity.
 - Clients SHOULD offer the ALPN [RFC7301] protocol identifier
   `risala/1`. Servers MUST accept connections that offer no ALPN, so that
@@ -342,7 +343,7 @@ its command.
 | `file-size` | server | bytes | The attached file's size (5.6) |
 | `cid` | client | tag value, at most 64 bytes | Client message id for safe resending (7.6) |
 | `deleted` | server | none | The event's content was removed (5.4) |
-| `retry` | server | seconds | With `ERR rate-limited`: when to try again |
+| `retry` | server | seconds | With `ERR rate-limited` or `ERR unavailable`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
 | `id` | server | id | On a JOIN event or a DROP line: the room's id (6.1, 10.4) |
 | `frank` | client | base64 | On ENC: the franking commitment (12.8) |
@@ -478,9 +479,11 @@ ERR <code> [<message...>]
   conversation, meaning a CONV line from SYNC or the `OK` of JOIN or
   `INFO <room>`, agrees with the live events the connection receives.
   Every event of that conversation sent to the connection before the
-  line is covered by it, and every event sent after it is newer. A
-  server does this by queuing the line while no event of that
-  conversation can be queued.
+  line is covered by it, and every event sent after it is newer. The
+  same holds for read markers: the `<read>` on a CONV line covers every
+  READ line (7.4) for that conversation sent to the connection before
+  it. A server does this by queuing the line while no event or READ
+  line of that conversation can be queued.
 - **Live events.** Events that a command causes, such as the event a MSG
   creates, are not part of its response. They go to every connection in
   the conversation without `ref`. The connection that sent the command
@@ -502,7 +505,7 @@ S: @ref=7 OK id=k3f9q2 more=1
 | `too-long` | The line or one of its parameters is too long, or a file is too large |
 | `not-authenticated` | The command needs GUEST, AUTH or REGISTER first |
 | `already-authenticated` | This connection is already a guest or signed in |
-| `auth-failed` | The signature did not verify, or the key file could not be fetched |
+| `auth-failed` | The signature did not verify against the identity's keys, or the connection's SNI does not name this server (4.5) |
 | `name-taken` | The guest name or identity name is already in use |
 | `not-found` | The room, user or message does not exist, or is not visible to you |
 | `forbidden` | Not allowed because of permissions, a ban or server policy |
@@ -512,6 +515,7 @@ S: @ref=7 OK id=k3f9q2 more=1
 | `stale` | The conversation's group is not in the state the command needs. Apply the newer commits, or commit pending removals, and try again (12.5, 12.6) |
 | `invalid` | MLS data or a franking commitment did not verify, or a required franking commitment or key is missing (5.8, Section 12) |
 | `rate-limited` | Too many requests. The `retry` tag says when to try again |
+| `unavailable` | The server could not get the identity's key file, so it could not check the signature. Try again later (4.5) |
 | `internal` | Something went wrong on the server |
 
 A name, room, id, text, URL or tag value that follows its grammar except
@@ -590,6 +594,12 @@ time. For this reason guests:
   it MUST record them when it starts again, with the time it records
   them as `t`. Sessions do not survive a restart.
 
+Since guests have no direct conversations, a conversation named by a uid
+does not exist for a guest. Any command from a guest that names a uid as
+its `<conv>`, such as MSG, HISTORY or TYPING, gets `ERR not-found`.
+Commands that guests may not use at all still get `ERR forbidden`
+(Section 13).
+
 **Resuming.** The token in GUEST's `OK` lets a guest come back after its
 connection closes, for example after a network drop, or after a phone
 app sends QUIT as it goes to the background (9.2):
@@ -650,11 +660,18 @@ mldsa44 <key> [<label...>]
 - `<key>` is the 1312-byte ML-DSA-44 public key [FIPS204], in base64
   with padding [RFC4648]. It is 1752 characters long.
 - `<label...>` is an optional note for people, usually the name of the
-  device.
+  device. It is at most 64 bytes. A line whose label is longer counts as
+  malformed, and is ignored.
 - Blank lines and lines starting with `#` are ignored. A line that is
   not valid UTF-8 counts as malformed, and is ignored too.
 - Lines with a key type other than `mldsa44` are ignored, so that new key
   types can be added later.
+
+A key line is therefore at most 1827 bytes, CRLF included: 7 for
+`mldsa44`, a space, 1752 for the key, a space, 64 for the label and 2
+for the line ending. So 64 keys take at most 116,928 bytes, less than
+half of the 256 KiB a fetch reads (below), which leaves room for
+comments.
 
 Each device SHOULD have its own key. A device's key is also its key in
 encrypted conversations (12.2). Revoking a lost device's key means
@@ -675,10 +692,8 @@ device fetches a key file:
 
 - It MUST use HTTPS with TLS 1.3, and validate the certificate against
   public certificate authorities.
-- It MUST NOT follow redirects. Only a 200 response counts. Any other
-  response means the identity has no keys.
-- It MUST stop after 10 seconds or 256 KiB. A file that is larger, or
-  that does not arrive in time, means the identity has no keys.
+- It MUST NOT follow redirects.
+- It MUST stop after 10 seconds or 256 KiB.
 - It MUST use at most 64 keys: the first 64 different, valid `mldsa44`
   keys in the file. Repeated keys, malformed lines and ignored lines do
   not count toward the 64.
@@ -689,14 +704,25 @@ device fetches a key file:
 - It MAY cache the file for up to one hour. If a signature does not
   verify against a cached file, it SHOULD fetch the file again once
   before failing, so that a newly added device works straight away.
-- If a fetch fails because no response arrives, for example a timeout
-  or a DNS or TLS error, a cached copy stays valid until its hour is
-  up. Any response other than 200 replaces it, and the identity then
-  has no keys.
 
-A server that notices a key has been removed SHOULD close the
-connections that signed in with it. It notices this only from a key file
-it has fetched. A fetch that fails is not a reason to close anything.
+A fetch has one of three outcomes:
+
+- **A key file.** A 200 response whose body arrives within the limits.
+  The identity's keys are the ones the file lists, which may be none. A
+  200 response whose body is larger than 256 KiB counts as a key file
+  that lists no keys.
+- **Gone.** A 404 or 410 response. The identity has no keys.
+- **Failed.** Anything else: no response, a DNS or TLS error, a timeout,
+  a 5xx response, or any other status, including a redirect. This is an
+  outage, and says nothing about the identity's keys.
+
+A key file or a gone answer replaces a cached copy. A failed fetch does
+not, and a cached copy stays valid until its hour is up.
+
+A key has been **removed** when a fetch returns a key file that no
+longer lists it, or a gone answer. A server that notices a key has been
+removed SHOULD close the connections that signed in with it. A failed
+fetch is not a reason to close anything, however long it lasts.
 
 ### 4.5. Signing In
 
@@ -728,16 +754,35 @@ tell them apart. Appendix B has a worked example.
 
 The server checks the signature as follows:
 
-1. It builds the same bytes, using this connection's SNI hostname and
+1. It checks that the connection's SNI hostname is a name it serves:
+   its configured hostname, or a name on one of its certificates. If it
+   is not, or the client sent no SNI, the server MUST refuse AUTH and
+   REGISTER with `ERR auth-failed`.
+2. It builds the same bytes, using this connection's SNI hostname and
    nonce.
-2. It gets the identity's keys. If it hosts the identity itself (4.6), it
-   uses its own records. Otherwise it fetches the key file (4.4).
-3. It accepts if the signature verifies under any of those keys.
+3. It gets the identity's keys. If it hosts the identity itself (4.6), it
+   uses its own records. Otherwise it fetches the key file (4.4), or
+   uses a cached copy.
+4. It accepts if the signature verifies under any of those keys.
 
 On success the server replies `OK uid=<uid>`, and adds `op=yes` if the
 identity is a server operator (Section 10). The key that verified becomes
 the connection's **device key**, which push notifications use (Section
-9). On failure the server replies `ERR auth-failed`.
+9). On failure the server replies:
+
+- `ERR auth-failed` if step 1 fails, or if the signature does not verify
+  under the keys the server got. A key file that does not list the key,
+  and a gone answer (4.4), count as keys the server got: the identity
+  has none that verify.
+- `ERR unavailable` if the fetch failed (4.4) and the server has no
+  cached copy, so it could not check the signature at all. This
+  includes the case where a cached copy did not verify and fetching
+  again failed. It MAY add a `retry` tag.
+
+A client that gets `unavailable` SHOULD reconnect and try again later,
+waiting longer after each failure, and at least as long as `retry`
+says. A client that gets `auth-failed` SHOULD NOT try again on its own,
+since the same key will fail the same way. It tells the user instead.
 
 Each part of the signed bytes has a job:
 
@@ -746,7 +791,10 @@ Each part of the signed bytes has a job:
 - **The host** stops a server from using a signature it received to sign
   in somewhere else. Without it, a malicious server could pass another
   server's nonce to the client, then use the client's answer to sign in
-  there as that user.
+  there as that user. The host alone is not enough, since the malicious
+  server could connect to the other server with its own name in SNI.
+  Step 1 closes that gap: the other server refuses a name it does not
+  serve.
 - **The nonce** stops replay.
 - **The uid** ties the signature to one identity.
 
@@ -781,10 +829,20 @@ Errors:
 - `not-supported`: this server does not offer registration.
 - `name-taken`: the name is already registered, or was once and has been
   retired (4.8).
-- `auth-failed`: the signature did not verify.
+- `auth-failed`: the signature did not verify, or the connection's SNI
+  is not a name the server serves (4.5).
 - `forbidden`: for example, registration is closed.
 - `rate-limited`: too many registrations from the client's network
-  address (Section 14). The `retry` tag says when to try again.
+  address (Section 14). The `retry` tag says when to try again. The
+  limit counts registrations that have succeeded or are still in
+  progress, so that sending REGISTER on several connections at once
+  does not get around it.
+
+A client whose REGISTER got no answer, because the connection dropped,
+cannot tell whether the identity was created. It SHOULD reconnect and
+try AUTH as the new identity with the same key before it treats the
+registration as failed. It MUST NOT throw the key away before then: if
+the registration went through, that key is the identity's only key.
 
 If someone loses all the keys of an identity the server hosts, an
 operator can add a new key for them with `ADMIN ADDKEY` (10.5). How the
@@ -794,6 +852,10 @@ operator checks who is asking is outside the scope of this document.
 
 These commands work only for identities that the server itself hosts.
 Other people edit their key file directly, and get `ERR not-supported`.
+So a client can tell from KEY LIST whether a server hosts the identity
+it is signed in as: `ERR not-supported` means it does not. INFO's
+`register=` (8.5) is not a reliable sign, since it says `no` while
+registration is closed.
 
 ```
 KEY LIST
@@ -807,9 +869,10 @@ KEY DEL <key>
   in. The new device then joins the identity's encrypted conversations
   (12.6).
 - `KEY ADD` of a key the identity already has replaces its label. A
-  label that holds a line break once unescaped (3.4) gets
-  `ERR bad-syntax`, since it cannot go in a key file. A key beyond the
-  64 of 4.4 gets `ERR forbidden`.
+  label longer than the 64 bytes of 4.4 gets `ERR too-long`. Like all
+  text, it is measured escaped (3.4). A label that holds a line break
+  once unescaped gets `ERR bad-syntax`, since it cannot go in a key
+  file. A key beyond the 64 of 4.4 gets `ERR forbidden`.
 - `KEY DEL` removes a key. The server MUST refuse to remove the last key
   (`ERR forbidden`). It SHOULD close the connections that use the
   removed key. It deletes the key's KeyPackages and pending Welcomes
@@ -844,7 +907,8 @@ remove its leaves from encrypted rooms (12.6). Then:
   without one. An operator can give it a new owner (Section 10).
 - **Hosted identities (4.6):** the server also deletes the identity's
   keys and key file. It SHOULD NOT let anyone register the name again,
-  for the reason given in Section 10.5.
+  for the reason given in Section 10.5. A client can tell beforehand
+  whether the server hosts the identity with KEY LIST (4.7).
 - **Other identities** are only forgotten by this server. If the same
   identity signs in again later, the server treats it as new.
 
@@ -1117,6 +1181,14 @@ BLOCKS
   per block, then `OK`.
 - A block belongs to the account and applies to all its devices. Nobody
   else can see it. Only identities can block.
+- After BLOCK or UNBLOCK, the server sends `BLOCK <target>` or
+  `UNBLOCK <target>` to the account's other connections, as it does
+  READ (7.4), so that their lists stay current. These lines are not
+  events. A client applies each one to its list, adding or removing that
+  one target, rather than replacing its whole list. The lines BLOCKS
+  returns agree with them as a CONV line agrees with READ lines (3.6):
+  they cover every BLOCK and UNBLOCK line sent to the connection before
+  them.
 - A server MAY limit how many blocks an account has, and replies
   `ERR forbidden` beyond the limit. Domain blocks keep the need for many
   entries low.
@@ -1295,7 +1367,10 @@ discards what it has stored, as in 7.1, before storing the event.
 - **The room does not exist.** The server MAY create it, if the user is
   an identity and server policy allows. The creator becomes the room's
   owner, and their JOIN is event 1. Otherwise the server replies
-  `ERR not-found`.
+  `ERR not-found`. Anyone who controls a domain can make any number of
+  identities, so servers SHOULD limit how often one identity creates
+  rooms, and reply `ERR rate-limited` with a `retry` tag beyond the
+  limit (Section 14).
 
 Who may join:
 
@@ -1521,7 +1596,8 @@ conversations:
 - `<id>` is the conversation's id (5.1).
 - `<head>` is the conversation's newest seq.
 - `<read>` is the account's read marker (7.4), or `0` if there is none.
-  It is always `0` for guests.
+  It is always `0` for guests. It covers every READ line for the
+  conversation sent to the connection before the CONV line (3.6).
 
 A connection receives live events for its conversations from the moment
 it signs in. So every event newer than the head that SYNC reports is
@@ -1695,7 +1771,9 @@ those it is in.
 - The marker only moves forward. A lower value is ignored. A value
   beyond the conversation's head sets the marker to the head.
 - The server sends `READ <conv> <seq>` to the account's other connections,
-  so they can update their unread counts. This line is not an event.
+  so they can update their unread counts. This line is not an event. A
+  CONV line from SYNC agrees with these lines as it does with events
+  (3.6), so a client can take the higher of the two values.
 - Read markers are private to the account. Nobody else sees them.
 - Only identities can set read markers.
 
@@ -1785,7 +1863,20 @@ guest's display name lasts as long as its session (4.2).
 
 Display names are not unique and prove nothing, since anyone can call
 themselves anything. Clients SHOULD show the uid whenever two people in
-a conversation share a display name, and whenever the user asks.
+a conversation share a display name, and whenever the user asks:
+
+- To decide whether two people share a display name, a client compares
+  the names unescaped (3.4), after removing bidirectional text controls
+  (U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069),
+  ignoring case, and collapsing each run of whitespace into one space,
+  with none at either end.
+- A client SHOULD show the uid as a separate element, not as text
+  appended to the name, so that a name cannot pass for a uid. It SHOULD
+  always show the uid when a name contains `@`, or otherwise looks like
+  a uid.
+
+Servers MAY refuse display names that contain bidirectional text
+controls, with `ERR forbidden`.
 
 ### 8.3. Members and Users
 
@@ -1842,7 +1933,10 @@ S: PRESENCE offline carol@example.com
   is a member, and its PART (4.2) says when it leaves.
 
 A client learns the current presence of members from MEMBERS and of
-others from WHOIS, then keeps it current with PRESENCE. Future versions
+others from WHOIS, then keeps it current with PRESENCE. PRESENCE only
+reports changes, and a client misses those while it is disconnected. So
+a client that shows presence SHOULD send MEMBERS again for the rooms it
+shows, and WHOIS for the others, after it reconnects. Future versions
 may add presence values. A client SHOULD show an unknown value as
 `online`.
 
@@ -1870,7 +1964,7 @@ INFO is allowed before signing in. It returns these values:
 |---|---|
 | `version=1` | The protocol version |
 | `guests=yes` or `guests=no` | Whether guests are allowed |
-| `register=<domain>` or `register=no` | The identity domain for REGISTER, or `no` if the server offers no registration or it is closed right now |
+| `register=<domain>` or `register=no` | The identity domain for REGISTER, or `no` if the server offers no registration or it is closed right now. It does not say whether the server hosts an identity: KEY LIST does (4.7) |
 | `retention=<days>` or `retention=forever` | How long events are kept |
 | `push=yes` or `push=no` | Whether PUSH is supported |
 | `upload=<bytes>` or `upload=no` | The largest file UPLOAD accepts, or `no` if the server offers no uploads (5.6) |
@@ -3071,7 +3165,8 @@ A device does not take the server's word for which keys belong to whom:
   an hour.
 - For each identity it shares an encrypted conversation with, a device
   SHOULD fetch the key file again at least once a day, and remove the
-  leaves of keys that have gone (12.6).
+  leaves of keys that have been removed (4.4, 12.6). A failed fetch
+  removes nothing.
 - Clients SHOULD show each identity's devices, and tell the user when
   one is added or removed, so that people notice a device they do not
   recognise.
@@ -3085,7 +3180,8 @@ A device does not take the server's word for which keys belong to whom:
 
 Commands a client can send. "Before sign-in" means the command is
 allowed before GUEST, AUTH or REGISTER. A guest that sends a command
-marked "no" under "Guests" gets `ERR forbidden`.
+marked "no" under "Guests" gets `ERR forbidden`. A guest that names a
+uid as the `<conv>` of any other command gets `ERR not-found` (4.2).
 
 | Command | Section | Before sign-in | Guests |
 |---|---|---|---|
@@ -3146,7 +3242,8 @@ Lines a server can send:
 | `MEMBER <room> <uid> <role> <presence> [<name...>]` | response to MEMBERS | 8.3 |
 | `USER <uid> <presence> [<name...>]` | response to WHOIS | 8.3 |
 | `PRESENCE <presence> <uids>` | users came online or went offline | 8.3 |
-| `BLOCK <target>` | response to BLOCKS | 5.7 |
+| `BLOCK <target>` | response to BLOCKS, or a block made on your other devices | 5.7 |
+| `UNBLOCK <target>` | a block lifted on your other devices | 5.7 |
 | `REPORT <conv> <seq> [<reason...>]` or `REPORTENC <conv> <seq> <frank-key> <content> [<reason...>]`, then the reported event | a report, live or in response to REPORTS | 5.8 |
 | `RESOLVED <id>` | a report was resolved | 5.8 |
 | `KEY <key> [<label...>]` | response to KEY LIST and ADMIN KEYS | 4.7, 10.5 |
@@ -3222,7 +3319,10 @@ Lines a server can send:
   should be protected like SSH keys.
 - **Signatures.** The signed bytes (4.5) bind a signature to one server,
   one connection and one identity. A signature therefore cannot be
-  replayed, or used on another server.
+  replayed, or used on another server. This relies on servers accepting
+  sign-ins only on connections whose SNI is a name they serve (4.5).
+  Otherwise a malicious server could relay another server's nonce under
+  its own name, and sign in there as its users.
 - **Requests from the server.** Fetching key files and sending pushes
   both mean connecting to hosts that users choose. The rules in Sections
   4.4 and 9.3 stop these requests from reaching the server's internal
@@ -3234,17 +3334,29 @@ Lines a server can send:
   exactly this to recover lost accounts. People who do not
   want to depend on a host can publish their own key file. While a host
   is unreachable, its users cannot sign in to servers that have no
-  cached copy of their key file (4.4).
+  cached copy of their key file, and get `ERR unavailable` (4.5). An
+  outage does not revoke keys: only a key file that no longer lists a
+  key, or a 404 or 410 answer, does (4.4).
 - **Open registration.** Each REGISTER creates an identity that works on
   every server. A server with open registration SHOULD rate-limit it,
-  for example per network address, and close it if it is abused. Other
-  servers can answer abuse from such a server only by banning single
-  identities or its whole domain (10.2), and a domain ban also shuts out
-  that server's legitimate users.
+  for example per network address, and close it if it is abused. The
+  limit counts registrations that have succeeded or are still in
+  progress, so that parallel connections cannot get around it (4.6).
+  Other servers can answer abuse from such a server only by banning
+  single identities or its whole domain (10.2), and a domain ban also
+  shuts out that server's legitimate users.
 - **Abuse.** Guests are anonymous. Servers SHOULD rate-limit commands and
   connections per network address, and limit how often they fetch any
   one key file. The `guests` setting restricts guests per room.
+- **Room creation.** Anyone who controls a domain can make any number
+  of identities, and each one can create rooms. Servers SHOULD limit how
+  often one identity creates rooms (6.1), and can ban a whole domain
+  that abuses this (10.2).
 - **Display names** can be used to imitate other people (8.2).
+  Bidirectional text controls can make one name look like another, or
+  make the text after a name look like part of it. So clients compare
+  names without them, and show the uid apart from the name. Servers can
+  refuse names that contain them.
 - **Reports and blocks.** Room owners and moderators do not learn who
   reported a message, but operators do (5.8). The server keeps reported
   messages until reports are resolved, even after their authors delete

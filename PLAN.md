@@ -583,6 +583,69 @@ Open:
     Nobody gets PRESENCE about themselves. NAME also goes to your own
     devices. Servers may cap blocks, with `forbidden` beyond the cap.
 
+28. **Found by the M3 review** (2.1, 3.2, 3.6, 3.7, 4.2, 4.4-4.8, 5.7,
+    6.1, 7.1, 7.4, 8.2, 8.3, 8.5, 12.12, 13, 14).
+    - Confirmed with the user on 2026-11-07:
+      - **SNI must name the server** (4.5, 14). AUTH and REGISTER get
+        `auth-failed` unless the connection's SNI is the server's
+        configured hostname or a name on one of its certificates.
+        Otherwise a malicious server could connect to another with its
+        own name in SNI and relay that server's nonce, so binding the
+        host into the signature stopped nothing.
+      - **New error code `unavailable`** (3.2, 3.7, 4.5). AUTH gets it
+        when the server could not get the key file at all, and may add
+        `retry`. `auth-failed` now means only that the signature did not
+        verify against the keys the server got, which includes a file
+        without the key and a 404. Clients retry `unavailable` with
+        backoff and do not retry `auth-failed`.
+      - **BLOCK and UNBLOCK reach the account's other connections** (5.7,
+        13), as READ does. Not events. Clients apply them one at a time.
+        `UNBLOCK <target>` is a new server line.
+      - **Display names** (8.2, 14). Clients compare names without bidi
+        controls, ignoring case and collapsing whitespace, show the uid as
+        a separate element, and always show it for a name with `@` or
+        one that looks like a uid. Servers may refuse names with bidi
+        controls.
+      - **Key labels are at most 64 bytes** (4.4, 4.7, 10.5). KEY ADD and
+        ADMIN ADDKEY get `too-long`, and a key file line with a longer
+        label is malformed. A key line is then at most 1827 bytes with
+        CRLF, so 64 keys take 116,928 bytes, under half of 256 KiB.
+      - **Which answers remove a key** (4.4, 12.12). A fetch now has
+        three outcomes: a key file (200), gone (404 or 410), or failed
+        (no response, DNS, TLS, timeout, 5xx, any other status). A key
+        file without the key, or gone, removes the key and closes its
+        connections. A failed fetch keeps the cached copy and closes
+        nothing. This replaces item 25's "any non-200 answer revokes
+        it".
+      - **Room creation is rate-limited** (6.1, 14): `rate-limited` with
+        `retry`, since anyone can mint identities on their own domain.
+      - **Guests naming a uid get `not-found`** (4.2, 13), since they
+        have no direct conversations.
+    - Clarifications:
+      - The `<read>` on a CONV line covers the READ lines sent before
+        it, as heads cover events (3.6, 7.1, 7.4). BLOCKS covers the
+        BLOCK and UNBLOCK lines sent before it in the same way (5.7).
+      - A client whose REGISTER got no answer tries AUTH with the same
+        key before giving up, and keeps the key until then (4.6).
+      - KEY LIST tells a client whether the server hosts its identity
+        (`not-supported` if not). INFO's `register=` does not, since it
+        says `no` while registration is closed (4.7, 4.8, 8.5).
+      - Clients that show presence send MEMBERS and WHOIS again after
+        reconnecting, since PRESENCE only reports changes (8.3).
+      - The registration rate limit counts registrations that succeeded
+        or are in progress, so parallel connections cannot get around
+        it (4.6, 14).
+    - Chosen while writing it up, not yet confirmed:
+      - A 200 file over 256 KiB counts as a file with no keys (removed),
+        while a redirect, 401, 403, 429 or other non-404/410 status
+        counts as a failed fetch (outage).
+      - A cached copy that does not verify, followed by a failed
+        refetch, gets `unavailable`, not `auth-failed`.
+      - Display names are also trimmed before comparing, and a server
+        refuses a name with bidi controls with `forbidden`.
+      - Guests still get `forbidden` for commands closed to them (READ,
+        ENC and so on), even when they name a uid.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
