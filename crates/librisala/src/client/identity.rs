@@ -213,6 +213,22 @@ impl Client {
         .await
     }
 
+    /// Deletes this device's key for `identity` from the key store, for
+    /// example a key kept after [`RefusedKind::NotRegistered`]. Deleting a
+    /// key that is not there does nothing.
+    ///
+    /// If the identity's key file lists the key, signing in as it from
+    /// this device then needs a new key, and if it is the identity's only
+    /// key, nobody can sign in as it. Ask the user first.
+    pub async fn delete_device_key(&self, identity: &str) -> Result<(), ClientError> {
+        let identity = parse_identity(identity)?;
+        let keys = self.key_store()?;
+        blocking(self.runtime(), move || {
+            keys.delete(identity.as_str()).map_err(store_error)
+        })
+        .await
+    }
+
     /// The key file line for this device's key for `identity`,
     /// `mldsa44 <key> [<label>]`, without a line break (4.4). A
     /// self-hosted identity publishes it in its key file, at
@@ -243,9 +259,9 @@ impl Client {
     /// It asks INFO for the identity domain first (8.5). The device key is
     /// the one the key store has for `<name>@<domain>`, or a new one,
     /// stored before REGISTER is sent, so that it is not lost if the
-    /// answer is. A new key is deleted again if REGISTER fails. The server
-    /// publishes the identity's key file itself; [`key_line`](Self::key_line)
-    /// shows the line it holds.
+    /// answer is. A new key is deleted again only if the server refuses
+    /// REGISTER. The server publishes the identity's key file itself;
+    /// [`key_line`](Self::key_line) shows the line it holds.
     ///
     /// Refusals are [`ClientError::Refused`]:
     /// [`RefusedKind::NoRegistration`], [`RefusedKind::NoHostname`] for
@@ -253,6 +269,15 @@ impl Client {
     /// [`RefusedKind::Forbidden`] (closed, banned, or a limit with
     /// `retry_after_secs`), [`RefusedKind::RateLimited`] and
     /// [`RefusedKind::AuthFailed`].
+    ///
+    /// If the connection drops before REGISTER is answered, the identity
+    /// may or may not exist, and the key is kept (4.6). The client
+    /// connects again and signs in with the key to find out: if that
+    /// works, the registration went through and this returns the account
+    /// as usual. If the server refuses the key, the identity was not
+    /// created: [`RefusedKind::NotRegistered`], with the key still kept
+    /// for the user to decide on. If neither can be learned,
+    /// [`ClientError::Unconfirmed`].
     pub async fn register(&self, server: &str, name: &str) -> Result<Account, ClientError> {
         let addr = parse_server(server)?;
         let name: Name = name
@@ -287,33 +312,100 @@ async fn register_on(
 ) -> Result<Identity, ClientError> {
     let server = addr.to_string();
     let fail = |e: conn::Error| ClientError::from_sign_in(&server, &e);
-    let session = Session::connect(&addr, trust, options)
+    let session = Session::connect(&addr, trust.clone(), options.clone())
         .await
         .map_err(fail)?;
-    let result = async {
+    let rt = tokio::runtime::Handle::current();
+    let prepared = async {
         let domain = session.identity_domain().await.map_err(fail)?;
         let identity = Identity::new(&name, &domain);
-        let rt = tokio::runtime::Handle::current();
-        let (key, created) = {
-            let (keys, identity) = (keys.clone(), identity.clone());
-            blocking(&rt, move || load_or_create(&*keys, &identity)).await?
-        };
-        match session.register_under(&name, &domain, &key).await {
-            Ok(_) => Ok(identity),
-            Err(e) => {
-                if created {
-                    let id = identity.clone();
-                    if let Err(e) = blocking(&rt, move || keys.delete(id.as_str())).await {
-                        warn!(error = %e, "deleting the key of a failed registration");
-                    }
-                }
-                Err(fail(e))
-            }
-        }
+        let (keys, id) = (keys.clone(), identity.clone());
+        let (key, created) = blocking(&rt, move || load_or_create(&*keys, &id)).await?;
+        Ok((domain, identity, key, created))
     }
     .await;
+    let (domain, identity, key, created) = match prepared {
+        Ok(p) => p,
+        Err(e) => {
+            quit(&session).await;
+            return Err(e);
+        }
+    };
+    let sent = session.register_under(&name, &domain, &key).await;
+    match sent {
+        Ok(_) => {
+            quit(&session).await;
+            Ok(identity)
+        }
+        Err(e) if certainly_not_registered(&e) => {
+            quit(&session).await;
+            if created {
+                let id = identity.clone();
+                if let Err(e) = blocking(&rt, move || keys.delete(id.as_str())).await {
+                    warn!(error = %e, "deleting the key of a failed registration");
+                }
+            }
+            Err(fail(e))
+        }
+        Err(lost) => {
+            // The answer was lost: the identity may exist, with this key as
+            // its only key. Keep the key, and sign in to find out (4.6).
+            session.close();
+            warn!(error = %lost, %identity, "REGISTER got no answer; signing in to check");
+            confirm_registration(&addr, trust, options, &identity, &key, &lost).await
+        }
+    }
+}
+
+/// Whether REGISTER certainly did not create the identity: the server
+/// answered `ERR`, or the command was never sent.
+fn certainly_not_registered(e: &conn::Error) -> bool {
+    matches!(
+        e,
+        conn::Error::Rejected(conn::CommandError::Server(_))
+            | conn::Error::NoRegistration
+            | conn::Error::NoSni
+            | conn::Error::NonceUsed
+            | conn::Error::InvalidCommand(_)
+            | conn::Error::NoResponse
+    )
+}
+
+/// After REGISTER got no answer, signs in on a new connection as
+/// `identity` with the key it was sent with, to learn whether it was
+/// created (4.6). The key is kept whatever happens.
+async fn confirm_registration(
+    addr: &ServerAddr,
+    trust: Arc<dyn TrustStore>,
+    options: SessionOptions,
+    identity: &Identity,
+    key: &SecretKey,
+    lost: &conn::Error,
+) -> Result<Identity, ClientError> {
+    let unconfirmed = |why: String| ClientError::Unconfirmed {
+        uid: identity.to_string(),
+        message: format!(
+            "REGISTER got no answer ({lost}), and {why}: whether {identity} was registered \
+             is not known. This device's key for it is kept"
+        ),
+    };
+    let session = match Session::connect(addr, trust, options).await {
+        Ok(session) => session,
+        Err(e) => return Err(unconfirmed(format!("connecting again failed ({e})"))),
+    };
+    let signed_in = session.auth(identity, key).await;
     quit(&session).await;
-    result
+    match signed_in {
+        Ok(_) => Ok(identity.clone()),
+        Err(e) if e.is_auth_failed() => Err(ClientError::refused(
+            RefusedKind::NotRegistered,
+            format!(
+                "REGISTER got no answer ({lost}), and the server refused to sign in with its \
+                 key: {identity} was not registered. This device's key for it is kept"
+            ),
+        )),
+        Err(e) => Err(unconfirmed(format!("signing in to check failed ({e})"))),
+    }
 }
 
 /// An `ERR` to a KEY or UNREGISTER command as a client error.

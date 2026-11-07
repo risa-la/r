@@ -116,6 +116,26 @@ pub enum ClientError {
         /// What went wrong, in English, for logs.
         message: String,
     },
+    /// REGISTER or UNREGISTER was sent, but its answer was lost: the
+    /// connection dropped before it came. Whether the identity was created
+    /// or deleted is not known (4.6, 4.8).
+    ///
+    /// - After [`Client::register`](super::Client::register), the device
+    ///   key for `uid` is kept, since if the registration went through it
+    ///   is the identity's only key. The client tried to sign in with it
+    ///   and could not tell either. Check later by signing in:
+    ///   [`Client::add_identity`](super::Client::add_identity), then
+    ///   [`Account::connect`](super::Account::connect).
+    /// - After [`Account::unregister`](super::Account::unregister), the
+    ///   account is kept, stopped. Call `unregister` again to find out
+    ///   and finish.
+    #[error("{message}")]
+    Unconfirmed {
+        /// The identity registered or deleted.
+        uid: String,
+        /// What happened, in English, for logs.
+        message: String,
+    },
 }
 
 /// Why connecting or signing in failed ([`ClientError::Connection`]), so
@@ -203,6 +223,12 @@ pub enum RefusedKind {
     /// `not-supported`: the server does not offer this, for example
     /// signing in as an identity at all, or UNREGISTER's `purge`.
     NotSupported,
+    /// REGISTER got no answer, and the server then refused to sign in
+    /// with the key it was sent with (`auth-failed`): the identity was
+    /// not created (4.6). The device key made for it is kept, for the
+    /// user to decide on; [`Client::delete_device_key`](super::Client::delete_device_key)
+    /// deletes it.
+    NotRegistered,
 }
 
 impl RefusedKind {
@@ -222,7 +248,7 @@ impl RefusedKind {
     /// The error code the server sent, if it sent one.
     fn code(self) -> Option<&'static str> {
         Some(match self {
-            RefusedKind::AuthFailed => "auth-failed",
+            RefusedKind::AuthFailed | RefusedKind::NotRegistered => "auth-failed",
             RefusedKind::NameTaken => "name-taken",
             RefusedKind::Forbidden | RefusedKind::LastKey => "forbidden",
             RefusedKind::RateLimited => "rate-limited",
@@ -323,6 +349,7 @@ impl ClientError {
                 "auth-failed" | "forbidden" | "not-supported" | "bad-syntax" | "unknown-command"
             ),
             ClientError::AlreadyTrusted { .. }
+            | ClientError::Unconfirmed { .. }
             | ClientError::NotConnected
             | ClientError::NotJoined(_)
             | ClientError::Store(_) => false,

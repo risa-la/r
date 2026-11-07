@@ -343,6 +343,98 @@ async fn register_makes_a_key_and_drops_it_if_refused() {
     s.server.done().await;
 }
 
+/// What happens on the connection after a REGISTER whose answer is lost.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterLost {
+    /// The server accepts AUTH with the key: the identity exists.
+    Accept,
+    /// The server refuses AUTH with `auth-failed`.
+    Refuse,
+    /// Nobody answers: the server accepts no second connection.
+    Nothing,
+}
+
+/// REGISTER for bob whose answer is lost, then what `after` says.
+async fn lost_register(after: AfterLost) -> (Setup, Result<Account, ClientError>) {
+    let conns = if after == AfterLost::Nothing { 1 } else { 2 };
+    let sent: Arc<std::sync::Mutex<Option<risala_proto::auth::PublicKey>>> = Arc::default();
+    let s = setup(conns, move |i, mut peer| {
+        let sent = sent.clone();
+        async move {
+            greet(&mut peer).await;
+            let nonce: Nonce = NONCE.parse().unwrap();
+            if i == 0 {
+                peer.expect("@ref=1 INFO").await;
+                peer.send("@ref=1 OK version=1 register=example.org").await;
+                let line = peer.recv().await.unwrap();
+                let Command::Register { key, .. } = line.parse::<Request>().unwrap().command else {
+                    panic!("{line}")
+                };
+                *sent.lock().unwrap() = Some(key);
+                // The connection drops before the answer.
+                peer.close().await;
+                return;
+            }
+            let line = peer.recv().await.unwrap();
+            let Command::Auth {
+                identity,
+                signature,
+            } = line.parse::<Request>().unwrap().command
+            else {
+                panic!("{line}")
+            };
+            assert_eq!(identity.as_str(), "bob@example.org");
+            let key = sent.lock().unwrap().clone().unwrap();
+            assert!(key.verify_challenge(HOST, &nonce, "bob@example.org", &signature));
+            if after == AfterLost::Accept {
+                peer.send("@ref=1 OK uid=bob@example.org").await;
+            } else {
+                peer.send("@ref=1 ERR auth-failed").await;
+            }
+            quit(peer).await;
+        }
+    })
+    .await;
+    let result = within(s.client.register(HOST, "bob")).await;
+    (s, result)
+}
+
+#[tokio::test]
+async fn a_register_whose_answer_is_lost_keeps_the_key_and_signs_in() {
+    let (s, result) = lost_register(AfterLost::Accept).await;
+    let bob = result.unwrap();
+    assert_eq!(bob.uid(), "bob@example.org");
+    assert!(s.keys.load("bob@example.org").unwrap().is_some());
+    assert_eq!(s.client.accounts().unwrap().len(), 1);
+    s.server.done().await;
+}
+
+#[tokio::test]
+async fn a_lost_register_refused_on_sign_in_keeps_the_key() {
+    let (s, result) = lost_register(AfterLost::Refuse).await;
+    let err = result.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::NotRegistered, None));
+    assert_eq!(err.code(), Some("auth-failed"));
+    // The user decides about the key.
+    assert!(s.keys.load("bob@example.org").unwrap().is_some());
+    assert!(s.client.accounts().unwrap().is_empty());
+    s.client.delete_device_key("bob@example.org").await.unwrap();
+    assert!(s.keys.load("bob@example.org").unwrap().is_none());
+    s.server.done().await;
+}
+
+#[tokio::test]
+async fn a_lost_register_that_cannot_be_checked_is_unconfirmed() {
+    let (s, result) = lost_register(AfterLost::Nothing).await;
+    match result.unwrap_err() {
+        ClientError::Unconfirmed { uid, .. } => assert_eq!(uid, "bob@example.org"),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.keys.load("bob@example.org").unwrap().is_some());
+    assert!(s.client.accounts().unwrap().is_empty());
+    s.server.done().await;
+}
+
 #[tokio::test]
 async fn register_refusals() {
     // One connection per case, in this order.
