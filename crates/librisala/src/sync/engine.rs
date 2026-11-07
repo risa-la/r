@@ -39,8 +39,13 @@ struct Live {
     loading_older: bool,
     /// Catch up to the end, even across a large gap.
     download: bool,
-    /// HISTORY or RELATED failures on this connection.
+    /// HISTORY or RELATED failures on this connection, for the id in
+    /// `failed_for`.
     failures: u32,
+    /// The id the failures were counted for. Confirming the same id again
+    /// does not clear them, so a server that lists a conversation in SYNC
+    /// but refuses its HISTORY is not asked forever.
+    failed_for: Option<Id>,
     /// Catching up to this goal made no progress: the events in between
     /// expired. Do not ask again until the goal moves.
     stuck: Option<u64>,
@@ -525,8 +530,11 @@ impl SyncEngine {
     /// The id of `conv` was learned on this connection.
     fn confirm(&mut self, conv: &Conv, id: Id) {
         let live = self.live(conv);
+        if live.failed_for.as_ref() != Some(&id) {
+            live.failures = 0;
+            live.failed_for = None;
+        }
         live.confirmed = Some(id);
-        live.failures = 0;
         live.stuck = None;
         live.newest_for = None;
     }
@@ -1081,12 +1089,17 @@ impl SyncEngine {
             return Some(id);
         }
         let live = self.live(conv);
+        if let Some(id) = live.confirmed.clone() {
+            live.failed_for = Some(id);
+        }
         live.failures += 1;
         if let Outcome::Err(err) = &reply.outcome
             && matches!(err.code, ErrorCode::NotFound | ErrorCode::Forbidden)
         {
             live.confirmed = None;
-            self.want_sync = true;
+            if live.failures < MAX_FAILURES {
+                self.want_sync = true;
+            }
         }
         None
     }

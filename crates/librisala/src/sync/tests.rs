@@ -414,6 +414,26 @@ fn a_stale_sync_does_not_undo_a_join() {
     assert!(h.conv("#general").joined);
 }
 
+#[test]
+fn a_server_that_refuses_history_is_not_asked_forever() {
+    let mut h = H::new(ALICE);
+    let r = h.start();
+    h.reply(r, &["CONV #general k1 3 0"], "OK");
+    for _ in 0..2 {
+        let r = h.expect("HISTORY #general after=0 limit=50");
+        h.reply(r, &[], "ERR not-found");
+        let r = h.expect("SYNC");
+        h.reply(r, &["CONV #general k1 3 0"], "OK");
+    }
+    // The third failure is the last.
+    let r = h.expect("HISTORY #general after=0 limit=50");
+    h.reply(r, &[], "ERR not-found");
+    h.idle();
+    // A new id is a new conversation, and is tried again.
+    h.line(&ev(4, "from=alice@example.org;id=k2 JOIN #general"));
+    h.expect("HISTORY #general after=0 limit=50");
+}
+
 // ---------------------------------------------------------------------------
 // 6.1, 6.4, 10.4: joins, notifications, DROP
 
