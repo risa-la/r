@@ -995,9 +995,9 @@ reach copies that people have already made.
 
 ENC events are deleted the same way. The placeholder has an empty
 payload, and loses the `frank` tag as well as the file tags, since the
-content it commits to is gone. Since the server cannot see their edits
-and reactions, it does not delete those with them (12.11). The copy kept
-for an open report (5.8) keeps its `frank` tag.
+content it commits to is gone. The copy kept for an open report (5.8)
+keeps its `frank` tag. The server cannot see the edits and reactions of
+an ENC event, so it does not delete those with it (12.11).
 
 ### 5.5. Mentions
 
