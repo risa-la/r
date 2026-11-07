@@ -1,6 +1,6 @@
 //! Tests against a scripted TLS server.
 
-mod server;
+pub(crate) mod server;
 mod session;
 mod supervisor;
 mod trust;

@@ -254,6 +254,8 @@ enum Input {
 /// What to do with an input's result, on the async side.
 enum Ctx {
     None,
+    /// A NOTICE line, to report after the changes before it.
+    Notice(String),
     /// A JOIN the app asked for.
     Join(Room, Reply<()>),
     /// A JOIN after reconnecting (4.2).
@@ -425,18 +427,13 @@ impl Online<'_> {
     fn take(&mut self, item: Incoming, inputs: &mut Vec<(Input, Ctx)>) {
         match item {
             Incoming::Line(msg) => {
-                if let ServerLine::Notice { message } = &msg.line {
-                    self.shared.publish(Batch {
-                        reload: false,
-                        changes: Vec::new(),
-                        events: vec![AccountEvent::Notice {
-                            notice: Notice::Server {
-                                text: unescape(message).into_owned(),
-                            },
-                        }],
-                    });
-                }
-                inputs.push((Input::Line(msg), Ctx::None));
+                // A NOTICE is published in its place among the changes of
+                // the lines around it (8.4).
+                let ctx = match &msg.line {
+                    ServerLine::Notice { message } => Ctx::Notice(unescape(message).into_owned()),
+                    _ => Ctx::None,
+                };
+                inputs.push((Input::Line(msg), ctx));
             }
             Incoming::Reply { ref_, response } => match self.refs.remove(&ref_) {
                 Some(req) => inputs.push((Input::Reply(req, to_reply(response)), Ctx::None)),
@@ -552,6 +549,11 @@ impl Online<'_> {
         let mut not_again: Vec<Room> = Vec::new();
         let mut join_again: Vec<Room> = Vec::new();
         let mut events = events;
+        if let Ctx::Notice(text) = &ctx {
+            events.push(AccountEvent::Notice {
+                notice: Notice::Server { text: text.clone() },
+            });
+        }
         for n in &out.notifications {
             match n {
                 Notification::Kicked { room, .. }
@@ -625,7 +627,7 @@ impl Online<'_> {
             self.shared.synced.send_modify(|s| s.idle = false);
         }
         match ctx {
-            Ctx::None => {}
+            Ctx::None | Ctx::Notice(_) => {}
             Ctx::Join(room, reply) => match first_req {
                 Some(req) => {
                     self.waiters.insert(req, (Some(room), reply));
@@ -690,7 +692,7 @@ fn answer_err(ctx: Ctx, e: ClientError) {
         Ctx::Send(reply) => {
             let _ = reply.send(Err(e));
         }
-        Ctx::None | Ctx::Rejoin(_) => {}
+        Ctx::None | Ctx::Notice(_) | Ctx::Rejoin(_) => {}
     }
 }
 
