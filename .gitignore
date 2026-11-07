@@ -46,7 +46,8 @@ local.properties
 *.aab
 clients/android/**/build/
 
-# Apple / Xcode (future client)
+# Apple / Xcode
+/.build/apple/
 DerivedData/
 xcuserdata/
 *.xcuserstate

@@ -66,6 +66,7 @@ The development environment is a Nix flake (using flake-parts):
 nix develop          # Rust toolchain, SQLite, OpenSSL, GTK 4, libadwaita
 nix fmt              # format Nix files
 nix build .#risalad  # build the server into ./result
+nix build .#apple-macos # cacheable Apple Release app, using the declared host Xcode
 nix flake check      # fmt, clippy, tests, REUSE and Nix formatting, as CI runs them
 ```
 
