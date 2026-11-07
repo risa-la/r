@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use risala_keyfetch::{FetchOptions, KeyFetcher, Roots, StaticResolver};
 use risala_proto::auth::{PublicKey, SecretKey};
@@ -119,6 +120,52 @@ async fn listener_serves_published_key_files() {
     keys.remove(&name("alice")).unwrap();
     fetcher.invalidate(&alice);
     assert!(fetcher.lookup(&alice, false).await.unwrap().gone);
+
+    stop.send(()).unwrap();
+    running.await.unwrap().unwrap();
+}
+
+/// One address may hold only so many connections open, so that a client
+/// that sends nothing cannot take them all (slowloris).
+#[tokio::test]
+async fn connections_are_limited_per_address() {
+    use super::server::MAX_HTTP_PER_ADDRESS;
+    use tokio::net::TcpStream;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ca = TestCa::new();
+    let pair = ca.issue(tmp.path(), &["example.test"]);
+    let keys: Arc<dyn KeyFiles> = Arc::new(KeyDir::new(tmp.path().join("keys")));
+    let certs = Certificates::from_pairs(vec![pair]).unwrap();
+    let server = HttpServer::bind(&["127.0.0.1:0".parse().unwrap()], certs, false, keys).unwrap();
+    let addr = server.local_addrs()[0];
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run(async {
+        let _ = stopped.await;
+    }));
+
+    /// Whether the server closed `tcp` at once, rather than waiting for
+    /// its handshake.
+    async fn closed_at_once(tcp: &mut TcpStream) -> bool {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(300), tcp.read(&mut byte)).await;
+        matches!(read, Ok(Ok(0) | Err(_)))
+    }
+
+    let mut idle = Vec::new();
+    for _ in 0..MAX_HTTP_PER_ADDRESS {
+        idle.push(TcpStream::connect(addr).await.unwrap());
+    }
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    assert!(closed_at_once(&mut extra).await);
+    for tcp in &mut idle[..2] {
+        assert!(!closed_at_once(tcp).await);
+    }
+    // Once one goes, another may come.
+    drop(idle.pop());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut next = TcpStream::connect(addr).await.unwrap();
+    assert!(!closed_at_once(&mut next).await);
 
     stop.send(()).unwrap();
     running.await.unwrap().unwrap();

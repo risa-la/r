@@ -15,10 +15,11 @@
 //! exchange groups are the usual ones (X25519MLKEM768 first, then X25519,
 //! P-256 and P-384), not the risala listener's X25519MLKEM768 alone (2.1).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use risala_proto::names::Name;
@@ -63,11 +64,20 @@ pub const KEY_FILE_PREFIX: &str = "/.well-known/risala/";
 /// they are accepted.
 pub const MAX_HTTP_CONNECTIONS: usize = 1024;
 
+/// The most HTTPS connections open at once from one network address (an
+/// IPv6 address counts by its /64), so that one client that opens
+/// connections and sends nothing cannot take them all. Others are closed
+/// as soon as they are accepted.
+pub const MAX_HTTP_PER_ADDRESS: usize = 16;
+
 /// The most bytes of request head (request line and headers).
 pub const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
-/// How long a client has for its TLS handshake, and then again for its
-/// request, and the server for its response.
+/// How long a client has for its TLS handshake, and then again for the
+/// head of its request. A key file request is a few hundred bytes.
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the server has to send its response.
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The HTTPS listener, bound but not yet accepting.
@@ -145,6 +155,7 @@ impl HttpServer {
             acceptor: self.acceptor,
             keys: self.keys,
             permits: Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS)),
+            per_address: Mutex::new(HashMap::new()),
         });
         let mut background = JoinSet::new();
         for listener in listeners {
@@ -165,6 +176,56 @@ struct Shared {
     acceptor: TlsAcceptor,
     keys: Arc<dyn KeyFiles>,
     permits: Arc<Semaphore>,
+    /// How many connections each network address has open.
+    per_address: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// The network a connection counts against: the address, or the /64 of
+/// an IPv6 address, since one host usually has a whole /64.
+fn address_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+        v4 => v4,
+    }
+}
+
+/// One of an address's connections, counted until it is dropped.
+struct AddressSlot {
+    shared: Arc<Shared>,
+    key: IpAddr,
+}
+
+impl AddressSlot {
+    /// Counts a connection from `peer`, unless it has its fill.
+    fn take(shared: &Arc<Shared>, peer: IpAddr) -> Option<AddressSlot> {
+        let key = address_key(peer);
+        let mut counts = shared.per_address.lock().unwrap_or_else(|e| e.into_inner());
+        let n = counts.entry(key).or_default();
+        if *n >= MAX_HTTP_PER_ADDRESS {
+            return None;
+        }
+        *n += 1;
+        Some(AddressSlot {
+            shared: shared.clone(),
+            key,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .shared
+            .per_address
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = counts.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
 }
 
 async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
@@ -184,7 +245,11 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     tracing::warn!(%peer, "too many HTTPS connections, closing a new one");
                     continue;
                 };
-                conns.spawn(connection(shared.clone(), tcp, peer, permit));
+                let Some(slot) = AddressSlot::take(&shared, peer.ip()) else {
+                    tracing::debug!(%peer, "too many HTTPS connections from one address");
+                    continue;
+                };
+                conns.spawn(connection(shared.clone(), tcp, peer, (permit, slot)));
             }
             // Reap finished connections, so the set does not grow.
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
@@ -196,9 +261,10 @@ async fn connection(
     shared: Arc<Shared>,
     tcp: TcpStream,
     peer: SocketAddr,
-    _permit: OwnedSemaphorePermit,
+    _held: (OwnedSemaphorePermit, AddressSlot),
 ) {
-    let mut tls = match tokio::time::timeout(HTTP_TIMEOUT, shared.acceptor.accept(tcp)).await {
+    let handshake = shared.acceptor.accept(tcp);
+    let mut tls = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, handshake).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
             tracing::debug!(%peer, error = %e, "HTTPS handshake failed");
@@ -209,7 +275,7 @@ async fn connection(
             return;
         }
     };
-    let response = match tokio::time::timeout(HTTP_TIMEOUT, read_request(&mut tls)).await {
+    let response = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_request(&mut tls)).await {
         Ok(Ok(request)) => route(&request, &shared.keys).await,
         Ok(Err(response)) => response,
         Err(_) => Response::error(408, "Request Timeout"),
@@ -412,6 +478,14 @@ pub(crate) async fn handle<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addresses_count_by_network() {
+        let key = |s: &str| address_key(s.parse().unwrap()).to_string();
+        assert_eq!(key("203.0.113.7"), "203.0.113.7");
+        assert_eq!(key("::ffff:203.0.113.7"), "203.0.113.7");
+        assert_eq!(key("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::");
+    }
 
     #[test]
     fn request_lines() {
