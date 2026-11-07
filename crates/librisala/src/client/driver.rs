@@ -155,9 +155,13 @@ async fn drive(
                         });
                     }
                     SupervisorEvent::Waiting { delay, error } => {
+                        let error = error.map(|e| ClientError::from_sign_in(&server, &e));
+                        // Account::connect promises apps that the account
+                        // stops exactly on permanent errors.
+                        debug_assert!(!error.as_ref().is_some_and(ClientError::is_permanent));
                         shared.set_state(ConnectionState::Waiting {
                             retry_in_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                            error: error.map(|e| ClientError::from_sign_in(&server, &e)),
+                            error,
                         });
                     }
                     SupervisorEvent::Failed { error } => {
@@ -175,6 +179,7 @@ async fn drive(
                                 shared.uid
                             );
                         }
+                        debug_assert!(error.is_permanent(), "{error:?}");
                         shared.set_state(ConnectionState::Failed { error });
                         return None;
                     }

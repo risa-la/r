@@ -333,9 +333,24 @@ impl Account {
     /// Returns the uid it signed in as.
     ///
     /// It fails with the error of the first attempt that fails, such as
-    /// [`ClientError::UnknownCertificate`] (2.2) or a refused connection.
-    /// The account goes on trying in the background unless the error is
-    /// permanent; [`disconnect`](Self::disconnect) stops it.
+    /// [`ClientError::UnknownCertificate`] (2.2), `auth-failed` (4.5) or
+    /// a refused connection. What happens next follows from
+    /// [`ClientError::is_permanent`], and from nothing else:
+    ///
+    /// - **Permanent:** the account has stopped, in
+    ///   [`ConnectionState::Failed`] with this error. Show it, let the user
+    ///   act (accept a certificate, publish a key), then call `connect` or
+    ///   [`start`](Self::start) again.
+    /// - **Not permanent**, such as a network failure, `unavailable` or
+    ///   `rate-limited`: the account is in [`ConnectionState::Waiting`],
+    ///   and tries again in the background on its own. Show the error as
+    ///   passing, and follow [`state`](Self::state) or
+    ///   [`subscribe`](Self::subscribe) for what comes next, or call
+    ///   [`wait_synced`](Self::wait_synced). [`disconnect`](Self::disconnect)
+    ///   stops it.
+    ///
+    /// [`ClientError::NotConnected`] means the account was stopped while
+    /// this waited.
     pub async fn connect(&self) -> Result<String, ClientError> {
         let mut state = self.shared.state.subscribe();
         self.start();

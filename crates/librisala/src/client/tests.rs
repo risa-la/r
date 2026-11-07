@@ -374,6 +374,63 @@ async fn writes_from_another_process_reach_timelines() {
 }
 
 #[test]
+fn an_error_is_permanent_exactly_when_the_supervisor_stops_on_it() {
+    // The supervisor stops on conn::Error::is_permanent, and apps read
+    // ClientError::is_permanent (Account::connect). They must agree, for
+    // every code, with and without retry.
+    use crate::conn::{CommandError, Error};
+    use risala_proto::error::ErrorCode;
+    use risala_proto::server::ErrResponse;
+    let codes = [
+        "bad-syntax",
+        "unknown-command",
+        "too-long",
+        "not-authenticated",
+        "already-authenticated",
+        "auth-failed",
+        "unavailable",
+        "name-taken",
+        "not-found",
+        "forbidden",
+        "last-owner",
+        "not-supported",
+        "encrypted",
+        "stale",
+        "invalid",
+        "rate-limited",
+        "internal",
+        "some-future-code",
+    ];
+    for code in codes {
+        for retry in [None, Some(30)] {
+            let err = ErrResponse {
+                code: code.parse::<ErrorCode>().unwrap(),
+                retry,
+                message: String::new(),
+            };
+            let e = Error::Rejected(CommandError::Server(err));
+            let client = ClientError::from_sign_in(SERVER, &e);
+            assert_eq!(
+                client.is_permanent(),
+                e.is_permanent(),
+                "{code} retry={retry:?}: {client:?}"
+            );
+        }
+    }
+    for e in [
+        Error::Timeout,
+        Error::NoSni,
+        Error::NoRegistration,
+        Error::NonceUsed,
+        Error::UnsupportedVersion(2),
+        Error::Rejected(CommandError::Unparseable("ERR".into())),
+    ] {
+        let client = ClientError::from_sign_in(SERVER, &e);
+        assert_eq!(client.is_permanent(), e.is_permanent(), "{e:?}");
+    }
+}
+
+#[test]
 fn errors_carry_kinds_to_localize() {
     use crate::conn::{CloseReason, Error};
     let e = ClientError::from_conn("x", &Error::Timeout);
