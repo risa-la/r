@@ -517,30 +517,53 @@ a challenge by hand (Appendix A).
 ### 4.2. Guests
 
 ```
-GUEST <name>
+GUEST <name> [token=<token>]
 ```
 
-→ `OK uid=~<name>`
+→ `OK uid=~<name> token=<token>`
 
-A guest's uid lasts only as long as its connection. Once that connection
-closes, another guest may take the same name, so a guest uid says
-nothing about who someone is over time. For this reason guests:
+A guest has a name for as long as its **session** lasts. The session
+starts with GUEST and ends a while after its connection closes, unless
+the guest resumes it (see below). Once it ends, another guest may take
+the same name, so a guest uid says nothing about who someone is over
+time. For this reason guests:
 
 - cannot take part in direct conversations
 - cannot create rooms, hold roles, be invited, set read markers, block
   anyone, upload files or register for push
-- stay members of the rooms they join only until they disconnect. At
+- stay members of the rooms they join only until their session ends. At
   that point the server records a PART for each of those rooms. If the
   server stops without recording them, for example because it crashed,
-  it MUST record them when it starts again.
+  it MUST record them when it starts again. Sessions do not survive a
+  restart.
 
-The server replies `ERR name-taken` if a connected guest already has the
-name. A guest that reconnects can get this for its own name, if the
-server has not yet noticed that its old connection is gone (Section 11),
-or is still recording the PARTs for it. A name is free again once those
-PARTs are recorded.
-Clients SHOULD then try another name, for example by adding a number. It MAY also reserve names, for example the names of identities it
-hosts. It MAY refuse guests entirely with `ERR forbidden`.
+**Resuming.** The token in GUEST's `OK` lets a guest come back after its
+connection closes, for example after a network drop, or after a phone
+app sends QUIT as it goes to the background (9.2):
+
+- The token is an id (3.5) with at least 128 bits of randomness. It is a
+  secret: anyone who has it can take over the guest's name and rooms.
+- When a guest's connection closes for any reason, QUIT included, the
+  server keeps its session, name and rooms for a resume period of its
+  choosing, at least 2 minutes. Only then does the session end and the
+  server record the PARTs.
+- `GUEST <name> token=<token>` with the session's current token resumes
+  it. The connection becomes that guest again, still a member of its
+  rooms, and no JOIN or PART is recorded. If another connection still
+  has the session, the server closes that one with BYE. The `OK`
+  carries a new token, and the old one stops working.
+- A token that matches no current session for that name is ignored, and
+  GUEST works as it does without one.
+- The client catches up on what happened in the meantime with SYNC and
+  HISTORY, as in Section 7.1.
+- ADMIN DISCONNECT (10.3) and server bans (10.2) end a guest's session
+  at once.
+
+The server replies `ERR name-taken` while a session holds the name,
+whether its connection is open or it is waiting to be resumed. A client
+that cannot resume SHOULD then try another name, for example by adding a
+number. The server MAY reserve names, for example the names of
+identities it hosts. It MAY refuse guests entirely with `ERR forbidden`.
 
 ### 4.3. Identities
 
@@ -810,7 +833,7 @@ INVITE, KICK, BAN, UNBAN, SET and ROLE (Section 6).
 
 The server sends each new event straight away to every connection in
 the conversation. For a room, that means the connections of all its
-members, including guests who joined it on that connection. For a direct
+members, including each guest member's connection while it has one. For a direct
 conversation, it means the connections of both participants. Either way,
 it includes the author's own connections. Within one conversation,
 events arrive in sequence order. There is no ordering across
@@ -1158,7 +1181,8 @@ PART <room> [<reason...>]
 → PART event, then `OK`
 
 Leaves the room. Owners and moderators keep their role when they leave
-(6.3). Guests leave all their rooms automatically when they disconnect.
+(6.3). Guests leave all their rooms automatically when their session
+ends (4.2).
 PART for a room you are not a member of gets `ERR not-found`.
 
 A room goes on existing when its last member leaves. Nothing about it
@@ -1192,7 +1216,7 @@ SET <room> <key> [<value...>]
 - Changing `guests` applies at once to the guests already in the room.
   Under `read` they stay but can no longer send. Under `none` the
   server removes them, recording a PART for each as when a guest
-  disconnects (4.2).
+  session ends (4.2).
 - `retention <days>`: events older than this many days are deleted
   (7.5). The value MUST be at least 1, and MUST NOT be longer than the
   server's own retention period (`ERR forbidden`). Shortening it also
@@ -1508,10 +1532,10 @@ To make resending safe:
   dropped and created again (10.4), a cid from the old room does not
   match, so a resent message is sent to the new room. Otherwise the
   client would be given the seq of someone else's event.
-- For guests, the server checks cids only within one connection. A
-  guest therefore cannot resend safely after it reconnects. Its client
-  SHOULD show a message that never got its `OK` as possibly not sent,
-  rather than send it again.
+- For guests, the server checks cids only within one guest session,
+  which a resumed connection continues (4.2). A guest whose session has
+  ended cannot resend safely. Its client SHOULD show a message that
+  never got its `OK` as possibly not sent, rather than send it again.
 - The cid is not part of the event.
 
 ---
@@ -1546,7 +1570,7 @@ Sets your display name on this server. With no text, it clears your
 display name. A display name is any text up to 128 bytes, for example
 "Alice Martin" or "عائشة". The server sends `@from=<uid> NAME
 [<name...>]` to the connections that share a conversation with you. A
-guest's display name lasts as long as its connection.
+guest's display name lasts as long as its session (4.2).
 
 Display names are not unique and prove nothing, since anyone can call
 themselves anything. Clients SHOULD show the uid whenever two people in
@@ -1971,7 +1995,7 @@ marked "no" under "Guests" gets `ERR forbidden`.
 | Command | Section | Before sign-in | Guests |
 |---|---|---|---|
 | `INFO [<room>]` | 8.5, 6.2 | without a room | yes |
-| `GUEST <name>` | 4.2 | yes | – |
+| `GUEST <name> [token=]` | 4.2 | yes | – |
 | `AUTH <identity> <signature>` | 4.5 | yes | – |
 | `REGISTER <name> <key> <signature>` | 4.6 | yes | – |
 | `KEY LIST` / `KEY ADD <key> [<label...>]` / `KEY DEL <key>` | 4.7 | | no |

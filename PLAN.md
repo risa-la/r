@@ -353,6 +353,14 @@ Settled (now in SPEC.md):
       timer only once its LF arrives.
     - Expiry stops at the first event that is not old enough.
 
+17. **Guest sessions and resuming** (4.2, 7.6, 12). Guests that
+    reconnected filled rooms with JOIN and PART pairs, and came back as
+    `~sam2`. Now GUEST's `OK` carries a secret `token`. After a guest's
+    connection closes, QUIT included, the server keeps its name and rooms
+    for at least 2 minutes. `GUEST <name> token=<token>` resumes the
+    session without recording anything, and gets a new token. cids carry
+    over to the resumed session.
+
 Nothing is open right now.
 
 ## 6. Decisions
