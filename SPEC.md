@@ -1455,7 +1455,9 @@ BANS <room>
   room. The event also goes to the invitee's connections, so their
   client can offer to join. The invitation lasts until it is used or the
   invitee is banned. Guests cannot be invited. Inviting someone who is
-  already a member records nothing, and gets a plain `OK`.
+  already a member records nothing, and gets a plain `OK`. So a client
+  that receives an INVITE for its own account knows the server does not
+  count it as a member, and SHOULD send SYNC if it thought it was one.
 - `KICK` removes a member. They may join again.
 - `BAN` removes a member, if they are one, and stops them from joining.
   Banning a guest uid has little effect, because guest names get reused.
@@ -1532,7 +1534,9 @@ A client catches up like this:
    HISTORY returns such events later. A live event for a conversation
    the client has not heard of on this connection, such as the first
    message of a new direct conversation, means it should send SYNC
-   again to learn the id, then catch up as above.
+   again to learn the id, then catch up as above. So does a live event
+   whose seq is above the head that SYNC just reported for that
+   conversation, since the head was computed before the event.
 
 A client MAY download the whole history of its conversations for reading
 offline. Sequence numbers make the download easy to resume. In encrypted
@@ -1548,11 +1552,13 @@ The new room has a new id, and its sequence numbers start again at 1. A
 client that missed the DROP notices the new id and starts the room
 afresh, instead of mixing the two rooms' histories. The client also
 discards what it has stored when the head a server reports is lower than
-its sync point for that id. This cannot happen with a correct server,
-but it keeps the client consistent. Events stored past the sync point
-do not count, because another process sharing the client's cache, such
-as a notification extension, may have stored them after the server
-computed the head.
+its sync point for that id, as the sync point was when the client sent
+the SYNC, JOIN or INFO that reported the head. This cannot happen with a
+correct server, but it keeps the client consistent. Events stored past
+the sync point do not count, and neither does a sync point that moved
+after the command was sent, because another process sharing the
+client's cache, such as a notification extension, may have stored
+events after the server computed the head.
 
 ### 7.2. HISTORY
 

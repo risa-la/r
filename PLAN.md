@@ -409,9 +409,6 @@ Settled (now in SPEC.md):
 
 Open:
 
-- The spec example tests, which now include the new verbs, and the
-  Appendix B tests, which now use ML-DSA. Both fail until risala-proto
-  catches up.
 - The size limits, and whether OpenMLS can remove the joiner's earlier
   leaf and take the tree out of band, were settled by the spike (22).
 
@@ -547,6 +544,12 @@ Open:
         accept both. `-provparam ml-dsa.output_formats=seed-only` writes
         the seed-only form. `pkeyutl -sign` needs `-in` for ML-DSA.
         Checked with OpenSSL 3.5.9 (the dev shell) and 3.6.5.
+
+24. **Found while fixing librisala's review** (6.4, 7.1). The head check
+    uses the sync point as it was when the command was sent. A live event
+    above the head SYNC just reported, and an INVITE for your own
+    account, are both reasons to SYNC again. BACKUP GET's `limit` counts
+    epochs and never splits one (confirmed with the user).
 
 ## 6. Decisions
 
