@@ -768,10 +768,16 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             eprintln!("risala: removed the account and its cache");
             if done.key_deleted {
                 eprintln!("risala: deleted this device's key, which the server no longer lists");
-            } else if !done.hosted {
+            } else if done.hosted {
                 eprintln!(
-                    "risala: kept this device's key: {} is not hosted by {server}, and its \
-                     key file still lists the key",
+                    "risala: could not delete this device's key for {}; the server no longer \
+                     lists it",
+                    done.uid
+                );
+            } else {
+                eprintln!(
+                    "risala: kept this device's key: {server} does not host {}, whose own key \
+                     file is unchanged and still decides where the key works",
                     done.uid
                 );
             }
