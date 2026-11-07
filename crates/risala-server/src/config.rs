@@ -143,8 +143,10 @@ pub const MIN_GUEST_RESUME_SECS: u64 = 120;
 
 impl Limits {
     /// The most lines one command's response queues: a full HISTORY or
-    /// LIST page, plus [`REPLY_MARGIN`]. SYNC is not bounded by this: it
-    /// has a line for every conversation the user is in.
+    /// LIST page, plus [`REPLY_MARGIN`]. SYNC has a line for every
+    /// conversation the user is in, so it queues them in chunks of fewer
+    /// than this, waiting for [`command_room`](Self::command_room) again
+    /// before each chunk.
     pub fn reply_lines(&self) -> usize {
         let page = self.max_page.max(self.max_list);
         usize::try_from(page)

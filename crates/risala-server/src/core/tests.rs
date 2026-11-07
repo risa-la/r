@@ -1481,6 +1481,80 @@ async fn sync_lists_the_rooms_of_the_connection() {
     bob.lines();
 }
 
+/// A guest in more rooms than its connection's queue holds lines: 400
+/// rooms, and a queue of the fewest lines the limits allow (145).
+async fn in_many_rooms() -> (Harness, Client, usize) {
+    let mut c = config();
+    c.limits.max_page = 1;
+    c.limits.max_list = 1;
+    c.limits.out_queue = c.limits.command_room();
+    c.limits.out_queue_bytes = c.limits.command_room_bytes();
+    let rooms: Vec<String> = (0..400).map(|n| format!("#r{n:03}")).collect();
+    c.rooms = rooms.clone();
+    let queue = c.limits.out_queue;
+    let mut h = Harness::with(c, |_| {});
+    let mut sam = h.connect_sni(None, queue);
+    sam.lines();
+    h.send(&sam, "guest sam").await;
+    sam.lines();
+    for room in &rooms {
+        h.send(&sam, &format!("join {room}")).await;
+        assert_eq!(sam.lines().len(), 6);
+    }
+    (h, sam, rooms.len())
+}
+
+#[tokio::test]
+async fn sync_waits_for_room_in_the_queue() {
+    let (h, mut sam, rooms) = in_many_rooms().await;
+    assert!(rooms > 145);
+    let hub = h.hub.clone();
+    let id = sam.id;
+    let task = tokio::spawn(async move { hub.command(id, "@ref=s sync".parse().unwrap()).await });
+    // SYNC fills the queue as far as it may, then waits for the client.
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!task.is_finished());
+    assert!(!sam.rx.is_killed());
+    let mut lines = Vec::new();
+    while let Some(item) = sam.rx.recv().await {
+        let Outgoing::Line(line) = item else {
+            panic!("closed: {item:?}");
+        };
+        let line = line.to_line().to_string();
+        let done = line == "@ref=s OK";
+        lines.push(line);
+        if done {
+            break;
+        }
+    }
+    task.await.unwrap();
+    assert!(!sam.rx.is_killed());
+    assert_eq!(lines.len(), rooms + 1);
+    for (n, line) in lines[..rooms].iter().enumerate() {
+        assert!(
+            line.starts_with(&format!("@ref=s CONV #r{n:03} ")) && line.ends_with(" 1 0"),
+            "{line}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sync_drops_a_client_that_stops_reading() {
+    let (h, sam, _) = in_many_rooms().await;
+    let hub = h.hub.clone();
+    let id = sam.id;
+    let task = tokio::spawn(async move { hub.command(id, "sync".parse().unwrap()).await });
+    // As long as the keepalive allows (11): 120 and 60 seconds.
+    tokio::time::sleep(Duration::from_secs(179)).await;
+    assert!(!task.is_finished());
+    assert!(!sam.rx.is_killed());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    task.await.unwrap();
+    assert!(sam.rx.is_killed());
+}
+
 // ---------------------------------------------------------------------------
 // Ordering and fan-out (5.2, 3.6)
 

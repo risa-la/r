@@ -3,6 +3,7 @@
 use std::num::NonZeroU64;
 use std::ops::Bound;
 use std::sync::Arc;
+use std::time::Duration;
 
 use risala_proto::command::{Command, Request, RoomPage};
 use risala_proto::error::ErrorCode;
@@ -517,6 +518,14 @@ impl Inner {
     }
 
     /// SYNC (7.1).
+    ///
+    /// SYNC has a CONV line for every conversation, however many, so it is
+    /// not bounded by the room the network layer keeps for a response
+    /// ([`Limits::command_room`](crate::config::Limits::command_room)). It
+    /// queues its lines in chunks small enough to fit that room, and
+    /// before each chunk after the first it waits, holding no room lock,
+    /// until the connection's queue has that room again. Each CONV line is
+    /// still queued under its room's lock (3.6).
     async fn sync(&self, uid: &Uid, reply: &Reply) -> Outcome {
         let rooms: Vec<Room> = self
             .reg()
@@ -524,7 +533,13 @@ impl Inner {
             .get(uid)
             .map(|r| r.iter().cloned().collect())
             .unwrap_or_default();
-        for room in rooms {
+        // The network layer left room for this many lines and the OK.
+        let chunk = self.config.limits.reply_lines().saturating_sub(1).max(1);
+        for (n, room) in rooms.into_iter().enumerate() {
+            if n > 0 && n % chunk == 0 && !self.wait_for_reply_room(&reply.handle).await {
+                // The connection is gone, so nobody reads the rest.
+                return Ok(None);
+            }
             let Some(entry) = self.room_entry(&room) else {
                 continue;
             };
@@ -546,6 +561,26 @@ impl Inner {
             }
         }
         Ok(Some(OkResponse::new()))
+    }
+
+    /// Waits until `handle`'s queue has room for a whole response and live
+    /// events besides, as the network layer does before each command.
+    /// Returns `false` if the connection closed instead. A client that
+    /// reads nothing for as long as the keepalive allows (11) is dropped.
+    async fn wait_for_reply_room(&self, handle: &ConnHandle) -> bool {
+        let limits = &self.config.limits;
+        let patience = Duration::from_secs(
+            limits
+                .idle_ping_secs
+                .saturating_add(limits.ping_timeout_secs),
+        );
+        let wait = handle.wait_for_room(limits.command_room(), limits.command_room_bytes());
+        if tokio::time::timeout(patience, wait).await.is_err() {
+            tracing::debug!(conn = handle.id().0, "not reading SYNC");
+            handle.kill();
+            return false;
+        }
+        !handle.is_closed()
     }
 
     /// HISTORY (7.2).
