@@ -2,6 +2,7 @@
   perSystem =
     { pkgs, lib, ... }:
     let
+      inherit (builtins) toJSON;
       inherit (pkgs.stdenv.hostPlatform) isDarwin isAarch64;
       sweetpad = import ./sweetpad.nix { inherit pkgs lib; };
       toolchain = import ./toolchain.nix;
@@ -58,7 +59,7 @@
             test -f "$resources/en.lproj/Localizable.strings"
             test -f "$resources/ar.lproj/Localizable.strings"
             cp "$TMPDIR/build.log" $out/nix-support/build.log
-            cp ${pkgs.writeText "toolchain.json" (builtins.toJSON toolchain)} $out/nix-support/toolchain.json
+            cp ${pkgs.writeText "toolchain.json" (toJSON toolchain)} $out/nix-support/toolchain.json
             runHook postInstall
           '';
         };
