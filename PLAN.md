@@ -295,13 +295,17 @@ Settled (now in SPEC.md):
     - A cid only matches within the conversation, by id, it was first
       sent to.
 
-Open:
+12. **Decided while building M2** (2.1, 6.2, 11).
+    - INFO reports `head=0` for a room with no events yet, such as one
+      the server creates from its configuration.
+    - A client that offers ALPN without `risala/1` is refused with
+      `no_application_protocol`.
+    - Only complete lines reset the idle timer, including empty and
+      unparseable ones.
+    - QUIT is the last command a connection runs. Later lines are
+      ignored.
 
-12. **A room with no events** (6.2, 7.1). A room the operator creates
-    from the configuration exists before anyone joins it, so it has no
-    seq to report as INFO's `head`. For now `risalad` leaves `head` out.
-    Either allow `head=0`, or make the head optional, or record a
-    first event when such a room is created.
+Nothing is open right now.
 
 ## 6. Decisions
 
@@ -313,8 +317,9 @@ Open:
   and the newest GNOME platform and libadwaita. Apps may use their
   newest APIs freely, and raise the minimum when a new release comes
   out.
-
-Still open:
-
-- Whether `risalad` serves the `.well-known` files itself by default, or
-  expects a separate web server. Decide in M3.
+- **Hosted key files** (M3): `risalad` has an optional HTTPS listener
+  that serves `/.well-known/risala/<name>`, and later the upload URLs.
+  It also writes the key files to a directory, so operators can serve
+  them from their own web server instead.
+- **The Apple app** keeps its current deployment targets (iOS 18 and
+  macOS 15) for now.

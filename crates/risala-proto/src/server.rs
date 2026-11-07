@@ -1016,7 +1016,7 @@ impl AsRef<str> for Host {
 /// use risala_proto::server::OkResponse;
 ///
 /// let ok = OkResponse::new().with("id", "k3f9q2").with("head", 8812);
-/// assert_eq!(ok.head()?, Seq::new(8812));
+/// assert_eq!(ok.head()?, Some(8812));
 /// assert_eq!(ok.value("id"), Some("k3f9q2"));
 /// assert_eq!(ok.more()?, None);
 /// # Ok::<(), risala_proto::error::ParseError>(())
@@ -1145,8 +1145,9 @@ impl OkResponse {
     }
 
     /// `head=`: a room's newest seq, from JOIN or `INFO <room>` (6.1, 6.2).
-    pub fn head(&self) -> Result<Option<Seq>, ParseError> {
-        self.typed("head", str::parse)
+    /// It is `0` for a room with no events yet, which only INFO can report.
+    pub fn head(&self) -> Result<Option<u64>, ParseError> {
+        self.typed("head", parse_u64)
     }
 
     /// `more=`: whether HISTORY or RELATED has more events, from `0` or `1`
@@ -1257,9 +1258,9 @@ impl OkResponse {
         self.with("id", id)
     }
 
-    /// Adds `head=` (6.1, 6.2).
-    pub fn with_head(self, head: Seq) -> OkResponse {
-        self.with("head", head)
+    /// Adds `head=` (6.1, 6.2): a seq, or `0` for a room with no events.
+    pub fn with_head(self, head: impl Into<u64>) -> OkResponse {
+        self.with("head", head.into())
     }
 
     /// Adds `more=0` or `more=1` (6.1, 7.2, 7.3).
@@ -2270,11 +2271,24 @@ mod tests {
         assert_eq!(keys, ["id", "head", "future"]);
         assert_eq!(ok.value("future"), Some("thing"));
         assert_eq!(ok.id().unwrap().unwrap().as_str(), "k3f9q2");
-        assert_eq!(ok.head().unwrap(), Some(seq(8812)));
+        assert_eq!(ok.head().unwrap(), Some(8812));
         round_trip("OK");
         canonical("OK  SEQ=1 ", "OK seq=1");
         syntax("OK yes");
         syntax("OK seq=1 seq=2");
+    }
+
+    #[test]
+    fn ok_head_zero_is_an_empty_room() {
+        let ok = round_trip("OK id=k3f9q2 members=0 head=0 role=none joined=no");
+        let ServerLine::Ok(ok) = ok.line else {
+            panic!("not OK")
+        };
+        assert_eq!(ok.head().unwrap(), Some(0));
+        let line = |ok: OkResponse| ServerMessage::new(ServerLine::Ok(ok)).to_line().to_string();
+        assert_eq!(line(OkResponse::new().with_head(0u64)), "OK head=0");
+        assert_eq!(line(OkResponse::new().with_head(seq(7))), "OK head=7");
+        assert!(OkResponse::new().with("head", "007").head().is_err());
     }
 
     #[test]
@@ -2300,7 +2314,7 @@ mod tests {
             .with("upload", Upload::MaxBytes(10_000_000));
         assert_eq!(ok.seq().unwrap(), Some(seq(8813)));
         assert_eq!(ok.id().unwrap().unwrap().as_str(), "p4x8n2");
-        assert_eq!(ok.head().unwrap(), Some(seq(9)));
+        assert_eq!(ok.head().unwrap(), Some(9));
         assert_eq!(ok.more().unwrap(), Some(true));
         assert_eq!(ok.uid().unwrap(), Some(uid("alice@example.org")));
         assert_eq!(ok.op().unwrap(), Some(true));

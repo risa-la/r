@@ -164,7 +164,10 @@ upgrade step.
   cannot sign in as an identity.
 - Clients SHOULD offer the ALPN [RFC7301] protocol identifier
   `risala/1`. Servers MUST accept connections that offer no ALPN, so that
-  tools such as `openssl s_client` work without extra flags.
+  tools such as `openssl s_client` work without extra flags. A server
+  MUST refuse a client that offers ALPN identifiers but not `risala/1`,
+  with the `no_application_protocol` alert, so that a web browser or
+  other client sent to the wrong port fails clearly.
 
 A server address is a hostname with an optional port, for example
 `chat.example.org` or `chat.example.org:7000`.
@@ -1166,9 +1169,12 @@ INFO <room>
 ```
 
 → snapshot SET lines, then
-`OK id=<id> members=<n> head=<seq> role=<role> joined=<yes or no>`
+`OK id=<id> members=<n> head=<head> role=<role> joined=<yes or no>`
 
 - `<id>` is the room's id (5.1).
+- `<head>` is the room's newest seq, or `0` if it has no events yet. A
+  room that the server creates itself, for example from its
+  configuration, has none until someone joins it.
 - `<role>` is your role in the room (6.3): `owner` or `mod` if you hold
   one of those roles, `member` if you are a member without one, and
   `none` otherwise.
@@ -1869,12 +1875,14 @@ PING [<token>]
 
 A client can send PING to check that the connection works.
 
-When a server has received nothing from a client for 120 seconds, it
+When a server has received no line from a client for 120 seconds, it
 sends `PING <token>`. The client MUST answer `PONG <token>` right away,
 which gets no response. The server also sends PING to check a
-connection before a push (9.2). If another 60 seconds pass with nothing received, the server
-closes the connection. Any line resets the timer, including an empty
-one, so someone typing by hand can simply press Enter. This lets the
+connection before a push (9.2). If another 60 seconds pass with no line
+received, the server closes the connection. Any complete line resets the
+timer, including an empty one or one the server cannot parse, so someone
+typing by hand can simply press Enter. Part of a line does not reset
+it. This lets the
 server notice dead connections, which matters for deciding when to push.
 
 ```
@@ -1882,6 +1890,9 @@ QUIT [<message...>]
 ```
 
 → `OK`, then the server closes the connection
+
+QUIT is the last command a connection runs. The server ignores any
+lines that arrive after it.
 
 ```
 BYE [<message...>]
