@@ -10,6 +10,21 @@ authors.workspace = true
 
 [dependencies]
 risala-proto.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+webpki.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+rusqlite.workspace = true
+getrandom.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile.workspace = true
+proptest.workspace = true
+risala-server = { path = "../risala-server" }
 
 [lints]
 workspace = true

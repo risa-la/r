@@ -1,0 +1,28 @@
+[package]
+name = "risala-cli"
+description = "A small terminal client and key tool built on librisala"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "risala"
+path = "src/main.rs"
+
+[dependencies]
+librisala.workspace = true
+risala-proto.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+risala-server = { path = "../risala-server" }
+
+[lints]
+workspace = true

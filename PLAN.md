@@ -295,11 +295,26 @@ Settled (now in SPEC.md):
     - A cid only matches within the conversation, by id, it was first
       sent to.
 
-Nothing is open right now.
+Open:
 
-## 6. Open decisions
+12. **A room with no events** (6.2, 7.1). A room the operator creates
+    from the configuration exists before anyone joins it, so it has no
+    seq to report as INFO's `head`. For now `risalad` leaves `head` out.
+    Either allow `head=0`, or make the head optional, or record a
+    first event when such a room is created.
 
-- Minimum Rust version, and minimum OS versions (iOS, macOS, Android API
-  level, GNOME platform).
+## 6. Decisions
+
+- **Minimum Rust version:** the newest rustc in the current NixOS stable
+  release, now 1.95 (NixOS 26.05). Raise `rust-version` in Cargo.toml
+  when a new NixOS release ships a newer one.
+- **Minimum OS versions:** the latest release of each platform: iOS and
+  macOS 27 (the ones Xcode 27 ships with), the newest Android API level,
+  and the newest GNOME platform and libadwaita. Apps may use their
+  newest APIs freely, and raise the minimum when a new release comes
+  out.
+
+Still open:
+
 - Whether `risalad` serves the `.well-known` files itself by default, or
-  expects a separate web server.
+  expects a separate web server. Decide in M3.

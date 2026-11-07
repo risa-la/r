@@ -77,7 +77,9 @@ impl Nonce {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.0
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (hex_digit(pair[0]).unwrap() << 4) | hex_digit(pair[1]).unwrap())
             .collect()
     }
@@ -94,7 +96,7 @@ impl FromStr for Nonce {
         if s.len() < MIN_NONCE_BYTES * 2 {
             return Err(ParseError::BadSyntax("nonce is shorter than 16 bytes"));
         }
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(ParseError::BadSyntax(
                 "nonce has an odd number of hex digits",
             ));
@@ -393,7 +395,7 @@ mod tests {
         let b = s.as_bytes();
         assert_eq!(b.len(), N * 2);
         let mut out = [0u8; N];
-        for (i, pair) in b.chunks_exact(2).enumerate() {
+        for (i, pair) in b.as_chunks::<2>().0.iter().enumerate() {
             out[i] = (hex_digit(pair[0]).unwrap() << 4) | hex_digit(pair[1]).unwrap();
         }
         out

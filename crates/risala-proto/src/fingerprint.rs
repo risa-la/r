@@ -59,8 +59,8 @@ impl FromStr for Fingerprint {
             ));
         }
         let mut out = [0u8; 32];
-        for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
-            match (hex_digit(pair[0]), hex_digit(pair[1])) {
+        for (byte, [hi, lo]) in out.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
+            match (hex_digit(*hi), hex_digit(*lo)) {
                 (Some(hi), Some(lo)) => *byte = (hi << 4) | lo,
                 _ => return Err(ParseError::BadSyntax("fingerprint is not hex")),
             }

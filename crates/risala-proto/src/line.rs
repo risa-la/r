@@ -245,10 +245,10 @@ fn check_tag(key: &str, value: Option<&str>) -> Result<(), ParseError> {
     if !is_tag_key(key) {
         return Err(ParseError::BadSyntax("bad tag key"));
     }
-    if let Some(value) = value {
-        if !is_tag_value(value) {
-            return Err(ParseError::BadSyntax("bad tag value"));
-        }
+    if let Some(value) = value
+        && !is_tag_value(value)
+    {
+        return Err(ParseError::BadSyntax("bad tag value"));
     }
     Ok(())
 }

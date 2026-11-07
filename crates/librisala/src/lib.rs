@@ -1,7 +1,22 @@
 //! librisala, the risala client library.
 //!
-//! Work starts in milestone M5 (see PLAN.md): connections, trust on first
-//! use, keys, sign-in, sync, the history cache and timelines. It builds on
-//! `risala-proto` for everything about the wire format.
+//! It owns everything apps share (PLAN.md 3.3): connections, trust on
+//! first use, keys, sign-in, sync, the history cache and timelines. It
+//! builds on `risala-proto` for everything about the wire format.
+//!
+//! Module map (owner in M5 brackets, see docs/plans/M2-M5.md):
+//!
+//! - [`addr`]: server addresses and trust records, shared by all modules.
+//! - [`conn`]: TLS with trust on first use, sessions, sign-in, keys.
+//! - [`store`]: the SQLite cache: servers, trust, conversations, events,
+//!   read markers, the outbox.
+//! - [`sync`]: the sans-I/O sync engine (7.1-7.3, 7.6).
+
+#![warn(missing_docs)]
 
 pub use risala_proto as proto;
+
+pub mod addr;
+pub mod conn;
+pub mod store;
+pub mod sync;

@@ -112,12 +112,12 @@ pub fn mentions(escaped: &str) -> Vec<Uid> {
     let mut seen = HashSet::new();
     let mut after_space = true;
     for (i, c) in text.char_indices() {
-        if c == '@' && after_space {
-            if let Some(uid) = mention_at(&text[i + 1..]) {
-                if seen.insert(uid.clone()) {
-                    found.push(uid);
-                }
-            }
+        if c == '@'
+            && after_space
+            && let Some(uid) = mention_at(&text[i + 1..])
+            && seen.insert(uid.clone())
+        {
+            found.push(uid);
         }
         after_space = c.is_whitespace();
     }

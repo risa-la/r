@@ -1,7 +1,4 @@
-//! `risalad`, the risala server.
-//!
-//! Work starts in milestone M2 (see PLAN.md). For now this only proves the
-//! workspace builds and links against `risala-proto`.
+//! `risalad`, the risala server. Owned by task B in docs/plans/M2-M5.md.
 
 fn main() {
     println!(

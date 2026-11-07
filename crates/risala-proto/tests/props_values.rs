@@ -298,7 +298,7 @@ proptest! {
 /// A slow, obvious calendar: the wire form of `ms`, counting whole years
 /// and months from 1970.
 fn naive_timestamp(ms: u64) -> String {
-    let leap = |y: u64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let mut days = ms / 86_400_000;
     let rest = ms % 86_400_000;
     let mut year = 1970;
@@ -342,7 +342,7 @@ fn naive_timestamp(ms: u64) -> String {
 
 /// Whether the fields make a timestamp in range (3.5).
 fn naive_valid(y: u64, mo: u64, d: u64, h: u64, mi: u64, s: u64) -> bool {
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let month_len = match mo {
         2 if leap => 29,
         2 => 28,
