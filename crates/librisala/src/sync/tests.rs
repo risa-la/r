@@ -704,6 +704,29 @@ fn drop_removes_the_room() {
 }
 
 #[test]
+fn a_drop_for_another_id_is_ignored() {
+    // 10.4: a DROP whose id is not the stored one is about an older room
+    // of the same name.
+    let mut h = H::new(ALICE);
+    h.joined("k2", 3);
+    h.line("@id=k1 DROP #general spam");
+    assert_eq!(h.seqs("#general"), [1, 2, 3]);
+    assert!(h.notes.is_empty());
+    assert!(h.engine.is_live(&conv("#general")));
+    // Live events are still stored.
+    h.line(&bob(4));
+    assert_eq!(h.seqs("#general"), [1, 2, 3, 4]);
+
+    // The DROP of the stored room removes it.
+    h.line("@id=k2 DROP #general spam");
+    assert!(!h.has_conv("#general"));
+    assert!(h.notes.contains(&Notification::Dropped {
+        room: "#general".parse().unwrap(),
+        reason: "spam".into(),
+    }));
+}
+
+#[test]
 fn a_page_after_starting_afresh_is_ignored() {
     // The model's note for client authors: remember what HISTORY was asked
     // for.

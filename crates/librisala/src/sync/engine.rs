@@ -267,7 +267,7 @@ impl SyncEngine {
                     Ok(())
                 })?;
             }
-            ServerLine::Drop { room, reason } => self.on_drop(room, reason)?,
+            ServerLine::Drop { id, room, reason } => self.on_drop(id.as_ref(), room, reason)?,
             _ => {}
         }
         Ok(self.finish())
@@ -732,17 +732,30 @@ impl SyncEngine {
         }
     }
 
-    fn on_drop(&mut self, room: &Room, reason: &str) -> Result<(), SyncError> {
+    /// DROP (10.4). One whose `id` is not the stored id is about an older
+    /// room of the same name, and is ignored. One with no `id` is taken to
+    /// be about the stored room.
+    fn on_drop(&mut self, id: Option<&Id>, room: &Room, reason: &str) -> Result<(), SyncError> {
         let conv = Conv::Room(room.clone());
-        self.live(&conv).confirmed = None;
-        self.touch_left(&conv);
         let account = self.account;
-        self.write(|tx| {
-            if let Some(row) = tx.conv_by_name(account, &conv)? {
+        let ours = self.write(|tx| {
+            let row = tx.conv_by_name(account, &conv)?;
+            if let Some(id) = id
+                && row.as_ref().and_then(|r| r.conv_id.as_ref()) != Some(id)
+            {
+                return Ok(false);
+            }
+            if let Some(row) = row {
                 tx.remove(&row)?;
             }
-            Ok(())
+            Ok(true)
         })?;
+        if !ours {
+            debug!(%room, "DROP for another room of the same name");
+            return Ok(());
+        }
+        self.live(&conv).confirmed = None;
+        self.touch_left(&conv);
         self.out.notifications.push(Notification::Dropped {
             room: room.clone(),
             reason: reason.to_owned(),

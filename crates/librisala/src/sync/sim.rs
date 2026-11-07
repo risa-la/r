@@ -656,6 +656,7 @@ impl World {
             Action::Drop(r) => {
                 if let Some(inc) = self.alive(&room(r)) {
                     let line = ServerMessage::new(ServerLine::Drop {
+                        id: Some(self.incs[inc].id.clone()),
                         room: room(r),
                         reason: String::new(),
                     });
