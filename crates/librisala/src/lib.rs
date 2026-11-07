@@ -11,12 +11,15 @@
 //! - [`store`]: the SQLite cache: servers, trust, conversations, events,
 //!   read markers, the outbox.
 //! - [`sync`]: the sans-I/O sync engine (7.1-7.3, 7.6).
+//! - [`client`]: the API apps use: [`Client`](client::Client),
+//!   accounts, conversations and timelines, driving the three above.
 
 #![warn(missing_docs)]
 
 pub use risala_proto as proto;
 
 pub mod addr;
+pub mod client;
 pub mod conn;
 pub mod store;
 pub mod sync;

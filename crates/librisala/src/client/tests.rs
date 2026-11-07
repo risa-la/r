@@ -1,0 +1,247 @@
+//! Unit tests of the client layer that need no server: offline sends,
+//! the timeline's diffs and input checks. The end-to-end tests are in
+//! `tests/client.rs` and `tests/cuts.rs`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use risala_proto::names::Conv;
+use risala_proto::server::{Event, ServerLine, ServerMessage};
+use risala_proto::time::Timestamp;
+
+use super::account::Batch;
+use super::*;
+
+const SERVER: &str = "chat.example.org";
+
+fn event(seq: u64, rest: &str) -> Event {
+    let t = Timestamp::from_unix_millis(1_800_000_000_000 + seq).unwrap();
+    match format!("@seq={seq};t={t};{rest}")
+        .parse::<ServerMessage>()
+        .unwrap()
+        .line
+    {
+        ServerLine::Event(e) => e,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Stores events for `conv` as the sync engine would, and tells the
+/// account's subscribers, as its task does.
+fn store_events(account: &Account, conv: &str, id: &str, events: &[Event]) {
+    let shared = account.shared();
+    let conv: Conv = conv.parse().unwrap();
+    let account_id = shared.id;
+    let ((), changes) = shared
+        .store
+        .write(|tx| {
+            let mut row = tx.conv_or_create(account_id, &conv)?;
+            tx.learn_id(&mut row, &id.parse().unwrap(), None)?;
+            tx.set_joined(&mut row, true)?;
+            for e in events {
+                tx.store_event(&row, e)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    shared.publish(Batch {
+        changes,
+        events: Vec::new(),
+    });
+}
+
+fn guest() -> Account {
+    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
+    client.add_guest(SERVER, "sam").unwrap()
+}
+
+#[tokio::test]
+async fn invalid_input_is_refused() {
+    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
+    assert!(matches!(
+        client.add_guest("bad host!", "sam"),
+        Err(ClientError::Invalid(_))
+    ));
+    assert!(matches!(
+        client.add_guest(SERVER, "not a name"),
+        Err(ClientError::Invalid(_))
+    ));
+    assert!(matches!(
+        client.accept_fingerprint(SERVER, "sha256:nothex"),
+        Err(ClientError::Invalid(_))
+    ));
+    let sam = client.add_guest(SERVER, "sam").unwrap();
+    assert!(matches!(
+        sam.conversation("general"),
+        Err(ClientError::Invalid(_))
+    ));
+    assert!(matches!(
+        sam.join("general").await,
+        Err(ClientError::Invalid(_))
+    ));
+    // The same account is the same handle.
+    let again = client.add_guest(SERVER, "sam").unwrap();
+    assert!(Arc::ptr_eq(sam.shared(), again.shared()));
+    assert_eq!(client.accounts().unwrap().len(), 1);
+    assert_eq!(
+        client.account(SERVER, "~sam").unwrap().unwrap().id(),
+        sam.id()
+    );
+}
+
+#[tokio::test]
+async fn offline_sends_wait_in_the_outbox() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    // A room never joined has no id to bind a message to (7.6).
+    assert_eq!(
+        general.send("hi").await.unwrap_err(),
+        ClientError::NotJoined("#general".into())
+    );
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let events = sam.subscribe();
+    let entry = general.send("hi\nthere").await.unwrap();
+    assert_eq!(entry.status, OutboxStatus::Queued);
+    assert_eq!(entry.text, "hi\nthere");
+    assert_eq!(entry.conversation, "#general");
+    match events.next().await.unwrap() {
+        AccountEvent::Outbox { entry: e } => assert_eq!(e, entry),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(sam.outbox().unwrap(), std::slice::from_ref(&entry));
+    // Blank text is refused (5.3).
+    assert!(matches!(
+        general.send(" \t").await,
+        Err(ClientError::Invalid(_))
+    ));
+    // Things that need a server say so.
+    assert_eq!(general.load_older().await, Err(ClientError::NotConnected));
+    assert_eq!(
+        sam.join("#dev").await.unwrap_err(),
+        ClientError::NotConnected
+    );
+    assert_eq!(sam.wait_synced().await, Err(ClientError::NotConnected));
+    // A guest that is offline is in no room: parting only stops the room
+    // being joined again.
+    let rooms = |a: &Account| a.shared().store.rejoin_rooms(a.id()).unwrap();
+    sam.shared()
+        .store
+        .set_rejoin(sam.id(), &"#general".parse().unwrap(), true)
+        .unwrap();
+    sam.part("#general", "").await.unwrap();
+    assert!(rooms(&sam).is_empty());
+    assert!(!general.info().unwrap().unwrap().joined);
+    // The read marker moves in the cache.
+    general.mark_read(1).await.unwrap();
+    assert_eq!(general.info().unwrap().unwrap().read, 1);
+    // Removing an outbox entry.
+    sam.remove_outbox(entry.id).unwrap();
+    assert!(sam.outbox().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_timeline_reports_inserts_updates_and_resets() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    let timeline = general.timeline(3).unwrap();
+    assert!(timeline.items().is_empty());
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("diffs")
+            .expect("not closed")
+    };
+
+    // The conversation appears; its messages are inserted.
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[
+            event(1, "from=~ann;id=k1 JOIN #general"),
+            event(3, "from=~ann MSG #general three"),
+        ],
+    );
+    let diffs = next().await;
+    assert_eq!(diffs.len(), 2);
+    assert!(matches!(&diffs[1], TimelineDiff::Insert { index: 1, item } if item.seq == 3));
+    // An older one goes in its place.
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(2, "from=~ann MSG #general two")],
+    );
+    let diffs = next().await;
+    assert!(
+        matches!(&diffs[..], [TimelineDiff::Insert { index: 1, item }] if item.text.as_deref() == Some("two")),
+        "{diffs:?}"
+    );
+    // An edit and a reaction update their target, and are not items.
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[
+            event(4, "from=~ann;edit=3 MSG #general THREE"),
+            event(5, "from=~sam;react=3 MSG #general 👍"),
+        ],
+    );
+    let diffs = next().await;
+    let TimelineDiff::Update { index: 2, item } = diffs.last().unwrap() else {
+        panic!("{diffs:?}")
+    };
+    assert_eq!(item.text.as_deref(), Some("THREE"));
+    assert!(item.edited);
+    assert_eq!(item.reactions.len(), 1);
+    assert!(item.reactions[0].mine);
+    assert_eq!(timeline.items().len(), 3);
+    assert_eq!(timeline.items(), general.messages(None, 10).unwrap());
+
+    // A new id discards the history (7.1): a reset.
+    let shared = sam.shared();
+    let account = shared.id;
+    let ((), changes) = shared
+        .store
+        .write(|tx| {
+            let mut row = tx
+                .conv_by_name(account, &"#general".parse().unwrap())?
+                .unwrap();
+            tx.discard(&mut row, Some("k2".parse().unwrap()))?;
+            Ok(())
+        })
+        .unwrap();
+    shared.publish(Batch {
+        changes,
+        events: Vec::new(),
+    });
+    let diffs = next().await;
+    assert!(diffs.contains(&TimelineDiff::Reset { items: Vec::new() }));
+    assert!(timeline.items().is_empty());
+}
+
+#[tokio::test]
+async fn the_timeline_pages_back_through_the_cache() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    let events: Vec<Event> = (1..=10)
+        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
+        .collect();
+    store_events(&sam, "#general", "k1", &events);
+    let timeline = general.timeline(4).unwrap();
+    let seqs = |t: &Timeline| t.items().iter().map(|m| m.seq).collect::<Vec<_>>();
+    assert_eq!(seqs(&timeline), [7, 8, 9, 10]);
+    // An item below the window is not shown.
+    assert!(!timeline.paginate_back(4).await.unwrap());
+    let diffs = timeline.next().await.unwrap();
+    assert_eq!(diffs.len(), 4);
+    assert_eq!(seqs(&timeline), [3, 4, 5, 6, 7, 8, 9, 10]);
+    // The cache runs out; offline, nothing more comes.
+    assert!(timeline.paginate_back(4).await.unwrap());
+    assert_eq!(seqs(&timeline), (1..=10).collect::<Vec<_>>());
+}
