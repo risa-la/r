@@ -49,24 +49,27 @@
 //! connection, so messages sent as `~sam2` do not count as unread for the
 //! account `~sam`.
 //!
-//! A session that ended has left its rooms. So for a guest account the
-//! client layer keeps the rooms the user joined (in the cache,
-//! [`Store::rejoin_rooms`]). On each new connection it sends SYNC first,
-//! and joins again only the rooms that SYNC does not list: none after a
-//! resume, all of them after a new session. This happens before the sync
-//! engine's own SYNC, so that it lists them. A room that can no longer be
-//! joined (`not-found` or `forbidden`) is taken off the list and reported
-//! as [`Notice::RejoinFailed`]. Parting a room, or being kicked or banned
-//! from it, or its being dropped, takes it off too. Turn this off with
-//! [`ClientOptions::rejoin_guest_rooms`]. Identities stay members across
-//! connections (6.1), so nothing is joined again for them.
+//! GUEST's `OK` says whether the session was resumed (`resumed=yes`) or
+//! is new.
 //!
-//! A guest's messages that were sent but not answered when the
-//! connection dropped are not sent again. The server checks a guest's
-//! cids only within one session (7.6), and the `OK` of GUEST does not say
-//! whether the session was resumed or is new, so a resend could post the
-//! message twice. They end as [`OutboxStatus::Failed`] with `maybe_sent`
-//! set.
+//! - **Rooms.** A session that ended has left its rooms. So for a guest
+//!   account the client layer keeps the rooms the user joined (in the
+//!   cache, [`Store::rejoin_rooms`]). After a new session it joins them all
+//!   again, before the sync engine's SYNC, so that SYNC lists them. After a
+//!   resumed session it joins none, since the session is still in them,
+//!   and nothing is recorded. A room that can no longer be joined
+//!   (`not-found` or `forbidden`) is taken off the list and reported as
+//!   [`Notice::RejoinFailed`]. Parting a room, or being kicked or banned
+//!   from it, or its being dropped, takes it off too. Turn this off with
+//!   [`ClientOptions::rejoin_guest_rooms`]. Identities stay members across
+//!   connections (6.1), so nothing is joined again for them.
+//! - **Messages without an answer.** After a resumed session, a guest's
+//!   messages that were sent but not answered when the connection dropped
+//!   are sent again with their cids, which carry over to the resumed
+//!   session, so the server posts each at most once (7.6). After a new
+//!   session the server no longer knows those cids, so a resend could
+//!   post a message twice: they end as [`OutboxStatus::Failed`] with
+//!   `maybe_sent` set.
 //!
 //! # Threads and the runtime
 //!

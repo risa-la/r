@@ -36,6 +36,8 @@ pub trait SignIn: Send + Sync {
 #[derive(Default)]
 pub struct GuestToken {
     session: std::sync::Mutex<Option<(Name, Id)>>,
+    /// Whether the last sign-in resumed its session.
+    resumed: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for GuestToken {
@@ -51,7 +53,16 @@ impl GuestToken {
     pub fn new(session: Option<(Name, Id)>) -> GuestToken {
         GuestToken {
             session: std::sync::Mutex::new(session),
+            resumed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether the last sign-in resumed the stored session (`resumed=yes`,
+    /// 4.2), rather than starting a new one. Read it after
+    /// [`SupervisorEvent::SignedIn`]: then the connection's guest has the
+    /// session's cids, and may send again what got no `OK` (7.6).
+    pub fn resumed(&self) -> bool {
+        self.resumed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The name and token of the session to resume, if any.
@@ -80,7 +91,8 @@ impl GuestToken {
 ///   all. Each new connection starts again from the stored session.
 ///
 /// Either way, the name and the new token from the `OK` go into
-/// [`session`](Self::session), and the uid is in
+/// [`session`](Self::session), with whether the server resumed the session
+/// ([`GuestToken::resumed`]), and the uid is in
 /// [`SupervisorEvent::SignedIn`].
 #[derive(Debug, Clone)]
 pub struct GuestSignIn {
@@ -124,8 +136,11 @@ impl GuestSignIn {
     }
 
     /// Records the session `GUEST <name>` signed in to.
-    fn signed_in(&self, name: &Name, token: Option<Id>) {
+    fn signed_in(&self, name: &Name, token: Option<Id>, resumed: bool) {
         self.session.set(token.map(|t| (name.clone(), t)));
+        self.session
+            .resumed
+            .store(resumed, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -139,8 +154,8 @@ impl SignIn for GuestSignIn {
             let resumed = self.session.get();
             if let Some((name, token)) = &resumed {
                 match session.guest_session(name, Some(token)).await {
-                    Ok((uid, token)) => {
-                        self.signed_in(name, token);
+                    Ok((uid, token, resumed)) => {
+                        self.signed_in(name, token, resumed);
                         return Ok(uid);
                     }
                     Err(e) if name_taken(&e) => {}
@@ -158,8 +173,8 @@ impl SignIn for GuestSignIn {
                 }
                 match session.guest_session(&name, None).await {
                     Err(e) if name_taken(&e) && n < Self::MAX_NAMES => n += 1,
-                    Ok((uid, token)) => {
-                        self.signed_in(&name, token);
+                    Ok((uid, token, _)) => {
+                        self.signed_in(&name, token, false);
                         return Ok(uid);
                     }
                     Err(e) => return Err(e),

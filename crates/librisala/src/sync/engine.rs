@@ -166,6 +166,9 @@ pub struct SyncEngine {
     account: AccountId,
     me: Uid,
     guest: bool,
+    /// A guest's session was resumed on this connection (4.2), so its
+    /// cids carry over (7.6).
+    resumed: bool,
     config: SyncConfig,
     next_req: u64,
     pending: HashMap<ReqId, Pending>,
@@ -209,6 +212,7 @@ impl SyncEngine {
             store,
             account,
             guest: me.is_guest(),
+            resumed: false,
             me,
             config,
             next_req: 1,
@@ -220,6 +224,16 @@ impl SyncEngine {
             ticks: 0,
             out: Output::default(),
         }
+    }
+
+    /// Says that this connection's guest resumed its session: GUEST's
+    /// `OK` carried `resumed=yes` (4.2). The session's cids carry over, so
+    /// messages sent on an earlier connection of the session with no `OK`
+    /// are sent again with their cids (7.6), as an identity's are. Without
+    /// it, a guest marks them as possibly not sent. Call it before
+    /// [`start`](Self::start). Identities need not.
+    pub fn set_resumed(&mut self, resumed: bool) {
+        self.resumed = resumed;
     }
 
     /// The account this engine syncs.
@@ -1378,7 +1392,8 @@ impl SyncEngine {
         let now = self.now();
         let window = self.config.resend_window;
         let lease = self.config.claim_lease;
-        let guest = self.guest;
+        // A guest's cids count only within its session (7.6).
+        let cids_hold = !self.guest || self.resumed;
         let claim = self.claim.clone();
         let store = self.store.clone();
         let in_flight = self.sending.clone();
@@ -1402,11 +1417,12 @@ impl SyncEngine {
                         continue;
                     }
                     // Sent on an earlier connection, with no answer. Only an
-                    // identity's cid survives that, and only for 24 hours.
+                    // identity's cid survives that, or a resumed guest
+                    // session's, and only for 24 hours.
                     let fresh = item
                         .first_sent
                         .is_some_and(|t| now.saturating_duration_since(t) < window);
-                    if guest || !fresh {
+                    if !cids_hold || !fresh {
                         tx.outbox_failed(item.id, FailReason::Unconfirmed)?;
                         continue;
                     }

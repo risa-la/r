@@ -51,10 +51,11 @@
 //!   the conversation's id. Entries are picked and marked as sent in one
 //!   write transaction, with a claim naming the connection, so two
 //!   processes sharing the cache never send the same one, and neither
-//!   settles one the other still waits on. It is resent after a reconnect only while that
-//!   id still matches, only by an identity (a guest's cids count only
-//!   within one session, which may have ended unseen) and only within 23
-//!   hours (7.6).
+//!   settles one the other still waits on. It is resent after a
+//!   reconnect only while that id still matches, only within 23 hours,
+//!   and only by an identity or by a guest whose session was resumed
+//!   ([`SyncEngine::set_resumed`]): a guest's cids count only within one
+//!   session (7.6).
 
 mod engine;
 

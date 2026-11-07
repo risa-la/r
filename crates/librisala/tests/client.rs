@@ -516,3 +516,148 @@ async fn after_its_session_ends_a_guest_takes_a_numbered_name() {
     client.shutdown().await;
     server.stop().await;
 }
+
+/// Waits until the account's connection has closed.
+async fn disconnected(events: &librisala::client::AccountEvents) {
+    within("disconnect", async {
+        loop {
+            if let AccountEvent::State {
+                state: ConnectionState::Disconnected { .. },
+            } = events.next().await.unwrap()
+            {
+                return;
+            }
+        }
+    })
+    .await;
+}
+
+/// Sends `text` as `sam` while the proxy holds back what the server
+/// sends, waits until `ann` sees the message stored, then cuts the
+/// connection: the server has the message, and sam never got its OK.
+async fn send_and_cut_before_the_ok(
+    proxy: &Proxy,
+    sam: &librisala::client::Account,
+    events: &librisala::client::AccountEvents,
+    ann: &mut risala_server::testing::TestClient,
+    text: &str,
+) -> i64 {
+    let a = sam.conversation("#a").unwrap();
+    proxy.hold(true);
+    let entry = a.send(text).await.unwrap();
+    within("the server storing it", async {
+        loop {
+            let line = ann.expect_line().await.unwrap();
+            if line.contains("from=~sam") && line.ends_with(&format!("MSG #a {text}")) {
+                return;
+            }
+        }
+    })
+    .await;
+    let pending = sam.outbox().unwrap();
+    assert_eq!(pending[0].status, OutboxStatus::Sending, "{pending:?}");
+    proxy.cut();
+    // Only once the old connection is gone may the server's bytes flow
+    // again, so the held OK is never delivered.
+    disconnected(events).await;
+    proxy.hold(false);
+    entry.id
+}
+
+/// 4.2, 7.6: a message whose OK was lost in a cut is sent again after the
+/// session resumes, with the same cid, and the server posts it once.
+#[tokio::test]
+async fn a_resumed_guest_resends_what_got_no_ok() {
+    let server = TestServer::builder().room("#a").start().await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (client, addr) = trusting_client(&server, proxy.addr(), 50);
+    let mut ann = guest_in(&server, "ann", "#a").await;
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    let events = sam.subscribe();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+
+    let id = send_and_cut_before_the_ok(&proxy, &sam, &events, &mut ann, "only once").await;
+    let entry = within("sent", sam.wait_outbox(id)).await.unwrap();
+    let OutboxStatus::Sent { seq } = entry.status else {
+        panic!("{entry:?}")
+    };
+    within("sync", sam.wait_synced()).await.unwrap();
+    // Exactly one message, and the resume recorded nothing.
+    assert_eq!(verbs_of(&server, "#a", "~sam").await, ["JOIN", "MSG"]);
+    let a = sam.conversation("#a").unwrap();
+    let mine: Vec<u64> = a
+        .messages(None, 50)
+        .unwrap()
+        .messages
+        .iter()
+        .filter(|m| m.own && m.kind == EventKind::Message)
+        .map(|m| m.seq)
+        .collect();
+    assert_eq!(mine, [seq]);
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// 4.2, 7.6: once the session has ended, its cids are gone, so a message
+/// whose OK was lost is not sent again: it may have been posted.
+#[tokio::test]
+async fn a_guest_whose_session_ended_does_not_resend() {
+    let server = TestServer::builder()
+        .room("#a")
+        .guest_resume(Duration::from_millis(100))
+        .start()
+        .await;
+    let proxy = Proxy::start(server.addr()).await;
+    let (client, addr) = trusting_client(&server, proxy.addr(), 50);
+    let mut ann = guest_in(&server, "ann", "#a").await;
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    let events = sam.subscribe();
+    sam.connect().await.unwrap();
+    sam.join("#a").await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+
+    proxy.hold(true);
+    let a = sam.conversation("#a").unwrap();
+    let entry = a.send("maybe once").await.unwrap();
+    within("the server storing it", async {
+        loop {
+            let line = ann.expect_line().await.unwrap();
+            if line.contains("from=~sam") && line.ends_with("MSG #a maybe once") {
+                return;
+            }
+        }
+    })
+    .await;
+    proxy.cut();
+    disconnected(&events).await;
+    // The session ends before sam comes back: the server records its PART.
+    within("the session ending", async {
+        while verbs_of(&server, "#a", "~sam").await != ["JOIN", "MSG", "PART"] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    proxy.hold(false);
+
+    let entry = within("settled", sam.wait_outbox(entry.id)).await.unwrap();
+    assert!(
+        matches!(
+            entry.status,
+            OutboxStatus::Failed {
+                maybe_sent: true,
+                ..
+            }
+        ),
+        "{entry:?}"
+    );
+    within("sync", sam.wait_synced()).await.unwrap();
+    // A new session: the room was joined again, and nothing was resent.
+    assert_eq!(
+        verbs_of(&server, "#a", "~sam").await,
+        ["JOIN", "MSG", "PART", "JOIN"]
+    );
+    client.shutdown().await;
+    server.stop().await;
+}

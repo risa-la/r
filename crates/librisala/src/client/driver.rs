@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use risala_proto::command::Command;
 use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::unescape;
@@ -125,10 +124,12 @@ async fn drive(
                     }
                     SupervisorEvent::Connected { .. } => shared.set_state(ConnectionState::SigningIn),
                     SupervisorEvent::SignedIn { uid, session, incoming } => {
+                        // A guest's session was resumed or is new (4.2).
+                        let resumed = guest_token.as_ref().is_some_and(|t| t.resumed());
                         if let Some(token) = &guest_token {
                             save_guest_session(shared, token.get()).await;
                         }
-                        match online(shared, uid, session.clone(), incoming, cmds).await {
+                        match online(shared, uid, resumed, session.clone(), incoming, cmds).await {
                             Flow::Disconnected => session.close(),
                             Flow::Reconnect => supervisor.reconnect_now(),
                             Flow::Stop(reply) => {
@@ -269,6 +270,8 @@ enum Ctx {
 /// One signed-in connection.
 struct Online<'a> {
     shared: &'a Arc<AccountShared>,
+    /// A guest's session was resumed on this connection (4.2).
+    resumed: bool,
     session: Arc<Session>,
     engine: Option<SyncEngine>,
     /// The engine's requests in flight, by the `ref` they were sent with.
@@ -286,6 +289,7 @@ struct Online<'a> {
 async fn online(
     shared: &Arc<AccountShared>,
     uid: Uid,
+    resumed: bool,
     session: Arc<Session>,
     mut incoming: mpsc::Receiver<Incoming>,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
@@ -301,14 +305,16 @@ async fn online(
     shared.set_state(ConnectionState::Online {
         uid: uid.to_string(),
     });
-    let engine = SyncEngine::signed_in_as(
+    let mut engine = SyncEngine::signed_in_as(
         shared.store.clone(),
         shared.id,
         uid.clone(),
         shared.options.sync.clone(),
     );
+    engine.set_resumed(resumed);
     let mut on = Online {
         shared,
+        resumed,
         session,
         engine: Some(engine),
         refs: HashMap::new(),
@@ -330,11 +336,14 @@ impl Online<'_> {
         incoming: &mut mpsc::Receiver<Incoming>,
         cmds: &mut mpsc::UnboundedReceiver<Cmd>,
     ) -> Flow {
-        // Guests rejoin the rooms their session lost first, so that SYNC
-        // lists them (4.2).
+        // A guest whose session is new is in no room: it joins its rooms
+        // again first, so that SYNC lists them. A resumed session is still
+        // in them (4.2).
         let mut first = Vec::new();
-        if self.shared.is_guest() && self.shared.options.rejoin_guest_rooms {
-            match self.rooms_to_rejoin().await {
+        if self.shared.is_guest() && !self.resumed && self.shared.options.rejoin_guest_rooms {
+            let store = self.shared.store.clone();
+            let account = self.shared.id;
+            match blocking(&self.shared.rt, move || store.rejoin_rooms(account)).await {
                 Ok(rooms) => {
                     for room in rooms {
                         first.push((Input::Join(room.clone()), Ctx::Rejoin(room)));
@@ -389,38 +398,6 @@ impl Online<'_> {
                 return Flow::Disconnected;
             }
         }
-    }
-
-    /// The rooms a guest joins again on this connection: those it should
-    /// be in, by [`Store::rejoin_rooms`], that a SYNC sent before anything
-    /// else does not list. After a resumed session, that is none (4.2), so
-    /// no JOIN is recorded; after a new session, it is all of them.
-    ///
-    /// If the SYNC fails, it is all of them too. That is safe: JOIN of a
-    /// room the guest is still in records nothing (6.1).
-    async fn rooms_to_rejoin(&self) -> Result<Vec<Room>, StoreError> {
-        let store = self.shared.store.clone();
-        let account = self.shared.id;
-        let mut rooms = blocking(&self.shared.rt, move || store.rejoin_rooms(account)).await?;
-        if rooms.is_empty() {
-            return Ok(rooms);
-        }
-        match self.session.request(Command::Sync).await {
-            Ok(response) if response.is_ok() => {
-                let listed: HashSet<Conv> = response
-                    .lines
-                    .iter()
-                    .filter_map(|msg| match &msg.line {
-                        ServerLine::Conv { conv, .. } => Some(conv.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                rooms.retain(|room| !listed.contains(&Conv::Room(room.clone())));
-            }
-            Ok(response) => debug!(end = ?response.end, "SYNC before rejoining failed"),
-            Err(e) => debug!(error = %e, "SYNC before rejoining failed"),
-        }
-        Ok(rooms)
     }
 
     /// Turns an incoming item into engine input.

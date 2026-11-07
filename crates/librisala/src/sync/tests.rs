@@ -1139,6 +1139,32 @@ fn a_message_that_could_not_be_written_is_not_maybe_sent() {
 }
 
 #[test]
+fn a_resumed_guest_resends_with_its_cid() {
+    // 4.2, 7.6: GUEST's OK said resumed=yes, so the session's cids carry
+    // over, and a message with no OK goes again with the same cid.
+    let mut h = H::new("~sam");
+    h.joined("k1", 3);
+    let (queued, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("one"))
+        .unwrap();
+    h.absorb(out);
+    let (_, cid) = h.expect_msg("one");
+    h.queue.clear();
+    h.engine = SyncEngine::new(h.store.clone(), h.account, h.config.clone()).unwrap();
+    h.engine.set_resumed(true);
+    let r = h.start();
+    h.reply(r, &["CONV #general k1 3 0"], "OK");
+    let (r, again) = h.expect_msg("one");
+    assert_eq!(again, cid);
+    h.reply(r, &[], "OK seq=4");
+    assert_eq!(
+        h.store.outbox_item(queued).unwrap().unwrap().state,
+        OutboxState::Sent(seq(4))
+    );
+}
+
+#[test]
 fn no_resending_after_a_day() {
     let mut h = H::new(ALICE);
     h.joined("k1", 3);

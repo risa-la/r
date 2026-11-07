@@ -242,7 +242,7 @@ async fn guests_resume_their_session_with_its_token() {
             // Resumed: the token changes.
             1 => {
                 peer.expect("@ref=1 GUEST sam token=t1").await;
-                peer.send("@ref=1 OK uid=~sam token=t2").await;
+                peer.send("@ref=1 OK uid=~sam token=t2 resumed=yes").await;
             }
             // The session ended and someone else took ~sam: numbered
             // names, without a token, and not ~sam again.
@@ -262,10 +262,10 @@ async fn guests_resume_their_session_with_its_token() {
     let (supervisor, mut events) =
         Supervisor::spawn(chat_test(), trust, options(&ca, &server), sign_in, fast());
     let session = |name: &str, t: &str| Some((name.parse().unwrap(), t.parse().unwrap()));
-    for (uid, saved) in [
-        ("~sam", session("sam", "t1")),
-        ("~sam", session("sam", "t2")),
-        ("~sam2", session("sam2", "t3")),
+    for (uid, saved, resumed) in [
+        ("~sam", session("sam", "t1"), false),
+        ("~sam", session("sam", "t2"), true),
+        ("~sam2", session("sam2", "t3"), false),
     ] {
         loop {
             if let SupervisorEvent::SignedIn { uid: got, .. } = next(&mut events).await {
@@ -274,6 +274,7 @@ async fn guests_resume_their_session_with_its_token() {
             }
         }
         assert_eq!(token.get(), saved);
+        assert_eq!(token.resumed(), resumed, "{uid}");
     }
     // The token is a secret.
     assert!(!format!("{token:?}").contains("t3"), "{token:?}");
