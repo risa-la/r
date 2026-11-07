@@ -34,6 +34,8 @@ struct HudhudMessage<Actions: View>: View {
             actions
                 .padding(.top, Layout.hudhudActionsSpacing)
         }
+        // A narrow column, so a wide window doesn't stretch the actions.
+        .frame(maxWidth: Layout.hudhudColumnWidth)
         .padding(.horizontal, Layout.hudhudMargin)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

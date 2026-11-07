@@ -33,6 +33,8 @@ extension Layout {
     static let hudhudHeight: CGFloat = 170
     /// Space between Hudhud and the text below.
     static let hudhudSpacing: CGFloat = 28
+    /// The widest Hudhud's text and actions get, from the large-screen mockups.
+    static let hudhudColumnWidth: CGFloat = 300
     /// Horizontal margin that keeps Hudhud's message to a readable measure.
     static let hudhudMargin: CGFloat = 36
 }

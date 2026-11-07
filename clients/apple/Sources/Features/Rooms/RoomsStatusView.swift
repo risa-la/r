@@ -39,18 +39,19 @@ struct RoomsStatusView: View {
             Button {
             } label: {
                 Label("Give Hudhud a job", systemImage: "arrowtriangle.up.fill")
+                    .terminalButtonLabel(primary: true)
                     .frame(maxWidth: .infinity)
             }
             .terminalPrimaryButton()
             secondaryLayout {
                 Button {
                 } label: {
-                    Text("Paste invite").frame(maxWidth: .infinity)
+                    Text("Paste invite").terminalButtonLabel().frame(maxWidth: .infinity)
                 }
                 .terminalSecondaryButton()
                 Button {
                 } label: {
-                    Text("Browse spaces").frame(maxWidth: .infinity)
+                    Text("Browse spaces").terminalButtonLabel().frame(maxWidth: .infinity)
                 }
                 .terminalSecondaryButton()
             }
