@@ -160,6 +160,7 @@
                 openssl # for `openssl s_client`, the protocol's reference "client"
                 curl
                 reuse
+                tlaplus # TLC, for the models in proofs/
               ]
               ++ lib.optionals stdenv.hostPlatform.isLinux [
                 # GNOME client (gtk4-rs + libadwaita)
