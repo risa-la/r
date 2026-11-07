@@ -1154,39 +1154,28 @@ fn blocks_are_kept_per_account_up_to_a_limit() {
     let (alice, bob) = (uid("alice@example.org"), uid("bob@example.net"));
     let target = |s: &str| s.parse::<BlockTarget>().unwrap();
     assert!(store.blocks(&alice).unwrap().is_empty());
-    assert!(
-        store
-            .add_block(&alice, &target("spam@example.net"), 2, t(1))
-            .unwrap()
-    );
-    assert!(
-        store
-            .add_block(&alice, &target("*@bad.example"), 2, t(1))
-            .unwrap()
-    );
+    let add = |s: &str| store.add_block(&alice, &target(s), 2, t(1)).unwrap();
+    assert_eq!(add("spam@example.net"), BlockAdded::Added);
+    assert_eq!(add("*@bad.example"), BlockAdded::Added);
     // A third is over the limit, but one it has already counts as done.
-    assert!(
-        !store
-            .add_block(&alice, &target("x@example.com"), 2, t(1))
-            .unwrap()
-    );
-    assert!(
-        store
-            .add_block(&alice, &target("spam@example.net"), 2, t(1))
-            .unwrap()
-    );
+    assert_eq!(add("x@example.com"), BlockAdded::Full);
+    assert_eq!(add("spam@example.net"), BlockAdded::Already);
     assert_eq!(
         store.blocks(&alice).unwrap(),
         [target("*@bad.example"), target("spam@example.net")]
     );
     assert!(store.blocks(&bob).unwrap().is_empty());
-    store
-        .remove_block(&alice, &target("*@bad.example"))
-        .unwrap();
+    assert!(
+        store
+            .remove_block(&alice, &target("*@bad.example"))
+            .unwrap()
+    );
     // Removing one it does not have changes nothing.
-    store
-        .remove_block(&alice, &target("*@bad.example"))
-        .unwrap();
+    assert!(
+        !store
+            .remove_block(&alice, &target("*@bad.example"))
+            .unwrap()
+    );
     assert_eq!(store.blocks(&alice).unwrap(), [target("spam@example.net")]);
 }
 
@@ -1202,7 +1191,10 @@ fn is_blocked_matches_identities_and_domains() {
         "*@deep.sub.example.com",
     ] {
         let target = target.parse::<BlockTarget>().unwrap();
-        assert!(store.add_block(&alice, &target, 10, t(1)).unwrap());
+        assert_eq!(
+            store.add_block(&alice, &target, 10, t(1)).unwrap(),
+            BlockAdded::Added
+        );
     }
     for (who, blocked) in [
         ("spam@example.net", true),

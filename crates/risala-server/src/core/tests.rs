@@ -2272,7 +2272,7 @@ impl Store for Flaky {
         b: &risala_proto::names::BlockTarget,
         m: usize,
         t: Timestamp,
-    ) -> crate::store::Result<bool> {
+    ) -> crate::store::Result<crate::store::BlockAdded> {
         self.pause.at("add_block");
         self.inner.add_block(u, b, m, t)
     }
@@ -2280,7 +2280,7 @@ impl Store for Flaky {
         &self,
         u: &Uid,
         b: &risala_proto::names::BlockTarget,
-    ) -> crate::store::Result<()> {
+    ) -> crate::store::Result<bool> {
         self.inner.remove_block(u, b)
     }
     fn is_blocked(&self, by: &Uid, u: &Uid) -> crate::store::Result<bool> {

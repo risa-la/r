@@ -661,14 +661,11 @@ async fn blocks_are_stored_listed_and_removed() {
         h.send(&a1, &format!("@ref=x block {target}")).await;
         assert_eq!(a1.lines(), ["@ref=x OK"]);
     }
-    // The account's other connections hear of it, line by line (5.7).
+    // The account's other connections hear of each change, line by line
+    // (5.7). Blocking again changes nothing, so it is not passed on.
     assert_eq!(
         a2.lines(),
-        [
-            "BLOCK spam@example.net",
-            "BLOCK *@bad.example",
-            "BLOCK spam@example.net"
-        ]
+        ["BLOCK spam@example.net", "BLOCK *@bad.example"]
     );
     // A block belongs to the account, and applies to all its devices.
     h.send(&a2, "@ref=l blocks").await;
@@ -706,10 +703,8 @@ async fn blocks_are_stored_listed_and_removed() {
     h.send(&a2, "unblock *@bad.example").await;
     h.send(&a2, "unblock nobody@example.com").await;
     assert_eq!(a2.lines(), ["OK", "OK"]);
-    assert_eq!(
-        a1.lines(),
-        ["UNBLOCK *@bad.example", "UNBLOCK nobody@example.com"]
-    );
+    // Lifting a block that was never there changes nothing either.
+    assert_eq!(a1.lines(), ["UNBLOCK *@bad.example"]);
     h.send(&a1, "blocks").await;
     assert_eq!(a1.lines(), ["BLOCK spam@example.net", "OK"]);
     // Nobody else hears of them.

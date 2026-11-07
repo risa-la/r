@@ -19,7 +19,7 @@ use super::Inner;
 use super::commands::{Fail, Outcome, Reply, check_read, fail, not_supported, room_of};
 use super::state::UserEntry;
 use crate::handler::OutLine;
-use crate::store::StoreError;
+use crate::store::{BlockAdded, StoreError};
 
 /// Whether `c` is a bidirectional text control that 8.2 lists: U+061C,
 /// U+200E, U+200F, U+202A to U+202E, or U+2066 to U+2069. Escaping (3.4)
@@ -262,21 +262,25 @@ impl Inner {
     }
 
     /// BLOCK (5.7). Only identities get here (13). The account's other
-    /// connections get `BLOCK <target>`.
+    /// connections get `BLOCK <target>`, if it is a new block: like READ,
+    /// only a change is passed on.
     pub(super) async fn block(&self, uid: &Uid, reply: &Reply, target: BlockTarget) -> Outcome {
         let user = self.pin(uid);
         let result = async {
             let _blocks = user.blocks.lock().await;
             let (who, max, now) = (uid.clone(), self.config.limits.max_blocks, self.now());
             let stored = target.clone();
-            if !self
+            match self
                 .db(move |s| s.add_block(&who, &stored, max, now))
                 .await?
             {
-                return Err(fail(ErrorCode::Forbidden, "too many blocks"));
+                BlockAdded::Full => return Err(fail(ErrorCode::Forbidden, "too many blocks")),
+                BlockAdded::Already => {}
+                BlockAdded::Added => {
+                    let line = OutLine::new(ServerMessage::new(ServerLine::Block { target }));
+                    user.send_except(&line, reply.handle.id());
+                }
             }
-            let line = OutLine::new(ServerMessage::new(ServerLine::Block { target }));
-            user.send_except(&line, reply.handle.id());
             Ok(Some(OkResponse::new()))
         }
         .await;
@@ -285,15 +289,17 @@ impl Inner {
     }
 
     /// UNBLOCK (5.7). Removing a block the account does not have is not an
-    /// error. The account's other connections get `UNBLOCK <target>`.
+    /// error. The account's other connections get `UNBLOCK <target>`, if a
+    /// block was removed.
     pub(super) async fn unblock(&self, uid: &Uid, reply: &Reply, target: BlockTarget) -> Outcome {
         let user = self.pin(uid);
         let result = async {
             let _blocks = user.blocks.lock().await;
             let (who, stored) = (uid.clone(), target.clone());
-            self.db(move |s| s.remove_block(&who, &stored)).await?;
-            let line = OutLine::new(ServerMessage::new(ServerLine::Unblock { target }));
-            user.send_except(&line, reply.handle.id());
+            if self.db(move |s| s.remove_block(&who, &stored)).await? {
+                let line = OutLine::new(ServerMessage::new(ServerLine::Unblock { target }));
+                user.send_except(&line, reply.handle.id());
+            }
             Ok(Some(OkResponse::new()))
         }
         .await;

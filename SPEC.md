@@ -757,7 +757,9 @@ The server checks the signature as follows:
 1. It checks that the connection's SNI hostname is a name it serves:
    its configured hostname, or a name on one of its certificates. If it
    is not, or the client sent no SNI, the server MUST refuse AUTH and
-   REGISTER with `ERR auth-failed`.
+   REGISTER with `ERR auth-failed`. Its message SHOULD say that the host
+   name is wrong, so that a client does not tell the user their key was
+   removed.
 2. It builds the same bytes, using this connection's SNI hostname and
    nonce.
 3. It gets the identity's keys. If it hosts the identity itself (4.6), it
@@ -1181,9 +1183,11 @@ BLOCKS
   per block, then `OK`.
 - A block belongs to the account and applies to all its devices. Nobody
   else can see it. Only identities can block.
-- After BLOCK or UNBLOCK, the server sends `BLOCK <target>` or
-  `UNBLOCK <target>` to the account's other connections, as it does
-  READ (7.4), so that their lists stay current. These lines are not
+- After a BLOCK or UNBLOCK that changes the account's blocks, the server
+  sends `BLOCK <target>` or `UNBLOCK <target>` to the account's other
+  connections, as it does a READ that moves the marker (7.4), so that
+  their lists stay current. Blocking someone already blocked, or
+  unblocking someone who is not, gets `OK` and sends nothing. These lines are not
   events. A client applies each one to its list, adding or removing that
   one target, rather than replacing its whole list. The lines BLOCKS
   returns agree with them as a CONV line agrees with READ lines (3.6):
@@ -1370,7 +1374,7 @@ discards what it has stored, as in 7.1, before storing the event.
   `ERR not-found`. Anyone who controls a domain can make any number of
   identities, so servers SHOULD limit how often one identity creates
   rooms, and reply `ERR rate-limited` with a `retry` tag beyond the
-  limit (Section 14).
+  limit (Section 14). The limit need not apply to operators.
 
 Who may join:
 
@@ -1867,13 +1871,15 @@ a conversation share a display name, and whenever the user asks:
 
 - To decide whether two people share a display name, a client compares
   the names unescaped (3.4), after removing bidirectional text controls
-  (U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069),
-  ignoring case, and collapsing each run of whitespace into one space,
+  (U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069) and
+  zero-width characters (U+200B to U+200D, U+2060 and U+FEFF), which are
+  invisible, ignoring case, and collapsing each run of whitespace into one space,
   with none at either end.
 - A client SHOULD show the uid as a separate element, not as text
   appended to the name, so that a name cannot pass for a uid. It SHOULD
-  always show the uid when a name contains `@`, or otherwise looks like
-  a uid.
+  always show the uid when a name contains `@`, or a character that
+  looks like one such as U+FF20 or U+FE6B, or otherwise looks like a
+  uid.
 
 Servers MAY refuse display names that contain bidirectional text
 controls, with `ERR forbidden`.

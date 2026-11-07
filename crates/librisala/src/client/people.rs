@@ -60,18 +60,28 @@ fn parse_target(target: &str) -> Result<BlockTarget, ClientError> {
         .map_err(|_| ClientError::Invalid(format!("block target {target:?}")))
 }
 
-/// Whether `c` is a bidirectional text control (8.2): U+061C, U+200E,
-/// U+200F, U+202A to U+202E or U+2066 to U+2069. They can make one name
-/// look like another, or make what follows a name look like part of it.
+/// Whether `c` is removed from display names before they are shown or
+/// compared (8.2):
+///
+/// - bidirectional text controls: U+061C, U+200E, U+200F, U+202A to
+///   U+202E and U+2066 to U+2069. They can make one name look like another,
+///   or make what follows a name look like part of it.
+/// - zero-width characters: U+200B to U+200D, U+2060 and U+FEFF. They are
+///   invisible, so `Alice` and `Al\u{200B}ice` must count as one name.
 fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
     )
 }
 
 /// A display name, unescaped, as it is shown and compared (8.2): without
-/// bidirectional text controls, and with each run of white space, line
+/// bidirectional text controls or zero-width characters, and with each run of white space, line
 /// breaks included, as one space, with none at either end.
 pub(crate) fn clean_name(name: &str) -> String {
     let without: String = name.chars().filter(|&c| !is_bidi_control(c)).collect();
@@ -640,6 +650,25 @@ mod tests {
                 label("Bob Builder", None),
                 label("~frank", Some("frank@example.com")),
                 label("gus＠example.com", Some("gus@example.com")),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_width_characters_are_removed_before_comparing() {
+        // Invisible characters cannot make a second "Alice" (8.2).
+        let people = vec![
+            person("alice@example.org", Some("Alice")),
+            person(
+                "mallory@evil.example",
+                Some("Al\u{200B}i\u{FEFF}ce\u{2060}"),
+            ),
+        ];
+        assert_eq!(
+            labels(&people),
+            [
+                label("Alice", Some("alice@example.org")),
+                label("Alice", Some("mallory@evil.example")),
             ]
         );
     }

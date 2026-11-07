@@ -17,9 +17,9 @@ use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
 use super::schema;
 use super::{
-    Appended, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, HostedKey, IdentityRecord,
-    KeyChange, NewEvent, Page, ReadMarker, Registered, Result, RoomRecord, RoomSettings,
-    ServerSettings, Store, StoreError, StoredEvent, random_id,
+    Appended, BlockAdded, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, HostedKey,
+    IdentityRecord, KeyChange, NewEvent, Page, ReadMarker, Registered, Result, RoomRecord,
+    RoomSettings, ServerSettings, Store, StoreError, StoredEvent, random_id,
 };
 
 /// How long a statement waits for another process's lock before failing.
@@ -1170,7 +1170,7 @@ impl Store for SqliteStore {
         target: &BlockTarget,
         max: usize,
         now: Timestamp,
-    ) -> Result<bool> {
+    ) -> Result<BlockAdded> {
         let target = target.to_string();
         self.write(|tx| {
             let exists = tx
@@ -1179,29 +1179,29 @@ impl Store for SqliteStore {
                 .optional()?
                 .is_some();
             if exists {
-                return Ok(true);
+                return Ok(BlockAdded::Already);
             }
             let count: i64 = tx
                 .prepare_cached("SELECT COUNT(*) FROM blocks WHERE uid = ?")?
                 .query_row([uid.as_str()], |row| row.get(0))?;
             if usize::try_from(count).unwrap_or(usize::MAX) >= max {
-                return Ok(false);
+                return Ok(BlockAdded::Full);
             }
             tx.execute(
                 "INSERT INTO blocks (uid, target, t) VALUES (?1, ?2, ?3)",
                 params![uid.as_str(), target, ms(now)],
             )?;
-            Ok(true)
+            Ok(BlockAdded::Added)
         })
     }
 
-    fn remove_block(&self, uid: &Uid, target: &BlockTarget) -> Result<()> {
+    fn remove_block(&self, uid: &Uid, target: &BlockTarget) -> Result<bool> {
         self.write(|tx| {
-            tx.execute(
+            let removed = tx.execute(
                 "DELETE FROM blocks WHERE uid = ? AND target = ?",
                 params![uid.as_str(), target.to_string()],
             )?;
-            Ok(())
+            Ok(removed > 0)
         })
     }
 

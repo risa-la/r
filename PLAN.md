@@ -647,6 +647,28 @@ Open:
       - Guests still get `forbidden` for commands closed to them (READ,
         ENC and so on), even when they name a uid.
 
+29. **Found while fixing the M3 reviews** (4.5, 5.7, 6.1, 8.2),
+    confirmed with the user on 2026-11-07:
+    - Display names are also compared without zero-width characters, and
+      look-alike `@` signs make the uid show.
+    - A sign-in refused for a wrong host name keeps `auth-failed`, with a
+      message that says so.
+    - BLOCK and UNBLOCK that change nothing are not sent to other devices.
+    - The room-creation limit may exempt operators.
+
+    Implementation choices recorded without a spec change:
+    - A device has one key per identity, used on every server and in
+      MLS. librisala's platform key store is keyed by identity only.
+    - A REGISTER with no answer gets one AUTH attempt with the same key,
+      then `Unconfirmed`, and the key is kept.
+    - librisala refreshes MEMBERS and WHOIS after a reconnect only for
+      what the app watches, at most 64 at a time.
+    - UNREGISTER replies `OK` once the identity is deleted, even if the
+      key file could not be removed. The removal is retried, logged, and
+      redone at startup. A second UNREGISTER at the same time gets
+      `forbidden`.
+    - Certificate names for the SNI check are taken at handshake time.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
@@ -659,7 +681,8 @@ Open:
   out.
 - **Hosted key files** (M3): `risalad` has an optional HTTPS listener
   that serves `/.well-known/risala/<name>`, and later the upload URLs.
-  It also writes the key files to a directory, so operators can serve
-  them from their own web server instead.
+  It builds each file from its own records, so it can only ever serve
+  hosted key files. It also writes the key files to a directory, so
+  operators can serve them from their own web server instead.
 - **The Apple app** keeps its current deployment targets (iOS 18 and
   macOS 15) for now.

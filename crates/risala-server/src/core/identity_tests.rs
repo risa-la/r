@@ -282,7 +282,7 @@ async fn sign_ins_need_the_servers_name_in_sni() {
     let mut w = World::new();
     let bob = identity("bob@example.net");
     w.fetcher.set(&bob, vec![public(1)]);
-    let refused = "ERR auth-failed connect with this server's name in SNI";
+    let refused = "ERR auth-failed the host name this connection used is not one of this server's; connect using the server's own name";
 
     // evil.example connects here with its own name in SNI, and has bob
     // sign the challenge for it.

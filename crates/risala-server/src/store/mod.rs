@@ -443,6 +443,17 @@ pub struct Page {
     pub more: bool,
 }
 
+/// What [`Store::add_block`] did (5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockAdded {
+    /// The block is new.
+    Added,
+    /// The account had it already: nothing changed.
+    Already,
+    /// The account has as many blocks as it may: nothing was stored.
+    Full,
+}
+
 /// Persistent storage for the hub.
 ///
 /// Every method blocks. Implementations are shared between threads.
@@ -584,18 +595,19 @@ pub trait Store: Send + Sync + 'static {
     // ---- Blocks (5.7) ----
 
     /// Adds `target` to the blocks of `uid`, unless the account already has
-    /// `max` others. Returns `false` if it has, and stored nothing. A block
-    /// the account has already is kept, and counts as done.
+    /// `max` others. A block the account has already is kept, and counts as
+    /// done, but changed nothing.
     fn add_block(
         &self,
         uid: &Uid,
         target: &BlockTarget,
         max: usize,
         now: Timestamp,
-    ) -> Result<bool>;
+    ) -> Result<BlockAdded>;
 
-    /// Removes `target` from the blocks of `uid`, if it is there.
-    fn remove_block(&self, uid: &Uid, target: &BlockTarget) -> Result<()>;
+    /// Removes `target` from the blocks of `uid`, if it is there. Returns
+    /// whether it was.
+    fn remove_block(&self, uid: &Uid, target: &BlockTarget) -> Result<bool>;
 
     /// The blocks of `uid`, in the byte order of their wire form.
     fn blocks(&self, uid: &Uid) -> Result<Vec<BlockTarget>>;

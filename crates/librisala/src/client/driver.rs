@@ -172,10 +172,12 @@ async fn drive(
                             && was_accepted(shared, key).await
                         {
                             *kind = RefusedKind::KeyRemoved;
+                            // Lead with the server's own reason: it may be
+                            // about the host name rather than the key (4.5).
                             *message = format!(
-                                "{server} no longer accepts this device's key for {}, which \
-                                 it accepted before: the key was most likely removed from the \
-                                 identity's key file ({message})",
+                                "{server} refused this device's key for {}, which it accepted \
+                                 before: {message}. If the server gives no other reason, the \
+                                 key was probably removed from the identity's key file",
                                 shared.uid
                             );
                         }

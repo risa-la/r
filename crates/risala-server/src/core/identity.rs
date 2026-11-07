@@ -183,7 +183,10 @@ impl Inner {
             .sni
             .ok_or_else(|| auth_failed("connect with SNI to sign in as an identity"))?;
         if !challenge.sni_certified && !self.is_hostname(&host) {
-            return Err(auth_failed("connect with this server's name in SNI"));
+            return Err(auth_failed(
+                "the host name this connection used is not one of this server's; \
+                 connect using the server's own name",
+            ));
         }
         Ok((host, nonce))
     }
