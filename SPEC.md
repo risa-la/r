@@ -1117,6 +1117,9 @@ BLOCKS
   per block, then `OK`.
 - A block belongs to the account and applies to all its devices. Nobody
   else can see it. Only identities can block.
+- A server MAY limit how many blocks an account has, and replies
+  `ERR forbidden` beyond the limit. Domain blocks keep the need for many
+  entries low.
 
 A block applies to direct conversations only. While U has blocked
 someone:
@@ -1680,7 +1683,9 @@ READ <conv> <seq>
 
 → `OK`
 
-Sets the account's read marker for the conversation to `<seq>`.
+Sets the account's read marker for the conversation to `<seq>`. Any
+conversation the account may read (7.2) can have a marker, not only
+those it is in.
 
 - The marker only moves forward. A lower value is ignored. A value
   beyond the conversation's head sets the marker to the head.
@@ -1750,6 +1755,11 @@ sends `@from=<uid> TYPING <conv>` to their connections. It is not stored
 and has no seq. In a direct conversation, `<conv>` follows the same rule
 as for events (5.2).
 
+Only someone who may send messages in the conversation may send TYPING
+(5.3). Others get `ERR forbidden`. A server MAY drop TYPING that comes
+more often than about once a second per conversation; it still replies
+`OK`.
+
 A typing notification lasts 6 seconds, so clients repeat it about every 4
 seconds while the user types. A message from the same user ends it.
 
@@ -1764,7 +1774,8 @@ NAME [<name...>]
 Sets your display name on this server. With no text, it clears your
 display name. A display name is any text up to 128 bytes, for example
 "Alice Martin" or "عائشة". The server sends `@from=<uid> NAME
-[<name...>]` to the connections that share a conversation with you. A
+[<name...>]` to the connections that share a conversation with you,
+and to your own other connections. A
 guest's display name lasts as long as its session (4.2).
 
 Display names are not unique and prove nothing, since anyone can call
@@ -1787,7 +1798,9 @@ WHOIS <uid>
 → `USER <uid> <presence> [<name...>]`, then `OK`
 
 - `<presence>` is `online` if the user has at least one open connection,
-  and `offline` otherwise.
+  and `offline` otherwise. During the wait before PRESENCE reports
+  someone offline (below), they still count as online, so MEMBERS and
+  WHOIS agree with PRESENCE.
 - `<name...>` is the user's display name.
 - MEMBERS requires permission to read the room (7.2).
 - WHOIS replies `not-found` for a user the server does not know, and for
@@ -1819,6 +1832,7 @@ S: PRESENCE offline carol@example.com
 - The server SHOULD wait about 30 seconds after a user's last
   connection closes before reporting them `offline`, so that a client
   reconnecting does not make them blink off and on.
+- A connection never receives PRESENCE about its own account.
 - PRESENCE covers identities only. A guest is online for as long as it
   is a member, and its PART (4.2) says when it leaves.
 

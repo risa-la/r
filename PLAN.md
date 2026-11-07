@@ -575,6 +575,14 @@ Open:
     - UNREGISTER `purge=yes` waits for DELETE in M4 and gets
       `not-supported` until then.
 
+27. **Found while building READ, TYPING, NAME and PRESENCE** (5.7,
+    7.4, 8.1-8.3), all confirmed with the user. People in the 30-second
+    wait before going offline count as online in MEMBERS and WHOIS.
+    TYPING needs the right to post, and may be dropped when sent more
+    than about once a second. READ works in any room you may read.
+    Nobody gets PRESENCE about themselves. NAME also goes to your own
+    devices. Servers may cap blocks, with `forbidden` beyond the cap.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
