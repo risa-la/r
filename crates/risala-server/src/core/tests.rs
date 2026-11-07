@@ -1246,6 +1246,76 @@ async fn guests_cut_off_by_a_crash_part_at_the_next_start() {
     assert!(sam.lines()[0].starts_with("@seq=7;"));
 }
 
+/// Runs only inside [`files_are_private_under_umask_022`], in a process
+/// with umask 022, with the directory to use in `RISALA_TEST_STATE_DIR`.
+#[cfg(unix)]
+#[test]
+fn private_files_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(base) = std::env::var_os("RISALA_TEST_STATE_DIR") else {
+        return;
+    };
+    let base = std::path::PathBuf::from(base);
+    let mode = |path: &std::path::Path| {
+        format!(
+            "{:o}",
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        )
+    };
+    // The umask is 022: a plain new file is readable by everyone.
+    let plain = base.join("plain");
+    std::fs::write(&plain, b"").unwrap();
+    assert_eq!(mode(&plain), "644");
+
+    let mut c = config();
+    c.state_dir = base.join("state").join("risala");
+    let hub = Hub::open(c.clone()).unwrap();
+    assert_eq!(mode(&c.state_dir), "700");
+    assert_eq!(mode(c.state_dir.parent().unwrap()), "700");
+    let db = c.database_path();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db.as_os_str().to_owned();
+        name.push(suffix);
+        assert_eq!(mode(name.as_ref()), "600", "risala.db{suffix}");
+    }
+    drop(hub);
+
+    // Files left open to others are closed to them on the next start.
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let hub = Hub::open(c).unwrap();
+    assert_eq!(mode(&db), "600");
+    drop(hub);
+}
+
+/// The state directory and the database are private whatever the umask
+/// (13). The umask belongs to the whole process, so the checks run in a
+/// child process, started through `sh` to set it.
+#[cfg(unix)]
+#[test]
+fn files_are_private_under_umask_022() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 022 && exec \"$0\" \"$@\"")
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "core::tests::private_files_child",
+            "--test-threads=1",
+        ])
+        .env("RISALA_TEST_STATE_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "the child test failed:\n{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    // The child ran its checks, rather than skipping them.
+    assert!(dir.path().join("plain").exists());
+}
+
 #[tokio::test]
 async fn a_restart_keeps_rooms_ids_and_history() {
     let dir = tempfile::tempdir().unwrap();

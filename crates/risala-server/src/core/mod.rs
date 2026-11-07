@@ -148,8 +148,11 @@ impl Hub {
     ///
     /// This blocks while the database opens. In async code, call it from
     /// `spawn_blocking`.
+    ///
+    /// A new state directory gets mode 0700, and a warning is logged if an
+    /// existing one can be read by others (13).
     pub fn open(config: Config) -> Result<Hub, HubError> {
-        std::fs::create_dir_all(&config.state_dir).map_err(|source| HubError::Io {
+        create_state_dir(&config.state_dir).map_err(|source| HubError::Io {
             path: config.state_dir.clone(),
             source,
         })?;
@@ -254,6 +257,31 @@ impl Hub {
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
+}
+
+/// Creates the state directory, and any missing parents, with mode 0700,
+/// and warns if it is open to others (13): it holds the database and the
+/// generated certificate's private key.
+fn create_state_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                dir = %dir.display(),
+                mode = format!("{:o}", mode & 0o777),
+                "the state directory is open to other users; consider chmod 700"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
 }
 
 /// Records a PART, with no reason, for every guest still in a room when

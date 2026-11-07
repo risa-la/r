@@ -340,7 +340,10 @@ impl TempDir {
         getrandom::fill(&mut bytes).expect("random bytes");
         let name: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let path = std::env::temp_dir().join(format!("risala-test-{name}"));
-        std::fs::create_dir(&path).expect("creating a temporary directory");
+        let mut dir = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
+        dir.create(&path).expect("creating a temporary directory");
         TempDir(path)
     }
 

@@ -34,7 +34,13 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Opens (or creates) the database at `path` and brings its schema up
     /// to date. Fails if the database cannot use WAL mode.
+    ///
+    /// On Unix, the database and its `-wal` and `-shm` files are readable
+    /// by the server's user only (mode 0600, 13), whatever the umask:
+    /// SQLite gives the `-wal` and `-shm` files the database file's mode.
     pub fn open(path: &Path) -> Result<SqliteStore> {
+        private_files(path)
+            .map_err(|e| StoreError::Setup(format!("making {} private: {e}", path.display())))?;
         SqliteStore::setup(Connection::open(path)?, true)
     }
 
@@ -94,6 +100,43 @@ impl SqliteStore {
         tx.commit()?;
         Ok(value)
     }
+}
+
+/// Creates the database file at `path` with mode 0600 if it is missing,
+/// and takes away any access others have to it and its `-wal` and `-shm`
+/// files (13).
+#[cfg(unix)]
+fn private_files(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    // An empty file is an empty database to SQLite.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let with = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    for file in [path.to_owned(), with("-wal"), with("-shm")] {
+        let mode = match std::fs::metadata(&file) {
+            Ok(meta) => meta.permissions().mode(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if mode & 0o077 != 0 {
+            tracing::warn!(file = %file.display(), "taking away other users' access");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn private_files(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
