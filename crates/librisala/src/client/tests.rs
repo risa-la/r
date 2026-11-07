@@ -424,3 +424,32 @@ fn errors_carry_kinds_to_localize() {
         }
     }
 }
+
+#[test]
+fn messages_say_whether_they_are_the_accounts_own() {
+    // A guest signed in as ~sam2 (4.2): its messages are its own, and
+    // ~sam's are someone else's.
+    let sam = guest();
+    let shared = sam.shared();
+    let conv: Conv = "#general".parse().unwrap();
+    let account = shared.id;
+    shared
+        .store
+        .write(|tx| {
+            tx.signed_in_as(&"~sam2".parse().unwrap());
+            let mut row = tx.conv_or_create(account, &conv)?;
+            tx.learn_id(&mut row, &"k1".parse().unwrap(), None)?;
+            tx.store_event(&row, &event(1, "from=~sam2 MSG #general mine"))?;
+            tx.store_event(&row, &event(2, "from=~sam MSG #general theirs"))
+        })
+        .unwrap();
+    let own: Vec<(String, bool)> = sam
+        .conversation("#general")
+        .unwrap()
+        .messages(None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|m| (m.text.unwrap(), m.own))
+        .collect();
+    assert_eq!(own, [("mine".into(), true), ("theirs".into(), false)]);
+}

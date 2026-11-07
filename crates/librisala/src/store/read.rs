@@ -64,6 +64,9 @@ pub struct TimelineItem {
     pub deleted: bool,
     /// Reactions to it (5.3), in byte order.
     pub reactions: Vec<Reaction>,
+    /// Whether the account sent it, from the connection it was stored on
+    /// (4.2).
+    pub own: bool,
 }
 
 /// The count of one reaction on a message.
@@ -165,17 +168,24 @@ fn reactions(conn: &Connection, conv: ConvId, target: i64) -> Result<Vec<Reactio
     Ok(out)
 }
 
-type RawItem = (i64, String, bool, Option<String>, Option<i64>);
+type RawItem = (i64, String, bool, Option<String>, Option<i64>, bool);
 
 const ITEM: &str = "
-    SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq
+    SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq, e.own
     FROM events e LEFT JOIN message_state m ON m.conv = e.conv AND m.seq = e.seq";
 
 /// Timeline items only: no DELETE, edit or reaction.
 const IS_ITEM: &str = "e.verb != 'DELETE' AND (e.rel IS NULL OR e.rel = 'reply')";
 
 fn raw_timeline(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+    ))
 }
 
 fn finish_timeline(
@@ -183,7 +193,7 @@ fn finish_timeline(
     conv: ConvId,
     raw: RawItem,
 ) -> Result<TimelineItem, StoreError> {
-    let (n, line, deleted, text, edit) = raw;
+    let (n, line, deleted, text, edit, own) = raw;
     let event = stored_event(&line)?;
     let meta = event
         .meta
@@ -201,6 +211,7 @@ fn finish_timeline(
         },
         edit: edit.map(seq).transpose()?,
         deleted,
+        own,
         reactions: if is_msg {
             reactions(conn, conv, n)?
         } else {

@@ -442,6 +442,10 @@ pub struct Message {
     pub time: String,
     /// Who caused it.
     pub from: String,
+    /// Whether the account sent it. A guest may have sent it under a
+    /// numbered name, such as `~sam2` for the account `~sam` (4.2), so
+    /// use this rather than comparing `from` with the account's uid.
+    pub own: bool,
     /// What kind of event it is.
     pub kind: EventKind,
     /// The text, unescaped: a message's current text after edits (empty
@@ -502,6 +506,7 @@ impl From<TimelineItem> for Message {
             time_ms: item.t.unix_millis(),
             time: item.t.to_string(),
             from: item.from.to_string(),
+            own: item.own,
             kind,
             text,
             subject,
