@@ -21,6 +21,16 @@ use super::state::UserEntry;
 use crate::handler::OutLine;
 use crate::store::StoreError;
 
+/// Whether `c` is a bidirectional text control that 8.2 lists: U+061C,
+/// U+200E, U+200F, U+202A to U+202E, or U+2066 to U+2069. Escaping (3.4)
+/// leaves them as they are, so the escaped text holds them too.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 impl Inner {
     /// READ (7.4): moves the account's read marker forward, and tells the
     /// account's other connections. Only identities get here (13).
@@ -111,6 +121,14 @@ impl Inner {
     /// conversation with the user, and to the user's other connections.
     /// An identity's is stored; a guest's lasts as long as its session.
     pub(super) async fn name(&self, uid: &Uid, reply: &Reply, name: String) -> Outcome {
+        // They can make one name look like another, or the text after a
+        // name look like part of it (8.2, 14).
+        if name.chars().any(is_bidi_control) {
+            return Err(fail(
+                ErrorCode::Forbidden,
+                "a display name may not hold bidirectional text controls",
+            ));
+        }
         // One NAME at a time, so that every connection gets the names in
         // the order they were stored.
         let _names = self.names_lock.lock().await;

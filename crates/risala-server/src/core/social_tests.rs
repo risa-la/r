@@ -344,6 +344,41 @@ async fn names_reach_everyone_who_shares_a_conversation() {
     assert_eq!(a1.lines(), none());
 }
 
+/// A display name may not hold bidirectional text controls, which can
+/// make one name look like another (8.2, 14). Other text is fine.
+#[tokio::test]
+async fn names_with_bidi_controls_are_refused() {
+    let mut h = harness(timers());
+    let mut alice = h.signed_in_as(ALICE);
+    let mut bob = h.signed_in_as(BOB);
+    h.send(&alice, "name عائشة").await;
+    assert_eq!(alice.lines(), ["OK"]);
+    bob.lines();
+    for c in [
+        '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}',
+    ] {
+        h.send(&alice, &format!("name bob{c}")).await;
+        assert_eq!(
+            alice.lines(),
+            ["ERR forbidden a display name may not hold bidirectional text controls"],
+            "{:04X}",
+            c as u32
+        );
+    }
+    assert_eq!(bob.lines(), none());
+    assert_eq!(
+        h.store.identity(&uid(ALICE)).unwrap().unwrap().display_name,
+        "عائشة"
+    );
+    // Guests too.
+    let mut sam = h.guest("sam").await;
+    h.send(&sam, "name \u{202E}mas").await;
+    assert_eq!(
+        sam.lines(),
+        ["ERR forbidden a display name may not hold bidirectional text controls"]
+    );
+}
+
 #[tokio::test]
 async fn guest_names_last_as_long_as_the_session() {
     let mut h = harness(timers());
