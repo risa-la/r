@@ -30,12 +30,11 @@ explicit. From the repository root, one-shot commands are also available:
 nix run .#apple -- build -C clients/apple --mac
 nix build .#apple-macos    # Release: result/Applications/Risala.app
 nix build .#apple-ios      # Release simulator app, host architecture
-nix build .#librisala      # native Rust rlibs, not yet linked into the app
 ```
 
-`default.nix` is the flake-parts module exposing Apple packages and commands.
+`nix/default.nix` is the flake-parts module exposing Apple packages and commands.
 It builds both Release packages through SweetPad and the host Xcode.
-`toolchain.nix` records the required Xcode version/build and path; package builds
+`nix/toolchain.nix` records the required Xcode version/build and path; package builds
 verify that identity. These builds are cacheable but not hermetic: Xcode and the
 SDKs remain host dependencies. With Nix sandboxing enabled, use
 `--option sandbox relaxed`. Package builds are unsigned and disable Swift macro

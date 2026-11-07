@@ -9,7 +9,7 @@
   outputs =
     inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
-      imports = [ ./clients/apple ];
+      imports = [ ./clients/apple/nix ];
 
       systems = [
         "x86_64-linux"

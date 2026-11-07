@@ -2,17 +2,18 @@
   perSystem =
     { pkgs, lib, ... }:
     let
+      inherit (pkgs.stdenv.hostPlatform) isDarwin isAarch64;
       sweetpad = import ./sweetpad.nix { inherit pkgs lib; };
       toolchain = import ./toolchain.nix;
       source = lib.fileset.toSource {
-        root = ./.;
+        root = ../.;
         fileset = lib.fileset.unions [
-          ./Sources
-          ./Resources
-          ./Tests
-          ./Risala.xcodeproj/project.pbxproj
-          ./Risala.xcodeproj/xcshareddata/xcschemes/Risala.xcscheme
-          ./sweetpad.toml
+          ../Sources
+          ../Resources
+          ../Tests
+          ../Risala.xcodeproj/project.pbxproj
+          ../Risala.xcodeproj/xcshareddata/xcschemes/Risala.xcscheme
+          ../sweetpad.toml
         ];
       };
       buildApp =
@@ -39,7 +40,7 @@
                 if platform == "macos" then "generic/platform=macOS" else "generic/platform=iOS Simulator"
               }' \
               -- -derivedDataPath "$TMPDIR/build" CODE_SIGNING_ALLOWED=NO \
-              ARCHS=${if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "x86_64"} \
+              ARCHS=${if isAarch64 then "arm64" else "x86_64"} \
               'OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox' > "$TMPDIR/build.log" 2>&1 \
               || { cat "$TMPDIR/build.log"; exit 1; }
             runHook postBuild
@@ -63,12 +64,12 @@
         };
     in
     {
-      packages = lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      packages = lib.optionalAttrs isDarwin {
         apple-dev = sweetpad;
         apple-macos = buildApp "macos";
         apple-ios = buildApp "ios";
       };
-      apps = lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      apps = lib.optionalAttrs isDarwin {
         apple = {
           type = "app";
           program = lib.getExe sweetpad;
