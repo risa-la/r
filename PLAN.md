@@ -428,6 +428,17 @@ Open:
     - INVITE for someone already a member records nothing and gets a
       plain `OK`.
 
+21. **Found while building guest resume and post-quantum TLS** (2.1,
+    4.2, 6.2, 7.6).
+    - GUEST's `OK` carries `resumed=yes` when a token resumed the
+      session, so guests can resend unconfirmed messages and skip the
+      extra SYNC.
+    - The resumed session's old connection gets BYE and nothing more is
+      read from it.
+    - `guests none` removes guests from that room only.
+    - Servers SHOULD refuse a client without X25519MLKEM768 with
+      `handshake_failure`.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

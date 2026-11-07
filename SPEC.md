@@ -131,7 +131,7 @@ part of the protocol. Examples use the domain names reserved by
 $ openssl s_client -connect chat.example.org:7472 -quiet
 S: RISALA 1 chat.example.org 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e Welcome!
 C: guest sam
-S: OK uid=~sam
+S: OK uid=~sam token=q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3
 C: join #general
 S: @seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general
 S: SET #general topic General chat. Be kind.
@@ -175,8 +175,10 @@ upgrade step.
 - Both sides MUST use TLS 1.3 [RFC8446].
 - Both sides MUST use the hybrid post-quantum key exchange
   X25519MLKEM768 [ECDHE-MLKEM]. Clients MUST offer it, and servers MUST
-  NOT complete a handshake that uses any other key exchange. This keeps
-  recorded connections secret against a future quantum computer.
+  NOT complete a handshake that uses any other key exchange. A server
+  SHOULD refuse such a client with the `handshake_failure` alert, so
+  that clients can tell the user why. This keeps recorded connections
+  secret against a future quantum computer.
   `openssl s_client` offers it by default from OpenSSL 3.5 on.
 - The client MUST send the server's hostname using Server Name Indication
   (SNI) [RFC6066]. The server uses this name to choose its certificate.
@@ -562,7 +564,7 @@ a challenge by hand (Appendix A).
 GUEST <name> [token=<token>]
 ```
 
-→ `OK uid=~<name> token=<token>`
+→ `OK uid=~<name> token=<token> [resumed=yes]`
 
 A guest has a name for as long as its **session** lasts. The session
 starts with GUEST and ends a while after its connection closes, unless
@@ -592,8 +594,10 @@ app sends QUIT as it goes to the background (9.2):
 - `GUEST <name> token=<token>` with the session's current token resumes
   it. The connection becomes that guest again, still a member of its
   rooms, and no JOIN or PART is recorded. If another connection still
-  has the session, the server closes that one with BYE. The `OK`
-  carries a new token, and the old one stops working.
+  has the session, the server closes that one with BYE and reads no
+  more commands from it. The `OK` carries `resumed=yes` and a new token,
+  and the old token stops working. Without `resumed=yes`, a new session
+  has started.
 - A token that matches no current session for that name is ignored, and
   GUEST works as it does without one.
 - The client catches up on what happened in the meantime with SYNC and
@@ -1309,8 +1313,8 @@ SET <room> <key> [<value...>]
   spam, an owner can switch the room to `read`.
 - Changing `guests` applies at once to the guests already in the room.
   Under `read` they stay but can no longer send. Under `none` the
-  server removes them, recording a PART for each as when a guest
-  session ends (4.2).
+  server removes them from the room, recording a PART for each. Their
+  sessions and their other rooms are not affected (4.2).
 - `retention <days>`: events older than this many days are deleted
   (7.5). The value MUST be at least 1, and MUST NOT be longer than the
   server's own retention period (`ERR forbidden`). Shortening it also
@@ -1665,7 +1669,8 @@ To make resending safe:
   match, so a resent message is sent to the new room. Otherwise the
   client would be given the seq of someone else's event.
 - For guests, the server checks cids only within one guest session,
-  which a resumed connection continues (4.2). A guest whose session has
+  which a resumed connection continues (4.2). A guest whose `OK` carried
+  `resumed=yes` may resend with the same cid. A guest whose session has
   ended cannot resend safely. Its client SHOULD show a message that
   never got its `OK` as possibly not sent, rather than send it again.
 - The cid is not part of the event.
