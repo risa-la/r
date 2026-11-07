@@ -3,7 +3,8 @@
 risala is a chat protocol for independent servers, made of plain UTF-8
 text lines over TLS. Think "modern IRC": rooms, guests and a terminal
 you can type into, plus stored history, portable identities, replies,
-edits, reactions, file sharing and push notifications.
+edits, reactions, file sharing, push notifications and end-to-end
+encryption.
 
 ```
 $ openssl s_client -connect chat.example.org:7472 -quiet
@@ -16,15 +17,17 @@ SET #general topic General chat. Be kind.
 SET #general public yes
 SET #general guests write
 SET #general retention server
+SET #general e2ee no
 OK id=k3f9q2 head=8812
 msg #general hello!
 @seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam MSG #general hello!
 OK seq=8813
 ```
 
-- **Usable by hand.** Every feature works from `openssl s_client`.
-- **Small.** A complete client or server is realistic to write in Go,
-  Rust or C.
+- **Usable by hand.** Everything outside encrypted conversations works
+  from `openssl s_client`.
+- **Small where it can be.** A client for public rooms needs only TLS
+  and ML-DSA. Encrypted conversations need MLS.
 - **Independent servers.** No federation, and no server is special.
   Every conversation lives on exactly one server.
 - **Portable identity.** `alice@example.org` is whoever holds a key
@@ -32,10 +35,13 @@ OK seq=8813
   identity works on any server.
 - **History.** Every event has a sequence number, so a client that
   reconnects fetches exactly what it missed.
-- **No end-to-end encryption** in this version. The server can read
-  everything.
+- **End-to-end encrypted** direct conversations and private rooms, using
+  MLS. Devices keep their history keys, so encrypted history still syncs
+  and works offline.
+- **Post-quantum.** Hybrid ML-KEM key exchange for TLS and MLS, and
+  ML-DSA signatures.
 
-The protocol is defined in [SPEC.md](SPEC.md) (draft-01). Anything in it
+The protocol is defined in [SPEC.md](SPEC.md) (draft-02). Anything in it
 may still change.
 
 ## This repository

@@ -1,8 +1,8 @@
 # risala
 
 ```
-risala                                                        draft-01
-A Line-Based Chat Protocol                                  2026-11-06
+risala                                                        draft-02
+A Line-Based Chat Protocol                                  2026-11-07
 Status: Draft. Anything in this document may change.
 Copyright (c) 2026 Risala developers. Licensed under CC BY 4.0.
 ```
@@ -10,12 +10,15 @@ Copyright (c) 2026 Risala developers. Licensed under CC BY 4.0.
 ## Abstract
 
 risala is a protocol for real-time chat on independent servers. It runs
-over TLS and is made of UTF-8 text lines, so a person can use it directly
-from a terminal with `openssl s_client`. It provides:
+over TLS and is made of UTF-8 text lines, so a person can use most of it
+directly from a terminal with `openssl s_client`. It provides:
 
 - guest access
-- portable identities built on domain names and Ed25519 keys
-- stored history that clients can catch up on without gaps
+- portable identities built on domain names and ML-DSA keys
+- end-to-end encryption for direct conversations and private rooms,
+  using MLS with post-quantum algorithms
+- stored history that clients can catch up on without gaps, including
+  encrypted history
 - replies, edits and reactions
 - optional file uploads over HTTPS
 - push notifications that carry no message content
@@ -36,10 +39,11 @@ Servers do not federate: every conversation lives on exactly one server.
 9. Push Notifications
 10. Server Administration
 11. Keepalive and Closing
-12. Command Summary
-13. Security Considerations
-14. Assigned Values
-15. References
+12. End-to-End Encryption
+13. Command Summary
+14. Security Considerations
+15. Assigned Values
+16. References
 - Appendix A. Using risala by Hand
 - Appendix B. Test Vectors
 - Appendix C. Push Gateways
@@ -63,36 +67,47 @@ IRC hard to use and implement today:
 - having no history
 
 It adds what people now expect from chat: identities that work on any
-server, stored history, replies, edits, reactions, file sharing and push
-notifications.
+server, stored history, replies, edits, reactions, file sharing, push
+notifications and end-to-end encryption.
 
 ### 1.1. Goals
 
-- **Usable by hand.** Every feature can be used by typing lines into
-  `openssl s_client`. Uploading a file also needs an HTTP tool such as
-  `curl`.
-- **Small.** A complete client or server is realistic to write in Go,
-  Rust or C. A client needs TLS and Ed25519. A server also needs an HTTPS
-  client. File uploads are optional and need HTTPS on both sides.
+- **Usable by hand.** Every feature outside encrypted conversations can
+  be used by typing lines into `openssl s_client`. Uploading a file also
+  needs an HTTP tool such as `curl`. Encrypted conversations need a real
+  client (Section 12).
+- **Small where it can be.** A client for public rooms needs only TLS and
+  ML-DSA. Encrypted conversations need an MLS implementation in clients,
+  and in servers to check commits. A server also needs an HTTPS client.
+  File uploads are optional and need HTTPS on both sides.
+- **Private.** Direct conversations, and private rooms that choose it,
+  are end-to-end encrypted. The server stores them but cannot read them.
+- **Post-quantum.** Connections and encrypted conversations use hybrid
+  post-quantum key exchange, so recorded traffic stays secret against a
+  future quantum computer. Signatures use ML-DSA.
 - **Independent servers.** Anyone can run a server. No server is special,
   and nothing depends on central infrastructure.
 - **Portable identity.** A person can prove the same identity, such as
   `alice@example.org`, to any server. No server has to trust any other
   server for this.
 - **History.** Servers store conversations. A client that reconnects
-  fetches exactly what it missed.
+  fetches exactly what it missed. Devices keep the keys of encrypted
+  conversations, so encrypted history can be fetched and read offline
+  too.
 
 ### 1.2. Non-goals
 
 This version does not provide:
 
 - **Federation.** Messages never move between servers.
-- **End-to-end encryption.** The server can read every message, including
-  direct messages.
+- **Hiding metadata.** Even in encrypted conversations, the server sees
+  who talks to whom and when (Section 14).
+- **Encrypting public rooms.** Anyone may join a public room, so
+  encrypting it would protect nothing.
 - **Browser clients.** There is no WebSocket or HTTP transport. Clients
   are native applications.
 - **Binary data on the chat connection.** Files, where a server supports
-  them, travel over HTTPS (Section 5.6).
+  them, travel over HTTPS (Section 5.6). MLS data travels in base64.
 - **Group direct conversations.** A conversation is either a direct
   conversation between two people or a room. A group talks in a room,
   which can be private.
@@ -123,6 +138,7 @@ S: SET #general topic General chat. Be kind.
 S: SET #general public yes
 S: SET #general guests write
 S: SET #general retention server
+S: SET #general e2ee no
 S: OK id=k3f9q2 head=8812
 C: history #general before=8812 limit=2
 S: @seq=8810;t=2026-11-06T15:30:11.004Z;from=alice@example.org MSG #general anyone around?
@@ -157,6 +173,11 @@ away. The default port is 7472. There is no unencrypted mode and no
 upgrade step.
 
 - Both sides MUST use TLS 1.3 [RFC8446].
+- Both sides MUST use the hybrid post-quantum key exchange
+  X25519MLKEM768 [ECDHE-MLKEM]. Clients MUST offer it, and servers MUST
+  NOT complete a handshake that uses any other key exchange. This keeps
+  recorded connections secret against a future quantum computer.
+  `openssl s_client` offers it by default from OpenSSL 3.5 on.
 - The client MUST send the server's hostname using Server Name Indication
   (SNI) [RFC6066]. The server uses this name to choose its certificate.
   The name is also what authentication is bound to (Section 4.5). A
@@ -233,6 +254,11 @@ After the TLS handshake, both sides exchange lines.
   including the LF. A line from a server MUST NOT be longer than 16384
   bytes. The difference leaves room for the tags a server adds when it
   relays a client's text.
+- **Long lines.** Lines that carry MLS data (Section 12) may be longer.
+  A line whose verb is COMMIT, ENC, GROUPINFO, INIT, KEYPKG, REPORT or
+  WELCOME may be up to 8 MiB (8388608 bytes) including the LF from a
+  client, and 8 MiB plus 16384 bytes from a server. Before a connection
+  has signed in, the server applies the normal limits to every line.
 - **Bad lines.** A server that receives a line that is too long MUST
   discard everything up to the next LF and reply `ERR too-long`. It MAY
   reply as soon as it knows the line is too long, before the LF arrives. A server
@@ -282,9 +308,11 @@ its command.
 - A lone `@` carries no tags. Receivers MUST accept it, and senders
   SHOULD leave it out.
 - Receivers MUST ignore tags they do not understand.
-- From a client command, a server copies only `reply`, `edit`, `react`
-  and `file` onto the event the command causes.
+- From a client command, a server copies only `reply`, `edit`, `react`,
+  `file` and `frank` onto the event the command causes.
 - Tag keys that begin with `x-` are reserved for experiments.
+- The content of an encrypted message has tags of its own, which never
+  appear on the connection (12.8).
 
 | Tag | Set by | Value | Meaning |
 |---|---|---|---|
@@ -303,6 +331,9 @@ its command.
 | `retry` | server | seconds | With `ERR rate-limited`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
 | `id` | server | id | On a JOIN event: the room's id (6.1) |
+| `frank` | client | base64 | On ENC: the franking commitment (12.8) |
+| `frank-key` | client | base64 | On REPORT of an ENC event: the franking key (5.8) |
+| `content` | client | base64 | On REPORT of an ENC event: the reported content (5.8) |
 
 ### 3.3. Parameters
 
@@ -460,6 +491,9 @@ S: @ref=7 OK id=k3f9q2 more=1
 | `forbidden` | Not allowed because of permissions, a ban or server policy |
 | `last-owner` | The only owner of a room cannot give up the role |
 | `not-supported` | The server does not offer this feature |
+| `encrypted` | The conversation is encrypted, so this command cannot be used in it (Section 12) |
+| `stale` | The conversation's group is not in the state the command needs. Apply the newer commits, or commit pending removals, and try again (12.5, 12.6) |
+| `invalid` | MLS data or a franking commitment did not verify (Section 12) |
 | `rate-limited` | Too many requests. The `retry` tag says when to try again |
 | `internal` | Something went wrong on the server |
 
@@ -566,44 +600,50 @@ any other server.
 A key file is UTF-8 text. Each line lists one key:
 
 ```
-ed25519 <key> [<label...>]
+mldsa44 <key> [<label...>]
 ```
 
-- `<key>` is the 32-byte Ed25519 public key [RFC8032], in base64 with
-  padding [RFC4648]. It is 44 characters long.
+- `<key>` is the 1312-byte ML-DSA-44 public key [FIPS204], in base64
+  with padding [RFC4648]. It is 1752 characters long.
 - `<label...>` is an optional note for people, usually the name of the
   device.
 - Blank lines and lines starting with `#` are ignored.
-- Lines with a key type other than `ed25519` are ignored, so that new key
+- Lines with a key type other than `mldsa44` are ignored, so that new key
   types can be added later.
 
-Each device SHOULD have its own key. Revoking a lost device's key means
-deleting its line.
+Each device SHOULD have its own key. A device's key is also its key in
+encrypted conversations (12.2). Revoking a lost device's key means
+deleting its line, which also removes the device from those
+conversations (12.6).
+
+Keys are shortened here. Appendix B has a full one.
 
 ```
 # alice@example.org
-ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop
-ed25519 xOANpWbIg5OCt//dfeEit/1AngQtJJdLe4ks1mxhd5M= phone
+mldsa44 xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp… laptop
+mldsa44 0Kc2Ffq9WbL7xNHe1sTr5VgmPa3Ziu4D… phone
 ```
 
-When a server fetches a key file:
+Servers fetch key files to check sign-ins, and devices fetch them to
+check the members of encrypted conversations (12.12). When a server or
+device fetches a key file:
 
 - It MUST use HTTPS and validate the certificate against public
   certificate authorities.
 - It MUST NOT follow redirects. Only a 200 response counts. Any other
   response means the identity has no keys.
-- It MUST stop after 10 seconds or 64 KiB. A file that is larger, or
+- It MUST stop after 10 seconds or 256 KiB. A file that is larger, or
   that does not arrive in time, means the identity has no keys.
-- It MUST use at most 64 keys: the first 64 different, valid `ed25519`
+- It MUST use at most 64 keys: the first 64 different, valid `mldsa44`
   keys in the file. Repeated keys, malformed lines and ignored lines do
   not count toward the 64.
-- It MUST NOT connect to loopback, private, link-local or other
+- A server MUST NOT connect to loopback, private, link-local or other
   special-purpose addresses [RFC6890] unless its operator has configured
   it to. Users choose the domain, so without this rule they could make
   the server probe its own internal network.
 - It MAY cache the file for up to one hour. If a signature does not
-  verify against a cached file, the server SHOULD fetch the file again
-  once before failing, so that a newly added device works straight away.
+  verify against a cached file, it SHOULD fetch the file again once
+  before failing, so that a newly added device works straight away.
 
 A server that notices a key has been removed SHOULD close the
 connections that signed in with it.
@@ -630,9 +670,11 @@ The client signs these bytes with its device's private key:
 - `nonce` is the nonce from the greeting.
 - `uid` is the identity, in lower case.
 
-`<signature>` is the 64-byte Ed25519 signature, in base64 with padding.
-It is plain Ed25519, with no prehash and no context. Appendix B has a
-worked example.
+`<signature>` is the 2420-byte ML-DSA-44 signature [FIPS204], in base64
+with padding, which is 3228 characters long. It is plain ML-DSA.Sign,
+with an empty context string and no prehash. The signer may use the
+hedged (randomised) or the deterministic variant, and verifiers cannot
+tell them apart. Appendix B has a worked example.
 
 The server checks the signature as follows:
 
@@ -709,10 +751,12 @@ KEY DEL <key>
 - `KEY LIST` sends one `KEY <key> [<label...>]` line per key, then OK.
 - `KEY ADD` adds a key. To set up a new device, the new device shows its
   public key, and the user adds it from a device that is already signed
-  in.
+  in. The new device then joins the identity's encrypted conversations
+  (12.6).
 - `KEY DEL` removes a key. The server MUST refuse to remove the last key
   (`ERR forbidden`). It SHOULD close the connections that use the
-  removed key.
+  removed key. It deletes the key's KeyPackages and pending Welcomes
+  (Section 12), and devices remove its leaves from their groups (12.6).
 
 ### 4.8. Deleting an Identity
 
@@ -728,8 +772,9 @@ otherwise). Having to type it out guards against sending UNREGISTER by
 mistake. Any identity may do this on any server.
 
 The server removes the identity from all its rooms, and deletes its
-roles, read markers, blocks, display name, cids and push registrations.
-Then:
+roles, read markers, blocks, display name, cids, push registrations,
+KeyPackages, pending Welcomes and backups (Section 12). Members' devices
+remove its leaves from encrypted rooms (12.6). Then:
 
 - **With `purge=yes`,** the server also deletes every message the
   identity has sent, in every conversation, as if by DELETE (5.4). The
@@ -756,9 +801,10 @@ by DELETE, or by an operator (10.4).
 - A **room**, such as `#general`, has any number of members (Section 6).
 - A **direct conversation** is between two identities. Each side names it
   by the other person's uid: Alice talks to `bob@example.net`, and Bob
-  talks to `alice@example.org`. It starts with the first message. A
-  conversation with yourself, for example for notes, is named by your
-  own uid.
+  talks to `alice@example.org`. It starts when one of them creates its
+  encryption group with INIT (12.5). A conversation with yourself, for
+  example for notes, is named by your own uid. Direct conversations are
+  always end-to-end encrypted (Section 12).
 
 There are no other kinds. There are no group direct conversations: a
 group of people talks in a room, which can be private (6.2).
@@ -791,8 +837,8 @@ An event line looks like this:
 ```
 
 - `seq`, `t` and `from` MUST be present on every event.
-- An event has the same parameters as the command that caused it. A
-  guest's automatic PART has no reason text.
+- An event has the same parameters as the command that caused it,
+  except COMMIT (12.5). A guest's automatic PART has no reason text.
 - In a room, `<conv>` is the room.
 - In a direct conversation, `<conv>` is the other participant, as seen
   by whoever receives the line. It is therefore always the uid to send
@@ -805,8 +851,9 @@ An event line looks like this:
   (10.4). The server writes each line of a direct conversation for the
   person receiving it, in live events and in HISTORY alike.
 
-The event verbs are MSG and DELETE (this section), and JOIN, PART,
-INVITE, KICK, BAN, UNBAN, SET and ROLE (Section 6).
+The event verbs are MSG and DELETE (this section), JOIN, PART, INVITE,
+KICK, BAN, UNBAN, SET and ROLE (Section 6), and ENC and COMMIT
+(Section 12).
 
 The server sends each new event straight away to every connection in
 the conversation. For a room, that means the connections of all its
@@ -862,6 +909,11 @@ Both participants of a direct conversation may send messages in it.
 Anyone else gets `ERR forbidden`, or `ERR not-found` for a room they
 cannot see (6.1).
 
+In an encrypted conversation, messages are sent with ENC instead
+(12.8), and MSG gets `ERR encrypted`. The tags of this section then
+travel inside the encryption, and devices apply their rules themselves
+(12.11).
+
 ### 5.4. Deleting Messages
 
 ```
@@ -872,7 +924,7 @@ DELETE <conv> <seq>
 
 Deletes message `<seq>`. The author may delete their own messages. In
 rooms, moderators and owners may delete any message (6.3). Only MSG
-events can be deleted.
+and ENC events can be deleted.
 
 The server records a `DELETE <conv> <seq>` event and MUST erase the
 stored text of the target. The one exception is the copy kept for an
@@ -897,6 +949,9 @@ S: @seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam;reply=8810;deleted MSG #genera
 Clients SHOULD discard deleted text they have stored. Deletion cannot
 reach copies that people have already made.
 
+ENC events are deleted the same way. Since the server cannot see their
+edits and reactions, it does not delete those with them (12.11).
+
 ### 5.5. Mentions
 
 A mention is `@` followed by a uid, for example `@alice@example.org` or
@@ -907,14 +962,17 @@ Uids never end with `.` (3.5), so in `thanks @~sam.` the mention is
 
 Servers use mentions to decide when to send push notifications (Section
 9). Clients SHOULD highlight mentions of the user. They SHOULD also let
-users type a display name and insert the matching uid.
+users type a display name and insert the matching uid. In encrypted
+conversations, mentions are inside the encryption, and the server cannot
+see them (12.11).
 
 ### 5.6. Files
 
 Servers MAY support file uploads. INFO reports the largest file allowed
 as `upload=<bytes>`, or `upload=no` (8.5). Files never travel over the
 chat connection. They go over HTTPS, so a client that uploads or
-downloads files also needs an HTTPS client.
+downloads files also needs an HTTPS client. In encrypted conversations,
+devices encrypt files before uploading them (12.11).
 
 ```
 UPLOAD <size> <type> <name...>
@@ -1030,9 +1088,9 @@ Reports message `<seq>` as abusive to the people who can act on it, its
 Rules for REPORT:
 
 - Anyone who can read the message may report it, guests included.
-- The target MUST be a message (a MSG event, which includes edits and
-  reactions) that is not deleted (`ERR not-found`). It MUST NOT be your
-  own (`ERR forbidden`).
+- The target MUST be a message (a MSG or ENC event, which includes edits
+  and reactions) that is not deleted (`ERR not-found`). It MUST NOT be
+  your own (`ERR forbidden`).
 - `<reason...>` is free text of up to 512 bytes.
 - If the same uid reports the same message again, the server replies
   with the existing report's id.
@@ -1065,6 +1123,26 @@ S: @report=p4x8n2;seq=8816;t=2026-11-06T15:43:58.019Z;from=~spammer MSG #general
   the report is made.
 - The event line is a copy for review. Clients MUST NOT treat it as a
   new event in the conversation.
+
+The server cannot read an ENC event (12.8), so a report of one reveals
+its content to the reviewers. The `frank` tag on the event makes this
+checkable:
+
+- The reporter's client adds two tags to REPORT, both in base64 with
+  padding: `frank-key`, the message's franking key, and `content`, its
+  decrypted content (12.8).
+- The server checks that HMAC-SHA-384 of `content` under `frank-key`
+  equals the event's `frank` tag. If the tags are missing or do not
+  match, it replies `ERR invalid`. Devices make the same check before
+  they show a message, so the content can only be what its author sent.
+- Reviewers receive the ENC event with an empty payload and the
+  `frank-key` and `content` tags added. They decode `content` to read
+  the message, and MAY check the commitment themselves.
+
+```
+S: @report=w7c1m5;t=2026-11-07T10:20:41.118Z;from=bob@example.net REPORT alice@example.org 2 harassment
+S: @report=w7c1m5;seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m…;frank-key=9vQe…;content=VEVYVCBz… ENC alice@example.org 1
+```
 
 ```
 REPORTS <room>
@@ -1139,6 +1217,9 @@ Who may join:
 - Joining a private room takes an invitation (6.4), unless you hold the
   role owner or mod in it (6.3).
 - Guests may join only rooms whose `guests` setting is not `none`.
+- Joining an encrypted room always takes an invitation, made by adding
+  your devices to the room's group (12.6). This holds for owners,
+  moderators and server operators too.
 
 A room you cannot see, meaning a private room you are not a member of
 and hold no role or invitation in, gets `ERR not-found`, as if it did
@@ -1159,12 +1240,15 @@ PART <room> [<reason...>]
 
 Leaves the room. Owners and moderators keep their role when they leave
 (6.3). Guests leave all their rooms automatically when they disconnect.
-PART for a room you are not a member of gets `ERR not-found`.
+PART for a room you are not a member of gets `ERR not-found`. The one
+exception is an invitee of an encrypted room, for whom PART declines the
+invitation (12.6). The server records a PART event for it.
 
 A room goes on existing when its last member leaves. Nothing about it
 changes: its history, settings, roles, invitations and bans all stay.
 Its owners and moderators can join it again at any time, and so can
-server operators (Section 10). Only ADMIN DROP (10.4) deletes a room.
+server operators (Section 10), except that an encrypted room takes a new
+invitation (12.6). Only ADMIN DROP (10.4) deletes a room.
 
 ### 6.2. Settings
 
@@ -1180,6 +1264,8 @@ SET <room> <key> [<value...>]
 | `public` | `yes` or `no` | `yes` | owners |
 | `guests` | `none`, `read` or `write` | `write` | owners |
 | `retention` | a number of days, or `server` | `server` | owners |
+| `e2ee` | `yes` or `no` | `no` | nobody: only INIT sets it (12.5) |
+| `history` | `shared` or `joined` | `shared` | owners, in encrypted rooms |
 
 - `public yes`: LIST shows the room, and anyone may join.
 - `public no`: LIST does not show the room, and joining takes an
@@ -1198,6 +1284,20 @@ SET <room> <key> [<value...>]
   server's own retention period (`ERR forbidden`). Shortening it also
   applies to events already stored.
 - `retention server`: the room follows the server's retention period.
+- `e2ee yes`: the room is end-to-end encrypted (Section 12). INIT turns
+  this on (12.5), and nothing turns it off. SET of `e2ee` gets
+  `ERR forbidden`, and so does SET of `public` or `guests` in an
+  encrypted room.
+- `history shared`: devices that add a new member to an encrypted room
+  also give it the keys to read the room's earlier messages (12.9).
+- `history joined`: new members can read only what is sent after they
+  are added.
+- `history` exists only in encrypted rooms, and its snapshot SET lines
+  leave it out elsewhere. Its value lives in the room's group, where
+  devices read and enforce it (12.9). An owner changes it with a COMMIT
+  (12.5), and the server then records the SET event. SET of `history`
+  gets `ERR encrypted` in an encrypted room, and `ERR forbidden` in any
+  other.
 
 Keyword and number values ignore trailing spaces, so `SET #r public yes `
 works. A topic keeps its spaces. An unknown key gets
@@ -1231,6 +1331,8 @@ membership:
 
 - Someone who leaves with PART keeps the role. They can join again
   without an invitation, even in a private room, and have the role back.
+  An encrypted room is the exception: there, coming back always takes a
+  new invitation (12.6).
 - KICK and BAN take the role away.
 - A room therefore never loses its owners because they left.
 
@@ -1240,7 +1342,7 @@ membership:
 | Delete anyone's messages | | ✓ | ✓ |
 | Set `topic` | | ✓ | ✓ |
 | INVITE, KICK, BAN, UNBAN, BANS | | ✓ | ✓ |
-| Set `public`, `guests` and `retention` | | | ✓ |
+| Set `public`, `guests`, `retention` and `history` | | | ✓ |
 | ROLE | | | ✓ |
 
 - Moderators may kick and ban only plain members. Owners may act on
@@ -1248,7 +1350,7 @@ membership:
 - Guests in a room with `guests read` cannot send messages, reactions or
   typing notifications.
 - Server operators (Section 10) have owner rights in every room, and may
-  join any room without an invitation.
+  join any room without an invitation, except an encrypted one (6.1).
 
 ```
 ROLE <room> <uid> <role>
@@ -1298,6 +1400,13 @@ An INVITE event that reaches an invitee who is not a member, and a KICK
 or BAN event that reaches its target, are notifications. They do not
 make the receiver a member, and a client that is not a member does not
 store them as the room's history.
+
+In an encrypted room, INVITE gets `ERR encrypted`. An invitation there
+is a COMMIT that adds the invitee's devices, and the server records the
+INVITE event for it (12.6). After KICK or BAN, members' devices remove
+the person's devices from the group, so someone who was kicked needs a
+new invitation to come back.
+
 For moderation across a whole server, see Section 10.
 
 ---
@@ -1356,7 +1465,9 @@ A client catches up like this:
    again to learn the id, then catch up as above.
 
 A client MAY download the whole history of its conversations for reading
-offline. Sequence numbers make the download easy to resume.
+offline. Sequence numbers make the download easy to resume. In encrypted
+conversations, the client decrypts the events with the history keys it
+keeps (12.9).
 
 If a conversation the client knows about is missing from SYNC, the
 account is no longer in it. It may have left, been kicked or banned, or
@@ -1373,7 +1484,7 @@ correct server, but it keeps the client consistent.
 ### 7.2. HISTORY
 
 ```
-HISTORY <conv> [after=<seq>] [before=<seq>] [limit=<n>]
+HISTORY <conv> [after=<seq>] [before=<seq>] [limit=<n>] [only=commit]
 ```
 
 → events in ascending seq order, then `OK id=<id> more=<0 or 1>`
@@ -1395,6 +1506,11 @@ conversation afresh as in 7.1.
   asked for. `more` says whether there are more.
 - `after` may be `0`, which a client with nothing stored uses to read
   from the start (7.1). `before` and `limit` are at least 1.
+- **`only=commit`** returns only COMMIT events, so that a device can
+  bring an encrypted conversation's group up to date before it fetches
+  messages (12.11). `more` then says whether there are more COMMIT
+  events. Such a page does not move the sync point (7.1), since it
+  skips other events.
 
 You may read the history of:
 
@@ -1435,6 +1551,8 @@ edits and reactions. RELATED returns them:
   with `after` set to the last seq returned.
 - **`limit`** defaults to 50, as in HISTORY.
 - The same rules about who may read apply as for HISTORY (7.2).
+- In encrypted conversations it returns no ENC events, since the server
+  cannot see what they target (12.11).
 
 ```
 C: history #general before=4001 limit=2
@@ -1488,16 +1606,18 @@ from gaps (7.1, 7.2).
 
 The sequence numbers of expired events are never reused. Files expire
 together with the messages they are attached to (5.6). Copies kept for
-open reports do not expire (5.8).
+open reports do not expire (5.8). COMMIT events expire like other
+events. Section 12.11 says what a device that missed expired commits
+does.
 
 ### 7.6. Resending Safely
 
-A connection might drop after a client sends MSG but before the OK
-arrives. The client then cannot know whether the message went through.
+A connection might drop after a client sends MSG or ENC but before the
+OK arrives. The client then cannot know whether the message went through.
 To make resending safe:
 
-- A client MAY tag MSG with `cid=<token>`. The token is a random value
-  of at least 16 characters, chosen anew for each message.
+- A client MAY tag MSG or ENC with `cid=<token>`. The token is a random
+  value of at least 16 characters, chosen anew for each message.
 - If the same identity has already sent a message with that cid in the
   last 24 hours, to the same conversation, the server MUST NOT create a
   new event. It replies `OK seq=<seq>` with the existing message's seq.
@@ -1683,8 +1803,13 @@ whom U has not blocked (5.7), that:
 - is in a direct conversation with U (reason `dm`)
 - mentions U in a room U is a member of (reason `mention`)
 - replies to one of U's messages (reason `reply`)
+- is in an encrypted room U is a member of (reason `message`)
 
-Edits and reactions are never notable.
+Edits and reactions are never notable. In encrypted conversations,
+though, the server cannot see mentions, replies, edits or reactions
+(12.11). There, every ENC event from someone else is notable, even one
+that only carries keys (12.9), and the app decides after syncing whether
+to show a notification.
 
 U's **unread count** is the number of notable events, across all U's
 conversations, that are newer than U's read marker in their
@@ -1726,8 +1851,9 @@ NOTIFY <tag> <reason> <unread>
 ```
 
 The body is one line in the format of Section 3, ending with LF.
-`<reason>` is `dm`, `mention`, `reply` or `read`, and `<unread>` is the
-unread count. A reason is 1 to 32 characters of `a-z`, `0-9` and `-`.
+`<reason>` is `dm`, `mention`, `reply`, `message` or `read`, and
+`<unread>` is the unread count. A reason is 1 to 32 characters of `a-z`,
+`0-9` and `-`.
 Later versions may add reasons. A gateway forwards a
 NOTIFY with a reason it does not know unchanged, and an app treats it as
 new activity: it connects and syncs as for any other push.
@@ -1770,8 +1896,11 @@ offer administration tools for any server.
   `ERR not-supported`. For example, a server that hosts no identities has
   no use for the commands in Section 10.5.
 - Operators also have owner rights in every room through the ordinary
-  commands of Section 6. They may join any room without an invitation.
-  Their actions in rooms are recorded as events like anyone else's.
+  commands of Section 6. They may join any room without an invitation,
+  except an encrypted one (6.1). Their actions in rooms are recorded as
+  events like anyone else's.
+- Operators cannot read encrypted conversations, unless a member reports
+  a message (5.8). They can still delete, purge and drop them.
 - The ADMIN commands themselves create no events, except PURGE (10.4).
 
 ### 10.1. Operators
@@ -1856,7 +1985,8 @@ ADMIN REPORTS
 - **`ADMIN DROP`** deletes a room together with all of its events and
   files. This cannot be undone.
   - Every member is removed from the room, as if kicked. The room's
-    roles, invitations and bans are deleted too.
+    roles, invitations and bans are deleted too, and so are its group,
+    GroupInfo and pending Welcomes if it is encrypted (Section 12).
   - The server sends `DROP <room> [<reason...>]` to every connection in
     the room. No event is recorded, since the room's events are gone.
   - The room stops appearing in SYNC.
@@ -1867,7 +1997,7 @@ ADMIN REPORTS
   - The name becomes free. If anyone creates a room with it later
     (6.1), that is a new room with a new id, whose sequence numbers
     start again at 1. Clients that missed the DROP notice the new id
-    (7.1). Links that name a seq in the old room (Section 14) do not
+    (7.1). Links that name a seq in the old room (Section 15) do not
     carry over, and may point to a different message in the new room.
 - **`ADMIN PURGE`** deletes the messages `<uid>` has sent, in every
   conversation.
@@ -1895,7 +2025,9 @@ ADMIN UNREGISTER <uid>
   lines (4.7), then OK.
 - **`ADMIN ADDKEY`** and **`ADMIN DELKEY`** work like KEY ADD and KEY DEL
   (4.7), but for any hosted identity. DELKEY may remove the last key,
-  which locks the identity.
+  which locks the identity. A key added with ADDKEY can join the
+  identity's encrypted conversations like any other device (12.6), so
+  its users see it as a new device (12.12).
 - **`ADMIN UNREGISTER`** deletes a hosted identity, as UNREGISTER (4.8)
   without `purge=yes` does. The server removes its key file and closes
   its connections. Messages it has sent stay unless they are purged.
@@ -1962,7 +2094,736 @@ reasons, such as shutting down, an idle timeout or a removed key.
 
 ---
 
-## 12. Command Summary
+## 12. End-to-End Encryption
+
+### 12.1. Overview
+
+Direct conversations, and rooms whose `e2ee` setting is `yes` (6.2), are
+**encrypted conversations**. Their messages are encrypted on the
+sender's device, and only the devices of the conversation's members can
+read them. The server stores and relays them, but cannot read them.
+
+risala uses Messaging Layer Security (MLS) [RFC9420] for this, with
+post-quantum algorithms (12.2):
+
+- Each encrypted conversation has one MLS **group**. Each device in it
+  is one member of the group, called a **leaf**.
+- A group moves through numbered **epochs**. Each commit (12.5), for
+  example one that adds or removes devices, starts a new epoch with new
+  keys.
+- The server is the group's delivery service. It puts commits in order,
+  checks them against the conversation's membership, and keeps the
+  public part of each group, so that devices can join while no one else
+  is online. It never holds a group's secrets.
+- Messages are encrypted with a **history key** that devices derive for
+  each epoch (12.9). Devices keep these keys, so they can decrypt stored
+  history at any time: after reconnecting, offline, and on a new device.
+
+Encrypted conversations need a client that implements MLS, and cannot
+be used by hand. Everything else in this document still can.
+
+In the examples of this section, long base64 values are shortened with
+`…`.
+
+### 12.2. Algorithms
+
+All encrypted conversations use one MLS cipher suite, `0x0052`:
+
+| Part | Algorithm |
+|---|---|
+| KEM | X-Wing, which combines ML-KEM-768 and X25519 [XWING] |
+| AEAD | ChaCha20-Poly1305 [RFC8439] |
+| Hash | SHA-384 |
+| Signatures | ML-DSA-44 [FIPS204] |
+
+- The KEM is post-quantum and classical at once. Its keys stay secret as
+  long as either ML-KEM-768 or X25519 holds.
+- Signatures are ML-DSA-44 alone, as for signing in (4.5).
+- The MLS protocol version is `mls10`.
+- `<keypackage>`, `<groupinfo>`, `<commit>` and `<welcome>` in this
+  section are each an MLSMessage [RFC9420] in base64 with padding
+  [RFC4648]. `<tree>` is a ratchet tree, encoded as the data of a
+  `ratchet_tree` extension (the `optional<Node>` vector of [RFC9420]),
+  in base64 with padding.
+
+Credentials:
+
+- A leaf's credential is an MLS `basic` credential. Its identity is the
+  identity's uid in lower case, in UTF-8.
+- Its signature key is one of the identity's device keys (4.4), as the
+  raw 1312-byte ML-DSA-44 public key. A device uses the same key to sign
+  in and to sign in MLS. The labels that MLS and Section 4.5 put in front
+  of what they sign keep the two uses apart.
+- Two leaves of a group never share a signature key [RFC9420].
+- Only identities have leaves. Guests cannot take part in encrypted
+  conversations.
+
+Every group carries a **conversation extension** in its group context,
+of type `0xF2A1` (Section 15). Leaves list this type in their
+capabilities, and the group lists it in its `required_capabilities`. It
+ties the group to one conversation, and holds the room's `history`
+setting (12.9):
+
+```
+enum {
+    reserved(0),
+    direct(1),
+    room(2),
+    (255)
+} ConversationKind;
+
+enum {
+    reserved(0),
+    shared(1),
+    joined(2),
+    (255)
+} HistoryMode;
+
+struct {
+    ConversationKind kind;
+    opaque name<V>;
+    HistoryMode history;
+} RisalaConversation;
+```
+
+- For a direct conversation, `name` is the uids of its two participants
+  in lower case, sorted byte by byte and joined by one space. For a
+  conversation with yourself, it is your uid alone. `history` is
+  `shared`.
+- For a room, `name` is the room's id (5.1), and `history` is the room's
+  setting.
+
+### 12.3. Encrypted Conversations
+
+- **Direct conversations** are always encrypted, including a
+  conversation with yourself.
+- **Rooms** are encrypted when an owner sends INIT while they are the
+  room's only member (12.5). The room is then private for good: `public`
+  is `no`, `guests` is `none` and `e2ee` is `yes`, and none of these can
+  change again (`ERR forbidden`). Events from before INIT stay as they
+  were, unencrypted.
+- **Public rooms** are never encrypted. Anyone may join them, so
+  encryption would protect nothing.
+
+In an encrypted conversation, messages are sent with ENC (12.8), and MSG
+gets `ERR encrypted`. In an encrypted room, INVITE also gets
+`ERR encrypted`, because inviting someone means adding their devices to
+the group (12.6). ENC and COMMIT in a room that is not encrypted get
+`ERR forbidden`. Section 12.11 lists what else changes.
+
+A client MUST NOT send MSG to a direct conversation, or to a room for
+which it holds a group, whatever the server says about the room's
+settings. Otherwise a server could make it send in the clear.
+
+### 12.4. Key Packages
+
+To add a device to a group, a member needs one of that device's
+KeyPackages. Devices upload KeyPackages in advance, so that others can
+add them while they are offline.
+
+```
+KEYPKG ADD <keypackage>
+KEYPKG COUNT
+KEYPKG GET <uid>
+```
+
+- **`KEYPKG ADD`** stores a KeyPackage for this connection's device, and
+  replies `OK`. The server checks that the KeyPackage uses the cipher
+  suite of 12.2, that its credential is the connection's uid, that its
+  signature key is the connection's device key (4.5), that its
+  signatures verify, and that its lifetime has not ended. Otherwise it
+  replies `ERR invalid`. A server MAY limit how many KeyPackages it keeps
+  for each device (`ERR forbidden`).
+- **`KEYPKG COUNT`** replies `OK count=<n> last-resort=<yes or no>`: the
+  number of ordinary KeyPackages the server holds for this device, and
+  whether it holds a last-resort one.
+- **`KEYPKG GET`** sends one `KEYPKG <uid> <keypackage>` line for each
+  device of `<uid>` that has a KeyPackage, then `OK`. It leaves out the
+  device that asks, and devices whose keys are no longer in the
+  identity's key file. A uid the server does not know gets
+  `ERR not-found`.
+
+The server hands out each ordinary KeyPackage once, then deletes it. A
+device MAY also upload one KeyPackage with the `last_resort` extension
+[MLS-EXT]. The server hands that one out only when the device has no
+ordinary KeyPackage left, and keeps it, so the device can always be
+added. A new one replaces it.
+
+A device SHOULD keep about ten ordinary KeyPackages on the server, and
+upload more when KEYPKG COUNT reports fewer than five. Servers delete
+KeyPackages whose lifetime has ended, and SHOULD rate-limit KEYPKG GET,
+since every request uses KeyPackages up.
+
+Only identities can use KEYPKG.
+
+### 12.5. Groups and Commits
+
+```
+INIT <conv> <groupinfo> <tree>
+```
+
+→ for a room, SET events; then `OK id=<id> epoch=0`
+
+INIT creates the group of an encrypted conversation. The client creates
+an MLS group with a new random 32-byte group id, in which its own device
+is the only member, and whose conversation extension (12.2) names the
+conversation. It sends the group's GroupInfo for epoch 0, with the
+`external_pub` extension, and its ratchet tree. The server checks them
+as it checks commits (below), checks the conversation extension, and
+rejects a group id it has seen before (`ERR invalid`). `<id>` in the
+reply is the conversation's id (5.1).
+
+- **A direct conversation** must not have a group yet (`ERR stale`). If
+  the conversation does not exist, INIT starts it, under the rules of
+  5.1.
+- **A room** must not be encrypted yet (`ERR stale`). The sender must be
+  an owner and the room's only member (`ERR forbidden`). Since the
+  extension names the room's id, the client gets it from INFO first. The
+  server sets `public` to `no`, `guests` to `none`, `e2ee` to `yes` and
+  `history` to the extension's value, and records a SET event for each,
+  with the sender as `from`. It also ends the room's pending
+  invitations, which were made without the group.
+
+```
+COMMIT <conv> <commit> <groupinfo> [<welcome>]
+```
+
+→ COMMIT event, then `OK seq=<seq> epoch=<epoch>`
+
+COMMIT changes the group:
+
+- `<commit>` holds a Commit. It is sent as a PublicMessage, or as an
+  external commit (12.6), so the server and every device can check it.
+- `<groupinfo>` is the GroupInfo of the new epoch, with the
+  `external_pub` extension and without a `ratchet_tree` extension.
+- `<welcome>` is the Welcome for the devices the commit adds. It is
+  present exactly when the commit adds devices (`ERR invalid`).
+
+The server records the commit as an event. Unlike other events, it does
+not repeat the command's parameters. `<epoch>` is the new epoch:
+
+```
+@seq=<seq>;t=<timestamp>;from=<uid> COMMIT <conv> <epoch> <commit>
+```
+
+Devices apply commits in seq order. The server accepts a commit only if
+all of these hold:
+
+1. **It is for the current epoch.** Otherwise the server replies
+   `ERR stale`, because another commit came first. The client applies
+   the commits it missed, then makes its change again if it is still
+   needed.
+2. **It is valid.** It verifies under MLS as far as someone outside the
+   group can check: its signatures, the new ratchet tree and its parent
+   hashes, and the GroupInfo, which must match the new epoch. Otherwise
+   `ERR invalid`.
+3. **The committer may change the group** (`ERR forbidden`). The
+   committer's signature key is the connection's device key, and its
+   identity is a participant of the direct conversation, or a member or
+   invitee of the room.
+4. **Its proposals are allowed** (`ERR forbidden`). All proposals are
+   inside the commit, by value. There are no separate proposals.
+   - **Add** adds a device whose key is in its identity's key file. In a
+     direct conversation, the identity must be one of the participants.
+     In a room, it must be a member, someone already invited, or someone
+     the committer may invite (6.4). In the last case the commit is an
+     invitation (12.6). If the device's key already has a leaf, the
+     same commit removes that leaf.
+   - **Remove** removes a leaf of the committer's own identity, a leaf
+     whose key is no longer in its identity's key file, or, in a room, a
+     leaf of an identity that is neither a member nor invited.
+   - **GroupContextExtensions** changes only the `history` field of the
+     conversation extension, in a room, and the committer must be an
+     owner. The server records `SET <room> history <value>` after the
+     COMMIT event.
+   - **ExternalInit** is allowed only in an external commit. An external
+     commit may hold at most one Remove, and only of the joiner's own
+     earlier leaf (12.6).
+   - No other kinds are allowed. A device refreshes its own keys with a
+     commit that has no proposals (12.6).
+5. **The group stays small enough.** A group has at most 512 leaves.
+
+After it accepts a commit, the server:
+
+- records the COMMIT event
+- records an INVITE event (6.4) for each identity the commit invites,
+  after the COMMIT event, with the committer as `from`
+- keeps the new GroupInfo, and the new ratchet tree, which it builds
+  from the commit
+- stores the Welcome for each device the commit adds (12.7)
+
+```
+GROUPINFO <conv>
+```
+
+→ `GROUPINFO <conv> <epoch> <seq> <groupinfo> <tree>`, then `OK`
+
+Returns the group's current GroupInfo, as sent with the last commit, and
+its current ratchet tree. `<seq>` is the seq of the COMMIT event that
+started the epoch, or `0` in epoch 0. A device uses these to join by
+external commit (12.6), so only identities that may do that can ask
+(`ERR forbidden`): a participant of the direct conversation, or a member
+or invitee of the room that has a leaf in the group. A conversation
+without a group gets `ERR not-found`.
+
+### 12.6. Membership
+
+Devices check every change to a group before applying it, besides what
+MLS itself requires.
+
+**Joining.** When a device joins a group, by Welcome (12.7) or by
+external commit, it checks the whole group:
+
+- The conversation extension names the conversation the device meant to
+  join: for a direct conversation, its two participants, and for a
+  room, the id that the room's JOIN, INFO or SYNC reports.
+- In a direct conversation, every leaf belongs to one of its two
+  participants, or in a conversation with yourself, to you.
+- Every leaf's key passes the key check below.
+
+A device MUST NOT join a group that fails the first two checks.
+
+**Commits.** For every commit, a device MUST reject it if it:
+
+- in a direct conversation, adds a leaf of anyone other than the
+  participants, or in a conversation with yourself, of anyone else
+- changes the conversation extension other than its `history` field
+- is an external commit by an identity that had no leaf in the group
+  before it, except a participant of a direct conversation
+- removes a leaf for no reason the device can see: the leaf belongs to
+  the committer's own identity, its key is no longer in its identity's
+  key file, or, in a room, the conversation's events show that its
+  identity left, was kicked or banned, or declined an invitation
+
+It also applies the key check to every leaf that the commit adds or
+changes. A device that rejects a commit can no longer follow the group.
+It SHOULD warn the user, and stop sending in that conversation.
+
+**The key check.** A leaf passes if its signature key is listed in the
+key file of the identity in its credential (12.12). If the device cannot
+confirm that, because the key is not listed, or because the key file
+cannot be fetched right now, the leaf is **unconfirmed**. This happens
+to honest devices too, for example when a device catches up on a commit
+that added a key that has been revoked since. So the device does not
+reject the commit, but while any leaf of a group is unconfirmed:
+
+- it MUST NOT send ENC in that conversation
+- it tries the key file again from time to time
+- it SHOULD commit the removal of the leaf, which the server allows when
+  the key is not in the key file (12.5)
+
+Together these rules mean the server cannot, on its own, let anyone else
+read an encrypted conversation. A direct conversation only ever holds
+the devices of its two participants, every new identity in a room is
+added by a member's device, and a device that joins by itself must use a
+key from its identity's key file. Section 14 covers the one exception,
+whoever controls an identity's key file.
+
+**Starting a direct conversation.** Alice's device:
+
+1. Sends INIT for the conversation.
+2. Fetches KeyPackages for Bob's devices and her own other devices with
+   KEYPKG GET.
+3. Sends a COMMIT that adds them all, with a Welcome.
+4. Sends her message with ENC (12.8).
+
+```
+C: init bob@example.net AAEABA… gAAU…
+S: OK id=d7hq2klm epoch=0
+C: keypkg get bob@example.net
+S: KEYPKG bob@example.net AAEABQABAFI…
+S: KEYPKG bob@example.net AAEABQABAFI…
+S: OK
+C: commit bob@example.net AAEAAQ… AAEABA… AAEAAw…
+S: @seq=1;t=2026-11-07T10:02:11.540Z;from=alice@example.org COMMIT bob@example.net 1 AAEAAQ…
+S: OK seq=1 epoch=1
+```
+
+If both participants send INIT at about the same time, one of them gets
+`ERR stale`, and its device then joins the other's group by Welcome or
+external commit.
+
+**Creating an encrypted room.** The owner creates the room with JOIN
+(6.1), reads its id with INFO, then sends INIT for it.
+
+**Inviting.** In an encrypted room, someone who may invite (6.4) fetches
+the invitee's KeyPackages and sends a COMMIT that adds the invitee's
+devices, with a Welcome. The server records the invitation as an INVITE
+event. The invitee's devices are in the group from that epoch on, and
+the invitee joins the room with JOIN as usual. An invitee who does not
+want to join sends PART for the room, which ends the invitation.
+
+In an encrypted room, joining always takes an invitation made this way,
+including for owners and moderators who left and for server operators
+(`ERR forbidden`). If every member leaves, no device remains that could
+add anyone, so the room cannot be used again.
+
+**New devices.** A device that signs in for the first time joins each of
+its identity's encrypted conversations listed by SYNC (7.1), starting
+with the conversation with itself, so that the identity's other devices
+can send it history keys (12.9). It can join in either of two ways:
+
+- Another device of the same identity adds it with a KeyPackage.
+- It joins by **external commit**: it fetches GROUPINFO, then sends a
+  COMMIT holding an external commit. This is allowed when its identity
+  is a participant of the direct conversation, or a member or invitee of
+  the room that already has a leaf in the group. If the device's key
+  still has a leaf, for example after the app was reinstalled with the
+  same key, the external commit MUST remove that leaf.
+
+**Leaving.** An identity's leaves must be removed from a room's group
+when it is no longer a member or invited: after PART, KICK, BAN or
+UNREGISTER. A device's leaves must be removed from every group when its
+key leaves its identity's key file (4.7).
+
+- The server stops sending the conversation's events to an identity
+  that left straight away, as for any room (6.1).
+- While a group has a leaf that the server knows must be removed, the
+  server refuses ENC in that conversation with `ERR stale`. The device
+  then commits the removal and sends again. So no message is encrypted
+  for someone who has left.
+- Devices learn that keys were removed by fetching key files again
+  (12.12). A device whose own identity removed a key SHOULD remove that
+  key's leaves from all its groups.
+
+Since PART removes an identity's leaves, coming back to an encrypted room
+always takes a new invitation.
+
+**Refreshing keys.** A device SHOULD commit a fresh leaf of its own,
+with a commit that has no proposals, about once a week while it is in
+use. After that commit, keys that someone may have stolen from the
+device no longer decrypt new messages.
+
+### 12.7. Welcome Messages
+
+A device that a commit adds gets a Welcome. The server keeps it until
+the device deletes it.
+
+```
+WELCOME LIST
+WELCOME DEL <id>
+```
+
+The server sends each Welcome to the device's connections as soon as it
+accepts the commit, and `WELCOME LIST` sends every pending one, then
+`OK`:
+
+```
+WELCOME <conv> <id> <seq> <welcome> <tree>
+```
+
+- `<conv>` names the conversation as for events (5.2).
+- `<id>` identifies the Welcome. It is chosen by the server, in the
+  form of an id (3.5).
+- `<seq>` is the seq of the COMMIT event that added the device.
+- `<tree>` is the ratchet tree of the epoch the commit started. The
+  server attaches it, and the device checks it against the tree hash in
+  the Welcome.
+
+The device checks the group as in 12.6, then joins it in that epoch. It
+then reads the conversation's commits after `<seq>`, once it may read
+the conversation (an invitee, once it has joined the room), and applies
+them. When it has processed the Welcome, the device deletes it with
+`WELCOME DEL <id>`, which replies `OK`.
+
+A device SHOULD send `WELCOME LIST` after each sign-in. The server
+deletes the pending Welcomes of a device whose leaf has been removed, or
+whose key has been removed.
+
+### 12.8. Encrypted Messages
+
+```
+ENC <conv> <epoch> <payload...>
+```
+
+→ ENC event, then `OK seq=<seq>`
+
+Sends an encrypted message:
+
+- `<epoch>` is the epoch whose history key encrypts the message. It MUST
+  be the group's current epoch, and the group MUST NOT have a leaf that
+  must be removed (`ERR stale` for both, see 12.6).
+- The connection's device key MUST have a leaf in the group
+  (`ERR forbidden`). Who may send is otherwise as for MSG (5.3).
+- `<payload...>` is the encrypted message in base64 with padding. It
+  MUST decode to at least 48 bytes (`ERR invalid`). The server checks
+  nothing more about it.
+- The `frank` tag is required (`ERR invalid`). It is the message's
+  franking commitment in base64, which lets the content be reported
+  (5.8).
+- The `file` tag (5.6) and the `cid` tag (7.6) MAY be added, and work as
+  for MSG.
+
+```
+C: @frank=hT3m…;cid=q2r8sv0alm3nb7xk enc bob@example.net 1 3qG8w…
+S: @seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m… ENC bob@example.net 1 3qG8w…
+S: OK seq=2
+```
+
+The structures below use the notation of MLS [RFC9420]:
+
+```
+struct {
+    opaque message_id[16];
+    opaque sender_key_id[48];
+    opaque frank_key[32];
+    opaque content<V>;
+    opaque signature<V>;
+    opaque padding<V>;
+} RisalaMessage;
+
+struct {
+    opaque group_id<V>;
+    uint64 epoch;
+    opaque message_id[16];
+    opaque sender_key_id[48];
+    opaque frank_key[32];
+    opaque content<V>;
+} RisalaMessageTBS;
+
+struct {
+    opaque group_id<V>;
+    uint64 epoch;
+} RisalaMessageAAD;
+```
+
+To encrypt a message, the sender's device:
+
+1. Writes the content lines (below) as `content`.
+2. Sets `message_id` and `frank_key` to new random values.
+3. Sets `sender_key_id` to the SHA-384 hash of its raw signature key.
+4. Signs: `signature` is SignWithLabel(signature key, "risala message",
+   RisalaMessageTBS) [RFC9420], with the fields above and the group's id
+   and epoch.
+5. Sets `padding` to zero bytes. It SHOULD pad RisalaMessage to a
+   multiple of 256 bytes, so that the server learns less about lengths.
+6. Picks a random 32-byte `salt`, and derives the message key:
+   ExpandWithLabel(history_key, "risala message key", salt, 32)
+   [RFC9420], where `history_key` is the epoch's history key (12.9).
+7. Encrypts RisalaMessage with ChaCha20-Poly1305 under the message key,
+   with a nonce of 12 zero bytes, and RisalaMessageAAD as the associated
+   data. A message key is used only once, so a fixed nonce is safe.
+8. Sends `salt` followed by the ciphertext as the payload, and
+   HMAC-SHA-384(frank_key, content) [RFC2104] as the `frank` tag.
+
+To decrypt an ENC event, a device:
+
+1. Checks that `<epoch>` is the epoch the group was in at the event's
+   place in the conversation: the epoch of the latest COMMIT event before
+   it, or `0`.
+2. Finds the history key of the conversation and `<epoch>`.
+3. Derives the message key from the first 32 bytes of the payload, and
+   decrypts the rest.
+4. Finds the sender's key. If the device was in the group in that epoch,
+   it is the signature key of the leaf of `from` whose SHA-384 hash is
+   `sender_key_id`. Otherwise it is a key of `from` with that hash that
+   the device has seen in a key file or a group. It verifies `signature`
+   with that key.
+5. Checks that HMAC-SHA-384(frank_key, content) equals the `frank` tag.
+6. Checks that it has not already seen `message_id` in the conversation,
+   so that the server cannot replay a message under a new seq.
+
+If any step fails, the device MUST NOT show the content, and MAY show
+that the message could not be read. There is one exception to step 4. A
+device that was not in the group in that epoch, and does not know the
+sender's key, for example because the key was revoked before the device
+restored the history key from a backup (12.10), MAY show the content
+marked as unverified. A device that was in the group in that epoch knows
+every leaf, and MUST NOT show the content unless the signature verifies.
+
+The content is one or more lines in UTF-8, in the format of Section 3,
+each ending in LF. It is either a single TEXT line, or any number of KEY
+and RECOVERY lines. Devices ignore lines with verbs they do not know.
+
+```
+[@<tags>] TEXT <text...>
+KEY <id> <epoch> <key>
+RECOVERY <key>
+```
+
+- **TEXT** is a message. Its text follows the rules of MSG (5.3): it is
+  escaped as in 3.4, it MUST NOT be empty, and it is at most 8192 bytes.
+  It may carry these tags:
+  - `reply`, `edit` and `react`, as in 5.3. Each comes with `target`,
+    the target message's `message_id` in base64 with padding. A device
+    ignores the reference unless the event at that seq is a message with
+    that id, so the server cannot point it at another message.
+  - `file-key` and `file-type`, for files (12.11).
+- **KEY** shares a history key (12.9).
+- **RECOVERY** shares a recovery key (12.10).
+
+For example, a reply as it appears inside the encryption:
+
+```
+@reply=15;target=0Jx1HkY3x9z2b5R0qWm1fA== TEXT see you at 12
+```
+
+### 12.9. History Keys
+
+For each epoch of each group it is in, a device derives the epoch's
+history key [RFC9420]:
+
+```
+history_key = MLS-Exporter("risala history", "", 48)
+```
+
+Devices keep history keys for as long as they keep the conversation, and
+SHOULD protect them at rest as they protect their device key. With them,
+a device can decrypt any ENC event of those epochs that HISTORY returns,
+at any time. This is what lets clients download history and read it
+offline (7.1).
+
+History keys reach a device in three ways:
+
+1. **Its own epochs.** A device derives the key of every epoch from the
+   one it joined in.
+2. **From its identity's other devices.** When a new device joins an
+   identity's conversation with itself, the identity's other devices can
+   send it every history key they hold, as KEY lines in ENC messages in
+   that conversation. Whoever controls the identity's key file could add
+   a device of their own (Section 14), so a device MUST NOT send history
+   keys to a new device until the user has confirmed on it that the new
+   device is theirs, for example by comparing fingerprints (12.12). Once
+   one device has sent the keys, the others MAY skip it.
+3. **From other members of a room.** When the `history` field of the
+   room's conversation extension (12.2) is `shared`, the device that adds
+   a new identity (12.6) also sends, in ENC messages in the room right
+   after its commit, the history keys of every earlier epoch of the room
+   that it holds. When it is `joined`, devices MUST NOT send earlier
+   history keys to an identity they add, so new members can read only
+   what was sent after they were added. Devices read this setting from
+   the group, not from SET events, which the server could forge.
+
+In a KEY line, `<id>` is a conversation's id (5.1), `<epoch>` is an
+epoch number, and `<key>` is the 48-byte history key, in base64 with
+padding. A set of keys that does not fit in one message is split over
+several. A device accepts KEY lines only in its conversation with
+itself, or in a room for that room's own id. When it gets two different
+keys for the same epoch, it keeps the one it derived itself, then one
+from its own identity's devices or backup, then the first one it got,
+and SHOULD warn the user.
+
+### 12.10. Key Backup
+
+A device can get history keys from another of its identity's devices
+(12.9). If someone loses all their devices, a **recovery key** lets a
+new device restore history keys from an encrypted backup on the server
+instead. Backups are optional for users. Servers MUST support them.
+
+- A recovery key is 32 random bytes. Clients show it as 52 characters of
+  lower-case base32 [RFC4648], without padding, in groups of four
+  separated by spaces. When reading one that a user typed, they ignore
+  case, spaces and `-`.
+- The backup key is derived from it with HKDF [RFC5869] and SHA-384:
+  HKDF-Expand(HKDF-Extract("", recovery key), info, 32), where `info` is
+  `risala backup ` followed by the uid. Its **key id** is the first 8
+  bytes of its SHA-384 hash.
+- A client that creates a recovery key shows it to the user once, and
+  sends it to the identity's other devices as a RECOVERY line, in base64
+  with padding, in the conversation with itself. Devices MUST ignore
+  RECOVERY lines in any other conversation. A newer RECOVERY line
+  replaces an older one.
+- Every device that holds the recovery key backs up each history key it
+  gets, as a **blob**: the key id, then a random 12-byte nonce, then the
+  history key encrypted with ChaCha20-Poly1305 under the backup key and
+  that nonce. The associated data is the conversation's id, a space and
+  the epoch number, in ASCII. A blob is 84 bytes.
+
+```
+BACKUP ADD <id> <epoch> <blob>
+BACKUP GET <id> [after=<epoch>] [limit=<n>]
+BACKUP DEL [<id>]
+```
+
+- **`BACKUP ADD`** stores the blob for epoch `<epoch>` of conversation
+  `<id>`, and replies `OK`. If the server already has a blob for that
+  epoch with the same key id, it keeps the one it has and still replies
+  `OK`.
+- **`BACKUP GET`** sends one `BACKUP <id> <epoch> <blob>` line per stored
+  blob, in ascending epoch order, then `OK more=<0 or 1>`. `after` and
+  `limit` work as for HISTORY (7.2), and `limit` defaults to 500.
+- **`BACKUP DEL`** deletes the blobs of conversation `<id>`, or every blob
+  of the identity, and replies `OK`.
+
+Backups belong to the identity, not to a device. Only identities can use
+BACKUP. The server MAY delete the blobs of conversations the identity is
+no longer in.
+
+To restore, a device that has the recovery key sends BACKUP GET for each
+conversation SYNC lists, and decrypts the blobs whose key id matches. If
+none match, the recovery key is wrong.
+
+A device that is lost keeps the recovery key it was sent. So when one of
+an identity's keys is removed, its client SHOULD offer to make a new
+recovery key. It then deletes every blob, and backs up the history keys
+again under the new one.
+
+### 12.11. What Changes in Encrypted Conversations
+
+The server cannot see what an encrypted message says, so some features
+work differently:
+
+- **Replies, edits and reactions** are tags on the TEXT line (12.8), with
+  the meanings of 5.3. The server cannot check them, so devices apply
+  the rules themselves. They ignore an edit from anyone other than the
+  author of its target, a reaction longer than 64 bytes, and a second
+  identical reaction from the same person to the same message.
+- **Deleting** (5.4) works on ENC events. The server erases the payload
+  and keeps a placeholder with the `deleted` tag and an empty payload.
+  It cannot find the message's edits and reactions, so it leaves them.
+  A client that deletes a message SHOULD also delete the edits of it
+  that it knows about, and devices hide edits and reactions whose target
+  is deleted. The server does delete the attached file, which it knows
+  from the `file` tag.
+- **Catching up** (7.1). A device must apply every COMMIT in order
+  before it can decrypt later messages, so it first fetches the
+  conversation's commits with `HISTORY <conv> after=<seq> only=commit`
+  (7.2). It can then fetch messages page by page, newest first if it
+  likes.
+- **RELATED** (7.3) returns no ENC events, since the server cannot see
+  their targets. A client that needs the edits and reactions of older
+  messages reads the history in between.
+- **Mentions** (5.5) and replies are hidden from the server, so push
+  works differently (9.2).
+- **Files** (5.6) are encrypted before they are uploaded. The device
+  encrypts the file with ChaCha20-Poly1305 under a new random 32-byte
+  key, with a nonce of 12 zero bytes and no associated data. It uploads
+  the result with UPLOAD, giving the type `application/octet-stream` and
+  the name `file`, so that the server learns neither. The ENC carries
+  the `file` tag as in 5.6. The TEXT line carries `file-key`, the key in
+  base64 with padding, and `file-type`, the file's media type. Its text
+  is the caption or the file name, as for MSG.
+- **Reports** (5.8) of ENC events reveal their content to the reviewers
+  through the franking commitment.
+- **Typing, read markers, display names and presence** (Section 8) are
+  not encrypted.
+- **Blocks** (5.7) work as before.
+- **Retention** (7.5) also removes old COMMIT events. A device that
+  missed commits that have since expired cannot catch up by reading
+  them. It joins again by external commit (12.6), and gets the history
+  keys it lacks from its identity's other devices or from a backup.
+
+### 12.12. Checking Devices
+
+A device does not take the server's word for which keys belong to whom:
+
+- A device checks the signature key of every leaf it accepts against the
+  key file of the identity in the leaf's credential (12.6). It fetches
+  key files itself, under the rules of 4.4, and MAY cache them for up to
+  an hour.
+- For each identity it shares an encrypted conversation with, a device
+  SHOULD fetch the key file again at least once a day, and remove the
+  leaves of keys that have gone (12.6).
+- Clients SHOULD show each identity's devices, and tell the user when
+  one is added or removed, so that people notice a device they do not
+  recognise.
+- Clients SHOULD let people compare device keys through another channel.
+  A key's fingerprint is `sha256:` followed by the SHA-256 hash of the
+  raw public key in lower-case hex, as in 2.2.
+
+---
+
+## 13. Command Summary
 
 Commands a client can send. "Before sign-in" means the command is
 allowed before GUEST, AUTH or REGISTER. A guest that sends a command
@@ -1986,7 +2847,7 @@ marked "no" under "Guests" gets `ERR forbidden`.
 | `ROLES <room>` | 6.3 | | yes |
 | `INVITE` / `KICK` / `BAN` / `UNBAN` / `BANS` | 6.4 | | no |
 | `SYNC` | 7.1 | | yes |
-| `HISTORY <conv> [after=] [before=] [limit=]` | 7.2 | | yes |
+| `HISTORY <conv> [after=] [before=] [limit=] [only=]` | 7.2 | | yes |
 | `RELATED <conv> <first> <last> [after=] [limit=]` | 7.3 | | yes |
 | `READ <conv> <seq>` | 7.4 | | no |
 | `TYPING <conv>` | 8.1 | | yes |
@@ -1998,6 +2859,13 @@ marked "no" under "Guests" gets `ERR forbidden`.
 | `REPORT <conv> <seq> [<reason...>]` | 5.8 | | yes |
 | `REPORTS <room>` / `RESOLVE <id>` | 5.8 | | no |
 | `PUSH ADD <url> <tag>` / `PUSH DEL <url>` / `PUSH LIST` | 9.1 | | no |
+| `KEYPKG ADD <keypackage>` / `KEYPKG COUNT` / `KEYPKG GET <uid>` | 12.4 | | no |
+| `INIT <conv> <groupinfo> <tree>` | 12.5 | | no |
+| `COMMIT <conv> <commit> <groupinfo> [<welcome>]` | 12.5 | | no |
+| `GROUPINFO <conv>` | 12.5 | | no |
+| `WELCOME LIST` / `WELCOME DEL <id>` | 12.7 | | no |
+| `ENC <conv> <epoch> <payload...>` | 12.8 | | no |
+| `BACKUP ADD <id> <epoch> <blob>` / `BACKUP GET <id> [after=] [limit=]` / `BACKUP DEL [<id>]` | 12.10 | | no |
 | `ADMIN OPS` / `OP <uid>` / `DEOP <uid>` | 10.1 | | no |
 | `ADMIN BAN <target> [<reason...>]` / `UNBAN <target>` / `BANS` | 10.2 | | no |
 | `ADMIN WHO` / `DISCONNECT <uid> [<reason...>]` / `NOTICE <message...>` | 10.3 | | no |
@@ -2013,7 +2881,7 @@ Lines a server can send:
 |---|---|---|
 | `RISALA <version> <host> <nonce> [<message...>]` | greeting | 4.1 |
 | `OK [<key>=<value> ...]` / `ERR <code> [<message...>]` | final response | 3.6 |
-| `MSG` `DELETE` `JOIN` `PART` `INVITE` `KICK` `BAN` `UNBAN` `SET` `ROLE` | events; `SET`, `BAN` and `ROLE` also as snapshots | 5.2, 6 |
+| `MSG` `DELETE` `JOIN` `PART` `INVITE` `KICK` `BAN` `UNBAN` `SET` `ROLE` `ENC` `COMMIT` | events; `SET`, `BAN` and `ROLE` also as snapshots | 5.2, 6, 12 |
 | `ROOM <room> <members> [<topic...>]` | response to LIST and ADMIN ROOMS | 6.1, 10.4 |
 | `CONV <conv> <id> <head> <read>` | response to SYNC | 7.1 |
 | `MEMBER <room> <uid> <role> <presence> [<name...>]` | response to MEMBERS | 8.3 |
@@ -2024,6 +2892,10 @@ Lines a server can send:
 | `RESOLVED <id>` | a report was resolved | 5.8 |
 | `KEY <key> [<label...>]` | response to KEY LIST and ADMIN KEYS | 4.7, 10.5 |
 | `PUSH <url> <tag>` | response to PUSH LIST | 9.1 |
+| `KEYPKG <uid> <keypackage>` | response to KEYPKG GET | 12.4 |
+| `GROUPINFO <conv> <epoch> <seq> <groupinfo> <tree>` | response to GROUPINFO | 12.5 |
+| `WELCOME <conv> <id> <seq> <welcome> <tree>` | a Welcome for this device, live or in response to WELCOME LIST | 12.7 |
+| `BACKUP <id> <epoch> <blob>` | response to BACKUP GET | 12.10 |
 | `READ <conv> <seq>` | read marker from your other devices | 7.4 |
 | `TYPING <conv>` / `NAME [<name...>]` | not stored | 8.1, 8.2 |
 | `NOTICE <message...>` | information | 8.4 |
@@ -2035,12 +2907,48 @@ Lines a server can send:
 
 ---
 
-## 13. Security Considerations
+## 14. Security Considerations
 
-- **No end-to-end encryption.** TLS protects messages in transit, but
-  server operators can read everything, including direct messages.
-  Clients SHOULD tell users this where they will see it, for example
-  when starting a direct conversation.
+- **What is encrypted end to end.** Direct conversations and encrypted
+  rooms are end-to-end encrypted (Section 12). The server cannot read
+  their messages or files. Public rooms, and private rooms that are not
+  encrypted, are protected only by TLS, and their server's operators can
+  read them. Clients SHOULD show users which kind of conversation they
+  are in.
+- **Post-quantum.** Connections use a hybrid key exchange (2.1), and
+  encrypted conversations a hybrid KEM (12.2). Both stay secret as long
+  as either their classical or their post-quantum half holds, so traffic
+  recorded today cannot be decrypted later by a quantum computer.
+  Signing in and MLS use ML-DSA signatures. TLS certificates still use
+  classical signatures, because certificate authorities issue no other
+  kind yet. A quantum attacker could therefore impersonate a server in
+  real time, and read what passes through it, but not what is encrypted
+  end to end.
+- **Kept history keys.** Devices keep the history keys of every epoch
+  (12.9), so that history works on new devices and offline. This gives up
+  part of the forward secrecy of MLS: whoever takes a device can read the
+  history it can reach. Commits still give post-compromise security: once
+  a device has committed a fresh leaf (12.6), keys stolen earlier do not
+  decrypt new messages.
+- **Recovery keys.** A recovery key (12.10) decrypts the identity's whole
+  backup, so it should be stored like a password. The server holds only
+  encrypted backups. Every device of the identity knows the recovery
+  key, so after a device is lost, the user should make a new one.
+- **What the server can still do.** It can withhold, delay or reorder
+  encrypted messages, and refuse commits. Devices detect replayed and
+  re-pointed messages (12.8), but not ones that are withheld.
+- **Who can add a device.** Whoever controls an identity's key file can
+  add a key, and that key's device can join every encrypted conversation
+  of the identity (12.6) and read what is sent there from then on. For
+  identities a server hosts, this includes its operator (10.5). Members
+  see such a device as a new device of the identity (12.12), and SHOULD
+  check with its owner. Earlier history needs more: the identity's other
+  devices send history keys to a new device only once the user confirms
+  it (12.9). The server cannot add devices of identities it does not
+  host, because devices check key files themselves.
+- **Reports reveal content.** A report of an encrypted message reveals
+  its content to the reviewers, by the choice of the member who reports
+  it (5.8).
 - **Trust on first use.** Someone can intercept the first connection to
   a server that has a self-signed certificate. Users can compare the
   fingerprint through another channel (Appendix A). Servers with CA
@@ -2058,8 +2966,9 @@ Lines a server can send:
   network.
 - **Hosted identities trust their host.** A server that hosts
   identities (4.6) publishes their key files. Its operator can therefore
-  add a key and sign in as any of them on any server, and ADMIN ADDKEY
-  (10.5) does exactly this to recover lost accounts. People who do not
+  add a key and sign in as any of them on any server, or join their
+  encrypted conversations as a new device. ADMIN ADDKEY (10.5) does
+  exactly this to recover lost accounts. People who do not
   want to depend on a host can publish their own key file. While a host
   is unreachable, its users cannot sign in to servers that have no
   cached copy of their key file (4.4).
@@ -2079,26 +2988,32 @@ Lines a server can send:
   them. Blocks stop direct messages only (5.7). In rooms, people who
   have been blocked can still be seen by others and can still mention
   the person who blocked them.
-- **Metadata.** The server sees who talks to whom, and when. Because
-  identities work everywhere, different servers can tell that the same
-  person uses all of them. Someone who does not want this can use a
-  guest name or a separate identity.
+- **Metadata.** The server sees who talks to whom, and when, even in
+  encrypted conversations. There it also sees which devices each person
+  uses, roughly how long messages are, file sizes, typing, read markers
+  and presence. Because devices fetch key files themselves (12.12), the
+  web server of an identity's domain learns the network addresses of
+  devices that talk to it. Because identities work everywhere, different
+  servers can tell that the same person uses all of them. Someone who
+  does not want this can use a guest name or a separate identity.
 - **Push.** Pushes carry no content (Section 9). The push service, and
   any gateway in between, still see when pushes happen and the unread
   count.
 - **Deletion** removes text from the server, but not from copies that
   people have already made.
 - **Files.** `get` URLs are capabilities (5.6). Anyone a URL is passed to
-  can download the file, including people outside the room. People will
+  can download the file, including people outside the room. In
+  encrypted conversations they get only ciphertext (12.11). People will
   open these URLs in web browsers, so servers SHOULD serve files from a
   domain that is used for nothing else, and with the header
   `X-Content-Type-Options: nosniff`.
-- **Operators** can read and remove anything on their server, and ADMIN
+- **Operators** can read and remove anything on their server except the
+  content of encrypted conversations, which they can only remove. ADMIN
   WHO shows them users' network addresses (10.3).
 
 ---
 
-## 14. Assigned Values
+## 15. Assigned Values
 
 - **Port:** 7472/tcp. The digits spell RISA on a phone keypad. The port
   is not yet registered with IANA.
@@ -2108,11 +3023,36 @@ Lines a server can send:
   `<room>` is written without its `#`. For example,
   `risala://chat.example.org/general` points to `#general`, and
   `risala://chat.example.org/general/8813` to one message in it.
+- **MLS cipher suite:** `0x0052`, for the algorithms of 12.2: X-Wing,
+  ChaCha20-Poly1305, SHA-384 and ML-DSA-44. MLS cipher suites for
+  post-quantum algorithms are not yet standardised [MLS-PQ]. This
+  document fixes the meaning of `0x0052` for risala, whatever values a
+  later standard assigns.
+- **TLS key exchange:** X25519MLKEM768, value `0x11EC` [ECDHE-MLKEM].
+- **MLS extension type:** `0xF2A1`, from the range for private use, for
+  the conversation extension (12.2).
+- **Labels:** the MLS exporter label `risala history` (12.9), the
+  SignWithLabel label `risala message` and the ExpandWithLabel label
+  `risala message key` (12.8), the HKDF info prefix `risala backup `
+  (12.10), and the sign-in prefix `risala-auth-1` (4.5).
 
 ---
 
-## 15. References
+## 16. References
 
+- [ECDHE-MLKEM] Kwiatkowski, K., Kampanakis, P., Westerbaan, B., and D.
+  Stebila, "Post-quantum hybrid ECDHE-MLKEM Key Agreement for TLSv1.3",
+  Internet-Draft draft-ietf-tls-ecdhe-mlkem, work in progress.
+- [FIPS204] National Institute of Standards and Technology,
+  "Module-Lattice-Based Digital Signature Standard", FIPS 204, August
+  2024.
+- [MLS-EXT] Robert, R., "The Messaging Layer Security (MLS)
+  Extensions", Internet-Draft draft-ietf-mls-extensions, work in
+  progress.
+- [MLS-PQ] "MLS Cipher Suites with ML-KEM", Internet-Draft
+  draft-ietf-mls-pq-ciphersuites, work in progress.
+- [RFC2104] Krawczyk, H., Bellare, M., and R. Canetti, "HMAC:
+  Keyed-Hashing for Message Authentication", RFC 2104, February 1997.
 - [RFC2119] Bradner, S., "Key words for use in RFCs to Indicate
   Requirement Levels", BCP 14, RFC 2119, March 1997.
 - [RFC2606] Eastlake 3rd, D. and A. Panitz, "Reserved Top Level DNS
@@ -2125,6 +3065,8 @@ Lines a server can send:
   Encodings", RFC 4648, October 2006.
 - [RFC5234] Crocker, D. and P. Overell, "Augmented BNF for Syntax
   Specifications: ABNF", STD 68, RFC 5234, January 2008.
+- [RFC5869] Krawczyk, H. and P. Eronen, "HMAC-based Extract-and-Expand
+  Key Derivation Function (HKDF)", RFC 5869, May 2010.
 - [RFC5890] Klensin, J., "Internationalized Domain Names for
   Applications (IDNA): Definitions and Document Framework", RFC 5890,
   August 2010.
@@ -2138,20 +3080,30 @@ Lines a server can send:
 - [RFC7301] Friedl, S., Popov, A., Langley, A., and E. Stephan,
   "Transport Layer Security (TLS) Application-Layer Protocol Negotiation
   Extension", RFC 7301, July 2014.
-- [RFC8032] Josefsson, S. and I. Liusvaara, "Edwards-Curve Digital
-  Signature Algorithm (EdDSA)", RFC 8032, January 2017.
 - [RFC8174] Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC 2119
   Key Words", BCP 14, RFC 8174, May 2017.
+- [RFC8439] Nir, Y. and A. Langley, "ChaCha20 and Poly1305 for IETF
+  Protocols", RFC 8439, June 2018.
 - [RFC8446] Rescorla, E., "The Transport Layer Security (TLS) Protocol
   Version 1.3", RFC 8446, August 2018.
 - [RFC8615] Nottingham, M., "Well-Known Uniform Resource Identifiers
   (URIs)", RFC 8615, May 2019.
+- [RFC9420] Barnes, R., Beurdouche, B., Robert, R., Millican, J., Omara,
+  E., and K. Cohn-Gordon, "The Messaging Layer Security (MLS) Protocol",
+  RFC 9420, July 2023.
 - [RFC9525] Saint-Andre, P. and R. Salz, "Service Identity in TLS",
   RFC 9525, November 2023.
+- [XWING] Connolly, D., Schwabe, P., and B. Westerbaan, "X-Wing: general-
+  purpose hybrid post-quantum KEM", Internet-Draft
+  draft-connolly-cfrg-xwing-kem-06, work in progress.
 
 ---
 
 ## Appendix A. Using risala by Hand
+
+This needs OpenSSL 3.5 or later, for the post-quantum key exchange
+(2.1) and ML-DSA (4.5). Encrypted conversations (Section 12) cannot be
+used by hand.
 
 **Connect:**
 
@@ -2175,9 +3127,9 @@ openssl s_client -connect chat.example.org:7472 </dev/null 2>/dev/null \
 **Make a key, and print the line for your key file:**
 
 ```
-openssl genpkey -algorithm ed25519 -out alice.pem
-printf 'ed25519 %s laptop\n' \
-  "$(openssl pkey -in alice.pem -pubout -outform der | tail -c 32 | openssl base64 -A)"
+openssl genpkey -algorithm ML-DSA-44 -out alice.pem
+printf 'mldsa44 %s laptop\n' \
+  "$(openssl pkey -in alice.pem -pubout -outform der | tail -c 1312 | openssl base64 -A)"
 ```
 
 **Sign in.** Copy the nonce from the server's greeting. In a second
@@ -2205,10 +3157,15 @@ empty line.
 
 ## Appendix B. Test Vectors
 
-These keys are for testing only. Ed25519 signatures are deterministic, so
-every correct implementation produces exactly this signature.
+These keys are for testing only.
 
-Private key (seed, hex):
+ML-DSA signing normally mixes in fresh randomness, so each signature
+differs. The signature below uses the deterministic variant of
+[FIPS204], so every correct implementation of that variant produces
+exactly these bytes. Verifiers accept signatures from either variant.
+With OpenSSL, add `-pkeyopt deterministic:1` to `openssl pkeyutl -sign`.
+
+Private key (the 32-byte seed, hex):
 
 ```
 c11fae5c592e13be67dc96f6e85004d32e928615f7af1fd3a6c5d9ea0ab6cba8
@@ -2218,20 +3175,50 @@ The same private key as PEM:
 
 ```
 -----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEIMEfrlxZLhO+Z9yW9uhQBNMukoYV968f06bF2eoKtsuo
+MDQCAQAwCwYJYIZIAWUDBAMRBCKAIMEfrlxZLhO+Z9yW9uhQBNMukoYV968f06bF
+2eoKtsuo
 -----END PRIVATE KEY-----
 ```
 
-Public key (hex):
+Public key (1312 bytes, base64). It is shown wrapped at 64 characters,
+but is a single line in key files and commands. Its SHA-256 hash is
+`d9d69ac9b18f42759e43edba0106410c07045a1edab642925b7496ea40baccdf`.
 
 ```
-27f2a6ba9b9461c45dd82db235978acfad4921b20a6dd469fdd2fc95faae0d86
+xjgGNXnY2mHZ3KDuXsHq19lnJd7U5fdp0TNCHpsz6xf7jMhE9181WJAPmoeTW0Bn
+URbEsAPsYPUiBIunfbRrvADeL/bfXGDlU5cZwg3n6zkLeUm9dx3+Jz1+ZHcuHPIB
+JvZ1fJrfFwJ68vdGFxDTQo3pUBEEejtwqB3L2WXeboCtNEB/6IlKJfCr1droLXLW
+nckZiRpCoJRmv4g4hxVfNP4Uubjc2Fde4NxJmV8oW0wsRRnyzCYLI4QW7MDWz3uU
+EsQJ9q9okdUTb0eSfm4TQ3FMeL39/9iBQaeidHXCdrFCHSfKndH/DH3jY18Oaogz
+Q6S7TlHTwPmU12VVZbPEHIJtakRF9G4DS0ps0H8T3NKipFo6BpbtwpPqLR2EAX5M
+gL7FI/Jv171G5/sD3nnsJ4A5jfXwHWr6UPlIB/VtKOfXzKRYWy37Y5EaQzEirdrb
+9+xRouAS9gov36hlUYxwvFIRTF1XG1L5R2453DCE6drWUGNkLSCXRloO+RvXrdvA
+Qm+fmqS2OuEs9+GsEHN531Duz2yOzM4DAn+IAIeU2kLGUZy54VTZV49nBI+rPh1X
+wpoqw6BPgWVAdGK5XqyZYu2X1AjM2XvnRe4vDEg7UsfYv2JWeqWbu4c7KBx8F1ZE
+SHTchYKRAvWfKBOF3PWifoIXqm0wtXuqu06Mne1LqYdwxilPiJDyt745mOG6K59V
+WCeXFxGqebiy5R9FBkb3OLTJXU6OVXX/iumCRAdK/dbKb7+54OholPVj/PDAH2EY
+anMXrumWy7B1dTH/jgI2MpkTYgjJ3bwsidZpF9Dx2eVuscgsRrXNKbbZ5mSYbTx+
+WTCEpgPDGD6K6GRBjbCg5bwz4iCqMs2+Rv55bV2vwCaJmeu9SVevrmKtk4iBTiLp
+ZO+nRBIAuhNJ2ftbJ67dNt2pz5ZacqP4TxbyKaknlsLMMoYrsrq8QVid0mz+9FR7
+U7La2NoCPcMcDgWWOoDKlKNGIQx23v1x/z1YsnWpi7dt9FtJxvFa8mbsrVd4kci9
+h2zjIsJXrBXpBO+iWzzoxDHiI8eOXTag8yOuEQHaUVVdwxQ0r4nwZUNL34WuuED6
+FDF6/TE/nfkffQVzW52PkixgxmC5OIrWNcc0GXGAdxa2p3KxwMBbfk27in3wESIM
+g4CDmmfdH65prjzxG47TSEqMZHxAM5bTfNLqjUN3QRGaVd2b3BecnplFXrjyKp8a
+MyDUPJNolLq4dJG/n1wby85wino837kaodjRZeYryU0RyzLgqY1UHyzmU+AMu4q7
+HM+jwSvdGQXX60Q7NLxSk+ClmoO+YEDrj3ki9WSp3NWG538oiGV4EqBJi+apjuPC
+aWWtNm1DILZDAOjCCOyU9TEllzsjv8heU2bVmsLe1oRfIiDBQw7/Z9ZQFUjXka1B
+e/JFUyiujtH+oLJVr3clrsZWPl9bawODt/znveuHTYZHf1j7azTcCBm5JZjjW8r8
+guknfhcKPKOaTQUzqpXiALNhvcSO4RRtDFyn7L4VAz7K1uHbnXKHSeMnMRjpZnMZ
+QoqyhEjNllb06dD0s4xDd1wJgGmWEd2KVHnLKhwKp1ED775+034shRb2v8W+DFIp
+y3hVp9PEdnc9aJwzIreZHEJymMosqXo7mZaJNM+i+oYo2daWHMQYL1sOwzOTwEK2
+xewaE3w/Xkq+iY4TC++t/oNTt5BdWJrJ90PPw6arr7MbXCEkTgNElxgTC7gcwdLS
+nnO/Wp68V/V/przmVp4j4g==
 ```
 
 Key file line:
 
 ```
-ed25519 J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY= laptop
+mldsa44 <the public key above, on one line> laptop
 ```
 
 Signing in to `chat.example.org` as `alice@example.org` with the nonce
@@ -2245,16 +3232,68 @@ chat.example.org
 alice@example.org
 ```
 
-Signature (base64):
+Signature (2420 bytes, base64, wrapped at 64 characters in the same
+way). Its SHA-256 hash is
+`eeda7aa7dd2ffa7cc2fa6683e7d8d2b94cf46716484b784d6a53b4928df58906`.
 
 ```
-Hk+S5Vd7ciW57dRNS3AhcvZkYNLmj+kkgJUxOYvCrbEQSBk0UDdH+cSBXF6YvCSU85FRVPaURwsQdbV/SAK0CQ==
+0eS7OdclGDTKyqFlcGMJZOcRDKwNWe46pKczbvw1K6r08d/1QDbNxsCWmTMmGgol
+t6rEII7exIqtw+hXEXbaIenHtLLYgZcrFaL24Ef5aqSh/phIr9eh1p1NjBs/tlqy
+cpEzZ/nXdeWH2AL7tIIq3n3DS2fnZkKHeUiL/TwzwW8hh8yO3ZibXKiQMl4AOgnX
+fmrgBcslOSid4JG572ssA0hWMJa4+I/vWVKWY3I++y4DexyJzU5S2uks2QwsWLJp
+keA9gELCe0QnkZcqwZn8sRCk9zHCdsfVh+Thdc0eifSfxioL3LIl3wv8fO8ryjmB
+ogWeIR009sdh5n+1SEYno/vfVK4KPUV0LqMAYgqWCPpQR16DSxtTkKabj44TvV6e
+jKXci4jHeQtxuih8VUpJGz+xNdOIAlm8Kjj/7ggUpu0DPiq8YA201+yvwpuYZdVh
+P49x3N0ltKolxJ4dyAxm6SOHiqAvCLk8ELJ9AtZdHQN0Gs1z8grfv2dAyhPzC9qu
+eHbsU9qlWW2vgZaArhZQpqk78piCTNnS9FQq3COnS/mJHcOwGLvmpirKo8lHRNh2
+KToTE1oZTLB1qDuCy2TaBKqwes2N5ps/ws2B1/4lzh9wYS39CO2ucDsab480ez2H
+RmGEyTIPhNtr0peQxnLZ31BCzkK6KNyiXY0WdiyTyg12krjtkyR4l6pbm5tT71Zz
+ZhKrNOvjlyO3GgXXoCFuBvGQ6+J0CcbSHW1D1LgDq27D2W6lDy6YfPbDf23lMwmj
+FjU3m/2CIhcEk2FsXXMKL7qLuiUJW8LtucoH/uGoP/p50z9aPUTuOSGnRK3jHFaD
+xstPLojSouWLhNOqAfK6WDrEIwTPeEgCsrZ6aPaH7F5qbaaqVQX3WfhO82NQUeQr
+vS9ZeotxoI7p3lUYf1qWB6kzsrXxSa/+t1YA632Ec/dmWzgI1WTGqpmOAl5hm/ui
+WgLMQKkkKwdnOuMPJgc8GENjBbODESLzXCdKkQieNtoWcx5U5hMgC+tj9NiZwVMo
+N0ejGaRvuzXzGR7WRuLPImht5DOaIjkvkKgt1lE6Xfy2Fc9xZGUYlh2rAn1ekv01
+zLcuKq+KrcpuqMeyaJFK5L8dhhVwzE8lymJixGbR54mDiZLMQlLIJ3oi0OX/InK8
+9+AJwawKmsELa3HTuYHbzXjXtryYTz5ESivyWS6vibct6187IPVec2bmZAg+Y/4G
+pgxasek3zDp1c6ZyzvBz7NVqCr299gYHcbeFMAx5COyYGYKsnAASgN3ukC6qD6O+
+rMqWBm5e3XMYesyhpDqzqUGLPOUPeA1auS11CopxihafmFKuTBGZyOVut30xnPGJ
+nEj/cbaw6rAkK/pR8v2Mc2lks/P18A0/+/pjqmWX8qRUUdnHRGfV3vMC2+26ZQqo
+jExOU7bgeuWn9KSCq50D3Jsmh0xCWaPz//App1DGxtTHB/745jn39W96MdIct7AT
+bNnYjcOtjdI3+5RP0+1BSKptuFh6RwumXwO6rbLSNrYXvANs6By+PCH8L1anKe9H
+vd2EmW9W42bHwW7TZC7fIYGaU5gvuV7YifNPElHknSyvriU+vDPkbpCjfRPXZ+6o
+mLd8CeLwwARtLdq/KltBkrfJXhZg/DprrDZoDkIojD0qtK9hop19pPMCUEcB2pGX
+fCpGeWGhIVoheevb4zIH/9MHlZKaqdwDWEjSYOOxXlWGPumqNgviqRL4Om32TqtQ
+a61bPlV3Fn56APcAD0xWvkqOme6m74sJpZm+/evB0/Tvm0fZSEvEVmgPXCfnbOj+
+ljhiKO9d8e4f8pEElr18tz6p0BEUfByfL9tZSjQh/XxU0Bnhdwjrwl/itp14QIQy
+dsUq3+O7YBhGyHdDPQIMg3tVeXZNi1naOtryiYTFYll9XYfy/iw+CpjuVyiYA7aM
+917neTrG3XWs674YkcPOg94yEHq5fstqBqHKmKdsIJTyXWmL7gDYDTfgbWGUg9cg
+FQAY82ZFEOpkCVC47m3U+J3btaNPbg6itpdNTdYNy+74EQgJ2Z2snXQJE1Mkt75v
+80iveufZmaXYi0l4O2v3EV7StufMWLF+3Ys0JJC34IulK8xw+mbop0wsHXoLsUmA
+v+1rtrENYWIi2NI+2hs3OmPtB0Oh8OYfzDe90u3cexbv+Xu5iFv9CnUKFl8OpvDi
+IfWahA3Iym9rYftmLuYHZA/JDPElQcNRp0aSA6jjiwd1N04SUNNZHshLxHxQC6rB
+QxTxOXSVDiiEt9J/PD9FUs0OpvjhsnqYt9m32yEA6QSaTFRnyZ2E2T6BMLI9AnKO
+ccmxiwgP5JqCG36W9Mdoy6egJ0J4YTyR2qX6PQ2cSM4/ek5vqPVaoWuBd6/JxM+n
+r2d4xVGkmr10S6txu25Z0FDXtpUD5qtaw/pSYa5SaTmbj3XI65TxyUFXPnM2xm/0
+mzGIUMU9EuLAZWA01BCXrzLyvkALVGCe9OGZ++XTOWJO+snQzmnwrlXEumx2YPSh
+aP5ez4O4BYqvw+RuGZSVQWHmIFV0/JRuACRghfN3wvszaXc8c8b/h7/o9A9Vdo4p
+dk85TUI6FC7SvF1XvHa9oNab3akEs7kV7IiHJjrLO6PXVXvLmIgTAI81gv5PdXsp
+oHXs2T+90UvgraPU86W8xsUCAxedWZmbpqf2dLV2ajhnNAf44hIQSoVrcTibnKAZ
+Z5Cq+802OMtnrrcL3c/gOgCYRdvogS4LjJy7jBDElt5OTPdxRTApwt5kmsfY5N2Q
+OjfvV9wMC/jJh6fHo+yUUzzizd7waphmuy9M3ru1MR2AQQdBw4HQgOA8Uvw4p0zL
++Xi/zqRdnJBK/e3h6YW+RCkMHkFrw4LCCgRkriu7YFRPgsHk0uow8sZ7X3QcZwvK
+O6AfFcSP386z9ReSlzHs2jxsU6L/DVKcWFnaqztnXYgoZwiPHNQV3p2ZDpiRYBGf
+BleeItv/QXXOBGdB3J0j1I7j8+XrwgBx1ObwZAL2qE3MfiMdQhM2h2dU98bufk/F
+Mc/dKqTUubjy1m3BhkGqAQlFzW9hHnIfbLv/P0uDNI2yoLzB5hk52MqMRrMcS451
+oN31ep7H7yr2IE8iA5xxL5bmF3asOLMhWxqZPZZWjxogLjl2gZaj6vcGHjpTVVxg
+YneMztbX2w8qOkFCXG1vfZOcpqyvs8MIJys9WF57iJ7K6+4AAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAkXJzM=
 ```
 
-The command:
+The command, on one line:
 
 ```
-AUTH alice@example.org Hk+S5Vd7ciW57dRNS3AhcvZkYNLmj+kkgJUxOYvCrbEQSBk0UDdH+cSBXF6YvCSU85FRVPaURwsQdbV/SAK0CQ==
+AUTH alice@example.org 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
 ```
 
 ## Appendix C. Push Gateways (Informative)

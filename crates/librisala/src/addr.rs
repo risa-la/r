@@ -63,7 +63,7 @@ impl FromStr for ServerAddr {
     type Err = BadAddr;
 
     /// Parses `host`, `host:port`, `[v6]` or `[v6]:port`. The default port
-    /// is 7472 (14).
+    /// is 7472 (15).
     fn from_str(s: &str) -> Result<ServerAddr, BadAddr> {
         let bad = || BadAddr(s.to_owned());
         let default = risala_proto::DEFAULT_PORT;

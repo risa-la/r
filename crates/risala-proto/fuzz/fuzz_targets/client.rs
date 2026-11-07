@@ -1,4 +1,4 @@
-//! Lines into `command::Request::parse` (SPEC 4-11, 12).
+//! Lines into `command::Request::parse` (SPEC 4-11, 13).
 //!
 //! Whatever parses must serialise with `to_line` into a line that parses
 //! back to the same request, both directly and through its wire form.

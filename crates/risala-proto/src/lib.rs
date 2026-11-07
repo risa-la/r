@@ -1,4 +1,4 @@
-//! The risala protocol, as defined in SPEC.md (draft-01).
+//! The risala protocol, as defined in SPEC.md (draft-02).
 //!
 //! This crate has no networking and no async code. It parses and
 //! serialises lines, validates names, escapes text and builds and checks
@@ -40,7 +40,7 @@ mod proofs;
 /// The protocol version this crate implements, as sent in the greeting (4.1).
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The default TCP port (14).
+/// The default TCP port (15).
 pub const DEFAULT_PORT: u16 = 7472;
 
 /// The ALPN protocol identifier (2.1, 14).

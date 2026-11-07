@@ -61,7 +61,7 @@ and fuzz.
 - Text escaping (3.4) and mention extraction (5.5).
 - Typed commands (client → server) and server lines (events, snapshots,
   responses, notices), with conversions both ways.
-- The auth challenge bytes and Ed25519 sign/verify (4.5), key file
+- The auth challenge bytes and ML-DSA-44 sign/verify (4.5), key file
   parsing (4.4).
 - Tests: the Appendix B vectors, every example line in the spec, property
   tests (parsing what we serialise gives back the same value) and a
@@ -109,14 +109,16 @@ across the FFI boundary.
 - **Accounts and identity:**
   - Accounts are guests, identities this server hosts (REGISTER), or
     self-hosted identities on your own domain.
-  - Each device generates its own Ed25519 key.
+  - Each device generates its own ML-DSA-44 key. It is also the
+    device's MLS signature key (Section 12).
   - For self-hosted identities, the library helps produce the key file
     line to publish.
   - KEY management, and adding a new device by showing its public key.
   - Keys are stored through a platform trait: Keychain on Apple
     platforms, an Android Keystore-wrapped key on Android, and libsecret
-    on Linux. The Secure Enclave cannot hold Ed25519 keys, so keys are
-    software keys that are encrypted or protected at rest.
+    on Linux. The Secure Enclave cannot hold ML-DSA keys, so keys are
+    software keys that are encrypted or protected at rest. History keys
+    and the recovery key (12.9, 12.10) are stored the same way.
 - **Sync engine:** SYNC, then fill gaps with HISTORY, dropping duplicates
   by seq. The cache is keyed by conversation id, so a dropped and
   recreated room starts afresh. Lazy paging backwards, with RELATED for
@@ -177,6 +179,7 @@ Each milestone ends with something that runs.
 | M3 | Server: identities | AUTH with key files, REGISTER, KEY, hosted `.well-known`, direct conversations, BLOCK, UNREGISTER, READ, `cid`, TYPING, NAME, MEMBERS, WHOIS, PRESENCE |
 | M4 | Server: rich messages and moderation | reply, edit, react, DELETE, RELATED; roles, ROLES, SET, INVITE, KICK, BAN; REPORT and RESOLVE; retention; all ADMIN commands |
 | M5 | librisala core and `risala-cli` | The CLI signs in, syncs, works offline from its cache and recovers from dropped connections without losing or duplicating messages |
+| M5a | End-to-end encryption | Post-quantum TLS and ML-DSA keys everywhere. KEYPKG, INIT, COMMIT, GROUPINFO, WELCOME, ENC and BACKUP in `risalad` and librisala. Two CLI devices talk in an encrypted direct conversation and room; a new device of the same identity reads the whole history offline; a restore from a recovery key works; reports of encrypted messages verify |
 | M6 | GNOME app | Day-to-day usable on Linux against a real server |
 | M7 | FFI, Apple and Android apps | macOS first, then iOS, then Android, all on the same librisala |
 | M8 | Files and push | UPLOAD over HTTPS, PUSH, the gateway, the iOS extension, FCM and UnifiedPush |
@@ -353,7 +356,51 @@ Settled (now in SPEC.md):
       timer only once its LF arrives.
     - Expiry stops at the first event that is not old enough.
 
-Nothing is open right now.
+17. **Added end-to-end encryption to v1** (draft-02: 1, 2.1, 2.3, 3.2,
+    3.7, 4.4, 4.5, 4.7, 4.8, 5, 6, 7, 9.2, 10, 12, 14, 15, App. A, B).
+    - MLS [RFC9420] for direct conversations (always) and private rooms
+      (opt-in at creation, with INIT). Public rooms are never encrypted.
+    - One cipher suite, `0x0052`: X-Wing (ML-KEM-768 + X25519),
+      ChaCha20-Poly1305, SHA-384, ML-DSA-44. It is the provisional value
+      that OpenMLS 0.9 uses for these algorithms (feature
+      `draft-ietf-mls-pq-ciphersuites`), so no fork is needed. The spec
+      fixes the value for risala.
+    - Device keys are ML-DSA-44 (`mldsa44` key file lines). The same key
+      signs in and signs in MLS.
+    - TLS requires X25519MLKEM768. rustls has it only in the aws-lc-rs
+      provider, so the server and librisala move off ring.
+    - Messages are encrypted under per-epoch history keys from the MLS
+      exporter, not MLS application messages, so devices can keep them
+      and decrypt HISTORY later and offline. New devices get keys from
+      the identity's other devices, and there is an optional recovery
+      key backup. Rooms choose `history shared` or `joined`.
+    - The server tracks each group's public state (OpenMLS
+      `PublicGroup`), checks commits against membership, and stores
+      KeyPackages, Welcomes, GroupInfo and backups.
+    - Lines that carry MLS data may be up to 8 MiB. Groups have at most
+      512 devices.
+    - Reports of encrypted messages use message franking.
+    - Each group carries a conversation extension (`0xF2A1`) that ties
+      it to its conversation and holds the room's `history` setting, so
+      the server cannot swap groups or flip the setting.
+    - A device keeps sending blocked while any leaf's key cannot be
+      confirmed against its key file, instead of dropping the group.
+    - New devices get earlier history keys only after the user confirms
+      them on an existing device.
+    - Confirmed with the user on 2026-11-07: ML-DSA-44 (not 65), suite
+      value `0x0052` (not a private-use value), direct conversations
+      always encrypted, and servers refuse TLS without X25519MLKEM768.
+
+Open:
+
+- The spec example tests, which now include the new verbs, and the
+  Appendix B tests, which now use ML-DSA. Both fail until risala-proto
+  catches up.
+- Whether 512 devices per group and 8 MiB lines are the right limits
+  once we measure real commit and Welcome sizes.
+- Check that OpenMLS can build an external commit that removes the
+  joiner's own earlier leaf (12.6), and can take the ratchet tree out of
+  band for Welcome and external joins.
 
 ## 6. Decisions
 

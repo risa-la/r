@@ -1,5 +1,5 @@
 //! Every `S:` example in SPEC.md and README.md parses as a typed
-//! [`ServerMessage`] and serialises back byte for byte (SPEC Section 12).
+//! [`ServerMessage`] and serialises back byte for byte (SPEC Section 13).
 
 mod common;
 

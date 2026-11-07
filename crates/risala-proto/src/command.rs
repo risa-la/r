@@ -1,4 +1,4 @@
-//! Typed client commands (SPEC 4-11, the first table of Section 12).
+//! Typed client commands (SPEC 4-11, the first table of Section 13).
 //!
 //! A [`Request`] is one line a client sends: its optional `ref` tag (3.6)
 //! and a [`Command`]. Parse one from a [`Line`] with [`Request::parse`],
@@ -101,7 +101,7 @@ impl Request {
         }
     }
 
-    /// Parses a client line into a typed request (3.3, Section 12).
+    /// Parses a client line into a typed request (3.3, Section 13).
     ///
     /// Errors: [`ParseError::UnknownVerb`] for a verb that is not a client
     /// command, `TooLong` for a value over a protocol limit, and
@@ -205,7 +205,7 @@ impl fmt::Display for Request {
 // ---------------------------------------------------------------------------
 // Command
 
-/// A client command: one variant per row of the first table in Section 12.
+/// A client command: one variant per row of the first table in Section 13.
 ///
 /// Optional text is an empty `String` when absent. Text is escaped, as on
 /// the wire (3.4).
@@ -639,7 +639,7 @@ pub enum AdminCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Tables (Section 12)
+// Tables (Section 13)
 
 impl Command {
     /// The verb, in upper case (3.1). Subcommands share their verb:
@@ -689,7 +689,7 @@ impl Command {
     }
 
     /// Whether the server accepts this command before the connection has
-    /// signed in (4.1, the "Before sign-in" column of Section 12): INFO
+    /// signed in (4.1, the "Before sign-in" column of Section 13): INFO
     /// without a room, GUEST, AUTH, REGISTER, PING, PONG and QUIT. The
     /// server replies `ERR not-authenticated` to anything else.
     pub fn allowed_before_sign_in(&self) -> bool {
@@ -888,10 +888,10 @@ fn tag_value<T: FromStr<Err = ParseError>>(
 }
 
 // ---------------------------------------------------------------------------
-// Parsing (one arm per command, in the order of Section 12)
+// Parsing (one arm per command, in the order of Section 13)
 
 impl Command {
-    /// Parses the command of a line, ignoring its `ref` (Section 12). Use
+    /// Parses the command of a line, ignoring its `ref` (Section 13). Use
     /// [`Request::parse`] to keep the `ref`.
     pub fn parse(line: &Line) -> Result<Command, ParseError> {
         let mut p = line.params();

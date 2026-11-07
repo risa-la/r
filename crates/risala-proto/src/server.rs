@@ -1,7 +1,7 @@
 //! Typed server lines, server to client (SPEC 3.6, 4.1, 5-11), and the
 //! NOTIFY push body (9.3).
 //!
-//! Every line in the second table of Section 12 parses into a
+//! Every line in the second table of Section 13 parses into a
 //! [`ServerMessage`]: an envelope with the `ref` (3.6) and `report` (5.8)
 //! tags, around a [`ServerLine`]. Events and snapshots (5.2) share one
 //! type, [`Event`], whose [`meta`](Event::meta) is `None` for a snapshot.
@@ -46,7 +46,7 @@
 //!   a value on it is ignored.
 //! - **Events and snapshots (5.2).** `seq`, `t` and `from` must be all
 //!   present (an event) or all absent (a snapshot); anything in between is
-//!   `BadSyntax`. Only SET, BAN and ROLE may be snapshots (Section 12), so a
+//!   `BadSyntax`. Only SET, BAN and ROLE may be snapshots (Section 13), so a
 //!   MSG, DELETE, JOIN, PART, INVITE, KICK or UNBAN without them is
 //!   `BadSyntax`.
 //! - **Messages (5.3, 5.4, 5.6).** At most one of `reply`, `edit` and
@@ -101,7 +101,7 @@ const fn bad(what: &'static str) -> ParseError {
 // ---------------------------------------------------------------------------
 // The envelope
 
-/// A line from the server (Section 12, second table), with the tags that
+/// A line from the server (Section 13, second table), with the tags that
 /// any line may carry (3.6, 5.8).
 ///
 /// - `ref_` is the client's `ref` tag, copied onto every response line and
@@ -166,7 +166,7 @@ impl ServerMessage {
         }
     }
 
-    /// Parses a line from the server (Section 12).
+    /// Parses a line from the server (Section 13).
     ///
     /// An unknown verb gives [`ServerLine::Unknown`] (3.8). A known verb
     /// with bad parameters or bad tags fails with `BadSyntax`, or `TooLong`
@@ -304,7 +304,7 @@ impl From<ServerLine> for ServerMessage {
 // ---------------------------------------------------------------------------
 // Lines
 
-/// One line a server can send (Section 12, second table), without the
+/// One line a server can send (Section 13, second table), without the
 /// `ref` and `report` tags, which are in [`ServerMessage`].
 ///
 /// Text fields hold escaped text (3.4) without control characters other
@@ -1665,7 +1665,7 @@ impl EventBody {
     }
 
     /// Whether this verb is also sent as a snapshot: SET, BAN and ROLE
-    /// (Section 12).
+    /// (Section 13).
     pub fn can_be_snapshot(&self) -> bool {
         matches!(
             self,

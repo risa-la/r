@@ -1,5 +1,5 @@
 //! Every `C:` example in SPEC.md and README.md parses as a typed
-//! [`Request`] (Section 12), and serialises back to the same line with
+//! [`Request`] (Section 13), and serialises back to the same line with
 //! only the verb in upper case.
 
 mod common;

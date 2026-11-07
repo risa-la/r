@@ -365,13 +365,13 @@ impl PartialEq<Uid> for Identity {
 }
 
 impl Room {
-    /// The room without its `#`, as written in `risala://` URIs (14):
+    /// The room without its `#`, as written in `risala://` URIs (15):
     /// `general` for `#general`.
     pub fn bare(&self) -> &str {
         &self.0[1..]
     }
 
-    /// Parses a room written without its `#`, as in a `risala://` URI (14).
+    /// Parses a room written without its `#`, as in a `risala://` URI (15).
     pub fn from_bare(bare: &str) -> Result<Room, ParseError> {
         format!("#{bare}").parse()
     }
