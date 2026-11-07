@@ -499,8 +499,8 @@ RISALA <version> <host> <nonce> [<message...>]
 - `<message...>` is an optional welcome text, at most 512 bytes.
 
 A new connection is not yet a guest or an identity. Until it becomes
-one, the server accepts only INFO, GUEST, AUTH, REGISTER, PING, PONG and
-QUIT. It replies `ERR not-authenticated` to anything else.
+one, the server accepts only INFO without a room, GUEST, AUTH, REGISTER,
+PING, PONG and QUIT. It replies `ERR not-authenticated` to anything else.
 
 A connection signs in once. To become someone else, reconnect. Servers
 SHOULD allow at least 120 seconds to sign in, which leaves time to sign
@@ -526,7 +526,9 @@ nothing about who someone is over time. For this reason guests:
 
 The server replies `ERR name-taken` if a connected guest already has the
 name. A guest that reconnects can get this for its own name, if the
-server has not yet noticed that its old connection is gone (Section 11).
+server has not yet noticed that its old connection is gone (Section 11),
+or is still recording the PARTs for it. A name is free again once those
+PARTs are recorded.
 Clients SHOULD then try another name, for example by adding a number. It MAY also reserve names, for example the names of identities it
 hosts. It MAY refuse guests entirely with `ERR forbidden`.
 
