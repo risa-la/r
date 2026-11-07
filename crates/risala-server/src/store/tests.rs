@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use risala_proto::names::{Conv, Room, Seq, Uid};
+use risala_proto::names::{Conv, Id, Room, Seq, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
     GuestAccess, Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting,
@@ -309,7 +309,7 @@ fn deleted_events_are_placeholders() {
         .events
         .iter()
         .map(|e| {
-            let line = e.to_event(Conv::Room(r.room.clone()), &r.id);
+            let line = e.to_event(Conv::Room(r.room.clone()), &r.id).unwrap();
             let s = risala_proto::server::ServerMessage::new(line)
                 .to_line()
                 .to_string();
@@ -337,6 +337,38 @@ fn deleted_events_are_placeholders() {
         )
         .unwrap();
     assert_eq!(n, 1);
+}
+
+#[test]
+fn room_events_in_a_direct_conversation_are_errors() {
+    // Only MSG and DELETE happen in direct conversations. Anything else
+    // there is bad data, and an error rather than a panic.
+    let id: Id = "abcdefghijkl".parse().unwrap();
+    let direct = Conv::Uid(uid("alice@example.org"));
+    let stored = |kind| StoredEvent {
+        seq: seq(3),
+        t: t(0),
+        from: uid("bob@example.org"),
+        kind,
+        deleted: false,
+    };
+    let message = stored(msg("bob@example.org", 0, "hi").kind);
+    assert!(message.to_event(direct.clone(), &id).is_ok());
+    assert!(
+        stored(EventKind::Delete { target: seq(1) })
+            .to_event(direct.clone(), &id)
+            .is_ok()
+    );
+    for kind in [
+        EventKind::Join,
+        EventKind::Part {
+            reason: String::new(),
+        },
+        EventKind::Set(RoomSetting::Public(true)),
+    ] {
+        let err = stored(kind).to_event(direct.clone(), &id).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+    }
 }
 
 #[test]

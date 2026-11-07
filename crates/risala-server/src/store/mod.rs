@@ -308,12 +308,18 @@ impl StoredEvent {
     /// The event as a line (5.2), for a conversation named `conv` as the
     /// receiver sees it, with id `id` for the `id` tag of JOIN (6.1). A
     /// deleted message is a placeholder: empty text and no file (5.4).
-    pub fn to_event(&self, conv: impl Into<risala_proto::names::Conv>, id: &Id) -> Event {
+    ///
+    /// Only MSG and DELETE happen in direct conversations. Any other event
+    /// there is bad data, and gives [`StoreError::Corrupt`].
+    pub fn to_event(&self, conv: impl Into<risala_proto::names::Conv>, id: &Id) -> Result<Event> {
         let conv = conv.into();
         let room = || match &conv {
-            risala_proto::names::Conv::Room(room) => room.clone(),
-            // Only MSG and DELETE happen in direct conversations.
-            risala_proto::names::Conv::Uid(_) => unreachable!("room event outside a room"),
+            risala_proto::names::Conv::Room(room) => Ok(room.clone()),
+            risala_proto::names::Conv::Uid(_) => Err(StoreError::Corrupt(format!(
+                "{} event {} in a direct conversation",
+                self.kind.verb(),
+                self.seq
+            ))),
         };
         let body = match &self.kind {
             EventKind::Msg {
@@ -336,49 +342,49 @@ impl StoredEvent {
                 seq: *target,
             },
             EventKind::Join => EventBody::Join {
-                room: room(),
+                room: room()?,
                 id: id.clone(),
             },
             EventKind::Part { reason } => EventBody::Part {
-                room: room(),
+                room: room()?,
                 reason: reason.clone(),
             },
             EventKind::Invite { uid } => EventBody::Invite {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
             },
             EventKind::Kick { uid, reason } => EventBody::Kick {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
                 reason: reason.clone(),
             },
             EventKind::Ban { uid, reason } => EventBody::Ban {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
                 reason: reason.clone(),
             },
             EventKind::Unban { uid } => EventBody::Unban {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
             },
             EventKind::Set(setting) => EventBody::Set {
-                room: room(),
+                room: room()?,
                 setting: setting.clone(),
             },
             EventKind::Role { uid, role } => EventBody::Role {
-                room: room(),
+                room: room()?,
                 uid: uid.clone(),
                 role: *role,
             },
         };
-        Event::new(
+        Ok(Event::new(
             EventMeta {
                 seq: self.seq,
                 t: self.t,
                 from: self.from.clone(),
             },
             body,
-        )
+        ))
     }
 
     /// Whether this is a MSG that is not an edit or a reaction, and so may

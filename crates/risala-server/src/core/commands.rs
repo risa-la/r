@@ -15,7 +15,7 @@ use risala_proto::types::{
 };
 
 use super::Inner;
-use super::state::RoomState;
+use super::state::{Registry, RoomState};
 use crate::handler::{ConnHandle, ConnId};
 use crate::store::{Appended, EventKind, HistoryQuery, NewEvent, StoreError, StoredEvent};
 
@@ -331,9 +331,14 @@ impl Inner {
         ))
     }
 
-    /// The live line of an event in a room (5.2).
-    fn room_line(st: &RoomState, event: &StoredEvent) -> ServerMessage {
-        ServerMessage::new(event.to_event(st.room.clone(), &st.id))
+    /// Queues a room's event for every connection of every member (5.2).
+    /// The event is already stored, so an event that cannot be shown is
+    /// only logged.
+    fn broadcast_event(reg: &Registry, st: &RoomState, event: &StoredEvent) {
+        match event.to_event(st.room.clone(), &st.id) {
+            Ok(line) => reg.broadcast(&st.room, &ServerMessage::new(line)),
+            Err(e) => tracing::error!(room = %st.room, "cannot send an event: {e}"),
+        }
     }
 
     /// JOIN (6.1).
@@ -353,7 +358,7 @@ impl Inner {
             let (_, event) = self.append(&mut st, event).await?;
             let mut reg = self.reg();
             reg.add_member(room, uid);
-            reg.broadcast(room, &Self::room_line(&st, &event));
+            Self::broadcast_event(&reg, &st, &event);
         }
         send_settings(reply, &st);
         // A member has joined, so there is an event.
@@ -379,7 +384,7 @@ impl Inner {
         };
         let (_, event) = self.append(&mut st, event).await?;
         let mut reg = self.reg();
-        reg.broadcast(room, &Self::room_line(&st, &event));
+        Self::broadcast_event(&reg, &st, &event);
         reg.remove_member(room, uid);
         Ok(Some(OkResponse::new()))
     }
@@ -402,7 +407,7 @@ impl Inner {
         let result = self.append(&mut st, event).await;
         let mut reg = self.reg();
         match result {
-            Ok((_, event)) => reg.broadcast(room, &Self::room_line(&st, &event)),
+            Ok((_, event)) => Self::broadcast_event(&reg, &st, &event),
             // The guest is gone either way. No seq was used.
             Err(e) => tracing::error!(%room, "storing a guest's PART failed: {e}"),
         }
@@ -477,7 +482,7 @@ impl Inner {
         let mut reg = self.reg();
         match appended {
             Appended::New(seq) => {
-                reg.broadcast(&room, &Self::room_line(&st, &event));
+                Self::broadcast_event(&reg, &st, &event);
                 if let Some(cid) = cid
                     && uid.is_guest()
                     && let Some(conn) = reg.conns.get_mut(&id)
@@ -567,8 +572,15 @@ impl Inner {
             limit: page_limit(limit, DEFAULT_LIMIT, self.config.limits.max_page),
         };
         let page = self.db(move |s| s.history(key, query)).await?;
-        for event in &page.events {
-            reply.line(event.to_event(room.clone(), &id));
+        // Every line is made before any is sent, so that bad data gives
+        // only `ERR internal`.
+        let lines = page
+            .events
+            .iter()
+            .map(|event| event.to_event(room.clone(), &id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for line in lines {
+            reply.line(line);
         }
         Ok(Some(OkResponse::new().with_id(&id).with_more(page.more)))
     }
