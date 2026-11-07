@@ -248,8 +248,8 @@ impl Inner {
     }
 
     /// Checks an AUTH signature against `identity`'s key file (4.4): first
-    /// as the fetcher has it, which may be cached, then once more freshly
-    /// fetched if that fails. Returns the key that verified, `None` if
+    /// as the fetcher has it, then, if that came from a cache and fails,
+    /// once more freshly fetched. Returns the key that verified, `None` if
     /// none of the keys the server got did (`auth-failed`), or `ERR
     /// unavailable` if a fetch failed before the server got any keys to
     /// go by (4.5).
@@ -288,7 +288,10 @@ impl Inner {
                 fetched.keys,
             )
             .await;
-            if found.is_some() {
+            // Fetching again is for a copy from the cache, which may be
+            // older than the device (4.4): one fetched just now is the
+            // file as it is.
+            if found.is_some() || !fetched.cached {
                 return Ok(found);
             }
         }

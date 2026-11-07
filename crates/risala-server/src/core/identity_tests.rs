@@ -204,14 +204,12 @@ async fn auth_failures() {
     w.fetcher.set(&bob, vec![public(1)]);
     let failed = "ERR auth-failed the signature did not verify";
 
-    // A key the file does not list. The server fetches again once (4.4).
+    // A key the file does not list. The file was fetched just now, so it
+    // is not fetched again (4.4).
     let (mut c, nonce) = w.dial(Some(HOST));
     w.send(&c, &auth("bob@example.net", 2, HOST, &nonce)).await;
     assert_eq!(c.lines(), [failed]);
-    assert_eq!(
-        w.fetcher.calls(),
-        [(bob.clone(), false), (bob.clone(), true)]
-    );
+    assert_eq!(w.fetcher.calls(), [(bob.clone(), false)]);
     w.send(&c, "sync").await;
     assert_eq!(c.lines(), ["ERR not-authenticated sign in first"]);
 
