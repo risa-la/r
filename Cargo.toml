@@ -19,10 +19,11 @@ authors = ["Risala developers <dev@risa.la>"]
 risala-proto = { path = "crates/risala-proto" }
 
 base64 = "0.23"
-# ML-DSA (FIPS 204), RustCrypto's implementation, which is also the one
-# openmls_rust_crypto uses for the MLS cipher suite 0x0052 (SPEC 12.2).
-# No default features: risala-proto needs no RNG and reads PKCS#8 itself.
-ml-dsa = { version = "0.1.2", default-features = false, features = ["alloc", "zeroize"] }
+# ML-DSA (FIPS 204), Cryspen's formally verified libcrux implementation.
+# The MLS layer (SPEC 12.2) adds it to openmls_libcrux_crypto, so a binary
+# carries one ML-DSA. Only ML-DSA-44, and no std (it is needed only for
+# tls_codec). The build script turns on AVX2 or NEON code, chosen at run time.
+libcrux-ml-dsa = { version = "0.0.11", default-features = false, features = ["mldsa44"] }
 sha2 = "0.11"
 thiserror = "2"
 zeroize = "1"
@@ -57,15 +58,15 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 all = { level = "warn", priority = -1 }
 
 # ML-DSA is slow unoptimised, and tests across the workspace sign in. Build
-# it, and the Keccak and lattice code under it, optimised in dev too.
-[profile.dev.package.ml-dsa]
+# it, and the Keccak and helper code under it, optimised in dev too.
+[profile.dev.package.libcrux-ml-dsa]
 opt-level = 3
 
-[profile.dev.package.module-lattice]
+[profile.dev.package.libcrux-sha3]
 opt-level = 3
 
-[profile.dev.package.keccak]
+[profile.dev.package.libcrux-intrinsics]
 opt-level = 3
 
-[profile.dev.package.shake]
+[profile.dev.package.libcrux-secrets]
 opt-level = 3

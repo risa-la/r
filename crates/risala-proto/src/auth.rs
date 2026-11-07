@@ -19,9 +19,9 @@
 //! takes the fresh randomness of the hedged variant. Verification cannot
 //! tell the two apart and accepts both.
 //!
-//! The implementation is RustCrypto's `ml-dsa`, the same one OpenMLS's
-//! `openmls_rust_crypto` provider uses for the MLS cipher suite of 12.2,
-//! so a binary carries one ML-DSA.
+//! The implementation is Cryspen's formally verified `libcrux-ml-dsa`.
+//! The MLS layer (12.2) uses the same crate for the cipher suite's
+//! signatures, so a binary carries one ML-DSA.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -31,8 +31,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use ml_dsa::signature::Signer as _;
-use ml_dsa::{EncodedSignature, EncodedVerifyingKey, ExpandedSigningKey, MlDsa44};
+use libcrux_ml_dsa::ml_dsa_44 as mldsa;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::error::ParseError;
@@ -209,14 +208,9 @@ impl PublicKey {
         signature: &Signature,
     ) -> bool {
         let message = challenge_bytes(host, nonce, uid);
-        let encoded = EncodedSignature::<MlDsa44>::try_from(&signature.0[..])
-            .expect("a signature has the ML-DSA-44 length");
-        let Some(signature) = ml_dsa::Signature::<MlDsa44>::decode(&encoded) else {
-            return false;
-        };
-        let key = EncodedVerifyingKey::<MlDsa44>::try_from(&self.0[..])
-            .expect("a public key has the ML-DSA-44 length");
-        ml_dsa::VerifyingKey::<MlDsa44>::decode(&key).verify_with_context(&message, b"", &signature)
+        let key = mldsa::MLDSA44VerificationKey::new(*self.as_bytes());
+        let signature = mldsa::MLDSA44Signature::new(*signature.as_bytes());
+        mldsa::verify(&key, &message, b"", &signature).is_ok()
     }
 }
 
@@ -308,12 +302,18 @@ impl fmt::Debug for Signature {
 
 /// A device's ML-DSA-44 private key (4.3-4.5, 12.2, App. A, App. B).
 ///
-/// It is kept as the 32-byte seed and the key expanded from it. Both are
-/// wiped from memory when the value is dropped, and so is every copy this
-/// module makes while reading or writing the key. `Debug` shows only the
-/// public key's fingerprint.
+/// It is kept as the 32-byte seed, on the heap so that moving the value
+/// does not copy it, together with the public key. The seed is wiped from
+/// memory when the value is dropped. Each signature expands the seed into
+/// the FIPS 204 signing key again and wipes that once it is done, and
+/// every other copy this module makes while reading or writing the key
+/// is wiped too. Copies libcrux leaves on the stack while it computes
+/// are not. `Debug` shows only the public key's fingerprint.
 #[derive(Clone)]
-pub struct SecretKey(ml_dsa::SigningKey<MlDsa44>);
+pub struct SecretKey {
+    seed: Box<Zeroizing<[u8; SEED_LEN]>>,
+    public: PublicKey,
+}
 
 impl SecretKey {
     /// Makes a key from its 32-byte seed, the ξ of FIPS 204's
@@ -321,11 +321,15 @@ impl SecretKey {
     ///
     /// To make a new key, pass 32 bytes from a cryptographically secure
     /// random source.
-    pub fn from_seed(seed: [u8; SEED_LEN]) -> SecretKey {
-        let mut seed = Zeroizing::new(ml_dsa::Seed::from(seed));
-        let key = ml_dsa::SigningKey::from_seed(&seed);
+    pub fn from_seed(mut seed: [u8; SEED_LEN]) -> SecretKey {
+        let mut stored: Box<Zeroizing<[u8; SEED_LEN]>> = Box::default();
+        stored.copy_from_slice(&seed);
         seed.zeroize();
-        SecretKey(key)
+        let public = Expanded::new(&stored).public_key();
+        SecretKey {
+            seed: stored,
+            public,
+        }
     }
 
     /// Reads a PEM-encoded PKCS#8 ML-DSA-44 private key (App. A, App. B).
@@ -356,7 +360,7 @@ impl SecretKey {
     /// same as `openssl pkey -provparam ml-dsa.output_formats=seed-only`
     /// writes. The string holds the secret and is wiped when dropped.
     pub fn to_pkcs8_pem(&self) -> Zeroizing<String> {
-        let der = pkcs8::encode_seed(self.0.as_seed().as_ref());
+        let der = pkcs8::encode_seed(&self.seed[..]);
         let body = Zeroizing::new(BASE64.encode(&der[..]));
         let mut pem = Zeroizing::new(String::with_capacity(body.len() + 64));
         pem.push_str(PEM_BEGIN);
@@ -372,9 +376,7 @@ impl SecretKey {
 
     /// The matching public key (4.4).
     pub fn public_key(&self) -> PublicKey {
-        let key: &ml_dsa::VerifyingKey<MlDsa44> = self.0.as_ref();
-        let bytes: [u8; PUBLIC_KEY_LEN] = key.encode().into();
-        PublicKey(Arc::new(bytes))
+        self.public.clone()
     }
 
     /// Signs the challenge bytes for `host`, `nonce` and `uid`, for AUTH
@@ -382,9 +384,9 @@ impl SecretKey {
     /// ML-DSA.Sign. The same inputs always give the same signature, as in
     /// Appendix B.
     pub fn sign_challenge(&self, host: &str, nonce: &Nonce, uid: &str) -> Signature {
-        let message = challenge_bytes(host, nonce, uid);
-        let signature = self.0.sign(&message);
-        Signature(Box::new(signature.encode().into()))
+        // The deterministic variant is the hedged one with rnd all zeros
+        // (FIPS 204, Algorithm 2).
+        self.sign(&challenge_bytes(host, nonce, uid), [0; 32])
     }
 
     /// Signs the challenge bytes like [`sign_challenge`](Self::sign_challenge),
@@ -396,16 +398,53 @@ impl SecretKey {
         host: &str,
         nonce: &Nonce,
         uid: &str,
-        rnd: [u8; 32],
+        mut rnd: [u8; 32],
     ) -> Signature {
-        let message = challenge_bytes(host, nonce, uid);
-        let rnd = Zeroizing::new(ml_dsa::B32::from(rnd));
-        let expanded = ExpandedSigningKey::<MlDsa44>::from_seed(self.0.as_seed());
-        // M' for ML-DSA.Sign with an empty context: a zero byte for "not
-        // prehashed", the context's length (0), then the message (FIPS
-        // 204, Algorithm 2).
-        let signature = expanded.sign_internal(&[&[0, 0], &message], &rnd);
-        Signature(Box::new(signature.encode().into()))
+        let signature = self.sign(&challenge_bytes(host, nonce, uid), rnd);
+        rnd.zeroize();
+        signature
+    }
+
+    /// ML-DSA.Sign over `message` with an empty context and randomness
+    /// `rnd` (FIPS 204, Algorithm 2).
+    fn sign(&self, message: &[u8], rnd: [u8; 32]) -> Signature {
+        let expanded = Expanded::new(&self.seed);
+        // Signing fails only if rejection sampling runs out of attempts,
+        // which FIPS 204 Appendix C bounds at 2^-256, or if the context is
+        // longer than 255 bytes, which ours is not.
+        let signature = mldsa::sign(&expanded.0.signing_key, message, b"", rnd)
+            .expect("ML-DSA-44 signing with an empty context does not fail");
+        Signature::from_bytes(signature.as_ref())
+    }
+}
+
+/// A key pair expanded from a seed by ML-DSA.KeyGen_internal (FIPS 204,
+/// Algorithm 6). libcrux's key types do not wipe themselves, so this
+/// wipes the signing key when it is dropped.
+///
+/// libcrux takes the seed by value and returns the key pair by value, so
+/// copies may remain in stack memory that neither this module nor
+/// libcrux wipes, as with its other temporaries while it computes.
+struct Expanded(mldsa::MLDSA44KeyPair);
+
+impl Expanded {
+    fn new(seed: &[u8; SEED_LEN]) -> Expanded {
+        Expanded(mldsa::generate_key_pair(*seed))
+    }
+
+    fn public_key(&self) -> PublicKey {
+        PublicKey::from_bytes(self.0.verification_key.as_ref())
+    }
+
+    /// The signing key in FIPS 204's skEncode form.
+    fn signing_key(&self) -> &[u8] {
+        self.0.signing_key.as_slice()
+    }
+}
+
+impl Drop for Expanded {
+    fn drop(&mut self) {
+        self.0.signing_key.as_ref_mut().zeroize();
     }
 }
 
@@ -488,7 +527,7 @@ fn pem_decode(pem: &str) -> Result<Zeroizing<Vec<u8>>, ParseError> {
 mod pkcs8 {
     use zeroize::Zeroizing;
 
-    use super::SecretKey;
+    use super::{Expanded, SecretKey};
     use crate::error::ParseError;
 
     /// The DER of the OID 2.16.840.1.101.3.4.3.17, id-ml-dsa-44.
@@ -593,10 +632,9 @@ mod pkcs8 {
 
     /// Whether `expanded` is the FIPS 204 skEncode of the key's seed,
     /// compared without branching on secret bytes.
-    #[allow(deprecated)] // to_expanded is deprecated only as a storage form
     fn expanded_matches(key: &SecretKey, expanded: &[u8]) -> bool {
-        let ours = ml_dsa::ExpandedSigningKey::<ml_dsa::MlDsa44>::from_seed(key.0.as_seed());
-        let ours = Zeroizing::new(ours.to_expanded());
+        let ours = Expanded::new(&key.seed);
+        let ours = ours.signing_key();
         ours.len() == expanded.len()
             && ours
                 .iter()
@@ -754,6 +792,11 @@ pub(crate) mod tests {
         "AAAAAAAAAAAAAAAAAAAAAAkXJzM=",
     );
     const PUBLIC_SHA256: &str = "d9d69ac9b18f42759e43edba0106410c07045a1edab642925b7496ea40baccdf";
+    /// The SHA-256 of the Appendix B key's expanded form (FIPS 204
+    /// skEncode), as RustCrypto's `ml-dsa` 0.1.2 and OpenSSL 3.5 compute
+    /// it. Not in the spec; it checks libcrux against them.
+    const EXPANDED_SHA256: &str =
+        "e328ea2d60f65481fdc752aa4bdea3f1c272c70a409718759770cc74a30d024c";
     const SIGNATURE_SHA256: &str =
         "eeda7aa7dd2ffa7cc2fa6683e7d8d2b94cf46716484b784d6a53b4928df58906";
     const HOST: &str = "chat.example.org";
@@ -999,10 +1042,9 @@ pub(crate) mod tests {
         assert!(SecretKey::from_pkcs8_der(&seed_only).is_ok());
 
         // The "both" form, as openssl writes by default.
-        #[allow(deprecated)]
-        let expanded =
-            ExpandedSigningKey::<MlDsa44>::from_seed(&ml_dsa::Seed::from(unhex::<32>(SEED_HEX)))
-                .to_expanded();
+        let expanded = Expanded::new(&unhex::<32>(SEED_HEX)).signing_key().to_vec();
+        assert_eq!(expanded.len(), 2560);
+        assert_eq!(sha256_hex(&expanded), EXPANDED_SHA256);
         let both = |expanded: &[u8]| {
             let mut inner = vec![0x30, 0x82, 0x0a, 0x26, 0x04, 0x20];
             inner.extend_from_slice(&unhex::<32>(SEED_HEX));
