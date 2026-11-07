@@ -21,13 +21,14 @@ use risala_proto::auth::PublicKey;
 use risala_proto::keyfile::KeyEntry;
 use risala_proto::names::{Identity, Name};
 
-/// Why an identity's key file could not be had (4.4). For signing in, any
-/// of these means the identity has no keys.
+/// Why an identity's key file could not be had (4.4). Either way, this
+/// says nothing about the identity's keys: AUTH gets `ERR unavailable`
+/// (4.5), and no connection is closed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
-    /// Fetching failed: the address is not allowed, the connection or TLS
-    /// failed, the response was not 200, or it was too large or too slow
-    /// (4.4).
+    /// The fetch failed (4.4): the address is not allowed, DNS, the
+    /// connection or TLS failed, it took too long, or the response was a
+    /// status other than 200, 404 and 410.
     #[error("fetching the key file failed: {0}")]
     Failed(String),
     /// This server fetches no key files.
@@ -35,13 +36,28 @@ pub enum FetchError {
     Unavailable,
 }
 
+/// What a fetch found (4.4): the keys of a key file, which may be none, or
+/// none for a gone answer (404 or 410).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedKeys {
+    /// The keys.
+    pub keys: Vec<PublicKey>,
+    /// They came from a cache, and fetching the file again with `refresh`
+    /// may find newer ones. `false` when they were fetched just now, or so
+    /// recently that a refetch would give the same. Only such an answer
+    /// closes the connections of keys it does not list (4.4).
+    pub cached: bool,
+}
+
 /// Gets the keys of identities the server does not host, from their key
 /// files (4.3, 4.4).
 ///
 /// Implementations follow 4.4: HTTPS with certificates checked, no
-/// redirects, only a 200 response, at most 10 seconds and 256 KiB, the
-/// first 64 different `mldsa44` keys, and no special-purpose addresses
-/// unless configured. They may cache a file for up to an hour.
+/// redirects, at most 10 seconds and 256 KiB, the first 64 different
+/// `mldsa44` keys, and no special-purpose addresses unless configured. A
+/// 200 is a key file, a 404 or 410 is gone, and anything else is a failed
+/// fetch. They may cache a file for up to an hour, and a failed fetch
+/// does not replace the cached copy.
 ///
 /// The hub calls this without holding any lock, and gives up after
 /// [`KEY_FETCH_TIMEOUT`](super::KEY_FETCH_TIMEOUT), so a slow key host
@@ -49,22 +65,26 @@ pub enum FetchError {
 pub trait KeyFetcher: Send + Sync + 'static {
     /// The keys in `identity`'s key file.
     ///
-    /// - `Ok` means a key file was fetched (or is cached) and parsed: its
-    ///   keys, which may be none. The hub closes the identity's connections
-    ///   whose device key is no longer listed (4.4).
-    /// - `Err` means there is no file to go by: the identity has no keys
-    ///   for this sign-in, but its signed-in devices stay.
+    /// - `Ok` means a key file or a gone answer, fetched or cached: the
+    ///   identity's keys, which may be none. When it is not
+    ///   [`cached`](FetchedKeys::cached), the hub closes the identity's
+    ///   connections whose device key it does not list (4.4).
+    /// - `Err` means the fetch failed, and there is no cached copy to go
+    ///   by: AUTH gets `ERR unavailable`, and the identity's signed-in
+    ///   devices stay.
     ///
     /// With `refresh`, a cached copy must not be used: the hub asks again
-    /// with `refresh` once when a signature does not verify against what
-    /// it got first, so that a newly added device works straight away
-    /// (4.4). After a fetch with `refresh`, later fetches without it
-    /// return that file or a newer one.
+    /// with `refresh` once when a signature does not verify against a
+    /// cached answer, so that a newly added device works straight away
+    /// (4.4). If that fetch fails, it is an `Err`, even though the cached
+    /// copy stays for later fetches without `refresh`. After a fetch with
+    /// `refresh` that did not fail, later fetches without it return that
+    /// answer or a newer one.
     fn fetch(
         &self,
         identity: &Identity,
         refresh: bool,
-    ) -> impl Future<Output = Result<Vec<PublicKey>, FetchError>> + Send;
+    ) -> impl Future<Output = Result<FetchedKeys, FetchError>> + Send;
 }
 
 /// Publishes the key files of the identities the server hosts (4.6): to a
@@ -99,7 +119,7 @@ pub trait KeyFilePublisher: Send + Sync + 'static {
 pub struct NoFetcher;
 
 impl KeyFetcher for NoFetcher {
-    async fn fetch(&self, _: &Identity, _: bool) -> Result<Vec<PublicKey>, FetchError> {
+    async fn fetch(&self, _: &Identity, _: bool) -> Result<FetchedKeys, FetchError> {
         Err(FetchError::Unavailable)
     }
 }
@@ -125,7 +145,7 @@ pub(crate) trait DynKeyFetcher: Send + Sync + 'static {
         &'a self,
         identity: &'a Identity,
         refresh: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<PublicKey>, FetchError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<FetchedKeys, FetchError>> + Send + 'a>>;
 }
 
 impl<T: KeyFetcher> DynKeyFetcher for T {
@@ -133,7 +153,7 @@ impl<T: KeyFetcher> DynKeyFetcher for T {
         &'a self,
         identity: &'a Identity,
         refresh: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<PublicKey>, FetchError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<FetchedKeys, FetchError>> + Send + 'a>> {
         Box::pin(self.fetch(identity, refresh))
     }
 }
@@ -179,7 +199,7 @@ impl fmt::Debug for KeyServices {
 /// What a [`MemoryFetcher`] has for one identity.
 #[derive(Debug, Clone)]
 enum Answer {
-    /// These keys, or this error.
+    /// These keys (none for a gone answer), or this failure.
     Keys(Result<Vec<PublicKey>, FetchError>),
     /// Never answers, like a key host that does not respond.
     Hang,
@@ -199,11 +219,11 @@ struct MemoryState {
 }
 
 /// A [`KeyFetcher`] with key files in memory, for tests. It can model a
-/// cache that is out of date ([`set_cached`](Self::set_cached)), a fetch
-/// that fails, and a key host that never answers.
+/// cache that is out of date ([`set_cached`](Self::set_cached)), a file
+/// that is gone, a fetch that fails, and a key host that never answers.
 ///
-/// An identity it knows nothing about gets [`FetchError::Failed`], as for
-/// a 404.
+/// An identity it knows nothing about is gone, as for a 404: it has no
+/// keys.
 #[derive(Debug, Default)]
 pub struct MemoryFetcher {
     state: Mutex<MemoryState>,
@@ -226,12 +246,23 @@ impl MemoryFetcher {
             .insert(identity.clone(), Answer::Keys(Ok(keys)));
     }
 
-    /// Fetching `identity`'s key file fails from now on.
+    /// Fetching `identity`'s key file fails from now on, as when its host
+    /// cannot be reached (4.4). A cached copy from
+    /// [`set_cached`](Self::set_cached) is still returned without
+    /// `refresh`.
     pub fn fail(&self, identity: &Identity) {
         self.state().current.insert(
             identity.clone(),
-            Answer::Keys(Err(FetchError::Failed("404".into()))),
+            Answer::Keys(Err(FetchError::Failed("unreachable".into()))),
         );
+    }
+
+    /// `identity`'s key file is gone from now on, as for a 404 (4.4): it
+    /// has no keys.
+    pub fn gone(&self, identity: &Identity) {
+        self.state()
+            .current
+            .insert(identity.clone(), Answer::Keys(Ok(Vec::new())));
     }
 
     /// Fetching `identity`'s key file never finishes from now on.
@@ -264,37 +295,37 @@ impl MemoryFetcher {
 }
 
 impl KeyFetcher for MemoryFetcher {
-    async fn fetch(
-        &self,
-        identity: &Identity,
-        refresh: bool,
-    ) -> Result<Vec<PublicKey>, FetchError> {
-        let answer = {
+    async fn fetch(&self, identity: &Identity, refresh: bool) -> Result<FetchedKeys, FetchError> {
+        let (answer, cached) = {
             let mut state = self.state();
             state.calls.push((identity.clone(), refresh));
-            let cached = if refresh {
-                state.cached.remove(identity);
-                None
-            } else {
-                state.cached.get(identity).cloned()
-            };
-            match cached {
-                Some(keys) => Answer::Keys(Ok(keys)),
-                None => state
-                    .current
-                    .get(identity)
-                    .cloned()
-                    .unwrap_or(Answer::Keys(Err(FetchError::Failed("404".into())))),
+            let current = state
+                .current
+                .get(identity)
+                .cloned()
+                .unwrap_or(Answer::Keys(Ok(Vec::new())));
+            match (refresh, state.cached.get(identity).cloned()) {
+                (false, Some(keys)) => (Answer::Keys(Ok(keys)), true),
+                (_, cached) => {
+                    // A failed fetch keeps the cached copy (4.4); anything
+                    // else replaces it.
+                    let failed = matches!(current, Answer::Keys(Err(_)));
+                    if cached.is_some() && !failed {
+                        state.cached.remove(identity);
+                    }
+                    (current, false)
+                }
             }
         };
-        match answer {
-            Answer::Keys(result) => result,
+        let keys = match answer {
+            Answer::Keys(result) => result?,
             Answer::Hang => std::future::pending().await,
             Answer::Held(notify, keys) => {
                 notify.notified().await;
-                Ok(keys)
+                keys
             }
-        }
+        };
+        Ok(FetchedKeys { keys, cached })
     }
 }
 

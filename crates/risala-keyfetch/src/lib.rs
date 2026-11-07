@@ -8,14 +8,25 @@
 //!
 //! - HTTPS, with TLS 1.3 and certificates checked against public CAs
 //!   ([`Roots`]);
-//! - no redirects: only a 200 response counts;
-//! - at most 10 seconds and 256 KiB, or else no keys;
+//! - no redirects;
+//! - at most 10 seconds and 256 KiB;
 //! - at most 64 distinct valid keys ([`risala_proto::keyfile`]);
 //! - an optional guard against special-purpose addresses ([`guard`]),
 //!   checked on every address it connects to, which servers must use;
 //! - a cache of up to an hour, with an explicit refetch for "fetch again
 //!   once before failing";
 //! - a limit on how often any one key file is fetched (14, "Abuse").
+//!
+//! A fetch has one of three outcomes (4.4):
+//!
+//! - **a key file**: a 200 response, whose keys may be none. One over 256
+//!   KiB counts as a file with no keys.
+//! - **gone**: a 404 or 410 response. The identity has no keys.
+//! - **failed**: anything else, a [`FetchError`]. This is an outage, and
+//!   says nothing about the identity's keys.
+//!
+//! A key file or a gone answer replaces the cached copy. A failed fetch
+//! does not: the cached copy stays valid until its hour is up.
 //!
 //! ```no_run
 //! # async fn f() -> Result<(), risala_keyfetch::FetchError> {
@@ -69,8 +80,24 @@ pub const DEFAULT_MIN_REFETCH: Duration = Duration::from_secs(10);
 /// The default number of fetches that may run at once.
 pub const DEFAULT_MAX_CONCURRENT: usize = 64;
 
-/// Why a fetch gave no keys. Every error means the identity has no keys
-/// (4.4); the kinds are there for logs.
+/// What a fetch found (4.4): a key file, or a gone answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    /// The identity's keys, in file order, with their labels: those the
+    /// key file lists, which may be none. None for a gone answer, or for a
+    /// file over 256 KiB.
+    pub entries: Arc<[KeyEntry]>,
+    /// The answer was a 404 or 410, not a key file.
+    pub gone: bool,
+    /// It came from the cache, and the rate limit would let it be fetched
+    /// again now, so a fetch with `refresh` may find a newer file. `false`
+    /// when it was fetched for this call, or so recently that it would
+    /// not be fetched again yet.
+    pub cached: bool,
+}
+
+/// Why a fetch failed: an outage, which says nothing about the identity's
+/// keys (4.4). The kinds are there for logs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FetchError {
@@ -88,13 +115,10 @@ pub enum FetchError {
     /// not valid for the domain.
     #[error("TLS: {0}")]
     Tls(String),
-    /// The response was not a 200 (4.4). Redirects end here too, without
-    /// being followed.
+    /// The response was not a 200, 404 or 410 (4.4). Redirects end here
+    /// too, without being followed.
     #[error("HTTP status {0}")]
     Status(u16),
-    /// The file is over 256 KiB (4.4).
-    #[error("the key file is over 256 KiB")]
-    TooLarge,
     /// The file did not arrive within the time limit (4.4).
     #[error("the key file did not arrive in time")]
     Timeout,
@@ -203,52 +227,83 @@ struct Inner {
     resolver: Arc<dyn Resolve>,
     clock: Arc<dyn Clock>,
     permits: Semaphore,
-    cache: Mutex<HashMap<Identity, Arc<Slot>>>,
+    cache: Mutex<Cache>,
+}
+
+/// The cache: a slot per identity.
+#[derive(Default)]
+struct Cache {
+    slots: HashMap<Identity, Arc<Slot>>,
+}
+
+impl Cache {
+    fn insert(&mut self, identity: &Identity) -> Arc<Slot> {
+        let slot = Arc::<Slot>::default();
+        self.slots.insert(identity.clone(), slot.clone());
+        slot
+    }
+
+    fn remove(&mut self, identity: &Identity) {
+        self.slots.remove(identity);
+    }
 }
 
 /// One key file's place in the cache. Its lock is held while it is
 /// fetched, so concurrent fetches of one file become one.
 #[derive(Default)]
 struct Slot {
-    last: tokio::sync::Mutex<Option<Fetched>>,
+    last: tokio::sync::Mutex<Option<Last>>,
 }
 
-/// What is known of a key file: the outcome of its last fetch.
+/// What is known of a key file.
 #[derive(Clone)]
-struct Fetched {
-    /// When `result` was fetched.
-    at: Instant,
-    /// When a fetch was last tried. Later than `at` when a refetch failed
-    /// to reach the server and the file fetched at `at` was kept.
+struct Last {
+    /// The last answer the host gave about the file, a key file or gone,
+    /// and when it came. `None` if every fetch so far failed.
+    answer: Option<(Instant, Answer)>,
+    /// When a fetch was last tried.
     tried: Instant,
-    result: Result<Arc<[KeyEntry]>, FetchError>,
+    /// Why the last try failed, if it did. An answer from before it is
+    /// kept, and stays valid for the cache's lifetime (4.4).
+    failure: Option<FetchError>,
 }
 
-impl Fetched {
-    /// Whether this may still be used without fetching again: a file for
-    /// the cache's lifetime, a failure only for the rate limit's.
-    fn fresh(&self, now: Instant, inner: &Inner) -> bool {
-        match self.result {
-            Ok(_) => now.saturating_duration_since(self.at) < inner.cache_ttl,
-            Err(_) => !self.may_retry(now, inner),
+/// A key file or a gone answer (4.4).
+#[derive(Clone)]
+struct Answer {
+    entries: Arc<[KeyEntry]>,
+    gone: bool,
+}
+
+impl Answer {
+    fn found(&self, cached: bool) -> Found {
+        Found {
+            entries: self.entries.clone(),
+            gone: self.gone,
+            cached,
         }
+    }
+}
+
+impl Last {
+    /// The answer, if it may still be used: younger than the cache's
+    /// lifetime.
+    fn fresh(&self, now: Instant, inner: &Inner) -> Option<&Answer> {
+        self.answer
+            .as_ref()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < inner.cache_ttl)
+            .map(|(_, answer)| answer)
     }
 
     /// Whether the rate limit lets the file be fetched again (14).
     fn may_retry(&self, now: Instant, inner: &Inner) -> bool {
         now.saturating_duration_since(self.tried) >= inner.min_refetch
     }
-}
 
-impl FetchError {
-    /// Whether the key file's server answered: with a status other than
-    /// 200, a file over the size limit, or a response that is not HTTP.
-    /// Other errors mean it could not be reached in time.
-    pub fn is_answer(&self) -> bool {
-        matches!(
-            self,
-            FetchError::Status(_) | FetchError::TooLarge | FetchError::BadResponse(_)
-        )
+    /// Whether nothing in it is of use any more, so that the cache may
+    /// drop it first.
+    fn expired(&self, now: Instant, inner: &Inner) -> bool {
+        self.fresh(now, inner).is_none() && self.may_retry(now, inner)
     }
 }
 
@@ -265,45 +320,32 @@ impl KeyFetcher {
     /// A fetcher with `options`. Loading the built-in roots takes a few
     /// milliseconds, so make one and share it.
     pub fn new(options: FetchOptions) -> KeyFetcher {
+        let cache_capacity = options.cache_capacity.max(1);
         KeyFetcher {
             inner: Arc::new(Inner {
                 connector: tls::connector(&options.roots),
                 allow_private: options.allow_private,
                 timeout: options.timeout.min(FETCH_TIMEOUT),
                 cache_ttl: options.cache_ttl.min(MAX_CACHE_TTL),
-                cache_capacity: options.cache_capacity.max(1),
+                cache_capacity,
                 min_refetch: options.min_refetch,
                 resolver: options.resolver,
                 clock: options.clock,
                 permits: Semaphore::new(options.max_concurrent.max(1)),
-                cache: Mutex::new(HashMap::new()),
+                cache: Mutex::new(Cache::default()),
             }),
         }
     }
 
-    /// The public keys of `identity`'s key file, in file order (4.4).
-    ///
-    /// A cached file is used if it is younger than the cache's lifetime.
-    /// With `refresh`, the file is fetched again instead, as 4.4 asks
-    /// after a signature fails against a cached file, unless it was
-    /// fetched less than [`FetchOptions::min_refetch`] ago: then the last
-    /// result stands. A failure is remembered for that long too.
-    ///
-    /// If a refetch cannot reach the server (any error but
-    /// [`is_answer`](FetchError::is_answer)), a cached file still within
-    /// the cache's lifetime is kept and returned: the cache is there so
-    /// that people can sign in while their key file's host is down (14).
-    /// An answer, such as a 404 for a deleted file, replaces it.
-    ///
-    /// Any error means the identity has no keys (4.4). An empty list means
-    /// the file was fetched but has no valid key.
+    /// The public keys of `identity`, in file order (4.4): those its key
+    /// file lists, or none if it is gone. See [`lookup`](Self::lookup).
     pub async fn fetch(
         &self,
         identity: &Identity,
         refresh: bool,
     ) -> Result<Vec<PublicKey>, FetchError> {
-        let entries = self.fetch_entries(identity, refresh).await?;
-        Ok(entries.iter().map(|e| e.key().clone()).collect())
+        let found = self.lookup(identity, refresh).await?;
+        Ok(found.entries.iter().map(|e| e.key().clone()).collect())
     }
 
     /// [`fetch`](Self::fetch), with each key's label, for clients that
@@ -313,36 +355,71 @@ impl KeyFetcher {
         identity: &Identity,
         refresh: bool,
     ) -> Result<Arc<[KeyEntry]>, FetchError> {
+        Ok(self.lookup(identity, refresh).await?.entries)
+    }
+
+    /// What `identity`'s key file says (4.4): a key file, which may list
+    /// no keys, or gone. An error means the fetch failed, and says nothing
+    /// about the identity's keys.
+    ///
+    /// - A cached answer is used if it is younger than the cache's
+    ///   lifetime.
+    /// - With `refresh`, the file is fetched again instead, as 4.4 asks
+    ///   after a signature fails against a cached file, unless it was
+    ///   tried less than [`FetchOptions::min_refetch`] ago: then the last
+    ///   outcome stands, failure included.
+    /// - A key file or a gone answer replaces the cached one. A failed
+    ///   fetch does not, but is returned: the cached answer stays, and is
+    ///   used without `refresh` until its hour is up, so that people can
+    ///   sign in while their key file's host is down (14).
+    pub async fn lookup(&self, identity: &Identity, refresh: bool) -> Result<Found, FetchError> {
         let inner = &*self.inner;
         let slot = self.slot(identity);
         let mut last = slot.last.lock().await;
         let now = inner.clock.now();
-        if let Some(fetched) = &*last
-            && (!fetched.may_retry(now, inner) || (!refresh && fetched.fresh(now, inner)))
-        {
-            return fetched.result.clone();
+        if let Some(known) = &*last {
+            if !known.may_retry(now, inner) {
+                // Tried too recently to try again: the last outcome stands.
+                return match (&known.failure, known.fresh(now, inner)) {
+                    (Some(failure), _) if refresh => Err(failure.clone()),
+                    (_, Some(answer)) => Ok(answer.found(false)),
+                    (Some(failure), None) => Err(failure.clone()),
+                    (None, None) => Err(FetchError::Timeout),
+                };
+            }
+            if !refresh && let Some(answer) = known.fresh(now, inner) {
+                return Ok(answer.found(true));
+            }
         }
         let result = self.get(identity).await;
         let tried = inner.clock.now();
-        match &result {
-            Ok(keys) => tracing::debug!(%identity, keys = keys.len(), "fetched key file"),
-            Err(error) => tracing::info!(%identity, %error, "key file fetch failed"),
+        match result {
+            Ok(answer) => {
+                tracing::debug!(
+                    %identity,
+                    keys = answer.entries.len(),
+                    gone = answer.gone,
+                    "fetched key file"
+                );
+                let found = answer.found(false);
+                *last = Some(Last {
+                    answer: Some((tried, answer)),
+                    tried,
+                    failure: None,
+                });
+                Ok(found)
+            }
+            Err(error) => {
+                tracing::info!(%identity, %error, "key file fetch failed");
+                let answer = last.take().and_then(|known| known.answer);
+                *last = Some(Last {
+                    answer,
+                    tried,
+                    failure: Some(error.clone()),
+                });
+                Err(error)
+            }
         }
-        if let (Err(error), Some(fetched)) = (&result, &mut *last)
-            && !error.is_answer()
-            && fetched.result.is_ok()
-            && fetched.fresh(tried, inner)
-        {
-            tracing::info!(%identity, "keeping the cached key file");
-            fetched.tried = tried;
-            return fetched.result.clone();
-        }
-        *last = Some(Fetched {
-            at: tried,
-            tried,
-            result: result.clone(),
-        });
-        result
     }
 
     /// Forgets the cached key file of `identity`, so that the next fetch
@@ -354,53 +431,73 @@ impl KeyFetcher {
 
     /// The number of key files in the cache, fetched or being fetched.
     pub fn cached(&self) -> usize {
-        self.cache().len()
+        self.cache().slots.len()
     }
 
-    fn cache(&self) -> MutexGuard<'_, HashMap<Identity, Arc<Slot>>> {
+    fn cache(&self) -> MutexGuard<'_, Cache> {
         self.inner.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The cache slot of `identity`, made if there is none. When the cache
-    /// is full, it drops expired entries, then the oldest. If every entry
-    /// is being fetched, the new slot is used without being cached.
+    /// is full, expired entries go, then the oldest. Entries being fetched
+    /// are locked, and skipped. If no entry can go, the new slot is used
+    /// without being cached.
     fn slot(&self, identity: &Identity) -> Arc<Slot> {
         let inner = &*self.inner;
         let mut cache = self.cache();
-        if let Some(slot) = cache.get(identity) {
+        if let Some(slot) = cache.slots.get(identity) {
             return slot.clone();
         }
-        if cache.len() >= inner.cache_capacity {
-            let now = inner.clock.now();
-            // Entries being fetched are locked, and skipped.
-            let mut oldest: Option<(Instant, Identity)> = None;
-            cache.retain(|id, slot| {
-                let Ok(last) = slot.last.try_lock() else {
-                    return true;
-                };
-                let Some(fetched) = &*last else {
-                    return false;
-                };
-                let expired = !fetched.fresh(now, inner) && fetched.may_retry(now, inner);
-                if !expired && oldest.as_ref().is_none_or(|(at, _)| fetched.tried < *at) {
-                    oldest = Some((fetched.tried, id.clone()));
-                }
-                !expired
-            });
-            if cache.len() >= inner.cache_capacity
-                && let Some((_, id)) = oldest
-            {
-                cache.remove(&id);
+        let now = inner.clock.now();
+        if cache.slots.len() >= inner.cache_capacity && !self.make_room(&mut cache, now, |_| true) {
+            return Arc::default();
+        }
+        cache.insert(identity)
+    }
+
+    /// Drops the expired entries of those for which `which` is true, or
+    /// else the oldest of them. Returns whether any went.
+    fn make_room(
+        &self,
+        cache: &mut Cache,
+        now: Instant,
+        which: impl Fn(&Identity) -> bool,
+    ) -> bool {
+        let inner = &*self.inner;
+        let mut expired = Vec::new();
+        let mut oldest: Option<(Instant, Identity)> = None;
+        for (id, slot) in &cache.slots {
+            if !which(id) {
+                continue;
             }
-            if cache.len() >= inner.cache_capacity {
-                return Arc::default();
+            // Entries being fetched are locked, and skipped.
+            let Ok(last) = slot.last.try_lock() else {
+                continue;
+            };
+            let Some(known) = &*last else {
+                expired.push(id.clone());
+                continue;
+            };
+            if known.expired(now, inner) {
+                expired.push(id.clone());
+            } else if oldest.as_ref().is_none_or(|(at, _)| known.tried < *at) {
+                oldest = Some((known.tried, id.clone()));
             }
         }
-        cache.entry(identity.clone()).or_default().clone()
+        if expired.is_empty() {
+            match oldest {
+                Some((_, id)) => expired.push(id),
+                None => return false,
+            }
+        }
+        for id in &expired {
+            cache.remove(id);
+        }
+        true
     }
 
     /// Fetches the key file of `identity` now, within the time limit.
-    async fn get(&self, identity: &Identity) -> Result<Arc<[KeyEntry]>, FetchError> {
+    async fn get(&self, identity: &Identity) -> Result<Answer, FetchError> {
         let inner = &*self.inner;
         let work = async {
             let _permit = inner
@@ -423,10 +520,29 @@ impl KeyFetcher {
                 .connect(name, tcp)
                 .await
                 .map_err(|e| FetchError::Tls(e.to_string()))?;
-            let body = http::get(&mut stream, domain, &path, MAX_KEY_FILE_BYTES).await?;
-            let text = valid_lines(&body);
-            let file = KeyFile::parse(&text).map_err(|_| FetchError::TooLarge)?;
-            Ok(Arc::from(file.into_keys()))
+            let none = || Answer {
+                entries: Arc::from(Vec::new()),
+                gone: false,
+            };
+            match http::get(&mut stream, domain, &path, MAX_KEY_FILE_BYTES).await? {
+                http::Got::Body(body) => {
+                    let text = valid_lines(&body);
+                    // Parsing fails only for a file over the limit.
+                    Ok(KeyFile::parse(&text).map_or_else(
+                        |_| none(),
+                        |file| Answer {
+                            entries: Arc::from(file.into_keys()),
+                            gone: false,
+                        },
+                    ))
+                }
+                // A file over 256 KiB lists no keys (4.4).
+                http::Got::TooLarge => Ok(none()),
+                http::Got::Gone => Ok(Answer {
+                    entries: Arc::from(Vec::new()),
+                    gone: true,
+                }),
+            }
         };
         tokio::time::timeout(inner.timeout, work)
             .await

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use risala_keyfetch::{FetchError, FetchOptions, KeyFetcher, Roots, StaticResolver};
+use risala_keyfetch::{FetchOptions, KeyFetcher, Roots, StaticResolver};
 use risala_proto::auth::{PublicKey, SecretKey};
 use risala_proto::keyfile::KeyEntry;
 use risala_proto::names::{Identity, Name};
@@ -101,10 +101,7 @@ async fn listener_serves_published_key_files() {
 
     let fetcher = fetcher(&ca, addr);
     let alice = id("alice@example.test");
-    assert_eq!(
-        fetcher.fetch(&alice, false).await,
-        Err(FetchError::Status(404))
-    );
+    assert!(fetcher.lookup(&alice, false).await.unwrap().gone);
 
     keys.publish(&name("alice"), &[entry(1, "laptop"), entry(2, "phone")])
         .unwrap();
@@ -121,10 +118,7 @@ async fn listener_serves_published_key_files() {
     // UNREGISTER removes it.
     keys.remove(&name("alice")).unwrap();
     fetcher.invalidate(&alice);
-    assert_eq!(
-        fetcher.fetch(&alice, false).await,
-        Err(FetchError::Status(404))
-    );
+    assert!(fetcher.lookup(&alice, false).await.unwrap().gone);
 
     stop.send(()).unwrap();
     running.await.unwrap().unwrap();
@@ -284,19 +278,33 @@ async fn daemon_runs_the_listener() {
         Ok(vec![key(7)])
     );
     for nobody in ["carol", "dave", "bob"] {
-        assert_eq!(
-            fetcher
-                .fetch(&id(&format!("{nobody}@example.test")), false)
-                .await,
-            Err(FetchError::Status(404)),
-            "{nobody}"
-        );
+        let found = fetcher
+            .lookup(&id(&format!("{nobody}@example.test")), false)
+            .await
+            .unwrap();
+        assert!(found.gone && found.entries.is_empty(), "{nobody}");
     }
     // Through the server's trait, as the hub calls it.
     let fetcher = super::HttpsKeyFetcher(fetcher);
     assert_eq!(
         crate::core::KeyFetcher::fetch(&fetcher, &id("alice@example.test"), true).await,
-        Ok(vec![key(7)])
+        Ok(crate::core::FetchedKeys {
+            keys: vec![key(7)],
+            cached: false
+        })
+    );
+    // Gone is no keys, and a failure is an error (4.4).
+    assert_eq!(
+        crate::core::KeyFetcher::fetch(&fetcher, &id("bob@example.test"), true).await,
+        Ok(crate::core::FetchedKeys {
+            keys: vec![],
+            cached: false
+        })
+    );
+    assert!(
+        crate::core::KeyFetcher::fetch(&fetcher, &id("bob@unknown.test"), true)
+            .await
+            .is_err()
     );
 
     stop.send(()).unwrap();

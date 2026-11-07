@@ -1,7 +1,7 @@
 //! The tools in `risala_server::testing` that other crates use: the
 //! cutting proxy, `restart_with`, and the key server for identities.
 
-use risala_keyfetch::{FetchError, KeyFetcher};
+use risala_keyfetch::KeyFetcher;
 use risala_server::testing::{ClientOptions, Proxy, TestClient, TestKeyServer, TestServer};
 
 async fn guest_via(proxy: &Proxy, name: &str) -> TestClient {
@@ -171,10 +171,8 @@ async fn key_server_serves_what_it_is_given() {
         [phone.public_key()]
     );
     keys.remove(bob.identity());
-    assert_eq!(
-        fetcher.fetch(bob.identity(), true).await,
-        Err(FetchError::Status(404))
-    );
+    let found = fetcher.lookup(bob.identity(), true).await.unwrap();
+    assert!(found.gone && found.entries.is_empty());
     // The same name at another domain is another file.
     let other = keys.new_identity("bob@example.com");
     assert_eq!(

@@ -101,10 +101,11 @@ async fn auth_with_a_fetched_key_file() {
     let carol = TestIdentity::new("carol@example.com");
     let (_c, answer) = server.auth(&carol).await;
     assert!(answer.starts_with("ERR auth-failed"), "{answer}");
-    // A domain the key server does not serve at all.
+    // A domain the key server does not serve at all: the fetch fails, so
+    // the server could not check the signature (4.5).
     let dave = TestIdentity::new("dave@example.invalid");
     let (_c, answer) = server.auth(&dave).await;
-    assert!(answer.starts_with("ERR auth-failed"), "{answer}");
+    assert!(answer.starts_with("@retry=10 ERR unavailable"), "{answer}");
 
     // Once carol publishes her key, she may sign in.
     server

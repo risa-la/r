@@ -242,15 +242,13 @@ async fn auth_failures() {
     w.send(&c, &format!("auth eve@example.net {sig}")).await;
     assert_eq!(c.lines(), [failed]);
 
-    // No key file: fetching fails, and is not tried again.
+    // A key file that is gone (404 or 410): carol has no keys (4.4).
     let carol = identity("carol@example.com");
-    w.fetcher.fail(&carol);
-    let before = w.fetcher.calls().len();
+    w.fetcher.gone(&carol);
     let (mut c, nonce) = w.dial(Some(HOST));
     w.send(&c, &auth("carol@example.com", 1, HOST, &nonce))
         .await;
     assert_eq!(c.lines(), [failed]);
-    assert_eq!(w.fetcher.calls()[before..], [(carol, false)]);
 
     // Without SNI there is no host to check against.
     let (mut c, nonce) = w.dial(None);
@@ -318,8 +316,8 @@ async fn sign_ins_need_the_servers_name_in_sni() {
     }
 }
 
-/// A key file that does not arrive in time fails AUTH, without holding up
-/// anyone else.
+/// A key file that does not arrive in time gets `unavailable`, without
+/// holding up anyone else (4.5).
 #[tokio::test(start_paused = true)]
 async fn auth_gives_up_on_a_slow_key_host() {
     let mut w = World::new();
@@ -339,7 +337,80 @@ async fn auth_gives_up_on_a_slow_key_host() {
     w.send(&sam, "msg #general still here").await;
     assert_eq!(sam.lines().last().unwrap(), "OK seq=2");
     task.await.unwrap();
+    assert_eq!(
+        c.lines(),
+        ["@retry=10 ERR unavailable could not get the identity's key file; try again later"]
+    );
+}
+
+/// AUTH tells a failed fetch, an outage, from keys that do not verify
+/// (4.4, 4.5): `unavailable` when the server got no key file to go by,
+/// `auth-failed` only against keys it actually got.
+#[tokio::test]
+async fn a_failed_fetch_is_unavailable() {
+    let mut w = World::new();
+    let unavailable =
+        "@retry=10 ERR unavailable could not get the identity's key file; try again later";
+    let bob = identity("bob@example.net");
+
+    // No copy at all.
+    w.fetcher.fail(&bob);
+    let (mut c, nonce) = w.dial(Some(HOST));
+    w.send(&c, &auth("bob@example.net", 1, HOST, &nonce)).await;
+    assert_eq!(c.lines(), [unavailable]);
+
+    // A cached copy that verifies is used while the host is down.
+    w.fetcher.set_cached(&bob, vec![public(1)]);
+    let mut laptop = w.sign_in("bob@example.net", 1).await;
+
+    // A cached copy that does not verify, and a refetch that fails: the
+    // server could not check the signature against the current file.
+    let (mut c, nonce) = w.dial(Some(HOST));
+    w.send(&c, &auth("bob@example.net", 2, HOST, &nonce)).await;
+    assert_eq!(c.lines(), [unavailable]);
+    // A failed fetch closes nothing.
+    w.send(&laptop, "sync").await;
+    assert_eq!(laptop.lines(), ["OK"]);
+
+    // A server that fetches no key files at all gives no retry.
+    let mut h = Harness::with(id_config(), |_| {});
+    let mut c = h.connect_sni(Some(HOST), 4096);
+    let nonce: Nonce = c.lines()[0].split(' ').nth(3).unwrap().parse().unwrap();
+    h.send(&c, &auth("bob@example.net", 1, HOST, &nonce)).await;
+    assert_eq!(
+        c.lines(),
+        ["ERR unavailable could not get the identity's key file; try again later"]
+    );
+}
+
+/// Only a key file that does not list a key, or a gone answer, removes
+/// it: then the devices that signed in with it are closed (4.4). An
+/// answer from the cache, which may be older than what they signed in
+/// with, closes nothing.
+#[tokio::test]
+async fn only_a_fresh_answer_removes_keys() {
+    let mut w = World::new();
+    let bob = identity("bob@example.net");
+    w.fetcher.set(&bob, vec![public(1), public(2)]);
+    let mut laptop = w.sign_in("bob@example.net", 1).await;
+    let mut phone = w.sign_in("bob@example.net", 2).await;
+
+    // A cached copy without the phone's key verifies the laptop again.
+    w.fetcher.set_cached(&bob, vec![public(1)]);
+    let _again = w.sign_in("bob@example.net", 1).await;
+    w.send(&phone, "sync").await;
+    assert_eq!(phone.lines(), ["OK"]);
+
+    // The file is gone: every device of bob's is closed.
+    w.fetcher.gone(&bob);
+    let (mut c, nonce) = w.dial(Some(HOST));
+    w.send(&c, &auth("bob@example.net", 3, HOST, &nonce)).await;
     assert_eq!(c.lines(), ["ERR auth-failed the signature did not verify"]);
+    assert_eq!(phone.lines(), ["<close> BYE this device's key was removed"]);
+    assert_eq!(
+        laptop.lines(),
+        ["<close> BYE this device's key was removed"]
+    );
 }
 
 /// A key added to a key file that the server has cached works at once:

@@ -89,8 +89,8 @@ use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 use risala_proto::names::{Domain, Id, Uid};
 
 pub use keys::{
-    FetchError, KeyFetcher, KeyFilePublisher, KeyServices, MemoryFetcher, MemoryPublisher,
-    NoFetcher, NoPublisher,
+    FetchError, FetchedKeys, KeyFetcher, KeyFilePublisher, KeyServices, MemoryFetcher,
+    MemoryPublisher, NoFetcher, NoPublisher,
 };
 use presence::PresenceBook;
 use state::{ConnEntry, ConvEntry, ConvState, GuestSession, Registry};
@@ -102,9 +102,15 @@ pub const NONCE_BYTES: usize = 32;
 /// of them carry about 165 bits.
 pub const TOKEN_LEN: usize = 32;
 
-/// How long AUTH waits for an identity's key file (4.4) before it fails.
-/// A fetcher stops after 10 seconds itself; this is a backstop.
+/// How long AUTH waits for an identity's key file (4.4) before it gives
+/// up with `ERR unavailable`. A fetcher stops after 10 seconds itself;
+/// this is a backstop.
 pub const KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The `retry` on AUTH's `ERR unavailable` (4.5): how long a client
+/// should wait before it tries again after a key file could not be
+/// fetched. A fetcher does not try a file again sooner anyway (14).
+pub const UNAVAILABLE_RETRY: Duration = Duration::from_secs(10);
 
 /// The BYE text for a connection whose guest session was resumed on
 /// another connection (4.2).

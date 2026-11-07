@@ -207,15 +207,23 @@ async fn fetches_keys() {
     assert_eq!(entries[1].label(), Some("device2"));
     assert_eq!(server.hits(), 1);
 
-    // Anything but a 200 is an error, which means no keys.
+    // A 404: the file is gone, and bob has no keys (4.4).
     assert_eq!(
         fetcher.fetch(&id("bob@example.test"), false).await,
-        Err(FetchError::Status(404))
+        Ok(vec![])
     );
+    let found = fetcher
+        .lookup(&id("bob@example.test"), false)
+        .await
+        .unwrap();
+    assert!(found.gone && found.entries.is_empty());
 }
 
+/// The three outcomes of a fetch (4.4): a 200 is a key file, a 404 or
+/// 410 is gone, and anything else fails, redirects included, which are
+/// not followed.
 #[tokio::test]
-async fn only_200_counts_and_redirects_are_not_followed() {
+async fn outcomes_and_redirects() {
     let ca = TestCa::new();
     let server = Server::start(
         &ca,
@@ -237,6 +245,11 @@ async fn only_200_counts_and_redirects_are_not_followed() {
                 .into_bytes(),
             ),
             "/.well-known/risala/error" => status(500, ""),
+            "/.well-known/risala/unavailable" => status(503, ""),
+            "/.well-known/risala/denied" => status(403, ""),
+            "/.well-known/risala/login" => status(401, ""),
+            "/.well-known/risala/slow-down" => status(429, ""),
+            "/.well-known/risala/deleted" => status(410, ""),
             "/.well-known/risala/empty" => ok("# nothing here\n"),
             _ => status(404, ""),
         }),
@@ -249,7 +262,10 @@ async fn only_200_counts_and_redirects_are_not_followed() {
         ("temp", 307),
         ("created", 201),
         ("error", 500),
-        ("nobody", 404),
+        ("unavailable", 503),
+        ("denied", 403),
+        ("login", 401),
+        ("slow-down", 429),
     ] {
         let result = fetcher
             .fetch(&id(&format!("{name}@example.test")), false)
@@ -264,10 +280,18 @@ async fn only_200_counts_and_redirects_are_not_followed() {
             .unwrap()
             .contains(&"/.well-known/risala/target".to_owned())
     );
-    assert_eq!(
-        fetcher.fetch(&id("empty@example.test"), false).await,
-        Ok(vec![])
-    );
+    for name in ["nobody", "deleted"] {
+        let found = fetcher
+            .lookup(&id(&format!("{name}@example.test")), false)
+            .await
+            .unwrap();
+        assert!(found.gone && found.entries.is_empty(), "{name}");
+    }
+    let found = fetcher
+        .lookup(&id("empty@example.test"), false)
+        .await
+        .unwrap();
+    assert!(!found.gone && found.entries.is_empty() && !found.cached);
 }
 
 #[tokio::test]
@@ -308,14 +332,14 @@ async fn size_limit() {
         fetcher.fetch(&id("full-close@example.test"), false).await,
         Ok(vec![key(1)])
     );
-    assert_eq!(
-        fetcher.fetch(&id("over@example.test"), false).await,
-        Err(FetchError::TooLarge)
-    );
-    assert_eq!(
-        fetcher.fetch(&id("over-close@example.test"), false).await,
-        Err(FetchError::TooLarge)
-    );
+    // A file over 256 KiB counts as a file with no keys (4.4).
+    for name in ["over", "over-close"] {
+        let found = fetcher
+            .lookup(&id(&format!("{name}@example.test")), false)
+            .await
+            .unwrap();
+        assert!(!found.gone && found.entries.is_empty(), "{name}");
+    }
 }
 
 #[tokio::test]
@@ -459,6 +483,7 @@ async fn changing_file() -> (
             let current = current.lock().unwrap();
             match (path, current.as_str()) {
                 ("/.well-known/risala/gone", _) | (_, "404") => status(404, ""),
+                ("/.well-known/risala/broken", _) | (_, "500") => status(500, ""),
                 (_, "hang") => Reply::Hang,
                 (_, file) => ok(file),
             }
@@ -494,17 +519,23 @@ async fn cache_expires_after_an_hour() {
 async fn refetch_once_on_failure_is_rate_limited() {
     let (server, file, clock, fetcher, _ca) = changing_file().await;
     let alice = id("alice@example.test");
-    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
+    let found = fetcher.lookup(&alice, false).await.unwrap();
+    assert!(!found.cached);
     // A new device is added to the file.
     file.lock().unwrap().push_str(&line(2));
 
-    // A refetch right after a fetch is held back by the rate limit.
-    assert_eq!(fetcher.fetch(&alice, true).await, Ok(vec![key(1)]));
+    // A refetch right after a fetch is held back by the rate limit, and
+    // the answer is as fresh as a refetch could get.
+    let found = fetcher.lookup(&alice, true).await.unwrap();
+    assert_eq!(found.entries.len(), 1);
+    assert!(!found.cached);
     assert_eq!(server.hits(), 1);
 
-    // Later, a refetch gets the new key at once, cache or not.
+    // Later, the cached file is marked so, and a refetch gets the new key.
     clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
-    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
+    let found = fetcher.lookup(&alice, false).await.unwrap();
+    assert_eq!(found.entries.len(), 1);
+    assert!(found.cached);
     assert_eq!(fetcher.fetch(&alice, true).await, Ok(vec![key(1), key(2)]));
     assert_eq!(server.hits(), 2);
     // The refetched file is cached in turn.
@@ -518,58 +549,75 @@ async fn refetch_once_on_failure_is_rate_limited() {
     assert_eq!(server.hits(), 3);
 }
 
+/// A failed fetch is an outage: it does not replace the cached file,
+/// which stays valid for its hour, but a refetch that fails says so
+/// (4.4). Only a key file or a gone answer replaces it.
 #[tokio::test]
 async fn a_cached_file_outlives_an_unreachable_host() {
     let (server, file, clock, fetcher, _ca) = changing_file().await;
     let alice = id("alice@example.test");
     assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
 
-    // The host stops answering. A refetch keeps the cached file.
+    // The host stops answering. A refetch fails, but the file stays.
     *file.lock().unwrap() = "hang".into();
     clock.advance(Duration::from_secs(30 * 60));
-    assert_eq!(fetcher.fetch(&alice, true).await, Ok(vec![key(1)]));
+    assert_eq!(fetcher.fetch(&alice, true).await, Err(FetchError::Timeout));
     assert_eq!(server.hits(), 2);
-    // The failed attempt counts for the rate limit.
-    assert_eq!(fetcher.fetch(&alice, true).await, Ok(vec![key(1)]));
+    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
+    // The failed attempt counts for the rate limit, and stands.
+    assert_eq!(fetcher.fetch(&alice, true).await, Err(FetchError::Timeout));
     assert_eq!(server.hits(), 2);
+    // A 5xx is no different.
+    *file.lock().unwrap() = "500".into();
+    clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
+    assert_eq!(
+        fetcher.fetch(&alice, true).await,
+        Err(FetchError::Status(500))
+    );
+    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
+    assert_eq!(server.hits(), 3);
     // But the file keeps its age, and expires an hour after it was fetched.
     clock.advance(Duration::from_secs(30 * 60));
-    assert_eq!(fetcher.fetch(&alice, false).await, Err(FetchError::Timeout));
-    assert_eq!(server.hits(), 3);
+    assert_eq!(
+        fetcher.fetch(&alice, false).await,
+        Err(FetchError::Status(500))
+    );
+    assert_eq!(server.hits(), 4);
 
-    // An answer from the host replaces a cached file: here, it is gone.
+    // An answer from the host replaces the cached file: here, it is gone.
     *file.lock().unwrap() = line(1);
     clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
     assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1)]));
     *file.lock().unwrap() = "404".into();
     clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
-    assert_eq!(
-        fetcher.fetch(&alice, true).await,
-        Err(FetchError::Status(404))
-    );
-    assert_eq!(
-        fetcher.fetch(&alice, false).await,
-        Err(FetchError::Status(404))
-    );
+    let found = fetcher.lookup(&alice, true).await.unwrap();
+    assert!(found.gone && found.entries.is_empty());
+    assert!(fetcher.lookup(&alice, false).await.unwrap().gone);
 }
 
 #[tokio::test]
 async fn failures_are_remembered_for_the_rate_limit() {
     let (server, _file, clock, fetcher, _ca) = changing_file().await;
-    let gone = id("gone@example.test");
+    let broken = id("broken@example.test");
     for refresh in [false, true, false] {
         assert_eq!(
-            fetcher.fetch(&gone, refresh).await,
-            Err(FetchError::Status(404))
+            fetcher.fetch(&broken, refresh).await,
+            Err(FetchError::Status(500))
         );
     }
     assert_eq!(server.hits(), 1);
     clock.advance(risala_keyfetch::DEFAULT_MIN_REFETCH);
     assert_eq!(
-        fetcher.fetch(&gone, false).await,
-        Err(FetchError::Status(404))
+        fetcher.fetch(&broken, false).await,
+        Err(FetchError::Status(500))
     );
     assert_eq!(server.hits(), 2);
+    // So are gone answers.
+    let gone = id("gone@example.test");
+    for refresh in [false, true] {
+        assert!(fetcher.lookup(&gone, refresh).await.unwrap().gone);
+    }
+    assert_eq!(server.hits(), 3);
 }
 
 #[tokio::test]

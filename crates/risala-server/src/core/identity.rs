@@ -18,9 +18,9 @@ use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
 use risala_proto::text::unescape;
 
 use super::commands::{Fail, Outcome, Reply, fail, respond};
-use super::keys::KeyFilePublisher;
+use super::keys::{FetchError, KeyFilePublisher};
 use super::state::UserEntry;
-use super::{Inner, KEY_FETCH_TIMEOUT};
+use super::{Inner, KEY_FETCH_TIMEOUT, UNAVAILABLE_RETRY};
 use crate::handler::ConnId;
 use crate::store::{HostedKey, KeyChange, Registered};
 
@@ -43,6 +43,18 @@ pub(super) const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 fn auth_failed(message: &str) -> Fail {
     fail(ErrorCode::AuthFailed, message)
+}
+
+/// `ERR unavailable` (4.5): the key file could not be had, so the
+/// signature could not be checked. Try again later, unless the server
+/// fetches no key files at all.
+fn unavailable(e: &FetchError) -> Fail {
+    let err = ErrResponse::new(ErrorCode::Unavailable)
+        .with_message("could not get the identity's key file; try again later");
+    Fail::Err(match e {
+        FetchError::Failed(_) => err.with_retry(UNAVAILABLE_RETRY.as_secs()),
+        FetchError::Unavailable => err,
+    })
 }
 
 /// What AUTH and REGISTER need from the connection, taken as they start.
@@ -209,7 +221,8 @@ impl Inner {
                     .collect();
                 verify(host, nonce, uid.clone(), signature, keys).await
             } else {
-                self.verify_fetched(&identity, host, nonce, signature).await
+                self.verify_fetched(&identity, host, nonce, signature)
+                    .await?
             };
             let Some(key) = key else {
                 tracing::debug!(conn = id.0, "AUTH failed");
@@ -236,42 +249,50 @@ impl Inner {
 
     /// Checks an AUTH signature against `identity`'s key file (4.4): first
     /// as the fetcher has it, which may be cached, then once more freshly
-    /// fetched if that fails.
+    /// fetched if that fails. Returns the key that verified, `None` if
+    /// none of the keys the server got did (`auth-failed`), or `ERR
+    /// unavailable` if a fetch failed before the server got any keys to
+    /// go by (4.5).
+    ///
+    /// Only an answer fetched just now closes the identity's connections
+    /// whose key it does not list (4.4). A failed fetch closes nothing.
     async fn verify_fetched(
         &self,
         identity: &Identity,
         host: String,
         nonce: Nonce,
         signature: Signature,
-    ) -> Option<PublicKey> {
+    ) -> Result<Option<PublicKey>, Fail> {
         let uid = identity.to_uid();
         for refresh in [false, true] {
             let fetch = self.keys.fetcher.fetch_boxed(identity, refresh);
-            let keys = match tokio::time::timeout(KEY_FETCH_TIMEOUT, fetch).await {
-                Ok(Ok(keys)) => keys,
+            let fetched = match tokio::time::timeout(KEY_FETCH_TIMEOUT, fetch).await {
+                Ok(Ok(fetched)) => fetched,
                 Ok(Err(e)) => {
                     tracing::debug!(%uid, refresh, "no key file: {e}");
-                    return None;
+                    return Err(unavailable(&e));
                 }
                 Err(_) => {
                     tracing::debug!(%uid, refresh, "fetching the key file timed out");
-                    return None;
+                    return Err(unavailable(&FetchError::Failed("timed out".into())));
                 }
             };
-            self.close_removed_keys(&uid, &keys);
+            if !fetched.cached {
+                self.close_removed_keys(&uid, &fetched.keys);
+            }
             let found = verify(
                 host.clone(),
                 nonce.clone(),
                 uid.clone(),
                 signature.clone(),
-                keys,
+                fetched.keys,
             )
             .await;
             if found.is_some() {
-                return found;
+                return Ok(found);
             }
         }
-        None
+        Ok(None)
     }
 
     /// Signs connection `id` in as the identity of `user`, with `key` as
@@ -325,7 +346,8 @@ impl Inner {
     }
 
     /// Closes the connections of `uid` whose device key is not in `keys`
-    /// (4.4): a key file fetched for AUTH no longer lists them.
+    /// (4.4): a key file fetched for AUTH no longer lists them, or the
+    /// file is gone.
     fn close_removed_keys(&self, uid: &Uid, keys: &[PublicKey]) {
         self.close_keys(uid, |key| !keys.contains(key));
     }

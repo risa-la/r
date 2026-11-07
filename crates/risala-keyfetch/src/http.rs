@@ -1,10 +1,15 @@
 //! A small HTTP/1.1 client: one GET per connection, nothing else (4.4).
 //!
-//! It sends `Connection: close` and reads one response. Only a 200 counts:
-//! any other status, redirects included, is returned as
-//! [`FetchError::Status`] without reading the body or following anything.
+//! It sends `Connection: close` and reads one response (4.4):
+//!
+//! - a 200 is a key file, whose body is read up to a size limit; one over
+//!   it is [`Got::TooLarge`];
+//! - a 404 or 410 is [`Got::Gone`];
+//! - any other status, redirects included, is [`FetchError::Status`],
+//!   returned without reading the body or following anything.
+//!
 //! Bodies may be framed by `Content-Length`, by chunked transfer coding or
-//! by the end of the connection, and are cut off at a size limit.
+//! by the end of the connection.
 //!
 //! It works over any stream, so the tests drive it through an in-memory
 //! pipe.
@@ -23,14 +28,27 @@ const MAX_CHUNK_LINE: usize = 1024;
 /// The most interim (1xx) responses skipped before the real one.
 const MAX_INTERIM: usize = 8;
 
-/// Sends `GET <path>` for `host` over `stream`, and returns the body of a
-/// 200 response, at most `max_body` bytes.
+/// What a response said, when it was an answer about the file (4.4).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Got {
+    /// A 200, with its body.
+    Body(Vec<u8>),
+    /// A 200 whose body is larger than the limit. It was not read to the
+    /// end.
+    TooLarge,
+    /// A 404 or 410: there is no key file.
+    Gone,
+}
+
+/// Sends `GET <path>` for `host` over `stream`, and returns what the
+/// response said: the body of a 200 response of at most `max_body` bytes,
+/// a 200 that is larger, or a 404 or 410.
 pub(crate) async fn get<S>(
     stream: &mut S,
     host: &str,
     path: &str,
     max_body: usize,
-) -> Result<Vec<u8>, FetchError>
+) -> Result<Got, FetchError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -58,13 +76,35 @@ where
             // real one.
             100 | 102..=199 if interim < MAX_INTERIM => interim += 1,
             200 => break head,
+            404 | 410 => return Ok(Got::Gone),
             status => return Err(FetchError::Status(status)),
         }
     };
-    match head.framing {
+    let body = match head.framing {
         Framing::Chunked => reader.chunked(max_body).await,
         Framing::Length(len) => reader.exact(len, max_body).await,
         Framing::Close => reader.until_close(max_body).await,
+    };
+    match body {
+        Ok(body) => Ok(Got::Body(body)),
+        Err(TooLarge) => Ok(Got::TooLarge),
+        Err(Failed(e)) => Err(e),
+    }
+}
+
+/// Why a body was not read.
+enum BodyError {
+    /// It is larger than the limit.
+    TooLarge,
+    /// The response or the connection failed.
+    Failed(FetchError),
+}
+
+use BodyError::{Failed, TooLarge};
+
+impl From<FetchError> for BodyError {
+    fn from(e: FetchError) -> BodyError {
+        Failed(e)
     }
 }
 
@@ -222,19 +262,19 @@ impl<S: AsyncRead + Unpin> Reader<'_, S> {
     }
 
     /// A body of `len` bytes (`Content-Length`).
-    async fn exact(&mut self, len: u64, max: usize) -> Result<Vec<u8>, FetchError> {
-        let len = usize::try_from(len).map_err(|_| FetchError::TooLarge)?;
+    async fn exact(&mut self, len: u64, max: usize) -> Result<Vec<u8>, BodyError> {
+        let len = usize::try_from(len).map_err(|_| TooLarge)?;
         if len > max {
-            return Err(FetchError::TooLarge);
+            return Err(TooLarge);
         }
-        self.take(len).await
+        Ok(self.take(len).await?)
     }
 
     /// A body that ends with the connection.
-    async fn until_close(&mut self, max: usize) -> Result<Vec<u8>, FetchError> {
+    async fn until_close(&mut self, max: usize) -> Result<Vec<u8>, BodyError> {
         loop {
             if self.buf.len() > max {
-                return Err(FetchError::TooLarge);
+                return Err(TooLarge);
             }
             if !self.fill().await? {
                 return Ok(std::mem::take(&mut self.buf));
@@ -244,7 +284,7 @@ impl<S: AsyncRead + Unpin> Reader<'_, S> {
 
     /// A chunked body (RFC 9112 7.1). Chunk extensions and trailers are
     /// read and ignored.
-    async fn chunked(&mut self, max: usize) -> Result<Vec<u8>, FetchError> {
+    async fn chunked(&mut self, max: usize) -> Result<Vec<u8>, BodyError> {
         let mut body = Vec::new();
         loop {
             let line = self.line(MAX_CHUNK_LINE).await?;
@@ -253,7 +293,7 @@ impl<S: AsyncRead + Unpin> Reader<'_, S> {
                 .ok()
                 .map(|s| s.trim_matches([' ', '\t']))
                 .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
-                .ok_or(FetchError::BadResponse("bad chunk size"))?;
+                .ok_or(Failed(FetchError::BadResponse("bad chunk size")))?;
             // More than 16 hex digits does not fit, and is too large anyway.
             let size = u64::from_str_radix(size, 16).unwrap_or(u64::MAX);
             if size == 0 {
@@ -262,18 +302,20 @@ impl<S: AsyncRead + Unpin> Reader<'_, S> {
                 while !self.line(MAX_CHUNK_LINE).await?.is_empty() {
                     trailers += 1;
                     if trailers > 64 {
-                        return Err(FetchError::BadResponse("too many trailers"));
+                        return Err(Failed(FetchError::BadResponse("too many trailers")));
                     }
                 }
                 return Ok(body);
             }
-            let size = usize::try_from(size).map_err(|_| FetchError::TooLarge)?;
+            let size = usize::try_from(size).map_err(|_| TooLarge)?;
             if size > max.saturating_sub(body.len()) {
-                return Err(FetchError::TooLarge);
+                return Err(TooLarge);
             }
             body.extend(self.take(size).await?);
             if !self.line(0).await?.is_empty() {
-                return Err(FetchError::BadResponse("chunk not followed by CRLF"));
+                return Err(Failed(FetchError::BadResponse(
+                    "chunk not followed by CRLF",
+                )));
             }
         }
     }
@@ -299,7 +341,7 @@ mod tests {
 
     /// Runs `get` against a server that replies `response` and then
     /// closes. Returns the result and the request the server saw.
-    async fn exchange(response: &[u8], max: usize) -> (Result<Vec<u8>, FetchError>, String) {
+    async fn exchange(response: &[u8], max: usize) -> (Result<Got, FetchError>, String) {
         let (mut client, mut server) = tokio::io::duplex(1 << 20);
         let response = response.to_vec();
         let server = tokio::spawn(async move {
@@ -322,7 +364,7 @@ mod tests {
     async fn request_is_a_plain_get() {
         let (result, request) =
             exchange(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi", 100).await;
-        assert_eq!(result.unwrap(), b"hi");
+        assert_eq!(result.unwrap(), Got::Body(b"hi".to_vec()));
         assert!(
             request.starts_with("GET /.well-known/risala/alice HTTP/1.1\r\nHost: example.org\r\n")
         );
@@ -331,7 +373,10 @@ mod tests {
 
     #[tokio::test]
     async fn framings() {
-        let ok = |r: Result<Vec<u8>, FetchError>| String::from_utf8(r.unwrap()).unwrap();
+        let ok = |r: Result<Got, FetchError>| match r.unwrap() {
+            Got::Body(body) => String::from_utf8(body).unwrap(),
+            other => panic!("{other:?}"),
+        };
         // Content-Length, with more bytes after it that are not read.
         let (r, _) = exchange(
             b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello world",
@@ -359,18 +404,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_200_counts() {
-        for status in [201u16, 204, 301, 302, 304, 307, 308, 404, 500] {
+    async fn only_200_404_and_410_are_answers() {
+        for status in [
+            201u16, 204, 301, 302, 304, 307, 308, 401, 403, 429, 500, 503,
+        ] {
             let response = format!(
                 "HTTP/1.1 {status} X\r\nLocation: https://example.org/elsewhere\r\nContent-Length: 0\r\n\r\n"
             );
             let (r, _) = exchange(response.as_bytes(), 100).await;
             assert_eq!(r, Err(FetchError::Status(status)));
         }
+        for status in [404u16, 410] {
+            let response = format!("HTTP/1.1 {status} X\r\nContent-Length: 3\r\n\r\nno\n");
+            let (r, _) = exchange(response.as_bytes(), 100).await;
+            assert_eq!(r, Ok(Got::Gone));
+        }
     }
 
     #[tokio::test]
     async fn size_limit() {
+        let len = |r: Result<Got, FetchError>| match r.unwrap() {
+            Got::Body(body) => body.len(),
+            other => panic!("{other:?}"),
+        };
         let body = "x".repeat(100);
         let at = |n: usize| {
             format!(
@@ -378,23 +434,17 @@ mod tests {
                 &body[..n]
             )
         };
-        assert_eq!(exchange(at(10).as_bytes(), 10).await.0.unwrap().len(), 10);
-        assert_eq!(
-            exchange(at(11).as_bytes(), 10).await.0,
-            Err(FetchError::TooLarge)
-        );
+        assert_eq!(len(exchange(at(10).as_bytes(), 10).await.0), 10);
+        assert_eq!(exchange(at(11).as_bytes(), 10).await.0, Ok(Got::TooLarge));
         // A huge Content-Length is refused before any body is read.
         let huge = b"HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n";
-        assert_eq!(exchange(huge, 10).await.0, Err(FetchError::TooLarge));
+        assert_eq!(exchange(huge, 10).await.0, Ok(Got::TooLarge));
 
         let close = |n: usize| format!("HTTP/1.1 200 OK\r\n\r\n{}", &body[..n]);
-        assert_eq!(
-            exchange(close(10).as_bytes(), 10).await.0.unwrap().len(),
-            10
-        );
+        assert_eq!(len(exchange(close(10).as_bytes(), 10).await.0), 10);
         assert_eq!(
             exchange(close(11).as_bytes(), 10).await.0,
-            Err(FetchError::TooLarge)
+            Ok(Got::TooLarge)
         );
 
         let chunked = |n: usize| {
@@ -403,17 +453,14 @@ mod tests {
                 &body[..n]
             )
         };
-        assert_eq!(
-            exchange(chunked(5).as_bytes(), 10).await.0.unwrap().len(),
-            10
-        );
+        assert_eq!(len(exchange(chunked(5).as_bytes(), 10).await.0), 10);
         assert_eq!(
             exchange(chunked(6).as_bytes(), 10).await.0,
-            Err(FetchError::TooLarge)
+            Ok(Got::TooLarge)
         );
         let huge =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffffffffff\r\n";
-        assert_eq!(exchange(huge, 10).await.0, Err(FetchError::TooLarge));
+        assert_eq!(exchange(huge, 10).await.0, Ok(Got::TooLarge));
     }
 
     #[tokio::test]
