@@ -418,6 +418,16 @@ Open:
   joiner's own earlier leaf (12.6), and can take the ratchet tree out of
   band for Welcome and external joins.
 
+20. **Found by the librisala review** (2.1, 3.2, 6.4, 7.1, 10.4).
+    - The 7.1 head check compares with the sync point, not the newest
+      seq stored, so a cache shared by two processes is not wiped.
+    - Clients lower-case server hostnames and drop a trailing dot
+      before SNI, trust records and signing.
+    - DROP carries the dropped room's id in an `id` tag, and clients
+      ignore a DROP for another id.
+    - INVITE for someone already a member records nothing and gets a
+      plain `OK`.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

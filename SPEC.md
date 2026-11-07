@@ -191,7 +191,10 @@ upgrade step.
   other client sent to the wrong port fails clearly.
 
 A server address is a hostname with an optional port, for example
-`chat.example.org` or `chat.example.org:7000`.
+`chat.example.org` or `chat.example.org:7000`. Clients lower-case the
+hostname and drop one trailing `.` before using it anywhere: in SNI, as
+the key of the trust record (2.2) and in the signed bytes (4.5). So
+`Chat.Example.org.` and `chat.example.org` are the same server.
 
 ### 2.2. Verifying the Server
 
@@ -330,7 +333,7 @@ its command.
 | `deleted` | server | none | The event's content was removed (5.4) |
 | `retry` | server | seconds | With `ERR rate-limited`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
-| `id` | server | id | On a JOIN event: the room's id (6.1) |
+| `id` | server | id | On a JOIN event or a DROP line: the room's id (6.1, 10.4) |
 | `frank` | client | base64 | On ENC: the franking commitment (12.8) |
 | `frank-key` | client | base64 | On REPORT of an ENC event: the franking key (5.8) |
 | `content` | client | base64 | On REPORT of an ENC event: the reported content (5.8) |
@@ -1414,7 +1417,8 @@ BANS <room>
 - `INVITE` records an INVITE event, which lets an identity join a private
   room. The event also goes to the invitee's connections, so their
   client can offer to join. The invitation lasts until it is used or the
-  invitee is banned. Guests cannot be invited.
+  invitee is banned. Guests cannot be invited. Inviting someone who is
+  already a member records nothing, and gets a plain `OK`.
 - `KICK` removes a member. They may join again.
 - `BAN` removes a member, if they are one, and stops them from joining.
   Banning a guest uid has little effect, because guest names get reused.
@@ -1507,8 +1511,11 @@ The new room has a new id, and its sequence numbers start again at 1. A
 client that missed the DROP notices the new id and starts the room
 afresh, instead of mixing the two rooms' histories. The client also
 discards what it has stored when the head a server reports is lower than
-the newest seq it has stored for that id. This cannot happen with a
-correct server, but it keeps the client consistent.
+its sync point for that id. This cannot happen with a correct server,
+but it keeps the client consistent. Events stored past the sync point
+do not count, because another process sharing the client's cache, such
+as a notification extension, may have stored them after the server
+computed the head.
 
 ### 7.2. HISTORY
 
@@ -2016,8 +2023,11 @@ ADMIN REPORTS
   - Every member is removed from the room, as if kicked. The room's
     roles, invitations and bans are deleted too, and so are its group,
     GroupInfo and pending Welcomes if it is encrypted (Section 12).
-  - The server sends `DROP <room> [<reason...>]` to every connection in
-    the room. No event is recorded, since the room's events are gone.
+  - The server sends `@id=<id> DROP <room> [<reason...>]` to every
+    connection in the room, where `<id>` is the dropped room's id (5.1).
+    No event is recorded, since the room's events are gone. A client
+    ignores a DROP whose id is not the one it has stored for the room,
+    since it may be about an older room of the same name.
   - The room stops appearing in SYNC.
   - Clients SHOULD remove the room and the history they have stored for
     it.
