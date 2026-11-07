@@ -794,7 +794,7 @@ impl SyncEngine {
         } else if let Outcome::Ok(ok) = &reply.outcome
             && let Ok(Some(id)) = ok.id()
         {
-            let head = ok.head().ok().flatten().map(Seq::get);
+            let head = ok.head().ok().flatten();
             let fresh = self.head_is_fresh(&conv, sent);
             let account = self.account;
             self.write(|tx| {
@@ -834,7 +834,7 @@ impl SyncEngine {
             && let Ok(Some(id)) = ok.id()
         {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
-            let head = ok.head().ok().flatten().map(Seq::get);
+            let head = ok.head().ok().flatten();
             let fresh = self.head_is_fresh(&conv, sent);
             let account = self.account;
             self.write(|tx| {
