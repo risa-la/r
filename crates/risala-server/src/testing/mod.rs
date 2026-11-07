@@ -21,6 +21,59 @@
 //! ```
 //!
 //! Every method panics when something fails, since it runs in a test.
+//!
+//! # Identities
+//!
+//! A test server can have identities of two kinds (4.3):
+//!
+//! - **Hosted ones**, under its own identity domain, made with REGISTER
+//!   (4.6). Set the domain with
+//!   [`identity_domain`](TestServerBuilder::identity_domain), which also
+//!   opens registration, then call [`TestServer::register`].
+//! - **Others**, whose key files a [`TestKeyServer`] serves over HTTPS
+//!   (4.4). Name their domains with
+//!   [`key_domains`](TestServerBuilder::key_domains), then make them with
+//!   [`TestServer::identity`]. The server fetches their key files for real:
+//!   it trusts the key server's test CA through `[keys] extra_roots`, may
+//!   fetch from `127.0.0.1` through `[keys] allow_private`, and sends each
+//!   domain to its listener with a test resolver. It fetches a file again
+//!   whenever a signature fails against the cached copy, without the usual
+//!   rate limit, so a key added during a test works at once.
+//!
+//! The key server also serves the hosted identities' key files, from the
+//! server's `key_dir`, so devices can fetch every key file (12.12) with
+//! [`TestKeyServer::fetch_options`].
+//!
+//! Each identity is handled through a [`TestIdentity`]: one device, with
+//! its own key. [`TestServer::sign_in`] connects and signs in with AUTH
+//! (4.5); [`TestServer::new_device`] adds another key to the identity
+//! (with KEY ADD for a hosted one) and returns the new device.
+//!
+//! ```no_run
+//! # async fn f() {
+//! use risala_server::testing::TestServer;
+//!
+//! let server = TestServer::builder()
+//!     .identity_domain("example.org")
+//!     .key_domains(&["example.net"])
+//!     .start()
+//!     .await;
+//! // Hosted: registered, and signed in on that connection.
+//! let (alice, mut laptop) = server.register("alice").await;
+//! // A second device of alice, signed in with its own key.
+//! let phone = server.new_device(&alice).await;
+//! let mut phone_conn = server.sign_in(&phone).await;
+//! // Someone from elsewhere, whose key file the server fetches.
+//! let bob = server.identity("bob@example.net");
+//! let mut bob_conn = server.sign_in(&bob).await;
+//! laptop.send("join #general").await.unwrap();
+//! # }
+//! ```
+//!
+//! Presence (8.3) is on, with the spec's timings unless
+//! [`presence`](TestServerBuilder::presence) changes them: a client signed
+//! in as an identity gets `PRESENCE` lines a second after people who share
+//! a room with it come online, and 30 seconds after they go.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -34,11 +87,15 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, Limits};
-use crate::core::Timers;
+use crate::core::{KeyServices, Timers};
 use crate::daemon::{Daemon, RunError};
+use crate::http::{HttpsKeyFetcher, KeyDir};
 use crate::store::{SqliteStore, Store as _};
 
+mod identities;
+
 pub use crate::net::testing::{ClientOptions, RECV_TIMEOUT, TestClient};
+pub use identities::{TestIdentity, TestKeyServer};
 
 /// How long [`TestServer::stop`] waits for the server to finish.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,11 +112,14 @@ type Prepare = Box<dyn FnOnce(&SqliteStore) + Send>;
 ///   [`room`](Self::room))
 /// - allows guests, has no welcome text, and uses the default
 ///   [`Limits`]
+/// - hosts no identities, and fetches no key files
 #[must_use]
 pub struct TestServerBuilder {
     config: Config,
     prepare: Vec<Prepare>,
     guest_resume: Option<Duration>,
+    presence: Option<(Duration, Duration)>,
+    key_domains: Vec<String>,
 }
 
 impl fmt::Debug for TestServerBuilder {
@@ -122,6 +182,36 @@ impl TestServerBuilder {
         self
     }
 
+    /// Hosts identities under `domain` (`identity_domain`, 4.6), with
+    /// registration open (`server.registration`). Register them with
+    /// [`TestServer::register`]. Their key files are written to the
+    /// server's `key_dir`, and the [`TestKeyServer`] serves them.
+    pub fn identity_domain(mut self, domain: &str) -> Self {
+        self.config.identity_domain = Some(domain.to_owned());
+        self.config.server.registration = true;
+        self
+    }
+
+    /// Identities at `domains` may sign in: a [`TestKeyServer`] serves
+    /// their key files, and the server fetches them from it (4.4). Make
+    /// them with [`TestServer::identity`].
+    pub fn key_domains(mut self, domains: &[&str]) -> Self {
+        self.key_domains
+            .extend(domains.iter().map(|d| (*d).to_owned()));
+        self
+    }
+
+    /// How long after an identity's last connection closes it is reported
+    /// offline, and how long presence changes are collected before they
+    /// are sent (8.3). Unlike `limits.presence_offline_secs` and
+    /// `limits.presence_batch_ms`, these may be any length, so that tests
+    /// can watch presence change. Without it, the configuration's values
+    /// are used: 30 seconds and 1 second.
+    pub fn presence(mut self, offline: Duration, batch: Duration) -> Self {
+        self.presence = Some((offline, batch));
+        self
+    }
+
     /// Changes anything else in the configuration. `listen` and
     /// `state_dir` are replaced when the server starts.
     pub fn configure(mut self, f: impl FnOnce(&mut Config)) -> Self {
@@ -156,17 +246,56 @@ impl TestServerBuilder {
         if let Some(wait) = self.guest_resume {
             timers.guest_resume = wait;
         }
+        if let Some((offline, batch)) = self.presence {
+            timers.presence_offline = offline;
+            timers.presence_batch = batch;
+        }
+        let hosted = config.identity_domain.clone();
+        let keys = if self.key_domains.is_empty() && hosted.is_none() {
+            None
+        } else {
+            let domains: Vec<&str> = self.key_domains.iter().map(String::as_str).collect();
+            let keys = TestKeyServer::start_with(
+                &domains,
+                hosted.as_deref().map(|d| (d, config.key_dir())),
+            )
+            .await;
+            config.keys.extra_roots.push(keys.ca_path().to_owned());
+            config.keys.allow_private = true;
+            Some(keys)
+        };
         let mut server = TestServer {
             config,
             timers,
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             fingerprint: None,
             running: None,
+            keys,
             dir: Some(dir),
         };
         server.launch().await;
         server
     }
+}
+
+/// Key file fetching from `keys` for a server with `config`, and
+/// publishing into its `key_dir`: `[keys]` as configured, with the key
+/// server's resolver, and no limit on refetching (see the [module
+/// documentation](self)).
+async fn key_services(config: &Config, keys: &TestKeyServer) -> KeyServices {
+    let keys_config = config.keys.clone();
+    let mut options =
+        tokio::task::spawn_blocking(move || crate::http::fetch::fetch_options(&keys_config))
+            .await
+            .expect("reading [keys]")
+            .expect("reading the test CA");
+    options.resolver = std::sync::Arc::new(keys.resolver());
+    options.min_refetch = Duration::ZERO;
+    let fetcher = HttpsKeyFetcher(risala_keyfetch::KeyFetcher::new(options));
+    KeyServices::shared(
+        std::sync::Arc::new(fetcher),
+        std::sync::Arc::new(KeyDir::new(config.key_dir())),
+    )
 }
 
 fn prepare_store(config: &Config, prepare: Vec<Prepare>) {
@@ -195,6 +324,7 @@ pub struct TestServer {
     addr: SocketAddr,
     fingerprint: Option<Fingerprint>,
     running: Option<Running>,
+    keys: Option<TestKeyServer>,
     dir: Option<TempDir>,
 }
 
@@ -219,6 +349,8 @@ impl TestServer {
             },
             prepare: Vec::new(),
             guest_resume: None,
+            presence: None,
+            key_domains: Vec::new(),
         }
     }
 
@@ -295,6 +427,119 @@ impl TestServer {
         (client, new_token.to_owned())
     }
 
+    /// The key server, which serves the key files of identities that are
+    /// not hosted here, and of hosted ones. Panics if the server has
+    /// neither [`identity_domain`](TestServerBuilder::identity_domain) nor
+    /// [`key_domains`](TestServerBuilder::key_domains).
+    pub fn key_server(&self) -> &TestKeyServer {
+        self.keys
+            .as_ref()
+            .expect("the test server has no identities: use identity_domain or key_domains")
+    }
+
+    /// A new identity at one of the [`key_domains`](TestServerBuilder::key_domains),
+    /// with one device, whose key file the key server now serves (4.4).
+    /// Sign in with [`sign_in`](Self::sign_in).
+    pub fn identity(&self, identity: &str) -> TestIdentity {
+        self.key_server().new_identity(identity)
+    }
+
+    /// A new device of `of`'s identity, with its own key: added to its key
+    /// file on the key server, or for a hosted identity with `KEY ADD`
+    /// (4.7) from a connection signed in as `of`, which then quits.
+    pub async fn new_device(&self, of: &TestIdentity) -> TestIdentity {
+        if !self.hosts(of) {
+            return self.key_server().new_device(of);
+        }
+        let device = of.new_key();
+        let mut conn = self.sign_in(of).await;
+        let command = format!("@ref=testkey KEY ADD {} device", device.public_key());
+        conn.send(&command).await.expect("sending");
+        loop {
+            let line = conn.expect_line().await.expect("an answer to KEY ADD");
+            if line.starts_with("@ref=testkey ") {
+                assert_eq!(line, "@ref=testkey OK", "answer to KEY ADD");
+                break;
+            }
+        }
+        conn.send("QUIT").await.expect("sending");
+        device
+    }
+
+    /// Whether `who` is hosted here (4.6).
+    fn hosts(&self, who: &TestIdentity) -> bool {
+        self.config
+            .identity_domain()
+            .is_some_and(|d| d.as_str() == who.identity().domain())
+    }
+
+    /// Connects, reads the greeting and sends `AUTH` for `who` (4.5),
+    /// signing for the server's hostname, which it sends in SNI. Returns
+    /// the client and the answer: `OK uid=<uid>` (with ` op=yes` for an
+    /// operator) or an `ERR`.
+    pub async fn auth(&self, who: &TestIdentity) -> (TestClient, String) {
+        let (mut client, nonce) = self.connect_for_sign_in().await;
+        client
+            .send(&who.auth_line(&self.config.hostname, &nonce))
+            .await
+            .expect("sending");
+        let answer = client.expect_line().await.expect("an answer to AUTH");
+        (client, answer)
+    }
+
+    /// Connects and signs in as `who` (4.5). Panics unless AUTH succeeds.
+    /// The next line to read is whatever comes after `OK`: live events of
+    /// the identity's rooms start at once (7.1).
+    pub async fn sign_in(&self, who: &TestIdentity) -> TestClient {
+        let (client, answer) = self.auth(who).await;
+        let ok = format!("OK uid={}", who.identity());
+        assert!(
+            answer == ok || answer == format!("{ok} op=yes"),
+            "answer to AUTH {}: {answer}",
+            who.identity()
+        );
+        client
+    }
+
+    /// Connects and registers `<name>@<identity domain>` (4.6) with a new
+    /// key. Returns the new identity's device and the connection, signed
+    /// in. Panics unless REGISTER succeeds; the server needs an
+    /// [`identity_domain`](TestServerBuilder::identity_domain).
+    pub async fn register(&self, name: &str) -> (TestIdentity, TestClient) {
+        let domain = self
+            .config
+            .identity_domain
+            .clone()
+            .expect("the test server has no identity_domain");
+        let who = TestIdentity::new(&format!("{name}@{domain}"));
+        let (mut client, nonce) = self.connect_for_sign_in().await;
+        client
+            .send(&who.register_line(&self.config.hostname, &nonce))
+            .await
+            .expect("sending");
+        let answer = client.expect_line().await.expect("an answer to REGISTER");
+        assert_eq!(
+            answer,
+            format!("OK uid={}", who.identity()),
+            "answer to REGISTER {name}"
+        );
+        (who, client)
+    }
+
+    /// Connects and reads the greeting. Returns the client and the
+    /// greeting's nonce (4.1).
+    async fn connect_for_sign_in(&self) -> (TestClient, risala_proto::auth::Nonce) {
+        let mut client = self.connect().await;
+        let greeting = client.expect_line().await.expect("a greeting");
+        let nonce = greeting
+            .strip_prefix("RISALA 1 ")
+            .and_then(|rest| rest.split(' ').nth(1))
+            .unwrap_or_else(|| panic!("greeting: {greeting}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("the greeting's nonce: {e}: {greeting}"));
+        (client, nonce)
+    }
+
     /// Stops the server and starts it again on the same directory and
     /// address, as after a restart of `risalad`. Connections are closed
     /// with `BYE server shutting down` (11), and guest sessions end, so
@@ -332,9 +577,14 @@ impl TestServer {
         let mut config = self.config.clone();
         // After a restart, listen on the same port again.
         config.listen = vec![self.addr];
-        let daemon = Daemon::bind_with(config, self.timers)
-            .await
-            .expect("starting the test server");
+        let daemon = match &self.keys {
+            None => Daemon::bind_with(config, self.timers).await,
+            Some(keys) => {
+                let services = key_services(&config, keys).await;
+                Daemon::bind_full(config, self.timers, Some(services)).await
+            }
+        }
+        .expect("starting the test server");
         self.addr = daemon.local_addrs()[0];
         let fingerprint = daemon.fingerprint();
         if let Some(old) = self.fingerprint {

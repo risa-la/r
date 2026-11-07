@@ -1,7 +1,8 @@
-//! The tools in `risala_server::testing` that other crates use to break
-//! things: the cutting proxy and `restart_with`.
+//! The tools in `risala_server::testing` that other crates use: the
+//! cutting proxy, `restart_with`, and the key server for identities.
 
-use risala_server::testing::{ClientOptions, Proxy, TestClient, TestServer};
+use risala_keyfetch::{FetchError, KeyFetcher};
+use risala_server::testing::{ClientOptions, Proxy, TestClient, TestKeyServer, TestServer};
 
 async fn guest_via(proxy: &Proxy, name: &str) -> TestClient {
     let mut client = TestClient::connect_with(proxy.addr(), ClientOptions::sni("localhost"))
@@ -144,4 +145,54 @@ async fn proxy_holds_back_what_the_server_sends() {
     );
     proxy.hold(false);
     server.stop().await;
+}
+
+#[tokio::test]
+async fn key_server_serves_what_it_is_given() {
+    let keys = TestKeyServer::start(&["example.net", "Example.COM"]).await;
+    assert_eq!(keys.domains(), ["example.com", "example.net"]);
+    assert!(keys.serves("EXAMPLE.net"));
+    let fetcher = KeyFetcher::new(keys.fetch_options());
+
+    let bob = keys.new_identity("bob@example.net");
+    assert_eq!(
+        fetcher.fetch(bob.identity(), false).await.unwrap(),
+        [bob.public_key()]
+    );
+    let phone = keys.new_device(&bob);
+    assert_eq!(keys.keys(bob.identity())[1].label(), Some("device2"));
+    assert_eq!(
+        fetcher.fetch(bob.identity(), true).await.unwrap(),
+        [bob.public_key(), phone.public_key()]
+    );
+    keys.remove_key(bob.identity(), &bob.public_key());
+    assert_eq!(
+        fetcher.fetch(bob.identity(), true).await.unwrap(),
+        [phone.public_key()]
+    );
+    keys.remove(bob.identity());
+    assert_eq!(
+        fetcher.fetch(bob.identity(), true).await,
+        Err(FetchError::Status(404))
+    );
+    // The same name at another domain is another file.
+    let other = keys.new_identity("bob@example.com");
+    assert_eq!(
+        fetcher.fetch(other.identity(), false).await.unwrap(),
+        [other.public_key()]
+    );
+}
+
+#[tokio::test]
+async fn identities_survive_a_restart() {
+    let mut server = TestServer::builder()
+        .identity_domain("example.org")
+        .key_domains(&["example.net"])
+        .start()
+        .await;
+    let (alice, _laptop) = server.register("alice").await;
+    let bob = server.identity("bob@example.net");
+    server.restart().await;
+    let _alice = server.sign_in(&alice).await;
+    let _bob = server.sign_in(&bob).await;
 }

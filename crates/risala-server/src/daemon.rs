@@ -92,7 +92,7 @@ impl Daemon {
 
     /// Binds with `keys`, or else with key files fetched over HTTPS as
     /// `[keys]` says (4.4) and hosted ones written to `key_dir` (4.6).
-    async fn bind_full(
+    pub(crate) async fn bind_full(
         config: Config,
         timers: Timers,
         keys: Option<KeyServices>,
