@@ -430,11 +430,10 @@ impl Inner {
         }
         let entry = self.room_entry(&room).ok_or_else(not_found)?;
         let mut st = entry.state.lock().await;
-        let member = self.reg().is_member(&room, uid);
-        check_access(&st, uid, member)?;
 
-        // A message that was already sent gets its seq again (7.6), even if
-        // what would be checked below has changed since.
+        // A message that was already sent gets its seq again (7.6), before
+        // any other check: the sender may have left since, or the room may
+        // have become private or closed to guests (PLAN.md 5, item 14).
         let now = self.now();
         if let Some(cid) = &cid {
             let earlier = if uid.is_guest() {
@@ -451,6 +450,8 @@ impl Inner {
             }
         }
 
+        let member = self.reg().is_member(&room, uid);
+        check_access(&st, uid, member)?;
         if !member {
             return Err(fail(ErrorCode::Forbidden, "join the room first"));
         }

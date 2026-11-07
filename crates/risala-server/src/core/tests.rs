@@ -831,6 +831,37 @@ async fn a_resent_message_gets_its_seq_even_after_leaving() {
     assert_eq!(sam.lines(), ["OK seq=2"]);
 }
 
+#[tokio::test]
+async fn a_resent_message_gets_its_seq_before_any_other_check() {
+    // The cid is checked first (7.6), so a resend gets the original seq
+    // even once the room is closed to guests, or private, and so not
+    // visible to a guest that has left it (PLAN.md 5, item 14).
+    for change in [
+        RoomSetting::Guests(GuestAccess::None),
+        RoomSetting::Guests(GuestAccess::Read),
+        RoomSetting::Public(false),
+    ] {
+        let mut h = Harness::new();
+        let (mut sam, _) = h.joined("sam", "#general").await;
+        let cid = "cid=0123456789abcdef";
+        h.send(&sam, &format!("@{cid} msg #general hi")).await;
+        assert_eq!(sam.lines().last().unwrap(), "OK seq=2");
+        h.send(&sam, "part #general").await;
+        sam.lines();
+        let room: Room = "#general".parse().unwrap();
+        let entry = h.hub.inner.room_entry(&room).unwrap();
+        entry.state.lock().await.settings.apply(&change);
+
+        h.send(&sam, &format!("@ref=1;{cid} msg #general hi")).await;
+        assert_eq!(sam.lines(), ["@ref=1 OK seq=2"], "{change:?}");
+        // A new message is refused as before.
+        h.send(&sam, "@ref=2 msg #general hi").await;
+        let refused = sam.lines();
+        assert_eq!(refused.len(), 1, "{change:?}");
+        assert!(refused[0].starts_with("@ref=2 ERR "), "{refused:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // History and sync (7.1, 7.2)
 
