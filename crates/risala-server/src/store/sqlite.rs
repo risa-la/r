@@ -489,7 +489,10 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
                 RoomSetting::Retention(_) => {
                     "UPDATE room_settings SET retention = ? WHERE conv = ?"
                 }
-                RoomSetting::Other { .. } => return Ok(()),
+                // Encrypted rooms (12) are not stored yet.
+                RoomSetting::E2ee(_) | RoomSetting::History(_) | RoomSetting::Other { .. } => {
+                    return Ok(());
+                }
             };
             match setting {
                 RoomSetting::Public(public) => tx.execute(sql, params![*public, conv])?,

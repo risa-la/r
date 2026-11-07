@@ -230,6 +230,7 @@ fn default_settings(room: &str) -> Vec<String> {
         format!("SET {room} public yes"),
         format!("SET {room} guests write"),
         format!("SET {room} retention server"),
+        format!("SET {room} e2ee no"),
     ]
 }
 
@@ -377,8 +378,9 @@ async fn guests_can_be_turned_off() {
 async fn auth_and_register_are_not_supported_yet() {
     let mut h = Harness::new();
     let mut c = h.connect();
-    let key = "J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY=";
-    let sig = "A".repeat(86) + "==";
+    // Valid lengths for ML-DSA-44 (4.4, 4.5), so that the lines parse.
+    let key = "A".repeat(1750) + "==";
+    let sig = "A".repeat(3227) + "=";
     h.send(&c, &format!("auth alice@example.org {sig}")).await;
     h.send(&c, &format!("register alice {key} {sig}")).await;
     assert_eq!(
@@ -863,6 +865,7 @@ async fn join_shows_current_settings() {
             "SET #general public yes".into(),
             "SET #general guests read".into(),
             "SET #general retention server".into(),
+            "SET #general e2ee no".into(),
             format!("OK id={id} head=3"),
         ]
     );
@@ -1465,7 +1468,8 @@ async fn sync_lists_the_rooms_of_the_connection() {
     h.send(&sam, "join #general").await;
     let lines = sam.lines();
     let other = value(&lines[0], "id");
-    let general = value(&lines[6], "id");
+    // #other's JOIN, five SET lines and OK, then #general's JOIN.
+    let general = value(&lines[7], "id");
     let (mut bob, _) = h.joined("bob", "#general").await;
     h.send(&bob, "msg #general hi").await;
     sam.lines();
@@ -2032,6 +2036,7 @@ async fn the_overview_session() {
             "SET #general public yes".into(),
             "SET #general guests write".into(),
             "SET #general retention server".into(),
+            "SET #general e2ee no".into(),
             format!("OK id={id} head=4"),
         ]
     );

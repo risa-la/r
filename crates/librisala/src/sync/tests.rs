@@ -602,7 +602,11 @@ fn drop_removes_the_room() {
         .unwrap();
     h.absorb(out);
     h.expect_msg("hi");
-    h.line("DROP #general spam");
+    // A DROP for another id is about an older room of the same name.
+    h.line("@id=k0 DROP #general spam");
+    assert!(h.has_conv("#general"));
+    assert!(h.notes.is_empty());
+    h.line("@id=k1 DROP #general spam");
     assert!(!h.has_conv("#general"));
     assert!(h.notes.contains(&Notification::Dropped {
         room: "#general".parse().unwrap(),
@@ -620,7 +624,7 @@ fn a_page_after_starting_afresh_is_ignored() {
     let r = h.start();
     h.reply(r, &["CONV #general k1 3 0"], "OK");
     let old = h.expect("HISTORY #general after=0 limit=50");
-    h.line("DROP #general");
+    h.line("@id=k1 DROP #general");
     h.line(&ev(1, "from=alice@example.org;id=k2 JOIN #general"));
     // The old request's page arrives, from the new room.
     h.reply_s(

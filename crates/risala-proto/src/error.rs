@@ -31,6 +31,15 @@ pub enum ErrorCode {
     LastOwner,
     /// `not-supported`
     NotSupported,
+    /// `encrypted`: the conversation is encrypted, so the command cannot be
+    /// used in it (12.3).
+    Encrypted,
+    /// `stale`: the conversation's group is not in the state the command
+    /// needs (12.5, 12.6).
+    Stale,
+    /// `invalid`: MLS data or a franking commitment did not verify
+    /// (Section 12).
+    Invalid,
     /// `rate-limited`
     RateLimited,
     /// `internal`
@@ -55,6 +64,9 @@ impl ErrorCode {
             ErrorCode::Forbidden => "forbidden",
             ErrorCode::LastOwner => "last-owner",
             ErrorCode::NotSupported => "not-supported",
+            ErrorCode::Encrypted => "encrypted",
+            ErrorCode::Stale => "stale",
+            ErrorCode::Invalid => "invalid",
             ErrorCode::RateLimited => "rate-limited",
             ErrorCode::Internal => "internal",
             ErrorCode::Other(code) => code,
@@ -88,6 +100,9 @@ impl FromStr for ErrorCode {
             "forbidden" => ErrorCode::Forbidden,
             "last-owner" => ErrorCode::LastOwner,
             "not-supported" => ErrorCode::NotSupported,
+            "encrypted" => ErrorCode::Encrypted,
+            "stale" => ErrorCode::Stale,
+            "invalid" => ErrorCode::Invalid,
             "rate-limited" => ErrorCode::RateLimited,
             "internal" => ErrorCode::Internal,
             _ => ErrorCode::Other(lower),
@@ -150,6 +165,9 @@ mod tests {
             "forbidden",
             "last-owner",
             "not-supported",
+            "encrypted",
+            "stale",
+            "invalid",
             "rate-limited",
             "internal",
         ] {

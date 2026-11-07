@@ -202,7 +202,8 @@ fn two_openssl_sessions_chat_through_risalad() {
     alice.type_line("join #general");
     let join = alice.expect_prefix("@seq=1;");
     assert!(join.contains(";from=~alice;id=") && join.ends_with(" JOIN #general"));
-    for _ in 0..4 {
+    // topic, public, guests, retention and e2ee (6.2).
+    for _ in 0..5 {
         alice.expect_prefix("SET #general ");
     }
     alice.expect_prefix("OK id=");
@@ -213,7 +214,7 @@ fn two_openssl_sessions_chat_through_risalad() {
     bob.expect_prefix("OK uid=~bob token=");
     bob.type_line("join #general");
     bob.expect_prefix("@seq=2;");
-    for _ in 0..4 {
+    for _ in 0..5 {
         bob.expect_prefix("SET #general ");
     }
     bob.expect_prefix("OK id=");

@@ -6,9 +6,9 @@ parses it again and checks that the value is the same.
 
 | Target    | Input                                                        |
 |-----------|--------------------------------------------------------------|
-| `frame`   | bytes into `LineDecoder` in several chunk splits, then each line into `Line::parse` |
+| `frame`   | bytes into `LineDecoder`, with and without the long limit of MLS lines, in several chunk splits, then each line into `Line::parse` |
 | `keyfile` | text into `KeyFile::parse`. `$` and the byte after it become a real key |
-| `names`   | a string into every name, value and key `FromStr`, `Timestamp`, and the text functions |
+| `names`   | a string into every name, value, key and MLS value `FromStr`, `Timestamp`, and the text functions |
 | `client`  | a line into `command::Request::parse`                        |
 | `server`  | a line into `server::ServerMessage::parse`                   |
 

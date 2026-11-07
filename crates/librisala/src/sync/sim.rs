@@ -454,6 +454,7 @@ impl World {
                 after,
                 before,
                 limit,
+                ..
             } => match conv.room().and_then(|r| self.alive(r)) {
                 Some(inc) => {
                     let i = &self.incs[inc];
@@ -657,6 +658,7 @@ impl World {
                 if let Some(inc) = self.alive(&room(r)) {
                     let line = ServerMessage::new(ServerLine::Drop {
                         room: room(r),
+                        id: self.incs[inc].id.clone(),
                         reason: String::new(),
                     });
                     self.send_to_me(inc, &line);

@@ -51,7 +51,8 @@ fn default_settings(who: &str, room: &str) -> String {
         "{who} S: SET {room} topic
          {who} S: SET {room} public yes
          {who} S: SET {room} guests write
-         {who} S: SET {room} retention server"
+         {who} S: SET {room} retention server
+         {who} S: SET {room} e2ee no"
     )
 }
 
@@ -465,18 +466,21 @@ async fn info_about_the_server_and_rooms() {
          S: @ref=i SET #general public yes
          S: @ref=i SET #general guests write
          S: @ref=i SET #general retention server
+         S: @ref=i SET #general e2ee no
          S: @ref=i OK id={{id}} members=1 head=1 role=member joined=yes
          C: info #help
          S: SET #help topic Ask here
          S: SET #help public yes
          S: SET #help guests write
          S: SET #help retention server
+         S: SET #help e2ee no
          S: OK id={{help}} members=0 head=1 role=none joined=no
          C: info #readonly
          S: SET #readonly topic
          S: SET #readonly public yes
          S: SET #readonly guests read
          S: SET #readonly retention server
+         S: SET #readonly e2ee no
          S: OK id={{*}} members=0 head=1 role=none joined=no",
         default_settings("sam", "#general"),
         default_settings("sam", "#general"),
@@ -532,6 +536,7 @@ async fn forbidden_and_not_found() {
          ann S: SET #readonly public yes
          ann S: SET #readonly guests read
          ann S: SET #readonly retention server
+         ann S: SET #readonly e2ee no
          ann S: OK id={id} head=2
          C: join #readonly
          S: @seq=3;t={*};from=~sam;id={id} JOIN #readonly
@@ -539,6 +544,7 @@ async fn forbidden_and_not_found() {
          S: SET #readonly public yes
          S: SET #readonly guests read
          S: SET #readonly retention server
+         S: SET #readonly e2ee no
          S: OK id={id} head=3
          ann S: @seq=3;t={*};from=~sam;id={id} JOIN #readonly
          C: msg #readonly may I?
@@ -1132,6 +1138,7 @@ async fn a_restart_keeps_rooms_ids_and_history() {
          S: SET #general public yes
          S: SET #general guests write
          S: SET #general retention server
+         S: SET #general e2ee no
          S: OK id={id} members=0 head=5 role=none joined=no
          C: join #general
          S: @seq=6;t={*};from=~sam;id={id} JOIN #general
@@ -1139,6 +1146,7 @@ async fn a_restart_keeps_rooms_ids_and_history() {
          S: SET #general public yes
          S: SET #general guests write
          S: SET #general retention server
+         S: SET #general e2ee no
          S: OK id={id} head=6
          C: msg #general after the restart
          S: @seq=7;t={*};from=~sam MSG #general after the restart

@@ -15,13 +15,8 @@ use crate::addr::{ServerAddr, TrustRecord, TrustStore};
 use crate::conn::{CloseReason, CommandError, End, Error, Incoming, Session, SessionOptions};
 
 // Appendix B.
-const PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
-    MC4CAQAwBQYDK2VwBCIEIMEfrlxZLhO+Z9yW9uhQBNMukoYV968f06bF2eoKtsuo\n\
-    -----END PRIVATE KEY-----\n";
+use crate::conn::keys::tests::{PEM, PUBLIC, SIGNATURE};
 const NONCE: &str = "6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e";
-const SIGNATURE: &str =
-    "Hk+S5Vd7ciW57dRNS3AhcvZkYNLmj+kkgJUxOYvCrbEQSBk0UDdH+cSBXF6YvCSU85FRVPaURwsQdbV/SAK0CQ==";
-const PUBLIC: &str = "J/KmupuUYcRd2C2yNZeKz61JIbIKbdRp/dL8lfquDYY=";
 
 /// A pinned self-signed server at `addr` running `script` once.
 async fn run<F, Fut>(addr: &ServerAddr, script: F) -> (ScriptServer, Arc<dyn TrustStore>, TestCa)
@@ -313,6 +308,7 @@ async fn responses_are_matched_with_live_events_interleaved() {
         after: Some(8811),
         before: None,
         limit: std::num::NonZeroU64::new(2),
+        only: None,
     });
     let msg = session.request(Command::Msg {
         conv: "#general".parse().unwrap(),
@@ -649,6 +645,7 @@ async fn sent_replies_keep_their_place_among_live_lines() {
             after: Some(0),
             before: None,
             limit: None,
+            only: None,
         })
     };
     let (ping, history) = tokio::join!(ping, history);
