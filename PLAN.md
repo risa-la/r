@@ -540,7 +540,7 @@ Open:
 Open:
 
 - librisala's MLS storage: `openmls_sqlite_storage` 0.3 cannot link next
-  to rusqlite 0.41. The spike recommends porting it.
+  to rusqlite 0.41. Settled in 42: it is ported.
 - Run `cargo audit` on the chosen crates.
 
 23. **Found while implementing draft-02 in risala-proto** (2.3, 3.2,
@@ -865,8 +865,6 @@ Open:
     Open:
 
     - The QR payload, and whether it is a URI that invite links share.
-    - The HKDF label for the recovery signing key, and whether servers
-      treat the `recovery` key differently (for example, no KEYPKG).
     - Invite codes: single-use or counted, expiry, the ADMIN verbs (room
       INVITE already exists), and the error for a bad code.
 
@@ -935,6 +933,32 @@ Open:
     - The default difficulty, an `ADMIN SET` key for it, and whether it
       rises under load. It has to be set from the slowest supported
       client, an iPhone using the interpreter.
+
+42. **Decided before building M5a** (4.4, 12.10, 14), with the user on
+    2026-11-08:
+    - **The recovery signing key** (from 40). Its ML-DSA-44 seed is
+      HKDF-Expand(HKDF-Extract("", recovery key), info, 32), where
+      `info` is `risala identity ` followed by the uid, the same shape
+      as the backup key's.
+    - **Only clients treat the `recovery` key differently.** A client
+      MUST NOT upload KeyPackages with it, so it never joins a group.
+      Servers and devices ignore the label, which stays a hint for apps,
+      as labels are for people (4.4).
+    - **Built in M5a.** The spec text for the recovery key restoring the
+      identity is written now, and librisala and the CLI build it, so
+      M5a's recovery test starts from losing every device.
+    - **MLS storage** (implementation only, from 22).
+      `openmls_sqlite_storage` is ported to rusqlite 0.41 inside the
+      workspace, with a binary codec, as the spike recommended.
+    - **At rest** (implementation only). librisala's whole database,
+      the MLS state, history keys and the message cache, is encrypted
+      with SQLCipher. The apps keep its key in the platform key store
+      (M6): the Keychain, under a Secure Enclave key where there is one,
+      the Android Keystore, under StrongBox where there is one, and
+      libsecret on GNOME. The device key's seed and the recovery key are
+      kept the same way. The Secure Enclave and StrongBox cannot hold
+      ML-DSA keys themselves, so they only wrap the stored secrets. The
+      CLI keeps the database key in its private state directory.
 
 ## 6. Decisions
 
