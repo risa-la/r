@@ -26,8 +26,9 @@ use crate::error::ParseError;
 use crate::frame::MAX_LONG_CLIENT_LINE;
 
 /// The MLS cipher suite of every encrypted conversation: X-Wing,
-/// ChaCha20-Poly1305, SHA-384 and ML-DSA-44 (12.2, 15).
-pub const CIPHER_SUITE: u16 = 0x0052;
+/// ChaCha20-Poly1305, SHA-384 and ML-DSA-44 (12.2, 15). It is the value
+/// draft-ietf-mls-pq-ciphersuites-07 requests.
+pub const CIPHER_SUITE: u16 = 0x0020;
 
 /// The MLS extension type of the conversation extension (12.2, 15).
 pub const CONVERSATION_EXTENSION_TYPE: u16 = 0xF2A1;

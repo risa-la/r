@@ -306,7 +306,7 @@ pub(crate) struct Inner {
     /// The KEYPKG GETs each identity sent in the last hour (12.4), for
     /// `limits.key_package_gets_per_hour`.
     key_package_gets: rate::WindowLimit<Uid>,
-    /// The crypto of cipher suite `0x0052` (12.2), for checking
+    /// The crypto of cipher suite `0x0020` (12.2), for checking
     /// KeyPackages and commits. Shared by every MLS operation.
     mls: Arc<risala_mls::RisalaCrypto>,
 }

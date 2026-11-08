@@ -27,7 +27,7 @@ pub enum KeyPackageError {
     /// It is not an MLSMessage holding a KeyPackage.
     #[error(transparent)]
     Wire(#[from] WireError),
-    /// It uses another cipher suite than `0x0052`.
+    /// It uses another cipher suite than `0x0020`.
     #[error("the KeyPackage uses another cipher suite")]
     CipherSuite,
     /// A signature does not verify, or OpenMLS finds it invalid otherwise.

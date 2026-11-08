@@ -122,7 +122,7 @@ pub(super) struct CheckedKeyPackage {
 /// [`risala_mls::check_key_package`] decodes `key_package` as an
 /// MLSMessage holding a KeyPackage, and checks that:
 ///
-/// - its protocol version is `mls10`, and its cipher suite is `0x0052`
+/// - its protocol version is `mls10`, and its cipher suite is `0x0020`
 ///   (12.2)
 /// - its leaf's credential is a `basic` credential whose identity is
 ///   `uid`, in lower case, in UTF-8 (12.2)

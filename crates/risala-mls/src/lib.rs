@@ -1,6 +1,6 @@
 //! The MLS layer of risala (SPEC 12), shared by `risalad` and librisala.
 //!
-//! - [`crypto`]: the OpenMLS provider for cipher suite `0x0052` (12.2):
+//! - [`crypto`]: the OpenMLS provider for cipher suite `0x0020` (12.2):
 //!   libcrux, with ML-DSA-44 added, over any OpenMLS storage.
 //! - [`signer`]: a device's [`DeviceSigner`] and credential (12.2). The
 //!   device key stays with the caller, out of OpenMLS storage.
@@ -52,7 +52,7 @@ pub use wire::WireError;
 
 use openmls::prelude::Ciphersuite;
 
-/// The cipher suite of every encrypted conversation, `0x0052`: X-Wing,
+/// The cipher suite of every encrypted conversation, `0x0020`: X-Wing,
 /// ChaCha20-Poly1305, SHA-384 and ML-DSA-44 (12.2, 15). Its value is
 /// `risala_proto::mls::CIPHER_SUITE`.
 pub const CIPHERSUITE: Ciphersuite =
@@ -65,9 +65,26 @@ mod tests;
 mod suite_tests {
     use super::*;
 
+    /// The suite is pinned (12.2): its value is `0x0020` and its
+    /// algorithms are the table's, so an OpenMLS upgrade that changed
+    /// either fails here. OpenMLS calls X-Wing's HPKE KEM
+    /// `XWingKemDraft6`; HPKE itself uses 0x647a for it (hpke-rs).
     #[test]
     fn suite_value() {
+        assert_eq!(risala_proto::mls::CIPHER_SUITE, 0x0020);
         assert_eq!(u16::from(CIPHERSUITE), risala_proto::mls::CIPHER_SUITE);
+        assert_eq!(
+            CIPHERSUITE.hpke_kem_algorithm(),
+            openmls_traits::types::HpkeKemType::XWingKemDraft6
+        );
+        assert_eq!(
+            CIPHERSUITE.hpke_kdf_algorithm(),
+            openmls_traits::types::HpkeKdfType::HkdfSha384
+        );
+        assert_eq!(
+            CIPHERSUITE.hpke_aead_algorithm(),
+            openmls_traits::types::HpkeAeadType::ChaCha20Poly1305
+        );
         assert_eq!(
             Ciphersuite::try_from(risala_proto::mls::CIPHER_SUITE),
             Ok(CIPHERSUITE)

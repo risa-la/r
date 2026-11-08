@@ -1,4 +1,4 @@
-//! The OpenMLS crypto provider for cipher suite `0x0052` (12.2).
+//! The OpenMLS crypto provider for cipher suite `0x0020` (12.2).
 //!
 //! `openmls_libcrux_crypto` has X-Wing, ChaCha20-Poly1305 and SHA-384, but
 //! signs only with Ed25519. [`RisalaCrypto`] passes every call through to

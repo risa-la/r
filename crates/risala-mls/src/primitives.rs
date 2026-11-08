@@ -1,4 +1,4 @@
-//! The primitives of cipher suite `0x0052` that risala uses outside MLS
+//! The primitives of cipher suite `0x0020` that risala uses outside MLS
 //! itself (12.8-12.10): SHA-384, HKDF-SHA384, HMAC-SHA-384 and
 //! ChaCha20-Poly1305, from the same libcrux crates as the provider, and the
 //! labelled functions of [RFC9420] built from them.
@@ -199,7 +199,7 @@ pub(crate) mod tests {
     }
 
     /// RFC 9420's test vectors for cipher suite 7, which uses the same hash
-    /// and KDF as `0x0052` (12.9, App. B), from mlswg/mls-implementations:
+    /// and KDF as `0x0020` (12.9, App. B), from mlswg/mls-implementations:
     /// `crypto-basics.json` and two epochs of `key-schedule.json`.
     #[test]
     fn rfc9420_suite_7_vectors() {

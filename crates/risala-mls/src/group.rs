@@ -4,7 +4,7 @@
 //!
 //! Every group:
 //!
-//! - uses the cipher suite `0x0052` and `basic` credentials (12.2)
+//! - uses the cipher suite `0x0020` and `basic` credentials (12.2)
 //! - carries the conversation extension, and requires it of every leaf
 //!   through `required_capabilities` (12.2)
 //! - sends commits as PublicMessages, so the server can check them (12.5),

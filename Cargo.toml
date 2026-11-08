@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-exclude = ["crates/risala-proto/fuzz", "crates/risala-pow/fuzz"]
+# crates/openmls-traits is a patched copy of a crates.io release (see
+# [patch.crates-io]), kept out of the workspace's lints.
+exclude = ["crates/risala-proto/fuzz", "crates/risala-pow/fuzz", "crates/openmls-traits"]
 members = [
     "crates/risala-proto",
     "crates/risala-server",
@@ -94,6 +96,10 @@ tempfile = "3"
 # place everywhere.
 [patch.crates-io]
 openmls_sqlite_storage = { path = "crates/openmls-sqlite-storage" }
+# openmls_traits 0.6.0 with one change: risala's cipher suite is 0x0020, the
+# value draft-ietf-mls-pq-ciphersuites-07 requests, not OpenMLS's placeholder
+# 0x0052 (SPEC 12.2, 15). See crates/openmls-traits/RISALA.md.
+openmls_traits = { path = "crates/openmls-traits" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
