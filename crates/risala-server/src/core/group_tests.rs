@@ -819,6 +819,12 @@ impl Device {
     /// The content of an ENC event line, decrypted with `group`'s current
     /// history key, from a sender who has a leaf.
     pub(super) fn read(&self, group: &MlsGroup, line: &str) -> String {
+        String::from_utf8(self.message(group, line).content).unwrap()
+    }
+
+    /// An ENC event line, decrypted and verified as [`read`](Self::read)
+    /// does.
+    pub(super) fn message(&self, group: &MlsGroup, line: &str) -> risala_mls::Message {
         let event: risala_proto::server::ServerMessage = line.parse().unwrap();
         let risala_proto::server::ServerLine::Event(event) = event.line else {
             panic!("not an event: {line}");
@@ -840,7 +846,7 @@ impl Device {
             .map(|m| risala_mls::signer::signature_key(&m.signature_key).unwrap())
             .collect();
         let sender = unverified.find_sender(&leaves).unwrap().clone();
-        String::from_utf8(unverified.verify(&sender).unwrap().content).unwrap()
+        unverified.verify(&sender).unwrap()
     }
 }
 
@@ -1284,4 +1290,125 @@ async fn direct_conversations_outlive_a_restart() {
     assert!(lines[0].starts_with("GROUPINFO alice@example.org 0 0 "));
     let lines = w.ask(&mut c7, "history alice@example.org").await;
     assert_eq!(lines, [format!("OK id={id} more=0")]);
+}
+
+// ---------------------------------------------------------------------------
+// REPORTENC (5.8)
+
+#[tokio::test]
+async fn reportenc_reveals_content_that_matches_its_commitment() {
+    let mut w = World::new();
+    w.h.hub.inner.operators.write().unwrap().insert(uid(CAROL));
+    let mut op = w.connect(&Device::new(CAROL, 7));
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let mut ga1 = a1.create(&RisalaConversation::direct(&a1.uid, &b5.uid));
+    let id = ok_value(&w.ask(&mut c1, &a1.init_line(BOB, &ga1)).await, "id");
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b5.kp()],
+            ..Changes::default()
+        },
+    );
+    w.ask(&mut c1, &sent.line(BOB)).await;
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    let gb5 = b5.join(find(&cb.lines(), "WELCOME"));
+    w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT buy now\n")).await;
+    let event = find(&cb.lines(), "ENC alice@example.org 1 ").to_owned();
+    let message = b5.message(&gb5, &event);
+    let franking = message.franking().unwrap();
+
+    // REPORT is for MSG, and the content must be what was committed to.
+    assert_eq!(
+        w.ask(&mut cb, "report alice@example.org 2 spam").await,
+        ["ERR invalid report an ENC event with REPORTENC"]
+    );
+    let other = mls::Content::from_bytes(b"TEXT something else\n").unwrap();
+    assert_eq!(
+        w.ask(
+            &mut cb,
+            &format!(
+                "reportenc alice@example.org 2 {} {other} spam",
+                franking.key
+            )
+        )
+        .await,
+        ["ERR invalid the content does not match the message's franking commitment"]
+    );
+    // Not one's own, and not a COMMIT.
+    let line = format!(
+        "reportenc bob@example.net 2 {} {} spam",
+        franking.key, franking.content
+    );
+    assert_eq!(
+        w.ask(&mut c1, &line).await,
+        ["ERR forbidden you cannot report your own message"]
+    );
+    let line = format!(
+        "reportenc alice@example.org 1 {} {} spam",
+        franking.key, franking.content
+    );
+    assert_eq!(
+        w.ask(&mut cb, &line).await,
+        ["ERR not-found no such message"]
+    );
+
+    let line = format!(
+        "reportenc alice@example.org 2 {} {} spam",
+        franking.key, franking.content
+    );
+    let lines = w.ask(&mut cb, &line).await;
+    let report = ok_value(&lines, "id");
+    // Sent again, the same report.
+    assert_eq!(w.ask(&mut cb, &line).await, [format!("OK id={report}")]);
+    // The operators review reports in direct conversations: the REPORTENC
+    // line, then the ENC event without its payload.
+    let lines = op.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].starts_with(&format!("@report={report};id={id};t=")),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].ends_with(&format!(
+        ";from=bob@example.net REPORTENC alice@example.org 2 {} {} spam",
+        franking.key, franking.content
+    )));
+    let frank = event
+        .split(";frank=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    assert!(
+        lines[1].ends_with(&format!(
+            ";from=alice@example.org;frank={frank} ENC alice@example.org 1"
+        )),
+        "{}",
+        lines[1]
+    );
+    // And again from ADMIN REPORTS, once the message is gone.
+    w.ask(&mut c1, "delete bob@example.net 2").await;
+    let lines = w.ask(&mut op, "admin reports").await;
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[0].contains(" REPORTENC alice@example.org 2 "));
+    assert!(lines[1].ends_with(" ENC alice@example.org 1"));
+    // REPORTENC of a MSG in a room is refused.
+    let mut cr = w.connect(&Device::new(BOB, 5));
+    w.ask(&mut c1, "join #plain").await;
+    w.ask(&mut cr, "join #plain").await;
+    w.ask(&mut c1, "msg #plain hello").await;
+    cr.lines();
+    let line = format!(
+        "reportenc #plain 3 {} {} spam",
+        franking.key, franking.content
+    );
+    assert_eq!(
+        w.ask(&mut cr, &line).await,
+        ["ERR invalid REPORTENC is for ENC events"]
+    );
 }

@@ -2,6 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use risala_proto::mls::{Frank, FrankKey, Franking};
 use risala_proto::names::{Id, Seq, Uid};
 use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
@@ -14,7 +15,8 @@ use crate::store::{
 };
 
 const REPORT_COLUMNS: &str = "n, id, conv_id, room, seq, reporter, reason, t, ev_t, ev_author, \
-     ev_relation, ev_target, ev_file_url, ev_file_type, ev_file_size, ev_text FROM reports";
+     ev_relation, ev_target, ev_file_url, ev_file_type, ev_file_size, ev_text, ev_verb, ev_epoch, \
+     ev_frank, frank_key, content FROM reports";
 
 /// A report's row, before its values are checked.
 struct ReportRow {
@@ -34,6 +36,11 @@ struct ReportRow {
     ev_file_type: Option<String>,
     ev_file_size: Option<i64>,
     ev_text: String,
+    ev_verb: String,
+    ev_epoch: Option<i64>,
+    ev_frank: Option<Vec<u8>>,
+    frank_key: Option<Vec<u8>>,
+    content: Option<String>,
 }
 
 fn report_from_row(row: &Row<'_>) -> rusqlite::Result<ReportRow> {
@@ -54,6 +61,11 @@ fn report_from_row(row: &Row<'_>) -> rusqlite::Result<ReportRow> {
         ev_file_type: row.get(13)?,
         ev_file_size: row.get(14)?,
         ev_text: row.get(15)?,
+        ev_verb: row.get(16)?,
+        ev_epoch: row.get(17)?,
+        ev_frank: row.get(18)?,
+        frank_key: row.get(19)?,
+        content: row.get(20)?,
     })
 }
 
@@ -83,6 +95,40 @@ impl ReportRow {
                     .transpose()?,
             }),
         };
+        let kind = match self.ev_verb.as_str() {
+            "MSG" => EventKind::Msg {
+                relation,
+                file,
+                text: self.ev_text,
+            },
+            "ENC" => EventKind::Enc {
+                epoch: self
+                    .ev_epoch
+                    .and_then(|e| u64::try_from(e).ok())
+                    .ok_or_else(|| corrupt("report", "an ENC with no epoch"))?,
+                payload: None,
+                frank: Some(Frank::from_bytes(
+                    self.ev_frank
+                        .as_deref()
+                        .and_then(|f| f.try_into().ok())
+                        .ok_or_else(|| corrupt("report", "an ENC with no frank"))?,
+                )),
+                file,
+            },
+            verb => return Err(corrupt("reported verb", verb)),
+        };
+        let franking = match (&self.frank_key, &self.content) {
+            (Some(key), Some(content)) => Some(Franking {
+                key: FrankKey::from_bytes(
+                    key.as_slice()
+                        .try_into()
+                        .map_err(|_| corrupt("franking key", key.len()))?,
+                ),
+                content: parse("reported content", content)?,
+            }),
+            (None, None) => None,
+            _ => return Err(corrupt("report", "half a franking")),
+        };
         Ok(ReportRecord {
             n: u64::try_from(self.n).map_err(|_| corrupt("report number", self.n))?,
             id: parse("report id", &self.id)?,
@@ -96,13 +142,10 @@ impl ReportRow {
                     seq: seq(self.seq)?,
                     t: time(self.ev_t)?,
                     from: parse("author", &self.ev_author)?,
-                    kind: EventKind::Msg {
-                        relation,
-                        file,
-                        text: self.ev_text,
-                    },
+                    kind,
                     deleted: false,
                 },
+                franking,
             },
         })
     }
@@ -125,11 +168,15 @@ impl ReportStore for SqliteStore {
     }
 
     fn add_report(&self, report: &NewReport) -> Result<ReportAdded> {
-        let EventKind::Msg { .. } = &report.event.kind else {
-            return Err(StoreError::Corrupt(format!(
-                "a report of a {} event",
-                report.event.kind.verb()
-            )));
+        let (epoch, frank) = match &report.event.kind {
+            EventKind::Msg { .. } => (None, None),
+            EventKind::Enc { epoch, frank, .. } => (Some(*epoch), *frank),
+            kind => {
+                return Err(StoreError::Corrupt(format!(
+                    "a report of a {} event",
+                    kind.verb()
+                )));
+            }
         };
         self.write(|tx| {
             if let Some(id) = report_of_in(tx, &report.conv_id, report.event.seq, &report.reporter)?
@@ -138,10 +185,17 @@ impl ReportStore for SqliteStore {
             }
             let id = take_id(tx, "report", report.t)?;
             let c = columns(&report.event.kind);
+            // An ENC copy keeps no payload (5.8).
+            let text = match epoch {
+                Some(_) => "",
+                None => c.text.as_deref().unwrap_or(""),
+            };
+            let f = report.franking.as_ref();
             tx.execute(
                 "INSERT INTO reports (id, conv_id, room, seq, reporter, reason, t, ev_t, \
                  ev_author, ev_relation, ev_target, ev_file_url, ev_file_type, ev_file_size, \
-                 ev_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 ev_text, ev_verb, ev_epoch, ev_frank, frank_key, content) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     id.as_str(),
                     report.conv_id.as_str(),
@@ -157,7 +211,12 @@ impl ReportStore for SqliteStore {
                     c.file_url,
                     c.file_type,
                     c.file_size,
-                    c.text.as_deref().unwrap_or(""),
+                    text,
+                    report.event.kind.verb(),
+                    epoch.map(super::sql_epoch),
+                    frank.as_ref().map(|f| &f.as_bytes()[..]),
+                    f.map(|f| &f.key.as_bytes()[..]),
+                    f.map(|f| f.content.as_str()),
                 ],
             )?;
             Ok(ReportAdded::New(id))

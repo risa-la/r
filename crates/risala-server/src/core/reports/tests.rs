@@ -205,10 +205,22 @@ async fn what_may_be_reported() {
         "ERR not-found no such room",
     )
     .await;
-    // REPORTENC and direct conversations wait for M5a.
-    let later = "ERR not-supported not supported yet";
-    expect(&h, &mut bob, &format!("reportenc #general 5 {enc}"), later).await;
-    expect(&h, &mut bob, "report alice@example.org 1", later).await;
+    // REPORTENC is for ENC events, and a direct conversation must exist
+    // (`group_tests` has both).
+    expect(
+        &h,
+        &mut bob,
+        &format!("reportenc #general 5 {enc}"),
+        "ERR invalid REPORTENC is for ENC events",
+    )
+    .await;
+    expect(
+        &h,
+        &mut bob,
+        "report alice@example.org 1",
+        "ERR not-found no such conversation",
+    )
+    .await;
     // Guests have no direct conversations, and cannot use REPORTENC.
     let direct = "ERR not-found no such conversation";
     expect(&h, &mut sam, "report alice@example.org 1", direct).await;

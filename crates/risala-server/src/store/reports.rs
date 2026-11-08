@@ -5,6 +5,7 @@
 //! store's key. So a report outlives the message (5.4), its expiry (7.5)
 //! and the room itself (10.4), until it is resolved.
 
+use risala_proto::mls::Franking;
 use risala_proto::names::{Id, Room, Seq, Uid};
 use risala_proto::time::Timestamp;
 
@@ -26,8 +27,12 @@ pub struct NewReport {
     /// When the report was made.
     pub t: Timestamp,
     /// The copy of the reported event, as it was when it was reported: a
-    /// MSG that was not deleted. Its seq is the reported seq.
+    /// MSG or ENC that was not deleted. Its seq is the reported seq. An
+    /// ENC copy keeps no payload, but keeps its `frank` tag (5.8).
     pub event: StoredEvent,
+    /// For a report of an ENC event (REPORTENC), its franking key and
+    /// content, which reviewers receive.
+    pub franking: Option<Franking>,
 }
 
 /// An open report, as stored (5.8).

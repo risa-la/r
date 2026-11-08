@@ -585,6 +585,11 @@ ALTER TABLE reports
     ADD COLUMN ev_verb TEXT NOT NULL DEFAULT 'MSG' CHECK (ev_verb IN ('MSG', 'ENC'));
 ALTER TABLE reports ADD COLUMN ev_epoch INTEGER CHECK (ev_epoch >= 0);
 ALTER TABLE reports ADD COLUMN ev_frank BLOB CHECK (ev_frank IS NULL OR length(ev_frank) = 48);
+-- What REPORTENC reveals (5.8): the franking key and the content, in
+-- base64, checked against `ev_frank` when the report was made.
+ALTER TABLE reports
+    ADD COLUMN frank_key BLOB CHECK (frank_key IS NULL OR length(frank_key) = 32);
+ALTER TABLE reports ADD COLUMN content TEXT;
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.

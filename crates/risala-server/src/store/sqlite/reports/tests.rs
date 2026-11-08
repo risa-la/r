@@ -68,6 +68,7 @@ fn new_report(store: &SqliteStore, record: &RoomRecord, n: u64, reporter: &str) 
         reason: "spam".into(),
         t: t("2026-11-06T15:44:10.230Z"),
         event,
+        franking: None,
     }
 }
 

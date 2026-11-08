@@ -32,7 +32,7 @@ use risala_proto::command::{AdminCommand, Command, RoomPage};
 use risala_proto::error::ErrorCode;
 use risala_proto::mls::Franking;
 use risala_proto::names::{Conv, Id, Room, Seq, Uid};
-use risala_proto::server::{ErrResponse, OkResponse, Report, ServerLine, ServerMessage};
+use risala_proto::server::{ErrResponse, EventBody, OkResponse, Report, ServerLine, ServerMessage};
 use risala_proto::types::DEFAULT_LIST_LIMIT;
 
 use super::Inner;
@@ -41,7 +41,9 @@ use super::messages::BATCH;
 use super::rate::{WindowLimit, network};
 use super::state::{ConvEntry, ConvState, RoomInfo};
 use crate::handler::OutLine;
-use crate::store::{ConvKey, EventKind, NewReport, ReportAdded, ReportRecord, StoreError};
+use crate::store::{
+    ConvKey, EventKind, NewReport, ReportAdded, ReportRecord, StoreError, StoredEvent,
+};
 
 /// The window of `limits.reports_per_hour` (5.8).
 pub(super) const REPORT_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -96,13 +98,17 @@ fn report_lines(
         Some(room) => Conv::Room(room.clone()),
         None => Conv::Uid(report.event.from.clone()),
     };
-    let copy = report.event.to_event(conv.clone(), &report.conv_id)?;
+    let mut copy = report.event.to_event(conv.clone(), &report.conv_id)?;
+    // Reviewers get an ENC without its payload, with its `frank` (5.8).
+    if let EventBody::Enc(enc) = &copy.body {
+        copy.body = EventBody::Enc(enc.for_review());
+    }
     let line = Report {
         t: report.t,
         from: with_from.then(|| report.reporter.clone()),
         conv,
         seq: report.event.seq,
-        franking: None,
+        franking: report.franking.clone(),
         reason: report.reason.clone(),
     };
     // Both carry the conversation's id, so that a report from a room that
@@ -210,7 +216,8 @@ impl Inner {
         Ok(())
     }
 
-    /// REPORT (5.8), of a MSG event in a room.
+    /// REPORT of a MSG event and REPORTENC of an ENC event (5.8), in a
+    /// room or a direct conversation.
     async fn report(
         &self,
         uid: &Uid,
@@ -219,16 +226,10 @@ impl Inner {
         franking: Option<Franking>,
         reason: String,
     ) -> Outcome {
-        // M5a: REPORTENC, and direct conversations. Guests naming a uid were
-        // answered `not-found` before this (4.2).
-        if franking.is_some() {
-            return Err(not_supported());
-        }
-        let Conv::Room(room) = conv else {
-            return Err(not_supported());
-        };
-        let st = self.lock_room(&room).await?;
-        let info = room_of(&st)?;
+        // Guests naming a uid were answered `not-found` before this (4.2),
+        // and guests may not use REPORTENC (13).
+        let st = self.lock_conv(uid, &conv).await?;
+        let info = st.room_info();
         let (key, conv_id) = (st.key, st.id.clone());
         // A report made before gets its id again, before every other check,
         // so that a client may resend it safely: even if the message was
@@ -237,11 +238,13 @@ impl Inner {
         if let Some(id) = self.db(move |s| s.report_of(&c, seq, &who)).await? {
             return Ok(Some(OkResponse::new().with_id(&id)));
         }
-        // Anyone who can read the message may report it (5.8, 7.2).
-        check_read(info, self.asker(uid, st.is_member(uid)))?;
+        // Anyone who can read the message may report it (5.8, 7.2): in a
+        // direct conversation, its participants, who alone can name it.
+        if let Some(info) = info {
+            check_read(info, self.asker(uid, st.is_member(uid)))?;
+        }
         let event = self.db(move |s| s.event(key, seq)).await?;
-        let Some(event) = event.filter(|e| !e.deleted && matches!(e.kind, EventKind::Msg { .. }))
-        else {
+        let Some(event) = event.filter(StoredEvent::is_live_message) else {
             return Err(fail(ErrorCode::NotFound, "no such message"));
         };
         // A guest's name may have been someone else's before its session
@@ -251,6 +254,25 @@ impl Inner {
                 ErrorCode::Forbidden,
                 "you cannot report your own message",
             ));
+        }
+        match (&event.kind, &franking) {
+            (EventKind::Msg { .. }, None) => {}
+            (EventKind::Enc { frank, .. }, Some(franking)) => {
+                // Devices make the same check before they show it (12.8).
+                if !frank.is_some_and(|frank| franking.verifies(&frank)) {
+                    return Err(fail(
+                        ErrorCode::Invalid,
+                        "the content does not match the message's franking commitment",
+                    ));
+                }
+            }
+            (EventKind::Enc { .. }, None) => {
+                return Err(fail(
+                    ErrorCode::Invalid,
+                    "report an ENC event with REPORTENC",
+                ));
+            }
+            _ => return Err(fail(ErrorCode::Invalid, "REPORTENC is for ENC events")),
         }
         let slot = self
             .report_book
@@ -270,24 +292,26 @@ impl Inner {
 
         let report = NewReport {
             conv_id,
-            room: Some(info.room.clone()),
+            room: info.map(|info| info.room.clone()),
             reporter: uid.clone(),
             reason,
             t: self.now(),
             event,
+            franking,
         };
-        let reviewers = self.reviewers(Some(info), &report.event.from);
+        // A direct conversation's reviewers are the operators (5.8).
+        let reviewers = self.reviewers(info, &report.event.from);
         let _book = self.report_book.lock.lock().await;
         let stored = report.clone();
         let id = match self.db(move |s| s.add_report(&stored)).await? {
             ReportAdded::New(id) => id,
-            // Cannot happen under the room's lock, but is harmless.
+            // Cannot happen under the conversation's lock, but is harmless.
             ReportAdded::Existing(id) => return Ok(Some(OkResponse::new().with_id(&id))),
         };
         if let Some(slot) = slot {
             slot.keep();
         }
-        tracing::info!(%room, report = %id, "message reported");
+        tracing::info!(conv = %st.id, report = %id, "message reported");
         self.send_report(&reviewers, &id, &report)?;
         Ok(Some(OkResponse::new().with_id(&id)))
     }
