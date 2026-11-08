@@ -70,3 +70,6 @@ xcuserdata/
 site/node_modules/
 site/dist/
 site/.astro/
+
+# Verification page data, made by verification/assemble.ts
+site/public/verification-data/

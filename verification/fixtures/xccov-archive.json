@@ -1,0 +1,11 @@
+{
+  "/Users/runner/work/r/r/clients/apple/Sources/Client/ChatClient.swift": [
+    { "line": 1, "isExecutable": false, "subranges": [] },
+    { "line": 2, "isExecutable": true, "executionCount": 3, "subranges": [] },
+    { "line": 3, "isExecutable": true, "executionCount": 0, "subranges": [] },
+    { "line": 4, "isExecutable": true, "executionCount": 1, "subranges": [{ "column": 5, "executionCount": 0, "length": 9 }] }
+  ],
+  "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Some.swift": [
+    { "line": 1, "isExecutable": true, "executionCount": 9, "subranges": [] }
+  ]
+}
