@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::events::stored_event;
 use super::people::HIDDEN;
-use super::{AccountId, ConvId, Store, StoreError, opt_id, parse, seq, sql};
+use super::{AccountId, ConvId, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
 
 /// A conversation, for the conversation list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +80,10 @@ pub struct TimelineItem {
     /// Whether the account sent it, from the connection it was stored on
     /// (4.2).
     pub own: bool,
+    /// The outbox entry it was sent from, once the server's OK named it
+    /// (7.6). `None` for an event the account did not send through this
+    /// cache's outbox, and until the OK arrives.
+    pub outbox: Option<OutboxId>,
 }
 
 /// The count of one reaction on a message.
@@ -244,10 +248,26 @@ fn reactions(conn: &Connection, conv: ConvId, target: i64) -> Result<Vec<Reactio
     Ok(out)
 }
 
-type RawItem = (i64, String, bool, Option<String>, Option<i64>, bool);
+type RawItem = (
+    i64,
+    String,
+    bool,
+    Option<String>,
+    Option<i64>,
+    bool,
+    Option<i64>,
+);
 
+/// The last column is the outbox entry an own event was sent from: the
+/// account's message (not a DELETE) for the conversation, bound to its
+/// current id (7.6), that the server accepted as this seq.
 const ITEM: &str = "
-    SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq, e.own
+    SELECT e.seq, e.line, e.deleted, m.text, m.edit_seq, e.own,
+        CASE WHEN e.own THEN (
+            SELECT MIN(o.id) FROM outbox o JOIN convs c ON c.id = e.conv
+            WHERE o.account = c.account AND o.conv = c.name AND o.state = 'sent'
+                AND o.seq = e.seq AND o.conv_id = c.conv_id AND o.verb = 'MSG'
+        ) END
     FROM events e LEFT JOIN message_state m ON m.conv = e.conv AND m.seq = e.seq";
 
 /// Timeline items only: no DELETE, edit or reaction. Messages hidden
@@ -264,6 +284,7 @@ fn raw_timeline(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
         r.get(3)?,
         r.get(4)?,
         r.get(5)?,
+        r.get(6)?,
     ))
 }
 
@@ -272,7 +293,7 @@ fn finish_timeline(
     conv: ConvId,
     raw: RawItem,
 ) -> Result<TimelineItem, StoreError> {
-    let (n, line, deleted, text, edit, own) = raw;
+    let (n, line, deleted, text, edit, own, outbox) = raw;
     let event = stored_event(&line)?;
     let meta = event
         .meta
@@ -291,6 +312,7 @@ fn finish_timeline(
         edit: edit.map(seq).transpose()?,
         deleted,
         own,
+        outbox: outbox.map(OutboxId),
         reactions: if is_msg {
             reactions(conn, conv, n)?
         } else {
@@ -411,6 +433,31 @@ impl Store {
                 out.push(finish_timeline(conn, conv, raw)?);
             }
             Ok(out)
+        })
+    }
+
+    /// Whether every event the server keeps below `seq` is stored (7.1):
+    /// the conversation's sync point reaches up to it. With `None`, whether
+    /// every event up to the newest one known is stored. `false` for a
+    /// conversation that is not in the cache.
+    pub fn complete_below(&self, conv: ConvId, seq: Option<Seq>) -> Result<bool, StoreError> {
+        self.read(|conn| {
+            let row: Option<(i64, i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT c.sync_point, c.head,
+                         (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
+                     FROM convs c WHERE c.id = ?1",
+                    [conv.0],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(row.is_some_and(|(sync_point, head, newest)| {
+                let sync_point = sync_point.max(0) as u64;
+                match seq {
+                    Some(seq) => sync_point + 1 >= seq.get(),
+                    None => sync_point >= head.max(newest.unwrap_or(0)).max(0) as u64,
+                }
+            }))
         })
     }
 

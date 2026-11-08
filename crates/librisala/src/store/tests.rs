@@ -413,6 +413,82 @@ fn sync_point_follows_stored_events() {
 }
 
 #[test]
+fn a_sent_message_names_its_outbox_entry() {
+    let (store, account, conv) = setup();
+    let (out, _) = store
+        .write(|tx| {
+            tx.queue(
+                account,
+                &room(),
+                Some(&id("k1")),
+                &Draft::text("hello"),
+                Timestamp::MIN,
+            )
+        })
+        .unwrap();
+    store_all(
+        &store,
+        conv,
+        &[
+            ev(1, "from=alice@example.org MSG #general hello"),
+            ev(2, "from=bob@example.net MSG #general hello"),
+        ],
+    );
+    let link = |n| store.message(conv, seq(n)).unwrap().unwrap().outbox;
+    // Not until the OK names it.
+    assert_eq!(link(1), None);
+    store.write(|tx| tx.outbox_sent(out, seq(1))).unwrap();
+    assert_eq!(link(1), Some(out));
+    assert_eq!(store.timeline(conv, None, 10).unwrap()[0].outbox, Some(out));
+    // Only the account's own event.
+    store.write(|tx| tx.outbox_sent(out, seq(2))).unwrap();
+    assert_eq!(link(2), None);
+    store.write(|tx| tx.outbox_sent(out, seq(1))).unwrap();
+
+    // A room dropped and created again under the name: its seq 1 is
+    // another message (7.6).
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.discard(&mut row, Some(id("k2")))
+        })
+        .unwrap();
+    store_all(
+        &store,
+        conv,
+        &[ev(1, "from=alice@example.org MSG #general hello")],
+    );
+    assert_eq!(link(1), None);
+}
+
+#[test]
+fn history_is_complete_below_the_sync_point() {
+    let (store, _, conv) = setup();
+    assert!(store.complete_below(conv, None).unwrap());
+    // Events 3 and 4: 1 and 2 may be on the server.
+    let ((), _) = store
+        .write(|tx| {
+            let row = tx.conv(conv)?.unwrap();
+            tx.store_event(&row, &ev(3, "from=bob@example.net MSG #general a"))?;
+            tx.store_event(&row, &ev(4, "from=bob@example.net MSG #general b"))?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(!store.complete_below(conv, Some(seq(3))).unwrap());
+    assert!(!store.complete_below(conv, None).unwrap());
+    // They expired: the sync point moves past them.
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.raise_sync_point(&mut row, 2)
+        })
+        .unwrap();
+    assert!(store.complete_below(conv, Some(seq(3))).unwrap());
+    assert!(store.complete_below(conv, None).unwrap());
+    assert!(!store.complete_below(ConvId(conv.0 + 1), None).unwrap());
+}
+
+#[test]
 fn a_new_id_discards_history() {
     let (store, account, conv) = setup();
     store_all(

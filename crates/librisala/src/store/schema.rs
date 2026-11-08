@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -286,6 +286,15 @@ ALTER TABLE accounts ADD COLUMN unregister_lost INTEGER;
 /// it: DELETE has no `cid` tag (7.6).
 const V9: &str = "
 ALTER TABLE outbox ADD COLUMN verb TEXT NOT NULL DEFAULT 'MSG' CHECK (verb IN ('MSG', 'DELETE'));
+";
+
+/// Version 10: finding the outbox entry a stored message was sent from.
+///
+/// A timeline item the account sent through the outbox keeps the entry's
+/// id, so that a UI does not take it for a new message once it is stored.
+/// The entry names the event by its `seq` once sent; this index finds it.
+const V10: &str = "
+CREATE INDEX outbox_sent ON outbox (account, conv, seq) WHERE state = 'sent';
 ";
 
 /// Brings the schema up to [`VERSION`].
