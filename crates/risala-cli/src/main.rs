@@ -474,7 +474,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The file in the state directory that holds the cache's key.
 const CACHE_KEY: &str = "cache.key";
 
-/// The key `cache.db` is encrypted with (PLAN.md 42): 32 bytes in
+/// The key `cache.db` is encrypted with (PLAN.md 43): 32 bytes in
 /// `cache.key`, random ones made on first use. The file is its owner's
 /// only (0600) on Unix, and one that group or others can read is refused,
 /// as for device keys.

@@ -46,7 +46,7 @@
           # Vendored crates, shared by the package and every cargo check.
           cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
 
-          # librisala's cache is SQLCipher (PLAN.md 42). Off Apple platforms
+          # librisala's cache is SQLCipher (PLAN.md 43). Off Apple platforms
           # it needs OpenSSL's libcrypto; plain cargo builds compile their
           # own, and Nix links nixpkgs' instead.
           sqlcipher = {

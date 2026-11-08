@@ -1127,7 +1127,7 @@ fn a_removal_waits_for_a_key_file_that_cannot_be_fetched() {
     net.run();
     let epoch = net.devs[a].group("bob@example.net").unwrap().epoch;
 
-    // It does not reject the commit: it waits, behind it (PLAN.md 46).
+    // It does not reject the commit: it waits, behind it (PLAN.md 47).
     let group = net.devs[b].group("alice@example.org").unwrap();
     assert_eq!(group.state, GroupState::Active);
     assert!(group.epoch < epoch);

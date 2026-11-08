@@ -1,4 +1,4 @@
-//! OpenMLS storage in SQLite, for librisala (PLAN.md 22, 42).
+//! OpenMLS storage in SQLite, for librisala (PLAN.md 22, 43).
 //!
 //! A port of `openmls_sqlite_storage` 0.3.0 by the OpenMLS Authors (MIT) to
 //! the workspace's rusqlite. The upstream crate pins an older rusqlite, and

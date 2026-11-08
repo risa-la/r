@@ -138,7 +138,7 @@ across the FFI boundary.
     line to publish.
   - KEY management, and adding a new device by showing its public key.
   - Keys are stored through a platform trait, always under hardware
-    (item 44): the Keychain wrapped by the Secure Enclave on Apple
+    (item 45): the Keychain wrapped by the Secure Enclave on Apple
     platforms, the Android Keystore (StrongBox where there is one) on
     Android, and libsecret wrapped by the TPM through `systemd-creds` on
     Linux. A device without that hardware does not start. The Secure
@@ -182,7 +182,7 @@ across the FFI boundary.
   Decisions), so the same screen says the same thing on every platform.
 - **GNOME:** gtk4-rs and libadwaita, using librisala directly with no
   FFI. It comes after the phone apps (item 40). Shipped through Nix and
-  native packages, not Flatpak (item 44).
+  native packages, not Flatpak (item 45).
 - **Apple:** a SwiftUI app shared between macOS and iOS, with a
   Notification Service Extension for push.
 - **Android:** Kotlin with Jetpack Compose. Push through FCM, and through
@@ -544,7 +544,7 @@ Open:
 Open:
 
 - librisala's MLS storage: `openmls_sqlite_storage` 0.3 cannot link next
-  to rusqlite 0.41. Settled in 42: it is ported.
+  to rusqlite 0.41. Settled in 43: it is ported.
 - Run `cargo audit` on the chosen crates.
 
 23. **Found while implementing draft-02 in risala-proto** (2.3, 3.2,
@@ -938,7 +938,7 @@ Open:
       rises under load. It has to be set from the slowest supported
       client, an iPhone using the interpreter.
 
-42. **Decided before building M5a** (4.4, 12.10, 14), with the user on
+43. **Decided before building M5a** (4.4, 12.10, 14), with the user on
     2026-11-08:
     - **The recovery signing key** (from 40). Its ML-DSA-44 seed is
       HKDF-Expand(HKDF-Extract("", recovery key), info, 32), where
@@ -963,11 +963,11 @@ Open:
       (M6): the Keychain, under a Secure Enclave key where there is one,
       the Android Keystore, under StrongBox where there is one, and
       libsecret on GNOME. The device key's seed and the recovery key are
-      kept the same way (Linux and the CLI changed by 44). The Secure
+      kept the same way (Linux and the CLI changed by 45). The Secure
       Enclave and StrongBox cannot hold ML-DSA keys themselves, so they
       only wrap the stored secrets. The
       CLI keeps the database key in its private state directory (changed
-      by 44).
+      by 45).
     - **How the storage and SQLCipher were built** (implementation only,
       no spec change):
       - The port of `openmls_sqlite_storage` is tested with real groups:
@@ -1004,7 +1004,7 @@ Open:
         once. The old file's blocks are freed, not overwritten.
       - The CLI keeps the key as 32 bytes in `cache.key`, made on first
         use, mode 0600; one that others can read is refused, as for
-        device keys. Losing it loses the cache. (Replaced by 44: the CLI
+        device keys. Losing it loses the cache. (Replaced by 45: the CLI
         keeps it under the TPM or the Secure Enclave.)
       - The MLS tables are schema version 12 of the cache. MLS operations
         run in the cache's own write transaction (`BEGIN IMMEDIATE`), on
@@ -1016,7 +1016,7 @@ Open:
         app for holding its lock while suspended. Check this when the
         app shares the cache with its notification extension.
 
-43. **Found while building M5a's foundation and server storage** (3.7,
+44. **Found while building M5a's foundation and server storage** (3.7,
     12.2, 12.4, 12.7, 12.10), decided with the user on 2026-11-08:
     - **`required_capabilities`** lists exactly the conversation
       extension `0xF2A1`, no proposal types and the `basic` credential
@@ -1040,7 +1040,7 @@ Open:
     deletes ended KeyPackages hourly. Uploading a KeyPackage it already
     has stores nothing and replies `OK`.
 
-44. **Keys at rest need hardware** (3.3, 42), decided with the user on
+45. **Keys at rest need hardware** (3.3, 43), decided with the user on
     2026-11-08. Implementation only, no spec change. It covers the
     cache's SQLCipher key, the device key's seed, history keys and the
     recovery key.
@@ -1076,10 +1076,10 @@ Open:
       through Nix and native packages instead.
     - **Tests and CI.** The CLI's tests run against a software TPM
       (swtpm) and `systemd-creds`, in CI and locally, so the real path
-      is tested. The 0600 `cache.key` and PEM key files of 42 go away;
+      is tested. The 0600 `cache.key` and PEM key files of 43 go away;
       there is no test-only file store.
 
-45. **Found while building M5a's server groups** (6.2, 6.3, 7.1, 12.5),
+46. **Found while building M5a's server groups** (6.2, 6.3, 7.1, 12.5),
     decided with the user on 2026-11-08:
     - **CONV allows head `0`**, for a direct conversation that INIT
       started, before its first COMMIT. Otherwise a crash between INIT
@@ -1091,7 +1091,7 @@ Open:
     - **SET of `send` or `history` in an encrypted room** gets
       `forbidden` without the owner role, and `encrypted` with it.
 
-46. **Found while building librisala's engine** (12.6, 12.9, 12.10),
+47. **Found while building librisala's engine** (12.6, 12.9, 12.10),
     decided with the user on 2026-11-08:
     - **The conversation with yourself** is created by any device that
       cannot see it. One that loses the race gets `stale` and joins.
@@ -1101,8 +1101,8 @@ Open:
       It is neither applied nor rejected, since a failed fetch says
       nothing about the keys (4.4).
 
-47. **Found while testing M5a end to end** (5.8, 12.6, 12.12), on
-    2026-11-08. Item 46's decisions are built and tested, and the last
+48. **Found while testing M5a end to end** (5.8, 12.6, 12.12), on
+    2026-11-08. Item 47's decisions are built and tested, and the last
     point below changed 12.6:
     - librisala's encryption is tested end to end against `risalad`, with
       key files fetched over HTTPS from the test server's key file host.
@@ -1150,7 +1150,7 @@ Open:
       connections that do not start with TLS. The client was right: it
       never reconnected after `disconnect`.
 
-48. **Server follow-ups for M5a** (4.8, 10.4, 12.5, 12.6), on 2026-11-08.
+49. **Server follow-ups for M5a** (4.8, 10.4, 12.5, 12.6), on 2026-11-08.
     Implementation choices, no spec change:
     - **Purges reach every conversation.** ADMIN PURGE and UNREGISTER
       `purge=yes` delete ENC events as well as MSG, in direct

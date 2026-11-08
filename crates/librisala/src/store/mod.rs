@@ -244,7 +244,7 @@ impl Store {
     /// Opens the cache at `path`, creating it if needed, and brings its
     /// schema up to date.
     ///
-    /// The file is encrypted with `key` (SQLCipher, PLAN.md 42), which
+    /// The file is encrypted with `key` (SQLCipher, PLAN.md 43), which
     /// must be the same every time. A wrong key gives
     /// [`StoreError::WrongKey`]. A cache from before encryption, in the
     /// clear, is encrypted with `key` first, keeping all it holds.

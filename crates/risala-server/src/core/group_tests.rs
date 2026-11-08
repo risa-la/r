@@ -402,7 +402,7 @@ async fn encrypted_room(
 #[tokio::test]
 async fn only_the_owner_role_encrypts_a_room() {
     // Devices check the role from the room's events, so an operator
-    // without it counts as a plain member (12.5, PLAN.md 5 item 45).
+    // without it counts as a plain member (12.5, PLAN.md 5 item 46).
     let mut w = World::new();
     w.h.hub.inner.operators.write().unwrap().insert(uid(CAROL));
     let a1 = Device::new(ALICE, 1);

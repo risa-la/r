@@ -201,7 +201,7 @@ pub struct NewRecoveryKey {
 }
 
 /// The id a recovery key is kept under in the key store, beside the
-/// identity's device key (PLAN.md 42). It starts with `~`, as no identity
+/// identity's device key (PLAN.md 43). It starts with `~`, as no identity
 /// does, so that it never names a device key, and uses only characters
 /// every key store takes.
 fn recovery_id(identity: &Identity) -> String {

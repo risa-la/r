@@ -24,7 +24,7 @@ base64.workspace = true
 zeroize.workspace = true
 openmls_sqlite_storage.workspace = true
 
-# SQLCipher, to encrypt the cache (PLAN.md 42). On Apple platforms it uses
+# SQLCipher, to encrypt the cache (PLAN.md 43). On Apple platforms it uses
 # CommonCrypto. Elsewhere it uses OpenSSL's libcrypto, built from source
 # and linked statically, since Android has no libcrypto for apps and plain
 # cargo builds need no OpenSSL headers. Nix builds set OPENSSL_NO_VENDOR to

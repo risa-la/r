@@ -1,4 +1,4 @@
-//! Encryption of the cache at rest, with SQLCipher (PLAN.md 42).
+//! Encryption of the cache at rest, with SQLCipher (PLAN.md 43).
 //!
 //! Every connection to a cache file is keyed with [`key`] before anything
 //! else reads it. The key is a raw 256-bit key, so SQLCipher skips its

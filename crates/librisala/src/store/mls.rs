@@ -1,4 +1,4 @@
-//! OpenMLS's state in the cache (SPEC 12, PLAN.md 22, 42).
+//! OpenMLS's state in the cache (SPEC 12, PLAN.md 22, 43).
 //!
 //! OpenMLS keeps its groups, KeyPackages, proposals and keys in the cache's
 //! `openmls_*` tables (schema version 13), through

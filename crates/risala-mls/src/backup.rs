@@ -13,7 +13,7 @@
 //!   associated data. It is 84 bytes.
 //! - The **recovery signing key** is the ML-DSA-44 key whose seed is
 //!   HKDF-Expand(HKDF-Extract("", recovery key), "risala identity " + uid,
-//!   32) with SHA-384, the same shape as the backup key (PLAN.md 42). It
+//!   32) with SHA-384, the same shape as the backup key (PLAN.md 43). It
 //!   lets the recovery key restore the identity once every device is lost.
 
 use base64::Engine as _;
@@ -166,7 +166,7 @@ impl RecoveryKey {
         BackupKey { key, id }
     }
 
-    /// The recovery signing key of `uid` (PLAN.md 42): the ML-DSA-44 key
+    /// The recovery signing key of `uid` (PLAN.md 43): the ML-DSA-44 key
     /// whose seed is derived from the recovery key with the info
     /// `risala identity <uid>`.
     pub fn signing_key(&self, uid: &Identity) -> SecretKey {

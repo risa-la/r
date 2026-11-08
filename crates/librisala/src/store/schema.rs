@@ -356,7 +356,7 @@ CREATE INDEX convs_activity ON convs (activity DESC, id);
 CREATE INDEX outbox_unsent ON outbox (account, conv, id) WHERE state != 'sent';
 ";
 
-/// Version 13: OpenMLS's state (SPEC 12, PLAN.md 42).
+/// Version 13: OpenMLS's state (SPEC 12, PLAN.md 43).
 ///
 /// The `openmls_*` tables of `openmls_sqlite_storage`, which OpenMLS reads
 /// and writes through [`MlsStorage`](super::mls::MlsStorage): groups,

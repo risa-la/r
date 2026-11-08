@@ -258,7 +258,7 @@ impl SyncEngine {
                 }
             }
             // The recovery key too, so that the new device backs up the
-            // history keys it gets from now on (12.10, PLAN.md 46).
+            // history keys it gets from now on (12.10, PLAN.md 47).
             if let Some(recovery) = recovery {
                 lines.push(Control::Recovery(recovery));
             }
