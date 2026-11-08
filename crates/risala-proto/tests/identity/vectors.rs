@@ -381,7 +381,7 @@ pub fn must_fail(f: &Fixture) -> Vec<(&'static str, String)> {
         let last = body.chars().last().unwrap();
         const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let index = ALPHABET.find(last).unwrap();
-        assert_eq!(index % 4, 0, "two unused bits");
+        assert!(index.is_multiple_of(4), "two unused bits");
         let changed = ALPHABET.as_bytes()[index + 1] as char;
         let bad = format!(
             "{}{changed}{}",
@@ -392,8 +392,7 @@ pub fn must_fail(f: &Fixture) -> Vec<(&'static str, String)> {
     }));
     let mut repeated = r[3].content().clone();
     if let RecordBody::Signing { removed, .. } = &mut repeated.body {
-        let first = removed[0].clone();
-        removed.push(first);
+        removed.push(removed[0]);
     }
     out.push((
         "replay 7, removed names a device twice",
@@ -492,7 +491,7 @@ fn b1_key_and_auth() {
 fn b2_risala_sign() {
     use libcrux_ml_dsa::ml_dsa_44 as mldsa;
     let mut ck = Checker::open("B.2 ");
-    let key = appendix_key();
+    let key = fixture().device_secret;
     let content = b"risala";
     ck.eq("key seed", APPENDIX_B_SEED);
     ck.eq("label", SignLabel::Record.as_str());
