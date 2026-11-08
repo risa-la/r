@@ -2415,6 +2415,38 @@ impl crate::store::E2eeStore for Flaky {
 
 // (the rest)
 
+impl crate::store::GroupStore for Flaky {
+    fn group(&self, c: ConvKey) -> crate::store::Result<Option<crate::store::GroupRecord>> {
+        self.inner.group(c)
+    }
+    fn init_group(
+        &self,
+        c: ConvKey,
+        g: &crate::store::GroupRecord,
+        l: &[crate::store::GroupLeaf],
+        e: &[NewEvent],
+        i: bool,
+    ) -> crate::store::Result<crate::store::GroupInit> {
+        self.inner.init_group(c, g, l, e, i)
+    }
+    fn commit_group(
+        &self,
+        c: ConvKey,
+        g: &crate::store::GroupCommit,
+    ) -> crate::store::Result<Option<crate::store::CommitStored>> {
+        self.inner.commit_group(c, g)
+    }
+    fn has_leaf(&self, c: ConvKey, u: &Uid, k: &PublicKey) -> crate::store::Result<bool> {
+        self.inner.has_leaf(c, u, k)
+    }
+    fn leaf_uids(&self, c: ConvKey) -> crate::store::Result<Vec<Uid>> {
+        self.inner.leaf_uids(c)
+    }
+    fn has_removed_leaf(&self, c: ConvKey) -> crate::store::Result<bool> {
+        self.inner.has_removed_leaf(c)
+    }
+}
+
 impl Store for Flaky {
     fn load_server_settings(
         &self,

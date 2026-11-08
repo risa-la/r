@@ -21,7 +21,58 @@ fn sql_epoch(epoch: u64) -> Result<i64> {
 
 /// Deletes the Welcome and tree of each commit that no device has pending
 /// any more (12.7).
-fn prune_welcome_commits(tx: &Transaction<'_>) -> Result<()> {
+/// Stores a commit's Welcome as pending for each of `devices`, in `tx`
+/// (see [`E2eeStore::add_welcomes`]).
+pub(super) fn add_welcomes_in(
+    tx: &Transaction<'_>,
+    conv: ConvKey,
+    seq: Seq,
+    welcome: &Welcome,
+    tree: &RatchetTree,
+    devices: &[(Uid, PublicKey)],
+) -> Result<Vec<Id>> {
+    if devices.is_empty() {
+        return Ok(Vec::new());
+    }
+    tx.execute(
+        "INSERT INTO welcome_commits (conv, seq, welcome, tree) VALUES (?, ?, ?, ?)",
+        params![conv.0, sql_seq(seq), welcome.as_str(), tree.as_str()],
+    )?;
+    let n = tx.last_insert_rowid();
+    let mut ids = Vec::with_capacity(devices.len());
+    for (uid, key) in devices {
+        let device = key.to_string();
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM pending_welcomes \
+                 WHERE uid = ? AND device_key = ? AND commit_n = ?",
+                params![uid.as_str(), device, n],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            ids.push(parse("Welcome id", &id)?);
+            continue;
+        }
+        // Ids are random: one that is taken, however unlikely, is made
+        // again.
+        let id = loop {
+            let id = random_id()?;
+            let added = tx.execute(
+                "INSERT OR IGNORE INTO pending_welcomes (id, commit_n, uid, device_key) \
+                 VALUES (?, ?, ?, ?)",
+                params![id.as_str(), n, uid.as_str(), device],
+            )?;
+            if added > 0 {
+                break id;
+            }
+        };
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+pub(super) fn prune_welcome_commits(tx: &Transaction<'_>) -> Result<()> {
     tx.execute(
         "DELETE FROM welcome_commits WHERE NOT EXISTS \
          (SELECT 1 FROM pending_welcomes p WHERE p.commit_n = welcome_commits.n)",
@@ -190,44 +241,7 @@ impl E2eeStore for SqliteStore {
         if devices.is_empty() {
             return Ok(Vec::new());
         }
-        self.write(|tx| {
-            tx.execute(
-                "INSERT INTO welcome_commits (conv, seq, welcome, tree) VALUES (?, ?, ?, ?)",
-                params![conv.0, sql_seq(seq), welcome.as_str(), tree.as_str()],
-            )?;
-            let n = tx.last_insert_rowid();
-            let mut ids = Vec::with_capacity(devices.len());
-            for (uid, key) in devices {
-                let device = key.to_string();
-                let existing: Option<String> = tx
-                    .query_row(
-                        "SELECT id FROM pending_welcomes \
-                         WHERE uid = ? AND device_key = ? AND commit_n = ?",
-                        params![uid.as_str(), device, n],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(id) = existing {
-                    ids.push(parse("Welcome id", &id)?);
-                    continue;
-                }
-                // Ids are random: one that is taken, however unlikely, is
-                // made again.
-                let id = loop {
-                    let id = random_id()?;
-                    let added = tx.execute(
-                        "INSERT OR IGNORE INTO pending_welcomes (id, commit_n, uid, device_key) \
-                         VALUES (?, ?, ?, ?)",
-                        params![id.as_str(), n, uid.as_str(), device],
-                    )?;
-                    if added > 0 {
-                        break id;
-                    }
-                };
-                ids.push(id);
-            }
-            Ok(ids)
-        })
+        self.write(|tx| add_welcomes_in(tx, conv, seq, welcome, tree, devices))
     }
 
     fn pending_welcomes(&self, uid: &Uid, key: &PublicKey) -> Result<Vec<Id>> {
@@ -326,6 +340,9 @@ impl E2eeStore for SqliteStore {
             &self.conn(),
             "SELECT device_key FROM key_packages WHERE uid = ?1 \
              UNION SELECT device_key FROM pending_welcomes WHERE uid = ?1 \
+             UNION SELECT device_key FROM group_leaves l WHERE uid = ?1 AND NOT EXISTS \
+                 (SELECT 1 FROM removed_keys r WHERE r.uid = l.uid \
+                  AND r.device_key = l.device_key) \
              ORDER BY 1",
             [uid.as_str()],
         )
@@ -337,6 +354,8 @@ impl E2eeStore for SqliteStore {
             for sql in [
                 "DELETE FROM key_packages WHERE uid = ? AND device_key = ?",
                 "DELETE FROM pending_welcomes WHERE uid = ? AND device_key = ?",
+                // Its leaves must go before anyone sends again (12.6).
+                "INSERT OR IGNORE INTO removed_keys (uid, device_key) VALUES (?, ?)",
             ] {
                 tx.execute(sql, params![uid.as_str(), device])?;
             }

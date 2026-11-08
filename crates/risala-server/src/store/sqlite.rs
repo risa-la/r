@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 
 use risala_proto::auth::PublicKey;
 use risala_proto::keyfile::MAX_KEY_LABEL;
+use risala_proto::mls::{FRANK_LEN, Frank};
 use risala_proto::names::{BlockTarget, Id, Room, Seq, Uid};
 use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
@@ -17,6 +18,7 @@ use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
 mod admin;
 mod e2ee;
+mod groups;
 mod messages;
 mod moderation;
 mod reports;
@@ -195,7 +197,7 @@ fn sql_seq(s: Seq) -> i64 {
 // Rooms
 
 const ROOM_COLUMNS: &str = "c.conv, c.id, c.room, c.head, c.created, \
-     s.topic, s.public, s.guests, s.retention, s.send \
+     s.topic, s.public, s.guests, s.retention, s.send, s.e2ee, s.history \
      FROM conversations c JOIN room_settings s ON s.conv = c.conv";
 
 fn room_from_row(row: &Row<'_>) -> rusqlite::Result<RoomRow> {
@@ -210,6 +212,8 @@ fn room_from_row(row: &Row<'_>) -> rusqlite::Result<RoomRow> {
         guests: row.get(7)?,
         retention: row.get(8)?,
         send: row.get(9)?,
+        e2ee: row.get(10)?,
+        history: row.get(11)?,
     })
 }
 
@@ -225,6 +229,8 @@ struct RoomRow {
     guests: String,
     retention: String,
     send: String,
+    e2ee: bool,
+    history: String,
 }
 
 impl RoomRow {
@@ -262,6 +268,7 @@ impl RoomRow {
             "SELECT uid FROM room_bans WHERE conv = ? ORDER BY uid",
             "banned uid",
         )?;
+        let group = groups::group_meta(conn, key)?;
         Ok(RoomRecord {
             key,
             room: parse("room", &self.room)?,
@@ -274,11 +281,14 @@ impl RoomRow {
                 guests: parse("guests setting", &self.guests)?,
                 retention: parse("retention setting", &self.retention)?,
                 send: parse("send setting", &self.send)?,
+                e2ee: self.e2ee,
+                history: parse("history setting", &self.history)?,
             },
             members,
             roles,
             invites,
             bans,
+            group,
         })
     }
 }
@@ -309,8 +319,8 @@ fn take_id(tx: &Transaction<'_>, kind: &str, now: Timestamp) -> Result<Id> {
 // Events
 
 const EVENT_COLUMNS: &str = "e.seq, e.t, e.author, e.verb, e.relation, e.target, e.subject, \
-     e.arg, e.file_url, e.file_type, e.file_size, e.deleted, COALESCE(x.text, '') \
-     FROM events e LEFT JOIN event_text x ON x.conv = e.conv AND x.seq = e.seq";
+     e.arg, e.file_url, e.file_type, e.file_size, e.deleted, COALESCE(x.text, ''), e.epoch, \
+     e.frank FROM events e LEFT JOIN event_text x ON x.conv = e.conv AND x.seq = e.seq";
 
 /// An event's row, before its values are checked.
 struct EventRow {
@@ -327,6 +337,8 @@ struct EventRow {
     file_size: Option<i64>,
     deleted: bool,
     text: String,
+    epoch: Option<i64>,
+    frank: Option<Vec<u8>>,
 }
 
 fn event_from_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
@@ -344,6 +356,8 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
         file_size: row.get(10)?,
         deleted: row.get(11)?,
         text: row.get(12)?,
+        epoch: row.get(13)?,
+        frank: row.get(14)?,
     })
 }
 
@@ -358,7 +372,51 @@ impl EventRow {
             )
         };
         let target = || seq(self.target.ok_or_else(|| corrupt("event", "no target"))?);
+        let epoch = || {
+            self.epoch
+                .and_then(|e| u64::try_from(e).ok())
+                .ok_or_else(|| corrupt("event", "no epoch"))
+        };
+        let file = || -> Result<Option<Attachment>> {
+            let Some(url) = &self.file_url else {
+                return Ok(None);
+            };
+            Ok(Some(Attachment {
+                url: parse("file URL", url)?,
+                media_type: self
+                    .file_type
+                    .as_deref()
+                    .map(|m| parse("media type", m))
+                    .transpose()?,
+                size: self
+                    .file_size
+                    .map(|n| u64::try_from(n).map_err(|_| corrupt("file size", n)))
+                    .transpose()?,
+            }))
+        };
         let kind = match self.verb.as_str() {
+            "ENC" => EventKind::Enc {
+                epoch: epoch()?,
+                payload: if self.text.is_empty() {
+                    None
+                } else {
+                    Some(parse("ENC payload", &self.text)?)
+                },
+                frank: self
+                    .frank
+                    .as_deref()
+                    .map(|f| {
+                        <[u8; FRANK_LEN]>::try_from(f)
+                            .map(Frank::from_bytes)
+                            .map_err(|_| corrupt("frank", f.len()))
+                    })
+                    .transpose()?,
+                file: file()?,
+            },
+            "COMMIT" => EventKind::Commit {
+                epoch: epoch()?,
+                commit: parse("commit", &self.text)?,
+            },
             "MSG" => {
                 let relation = match &self.relation {
                     None => None,
@@ -366,24 +424,9 @@ impl EventRow {
                         Relation::new(key, target()?).ok_or_else(|| corrupt("relation", key))?,
                     ),
                 };
-                let file = match &self.file_url {
-                    None => None,
-                    Some(url) => Some(Attachment {
-                        url: parse("file URL", url)?,
-                        media_type: self
-                            .file_type
-                            .as_deref()
-                            .map(|m| parse("media type", m))
-                            .transpose()?,
-                        size: self
-                            .file_size
-                            .map(|n| u64::try_from(n).map_err(|_| corrupt("file size", n)))
-                            .transpose()?,
-                    }),
-                };
                 EventKind::Msg {
                     relation,
-                    file,
+                    file: file()?,
                     text: self.text,
                 }
             }
@@ -436,6 +479,8 @@ struct EventColumns<'a> {
     file_type: Option<&'a str>,
     file_size: Option<i64>,
     text: Option<std::borrow::Cow<'a, str>>,
+    epoch: Option<i64>,
+    frank: Option<&'a [u8]>,
 }
 
 fn columns(kind: &EventKind) -> EventColumns<'_> {
@@ -473,15 +518,39 @@ fn columns(kind: &EventKind) -> EventColumns<'_> {
             c.subject = Some(uid.as_str());
             c.arg = Some(role.as_str());
         }
+        EventKind::Enc {
+            epoch,
+            payload,
+            frank,
+            file,
+        } => {
+            c.epoch = Some(sql_epoch(*epoch));
+            c.text = payload.as_ref().map(|p| p.as_str().into());
+            c.frank = frank.as_ref().map(|f| &f.as_bytes()[..]);
+            if let Some(f) = file {
+                c.file_url = Some(f.url.as_str());
+                c.file_type = f.media_type.as_ref().map(|m| m.as_str());
+                c.file_size = f.size.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+            }
+        }
+        EventKind::Commit { epoch, commit } => {
+            c.epoch = Some(sql_epoch(*epoch));
+            c.text = Some(commit.as_str().into());
+        }
     }
     c
+}
+
+/// An epoch as stored: epochs are at most 2^63-1 (12.5, 12.8).
+fn sql_epoch(epoch: u64) -> i64 {
+    i64::try_from(epoch).unwrap_or(i64::MAX)
 }
 
 /// Applies what an event changes, in the event's transaction.
 fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) -> Result<()> {
     let identity = |uid: &Uid| uid.is_identity();
     match &event.kind {
-        EventKind::Msg { .. } => {}
+        EventKind::Msg { .. } | EventKind::Enc { .. } | EventKind::Commit { .. } => {}
         EventKind::Join => {
             if event.from.is_guest() {
                 // Kept until the guest's PART, even across a crash (4.2).
@@ -519,13 +588,13 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
                     "UPDATE room_settings SET retention = ? WHERE conv = ?"
                 }
                 RoomSetting::Send(_) => "UPDATE room_settings SET send = ? WHERE conv = ?",
-                // Encrypted rooms (12) are not stored yet.
-                RoomSetting::E2ee(_) | RoomSetting::History(_) | RoomSetting::Other { .. } => {
-                    return Ok(());
-                }
+                RoomSetting::E2ee(_) => "UPDATE room_settings SET e2ee = ? WHERE conv = ?",
+                RoomSetting::History(_) => "UPDATE room_settings SET history = ? WHERE conv = ?",
+                RoomSetting::Other { .. } => return Ok(()),
             };
             match setting {
                 RoomSetting::Public(public) => tx.execute(sql, params![*public, conv])?,
+                RoomSetting::E2ee(e2ee) => tx.execute(sql, params![*e2ee, conv])?,
                 other => tx.execute(sql, params![other.value(), conv])?,
             };
         }
@@ -604,7 +673,7 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             for s in erase {
                 tx.execute(
                     "UPDATE events SET deleted = 1, file_url = NULL, file_type = NULL, \
-                     file_size = NULL WHERE conv = ? AND seq = ?",
+                     file_size = NULL, frank = NULL WHERE conv = ? AND seq = ?",
                     params![conv, s],
                 )?;
                 tx.execute(
@@ -636,7 +705,8 @@ fn append_in(tx: &Transaction<'_>, conv: ConvKey, event: &NewEvent) -> Result<Ap
     let c = columns(&event.kind);
     tx.prepare_cached(
         "INSERT INTO events (conv, seq, t, author, verb, relation, target, subject, arg, \
-                 file_url, file_type, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 file_url, file_type, file_size, epoch, frank) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )?
     .execute(params![
         conv,
@@ -651,6 +721,8 @@ fn append_in(tx: &Transaction<'_>, conv: ConvKey, event: &NewEvent) -> Result<Ap
         c.file_url,
         c.file_type,
         c.file_size,
+        c.epoch,
+        c.frank,
     ])?;
     if let Some(text) = c.text.as_deref().filter(|t| !t.is_empty()) {
         tx.prepare_cached("INSERT INTO event_text (conv, seq, text) VALUES (?, ?, ?)")?
@@ -1040,6 +1112,11 @@ impl Store for SqliteStore {
                     "INSERT INTO hosted_keys (uid, key, label, added) VALUES (?, ?, ?, ?)",
                     params![uid.as_str(), key, label, ms(now)],
                 )?;
+                // Listed again: its leaves need not go (12.6).
+                tx.execute(
+                    "DELETE FROM removed_keys WHERE uid = ? AND device_key = ?",
+                    params![uid.as_str(), key],
+                )?;
             }
             Ok(KeyChange::Done(hosted_keys_in(tx, uid)?))
         })
@@ -1067,6 +1144,12 @@ impl Store for SqliteStore {
 
     fn forget_identity(&self, uid: &Uid, retire: bool, now: Timestamp) -> Result<()> {
         self.write(|tx| {
+            // Its keys are gone, and so must its leaves be (4.8, 12.6).
+            tx.execute(
+                "INSERT OR IGNORE INTO removed_keys (uid, device_key) \
+                 SELECT DISTINCT uid, device_key FROM group_leaves WHERE uid = ?",
+                [uid.as_str()],
+            )?;
             for sql in [
                 // Hosted keys go with it (ON DELETE CASCADE).
                 "DELETE FROM identities WHERE uid = ?",

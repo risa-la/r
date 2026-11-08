@@ -19,6 +19,7 @@
 
 mod admin;
 mod e2ee;
+mod groups;
 mod messages;
 mod moderation;
 mod reports;
@@ -29,18 +30,24 @@ use std::collections::HashMap;
 use std::fmt;
 
 use risala_proto::auth::PublicKey;
+use risala_proto::mls::Ciphertext;
+use risala_proto::mls::{CommitMessage, Frank};
 use risala_proto::names::{BlockTarget, Id, Room, Seq, Uid};
-use risala_proto::server::{Attachment, Event, EventBody, EventMeta, Message};
+use risala_proto::server::{Attachment, Encrypted, Event, EventBody, EventMeta, Message};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
-    Cid, GuestAccess, Relation, Role, RoomRetention, RoomSetting, SendMode, ServerRetention,
-    ServerSetting,
+    Cid, GuestAccess, HistoryMode, Relation, Role, RoomRetention, RoomSetting, SendMode,
+    ServerRetention, ServerSetting,
 };
 
 pub use admin::{AdminStore, ServerBan};
 pub use e2ee::{
     BackupAdded, BackupPage, E2eeStore, KeyPackageAdded, KeyPackageCount, NewKeyPackage,
     PendingWelcome,
+};
+pub use groups::{
+    CommitStored, GroupCommit, GroupInit, GroupLeaf, GroupMeta, GroupParts, GroupRecord,
+    GroupState, GroupStateError, GroupStore, NewWelcome,
 };
 pub use messages::{MessageStore, PurgeQuery, RelatedQuery};
 pub use moderation::ModerationStore;
@@ -143,6 +150,11 @@ pub struct RoomSettings {
     pub retention: RoomRetention,
     /// `send`: who may send messages (6.2).
     pub send: SendMode,
+    /// `e2ee`: whether the room is encrypted (6.2, 12.3).
+    pub e2ee: bool,
+    /// `history`: what new members may read (6.2, 12.9). It exists only
+    /// in encrypted rooms.
+    pub history: HistoryMode,
 }
 
 impl RoomSettings {
@@ -155,6 +167,8 @@ impl RoomSettings {
             guests: GuestAccess::Write,
             retention: RoomRetention::Server,
             send: SendMode::All,
+            e2ee: false,
+            history: HistoryMode::Shared,
         }
     }
 
@@ -166,24 +180,28 @@ impl RoomSettings {
             RoomSetting::Guests(v) => self.guests = *v,
             RoomSetting::Retention(v) => self.retention = *v,
             RoomSetting::Send(v) => self.send = *v,
-            // Encrypted rooms (12) are not stored yet.
-            RoomSetting::E2ee(_) | RoomSetting::History(_) | RoomSetting::Other { .. } => {}
+            RoomSetting::E2ee(v) => self.e2ee = *v,
+            RoomSetting::History(v) => self.history = *v,
+            RoomSetting::Other { .. } => {}
         }
     }
 
     /// The settings in the order of the snapshot after JOIN and INFO:
-    /// `topic`, `public`, `guests`, `retention`, `e2ee`, `send` (1.4, 6.1,
-    /// 6.2). `e2ee` is always `no` until encrypted rooms (12) are
-    /// supported, and `history` exists only in encrypted rooms.
-    pub fn to_settings(&self) -> [RoomSetting; 6] {
-        [
+    /// `topic`, `public`, `guests`, `retention`, `e2ee`, then `history` in
+    /// an encrypted room only, then `send` (1.4, 6.1, 6.2).
+    pub fn to_settings(&self) -> Vec<RoomSetting> {
+        let mut settings = vec![
             RoomSetting::Topic(self.topic.clone()),
             RoomSetting::Public(self.public),
             RoomSetting::Guests(self.guests),
             RoomSetting::Retention(self.retention),
-            RoomSetting::E2ee(false),
-            RoomSetting::Send(self.send),
-        ]
+            RoomSetting::E2ee(self.e2ee),
+        ];
+        if self.e2ee {
+            settings.push(RoomSetting::History(self.history));
+        }
+        settings.push(RoomSetting::Send(self.send));
+        settings
     }
 }
 
@@ -212,6 +230,8 @@ pub struct RoomRecord {
     pub invites: Vec<Uid>,
     /// The identities banned from the room (6.4), in order.
     pub bans: Vec<Uid>,
+    /// Where its group is, if it is encrypted (12.5).
+    pub group: Option<GroupMeta>,
 }
 
 /// The result of [`Store::create_room`].
@@ -284,6 +304,24 @@ pub enum EventKind {
         /// The new role.
         role: Role,
     },
+    /// ENC (12.8).
+    Enc {
+        /// The epoch whose history key encrypts it.
+        epoch: u64,
+        /// The payload. `None` once deleted (5.4).
+        payload: Option<Ciphertext>,
+        /// The `frank` tag. `None` once deleted (5.4).
+        frank: Option<Frank>,
+        /// The attached file (5.6, 12.11).
+        file: Option<Attachment>,
+    },
+    /// COMMIT (12.5).
+    Commit {
+        /// The epoch the commit started.
+        epoch: u64,
+        /// The commit.
+        commit: CommitMessage,
+    },
 }
 
 impl EventKind {
@@ -300,6 +338,8 @@ impl EventKind {
             EventKind::Unban { .. } => "UNBAN",
             EventKind::Set(_) => "SET",
             EventKind::Role { .. } => "ROLE",
+            EventKind::Enc { .. } => "ENC",
+            EventKind::Commit { .. } => "COMMIT",
         }
     }
 }
@@ -349,8 +389,9 @@ impl StoredEvent {
     /// receiver sees it, with id `id` for the `id` tag of JOIN (6.1). A
     /// deleted message is a placeholder: empty text and no file (5.4).
     ///
-    /// Only MSG and DELETE happen in direct conversations. Any other event
-    /// there is bad data, and gives [`StoreError::Corrupt`].
+    /// Only MSG, DELETE, ENC and COMMIT happen in direct conversations.
+    /// Any other event there is bad data, and gives
+    /// [`StoreError::Corrupt`].
     pub fn to_event(&self, conv: impl Into<risala_proto::names::Conv>, id: &Id) -> Result<Event> {
         let conv = conv.into();
         let room = || match &conv {
@@ -416,6 +457,27 @@ impl StoredEvent {
                 uid: uid.clone(),
                 role: *role,
             },
+            EventKind::Enc {
+                epoch,
+                payload,
+                frank,
+                file,
+            } => {
+                let live = !self.deleted;
+                EventBody::Enc(Encrypted {
+                    conv: conv.clone(),
+                    epoch: *epoch,
+                    payload: payload.clone().filter(|_| live),
+                    frank: frank.filter(|_| live),
+                    file: file.clone().filter(|_| live),
+                    deleted: self.deleted,
+                })
+            }
+            EventKind::Commit { epoch, commit } => EventBody::Commit {
+                conv: conv.clone(),
+                epoch: *epoch,
+                commit: commit.clone(),
+            },
         };
         Ok(Event::new(
             EventMeta {
@@ -425,6 +487,12 @@ impl StoredEvent {
             },
             body,
         ))
+    }
+
+    /// Whether this is a message, MSG or ENC, that is not deleted (5.4,
+    /// 5.8).
+    pub fn is_live_message(&self) -> bool {
+        !self.deleted && matches!(self.kind, EventKind::Msg { .. } | EventKind::Enc { .. })
     }
 
     /// Whether this is a MSG that is not an edit or a reaction, and so may
@@ -480,9 +548,17 @@ pub enum BlockAdded {
 ///
 /// M4's methods are in the supertraits [`MessageStore`], [`ModerationStore`],
 /// [`ReportStore`] and [`AdminStore`], one per area of work, and those of
-/// encrypted conversations (M5a) in [`E2eeStore`].
+/// encrypted conversations (M5a) in [`E2eeStore`] and [`GroupStore`].
 pub trait Store:
-    MessageStore + ModerationStore + ReportStore + AdminStore + E2eeStore + Send + Sync + 'static
+    MessageStore
+    + ModerationStore
+    + ReportStore
+    + AdminStore
+    + E2eeStore
+    + GroupStore
+    + Send
+    + Sync
+    + 'static
 {
     /// Returns the server settings (10.6), first storing `defaults` for any
     /// that are not stored yet. This is how the configuration file's

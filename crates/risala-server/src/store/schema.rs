@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -482,6 +482,109 @@ CREATE TABLE backups (
     blob    BLOB NOT NULL CHECK (length(blob) = 84),
     PRIMARY KEY (uid, conv_id, epoch, key_id)
 ) WITHOUT ROWID;
+"#;
+
+/// Version 9: encrypted conversations themselves (Section 12): ENC and
+/// COMMIT events, encrypted rooms' settings, each group's public state,
+/// and what reports of ENC events keep (5.8).
+pub(super) const V9: &str = r#"
+-- Events gain the verbs ENC (12.8) and COMMIT (12.5), so the table is
+-- made again with a wider CHECK. `epoch` is the epoch of an ENC, or the
+-- epoch a COMMIT started. `frank` is an ENC's franking commitment, 48
+-- bytes, gone once it is deleted (5.4). An ENC's payload, and a COMMIT's
+-- commit, are the event's text, in base64, so DELETE erases a payload as
+-- it erases a MSG's text.
+CREATE TABLE events_v9 (
+    conv      INTEGER NOT NULL REFERENCES conversations (conv) ON DELETE CASCADE,
+    seq       INTEGER NOT NULL CHECK (seq >= 1),
+    t         INTEGER NOT NULL,
+    author    TEXT NOT NULL,
+    verb      TEXT NOT NULL CHECK (verb IN ('MSG', 'DELETE', 'JOIN', 'PART', 'INVITE',
+                                            'KICK', 'BAN', 'UNBAN', 'SET', 'ROLE',
+                                            'ENC', 'COMMIT')),
+    relation  TEXT CHECK (relation IN ('reply', 'edit', 'react')),
+    target    INTEGER,
+    subject   TEXT,
+    arg       TEXT,
+    file_url  TEXT,
+    file_type TEXT,
+    file_size INTEGER,
+    deleted   INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    epoch     INTEGER CHECK (epoch >= 0),
+    frank     BLOB CHECK (frank IS NULL OR length(frank) = 48),
+    CHECK ((verb IN ('ENC', 'COMMIT')) = (epoch IS NOT NULL)),
+    PRIMARY KEY (conv, seq)
+) WITHOUT ROWID;
+INSERT INTO events_v9 (conv, seq, t, author, verb, relation, target, subject, arg,
+                       file_url, file_type, file_size, deleted)
+    SELECT conv, seq, t, author, verb, relation, target, subject, arg,
+           file_url, file_type, file_size, deleted FROM events;
+DROP TABLE events;
+ALTER TABLE events_v9 RENAME TO events;
+CREATE INDEX events_target ON events (conv, target) WHERE target IS NOT NULL;
+CREATE INDEX events_author ON events (author, t);
+CREATE INDEX events_time ON events (conv, t);
+-- HISTORY only=commit (7.2).
+CREATE INDEX events_commits ON events (conv, seq) WHERE verb = 'COMMIT';
+
+-- An encrypted room (6.2, 12.3): `e2ee` once INIT has made its group, and
+-- `history`, which exists only then. `send` is already here.
+ALTER TABLE room_settings
+    ADD COLUMN e2ee INTEGER NOT NULL DEFAULT 0 CHECK (e2ee IN (0, 1));
+ALTER TABLE room_settings
+    ADD COLUMN history TEXT NOT NULL DEFAULT 'shared' CHECK (history IN ('shared', 'joined'));
+
+-- Every group id INIT ever accepted (12.5). Rows are never deleted, so a
+-- group id is refused the second time, even after its conversation is
+-- gone.
+CREATE TABLE group_ids (
+    group_id BLOB PRIMARY KEY
+) WITHOUT ROWID;
+
+-- The group of an encrypted conversation (12.5): its public state as
+-- OpenMLS keeps it, each part encoded with MessagePack, and the GroupInfo
+-- sent with the last commit. `seq` is the seq of the COMMIT event that
+-- started the current epoch, 0 in epoch 0.
+CREATE TABLE groups (
+    conv             INTEGER PRIMARY KEY REFERENCES conversations (conv) ON DELETE CASCADE,
+    group_id         BLOB NOT NULL UNIQUE REFERENCES group_ids (group_id),
+    epoch            INTEGER NOT NULL CHECK (epoch >= 0),
+    seq              INTEGER NOT NULL CHECK (seq >= 0),
+    group_info       TEXT NOT NULL,
+    tree             BLOB NOT NULL,
+    context          BLOB NOT NULL,
+    interim_hash     BLOB NOT NULL,
+    confirmation_tag BLOB NOT NULL
+);
+
+-- The leaves of each group (12.2): whose device each one is. Written with
+-- the group, so that ENC can check its sender and the leaves that must go
+-- (12.6, 12.8) without reading the tree.
+CREATE TABLE group_leaves (
+    conv       INTEGER NOT NULL REFERENCES groups (conv) ON DELETE CASCADE,
+    leaf       INTEGER NOT NULL CHECK (leaf >= 0),
+    uid        TEXT NOT NULL,
+    device_key TEXT NOT NULL,
+    PRIMARY KEY (conv, leaf),
+    UNIQUE (conv, device_key)
+) WITHOUT ROWID;
+CREATE INDEX group_leaves_device ON group_leaves (uid, device_key);
+
+-- Device keys the server knows have left their identity's key file (4.7,
+-- 4.8, 12.6): a leaf with one must be removed before anyone sends ENC in
+-- its group. A key added back is taken off the list.
+CREATE TABLE removed_keys (
+    uid        TEXT NOT NULL,
+    device_key TEXT NOT NULL,
+    PRIMARY KEY (uid, device_key)
+) WITHOUT ROWID;
+
+-- What a report keeps of an ENC event (5.8): its verb, epoch and franking
+-- commitment. Reports of MSG events keep 'MSG' and no epoch.
+ALTER TABLE reports
+    ADD COLUMN ev_verb TEXT NOT NULL DEFAULT 'MSG' CHECK (ev_verb IN ('MSG', 'ENC'));
+ALTER TABLE reports ADD COLUMN ev_epoch INTEGER CHECK (ev_epoch >= 0);
+ALTER TABLE reports ADD COLUMN ev_frank BLOB CHECK (ev_frank IS NULL OR length(ev_frank) = 48);
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.

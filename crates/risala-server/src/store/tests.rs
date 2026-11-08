@@ -641,6 +641,7 @@ fn settings_roles_and_bans_follow_events() {
             guests: GuestAccess::None,
             retention: RoomRetention::Days(std::num::NonZeroU32::new(7).unwrap()),
             send: risala_proto::types::SendMode::Mods,
+            ..RoomSettings::new()
         }
     );
     assert_eq!(r.roles, [(bob.clone(), Role::Mod)]);
@@ -1283,4 +1284,202 @@ fn is_blocked_matches_identities_and_domains() {
             .is_blocked(&uid("bob@example.org"), &uid("spam@example.net"))
             .unwrap()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Groups (12.5)
+
+fn group(id: u8, epoch: u64, part: u8) -> GroupRecord {
+    GroupRecord {
+        group_id: vec![id; 32],
+        meta: GroupMeta { epoch, seq: None },
+        group_info: risala_proto::mls::GroupInfo::from_bytes(&[part; 9]).unwrap(),
+        parts: GroupParts {
+            tree: vec![part, 1],
+            context: vec![part, 2],
+            interim_hash: vec![part, 3],
+            confirmation_tag: vec![part, 4],
+        },
+    }
+}
+
+fn leaf(index: u32, who: &str, n: u8) -> GroupLeaf {
+    GroupLeaf {
+        index,
+        uid: uid(who),
+        key: key(n),
+    }
+}
+
+fn commit_event(from: &str, epoch: u64) -> NewEvent {
+    event(
+        from,
+        EventKind::Commit {
+            epoch,
+            commit: risala_proto::mls::CommitMessage::from_bytes(&[7; 12]).unwrap(),
+        },
+    )
+}
+
+#[test]
+fn groups_are_stored_with_their_events() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let general = room("#general");
+    let Created::New(r) = store.create_room(&general, &uid("a@x.org"), t(0)).unwrap() else {
+        panic!("not created");
+    };
+    let other = match store
+        .create_room(&room("#other"), &uid("a@x.org"), t(0))
+        .unwrap()
+    {
+        Created::New(r) => r,
+        Created::Exists(_) => panic!("not created"),
+    };
+    store
+        .append(
+            r.key,
+            &event(
+                "a@x.org",
+                EventKind::Invite {
+                    uid: uid("b@x.org"),
+                },
+            ),
+        )
+        .unwrap();
+    assert_eq!(store.group(r.key).unwrap(), None);
+
+    let set = event("a@x.org", EventKind::Set(RoomSetting::E2ee(true)));
+    let g0 = group(1, 0, 10);
+    let init = store
+        .init_group(r.key, &g0, &[leaf(0, "a@x.org", 1)], &[set], true)
+        .unwrap();
+    assert_eq!(init, GroupInit::Done(vec![seq(3)]));
+    assert_eq!(store.group(r.key).unwrap(), Some(g0.clone()));
+    let stored = store.room(&general).unwrap().unwrap();
+    assert!(stored.settings.e2ee);
+    assert!(stored.invites.is_empty(), "INIT ends invitations");
+    assert_eq!(
+        stored.group,
+        Some(GroupMeta {
+            epoch: 0,
+            seq: None
+        })
+    );
+    // A second group for the room, or the same id for another.
+    assert_eq!(
+        store
+            .init_group(r.key, &group(2, 0, 10), &[], &[], false)
+            .unwrap(),
+        GroupInit::Exists
+    );
+    assert_eq!(
+        store.init_group(other.key, &g0, &[], &[], false).unwrap(),
+        GroupInit::IdTaken
+    );
+
+    // A commit that adds b's device 2, with its Welcome.
+    let commit = GroupCommit {
+        from_epoch: 0,
+        group: group(1, 1, 20),
+        leaves: vec![leaf(0, "a@x.org", 1), leaf(1, "b@x.org", 2)],
+        event: commit_event("a@x.org", 1),
+        then: vec![event(
+            "a@x.org",
+            EventKind::Invite {
+                uid: uid("b@x.org"),
+            },
+        )],
+        welcome: Some(NewWelcome {
+            welcome: risala_proto::mls::Welcome::from_bytes(&[3; 9]).unwrap(),
+            tree: risala_proto::mls::RatchetTree::from_bytes(&[4; 9]).unwrap(),
+            devices: vec![(uid("b@x.org"), key(2))],
+        }),
+        removed: vec![],
+    };
+    let done = store.commit_group(r.key, &commit).unwrap().unwrap();
+    assert_eq!(done.seqs, [seq(4), seq(5)]);
+    assert_eq!(done.welcome_ids.len(), 1);
+    let g1 = store.group(r.key).unwrap().unwrap();
+    assert_eq!(
+        g1.meta,
+        GroupMeta {
+            epoch: 1,
+            seq: Some(seq(4))
+        }
+    );
+    assert_eq!(g1.parts, group(1, 1, 20).parts);
+    assert_eq!(
+        store.pending_welcomes(&uid("b@x.org"), &key(2)).unwrap(),
+        done.welcome_ids
+    );
+    match store.event(r.key, seq(4)).unwrap().unwrap().kind {
+        EventKind::Commit { epoch: 1, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(store.has_leaf(r.key, &uid("b@x.org"), &key(2)).unwrap());
+    assert!(!store.has_leaf(r.key, &uid("b@x.org"), &key(1)).unwrap());
+    assert_eq!(
+        store.leaf_uids(r.key).unwrap(),
+        [uid("a@x.org"), uid("b@x.org")]
+    );
+
+    // The same commit again finds the group in another epoch.
+    assert_eq!(store.commit_group(r.key, &commit).unwrap(), None);
+    assert_eq!(store.room(&general).unwrap().unwrap().head, Some(seq(5)));
+
+    // A key that left its key file marks its leaf; adding it back clears it.
+    assert!(!store.has_removed_leaf(r.key).unwrap());
+    assert_eq!(store.stored_devices(&uid("b@x.org")).unwrap(), [key(2)]);
+    store.forget_device(&uid("b@x.org"), &key(2)).unwrap();
+    assert!(store.has_removed_leaf(r.key).unwrap());
+    assert!(
+        store
+            .pending_welcomes(&uid("b@x.org"), &key(2))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.stored_devices(&uid("b@x.org")).unwrap().is_empty());
+
+    // Removing b's leaf 2, and adding its device 3.
+    let commit = GroupCommit {
+        from_epoch: 1,
+        group: group(1, 2, 30),
+        leaves: vec![leaf(0, "a@x.org", 1), leaf(1, "b@x.org", 3)],
+        event: commit_event("a@x.org", 2),
+        then: vec![],
+        welcome: Some(NewWelcome {
+            welcome: risala_proto::mls::Welcome::from_bytes(&[5; 9]).unwrap(),
+            tree: risala_proto::mls::RatchetTree::from_bytes(&[6; 9]).unwrap(),
+            devices: vec![(uid("b@x.org"), key(3))],
+        }),
+        removed: vec![(uid("b@x.org"), key(2))],
+    };
+    store.commit_group(r.key, &commit).unwrap().unwrap();
+    assert!(!store.has_removed_leaf(r.key).unwrap());
+    assert_eq!(
+        store
+            .pending_welcomes(&uid("b@x.org"), &key(3))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Removing device 3 ends its pending Welcome of the room (12.7).
+    let commit = GroupCommit {
+        from_epoch: 2,
+        group: group(1, 3, 40),
+        leaves: vec![leaf(0, "a@x.org", 1)],
+        event: commit_event("a@x.org", 3),
+        then: vec![],
+        welcome: None,
+        removed: vec![(uid("b@x.org"), key(3))],
+    };
+    store.commit_group(r.key, &commit).unwrap().unwrap();
+    assert!(
+        store
+            .pending_welcomes(&uid("b@x.org"), &key(3))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.leaf_uids(r.key).unwrap(), [uid("a@x.org")]);
 }

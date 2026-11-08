@@ -183,12 +183,14 @@ pub trait E2eeStore {
 
     // ---- Devices (4.4, 4.7) ----
 
-    /// The device keys of `uid` that have KeyPackages or pending Welcomes,
-    /// whatever their lifetimes, in the byte order of their base64.
+    /// The device keys of `uid` that have KeyPackages, pending Welcomes, or
+    /// leaves in groups not yet known to be removed, whatever their
+    /// lifetimes, in the byte order of their base64.
     fn stored_devices(&self, uid: &Uid) -> Result<Vec<PublicKey>>;
 
     /// Deletes the KeyPackages and pending Welcomes of the device `uid`
-    /// and `key`, whose key left the identity's key file (4.7, 12.7).
+    /// and `key`, whose key left the identity's key file (4.7, 12.7), and
+    /// notes that its leaves must be removed (12.6).
     fn forget_device(&self, uid: &Uid, key: &PublicKey) -> Result<()>;
 
     // ---- Backups (12.10) ----
