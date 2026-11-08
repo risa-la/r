@@ -289,10 +289,10 @@ async fn rooms_and_reports() {
     );
     assert_eq!(within(general.unban("troll@example.com")).await.unwrap(), 9);
     // The events were stored before each answer.
-    let kinds: Vec<(u64, EventKind, Option<String>)> = general
-        .messages(None, 20)
-        .unwrap()
-        .messages
+    let messages = general.messages(None, 20).unwrap().messages;
+    let role = messages.iter().find(|m| m.seq == 5).unwrap();
+    assert_eq!(role.text.as_deref(), Some("mod"));
+    let kinds: Vec<(u64, EventKind, Option<String>)> = messages
         .into_iter()
         .filter(|m| m.seq > 4)
         .map(|m| (m.seq, m.kind, m.subject))

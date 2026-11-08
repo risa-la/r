@@ -791,8 +791,9 @@ pub struct Message {
     /// What kind of event it is.
     pub kind: EventKind,
     /// The text, unescaped: a message's current text after edits (empty
-    /// when deleted), the reason of a PART, KICK or BAN, or `key value`
-    /// of a SET. `None` otherwise.
+    /// when deleted), the reason of a PART, KICK or BAN, `key value` of a
+    /// SET, or the role a ROLE gives (`owner`, `mod` or `member`). `None`
+    /// otherwise.
     pub text: Option<String>,
     /// The uid an INVITE, KICK, BAN, UNBAN or ROLE acts on.
     pub subject: Option<String>,
@@ -866,7 +867,9 @@ impl From<TimelineItem> for Message {
                 None,
                 None,
             ),
-            EventBody::Role { uid, .. } => (EventKind::Role, None, Some(uid), None),
+            EventBody::Role { uid, role, .. } => {
+                (EventKind::Role, Some(role.to_string()), Some(uid), None)
+            }
             _ => (EventKind::Other, None, None, None),
         };
         let subject = subject.map(|u| u.to_string());
