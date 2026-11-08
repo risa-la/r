@@ -80,10 +80,14 @@ Every conversation uses one MLS cipher suite, `0x0020` [MLS-PQ]:
   `mls10`, whatever the server accepted.
 - `<keypackage>`, `<groupinfo>`, `<message>` and `<welcome>` in this
   document are each an MLSMessage [RFC9420] in base64 with padding
-  [RFC4648]. `<tree>` is a ratchet tree, encoded as the data of a
-  `ratchet_tree` extension (the `optional<Node>` vector of [RFC9420]),
-  in base64 with padding. Each of them may instead be a blob-ref, naming
-  a blob that holds the same bytes without base64 (12.12).
+  [RFC4648], except where 12.6 and 12.8 say otherwise: a `<welcome>`
+  is a SealedWelcome for a KeyPackage that KEYPKG GET handed out, and an
+  AnnotatedWelcome with `light=yes`, and a commit's `<message>` is an
+  AnnotatedCommit on a FETCH with `leaf`. `<tree>` is a ratchet tree,
+  encoded as the data of a `ratchet_tree` extension (the
+  `optional<Node>` vector of [RFC9420]), in base64 with padding. Each
+  of them may instead be a blob-ref, naming a blob that holds the same
+  bytes without base64 (12.12).
 
 ### 12.3. Credentials and Leaf Keys
 
@@ -122,9 +126,13 @@ use its device key, or any key it uses elsewhere, as a leaf key.
   been Updated since it was added: its `leaf_node_source` [RFC9420] is
   still `key_package`. In an epochal group, a leaf node may bring one
   only if the `t` of the post that carries it (5.2) falls in a later
-  period (12.10) than the leaf's previous `updated`, so at most once a
-  period. Which periods a device must rotate in is up to the device,
-  and not checked.
+  period (12.10) than the time 10 minutes before the leaf's previous
+  `updated`. Since `updated` may be up to 10 minutes after `t`, this
+  keeps a device whose clock runs a little ahead, and that commits just
+  before midnight, from being barred for the whole next period. So a
+  leaf changes its signature key at most once a period, or twice if the
+  first change comes in the period's first 20 minutes. Which periods a
+  device must rotate in is up to the device, and not checked.
 - A fresh leaf node keeps the leaf's index. Pseudonyms are not part of
   the leaf: 7.3 says how they are found.
 - Two leaves of a group never share a signature key [RFC9420].
@@ -201,7 +209,10 @@ device carries a profile.
   or the Update proposal (5.2). So a device sets it from its clock, or, if its clock disagrees
   by minutes with the `t` of the posts it receives, from the time those
   suggest, and never below the leaf's previous `updated`. In a
-  KeyPackage it is the time the KeyPackage was made, and devices treat
+  KeyPackage it is the time the KeyPackage was made, except in a
+  last-resort one (12.5), where it is the start of the period (12.10)
+  before the one it was made in, so that a device added from it can
+  change its signature key at once in an epochal group. Devices treat
   as invalid a commit that adds a KeyPackage whose `updated` is more
   than 10 minutes after the `t` of the commit's post (12.7).
 - **`streak`** counts the epochs in a row, up to and including the one
@@ -358,8 +369,9 @@ upload more when KEYPKG COUNT reports fewer than five. Servers delete
 KeyPackages whose lifetime has ended. Every KEYPKG GET uses KeyPackages
 up, and once a device's ordinary ones are gone, groups fall back to its
 last-resort one. So servers MUST rate-limit KEYPKG GET per network
-address and per `<uid>` asked for (`ERR rate-limited`), and SHOULD
-require proof of work for it on anonymous and guest connections (4.1).
+address and per `<uid>` asked for (`ERR rate-limited`), and will
+require proof of work for it on anonymous and guest connections once a
+later draft specifies it (4.1).
 
 **Lifetimes.** A KeyPackage's lifetime is acceptable if it spans at most
 12 weeks and one hour (7261200 seconds from `not_before` to `not_after`),
@@ -454,22 +466,24 @@ outside the group can, and refuses one that fails:
    gives the post its `t`) and `streak` of the committer, of each Update
    and of each added leaf (12.3), and that no guest's leaf commits or
    proposes an Update (`ERR forbidden`).
-4. **It comes from the leaf's own device.** A commit, an external
-   commit or an Update proposal whose sender's credential names an
-   identity is posted on a signed-in connection of the device that the
-   credential names, and a join proposal whose credential names a guest
-   on that guest's connection (`ERR forbidden`). This is how the server
-   keeps a public room's commits to its identities' devices, and holds
-   bans and limits against them, without device bindings (12.3). It
-   tells the server nothing that the credential does not already show,
-   and proves nothing to anyone else. A join proposal whose credential
-   names an identity may come from any anonymous or signed-in
-   connection: the server does not check it, and devices treat the leaf
-   as unverified until it attests (12.10). A commit too large for a
-   line is first stored as a blob, over an anonymous connection (4.1,
-   12.12), and then posted on the signed-in one, which ties the two
-   connections together. That tells the server nothing the commit does
-   not, since the commit names its sender.
+4. **It comes from the leaf's own device.** A commit, an external commit
+   or an Update proposal whose sender's credential names an identity is
+   posted on a signed-in connection of the device that the credential
+   names, and a join proposal whose credential names a guest on that
+   guest's connection (`ERR forbidden`). This is how the server keeps a
+   public room's commits to its identities' devices, and holds bans and
+   limits against them, without device bindings (12.3). It tells the
+   server nothing that the credential does not already show, and proves
+   nothing to anyone else. Devices cannot check it, so a server that
+   skips it can commit in any identity's name (12.7, "Commits in
+   another's name", Section 14). A join proposal whose credential names
+   an identity may come from any anonymous or signed-in connection: the
+   server does not check it, and devices treat the leaf as unverified
+   until it attests (12.10). A commit too large for a line is first
+   stored as a blob, over an anonymous connection (4.1, 12.12), and then
+   posted on the signed-in one, which ties the two connections together.
+   That tells the server nothing the commit does not, since the commit
+   names its sender.
 5. **A commit carries the new GroupInfo,** with the `external_pub`
    extension and no `ratchet_tree` extension, as the option
    `groupinfo=<groupinfo>` of POST. Its group context must be the one
@@ -669,6 +683,13 @@ checks:
     by reference, by any member whose leaf is an identity's;
   - never a leaf whose credential names a banned identity, nor, in a
     public room whose `guests` is `none`, a guest's.
+
+  Whichever of these rules allows it, in a private room, a device of an
+  identity listed in `owners`, before or after the commit, is added only
+  in a commit by a leaf of that identity or of an owner, and a device of
+  an identity listed in `mods` only by a leaf of that identity, of an
+  owner or of a moderator. Whoever adds a leaf may hold it (below), so
+  no Add hands anyone control of a leaf with a role above its own.
 - **One leaf per device.** Outside public rooms, no two leaves of the
   group have the same uid and `device_id` after the commit. In a public
   room they may, until one is removed as a copy (below).
@@ -688,7 +709,12 @@ checks:
     (below). A commit removes for a check the leaves of **one**
     identity at most. Every such reason concerns one identity's leaves,
     and the limit keeps any one member from emptying a group in a
-    single commit;
+    single commit. In a room, a leaf of an identity listed in `owners`
+    is removed for a check only in a commit by a leaf of that identity
+    or of an owner, and a leaf of an identity listed in `mods` only by a
+    leaf of that identity, of an owner or of a moderator, as of the
+    epoch the commit is for. So no member can take out, by a claim that
+    nobody can check, those who could add it back (6.3);
   - in a public room, a **copy**: a leaf with the same uid and
     `device_id` as another leaf that has committed or been Updated since
     it was added (its `leaf_node_source` is `commit` or `update`), and
@@ -765,20 +791,24 @@ device checks:
   (4.4) in its identity's chain, as far as the device has accepted it.
   A device MUST NOT show a message, or act on a line, from a leaf of a
   device removed by record (12.9).
-- **Removals for a check.** A commit does not say why it removed a
-  leaf for a check, so for each such leaf the device looks for a reason
-  that it can see: the leaf's device has been removed by record (4.4),
-  its identity's chain ends with a `retire` record (4.9), its device
-  binding does not verify, or its identity is forked or has its keys
-  missing (12.14); the leaf posted RESYNC; or the leaf is an impostor to
-  the device itself (below). If it finds none, it cannot tell whether
-  another device saw a fork, missing keys or an impostor that it does
-  not, since what one device sees of a key file or a log another may
-  not. The removal then stands, as one it could not check, and the
-  device warns its user, naming the member who made the commit. Only
-  for a leaf of its own identity does a device know: if that leaf's
-  device is still current, and the identity is neither forked nor
-  missing its keys, the removal failed.
+- **Removals for a check.** A commit does not say why it removed a leaf
+  for a check, so for each such leaf the device looks for a reason that
+  it can see: the leaf's device has been removed by record (4.4), its
+  identity's chain ends with a `retire` record (4.9), its device binding
+  does not verify, its identity is forked or has its keys missing
+  (12.14), or a record of its device was still pending for the device 2
+  hours after it first needed it, or the device had to wait for it
+  before accepting it, so that another device may have given up on it
+  after 2 hours (below); the leaf posted RESYNC; or the leaf is an
+  impostor to the device itself (below). If it finds none, it cannot
+  tell whether another device saw a fork, missing keys, a late record or
+  an impostor that it does not, since what one device sees of a key file
+  or a log another may not. The removal then stands, as one it could not
+  check, and the device warns its user that it disagrees with the
+  removal, naming the member who made the commit. Only for a leaf of its
+  own identity does a device know: if that leaf's device is still
+  current, and the identity is neither forked nor missing its keys, the
+  removal failed.
 
 Public rooms have no key checks, since their leaves carry no device
 binding: attestation does that work there (12.10).
@@ -812,10 +842,19 @@ repairs it in a commit:
   (12.5), as its own identity's. A removal of another identity's leaves
   that it could not check stands. If that identity has no leaf left in
   a room, the devices of owners and moderators SHOULD offer their users
-  to add its devices again (6.1), once its keys are present and no fork
-  is known (12.14).
+  to add its devices again (6.1), as far as the Adds checks let them,
+  once its keys are present and no fork is known (12.14). Nobody else
+  can: in a private room, an identity with no leaf left comes back only
+  by such an Add, and an identity listed in `owners` only by an
+  owner's (6.3).
 - **The committer's device had been removed by record:** it removes the
   committer's leaf as an impostor (below).
+
+A device makes a repair only where the group checks let it. Where they
+do not, as for a plain member's device and a leaf of an owner, it warns
+its user, hides what the leaf sends, as for an identity it cannot check
+(12.14), and keeps sending; the leaf's own identity, or an owner or
+moderator as the Removes checks allow, makes the repair.
 
 **Leaves that use authority.** Whoever adds a device builds its leaf
 from the device's KeyPackage, and the device binding does not cover the
@@ -825,9 +864,9 @@ role of its identity, until devices confirm the leaf (12.10). Devices
 therefore check every leaf that uses authority:
 
 - A device challenges (12.10), at once, every new leaf of its own
-  identity, in every group, and every leaf that it has not confirmed
-  and that makes an **authority commit**: a commit that only a role
-  allows (6.3), that removes leaves of the committer's own identity
+  identity, in every pairwise group, and every leaf that it has not
+  confirmed and that makes an **authority commit**: a commit that only a
+  role allows (6.3), that removes leaves of the committer's own identity
   other than its own, or that removes leaves of another identity for a
   check: outside public rooms, any removal of another identity's leaf
   that the committer's role does not allow, other than of a stale or
@@ -835,17 +874,22 @@ therefore check every leaf that uses authority:
   role allows, such as a DELETE of someone else's message (5.4). In an
   epochal group, where there is no challenge, the leaf's device sends
   ATTEST (12.10), in a message of its own if it has nothing else to
-  send, within an hour of each authority commit it makes in a period
-  for which it has not attested yet.
-- A leaf that answers wrongly, or not within an hour, is an
-  **impostor** to that device. The device shows that leaf's messages
-  and actions as unconfirmed, and warns the user, with what the leaf's
-  commits changed. After a random wait of up to 10 minutes, unless
-  another device has done so first, it removes the leaf, for a check
-  (above). Any member may do this, whatever its role: removing a leaf
-  never lets anyone new read, and the leaf's own identity adds its
-  device again. A leaf whose device has been removed by record (above)
-  is removed the same way.
+  send, within an hour of each authority commit it makes in a period for
+  which it has not attested yet. There, a device expects a valid ATTEST
+  in the first message of each new leaf of its own identity.
+- A leaf that answers wrongly, or not within an hour, or a new leaf of
+  the device's own identity that sends in an epochal group without a
+  valid ATTEST, is an **impostor** to that device. The device shows that
+  leaf's messages and actions as unconfirmed, and warns the user, with
+  what the leaf's commits changed. After a random wait of up to 10
+  minutes, unless another device has done so first, it removes the leaf,
+  for a check (above). Any member may do this, whatever its role, except
+  that in a room only those whom the Removes checks name remove a leaf
+  of an owner or a moderator: removing a leaf never lets anyone new
+  read. The leaf's own identity adds its device again if it still has a
+  leaf in the group; otherwise, in a private room, only an owner or
+  moderator can (above). A leaf whose device has been removed by record
+  (above) is removed the same way.
 - Removing an impostor does not undo what it did. That takes ordinary
   commits, which need the role that each change needs now (6.3): that
   of the impostor's own identity, whose devices hold the role that the
@@ -857,10 +901,12 @@ therefore check every leaf that uses authority:
   KeyPackages, the devices whose leaves those commits removed. The
   group judges that commit like any other, so a member without the role
   cannot undo an owner's moderation by calling the owner an impostor.
-- A device that sees a leaf that it has confirmed removed for a check
-  tells the user, and names the member who made the commit, since the
-  removal is then itself the abuse. The removed leaf's own identity
-  adds its device again (below).
+- A device that sees a leaf that it has confirmed removed for a check,
+  with no reason that it can see (above), tells the user, and names the
+  member who made the commit, since the removal may then itself be
+  abuse, or a disagreement over what each device has fetched. The
+  removed leaf's own identity adds its device again, where the Adds
+  checks let it (below).
 - A device that is welcomed to a group in which no leaf has the
   signature key of the KeyPackage it was added from does not join. It
   tells the user that someone may have added the device with a key of
@@ -869,13 +915,19 @@ therefore check every leaf that uses authority:
   credential names commits there (12.6), so a leaf can use authority in
   another's name only with the server's help or from a stolen device.
   Owners and moderators remove such a leaf within their roles, and the
-  identity's own devices as one of their own.
+  identity's own devices as one of their own. The server alone checks
+  who commits as whom there, so a server can commit in an owner's name,
+  and devices apply what it commits (Section 14). For the room's
+  content, they SHOULD keep the roles they had before such a leaf's
+  commits ("Commits in another's name", below).
 
-Only owners invite identities that are listed in `owners` or `mods`
-(above), so that an invitation never hands a moderator control of an
-owner's leaf. Until a device has confirmed a leaf, that leaf may still
-be held by whoever added it, with the role of the leaf's identity, for
-up to an hour after it first uses that role (Section 14).
+In a private room, only an owner, or the identity's own devices, add a
+device of an identity listed in `owners`, and only those or a moderator
+a device of one listed in `mods` (above), so that no Add hands anyone
+control of a leaf with a role above its own. Until a device has
+confirmed a leaf, that leaf may still be held by whoever added it, with
+the role of the leaf's identity, for up to an hour after it first uses
+that role (Section 14).
 
 **Commits a device cannot process.** A commit can fail MLS for some
 devices only: its committer may, for example, encrypt its path secrets
@@ -896,10 +948,11 @@ conversation or a private room:
   new KeyPackage (12.5), as its own identity's. If the identity has no
   other leaf in the group, the other participant's device does the same
   in a direct conversation, and an owner's or moderator's in a room,
-  removing the leaf for a check (above). Other members only warn their
-  users: a plain member who could replace another identity's leaf could
-  also hold the new one (above). The device then gets a Welcome, and
-  asks its own devices for what it missed (12.13).
+  removing the leaf for a check (above), as far as the Removes and Adds
+  checks let it: only an owner's for an owner's device. Other members
+  only warn their users: a plain member who could replace another
+  identity's leaf could also hold the new one (above). The device then
+  gets a Welcome, and asks its own devices for what it missed (12.13).
 - Devices tell the user when one member's commits keep leading to RESYNC
   lines from others: that member may be cutting devices out on purpose.
 
@@ -979,6 +1032,22 @@ kept:
   the device stays in the room. Commits it judges by the group, as every
   other device does.
 
+**Commits in another's name.** In a public room, only the server checks
+that a commit or Update comes from the device its credential names
+(12.6), and the group checks do not depend on attestation. So a server
+can join, commit and Update under a credential that names an owner's
+device, and every device applies what it commits. A device SHOULD
+treat what such a leaf does as it treats a change by the server above.
+Once a leaf that made an authority commit is an impostor to it, having
+sent no valid ATTEST within the hour (above), the device keeps, for the
+room's content, the roles it held before that leaf's first authority
+commit: an identity that gained `owner` or `mod` through the leaf's
+commits counts as a plain member for `send mods`, for deleting others'
+messages and for how the device shows it, and a ban that those commits
+made hides nobody. It shows the user what those commits changed. This
+is display only: commits it still judges by the group, so devices never
+split over it.
+
 A device that joins a public room for the first time has nothing to
 compare with, and takes the roles that the GroupInfo shows (Section
 14).
@@ -994,12 +1063,25 @@ identity's groups outside public rooms gets added:
 - Otherwise, any member's device that finds it, when it checks key
   files (12.14), and that the Adds checks let add it (above), adds it
   after a random wait of up to an hour, unless someone has done so
-  first. This is how a device that recovered an identity (4.8) gets
-  back into its conversations.
+  first. In a direct conversation that is either participant's device.
+  In a private room, while the identity keeps a leaf there, it is any
+  member's device for a plain member's devices, but only an owner's or
+  the identity's own for an owner's, and also a moderator's for a
+  moderator's; once the identity has no leaf left, only an owner's or a
+  moderator's, as an invitation, and only an owner's for an identity
+  listed in `owners`.
 - A device that commits the removal of an identity's devices removed by
-  record adds that identity's current devices without a leaf in the
-  same commit, where the Adds checks let it, so that the identity never
-  drops out of the group by accident.
+  record adds that identity's current devices without a leaf in the same
+  commit, where the Adds checks let it. In a private room they do not
+  let a plain member do so once the commit removes the identity's last
+  leaf, since added leaves do not count as kept.
+
+So a device that recovered an identity (4.8), or whose identity's
+leaves were all removed for a check, gets back into its direct
+conversations, where the other participant's devices add it, but into
+a private room in which its identity has no leaf left only when an
+owner or moderator adds it, and into one in which it was the only
+owner not at all (4.8, 6.3, Section 14).
 
 A device adds another identity's devices only from a key file that
 extends the head it holds for that identity (4.5), never a device it has
@@ -1036,8 +1118,12 @@ if that is later; but never later than the `t` of the commit's post.
   device computes the same value. Any member's device MAY remove stale
   leaves, within the bulk limit above. Outside public rooms, it MUST,
   in the same commit, add the same devices again from new KeyPackages,
-  for each that KEYPKG GET returns one. In a public room nobody adds
-  them: their devices join again by themselves (6.1).
+  for each that KEYPKG GET returns one, and so it removes there only
+  stale leaves that the Adds checks let it add again: a plain member's
+  device leaves those of owners and moderators to their own identity's
+  devices and to owners (and moderators, for moderators). In a public
+  room nobody adds them: their devices join again by themselves
+  (6.1).
 
 A device that finds it has fallen behind (7.4) uploads fresh
 KeyPackages, and waits to be added again. Once it is back in the
@@ -1507,9 +1593,12 @@ lines alone do not count, so a member that never sends is never
 challenged and costs nothing. There are three exceptions, where a device
 challenges a leaf at once, whether or not it sends: every leaf of the
 conversation with yourself, where every line counts (12.9); every new
-leaf of the device's own identity, in every group; and every leaf that
-makes an authority commit (12.7). Guest leaves have no attestation key,
-and are never challenged or confirmed.
+leaf of the device's own identity, in every pairwise group; and every
+leaf that makes an authority commit (12.7). In an epochal group, where
+there are no challenges, a device instead expects a valid ATTEST in the
+first message of each new leaf of its own identity, and treats one that
+sends without it as an impostor (12.7). Guest leaves have no attestation
+key, and are never challenged or confirmed.
 
 A device puts its pending CHALLENGE and ANSWER lines in its next message
 in the group, or, if it sends none, in a message of their own, at a
@@ -2063,25 +2152,39 @@ A device does not take the server's word for which keys belong to whom:
   checks of 12.7 let it. In a public
   room, devices join by themselves (6.1), and their leaves carry no
   device binding to check (12.10). An outage changes nothing.
-- An identity whose keys are missing (4.4), or that is forked (4.5), is
-  one the device cannot check. Until a valid key file is back, or the
-  user resolves the fork, the device tells the user why, and:
+- An identity other than the device's own whose keys are missing
+  (4.4), or that is forked (4.5), is one the device cannot check. Until
+  a valid key file is back, or the user resolves the fork, the device
+  tells the user why, and:
   - in a direct conversation with the identity, sends no messages. It
     still makes commits, including those that remove or repair leaves;
   - in a room, treats the identity's leaves as unverified, hides what
     they send, showing that it hid a message from an identity it cannot
     check, and keeps sending;
   - in a room that is not public, removes the identity's leaves, for
-    that key check (12.7). Removing a leaf never lets anyone new read,
-    and it keeps an identity that may be in someone else's hands from
-    reading what the room sends next. The identity's devices are added
-    again once its keys are back and no fork is known (12.7);
+    that key check (12.7), where the Removes checks let it: a leaf of an
+    identity listed in `owners` only if the device's identity is an
+    owner, and one listed in `mods` only if it is an owner or a
+    moderator. Removing a leaf never lets anyone new read, and it keeps
+    an identity that may be in someone else's hands from reading what
+    the room sends next. The other devices only hide and warn, so a
+    forked owner or moderator stays in the room, and reads it, until its
+    own devices or an owner (or moderator) remove it. Once its keys are
+    back and no fork is known, the identity's devices come back only as
+    12.7's Adds allow: where it has no leaf left, by an owner's or
+    moderator's Add, an owner's for an owner, which their devices offer
+    their users (12.7), and never by a plain member's;
   - in a public room, which has no key checks, if its identity is an
     owner or moderator, SHOULD ban the uid of a forked identity (6.4),
     and MAY kick one whose keys are missing.
 
   So an identity that forks its own chain, or takes its key file down,
   stops only its own direct conversations, not the rooms it is in.
+- If the device's own identity is forked or has its keys missing, the
+  device keeps sending in the conversation with yourself (5.1): ALERT,
+  RECORD and the other lines of 12.9 there, so that the identity's
+  devices can act on it. SIGNINGKEY and BACKUPKEY stay limited as 12.9
+  says. Other identities' devices treat it as above.
 - These fetches tell the host of each key file and log which network
   addresses look up which identities, and how often (Section 14). A
   device SHOULD fetch whole entry bundles and tiles rather than single
@@ -2133,6 +2236,10 @@ the owner's own devices watching it (4.5), and a new one is a notice.
 - A **new master key** (4.5) clears "verified". In a direct
   conversation and in a private room, the device stops sending until the
   user acknowledges the new key. In a public room, it shows a warning.
+  Once the user has acknowledged it, the device's head is the new chain,
+  and it adds the new chain's devices to private rooms where the Adds
+  checks of 12.7 let it. Section 14 says what this lets a member, or
+  its domain's controller, do.
 - A fork or a rollback (4.5) is treated as above, whether or not the
   identity was verified.
 - The pins and verified marks of an identity's devices are kept in step

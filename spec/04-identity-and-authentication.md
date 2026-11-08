@@ -107,8 +107,9 @@ over. So:
   connection, or any link between such a connection and a signed-in
   connection, a post, a follow, a mailbox, a token, a blob, an upload, a
   Welcome, a report or a push subscription.
-- A post is stored with its box, seq, time and message only, and a
-  commit with its `next` (5.2). A
+- A post is stored with its box, seq, time and message only, a
+  commit with its `next` (5.2), and a post with its `cid` for 24 hours
+  (7.6). A
   mailbox, blob, upload, Welcome or mailbox push subscription is stored
   without the connection or address that made it.
 - State kept per network address for rate limits and quotas is kept in
@@ -728,9 +729,9 @@ device until its user resolves it, for example by checking the safety
 number with the person (12.14) and choosing which keys to trust. The
 device tells the user, and treats a forked identity as 12.14 says: it
 stops sending in direct conversations with it, and in rooms it stops
-trusting the identity's leaves, and removes them outside public rooms,
-but keeps sending. So nobody can stop a room by forking their own
-chain.
+trusting the identity's leaves, and removes them outside public rooms
+where its role lets it (12.7), but keeps sending. So nobody can stop a
+room by forking their own chain.
 
 **Watching your own records.** At least one device of each identity MUST
 do the following at least once a day, and every device that comes back
@@ -1115,7 +1116,7 @@ PAIR GET <id>
   per network address (`ERR rate-limited`).
 
 ```
-C: pair put mxrq3bzf5kjw2ahd6uyc4en7ta AQDNnL2v…
+C: pair put mxrq3bzf5kjw2ahd6uyc4en7ta AVg4nL2v…
 S: OK
 C: pair get kbv4yqz7hd2cm6xw3rnfe5ug3a
 S: PAIR kbv4yqz7hd2cm6xw3rnfe5ug3a AUa1w0Ur…
@@ -1192,8 +1193,16 @@ the generation before, if there is one (12.13), and makes a new backup
 in the new generation; the backup also names the servers its
 conversations live on. Without a backup, the
 user names them. Once its records are accepted, it signs in to each,
-uploads KeyPackages, and the members of the identity's conversations add
-it (12.7).
+uploads KeyPackages, and the other participant of each direct
+conversation adds it (12.7). Private rooms are another matter. The
+`signing` record removes every old device by record, and members'
+devices remove those leaves, after which the identity has no leaf left
+there. A private room then takes it back only by an owner's or
+moderator's Add, and an owner's for an identity listed in `owners`. In
+a room where the identity was the only owner, nobody can: only an
+owner may remove an owner's leaves for a check, so its old leaves stay,
+and devices show nothing from them, though they can still read, and the
+identity cannot come back (6.3, 12.7, Section 14).
 
 **Changing the recovery key.** A user who thinks the recovery key may
 have leaked enters it on a device, which makes a new recovery key and
@@ -1247,8 +1256,10 @@ other people's devices remove an identity from their conversations for
 good (12.7). A device publishes one with KEYS PUT, which needs the
 recovery key, before UNREGISTER. A key file that is gone is only an
 identity's keys missing (4.4): contacts stop sending to it in direct
-conversations, take its leaves out of private rooms until the file is
-back, and warn (12.14), but its devices are never removed by record.
+conversations, take its leaves out of private rooms, and warn (12.14),
+but its devices are never removed by record. Once the file is back, a
+private room in which the identity has no leaf left takes it back only
+by an owner's or moderator's Add (12.7).
 
 - **Hosted identities (4.7):** the server also stops serving the
   identity. If its chain ends with a `retire` record, the server keeps

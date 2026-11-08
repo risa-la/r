@@ -47,13 +47,18 @@ active.
   first post (Section 14). With a member's help, open or close the time
   windows of the group checks through the `t` it gives posts. Leave
   members out of what a light client is told, which it shows only as
-  the server's word (12.6).
+  the server's word (12.6). In a public room, join, commit and Update
+  in any identity's name, owners' included, since it alone checks who
+  commits as whom there: change the room's roles, bans and settings,
+  and push members out as copies, which every device applies, though
+  devices find the leaf unconfirmed within an hour, warn, and keep the
+  roles they had for the room's content (12.7, Section 14).
 - Cannot: read any message, file, private display name or topic. Learn
   who sent a post, or who is in a direct conversation or a private room,
   except by the links above. Keep those links in what it stores, if it
   follows 4.2, so that a database seized or handed over later does not
-  hold them. Add anyone to a conversation, change the
-  roles or settings of a room for its members' devices, change or forge
+  hold them. Add anyone to a conversation, change the roles or
+  settings of a private room for its members' devices, change or forge
   a message, replay one unnoticed, or hide a gap in one member's
   messages once a later message from that member arrives. Reset an
   identity or add a device to one. Serve a backup of an older generation
@@ -66,19 +71,24 @@ that hosts an identity.
 - Can: publish a key file with a new chain, an older one, or none at
   all. With no key file, or an invalid one, it makes devices stop
   sending in direct conversations with the identity, hide its messages
-  in rooms, remove its leaves from rooms that are not public until the
-  file is back, and warn their users (12.14). Show someone meeting the
-  identity for the first time a chain of its own in a log on another
-  host, which only safety numbers catch (Section 14). Sign in as the
-  identity on servers that have not seen it before, and use its account
-  there. Stop the identity from signing in to servers that have no
-  cached key file.
+  in rooms, remove its leaves from rooms that are not public where it is
+  a plain member, from which it then comes back only when an owner or
+  moderator adds it, and warn their users (12.14). With a new chain,
+  whose records need not be logged, it makes every device that knows the
+  identity stop sending in each private room it is in until each user
+  acknowledges the new master key, and a device whose user does may add
+  the new chain's devices to those rooms (Section 14). Show someone
+  meeting the identity for the first time a chain of its own in a log on
+  another host, which only safety numbers catch (Section 14). Sign in as
+  the identity on servers that have not seen it before, and use its
+  account there. Stop the identity from signing in to servers that have
+  no cached key file.
 - Cannot: change the keys of an identity that a device already knows
   unseen: a new chain is a new master key, a fork or a rollback, and
   devices stop trusting it until their users act (4.5, 12.14). Add a
   device unseen by the identity's own devices. Make anyone remove the
-  identity from a conversation for good, which takes a `retire` record
-  (4.9). Sign a record of an existing chain without its keys.
+  identity from a direct conversation for good, which takes a `retire`
+  record (4.9). Sign a record of an existing chain without its keys.
 
 **A key log and its witnesses.**
 
@@ -101,11 +111,13 @@ that hosts an identity.
   room, make a resync commit, which removes one other leaf and which
   devices that did not need it attribute. Outside public rooms, remove
   the leaves of one other identity per commit by claiming that a check
-  fails for them, which devices attribute (12.7); a plain member who
-  removes all of an identity's leaves keeps it out of a room until an
-  owner or moderator adds it back. Hold a leaf of a device it adds, in
-  that device's name, until devices confirm the leaf or find it out,
-  about an hour after it first uses a role. Within its role, invite,
+  fails for them, which devices attribute (12.7), though in a room not
+  those of an owner or moderator above its own role; a plain member
+  who removes all of a plain member's leaves keeps it out of a private
+  room until an owner or moderator adds it back. Hold a leaf of a
+  device it adds, in that device's name and with at most its own role,
+  until devices confirm the leaf or find it out, about an hour after it
+  first uses a role. Within its role, invite,
   kick, ban, delete and change settings. Remove others' stale leaves,
   and in a public room copies and joins that nobody uses, within the
   limits of 12.7. With its identity's other devices, commit in up to 3
@@ -115,15 +127,21 @@ that hosts an identity.
   other's messages for third parties. In an epochal group, prove a
   message to others until its period key is published, or later if it
   timestamped the message's hash in public beforehand. Post abuse and
-  report it to operators as someone else's. Once removed, watch the old
-  mailbox and post junk there, until the group moves (7.8), which it
-  does right after the removal. Fork its own chain, or take its key
-  file down, which stops only its own direct conversations, and has its
-  leaves hidden in rooms and removed from rooms that are not public
-  (12.14).
+  report it to operators as someone else's, or under someone else's
+  pseudonym, which an operator may mute until the next commit (5.8).
+  Change its own recovery key, which stops every other device from
+  sending in the private rooms it is in until each user acknowledges
+  the new master key (12.14). Once removed, watch the old mailbox and
+  post junk there, until the group moves (7.8), which it does right
+  after the removal. Fork its own chain, or take its key file down,
+  which stops only its own direct conversations, and has its leaves
+  hidden in rooms, and removed from rooms that are not public, unless
+  it is an owner or moderator there, in which case it stays and reads
+  until its own devices or one at or above its role remove it (12.14).
 - Cannot: post as another member to the other members, make another
-  member's leaf look confirmed, give a moderator control of an owner's
-  leaf by an invitation, read anything sent after it is removed, post or
+  member's leaf look confirmed, get control of a leaf with a role above
+  its own by an Add, remove an owner's or moderator's leaves without a
+  role that allows it, read anything sent after it is removed, post or
   act on a role it has lost after the commit that removed or demoted it,
   or add new identities to a room without a role that allows it. Undo
   moderation without the role that it needed, by calling a leaf an
@@ -240,8 +258,8 @@ Each risk is marked **Mitigated**, where this document limits it, or
   anyone who joins, so that the server can check commits and serve light
   clients. A light client also tells the server its leaf.
 - **Delayed deniability in large rooms** (Open). In epochal groups, a
-  message is deniable only once its period key is out, up to a day and
-  an hour later, and a member who timestamps a message in public before
+  message is deniable only once its period key is out, up to about two
+  days later, and a member who timestamps a message in public before
   then can prove it later.
 - **Enrolment by host name** (Mitigated: witnesses fetch a host's first
   log key from the host itself, 4.10). Whoever controls a host's name,
@@ -294,15 +312,34 @@ Each risk is marked **Mitigated**, where this document limits it, or
   compare epochs through read markers (12.7, 7.7), but cannot end the
   split.
 - **Leaves held by whoever added them** (Mitigated: challenged at their
-  first use of a role, removed within about an hour, 12.7). A member
-  who adds a device can hold its leaf until devices confirm it. Undoing
-  what such a leaf did takes ordinary commits by those whose role
-  allows each change.
+  first use of a role, removed within about an hour, and never with a
+  role above the adder's own, 12.7). A member who adds a device can hold
+  its leaf until devices confirm it. Undoing what such a leaf did takes
+  ordinary commits by those whose role allows each change.
 - **Removals for a check** (Mitigated: one identity per commit, streaks
-  per identity, and attribution, 12.7). In a direct conversation or a
-  private room, any member can remove another identity's leaves by
-  claiming a check that the group cannot make, and in a room, if it
-  removes all of them, only owners and moderators can add them back.
+  per identity, owners and moderators only by those at or above their
+  role, and attribution, 12.7). In a direct conversation or a private
+  room, any member can remove another plain member's leaves by
+  claiming a check that the group cannot make, and in a private room,
+  if it removes all of them, only owners and moderators can add them
+  back. In return, a forked, compromised or keys-missing owner or
+  moderator stays in a private room, and its leaves go on reading it,
+  until its own devices or an owner (or moderator) remove it.
+- **Losing every leaf in a private room** (Open). An identity with no
+  leaf left in a private room, after recovery, a key file that was
+  missing for a while, a fork or a RESYNC, comes back only when an
+  owner or moderator adds it. A room's only owner that recovers never
+  comes back, and its old leaves stay, able to read (Section 14).
+- **New master keys in private rooms** (Open). A member, or the
+  controller of a member's domain, can stop every device from sending
+  in a private room until each user acknowledges a new master key, and
+  one user who acknowledges lets the new key's devices in (Section 14).
+- **Public-room roles rest on the server** (Open). In a public room,
+  only the server checks that a commit or Update comes from the device
+  its credential names, so the server can commit in an owner's name and
+  take over the room's roles, bans and settings. Devices find the leaf
+  unconfirmed within an hour, warn, and keep the roles they had for the
+  room's content, but cannot undo its commits (12.7, Section 14).
 - **Resyncs in public rooms** (Mitigated: only identities commit, from
   their signed-in connections, a resync removes one leaf and is
   attributed, and recovery is one commit and batches, 12.7). A member's
@@ -415,3 +452,14 @@ claims that depend on it.
   commits' hashes and not in public rooms (7.2); past-epoch secrets
   deleted 2 hours after the commit (12.9); pending records failing
   after 2 hours; the light client's wire format (12.6).
+- **draft-03, review round 3** (2026-11-09): in a private room, only an
+  identity's own devices or an owner add an owner's devices or remove
+  its leaves for a check, and also a moderator for a moderator's
+  (12.7); a room's owners are gone only as of the epoch before a commit
+  (6.3); devices keep the roles they had in a public room against
+  commits made in another's name (12.7); what a server can do in a
+  public room's name, who brings back an identity that lost every leaf
+  in a private room, and what a new master key does to private rooms,
+  stated (Section 14); epochal leaf rotation near midnight and after a
+  last-resort KeyPackage (12.3); a mailbox push subscription needs a
+  send token (9.1).

@@ -79,8 +79,10 @@ for epoch 0 (7.2), in base64 with padding.
 The server replies `ERR name-taken` to a box it has seen before, to a
 room name that is in use, and, without `epoch`, to a group id it has
 seen before. With `epoch`, `from` must be a mailbox that the server
-holds with the same group id (`ERR not-found`), whose token set for the
-epoch before `epoch` holds `token` (`ERR stale`, 7.2). A box that is
+holds with the same group id (`ERR not-found`), and not a public
+room's, since public rooms never move (`ERR forbidden`, 7.8), and its
+token set for the epoch before `epoch` must hold `token` (`ERR stale`,
+7.2). A box that is
 already the mailbox of that group from that epoch gets `OK`, and
 nothing changes (7.8).
 
@@ -94,14 +96,15 @@ The new mailbox of a group whose move creates epoch 42 (7.8):
 ```
 C: CREATE 7tz3w5ka2qnmxhfyvd4pcr6bje q1Zx8bN3vR7tY2wK5mP9sD4fG6hJ0lC3xV8bN1mQ2wE= OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm epoch=42 from=m4qkz7xw2rjv5tbnhc3pfyd6ea token=Xk2pV9rT4mW7qZ1nB8cF3sH6jL0dG5yA2eR9uK4oP1w=
 S: OK
-``` A server never uses a box again,
-even once its mailbox is gone (7.5, 10.4), and MAY remember boxes and
-group ids by their hashes only.
+```
+
+A server never uses a box again, even once its mailbox is gone (7.5,
+10.4), and MAY remember boxes and group ids by their hashes only.
 
 Servers MUST limit how many mailboxes one connection and one network
 address create (`ERR rate-limited`), and SHOULD limit how often one
-identity creates public rooms. Servers MAY require proof of work for
-CREATE (4.1).
+identity creates public rooms. Servers will be able to require proof
+of work for CREATE once a later draft specifies it (4.1).
 
 ```
 POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>] [next=<hash>]
@@ -479,11 +482,17 @@ RESOLVE <id>
 
 **`author` is not evidence.** It is the reporter's claim. A member can
 post something abusive, then report it naming someone else as its
-author, and the franking still checks. So:
+author, and the franking still checks. The same goes for the post's
+`pseudonym`: the server does not check it (5.2), and every member can
+learn the others' pseudonyms (7.3), so a member can post under another
+member's pseudonym, which devices ignore, and report that post. So:
 
 - Operators act on a report with the commands of Section 10, and then
   resolve it: they mute the target's pseudonym (ADMIN MUTE), or drop
-  the mailbox or room (ADMIN DROP).
+  the mailbox or room (ADMIN DROP). They SHOULD NOT mute a pseudonym on
+  a single report. Outside public rooms a mute matters only until the
+  next commit anyway, which changes every pseudonym (7.3), and in a
+  public room it ends with the period (10.4).
 - Operators MUST NOT ban or unregister an identity (10.2, 10.5) on
   reports alone, only on evidence from outside them.
 - An operator's client shows `author` as claimed by the reporter.

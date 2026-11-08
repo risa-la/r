@@ -90,12 +90,12 @@ where `guests` is `none`. It does not check that a joining identity's
 device is current, since the join carries no device binding: anyone may
 post a join whose credential names any device, and devices treat the
 leaf as unverified, like a guest's, until it attests (12.10). The
-server MAY ask for proof of work first (4.1). A leaf that its device
-does not use, because it never joined after all or because its
-credential names a device that does not hold it, never commits or
-proposes an Update. Owners and moderators may remove such a leaf
-without kicking the uid it names, and any member may once it is 8 days
-old (12.7), so such joins cannot fill a room for ever.
+server will ask for proof of work first once a later draft specifies it
+(4.1). A leaf that its device does not use, because it never joined
+after all or because its credential names a device that does not hold
+it, never commits or proposes an Update. Owners and moderators may
+remove such a leaf without kicking the uid it names, and any member may
+once it is 8 days old (12.7), so such joins cannot fill a room for ever.
 
 Full clients in a public room commit pending join proposals, Update
 proposals (12.10) and SelfRemove proposals (below), at most 256 devices
@@ -208,18 +208,25 @@ identity leaves the room of its own accord, but not when it is banned
 - A room always keeps at least one owner. Devices refuse a commit that
   removes the last one from `owners`, or kicks or bans them.
 - **A room whose owners are gone.** If no identity in `owners` has a
-  leaf in the group, for example because the last owner left, a
-  moderator may do what an owner may, including adding itself to
-  `owners`. Without moderators either, the room's settings can no
-  longer change.
+  leaf in the group as it is before a commit, in the epoch the commit
+  is for, for example because the last owner left, a moderator may do
+  what an owner may in that commit, including adding itself to
+  `owners`. Since this looks at the group before the commit, a
+  moderator cannot remove the owners and take their place in one
+  commit, and it cannot remove an owner's leaves for a check at all
+  (12.7). Without moderators either, the room's settings can no longer
+  change, and nobody can add an owner back (12.7).
 - Devices check the role of whoever made a commit against the extension
   of the epoch the commit is for. They check the role behind a message
   against that epoch's extension and against the newest one applied at
   the message's place in the order of posts, so that a kick or a
   demotion takes effect at once (12.9).
-- Server operators have no role in rooms, and no way to act as one,
-  since devices take roles only from the group. They can mute and drop
-  (Section 10).
+- Server operators have no role in rooms, since devices take roles
+  only from the group. In direct conversations and private rooms they
+  have no way to act as one either. In a public room, where only the
+  server checks who commits as whom, a server can commit in an owner's
+  name, which devices apply and warn about (12.7, Section 14). They can
+  mute and drop (Section 10).
 
 ### 6.4. Moderation
 

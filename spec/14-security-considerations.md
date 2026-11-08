@@ -7,7 +7,9 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   the server: not membership, roles or settings (12.4, 12.7), not whose
   keys are whose (4.5, 12.14), and not who wrote a message (12.9,
   12.10). What the server can still do is listed below, and devices can
-  see most of it.
+  see most of it. The largest exception is public rooms, where only the
+  server checks who commits as whom, so that it can commit in an
+  owner's name (below).
 
 - **What is encrypted end to end.** Every conversation, public rooms
   included (Section 12). The server cannot read messages, files, display
@@ -85,16 +87,17 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   only themselves (12.10). So a message that leaks does not prove to a
   third party who wrote it. The limits:
   - In groups whose `confirm` is `epochal`, a message is deniable only
-    once its period key is published, up to a day and an hour after it
-    was sent. Until then, a member who captures a message and its
-    attestation can prove it. A member who publishes a message's hash
-    somewhere public before the key comes out, such as in a public log,
-    can prove later that it existed while only its sender could have
-    signed it. Anyone can join a public room, so a bot that joins every
-    public room and timestamps every ATTEST and message it sees defeats
-    delayed deniability for everything it archived. A new leaf key each
-    period limits what a revealed period key lets anyone forge, but does
-    not keep the periods apart: in a public room, the Updates that bring
+    once its period key is published, up to about two days after it was
+    sent: the rest of its day, 3 hours, and up to a day more (12.10).
+    Until then, a member who captures a message and its attestation can
+    prove it. A member who publishes a message's hash somewhere public
+    before the key comes out, such as in a public log, can prove later
+    that it existed while only its sender could have signed it. Anyone
+    can join a public room, so a bot that joins every public room and
+    timestamps every ATTEST and message it sees defeats delayed
+    deniability for everything it archived. A new leaf key each period
+    limits what a revealed period key lets anyone forge, but does not
+    keep the periods apart: in a public room, the Updates that bring
     each period's leaf key are public and signed with the key before, so
     one timestamped ATTEST ties a leaf to its device in every period
     (12.10).
@@ -251,6 +254,23 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   - It can leave members out of the list that MEMBERS gives a light
     client (8.3), which shows that list only as the server's word
     (12.6).
+  - In a public room, it can join, commit and propose Updates in any
+    identity's name, since its leaves carry no device binding, and only
+    the server checks that a commit or Update comes from the device that
+    its credential names (12.6). The group checks do not depend on
+    attestation, so every device applies what it commits. A server can
+    so join under a credential that names an owner's device, as a rejoin
+    (12.7), and then remove the real owner's leaves, ban the other
+    owners and moderators, add uids to `owners` and change any setting,
+    and push out any member by Updating a copy of its leaf and removing
+    the real one as a copy. Devices find such a leaf unconfirmed within
+    the hour, since it sends no valid ATTEST, warn their users, and keep
+    for the room's content the roles they had before its commits
+    (12.7, "Commits in another's name"). But nobody who still holds a
+    role can undo its commits, the server can refuse the real owners'
+    posts as banned, and devices that join afterwards see a normal room.
+    In direct conversations and private rooms the server cannot do this,
+    since it holds no group secrets and cannot sign as any leaf.
   - Within a generation, it can serve an older backup (above).
 
 - **Insiders.** A member can read the conversation, and can leak it. A
@@ -267,29 +287,36 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   key files (12.7), so in a direct conversation or a private room any
   member can remove the leaves of one other identity in a commit, by
   claiming that a key check fails for them, that a leaf is an impostor,
-  or that it asked to be replaced. Every device checks a key-check
-  claim and warns, and devices that had confirmed a removed leaf name
-  whoever removed it. The removed devices come back only as the group
-  checks allow, which never depend on history: through their identity's
-  own devices if some are still in the group, the other participant of
-  a direct conversation, or, in a room, an owner or moderator. So a
-  plain member who removes all of an identity's leaves keeps it out
-  until one of those acts, and while no owner or moderator device is
-  online. One identity per commit and commit streaks per identity
-  (12.7) mean that emptying a room takes a member many commits over
-  hours, in view of every device; the group recovers as long as a
-  device that can check and add back remains in it. A device that was
-  removed misses what was said in between until its own devices fill
-  the gap (12.13). The same goes for a member who encrypts a commit's
-  path secrets so that a few devices cannot follow: they post RESYNC,
-  and their identity's devices, or an owner or moderator, add them back
-  (12.7).
-  A later version may carry a bounded history of recent commits in the
-  group context, which every commit updates and joiners read from the
-  GroupInfo, so that plain members could again add back what a false
-  removal took out, and undo an impostor's commits, without the group
-  checks depending on anything a joiner lacks. This version keeps every
-  group check to the current state, and leaves such repairs to roles.
+  or that it asked to be replaced. In a room, only an owner or the
+  identity's own devices can remove an owner's leaves so, and only those
+  or a moderator a moderator's (12.7), so that no member can take out
+  those who could add it back. Every device checks a key-check claim and
+  warns, and devices that had confirmed a removed leaf name whoever
+  removed it. The removed devices come back only as the group checks
+  allow, which never depend on history: through their identity's own
+  devices if some are still in the group, the other participant of a
+  direct conversation, or, in a private room, an owner's or moderator's
+  Add, which their devices offer their users but do not make by
+  themselves. So a plain member who removes all of a plain member's
+  leaves keeps it out until an owner or moderator acts. One identity per
+  commit and commit streaks per identity (12.7) mean that emptying a
+  room takes a member many commits over hours, in view of every device,
+  and the room keeps its owners and moderators, who can add back, unless
+  they leave. The price is that a forked or compromised owner or
+  moderator, or one missing its keys, stays in a private room, and its
+  leaves go on reading it, until its own devices or an owner (or, for a
+  moderator, a moderator) remove it. Other devices hide what it sends,
+  and keep sending (12.14). A device that was removed misses what was
+  said in between until its own devices fill the gap (12.13). The same
+  goes for a member who encrypts a commit's path secrets so that a few
+  devices cannot follow: they post RESYNC, and their identity's devices,
+  or an owner or moderator, add them back (12.7). A later version may
+  carry a bounded history of recent commits in the group context, which
+  every commit updates and joiners read from the GroupInfo, so that
+  plain members could again add back what a false removal took out, and
+  undo an impostor's commits, without the group checks depending on
+  anything a joiner lacks. This version keeps every group check to the
+  current state, and leaves such repairs to roles.
 - **Leaves held by whoever added them.** A device binding covers the
   keys that others encrypt to, not the leaf's signature key (12.3). So
   the member who adds a device, or the server that hands out its
@@ -300,38 +327,43 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   who does it holds a leaf in the name of another identity's device,
   with that identity's role, until devices confirm it (12.10). Devices
   challenge such a leaf as soon as it uses a role, and the identity's
-  own devices challenge every new leaf of it, so within about an hour
+  own devices challenge every new leaf of it, or, in an epochal group,
+  expect an ATTEST in its first message, so within about an hour
   devices find it out and remove it (12.7). Removing it does not undo
   what its commits did: the identity's own devices, or the room's other
   owners and moderators, undo that with ordinary commits, within their
-  roles. Its messages show as unverified throughout. An invitation never
-  hands a moderator an owner's leaf, since only owners invite owners and
-  moderators. Any member can also remove, as an impostor, a leaf that
-  is not one; devices that had confirmed that leaf then name the member
-  who did it, and its identity adds its device back. Calling a leaf an
-  impostor gives no power to undo what it did, so a member cannot
-  reverse an owner's moderation that way.
+  roles. Its messages show as unverified throughout. No Add hands anyone
+  a leaf with a role above its own: in a private room, only an owner or
+  the identity's own devices add an owner's devices, and only those or
+  a moderator a moderator's (12.7). So a leaf held this way has at most
+  the role of whoever added it. Any member can also remove, as an
+  impostor, a leaf that is not one, within the limits of the Removes
+  checks; devices that had confirmed that leaf then name the member who
+  did it, and its identity adds its device back where the Adds checks
+  let it. Calling a leaf an impostor gives no power to undo what it
+  did, so a member cannot reverse an owner's moderation that way.
 - **Public rooms.** Anyone can join a public room under a credential
   that names any device (12.3). Such a leaf never attests, so devices
   treat it as a guest's. It cannot commit or propose an Update, since
-  the server takes those only from the device a credential names
-  (12.6), and so it cannot push the device it names out of the room: a
-  copy of a leaf is removed only once the other leaf has committed or
-  been Updated, which only the named device can do, while that device
-  can remove the copy at once (12.7). Owners and moderators remove such
-  leaves without kicking the uid they name, and any member may once
-  they are 8 days old; until then, joins that nobody uses count towards
-  the room's limits, which only rate limits bound until proof of work
-  is specified (4.1). An identity in the room can make a resync commit at any time,
-  which removes the last committer's leaf until that device joins
-  again; devices that had no trouble with the commit it undid name its
-  maker. Apart from owners and moderators, who act within their roles,
-  a commit removes at most a tenth of a room's leaves, and only leaves
-  that are stale, guests', copies or never used, so no member can empty
-  a public room. A hostile member that is the only full client online
-  can hold back joins, but owners and moderators can still get in by
-  external commit (12.7). Anyone who joins a public room can post under
-  another member's pseudonym, which the server cannot tell apart,
+  the server takes those only from the device a credential names (12.6),
+  and so it cannot push the device it names out of the room: a copy of a
+  leaf is removed only once the other leaf has committed or been
+  Updated, which, while the server is honest, only the named device can
+  do, while that device can remove the copy at once (12.7). The server
+  itself can do all of this (above). Owners and moderators remove such
+  leaves without kicking the uid they name, and any member may once they
+  are 8 days old; until then, joins that nobody uses count towards the
+  room's limits, which only rate limits bound until proof of work is
+  specified (4.1). An identity in the room can make a resync commit at
+  any time, which removes the last committer's leaf until that device
+  joins again; devices that had no trouble with the commit it undid name
+  its maker. Apart from owners and moderators, who act within their
+  roles, a commit removes at most a tenth of a room's leaves, and only
+  leaves that are stale, guests', copies or never used, so no member can
+  empty a public room. A hostile member that is the only full client
+  online can hold back joins, but owners and moderators can still get in
+  by external commit (12.7). Anyone who joins a public room can post
+  under another member's pseudonym, which the server cannot tell apart,
   though members' devices ignore such posts (7.3).
 - **Other insiders.** In a direct conversation or a private room, a
   member can add useless hashes to a token set with TOKEN, but cannot
@@ -366,6 +398,23 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   hosts an identity holds none of its keys, and can do no more than the
   domain's controller. No operator can reset an identity.
 
+- **New master keys freeze private rooms.** A new master key stops
+  sending in direct conversations and private rooms until each user
+  acknowledges it (12.14). Any member can cause that by changing its
+  own recovery key (4.8), and so can whoever controls any member's
+  domain, by serving a valid key file with a new chain, whose records
+  need not be logged, and as often as it likes, by switching between
+  files. Stopping protects little in a room, whose leaves of that
+  identity are its old devices. And acknowledging is risky: once one
+  member's device has acknowledged, its head is the new chain, and it
+  may add the new chain's devices to every private room where the
+  identity still has a leaf, for everyone (12.7, "Adding devices"). The
+  identity's own devices then remove them as a failed key check, and
+  that member's device may add them again within the hour, so they can
+  read in between. So one member, or the controller of one member's
+  domain, can stop a private room until every user acknowledges, and
+  one user who acknowledges carelessly lets the new key's devices in.
+
 - **First contact.** A device that meets an identity for the first time
   cannot tell whether the chain it is shown is the one the identity's
   owner watches. Within one host, logs form a hand-off chain (4.5,
@@ -385,22 +434,47 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   then remove its leaves, as for an impostor, and the identity's other
   devices undo what it did, within the identity's role (12.7).
 
-- **Missing key files and forks.** A key file that is gone or invalid
-  is unsigned, so it removes no device by record (4.4). Devices cannot
+- **Missing key files and forks.** A key file that is gone or invalid is
+  unsigned, so it removes no device by record (4.4). Devices cannot
   check such an identity, nor one whose chain or log has forked (4.5),
   so they stop sending in direct conversations with it, hide what its
   leaves send in rooms, and remove its leaves from rooms that are not
-  public (12.14). So the host of a key file can make an identity
-  unreachable, visibly, and push it out of private rooms until the file
-  is back, when its devices are added again; only a `retire` record,
-  which needs the recovery key, removes it for good (4.9). And an
-  identity that forks its own chain, or takes down its own key file,
-  stops only its direct conversations: a room goes on without it. The
-  cost is that, in rooms, a device keeps sending while the identity's
-  leaves are being removed, so those leaves can read what is sent in
-  between. Devices that see the key file or log differently can also
-  disagree about such a removal, and one may add the identity back
-  while another removes it again (12.7), which each device shows.
+  public (12.14), apart from owners and moderators, whose leaves only
+  their own devices and those at or above them in role may remove there.
+  So the host of a key file can make an identity unreachable, visibly,
+  and push it out of private rooms in which it is a plain member. Once
+  the file is back, it does not come back by itself: see below. Only a
+  `retire` record, which needs the recovery key, removes an identity for
+  good from every conversation (4.9). And an identity that forks its own
+  chain, or takes down its own key file, stops only its direct
+  conversations: a room goes on without it. The cost is that, in rooms,
+  a device keeps sending while the identity's leaves are being removed,
+  so those leaves can read what is sent in between. Devices that see the
+  key file or log differently can also disagree about such a removal,
+  and one may add the identity back while another removes it again
+  (12.7), which each device shows.
+
+- **Losing every leaf in a private room.** In a direct conversation,
+  either participant's devices add the other's. In a private room, an
+  identity that has no leaf left comes back only when an owner's or
+  moderator's device adds it, and only an owner's for an identity
+  listed in `owners` (12.7). Devices offer this to their users, but do
+  not do it by themselves. Ordinary events take every leaf of an
+  identity out of a private room: recovery after losing every device,
+  whose `signing` record removes every old device (4.8); a key file
+  that answers 404 for a while, during a move or after ADMIN
+  UNREGISTER (12.14); and a fork, even one the user later resolves. In
+  each case the identity is out until an owner or moderator acts. A
+  device whose identity has no other leaf there, and that posts RESYNC,
+  likewise cannot follow the room until an owner or moderator replaces
+  its leaf (12.7).
+  Owners and moderators are not removed for a fork or missing keys by
+  those below them (above), but recovery hits them too. A room's only
+  owner that recovers never comes back, whether or not the room has
+  moderators: only an owner may remove an owner's leaves or add its
+  devices, so its old leaves stay in the room, showing nothing but
+  still able to read, and the room keeps no owner who can act (4.8,
+  6.3).
 
 - **Accounts on other servers.** A server that has never seen an
   identity takes its first chain from whoever controls the identity's
@@ -506,6 +580,11 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   but only the reporter's claim of who wrote it. A member can report its
   own post as someone else's, so operators act on pseudonyms, mailboxes
   and rooms, and never ban an identity on reports alone (5.8). The
+  pseudonym is a claim too: a member can post under another member's
+  pseudonym, which devices ignore, and report that post, so that an
+  operator mutes the other member. Operators SHOULD NOT mute on a
+  single report, and outside public rooms a mute matters only until
+  the next commit (5.8, 7.3). The
   reporter is told who will see the report. Operators learn who reported
   only if the reporter was signed in.
 
@@ -547,7 +626,9 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Operators** see what the server sees, and can refuse service: drop
   rooms and mailboxes, mute pseudonyms and ban identities and addresses
-  (Section 10). They cannot read any conversation, act as a room's
-  moderator, or change anyone's keys. ADMIN WHO shows them every open
-  connection's network address (10.3), but servers do not keep the
-  addresses of anonymous and guest connections once they close (4.2).
+  (Section 10). They cannot read any conversation, act as a private
+  room's moderator, or change anyone's keys. In a public room, though, a
+  server can commit in any identity's name (above). ADMIN WHO shows them
+  every open connection's network address (10.3), but servers do not
+  keep the addresses of anonymous and guest connections once they close
+  (4.2).
