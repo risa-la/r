@@ -29,6 +29,7 @@ pub mod group;
 pub mod history;
 pub mod keypackage;
 pub mod message;
+pub mod pairing;
 pub mod primitives;
 pub mod signer;
 pub mod wire;
@@ -54,6 +55,7 @@ pub use keypackage::{
     lifetime_acceptable,
 };
 pub use message::{Encrypted, Message, MessageError, UnverifiedMessage, decrypt, encrypt};
+pub use pairing::{IdentityBundle, PairingCode, PairingError, PairingSecret, Relay, RelayId};
 pub use signer::{DeviceSigner, credential_with_key};
 pub use wire::WireError;
 
