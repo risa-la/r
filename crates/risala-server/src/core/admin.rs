@@ -136,10 +136,6 @@ pub(crate) fn is_configured_operator(inner: &Inner, uid: &Uid) -> bool {
 /// in, and its devices cannot join public rooms. Server bans never apply
 /// to operators named in the configuration. AUTH and REGISTER ask this
 /// only once the signature verifies (10.2).
-#[allow(
-    dead_code,
-    reason = "used by AUTH, REGISTER (SV1) and public room joins (SV3)"
-)]
 pub(crate) fn banned(inner: &Inner, uid: &Uid) -> bool {
     !is_configured_operator(inner, uid) && inner.admin.bans().iter().any(|b| b.covers_uid(uid))
 }

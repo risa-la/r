@@ -388,7 +388,6 @@ pub(crate) fn welcome_arrived(inner: &Arc<Inner>, uid: &Uid, device: DeviceId) {
 
 /// A device was removed from its identity's chain (4.4, 9.1): its account
 /// subscriptions go. The identity area calls this.
-#[allow(dead_code, reason = "called by the identity area (SV1)")]
 pub(crate) async fn device_removed(inner: &Inner, device: DeviceId) {
     if let Err(e) = inner
         .db(move |store| store.delete_device_pushes(&device))
@@ -400,7 +399,6 @@ pub(crate) async fn device_removed(inner: &Inner, device: DeviceId) {
 
 /// An identity unregistered (4.9, 10.5): its account subscriptions and its
 /// presence setting go. The identity area calls this.
-#[allow(dead_code, reason = "called by the identity area (SV1)")]
 pub(crate) async fn identity_removed(inner: &Inner, uid: &Uid) {
     let who = uid.clone();
     if let Err(e) = inner

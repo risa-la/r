@@ -808,6 +808,75 @@ async fn keys_put_closes_removed_devices() {
 }
 
 // ---------------------------------------------------------------------------
+// Server bans (10.2), presence (8.3) and push (9.1), from the misc and
+// admin areas
+
+/// AUTH and REGISTER answer `forbidden` for a banned identity, but only
+/// once its signature verifies (10.2). Signing in tells presence (8.3),
+/// and UNREGISTER deletes the account's push subscriptions (9.1).
+#[tokio::test]
+async fn bans_presence_and_push_at_sign_in() {
+    use crate::core::misc::presence::presence_of;
+    use crate::store::{MiscStore as _, PushTarget};
+    use risala_proto::types::Presence;
+
+    let mut ids = Ids::new();
+    let (_alice, _chain, device) = ids.register("alice").await;
+    let mut op = ids.h.signed_in_as("op@example.org");
+    ids.h.send(&op, "ADMIN BAN alice@example.org").await;
+    ids.h.send(&op, "ADMIN BAN bob@example.org").await;
+    assert_eq!(op.lines(), ["OK", "OK"]);
+    let (_, lines) = ids.auth(&device).await;
+    assert_eq!(lines, ["ERR forbidden"]);
+    // A key that does not verify hears auth-failed, not that it is banned.
+    let (_, lines) = ids.auth(&TestIdentity::new("alice@example.org")).await;
+    assert_eq!(lines, ["ERR auth-failed"]);
+    let (chain, bob) = TestChain::new("bob@example.org", &ids.log().log);
+    let (mut c, nonce) = ids.connect();
+    ids.h
+        .send(&c, &chain.register_line(&bob, "chat.example.org", &nonce))
+        .await;
+    assert_eq!(c.lines(), ["ERR forbidden"]);
+
+    // Unbanned, Alice signs in, and is online for whoever watches, since
+    // her presence is on.
+    ids.h.send(&op, "ADMIN UNBAN alice@example.org").await;
+    assert_eq!(op.lines(), ["OK"]);
+    let uid: Uid = "alice@example.org".parse().unwrap();
+    ids.h.store.set_presence(&uid, true).unwrap();
+    let (mut alice, lines) = ids.auth(&device).await;
+    assert_eq!(lines, ["OK uid=alice@example.org"]);
+    assert_eq!(presence_of(ids.h.inner(), &uid), Presence::Online);
+
+    // Her account subscription goes when she unregisters.
+    let keys = super::misc::Keys::new();
+    ids.h
+        .send(
+            &alice,
+            &format!("PUSH ADD https://p.example/a t {} {}", keys.key, keys.auth),
+        )
+        .await;
+    assert_eq!(alice.lines(), ["OK"]);
+    let target = PushTarget::Device {
+        uid: uid.clone(),
+        device: risala_proto::record::DeviceId::of(&device.public_key()),
+    };
+    let now = T.parse().unwrap();
+    assert_eq!(
+        ids.h.store.push_subscriptions(&target, now).unwrap().len(),
+        1
+    );
+    ids.h.send(&alice, "UNREGISTER alice@example.org").await;
+    assert!(
+        ids.h
+            .store
+            .push_subscriptions(&target, now)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!ids.h.store.presence_on(&uid).unwrap());
+}
+
 // UNREGISTER (4.9) and ADMIN UNREGISTER (10.5)
 
 /// UNREGISTER must name the connection's own identity; it deletes the

@@ -59,7 +59,7 @@ use sha2::{Digest as _, Sha384};
 use super::command::{Cx, Reply, err, misrouted};
 use super::rate::{WindowLimit, network};
 use super::state::{ConnEntry, Device, Who};
-use super::{Inner, admin, keylog};
+use super::{Inner, admin, keylog, misc};
 use crate::config::Config;
 use crate::handler::ConnId;
 use crate::keyfiles::{Body, FetchError, KEY_FETCH_TIMEOUT, UrlBody};
@@ -269,8 +269,10 @@ async fn auth(cx: &Cx, identity: &Identity, signature: &Signature) -> Reply {
     let Some(key) = key else {
         return Err(err(ErrorCode::AuthFailed));
     };
-    // Server bans of identities (10.2) are the admin area's: it refuses
-    // banned identities here once it has them.
+    // A banned identity learns it only once its signature verifies (10.2).
+    if admin::banned(&cx.inner, &identity.to_uid()) {
+        return Err(err(ErrorCode::Forbidden));
+    }
     sign_in(cx, identity, key).await
 }
 
@@ -786,6 +788,10 @@ async fn register(cx: &Cx, name: &Name, records: &EncodedRecords, signature: &Si
     if !key.verify_challenge(&host, &nonce, identity.as_str(), signature) {
         return Err(err(ErrorCode::AuthFailed));
     }
+    // A banned identity learns it only once its signature verifies (10.2).
+    if admin::banned(inner, &identity.to_uid()) {
+        return Err(err(ErrorCode::Forbidden));
+    }
 
     let _write = inner.identity.write.lock().await;
     let (name2, id2) = (name.clone(), identity.clone());
@@ -987,10 +993,14 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
     if hosted && let Ok(name) = identity.name().parse::<Name>() {
         publish(inner, &name).await;
         // A device removed by record, or every device after `retire`,
-        // signs in no more (4.4).
+        // signs in no more (4.4), and its account push subscriptions go
+        // (9.1).
         close_devices(inner, &identity.to_uid(), |key| {
             chain.device_by_key(key).is_some()
         });
+        for device in chain.removed().iter().copied() {
+            misc::device_removed(inner, device).await;
+        }
     }
     for (index, hash) in lines {
         cx.send(ServerLine::Record { index, hash });
@@ -1153,6 +1163,8 @@ async fn delete_identity(cx: &Cx, uid: &Uid) -> Result<bool, ErrResponse> {
             }
         }
     }
+    // Its account push subscriptions and presence setting go too (4.9, 9.1).
+    misc::identity_removed(inner, uid).await;
     tracing::info!(known, "unregistered an identity");
     Ok(known)
 }
