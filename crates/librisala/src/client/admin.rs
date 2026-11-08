@@ -1,16 +1,5 @@
 //! Server administration (Section 10): [`Admin`], the ADMIN commands of an
 //! operator, from [`Account::admin`].
-//!
-//! Anyone who is not an operator gets `forbidden` for every one of them,
-//! as [`ClientError::Server`]. An identity learns that it is an operator
-//! from `op=yes` when it signs in (4.5); the server may also leave out
-//! commands that do not apply to it, with `not-supported`. Each command
-//! needs a connection.
-//!
-//! Operators also have owner rights in every room through the ordinary
-//! commands ([`Conversation`](super::Conversation)'s
-//! [`kick`](super::Conversation::kick), [`ban`](super::Conversation::ban)
-//! and the rest), and see reports with their reporters (5.8).
 
 use std::num::NonZeroU64;
 
@@ -28,8 +17,18 @@ use super::types::{
     ClientError, ConnectionInfo, KeyInfo, ReportInfo, RoomList, RoomListing, ServerBanInfo,
 };
 
-/// The ADMIN commands of an operator (Section 10), for one account. See
-/// the [module docs](self).
+/// The ADMIN commands of an operator (Section 10), for one account.
+///
+/// Anyone who is not an operator gets `forbidden` for every one of them,
+/// as [`ClientError::Server`]. An identity learns that it is an operator
+/// from `op=yes` when it signs in (4.5); the server may also leave out
+/// commands that do not apply to it, with `not-supported`. Each command
+/// needs a connection.
+///
+/// Operators also have owner rights in every room through the ordinary
+/// commands ([`Conversation`](super::Conversation)'s
+/// [`kick`](super::Conversation::kick), [`ban`](super::Conversation::ban)
+/// and the rest), and see reports with their reporters (5.8).
 ///
 /// Cloning it is cheap.
 #[derive(Debug, Clone)]

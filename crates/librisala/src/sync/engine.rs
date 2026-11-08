@@ -502,7 +502,8 @@ impl SyncEngine {
     /// It goes out once the id is confirmed on this connection, or, for a
     /// room the cache says the account is no longer in, at once while the
     /// id is still stored: authors may delete their own messages in rooms
-    /// they have left (5.4). See [`delete_left`] for that rule.
+    /// they have left (5.4). The DELETE carries the id it is bound to, so
+    /// the server deletes nothing if the room's id is different.
     pub fn delete(&mut self, conv: &Conv, seq: Seq) -> Result<(OutboxId, Output), SyncError> {
         let (account, now) = (self.account, self.now());
         let id = self.write(|tx| {

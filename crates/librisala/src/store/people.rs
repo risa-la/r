@@ -234,8 +234,8 @@ impl Store {
     }
 
     /// The account's block clock: how many times its blocks have changed
-    /// one at a time (5.7). Read it when sending BLOCKS, for
-    /// [`Tx::apply_blocks`].
+    /// one at a time (5.7). Read it when sending BLOCKS, so that the
+    /// reply leaves alone the blocks changed since.
     pub fn blocks_clock(&self, account: AccountId) -> Result<u64, StoreError> {
         self.read(|conn| {
             let clock: Option<i64> = conn
