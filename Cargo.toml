@@ -8,7 +8,6 @@ members = [
     "crates/risala-keyfetch",
     "crates/risala-pow",
     "crates/risala-dev",
-
     "crates/openmls-sqlite-storage",
     "crates/risala-mls",
 ]
