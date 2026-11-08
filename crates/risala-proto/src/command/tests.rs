@@ -720,7 +720,13 @@ fn watch_holds_a_thousand_long_uids() {
     // 8.3: a server must allow at least 1,000 uids, so WATCH is a long
     // line (2.3). 1,000 uids of the longest kind fit in 1 MiB.
     let name = "n".repeat(crate::names::MAX_NAME_LEN);
-    let domain = format!("{}.{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+    let domain = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
     let uids: Vec<String> = (0..1000)
         .map(|i| format!("{}{i:04}@{domain}", &name[4..]))
         .collect();

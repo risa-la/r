@@ -377,7 +377,9 @@ fn ok_values() {
     );
     assert_eq!(
         ok.log(),
-        Ok(Some(Log::Url("https://chat.example.org/risala-log/1".into())))
+        Ok(Some(Log::Url(
+            "https://chat.example.org/risala-log/1".into()
+        )))
     );
     assert_eq!(ok.retention(), Ok(Retention::new(30)));
     assert_eq!(ok.push(), Ok(Some(true)));

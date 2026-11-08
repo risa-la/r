@@ -645,7 +645,11 @@ impl ContentLine {
                 if hosts.is_empty() {
                     return Err(bad("SERVERS lists at least one server"));
                 }
-                if hosts.iter().enumerate().any(|(i, h)| hosts[..i].contains(h)) {
+                if hosts
+                    .iter()
+                    .enumerate()
+                    .any(|(i, h)| hosts[..i].contains(h))
+                {
                     return Err(bad("SERVERS lists each server once"));
                 }
                 ContentLine::Servers(hosts)

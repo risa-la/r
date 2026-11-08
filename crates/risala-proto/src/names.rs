@@ -680,8 +680,9 @@ impl FromStr for ServerAddr {
     /// `server = host [ ":" port ]`, `port = %x31-39 *4DIGIT`, 1 to 65535
     /// and never 7472 (3.5). Upper case is `BadSyntax` (2.1).
     fn from_str(s: &str) -> Result<ServerAddr, ParseError> {
-        const PORT: ParseError =
-            ParseError::BadSyntax("a server's port is 1 to 65535, never 7472, without leading zeros");
+        const PORT: ParseError = ParseError::BadSyntax(
+            "a server's port is 1 to 65535, never 7472, without leading zeros",
+        );
         let (host, port) = match s.split_once(':') {
             Some((host, port)) => (host, Some(port)),
             None => (s, None),
@@ -697,10 +698,7 @@ impl FromStr for ServerAddr {
             None => DEFAULT_PORT,
             Some(p) => {
                 let b = p.as_bytes();
-                if b.is_empty()
-                    || b.len() > 5
-                    || b[0] == b'0'
-                    || !b.iter().all(u8::is_ascii_digit)
+                if b.is_empty() || b.len() > 5 || b[0] == b'0' || !b.iter().all(u8::is_ascii_digit)
                 {
                     return Err(PORT);
                 }
@@ -1424,7 +1422,9 @@ mod tests {
         let made = ServerAddr::new("Chat.Example.org.", 7472).unwrap();
         assert_eq!(made.to_string(), "chat.example.org");
         assert_eq!(
-            ServerAddr::new("chat.example.org", 7000).unwrap().to_string(),
+            ServerAddr::new("chat.example.org", 7000)
+                .unwrap()
+                .to_string(),
             "chat.example.org:7000"
         );
         assert!(ServerAddr::new("127.0.0.1", 7000).is_err());

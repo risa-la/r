@@ -461,7 +461,7 @@ mod tests {
             w.add_checkpoint(&req(0, vec![], &cp5), 100),
             Err(WitnessRefusal::Unavailable)
         );
-        assert_eq!(w.key_files().fetched(), [url.clone()]);
+        assert_eq!(w.key_files().fetched(), std::slice::from_ref(&url));
         // Within the minute it does not fetch again.
         w.serve_log(&log);
         assert_eq!(

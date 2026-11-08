@@ -12,10 +12,10 @@
 //!   key named after the origin, with a timestamp that is not zero. The
 //!   witness gets that key itself: for log 1, from
 //!   `https://<host>/risala-log/1/risala/key`, through a
-//!   [`LogKeyFetcher`], at most once a minute for each origin; for log `n`
-//!   > 1, from the hand-off it took from log `n`-1. Log 1 of a host enrols
-//!   only if the witness has never enrolled a log of that host. No origin
-//!   ever gets a second key.
+//!   [`LogKeyFetcher`], at most once a minute for each origin; for each
+//!   later log, from the hand-off it took from the log before. Log 1 of a
+//!   host enrols only if the witness has never enrolled a log of that
+//!   host. No origin ever gets a second key.
 //! - **Hand-offs.** Log `n`-1 shows the witness its hand-off entry, the
 //!   last entry of the newest checkpoint the witness cosigned for it, with
 //!   an inclusion proof. From then on the witness cosigns no larger tree of
@@ -366,7 +366,12 @@ impl<S: fmt::Debug, F> fmt::Debug for WitnessCore<S, F> {
 impl<S: WitnessStore, F: LogKeyFetcher> WitnessCore<S, F> {
     /// A witness that cosigns with `cosigner`, and fetches the keys of
     /// hosts' first logs with `fetcher`.
-    pub fn new(cosigner: Cosigner, store: S, fetcher: F, config: WitnessConfig) -> WitnessCore<S, F> {
+    pub fn new(
+        cosigner: Cosigner,
+        store: S,
+        fetcher: F,
+        config: WitnessConfig,
+    ) -> WitnessCore<S, F> {
         WitnessCore {
             cosigner,
             store,

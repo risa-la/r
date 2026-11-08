@@ -221,8 +221,8 @@ pub fn parse_log_key(body: &[u8], origin: &LogOrigin) -> Result<LogKey, HintErro
     if vkey.contains('\n') {
         return Err(HintError::Malformed("a log's key file has two lines"));
     }
-    let key =
-        LogKey::from_vkey_str(vkey).map_err(|_| HintError::Malformed("not a log's verifier key"))?;
+    let key = LogKey::from_vkey_str(vkey)
+        .map_err(|_| HintError::Malformed("not a log's verifier key"))?;
     if key.origin() != origin {
         return Err(HintError::Malformed("the key names another log"));
     }
@@ -334,7 +334,15 @@ mod tests {
     fn next_hints() {
         assert_eq!(parse_next(b"risala-hint/1\n41\n"), Ok(41));
         assert_eq!(next_body(41), "risala-hint/1\n41\n");
-        for bad in [&b""[..], b"41", b"41\n\n", b"041\n", b"4 1\n", b"-1\n", b"41\n42\n"] {
+        for bad in [
+            &b""[..],
+            b"41",
+            b"41\n\n",
+            b"041\n",
+            b"4 1\n",
+            b"-1\n",
+            b"41\n42\n",
+        ] {
             assert!(parse_next(&hint(bad)).is_err(), "{bad:?}");
         }
         for bad in [&b"41\n"[..], b"risala-hint/1\n", b"risala-hint/2\n41\n"] {
@@ -359,7 +367,14 @@ mod tests {
         let vkey = key.verifier().vkey().to_string();
         let (name, rest) = vkey.split_once('+').unwrap();
         let (id, b64) = rest.split_once('+').unwrap();
-        let wrong_id = format!("{name}+{}+{b64}", if id == "00000000" { "00000001" } else { "00000000" });
+        let wrong_id = format!(
+            "{name}+{}+{b64}",
+            if id == "00000000" {
+                "00000001"
+            } else {
+                "00000000"
+            }
+        );
         for bad in [
             format!("risala-log-key/1\n{wrong_id}\n"),
             format!("risala-log-key/2\n{vkey}\n"),

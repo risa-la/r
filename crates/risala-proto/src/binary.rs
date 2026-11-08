@@ -237,7 +237,10 @@ mod tests {
             blob.to_string().parse::<ReportRef>(),
             Ok(ReportRef::Blob(blob))
         );
-        assert!(matches!("AQ==".parse::<ReportRef>(), Ok(ReportRef::Inline(_))));
+        assert!(matches!(
+            "AQ==".parse::<ReportRef>(),
+            Ok(ReportRef::Inline(_))
+        ));
         assert!("sha384:00".parse::<ReportRef>().is_err());
         let records: EncodedRecords = "AQ==".parse().unwrap();
         assert_eq!(records.decode(), [1]);

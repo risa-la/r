@@ -108,16 +108,17 @@ fn instantiate(syntax: &str) -> String {
         ("<after>", "100".into()),
         ("<before>", "200".into()),
         ("<ref>", b64(TRANSFER_REF_LEN)),
-        ("<hosts...>", "chat.example.org other.example.net:7000".into()),
+        (
+            "<hosts...>",
+            "chat.example.org other.example.net:7000".into(),
+        ),
         ("<uid>", "bob@example.net".into()),
         ("<master>", hash.clone()),
         ("<origin>", "chat.example.net/risala-log/1".into()),
         ("<head>", hash),
         ("<verified>", "yes".into()),
     ];
-    let mut line = syntax
-        .replace("[@<tags>] ", "")
-        .replace(['[', ']'], "");
+    let mut line = syntax.replace("[@<tags>] ", "").replace(['[', ']'], "");
     for (placeholder, value) in &values {
         line = line.replace(placeholder, value);
     }
