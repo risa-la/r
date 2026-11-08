@@ -1155,10 +1155,10 @@ async fn backup_put_checks_its_blobs_and_key() {
     let missing = BlobRef::of(b"missing");
     h.send(&a, &format!("BACKUP PUT 0 {missing} {key}")).await;
     assert_eq!(a.lines(), ["ERR not-found"]);
-    for bad in [b64(&[1; 60]), b64(&[2; 61])] {
-        h.send(&a, &format!("BACKUP PUT 0 {first} {bad}")).await;
-        assert_eq!(a.lines(), ["ERR invalid"]);
-    }
+    // A WrappedKey of another version (12.13).
+    let bad = b64(&[2; WRAPPED_KEY_LEN]);
+    h.send(&a, &format!("BACKUP PUT 0 {first} {bad}")).await;
+    assert_eq!(a.lines(), ["ERR invalid"]);
     h.send(&a, &format!("BACKUP PUT 0 {first} {key} files={missing}"))
         .await;
     assert_eq!(a.lines(), ["ERR not-found"]);
