@@ -95,14 +95,24 @@ impl Example {
     /// The line with each shortened base64 value made whole, so that it
     /// parses as a typed line. See [`expand_shortened`].
     pub fn expanded(&self) -> String {
-        expand_shortened(&self.line)
+        let verb = self.line.split(' ').next().unwrap_or_default();
+        if verb.eq_ignore_ascii_case("BACKUP") {
+            expand_shortened_to(&self.line, SHORTENED_WRAPPED_KEY_BYTES)
+        } else {
+            expand_shortened(&self.line)
+        }
     }
 }
 
-/// How many bytes a shortened base64 value stands for. MLS data, the
-/// only base64 the spec's examples shorten, has any length; 96 bytes is
+/// How many bytes a shortened base64 value stands for. MLS data, which
+/// most of the spec's shortened base64 is, has any length; 96 bytes is
 /// enough to look like a real value.
 const SHORTENED_BYTES: usize = 96;
+
+/// How many bytes a shortened base64 value of a BACKUP PUT or BACKUP line
+/// stands for: its WrappedKey is always 61 bytes, and another length is
+/// `bad-syntax` (12.13).
+const SHORTENED_WRAPPED_KEY_BYTES: usize = 61;
 
 /// The spec's examples shorten long values with `…` (README), as in
 /// `POST ujzdegxdncf32epf3dhodzdoci AAEAAQ…` or
@@ -118,6 +128,11 @@ const SHORTENED_BYTES: usize = 96;
 /// that does not follow a base64 character, as in `cheap pills at …`, is
 /// left alone.
 pub fn expand_shortened(line: &str) -> String {
+    expand_shortened_to(line, SHORTENED_BYTES)
+}
+
+/// [`expand_shortened`], with shortened base64 standing for `bytes` bytes.
+pub fn expand_shortened_to(line: &str, bytes: usize) -> String {
     let is_b64 = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/';
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -138,8 +153,8 @@ pub fn expand_shortened(line: &str) -> String {
             out.push_str(prefix);
             out.extend(std::iter::repeat_n('0', 96 - prefix.len()));
         } else {
-            let len = SHORTENED_BYTES.div_ceil(3) * 4;
-            let pad = (3 - SHORTENED_BYTES % 3) % 3;
+            let len = bytes.div_ceil(3) * 4;
+            let pad = (3 - bytes % 3) % 3;
             assert!(prefix.len() < len - pad, "{line}: {prefix} is too long");
             out.push_str(prefix);
             out.extend(std::iter::repeat_n('A', len - pad - prefix.len()));

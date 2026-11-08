@@ -61,38 +61,85 @@ blob_type!(
     "a report is base64"
 );
 
-blob_type!(
+/// The `<report>` of REPORT and the REPORT line (5.8): a RisalaReport in
+/// base64, or a blob-ref naming a blob that holds its bytes, for a report
+/// too large for a line. Base64 never holds a `:`, so the two forms never
+/// overlap.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReportRef {
+    /// The RisalaReport itself.
+    Inline(ReportData),
+    /// A blob that holds the RisalaReport's bytes, without base64 (12.12).
+    /// The server keeps it as long as the report, and sends operators the
+    /// same blob-ref.
+    Blob(BlobRef),
+}
+
+impl fmt::Display for ReportRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReportRef::Inline(data) => data.fmt(f),
+            ReportRef::Blob(blob) => blob.fmt(f),
+        }
+    }
+}
+
+impl FromStr for ReportRef {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<ReportRef, ParseError> {
+        if s.contains(':') {
+            s.parse().map(ReportRef::Blob)
+        } else {
+            s.parse().map(ReportRef::Inline)
+        }
+    }
+}
+
+impl From<ReportData> for ReportRef {
+    fn from(data: ReportData) -> ReportRef {
+        ReportRef::Inline(data)
+    }
+}
+
+impl From<BlobRef> for ReportRef {
+    fn from(blob: BlobRef) -> ReportRef {
+        ReportRef::Blob(blob)
+    }
+}
+
+fixed_type!(
     /// The `<key>` of BACKUP PUT and the BACKUP line (12.13): a
     /// WrappedKey, a backup's random key wrapped under the backup key of
-    /// its generation.
+    /// its generation, [`WRAPPED_KEY_LEN`] bytes.
     ///
-    /// Any base64 parses: 12.13 makes a key that is not
-    /// [`WRAPPED_KEY_LEN`] bytes starting with [`WRAPPED_KEY_VERSION`]
-    /// `ERR invalid`, not `ERR bad-syntax`. [`WrappedKey::check`] is that
-    /// check.
+    /// 12.13: a key of another length is `ERR bad-syntax`, as any value
+    /// of the wrong length is (3.7), but one whose first byte is not
+    /// [`WRAPPED_KEY_VERSION`] is `ERR invalid`. [`WrappedKey::check`] is
+    /// that second check.
     WrappedKey,
-    "a wrapped key is base64"
+    WRAPPED_KEY_LEN,
+    "a wrapped key is 61 bytes of base64"
 );
 
 impl WrappedKey {
     /// Encodes a WrappedKey's bytes.
     pub fn from_array(bytes: &[u8; WRAPPED_KEY_LEN]) -> WrappedKey {
-        WrappedKey::from_bytes(bytes).expect("61 bytes fit a line")
+        WrappedKey::from_bytes(*bytes)
     }
 
-    /// The check of BACKUP PUT (12.13): `ERR invalid` unless the key is
-    /// [`WRAPPED_KEY_LEN`] bytes and starts with
-    /// [`WRAPPED_KEY_VERSION`].
+    /// The check of BACKUP PUT (12.13): `ERR invalid` unless the key
+    /// starts with [`WRAPPED_KEY_VERSION`].
     pub fn check(&self) -> Result<(), ErrorCode> {
-        match self.decode().as_slice() {
-            [WRAPPED_KEY_VERSION, ..] if self.decoded_len() == WRAPPED_KEY_LEN => Ok(()),
+        match self.as_bytes() {
+            [WRAPPED_KEY_VERSION, ..] => Ok(()),
             _ => Err(ErrorCode::Invalid),
         }
     }
 
     /// The key's bytes, if it passes [`WrappedKey::check`].
     pub fn to_array(&self) -> Option<[u8; WRAPPED_KEY_LEN]> {
-        self.decode().try_into().ok()
+        self.check().ok().map(|()| *self.as_bytes())
     }
 }
 
@@ -113,11 +160,19 @@ secret_type!(
     "a push auth secret is 16 bytes of base64"
 );
 
-/// Reads the list blob of BACKUP PUT's `files=` (12.13): the 48-byte
-/// hashes of the backup's other blobs, one after another. A length that
-/// is not a multiple of 48 is `ERR invalid`.
+/// The `version` byte that starts the list blob of BACKUP PUT's
+/// `files=` (12.13).
+pub const BLOB_LIST_VERSION: u8 = 1;
+
+/// Reads the list blob of BACKUP PUT's `files=` (12.13): a `version` byte,
+/// [`BLOB_LIST_VERSION`], then the 48-byte hashes of the backup's other
+/// blobs, one after another. Another first byte, or a length that is not
+/// 1 plus a multiple of 48, is `ERR invalid`.
 pub fn read_blob_list(bytes: &[u8]) -> Result<Vec<BlobRef>, ErrorCode> {
-    let (hashes, rest) = bytes.as_chunks::<BLOB_HASH_LEN>();
+    let Some((&BLOB_LIST_VERSION, hashes)) = bytes.split_first() else {
+        return Err(ErrorCode::Invalid);
+    };
+    let (hashes, rest) = hashes.as_chunks::<BLOB_HASH_LEN>();
     if !rest.is_empty() {
         return Err(ErrorCode::Invalid);
     }
@@ -126,7 +181,9 @@ pub fn read_blob_list(bytes: &[u8]) -> Result<Vec<BlobRef>, ErrorCode> {
 
 /// Writes the list blob of BACKUP PUT's `files=` (12.13).
 pub fn write_blob_list(refs: &[BlobRef]) -> Vec<u8> {
-    refs.iter().flat_map(|r| *r.hash()).collect()
+    std::iter::once(BLOB_LIST_VERSION)
+        .chain(refs.iter().flat_map(|r| *r.hash()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -137,7 +194,7 @@ mod tests {
     fn lengths() {
         let key = WrappedKey::from_array(&[1; WRAPPED_KEY_LEN]);
         assert_eq!(key.to_string().len(), 84);
-        assert_eq!(key.to_string().parse::<WrappedKey>(), Ok(key.clone()));
+        assert_eq!(key.to_string().parse::<WrappedKey>(), Ok(key));
         assert_eq!(key.check(), Ok(()));
         assert_eq!(key.to_array(), Some([1; WRAPPED_KEY_LEN]));
         let push = PushKey::from_bytes([4; PUSH_KEY_LEN]);
@@ -147,18 +204,41 @@ mod tests {
         let auth = PushAuth::from_bytes([5; PUSH_AUTH_LEN]);
         assert_eq!(auth.to_string().parse::<PushAuth>(), Ok(auth.clone()));
         assert_eq!(format!("{auth:?}"), "PushAuth(..)");
-        // 12.13: a wrong length or version is `ERR invalid`, not a parse
-        // error.
-        for bad in [&[1u8; 60][..], &[1; 62], &[2; 61], &[0; 61]] {
-            let key = WrappedKey::from_bytes(bad).unwrap();
-            assert_eq!(key.check(), Err(ErrorCode::Invalid), "{bad:?}");
+        // 12.13: a wrong length is `ERR bad-syntax` (a parse error), a
+        // wrong version `ERR invalid`.
+        for bad in [&[1u8; 60][..], &[1; 62]] {
+            let text = BASE64.encode(bad);
+            assert!(
+                matches!(text.parse::<WrappedKey>(), Err(ParseError::BadSyntax(_))),
+                "{bad:?}"
+            );
         }
+        for bad in [[2; 61], [0; 61]] {
+            let key = WrappedKey::from_array(&bad);
+            assert_eq!(key.check(), Err(ErrorCode::Invalid), "{bad:?}");
+            assert_eq!(key.to_array(), None);
+        }
+        // The list starts with its version byte (12.13).
         let refs = [BlobRef::of(b"a"), BlobRef::of(b"b")];
         let list = write_blob_list(&refs);
-        assert_eq!(list.len(), 96);
+        assert_eq!(list.len(), 97);
+        assert_eq!(list[0], 1);
         assert_eq!(read_blob_list(&list), Ok(refs.to_vec()));
-        assert_eq!(read_blob_list(&[]), Ok(vec![]));
+        assert_eq!(read_blob_list(&[1]), Ok(vec![]));
+        assert_eq!(read_blob_list(&[]), Err(ErrorCode::Invalid));
         assert_eq!(read_blob_list(&list[1..]), Err(ErrorCode::Invalid));
+        assert_eq!(read_blob_list(&list[..96]), Err(ErrorCode::Invalid));
+        let mut v2 = list.clone();
+        v2[0] = 2;
+        assert_eq!(read_blob_list(&v2), Err(ErrorCode::Invalid));
+        // REPORT's `<report>` is base64 or a blob-ref (5.8).
+        let blob = BlobRef::of(b"r");
+        assert_eq!(
+            blob.to_string().parse::<ReportRef>(),
+            Ok(ReportRef::Blob(blob))
+        );
+        assert!(matches!("AQ==".parse::<ReportRef>(), Ok(ReportRef::Inline(_))));
+        assert!("sha384:00".parse::<ReportRef>().is_err());
         let records: EncodedRecords = "AQ==".parse().unwrap();
         assert_eq!(records.decode(), [1]);
         assert!("".parse::<PairData>().is_err());

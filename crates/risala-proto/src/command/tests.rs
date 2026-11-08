@@ -561,6 +561,15 @@ fn length_limits() {
     syntax(&format!("@cid=short POST {BOX} - AAEAAQ=="));
     syntax(&format!("@cid POST {BOX} - AAEAAQ=="));
     syntax("@ref ANON");
+    // A number, seq or epoch above 2^63-1 is bad-syntax, though the
+    // grammar admits 19 digits (3.3).
+    let (tok, th) = (token(), token_hash());
+    rt(&format!("TOKEN {BOX} 9223372036854775807 {tok} {th}"));
+    syntax(&format!("TOKEN {BOX} 9223372036854775808 {tok} {th}"));
+    syntax(&format!("TOKEN {BOX} 9999999999999999999 {tok} {th}"));
+    rt(&format!("FETCH {BOX} after=9223372036854775807"));
+    syntax(&format!("FETCH {BOX} after=9223372036854775808"));
+    syntax(&format!("FETCH {BOX} after=1 limit=9223372036854775808"));
 }
 
 #[test]
@@ -704,6 +713,25 @@ fn hand_built_requests_are_checked() {
         uids: vec!["a@b.org".parse().unwrap(), "~sam".parse().unwrap()],
     });
     assert_eq!(ok.to_string(), "WATCH a@b.org,~sam");
+}
+
+#[test]
+fn watch_holds_a_thousand_long_uids() {
+    // 8.3: a server must allow at least 1,000 uids, so WATCH is a long
+    // line (2.3). 1,000 uids of the longest kind fit in 1 MiB.
+    let name = "n".repeat(crate::names::MAX_NAME_LEN);
+    let domain = format!("{}.{}.{}.{}", "a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61));
+    let uids: Vec<String> = (0..1000)
+        .map(|i| format!("{}{i:04}@{domain}", &name[4..]))
+        .collect();
+    let line = format!("WATCH {}", uids.join(","));
+    assert!(line.len() > crate::frame::MAX_CLIENT_LINE);
+    assert!(line.len() < crate::frame::MAX_LONG_CLIENT_LINE);
+    assert!(uids[0].len() == crate::names::MAX_UID_LEN);
+    match parse(&line).unwrap().command {
+        Command::Watch { uids } => assert_eq!(uids.len(), 1000),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! and DROP (6.1, 10.4), and REPORT and RESOLVED (5.8).
 
 use super::ServerLine;
-use crate::binary::ReportData;
+use crate::binary::ReportRef;
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params, Tags};
 use crate::mls::{MlsMessage, OrBlob, Pseudonym, TokenHash};
@@ -87,8 +87,8 @@ pub struct Report {
     pub from: Option<Uid>,
     /// The mailbox the reported posts are in.
     pub mailbox: BoxName,
-    /// The RisalaReport.
-    pub report: ReportData,
+    /// The RisalaReport, or the blob-ref the reporter sent for it.
+    pub report: ReportRef,
 }
 
 /// Parses the lines of this module; `None` for any other verb.

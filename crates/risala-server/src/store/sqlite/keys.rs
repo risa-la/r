@@ -151,7 +151,7 @@ impl KeysStore for SqliteStore {
                     uid.as_str(),
                     backup.generation,
                     &backup.hash.hash()[..],
-                    backup.key.decode(),
+                    &backup.key.as_bytes()[..],
                     backup.files.as_ref().map(|files| &files.hash()[..]),
                     millis(now)
                 ],

@@ -58,9 +58,9 @@ pub const MAX_REGISTER_LINE: usize = 65536;
 
 /// The verbs of client lines that may be long once the connection has a
 /// kind (2.3), in upper case: the commands that carry MLS data, records,
-/// pairing messages or reports.
-pub const CLIENT_LONG_VERBS: [&str; 7] = [
-    "CREATE", "KEYPKG", "KEYS", "PAIR", "POST", "REPORT", "WELCOME",
+/// pairing messages or reports, and WATCH for its list of uids (8.3).
+pub const CLIENT_LONG_VERBS: [&str; 8] = [
+    "CREATE", "KEYPKG", "KEYS", "PAIR", "POST", "REPORT", "WATCH", "WELCOME",
 ];
 
 /// The verbs of server lines that may be long (2.3), in upper case.
@@ -821,8 +821,9 @@ mod tests {
             assert_eq!(new.for_verb(verb), MAX_REGISTER_LINE);
         }
         assert_eq!(new.for_verb("KEYS"), MAX_REGISTER_LINE);
-        // Clients send CREATE and KEYS; servers send GROUPINFO.
-        for verb in ["CREATE", "KEYS"] {
+        // Clients send CREATE, KEYS and WATCH, whose list of 1,000 uids
+        // does not fit in 8192 bytes (8.3); servers send GROUPINFO.
+        for verb in ["CREATE", "KEYS", "WATCH", "watch"] {
             assert!(client.is_long_verb(verb));
             assert!(!server.is_long_verb(verb));
         }

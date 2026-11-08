@@ -82,7 +82,7 @@ use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use crate::auth::Signature;
-use crate::binary::{EncodedRecords, ReportData};
+use crate::binary::{EncodedRecords, ReportRef};
 use crate::connection::{ConnectionKind, Kinds};
 use crate::error::{ErrorCode, ParseError};
 use crate::line::{Line, LineBuilder, Params, Tags};
@@ -365,8 +365,8 @@ pub enum Command {
     Report {
         /// The mailbox the posts are in.
         mailbox: BoxName,
-        /// The RisalaReport.
-        report: ReportData,
+        /// The RisalaReport, or a blob that holds it.
+        report: ReportRef,
     },
 
     // ---- 6.1
