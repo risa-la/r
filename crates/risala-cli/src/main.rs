@@ -563,8 +563,24 @@ async fn run(cli: Cli) -> Res {
     let (dir, own) = state_dir(cli.state)?;
     let ctx = open(&dir, own, cli.account)?;
     let result = command(&ctx, cli.command).await;
+    settle(&ctx).await;
     ctx.client.shutdown().await;
     result
+}
+
+/// Lets each signed-in account finish what its connection started before
+/// the process ends: uploading KeyPackages, joining groups, sending keys
+/// to new devices (Section 12). Otherwise a device that only ever runs
+/// short commands would leave that work half done every time.
+async fn settle(ctx: &Ctx) {
+    let Ok(accounts) = ctx.client.accounts() else {
+        return;
+    };
+    for account in accounts {
+        if account.state().is_online() {
+            let _ = tokio::time::timeout(WAIT, account.wait_synced()).await;
+        }
+    }
 }
 
 async fn command(ctx: &Ctx, command: Command) -> Res {
@@ -873,6 +889,11 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             // Not cut short by WAIT: the library settles a lost answer
             // itself (4.6), and the session's keepalive bounds the wait.
             let account = client.register(&server, &name).await.or_else(explain)?;
+            // Sign in once, so that the device uploads its KeyPackages and
+            // others can add it to their groups (12.4).
+            if let Err(e) = try_connect(&account).await {
+                eprintln!("risala: registered, but could not sign in yet: {e}");
+            }
             let uid = account.uid();
             let line = client
                 .key_line(&uid, label.as_deref().unwrap_or(""))
