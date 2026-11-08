@@ -13,7 +13,7 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{Relation, Role, RoomSetting, SendMode};
 use risala_server::testing::{TestIdentity, TestServer};
 
-use crate::actors::{Actor, Pool, Refused};
+use crate::actors::{Actor, Pool, Who, part};
 use crate::plan::{Act, ME, Plan};
 use crate::rng::Rng;
 
@@ -34,17 +34,16 @@ pub fn actors(plan: &Plan, seed: u64) -> Vec<Actor> {
         .iter()
         .enumerate()
         .map(|(who, p)| {
-            if p.guest {
-                Actor::guest(p.name.parse().expect("a guest name"), &p.display)
+            let who = if p.guest {
+                let name = p.name.parse().expect("a guest name");
+                Who::Guest { name, token: None }
             } else {
                 let identity = format!("{}@{IDENTITY_DOMAIN}", p.name)
                     .parse()
                     .expect("an identity");
-                let mut actor =
-                    Actor::identity(TestIdentity::with_key(identity, key_for(seed, who)));
-                actor.display = p.display.clone();
-                actor
-            }
+                Who::Identity(TestIdentity::with_key(identity, key_for(seed, who)))
+            };
+            Actor::new(who, &p.display)
         })
         .collect()
 }
@@ -69,7 +68,7 @@ struct RoomState {
     me_joined: Option<Seq>,
     /// Messages from others that count as unread, oldest first, with
     /// whether they are still there (not deleted).
-    counted: Vec<(Seq, usize, bool)>,
+    counted: Vec<(Seq, bool)>,
 }
 
 /// Seeds `plan` on `server`, whose manual clock must stand at or before
@@ -114,10 +113,7 @@ pub async fn seed(server: &TestServer, plan: &Plan, seed: u64, end: Timestamp) -
         let command = match &item.act {
             Act::Register => unreachable!("handled above"),
             Act::Create | Act::Join => Command::Join { room: room.clone() },
-            Act::Part => Command::Part {
-                room: room.clone(),
-                reason: String::new(),
-            },
+            Act::Part => part(&room),
             Act::Topic(topic) => Command::Set {
                 room: room.clone(),
                 setting: RoomSetting::Topic(escape(topic)),
@@ -133,51 +129,27 @@ pub async fn seed(server: &TestServer, plan: &Plan, seed: u64, end: Timestamp) -
             },
             Act::Msg { n, text, reply } => {
                 new_message = Some(*n);
-                Command::Msg {
-                    conv: conv.clone(),
-                    text: escape(text),
-                    relation: reply
-                        .and_then(|r| message_seq(state, r))
-                        .map(Relation::Reply),
-                    file: None,
-                    cid: Some(pool.cid()),
-                    id: None,
-                }
+                let reply = reply.and_then(|r| message_seq(state, r));
+                pool.msg(conv.clone(), text, reply.map(Relation::Reply))
             }
             Act::Edit { target, text } => {
                 let Some(seq) = message_seq(state, *target) else {
                     continue;
                 };
-                Command::Msg {
-                    conv: conv.clone(),
-                    text: escape(text),
-                    relation: Some(Relation::Edit(seq)),
-                    file: None,
-                    cid: Some(pool.cid()),
-                    id: None,
-                }
+                pool.msg(conv.clone(), text, Some(Relation::Edit(seq)))
             }
             Act::React { target, emoji } => {
                 let Some(seq) = message_seq(state, *target) else {
                     continue;
                 };
-                Command::Msg {
-                    conv: conv.clone(),
-                    text: escape(emoji),
-                    relation: Some(Relation::React(seq)),
-                    file: None,
-                    cid: Some(pool.cid()),
-                    id: None,
-                }
+                pool.msg(conv.clone(), emoji, Some(Relation::React(seq)))
             }
             Act::Delete { target } => {
                 let Some(seq) = message_seq(state, *target) else {
                     continue;
                 };
-                for c in &mut state.counted {
-                    if c.0 == seq {
-                        c.2 = false;
-                    }
+                for c in state.counted.iter_mut().filter(|c| c.0 == seq) {
+                    c.1 = false;
                 }
                 Command::Delete {
                     conv: conv.clone(),
@@ -187,7 +159,7 @@ pub async fn seed(server: &TestServer, plan: &Plan, seed: u64, end: Timestamp) -
             }
             Act::Read => {
                 let want = plan.rooms[item.room].unread;
-                let alive: Vec<Seq> = state.counted.iter().filter(|c| c.2).map(|c| c.0).collect();
+                let alive: Vec<Seq> = state.counted.iter().filter(|c| c.1).map(|c| c.0).collect();
                 let marker = if want == 0 {
                     state.head
                 } else if want < alive.len() {
@@ -218,13 +190,14 @@ pub async fn seed(server: &TestServer, plan: &Plan, seed: u64, end: Timestamp) -
                     }
                     state.messages[n] = Some(seq);
                     if a != ME {
-                        state.counted.push((seq, n, true));
+                        state.counted.push((seq, true));
                     }
                 }
             }
             Err(e) => {
                 refused += 1;
-                report_refusal(&uids[a], verb, &room, &e);
+                // Without the step's text.
+                eprintln!("\rrisala-dev: {}: {verb} {room}: {e}", uids[a]);
             }
         }
     }
@@ -266,9 +239,4 @@ fn verb(act: &Act) -> &'static str {
         Act::Delete { .. } => "DELETE",
         Act::Read => "READ",
     }
-}
-
-/// Reports a refused step, without its text.
-fn report_refusal(who: &Uid, verb: &str, room: &Room, e: &Refused) {
-    eprintln!("\rrisala-dev: {who}: {verb} {room}: {e}");
 }

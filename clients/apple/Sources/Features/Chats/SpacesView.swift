@@ -125,55 +125,28 @@ struct SpacesView: View {
     // MARK: Rows and search
 
     private func row(_ space: Space, isBest: Bool = false) -> some View {
-        Button {
+        ResultRow(isBest: isBest) {
             choose(space.id)
         } label: {
-            HStack(spacing: 10) {
-                if let identity = spaces.identity(space.identity) {
-                    IdentityChip(identity: identity)
-                        .frame(width: Layout.chipSizeLarge)
-                }
-                Text(terminal: space.id.rawValue.leftToRightIsolated)
-                    .foregroundStyle(.text)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 0)
-                if !space.isReachable {
-                    Text("offline").font(Typography.terminalSmall).foregroundStyle(.wax)
-                } else if space.mentions > 0 {
-                    Text(verbatim: "@").fontWeight(.bold).foregroundStyle(.mention)
-                        .accessibilityLabel(Text("\(space.mentions) mentions"))
-                } else if space.unreadChats > 0 {
-                    Text(count: space.unreadChats)
-                        .fontWeight(.bold).foregroundStyle(.ink)
-                        .monospacedDigit()
-                        .fixedSize()
-                        .accessibilityLabel(Text("\(space.unreadChats) unread chats"))
-                }
-                if isBest {
-                    Text(verbatim: "↵").foregroundStyle(.ink).accessibilityHidden(true)
-                }
+            if let identity = spaces.identity(space.identity) {
+                IdentityChip(identity: identity)
+                    .frame(width: Layout.chipSizeLarge)
             }
-            .font(Typography.terminal)
-            .padding(.horizontal, Layout.chatRowHorizontalPadding)
-            .frame(minHeight: Layout.minimumTouchTarget)
-            .background(isBest ? Color.location.opacity(0.12) : .clear)
-            .contentShape(.rect)
+            SpaceName(space: space)
+            Spacer(minLength: 0)
+            if !space.isReachable {
+                Text("offline").font(Typography.terminalSmall).foregroundStyle(.wax)
+            } else {
+                UnreadMark(
+                    mentions: space.mentions, unread: space.unreadChats,
+                    unreadLabel: Text("\(space.unreadChats) unread chats"))
+            }
         }
-        .buttonStyle(.plain)
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
         .contextMenu {
-            Button {
-                toggleFavourite(space)
-            } label: {
-                if space.isFavourite {
-                    Label("Remove from favourites", systemImage: "star.slash")
-                } else {
-                    Label("Add to favourites", systemImage: "star")
-                }
-            }
+            FavouriteButton(isFavourite: space.isFavourite) { toggleFavourite(space) }
         }
     }
 

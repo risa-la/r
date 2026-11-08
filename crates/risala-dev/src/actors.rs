@@ -13,8 +13,23 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use risala_proto::command::{Command, GuestToken, Request};
 use risala_proto::names::{Conv, Name, Room, Seq, Uid};
 use risala_proto::server::{EventBody, OkResponse, ServerLine, ServerMessage};
-use risala_proto::types::{Cid, Ref};
+use risala_proto::types::{Ref, Relation};
 use risala_server::testing::{TestClient, TestIdentity, TestServer};
+
+/// Leaves `room`, giving no reason.
+pub fn part(room: &Room) -> Command {
+    Command::Part {
+        room: room.clone(),
+        reason: String::new(),
+    }
+}
+
+/// Sets someone's display name (8.2).
+fn set_name(display: &str) -> Command {
+    Command::Name {
+        display_name: risala_proto::text::escape(display),
+    }
+}
 
 use crate::rng::Rng;
 
@@ -52,19 +67,9 @@ pub struct Actor {
 }
 
 impl Actor {
-    pub fn identity(identity: TestIdentity) -> Actor {
+    pub fn new(who: Who, display: &str) -> Actor {
         Actor {
-            who: Who::Identity(identity),
-            display: String::new(),
-            conn: None,
-            used: 0,
-            rooms: BTreeSet::new(),
-        }
-    }
-
-    pub fn guest(name: Name, display: &str) -> Actor {
-        Actor {
-            who: Who::Guest { name, token: None },
+            who,
             display: display.to_owned(),
             conn: None,
             used: 0,
@@ -130,13 +135,20 @@ impl<'a> Pool<'a> {
         }
     }
 
-    /// A cid (7.6), so that a message sent again after a lost connection
-    /// is not stored twice.
-    pub fn cid(&mut self) -> Cid {
+    /// A MSG with a cid (7.6), so that a message sent again after a lost
+    /// connection is not stored twice.
+    pub fn msg(&mut self, conv: Conv, text: &str, relation: Option<Relation>) -> Command {
         let hex: String = (0..3)
             .map(|_| format!("{:016x}", self.rng.next_u64()))
             .collect();
-        hex.parse().expect("hex digits are a cid")
+        Command::Msg {
+            conv,
+            text: risala_proto::text::escape(text),
+            relation,
+            file: None,
+            cid: Some(hex.parse().expect("hex digits are a cid")),
+            id: None,
+        }
     }
 
     /// Runs `command` as actor `a` and returns the server's OK, or its
@@ -156,12 +168,12 @@ impl<'a> Pool<'a> {
             }
             match self.exchange(a, &command).await {
                 Ok(result) => {
-                    self.actors[a].used = self.commands;
-                    if let (Ok(_), Command::Join { room }) = (&result, &command) {
-                        self.actors[a].rooms.insert(room.clone());
-                    }
-                    if let (Ok(_), Command::Part { room, .. }) = (&result, &command) {
-                        self.actors[a].rooms.remove(room);
+                    let actor = &mut self.actors[a];
+                    actor.used = self.commands;
+                    match (&result, &command) {
+                        (Ok(_), Command::Join { room }) => _ = actor.rooms.insert(room.clone()),
+                        (Ok(_), Command::Part { room, .. }) => _ = actor.rooms.remove(room),
+                        _ => {}
                     }
                     return result;
                 }
@@ -281,10 +293,7 @@ impl<'a> Pool<'a> {
         let display = actor.display.clone();
         let rooms: Vec<Room> = actor.rooms.iter().cloned().collect();
         if !display.is_empty() {
-            let name = Command::Name {
-                display_name: risala_proto::text::escape(&display),
-            };
-            let _ = self.exchange(a, &name).await;
+            let _ = self.exchange(a, &set_name(&display)).await;
         }
         if token.is_some() {
             // The session ended while the connection was closed: back
@@ -305,13 +314,10 @@ impl<'a> Pool<'a> {
         self.actors[a].conn = Some(conn);
         self.actors[a].used = self.commands;
         let display = self.actors[a].display.clone();
-        if !display.is_empty() {
-            let name = Command::Name {
-                display_name: risala_proto::text::escape(&display),
-            };
-            if let Err(e) = self.call(a, name).await {
-                panic!("{}: NAME: {e}", self.actors[a].uid());
-            }
+        if !display.is_empty()
+            && let Err(e) = self.call(a, set_name(&display)).await
+        {
+            panic!("{}: NAME: {e}", self.actors[a].uid());
         }
     }
 

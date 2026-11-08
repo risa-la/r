@@ -88,7 +88,6 @@ final class TestChatClient: ChatClient {
     /// The filter of each chat list subscription, in order.
     private(set) var chatFilters: [ChatFilter] = []
     private(set) var loadMoreRequests = 0
-    private(set) var favourites: [Chat.ID: Bool] = [:]
     private var nextMessageID = 0
 
     init(holdsSends: Bool = false, holdsOlderPages: Bool = false) {
@@ -170,11 +169,7 @@ final class TestChatClient: ChatClient {
         chatSubscribed.yield(())
         return ChatListSubscription(
             initial: initial, counts: counts(initial), batches: batches,
-            loadMore: { [self] _ in await self.countLoadMore() })
-    }
-
-    private func countLoadMore() {
-        loadMoreRequests += 1
+            loadMore: { [self] _ in await MainActor.run { self.loadMoreRequests += 1 } })
     }
 
     /// Every chat the library has, newest first, for `chat(_:)` and searches.
@@ -202,9 +197,7 @@ final class TestChatClient: ChatClient {
 
     @MainActor func setFavourite(_ isFavourite: Bool, space: Space.ID) async throws {}
 
-    @MainActor func setFavourite(_ isFavourite: Bool, for chatID: Chat.ID) async throws {
-        favourites[chatID] = isFavourite
-    }
+    @MainActor func setFavourite(_ isFavourite: Bool, for chatID: Chat.ID) async throws {}
 
     /// The read marker each chat's timeline opens with.
     var firstUnread: [Chat.ID: Message.ID] = [:]

@@ -1,82 +1,78 @@
 import SwiftUI
 
+/// The open chat: the phone's pushed screen, or the chat pane beside the list on
+/// large screens.
 struct ConversationView: View {
-    /// The phone's pushed screen, or the chat pane beside the list on large screens.
-    enum Placement {
-        /// The identity you speak as, for the composer.
-        case screen(identity: Identity?)
-        case pane(Pane)
-    }
-
     /// What a chat pane needs from the window around it.
     struct Pane {
         /// Whether the pane has the focus, so its composer shows the mode.
         var isFocused: Bool
-        /// The identity you speak as in the open chat.
-        var identity: Identity?
         var isListHidden: Bool
         var toggleList: () -> Void
         var close: () -> Void
     }
 
     @Bindable var model: ConversationViewModel
-    var placement = Placement.screen(identity: nil)
+    /// The identity you speak as, for the composer.
+    var identity: Identity?
+    /// Set in a pane; `nil` on the phone.
+    var pane: Pane?
 
     var body: some View {
         Group {
-            switch placement {
-            case .screen(let identity): screen(identity: identity)
-            case .pane(let pane): self.pane(pane)
+            if let chat = model.chat {
+                if let pane {
+                    VStack(spacing: 0) {
+                        PaneChatHeader(chat: chat, pane: pane)
+                        timeline(for: chat, showsTopic: false)
+                        bottom(for: chat, showsMode: pane.isFocused)
+                    }
+                    .id(chat.id)
+                } else {
+                    timeline(for: chat, showsTopic: true)
+                        .safeAreaInset(edge: .bottom, spacing: 0) {
+                            // The same bottom bar as the chat list: the mode, who you
+                            // speak as, and the prompt.
+                            bottom(for: chat, showsMode: true)
+                                .background {
+                                    LinearGradient(
+                                        colors: [Color.surface.opacity(0), .surface],
+                                        startPoint: .top, endPoint: .center
+                                    )
+                                    .ignoresSafeArea()
+                                }
+                        }
+                        .background(Color.surface.ignoresSafeArea())
+                        .id(chat.id)
+                        .navigationTitle(chat.name)
+                        .toolbarTitleDisplayMode(.inline)
+                }
+            } else {
+                noChatOpen
             }
         }
         .task(id: model.timelineID) { await model.observeTimeline() }
     }
 
-    // MARK: Screen
-
-    @ViewBuilder
-    private func screen(identity: Identity?) -> some View {
-        if let chat = model.chat {
-            timeline(for: chat, showsTopic: true)
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    // The same bottom bar as the chat list: the mode, who you speak
-                    // as, and the prompt, with the typing line above it.
-                    VStack(spacing: 0) {
-                        if !chat.typing.isEmpty {
-                            typingLine(chat.typing)
-                        }
-                        composer(for: chat, identity: identity, showsMode: true)
-                            .padding(.horizontal, Layout.modeBarInset)
-                            .padding(.bottom, 4)
-                    }
-                    .background {
-                        LinearGradient(
-                            colors: [Color.surface.opacity(0), .surface], startPoint: .top,
-                            endPoint: .center
-                        )
-                        .ignoresSafeArea()
-                    }
-                }
-                .background(Color.surface.ignoresSafeArea())
-                .id(chat.id)
-                .navigationTitle(chat.name)
-                .toolbarTitleDisplayMode(.inline)
-        } else {
-            noChatOpen
-        }
-    }
-
-    private func composer(for chat: Chat, identity: Identity?, showsMode: Bool) -> some View {
-        MessageComposer(
-            roomName: chat.kind == .room ? "#" + chat.name : chat.name,
-            draft: $model.draft,
-            canSend: model.canSend,
-            sendFailed: model.sendFailed,
-            identity: identity,
-            showsMode: showsMode
-        ) {
-            // A submitted send survives the conversation view disappearing.
-            Task { [model] in await model.sendMessage() }
+    /// The typing line, then the composer.
+    private func bottom(for chat: Chat, showsMode: Bool) -> some View {
+        VStack(spacing: 0) {
+            if !chat.typing.isEmpty {
+                typingLine(chat.typing)
+            }
+            MessageComposer(
+                roomName: chat.kind == .room ? "#" + chat.name : chat.name,
+                draft: $model.draft,
+                canSend: model.canSend,
+                sendFailed: model.sendFailed,
+                identity: identity,
+                showsMode: showsMode
+            ) {
+                // A submitted send survives the conversation view disappearing.
+                Task { [model] in await model.sendMessage() }
+            }
+            .padding(.horizontal, pane == nil ? Layout.modeBarInset : 16)
+            .padding(.bottom, pane == nil ? 4 : 14)
         }
     }
 
@@ -88,27 +84,6 @@ struct ConversationView: View {
             .multilineTextAlignment(.center)
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: Pane
-
-    @ViewBuilder
-    private func pane(_ pane: Pane) -> some View {
-        if let chat = model.chat {
-            VStack(spacing: 0) {
-                PaneChatHeader(chat: chat, pane: pane)
-                timeline(for: chat, showsTopic: false)
-                if !chat.typing.isEmpty {
-                    typingLine(chat.typing)
-                }
-                composer(for: chat, identity: pane.identity, showsMode: pane.isFocused)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 14)
-            }
-            .id(chat.id)
-        } else {
-            noChatOpen
-        }
     }
 
     /// `farah, karim +2 typing` under the timeline, lined up with it.
@@ -142,13 +117,7 @@ struct ConversationView: View {
                 HStack(spacing: 4) {
                     Text("Unable to load messages.")
                         .foregroundStyle(.textSecondary)
-                    Button {
-                        model.retryTimeline()
-                    } label: {
-                        Text("Try again").fontWeight(.bold).foregroundStyle(.ink)
-                            .minimumTouchTarget()
-                    }
-                    .buttonStyle(.plain)
+                    TryAgainButton(action: model.retryTimeline)
                 }
                 .font(Typography.terminalSmall)
                 .padding(.horizontal)
@@ -183,18 +152,16 @@ private struct PaneChatHeader: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 ChatName(chat: chat)
                     .foregroundStyle(.text)
-                if let present = chat.presentCount {
-                    Text("\(present) here")
-                        .foregroundStyle(.textTertiary)
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .fixedSize()
-                } else if chat.isOnline == true {
-                    Text("online")
-                        .foregroundStyle(.textTertiary)
-                        .lineLimit(1)
-                        .fixedSize()
+                Group {
+                    if let present = chat.presentCount {
+                        Text("\(present) here").monospacedDigit()
+                    } else if chat.isOnline == true {
+                        Text("online")
+                    }
                 }
+                .foregroundStyle(.textTertiary)
+                .lineLimit(1)
+                .fixedSize()
             }
             .font(Typography.paneTitle)
             .accessibilityElement(children: .combine)

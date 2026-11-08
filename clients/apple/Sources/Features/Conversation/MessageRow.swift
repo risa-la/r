@@ -15,9 +15,9 @@ struct MessageRow: View {
     @Environment(\.layoutDirection) private var layoutDirection
 
     var body: some View {
-        if message.kind == .message {
-            HStack(alignment: .firstTextBaseline, spacing: Layout.gutterSpacing) {
-                TimeGutter(message: message, showsTime: !continuesGroup)
+        HStack(alignment: .firstTextBaseline, spacing: Layout.gutterSpacing) {
+            TimeGutter(message: message, showsTime: message.kind != .message || !continuesGroup)
+            if message.kind == .message {
                 VStack(alignment: .leading, spacing: 0) {
                     content
                         .accessibilityElement(children: .combine)
@@ -26,10 +26,7 @@ struct MessageRow: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        } else {
-            HStack(alignment: .firstTextBaseline, spacing: Layout.gutterSpacing) {
-                TimeGutter(message: message, showsTime: true)
+            } else {
                 EventLine(message: message)
             }
         }
@@ -164,9 +161,7 @@ struct MessageRow: View {
                 }
             }
             .foregroundStyle(.wax)
-            Button(action: retry) {
-                Text("Try again").fontWeight(.bold).foregroundStyle(.ink).minimumTouchTarget()
-            }
+            TryAgainButton(action: retry)
             Button(role: .destructive, action: discard) {
                 Text("Remove").foregroundStyle(.textSecondary).minimumTouchTarget()
             }
@@ -347,13 +342,11 @@ private struct WrappingStack: SwiftUI.Layout {
         var current = Row()
         for index in subviews.indices {
             let size = subviews[index].sizeThatFits(.unspecified)
-            let needed = current.indices.isEmpty ? size.width : current.width + spacing + size.width
-            if needed > available, !current.indices.isEmpty {
+            if !current.indices.isEmpty, current.width + spacing + size.width > available {
                 rows.append(current)
                 current = Row()
             }
-            current.width =
-                current.indices.isEmpty ? size.width : current.width + spacing + size.width
+            current.width += (current.indices.isEmpty ? 0 : spacing) + size.width
             current.height = max(current.height, size.height)
             current.indices.append(index)
         }

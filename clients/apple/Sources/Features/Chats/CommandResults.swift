@@ -95,54 +95,74 @@ struct CommandResults: View {
     }
 
     private func row(_ item: CommandItem, isBest: Bool) -> some View {
-        Button {
+        ResultRow(
+            isBest: isBest,
+            horizontalPadding: Layout.chatRowHorizontalPadding - Layout.modeBarInset
+        ) {
             choose(item)
         } label: {
-            HStack(spacing: 10) {
-                switch item {
-                case .chat(let chat):
-                    ChatMark(chat: chat, isSmall: true)
-                    HStack(spacing: 7) {
-                        ChatName(chat: chat)
-                            .font(Typography.chatPreview)
-                            .foregroundStyle(.text)
-                        if let identity = spaces.identity(chat.identity), !identity.isMain {
-                            IdentityChip(identity: identity)
-                                .layoutPriority(1)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                    if chat.mentionCount > 0 {
-                        Text(verbatim: "@").fontWeight(.bold).foregroundStyle(.mention)
-                            .accessibilityLabel(Text("\(chat.mentionCount) mentions"))
-                    } else if chat.unreadCount > 0 {
-                        Text(count: chat.unreadCount)
-                            .fontWeight(.bold).foregroundStyle(.ink)
-                            .monospacedDigit()
-                            .fixedSize()
-                            .accessibilityLabel(Text("\(chat.unreadCount) unread"))
-                    }
-                case .space(let space):
-                    if let identity = spaces.identity(space.identity) {
-                        IdentityChip(identity: identity, isLarge: true)
-                    }
-                    Text(terminal: space.id.rawValue.leftToRightIsolated)
+            switch item {
+            case .chat(let chat):
+                ChatMark(chat: chat, isSmall: true)
+                HStack(spacing: 7) {
+                    ChatName(chat: chat)
+                        .font(Typography.chatPreview)
                         .foregroundStyle(.text)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer(minLength: 0)
-                    Text("space").foregroundStyle(.textTertiary)
+                    if let identity = spaces.identity(chat.identity), !identity.isMain {
+                        IdentityChip(identity: identity)
+                            .layoutPriority(1)
+                    }
                 }
+                Spacer(minLength: 0)
+                UnreadMark(
+                    mentions: chat.mentionCount, unread: chat.unreadCount,
+                    unreadLabel: Text("\(chat.unreadCount) unread"))
+            case .space(let space):
+                if let identity = spaces.identity(space.identity) {
+                    IdentityChip(identity: identity, isLarge: true)
+                }
+                SpaceName(space: space)
+                Spacer(minLength: 0)
+                Text("space").foregroundStyle(.textTertiary)
+            }
+        }
+    }
+}
+
+/// A result of the command line or the spaces search. The best match, nearest the
+/// prompt, is tinted and marked `↵`, for Return.
+struct ResultRow<Label: View>: View {
+    let isBest: Bool
+    var horizontalPadding = Layout.chatRowHorizontalPadding
+    let action: () -> Void
+    @ViewBuilder let label: Label
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                label
                 if isBest {
                     Text(verbatim: "↵").foregroundStyle(.ink).accessibilityHidden(true)
                 }
             }
             .font(Typography.terminal)
-            .padding(.horizontal, Layout.chatRowHorizontalPadding - Layout.modeBarInset)
+            .padding(.horizontal, horizontalPadding)
             .frame(minHeight: Layout.minimumTouchTarget)
             .background(isBest ? Color.location.opacity(0.12) : .clear)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// A space's full host, read left to right whatever its script, cut in the middle.
+struct SpaceName: View {
+    let space: Space
+
+    var body: some View {
+        Text(terminal: space.id.rawValue.leftToRightIsolated)
+            .foregroundStyle(.text)
+            .lineLimit(1)
+            .truncationMode(.middle)
     }
 }

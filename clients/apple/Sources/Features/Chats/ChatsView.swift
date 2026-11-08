@@ -49,15 +49,8 @@ struct ChatsView: View {
                 // Empty states show neither tabs nor filters.
                 if !isPane, !model.hasNoChats, model.state != .disconnected {
                     SpaceTabs(
-                        spaces: model.spaces,
-                        selection: $model.filter.space,
-                        allUnread: model.spaces.spaces.reduce(0) { $0 + $1.unreadChats },
-                        allMentions: model.spaces.spaces.reduce(0) { $0 + $1.mentions },
-                        showAll: { showsSpaces = true },
-                        toggleFavourite: { space in
-                            Task { await model.setFavourite(!space.isFavourite, space: space) }
-                        }
-                    )
+                        spaces: model.spaces, selection: $model.filter.space,
+                        showAll: { showsSpaces = true }, toggleFavourite: model.toggleFavourite)
                 }
                 if model.isInterrupted {
                     interruptedLine
@@ -185,13 +178,7 @@ struct ChatsView: View {
             Text("Chats aren’t updating.")
                 .foregroundStyle(.textSecondary)
             Spacer(minLength: 0)
-            Button(action: model.retry) {
-                Text("Try again")
-                    .fontWeight(.bold)
-                    .foregroundStyle(.ink)
-                    .minimumTouchTarget()
-            }
-            .buttonStyle(.plain)
+            TryAgainButton(action: model.retry)
         }
         .font(Typography.terminalSmall)
         .lineLimit(2)
@@ -201,9 +188,11 @@ struct ChatsView: View {
     // MARK: Command line
 
     /// Springy where motion is welcome; a short crossfade under Reduce Motion.
-    private var motion: Animation {
+    static func commandLineMotion(reduceMotion: Bool) -> Animation {
         reduceMotion ? .easeInOut(duration: 0.15) : .spring(response: 0.34, dampingFraction: 0.86)
     }
+
+    private var motion: Animation { Self.commandLineMotion(reduceMotion: reduceMotion) }
 
     /// The field takes focus as it appears in the mode bar.
     private func beginCommand() {
@@ -228,11 +217,8 @@ struct ChatsView: View {
 
     private var spacesPage: some View {
         SpacesView(
-            spaces: model.spaces,
-            select: { model.filter.space = $0 },
-            toggleFavourite: { space in
-                Task { await model.setFavourite(!space.isFavourite, space: space) }
-            })
+            spaces: model.spaces, select: { model.filter.space = $0 },
+            toggleFavourite: model.toggleFavourite)
     }
 
     /// What to show instead of rows, if anything.
@@ -274,9 +260,7 @@ struct ChatsView: View {
                     Section {
                         noMatches
                     } header: {
-                        SectionLine(title: Text("today"), fill: fill, holdsControls: true) {
-                            filters
-                        }
+                        sectionLine(Text("today"), holdsFilters: true)
                     }
                 }
                 ForEach(Array(sections.enumerated()), id: \.element.0) { index, entry in
@@ -285,13 +269,7 @@ struct ChatsView: View {
                             row(chat, now: context.date)
                         }
                     } header: {
-                        if index == 0 {
-                            SectionLine(title: entry.0.title, fill: fill, holdsControls: true) {
-                                filters
-                            }
-                        } else {
-                            SectionLine(title: entry.0.title, fill: fill)
-                        }
+                        sectionLine(entry.0.title, holdsFilters: index == 0)
                     }
                 }
             }
@@ -325,10 +303,21 @@ struct ChatsView: View {
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
         .listRowBackground(rowBackground(isSelected: selection == chat.id))
-        .contextMenu { favouriteButton(for: chat) }
+        .contextMenu {
+            FavouriteButton(isFavourite: chat.isFavourite) { model.toggleFavourite(chat) }
+        }
         .onAppear {
             if chat.id == model.chats.last?.id {
                 Task { await model.loadMore() }
+            }
+        }
+    }
+
+    /// A section line; the first one holds the filters.
+    private func sectionLine(_ title: Text, holdsFilters: Bool) -> some View {
+        SectionLine(title: title, fill: fill, holdsControls: holdsFilters) {
+            if holdsFilters {
+                ChatFilterSwitches(filter: $model.filter, counts: model.counts)
             }
         }
     }
@@ -355,18 +344,6 @@ struct ChatsView: View {
         }
     }
 
-    private func favouriteButton(for chat: Chat) -> some View {
-        Button {
-            Task { await model.setFavourite(!chat.isFavourite, for: chat) }
-        } label: {
-            if chat.isFavourite {
-                Label("Remove from favourites", systemImage: "star.slash")
-            } else {
-                Label("Add to favourites", systemImage: "star")
-            }
-        }
-    }
-
     /// The filters leave nothing to show; the chats themselves are fine.
     private var noMatches: some View {
         Text("No chats match these filters.")
@@ -378,10 +355,6 @@ struct ChatsView: View {
             .listRowInsets(EdgeInsets())
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
-    }
-
-    private var filters: some View {
-        ChatFilterSwitches(filter: $model.filter, counts: model.counts)
     }
 }
 
@@ -420,14 +393,12 @@ struct ChatFilterSwitches: View {
                 .accessibilityLabel(Text("Mentions"))
                 .accessibilityValue(Text("\(counts.mentions) unread"))
             }
-            toggle(isOn: $filter.unread, fill: .ink, offStyle: .textSecondary) { unreadLabel }
+            toggle(isOn: $filter.unread) { unreadLabel }
                 .accessibilityLabel(Text("Unread"))
                 .accessibilityValue(Text("\(counts.unreadChats) chats"))
-            toggle(isOn: $filter.favourites, fill: .ink, offStyle: .textSecondary) {
-                Text("favs")
-            }
-            .accessibilityLabel(Text("Favourites"))
-            toggle(isOn: $filter.rooms, fill: .ink, offStyle: .textSecondary) { Text("rooms") }
+            toggle(isOn: $filter.favourites) { Text("favs") }
+                .accessibilityLabel(Text("Favourites"))
+            toggle(isOn: $filter.rooms) { Text("rooms") }
                 .accessibilityLabel(Text("Rooms"))
         }
         .lineLimit(1)
@@ -451,7 +422,8 @@ struct ChatFilterSwitches: View {
 
     /// A switch: `label` in `offStyle` while off, in reverse video on `fill` while on.
     private func toggle(
-        isOn: Binding<Bool>, fill: Color, offStyle: Color, label: () -> Text
+        isOn: Binding<Bool>, fill: Color = .ink, offStyle: Color = .textSecondary,
+        label: () -> Text
     ) -> some View {
         Button {
             isOn.wrappedValue.toggle()

@@ -10,10 +10,8 @@ struct ChatsViewModelTests {
     @Test func noClientStaysDisconnected() async {
         let model = ChatsViewModel()
         await model.observe()
-        guard case .disconnected = model.state else {
-            Issue.record("Missing client must not appear as an empty chat list")
-            return
-        }
+        // A missing client must not appear as an empty chat list.
+        #expect(model.state == .disconnected)
         #expect(!model.hasNoChats)
     }
 
@@ -218,10 +216,7 @@ struct ChatsViewModelTests {
         _ = await eventually { model.state == .loaded }
         return observing
     }
-}
 
-@MainActor
-struct ChatsIdentityTests {
     /// Catches every row of a one-identity person carrying a chip, or another identity's
     /// rows losing theirs.
     @Test(.timeLimit(.minutes(1)))

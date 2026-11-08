@@ -13,27 +13,14 @@ struct MessageComposer: View {
     let onSend: () -> Void
     @FocusState private var composerFocused: Bool
 
-    var body: some View {
-        modeBar
-    }
-
-    // MARK: Mode bar
-
     /// `NOR L › message #general`, with Send once there is something to send. Typing
     /// is INS; the mode shows only in the focused pane.
-    private var modeBar: some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if sendFailed {
                 HStack(spacing: 4) {
                     Text("Unable to send message.").foregroundStyle(.wax)
-                    Button {
-                        send()
-                    } label: {
-                        Text("Try again").fontWeight(.bold).foregroundStyle(.ink)
-                            .minimumTouchTarget()
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend)
+                    TryAgainButton(action: send).disabled(!canSend)
                 }
                 .font(Typography.terminalSmall)
                 .padding(.horizontal, 12)

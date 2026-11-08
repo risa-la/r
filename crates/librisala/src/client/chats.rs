@@ -486,25 +486,15 @@ impl ChatState {
                         touched.insert(conv);
                     }
                 }
-                // Names show only in the rows' labels.
-                Change::User { account, .. } => {
-                    touched.extend(
-                        self.rows
-                            .iter()
-                            .filter(|e| e.account == *account)
-                            .map(|e| e.key.1),
-                    );
-                }
-                // Previews and unread counts may change in every one of the
+                // Names show only in the rows' labels. With blocks,
+                // previews and unread counts may change in every one of the
                 // account's conversations.
-                Change::Blocks { account } => {
-                    touched.extend(self.store.conversation_ids(*account)?);
-                    touched.extend(
-                        self.rows
-                            .iter()
-                            .filter(|e| e.account == *account)
-                            .map(|e| e.key.1),
-                    );
+                Change::User { account, .. } | Change::Blocks { account } => {
+                    if matches!(change, Change::Blocks { .. }) {
+                        touched.extend(self.store.conversation_ids(*account)?);
+                    }
+                    let rows = self.rows.iter().filter(|e| e.account == *account);
+                    touched.extend(rows.map(|e| e.key.1));
                 }
                 Change::Members { .. } => {}
             }

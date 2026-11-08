@@ -10,9 +10,8 @@ struct PanesView: View {
     @Binding var selection: Chat.ID?
     @Binding var isCommanding: Bool
     @Binding var showsSpaces: Bool
-    @Binding var isListHidden: Bool
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let isListHidden: Bool
+    let toggleList: () -> Void
 
     private var isListFocused: Bool {
         isCommanding || conversation.chat == nil
@@ -41,16 +40,10 @@ struct PanesView: View {
                 }
                 ConversationView(
                     model: conversation,
-                    placement: .pane(
-                        ConversationView.Pane(
-                            isFocused: !isListFocused,
-                            identity: conversation.chat.flatMap {
-                                chats.spaces.identity($0.identity)
-                            },
-                            isListHidden: !showsList,
-                            toggleList: toggleList,
-                            close: { selection = nil }
-                        ))
+                    identity: conversation.chat.flatMap { chats.spaces.identity($0.identity) },
+                    pane: ConversationView.Pane(
+                        isFocused: !isListFocused, isListHidden: !showsList,
+                        toggleList: toggleList, close: { selection = nil })
                 )
                 .frame(minWidth: Layout.chatPaneMinWidth)
                 .pane(isFocused: !isListFocused)
@@ -66,10 +59,6 @@ struct PanesView: View {
             // The bar sits in the title bar, beside the window buttons.
             .ignoresSafeArea(.container, edges: .top)
         #endif
-    }
-
-    private func toggleList() {
-        withAnimation(reduceMotion ? nil : .snappy) { isListHidden.toggle() }
     }
 
     /// The Mac's close, minimise, and zoom buttons, which the bar makes room for.

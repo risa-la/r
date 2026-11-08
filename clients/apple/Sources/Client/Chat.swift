@@ -26,74 +26,39 @@ nonisolated struct Chat: Identifiable, Hashable, Sendable {
         let delivery: Message.Delivery
     }
 
+    // Properties with defaults are `var` so the memberwise initializer offers them.
     let id: ID
-    let kind: Kind
+    var kind = Kind.room
     /// A room's name, or the other person's display name; user content, shown as is.
     let name: String
     /// In a direct conversation, the other person's uid when it must show apart from
     /// their name, never appended to it; `nil` when the name is enough.
-    let uid: String?
+    var uid: String?
     /// A room's topic; empty when it has none.
-    let topic: String
+    var topic = ""
     /// The space the conversation lives on.
     let space: Space.ID
     /// Which of the person's identities is in it.
     let identity: Identity.ID
     /// Whether the space is that identity's home. Rows name only other spaces.
-    let isOnHomeServer: Bool
+    var isOnHomeServer = true
     /// When something last happened in it; the list is newest first.
     let lastActivity: Date
     /// The newest message, if there is one.
-    let preview: Preview?
+    var preview: Preview?
     /// Messages from others after the read marker.
-    let unreadCount: Int
+    var unreadCount = 0
     /// Unread messages that mention the identity in it.
-    let mentionCount: Int
+    var mentionCount = 0
     /// Display names of the people typing now, in the order they started.
-    let typing: [String]
+    var typing: [String] = []
     /// In a direct conversation, whether the other person is connected; `nil` when
     /// not known, and for rooms.
-    let isOnline: Bool?
+    var isOnline: Bool?
     /// In a room, how many people are connected to it now; `nil` when not known,
     /// and for direct conversations.
-    let presentCount: Int?
-    var isFavourite: Bool
-
-    init(
-        id: ID,
-        kind: Kind = .room,
-        name: String,
-        uid: String? = nil,
-        topic: String = "",
-        space: Space.ID,
-        identity: Identity.ID,
-        isOnHomeServer: Bool = true,
-        lastActivity: Date,
-        preview: Preview? = nil,
-        unreadCount: Int = 0,
-        mentionCount: Int = 0,
-        typing: [String] = [],
-        isOnline: Bool? = nil,
-        presentCount: Int? = nil,
-        isFavourite: Bool = false
-    ) {
-        self.id = id
-        self.kind = kind
-        self.name = name
-        self.uid = uid
-        self.topic = topic
-        self.space = space
-        self.identity = identity
-        self.isOnHomeServer = isOnHomeServer
-        self.lastActivity = lastActivity
-        self.preview = preview
-        self.unreadCount = unreadCount
-        self.mentionCount = mentionCount
-        self.typing = typing
-        self.isOnline = isOnline
-        self.presentCount = presentCount
-        self.isFavourite = isFavourite
-    }
+    var presentCount: Int?
+    var isFavourite = false
 }
 
 /// One of the person's identities, or all their guest names together. Every
@@ -196,15 +161,9 @@ nonisolated struct ChatCounts: Hashable, Sendable {
     /// Chats with unread messages in the current tab, for the unread toggle.
     let unreadChats: Int
     /// Unread mentions in the current tab, for the mentions toggle.
-    let mentions: Int
+    var mentions = 0
     /// Chats that match the filter in all, shown or not yet loaded.
     let total: Int
-
-    init(unreadChats: Int, mentions: Int = 0, total: Int) {
-        self.unreadChats = unreadChats
-        self.mentions = mentions
-        self.total = total
-    }
 
     static let zero = ChatCounts(unreadChats: 0, total: 0)
 }

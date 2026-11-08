@@ -235,16 +235,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         // offline until a client signs in.
         server.restart().await;
         let seconds = outcome.elapsed.as_secs_f64();
-        write_marker(
-            &dir,
-            &Marker {
-                version: STATE_VERSION,
-                scenario: cli.scenario,
-                seed,
-                seeded_at: Timestamp::now().unix_millis(),
-                seconds,
-            },
-        )?;
+        let marker = Marker {
+            version: STATE_VERSION,
+            scenario: cli.scenario,
+            seed,
+            seeded_at: Timestamp::now().unix_millis(),
+            seconds,
+        };
+        write_json(&dir, "scenario.json", &marker)?;
         let refused = if outcome.refused == 0 {
             String::new()
         } else {
@@ -274,8 +272,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         key: "me.pem",
         scenario: cli.scenario,
     };
-    let json = serde_json::to_string_pretty(&me_json).expect("JSON") + "\n";
-    std::fs::write(dir.join("me.json"), json).map_err(|e| format!("writing me.json: {e}"))?;
+    write_json(&dir, "me.json", &me_json)?;
 
     let shown = shown_path(&dir);
     println!("risala-dev: {summary}");
@@ -414,10 +411,9 @@ fn read_marker(dir: &Path) -> Result<Option<Marker>, String> {
     }
 }
 
-fn write_marker(dir: &Path, marker: &Marker) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(marker).expect("JSON") + "\n";
-    std::fs::write(dir.join("scenario.json"), json)
-        .map_err(|e| format!("writing scenario.json: {e}"))
+fn write_json(dir: &Path, name: &str, value: &impl serde::Serialize) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value).expect("JSON") + "\n";
+    std::fs::write(dir.join(name), json).map_err(|e| format!("writing {name}: {e}"))
 }
 
 /// Writes the account's device key to `me.pem`, readable only by its
