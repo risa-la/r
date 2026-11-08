@@ -165,6 +165,9 @@ pub struct RoomGroup {
     /// The proposals posted in the current epoch, as MLSMessages, in the
     /// order they were posted (12.6), for commits to refer to.
     pub proposals: Vec<Vec<u8>>,
+    /// What the server saw of the group's recent commits, for the group
+    /// checks that look back (12.7), as the hub encodes it.
+    pub history: Vec<u8>,
 }
 
 /// A public room's group as of a new epoch, or as created (6.1, 12.6).
@@ -183,6 +186,9 @@ pub struct RoomUpdate {
     pub topic: String,
     /// Its `guests` setting (6.2).
     pub guests: GuestAccess,
+    /// What the server saw of the group's recent commits (12.7), as the
+    /// hub encodes it.
+    pub history: Vec<u8>,
 }
 
 /// A public room to create with its mailbox (5.2, 6.1).
@@ -202,8 +208,14 @@ pub enum RoomChange {
     /// An accepted commit moved the group to a new epoch (12.6). The
     /// epoch's seq is the post's, and the pending proposals are dropped.
     Commit(RoomUpdate),
-    /// A proposal for the current epoch, kept for commits to refer to.
-    Proposal(Vec<u8>),
+    /// A proposal for the current epoch, kept for commits to refer to, and
+    /// the group's history with it (12.7).
+    Proposal {
+        /// The MLSMessage.
+        message: Vec<u8>,
+        /// The history.
+        history: Vec<u8>,
+    },
 }
 
 /// A post to keep (5.2), with everything that changes with it, in one

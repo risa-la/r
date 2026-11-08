@@ -7,6 +7,7 @@
 //! without sockets.
 
 use openmls_memory_storage::MemoryStorage;
+use risala_mls::checks::CommitPost;
 use risala_mls::conversation::RisalaConversation;
 use risala_mls::group::{Changes, commit, create_group, encrypt_application, merge_own_commit};
 use risala_mls::identity::{DeviceId, RisalaIdentity};
@@ -65,9 +66,9 @@ async fn two_anonymous_connections() {
         alice.uid.clone(),
         DeviceId::of_device_key(alice.key.public_key()),
     );
-    let mut a = create_group(&alice.provider, &identity, &alice.profile(), &conv)
-        .unwrap()
-        .0;
+    let now = Timestamp::now().unix_millis();
+    let (mut a, _, mut history) =
+        create_group(&alice.provider, &identity, &alice.profile(), &conv, now).unwrap();
     let gid = GroupId::from_bytes(a.group_id().as_slice().try_into().unwrap());
     let hash0 = TokenHash::from_bytes(alice.token(&a).hash());
 
@@ -89,6 +90,7 @@ async fn two_anonymous_connections() {
         &mut a,
         Pseudonym([1; 16]),
         &alice.profile(),
+        &history,
         Changes {
             add: vec![kp],
             ..Changes::default()
@@ -105,7 +107,11 @@ async fn two_anonymous_connections() {
     let event = reader.expect_line().await.unwrap();
     assert!(event.starts_with("@seq=1;t="), "{event}");
     assert!(event.ends_with(&format!(" POST {m} {commit} next={next}")));
-    merge_own_commit(&alice.provider, &mut a).unwrap();
+    let post = CommitPost {
+        t: now,
+        next: Some(out.next_token_hash),
+    };
+    merge_own_commit(&alice.provider, &mut a, &mut history, &post).unwrap();
 
     // A message of epoch 1, live to the reader, and kept for FETCH.
     let aad = RisalaAad::application(Pseudonym([1; 16]), [7; 48]);

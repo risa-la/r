@@ -20,12 +20,15 @@ use std::time::Duration;
 use openmls_memory_storage::MemoryStorage;
 use risala_mls::RisalaCrypto;
 use risala_mls::checks::{
-    CommitError, CommitView, Fact, GroupView, JoinExpectation, KeyFacts, check_commit, check_join,
+    CommitError, CommitPost, CommitView, GroupView, History, JoinExpectation, check_commit,
+    check_join,
 };
 use risala_mls::conversation::{ConversationKind, GuestMode, RisalaConversation, Role as MlsRole};
 use risala_mls::framing::ContentType;
 use risala_mls::identity::{DeviceId, RisalaIdentity};
-use risala_mls::keypackage::{check_guest_key_package, check_key_package_contents};
+use risala_mls::keypackage::{
+    KeyPackageError, check_key_package_contents, has_no_binding, lifetime_acceptable_at,
+};
 use risala_mls::openmls::group::ProposalStore;
 use risala_mls::openmls::prelude::{
     LeafNodeIndex, ProcessedMessageContent, Proposal, PublicGroup, Sender as MlsSender,
@@ -38,7 +41,7 @@ use risala_proto::names::{BoxName, Seq, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{GuestAccess, Role};
-use tls_codec::{Serialize as _, Size as _};
+use tls_codec::Serialize as _;
 
 use super::super::admin;
 use super::super::command::{Cx, Reply, err};
@@ -67,6 +70,8 @@ struct RoomCache {
     group: PublicGroup,
     /// OpenMLS's state of the group: its pending proposals.
     storage: MemoryStorage,
+    /// What the server saw of the group's recent commits (12.7).
+    history: History,
 }
 
 /// The public rooms' groups in memory, and the limit on rooms created.
@@ -120,11 +125,15 @@ impl Rooms {
 
     /// A post to `mailbox` was kept: its group is now `post`'s.
     pub(super) fn applied(&self, mailbox: BoxName, post: CheckedPost) {
+        self.keep(mailbox, post.group);
+    }
+
+    fn keep(&self, mailbox: BoxName, group: RoomCache) {
         let mut cache = self.cache();
         if cache.len() >= CACHED_ROOMS {
             cache.clear();
         }
-        cache.insert(mailbox, post.group);
+        cache.insert(mailbox, group);
     }
 
     /// `mailbox` is gone.
@@ -133,19 +142,25 @@ impl Rooms {
     }
 }
 
-/// Facts from key files and the key log, which the server does not fetch
-/// for public rooms (12.6): it checks neither device bindings nor removals
-/// by key files there, so every one of them is unknown.
-struct NoKeyFacts;
+/// A room's history (12.7), as the store keeps it.
+fn encode_history(history: &History) -> Result<Vec<u8>, ErrResponse> {
+    rmp_serde::to_vec(history).map_err(|e| {
+        tracing::error!("encoding a public room's history: {e}");
+        err(ErrorCode::Internal)
+    })
+}
 
-impl KeyFacts for NoKeyFacts {
-    fn current_device_key(&self, _uid: &Uid, _device_id: &DeviceId) -> Fact<Option<Vec<u8>>> {
-        Fact::Unknown
-    }
+/// A room's history (12.7), read back from the store.
+fn decode_history(bytes: &[u8]) -> Result<History, ErrResponse> {
+    rmp_serde::from_slice(bytes).map_err(|e| {
+        tracing::error!("reading a public room's history: {e}");
+        err(ErrorCode::Internal)
+    })
+}
 
-    fn device_removed(&self, _uid: &Uid, _device_id: &DeviceId) -> Fact<bool> {
-        Fact::Unknown
-    }
+/// A time as the group checks take it: ms since 1970-01-01T00:00:00Z.
+fn ms(t: Timestamp) -> u64 {
+    t.unix_millis()
 }
 
 fn invalid(what: impl std::fmt::Display) -> ErrResponse {
@@ -182,7 +197,11 @@ fn build(
             "a public room's GroupInfo has external_pub and no ratchet_tree",
         ));
     }
-    let (group, info) = PublicGroup::from_external(
+    let signer = verifiable.signer();
+    // OpenMLS checks the signature under the signer's leaf, and the tree
+    // against the group context's tree hash, but not the lifetimes of the
+    // tree's leaves, which 12.5 leaves to the commits that add them.
+    let (group, _) = PublicGroup::from_external(
         crypto,
         &storage,
         read_tree(tree).map_err(invalid)?,
@@ -190,19 +209,7 @@ fn build(
         ProposalStore::new(),
     )
     .map_err(invalid)?;
-    // The signer is the u32 before the signature, at the end of the
-    // GroupInfo (RFC 9420, 12.4.3).
-    // TODO: use VerifiableGroupInfo::signer once the patched OpenMLS makes
-    // it public (task M1b).
-    let signature_len = info.signature().tls_serialized_len();
-    let signer = group_info
-        .len()
-        .checked_sub(signature_len + 4)
-        .and_then(|at| group_info.get(at..at + 4))
-        .and_then(|b| <[u8; 4]>::try_from(b).ok())
-        .map(u32::from_be_bytes)
-        .ok_or_else(|| invalid("a GroupInfo without a signer"))?;
-    Ok((group, storage, LeafNodeIndex::new(signer)))
+    Ok((group, storage, signer))
 }
 
 /// A room's group as stored, with its pending proposals.
@@ -232,6 +239,7 @@ fn rebuild(crypto: &RisalaCrypto, stored: &RoomGroup) -> Result<RoomCache, ErrRe
         proposals: stored.proposals.len(),
         group,
         storage,
+        history: decode_history(&stored.history)?,
     })
 }
 
@@ -250,7 +258,8 @@ fn room_update(
     group: &PublicGroup,
     conversation: &RisalaConversation,
     group_info: Vec<u8>,
-) -> RoomUpdate {
+    history: &History,
+) -> Result<RoomUpdate, ErrResponse> {
     let view = GroupView::of(group);
     let members: BTreeMap<Uid, Role> = view
         .leaves
@@ -258,7 +267,7 @@ fn room_update(
         .filter_map(|leaf| leaf.identity.as_ref())
         .map(|identity| (identity.uid.clone(), role(conversation.role(&identity.uid))))
         .collect();
-    RoomUpdate {
+    Ok(RoomUpdate {
         epoch: group.group_context().epoch().as_u64(),
         group_info,
         tree: tree_to_bytes(&group.export_ratchet_tree()),
@@ -269,7 +278,8 @@ fn room_update(
             GuestMode::Read => GuestAccess::Read,
             GuestMode::Write => GuestAccess::Write,
         },
-    }
+        history: encode_history(history)?,
+    })
 }
 
 /// The topic, escaped for ROOM lines (3.4).
@@ -374,13 +384,15 @@ pub(super) async fn create(
         {
             return Err(invalid("a public room with the creator as an owner"));
         }
-        let update = room_update(&group, &conversation, group_info);
+        let history = History::created(ms(now));
+        let update = room_update(&group, &conversation, group_info, &history)?;
         Ok((
             RoomCache {
                 epoch: 0,
                 proposals: 0,
                 group,
                 storage,
+                history,
             },
             update,
         ))
@@ -407,13 +419,7 @@ pub(super) async fn create(
             if let Some(slot) = slot {
                 slot.keep();
             }
-            rooms.applied(
-                mailbox,
-                CheckedPost {
-                    change: RoomChange::Proposal(Vec::new()),
-                    group: cache,
-                },
-            );
+            rooms.keep(mailbox, cache);
             Ok(OkResponse::new())
         }
         Created::Taken | Created::Exists => Err(err(ErrorCode::NameTaken)),
@@ -429,6 +435,7 @@ pub(super) async fn check_post(
     framing: &PostFraming,
     message: Vec<u8>,
     group_info: Option<Vec<u8>>,
+    next: Option<TokenHash>,
     now: Timestamp,
 ) -> Result<CheckedPost, ErrResponse> {
     let mailbox = record.mailbox;
@@ -463,6 +470,10 @@ pub(super) async fn check_post(
         match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) if commit => {
                 let view = GroupView::of(&room.group);
+                let post = CommitPost {
+                    t: ms(now),
+                    next: next.map(|next| *next.as_bytes()),
+                };
                 let pending = room
                     .group
                     .queued_proposals(&room.storage)
@@ -478,7 +489,7 @@ pub(super) async fn check_post(
                 if committer.is_guest() {
                     return Err(forbidden("a guest's leaf does not commit"));
                 }
-                check_commit(&view, &commit_view, &NoKeyFacts, now.to_system_time())
+                let verdict = check_commit(&view, &commit_view, &room.history, &post)
                     .map_err(commit_error)?;
                 // 4. From the leaf's own device.
                 if !is_device(&who, &committer) {
@@ -511,7 +522,14 @@ pub(super) async fn check_post(
                 if signer_key.is_none() || signer_key != new_signature_key {
                     return Err(invalid("the GroupInfo is not signed by the committer"));
                 }
-                let update = room_update(&room.group, &conversation, group_info);
+                room.history.record(
+                    &view,
+                    &commit_view,
+                    &verdict,
+                    &GroupView::of(&room.group),
+                    &post,
+                );
+                let update = room_update(&room.group, &conversation, group_info, &room.history)?;
                 room.epoch = update.epoch;
                 room.proposals = 0;
                 Ok(CheckedPost {
@@ -530,7 +548,9 @@ pub(super) async fn check_post(
                 match queued.proposal() {
                     // A SelfRemove, from any connection that may post (6.1).
                     Proposal::SelfRemove => {}
-                    // An Update, from the leaf's own device (12.6, 12.10).
+                    // An Update, from the leaf's own device (12.6, 12.10). Its
+                    // post's time is what its `updated` is checked against
+                    // when a commit applies it (12.3).
                     Proposal::Update(_) => {
                         if leaf.is_guest() {
                             return Err(forbidden("a guest's leaf does not propose Updates"));
@@ -540,6 +560,8 @@ pub(super) async fn check_post(
                                 "an identity's Update comes from its device's signed-in connection",
                             ));
                         }
+                        let reference = queued.proposal_reference_ref().as_slice().to_vec();
+                        room.history.note_update(&reference, ms(now));
                     }
                     _ => return Err(invalid("a proposal that is not posted on its own")),
                 }
@@ -551,11 +573,16 @@ pub(super) async fn check_post(
                 };
                 let key_package = add.key_package();
                 let conversation = GroupView::of(&room.group).conversation.map_err(invalid)?;
-                let guest = RisalaIdentity::from_credential(key_package.leaf_node().credential())
-                    .is_ok_and(|identity| identity.is_guest());
-                let now = now.to_system_time();
-                if guest {
-                    let identity = check_guest_key_package(key_package, now).map_err(invalid)?;
+                // A KeyPackage made for this join, with no device binding,
+                // within its lifetime at the post's time (6.1, 12.3, 12.5).
+                let (identity, _) = check_key_package_contents(key_package).map_err(invalid)?;
+                if !lifetime_acceptable_at(key_package.life_time(), ms(now)) {
+                    return Err(invalid(KeyPackageError::Lifetime));
+                }
+                if !has_no_binding(key_package) {
+                    return Err(invalid(KeyPackageError::Binding));
+                }
+                if identity.is_guest() {
                     if conversation.guests == GuestMode::None {
                         return Err(forbidden("this room does not let guests in"));
                     }
@@ -563,12 +590,8 @@ pub(super) async fn check_post(
                     if who != Who::Guest(identity.uid) {
                         return Err(forbidden("a guest joins from its own connection"));
                     }
-                } else {
-                    let (identity, _) =
-                        check_key_package_contents(key_package, now).map_err(invalid)?;
-                    if conversation.is_banned(&identity.uid) {
-                        return Err(forbidden("banned"));
-                    }
+                } else if conversation.is_banned(&identity.uid) {
+                    return Err(forbidden("banned"));
                 }
                 keep_proposal(room, *queued, message)
             }
@@ -589,7 +612,10 @@ fn keep_proposal(
         .map_err(|e| invalid(format!("{e:?}")))?;
     room.proposals += 1;
     Ok(CheckedPost {
-        change: RoomChange::Proposal(message),
+        change: RoomChange::Proposal {
+            message,
+            history: encode_history(&room.history)?,
+        },
         group: room,
     })
 }
@@ -600,15 +626,19 @@ fn keep_proposal(
 fn commit_error(e: CommitError) -> ErrResponse {
     match e {
         CommitError::NoPath
+        | CommitError::NextToken
         | CommitError::Proposal(_)
         | CommitError::Group
         | CommitError::Leaf
         | CommitError::KeyPackage(_) => invalid(e),
         CommitError::External
+        | CommitError::Guest
+        | CommitError::Updated
+        | CommitError::Streak
         | CommitError::Extension(_)
-        | CommitError::NotCurrentDevice
         | CommitError::Add
         | CommitError::Remove
+        | CommitError::SameDevice
         | CommitError::LeftBehind
         | CommitError::TooLarge => forbidden(e),
     }
@@ -717,13 +747,5 @@ mod tests {
         assert_eq!(end_of_period(t).to_string(), "2026-11-10T00:00:00.000Z");
         let t: Timestamp = "2026-11-10T00:00:00.000Z".parse().unwrap();
         assert_eq!(end_of_period(t).to_string(), "2026-11-11T00:00:00.000Z");
-    }
-
-    #[test]
-    fn the_server_checks_no_key_facts() {
-        let uid: Uid = "alice@example.org".parse().unwrap();
-        let id = DeviceId([1; 48]);
-        assert_eq!(NoKeyFacts.current_device_key(&uid, &id), Fact::Unknown);
-        assert_eq!(NoKeyFacts.device_removed(&uid, &id), Fact::Unknown);
     }
 }

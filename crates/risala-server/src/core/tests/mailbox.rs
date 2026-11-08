@@ -5,11 +5,16 @@ use std::time::Duration;
 
 use openmls_memory_storage::MemoryStorage;
 use risala_mls::conversation::{GuestMode, RisalaConversation};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use risala_mls::checks::{CommitPost, History};
 use risala_mls::group::{
     Changes, CommitOutput, commit, create_group, encrypt_application, join_by_welcome,
-    merge_own_commit, own_leaf_key,
+    join_proposal, merge_own_commit, own_leaf_key, process_message,
 };
 use risala_mls::identity::{DeviceId, RisalaIdentity};
+use risala_mls::keypackage::make_join_key_package;
 use risala_mls::keypackage::make_key_package;
 use risala_mls::openmls::group::MlsGroup;
 use risala_mls::openmls::prelude::KeyPackage;
@@ -29,12 +34,19 @@ use risala_proto::error::ErrorCode;
 
 const HOST: &str = "chat.example.org";
 
-/// One device of an identity, with its own MLS storage.
+/// One device of an identity, with its own MLS storage, and the history of
+/// each of its groups (12.7).
 struct Dev {
     uid: Uid,
     key: SigningKey,
     provider: Provider<MemoryStorage>,
     pseudonym: risala_mls::Pseudonym,
+    histories: RefCell<HashMap<Vec<u8>, History>>,
+}
+
+/// The time now, in ms, as devices and the group checks take it.
+fn now_ms() -> u64 {
+    Timestamp::now().unix_millis()
 }
 
 impl Dev {
@@ -44,6 +56,7 @@ impl Dev {
             key: SigningKey::from_seed([seed; 32]),
             provider: Provider::new(MemoryStorage::default()).unwrap(),
             pseudonym: risala_mls::Pseudonym([seed; 16]),
+            histories: RefCell::default(),
         }
     }
 
@@ -55,7 +68,7 @@ impl Dev {
     }
 
     fn profile(&self) -> RisalaProfile {
-        RisalaProfile::new(self.uid.name(), Timestamp::now().unix_millis()).unwrap()
+        RisalaProfile::new(self.uid.name(), now_ms()).unwrap()
     }
 
     fn key_package(&self) -> KeyPackage {
@@ -64,15 +77,31 @@ impl Dev {
             .key_package
     }
 
+    fn history(&self, group: &MlsGroup) -> History {
+        self.histories
+            .borrow()
+            .get(group.group_id().as_slice())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_history(&self, group: &MlsGroup, history: History) {
+        self.histories
+            .borrow_mut()
+            .insert(group.group_id().as_slice().to_vec(), history);
+    }
+
     fn create(&self, conversation: &RisalaConversation) -> MlsGroup {
-        create_group(
+        let (group, _, history) = create_group(
             &self.provider,
             &self.identity(),
             &self.profile(),
             conversation,
+            now_ms(),
         )
-        .unwrap()
-        .0
+        .unwrap();
+        self.set_history(&group, history);
+        group
     }
 
     fn commit(&self, group: &mut MlsGroup, changes: Changes) -> CommitOutput {
@@ -81,9 +110,21 @@ impl Dev {
             group,
             self.pseudonym,
             &self.profile(),
+            &self.history(group),
             changes,
         )
         .unwrap()
+    }
+
+    /// Merges this device's pending commit, which won (7.2).
+    fn merge(&self, group: &mut MlsGroup, out: &CommitOutput) {
+        let mut history = self.history(group);
+        let post = CommitPost {
+            t: now_ms(),
+            next: Some(out.next_token_hash),
+        };
+        merge_own_commit(&self.provider, group, &mut history, &post).unwrap();
+        self.set_history(group, history);
     }
 
     fn join(&self, welcome: &[u8]) -> MlsGroup {
@@ -92,9 +133,9 @@ impl Dev {
             own_uid: self.uid.clone(),
             public_room: None,
         };
-        join_by_welcome(&self.provider, welcome, None, &expect)
-            .unwrap()
-            .group
+        let joined = join_by_welcome(&self.provider, welcome, None, &expect, now_ms()).unwrap();
+        self.set_history(&joined.group, joined.history);
+        joined.group
     }
 
     /// The group's send token now (7.2), in base64.
@@ -188,7 +229,7 @@ impl Direct {
         h.send(anon, &format!("POST {m} {token} {commit} next={next}"))
             .await;
         assert_eq!(anon.lines(), ["OK seq=1"]);
-        merge_own_commit(&alice.provider, &mut a).unwrap();
+        alice.merge(&mut a, &out);
         let b = bob.join(&out.welcome.unwrap());
         Direct {
             alice,
@@ -310,7 +351,7 @@ async fn post_follow_and_fetch() {
     assert_eq!(anon.lines(), [event.clone(), "@ref=p OK seq=1".into()]);
     assert_eq!(watcher.lines(), std::slice::from_ref(&event));
     assert_eq!(guest.lines(), std::slice::from_ref(&event));
-    merge_own_commit(&alice.provider, &mut a).unwrap();
+    alice.merge(&mut a, &out);
     let mut b = bob.join(&out.welcome.unwrap());
 
     // Epoch 1: the commit's next opened it (7.2).
@@ -542,7 +583,7 @@ async fn send_tokens() {
     )
     .await;
     assert_eq!(anon.lines(), ["OK seq=3"]);
-    merge_own_commit(&d.alice.provider, &mut d.a).unwrap();
+    d.alice.merge(&mut d.a, &out);
     let message = d.alice.send(&mut d.a, b"epoch 2");
     let token2 = d.alice.token(&d.a);
     let hash2 = d.alice.token_hash(&d.a);
@@ -608,7 +649,7 @@ async fn moves() {
     let mut d = Direct::new(&h, &mut anon, 1).await;
     let token1 = d.alice.token(&d.a);
     let out = d.alice.commit(&mut d.a, Changes::default());
-    merge_own_commit(&d.alice.provider, &mut d.a).unwrap();
+    d.alice.merge(&mut d.a, &out);
     // The mover gives a wrong hash for epoch 2.
     let new = mailbox(2);
     h.send(
@@ -1238,15 +1279,28 @@ fn harness_now() -> Harness {
 }
 
 async fn create_room(h: &mut Harness, n: u8) -> PublicRoomSetup {
+    create_room_with(h, n, "#general", |_| {}).await
+}
+
+/// A public room named `room`, whose conversation extension `f` changes.
+async fn create_room_with(
+    h: &mut Harness,
+    n: u8,
+    room: &str,
+    f: impl FnOnce(&mut RisalaConversation),
+) -> PublicRoomSetup {
     let owen = Dev::new("owen@example.org", n);
     let m = mailbox(n);
-    let o = owen.create(&public_conv(&owen, m, GuestMode::Write));
+    let mut conv = public_conv(&owen, m, GuestMode::Write);
+    conv.name = room.into();
+    f(&mut conv);
+    let o = owen.create(&conv);
     let (group_info, tree) = public_state(&owen, &o);
     let mut signed = owen.sign_in(h);
     h.send(
         &signed,
         &format!(
-            "CREATE {m} {} {} #general {group_info} {tree}",
+            "CREATE {m} {} {} {room} {group_info} {tree}",
             gid(&o),
             owen.token_hash(&o)
         ),
@@ -1254,6 +1308,126 @@ async fn create_room(h: &mut Harness, n: u8) -> PublicRoomSetup {
     .await;
     assert_eq!(signed.lines(), ["OK"]);
     PublicRoomSetup { owen, o, m, signed }
+}
+
+/// A join proposal (6.1) for the room's group as GROUPINFO shows it, by
+/// `identity`, in base64.
+fn join(device: &Dev, identity: &RisalaIdentity, room: &PublicRoomSetup) -> String {
+    let made = make_join_key_package(
+        &device.provider,
+        identity,
+        (!identity.is_guest()).then(|| device.profile()).as_ref(),
+    )
+    .unwrap();
+    let context = room.o.public_group().group_context();
+    b64(&join_proposal::<Provider<MemoryStorage>>(
+        &made.key_package,
+        context.group_id(),
+        context.epoch().as_u64(),
+        &made.leaf_key,
+    )
+    .unwrap())
+}
+
+/// Joining a public room by external proposal, with the token `-` (6.1,
+/// 12.6): an identity's from any connection, a guest's from its own
+/// guest connection, never a banned identity's or, with `guests none`, a
+/// guest's. A full client commits them; the server then knows the room's
+/// members, and a guest's end sends GONE.
+#[tokio::test]
+async fn public_room_joins() {
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let mut anon = h.anon().await;
+    h.send(&anon, &format!("FOLLOW {m}")).await;
+    anon.lines();
+    let (mut sam_conn, _) = h.guest("sam").await;
+    let dave = Dev::new("dave@example.org", 4);
+    let sam = Dev::new("~sam", 5);
+    let dave_join = join(&dave, &dave.identity(), &room);
+    let sam_join = join(&sam, &RisalaIdentity::guest("~sam".parse().unwrap()), &room);
+
+    h.send(&anon, &format!("POST {m} - {dave_join}")).await;
+    let lines = anon.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[1], "OK seq=1");
+    h.send(&anon, &format!("POST {m} - {sam_join}")).await;
+    assert_eq!(
+        anon.lines(),
+        ["ERR forbidden a guest joins from its own connection"]
+    );
+    h.send(&sam_conn, &format!("POST {m} - {sam_join}")).await;
+    assert_eq!(sam_conn.lines(), ["OK seq=2"]);
+    // The owner's device commits both, by reference.
+    for message in [&dave_join, &sam_join] {
+        let bytes = message.parse::<MlsMessage>().unwrap().decode();
+        process_message(&room.owen.provider, &mut room.o, &bytes).unwrap();
+    }
+    let token0 = room.owen.token(&room.o);
+    let out = room.owen.commit(&mut room.o, Changes::default());
+    h.send(
+        &room.signed,
+        &format!(
+            "POST {m} {token0} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(out.group_info.as_ref().unwrap())
+        ),
+    )
+    .await;
+    assert_eq!(room.signed.lines(), ["OK seq=3"]);
+    room.owen.merge(&mut room.o, &out);
+    let role = |uid: &str| h.store.room_member(&m, &uid.parse().unwrap()).unwrap();
+    assert_eq!(
+        role("dave@example.org"),
+        Some(risala_proto::types::Role::Member)
+    );
+    assert_eq!(role("~sam"), Some(risala_proto::types::Role::Member));
+    assert_eq!(
+        role("owen@example.org"),
+        Some(risala_proto::types::Role::Owner)
+    );
+    // An old join, for epoch 0, is stale now.
+    h.send(&anon, &format!("POST {m} - {dave_join}")).await;
+    assert_eq!(anon.lines().last().unwrap(), "ERR stale");
+    // Sam's session ends: the room's followers get GONE (6.1).
+    h.close(sam_conn).await;
+    h.end("sam").await;
+    assert_eq!(anon.lines(), [format!("GONE {m} ~sam")]);
+
+    // A room without guests, which has banned Mallory.
+    let mallory = Dev::new("mallory@example.org", 6);
+    let other = create_room_with(&mut h, 2, "#closed", |conv| {
+        conv.guests = GuestMode::None;
+        conv.bans = vec![mallory.uid.clone()];
+    })
+    .await;
+    let (bea_conn, _) = h.guest("bea").await;
+    let mut bea_conn = bea_conn;
+    let bea = Dev::new("~bea", 7);
+    let bea_join = join(
+        &bea,
+        &RisalaIdentity::guest("~bea".parse().unwrap()),
+        &other,
+    );
+    h.send(&bea_conn, &format!("POST {} - {bea_join}", other.m))
+        .await;
+    assert_eq!(
+        bea_conn.lines(),
+        ["ERR forbidden this room does not let guests in"]
+    );
+    let mallory_join = join(&mallory, &mallory.identity(), &other);
+    h.send(&anon, &format!("POST {} - {mallory_join}", other.m))
+        .await;
+    assert_eq!(anon.lines(), ["ERR forbidden banned"]);
+    // `-` is only for joins.
+    let message = room.owen.send(&mut room.o, b"hello");
+    h.send(&anon, &format!("POST {m} - {message}")).await;
+    assert_eq!(
+        anon.lines(),
+        ["ERR forbidden - is only for joining a public room"]
+    );
 }
 
 /// The second form of CREATE: a public room, on its owner's device's
@@ -1432,7 +1606,7 @@ async fn public_room_commits() {
     )
     .await;
     assert_eq!(signed.lines(), ["ERR stale"]);
-    merge_own_commit(&owen.provider, &mut o).unwrap();
+    owen.merge(&mut o, &out);
     h.send(&anon, &format!("GROUPINFO {m}")).await;
     let (_, tree) = public_state(&owen, &o);
     assert_eq!(

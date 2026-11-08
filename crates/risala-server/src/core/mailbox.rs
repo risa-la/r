@@ -491,7 +491,7 @@ fn read_framing(bytes: &[u8], group_id: &GroupId) -> Result<PostFraming, ErrResp
 /// The pseudonym of a RisalaAAD (7.3): 16 bytes in a PrivateMessage, which
 /// `read_post` has checked.
 fn aad_pseudonym(aad: &risala_mls::RisalaAad) -> Option<[u8; 16]> {
-    Some(aad.pseudonym.0)
+    aad.pseudonym.map(|p| p.0)
 }
 
 /// The bytes of a message or GroupInfo that a line names as a blob
@@ -638,7 +638,7 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
             Some(groupinfo) => Some(line_bytes(inner, groupinfo, GroupInfo::decode).await?),
             None => None,
         };
-        Some(room::check_post(cx, &record, &framing, bytes, groupinfo, now).await?)
+        Some(room::check_post(cx, &record, &framing, bytes, groupinfo, post.next, now).await?)
     } else {
         None
     };
