@@ -1,5 +1,6 @@
-//! Identities for tests: [`TestIdentity`], a device's key, and
-//! [`TestKeyServer`], an HTTPS server with key files (4.4).
+//! Identities for tests: [`TestChain`], an identity's keys and chain of
+//! records (4.4), [`TestIdentity`], one device of it, and
+//! [`TestKeyServer`], an HTTPS server with key files.
 //!
 //! **For tests only.** See the [module documentation](super) for how a
 //! [`TestServer`](super::TestServer) uses them.
@@ -11,10 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use risala_keyfetch::{FetchOptions, Roots, StaticResolver};
 use risala_proto::auth::{Nonce, PublicKey, SecretKey, Signature};
-use risala_proto::keyfile::m5a::KeyEntry;
+use risala_proto::chain::Chain;
+use risala_proto::keyfile::KeyFile;
 use risala_proto::names::{Identity, Name, Uid};
+use risala_proto::record::{
+    DeviceId, DeviceKeys, LogKey, Record, RecordBody, RecordContent, XWING_PUBLIC_KEY_LEN,
+    XWingPublicKey, encode_records,
+};
 use rustls::pki_types::CertificateDer;
 use tokio::task::JoinHandle;
 
@@ -24,15 +32,17 @@ use crate::http::{HttpServer, KeyDir, KeyFiles};
 use crate::keyfiles::KeyFilePublisher as _;
 use crate::net::Certificates;
 
+/// The time of a chain's first record: 2026-01-01T00:00:00Z, in ms. Each
+/// record after it is a second later, so that records are never ahead of
+/// a test server's clock (4.4).
+const FIRST_RECORD_MS: u64 = 1_767_225_600_000;
+
 /// One device of an identity, for tests: the identity and the device's
-/// ML-DSA-44 key (4.3-4.5).
+/// ML-DSA-44 device key (4.3).
 ///
-/// Make one with [`TestServer::identity`](super::TestServer::identity) or
-/// [`TestKeyServer::new_identity`], which also publish its key, or with
-/// [`TestIdentity::new`] for a key that nothing lists yet.
-///
-/// Its key files are still draft-02's, one key per line: they become
-/// chains of records (4.4) with the identity area of the server.
+/// Make one with a [`TestChain`], whose records list it, or with
+/// [`TestServer::identity`](super::TestServer::identity) or
+/// [`TestKeyServer::new_identity`], which also publish its key file.
 #[derive(Clone)]
 pub struct TestIdentity {
     identity: Identity,
@@ -49,8 +59,8 @@ impl fmt::Debug for TestIdentity {
 }
 
 impl TestIdentity {
-    /// `identity` with a new random key. Panics if `identity` is not one
-    /// (4.3).
+    /// `identity` with a new random device key, which no chain lists.
+    /// Panics if `identity` is not one (4.3).
     pub fn new(identity: &str) -> TestIdentity {
         let identity = identity
             .parse()
@@ -63,12 +73,6 @@ impl TestIdentity {
         TestIdentity { identity, key }
     }
 
-    /// Another device of the same identity: a new random key, which
-    /// nothing lists yet.
-    pub fn new_key(&self) -> TestIdentity {
-        TestIdentity::with_key(self.identity.clone(), random_key())
-    }
-
     /// The identity, such as `alice@example.org`.
     pub fn identity(&self) -> &Identity {
         &self.identity
@@ -79,23 +83,19 @@ impl TestIdentity {
         self.identity.to_uid()
     }
 
-    /// The device's private key, for a client's key store.
+    /// The device's private key.
     pub fn key(&self) -> &SecretKey {
         &self.key
     }
 
-    /// The device's public key, as in key files (4.4).
+    /// The device's public key, as its `device` record lists it (4.4).
     pub fn public_key(&self) -> PublicKey {
         self.key.public_key()
     }
 
-    /// The device's key file entry (4.4), with `label`.
-    pub fn key_entry(&self, label: Option<&str>) -> KeyEntry {
-        KeyEntry::new(self.public_key(), label).expect("a label that fits in a key file")
-    }
-
-    /// The signature AUTH needs on a connection to `host` whose greeting
-    /// had `nonce` (4.6). `host` is the name the client sent in SNI.
+    /// The signature AUTH and REGISTER need on a connection to `host`
+    /// whose greeting had `nonce` (4.6). `host` is the name the client
+    /// sent in SNI.
     pub fn sign(&self, host: &str, nonce: &Nonce) -> Signature {
         self.key.sign_challenge(host, nonce, self.identity.as_str())
     }
@@ -106,11 +106,217 @@ impl TestIdentity {
     }
 }
 
-/// A new random device key.
+/// A new random ML-DSA-44 key.
 fn random_key() -> SecretKey {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("random bytes");
     SecretKey::from_seed(seed)
+}
+
+/// An X-Wing public key that passes the checks of 12.2, different for
+/// each `n` below 3329 and random in its X25519 part.
+fn xwing(n: u16) -> XWingPublicKey {
+    assert!(n < 3329, "too many attestation keys for one test chain");
+    let mut bytes = [0u8; XWING_PUBLIC_KEY_LEN];
+    // The first 12-bit coefficient of the ML-KEM-768 key, below q.
+    let [low, high] = n.to_le_bytes();
+    bytes[0] = low;
+    bytes[1] = high;
+    getrandom::fill(&mut bytes[XWING_PUBLIC_KEY_LEN - 32..]).expect("random bytes");
+    XWingPublicKey::from_bytes(&bytes).expect("a valid X-Wing key")
+}
+
+/// An identity's keys and its chain of records (4.4), for tests: a
+/// master key, a device-signing key, and records that the test adds one
+/// at a time, as an identity's devices would.
+#[derive(Clone)]
+pub struct TestChain {
+    identity: Identity,
+    master: SecretKey,
+    signing: SecretKey,
+    records: Vec<Record>,
+    attestation_keys: u16,
+}
+
+impl fmt::Debug for TestChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestChain")
+            .field("identity", &self.identity)
+            .field("records", &self.records.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TestChain {
+    /// A new identity whose chain names `log` (4.5): its `master` record,
+    /// then a `device` record for its first device, labelled `device1`,
+    /// which this returns.
+    pub fn new(identity: &str, log: &LogKey) -> (TestChain, TestIdentity) {
+        let identity: Identity = identity
+            .parse()
+            .unwrap_or_else(|e| panic!("{identity:?} is not an identity: {e}"));
+        let master = random_key();
+        let signing = random_key();
+        let mut chain = TestChain {
+            identity,
+            master: master.clone(),
+            signing: signing.clone(),
+            records: Vec::new(),
+            attestation_keys: 0,
+        };
+        chain.push(
+            RecordBody::Master {
+                master_key: master.public_key(),
+                signing_key: signing.public_key(),
+                log: log.clone(),
+            },
+            &master,
+        );
+        let device = chain.add_device("device1");
+        (chain, device)
+    }
+
+    /// The identity.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    /// The records, oldest first.
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    /// The newest record.
+    pub fn head(&self) -> &Record {
+        self.records.last().expect("a chain has records")
+    }
+
+    /// The chain, replayed (4.4).
+    pub fn chain(&self) -> Chain {
+        Chain::replay(&self.identity, &self.records).expect("a test chain is valid")
+    }
+
+    /// Adds a record with `body`, signed with `key`, after the newest.
+    fn push(&mut self, body: RecordBody, key: &SecretKey) -> Record {
+        let n = u64::try_from(self.records.len()).expect("a short chain");
+        let content = RecordContent {
+            uid: self.identity.clone(),
+            previous: self.records.last().map(Record::hash),
+            time: FIRST_RECORD_MS + n * 1000,
+            body,
+        };
+        let mut rnd = [0u8; 32];
+        getrandom::fill(&mut rnd).expect("random bytes");
+        let record = Record::sign(content, key, rnd).expect("a valid record");
+        self.records.push(record.clone());
+        record
+    }
+
+    /// Adds a device labelled `label`, with a `device` record signed by
+    /// the device-signing key (4.4), and returns it.
+    pub fn add_device(&mut self, label: &str) -> TestIdentity {
+        self.attestation_keys += 1;
+        let device = TestIdentity::with_key(self.identity.clone(), random_key());
+        let keys = DeviceKeys {
+            device_key: device.public_key(),
+            attestation_key: xwing(self.attestation_keys),
+            label: label.to_owned(),
+        };
+        let signing = self.signing.clone();
+        self.push(RecordBody::Device(keys), &signing);
+        device
+    }
+
+    /// Removes `devices` with a `signing` record, signed by the master key,
+    /// that names a new device-signing key (4.4, 4.8).
+    pub fn remove_devices(&mut self, devices: &[&TestIdentity]) -> Record {
+        let mut removed: Vec<DeviceId> = devices
+            .iter()
+            .map(|d| DeviceId::of(&d.public_key()))
+            .collect();
+        removed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        self.signing = random_key();
+        let master = self.master.clone();
+        self.push(
+            RecordBody::Signing {
+                signing_key: self.signing.public_key(),
+                removed,
+            },
+            &master,
+        )
+    }
+
+    /// Ends the identity with a `retire` record (4.4, 4.9).
+    pub fn retire(&mut self) -> Record {
+        let master = self.master.clone();
+        self.push(RecordBody::Retire, &master)
+    }
+
+    /// Moves the chain to `log` with a `log` record (4.4, 4.8).
+    pub fn move_to(&mut self, log: &LogKey) -> Record {
+        let master = self.master.clone();
+        self.push(RecordBody::Log(log.clone()), &master)
+    }
+
+    /// `records` encoded as REGISTER and KEYS PUT carry them, in base64
+    /// (4.7).
+    pub fn payload(records: &[Record]) -> String {
+        BASE64.encode(encode_records(records))
+    }
+
+    /// The `REGISTER <name> <keyfile> <signature>` line for this chain's
+    /// first two records, signed by `device` for a connection to `host`
+    /// whose greeting had `nonce` (4.7).
+    pub fn register_line(&self, device: &TestIdentity, host: &str, nonce: &Nonce) -> String {
+        format!(
+            "REGISTER {} {} {}",
+            self.identity.name(),
+            TestChain::payload(&self.records[..2]),
+            device.sign(host, nonce)
+        )
+    }
+
+    /// The `KEYS PUT <after> <records>` line for the records from position
+    /// `from` on (4.7).
+    pub fn keys_put_line(&self, from: usize) -> String {
+        let after = match from {
+            0 => "-".to_owned(),
+            n => self.records[n - 1].hash().to_string(),
+        };
+        format!(
+            "KEYS PUT {after} {}",
+            TestChain::payload(&self.records[from..])
+        )
+    }
+
+    /// The key file of the chain with every record unlogged, as `- `
+    /// lines (4.4), each log at `https://<origin>`.
+    pub fn key_file(&self) -> String {
+        KeyFile::from_chain(&self.chain(), &|_| None, &|log| {
+            format!("https://{}", log.origin())
+        })
+        .expect("a test chain makes a key file")
+        .to_text()
+    }
+
+    /// The key file of the chain with the records at the positions
+    /// `logged` gives listed by their index (4.4).
+    pub fn key_file_logged(&self, logged: &dyn Fn(usize) -> Option<u64>) -> String {
+        KeyFile::from_chain(&self.chain(), logged, &|log| {
+            format!("https://{}", log.origin())
+        })
+        .expect("a test chain makes a key file")
+        .to_text()
+    }
+}
+
+/// A key log's key for tests, `<host>/risala-log/<number>`, from `seed`.
+pub fn test_log_key(host: &str, number: u64, seed: [u8; 32]) -> LogKey {
+    LogKey::new(
+        &format!("{host}/risala-log/{number}"),
+        SecretKey::from_seed(seed).public_key(),
+    )
+    .expect("a valid log origin")
 }
 
 /// An HTTPS server with the key files of identities at some domains
@@ -123,6 +329,10 @@ fn random_key() -> SecretKey {
 /// private addresses allowed. [`fetch_options`](Self::fetch_options) has
 /// all three. A [`TestServer`](super::TestServer) sets this up itself.
 ///
+/// The identities it makes have chains that name a log of their domain,
+/// `<domain>/risala-log/1`, which nothing serves: their key files list
+/// every record unlogged (4.4).
+///
 /// ```no_run
 /// # async fn f() {
 /// use risala_server::testing::TestKeyServer;
@@ -130,8 +340,7 @@ fn random_key() -> SecretKey {
 /// let keys = TestKeyServer::start(&["example.net"]).await;
 /// let bob = keys.new_identity("bob@example.net");
 /// let phone = keys.new_device(&bob);
-/// assert_eq!(keys.keys(bob.identity()).len(), 2);
-/// keys.remove_key(bob.identity(), &phone.public_key());
+/// keys.remove_device(&bob, &phone);
 /// # }
 /// ```
 pub struct TestKeyServer {
@@ -140,9 +349,10 @@ pub struct TestKeyServer {
     ca: CertificateDer<'static>,
     ca_path: PathBuf,
     sites: BTreeMap<String, Site>,
-    /// The key files this server writes, by identity. A domain served from
-    /// someone else's directory (a server's hosted identities) is not here.
-    files: Mutex<HashMap<Identity, Vec<KeyEntry>>>,
+    /// The chains of the identities whose key files this server writes. A
+    /// domain served from someone else's directory (a server's hosted
+    /// identities) is not here.
+    chains: Mutex<HashMap<Identity, TestChain>>,
 }
 
 struct Site {
@@ -181,7 +391,7 @@ impl TestKeyServer {
 
     /// Starts a server for `domains`, and for `hosted`, a domain whose key
     /// files are those another writes to a directory: a server's identity
-    /// domain and its `key_dir` (4.6).
+    /// domain and its `key_dir` (4.7).
     pub(crate) async fn start_with(
         domains: &[&str],
         hosted: Option<(&str, PathBuf)>,
@@ -230,7 +440,7 @@ impl TestKeyServer {
             ca,
             ca_path,
             sites,
-            files: Mutex::new(HashMap::new()),
+            chains: Mutex::new(HashMap::new()),
         }
     }
 
@@ -286,67 +496,64 @@ impl TestKeyServer {
         }
     }
 
-    /// A new identity with one device, whose key file lists only that
-    /// device's key, labelled `device1`. Panics if it serves no such
-    /// domain, or if the domain is a server's identity domain: register
-    /// those instead.
+    /// A new identity with one device, labelled `device1`, whose chain
+    /// names `<domain>/risala-log/1`, and whose key file lists its records
+    /// unlogged. Panics if it serves no such domain, or if the domain is a
+    /// server's identity domain: register those instead.
     pub fn new_identity(&self, identity: &str) -> TestIdentity {
-        let device = TestIdentity::new(identity);
-        self.publish(device.identity(), &[device.key_entry(Some("device1"))]);
+        let id: Identity = identity
+            .parse()
+            .unwrap_or_else(|e| panic!("{identity:?} is not an identity: {e}"));
+        let log = test_log_key(id.domain(), 1, [7; 32]);
+        let (chain, device) = TestChain::new(identity, &log);
+        self.set_chain(chain);
         device
     }
 
-    /// A new device of `of`'s identity: a new key, added to the end of its
-    /// key file with the label `device<n>`.
-    pub fn new_device(&self, of: &TestIdentity) -> TestIdentity {
-        let device = of.new_key();
-        let n = self.keys(of.identity()).len() + 1;
-        self.add_key(
-            of.identity(),
-            &device.public_key(),
-            Some(&format!("device{n}")),
-        );
-        device
-    }
-
-    /// The entries of `identity`'s key file, empty if it has none.
-    pub fn keys(&self, identity: &Identity) -> Vec<KeyEntry> {
-        self.files
+    /// The chain of `identity`. Panics if this server made none for it.
+    pub fn chain(&self, identity: &Identity) -> TestChain {
+        self.chains
             .lock()
             .expect("poisoned")
             .get(identity)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|| panic!("no chain for {identity}"))
     }
 
-    /// Replaces `identity`'s key file with one listing `keys`, in order.
-    pub fn publish(&self, identity: &Identity, keys: &[KeyEntry]) {
-        let site = self.own_site(identity);
-        site.keys
-            .publish(&name(identity), keys)
-            .expect("writing a key file");
-        self.files
+    /// Replaces `chain`'s identity's chain with `chain`, and publishes its
+    /// key file.
+    pub fn set_chain(&self, chain: TestChain) {
+        self.publish_file(chain.identity(), chain.key_file().as_bytes());
+        self.chains
             .lock()
             .expect("poisoned")
-            .insert(identity.clone(), keys.to_vec());
+            .insert(chain.identity().clone(), chain);
     }
 
-    /// Adds `key` to the end of `identity`'s key file, making the file if
-    /// there is none.
-    pub fn add_key(&self, identity: &Identity, key: &PublicKey, label: Option<&str>) {
-        let mut keys = self.keys(identity);
-        keys.push(KeyEntry::new(key.clone(), label).expect("a label that fits in a key file"));
-        self.publish(identity, &keys);
+    /// A new device of `of`'s identity, labelled `device<n>`, added to its
+    /// chain.
+    pub fn new_device(&self, of: &TestIdentity) -> TestIdentity {
+        let mut chain = self.chain(of.identity());
+        let n = chain.chain().devices().len() + 1;
+        let device = chain.add_device(&format!("device{n}"));
+        self.set_chain(chain);
+        device
     }
 
-    /// Takes `key` out of `identity`'s key file.
-    pub fn remove_key(&self, identity: &Identity, key: &PublicKey) {
-        let keys: Vec<KeyEntry> = self
-            .keys(identity)
-            .into_iter()
-            .filter(|e| e.key() != key)
-            .collect();
-        self.publish(identity, &keys);
+    /// Removes `device` from its identity's chain, with a `signing`
+    /// record (4.4).
+    pub fn remove_device(&self, of: &TestIdentity, device: &TestIdentity) {
+        let mut chain = self.chain(of.identity());
+        chain.remove_devices(&[device]);
+        self.set_chain(chain);
+    }
+
+    /// Serves `file` as `identity`'s key file, whatever it holds.
+    pub fn publish_file(&self, identity: &Identity, file: &[u8]) {
+        let site = self.own_site(identity);
+        site.keys
+            .publish(&name(identity), file)
+            .expect("writing a key file");
     }
 
     /// Deletes `identity`'s key file, so that fetching it gets 404.
@@ -355,7 +562,6 @@ impl TestKeyServer {
         site.keys
             .remove(&name(identity))
             .expect("deleting a key file");
-        self.files.lock().expect("poisoned").remove(identity);
     }
 
     fn site(&self, domain: &str) -> &Site {
@@ -368,8 +574,8 @@ impl TestKeyServer {
         let site = self.site(identity.domain());
         assert!(
             !site.foreign,
-            "{} is the server's identity domain: register identities there, and manage their \
-             keys with KEY",
+            "{} is the server's identity domain: register identities there, and change their \
+             chains with KEYS PUT",
             identity.domain()
         );
         site

@@ -68,6 +68,7 @@ use crate::keyfiles::KeyServices;
 use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 use state::Registry;
 
+pub use identity::{BYE_KEYS_CHANGED, BYE_UNREGISTERED, HostedKeyFile, PAIR_LIFETIME};
 pub use session::{BYE_RESUMED, BYE_SHUTDOWN, BYE_SIGN_IN_TIMEOUT, NONCE_BYTES, TOKEN_LEN};
 
 /// Where the hub gets the time from. Replace it in tests where timing
@@ -392,10 +393,18 @@ impl Hub {
     }
 
     /// The key file of the hosted identity `<name>@<identity domain>`, as
-    /// served at its URL (4.3, 4.7), or `None` if the server hosts no such
-    /// identity. This blocks while it reads the store.
-    pub fn hosted_key_file(&self, name: &Name) -> std::io::Result<Option<Vec<u8>>> {
+    /// served at its URL (4.3, 4.7): the file, gone once the identity was
+    /// unregistered without a `retire` record (4.9), or not found. This
+    /// blocks while it reads the store.
+    pub fn hosted_key_file(&self, name: &Name) -> std::io::Result<HostedKeyFile> {
         identity::hosted_key_file(&self.inner, name)
+    }
+
+    /// The server's current key log (4.5), as a key file's `log` line
+    /// names it, if it keeps one: the log that REGISTER's `master` record
+    /// names (4.7).
+    pub fn key_log(&self) -> Option<risala_proto::keyfile::LogLine> {
+        identity::current_log(&self.inner)
     }
 
     /// Runs every area's background work (retention, expiry, checkpoints,

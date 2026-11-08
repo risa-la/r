@@ -17,6 +17,7 @@ name = "risala_server"
 path = "src/lib.rs"
 
 [dependencies]
+base64.workspace = true
 risala-proto.workspace = true
 risala-keyfetch.workspace = true
 risala-mls.workspace = true

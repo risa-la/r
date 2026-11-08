@@ -32,7 +32,7 @@ fn samples() -> Vec<String> {
         format!("KEYS PUT - {}", b64(10)),
         format!("PAIR PUT {BOX} {}", b64(40)),
         format!("PAIR GET {BOX}"),
-        "UNREGISTER alice@example.org".into(),
+        "UNREGISTER bob@example.org".into(),
         format!("CREATE {BOX} {gid} {hash}"),
         format!("CREATE {BOX} {gid} {hash} epoch=3 from={BOX} token={token}"),
         format!("CREATE {BOX} {gid} {hash} #general {msg} {msg}"),
@@ -82,7 +82,7 @@ fn samples() -> Vec<String> {
         "ADMIN BAN spam@example.net spam".into(),
         format!("ADMIN DROP {BOX}"),
         "ADMIN SET guests no".into(),
-        "ADMIN UNREGISTER alice@example.org".into(),
+        "ADMIN UNREGISTER bob@example.org".into(),
         "RESOLVE r1".into(),
         "PING".into(),
     ]
@@ -91,17 +91,25 @@ fn samples() -> Vec<String> {
 /// What the hub answers `request` on a connection of `kind`: the error of
 /// Section 13 if the kind may not send it, `forbidden` for ADMIN from
 /// someone who is not an operator (Section 10), `OK` for PING, and
-/// `not-supported` for every area's commands, which are not built yet.
-fn expected(request: &Request, kind: ConnectionKind, operator: bool) -> String {
+/// `not-supported` for every area's commands that are not built yet.
+/// `None` for the identity area's, which `identity.rs` tests: they get
+/// past the kind check, and answer for themselves.
+fn expected(request: &Request, kind: ConnectionKind, operator: bool) -> Option<String> {
     let code = match request.command.check_kind(kind) {
         Err(code) => code.to_string(),
         Ok(()) => match &request.command {
-            Command::Ping { .. } => return "OK".into(),
+            Command::Ping { .. } => return Some("OK".into()),
             Command::Admin(_) if !operator => "forbidden".into(),
+            Command::Auth { .. }
+            | Command::Register { .. }
+            | Command::KeysPut { .. }
+            | Command::Pair(_)
+            | Command::Unregister { .. }
+            | Command::Admin(AdminCommand::Unregister { .. }) => return None,
             _ => "not-supported".into(),
         },
     };
-    format!("ERR {code}")
+    Some(format!("ERR {code}"))
 }
 
 /// Every command, on every kind of connection, gets the answer Section 13
@@ -130,12 +138,23 @@ async fn every_command_on_every_kind() {
             .unwrap_or_else(|e| panic!("sample {line:?}: {e}"));
         for (kind, operator, conn) in &mut conns {
             h.send(conn, &format!("@ref=k {line}")).await;
-            let want = format!("@ref=k {}", expected(&request, *kind, *operator));
-            assert_eq!(
-                conn.lines(),
-                [want],
-                "{line} on {kind} (operator: {operator})"
-            );
+            let lines = conn.lines();
+            match expected(&request, *kind, *operator) {
+                Some(want) => assert_eq!(
+                    lines,
+                    [format!("@ref=k {want}")],
+                    "{line} on {kind} (operator: {operator})"
+                ),
+                None => {
+                    let last = lines.last().expect("a final response");
+                    for refused in ["not-authenticated", "wrong-connection"] {
+                        assert!(
+                            !last.contains(refused),
+                            "{line} on {kind} (operator: {operator}): {lines:?}"
+                        );
+                    }
+                }
+            }
             assert_eq!(conn.handle.kind(), *kind, "{line} changed the kind");
         }
     }
@@ -166,8 +185,12 @@ async fn section_13_by_hand() {
         (NEW, "INFO #general".into(), "ERR not-authenticated"),
         (NEW, format!("FOLLOW {BOX}"), "ERR not-authenticated"),
         (NEW, "INFO".into(), "ERR not-supported"),
-        (NEW, "KEYS PUT - AAAA".into(), "ERR not-supported"),
-        (NEW, format!("PAIR GET {BOX}"), "ERR not-supported"),
+        (
+            NEW,
+            "KEYS PUT - AAAA".into(),
+            "ERR not-supported this server keeps no key log",
+        ),
+        (NEW, format!("PAIR GET {BOX}"), "ERR not-found"),
         // Once it has a kind, a command for another kind gets
         // wrong-connection (4.1, Section 13).
         (GUEST, "KEYS PUT - AAAA".into(), "ERR wrong-connection"),
@@ -217,14 +240,18 @@ async fn section_13_by_hand() {
 }
 
 /// An ADMIN command an operator sends reaches its area: ADMIN UNREGISTER
-/// the identity area's, the rest the admin area's (both not built yet).
+/// the identity area's, which knows nobody here, the rest the admin
+/// area's (not built yet).
 #[tokio::test]
 async fn admin_commands_reach_their_area() {
     let mut h = Harness::new();
     let mut op = h.signed_in_as("op@example.org");
-    for line in ["ADMIN OPS", "ADMIN UNREGISTER alice@example.org"] {
+    for (line, want) in [
+        ("ADMIN OPS", "ERR not-supported"),
+        ("ADMIN UNREGISTER alice@example.org", "ERR not-found"),
+    ] {
         h.send(&op, line).await;
-        assert_eq!(op.lines(), ["ERR not-supported"], "{line}");
+        assert_eq!(op.lines(), [want], "{line}");
     }
     // The route itself is the one the command table names.
     let unregister: Request = "ADMIN UNREGISTER a@example.org".parse().unwrap();

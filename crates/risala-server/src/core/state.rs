@@ -191,6 +191,20 @@ impl Registry {
         }
     }
 
+    /// Runs none of connection `id`'s commands from now on, and no longer
+    /// counts it as a connection of its uid, without closing it yet: the
+    /// command running now closes it after its reply, as UNREGISTER does
+    /// (4.9).
+    pub(crate) fn stop(&mut self, id: ConnId) {
+        let Some(conn) = self.conns.get_mut(&id) else {
+            return;
+        };
+        conn.detached = true;
+        if let Some(uid) = conn.who.uid().cloned() {
+            unlink(&mut self.by_uid, &uid, id);
+        }
+    }
+
     /// The connections of `uid`, signed in or a guest.
     #[allow(
         dead_code,

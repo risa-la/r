@@ -6,9 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use risala_keyfetch::{FetchOptions, KeyFetcher, Roots, StaticResolver};
-use risala_proto::auth::{PublicKey, SecretKey};
-use risala_proto::keyfile::m5a::KeyEntry;
+use risala_keyfetch::{Body, FetchOptions, KeyFetcher, Roots, StaticResolver};
+use risala_proto::keyfile::KEY_FILE_HEADER;
 use risala_proto::names::{Identity, Name};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -59,12 +58,13 @@ impl TestCa {
     }
 }
 
-fn entry(seed: u8, label: &str) -> KeyEntry {
-    KeyEntry::new(SecretKey::from_seed([seed; 32]).public_key(), Some(label)).unwrap()
+/// A made-up key file: the listener and the fetcher do not read it.
+fn file(n: u8) -> Vec<u8> {
+    format!("{KEY_FILE_HEADER}\n# file {n}\n").into_bytes()
 }
 
-fn key(seed: u8) -> PublicKey {
-    SecretKey::from_seed([seed; 32]).public_key()
+fn body(found: risala_keyfetch::Found) -> Body {
+    found.body
 }
 
 fn name(s: &str) -> Name {
@@ -102,24 +102,22 @@ async fn listener_serves_published_key_files() {
 
     let fetcher = fetcher(&ca, addr);
     let alice = id("alice@example.test");
-    assert!(fetcher.lookup(&alice, false).await.unwrap().gone);
+    let lookup = async |fetcher: &KeyFetcher| body(fetcher.lookup(&alice, false).await.unwrap());
+    assert_eq!(lookup(&fetcher).await, Body::Gone(404));
 
-    keys.publish(&name("alice"), &[entry(1, "laptop"), entry(2, "phone")])
-        .unwrap();
+    keys.publish(&name("alice"), &file(1)).unwrap();
     fetcher.invalidate(&alice);
-    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(1), key(2)]));
-    let entries = fetcher.fetch_entries(&alice, false).await.unwrap();
-    assert_eq!(entries[1].label(), Some("phone"));
+    assert_eq!(lookup(&fetcher).await, Body::File(file(1).into()));
 
-    // KEY DEL republishes the file.
-    keys.publish(&name("alice"), &[entry(2, "phone")]).unwrap();
+    // KEYS PUT republishes the file.
+    keys.publish(&name("alice"), &file(2)).unwrap();
     fetcher.invalidate(&alice);
-    assert_eq!(fetcher.fetch(&alice, false).await, Ok(vec![key(2)]));
+    assert_eq!(lookup(&fetcher).await, Body::File(file(2).into()));
 
     // UNREGISTER removes it.
     keys.remove(&name("alice")).unwrap();
     fetcher.invalidate(&alice);
-    assert!(fetcher.lookup(&alice, false).await.unwrap().gone);
+    assert_eq!(lookup(&fetcher).await, Body::Gone(404));
 
     stop.send(()).unwrap();
     running.await.unwrap().unwrap();
@@ -174,8 +172,11 @@ async fn connections_are_limited_per_address() {
 /// Sends `request` to the listener's request handling and returns the
 /// response.
 async fn exchange(keys: &Arc<KeyDir>, request: &[u8]) -> String {
+    exchange_with(keys.clone(), request).await
+}
+
+async fn exchange_with(keys: Arc<dyn KeyFiles>, request: &[u8]) -> String {
     let (mut client, mut server) = tokio::io::duplex(1 << 20);
-    let keys: Arc<dyn KeyFiles> = keys.clone();
     let task = tokio::spawn(async move { handle(&mut server, &keys).await });
     client.write_all(request).await.unwrap();
     client.shutdown().await.unwrap();
@@ -189,8 +190,8 @@ async fn exchange(keys: &Arc<KeyDir>, request: &[u8]) -> String {
 async fn responses() {
     let tmp = tempfile::tempdir().unwrap();
     let keys = Arc::new(KeyDir::new(tmp.path()));
-    keys.publish(&name("alice"), &[entry(1, "laptop")]).unwrap();
-    let file = KeyDir::render(&[entry(1, "laptop")]);
+    keys.publish(&name("alice"), &file(1)).unwrap();
+    let file = String::from_utf8(file(1)).unwrap();
 
     let get = exchange(
         &keys,
@@ -251,9 +252,26 @@ async fn responses() {
     assert!(exchange(&keys, &long).await.starts_with("HTTP/1.1 431 "));
 }
 
+/// The key file of a name that was unregistered gets 410 (4.9).
+#[tokio::test]
+async fn unregistered_names_are_gone() {
+    struct Gone;
+    impl KeyFiles for Gone {
+        fn key_file(&self, _: &Name) -> std::io::Result<crate::core::HostedKeyFile> {
+            Ok(crate::core::HostedKeyFile::Gone)
+        }
+    }
+    let response = exchange_with(
+        Arc::new(Gone),
+        b"GET /.well-known/risala/alice HTTP/1.1\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 410 Gone\r\n"), "{response}");
+}
+
 /// `risalad`'s listener serves the key files of the identities it hosts,
 /// from its records, and nothing else that is in `key_dir` (4.7). It hosts
-/// none yet, so every name is gone, and the fetcher says so.
+/// none here, so every name is gone, and the fetcher says so.
 #[tokio::test]
 async fn daemon_runs_the_listener() {
     let tmp = tempfile::tempdir().unwrap();
@@ -278,11 +296,7 @@ async fn daemon_runs_the_listener() {
     assert_eq!(daemon.key_dir().dir(), tmp.path().join("state/keys"));
     // A file someone writes to the directory is not served.
     std::fs::create_dir_all(config.key_dir()).unwrap();
-    std::fs::write(
-        config.key_dir().join("dave"),
-        KeyDir::render(&[entry(9, "x")]),
-    )
-    .unwrap();
+    std::fs::write(config.key_dir().join("dave"), file(9)).unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let running = tokio::spawn(daemon.run(async {
         let _ = stopped.await;
@@ -301,15 +315,15 @@ async fn daemon_runs_the_listener() {
             .lookup(&id(&format!("{nobody}@example.test")), false)
             .await
             .unwrap();
-        assert!(found.gone && found.entries.is_empty(), "{nobody}");
+        assert_eq!(found.body, Body::Gone(404), "{nobody}");
     }
-    // Through the server's trait, as the hub calls it: gone is no keys,
+    // Through the server's trait, as the hub calls it: gone is an answer,
     // and a failure is an error (4.4).
     let fetcher = super::HttpsKeyFetcher(fetcher);
     assert_eq!(
         crate::keyfiles::KeyFetcher::fetch(&fetcher, &id("bob@example.test"), true).await,
-        Ok(crate::keyfiles::FetchedKeys {
-            keys: vec![],
+        Ok(crate::keyfiles::FetchedFile {
+            body: Body::Gone(404),
             cached: false
         })
     );

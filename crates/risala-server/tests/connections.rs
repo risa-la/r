@@ -66,11 +66,12 @@ async fn line_limits_follow_the_kind() {
         client.expect_line().await.unwrap(),
         "@ref=p ERR too-long too long"
     );
-    // REGISTER passes the framing, and reaches the hub (4.7, not built).
+    // REGISTER passes the framing, and reaches the hub (4.7), which hosts
+    // no identities here.
     client.send(&register).await.unwrap();
     assert_eq!(
         client.expect_line().await.unwrap(),
-        "@ref=r ERR not-supported"
+        "@ref=r ERR not-supported this server does not offer registration"
     );
     let too_big = format!(
         "@ref=b REGISTER alice {} {}",

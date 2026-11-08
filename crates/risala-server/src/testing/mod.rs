@@ -33,9 +33,12 @@
 //! `[keys] allow_private`, and sends each domain to its listener with a
 //! test resolver. [`TestServer::auth`] sends AUTH (4.6) for one.
 //!
-//! The key files are still draft-02's, and AUTH and REGISTER reply
-//! `ERR not-supported` until the server's identity area is built; helpers
-//! to register and sign in come with it.
+//! Their chains name a log of their own domain, which nothing serves, so
+//! their key files list every record unlogged (4.4).
+//!
+//! With [`identity_domain`](TestServerBuilder::identity_domain), the
+//! server hosts identities (4.7): [`TestServer::register`] registers one,
+//! with a [`TestChain`] that names the server's key log.
 //!
 //! # Time
 //!
@@ -79,7 +82,7 @@ use crate::store::SqliteStore;
 mod identities;
 
 pub use crate::net::testing::{ClientOptions, RECV_TIMEOUT, TestClient};
-pub use identities::{TestIdentity, TestKeyServer};
+pub use identities::{TestChain, TestIdentity, TestKeyServer, test_log_key};
 
 /// How long [`TestServer::stop`] waits for the server to finish.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -526,6 +529,35 @@ impl TestServer {
             who.identity()
         );
         client
+    }
+
+    /// Registers `<name>@<identity domain>` (4.7) with a new chain that
+    /// names the server's key log, and its first device. Panics unless
+    /// REGISTER succeeds. Returns the client, signed in as the new
+    /// identity, the chain, and the device.
+    pub async fn register(&self, name: &str) -> (TestClient, TestChain, TestIdentity) {
+        let domain = self
+            .config
+            .identity_domain
+            .as_deref()
+            .expect("the test server has no identity_domain");
+        let log = self
+            .hub()
+            .key_log()
+            .expect("a server with an identity domain has a log");
+        let (chain, device) = TestChain::new(&format!("{name}@{domain}"), &log.log);
+        let (mut client, nonce) = self.connect_for_sign_in().await;
+        client
+            .send(&chain.register_line(&device, &self.config.hostname, &nonce))
+            .await
+            .expect("sending");
+        let answer = client.expect_line().await.expect("an answer to REGISTER");
+        let ok = format!("OK uid={}", chain.identity());
+        assert!(
+            answer == ok || answer == format!("{ok} op=yes"),
+            "answer to REGISTER {name}: {answer}"
+        );
+        (client, chain, device)
     }
 
     /// Connects and reads the greeting. Returns the client and the

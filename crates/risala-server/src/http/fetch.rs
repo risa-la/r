@@ -1,5 +1,5 @@
-//! Fetching key files for AUTH (4.4, 4.5): the hub's
-//! [`KeyFetcher`], implemented by
+//! Fetching key files and key logs' files for AUTH and KEYS PUT (4.4,
+//! 4.6, 4.7): the hub's [`KeyFetcher`], implemented by
 //! [`risala_keyfetch`].
 
 use std::io;
@@ -11,25 +11,32 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject as _;
 
 use crate::config::KeysConfig;
-use crate::keyfiles::{FetchError, FetchedKeys, KeyFetcher};
+use crate::keyfiles::{FetchError, FetchedFile, KeyFetcher, UrlBody};
 
-/// Fetches key files over HTTPS under the rules of 4.4, for the hub's
-/// AUTH (4.5). A key file or a gone answer gives the identity's keys; a
-/// failed fetch gives an error, and AUTH `ERR unavailable`.
+/// Fetches key files and key logs' files over HTTPS under the rules of
+/// 4.4, for the hub's AUTH and KEYS PUT (4.6, 4.7). A failed fetch is an
+/// outage, and AUTH gets `ERR unavailable`.
 #[derive(Debug)]
 pub struct HttpsKeyFetcher(pub risala_keyfetch::KeyFetcher);
 
 impl KeyFetcher for HttpsKeyFetcher {
-    async fn fetch(&self, identity: &Identity, refresh: bool) -> Result<FetchedKeys, FetchError> {
+    async fn fetch(&self, identity: &Identity, refresh: bool) -> Result<FetchedFile, FetchError> {
         let found = self
             .0
             .lookup(identity, refresh)
             .await
             .map_err(|e| FetchError::Failed(e.to_string()))?;
-        Ok(FetchedKeys {
-            keys: found.entries.iter().map(|e| e.key().clone()).collect(),
+        Ok(FetchedFile {
+            body: found.body,
             cached: found.cached,
         })
+    }
+
+    async fn fetch_log(&self, url: &str) -> Result<UrlBody, FetchError> {
+        self.0
+            .fetch_url(url, risala_proto::keyfile::MAX_LOG_FETCH_BYTES)
+            .await
+            .map_err(|e| FetchError::Failed(e.to_string()))
     }
 }
 

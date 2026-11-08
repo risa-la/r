@@ -2422,6 +2422,7 @@ dependencies = [
 name = "risala-server"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "openmls_memory_storage",
  "proptest",

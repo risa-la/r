@@ -1,4 +1,4 @@
-//! Publishing hosted identities' key files (4.6): [`KeyDir`], the hub's
+//! Publishing hosted identities' key files (4.7): [`KeyDir`], the hub's
 //! [`KeyFilePublisher`], which writes the files to a directory.
 //!
 //! The directory holds one file per hosted name, `<dir>/<name>`, readable
@@ -11,7 +11,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use risala_proto::keyfile::m5a::KeyEntry;
+use risala_proto::keyfile::KEY_FILE_HEADER;
 use risala_proto::names::Name;
 
 use crate::keyfiles::KeyFilePublisher;
@@ -46,12 +46,6 @@ impl KeyDir {
         self.dir.join(name.as_str())
     }
 
-    /// The text of a key file with `keys`: one line each, ending in LF
-    /// (4.4).
-    pub fn render(keys: &[KeyEntry]) -> String {
-        keys.iter().map(|k| format!("{k}\n")).collect()
-    }
-
     /// Reads `name`'s key file, or `None` if there is none. Blocks.
     pub fn read(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
         match fs::read(self.path(name)) {
@@ -77,7 +71,7 @@ impl KeyFilePublisher for KeyDir {
     /// Writes `<dir>/.<name>.tmp`, then renames it over `<dir>/<name>`, so
     /// that a web server never serves half a file. Names never start with
     /// `.` (3.5), so the temporary file is never served as a key file.
-    fn publish(&self, name: &Name, keys: &[KeyEntry]) -> io::Result<()> {
+    fn publish(&self, name: &Name, contents: &[u8]) -> io::Result<()> {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         self.create_dir()?;
         let path = self.path(name);
@@ -101,16 +95,14 @@ impl KeyFilePublisher for KeyDir {
             use std::os::unix::fs::PermissionsExt as _;
             file.set_permissions(fs::Permissions::from_mode(0o644))?;
         }
-        let written = file
-            .write_all(Self::render(keys).as_bytes())
-            .and_then(|()| file.sync_all());
+        let written = file.write_all(contents).and_then(|()| file.sync_all());
         drop(file);
         if let Err(e) = written.and_then(|()| fs::rename(&tmp, &path)) {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
         sync_dir(&self.dir);
-        tracing::debug!(%name, keys = keys.len(), "published key file");
+        tracing::debug!(%name, bytes = contents.len(), "published key file");
         Ok(())
     }
 
@@ -130,8 +122,7 @@ impl KeyFilePublisher for KeyDir {
     /// Removes the key files of names not in `hosted`. Operators may keep
     /// other files in the directory, such as an index page, so only a
     /// file this could have written is removed: a regular file, named as
-    /// a name is (3.5), that is not empty and holds nothing but key lines
-    /// (4.4).
+    /// a name is (3.5), whose first line is a key file's (4.4).
     fn retain(&self, hosted: &[Name]) -> io::Result<()> {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let entries = match fs::read_dir(&self.dir) {
@@ -158,14 +149,8 @@ impl KeyFilePublisher for KeyDir {
                 continue;
             }
             let path = entry.path();
-            let text = match fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
-                Err(e) => return Err(e),
-            };
-            let key_lines =
-                !text.is_empty() && text.lines().all(|line| line.parse::<KeyEntry>().is_ok());
-            if !key_lines {
+            let bytes = fs::read(&path)?;
+            if !is_key_file(&bytes) {
                 continue;
             }
             fs::remove_file(&path)?;
@@ -177,6 +162,13 @@ impl KeyFilePublisher for KeyDir {
         }
         Ok(())
     }
+}
+
+/// Whether `bytes` start like a key file of this version (4.4).
+fn is_key_file(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(KEY_FILE_HEADER.as_bytes())
+        .is_some_and(|rest| rest.starts_with(b"\n"))
 }
 
 /// Makes a rename or removal in `dir` durable, where the platform allows.
@@ -192,11 +184,9 @@ fn sync_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use risala_proto::auth::SecretKey;
-    use risala_proto::keyfile::m5a::KeyFile;
 
-    fn entry(seed: u8, label: Option<&str>) -> KeyEntry {
-        KeyEntry::new(SecretKey::from_seed([seed; 32]).public_key(), label).unwrap()
+    fn file(n: u8) -> Vec<u8> {
+        format!("{KEY_FILE_HEADER}\n# file {n}\n").into_bytes()
     }
 
     fn name(s: &str) -> Name {
@@ -210,26 +200,17 @@ mod tests {
         let alice = name("alice");
         assert_eq!(dir.read(&alice).unwrap(), None);
 
-        let keys = [entry(1, Some("laptop")), entry(2, None)];
-        dir.publish(&alice, &keys).unwrap();
-        let text = String::from_utf8(dir.read(&alice).unwrap().unwrap()).unwrap();
-        assert_eq!(KeyFile::parse(&text).unwrap().keys(), &keys);
-        assert!(text.ends_with('\n'));
-
-        dir.publish(&alice, &keys[1..]).unwrap();
-        let text = fs::read_to_string(tmp.path().join("keys/alice")).unwrap();
-        assert_eq!(KeyFile::parse(&text).unwrap().keys(), &keys[1..]);
-
-        // No keys: an empty file, which locks the identity.
-        dir.publish(&alice, &[]).unwrap();
-        assert_eq!(dir.read(&alice).unwrap(), Some(Vec::new()));
+        dir.publish(&alice, &file(1)).unwrap();
+        assert_eq!(dir.read(&alice).unwrap(), Some(file(1)));
+        dir.publish(&alice, &file(2)).unwrap();
+        assert_eq!(fs::read(tmp.path().join("keys/alice")).unwrap(), file(2));
 
         dir.remove(&alice).unwrap();
         assert_eq!(dir.read(&alice).unwrap(), None);
         dir.remove(&alice).unwrap();
 
         // Only key files are left behind.
-        dir.publish(&name("bob"), &keys).unwrap();
+        dir.publish(&name("bob"), &file(1)).unwrap();
         let files: Vec<_> = fs::read_dir(dir.dir())
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -242,18 +223,18 @@ mod tests {
     fn retain_removes_only_stale_key_files() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = KeyDir::new(tmp.path());
-        let keys = [entry(1, Some("laptop")), entry(2, None)];
-        dir.publish(&name("alice"), &keys).unwrap();
-        dir.publish(&name("bob"), &keys).unwrap();
-        dir.publish(&name("carol.x"), &keys[..1]).unwrap();
-        for (file, text) in [
+        dir.publish(&name("alice"), &file(1)).unwrap();
+        dir.publish(&name("bob"), &file(2)).unwrap();
+        dir.publish(&name("carol.x"), &file(3)).unwrap();
+        let key_file = String::from_utf8(file(4)).unwrap();
+        for (path, text) in [
             ("index.html", "<html></html>\n"),
             ("empty", ""),
-            ("notes", "mldsa44 not-a-key\n"),
-            ("Dave", &KeyDir::render(&keys)),
-            (".eve.tmp", &KeyDir::render(&keys)),
+            ("notes", "risala-keys/10\n"),
+            ("Dave", key_file.as_str()),
+            (".eve.tmp", key_file.as_str()),
         ] {
-            fs::write(tmp.path().join(file), text).unwrap();
+            fs::write(tmp.path().join(path), text).unwrap();
         }
         fs::create_dir(tmp.path().join("frank")).unwrap();
 
@@ -291,7 +272,7 @@ mod tests {
         fs::write(&stale, "junk").unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
 
-        dir.publish(&name("carol"), &[entry(3, None)]).unwrap();
+        dir.publish(&name("carol"), &file(3)).unwrap();
         let mode = fs::metadata(dir.path(&name("carol")))
             .unwrap()
             .permissions()

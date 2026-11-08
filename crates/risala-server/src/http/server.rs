@@ -2,7 +2,8 @@
 //! identities' key files at `/.well-known/risala/<name>`, from wherever
 //! its [`KeyFiles`] gets them. In `risalad` that is the hub's own records
 //! of the identities it hosts, so the listener serves those names and
-//! nothing else, whatever else is in `key_dir`.
+//! nothing else, whatever else is in `key_dir`. The key file of a name
+//! that was unregistered gets 410 (4.9).
 //!
 //! It speaks just enough HTTP/1.1 for that: one request per connection,
 //! answered and then closed. `GET` and `HEAD` of a key file get it, with
@@ -30,14 +31,14 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use super::KeyDir;
-use crate::core::Hub;
+use crate::core::{HostedKeyFile, Hub};
 use crate::net::{self, Certificates};
 
 /// Where the HTTPS listener gets the key files it serves.
 pub trait KeyFiles: Send + Sync + 'static {
-    /// The key file of `<name>@<identity domain>`, or `None` if there is
-    /// none to serve (404). Called on the blocking pool.
-    fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>>;
+    /// The key file of `<name>@<identity domain>`, or why there is none
+    /// to serve. Called on the blocking pool.
+    fn key_file(&self, name: &Name) -> io::Result<HostedKeyFile>;
 
     /// The hub, whose key log and witness the listener also serves (4.5,
     /// 4.10); `None` for key files from elsewhere.
@@ -49,7 +50,7 @@ pub trait KeyFiles: Send + Sync + 'static {
 /// The key files of the identities the hub hosts, made from its records
 /// (4.7): the names it hosts, and nothing else.
 impl KeyFiles for Hub {
-    fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
+    fn key_file(&self, name: &Name) -> io::Result<HostedKeyFile> {
         self.hosted_key_file(name)
     }
 
@@ -61,8 +62,10 @@ impl KeyFiles for Hub {
 /// The files in a directory that another program writes, as a web server
 /// serving `key_dir` would. Tests use it for key servers of their own.
 impl KeyFiles for KeyDir {
-    fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
-        self.read(name)
+    fn key_file(&self, name: &Name) -> io::Result<HostedKeyFile> {
+        Ok(self
+            .read(name)?
+            .map_or(HostedKeyFile::NotFound, HostedKeyFile::File))
     }
 }
 
@@ -513,12 +516,12 @@ async fn route(request: &Request, keys: &Arc<dyn KeyFiles>) -> Response {
     response
 }
 
-/// A hosted identity's key file, or 404.
+/// A hosted identity's key file, 410 for one unregistered (4.9), or 404.
 async fn key_file(name: Name, keys: &Arc<dyn KeyFiles>) -> Response {
     let keys = keys.clone();
     let read = tokio::task::spawn_blocking(move || keys.key_file(&name)).await;
     match read {
-        Ok(Ok(Some(body))) => Response {
+        Ok(Ok(HostedKeyFile::File(body))) => Response {
             status: 200,
             reason: "OK",
             content_type: "text/plain; charset=utf-8",
@@ -526,7 +529,8 @@ async fn key_file(name: Name, keys: &Arc<dyn KeyFiles>) -> Response {
             body,
             head_only: false,
         },
-        Ok(Ok(None)) => Response::error(404, "Not Found"),
+        Ok(Ok(HostedKeyFile::Gone)) => Response::error(410, "Gone"),
+        Ok(Ok(HostedKeyFile::NotFound)) => Response::error(404, "Not Found"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "reading a key file");
             Response::error(500, "Internal Server Error")

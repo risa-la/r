@@ -88,16 +88,20 @@ impl Harness {
 
     /// A hub on `store`.
     pub(super) fn on(config: Config, timers: Timers, store: SqliteStore) -> Harness {
+        Harness::with_keys(config, timers, store, KeyServices::default())
+    }
+
+    /// A hub on `store`, fetching and publishing key files with `keys`
+    /// (4.4, 4.7).
+    pub(super) fn with_keys(
+        config: Config,
+        timers: Timers,
+        store: SqliteStore,
+        keys: KeyServices,
+    ) -> Harness {
         let store = Arc::new(store);
         let clock = Arc::new(ManualClock::new(T.parse().unwrap()));
-        let hub = Hub::build(
-            config,
-            store.clone(),
-            clock.clone(),
-            timers,
-            KeyServices::default(),
-        )
-        .unwrap();
+        let hub = Hub::build(config, store.clone(), clock.clone(), timers, keys).unwrap();
         Harness {
             hub,
             store,

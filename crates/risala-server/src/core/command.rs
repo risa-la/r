@@ -70,6 +70,9 @@ pub(crate) struct Cx {
     pub(crate) peer: SocketAddr,
     /// Who the connection acts for, as the command began.
     pub(crate) who: Who,
+    /// A BYE text to close the connection with once the final response
+    /// has been sent ([`close_after`](Self::close_after)).
+    close_after: std::sync::Mutex<Option<String>>,
 }
 
 #[allow(
@@ -101,6 +104,12 @@ impl Cx {
             Who::SignedIn(device) => Some(device),
             _ => None,
         }
+    }
+
+    /// Closes the connection with `BYE <bye>` once the command's final
+    /// response has been sent, as UNREGISTER does (4.9).
+    pub(crate) fn close_after(&self, bye: &str) {
+        *self.close_after.lock().unwrap_or_else(|e| e.into_inner()) = Some(bye.to_owned());
     }
 
     /// Runs a store call on the blocking pool. A failure is logged, and
@@ -135,6 +144,7 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
             ref_,
             peer: conn.info.peer,
             who: conn.who.clone(),
+            close_after: std::sync::Mutex::new(None),
         }
     };
     if let Err(code) = command.check_kind(cx.who.kind()) {
@@ -182,6 +192,14 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
         | Command::Resolve { .. }) => misc::handle(&cx, command).await,
     };
     finish(&cx, reply);
+    let close = cx
+        .close_after
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(bye) = close {
+        cx.handle.close(Some(bye));
+    }
 }
 
 /// ADMIN commands are for operators only: anyone else gets `ERR forbidden`

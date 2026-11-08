@@ -103,6 +103,7 @@ mod tests {
                 "mutes",
                 "operators",
                 "pairing",
+                "pins",
                 "posts",
                 "presence",
                 "public_rooms",
