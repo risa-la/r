@@ -30,18 +30,46 @@ kind until it closes:
   guest name for public rooms.
 
 Until it becomes one of them, the server accepts only INFO without a
-room, ANON, GUEST, AUTH, REGISTER, KEYS PUT, PAIR, PING, PONG and QUIT.
-It replies `ERR not-authenticated` to anything else, and to a command
-that needs a kind of connection this one is not (Section 13).
+room, ANON, GUEST, AUTH, REGISTER, KEYS PUT, PAIR, PING, PONG and QUIT,
+and replies `ERR not-authenticated` to anything else. Once it is one of
+them, a command that needs another kind of connection gets
+`ERR wrong-connection` (Section 13).
 
 A device keeps one signed-in connection and at least one anonymous
 connection open while it is online. Section 14 says what the server can
 still link between them.
 
+**Keeping connections apart.** An anonymous connection is anonymous only
+as long as nothing sent on it names the device. So:
+
+- A device MUST send each command that names or proves its identity,
+  device, leaf or KeyPackage either on its signed-in connection, where
+  Section 13 allows it there, or on a connection of its own, which it
+  opens for that command, uses for nothing else and closes afterwards,
+  never on an anonymous connection that it uses for anything else. These
+  are KEYS PUT (4.7), PAIR PUT and PAIR GET (4.8), WELCOME GET (12.8),
+  FETCH with `leaf` (12.6), and every PublicMessage it posts: in a
+  public room, every commit, external commit and proposal, whose sender
+  the server can read (12.6). A light client keeps one such connection
+  open for its fetches with `leaf`, and uses it for nothing else.
+- A device MUST store the blobs and files that a post or a Welcome
+  refers to over an anonymous connection (5.6, 12.12), never over its
+  signed-in one, which would tie the post to the identity.
+- A device SHOULD use a fresh anonymous connection for each CREATE,
+  each KEYPKG GET (12.5) and each WELCOME PUT (12.8), and a separate
+  anonymous connection for WATCH (8.3), since each says something about
+  whom the device talks to.
+
+Section 14 says what a device's anonymous connections can still reveal
+about each other.
+
 **Proof of work.** A server MAY require a client to solve a
-proof-of-work puzzle before ANON, GUEST or REGISTER succeeds, and before
-an anonymous or guest connection joins a public room (6.1). The puzzle,
-and how it is bound to the connection, are specified separately.
+proof-of-work puzzle before ANON, GUEST or REGISTER succeeds, before
+CREATE, before KEYPKG GET on an anonymous or guest connection (12.5),
+and before an anonymous or guest connection joins a public room (6.1).
+The puzzle, and how it is bound to the connection, are specified
+separately: this paragraph holds the place of that specification, which
+will make proof of work on by default.
 
 Servers SHOULD allow at least 120 seconds to sign in or become
 anonymous.
@@ -57,7 +85,31 @@ ANON
 The connection becomes anonymous. It can then use the commands of
 Sections 5 to 7 that the summary in Section 13 marks for anonymous
 connections. The server MAY limit how many anonymous connections one
-network address keeps open, and how much each one posts (Section 14).
+network address keeps open, and MUST limit how much each connection and
+each network address posts and stores (5.2, 7.5).
+
+**What the server keeps.** Without Tor (Section 14), a server that
+watches in real time can often link an anonymous connection to a
+signed-in one by its network address. What anonymous connections can
+still protect is data the server stores, against anyone who later reads
+it: a database that is seized, or that the operator is compelled to hand
+over. So:
+
+- A server MUST NOT keep, beyond the life of the connection (or of a
+  guest's session, below), the network address of an anonymous or guest
+  connection, or any link between such a connection and a signed-in
+  connection, a post, a follow, a mailbox, a token, a blob, an upload, a
+  Welcome, a report or a push subscription.
+- A post is stored with its box, seq, time and message only (5.2). A
+  mailbox, blob, upload, Welcome or mailbox push subscription is stored
+  without the connection or address that made it.
+- State kept per network address for rate limits and quotas is kept in
+  memory only, or for no longer than the limit's window. Address bans
+  (10.2) hold the banned address, and nothing about the connections that
+  led to them.
+- Operators' logs follow the same rules. Implementations MUST NOT log
+  the addresses of anonymous and guest connections by default.
+- ADMIN WHO (10.3) shows open connections only.
 
 ```
 GUEST <name> [token=<token>]
@@ -69,7 +121,9 @@ A guest is an anonymous connection with a name, so that it can take part
 in public rooms that allow guests (6.2). Guests join public rooms only.
 The one other conversation a guest may start is a direct conversation
 with an owner or moderator of a room it is in, to report a message
-(5.8).
+(5.8). For that, a guest connection may also fetch the moderator's
+KeyPackages, create the conversation's mailbox and send its Welcomes
+(Section 13).
 A guest has a name for as long as its **session** lasts. The session
 starts with GUEST and ends a while after its connection closes, unless
 the guest resumes it (see below). Once it ends, another guest may take

@@ -127,8 +127,12 @@ domain     = label 1*( "." label )              ; A-labels [RFC5890]
 label      = alnum [ *61( alnum / "-" ) alnum ]
 uid        = guest / identity
 room       = "#" alnum [ *62( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]
-box        = 26( %x61-7A / %x32-37 )            ; a-z 2-7: 16 bytes, base32
+box        = 25( %x61-7A / %x32-37 )
+             ( "a" / "e" / "i" / "m" / "q" / "u" / "y" / "4" )
+                                                ; 16 bytes, base32: a-z 2-7
 seq        = %x31-39 *18DIGIT                   ; 1 to 2^63-1
+position   = "0" / seq                          ; FETCH after, FOLLOW head,
+                                                ; GROUPINFO's seq
 id         = 1*64( alnum / "-" / "_" )          ; report or Welcome id
 blob-ref   = "sha384:" 96( DIGIT / %x61-66 )    ; a blob's hash, lower-case hex
 timestamp  = full-date "T" time-hour ":" time-minute ":"
@@ -142,8 +146,14 @@ timestamp  = full-date "T" time-hour ":" time-minute ":"
   (Section 4.2) or an identity such as `alice@example.org` (4.3).
 - A **box** names a mailbox, the place on the server where one
   conversation's posts are kept (5.2). It is 16 random bytes in
-  lower-case base32 [RFC4648], without padding. A **room** name is used
-  only for public rooms, to find them (6.1).
+  lower-case base32 [RFC4648], without padding. 26 characters carry 130
+  bits, so the last character's two unused bits MUST be zero, which
+  leaves it one of `a e i m q u y 4`. A box with any other last character
+  gets `ERR bad-syntax`. So each box has one spelling, and servers
+  compare boxes as strings, after folding upper case to lower case. A
+  **room** name is used only for public rooms, to find them (6.1).
+- A **position** in a mailbox is a seq, or `0` for the place before the
+  first post (7.1).
 - A **blob-ref** names a blob, by the SHA-384 hash of its bytes (12.12).
 - Names and rooms never end with `.`, so a full stop after one in a
   sentence is never part of it.
@@ -211,7 +221,8 @@ S: @ref=7 OK more=1
 | `bad-syntax` | The line could not be parsed, or has the wrong parameters |
 | `unknown-command` | The verb is not known |
 | `too-long` | The line or one of its parameters is too long, or a file, blob or KeyPackage is too large |
-| `not-authenticated` | The command needs ANON, GUEST, AUTH or REGISTER first, or needs a signed-in connection (4.1) |
+| `not-authenticated` | The connection is new: the command needs ANON, GUEST, AUTH or REGISTER first (4.1) |
+| `wrong-connection` | The command needs another kind of connection than this one, for example a signed-in one, or an anonymous one (4.1, 13) |
 | `already-authenticated` | This connection is already anonymous, a guest or signed in |
 | `auth-failed` | The signature did not verify against the identity's keys, or the connection's SNI does not name this server (4.6) |
 | `name-taken` | The guest name, identity name, room name or mailbox is already in use |

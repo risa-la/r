@@ -26,6 +26,15 @@ upgrade step.
   MUST refuse a client that offers ALPN identifiers but not `risala/1`,
   with the `no_application_protocol` alert, so that a web browser or
   other client sent to the wrong port fails clearly.
+- Clients MUST NOT resume TLS sessions or use pre-shared keys, on
+  risala connections or on the HTTPS requests they make for risala
+  (uploads, blobs and key files: 4.4, 5.6, 12.12). A session ticket
+  offered on one connection would tell the server that it comes from the
+  same client as the connection that got the ticket, whatever address it
+  comes from, and so link anonymous connections to signed-in ones (4.1).
+  For the same reason, a client SHOULD NOT send HTTPS requests that
+  belong to different risala connections over one HTTPS connection.
+  Servers SHOULD NOT issue session tickets.
 
 A server address is a hostname with an optional port, for example
 `chat.example.org` or `chat.example.org:7000`. Clients lower-case the
@@ -42,14 +51,25 @@ risala on port 7472. Servers SHOULD load renewed certificates without
 dropping connections.
 
 For each server address, a client keeps a record of how that server was
-verified: nothing yet, "CA", or a pinned fingerprint. It checks the
-server's certificate as follows:
+verified. The record is one of:
 
+- nothing yet;
+- `CA`;
+- `pin <fingerprint>`, a pin from trust on first use;
+- `strict <fingerprint>`, a strict pin (below), whether the server's
+  certificate is CA-valid or not.
+
+It checks the server's certificate as follows:
+
+0. **A strict pin is recorded.** The client accepts a certificate whose
+   key has the pinned fingerprint, CA-valid or not. It MUST refuse any
+   other certificate, CA-valid or not, and show its fingerprint, until
+   the user accepts the new key, which then becomes the strict pin.
 1. **The certificate is CA-valid.** The chain validates against the
    client's trusted certificate authorities and matches the hostname
-   [RFC9525]. The client accepts it and records "CA". Unless the user
-   has set a strict pin (below), the client MUST NOT compare a CA-valid
-   certificate against a pin, because ACME clients such as those used
+   [RFC9525]. The client accepts it and records `CA`. Without a strict
+   pin, the client MUST NOT compare a CA-valid certificate against a
+   pin, because ACME clients such as those used
    with Let's Encrypt usually generate a new key at every renewal.
 2. **Any other certificate** (self-signed, expired, wrong name or unknown
    authority) is handled by trust on first use:
@@ -58,30 +78,30 @@ server's certificate as follows:
      lower-case hex digits.
    - If nothing is recorded for the server yet, the client MUST show the
      fingerprint and ask the user whether to accept it. If the user
-     accepts, the client records the fingerprint as the server's pin.
+     accepts, the client records `pin <fingerprint>`.
    - If a pin is recorded and matches, the client accepts.
-   - If a pin is recorded and does not match, or "CA" is recorded, the
+   - If a pin is recorded and does not match, or `CA` is recorded, the
      client MUST refuse the connection and show the fingerprint. The
      user SHOULD have to delete the record explicitly before trying
      again.
 
-A client records "CA" or a pin only after the TLS handshake has
+A client records `CA` or a pin only after the TLS handshake has
 completed, which proves that the server holds the certificate's private
 key. Otherwise anyone could replay a server's public certificate to
 change the record.
 
-Recording "CA" means an attacker cannot downgrade a server that has a CA
+Recording `CA` means an attacker cannot downgrade a server that has a CA
 certificate to a trust-on-first-use prompt. A server that moves from a
 self-signed certificate to a CA-valid one is accepted under rule 1, and
-the client replaces its pin with "CA". When it replaces a pin this way,
+the client replaces its pin with `CA`. When it replaces a pin this way,
 the client SHOULD tell the user once, showing the old fingerprint and
 the new certificate's, since whoever can get a certificate for the name,
 for example by taking over its DNS, could be behind the change.
 
-Clients SHOULD let users set a **strict pin** for a server. The client
-then compares every certificate, CA-valid or not, against the pinned
-key, and asks the user before accepting a different one. An operator
-whose users do this keeps the same key across renewals.
+Clients SHOULD let users set a **strict pin** for a server, on the key
+of the certificate it has just accepted. The client then compares every
+certificate, CA-valid or not, against the pinned key (rule 0). An
+operator whose users do this keeps the same key across renewals.
 
 Pinning the public key rather than the whole certificate lets an
 operator renew a self-signed certificate by keeping its key. Appendix A
