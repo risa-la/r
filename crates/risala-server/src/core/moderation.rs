@@ -348,8 +348,9 @@ impl Inner {
             return Err(fail(ErrorCode::Forbidden, "banned; unban first"));
         }
         // M5a: `ERR encrypted` in an encrypted room, where a COMMIT invites.
-        // A member needs no invitation: nothing is recorded (6.4).
-        if st.is_member(&target) {
+        // A member needs no invitation, and someone invited already needs
+        // no second one: nothing is recorded (6.4).
+        if st.is_member(&target) || info.invites.contains(&target) {
             return Ok(Some(OkResponse::new()));
         }
 

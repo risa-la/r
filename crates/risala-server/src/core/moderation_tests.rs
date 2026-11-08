@@ -507,6 +507,25 @@ async fn inviting_a_member_records_nothing() {
 }
 
 #[tokio::test]
+async fn inviting_someone_invited_already_records_nothing() {
+    let mut h = harness();
+    let [mut alice, mut dave] = sign_in(&mut h, [ALICE, DAVE]);
+    h.send(&alice, "invite #private dave@example.net").await;
+    assert_eq!(alice.lines().last().unwrap(), "OK seq=4");
+    dave.lines();
+    let before = stored(&h, "#private").len();
+    assert_eq!(
+        last(&h, &mut alice, "invite #private dave@example.net").await,
+        "OK"
+    );
+    assert_eq!(stored(&h, "#private").len(), before);
+    assert_eq!(dave.lines(), Vec::<String>::new());
+    // The invitation still lets them in.
+    h.send(&dave, "join #private").await;
+    assert!(dave.lines().last().unwrap().starts_with("OK id="));
+}
+
+#[tokio::test]
 async fn who_may_invite_whom() {
     let mut h = harness();
     let [mut carol, mut op, mut dave] = sign_in(&mut h, [CAROL, OP, DAVE]);
