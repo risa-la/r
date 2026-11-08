@@ -125,6 +125,14 @@
               '';
             };
 
+            rustdoc = cargoCheck "rustdoc" {
+              buildPhase = ''
+                runHook preBuild
+                RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --offline
+                runHook postBuild
+              '';
+            };
+
             tests = cargoCheck "tests" {
               # Some tests use `openssl` when it is on PATH.
               nativeCheckInputs = [ pkgs.openssl ];
