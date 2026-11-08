@@ -17,12 +17,16 @@ use crate::hash::{Backend, HashWx, Scratchpad};
 use crate::puzzle::Puzzle;
 
 /// Whether the JIT must run here: this build compiles functions on this
-/// platform, and the system is not known to refuse executable memory.
-/// `RISALA_POW_JIT_REFUSED` says it is: CI sets it to run the tests under
-/// macOS's hardened runtime without the allow-jit entitlement, where the
-/// JIT must fall back to the interpreter.
+/// platform, the machine has what the JIT needs (on Apple Silicon, the
+/// per-thread write switch, which virtual machines lack), and the system
+/// is not known to refuse executable memory. `RISALA_POW_JIT_REFUSED`
+/// says it is: CI sets it to run the tests under macOS's hardened runtime
+/// without the allow-jit entitlement, where the JIT must fall back to the
+/// interpreter.
 fn jit_expected() -> bool {
-    crate::jit::BUILT && std::env::var_os("RISALA_POW_JIT_REFUSED").is_none()
+    crate::jit::BUILT
+        && crate::jit::machine_supports()
+        && std::env::var_os("RISALA_POW_JIT_REFUSED").is_none()
 }
 
 fn jit(seed: &[u8; 32]) -> HashWx {

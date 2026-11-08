@@ -45,6 +45,17 @@ pub(crate) const BUILT: bool = cfg!(all(
 #[allow(unsafe_code)]
 mod exec;
 
+/// Whether this machine has what the JIT needs beyond the build: on macOS
+/// on Apple Silicon, the per-thread write switch, which virtual machines
+/// such as GitHub's macOS runners lack. There the JIT must fall back.
+#[cfg(test)]
+pub(crate) fn machine_supports() -> bool {
+    #[cfg(all(feature = "jit", target_os = "macos", target_arch = "aarch64"))]
+    return exec::write_switch_supported();
+    #[cfg(not(all(feature = "jit", target_os = "macos", target_arch = "aarch64")))]
+    true
+}
+
 /// Why the system last refused JIT memory, where that is recorded (macOS
 /// on Apple Silicon), for tests that expected the JIT to run.
 #[cfg(test)]

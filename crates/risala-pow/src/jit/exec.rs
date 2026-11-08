@@ -64,6 +64,15 @@ pub(crate) fn last_failure() -> Option<std::string::String> {
     LAST_FAILURE.lock().ok()?.clone()
 }
 
+/// Whether this Mac has the per-thread write switch for `MAP_JIT` memory.
+/// Apple Silicon hardware has it; virtual machines may not (GitHub's
+/// macOS runners do not), and there the JIT is not used.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn write_switch_supported() -> bool {
+    // SAFETY: only reads whether this system has the per-thread switch.
+    unsafe { libc::pthread_jit_write_protect_supported_np() != 0 }
+}
+
 /// Records why mapping failed, in test builds.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn note(what: &str) {
@@ -186,8 +195,7 @@ impl Mapping {
     /// placed around it: they are part of it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn new() -> io::Result<Mapping> {
-        // SAFETY: only reads whether this system has the per-thread switch.
-        if unsafe { libc::pthread_jit_write_protect_supported_np() } == 0 {
+        if !write_switch_supported() {
             note("pthread_jit_write_protect_supported_np() is 0");
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
