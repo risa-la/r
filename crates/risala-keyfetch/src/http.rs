@@ -36,8 +36,8 @@ pub(crate) enum Got {
     /// A 200 whose body is larger than the limit. It was not read to the
     /// end.
     TooLarge,
-    /// A 404 or 410: there is no key file.
-    Gone,
+    /// A 404 or 410, with its status: there is no key file.
+    Gone(u16),
 }
 
 /// Sends `GET <path>` for `host` over `stream`, and returns what the
@@ -76,7 +76,7 @@ where
             // real one.
             100 | 102..=199 if interim < MAX_INTERIM => interim += 1,
             200 => break head,
-            404 | 410 => return Ok(Got::Gone),
+            status @ (404 | 410) => return Ok(Got::Gone(status)),
             status => return Err(FetchError::Status(status)),
         }
     };
@@ -507,7 +507,7 @@ mod tests {
         for status in [404u16, 410] {
             let response = format!("HTTP/1.1 {status} X\r\nContent-Length: 3\r\n\r\nno\n");
             let (r, _) = exchange(response.as_bytes(), 100).await;
-            assert_eq!(r, Ok(Got::Gone));
+            assert_eq!(r, Ok(Got::Gone(status)));
         }
     }
 

@@ -1,16 +1,17 @@
-//! Fetching risala key files over HTTPS (SPEC 4.4).
+//! Fetching risala key files over HTTPS (SPEC 4.4), and the files of key
+//! logs that readers check them against (4.5).
 //!
 //! `alice@example.org` is controlled by whoever controls
 //! `https://example.org/.well-known/risala/alice` (4.3). Servers fetch that
-//! file to check sign-ins (4.5), and devices to check the members of
-//! encrypted conversations (12.12). [`KeyFetcher`] does it under the rules
+//! file to check sign-ins (4.6), and devices to check the members of
+//! encrypted conversations (12.7). [`KeyFetcher`] does it under the rules
 //! of 4.4:
 //!
 //! - HTTPS, with TLS 1.3 and certificates checked against public CAs
 //!   ([`Roots`]);
 //! - no redirects;
-//! - at most 10 seconds and 256 KiB;
-//! - at most 64 distinct valid keys ([`risala_proto::keyfile`]);
+//! - at most 10 seconds and 2 MiB
+//!   ([`MAX_KEY_FILE_BYTES`](risala_proto::keyfile::MAX_KEY_FILE_BYTES));
 //! - an optional guard against special-purpose addresses ([`guard`]),
 //!   checked on every address it connects to, which servers must use;
 //! - a cache of up to an hour, with an explicit refetch for "fetch again
@@ -19,16 +20,24 @@
 //!   how many fetches run at once, overall and per domain, and on how much
 //!   of the cache one domain may take.
 //!
-//! A fetch has one of three outcomes (4.4):
+//! It does not read the file: what a body means, keys, keys missing or an
+//! outage, is for [`risala_proto::keyfile::read_key_file`], which needs
+//! the log's entries too. A fetch has one of these outcomes:
 //!
-//! - **a key file**: a 200 response, whose keys may be none. One over 256
-//!   KiB counts as a file with no keys.
-//! - **gone**: a 404 or 410 response. The identity has no keys.
+//! - **a body** ([`Body::File`]): a 200 response within 2 MiB;
+//! - **too large** ([`Body::TooLarge`]): a 200 response over 2 MiB, which
+//!   makes the keys missing;
+//! - **gone** ([`Body::Gone`]): a 404 or 410 response, which makes the
+//!   keys missing;
 //! - **failed**: anything else, a [`FetchError`]. This is an outage, and
 //!   says nothing about the identity's keys.
 //!
-//! A key file or a gone answer replaces the cached copy. A failed fetch
-//! does not: the cached copy stays valid until its hour is up.
+//! An answer replaces the cached copy. A failed fetch does not: the
+//! cached copy stays valid until its hour is up.
+//!
+//! [`KeyFetcher::fetch_url`] fetches a key log's checkpoint, tiles and
+//! entry bundles (4.5) under the same rules, with a limit of 8 MiB, and
+//! without the cache.
 //!
 //! ```no_run
 //! # async fn f() -> Result<(), risala_keyfetch::FetchError> {
@@ -36,7 +45,7 @@
 //!
 //! let fetcher = KeyFetcher::new(FetchOptions::default());
 //! let alice = "alice@example.org".parse().unwrap();
-//! let keys = fetcher.fetch(&alice, false).await?;
+//! let found = fetcher.lookup(&alice, false).await?;
 //! # Ok(()) }
 //! ```
 //!
@@ -55,8 +64,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use risala_proto::auth::PublicKey;
-use risala_proto::keyfile::m5a::{KeyEntry, KeyFile, MAX_KEY_FILE_BYTES};
+use risala_proto::keyfile::MAX_KEY_FILE_BYTES;
 use risala_proto::names::Identity;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
@@ -93,20 +101,40 @@ pub const DEFAULT_CACHE_SHARE: usize = 8;
 /// logged at debug level, and counted in the next one.
 const FAILURE_LOGS_PER_MINUTE: u32 = 10;
 
-/// What a fetch found (4.4): a key file, or a gone answer.
+/// What a key file fetch got (4.4), when it was an answer about the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Body {
+    /// A 200 response within 2 MiB, with its body, unread.
+    File(Arc<[u8]>),
+    /// A 200 response over 2 MiB, which was not read to the end: the
+    /// identity's keys are missing.
+    TooLarge,
+    /// A 404 or 410 response, with its status: the identity's keys are
+    /// missing.
+    Gone(u16),
+}
+
+/// What a fetch found (4.4): an answer about the key file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
-    /// The identity's keys, in file order, with their labels: those the
-    /// key file lists, which may be none. None for a gone answer, or for a
-    /// file over 256 KiB.
-    pub entries: Arc<[KeyEntry]>,
-    /// The answer was a 404 or 410, not a key file.
-    pub gone: bool,
+    /// The answer.
+    pub body: Body,
     /// It came from the cache, and the rate limit would let it be fetched
     /// again now, so a fetch with `refresh` may find a newer file. `false`
     /// when it was fetched for this call, or so recently that it would
     /// not be fetched again yet.
     pub cached: bool,
+}
+
+/// What a fetch of a key log's file got ([`KeyFetcher::fetch_url`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlBody {
+    /// A 200 response within the limit, with its body.
+    Ok(Vec<u8>),
+    /// A 200 response over the limit.
+    TooLarge,
+    /// A 404 or 410 response, with its status.
+    Gone(u16),
 }
 
 /// Why a fetch failed: an outage, which says nothing about the identity's
@@ -145,6 +173,9 @@ pub enum FetchError {
     /// one to start in time. Nothing was fetched.
     #[error("too many key file fetches at once")]
     Busy,
+    /// The URL is not an `https` URL this fetcher can use.
+    #[error("not an https URL: {0}")]
+    Url(String),
 }
 
 /// Where a [`KeyFetcher`] gets the time from, for its cache and rate
@@ -332,18 +363,16 @@ struct Last {
     failure: Option<FetchError>,
 }
 
-/// A key file or a gone answer (4.4).
+/// An answer about a key file (4.4).
 #[derive(Clone)]
 struct Answer {
-    entries: Arc<[KeyEntry]>,
-    gone: bool,
+    body: Body,
 }
 
 impl Answer {
     fn found(&self, cached: bool) -> Found {
         Found {
-            entries: self.entries.clone(),
-            gone: self.gone,
+            body: self.body.clone(),
             cached,
         }
     }
@@ -439,30 +468,9 @@ impl KeyFetcher {
         }
     }
 
-    /// The public keys of `identity`, in file order (4.4): those its key
-    /// file lists, or none if it is gone. See [`lookup`](Self::lookup).
-    pub async fn fetch(
-        &self,
-        identity: &Identity,
-        refresh: bool,
-    ) -> Result<Vec<PublicKey>, FetchError> {
-        let found = self.lookup(identity, refresh).await?;
-        Ok(found.entries.iter().map(|e| e.key().clone()).collect())
-    }
-
-    /// [`fetch`](Self::fetch), with each key's label, for clients that
-    /// show an identity's devices (12.12).
-    pub async fn fetch_entries(
-        &self,
-        identity: &Identity,
-        refresh: bool,
-    ) -> Result<Arc<[KeyEntry]>, FetchError> {
-        Ok(self.lookup(identity, refresh).await?.entries)
-    }
-
-    /// What `identity`'s key file says (4.4): a key file, which may list
-    /// no keys, or gone. An error means the fetch failed, and says nothing
-    /// about the identity's keys.
+    /// What `identity`'s key file is (4.4): a body, one too large, or
+    /// gone. An error means the fetch failed, and says nothing about the
+    /// identity's keys.
     ///
     /// - A cached answer is used if it is younger than the cache's
     ///   lifetime.
@@ -470,7 +478,7 @@ impl KeyFetcher {
     ///   after a signature fails against a cached file, unless it was
     ///   tried less than [`FetchOptions::min_refetch`] ago: then the last
     ///   outcome stands, failure included.
-    /// - A key file or a gone answer replaces the cached one. A failed
+    /// - An answer replaces the cached one. A failed
     ///   fetch does not, but is returned: the cached answer stays, and is
     ///   used without `refresh` until its hour is up, so that people can
     ///   sign in while their key file's host is down (14).
@@ -497,12 +505,7 @@ impl KeyFetcher {
         let tried = inner.clock.now();
         match result {
             Ok(answer) => {
-                tracing::debug!(
-                    %identity,
-                    keys = answer.entries.len(),
-                    gone = answer.gone,
-                    "fetched key file"
-                );
+                tracing::debug!(%identity, body = ?answer.body.summary(), "fetched key file");
                 let found = answer.found(false);
                 *last = Some(Last {
                     answer: Some((tried, answer)),
@@ -681,29 +684,55 @@ impl KeyFetcher {
                 .connect(name, tcp)
                 .await
                 .map_err(|e| FetchError::Tls(e.to_string()))?;
-            let none = || Answer {
-                entries: Arc::from(Vec::new()),
-                gone: false,
+            let body = match http::get(&mut stream, domain, &path, MAX_KEY_FILE_BYTES).await? {
+                http::Got::Body(body) => Body::File(Arc::from(body)),
+                http::Got::TooLarge => Body::TooLarge,
+                http::Got::Gone(status) => Body::Gone(status),
             };
-            match http::get(&mut stream, domain, &path, MAX_KEY_FILE_BYTES).await? {
-                http::Got::Body(body) => {
-                    let text = valid_lines(&body);
-                    // Parsing fails only for a file over the limit.
-                    Ok(KeyFile::parse(&text).map_or_else(
-                        |_| none(),
-                        |file| Answer {
-                            entries: Arc::from(file.into_keys()),
-                            gone: false,
-                        },
-                    ))
-                }
-                // A file over 256 KiB lists no keys (4.4).
-                http::Got::TooLarge => Ok(none()),
-                http::Got::Gone => Ok(Answer {
-                    entries: Arc::from(Vec::new()),
-                    gone: true,
-                }),
-            }
+            Ok(Answer { body })
+        };
+        tokio::time::timeout(inner.timeout, work)
+            .await
+            .unwrap_or(Err(FetchError::Timeout))
+    }
+
+    /// Fetches `url`, an `https` URL such as a key log's checkpoint, tile
+    /// or entry bundle (4.5), under the rules of 4.4: no redirects, the
+    /// address guard, the time limit, and at most `max_body` bytes. Nothing
+    /// is cached.
+    pub async fn fetch_url(&self, url: &str, max_body: usize) -> Result<UrlBody, FetchError> {
+        let (host, port, path) = split_url(url).ok_or_else(|| FetchError::Url(url.to_owned()))?;
+        let inner = &*self.inner;
+        let _permits = self.permits(host).await?;
+        let deadline = tokio::time::Instant::now() + inner.timeout;
+        let work = async {
+            let addrs: Vec<SocketAddr> = inner
+                .resolver
+                .resolve(host)
+                .await
+                .map_err(|e| FetchError::Resolve(e.to_string()))?
+                .into_iter()
+                .map(|a| SocketAddr::new(a.ip(), port.unwrap_or(a.port())))
+                .collect();
+            let tcp = self.connect(&addrs, deadline).await?;
+            let name = ServerName::try_from(host.to_owned())
+                .map_err(|e| FetchError::Tls(e.to_string()))?;
+            let mut stream = inner
+                .connector
+                .connect(name, tcp)
+                .await
+                .map_err(|e| FetchError::Tls(e.to_string()))?;
+            let host_header = match port {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            };
+            Ok(
+                match http::get(&mut stream, &host_header, path, max_body).await? {
+                    http::Got::Body(body) => UrlBody::Ok(body),
+                    http::Got::TooLarge => UrlBody::TooLarge,
+                    http::Got::Gone(status) => UrlBody::Gone(status),
+                },
+            )
         };
         tokio::time::timeout(inner.timeout, work)
             .await
@@ -795,15 +824,38 @@ impl Drop for Permits<'_> {
     }
 }
 
-/// The lines of a key file that are valid UTF-8, joined with LF. A line
-/// that is not valid UTF-8 counts as malformed and is skipped, like any
-/// other malformed line, so a stray byte does not lose the other keys
-/// (4.4). The result is never longer than `body`.
-fn valid_lines(body: &[u8]) -> String {
-    body.split(|&b| b == b'\n')
-        .filter_map(|line| std::str::from_utf8(line).ok())
-        .collect::<Vec<_>>()
-        .join("\n")
+impl Body {
+    /// A short description, for logs: never the body itself.
+    fn summary(&self) -> String {
+        match self {
+            Body::File(body) => format!("{} bytes", body.len()),
+            Body::TooLarge => "too large".into(),
+            Body::Gone(status) => format!("gone ({status})"),
+        }
+    }
+}
+
+/// Splits an `https` URL into its host, its port if it names one, and its
+/// path (`/` if it has none). The host is a domain name: no user info, no
+/// IP literal, no query or fragment.
+fn split_url(url: &str) -> Option<(&str, Option<u16>, &str)> {
+    let rest = url.strip_prefix("https://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, "/"),
+    };
+    if path.contains(['?', '#', ' ', '\r', '\n']) || authority.contains(['@', '[']) {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse().ok()?)),
+        None => (authority, None),
+    };
+    let valid = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    valid.then_some((host, port, path))
 }
 
 #[cfg(test)]
@@ -840,15 +892,33 @@ mod limit_tests {
 }
 
 #[cfg(test)]
-mod utf8_tests {
-    use super::valid_lines;
+mod url_tests {
+    use super::split_url;
 
     #[test]
-    fn lines_that_are_not_utf8_are_skipped() {
-        let body = b"# keys\nmldsa44 AAAA laptop\nmldsa44 BBBB \xff\xfe phone\r\nmldsa44 CCCC\n";
+    fn urls() {
         assert_eq!(
-            valid_lines(body),
-            "# keys\nmldsa44 AAAA laptop\nmldsa44 CCCC\n"
+            split_url("https://chat.example.org/risala-log/1/checkpoint"),
+            Some(("chat.example.org", None, "/risala-log/1/checkpoint"))
         );
+        assert_eq!(
+            split_url("https://example.org:8443/a"),
+            Some(("example.org", Some(8443), "/a"))
+        );
+        assert_eq!(
+            split_url("https://example.org"),
+            Some(("example.org", None, "/"))
+        );
+        for bad in [
+            "http://example.org/a",
+            "https:///a",
+            "https://user@example.org/a",
+            "https://[::1]/a",
+            "https://example.org:x/a",
+            "https://example.org/a?b",
+            "https://example.org/a b",
+        ] {
+            assert_eq!(split_url(bad), None, "{bad}");
+        }
     }
 }
