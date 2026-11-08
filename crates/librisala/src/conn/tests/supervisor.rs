@@ -41,6 +41,41 @@ async fn pinned(cert: &ServerCert) -> Arc<dyn TrustStore> {
 }
 
 #[tokio::test]
+async fn a_held_supervisor_does_not_connect_again() {
+    // Stopping sends QUIT first (11), and the server then closes the
+    // connection: held, the supervisor waits for stop() instead of
+    // connecting again, which the one-connection server would count.
+    let cert = ServerCert::self_signed("chat.test");
+    let trust = pinned(&cert).await;
+    let server = ScriptServer::start(cert, 1, |_, mut peer: Peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 GUEST sam").await;
+        peer.send("@ref=1 OK uid=~sam").await;
+        peer.expect("@ref=2 QUIT").await;
+        peer.send("@ref=2 OK").await;
+        peer.close().await;
+    })
+    .await;
+    let ca = TestCa::new();
+    let (supervisor, mut events) =
+        Supervisor::spawn(chat_test(), trust, options(&ca, &server), guest(), fast());
+    let session = loop {
+        if let SupervisorEvent::SignedIn { session, .. } = next(&mut events).await {
+            break session;
+        }
+    };
+    supervisor.hold();
+    session.quit("").await.unwrap();
+    assert!(matches!(
+        next(&mut events).await,
+        SupervisorEvent::Disconnected { .. }
+    ));
+    supervisor.stop().await;
+    assert!(matches!(next(&mut events).await, SupervisorEvent::Stopped));
+    server.done().await;
+}
+
+#[tokio::test]
 async fn reconnects_and_signs_in_again() {
     let cert = ServerCert::self_signed("chat.test");
     let trust = pinned(&cert).await;

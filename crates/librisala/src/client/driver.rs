@@ -152,6 +152,8 @@ async fn drive(
                             Flow::Disconnected => session.close(),
                             Flow::Reconnect => supervisor.reconnect_now(),
                             Flow::Stop(reply) => {
+                                // Not to connect again when QUIT closes it.
+                                supervisor.hold();
                                 let _ = tokio::time::timeout(QUIT_TIMEOUT, session.quit("")).await;
                                 supervisor.stop().await;
                                 return Some(reply);

@@ -313,6 +313,7 @@ pub enum SupervisorEvent {
 #[derive(Debug)]
 pub struct Supervisor {
     stop: watch::Sender<bool>,
+    hold: watch::Sender<bool>,
     retry: watch::Sender<u64>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -331,6 +332,7 @@ impl Supervisor {
     ) -> (Supervisor, mpsc::Receiver<SupervisorEvent>) {
         let (events_tx, events_rx) = mpsc::channel(16);
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (hold, hold_rx) = watch::channel(false);
         let (retry, retry_rx) = watch::channel(0u64);
         let run = Run {
             addr,
@@ -340,12 +342,14 @@ impl Supervisor {
             backoff,
             events: events_tx,
             stop: stop_rx,
+            hold: hold_rx,
             retry: retry_rx,
         };
         let task = tokio::spawn(run.run());
         (
             Supervisor {
                 stop: stop_tx,
+                hold,
                 retry,
                 task,
             },
@@ -359,6 +363,14 @@ impl Supervisor {
     /// connecting does nothing.
     pub fn reconnect_now(&self) {
         self.retry.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Stops connecting again, but leaves the current connection open, for
+    /// example while QUIT is sent before [`stop`](Self::stop) (11). Once
+    /// the connection closes, the supervisor reports
+    /// [`SupervisorEvent::Disconnected`] and waits for `stop`.
+    pub fn hold(&self) {
+        self.hold.send_replace(true);
     }
 
     /// Closes the connection and stops. Reports
@@ -383,6 +395,7 @@ struct Run {
     backoff: Backoff,
     events: mpsc::Sender<SupervisorEvent>,
     stop: watch::Receiver<bool>,
+    hold: watch::Receiver<bool>,
     retry: watch::Receiver<u64>,
 }
 
@@ -459,6 +472,12 @@ impl Run {
                     hint = Duration::from_secs(e.retry_after().unwrap_or(0));
                     error = Some(e);
                 }
+            }
+            // Held: the connection is closing on purpose, so wait to stop.
+            if *self.hold.borrow() {
+                let mut stop = self.stop.clone();
+                Run::stopped(&mut stop).await;
+                return self.emit(SupervisorEvent::Stopped).await;
             }
             let delay = self.backoff.delay(failures).max(hint);
             if delay.is_zero() {
