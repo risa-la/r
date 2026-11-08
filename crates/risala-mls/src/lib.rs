@@ -30,6 +30,8 @@
 //! - [`group`]: creating groups, joining by Welcome and external commit,
 //!   commits, SelfRemove, and processing posts (12.6-12.8, 6.1).
 //! - [`checks`]: the checks of joining and of every commit (12.7).
+//! - [`message`]: RisalaMessage, franking, counters, late messages and
+//!   reports (12.9, 5.4, 5.8).
 //!
 //! OpenMLS is patched in two places (`crates/openmls-traits/RISALA.md`,
 //! `crates/openmls/RISALA.md`): the suite's value is `0x0020`, and
@@ -48,6 +50,7 @@ pub mod framing;
 pub mod group;
 pub mod identity;
 pub mod keypackage;
+pub mod message;
 pub mod mldsa;
 pub mod pairing;
 pub mod primitives;
@@ -75,6 +78,9 @@ pub use file::{
     BlobRef, BlobRefError, Decryptor, EncryptedFile, Encryptor, FileError, FileKey, Label,
 };
 pub use identity::{DeviceId, RisalaIdentity};
+pub use message::{
+    Decrypted, FrankKey, MemoryHistory, MessageHistory, RisalaMessage, RisalaReport, SendCounter,
+};
 pub use mldsa::{LeafKey, SigningKey};
 pub use pairing::{
     DeviceKeys, IdentityBundle, NewDevice, NewDeviceContent, PairingCode, PairingError, PairingKey,
