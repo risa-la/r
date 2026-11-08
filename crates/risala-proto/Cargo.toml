@@ -1,6 +1,6 @@
 [package]
 name = "risala-proto"
-description = "The risala protocol: lines, tags, names, escaping and auth bytes. No I/O."
+description = "The risala protocol: lines, tags, names, escaping, auth bytes, key files and identity formats. No I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,12 +11,18 @@ authors.workspace = true
 [dependencies]
 base64.workspace = true
 libcrux-ml-dsa.workspace = true
+# HKDF-SHA384, for the master key's derivation from the recovery key (4.8).
+libcrux-hkdf.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# X-Wing keys from fixed seeds, for tests and Appendix B's vectors (4.4, 4.8).
+libcrux-kem = "0.0.9"
+# Checks that a LogKey's verifier key is the one the key log reads (4.4).
+risala-keylog.workspace = true
 
 [lints]
 workspace = true

@@ -24,14 +24,27 @@
 //! - [`command`]: typed commands, client to server (4-12, 13).
 //! - [`server`]: typed server lines, server to client (4-12, 13), and the
 //!   NOTIFY push body (9.3).
-//! - [`auth`]: the sign-in challenge and ML-DSA-44 keys (4.6, App. B).
-//! - [`keyfile`]: key files (4.4).
+//! - [`auth`]: the sign-in challenge, RisalaSign and ML-DSA-44 keys (4.3,
+//!   4.6, App. B).
+//! - [`codec`]: the TLS presentation language of [RFC9420], for risala's
+//!   own binary structures.
+//! - [`record`]: key file records, key log entries and the record payload
+//!   of REGISTER and KEYS PUT (4.4, 4.5, 4.7).
+//! - [`chain`]: replaying a chain of records, pins, forks, and the chain
+//!   checks of REGISTER and KEYS PUT (4.4-4.7).
+//! - [`keyfile`]: the key file text format and its three states (4.4).
+//! - [`recovery`]: recovery keys and the master key (4.8).
+//! - [`pairing`]: PairingCode, NewDevice and SealedBundle (4.8).
+//! - [`safety`]: safety numbers (12.14).
 //! - [`fingerprint`]: certificate fingerprints for trust on first use (2.2).
 
 #![warn(missing_docs)]
 
 pub mod auth;
+mod base32;
 pub mod binary;
+pub mod chain;
+pub mod codec;
 pub mod command;
 pub mod connection;
 pub mod content;
@@ -43,7 +56,11 @@ pub mod line;
 mod m5a;
 pub mod mls;
 pub mod names;
+pub mod pairing;
 mod parse;
+pub mod record;
+pub mod recovery;
+pub mod safety;
 pub mod server;
 pub mod text;
 pub mod time;

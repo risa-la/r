@@ -1,5 +1,7 @@
 //! Property tests for keys: the sign-in challenge and ML-DSA-44 values
-//! (SPEC 4.5, App. B), key files (4.4) and fingerprints (2.2, 12.12).
+//! (SPEC 4.6, App. B), M5a's key files and fingerprints (2.2). M5a's key
+//! file tests go when `keyfile::m5a` does; draft-03's key files are
+//! tested in `props_identity.rs`.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -14,7 +16,7 @@ use risala_proto::auth::{
 };
 use risala_proto::error::ParseError;
 use risala_proto::fingerprint::Fingerprint;
-use risala_proto::keyfile::{
+use risala_proto::keyfile::m5a::{
     KeyEntry, KeyFile, MAX_KEY_FILE_BYTES, MAX_KEY_LABEL, MAX_KEY_LINE_BYTES, MAX_KEYS, SkipReason,
 };
 

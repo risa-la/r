@@ -40,6 +40,64 @@ use crate::fingerprint::Fingerprint;
 /// The first line of the signed bytes, without its LF (4.5).
 pub const CHALLENGE_PREFIX: &str = "risala-auth-1";
 
+/// The start of every RisalaSign label (4.3, 2.4).
+pub const RISALA_SIGN_PREFIX: &str = "risala/1 ";
+
+/// The labels that RisalaSign signs under (4.3, 15). Each is signed with
+/// [`RISALA_SIGN_PREFIX`] in front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SignLabel {
+    /// `record`: key file records (4.4).
+    Record,
+    /// `pair`: a new device's NewDevice (4.8).
+    Pair,
+    /// `keypackage`: KeyPackage bindings (12.3).
+    KeyPackage,
+    /// `period`: period-key certificates (12.10).
+    Period,
+    /// `attest`: attestations (12.10).
+    Attest,
+}
+
+impl SignLabel {
+    /// Every label.
+    pub const ALL: [SignLabel; 5] = [
+        SignLabel::Record,
+        SignLabel::Pair,
+        SignLabel::KeyPackage,
+        SignLabel::Period,
+        SignLabel::Attest,
+    ];
+
+    /// The label without its prefix, such as `record`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SignLabel::Record => "record",
+            SignLabel::Pair => "pair",
+            SignLabel::KeyPackage => "keypackage",
+            SignLabel::Period => "period",
+            SignLabel::Attest => "attest",
+        }
+    }
+}
+
+/// The encoded RisalaSignContent for `label` and `content` (4.3):
+///
+/// ```text
+/// struct {
+///     opaque label<V>;      // "risala/1 " followed by the label
+///     opaque content<V>;
+/// } RisalaSignContent;
+/// ```
+///
+/// This is what [`SecretKey::risala_sign`] signs with ML-DSA.Sign.
+pub fn risala_sign_content(label: SignLabel, content: &[u8]) -> Vec<u8> {
+    let mut w = crate::codec::Writer::new();
+    w.vector(format!("{RISALA_SIGN_PREFIX}{}", label.as_str()).as_bytes())
+        .vector(content);
+    w.finish()
+}
+
 /// The length of an ML-DSA-44 public key in bytes (4.4).
 pub const PUBLIC_KEY_LEN: usize = 1312;
 
@@ -210,6 +268,19 @@ impl PublicKey {
         let message = challenge_bytes(host, nonce, uid);
         let key = mldsa::MLDSA44VerificationKey::new(*self.as_bytes());
         let signature = mldsa::MLDSA44Signature::new(*signature.as_bytes());
+        mldsa::verify(&key, &message, b"", &signature).is_ok()
+    }
+
+    /// RisalaVerify (4.3): checks `signature` over the RisalaSignContent
+    /// of `label` and `content`, with ML-DSA.Verify and an empty context.
+    /// A signature that is not [`SIGNATURE_LEN`] bytes fails.
+    pub fn risala_verify(&self, label: SignLabel, content: &[u8], signature: &[u8]) -> bool {
+        let Ok(signature) = <[u8; SIGNATURE_LEN]>::try_from(signature) else {
+            return false;
+        };
+        let message = risala_sign_content(label, content);
+        let key = mldsa::MLDSA44VerificationKey::new(*self.as_bytes());
+        let signature = mldsa::MLDSA44Signature::new(signature);
         mldsa::verify(&key, &message, b"", &signature).is_ok()
     }
 }
@@ -415,6 +486,26 @@ impl SecretKey {
     /// which cannot be read as each other (12.2).
     pub fn sign_mls(&self, sign_content: &[u8]) -> Option<Signature> {
         is_mls_sign_content(sign_content).then(|| self.sign(sign_content, [0; 32]))
+    }
+
+    /// RisalaSign (4.3): signs the RisalaSignContent of `label` and
+    /// `content` with the hedged variant of ML-DSA.Sign, which mixes in
+    /// `rnd`. Pass 32 bytes from a cryptographically secure random
+    /// source; signers SHOULD use this variant (4.3).
+    ///
+    /// A RisalaSignContent's label starts with `risala/1 `, so it cannot
+    /// be read as the challenge bytes of 4.6 or as an MLS SignContent.
+    pub fn risala_sign(&self, label: SignLabel, content: &[u8], mut rnd: [u8; 32]) -> Signature {
+        let signature = self.sign(&risala_sign_content(label, content), rnd);
+        rnd.zeroize();
+        signature
+    }
+
+    /// RisalaSign with the deterministic variant of ML-DSA.Sign, for test
+    /// vectors (Appendix B). Verifiers cannot tell it from the hedged
+    /// variant.
+    pub fn risala_sign_deterministic(&self, label: SignLabel, content: &[u8]) -> Signature {
+        self.sign(&risala_sign_content(label, content), [0; 32])
     }
 
     /// ML-DSA.Sign over `message` with an empty context and randomness

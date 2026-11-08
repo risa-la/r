@@ -9,7 +9,7 @@ use risala_keyfetch::{
     CertificateDer, Clock, FetchError, FetchOptions, KeyFetcher, Roots, StaticResolver,
 };
 use risala_proto::auth::{PublicKey, SecretKey};
-use risala_proto::keyfile::MAX_KEY_FILE_BYTES;
+use risala_proto::keyfile::m5a::MAX_KEY_FILE_BYTES;
 use risala_proto::names::Identity;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

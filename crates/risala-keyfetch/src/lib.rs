@@ -56,7 +56,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use risala_proto::auth::PublicKey;
-use risala_proto::keyfile::{KeyEntry, KeyFile, MAX_KEY_FILE_BYTES};
+use risala_proto::keyfile::m5a::{KeyEntry, KeyFile, MAX_KEY_FILE_BYTES};
 use risala_proto::names::Identity;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;

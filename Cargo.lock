@@ -2238,8 +2238,11 @@ name = "risala-proto"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "libcrux-hkdf",
+ "libcrux-kem",
  "libcrux-ml-dsa",
  "proptest",
+ "risala-keylog",
  "sha2 0.11.0",
  "thiserror",
  "zeroize",
