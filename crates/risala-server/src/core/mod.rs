@@ -709,7 +709,10 @@ impl Inner {
     }
 
     /// Sends the greeting (4.1), registers the connection and starts its
-    /// sign-in timer.
+    /// sign-in timer. The greeting is queued under the registry's lock, as
+    /// the connection is registered, so that a client that has read it is
+    /// already listed (ADMIN WHO), and nothing else reaches the connection
+    /// before it.
     fn open(self: &Arc<Self>, info: ConnInfo, handle: ConnHandle) {
         let id = handle.id();
         let mut bytes = [0u8; NONCE_BYTES];
@@ -729,12 +732,12 @@ impl Inner {
                     .parse()
                     .expect("hostname checked at start")
             });
-        handle.send(ServerMessage::new(Greeting {
+        let greeting = ServerMessage::new(Greeting {
             version: risala_proto::PROTOCOL_VERSION,
             host: host.clone(),
             nonce: nonce.clone(),
             message: self.settings().welcome,
-        }));
+        });
         tracing::debug!(conn = id.0, peer = %info.peer, "connection opened");
 
         let timer = tokio::runtime::Handle::try_current().ok().map(|rt| {
@@ -749,6 +752,7 @@ impl Inner {
             .abort_handle()
         });
         let mut reg = self.reg();
+        handle.send(greeting);
         reg.conns.insert(
             id,
             ConnEntry {
