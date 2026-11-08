@@ -97,6 +97,8 @@ pub struct Config {
     pub log: LogConfig,
     /// Acting as a witness for other servers' key logs (4.10).
     pub witness: WitnessConfig,
+    /// Push notifications (Section 9).
+    pub push: PushConfig,
 }
 
 /// The key log (4.5): its URL, its number, and the witnesses asked to
@@ -169,6 +171,43 @@ pub struct WitnessConfig {
     /// example the host's INFO `log-key=`). Later logs of a host enrol
     /// through hand-offs, with no configuration (4.10).
     pub logs: Vec<String>,
+}
+
+/// Push notifications (Section 9): PUSH ADD, and sending pushes over
+/// HTTPS (9.3).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PushConfig {
+    /// Whether PUSH is supported (8.5). Off, PUSH gets `ERR not-supported`.
+    pub enabled: bool,
+    /// Lets the server send pushes to loopback, private, link-local and
+    /// other special-purpose addresses (9.3, 4.4). Off by default; for
+    /// tests and internal deployments only.
+    pub allow_private: bool,
+    /// PEM files of CA certificates to trust besides the public ones built
+    /// in, for push URLs. For tests and private deployments.
+    pub extra_roots: Vec<PathBuf>,
+    /// The most subscriptions one mailbox may have (9.1). At least 1.
+    pub max_per_mailbox: usize,
+    /// The most mailbox subscriptions one connection may add (9.1). At
+    /// least 1.
+    pub max_per_connection: usize,
+    /// The most account subscriptions one device may have (9.1). At least
+    /// 1.
+    pub max_per_device: usize,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        PushConfig {
+            enabled: true,
+            allow_private: false,
+            extra_roots: Vec::new(),
+            max_per_mailbox: 256,
+            max_per_connection: 1024,
+            max_per_device: 16,
+        }
+    }
 }
 
 /// Fetching key files over HTTPS (4.4), to check sign-ins (4.5).
@@ -423,6 +462,7 @@ impl Default for Config {
             http: HttpConfig::default(),
             log: LogConfig::default(),
             witness: WitnessConfig::default(),
+            push: PushConfig::default(),
         }
     }
 }
@@ -599,6 +639,16 @@ impl Config {
         if k.cache_size == 0 {
             return invalid("keys.cache_size must be at least 1".into());
         }
+        let p = &self.push;
+        for (name, value) in [
+            ("max_per_mailbox", p.max_per_mailbox),
+            ("max_per_connection", p.max_per_connection),
+            ("max_per_device", p.max_per_device),
+        ] {
+            if value == 0 {
+                return invalid(format!("push.{name} must be at least 1 (9.1)"));
+            }
+        }
         if let Some(dir) = &self.http.key_dir {
             let (keys, state) = (lexical_absolute(dir), lexical_absolute(&self.state_dir));
             if state.starts_with(&keys) {
@@ -621,6 +671,13 @@ impl Config {
             warnings.push(
                 "keys.allow_private is on: key files may be fetched from loopback and \
                  private addresses (4.4)"
+                    .into(),
+            );
+        }
+        if self.push.allow_private {
+            warnings.push(
+                "push.allow_private is on: pushes may be sent to loopback and private \
+                 addresses (9.3)"
                     .into(),
             );
         }

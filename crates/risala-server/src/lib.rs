@@ -28,6 +28,7 @@ pub mod handler;
 pub mod http;
 pub mod keyfiles;
 pub mod net;
+pub mod push;
 pub mod secret;
 pub mod store;
 pub mod testing;
