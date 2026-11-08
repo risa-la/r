@@ -7,8 +7,8 @@ use std::num::NonZeroU64;
 use super::Command;
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params, Tags};
-use crate::mls::{GroupInfo, OrBlob, RatchetTree};
-use crate::names::{Room, Seq};
+use crate::mls::{GroupInfo, OrBlob, RatchetTree, SendToken};
+use crate::names::{BoxName, Room, Seq};
 use crate::parse::{
     bad, flag_opt, last, number, opt, opt_tok, options, parse_tag, positive_opt, tok,
 };
@@ -16,13 +16,13 @@ use crate::parse::{
 /// The two forms of CREATE (5.2), after `<box> <group-id> <token-hash>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateForm {
-    /// `[epoch=<epoch>]`: the mailbox of a direct conversation or a
-    /// private room, on an anonymous or guest connection.
+    /// `[epoch=<epoch> from=<box> token=<token>]`: the mailbox of a direct
+    /// conversation or a private room, on an anonymous or guest
+    /// connection.
     Private {
-        /// `epoch=`: the first epoch of the new mailbox of a group that is
-        /// moving (7.8), greater than 0. `None` for a new group, which
-        /// starts at epoch 0.
-        epoch: Option<NonZeroU64>,
+        /// The three options of a group that is moving (7.8). `None` for a
+        /// new group, which starts at epoch 0.
+        moving: Option<Move>,
     },
     /// `<room> <groupinfo> <tree>`: a public room, on a signed-in
     /// connection (6.1).
@@ -31,15 +31,28 @@ pub enum CreateForm {
 
 impl CreateForm {
     /// The first form without `epoch=`: a new group's mailbox.
-    pub const NEW: CreateForm = CreateForm::Private { epoch: None };
+    pub const NEW: CreateForm = CreateForm::Private { moving: None };
 
     /// The epoch the mailbox starts at: 0, or `epoch=` (5.2, 7.8).
     pub fn first_epoch(&self) -> u64 {
         match self {
-            CreateForm::Private { epoch: Some(e) } => e.get(),
+            CreateForm::Private { moving: Some(m) } => m.epoch.get(),
             _ => 0,
         }
     }
+}
+
+/// The options of the first form of CREATE for a group that is moving
+/// (5.2, 7.8). The three come together or not at all (`BadSyntax`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Move {
+    /// `epoch=`: the new mailbox's first epoch, greater than 0.
+    pub epoch: NonZeroU64,
+    /// `from=`: the box of the mailbox the group moves from.
+    pub from: BoxName,
+    /// `token=`: the group's send token for the epoch before `epoch`,
+    /// which the server checks against `from`'s token set (7.2).
+    pub token: SendToken,
 }
 
 /// What the second form of CREATE adds: the public room it creates
@@ -81,11 +94,18 @@ pub(super) fn parse(verb: &str, tags: &Tags, p: Params<'_>) -> Option<Result<Com
                     CreateForm::Public(public)
                 }
                 _ => {
-                    let options = options(p, &["epoch"])?;
-                    // `epoch` is "a number greater than 0" (5.2).
-                    CreateForm::Private {
-                        epoch: positive_opt(&options, "epoch")?,
-                    }
+                    let options = options(p, &["epoch", "from", "token"])?;
+                    // `epoch` is "a number greater than 0", and "each of
+                    // the three options needs the other two" (5.2).
+                    let epoch = positive_opt(&options, "epoch")?;
+                    let from = opt(&options, "from")?;
+                    let token = opt(&options, "token")?;
+                    let moving = match (epoch, from, token) {
+                        (Some(epoch), Some(from), Some(token)) => Some(Move { epoch, from, token }),
+                        (None, None, None) => None,
+                        _ => return Err(bad("CREATE needs epoch=, from= and token= together")),
+                    };
+                    CreateForm::Private { moving }
                 }
             };
             Ok(Command::Create {
@@ -212,9 +232,13 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
         } => {
             b.token(mailbox).token(group_id).token(token_hash);
             match form {
-                CreateForm::Private { epoch: None } => {}
-                CreateForm::Private { epoch: Some(epoch) } => {
-                    b.option("epoch", epoch);
+                CreateForm::Private { moving: None } => {}
+                CreateForm::Private {
+                    moving: Some(moving),
+                } => {
+                    b.option("epoch", moving.epoch)
+                        .option("from", moving.from)
+                        .option("token", &moving.token);
                 }
                 CreateForm::Public(public) => {
                     b.token(&public.room)

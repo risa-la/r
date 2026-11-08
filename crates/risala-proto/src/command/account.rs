@@ -9,7 +9,7 @@ use crate::binary::{PushAuth, PushKey, WrappedKey};
 use crate::connection::Kinds;
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params};
-use crate::mls::{KeyPackage, KeyPackageRef, OrBlob, SendToken, Welcome};
+use crate::mls::{KeyPackage, KeyPackageRef, OrBlob, SendToken, Welcome, WelcomeSecret};
 use crate::names::{BlobRef, BoxName, Id, Uid};
 use crate::parse::{
     bad, flag_opt, last, number, number_u32, opt, options, subcommand, tok, unknown_subcommand,
@@ -114,11 +114,14 @@ impl KeyPkgCommand {
 /// `WELCOME PUT`, `WELCOME LIST`, `WELCOME DEL` and `WELCOME GET` (12.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WelcomeCommand {
-    /// `WELCOME PUT <ref> <welcome>`: a Welcome for the KeyPackage whose
-    /// KeyPackageRef is `<ref>`.
+    /// `WELCOME PUT <ref> <secret> <welcome>`: a Welcome for the
+    /// KeyPackage whose KeyPackageRef is `<ref>`.
     Put {
         /// The KeyPackageRef.
         key_package_ref: KeyPackageRef,
+        /// The put secret of the KEYPKG GET handout, or `-` for an
+        /// external Add proposal's KeyPackage (12.8).
+        secret: WelcomeSecret,
         /// The Welcome, or a blob that holds it.
         welcome: OrBlob<Welcome>,
     },
@@ -283,9 +286,11 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<Command, ParseEr
             Ok(Command::Welcome(match subcommand(&mut p)?.as_str() {
                 "PUT" => {
                     let key_package_ref = tok(&mut p)?;
+                    let secret = tok(&mut p)?;
                     let welcome = last(p)?;
                     WelcomeCommand::Put {
                         key_package_ref,
+                        secret,
                         welcome,
                     }
                 }
@@ -405,9 +410,10 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
             match welcome {
                 WelcomeCommand::Put {
                     key_package_ref,
+                    secret,
                     welcome,
                 } => {
-                    b.token(key_package_ref).token(welcome);
+                    b.token(key_package_ref).token(secret).token(welcome);
                 }
                 WelcomeCommand::List => {}
                 WelcomeCommand::Del { id } => {

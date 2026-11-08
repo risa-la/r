@@ -99,8 +99,8 @@ fn every_form() -> Vec<String> {
         format!("PAIR GET {BOX}"),
         "UNREGISTER alice@example.org".into(),
         format!("CREATE {BOX} {gid} {th}"),
-        format!("CREATE {BOX} {gid} {th} epoch=1"),
-        format!("CREATE {BOX} {gid} {th} epoch=9223372036854775807"),
+        format!("CREATE {BOX} {gid} {th} epoch=1 from={BOX} token={tok}"),
+        format!("CREATE {BOX} {gid} {th} epoch=9223372036854775807 from={BOX} token={tok}"),
         format!("CREATE {BOX} {gid} {th} #general AAEABA== AAEC"),
         format!("CREATE {BOX} {gid} {th} #general {blob} {blob}"),
         format!("POST {BOX} {tok} AAEAAQ=="),
@@ -124,6 +124,9 @@ fn every_form() -> Vec<String> {
         format!("FETCH {BOX} after=9120 limit=2 leaf=7"),
         format!("TOKEN {BOX} 0 {tok} {th}"),
         format!("TOKEN {BOX} 41 {tok} {th}"),
+        // 2^63-1 has no next epoch: `ERR stale` from the server, not
+        // bad syntax (7.2).
+        format!("TOKEN {BOX} 9223372036854775807 {tok} {th}"),
         "PRESENCE ON".into(),
         "PRESENCE OFF".into(),
         "WATCH".into(),
@@ -138,8 +141,8 @@ fn every_form() -> Vec<String> {
         "KEYPKG ADD AAEABQ==".into(),
         "KEYPKG COUNT".into(),
         "KEYPKG GET bob@example.net".into(),
-        format!("WELCOME PUT {r} AAEABg=="),
-        format!("WELCOME PUT {r} {blob}"),
+        format!("WELCOME PUT {r} {tok} AAEABg=="),
+        format!("WELCOME PUT {r} - {blob}"),
         "WELCOME LIST".into(),
         "WELCOME DEL w7k2".into(),
         format!("WELCOME GET {r}"),
@@ -360,6 +363,31 @@ fn arity() {
             token_hash()
         ),
         format!("CREATE {BOX} {} {} room=#general", group_id(), token_hash()),
+        // epoch=, from= and token= come together (5.2).
+        format!("CREATE {BOX} {} {} epoch=1", group_id(), token_hash()),
+        format!(
+            "CREATE {BOX} {} {} epoch=1 from={BOX}",
+            group_id(),
+            token_hash()
+        ),
+        format!(
+            "CREATE {BOX} {} {} from={BOX} token={}",
+            group_id(),
+            token_hash(),
+            token()
+        ),
+        format!(
+            "CREATE {BOX} {} {} epoch=1 token={}",
+            group_id(),
+            token_hash(),
+            token()
+        ),
+        format!(
+            "CREATE {BOX} {} {} epoch=0 from={BOX} token={}",
+            group_id(),
+            token_hash(),
+            token()
+        ),
         format!("CREATE {BOX} {} {} 7", group_id(), token_hash()),
         format!(
             "CREATE {BOX} {} {} #general AAEABA== AAEC epoch=1",
@@ -402,6 +430,11 @@ fn arity() {
         format!("TOKEN {BOX} 41 {} {} x", token(), token_hash()),
         format!("TOKEN {BOX} -1 {} {}", token(), token_hash()),
         format!("TOKEN {BOX} 01 {} {}", token(), token_hash()),
+        format!(
+            "TOKEN {BOX} 9223372036854775808 {} {}",
+            token(),
+            token_hash()
+        ),
         format!("TOKEN {BOX} 41 - {}", token_hash()),
         format!("TOKEN {BOX} 41 {} {}", token_hash(), token_hash()),
         format!("TOKEN {BOX} 41 {} {}", token(), token()),
@@ -422,6 +455,7 @@ fn arity() {
         "KEYPKG ADD".into(),
         "WELCOME LIST x".into(),
         format!("WELCOME PUT {}", kp_ref()),
+        format!("WELCOME PUT {} AAEABg==", kp_ref()),
         format!("WELCOME GET {} light=maybe", kp_ref()),
         format!("BLOB {}", blob()),
         format!("BLOB {} 1 box={BOX}", blob()),
@@ -492,7 +526,8 @@ fn values_have_their_grammar() {
             zeros(65),
             zeros(17)
         ),
-        format!("WELCOME PUT {} AAEABg==", zeros(32)),
+        format!("WELCOME PUT {} - AAEABg==", zeros(32)),
+        format!("WELCOME PUT {} {} AAEABg==", kp_ref(), zeros(31)),
         "WELCOME DEL w.7".into(),
         format!("BACKUP PUT 0 {} AAE", blob()),
         format!("BACKUP PUT 0 sha256:{} {}", "5d".repeat(32), zeros(61)),
@@ -708,7 +743,10 @@ fn table() -> Vec<(String, &'static str)> {
         (format!("PAIR GET {BOX}"), "nas"),
         ("UNREGISTER alice@example.org".into(), "s"),
         (format!("CREATE {BOX} {gid} {th}"), "ag"),
-        (format!("CREATE {BOX} {gid} {th} epoch=12"), "ag"),
+        (
+            format!("CREATE {BOX} {gid} {th} epoch=12 from={BOX} token={tok}"),
+            "ag",
+        ),
         (
             format!("CREATE {BOX} {gid} {th} #general AAEABA== AAEC"),
             "s",
@@ -742,7 +780,7 @@ fn table() -> Vec<(String, &'static str)> {
         ("KEYPKG ADD AAEABQ==".into(), "s"),
         ("KEYPKG COUNT".into(), "s"),
         ("KEYPKG GET bob@example.net".into(), "ags"),
-        (format!("WELCOME PUT {r} AAEABg=="), "ags"),
+        (format!("WELCOME PUT {r} - AAEABg=="), "ags"),
         (format!("WELCOME GET {r}"), "ags"),
         ("WELCOME LIST".into(), "s"),
         ("WELCOME DEL w7".into(), "s"),

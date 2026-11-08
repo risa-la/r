@@ -78,7 +78,7 @@ use std::str::FromStr;
 use crate::binary::{PairData, WrappedKey};
 use crate::error::ParseError;
 use crate::line::{Line, LineBuilder, Params, Tags};
-use crate::mls::{GroupInfo, KeyPackage, OrBlob, RatchetTree, Welcome};
+use crate::mls::{GroupInfo, KeyPackage, OrBlob, PutSecret, RatchetTree, Welcome};
 use crate::names::{BlobRef, BoxName, Id, PairId, Room, Seq, ServerBanTarget, Uid};
 use crate::parse::{bad, parse_tag, required_text};
 use crate::time::Timestamp;
@@ -362,22 +362,29 @@ pub enum ServerLine {
         /// Its tag.
         tag: PushTag,
     },
-    /// `KEYPKG <uid> <keypackage>`: a KeyPackage of one of the identity's
-    /// current devices, in response to KEYPKG GET (12.5).
+    /// `KEYPKG <uid> <keypackage> <secret>`: a KeyPackage of one of the
+    /// identity's current devices, in response to KEYPKG GET (12.5).
     KeyPkg {
         /// The identity.
         uid: Uid,
         /// The KeyPackage.
         key_package: KeyPackage,
+        /// The put secret of this handout, which the Welcome for the
+        /// KeyPackage must carry (12.5, 12.8).
+        secret: PutSecret,
     },
-    /// `WELCOME <id> <welcome>`: a Welcome, live or in response to
-    /// WELCOME LIST or WELCOME GET (12.8).
+    /// `WELCOME <id> <welcome> [tree=<tree>]`: a Welcome, live or in
+    /// response to WELCOME LIST or WELCOME GET (12.8).
     Welcome {
         /// The id the server gave it, for WELCOME DEL.
         id: Id,
         /// The SealedWelcome, Welcome, AnnotatedWelcome or a blob that
         /// holds it (12.6, 12.8).
         welcome: OrBlob<Welcome>,
+        /// `tree=`: the ratchet tree of the Welcome's epoch, which the
+        /// server keeps for a public room's Welcomes (12.6), in response
+        /// to WELCOME GET without `light=yes`; `None` otherwise.
+        tree: Option<OrBlob<RatchetTree>>,
     },
     /// `BACKUP <generation> <hash> <key> [files=<list>]`: in response to
     /// BACKUP GET (12.13).

@@ -57,13 +57,23 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<ServerLine, Pars
         },
         "KEYPKG" => |mut p| {
             let uid = tok(&mut p)?;
-            let key_package = last(p)?;
-            Ok(ServerLine::KeyPkg { uid, key_package })
+            let key_package = tok(&mut p)?;
+            let secret = last(p)?;
+            Ok(ServerLine::KeyPkg {
+                uid,
+                key_package,
+                secret,
+            })
         },
         "WELCOME" => |mut p| {
             let id = tok(&mut p)?;
-            let welcome = last(p)?;
-            Ok(ServerLine::Welcome { id, welcome })
+            let welcome = tok(&mut p)?;
+            let options = options(p, &["tree"])?;
+            Ok(ServerLine::Welcome {
+                id,
+                welcome,
+                tree: opt(&options, "tree")?,
+            })
         },
         "BACKUP" => |mut p| {
             let generation = number_u32(&mut p)?;
@@ -109,11 +119,18 @@ pub(super) fn write(line: &ServerLine, b: &mut LineBuilder) -> bool {
         ServerLine::Push { url, tag } => {
             b.token(url).token(tag);
         }
-        ServerLine::KeyPkg { uid, key_package } => {
-            b.token(uid).token(key_package);
+        ServerLine::KeyPkg {
+            uid,
+            key_package,
+            secret,
+        } => {
+            b.token(uid).token(key_package).token(secret);
         }
-        ServerLine::Welcome { id, welcome } => {
+        ServerLine::Welcome { id, welcome, tree } => {
             b.token(id).token(welcome);
+            if let Some(tree) = tree {
+                b.option("tree", tree);
+            }
         }
         ServerLine::Backup {
             generation,

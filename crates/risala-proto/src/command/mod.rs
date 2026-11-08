@@ -101,7 +101,7 @@ pub mod mailbox;
 pub use account::{BackupCommand, BlobPermit, KeyPkgCommand, PushCommand, WelcomeCommand};
 pub use admin::{AdminCommand, DropTarget};
 pub use identity::{GuestToken, KeysPutRecords, PairCommand};
-pub use mailbox::{CreateForm, PublicRoom};
+pub use mailbox::{CreateForm, Move, PublicRoom};
 
 // ---------------------------------------------------------------------------
 // Request
@@ -318,7 +318,8 @@ pub enum Command {
         /// The SHA-384 hash of the group's send token for the mailbox's
         /// first epoch: 0, or `epoch`.
         token_hash: TokenHash,
-        /// The second form's public room, or the first form's `epoch=`.
+        /// The second form's public room, or the first form's options of a
+        /// group that is moving.
         form: CreateForm,
     },
     /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
@@ -440,7 +441,8 @@ pub enum Command {
     Token {
         /// The mailbox.
         mailbox: BoxName,
-        /// The epoch of `token`.
+        /// The epoch of `token`. 2^63-1, which has no next epoch, parses:
+        /// the server replies `ERR stale` (7.2).
         epoch: u64,
         /// A send token of `epoch`, checked as for POST (5.2).
         token: SendToken,

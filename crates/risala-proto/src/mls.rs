@@ -61,6 +61,9 @@ pub const SEND_TOKEN_LABEL: &str = "risala/1 send";
 /// The length of a send token, from the MLS exporter (7.2).
 pub const SEND_TOKEN_LEN: usize = 32;
 
+/// The length of a put secret: 32 random bytes (12.5, 12.8).
+pub const PUT_SECRET_LEN: usize = 32;
+
 /// The length of a send token's hash, SHA-384 (5.2, 7.2).
 pub const TOKEN_HASH_LEN: usize = 48;
 
@@ -382,6 +385,55 @@ impl SendToken {
     pub fn hash(&self) -> TokenHash {
         use sha2::{Digest as _, Sha384};
         TokenHash::from_bytes(Sha384::digest(&self.0[..]).into())
+    }
+}
+
+secret_type!(
+    /// A put secret (12.5): 32 random bytes the server makes for one
+    /// KEYPKG GET handout, as in the KEYPKG line and WELCOME PUT. Only
+    /// whoever fetched the KeyPackage can deliver its Welcome (12.8); the
+    /// server keeps only its hash.
+    PutSecret,
+    PUT_SECRET_LEN,
+    "a put secret is 32 bytes of base64"
+);
+
+/// The `<secret>` of WELCOME PUT (12.8): the put secret of a KEYPKG GET
+/// handout, or `-` for a KeyPackage of an external Add proposal in a
+/// public room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WelcomeSecret {
+    /// The put secret of the handout (12.5).
+    Put(PutSecret),
+    /// `-`: an external Add proposal's KeyPackage, which the server takes
+    /// only from the device that committed the proposal (12.8).
+    Proposal,
+}
+
+impl fmt::Display for WelcomeSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WelcomeSecret::Put(secret) => fmt::Display::fmt(secret, f),
+            WelcomeSecret::Proposal => f.write_str("-"),
+        }
+    }
+}
+
+impl FromStr for WelcomeSecret {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<WelcomeSecret, ParseError> {
+        if s == "-" {
+            Ok(WelcomeSecret::Proposal)
+        } else {
+            s.parse().map(WelcomeSecret::Put)
+        }
+    }
+}
+
+impl From<PutSecret> for WelcomeSecret {
+    fn from(secret: PutSecret) -> WelcomeSecret {
+        WelcomeSecret::Put(secret)
     }
 }
 

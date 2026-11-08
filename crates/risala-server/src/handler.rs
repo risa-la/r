@@ -465,6 +465,7 @@ mod tests {
             ServerMessage::new(ServerLine::KeyPkg {
                 uid: uid.clone(),
                 key_package: KeyPackage::from_bytes(&vec![7; bytes]).unwrap(),
+                secret: risala_proto::mls::PutSecret::from_bytes([1; 32]),
             })
         };
         let long = OutLine::new(line(3 * MAX_SERVER_LINE));

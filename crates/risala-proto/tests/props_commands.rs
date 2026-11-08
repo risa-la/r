@@ -143,8 +143,19 @@ fn command() -> impl Strategy<Value = String> {
         (boxname(), data()).prop_map(|(i, d)| format!("PAIR PUT {i} {d}")),
         boxname().prop_map(|i| format!("PAIR GET {i}")),
         uid().prop_map(|u| format!("UNREGISTER {u}")),
-        (boxname(), fixed(32), fixed(48), opt("epoch", positive()))
-            .prop_map(|(b, g, h, e)| format!("CREATE {b} {g} {h}{e}")),
+        // A move's three options come together (5.2).
+        (
+            boxname(),
+            fixed(32),
+            fixed(48),
+            proptest::option::of((positive(), boxname(), fixed(32)))
+        )
+            .prop_map(|(b, g, h, m)| {
+                let m = m.map_or(String::new(), |(e, f, t)| {
+                    format!(" epoch={e} from={f} token={t}")
+                });
+                format!("CREATE {b} {g} {h}{m}")
+            }),
         (
             boxname(),
             fixed(32),
@@ -206,7 +217,12 @@ fn command() -> impl Strategy<Value = String> {
         data().prop_map(|k| format!("KEYPKG ADD {k}")),
         Just("KEYPKG COUNT".to_owned()),
         uid().prop_map(|u| format!("KEYPKG GET {u}")),
-        (fixed(48), or_blob()).prop_map(|(r, w)| format!("WELCOME PUT {r} {w}")),
+        (
+            fixed(48),
+            prop_oneof![fixed(32), Just("-".to_owned())],
+            or_blob()
+        )
+            .prop_map(|(r, s, w)| format!("WELCOME PUT {r} {s} {w}")),
         Just("WELCOME LIST".to_owned()),
         id().prop_map(|i| format!("WELCOME DEL {i}")),
         (fixed(48), any::<bool>())
@@ -350,8 +366,9 @@ fn server_line() -> impl Strategy<Value = String> {
         (number(), blob_ref()).prop_map(|(i, h)| format!("RECORD {i} {h}")),
         (boxname(), data()).prop_map(|(i, d)| format!("PAIR {i} {d}")),
         (push_url(), "[!-~]{1,64}").prop_map(|(u, t)| format!("PUSH {u} {t}")),
-        (uid(), data()).prop_map(|(u, k)| format!("KEYPKG {u} {k}")),
-        (id(), or_blob()).prop_map(|(i, w)| format!("WELCOME {i} {w}")),
+        (uid(), data(), fixed(32)).prop_map(|(u, k, s)| format!("KEYPKG {u} {k} {s}")),
+        (id(), or_blob(), opt("tree", or_blob()))
+            .prop_map(|(i, w, t)| format!("WELCOME {i} {w}{t}")),
         (
             any::<u32>(),
             blob_ref(),
