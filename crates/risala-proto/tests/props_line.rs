@@ -14,7 +14,7 @@ use proptest::sample::Index;
 use risala_proto::error::ParseError;
 use risala_proto::frame::{
     CLIENT_LONG_VERBS, LineDecoder, LineLimits, MAX_CLIENT_LINE, MAX_LONG_CLIENT_LINE,
-    MAX_SERVER_LINE, SERVER_LONG_VERBS, check_line,
+    MAX_REGISTER_LINE, MAX_SERVER_LINE, NEW_CONNECTION_LONG_VERBS, SERVER_LONG_VERBS, check_line,
 };
 use risala_proto::line::{Line, Tags};
 
@@ -647,8 +647,8 @@ fn verb_stream() -> impl Strategy<Value = Vec<u8>> {
         3 => Just(b"\n".to_vec()),
         1 => Just(b"\r\n".to_vec()),
         3 => prop::sample::select(vec![
-            "ENC ", "enc ", "COMMIT", "groupinfo ", "REPORT ", "WelCome ", "INIT", "KEYPKG ",
-            "reportEnc ", "MSG ", "ENCX ", "GROUPINFOS ", "REPORTENCS ", "PING", "@", "@ref=1 ",
+            "POST ", "post ", "CREATE", "groupinfo ", "REPORT ", "WelCome ", "KEYS", "KEYPKG ",
+            "Register ", "LIST ", "POSTS ", "GROUPINFOS ", "REPORTS ", "PING", "@", "@ref=1 ",
             "@x-tag=AAAA  ", " ",
         ])
         .prop_map(|s| s.as_bytes().to_vec()),
@@ -659,13 +659,13 @@ fn verb_stream() -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn limits() -> impl Strategy<Value = LineLimits> {
-    (1..=24usize, 0..=40usize, any::<bool>()).prop_map(|(normal, extra, client)| LineLimits {
+    (1..=24usize, 0..=40usize, 0..3u8).prop_map(|(normal, extra, side)| LineLimits {
         normal,
         long: normal + extra,
-        long_verbs: if client {
-            &CLIENT_LONG_VERBS
-        } else {
-            &SERVER_LONG_VERBS
+        long_verbs: match side {
+            0 => &CLIENT_LONG_VERBS,
+            1 => &SERVER_LONG_VERBS,
+            _ => &NEW_CONNECTION_LONG_VERBS,
         },
     })
 }
@@ -738,15 +738,36 @@ impl ForVerbOf for LineLimits {
     }
 }
 
-/// A real ENC line just under, at and over the real long limit, with
-/// the normal limit for a MSG of the same length.
+/// A real POST line just under, at and over the real long limit, with
+/// the normal limit for a LIST of the same length, and a REGISTER on a
+/// new connection (2.3).
 #[test]
 fn real_long_limit() {
+    for (limits, prefix, max) in [
+        (LineLimits::CLIENT, "POST b - ", MAX_LONG_CLIENT_LINE),
+        (LineLimits::NEW_CONNECTION, "REGISTER a ", MAX_REGISTER_LINE),
+    ] {
+        for (len, ok) in [(max - 1, true), (max, false)] {
+            let mut line = prefix.as_bytes().to_vec();
+            line.resize(len, b'A');
+            line.push(b'\n');
+            let mut d = LineDecoder::with_limits(limits);
+            for chunk in line.chunks(65536) {
+                d.push(chunk);
+                assert!(d.pending_bytes() < max);
+            }
+            let got = d.next_line().unwrap();
+            assert_eq!(got.is_ok(), ok, "{prefix}{len}");
+            if let Ok(got) = got {
+                assert_eq!(got.len(), len);
+            }
+        }
+    }
     for (len, ok) in [
         (MAX_LONG_CLIENT_LINE - 1, true),
         (MAX_LONG_CLIENT_LINE, false),
     ] {
-        let prefix = "ENC #a 0 ";
+        let prefix = "WELCOME PUT ";
         let mut line = prefix.as_bytes().to_vec();
         line.resize(len, b'A');
         line.push(b'\n');
@@ -761,11 +782,17 @@ fn real_long_limit() {
             assert_eq!(got.len(), len);
         }
     }
-    let mut d = LineDecoder::with_limits(LineLimits::CLIENT);
-    let mut msg = b"MSG #a ".to_vec();
-    msg.resize(MAX_CLIENT_LINE, b'a');
-    d.push(&msg);
-    assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
+    for (limits, verb) in [
+        (LineLimits::CLIENT, "LIST "),
+        (LineLimits::NEW_CONNECTION, "POST "),
+        (LineLimits::CLIENT, "REGISTER "),
+    ] {
+        let mut d = LineDecoder::with_limits(limits);
+        let mut line = verb.as_bytes().to_vec();
+        line.resize(MAX_CLIENT_LINE, b'a');
+        d.push(&line);
+        assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)), "{verb}");
+    }
 }
 
 /// With the real limits, the verb of a long line must end within the
@@ -773,9 +800,9 @@ fn real_long_limit() {
 #[test]
 fn real_tags_before_a_long_verb() {
     for (limits, verb) in [
-        (LineLimits::CLIENT, "REPORTENC"),
-        (LineLimits::SERVER, "REPORTENC"),
-        (LineLimits::SERVER, "WELCOME"),
+        (LineLimits::CLIENT, "WELCOME"),
+        (LineLimits::SERVER, "GROUPINFO"),
+        (LineLimits::NEW_CONNECTION, "REGISTER"),
     ] {
         let normal = limits.normal;
         assert!(normal == MAX_CLIENT_LINE || normal == MAX_SERVER_LINE);

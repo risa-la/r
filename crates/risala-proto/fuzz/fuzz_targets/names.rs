@@ -1,6 +1,6 @@
 //! Strings into every `FromStr` of the name, value and key types (SPEC
-//! 2.2, 3.4, 3.5, 4.4, 4.5, 5.3, 5.7, 6.2, 7.2, 10.2, 10.6, 12), and into
-//! the text functions (3.4, 5.5).
+//! 2.2, 3.4, 3.5, 4.4, 4.6, 5.2, 5.7, 6.2, 7.2, 7.3, 8.3, 9, 10.2, 10.6,
+//! 12), and into the text functions (3.4, 5.5).
 //!
 //! Whatever parses must display as a string that parses back to the same
 //! value and displays the same again.
@@ -12,23 +12,26 @@ use std::str::FromStr;
 
 use libfuzzer_sys::fuzz_target;
 use risala_proto::auth::{Nonce, PublicKey, Signature};
+use risala_proto::binary::{EncodedRecords, PairData, PushAuth, PushKey, ReportData, WrappedKey};
+use risala_proto::command::DropTarget;
 use risala_proto::error::ErrorCode;
 use risala_proto::fingerprint::Fingerprint;
 use risala_proto::frame::check_line;
 use risala_proto::keyfile::KeyEntry;
 use risala_proto::mls::{
-    BackupBlob, Ciphertext, CommitMessage, Content, Frank, FrankKey, GroupInfo, KeyPackage,
-    RatchetTree, Welcome, is_strict_base64,
+    GroupId, GroupInfo, KeyPackage, KeyPackageRef, MlsMessage, OrBlob, PostToken, Pseudonym,
+    RatchetTree, SendToken, TokenHash, Welcome, is_strict_base64,
 };
 use risala_proto::names::{
-    BlockTarget, Conv, Domain, Id, Identity, IpPrefix, Name, Room, Seq, ServerBanTarget, Uid,
+    BlobRef, BlockTarget, BoxName, Domain, Id, Identity, IpPrefix, Name, PairId, Room, Seq,
+    ServerBanTarget, Uid,
 };
+use risala_proto::server::{Host, Log, Register, Upload};
 use risala_proto::text::{escape, mentions, unescape};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
-    Cid, GuestAccess, HistoryMode, HistoryOnly, InfoRole, Presence, PushReason, PushTag, Ref,
-    Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting, parse_u64,
-    parse_yes_no,
+    Cid, ConfirmMode, FileUrl, GuestAccess, MediaType, NotifyReason, Presence, PushReason, PushTag,
+    PushUrl, Ref, Retention, Role, SendMode, ServerSetting, parse_u64, parse_yes_no,
 };
 
 fn round_trip<T>(s: &str)
@@ -56,41 +59,56 @@ fuzz_target!(|data: &[u8]| {
     round_trip::<Uid>(s);
     round_trip::<Identity>(s);
     round_trip::<Room>(s);
-    round_trip::<Conv>(s);
+    round_trip::<BoxName>(s);
+    round_trip::<PairId>(s);
+    round_trip::<BlobRef>(s);
     round_trip::<Seq>(s);
     round_trip::<Id>(s);
     round_trip::<BlockTarget>(s);
     round_trip::<IpPrefix>(s);
     round_trip::<ServerBanTarget>(s);
+    round_trip::<DropTarget>(s);
     round_trip::<Timestamp>(s);
+    round_trip::<Host>(s);
 
     round_trip::<Role>(s);
-    round_trip::<InfoRole>(s);
     round_trip::<GuestAccess>(s);
+    round_trip::<SendMode>(s);
+    round_trip::<ConfirmMode>(s);
     round_trip::<PushReason>(s);
+    round_trip::<NotifyReason>(s);
     round_trip::<Presence>(s);
-    round_trip::<RoomRetention>(s);
-    round_trip::<ServerRetention>(s);
-    round_trip::<Relation>(s);
+    round_trip::<Retention>(s);
     round_trip::<Ref>(s);
     round_trip::<Cid>(s);
     round_trip::<PushTag>(s);
-    round_trip::<RoomSetting>(s);
+    round_trip::<PushUrl>(s);
+    round_trip::<FileUrl>(s);
+    round_trip::<MediaType>(s);
     round_trip::<ServerSetting>(s);
     round_trip::<ErrorCode>(s);
-    round_trip::<HistoryMode>(s);
-    round_trip::<HistoryOnly>(s);
+    round_trip::<Register>(s);
+    round_trip::<Log>(s);
+    round_trip::<Upload>(s);
 
     round_trip::<KeyPackage>(s);
     round_trip::<GroupInfo>(s);
-    round_trip::<CommitMessage>(s);
     round_trip::<Welcome>(s);
     round_trip::<RatchetTree>(s);
-    round_trip::<Ciphertext>(s);
-    round_trip::<Content>(s);
-    round_trip::<Frank>(s);
-    round_trip::<FrankKey>(s);
-    round_trip::<BackupBlob>(s);
+    round_trip::<MlsMessage>(s);
+    round_trip::<OrBlob<MlsMessage>>(s);
+    round_trip::<GroupId>(s);
+    round_trip::<TokenHash>(s);
+    round_trip::<Pseudonym>(s);
+    round_trip::<KeyPackageRef>(s);
+    round_trip::<SendToken>(s);
+    round_trip::<PostToken>(s);
+    round_trip::<EncodedRecords>(s);
+    round_trip::<PairData>(s);
+    round_trip::<ReportData>(s);
+    round_trip::<WrappedKey>(s);
+    round_trip::<PushKey>(s);
+    round_trip::<PushAuth>(s);
     // Strict base64 is exactly what the standard decoder accepts and
     // encodes back unchanged.
     if let Ok(blob) = s.parse::<KeyPackage>() {

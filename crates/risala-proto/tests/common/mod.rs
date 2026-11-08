@@ -99,24 +99,24 @@ impl Example {
     }
 }
 
-/// How many bytes a shortened value in a tag with this key stands for.
-/// The spec fixes the length of `frank` (12.8); other MLS data, and
-/// REPORTENC's content (5.8), have any length. Values of a fixed length
-/// in parameters, such as REPORTENC's franking key, are written in full.
-fn shortened_len(tag_key: Option<&str>) -> usize {
-    match tag_key {
-        Some("frank") => 48,
-        _ => 96,
-    }
-}
+/// How many bytes a shortened base64 value stands for. MLS data, the
+/// only base64 the spec's examples shorten, has any length; 96 bytes is
+/// enough to look like a real value.
+const SHORTENED_BYTES: usize = 96;
 
-/// Section 12's examples shorten long base64 values with `…` (12.1), as
-/// in `init bob@example.net AAEABA… gAAU…`. This replaces each such value,
-/// a run of base64 characters followed by `…`, with valid base64 of the
-/// right length that starts with the same characters, so that the line
-/// parses as a typed line. The same shortened value always becomes the
-/// same full one. An `…` that does not follow a base64 character, as in
-/// `cheap pills at …`, is left alone.
+/// The spec's examples shorten long values with `…` (README), as in
+/// `POST ujzdegxdncf32epf3dhodzdoci AAEAAQ…` or
+/// `sha384:5d0c9a1e…`. This replaces each such value, a run of base64
+/// characters followed by `…`, so that the line parses as a typed line:
+///
+/// - after `sha384:`, with the 96 hex digits of a blob-ref (3.5), padded
+///   with `0`;
+/// - otherwise with valid base64 of 96 bytes that starts with the same
+///   characters.
+///
+/// The same shortened value always becomes the same full one. An `…`
+/// that does not follow a base64 character, as in `cheap pills at …`, is
+/// left alone.
 pub fn expand_shortened(line: &str) -> String {
     let is_b64 = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/';
     let mut out = String::with_capacity(line.len());
@@ -133,15 +133,13 @@ pub fn expand_shortened(line: &str) -> String {
         out.push_str(&before[..start]);
         if prefix.is_empty() {
             out.push('…');
+        } else if before[..start].ends_with("sha384:") {
+            assert!(prefix.len() < 96, "{line}: {prefix} is too long");
+            out.push_str(prefix);
+            out.extend(std::iter::repeat_n('0', 96 - prefix.len()));
         } else {
-            // The tag key, if the value is a tag's: `;key=` or `@key=`.
-            let tag_key = before[..start]
-                .strip_suffix('=')
-                .and_then(|s| s.rsplit([';', '@']).next())
-                .filter(|_| line.starts_with('@') && !line[..start].contains(' '));
-            let bytes = shortened_len(tag_key);
-            let len = bytes.div_ceil(3) * 4;
-            let pad = (3 - bytes % 3) % 3;
+            let len = SHORTENED_BYTES.div_ceil(3) * 4;
+            let pad = (3 - SHORTENED_BYTES % 3) % 3;
             assert!(prefix.len() < len - pad, "{line}: {prefix} is too long");
             out.push_str(prefix);
             out.extend(std::iter::repeat_n('A', len - pad - prefix.len()));

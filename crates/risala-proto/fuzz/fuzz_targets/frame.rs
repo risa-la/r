@@ -16,7 +16,8 @@
 use libfuzzer_sys::fuzz_target;
 use risala_proto::error::ParseError;
 use risala_proto::frame::{
-    CLIENT_LONG_VERBS, LineDecoder, LineLimits, MAX_CLIENT_LINE, SERVER_LONG_VERBS, check_line,
+    CLIENT_LONG_VERBS, LineDecoder, LineLimits, MAX_CLIENT_LINE, NEW_CONNECTION_LONG_VERBS,
+    SERVER_LONG_VERBS, check_line,
 };
 use risala_proto::line::Line;
 
@@ -94,15 +95,16 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let limits = match seed & 3 {
-        0 => LineLimits::uniform(MAX_CLIENT_LINE),
+        0 if seed & 4 == 0 => LineLimits::uniform(MAX_CLIENT_LINE),
+        0 => LineLimits::NEW_CONNECTION,
         1 => LineLimits::SERVER,
         2 => LineLimits {
             normal: 16,
             long: 64,
-            long_verbs: if seed & 4 == 0 {
-                &CLIENT_LONG_VERBS
-            } else {
-                &SERVER_LONG_VERBS
+            long_verbs: match seed & 12 {
+                0 => &CLIENT_LONG_VERBS,
+                4 => &SERVER_LONG_VERBS,
+                _ => &NEW_CONNECTION_LONG_VERBS,
             },
         },
         _ => LineLimits::uniform(usize::from(seed >> 2)),

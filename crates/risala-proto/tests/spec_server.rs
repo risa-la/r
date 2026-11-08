@@ -1,8 +1,8 @@
 //! Every `S:` example in the spec (`spec/`) parses as a typed
 //! [`ServerMessage`] and serialises back byte for byte (SPEC Section 13).
 //!
-//! Base64 values that the spec shortens with `…` (12.1) are first made
-//! whole with `common::expand_shortened`.
+//! Values that the spec shortens with `…` (README) are first made whole
+//! with `common::expand_shortened`.
 
 mod common;
 
@@ -13,7 +13,8 @@ use risala_proto::server::{ServerLine, ServerMessage};
 #[test]
 fn every_server_example_round_trips() {
     let examples = server_examples();
-    assert!(examples.len() >= 30, "only {} examples", examples.len());
+    // The spec has 16 `S:` lines.
+    assert!(examples.len() >= 16, "only {} examples", examples.len());
     for example in examples {
         let expanded = example.expanded();
         let msg: ServerMessage = expanded

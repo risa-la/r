@@ -2,8 +2,8 @@
 //! [`Request`] (Section 13), and serialises back to the same line with
 //! only the verb in upper case.
 //!
-//! Base64 values that the spec shortens with `…` (12.1) are first made
-//! whole with [`common::expand_shortened`].
+//! Values that the spec shortens with `…` (README) are first made whole
+//! with [`common::expand_shortened`].
 
 mod common;
 
@@ -12,7 +12,9 @@ use risala_proto::command::Request;
 use risala_proto::line::Line;
 
 /// Verbs that take a subcommand, which is written in upper case too.
-const WITH_SUBCOMMAND: [&str; 6] = ["ADMIN", "BACKUP", "KEY", "KEYPKG", "PUSH", "WELCOME"];
+const WITH_SUBCOMMAND: [&str; 8] = [
+    "ADMIN", "BACKUP", "KEYPKG", "KEYS", "PAIR", "PRESENCE", "PUSH", "WELCOME",
+];
 
 /// The example with its verb, and subcommand if any, in upper case. Spec
 /// examples use lower-case verbs, as someone typing would, and
@@ -46,8 +48,9 @@ fn with_upper_verb(example: &str) -> String {
 #[test]
 fn every_client_example_parses() {
     let examples = client_examples();
+    // The spec has 7 `C:` lines, and Appendix B's AUTH.
     assert!(
-        examples.len() >= 10,
+        examples.len() >= 8,
         "only {} client examples",
         examples.len()
     );
@@ -63,48 +66,61 @@ fn every_client_example_parses() {
 }
 
 #[test]
+fn every_client_example_may_be_sent_by_some_kind() {
+    use risala_proto::connection::ConnectionKind;
+    for example in client_examples() {
+        let request: Request = example.expanded().parse().unwrap();
+        assert!(
+            ConnectionKind::ALL
+                .iter()
+                .any(|&k| request.command.check_kind(k).is_ok()),
+            "{example}"
+        );
+    }
+}
+
+#[test]
 fn shortened_values_are_expanded() {
     use common::expand_shortened;
-    // frank is 48 bytes (12.8); other values 96.
-    let frank = format!("hT3m{}", "A".repeat(60));
-    let blob = |p: &str| format!("{p}{}", "A".repeat(128 - p.len()));
+    // Base64 becomes 96 bytes; a blob-ref 96 hex digits.
+    let b64 = |p: &str| format!("{p}{}", "A".repeat(128 - p.len()));
+    let hex = |p: &str| format!("{p}{}", "0".repeat(96 - p.len()));
     assert_eq!(
-        expand_shortened("@frank=hT3m…;cid=q2r8sv0alm3nb7xk enc bob@example.net 1 3qG8w…"),
+        expand_shortened("post ujzdegxdncf32epf3dhodzdoci - AAEAAQ… groupinfo=AAEABA…"),
         format!(
-            "@frank={frank};cid=q2r8sv0alm3nb7xk enc bob@example.net 1 {}",
-            blob("3qG8w")
+            "post ujzdegxdncf32epf3dhodzdoci - {} groupinfo={}",
+            b64("AAEAAQ"),
+            b64("AAEABA")
         )
     );
-    // REPORTENC's content, after a franking key written in full.
-    let key = "g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4=";
     assert_eq!(
-        expand_shortened(&format!("reportenc a@b.org 2 {key} VEVYVCBz… spam")),
-        format!("reportenc a@b.org 2 {key} {} spam", blob("VEVYVCBz"))
+        expand_shortened("GROUPINFO b 1 0 AAEABA… sha384:5d0c9a1e…"),
+        format!(
+            "GROUPINFO b 1 0 {} sha384:{}",
+            b64("AAEABA"),
+            hex("5d0c9a1e")
+        )
     );
     // Not base64: left alone.
     assert_eq!(
-        expand_shortened("MSG #general cheap pills at …"),
-        "MSG #general cheap pills at …"
-    );
-    // A value that looks like a tag's but is in the parameters.
-    assert_eq!(
-        expand_shortened("@ref=1 X frank=hT3m…"),
-        format!("@ref=1 X frank={}", blob("hT3m"))
+        expand_shortened("NOTICE cheap pills at …"),
+        "NOTICE cheap pills at …"
     );
 }
 
 #[test]
 fn upper_case_verb_helper() {
-    assert_eq!(with_upper_verb("sync"), "SYNC");
-    assert_eq!(with_upper_verb("join #a"), "JOIN #a");
-    assert_eq!(with_upper_verb("@ref=7 msg #a hi"), "@ref=7 MSG #a hi");
+    assert_eq!(with_upper_verb("anon"), "ANON");
+    assert_eq!(with_upper_verb("list after=#a"), "LIST after=#a");
     assert_eq!(
-        with_upper_verb("msg #a  two  spaces"),
-        "MSG #a  two  spaces"
+        with_upper_verb("@ref=7 fetch b after=1"),
+        "@ref=7 FETCH b after=1"
     );
+    assert_eq!(with_upper_verb("quit  two  spaces"), "QUIT  two  spaces");
     assert_eq!(
         with_upper_verb("keypkg get bob@example.net"),
         "KEYPKG GET bob@example.net"
     );
+    assert_eq!(with_upper_verb("presence on"), "PRESENCE ON");
     assert_eq!(with_upper_verb("welcome list"), "WELCOME LIST");
 }

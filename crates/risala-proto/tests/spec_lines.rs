@@ -15,9 +15,10 @@ fn collects_examples() {
     let client = count(&|e| e.dir == Dir::Client);
     let server = count(&|e| e.dir == Dir::Server);
     eprintln!("{spec} examples in the spec: {client} client, {server} server");
-    assert!(spec >= 41, "only {spec} examples in the spec");
-    assert!(client >= 10, "only {client} client examples");
-    assert!(server >= 30, "only {server} server examples");
+    // draft-03 has 23 `C:` and `S:` lines, and Appendix B's AUTH.
+    assert!(spec >= 24, "only {spec} examples in the spec");
+    assert!(client >= 8, "only {client} client examples");
+    assert!(server >= 16, "only {server} server examples");
 }
 
 #[test]
@@ -115,20 +116,17 @@ fn specific_examples_are_present() {
     assert_eq!(auth.line.len(), "AUTH alice@example.org ".len() + 3228);
     assert!(auth.line.ends_with("kXJzM="));
 
-    let deleted = find(";deleted MSG #general");
-    assert_eq!(deleted.dir, Dir::Server);
-    assert!(deleted.line.ends_with("MSG #general"));
-
-    assert_eq!(find("@ref=7 history").dir, Dir::Client);
-    assert_eq!(find("upload 48213").dir, Dir::Client);
+    // The example session of 1.4 and the FETCH of 3.6.
+    assert_eq!(find("RISALA 1 chat.example.org").dir, Dir::Server);
+    assert_eq!(find("anon").dir, Dir::Client);
+    assert_eq!(find("@ref=7 fetch").dir, Dir::Client);
+    assert_eq!(find("@ref=7 OK more=1").dir, Dir::Server);
+    assert_eq!(find("post ujzdegxdncf32epf3dhodzdoci -").dir, Dir::Client);
+    assert_eq!(
+        find("GROUPINFO ujzdegxdncf32epf3dhodzdoci").dir,
+        Dir::Server
+    );
     assert_eq!(find("PRESENCE offline").dir, Dir::Server);
-    assert_eq!(find("SET #general e2ee no").dir, Dir::Server);
-    assert_eq!(find("SET #general send all").dir, Dir::Server);
-    assert_eq!(find("init bob@example.net").dir, Dir::Client);
-    assert_eq!(find("COMMIT bob@example.net 1").dir, Dir::Server);
-    assert_eq!(find("enc bob@example.net 1").dir, Dir::Client);
-    assert_eq!(find("reportenc alice@example.org 2").dir, Dir::Client);
-    assert_eq!(find("REPORTENC alice@example.org 2").dir, Dir::Server);
 
     // Prose and shell commands inside example blocks are skipped.
     for e in &all {
@@ -182,17 +180,20 @@ fn code_blocks_panic_when_unclosed() {
 #[test]
 fn shape_rule() {
     assert_eq!(direction_by_shape("guest sam"), Some(Dir::Client));
-    assert_eq!(direction_by_shape("@reply=1 msg #a hi"), Some(Dir::Client));
+    assert_eq!(
+        direction_by_shape("@ref=1 fetch b after=0"),
+        Some(Dir::Client)
+    );
     assert_eq!(direction_by_shape("OK uid=~sam"), Some(Dir::Server));
     assert_eq!(
-        direction_by_shape("@seq=1;t=x;from=~sam JOIN #general"),
+        direction_by_shape("@seq=1;t=x POST b AAAA"),
         Some(Dir::Server)
     );
     assert_eq!(
         direction_by_shape("RISALA 1 host nonce Welcome!"),
         Some(Dir::Server)
     );
-    assert_eq!(direction_by_shape("Msg #a"), None);
+    assert_eq!(direction_by_shape("Post b"), None);
     assert_eq!(direction_by_shape("$ openssl"), None);
     assert_eq!(direction_by_shape(""), None);
     assert_eq!(direction_by_shape("@ref=7"), None);

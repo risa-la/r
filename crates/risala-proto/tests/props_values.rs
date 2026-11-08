@@ -17,14 +17,15 @@ use risala_proto::error::{ErrorCode, ParseError};
 use risala_proto::frame::check_line;
 use risala_proto::line::Line;
 use risala_proto::names::{
-    BlockTarget, Conv, Domain, Id, Identity, IpPrefix, Name, Room, Seq, ServerBanTarget, Uid,
+    BlobRef, BlockTarget, BoxName, Domain, Id, Identity, IpPrefix, Name, PairId, Room, Seq,
+    ServerBanTarget, Uid,
 };
 use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
 use risala_proto::text::{escape, mentions, unescape};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
-    Cid, GuestAccess, InfoRole, Presence, PushReason, PushTag, Ref, Relation, Role, RoomRetention,
-    RoomSetting, ServerRetention, ServerSetting, parse_u64, parse_yes_no,
+    Cid, ConfirmMode, GuestAccess, NotifyReason, Presence, PushReason, PushTag, Ref, Retention,
+    Role, SendMode, ServerSetting, parse_u64, parse_yes_no,
 };
 
 /// Explicit case counts keep `cargo test` fast in debug builds. Set
@@ -173,7 +174,6 @@ proptest! {
         let room_value = check_canonical::<Room>(&room)?;
         prop_assert_eq!(room_value.bare(), &room[1..]);
         prop_assert_eq!(Room::from_bare(room_value.bare()), Ok(room_value.clone()));
-        prop_assert_eq!(check_canonical::<Conv>(&room)?, Conv::Room(room_value));
 
         let g = check_canonical::<Uid>(&guest)?;
         prop_assert!(g.is_guest());
@@ -181,7 +181,6 @@ proptest! {
         prop_assert_eq!(g.domain(), None);
         prop_assert_eq!(g.to_identity(), None);
         prop_assert_eq!(Uid::guest(&guest[1..].parse::<Name>()?), g.clone());
-        prop_assert_eq!(check_canonical::<Conv>(&guest)?, Conv::Uid(g));
         prop_assert!(guest.parse::<Identity>().is_err());
 
         let i = check_canonical::<Uid>(&identity)?;
@@ -191,8 +190,7 @@ proptest! {
         prop_assert_eq!(i.domain(), Some(d));
         let ident = check_canonical::<Identity>(&identity)?;
         prop_assert_eq!(Identity::new(&n.parse()?, &d.parse()?), ident.clone());
-        prop_assert_eq!(ident.to_uid(), i.clone());
-        prop_assert_eq!(check_canonical::<Conv>(&identity)?, Conv::Uid(i));
+        prop_assert_eq!(ident.to_uid(), i);
     }
 
     /// `seq` from 1 to 2^63-1 round-trips; 0, 2^63 and leading zeros do
@@ -209,6 +207,47 @@ proptest! {
         prop_assert!("0".parse::<Seq>().is_err());
         prop_assert_eq!(Seq::parse_or_zero("0"), Ok(None));
         prop_assert!((i64::MAX as u64 + 1).to_string().parse::<Seq>().is_err());
+    }
+
+    /// A box is any 16 bytes, written as 26 characters of lower-case
+    /// base32; upper case folds, and changing the length or the last
+    /// character's two padding bits breaks it (3.5).
+    #[test]
+    fn boxes_round_trip(bytes in any::<[u8; 16]>(), upper in any::<bool>(), cut in 1..26usize) {
+        let b = BoxName::from_bytes(bytes);
+        let s = b.to_string();
+        prop_assert_eq!(s.len(), 26);
+        prop_assert!(s.bytes().all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c)));
+        let written = if upper { s.to_ascii_uppercase() } else { s.clone() };
+        prop_assert_eq!(written.parse::<BoxName>(), Ok(b));
+        prop_assert_eq!(s.parse::<PairId>().map(|p| *p.as_bytes()), Ok(bytes));
+        prop_assert!(s[..cut].parse::<BoxName>().is_err());
+        let longer = format!("{s}a");
+        prop_assert!(longer.parse::<BoxName>().is_err());
+        // The last character carries 3 bits of data and 2 zero bits.
+        let last = s.as_bytes()[25];
+        let value = if last.is_ascii_lowercase() { last - b'a' } else { last - b'2' + 26 };
+        prop_assert_eq!(value & 3, 0);
+        for low in 1..4u8 {
+            let v = value | low;
+            let c = if v < 26 { b'a' + v } else { b'2' + v - 26 };
+            let mut bad = s.clone().into_bytes();
+            bad[25] = c;
+            prop_assert!(String::from_utf8(bad).unwrap().parse::<BoxName>().is_err());
+        }
+    }
+
+    /// A blob-ref is `sha384:` and 96 hex digits of any hash (3.5).
+    #[test]
+    fn blob_refs_round_trip(hash in any::<[u8; 48]>(), upper in any::<bool>(), cut in 0..96usize) {
+        let r = BlobRef::from_hash(hash);
+        let s = r.to_string();
+        prop_assert_eq!(s.len(), 7 + 96);
+        prop_assert_eq!(&s[7..], r.hex());
+        let written = if upper { s.to_ascii_uppercase() } else { s.clone() };
+        prop_assert_eq!(written.parse::<BlobRef>(), Ok(r));
+        prop_assert!(s[..7 + cut].parse::<BlobRef>().is_err());
+        prop_assert_eq!(BlobRef::of(&hash).hash().len(), 48);
     }
 
     /// Block targets (5.7) and ban targets (10.2) round-trip.
@@ -283,7 +322,9 @@ proptest! {
         if let Some(v) = check_any::<Uid>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
         if let Some(v) = check_any::<Identity>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
         if let Some(v) = check_any::<Room>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
-        if let Some(v) = check_any::<Conv>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
+        if let Some(v) = check_any::<BoxName>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
+        if let Some(v) = check_any::<PairId>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
+        if let Some(v) = check_any::<BlobRef>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
         if let Some(v) = check_any::<Id>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
         if let Some(v) = check_any::<BlockTarget>(&s)? { prop_assert_eq!(v.to_string(), lower.as_str()); }
         if let Some(v) = check_any::<Seq>(&s)? { prop_assert_eq!(v.to_string(), s.as_str()); }
@@ -618,68 +659,53 @@ proptest! {
 proptest! {
     #![proptest_config(config(256))]
 
-    /// The keyword, retention, relation, token and setting types
-    /// round-trip from valid values.
+    /// The keyword, retention, token and setting types round-trip from
+    /// valid values.
     #[test]
     fn types_round_trip(
-        days in 1..=u32::MAX,
-        seq in 1..=i64::MAX as u64,
+        days in 7..=u32::MAX,
+        short in 0..7u32,
         presence in "[a-z][a-z0-9-]{0,10}",
         tag_token in "[!-:<-~]{1,64}",
         cid in "[!-:<-~]{16,64}",
         push_tag in "[!-~]{1,64}",
-        topic in "[ -~]{0,40}",
+        welcome in "[ -~]{0,40}",
         key in "[a-z][a-z0-9-]{0,10}",
         value in "[ -~]{0,20}",
+        reason in "[a-z0-9-]{1,32}",
         n in 0..=i64::MAX as u64,
     ) {
         for role in Role::ALL {
             check_canonical::<Role>(role.as_str())?;
-            check_canonical::<InfoRole>(role.as_str())?;
         }
-        check_canonical::<InfoRole>("none")?;
         for g in GuestAccess::ALL {
             check_canonical::<GuestAccess>(g.as_str())?;
+        }
+        for m in SendMode::ALL {
+            check_canonical::<SendMode>(m.as_str())?;
+        }
+        for c in ConfirmMode::ALL {
+            check_canonical::<ConfirmMode>(c.as_str())?;
         }
         for r in PushReason::ALL {
             check_canonical::<PushReason>(r.as_str())?;
         }
+        check_canonical::<NotifyReason>(&reason)?;
         check_canonical::<Presence>(&presence)?;
         let d = days.to_string();
-        check_canonical::<RoomRetention>(&d)?;
-        check_canonical::<ServerRetention>(&d)?;
-        check_canonical::<RoomRetention>("server")?;
-        check_canonical::<ServerRetention>("forever")?;
-        let seq = Seq::new(seq).unwrap();
-        for relation in [Relation::Reply(seq), Relation::Edit(seq), Relation::React(seq)] {
-            prop_assert_eq!(relation.to_string().parse::<Relation>(), Ok(relation));
-            prop_assert_eq!(
-                Relation::from_tag(relation.key(), Some(&seq.to_string())),
-                Ok(Some(relation))
-            );
-        }
+        prop_assert_eq!(check_canonical::<Retention>(&d)?.days(), days);
+        prop_assert!(short.to_string().parse::<Retention>().is_err());
         prop_assert_eq!(tag_token.parse::<Ref>().map(|r| r.to_string()), Ok(tag_token.clone()));
         prop_assert_eq!(cid.parse::<Cid>().map(|c| c.to_string()), Ok(cid.clone()));
         prop_assert_eq!(push_tag.parse::<PushTag>().map(|t| t.to_string()), Ok(push_tag.clone()));
 
-        let topic_setting = RoomSetting::Topic(topic.clone());
-        prop_assert_eq!(topic_setting.to_string().parse::<RoomSetting>(), Ok(topic_setting));
-        let welcome = ServerSetting::Welcome(topic);
-        prop_assert_eq!(welcome.to_string().parse::<ServerSetting>(), Ok(welcome));
+        let setting = ServerSetting::Welcome(welcome);
+        prop_assert_eq!(setting.to_string().parse::<ServerSetting>(), Ok(setting));
         for setting in [
-            RoomSetting::Public(n % 2 == 0),
-            RoomSetting::Guests(GuestAccess::ALL[n as usize % GuestAccess::ALL.len()]),
-            RoomSetting::Retention(RoomRetention::Days(d.parse().unwrap())),
-        ] {
-            prop_assert_eq!(setting.to_string().parse::<RoomSetting>(), Ok(setting));
-        }
-        if let Ok(setting) = RoomSetting::parse(&key, &value) {
-            prop_assert_eq!(setting.to_string().parse::<RoomSetting>(), Ok(setting));
-        }
-        for setting in [
-            ServerSetting::Guests(n % 2 == 0),
-            ServerSetting::Registration(n % 3 == 0),
-            ServerSetting::Retention(ServerRetention::Days(d.parse().unwrap())),
+            ServerSetting::Anon(n % 2 == 0),
+            ServerSetting::Guests(n % 3 == 0),
+            ServerSetting::Registration(n % 5 == 0),
+            ServerSetting::Retention(d.parse().unwrap()),
         ] {
             prop_assert_eq!(setting.to_string().parse::<ServerSetting>(), Ok(setting));
         }
@@ -695,21 +721,18 @@ proptest! {
     #[test]
     fn any_type_round_trips(s in prop_oneof![any::<String>(), "[a-zA-Z0-9 =-]{0,20}"]) {
         check_any::<Role>(&s)?;
-        check_any::<InfoRole>(&s)?;
         check_any::<GuestAccess>(&s)?;
+        check_any::<SendMode>(&s)?;
+        check_any::<ConfirmMode>(&s)?;
         check_any::<PushReason>(&s)?;
+        check_any::<NotifyReason>(&s)?;
         check_any::<Presence>(&s)?;
-        check_any::<RoomRetention>(&s)?;
-        check_any::<ServerRetention>(&s)?;
+        check_any::<Retention>(&s)?;
         check_any::<Ref>(&s)?;
         check_any::<Cid>(&s)?;
         check_any::<PushTag>(&s)?;
-        check_any::<RoomSetting>(&s)?;
         check_any::<ServerSetting>(&s)?;
         check_any::<ErrorCode>(&s)?;
-        if let Ok(relation) = s.parse::<Relation>() {
-            prop_assert_eq!(relation.to_string().parse::<Relation>(), Ok(relation));
-        }
         if let Ok(n) = parse_u64(&s) {
             prop_assert_eq!(n.to_string(), s.as_str());
         }
