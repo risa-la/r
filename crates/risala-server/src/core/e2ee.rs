@@ -238,6 +238,13 @@ impl Inner {
     async fn keypkg_add(&self, uid: &Uid, reply: &Reply, key_package: KeyPackage) -> Outcome {
         let id = reply.handle.id();
         let key = self.device_key(uid, id)?;
+        let max = self.config.limits.max_key_package_bytes;
+        if key_package.decoded_len() > max {
+            return Err(fail(
+                ErrorCode::TooLong,
+                &format!("a KeyPackage is at most {max} bytes"),
+            ));
+        }
         let now = self.now();
         let checked = {
             let (kp, who, k) = (key_package.clone(), uid.clone(), key.clone());

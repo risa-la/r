@@ -261,6 +261,10 @@ pub struct Limits {
     /// SHOULD rate-limit it, since each one uses KeyPackages up). Further
     /// ones get `ERR rate-limited`. 0 means no limit.
     pub key_package_gets_per_hour: u32,
+    /// The largest KeyPackage KEYPKG ADD takes, in bytes once decoded
+    /// (12.4). Larger ones get `ERR too-long`. At least
+    /// [`MIN_KEY_PACKAGE_BYTES`], since 12.4 allows no lower limit.
+    pub max_key_package_bytes: usize,
 }
 
 /// The most lines a command's response has besides a full page of events
@@ -278,6 +282,9 @@ pub const MIN_SIGN_IN_SECS: u64 = 120;
 
 /// The least `limits.guest_resume_secs` the spec allows (4.2).
 pub const MIN_GUEST_RESUME_SECS: u64 = 120;
+
+/// The lowest [`Limits::max_key_package_bytes`] may be (12.4).
+pub const MIN_KEY_PACKAGE_BYTES: usize = 16 * 1024;
 
 impl Limits {
     /// The most lines one command's response queues: a full HISTORY or
@@ -385,6 +392,7 @@ impl Default for Limits {
             max_blocks: 1000,
             max_key_packages: 100,
             key_package_gets_per_hour: 600,
+            max_key_package_bytes: 64 * 1024,
         }
     }
 }
@@ -468,6 +476,12 @@ impl Config {
             return invalid(format!(
                 "limits.guest_resume_secs is {}, but must be at least {MIN_GUEST_RESUME_SECS} (4.2)",
                 l.guest_resume_secs
+            ));
+        }
+        if l.max_key_package_bytes < MIN_KEY_PACKAGE_BYTES {
+            return invalid(format!(
+                "limits.max_key_package_bytes is {}, but must be at least {MIN_KEY_PACKAGE_BYTES} (12.4)",
+                l.max_key_package_bytes
             ));
         }
         if l.out_queue < l.command_room() {
@@ -605,6 +619,7 @@ mod tests {
         assert_eq!(c.limits.max_blocks, 1000);
         assert_eq!(c.limits.max_key_packages, 100);
         assert_eq!(c.limits.key_package_gets_per_hour, 600);
+        assert_eq!(c.limits.max_key_package_bytes, 65536);
     }
 
     #[test]
@@ -688,6 +703,8 @@ mod tests {
         invalid(|l| l.max_key_packages = 0, "max_key_packages");
         assert!(with(|l| l.presence_offline_secs = 0).is_ok());
         assert!(with(|l| l.typing_interval_ms = 0).is_ok());
+        invalid(|l| l.max_key_package_bytes = 16383, "max_key_package_bytes");
+        assert!(with(|l| l.max_key_package_bytes = 16384).is_ok());
         invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");
         assert!(with(|l| l.guest_resume_secs = 120).is_ok());
 

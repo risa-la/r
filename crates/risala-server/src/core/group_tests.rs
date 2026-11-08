@@ -385,6 +385,16 @@ async fn keypkg_add_checks_key_packages() {
         c.lines(),
         ["ERR invalid the MLSMessage is not a KeyPackage"]
     );
+    // At most 64 KiB (12.4): one byte more is too long, before any other
+    // check.
+    for (n, reply) in [
+        (65536, "ERR invalid not a valid KeyPackage"),
+        (65537, "ERR too-long a KeyPackage is at most 65536 bytes"),
+    ] {
+        let big = mls::KeyPackage::from_bytes(&vec![0; n]).unwrap();
+        w.send(&c, &format!("keypkg add {big}")).await;
+        assert_eq!(c.lines(), [reply], "{n} bytes");
+    }
 
     // Out of its lifetime: two weeks before it starts, and after it ends.
     w.h.clock.set(
