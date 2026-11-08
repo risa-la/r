@@ -19,7 +19,10 @@ use crate::keypackage::make_key_package;
 use crate::mldsa::SigningKey;
 use crate::profile::RisalaProfile;
 
-const HOST: &str = "chat.example.org";
+/// The server of the tests' conversations.
+fn host() -> risala_proto::names::ServerAddr {
+    "chat.example.org".parse().unwrap()
+}
 const BOX: [u8; 16] = [0x42; 16];
 
 type Storage = <Provider<MemoryStorage> as OpenMlsProvider>::StorageError;
@@ -110,7 +113,7 @@ impl Device {
 
     fn join(&self, welcome: &[u8]) -> MlsGroup {
         let expect = JoinExpectation {
-            host: HOST.into(),
+            host: host(),
             own_uid: self.uid.clone(),
             public_room: None,
         };
@@ -202,7 +205,7 @@ fn direct() -> Direct {
     let alice = Device::new("alice@example.org", 1);
     let alice2 = Device::new("alice@example.org", 11);
     let bob = Device::new("bob@example.org", 2);
-    let conversation = RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid);
+    let conversation = RisalaConversation::direct(host(), BOX, &alice.uid, &bob.uid);
     let mut a = alice.create(&conversation);
     let out = commit(
         &alice.provider,
@@ -296,9 +299,9 @@ fn round_trip_between_members() {
 #[test]
 fn conversation_with_yourself() {
     let alice = Device::new("alice@example.org", 1);
-    let conversation = RisalaConversation::direct(HOST, BOX, &alice.uid, &alice.uid);
+    let conversation = RisalaConversation::direct(host(), BOX, &alice.uid, &alice.uid);
     assert_eq!(line_conversation(&conversation), Conversation::WithYourself);
-    let room = RisalaConversation::private_room(HOST, BOX, "Friends", &alice.uid);
+    let room = RisalaConversation::private_room(host(), BOX, "Friends", &alice.uid);
     assert_eq!(
         line_conversation(&room),
         Conversation::PrivateRoom(LineConfirmMode::Pairwise)
@@ -836,7 +839,7 @@ fn self_removed_sender() {
 fn epochal_private_rooms_derive() {
     let mut owen = Device::new("owen@example.org", 1);
     let mia = Device::new("mia@example.org", 2);
-    let mut conversation = RisalaConversation::private_room(HOST, BOX, "Friends", &owen.uid);
+    let mut conversation = RisalaConversation::private_room(host(), BOX, "Friends", &owen.uid);
     conversation.confirm = ConfirmMode::Epochal;
     let mut o = owen.create(&conversation);
     let out = commit(
@@ -953,11 +956,11 @@ fn deletes() {
     let owen: Uid = "owen@example.org".parse().unwrap();
     let mia: Uid = "mia@example.org".parse().unwrap();
     let pat: Uid = "pat@example.org".parse().unwrap();
-    let direct = RisalaConversation::direct(HOST, BOX, &owen, &mia);
+    let direct = RisalaConversation::direct(host(), BOX, &owen, &mia);
     assert!(may_delete(&owen, &owen, &direct, &direct));
     assert!(!may_delete(&owen, &mia, &direct, &direct));
 
-    let room = RisalaConversation::private_room(HOST, BOX, "Friends", &owen);
+    let room = RisalaConversation::private_room(host(), BOX, "Friends", &owen);
     let mut with_mod = room.clone();
     with_mod.mods.push(mia.clone());
     // An owner, a moderator in both epochs, the author.

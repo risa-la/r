@@ -8,7 +8,7 @@
 //! struct {
 //!     uint8 version;               // 1
 //!     ConversationKind kind;       // direct(1), private_room(2), public_room(3)
-//!     opaque host<V>;              // the server, in lower case
+//!     opaque host<V>;              // the server, as a server (3.5)
 //!     opaque box[16];              // the mailbox
 //!     opaque name<V>;
 //!     opaque topic<V>;             // UTF-8, at most 512 bytes
@@ -30,7 +30,7 @@ use openmls::prelude::{
     Extension, ExtensionType, Extensions, GroupContext, RequiredCapabilitiesExtension,
     UnknownExtension,
 };
-use risala_proto::names::{Room, Uid};
+use risala_proto::names::{Room, ServerAddr, Uid};
 
 use crate::codec::{DecodeError, Reader, Writer};
 
@@ -49,9 +49,6 @@ pub const MAX_TOPIC_LEN: usize = 512;
 
 /// The longest private room name, in bytes (12.4).
 pub const MAX_PRIVATE_NAME_LEN: usize = 128;
-
-/// The longest host name accepted, in bytes.
-const MAX_HOST_LEN: usize = 255;
 
 /// The kind of conversation a group belongs to (12.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,8 +106,9 @@ pub enum Role {
 pub struct RisalaConversation {
     /// Direct conversation, private room or public room. It never changes.
     pub kind: ConversationKind,
-    /// The server, in lower case. It never changes.
-    pub host: String,
+    /// The server, as a server address in its one written form (3.5),
+    /// which is compared byte for byte (12.7). It never changes.
+    pub host: ServerAddr,
     /// The mailbox (`box`). It changes only when a direct conversation or
     /// a private room moves to a new mailbox (7.8).
     pub mailbox: [u8; BOX_LEN],
@@ -245,25 +243,19 @@ fn direct_name(a: &Uid, b: &Uid) -> String {
     }
 }
 
-/// Whether `host` is a server name in lower case: printable ASCII without
-/// spaces or upper case. 12.4 says only "in lower case"; the device also
-/// compares it with the server it is on (12.7).
-fn host_ok(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= MAX_HOST_LEN
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !b.is_ascii_uppercase())
-}
-
 impl RisalaConversation {
     /// The extension of the direct conversation between `a` and `b`, on
     /// `host` with mailbox `mailbox` (12.4). `a` and `b` may be the same
     /// uid, for a conversation with yourself; their order does not matter.
-    pub fn direct(host: &str, mailbox: [u8; BOX_LEN], a: &Uid, b: &Uid) -> RisalaConversation {
+    pub fn direct(
+        host: ServerAddr,
+        mailbox: [u8; BOX_LEN],
+        a: &Uid,
+        b: &Uid,
+    ) -> RisalaConversation {
         RisalaConversation {
             kind: ConversationKind::Direct,
-            host: host.to_ascii_lowercase(),
+            host,
             mailbox,
             name: direct_name(a, b),
             topic: String::new(),
@@ -279,14 +271,14 @@ impl RisalaConversation {
     /// The extension of a new private room named `name`, whose only owner
     /// is `creator` (12.4, 6.2): pairwise, no guests, everyone sends.
     pub fn private_room(
-        host: &str,
+        host: ServerAddr,
         mailbox: [u8; BOX_LEN],
         name: &str,
         creator: &Uid,
     ) -> RisalaConversation {
         RisalaConversation {
             kind: ConversationKind::PrivateRoom,
-            host: host.to_ascii_lowercase(),
+            host,
             mailbox,
             name: name.to_owned(),
             topic: String::new(),
@@ -302,14 +294,14 @@ impl RisalaConversation {
     /// The extension of a new public room `room`, whose only owner is
     /// `creator` (12.4, 6.2): epochal, guests may write, everyone sends.
     pub fn public_room(
-        host: &str,
+        host: ServerAddr,
         mailbox: [u8; BOX_LEN],
         room: &Room,
         creator: &Uid,
     ) -> RisalaConversation {
         RisalaConversation {
             kind: ConversationKind::PublicRoom,
-            host: host.to_ascii_lowercase(),
+            host,
             mailbox,
             name: room.as_str().to_owned(),
             topic: String::new(),
@@ -327,7 +319,7 @@ impl RisalaConversation {
         let mut w = Writer::new();
         w.u8(1)
             .u8(kind_value(self.kind))
-            .vector(self.host.as_bytes())
+            .vector(self.host.to_string().as_bytes())
             .fixed(&self.mailbox)
             .vector(self.name.as_bytes())
             .vector(self.topic.as_bytes())
@@ -341,8 +333,9 @@ impl RisalaConversation {
     }
 
     /// Reads the extension's data: exactly one RisalaConversation of
-    /// version 1, with values its enums define, UTF-8 text and uids in
-    /// lower case. Whether it is well formed is [`check`](Self::check)'s.
+    /// version 1, with values its enums define, UTF-8 text, a host that is
+    /// a server address in its one written form (3.5) and uids in lower
+    /// case. Whether it is well formed is [`check`](Self::check)'s.
     pub fn decode(bytes: &[u8]) -> Result<RisalaConversation, DecodeError> {
         let mut r = Reader::new(bytes);
         if r.u8()? != 1 {
@@ -354,7 +347,12 @@ impl RisalaConversation {
             3 => ConversationKind::PublicRoom,
             _ => return Err(DecodeError("unknown conversation kind")),
         };
-        let host = utf8(r.vector()?, "host is not UTF-8")?;
+        // Parsing a server address is strict: only its one written form
+        // parses, so the bytes are that form (3.5, 12.4).
+        let host = std::str::from_utf8(r.vector()?)
+            .ok()
+            .and_then(|host| host.parse::<ServerAddr>().ok())
+            .ok_or(DecodeError("host is not a server in its one written form"))?;
         let mailbox = r.array::<BOX_LEN>()?;
         let name = utf8(r.vector()?, "name is not UTF-8")?;
         let topic = utf8(r.vector()?, "topic is not UTF-8")?;
@@ -396,9 +394,6 @@ impl RisalaConversation {
     /// Checks that the extension is well formed (12.4, 6.2).
     pub fn check(&self) -> Result<(), ConversationError> {
         let invalid = |why| Err(ConversationError::Invalid(why));
-        if !host_ok(&self.host) {
-            return invalid("host is not a lower-case server name");
-        }
         if self.topic.len() > MAX_TOPIC_LEN {
             return invalid("topic longer than 512 bytes");
         }
@@ -724,11 +719,19 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn server(s: &str) -> ServerAddr {
+        s.parse().unwrap()
+    }
+
     const BOX: [u8; 16] = [0xab; 16];
 
     fn room() -> RisalaConversation {
-        let mut conv =
-            RisalaConversation::private_room("chat.example.org", BOX, "Friends", &uid("o@x.org"));
+        let mut conv = RisalaConversation::private_room(
+            server("chat.example.org"),
+            BOX,
+            "Friends",
+            &uid("o@x.org"),
+        );
         conv.mods.push(uid("m@x.org"));
         conv
     }
@@ -737,23 +740,23 @@ mod tests {
     fn direct() {
         let a = uid("bob@example.net");
         let b = uid("alice@example.org");
-        let conv = RisalaConversation::direct("Chat.Example.org", BOX, &a, &b);
-        assert_eq!(conv.host, "chat.example.org");
+        let conv = RisalaConversation::direct(server("chat.example.org"), BOX, &a, &b);
+        assert_eq!(conv.host.to_string(), "chat.example.org");
         assert_eq!(conv.name, "alice@example.org bob@example.net");
         assert_eq!(
             conv,
-            RisalaConversation::direct("chat.example.org", BOX, &b, &a)
+            RisalaConversation::direct(server("chat.example.org"), BOX, &b, &a)
         );
         assert_eq!(conv.check(), Ok(()));
         assert_eq!(conv.direct_participants(), Some(vec![b.clone(), a.clone()]));
 
-        let me = RisalaConversation::direct("chat.example.org", BOX, &a, &a);
+        let me = RisalaConversation::direct(server("chat.example.org"), BOX, &a, &a);
         assert_eq!(me.name, "bob@example.net");
         assert_eq!(me.direct_participants(), Some(vec![a.clone()]));
         assert_eq!(me.check(), Ok(()));
 
         // A guest may be a participant (4.2, 5.8).
-        let guest = RisalaConversation::direct("chat.example.org", BOX, &uid("~sam"), &b);
+        let guest = RisalaConversation::direct(server("chat.example.org"), BOX, &uid("~sam"), &b);
         assert_eq!(guest.name, "alice@example.org ~sam");
         assert_eq!(guest.check(), Ok(()));
 
@@ -823,7 +826,7 @@ mod tests {
     fn well_formed_rooms() {
         assert_eq!(room().check(), Ok(()));
         let public = RisalaConversation::public_room(
-            "chat.example.org",
+            server("chat.example.org"),
             BOX,
             &"#general".parse().unwrap(),
             &uid("o@x.org"),
@@ -832,15 +835,13 @@ mod tests {
         assert_eq!(public.guests, GuestMode::Write);
 
         type Change = fn(&mut RisalaConversation);
-        let checks: [(Change, bool); 11] = [
+        let checks: [(Change, bool); 9] = [
             (|c| c.owners.clear(), true),
             (|c| c.mods.push("o@x.org".parse().unwrap()), true),
             (|c| c.bans.push("~sam".parse().unwrap()), true),
             (|c| c.mods.push("m@x.org".parse().unwrap()), true),
             (|c| c.topic = "x".repeat(513), true),
             (|c| c.topic = "x".repeat(512), false),
-            (|c| c.host = "Chat.example.org".into(), true),
-            (|c| c.host = String::new(), true),
             (|c| c.name = String::new(), true),
             (|c| c.name = "x".repeat(129), true),
             (|c| c.guests = GuestMode::Read, true),
@@ -856,6 +857,38 @@ mod tests {
         let mut bad = public.clone();
         bad.name = "general".into();
         assert!(bad.check().is_err());
+    }
+
+    /// `host` is a server address in its one written form (3.5, 12.4):
+    /// anything else does not decode.
+    #[test]
+    fn hosts() {
+        let a = uid("alice@example.org");
+        let conv = RisalaConversation::direct(server("chat.example.org"), BOX, &a, &a);
+        let bytes = conv.encode();
+        // The version, the kind, then the host's one-byte length and bytes.
+        assert_eq!(&bytes[2..19], b"\x10chat.example.org");
+        let with_host = |host: &str| {
+            let mut w = Writer::new();
+            w.u8(1).u8(1).vector(host.as_bytes());
+            let mut out = w.into_bytes();
+            out.extend_from_slice(&bytes[19..]);
+            RisalaConversation::decode(&out)
+        };
+        assert_eq!(with_host("chat.example.org"), Ok(conv.clone()));
+        let ported = with_host("chat.example.org:7000").unwrap();
+        assert_eq!(ported.host, server("chat.example.org:7000"));
+        assert_eq!(RisalaConversation::decode(&ported.encode()), Ok(ported));
+        for host in [
+            "Chat.example.org",
+            "chat.example.org:7472",
+            "chat.example.org.",
+            "192.0.2.1",
+            "",
+            "chat example.org",
+        ] {
+            assert!(with_host(host).is_err(), "{host:?}");
+        }
     }
 
     #[test]
@@ -905,7 +938,7 @@ mod tests {
         // owner; guests only in public rooms.
         for change in [
             (|c: &mut RisalaConversation| c.kind = ConversationKind::PublicRoom) as fn(&mut _),
-            |c| c.host = "other.org".into(),
+            |c| c.host = server("other.org"),
             |c| c.mailbox = [0; 16],
             |c| c.owners.clear(),
             |c| c.guests = GuestMode::Read,
@@ -918,7 +951,7 @@ mod tests {
         assert!(epochal.check_change(&old, &as_owner).is_err());
 
         let public = RisalaConversation::public_room(
-            "chat.example.org",
+            server("chat.example.org"),
             BOX,
             &"#general".parse().unwrap(),
             &owner,
@@ -961,7 +994,7 @@ mod tests {
         and_topic.topic = "x".into();
         assert!(old.check_change(&and_topic, &member).is_err());
         let public = RisalaConversation::public_room(
-            "chat.example.org",
+            server("chat.example.org"),
             BOX,
             &"#general".parse().unwrap(),
             &uid("o@x.org"),

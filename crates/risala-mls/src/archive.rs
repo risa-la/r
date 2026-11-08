@@ -47,7 +47,7 @@ use std::str::FromStr;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use risala_proto::names::{Domain, Identity, Uid};
+use risala_proto::names::{Identity, ServerAddr, Uid};
 use zeroize::Zeroizing;
 
 use crate::file::{self, BlobRef, FILE_KEY_LEN, FileError, FileKey, Label};
@@ -215,8 +215,9 @@ impl fmt::Debug for ArchivedMessage {
 pub struct ArchivedConversation {
     /// The MLS group id.
     pub group_id: Vec<u8>,
-    /// The server that holds its mailbox, in lower case.
-    pub host: Domain,
+    /// The server that holds its mailbox, as a server address in its one
+    /// written form (3.5), which may carry a port.
+    pub host: ServerAddr,
     /// Its mailbox (5.2).
     pub mailbox: [u8; BOX_LEN],
     /// Its messages, in seq order, oldest first.
@@ -606,7 +607,7 @@ const VECTOR_BOUND: u64 = 4;
 
 /// An upper bound of a conversation's encoding without its messages.
 fn opening_bound(c: &ArchivedConversation) -> u64 {
-    VECTOR_BOUND * 3 + c.group_id.len() as u64 + c.host.as_str().len() as u64 + BOX_LEN as u64
+    VECTOR_BOUND * 3 + c.group_id.len() as u64 + c.host.to_string().len() as u64 + BOX_LEN as u64
 }
 
 /// An upper bound of a message's encoding.
@@ -641,7 +642,7 @@ fn push_message(
 
 fn encode_conversation(w: &mut Writer, conversation: &ArchivedConversation) {
     w.vector(&conversation.group_id);
-    w.vector(conversation.host.as_str().as_bytes());
+    w.vector(conversation.host.to_string().as_bytes());
     w.bytes(&conversation.mailbox);
     w.nested(|w| {
         for message in &conversation.messages {
@@ -666,7 +667,12 @@ fn encode_conversation(w: &mut Writer, conversation: &ArchivedConversation) {
 
 fn decode_conversation(r: &mut Reader<'_>) -> Result<ArchivedConversation, ArchiveError> {
     let group_id = r.vector()?.to_vec();
-    let host = canonical::<Domain>(r.vector()?, "host")?;
+    // Parsing a server address is strict: only its one written form
+    // parses (3.5).
+    let host = std::str::from_utf8(r.vector()?)
+        .ok()
+        .and_then(|host| host.parse::<ServerAddr>().ok())
+        .ok_or(ArchiveError::Malformed("host"))?;
     let mailbox = r.array::<BOX_LEN>()?;
     let mut messages = Vec::new();
     let mut list = Reader(r.vector()?);
@@ -924,6 +930,11 @@ mod tests {
             let bytes = archive.encode();
             assert_eq!(HistoryArchive::decode(&bytes), Ok(archive.clone()));
         }
+        // A server on a port other than 7472 (3.5, 12.13).
+        archive.conversations[1].host = "example.org:7000".parse().unwrap();
+        let bytes = archive.encode();
+        assert!(bytes.windows(17).any(|w| w == b"\x10example.org:7000"));
+        assert_eq!(HistoryArchive::decode(&bytes), Ok(archive.clone()));
     }
 
     #[test]
@@ -1010,6 +1021,14 @@ mod tests {
         // An upper-case host or sender.
         let mut bad = b.clone();
         bad[conv + 34] = b'E';
+        assert_eq!(
+            HistoryArchive::decode(&bad),
+            Err(ArchiveError::Malformed("host"))
+        );
+        // A host that is not a server address: `example:org`.
+        let mut bad = b.clone();
+        assert_eq!(bad[conv + 41], b'.');
+        bad[conv + 41] = b':';
         assert_eq!(
             HistoryArchive::decode(&bad),
             Err(ArchiveError::Malformed("host"))

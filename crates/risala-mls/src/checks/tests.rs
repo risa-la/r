@@ -43,10 +43,13 @@ fn leaf_of_device(index: u32, who: &str, device: u8, updated: u64) -> LeafView {
 fn room(kind: ConversationKind) -> RisalaConversation {
     let owner = uid("o@x.org");
     let mut conv = match kind {
-        ConversationKind::PublicRoom => {
-            RisalaConversation::public_room("h.org", [0; 16], &"#r".parse().unwrap(), &owner)
-        }
-        _ => RisalaConversation::private_room("h.org", [0; 16], "R", &owner),
+        ConversationKind::PublicRoom => RisalaConversation::public_room(
+            "h.org".parse().unwrap(),
+            [0; 16],
+            &"#r".parse().unwrap(),
+            &owner,
+        ),
+        _ => RisalaConversation::private_room("h.org".parse().unwrap(), [0; 16], "R", &owner),
     };
     conv.mods.push(uid("m@x.org"));
     conv
@@ -281,7 +284,12 @@ fn streaks() {
         Err(CommitError::Streak)
     );
     // No limit in the conversation with yourself.
-    let me = RisalaConversation::direct("h.org", [0; 16], &uid("p@x.org"), &uid("p@x.org"));
+    let me = RisalaConversation::direct(
+        "h.org".parse().unwrap(),
+        [0; 16],
+        &uid("p@x.org"),
+        &uid("p@x.org"),
+    );
     let mut mine = view(
         &me,
         vec![leaf(2, "p@x.org", T), leaf_of_device(3, "p@x.org", 3, T)],
@@ -343,7 +351,12 @@ fn removes_and_kicks() {
     assert!(verdict.authority);
     // In a direct conversation, nobody is kicked: removing the other
     // participant's leaves is for a check.
-    let direct = RisalaConversation::direct("h.org", [0; 16], &uid("o@x.org"), &uid("p@x.org"));
+    let direct = RisalaConversation::direct(
+        "h.org".parse().unwrap(),
+        [0; 16],
+        &uid("o@x.org"),
+        &uid("p@x.org"),
+    );
     let mut gd = group(&direct);
     gd.leaves.remove(1);
     let verdict = check(&gd, &commit(&gd, 0, remove(&[2, 3]))).unwrap();
@@ -627,7 +640,7 @@ fn one_leaf_per_device() {
         Err(CommitError::SameDevice)
     );
     let expect = JoinExpectation {
-        host: "h.org".into(),
+        host: "h.org".parse().unwrap(),
         own_uid: uid("p@x.org"),
         public_room: None,
     };
@@ -876,7 +889,12 @@ fn adds() {
     let gb = group(&banned);
     assert_eq!(check(&gb, &commit(&gb, 0, invite())), Err(CommitError::Add));
     // In a direct conversation, either participant's devices, by anyone.
-    let direct = RisalaConversation::direct("h.org", [0; 16], &uid("o@x.org"), &uid("p@x.org"));
+    let direct = RisalaConversation::direct(
+        "h.org".parse().unwrap(),
+        [0; 16],
+        &uid("o@x.org"),
+        &uid("p@x.org"),
+    );
     let mut gd = group(&direct);
     gd.leaves.remove(1);
     assert!(
@@ -1202,7 +1220,12 @@ fn limits() {
     let g = crowd(&public, 1001, 1);
     assert!(check(&g, &commit(&g, 0, vec![])).is_ok());
     // A direct conversation holds at most 128 leaves (12.7).
-    let direct = RisalaConversation::direct("h.org", [0; 16], &uid("o@x.org"), &uid("u1@x.org"));
+    let direct = RisalaConversation::direct(
+        "h.org".parse().unwrap(),
+        [0; 16],
+        &uid("o@x.org"),
+        &uid("u1@x.org"),
+    );
     let g = crowd(&direct, 2, 127);
     assert_eq!(g.leaves.len(), 128);
     assert!(check(&g, &commit(&g, 0, vec![])).is_ok());
@@ -1217,14 +1240,14 @@ fn limits() {
 fn joining() {
     let conv = room(ConversationKind::PrivateRoom);
     let expect = JoinExpectation {
-        host: "h.org".into(),
+        host: "h.org".parse().unwrap(),
         own_uid: uid("p@x.org"),
         public_room: None,
     };
     let g = group(&conv);
     assert_eq!(check_join(&g, &expect), Ok(()));
     let mut other_host = expect.clone();
-    other_host.host = "x.org".into();
+    other_host.host = "x.org".parse().unwrap();
     assert_eq!(
         check_join(&g, &other_host),
         Err(JoinError::WrongConversation)
@@ -1256,7 +1279,12 @@ fn joining() {
     assert_eq!(check_join(&big, &expect), Err(JoinError::TooLarge));
 
     // A guest's report conversation: the guest has exactly one leaf.
-    let report = RisalaConversation::direct("h.org", [0; 16], &uid("~sam"), &uid("p@x.org"));
+    let report = RisalaConversation::direct(
+        "h.org".parse().unwrap(),
+        [0; 16],
+        &uid("~sam"),
+        &uid("p@x.org"),
+    );
     let mut r = view(&report, vec![leaf(0, "~sam", T), leaf(1, "p@x.org", T)]);
     r.leaves[0].profile = None;
     assert_eq!(check_join(&r, &expect), Ok(()));
@@ -1268,7 +1296,12 @@ fn joining() {
 /// profile to check (12.7).
 #[test]
 fn report_conversations() {
-    let report = RisalaConversation::direct("h.org", [0; 16], &uid("~sam"), &uid("p@x.org"));
+    let report = RisalaConversation::direct(
+        "h.org".parse().unwrap(),
+        [0; 16],
+        &uid("~sam"),
+        &uid("p@x.org"),
+    );
     let mut g = view(&report, vec![leaf(0, "~sam", T), leaf(1, "p@x.org", T)]);
     g.leaves[0].profile = None;
     let mut c = commit(&g, 0, vec![]);

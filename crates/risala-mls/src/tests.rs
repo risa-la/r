@@ -36,7 +36,10 @@ use crate::token::SendToken;
 use crate::wire::{to_bytes, tree_to_bytes};
 use crate::{Provider, RisalaCrypto};
 
-const HOST: &str = "chat.example.org";
+/// The server of the tests' conversations.
+fn host() -> risala_proto::names::ServerAddr {
+    "chat.example.org".parse().unwrap()
+}
 const BOX: [u8; 16] = [0x42; 16];
 const HOUR: u64 = 60 * 60 * 1000;
 
@@ -135,7 +138,7 @@ impl Device {
 
     fn expect(&self) -> JoinExpectation {
         JoinExpectation {
-            host: HOST.into(),
+            host: host(),
             own_uid: self.uid.clone(),
             public_room: None,
         }
@@ -516,7 +519,7 @@ fn direct_conversation() {
     let bob = Device::new("bob@example.org", 2);
     let mallory = Device::new("mallory@example.org", 3);
     let facts = Facts::with(&[&alice, &alice2, &bob, &mallory]);
-    let conv = RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid);
+    let conv = RisalaConversation::direct(host(), BOX, &alice.uid, &bob.uid);
     let mut a = alice.create(&conv);
     assert_eq!(a.group_id().as_slice().len(), 32);
     assert_eq!(conversation(&a), Some(conv.clone()));
@@ -649,7 +652,12 @@ fn next_token_and_updated() {
     let alice = Device::new("alice@example.org", 1);
     let bob = Device::new("bob@example.org", 2);
     let facts = Facts::with(&[&alice, &bob]);
-    let mut a = alice.create(&RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid));
+    let mut a = alice.create(&RisalaConversation::direct(
+        host(),
+        BOX,
+        &alice.uid,
+        &bob.uid,
+    ));
     let out = alice.commit(&mut a, add(vec![bob.key_package(false)]));
     alice.merge(&mut a, &out);
     let mut b = bob.join(out.welcome.as_ref().unwrap());
@@ -700,7 +708,12 @@ fn streaks() {
     let alice = Device::new("alice@example.org", 1);
     let bob = Device::new("bob@example.org", 2);
     let facts = Facts::with(&[&alice, &bob]);
-    let mut a = alice.create(&RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid));
+    let mut a = alice.create(&RisalaConversation::direct(
+        host(),
+        BOX,
+        &alice.uid,
+        &bob.uid,
+    ));
     let t0 = now_ms();
     let out = alice.commit_at(&mut a, add(vec![bob.key_package(false)]), t0);
     alice.merge_at(&mut a, &out, t0);
@@ -747,7 +760,7 @@ fn welcome_checks() {
     let alice = Device::new("alice@example.org", 1);
     let bob = Device::new("bob@example.org", 2);
     let carol = Device::new("carol@example.org", 3);
-    let conv = RisalaConversation::direct(HOST, BOX, &alice.uid, &carol.uid);
+    let conv = RisalaConversation::direct(host(), BOX, &alice.uid, &carol.uid);
     let mut a = alice.create(&conv);
     // Alice (wrongly) adds Bob to her conversation with Carol: Bob refuses
     // to join, since it is not his conversation (12.7).
@@ -759,7 +772,8 @@ fn welcome_checks() {
     ));
 
     // A Welcome for a group on another server is refused too.
-    let conv = RisalaConversation::direct("other.example", BOX, &alice.uid, &bob.uid);
+    let conv =
+        RisalaConversation::direct("other.example".parse().unwrap(), BOX, &alice.uid, &bob.uid);
     let mut a = alice.create(&conv);
     let out = alice.commit(&mut a, add(vec![bob.key_package(false)]));
     let err = join_by_welcome(&bob.provider, &out.welcome.unwrap(), None, &bob.expect());
@@ -778,7 +792,7 @@ fn sealed_welcomes() {
     let alice = Device::new("alice@example.org", 1);
     let bob = Device::new("bob@example.org", 2);
     let bob2 = Device::new("bob@example.org", 12);
-    let conv = RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid);
+    let conv = RisalaConversation::direct(host(), BOX, &alice.uid, &bob.uid);
     let mut a = alice.create(&conv);
     let out = alice.commit(
         &mut a,
@@ -830,7 +844,7 @@ fn private_room_at(t: u64) -> Room3 {
     let mia = Device::new("mia@example.org", 2);
     let pat = Device::new("pat@example.org", 3);
     let facts = Facts::with(&[&owen, &mia, &pat]);
-    let mut conv = RisalaConversation::private_room(HOST, BOX, "Friends", &owen.uid);
+    let mut conv = RisalaConversation::private_room(host(), BOX, "Friends", &owen.uid);
     conv.mods.push(mia.uid.clone());
     let mut o = owen.create_at(&conv, t);
     let out = owen.commit_at(
@@ -1178,7 +1192,7 @@ fn lifetimes_at_the_post() {
     let week = 7 * 24 * 3600;
     let then = now_ms() - 2 * week * 1000;
     let mut a = alice.create_at(
-        &RisalaConversation::private_room(HOST, BOX, "Room", &alice.uid),
+        &RisalaConversation::private_room(host(), BOX, "Room", &alice.uid),
         then,
     );
     let out = alice.commit_at(&mut a, add(vec![bob.key_package_at(then)]), then);
@@ -1562,10 +1576,20 @@ fn last_resort_key_packages() {
     assert!(updated(&bob.key_package(false)) >= before);
 
     // Two groups add Bob with the same last-resort KeyPackage.
-    let mut a = alice.create(&RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid));
+    let mut a = alice.create(&RisalaConversation::direct(
+        host(),
+        BOX,
+        &alice.uid,
+        &bob.uid,
+    ));
     let out_a = alice.commit(&mut a, add(vec![last.clone()]));
     alice.merge(&mut a, &out_a);
-    let mut c = carol.create(&RisalaConversation::direct(HOST, BOX, &carol.uid, &bob.uid));
+    let mut c = carol.create(&RisalaConversation::direct(
+        host(),
+        BOX,
+        &carol.uid,
+        &bob.uid,
+    ));
     let out_c = carol.commit(&mut c, add(vec![last]));
     carol.merge(&mut c, &out_c);
 
@@ -1640,7 +1664,7 @@ fn last_resort_key_packages() {
 fn public_room(guests: GuestMode) -> (Device, MlsGroup, RisalaConversation) {
     let owen = Device::new("owen@example.org", 1);
     let room: Room = "#general".parse().unwrap();
-    let mut conv = RisalaConversation::public_room(HOST, BOX, &room, &owen.uid);
+    let mut conv = RisalaConversation::public_room(host(), BOX, &room, &owen.uid);
     conv.guests = guests;
     let o = owen.create(&conv);
     (owen, o, conv)
@@ -1659,7 +1683,7 @@ fn public_state(device: &Device, group: &MlsGroup) -> (Vec<u8>, Vec<u8>) {
 
 fn public_expect(device: &Device) -> JoinExpectation {
     JoinExpectation {
-        host: HOST.into(),
+        host: host(),
         own_uid: device.uid.clone(),
         public_room: Some(("#general".parse().unwrap(), BOX)),
     }
@@ -1905,7 +1929,12 @@ fn public_room_welcome_trees() {
     // the server is refused.
     let alice = Device::new("alice@example.org", 1);
     let bob = Device::new("bob@example.org", 2);
-    let mut a = alice.create(&RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid));
+    let mut a = alice.create(&RisalaConversation::direct(
+        host(),
+        BOX,
+        &alice.uid,
+        &bob.uid,
+    ));
     let out = alice.commit(&mut a, add(vec![bob.key_package(false)]));
     alice.merge(&mut a, &out);
     let tree = tree_to_bytes(&a.export_ratchet_tree());
@@ -2288,7 +2317,7 @@ fn sqlite_storage() {
     let crypto = Arc::new(RisalaCrypto::new().unwrap());
     let mut db = rusqlite::Connection::open_in_memory().unwrap();
     db.execute_batch(SCHEMA).unwrap();
-    let conv = RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid);
+    let conv = RisalaConversation::direct(host(), BOX, &alice.uid, &bob.uid);
 
     // A KeyPackage made in SQLite, used by a Welcome later.
     let kp = {

@@ -30,7 +30,7 @@ use openmls::prelude::{
     KeyPackage, LeafNode, LeafNodeIndex, Proposal, ProposalOrRefType, PublicGroup, Sender,
 };
 use openmls::treesync::LeafNodeSource;
-use risala_proto::names::{Room, Uid};
+use risala_proto::names::{Room, ServerAddr, Uid};
 use serde::{Deserialize, Serialize};
 
 use crate::conversation::{
@@ -511,8 +511,8 @@ pub enum JoinError {
 /// What the joining device expects of a group (12.7).
 #[derive(Debug, Clone)]
 pub struct JoinExpectation {
-    /// The server the device is joining on.
-    pub host: String,
+    /// The server the device is joining on, as a server address (3.5).
+    pub host: ServerAddr,
     /// The device's own uid.
     pub own_uid: Uid,
     /// For a public room joined by name, its name and box.
@@ -523,7 +523,7 @@ pub struct JoinExpectation {
 /// commit (12.7). Leaves it cannot confirm yet are allowed.
 pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), JoinError> {
     let conversation = group.conversation.clone()?;
-    if conversation.host != expect.host.to_ascii_lowercase() {
+    if conversation.host != expect.host {
         return Err(JoinError::WrongConversation);
     }
     if let Some((room, mailbox)) = &expect.public_room
