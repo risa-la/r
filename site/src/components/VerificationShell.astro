@@ -1,0 +1,24 @@
+---
+// The frame of a verification page: the site layout, the page's styles, and
+// a line for browsers without JavaScript. The page itself is a React app
+// that reads /verification-data/ in the browser.
+import Base from "../layouts/Base.astro";
+import "../verification/verification.css";
+
+interface Props {
+  title: string;
+  description?: string;
+}
+const { title, description = "How the risala code is checked: tests, fuzzing, Kani proofs and a TLA+ model, line by line." } = Astro.props;
+---
+
+<Base title={title} description={description}>
+  <div class="v-page">
+    <noscript>
+      <p class="panel v-noscript">
+        this page is drawn by javascript from the verification results; turn javascript on to see it.
+      </p>
+    </noscript>
+    <slot />
+  </div>
+</Base>

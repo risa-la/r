@@ -1,0 +1,17 @@
+---
+// One page per source file the verification data lists. Without data
+// (assemble.ts has not run) there are none.
+import VerificationShell from "../../../components/VerificationShell.astro";
+import FileView from "../../../verification/FileView";
+import { readSummary } from "../../../verification/build";
+
+export function getStaticPaths() {
+  return (readSummary()?.files ?? []).map((f) => ({ params: { path: f.path }, props: { path: f.path } }));
+}
+
+const { path } = Astro.props;
+---
+
+<VerificationShell title={path}>
+  <FileView client:only="react" path={path} />
+</VerificationShell>

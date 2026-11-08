@@ -4,6 +4,7 @@ import Breadcrumb from "../components/Breadcrumb.astro";
 import AppMock from "../components/AppMock.astro";
 import Glyph from "../components/Glyph.astro";
 import { REPO_URL } from "../docs";
+import { readSummary } from "../verification/build";
 import shieldStar from "@phosphor-icons/core/assets/bold/shield-star-bold.svg?raw";
 import swap from "@phosphor-icons/core/assets/bold/swap-bold.svg?raw";
 import clockCountdown from "@phosphor-icons/core/assets/bold/clock-countdown-bold.svg?raw";
@@ -28,6 +29,41 @@ const stores = [
   { logo: appleLogo, store: "App Store", platforms: "iPhone, iPad and Mac" },
   { logo: googlePlayLogo, store: "Google Play", platforms: "Android" },
   { logo: linuxLogo, store: "Linux", platforms: "desktop" },
+];
+
+// The verification numbers, read when the site is built. Without results
+// the panel says so rather than showing zeros.
+const summary = readSummary();
+const share = (t?: { covered: number; total: number }) =>
+  t && t.total ? `${(Math.floor((1000 * t.covered) / t.total) / 10).toFixed(1)}%` : undefined;
+const tests = summary ? [summary.tests.unit, summary.tests.integration, summary.tests.swift].filter((t) => t !== null) : [];
+const fuzzSeconds = summary?.fuzz.reduce((a, t) => a + (t.seconds ?? 0), 0) ?? 0;
+const tlaDone = summary?.tla.runs.filter((r) => r.result !== "none") ?? [];
+const stats: { value?: string; label: string; detail?: string }[] = [
+  {
+    value: summary?.has.unit || summary?.has.integration ? share(summary.totals.any) : undefined,
+    label: "lines reached",
+    detail: summary?.totals.any.total ? `by tests, fuzzing or proofs, of ${summary.totals.any.total.toLocaleString("en")}` : undefined,
+  },
+  {
+    value: tests.length ? `${tests.reduce((a, t) => a + (t.passed ?? 0), 0).toLocaleString("en")}` : undefined,
+    label: "tests passed",
+    detail: tests.length ? `${tests.reduce((a, t) => a + (t.failed ?? 0), 0)} failed` : undefined,
+  },
+  {
+    value: summary?.has.kani ? `${summary.kani.filter((p) => p.status === "success").length}/${summary.kani.length}` : undefined,
+    label: "kani proofs pass",
+  },
+  {
+    value: summary?.has.fuzz ? `${(fuzzSeconds / 3600).toFixed(fuzzSeconds < 36000 ? 1 : 0)}h` : undefined,
+    label: "fuzzed",
+    detail: summary?.has.fuzz ? `over ${summary.fuzz.length} targets` : undefined,
+  },
+  {
+    value: summary?.has.tla ? tlaDone.reduce((a, r) => a + (r.distinct ?? 0), 0).toLocaleString("en") : undefined,
+    label: "tla+ states checked",
+    detail: summary?.has.tla ? `${tlaDone.filter((r) => r.asExpected).length} of ${tlaDone.length} runs as expected` : undefined,
+  },
 ];
 ---
 
@@ -64,6 +100,27 @@ const stores = [
           ))
         }
       </ul>
+    </section>
+
+    <section class="panel verify">
+      <div class="panel-head"><Breadcrumb parts={[{ label: "verification", href: "/verification/" }]} /></div>
+      <div class="panel-body">
+        <dl class="stats">
+          {
+            stats.map((s) => (
+              <div>
+                <dt class="label">{s.label}</dt>
+                <dd class:list={["value", { none: !s.value }]}>{s.value ?? "-"}</dd>
+                <dd class="label">{s.value ? s.detail : "no results yet"}</dd>
+              </div>
+            ))
+          }
+        </dl>
+        <p class="verify-foot">
+          {summary?.commit ? <span>for commit {summary.commit.slice(0, 10)}. </span> : <span>no results for this commit yet. </span>}
+          <a href="/verification/">see how the code is checked, line by line</a>
+        </p>
+      </div>
     </section>
 
     <section class="panel">
@@ -234,5 +291,33 @@ const stores = [
     .actions {
       justify-content: center;
     }
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: var(--inline);
+    margin: 0;
+  }
+  .stats div {
+    padding: var(--row-padding);
+    border: 1px solid var(--rule);
+    border-radius: var(--row-radius);
+  }
+  .stats dd {
+    margin: 0;
+  }
+  .stats .value {
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .stats .value.none {
+    color: var(--text-tertiary);
+  }
+  .verify-foot {
+    margin-top: 12px;
+    max-width: none;
+    font-size: 12px;
   }
 </style>

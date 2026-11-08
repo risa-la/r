@@ -3,20 +3,29 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "verification-data": "node ../verification/assemble.ts",
+    "predev": "npm run verification-data",
     "dev": "astro dev",
+    "prebuild": "npm run verification-data",
     "build": "astro build",
     "preview": "astro preview",
     "check": "astro check"
   },
   "dependencies": {
     "@astrojs/markdown-satteri": "^0.4.7",
+    "@astrojs/react": "^7.1.4",
     "@fontsource/jetbrains-mono": "^5.3.0",
     "@phosphor-icons/core": "^2.1.1",
-    "astro": "^7.4.7"
+    "astro": "^7.4.7",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "shiki": "^4.6.0"
   },
   "devDependencies": {
     "@astrojs/check": "^0.9.12",
     "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "typescript": "^6.0.3"
   }
 }
