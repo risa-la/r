@@ -1256,6 +1256,62 @@ Open:
       transaction that removes the key. Guests keep the normal line
       limits once signed in.
 
+    How librisala builds these (implementation only):
+    - **Keys belong to an identity.** The cache keeps device keys by
+      identity and key id (cache version 15), and every key is checked
+      again after the upgrade. A key counts as listed only in its own
+      identity's key file.
+    - **Joining a room.** INVITE events are kept with the members (version
+      16). A leaf passes if its identity is a member or invitee now, or its
+      membership changed after the seq the device joins at, since a later
+      commit, which the device checks, then removes it. An invitee's
+      Welcome waits on the server until the room is joined and caught up,
+      as only then are its events here; a room is joined by external
+      commit only once caught up too.
+    - **Commits.** The checks of 12.6 run on the commit as the group's
+      public part stages it, before MLS processes it with the secrets. A
+      commit that skips an epoch makes the group broken only if events
+      between are missing (expired); otherwise the server left a commit
+      out, and the group is rejected (the narrowest reading of "do not
+      rejoin"). A rejected group stays rejected when the conversation is
+      discarded for a new id, refuses Welcomes and INIT, and only
+      `Conversation::reset_encryption`, on the user's word, forgets it.
+    - **Every leaf of a group joined by external commit** gets the key
+      check, as a Welcome's do.
+    - **Own devices.** "Already there when the device joined" is the
+      devices of the conversation with yourself the first time the device
+      notes its leaves, right after it joins. Declining a device makes
+      each conversation's duties remove its leaves; `confirm_device`
+      returns its key file line (`DeclinedDevice`) to offer removing it.
+      A recovery key to send, and one another device offered, are kept in
+      the cache (version 17). "The key file lists it now" is the last
+      fetch, which must be newer than the offer; otherwise the key file is
+      fetched first. The user's answer is
+      `Account::accept_recovery_key` (CLI `recovery accept`).
+    - **24 hours.** The commit that waits, and since when, is kept in the
+      cache (version 18), by the engine's clock. Key files a commit waits
+      for are asked for again every five minutes on the same connection.
+    - **The recovery key's connection.** `SyncEngine::issue`, through which
+      every command goes, drops KEYPKG ADD, INIT, COMMIT and ENC on it;
+      `recover_identity` uses a connection type that sends only KEY.
+    - **A new recovery key in two steps.** `create_recovery_key` only adds
+      the new key and returns it; the app shows it, then
+      `finish_recovery_key` keeps it, backs up every history key under it,
+      and only then sends BACKUP DEL, backs up again and removes the
+      previous recovery key. BACKUP DEL cannot spare one key id's blobs,
+      hence backing up twice. The other devices get the new key last, so
+      the BACKUP DEL does not take theirs.
+    - **Recovery.** `recover_identity` waits for the new device to join
+      every encrypted conversation SYNC lists (up to five times for the
+      connection to settle), restores the backups, then removes the lost
+      keys, and keeps them if a conversation could not be joined
+      (`Recovered::not_joined`). The CLI's `recover` then makes a new
+      recovery key. The end-to-end test cannot force the old order to
+      fail: another member removes the old leaf only when it next fetches
+      the key file.
+    - **Edits and reactions** count toward a verified message only if
+      they are verified too.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
