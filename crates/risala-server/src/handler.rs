@@ -263,10 +263,10 @@ impl ConnHandle {
         self.state.drained.notify_waiters();
     }
 
-    /// Records that the connection has signed in, as a guest or an
-    /// identity. From the next line on, the network layer takes lines as
-    /// long as 2.3 allows a signed-in client; before, every line has the
-    /// normal limit.
+    /// Records that the connection has signed in as an identity. From the
+    /// next line on, the network layer takes lines as long as 2.3 allows a
+    /// signed-in client; before, and for guests, which send none of the
+    /// lines that may be long, every line has the normal limit.
     pub fn set_signed_in(&self) {
         self.state.signed_in.store(true, Ordering::SeqCst);
     }

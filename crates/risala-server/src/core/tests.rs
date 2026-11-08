@@ -398,6 +398,21 @@ async fn guest_signs_in_once() {
     }
 }
 
+/// Long lines are for identities (2.3): guests send nothing that needs
+/// them, so they keep the normal limits once signed in.
+#[tokio::test]
+async fn only_identities_get_long_lines() {
+    let mut h = Harness::new();
+    let signed_in = |h: &Harness, c: &Client| h.hub.inner.reg().conns[&c.id].handle.is_signed_in();
+    let c = h.connect();
+    assert!(!signed_in(&h, &c));
+    let g = h.guest("sam").await;
+    assert!(!signed_in(&h, &g));
+    let a = h.signed_in_as("alice@example.org");
+    assert!(signed_in(&h, &a));
+    drop(c);
+}
+
 #[tokio::test]
 async fn guest_names_are_unique_while_a_session_lasts() {
     let mut h = Harness::new();
