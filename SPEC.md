@@ -517,7 +517,7 @@ S: @ref=7 OK id=k3f9q2 more=1
 | `stale` | The conversation's group is not in the state the command needs. Apply the newer commits, or commit pending removals, and try again (12.5, 12.6) |
 | `invalid` | MLS data or a franking commitment did not verify, or a required franking commitment or key is missing (5.8, Section 12) |
 | `rate-limited` | Too many requests. The `retry` tag says when to try again |
-| `unavailable` | The server could not get the identity's key file, so it could not check the signature. Try again later (4.5) |
+| `unavailable` | The server could not get an identity's key file, so it could not check a signature or which keys the identity has. Try again later (4.5, 12.4) |
 | `internal` | Something went wrong on the server |
 
 A name, room, id, text, URL or tag value that follows its grammar except
@@ -2515,7 +2515,10 @@ Credentials:
 Every group carries a **conversation extension** in its group context,
 of type `0xF2A1` (Section 15). Leaves list this type, and the
 `last_resort` extension type `0x000A` [MLS-EXT], in their capabilities,
-and the group lists `0xF2A1` in its `required_capabilities`. It
+and the group's `required_capabilities` extension lists exactly the
+extension type `0xF2A1`, no proposal types, and the credential type
+`basic`. The group context has exactly these two extensions,
+`required_capabilities` first. The conversation extension
 ties the group to one conversation, and holds the room's `history`
 (12.9) and `send` (6.2) settings:
 
@@ -2606,7 +2609,9 @@ KEYPKG GET <uid>
   device of `<uid>` that has a KeyPackage, then `OK`. It leaves out the
   device that asks, and devices whose keys are no longer in the
   identity's key file. A uid the server does not know gets
-  `ERR not-found`.
+  `ERR not-found`. If the server cannot fetch the key file (4.4) and
+  has no cached copy still valid, it replies `ERR unavailable` rather
+  than hand out KeyPackages of keys that may have been removed.
 
 The server hands out each ordinary KeyPackage once, then deletes it. A
 device MAY also upload one KeyPackage with the `last_resort` extension
@@ -2945,7 +2950,9 @@ the conversation (an invitee, once it has joined the room), and applies
 them.
 
 Once it has joined, the device deletes the Welcome with
-`WELCOME DEL <id>`, which replies `OK`. It SHOULD NOT delete the Welcome,
+`WELCOME DEL <id>`, which replies `OK`. It replies `OK` too for an id
+that is not pending for the device, so that a device whose first `OK`
+was lost can send it again. It SHOULD NOT delete the Welcome,
 or the private keys of the KeyPackage it was made for, before then, so
 that it can try again if joining is cut short, for example by a crash.
 It also deletes a Welcome whose group fails the checks of 12.6.
@@ -3227,7 +3234,9 @@ BACKUP DEL [<id>]
 - **`BACKUP ADD`** stores the blob for epoch `<epoch>` of conversation
   `<id>`, and replies `OK`. If the server already has a blob for that
   epoch with the same key id, it keeps the one it has and still replies
-  `OK`.
+  `OK`. A server MAY limit how many key ids it keeps blobs for in one
+  epoch, since a page of BACKUP GET always holds a whole epoch, and
+  refuse more with `ERR forbidden`. It MUST allow at least 4.
 - **`BACKUP GET`** sends one `BACKUP <id> <epoch> <blob>` line per stored
   blob of conversation `<id>`, oldest epoch first, then
   `OK more=<0 or 1>`:

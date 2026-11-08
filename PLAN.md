@@ -963,6 +963,30 @@ Open:
       ML-DSA keys themselves, so they only wrap the stored secrets. The
       CLI keeps the database key in its private state directory.
 
+43. **Found while building M5a's foundation and server storage** (3.7,
+    12.2, 12.4, 12.7, 12.10), decided with the user on 2026-11-08:
+    - **`required_capabilities`** lists exactly the conversation
+      extension `0xF2A1`, no proposal types and the `basic` credential
+      type, as the spike did. The group context has exactly that and
+      the conversation extension, in that order, since the server
+      compares the list exactly.
+    - **KEYPKG GET without a key file** replies `ERR unavailable`
+      rather than hand out KeyPackages of keys that may have been
+      removed. `unavailable` now covers that too.
+    - **Backups per epoch.** A server MAY limit how many key ids it
+      keeps blobs for in one epoch (`ERR forbidden`), since a BACKUP GET
+      page holds whole epochs. It must allow at least 4. risalad allows
+      8.
+    - **WELCOME DEL** of an id that is not pending replies `OK`, so a
+      device whose `OK` was lost can retry.
+
+    Implementation choices recorded without a spec change: risalad
+    keeps an identity's backups after it leaves a conversation or the
+    room is dropped, until BACKUP DEL or UNREGISTER. It allows 100
+    KeyPackages per device and 600 KEYPKG GETs per identity an hour, and
+    deletes ended KeyPackages hourly. Uploading a KeyPackage it already
+    has stores nothing and replies `OK`.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
