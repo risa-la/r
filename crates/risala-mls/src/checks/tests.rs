@@ -89,7 +89,6 @@ fn commit(group: &GroupView, by: u32, proposals: Vec<ProposalView>) -> CommitVie
         proposals,
         path_leaf: Some(path),
         new_conversation: group.conversation.clone(),
-        pending_self_removes: Vec::new(),
     }
 }
 
@@ -313,10 +312,13 @@ fn removes_and_kicks() {
     assert!(verdict.authority, "removes its identity's other leaf");
     let verdict = check(&g, &commit(&g, 0, remove(&[1]))).unwrap();
     assert!(verdict.authority, "an owner kicks a moderator");
-    let mut pending = commit(&g, 2, remove(&[0]));
-    assert_eq!(check(&g, &pending), Err(CommitError::Remove));
-    pending.pending_self_removes.push(idx(0));
-    assert!(check(&g, &pending).is_ok());
+    // Only a SelfRemove that the commit applies counts (12.7): a Remove by
+    // value of a leaf whose SelfRemove is merely pending does not.
+    assert_eq!(
+        check(&g, &commit(&g, 2, remove(&[0]))),
+        Err(CommitError::Remove)
+    );
+    assert!(check(&g, &commit(&g, 2, vec![ProposalView::SelfRemove(idx(0))])).is_ok());
     // A kick removes every leaf of the identity.
     assert!(check(&g, &commit(&g, 1, remove(&[2, 3]))).is_ok());
     assert_eq!(
@@ -343,11 +345,13 @@ fn removes_and_kicks() {
         ],
     );
     assert!(matches!(check(&g, &twice), Err(CommitError::Proposal(_))));
-    // Outside public rooms, any other removal is for a check (12.7): an
-    // authority commit.
-    let private = group(&room(ConversationKind::PrivateRoom));
-    let verdict = check(&private, &commit(&private, 2, remove(&[0]))).unwrap();
-    assert_eq!(verdict.check_removals, vec![idx(0)]);
+    // Outside public rooms, any other removal of a plain member's leaf is
+    // for a check (12.7): an authority commit.
+    let mut private = group(&room(ConversationKind::PrivateRoom));
+    private.leaves.push(leaf(4, "q@x.org", T));
+    private.leaves.push(leaf(5, "q@x.org", T));
+    let verdict = check(&private, &commit(&private, 2, remove(&[4]))).unwrap();
+    assert_eq!(verdict.check_removals, vec![idx(4)]);
     assert!(verdict.authority);
     // In a direct conversation, nobody is kicked: removing the other
     // participant's leaves is for a check.
@@ -366,22 +370,23 @@ fn removes_and_kicks() {
 /// A commit removes for a check the leaves of one identity at most (12.7).
 #[test]
 fn check_removals_of_one_identity() {
-    let g = group(&room(ConversationKind::PrivateRoom));
-    let mut g = g;
+    let mut g = group(&room(ConversationKind::PrivateRoom));
     g.leaves.push(leaf(4, "q@x.org", T));
+    g.leaves.push(leaf(5, "r@x.org", T));
+    g.leaves.push(leaf(6, "r@x.org", T));
     // Two of p's leaves: fine.
     assert!(check(&g, &commit(&g, 4, remove(&[2, 3]))).is_ok());
-    // o's and m's: not by a plain member.
+    // One of p's and one of r's: two identities, not in one commit.
     assert_eq!(
-        check(&g, &commit(&g, 4, remove(&[0, 1]))),
+        check(&g, &commit(&g, 4, remove(&[2, 5]))),
         Err(CommitError::CheckRemovals)
     );
-    // Nor by an owner, whose kick of m goes with a check of p's leaf: the
-    // kick is a role's, p's single leaf is for a check, which is fine; but
-    // two identities' leaves for a check are not.
+    // An owner's kick of m goes with a check of p's leaf: the kick is a
+    // role's, p's single leaf is for a check, which is fine; but two
+    // identities' leaves for a check are not, whatever the role.
     assert!(check(&g, &commit(&g, 0, remove(&[1, 2]))).is_ok());
     assert_eq!(
-        check(&g, &commit(&g, 1, remove(&[0, 2]))),
+        check(&g, &commit(&g, 0, remove(&[2, 5]))),
         Err(CommitError::CheckRemovals)
     );
 }
@@ -629,6 +634,134 @@ fn ownerless_rooms() {
     assert_eq!(g.effective_role(&uid("m@x.org")), Role::Owner);
 }
 
+/// In a room, leaves of an identity listed in `owners` are removed for a
+/// check only by that identity or an owner, and those of one listed in
+/// `mods` only by that identity, an owner or a moderator, as of the
+/// commit's epoch (12.7, CR-H2).
+#[test]
+fn owners_and_mods_removed_for_a_check() {
+    let mut conv = room(ConversationKind::PrivateRoom);
+    conv.owners.push(uid("o2@x.org"));
+    conv.mods.push(uid("n@x.org"));
+    let g = view(
+        &conv,
+        vec![
+            leaf(0, "o@x.org", T),
+            leaf(1, "m@x.org", T),
+            leaf(2, "p@x.org", T),
+            leaf(3, "p@x.org", T),
+            leaf(4, "o@x.org", T),
+            leaf(5, "m@x.org", T),
+            leaf(6, "o2@x.org", T),
+            leaf(7, "n@x.org", T),
+            leaf(8, "n@x.org", T),
+            leaf(9, "o2@x.org", T),
+        ],
+    );
+    // The attack: a plain member removes an owner's leaves "for a check",
+    // leaving nobody who could add them back. Refused, one leaf or all.
+    for target in [&[0][..], &[0, 4][..], &[6][..]] {
+        assert_eq!(
+            check(&g, &commit(&g, 2, remove(target))),
+            Err(CommitError::Remove),
+            "plain member removing {target:?}"
+        );
+    }
+    // Nor a moderator's.
+    for target in [&[1][..], &[1, 5][..], &[7][..]] {
+        assert_eq!(
+            check(&g, &commit(&g, 2, remove(target))),
+            Err(CommitError::Remove)
+        );
+    }
+    // A moderator may not remove an owner's leaf for a check either.
+    assert_eq!(
+        check(&g, &commit(&g, 1, remove(&[0]))),
+        Err(CommitError::Remove)
+    );
+    // But another moderator's, and a plain member's.
+    let verdict = check(&g, &commit(&g, 1, remove(&[7]))).unwrap();
+    assert_eq!(verdict.check_removals, vec![idx(7)]);
+    assert!(verdict.authority);
+    assert_eq!(
+        check(&g, &commit(&g, 1, remove(&[2])))
+            .unwrap()
+            .check_removals,
+        vec![idx(2)]
+    );
+    // An owner may remove another owner's leaf and a moderator's (and kick
+    // another owner, removing all its leaves, by its role).
+    assert!(
+        check(&g, &commit(&g, 0, remove(&[6, 9])))
+            .unwrap()
+            .check_removals
+            .is_empty()
+    );
+    let verdict = check(&g, &commit(&g, 0, remove(&[6]))).unwrap();
+    assert_eq!(verdict.check_removals, vec![idx(6)]);
+    assert_eq!(
+        check(&g, &commit(&g, 6, remove(&[1])))
+            .unwrap()
+            .check_removals,
+        vec![idx(1)]
+    );
+    // The identity's own leaves are its own, whatever the role.
+    assert!(check(&g, &commit(&g, 4, remove(&[0]))).is_ok());
+    assert!(check(&g, &commit(&g, 5, remove(&[1]))).is_ok());
+    // What a device may repair, and where it only warns (12.7).
+    let (o, m, p, n) = (
+        uid("o@x.org"),
+        uid("m@x.org"),
+        uid("p@x.org"),
+        uid("n@x.org"),
+    );
+    assert!(!g.may_remove_for_check(&p, &o));
+    assert!(!g.may_remove_for_check(&p, &m));
+    assert!(!g.may_remove_for_check(&m, &o));
+    assert!(g.may_remove_for_check(&m, &n));
+    assert!(g.may_remove_for_check(&o, &m));
+    assert!(g.may_remove_for_check(&p, &p));
+    assert!(g.may_remove_for_check(&o, &p));
+    // In a direct conversation either participant removes the other's
+    // leaves for a check; in a public room nobody does.
+    let direct = RisalaConversation::direct("h.org".parse().unwrap(), [0; 16], &o, &p);
+    let gd = view(&direct, vec![leaf(0, "o@x.org", T), leaf(1, "p@x.org", T)]);
+    assert!(gd.may_remove_for_check(&p, &o));
+    let public = group(&room(ConversationKind::PublicRoom));
+    assert!(!public.may_remove_for_check(&o, &p));
+}
+
+/// 6.3's "owners are gone" looks at the group before the commit: a
+/// moderator cannot take the owners' place in the commit that removes them.
+#[test]
+fn owners_gone_before_the_commit() {
+    let conv = room(ConversationKind::PrivateRoom);
+    let g = group(&conv);
+    let mut takeover = commit(&g, 1, vec![ProposalView::GroupContextExtensions]);
+    let new = takeover.new_conversation.as_mut().unwrap();
+    new.mods.clear();
+    new.owners.push(uid("m@x.org"));
+    // Even when the owner's SelfRemove is applied in the same commit.
+    takeover.proposals.push(ProposalView::SelfRemove(idx(0)));
+    assert!(matches!(
+        check(&g, &takeover),
+        Err(CommitError::Extension(_))
+    ));
+    // Nor by removing the owner's leaf for a check, which no moderator may.
+    let mut by_check = takeover.clone();
+    by_check.proposals = vec![
+        ProposalView::GroupContextExtensions,
+        ProposalView::Remove(idx(0)),
+    ];
+    assert_eq!(check(&g, &by_check), Err(CommitError::Remove));
+    // Once the owner has left, in a later commit, the moderator may.
+    let mut gone = g.clone();
+    gone.leaves.remove(0);
+    let mut later = takeover.clone();
+    later.proposals = vec![ProposalView::GroupContextExtensions];
+    assert!(check(&gone, &later).unwrap().authority);
+}
+
 /// One leaf per device outside public rooms (12.7); joins check it too.
 #[test]
 fn one_leaf_per_device() {
@@ -693,7 +826,6 @@ fn external_commits() {
             proposals,
             path_leaf: Some(path),
             new_conversation: Ok(conv.clone()),
-            pending_self_removes: Vec::new(),
         }
     };
     let with = |indices: &[u32]| {
@@ -907,6 +1039,96 @@ fn adds() {
     assert_eq!(check(&gd, &commit(&gd, 0, invite())), Err(CommitError::Add));
 }
 
+/// In a private room, a device of an identity listed in `owners`, before
+/// or after the commit, is added only by a leaf of that identity or of an
+/// owner, and one listed in `mods` also by a moderator, whichever Add rule
+/// allows it (12.7, CR-H1).
+#[test]
+fn owners_and_mods_added() {
+    let provider = provider();
+    let mut conv = room(ConversationKind::PrivateRoom);
+    conv.owners.push(uid("o2@x.org"));
+    conv.mods.push(uid("n@x.org"));
+    let g = view(
+        &conv,
+        vec![
+            leaf(0, "o@x.org", T),
+            leaf(1, "m@x.org", T),
+            leaf(2, "p@x.org", T),
+            leaf(3, "q@x.org", T),
+            leaf(4, "o2@x.org", T),
+            leaf(5, "n@x.org", T),
+        ],
+    );
+    // The attack: a plain member builds a KeyPackage that names the owner,
+    // with keys of its own, and adds it, since the owner has a leaf. It
+    // would then hold a leaf with the owner's role. Refused.
+    let forged = || vec![add(key_package(&provider, "o@x.org", 70, T))];
+    assert_eq!(check(&g, &commit(&g, 2, forged())), Err(CommitError::Add));
+    // A moderator may not add an owner's device either.
+    assert_eq!(check(&g, &commit(&g, 1, forged())), Err(CommitError::Add));
+    // The owner's own device, and another owner, may: the latter an
+    // authority commit, since only a role allows it.
+    assert!(!check(&g, &commit(&g, 0, forged())).unwrap().authority);
+    assert!(check(&g, &commit(&g, 4, forged())).unwrap().authority);
+    // A moderator's device: not by a plain member, but by the moderator,
+    // another moderator or an owner.
+    let moderator = || vec![add(key_package(&provider, "m@x.org", 71, T))];
+    assert_eq!(
+        check(&g, &commit(&g, 2, moderator())),
+        Err(CommitError::Add)
+    );
+    assert!(check(&g, &commit(&g, 1, moderator())).is_ok());
+    assert!(check(&g, &commit(&g, 5, moderator())).unwrap().authority);
+    assert!(check(&g, &commit(&g, 0, moderator())).unwrap().authority);
+    // A plain member's device, by anyone, as before.
+    let plain = || vec![add(key_package(&provider, "p@x.org", 72, T))];
+    assert!(!check(&g, &commit(&g, 3, plain())).unwrap().authority);
+    // Listed after the commit counts too: a commit that also makes p an
+    // owner (which only an owner may) cannot slip its device past.
+    let mut promote = commit(&g, 3, plain());
+    promote.proposals.push(ProposalView::GroupContextExtensions);
+    promote
+        .new_conversation
+        .as_mut()
+        .unwrap()
+        .owners
+        .push(uid("p@x.org"));
+    assert_eq!(check(&g, &promote), Err(CommitError::Add));
+    let mut promote = commit(&g, 0, plain());
+    promote.proposals.push(ProposalView::GroupContextExtensions);
+    promote
+        .new_conversation
+        .as_mut()
+        .unwrap()
+        .owners
+        .push(uid("p@x.org"));
+    assert!(check(&g, &promote).is_ok());
+    // Through a stale leaf's replacement: removing the owner's stale leaf is
+    // allowed to anyone, but adding the device again is not.
+    let mut stale = g.clone();
+    stale.leaves[0] = leaf(0, "o@x.org", T - 40 * DAY);
+    stale.leaves[0].identity = Some(RisalaIdentity::device(uid("o@x.org"), device_of(73)));
+    let replace = |by: u32| {
+        let mut c = commit(&stale, by, remove(&[0]));
+        c.proposals
+            .push(add(key_package(&provider, "o@x.org", 73, T)));
+        c
+    };
+    assert!(check(&stale, &commit(&stale, 2, remove(&[0]))).is_ok());
+    assert_eq!(check(&stale, &replace(2)), Err(CommitError::Add));
+    assert_eq!(check(&stale, &replace(1)), Err(CommitError::Add));
+    assert!(check(&stale, &replace(4)).is_ok());
+    // So a device replaces only the stale leaves it may add again.
+    assert!(stale.stale_leaves_for(&uid("p@x.org"), T).is_empty());
+    assert!(stale.stale_leaves_for(&uid("m@x.org"), T).is_empty());
+    assert_eq!(stale.stale_leaves_for(&uid("o2@x.org"), T), vec![idx(0)]);
+    assert_eq!(stale.stale_leaves_for(&uid("o@x.org"), T), vec![idx(0)]);
+    let mut public = stale.clone();
+    public.conversation = Ok(room(ConversationKind::PublicRoom));
+    assert_eq!(public.stale_leaves_for(&uid("p@x.org"), T), vec![idx(0)]);
+}
+
 /// In a public room, only external Add proposals, by reference, with no
 /// binding and `streak` 0 (12.7).
 #[test]
@@ -1034,7 +1256,11 @@ impl KeyFacts for Facts {
 /// can it find the removal failed.
 #[test]
 fn key_checks_of_removals() {
-    let g = group(&room(ConversationKind::PrivateRoom));
+    // o is a plain member here, so that any member may remove its leaves
+    // for a check (12.7).
+    let mut conv = room(ConversationKind::PrivateRoom);
+    conv.owners = vec![uid("z@x.org")];
+    let g = group(&conv);
     // Leaf 2 (p) removes o's leaf for a check.
     let c = commit(&g, 2, remove(&[0]));
     let verdict = check(&g, &c).unwrap();

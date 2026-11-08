@@ -499,11 +499,7 @@ pub(super) async fn check_post(
             ProcessedMessageContent::StagedCommitMessage(staged) if commit => {
                 let view = GroupView::of(&room.group, &room.state);
                 let post = room.state.post(ms(now), next.map(|next| *next.as_bytes()));
-                let pending = room
-                    .group
-                    .queued_proposals(&room.storage)
-                    .map_err(|e| invalid(format!("{e:?}")))?;
-                let commit_view = CommitView::of(&sender, &staged, pending.iter().map(|(_, q)| q));
+                let commit_view = CommitView::of(&sender, &staged);
                 // The committer's leaf: its credential, as of the commit.
                 let committer = commit_view
                     .path_leaf

@@ -946,12 +946,11 @@ fn private_room_roles() {
     let owen_leaf = o.own_leaf_index();
     let mia_leaf = m.own_leaf_index();
     let out = mia.commit(&mut m, remove(vec![owen_leaf]));
-    let verdict = pat.receive(&mut p, &out).1.unwrap();
-    // Not as a kick: but any member may remove a leaf for a check (12.7),
-    // an authority commit, which devices that confirmed Owen's leaf show
-    // as abuse, naming Mia.
-    assert_eq!(verdict.check_removals, vec![owen_leaf]);
-    assert!(verdict.authority);
+    // Not as a kick, nor for a check: in a room, only an owner or Owen's own
+    // identity removes an owner's leaf for a check (12.7), so that no
+    // member can lock out, by a claim nobody can check, those who could add
+    // it back.
+    assert_eq!(pat.receive(&mut p, &out).1, Err(CommitError::Remove));
     discard_own_commit(&mia.provider, &mut m).unwrap();
 
     let mut ban = conversation(&o).unwrap();
@@ -1137,38 +1136,43 @@ fn stale_leaves() {
     assert_eq!(view.median_activity(now), Some(now));
     assert_eq!(view.stale_leaves(now), vec![o.own_leaf_index()]);
     assert_eq!(view.bulk_limit(), 1);
-    // Pat, a plain member, removes Owen's leaf as stale and adds his device
-    // again from a new KeyPackage (12.7): a group reason, not a check,
-    // though Owen is an owner, whom Pat could not invite.
+    // Pat, a plain member, may remove Owen's leaf as stale, a group reason,
+    // but must add his device again in the same commit outside public
+    // rooms, and may not: Owen is an owner, whose devices only his own
+    // identity or an owner adds (12.7). So Pat's device leaves it alone.
     let owen_leaf = o.own_leaf_index();
-    let out = pat.commit(
-        &mut p,
-        Changes {
-            remove: vec![owen_leaf],
-            add: vec![owen.again().key_package(false)],
-            ..Changes::default()
-        },
-    );
+    assert!(view.stale_leaves_for(&pat.uid, now).is_empty());
+    assert!(view.stale_leaves_for(&mia.uid, now).is_empty());
+    assert_eq!(view.stale_leaves_for(&owen.uid, now), vec![owen_leaf]);
+    let replace = |device: &Device, group: &mut MlsGroup| {
+        device.commit(
+            group,
+            Changes {
+                remove: vec![owen_leaf],
+                add: vec![owen.again().key_package(false)],
+                ..Changes::default()
+            },
+        )
+    };
+    let out = replace(&pat, &mut p);
+    assert_eq!(mia.receive(&mut m, &out).1, Err(CommitError::Add));
+    discard_own_commit(&pat.provider, &mut p).unwrap();
+    // Nor Mia, a moderator.
+    let out = replace(&mia, &mut m);
+    assert_eq!(pat.receive(&mut p, &out).1, Err(CommitError::Add));
+    discard_own_commit(&mia.provider, &mut m).unwrap();
+    // Removing it alone is still a group reason, not a check.
+    let out = pat.commit(&mut p, remove(vec![owen_leaf]));
     let verdict = mia.receive(&mut m, &out).1.unwrap();
     assert!(verdict.check_removals.is_empty());
     assert!(!verdict.authority);
     discard_own_commit(&pat.provider, &mut p).unwrap();
-    // Mia's leaf is not stale: removing it is a removal for a check, and
-    // she may not be added back by Pat in the same commit.
+    // Mia's leaf is not stale: removing it would be a removal for a check,
+    // which a plain member may not make of a moderator's leaf (12.7).
     let mia_leaf = m.own_leaf_index();
     let out = pat.commit(&mut p, remove(vec![mia_leaf]));
-    let verdict = owen.receive(&mut o, &out).1.unwrap();
-    assert_eq!(verdict.check_removals, vec![mia_leaf]);
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Remove));
     discard_own_commit(&pat.provider, &mut p).unwrap();
-    let out = pat.commit(
-        &mut p,
-        Changes {
-            remove: vec![mia_leaf],
-            add: vec![mia.again().key_package(false)],
-            ..Changes::default()
-        },
-    );
-    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Add));
 
     // The weekly refresh (12.7).
     let own = RisalaProfile::new("", now_ms() - 8 * 24 * HOUR).unwrap();
@@ -1261,10 +1265,11 @@ fn resync_repairs() {
             },
         )
     };
-    // Mia has no other leaf, so Pat, a plain member, may not: he could hold
-    // the new leaf himself (12.7).
+    // Pat, a plain member, may not: Mia is a moderator, whose leaves he may
+    // not remove for a check, nor add (12.7); and he could hold the new leaf
+    // himself.
     let out = replace(&pat, &mut p);
-    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Add));
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Remove));
     discard_own_commit(&pat.provider, &mut p).unwrap();
     // Owen, an owner, may: his role lets him remove all of Mia's leaves,
     // and invite her (a moderator, whom only owners invite).
@@ -1283,32 +1288,41 @@ fn resync_repairs() {
     // With a second device of Mia's in the room, her own identity repairs.
     let mia2 = Device::new("mia@example.org", 12);
     facts.add(&mia2);
+    // Not added by Pat: a moderator's devices are added only by her own
+    // identity, an owner or a moderator (12.7).
     let out = pat.commit(&mut p, add(vec![mia2.key_package(false)]));
-    pat.merge(&mut p, &out);
-    owen.apply(&mut o, &out, &facts);
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Add));
+    discard_own_commit(&pat.provider, &mut p).unwrap();
+    let out = owen.commit(&mut o, add(vec![mia2.key_package(false)]));
+    owen.merge(&mut o, &out);
+    pat.apply(&mut p, &out, &facts);
     mia.apply(&mut m, &out, &facts);
     let mut m2 = mia2.join(out.welcome.as_ref().unwrap());
     let out = replace(&mia2, &mut m2);
     let verdict = pat.receive(&mut p, &out).1.unwrap();
     assert!(verdict.check_removals.is_empty());
-    // Pat, removing Mia's leaf without re-adding it, needs a reason he can
-    // see: the RESYNC he read is one.
+    // Owen, removing Mia's leaf without re-adding it, needs a reason Pat
+    // can see: the RESYNC he read is one. Pat himself may not remove it.
     discard_own_commit(&mia2.provider, &mut m2).unwrap();
     let out = pat.commit(&mut p, remove(vec![mia_leaf]));
-    let (received2, verdict2) = owen.receive(&mut o, &out);
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Remove));
+    discard_own_commit(&pat.provider, &mut p).unwrap();
+    let out = owen.commit(&mut o, remove(vec![mia_leaf]));
+    let (received2, verdict2) = pat.receive(&mut p, &out);
     let verdict2 = verdict2.unwrap();
+    assert_eq!(verdict2.check_removals, vec![mia_leaf]);
     let resyncs = [mia_leaf];
     let saw = Seen {
-        own_uid: &owen.uid,
+        own_uid: &pat.uid,
         resyncs: &resyncs,
         impostors: &[],
     };
     assert_eq!(
-        owen.keys(&o, &received2, &verdict2, &facts, &saw),
+        pat.keys(&p, &received2, &verdict2, &facts, &saw),
         KeyReport::default()
     );
     assert_eq!(
-        owen.keys(&o, &received2, &verdict2, &facts, &owen.seen())
+        pat.keys(&p, &received2, &verdict2, &facts, &pat.seen())
             .unexplained_removals,
         vec![mia_leaf]
     );
@@ -1356,43 +1370,25 @@ fn impostor_removals() {
     mia.merge(&mut m, &out);
     owen.apply(&mut o, &out, &facts);
     assert!(pat.apply(&mut p, &out, &facts).authority);
-    // Pat, a plain member, finds her an impostor and removes her leaf.
+    // Pat, a plain member, finds her an impostor, but may not remove a
+    // moderator's leaf for a check (12.7): his device warns, hides what
+    // the leaf sends, and keeps sending.
     let mia_leaf = m.own_leaf_index();
+    let view = GroupView::of(p.public_group(), &pat.state(&p));
+    assert!(!view.may_remove_for_check(&pat.uid, &mia.uid));
+    assert!(view.may_remove_for_check(&owen.uid, &mia.uid));
     let out = pat.commit(&mut p, remove(vec![mia_leaf]));
-    let (received, verdict) = owen.receive(&mut o, &out);
-    let verdict = verdict.unwrap();
-    assert_eq!(verdict.check_removals, vec![mia_leaf]);
-    // Owen sees no reason himself: it stands, with a warning naming Pat.
-    assert_eq!(
-        owen.keys(&o, &received, &verdict, &facts, &owen.seen())
-            .unexplained_removals,
-        vec![mia_leaf]
-    );
-    // Pat's device, to which she is an impostor, has its reason.
-    let impostors = [mia_leaf];
-    let saw = Seen {
-        own_uid: &pat.uid,
-        resyncs: &[],
-        impostors: &impostors,
-    };
-    let own_commit = crate::checks::CommitView::of(
-        &openmls::prelude::Sender::Member(p.own_leaf_index()),
-        p.pending_commit().unwrap(),
-        p.pending_proposals(),
-    );
-    assert_eq!(
-        crate::checks::key_checks(
-            &GroupView::of(p.public_group(), &pat.state(&p)),
-            &own_commit,
-            &verdict,
-            &facts,
-            &saw
-        ),
-        KeyReport::default()
-    );
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Remove));
+    discard_own_commit(&pat.provider, &mut p).unwrap();
+    // Owen, an owner, to whom she is an impostor too, removes her leaf: her
+    // only one, so a kick his role allows, which needs no check.
+    let out = owen.commit(&mut o, remove(vec![mia_leaf]));
+    let verdict = pat.receive(&mut p, &out).1.unwrap();
+    assert!(verdict.check_removals.is_empty());
+    assert!(verdict.authority);
+    discard_own_commit(&owen.provider, &mut o).unwrap();
     // The removal undoes nothing: putting the topic back or adding Quinn
     // again in the same commit is not Pat's to do.
-    discard_own_commit(&pat.provider, &mut p).unwrap();
     let mut back = conversation(&p).unwrap();
     back.topic = String::new();
     let out = pat.commit(
@@ -1848,7 +1844,7 @@ impl Server {
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
             panic!("not a commit");
         };
-        let view = crate::checks::CommitView::of(&sender, &staged, std::iter::empty());
+        let view = crate::checks::CommitView::of(&sender, &staged);
         let verdict = crate::checks::check_commit(
             &GroupView::of(&self.group, &self.state),
             &view,
@@ -2251,7 +2247,7 @@ fn server_checks_public_commits() {
             else {
                 panic!("not a commit");
             };
-            let view = CommitView::of(&sender, &staged, std::iter::empty());
+            let view = CommitView::of(&sender, &staged);
             let verdict = check_commit(&GroupView::of(public, state), &view, post);
             (staged, verdict)
         };

@@ -379,8 +379,11 @@ impl GroupView {
         })
     }
 
-    /// Whether some identity in `owners` has a leaf (6.3). In a room whose
-    /// owners are gone, moderators may do what owners may.
+    /// Whether some identity in `owners` has a leaf in the group as it is
+    /// before a commit, in the epoch the commit is for (6.3). In a room
+    /// whose owners are gone, moderators may do what owners may; since this
+    /// looks at the group before the commit, a moderator cannot remove the
+    /// owners and take their place in one commit.
     fn owner_present(&self, conversation: &RisalaConversation) -> bool {
         conversation
             .owners
@@ -398,6 +401,63 @@ impl GroupView {
             Role::Mod if !self.owner_present(conversation) => Role::Owner,
             role => role,
         }
+    }
+
+    /// Whether, in a room, a leaf of `committer` may act on the leaves of
+    /// `target`, as the Adds and Removes checks limit it (12.7): those of an
+    /// identity listed in `owners` only a leaf of that identity or of an
+    /// owner, those of one listed in `mods` only that identity, an owner or
+    /// a moderator, and other members' anyone. Roles are as of this epoch,
+    /// a moderator counting as an owner in a room whose owners are gone
+    /// (6.3). In a direct conversation it is always true.
+    pub fn may_act_on(&self, committer: &Uid, target: &Uid) -> bool {
+        let Ok(conversation) = &self.conversation else {
+            return committer == target;
+        };
+        if conversation.kind == ConversationKind::Direct || committer == target {
+            return true;
+        }
+        may_act_on_role(self.effective_role(committer), conversation.role(target))
+    }
+
+    /// Whether a device of `committer` may remove `target`'s leaves for a
+    /// check (12.7), as a repair of a key check that failed, a fork, keys
+    /// missing, an impostor or a RESYNC. Where it may not, as for a plain
+    /// member's device and a leaf of an owner, the device warns its user,
+    /// hides what the leaf sends, and keeps sending (12.7, 12.14): the
+    /// leaf's own identity, or an owner or moderator, makes the repair.
+    /// Public rooms have no removals for a check.
+    pub fn may_remove_for_check(&self, committer: &Uid, target: &Uid) -> bool {
+        match &self.conversation {
+            Ok(conversation) if conversation.kind == ConversationKind::PublicRoom => false,
+            _ => self.may_act_on(committer, target),
+        }
+    }
+
+    /// The stale leaves (12.7) that a device of `committer` may replace in
+    /// a commit whose post has `t`. Outside public rooms, it MUST add each
+    /// device again in the same commit, so it removes only stale leaves
+    /// that the Adds checks let it add again: a plain member's device
+    /// leaves those of owners and moderators to their own identity's
+    /// devices and to owners (and moderators, for moderators). In a public
+    /// room nobody adds them again, and any member may remove them. The
+    /// bulk limit still applies to a member without a role.
+    pub fn stale_leaves_for(&self, committer: &Uid, t: u64) -> Vec<LeafNodeIndex> {
+        let public = self
+            .conversation
+            .as_ref()
+            .is_ok_and(|c| c.kind == ConversationKind::PublicRoom);
+        self.leaves
+            .iter()
+            .filter(|leaf| self.is_stale(leaf, t))
+            .filter(|leaf| {
+                public
+                    || leaf
+                        .uid()
+                        .is_some_and(|uid| self.may_act_on(committer, uid))
+            })
+            .map(|leaf| leaf.index)
+            .collect()
     }
 
     /// The `streak` that a commit by a leaf of `uid` must carry (12.3): the
@@ -665,19 +725,14 @@ pub struct CommitView {
     pub path_leaf: Option<LeafView>,
     /// The conversation extension of the epoch the commit creates.
     pub new_conversation: Result<RisalaConversation, ConversationError>,
-    /// The leaves that have posted a SelfRemove that is pending in the
-    /// group, besides those the commit itself includes.
-    pub pending_self_removes: Vec<LeafNodeIndex>,
 }
 
 impl CommitView {
-    /// Reads a commit from OpenMLS: its sender, the staged commit, and the
-    /// SelfRemoves pending in the group's proposal store.
-    pub fn of<'a>(
-        sender: &Sender,
-        staged: &StagedCommit,
-        pending: impl Iterator<Item = &'a QueuedProposal>,
-    ) -> CommitView {
+    /// Reads a commit from OpenMLS: its sender and the staged commit. Only
+    /// the SelfRemoves that the commit applies count (12.7): one that is
+    /// merely pending in some device's proposal store does not, since the
+    /// group checks depend only on the commit's own posts.
+    pub fn of(sender: &Sender, staged: &StagedCommit) -> CommitView {
         let committer = match sender {
             Sender::Member(index) => Committer::Member(*index),
             _ => Committer::External,
@@ -693,13 +748,6 @@ impl CommitView {
             new_conversation: RisalaConversation::from_extensions(
                 staged.group_context().extensions(),
             ),
-            pending_self_removes: pending
-                .filter(|queued| matches!(queued.proposal(), Proposal::SelfRemove))
-                .filter_map(|queued| match queued.sender() {
-                    Sender::Member(index) => Some(*index),
-                    _ => None,
-                })
-                .collect(),
         }
     }
 
@@ -715,11 +763,9 @@ impl CommitView {
     }
 
     fn self_removes(&self, index: LeafNodeIndex) -> bool {
-        self.pending_self_removes.contains(&index)
-            || self
-                .proposals
-                .iter()
-                .any(|p| matches!(p, ProposalView::SelfRemove(i) if *i == index))
+        self.proposals
+            .iter()
+            .any(|p| matches!(p, ProposalView::SelfRemove(i) if *i == index))
     }
 
     /// The identities of the leaves it adds from KeyPackages.
@@ -1258,6 +1304,18 @@ fn may_kick(
     }
 }
 
+/// Whether a member whose role is `committer` may act on the leaves of an
+/// identity whose role is `target`, in a room (12.7): an owner's only an
+/// owner, a moderator's an owner or a moderator, a plain member's anyone.
+/// Leaves of the committer's own identity are always its own to act on.
+fn may_act_on_role(committer: Role, target: Role) -> bool {
+    match target {
+        Role::Owner => committer == Role::Owner,
+        Role::Mod => committer >= Role::Mod,
+        Role::Member => true,
+    }
+}
+
 /// The checks of an external commit (12.7), which appear only in public
 /// rooms, by a leaf whose credential names an identity, with one
 /// ExternalInit, adding only the committer's own leaf:
@@ -1364,6 +1422,20 @@ fn removal_reason(
         }
         return Err(CommitError::Remove);
     }
+    // For a check. In a room, a leaf of an identity listed in `owners` only
+    // by a leaf of that identity or of an owner, and one listed in `mods`
+    // only by that identity, an owner or a moderator, as of the epoch the
+    // commit is for: no member can take out, by a claim that nobody can
+    // check, those who could add it back (12.7, 6.3). The committer's own
+    // identity was handled above.
+    if conversation.kind != ConversationKind::Direct
+        && !may_act_on_role(
+            group.effective_role(committer),
+            conversation.role(&identity.uid),
+        )
+    {
+        return Err(CommitError::Remove);
+    }
     Ok(RemoveReason::Check)
 }
 
@@ -1439,14 +1511,27 @@ fn check_add(
             Err(CommitError::Add)
         };
     }
-    // A room. An identity that has a leaf after the commit, by any member:
-    // only leaves the commit keeps count, so a plain member cannot remove
-    // an identity's last leaf for a check and add it back (12.7).
+    // A room. Whichever rule below allows it, a device of an identity
+    // listed in `owners`, before or after the commit, is added only by a
+    // leaf of that identity or of an owner, and one listed in `mods` only
+    // by that identity, an owner or a moderator: whoever adds a leaf may
+    // hold it, so no Add hands anyone control of a leaf with a role above
+    // its own (12.7). The committer's own identity was handled above, so
+    // here that takes a role: an authority commit.
+    let role = group.effective_role(committer);
+    let listed = old.role(uid).max(new.role(uid));
+    if !may_act_on_role(role, listed) {
+        return Err(CommitError::Add);
+    }
+    let by_role = listed != Role::Member;
+    // An identity that has a leaf after the commit, by any member: only
+    // leaves the commit keeps count, so a plain member cannot remove an
+    // identity's last leaf for a check and add it back (12.7).
     if group
         .leaves_of(uid)
         .any(|leaf| !removed.contains(&leaf.index))
     {
-        return Ok((identity, false));
+        return Ok((identity, by_role));
     }
     // A device whose stale leaf the same commit removes, by any member.
     if group.leaves.iter().any(|leaf| {
@@ -1454,13 +1539,11 @@ fn check_add(
             && leaf.identity.as_ref() == Some(&identity)
             && group.is_stale(leaf, t)
     }) {
-        return Ok((identity, false));
+        return Ok((identity, by_role));
     }
     // An invitation: owners and moderators, and only owners for an
     // identity listed in `owners` or `mods` (12.7).
-    let role = group.effective_role(committer);
-    let listed = old.role(uid) != Role::Member || new.role(uid) != Role::Member;
-    let allowed = if listed {
+    let allowed = if listed != Role::Member {
         role == Role::Owner
     } else {
         role >= Role::Mod

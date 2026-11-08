@@ -1378,7 +1378,7 @@ pub fn process_message<P: OpenMlsProvider>(
             if let Sender::Member(index) = sender {
                 check_handshake_pseudonym(provider, group, kind, index, &aad)?;
             }
-            let view = CommitView::of(&sender, &staged, group.pending_proposals());
+            let view = CommitView::of(&sender, &staged);
             Ok(Incoming::Commit(Box::new(ReceivedCommit {
                 staged,
                 view,
