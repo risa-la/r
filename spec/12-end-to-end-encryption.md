@@ -324,8 +324,8 @@ server hands
 that one out only when the device has no ordinary KeyPackage left, and
 keeps it, so the device can always be added. A new one replaces it.
 Since its leaf key may be used in several groups, a device that joins
-with it commits a fresh leaf with a new signature key before it sends
-anything (12.3).
+with it replaces its leaf node with one that has a new signature key,
+as 12.3 says, before it sends anything.
 
 A device SHOULD keep about ten ordinary KeyPackages on the server, and
 upload more when KEYPKG COUNT reports fewer than five. Servers delete
