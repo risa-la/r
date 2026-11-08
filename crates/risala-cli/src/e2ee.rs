@@ -117,6 +117,12 @@ pub(crate) async fn run(ctx: &Ctx, command: E2eeCommand) -> Res {
             let account = online(ctx, &server).await?;
             within(account.wait_synced()).await?;
             let uid = uid.unwrap_or_else(|| account.uid());
+            // What the key file lists now, not at the last daily check
+            // (12.12).
+            if !within(account.refresh_devices(&uid)).await? {
+                eprintln!("risala: could not fetch the key file of {uid}; showing what is known");
+            }
+            within(account.wait_synced()).await?;
             let devices = account.devices(&uid).or_else(explain)?;
             if devices.is_empty() {
                 println!("no devices of {uid} known here");

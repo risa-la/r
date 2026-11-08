@@ -120,7 +120,10 @@ impl Net {
     async fn second_device(&self, of: &Device, uid: &str) -> Device {
         let device = self.device().await;
         let line = self.ok(&device, &["keygen", uid]).await;
-        let line = line.lines().find(|l| l.contains("ML-DSA-44")).unwrap_or(&line);
+        let line = line
+            .lines()
+            .find(|l| l.contains("ML-DSA-44"))
+            .unwrap_or(&line);
         let mut args = vec!["keys", "add", &self.addr];
         args.extend(line.split_whitespace());
         self.ok(of, &args).await;
@@ -228,8 +231,14 @@ async fn two_devices_talk_encrypted_and_new_devices_read_the_history() {
     let nowhere = dead.local_addr().unwrap().to_string();
     drop(dead);
     for (conv, want) in [
-        ("bob@chat.test", ["<alice@chat.test> hello bob", "<bob@chat.test> hi alice"]),
-        ("#secret", ["<alice@chat.test> before bob", "<bob@chat.test> hi all"]),
+        (
+            "bob@chat.test",
+            ["<alice@chat.test> hello bob", "<bob@chat.test> hi alice"],
+        ),
+        (
+            "#secret",
+            ["<alice@chat.test> before bob", "<bob@chat.test> hi all"],
+        ),
     ] {
         let out = net.run_at(&alice2, &nowhere, &["log", &addr, conv]).await;
         assert!(out.status.success(), "{}", stderr(&out));
@@ -247,7 +256,8 @@ async fn a_recovery_key_restores_the_history_and_the_identity() {
     let alice = net.registered("alice").await;
     let bob = net.registered("bob").await;
     let addr = net.addr.clone();
-    net.ok(&alice, &["send", &addr, "bob@chat.test", "one"]).await;
+    net.ok(&alice, &["send", &addr, "bob@chat.test", "one"])
+        .await;
     net.ok(&alice, &["join", &addr, "#secret"]).await;
     net.ok(&alice, &["encrypt", &addr, "#secret"]).await;
     net.ok(&alice, &["send", &addr, "#secret", "in", "the", "room"])
@@ -259,7 +269,8 @@ async fn a_recovery_key_restores_the_history_and_the_identity() {
     assert_eq!(key.len(), 64, "{key}");
     let keys = net.ok(&alice, &["keys", "list", &addr]).await;
     assert!(keys.contains("recovery"), "{keys}");
-    net.ok(&bob, &["send", &addr, "alice@chat.test", "two"]).await;
+    net.ok(&bob, &["send", &addr, "alice@chat.test", "two"])
+        .await;
     net.log_until(&alice, "bob@chat.test", &["<bob@chat.test> two"])
         .await;
 
@@ -296,7 +307,11 @@ async fn a_recovery_key_restores_the_history_and_the_identity() {
         "{out}"
     );
     let keys = net.ok(&alice3, &["keys", "list", &addr]).await;
-    assert_eq!(keys.lines().count(), 2, "this device and the recovery key:\n{keys}");
+    assert_eq!(
+        keys.lines().count(),
+        2,
+        "this device and the recovery key:\n{keys}"
+    );
     net.log_until(
         &alice3,
         "bob@chat.test",
@@ -306,7 +321,8 @@ async fn a_recovery_key_restores_the_history_and_the_identity() {
     // The rooms come back too, and she writes again.
     net.log_until(&alice3, "#secret", &["<alice@chat.test> in the room"])
         .await;
-    net.ok(&alice3, &["send", &addr, "bob@chat.test", "back"]).await;
+    net.ok(&alice3, &["send", &addr, "bob@chat.test", "back"])
+        .await;
     net.log_until(&bob, "alice@chat.test", &["<alice@chat.test> back"])
         .await;
 }
@@ -318,8 +334,11 @@ async fn a_report_of_an_encrypted_message_verifies_for_the_operator() {
     let alice = net.registered("alice").await;
     let bob = net.registered("bob").await;
     let addr = net.addr.clone();
-    net.ok(&alice, &["send", &addr, "bob@chat.test", "something", "awful"])
-        .await;
+    net.ok(
+        &alice,
+        &["send", &addr, "bob@chat.test", "something", "awful"],
+    )
+    .await;
     let log = net
         .log_until(&bob, "alice@chat.test", &["something awful"])
         .await;
@@ -327,13 +346,160 @@ async fn a_report_of_an_encrypted_message_verifies_for_the_operator() {
 
     // Bob reports it: REPORTENC reveals the content (5.8).
     let out = net
-        .ok(&bob, &["report", &addr, "alice@chat.test", &seq, "harassment"])
+        .ok(
+            &bob,
+            &["report", &addr, "alice@chat.test", &seq, "harassment"],
+        )
         .await;
     assert!(!out.trim().is_empty());
 
     // The operator reads it, checked against the franking commitment.
     let reports = net.ok(&olga, &["admin", "reports", &addr]).await;
-    assert!(reports.contains("(encrypted, content verified)"), "{reports}");
-    assert!(reports.contains("<alice@chat.test> something awful"), "{reports}");
+    assert!(
+        reports.contains("(encrypted, content verified)"),
+        "{reports}"
+    );
+    assert!(
+        reports.contains("<alice@chat.test> something awful"),
+        "{reports}"
+    );
     assert!(reports.contains("harassment"), "{reports}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypt_needs_an_owner_alone_in_the_room() {
+    let net = Net::start(&[]).await;
+    let alice = net.registered("alice").await;
+    let bob = net.registered("bob").await;
+    let addr = net.addr.clone();
+    net.ok(&alice, &["join", &addr, "#busy"]).await;
+    net.ok(&bob, &["join", &addr, "#busy"]).await;
+
+    // Bob does not own it, and Alice is not alone in it (12.5).
+    for who in [&bob, &alice] {
+        let out = net.run(who, &["encrypt", &addr, "#busy"]).await;
+        assert!(!out.status.success(), "{}", stdout(&out));
+        assert!(
+            stderr(&out).contains("#busy was not encrypted"),
+            "{}",
+            stderr(&out)
+        );
+    }
+
+    // Alone in a room of her own, with announcements and joined history.
+    net.ok(&alice, &["join", &addr, "#news"]).await;
+    let out = net
+        .ok(
+            &alice,
+            &["encrypt", &addr, "#news", "--joined", "--announcements"],
+        )
+        .await;
+    assert!(out.contains("#news is end-to-end encrypted"), "{out}");
+    let info = net.ok(&alice, &["info", &addr, "#news"]).await;
+    for setting in ["e2ee yes", "public no", "history joined", "send mods"] {
+        assert!(info.contains(setting), "{setting}:\n{info}");
+    }
+    // It is encrypted for good: no going public (12.3).
+    assert!(
+        !net.run(&alice, &["set", &addr, "#news", "public", "yes"])
+            .await
+            .status
+            .success()
+    );
+    // Messages there go encrypted.
+    net.ok(&alice, &["send", &addr, "#news", "first"]).await;
+    let export = net.ok(&alice, &["export", &addr, "#news"]).await;
+    assert!(export.contains(" ENC #news "), "{export}");
+    assert!(!export.contains("first"), "{export}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn devices_lists_and_declines() {
+    let net = Net::start(&[]).await;
+    let alice = net.registered("alice").await;
+    let bob = net.registered("bob").await;
+    let addr = net.addr.clone();
+    net.ok(&alice, &["send", &addr, "bob@chat.test", "hi"])
+        .await;
+
+    // Alice's own devices: just this one, checked against her key file.
+    let mine = net.ok(&alice, &["devices", &addr]).await;
+    assert_eq!(mine.lines().count(), 1, "{mine}");
+    assert!(mine.contains("(this device)"), "{mine}");
+    // Bob's device, as Alice's device knows it from their group.
+    let theirs = net.ok(&alice, &["devices", &addr, "bob@chat.test"]).await;
+    assert_eq!(theirs.lines().count(), 1, "{theirs}");
+    assert!(theirs.starts_with("sha256:"), "{theirs}");
+    assert!(!theirs.contains("this device"), "{theirs}");
+    let whoami = net.ok(&bob, &["whoami", &addr]).await;
+    let bob_key = theirs.split_whitespace().next().unwrap();
+    assert!(whoami.contains(bob_key), "{whoami}\n{theirs}");
+
+    // A device Alice does not recognise: she declines it, and it gets no
+    // history keys (12.9).
+    let other = net.second_device(&alice, "alice@chat.test").await;
+    let devices = net.ok(&alice, &["devices", &addr]).await;
+    let fingerprint = new_device(&devices).expect(&devices);
+    let out = net
+        .ok(&alice, &["confirm", &addr, &fingerprint, "--decline"])
+        .await;
+    assert!(out.contains("gets no history keys"), "{out}");
+    let devices = net.ok(&alice, &["devices", &addr]).await;
+    assert!(
+        devices
+            .lines()
+            .any(|l| l.starts_with(&fingerprint) && l.contains("declined")),
+        "{devices}"
+    );
+    net.ok(&other, &["sync", &addr]).await;
+    let log = net.ok(&other, &["log", &addr, "bob@chat.test"]).await;
+    assert!(log.contains("waiting for its key"), "{log}");
+
+    // A fingerprint that names no device of hers is refused.
+    let out = net.run(&alice, &["confirm", &addr, "sha256:00"]).await;
+    assert!(!out.status.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_recovery_key_replaces_the_old_one() {
+    let net = Net::start(&[]).await;
+    let alice = net.registered("alice").await;
+    let bob = net.registered("bob").await;
+    let addr = net.addr.clone();
+    net.ok(&alice, &["send", &addr, "bob@chat.test", "one"])
+        .await;
+    let first = recovery_key(&net.ok(&alice, &["recovery", "create", &addr]).await);
+    let second = recovery_key(&net.ok(&alice, &["recovery", "create", &addr]).await);
+    assert_ne!(first, second);
+
+    // One recovery key in the key file, and it is the shown recovery key,
+    // not a device (12.12).
+    let keys = net.ok(&alice, &["keys", "list", &addr]).await;
+    assert_eq!(
+        keys.lines().filter(|l| l.contains("recovery")).count(),
+        1,
+        "{keys}"
+    );
+    let devices = net.ok(&alice, &["devices", &addr]).await;
+    assert!(devices.contains("(recovery key)"), "{devices}");
+
+    // The old key no longer restores anything; the new one does (12.10).
+    let alice2 = net.second_device(&alice, "alice@chat.test").await;
+    net.ok(&alice2, &["sync", &addr]).await;
+    for (key, works) in [(&first, false), (&second, true)] {
+        let mut args = vec!["recovery", "restore", addr.as_str()];
+        args.extend(key.split_whitespace());
+        let out = net.run(&alice2, &args).await;
+        assert_eq!(out.status.success(), works, "{}", stderr(&out));
+    }
+    net.log_until(&alice2, "bob@chat.test", &["<alice@chat.test> one"])
+        .await;
+
+    // Nor does the old key sign in as her.
+    let lost = net.device().await;
+    let mut args = vec!["recover", addr.as_str(), "alice@chat.test"];
+    args.extend(first.split_whitespace());
+    let out = net.run(&lost, &args).await;
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let _ = bob;
 }
