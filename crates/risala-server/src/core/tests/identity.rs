@@ -786,6 +786,35 @@ async fn keys_put_closes_removed_devices() {
     alice.lines();
     let (mut phone_conn, lines) = ids.auth(&phone).await;
     assert_eq!(lines, ["OK uid=alice@example.org"]);
+    // The phone has a KeyPackage, which goes with it (12.8).
+    use crate::store::KeysStore as _;
+    use crate::store::keys::NewKeyPackage;
+    let uid: Uid = "alice@example.org".parse().unwrap();
+    let phone_id = *risala_proto::record::DeviceId::of(&phone.public_key()).as_bytes();
+    let now = ids.h.inner().now();
+    ids.h
+        .store
+        .add_key_package(
+            &NewKeyPackage {
+                uid: uid.clone(),
+                device: phone_id,
+                key_package_ref: [1; 48],
+                key_package: vec![1, 2, 3],
+                last_resort: true,
+                not_after: Timestamp::MAX,
+            },
+            10,
+            now,
+        )
+        .unwrap();
+    let held = |ids: &Ids| {
+        ids.h
+            .store
+            .count_key_packages(&uid, &phone_id, now)
+            .unwrap()
+            .last_resort
+    };
+    assert!(held(&ids));
     chain.remove_devices(&[&phone]);
     ids.h.send(&alice, &chain.keys_put_line(3)).await;
     assert_eq!(alice.lines().last().unwrap(), "OK");
@@ -793,6 +822,7 @@ async fn keys_put_closes_removed_devices() {
         phone_conn.lines(),
         [format!("<close> BYE {}", crate::core::BYE_KEYS_CHANGED)]
     );
+    assert!(!held(&ids));
     assert_eq!(ids.auth(&phone).await.1, ["ERR auth-failed"]);
     let (mut again, _) = ids.auth(&device).await;
     again.lines();

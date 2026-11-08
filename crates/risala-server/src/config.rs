@@ -241,13 +241,6 @@ pub struct FilesConfig {
     /// The largest blob BLOB accepts, in bytes (12.12): at least
     /// [`MIN_MAX_BLOB`], 256 MiB.
     pub max_blob: u64,
-    /// The most bytes of files and blobs kept for one mailbox (7.5),
-    /// reported by INFO as `quota=` (8.5). More get `ERR rate-limited`.
-    pub quota: u64,
-    /// The most bytes one network address may ask to store with UPLOAD
-    /// and BLOB in an hour (7.5). IPv6 addresses count by their /64. 0
-    /// means no limit.
-    pub address_bytes_per_hour: u64,
     /// The most bytes one identity may ask to store with BLOB in a day
     /// (12.12). 0 means no limit.
     pub identity_bytes_per_day: u64,
@@ -272,8 +265,6 @@ impl Default for FilesConfig {
             dir: None,
             max_upload: 100 * 1024 * 1024,
             max_blob: MIN_MAX_BLOB,
-            quota: 4 * 1024 * 1024 * 1024,
-            address_bytes_per_hour: 8 * 1024 * 1024 * 1024,
             identity_bytes_per_day: 16 * 1024 * 1024 * 1024,
             max_backup: 16 * 1024 * 1024 * 1024,
             max_backup_blobs: 100_000,
@@ -460,8 +451,11 @@ pub struct Limits {
     pub max_key_package_bytes: usize,
     /// The most bytes one mailbox keeps at once, counting its posts and
     /// the files and blobs stored with its token (7.5), reported by INFO
-    /// as `quota=`. Over it, the mailbox's oldest posts expire early, and a
-    /// post larger than it gets `ERR rate-limited`.
+    /// as `quota=`. Over it, the mailbox's oldest posts expire early to
+    /// make room for a post, file or blob; a post larger than what its
+    /// files and blobs leave, or a file or blob that does not fit beside
+    /// them, gets `ERR rate-limited`. At least [`MIN_MAX_BLOB`], so that a
+    /// mailbox holds a blob of the size every server takes (12.12).
     pub mailbox_quota: u64,
     /// The most bytes one network address may store in an hour, counting
     /// POST, UPLOAD and BLOB together (7.5). Further ones get
@@ -609,8 +603,8 @@ impl Default for Limits {
             max_key_packages: 100,
             key_package_gets_per_hour: 600,
             max_key_package_bytes: 64 * 1024,
-            mailbox_quota: 256 * 1024 * 1024,
-            address_bytes_per_hour: 1024 * 1024 * 1024,
+            mailbox_quota: 4 * 1024 * 1024 * 1024,
+            address_bytes_per_hour: 8 * 1024 * 1024 * 1024,
             creates_per_hour: 120,
             posts_per_minute: 600,
             commits_per_hour: 600,
@@ -790,7 +784,6 @@ impl Config {
             ));
         }
         for (name, value) in [
-            ("quota", f.quota),
             ("max_backup", f.max_backup),
             ("max_pending_welcomes", f.max_pending_welcomes),
         ] {
@@ -812,6 +805,16 @@ impl Config {
                  addresses (9.3)"
                     .into(),
             );
+        }
+        // A warning, not an error, so that tests and small servers may set
+        // less; such a server keeps no blob of 12.12's minimum size for a
+        // mailbox (a choice to confirm).
+        if self.limits.mailbox_quota < MIN_MAX_BLOB {
+            warnings.push(format!(
+                "limits.mailbox_quota is {}; a mailbox then cannot hold a blob of {MIN_MAX_BLOB} \
+                 bytes, the least every server must take (7.5, 12.12)",
+                self.limits.mailbox_quota
+            ));
         }
         if self.server.retention < 30 {
             warnings.push(format!(
@@ -1000,6 +1003,10 @@ mod tests {
         assert!(with(|l| l.max_follows = 1000).is_ok());
         invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");
         assert!(with(|l| l.guest_resume_secs = 120).is_ok());
+        // A mailbox that cannot hold a blob of the size every server takes
+        // is warned about (12.12).
+        let warnings = with(|l| l.mailbox_quota = MIN_MAX_BLOB - 1).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("mailbox_quota")));
 
         // The queue holds the longest response and room for live events.
         let l = Limits::default();

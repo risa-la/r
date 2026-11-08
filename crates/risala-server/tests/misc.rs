@@ -12,7 +12,7 @@ async fn info_before_and_after_choosing_a_kind() {
     client.send("@ref=1 INFO").await.unwrap();
     assert_eq!(
         client.expect_line().await.unwrap(),
-        "@ref=1 OK version=1 anon=yes guests=no register=no log=no retention=30 quota=268435456 push=yes upload=no"
+        "@ref=1 OK version=1 anon=yes guests=no register=no log=no retention=30 quota=4294967296 push=yes upload=no"
     );
     client.send("INFO #general").await.unwrap();
     assert_eq!(client.expect_line().await.unwrap(), "ERR not-authenticated");

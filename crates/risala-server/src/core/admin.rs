@@ -432,22 +432,17 @@ async fn drop_target(cx: &Cx, target: DropTarget, reason: String) -> Reply {
             None => return Err(err(ErrorCode::NotFound)),
         },
     };
-    if !cx.db(move |store| store.drop_mailbox(&mailbox)).await? {
+    // Under the mailbox's lock, so that no post reaches its followers
+    // after their DROP (10.4).
+    let dropped = mailbox::drop_mailbox(&cx.inner, &mailbox, &reason)
+        .await
+        .map_err(|e| {
+            tracing::error!("admin: dropping a mailbox: {e}");
+            err(ErrorCode::Internal)
+        })?;
+    if !dropped {
         return Err(err(ErrorCode::NotFound));
     }
-    misc::mailbox_dropped(&cx.inner, mailbox).await;
-    let line = OutLine::new(ServerMessage::new(ServerLine::Drop { mailbox, reason }));
-    let followers = cx.inner.mailbox.followers(&mailbox);
-    {
-        let reg = cx.inner.reg();
-        for conn in followers.iter().filter_map(|id| reg.conns.get(id)) {
-            conn.handle.send_line(line.clone());
-        }
-    }
-    for conn in followers {
-        misc::unfollow(&cx.inner, conn, &mailbox);
-    }
-    mailbox::dropped(&cx.inner, &mailbox);
     tracing::info!("mailbox dropped");
     Ok(OkResponse::new())
 }

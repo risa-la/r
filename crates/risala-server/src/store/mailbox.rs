@@ -239,8 +239,8 @@ pub struct NewPost {
     pub next: Option<(u64, TokenHash)>,
     /// The `cid` it was tagged with (7.6).
     pub cid: Option<String>,
-    /// The mailbox's quota in bytes (7.5): its oldest posts expire early to
-    /// make room.
+    /// The bytes the mailbox's posts may take (7.5): its quota less its
+    /// files and blobs. Its oldest posts expire early to make room.
     pub quota: u64,
     /// What it changes in a public room.
     pub room: Option<RoomChange>,
@@ -325,6 +325,11 @@ pub trait MailboxStore {
 
     /// The bytes of the posts `mailbox` keeps (7.5).
     fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64>;
+
+    /// Expires the oldest posts of `mailbox` early until it keeps at most
+    /// `max` bytes of posts, to make room within its quota for files and
+    /// blobs (7.5). Returns how many expired.
+    fn trim_posts(&self, mailbox: &BoxName, max: u64) -> Result<usize>;
 
     /// Whether `pseudonym` is muted in `mailbox` at `now` (6.4).
     fn muted(&self, mailbox: &BoxName, pseudonym: &Pseudonym, now: Timestamp) -> Result<bool>;

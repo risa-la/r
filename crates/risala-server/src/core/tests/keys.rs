@@ -721,7 +721,10 @@ async fn a_removed_device_loses_its_keypackages_and_welcomes() {
     )
     .await;
     assert_eq!(alice.lines(), ["OK"]);
-    keys::device_removed(h.inner(), bob.uid.clone(), bob.key.public_key())
+    let device = risala_proto::record::DeviceId::of(&risala_proto::auth::PublicKey::from_bytes(
+        bob.key.public_key(),
+    ));
+    keys::device_removed(h.inner(), bob.uid.clone(), device)
         .await
         .unwrap();
     b.lines();
@@ -977,8 +980,8 @@ async fn put_urls_last_ten_minutes() {
 #[tokio::test]
 async fn blob_sizes_and_quotas_are_limited() {
     let mut h = keys_with(|c| {
-        c.files.quota = 100;
-        c.files.address_bytes_per_hour = 150;
+        c.limits.mailbox_quota = 100;
+        c.limits.address_bytes_per_hour = 150;
     });
     h.mailbox();
     let mut anon = h.anon().await;

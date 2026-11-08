@@ -168,7 +168,7 @@ async fn info_on_every_kind_of_connection() {
     let mut h = Harness::new();
     let mut new = h.connect();
     h.send(&new, "INFO").await;
-    let want = "OK version=1 anon=yes guests=yes register=no log=no retention=30 quota=268435456 push=yes upload=no";
+    let want = "OK version=1 anon=yes guests=yes register=no log=no retention=30 quota=4294967296 push=yes upload=no";
     assert_eq!(new.lines(), [want]);
     let mut anon = h.anon().await;
     h.send(&anon, "@ref=i INFO").await;
@@ -210,7 +210,7 @@ async fn info_follows_the_settings() {
     assert_eq!(
         info(&mut c),
         "OK version=1 anon=yes guests=no register=example.org \
-         log=https://chat.example.org/risala-log/1 retention=7 quota=268435456 push=no upload=no"
+         log=https://chat.example.org/risala-log/1 retention=7 quota=4294967296 push=no upload=no"
     );
     // Closed registration is register=no (8.5), and ADMIN SET shows at once.
     let mut op = h.signed_in_as("op@example.org");
@@ -221,7 +221,7 @@ async fn info_follows_the_settings() {
     assert_eq!(
         info(&mut c),
         "OK version=1 anon=no guests=no register=no \
-         log=https://chat.example.org/risala-log/1 retention=7 quota=268435456 push=no upload=no"
+         log=https://chat.example.org/risala-log/1 retention=7 quota=4294967296 push=no upload=no"
     );
     // Without push, PUSH is not supported.
     let mut alice = h.signed_in_as("alice@example.org");

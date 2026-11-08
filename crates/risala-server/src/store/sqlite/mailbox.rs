@@ -371,6 +371,33 @@ fn store_room_group(
     Ok(())
 }
 
+/// Expires the oldest posts of `mailbox` until it keeps at most `max`
+/// bytes of posts (7.5). Returns how many expired.
+fn trim_posts(tx: &Transaction<'_>, mailbox: &[u8], max: u64) -> Result<usize> {
+    let mut expired = 0;
+    loop {
+        let bytes: Option<i64> = tx
+            .query_row(
+                "SELECT bytes FROM mailboxes WHERE box = ?",
+                [mailbox],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if from_sql_u64("bytes", bytes.unwrap_or(0))? <= max {
+            return Ok(expired);
+        }
+        let deleted = tx.execute(
+            "DELETE FROM posts WHERE box = ?1 AND seq = (
+                 SELECT min(seq) FROM posts WHERE box = ?1)",
+            [mailbox],
+        )?;
+        if deleted == 0 {
+            return Ok(expired);
+        }
+        expired += deleted;
+    }
+}
+
 impl MailboxStore for SqliteStore {
     fn create_mailbox(&self, new: &NewMailbox) -> Result<Created> {
         self.write(|tx| {
@@ -532,24 +559,7 @@ impl MailboxStore for SqliteStore {
                 return Ok(Posted::OverQuota);
             }
             // Over its quota, the mailbox's oldest posts expire early (7.5).
-            loop {
-                let bytes: i64 = tx.query_row(
-                    "SELECT bytes FROM mailboxes WHERE box = ?",
-                    [mailbox],
-                    |row| row.get(0),
-                )?;
-                if from_sql_u64("bytes", bytes)?.saturating_add(size) <= post.quota {
-                    break;
-                }
-                let deleted = tx.execute(
-                    "DELETE FROM posts WHERE box = ?1 AND seq = (
-                         SELECT min(seq) FROM posts WHERE box = ?1)",
-                    [mailbox],
-                )?;
-                if deleted == 0 {
-                    break;
-                }
-            }
+            trim_posts(tx, mailbox, post.quota - size)?;
             let seq = head + 1;
             let t = millis(post.t);
             let (message, blob) = match &post.message {
@@ -674,6 +684,10 @@ impl MailboxStore for SqliteStore {
                 .optional()?;
             from_sql_u64("bytes", bytes.unwrap_or(0))
         })
+    }
+
+    fn trim_posts(&self, mailbox: &BoxName, max: u64) -> Result<usize> {
+        self.write(|tx| trim_posts(tx, &mailbox.as_bytes()[..], max))
     }
 
     fn muted(&self, mailbox: &BoxName, pseudonym: &Pseudonym, now: Timestamp) -> Result<bool> {
@@ -1340,6 +1354,23 @@ mod tests {
         big.message = PostBody::Inline(vec![1; 100]);
         assert_eq!(store.add_post(&big).unwrap(), Posted::Seq(5));
         assert_eq!(seqs(&store, &m.mailbox), [5]);
+    }
+
+    /// Files and blobs make room by expiring the oldest posts (7.5).
+    #[test]
+    fn trimming_posts() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        for secs in 0..4 {
+            store.add_post(&post(m.mailbox, secs, 30)).unwrap();
+        }
+        assert_eq!(store.trim_posts(&m.mailbox, 120).unwrap(), 0);
+        assert_eq!(store.trim_posts(&m.mailbox, 70).unwrap(), 2);
+        assert_eq!(seqs(&store, &m.mailbox), [3, 4]);
+        assert_eq!(store.trim_posts(&m.mailbox, 0).unwrap(), 2);
+        assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 0);
+        assert_eq!(store.trim_posts(&new_mailbox(2).mailbox, 0).unwrap(), 0);
     }
 
     /// Retention expires posts oldest first, stopping at the first that is

@@ -408,7 +408,7 @@ async fn settings() {
     assert_eq!(
         c.lines(),
         [
-            "OK version=1 anon=no guests=no register=no log=no retention=7 quota=268435456 push=yes upload=no"
+            "OK version=1 anon=no guests=no register=no log=no retention=7 quota=4294967296 push=yes upload=no"
         ]
     );
     let settings = h.store.settings(&h.inner().settings()).unwrap();

@@ -24,7 +24,7 @@
 
 mod room;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -70,8 +70,6 @@ pub(crate) struct State {
     creates: Limit,
     posts: Limit,
     commits: Limit,
-    /// The bytes each network address stored in the last hour (7.5).
-    stored: ByteWindow,
     /// Public rooms' groups (12.6).
     rooms: room::Rooms,
 }
@@ -120,60 +118,6 @@ impl Limit {
     }
 }
 
-/// The bytes each key stored in a sliding window (7.5), in memory only
-/// (4.2).
-#[derive(Debug)]
-struct ByteWindow {
-    window: Duration,
-    stored: Mutex<HashMap<IpAddr, VecDeque<(Timestamp, u64)>>>,
-}
-
-impl ByteWindow {
-    fn new(window: Duration) -> ByteWindow {
-        ByteWindow {
-            window,
-            stored: Mutex::default(),
-        }
-    }
-
-    /// Counts `bytes` for `address` at `now`, unless that takes it over
-    /// `max` in the window: then the seconds until it would fit. A `max`
-    /// of 0 means no limit.
-    fn charge(&self, address: IpAddr, bytes: u64, max: u64, now: Timestamp) -> Result<(), u64> {
-        if max == 0 {
-            return Ok(());
-        }
-        let mut all = self.stored.lock().unwrap_or_else(|e| e.into_inner());
-        all.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= self.window)
-            {
-                times.pop_front();
-            }
-            !times.is_empty()
-        });
-        let times = all.entry(address).or_default();
-        let total: u64 = times.iter().map(|(_, n)| n).sum();
-        if total.saturating_add(bytes) > max {
-            // Wait until enough of the oldest has left the window.
-            let mut left = total.saturating_add(bytes).saturating_sub(max);
-            let mut until = now;
-            for (t, n) in times.iter() {
-                until = *t;
-                left = left.saturating_sub(*n);
-                if left == 0 {
-                    break;
-                }
-            }
-            let waited = now.saturating_duration_since(until);
-            return Err(self.window.saturating_sub(waited).as_secs().max(1));
-        }
-        times.push_back((now, bytes));
-        Ok(())
-    }
-}
-
 fn rate_limited(retry: u64) -> ErrResponse {
     err(ErrorCode::RateLimited).with_retry(retry)
 }
@@ -187,7 +131,6 @@ impl State {
             creates: Limit::new(HOUR),
             posts: Limit::new(MINUTE),
             commits: Limit::new(HOUR),
-            stored: ByteWindow::new(HOUR),
             rooms: room::Rooms::new(),
         })
     }
@@ -306,24 +249,6 @@ impl State {
         }
         conns
     }
-
-    /// Counts `bytes` that the network address of `peer` stores, with POST,
-    /// UPLOAD or BLOB, against the hourly limit (7.5), or fails with the
-    /// seconds to wait.
-    pub(crate) fn charge_address(
-        &self,
-        config: &Config,
-        peer: IpAddr,
-        bytes: u64,
-        now: Timestamp,
-    ) -> Result<(), u64> {
-        self.stored.charge(
-            network(peer),
-            bytes,
-            config.limits.address_bytes_per_hour,
-            now,
-        )
-    }
 }
 
 /// What the mailbox area keeps about one connection: nothing, beyond what
@@ -424,18 +349,22 @@ async fn create(
             let held = cx
                 .db(move |store| {
                     let Some(old) = store.mailbox(&from)? else {
-                        return Ok(None);
+                        return Ok(Err(ErrorCode::NotFound));
                     };
                     if old.group_id != group_id {
-                        return Ok(None);
+                        return Ok(Err(ErrorCode::NotFound));
                     }
-                    store.has_token(&from, epoch - 1, &hash).map(Some)
+                    // Public rooms never move (5.2, 7.8).
+                    if old.room.is_some() {
+                        return Ok(Err(ErrorCode::Forbidden));
+                    }
+                    store.has_token(&from, epoch - 1, &hash).map(Ok)
                 })
                 .await?;
             match held {
-                None => return Err(err(ErrorCode::NotFound)),
-                Some(false) => return Err(err(ErrorCode::Stale)),
-                Some(true) => (epoch, Some(from)),
+                Err(code) => return Err(err(code)),
+                Ok(false) => return Err(err(ErrorCode::Stale)),
+                Ok(true) => (epoch, Some(from)),
             }
         }
     };
@@ -633,11 +562,9 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         OrBlob::Inline(_) => PostBody::Inline(bytes.clone()),
         OrBlob::Blob(blob) => PostBody::Blob(*blob),
     };
+    // One window per network address, with UPLOAD and BLOB (7.5).
     if !post.live {
-        inner
-            .mailbox
-            .charge_address(&inner.config, cx.peer.ip(), message.size(), now)
-            .map_err(rate_limited)?;
+        keys::charge_address(inner, cx.peer.ip(), message.size())?;
     }
     // 5. A public room's commits and proposals.
     let room = if public_room && !framing.private {
@@ -656,6 +583,13 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         send_to_followers(inner, &mailbox, &OutLine::new(ServerMessage::new(line)));
         return Ok(OkResponse::new());
     }
+    // One quota for the mailbox's posts, files and blobs (7.5): its posts
+    // take what its files and blobs leave.
+    let files = keys::stored_bytes(inner, mailbox).await.map_err(|e| {
+        tracing::error!("mailbox: {e}");
+        err(ErrorCode::Internal)
+    })?;
+    let quota = limits.mailbox_quota.saturating_sub(files);
     let new = NewPost {
         mailbox,
         t: now,
@@ -663,7 +597,7 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         token: used,
         next: post.next.map(|next| (framing.epoch, next)),
         cid,
-        quota: limits.mailbox_quota,
+        quota,
         room: room.as_ref().map(|room| room.change.clone()),
     };
     let seq = match cx.db(move |store| store.add_post(&new)).await? {
@@ -671,8 +605,32 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         Posted::OverQuota => return Err(rate_limited(HOUR.as_secs())),
         Posted::NoMailbox => return Err(err(ErrorCode::NotFound)),
     };
-    if let Some(room) = room {
-        inner.mailbox.rooms.applied(mailbox, room);
+    if let Some(room) = room
+        && let Some(joins) = inner.mailbox.rooms.applied(mailbox, room)
+    {
+        // Before the OK, so that the committer's WELCOME PUT with `-` finds
+        // the joins (12.6, 12.8). The post is kept by now, so a failure
+        // here costs the joiners only their Welcomes: they propose again.
+        let room::Joins {
+            epoch,
+            committer_uid,
+            committer,
+            refs,
+            tree,
+        } = joins;
+        if let Err(e) = keys::room_joins_committed(
+            &cx.inner,
+            mailbox,
+            epoch,
+            committer_uid,
+            committer,
+            refs,
+            tree,
+        )
+        .await
+        {
+            tracing::error!("keeping a public room's joins for Welcomes: {e}");
+        }
     }
     let seq = Seq::new(seq).ok_or_else(|| err(ErrorCode::Internal))?;
     let mut line = Post::new(seq, now, mailbox, post.message);
@@ -862,10 +820,6 @@ pub(crate) async fn check_token(
 /// Deletes `mailbox` with its posts, and for a public room the room, and
 /// sends `DROP <box> [<reason...>]` to every connection that follows it
 /// (6.1, 10.4). `reason` is escaped text. Returns whether it existed.
-#[allow(
-    dead_code,
-    reason = "ADMIN DROP drops by itself (admin.rs); the tests drop with this"
-)]
 pub(crate) async fn drop_mailbox(
     inner: &Inner,
     mailbox: &BoxName,
@@ -955,6 +909,22 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Files or blobs of `mailbox` will take `files` bytes of its quota (7.5):
+/// its oldest posts expire early until its posts fit in the rest. Under
+/// the mailbox's lock, so that it does not run within a POST. The keys
+/// area calls this for UPLOAD and BLOB.
+pub(crate) async fn make_room(inner: &Inner, mailbox: BoxName, files: u64) -> Result<(), StoreError> {
+    let _lock = inner.mailbox.lock(mailbox).await;
+    let max = inner.config.limits.mailbox_quota.saturating_sub(files);
+    let expired = inner
+        .db(move |store| store.trim_posts(&mailbox, max))
+        .await?;
+    if expired > 0 {
+        tracing::debug!(expired, "posts expired early for files");
+    }
+    Ok(())
+}
+
 /// The role that lets an identity mute in a public room (6.4).
 fn may_mute(role: Option<Role>) -> bool {
     matches!(role, Some(Role::Owner | Role::Mod))
@@ -963,11 +933,4 @@ fn may_mute(role: Option<Role>) -> bool {
 /// The most a mailbox may hold at once, for INFO's `quota=` (7.5, 8.5).
 pub(crate) fn quota(inner: &Inner) -> Option<u64> {
     Some(inner.config.limits.mailbox_quota)
-}
-
-/// An operator dropped the mailbox (10.4): nobody follows it any more, and
-/// its room's group is gone from memory. The DROP line is the caller's.
-pub(crate) fn dropped(inner: &Inner, mailbox: &BoxName) {
-    inner.mailbox.forget_mailbox(mailbox);
-    inner.mailbox.rooms.forget(mailbox);
 }

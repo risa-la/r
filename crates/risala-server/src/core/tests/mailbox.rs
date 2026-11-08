@@ -997,6 +997,82 @@ async fn quotas() {
     assert!(anon.lines()[0].ends_with("ERR rate-limited"));
 }
 
+/// One quota for a mailbox's posts, files and blobs (7.5): files and
+/// blobs make its oldest posts expire early, never the other way round,
+/// and its posts get what they leave.
+#[tokio::test]
+async fn one_quota_for_posts_and_files() {
+    let mut config = config();
+    config.limits.mailbox_quota = 60_000;
+    config.limits.posts_per_minute = 0;
+    let mut h = Harness::with(config, timers());
+    h.hub.set_files_url("https://chat.example.org");
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    for i in 0..20u8 {
+        let message = d.alice.send(&mut d.a, &[i; 1000]);
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+        )
+        .await;
+        assert!(anon.lines()[0].starts_with("OK seq="));
+    }
+    let posts = h.store.mailbox_bytes(&d.m).unwrap();
+    assert!(posts > 20_000, "{posts}");
+    // A blob that fits beside the posts only if some expire.
+    let token = d.alice.token(&d.a);
+    let blob = |b: &[u8]| risala_proto::names::BlobRef::of(b);
+    h.send(
+        &anon,
+        &format!("BLOB {} 50000 box={} token={token}", blob(b"a"), d.m),
+    )
+    .await;
+    assert!(anon.raw_lines()[0].starts_with("OK put="));
+    assert!(h.store.mailbox_bytes(&d.m).unwrap() <= 10_000);
+    // Another that does not fit beside it.
+    h.send(
+        &anon,
+        &format!("BLOB {} 20000 box={} token={token}", blob(b"b"), d.m),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR rate-limited"]);
+    // A post larger than what the blob leaves.
+    let big = d.alice.send(&mut d.a, &[9; 15_000]);
+    h.send(&anon, &format!("POST {} {token} {big}", d.m)).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+    // A smaller one fits, and the posts stay within what is left.
+    let small = d.alice.send(&mut d.a, &[9; 3000]);
+    h.send(&anon, &format!("POST {} {token} {small}", d.m))
+        .await;
+    assert!(anon.lines()[0].starts_with("OK seq="));
+    assert!(h.store.mailbox_bytes(&d.m).unwrap() <= 10_000);
+}
+
+/// POST, UPLOAD and BLOB share one window per network address (7.5).
+#[tokio::test]
+async fn one_address_window() {
+    let mut config = config();
+    config.limits.address_bytes_per_hour = 1_000_000;
+    let mut h = Harness::with(config, timers());
+    h.hub.set_files_url("https://chat.example.org");
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let token = d.alice.token(&d.a);
+    // The commit that made the group took some of the window.
+    let commit = d.commit.parse::<MlsMessage>().unwrap().decode().len() as u64;
+    let size = 1_000_000 - commit - 3000;
+    let blob = risala_proto::names::BlobRef::of(b"a");
+    h.send(&anon, &format!("BLOB {blob} {size} box={} token={token}", d.m))
+        .await;
+    let lines = anon.raw_lines();
+    assert!(lines[0].starts_with("OK put="), "{lines:?}");
+    let message = d.alice.send(&mut d.a, &[1; 6000]);
+    h.send(&anon, &format!("POST {} {token} {message}", d.m))
+        .await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+}
+
 /// Retention: posts expire oldest first, and a mailbox whose posts have
 /// all expired and that nobody follows ends (7.5).
 #[tokio::test]
@@ -1464,6 +1540,129 @@ async fn public_room_joins() {
         anon.lines(),
         ["ERR forbidden - is only for joining a public room"]
     );
+}
+
+/// A device joins a public room by external proposal; the owner's device
+/// commits it and puts its Welcome with `-`; the joiner gets it with the
+/// tree of its epoch, and joins (6.1, 12.6, 12.8).
+#[tokio::test]
+async fn public_room_welcomes() {
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let dave = Dev::new("dave@example.org", 4);
+    let made = make_join_key_package(&dave.provider, &dave.identity(), Some(&dave.profile()))
+        .unwrap();
+    let context = room.o.public_group().group_context();
+    let proposal = b64(&join_proposal::<Provider<MemoryStorage>>(
+        &made.key_package,
+        context.group_id(),
+        context.epoch().as_u64(),
+        &made.leaf_key,
+    )
+    .unwrap());
+    let kp_ref = made
+        .key_package
+        .hash_ref(dave.provider.crypto())
+        .unwrap();
+    let kp_ref = risala_proto::mls::KeyPackageRef::from_bytes(kp_ref.as_slice().try_into().unwrap());
+    let mut anon = h.anon().await;
+    h.send(&anon, &format!("POST {m} - {proposal}")).await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+    // Nothing to fetch yet, and nothing to put before a commit applies it.
+    h.send(&anon, &format!("WELCOME GET {kp_ref}")).await;
+    assert_eq!(anon.lines(), ["ERR not-found"]);
+
+    // The owner's device commits it.
+    let bytes = proposal.parse::<MlsMessage>().unwrap().decode();
+    process_message(&room.owen.provider, &mut room.o, &bytes).unwrap();
+    let token0 = room.owen.token(&room.o);
+    let out = room.owen.commit(&mut room.o, Changes::default());
+    assert_eq!(out.added.len(), 1);
+    h.send(
+        &room.signed,
+        &format!(
+            "POST {m} {token0} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(out.group_info.as_ref().unwrap())
+        ),
+    )
+    .await;
+    assert_eq!(room.signed.lines(), ["OK seq=2"]);
+    room.owen.merge(&mut room.o, &out);
+    let welcome = risala_proto::mls::Welcome::from_bytes(out.welcome.as_ref().unwrap()).unwrap();
+
+    // Only the committing device puts it.
+    let other = Dev::new("owen@example.org", 9);
+    let mut other_conn = other.sign_in(&mut h);
+    h.send(&other_conn, &format!("WELCOME PUT {kp_ref} - {welcome}"))
+        .await;
+    assert_eq!(other_conn.lines(), ["ERR forbidden"]);
+    h.send(&room.signed, &format!("WELCOME PUT {kp_ref} - {welcome}"))
+        .await;
+    assert_eq!(room.signed.lines(), ["OK"]);
+
+    // The joiner gets it with the tree, and joins.
+    h.send(&anon, &format!("WELCOME GET {kp_ref}")).await;
+    let lines = anon.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[1], "OK");
+    let words: Vec<&str> = lines[0].split(' ').collect();
+    assert_eq!(words[0], "WELCOME");
+    assert_eq!(words[2], welcome.to_string());
+    // A tree too long for the line is a blob the server keeps (12.12).
+    let tree = match words[3].strip_prefix("tree=").expect("a tree") {
+        blob if blob.starts_with("sha384:") => {
+            let blob: risala_proto::names::BlobRef = blob.parse().unwrap();
+            crate::core::keys::blob_bytes(h.inner(), &blob, u64::MAX)
+                .await
+                .unwrap()
+        }
+        inline => inline
+            .parse::<risala_proto::mls::RatchetTree>()
+            .unwrap()
+            .decode(),
+    };
+    let expect = risala_mls::checks::JoinExpectation {
+        host: host(),
+        own_uid: dave.uid.clone(),
+        public_room: Some(("#general".parse().unwrap(), *m.as_bytes())),
+    };
+    let joined = join_by_welcome(
+        &dave.provider,
+        &out.welcome.unwrap(),
+        Some(&tree),
+        &expect,
+    )
+    .unwrap();
+    assert_eq!(joined.group.epoch(), room.o.epoch());
+    assert_eq!(
+        joined.group.epoch_authenticator().as_slice(),
+        room.o.epoch_authenticator().as_slice()
+    );
+}
+
+/// Public rooms never move: CREATE with `from` naming one gets
+/// `ERR forbidden`, even with the group's id and token (5.2, 7.8).
+#[tokio::test]
+async fn public_rooms_do_not_move() {
+    let mut h = harness_now();
+    let room = create_room(&mut h, 1).await;
+    let mut anon = h.anon().await;
+    h.send(
+        &anon,
+        &format!(
+            "CREATE {} {} {} epoch=1 from={} token={}",
+            mailbox(9),
+            gid(&room.o),
+            hash([6; 48]),
+            room.m,
+            room.owen.token(&room.o)
+        ),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR forbidden"]);
 }
 
 /// The second form of CREATE: a public room, on its owner's device's

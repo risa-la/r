@@ -223,7 +223,7 @@ async fn section_13_by_hand() {
         (
             NEW,
             "INFO".into(),
-            "OK version=1 anon=yes guests=yes register=no log=no retention=30 quota=268435456 push=yes upload=no",
+            "OK version=1 anon=yes guests=yes register=no log=no retention=30 quota=4294967296 push=yes upload=no",
         ),
         (
             NEW,

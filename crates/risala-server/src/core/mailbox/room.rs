@@ -35,7 +35,9 @@ use risala_mls::openmls::prelude::{
 use risala_mls::wire::{read_group_info, read_protocol_message, read_tree, tree_to_bytes};
 use risala_proto::command::PublicRoom;
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{GroupId, GroupInfo, OrBlob, Pseudonym, RatchetTree, TokenHash};
+use risala_proto::mls::{
+    GroupId, GroupInfo, KeyPackageRef, OrBlob, Pseudonym, RatchetTree, TokenHash,
+};
 use risala_proto::names::{BoxName, Seq, ServerAddr, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
 use risala_proto::time::Timestamp;
@@ -87,7 +89,23 @@ pub(super) struct Rooms {
 pub(super) struct CheckedPost {
     /// What to store with the post.
     pub(super) change: RoomChange,
+    /// A commit's external joins, which may then get Welcomes (12.8).
+    pub(super) joins: Option<Joins>,
     group: RoomCache,
+}
+
+/// The external Add proposals a public room's commit applied (12.6, 12.8):
+/// one Welcome each may come from the committing device.
+pub(super) struct Joins {
+    /// The epoch the commit started.
+    pub(super) epoch: u64,
+    /// The committer's identity and device id (4.4).
+    pub(super) committer_uid: Uid,
+    pub(super) committer: [u8; 48],
+    /// The KeyPackageRefs of the proposals' KeyPackages.
+    pub(super) refs: Vec<KeyPackageRef>,
+    /// The ratchet tree of the new epoch.
+    pub(super) tree: Vec<u8>,
 }
 
 impl Rooms {
@@ -123,9 +141,11 @@ impl Rooms {
             .filter(|c| c.epoch == stored.epoch && c.proposals == stored.proposals.len())
     }
 
-    /// A post to `mailbox` was kept: its group is now `post`'s.
-    pub(super) fn applied(&self, mailbox: BoxName, post: CheckedPost) {
+    /// A post to `mailbox` was kept: its group is now `post`'s. Returns
+    /// the commit's external joins.
+    pub(super) fn applied(&self, mailbox: BoxName, post: CheckedPost) -> Option<Joins> {
         self.keep(mailbox, post.group);
+        post.joins
     }
 
     fn keep(&self, mailbox: BoxName, group: RoomCache) {
@@ -504,6 +524,24 @@ pub(super) async fn check_post(
                     .update_path_leaf_node()
                     .map(|leaf| leaf.signature_key().as_slice().to_vec());
                 let conversation = commit_view.new_conversation.clone().map_err(invalid)?;
+                // The KeyPackages of the external Adds it applies, which
+                // the committer may then send Welcomes to (12.8).
+                let refs = staged
+                    .add_proposals()
+                    .filter(|add| matches!(add.sender(), MlsSender::NewMemberProposal))
+                    .map(|add| {
+                        let r = add
+                            .add_proposal()
+                            .key_package()
+                            .hash_ref(&*crypto)
+                            .map_err(|e| invalid(format!("{e:?}")))?;
+                        let bytes: [u8; 48] = r
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| invalid("a KeyPackageRef is 48 bytes"))?;
+                        Ok(KeyPackageRef::from_bytes(bytes))
+                    })
+                    .collect::<Result<Vec<_>, ErrResponse>>()?;
                 room.group
                     .merge_commit(&room.storage, *staged)
                     .map_err(|e| invalid(format!("{e:?}")))?;
@@ -531,8 +569,19 @@ pub(super) async fn check_post(
                 let update = room_update(&room.group, &conversation, group_info, &room.state)?;
                 room.epoch = update.epoch;
                 room.proposals = 0;
+                let joins = match committer.device_id {
+                    Some(device_id) if !refs.is_empty() => Some(Joins {
+                        epoch: update.epoch,
+                        committer_uid: committer.uid.clone(),
+                        committer: *device_id.as_bytes(),
+                        refs,
+                        tree,
+                    }),
+                    _ => None,
+                };
                 Ok(CheckedPost {
                     change: RoomChange::Commit(update),
+                    joins,
                     group: room,
                 })
             }
@@ -619,6 +668,7 @@ fn keep_proposal(
             message,
             state: encode_state(&room.state)?,
         },
+        joins: None,
         group: room,
     })
 }

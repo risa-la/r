@@ -214,8 +214,17 @@ impl<K: Eq + Hash + Clone> ByteWindow<K> {
         let taken = all.entry(key).or_default();
         let used: u64 = taken.iter().map(|(_, n)| n).sum();
         if used.saturating_add(bytes) > max {
-            let oldest = taken.front().map_or(now, |(t, _)| *t);
-            let waited = now.saturating_duration_since(oldest);
+            // Wait until enough of the oldest has left the window.
+            let mut left = used.saturating_add(bytes).saturating_sub(max);
+            let mut until = now;
+            for (t, n) in taken.iter() {
+                until = *t;
+                left = left.saturating_sub(*n);
+                if left == 0 {
+                    break;
+                }
+            }
+            let waited = now.saturating_duration_since(until);
             return Err(self.window.saturating_sub(waited).as_secs().max(1));
         }
         taken.push_back((now, bytes));
@@ -735,10 +744,6 @@ const MAX_INLINE_TREE: usize = MAX_SERVER_LINE / 2;
 /// The mailbox area calls this once it has accepted such a commit, with
 /// the KeyPackageRefs of the proposals' KeyPackages and the tree it
 /// exported after merging the commit (docs/plans/M5b.md, SV3).
-#[allow(
-    dead_code,
-    reason = "called by the mailbox area (docs/plans/M5b.md, SV3)"
-)]
 pub(crate) async fn room_joins_committed(
     inner: &Arc<Inner>,
     mailbox: BoxName,
@@ -840,22 +845,13 @@ pub(crate) async fn blob_bytes(inner: &Inner, hash: &BlobRef, max: u64) -> Resul
     }
 }
 
-/// The device whose key is `device_key` has left `uid` (4.8): its
-/// KeyPackages and pending Welcomes go (12.8). The identity area calls
-/// this.
-#[allow(
-    dead_code,
-    reason = "called by the identity area (docs/plans/M5b.md, SV1)"
-)]
+/// The device `device` has left `uid` (4.4, 4.8): its KeyPackages and
+/// pending Welcomes go (12.8). The identity area calls this.
 pub(crate) async fn device_removed(
     inner: &Inner,
     uid: Uid,
-    device_key: &[u8],
+    device: risala_proto::record::DeviceId,
 ) -> Result<(), StoreError> {
-    // A key that is not an ML-DSA-44 key names no device.
-    let Some(device) = risala_mls::identity::device_id_of(device_key) else {
-        return Ok(());
-    };
     let device = *device.as_bytes();
     inner
         .db(move |store| store.forget_device(&uid, &device))
@@ -877,7 +873,7 @@ async fn check_token(cx: &Cx, mailbox: &BoxName, token: &SendToken) -> Result<()
 /// window, which POST, UPLOAD and BLOB share (7.5): `ERR rate-limited`
 /// when it is full. The mailbox area calls this for POST.
 pub(crate) fn charge_address(inner: &Inner, ip: IpAddr, bytes: u64) -> Result<(), ErrResponse> {
-    let max = inner.config.files.address_bytes_per_hour;
+    let max = inner.config.limits.address_bytes_per_hour;
     inner
         .keys
         .address_bytes
@@ -885,30 +881,35 @@ pub(crate) fn charge_address(inner: &Inner, ip: IpAddr, bytes: u64) -> Result<()
         .map_err(rate_limited)
 }
 
-/// The bytes of files and blobs kept for `mailbox` (7.5). The mailbox
-/// area adds its posts to check the quota on POST.
-#[allow(
-    dead_code,
-    reason = "called by the mailbox area (docs/plans/M5b.md, SV3)"
-)]
+/// The bytes of files and blobs kept for `mailbox` (7.5), those on their
+/// way included. The mailbox area takes them from the quota left for its
+/// posts on POST.
 pub(crate) async fn stored_bytes(inner: &Inner, mailbox: BoxName) -> Result<u64, StoreError> {
     inner
         .db(move |store| store.mailbox_file_bytes(&mailbox))
         .await
 }
 
-/// Checks that `mailbox` has room for `size` more bytes (7.5).
-///
-/// TODO(SV3): the quota counts the mailbox's posts too; add them here
-/// once the mailbox area has a way to count them.
+/// Checks that `mailbox` has room for `size` more bytes of files and blobs
+/// within its one quota for posts, files and blobs (7.5): files and blobs
+/// are not expired early, so ones that do not fit beside the others get
+/// `ERR rate-limited`; then the oldest posts expire early to make room,
+/// as a post over the quota makes them (the choice of 7.5 SV3 made).
+/// The bytes count against the address's window too, before any post
+/// expires.
 async fn check_quota(cx: &Cx, mailbox: BoxName, size: u64) -> Result<(), ErrResponse> {
-    let quota = cx.inner.config.files.quota;
-    let used = cx
-        .db(move |store| store.mailbox_file_bytes(&mailbox))
-        .await?;
-    if used.saturating_add(size) > quota {
+    let quota = cx.inner.config.limits.mailbox_quota;
+    let files = stored_bytes(&cx.inner, mailbox)
+        .await
+        .map_err(internal)?
+        .saturating_add(size);
+    if files > quota {
         return Err(err(ErrorCode::RateLimited));
     }
+    charge_address(&cx.inner, cx.peer.ip(), size)?;
+    mailbox::make_room(&cx.inner, mailbox, files)
+        .await
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -943,7 +944,6 @@ async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<MailboxPermit>) 
     let uid = match (&mailbox, cx.device()) {
         (Some(mailbox), _) => {
             check_quota(cx, *mailbox, size).await?;
-            charge_address(inner, cx.peer.ip(), size)?;
             None
         }
         (None, Some(device)) => {
@@ -985,7 +985,6 @@ async fn upload(cx: &Cx, mailbox: BoxName, token: SendToken, size: u64) -> Reply
     }
     check_token(cx, &mailbox, &token).await?;
     check_quota(cx, mailbox, size).await?;
-    charge_address(inner, cx.peer.ip(), size)?;
     let id = random_token(ID_LEN).map_err(internal)?;
     let [put, get, del] = [(); 3].map(|()| random_token(SECRET_LEN));
     let (put, get, del) = (

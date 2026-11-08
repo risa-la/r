@@ -1016,6 +1016,14 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
             misc::device_removed(inner, device).await;
         }
     }
+    // A removed device's KeyPackages and pending Welcomes go (12.8), for
+    // any identity whose records the server takes.
+    let uid = identity.to_uid();
+    for device in chain.removed().iter().copied() {
+        if let Err(e) = keys::device_removed(inner, uid.clone(), device).await {
+            tracing::error!("forgetting a removed device's KeyPackages: {e}");
+        }
+    }
     for (index, hash) in lines {
         cx.send(ServerLine::Record { index, hash });
     }
