@@ -19,6 +19,7 @@
 //!   reports, wrapped backup keys and push keys (4.7, 4.8, 5.8, 9.1,
 //!   12.13).
 //! - [`connection`]: kinds of connection, and their line limits (4.1, 13).
+//! - [`command`]: typed commands, client to server (4-12, 13).
 //! - [`auth`]: the sign-in challenge and ML-DSA-44 keys (4.6, App. B).
 //! - [`keyfile`]: key files (4.4).
 //! - [`fingerprint`]: certificate fingerprints for trust on first use (2.2).
@@ -27,6 +28,7 @@
 
 pub mod auth;
 pub mod binary;
+pub mod command;
 pub mod connection;
 pub mod error;
 pub mod fingerprint;
