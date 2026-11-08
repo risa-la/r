@@ -6,7 +6,8 @@ use risala_proto::names::{Room, Seq, Uid};
 use risala_proto::time::Timestamp;
 
 use super::{
-    EVENT_COLUMNS, EventRow, SqliteStore, append_in, event_from_row, ms, parse, seq, sql_seq,
+    EVENT_COLUMNS, EventRow, SqliteStore, append_in, conv_exists, event_from_row, ms, parse, seq,
+    sql_seq,
 };
 use crate::store::{
     Appended, ConvKey, EventKind, MessageStore, NewEvent, Page, PurgeQuery, RelatedQuery, Result,
@@ -64,6 +65,9 @@ impl MessageStore for SqliteStore {
     }
 
     fn related(&self, conv: ConvKey, q: RelatedQuery) -> Result<Page> {
+        // Under the same lock as the query: see `history`.
+        let conn = self.conn();
+        conv_exists(&conn, conv)?;
         if q.first > q.last {
             return Ok(Page {
                 events: Vec::new(),
@@ -72,8 +76,7 @@ impl MessageStore for SqliteStore {
         }
         let limit = q.limit.clamp(1, i64::MAX as u64 - 1);
         let after = i64::try_from(q.after).unwrap_or(i64::MAX);
-        let rows = self
-            .conn()
+        let rows = conn
             .prepare_cached(&format!(
                 "SELECT {EVENT_COLUMNS} WHERE e.conv = ? AND e.target BETWEEN ? AND ? \
                  AND e.verb = 'MSG' AND e.relation IN ('edit', 'react') AND e.seq > ? \

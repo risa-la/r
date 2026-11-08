@@ -46,6 +46,16 @@ pub(super) fn not_found() -> Fail {
     fail(ErrorCode::NotFound, "no such room")
 }
 
+/// A store error, except that a conversation that is gone is `not-found`:
+/// it was dropped (10.4) after the command looked it up, so the command
+/// answers as if it had come a moment later.
+pub(super) fn gone_is_not_found(e: StoreError) -> Fail {
+    match e {
+        StoreError::NoConversation => not_found(),
+        e => Fail::Store(e),
+    }
+}
+
 pub(super) fn not_supported() -> Fail {
     fail(ErrorCode::NotSupported, "not supported yet")
 }
@@ -870,7 +880,10 @@ impl Inner {
             before,
             limit: page_limit(limit, DEFAULT_LIMIT, self.config.limits.max_page),
         };
-        let page = self.db(move |s| s.history(key, query)).await?;
+        let page = self
+            .db(move |s| s.history(key, query))
+            .await
+            .map_err(gone_is_not_found)?;
         // Every line is made before any is sent, so that bad data gives
         // only `ERR internal`.
         let lines = page

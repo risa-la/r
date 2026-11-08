@@ -32,7 +32,9 @@ use risala_proto::server::OkResponse;
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, DEFAULT_LIMIT, FileUrl, MAX_REACTION, Relation, Role};
 
-use super::commands::{Fail, Outcome, Reply, check_read, fail, not_supported, room_of};
+use super::commands::{
+    Fail, Outcome, Reply, check_read, fail, gone_is_not_found, not_supported, room_of,
+};
 use super::state::{ConvState, RoomInfo};
 use super::{Hub, Inner};
 use crate::handler::ConnId;
@@ -344,7 +346,10 @@ impl Inner {
             (st.key, st.id.clone())
         };
         query.limit = query.limit.min(self.config.limits.max_page).max(1);
-        let page = self.db(move |s| s.related(key, query)).await?;
+        let page = self
+            .db(move |s| s.related(key, query))
+            .await
+            .map_err(gone_is_not_found)?;
         // Every line is made before any is sent, so that bad data gives
         // only `ERR internal`.
         let lines = page

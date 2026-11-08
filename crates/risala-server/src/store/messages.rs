@@ -65,7 +65,11 @@ pub trait MessageStore {
     /// A page of RELATED (7.3): the edits and reactions whose target is in
     /// `first..=last` and whose seq is greater than `after`, deleted ones
     /// included, in ascending seq order. `more` says whether there are
-    /// more after the last one returned.
+    /// more after the last one returned. [`StoreError::NoConversation`]
+    /// if the conversation no longer exists, as for
+    /// [`Store::history`](super::Store::history).
+    ///
+    /// [`StoreError::NoConversation`]: super::StoreError::NoConversation
     fn related(&self, conv: ConvKey, query: RelatedQuery) -> Result<Page>;
 
     /// The rooms in which `author` has messages that are not deleted, sent

@@ -2144,6 +2144,7 @@ impl crate::store::MessageStore for Flaky {
         self.inner.reaction(c, f, t, x, s)
     }
     fn related(&self, c: ConvKey, q: crate::store::RelatedQuery) -> crate::store::Result<Page> {
+        self.pause.at("related");
         self.inner.related(c, q)
     }
     fn authored_rooms(
@@ -2310,6 +2311,7 @@ impl Store for Flaky {
         self.inner.event(c, s)
     }
     fn history(&self, c: ConvKey, q: HistoryQuery) -> crate::store::Result<Page> {
+        self.pause.at("history");
         self.inner.history(c, q)
     }
     fn cid_seq(

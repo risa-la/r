@@ -651,6 +651,45 @@ async fn commands_waiting_on_a_dropped_room_get_not_found() {
     assert_eq!(lines[1], "@ref=m ERR not-found no such room");
 }
 
+/// HISTORY and RELATED whose query comes after a DROP that went through
+/// once they had checked the room: `not-found`, not an empty page with the
+/// old room's id.
+#[tokio::test]
+async fn history_and_related_racing_a_drop_get_not_found() {
+    for (method, line) in [
+        ("history", "@ref=q history #temp"),
+        ("related", "@ref=q related #temp 1 2"),
+    ] {
+        let flaky = Arc::new(Flaky::new());
+        let mut c = config();
+        c.rooms = strings(&["#general", "#private"]);
+        c.operators = strings(&[OP]);
+        for room in &c.rooms {
+            flaky
+                .inner
+                .ensure_room(&room.parse().unwrap(), start())
+                .unwrap();
+        }
+        prepare(&flaky.inner);
+        let mut h = Harness::on(c, flaky.clone(), timers());
+        let mut bob = h.signed_in_as(BOB);
+        let mut op = h.signed_in_as(OP);
+
+        flaky.pause.arm(method);
+        let (hub, id, req) = (h.hub.clone(), bob.id, line.parse().unwrap());
+        let query = tokio::spawn(async move { hub.command(id, req).await });
+        flaky.pause.reached().await;
+        h.send(&op, "admin drop #temp").await;
+        assert_eq!(op.lines(), ["OK"], "{method}");
+        flaky.pause.release();
+        query.await.unwrap();
+        let lines = bob.lines();
+        assert_eq!(lines.len(), 2, "{method}: {lines:?}");
+        assert!(lines[0].ends_with(" DROP #temp"), "{method}: {lines:?}");
+        assert_eq!(lines[1], "@ref=q ERR not-found no such room", "{method}");
+    }
+}
+
 #[tokio::test]
 async fn a_drop_that_fails_changes_nothing() {
     let flaky = Arc::new(Flaky::new());

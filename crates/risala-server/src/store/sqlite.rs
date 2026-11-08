@@ -664,6 +664,14 @@ fn append_in(tx: &Transaction<'_>, conv: ConvKey, event: &NewEvent) -> Result<Ap
     Ok(Appended::New(seq(next)?))
 }
 
+/// [`StoreError::NoConversation`] unless the conversation `conv` exists.
+pub(super) fn conv_exists(conn: &Connection, conv: ConvKey) -> Result<()> {
+    conn.prepare_cached("SELECT 1 FROM conversations WHERE conv = ?")?
+        .query_row([conv.0], |_| Ok(()))
+        .optional()?
+        .ok_or(StoreError::NoConversation)
+}
+
 /// The seq of a message sent with `cid` in the 24 hours before `now` (7.6).
 fn find_cid(
     conn: &Connection,
@@ -840,7 +848,10 @@ impl Store for SqliteStore {
         let limit = q.limit.clamp(1, i64::MAX as u64 - 1);
         let fetch = (limit + 1) as i64;
         let before = q.before.map_or(i64::MAX, sql_seq);
+        // Under the same lock as the query, so that a page is never read
+        // from a conversation dropped meanwhile, as an empty one.
         let conn = self.conn();
+        conv_exists(&conn, conv)?;
         let rows = match q.after {
             Some(after) => {
                 let after = i64::try_from(after).unwrap_or(i64::MAX);

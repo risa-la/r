@@ -511,7 +511,9 @@ pub trait Store:
     /// One event, or `None` if it does not exist or has expired.
     fn event(&self, conv: ConvKey, seq: Seq) -> Result<Option<StoredEvent>>;
 
-    /// A page of events (7.2).
+    /// A page of events (7.2). [`StoreError::NoConversation`] if the
+    /// conversation no longer exists, for example dropped (10.4) since
+    /// the caller looked it up.
     fn history(&self, conv: ConvKey, query: HistoryQuery) -> Result<Page>;
 
     /// The seq of the message `from` sent with `cid` to the conversation
