@@ -818,11 +818,13 @@ impl Conversation {
     /// Follow it with [`Account::wait_outbox`] or [`Account::subscribe`].
     ///
     /// `text` is plain; it is escaped here (3.4). Fails with
-    /// [`ClientError::NotJoined`] for a room that has never been joined,
-    /// and, for an identity, for a room it has left. A message still queued
-    /// when an identity learns it has left fails with
-    /// [`FailKind::NotInRoom`](super::FailKind::NotInRoom). A guest's
-    /// messages wait instead, since it rejoins its rooms after a reconnect.
+    /// [`ClientError::NotJoined`] for a room that has never been joined, or
+    /// that the account has left, or was kicked or banned from. A message
+    /// still queued when the account learns it has left fails with
+    /// [`FailKind::NotInRoom`](super::FailKind::NotInRoom). The exception
+    /// is a guest's room that went missing because its session ended:
+    /// messages wait, since the client joins it again after a reconnect
+    /// (4.2).
     pub async fn send(&self, text: &str) -> Result<OutboxEntry, ClientError> {
         self.send_draft(Draft::text(escape(text))).await
     }

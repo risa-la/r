@@ -138,6 +138,19 @@ async fn offline_sends_wait_in_the_outbox() {
     sam.part("#general", "").await.unwrap();
     assert!(rooms(&sam).is_empty());
     assert!(!general.info().unwrap().unwrap().joined);
+    // Its messages there fail, and new ones are refused (PLAN.md 5, item
+    // 37).
+    assert!(matches!(
+        sam.outbox().unwrap()[0].status,
+        OutboxStatus::Failed {
+            kind: FailKind::NotInRoom,
+            ..
+        }
+    ));
+    assert_eq!(
+        general.send("more").await.unwrap_err(),
+        ClientError::NotJoined("#general".into())
+    );
     // The read marker moves in the cache.
     general.mark_read(1).await.unwrap();
     assert_eq!(general.info().unwrap().unwrap().read, 1);
@@ -180,6 +193,40 @@ async fn offline_sends_to_a_room_left_are_refused() {
     );
     // Deleting still goes through the outbox (5.4).
     assert!(general.delete(1).await.is_ok());
+
+    // A guest's room that its client joins again after a new session
+    // takes messages (PLAN.md 5, item 37); another does not.
+    let sam = guest();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let shared = sam.shared();
+    let account = shared.id;
+    shared
+        .store
+        .write(|tx| {
+            let mut row = tx
+                .conv_by_name(account, &"#general".parse().unwrap())?
+                .unwrap();
+            tx.set_joined(&mut row, false)
+        })
+        .unwrap();
+    let general = sam.conversation("#general").unwrap();
+    assert_eq!(
+        general.send("hi").await.unwrap_err(),
+        ClientError::NotJoined("#general".into())
+    );
+    shared
+        .store
+        .set_rejoin(account, &"#general".parse().unwrap(), true)
+        .unwrap();
+    assert_eq!(
+        general.send("hi").await.unwrap().status,
+        OutboxStatus::Queued
+    );
 }
 
 #[tokio::test]
@@ -970,6 +1017,104 @@ async fn admin_keys_does_not_block_the_runtime() {
     .unwrap();
     assert!(listed.is_empty());
     assert!(keys.released.load(std::sync::atomic::Ordering::SeqCst));
+    sam.disconnect().await;
+    server.done().await;
+}
+
+#[tokio::test]
+async fn a_room_missing_from_a_resumed_session_is_not_joined_again() {
+    // 4.2: a resumed session is still in its rooms, so one missing from
+    // SYNC was left while the connection was down. Its messages fail and
+    // it comes off the rooms to join again (PLAN.md 5, item 37).
+    use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
+    let ca = TestCa::new();
+    let server = ScriptServer::start(ca.issue("chat.test"), 2, |i, mut peer: Peer| async move {
+        peer.greet().await;
+        if i == 0 {
+            // A new session: the client joins #general again first.
+            peer.expect("@ref=1 GUEST sam").await;
+            peer.send("@ref=1 OK uid=~sam token=t1").await;
+            peer.expect("@ref=2 JOIN #general").await;
+            peer.send("@ref=2 OK id=k1 head=1").await;
+            peer.expect("@ref=3 SYNC").await;
+            peer.send("@ref=3 CONV #general k1 1 0\n@ref=3 OK").await;
+            // The connection drops; the session waits to be resumed.
+            peer.close().await;
+            return;
+        }
+        peer.expect("@ref=1 GUEST sam token=t1").await;
+        peer.send("@ref=1 OK uid=~sam token=t2 resumed=yes").await;
+        peer.expect("@ref=2 SYNC").await;
+        peer.send("@ref=2 OK").await;
+        while let Some(line) = peer.recv().await {
+            if let Some(r) = line.strip_suffix(" QUIT") {
+                peer.send(&format!("{r} OK")).await;
+                break;
+            }
+        }
+        peer.close().await;
+    })
+    .await;
+    let client = Client::open_in_memory(ClientOptions {
+        session: crate::conn::SessionOptions {
+            ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
+            connect_to: Some(server.addr),
+            ..crate::conn::SessionOptions::default()
+        },
+        backoff: crate::conn::Backoff {
+            initial: Duration::from_millis(5),
+            max: Duration::from_millis(20),
+            stable_after: Duration::from_secs(3600),
+        },
+        ..ClientOptions::default()
+    })
+    .unwrap();
+    let sam = client.add_guest("chat.test", "sam").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let general_room: risala_proto::names::Room = "#general".parse().unwrap();
+    sam.shared()
+        .store
+        .set_rejoin(sam.id(), &general_room, true)
+        .unwrap();
+    let events = sam.subscribe();
+    sam.start();
+    // Online, synced, then disconnected and online again: SYNC no longer
+    // lists #general.
+    let mut online = 0;
+    while online < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("events")
+            .expect("not closed");
+        if let AccountEvent::State {
+            state: ConnectionState::Online { .. },
+        } = event
+        {
+            online += 1;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(30), sam.wait_synced())
+        .await
+        .expect("syncing")
+        .unwrap();
+    let general = sam.conversation("#general").unwrap();
+    assert!(!general.info().unwrap().unwrap().joined);
+    assert!(
+        sam.shared()
+            .store
+            .rejoin_rooms(sam.id())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        general.send("hi").await.unwrap_err(),
+        ClientError::NotJoined("#general".into())
+    );
     sam.disconnect().await;
     server.done().await;
 }

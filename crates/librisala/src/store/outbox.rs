@@ -60,8 +60,9 @@ pub enum FailReason {
     Dropped,
     /// The account left the room, or was kicked or banned from it, before
     /// the message went out. Sending it later, after a new JOIN, would put
-    /// it out of context (PLAN.md 5, item 34). Never for guests, who rejoin
-    /// their rooms by themselves after a reconnect.
+    /// it out of context (PLAN.md 5, items 34 and 37). A guest's messages
+    /// wait instead for a room its session left by ending, which the
+    /// client joins again ([`Store::rejoin_rooms`]).
     NotInRoom,
     /// The server answered with an error.
     Rejected(ErrorCode),
@@ -433,12 +434,30 @@ impl Tx<'_> {
     }
 
     /// Whether messages for `row` may be queued, and wait in the outbox,
-    /// rather than fail with [`FailReason::NotInRoom`] (PLAN.md 5, item
-    /// 34): always for a room the account is in and for a direct
-    /// conversation, and for a guest, which rejoins its rooms by itself
-    /// after a reconnect.
+    /// rather than fail with [`FailReason::NotInRoom`] (PLAN.md 5, items 34
+    /// and 37): always for a room the account is in and for a direct
+    /// conversation. For a room it is not in, only for a guest's room that
+    /// the client joins again after a new session
+    /// ([`Store::rejoin_rooms`](super::Store::rejoin_rooms)).
     pub(crate) fn messages_wait(&self, row: &ConvRow, guest: bool) -> Result<bool, StoreError> {
-        Ok(guest || !row.name.is_room() || row.joined)
+        let Conv::Room(room) = &row.name else {
+            return Ok(true);
+        };
+        if row.joined {
+            return Ok(true);
+        }
+        if !guest {
+            return Ok(false);
+        }
+        let rejoin: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM rejoin WHERE account = ?1 AND room = ?2",
+                params![row.account.0, room.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(rejoin.is_some())
     }
 
     /// Fails the messages of `conv` still waiting to be sent, not DELETEs:

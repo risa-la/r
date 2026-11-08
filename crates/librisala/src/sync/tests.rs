@@ -2146,11 +2146,14 @@ fn messages_for_a_room_an_identity_left_fail() {
 }
 
 #[test]
-fn a_guests_messages_wait_for_its_rooms() {
-    // A guest rejoins its rooms by itself after a reconnect (4.2), so its
-    // messages wait rather than fail.
+fn a_guests_messages_wait_only_for_rooms_it_joins_again() {
+    // PLAN.md 5, item 37: a guest's room goes missing from SYNC when its
+    // session ends, and the client joins it again (4.2), so its messages
+    // wait. Only for the rooms the client joins again.
     let mut h = H::new("~sam");
     h.joined("k1", 3);
+    let general: risala_proto::names::Room = "#general".parse().unwrap();
+    h.store.set_rejoin(h.account, &general, true).unwrap();
     let r = h.reconnect();
     let (msg, out) = h
         .engine
@@ -2158,6 +2161,7 @@ fn a_guests_messages_wait_for_its_rooms() {
         .unwrap();
     h.absorb(out);
     h.reply(r, &[], "OK");
+    assert!(!h.conv("#general").joined);
     assert_eq!(
         h.store.outbox_item(msg).unwrap().unwrap().state,
         OutboxState::Queued
@@ -2166,6 +2170,74 @@ fn a_guests_messages_wait_for_its_rooms() {
         h.engine
             .send(&conv("#general"), &Draft::text("again"))
             .is_ok()
+    );
+    // Joining it again failed for good: the client takes it off the list.
+    // Waiting messages fail when the outbox is next looked at, and new
+    // ones are refused.
+    h.store.set_rejoin(h.account, &general, false).unwrap();
+    let out = h.engine.resume_outbox().unwrap();
+    h.absorb(out);
+    h.idle();
+    assert_eq!(
+        h.store.outbox_item(msg).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::NotInRoom)
+    );
+    assert!(matches!(
+        h.engine.send(&conv("#general"), &Draft::text("more")),
+        Err(SyncError::NotJoined(_))
+    ));
+}
+
+#[test]
+fn a_guests_messages_fail_when_it_is_kicked() {
+    // PLAN.md 5, item 37: item 34 holds for guests after KICK, BAN, their
+    // own PART or DROP, even for a room the client would join again.
+    let mut h = H::new("~sam");
+    h.joined("k1", 3);
+    let general: risala_proto::names::Room = "#general".parse().unwrap();
+    h.store.set_rejoin(h.account, &general, true).unwrap();
+    let r = h.reconnect();
+    let (msg, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("hi"))
+        .unwrap();
+    h.absorb(out);
+    h.line(&ev(4, "from=bob@example.net KICK #general ~sam"));
+    assert_eq!(
+        h.store.outbox_item(msg).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::NotInRoom)
+    );
+    h.reply(r, &[], "OK");
+    // The KICK came while SYNC was out, so it asks again.
+    h.expect("SYNC");
+    h.idle();
+}
+
+#[test]
+fn a_resumed_guests_missing_room_was_left() {
+    // A resumed session is still in its rooms (4.2): one missing from SYNC
+    // was left while the connection was down, so its messages fail, as an
+    // identity's do (PLAN.md 5, item 37).
+    let mut h = H::new("~sam");
+    h.joined("k1", 3);
+    let general: risala_proto::names::Room = "#general".parse().unwrap();
+    h.store.set_rejoin(h.account, &general, true).unwrap();
+    h.queue.clear();
+    h.engine = SyncEngine::new(h.store.clone(), h.account, h.config.clone()).unwrap();
+    h.engine.set_resumed(true);
+    let r = h.start();
+    let (msg, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("hi"))
+        .unwrap();
+    h.absorb(out);
+    h.reply(r, &[], "OK");
+    assert!(h.notes.contains(&Notification::Left {
+        conv: conv("#general")
+    }));
+    assert_eq!(
+        h.store.outbox_item(msg).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::NotInRoom)
     );
 }
 

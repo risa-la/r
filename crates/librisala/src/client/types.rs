@@ -921,7 +921,7 @@ fn opt_text(escaped: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboxStatus {
     /// Waiting to be sent, until the account is in the room on a
-    /// connection. If an identity turns out to have left the room, it
+    /// connection. If the account turns out to have left the room, it
     /// fails with [`FailKind::NotInRoom`] instead.
     Queued,
     /// Sent, with no answer yet.

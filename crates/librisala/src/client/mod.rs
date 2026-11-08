@@ -101,6 +101,12 @@
 //!   from it, or its being dropped, takes it off too. Turn this off with
 //!   [`ClientOptions::rejoin_guest_rooms`]. Identities stay members across
 //!   connections (6.1), so nothing is joined again for them.
+//! - **Messages for its rooms.** Messages queued for a room on the list
+//!   wait for it to be joined again. Messages for a room the guest left
+//!   otherwise, by its own PART, a KICK, BAN or DROP, or while a resumed
+//!   session was away, fail with [`FailKind::NotInRoom`], as an
+//!   identity's do, and such a room comes off the list (PLAN.md 5, item
+//!   37).
 //! - **Messages without an answer.** After a resumed session, a guest's
 //!   messages that were sent but not answered when the connection dropped
 //!   are sent again with their cids, which carry over to the resumed

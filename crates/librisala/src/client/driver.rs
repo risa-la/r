@@ -743,6 +743,13 @@ impl Online<'_> {
                 Notification::Kicked { room, .. }
                 | Notification::Banned { room, .. }
                 | Notification::Dropped { room, .. } => not_again.push(room.clone()),
+                // A resumed session is still in its rooms (4.2), so one
+                // missing from SYNC was left while the connection was down,
+                // by a KICK, BAN or DROP: its messages failed, and it is
+                // not joined again (PLAN.md 5, item 37).
+                Notification::Left {
+                    conv: Conv::Room(room),
+                } if self.resumed => not_again.push(room.clone()),
                 _ => {}
             }
         }
@@ -1198,8 +1205,12 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
                 s.store.set_rejoin(s.id, &room, false)?;
                 let account = s.id;
                 let (_, changes) = s.store.write(|tx| {
-                    if let Some(mut row) = tx.conv_by_name(account, &Conv::Room(room))? {
+                    let conv = Conv::Room(room);
+                    if let Some(mut row) = tx.conv_by_name(account, &conv)? {
                         tx.set_joined(&mut row, false)?;
+                        // Its own PART: its messages there fail (PLAN.md 5,
+                        // item 37).
+                        tx.fail_queued_messages(account, &conv)?;
                     }
                     Ok(())
                 })?;
@@ -1244,7 +1255,7 @@ fn queue_offline(
     let (id, changes) = shared.store.write(|tx| {
         let row = tx.conv_by_name(account, conv)?;
         // Nothing more goes to a room the account has left until it joins
-        // again (PLAN.md 5, item 34).
+        // again (PLAN.md 5, items 34 and 37).
         if let Some(row) = &row
             && !tx.messages_wait(row, guest)?
         {

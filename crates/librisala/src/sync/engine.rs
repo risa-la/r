@@ -476,7 +476,7 @@ impl SyncEngine {
         let id = self.write(|tx| {
             let row = tx.conv_by_name(account, conv)?;
             // Nothing more goes to a room the account has left until it
-            // joins again (PLAN.md 5, item 34).
+            // joins again (PLAN.md 5, items 34 and 37).
             if let Some(row) = &row
                 && !tx.messages_wait(row, guest)?
             {
@@ -796,16 +796,25 @@ impl SyncEngine {
     }
 
     /// The account is no longer in `conv`: stop storing its live events.
+    /// It left, or was kicked or banned, so its queued messages fail, a
+    /// guest's too (PLAN.md 5, items 34 and 37).
     fn left(&mut self, conv: &Conv) -> Result<(), SyncError> {
         self.live(conv).confirmed = None;
-        let (account, guest) = (self.account, self.guest);
+        let account = self.account;
         self.write(|tx| {
             if let Some(mut row) = tx.conv_by_name(account, conv)? {
                 tx.set_joined(&mut row, false)?;
-                left_outbox(tx, guest, &row)?;
+                left_outbox(tx, false, &row)?;
             }
             Ok(())
         })
+    }
+
+    /// Whether this connection's guest session is new, so that a room the
+    /// account was in may have gone missing only because the session
+    /// ended, and the client joins it again (4.2).
+    fn session_ended(&self) -> bool {
+        self.guest && !self.resumed
     }
 
     /// A live line showed the account leaving `conv`, or its id changing.
@@ -1072,6 +1081,7 @@ impl SyncEngine {
         }
         let account = self.account;
         let guest = self.guest;
+        let session_ended = self.session_ended();
         let mut listed = Vec::new();
         let mut heads = HashMap::new();
         // Read markers moved here while the server did not hear (7.4).
@@ -1117,7 +1127,7 @@ impl SyncEngine {
             for mut row in tx.convs(account)? {
                 if row.joined && !listed.contains(&row.name) && !newer.contains(&row.name) {
                     tx.set_joined(&mut row, false)?;
-                    left_outbox(tx, guest, &row)?;
+                    left_outbox(tx, session_ended, &row)?;
                     gone.push(row.name);
                 }
             }
@@ -1318,7 +1328,7 @@ impl SyncEngine {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
             let head = ok.head().ok().flatten();
             let floor = self.head_floor(&conv, sent, floor);
-            let (account, guest) = (self.account, self.guest);
+            let (account, session_ended) = (self.account, self.session_ended());
             self.write(|tx| {
                 let row = if joined {
                     Some(tx.conv_or_create(account, &conv)?)
@@ -1344,7 +1354,7 @@ impl SyncEngine {
                         tx.discard(&mut row, None)?;
                     }
                     tx.set_joined(&mut row, false)?;
-                    left_outbox(tx, guest, &row)?;
+                    left_outbox(tx, session_ended, &row)?;
                 }
                 Ok(())
             })?;
@@ -1839,7 +1849,7 @@ impl SyncEngine {
                 let row = tx.conv_by_name(account, &item.conv)?;
                 // A message queued for a room the account is not in, perhaps
                 // while offline, fails as it would have when the account
-                // left (PLAN.md 5, item 34).
+                // left (PLAN.md 5, items 34 and 37).
                 if item.delete.is_none()
                     && item.state == OutboxState::Queued
                     && let Some(row) = &row
@@ -1939,11 +1949,13 @@ fn learn(
     Ok(reset)
 }
 
-/// Fails the messages still queued for a room an identity has left
-/// (PLAN.md 5, item 34). A guest's wait, since it rejoins its rooms by
-/// itself after a reconnect (4.2).
-fn left_outbox(tx: &mut Tx<'_>, guest: bool, row: &ConvRow) -> Result<(), StoreError> {
-    if guest || !row.name.is_room() {
+/// Fails the messages still queued for a room the account is no longer in
+/// (PLAN.md 5, items 34 and 37). With `session_ended`, the room may have
+/// gone missing only because a guest's session ended, and a guest's
+/// messages for a room the client joins again wait
+/// ([`Tx::messages_wait`]).
+fn left_outbox(tx: &mut Tx<'_>, session_ended: bool, row: &ConvRow) -> Result<(), StoreError> {
+    if !row.name.is_room() || tx.messages_wait(row, session_ended)? {
         return Ok(());
     }
     tx.fail_queued_messages(row.account, &row.name)
