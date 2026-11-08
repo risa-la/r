@@ -21,6 +21,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use risala_proto::command::{AdminCommand, Command, Request};
 use risala_proto::error::ErrorCode;
@@ -73,6 +74,9 @@ pub(crate) struct Cx {
     /// A BYE text to close the connection with once the final response
     /// has been sent ([`close_after`](Self::close_after)).
     close_after: std::sync::Mutex<Option<String>>,
+    /// Whether the handler has already sent the final response, with
+    /// [`Cx::reply_now`].
+    replied: AtomicBool,
 }
 
 #[allow(
@@ -96,6 +100,16 @@ impl Cx {
         self.handle
             .wait_for_room(limits.command_room(), limits.command_room_bytes())
             .await;
+    }
+
+    /// Sends the command's final response now, rather than when the
+    /// handler returns, which then returns a reply that is not sent. FOLLOW
+    /// queues its `OK` this way while no post of the mailbox can be queued
+    /// (3.6, 7.1).
+    pub(crate) fn reply_now(&self, reply: Reply) {
+        if !self.replied.swap(true, Ordering::SeqCst) {
+            send_reply(self, reply);
+        }
     }
 
     /// The signed-in identity and device, if the connection is signed in.
@@ -145,6 +159,7 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
             peer: conn.info.peer,
             who: conn.who.clone(),
             close_after: std::sync::Mutex::new(None),
+            replied: AtomicBool::new(false),
         }
     };
     // A line arrived: a connection that follows quietly is alive (9.2).
@@ -232,8 +247,15 @@ async fn route_admin(cx: &Cx, command: AdminCommand) -> Reply {
     }
 }
 
-/// Sends a command's final response, with its `ref` (3.6).
+/// Sends a command's final response, with its `ref` (3.6), unless the
+/// handler sent it already ([`Cx::reply_now`]).
 fn finish(cx: &Cx, reply: Reply) {
+    if !cx.replied.swap(true, Ordering::SeqCst) {
+        send_reply(cx, reply);
+    }
+}
+
+fn send_reply(cx: &Cx, reply: Reply) {
     let line = match reply {
         Ok(ok) => ServerLine::Ok(ok),
         Err(err) => ServerLine::Err(err),

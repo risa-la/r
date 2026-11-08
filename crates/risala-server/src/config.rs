@@ -384,6 +384,27 @@ pub struct Limits {
     /// (12.5). Larger ones get `ERR too-long`. At least
     /// [`MIN_KEY_PACKAGE_BYTES`], since 12.5 allows no lower limit.
     pub max_key_package_bytes: usize,
+    /// The most bytes one mailbox keeps at once, counting its posts and
+    /// the files and blobs stored with its token (7.5), reported by INFO
+    /// as `quota=`. Over it, the mailbox's oldest posts expire early, and a
+    /// post larger than it gets `ERR rate-limited`.
+    pub mailbox_quota: u64,
+    /// The most bytes one network address may store in an hour, counting
+    /// POST, UPLOAD and BLOB together (7.5). Further ones get
+    /// `ERR rate-limited`. IPv6 addresses count by their /64. 0 means no
+    /// limit.
+    pub address_bytes_per_hour: u64,
+    /// The most mailboxes one connection, and one network address, may
+    /// create in an hour (5.2). 0 means no limit.
+    pub creates_per_hour: u32,
+    /// The most posts one connection, and one network address, may send in
+    /// a minute (4.2, 5.2). 0 means no limit.
+    pub posts_per_minute: u32,
+    /// The most commits and TOKEN commands one connection, and one network
+    /// address, may send in an hour (7.2). 0 means no limit.
+    pub commits_per_hour: u32,
+    /// The most mailboxes one connection may follow (7.1): at least 1,000.
+    pub max_follows: usize,
 }
 
 /// The most lines a command's response has besides a full page of posts
@@ -401,6 +422,9 @@ pub const MIN_SIGN_IN_SECS: u64 = 120;
 
 /// The least `limits.guest_resume_secs` the spec allows (4.2).
 pub const MIN_GUEST_RESUME_SECS: u64 = 120;
+
+/// The fewest mailboxes [`Limits::max_follows`] may allow (7.1).
+pub const MIN_FOLLOWS: usize = 1000;
 
 /// The lowest [`Limits::max_key_package_bytes`] may be (12.5).
 pub const MIN_KEY_PACKAGE_BYTES: usize = 16 * 1024;
@@ -510,6 +534,12 @@ impl Default for Limits {
             max_key_packages: 100,
             key_package_gets_per_hour: 600,
             max_key_package_bytes: 64 * 1024,
+            mailbox_quota: 256 * 1024 * 1024,
+            address_bytes_per_hour: 1024 * 1024 * 1024,
+            creates_per_hour: 120,
+            posts_per_minute: 600,
+            commits_per_hour: 600,
+            max_follows: 4096,
         }
     }
 }
@@ -604,6 +634,12 @@ impl Config {
             return invalid(format!(
                 "limits.max_key_package_bytes is {}, but must be at least {MIN_KEY_PACKAGE_BYTES} (12.5)",
                 l.max_key_package_bytes
+            ));
+        }
+        if l.max_follows < MIN_FOLLOWS {
+            return invalid(format!(
+                "limits.max_follows is {}, but must be at least {MIN_FOLLOWS} (7.1)",
+                l.max_follows
             ));
         }
         if l.out_queue < l.command_room() {
@@ -853,6 +889,8 @@ mod tests {
         assert!(with(|l| l.presence_offline_secs = 0).is_ok());
         invalid(|l| l.max_key_package_bytes = 16383, "max_key_package_bytes");
         assert!(with(|l| l.max_key_package_bytes = 16384).is_ok());
+        invalid(|l| l.max_follows = 999, "max_follows");
+        assert!(with(|l| l.max_follows = 1000).is_ok());
         invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");
         assert!(with(|l| l.guest_resume_secs = 120).is_ok());
 

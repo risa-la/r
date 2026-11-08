@@ -1,34 +1,1124 @@
-//! Mailboxes and delivery (5.2, 6.1, 6.4, 7).
+//! Mailboxes and delivery (5.2, 6.1, 6.4, 7), through the hub, with real
+//! MLS groups from risala-mls wherever the framing matters.
 
+use std::time::Duration;
+
+use openmls_memory_storage::MemoryStorage;
+use risala_mls::conversation::{GuestMode, RisalaConversation};
+use risala_mls::group::{
+    Changes, CommitOutput, commit, create_group, encrypt_application, join_by_welcome,
+    merge_own_commit, own_leaf_key,
+};
+use risala_mls::identity::{DeviceId, RisalaIdentity};
+use risala_mls::keypackage::make_key_package;
+use risala_mls::openmls::group::MlsGroup;
+use risala_mls::openmls::prelude::KeyPackage;
+use risala_mls::openmls_traits::OpenMlsProvider as _;
+use risala_mls::wire::{to_bytes, tree_to_bytes};
+use risala_mls::{Provider, RisalaAad, RisalaProfile, SendToken, SigningKey};
+use risala_proto::auth::PublicKey;
+use risala_proto::mls::{GroupId, MlsMessage, Pseudonym, TokenHash};
+use risala_proto::names::{BoxName, Room, Uid};
+use risala_proto::time::Timestamp;
 use rusqlite::params;
 
-use risala_proto::mls::{GroupId, TokenHash};
-use risala_proto::names::BoxName;
-
-use crate::store::{MailboxStore as _, NewMailbox};
-
 use super::*;
+use crate::core::mailbox::{check_token, drop_mailbox, run_maintenance};
+use crate::store::{MailboxStore as _, NewMailbox};
+use risala_proto::error::ErrorCode;
 
-/// Nothing is built yet: the area's commands reply `not-supported` on the
-/// kinds that may send them.
-#[tokio::test]
-async fn not_built_yet() {
-    let mut h = Harness::new();
-    let mut anon = h.anon().await;
-    let (mut guest, _) = h.guest("sam").await;
-    for line in [
-        "FOLLOW ujzdegxdncf32epf3dhodzdoci",
-        "FETCH ujzdegxdncf32epf3dhodzdoci after=0",
-        "GROUPINFO ujzdegxdncf32epf3dhodzdoci",
-    ] {
-        h.send(&anon, line).await;
-        assert_eq!(anon.lines(), ["ERR not-supported"], "{line}");
-        h.send(&guest, line).await;
-        assert_eq!(guest.lines(), ["ERR not-supported"], "{line}");
+const HOST: &str = "chat.example.org";
+
+/// One device of an identity, with its own MLS storage.
+struct Dev {
+    uid: Uid,
+    key: SigningKey,
+    provider: Provider<MemoryStorage>,
+    pseudonym: risala_mls::Pseudonym,
+}
+
+impl Dev {
+    fn new(uid: &str, seed: u8) -> Dev {
+        Dev {
+            uid: uid.parse().unwrap(),
+            key: SigningKey::from_seed([seed; 32]),
+            provider: Provider::new(MemoryStorage::default()).unwrap(),
+            pseudonym: risala_mls::Pseudonym([seed; 16]),
+        }
+    }
+
+    fn identity(&self) -> RisalaIdentity {
+        RisalaIdentity::device(
+            self.uid.clone(),
+            DeviceId::of_device_key(self.key.public_key()),
+        )
+    }
+
+    fn profile(&self) -> RisalaProfile {
+        RisalaProfile::new(self.uid.name(), Timestamp::now().unix_millis()).unwrap()
+    }
+
+    fn key_package(&self) -> KeyPackage {
+        make_key_package(&self.provider, &self.key, &self.uid, &self.profile(), false)
+            .unwrap()
+            .key_package
+    }
+
+    fn create(&self, conversation: &RisalaConversation) -> MlsGroup {
+        create_group(
+            &self.provider,
+            &self.identity(),
+            &self.profile(),
+            conversation,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn commit(&self, group: &mut MlsGroup, changes: Changes) -> CommitOutput {
+        commit(
+            &self.provider,
+            group,
+            self.pseudonym,
+            &self.profile(),
+            changes,
+        )
+        .unwrap()
+    }
+
+    fn join(&self, welcome: &[u8]) -> MlsGroup {
+        let expect = risala_mls::checks::JoinExpectation {
+            host: HOST.into(),
+            own_uid: self.uid.clone(),
+            public_room: None,
+        };
+        join_by_welcome(&self.provider, welcome, None, &expect)
+            .unwrap()
+            .group
+    }
+
+    /// The group's send token now (7.2), in base64.
+    fn token(&self, group: &MlsGroup) -> String {
+        let token = SendToken::of_group(group, self.provider.crypto()).unwrap();
+        risala_proto::mls::SendToken::from_bytes(*token.as_bytes()).to_string()
+    }
+
+    /// The hash of the group's send token now, in base64.
+    fn token_hash(&self, group: &MlsGroup) -> String {
+        let token = SendToken::of_group(group, self.provider.crypto()).unwrap();
+        TokenHash::from_bytes(token.hash()).to_string()
+    }
+
+    /// An application message, in base64.
+    fn send(&self, group: &mut MlsGroup, text: &[u8]) -> String {
+        let aad = RisalaAad::application(self.pseudonym, [7; 48]);
+        b64(&encrypt_application(&self.provider, group, &aad, text).unwrap())
+    }
+
+    /// A new connection signed in as this device (4.6), without AUTH.
+    fn sign_in(&self, h: &mut Harness) -> Client {
+        let c = h.connect();
+        let device = Device {
+            uid: self.uid.clone(),
+            key: PublicKey::from_bytes(self.key.public_key()),
+        };
+        assert!(h.inner().reg().set_who(c.id, Who::SignedIn(device)));
+        c
     }
 }
 
-/// A public room for tests, with `members` holding a leaf in its group.
+fn b64(bytes: &[u8]) -> String {
+    MlsMessage::from_bytes(bytes).unwrap().to_string()
+}
+
+fn gid(group: &MlsGroup) -> String {
+    GroupId::from_bytes(group.group_id().as_slice().try_into().unwrap()).to_string()
+}
+
+fn hash(bytes: [u8; 48]) -> String {
+    TokenHash::from_bytes(bytes).to_string()
+}
+
+fn mailbox(n: u8) -> BoxName {
+    BoxName::from_bytes([n; 16])
+}
+
+fn now(h: &Harness) -> String {
+    h.inner().now().to_string()
+}
+
+/// A direct conversation between Alice and Bob in mailbox `m`, created on
+/// `anon`, with Alice's commit that adds Bob posted and merged: the group
+/// is in epoch 1, its first post seq 1.
+struct Direct {
+    alice: Dev,
+    bob: Dev,
+    a: MlsGroup,
+    b: MlsGroup,
+    m: BoxName,
+    /// The commit, as posted.
+    commit: String,
+    /// Its `next`.
+    next: String,
+}
+
+impl Direct {
+    async fn new(h: &Harness, anon: &mut Client, n: u8) -> Direct {
+        let alice = Dev::new("alice@example.org", n);
+        let bob = Dev::new("bob@example.org", n.wrapping_add(100));
+        let m = mailbox(n);
+        let conv = RisalaConversation::direct(HOST, *m.as_bytes(), &alice.uid, &bob.uid);
+        let mut a = alice.create(&conv);
+        h.send(
+            anon,
+            &format!("CREATE {m} {} {}", gid(&a), alice.token_hash(&a)),
+        )
+        .await;
+        assert_eq!(anon.lines(), ["OK"]);
+        let token = alice.token(&a);
+        let out = alice.commit(
+            &mut a,
+            Changes {
+                add: vec![bob.key_package()],
+                ..Changes::default()
+            },
+        );
+        let commit = b64(&out.message);
+        let next = hash(out.next_token_hash);
+        h.send(anon, &format!("POST {m} {token} {commit} next={next}"))
+            .await;
+        assert_eq!(anon.lines(), ["OK seq=1"]);
+        merge_own_commit(&alice.provider, &mut a).unwrap();
+        let b = bob.join(&out.welcome.unwrap());
+        Direct {
+            alice,
+            bob,
+            a,
+            b,
+            m,
+            commit,
+            next,
+        }
+    }
+}
+
+/// CREATE's first form, and the boxes and group ids it never takes twice
+/// (5.2); with `epoch`, a group that moves (7.8).
+#[tokio::test]
+async fn create() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let (mut guest, _) = h.guest("sam").await;
+    let gid1 = GroupId::from_bytes([1; 32]);
+    let gid2 = GroupId::from_bytes([2; 32]);
+    let token = hash([9; 48]);
+    let (m1, m2, m3) = (mailbox(1), mailbox(2), mailbox(3));
+    h.send(&anon, &format!("CREATE {m1} {gid1} {token}")).await;
+    assert_eq!(anon.lines(), ["OK"]);
+    // A guest creates its report conversation's mailbox the same way (4.2).
+    h.send(&guest, &format!("CREATE {m2} {gid2} {token}")).await;
+    assert_eq!(guest.lines(), ["OK"]);
+    for line in [
+        format!("CREATE {m1} {} {token}", GroupId::from_bytes([3; 32])),
+        format!("CREATE {m3} {gid1} {token}"),
+        format!("CREATE {m1} {gid1} {token} epoch=4"),
+    ] {
+        h.send(&anon, &line).await;
+        assert_eq!(anon.lines(), ["ERR name-taken"], "{line}");
+    }
+    // A move needs a mailbox of the group (7.8).
+    h.send(
+        &anon,
+        &format!(
+            "CREATE {m3} {} {token} epoch=4",
+            GroupId::from_bytes([3; 32])
+        ),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR not-found"]);
+    h.send(&anon, &format!("CREATE {m3} {gid1} {token} epoch=4"))
+        .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    let record = h.store.mailbox(&m3).unwrap().unwrap();
+    assert_eq!((record.first_epoch, record.moved_from), (4, Some(m1)));
+    // A box is never used again, even once its mailbox is gone (5.2).
+    assert!(drop_mailbox(h.inner(), &m2, "").await.unwrap());
+    h.send(
+        &anon,
+        &format!("CREATE {m2} {} {token}", GroupId::from_bytes([5; 32])),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR name-taken"]);
+    // A signed-in connection creates only public rooms (13).
+    let mut alice = h.signed_in_as("alice@example.org");
+    h.send(&alice, &format!("CREATE {} {gid1} {token}", mailbox(4)))
+        .await;
+    assert_eq!(alice.lines(), ["ERR wrong-connection"]);
+}
+
+/// Posts go to every follower in seq order, as event lines, the poster's
+/// before its OK; FETCH pages through them; FOLLOW reports the head (5.2,
+/// 7.1).
+#[tokio::test]
+async fn post_follow_and_fetch() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut watcher = h.anon().await;
+    let (mut guest, _) = h.guest("sam").await;
+    let m = mailbox(1);
+    let alice = Dev::new("alice@example.org", 1);
+    let bob = Dev::new("bob@example.org", 2);
+    let conv = RisalaConversation::direct(HOST, *m.as_bytes(), &alice.uid, &bob.uid);
+    let mut a = alice.create(&conv);
+    h.send(
+        &anon,
+        &format!("CREATE {m} {} {}", gid(&a), alice.token_hash(&a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    h.send(&watcher, &format!("FOLLOW {m}")).await;
+    assert_eq!(watcher.lines(), ["OK head=0"]);
+    h.send(&guest, &format!("@ref=g FOLLOW {m}")).await;
+    assert_eq!(guest.lines(), ["@ref=g OK head=0"]);
+    h.send(&anon, &format!("FOLLOW {m}")).await;
+    assert_eq!(anon.lines(), ["OK head=0"]);
+
+    let token = alice.token(&a);
+    let out = alice.commit(
+        &mut a,
+        Changes {
+            add: vec![bob.key_package()],
+            ..Changes::default()
+        },
+    );
+    let (commit, next) = (b64(&out.message), hash(out.next_token_hash));
+    h.send(
+        &anon,
+        &format!("@ref=p POST {m} {token} {commit} next={next}"),
+    )
+    .await;
+    let event = format!("@seq=1;t={} POST {m} {commit} next={next}", now(&h));
+    // Live posts carry no ref; the poster gets the post before its OK.
+    assert_eq!(anon.lines(), [event.clone(), "@ref=p OK seq=1".into()]);
+    assert_eq!(watcher.lines(), std::slice::from_ref(&event));
+    assert_eq!(guest.lines(), std::slice::from_ref(&event));
+    merge_own_commit(&alice.provider, &mut a).unwrap();
+    let mut b = bob.join(&out.welcome.unwrap());
+
+    // Epoch 1: the commit's next opened it (7.2).
+    let mut events = vec![event];
+    for (i, dev) in [&bob, &alice, &bob].into_iter().enumerate() {
+        let group = if dev.uid == bob.uid { &mut b } else { &mut a };
+        let message = dev.send(group, format!("hello {i}").as_bytes());
+        h.send(&guest, &format!("POST {m} {} {message}", dev.token(group)))
+            .await;
+        let seq = i + 2;
+        let event = format!("@seq={seq};t={} POST {m} {message}", now(&h));
+        assert_eq!(guest.lines(), [event.clone(), format!("OK seq={seq}")]);
+        assert_eq!(watcher.lines(), std::slice::from_ref(&event));
+        events.push(event);
+    }
+
+    // FETCH: the earliest posts after a position, in order (7.1).
+    h.send(&watcher, &format!("@ref=f FETCH {m} after=0")).await;
+    let mut want: Vec<String> = events
+        .iter()
+        .map(|e| format!("@ref=f;{}", &e[1..]))
+        .collect();
+    want.push("@ref=f OK more=0".into());
+    assert_eq!(watcher.lines(), want);
+    h.send(&watcher, &format!("FETCH {m} after=1 limit=2"))
+        .await;
+    assert_eq!(
+        watcher.lines(),
+        [events[1].clone(), events[2].clone(), "OK more=1".into()]
+    );
+    h.send(&watcher, &format!("FETCH {m} after=4")).await;
+    assert_eq!(watcher.lines(), ["OK more=0"]);
+    h.send(&watcher, &format!("FETCH {m} after=9")).await;
+    assert_eq!(watcher.lines(), ["OK more=0"]);
+    // FOLLOW again: OK, with the head.
+    h.send(&watcher, &format!("FOLLOW {m}")).await;
+    assert_eq!(watcher.lines(), ["OK head=4"]);
+
+    // UNFOLLOW stops it; unfollowing again is OK.
+    h.send(&watcher, &format!("UNFOLLOW {m}")).await;
+    h.send(&watcher, &format!("UNFOLLOW {m}")).await;
+    assert_eq!(watcher.lines(), ["OK", "OK"]);
+    anon.lines();
+    let message = alice.send(&mut a, b"quiet");
+    h.send(&anon, &format!("POST {m} {} {message}", alice.token(&a)))
+        .await;
+    assert_eq!(anon.lines().len(), 2);
+    assert!(watcher.lines().is_empty());
+
+    // A box that does not exist (7.1).
+    let none = mailbox(9);
+    for line in [
+        format!("FOLLOW {none}"),
+        format!("UNFOLLOW {none}"),
+        format!("FETCH {none} after=0"),
+        format!("POST {none} {} {message}", alice.token(&a)),
+        format!("TOKEN {none} 1 {} {}", alice.token(&a), hash([1; 48])),
+        format!("GROUPINFO {none}"),
+    ] {
+        h.send(&watcher, &line).await;
+        assert_eq!(watcher.lines(), ["ERR not-found"], "{line}");
+    }
+    // Light clients are not in this version (12.6).
+    h.send(&watcher, &format!("FETCH {m} after=0 leaf=3")).await;
+    assert_eq!(watcher.lines(), ["ERR not-supported light clients"]);
+}
+
+/// FETCH returns at most `limit` posts, 50 by default, and the server's
+/// cap, which is never under 50 (7.1).
+#[tokio::test]
+async fn fetch_limits() {
+    let mut config = config();
+    config.limits.max_page = 60;
+    config.limits.posts_per_minute = 0;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    let d = Direct::new(&h, &mut anon, 1).await;
+    let mut a = d.a;
+    for i in 0..70 {
+        let message = d.alice.send(&mut a, format!("{i}").as_bytes());
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&a)),
+        )
+        .await;
+    }
+    anon.lines();
+    h.send(&anon, &format!("FETCH {} after=0", d.m)).await;
+    let lines = anon.lines();
+    assert_eq!(lines.len(), 51);
+    assert_eq!(lines[50], "OK more=1");
+    h.send(&anon, &format!("FETCH {} after=0 limit=1000", d.m))
+        .await;
+    let lines = anon.lines();
+    assert_eq!(lines.len(), 61);
+    assert!(lines[59].starts_with("@seq=60;"));
+    h.send(&anon, &format!("FETCH {} after=60 limit=1000", d.m))
+        .await;
+    let lines = anon.lines();
+    assert_eq!(lines.len(), 12);
+    assert_eq!(lines[11], "OK more=0");
+}
+
+/// The checks of POST's points 1 and 2: the message's group, framing,
+/// RisalaAAD, and the options its content type needs (5.2).
+#[tokio::test]
+async fn post_framing() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let m = d.m;
+    let token = d.alice.token(&d.a);
+    let app = d.alice.send(&mut d.a, b"hi");
+    let invalid = |line: &[String]| {
+        assert_eq!(line.len(), 1, "{line:?}");
+        assert!(line[0].starts_with("ERR invalid"), "{line:?}");
+    };
+
+    // Another group's message.
+    let other = Dev::new("carol@example.org", 7);
+    let conv = RisalaConversation::direct(HOST, [7; 16], &other.uid, &d.bob.uid);
+    let mut o = other.create(&conv);
+    let foreign = other.send(&mut o, b"x");
+    h.send(&anon, &format!("POST {m} {token} {foreign}")).await;
+    invalid(&anon.lines());
+    // Not an MLS message, or a KeyPackage.
+    let kp = b64(&to_bytes(&d.bob.key_package().into()));
+    for junk in [b64(&[0; 64]), kp] {
+        h.send(&anon, &format!("POST {m} {token} {junk}")).await;
+        invalid(&anon.lines());
+    }
+    // An application message has no next; a commit needs it.
+    h.send(
+        &anon,
+        &format!("POST {m} {token} {app} next={}", hash([1; 48])),
+    )
+    .await;
+    invalid(&anon.lines());
+    let out = d.alice.commit(&mut d.a, Changes::default());
+    let commit = b64(&out.message);
+    h.send(&anon, &format!("POST {m} {token} {commit}")).await;
+    invalid(&anon.lines());
+    // Only application messages may be live; groupinfo is a public room's.
+    let next = hash(out.next_token_hash);
+    h.send(
+        &anon,
+        &format!("POST {m} {token} {commit} next={next} live=yes"),
+    )
+    .await;
+    invalid(&anon.lines());
+    let group_info = b64(&[1; 40]);
+    h.send(
+        &anon,
+        &format!("POST {m} {token} {app} groupinfo={group_info}"),
+    )
+    .await;
+    invalid(&anon.lines());
+    // A PublicMessage outside a public room: a public room's commit, in a
+    // mailbox made for its group.
+    let owen = Dev::new("owen@example.org", 8);
+    let room: Room = "#general".parse().unwrap();
+    let pm = mailbox(8);
+    let mut p = owen.create(&RisalaConversation::public_room(
+        HOST,
+        *pm.as_bytes(),
+        &room,
+        &owen.uid,
+    ));
+    h.send(
+        &anon,
+        &format!("CREATE {pm} {} {}", gid(&p), owen.token_hash(&p)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    let ptoken = owen.token(&p);
+    let out = owen.commit(&mut p, Changes::default());
+    h.send(
+        &anon,
+        &format!(
+            "POST {pm} {ptoken} {} next={}",
+            b64(&out.message),
+            hash(out.next_token_hash)
+        ),
+    )
+    .await;
+    assert_eq!(
+        anon.lines(),
+        ["ERR invalid a PublicMessage outside a public room"]
+    );
+
+    // Nothing was kept.
+    h.send(&anon, &format!("FETCH {m} after=1")).await;
+    assert_eq!(anon.lines(), ["OK more=0"]);
+    // The commit, posted properly, is kept.
+    h.send(&anon, &format!("POST {m} {token} {commit} next={next}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+}
+
+/// Send tokens: POST checks a post's token against its epoch's set; `-`
+/// is for joining public rooms; a commit's next opens the next epoch;
+/// TOKEN adds a hash for a holder of the epoch before (7.2).
+#[tokio::test]
+async fn send_tokens() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let m = d.m;
+    let message = d.alice.send(&mut d.a, b"hi");
+    let token1 = d.alice.token(&d.a);
+    // Epoch 0's token, or a made-up one, for a message of epoch 1.
+    let wrong = risala_proto::mls::SendToken::from_bytes([3; 32]).to_string();
+    h.send(&anon, &format!("POST {m} {wrong} {message}")).await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
+    h.send(&anon, &format!("POST {m} - {message}")).await;
+    assert_eq!(
+        anon.lines(),
+        ["ERR forbidden - is only for joining a public room"]
+    );
+    h.send(&anon, &format!("POST {m} {token1} {message}")).await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+
+    // A commit whose next is wrong opens nothing; TOKEN repairs it.
+    let out = d.alice.commit(&mut d.a, Changes::default());
+    let bogus = hash([4; 48]);
+    h.send(
+        &anon,
+        &format!("POST {m} {token1} {} next={bogus}", b64(&out.message)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK seq=3"]);
+    merge_own_commit(&d.alice.provider, &mut d.a).unwrap();
+    let message = d.alice.send(&mut d.a, b"epoch 2");
+    let token2 = d.alice.token(&d.a);
+    let hash2 = d.alice.token_hash(&d.a);
+    h.send(&anon, &format!("POST {m} {token2} {message}")).await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
+    // TOKEN with a token that is not of epoch 1, or of the wrong epoch.
+    for line in [
+        format!("TOKEN {m} 1 {wrong} {hash2}"),
+        format!("TOKEN {m} 0 {token1} {hash2}"),
+        format!("TOKEN {m} 2 {token1} {hash2}"),
+    ] {
+        h.send(&anon, &line).await;
+        assert_eq!(anon.lines(), ["ERR stale"], "{line}");
+    }
+    h.send(&anon, &format!("TOKEN {m} 1 {token1} {hash2}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    // A hash the set holds already: OK, and nothing changes.
+    h.send(&anon, &format!("TOKEN {m} 1 {token1} {hash2}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    h.send(&anon, &format!("POST {m} {token2} {message}")).await;
+    assert_eq!(anon.lines(), ["OK seq=4"]);
+    // The bogus hash is in epoch 2's set too: it is what the commit named.
+    assert!(
+        h.store
+            .has_token(&m, 2, &TokenHash::from_bytes([4; 48]))
+            .unwrap()
+    );
+
+    // UPLOAD and BLOB check a token without its epoch (5.6, 12.12).
+    let proto = |t: &str| t.parse::<risala_proto::mls::SendToken>().unwrap();
+    assert_eq!(check_token(h.inner(), &m, &proto(&token2)).await, Ok(()));
+    assert_eq!(check_token(h.inner(), &m, &proto(&token1)).await, Ok(()));
+    assert_eq!(
+        check_token(h.inner(), &m, &proto(&wrong)).await,
+        Err(ErrorCode::Stale)
+    );
+    assert_eq!(
+        check_token(h.inner(), &mailbox(99), &proto(&token1)).await,
+        Err(ErrorCode::NotFound)
+    );
+    // A guest may send TOKEN; a signed-in connection may not (13).
+    let (mut guest, _) = h.guest("sam").await;
+    h.send(&guest, &format!("TOKEN {m} 2 {token2} {}", hash([5; 48])))
+        .await;
+    assert_eq!(guest.lines(), ["OK"]);
+}
+
+/// A moved mailbox starts at the move's epoch; TOKEN for the epoch before
+/// it is checked against the mailbox the group moved from (7.8).
+#[tokio::test]
+async fn moves() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let token1 = d.alice.token(&d.a);
+    let out = d.alice.commit(&mut d.a, Changes::default());
+    merge_own_commit(&d.alice.provider, &mut d.a).unwrap();
+    // The mover gives a wrong hash for epoch 2.
+    let new = mailbox(2);
+    h.send(
+        &anon,
+        &format!("CREATE {new} {} {} epoch=2", gid(&d.a), hash([6; 48])),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    let _ = out;
+    let message = d.alice.send(&mut d.a, b"moved");
+    let token2 = d.alice.token(&d.a);
+    let hash2 = d.alice.token_hash(&d.a);
+    h.send(&anon, &format!("POST {new} {token2} {message}"))
+        .await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
+    // A member repairs it with its token of epoch 1, which only the old
+    // mailbox knows.
+    h.send(&anon, &format!("TOKEN {new} 1 {token1} {hash2}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    h.send(&anon, &format!("POST {new} {token2} {message}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+    // Only for the epoch just before the move.
+    h.send(&anon, &format!("TOKEN {new} 0 {token1} {hash2}"))
+        .await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
+    // Once the old mailbox is gone, nothing can be checked against it.
+    let newer = mailbox(3);
+    h.send(
+        &anon,
+        &format!("CREATE {newer} {} {} epoch=2", gid(&d.a), hash([6; 48])),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    assert!(drop_mailbox(h.inner(), &new, "").await.unwrap());
+    h.send(&anon, &format!("TOKEN {newer} 1 {token1} {hash2}"))
+        .await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
+}
+
+/// A cid makes resending safe: within 24 hours the same cid gets the
+/// existing seq, checked before the token, and no new post (7.6).
+#[tokio::test]
+async fn cids() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut other = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let m = d.m;
+    h.send(&other, &format!("FOLLOW {m}")).await;
+    other.lines();
+    let token = d.alice.token(&d.a);
+    let message = d.alice.send(&mut d.a, b"once");
+    let cid = "abcdefghijklmnop";
+    h.send(&anon, &format!("@cid={cid} POST {m} {token} {message}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+    // The cid is not part of the post.
+    assert_eq!(
+        other.lines(),
+        [format!("@seq=2;t={} POST {m} {message}", now(&h))]
+    );
+    // Again, even with a stale token and on another connection.
+    let wrong = risala_proto::mls::SendToken::from_bytes([3; 32]);
+    h.send(&other, &format!("@cid={cid} POST {m} {wrong} {message}"))
+        .await;
+    assert_eq!(other.lines(), ["OK seq=2"]);
+    // In another mailbox the cid means nothing.
+    let mut e = Direct::new(&h, &mut anon, 2).await;
+    let message2 = e.alice.send(&mut e.a, b"other");
+    h.send(
+        &anon,
+        &format!("@cid={cid} POST {} {} {message2}", e.m, e.alice.token(&e.a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+    // After 24 hours it is a new post.
+    h.clock.advance(Duration::from_secs(24 * 60 * 60 + 1));
+    h.send(&anon, &format!("@cid={cid} POST {m} {token} {message}"))
+        .await;
+    assert_eq!(anon.lines(), ["OK seq=3"]);
+}
+
+/// A live post is not kept: it goes to the followers of now, with `t` and
+/// no `seq` (5.2).
+#[tokio::test]
+async fn live_posts() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut other = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let m = d.m;
+    h.send(&other, &format!("FOLLOW {m}")).await;
+    other.lines();
+    let message = d.alice.send(&mut d.a, b"typing");
+    h.send(
+        &anon,
+        &format!(
+            "@cid=abcdefghijklmnop POST {m} {} {message} live=yes",
+            d.alice.token(&d.a)
+        ),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    assert_eq!(
+        other.lines(),
+        [format!("@t={} POST {m} {message}", now(&h))]
+    );
+    h.send(&other, &format!("FETCH {m} after=1")).await;
+    assert_eq!(other.lines(), ["OK more=0"]);
+    h.send(&other, &format!("FOLLOW {m}")).await;
+    assert_eq!(other.lines(), ["OK head=1"]);
+}
+
+/// A signed-in connection posts only a public room's PublicMessages (5.2
+/// point 5, 13).
+#[tokio::test]
+async fn signed_in_connections_do_not_post_privately() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let mut signed = d.alice.sign_in(&mut h);
+    let message = d.alice.send(&mut d.a, b"hi");
+    h.send(
+        &signed,
+        &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["ERR wrong-connection"]);
+}
+
+/// A muted pseudonym's posts are refused (5.2 point 4, 6.4, 10.4).
+#[tokio::test]
+async fn muted_pseudonyms() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let pseudonym = Pseudonym::from_bytes(d.bob.pseudonym.0);
+    let until: Timestamp = "2026-11-09T13:00:00.000Z".parse().unwrap();
+    assert!(h.store.mute(&d.m, &pseudonym, until).unwrap());
+    let message = d.bob.send(&mut d.b, b"spam");
+    let line = format!("POST {} {} {message}", d.m, d.bob.token(&d.b));
+    h.send(&anon, &line).await;
+    assert_eq!(anon.lines(), ["ERR forbidden muted"]);
+    // Alice is not muted.
+    let message = d.alice.send(&mut d.a, b"fine");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+    // The mute ends.
+    h.clock.advance(Duration::from_secs(60 * 60));
+    h.send(&anon, &line).await;
+    assert_eq!(anon.lines(), ["OK seq=3"]);
+}
+
+/// Limits per connection and per network address: CREATE, posts, commits
+/// and TOKEN, and the bytes an address stores (4.2, 5.2, 7.2, 7.5).
+#[tokio::test]
+async fn rate_limits() {
+    let mut config = config();
+    config.limits.creates_per_hour = 2;
+    config.limits.posts_per_minute = 3;
+    config.limits.commits_per_hour = 2;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    // Direct::new creates a mailbox and posts a commit.
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let token = hash([1; 48]);
+    h.send(
+        &anon,
+        &format!(
+            "CREATE {} {} {token}",
+            mailbox(2),
+            GroupId::from_bytes([2; 32])
+        ),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    let create3 = format!(
+        "CREATE {} {} {token}",
+        mailbox(3),
+        GroupId::from_bytes([3; 32])
+    );
+    h.send(&anon, &create3).await;
+    let lines = anon.lines();
+    assert!(lines[0].starts_with("@retry="), "{lines:?}");
+    assert!(lines[0].ends_with(" ERR rate-limited"), "{lines:?}");
+    // The same address, on another connection.
+    let mut other = h.anon().await;
+    h.send(&other, &create3).await;
+    assert!(other.lines()[0].ends_with("ERR rate-limited"));
+    h.clock.advance(Duration::from_secs(60 * 60));
+    h.send(&other, &create3).await;
+    assert_eq!(other.lines(), ["OK"]);
+
+    // Posts: 3 a minute, the commit of Direct::new included... a minute
+    // has passed, so three more.
+    for i in 0..3 {
+        let message = d.alice.send(&mut d.a, &[i]);
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+        )
+        .await;
+        assert!(anon.lines()[0].starts_with("OK seq="));
+    }
+    let message = d.alice.send(&mut d.a, b"one too many");
+    let post = format!("POST {} {} {message}", d.m, d.alice.token(&d.a));
+    h.send(&anon, &post).await;
+    assert_eq!(anon.lines(), ["@retry=60 ERR rate-limited"]);
+    // Another address is not limited by this one.
+    let mut far = h.connect_from("198.51.100.9:4000");
+    h.send(&far, "ANON").await;
+    h.send(&far, &post).await;
+    assert_eq!(far.lines(), ["OK", "OK seq=5"]);
+
+    // TOKEN and commits: 2 an hour (Direct::new's commit was over an hour
+    // ago).
+    let token1 = d.alice.token(&d.a);
+    for n in [7, 8] {
+        h.send(&far, &format!("TOKEN {} 1 {token1} {}", d.m, hash([n; 48])))
+            .await;
+        assert_eq!(far.lines(), ["OK"]);
+    }
+    h.send(&far, &format!("TOKEN {} 1 {token1} {}", d.m, hash([9; 48])))
+        .await;
+    assert!(far.lines()[0].ends_with("ERR rate-limited"));
+}
+
+/// The bytes one address stores in an hour (7.5).
+#[tokio::test]
+async fn address_bytes() {
+    let mut config = config();
+    config.limits.address_bytes_per_hour = 40_000;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let mut kept = 0;
+    let mut refused = None;
+    for i in 0..50 {
+        let message = d.alice.send(&mut d.a, &[i; 100]);
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+        )
+        .await;
+        let lines = anon.lines();
+        if lines[0].starts_with("OK") {
+            kept += 1;
+        } else {
+            refused = Some(lines[0].clone());
+            break;
+        }
+    }
+    assert!(kept > 0);
+    let refused = refused.expect("the limit was reached");
+    assert!(refused.ends_with("ERR rate-limited"), "{refused}");
+    // Live posts store nothing.
+    let message = d.alice.send(&mut d.a, b"typing");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message} live=yes", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    h.clock.advance(Duration::from_secs(60 * 60));
+    let message = d.alice.send(&mut d.a, b"later");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert!(anon.lines()[0].starts_with("OK seq="));
+}
+
+/// Over its quota a mailbox's oldest posts expire early, and a post larger
+/// than the quota is refused (7.5).
+#[tokio::test]
+async fn quotas() {
+    let mut config = config();
+    config.limits.mailbox_quota = 60_000;
+    config.limits.posts_per_minute = 0;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    for i in 0..20u8 {
+        let message = d.alice.send(&mut d.a, &[i; 1000]);
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+        )
+        .await;
+        assert!(anon.lines()[0].starts_with("OK seq="));
+        assert!(h.store.mailbox_bytes(&d.m).unwrap() <= 60_000);
+    }
+    h.send(&anon, &format!("FETCH {} after=0", d.m)).await;
+    let lines = anon.lines();
+    // The oldest posts expired early; the newest are all there.
+    assert!(!lines[0].starts_with("@seq=1;"));
+    assert!(lines[lines.len() - 2].starts_with("@seq=21;"));
+    let big = d.alice.send(&mut d.a, &[9; 70_000]);
+    h.send(
+        &anon,
+        &format!("POST {} {} {big}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+}
+
+/// Retention: posts expire oldest first, and a mailbox whose posts have
+/// all expired and that nobody follows ends (7.5).
+#[tokio::test]
+async fn retention() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let mut e = Direct::new(&h, &mut anon, 2).await;
+    let day = Duration::from_secs(24 * 60 * 60);
+    h.clock.advance(day * 20);
+    let message = d.alice.send(&mut d.a, b"later");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+    h.send(&anon, &format!("FOLLOW {}", e.m)).await;
+    assert_eq!(anon.lines(), ["OK head=1"]);
+    // 30 days after the first posts.
+    h.clock.advance(day * 10 + Duration::from_secs(1));
+    run_maintenance(h.inner()).await.unwrap();
+    h.send(&anon, &format!("FETCH {} after=0", d.m)).await;
+    assert_eq!(anon.lines().len(), 2, "only seq 2 is left");
+    h.send(&anon, &format!("FETCH {} after=0", e.m)).await;
+    assert_eq!(anon.lines(), ["OK more=0"]);
+    // Both are kept: one has a post, the other a follower.
+    assert!(h.store.mailbox(&d.m).unwrap().is_some());
+    assert!(h.store.mailbox(&e.m).unwrap().is_some());
+    // Its token sets went with them, unused for a retention period (7.2).
+    let message = e.alice.send(&mut e.a, b"still here");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message}", e.m, e.alice.token(&e.a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
+    // Once nobody follows a mailbox whose posts have all gone, it ends.
+    h.send(&anon, &format!("UNFOLLOW {}", e.m)).await;
+    assert_eq!(anon.lines(), ["OK"]);
+    h.clock.advance(day * 31);
+    run_maintenance(h.inner()).await.unwrap();
+    assert!(h.store.mailbox(&d.m).unwrap().is_none());
+    assert!(h.store.mailbox(&e.m).unwrap().is_none());
+    // Its box is never used again.
+    h.send(
+        &anon,
+        &format!(
+            "CREATE {} {} {}",
+            d.m,
+            GroupId::from_bytes([9; 32]),
+            hash([1; 48])
+        ),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR name-taken"]);
+}
+
+/// FOLLOW's OK agrees with the live posts (3.6): posts sent to the
+/// connection before it are at most its head, and those after it newer.
+#[tokio::test]
+async fn follow_agrees_with_live_posts() {
+    let mut config = config();
+    config.limits.posts_per_minute = 0;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let messages: Vec<String> = (0..40).map(|i| d.alice.send(&mut d.a, &[i])).collect();
+    let token = d.alice.token(&d.a);
+    let mut posters = Vec::new();
+    for _ in 0..4 {
+        posters.push(h.anon().await);
+    }
+    let mut followers = Vec::new();
+    for _ in 0..8 {
+        followers.push(h.anon().await);
+    }
+    let posting = async {
+        for (i, message) in messages.iter().enumerate() {
+            h.send(&posters[i % 4], &format!("POST {} {token} {message}", d.m))
+                .await;
+        }
+    };
+    let following = async {
+        for f in &followers {
+            h.send(f, &format!("FOLLOW {}", d.m)).await;
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::join!(posting, following);
+    for f in &mut followers {
+        let lines = f.lines();
+        let ok = lines
+            .iter()
+            .position(|l| l.starts_with("OK head="))
+            .unwrap();
+        let head: u64 = lines[ok]["OK head=".len()..].parse().unwrap();
+        let seqs: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("@seq="))
+            .map(|l| l[..l.find(';').unwrap()].parse().unwrap())
+            .collect();
+        // Every post after the head, in order, and none before it.
+        assert_eq!(seqs, ((head + 1)..=41).collect::<Vec<_>>(), "head {head}");
+        assert!(lines[..ok].is_empty());
+    }
+}
+
+/// A connection follows at most `max_follows` mailboxes (7.1).
+#[tokio::test]
+async fn follow_limit() {
+    let mut config = config();
+    config.limits.max_follows = 1000;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    for n in 0..1001u32 {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        let mut gid = [0; 32];
+        gid[..4].copy_from_slice(&n.to_be_bytes());
+        h.store
+            .create_mailbox(&NewMailbox {
+                mailbox: BoxName::from_bytes(bytes),
+                group_id: GroupId::from_bytes(gid),
+                first_epoch: 0,
+                token_hash: TokenHash::from_bytes([1; 48]),
+                created: T.parse().unwrap(),
+            })
+            .unwrap();
+        h.send(&anon, &format!("FOLLOW {}", BoxName::from_bytes(bytes)))
+            .await;
+        let want = if n < 1000 {
+            "OK head=0"
+        } else {
+            "ERR forbidden following too many mailboxes"
+        };
+        assert_eq!(anon.lines(), [want], "{n}");
+    }
+}
+
+/// When an operator drops a mailbox, its followers get DROP, and nothing
+/// of it is left but its box (6.1, 10.4).
+#[tokio::test]
+async fn drop_lines() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut other = h.anon().await;
+    let d = Direct::new(&h, &mut anon, 1).await;
+    h.send(&other, &format!("FOLLOW {}", d.m)).await;
+    other.lines();
+    assert!(drop_mailbox(h.inner(), &d.m, "spam\\sroom").await.unwrap());
+    assert_eq!(other.lines(), [format!("DROP {} spam\\sroom", d.m)]);
+    assert!(h.inner().mailbox.followers(&d.m).is_empty());
+    assert!(!drop_mailbox(h.inner(), &d.m, "").await.unwrap());
+    h.send(&other, &format!("FETCH {} after=0", d.m)).await;
+    assert_eq!(other.lines(), ["ERR not-found"]);
+    let _ = d.commit;
+    let _ = d.next;
+}
+
+/// Nothing the store keeps names an anonymous or guest connection or its
+/// address (4.2).
+#[tokio::test]
+async fn nothing_kept_about_anonymous_connections() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    let (guest, _) = h.guest("sam").await;
+    let message = d.bob.send(&mut d.b, b"hi");
+    h.send(
+        &guest,
+        &format!(
+            "@cid=abcdefghijklmnop POST {} {} {message}",
+            d.m,
+            d.bob.token(&d.b)
+        ),
+    )
+    .await;
+    h.send(&guest, &format!("FOLLOW {}", d.m)).await;
+    h.send(
+        &anon,
+        &format!("TOKEN {} 1 {} {}", d.m, d.bob.token(&d.b), hash([2; 48])),
+    )
+    .await;
+    let conn = h.store.raw();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for table in tables {
+        let mut select = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let columns = select.column_count();
+        let mut rows = select.query(params![]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..columns {
+                let text = match row.get_ref(i).unwrap() {
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                    rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+                    _ => continue,
+                };
+                assert!(!text.contains("203.0.113.7"), "{table}: {text}");
+                assert!(!text.contains("~sam"), "{table}: {text}");
+            }
+        }
+    }
+}
+
+/// A public room for the tests of GONE, with `members` holding a leaf in
+/// its group, set up in the store directly.
 fn public_room(h: &Harness, n: u8, room: &str, members: &[&str]) -> BoxName {
     let mailbox = BoxName::from_bytes([n; 16]);
     h.store
@@ -70,11 +1160,12 @@ async fn gone_when_a_guest_session_ends() {
     let mut a = h.anon().await;
     let mut b = h.anon().await;
     let mut c = h.anon().await;
-    let mailbox = &h.inner().mailbox;
-    mailbox.follow(general, a.id);
-    mailbox.follow(help, a.id);
-    mailbox.follow(general, b.id);
-    mailbox.follow(quiet, c.id);
+    for (conn, room) in [(&a, general), (&a, help), (&b, general), (&c, quiet)] {
+        h.send(conn, &format!("FOLLOW {room}")).await;
+    }
+    for conn in [&mut a, &mut b, &mut c] {
+        conn.lines();
+    }
 
     // While the session waits to be resumed, nothing is sent.
     h.close(sam).await;
@@ -88,6 +1179,350 @@ async fn gone_when_a_guest_session_ends() {
     assert!(c.lines().is_empty());
 
     // A connection that closed follows nothing.
+    let mailbox = &h.inner().mailbox;
     h.close(b).await;
     assert_eq!(mailbox.followers(&general), [a.id]);
+}
+
+// ---- Public rooms (6.1, 6.4, 12.6)
+
+/// A public room created on the owner's signed-in connection.
+struct PublicRoomSetup {
+    owen: Dev,
+    o: MlsGroup,
+    m: BoxName,
+    signed: Client,
+}
+
+/// The GroupInfo and tree of a public room's group, as CREATE and
+/// GROUPINFO carry them.
+fn public_state(device: &Dev, group: &MlsGroup) -> (String, String) {
+    let leaf_key = own_leaf_key(&device.provider, group).unwrap();
+    let group_info = group
+        .export_group_info(device.provider.crypto(), &leaf_key, false)
+        .unwrap();
+    (
+        b64(&to_bytes(&group_info)),
+        b64(&tree_to_bytes(&group.export_ratchet_tree())),
+    )
+}
+
+fn public_conv(owner: &Dev, m: BoxName, guests: GuestMode) -> RisalaConversation {
+    let room: Room = "#general".parse().unwrap();
+    let mut conv = RisalaConversation::public_room(HOST, *m.as_bytes(), &room, &owner.uid);
+    conv.guests = guests;
+    conv
+}
+
+/// The harness, with its clock at the system's time, so that KeyPackages
+/// made now are within their lifetimes (12.5).
+fn harness_now() -> Harness {
+    let h = Harness::new();
+    h.clock.set(Timestamp::now());
+    h
+}
+
+async fn create_room(h: &mut Harness, n: u8) -> PublicRoomSetup {
+    let owen = Dev::new("owen@example.org", n);
+    let m = mailbox(n);
+    let o = owen.create(&public_conv(&owen, m, GuestMode::Write));
+    let (group_info, tree) = public_state(&owen, &o);
+    let mut signed = owen.sign_in(h);
+    h.send(
+        &signed,
+        &format!(
+            "CREATE {m} {} {} #general {group_info} {tree}",
+            gid(&o),
+            owen.token_hash(&o)
+        ),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["OK"]);
+    PublicRoomSetup { owen, o, m, signed }
+}
+
+/// The second form of CREATE: a public room, on its owner's device's
+/// signed-in connection, checked as 12.6 says (5.2, 6.1).
+#[tokio::test]
+async fn create_public_rooms() {
+    let mut h = harness_now();
+    let owen = Dev::new("owen@example.org", 1);
+    let m = mailbox(1);
+    let o = owen.create(&public_conv(&owen, m, GuestMode::Write));
+    let (group_info, tree) = public_state(&owen, &o);
+    let line = |m: BoxName, room: &str| {
+        format!(
+            "CREATE {m} {} {} {room} {group_info} {tree}",
+            gid(&o),
+            owen.token_hash(&o)
+        )
+    };
+    // Not on another identity's connection, nor another device's.
+    let mut mallory = h.signed_in_as("mallory@example.org");
+    h.send(&mallory, &line(m, "#general")).await;
+    assert!(mallory.lines()[0].starts_with("ERR invalid"));
+    let mut other_device = h.signed_in_as("owen@example.org");
+    h.send(&other_device, &line(m, "#general")).await;
+    assert_eq!(
+        other_device.lines(),
+        ["ERR invalid the leaf is not this device's"]
+    );
+    let mut signed = owen.sign_in(&mut h);
+    // Another name or box than the group's.
+    h.send(&signed, &line(m, "#other")).await;
+    assert!(signed.lines()[0].starts_with("ERR invalid"));
+    h.send(&signed, &line(mailbox(2), "#general")).await;
+    assert!(signed.lines()[0].starts_with("ERR invalid"));
+    // Junk.
+    let junk = b64(&[1; 100]);
+    h.send(
+        &signed,
+        &format!(
+            "CREATE {m} {} {} #general {junk} {tree}",
+            gid(&o),
+            owen.token_hash(&o)
+        ),
+    )
+    .await;
+    assert!(signed.lines()[0].starts_with("ERR invalid"));
+    h.send(&signed, &line(m, "#general")).await;
+    assert_eq!(signed.lines(), ["OK"]);
+    // The name is taken; so are the box and the group id.
+    let owen2 = Dev::new("owen@example.org", 2);
+    let o2 = owen2.create(&public_conv(&owen2, mailbox(2), GuestMode::Write));
+    let (gi2, tree2) = public_state(&owen2, &o2);
+    let mut signed2 = owen2.sign_in(&mut h);
+    h.send(
+        &signed2,
+        &format!(
+            "CREATE {} {} {} #general {gi2} {tree2}",
+            mailbox(2),
+            gid(&o2),
+            owen2.token_hash(&o2)
+        ),
+    )
+    .await;
+    assert_eq!(signed2.lines(), ["ERR name-taken"]);
+    h.send(&signed, &line(m, "#general")).await;
+    assert_eq!(signed.lines(), ["ERR name-taken"]);
+    // GROUPINFO: epoch 0, seq 0.
+    let mut anon = h.anon().await;
+    h.send(&anon, &format!("GROUPINFO {m}")).await;
+    assert_eq!(
+        anon.lines(),
+        [
+            format!("GROUPINFO {m} 0 0 {group_info} {tree}"),
+            "OK".into()
+        ]
+    );
+    let room = h.store.room_member(&m, &owen.uid).unwrap();
+    assert_eq!(room, Some(risala_proto::types::Role::Owner));
+    // A private mailbox is not a public room.
+    let d = Direct::new(&h, &mut anon, 9).await;
+    h.send(&anon, &format!("GROUPINFO {}", d.m)).await;
+    assert_eq!(anon.lines(), ["ERR not-found"]);
+}
+
+/// Who may create public rooms (5.2, 6.1), and how many a day.
+#[tokio::test]
+async fn room_creation_limits() {
+    let mut config = config();
+    config.limits.rooms_per_day = 1;
+    let mut h = Harness::with(config.clone(), timers());
+    h.clock.set(Timestamp::now());
+    create_room(&mut h, 1).await;
+    let owen = Dev::new("owen@example.org", 2);
+    let o = owen.create(&public_conv(&owen, mailbox(2), GuestMode::Write));
+    let (gi, tree) = public_state(&owen, &o);
+    let mut signed = owen.sign_in(&mut h);
+    let line = format!(
+        "CREATE {} {} {} #other {gi} {tree}",
+        mailbox(2),
+        gid(&o),
+        owen.token_hash(&o)
+    );
+    h.send(&signed, &line).await;
+    assert!(signed.lines()[0].ends_with("ERR rate-limited"));
+
+    config.room_creation = crate::config::RoomCreation::Nobody;
+    let mut h = Harness::with(config, timers());
+    h.clock.set(Timestamp::now());
+    let mut signed = owen.sign_in(&mut h);
+    h.send(&signed, &line).await;
+    assert_eq!(
+        signed.lines(),
+        ["ERR forbidden this server does not let you create rooms"]
+    );
+}
+
+/// A public room's commits: for the current epoch only, one an epoch, from
+/// the committer's device's signed-in connection, with the GroupInfo the
+/// commit makes; then GROUPINFO serves the new state (6.1, 12.6).
+#[tokio::test]
+async fn public_room_commits() {
+    let mut h = harness_now();
+    let PublicRoomSetup {
+        owen,
+        mut o,
+        m,
+        mut signed,
+    } = create_room(&mut h, 1).await;
+    let mut anon = h.anon().await;
+    h.send(&anon, &format!("FOLLOW {m}")).await;
+    assert_eq!(anon.lines(), ["OK head=0"]);
+    let token0 = owen.token(&o);
+    let out = owen.commit(&mut o, Changes::default());
+    let commit = b64(&out.message);
+    let next = hash(out.next_token_hash);
+    let gi = b64(out.group_info.as_ref().unwrap());
+
+    // Without its GroupInfo, or with another's.
+    h.send(&signed, &format!("POST {m} {token0} {commit} next={next}"))
+        .await;
+    assert!(signed.lines()[0].starts_with("ERR invalid"));
+    let (old_gi, _) = public_state(&owen, &o);
+    h.send(
+        &signed,
+        &format!("POST {m} {token0} {commit} next={next} groupinfo={old_gi}"),
+    )
+    .await;
+    assert!(signed.lines()[0].starts_with("ERR invalid"));
+    // From an anonymous connection, or another device's.
+    h.send(
+        &anon,
+        &format!("POST {m} {token0} {commit} next={next} groupinfo={gi}"),
+    )
+    .await;
+    assert!(anon.lines()[0].starts_with("ERR forbidden"));
+    let mut other = h.signed_in_as("owen@example.org");
+    h.send(
+        &other,
+        &format!("POST {m} {token0} {commit} next={next} groupinfo={gi}"),
+    )
+    .await;
+    assert!(other.lines()[0].starts_with("ERR forbidden"));
+    // As it should be.
+    h.send(
+        &signed,
+        &format!("POST {m} {token0} {commit} next={next} groupinfo={gi}"),
+    )
+    .await;
+    let event = format!("@seq=1;t={} POST {m} {commit} next={next}", now(&h));
+    assert_eq!(signed.lines(), ["OK seq=1"]);
+    assert_eq!(anon.lines(), [event]);
+    // A second commit for epoch 0 is stale.
+    h.send(
+        &signed,
+        &format!("POST {m} {token0} {commit} next={next} groupinfo={gi}"),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["ERR stale"]);
+    merge_own_commit(&owen.provider, &mut o).unwrap();
+    h.send(&anon, &format!("GROUPINFO {m}")).await;
+    let (_, tree) = public_state(&owen, &o);
+    assert_eq!(
+        anon.lines(),
+        [format!("GROUPINFO {m} 1 1 {gi} {tree}"), "OK".into()]
+    );
+
+    // Application messages are PrivateMessages, posted anonymously; a
+    // commit as a PrivateMessage is refused.
+    let message = owen.send(&mut o, b"hello room");
+    let token1 = owen.token(&o);
+    h.send(&anon, &format!("POST {m} {token1} {message}")).await;
+    let event = format!("@seq=2;t={} POST {m} {message}", now(&h));
+    assert_eq!(anon.lines(), [event, "OK seq=2".into()]);
+    h.send(&signed, &format!("POST {m} {token1} {message}"))
+        .await;
+    assert_eq!(signed.lines(), ["ERR wrong-connection"]);
+
+    // Once restarted, the hub rebuilds the room's group from the store.
+    h.inner().mailbox.forget_room(&m);
+    let out = owen.commit(&mut o, Changes::default());
+    h.send(
+        &signed,
+        &format!(
+            "POST {m} {token1} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(out.group_info.as_ref().unwrap())
+        ),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["OK seq=3"]);
+}
+
+/// MUTE and UNMUTE (6.4): owners and moderators with a leaf, on a
+/// signed-in connection, until the hours or the period's end.
+#[tokio::test]
+async fn mutes() {
+    let mut h = harness_now();
+    let PublicRoomSetup {
+        owen,
+        mut o,
+        m,
+        mut signed,
+        ..
+    } = create_room(&mut h, 1).await;
+    let mut anon = h.anon().await;
+    let pseudonym = Pseudonym::from_bytes(owen.pseudonym.0);
+    // Nobody else may mute: not a member, nor a member of another room.
+    let mut mallory = h.signed_in_as("mallory@example.org");
+    h.send(&mallory, &format!("MUTE {m} {pseudonym}")).await;
+    assert_eq!(
+        mallory.lines(),
+        ["ERR forbidden only the room's owners and moderators mute"]
+    );
+    // A private mailbox is not found.
+    let d = Direct::new(&h, &mut anon, 9).await;
+    h.send(&signed, &format!("MUTE {} {pseudonym}", d.m)).await;
+    assert_eq!(signed.lines(), ["ERR not-found"]);
+    h.send(&anon, &format!("MUTE {m} {pseudonym}")).await;
+    assert_eq!(anon.lines(), ["ERR wrong-connection"]);
+
+    h.send(&signed, &format!("MUTE {m} {pseudonym} hours=1"))
+        .await;
+    assert_eq!(signed.lines(), ["OK"]);
+    let message = owen.send(&mut o, b"muted");
+    let post = format!("POST {m} {} {message}", owen.token(&o));
+    h.send(&anon, &post).await;
+    assert_eq!(anon.lines(), ["ERR forbidden muted"]);
+    h.send(&signed, &format!("UNMUTE {m} {pseudonym}")).await;
+    assert_eq!(signed.lines(), ["OK"]);
+    h.send(&anon, &post).await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+
+    // At most until the end of the period: muted at 23:00 for 24 hours,
+    // free at midnight.
+    let late: Timestamp = format!("{}T23:00:00.000Z", &h.inner().now().to_string()[..10])
+        .parse()
+        .unwrap();
+    h.clock.set(late);
+    h.send(&signed, &format!("MUTE {m} {pseudonym}")).await;
+    assert_eq!(signed.lines(), ["OK"]);
+    h.send(&anon, &post).await;
+    assert_eq!(anon.lines(), ["ERR forbidden muted"]);
+    h.clock.advance(Duration::from_secs(60 * 60));
+    h.send(&anon, &post).await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+}
+
+/// The commands' kinds as Section 13 has them, for this area (4.1).
+#[tokio::test]
+async fn kinds() {
+    let mut h = Harness::new();
+    let mut alice = h.signed_in_as("alice@example.org");
+    let m = mailbox(1);
+    for line in [
+        format!("FOLLOW {m}"),
+        format!("FETCH {m} after=0"),
+        format!("GROUPINFO {m}"),
+    ] {
+        h.send(&alice, &line).await;
+        assert_eq!(alice.lines(), ["ERR wrong-connection"], "{line}");
+    }
+    let mut anon = h.anon().await;
+    let p = Pseudonym::from_bytes([1; 16]);
+    h.send(&anon, &format!("UNMUTE {m} {p}")).await;
+    assert_eq!(anon.lines(), ["ERR wrong-connection"]);
 }

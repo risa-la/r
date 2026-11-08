@@ -261,6 +261,11 @@ pub trait MailboxStore {
     /// constant time (7.2).
     fn has_token(&self, mailbox: &BoxName, epoch: u64, hash: &TokenHash) -> Result<bool>;
 
+    /// Whether any set of `mailbox` holds `hash`, compared in constant time:
+    /// the check of a send token that comes without its epoch, for UPLOAD
+    /// and BLOB (5.6, 12.12).
+    fn has_token_any(&self, mailbox: &BoxName, hash: &TokenHash) -> Result<bool>;
+
     /// Adds `hash` to the set of `epoch` of `mailbox` at `now`, within the
     /// bounds of 7.2: a set holds at most [`MAX_SET_HASHES`], and a full
     /// set drops the hash added first among those no post has used, or if

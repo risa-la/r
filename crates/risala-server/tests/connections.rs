@@ -87,10 +87,7 @@ async fn line_limits_follow_the_kind() {
     client.send("ANON").await.unwrap();
     assert_eq!(client.expect_line().await.unwrap(), "OK");
     client.send(&post).await.unwrap();
-    assert_eq!(
-        client.expect_line().await.unwrap(),
-        "@ref=p ERR not-supported"
-    );
+    assert_eq!(client.expect_line().await.unwrap(), "@ref=p ERR not-found");
     client.send(&register).await.unwrap();
     assert_eq!(
         client.expect_line().await.unwrap(),

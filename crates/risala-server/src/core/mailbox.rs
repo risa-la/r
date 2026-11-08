@@ -2,38 +2,180 @@
 //! MUTE, UNMUTE, FOLLOW, UNFOLLOW, FETCH and TOKEN, the GONE and DROP
 //! lines, moves (7.8), retention and quotas (7.5).
 //!
-//! Not built yet: every command replies `ERR not-supported`. What is here
-//! is the followers of each mailbox, and GONE when a guest's session ends
-//! (4.2, 6.1).
+//! # Order
+//!
+//! Each mailbox has a lock, an async mutex, held while a post is checked,
+//! kept and sent to the mailbox's followers, while TOKEN changes its token
+//! sets, and while FOLLOW reads its head, starts following and queues its
+//! `OK`. So followers get posts in seq order, and FOLLOW's `OK` agrees with
+//! the live posts as 3.6 says: every post queued before it is covered by
+//! its head, and every post queued after it is newer.
+//!
+//! # What is kept
 //!
 //! The store keeps mailboxes, token hashes, posts, cids, public rooms,
-//! their members and mutes ([`MailboxStore`](crate::store::MailboxStore)).
+//! their members and mutes ([`MailboxStore`]), and nothing about the
+//! connections or addresses that made them (4.2). Which connections follow
+//! which mailboxes, and the counts behind the limits per connection and
+//! per network address, are kept in memory only, for the life of the
+//! connection or the limit's window.
+//!
+//! Public rooms' groups, which the server checks (12.6), are in [`room`].
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard};
+mod room;
 
-use risala_proto::command::Command;
-use risala_proto::names::{BoxName, Uid};
-use risala_proto::server::{ServerLine, ServerMessage};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
+
+use risala_mls::framing::{ContentType, Sender, read_post};
+use risala_proto::command::{Command, CreateForm};
+use risala_proto::error::ErrorCode;
+use risala_proto::mls::{
+    GroupId, GroupInfo, MlsMessage, OrBlob, PostToken, Pseudonym, SendToken, TokenHash,
+};
+use risala_proto::names::{BlobRef, BoxName, Seq, Uid};
+use risala_proto::server::{ErrResponse, OkResponse, Post, ServerLine, ServerMessage};
+use risala_proto::time::Timestamp;
+use risala_proto::types::{DEFAULT_FETCH_LIMIT, MIN_FETCH_LIMIT_CAP, PushTag, Role};
+use tokio::sync::OwnedMutexGuard;
 
 use super::Inner;
-use super::command::{Cx, Reply, misrouted, not_supported};
-use super::state::ConnEntry;
+use super::command::{Cx, Reply, err, misrouted};
+use super::rate::{WindowLimit, network};
+use super::state::{ConnEntry, Who};
 use crate::config::Config;
 use crate::handler::{ConnId, OutLine};
-use crate::store::{Store, StoreError};
+use crate::store::{
+    Created, MailboxRecord, NewMailbox, NewPost, PostBody, Posted, Store, StoreError, StoredPost,
+};
+
+/// The window of the limits on CREATE, commits and TOKEN, and on the bytes
+/// an address stores (5.2, 7.2, 7.5).
+const HOUR: Duration = Duration::from_secs(60 * 60);
+
+/// The window of the limit on posts (4.2, 5.2).
+const MINUTE: Duration = Duration::from_secs(60);
+
+/// How often the area's background work runs.
+const MAINTAIN_EVERY: Duration = Duration::from_secs(60);
 
 /// What the mailbox area keeps in memory.
-#[derive(Debug)]
 pub(crate) struct State {
     follows: Mutex<Follows>,
+    /// Each mailbox's lock, while anyone holds it.
+    locks: Mutex<HashMap<BoxName, Weak<tokio::sync::Mutex<()>>>>,
+    /// Limits per connection and per network address (4.2, 5.2, 7.2).
+    creates: Limit,
+    posts: Limit,
+    commits: Limit,
+    /// The bytes each network address stored in the last hour (7.5).
+    stored: ByteWindow,
+    /// Public rooms' groups (12.6).
+    rooms: room::Rooms,
 }
 
-/// Which connections follow which mailboxes (7.1), both ways.
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State").finish_non_exhaustive()
+    }
+}
+
+/// Which connections follow which mailboxes (7.1), both ways, with each
+/// follow's `quiet` tag (9.2).
 #[derive(Debug, Default)]
 struct Follows {
-    by_box: HashMap<BoxName, BTreeSet<ConnId>>,
+    by_box: HashMap<BoxName, BTreeMap<ConnId, Option<PushTag>>>,
     by_conn: HashMap<ConnId, BTreeSet<BoxName>>,
+}
+
+/// A limit in a sliding window, per connection and per network address.
+#[derive(Debug)]
+struct Limit {
+    conns: WindowLimit<ConnId>,
+    addresses: WindowLimit<IpAddr>,
+}
+
+impl Limit {
+    fn new(window: Duration) -> Limit {
+        Limit {
+            conns: WindowLimit::new(window),
+            addresses: WindowLimit::new(window),
+        }
+    }
+
+    /// Takes a slot of `max` for the connection and for its network
+    /// address, and keeps both, or fails with `ERR rate-limited` and the
+    /// seconds to wait.
+    fn take(&self, cx: &Cx, max: u32, now: Timestamp) -> Result<(), ErrResponse> {
+        let conn = self.conns.take(cx.conn, max, now).map_err(rate_limited)?;
+        let address = self
+            .addresses
+            .take(network(cx.peer.ip()), max, now)
+            .map_err(rate_limited)?;
+        conn.into_iter().for_each(|slot| slot.keep());
+        address.into_iter().for_each(|slot| slot.keep());
+        Ok(())
+    }
+}
+
+/// The bytes each key stored in a sliding window (7.5), in memory only
+/// (4.2).
+#[derive(Debug)]
+struct ByteWindow {
+    window: Duration,
+    stored: Mutex<HashMap<IpAddr, VecDeque<(Timestamp, u64)>>>,
+}
+
+impl ByteWindow {
+    fn new(window: Duration) -> ByteWindow {
+        ByteWindow {
+            window,
+            stored: Mutex::default(),
+        }
+    }
+
+    /// Counts `bytes` for `address` at `now`, unless that takes it over
+    /// `max` in the window: then the seconds until it would fit. A `max`
+    /// of 0 means no limit.
+    fn charge(&self, address: IpAddr, bytes: u64, max: u64, now: Timestamp) -> Result<(), u64> {
+        if max == 0 {
+            return Ok(());
+        }
+        let mut all = self.stored.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= self.window)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        let times = all.entry(address).or_default();
+        let total: u64 = times.iter().map(|(_, n)| n).sum();
+        if total.saturating_add(bytes) > max {
+            // Wait until enough of the oldest has left the window.
+            let mut left = total.saturating_add(bytes).saturating_sub(max);
+            let mut until = now;
+            for (t, n) in times.iter() {
+                until = *t;
+                left = left.saturating_sub(*n);
+                if left == 0 {
+                    break;
+                }
+            }
+            let waited = now.saturating_duration_since(until);
+            return Err(self.window.saturating_sub(waited).as_secs().max(1));
+        }
+        times.push_back((now, bytes));
+        Ok(())
+    }
+}
+
+fn rate_limited(retry: u64) -> ErrResponse {
+    err(ErrorCode::RateLimited).with_retry(retry)
 }
 
 impl State {
@@ -41,6 +183,12 @@ impl State {
     pub(crate) fn load(_config: &Config, _store: &dyn Store) -> Result<State, StoreError> {
         Ok(State {
             follows: Mutex::default(),
+            locks: Mutex::default(),
+            creates: Limit::new(HOUR),
+            posts: Limit::new(MINUTE),
+            commits: Limit::new(HOUR),
+            stored: ByteWindow::new(HOUR),
+            rooms: room::Rooms::new(),
         })
     }
 
@@ -48,15 +196,63 @@ impl State {
         self.follows.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Connection `conn` follows `mailbox` from now on (7.1).
-    #[allow(
-        dead_code,
-        reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-    )]
-    pub(crate) fn follow(&self, mailbox: BoxName, conn: ConnId) {
+    /// The lock of `mailbox` (see the [module](self) docs).
+    async fn lock(&self, mailbox: BoxName) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+            match locks.get(&mailbox).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    if locks.len() >= 1024 {
+                        locks.retain(|_, lock| lock.strong_count() > 0);
+                    }
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(mailbox, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    /// Connection `conn` follows `mailbox` from now on (7.1), with `quiet`
+    /// (9.2). Returns `false` if it already follows `max` others.
+    pub(crate) fn follow(
+        &self,
+        mailbox: BoxName,
+        conn: ConnId,
+        quiet: Option<PushTag>,
+        max: usize,
+    ) -> bool {
         let mut follows = self.follows();
-        follows.by_box.entry(mailbox).or_default().insert(conn);
-        follows.by_conn.entry(conn).or_default().insert(mailbox);
+        let boxes = follows.by_conn.entry(conn).or_default();
+        if !boxes.contains(&mailbox) && boxes.len() >= max {
+            return false;
+        }
+        boxes.insert(mailbox);
+        follows
+            .by_box
+            .entry(mailbox)
+            .or_default()
+            .insert(conn, quiet);
+        true
+    }
+
+    /// Connection `conn` no longer follows `mailbox`.
+    fn unfollow(&self, mailbox: &BoxName, conn: ConnId) {
+        let mut follows = self.follows();
+        if let Some(boxes) = follows.by_conn.get_mut(&conn) {
+            boxes.remove(mailbox);
+            if boxes.is_empty() {
+                follows.by_conn.remove(&conn);
+            }
+        }
+        if let Some(conns) = follows.by_box.get_mut(mailbox) {
+            conns.remove(&conn);
+            if conns.is_empty() {
+                follows.by_box.remove(mailbox);
+            }
+        }
     }
 
     /// The connections that follow `mailbox`.
@@ -64,8 +260,30 @@ impl State {
         self.follows()
             .by_box
             .get(mailbox)
-            .map(|conns| conns.iter().copied().collect())
+            .map(|conns| conns.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// The `quiet` tags of the connections that follow `mailbox`: the push
+    /// subscriptions to hold back meanwhile (9.2).
+    #[allow(dead_code, reason = "for pushes (docs/plans/M5b.md, SV5)")]
+    pub(crate) fn quiet_tags(&self, mailbox: &BoxName) -> Vec<PushTag> {
+        self.follows()
+            .by_box
+            .get(mailbox)
+            .map(|conns| conns.values().flatten().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Forgets the public room's group kept in memory, as a restart does.
+    #[cfg(test)]
+    pub(crate) fn forget_room(&self, mailbox: &BoxName) {
+        self.rooms.forget(mailbox);
+    }
+
+    /// Whether any connection follows `mailbox`.
+    fn followed(&self, mailbox: &BoxName) -> bool {
+        self.follows().by_box.contains_key(mailbox)
     }
 
     /// Connection `conn` follows nothing any more.
@@ -80,27 +298,565 @@ impl State {
             }
         }
     }
+
+    /// Nobody follows `mailbox` any more: it is gone. Returns who did.
+    fn forget_mailbox(&self, mailbox: &BoxName) -> Vec<ConnId> {
+        let mut follows = self.follows();
+        let conns: Vec<ConnId> = follows
+            .by_box
+            .remove(mailbox)
+            .map(|conns| conns.into_keys().collect())
+            .unwrap_or_default();
+        for conn in &conns {
+            if let Some(boxes) = follows.by_conn.get_mut(conn) {
+                boxes.remove(mailbox);
+                if boxes.is_empty() {
+                    follows.by_conn.remove(conn);
+                }
+            }
+        }
+        conns
+    }
+
+    /// Counts `bytes` that the network address of `peer` stores, with POST,
+    /// UPLOAD or BLOB, against the hourly limit (7.5), or fails with the
+    /// seconds to wait.
+    pub(crate) fn charge_address(
+        &self,
+        config: &Config,
+        peer: IpAddr,
+        bytes: u64,
+        now: Timestamp,
+    ) -> Result<(), u64> {
+        self.stored.charge(
+            network(peer),
+            bytes,
+            config.limits.address_bytes_per_hour,
+            now,
+        )
+    }
 }
 
-/// What the mailbox area keeps about one connection.
+/// What the mailbox area keeps about one connection: nothing, beyond what
+/// [`State`] keeps.
 #[derive(Debug, Default)]
 pub(crate) struct ConnState {}
 
 /// Handles CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW, UNFOLLOW, FETCH
 /// and TOKEN.
-pub(super) async fn handle(_cx: &Cx, command: Command) -> Reply {
+pub(super) async fn handle(cx: &Cx, command: Command) -> Reply {
     match command {
-        Command::Create { .. } // 5.2
-        | Command::Post { .. } // 5.2
-        | Command::GroupInfo { .. } // 6.1
-        | Command::Mute { .. } // 6.4
-        | Command::Unmute { .. } // 6.4
-        | Command::Follow { .. } // 7.1
-        | Command::Unfollow { .. } // 7.1
-        | Command::Fetch { .. } // 7.1
-        | Command::Token { .. } /* 7.2 */ => not_supported(),
+        Command::Create {
+            mailbox,
+            group_id,
+            token_hash,
+            form,
+        } => match form {
+            CreateForm::Private { .. } => {
+                create(cx, mailbox, group_id, token_hash, form.first_epoch()).await
+            }
+            CreateForm::Public(public) => {
+                room::create(cx, mailbox, group_id, token_hash, public).await
+            }
+        },
+        Command::Post {
+            mailbox,
+            token,
+            message,
+            live,
+            groupinfo,
+            next,
+            cid,
+        } => {
+            let post = PostCommand {
+                mailbox,
+                token,
+                message,
+                live,
+                groupinfo,
+                next,
+                cid: cid.map(|cid| cid.as_str().to_owned()),
+            };
+            handle_post(cx, post).await
+        }
+        Command::GroupInfo { mailbox } => room::group_info(cx, mailbox).await,
+        Command::Mute {
+            mailbox,
+            pseudonym,
+            hours,
+        } => room::mute(cx, mailbox, pseudonym, hours.map(|h| h.get())).await,
+        Command::Unmute { mailbox, pseudonym } => room::unmute(cx, mailbox, pseudonym).await,
+        Command::Follow { mailbox, quiet } => follow(cx, mailbox, quiet).await,
+        Command::Unfollow { mailbox } => unfollow(cx, mailbox).await,
+        Command::Fetch {
+            mailbox,
+            after,
+            limit,
+            leaf,
+        } => fetch(cx, mailbox, after, limit.map(|l| l.get()), leaf).await,
+        Command::Token {
+            mailbox,
+            epoch,
+            token,
+            hash,
+        } => handle_token(cx, mailbox, epoch, token, hash).await,
         other => misrouted("mailbox", &other),
     }
+}
+
+/// The mailbox `mailbox`, or `ERR not-found`.
+async fn mailbox(cx: &Cx, mailbox: BoxName) -> Result<MailboxRecord, ErrResponse> {
+    cx.db(move |store| store.mailbox(&mailbox))
+        .await?
+        .ok_or_else(|| err(ErrorCode::NotFound))
+}
+
+/// `CREATE <box> <group-id> <token-hash> [epoch=<epoch>]` (5.2, 7.8): the
+/// mailbox of a direct conversation or a private room, or with `epoch`, of
+/// a group that moves.
+async fn create(
+    cx: &Cx,
+    mailbox: BoxName,
+    group_id: GroupId,
+    token_hash: TokenHash,
+    first_epoch: u64,
+) -> Reply {
+    let inner = &cx.inner;
+    let now = inner.now();
+    inner
+        .mailbox
+        .creates
+        .take(cx, inner.config.limits.creates_per_hour, now)?;
+    let new = NewMailbox {
+        mailbox,
+        group_id,
+        first_epoch,
+        token_hash,
+        created: now,
+    };
+    match cx.db(move |store| store.create_mailbox(&new)).await? {
+        Created::Created => Ok(OkResponse::new()),
+        Created::Taken => Err(err(ErrorCode::NameTaken)),
+        Created::NoGroup => Err(err(ErrorCode::NotFound)),
+    }
+}
+
+/// A POST, as parsed.
+struct PostCommand {
+    mailbox: BoxName,
+    token: PostToken,
+    message: OrBlob<MlsMessage>,
+    live: bool,
+    groupinfo: Option<OrBlob<GroupInfo>>,
+    next: Option<TokenHash>,
+    cid: Option<String>,
+}
+
+/// What POST read from a message's framing (5.2).
+pub(super) struct PostFraming {
+    /// Whether it is a PrivateMessage.
+    pub(super) private: bool,
+    /// Its epoch.
+    pub(super) epoch: u64,
+    /// Its content type.
+    pub(super) content_type: ContentType,
+    /// A PublicMessage's sender.
+    pub(super) sender: Option<Sender>,
+    /// A PrivateMessage's pseudonym (7.3).
+    pub(super) pseudonym: Option<Pseudonym>,
+}
+
+/// Reads and checks a post's framing (5.2, points 1 and 2): `ERR invalid`
+/// unless it is a PrivateMessage or PublicMessage of `mls10` with a
+/// RisalaAAD that fits it, of the mailbox's group.
+fn read_framing(bytes: &[u8], group_id: &GroupId) -> Result<PostFraming, ErrResponse> {
+    let invalid = |what: &str| err(ErrorCode::Invalid).with_message(what);
+    let (framing, aad) = read_post(bytes).map_err(|e| invalid(&e.to_string()))?;
+    if framing.group_id != &group_id.as_bytes()[..] {
+        return Err(invalid("the message is not of the mailbox's group"));
+    }
+    Ok(PostFraming {
+        private: framing.private,
+        epoch: framing.epoch,
+        content_type: framing.content_type,
+        sender: framing.sender,
+        pseudonym: framing
+            .private
+            .then_some(aad_pseudonym(&aad))
+            .flatten()
+            .map(Pseudonym::from_bytes),
+    })
+}
+
+/// The pseudonym of a RisalaAAD (7.3): 16 bytes in a PrivateMessage, which
+/// `read_post` has checked.
+fn aad_pseudonym(aad: &risala_mls::RisalaAad) -> Option<[u8; 16]> {
+    Some(aad.pseudonym.0)
+}
+
+/// The bytes of a message or GroupInfo that a line names as a blob
+/// (12.12), if the server holds it.
+///
+/// The blob store belongs to the keys area (docs/plans/M5b.md, SV4), which
+/// does not yet say how to read a blob's bytes: until it does, no blob is
+/// found, and a post or CREATE that names one gets `ERR not-found`.
+pub(super) async fn blob_bytes(_inner: &Inner, _blob: &BlobRef) -> Option<Vec<u8>> {
+    None
+}
+
+/// The bytes of a message or GroupInfo in a line: decoded, or read from
+/// its blob (`ERR not-found`).
+pub(super) async fn line_bytes<T>(
+    inner: &Inner,
+    value: &OrBlob<T>,
+    decode: impl FnOnce(&T) -> Vec<u8>,
+) -> Result<Vec<u8>, ErrResponse> {
+    match value {
+        OrBlob::Inline(inline) => Ok(decode(inline)),
+        OrBlob::Blob(blob) => blob_bytes(inner, blob)
+            .await
+            .ok_or_else(|| err(ErrorCode::NotFound).with_message("no such blob")),
+    }
+}
+
+/// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
+/// [next=<hash>]` (5.2), with the checks in the spec's order.
+async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
+    let inner = &cx.inner;
+    let mailbox = post.mailbox;
+    let _lock = inner.mailbox.lock(mailbox).await;
+    let now = inner.now();
+
+    // The cid comes before anything else about the post (7.6). A live
+    // post gets no seq, so its cid is not kept.
+    let cid = post.cid.clone().filter(|_| !post.live);
+    let since = now
+        .checked_sub(crate::store::mailbox::CID_LIFETIME)
+        .unwrap_or(Timestamp::MIN);
+    let (record, seen) = cx
+        .db({
+            let cid = cid.clone();
+            move |store| {
+                let record = store.mailbox(&mailbox)?;
+                let seen = match (&record, &cid) {
+                    (Some(_), Some(cid)) => store.cid_post(&mailbox, cid, since)?,
+                    _ => None,
+                };
+                Ok((record, seen))
+            }
+        })
+        .await?;
+    if let Some(seq) = seen {
+        return Ok(OkResponse::new().with("seq", seq));
+    }
+    // 1. The mailbox exists, and the message is of its group.
+    let record = record.ok_or_else(|| err(ErrorCode::NotFound))?;
+    let bytes = line_bytes(inner, &post.message, MlsMessage::decode).await?;
+    // 2. The framing.
+    let framing = read_framing(&bytes, &record.group_id)?;
+    let invalid = |what: &str| Err(err(ErrorCode::Invalid).with_message(what));
+    let public_room = record.room.is_some();
+    let commit = framing.content_type == ContentType::Commit;
+    if !framing.private && !public_room {
+        return invalid("a PublicMessage outside a public room");
+    }
+    if framing.private && public_room && framing.content_type != ContentType::Application {
+        // A public room's commits and proposals are PublicMessages, which
+        // the server checks (12.6).
+        return invalid("a public room's commits and proposals are PublicMessages");
+    }
+    if commit != post.next.is_some() {
+        return invalid("a commit has next, and nothing else does");
+    }
+    if post.live && framing.content_type != ContentType::Application {
+        return invalid("only application messages may be live");
+    }
+    if post.groupinfo.is_some() != (commit && public_room) {
+        return invalid("a public room's commit has groupinfo, and nothing else does");
+    }
+    // 5, the kind of connection: a signed-in connection posts a public
+    // room's PublicMessages only (13).
+    if matches!(cx.who, Who::SignedIn(_)) && framing.private {
+        return Err(err(ErrorCode::WrongConnection));
+    }
+    // 3. The token.
+    let used = match &post.token {
+        PostToken::Join => {
+            let join = matches!(
+                framing.sender,
+                Some(Sender::NewMemberCommit | Sender::NewMemberProposal)
+            );
+            if !(public_room && join) {
+                return Err(
+                    err(ErrorCode::Forbidden).with_message("- is only for joining a public room")
+                );
+            }
+            None
+        }
+        PostToken::Send(token) => {
+            let hash = token.hash();
+            let epoch = framing.epoch;
+            let held = cx
+                .db(move |store| store.has_token(&mailbox, epoch, &hash))
+                .await?;
+            if !held {
+                return Err(err(ErrorCode::Stale));
+            }
+            Some((epoch, hash))
+        }
+    };
+    // 4. Mutes and limits.
+    if let Some(pseudonym) = framing.pseudonym {
+        let muted = cx
+            .db(move |store| store.muted(&mailbox, &pseudonym, now))
+            .await?;
+        if muted {
+            return Err(err(ErrorCode::Forbidden).with_message("muted"));
+        }
+    }
+    let limits = &inner.config.limits;
+    inner.mailbox.posts.take(cx, limits.posts_per_minute, now)?;
+    if commit {
+        inner
+            .mailbox
+            .commits
+            .take(cx, limits.commits_per_hour, now)?;
+    }
+    let message = match &post.message {
+        OrBlob::Inline(_) => PostBody::Inline(bytes.clone()),
+        OrBlob::Blob(blob) => PostBody::Blob(*blob),
+    };
+    if !post.live {
+        inner
+            .mailbox
+            .charge_address(&inner.config, cx.peer.ip(), message.size(), now)
+            .map_err(rate_limited)?;
+    }
+    // 5. A public room's commits and proposals.
+    let room = if public_room && !framing.private {
+        let groupinfo = match &post.groupinfo {
+            Some(groupinfo) => Some(line_bytes(inner, groupinfo, GroupInfo::decode).await?),
+            None => None,
+        };
+        Some(room::check_post(cx, &record, &framing, bytes, groupinfo, now).await?)
+    } else {
+        None
+    };
+
+    if post.live {
+        // Not kept, numbered or pushed (5.2).
+        let line = Post::live(now, mailbox, post.message);
+        send_to_followers(inner, &mailbox, &OutLine::new(ServerMessage::new(line)));
+        return Ok(OkResponse::new());
+    }
+    let new = NewPost {
+        mailbox,
+        t: now,
+        message,
+        token: used,
+        next: post.next.map(|next| (framing.epoch, next)),
+        cid,
+        quota: limits.mailbox_quota,
+        room: room.as_ref().map(|room| room.change.clone()),
+    };
+    let seq = match cx.db(move |store| store.add_post(&new)).await? {
+        Posted::Seq(seq) => seq,
+        Posted::OverQuota => return Err(rate_limited(HOUR.as_secs())),
+        Posted::NoMailbox => return Err(err(ErrorCode::NotFound)),
+    };
+    if let Some(room) = room {
+        inner.mailbox.rooms.applied(mailbox, room);
+    }
+    let seq = Seq::new(seq).ok_or_else(|| err(ErrorCode::Internal))?;
+    let mut line = Post::new(seq, now, mailbox, post.message);
+    if let Some(next) = post.next {
+        line = line.with_next(next);
+    }
+    send_to_followers(inner, &mailbox, &OutLine::new(ServerMessage::new(line)));
+    Ok(OkResponse::new().with("seq", seq))
+}
+
+/// Sends `line` to every connection that follows `mailbox`.
+fn send_to_followers(inner: &Inner, mailbox: &BoxName, line: &OutLine) {
+    let followers = inner.mailbox.followers(mailbox);
+    if followers.is_empty() {
+        return;
+    }
+    let handles: Vec<_> = {
+        let reg = inner.reg();
+        followers
+            .iter()
+            .filter_map(|id| reg.conns.get(id))
+            .map(|conn| conn.handle.clone())
+            .collect()
+    };
+    for handle in handles {
+        handle.send_line(line.clone());
+    }
+}
+
+/// `TOKEN <box> <epoch> <token> <hash>` (7.2): adds `hash` to the set of
+/// epoch `epoch + 1`, for a holder of a token of `epoch`.
+async fn handle_token(
+    cx: &Cx,
+    mailbox: BoxName,
+    epoch: u64,
+    token: SendToken,
+    hash: TokenHash,
+) -> Reply {
+    let inner = &cx.inner;
+    let _lock = inner.mailbox.lock(mailbox).await;
+    let now = inner.now();
+    let record = self::mailbox(cx, mailbox).await?;
+    let Some(next_epoch) = epoch.checked_add(1) else {
+        return Err(err(ErrorCode::Stale));
+    };
+    // For the epoch just before a moved mailbox's first, the token is
+    // checked against the set of the mailbox the group moved from (7.8).
+    let checked_in = if next_epoch == record.first_epoch {
+        record.moved_from
+    } else {
+        Some(mailbox)
+    };
+    let token_hash = token.hash();
+    let held = match checked_in {
+        Some(from) => {
+            cx.db(move |store| store.has_token(&from, epoch, &token_hash))
+                .await?
+        }
+        None => false,
+    };
+    if !held {
+        return Err(err(ErrorCode::Stale));
+    }
+    inner
+        .mailbox
+        .commits
+        .take(cx, inner.config.limits.commits_per_hour, now)?;
+    cx.db(move |store| store.add_token(&mailbox, next_epoch, &hash, now))
+        .await?;
+    Ok(OkResponse::new())
+}
+
+/// `FOLLOW <box> [quiet=<tag>]` (7.1). The `OK` is queued while no post of
+/// the mailbox can be (3.6).
+async fn follow(cx: &Cx, mailbox: BoxName, quiet: Option<PushTag>) -> Reply {
+    let inner = &cx.inner;
+    let _lock = inner.mailbox.lock(mailbox).await;
+    let record = self::mailbox(cx, mailbox).await?;
+    if !inner
+        .mailbox
+        .follow(mailbox, cx.conn, quiet, inner.config.limits.max_follows)
+    {
+        return Err(err(ErrorCode::Forbidden).with_message("following too many mailboxes"));
+    }
+    cx.reply_now(Ok(OkResponse::new().with("head", record.head)));
+    Ok(OkResponse::new())
+}
+
+/// `UNFOLLOW <box>` (7.1).
+async fn unfollow(cx: &Cx, mailbox: BoxName) -> Reply {
+    self::mailbox(cx, mailbox).await?;
+    cx.inner.mailbox.unfollow(&mailbox, cx.conn);
+    Ok(OkResponse::new())
+}
+
+/// `FETCH <box> after=<position> [limit=<n>] [leaf=<n>]` (7.1).
+async fn fetch(
+    cx: &Cx,
+    mailbox: BoxName,
+    after: u64,
+    limit: Option<u64>,
+    leaf: Option<u32>,
+) -> Reply {
+    if leaf.is_some() {
+        // Light clients (12.6) are not in this version (docs/plans/M5b.md).
+        return Err(err(ErrorCode::NotSupported).with_message("light clients"));
+    }
+    self::mailbox(cx, mailbox).await?;
+    let cap = cx.inner.config.limits.max_page.max(MIN_FETCH_LIMIT_CAP);
+    let limit = limit.unwrap_or(DEFAULT_FETCH_LIMIT).min(cap);
+    let (posts, more) = cx
+        .db(move |store| store.posts(&mailbox, after, limit))
+        .await?;
+    for post in posts {
+        cx.send(post_line(mailbox, post)?);
+    }
+    Ok(OkResponse::new().with("more", u8::from(more)))
+}
+
+/// A kept post as a POST line (5.2).
+fn post_line(mailbox: BoxName, post: StoredPost) -> Result<Post, ErrResponse> {
+    let internal = |what: &str| {
+        tracing::error!("a stored post's {what} cannot be sent");
+        err(ErrorCode::Internal)
+    };
+    let seq = Seq::new(post.seq).ok_or_else(|| internal("seq"))?;
+    let message = match post.message {
+        PostBody::Inline(bytes) => {
+            OrBlob::Inline(MlsMessage::from_bytes(&bytes).map_err(|_| internal("message"))?)
+        }
+        PostBody::Blob(blob) => OrBlob::Blob(blob),
+    };
+    let line = Post::new(seq, post.t, mailbox, message);
+    Ok(match post.next {
+        Some(next) => line.with_next(next),
+        None => line,
+    })
+}
+
+/// Checks a send token that comes without its epoch, as UPLOAD and BLOB
+/// carry one (5.6, 12.12), against every set of `mailbox`: `ERR not-found`
+/// for a mailbox that does not exist, `ERR stale` for a token in none.
+#[allow(dead_code, reason = "for UPLOAD and BLOB (docs/plans/M5b.md, SV4)")]
+pub(crate) async fn check_token(
+    inner: &Inner,
+    mailbox: &BoxName,
+    token: &SendToken,
+) -> Result<(), ErrorCode> {
+    let mailbox = *mailbox;
+    let hash = token.hash();
+    let found = inner
+        .db(move |store| {
+            if store.mailbox(&mailbox)?.is_none() {
+                return Ok(None);
+            }
+            store.has_token_any(&mailbox, &hash).map(Some)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("checking a send token: {e}");
+            ErrorCode::Internal
+        })?;
+    match found {
+        None => Err(ErrorCode::NotFound),
+        Some(false) => Err(ErrorCode::Stale),
+        Some(true) => Ok(()),
+    }
+}
+
+/// Deletes `mailbox` with its posts, and for a public room the room, and
+/// sends `DROP <box> [<reason...>]` to every connection that follows it
+/// (6.1, 10.4). `reason` is escaped text. Returns whether it existed.
+#[allow(dead_code, reason = "for ADMIN DROP (docs/plans/M5b.md, SV5)")]
+pub(crate) async fn drop_mailbox(
+    inner: &Inner,
+    mailbox: &BoxName,
+    reason: &str,
+) -> Result<bool, StoreError> {
+    let mailbox = *mailbox;
+    let _lock = inner.mailbox.lock(mailbox).await;
+    let existed = inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
+    inner.mailbox.rooms.forget(&mailbox);
+    if existed {
+        let line = OutLine::new(ServerMessage::new(ServerLine::Drop {
+            mailbox,
+            reason: reason.to_owned(),
+        }));
+        send_to_followers(inner, &mailbox, &line);
+    }
+    inner.mailbox.forget_mailbox(&mailbox);
+    Ok(existed)
 }
 
 /// The session of the guest `uid` has ended (4.2): every connection that
@@ -120,18 +876,7 @@ pub(super) async fn guest_session_ended(inner: &Inner, uid: &Uid) {
             mailbox,
             uid: uid.clone(),
         }));
-        let followers = inner.mailbox.followers(&mailbox);
-        let handles: Vec<_> = {
-            let reg = inner.reg();
-            followers
-                .iter()
-                .filter_map(|id| reg.conns.get(id))
-                .map(|conn| conn.handle.clone())
-                .collect()
-        };
-        for handle in handles {
-            handle.send_line(line.clone());
-        }
+        send_to_followers(inner, &mailbox, &line);
     }
 }
 
@@ -140,29 +885,57 @@ pub(super) fn conn_closed(inner: &Arc<Inner>, id: ConnId, _conn: &ConnEntry) {
     inner.mailbox.forget(id);
 }
 
-/// The area's background work: expiring posts (7.5) and cids (7.6),
-/// forgetting unused token sets (7.2), and ending mailboxes (7.5).
-pub(super) async fn maintain(_inner: Arc<Inner>) {}
-
-/// The most a mailbox may hold at once, for INFO's `quota=` (7.5, 8.5), or
-/// `None` while the server sets none.
-///
-/// TODO(SV3): a stub added by SV5 (INFO) until quotas are built.
-pub(crate) fn quota(_inner: &Inner) -> Option<u64> {
-    None
-}
-
-/// The mailbox was dropped (10.4): nobody follows it any more.
-///
-/// TODO(SV3): added by SV5 for ADMIN DROP.
-pub(crate) fn dropped(inner: &Inner, mailbox: &BoxName) {
-    let mut follows = inner.mailbox.follows();
-    for conn in follows.by_box.remove(mailbox).unwrap_or_default() {
-        if let Some(boxes) = follows.by_conn.get_mut(&conn) {
-            boxes.remove(mailbox);
-            if boxes.is_empty() {
-                follows.by_conn.remove(&conn);
-            }
+/// The area's background work, every minute: expiring posts (7.5) and cids
+/// (7.6), forgetting unused token sets (7.2) and ended mutes (6.4), and
+/// ending mailboxes (7.5).
+pub(super) async fn maintain(inner: Arc<Inner>) {
+    let mut every = tokio::time::interval(MAINTAIN_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        if let Err(e) = run_maintenance(&inner).await {
+            tracing::error!("mailbox maintenance: {e}");
         }
     }
+}
+
+/// One round of [`maintain`].
+pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
+    let now = inner.now();
+    let retention = Duration::from_secs(u64::from(inner.settings().retention.days()) * 86_400);
+    let expired = inner.db(move |store| store.expire(now, retention)).await?;
+    if expired != Default::default() {
+        tracing::debug!(?expired, "expired");
+    }
+    // A mailbox whose posts have all expired, and that nobody follows, has
+    // had no device of its group online for a retention period: it ends,
+    // and its box is never used again (7.5).
+    let before = now.checked_sub(retention).unwrap_or(Timestamp::MIN);
+    let idle = inner.db(move |store| store.idle_mailboxes(before)).await?;
+    for mailbox in idle {
+        let _lock = inner.mailbox.lock(mailbox).await;
+        if inner.mailbox.followed(&mailbox) {
+            continue;
+        }
+        inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
+        inner.mailbox.rooms.forget(&mailbox);
+    }
+    Ok(())
+}
+
+/// The role that lets an identity mute in a public room (6.4).
+fn may_mute(role: Option<Role>) -> bool {
+    matches!(role, Some(Role::Owner | Role::Mod))
+}
+
+/// The most a mailbox may hold at once, for INFO's `quota=` (7.5, 8.5).
+pub(crate) fn quota(inner: &Inner) -> Option<u64> {
+    Some(inner.config.limits.mailbox_quota)
+}
+
+/// An operator dropped the mailbox (10.4): nobody follows it any more, and
+/// its room's group is gone from memory. The DROP line is the caller's.
+pub(crate) fn dropped(inner: &Inner, mailbox: &BoxName) {
+    inner.mailbox.forget_mailbox(mailbox);
+    inner.mailbox.rooms.forget(mailbox);
 }

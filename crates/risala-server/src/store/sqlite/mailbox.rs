@@ -434,6 +434,20 @@ impl MailboxStore for SqliteStore {
         })
     }
 
+    fn has_token_any(&self, mailbox: &BoxName, hash: &TokenHash) -> Result<bool> {
+        self.read(|tx| {
+            let mut select =
+                tx.prepare_cached("SELECT hash FROM token_hashes WHERE box = ? ORDER BY rowid")?;
+            let rows =
+                select.query_map([&mailbox.as_bytes()[..]], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut found = false;
+            for row in rows {
+                found |= ct_eq(&row?, &hash.as_bytes()[..]);
+            }
+            Ok(found)
+        })
+    }
+
     fn add_token(
         &self,
         mailbox: &BoxName,
@@ -1072,6 +1086,8 @@ mod tests {
         assert!(store.has_token(&m.mailbox, 0, &m.token_hash).unwrap());
         assert!(!store.has_token(&m.mailbox, 0, &hash(2)).unwrap());
         assert!(!store.has_token(&m.mailbox, 1, &m.token_hash).unwrap());
+        assert!(store.has_token_any(&m.mailbox, &m.token_hash).unwrap());
+        assert!(!store.has_token_any(&m.mailbox, &hash(2)).unwrap());
 
         let mut first = post(m.mailbox, 1, 10);
         first.token = Some((0, m.token_hash));

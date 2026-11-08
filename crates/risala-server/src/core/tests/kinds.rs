@@ -104,6 +104,16 @@ fn built(command: &Command) -> bool {
             | Command::Push(_)
             | Command::Report { .. }
             | Command::Resolve { .. }
+            // The mailbox area's, which `mailbox.rs` tests.
+            | Command::Create { .. }
+            | Command::Post { .. }
+            | Command::GroupInfo { .. }
+            | Command::Mute { .. }
+            | Command::Unmute { .. }
+            | Command::Follow { .. }
+            | Command::Unfollow { .. }
+            | Command::Fetch { .. }
+            | Command::Token { .. }
     ) || matches!(command, Command::Admin(a) if !matches!(a, AdminCommand::Unregister { .. }))
 }
 
@@ -240,12 +250,8 @@ async fn section_13_by_hand() {
         (ANON, "ADMIN OPS".into(), "ERR wrong-connection"),
         (GUEST, "ADMIN OPS".into(), "ERR wrong-connection"),
         // A guest may follow, and create a report conversation (4.2).
-        (GUEST, format!("FOLLOW {BOX}"), "ERR not-supported"),
-        (
-            GUEST,
-            format!("CREATE {BOX} {gid} {hash}"),
-            "ERR not-supported",
-        ),
+        (GUEST, format!("FOLLOW {BOX}"), "ERR not-found"),
+        (GUEST, format!("CREATE {BOX} {gid} {hash}"), "OK"),
         // ADMIN needs an operator (Section 10).
         (ALICE, "ADMIN OPS".into(), "ERR forbidden"),
         // BLOB from an anonymous connection needs box= and token= (12.12).

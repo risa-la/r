@@ -41,14 +41,14 @@ thiserror.workspace = true
 sha2.workspace = true
 # Push (9.3): RFC 8291 encryption.
 aws-lc-rs.workspace = true
+# OpenMLS's state of public rooms' groups, which the server checks (12.6).
+openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 
 [dev-dependencies]
 # Paused time for the keepalive tests.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 proptest.workspace = true
-# Devices' MLS state in the hub's tests of groups (12).
-openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 
 [lints]
 workspace = true
