@@ -253,7 +253,9 @@ impl Inner {
     /// go by (4.5).
     ///
     /// Only an answer fetched just now closes the identity's connections
-    /// whose key it does not list (4.4). A failed fetch closes nothing.
+    /// whose key it does not list (4.4), and deletes those keys'
+    /// KeyPackages and pending Welcomes (12.4, 12.7). A failed fetch
+    /// closes and deletes nothing.
     async fn verify_fetched(
         &self,
         identity: &Identity,
@@ -277,6 +279,8 @@ impl Inner {
             };
             if !fetched.cached {
                 self.close_removed_keys(&uid, &fetched.keys);
+                // Their KeyPackages and pending Welcomes go too (12.4, 12.7).
+                self.forget_unlisted_devices(&uid, &fetched.keys).await;
             }
             let found = verify(
                 host.clone(),
@@ -569,8 +573,9 @@ impl Inner {
                         // this one too, after its response.
                         respond(reply, "KEY", result);
                         self.close_keys(uid, |k| *k == key);
-                        // M5a: delete the key's KeyPackages and pending
-                        // Welcomes (4.7).
+                        // Its KeyPackages and pending Welcomes go (4.7),
+                        // under `keys_lock`: see `e2ee`.
+                        self.forget_device(uid, &key).await;
                         Ok(None)
                     }
                     KeyChange::NotFound => Err(fail(ErrorCode::NotFound, "no such key")),
@@ -766,7 +771,9 @@ impl Inner {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(uid);
         }
-        // M5a: KeyPackages, pending Welcomes and backups (4.8).
+        // Its KeyPackages, pending Welcomes and backups went with
+        // `forget_identity` (4.8). Its connections, which could store more,
+        // are held at their gates until it is done.
         Ok(())
     }
 }

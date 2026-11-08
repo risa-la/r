@@ -487,3 +487,69 @@ async fn an_epoch_keeps_a_few_key_ids() {
         .await;
     assert_eq!(a1.lines(), ["OK"]);
 }
+
+// ---------------------------------------------------------------------------
+// Keys and identities that go (4.7, 4.8, 10.5)
+
+/// Puts a KeyPackage and a Welcome in for each of `devices`.
+async fn give_each(w: &World, devices: &[(&str, u8)]) {
+    for (who, n) in devices {
+        w.put_kp(who, *n, kp(*n, false));
+    }
+    store_welcome(w, 4, 1, &tree(3), devices).await;
+}
+
+/// The devices of `who` that have KeyPackages or Welcomes.
+fn devices_of(w: &World, who: &str) -> Vec<PublicKey> {
+    w.h.store.stored_devices(&uid(who)).unwrap()
+}
+
+#[tokio::test]
+async fn a_deleted_key_takes_its_key_packages_and_welcomes() {
+    let mut w = World::with(|c| c.operators = vec!["op@example.org".into()]);
+    give_each(&w, &[(ALICE, 1), (ALICE, 2), (ALICE, 3)]).await;
+    let mut a1 = w.device(ALICE, 1);
+    let mut a2 = w.device(ALICE, 2);
+    w.send(&a1, &format!("key del {}", key(2))).await;
+    assert_eq!(a1.lines(), ["OK"]);
+    assert_eq!(a2.lines(), ["<close> BYE this device's key was removed"]);
+    // In the order of their base64.
+    let mut left = vec![key(1), key(3)];
+    left.sort_by_key(|k| k.to_string());
+    assert_eq!(devices_of(&w, ALICE), left);
+
+    // ADMIN DELKEY too (10.5).
+    let mut op = w.device("op@example.org", 9);
+    w.send(&op, &format!("admin delkey alice@example.org {}", key(3)))
+        .await;
+    assert_eq!(op.lines(), ["OK"]);
+    assert_eq!(devices_of(&w, ALICE), [key(1)]);
+}
+
+#[tokio::test]
+async fn unregister_deletes_key_packages_welcomes_and_backups() {
+    let mut w = World::new();
+    give_each(&w, &[(ALICE, 1), (BOB, 5)]).await;
+    let mut a1 = w.device(ALICE, 1);
+    w.send(&a1, &format!("backup add k3f9q2 0 {}", blob(1, 0)))
+        .await;
+    let mut bob = w.device(BOB, 5);
+    w.send(&bob, &format!("backup add k3f9q2 0 {}", blob(1, 0)))
+        .await;
+    a1.lines();
+    bob.lines();
+    w.send(&a1, "unregister alice@example.org").await;
+    assert_eq!(a1.lines(), ["OK", "<close> BYE identity deleted"]);
+    assert!(devices_of(&w, ALICE).is_empty());
+    let page =
+        w.h.store
+            .backups(&uid(ALICE), &"k3f9q2".parse().unwrap(), None, 500, 100)
+            .unwrap();
+    assert!(page.blobs.is_empty());
+    // Bob's stay, with the Welcome he still has pending.
+    assert_eq!(devices_of(&w, BOB), [key(5)]);
+    w.send(&bob, "welcome list").await;
+    assert_eq!(bob.lines().len(), 2);
+    w.send(&bob, "backup get k3f9q2").await;
+    assert_eq!(bob.lines().len(), 2);
+}

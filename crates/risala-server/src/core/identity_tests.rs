@@ -393,11 +393,15 @@ async fn only_a_fresh_answer_removes_keys() {
     let mut laptop = w.sign_in("bob@example.net", 1).await;
     let mut phone = w.sign_in("bob@example.net", 2).await;
 
+    put_key_package(&w, "bob@example.net", 2);
+
     // A cached copy without the phone's key verifies the laptop again.
     w.fetcher.set_cached(&bob, vec![public(1)]);
     let _again = w.sign_in("bob@example.net", 1).await;
     w.send(&phone, "sync").await;
     assert_eq!(phone.lines(), ["OK"]);
+    let bob_uid = uid("bob@example.net");
+    assert_eq!(w.h.store.stored_devices(&bob_uid).unwrap(), [public(2)]);
 
     // The file is gone: every device of bob's is closed.
     w.fetcher.gone(&bob);
@@ -409,6 +413,7 @@ async fn only_a_fresh_answer_removes_keys() {
         laptop.lines(),
         ["<close> BYE this device's key was removed"]
     );
+    assert!(w.h.store.stored_devices(&bob_uid).unwrap().is_empty());
 }
 
 /// A key added to a key file that the server has cached works at once:
@@ -439,12 +444,34 @@ async fn a_device_whose_key_was_removed_is_closed() {
     w.fetcher.set(&bob, vec![public(1), public(2)]);
     let mut lost = w.sign_in("bob@example.net", 1).await;
     let mut phone = w.sign_in("bob@example.net", 2).await;
+    for n in [1, 2] {
+        put_key_package(&w, "bob@example.net", n);
+    }
     w.fetcher.set(&bob, vec![public(2), public(3)]);
     let mut laptop = w.sign_in("bob@example.net", 3).await;
     assert_eq!(lost.lines(), ["<close> BYE this device's key was removed"]);
     assert_eq!(phone.lines(), Vec::<String>::new());
     w.send(&laptop, "sync").await;
     assert_eq!(laptop.lines(), ["OK"]);
+    // The removed key's KeyPackages went with it (12.4).
+    assert_eq!(
+        w.h.store.stored_devices(&uid("bob@example.net")).unwrap(),
+        [public(2)]
+    );
+}
+
+/// Stores a KeyPackage for `who`'s device with key `n`, as KEYPKG ADD
+/// would once it can check one (12.4).
+fn put_key_package(w: &World, who: &str, n: u8) {
+    let kp = crate::store::NewKeyPackage {
+        key_package: "AAAA".parse().unwrap(),
+        kp_ref: vec![n],
+        not_after: start().checked_add(Duration::from_secs(3600)).unwrap(),
+        last_resort: false,
+    };
+    w.h.store
+        .add_key_package(&uid(who), &public(n), &kp, 100, start())
+        .unwrap();
 }
 
 #[tokio::test]
