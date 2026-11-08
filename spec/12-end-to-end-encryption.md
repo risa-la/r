@@ -108,16 +108,25 @@ use its device key, or any key it uses elsewhere, as a leaf key.
 - **The credential never changes.** A commit's path MUST NOT change the
   credential of the committer's leaf. A device of another identity, or
   another device, means a new leaf.
-- **The signature key changes only** in a group whose `confirm` is
+- **The signature key changes** in a group whose `confirm` is
   `epochal`, once per period in which the device sends or sent the
-  period before (12.10), and once right after a device joins with its
+  period before (12.10), and right after a device joins with its
   last-resort KeyPackage (12.5). In both cases the device replaces its
   leaf node with a fresh one that has a new signature key, by an Update
   proposal in an epochal group (12.10) or by a commit of its own
   otherwise, and deletes the old key once that has taken effect.
   Otherwise a new signature key means a new leaf.
-- A fresh leaf node keeps the leaf's index, and its pseudonym (7.3),
-  except where 12.10 gives epochal groups a new pseudonym each period.
+- **Which changes are valid** is a group check (12.7), decided from the
+  tree and the post alone. Outside epochal groups, a leaf node may bring
+  a new signature key only while the leaf has neither committed nor
+  been Updated since it was added: its `leaf_node_source` [RFC9420] is
+  still `key_package`. In an epochal group, a leaf node may bring one
+  only if the `t` of the post that carries it (5.2) falls in a later
+  period (12.10) than the leaf's previous `updated`, so at most once a
+  period. Which periods a device must rotate in is up to the device,
+  and not checked.
+- A fresh leaf node keeps the leaf's index. Pseudonyms are not part of
+  the leaf: 7.3 says how they are found.
 - Two leaves of a group never share a signature key [RFC9420].
 
 **Guests** (4.2) have leaves whose credential names their guest uid and
@@ -192,15 +201,21 @@ device carries a profile.
   or the Update proposal (5.2). So a device sets it from its clock, or, if its clock disagrees
   by minutes with the `t` of the posts it receives, from the time those
   suggest, and never below the leaf's previous `updated`. In a
-  KeyPackage it is the time the KeyPackage was made.
+  KeyPackage it is the time the KeyPackage was made, and devices treat
+  as invalid a commit that adds a KeyPackage whose `updated` is more
+  than 10 minutes after the `t` of the commit's post (12.7).
 - **`streak`** counts the epochs in a row, up to and including the one
-  the commit starts, that this leaf has started with its own commits:
-  the previous `streak` plus 1 if the leaf made the commit that started
-  the current epoch, or 1 if it did not, at most 255. It is 0 in a
-  KeyPackage and in an Update proposal. Devices treat a commit whose `streak` is not this value as
-  invalid, and limit commits by it (12.7). Every device knows which leaf
-  started the current epoch, including one that has just joined: it is
-  the signer of the GroupInfo it joined with.
+  the commit starts, that leaves of the committer's **identity** have
+  started with their commits. Let S be the leaf that made the commit
+  that started the current epoch. The committer's new `streak` is S's
+  `streak` plus 1 if S's credential has the same uid as the
+  committer's, and 1 if it does not, at most 255. So two devices of one
+  identity that take turns count as one. It is 0 in a KeyPackage and in
+  an Update proposal. Devices treat a commit whose `streak` is not this
+  value as invalid, and limit commits by it (12.7). Every device knows
+  S, including one that has just joined: S is the signer of the
+  GroupInfo it joined with, and is still in the group, since a commit
+  never removes its own committer [RFC9420].
 
 **Capabilities.** Leaves list in their capabilities the extension types
 `0xF2A1`, `0xF2A2` and `0xF2A3`, the `app_data_dictionary` extension
@@ -231,7 +246,7 @@ opaque Uid<V>;
 struct {
     uint8 version;               // 1
     ConversationKind kind;
-    opaque host<V>;              // the server, in lower case
+    opaque host<V>;              // the server (below)
     opaque box[16];              // the mailbox
     opaque name<V>;
     opaque topic<V>;             // UTF-8, at most 512 bytes
@@ -253,9 +268,13 @@ struct {
   that members see. It need not be unique. `guests` is `none`.
 - **Public rooms:** `name` is the room name, such as `#general` (3.5),
   and `confirm` is `epochal`.
-- `owners` holds at least one uid, and every uid in `owners`, `mods` and
-  `bans` is an identity, not a guest. A uid is in at most one of
-  `owners` and `mods`.
+- `host` is the server, written as a `server` of 3.5: its host name in
+  lower case, followed by `:` and the port only if the port is not
+  7472, as in `chat.example.org` or `chat.example.org:7000`. It is
+  compared byte for byte (12.7).
+- In a room, `owners` holds at least one uid. In a direct conversation
+  the lists are empty. Every uid in `owners`, `mods` and `bans` is an
+  identity, not a guest. A uid is in at most one of `owners` and `mods`.
 
 The group context has exactly two extensions: `required_capabilities`
 first, which lists the extension types `0xF2A1`, `0xF2A2` and `0xF2A3`,
@@ -264,7 +283,8 @@ the conversation extension. A commit may change only the fields that
 6.2 and 6.3 allow, through a GroupContextExtensions proposal, and never
 `version`, `kind` or `host`, nor the `name` of a direct conversation or
 a public room. `box` changes only when a direct conversation or a
-private room moves to a new mailbox (7.8).
+private room moves to a new mailbox, and then only to the box that 7.8
+derives from the group's secrets.
 
 ### 12.5. Key Packages
 
@@ -290,12 +310,17 @@ KEYPKG GET <uid>
   Otherwise it replies `ERR invalid`. A server MAY limit how many
   KeyPackages it keeps for each device (`ERR forbidden`), and how large
   a KeyPackage may be (`ERR too-long`). KeyPackages of this suite are
-  about 9 KiB, so a limit MUST NOT be below 16 KiB.
+  about 11 KiB with a device binding, so a limit MUST NOT be below 16
+  KiB.
 - **`KEYPKG COUNT`** replies `OK count=<n> last-resort=<yes or no>`: the
   number of ordinary KeyPackages the server holds for this device, and
   whether it holds a last-resort one. It needs a signed-in connection.
-- **`KEYPKG GET`** sends one `KEYPKG <uid> <keypackage>` line for each
-  current device of `<uid>` (4.4) that has a KeyPackage, then `OK`. It
+- **`KEYPKG GET`** sends one `KEYPKG <uid> <keypackage> <secret>` line
+  for each current device of `<uid>` (4.4) that has a KeyPackage, then
+  `OK`. `<secret>` is a **put secret**: 32 random bytes, in base64 with
+  padding, that the server makes for this one handout and keeps only
+  as a hash. The Welcome for that KeyPackage must carry it (12.8), so
+  that only whoever fetched the KeyPackage can deliver its Welcome. It
   works on anonymous, guest and signed-in connections (Section 13).
   Since it shows whom the device is
   about to talk to, a device SHOULD send it on a fresh anonymous
@@ -309,23 +334,24 @@ KEYPKG GET <uid>
 
 ```
 C: KEYPKG GET bob@example.net
-S: KEYPKG bob@example.net AAEABQBA…
-S: KEYPKG bob@example.net AAEABQBA…
+S: KEYPKG bob@example.net AAEABQBA… Hc2vQ0mX4t9bLr7kWz1pYf8eNa3sJd6uGq5iTo2lVyE=
+S: KEYPKG bob@example.net AAEABQBA… 8kLw2sQe9rTz4nVb7mXc1aPd6fGh3jYu0iKo5lBq2Rs=
 S: OK
 ```
 
 Each KeyPackage has a leaf key of its own, so that each group a device
 joins gets a different one (12.3). The server hands out each ordinary
-KeyPackage once, then deletes it. A device MAY also upload one
-KeyPackage of last resort, marked as [MLS-EXT] marks it: its
-`app_data_dictionary` extension (`0x0006`) holds the
+KeyPackage once, then deletes it, keeping only its KeyPackageRef and the
+hash of its put secret until its Welcome arrives (12.8). A device MAY
+also upload one KeyPackage of last resort, marked as [MLS-EXT] marks it:
+its `app_data_dictionary` extension (`0x0006`) holds the
 `last_resort_key_package` component (`0x0004`), with empty data. The
-server hands
-that one out only when the device has no ordinary KeyPackage left, and
-keeps it, so the device can always be added. A new one replaces it.
-Since its leaf key may be used in several groups, a device that joins
-with it replaces its leaf node with one that has a new signature key,
-as 12.3 says, before it sends anything.
+server hands that one out only when the device has no ordinary
+KeyPackage left, and keeps it, so the device can always be added, with a
+new put secret for each handout. A new one replaces it. Since its leaf
+key may be used in several groups, a device that joins with it replaces
+its leaf node with one that has a new signature key, as 12.3 says,
+before it sends anything.
 
 A device SHOULD keep about ten ordinary KeyPackages on the server, and
 upload more when KEYPKG COUNT reports fewer than five. Servers delete
@@ -387,7 +413,7 @@ or PSK proposal: a group never changes its cipher suite or protocol
 version, and a conversation that moves to new ones (Section 15) will
 start a new group with a new mailbox. A client that adds
 many devices SHOULD split them over several commits of at most 256
-devices each, bearing in mind that a leaf's fourth commit in a row has
+devices each, bearing in mind that an identity's fourth commit in a row has
 to wait (12.7). A commit too large for a line travels as a blob (12.12).
 A commit's size, like a Welcome's, shows roughly how large the group
 is, so commits and proposals sent as PrivateMessages SHOULD be padded
@@ -419,13 +445,15 @@ outside the group can, and refuses one that fails:
    confirmation tag, or that the path's secrets decrypt, since both need
    the group's secrets.
 3. **It passes the group checks of 12.7** that need only the public
-   state: who may add and remove whom, which fields of the conversation
-   extension change and by whom, bans (by the uids in credentials), the
-   `guests` setting, the size limits of 6.1, external commits only as
-   resync commits (12.7), the `updated` (against its own clock, which
-   gives the post its `t`) and `streak` of the committer and of each
-   Update (12.3), and that no guest's leaf commits or proposes an Update
-   (`ERR forbidden`).
+   state, which in a public room is all of them but the path secrets and
+   the confirmation tag: who may add and remove whom, and how many,
+   which fields of the conversation extension change and by whom, bans
+   (by the uids in credentials), the `guests` setting, the size limits
+   of 6.1, external commits only as resync commits and rejoins (12.7),
+   signature key changes, the `updated` (against its own clock, which
+   gives the post its `t`) and `streak` of the committer, of each Update
+   and of each added leaf (12.3), and that no guest's leaf commits or
+   proposes an Update (`ERR forbidden`).
 4. **It comes from the leaf's own device.** A commit, an external
    commit or an Update proposal whose sender's credential names an
    identity is posted on a signed-in connection of the device that the
@@ -437,7 +465,11 @@ outside the group can, and refuses one that fails:
    and proves nothing to anyone else. A join proposal whose credential
    names an identity may come from any anonymous or signed-in
    connection: the server does not check it, and devices treat the leaf
-   as unverified until it attests (12.10).
+   as unverified until it attests (12.10). A commit too large for a
+   line is first stored as a blob, over an anonymous connection (4.1,
+   12.12), and then posted on the signed-in one, which ties the two
+   connections together. That tells the server nothing the commit does
+   not, since the commit names its sender.
 5. **A commit carries the new GroupInfo,** with the `external_pub`
    extension and no `ratchet_tree` extension, as the option
    `groupinfo=<groupinfo>` of POST. Its group context must be the one
@@ -445,7 +477,21 @@ outside the group can, and refuses one that fails:
    its signer must be the committer's leaf (`ERR invalid`).
 
 The server then keeps the new tree and GroupInfo, and serves them with
-GROUPINFO (6.1). It never holds a group's secrets, so it can still
+GROUPINFO (6.1). A public room's Welcomes carry no tree (12.8), and in
+a busy room the group has often moved on by the time a joiner fetches
+its Welcome. So the server also keeps the tree of each epoch for which
+a Welcome is pending, and hands it out with that Welcome (12.8), until
+every Welcome of that epoch has been fetched or has expired. It MUST
+keep such a tree for at least 24 hours after the commit that started
+the epoch, and MAY drop it after that, together with the Welcomes that
+need it, whose devices then join again by a new proposal (6.1). It MAY
+store the trees as differences from one epoch to the next, which share
+most of their nodes. A joiner checks the tree against the tree hash in
+the Welcome's group context [RFC9420], so the server cannot change it.
+The server holds these trees anyway, so keeping them a while longer
+tells it nothing new.
+
+The server never holds a group's secrets, so it can still
 accept a commit that members' devices reject (12.7), for example one
 whose path secrets do not decrypt, or whose `next` is wrong. Those
 devices then recover the room with a resync commit, and check before
@@ -458,15 +504,62 @@ MAY be a **light client** (a partial client in [MLS-PARTIAL]) that does
 not hold the tree:
 
 - It joins by external proposal (6.1), and fetches its Welcome with
-  `WELCOME GET <ref> light=yes`, which returns an AnnotatedWelcome that
-  the server builds from the tree it holds.
+  `WELCOME GET <ref> light=yes`. In the WELCOME line (12.8),
+  `<welcome>` is then an AnnotatedWelcome, which the server builds from
+  the Welcome and the tree of its epoch (above).
 - It fetches with `FETCH <box> after=<position> leaf=<n>`, where `<n>`
-  is its leaf index. The server then returns each commit as an
-  AnnotatedCommit for that leaf.
+  is its leaf index, in decimal. In the event line (5.2) of each commit
+  that the server returns, `<message>` is then an AnnotatedCommit for
+  that leaf, which the server builds from the commit and the trees it
+  holds. Every other post comes as it is.
+- Both are encoded with the TLS presentation language [RFC9420], and
+  sent in base64 with padding, or as a blob-ref (12.12) if too large for
+  a line.
 - It checks the membership proofs in these, as [MLS-PARTIAL] requires,
-  and gets members and roles from them and from MEMBERS (8.3).
+  and gets roles and settings from the conversation extension it
+  computes. It shows as members only the leaves for which it holds a
+  membership proof, such as committers and senders of messages. It
+  shows a list from MEMBERS (8.3) only as the server's word, since the
+  server could leave a leaf out of it, its own included.
 - It cannot commit. It replaces its leaf node with Update proposals,
   each period it sends in as 12.10 says, and at least weekly (12.7).
+
+The structures are those of draft-ietf-mls-partial-02 [MLS-PARTIAL],
+Sections 6 to 10, where `Node`, `Welcome` and `MLSMessage` are as in
+[RFC9420]. Risala follows that draft's version, and will follow a later
+one only with a new protocol version:
+
+```
+struct {
+    opaque hash_value<V>;
+} CopathHash;
+
+struct {
+    uint32 leaf_index;
+    uint32 n_leaves;
+    optional<Node> direct_path_nodes<V>;
+    CopathHash copath_hashes<V>;
+} MembershipProof;
+
+struct {
+    T message;
+    MembershipProof sender_membership_proof;
+} SenderAuthenticatedMessage<T>;
+
+struct {
+    SenderAuthenticatedMessage<Welcome> welcome;
+    MembershipProof joiner_membership_proof;
+} AnnotatedWelcome;
+
+struct {
+    MLSMessage commit;
+    optional<MembershipProof> sender_membership_proof;
+    opaque tree_hash_after<V>;
+    optional<uint32> resolution_index;
+    MembershipProof sender_membership_proof_after;
+    MembershipProof receiver_membership_proof_after;
+} AnnotatedCommit;
+```
 
 A light client tells the server its leaf index, which the server can
 tie to its identity in a public room. So it MUST fetch with `leaf` on an
@@ -483,9 +576,9 @@ server.
 external commit, it checks the whole group, and MUST NOT join one that
 fails:
 
-- The conversation extension is well formed (12.4), names the server
-  the device is joining on, and, for a public room it joins by name,
-  that room and its box.
+- The conversation extension is well formed (12.4), its `host` names
+  the server the device is joining on, written as 12.4 says, and, for
+  a public room it joins by name, it names that room and its box.
 - Every leaf's credential is a RisalaIdentity, and every leaf of an
   identity carries a profile (12.3).
 - In a direct conversation, every leaf belongs to one of the two
@@ -510,18 +603,30 @@ of a public room on that server whose `guests` is not `none`. In it:
 
 - the guest has exactly one leaf, which never changes its credential
   and is never confirmed, since a guest has no attestation key (12.10);
-- after the commit that adds the identity's devices, the guest's leaf
-  adds nobody: devices treat any later Add by it as invalid;
+- the guest's leaf adds devices only while it is the only leaf in the
+  group, that is, in the commit that adds the identity's devices:
+  devices treat any other Add by it as invalid;
 - devices act only on REPORT lines from the guest's leaf, and ignore
   every other content line it sends (5.8).
 
 **Commits.** A device makes two kinds of check on each commit, as of
 the epoch the commit is for:
 
-- **Group checks** use only the group's state, the commit, and the post
-  that carries it, with its `t` and `next` (5.2). Every device that has
-  applied the same posts reaches the same answer. A commit that fails
-  one is invalid, and the device ignores it (7.2).
+- **Group checks** decide whether the commit is valid. They depend only
+  on the group's state in that epoch, on the commit, and on the posts
+  that carry the commit and the proposals it applies by reference, with
+  their `t` and the commit's `next` (5.2). The group's state is what
+  every member of the epoch holds, including one that has just joined
+  it by Welcome or by external commit: the ratchet tree, with each
+  leaf's credential, profile, lifetime and `leaf_node_source`
+  [RFC9420]; the group context, with the conversation extension; and
+  which leaf made the commit that started the epoch, which is the
+  signer of the GroupInfo that a joiner joins with. Group checks MUST
+  NOT depend on anything else: not on earlier epochs, on other posts,
+  on key files or on the device's clock. So every device that has
+  applied the same posts reaches the same answer, whenever it joined
+  and however late it looks. A commit that fails one is invalid, and
+  the device ignores it (7.2).
 - **Key checks** use key files and the key log (4.4, 4.5), which devices
   fetch at different times, and which may answer differently for a
   while. They never make a commit invalid. A device applies a commit
@@ -529,7 +634,14 @@ the epoch the commit is for:
   repairs afterwards (below), so that devices never split over what
   they have fetched.
 
-The group checks:
+Every time window of the group checks therefore runs on the server's
+`t`, which a server could set to suit a member (Section 14). Devices
+SHOULD warn their user when the `t` of a commit that reaches them as it
+is posted (5.2) differs from their own clock by more than an hour.
+
+Below, an identity **has a leaf** if the group keeps a leaf of it after
+the commit, and n is the number of leaves before the commit. The group
+checks:
 
 - **MLS.** The commit is valid MLS [RFC9420], and the device can process
   it: its path secrets decrypt, and its confirmation tag is right (but
@@ -537,87 +649,105 @@ The group checks:
 - **Next token.** `next` (5.2) is the hash of the send token of the
   epoch that the commit creates (12.6).
 - **Adds.** Each added KeyPackage is valid MLS, with a lifetime that is
-  acceptable at the post's `t` (12.5). Outside public rooms, its leaf
-  node has a device binding whose `device_id` and uid are those of its
-  credential (12.3). In a public room it has none. Who may add:
-  - a device of the committer's own identity, by anyone in the group;
+  acceptable at the post's `t` (12.5), and its leaf's profile has a
+  `streak` of 0 and an `updated` no more than 10 minutes after the
+  post's `t` (12.3). Outside public rooms, its leaf node has a device
+  binding whose `device_id` and uid are those of its credential (12.3).
+  In a public room it has none. Who may add:
+  - outside public rooms, a device of the committer's own identity, by
+    anyone in the group;
   - in a direct conversation, a device of either participant, and of
     nobody else;
-  - in a room, a device of an identity that already has a leaf, by any
+  - in a private room, a device of an identity that has a leaf, by any
     member;
-  - in a room, a device of an identity that has had a leaf in one of the
-    last 16 epochs, by any member, unless its last leaf was removed by
-    the commit of its SelfRemove (6.1), or by a commit of an owner or
-    moderator who may kick it (6.4). This is how members add back
-    devices whose removal a key check does not support (below);
-  - in a room, a device of any other identity, by an owner or moderator
-    only (an invitation), and of an identity listed in `owners` or
-    `mods`, by an owner only;
-  - in a public room, the leaf of an external Add proposal (6.1), by any
-    member whose leaf is an identity's;
+  - outside public rooms, a device whose stale leaf (below) the same
+    commit removes, by any member;
+  - in a private room, a device of any other identity, by an owner or
+    moderator only (an invitation), and of an identity listed in
+    `owners` or `mods`, by an owner only;
+  - in a public room, only the leaf of an external Add proposal (6.1),
+    by reference, by any member whose leaf is an identity's;
   - never a leaf whose credential names a banned identity, nor, in a
     public room whose `guests` is `none`, a guest's.
 - **One leaf per device.** Outside public rooms, no two leaves of the
   group have the same uid and `device_id` after the commit. In a public
-  room they may, until the earlier one is removed as inactive (below).
+  room they may, until one is removed as a copy (below).
 - **Removes.** Each removed leaf is:
   - a leaf of the committer's own identity;
   - in a room, a leaf of an identity that the committer may kick or ban
     (6.3, 6.4);
-  - a leaf that has posted a SelfRemove;
+  - a leaf whose SelfRemove the commit applies (6.1);
   - a guest leaf;
   - a **stale** leaf (below);
-  - a leaf that posted RESYNC, together with an Add of the same device
-    (below);
-  - a leaf that an impostor repair removes (below);
-  - outside public rooms, any other leaf, **for a key check**: its device
-    has been removed by record (4.4), its identity's chain ends with a
-    `retire` record, its device binding does not verify, or its identity
-    is forked or has its keys missing (12.14). Each device makes that
-    check itself afterwards (below);
-  - in a public room, a leaf that has the same uid and `device_id` as a
-    later leaf and is **inactive**: its `updated`, or the `t` of the
-    commit that added it if that is later, is more than 48 hours before
-    the post's `t`. So a device that joins a public room again replaces
-    its old leaf only once that leaf has stopped committing, and someone
-    who copies its credential cannot push it out. The device itself can
-    remove a leaf that copies its credential at any time, as a leaf of
-    its own identity, since in a public room only the device that a
-    credential names can commit (12.6);
-  - in a public room, within 24 hours after a resync commit, by the
-    posts' `t`, a leaf that has neither committed nor been added since
-    that commit (below).
+  - in a resync commit, the leaf that made the commit that started the
+    epoch (below);
+  - outside public rooms, a leaf of another identity, removed **for a
+    check** that the group cannot make: a key check (below), including
+    that its identity is forked or has its keys missing (12.14), a leaf
+    found to be an impostor (below), or a device that posted RESYNC
+    (below). A commit removes for a check the leaves of **one**
+    identity at most. Every such reason concerns one identity's leaves,
+    and the limit keeps any one member from emptying a group in a
+    single commit;
+  - in a public room, a **copy**: a leaf with the same uid and
+    `device_id` as another leaf that has committed or been Updated since
+    it was added (its `leaf_node_source` is `commit` or `update`), and
+    whose `updated` is lower than that other leaf's. In a public room,
+    only the device that a credential names can commit or propose an
+    Update of an identity's leaf (12.6), so a copy of someone's
+    credential never pushes their leaf out, while a device that joins
+    again has its old leaf removed once its new one has committed or
+    been Updated;
+  - in a public room, a leaf that has neither committed nor been Updated
+    since it was added (its `leaf_node_source` is `key_package`): by an
+    owner or moderator, whatever its uid, without kicking that uid; and
+    by any member, once the leaf's `updated` is more than 8 days before
+    the post's `t`. Devices commit or propose an Update at least weekly
+    (below), so this removes only joins that nobody uses, such as leaves
+    whose credential names a device that does not hold them.
+- **Bulk.** In a commit by a member that is not an owner or moderator,
+  the stale leaves, guest leaves, copies and leaves that have never
+  committed that it removes, other than leaves of its own identity,
+  number at most max(1, floor(n/10)) together.
 - **Extensions.** A GroupContextExtensions proposal changes only the
   fields of the conversation extension that the committer may change
   (6.2, 6.3), and the other extension is unchanged. A commit that adds a
   uid to `bans` also takes it out of `owners` and `mods` (6.4). In a
   direct conversation or a private room, any member may instead change
-  `box` alone, to move the mailbox (7.8), in a commit with no other
-  proposal. An impostor repair (below) may also put back fields that
-  the impostor's commits changed, whatever the committer's role.
+  `box` alone, to move the mailbox, in a commit with no other proposal,
+  and the new `box` is the one that 7.8 derives from the epoch the
+  commit is made in.
 - **Leaves.** The commit's path keeps the committer's credential, and
-  changes its signature key only as 12.3 allows. The committer's new
+  brings a new signature key only as 12.3 allows. The committer's new
   `updated` and `streak` are as 12.3 requires.
 - **Updates.** Each Update proposal it commits is in an epochal group,
-  keeps its sender's credential, and has an `updated` as 12.3 requires.
-- **Streaks.** A commit whose `streak` is more than 3, so that its leaf
-  has started each of the last 3 epochs, is invalid, unless its only
+  keeps its sender's credential, brings a new signature key only as
+  12.3 allows, and has a `streak` of 0 and an `updated` as 12.3
+  requires, against the `t` of the post that carried the proposal.
+- **Streaks.** Outside the conversation with yourself, a commit whose
+  `streak` is more than 3, so that leaves of the committer's identity
+  have started each of the last 3 epochs, is invalid, unless its only
   proposals remove leaves of the committer's own identity, or its new
-  `updated` is at least 10 minutes after the leaf's previous `updated`.
-  Since `updated` stays within 10 minutes of the server's `t`, no leaf
-  can win every epoch: after three commits in a row, a leaf can commit
-  about once every 10 minutes, and others have that long to commit
-  first.
-- **External commits** appear only in public rooms, and only as resync
-  commits (below): by a leaf whose credential names an identity that
-  already has a leaf in the group, adding only the joiner, and removing
-  only what a resync commit may remove.
-- **Size.** The group stays within the limits of 6.1.
-
-Some group checks depend on commits that the device applied earlier, up
-to 16 epochs or 24 hours back. A device that joined since, by Welcome,
-has not applied them, and treats such a check as one it could not make:
-it applies the commit, as for a key check it cannot make yet (below).
+  `updated` is at least 10 minutes after the highest `updated` among the
+  leaves of its identity that have committed or been Updated. Since
+  `updated` stays within 10 minutes of the server's `t`, no identity can
+  win every epoch: after three commits in a row, its devices between
+  them can commit about once every 10 minutes, and others have that
+  long to commit first.
+- **External commits** appear only in public rooms, by a leaf whose
+  credential names an identity, and add only the committer's own leaf.
+  Each is one of:
+  - a **resync commit** (below), by an identity that had a leaf in the
+    group before it: it removes the leaf that made the commit that
+    started the epoch, which signed the GroupInfo, and may remove leaves
+    of its own identity, and nothing else;
+  - a **rejoin** (below), by an identity listed in `owners` or `mods`:
+    it removes only leaves of its own identity.
+- **Size.** The group stays within the limits of 6.1. A direct
+  conversation holds at most 128 leaves, one for each current device of
+  its participants, which have at most 64 each (4.4). In a private room,
+  a commit after which more than 256 identities have leaves sets
+  `confirm` to `epochal`, unless it is already (6.2).
 
 A device that sees a commit by a leaf of its own identity that removes
 another leaf of its identity, whose device is still current, without
@@ -635,11 +765,20 @@ device checks:
   (4.4) in its identity's chain, as far as the device has accepted it.
   A device MUST NOT show a message, or act on a line, from a leaf of a
   device removed by record (12.9).
-- **Removals for a key check.** Each leaf removed for a key check fails
-  it. A removal because the identity was forked or had its keys missing
-  never fails: what one device saw of a key file or a log, another may
-  not see. It stands, as one the device could not check, and the device
-  warns if it does not see the same itself.
+- **Removals for a check.** A commit does not say why it removed a
+  leaf for a check, so for each such leaf the device looks for a reason
+  that it can see: the leaf's device has been removed by record (4.4),
+  its identity's chain ends with a `retire` record (4.9), its device
+  binding does not verify, or its identity is forked or has its keys
+  missing (12.14); the leaf posted RESYNC; or the leaf is an impostor to
+  the device itself (below). If it finds none, it cannot tell whether
+  another device saw a fork, missing keys or an impostor that it does
+  not, since what one device sees of a key file or a log another may
+  not. The removal then stands, as one it could not check, and the
+  device warns its user, naming the member who made the commit. Only
+  for a leaf of its own identity does a device know: if that leaf's
+  device is still current, and the identity is neither forked nor
+  missing its keys, the removal failed.
 
 Public rooms have no key checks, since their leaves carry no device
 binding: attestation does that work there (12.10).
@@ -649,7 +788,10 @@ key file now (4.4), or because a record the check needs is still
 pending (4.5), has not failed it. It applies the commit, and checks
 again from time to time. Every fact these checks rely on, such as a
 record in a log, stays true once it is true, so devices that fetch later
-reach the same answer. Until the check passes:
+reach the same answer. But a record that is still pending 2 hours after
+the device first needed it counts as failed: a log must witness a record
+within an hour (4.5), and otherwise whoever controls a log could keep a
+group waiting for ever. Until a check passes or fails:
 
 - **A removal it could not check** stands, and the device warns the user
   that a leaf was removed for a reason it could not check. Removing a
@@ -662,11 +804,17 @@ When a key check fails, the device warns the user, and, after a random
 wait of up to 10 minutes, unless another device has done so first,
 repairs it in a commit:
 
-- **An add failed:** it removes the leaf, for that key check.
-- **A removal failed,** since the device is still current: it adds the
-  removed devices again from new KeyPackages (12.5), as the group checks
-  allow for 16 epochs.
-- **The committer's device had been removed by record:** it treats the
+- **An add failed:** it removes the leaf, for a check. If the record
+  that it waited for is accepted later, the device is added again
+  (below), since the facts only ever move towards a check that passes.
+- **A removal failed,** of a leaf of its own identity: it adds the
+  removed devices that are still current again, from new KeyPackages
+  (12.5), as its own identity's. A removal of another identity's leaves
+  that it could not check stands. If that identity has no leaf left in
+  a room, the devices of owners and moderators SHOULD offer their users
+  to add its devices again (6.1), once its keys are present and no fork
+  is known (12.14).
+- **The committer's device had been removed by record:** it removes the
   committer's leaf as an impostor (below).
 
 **Leaves that use authority.** Whoever adds a device builds its leaf
@@ -680,35 +828,48 @@ therefore check every leaf that uses authority:
   identity, in every group, and every leaf that it has not confirmed
   and that makes an **authority commit**: a commit that only a role
   allows (6.3), that removes leaves of the committer's own identity
-  other than its own, or that only an impostor repair allows. It does
-  the same for a leaf that sends a line that only a role allows, such
-  as a DELETE of someone else's message (5.4). In an epochal group,
-  where there is no challenge, the leaf's device sends ATTEST (12.10),
-  in a message of its own if it has nothing else to send, within an
-  hour of each authority commit it makes in a period for which it has
-  not attested yet.
+  other than its own, or that removes leaves of another identity for a
+  check: outside public rooms, any removal of another identity's leaf
+  that the committer's role does not allow, other than of a stale or
+  guest leaf. It does the same for a leaf that sends a line that only a
+  role allows, such as a DELETE of someone else's message (5.4). In an
+  epochal group, where there is no challenge, the leaf's device sends
+  ATTEST (12.10), in a message of its own if it has nothing else to
+  send, within an hour of each authority commit it makes in a period
+  for which it has not attested yet.
 - A leaf that answers wrongly, or not within an hour, is an
   **impostor** to that device. The device shows that leaf's messages
-  and actions as unconfirmed, and warns the user. After a random wait of
-  up to 10 minutes, unless another device has done so first, it makes an
-  **impostor repair**: one commit that removes the leaf, puts back the
-  fields of the conversation extension that the leaf's commits changed
-  to the values they had before the first of those commits, and adds
-  again, from new KeyPackages, the devices whose leaves those commits
-  removed. A leaf whose device has been removed by record (above) is
-  repaired the same way.
-- An impostor repair is a group check. Any member may make one,
-  whatever its role, against a leaf of another identity, and undo only
-  commits made by that leaf whose posts' `t` are at most 24 hours before
-  the repair's.
-- A device that sees a repair remove a leaf that it has confirmed tells
-  the user, and names the member who made it, since the repair is then
-  itself the abuse. The removed leaf's own identity adds its device
-  again (below).
+  and actions as unconfirmed, and warns the user, with what the leaf's
+  commits changed. After a random wait of up to 10 minutes, unless
+  another device has done so first, it removes the leaf, for a check
+  (above). Any member may do this, whatever its role: removing a leaf
+  never lets anyone new read, and the leaf's own identity adds its
+  device again. A leaf whose device has been removed by record (above)
+  is removed the same way.
+- Removing an impostor does not undo what it did. That takes ordinary
+  commits, which need the role that each change needs now (6.3): that
+  of the impostor's own identity, whose devices hold the role that the
+  impostor used unless its commits took it away, or that of the room's
+  other owners and moderators. Such a device SHOULD offer its user to
+  undo, in one commit, what the impostor's commits changed in the 24
+  hours before it was found out, as far as its role allows: to put back
+  fields of the conversation extension, and to add again, from new
+  KeyPackages, the devices whose leaves those commits removed. The
+  group judges that commit like any other, so a member without the role
+  cannot undo an owner's moderation by calling the owner an impostor.
+- A device that sees a leaf that it has confirmed removed for a check
+  tells the user, and names the member who made the commit, since the
+  removal is then itself the abuse. The removed leaf's own identity
+  adds its device again (below).
 - A device that is welcomed to a group in which no leaf has the
   signature key of the KeyPackage it was added from does not join. It
   tells the user that someone may have added the device with a key of
   their own.
+- Public rooms have no removals for a check. Only the device that a
+  credential names commits there (12.6), so a leaf can use authority in
+  another's name only with the server's help or from a stolen device.
+  Owners and moderators remove such a leaf within their roles, and the
+  identity's own devices as one of their own.
 
 Only owners invite identities that are listed in `owners` or `mods`
 (above), so that an invitation never hands a moderator control of an
@@ -728,15 +889,17 @@ conversation or a private room:
   once, where `<seq>` is the seq of the commit it could not process.
   The others can still decrypt it for a while (12.9, "Late messages").
   If nobody acts on it within an hour, the device sends
-  `RESYNC <box> <seq>` in the conversation with itself instead, and its
-  own identity's devices act on it.
-- Any member's device that reads a RESYNC, after a random wait of up to
-  10 minutes and unless another has done so first, commits the removal
-  of that leaf together with an Add of the same device from a new
-  KeyPackage (12.5). This is a group check: the removed leaf posted
-  RESYNC in one of the last 16 epochs, and the same commit adds a leaf
-  with its uid and `device_id`. The device then gets a Welcome, and asks
-  its own devices for what it missed (12.13).
+  `RESYNC <box> <seq>` in the conversation with itself instead.
+- A device of the same identity that reads a RESYNC, after a random wait
+  of up to 10 minutes and unless another has done so first, commits the
+  removal of that leaf together with an Add of the same device from a
+  new KeyPackage (12.5), as its own identity's. If the identity has no
+  other leaf in the group, the other participant's device does the same
+  in a direct conversation, and an owner's or moderator's in a room,
+  removing the leaf for a check (above). Other members only warn their
+  users: a plain member who could replace another identity's leaf could
+  also hold the new one (above). The device then gets a Welcome, and
+  asks its own devices for what it missed (12.13).
 - Devices tell the user when one member's commits keep leading to RESYNC
   lines from others: that member may be cutting devices out on purpose.
 
@@ -758,17 +921,16 @@ then in batches:
    GroupInfo the server holds, after the comparison that "Rejoining a
    public room" requires (below). It removes the leaf that made the
    commit the devices could not apply, which is the GroupInfo's signer,
-   and its own earlier leaf if that is inactive (above), and nothing
-   else.
+   and its own earlier leaf, and nothing else.
 2. Every other device that cannot follow joins again by external
    proposal, as for a first join (6.1). Full clients commit these
    proposals as 6.1 says, at most 256 devices in a commit.
-3. For 24 hours after the resync commit, by the posts' `t`, a commit
-   may also remove leaves that have neither committed nor been added
-   since the resync commit, which are those of the devices that could
-   not follow. Full clients remove them, at most 256 in a commit, with
-   the proposals they commit. Until then, a device that joined again
-   has two leaves.
+3. A device that joined again removes its earlier leaf: a full client in
+   its next commit, as a leaf of its own identity, and a light client by
+   proposing an Update of its new leaf (12.10), after which full clients
+   remove the earlier one as a copy (above). Until then, the device has
+   two leaves. Leaves of devices that never come back are removed once
+   they are stale (below).
 
 This costs one external commit and a few batched commits, rather than an
 external commit from every device in the room, each racing the others
@@ -777,12 +939,31 @@ they could not apply. The server took that commit only from the device
 its credential names (12.6), so an owner or moderator can ban that
 identity, and the server then refuses its commits (6.4).
 
+A resync commit removes one leaf of another identity, and the group
+checks it like any other commit, so it gives its maker no hold over the
+room. But nothing shows whether any device needed it. So a device that
+applied without trouble the commit that a resync commit undoes shows the
+resync to its user as possible abuse, and names the identity that made
+it, so that owners and moderators can ban it.
+
+**Owners and moderators rejoining.** Only full clients in the group
+commit join proposals, so a room whose only full client online is
+hostile could keep everyone else out. An owner or moderator whose join
+proposal no commit has applied within 30 minutes MAY join again by an
+external commit instead, a **rejoin**, which adds only its own leaf and
+may remove its identity's earlier leaves (above). The server checks the
+role in the conversation extension it holds, and that the commit comes
+from the device that its credential names (12.6). The owner or
+moderator can then commit the waiting proposals, and ban whoever kept
+them out.
+
 **Rejoining a public room.** For each public room it is in, a device
 keeps the conversation extension of the newest epoch that it applied
 and checked itself. When it finds that the server accepted a commit
 that the device holds invalid, it MUST tell the user that the server
 accepted an invalid commit in that room. Before it joins the room
-again, by a resync commit or by a Welcome after a resync (above), it
+again, by a resync commit, a rejoin, or a Welcome after a resync
+(above), it
 compares the extension of the GroupInfo it would join with the one it
 kept:
 
@@ -804,20 +985,21 @@ compare with, and takes the roles that the GroupInfo shows (Section
 
 **Adding devices.** Every device of an identity that is current, whose
 record has been accepted (4.5), and that has no leaf in one of the
-identity's groups gets added:
+identity's groups outside public rooms gets added:
 
 - A device of the same identity adds it as soon as it has accepted its
   record, which is usually within a minute of pairing (4.5, 4.8), not
   before: members who cannot yet accept the record would see a leaf
   they cannot check, and stop sending.
 - Otherwise, any member's device that finds it, when it checks key
-  files (12.14), adds it after a random wait of up to an hour, unless
-  someone has done so first. This is how a device that recovered an
-  identity (4.8) gets back into its conversations.
+  files (12.14), and that the Adds checks let add it (above), adds it
+  after a random wait of up to an hour, unless someone has done so
+  first. This is how a device that recovered an identity (4.8) gets
+  back into its conversations.
 - A device that commits the removal of an identity's devices removed by
   record adds that identity's current devices without a leaf in the
-  same commit, so that the identity never drops out of the group by
-  accident.
+  same commit, where the Adds checks let it, so that the identity never
+  drops out of the group by accident.
 
 A device adds another identity's devices only from a key file that
 extends the head it holds for that identity (4.5), never a device it has
@@ -828,30 +1010,34 @@ public room, devices join by themselves (6.1), and nobody adds them.
 
 **Replacing stale leaves.** A device that has been offline for longer
 than retention cannot catch up from the server (7.5). Its leaves are
-replaced, so that it gets back in by Welcome:
+replaced, so that it gets back in by Welcome. A leaf's **activity time**
+is its `updated`, or, for a leaf that has neither committed nor been
+Updated since it was added, the end of its KeyPackage's lifetime (12.5)
+if that is later; but never later than the `t` of the commit's post.
 
-- **By its own identity's devices, first.** A device MUST replace, by
-  removing it and adding the same device again from a new KeyPackage,
-  the leaf of another device of its own identity whose `updated` is
-  older than the server's retention period (8.5) plus one day, by the
-  device's clock. The extra day leaves room for the weekly fresh-leaf
-  commit (below) where retention is 7 days.
-  It SHOULD do so as soon as it notices, in every group they share,
-  starting with the conversation with yourself. Both are allowed for
-  one's own leaves, and removing a leaf never lets anyone new read, so
-  relying on INFO's retention here is safe.
-- **By anyone, after 35 days.** A leaf is **stale** if its `updated` is
-  more than 35 days older than the group's median `updated`. For a leaf
-  that has not committed since it was added, the end of its
-  KeyPackage's lifetime (12.5) counts as its `updated`, if that is
-  later. The median is taken over every leaf that carries a profile, as
-  the group was before the commit: sort their values, and take the one
-  at position floor(n/2), counting from 0. No one member can move it,
-  and every device computes the same value. Any member's device MAY
-  remove stale leaves, at most max(1, floor(n/10)) of them in one
-  commit, where n is the number of leaves before the commit. It MUST,
+- **By its own identity's devices, first.** Outside public rooms, a
+  device MUST replace, by removing it and adding the same device again
+  from a new KeyPackage, the leaf of another device of its own identity
+  whose activity time is older than the server's retention period (8.5)
+  plus one day, by the device's clock. The extra day leaves room for the
+  weekly fresh-leaf commit (below) where retention is 7 days. It SHOULD
+  do so as soon as it notices, in every group they share outside public
+  rooms, starting with the conversation with yourself. Both are allowed
+  for one's own leaves, and removing a leaf never lets anyone new read,
+  so relying on INFO's retention here is safe. In a public room, the
+  device that fell behind joins again by itself (6.1).
+- **By anyone, after 35 days.** A leaf is **stale** if its activity time
+  is more than 35 days before the group's median activity time. The
+  median is taken over every leaf that carries a profile, as the group
+  was before the commit: sort their values, and take the one at
+  position floor(n/2), counting from 0. No leaf counts as newer than the
+  commit, so leaves added from long-lived KeyPackages cannot push the
+  median into the future, a leaf just added is never stale, and every
+  device computes the same value. Any member's device MAY remove stale
+  leaves, within the bulk limit above. Outside public rooms, it MUST,
   in the same commit, add the same devices again from new KeyPackages,
-  for each that KEYPKG GET returns one.
+  for each that KEYPKG GET returns one. In a public room nobody adds
+  them: their devices join again by themselves (6.1).
 
 A device that finds it has fallen behind (7.4) uploads fresh
 KeyPackages, and waits to be added again. Once it is back in the
@@ -880,7 +1066,7 @@ A device that a commit adds gets a Welcome, encrypted to its
 KeyPackage.
 
 ```
-WELCOME PUT <ref> <welcome>
+WELCOME PUT <ref> <secret> <welcome>
 WELCOME LIST
 WELCOME DEL <id>
 WELCOME GET <ref> [light=yes]
@@ -889,13 +1075,26 @@ WELCOME GET <ref> [light=yes]
 - **`WELCOME PUT`** hands the server a Welcome for the KeyPackage whose
   KeyPackageRef [RFC9420] is `<ref>`, 48 bytes in base64 with padding,
   and replies `OK`. It works on anonymous, guest and signed-in
-  connections (Section 13), and the committer SHOULD send each one on a
-  fresh anonymous connection (4.1).
-  The server accepts it only for a KeyPackage it handed out with KEYPKG
-  GET, or one in an external Add proposal in a public room
-  (`ERR not-found`), and only once for each: once for each ref it
-  handed out, and for a last-resort KeyPackage, once for each KEYPKG GET
-  that handed it out. A server MUST limit how many Welcomes are pending
+  connections (Section 13). The server accepts it only for a KeyPackage
+  that it handed out with KEYPKG GET, or that is in an external Add
+  proposal in a public room (`ERR not-found`), and only from whoever
+  added it (`ERR forbidden`):
+  - For a KeyPackage from KEYPKG GET, `<secret>` is the put secret of
+    that handout (12.5), which the server checks against its hash, in
+    constant time. Other members see the KeyPackage inside the commit,
+    but never its secret. The committer SHOULD send each such Welcome on
+    a fresh anonymous connection (4.1).
+  - For a KeyPackage of an external Add proposal, `<secret>` is `-`. The
+    server accepts the Welcome only once it has accepted a commit that
+    applies the proposal (12.6), and only on a signed-in connection of
+    the device that made that commit, which it knows already. So someone
+    who follows the room, and sees the proposal, cannot deliver a
+    Welcome first.
+  Each handout has at most one Welcome: for a last-resort KeyPackage,
+  each KEYPKG GET is a handout of its own. A PUT for a handout that
+  already has a Welcome, from whoever may put it, replaces that Welcome
+  while it has not been fetched, so that a committer whose `OK` was lost
+  can send it again. A server MUST limit how many Welcomes are pending
   for each device (`ERR rate-limited`).
 - `<welcome>` is a SealedWelcome (below) for a KeyPackage handed out by
   KEYPKG GET, and the MLSMessage that holds the Welcome for one in an
@@ -911,11 +1110,14 @@ WELCOME GET <ref> [light=yes]
   for the device, so that a device whose first `OK` was lost can send it
   again.
 - **`WELCOME GET`** returns the Welcome for a KeyPackage of an external
-  proposal, as `WELCOME <id> <welcome>`, then `OK`, or `ERR not-found`
-  if there is none yet. It works on anonymous, guest and signed-in
+  proposal, as `WELCOME <id> <welcome> tree=<tree>`, then `OK`, or
+  `ERR not-found` if there is none yet. `<tree>` is the ratchet tree of
+  the Welcome's epoch, which the server keeps for it (12.6), in base64
+  with padding or, for a large room, as a blob-ref (12.12). With
+  `light=yes`, `<welcome>` is an AnnotatedWelcome (12.6), and the line
+  has no `tree`. WELCOME GET works on anonymous, guest and signed-in
   connections, so that a device or guest that joined a public room
   anonymously can fetch it, on a connection of its own (4.1).
-  With `light=yes`, `<welcome>` is an AnnotatedWelcome (12.6).
 
 **One Welcome per device.** An MLS Welcome lists, in the clear, the
 KeyPackageRef of every device it adds, and the part that every new
@@ -949,7 +1151,11 @@ itself, which costs the committer one upload of the tree per device.
 
 Welcomes for external Add proposals in a public room, whose membership
 the server knows anyway, are not sealed, so that the server can build
-an AnnotatedWelcome from them (12.6).
+an AnnotatedWelcome from them (12.6). The committer makes one Welcome
+for all the devices that its commit adds, without the `ratchet_tree`
+extension, since the server holds the tree (12.6). It stores that
+Welcome once as a blob if it is too large for a line (12.12), and puts
+it under each added device's ref.
 
 A committer MUST NOT send any Welcome for its commit before it has
 fetched the posts before the commit and found that the commit won
@@ -962,16 +1168,30 @@ or tie them to the commit. In a direct conversation or a private room,
 the Welcome's GroupInfo MUST carry the `ratchet_tree` extension, since
 the server does not hold the tree.
 
+A committer whose WELCOME PUT is refused, other than with
+`ERR rate-limited`, cannot know who holds the device's place. It tells
+its user, and, where the Adds checks let it (12.7), removes that leaf
+and adds the device again from a new KeyPackage.
+
 ```
-C: WELCOME PUT kq3V0X2l7r0o5yZ1TQm1bHk4Rk5r0Q2c8Jx7Vb9pL3dE6Gf1Ha2Ij4Kl5Mn6Op7Q AAEAAwBA…
+C: WELCOME PUT kq3V0X2l7r0o5yZ1TQm1bHk4Rk5r0Q2c8Jx7Vb9pL3dE6Gf1Ha2Ij4Kl5Mn6Op7Q Hc2vQ0mX4t9bLr7kWz1pYf8eNa3sJd6uGq5iTo2lVyE= AURgBA…
 S: OK
 ```
 
 On the new device's signed-in connection:
 
 ```
-S: WELCOME 7f3k2m9q AAEAAwBA…
+S: WELCOME 7f3k2m9q AURgBA…
 C: WELCOME DEL 7f3k2m9q
+S: OK
+```
+
+A device that joined a public room by proposal, on a connection of its
+own:
+
+```
+C: WELCOME GET Vb9pL3dE6Gf1Ha2Ij4Kl5Mn6Op7Qkq3V0X2l7r0o5yZ1TQm1bHk4Rk5r0Q2c8Jx7
+S: WELCOME 2hq8w5vn AAEAAwBA… tree=sha384:5d0c9a1e…
 S: OK
 ```
 
@@ -1053,8 +1273,10 @@ key used only for this message, which every device deletes once it has
 decrypted it. To receive a message, a device decrypts it with MLS, which
 also checks its signature, and then:
 
-1. Checks that the RisalaAAD's pseudonym is the one it pinned for that
-   leaf, or pins it (7.3).
+1. Checks that the RisalaAAD's pseudonym is the sender's pseudonym for
+   the message's epoch (7.3): the one derived from the epoch outside
+   public rooms, and in a public room the one it pinned for the leaf in
+   that period, or pins it.
 2. Checks that HMAC-SHA-384(`frank_key`, `content`) equals `frank`,
    comparing in constant time. This check is what makes sure that a
    report can only reveal what was sent (5.8): ChaCha20-Poly1305 is not
@@ -1062,9 +1284,17 @@ also checks its signature, and then:
    decrypts to other content under another key. It MUST NOT be
    skipped.
 3. Checks that it has not already seen `message_id` in the group, so
-   that the server cannot replay a message under a new seq.
+   that the server cannot replay a message under a new seq. It keeps
+   each `message_id` at least until it has deleted the secrets of the
+   message's epoch (below), after which MLS could not decrypt a replay
+   anyway. It also checks that a stored message has a `counter` of at
+   least 1, and a live one (5.2) a `counter` of 0 and an empty
+   `previous`.
 4. Checks `counter` and `previous` against the leaf's earlier messages,
-   and notes a gap (7.4).
+   and notes a gap (7.4). If it holds the leaf's message whose `counter`
+   is one less, and `previous` is not that message's `message_id`, the
+   sender or the server has shown devices different messages: it shows
+   the message with a mark that the sender's history disagrees.
 5. Compares `time` with the `t` of the post. If they differ by more than
    10 minutes, it shows the message with the sender's time and a mark
    that the times disagree.
@@ -1090,15 +1320,25 @@ message by where it falls in that order, not only by its epoch:
   post's `t` is within an hour of the `t` of the commit that ended
   epoch e. It shows a later one as unreadable, and MUST delete a past
   epoch's secrets, with the keys it kept for skipped messages of that
-  epoch, as soon as it has applied a post that puts the epoch past
-  either limit. These rules depend only on the posts, so every device
-  reaches the same result.
+  epoch, as soon as it has applied a stored post that puts the epoch
+  past either limit. These rules depend only on the posts, so every
+  device reaches the same result.
+- Whatever posts arrive, a device MUST also delete a past epoch's
+  secrets, with its skipped-message keys, 2 hours after it applied the
+  commit that ended the epoch, by its own clock. Otherwise a group that
+  goes quiet, or a server that holds back later posts, would keep them
+  on the device. A late message that it can then no longer decrypt is
+  unreadable, as above. This depends on when a device fetched, so it
+  can make a message unreadable on one device and not on another, but
+  it changes only what devices show, never which commit is valid
+  (12.7).
 - Within an epoch, a device keeps the keys of skipped messages for at
   most 1,000 generations behind the newest it has seen from each
   sender, and rejects a message more than 1,000 generations ahead of
-  it. With the rule above, a device holds the secrets of at most 2 past
-  epochs, and of none for more than an hour after the commit that ended
-  it.
+  it, or ahead of generation 0 if it has seen none from that sender.
+  With the rules above, a device holds the secrets of at most 2 past
+  epochs, and of none for more than 2 hours after it applied the commit
+  that ended it.
 
 The content is one or more lines in UTF-8, in the format of Section 3,
 each ending in LF. The rules of 2.3 for characters apply to these lines,
@@ -1145,7 +1385,9 @@ A TEXT line may carry these tags:
   SHA-384 hash of the exact bytes uploaded, in base64 with padding
   (12.11). A TEXT line that has `file` without both `file-key` and
   `file-hash`, or whose `file-key` is not 32 bytes or `file-hash` not 48
-  bytes, is shown as a message with no file.
+  bytes, is shown as a message with no file. File tags go only on a
+  plain TEXT line or a reply, never with `edit` or `react`, where
+  devices ignore them.
 
 For example, a reply as it appears inside the encryption:
 
@@ -1199,13 +1441,16 @@ The lines of the conversation with yourself:
   forward only to records it has accepted.
 
 Devices accept the lines of the conversation with yourself only from
-leaves of their own identity that they have confirmed (12.10), and send
-SIGNINGKEY and BACKUPKEY only while every leaf in that conversation is
-confirmed, since every leaf there reads them. So in that conversation, a
-device challenges every other leaf as soon as it appears, whether or
-not it sends (12.10). If a leaf there has not answered within 24 hours,
-the device tells the user, and removes it if the user agrees, which it
-may, since the leaf is of its own identity.
+leaves of their own identity that they have confirmed (12.10). Every
+leaf there reads SIGNINGKEY and BACKUPKEY, and a stolen device's leaf is
+confirmed too. So a device sends them only while every leaf in that
+conversation is confirmed, no leaf in it belongs to a device removed by
+record (4.4) or to a device whose removal the sender is carrying out
+(4.8), and the commits that removed such leaves have won (7.2). So in
+that conversation, a device challenges every other leaf as soon as it
+appears, whether or not it sends (12.10). If a leaf there has not
+answered within 24 hours, the device tells the user, and removes it if
+the user agrees, which it may, since the leaf is of its own identity.
 
 ### 12.10. Confirming Leaves
 
@@ -1220,9 +1465,9 @@ Confirmation must convince the members of a group, and nobody else.
 Signing the leaf key with the device key would convince anyone who sees
 the signature, and so would prove who wrote every message the leaf
 signed. Instead, the group's `confirm` field (12.4) picks one of two
-ways. Direct conversations, and private rooms of up to 256 members, use
-`pairwise`. Public rooms, and private rooms that have grown past 256
-members, use `epochal`.
+ways. Direct conversations, and private rooms of up to 256 identities,
+use `pairwise`. Public rooms, and private rooms that have grown past
+256 identities, use `epochal`.
 
 **Pairwise.** Each pair of devices confirms each other's leaf with a
 post-quantum KEM challenge and a MAC. For device B to confirm the leaf
@@ -1314,8 +1559,14 @@ deniable once the key is out.
 - **A new leaf key each period.** Before its first message of a period
   in an epochal group, the device replaces its leaf node with one that
   has a new signature key (12.3), and deletes the old key once that has
-  taken effect. So no leaf key is used in more than one period. It also
-  picks a new pseudonym (7.3).
+  taken effect. So no leaf key is used in more than one period. In a
+  public room, it also picks a new pseudonym (7.3). Rotating limits what
+  a revealed period key lets anyone forge. It does not keep the periods
+  apart: in a public room, each Update is a PublicMessage, signed with
+  the leaf's old key and carrying its new one, so anyone who follows the
+  room can chain a leaf's keys from one period to the next, and an
+  ATTEST that someone timestamped in one period ties the leaf to its
+  device in every period (Section 14).
 - **By Update.** The device does this with an Update proposal, posted
   on its own, which full clients in the group commit with others in
   batches: each waits a random time of up to 10 minutes after the
@@ -1340,8 +1591,10 @@ deniable once the key is out.
   sends `ATTEST <period> <period-key> <certificate> <attestation>
   <pseudonym>`. `<period>` is in decimal, and the rest are the period
   key, the certificate's signature, RisalaSign(period key, "attest",
-  AttestContent) and the leaf's pseudonym for the period, each in base64
-  with padding. The pseudonym is the one in that message's RisalaAAD.
+  AttestContent) and the leaf's pseudonym, each in base64 with padding.
+  The pseudonym is the one in that message's RisalaAAD: in a public room
+  the leaf's pseudonym for the period, and elsewhere the one derived for
+  the message's epoch (7.3).
 - **Revealing.** Once 3 hours have passed since the end of the period,
   the device sends `REVEAL <period> <seed>`, the period key's 32-byte seed
   in base64 with padding, in each group where it attested in that
@@ -1401,7 +1654,10 @@ device. Only attestation shows whose a leaf is. So, in a public room:
 - Owners' and moderators' devices SHOULD kick, ban, mute or report only
   leaves that they have confirmed, or whose commit they could not apply
   (12.7, "Resyncing a public room"), since an unconfirmed leaf's
-  credential may name someone else.
+  credential may name someone else. They MAY remove single leaves that
+  have never committed or been Updated, whatever uid these name (12.7),
+  which kicks and bans nobody, for example to clear joins that fill the
+  room.
 
 A device checks that a REVEAL's seed derives the period key that the
 leaf attested with, directly or through the chain of seeds above, and
@@ -1803,7 +2059,8 @@ A device does not take the server's word for which keys belong to whom:
   current period (12.10). It spreads these fetches over the day at
   random times, and checks the identity's freshness each time (4.5).
 - After a fetch, outside public rooms, it removes the leaves of devices
-  removed by record, and adds devices that have none (12.7). In a public
+  removed by record, and adds devices that have none, where the Adds
+  checks of 12.7 let it. In a public
   room, devices join by themselves (6.1), and their leaves carry no
   device binding to check (12.10). An outage changes nothing.
 - An identity whose keys are missing (4.4), or that is forked (4.5), is

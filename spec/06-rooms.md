@@ -14,8 +14,10 @@ stays so (12.4).
 | Leaf confirmation | pairwise up to 256 members, then epochal (12.10) | epochal (12.10) |
 
 Devices refuse a commit that takes a room over its limits, and in public
-rooms the server refuses it too (12.6, 12.7). These limits will be
-revisited once ML-DSA and X-Wing have been measured on phones.
+rooms the server refuses it too (12.6, 12.7). A direct conversation
+holds at most 128 leaves, the most that the current devices of its two
+participants can have (12.7). These limits will be revisited once
+ML-DSA and X-Wing have been measured on phones.
 
 ```
 LIST [after=<room>] [limit=<n>]
@@ -64,11 +66,13 @@ as in 12.7, and joins by external proposal: it posts an external Add
 proposal (`new_member_proposal` [RFC9420]) holding a KeyPackage that it
 makes for this join, with no device binding (12.3), with the token `-`
 (5.2). A full client in the room commits it (below), and the device then
-fetches its Welcome with WELCOME GET (12.8). Every device joins this
-way, full client or light client (12.6), identity or guest. An external
-commit is used only to resync a room that its devices could not follow
-(12.7), so that nobody who is not yet a member can force the room's
-devices to join again.
+fetches its Welcome with WELCOME GET (12.8), which comes with the tree
+of the Welcome's epoch, since the server keeps that tree for it (12.6).
+Every device joins this way, full client or light client (12.6),
+identity or guest. External commits are used only to resync a room that
+its devices could not follow, and for owners and moderators to get back
+in when nobody commits their proposals (12.7), so that nobody else who
+is not yet a member can force the room's devices to join again.
 
 A device remembers the group id of each public room it has joined, by
 host and room name. Before it joins a room of the same name again, or
@@ -86,7 +90,12 @@ where `guests` is `none`. It does not check that a joining identity's
 device is current, since the join carries no device binding: anyone may
 post a join whose credential names any device, and devices treat the
 leaf as unverified, like a guest's, until it attests (12.10). The
-server MAY ask for proof of work first (4.1).
+server MAY ask for proof of work first (4.1). A leaf that its device
+does not use, because it never joined after all or because its
+credential names a device that does not hold it, never commits or
+proposes an Update. Owners and moderators may remove such a leaf
+without kicking the uid it names, and any member may once it is 8 days
+old (12.7), so such joins cannot fill a room for ever.
 
 Full clients in a public room commit pending join proposals, Update
 proposals (12.10) and SelfRemove proposals (below), at most 256 devices
@@ -94,7 +103,9 @@ in a commit. Each one waits a random time of up to 10 minutes after the
 oldest pending proposal, then commits them all at once, unless another
 commit has done so first. A room in which no
 full client is online cannot admit anyone by proposal. An owner can keep
-a full client online for the room, for example on a desktop.
+a full client online for the room, for example on a desktop. Owners and
+moderators whose proposals nobody commits within 30 minutes may join by
+external commit instead (12.7).
 
 **Joining a private room.** Only by invitation. An owner or moderator
 invites someone by fetching KeyPackages of the invitee's devices
@@ -148,7 +159,7 @@ is no SET command.
 | `topic` | text up to 512 bytes, may be empty | empty | owners, moderators |
 | `guests` | `none`, `read` or `write` | `write` in public rooms, `none` in private ones | owners, in public rooms only |
 | `send` | `all` or `mods` | `all` | owners |
-| `confirm` | `pairwise` or `epochal` | `pairwise` in private rooms, `epochal` in public ones | owners, from `pairwise` to `epochal` only; anyone, in the commit that takes the room past 256 members |
+| `confirm` | `pairwise` or `epochal` | `pairwise` in private rooms, `epochal` in public ones | owners, from `pairwise` to `epochal` only; anyone, in the commit that takes the room past 256 identities |
 | `owners`, `mods` | lists of uids | the creator is the only owner | owners (6.3) |
 | `bans` | a list of uids | empty | owners, moderators (6.4) |
 
@@ -162,10 +173,12 @@ is no SET command.
   from plain members and guests, other than reactions, and their typing
   (5.3, 8.1).
 - `confirm`: how devices confirm whose leaf is whose (12.10). A private
-  room that grows past 256 members moves to `epochal`, in the commit
-  that takes it over 256 or before. It does not move back. Since the
-  move is forced, whoever makes the commit that takes the room past 256,
-  such as a moderator who invites someone, changes `confirm` in it.
+  room in which more than 256 identities have leaves moves to
+  `epochal`, in the commit that takes it over 256 or before. It does not
+  move back. Since the move is forced, whoever makes the commit that
+  takes the room past 256, such as a moderator who invites someone,
+  changes `confirm` in it, and devices refuse that commit if it does not
+  (12.7).
 
 Devices refuse a commit that changes a field it may not change, or any
 other field of the extension (12.7). In a public room the server

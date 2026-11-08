@@ -18,7 +18,7 @@ REGISTER on a connection that is no longer new get
 | `KEYS PUT <after> <records>` | 4.7 | ✓ | ✓ | | ✓ |
 | `PAIR PUT <id> <data>` / `PAIR GET <id>` | 4.8 | ✓ | ✓ | | ✓ |
 | `UNREGISTER <uid>` | 4.9 | | | | ✓ |
-| `CREATE <box> <group-id> <token-hash> [epoch=]` | 5.2, 7.8 | | ✓ | ✓ | |
+| `CREATE <box> <group-id> <token-hash> [epoch= from= token=]` | 5.2, 7.8 | | ✓ | ✓ | |
 | `CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>` | 5.2 | | | | ✓ |
 | `POST <box> <token> <message> [live=] [groupinfo=] [next=]` | 5.2 | | ✓ | ✓ | public rooms' PublicMessages (12.6) |
 | `UPLOAD <box> <token> <size>` | 5.6 | | ✓ | | |
@@ -35,7 +35,7 @@ REGISTER on a connection that is no longer new get
 | `PUSH ADD <url> <tag> <key> <auth>` / `PUSH DEL <url>` / `PUSH LIST` | 9.1 | | | | ✓ |
 | `KEYPKG ADD <keypackage>` / `KEYPKG COUNT` | 12.5 | | | | ✓ |
 | `KEYPKG GET <uid>` | 12.5 | | ✓ | ✓ | ✓ |
-| `WELCOME PUT <ref> <welcome>` / `WELCOME GET <ref> [light=]` | 12.8 | | ✓ | ✓ | ✓ |
+| `WELCOME PUT <ref> <secret> <welcome>` / `WELCOME GET <ref> [light=]` | 12.8 | | ✓ | ✓ | ✓ |
 | `WELCOME LIST` / `WELCOME DEL <id>` | 12.8 | | | | ✓ |
 | `BLOB <hash> <size> [box= token=]` | 12.12 | | ✓ | ✓ | ✓ |
 | `BACKUP PUT <generation> <hash> <key> [files=]` / `BACKUP GET` / `BACKUP DEL` | 12.13 | | | | ✓ |
@@ -68,8 +68,8 @@ Lines a server can send:
 | `RECORD <index> <hash>` | response to KEYS PUT | 4.7 |
 | `PAIR <id> <data>` | response to PAIR GET | 4.8 |
 | `PUSH <url> <tag>` | response to PUSH LIST | 9.1 |
-| `KEYPKG <uid> <keypackage>` | response to KEYPKG GET | 12.5 |
-| `WELCOME <id> <welcome>` | a Welcome, live or in response to WELCOME LIST or WELCOME GET | 12.8 |
+| `KEYPKG <uid> <keypackage> <secret>` | response to KEYPKG GET | 12.5 |
+| `WELCOME <id> <welcome> [tree=<tree>]` | a Welcome, live or in response to WELCOME LIST or WELCOME GET | 12.8 |
 | `BACKUP <generation> <hash> <key> [files=<list>]` | response to BACKUP GET | 12.13 |
 | `NOTICE <message...>` | information | 8.4 |
 | `OP <uid>` | response to ADMIN OPS | 10.1 |

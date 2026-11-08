@@ -27,7 +27,10 @@ FETCH <box> after=<position> [limit=<n>] [leaf=<n>]
   there are more. `after` may be `0`. `limit` is at least 1 and
   defaults to 50. A server MAY cap `limit`, but MUST allow at least 50,
   and MAY return fewer posts than asked for.
-- **`leaf`** asks for a light client's view of a public room (12.6).
+- **`leaf`** asks for a light client's view of a public room (12.6): the
+  event line of each commit then carries an AnnotatedCommit for leaf
+  `<n>` in place of the commit. A box that is not a public room's gets
+  `ERR invalid`.
 
 These commands need an anonymous or guest connection. A box that does
 not exist gets `ERR not-found`. A server MAY limit how many mailboxes
@@ -61,7 +64,7 @@ epoch number:
   epoch `e`, or with `-` as an external commit in a public room (12.7),
   adds its `next` (5.2) to the set of epoch `e+1`.
 - TOKEN (below) adds a hash to the set of epoch `e+1`, for anyone who
-  holds a token of epoch `e`.
+  holds a token of epoch `e`, outside public rooms.
 - POST checks a post's token against the set of the post's epoch.
 
 ```
@@ -73,11 +76,15 @@ TOKEN <box> <epoch> <token> <hash>
 Adds `<hash>`, a SHA-384 hash in base64 with padding, to the set of
 epoch `<epoch>` + 1, if `<token>` is a send token of epoch `<epoch>`,
 checked as for POST (5.2): `ERR not-found` for a mailbox that does not
-exist, `ERR stale` for a token that is not in the set. `<epoch>` is a
-number (3.3). TOKEN needs an anonymous or guest connection. A hash that
-the set already holds gets `OK` and changes nothing. For the epoch just
+exist, `ERR stale` for a token that is not in the set, and for an
+`<epoch>` of 2^63-1, which has no next epoch. `<epoch>` is a number
+(3.3). TOKEN needs an anonymous or guest connection. A hash that the
+set already holds gets `OK` and changes nothing. For the epoch just
 before a moved mailbox's first epoch, the server checks the token
-against the set of the mailbox the group moved from (7.8).
+against the set of the mailbox the group moved from (7.8). In a public
+room, the server checks every commit and takes one for each epoch, so a
+wrong hash there leads to a resync (12.7), never to TOKEN: TOKEN for a
+public room's mailbox gets `ERR forbidden`.
 
 ```
 C: TOKEN ujzdegxdncf32epf3dhodzdoci 41 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
@@ -93,7 +100,7 @@ creates always holds that epoch's hash, unless the server has dropped it
   `e+1` gets `ERR stale`, sends TOKEN with its hash of epoch `e+1`'s
   token, then posts again. This is how an epoch gets its hash back when
   someone who holds a token of the epoch before has pushed it out of
-  the set with hashes of no use (below).
+  the set with commits of no use (below).
 - It also repairs a moved mailbox whose first epoch has a wrong hash
   (7.8).
 
@@ -103,10 +110,14 @@ since it can post already.
 **Bounds.** The sets are bounded, so that nobody can fill the server's
 storage with them, or push out the hashes that members use:
 
-- A set holds at most 64 hashes. When a full set gets a new hash, the
-  server drops the hash in it that was added first among those that no
-  post has used, or, if every hash in it has been used, the one that a
-  post used least recently.
+- A set keeps the hashes that commits and CREATE added apart from those
+  that TOKEN added: at most 16 of the first kind, and at most 64 of the
+  second. When one part of a set is full and gets a new hash, the
+  server drops from that part the hash that was added first among those
+  that no post has used, or, if every hash in it has been used, the one
+  that a post used least recently. So TOKEN never pushes out a hash
+  that a commit added, and only further commits for the same epoch,
+  each a post that the server keeps and limits, can do that.
 - The server keeps each set until no hash in it has been added or used
   for a retention period (7.5). It MAY keep fewer sets, but then MUST
   keep at least the 256 sets of the mailbox that were used most
@@ -126,12 +137,14 @@ every commit that carries a valid token. Devices then decide:
   apply. They ignore later commits for the same epoch, and invalid ones,
   and messages of epochs that those commits would have started.
 - **The checks are the same everywhere.** Whether a commit is valid
-  depends only on its group checks (12.7): the group's state, the commit,
-  and the `t` and `next` of its post. Checks against key files and the
-  key log never make a commit invalid, since devices fetch those at
-  different times; they only lead to repairs by later commits. So every
-  device that sees the same posts picks the same commit, however late it
-  looks.
+  depends only on its group checks (12.7), which depend only on the
+  group's state in the commit's epoch, the commit, and the `t` and
+  `next` of its post (and the `t` of the posts of the proposals it
+  applies). Implementations MUST NOT let validity depend on anything
+  else, such as earlier epochs, key files, the key log or their own
+  clock: checks against key files and the key log only lead to repairs
+  by later commits. So every device that sees the same posts picks the
+  same commit, whenever it joined the group and however late it looks.
 - **A committer checks that it won.** After the `OK` of its commit, a
   device fetches the posts before it. If an earlier commit for the same
   epoch is valid, its own lost: it applies the winner, and makes its
@@ -153,37 +166,51 @@ new mailbox after a removal (7.8).
 
 ### 7.3. Pseudonyms
 
-Each leaf has a **pseudonym**: 16 random bytes that its device picks
-when it creates the leaf, and puts in the RisalaAAD (12.9) of every
-PrivateMessage it posts in the group. A PublicMessage, whose sender the
-server reads anyway (12.6), carries an empty pseudonym, so that it does
-not tie the pseudonym to the leaf.
+Every PrivateMessage carries a **pseudonym** in its RisalaAAD (12.9):
+16 bytes that stand for its sender's leaf, so that the server can mute
+a sender without learning who it is (6.4). A PublicMessage, whose
+sender the server reads anyway (12.6), carries an empty pseudonym, so
+that it does not tie a pseudonym to a leaf.
 
-- A pseudonym belongs to its leaf, at its leaf index, from the commit
-  that adds the leaf until the commit that removes it. A fresh leaf
-  node, by commit or Update (12.3), does not change it, except in groups
-  whose `confirm` is `epochal`.
-- In an **epochal group** (12.10), pseudonyms last one period. A device
-  picks a new pseudonym whenever its new leaf key of a period takes
-  effect, and announces it in that period's ATTEST line. So the
-  pseudonyms of different periods cannot be linked to each other from
-  the posts.
+- **Outside public rooms,** a leaf's pseudonym is derived anew in each
+  epoch:
 
-The server sees pseudonyms, and can mute one (6.4). It does not learn
+  ```
+  pseudonym = MLS-Exporter("risala/1 pseudonym", leaf_index, 16)
+  ```
+
+  This is the exporter of the message's epoch [RFC9420], with the
+  sender's leaf index as a `uint32` [RFC9420] for its context. Every
+  member of the epoch computes it, and devices check it on each message
+  rather than pin it (12.9). The server cannot compute it, and sees it
+  change with every commit, so it cannot link a leaf's posts across
+  commits from the posts alone. Every leaf is refreshed at least weekly
+  (12.7), so a pseudonym lasts a week at most, and in an active group
+  far less.
+- **In a public room,** anyone can join and compute the exporter, the
+  server included, so a derived pseudonym would hide nothing. There a
+  device picks 16 random bytes as its leaf's pseudonym for each period
+  (12.10), when its new leaf key of the period takes effect, and
+  announces it in that period's ATTEST line. A device pins each leaf's
+  pseudonym for a period: the one in its ATTEST line for the period,
+  which must match the pseudonym of the message that carries it, or,
+  for a leaf that sends without attesting, such as a guest's, the one
+  in its first PrivateMessage of the period. It ignores PrivateMessages
+  from the leaf that carry another in that period. So the pseudonyms of
+  different periods cannot be linked to each other from the posts, and
+  a member cannot dodge a mute by changing its pseudonym, short of a new
+  join or the next period.
+
+The server sees pseudonyms. It can mute one in a public room (6.4). An
+operator's mute in another mailbox (10.4) lasts only until the next
+commit, which changes every pseudonym there. The server does not learn
 from a pseudonym whose leaf it is, but may guess it from timing and
 network addresses: for example, from a public room's commits, which
 show their leaves, and from the first post of a new pseudonym soon
 after one of them (Section 14). It does not limit posts per pseudonym,
 since anyone who holds the token can post under any pseudonym (5.2).
-
-Members see pseudonyms too, since the RisalaAAD is authenticated by MLS.
-A device pins each leaf's pseudonym: the one in the first PrivateMessage
-it gets from that leaf, or in an epochal group, the one in the leaf's
-ATTEST line for the current period, which must match the pseudonym of
-the message that carries it. It ignores PrivateMessages from the leaf
-that carry another. So a member cannot dodge a mute by changing it,
-short of a new leaf, which needs an invitation in a private room and a
-new join in a public one, or, in an epochal group, the next period.
+Members see pseudonyms too, since the RisalaAAD is authenticated by
+MLS, and ignore a member's posts under any pseudonym but its own.
 
 ### 7.4. Catching Up
 
@@ -239,8 +266,9 @@ So, besides the random order and starting points above, devices SHOULD:
   they learned of from a Welcome (12.8), so that the FOLLOW does not
   match the WELCOME line on the signed-in connection;
 - close their anonymous and signed-in connections at independent random
-  times, rather than all at once, and send QUIT (9.2) only on the
-  connections they are closing;
+  times, each up to 10 minutes after the device stops needing it,
+  rather than all at once, and send QUIT (9.2) only on the connections
+  they are closing;
 - not send a `cid` again on another connection (7.6);
 - leave `quiet` out of FOLLOW (9.2), and drop pushes that arrive while
   the app is showing the conversation, unless the battery cost is too
@@ -357,17 +385,34 @@ do not move: their box is public, and anyone not banned may join.
   after removing someone for abuse, who is the member most likely to
   flood the old mailbox. A group MAY also move at other times, for
   example when its mailbox is flooded.
-- **How.** The device picks a new box (5.2) and makes a commit in the
-  epoch that the removal created, or a later one, holding one
-  GroupContextExtensions
-  proposal that changes only the `box` of the conversation extension
-  (12.4), and no other proposal. Before it posts this commit to the old
-  mailbox, it creates the new mailbox with
-  `CREATE <box> <group-id> <token-hash> epoch=<e>`, where `<e>` is the
-  epoch the move creates, and `<token-hash>` the hash of that epoch's
-  send token. The server accepts this only if it holds a mailbox of the
-  same group id (`ERR not-found`), and links the new mailbox to the
-  newest such one, for TOKEN (7.2).
+- **How.** The device makes a commit in the epoch that the removal
+  created, or a later one, holding one GroupContextExtensions proposal
+  that changes only the `box` of the conversation extension (12.4), and
+  no other proposal. The new box is not chosen but derived, from the
+  exporter of the epoch the commit is made in [RFC9420]:
+
+  ```
+  box = MLS-Exporter("risala/1 box", "", 16)
+  ```
+
+  Every member of that epoch computes it, and devices treat a move to
+  any other box as invalid (12.7). So the removed member cannot learn
+  it, and no member can move the group to a mailbox that cannot be
+  used, such as another group's or one that is never created.
+- **Creating it.** Before it posts the move to the old mailbox, the
+  device creates the new one with
+  `CREATE <box> <group-id> <token-hash> epoch=<e> from=<old> token=<token>`
+  (5.2), where `<e>` is the epoch the move creates, `<token-hash>` the
+  hash of that epoch's send token, `<old>` the old mailbox's box, and
+  `<token>` the send token of epoch `<e>`-1. The server accepts this
+  only if `<old>` is a mailbox with the same group id (`ERR not-found`)
+  whose set for epoch `<e>`-1 holds `<token>` (`ERR stale`), and links
+  the new mailbox to `<old>`, for TOKEN (7.2). So only a member of the
+  epoch before the move can create it. If the box is already the
+  mailbox of that group from epoch `<e>`, the server replies `OK` and
+  changes nothing: two members who both move find the same box, and a
+  member that finds the new mailbox missing after a move creates it the
+  same way.
 - **Why the epoch after.** The removal is encrypted for an epoch the
   removed member is in, so it could read a new box there. The epoch the
   removal creates is the first one it cannot read.
@@ -380,7 +425,7 @@ do not move: their box is public, and anyone not banned may join.
   whether its move won. A move that lost leaves a new mailbox that no
   one uses, which ends as 7.5 says.
 - **Wrong hashes.** If the new mailbox does not take a member's token for
-  the move's epoch, for example because whoever moved it gave a wrong
+  the move's epoch, for example because whoever created it gave a wrong
   hash, the member sends TOKEN to the new mailbox with its token of the
   epoch before, which the server checks against the old mailbox's set
   (7.2).

@@ -44,7 +44,7 @@ no members, no roles and no settings. A private conversation's box is
 known only to its members, and the server cannot tell who they are.
 
 ```
-CREATE <box> <group-id> <token-hash> [epoch=<epoch>]
+CREATE <box> <group-id> <token-hash> [epoch=<epoch> from=<box> token=<token>]
 CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>
 ```
 
@@ -60,19 +60,41 @@ for epoch 0 (7.2), in base64 with padding.
   for a guest's report conversation (4.2). With `epoch`, a number
   greater than 0, it creates the new mailbox of a group that is moving
   (7.8): the mailbox starts at that epoch, and `<token-hash>` is the
-  hash of that epoch's token.
+  hash of that epoch's token. `from` and `token` then come too: `from`
+  is the box of the mailbox the group moves from, and `token` the
+  group's send token for the epoch before `epoch`, in base64 with
+  padding. Each of the three options needs the other two
+  (`ERR bad-syntax`).
 - **The second form** creates a public room named `<room>` (6.1). It
   needs a signed-in connection. `<groupinfo>` and `<tree>` are the
   group's GroupInfo and ratchet tree (12.2), each in base64 with padding
   or as a blob-ref (12.12), which the server checks as in 12.6: one
   leaf, whose credential names the connection's identity, and a
   conversation extension of kind `public_room` that names this server,
-  `<box>` and `<room>`, with that identity as an owner.
+  `<box>` and `<room>`, with that identity as an owner. As for a
+  commit's (12.6), the GroupInfo carries the `external_pub` extension
+  and no `ratchet_tree` extension, its group context's tree hash is
+  that of `<tree>`, and its signer is the one leaf (`ERR invalid`).
 
 The server replies `ERR name-taken` to a box it has seen before, to a
 room name that is in use, and, without `epoch`, to a group id it has
-seen before. With `epoch`, the group id must be that of a mailbox the
-server holds (`ERR not-found`, 7.8). A server never uses a box again,
+seen before. With `epoch`, `from` must be a mailbox that the server
+holds with the same group id (`ERR not-found`), whose token set for the
+epoch before `epoch` holds `token` (`ERR stale`, 7.2). A box that is
+already the mailbox of that group from that epoch gets `OK`, and
+nothing changes (7.8).
+
+```
+C: CREATE m4qkz7xw2rjv5tbnhc3pfyd6ea q1Zx8bN3vR7tY2wK5mP9sD4fG6hJ0lC3xV8bN1mQ2wE= OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
+S: OK
+```
+
+The new mailbox of a group whose move creates epoch 42 (7.8):
+
+```
+C: CREATE 7tz3w5ka2qnmxhfyvd4pcr6bje q1Zx8bN3vR7tY2wK5mP9sD4fG6hJ0lC3xV8bN1mQ2wE= OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm epoch=42 from=m4qkz7xw2rjv5tbnhc3pfyd6ea token=Xk2pV9rT4mW7qZ1nB8cF3sH6jL0dG5yA2eR9uK4oP1w=
+S: OK
+``` A server never uses a box again,
 even once its mailbox is gone (7.5, 10.4), and MAY remember boxes and
 group ids by their hashes only.
 
@@ -106,7 +128,8 @@ checks that:
    `0x0020` and its version `mls10` (12.2). Its authenticated data is a
    RisalaAAD (12.9) with the fields its content type needs, and a
    pseudonym of 16 bytes in a PrivateMessage and an empty one in a
-   PublicMessage. A commit has `next`, and nothing else does
+   PublicMessage. A commit has `next`, and nothing else does; a commit
+   in a public room has `groupinfo`, and nothing else does
    (`ERR invalid`).
 3. The SHA-384 hash of `<token>` is one of the token hashes it holds for
    the message's epoch (7.2), compared in constant time
@@ -138,8 +161,8 @@ server stores the post as 4.2 says: with its box, seq, time, message
 and, for a commit, `next`, only.
 
 ```
-C: POST ujzdegxdncf32epf3dhodzdoci 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= AAEAAwBA… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
-S: @seq=9310;t=2026-11-09T08:12:44.051Z POST ujzdegxdncf32epf3dhodzdoci AAEAAwBA… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
+C: POST m4qkz7xw2rjv5tbnhc3pfyd6ea 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= AAEAAgBA… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
+S: @seq=9310;t=2026-11-09T08:12:44.051Z POST m4qkz7xw2rjv5tbnhc3pfyd6ea AAEAAgBA… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
 S: OK seq=9310
 ```
 

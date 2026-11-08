@@ -53,7 +53,8 @@
   `log` 4 and `retire` 5. **Key log entry types** (4.5): `record` 1 and
   `handoff` 2. The value 0 of each is reserved.
 - **Labels.** All of them carry the protocol version (2.4):
-  - the MLS exporter label `risala/1 send` (7.2);
+  - the MLS exporter labels `risala/1 send` (7.2), `risala/1 pseudonym`
+    (7.3) and `risala/1 box` (7.8);
   - the RisalaSign labels `record` (4.4), `pair` (4.8), `keypackage`
     (12.3), `period` and `attest` (12.10), each signed with the prefix
     `risala/1 ` (4.3);

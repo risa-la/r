@@ -15,8 +15,9 @@
 - [MLS-EXT] Robert, R., "The Messaging Layer Security (MLS)
   Extensions", Internet-Draft draft-ietf-mls-extensions-11, November
   2026, work in progress.
-- [MLS-PARTIAL] Internet-Draft draft-ietf-mls-partial-02, partial
-  clients for MLS, May 2026, work in progress.
+- [MLS-PARTIAL] Kiefer, F., Bhargavan, K., Barnes, R. L., Alwen, J.,
+  and M. Mularczyk, "Partial MLS", Internet-Draft
+  draft-ietf-mls-partial-02, May 2026, work in progress.
 - [MLS-PQ] Mahy, R. and R. Barnes, "ML-KEM and Hybrid Cipher Suites
   for Messaging Layer Security", Internet-Draft
   draft-ietf-mls-pq-ciphersuites-07, November 2026, work in progress.
