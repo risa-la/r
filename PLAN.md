@@ -1132,6 +1132,42 @@ Open:
       reconnect, or until that device joins by external commit.
       Messages sent before then could never be read by the other side.
 
+48. **Server follow-ups for M5a** (4.8, 10.4, 12.5, 12.6), on 2026-11-08.
+    Implementation choices, no spec change:
+    - **Purges reach every conversation.** ADMIN PURGE and UNREGISTER
+      `purge=yes` delete ENC events as well as MSG, in direct
+      conversations as well as rooms, each with a DELETE event as in 5.4:
+      the placeholder loses its payload and `frank`. Rooms come first, in
+      name order, then direct conversations in the order they started.
+      An identity that unregisters has left its conversations by then, so
+      only the other participant gets the DELETE events, as in rooms.
+    - **COMMIT fetches key files without the conversation's lock.** It
+      checks what it can under the lock and notes the key files it lacks.
+      It then lets go of the lock, fetches them, takes the lock again,
+      checks the conversation again and that the group is still in the
+      commit's epoch, and runs the checks again. Another commit that came
+      first gets `stale`, before `unavailable` or a refusal that needs a
+      key file, as rule 1 comes first. If membership changed meanwhile
+      so that other key files are needed, it goes round again, at most
+      three times, then replies `unavailable`. A slow key host no longer
+      holds up the conversation.
+    - **Key files fetched afresh for COMMIT** close the connections of
+      keys they no longer list, and mark those keys' leaves for removal,
+      as at AUTH and KEYPKG GET. That is safe now that no conversation's
+      lock is held while fetching.
+    - **A proposal by reference gets `forbidden`** (rule 4), not
+      `invalid`. The server never has the proposal it names, so OpenMLS
+      fails the commit as missing a proposal, and risalad answers with
+      rule 4's refusal, which says what is wrong. An Update by value
+      cannot be made with OpenMLS, and is not valid MLS (`invalid`).
+    - **Tests of 12.5's refusals.** A proposal by reference (an Update),
+      a PSK proposal by value, and a confirmation tag that differs from
+      the GroupInfo's and nothing else, are tested end to end. OpenMLS
+      cannot build an external commit that removes another device's
+      leaf, or more than one leaf, so rule 4 is a function of its own,
+      tested on crafted proposals. Rule 5's limit is a parameter of the
+      commit check, tested with a limit of 2 rather than 513 leaves.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
