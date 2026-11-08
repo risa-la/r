@@ -39,7 +39,12 @@ async fn answer(
     events: &[String],
     last: &str,
 ) {
-    peer.expect(&format!("@ref={r} {command}")).await;
+    // A command with tags of its own gets `ref` first among them.
+    let line = match command.strip_prefix('@') {
+        Some(tagged) => format!("@ref={r};{tagged}"),
+        None => format!("@ref={r} {command}"),
+    };
+    peer.expect(&line).await;
     for e in events {
         peer.send(e).await;
     }
@@ -55,7 +60,7 @@ async fn rooms_and_reports() {
         answer(
             p,
             5,
-            "DELETE #general 2",
+            "@id=k1 DELETE #general 2",
             &[ev(3, &format!("{me} DELETE #general 2"))],
             "OK seq=3",
         )

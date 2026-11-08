@@ -301,6 +301,9 @@ pub enum Command {
         conv: Conv,
         /// The message to delete.
         seq: Seq,
+        /// The `id` tag: the conversation's id (5.1) the client expects.
+        /// The server deletes nothing if it differs (5.4).
+        id: Option<Id>,
     },
     /// `UPLOAD <size> <type> <name...>` (5.6): ask to upload a file.
     Upload {
@@ -1157,7 +1160,8 @@ impl Command {
             "DELETE" => {
                 let conv = tok(&mut p)?;
                 let seq = last(p)?;
-                Command::Delete { conv, seq }
+                let id = tag_value(line.tags(), "id", "id needs a value")?;
+                Command::Delete { conv, seq, id }
             }
             // 6.1
             "LIST" => Command::List(RoomPage::parse(p)?),
@@ -1684,7 +1688,13 @@ impl Command {
                 }
                 b.token(conv).text(text);
             }
-            Command::Delete { conv, seq } | Command::Read { conv, seq } => {
+            Command::Delete { conv, seq, id } => {
+                if let Some(id) = id {
+                    b.tag("id", id);
+                }
+                b.token(conv).token(seq);
+            }
+            Command::Read { conv, seq } => {
                 b.token(conv).token(seq);
             }
             Command::Report {
@@ -2438,9 +2448,23 @@ mod tests {
             canon("delete #A 12", "DELETE #a 12").command,
             Command::Delete {
                 conv: Conv::Room(room("#a")),
-                seq: seq(12)
+                seq: seq(12),
+                id: None,
             }
         );
+        assert_eq!(
+            canon(
+                "@id=k3f9q2abcdef delete #a 12",
+                "@id=k3f9q2abcdef DELETE #a 12"
+            )
+            .command,
+            Command::Delete {
+                conv: Conv::Room(room("#a")),
+                seq: seq(12),
+                id: Some("k3f9q2abcdef".parse().unwrap()),
+            }
+        );
+        is_syntax("@id DELETE #a 12");
         is_syntax("DELETE #a");
         is_syntax("DELETE #a 0");
         is_syntax("DELETE #a 012");

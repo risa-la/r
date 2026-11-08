@@ -222,10 +222,12 @@ async fn delete_erases_a_message_with_its_edits_and_reactions() {
     assert_eq!(sam.lines(), [event.clone(), "@ref=d OK seq=7".into()]);
     assert_eq!(bob.lines(), [event]);
 
-    // Once only.
+    // Again, it records nothing and names the DELETE that did it, also
+    // for an edit that went with its message (5.4).
     h.send(&sam, "delete #general 3").await;
     h.send(&sam, "delete #general 4").await;
-    assert_eq!(sam.lines(), ["ERR not-found no such message"; 2]);
+    assert_eq!(sam.lines(), ["OK seq=7"; 2]);
+    assert!(bob.lines().is_empty());
 
     h.send(&sam, "history #general after=2").await;
     assert_eq!(
@@ -360,10 +362,14 @@ async fn authors_delete_where_they_can_no_longer_read() {
             "OK seq=5",
         ]
     );
-    // Only once.
+    // Again, it is safe to resend: the same seq, nothing recorded.
     h.send(&alice, "delete #general 1").await;
-    assert_eq!(alice.lines(), ["ERR not-found no such room"]);
+    assert_eq!(alice.lines(), ["OK seq=5"]);
     assert_eq!(stored(&h, "#general")[0], format!("1 {ALICE} MSG deleted"));
+    assert_eq!(stored(&h, "#general").len(), 5);
+    // With the id of an older room of the same name, nothing (5.4).
+    h.send(&alice, "@id=k3f9q2abcdef delete #general 1").await;
+    assert_eq!(alice.lines(), ["ERR not-found no such message"]);
 }
 
 #[tokio::test]

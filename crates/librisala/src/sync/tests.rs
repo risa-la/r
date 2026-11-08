@@ -1964,7 +1964,7 @@ fn deleting_goes_through_the_outbox() {
     assert_eq!(item.delete, Some(seq(2)));
     assert_eq!(item.conv_id, Some("k1".parse().unwrap()));
     h.reply(r, &["CONV #general k1 3 0"], "OK");
-    let d = h.expect("DELETE #general 2");
+    let d = h.expect("@id=k1 DELETE #general 2");
     h.line(&ev(4, "from=alice@example.org DELETE #general 2"));
     h.reply(d, &[], "OK seq=4");
     assert_eq!(
@@ -1987,12 +1987,12 @@ fn a_delete_is_sent_again_after_a_reconnect() {
         h.joined("k1", 3);
         let (id, out) = h.engine.delete(&conv("#general"), seq(3)).unwrap();
         h.absorb(out);
-        h.expect("DELETE #general 3");
+        h.expect("@id=k1 DELETE #general 3");
         // The connection drops before the OK; the DELETE went through.
         let r = h.reconnect();
         h.reply(r, &["CONV #general k1 4 0"], "OK");
         let fill = h.expect("HISTORY #general after=3 limit=50");
-        let d = h.expect("DELETE #general 3");
+        let d = h.expect("@id=k1 DELETE #general 3");
         h.reply_s(
             fill,
             &[ev(4, &format!("from={me} DELETE #general 3"))],
@@ -2013,7 +2013,7 @@ fn a_delete_of_a_message_not_deleted_that_is_not_found_fails() {
     h.joined("k1", 3);
     let (id, out) = h.engine.delete(&conv("#general"), seq(9)).unwrap();
     h.absorb(out);
-    let d = h.expect("DELETE #general 9");
+    let d = h.expect("@id=k1 DELETE #general 9");
     h.reply(d, &[], "ERR not-found");
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
@@ -2033,7 +2033,7 @@ fn authors_delete_in_rooms_they_left() {
     assert!(!h.conv("#general").joined);
     let (id, out) = h.engine.delete(&conv("#general"), seq(2)).unwrap();
     h.absorb(out);
-    let d = h.expect("DELETE #general 2");
+    let d = h.expect("@id=k1 DELETE #general 2");
     h.reply(d, &[], "OK seq=7");
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
@@ -2046,7 +2046,7 @@ fn authors_delete_in_rooms_they_left() {
     h.absorb(out);
     h.idle();
     h.reply(r, &[], "OK");
-    h.expect("DELETE #general 1");
+    h.expect("@id=k1 DELETE #general 1");
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
         OutboxState::Sending

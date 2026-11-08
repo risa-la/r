@@ -46,6 +46,10 @@ pub struct PurgeQuery {
 ///
 /// Every method blocks, like the rest of [`super::Store`].
 pub trait MessageStore {
+    /// The seq of the oldest DELETE event whose target is `target` (5.4),
+    /// if any. For DELETE of a message that is already deleted.
+    fn delete_of(&self, conv: ConvKey, target: Seq) -> Result<Option<Seq>>;
+
     /// The seq of the reaction `from` sent to message `target` with exactly
     /// `text` (escaped), at or after `since` if given, and not deleted
     /// (5.3). The oldest, if there are several.

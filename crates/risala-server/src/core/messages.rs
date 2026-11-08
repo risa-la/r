@@ -70,7 +70,7 @@ impl Inner {
         command: Command,
     ) -> Outcome {
         match command {
-            Command::Delete { conv, seq } => self.delete(uid, conv, seq).await,
+            Command::Delete { conv, seq, id } => self.delete(uid, conv, seq, id).await,
             Command::Related {
                 conv,
                 first,
@@ -257,19 +257,24 @@ impl Inner {
     }
 
     /// DELETE (5.4), in rooms.
-    async fn delete(&self, uid: &Uid, conv: Conv, target: Seq) -> Outcome {
+    async fn delete(&self, uid: &Uid, conv: Conv, target: Seq, id: Option<Id>) -> Outcome {
         // M5a: direct conversations. Guests never get here with one (4.2).
         let Conv::Room(room) = conv else {
             return Err(not_supported());
         };
         let mut guard = self.lock_room(&room).await?;
         let st = &mut *guard;
+        // A seq meant for an older room of the same name names nothing
+        // here (5.4).
+        if id.is_some_and(|id| id != st.id) {
+            return Err(no_message());
+        }
         let key = st.key;
         // M5a: ENC events too.
         let event = self
             .db(move |s| s.event(key, target))
             .await?
-            .filter(|e| matches!(e.kind, EventKind::Msg { .. }) && !e.deleted);
+            .filter(|e| matches!(e.kind, EventKind::Msg { .. }));
         // Authors may delete their own messages even where they can no
         // longer read, so this comes before the reading rules (5.4).
         let own = event.as_ref().is_some_and(|e| self.is_author(uid, e));
@@ -286,6 +291,29 @@ impl Inner {
                     "only moderators may delete others' messages",
                 ));
             }
+        }
+        // Already deleted: the DELETE that did it, so that resending is safe
+        // (5.4). An edit or reaction may have gone with its message.
+        if let Some(event) = event.filter(|e| e.deleted) {
+            let parent = match &event.kind {
+                EventKind::Msg {
+                    relation: Some(Relation::Edit(p) | Relation::React(p)),
+                    ..
+                } => Some(*p),
+                _ => None,
+            };
+            let found = self
+                .db(move |s| match s.delete_of(key, target)? {
+                    Some(seq) => Ok(Some(seq)),
+                    None => parent.map_or(Ok(None), |p| s.delete_of(key, p)),
+                })
+                .await?;
+            return match found {
+                Some(seq) => Ok(Some(OkResponse::new().with_seq(seq))),
+                // Deleted with no DELETE left to name, for example one that
+                // expired since (7.5).
+                None => Err(no_message()),
+            };
         }
         let event = NewEvent {
             t: self.now(),

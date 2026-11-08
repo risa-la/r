@@ -1854,9 +1854,13 @@ impl SyncEngine {
         })?;
         for item in to_send {
             let command = match item.delete {
+                // The id the entry is bound to, so that the server deletes
+                // nothing in a room created again under the same name
+                // (5.4).
                 Some(seq) => Command::Delete {
                     conv: item.conv,
                     seq,
+                    id: item.conv_id.clone(),
                 },
                 None => Command::Msg {
                     conv: item.conv,

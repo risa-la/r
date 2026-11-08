@@ -51,6 +51,18 @@ impl MessageStore for SqliteStore {
             .transpose()
     }
 
+    fn delete_of(&self, conv: ConvKey, target: Seq) -> Result<Option<Seq>> {
+        self.conn()
+            .prepare_cached(
+                "SELECT seq FROM events WHERE conv = ? AND target = ? AND verb = 'DELETE' \
+                 ORDER BY seq LIMIT 1",
+            )?
+            .query_row(params![conv.0, sql_seq(target)], |row| row.get::<_, i64>(0))
+            .optional()?
+            .map(seq)
+            .transpose()
+    }
+
     fn related(&self, conv: ConvKey, q: RelatedQuery) -> Result<Page> {
         if q.first > q.last {
             return Ok(Page {

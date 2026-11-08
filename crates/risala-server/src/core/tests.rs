@@ -2130,6 +2130,9 @@ impl Pause {
 // own block.
 
 impl crate::store::MessageStore for Flaky {
+    fn delete_of(&self, c: ConvKey, t: Seq) -> crate::store::Result<Option<Seq>> {
+        self.inner.delete_of(c, t)
+    }
     fn reaction(
         &self,
         c: ConvKey,
