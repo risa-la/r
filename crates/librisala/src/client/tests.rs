@@ -110,8 +110,10 @@ async fn area_methods_say_they_are_not_implemented() {
         "create_identity",
     );
     not_implemented(c.own_identities().map(drop), "own_identities");
-    not_implemented(c.conversations(account).map(drop), "conversations");
-    not_implemented(c.send_text(conv, "hi", None).await.map(drop), "send_text");
+    not_implemented(
+        c.join_public_room(account, "#general").await.map(drop),
+        "join_public_room",
+    );
     not_implemented(c.leaf_status(conv).map(drop), "leaf_status");
     not_implemented(c.fetch_file(conv, message).await.map(drop), "fetch_file");
     not_implemented(c.backup_now(account).await.map(drop), "backup_now");
