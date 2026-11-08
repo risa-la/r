@@ -728,6 +728,14 @@ Open:
     Implementation choice: the report rate limit is
     `limits.reports_per_hour` in the configuration, 30 by default.
 
+34. **Found while testing M4's client** (librisala only, no spec change),
+    confirmed with the user on 2026-11-08: an identity's messages for a
+    room it has left, or was kicked or banned from, fail with
+    `NotInRoom` instead of waiting until it joins again, and `send` to
+    such a room gets `NotJoined`. DELETEs still go out (5.4). A guest's
+    messages still wait, since a guest rejoins its rooms by itself after
+    a reconnect.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

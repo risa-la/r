@@ -911,7 +911,8 @@ fn opt_text(escaped: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboxStatus {
     /// Waiting to be sent, until the account is in the room on a
-    /// connection.
+    /// connection. If an identity turns out to have left the room, it
+    /// fails with [`FailKind::NotInRoom`] instead.
     Queued,
     /// Sent, with no answer yet.
     Sending,
@@ -945,6 +946,9 @@ pub enum FailKind {
     RoomChanged,
     /// The room was dropped (10.4).
     Dropped,
+    /// The account left the room, or was kicked or banned from it, before
+    /// it went out. It was not sent.
+    NotInRoom,
     /// The server refused it; the error code is in `code` (3.7).
     Rejected,
     /// The connection dropped before the answer, and sending it again was
@@ -995,6 +999,7 @@ impl From<OutboxItem> for OutboxEntry {
                 kind: match &why {
                     FailReason::RoomChanged => FailKind::RoomChanged,
                     FailReason::Dropped => FailKind::Dropped,
+                    FailReason::NotInRoom => FailKind::NotInRoom,
                     FailReason::Unconfirmed => FailKind::Unconfirmed,
                     FailReason::Rejected(_) => FailKind::Rejected,
                     FailReason::Invalid => FailKind::Invalid,
@@ -1002,6 +1007,7 @@ impl From<OutboxItem> for OutboxEntry {
                 reason: match &why {
                     FailReason::RoomChanged => "the room was replaced by a new one".to_owned(),
                     FailReason::Dropped => "the room was dropped".to_owned(),
+                    FailReason::NotInRoom => "you are no longer in the room".to_owned(),
                     FailReason::Unconfirmed => "possibly not sent".to_owned(),
                     FailReason::Invalid => "it could not be sent as it is".to_owned(),
                     FailReason::Rejected(code) => format!("refused: {code}"),

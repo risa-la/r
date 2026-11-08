@@ -58,6 +58,11 @@ pub enum FailReason {
     RoomChanged,
     /// The room was dropped (10.4).
     Dropped,
+    /// The account left the room, or was kicked or banned from it, before
+    /// the message went out. Sending it later, after a new JOIN, would put
+    /// it out of context (PLAN.md 5, item 34). Never for guests, who rejoin
+    /// their rooms by themselves after a reconnect.
+    NotInRoom,
     /// The server answered with an error.
     Rejected(ErrorCode),
     /// The connection dropped before the answer, and resending is not safe:
@@ -75,6 +80,7 @@ impl fmt::Display for FailReason {
         match self {
             FailReason::RoomChanged => f.write_str("room-changed"),
             FailReason::Dropped => f.write_str("dropped"),
+            FailReason::NotInRoom => f.write_str("not-in-room"),
             FailReason::Unconfirmed => f.write_str("unconfirmed"),
             FailReason::Invalid => f.write_str("invalid"),
             FailReason::Rejected(code) => write!(f, "rejected {code}"),
@@ -87,6 +93,7 @@ impl FailReason {
         Ok(match s {
             "room-changed" => FailReason::RoomChanged,
             "dropped" => FailReason::Dropped,
+            "not-in-room" => FailReason::NotInRoom,
             "unconfirmed" => FailReason::Unconfirmed,
             "invalid" => FailReason::Invalid,
             _ => match s.strip_prefix("rejected ") {
@@ -422,6 +429,29 @@ impl Tx<'_> {
             params![id.0, conv_id.as_str()],
         )?;
         self.changed(Change::Outbox { id });
+        Ok(())
+    }
+
+    /// Fails the messages of `conv` still waiting to be sent, not DELETEs:
+    /// the account left the room (PLAN.md 5, item 34). Authors may still
+    /// delete their own messages there (5.4). Entries already sent wait for
+    /// their answer.
+    pub(crate) fn fail_queued_messages(
+        &mut self,
+        account: AccountId,
+        conv: &Conv,
+    ) -> Result<(), StoreError> {
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn().prepare_cached(
+                "SELECT id FROM outbox WHERE account = ?1 AND conv = ?2
+                     AND state = 'queued' AND verb = 'MSG'",
+            )?;
+            stmt.query_map(params![account.0, conv.as_str()], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        for id in ids {
+            self.outbox_failed(OutboxId(id), FailReason::NotInRoom)?;
+        }
         Ok(())
     }
 

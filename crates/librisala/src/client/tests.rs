@@ -475,6 +475,7 @@ fn errors_carry_kinds_to_localize() {
     for (why, kind, maybe) in [
         (FailReason::RoomChanged, FailKind::RoomChanged, false),
         (FailReason::Dropped, FailKind::Dropped, false),
+        (FailReason::NotInRoom, FailKind::NotInRoom, false),
         (FailReason::Unconfirmed, FailKind::Unconfirmed, true),
         (FailReason::Invalid, FailKind::Invalid, false),
         (

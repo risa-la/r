@@ -2111,3 +2111,60 @@ fn a_delete_for_a_dropped_room_is_never_sent() {
         OutboxState::Failed(FailReason::RoomChanged)
     );
 }
+
+#[test]
+fn messages_for_a_room_an_identity_left_fail() {
+    // PLAN.md 5, item 34: an identity's queued messages for a room it has
+    // left fail, and new ones are refused. DELETEs still go out (5.4).
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    let (msg, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("hi"))
+        .unwrap();
+    h.absorb(out);
+    let (delete, out) = h.engine.delete(&conv("#general"), seq(2)).unwrap();
+    h.absorb(out);
+    h.idle();
+    // SYNC does not list the room: kicked meanwhile.
+    h.reply(r, &[], "OK");
+    assert!(!h.conv("#general").joined);
+    assert_eq!(
+        h.store.outbox_item(msg).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::NotInRoom)
+    );
+    h.expect("@id=k1 DELETE #general 2");
+    assert_eq!(
+        h.store.outbox_item(delete).unwrap().unwrap().state,
+        OutboxState::Sending
+    );
+    assert!(matches!(
+        h.engine.send(&conv("#general"), &Draft::text("again")),
+        Err(SyncError::NotJoined(_))
+    ));
+}
+
+#[test]
+fn a_guests_messages_wait_for_its_rooms() {
+    // A guest rejoins its rooms by itself after a reconnect (4.2), so its
+    // messages wait rather than fail.
+    let mut h = H::new("~sam");
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    let (msg, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("hi"))
+        .unwrap();
+    h.absorb(out);
+    h.reply(r, &[], "OK");
+    assert_eq!(
+        h.store.outbox_item(msg).unwrap().unwrap().state,
+        OutboxState::Queued
+    );
+    assert!(
+        h.engine
+            .send(&conv("#general"), &Draft::text("again"))
+            .is_ok()
+    );
+}

@@ -472,9 +472,16 @@ impl SyncEngine {
         check
             .validate()
             .map_err(|e| SyncError::Invalid(e.to_string()))?;
-        let (account, now) = (self.account, self.now());
+        let (account, now, guest) = (self.account, self.now(), self.guest);
         let id = self.write(|tx| {
-            let bound = tx.conv_by_name(account, conv)?.and_then(|r| r.conv_id);
+            let row = tx.conv_by_name(account, conv)?;
+            // An identity that has left a room sends nothing more to it
+            // until it joins again (PLAN.md 5, item 34). A guest rejoins its
+            // rooms by itself after a reconnect, so its messages wait.
+            if !guest && conv.is_room() && row.as_ref().is_some_and(|r| !r.joined) {
+                return Ok(None);
+            }
+            let bound = row.and_then(|r| r.conv_id);
             if bound.is_none() && conv.is_room() {
                 return Ok(None);
             }
@@ -789,10 +796,11 @@ impl SyncEngine {
     /// The account is no longer in `conv`: stop storing its live events.
     fn left(&mut self, conv: &Conv) -> Result<(), SyncError> {
         self.live(conv).confirmed = None;
-        let account = self.account;
+        let (account, guest) = (self.account, self.guest);
         self.write(|tx| {
             if let Some(mut row) = tx.conv_by_name(account, conv)? {
                 tx.set_joined(&mut row, false)?;
+                left_outbox(tx, guest, &row)?;
             }
             Ok(())
         })
@@ -1107,6 +1115,7 @@ impl SyncEngine {
             for mut row in tx.convs(account)? {
                 if row.joined && !listed.contains(&row.name) && !newer.contains(&row.name) {
                     tx.set_joined(&mut row, false)?;
+                    left_outbox(tx, guest, &row)?;
                     gone.push(row.name);
                 }
             }
@@ -1307,7 +1316,7 @@ impl SyncEngine {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
             let head = ok.head().ok().flatten();
             let floor = self.head_floor(&conv, sent, floor);
-            let account = self.account;
+            let (account, guest) = (self.account, self.guest);
             self.write(|tx| {
                 let row = if joined {
                     Some(tx.conv_or_create(account, &conv)?)
@@ -1333,6 +1342,7 @@ impl SyncEngine {
                         tx.discard(&mut row, None)?;
                     }
                     tx.set_joined(&mut row, false)?;
+                    left_outbox(tx, guest, &row)?;
                 }
                 Ok(())
             })?;
@@ -1902,6 +1912,16 @@ fn learn(
         tx.note_head(row, head)?;
     }
     Ok(reset)
+}
+
+/// Fails the messages still queued for a room an identity has left
+/// (PLAN.md 5, item 34). A guest's wait, since it rejoins its rooms by
+/// itself after a reconnect (4.2).
+fn left_outbox(tx: &mut Tx<'_>, guest: bool, row: &ConvRow) -> Result<(), StoreError> {
+    if guest || !row.name.is_room() {
+        return Ok(());
+    }
+    tx.fail_queued_messages(row.account, &row.name)
 }
 
 /// The events of a HISTORY or RELATED reply that belong to `conv`.
