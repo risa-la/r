@@ -8,8 +8,9 @@
 //! conversations and their ids (5.1), events (5.2), room settings (6.2),
 //! the membership of identities (6.1), roles (6.3), invitations and bans
 //! (6.4), read markers (7.4), cids (7.6) and, from M3 and M4 on, identities,
-//! blocks, reports, uploads and push registrations. Guests are not stored
-//! (4.2), except for which rooms they are in, so that the PARTs of guests
+//! blocks, reports, uploads and push registrations, and from M5a the
+//! KeyPackages, pending Welcomes and key backups of Section 12. Guests are
+//! not stored (4.2), except for which rooms they are in, so that the PARTs of guests
 //! cut off by a crash are recorded when the server starts again.
 //!
 //! Appending an event assigns the next seq, stores the event and applies
@@ -17,6 +18,7 @@
 //! transaction, so a seq is never lost or used twice (5.2).
 
 mod admin;
+mod e2ee;
 mod messages;
 mod moderation;
 mod reports;
@@ -36,6 +38,10 @@ use risala_proto::types::{
 };
 
 pub use admin::{AdminStore, ServerBan};
+pub use e2ee::{
+    BackupAdded, BackupPage, E2eeStore, KeyPackageAdded, KeyPackageCount, NewKeyPackage,
+    PendingWelcome,
+};
 pub use messages::{MessageStore, PurgeQuery, RelatedQuery};
 pub use moderation::ModerationStore;
 pub use reports::{NewReport, ReportAdded, ReportRecord, ReportStore};
@@ -473,9 +479,10 @@ pub enum BlockAdded {
 /// Every method blocks. Implementations are shared between threads.
 ///
 /// M4's methods are in the supertraits [`MessageStore`], [`ModerationStore`],
-/// [`ReportStore`] and [`AdminStore`], one per area of work.
+/// [`ReportStore`] and [`AdminStore`], one per area of work, and those of
+/// encrypted conversations (M5a) in [`E2eeStore`].
 pub trait Store:
-    MessageStore + ModerationStore + ReportStore + AdminStore + Send + Sync + 'static
+    MessageStore + ModerationStore + ReportStore + AdminStore + E2eeStore + Send + Sync + 'static
 {
     /// Returns the server settings (10.6), first storing `defaults` for any
     /// that are not stored yet. This is how the configuration file's
@@ -573,8 +580,8 @@ pub trait Store:
 
     /// Deletes what the server keeps about the identity `uid` (4.8): its
     /// record and display name, hosted keys, memberships, roles,
-    /// invitations, read markers, blocks, cids, push registrations and
-    /// operator status. Room bans stay: they belong to the rooms. With
+    /// invitations, read markers, blocks, cids, push registrations,
+    /// operator status, KeyPackages, pending Welcomes and backups. Room bans stay: they belong to the rooms. With
     /// `retire`, the uid can never be registered again (4.8, 10.5).
     ///
     /// Events are not touched, and nothing is recorded: the caller records

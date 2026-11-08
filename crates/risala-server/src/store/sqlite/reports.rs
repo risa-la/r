@@ -226,6 +226,8 @@ impl ReportStore for SqliteStore {
                 "invites",
                 "room_bans",
                 "read_markers",
+                // Its pending Welcomes, with their commits (12.7).
+                "welcome_commits",
             ] {
                 tx.execute(&format!("DELETE FROM {table} WHERE conv = ?"), [key.0])?;
             }

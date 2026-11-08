@@ -16,6 +16,7 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
 mod admin;
+mod e2ee;
 mod messages;
 mod moderation;
 mod reports;
@@ -1077,9 +1078,18 @@ impl Store for SqliteStore {
                 "DELETE FROM cids WHERE author = ?",
                 "DELETE FROM push_registrations WHERE uid = ?",
                 "DELETE FROM operators WHERE uid = ?",
+                "DELETE FROM key_packages WHERE uid = ?",
+                "DELETE FROM pending_welcomes WHERE uid = ?",
+                "DELETE FROM backups WHERE uid = ?",
             ] {
                 tx.execute(sql, [uid.as_str()])?;
             }
+            // The Welcomes that no device has pending any more (12.7).
+            tx.execute(
+                "DELETE FROM welcome_commits WHERE NOT EXISTS \
+                 (SELECT 1 FROM pending_welcomes p WHERE p.commit_n = welcome_commits.n)",
+                [],
+            )?;
             if retire {
                 tx.execute(
                     "INSERT OR IGNORE INTO retired_names (name, retired) VALUES (?, ?)",

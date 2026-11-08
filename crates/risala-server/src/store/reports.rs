@@ -78,8 +78,8 @@ pub trait ReportStore {
     /// Drops the room `key` (10.4), in one transaction: from then on the
     /// store treats `key` as gone, as if the room had been deleted, and
     /// its name is free. Its settings, memberships, roles, invitations,
-    /// bans, read markers and cids are deleted. Reports stay. Its id is
-    /// never used again. Its events are left for
+    /// bans, read markers, cids and pending Welcomes are deleted. Reports
+    /// and backups stay. Its id is never used again. Its events are left for
     /// [`clear_dropped`](Self::clear_dropped), so that no one transaction
     /// deletes a large room's events; nothing can read them meanwhile.
     ///

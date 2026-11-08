@@ -2311,6 +2311,108 @@ impl crate::store::AdminStore for Flaky {
     }
 }
 
+impl crate::store::E2eeStore for Flaky {
+    fn add_key_package(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+        p: &crate::store::NewKeyPackage,
+        m: usize,
+        t: Timestamp,
+    ) -> crate::store::Result<crate::store::KeyPackageAdded> {
+        self.inner.add_key_package(u, k, p, m, t)
+    }
+    fn key_package_count(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+        t: Timestamp,
+    ) -> crate::store::Result<crate::store::KeyPackageCount> {
+        self.inner.key_package_count(u, k, t)
+    }
+    fn key_package_devices(&self, u: &Uid, t: Timestamp) -> crate::store::Result<Vec<PublicKey>> {
+        self.inner.key_package_devices(u, t)
+    }
+    fn take_key_packages(
+        &self,
+        u: &Uid,
+        e: Option<&PublicKey>,
+        l: &[PublicKey],
+        t: Timestamp,
+    ) -> crate::store::Result<Vec<(PublicKey, risala_proto::mls::KeyPackage)>> {
+        self.inner.take_key_packages(u, e, l, t)
+    }
+    fn prune_key_packages(&self, t: Timestamp) -> crate::store::Result<u64> {
+        self.inner.prune_key_packages(t)
+    }
+    fn add_welcomes(
+        &self,
+        c: ConvKey,
+        s: Seq,
+        w: &risala_proto::mls::Welcome,
+        t: &risala_proto::mls::RatchetTree,
+        d: &[(Uid, PublicKey)],
+    ) -> crate::store::Result<Vec<risala_proto::names::Id>> {
+        self.inner.add_welcomes(c, s, w, t, d)
+    }
+    fn pending_welcomes(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+    ) -> crate::store::Result<Vec<risala_proto::names::Id>> {
+        self.inner.pending_welcomes(u, k)
+    }
+    fn pending_welcome(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+        i: &risala_proto::names::Id,
+    ) -> crate::store::Result<Option<crate::store::PendingWelcome>> {
+        self.inner.pending_welcome(u, k, i)
+    }
+    fn delete_welcome(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+        i: &risala_proto::names::Id,
+    ) -> crate::store::Result<bool> {
+        self.inner.delete_welcome(u, k, i)
+    }
+    fn stored_devices(&self, u: &Uid) -> crate::store::Result<Vec<PublicKey>> {
+        self.inner.stored_devices(u)
+    }
+    fn forget_device(&self, u: &Uid, k: &PublicKey) -> crate::store::Result<()> {
+        self.inner.forget_device(u, k)
+    }
+    fn add_backup(
+        &self,
+        u: &Uid,
+        c: &risala_proto::names::Id,
+        e: u64,
+        b: &risala_proto::mls::BackupBlob,
+        m: usize,
+    ) -> crate::store::Result<crate::store::BackupAdded> {
+        self.inner.add_backup(u, c, e, b, m)
+    }
+    fn backups(
+        &self,
+        u: &Uid,
+        c: &risala_proto::names::Id,
+        a: Option<u64>,
+        e: u64,
+        b: usize,
+    ) -> crate::store::Result<crate::store::BackupPage> {
+        self.inner.backups(u, c, a, e, b)
+    }
+    fn delete_backups(
+        &self,
+        u: &Uid,
+        c: Option<&risala_proto::names::Id>,
+    ) -> crate::store::Result<u64> {
+        self.inner.delete_backups(u, c)
+    }
+}
+
 // (the rest)
 
 impl Store for Flaky {

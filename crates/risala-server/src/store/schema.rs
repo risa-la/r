@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -418,6 +418,70 @@ INSERT INTO sqlite_sequence (name, seq)
     SELECT 'conversations_v7', seq FROM sqlite_sequence WHERE name = 'conversations';
 DROP TABLE conversations;
 ALTER TABLE conversations_v7 RENAME TO conversations;
+"#;
+
+/// Version 8: the data of encrypted conversations that the server keeps
+/// without reading it (Section 12): KeyPackages (12.4), pending Welcomes
+/// (12.7) and key backups (12.10).
+pub(super) const V8: &str = r#"
+-- KeyPackages (12.4), per device: an identity and one of its device keys
+-- (4.5), in base64 as in key files. `n` is the upload order, so the oldest
+-- ordinary KeyPackage is handed out first. `kp_ref` is the KeyPackage's
+-- ref [RFC9420], so that uploading one again stores nothing. A device has
+-- at most one last-resort KeyPackage. `not_after` is the end of the
+-- lifetime, in milliseconds: a KeyPackage is not handed out from then on,
+-- and is deleted.
+CREATE TABLE key_packages (
+    n           INTEGER PRIMARY KEY,
+    uid         TEXT NOT NULL,
+    device_key  TEXT NOT NULL,
+    kp_ref      BLOB NOT NULL,
+    key_package TEXT NOT NULL,
+    last_resort INTEGER NOT NULL CHECK (last_resort IN (0, 1)),
+    not_after   INTEGER NOT NULL,
+    added       INTEGER NOT NULL,
+    UNIQUE (uid, device_key, kp_ref)
+);
+CREATE UNIQUE INDEX key_packages_last_resort ON key_packages (uid, device_key)
+    WHERE last_resort = 1;
+CREATE INDEX key_packages_device ON key_packages (uid, device_key, last_resort, n);
+CREATE INDEX key_packages_expiry ON key_packages (not_after);
+
+-- The Welcome of each accepted commit that added devices (12.5, 12.7),
+-- with the ratchet tree of the epoch it started. It is kept while any of
+-- its devices has it pending, and deleted with the last of them.
+CREATE TABLE welcome_commits (
+    n       INTEGER PRIMARY KEY,
+    conv    INTEGER NOT NULL REFERENCES conversations (conv) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL CHECK (seq >= 1),
+    welcome TEXT NOT NULL,
+    tree    TEXT NOT NULL
+);
+CREATE INDEX welcome_commits_conv ON welcome_commits (conv);
+
+-- A Welcome pending for one device (12.7), until the device deletes it
+-- with WELCOME DEL, or the device or its identity goes (4.7, 4.8). `id` is
+-- the id of its WELCOME line.
+CREATE TABLE pending_welcomes (
+    id         TEXT PRIMARY KEY,
+    commit_n   INTEGER NOT NULL REFERENCES welcome_commits (n) ON DELETE CASCADE,
+    uid        TEXT NOT NULL,
+    device_key TEXT NOT NULL,
+    UNIQUE (uid, device_key, commit_n)
+) WITHOUT ROWID;
+CREATE INDEX pending_welcomes_commit ON pending_welcomes (commit_n);
+
+-- Key backups (12.10): per identity, not per device. A conversation is
+-- named by its id (5.1), which may be one the server no longer has. An
+-- epoch has at most one blob per key id, the blob's first 8 bytes.
+CREATE TABLE backups (
+    uid     TEXT NOT NULL,
+    conv_id TEXT NOT NULL,
+    epoch   INTEGER NOT NULL CHECK (epoch >= 0),
+    key_id  BLOB NOT NULL CHECK (length(key_id) = 8),
+    blob    BLOB NOT NULL CHECK (length(blob) = 84),
+    PRIMARY KEY (uid, conv_id, epoch, key_id)
+) WITHOUT ROWID;
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.
