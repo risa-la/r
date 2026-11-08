@@ -23,24 +23,30 @@ active.
   mailboxes each connection follows, push subscriptions, the size and
   pseudonym of each post, sign-ins, KeyPackage fetches and how many
   devices each identity has, watched presence, and which device got a
-  Welcome. Learn, from key file
-  and log fetches, who looks up the identities it hosts. See file uploads and who downloads them, the size and timing
-  of blobs and backups, and backup generations. See the members,
-  display names and topic of public rooms. Join a public room under an
-  identity of its own and read it from then on, in view of its members.
-  Withhold, delay and reorder posts, refuse service, drop mailboxes and
-  rooms, and mute pseudonyms. Hold back a member's last messages
+  Welcome, and when. Learn, from key file and log fetches, who looks up
+  the identities it hosts. See file uploads and who downloads them, the
+  size and timing of blobs and backups, and backup generations. See the
+  members, display names and topic of public rooms, and who commits in
+  them, and so roughly who sent the day before. See that a private
+  conversation moved its mailbox, so that someone left it. Join a public
+  room under an identity of its own and read it from then on, in view of
+  its members. Withhold, delay and reorder posts, refuse service, drop
+  mailboxes and rooms, and mute pseudonyms. Hold back a member's last messages
   unnoticed. Choose which of two concurrent commits wins in a private
   conversation, and refuse a commit forever. Set the roles and settings
   that newcomers to a public room see, by accepting a commit that
   members' devices reject, which they warn about. Swap the group behind
   a public room's name, which devices that knew the room notice. Send
   or hold back GONE for guests. Serve an older backup of the same
-  generation. Link anonymous connections to signed-in ones by address
-  and timing (Section 14).
+  generation. Link a device's anonymous connections to its signed-in
+  one by address and timing, and then every mailbox it follows. In a
+  quiet public room, tie a pseudonym to the commit made just before its
+  first post (Section 14).
 - Cannot: read any message, file, private display name or topic. Learn
   who sent a post, or who is in a direct conversation or a private room,
-  except by the links above. Add anyone to a conversation, change the
+  except by the links above. Keep those links in what it stores, if it
+  follows 4.2, so that a database seized or handed over later does not
+  hold them. Add anyone to a conversation, change the
   roles or settings of a room for its members' devices, change or forge
   a message, replay one unnoticed, or hide a gap in one member's
   messages once a later message from that member arrives. Reset an
@@ -87,7 +93,9 @@ that hosts an identity.
   parties. In an epochal group, prove a message to others until its
   period key is published, or later if it timestamped the message's
   hash in public beforehand. Post abuse and report it to operators as
-  someone else's.
+  someone else's. Once removed, watch the old mailbox and post junk
+  there, until the group moves (7.8), which it does right after the
+  removal.
 - Cannot: post as another member to the other members, make another
   member's leaf look confirmed, read anything sent after it is removed,
   post or act on a role it has lost after the commit that removed or
@@ -101,7 +109,7 @@ that hosts an identity.
 - Can: join public rooms that allow guests, and post where `guests` is
   `write`. Open a report conversation with an owner or moderator of such
   a room, if they accept it, to send reports (5.8). Use up server
-  resources within proof of work and rate limits.
+  resources within proof of work, rate limits and quotas.
 - Cannot: take part in private rooms or in other direct conversations,
   send anything but reports in a report conversation, or appear as
   anything but an unverified guest.
@@ -140,9 +148,12 @@ that hosts an identity.
 
 **Push services and gateways.**
 
-- Can: see when each subscription gets a push.
-- Cannot: read push bodies, which are encrypted to the device (9.3), or
-  tell which identity a subscription belongs to from the push itself.
+- Can: see when each subscription gets a push, and so, over many
+  pushes, which devices are woken together, which suggests who shares a
+  conversation (9.2).
+- Cannot: read push bodies, which are encrypted to the device and padded
+  to one size (9.3), or tell which identity a subscription belongs to
+  from the push itself.
 
 **Someone shown a transcript afterwards,** such as a court or the public.
 
@@ -168,10 +179,20 @@ that hosts an identity.
 Each risk is marked **Mitigated**, where this document limits it, or
 **Open**, where it stands as written.
 
-- **No Tor in this version** (Open). The server sees every connection's
-  network address and timing, and can link anonymous connections to
-  signed-in ones by them. On small servers, sealed sending hides little
-  from an operator who looks.
+- **No Tor in this version** (Mitigated: servers keep no links in
+  stored data, 4.2). The server sees every connection's network address
+  and timing, and can link a device's anonymous connections to its
+  signed-in one by them, on any server. Sealed sending then protects
+  against later analysis of what the server stores, and users who share
+  their network address with many others.
+- **Stable sessions** (Mitigated: random order and starting points,
+  7.4). The mailboxes a device follows, its sync points and its push
+  tags change little between sessions, so one link to its identity
+  exposes all of its conversations.
+- **Senders in public rooms** (Mitigated: no pseudonym on commits, and
+  new pseudonyms each period, 7.3, 12.10). The server sees who commits
+  in a public room, and so roughly who sends each day, and in a quiet
+  room it may tie a pseudonym to its sender by timing.
 - **Presence stays on the server** (Mitigated: off by default). It knows
   when each identity is online. Presence is off by default; an identity
   that turns it on is shown to anyone on the server who asks (8.3).
@@ -189,9 +210,16 @@ Each risk is marked **Mitigated**, where this document limits it, or
 - **Classical parts** (Open). TLS certificates and push encryption still
   use classical algorithms.
 - **Metadata from KeyPackages, Welcomes and watch lists** (Mitigated:
-  devices fetch KeyPackages on anonymous connections). The server sees
+  devices fetch KeyPackages on anonymous connections, and Welcomes are
+  sealed per device and sent at random times, 12.8). The server sees
   whose KeyPackages are fetched, how many devices an identity has, which
-  device gets a Welcome, and whose presence is watched.
+  device gets a Welcome, and whose presence is watched, and, from timing
+  and size, roughly which devices were added to a group together.
+- **Push timing** (Mitigated: independent random delays, 9.2). Push
+  services and gateways see which devices are woken together.
+- **Sizes of private conversations** (Open). The server sees roughly how
+  many devices a private conversation has, from its commits, Welcomes,
+  followers and push subscriptions.
 - **The key log lists identities** (Open). Anyone can list the uids
   whose records a log holds.
 - **First contact** (Open). Meeting an identity for the first time
@@ -206,7 +234,7 @@ Each risk is marked **Mitigated**, where this document limits it, or
   confirmation, send tokens with "the first valid commit wins", and
   pseudonyms are this document's own, and have not yet been reviewed or
   formally modelled. So are commit streaks and the stale-leaf median
-  (12.7).
+  (12.7), and TOKEN and mailbox moves (7.2, 7.8).
 - **Sizes are not yet measured** (Open). The room limits may change once
   ML-DSA and X-Wing have been measured on phones.
 - **Metadata from files, blobs and backups** (Open). The server sees
@@ -269,3 +297,9 @@ claims that depend on it.
   origins without asking (12.11); this appendix's risk statuses and
   assumptions; the log pinned in the chain, chain heads, three key file
   states, `retire` records, sealed pairing and witnessing (4.3-4.10).
+  Metadata: no TLS resumption (2.1); identifying commands on connections
+  of their own, and what the server keeps (4.1, 4.2); TOKEN and bounded
+  token sets (7.2); per-period pseudonyms, none on PublicMessages, and no
+  limits per pseudonym (7.3, 12.10); mailbox moves after removals (7.8);
+  quotas and mailbox expiry (7.5); sealed per-device Welcomes (12.8);
+  push delays, padding and expiry (9).

@@ -91,28 +91,42 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     not show who made them, which rests on the KEM's
     plaintext-awareness.
   - Franking (5.8) proves what a message said, but not who sent it.
-  - Pairwise confirmation, epochal confirmation, send tokens with "the
-    first valid commit wins" (7.2), and pseudonyms (7.3) are risala's
-    own constructions. They need a formal model and an outside review
-    before they are relied on.
+  - Pairwise confirmation, epochal confirmation, send tokens with TOKEN
+    and "the first valid commit wins" (7.2), pseudonyms (7.3) and
+    mailbox moves (7.8) are risala's own constructions. They need a
+    formal model and an outside review before they are relied on.
 
 - **What the server learns.** Devices post on anonymous connections
-  (4.2), so the server does not learn who sends a message. In direct
-  conversations and private rooms, commits are encrypted, so it does not
-  learn who is in them. It still learns:
+  (4.2), so a post does not say who sent it, except for a public room's
+  commits and proposals, which show their sender (12.6). In direct
+  conversations and private rooms, commits are encrypted and Welcomes
+  are sealed to each device (12.8), so the server does not learn the
+  members from them. It still learns:
   - every connection's network address and timing. There is no support
-    for Tor in this version. An anonymous connection from the same
-    address as a signed-in one, or opened at the same time, is easy to
-    link to it, so on a server with few users sealed sending hides
-    little from an operator who looks.
+    for Tor in this version. A device's anonymous and signed-in
+    connections usually come from the same address, at about the same
+    times, so a server that watches can link them, on a large server as
+    on a small one. Anonymous connections then protect against later
+    analysis of what the server stores, which 4.2 keeps from holding
+    these links, and protect users who share their address with many
+    others, behind a large NAT or a VPN. Clients do not resume TLS
+    sessions (2.1), which would link connections even across addresses.
   - which connections follow which mailboxes, which mailboxes one
     connection follows, and each post's pseudonym, size within its
-    padding, and time;
+    padding, and time. A device's set of mailboxes, its sync points, its
+    `quiet` tags and its `cid`s stay much the same from one session to
+    the next. So once any one of them is tied to its identity, by
+    address, by timing, or by an identifying command sent on the wrong
+    connection (4.1), every conversation the device follows is, past and
+    future. 7.4 makes them less stable. Spreading a device's mailboxes
+    over several connections is left for a version with Tor.
   - which push subscriptions follow which mailbox (9.1), and, through
     their URLs and timing, which subscriptions may belong to one device;
-  - that a device of an identity was added to some group, when a Welcome
-    arrives for one of its KeyPackages (12.8), and roughly which, from
-    timing;
+  - which device gets a Welcome, and when (12.8). Welcomes are sealed to
+    each device and sent at independent random times, but Welcomes for
+    several identities' devices that arrive within minutes of each other,
+    with about the same size, still suggest that those identities were
+    added to one group;
   - whose KeyPackages someone asked for (12.5), and whose presence
     someone watches (8.3);
   - that an identity has an account on the server: sign-ins, KeyPackages,
@@ -123,9 +137,21 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     shows who is in touch with whom, which sealed sending otherwise
     hides. The host of a self-hosted identity's key file learns the
     same;
+  - roughly how many devices a direct conversation or private room has,
+    from the size of its commits and Welcomes, and from the followers and
+    push subscriptions of its mailbox;
+  - that a direct conversation or private room moved its mailbox (7.8),
+    which shows that a member left or was removed, though not who;
   - in a public room, its members and their display names, the leaf of
-    each light client (12.6), and its topic;
-  - whether an identity is online, unless it has turned that off (8.3);
+    each light client (12.6), its topic, and who commits. Commits carry
+    no pseudonym (7.3), and pseudonyms change every period, so the
+    server does not learn from the posts which are whose. But it sees
+    which members' devices rotate their leaf key each day (12.10), which
+    is roughly who sent the day before, and in a quiet room it can often
+    tie a new pseudonym to the commit made just before its first post;
+  - that an identity is online whenever it has a signed-in connection.
+    Others learn it only if the identity turned presence on, which is
+    off by default (8.3);
   - how many devices an identity has, since KEYPKG GET answers one line
     per device, and KEYPKG COUNT and sign-ins are per device;
   - for files: how many are uploaded to each mailbox, their padded
@@ -173,9 +199,17 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Insiders.** A member can read the conversation, and can leak it. A
   member can post invalid commits, which cost every device some work
-  and which devices ignore (7.2); send tokens, limits per pseudonym and
-  proof of work bound how many. A member can take part in confirming
-  leaves only for itself: it cannot make another member's leaf look
+  and which devices ignore (7.2); send tokens, limits per connection and
+  per network address, and proof of work bound how many. A member, or
+  anyone who joins a public room, can also add useless hashes to a token
+  set (7.2), and post under another member's pseudonym, which the
+  server cannot tell apart, though members' devices ignore such posts
+  (7.3). A member can move its group's mailbox (7.8). A removed member
+  keeps the old box and its last token: it can watch the old mailbox
+  and post junk there until the group moves, which it does right after
+  the removal. A blocked person in a direct conversation stays in it,
+  and so sees its activity. A member can take part in confirming leaves
+  only for itself: it cannot make another member's leaf look
   confirmed. Any member can remove others' leaves that are stale, more
   than 35 days behind the group's median (12.7), at most a tenth of the
   group in one commit, and must add those devices again if they have
@@ -271,11 +305,13 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   signature made for one purpose is valid for another.
 
 - **Server secrets.** Guest tokens (4.2), send tokens (7.2), `put`,
-  `get` and `del` URLs (5.6, 12.12), pairing ids (4.8) and push URLs
-  (Section 9) work for whoever holds them. Servers SHOULD store only a
-  hash of each, look it up by a part that is not secret, and compare the
-  secret part in constant time. Franking tags are compared in constant
-  time too (5.8, 12.9).
+  `get` and `del` URLs (5.6, 12.12) and pairing ids (4.8) work for
+  whoever holds them. Servers SHOULD store only a hash of each, look it
+  up by a part that is not secret, and compare the secret part in
+  constant time. Franking tags are compared in constant time too (5.8,
+  12.9). Push URLs and their keys (Section 9) are kept in the clear,
+  since the server must send to them and encrypt to them. PUSH DEL looks
+  a subscription up by a hash of its URL.
 
 - **Requests from the server.** Fetching key files and sending pushes
   both mean connecting to hosts that users choose. The rules in Sections
@@ -291,12 +327,16 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   single identities or its whole domain (10.2).
 
 - **Spam and abuse.** The server cannot see who posts, so it limits
-  load per connection, per network address and per pseudonym, and can
-  require proof of work to open anonymous connections, to become a
-  guest, to register and to join public rooms (4.1). Room moderators
-  remove spammers with commits, and ask the server to mute a pseudonym
-  in the meantime (6.4). Operators can ban network addresses for
-  anonymous and guest connections (10.2).
+  load per connection and per network address. It does not limit per
+  pseudonym, since anyone who holds a group's token can post under any
+  pseudonym (5.2). It bounds what anyone can store: mailboxes have
+  quotas and end when unused (7.5), token sets are bounded (7.2), and so
+  are push subscriptions (9.1). It can require proof of work to open
+  anonymous connections, to become a guest, to register, to create
+  mailboxes, to fetch KeyPackages and to join public rooms (4.1). Room
+  moderators remove spammers with commits, and ask the server to mute a
+  pseudonym in the meantime (6.4). Operators can ban network addresses
+  for anonymous and guest connections (10.2).
 
 - **Display names** can be used to imitate other people (8.2).
   Bidirectional text controls can make one name look like another, or
@@ -315,9 +355,12 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   Someone who is blocked can still add the person who blocked them to a
   group, which their devices then ignore.
 
-- **Push.** Push bodies are encrypted to the device (9.3). The push
-  service, and any gateway in between, still see when pushes happen and
-  for which subscription.
+- **Push.** Push bodies are encrypted to the device, and padded to one
+  size (9.3). The push service, and any gateway in between, still see
+  when pushes happen and for which subscription, and so, over many
+  pushes, which devices are woken together, which suggests who shares a
+  conversation. The server delays each subscription's pushes by its own
+  random time (9.2), which blurs this but does not hide it.
 
 - **Deletion** removes a message from devices that honour it, not from
   copies that people have already made, nor from the server, which
@@ -340,10 +383,13 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 - **Sizes.** Private rooms of 1,000 members and public rooms of 10,000
   (6.1) are limits chosen before ML-DSA and X-Wing have been measured on
   phones, and may change. Every message carries a 2420-byte signature,
-  which dominates traffic in large rooms.
+  which dominates traffic in large rooms. Sealing each Welcome to its
+  device (12.8) means that a committer uploads a large private room's
+  tree once for each device it adds.
 
 - **Operators** see what the server sees, and can refuse service: drop
   rooms and mailboxes, mute pseudonyms and ban identities and addresses
   (Section 10). They cannot read any conversation, act as a room's
-  moderator, or change anyone's keys. ADMIN WHO shows them every
-  connection's network address (10.3).
+  moderator, or change anyone's keys. ADMIN WHO shows them every open
+  connection's network address (10.3), but servers do not keep the
+  addresses of anonymous and guest connections once they close (4.2).

@@ -38,5 +38,7 @@ How each platform handles a push:
   the user's UnifiedPush distributor directly. No gateway is needed.
 
 A gateway sees only which of its URLs got a push, and when, and so do
-Apple and Google. Anyone who knows a gateway URL can send to it, so
-gateways SHOULD rate-limit each URL.
+Apple and Google. Over many pushes, that shows which devices are woken
+together, which suggests who shares a conversation, even though the
+server delays each push by its own random time (9.2). Anyone who knows a
+gateway URL can send to it, so gateways SHOULD rate-limit each URL.

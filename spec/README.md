@@ -60,7 +60,7 @@ Section 12.9, in the file for Section 12.
 | [04-identity-and-authentication.md](04-identity-and-authentication.md) | 4. Identity and Authentication | Kinds of connection, guests, key files, the witnessed key log, signing in, registration, pairing and recovering devices |
 | [05-conversations.md](05-conversations.md) | 5. Conversations | Kinds of conversation, mailboxes and posts, messages, deletes, mentions, files, blocking and reports |
 | [06-rooms.md](06-rooms.md) | 6. Rooms | Public and private rooms, joining and leaving, settings, roles and moderation |
-| [07-delivery-and-sync.md](07-delivery-and-sync.md) | 7. Delivery and Sync | Following mailboxes, send tokens, pseudonyms, catching up, retention and read markers |
+| [07-delivery-and-sync.md](07-delivery-and-sync.md) | 7. Delivery and Sync | Following mailboxes, send tokens, pseudonyms, catching up, retention, read markers and moving a mailbox |
 | [08-other-lines.md](08-other-lines.md) | 8. Other Lines | Typing, display names, presence, notices and server information |
 | [09-push-notifications.md](09-push-notifications.md) | 9. Push Notifications | Mailbox and account subscriptions, and encrypted pushes |
 | [10-server-administration.md](10-server-administration.md) | 10. Server Administration | Operators, bans, connections, rooms and mailboxes, hosted identities and settings |
