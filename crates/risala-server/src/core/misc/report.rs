@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use aws_lc_rs::hmac;
 use risala_mls::framing::{ContentType, read_post};
-use risala_proto::binary::ReportData;
+use risala_proto::binary::{ReportData, ReportRef};
 use risala_proto::codec::{DecodeError, Reader};
 use risala_proto::content::{Content, ContentLine, FileUrl};
 use risala_proto::error::ErrorCode;
@@ -220,7 +220,7 @@ pub(crate) fn report_line(report: &StoredReport) -> ServerLine {
         pseudonym: report.pseudonym,
         from: report.from.clone(),
         mailbox: report.mailbox,
-        report: report.report.clone(),
+        report: ReportRef::Inline(report.report.clone()),
     })
 }
 

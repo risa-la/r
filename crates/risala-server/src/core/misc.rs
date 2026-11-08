@@ -32,6 +32,7 @@ pub(crate) mod report;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use risala_proto::binary::ReportRef;
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
 use risala_proto::names::Room;
@@ -104,7 +105,17 @@ pub(super) async fn handle(cx: &Cx, command: Command) -> Reply {
         Command::Whois { uid } => presence::whois(cx, uid).await,
         Command::Members { room } => members(cx, room).await,
         Command::Push(push) => push::handle(cx, push).await,
-        Command::Report { mailbox, report } => report::report(cx, mailbox, report).await,
+        Command::Report { mailbox, report } => {
+            match report {
+                ReportRef::Inline(data) => report::report(cx, mailbox, data).await,
+                // TO DO, the server's REPORT: a RisalaReport in a blob (5.8),
+                // which the server reads, keeps as long as the report, and
+                // sends operators by the same blob-ref. Until then it is
+                // refused rather than half supported.
+                ReportRef::Blob(_) => Err(err(ErrorCode::NotSupported)
+                    .with_message("reports in blobs are not supported yet")),
+            }
+        }
         Command::Resolve { id } => report::resolve(cx, id).await,
         other => misrouted("misc", &other),
     }
