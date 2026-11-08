@@ -2875,6 +2875,15 @@ S: @seq=1;t=2026-11-07T10:02:11.540Z;from=alice@example.org COMMIT bob@example.n
 S: OK seq=1 epoch=1
 ```
 
+If KEYPKG GET returns no KeyPackages for the other participant, none of
+their devices is ready yet. The device MUST NOT send messages in the
+conversation until a device of the other participant has a leaf: it
+keeps them, and tries KEYPKG GET again from time to time and when it
+reconnects, or waits for the other participant's device to join by
+external commit (12.6). The other participant could never read messages
+sent before then, since in a direct conversation history keys come only
+from a participant's own devices (12.9).
+
 If both participants send INIT at about the same time, one of them gets
 `ERR stale`, and its device then joins the other's group by Welcome or
 external commit.

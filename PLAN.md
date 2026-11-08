@@ -1102,8 +1102,8 @@ Open:
       nothing about the keys (4.4).
 
 47. **Found while testing M5a end to end** (5.8, 12.6, 12.12), on
-    2026-11-08. Implementation only, no spec change; item 46's
-    decisions are built and tested:
+    2026-11-08. Item 46's decisions are built and tested, and the last
+    point below changed 12.6:
     - librisala's encryption is tested end to end against `risalad`, with
       key files fetched over HTTPS from the test server's key file host.
       That found: the list of an identity's devices failed on every call;
@@ -1125,17 +1125,12 @@ Open:
     - **Key files on demand.** `Account::refresh_devices` fetches a key
       file now, and the CLI's `devices` uses it, so that a key just added,
       such as a new recovery key, is listed.
-
-    Open:
-
-    - **A direct conversation whose other side has no KeyPackages.** If
-      KEYPKG GET returns none for the other participant, the device sends
-      INIT and its message anyway. The other side's device later joins by
-      external commit, and can never read what came before, since in a
-      direct conversation history keys come only from its own identity's
-      devices (12.9). Should a device hold its messages until the other
-      participant has a leaf, or should the spec say that such messages
-      are lost?
+    - **A direct conversation whose other side has no KeyPackages**
+      (12.6), decided with the user on 2026-11-08: the device sends INIT
+      but holds its messages until a device of the other participant
+      has a leaf, retrying KEYPKG GET from time to time and on
+      reconnect, or until that device joins by external commit.
+      Messages sent before then could never be read by the other side.
 
 ## 6. Decisions
 
