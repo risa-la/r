@@ -170,7 +170,7 @@ pub(super) struct Sent {
 }
 
 impl Sent {
-    fn of(
+    pub(super) fn of(
         (commit, welcome, group_info): (
             risala_mls::openmls::prelude::MlsMessageOut,
             Option<risala_mls::openmls::prelude::MlsMessageOut>,

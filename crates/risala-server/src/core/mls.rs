@@ -17,6 +17,14 @@
 //! the new epoch's, with the commit's confirmation tag, signed by the
 //! committer; and the group's extensions are exactly
 //! [`risala_mls::group::group_context_extensions`] of its conversation.
+//!
+//! Every HPKE public key that devices may encrypt to must have the length
+//! of an X-Wing key: each leaf's and parent node's in the tree, the
+//! GroupInfo's `external_pub`, and the init keys of the KeyPackages a
+//! commit adds. OpenMLS does not check their length, and the libcrux-kem
+//! that devices use panics on a short one (PLAN.md 5, item 50), so the
+//! server does not hand such a group to devices. A commit's Welcome must be
+//! for exactly the KeyPackages it adds.
 
 use std::time::SystemTime;
 
@@ -27,8 +35,9 @@ use risala_mls::openmls::messages::group_info::VerifiableGroupInfo;
 use risala_mls::openmls::prelude::{ConfirmationTag, ProposalStore};
 use risala_mls::openmls::prelude::{
     ContentType, Extensions, GroupContext, LeafNodeIndex, MlsMessageBodyIn, MlsMessageIn,
-    OpenMlsSignaturePublicKey, ProcessedMessageContent, Proposal, ProposalOrRefType, ProposalType,
-    ProtocolVersion, PublicGroup, PublicProcessMessageError, Sender, StageCommitError,
+    OpenMlsSignaturePublicKey, ParentNode, ProcessedMessageContent, Proposal, ProposalOrRefType,
+    ProposalType, ProtocolVersion, PublicGroup, PublicProcessMessageError, Sender,
+    StageCommitError,
 };
 use risala_mls::signer::{credential_uid, signature_key};
 use risala_mls::{CIPHERSUITE, RisalaCrypto, wire};
@@ -109,11 +118,49 @@ fn group_info(value: &mls::GroupInfo) -> Result<VerifiableGroupInfo, Fail> {
 /// The checks of a GroupInfo's extensions (12.5): `external_pub`, and no
 /// `ratchet_tree`.
 fn check_group_info_extensions(gi: &VerifiableGroupInfo) -> Result<(), Fail> {
-    if gi.extensions().external_pub().is_none() {
+    let Some(external) = gi.extensions().external_pub() else {
         return Err(invalid("the GroupInfo has no external_pub extension"));
+    };
+    if !risala_mls::hpke_public_key_ok(external.external_pub().as_slice()) {
+        return Err(invalid(
+            "the GroupInfo's external_pub is not an X-Wing public key",
+        ));
     }
     if gi.extensions().ratchet_tree().is_some() {
         return Err(invalid("the GroupInfo has a ratchet_tree extension"));
+    }
+    Ok(())
+}
+
+/// Whether a parent node's encryption key is an X-Wing public key. OpenMLS
+/// keeps the key private, so it is read from the node's encoding, where it
+/// comes first (RFC 9420, 7.1).
+fn parent_key_ok(parent: &ParentNode) -> bool {
+    let Ok(bytes) = parent.tls_serialize_detached() else {
+        return false;
+    };
+    matches!(
+        VLBytes::tls_deserialize(&mut bytes.as_slice()),
+        Ok(key) if risala_mls::hpke_public_key_ok(key.as_slice())
+    )
+}
+
+/// Checks that every leaf's and parent node's encryption key in `group`'s
+/// tree is an X-Wing public key (12.2).
+fn check_tree_keys(group: &PublicGroup) -> Result<(), Fail> {
+    let tree = group.treesync();
+    if !tree
+        .full_leaves()
+        .all(|(_, leaf)| risala_mls::encryption_key_ok(leaf.encryption_key()))
+    {
+        return Err(invalid(
+            "a leaf's encryption key is not an X-Wing public key",
+        ));
+    }
+    if !tree.full_parents().all(|(_, parent)| parent_key_ok(parent)) {
+        return Err(invalid(
+            "a parent node's encryption key is not an X-Wing public key",
+        ));
     }
     Ok(())
 }
@@ -172,6 +219,7 @@ pub(super) fn check_init(
     if group.version() != ProtocolVersion::Mls10 {
         return Err(invalid("the group is not mls10"));
     }
+    check_tree_keys(&group)?;
     let leaves = leaves(&group)?;
     let [leaf] = leaves.as_slice() else {
         return Err(invalid("a new group has one leaf"));
@@ -385,6 +433,13 @@ pub(super) fn check_commit(
             return Err(invalid("an added KeyPackage's lifetime is not acceptable"));
         }
         let leaf = kp.leaf_node();
+        if !risala_mls::hpke_public_key_ok(kp.hpke_init_key().as_slice())
+            || !risala_mls::encryption_key_ok(leaf.encryption_key())
+        {
+            return Err(invalid(
+                "an added KeyPackage has an HPKE key of the wrong length",
+            ));
+        }
         let device = leaf_of(leaf.credential(), leaf.signature_key().as_slice())
             .ok_or_else(|| invalid("an added leaf is not a device of an identity"))?;
         adds.push(device);
@@ -488,6 +543,8 @@ pub(super) fn check_commit(
     group
         .merge_commit(&state, *staged)
         .map_err(|e| state_error(format!("{e:?}")))?;
+    // Rule 2: the new path's keys, and those of the leaves it adds.
+    check_tree_keys(&group)?;
     // Rule 5.
     let leaves = leaves(&group)?;
     if leaves.len() > max_leaves {

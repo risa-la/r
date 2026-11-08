@@ -1116,3 +1116,5 @@ mod e2ee_tests;
 
 #[cfg(test)]
 mod group_tests;
+#[cfg(test)]
+mod hpke_key_tests;
