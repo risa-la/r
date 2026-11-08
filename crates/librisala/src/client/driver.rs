@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
@@ -141,6 +142,7 @@ async fn drive(
                         if let Some(key) = &key {
                             note_accepted(shared, key).await;
                         }
+                        shared.operator.store(session.is_operator(), Ordering::SeqCst);
                         // A guest's session was resumed or is new (4.2).
                         let resumed = guest_token.as_ref().is_some_and(|t| t.resumed());
                         if let Some(token) = &guest_token {

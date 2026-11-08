@@ -549,6 +549,9 @@ async fn admin_commands_round_trip() {
     let alice = registered_in(&server, "alice", "#general").await;
     let carol = registered(&server, "carol").await;
     let admin = op.admin();
+    // The sign-in said who is an operator (op=yes, 4.5).
+    assert!(op.is_operator());
+    assert!(!alice.is_operator());
 
     // Non-operators get forbidden for every ADMIN command.
     assert_eq!(code(alice.admin().operators().await), "forbidden");

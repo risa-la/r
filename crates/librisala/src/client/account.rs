@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use risala_proto::command::{Command, Request, RoomPage};
@@ -73,6 +73,8 @@ pub(crate) struct AccountShared {
     /// Whether the account was running before an UNREGISTER whose answer
     /// was lost (4.8), to start it again if a later try is refused.
     pub ran_before_unregister: Mutex<Option<bool>>,
+    /// The last sign-in said the identity is an operator (`op=yes`).
+    pub operator: AtomicBool,
     next_driver: AtomicU64,
 }
 
@@ -209,6 +211,7 @@ impl AccountShared {
             presence: Mutex::new(HashMap::new()),
             watching: Mutex::new(Watching::default()),
             ran_before_unregister: Mutex::new(None),
+            operator: AtomicBool::new(false),
             next_driver: AtomicU64::new(1),
         })
     }
@@ -315,6 +318,15 @@ impl Account {
     /// may sign in under a numbered name; see [`ConnectionState::Online`].
     pub fn uid(&self) -> String {
         self.shared.uid.to_string()
+    }
+
+    /// Whether the identity is an operator of the server (10.1), as the
+    /// last sign-in said with `op=yes` (4.5): one that may use
+    /// [`Account::admin`]. `false` before the first sign-in, and for
+    /// guests. Operators added or removed while signed in show at the next
+    /// sign-in.
+    pub fn is_operator(&self) -> bool {
+        self.shared.operator.load(Ordering::SeqCst)
     }
 
     /// Whether this is a guest account (4.2).

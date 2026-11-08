@@ -224,6 +224,8 @@ struct State {
     pending: VecDeque<Pending>,
     closed: Option<CloseReason>,
     uid: Option<Uid>,
+    /// The sign-in's `OK` carried `op=yes` (4.5, 10.1).
+    operator: bool,
     nonce_used: bool,
 }
 
@@ -315,6 +317,7 @@ impl Session {
                 pending: VecDeque::new(),
                 closed: None,
                 uid: None,
+                operator: false,
                 nonce_used: false,
             }),
         });
@@ -357,6 +360,12 @@ impl Session {
     /// REGISTER has succeeded.
     pub fn uid(&self) -> Option<Uid> {
         self.shared.state.lock().expect("poisoned").uid.clone()
+    }
+
+    /// Whether the sign-in's `OK` said the identity is a server operator
+    /// (`op=yes`, 4.5, 10.1). `false` until signed in.
+    pub fn is_operator(&self) -> bool {
+        self.shared.state.lock().expect("poisoned").operator
     }
 
     /// Takes the incoming queue: every server line that is not a response
@@ -867,6 +876,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
             && let Ok(Some(uid)) = ok.uid()
         {
             st.uid = Some(uid);
+            st.operator = ok.op().ok().flatten().unwrap_or(false);
         }
         drop(st);
         let response = Response {

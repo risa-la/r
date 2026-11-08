@@ -928,7 +928,11 @@ async fn login(
         return Err(Failed(ACT));
     }
     let uid = connect(ctx, &account).await?;
-    println!("signed in to {} as {uid}", account.server());
+    if account.is_operator() {
+        println!("signed in to {} as {uid}, an operator", account.server());
+    } else {
+        println!("signed in to {} as {uid}", account.server());
+    }
     Ok(())
 }
 

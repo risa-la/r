@@ -78,7 +78,7 @@ async fn an_operator_reviews_moderates_and_administers() {
     let op: Identity = "op@example.org".parse().unwrap();
     server.key_server().add_key(&op, &key, Some("laptop"));
     let out = ok(state, &["login", &addr, "op@example.org"]).await;
-    assert!(out.contains("as op@example.org"), "{out}");
+    assert!(out.contains("as op@example.org, an operator"), "{out}");
 
     // A guest posts something to report.
     let mut ann = server.guest("ann").await;
