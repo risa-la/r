@@ -1,12 +1,10 @@
-use std::{
-    borrow::Borrow,
-    marker::PhantomData,
-};
+use std::{borrow::Borrow, marker::PhantomData};
 
-use openmls_traits::storage::{traits, Key, StorageProvider};
+use openmls_traits::storage::{Key, StorageProvider, traits};
 use rusqlite::Connection;
 
 use crate::{
+    STORAGE_PROVIDER_VERSION,
     codec::Codec,
     encryption_key_pairs::{
         StorableEncryptionKeyPair, StorableEncryptionKeyPairRef, StorableEncryptionPublicKeyRef,
@@ -20,7 +18,6 @@ use crate::{
     signature_key_pairs::{
         StorableSignatureKeyPairs, StorableSignatureKeyPairsRef, StorableSignaturePublicKeyRef,
     },
-    STORAGE_PROVIDER_VERSION,
 };
 
 /// Storage provider for OpenMLS using Sqlite through the `rusqlite` crate.

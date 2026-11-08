@@ -2,12 +2,12 @@ use std::marker::PhantomData;
 
 use openmls_traits::storage::{Entity, Key};
 use rusqlite::{
-    types::{FromSql, ToSqlOutput},
     ToSql,
+    types::{FromSql, ToSqlOutput},
 };
 use serde::Serialize;
 
-use crate::{codec::Codec, STORAGE_PROVIDER_VERSION};
+use crate::{STORAGE_PROVIDER_VERSION, codec::Codec};
 
 #[derive(Debug, Serialize)]
 pub(super) struct KeyRefWrapper<'a, C: Codec, T: Key<STORAGE_PROVIDER_VERSION>>(

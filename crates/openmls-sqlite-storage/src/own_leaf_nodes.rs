@@ -4,10 +4,10 @@ use openmls_traits::storage::{Entity, Key};
 use rusqlite::params;
 
 use crate::{
+    STORAGE_PROVIDER_VERSION,
     codec::Codec,
     storage_provider::StorableKeyRef,
     wrappers::{EntityRefWrapper, EntityWrapper, KeyRefWrapper},
-    STORAGE_PROVIDER_VERSION,
 };
 
 pub(crate) struct StorableLeafNode<LeafNode: Entity<STORAGE_PROVIDER_VERSION>>(pub LeafNode);

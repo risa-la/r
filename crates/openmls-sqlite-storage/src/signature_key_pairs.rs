@@ -1,12 +1,12 @@
 use std::marker::PhantomData;
 
-use openmls_traits::storage::{traits::SignaturePublicKey as SignaturePublicKeyTrait, Entity, Key};
-use rusqlite::{params, OptionalExtension};
+use openmls_traits::storage::{Entity, Key, traits::SignaturePublicKey as SignaturePublicKeyTrait};
+use rusqlite::{OptionalExtension, params};
 
 use crate::{
+    STORAGE_PROVIDER_VERSION,
     codec::Codec,
     wrappers::{EntityRefWrapper, EntityWrapper, KeyRefWrapper},
-    STORAGE_PROVIDER_VERSION,
 };
 
 pub(crate) struct StorableSignatureKeyPairs<SignatureKeyPairs: Entity<STORAGE_PROVIDER_VERSION>>(
