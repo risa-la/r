@@ -4,9 +4,7 @@
 //! code in `risala-keylog`.
 
 use std::collections::HashSet;
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +20,7 @@ use risala_proto::chain::Handoffs as _;
 use risala_proto::record::{LogKey, Record, RecordBody, RecordContent};
 
 use super::super::keylog::{
-    AppendError, Transport, append_records, check_config, index_of, witness_round,
+    AppendError, Posted, Transport, append_records, check_config, index_of, witness_round,
 };
 use super::super::{Clock as _, Hub, ManualClock};
 use super::{T, config, timers};
@@ -162,7 +160,8 @@ impl Witnesses {
                 let log1 = risala_keylog::LogKey::from_vkey_str(&log1_vkey()).unwrap();
                 let req = AddCheckpoint::parse(body).unwrap();
                 let key = (req.checkpoint.checkpoint().origin() == origin(1)).then_some(&log1);
-                w.add_checkpoint_body(body, key, now).map(String::into_bytes)
+                w.add_checkpoint_body(body, key, now)
+                    .map(String::into_bytes)
             }
             "risala/handoff" => w.handoff_body(body).map(|()| Vec::new()),
             _ => return (404, Vec::new()),
@@ -176,11 +175,7 @@ impl Witnesses {
 }
 
 impl Transport for Witnesses {
-    fn post<'a>(
-        &'a self,
-        url: &'a str,
-        body: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), String>> + Send + 'a>> {
+    fn post<'a>(&'a self, url: &'a str, body: Vec<u8>) -> Posted<'a> {
         Box::pin(async move {
             if self.down.lock().unwrap().iter().any(|d| url.starts_with(d)) {
                 return Err("connection refused".into());
@@ -362,7 +357,13 @@ async fn records_append_and_are_served() {
         index_of(inner, r.hash()).await.unwrap().map(|l| l.index),
         Some(2)
     );
-    assert_eq!(index_of(inner, r.content().previous.unwrap()).await.unwrap().map(|l| l.index), Some(0));
+    assert_eq!(
+        index_of(inner, r.content().previous.unwrap())
+            .await
+            .unwrap()
+            .map(|l| l.index),
+        Some(0)
+    );
 
     // Hints (4.5).
     let (status, body) = get(
@@ -416,14 +417,26 @@ async fn a_witnessed_checkpoint_proves_records() {
     assert_eq!(wc.checkpoint().size(), 260);
     assert_eq!(wc.witnesses().len(), 2);
     // The witness hub keeps what it cosigned.
-    let row = witnesses.hub.inner.store.witness_log(&origin(1)).unwrap().unwrap();
+    let row = witnesses
+        .hub
+        .inner
+        .store
+        .witness_log(&origin(1))
+        .unwrap()
+        .unwrap();
     assert_eq!((row.size, row.vkey), (260, log1_vkey()));
 
     // A device proves entries 3 and 258 from the tiles.
     let mut view = LogView::new(key.clone(), wc.clone()).unwrap();
     for index in [3u64, 258] {
         let mut set = TileSet::new();
-        fetch(&hub, 1, &view.tiles_for_entry(wc.checkpoint(), index), &mut set).await;
+        fetch(
+            &hub,
+            1,
+            &view.tiles_for_entry(wc.checkpoint(), index),
+            &mut set,
+        )
+        .await;
         let e = entry(&hub, 1, index, 260).await;
         let record = &records[index as usize];
         let got = accept_record(
@@ -483,7 +496,11 @@ async fn a_witness_that_is_down_is_retried() {
     // The log serves what it has: its own signature and one cosignature.
     let (status, body) = get(&hub, "/risala-log/1/checkpoint").await;
     assert_eq!(status, 200);
-    assert!(policy().verify(&key, &body, Freshness::fresh(now(&hub))).is_err());
+    assert!(
+        policy()
+            .verify(&key, &body, Freshness::fresh(now(&hub)))
+            .is_err()
+    );
     let one = WitnessPolicy::from_vkeys(&[test_w_vkey()], 1).unwrap();
     assert!(one.verify(&key, &body, Freshness::fresh(now(&hub))).is_ok());
 
@@ -548,9 +565,13 @@ async fn a_hand_off_end_to_end() {
         hub.inner.keylog.set_transport(witnesses.clone());
         let log1 = hub.inner.keylog.current_log().unwrap();
         let m = master("alice@example.org", 1, &log1);
-        append_records(&hub.inner, &"alice@example.org".parse().unwrap(), vec![m.clone()])
-            .await
-            .unwrap();
+        append_records(
+            &hub.inner,
+            &"alice@example.org".parse().unwrap(),
+            vec![m.clone()],
+        )
+        .await
+        .unwrap();
         assert!(witness_round(&hub.inner).await);
         (log1, m)
     };
@@ -563,14 +584,16 @@ async fn a_hand_off_end_to_end() {
     for bad in [Some(3), Some(0)] {
         let mut c = both();
         c.log.number = bad;
-        assert!(Hub::build(
-            c,
-            Arc::new(SqliteStore::open(&path).unwrap()),
-            clock.clone(),
-            timers(),
-            KeyServices::default()
-        )
-        .is_err());
+        assert!(
+            Hub::build(
+                c,
+                Arc::new(SqliteStore::open(&path).unwrap()),
+                clock.clone(),
+                timers(),
+                KeyServices::default()
+            )
+            .is_err()
+        );
     }
     clock.advance(Duration::from_secs(11));
     let mut c = both();
@@ -595,7 +618,12 @@ async fn a_hand_off_end_to_end() {
     // Chains continue in log 2, after their newest record in log 1.
     let alice_id = "alice@example.org".parse().unwrap();
     assert!(matches!(
-        append_records(inner, &alice_id, vec![master("alice@example.org", 9, &log2)]).await,
+        append_records(
+            inner,
+            &alice_id,
+            vec![master("alice@example.org", 9, &log2)]
+        )
+        .await,
         Err(AppendError::DoesNotFollow)
     ));
     let r = next(&m, 1, RecordBody::Retire);
@@ -628,14 +656,26 @@ async fn a_hand_off_end_to_end() {
     // A device that saw log 1 at size 1 follows the hand-off.
     let mut view = LogView::new(key1.clone(), seen).unwrap();
     let mut set = TileSet::new();
-    fetch(&hub, 1, &view.tiles_for_entry(w1.checkpoint(), index), &mut set).await;
+    fetch(
+        &hub,
+        1,
+        &view.tiles_for_entry(w1.checkpoint(), index),
+        &mut set,
+    )
+    .await;
     let e = entry(&hub, 1, index, 2).await;
     let next_key = accept_handoff(&mut view, w1, &e, index, &mut set.reader(2)).unwrap();
     assert_eq!(next_key, key2);
     // And accepts the record in log 2.
     let mut view2 = LogView::new(key2, w2.clone()).unwrap();
     let mut set = TileSet::new();
-    fetch(&hub, 2, &view2.tiles_for_entry(w2.checkpoint(), 0), &mut set).await;
+    fetch(
+        &hub,
+        2,
+        &view2.tiles_for_entry(w2.checkpoint(), 0),
+        &mut set,
+    )
+    .await;
     let e = entry(&hub, 2, 0, 1).await;
     accept_record(
         &mut view2,
@@ -652,7 +692,13 @@ async fn a_hand_off_end_to_end() {
     // larger tree of it.
     clock.advance(Duration::from_secs(3600));
     assert!(witness_round(inner).await);
-    assert_eq!(witnessed(&hub, 1, &key1, &policy()).await.checkpoint().size(), 2);
+    assert_eq!(
+        witnessed(&hub, 1, &key1, &policy())
+            .await
+            .checkpoint()
+            .size(),
+        2
+    );
     // A restart with the same number keeps log 2.
     drop(hub);
     let hub = hub_on(c, SqliteStore::open(&path).unwrap(), &clock);
@@ -667,12 +713,8 @@ async fn the_witness_answers_by_the_rules() {
     let witness = witness_hub(&clock);
     assert!(witness.inner.keylog.witness_vkey().is_some());
     let other = Cosigner::from_seed("other.example/risala-log/1", &[3; 32]).unwrap();
-    let cp = risala_keylog::Checkpoint::new(
-        other.name(),
-        0,
-        risala_keylog::merkle::empty_root(),
-    )
-    .unwrap();
+    let cp = risala_keylog::Checkpoint::new(other.name(), 0, risala_keylog::merkle::empty_root())
+        .unwrap();
     let mut sc = risala_keylog::SignedCheckpoint::unsigned(cp);
     sc.push_signature(other.cosign(sc.checkpoint(), now(&witness), [0; 32]))
         .unwrap();
@@ -687,11 +729,27 @@ async fn the_witness_answers_by_the_rules() {
         let w = witness.clone();
         async move { w.witness_request(path, body).await.unwrap() }
     };
-    assert_eq!(ask("/risala-witness/add-checkpoint", body).await.status, 404);
-    assert_eq!(ask("/risala-witness/add-checkpoint", b"junk".to_vec()).await.status, 400);
-    assert_eq!(ask("/risala-witness/risala/handoff", b"junk".to_vec()).await.status, 400);
+    assert_eq!(
+        ask("/risala-witness/add-checkpoint", body).await.status,
+        404
+    );
+    assert_eq!(
+        ask("/risala-witness/add-checkpoint", b"junk".to_vec())
+            .await
+            .status,
+        400
+    );
+    assert_eq!(
+        ask("/risala-witness/risala/handoff", b"junk".to_vec())
+            .await
+            .status,
+        400
+    );
     assert_eq!(ask("/risala-witness/other", Vec::new()).await.status, 404);
-    assert_eq!(witness.witness_request("/elsewhere", Vec::new()).await, None);
+    assert_eq!(
+        witness.witness_request("/elsewhere", Vec::new()).await,
+        None
+    );
 
     // Log 1 of chat.example.org, which the operator configured, enrols;
     // then a request from the wrong old size gets 409 with the size.
@@ -701,7 +759,11 @@ async fn the_witness_answers_by_the_rules() {
         proof: vec![],
         checkpoint: log.checkpoint(now(&witness)),
     };
-    let a = ask("/risala-witness/add-checkpoint", enrol.to_body().into_bytes()).await;
+    let a = ask(
+        "/risala-witness/add-checkpoint",
+        enrol.to_body().into_bytes(),
+    )
+    .await;
     assert_eq!(a.status, 200);
     clock.advance(Duration::from_secs(11));
     let mut log = log;
@@ -711,7 +773,11 @@ async fn the_witness_answers_by_the_rules() {
         proof: vec![],
         checkpoint: log.checkpoint(now(&witness)),
     };
-    let a = ask("/risala-witness/add-checkpoint", wrong.to_body().into_bytes()).await;
+    let a = ask(
+        "/risala-witness/add-checkpoint",
+        wrong.to_body().into_bytes(),
+    )
+    .await;
     assert_eq!((a.status, a.content_type), (409, "text/x.tlog.size"));
     assert_eq!(a.body, b"0\n");
 
@@ -728,7 +794,12 @@ async fn the_witness_answers_by_the_rules() {
 #[test]
 fn log_and_witness_configuration() {
     let good = both();
-    assert!(check_config(&good).unwrap().iter().any(|w| w.contains("HTTPS")));
+    assert!(
+        check_config(&good)
+            .unwrap()
+            .iter()
+            .any(|w| w.contains("HTTPS"))
+    );
     let mut none = log_config(&[], None, None);
     none.http.listen = vec!["127.0.0.1:0".parse().unwrap()];
     assert!(check_config(&none).unwrap()[0].contains("no witnesses"));
@@ -746,17 +817,24 @@ fn log_and_witness_configuration() {
     assert!(bad(&|c| c.log.witnesses[1].vkey = test_w_vkey()).contains("twice"));
     assert!(bad(&|c| c.log.refresh_secs = 90_000).contains("refresh_secs"));
     assert!(bad(&|c| c.hostname = "Chat.Example.org".into()).contains("hostname"));
-    assert!(bad(&|c| {
-        c.witness.enabled = true;
-        c.witness.logs = vec!["nonsense".into()];
-    })
-    .contains("witness.logs"));
-    let log2 = Cosigner::from_seed(&origin(2), &[2; 32]).unwrap().vkey().to_string();
-    assert!(bad(&|c| {
-        c.witness.enabled = true;
-        c.witness.logs = vec![log2.clone()];
-    })
-    .contains("hand-off"));
+    assert!(
+        bad(&|c| {
+            c.witness.enabled = true;
+            c.witness.logs = vec!["nonsense".into()];
+        })
+        .contains("witness.logs")
+    );
+    let log2 = Cosigner::from_seed(&origin(2), &[2; 32])
+        .unwrap()
+        .vkey()
+        .to_string();
+    assert!(
+        bad(&|c| {
+            c.witness.enabled = true;
+            c.witness.logs = vec![log2.clone()];
+        })
+        .contains("hand-off")
+    );
     // The whole configuration refuses it too.
     let mut c = both();
     c.log.k = Some(5);

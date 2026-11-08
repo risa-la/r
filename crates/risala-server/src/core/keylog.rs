@@ -160,10 +160,7 @@ fn settings(config: &Config) -> Result<Option<Settings>, String> {
             .iter()
             .any(|t: &Target| t.verifier.name() == verifier.name())
         {
-            return Err(format!(
-                "log.witnesses names {} twice",
-                verifier.name()
-            ));
+            return Err(format!("log.witnesses names {} twice", verifier.name()));
         }
         witnesses.push(Target {
             verifier,
@@ -173,7 +170,9 @@ fn settings(config: &Config) -> Result<Option<Settings>, String> {
     let n = witnesses.len();
     let k = log.k.unwrap_or(if n == 0 { 0 } else { n / 2 + 1 });
     if k > n || (n > 0 && k == 0) {
-        return Err(format!("log.k is {k}, but must be 1 to {n}, the number of witnesses"));
+        return Err(format!(
+            "log.k is {k}, but must be 1 to {n}, the number of witnesses"
+        ));
     }
     if !(60..=43_200).contains(&log.refresh_secs) {
         return Err(format!(
@@ -195,7 +194,9 @@ fn settings(config: &Config) -> Result<Option<Settings>, String> {
 }
 
 /// The witness's name and the first logs it enrols, from `[witness]`.
-fn witness_settings(config: &Config) -> Result<Option<(String, Vec<risala_keylog::LogKey>)>, String> {
+fn witness_settings(
+    config: &Config,
+) -> Result<Option<(String, Vec<risala_keylog::LogKey>)>, String> {
     let w = &config.witness;
     if !w.enabled {
         return Ok(None);
@@ -288,7 +289,10 @@ struct Logs {
 
 impl Logs {
     fn current(&self) -> &Run {
-        self.runs.values().next_back().expect("there is always a log")
+        self.runs
+            .values()
+            .next_back()
+            .expect("there is always a log")
     }
 
     fn current_mut(&mut self) -> &mut Run {
@@ -392,11 +396,8 @@ impl State {
                 let seed = store.witness_seed(random_seed()?, now)?;
                 let cosigner = Cosigner::from_seed(&name, &seed)
                     .map_err(|e| StoreError::Setup(format!("witness key: {e}")))?;
-                let core = WitnessCore::new(
-                    cosigner,
-                    StoreWitness(store.clone()),
-                    CoreConfig::default(),
-                );
+                let core =
+                    WitnessCore::new(cosigner, StoreWitness(store.clone()), CoreConfig::default());
                 tracing::info!(vkey = %core.vkey(), "acting as a key log witness (4.10)");
                 let enrols = logs
                     .into_iter()
@@ -414,14 +415,20 @@ impl State {
 
     /// The current log, as a chain's `master` or `log` record names it
     /// (4.4), or `None` if the server keeps no log.
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn current_log(&self) -> Option<LogKey> {
         let side = self.log.as_ref()?;
         Some(lock(&side.logs).current().key.clone())
     }
 
     /// The URL prefix of the current log, `log=` in INFO (8.5).
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn url(&self) -> Option<String> {
         let side = self.log.as_ref()?;
         let n = lock(&side.logs).current().number();
@@ -429,23 +436,33 @@ impl State {
     }
 
     /// The URL prefix of log `number`, if the server has run it.
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn url_of(&self, number: u64) -> Option<String> {
         let side = self.log.as_ref()?;
-        lock(&side.logs).runs.contains_key(&number).then(|| {
-            format!("{}{LOG_PATH}{number}", side.settings.base_url)
-        })
+        lock(&side.logs)
+            .runs
+            .contains_key(&number)
+            .then(|| format!("{}{LOG_PATH}{number}", side.settings.base_url))
     }
 
     /// The verifier key of the current log, `log-key=` in INFO (8.5), and
     /// what a key file's `log` line names (4.4).
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn vkey(&self) -> Option<String> {
         Some(self.current_log()?.vkey())
     }
 
     /// The number of entries in the current log.
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn size(&self) -> Option<u64> {
         let side = self.log.as_ref()?;
         Some(lock(&side.logs).current().size())
@@ -453,24 +470,37 @@ impl State {
 
     /// Every log the server has run, oldest first. Each one before the
     /// current one has handed off to the next (4.5).
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn logs(&self) -> Vec<LogKey> {
         self.log.as_ref().map_or_else(Vec::new, |side| {
-            lock(&side.logs).runs.values().map(|r| r.key.clone()).collect()
+            lock(&side.logs)
+                .runs
+                .values()
+                .map(|r| r.key.clone())
+                .collect()
         })
     }
 
     /// The server's own hand-offs, for the chain checks of KEYS PUT
     /// ([`risala_proto::chain::keys_put`]): a chain in one of the server's
     /// logs continues in each later one (4.5).
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn handoffs(&self) -> OwnHandoffs {
         OwnHandoffs { logs: self.logs() }
     }
 
     /// The witness's verifier key, for its operator to publish (4.10), in
     /// witness mode.
-    #[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+    #[allow(
+        dead_code,
+        reason = "the API of the identity area (SV1) and INFO (SV5)"
+    )]
     pub(crate) fn witness_vkey(&self) -> Option<String> {
         let w = self.witness.as_ref()?;
         Some(lock(&w.core).vkey().to_string())
@@ -581,7 +611,10 @@ impl LogSide {
 /// The server's own logs as hand-offs (4.5): every log before the current
 /// one handed off to the next.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+#[allow(
+    dead_code,
+    reason = "the API of the identity area (SV1) and INFO (SV5)"
+)]
 pub(crate) struct OwnHandoffs {
     logs: Vec<LogKey>,
 }
@@ -604,7 +637,10 @@ pub(super) fn conn_closed(_inner: &Arc<Inner>, _id: ConnId, _conn: &ConnEntry) {
 
 /// Where a record is in the key log.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+#[allow(
+    dead_code,
+    reason = "the API of the identity area (SV1) and INFO (SV5)"
+)]
 pub(crate) struct Logged {
     /// The log.
     pub(crate) log: LogKey,
@@ -614,7 +650,10 @@ pub(crate) struct Logged {
 
 /// Why the log did not append records.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+#[allow(
+    dead_code,
+    reason = "the API of the identity area (SV1) and INFO (SV5)"
+)]
 pub(crate) enum AppendError {
     /// The server keeps no key log.
     #[error("the server keeps no key log")]
@@ -646,7 +685,10 @@ pub(crate) enum AppendError {
 /// `uid`, and each follows the newest record of `uid` that the host's logs
 /// hold, if they hold any. Records are appended all or none. A witnessed
 /// checkpoint that includes them follows within the hour ([`maintain`]).
-#[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+#[allow(
+    dead_code,
+    reason = "the API of the identity area (SV1) and INFO (SV5)"
+)]
 pub(crate) async fn append_records(
     inner: &Arc<Inner>,
     uid: &Identity,
@@ -660,9 +702,7 @@ pub(crate) async fn append_records(
         let uid = uid.clone();
         tokio::task::spawn_blocking(move || append_blocking(&inner, &uid, &records))
     };
-    let logged = task
-        .await
-        .map_err(|e| StoreError::Task(e.to_string()))??;
+    let logged = task.await.map_err(|e| StoreError::Task(e.to_string()))??;
     if let Some(side) = &inner.keylog.log {
         side.wake.notify_one();
     }
@@ -724,8 +764,28 @@ fn append_blocking(
         .collect())
 }
 
+#[cfg(test)]
+impl Hub {
+    /// [`append_records`], for tests outside `core`.
+    pub(crate) async fn append_for_tests(
+        &self,
+        uid: &Identity,
+        records: Vec<Record>,
+    ) -> Result<Vec<Logged>, AppendError> {
+        append_records(&self.inner, uid, records).await
+    }
+
+    /// The key log's verifier key, for tests outside `core`.
+    pub(crate) fn log_vkey(&self) -> Option<String> {
+        self.inner.keylog.vkey()
+    }
+}
+
 /// Where a record is logged, if any of the server's logs holds it.
-#[allow(dead_code, reason = "the API of the identity area (SV1) and INFO (SV5)")]
+#[allow(
+    dead_code,
+    reason = "the API of the identity area (SV1) and INFO (SV5)"
+)]
 pub(crate) async fn index_of(
     inner: &Arc<Inner>,
     hash: risala_proto::names::BlobRef,
@@ -747,14 +807,14 @@ pub(crate) async fn index_of(
 // ---------------------------------------------------------------------------
 // Witnessing
 
+/// A response's status and body, or why there was none.
+pub(crate) type Posted<'a> =
+    Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), String>> + Send + 'a>>;
+
 /// How the log reaches its witnesses: an HTTPS POST (4.5, [TLOG-WITNESS]).
 pub(crate) trait Transport: Send + Sync {
     /// POSTs `body` to `url`, and returns the response's status and body.
-    fn post<'a>(
-        &'a self,
-        url: &'a str,
-        body: Vec<u8>,
-    ) -> Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), String>> + Send + 'a>>;
+    fn post<'a>(&'a self, url: &'a str, body: Vec<u8>) -> Posted<'a>;
 }
 
 /// Signs a checkpoint of the first `size` entries of log `number` at
@@ -881,10 +941,7 @@ async fn send_handoff(inner: &Inner, i: usize, number: u64, sc: &SignedCheckpoin
         };
         (index, proof)
     };
-    let entry = match inner
-        .db(move |s| s.log_entries(number, request.0, 1))
-        .await
-    {
+    let entry = match inner.db(move |s| s.log_entries(number, request.0, 1)).await {
         Ok(mut e) if e.len() == 1 => e.remove(0).entry,
         _ => return false,
     };
@@ -901,11 +958,18 @@ async fn send_handoff(inner: &Inner, i: usize, number: u64, sc: &SignedCheckpoin
     match tokio::time::timeout(WITNESS_TIMEOUT, transport.post(&url, body)).await {
         Ok(Ok((200, _))) => true,
         Ok(Ok((status, _))) => {
-            tracing::info!(witness = target.verifier.name(), status, "a witness refused a hand-off");
+            tracing::info!(
+                witness = target.verifier.name(),
+                status,
+                "a witness refused a hand-off"
+            );
             false
         }
         _ => {
-            tracing::info!(witness = target.verifier.name(), "a witness did not take a hand-off");
+            tracing::info!(
+                witness = target.verifier.name(),
+                "a witness did not take a hand-off"
+            );
             false
         }
     }
@@ -998,7 +1062,12 @@ pub(crate) async fn witness_round(inner: &Arc<Inner>) -> bool {
             done = false;
             continue;
         }
-        tracing::debug!(log = number, size, cosignatures = count, "witnessed checkpoint");
+        tracing::debug!(
+            log = number,
+            size,
+            cosignatures = count,
+            "witnessed checkpoint"
+        );
         if old {
             // Each witness of the old log takes its hand-off before the next
             // log's first checkpoint reaches it (4.10).
@@ -1182,10 +1251,7 @@ impl Hub {
         };
         if let Some(tile) = tile {
             let (start, width) = (tile.index() * TILE_WIDTH, u64::from(tile.width()));
-            let entries = match inner
-                .db(move |s| s.log_entries(number, start, width))
-                .await
-            {
+            let entries = match inner.db(move |s| s.log_entries(number, start, width)).await {
                 Ok(entries) => entries,
                 Err(e) => {
                     tracing::error!(error = %e, "reading log entries");

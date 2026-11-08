@@ -103,9 +103,8 @@ impl KeyLogStore for SqliteStore {
 
     fn first_log_key(&self, seed: [u8; 32], now: Timestamp) -> Result<Vec<LogKeyRow>> {
         self.write(|tx| {
-            let any: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM log_key)", [], |r| {
-                r.get(0)
-            })?;
+            let any: bool =
+                tx.query_row("SELECT EXISTS (SELECT 1 FROM log_key)", [], |r| r.get(0))?;
             if !any {
                 tx.execute(
                     "INSERT INTO log_key (number, seed, created) VALUES (1, ?, ?)",
@@ -208,9 +207,8 @@ impl KeyLogStore for SqliteStore {
             let mut select = tx.prepare_cached(
                 "SELECT idx FROM log_entries WHERE log = ? AND uid_hash = ? ORDER BY idx",
             )?;
-            let rows = select.query_map(params![sql_u64(log), &uid_hash[..]], |r| {
-                r.get::<_, i64>(0)
-            })?;
+            let rows =
+                select.query_map(params![sql_u64(log), &uid_hash[..]], |r| r.get::<_, i64>(0))?;
             rows.map(|i| from_sql_u64("index", i?)).collect()
         })
     }
@@ -340,22 +338,24 @@ impl KeyLogStore for SqliteStore {
                     },
                 )
                 .optional()?;
-            row.map(|(vkey, size, root, domain, enrolled, last, h_index, h_next)| {
-                let handoff = match (h_index, h_next) {
-                    (Some(i), Some(next)) => Some((from_sql_u64("hand-off index", i)?, next)),
-                    _ => None,
-                };
-                Ok(WitnessLogRow {
-                    origin: origin.to_owned(),
-                    vkey,
-                    size: from_sql_u64("size", size)?,
-                    root: fixed("root", &root)?,
-                    domain,
-                    enrolled_at: from_sql_u64("time", enrolled)?,
-                    last_cosigned: from_sql_u64("time", last)?,
-                    handoff,
-                })
-            })
+            row.map(
+                |(vkey, size, root, domain, enrolled, last, h_index, h_next)| {
+                    let handoff = match (h_index, h_next) {
+                        (Some(i), Some(next)) => Some((from_sql_u64("hand-off index", i)?, next)),
+                        _ => None,
+                    };
+                    Ok(WitnessLogRow {
+                        origin: origin.to_owned(),
+                        vkey,
+                        size: from_sql_u64("size", size)?,
+                        root: fixed("root", &root)?,
+                        domain,
+                        enrolled_at: from_sql_u64("time", enrolled)?,
+                        last_cosigned: from_sql_u64("time", last)?,
+                        handoff,
+                    })
+                },
+            )
             .transpose()
         })
     }
@@ -430,7 +430,13 @@ mod tests {
     fn entries_append_in_order_and_never_twice() {
         let store = SqliteStore::open_in_memory().unwrap();
         let logs = store.first_log_key([1; 32], t()).unwrap();
-        assert_eq!(logs, [LogKeyRow { number: 1, seed: [1; 32] }]);
+        assert_eq!(
+            logs,
+            [LogKeyRow {
+                number: 1,
+                seed: [1; 32]
+            }]
+        );
         // Log 1 is started once.
         assert_eq!(store.first_log_key([2; 32], t()).unwrap(), logs);
         assert_eq!(store.log_size(1).unwrap(), 0);

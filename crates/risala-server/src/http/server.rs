@@ -344,7 +344,8 @@ async fn read_body<S: AsyncRead + Unpin>(
     head: &[u8],
     end: usize,
 ) -> Result<Vec<u8>, Response> {
-    let text = std::str::from_utf8(&head[..end]).map_err(|_| Response::error(400, "Bad Request"))?;
+    let text =
+        std::str::from_utf8(&head[..end]).map_err(|_| Response::error(400, "Bad Request"))?;
     let mut length = None;
     for line in text.split('\n').skip(1) {
         let line = line.trim_end_matches('\r');
@@ -363,7 +364,8 @@ async fn read_body<S: AsyncRead + Unpin>(
         return Err(Response::error(413, "Content Too Large"));
     }
     // The blank line after the head is LF or CRLF.
-    let start = end + if head.get(end + 1) == Some(&b'\n') { 2 } else { 3 };
+    let crlf = head.get(end + 1) == Some(&b'\r');
+    let start = end + 2 + usize::from(crlf);
     let mut body = head.get(start..).unwrap_or_default().to_vec();
     body.truncate(length);
     let mut chunk = [0u8; 4096];
