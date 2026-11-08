@@ -680,6 +680,12 @@ encrypted conversations (12.2). Revoking a lost device's key means
 deleting its line, which also removes the device from those
 conversations (12.6).
 
+A key file may also list the identity's recovery key (12.10), with the
+label `recovery`. It signs in like any other key, but it is not a
+device: clients never use it in encrypted conversations. Servers and
+devices treat it like any other key. The label is only for clients and
+people.
+
 Keys are shortened here. Appendix B has a full one.
 
 ```
@@ -3190,6 +3196,16 @@ instead. Backups are optional for users. Servers MUST support them.
   HKDF-Expand(HKDF-Extract("", recovery key), info, 32), where `info` is
   `risala backup ` followed by the uid. Its **key id** is the first 8
   bytes of its SHA-384 hash.
+- The recovery key is also a key of the identity (4.4). Its ML-DSA-44
+  key pair is generated from a 32-byte seed [FIPS204] derived the same
+  way, with `info` `risala identity ` followed by the uid. The client
+  that creates a recovery key adds this public key to the identity's
+  key file with the label `recovery`: with KEY ADD if the server hosts
+  the identity (4.7), or otherwise by showing the key file line for the
+  user to add. It then removes the previous recovery key's line, if
+  there was one, which it finds by deriving that key's public key.
+- A client MUST NOT upload KeyPackages (12.4) on a connection signed in
+  with the recovery key, so that the recovery key never joins a group.
 - A client that creates a recovery key shows it to the user once, and
   sends it to the identity's other devices as a RECOVERY line, in base64
   with padding, in the conversation with itself. Devices MUST ignore
@@ -3237,10 +3253,19 @@ To restore, a device that has the recovery key sends BACKUP GET for each
 conversation SYNC lists, and decrypts the blobs whose key id matches. If
 none match, the recovery key is wrong.
 
+Someone who has lost every device can get their identity back with the
+recovery key. On a new device, the client derives the recovery key's
+key pair, signs in with it (4.5), adds the new device's key and removes
+the keys of the lost devices (4.7, or by editing the key file for an
+identity the server does not host), then signs in again with the new
+device's key. The new device then joins the identity's encrypted
+conversations (12.6), and restores the history keys as above.
+
 A device that is lost keeps the recovery key it was sent. So when one of
 an identity's keys is removed, its client SHOULD offer to make a new
-recovery key. It then deletes every blob, and backs up the history keys
-again under the new one.
+recovery key. It then replaces the recovery key's line in the key file,
+deletes every blob, and backs up the history keys again under the new
+one.
 
 ### 12.11. What Changes in Encrypted Conversations
 
@@ -3308,7 +3333,10 @@ A device does not take the server's word for which keys belong to whom:
   removes nothing.
 - Clients SHOULD show each identity's devices, and tell the user when
   one is added or removed, so that people notice a device they do not
-  recognise.
+  recognise. A client MAY show a key labelled `recovery` as the
+  identity's recovery key rather than as a device, but only while no
+  group has a leaf with it: a key with a leaf is a device, whatever its
+  label says.
 - Clients SHOULD let people compare device keys through another channel.
   A key's fingerprint is `sha256:` followed by the SHA-256 hash of the
   raw public key in lower-case hex, as in 2.2.
@@ -3426,9 +3454,12 @@ Lines a server can send:
   a device has committed a fresh leaf (12.6), keys stolen earlier do not
   decrypt new messages.
 - **Recovery keys.** A recovery key (12.10) decrypts the identity's whole
-  backup, so it should be stored like a password. The server holds only
-  encrypted backups. Every device of the identity knows the recovery
-  key, so after a device is lost, the user should make a new one.
+  backup, and is also one of its keys (4.4), which can sign in and add
+  and remove the others. Whoever holds it controls the identity, so it
+  should be stored like a password. The server holds only encrypted
+  backups. Every device of the identity knows the recovery key, so after
+  a device is lost, the user should make a new one, which also replaces
+  the old one in the key file.
 - **What the server can still do.** It can withhold, delay or reorder
   encrypted messages, and refuse commits. Devices detect replayed and
   re-pointed messages (12.8), but not ones that are withheld.
@@ -3547,8 +3578,9 @@ Lines a server can send:
   the conversation extension (12.2).
 - **Labels:** the MLS exporter label `risala history` (12.9), the
   SignWithLabel label `risala message` and the ExpandWithLabel label
-  `risala message key` (12.8), the HKDF info prefix `risala backup `
-  (12.10), and the sign-in prefix `risala-auth-1` (4.5).
+  `risala message key` (12.8), the HKDF info prefixes `risala backup `
+  and `risala identity ` (12.10), and the sign-in prefix `risala-auth-1`
+  (4.5).
 
 ---
 
