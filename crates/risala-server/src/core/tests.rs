@@ -2166,7 +2166,7 @@ impl crate::store::MessageStore for Flaky {
         f: &Uid,
         t: Seq,
         x: &str,
-        s: Option<Timestamp>,
+        s: Option<Seq>,
     ) -> crate::store::Result<Option<Seq>> {
         self.inner.reaction(c, f, t, x, s)
     }

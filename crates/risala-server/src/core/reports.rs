@@ -246,7 +246,7 @@ impl Inner {
         };
         // A guest's name may have been someone else's before its session
         // (5.3): their messages are not its own.
-        if self.is_author(uid, &event) {
+        if self.is_author(uid, key, &event) {
             return Err(fail(
                 ErrorCode::Forbidden,
                 "you cannot report your own message",

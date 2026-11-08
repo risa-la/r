@@ -51,15 +51,15 @@ pub trait MessageStore {
     fn delete_of(&self, conv: ConvKey, target: Seq) -> Result<Option<Seq>>;
 
     /// The seq of the reaction `from` sent to message `target` with exactly
-    /// `text` (escaped), at or after `since` if given, and not deleted
-    /// (5.3). The oldest, if there are several.
+    /// `text` (escaped), with a seq of at least `since` if given, and not
+    /// deleted (5.3). The oldest, if there are several.
     fn reaction(
         &self,
         conv: ConvKey,
         from: &Uid,
         target: Seq,
         text: &str,
-        since: Option<Timestamp>,
+        since: Option<Seq>,
     ) -> Result<Option<Seq>>;
 
     /// A page of RELATED (7.3): the edits and reactions whose target is in

@@ -383,10 +383,12 @@ pub(crate) struct GuestSession {
     /// The guest's display name (8.2), escaped; empty if none. It lasts as
     /// long as the session.
     pub(crate) display_name: String,
-    /// When the session started. Messages sent under the name before then
-    /// were another guest's, so this one may not edit or delete them (4.2,
-    /// 5.3, 5.4).
-    pub(crate) started: Timestamp,
+    /// The seq of the first message the session sent in each conversation.
+    /// Messages sent there under the name before it were another guest's,
+    /// so this one may not edit or delete them (4.2, 5.3, 5.4). The name is
+    /// the session's alone while it lasts, so every later one is its own.
+    /// Seqs, not times, so that a clock that steps back changes nothing.
+    pub(crate) first_sent: HashMap<ConvKey, Seq>,
 }
 
 impl GuestSession {

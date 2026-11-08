@@ -26,7 +26,7 @@ impl MessageStore for SqliteStore {
         from: &Uid,
         target: Seq,
         text: &str,
-        since: Option<Timestamp>,
+        since: Option<Seq>,
     ) -> Result<Option<Seq>> {
         self.conn()
             .prepare_cached(
@@ -34,7 +34,7 @@ impl MessageStore for SqliteStore {
                  JOIN event_text x ON x.conv = e.conv AND x.seq = e.seq \
                  WHERE e.conv = ? AND e.target = ? AND e.verb = 'MSG' \
                  AND e.relation = 'react' AND e.deleted = 0 AND e.author = ? \
-                 AND e.t >= ? AND x.text = ? \
+                 AND e.seq >= ? AND x.text = ? \
                  ORDER BY e.seq LIMIT 1",
             )?
             .query_row(
@@ -42,7 +42,7 @@ impl MessageStore for SqliteStore {
                     conv.0,
                     sql_seq(target),
                     from.as_str(),
-                    since_ms(since),
+                    since.map_or(0, sql_seq),
                     text
                 ],
                 |row| row.get::<_, i64>(0),

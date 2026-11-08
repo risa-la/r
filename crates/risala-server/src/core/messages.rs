@@ -40,7 +40,8 @@ use super::state::{ConvState, RoomInfo};
 use super::{Hub, Inner};
 use crate::handler::ConnId;
 use crate::store::{
-    Appended, EventKind, NewEvent, PurgeQuery, RelatedQuery, RoomSettings, StoreError, StoredEvent,
+    Appended, ConvKey, EventKind, NewEvent, PurgeQuery, RelatedQuery, RoomSettings, StoreError,
+    StoredEvent,
 };
 
 /// How often [`Hub::expire_every`] runs in `risalad` (7.5). Periods are
@@ -96,25 +97,30 @@ impl Inner {
         }
     }
 
-    /// Since when `uid`'s messages count as its own, or `None` for all of
-    /// them. The one place that decides whose message it is: see the
-    /// module documentation.
-    fn own_since(&self, uid: &Uid) -> Option<Timestamp> {
+    /// From which seq of the conversation `conv` `uid`'s messages count as
+    /// its own, or `None` for all of them. The one place that decides
+    /// whose message it is: see the module documentation.
+    fn own_since(&self, uid: &Uid, conv: ConvKey) -> Option<Seq> {
         if uid.is_identity() {
             return None;
         }
-        // A guest with no session sends nothing: nothing is its own.
+        // A guest with no session sends nothing, and one that has sent
+        // nothing here has nothing of its own here.
         Some(
             self.reg()
                 .sessions
                 .get(uid)
-                .map_or(Timestamp::MAX, |s| s.started),
+                .and_then(|s| s.first_sent.get(&conv).copied())
+                .unwrap_or(Seq::MAX),
         )
     }
 
-    /// Whether `uid` wrote `event` (5.3, 5.4).
-    pub(super) fn is_author(&self, uid: &Uid, event: &StoredEvent) -> bool {
-        event.from == *uid && self.own_since(uid).is_none_or(|since| event.t >= since)
+    /// Whether `uid` wrote `event` of the conversation `conv` (5.3, 5.4).
+    pub(super) fn is_author(&self, uid: &Uid, conv: ConvKey, event: &StoredEvent) -> bool {
+        event.from == *uid
+            && self
+                .own_since(uid, conv)
+                .is_none_or(|since| event.seq >= since)
     }
 
     /// MSG (5.3), in rooms, with a `reply`, `edit` or `react` tag.
@@ -188,7 +194,7 @@ impl Inner {
             }
             Some(Relation::Edit(target)) => {
                 let target = self.check_target(st, target).await?;
-                if !self.is_author(uid, &target) {
+                if !self.is_author(uid, st.key, &target) {
                     return Err(fail(
                         ErrorCode::Forbidden,
                         "only the author may edit a message",
@@ -203,7 +209,7 @@ impl Inner {
                 }
                 // The same reaction again is the same event (5.3).
                 let (key, from, reaction) = (st.key, uid.clone(), text.clone());
-                let since = self.own_since(uid);
+                let since = self.own_since(uid, st.key);
                 let earlier = self
                     .db(move |s| s.reaction(key, &from, target, &reaction, since))
                     .await?;
@@ -229,11 +235,13 @@ impl Inner {
             Appended::New(seq) => {
                 Self::broadcast_event(st, &event);
                 self.typing_ended(uid, &st.id);
-                if let Some(cid) = cid
-                    && uid.is_guest()
+                if uid.is_guest()
                     && let Some(session) = self.reg().sessions.get_mut(uid)
                 {
-                    session.cids.insert(st.id.clone(), cid, seq, now);
+                    session.first_sent.entry(st.key).or_insert(seq);
+                    if let Some(cid) = cid {
+                        session.cids.insert(st.id.clone(), cid, seq, now);
+                    }
                 }
                 Ok(Some(OkResponse::new().with_seq(seq)))
             }
@@ -294,7 +302,7 @@ impl Inner {
             .filter(|e| matches!(e.kind, EventKind::Msg { .. }));
         // Authors may delete their own messages even where they can no
         // longer read, so this comes before the reading rules (5.4).
-        let own = event.as_ref().is_some_and(|e| self.is_author(uid, e));
+        let own = event.as_ref().is_some_and(|e| self.is_author(uid, key, e));
         if !own {
             let info = room_of(st)?;
             check_read(info, self.asker(uid, st.is_member(uid)))?;

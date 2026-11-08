@@ -405,6 +405,35 @@ async fn a_guest_name_taken_again_is_not_the_author() {
     assert_eq!(sam.lines().last().unwrap(), "OK seq=7");
 }
 
+/// Whose message it is goes by seqs, not times: a clock that steps back
+/// does not give a new guest the old one's messages.
+#[tokio::test]
+async fn a_clock_stepping_back_does_not_make_a_guest_the_author() {
+    let mut h = Harness::new();
+    let (sam, _) = h.joined("sam", "#general").await;
+    h.send(&sam, "msg #general lunch?").await; // 2
+    h.leave(sam, "sam").await; // 3
+    let earlier = start().unix_millis() - 60 * 60 * 1000;
+    h.clock.set(Timestamp::from_unix_millis(earlier).unwrap());
+
+    let (mut sam, _) = h.joined("sam", "#general").await; // 4
+    h.send(&sam, "@edit=2 msg #general dinner?").await;
+    h.send(&sam, "delete #general 2").await;
+    assert_eq!(
+        sam.lines(),
+        [
+            "ERR forbidden only the author may edit a message",
+            "ERR forbidden only moderators may delete others' messages",
+        ]
+    );
+    h.send(&sam, "msg #general tea?").await; // 5
+    h.send(&sam, "@edit=5 msg #general coffee?").await; // 6
+    h.send(&sam, "delete #general 5").await; // 7
+    let lines = sam.lines();
+    assert!(lines.contains(&"OK seq=6".to_owned()), "{lines:?}");
+    assert_eq!(lines.last().unwrap(), "OK seq=7");
+}
+
 #[tokio::test]
 async fn delete_in_a_direct_conversation_waits_for_m5a() {
     let mut h = Harness::new();
@@ -889,7 +918,11 @@ fn the_store_finds_reactions_and_authored_rooms() {
     );
     assert_eq!(s.reaction(a, &sam, seq(1), "👎", None).unwrap(), None);
     assert_eq!(
-        s.reaction(a, &sam, seq(1), "👍", Some(later)).unwrap(),
+        s.reaction(a, &sam, seq(1), "👍", Some(seq(2))).unwrap(),
+        Some(seq(2))
+    );
+    assert_eq!(
+        s.reaction(a, &sam, seq(1), "👍", Some(seq(3))).unwrap(),
         None
     );
     let bob = BOB.parse().unwrap();

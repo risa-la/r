@@ -910,7 +910,7 @@ impl Inner {
                         expiry: None,
                         ending: false,
                         display_name: String::new(),
-                        started: self.now(),
+                        first_sent: HashMap::new(),
                     },
                 );
                 Ok(SignIn::New)

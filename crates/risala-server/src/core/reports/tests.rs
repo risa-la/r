@@ -176,7 +176,6 @@ async fn what_may_be_reported() {
     let mut sam = h.guest("sam").await;
     let mut alice = h.signed_in_as(ALICE);
     let mut bob = h.signed_in_as(BOB);
-    let mut spammer = h.guest("spammer").await;
     let enc = "g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4= VEVYVA== x";
     // Not a message, no such event, or a deleted one.
     for n in [1, 99, 9] {
@@ -188,9 +187,8 @@ async fn what_may_be_reported() {
         )
         .await;
     }
-    // Your own.
+    // Your own. A guest's own is in the next test.
     let own = "ERR forbidden you cannot report your own message";
-    expect(&h, &mut spammer, "report #general 5", own).await;
     expect(&h, &mut alice, "report #private 4", own).await;
     // A room you cannot see, or that does not exist.
     expect(
