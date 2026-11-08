@@ -1805,6 +1805,346 @@ Open:
     to change, and listed it here. None of these is settled until the
     user confirms it.
 
+    The full findings, with every option the reviewers gave, are kept
+    outside the repository in `/home/humaid/repos/risala-m5b/`: the
+    reviews (`review-*.md`), the fixers' and coders' choices
+    (`choices-*.md`) and the run's notes (`STATE.md`). Draft-03 had
+    three reviews: round 1 by area, round 2 for security and
+    consistency, round 3 a final one. The codes in parentheses (S-H6,
+    D-M3 and so on) are the reviewers' finding numbers.
+
+    **Choices that change something the user decided.** Each of these
+    goes back on, or narrows, an earlier item. They are in the spec now,
+    and each needs a yes or a no.
+
+    - **Forks no longer stop rooms** (4.4, 4.5, 12.7, 12.14; round 2,
+      S-H6). This changes item 60's answer "a fork stops sending in
+      every conversation with that identity, rooms included", and item
+      56's fork bullet. Why: a fork needs only the identity's own keys,
+      so anyone could fork their own chain, join every public room and
+      freeze them all, and any member could freeze a private room the
+      same way, or by taking its key file down. Now, for an identity
+      that is forked or whose keys are missing:
+      - in a direct conversation, sending stops, as before;
+      - in rooms, its leaves are shown as unverified, what they send is
+        hidden, and devices keep sending;
+      - in rooms that are not public, its leaves are also removed at
+        once, and come back once its keys are back and no fork is known
+        (but see R-M1 below: they do not come back by themselves);
+      - in public rooms, an owner's or moderator's device SHOULD ban a
+        forked identity, and MAY kick one whose keys are missing.
+    - **A missing key file now takes an identity out of private rooms**
+      (same fix). This partly reverses round 1's choice (I-M11) that
+      missing keys only stop sending and remove nothing. Devices are
+      still never removed *by record* for it, but whoever hosts a key
+      file can push its identity out of private rooms for as long as the
+      file is gone. Section 14 says so.
+    - **Owners and moderators are removed "for a check" only by their
+      own kind** (12.7, 6.3; round 3, R-H2). This narrows the first
+      bullet. In a room, the leaves of an identity listed in `owners`
+      may be removed for a check (fork, missing keys, failed key check,
+      impostor, RESYNC) only by that identity or an owner; those of one
+      in `mods` only by that identity, an owner or a moderator. Other
+      members' devices only hide what it sends, warn, and keep sending.
+      "A room whose owners are gone" (6.3) now looks at the group before
+      the commit, so a moderator cannot remove the owners and take their
+      place in one commit. Why: otherwise any member could remove a
+      private room's only owner on a claim nobody can check, and only
+      owners can add owners back. What it costs:
+      - a forked, compromised or keys-missing owner or moderator stays
+        in the room, and its leaves go on reading it, until its own
+        devices or an owner remove it;
+      - **a room's only owner who loses every device never gets back
+        in.** Recovery removes the old devices by record, but only an
+        owner may remove an owner's leaves, so the old leaves stay for
+        good (a thief holding one still reads), the new device can never
+        be added, and moderators cannot help (4.8, 12.7, 14, D.3).
+
+      The alternative is round 2's rule as written, accepting that any
+      member can leave a private room without owners and any moderator
+      can take one over.
+    - **No rate limits per pseudonym** (5.2, 7.3, 14; round 1, D-M3).
+      This changes item 54's "limits per pseudonym". The server cannot
+      tell whose pseudonym a post carries, so anyone in a room could use
+      up a moderator's limit with junk under their pseudonym, and a
+      spammer could use a new pseudonym for every post. Servers now
+      limit posts per connection and per network address only. Mutes
+      stay.
+    - **In public rooms the server sees who commits** (4.1, 5.2, 12.6,
+      14; round 1, M-M1 and D-C1). Every commit, external commit and
+      Update proposal by an identity's leaf in a public room goes on the
+      signed-in connection of the device its credential names, and a
+      guest's join on its guest connection. This changes item 54's
+      sealed sending, and item 60's "posting only on anonymous or guest
+      connections", for public-room commits. Why: public-room joins no
+      longer carry a device binding (next bullet), so this is what stops
+      anyone committing under someone else's name and lets the server
+      refuse banned identities. It proves nothing to third parties. What
+      it costs: the server learns who commits in a public room, which is
+      roughly who sent the day before (senders rotate their leaves
+      daily), and in quiet rooms may tie a pseudonym to a commit by
+      timing. Messages are still posted anonymously.
+    - **Public rooms' roles rest on the server** (12.3, 12.6, 14, D.1,
+      D.3; round 1, M-H7, and round 3, R-H3). Public-room joins carry no
+      device binding, which drops item 60's binding in external commits.
+      Why: chained through the room's public commits to every later leaf
+      key, the binding proved who wrote any message there, which undid
+      the epochal signatures. The cost, found in round 3: a malicious
+      server can commit in any identity's name in a public room, and so
+      change its roles, bans and settings. Devices find that leaf
+      unconfirmed within an hour, warn, and SHOULD keep showing the
+      roles from before. This narrows item 51: "the server cannot change
+      a room's roles" now holds outside public rooms only. A real fix is
+      a larger redesign, left for later.
+    - **Proof of work is off until it is specified** (4.1; round 2,
+      B-M11). Item 42 decided it is on by default. Servers now MUST NOT
+      require it until a later draft specifies the puzzle; 4.1 says what
+      that draft will cover. Until then, joins of public rooms are
+      bounded only by rate limits.
+    - **Pseudonyms change every epoch, outside public rooms** (7.3,
+      12.9; round 2, S-M8). Item 60 had a random pseudonym per leaf,
+      pinned by devices, which let the server count a group's senders
+      and follow each one's rhythm for months. Now it is derived from
+      the epoch and the leaf, and checked by devices. Public rooms keep
+      a random pseudonym per day. An operator's ADMIN MUTE outside
+      public rooms now lasts only until the next commit.
+    - **Large rooms rotate leaves by Update proposals** (12.3, 12.10;
+      round 1, M-M7). This changes item 60's answer "every active sender
+      commits once a day in each large room". A device posts an Update
+      at a random time in the first 12 hours of the day, and full
+      clients commit pending Updates in batches; after 30 minutes
+      without, it commits its own. Light clients rotate by Update too,
+      instead of rejoining weekly.
+    - **Every device joins a public room by external proposal** (6.1,
+      12.6; M-M1, S-C1). Item 60 had full clients join by external
+      commit. External commits are now only for a resync, after a commit
+      the server accepted but devices reject, and for owners and
+      moderators whose proposal waits over 30 minutes.
+    - **Confirmation covers more than senders** (12.7, 12.10; round 1,
+      M-H5, and round 2, S-H1). This extends item 60's "senders only". A
+      device also challenges at once every new leaf of its own identity,
+      and any unconfirmed leaf that uses authority (a commit that needs
+      a role, removes another identity's leaf, and so on). No good
+      answer within an hour makes the leaf an impostor, which any member
+      may remove; undoing what it did takes ordinary commits. Owners and
+      moderators are invited by owners only.
+    - **Welcomes wait up to 10 minutes each** (12.8; round 1, D-H1).
+      Item 60 had up to a minute, all together. Each Welcome is now
+      sealed to its device and sent after its own random wait, so a new
+      direct conversation can take up to 10 minutes to reach the other
+      side.
+    - **A server with a key log logs outside identities whose chains
+      name it** (4.7; code, SV1), with no switch to refuse. Item 60 let
+      a server refuse.
+
+    **Open decisions.** Round 3 left two findings that need the user.
+    The spec now states each risk plainly, but the design is unchanged
+    until the user decides.
+
+    - **R-M1: getting back into a private room** (4.8, 4.9, 10.5, 12.7,
+      12.14, 14, D.3). Since round 2, only an owner's or moderator's Add
+      brings back an identity that has no leaf left in a private room
+      (an owner's, for an owner). Ordinary events take all of an
+      identity's leaves out: recovering after losing every device, a key
+      file that goes missing (a web move, an ADMIN UNREGISTER), a fork
+      the user later resolves, and a RESYNC by a
+      device with no other leaf there. The identity comes back only
+      where an owner's or moderator's device is online and its user
+      agrees, and a room's only owner never comes back (R-H2 above). The
+      options:
+      - A: keep the design, and add client SHOULDs: warn a sole owner
+        with no moderator and suggest adding one, and before recovery
+        say which rooms the user owns alone and will lose;
+      - B: for missing keys only (not forks or removal by record),
+        devices in rooms hide the identity's leaves and keep sending,
+        but remove them only once the keys have been missing for, say, 7
+        days, so a short outage costs nothing;
+      - C, later: a list of member uids in a private room's extension,
+        kept by invitations, kicks, bans and leaves, so that any member
+        may add a listed identity's devices (owners still need an
+        owner).
+
+      The reviewer recommends A and B now.
+    - **R-M2: a new master key freezes private rooms** (12.14, 14, D.1,
+      D.3). Item 60 is kept: a new master key stops sending in direct
+      conversations and private rooms until the user acknowledges it.
+      But it is as easy to cause as the fork freeze round 2 removed: any
+      member can do it with its own recovery key, and whoever controls a
+      member's domain can do it as often as it likes, with an unlogged
+      key file. In a room, stopping protects nothing, and acknowledging
+      is risky: once one member acknowledges, its device adds the new
+      key's devices to every room where the identity still has a leaf,
+      for everyone. In a room of 500, the domain's controller needs one
+      member to click through. The options:
+      - the reviewer's fix, which changes item 60's answer for rooms: in
+        rooms a new master key behaves like missing keys (warn, hide the
+        new key's leaves, keep sending), and only the identity's own
+        devices, or an owner or moderator whose user acknowledged, add
+        devices under the new key; direct conversations still stop until
+        acknowledged;
+      - keep item 60 as it is, with the risk stated (the spec now).
+
+      The reviewer recommends the fix.
+
+    **Design choices, by area.** These fill in what the spec left open,
+    or fix what could not be built. Section numbers are draft-03's.
+
+    *Identity and the key log.*
+    - **Moving logs** (4.3, 4.5; I-C1). The first `master` record names
+      its log's key. A `log` record moves a chain to another host's log.
+      A host replaces its own log by a hand-off entry, which carries
+      every chain over with nothing for users to do; a host that loses
+      its log key can never hand off, so its identities' chains stop
+      growing. First contact through another host's log is protected
+      only by safety numbers.
+    - **Key files list hashes** (4.4, 4.7; I-H2), and readers fetch the
+      records from the log. A chain holds at most 4,096 records.
+    - **Witnessing** (new 4.10; I-H3, B-H4, S-H5). A witness takes on a
+      log by fetching its key from the host over HTTPS, which proves
+      control of the host. "Fresh" means k cosignatures under 24 hours
+      old. k must be more than half the list; the default stays 2 of 3.
+      **The apps ship with an empty witness list** (C1), since no
+      independent witnesses run yet, so every log shows "witness list
+      does not fit" until one is set.
+    - **Stale identities** (4.5; I-M14). After 7 days without a fresh
+      checkpoint, an identity is shown as stale: no new devices of it
+      are added, and sending goes on.
+    - **A `retire` record** (4.4, 4.9; I-M11), signed by the master key,
+      ends an identity for good, so a thief holding only a device
+      cannot. Only accepted records remove devices.
+    - **Servers pin outside identities** (4.6, 10.5; I-M12), and accept
+      only key files that extend the pinned chain.
+    - **Rollback or new master key** (4.4, 4.5; C1). A key file that
+      does not extend the pinned chain is a fork if its chain holds the
+      pinned master key, and otherwise a new master key, which waits for
+      the user's acknowledgment.
+    - **Backup generation comes from the chain** (12.13; K-H4), so
+      recovery moves it too, and a device that moves it makes a new
+      backup at once.
+    - **Pairing** (4.8; I-M13, S-L1, C1). The IdentityBundle travels
+      sealed under the QR code's secret. The new device shows the uid
+      and the identity's current devices and asks the user to confirm,
+      and finishes only once its record is witnessed (up to 10 minutes).
+    - **New lines in the conversation with yourself** (12.9): RECORDS
+      (which records each device knows), SERVERS (the identity's
+      servers; the first is home) and PIN (server pins, shared across
+      devices).
+
+    *Groups, MLS and confirmation.*
+    - **Group checks look only at the group's current state** (7.2,
+      12.7; S-H2). A commit's validity depends on the group in its
+      epoch, the commit and its posts' times, never on history, so every
+      device judges it the same way, even one that joined a minute ago.
+      Rules that looked back 16 epochs or 24 hours went with it.
+    - **Group checks and key checks** (12.7; M-H2, S-H3). Key checks,
+      against key files, never make a commit invalid; they lead to
+      repair commits. Outside public rooms any member may remove one
+      identity's leaves per commit "for a check". A device that sees no
+      reason warns and names the remover; only the removed identity's
+      own devices can call it false and re-add.
+    - **Who may add whom** (12.7; S-H2, R-H1). Any member may add
+      devices of an identity that still has a leaf after the commit;
+      others only by invitation. An owner's devices are added only by
+      that identity or an owner.
+    - **Commit streaks** (12.3, 12.7; K-L6, S-M3), a new construction:
+      one identity starts at most 3 epochs in a row, unless 10 minutes
+      have passed, so one member cannot flood a group with commits.
+    - **Stale leaves** (12.7; K-H2, S-M1) are judged against the group's
+      median rather than the remover's own leaf, at most a tenth per
+      commit, and the device is added back from a new KeyPackage.
+    - **Moving a mailbox** (new 7.8; D-H3, S-M5). After someone is
+      removed from a direct conversation or private room, the group
+      moves to a new mailbox, so the removed member cannot keep watching
+      its traffic. Blocking does not move it (D-M5).
+    - **Send tokens** (7.2; M-C1, D-H4). The next epoch's token hash
+      could not sit inside its own commit, so it goes as `next=` on the
+      commit's POST, and every device checks it. A new TOKEN command
+      repairs a token set someone filled with junk.
+    - **Public rooms** (6.1, 12.7; S-C1, S-M2, K-H1). Older copies of a
+      credential and never-used leaves may be removed; a plain member's
+      commit removes at most a tenth of the leaves that way. A device
+      that sees the server accept a commit it holds invalid tells the
+      user, and rejoins only if they choose.
+    - **RESYNC** (12.7; M-M5). A device that cannot process a commit
+      asks, with a RESYNC line, to be replaced. librisala asks only once
+      it sees a post of the next epoch it cannot read, so a junk commit
+      does not make every member ask (C2).
+    - **Splits** (7.7; M-M9). READ carries a short check of the epoch,
+      which an identity's own devices compare.
+    - **Epochal signatures** (12.10; M-M6). REVEAL comes no earlier than
+      3 hours after the day ends, so a message becomes deniable within
+      about two days.
+    - **Past epochs** (12.9; K-H3, S-M6). Their messages are read for at
+      most an hour after the commit that ended them, and their secrets
+      are deleted 2 hours after it.
+    - **Confirmation in code** (M3). A sender that never answers stays
+      unconfirmed; a wrong answer makes it an impostor.
+    - **OpenMLS is vendored** (`crates/openmls`, 0.9.2) with marked
+      patches, so SelfRemove travels as a PrivateMessage and a resync
+      may remove other leaves. `last_resort` needed no patch.
+
+    *Metadata, mailboxes and push.*
+    - **Sealed Welcomes** (12.8; D-H1, S-H4). Outside public rooms each
+      Welcome is sealed to its device, so the server cannot read the
+      group's members from it. Only the device that fetched the
+      KeyPackage may put its Welcome.
+    - **Which connection for what** (4.1, 7.4; D-M1, D-M2, C0). Key
+      uploads, pairing and public-room commits go on the signed-in
+      connection or a one-shot one; new mailboxes, KeyPackage fetches
+      and Welcomes SHOULD each take a fresh anonymous one. Otherwise
+      librisala keeps one anonymous connection, since spreading out
+      helps little without Tor. Devices follow and fetch in ways that
+      are hard to link (random order and waits), and never resume TLS
+      sessions.
+    - **What the server keeps** (4.2; D-H5, SV0): no address for an
+      anonymous or guest connection beyond the connection, posts with
+      mailbox, seq, time and message only, and mailboxes and group ids
+      only as hashes. Logs leave addresses out by default.
+    - **Quotas** (5.2; D-H6, SV3). Over a mailbox's quota the server
+      expires the oldest posts early rather than refusing new ones, so
+      one member cannot block a group.
+    - **Push** (9; D-M4, D-M8, R-L12). Each push waits a random time of
+      up to 10 seconds, and notices are padded. Subscriptions last one
+      retention period, devices renew them weekly, and subscribing to a
+      mailbox needs one of its send tokens.
+
+    *Content, files, transfer and backups.*
+    - **Files in transfers and backups** (12.13; K-M9) are encrypted
+      again as blobs of their own, which backups keep and reuse.
+    - **WANT** (12.13; K-M1). A device that fell behind asks its other
+      devices for a range; what comes back fills only the gaps, shown as
+      copied.
+    - **No forward secrecy between backups** (K-M6): whoever gets the
+      recovery key reads every backup the server kept.
+    - **Download origins** (8.5; K-M4). Devices download files without
+      asking only from the origins the conversation's server lists.
+    - **Reports** (5.8; K-M7, R-L9). The operators' copy carries the
+      post's pseudonym, so they can mute it. Operators MUST NOT ban on
+      reports alone, and SHOULD NOT mute on a single one.
+    - **Roles** (6.3; K-M2, K-L2). A ban takes the identity off `owners`
+      and `mods`. When no owner has a leaf, moderators may do what
+      owners may.
+    - **Room links** (15; K-L9) may carry the group id, and devices ask
+      before joining a different group under a room's name.
+
+    *Server operation.*
+    - **Settings** (SV0). Retention is in days, 30 by default and at
+      least 7. Anonymous connections are on by default. `room_creation`
+      now covers public rooms only.
+    - **risalad runs the key log and can be a witness** (SV2), with the
+      hand-off to a new log set in its configuration.
+    - **Default limits** (SV3, SV4), per connection and per address: 256
+      MiB per mailbox, 100 MiB uploads, 600 posts a minute and 120 new
+      mailboxes an hour.
+    - **KEYPKG GET** answers only for uids that uploaded KeyPackages
+      within retention, so it never fetches key files from a domain a
+      client names (SV4).
+
+    Still to check: the C2SP tag that has ML-DSA-44 cosignatures; which
+    X-Wing draft draft-ietf-mls-pq-ciphersuites cites (Section 16 still
+    names -06); and the light-client structures copied from
+    draft-ietf-mls-partial-02, byte for byte.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
