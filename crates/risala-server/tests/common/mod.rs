@@ -109,6 +109,14 @@ impl Session {
         }
     }
 
+    /// Checks a line `who` received against the pattern `want`, binding
+    /// values as [`play`](Self::play) does.
+    pub fn check(&mut self, who: &str, want: &str, got: &str) {
+        if let Err(e) = matches(want, got, &mut self.vars) {
+            panic!("{who} expected\n  {want}\ngot\n  {got}\n({e})");
+        }
+    }
+
     /// Checks that nothing more is waiting for any client.
     pub async fn settled(&mut self) {
         for (_, client) in &mut self.clients {

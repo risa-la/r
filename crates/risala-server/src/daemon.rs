@@ -28,8 +28,8 @@ use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
 use crate::core::{
-    BYE_SHUTDOWN, CID_PRUNE_PERIOD, Clock, EXPIRE_PERIOD, Hub, HubError, KeyServices,
-    SystemClock, Timers,
+    BYE_SHUTDOWN, CID_PRUNE_PERIOD, Clock, EXPIRE_PERIOD, Hub, HubError, KeyServices, SystemClock,
+    Timers,
 };
 use crate::http::{self, HttpServer, KeyDir};
 use crate::net;
