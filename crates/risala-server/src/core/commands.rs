@@ -586,6 +586,10 @@ impl Inner {
                 cid: None,
             };
             let (_, event) = self.append(st, event).await?;
+            // The invitation is used up (6.4), as in the store.
+            if let Some(info) = st.room_info_mut() {
+                info.invites.remove(uid);
+            }
             let user = self.reg().user(uid);
             st.add_member(&entry, &user);
             Self::broadcast_event(st, &event);
