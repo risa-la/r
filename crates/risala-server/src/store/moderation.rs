@@ -21,4 +21,10 @@ pub trait ModerationStore {
     /// recording an event: BAN of someone already banned (PLAN.md 5, item
     /// 31). Does nothing if `uid` is not banned.
     fn set_room_ban_reason(&self, conv: ConvKey, uid: &Uid, reason: &str) -> Result<()>;
+
+    /// Removes the role and the invitation of `uid` in one room, if it has
+    /// them, without recording an event: for UNREGISTER (4.8), which
+    /// removes them from the room in memory at the same time, under the
+    /// room's lock.
+    fn forget_room_roles(&self, conv: ConvKey, uid: &Uid) -> Result<()>;
 }

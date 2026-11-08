@@ -711,7 +711,8 @@ impl Inner {
     /// Deletes what the server keeps about `uid` (4.8): its memberships,
     /// with a PART each, then with `purge` every message it sent, as if by
     /// DELETE, then everything stored, then its roles and invitations in
-    /// memory, and for a hosted identity its key file.
+    /// each room, in memory and stored at once, and for a hosted identity
+    /// its key file.
     async fn forget(&self, uid: &Uid, user: &Arc<UserEntry>, purge: bool) -> Result<(), Fail> {
         // A JOIN under way may add a room after the first pass, but none
         // can start after it, since the user is ending. So this ends.
@@ -728,8 +729,6 @@ impl Inner {
             let deleted = self.purge(uid, uid, None).await?;
             tracing::info!(%uid, deleted, "purged an identity's messages");
         }
-        let who = uid.clone();
-        let rooms = self.db(move |s| s.rooms_with_role_or_invite(&who)).await?;
         let hosted = self.hosts_uid(uid);
         let now = self.now();
         {
@@ -744,14 +743,34 @@ impl Inner {
                 self.unpublish(uid).await;
             }
         }
-        for room in rooms {
-            if let Some(entry) = self.room_entry(&room) {
-                let mut st = entry.lock().await;
-                if let Some(info) = st.room_info_mut() {
-                    info.roles.remove(uid);
-                    info.invites.remove(uid);
-                }
+        // The store forgot its roles and invitations above, but a ROLE or
+        // INVITE may have stored one since, or be about to put one in
+        // memory. So each room's are removed again from both at once,
+        // under its lock: after that, a ROLE or INVITE changes both too.
+        // Every room is in memory, so this covers them all.
+        let entries: Vec<_> = self
+            .rooms
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for entry in entries {
+            let mut st = entry.lock().await;
+            let key = st.key;
+            if st.dropped {
+                continue;
             }
+            let Some(info) = st.room_info_mut() else {
+                continue;
+            };
+            if !info.roles.contains_key(uid) && !info.invites.contains(uid) {
+                continue;
+            }
+            let who = uid.clone();
+            self.db(move |s| s.forget_room_roles(key, &who)).await?;
+            info.roles.remove(uid);
+            info.invites.remove(uid);
         }
         // Operators from the configuration stay operators (10.1).
         let configured = self.config.operators().iter().any(|op| op.to_uid() == *uid);

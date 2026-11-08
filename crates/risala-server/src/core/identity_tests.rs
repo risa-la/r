@@ -13,7 +13,7 @@ use risala_proto::auth::{Nonce, PublicKey, SecretKey};
 use risala_proto::command::Request;
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{Identity, Room, Seq, Uid};
-use risala_proto::types::RoomSetting;
+use risala_proto::types::{Role, RoomSetting};
 
 use super::tests::{Client, Harness, T, config, start, stored, timers, value};
 use super::*;
@@ -982,6 +982,63 @@ async fn unregister_waits_for_the_other_devices() {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+/// The roles and invitations of `room`, in memory and stored. They should
+/// agree.
+async fn roles_and_invites(w: &World, room: &str) -> [(Vec<(Uid, Role)>, Vec<Uid>); 2] {
+    let room: Room = room.parse().unwrap();
+    let entry = w.h.hub.inner.room_entry(&room).unwrap();
+    let st = entry.lock().await;
+    let info = st.room_info().unwrap();
+    let memory = (
+        info.roles.iter().map(|(u, r)| (u.clone(), *r)).collect(),
+        info.invites.iter().cloned().collect(),
+    );
+    let record = w.h.store.room(&room).unwrap().unwrap();
+    [memory, (record.roles, record.invites)]
+}
+
+/// ROLE and INVITE of an identity while UNREGISTER forgets it, before the
+/// store forgets its roles and while it removes them room by room: each
+/// room in memory and the stored room agree afterwards, a room it had no
+/// role or invitation in at first included.
+#[tokio::test]
+async fn role_and_invite_racing_unregister() {
+    for method in ["forget_identity", "forget_room_roles"] {
+        let (mut w, store) = paused_world();
+        w.fetcher.set(&identity("bob@example.net"), vec![public(1)]);
+        w.fetcher
+            .set(&identity("carol@example.net"), vec![public(2)]);
+        let mut carol = w.sign_in("carol@example.net", 2).await;
+        let mut bob = w.sign_in("bob@example.net", 1).await;
+        for line in ["join #a", "join #b"] {
+            w.send(&carol, line).await;
+        }
+        w.send(&bob, "join #a").await;
+        w.send(&carol, "role #a bob@example.net mod").await;
+        carol.lines();
+        bob.lines();
+
+        store.pause.arm(method);
+        let unregister = spawn_send(&w, &bob, "unregister bob@example.net");
+        store.pause.reached().await;
+        w.send(&carol, "invite #b bob@example.net").await;
+        if method == "forget_identity" {
+            w.send(&carol, "role #a bob@example.net owner").await;
+        }
+        store.pause.release();
+        unregister.await.unwrap();
+        assert_eq!(
+            bob.lines().last().unwrap(),
+            "<close> BYE identity deleted",
+            "{method}"
+        );
+        for room in ["#a", "#b"] {
+            let [memory, stored] = roles_and_invites(&w, room).await;
+            assert_eq!(memory, stored, "{method} {room}");
+        }
     }
 }
 

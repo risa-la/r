@@ -2178,6 +2178,10 @@ impl crate::store::ModerationStore for Flaky {
     fn set_room_ban_reason(&self, c: ConvKey, u: &Uid, r: &str) -> crate::store::Result<()> {
         self.inner.set_room_ban_reason(c, u, r)
     }
+    fn forget_room_roles(&self, c: ConvKey, u: &Uid) -> crate::store::Result<()> {
+        self.pause.at("forget_room_roles");
+        self.inner.forget_room_roles(c, u)
+    }
 }
 
 // (reports)
@@ -2363,6 +2367,7 @@ impl Store for Flaky {
         self.inner.delete_hosted_key(u, k)
     }
     fn forget_identity(&self, u: &Uid, r: bool, t: Timestamp) -> crate::store::Result<()> {
+        self.pause.at("forget_identity");
         self.inner.forget_identity(u, r, t)
     }
     fn rooms_with_role_or_invite(&self, u: &Uid) -> crate::store::Result<Vec<Room>> {

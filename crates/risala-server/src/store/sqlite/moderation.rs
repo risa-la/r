@@ -25,6 +25,18 @@ impl ModerationStore for SqliteStore {
         )?;
         Ok(())
     }
+
+    fn forget_room_roles(&self, conv: ConvKey, uid: &Uid) -> Result<()> {
+        self.write(|tx| {
+            for sql in [
+                "DELETE FROM roles WHERE conv = ? AND uid = ?",
+                "DELETE FROM invites WHERE conv = ? AND uid = ?",
+            ] {
+                tx.execute(sql, rusqlite::params![conv.0, uid.as_str()])?;
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
