@@ -4,6 +4,12 @@
 //!   libcrux, with ML-DSA-44 added, over any OpenMLS storage.
 //! - [`signer`]: a device's [`DeviceSigner`] and credential (12.2). The
 //!   device key stays with the caller, out of OpenMLS storage.
+//! - [`conversation`]: the conversation extension `0xF2A1` (12.2).
+//! - [`group`]: how risala sets up OpenMLS: capabilities, extensions,
+//!   creating groups, KeyPackages, joining and commits (12.4-12.7).
+//! - [`keypackage`]: the checks of KEYPKG ADD (12.4).
+//! - [`wire`]: MLS values to and from the base64 values of
+//!   `risala_proto::mls` (12.2).
 //! - [`history`]: history keys (12.9).
 //! - [`message`]: encrypted messages, the payload of ENC (12.8).
 //! - [`primitives`]: the labelled functions of [RFC9420] that risala uses
@@ -12,19 +18,30 @@
 //! The server's checks of commits (12.5) and librisala's group engine are
 //! built on this crate, not in it.
 
+pub mod conversation;
 pub mod crypto;
+pub mod group;
 pub mod history;
+pub mod keypackage;
 pub mod message;
 pub mod primitives;
 pub mod signer;
+pub mod wire;
 
 pub use openmls;
 pub use openmls_traits;
 
+pub use conversation::{ConversationError, ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto, verify_ml_dsa_44};
+pub use group::{
+    Changes, CommitError, CreateGroupError, ExternalJoinError, commit, create_group,
+    join_by_external_commit, key_package, stage_welcome,
+};
 pub use history::HistoryKey;
+pub use keypackage::{CheckedKeyPackage, KeyPackageError, check_key_package, lifetime_acceptable};
 pub use message::{Encrypted, Message, MessageError, UnverifiedMessage, decrypt, encrypt};
 pub use signer::{DeviceSigner, credential_with_key};
+pub use wire::WireError;
 
 use openmls::prelude::Ciphersuite;
 
@@ -33,6 +50,9 @@ use openmls::prelude::Ciphersuite;
 /// `risala_proto::mls::CIPHER_SUITE`.
 pub const CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_MLKEM768X25519_CHACHA20POLY1305_SHA384_MLDSA44;
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod suite_tests {
