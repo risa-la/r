@@ -26,6 +26,9 @@ result-*
 !**/tests/fixtures/**/*.pem
 !**/tests/fixtures/**/*.key
 
+# risala-dev's server state and sign-in files (crates/risala-dev)
+/.dev/
+
 # Local runtime data (SQLite stores, WAL files)
 *.db
 *.db-shm
