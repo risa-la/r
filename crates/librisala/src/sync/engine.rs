@@ -1106,7 +1106,7 @@ impl SyncEngine {
             } = &msg.line
             {
                 listed.push(conv.clone());
-                heads.insert(conv.clone(), head.get());
+                heads.insert(conv.clone(), head.map_or(0, Seq::get));
                 if newer.contains(conv) {
                     continue;
                 }
@@ -1114,7 +1114,7 @@ impl SyncEngine {
                 let local = self.write(|tx| {
                     let mut row = tx.conv_or_create(account, conv)?;
                     // 7.1 step 2, and the head check.
-                    learn(tx, &mut row, id, Some(head.get()), floor)?;
+                    learn(tx, &mut row, id, Some(head.map_or(0, Seq::get)), floor)?;
                     tx.set_joined(&mut row, true)?;
                     // 7.4: the account's marker, from its other devices.
                     if let Some(read) = read {

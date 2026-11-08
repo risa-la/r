@@ -399,6 +399,33 @@ async fn encrypted_room(
 }
 
 #[tokio::test]
+async fn only_the_owner_role_encrypts_a_room() {
+    // Devices check the role from the room's events, so an operator
+    // without it counts as a plain member (12.5, PLAN.md 5 item 44).
+    let mut w = World::new();
+    w.h.hub.inner.operators.write().unwrap().insert(uid(CAROL));
+    let a1 = Device::new(ALICE, 1);
+    let mut ca = w.connect(&a1);
+    let lines = w.ask(&mut ca, "join #o").await;
+    let id: risala_proto::names::Id = ok_value(&lines, "id").parse().unwrap();
+    let c7 = Device::new(CAROL, 7);
+    let mut cc = w.connect(&c7);
+    w.ask(&mut cc, "join #o").await;
+    w.ask(&mut ca, "part #o").await;
+    let group = c7.create(&RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All));
+    cc.lines();
+    assert_eq!(
+        w.ask(&mut cc, &c7.init_line("#o", &group)).await.last().unwrap(),
+        "ERR forbidden only owners may encrypt a room"
+    );
+    // With the role, the operator may.
+    let lines = w.ask(&mut cc, "role #o carol@example.org owner").await;
+    assert!(lines.last().unwrap().starts_with("OK"), "{lines:?}");
+    let lines = w.ask(&mut cc, &c7.init_line("#o", &group)).await;
+    assert_eq!(lines.last().unwrap(), &format!("OK id={id} epoch=0"));
+}
+
+#[tokio::test]
 async fn init_encrypts_a_room_for_good() {
     let mut w = World::new();
     let a1 = Device::new(ALICE, 1);
@@ -924,6 +951,14 @@ async fn enc_sends_to_the_room() {
         a1.read(&ga1, find(&c1.lines(), "ENC")),
         "@react=10 TEXT 👍\n"
     );
+    // Only owners are told to change `send` and `history` with COMMIT.
+    for line in ["set #r send all", "set #r history joined"] {
+        assert_eq!(
+            w.ask(&mut cb, line).await,
+            ["ERR forbidden only owners change this setting, with COMMIT"],
+            "{line}"
+        );
+    }
 
     // The payload and the `frank` tag.
     let (payload, frank) = a1.encrypt(&ga1, "TEXT hi\n");
@@ -1089,6 +1124,11 @@ async fn direct_conversations_start_with_init() {
     let lines = w.ask(&mut c1, &a1.init_line(BOB, &ga1)).await;
     let id = ok_value(&lines, "id");
     assert_eq!(lines, [format!("OK id={id} epoch=0")]);
+    // With no events yet, SYNC lists it for both with head 0 (7.1).
+    let lines = w.ask(&mut c1, "sync").await;
+    assert!(lines.contains(&format!("CONV bob@example.net {id} 0 0")), "{lines:?}");
+    let lines = w.ask(&mut cb, "sync").await;
+    assert!(lines.contains(&format!("CONV alice@example.org {id} 0 0")), "{lines:?}");
     // Bob's INIT comes second.
     let gb = b5.create(&me);
     assert_eq!(
@@ -1283,9 +1323,12 @@ async fn direct_conversations_outlive_a_restart() {
     .unwrap();
     w.h.hub = hub;
     let mut c7 = w.connect(&Device::new(CAROL, 7));
-    // With no event yet, SYNC cannot list it: a CONV line's head is at
-    // least 1 (7.1). GROUPINFO finds it.
-    assert_eq!(w.ask(&mut c7, "sync").await, ["OK"]);
+    // With no event yet, SYNC lists it with head 0 (7.1), and GROUPINFO
+    // finds it.
+    assert_eq!(
+        w.ask(&mut c7, "sync").await,
+        [format!("CONV alice@example.org {id} 0 0"), "OK".to_owned()]
+    );
     let lines = w.ask(&mut c7, "groupinfo alice@example.org").await;
     assert!(lines[0].starts_with("GROUPINFO alice@example.org 0 0 "));
     let lines = w.ask(&mut c7, "history alice@example.org").await;

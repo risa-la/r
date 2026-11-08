@@ -34,8 +34,11 @@
 //! INIT makes a room encrypted for good: `public no`, `guests none`,
 //! `e2ee yes`, and `history` and `send` from the conversation extension.
 //! It records a SET event for each of these that changes, and always for
-//! `e2ee` and `history`, which did not exist before. The sender must have
-//! the rights of an owner (6.3), as for SET of `history`; operators do.
+//! `e2ee` and `history`, which did not exist before. The sender must hold
+//! the owner role. Operators without it count as plain members here, as
+//! for an owner's commit that changes `history` or `send`, since devices
+//! check the role from the room's events and cannot always know who is
+//! an operator (6.3, 12.5, PLAN.md 5 item 44).
 
 use std::sync::Arc;
 
@@ -55,7 +58,7 @@ use super::identity::unavailable;
 use super::keys::FetchError;
 use super::mls::{CheckedCommit, Device, check_commit, check_init, tree_of};
 use super::moderation::rights;
-use super::state::{ConvEntry, ConvState};
+use super::state::{ConvEntry, ConvState, RoomInfo};
 use super::{Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::OutLine;
 use crate::store::{
@@ -290,7 +293,7 @@ impl Inner {
         if st.group.is_some() {
             return Err(stale("the room is encrypted already"));
         }
-        if rights(info, a) != Role::Owner {
+        if owner_role(info, uid) != Role::Owner {
             return Err(forbidden("only owners may encrypt a room"));
         }
         if !st.is_member(uid) || st.member_count() != 1 {
@@ -487,7 +490,7 @@ impl Inner {
                 leaf.uid
             )));
         }
-        if checked.extensions.is_some() && rights(info, a) != Role::Owner {
+        if checked.extensions.is_some() && owner_role(info, uid) != Role::Owner {
             return Err(forbidden("only owners change the group's extensions"));
         }
         invited.sort();
@@ -826,6 +829,16 @@ struct Enc {
     frank: Option<Frank>,
     file: Option<FileUrl>,
     cid: Option<Cid>,
+}
+
+/// `uid`'s role in a room, without an operator's rights (6.3): what
+/// devices can check from the room's events, and so what counts for INIT
+/// and for changing the group's extensions (12.5).
+fn owner_role(info: &RoomInfo, uid: &Uid) -> Role {
+    if uid.is_guest() {
+        return Role::Member;
+    }
+    info.roles.get(uid).copied().unwrap_or(Role::Member)
 }
 
 /// The SET events of an owner's GroupContextExtensions (12.5): one for

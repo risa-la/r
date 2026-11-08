@@ -906,23 +906,24 @@ impl Inner {
             if st.dropped || !st.is_member(uid) {
                 continue;
             }
-            // A member has joined, so the conversation has an event.
-            if let Some(head) = st.head {
-                let read = if uid.is_identity() && st.marker_moved > since {
-                    let (key, who) = (st.key, uid.clone());
-                    self.db(move |s| s.read_marker(key, &who)).await?
-                } else {
-                    markers.get(&st.key).copied()
-                };
-                reply.line(ServerLine::Conv {
-                    conv: st.name_for(uid),
-                    id: st.id.clone(),
-                    head,
-                    // Always 0 for guests (7.1). A marker is never beyond
-                    // the head (7.4).
-                    read: read.map(|read| read.min(head)),
-                });
-            }
+            // A room has an event once a member has joined. A direct
+            // conversation that INIT started may have none yet, and is
+            // listed with head 0 (7.1, 12.5).
+            let head = st.head;
+            let read = if uid.is_identity() && st.marker_moved > since {
+                let (key, who) = (st.key, uid.clone());
+                self.db(move |s| s.read_marker(key, &who)).await?
+            } else {
+                markers.get(&st.key).copied()
+            };
+            reply.line(ServerLine::Conv {
+                conv: st.name_for(uid),
+                id: st.id.clone(),
+                head,
+                // Always 0 for guests (7.1). A marker is never beyond the
+                // head (7.4), so there is none without one.
+                read: read.and_then(|read| head.map(|head| read.min(head))),
+            });
         }
         Ok(Some(OkResponse::new()))
     }

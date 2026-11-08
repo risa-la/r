@@ -422,8 +422,9 @@ pub enum ServerLine {
         conv: Conv,
         /// The conversation's id (5.1).
         id: Id,
-        /// The newest seq.
-        head: Seq,
+        /// The newest seq, or `None` for `0`: a direct conversation whose
+        /// group has no events yet (7.1, 12.5).
+        head: Option<Seq>,
         /// The account's read marker, or `None` for `0`: no marker, or a
         /// guest (7.1, 7.4).
         read: Option<Seq>,
@@ -696,7 +697,11 @@ impl ServerLine {
                 head,
                 read,
             } => {
-                b.token(conv).token(id).token(head);
+                b.token(conv).token(id);
+                match head {
+                    Some(head) => b.token(head),
+                    None => b.token(0),
+                };
                 match read {
                     Some(read) => b.token(read),
                     None => b.token(0),
@@ -879,7 +884,7 @@ fn parse_response(
         "CONV" => {
             let conv = token(&mut p)?;
             let id = token(&mut p)?;
-            let head = token(&mut p)?;
+            let head = Seq::parse_or_zero(p.token()?)?;
             let read = Seq::parse_or_zero(p.token()?)?;
             p.end()?;
             ServerLine::Conv {
@@ -3606,13 +3611,14 @@ mod tests {
             ServerLine::Conv {
                 conv: Conv::Room(room("#general")),
                 id: "k3f9q2".parse().unwrap(),
-                head: seq(8814),
+                head: Some(seq(8814)),
                 read: Some(seq(8813)),
             }
         );
         let m = round_trip("CONV bob@example.net d1 3 0");
         assert!(matches!(m.line, ServerLine::Conv { read: None, .. }));
-        syntax("CONV #general k3f9q2 0 0");
+        // A direct conversation whose group has no events yet (7.1).
+        round_trip("CONV bob@example.net d1 0 0");
         syntax("CONV #general k3f9q2 1");
         syntax("CONV #general k3f9q2 1 1 1");
         syntax("CONV #general k3f9q2 1 01");

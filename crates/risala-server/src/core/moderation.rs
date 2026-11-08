@@ -226,6 +226,19 @@ impl Inner {
         if !visible(info, a) {
             return Err(not_found());
         }
+        // In an encrypted room, `send` and `history` change only by an
+        // owner's COMMIT. Someone without the owner role, operators
+        // included, may not change them that way either (12.5), so they
+        // get `forbidden`, and only owners are told to use COMMIT.
+        if info.settings.e2ee
+            && matches!(setting, RoomSetting::Send(_) | RoomSetting::History(_))
+            && (uid.is_guest() || info.roles.get(uid) != Some(&Role::Owner))
+        {
+            return Err(fail(
+                ErrorCode::Forbidden,
+                "only owners change this setting, with COMMIT",
+            ));
+        }
         let needed = needed_for(&setting, info.settings.e2ee)?;
         check_rights(info, a, needed)?;
         if let RoomSetting::Retention(RoomRetention::Days(days)) = &setting

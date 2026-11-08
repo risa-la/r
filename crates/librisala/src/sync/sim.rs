@@ -457,7 +457,7 @@ impl World {
                     lines.push(ServerMessage::new(ServerLine::Conv {
                         conv: Conv::Room(i.room.clone()),
                         id: i.id.clone(),
-                        head: Seq::new(i.head()).unwrap(),
+                        head: Seq::new(i.head()),
                         read: Seq::new(i.read),
                     }));
                 }
