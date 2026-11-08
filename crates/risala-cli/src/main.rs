@@ -533,10 +533,15 @@ fn open(dir: &Path, own: bool, account: Option<String>) -> Res<Ctx> {
         return fail(format!("creating {}: {e}", dir.display()));
     }
     let keys_dir = dir.join("keys");
-    let options = ClientOptions {
+    #[allow(unused_mut)]
+    let mut options = ClientOptions {
         keys: Some(std::sync::Arc::new(FileKeyStore::new(&keys_dir))),
         ..ClientOptions::default()
     };
+    #[cfg(debug_assertions)]
+    if let Err(e) = test_hooks(&mut options) {
+        return fail(e);
+    }
     let key = match cache_key(dir) {
         Ok(key) => key,
         Err(e) => return fail(e),
@@ -557,6 +562,48 @@ fn open(dir: &Path, own: bool, account: Option<String>) -> Res<Ctx> {
         Ok(client) => Ok(Ctx { client, account }),
         Err(e) => fail(format!("opening the cache in {}: {e}", dir.display())),
     }
+}
+
+/// Hooks for the CLI's own tests, in debug builds only, so that it can
+/// reach a test server under a made-up name, and the key files it hosts
+/// (4.6, 12.12):
+///
+/// - `RISALA_TEST_CONNECT=<address>`: connect there, whatever the server's
+///   name, which still goes in SNI and signatures (2.1, 4.5).
+/// - `RISALA_TEST_KEY_HOST=<domain>=<address>`: fetch `<domain>`'s key
+///   files from there, trusting only the certificate in DER form at
+///   `RISALA_TEST_KEY_CA`.
+#[cfg(debug_assertions)]
+fn test_hooks(options: &mut ClientOptions) -> Result<(), String> {
+    use librisala::keyfetch::{CertificateDer, FetchOptions, Roots, StaticResolver};
+    if let Some(at) = std::env::var_os("RISALA_TEST_CONNECT") {
+        let at = at.to_string_lossy();
+        options.session.connect_to = Some(
+            at.parse()
+                .map_err(|_| format!("RISALA_TEST_CONNECT: {at}"))?,
+        );
+    }
+    if let Some(host) = std::env::var_os("RISALA_TEST_KEY_HOST") {
+        let host = host.to_string_lossy();
+        let bad = || format!("RISALA_TEST_KEY_HOST: {host}");
+        let (domain, at) = host.split_once('=').ok_or_else(bad)?;
+        let at: std::net::SocketAddr = at.parse().map_err(|_| bad())?;
+        let ca = std::env::var_os("RISALA_TEST_KEY_CA")
+            .ok_or_else(|| "RISALA_TEST_KEY_CA is not set".to_owned())?;
+        let ca = std::fs::read(&ca).map_err(|e| format!("RISALA_TEST_KEY_CA: {e}"))?;
+        let mut resolver = StaticResolver::new();
+        resolver.insert(domain, [at]);
+        options.key_files = Some(std::sync::Arc::new(
+            librisala::client::HttpsKeyFiles::with_options(FetchOptions {
+                roots: Roots::Only(vec![CertificateDer::from(ca)]),
+                allow_private: true,
+                resolver: std::sync::Arc::new(resolver),
+                min_refetch: Duration::ZERO,
+                ..FetchOptions::default()
+            }),
+        ));
+    }
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Res {
