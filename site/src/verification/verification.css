@@ -1,0 +1,963 @@
+/*
+ * The verification pages. Global, since React draws them and Astro's
+ * scoped styles do not reach it; every class starts with v- or sits under
+ * one. Layer colours are the site's own tokens: unit --presence,
+ * integration --mode, fuzzing --mention, kani --location, tla+ --ink, and
+ * nothing reaches it --wax.
+ */
+
+/* Syntax colours, for Shiki's css-variables theme. They are the site's
+   tokens, so they follow the theme toggle. */
+:root {
+  --shiki-foreground: var(--text);
+  --shiki-background: transparent;
+  --shiki-token-keyword: var(--location);
+  --shiki-token-string: var(--presence);
+  --shiki-token-string-expression: var(--presence);
+  --shiki-token-comment: var(--text-tertiary);
+  --shiki-token-function: var(--ink);
+  --shiki-token-constant: var(--mention);
+  --shiki-token-parameter: var(--text);
+  --shiki-token-punctuation: var(--text-secondary);
+  --shiki-token-link: var(--mode);
+}
+
+.v-page {
+  display: grid;
+  gap: var(--panel-inset);
+  min-width: 0;
+}
+
+.v-noscript {
+  margin: 0;
+  padding: var(--panel-padding);
+  color: var(--text-secondary);
+}
+
+.v-loading {
+  padding: var(--panel-padding);
+}
+
+/* After Breadcrumb.astro. */
+.v-crumbs {
+  display: flex;
+  gap: var(--inline);
+  min-width: 0;
+  font-weight: 700;
+  font-size: 13px;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+.v-crumbs .part-wrap {
+  display: flex;
+  gap: var(--inline);
+  min-width: 0;
+}
+.v-crumbs a {
+  text-decoration: none;
+}
+.v-crumbs a:hover {
+  text-decoration: underline;
+}
+.v-crumbs .root {
+  color: var(--mode);
+}
+.v-crumbs .sep {
+  color: var(--rule);
+  font-weight: 400;
+}
+.v-crumbs .part {
+  color: var(--location);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* After Glyph.astro. */
+.v-glyph {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: var(--glyph);
+  height: var(--glyph);
+  border-radius: var(--glyph-radius);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--tint);
+  background: color-mix(in srgb, var(--tint) 18%, transparent);
+}
+
+.v-title {
+  margin: 12px 0 8px;
+  font-size: 20px;
+  line-height: 1.35;
+  font-weight: 800;
+  text-transform: lowercase;
+}
+.v-path {
+  margin: 4px 0 12px;
+  font-size: 16px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+.v-lede {
+  margin: 0;
+  max-width: 72ch;
+  color: var(--text-tertiary);
+}
+.v-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--inline);
+  margin: 16px 0;
+}
+
+/* Key and value pairs in a ruled row, as on the document pages. */
+.v-meta {
+  display: flex;
+  flex-wrap: wrap;
+  margin: 8px calc(-1 * var(--panel-padding)) 0;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+.v-meta div {
+  padding: 8px var(--panel-padding);
+  border-right: 1px solid var(--rule);
+}
+.v-meta dt {
+  margin-bottom: 2px;
+}
+.v-meta dd {
+  margin: 0;
+  font-size: 13px;
+}
+
+.v-banner {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--row-radius);
+  border-left: 3px solid var(--wax);
+  background: color-mix(in srgb, var(--wax) 10%, transparent);
+  font-size: 13px;
+  color: var(--text);
+}
+.v-banner strong {
+  color: var(--wax);
+}
+.v-banner.note {
+  border-left-color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+}
+.v-banner.note strong {
+  color: var(--ink);
+}
+.panel > .v-banner {
+  margin: 0 var(--panel-padding) var(--panel-padding);
+}
+
+.v-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.v-note.pad {
+  margin: 0;
+  padding: 0 var(--panel-padding) var(--inline);
+}
+
+.dim {
+  color: var(--text-tertiary);
+}
+.miss {
+  color: var(--wax);
+}
+
+/* A layer's colour swatch. */
+.sw {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 2px;
+  background: var(--c);
+}
+
+.v-bar {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  width: 64px;
+}
+.v-bar .track {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+.v-bar .fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 3px;
+}
+.v-pct {
+  display: inline-block;
+  min-width: 6ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+/* Totals ------------------------------------------------------------------ */
+
+.v-totals {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.v-totals li {
+  display: grid;
+  grid-template-columns: minmax(0, 22ch) minmax(64px, 1fr) 11ch minmax(0, 16ch);
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+}
+.v-totals .name {
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+}
+.v-totals .any .name {
+  font-weight: 700;
+}
+.v-totals .v-bar {
+  width: 100%;
+}
+.v-totals .v-bar .track {
+  height: 8px;
+}
+.v-totals .frac {
+  font-variant-numeric: tabular-nums;
+}
+
+/* What each method shows -------------------------------------------------- */
+
+.v-limits {
+  list-style: none;
+  margin: 0;
+  padding: var(--inline);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+.v-limits li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--row-padding);
+  padding: var(--row-padding);
+}
+.v-limits .v-glyph {
+  position: relative;
+  top: 4px;
+}
+.v-limits div {
+  display: grid;
+}
+.v-limits strong {
+  font-size: 13px;
+}
+.v-limits span {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* Test runs, proofs and TLC runs: rows with a status glyph. ---------------- */
+
+.v-rows-list,
+.v-proofs,
+.v-tla,
+.v-tla .runs {
+  list-style: none;
+  margin: 0;
+  padding: 0 var(--inline) var(--inline);
+}
+.v-rows-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 6px var(--row-padding);
+  border-radius: var(--row-radius);
+}
+.v-rows-list .name {
+  min-width: 20ch;
+  font-size: 13px;
+}
+.v-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+li.bad {
+  background: color-mix(in srgb, var(--wax) 9%, transparent);
+}
+.v-proofs > li,
+.v-tla .runs > li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--row-padding);
+  padding: 8px var(--row-padding);
+  border-radius: var(--row-radius);
+}
+.v-proofs .v-glyph,
+.v-tla .v-glyph {
+  position: relative;
+  top: 4px;
+}
+.v-proofs > li > div,
+.v-tla .runs > li > div {
+  min-width: 0;
+}
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+.top .id {
+  font-weight: 700;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.doc {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.v-tla > li {
+  padding: 4px var(--row-padding) 0;
+}
+.v-tla .runs {
+  margin: 8px calc(-1 * var(--row-padding)) 0;
+  padding: 0;
+}
+
+/* Tables ------------------------------------------------------------------ */
+
+.v-table-wrap {
+  overflow-x: auto;
+  padding: 0 var(--panel-padding) var(--panel-padding);
+}
+.v-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.v-table th,
+.v-table td {
+  padding: 6px 12px 6px 0;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--rule);
+}
+.v-table thead th {
+  font-weight: 400;
+}
+.v-table tbody th {
+  font-weight: 400;
+}
+.v-table .num {
+  font-variant-numeric: tabular-nums;
+}
+.cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.v-table .v-bar {
+  width: 48px;
+}
+
+/* Files ------------------------------------------------------------------- */
+
+.v-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--inline);
+}
+.v-filter input {
+  flex: 1;
+  max-width: 40ch;
+  min-height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--row-radius);
+}
+.v-files-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 10px;
+}
+.v-files-key span {
+  display: inline-flex;
+  align-items: center;
+}
+.v-files details {
+  border-top: 1px solid var(--rule);
+}
+.v-files summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px var(--panel-padding);
+  cursor: pointer;
+}
+.v-files summary .crate {
+  font-weight: 700;
+  font-size: 13px;
+}
+.v-files summary .cell {
+  margin-left: auto;
+}
+.v-files ul {
+  list-style: none;
+  margin: 0;
+  padding: 0 var(--inline) var(--inline);
+}
+.v-files li a {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 6ch auto;
+  align-items: center;
+  gap: 12px;
+  padding: 3px var(--row-padding);
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 12px;
+}
+.v-files li a:hover {
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+}
+.v-files .path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.v-files .n {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.v-files .minis {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.v-files .minis .v-bar {
+  width: 28px;
+}
+.v-files .tests {
+  min-width: calc(4 * 28px + 3 * 4px + 4px + 6ch);
+}
+.v-files li.test a {
+  color: var(--text-tertiary);
+}
+
+/* A file ------------------------------------------------------------------ */
+
+.v-legend {
+  display: grid;
+  gap: 10px;
+  padding: var(--panel-padding);
+}
+.v-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.v-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--c) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--c) 45%, transparent);
+  border-radius: var(--row-radius);
+  cursor: pointer;
+}
+.v-toggle .sw {
+  margin: 0;
+  width: 5px;
+  height: 14px;
+  border-radius: 1px;
+}
+.v-toggle .v-bar {
+  width: 40px;
+}
+.v-toggle .val {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+.v-toggle[aria-pressed="false"] {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--rule);
+  color: var(--text-tertiary);
+}
+.v-toggle[aria-pressed="false"] .sw {
+  background: transparent;
+  outline: 1px solid var(--c);
+  outline-offset: -1px;
+}
+.v-toggle[aria-pressed="false"] .name {
+  text-decoration: line-through;
+}
+.v-legend-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+.v-legend-key span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.v-legend-key .key {
+  display: inline-block;
+  width: 5px;
+  height: 14px;
+  --c: var(--text-secondary);
+}
+.v-legend-key .key.s-h {
+  background: var(--c);
+}
+.v-legend-key .key.s-m {
+  background: color-mix(in srgb, var(--c) 22%, transparent);
+}
+.v-legend-key .key.s-p {
+  box-shadow: inset 0 0 0 1px var(--c);
+}
+.v-legend-key .key.row-x {
+  width: 14px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--wax) 18%, transparent);
+  box-shadow: inset 2px 0 var(--wax);
+}
+.v-legend-key .key.row-test {
+  width: 14px;
+  border-radius: 3px;
+  background: repeating-linear-gradient(135deg, var(--rule) 0 2px, transparent 2px 5px);
+}
+.v-legend-text {
+  margin: 0;
+  max-width: 100ch;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.v-legend-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--inline);
+}
+.button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.v-code {
+  position: relative;
+  overflow: hidden;
+}
+.v-code-scroll {
+  overflow-x: auto;
+  padding: var(--inline) 0;
+}
+.v-rows {
+  width: max-content;
+  min-width: 100%;
+  font-size: 12.5px;
+  line-height: 20px;
+}
+
+.ln {
+  --bg: transparent;
+  display: flex;
+  background: var(--bg);
+}
+.ln .gut {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  /* The row's tint over the panel, so code scrolling under it is hidden. */
+  background: linear-gradient(var(--bg), var(--bg)), var(--panel);
+}
+.ln .num {
+  width: 6ch;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--text-tertiary);
+  text-decoration: none;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.ln .num:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+.ln .stripes {
+  display: flex;
+  gap: 1px;
+  padding-right: 10px;
+}
+.ln .src {
+  flex: 1;
+  padding-right: var(--panel-padding);
+  white-space: pre;
+  /* Keep empty lines a line tall. */
+  min-height: 20px;
+}
+
+.s {
+  width: 5px;
+}
+.s-u {
+  --c: var(--presence);
+}
+.s-i {
+  --c: var(--mode);
+}
+.s-f {
+  --c: var(--mention);
+}
+.s-k {
+  --c: var(--location);
+}
+.s-t {
+  --c: var(--ink);
+}
+.s.h {
+  background: var(--c);
+}
+.s.m {
+  background: color-mix(in srgb, var(--c) 22%, transparent);
+}
+.s.p {
+  box-shadow: inset 0 0 0 1px var(--c);
+}
+/* The model checks the spec, not this code: dotted, not solid. */
+.s-t.h {
+  background: repeating-linear-gradient(to bottom, var(--c) 0 3px, transparent 3px 5px);
+}
+.swift .s:not(.s-u) {
+  display: none;
+}
+.off-u .s-u,
+.off-i .s-i,
+.off-f .s-f,
+.off-k .s-k,
+.off-t .s-t {
+  display: none;
+}
+
+.ln.t-u {
+  --bg: color-mix(in srgb, var(--presence) 11%, transparent);
+}
+.ln.t-i {
+  --bg: color-mix(in srgb, var(--mode) 12%, transparent);
+}
+.ln.t-f {
+  --bg: color-mix(in srgb, var(--mention) 13%, transparent);
+}
+.ln.t-k {
+  --bg: color-mix(in srgb, var(--location) 13%, transparent);
+}
+/* Nothing reaches it: the line that most needs seeing. */
+.ln.t-x {
+  --bg: color-mix(in srgb, var(--wax) 16%, transparent);
+}
+.ln.t-x .num {
+  color: var(--wax);
+  font-weight: 700;
+  box-shadow: inset 2px 0 var(--wax);
+}
+.ln.test .src,
+.ln.test .num {
+  opacity: 0.55;
+}
+.ln.test .gut {
+  background:
+    repeating-linear-gradient(135deg, color-mix(in srgb, var(--rule) 70%, transparent) 0 1px, transparent 1px 5px),
+    var(--panel);
+}
+.ln:hover {
+  box-shadow: inset 0 0 0 1px var(--rule);
+}
+.ln.target {
+  box-shadow: inset 0 0 0 1px var(--ink);
+}
+.ln.target .num {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.v-details {
+  position: absolute;
+  right: 12px;
+  z-index: 5;
+  width: min(440px, calc(100% - 24px));
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--row-radius);
+  background: var(--panel);
+  box-shadow: 0 6px 24px color-mix(in srgb, #000 18%, transparent);
+  font-size: 12px;
+  pointer-events: none;
+}
+.v-details.pinned {
+  pointer-events: auto;
+  border-color: var(--ink);
+}
+.v-details .dh {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.v-details .close {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.v-details .close:hover {
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+.v-details dl {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+.v-details .dr {
+  display: grid;
+  grid-template-columns: 19ch minmax(0, 1fr);
+  gap: 8px;
+}
+.v-details dt {
+  display: flex;
+  align-items: center;
+  color: var(--text-secondary);
+}
+.v-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.v-details .sub {
+  margin-top: 2px;
+}
+.v-details .proofs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.v-details .hint {
+  margin-top: 6px;
+}
+
+/* The spec view ----------------------------------------------------------- */
+
+.v-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+}
+.v-tabs .button[aria-selected="true"] {
+  color: var(--on-ink);
+  background: var(--ink);
+  font-weight: 700;
+}
+.v-spec-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 14px;
+}
+.badge {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+  color: var(--c);
+  background: color-mix(in srgb, var(--c) 14%, transparent);
+}
+.badge.ex {
+  --c: var(--mode);
+}
+.badge.tla {
+  --c: var(--ink);
+}
+.badge.kani {
+  --c: var(--location);
+}
+.badge.code {
+  --c: var(--mention);
+}
+.badge.test {
+  --c: var(--presence);
+}
+.v-sections {
+  list-style: none;
+  margin: 0;
+  padding: 0 var(--inline) var(--inline);
+}
+.v-sections .row {
+  display: grid;
+  grid-template-columns: 6ch minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 5px var(--row-padding);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.v-sections summary.row {
+  cursor: pointer;
+  list-style: none;
+}
+.v-sections summary.row::-webkit-details-marker {
+  display: none;
+}
+.v-sections summary.row:hover {
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+}
+.v-sections summary.row .title::after {
+  content: " +";
+  color: var(--text-tertiary);
+}
+.v-sections details[open] > summary.row .title::after {
+  content: " −";
+}
+.v-sections .num {
+  color: var(--mode);
+  font-variant-numeric: tabular-nums;
+}
+.v-sections .depth-1 {
+  margin-top: 6px;
+}
+.v-sections .depth-1 > * > .row .title,
+.v-sections .depth-1 > .row .title {
+  font-weight: 700;
+}
+.v-sections .depth-2 .row .title {
+  padding-left: 2ch;
+}
+.v-sections .badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.v-sections .more {
+  display: grid;
+  gap: 8px;
+  padding: 4px var(--row-padding) 10px calc(6ch + 12px + var(--row-padding));
+}
+.v-sections .cites ul {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+  font-size: 12px;
+}
+.v-sections .cites a {
+  overflow-wrap: anywhere;
+}
+
+/* Phones: no sideways page scroll. The code still scrolls in its panel. */
+@media (max-width: 640px) {
+  .v-totals li {
+    grid-template-columns: minmax(0, 1fr) 9ch;
+    gap: 2px 12px;
+  }
+  .v-totals .v-bar {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .v-totals .frac {
+    display: none;
+  }
+  .v-files li a {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .v-files .n,
+  .v-files .minis .v-bar,
+  .v-files .tests {
+    display: none;
+  }
+  .v-files summary .label {
+    display: none;
+  }
+  .v-rows {
+    font-size: 12px;
+  }
+  .ln .num {
+    width: 5ch;
+  }
+  /* Pinned details sit at the bottom of the screen, under the thumb. */
+  .v-details.pinned {
+    position: fixed;
+    top: auto !important;
+    right: 8px;
+    bottom: 8px;
+    left: 8px;
+    width: auto;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .v-details:not(.pinned) {
+    display: none;
+  }
+  .v-details .dr {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .v-sections .row {
+    grid-template-columns: 5ch minmax(0, 1fr);
+  }
+  .v-sections .badges {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+  .v-sections .more {
+    padding-left: var(--row-padding);
+  }
+  .v-toggle .v-bar {
+    display: none;
+  }
+}
+
