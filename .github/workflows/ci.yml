@@ -54,18 +54,21 @@ jobs:
         run: nix develop --command cargo test --release -p risala-pow -- --include-ignored
 
   # risala-pow on macOS, where the JIT maps its code with MAP_JIT: on
-  # Apple Silicon (aarch64), and on a real Intel Mac (x86-64). Not under
-  # Rosetta 2, which lets a hardened x86-64 binary make executable memory
-  # even without the allow-jit entitlement, unlike a real Intel Mac.
-  # Rust comes from rustup, which the runner image has; the Nix dev shell
-  # would bring the whole risala toolchain for one crate.
+  # Apple Silicon (aarch64), and on a real Intel Mac (x86-64). Rust comes
+  # from rustup, which the runner image has; the Nix dev shell would bring
+  # the whole risala toolchain for one crate.
+  #
+  # GitHub's Apple Silicon runners are virtual machines without the
+  # per-thread write switch for MAP_JIT memory, so there the JIT falls
+  # back to the interpreter and the tests check that it does. The JIT
+  # itself runs only on Apple Silicon hardware, so test it on a Mac.
   #
   # A plain test binary is not under the hardened runtime, so it may map
-  # JIT memory without an entitlement: the tests check the JIT runs. The
-  # same binary is then signed (ad hoc) with the hardened runtime, as an
-  # app would be: with the com.apple.security.cs.allow-jit entitlement
-  # the JIT must still run, and without it the system refuses JIT memory
-  # and the JIT must fall back to the interpreter.
+  # JIT memory without an entitlement. The same binary is then signed (ad
+  # hoc) with the hardened runtime, as an app would be: with the
+  # com.apple.security.cs.allow-jit entitlement the tests pass as before.
+  # Without it, Apple Silicon refuses JIT memory and the JIT must fall
+  # back; Intel Macs allow it anyway, so that check is Apple Silicon only.
   pow-macos:
     strategy:
       fail-fast: false
@@ -106,9 +109,11 @@ jobs:
           codesign --force --sign - --options runtime --entitlements allow-jit.entitlements "$bin"
           codesign --display --verbose --entitlements - "$bin"
           "$bin"
-          codesign --force --sign - --options runtime "$bin"
-          codesign --display --verbose --entitlements - "$bin"
-          RISALA_POW_JIT_REFUSED=1 "$bin"
+          if [ "${{ matrix.target }}" = aarch64-apple-darwin ]; then
+            codesign --force --sign - --options runtime "$bin"
+            codesign --display --verbose --entitlements - "$bin"
+            RISALA_POW_JIT_REFUSED=1 "$bin"
+          fi
 
   kani:
     runs-on: ubuntu-latest
