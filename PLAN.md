@@ -1186,6 +1186,47 @@ Open:
       tested on crafted proposals. Rule 5's limit is a parameter of the
       commit check, tested with a limit of 2 rather than 513 leaves.
 
+50. **Found by the review of M5a** (4.8, 6.2, 6.3, 12.4, 12.6, 12.9,
+    12.10), decided with the user on 2026-11-08:
+    - **Joining a room checks its members.** Every leaf must belong to a
+      member or an invitee, by the room's events, also when a device
+      joins again after it could not process a commit. Otherwise a
+      server could make a device rejoin a group that holds an outsider.
+    - **Keys only to and from confirmed devices.** No KEY or RECOVERY
+      lines in the conversation with yourself while a leaf of your
+      identity is unconfirmed or declined, since every leaf there reads
+      them. Declining a device removes its leaves. KEY and RECOVERY
+      lines count only from confirmed devices, a recovery key only while
+      the key file lists its signing key, and replacing a recovery key
+      the device already holds asks the user.
+    - **Recovery order.** Add the new device's key, sign in with it and
+      join everything, and only then remove the lost keys. Removing them
+      first loses the encrypted rooms. A client that does not hold the
+      old recovery key offers to remove every other `recovery` line.
+    - **The recovery key never joins a group**: no KEYPKG ADD, INIT,
+      COMMIT or ENC on its connection.
+    - **A removal waits at most 24 hours** for a key file that cannot be
+      fetched, then is applied with a warning (changes item 47's
+      decision), so that a key host that stays down cannot hold up a
+      conversation.
+    - **A returning identity** that the server does not host is a
+      participant of its direct conversations again, which belong to the
+      pair. Its devices join by external commit, without the history.
+    - **Server limits now**: a KeyPackage size limit (at least 16 KiB;
+      risalad 64 KiB, `too-long`), and BACKUP ADD only for conversations
+      the identity is or was in, up to the group's current epoch. Byte
+      budgets for ENC and COMMIT stay for M10's rate limits.
+    - **Keys at rest under hardware** (item 45) comes right after M5a,
+      before M6. Until then the CLI keeps its secrets in files, a known
+      gap.
+
+    Implementation only: devices refuse X-Wing public keys that are not
+    1216 bytes before encrypting to them, since libcrux-kem 0.0.9 panics
+    on short ones (RUSTSEC-2026-0331), and KEYPKG ADD refuses
+    KeyPackages that carry such keys. Move to libcrux-kem 0.0.10 or later
+    once hpke-rs-libcrux allows it. The provider never signs with ML-DSA
+    itself; only the device signer does.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

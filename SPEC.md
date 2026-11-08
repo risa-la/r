@@ -504,7 +504,7 @@ S: @ref=7 OK id=k3f9q2 more=1
 |---|---|
 | `bad-syntax` | The line could not be parsed, or has the wrong parameters |
 | `unknown-command` | The verb is not known |
-| `too-long` | The line or one of its parameters is too long, or a file is too large |
+| `too-long` | The line or one of its parameters is too long, or a file or KeyPackage is too large |
 | `not-authenticated` | The command needs GUEST, AUTH or REGISTER first |
 | `already-authenticated` | This connection is already a guest or signed in |
 | `auth-failed` | The signature did not verify against the identity's keys, or the connection's SNI does not name this server (4.5) |
@@ -920,7 +920,10 @@ remove its leaves from encrypted rooms (12.6). Then:
   for the reason given in Section 10.5. A client can tell beforehand
   whether the server hosts the identity with KEY LIST (4.7).
 - **Other identities** are only forgotten by this server. If the same
-  identity signs in again later, the server treats it as new.
+  identity signs in again later, the server treats it as new, except
+  that it is again a participant of its direct conversations, which
+  belong to the pair (5.1). Its devices join them again by external
+  commit (12.6), and cannot read what was sent before.
 
 Guests have nothing to delete. What a guest has sent can be removed only
 by DELETE, or by an operator (10.4).
@@ -1534,8 +1537,8 @@ SET <room> <key> [<value...>]
 - In an encrypted room, the value of `send` lives in the room's group,
   like `history`, and an owner changes it with a COMMIT (12.5). The
   server cannot tell a reaction from a message there, so it lets plain
-  members send ENC, and their devices enforce the setting (12.11). SET
-  of `send` gets `ERR encrypted` in an encrypted room from someone with
+  members send ENC, and their devices enforce the setting (12.11). In an
+  encrypted room, SET of `send` gets `ERR encrypted` from someone with
   the owner role, and `ERR forbidden` from anyone else.
 
 Keyword and number values ignore trailing spaces, so `SET #r public yes `
@@ -1602,10 +1605,10 @@ membership:
   reactions, but not other messages or typing notifications (6.2).
 - Server operators (Section 10) have owner rights in every room, and may
   join any room without an invitation, except an encrypted one (6.1),
-  even one they are banned from. In an encrypted room, only the owner
-  role counts for INIT and for changing the group's extensions (12.5),
-  since devices check the role from the room's events: an operator gives
-  itself the role first.
+  even one they are banned from. For INIT of a room, and for changing
+  an encrypted room's group extensions (12.5), only the owner role
+  counts, since devices check the role from the room's events: an
+  operator gives itself the role first.
 
 ```
 ROLE <room> <uid> <role>
@@ -2608,7 +2611,9 @@ KEYPKG GET <uid>
   capabilities (12.2), that its signatures verify, and that its lifetime
   is acceptable (below). Otherwise it replies `ERR invalid`. A server
   MAY limit how many KeyPackages it keeps for each device
-  (`ERR forbidden`).
+  (`ERR forbidden`), and how large a KeyPackage may be (`ERR too-long`).
+  KeyPackages of this suite are a few KiB, so a limit MUST NOT be below
+  16 KiB.
 - **`KEYPKG COUNT`** replies `OK count=<n> last-resort=<yes or no>`: the
   number of ordinary KeyPackages the server holds for this device, and
   whether it holds a last-resort one.
@@ -2796,10 +2801,14 @@ external commit, it checks the whole group:
   room, the id that the room's JOIN, INFO or SYNC reports.
 - In a direct conversation, every leaf belongs to one of its two
   participants, or in a conversation with yourself, to you.
+- In a room, every leaf belongs to an identity that the room's events
+  show to be a member or invited, other than the device's own leaf when
+  it joins by external commit.
 - Every leaf's key passes the key check below.
 
-A device MUST NOT join a group that fails the first two checks. It does
-not check the lifetimes of leaves already in the tree (12.4).
+A device MUST NOT join a group that fails the first three checks. This
+holds when it joins again after it could not process a commit, too. It
+does not check the lifetimes of leaves already in the tree (12.4).
 
 **Commits.** For every commit, a device MUST reject it if it:
 
@@ -2821,6 +2830,11 @@ not check the lifetimes of leaves already in the tree (12.4).
 If the device needs the leaf's key file to see the reason, and the key
 file cannot be fetched right now (4.4), it neither applies nor rejects
 the commit: it waits, and tries the key file again from time to time.
+If the key file still cannot be fetched after 24 hours, the device
+applies the commit and warns the user that a leaf was removed for a
+reason it could not check. Removing a leaf never lets anyone new read,
+so waiting longer would only let a key host that stays down hold up the
+conversation.
 
 It also applies the key check to every leaf that the commit adds or
 changes. A device that rejects a commit can no longer follow the group.
@@ -3194,6 +3208,16 @@ History keys reach a device in three ways:
    holds the recovery key (12.10) sends it to the confirmed device too,
    as a RECOVERY line.
 
+   Every device of the identity can read an ENC message in the
+   conversation with itself. So a device MUST NOT send KEY or RECOVERY
+   lines there while the group has a leaf of the identity that the user
+   has not confirmed, or has declined. When the user declines a device,
+   the device commits the removal of its leaves, from this conversation
+   and every other, which 12.5 allows for leaves of your own identity,
+   and offers to remove its key from the key file. Devices accept KEY
+   and RECOVERY lines only from devices of their identity that the user
+   has confirmed, or that were already there when the device joined.
+
    Any device of an identity that cannot see the identity's conversation
    with itself, in SYNC or by GROUPINFO, creates it with INIT. If another
    device got there first, the INIT gets `ERR stale`, and the device
@@ -3238,15 +3262,22 @@ instead. Backups are optional for users. Servers MUST support them.
   key file with the label `recovery`: with KEY ADD if the server hosts
   the identity (4.7), or otherwise by showing the key file line for the
   user to add. It then removes the previous recovery key's line, if
-  there was one, which it finds by deriving that key's public key.
-- A client MUST NOT upload KeyPackages (12.4) on a connection signed in
-  with the recovery key, so that the recovery key never joins a group.
+  there was one, which it finds by deriving that key's public key. A
+  client that does not hold the previous recovery key offers to remove
+  every other line labelled `recovery`, and warns if one stays, since
+  that key can still sign in.
+- On a connection signed in with the recovery key, a client MUST NOT
+  send KEYPKG ADD (12.4), INIT, COMMIT or ENC (12.5, 12.8), so that the
+  recovery key never joins a group.
 - A client that creates a recovery key shows it to the user once, and
   sends it to the identity's other devices as a RECOVERY line, in base64
   with padding, in the conversation with itself. Devices that the user
   confirms later get it the same way (12.9). Devices MUST ignore
-  RECOVERY lines in any other conversation. A newer RECOVERY line
-  replaces an older one.
+  RECOVERY lines in any other conversation, and from devices they do not
+  accept KEY lines from (12.9). A device sends and accepts only a
+  recovery key whose signing key the identity's key file lists now, so
+  that a key that was replaced cannot come back. A device that already
+  holds a different recovery key asks the user before replacing it.
 - Every device that holds the recovery key backs up each history key it
   gets, as a **blob**: the key id, then a random 12-byte nonce, then the
   history key encrypted with ChaCha20-Poly1305 under the backup key and
@@ -3265,7 +3296,10 @@ BACKUP DEL [<id>]
   epoch with the same key id, it keeps the one it has and still replies
   `OK`. A server MAY limit how many key ids it keeps blobs for in one
   epoch, since a page of BACKUP GET always holds a whole epoch, and
-  refuse more with `ERR forbidden`. It MUST allow at least 4.
+  refuse more with `ERR forbidden`. It MUST allow at least 4. The
+  server refuses, with `ERR forbidden`, a blob for a conversation that
+  the identity is not in and has never been in, or for an epoch later
+  than the group's current one.
 - **`BACKUP GET`** sends one `BACKUP <id> <epoch> <blob>` line per stored
   blob of conversation `<id>`, oldest epoch first, then
   `OK more=<0 or 1>`:
@@ -3293,11 +3327,14 @@ none match, the recovery key is wrong.
 
 Someone who has lost every device can get their identity back with the
 recovery key. On a new device, the client derives the recovery key's
-key pair, signs in with it (4.5), adds the new device's key and removes
-the keys of the lost devices (4.7, or by editing the key file for an
-identity the server does not host), then signs in again with the new
-device's key. The new device then joins the identity's encrypted
-conversations (12.6), and restores the history keys as above.
+key pair, signs in with it (4.5), adds the new device's key (4.7, or by
+editing the key file for an identity the server does not host), and
+signs in again with the new device's key. The new device joins the
+identity's encrypted conversations (12.6) and restores the history keys
+as above. Only then does it remove the keys of the lost devices: in a
+room, a device may join by external commit only while its identity
+still has a leaf there, and members remove the leaves of removed keys.
+It then makes a new recovery key, as below.
 
 A device that is lost keeps the recovery key it was sent. So when one of
 an identity's keys is removed, its client SHOULD offer to make a new
