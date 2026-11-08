@@ -822,7 +822,7 @@ fn b10_safety_number() {
 }
 
 /// Every section of Appendix B with vectors is checked: B.1 to B.10
-/// here, B.11 to B.18 by risala-mls (`src/vectors.rs`).
+/// here, B.11 to B.19 by risala-mls (its modules' `appendix_b` tests).
 #[test]
 fn every_section_is_checked() {
     let titles: Vec<String> = sections()
@@ -830,7 +830,7 @@ fn every_section_is_checked() {
         .filter(|s| !s.values.is_empty() || !s.texts.is_empty())
         .map(|s| s.title)
         .collect();
-    let expected: Vec<String> = (1..=18).map(|n| format!("B.{n} ")).collect();
+    let expected: Vec<String> = (1..=19).map(|n| format!("B.{n} ")).collect();
     assert_eq!(titles.len(), expected.len(), "{titles:?}");
     for (title, prefix) in titles.iter().zip(&expected) {
         assert!(title.starts_with(prefix), "{title} is not {prefix}");

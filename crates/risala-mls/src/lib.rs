@@ -117,7 +117,7 @@ mod tests;
 
 /// Appendix B's vectors, read from the spec. The module is shared with
 /// risala-proto's tests, which check sections B.1 to B.10; the tests of
-/// this crate's modules check B.11 to B.18.
+/// this crate's modules check B.11 to B.19.
 #[cfg(test)]
 #[path = "../../risala-proto/tests/common/appendix.rs"]
 pub(crate) mod appendix;

@@ -1033,6 +1033,41 @@ mod tests {
         ck.finish();
     }
 
+    /// Appendix B.19: the list blob of BACKUP PUT's `files` (12.13), for a
+    /// backup whose archives in `more` are the blobs `backup2` and
+    /// `backup3`, with one file, the blob `photo`.
+    #[test]
+    fn appendix_b_list() {
+        let mut ck = crate::appendix::Checker::open("B.19 ");
+        let more = [b"backup2".as_slice(), b"backup3"];
+        let file = b"photo".as_slice();
+        ck.hex("archive 2", more[0]);
+        ck.hex("archive 3", more[1]);
+        ck.hex("file", file);
+        ck.gap();
+        // The archives in `more`, then the files (12.13).
+        let blobs: Vec<BlobRef> = more.iter().chain([&file]).map(|b| BlobRef::of(b)).collect();
+        let list = write_list(&blobs);
+        assert_eq!(list.len(), 1 + 3 * 48);
+        ck.hex("list", &list);
+        assert_eq!(read_list(&list), Some(blobs.clone()));
+        ck.eq("files", BlobRef::of(&list).to_string());
+        ck.gap();
+        let mut version = list.clone();
+        version[0] = 2;
+        ck.rejected("the list with version 2", read_list(&version).is_none());
+        ck.rejected(
+            "the list without its last byte",
+            read_list(&list[..list.len() - 1]).is_none(),
+        );
+        ck.rejected(
+            "the list with a byte after it",
+            read_list(&[&list[..], &[0]].concat()).is_none(),
+        );
+        ck.rejected("the empty list", read_list(&[]).is_none());
+        ck.finish();
+    }
+
     // The backup keys and the recovery text are unchanged from M4: only
     // the wrapped key gained its version byte.
     const BACKUP_VECTOR: [&str; 5] = [

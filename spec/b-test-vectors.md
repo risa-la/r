@@ -790,6 +790,34 @@ the report with context seqs 5 then 4:                               rejected
 the target with frank key 2, checked against the frank of content 1: rejected
 ```
 
+### B.19 A BACKUP `files` list (12.13)
+
+The list blob of BACKUP PUT's `files`, for a backup whose archives in
+`more` are the blobs `archive 2` and `archive 3` below, in that order,
+and that has one file, the blob `file` below. `files` is the list's
+blob-ref.
+
+```
+archive 2: 6261636b757032
+archive 3: 6261636b757033
+file:      70686f746f
+
+list:
+  01bdfbba43834f264ac13afa43b32c74a9f548be180b77f05021d4f52f3c2688
+  5f85bb2660a5dba50c5024a7c801157ec6837632c8954b8c6d7ba83c719cfba4
+  b1cecbc4e0b9983d991f870c30d0a130d7b39950e4ad00fb2baddcfe3c56a31e
+  2597fe205ee8c00c9e85e817c243a0de2ad6dbb99c81ca662712213454ad1307
+  b4879ac79883990c7a0446aeef0a740370
+files:
+  sha384:5b307842c44c23af292739bad2c8348f3bc7cc2904d7be567dc132e7a
+  feb9ba694a3a1190175d73e17f175128f40932b
+
+the list with version 2:        rejected
+the list without its last byte: rejected
+the list with a byte after it:  rejected
+the empty list:                 rejected
+```
+
 ### Still to come
 
 Vectors for the formats below will be added. They need values made by
@@ -846,8 +874,7 @@ MLS and messages:
 
 Files and history:
 
-- a history split over two archives (12.13), and a BACKUP `files` list
-  (12.13)
+- a history split over two archives (12.13)
 
 Cases that MUST fail:
 
@@ -871,7 +898,6 @@ Cases that MUST fail:
 - archives merged out of seq order, a later archive with another `uid`
   or `made`, and a split archive whose later part has a `more` of its
   own (12.13)
-- a BACKUP `files` list with a wrong version byte or length (12.13)
 
 For the cipher suite (12.2), implementations run the known-answer tests
 published with X-Wing [XWING], ML-KEM [FIPS203] and ML-DSA [FIPS204],
