@@ -103,12 +103,24 @@ impl Harness {
         certified: bool,
         capacity: usize,
     ) -> Client {
+        let peer = SocketAddr::from(([203, 0, 113, 7], 51000));
+        self.connect_peer(peer, sni, certified, capacity)
+    }
+
+    /// A new connection from `peer`, as [`connect_info`](Self::connect_info).
+    fn connect_peer(
+        &mut self,
+        peer: SocketAddr,
+        sni: Option<&str>,
+        certified: bool,
+        capacity: usize,
+    ) -> Client {
         self.next += 1;
         let id = ConnId(self.next);
         let (handle, rx) = conn_channel(id, capacity, usize::MAX);
         self.hub.open(
             ConnInfo {
-                peer: SocketAddr::from(([203, 0, 113, 7], 51000)),
+                peer,
                 sni: sni.map(str::to_owned),
                 sni_certified: certified,
                 since: start(),
@@ -130,6 +142,16 @@ impl Harness {
     /// A new connection, signed in as `~name`.
     pub(super) async fn guest(&mut self, name: &str) -> Client {
         self.guest_token(name).await.0
+    }
+
+    /// A new connection from `peer`, signed in as `~name`.
+    pub(super) async fn guest_from(&mut self, name: &str, peer: &str) -> Client {
+        let peer = peer.parse().unwrap();
+        let mut c = self.connect_peer(peer, Some("chat.example.org"), false, 4096);
+        assert_eq!(c.lines().len(), 1, "a greeting");
+        self.send(&c, &format!("guest {name}")).await;
+        assert_eq!(c.lines(), [format!("OK uid=~{name} token=<token>")]);
+        c
     }
 
     /// A new connection, signed in as `~name`, and its session's token.

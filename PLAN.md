@@ -737,6 +737,8 @@ Open:
 
     Implementation choice: the report rate limit is
     `limits.reports_per_hour` in the configuration, 30 by default.
+    Identities count by uid. Guests count by their session's address,
+    IPv6 by its /64, since a guest can take a new name at will.
 
 34. **Found while testing M4's client** (librisala only, no spec change),
     confirmed with the user on 2026-11-08: an identity's messages for a

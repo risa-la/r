@@ -22,6 +22,7 @@
 //! reports apart by id.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -36,7 +37,7 @@ use risala_proto::types::DEFAULT_LIST_LIMIT;
 
 use super::Inner;
 use super::commands::{Fail, Outcome, Reply, check_read, fail, not_found, not_supported, room_of};
-use super::rate::WindowLimit;
+use super::rate::{WindowLimit, network};
 use super::state::{ConvEntry, ConvState, RoomInfo};
 use crate::handler::OutLine;
 use crate::store::{EventKind, NewReport, ReportAdded, ReportRecord, StoreError};
@@ -50,8 +51,17 @@ pub(crate) struct ReportBook {
     /// See the module documentation, "Order". Taken after a room's lock,
     /// never before one.
     lock: tokio::sync::Mutex<()>,
-    /// The reports each uid made in the last [`REPORT_WINDOW`].
-    made: WindowLimit<Uid>,
+    /// The reports each reporter made in the last [`REPORT_WINDOW`].
+    made: WindowLimit<Reporter>,
+}
+
+/// Who a report counts against for `limits.reports_per_hour`: an
+/// identity by its uid, a guest by the network of its session's address
+/// (see [`network`]), since a guest can take a new name at will.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Reporter {
+    Identity(Uid),
+    Network(IpAddr),
 }
 
 impl ReportBook {
@@ -244,7 +254,11 @@ impl Inner {
         let slot = self
             .report_book
             .made
-            .take(uid.clone(), self.config.limits.reports_per_hour, self.now())
+            .take(
+                self.reporter(uid),
+                self.config.limits.reports_per_hour,
+                self.now(),
+            )
             .map_err(|retry| {
                 Fail::Err(
                     ErrResponse::new(ErrorCode::RateLimited)
@@ -275,6 +289,16 @@ impl Inner {
         tracing::info!(%room, report = %id, "message reported");
         self.send_report(&reviewers, &id, &report)?;
         Ok(Some(OkResponse::new().with_id(&id)))
+    }
+
+    /// Who a report by `uid` counts against (see [`Reporter`]).
+    fn reporter(&self, uid: &Uid) -> Reporter {
+        if !uid.is_identity()
+            && let Some(session) = self.reg().sessions.get(uid)
+        {
+            return Reporter::Network(network(session.address));
+        }
+        Reporter::Identity(uid.clone())
     }
 
     /// Checks that `uid` may see the reports of the room (5.8): the room

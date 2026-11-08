@@ -229,10 +229,12 @@ pub struct Limits {
     /// of identities. Further creations get `ERR rate-limited`. Operators
     /// are not limited. 0 means no limit.
     pub rooms_per_day: u32,
-    /// The most reports one uid may make in an hour (5.8: servers SHOULD
-    /// rate-limit reports). Further REPORTs get `ERR rate-limited`. A
-    /// report repeated, which gets the existing id, does not count. 0 means
-    /// no limit.
+    /// The most reports one identity, or the guests of one network, may
+    /// make in an hour (5.8: servers SHOULD rate-limit reports). Guests
+    /// count by their address, IPv6 addresses by their /64, since a guest
+    /// can take a new name at will. Further REPORTs get `ERR
+    /// rate-limited`. A report repeated, which gets the existing id, does
+    /// not count. 0 means no limit.
     pub reports_per_hour: u32,
     /// Seconds after an identity's last connection closes before the
     /// people who share a conversation with it are told it is offline

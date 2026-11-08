@@ -19,6 +19,7 @@ use risala_proto::text::unescape;
 
 use super::commands::{Fail, Outcome, Reply, fail, respond};
 use super::keys::{FetchError, KeyFilePublisher};
+use super::rate::network;
 use super::state::UserEntry;
 use super::{Inner, KEY_FETCH_TIMEOUT, UNAVAILABLE_RETRY};
 use crate::handler::ConnId;
@@ -74,21 +75,6 @@ struct Challenge {
     sni_certified: bool,
     /// The client's address, for the registration limit (13).
     peer: IpAddr,
-}
-
-/// The network a registration counts against (13): the address, or the
-/// /64 of an IPv6 address, since one host usually has a whole /64.
-fn rate_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => {
-                let bits = u128::from(v6) & !((1u128 << 64) - 1);
-                IpAddr::V6(bits.into())
-            }
-        },
-    }
 }
 
 /// The key file entry for a hosted key, whose label is escaped (3.4). A
@@ -462,7 +448,7 @@ impl Inner {
         let limit = self.config.limits.registrations_per_hour;
         let slot = self
             .registrations
-            .take(rate_key(peer), limit, now)
+            .take(network(peer), limit, now)
             .map_err(|retry| {
                 Fail::Err(
                     ErrResponse::new(ErrorCode::RateLimited)

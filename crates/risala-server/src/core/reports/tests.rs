@@ -359,6 +359,32 @@ async fn reports_are_rate_limited() {
     report(&h, &mut sam, "report #general 36").await;
 }
 
+#[tokio::test]
+async fn guests_count_reports_by_network() {
+    let mut c = config();
+    c.rooms = strings(&["#general", "#private"]);
+    c.limits.reports_per_hour = 2;
+    let mut h = Harness::with(c, prepare);
+    let mut sam = h.guest_from("sam", "[2001:db8:1:2::5]:4000").await;
+    report(&h, &mut sam, "report #general 5").await;
+    report(&h, &mut sam, "report #general 6").await;
+    // A new name in the same /64 does not get around the limit.
+    h.close(sam).await;
+    h.end("sam").await;
+    let mut tom = h.guest_from("tom", "[2001:db8:1:2:ffff::9]:4000").await;
+    h.send(&tom, "report #general 7").await;
+    assert_eq!(
+        tom.lines(),
+        ["@retry=3600 ERR rate-limited you have made too many reports"]
+    );
+    // Another network has its own reports.
+    let mut far = h.guest_from("far", "[2001:db8:1:3::5]:4000").await;
+    report(&h, &mut far, "report #general 7").await;
+    // Identities count by uid, wherever they connect from.
+    let mut bob = h.signed_in_as(BOB);
+    report(&h, &mut bob, "report #general 5").await;
+}
+
 // ---------------------------------------------------------------------------
 // REPORTS, RESOLVE and ADMIN REPORTS (5.8)
 

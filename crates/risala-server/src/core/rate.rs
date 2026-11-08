@@ -9,10 +9,28 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use risala_proto::time::Timestamp;
+
+/// The network an address counts against, for limits by address (13):
+/// the address, or the /64 of an IPv6 address, since one host usually
+/// has a whole /64. An IPv4-mapped IPv6 address counts as the IPv4
+/// address.
+pub(super) fn network(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let bits = u128::from(v6) & !((1u128 << 64) - 1);
+                IpAddr::V6(bits.into())
+            }
+        },
+    }
+}
 
 /// At most some number of slots per key in any `window`.
 #[derive(Debug)]
