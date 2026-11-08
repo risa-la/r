@@ -198,6 +198,12 @@ impl KeyFile {
     /// Fails with `TooLong` if the text is over [`MAX_KEY_FILE_BYTES`],
     /// which a server must treat as a file with no keys. This is the only
     /// error.
+    ///
+    /// The text is already UTF-8. A file fetched as bytes may have lines
+    /// that are not, which 4.4 says to ignore: the caller drops those lines
+    /// before calling this, rather than refusing the whole file, as
+    /// `risala-keyfetch` does. Line numbers in
+    /// [`skipped`](KeyFile::skipped) then count only the lines kept.
     pub fn parse(text: &str) -> Result<KeyFile, ParseError> {
         if text.len() > MAX_KEY_FILE_BYTES {
             return Err(ParseError::TooLong);
