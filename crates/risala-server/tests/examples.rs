@@ -1,5 +1,7 @@
 //! The example sessions of SPEC.md and README.md, played over TLS against
-//! a whole server, as far as guests can go in M2.
+//! a whole server: those of M2, as far as guests can go, and those of M4's
+//! sections (5.4, 5.8, 7.3). Sections 5.3, 6.2-6.4 and 10 have none, and
+//! REPORTENC's (5.8) waits for encryption (M5a).
 //!
 //! The examples are read from the documents themselves, so a change to
 //! them that the server does not follow fails here. Only times, the
@@ -9,8 +11,9 @@
 mod common;
 
 use common::{Session, msg, put, readme_example, spec_example};
-use risala_proto::types::RoomSetting;
-use risala_server::store::EventKind;
+use risala_proto::names::Seq;
+use risala_proto::types::{Relation, RoomSetting};
+use risala_server::store::{EventKind, SqliteStore};
 use risala_server::testing::TestServer;
 
 /// A server where `#general` is as in the examples: topic "General chat.
@@ -181,4 +184,125 @@ fn readme_sample_config_parses() {
     assert_eq!(config.hostname, "chat.example.org");
     assert_eq!(config.tls.certs.len(), 1);
     assert_eq!(config.rooms, ["#general", "#help"]);
+}
+
+/// A message with a `reply`, `edit` or `react` tag, for [`put`].
+fn related(relation: Relation, text: &str) -> EventKind {
+    EventKind::Msg {
+        relation: Some(relation),
+        file: None,
+        text: text.into(),
+    }
+}
+
+/// Section 5.4's placeholder: sam's reply from 1.4, deleted, as HISTORY
+/// returns it.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleted_placeholder() {
+    let server = example_server().await;
+    let mut s = Session::new();
+    s.add("sam", server.connect().await);
+    s.play(
+        &spec_example("### 1.4. Overview")
+            .until("OK seq=8813")
+            .script(),
+    )
+    .await;
+    s.play(
+        "C: delete #general 8813
+         S: @seq=8814;t={*};from=~sam DELETE #general 8813
+         S: OK seq=8814
+         C: history #general before=8814 limit=1",
+    )
+    .await;
+    s.play(&spec_example("### 5.4. Deleting Messages").script())
+        .await;
+    s.play("S: OK id={id} more=1").await;
+    s.settled().await;
+    server.stop().await;
+}
+
+/// Section 5.8: bob@example.net reports the spammer's message, and an
+/// operator receives the two lines, with `from`.
+#[tokio::test(flavor = "multi_thread")]
+async fn report_lines() {
+    let server = TestServer::builder()
+        .hostname("chat.example.org")
+        .key_domains(&["example.net", "example.com"])
+        .operator("op@example.com")
+        .room("#general")
+        .prepare(|store| {
+            for n in 1..=8815 {
+                put(
+                    store,
+                    "#general",
+                    "carol@example.org",
+                    msg(&format!("message {n}")),
+                );
+            }
+            put(store, "#general", "~spammer", msg("cheap pills at …"));
+        })
+        .start()
+        .await;
+    let op = server.identity("op@example.com");
+    let bob = server.identity("bob@example.net");
+    let mut s = Session::new();
+    s.add("op", server.sign_in(&op).await);
+    s.add("bob", server.sign_in(&bob).await);
+    s.play(
+        "bob C: report #general 8816 spam
+         bob S: OK id={report}",
+    )
+    .await;
+    let lines = spec_example("### 5.8. Reporting").script();
+    assert_eq!(lines.lines().count(), 2, "{lines}");
+    s.play(&lines.replace("p4x8n2", "{report}")).await;
+    s.settled().await;
+    server.stop().await;
+}
+
+/// Section 7.3: a page of older history, then the edits and reactions of
+/// its messages.
+#[tokio::test(flavor = "multi_thread")]
+async fn related_example() {
+    let server = TestServer::builder()
+        .hostname("chat.example.org")
+        .room("#general")
+        .prepare(|store| {
+            let filler = |store: &SqliteStore, from: u64, to: u64| {
+                for n in from..=to {
+                    put(
+                        store,
+                        "#general",
+                        "carol@example.org",
+                        msg(&format!("message {n}")),
+                    );
+                }
+            };
+            filler(store, 1, 3998);
+            put(store, "#general", "alice@example.org", msg("lunch?"));
+            put(store, "#general", "bob@example.net", msg("sure, at 12"));
+            filler(store, 4001, 4002);
+            put(
+                store,
+                "#general",
+                "bob@example.net",
+                related(Relation::Edit(Seq::new(4000).unwrap()), "sure, at 12:30"),
+            );
+            filler(store, 4004, 8789);
+            put(
+                store,
+                "#general",
+                "~sam",
+                related(Relation::React(Seq::new(3999).unwrap()), "🍕"),
+            );
+        })
+        .start()
+        .await;
+    let mut s = Session::new();
+    s.add("kim", server.guest("kim").await);
+    s.play(&spec_example("### 7.3. Edits and Reactions").script())
+        .await;
+    s.settled().await;
+    server.stop().await;
 }
