@@ -57,8 +57,8 @@ On 2026-11-08, with the user:
 
 - **Builds.** Run cargo only through
   `/home/humaid/repos/risala-m5b/cargo.sh <args>`. It allows two cargo
-  runs at a time across all agents, niced and memory-capped, each on a
-  shared target directory, and waits for a free slot. Never run cargo
+  runs at a time across all agents, niced and memory-capped, each
+  checkout with its own target directory, and waits for a free slot. Never run cargo
   directly, never `nix flake check`, Kani, TLC or fuzzers. Prefer
   `-p <crate>` and targeted tests while working; run the whole
   workspace's tests once before reporting.
@@ -145,7 +145,7 @@ four writing code at once.
   proofs computed from tiles, the witness policy (k of n), and fork
   evidence. Pure library, no I/O beyond traits for fetching tiles.
   Owns the new crate.
-- [~] **P4. Content lines** (12.9, 5.3-5.8, 8): the lines inside
+- [x] **P4. Content lines** (12.9, 5.3-5.8, 8): the lines inside
   encrypted messages (TEXT with its tags, DELETE, TYPING, READ, REPORT,
   CHALLENGE/ANSWER, ATTEST/REVEAL, BLOCK/UNBLOCK, RECORD/ALERT,
   SIGNINGKEY/BACKUPKEY), as a separate `Content` type with its own
