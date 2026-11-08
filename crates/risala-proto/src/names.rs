@@ -392,9 +392,10 @@ fn base32_value(c: u8) -> Option<u8> {
     }
 }
 
-/// The 26 characters of 16 bytes in lower-case base32, without padding.
-fn base32_encode(bytes: &[u8; 16]) -> String {
-    let mut out = String::with_capacity(BOX_LEN);
+/// `N` bytes in lower-case base32, without padding: 26 characters for 16
+/// bytes, 52 for 32.
+fn base32_encode<const N: usize>(bytes: &[u8; N]) -> String {
+    let mut out = String::with_capacity((8 * N).div_ceil(5));
     let mut acc: u32 = 0;
     let mut bits = 0;
     for &b in bytes {
@@ -405,21 +406,24 @@ fn base32_encode(bytes: &[u8; 16]) -> String {
             out.push(char::from(BASE32[(acc >> bits) as usize & 31]));
         }
     }
-    // 128 bits leave 3, padded with two zero bits to a last character.
-    out.push(char::from(BASE32[(acc << (5 - bits)) as usize & 31]));
+    // Bits left over are padded with zero bits to a last character: 3 of
+    // 128, 1 of 256.
+    if bits > 0 {
+        out.push(char::from(BASE32[(acc << (5 - bits)) as usize & 31]));
+    }
     out
 }
 
-/// Reads 16 bytes from 26 characters of base32, folding ASCII upper case
-/// (3.5). The two bits after the last byte must be zero, so that every
-/// value has one spelling. Any other length, character or trailing bits
-/// are `BadSyntax` (3.7).
-fn base32_decode(s: &str, what: &'static str) -> Result<[u8; 16], ParseError> {
+/// Reads `N` bytes from base32, folding ASCII upper case (3.5): 26
+/// characters for 16 bytes, 52 for 32. The bits after the last byte must
+/// be zero, so that every value has one spelling. Any other length,
+/// character or trailing bits are `BadSyntax` (3.7).
+fn base32_decode<const N: usize>(s: &str, what: &'static str) -> Result<[u8; N], ParseError> {
     let b = s.as_bytes();
-    if b.len() != BOX_LEN {
+    if b.len() != (8 * N).div_ceil(5) {
         return Err(ParseError::BadSyntax(what));
     }
-    let mut out = [0u8; 16];
+    let mut out = [0u8; N];
     let mut acc: u32 = 0;
     let mut bits = 0;
     let mut i = 0;
@@ -581,6 +585,98 @@ impl FromStr for BlobRef {
             *byte = (digit(*hi)? << 4 | digit(*lo)?) as u8;
         }
         Ok(BlobRef(out))
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+/// A `risala://` link (15): `risala://<host>[:<port>][/<room>[?g=<group-id>]]`.
+///
+/// `<room>` is a public room without its `#`, and `<group-id>` the room's
+/// 32-byte group id in lower-case base32 without padding, 52 characters.
+/// A device that follows a link with a group id joins only the group with
+/// that id (6.1).
+///
+/// Parsing folds the scheme, host and group id to lower case (2.1, 3.5),
+/// and the room as every room is folded. Anything else, such as a `/`
+/// after the host with no room, a query other than one `g`, or a
+/// fragment, is `BadSyntax`: the spec defines no other form, and a link
+/// that says more than this one cannot be followed as it was meant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Link {
+    /// The server's host, in lower case.
+    pub host: crate::server::Host,
+    /// The server's port, if not the default 7472 (2.1).
+    pub port: Option<u16>,
+    /// The public room the link points to.
+    pub room: Option<Room>,
+    /// The room's group id, which only a link with a room may carry.
+    pub group_id: Option<crate::mls::GroupId>,
+}
+
+impl Link {
+    /// The scheme, with its `://`.
+    pub const SCHEME: &'static str = "risala://";
+
+    /// The length of a group id in a link: 32 bytes in base32 (15).
+    pub const GROUP_ID_LEN: usize = 52;
+}
+
+impl fmt::Display for Link {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(Link::SCHEME)?;
+        crate::server::response::write_authority(f, &self.host, self.port)?;
+        if let Some(room) = &self.room {
+            write!(f, "/{}", room.bare())?;
+            if let Some(group_id) = &self.group_id {
+                write!(f, "?g={}", base32_encode(group_id.as_bytes()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Link {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Link, ParseError> {
+        const WHAT: ParseError =
+            ParseError::BadSyntax("a link is risala://<host>[:<port>][/<room>[?g=<group-id>]]");
+        let rest = match s.get(..Link::SCHEME.len()) {
+            Some(scheme) if scheme.eq_ignore_ascii_case(Link::SCHEME) => &s[Link::SCHEME.len()..],
+            _ => return Err(WHAT),
+        };
+        let (authority, path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, Some(path)),
+            None => (rest, None),
+        };
+        let (host, port) = crate::server::response::parse_authority(authority).ok_or(WHAT)?;
+        let (room, group_id) = match path {
+            None => (None, None),
+            Some(path) => {
+                let (room, query) = match path.split_once('?') {
+                    Some((room, query)) => (room, Some(query)),
+                    None => (path, None),
+                };
+                let room = Room::from_bare(room).map_err(|_| WHAT)?;
+                let group_id = match query {
+                    None => None,
+                    Some(query) => {
+                        let g = query.strip_prefix("g=").ok_or(WHAT)?;
+                        let bytes =
+                            base32_decode(g, "a link's group id is 52 characters of base32")?;
+                        Some(crate::mls::GroupId::from_bytes(bytes))
+                    }
+                };
+                (Some(room), group_id)
+            }
+        };
+        Ok(Link {
+            host,
+            port,
+            room,
+            group_id,
+        })
     }
 }
 
@@ -1163,6 +1259,62 @@ mod tests {
             syntax::<BoxName>(s);
         }
         assert_eq!(ok::<PairId>("aaaaaaaaaaaaaaaaaaaaaaaaaa"), "a".repeat(26));
+    }
+
+    #[test]
+    fn links() {
+        // 15's example, and the forms of the grammar.
+        let gid = format!("{}q", "a".repeat(51));
+        for s in [
+            "risala://chat.example.org".to_owned(),
+            "risala://chat.example.org/general".to_owned(),
+            "risala://chat.example.org:7000/general".to_owned(),
+            "risala://[2001:db8::1]:7000".to_owned(),
+            format!("risala://chat.example.org/general?g={gid}"),
+        ] {
+            assert_eq!(ok::<Link>(&s), s);
+        }
+        let link: Link = "RISALA://Chat.Example.ORG/General?g=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            link.to_string(),
+            "risala://chat.example.org/general?g=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaq"
+        );
+        assert_eq!(link.room.as_ref().map(Room::as_str), Some("#general"));
+        let mut bytes = [0u8; 32];
+        bytes[31] = 1;
+        assert_eq!(link.group_id.map(|g| *g.as_bytes()), Some(bytes));
+        // 32 bytes are 52 characters; the last carries one bit and four
+        // zero bits.
+        let id = crate::mls::GroupId::from_bytes([0xff; 32]);
+        let full = Link {
+            group_id: Some(id),
+            ..link
+        };
+        let text = full.to_string();
+        assert!(text.ends_with(&format!("?g={}q", "7".repeat(51))), "{text}");
+        assert_eq!(text.parse::<Link>(), Ok(full));
+        for s in [
+            "",
+            "risala:",
+            "risala://",
+            "https://chat.example.org/general",
+            "risala://chat.example.org/",
+            "risala://chat.example.org/#general",
+            "risala://chat.example.org/general/",
+            "risala://chat.example.org/general?",
+            "risala://chat.example.org/general?x=1",
+            "risala://chat.example.org/general#x",
+            "risala://chat.example.org?g=aaaa",
+            "risala://chat.example.org:0/general",
+            "risala://chat.example.org/general?g=aaaa",
+            &format!("risala://chat.example.org/general?g={}r", "a".repeat(51)),
+            &format!("risala://chat.example.org/general?g={gid}&x=1"),
+            &format!("risala://chat.example.org/general?g={gid}a"),
+        ] {
+            syntax::<Link>(s);
+        }
     }
 
     #[test]

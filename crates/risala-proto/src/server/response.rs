@@ -188,15 +188,7 @@ impl FileOrigin {
 impl fmt::Display for FileOrigin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("https://")?;
-        if self.host.as_str().contains(':') {
-            write!(f, "[{}]", self.host)?;
-        } else {
-            f.write_str(self.host.as_str())?;
-        }
-        if let Some(port) = self.port {
-            write!(f, ":{port}")?;
-        }
-        Ok(())
+        write_authority(f, &self.host, self.port)
     }
 }
 
@@ -209,34 +201,57 @@ impl FromStr for FileOrigin {
             Some(scheme) if scheme.eq_ignore_ascii_case("https://") => &s[8..],
             _ => return Err(WHAT),
         };
-        let (host, port) = match rest.strip_prefix('[') {
-            Some(v6) => {
-                let (addr, after) = v6.split_once(']').ok_or(WHAT)?;
-                let addr: Ipv6Addr = addr.parse().map_err(|_| WHAT)?;
-                let port = match after {
-                    "" => None,
-                    _ => Some(after.strip_prefix(':').ok_or(WHAT)?),
-                };
-                (Host(addr.to_string()), port)
-            }
-            None => {
-                let (host, port) = match rest.split_once(':') {
-                    Some((host, port)) => (host, Some(port)),
-                    None => (rest, None),
-                };
-                if host.is_empty() {
-                    return Err(WHAT);
-                }
-                (host.parse().map_err(|_| WHAT)?, port)
-            }
-        };
-        let port = port
-            .map(|p| match parse_u64(p) {
-                Ok(n @ 1..=65535) => Ok(n as u16),
-                _ => Err(WHAT),
-            })
-            .transpose()?;
+        let (host, port) = parse_authority(rest).ok_or(WHAT)?;
         Ok(FileOrigin { host, port })
+    }
+}
+
+/// Reads `<host>[:<port>]` (2.1): a [`Host`], or an IPv6 address in
+/// brackets, and a port of 1 to 65535. `None` for anything else.
+pub(crate) fn parse_authority(s: &str) -> Option<(Host, Option<u16>)> {
+    let (host, port) = match s.strip_prefix('[') {
+        Some(v6) => {
+            let (addr, after) = v6.split_once(']')?;
+            let addr: Ipv6Addr = addr.parse().ok()?;
+            let port = match after {
+                "" => None,
+                _ => Some(after.strip_prefix(':')?),
+            };
+            (Host(addr.to_string()), port)
+        }
+        None => {
+            let (host, port) = match s.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (s, None),
+            };
+            if host.is_empty() {
+                return None;
+            }
+            (host.parse().ok()?, port)
+        }
+    };
+    let port = match port.map(parse_u64) {
+        None => None,
+        Some(Ok(n @ 1..=65535)) => Some(n as u16),
+        Some(_) => return None,
+    };
+    Some((host, port))
+}
+
+/// Writes `<host>[:<port>]`, with an IPv6 address in brackets.
+pub(crate) fn write_authority(
+    f: &mut fmt::Formatter<'_>,
+    host: &Host,
+    port: Option<u16>,
+) -> fmt::Result {
+    if host.as_str().contains(':') {
+        write!(f, "[{host}]")?;
+    } else {
+        f.write_str(host.as_str())?;
+    }
+    match port {
+        Some(port) => write!(f, ":{port}"),
+        None => Ok(()),
     }
 }
 
