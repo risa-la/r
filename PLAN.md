@@ -1006,7 +1006,7 @@ Open:
         use, mode 0600; one that others can read is refused, as for
         device keys. Losing it loses the cache. (Replaced by 45: the CLI
         keeps it under the TPM or the Secure Enclave.)
-      - The MLS tables are schema version 12 of the cache. MLS operations
+      - The MLS tables are schema version 13 of the cache. MLS operations
         run in the cache's own write transaction (`BEGIN IMMEDIATE`), on
         a provider whose storage is that transaction, so the MLS state
         and the cache's rows commit or roll back together.
@@ -1258,7 +1258,7 @@ Open:
 
     How librisala builds these (implementation only):
     - **Keys belong to an identity.** The cache keeps device keys by
-      identity and key id (cache version 15), and every key is checked
+      identity and key id (cache version 16), and every key is checked
       again after the upgrade. A key counts as listed only in its own
       identity's key file.
     - **Joining a room.** INVITE events are kept with the members (version
@@ -1284,12 +1284,12 @@ Open:
       each conversation's duties remove its leaves; `confirm_device`
       returns its key file line (`DeclinedDevice`) to offer removing it.
       A recovery key to send, and one another device offered, are kept in
-      the cache (version 17). "The key file lists it now" is the last
+      the cache (version 18). "The key file lists it now" is the last
       fetch, which must be newer than the offer; otherwise the key file is
       fetched first. The user's answer is
       `Account::accept_recovery_key` (CLI `recovery accept`).
     - **24 hours.** The commit that waits, and since when, is kept in the
-      cache (version 18), by the engine's clock. Key files a commit waits
+      cache (version 19), by the engine's clock. Key files a commit waits
       for are asked for again every five minutes on the same connection.
     - **The recovery key's connection.** `SyncEngine::issue`, through which
       every command goes, drops KEYPKG ADD, INIT, COMMIT and ENC on it;
