@@ -17,9 +17,10 @@ This file covers how we build it.
   cache, timelines, rooms, moderation and admin. An app only draws the
   UI and supplies a few platform services (secure key storage, push
   tokens, notifications).
-- **`openssl s_client` stays a first-class client.** The server is tested
-  with scripted line transcripts. Every example in the spec becomes a
-  test.
+- **Tested from transcripts.** The server is tested with scripted line
+  transcripts. Every example in the spec becomes a test. Using the
+  protocol by hand with `openssl s_client` is no longer a goal: connecting
+  will need a client that solves proof of work (item 42).
 
 ## 2. Repository layout
 
@@ -37,6 +38,7 @@ risala/
 │   ├── risala-proto/      lines, tags, names, escaping, auth bytes; no I/O
 │   ├── risala-server/     the server binary, `risalad`
 │   ├── risala-keyfetch/   fetches key files over HTTPS (4.4), for the server
+│   ├── risala-pow/        HashWX proof of work: interpreter, JIT and puzzles
 │   ├── librisala/         the client library
 │   ├── librisala-ffi/     planned: UniFFI bindings for Kotlin and Swift
 │   ├── risala-cli/        small terminal client and key tool built on librisala
@@ -68,7 +70,27 @@ and fuzz.
   tests (parsing what we serialise gives back the same value) and a
   cargo-fuzz target for the parser.
 
-### 3.2. risala-server (`risalad`)
+### 3.2. risala-pow
+
+Proof of work against bots (item 42). It implements HashWX, written
+clean-room under Apache-2.0: tevador's reference is LGPL-3.0, which an
+iOS App Store app cannot ship.
+
+- A `no_std` core makes a function's 32 programs from a seed, hashes
+  nonces with a reusable scratchpad, and solves and checks puzzles. Kani
+  proofs cover every seed.
+- Two backends. A JIT for x86-64 and aarch64 (Linux, Android and macOS)
+  keeps strict W^X, or Apple's per-thread `MAP_JIT` on Apple Silicon. Its
+  only unsafe code is `jit/exec.rs`. The interpreter runs everywhere
+  else, including iOS, and wherever the OS refuses executable memory.
+- The JIT is checked against the interpreter: differential tests, a fuzz
+  target, every instruction encoding against an independent decoder, a
+  static checker of compiled code, and Kani proofs of the emitters. CI
+  runs the long comparison on x86-64, ARM and macOS runners.
+- On one Threadripper 5995WX core, the interpreter takes about 20 µs a
+  hash and the JIT 2.25 µs. tevador's JIT takes 2.35 µs.
+
+### 3.3. risala-server (`risalad`)
 
 - **Runtime:** tokio, with tokio-rustls for TLS 1.3. It picks
   certificates by SNI and reloads them when they are renewed, without
@@ -95,7 +117,7 @@ and fuzz.
 - **Configuration:** a TOML file. The first operators, the identity
   domain, limits and policies all live there. A NixOS module comes later.
 
-### 3.3. librisala
+### 3.4. librisala
 
 A Rust library, async inside (tokio), with a synchronous-looking API
 across the FFI boundary.
@@ -142,7 +164,7 @@ across the FFI boundary.
   be safe to open from two processes at once (a shared app group
   container, WAL, short transactions).
 
-### 3.4. Bindings and apps
+### 3.5. Bindings and apps
 
 - **librisala-ffi:** UniFFI. It produces Kotlin with JNI `.so` files for
   each Android ABI, and Swift with an XCFramework for macOS and iOS.
@@ -162,7 +184,7 @@ across the FFI boundary.
 - **Android:** Kotlin with Jetpack Compose. Push through FCM, and through
   UnifiedPush where available.
 
-### 3.5. Tooling
+### 3.6. Tooling
 
 - **Nix flake** (flake-parts): the dev shell now; later packages for
   `risalad` and `risala-cli`, `nix flake check` running the tests, and a
@@ -173,8 +195,11 @@ across the FFI boundary.
   builds the Apple app too (`nix build .#apple-macos`, `.#apple-ios`),
   through SweetPad and the host's Xcode. Those builds are not hermetic:
   Xcode itself stays outside the Nix store (see `clients/apple`).
-- **CI:** `nix flake check` (fmt, clippy, rustdoc, tests), plus a smoke test that
-  starts `risalad` and talks to it through `openssl s_client`.
+- **CI:** `nix flake check` (fmt, clippy, rustdoc, tests), Kani,
+  risala-pow's JIT against its interpreter on x86-64, ARM and macOS
+  runners, and a smoke test that starts `risalad` and talks to it through
+  `openssl s_client`. Once connecting needs proof of work (item 42), the
+  smoke test talks through `risala-cli` instead.
 
 ## 4. Milestones
 
@@ -190,6 +215,7 @@ Each milestone ends with something that runs.
 | M5 | librisala core and `risala-cli` | The CLI signs in, syncs, works offline from its cache and recovers from dropped connections without losing or duplicating messages |
 | M5a | End-to-end encryption | Post-quantum TLS and ML-DSA keys everywhere. KEYPKG, INIT, COMMIT, GROUPINFO, WELCOME, ENC and BACKUP in `risalad` and librisala, and direct conversations. Two CLI devices talk in an encrypted direct conversation and room; a new device of the same identity reads the whole history offline; a restore from a recovery key works; reports of encrypted messages verify |
 | M6 | FFI, shared theme and strings | `librisala-ffi` with UniFFI for Swift and Kotlin, platform key stores, one source for the theme's colors and metrics, and the shared strings in `l10n/`. The Apple app and an Android shell sign in, sync and show a timeline through the bindings |
+| M6a | Proof of work | The puzzle is in SPEC.md (item 42). `risalad` hands out puzzles and checks solutions with the interpreter; librisala solves them with the JIT where it can, on every hardware thread. By default a client cannot become a guest or register without solving one. The `openssl` smoke test moves to `risala-cli`. The `risala-pow` crate itself is done (3.2) |
 | M7 | iOS and Android apps | Built side by side, with macOS coming along through the shared SwiftUI app. Onboarding (guest, registering with an invite, signing in, pairing a device by QR code, recovery), rooms, direct conversations and encryption. Day-to-day usable on phones against a real server |
 | M8 | Push and files | PUSH, the gateway, the iOS extension, FCM and UnifiedPush, then UPLOAD over HTTPS |
 | M9 | GNOME app | Day-to-day usable on Linux against a real server |
@@ -879,6 +905,37 @@ Open:
       (diffs by index, paging through the timeline, start of history).
       It lands once it builds on a Mac.
 
+42. **Proof of work, and no more hand use** (1.1, 2.1, 4.1, 4.2, 4.6,
+    14, Appendix A), decided with the user on 2026-11-08. Spec change
+    still to write (M6a):
+    - **Proof of work is on by default**, to keep bots out. The
+      algorithm is HashWX 1.0.0, through our `risala-pow` (3.2, and
+      Section 6).
+    - **Hand use is dropped as a goal.** `openssl s_client` can no
+      longer connect on its own, since it cannot solve the puzzle. This
+      frees the spec to require ALPN `risala/1` (2.1) and shorten the
+      120-second sign-in window (4.1). Appendix A goes, and so does the
+      README's `s_client` session.
+
+    Still to settle, as questions to the user:
+
+    - Which commands need a solution: GUEST and REGISTER, and perhaps
+      AUTH for an identity whose key file the server has not cached,
+      since fetching it costs the server.
+    - How a solution is bound to the connection so it cannot be reused,
+      for example by deriving the puzzle's challenge from the greeting's
+      nonce.
+    - How the server announces the puzzle and its difficulty (a greeting
+      tag, or an `ERR` with the parameters), and the new error code.
+    - The pass rule: a hash at most the target with the block number as
+      8 little-endian bytes, as Cap does, or strictly below it, as
+      tevador's sketch has it.
+    - Nonces per function: 463, tevador's recommendation for native
+      code, or 65536, his choice for browsers.
+    - The default difficulty, an `ADMIN SET` key for it, and whether it
+      rises under load. It has to be set from the slowest supported
+      client, an iPhone using the interpreter.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
@@ -915,3 +972,24 @@ Open:
     generated Swift constants. Its AGENTS.md changes with it in M6.
 - **The Apple app** keeps its current deployment targets (iOS 18 and
   macOS 15) for now.
+- **risala-pow** (item 42), decided with the user on 2026-11-08:
+  - **Clean room.** One agent described HashWX from tevador's documents
+    and code, and another wrote the crate from that description alone.
+    Neither the description nor tevador's code is in the repository. The
+    test seeds are our own; their expected values come from tevador's
+    reference build, so the tests still check against it.
+  - **Unsafe code.** risala-pow has its own lints, with `unsafe_code` at
+    `deny` rather than the workspace's `forbid`, and only `jit/exec.rs`
+    allows it. Every other crate still forbids it.
+  - **Clients solve with the JIT** on x86-64 and aarch64. iOS never has
+    a JIT, since Apple forbids it, and uses the interpreter.
+  - **Servers verify with the interpreter.** Strict W^X costs two
+    `mprotect` calls per function, and those stall every thread of the
+    process: a JIT check takes 10.9 µs on one thread but 73 µs each
+    with 16 threads checking, while the interpreter takes about 25 µs at
+    any thread count. Memory protection keys would avoid the stall but
+    weaken W^X, so we did not use them.
+  - **No two-nonce JIT.** Running two nonces interleaved on one core was
+    23–32% slower on x86-64. A hash is held back by mispredicted loop
+    exits, which stall both nonces at once, and hyperthreading already
+    gives 1.44× per core. Solvers use every hardware thread instead.
