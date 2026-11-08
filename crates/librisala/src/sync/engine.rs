@@ -493,8 +493,8 @@ impl SyncEngine {
     /// a message of that conversation only. Returns the outbox entry.
     ///
     /// It goes out once the id is confirmed on this connection, or, for a
-    /// room the account is no longer in, once SYNC has been answered with
-    /// the id still stored: authors may delete their own messages in rooms
+    /// room the cache says the account is no longer in, at once while the
+    /// id is still stored: authors may delete their own messages in rooms
     /// they have left (5.4). See [`delete_left`] for that rule.
     pub fn delete(&mut self, conv: &Conv, seq: Seq) -> Result<(OutboxId, Output), SyncError> {
         let (account, now) = (self.account, self.now());
@@ -1782,9 +1782,6 @@ impl SyncEngine {
             .iter()
             .filter_map(|(c, l)| Some((c.clone(), l.confirmed.clone()?)))
             .collect();
-        // Rooms the account is not in can be told apart from rooms not
-        // confirmed yet only once SYNC has answered (7.1).
-        let synced = self.syncing.is_none() && !self.want_sync;
         let to_send = self.write(|tx| {
             let mut to_send = Vec::new();
             for item in tx.outbox_pending(account)? {
@@ -1824,8 +1821,7 @@ impl SyncEngine {
                 match (&item.conv_id, live) {
                     (Some(bound), Some(id)) if bound == id => {}
                     (Some(bound), None)
-                        if item.delete.is_some()
-                            && delete_left(synced, left, stored.as_ref(), bound) => {}
+                        if item.delete.is_some() && delete_left(left, stored.as_ref(), bound) => {}
                     (Some(_), Some(_)) => {
                         // The room was dropped and created again (7.6).
                         tx.outbox_failed(item.id, FailReason::RoomChanged)?;
@@ -1873,15 +1869,16 @@ impl SyncEngine {
 }
 
 /// Whether a DELETE bound to `bound` may be sent for a room that is not
-/// confirmed on this connection (5.4): SYNC has answered, the cache says
-/// the account is not in the room, and still has the id the DELETE is
-/// bound to. Authors may delete their own messages in rooms they have
-/// left, but the server cannot confirm the room's id to someone who no
-/// longer reads it, so a room dropped and created again since it was last
-/// seen cannot be told apart here. The server deletes only the sender's
-/// own messages in a room they cannot read.
-fn delete_left(synced: bool, left: bool, stored: Option<&Id>, bound: &Id) -> bool {
-    synced && left && stored == Some(bound)
+/// confirmed on this connection (5.4): the cache says the account is not
+/// in the room, and still has the id the DELETE is bound to. Authors may
+/// delete their own messages in rooms they have left, but the server
+/// cannot confirm the room's id to someone who no longer reads it. The
+/// DELETE carries the id it is bound to, and the server deletes nothing
+/// if the room's id is different, so it need not wait for SYNC: if the
+/// account is in the room again, or the room was dropped and created
+/// again, the server's answer is as safe as SYNC's.
+fn delete_left(left: bool, stored: Option<&Id>, bound: &Id) -> bool {
+    left && stored == Some(bound)
 }
 
 /// Learns a conversation's id and head from a reply (7.1). The head is

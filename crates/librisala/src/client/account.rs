@@ -871,8 +871,9 @@ impl Conversation {
     ///
     /// The author may delete their own messages, and in rooms moderators
     /// and owners anyone's. An author may delete their own messages in a
-    /// room they have left, too: the entry then goes out once the account
-    /// has synced. Fails with [`ClientError::NotJoined`] for a
+    /// room they have left, too. The entry carries the room's id, so that
+    /// nothing is deleted in a room created again under the same name.
+    /// Fails with [`ClientError::NotJoined`] for a
     /// conversation the cache has no id for, since there is no message to
     /// name. A message deleted already, by this DELETE sent before a
     /// dropped connection or by someone else, ends the entry as

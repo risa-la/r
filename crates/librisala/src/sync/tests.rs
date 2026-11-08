@@ -2047,8 +2047,8 @@ fn a_delete_of_a_message_someone_else_deleted_ends_as_sent() {
 #[test]
 fn authors_delete_in_rooms_they_left() {
     // 5.4: an author may delete their own messages after leaving. The
-    // room is not confirmed on the connection, so the DELETE waits until
-    // SYNC says the account is not in it, with the id still stored.
+    // room is not confirmed on the connection, but the cache says the
+    // account left it, and the DELETE carries the id it is bound to.
     let mut h = H::new(ALICE);
     h.joined("k1", 3);
     let r = h.reconnect();
@@ -2063,17 +2063,36 @@ fn authors_delete_in_rooms_they_left() {
         OutboxState::Sent(seq(7))
     );
 
-    // Queued while not known to have left, it goes out once SYNC answers.
+    // Known to have left, it goes out at once, before SYNC answers: the
+    // server deletes nothing if the room has another id by now.
     let r = h.reconnect();
     let (id, out) = h.engine.delete(&conv("#general"), seq(1)).unwrap();
     h.absorb(out);
-    h.idle();
-    h.reply(r, &[], "OK");
     h.expect("@id=k1 DELETE #general 1");
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
         OutboxState::Sending
     );
+    h.reply(r, &[], "OK");
+    h.idle();
+}
+
+#[test]
+fn a_delete_in_a_room_thought_joined_waits_for_sync() {
+    // Queued while the cache still counts the account as in the room, it
+    // waits for the id to be confirmed, or for SYNC to show it left.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    let (id, out) = h.engine.delete(&conv("#general"), seq(1)).unwrap();
+    h.absorb(out);
+    h.idle();
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Queued
+    );
+    h.reply(r, &[], "OK");
+    h.expect("@id=k1 DELETE #general 1");
 }
 
 #[test]
