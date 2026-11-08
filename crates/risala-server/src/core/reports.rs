@@ -123,7 +123,7 @@ impl Inner {
                     return Err(operators_only());
                 }
                 match command {
-                    AdminCommand::Reports => self.all_reports(reply).await,
+                    AdminCommand::Reports => self.all_reports(uid, reply).await,
                     AdminCommand::Rooms(page) => self.all_rooms(reply, page).await,
                     AdminCommand::Drop { room, reason } => self.drop_room(&room, reason).await,
                     _ => Err(not_supported()),
@@ -136,8 +136,10 @@ impl Inner {
     /// The reviewers of a report in a room (5.8), each with whether it is
     /// an operator, who alone see the reporter: the room's owners and
     /// moderators, members or not, and the operators. With `None`, for a
-    /// report whose room is gone, the operators only.
-    pub(super) fn reviewers(&self, info: Option<&RoomInfo>) -> BTreeMap<Uid, bool> {
+    /// report whose room is gone, the operators only. Never `author`, who
+    /// wrote the reported message, so that nobody reviews reports against
+    /// themselves (PLAN.md 5, item 35).
+    pub(super) fn reviewers(&self, info: Option<&RoomInfo>, author: &Uid) -> BTreeMap<Uid, bool> {
         let mut reviewers: BTreeMap<Uid, bool> = info
             .map(|info| info.roles.keys().map(|uid| (uid.clone(), false)).collect())
             .unwrap_or_default();
@@ -145,14 +147,22 @@ impl Inner {
         for op in operators.iter() {
             reviewers.insert(op.clone(), true);
         }
+        reviewers.remove(author);
         reviewers
     }
 
     /// Whether `uid` is a reviewer of reports in the room `info`, or of a
-    /// report whose room is gone if `None` (5.8).
-    fn is_reviewer(&self, uid: &Uid, info: Option<&RoomInfo>) -> bool {
+    /// report whose room is gone if `None` (5.8), leaving aside who wrote
+    /// the reported message.
+    fn reviews_room(&self, uid: &Uid, info: Option<&RoomInfo>) -> bool {
         uid.is_identity()
             && (self.is_operator(uid) || info.is_some_and(|info| info.roles.contains_key(uid)))
+    }
+
+    /// Whether `uid` is a reviewer of a report about a message by `author`
+    /// (PLAN.md 5, item 35).
+    fn is_reviewer(&self, uid: &Uid, info: Option<&RoomInfo>, author: &Uid) -> bool {
+        uid != author && self.reviews_room(uid, info)
     }
 
     /// Sends a report's two lines to every connection of every reviewer
@@ -243,7 +253,7 @@ impl Inner {
             t: self.now(),
             event,
         };
-        let reviewers = self.reviewers(Some(info));
+        let reviewers = self.reviewers(Some(info), &report.event.from);
         let _book = self.report_book.lock.lock().await;
         let stored = report.clone();
         let id = match self.db(move |s| s.add_report(&stored)).await? {
@@ -264,7 +274,7 @@ impl Inner {
     fn check_room_reviewer(&self, st: &ConvState, uid: &Uid) -> Result<(), Fail> {
         let info = room_of(st)?;
         check_read(info, self.asker(uid, st.is_member(uid)))?;
-        if !self.is_reviewer(uid, Some(info)) {
+        if !self.reviews_room(uid, Some(info)) {
             return Err(fail(
                 ErrorCode::Forbidden,
                 "only the room's owners and moderators may see its reports",
@@ -302,7 +312,7 @@ impl Inner {
             let _book = self.report_book.lock.lock().await;
             let conv_id = st.id.clone();
             let (records, more) = self.report_page(Some(conv_id), after).await?;
-            self.send_reports(reply, &records, operator)?;
+            self.send_reports(reply, uid, &records, operator)?;
             if !more {
                 return Ok(Some(OkResponse::new()));
             }
@@ -317,12 +327,12 @@ impl Inner {
 
     /// `ADMIN REPORTS` (5.8, 10.4): the two lines of every open report on
     /// the server, oldest first, then `OK`. Operators only.
-    async fn all_reports(&self, reply: &Reply) -> Outcome {
+    async fn all_reports(&self, uid: &Uid, reply: &Reply) -> Outcome {
         let mut after = 0;
         loop {
             let _book = self.report_book.lock.lock().await;
             let (records, more) = self.report_page(None, after).await?;
-            self.send_reports(reply, &records, true)?;
+            self.send_reports(reply, uid, &records, true)?;
             if !more {
                 return Ok(Some(OkResponse::new()));
             }
@@ -350,16 +360,19 @@ impl Inner {
         Ok((records, more))
     }
 
-    /// Queues the lines of `records` as part of a response. Every line is
-    /// made before any is sent, so that bad data gives only `ERR internal`.
+    /// Queues the lines of `records` as part of a response to `uid`,
+    /// leaving out reports about its own messages (PLAN.md 5, item 35).
+    /// Every line is made before any is sent, so that bad data gives only
+    /// `ERR internal`.
     fn send_reports(
         &self,
         reply: &Reply,
+        uid: &Uid,
         records: &[ReportRecord],
         with_from: bool,
     ) -> Result<(), StoreError> {
         let mut lines = Vec::with_capacity(records.len() * 2);
-        for record in records {
+        for record in records.iter().filter(|r| r.report.event.from != *uid) {
             lines.extend(report_lines(&record.id, &record.report, with_from)?);
         }
         for line in lines {
@@ -393,10 +406,11 @@ impl Inner {
             None => None,
         };
         let info = st.as_deref().and_then(ConvState::room_info);
-        if !self.is_reviewer(uid, info) {
+        let author = &record.report.event.from;
+        if !self.is_reviewer(uid, info, author) {
             return Err(no_report());
         }
-        let reviewers = self.reviewers(info);
+        let reviewers = self.reviewers(info, author);
         let _book = self.report_book.lock.lock().await;
         let key = id.clone();
         if !self.db(move |s| s.resolve_report(&key)).await? {

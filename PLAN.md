@@ -736,6 +736,13 @@ Open:
     messages still wait, since a guest rejoins its rooms by itself after
     a reconnect.
 
+35. **Found by M4's end-to-end tests** (5.8, 10.2), confirmed with the
+    user on 2026-11-08:
+    - The author of a reported message is never one of its reviewers:
+      no lines, left out of REPORTS, and RESOLVE gets `not-found`.
+    - ADMIN BAN of a target that covers an operator, the sender
+      included, gets `forbidden`. DEOP first.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

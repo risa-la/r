@@ -537,14 +537,19 @@ async fn a_guest_signing_in_while_its_address_is_banned() {
     assert_eq!(w.h.hub.guest_sessions(), Vec::<Uid>::new());
 }
 
-/// An operator that bans its own domain gets the `OK` before its BYE.
+/// A ban that covers an operator is refused, the sender's own included:
+/// DEOP first (PLAN.md 5, item 35).
 #[tokio::test]
-async fn an_operator_can_ban_itself() {
+async fn a_ban_that_covers_an_operator_is_refused() {
     let mut w = World::new();
-    assert_eq!(
-        w.admin("admin ban *@example.net oops").await,
-        ["OK", "<close> BYE oops"]
-    );
+    for cmd in ["admin ban *@example.net oops", "admin ban op@example.net"] {
+        assert_eq!(
+            w.admin(cmd).await,
+            ["ERR forbidden that would ban an operator; remove the operator first"],
+            "{cmd}"
+        );
+    }
+    assert_eq!(w.admin("admin bans").await, ["OK"]);
 }
 
 // ---------------------------------------------------------------------------

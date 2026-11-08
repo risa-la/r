@@ -1065,9 +1065,9 @@ async fn a_new_room_of_the_same_name_does_not_inherit_reports() {
         "@seq=3;t={*};from=alice@example.org MSG #r rude",
     )
     .await;
+    // alice owns #r, but wrote the message, so she is not one of its
+    // reviewers (PLAN.md 5, item 35).
     exchange(&mut s, "bob", "report #r 3", &["OK id={rid}"]).await;
-    expect(&mut s, "alice", "@report={rid};t={*} REPORT #r 3").await;
-    expect(&mut s, "alice", "*MSG #r rude").await;
     expect(
         &mut s,
         "op",
@@ -1090,30 +1090,30 @@ async fn a_new_room_of_the_same_name_does_not_inherit_reports() {
         &["ERR not-found{..}"],
     )
     .await;
-    // The same seq in the new room is another message, and bob's report
+    // The same seq in the new room is another message, and alice's report
     // of it is a new report, which carol reviews.
-    exchange(&mut s, "carol", "msg #r two", &["*", "OK seq=2"]).await;
-    exchange(&mut s, "carol", "msg #r three", &["*", "OK seq=3"]).await;
     join(&mut s, "bob", "#r").await;
     expect(
         &mut s,
         "carol",
-        "@seq=4;t={*};from=bob@example.org;id={*} JOIN #r",
+        "@seq=2;t={*};from=bob@example.org;id={*} JOIN #r",
     )
     .await;
-    exchange(&mut s, "bob", "report #r 3", &["OK id={rid2}"]).await;
+    exchange(&mut s, "bob", "msg #r three", &["*", "OK seq=3"]).await;
+    expect(&mut s, "carol", "*MSG #r three").await;
+    exchange(&mut s, "alice", "report #r 3", &["OK id={rid2}"]).await;
     assert_ne!(s.var("rid2"), rid);
     expect(&mut s, "carol", "@report={rid2};t={*} REPORT #r 3").await;
     expect(
         &mut s,
         "carol",
-        "@report={rid2};seq=3;t={*};from=carol@example.org MSG #r three",
+        "@report={rid2};seq=3;t={*};from=bob@example.org MSG #r three",
     )
     .await;
     expect(
         &mut s,
         "op",
-        "@report={rid2};t={*};from=bob@example.org REPORT #r 3",
+        "@report={rid2};t={*};from=alice@example.org REPORT #r 3",
     )
     .await;
     expect(&mut s, "op", "*MSG #r three").await;
@@ -1175,11 +1175,8 @@ async fn reports_are_rate_limited() {
     .await;
     server.advance(Duration::from_secs(60 * 60 + 1));
     exchange(&mut s, "bob", "report #r 4", &["OK id={*}"]).await;
-    // Each report reached alice, the owner.
-    for _ in 0..3 {
-        expect(&mut s, "alice", "@report={*};t={*} REPORT #r {*}").await;
-        expect(&mut s, "alice", "*").await;
-    }
+    // alice owns #r, but wrote the messages, so the reports do not reach
+    // her (PLAN.md 5, item 35).
     s.settled().await;
     server.stop().await;
 }

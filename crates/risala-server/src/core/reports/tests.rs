@@ -683,3 +683,36 @@ async fn a_drop_that_fails_changes_nothing() {
     assert_eq!(lines.len(), 3);
     assert!(lines[1].starts_with("CONV #temp "), "{lines:?}");
 }
+
+/// Nobody reviews a report about their own message: a moderator whose
+/// message is reported gets no lines for it, does not see it in REPORTS,
+/// and cannot RESOLVE it (PLAN.md 5, item 35).
+#[tokio::test]
+async fn the_author_is_not_a_reviewer() {
+    let mut h = harness();
+    let mut alice = h.signed_in_as(ALICE);
+    let mut dave = h.signed_in_as(DAVE);
+    let mut op = h.signed_in_as(OP);
+    let mut bob = h.signed_in_as(BOB);
+    h.send(&dave, "join #general").await;
+    h.send(&dave, "msg #general mods rule").await;
+    assert_eq!(dave.lines().last().unwrap(), "OK seq=9");
+    alice.lines();
+    bob.lines();
+    op.lines();
+
+    let id = report(&h, &mut bob, "report #general 9 rude").await;
+    assert_eq!(alice.lines().len(), 2);
+    assert_eq!(op.lines().len(), 2);
+    assert_eq!(dave.lines(), none());
+
+    h.send(&dave, "reports #general").await;
+    assert_eq!(dave.lines(), ["OK"]);
+    h.send(&dave, &format!("resolve {id}")).await;
+    assert_eq!(dave.lines(), ["ERR not-found no such report"]);
+    // The others still may, and dave hears nothing of it.
+    h.send(&alice, &format!("resolve {id}")).await;
+    assert_eq!(alice.lines(), ["OK"]);
+    assert_eq!(op.lines(), [format!("RESOLVED {id}")]);
+    assert_eq!(dave.lines(), none());
+}

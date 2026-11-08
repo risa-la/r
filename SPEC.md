@@ -1251,6 +1251,11 @@ Reports message `<seq>` as abusive to the people who can act on it, its
   operators
 - for a direct conversation: the server's operators
 
+The author of the reported message is never one of its reviewers, so
+nobody reviews or resolves a report about their own message. They do
+not receive its lines, REPORTS and ADMIN REPORTS leave it out for them,
+and their RESOLVE of it gets `ERR not-found`.
+
 REPORT reports a MSG event. REPORTENC reports an ENC event, and reveals
 its content to the reviewers (below). Rules for both:
 
@@ -2224,6 +2229,10 @@ of these:
 - **`ADMIN UNBAN`** of a target that is not banned gets `ERR not-found`.
 - **Banning deletes nothing.** Use ADMIN PURGE (10.4) to remove what a
   user has sent.
+- **Operators cannot be banned.** ADMIN BAN of a target that covers an
+  operator, including the one sending it, gets `ERR forbidden`. Remove
+  the operator with ADMIN DEOP first. Operators named in the server's
+  configuration cannot be banned this way at all.
 - **`ADMIN BANS`** sends one `SERVERBAN <target> [<reason...>]` line per
   ban, then OK.
 

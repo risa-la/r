@@ -1008,7 +1008,8 @@ async fn m4_state_survives_a_restart() {
     exchange(&mut s, "alice", "msg #p gone soon", &["*", "OK seq=12"]).await;
     exchange(&mut s, "alice", "msg #p rude", &["*", "OK seq=13"]).await;
     exchange(&mut s, "alice", "delete #p 12", &["*", "OK seq=14"]).await;
-    // bob is a moderator, so a reviewer of his own report.
+    // bob is a moderator, so a reviewer of his own report. alice wrote the
+    // message, so she is not one (PLAN.md 5, item 35).
     exchange(
         &mut s,
         "bob",
@@ -1020,8 +1021,6 @@ async fn m4_state_survives_a_restart() {
         ],
     )
     .await;
-    expect(&mut s, "alice", "*REPORT #p 13 rude").await;
-    expect(&mut s, "alice", "*MSG #p rude").await;
     expect(&mut s, "op", "*REPORT #p 13 rude").await;
     expect(&mut s, "op", "*MSG #p rude").await;
     exchange(&mut s, "op", "admin op carol@example.org", &["OK"]).await;
@@ -1177,23 +1176,23 @@ async fn hosted_identity_commands_need_hosted_identities() {
     server.stop().await;
 }
 
-/// An operator whose ban covers itself gets its `OK`, then BYE.
+/// A ban that covers an operator, the sender included, is refused: DEOP
+/// first (PLAN.md 5, item 35).
 #[tokio::test(flavor = "multi_thread")]
-async fn an_operator_banning_itself_gets_ok_first() {
+async fn a_ban_that_covers_an_operator_is_refused() {
     let server = server().await;
     let (mut s, _) = people(&server, &["alice"]).await;
-    let dan = server.identity("dan@example.com");
-    let mut dan = server.sign_in(&dan).await;
     join(&mut s, "alice", "#general").await;
-    s.client("op")
-        .send("admin ban *@example.com")
-        .await
-        .unwrap();
-    let lines = until_closed(s.client("op")).await;
-    assert_eq!(lines, ["OK", "BYE banned from this server"]);
-    assert_eq!(
-        until_closed(&mut dan).await,
-        ["BYE banned from this server"]
-    );
+    for target in ["*@example.com", "op@example.com"] {
+        exchange(
+            &mut s,
+            "op",
+            &format!("admin ban {target}"),
+            &["ERR forbidden{..}"],
+        )
+        .await;
+    }
+    exchange(&mut s, "op", "admin bans", &["OK"]).await;
+    s.settled().await;
     server.stop().await;
 }

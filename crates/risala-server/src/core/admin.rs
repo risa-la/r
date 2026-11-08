@@ -278,6 +278,19 @@ impl Inner {
         };
         let bye = bye_text(&reason, BYE_BANNED);
         let _admin = self.admin_state.lock.lock().await;
+        // Operators cannot be banned, so that nobody locks the server's
+        // operators out, themselves included: DEOP first. Configured
+        // operators cannot be removed, so never (PLAN.md 5, item 35).
+        let covers_operator = {
+            let operators = self.operators.read().unwrap_or_else(|e| e.into_inner());
+            operators.iter().any(|op| target.covers_uid(op))
+        };
+        if covers_operator {
+            return Err(fail(
+                ErrorCode::Forbidden,
+                "that would ban an operator; remove the operator first",
+            ));
+        }
         let ban = ServerBan {
             target: target.clone(),
             reason: reason.clone(),
