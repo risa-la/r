@@ -8,7 +8,7 @@ use super::{ANON, Command, HAVING_A_KIND, SIGNED};
 use crate::binary::{PushAuth, PushKey, WrappedKey};
 use crate::connection::Kinds;
 use crate::error::ParseError;
-use crate::line::{LineBuilder, Params};
+use crate::line::{LineBuilder, Options, Params};
 use crate::mls::{KeyPackage, KeyPackageRef, OrBlob, SendToken, Welcome, WelcomeSecret};
 use crate::names::{BlobRef, BoxName, Id, Uid};
 use crate::parse::{
@@ -20,10 +20,10 @@ use crate::types::{PushTag, PushUrl};
 ///
 /// With `box=`, ADD and DEL are about a mailbox subscription, made on an
 /// anonymous connection; without it, about an account subscription, made
-/// on a signed-in connection.
+/// on a signed-in connection. ADD takes `box=` together with `token=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushCommand {
-    /// `PUSH ADD <url> <tag> <key> <auth> [box=<box>]`.
+    /// `PUSH ADD <url> <tag> <key> <auth> [box=<box> token=<token>]`.
     Add {
         /// The `https` URL to push to.
         url: PushUrl,
@@ -33,8 +33,9 @@ pub enum PushCommand {
         key: PushKey,
         /// The subscription's authentication secret.
         auth: PushAuth,
-        /// The mailbox, for a mailbox subscription.
-        mailbox: Option<BoxName>,
+        /// The mailbox and a send token of its group, for a mailbox
+        /// subscription.
+        permit: Option<MailboxPermit>,
     },
     /// `PUSH DEL <url> [box=<box>]`.
     Del {
@@ -61,7 +62,7 @@ impl PushCommand {
     pub fn kinds(&self) -> Kinds {
         match self {
             PushCommand::Add {
-                mailbox: Some(_), ..
+                permit: Some(_), ..
             }
             | PushCommand::Del {
                 mailbox: Some(_), ..
@@ -162,13 +163,13 @@ impl WelcomeCommand {
     }
 }
 
-/// The `box=` and `token=` of BLOB (12.12), which show that an anonymous
-/// or guest connection is a member of some group.
+/// The `box=` and `token=` of BLOB (12.12) and PUSH ADD (9.1), which show
+/// that an anonymous or guest connection is a member of a group.
 ///
-/// The syntax line writes them as a pair, `[box=<box> token=<token>]`, so
+/// The syntax lines write them as a pair, `[box=<box> token=<token>]`, so
 /// one without the other is `BadSyntax`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlobPermit {
+pub struct MailboxPermit {
     /// A mailbox.
     pub mailbox: BoxName,
     /// A send token of its group, checked as for POST (5.2).
@@ -212,6 +213,16 @@ impl BackupCommand {
 
 /// Reads WATCH's `<uids>`: one or more uids separated by commas, with no
 /// spaces (8.3).
+/// The `box=` and `token=` pair, both or neither (9.1, 12.12); `what`
+/// says so for the command at hand.
+fn permit(options: &Options, what: &'static str) -> Result<Option<MailboxPermit>, ParseError> {
+    match (opt(options, "box")?, opt(options, "token")?) {
+        (Some(mailbox), Some(token)) => Ok(Some(MailboxPermit { mailbox, token })),
+        (None, None) => Ok(None),
+        _ => Err(bad(what)),
+    }
+}
+
 fn uid_list(s: &str) -> Result<Vec<Uid>, ParseError> {
     s.split(',').map(Uid::from_str).collect()
 }
@@ -245,13 +256,13 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<Command, ParseEr
                     let tag = tok(&mut p)?;
                     let key = tok(&mut p)?;
                     let auth = tok(&mut p)?;
-                    let options = options(p, &["box"])?;
+                    let options = options(p, &["box", "token"])?;
                     PushCommand::Add {
                         url,
                         tag,
                         key,
                         auth,
-                        mailbox: opt(&options, "box")?,
+                        permit: permit(&options, "PUSH ADD takes box= and token= together")?,
                     }
                 }
                 "DEL" => {
@@ -314,11 +325,7 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<Command, ParseEr
             let hash = tok(&mut p)?;
             let size = number(&mut p)?;
             let options = options(p, &["box", "token"])?;
-            let permit = match (opt(&options, "box")?, opt(&options, "token")?) {
-                (Some(mailbox), Some(token)) => Some(BlobPermit { mailbox, token }),
-                (None, None) => None,
-                _ => return Err(bad("BLOB takes box= and token= together")),
-            };
+            let permit = permit(&options, "BLOB takes box= and token= together")?;
             Ok(Command::Blob { hash, size, permit })
         },
         "BACKUP" => |mut p| {
@@ -377,11 +384,12 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
                     tag,
                     key,
                     auth,
-                    mailbox,
+                    permit,
                 } => {
                     b.token(url).token(tag).token(key).token(auth);
-                    if let Some(mailbox) = mailbox {
-                        b.option("box", mailbox);
+                    if let Some(permit) = permit {
+                        b.option("box", permit.mailbox)
+                            .option("token", &permit.token);
                     }
                 }
                 PushCommand::Del { url, mailbox } => {

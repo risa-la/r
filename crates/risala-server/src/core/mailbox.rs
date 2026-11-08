@@ -835,10 +835,10 @@ fn post_line(mailbox: BoxName, post: StoredPost) -> Result<Post, ErrResponse> {
     })
 }
 
-/// Checks a send token that comes without its epoch, as UPLOAD and BLOB
-/// carry one (5.6, 12.12), against every set of `mailbox`: `ERR not-found`
-/// for a mailbox that does not exist, `ERR stale` for a token in none.
-#[allow(dead_code, reason = "for UPLOAD and BLOB (docs/plans/M5b.md, SV4)")]
+/// Checks a send token that comes without its epoch, as PUSH ADD, UPLOAD
+/// and BLOB carry one (9.1, 5.6, 12.12), against every set of `mailbox`:
+/// `ERR not-found` for a mailbox that does not exist, `ERR stale` for a
+/// token in none.
 pub(crate) async fn check_token(
     inner: &Inner,
     mailbox: &BoxName,

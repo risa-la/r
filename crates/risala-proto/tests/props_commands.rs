@@ -209,9 +209,12 @@ fn command() -> impl Strategy<Value = String> {
             "[!-~]{1,64}",
             fixed(65),
             fixed(16),
-            opt("box", boxname())
+            proptest::option::of((boxname(), fixed(32)))
         )
-            .prop_map(|(u, t, k, a, b)| format!("PUSH ADD {u} {t} {k} {a}{b}")),
+            .prop_map(|(u, t, k, a, p)| {
+                let p = p.map_or(String::new(), |(b, t)| format!(" box={b} token={t}"));
+                format!("PUSH ADD {u} {t} {k} {a}{p}")
+            }),
         (push_url(), opt("box", boxname())).prop_map(|(u, b)| format!("PUSH DEL {u}{b}")),
         Just("PUSH LIST".to_owned()),
         data().prop_map(|k| format!("KEYPKG ADD {k}")),

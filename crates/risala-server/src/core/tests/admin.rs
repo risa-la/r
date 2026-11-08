@@ -5,7 +5,7 @@ use risala_proto::names::{BoxName, Uid};
 use crate::core::{Clock as _, admin};
 use crate::store::{AdminStore as _, MiscStore as _, PushTarget};
 
-use super::misc::{Keys, add_mailbox, add_room};
+use super::misc::{Keys, add_mailbox, add_room, token_of};
 use super::*;
 
 fn uid(s: &str) -> Uid {
@@ -295,8 +295,10 @@ async fn drop_rooms_and_mailboxes() {
     h.send(
         &follower,
         &format!(
-            "PUSH ADD https://p.example/1 t {} {} box={room}",
-            keys.key, keys.auth
+            "PUSH ADD https://p.example/1 t {} {} box={room} token={}",
+            keys.key,
+            keys.auth,
+            token_of(&room)
         ),
     )
     .await;

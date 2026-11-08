@@ -54,7 +54,7 @@ fn samples() -> Vec<String> {
         "WHOIS alice@example.org".into(),
         "MEMBERS #general".into(),
         format!(
-            "PUSH ADD https://push.example.net/a tag {} {} box={BOX}",
+            "PUSH ADD https://push.example.net/a tag {} {} box={BOX} token={token}",
             b64(65),
             b64(16)
         ),

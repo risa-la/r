@@ -39,7 +39,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
-use risala_proto::command::PushCommand;
+use risala_proto::command::{MailboxPermit, PushCommand};
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{BoxName, Uid};
 use risala_proto::record::DeviceId;
@@ -65,6 +65,15 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// The longest delay between retries.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
+
+/// The most leaves a public room's group may hold (6.1), and so the least
+/// the per-mailbox subscription limit may be for one (9.1).
+const PUBLIC_ROOM_LEAVES: usize = 32_768;
+
+/// The most leaves any other group may hold: a private room's (6.1). The
+/// server cannot tell a private room from a direct conversation (128
+/// leaves), so it allows a private room's number for both (9.1).
+const PRIVATE_GROUP_LEAVES: usize = 4_096;
 
 /// The push part of the misc area's state.
 pub(crate) struct State {
@@ -144,20 +153,31 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
             tag,
             key,
             auth,
-            mailbox,
+            permit,
         } => {
             if !crate::push::valid_key(&key) {
                 return Err(err(ErrorCode::Invalid).with_message("not a P-256 public key"));
             }
-            let (target, max, expires) = match mailbox {
-                Some(mailbox) => {
+            let (target, max, expires) = match permit {
+                Some(MailboxPermit { mailbox, token }) => {
                     if !matches!(cx.who, Who::Anonymous) {
                         return Err(err(ErrorCode::WrongConnection));
                     }
-                    let found = cx.db(move |store| store.mailbox(&mailbox)).await?;
-                    if found.is_none() {
+                    // Only members make or renew a mailbox subscription:
+                    // the token is checked as for POST (9.1).
+                    super::super::mailbox::check_token(&cx.inner, &mailbox, &token)
+                        .await
+                        .map_err(err)?;
+                    let Some(found) = cx.db(move |store| store.mailbox(&mailbox)).await? else {
                         return Err(err(ErrorCode::NotFound));
-                    }
+                    };
+                    // The limit allows one subscription for each leaf the
+                    // group may hold (9.1, 6.1).
+                    let least = if found.room.is_some() {
+                        PUBLIC_ROOM_LEAVES
+                    } else {
+                        PRIVATE_GROUP_LEAVES
+                    };
                     let retention = cx.inner.settings().retention;
                     let expires = cx
                         .inner
@@ -165,7 +185,7 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
                         .checked_add(Duration::from_secs(u64::from(retention.days()) * 86_400));
                     (
                         PushTarget::Mailbox(mailbox),
-                        cx.inner.config.push.max_per_mailbox,
+                        cx.inner.config.push.max_per_mailbox.max(least),
                         Some(expires.unwrap_or(risala_proto::time::Timestamp::MAX)),
                     )
                 }

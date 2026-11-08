@@ -131,6 +131,23 @@ fn specific_examples_are_present() {
     );
     assert_eq!(find("PRESENCE offline").dir, Dir::Server);
 
+    // 5.2's POST of a commit, its event line and its reply.
+    let post = find("POST m4qkz7xw2rjv5tbnhc3pfyd6ea 3J0nq8V2");
+    assert_eq!(post.dir, Dir::Client);
+    assert!(
+        post.line
+            .ends_with(" next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm")
+    );
+    let event = find("@seq=9310;t=2026-11-09T08:12:44.051Z POST m4qkz7xw2rjv5tbnhc3pfyd6ea");
+    assert_eq!(event.dir, Dir::Server);
+    assert_eq!(find("OK seq=9310").dir, Dir::Server);
+
+    // 4.8's PAIR PUT: 01, then a 2-byte length of 6200 (0x1838).
+    assert_eq!(
+        find("pair put mxrq3bzf5kjw2ahd6uyc4en7ta AVg4").dir,
+        Dir::Client
+    );
+
     // Prose and shell commands inside example blocks are skipped.
     for e in &all {
         assert!(!e.line.starts_with('('), "{e}");

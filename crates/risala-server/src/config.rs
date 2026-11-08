@@ -185,7 +185,9 @@ pub struct PushConfig {
     /// PEM files of CA certificates to trust besides the public ones built
     /// in, for push URLs. For tests and private deployments.
     pub extra_roots: Vec<PathBuf>,
-    /// The most subscriptions one mailbox may have (9.1). At least 1.
+    /// The most subscriptions one mailbox may have (9.1). At least 1. The
+    /// server never applies less than one per leaf the group may hold
+    /// (6.1): 4,096, or 32,768 for a public room.
     pub max_per_mailbox: usize,
     /// The most mailbox subscriptions one connection may add (9.1). At
     /// least 1.
@@ -201,7 +203,7 @@ impl Default for PushConfig {
             enabled: true,
             allow_private: false,
             extra_roots: Vec::new(),
-            max_per_mailbox: 256,
+            max_per_mailbox: 4_096,
             max_per_connection: 1024,
             max_per_device: 16,
         }

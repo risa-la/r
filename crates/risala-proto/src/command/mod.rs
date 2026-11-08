@@ -98,7 +98,7 @@ pub mod admin;
 pub mod identity;
 pub mod mailbox;
 
-pub use account::{BackupCommand, BlobPermit, KeyPkgCommand, PushCommand, WelcomeCommand};
+pub use account::{BackupCommand, KeyPkgCommand, MailboxPermit, PushCommand, WelcomeCommand};
 pub use admin::{AdminCommand, DropTarget};
 pub use identity::{GuestToken, KeysPutRecords, PairCommand};
 pub use mailbox::{CreateForm, Move, PublicRoom};
@@ -497,7 +497,7 @@ pub enum Command {
         /// Its size in bytes.
         size: u64,
         /// `box=` and `token=`, which anonymous and guest connections need.
-        permit: Option<BlobPermit>,
+        permit: Option<MailboxPermit>,
     },
 
     // ---- 12.13

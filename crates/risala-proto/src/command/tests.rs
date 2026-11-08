@@ -134,7 +134,7 @@ fn every_form() -> Vec<String> {
         "WHOIS alice@example.org".into(),
         "MEMBERS #general".into(),
         format!("PUSH ADD https://push.example/a x7Hq2 {key} {auth}"),
-        format!("PUSH ADD https://push.example/a x7Hq2 {key} {auth} box={BOX}"),
+        format!("PUSH ADD https://push.example/a x7Hq2 {key} {auth} box={BOX} token={tok}"),
         "PUSH DEL https://push.example/a".into(),
         format!("PUSH DEL https://push.example/a box={BOX}"),
         "PUSH LIST".into(),
@@ -450,6 +450,18 @@ fn arity() {
         "PUSH".into(),
         "PUSH LIST x".into(),
         "PUSH ADD https://push.example/a x7Hq2".into(),
+        // `box` and `token` come together (9.1).
+        format!(
+            "PUSH ADD https://push.example/a t {} {} box={BOX}",
+            zeros(65),
+            zeros(16)
+        ),
+        format!(
+            "PUSH ADD https://push.example/a t {} {} token={}",
+            zeros(65),
+            zeros(16),
+            token()
+        ),
         format!("PUSH DEL https://push.example/a box={BOX} box={BOX}"),
         "KEYPKG COUNT x".into(),
         "KEYPKG ADD".into(),
@@ -804,7 +816,7 @@ fn table() -> Vec<(String, &'static str)> {
         ("WHOIS a@b.org".into(), "ags"),
         ("MEMBERS #general".into(), "ags"),
         (
-            format!("PUSH ADD https://p.example/a t {key} {auth} box={BOX}"),
+            format!("PUSH ADD https://p.example/a t {key} {auth} box={BOX} token={tok}"),
             "a",
         ),
         (format!("PUSH DEL https://p.example/a box={BOX}"), "a"),

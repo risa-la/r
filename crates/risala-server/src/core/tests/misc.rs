@@ -8,7 +8,7 @@ use risala_mls::{Pseudonym as MlsPseudonym, RisalaAad};
 use risala_proto::binary::{PushAuth, PushKey};
 use risala_proto::codec::Writer;
 use risala_proto::command::Command;
-use risala_proto::mls::{GroupId, TokenHash};
+use risala_proto::mls::{GroupId, SendToken};
 use risala_proto::names::BoxName;
 use risala_proto::record::DeviceId;
 use risala_proto::server::{ServerLine, ServerMessage};
@@ -16,7 +16,9 @@ use risala_proto::types::PushTag;
 
 use crate::core::{Clock as _, misc};
 use crate::push::{BoxFuture, PushRequest, PushTransport, SendError};
-use crate::store::{MailboxStore as _, MiscStore as _, NewMailbox, PushTarget};
+use crate::store::{
+    MailboxStore as _, MiscStore as _, NewMailbox, NewPushSubscription, PushTarget,
+};
 
 use super::*;
 
@@ -27,7 +29,14 @@ pub(super) async fn sign_in(h: &mut Harness, uid: &str) -> Client {
     c
 }
 
-/// Makes a mailbox numbered `n`, as CREATE would.
+/// The send token of the first epoch of a mailbox that [`add_mailbox`]
+/// made.
+pub(super) fn token_of(mailbox: &BoxName) -> SendToken {
+    SendToken::from_bytes([mailbox.as_bytes()[0]; 32])
+}
+
+/// Makes a mailbox numbered `n`, as CREATE would, whose first epoch's
+/// send token is [`token_of`] it.
 pub(super) fn add_mailbox(h: &Harness, n: u8) -> BoxName {
     let mailbox = BoxName::from_bytes([n; 16]);
     h.store
@@ -36,7 +45,7 @@ pub(super) fn add_mailbox(h: &Harness, n: u8) -> BoxName {
             group_id: GroupId::from_bytes([n; 32]),
             first_epoch: 0,
             moved_from: None,
-            token_hash: TokenHash::from_bytes([n; 48]),
+            token_hash: token_of(&mailbox).hash(),
             created: T.parse().unwrap(),
         })
         .unwrap();
@@ -563,8 +572,10 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
     let keys = Keys::new();
     let add = |url: &str, tag: &str, mailbox: &BoxName| {
         format!(
-            "PUSH ADD {url} {tag} {} {} box={mailbox}",
-            keys.key, keys.auth
+            "PUSH ADD {url} {tag} {} {} box={mailbox} token={}",
+            keys.key,
+            keys.auth,
+            token_of(mailbox)
         )
     };
     let mut anon = h.anon().await;
@@ -574,16 +585,31 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
         .await;
     h.send(&anon, &add("https://p.example/2", "t3", &mailbox))
         .await;
-    // A third subscription for one mailbox is refused (9.1).
-    h.send(&anon, &add("https://p.example/3", "t4", &mailbox))
-        .await;
-    assert_eq!(anon.lines(), ["OK", "OK", "OK", "ERR rate-limited"]);
+    assert_eq!(anon.lines(), ["OK", "OK", "OK"]);
     let subs = h
         .store
         .push_subscriptions(&PushTarget::Mailbox(mailbox), h.clock.now())
         .unwrap();
     let tags: Vec<&str> = subs.iter().map(|s| s.tag.as_str()).collect();
     assert_eq!(tags, ["t2", "t3"]);
+
+    // The limit per mailbox allows one subscription for each leaf the
+    // group may hold, 4,096 outside public rooms, whatever the config says
+    // (9.1, 6.1). One more is refused.
+    for n in 3..=4096 {
+        let sub = NewPushSubscription {
+            target: PushTarget::Mailbox(mailbox),
+            url: format!("https://p.example/fill/{n}").parse().unwrap(),
+            tag: "f".parse().unwrap(),
+            key: keys.key,
+            auth: keys.auth.clone(),
+            expires: Some(risala_proto::time::Timestamp::MAX),
+        };
+        h.store.add_push(&sub, 4096).unwrap();
+    }
+    h.send(&anon, &add("https://p.example/3", "t4", &mailbox))
+        .await;
+    assert_eq!(anon.lines(), ["ERR rate-limited"]);
 
     // The connection may add three, replacements not counted.
     h.send(&anon, &add("https://p.example/4", "t5", &other))
@@ -594,9 +620,10 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
 
     // A key that is not on P-256 is invalid; an unknown mailbox not found.
     let bad = format!(
-        "PUSH ADD https://p.example/6 t {} {} box={other}",
+        "PUSH ADD https://p.example/6 t {} {} box={other} token={}",
         PushKey::from_bytes([4; 65]),
-        keys.auth
+        keys.auth,
+        token_of(&other)
     );
     let mut fresh = h.anon().await;
     h.send(&fresh, &bad).await;
@@ -607,6 +634,16 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
         fresh.lines(),
         ["ERR invalid not a P-256 public key", "ERR not-found"]
     );
+
+    // Only members subscribe: the token is checked as for POST (9.1).
+    let foreign = format!(
+        "PUSH ADD https://p.example/7 t {} {} box={mailbox} token={}",
+        keys.key,
+        keys.auth,
+        token_of(&other)
+    );
+    h.send(&fresh, &foreign).await;
+    assert_eq!(fresh.lines(), ["ERR stale"]);
 
     // PUSH DEL.
     h.send(
@@ -639,8 +676,10 @@ async fn mailbox_subscriptions_last_one_retention_period() {
     let mailbox = add_mailbox(&h, 1);
     let keys = Keys::new();
     let add = format!(
-        "PUSH ADD https://p.example/1 t1 {} {} box={mailbox}",
-        keys.key, keys.auth
+        "PUSH ADD https://p.example/1 t1 {} {} box={mailbox} token={}",
+        keys.key,
+        keys.auth,
+        token_of(&mailbox)
     );
     let mut anon = h.anon().await;
     h.send(&anon, &add).await;
@@ -685,8 +724,10 @@ async fn kept_posts_push_encrypted_bodies_at_most_every_interval() {
         h.send(
             &anon,
             &format!(
-                "PUSH ADD https://p.example/same {tag} {} {} box={mailbox}",
-                keys.key, keys.auth
+                "PUSH ADD https://p.example/same {tag} {} {} box={mailbox} token={}",
+                keys.key,
+                keys.auth,
+                token_of(mailbox)
             ),
         )
         .await;
@@ -728,8 +769,10 @@ async fn quiet_followers_that_are_alive_hold_pushes_back() {
     h.send(
         &anon,
         &format!(
-            "PUSH ADD https://p.example/1 qtag {} {} box={mailbox}",
-            keys.key, keys.auth
+            "PUSH ADD https://p.example/1 qtag {} {} box={mailbox} token={}",
+            keys.key,
+            keys.auth,
+            token_of(&mailbox)
         ),
     )
     .await;
@@ -838,8 +881,10 @@ async fn failing_subscriptions_are_retried_then_dropped_after_a_day() {
     h.send(
         &anon,
         &format!(
-            "PUSH ADD https://p.example/1 t {} {} box={mailbox}",
-            keys.key, keys.auth
+            "PUSH ADD https://p.example/1 t {} {} box={mailbox} token={}",
+            keys.key,
+            keys.auth,
+            token_of(&mailbox)
         ),
     )
     .await;
