@@ -10,6 +10,7 @@ members = [
     "crates/risala-dev",
 
     "crates/openmls-sqlite-storage",
+    "crates/risala-mls",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ authors = ["Risala developers <dev@risa.la>"]
 risala-proto = { path = "crates/risala-proto" }
 risala-keyfetch = { path = "crates/risala-keyfetch" }
 risala-mls-storage = { path = "crates/openmls-sqlite-storage" }
+risala-mls = { path = "crates/risala-mls" }
 
 base64 = "0.23"
 # ML-DSA (FIPS 204), Cryspen's formally verified libcrux implementation.
@@ -66,6 +68,14 @@ openmls_traits = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"
 openmls_libcrux_crypto = { version = "0.4", features = ["draft-ietf-mls-pq-ciphersuites"] }
 # MessagePack, the codec for MLS state in SQLite (crates/openmls-sqlite-storage).
 rmp-serde = "1"
+# The TLS presentation language, for risala's own MLS structures (SPEC 12.2,
+# 12.8). The version OpenMLS uses.
+tls_codec = { version = "0.5", features = ["derive", "mls"] }
+# The primitives under openmls_libcrux_crypto, which risala-mls also uses
+# directly for history keys, encrypted messages and backups (SPEC 12.8-12.10).
+libcrux-hkdf = "0.0.8"
+libcrux-hmac = "0.0.8"
+libcrux-chacha20poly1305 = "0.0.9"
 
 # dev
 openmls_basic_credential = "0.6"
