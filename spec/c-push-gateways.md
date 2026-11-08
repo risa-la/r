@@ -15,10 +15,10 @@ A typical setup:
    the device token.
 2. The app makes a P-256 key pair and an authentication secret for each
    subscription [RFC8291], and sends `PUSH ADD <url> <random tag> <key>
-   <auth> box=<box>` on an anonymous connection for each mailbox it
-   follows, with a new URL each time, and `PUSH ADD` without `box` on its
-   signed-in connection for its Welcomes (9.1). It remembers what each
-   tag is for.
+   <auth> box=<box> token=<token>` on an anonymous connection for each
+   mailbox it follows, with a new URL each time, and `PUSH ADD` without
+   `box` on its signed-in connection for its Welcomes (9.1). It
+   remembers what each tag is for.
 3. The server POSTs the encrypted body to the URL (9.3), and the gateway
    forwards it to the device unchanged. Only the app can decrypt it.
 

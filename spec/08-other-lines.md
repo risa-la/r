@@ -83,7 +83,8 @@ MEMBERS <room>
 - **`MEMBERS`** replies with one `MEMBER <room> <uid> <role> <presence>`
   line for each identity and guest with a leaf in a public room's group,
   then `OK`. `<role>` is `owner`, `mod` or `member`, from the room's
-  conversation extension. Light clients (12.6), which do not hold the
+  conversation extension. A guest's `<presence>` is `offline`, since
+  guests have no presence. Light clients (12.6), which do not hold the
   tree, use it to show members. Devices that hold the tree check it
   against their own. A room that is not public gets `ERR not-found`.
 

@@ -9,7 +9,7 @@ connects and fetches the rest itself, over TLS.
 ### 9.1. Registering
 
 ```
-PUSH ADD <url> <tag> <key> <auth> [box=<box>]
+PUSH ADD <url> <tag> <key> <auth> [box=<box> token=<token>]
 PUSH DEL <url> [box=<box>]
 PUSH LIST
 ```
@@ -25,6 +25,10 @@ PUSH LIST
   - `<key>` and `<auth>` are the subscription's P-256 public key, 65
     bytes, and its 16-byte authentication secret, each in base64 with
     padding. The server encrypts every push to them (9.3) [RFC8291].
+  - With `box`, `<token>` is a send token of the mailbox's group, in
+    base64 with padding, checked as for POST (5.2), so that only
+    members can make or renew a mailbox subscription, without saying
+    who they are. `box` and `token` come together (`ERR bad-syntax`).
   - Adding a URL that is already registered for the same mailbox, or for
     the same account, replaces its tag and keys, and renews it.
 - **`PUSH DEL`** removes a subscription, and replies `OK`.
@@ -61,7 +65,9 @@ gateways can provide (Appendix C), so that the server cannot link a
 device's subscriptions by their URL. A server MUST limit the number of
 subscriptions per mailbox, per connection and per device
 (`ERR rate-limited`), so that nobody can make it send many pushes to one
-URL. Guests cannot register for push.
+URL. The limit per mailbox MUST allow at least one subscription for
+each leaf that the group may hold (6.1). Guests cannot register for
+push.
 
 ### 9.2. When to Push
 

@@ -31,7 +31,7 @@ REGISTER on a connection that is no longer new get
 | `TOKEN <box> <epoch> <token> <hash>` | 7.2 | | ✓ | ✓ | |
 | `PRESENCE ON` / `PRESENCE OFF` | 8.3 | | | | ✓ |
 | `WATCH [<uids>]` / `WHOIS <uid>` / `MEMBERS <room>` | 8.3 | | ✓ | ✓ | ✓ |
-| `PUSH ADD <url> <tag> <key> <auth> box=` / `PUSH DEL <url> box=` | 9.1 | | ✓ | | |
+| `PUSH ADD <url> <tag> <key> <auth> box= token=` / `PUSH DEL <url> box=` | 9.1 | | ✓ | | |
 | `PUSH ADD <url> <tag> <key> <auth>` / `PUSH DEL <url>` / `PUSH LIST` | 9.1 | | | | ✓ |
 | `KEYPKG ADD <keypackage>` / `KEYPKG COUNT` | 12.5 | | | | ✓ |
 | `KEYPKG GET <uid>` | 12.5 | | ✓ | ✓ | ✓ |

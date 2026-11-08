@@ -81,8 +81,6 @@ S: OK more=0
 C: groupinfo ujzdegxdncf32epf3dhodzdoci
 S: GROUPINFO ujzdegxdncf32epf3dhodzdoci 4410 9120 AAEABA… sha384:5d0c9a1e…
 S: OK
-C: post ujzdegxdncf32epf3dhodzdoci - AAEAAQ…
-S: OK seq=9121
 C: follow ujzdegxdncf32epf3dhodzdoci
 S: OK head=9121
 S: @seq=9122;t=2026-11-08T15:40:51.208Z POST ujzdegxdncf32epf3dhodzdoci AAEAAQ… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
@@ -99,8 +97,9 @@ In this session:
 2. It lists the public rooms. `#general` has the mailbox
    `ujzdegxdncf32epf3dhodzdoci`.
 3. It fetches the room's group information, and asks to join the
-   room's MLS group by posting an external proposal. A join needs no
-   send token (`-`).
+   room's MLS group by posting an external proposal (seq 9121). The
+   proposal names the device, so the client posts it on a connection
+   of its own (4.1, not shown). A join needs no send token (`-`).
 4. It follows the mailbox, so that new posts reach it as they arrive.
    A member's device commits the proposal, and the client fetches its
    Welcome on a connection of its own (not shown). The commit carries
