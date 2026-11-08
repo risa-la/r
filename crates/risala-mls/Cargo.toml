@@ -27,15 +27,17 @@ serde.workspace = true
 # A throwaway storage, for the first of the two builds that bind a leaf's
 # keys (src/seeded.rs).
 openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
+# HPKE in mode_psk for pairing (SPEC 4.8): the hpke-rs and libcrux backend
+# that openmls_libcrux_crypto seals with, since OpenMLS's crypto trait has
+# base mode only.
+hpke-rs = "0.7"
+hpke-rs-crypto = "0.7"
+hpke-rs-libcrux = "0.7"
 
 [dev-dependencies]
 # The patched port in crates/openmls-sqlite-storage (see the root Cargo.toml).
 openmls_sqlite_storage.workspace = true
 rusqlite.workspace = true
-# HPKE with the KEM id spelled out, to pin what the provider sends (SPEC 12.2).
-hpke-rs = "0.7"
-hpke-rs-crypto = "0.7"
-hpke-rs-libcrux = "0.7"
 
 [lints]
 workspace = true

@@ -5,17 +5,20 @@
 //! number, the file, then zero bytes up to Padmé of 8 plus the file's
 //! length. It is split into chunks of 65536 bytes (the last may be
 //! shorter, never empty), and chunk i is encrypted with ChaCha20-Poly1305
-//! under the file key, with no associated data and the nonce
-//! `i (11 bytes, big-endian) || flag`, where `flag` is `0x01` for the last
-//! chunk and `0x00` for the others. The upload is the encrypted chunks in
+//! under the file key, with the nonce `i (11 bytes, big-endian) || flag`,
+//! where `flag` is `0x01` for the last chunk and `0x00` for the others.
+//! The associated data of every chunk is a [`Label`]: the ASCII text
+//! `risala/1 file`, or `risala/1 archive` for a history archive (12.13).
+//! The upload is one version byte, `0x01`, then the encrypted chunks in
 //! order, each followed by its tag.
 //!
 //! Since a chunk's position and flag are part of its nonce, a download
 //! that was truncated at a chunk boundary, extended, reordered, or has a
-//! chunk from another file or position fails to decrypt. A device checks
-//! the SHA-384 hash of the whole upload (`file-hash`) before it decrypts
-//! anything, then decrypts chunk by chunk, and uses nothing unless every
-//! check passes.
+//! chunk from another file or position fails to decrypt, and the label
+//! keeps a file from being read as an archive and the reverse. A device
+//! checks the SHA-384 hash of the whole upload (`file-hash`) before it
+//! decrypts anything, then the version byte, then decrypts chunk by chunk,
+//! and uses nothing unless every check passes.
 //!
 //! **Blob refs** (3.5, 12.12) name a blob by the SHA-384 hash of its bytes,
 //! as `sha384:` and 96 lower-case hex digits. A `file-hash` is the same
@@ -42,6 +45,30 @@ pub const ENCRYPTED_CHUNK_LEN: usize = CHUNK_LEN + AEAD_TAG_LEN;
 
 /// The length of the length at the start of the plain text (12.11).
 pub const LENGTH_LEN: usize = 8;
+
+/// The version byte at the start of every upload (12.11, 2.4).
+pub const UPLOAD_VERSION: u8 = 1;
+
+/// What an upload holds, which is the associated data of each of its
+/// chunks (12.11): the ASCII label alone, without a length or terminator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Label {
+    /// A file shared in a conversation, or carried with history (12.13):
+    /// `risala/1 file`.
+    File,
+    /// A history archive (12.13): `risala/1 archive`.
+    Archive,
+}
+
+impl Label {
+    /// The label's bytes, the associated data of every chunk.
+    pub fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Label::File => b"risala/1 file",
+            Label::Archive => b"risala/1 archive",
+        }
+    }
+}
 
 /// The prefix of a blob-ref (3.5).
 pub const BLOB_REF_PREFIX: &str = "sha384:";
@@ -70,15 +97,17 @@ pub fn plaintext_len(file_len: u64) -> Option<u64> {
     padme(file_len.checked_add(LENGTH_LEN as u64)?)
 }
 
-/// The length of the upload of a file of `file_len` bytes (12.11): its
-/// padded plain text plus a tag per chunk. This is the `<size>` of UPLOAD
+/// The length of the upload of a file of `file_len` bytes (12.11): the
+/// version byte, then its padded plain text plus a tag per chunk. This is the `<size>` of UPLOAD
 /// (5.6), and what the server learns. A device can compare it with a
 /// download's length before it fetches the rest, but the length inside
 /// the plain text is the one that counts, not `file-size` (12.11).
 pub fn encrypted_len(file_len: u64) -> Option<u64> {
     let plain = plaintext_len(file_len)?;
     let chunks = plain.div_ceil(CHUNK_LEN as u64);
-    plain.checked_add(chunks.checked_mul(AEAD_TAG_LEN as u64)?)
+    plain
+        .checked_add(chunks.checked_mul(AEAD_TAG_LEN as u64)?)?
+        .checked_add(1)
 }
 
 /// The nonce of chunk `index` (12.11): the index as an 11-byte big-endian
@@ -98,8 +127,12 @@ pub enum FileError {
     /// blob-ref. Nothing was decrypted.
     #[error("the file's hash does not match")]
     Hash,
-    /// The download's length cannot be an upload: it is empty, or its last
-    /// chunk would be empty.
+    /// The download's first byte is not the version this device reads
+    /// (2.4, 12.11). Nothing was decrypted.
+    #[error("unsupported upload version {0}")]
+    Version(u8),
+    /// The download's length cannot be an upload: it is empty, has nothing
+    /// after the version byte, or its last chunk would be empty.
     #[error("the file has the wrong length")]
     Length,
     /// A chunk does not decrypt: it was changed, moved, cut short,
@@ -321,10 +354,10 @@ pub struct EncryptedFile {
     pub size: u64,
 }
 
-/// Encrypts `file` under a new random key (12.11).
-pub fn encrypt(file: &[u8]) -> Result<EncryptedFile, getrandom::Error> {
+/// Encrypts `file`, as `label` says it is, under a new random key (12.11).
+pub fn encrypt(label: Label, file: &[u8]) -> Result<EncryptedFile, getrandom::Error> {
     let key = FileKey::generate()?;
-    let (upload, hash) = encrypt_with_key(&key, file);
+    let (upload, hash) = encrypt_with_key(&key, label, file);
     Ok(EncryptedFile {
         upload,
         key,
@@ -333,12 +366,12 @@ pub fn encrypt(file: &[u8]) -> Result<EncryptedFile, getrandom::Error> {
     })
 }
 
-/// Encrypts `file` under `key` (12.11), giving the upload and its hash.
-/// A key MUST NOT encrypt two files, since the nonces repeat; [`encrypt`]
-/// makes a new one.
-pub fn encrypt_with_key(key: &FileKey, file: &[u8]) -> (Vec<u8>, BlobRef) {
+/// Encrypts `file` under `key` with `label` (12.11), giving the upload
+/// and its hash. A key MUST NOT encrypt two files, since the nonces repeat;
+/// [`encrypt`] makes a new one.
+pub fn encrypt_with_key(key: &FileKey, label: Label, file: &[u8]) -> (Vec<u8>, BlobRef) {
     let mut encryptor =
-        Encryptor::new(key, file.len() as u64).expect("a file in memory can be padded");
+        Encryptor::new(key, label, file.len() as u64).expect("a file in memory can be padded");
     let mut upload = Vec::with_capacity(
         usize::try_from(encryptor.encrypted_len())
             .expect("it fits in memory, padded by at most 12%"),
@@ -356,6 +389,9 @@ pub fn encrypt_with_key(key: &FileKey, file: &[u8]) -> (Vec<u8>, BlobRef) {
 /// known at the start, since it is at the front of the plain text.
 pub struct Encryptor {
     key: FileKey,
+    label: Label,
+    /// Whether the version byte has been written.
+    started: bool,
     /// The plain text not yet encrypted: less than one chunk.
     pending: Zeroizing<Vec<u8>>,
     /// The index of the next chunk.
@@ -371,15 +407,17 @@ pub struct Encryptor {
 }
 
 impl Encryptor {
-    /// Starts encrypting a file of `file_len` bytes under `key`. A key
-    /// MUST NOT encrypt two files.
-    pub fn new(key: &FileKey, file_len: u64) -> Result<Encryptor, FileError> {
+    /// Starts encrypting a file of `file_len` bytes under `key`, with
+    /// `label`. A key MUST NOT encrypt two files.
+    pub fn new(key: &FileKey, label: Label, file_len: u64) -> Result<Encryptor, FileError> {
         let plain = plaintext_len(file_len).ok_or(FileError::Size)?;
         let encrypted_len = encrypted_len(file_len).ok_or(FileError::Size)?;
         let mut pending = Zeroizing::new(Vec::with_capacity(CHUNK_LEN));
         pending.extend_from_slice(&file_len.to_be_bytes());
         Ok(Encryptor {
             key: key.clone(),
+            label,
+            started: false,
             pending,
             index: 0,
             // The plain text is at least 8 bytes, so there is a chunk.
@@ -396,12 +434,13 @@ impl Encryptor {
         self.encrypted_len
     }
 
-    /// Encrypts the next piece of the file, appending whole encrypted
-    /// chunks to `out`.
+    /// Encrypts the next piece of the file, appending the version byte and
+    /// whole encrypted chunks to `out`.
     pub fn update(&mut self, mut data: &[u8], out: &mut Vec<u8>) -> Result<(), FileError> {
         if data.len() as u64 > self.remaining {
             return Err(FileError::Size);
         }
+        self.start(out);
         self.remaining -= data.len() as u64;
         while !data.is_empty() {
             let take = (CHUNK_LEN - self.pending.len()).min(data.len());
@@ -417,6 +456,7 @@ impl Encryptor {
         if self.remaining != 0 {
             return Err(FileError::Size);
         }
+        self.start(out);
         while self.padding > 0 {
             let take = ((CHUNK_LEN - self.pending.len()) as u64).min(self.padding) as usize;
             let len = self.pending.len() + take;
@@ -431,6 +471,15 @@ impl Encryptor {
         Ok(self.hasher.finish())
     }
 
+    /// Writes the version byte, once, before the first chunk.
+    fn start(&mut self, out: &mut Vec<u8>) {
+        if !self.started {
+            self.started = true;
+            self.hasher.update(&[UPLOAD_VERSION]);
+            out.push(UPLOAD_VERSION);
+        }
+    }
+
     /// Encrypts the pending chunk if it is full.
     fn flush_full(&mut self, out: &mut Vec<u8>) {
         if self.pending.len() == CHUNK_LEN {
@@ -440,7 +489,12 @@ impl Encryptor {
 
     fn seal_pending(&mut self, out: &mut Vec<u8>) {
         let nonce = chunk_nonce(self.index, self.index == self.last);
-        let chunk = seal(self.key.as_bytes(), &nonce, b"", &self.pending);
+        let chunk = seal(
+            self.key.as_bytes(),
+            &nonce,
+            self.label.as_bytes(),
+            &self.pending,
+        );
         self.hasher.update(&chunk);
         out.extend_from_slice(&chunk);
         self.pending.clear();
@@ -448,16 +502,17 @@ impl Encryptor {
     }
 }
 
-/// Checks `upload` against `file_hash`, then decrypts it (12.11). The
-/// hash is checked before anything is decrypted, and the file is given
-/// only if every check passes.
+/// Checks `upload` against `file_hash`, then decrypts it as `label` says
+/// it is (12.11). The hash is checked before anything is decrypted, and the
+/// file is given only if every check passes.
 pub fn decrypt(
     key: &FileKey,
+    label: Label,
     file_hash: &BlobRef,
     upload: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, FileError> {
     file_hash.check(upload)?;
-    let mut decryptor = Decryptor::new(key);
+    let mut decryptor = Decryptor::new(key, label);
     let mut file = Zeroizing::new(Vec::new());
     decryptor.update(upload, &mut file)?;
     decryptor.finish(&mut file)?;
@@ -471,6 +526,9 @@ pub fn decrypt(
 /// or save anything this gives unless [`Decryptor::finish`] succeeds.
 pub struct Decryptor {
     key: FileKey,
+    label: Label,
+    /// Whether the version byte has been read and checked.
+    started: bool,
     /// Encrypted bytes not yet decrypted: at most one encrypted chunk.
     pending: Vec<u8>,
     index: u64,
@@ -482,10 +540,13 @@ pub struct Decryptor {
 }
 
 impl Decryptor {
-    /// Starts decrypting an upload under `key`.
-    pub fn new(key: &FileKey) -> Decryptor {
+    /// Starts decrypting an upload under `key`, which `label` says what it
+    /// holds.
+    pub fn new(key: &FileKey, label: Label) -> Decryptor {
         Decryptor {
             key: key.clone(),
+            label,
+            started: false,
             pending: Vec::with_capacity(ENCRYPTED_CHUNK_LEN),
             index: 0,
             file_len: None,
@@ -500,6 +561,16 @@ impl Decryptor {
     pub fn update(&mut self, mut data: &[u8], out: &mut Vec<u8>) -> Result<(), FileError> {
         if let Some(error) = self.failed {
             return Err(error);
+        }
+        if !self.started
+            && let Some((&version, rest)) = data.split_first()
+        {
+            self.started = true;
+            if version != UPLOAD_VERSION {
+                self.failed = Some(FileError::Version(version));
+                return Err(FileError::Version(version));
+            }
+            data = rest;
         }
         while !data.is_empty() {
             if self.pending.len() == ENCRYPTED_CHUNK_LEN {
@@ -518,15 +589,14 @@ impl Decryptor {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        // An empty upload, or a last chunk with nothing but a tag.
-        if self.pending.len() <= AEAD_TAG_LEN {
+        // An empty upload, nothing after the version, or a last chunk with
+        // nothing but a tag.
+        if !self.started || self.pending.len() <= AEAD_TAG_LEN {
             return Err(FileError::Length);
         }
         self.open_pending(true, out)?;
         let file_len = self.file_len.ok_or(FileError::InnerLength)?;
-        // 12.11 says the length must fit the plain text; this also holds
-        // the sender to the exact Padmé length, so no two plain texts of
-        // one file differ (PLAN.md 62).
+        // The plain text is exactly Padmé of 8 + L bytes (12.11).
         if plaintext_len(file_len) != Some(self.plain_len) {
             return Err(FileError::InnerLength);
         }
@@ -543,8 +613,13 @@ impl Decryptor {
 
     fn open_pending_inner(&mut self, last: bool, out: &mut Vec<u8>) -> Result<(), FileError> {
         let nonce = chunk_nonce(self.index, last);
-        let plain = open(self.key.as_bytes(), &nonce, b"", &self.pending)
-            .ok_or(FileError::Chunk(self.index))?;
+        let plain = open(
+            self.key.as_bytes(),
+            &nonce,
+            self.label.as_bytes(),
+            &self.pending,
+        )
+        .ok_or(FileError::Chunk(self.index))?;
         self.pending.clear();
         self.index += 1;
 
@@ -588,6 +663,11 @@ mod tests {
 
     fn key() -> FileKey {
         FileKey::from_bytes(std::array::from_fn(|i| i as u8))
+    }
+
+    /// Encrypts `file` as a file under `key`.
+    fn enc(key: &FileKey, file: &[u8]) -> (Vec<u8>, BlobRef) {
+        encrypt_with_key(key, Label::File, file)
     }
 
     /// Padmé by its definition, with floating point avoided: the published
@@ -638,15 +718,16 @@ mod tests {
     #[test]
     fn lengths() {
         assert_eq!(plaintext_len(0), Some(8));
-        assert_eq!(encrypted_len(0), Some(24));
+        assert_eq!(encrypted_len(0), Some(25));
         assert_eq!(plaintext_len(1), Some(10));
         assert_eq!(plaintext_len(65528), Some(65536));
-        assert_eq!(encrypted_len(65528), Some(65552));
+        assert_eq!(encrypted_len(65528), Some(65553));
         assert_eq!(plaintext_len(65529), Some(67584));
-        assert_eq!(encrypted_len(65529), Some(67584 + 32));
+        assert_eq!(encrypted_len(65529), Some(67584 + 32 + 1));
         for len in [0, 1, 7, 100, 65527, 65528, 65529, 200_000] {
-            let (upload, _) = encrypt_with_key(&key(), &counting(len));
+            let (upload, _) = enc(&key(), &counting(len));
             assert_eq!(upload.len() as u64, encrypted_len(len as u64).unwrap());
+            assert_eq!(upload[0], UPLOAD_VERSION);
         }
     }
 
@@ -665,14 +746,20 @@ mod tests {
             300_000,
         ] {
             let file = counting(len);
-            let encrypted = encrypt(&file).unwrap();
-            assert_eq!(encrypted.size, len as u64);
-            assert_eq!(encrypted.hash, BlobRef::of(&encrypted.upload));
-            let decrypted = decrypt(&encrypted.key, &encrypted.hash, &encrypted.upload).unwrap();
-            assert_eq!(&decrypted[..], &file[..], "length {len}");
+            for label in [Label::File, Label::Archive] {
+                let encrypted = encrypt(label, &file).unwrap();
+                assert_eq!(encrypted.size, len as u64);
+                assert_eq!(encrypted.hash, BlobRef::of(&encrypted.upload));
+                let decrypted =
+                    decrypt(&encrypted.key, label, &encrypted.hash, &encrypted.upload).unwrap();
+                assert_eq!(&decrypted[..], &file[..], "length {len}");
+            }
         }
         // A new key each time.
-        assert_ne!(encrypt(b"x").unwrap().key, encrypt(b"x").unwrap().key);
+        assert_ne!(
+            encrypt(Label::File, b"x").unwrap().key,
+            encrypt(Label::File, b"x").unwrap().key
+        );
     }
 
     /// Feeding the encryptor and decryptor in odd pieces gives the same
@@ -680,7 +767,7 @@ mod tests {
     #[test]
     fn streaming() {
         let file = counting(3 * CHUNK_LEN + 12345);
-        let (whole, hash) = encrypt_with_key(&key(), &file);
+        let (whole, hash) = enc(&key(), &file);
         for piece in [
             1,
             7,
@@ -689,7 +776,7 @@ mod tests {
             ENCRYPTED_CHUNK_LEN,
             ENCRYPTED_CHUNK_LEN + 1,
         ] {
-            let mut encryptor = Encryptor::new(&key(), file.len() as u64).unwrap();
+            let mut encryptor = Encryptor::new(&key(), Label::File, file.len() as u64).unwrap();
             let mut upload = Vec::new();
             for part in file.chunks(piece) {
                 encryptor.update(part, &mut upload).unwrap();
@@ -698,7 +785,7 @@ mod tests {
             assert_eq!(upload, whole);
 
             let mut hasher = Hasher::new();
-            let mut decryptor = Decryptor::new(&key());
+            let mut decryptor = Decryptor::new(&key(), Label::File);
             let mut out = Vec::new();
             for part in upload.chunks(piece) {
                 hasher.update(part);
@@ -713,47 +800,90 @@ mod tests {
     #[test]
     fn encryptor_checks_length() {
         let mut out = Vec::new();
-        let mut e = Encryptor::new(&key(), 3).unwrap();
+        let mut e = Encryptor::new(&key(), Label::File, 3).unwrap();
         assert_eq!(e.update(b"abcd", &mut out), Err(FileError::Size));
-        let mut e = Encryptor::new(&key(), 3).unwrap();
+        let mut e = Encryptor::new(&key(), Label::File, 3).unwrap();
         e.update(b"ab", &mut out).unwrap();
         assert_eq!(e.finish(&mut out), Err(FileError::Size));
-        assert!(Encryptor::new(&key(), u64::MAX).is_err());
+        assert!(Encryptor::new(&key(), Label::File, u64::MAX).is_err());
+        // An empty file still gets its version byte, once.
+        let mut out = Vec::new();
+        let mut e = Encryptor::new(&key(), Label::File, 0).unwrap();
+        e.update(b"", &mut out).unwrap();
+        let hash = e.finish(&mut out).unwrap();
+        assert_eq!(out.len(), 25);
+        assert_eq!((out.clone(), hash), enc(&key(), b""));
     }
 
     /// Decrypts without the hash check, to reach the chunk checks behind
     /// it.
     fn decrypt_unhashed(key: &FileKey, upload: &[u8]) -> Result<Vec<u8>, FileError> {
-        decrypt(key, &BlobRef::of(upload), upload).map(|f| f.to_vec())
+        decrypt(key, Label::File, &BlobRef::of(upload), upload).map(|f| f.to_vec())
     }
 
-    /// Chunk `index` of `upload`, with its tag.
+    /// Chunk `index` of `upload`, with its tag, after the version byte.
     fn chunk(upload: &[u8], index: usize) -> &[u8] {
-        let start = index * ENCRYPTED_CHUNK_LEN;
+        let start = 1 + index * ENCRYPTED_CHUNK_LEN;
         &upload[start..(start + ENCRYPTED_CHUNK_LEN).min(upload.len())]
+    }
+
+    /// The version byte, then `chunks`.
+    fn upload_of(chunks: &[&[u8]]) -> Vec<u8> {
+        [&[UPLOAD_VERSION][..], &chunks.concat()].concat()
     }
 
     #[test]
     fn rejections() {
         let file = counting(3 * CHUNK_LEN);
-        let (upload, hash) = encrypt_with_key(&key(), &file);
+        let (upload, hash) = enc(&key(), &file);
         // 3 * 65536 + 8 bytes pad to 3 * 65536 + 4096: four chunks.
-        assert_eq!(upload.len(), 3 * ENCRYPTED_CHUNK_LEN + 4096 + 16);
+        assert_eq!(upload.len(), 1 + 3 * ENCRYPTED_CHUNK_LEN + 4096 + 16);
         let chunks: Vec<&[u8]> = (0..4).map(|i| chunk(&upload, i)).collect();
 
         // The hash is checked first: a flipped bit fails it.
         let mut changed = upload.clone();
         changed[100] ^= 1;
-        assert_eq!(decrypt(&key(), &hash, &changed), Err(FileError::Hash));
+        assert_eq!(
+            decrypt(&key(), Label::File, &hash, &changed),
+            Err(FileError::Hash)
+        );
         // ... and with a matching hash, the chunk fails.
         assert_eq!(decrypt_unhashed(&key(), &changed), Err(FileError::Chunk(0)));
 
         // Another key.
         let other = FileKey::from_bytes([9; 32]);
-        assert_eq!(decrypt(&other, &hash, &upload), Err(FileError::Chunk(0)));
+        assert_eq!(
+            decrypt(&other, Label::File, &hash, &upload),
+            Err(FileError::Chunk(0))
+        );
+        // The same upload read as an archive: the label differs.
+        assert_eq!(
+            decrypt(&key(), Label::Archive, &hash, &upload),
+            Err(FileError::Chunk(0))
+        );
+
+        // Another version byte, checked after the hash and before any
+        // chunk.
+        for version in [0, 2, 0xff] {
+            let mut b = upload.clone();
+            b[0] = version;
+            assert_eq!(
+                decrypt(&key(), Label::File, &hash, &b),
+                Err(FileError::Hash)
+            );
+            assert_eq!(
+                decrypt_unhashed(&key(), &b),
+                Err(FileError::Version(version))
+            );
+        }
+        // No version byte at all: the chunks alone.
+        assert_eq!(
+            decrypt_unhashed(&key(), &upload[1..]),
+            Err(FileError::Version(upload[1]))
+        );
 
         // Truncated at a chunk boundary: the new last chunk lacks the flag.
-        let truncated = chunks[..3].concat();
+        let truncated = upload_of(&chunks[..3]);
         assert_eq!(
             decrypt_unhashed(&key(), &truncated),
             Err(FileError::Chunk(2))
@@ -765,6 +895,7 @@ mod tests {
         );
         // Extended by a chunk: the old last chunk has the flag.
         let extended = [&upload[..], chunks[1]].concat();
+        assert_eq!(extended.len(), upload.len() + ENCRYPTED_CHUNK_LEN);
         assert_eq!(
             decrypt_unhashed(&key(), &extended),
             Err(FileError::Chunk(3))
@@ -776,8 +907,8 @@ mod tests {
         );
         // Bytes after a full last chunk: a tag's worth or less is a chunk
         // that cannot be, and more is a chunk that does not decrypt.
-        let (full, _) = encrypt_with_key(&key(), &counting(CHUNK_LEN - 8));
-        assert_eq!(full.len(), ENCRYPTED_CHUNK_LEN);
+        let (full, _) = enc(&key(), &counting(CHUNK_LEN - 8));
+        assert_eq!(full.len(), 1 + ENCRYPTED_CHUNK_LEN);
         assert_eq!(
             decrypt_unhashed(&key(), &[&full[..], &[0; 16]].concat()),
             Err(FileError::Chunk(0))
@@ -787,50 +918,74 @@ mod tests {
             Err(FileError::Chunk(0))
         );
         // Reordered, and a chunk repeated in place of another.
-        let swapped = [chunks[1], chunks[0], chunks[2], chunks[3]].concat();
+        let swapped = upload_of(&[chunks[1], chunks[0], chunks[2], chunks[3]]);
         assert_eq!(decrypt_unhashed(&key(), &swapped), Err(FileError::Chunk(0)));
-        let repeated = [chunks[0], chunks[0], chunks[2], chunks[3]].concat();
+        let repeated = upload_of(&[chunks[0], chunks[0], chunks[2], chunks[3]]);
         assert_eq!(
             decrypt_unhashed(&key(), &repeated),
             Err(FileError::Chunk(1))
         );
         // A chunk from another file, in its own place.
         let other_file: Vec<u8> = file.iter().map(|b| !b).collect();
-        let (other_upload, _) = encrypt_with_key(&FileKey::from_bytes([7; 32]), &other_file);
-        let spliced = [chunks[0], chunk(&other_upload, 1), chunks[2], chunks[3]].concat();
+        let (other_upload, _) = enc(&FileKey::from_bytes([7; 32]), &other_file);
+        let spliced = upload_of(&[chunks[0], chunk(&other_upload, 1), chunks[2], chunks[3]]);
         assert_eq!(decrypt_unhashed(&key(), &spliced), Err(FileError::Chunk(1)));
         // Had both files used one key, which a sender must never do, the
         // chunk would decrypt: the hash is what catches it then.
-        let (same_key, _) = encrypt_with_key(&key(), &other_file);
-        let spliced = [chunks[0], chunk(&same_key, 1), chunks[2], chunks[3]].concat();
+        let (same_key, _) = enc(&key(), &other_file);
+        let spliced = upload_of(&[chunks[0], chunk(&same_key, 1), chunks[2], chunks[3]]);
         assert!(decrypt_unhashed(&key(), &spliced).is_ok());
-        assert_eq!(decrypt(&key(), &hash, &spliced), Err(FileError::Hash));
-        // Empty.
-        assert_eq!(decrypt_unhashed(&key(), b""), Err(FileError::Length));
-        assert_eq!(decrypt_unhashed(&key(), &[0; 16]), Err(FileError::Length));
-        // The last chunk dropped to just the length.
         assert_eq!(
-            decrypt_unhashed(&key(), &upload[..3 * ENCRYPTED_CHUNK_LEN + 16]),
+            decrypt(&key(), Label::File, &hash, &spliced),
+            Err(FileError::Hash)
+        );
+        // Empty, the version byte alone, or with a tag's worth after it.
+        assert_eq!(decrypt_unhashed(&key(), b""), Err(FileError::Length));
+        assert_eq!(decrypt_unhashed(&key(), &[1]), Err(FileError::Length));
+        assert_eq!(decrypt_unhashed(&key(), &[1; 17]), Err(FileError::Length));
+        // The last chunk dropped to just the tag's length.
+        assert_eq!(
+            decrypt_unhashed(&key(), &upload[..1 + 3 * ENCRYPTED_CHUNK_LEN + 16]),
             Err(FileError::Length)
         );
 
         // A failed decryptor stays failed.
-        let mut d = Decryptor::new(&key());
+        let mut d = Decryptor::new(&key(), Label::File);
         let mut out = Vec::new();
         d.update(&swapped, &mut out).unwrap_err();
         assert_eq!(d.update(b"x", &mut out), Err(FileError::Chunk(0)));
         assert_eq!(d.finish(&mut out), Err(FileError::Chunk(0)));
+        let mut d = Decryptor::new(&key(), Label::File);
+        assert_eq!(d.update(&[2], &mut out), Err(FileError::Version(2)));
+        assert_eq!(d.update(&upload[1..], &mut out), Err(FileError::Version(2)));
+        assert_eq!(d.finish(&mut out), Err(FileError::Version(2)));
     }
 
     /// Encrypts a hand-made plain text in the 12.11 layout.
     fn seal_plaintext(plain: &[u8]) -> Vec<u8> {
         let count = plain.len().div_ceil(CHUNK_LEN);
-        let mut out = Vec::new();
+        let mut out = vec![UPLOAD_VERSION];
         for (i, part) in plain.chunks(CHUNK_LEN).enumerate() {
             let nonce = chunk_nonce(i as u64, i + 1 == count);
-            out.extend(seal(key().as_bytes(), &nonce, b"", part));
+            out.extend(seal(key().as_bytes(), &nonce, Label::File.as_bytes(), part));
         }
         out
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(Label::File.as_bytes(), b"risala/1 file");
+        assert_eq!(Label::Archive.as_bytes(), b"risala/1 archive");
+        // The first chunk's tag is over the label as associated data.
+        let (upload, _) = enc(&key(), b"hi");
+        let plain = [&2u64.to_be_bytes()[..], b"hi"].concat();
+        let expected = seal(
+            key().as_bytes(),
+            &chunk_nonce(0, true),
+            b"risala/1 file",
+            &plain,
+        );
+        assert_eq!(&upload[1..], &expected[..]);
     }
 
     #[test]
@@ -953,17 +1108,23 @@ mod tests {
         assert_eq!(hasher.finish(), h);
     }
 
-    const FILE_VECTOR_UPLOAD: &str = "695c7cd9310ab87445141243dc38376079825e2cafbb17167ddf125cda6c8452\
-     c0a8b4d01fc3";
+    const FILE_VECTOR_UPLOAD: &str = "01695c7cd9310ab87445141243dc38376079825e2cafbb7fb2f4733b92958a61\
+     462ef6b8fc2908";
+    const FILE_VECTOR_HASH: &str =
+        "NhCQTv1i4+tHqcz5ZpTBHCwVGQ3x1hFYL592D7m0qvnuYSm2BhfToxD1N1yyOGhK";
+    const FILE_VECTOR_ARCHIVE: &str = "01695c7cd9310ab87445141243dc38376079825e2cafbb6a50e919373de1083f\
+     d8a25c88a12d43";
+    const FILE_VECTOR_TWO_CHUNKS: &str = "sha384:df178956097f8985bee1e44daa2cf41c0f5a54cf7cd23297250ba8072\
+     3370c93d952bf4838eaa576bfe62949b83d745e";
 
     /// A fixed-input vector for Appendix B: the file "hello, risala\n"
     /// under the key 00 01 ... 1f.
     #[test]
     fn vector() {
         let file = b"hello, risala\n";
-        let (upload, hash) = encrypt_with_key(&key(), file);
+        let (upload, hash) = enc(&key(), file);
         // 8 + 14 = 22 bytes, which Padmé leaves as they are.
-        assert_eq!(upload.len(), 22 + 16);
+        assert_eq!(upload.len(), 1 + 22 + 16);
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         println!("file key   {}", hex(key().as_bytes()));
         println!("file       {}", hex(file));
@@ -971,21 +1132,24 @@ mod tests {
         println!("file-hash  {}", hash.to_base64());
         println!("blob-ref   {hash}");
         assert_eq!(hex(&upload), FILE_VECTOR_UPLOAD);
-        assert_eq!(decrypt(&key(), &hash, &upload).unwrap().as_slice(), file);
         assert_eq!(
-            hash.to_base64(),
-            "OYG9R90cF/C9CNWi55BAUXdBsP5auixTV/XUu7QF8iQVOCiM6H0rz3oOdpEmOWBF"
+            decrypt(&key(), Label::File, &hash, &upload)
+                .unwrap()
+                .as_slice(),
+            file
         );
+        assert_eq!(hash.to_base64(), FILE_VECTOR_HASH);
+        // The same file and key as an archive.
+        let (archive, archive_hash) = encrypt_with_key(&key(), Label::Archive, file);
+        println!("as archive {}", hex(&archive));
+        println!("archive-hash {}", archive_hash.to_base64());
+        assert_eq!(hex(&archive), FILE_VECTOR_ARCHIVE);
 
         // Two chunks: 65529 counting bytes pad to 67584, the second chunk
         // carrying the last-chunk flag.
-        let (upload, hash) = encrypt_with_key(&key(), &counting(65529));
+        let (upload, hash) = enc(&key(), &counting(65529));
         println!("65529 bytes {hash}");
-        assert_eq!(upload.len(), 67616);
-        assert_eq!(
-            hash.to_string(),
-            "sha384:3095b5fe1a5ae83843b17dcc2befe452c685a916e05c07635d814fb0\
-             ff42bdaa7e3a7dfa0d2d4c3a741ebd1689b5f03c"
-        );
+        assert_eq!(upload.len(), 67617);
+        assert_eq!(hash.to_string(), FILE_VECTOR_TWO_CHUNKS);
     }
 }

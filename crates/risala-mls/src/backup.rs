@@ -3,25 +3,29 @@
 //! - A **recovery key** is 32 random bytes, shown once when an identity
 //!   is made, as 52 characters of lower-case base32 [RFC4648] in groups of
 //!   four (4.8). People type it back ignoring case, spaces and `-`.
+//! - An identity's backup **generation** is its key file chain's (4.4):
+//!   the number of `signing` records plus the number of `master` records
+//!   after the first. It comes from the chain, checked against the key
+//!   log, never from a server or a counter of this module's, so every
+//!   function here takes it as an input. Removing a device, recovering
+//!   the identity and changing the recovery key each move to the next one.
 //! - A **backup key** is HKDF-Expand(HKDF-Extract("", recovery key), info,
 //!   32) with SHA-384, where `info` is `risala/1 backup `, the uid, a
-//!   space and the **generation** in decimal (12.13). The first generation
-//!   is 0. Every device keeps the current generation's backup key, never
-//!   the recovery key.
-//! - A **backup** is a HistoryArchive ([`crate::archive`]) encrypted as a
-//!   file under a new random key and stored as a blob. Its key is
-//!   **wrapped**: a random 12-byte nonce, then the key encrypted with
-//!   ChaCha20-Poly1305 under the backup key, with the associated data
-//!   `risala/1 backup <uid> <generation> <hash>`. The wrapped key is 60
-//!   bytes. BACKUP PUT stores the generation, the blob's hash and the
-//!   wrapped key; one backup per identity is current.
-//! - **Removing a device** moves to the next generation (4.8), since the
-//!   removed device knew the current backup key: the device that removes
-//!   it derives the next generation's key from the recovery key
-//!   ([`RecoveryKey::next_backup_key`]), sends it to the other devices in a
-//!   BACKUPKEY line, and makes a new backup under it, which replaces the
-//!   old one. Nothing is re-wrapped: the old backup's file key is one the
-//!   removed device may have kept, so the new backup has a new one.
+//!   space and the generation in decimal (12.13). Every device keeps the
+//!   current generation's backup key, never the recovery key.
+//! - A **backup** is a transfer of history archives ([`crate::archive`]),
+//!   each encrypted as a file and stored as a blob, with the files it
+//!   carries as blobs of their own. The first archive's key is
+//!   **wrapped** as a [`WrappedKey`]: version `0x01`, a random 12-byte
+//!   nonce, then the key encrypted with ChaCha20-Poly1305 under the backup
+//!   key, with the associated data `risala/1 backup <uid> <generation>
+//!   <blob-ref>`: 61 bytes. BACKUP PUT stores the generation, the first
+//!   archive's blob-ref, the wrapped key and, if there are other blobs,
+//!   the blob-ref of a list of their hashes.
+//! - **Restoring** ([`restore`]) follows 12.13's steps: the device names
+//!   the generation it computed from the key log, a backup of any other
+//!   generation is refused, and the first archive's `made` is given back
+//!   to show.
 //!
 //! The master key's derivation from the recovery key (`risala/1 identity
 //! <uid>`, 4.8) belongs with the key file records, in risala-proto.
@@ -33,11 +37,14 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use risala_proto::names::Identity;
 use zeroize::Zeroizing;
 
-use crate::archive::{ArchiveError, HistoryArchive};
+use crate::archive::{
+    ArchiveError, ArchivedConversation, ArchivedFile, OpenedTransfer, TransferRef, open_transfer,
+    seal_transfer,
+};
 use crate::file::{self, BlobRef, FILE_KEY_LEN, FileKey};
 use crate::primitives::{
-    AEAD_KEY_LEN, AEAD_NONCE_LEN, AEAD_TAG_LEN, ct_eq, hkdf_expand, hkdf_extract, open, random,
-    seal,
+    AEAD_KEY_LEN, AEAD_NONCE_LEN, AEAD_TAG_LEN, HASH_LEN, ct_eq, hkdf_expand, hkdf_extract, open,
+    random, seal,
 };
 
 /// The length of a recovery key (4.8).
@@ -50,8 +57,11 @@ pub const RECOVERY_KEY_BASE32_LEN: usize = 52;
 /// The length of a backup key (12.13).
 pub const BACKUP_KEY_LEN: usize = AEAD_KEY_LEN;
 
-/// The length of a wrapped key (12.13): nonce, key and tag.
-pub const WRAPPED_KEY_LEN: usize = AEAD_NONCE_LEN + FILE_KEY_LEN + AEAD_TAG_LEN;
+/// The version of a WrappedKey (12.13).
+pub const WRAPPED_KEY_VERSION: u8 = 1;
+
+/// The length of a WrappedKey (12.13): version, nonce, key and tag.
+pub const WRAPPED_KEY_LEN: usize = 1 + AEAD_NONCE_LEN + FILE_KEY_LEN + AEAD_TAG_LEN;
 
 /// The HKDF info of backup keys, and the start of a wrapped key's
 /// associated data, before the uid (12.13).
@@ -147,19 +157,16 @@ impl RecoveryKey {
     }
 
     /// The backup key of generation `generation` of `uid`'s backups
-    /// (12.13).
+    /// (12.13). The generation is the key file chain's (4.4): after
+    /// publishing a record that moves it, a device derives the new one's
+    /// key here, sends it in a BACKUPKEY line, and replaces the backup at
+    /// once.
     pub fn backup_key(&self, uid: &Identity, generation: u32) -> BackupKey {
         let prk = hkdf_extract(b"", &self.0[..]);
         let info = format!("{BACKUP_LABEL}{} {generation}", uid.as_str());
         let mut key = Zeroizing::new([0; BACKUP_KEY_LEN]);
         hkdf_expand(&prk[..], info.as_bytes(), &mut key[..]);
         BackupKey { generation, key }
-    }
-
-    /// The backup key of the generation after `current`'s, for removing a
-    /// device (4.8). `None` after generation 2^32 - 1.
-    pub fn next_backup_key(&self, uid: &Identity, current: &BackupKey) -> Option<BackupKey> {
-        Some(self.backup_key(uid, current.generation.checked_add(1)?))
     }
 }
 
@@ -197,23 +204,32 @@ pub(crate) fn base32_lower(bytes: &[u8]) -> Zeroizing<String> {
     out
 }
 
-/// Why a backup cannot be restored (12.13).
+/// Why a backup cannot be made or restored (12.13).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BackupError {
-    /// The backup was made under another generation than this key's.
-    #[error("the backup is of generation {backup}, the key of {key}")]
+    /// The backup is of another generation than the one the key log gives
+    /// (or this key's). The device tells the user that there is no usable
+    /// backup.
+    #[error("the backup is of generation {backup}, not {expected}")]
     Generation {
-        /// The backup's generation.
+        /// The backup's generation, as the server gave it.
         backup: u32,
-        /// The key's generation.
-        key: u32,
+        /// The generation the device expected.
+        expected: u32,
     },
+    /// The wrapped key names a version this device does not support (2.4).
+    #[error("unsupported wrapped key version {0}")]
+    Version(u8),
+    /// The wrapped key is not 61 bytes.
+    #[error("a wrapped key is 61 bytes")]
+    Length,
     /// The wrapped key does not decrypt: another key, uid, generation or
     /// hash, or it was changed.
     #[error("the backup's key does not unwrap")]
     Unwrap,
-    /// The blob does not match the hash, does not decrypt, or is not the
-    /// identity's archive.
+    /// The first archive cannot be fetched, does not match the hash, does
+    /// not decrypt, is not the identity's, or the archives do not belong
+    /// together.
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     /// The operating system gave no randomness for a key or nonce.
@@ -283,8 +299,9 @@ impl BackupKey {
         let aad = self.associated_data(uid, blob);
         let sealed = seal(&self.key, &nonce, &aad, file_key.as_bytes());
         let mut out = [0; WRAPPED_KEY_LEN];
-        out[..AEAD_NONCE_LEN].copy_from_slice(&nonce);
-        out[AEAD_NONCE_LEN..].copy_from_slice(&sealed);
+        out[0] = WRAPPED_KEY_VERSION;
+        out[1..1 + AEAD_NONCE_LEN].copy_from_slice(&nonce);
+        out[1 + AEAD_NONCE_LEN..].copy_from_slice(&sealed);
         WrappedKey(out)
     }
 
@@ -296,10 +313,10 @@ impl BackupKey {
         wrapped: &WrappedKey,
     ) -> Result<FileKey, BackupError> {
         let aad = self.associated_data(uid, blob);
-        let nonce: [u8; AEAD_NONCE_LEN] = wrapped.0[..AEAD_NONCE_LEN]
+        let nonce: [u8; AEAD_NONCE_LEN] = wrapped.0[1..1 + AEAD_NONCE_LEN]
             .try_into()
-            .expect("a wrapped key starts with a nonce");
-        let plain = open(&self.key, &nonce, &aad, &wrapped.0[AEAD_NONCE_LEN..])
+            .expect("a wrapped key has a nonce after its version");
+        let plain = open(&self.key, &nonce, &aad, &wrapped.0[1 + AEAD_NONCE_LEN..])
             .ok_or(BackupError::Unwrap)?;
         Ok(FileKey::from_bytes(
             plain[..]
@@ -308,48 +325,73 @@ impl BackupKey {
         ))
     }
 
-    /// `risala/1 backup <uid> <generation> <hash>` (12.13), with the hash
-    /// as a blob-ref, the form BACKUP PUT sends it in (PLAN.md 62).
+    /// `risala/1 backup <uid> <generation> <blob-ref>` (12.13), with the
+    /// first archive's hash as BACKUP PUT sends it.
     fn associated_data(&self, uid: &Identity, blob: &BlobRef) -> Vec<u8> {
         format!("{BACKUP_LABEL}{} {} {blob}", uid.as_str(), self.generation).into_bytes()
     }
 
-    /// Encrypts `archive` as a backup (12.13): the blob to store, and the
-    /// generation, hash and wrapped key for BACKUP PUT.
-    pub fn make_backup(&self, archive: &HistoryArchive) -> Result<(Vec<u8>, Backup), BackupError> {
-        let sealed = archive.seal()?;
-        let key = self.wrap(&archive.uid, &sealed.transfer.blob, &sealed.transfer.key)?;
-        Ok((
-            sealed.blob,
-            Backup {
+    /// Makes a backup of `conversations` and `files` (12.13): seals them
+    /// as archives of at most `max_blob` bytes each ([`seal_transfer`]),
+    /// wraps the first archive's key, and lists every other blob. The
+    /// files' blobs ([`ArchivedFile::encrypt`]) are the caller's to store,
+    /// and SHOULD be reused from earlier backups.
+    pub fn make_backup(
+        &self,
+        uid: &Identity,
+        made: u64,
+        conversations: Vec<ArchivedConversation>,
+        files: Vec<ArchivedFile>,
+        max_blob: u64,
+    ) -> Result<BackupUpload, BackupError> {
+        let file_blobs: Vec<BlobRef> = files.iter().map(|f| f.blob).collect();
+        let archives = seal_transfer(uid, made, conversations, files, max_blob)?;
+        let first = &archives[0].transfer;
+        let key = self.wrap(uid, &first.blob, &first.key)?;
+        // The hashes of every other blob: the archives in `more`, then the
+        // files in `files` (12.13).
+        let others: Vec<u8> = archives[1..]
+            .iter()
+            .map(|a| a.transfer.blob)
+            .chain(file_blobs)
+            .flat_map(|h| *h.as_bytes())
+            .collect();
+        let list = (!others.is_empty()).then_some(others);
+        Ok(BackupUpload {
+            backup: Backup {
                 generation: self.generation,
-                hash: sealed.transfer.blob,
+                hash: first.blob,
                 key,
+                files: list.as_deref().map(BlobRef::of),
             },
-        ))
+            archives: archives.into_iter().map(|a| a.blob).collect(),
+            list,
+        })
     }
 
-    /// Opens the backup `backup` of `uid` in `blob` (12.13): unwraps its
-    /// key, checks the blob's hash, decrypts it, and checks that the
-    /// archive is `uid`'s.
+    /// Opens `uid`'s backup `backup` with this key (12.13): refuses a
+    /// backup of another generation than this key's, unwraps the first
+    /// archive's key, and opens the archives through `fetch`
+    /// ([`open_transfer`]). The result's `made` is the first archive's,
+    /// for the device to show.
     pub fn restore(
         &self,
         uid: &Identity,
         backup: &Backup,
-        blob: &[u8],
-    ) -> Result<HistoryArchive, BackupError> {
+        fetch: impl FnMut(&BlobRef) -> Option<Vec<u8>>,
+    ) -> Result<OpenedTransfer, BackupError> {
         if backup.generation != self.generation {
             return Err(BackupError::Generation {
                 backup: backup.generation,
-                key: self.generation,
+                expected: self.generation,
             });
         }
         let key = self.unwrap(uid, &backup.hash, &backup.key)?;
-        let transfer = crate::archive::TransferRef {
+        let first = TransferRef {
             blob: backup.hash,
             key,
         };
-        Ok(HistoryArchive::open(&transfer, blob, uid)?)
+        Ok(open_transfer(&first, uid, fetch)?)
     }
 }
 
@@ -369,15 +411,24 @@ impl fmt::Debug for BackupKey {
     }
 }
 
-/// A wrapped backup key (12.13): the nonce, then the encrypted file key
-/// and its tag. 60 bytes.
+/// A WrappedKey (12.13): the version `0x01`, the nonce, then the
+/// encrypted file key and its tag. 61 bytes.
+///
+/// ```text
+/// struct { uint8 version; opaque nonce[12]; opaque ciphertext[48]; } WrappedKey;
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct WrappedKey([u8; WRAPPED_KEY_LEN]);
 
 impl WrappedKey {
-    /// A wrapped key from its bytes.
-    pub fn from_bytes(bytes: [u8; WRAPPED_KEY_LEN]) -> WrappedKey {
-        WrappedKey(bytes)
+    /// Reads a wrapped key: exactly 61 bytes, of version 1. A server
+    /// replies `ERR invalid` to BACKUP PUT for one that fails (12.13).
+    pub fn from_bytes(bytes: &[u8]) -> Result<WrappedKey, BackupError> {
+        let bytes: [u8; WRAPPED_KEY_LEN] = bytes.try_into().map_err(|_| BackupError::Length)?;
+        if bytes[0] != WRAPPED_KEY_VERSION {
+            return Err(BackupError::Version(bytes[0]));
+        }
+        Ok(WrappedKey(bytes))
     }
 
     /// The wrapped key's bytes.
@@ -386,17 +437,17 @@ impl WrappedKey {
     }
 
     /// The `<key>` of BACKUP PUT and BACKUP (12.13): base64 with padding,
-    /// 80 characters.
+    /// 84 characters.
     pub fn to_base64(&self) -> String {
         BASE64.encode(self.0)
     }
 
-    /// Reads the `<key>` of BACKUP PUT or BACKUP: exactly 60 bytes in
-    /// canonical base64 with padding.
-    pub fn from_base64(text: &str) -> Option<WrappedKey> {
+    /// Reads the `<key>` of BACKUP PUT or BACKUP: exactly 61 bytes in
+    /// canonical base64 with padding, then as [`WrappedKey::from_bytes`].
+    pub fn from_base64(text: &str) -> Result<WrappedKey, BackupError> {
         let mut out = [0; WRAPPED_KEY_LEN];
-        file::decode_base64_exact(text, &mut out)?;
-        Some(WrappedKey(out))
+        file::decode_base64_exact(text, &mut out).ok_or(BackupError::Length)?;
+        WrappedKey::from_bytes(&out)
     }
 }
 
@@ -405,31 +456,79 @@ impl WrappedKey {
 pub struct Backup {
     /// The generation of the backup key that wraps the key.
     pub generation: u32,
-    /// The blob-ref of the encrypted archive.
+    /// The blob-ref of the first archive.
     pub hash: BlobRef,
-    /// The wrapped key.
+    /// The wrapped key of the first archive.
     pub key: WrappedKey,
+    /// The blob-ref of the list of every other blob of the backup, if
+    /// there are any: BACKUP PUT's `files` (12.13).
+    pub files: Option<BlobRef>,
 }
 
-/// Restores `uid`'s backup with the recovery key (12.13): derives the
-/// backup key of the backup's generation, then [`BackupKey::restore`].
+/// A backup ready to store (12.13): the blobs to upload, then BACKUP PUT.
+#[derive(Debug)]
+pub struct BackupUpload {
+    /// What BACKUP PUT sends.
+    pub backup: Backup,
+    /// The archives' blobs, the first one first.
+    pub archives: Vec<Vec<u8>>,
+    /// The list blob: the 48-byte hashes of every other blob, the archives
+    /// after the first then the files, if there are any. Its hash is
+    /// `backup.files`.
+    pub list: Option<Vec<u8>>,
+}
+
+/// Reads the list blob of BACKUP PUT's `files` (12.13): 48-byte hashes,
+/// one after another. `None` if its length is not a multiple of 48, which
+/// a server answers with `ERR invalid`.
+pub fn read_list(list: &[u8]) -> Option<Vec<BlobRef>> {
+    let (hashes, rest) = list.as_chunks::<HASH_LEN>();
+    rest.is_empty()
+        .then(|| hashes.iter().map(|h| BlobRef::from_bytes(*h)).collect())
+}
+
+/// Restores `uid`'s backup with the recovery key, after recovering the
+/// identity (12.13):
+///
+/// 1. `generation` is the one the caller computed from the identity's key
+///    file, checked against the key log: the generation current just
+///    before its own recovery record (4.4).
+/// 2. A backup of any other generation is refused
+///    ([`BackupError::Generation`]): the device tells the user there is no
+///    usable backup. The server cannot choose the generation.
+/// 3. The generation's backup key is derived, the wrapped key's version
+///    was checked when it was read ([`WrappedKey::from_bytes`]), and the
+///    key is unwrapped and the archives opened.
+/// 4. The result's `made` is the first archive's, which the wrap covers
+///    through its blob-ref: the device shows it, so that the user can
+///    notice an older backup.
+/// 5. The device shows the messages as restored from a backup, and their
+///    `verified` flags as the user's device's at the time.
 pub fn restore(
     recovery: &RecoveryKey,
     uid: &Identity,
+    generation: u32,
     backup: &Backup,
-    blob: &[u8],
-) -> Result<HistoryArchive, BackupError> {
+    fetch: impl FnMut(&BlobRef) -> Option<Vec<u8>>,
+) -> Result<OpenedTransfer, BackupError> {
+    if backup.generation != generation {
+        return Err(BackupError::Generation {
+            backup: backup.generation,
+            expected: generation,
+        });
+    }
     recovery
-        .backup_key(uid, backup.generation)
-        .restore(uid, backup, blob)
+        .backup_key(uid, generation)
+        .restore(uid, backup, fetch)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ArchivedConversation, ArchivedMessage};
+    use crate::archive::{ArchivedMessage, HistoryArchive};
     use crate::file::FileError;
     use crate::primitives::{hmac_sha384, sha384};
+    use std::collections::HashMap;
 
     fn alice() -> Identity {
         "alice@example.org".parse().unwrap()
@@ -517,13 +616,8 @@ mod tests {
             assert_eq!(key.generation(), generation);
         }
         let g0 = recovery.backup_key(&alice(), 0);
-        let g1 = recovery.next_backup_key(&alice(), &g0).unwrap();
-        assert_eq!(g1, recovery.backup_key(&alice(), 1));
+        let g1 = recovery.backup_key(&alice(), 1);
         assert_ne!(g0, g1);
-        assert_eq!(
-            recovery.next_backup_key(&alice(), &recovery.backup_key(&alice(), u32::MAX)),
-            None
-        );
         // Another uid or recovery key.
         let bob: Identity = "bob@example.org".parse().unwrap();
         assert_ne!(recovery.backup_key(&bob, 0).as_bytes(), g0.as_bytes());
@@ -549,13 +643,16 @@ mod tests {
         // A new nonce each time.
         assert_ne!(key.wrap(&alice(), &blob, &file_key).unwrap(), wrapped);
 
-        // The layout: nonce, then the key under the associated data.
+        // The layout: version, nonce, then the key under the associated
+        // data, which ends with the blob-ref text.
         let fixed = key.wrap_with_nonce(&alice(), &blob, &file_key, [7; 12]);
         let aad = format!("risala/1 backup alice@example.org 3 {blob}");
+        assert!(aad.ends_with(&format!(" 3 sha384:{}", hex(blob.as_bytes()))));
         let expected = seal(key.as_bytes(), &[7; 12], aad.as_bytes(), &[0x42; 32]);
-        assert_eq!(&fixed.as_bytes()[..12], &[7; 12]);
-        assert_eq!(&fixed.as_bytes()[12..], &expected[..]);
-        assert_eq!(fixed.as_bytes().len(), 60);
+        assert_eq!(fixed.as_bytes()[0], 1);
+        assert_eq!(&fixed.as_bytes()[1..13], &[7; 12]);
+        assert_eq!(&fixed.as_bytes()[13..], &expected[..]);
+        assert_eq!(fixed.as_bytes().len(), 61);
 
         // Another uid, blob, generation, key, or a flipped bit.
         let bob: Identity = "bob@example.org".parse().unwrap();
@@ -574,83 +671,156 @@ mod tests {
             other.unwrap(&alice(), &blob, &wrapped),
             Err(BackupError::Unwrap)
         );
-        for i in [0, 11, 12, 43, 44, 59] {
+        for i in [1, 12, 13, 44, 45, 60] {
             let mut bytes = *wrapped.as_bytes();
             bytes[i] ^= 1;
             assert_eq!(
-                key.unwrap(&alice(), &blob, &WrappedKey::from_bytes(bytes)),
+                key.unwrap(&alice(), &blob, &WrappedKey::from_bytes(&bytes).unwrap()),
                 Err(BackupError::Unwrap)
             );
         }
+        // Another version, or another length, does not read.
+        for version in [0, 2] {
+            let mut bytes = *wrapped.as_bytes();
+            bytes[0] = version;
+            assert_eq!(
+                WrappedKey::from_bytes(&bytes),
+                Err(BackupError::Version(version))
+            );
+            assert_eq!(
+                WrappedKey::from_base64(&BASE64.encode(bytes)),
+                Err(BackupError::Version(version))
+            );
+        }
+        assert_eq!(
+            WrappedKey::from_bytes(&wrapped.as_bytes()[..60]),
+            Err(BackupError::Length)
+        );
+        assert_eq!(
+            WrappedKey::from_bytes(&[&wrapped.as_bytes()[..], &[0]].concat()),
+            Err(BackupError::Length)
+        );
 
         // Text form.
         let text = wrapped.to_base64();
-        assert_eq!(text.len(), 80);
-        assert_eq!(WrappedKey::from_base64(&text), Some(wrapped));
-        assert_eq!(WrappedKey::from_base64(&text[..76]), None);
+        assert_eq!(text.len(), 84);
+        assert_eq!(WrappedKey::from_base64(&text), Ok(wrapped));
+        assert_eq!(
+            WrappedKey::from_base64(&text[..80]),
+            Err(BackupError::Length)
+        );
     }
 
-    fn archive() -> HistoryArchive {
-        HistoryArchive {
-            uid: alice(),
-            made: 1_762_600_000_000,
-            conversations: vec![ArchivedConversation {
-                group_id: vec![1; 32],
-                host: "example.org".parse().unwrap(),
-                mailbox: [2; 16],
-                messages: vec![ArchivedMessage {
-                    message_id: [3; 16],
+    fn conversations() -> Vec<ArchivedConversation> {
+        vec![ArchivedConversation {
+            group_id: vec![1; 32],
+            host: "example.org".parse().unwrap(),
+            mailbox: [2; 16],
+            messages: (1..=30)
+                .map(|seq| ArchivedMessage {
+                    message_id: [seq as u8; 16],
                     sender: "alice@example.org".parse().unwrap(),
+                    device_id: Some(crate::identity::DeviceId([4; 48])),
+                    counter: seq,
+                    previous: None,
                     verified: true,
                     sent: 1,
                     received: 2,
-                    seq: 3,
-                    content: b"TEXT hello".to_vec(),
-                }],
-            }],
-            more: vec![],
+                    seq,
+                    content: format!("TEXT hello {seq} {}", "x".repeat(100)).into_bytes(),
+                })
+                .collect(),
+        }]
+    }
+
+    const MADE: u64 = 1_762_600_000_000;
+
+    /// Makes a backup and gives it with a store of its blobs, the files'
+    /// included.
+    fn make(
+        key: &BackupKey,
+        files: Vec<(Vec<u8>, ArchivedFile)>,
+        max_blob: u64,
+    ) -> (Backup, BackupUpload, HashMap<[u8; 48], Vec<u8>>) {
+        let entries = files.iter().map(|(_, f)| f.clone()).collect();
+        let upload = key
+            .make_backup(&alice(), MADE, conversations(), entries, max_blob)
+            .unwrap();
+        let mut blobs: HashMap<[u8; 48], Vec<u8>> = upload
+            .archives
+            .iter()
+            .map(|b| (sha384(b), b.clone()))
+            .collect();
+        for (blob, _) in files {
+            blobs.insert(sha384(&blob), blob);
         }
+        (upload.backup, upload, blobs)
     }
 
     #[test]
     fn backups() {
         let recovery = RecoveryKey::from_bytes([0x11; 32]);
         let g0 = recovery.backup_key(&alice(), 0);
-        let (blob, backup) = g0.make_backup(&archive()).unwrap();
+        let (backup, upload, blobs) = make(&g0, vec![], 1 << 20);
+        let fetch = |h: &BlobRef| blobs.get(h.as_bytes()).cloned();
         assert_eq!(backup.generation, 0);
-        assert_eq!(backup.hash, BlobRef::of(&blob));
+        assert_eq!(upload.archives.len(), 1);
+        assert_eq!(backup.hash, BlobRef::of(&upload.archives[0]));
+        assert_eq!((backup.files, upload.list.as_ref()), (None, None));
 
-        // With the recovery key, or the device's backup key.
-        assert_eq!(restore(&recovery, &alice(), &backup, &blob), Ok(archive()));
-        assert_eq!(g0.restore(&alice(), &backup, &blob), Ok(archive()));
+        // With the recovery key and the generation from the log, or the
+        // device's backup key. `made` comes back to show.
+        let restored = restore(&recovery, &alice(), 0, &backup, fetch).unwrap();
+        assert_eq!(restored.conversations, conversations());
+        assert_eq!(restored.made, MADE);
+        assert_eq!(g0.restore(&alice(), &backup, fetch), Ok(restored.clone()));
 
-        // After a device is removed, the old key cannot read the new
-        // backup, and the next generation cannot read the old one.
-        let g1 = recovery.next_backup_key(&alice(), &g0).unwrap();
-        let (blob1, backup1) = g1.make_backup(&archive()).unwrap();
-        assert_eq!(backup1.generation, 1);
+        // A device removed: the log says generation 1. The old backup is
+        // refused, whatever key opens it.
+        let g1 = recovery.backup_key(&alice(), 1);
+        let (backup1, _, blobs1) = make(&g1, vec![], 1 << 20);
+        let fetch1 = |h: &BlobRef| blobs1.get(h.as_bytes()).cloned();
         assert_eq!(
-            g0.restore(&alice(), &backup1, &blob1),
-            Err(BackupError::Generation { backup: 1, key: 0 })
+            restore(&recovery, &alice(), 1, &backup, fetch),
+            Err(BackupError::Generation {
+                backup: 0,
+                expected: 1
+            })
         );
         assert_eq!(
-            restore(&recovery, &alice(), &backup1, &blob1),
-            Ok(archive())
+            g0.restore(&alice(), &backup1, fetch1),
+            Err(BackupError::Generation {
+                backup: 1,
+                expected: 0
+            })
         );
-        // A backup that claims another generation does not unwrap.
+        assert_eq!(
+            restore(&recovery, &alice(), 1, &backup1, fetch1).map(|r| r.made),
+            Ok(MADE)
+        );
+        // A backup that claims the log's generation but was wrapped under
+        // another does not unwrap: the generation is in the associated
+        // data.
         let relabelled = Backup {
             generation: 1,
             ..backup
         };
         assert_eq!(
-            restore(&recovery, &alice(), &relabelled, &blob),
+            restore(&recovery, &alice(), 1, &relabelled, fetch),
             Err(BackupError::Unwrap)
         );
 
         // A swapped blob fails its hash; a hash swapped with it fails the
-        // unwrap, since the hash is in the associated data.
+        // unwrap, since the blob-ref is in the associated data.
+        let swapped_blob = |h: &BlobRef| {
+            if h == &backup.hash {
+                blobs1.get(backup1.hash.as_bytes()).cloned()
+            } else {
+                None
+            }
+        };
         assert_eq!(
-            restore(&recovery, &alice(), &backup, &blob1),
+            restore(&recovery, &alice(), 0, &backup, swapped_blob),
             Err(BackupError::Archive(ArchiveError::File(FileError::Hash)))
         );
         let swapped = Backup {
@@ -658,27 +828,38 @@ mod tests {
             ..backup
         };
         assert_eq!(
-            restore(&recovery, &alice(), &swapped, &blob1),
+            restore(&recovery, &alice(), 0, &swapped, fetch1),
             Err(BackupError::Unwrap)
+        );
+        // The first archive missing.
+        assert_eq!(
+            restore(&recovery, &alice(), 0, &backup, |_| None),
+            Err(BackupError::Archive(ArchiveError::Missing))
         );
         // Another identity's recovery key or uid.
         let bob: Identity = "bob@example.org".parse().unwrap();
         assert_eq!(
-            restore(&recovery, &bob, &backup, &blob),
+            restore(&recovery, &bob, 0, &backup, fetch),
             Err(BackupError::Unwrap)
         );
         assert_eq!(
             restore(
                 &RecoveryKey::from_bytes([0x12; 32]),
                 &alice(),
+                0,
                 &backup,
-                &blob
+                fetch
             ),
             Err(BackupError::Unwrap)
         );
         // An archive of another identity, wrapped for this one.
-        let mut theirs = archive();
-        theirs.uid = bob.clone();
+        let theirs = HistoryArchive {
+            uid: bob.clone(),
+            made: MADE,
+            conversations: conversations(),
+            files: vec![],
+            more: vec![],
+        };
         let sealed = theirs.seal().unwrap();
         let backup = Backup {
             generation: 0,
@@ -686,11 +867,51 @@ mod tests {
             key: g0
                 .wrap(&alice(), &sealed.transfer.blob, &sealed.transfer.key)
                 .unwrap(),
+            files: None,
         };
         assert_eq!(
-            g0.restore(&alice(), &backup, &sealed.blob),
+            g0.restore(&alice(), &backup, |_| Some(sealed.blob.clone())),
             Err(BackupError::Archive(ArchiveError::OtherIdentity))
         );
+    }
+
+    /// A backup split over several archives, with files: the list names
+    /// every other blob, and restoring gives back the files.
+    #[test]
+    fn split_backups_with_files() {
+        let g2 = RecoveryKey::from_bytes([0x11; 32]).backup_key(&alice(), 2);
+        let files: Vec<(Vec<u8>, ArchivedFile)> = (0..3u8)
+            .map(|i| ArchivedFile::encrypt(BlobRef::of(&[i]), &[i; 300]).unwrap())
+            .collect();
+        let (backup, upload, blobs) = make(&g2, files.clone(), 2048);
+        assert!(upload.archives.len() > 2);
+        let list = upload.list.as_ref().unwrap();
+        assert_eq!(backup.files, Some(BlobRef::of(list)));
+        let named = read_list(list).unwrap();
+        let expected: Vec<BlobRef> = upload.archives[1..]
+            .iter()
+            .map(|b| BlobRef::of(b))
+            .chain(files.iter().map(|(_, f)| f.blob))
+            .collect();
+        assert_eq!(named, expected);
+
+        let restored = g2
+            .restore(&alice(), &backup, |h| blobs.get(h.as_bytes()).cloned())
+            .unwrap();
+        assert_eq!(restored.conversations, conversations());
+        assert_eq!((restored.made, restored.missing), (MADE, 0));
+        assert_eq!(restored.files.len(), 3);
+        for (entry, (_, original)) in restored.files.iter().zip(&files) {
+            assert_eq!(entry, original);
+            let blob = &blobs[entry.blob.as_bytes()];
+            assert_eq!(entry.decrypt(blob).unwrap().len(), 300);
+        }
+
+        // Lists of other lengths are not lists.
+        assert_eq!(read_list(&[]), Some(vec![]));
+        assert_eq!(read_list(&[0; 47]), None);
+        assert_eq!(read_list(&[0; 97]), None);
+        assert_eq!(read_list(&[0; 96]).map(|l| l.len()), Some(2));
     }
 
     /// Fixed-input vectors for Appendix B.
@@ -701,6 +922,7 @@ mod tests {
         let g1 = recovery.backup_key(&alice(), 1);
         let blob = BlobRef::of(b"backup");
         let file_key = FileKey::from_bytes(std::array::from_fn(|i| 0x40 + i as u8));
+        let g3 = recovery.backup_key(&alice(), 3);
         let wrapped = g0.wrap_with_nonce(
             &alice(),
             &blob,
@@ -712,8 +934,10 @@ mod tests {
         println!("uid             alice@example.org");
         println!("backup key g=0  {}", hex(g0.as_bytes()));
         println!("backup key g=1  {}", hex(g1.as_bytes()));
+        println!("backup key g=3  {}", hex(g3.as_bytes()));
         println!("blob-ref        {blob}");
         println!("file key        {}", hex(file_key.as_bytes()));
+        println!("wrap aad        risala/1 backup alice@example.org 0 {blob}");
         println!("wrapped (g=0)   {}", hex(wrapped.as_bytes()));
         println!("wrapped base64  {}", wrapped.to_base64());
         assert_eq!(hex(&sha384(b"backup")), hex(blob.as_bytes()));
@@ -721,6 +945,7 @@ mod tests {
             [
                 hex(g0.as_bytes()),
                 hex(g1.as_bytes()),
+                hex(g3.as_bytes()),
                 hex(wrapped.as_bytes()),
                 recovery.to_display().to_string(),
             ],
@@ -728,11 +953,14 @@ mod tests {
         );
     }
 
-    const BACKUP_VECTOR: [&str; 4] = [
+    // The backup keys and the recovery text are unchanged from M4: only
+    // the wrapped key gained its version byte.
+    const BACKUP_VECTOR: [&str; 5] = [
         "bf567b1a74771d13e35f3428b382fe18ae35a8352a7b2b7eff120c991b5fab3d",
         "dab608fa392ada87879cb614886bdf24c06ba42d79bbb73b55dbe4037b255bb3",
-        "a0a1a2a3a4a5a6a7a8a9aaab6d97c6f02c7c3b1131a3e629e03523ef22fba8da\
-         bdc18677cb9b30be712ffb6f6ba6efbd70e20f7e0e0eebf3a7a7c97a",
+        "8ff5d23bd7c76d43e7fd34e2eda98546e3164ce8e7b7ecc8c8e5173695a2c46c",
+        "01a0a1a2a3a4a5a6a7a8a9aaab6d97c6f02c7c3b1131a3e629e03523ef22fba8\
+         dabdc18677cb9b30be712ffb6f6ba6efbd70e20f7e0e0eebf3a7a7c97a",
         "aaaq eaye auda ocaj bifq ydio b4ib ceqt cqkr mfyy denb wha5 dypq",
     ];
 }

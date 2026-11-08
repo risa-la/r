@@ -62,17 +62,24 @@ pub use openmls_traits;
 
 pub use aad::{Pseudonym, RisalaAad};
 pub use archive::{
-    ArchiveError, ArchivedConversation, ArchivedMessage, HistoryArchive, SealedArchive,
-    TransferRef, seal_transfer,
+    ArchiveError, ArchivedConversation, ArchivedFile, ArchivedMessage, HistoryArchive,
+    OpenedTransfer, SealedArchive, TransferRef, open_transfer, seal_transfer,
 };
-pub use backup::{Backup, BackupError, BackupKey, RecoveryKey, RecoveryKeyError, WrappedKey};
+pub use backup::{
+    Backup, BackupError, BackupKey, BackupUpload, RecoveryKey, RecoveryKeyError, WrappedKey,
+};
 pub use binding::DeviceBinding;
 pub use conversation::{ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto};
-pub use file::{BlobRef, BlobRefError, Decryptor, EncryptedFile, Encryptor, FileError, FileKey};
+pub use file::{
+    BlobRef, BlobRefError, Decryptor, EncryptedFile, Encryptor, FileError, FileKey, Label,
+};
 pub use identity::{DeviceId, RisalaIdentity};
 pub use mldsa::{LeafKey, SigningKey};
-pub use pairing::{IdentityBundle, PairingCode, PairingError, PairingSecret, Relay, RelayId};
+pub use pairing::{
+    DeviceKeys, IdentityBundle, NewDevice, NewDeviceContent, PairingCode, PairingError, PairingKey,
+    PairingSecret, Relay, RelayId, SealedBundle,
+};
 pub use profile::RisalaProfile;
 pub use token::SendToken;
 
