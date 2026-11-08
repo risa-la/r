@@ -46,6 +46,11 @@ New features and bug fixes come with tests. A bug fix gets a test that
 fails without it. The risala-proto tests parse every example line in
 the spec, so a change to the protocol updates its examples too.
 
+The site's [verification page](https://risa.la/verification) shows, line
+by line, what the tests, fuzzing, Kani proofs and TLA+ models reach.
+[`verification/`](verification/README.md) holds the tools behind it and
+says how to run them locally.
+
 ### Commits
 
 - Start the subject with the part it changes, then say what changed in

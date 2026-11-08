@@ -212,7 +212,11 @@ across the FFI boundary.
   risala-pow's JIT against its interpreter on x86-64, ARM and macOS
   runners, and a smoke test that starts `risalad` and talks to it through
   `openssl s_client`. Once connecting needs proof of work (item 42), the
-  smoke test talks through `risala-cli` instead.
+  smoke test talks through `risala-cli` instead. A separate Verification
+  workflow, on pushes to main and nightly, collects test coverage, the
+  fuzz corpora's coverage, Kani and TLC results for the site's
+  verification page (`verification/`); the nightly run also fuzzes each
+  target for 10 minutes.
 
 ## 4. Milestones
 
@@ -2557,3 +2561,67 @@ Open:
     for apt and dnf, and a Nix binary cache.
   - **No AppImage.** It would still need systemd 256 and a TPM, so it
     reaches few more machines, and it has no signed update path.
+- **Verification page**, decided with the user on 2026-11-08: the site
+  gets a source listing that shows, on each line, every kind of
+  evidence at once: tests, fuzzing, Kani, and TLA+ where a line is tied
+  to a spec section the model covers.
+  - **How a line shows it:** one narrow coloured column per kind of
+    evidence beside the line number, so they read side by side, and the
+    line's background tinted by the strongest one. Lines nothing reaches
+    are tinted red. Hovering a line names the tests' hit count, the fuzz
+    targets and the Kani proofs that reach it.
+  - **Where the results come from:** a `verification` workflow runs on
+    pushes to main and nightly, and uploads the results as JSON. The
+    site build downloads the latest copy; it never runs the tools
+    itself.
+  - **What it covers:** every Rust crate except the vendored
+    `openmls-traits`, and the Swift client through xccov on a macOS
+    runner.
+  - **Fuzz corpus:** kept out of git, in the CI cache, and grown by the
+    nightly run. The page states how long each target has been fuzzed.
+  - **Rendering:** a client-side React app at `/verification`, with the
+    file listings under `/verification/src/<path>`. The site build
+    copies the sources and the results JSON into the output as static
+    files. The app fetches them and highlights the code in the browser,
+    so the site gains `@astrojs/react` and a browser build of a
+    highlighter. Without JavaScript, the page shows nothing.
+  - **Kani column:** Kani's unstable source-coverage mode gives the
+    exact lines each proof reaches. Where that mode fails, on our Kani
+    version or in the JIT crates, a proof marks the whole of each
+    function it calls, and the page labels those marks function-level.
+  - **TLA+ column:** a line is marked when it lies in a function whose
+    comments cite a spec section the model covers, such as (7.1). The
+    mark says the model checks the spec, not this code.
+  - **More choices**, decided with the user on 2026-11-08:
+    - Shiki highlights in the browser, with the JavaScript regex engine
+      and only the grammars and themes the listing uses, loaded on
+      demand.
+    - Tests are two columns: unit tests (in `src/`, property tests
+      included) and integration tests (`tests/`, the spec example and
+      transcript tests included).
+    - Kani was to join the dev shell, but nixpkgs does not package it,
+      so it is installed with cargo, pinned to 0.68.0, locally and in
+      CI (`verification/README.md`). cargo-llvm-cov joins the dev
+      shell, but coverage builds use a rustup toolchain: nixpkgs' rustc
+      ships a coverage runtime from a newer LLVM than its own, and the
+      instrumented test binaries crash on exit.
+    - The Swift client's coverage comes from a macOS CI job. Its
+      converter is tested against a small hand-made xccov sample.
+    - With no results for a commit, the site still builds, and the page
+      says so in a banner.
+    - The nightly run fuzzes each target for 10 minutes.
+    - A spec view at `/verification/spec` lists each section with the
+      evidence for it: tested example lines, the TLA+ model, Kani
+      proofs that restate its rules, and the code that cites it.
+    - Test code (`tests/`, `#[cfg(test)]` modules, fuzz targets, Kani
+      proofs) is listed but left out of the percentages.
+    - The site's navigation links the page, and the front page shows a
+      summary of its numbers.
+    - Made while building it: the code still cites draft-02's section
+      numbers, so the spec view has a tab per draft. Draft-02's text
+      comes from git (`4634b6ff:SPEC.md`), and code citations, Kani
+      proofs and the TLA+ model are matched against it. Draft-03's
+      tab counts the example lines the spec tests read. When the code
+      moves to draft-03, change `verification/config.json`.
+    - Kani 0.68.0's coverage mode gives line coverage for all 40
+      proofs, so no proof falls back to function-level marks today.
