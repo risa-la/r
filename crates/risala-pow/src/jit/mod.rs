@@ -44,6 +44,27 @@ pub(crate) const BUILT: bool = cfg!(all(
 ))]
 #[allow(unsafe_code)]
 mod exec;
+
+/// Why the system last refused JIT memory, where that is recorded (macOS
+/// on Apple Silicon), for tests that expected the JIT to run.
+#[cfg(test)]
+pub(crate) fn last_failure() -> Option<std::string::String> {
+    #[cfg(all(
+        feature = "jit",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    ))]
+    return exec::last_failure();
+    #[cfg(not(all(
+        feature = "jit",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "android", target_os = "macos")
+    )))]
+    None
+}
+
 #[cfg(all(
     feature = "jit",
     target_endian = "little",

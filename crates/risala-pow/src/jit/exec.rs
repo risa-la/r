@@ -4,8 +4,8 @@
 //! keeps the instruction cache coherent, and calls it. W^X holds by type:
 //! a buffer is either a [`Writable`] or an [`Executable`], and changing
 //! one into the other consumes it. There is one mapping per buffer and no
-//! alias of it, writable or otherwise. Each buffer has a guard page on
-//! either side, mapped with no access.
+//! alias of it, writable or otherwise. Each buffer has a guard page with
+//! no access on either side.
 //!
 //! How a buffer changes between the two depends on the system:
 //!
@@ -17,8 +17,9 @@
 //!   runtime requires (with the `com.apple.security.cs.allow-jit`
 //!   entitlement) before it lets memory become executable.
 //! - macOS on Apple Silicon: the hardened runtime refuses `mprotect` to
-//!   executable, and `MAP_JIT` memory is not meant to change protection.
-//!   Instead the buffer is mapped once with `MAP_JIT`, and the system
+//!   executable. Instead the buffer, guard pages included, is mapped once
+//!   with `MAP_JIT` wherever the system puts it, and the guard pages then
+//!   lose all access. The code pages never change protection: the system
 //!   keeps a per-thread switch (`pthread_jit_write_protect_np`): a thread
 //!   sees every `MAP_JIT` page either writable and not executable, or
 //!   executable and not writable. Threads start on the second. Only
@@ -50,6 +51,36 @@ use std::sync::OnceLock;
 use super::arch;
 use crate::hash::SCRATCHPAD_LEN;
 use crate::program::{PROGRAM_COUNT, Program};
+
+/// Why mapping JIT memory last failed, kept in test builds only, so a
+/// test that expects the JIT can say why it fell back.
+#[cfg(test)]
+static LAST_FAILURE: std::sync::Mutex<Option<std::string::String>> = std::sync::Mutex::new(None);
+
+/// Why mapping JIT memory last failed, if it has. Always `None` outside
+/// macOS on Apple Silicon, which is the only system that records it.
+#[cfg(test)]
+pub(crate) fn last_failure() -> Option<std::string::String> {
+    LAST_FAILURE.lock().ok()?.clone()
+}
+
+/// Records why mapping failed, in test builds.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn note(what: &str) {
+    #[cfg(test)]
+    if let Ok(mut last) = LAST_FAILURE.lock() {
+        *last = Some(what.into());
+    }
+    let _ = what;
+}
+
+/// Records why mapping failed, with the system's error, in test builds.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn note_error(what: &str, e: &io::Error) {
+    #[cfg(test)]
+    note(&std::format!("{what}: {e}"));
+    let _ = (what, e);
+}
 
 /// The system's page size, asked once: 4 KiB on x86-64, and 4, 16 or
 /// 64 KiB on aarch64, depending on the kernel (16 KiB on Apple Silicon).
@@ -145,67 +176,61 @@ impl Mapping {
         Ok(mapping)
     }
 
-    /// Maps the guard pages with no access, and between them the code
-    /// pages with `MAP_JIT`, read-write-execute: each thread then sees
-    /// them as its write switch says.
+    /// Maps the guard pages and the code pages as one `MAP_JIT` mapping,
+    /// read-write-execute, then takes all access away from its first and
+    /// last page, the guard pages. Each thread sees the code pages as its
+    /// write switch says.
     ///
-    /// `MAP_JIT` memory is not meant to change protection, so the guard
-    /// pages are kept out of it. The whole range is first reserved with no
-    /// access, then the middle is unmapped and mapped again with
-    /// `MAP_JIT`, asking for the same place. If another thread took the
-    /// hole meanwhile, the system puts the code elsewhere; then only this
-    /// function's own pieces are unmapped (never the hole, which is no
-    /// longer ours), this fails, and the next function tries again.
+    /// The system places `MAP_JIT` memory itself, at a random address on
+    /// Apple Silicon, so the guard pages cannot be separate mappings
+    /// placed around it: they are part of it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn new() -> io::Result<Mapping> {
         // SAFETY: only reads whether this system has the per-thread switch.
         if unsafe { libc::pthread_jit_write_protect_supported_np() } == 0 {
+            note("pthread_jit_write_protect_supported_np() is 0");
             return Err(io::Error::from_raw_os_error(libc::EPERM));
         }
         let page = page_size();
         let code_len = arch::CODE_CAPACITY.next_multiple_of(page);
         let total = code_len + 2 * page;
-        let start = map(core::ptr::null_mut(), total, libc::PROT_NONE, 0)?;
-        let want = start.as_ptr().wrapping_add(page);
-        let after = want.wrapping_add(code_len);
-        // SAFETY: the code pages lie inside the reservation just made,
-        // which nothing else knows of.
-        if unsafe { libc::munmap(want.cast(), code_len) } != 0 {
-            let e = io::Error::last_os_error();
-            // SAFETY: the reservation is still whole, and still ours alone.
-            unsafe { libc::munmap(start.as_ptr().cast(), total) };
-            return Err(e);
-        }
         let prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-        let result = map(want, code_len, prot, MAP_JIT);
-        if let Ok(got) = result
-            && got.as_ptr() == want
-        {
-            // The three mappings are contiguous, and dropping the
-            // `Mapping` unmaps them all.
-            return Ok(Mapping {
-                start,
-                page,
-                code_len,
-            });
-        }
-        // SAFETY: unmaps the two guard pages, which are still this
-        // function's own: the hole between them may now be another's.
-        unsafe { libc::munmap(start.as_ptr().cast(), page) };
-        // SAFETY: as above, the second guard page.
-        unsafe { libc::munmap(after.cast(), page) };
-        match result {
-            Ok(got) => {
-                // SAFETY: unmaps exactly the mapping just made, elsewhere.
-                unsafe { libc::munmap(got.as_ptr().cast(), code_len) };
-                Err(io::Error::other("MAP_JIT memory went elsewhere"))
+        let start = match map(core::ptr::null_mut(), total, prot, MAP_JIT) {
+            Ok(start) => start,
+            Err(e) => {
+                note_error("mmap MAP_JIT", &e);
+                // Only running out of memory is worth trying again; any
+                // other error means this process gets no JIT memory (no
+                // allow-jit entitlement under the hardened runtime).
+                return Err(if e.raw_os_error() == Some(libc::ENOMEM) {
+                    e
+                } else {
+                    io::Error::from_raw_os_error(libc::EPERM)
+                });
             }
-            // The system does not give this process JIT memory (no
-            // allow-jit entitlement under the hardened runtime). Only
-            // running out of memory is worth trying again.
-            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => Err(e),
-            Err(_) => Err(io::Error::from_raw_os_error(libc::EPERM)),
+        };
+        // From here, dropping the `Mapping` unmaps all of it.
+        let mapping = Mapping {
+            start,
+            page,
+            code_len,
+        };
+        for guard in [
+            mapping.start.as_ptr(),
+            mapping.code().wrapping_add(code_len),
+        ] {
+            // SAFETY: changes only a page of the mapping just made, which
+            // nothing else knows of: its first page or its last.
+            if unsafe { libc::mprotect(guard.cast(), page, libc::PROT_NONE) } != 0 {
+                note_error(
+                    "mprotect of a MAP_JIT guard page",
+                    &io::Error::last_os_error(),
+                );
+                // Without guard pages the JIT is not used.
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
         }
+        Ok(mapping)
     }
 
     /// The first byte of code, after the first guard page.

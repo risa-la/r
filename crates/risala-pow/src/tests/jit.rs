@@ -32,7 +32,12 @@ fn jit(seed: &[u8; 32]) -> HashWx {
     } else {
         Backend::Interpreter
     };
-    assert_eq!(f.backend(), want);
+    assert_eq!(
+        f.backend(),
+        want,
+        "last JIT memory failure: {:?}",
+        crate::jit::last_failure()
+    );
     f
 }
 
@@ -100,7 +105,12 @@ const _: () = {
 #[test]
 fn jit_runs_where_supported() {
     if jit_expected() {
-        assert_eq!(Backend::best_available(), Backend::Jit);
+        assert_eq!(
+            Backend::best_available(),
+            Backend::Jit,
+            "last JIT memory failure: {:?}",
+            crate::jit::last_failure()
+        );
         assert_eq!(HashWx::new(&[0; 32]).backend(), Backend::Jit);
     } else {
         assert_eq!(Backend::best_available(), Backend::Interpreter);
