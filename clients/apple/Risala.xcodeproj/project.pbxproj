@@ -47,6 +47,11 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
+		A1C000000000000000000033 /* Development */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Development;
+			sourceTree = "<group>";
+		};
 		A1C000000000000000000032 /* Tests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Tests;
@@ -75,6 +80,7 @@
 		A1C000000000000000000002 = {
 			isa = PBXGroup;
 			children = (
+				A1C000000000000000000033 /* Development */,
 				A1C000000000000000000031 /* Resources */,
 				A1C000000000000000000030 /* Sources */,
 				A1C000000000000000000032 /* Tests */,
@@ -107,6 +113,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
+				A1C000000000000000000033 /* Development */,
 				A1C000000000000000000031 /* Resources */,
 				A1C000000000000000000030 /* Sources */,
 			);
@@ -275,6 +282,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_ASSET_PATHS = Development;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -314,6 +322,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_ASSET_PATHS = Development;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;

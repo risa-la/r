@@ -53,6 +53,21 @@ xcrun swift-format format --in-place --recursive Sources Tests
 xcrun swift-format lint --strict --recursive Sources Tests
 ```
 
+## Development data
+
+`Development/` holds `PreviewChatClient`, an in-memory library with fixed
+scenarios after the Paper mockups (`busy`, `worstCase`, `arabic`, `many`, `empty`,
+`loading`, `failed`). It is compiled only in Debug builds. SwiftUI previews use it,
+and a Debug build launched with `-RisalaPreview <scenario>` runs on it instead of
+librisala, for checking a screen in the simulator without a server:
+
+```sh
+xcrun simctl launch booted la.risa.apple -RisalaPreview worstCase
+```
+
+For real data, run the development server from the repository root
+(`nix run .#dev -- busy`; see the root README).
+
 ## Manual UI checks
 
 Set the scheme's Run > Options > App Language to English or Arabic. Check RTL
@@ -100,7 +115,7 @@ binding signatures.
 
 | Capability | Required behavior at the Apple adapter boundary |
 | --- | --- |
-| Initial rooms | Return local room summaries without waiting for connection/authentication/sync, then each changed room list (joins, parts, new conversations). Distinguish no cached rooms from unavailable or failed storage. Paginate large room collections. Room IDs identify the account too. |
+| Initial chats | Return the first page of local chat summaries for a filter, newest activity first, without waiting for connection/authentication/sync, then index changes to that window as for the timeline; more rows through the subscription. Report unread and matching counts. Distinguish no cached chats from unavailable or failed storage. Chat IDs identify the account too. |
 | Initial timeline | Read a bounded recent window for the selected room. Start with a requested limit of 50; the library enforces a maximum. Report whether the window reaches the start of the conversation's history. |
 | Older messages | Fetch only when requested, through the timeline subscription; older items arrive as its changes. Preserve library-provided ordering and stable identifiers, including an outgoing message's ID once the server stores it; do not rebuild history or generate replacement IDs in Swift. |
 | Live updates | Provide an ordered snapshot plus subsequent batches of index changes (reset, insert, update, remove) without a subscription gap. Edits, deletions, reactions, and history filled in mid-timeline arrive as such changes. Bound buffering; reset when a consumer falls behind or a reconnect may have missed changes. A batch that does not fit makes the client subscribe again. |
@@ -110,7 +125,7 @@ binding signatures.
 | Execution | No blocking storage/FFI work on MainActor. Async APIs must actually suspend or execute work on the library executor; async syntax alone is insufficient. |
 | Shared lifetime | One library session per account/server context, shared across windows. Each window owns its navigation, presentation, and subscriptions. |
 
-Startup order: show native navigation, obtain cached room summaries, restore a
+Startup order: show native navigation, obtain cached chat summaries, restore a
 valid selection and load its recent page, then apply synchronization updates.
 Network connection may start concurrently but must never gate cached content.
 An empty cache should still leave the shell responsive. If migrations or storage
