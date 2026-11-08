@@ -299,9 +299,11 @@ impl SyncEngine {
         self.convs.get(conv).is_some_and(|l| l.confirmed.is_some())
     }
 
-    /// Whether any request is still waiting for its reply.
+    /// Whether any request is still waiting for its reply, or a key file
+    /// asked for in [`Output::key_files`] has not been handed back yet:
+    /// the encryption engine may still have something to send (12.12).
     pub fn is_busy(&self) -> bool {
-        !self.pending.is_empty()
+        !self.pending.is_empty() || self.fetching_key_files()
     }
 
     /// Starts syncing: sends SYNC (7.1 step 1), and settles outbox entries

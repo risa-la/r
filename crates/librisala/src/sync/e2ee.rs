@@ -1396,6 +1396,11 @@ impl SyncEngine {
         self.check_keys(uids)
     }
 
+    /// Whether a key file asked for has not been handed back yet.
+    pub(super) fn fetching_key_files(&self) -> bool {
+        self.e2ee.as_ref().is_some_and(|e| !e.fetching.is_empty())
+    }
+
     fn fetch_key_file(&mut self, uid: &Uid) {
         if self.e2().fetching.insert(uid.clone()) {
             self.out.key_files.push(uid.clone());

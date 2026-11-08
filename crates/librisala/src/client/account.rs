@@ -609,13 +609,15 @@ impl Account {
     }
 
     /// Whether the account is signed in and has caught up: the sync engine
-    /// has nothing in flight. See [`wait_synced`](Self::wait_synced).
+    /// has nothing in flight, commands or key files being fetched. See
+    /// [`wait_synced`](Self::wait_synced).
     pub fn is_synced(&self) -> bool {
         self.state().is_online() && self.shared.synced.borrow().idle
     }
 
     /// Waits until the account is signed in and has caught up: the sync
-    /// engine has nothing in flight. Fails if the account stops, or fails
+    /// engine has nothing in flight, commands or key files being fetched
+    /// (12.12). Fails if the account stops, or fails
     /// for good.
     pub async fn wait_synced(&self) -> Result<(), ClientError> {
         let mut synced = self.shared.synced.subscribe();
