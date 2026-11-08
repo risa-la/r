@@ -332,34 +332,38 @@ async fn mute_and_unmute_any_mailbox() {
     let mut h = Harness::new();
     let mut op = h.signed_in_as("op@example.org");
     let mailbox = add_mailbox(&h, 1);
+    let room = add_room(&h, "#general", 2, "write", "", &[]);
     let pseudonym = risala_proto::mls::Pseudonym::from_bytes([6; 16]);
     let unknown = BoxName::from_bytes([9; 16]);
+    let until = |h: &Harness, b: &BoxName| -> i64 {
+        h.store
+            .raw()
+            .query_row(
+                "SELECT until FROM mutes WHERE box = ?",
+                [&b.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
     h.send(&op, &format!("ADMIN MUTE {mailbox} {pseudonym} hours=3"))
         .await;
     h.send(&op, &format!("ADMIN MUTE {unknown} {pseudonym}"))
         .await;
     assert_eq!(op.lines(), ["OK", "ERR not-found"]);
-    let until: i64 = h
-        .store
-        .raw()
-        .query_row("SELECT until FROM mutes", [], |r| r.get(0))
-        .unwrap();
     // 12:00 plus 3 hours.
-    assert_eq!(until, 1_794_236_400_000);
-    // The default, 24 hours, stops at the end of the period (6.4).
+    assert_eq!(until(&h, &mailbox), 1_794_236_400_000);
+    // The default is 24 hours; in a public room, which is epochal, it
+    // stops at the end of the period (6.4, 10.4).
     h.send(&op, &format!("ADMIN MUTE {mailbox} {pseudonym}"))
         .await;
-    let until: i64 = h
-        .store
-        .raw()
-        .query_row("SELECT until FROM mutes", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(until, 1_794_268_800_000);
+    h.send(&op, &format!("ADMIN MUTE {room} {pseudonym}")).await;
+    assert_eq!(until(&h, &mailbox), 1_794_312_000_000);
+    assert_eq!(until(&h, &room), 1_794_268_800_000);
     h.send(&op, &format!("ADMIN UNMUTE {mailbox} {pseudonym}"))
         .await;
     h.send(&op, &format!("ADMIN UNMUTE {mailbox} {pseudonym}"))
         .await;
-    assert_eq!(op.lines(), ["OK", "OK", "ERR not-found"]);
+    assert_eq!(op.lines(), ["OK", "OK", "OK", "ERR not-found"]);
 }
 
 #[tokio::test]

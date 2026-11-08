@@ -462,23 +462,32 @@ fn end_of_period(now: Timestamp) -> Timestamp {
     Timestamp::from_unix_millis((ms / DAY_MS + 1) * DAY_MS).unwrap_or(Timestamp::MAX)
 }
 
-/// When a mute made at `now` for `hours` ends (6.4): after the hours, 24 by
-/// default, and at the end of the current period at the latest.
-pub(crate) fn mute_until(now: Timestamp, hours: Option<NonZeroU64>) -> Timestamp {
+/// When a mute made at `now` for `hours` ends (6.4, 10.4): after the
+/// hours, 24 by default, and in an epochal group at the end of the current
+/// period at the latest.
+pub(crate) fn mute_until(now: Timestamp, hours: Option<NonZeroU64>, epochal: bool) -> Timestamp {
     let hours = hours.map_or(DEFAULT_MUTE_HOURS, NonZeroU64::get);
     let after = now
         .checked_add(Duration::from_secs(hours.saturating_mul(3600)))
         .unwrap_or(Timestamp::MAX);
-    after.min(end_of_period(now))
+    if epochal {
+        after.min(end_of_period(now))
+    } else {
+        after
+    }
 }
 
 /// `ADMIN MUTE <box> <pseudonym> [hours=<n>]` (10.4): MUTE (6.4) for any
 /// mailbox.
 async fn mute(cx: &Cx, mailbox: BoxName, pseudonym: Pseudonym, hours: Option<NonZeroU64>) -> Reply {
-    // 6.4 limits a mute to the current period, since a public room's
-    // pseudonyms last one period (7.3). 10.4 says ADMIN MUTE works like
-    // MUTE, so the same limit applies to every mailbox.
-    let until = mute_until(cx.inner.now(), hours);
+    let Some(record) = cx.db(move |store| store.mailbox(&mailbox)).await? else {
+        return Err(err(ErrorCode::NotFound));
+    };
+    // A mute ends with the period only in a group whose `confirm` is
+    // `epochal` (10.4). The server can read `confirm` only in public
+    // rooms, which are always epochal (6.1); in any other mailbox the mute
+    // lasts its hours.
+    let until = mute_until(cx.inner.now(), hours, record.room.is_some());
     if !cx
         .db(move |store| store.set_mute(&mailbox, &pseudonym, until))
         .await?
@@ -563,21 +572,26 @@ mod tests {
     }
 
     #[test]
-    fn mutes_end_with_the_period() {
+    fn mutes_end_with_the_period_in_epochal_groups() {
         let now = t("2026-11-09T12:00:00.000Z");
-        assert_eq!(mute_until(now, None), t("2026-11-10T00:00:00.000Z"));
+        assert_eq!(mute_until(now, None, true), t("2026-11-10T00:00:00.000Z"));
+        assert_eq!(mute_until(now, None, false), t("2026-11-10T12:00:00.000Z"));
         assert_eq!(
-            mute_until(now, NonZeroU64::new(3)),
+            mute_until(now, NonZeroU64::new(3), true),
             t("2026-11-09T15:00:00.000Z")
         );
         let late = t("2026-11-09T23:59:59.999Z");
         assert_eq!(
-            mute_until(late, NonZeroU64::new(1)),
+            mute_until(late, NonZeroU64::new(1), true),
             t("2026-11-10T00:00:00.000Z")
         );
         assert_eq!(
-            mute_until(now, NonZeroU64::new(u64::MAX)),
+            mute_until(now, NonZeroU64::new(u64::MAX), true),
             t("2026-11-10T00:00:00.000Z")
+        );
+        assert_eq!(
+            mute_until(now, NonZeroU64::new(u64::MAX), false),
+            Timestamp::MAX
         );
     }
 
