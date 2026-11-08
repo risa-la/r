@@ -215,16 +215,16 @@ four writing code at once.
 
 ### C. librisala and `risala-cli`
 
-- [~] **C0. Scaffold.** New store (schema version 1), the signed-in
+- [x] **C0. Scaffold.** New store (schema version 1), the signed-in
   connection plus anonymous connections for posting and fetching, the
   client API's shape, module stubs per area below. Needs P1.
-- [ ] **C1. Identity** (4.3-4.9, 12.14): creating an identity with its
+- [~] **C1. Identity** (4.3-4.9, 12.14): creating an identity with its
   recovery key, the key file chain, verifying records against the key
   log (witness policy, proofs from tiles, consistency, forks, daily
   watching, RECORD/ALERT), pairing by QR text, recovery, removing a
   device, safety numbers, pins on master keys and logs. Needs C0, P2,
   P3.
-- [ ] **C2. Conversations** (5, 6, 7, 12.6-12.9): the group engine on
+- [~] **C2. Conversations** (5, 6, 7, 12.6-12.9): the group engine on
   mailboxes, posting with tokens and pseudonyms, first valid commit
   wins, Welcomes, membership and roles in the group, PART, deletes,
   gaps, profiles, topics, typing and read markers, blocks, guests in
