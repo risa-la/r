@@ -181,14 +181,11 @@ struct PostCheck(&'static str);
 /// Checks one reported post against the post the server keeps (5.8), and
 /// returns the pseudonym of its RisalaAAD.
 fn check_post(post: &ReportedPost, kept: &[u8]) -> Result<Pseudonym, PostCheck> {
-    let (framing, aad) =
-        read_post(kept).map_err(|_| PostCheck("not an MLS message"))?;
+    let (framing, aad) = read_post(kept).map_err(|_| PostCheck("not an MLS message"))?;
     if framing.content_type != ContentType::Application {
         return Err(PostCheck("not an application message"));
     }
-    let tag = aad
-        .frank
-        .ok_or(PostCheck("no franking tag"))?;
+    let tag = aad.frank.ok_or(PostCheck("no franking tag"))?;
     let expected = frank(&post.frank_key, &post.content);
     if !crate::secret::ct_eq(&expected, &tag) {
         return Err(PostCheck("the franking tag does not match"));

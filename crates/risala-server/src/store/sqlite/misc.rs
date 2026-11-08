@@ -464,7 +464,12 @@ mod tests {
                 .unwrap()
         );
         // Expired subscriptions are left out, then deleted.
-        assert!(store.push_subscriptions(&other, t(later)).unwrap().is_empty());
+        assert!(
+            store
+                .push_subscriptions(&other, t(later))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(store.expire_pushes(t(later)).unwrap(), 2);
         assert_eq!(store.push_subscriptions(&device, now).unwrap().len(), 1);
         store.forget_identity_misc(&alice).unwrap();

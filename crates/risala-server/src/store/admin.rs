@@ -74,8 +74,12 @@ pub trait AdminStore {
 
     /// Adds a server ban at `now`, or replaces the reason of the same one
     /// (10.2). Returns `false` if it was already there.
-    fn add_server_ban(&self, target: &ServerBanTarget, reason: &str, now: Timestamp)
-    -> Result<bool>;
+    fn add_server_ban(
+        &self,
+        target: &ServerBanTarget,
+        reason: &str,
+        now: Timestamp,
+    ) -> Result<bool>;
 
     /// Lifts a server ban (10.2). Returns `false` if there was none.
     fn remove_server_ban(&self, target: &ServerBanTarget) -> Result<bool>;

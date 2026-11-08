@@ -96,7 +96,7 @@ async fn identity_and_domain_bans() {
     h.send(&op, "ADMIN BAN *@example.net").await;
     assert_eq!(op.lines(), ["OK"]);
     let bye = format!("<close> BYE {}", admin::BYE_BANNED);
-    assert_eq!(other.lines(), [bye.clone()]);
+    assert_eq!(other.lines(), std::slice::from_ref(&bye));
     assert_eq!(sub.lines(), [bye]);
     assert!(admin::banned(h.inner(), &uid("ham@mail.example.net")));
 
@@ -265,7 +265,8 @@ async fn who_disconnect_and_notice() {
         assert_eq!(c.lines(), ["NOTICE Back\\sin 5 minutes"]);
     }
 
-    h.send(&op, "ADMIN DISCONNECT alice@example.org go away").await;
+    h.send(&op, "ADMIN DISCONNECT alice@example.org go away")
+        .await;
     assert_eq!(op.lines(), ["OK"]);
     assert_eq!(alice.lines(), ["<close> BYE go away"]);
     assert_eq!(alice2.lines(), ["<close> BYE go away"]);
@@ -333,8 +334,10 @@ async fn mute_and_unmute_any_mailbox() {
     let mailbox = add_mailbox(&h, 1);
     let pseudonym = risala_proto::mls::Pseudonym::from_bytes([6; 16]);
     let unknown = BoxName::from_bytes([9; 16]);
-    h.send(&op, &format!("ADMIN MUTE {mailbox} {pseudonym} hours=3")).await;
-    h.send(&op, &format!("ADMIN MUTE {unknown} {pseudonym}")).await;
+    h.send(&op, &format!("ADMIN MUTE {mailbox} {pseudonym} hours=3"))
+        .await;
+    h.send(&op, &format!("ADMIN MUTE {unknown} {pseudonym}"))
+        .await;
     assert_eq!(op.lines(), ["OK", "ERR not-found"]);
     let until: i64 = h
         .store
@@ -344,15 +347,18 @@ async fn mute_and_unmute_any_mailbox() {
     // 12:00 plus 3 hours.
     assert_eq!(until, 1_794_236_400_000);
     // The default, 24 hours, stops at the end of the period (6.4).
-    h.send(&op, &format!("ADMIN MUTE {mailbox} {pseudonym}")).await;
+    h.send(&op, &format!("ADMIN MUTE {mailbox} {pseudonym}"))
+        .await;
     let until: i64 = h
         .store
         .raw()
         .query_row("SELECT until FROM mutes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(until, 1_794_268_800_000);
-    h.send(&op, &format!("ADMIN UNMUTE {mailbox} {pseudonym}")).await;
-    h.send(&op, &format!("ADMIN UNMUTE {mailbox} {pseudonym}")).await;
+    h.send(&op, &format!("ADMIN UNMUTE {mailbox} {pseudonym}"))
+        .await;
+    h.send(&op, &format!("ADMIN UNMUTE {mailbox} {pseudonym}"))
+        .await;
     assert_eq!(op.lines(), ["OK", "OK", "ERR not-found"]);
 }
 
@@ -369,7 +375,10 @@ async fn settings() {
     // anon no closes every anonymous connection (10.6).
     h.send(&op, "ADMIN SET anon no").await;
     assert_eq!(op.lines(), ["OK"]);
-    assert_eq!(anon.lines(), [format!("<close> BYE {}", admin::BYE_NO_ANON)]);
+    assert_eq!(
+        anon.lines(),
+        [format!("<close> BYE {}", admin::BYE_NO_ANON)]
+    );
     assert!(sam.lines().is_empty());
     let mut c = h.connect();
     h.send(&c, "ANON").await;
@@ -378,7 +387,10 @@ async fn settings() {
     // guests no ends every guest session, waiting ones too.
     h.send(&op, "ADMIN SET guests no").await;
     assert_eq!(op.lines(), ["OK"]);
-    assert_eq!(sam.lines(), [format!("<close> BYE {}", admin::BYE_NO_GUESTS)]);
+    assert_eq!(
+        sam.lines(),
+        [format!("<close> BYE {}", admin::BYE_NO_GUESTS)]
+    );
     assert!(h.hub.guest_sessions().is_empty());
 
     // Changes show in INFO and outlast a restart.

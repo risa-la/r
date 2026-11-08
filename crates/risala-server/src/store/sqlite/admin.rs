@@ -212,7 +212,10 @@ mod tests {
         assert!(!store.add_server_ban(&spam, "more spam", t).unwrap());
         assert_eq!(
             store.server_bans().unwrap(),
-            [(spam.clone(), "more spam".into()), (net.clone(), String::new())]
+            [
+                (spam.clone(), "more spam".into()),
+                (net.clone(), String::new())
+            ]
         );
         assert!(store.remove_server_ban(&spam).unwrap());
         assert!(!store.remove_server_ban(&spam).unwrap());

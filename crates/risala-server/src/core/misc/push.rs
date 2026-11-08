@@ -203,7 +203,13 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
                 PushAdded::TooMany => Err(err(ErrorCode::RateLimited)),
                 added => {
                     if is_mailbox && added == PushAdded::Added {
-                        *cx.inner.misc.push.timing().added.entry(cx.conn).or_default() += 1;
+                        *cx.inner
+                            .misc
+                            .push
+                            .timing()
+                            .added
+                            .entry(cx.conn)
+                            .or_default() += 1;
                     }
                     Ok(OkResponse::new())
                 }
@@ -608,7 +614,14 @@ async fn send(inner: &Arc<Inner>, sub: PushSubscription, reason: PushReason) -> 
     let id = sub.id;
     match result {
         Ok(200..=299) => {
-            inner.misc.push.timing().subs.entry(id).or_default().failures = 0;
+            inner
+                .misc
+                .push
+                .timing()
+                .subs
+                .entry(id)
+                .or_default()
+                .failures = 0;
             if sub.failing_since.is_some() {
                 let now = inner.now();
                 if let Err(e) = inner.db(move |store| store.note_push(id, true, now)).await {
@@ -680,11 +693,14 @@ pub(crate) async fn maintain_once(inner: &Arc<Inner>) {
     let interval = inner.timers.push_interval;
     let mut timing = inner.misc.push.timing();
     let now = Instant::now();
-    timing.urls.retain(|_, last| now.duration_since(*last) < interval);
+    timing
+        .urls
+        .retain(|_, last| now.duration_since(*last) < interval);
     timing.subs.retain(|_, t| {
         t.pending
             || t.failures > 0
-            || t.last_sent.is_some_and(|last| now.duration_since(last) < interval)
+            || t.last_sent
+                .is_some_and(|last| now.duration_since(last) < interval)
     });
 }
 

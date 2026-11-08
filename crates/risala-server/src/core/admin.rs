@@ -474,12 +474,7 @@ pub(crate) fn mute_until(now: Timestamp, hours: Option<NonZeroU64>) -> Timestamp
 
 /// `ADMIN MUTE <box> <pseudonym> [hours=<n>]` (10.4): MUTE (6.4) for any
 /// mailbox.
-async fn mute(
-    cx: &Cx,
-    mailbox: BoxName,
-    pseudonym: Pseudonym,
-    hours: Option<NonZeroU64>,
-) -> Reply {
+async fn mute(cx: &Cx, mailbox: BoxName, pseudonym: Pseudonym, hours: Option<NonZeroU64>) -> Reply {
     // 6.4 limits a mute to the current period, since a public room's
     // pseudonyms last one period (7.3). 10.4 says ADMIN MUTE works like
     // MUTE, so the same limit applies to every mailbox.
@@ -576,7 +571,10 @@ mod tests {
             t("2026-11-09T15:00:00.000Z")
         );
         let late = t("2026-11-09T23:59:59.999Z");
-        assert_eq!(mute_until(late, NonZeroU64::new(1)), t("2026-11-10T00:00:00.000Z"));
+        assert_eq!(
+            mute_until(late, NonZeroU64::new(1)),
+            t("2026-11-10T00:00:00.000Z")
+        );
         assert_eq!(
             mute_until(now, NonZeroU64::new(u64::MAX)),
             t("2026-11-10T00:00:00.000Z")

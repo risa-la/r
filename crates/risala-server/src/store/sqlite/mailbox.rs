@@ -331,12 +331,7 @@ impl MailboxStore for SqliteStore {
         })
     }
 
-    fn set_mute(
-        &self,
-        mailbox: &BoxName,
-        pseudonym: &Pseudonym,
-        until: Timestamp,
-    ) -> Result<bool> {
+    fn set_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp) -> Result<bool> {
         self.write(|tx| {
             let exists = tx
                 .query_row(

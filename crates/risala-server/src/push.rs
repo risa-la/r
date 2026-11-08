@@ -111,10 +111,7 @@ fn derive(
     let prk_key = hmac256(auth, &[ecdh]);
     // IKM = HMAC-SHA-256(PRK_key, "WebPush: info" || 0x00 || ua_public ||
     // as_public || 0x01)
-    let ikm = hmac256(
-        &prk_key,
-        &[b"WebPush: info\0", ua_public, as_public, &[1]],
-    );
+    let ikm = hmac256(&prk_key, &[b"WebPush: info\0", ua_public, as_public, &[1]]);
     // PRK = HMAC-SHA-256(salt, IKM)
     let prk = hmac256(salt, &[&ikm]);
     let cek = hmac256(&prk, &[b"Content-Encoding: aes128gcm\0", &[1]]);
@@ -606,7 +603,12 @@ mod tests {
     #[test]
     fn bodies_have_one_size_and_decrypt() {
         let ua = agreement::PrivateKey::generate(&agreement::ECDH_P256).unwrap();
-        let public: [u8; 65] = ua.compute_public_key().unwrap().as_ref().try_into().unwrap();
+        let public: [u8; 65] = ua
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
         let key = PushKey::from_bytes(public);
         assert!(valid_key(&key));
         let auth = PushAuth::from_bytes([7; 16]);
@@ -631,10 +633,7 @@ mod tests {
         let two = encrypt(&notify, &key, &auth).unwrap();
         assert_ne!(one[..HEADER_LEN], two[..HEADER_LEN]);
         // The wrong secret does not decrypt.
-        assert_eq!(
-            decrypt(&one, &ua, &[8; 16]),
-            Err(CryptoError::BadBody)
-        );
+        assert_eq!(decrypt(&one, &ua, &[8; 16]), Err(CryptoError::BadBody));
         // A key that is not on the curve is refused.
         assert!(!valid_key(&PushKey::from_bytes([4; 65])));
     }

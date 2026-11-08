@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use aws_lc_rs::{agreement, hmac};
+use risala_mls::{Pseudonym as MlsPseudonym, RisalaAad};
 use risala_proto::binary::{PushAuth, PushKey};
 use risala_proto::codec::Writer;
 use risala_proto::command::Command;
@@ -12,7 +13,6 @@ use risala_proto::names::BoxName;
 use risala_proto::record::DeviceId;
 use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::types::PushTag;
-use risala_mls::{Pseudonym as MlsPseudonym, RisalaAad};
 
 use crate::core::{Clock as _, misc};
 use crate::push::{BoxFuture, PushRequest, PushTransport, SendError};
@@ -158,7 +158,8 @@ async fn info_on_every_kind_of_connection() {
     let mut h = Harness::new();
     let mut new = h.connect();
     h.send(&new, "INFO").await;
-    let want = "OK version=1 anon=yes guests=yes register=no log=no retention=30 push=yes upload=no";
+    let want =
+        "OK version=1 anon=yes guests=yes register=no log=no retention=30 push=yes upload=no";
     assert_eq!(new.lines(), [want]);
     let mut anon = h.anon().await;
     h.send(&anon, "@ref=i INFO").await;
@@ -190,7 +191,9 @@ async fn info_follows_the_settings() {
     h.send(&c, "INFO").await;
     assert_eq!(
         c.lines(),
-        ["OK version=1 anon=yes guests=no register=example.org log=no retention=7 push=no upload=no"]
+        [
+            "OK version=1 anon=yes guests=no register=example.org log=no retention=7 push=no upload=no"
+        ]
     );
     // Closed registration is register=no (8.5), and ADMIN SET shows at once.
     let mut op = h.signed_in_as("op@example.org");
@@ -216,9 +219,23 @@ async fn list_pages_rooms_in_order_and_hides_guestless_rooms_from_guests() {
         c
     };
     let mut h = Harness::with(config, timers());
-    let general = add_room(&h, "#general", 1, "write", "Hello\\sall", &[("a@x.org", "owner")]);
+    let general = add_room(
+        &h,
+        "#general",
+        1,
+        "write",
+        "Hello\\sall",
+        &[("a@x.org", "owner")],
+    );
     add_room(&h, "#zeta", 2, "read", "", &[]);
-    add_room(&h, "#alpha", 3, "none", "staff", &[("a@x.org", "owner"), ("b@x.org", "member")]);
+    add_room(
+        &h,
+        "#alpha",
+        3,
+        "none",
+        "staff",
+        &[("a@x.org", "owner"), ("b@x.org", "member")],
+    );
     add_room(&h, "#beta", 4, "write", "", &[]);
     // A mailbox that is not a public room is never listed.
     add_mailbox(&h, 5);
@@ -287,7 +304,10 @@ async fn info_of_a_room_and_its_members() {
     );
     let mut anon = h.anon().await;
     h.send(&anon, "INFO #General").await;
-    assert_eq!(anon.lines(), [format!("OK box={general} members=3 epoch=3")]);
+    assert_eq!(
+        anon.lines(),
+        [format!("OK box={general} members=3 epoch=3")]
+    );
     h.send(&anon, "INFO #nope").await;
     h.send(&anon, "MEMBERS #nope").await;
     assert_eq!(anon.lines(), ["ERR not-found", "ERR not-found"]);
@@ -317,7 +337,8 @@ async fn presence_is_off_until_turned_on() {
     let mut h = Harness::with(config(), presence_timers());
     let mut watcher = h.anon().await;
     let mut alice = sign_in(&mut h, "alice@example.org").await;
-    h.send(&watcher, "WATCH alice@example.org,bob@example.org").await;
+    h.send(&watcher, "WATCH alice@example.org,bob@example.org")
+        .await;
     assert_eq!(
         watcher.lines(),
         [
@@ -334,7 +355,11 @@ async fn presence_is_off_until_turned_on() {
     assert_eq!(alice.lines(), ["OK"]);
     wait(80).await;
     assert_eq!(watcher.lines(), ["PRESENCE online alice@example.org"]);
-    assert!(h.store.presence_on(&"alice@example.org".parse().unwrap()).unwrap());
+    assert!(
+        h.store
+            .presence_on(&"alice@example.org".parse().unwrap())
+            .unwrap()
+    );
 
     // Off: reported offline to everyone, without the offline delay.
     h.send(&alice, "PRESENCE OFF").await;
@@ -351,7 +376,8 @@ async fn changes_are_batched_and_the_offline_delay_hides_reconnects() {
         h.store.set_presence(&uid.parse().unwrap(), true).unwrap();
     }
     let mut watcher = h.anon().await;
-    h.send(&watcher, "WATCH alice@example.org,bob@example.org,~sam").await;
+    h.send(&watcher, "WATCH alice@example.org,bob@example.org,~sam")
+        .await;
     assert_eq!(watcher.lines().len(), 4);
     let alice = sign_in(&mut h, "alice@example.org").await;
     let bob = sign_in(&mut h, "bob@example.org").await;
@@ -436,10 +462,7 @@ async fn watch_takes_a_thousand_uids_and_whois_knows_who_signed_in() {
         .unwrap();
     let _carol = sign_in(&mut h, "carol@example.org").await;
     h.send(&watcher, "WHOIS carol@example.org").await;
-    assert_eq!(
-        watcher.lines(),
-        ["USER carol@example.org online", "OK"]
-    );
+    assert_eq!(watcher.lines(), ["USER carol@example.org online", "OK"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,14 +553,21 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
     let other = add_mailbox(&h, 2);
     let keys = Keys::new();
     let add = |url: &str, tag: &str, mailbox: &BoxName| {
-        format!("PUSH ADD {url} {tag} {} {} box={mailbox}", keys.key, keys.auth)
+        format!(
+            "PUSH ADD {url} {tag} {} {} box={mailbox}",
+            keys.key, keys.auth
+        )
     };
     let mut anon = h.anon().await;
-    h.send(&anon, &add("https://p.example/1", "t1", &mailbox)).await;
-    h.send(&anon, &add("https://p.example/1", "t2", &mailbox)).await;
-    h.send(&anon, &add("https://p.example/2", "t3", &mailbox)).await;
+    h.send(&anon, &add("https://p.example/1", "t1", &mailbox))
+        .await;
+    h.send(&anon, &add("https://p.example/1", "t2", &mailbox))
+        .await;
+    h.send(&anon, &add("https://p.example/2", "t3", &mailbox))
+        .await;
     // A third subscription for one mailbox is refused (9.1).
-    h.send(&anon, &add("https://p.example/3", "t4", &mailbox)).await;
+    h.send(&anon, &add("https://p.example/3", "t4", &mailbox))
+        .await;
     assert_eq!(anon.lines(), ["OK", "OK", "OK", "ERR rate-limited"]);
     let subs = h
         .store
@@ -547,8 +577,10 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
     assert_eq!(tags, ["t2", "t3"]);
 
     // The connection may add three, replacements not counted.
-    h.send(&anon, &add("https://p.example/4", "t5", &other)).await;
-    h.send(&anon, &add("https://p.example/5", "t6", &other)).await;
+    h.send(&anon, &add("https://p.example/4", "t5", &other))
+        .await;
+    h.send(&anon, &add("https://p.example/5", "t6", &other))
+        .await;
     assert_eq!(anon.lines(), ["OK", "ERR rate-limited"]);
 
     // A key that is not on P-256 is invalid; an unknown mailbox not found.
@@ -560,23 +592,34 @@ async fn mailbox_subscriptions_are_checked_limited_and_replaced() {
     let mut fresh = h.anon().await;
     h.send(&fresh, &bad).await;
     let unknown = BoxName::from_bytes([9; 16]);
-    h.send(&fresh, &add("https://p.example/7", "t", &unknown)).await;
+    h.send(&fresh, &add("https://p.example/7", "t", &unknown))
+        .await;
     assert_eq!(
         fresh.lines(),
         ["ERR invalid not a P-256 public key", "ERR not-found"]
     );
 
     // PUSH DEL.
-    h.send(&fresh, &format!("PUSH DEL https://p.example/2 box={mailbox}")).await;
-    h.send(&fresh, &format!("PUSH DEL https://p.example/2 box={mailbox}")).await;
+    h.send(
+        &fresh,
+        &format!("PUSH DEL https://p.example/2 box={mailbox}"),
+    )
+    .await;
+    h.send(
+        &fresh,
+        &format!("PUSH DEL https://p.example/2 box={mailbox}"),
+    )
+    .await;
     assert_eq!(fresh.lines(), ["OK", "ERR not-found"]);
 
     // Guests cannot register for push, and mailbox subscriptions are made
     // on anonymous connections (9.1, Section 13).
     let (mut sam, _) = h.guest("sam").await;
-    h.send(&sam, &add("https://p.example/8", "t", &mailbox)).await;
+    h.send(&sam, &add("https://p.example/8", "t", &mailbox))
+        .await;
     let mut alice = h.signed_in_as("alice@example.org");
-    h.send(&alice, &add("https://p.example/8", "t", &mailbox)).await;
+    h.send(&alice, &add("https://p.example/8", "t", &mailbox))
+        .await;
     assert_eq!(sam.lines(), ["ERR wrong-connection"]);
     assert_eq!(alice.lines(), ["ERR wrong-connection"]);
 }
@@ -600,11 +643,19 @@ async fn mailbox_subscriptions_last_one_retention_period() {
     h.clock.advance(Duration::from_secs(29 * 86_400));
     misc::push::maintain_once(h.inner()).await;
     assert_eq!(
-        h.store.push_subscriptions(&target, h.clock.now()).unwrap().len(),
+        h.store
+            .push_subscriptions(&target, h.clock.now())
+            .unwrap()
+            .len(),
         1
     );
     h.clock.advance(Duration::from_secs(2 * 86_400));
-    assert!(h.store.push_subscriptions(&target, h.clock.now()).unwrap().is_empty());
+    assert!(
+        h.store
+            .push_subscriptions(&target, h.clock.now())
+            .unwrap()
+            .is_empty()
+    );
     misc::push::maintain_once(h.inner()).await;
     let left: i64 = h
         .store
@@ -678,7 +729,12 @@ async fn quiet_followers_that_are_alive_hold_pushes_back() {
 
     // A follower with another tag does not hold it back.
     let mut reader = h.anon().await;
-    misc::follow_quiet(h.inner(), reader.id, mailbox, Some("other".parse().unwrap()));
+    misc::follow_quiet(
+        h.inner(),
+        reader.id,
+        mailbox,
+        Some("other".parse().unwrap()),
+    );
     misc::post_kept(h.inner(), mailbox);
     wait(80).await;
     assert_eq!(recorder.take().len(), 1);
@@ -723,13 +779,13 @@ async fn account_subscriptions_wake_devices_that_are_not_connected() {
     let (mut h, recorder) = push_harness(config());
     let keys = Keys::new();
     let mut alice = h.signed_in_as("alice@example.org");
-    let add = format!("PUSH ADD https://p.example/w wtag {} {}", keys.key, keys.auth);
+    let add = format!(
+        "PUSH ADD https://p.example/w wtag {} {}",
+        keys.key, keys.auth
+    );
     h.send(&alice, &add).await;
     h.send(&alice, "PUSH LIST").await;
-    assert_eq!(
-        alice.lines(),
-        ["OK", "PUSH https://p.example/w wtag", "OK"]
-    );
+    assert_eq!(alice.lines(), ["OK", "PUSH https://p.example/w wtag", "OK"]);
     let uid: risala_proto::names::Uid = "alice@example.org".parse().unwrap();
     let device = DeviceId::of(&risala_proto::auth::PublicKey::from_bytes(
         &[7; risala_proto::auth::PUBLIC_KEY_LEN],
@@ -819,7 +875,12 @@ async fn reports_are_checked_and_reach_the_operators() {
 
     let mut op = h.signed_in_as("op@example.org");
     let mut reporter = h.anon().await;
-    let ok = report_b64((9, k3, c3), &[(3, k1, c1), (5, k2, c2)], "bob@example.org", "spam");
+    let ok = report_b64(
+        (9, k3, c3),
+        &[(3, k1, c1), (5, k2, c2)],
+        "bob@example.org",
+        "spam",
+    );
     h.send(&reporter, &format!("REPORT {mailbox} {ok}")).await;
     let lines = reporter.lines();
     assert_eq!(lines.len(), 1);
@@ -829,15 +890,23 @@ async fn reports_are_checked_and_reach_the_operators() {
     let pseudonym = risala_proto::mls::Pseudonym::from_bytes([6; 16]);
     assert_eq!(
         op.lines(),
-        [format!("@report={id};t={T};pseudonym={pseudonym} REPORT {mailbox} {ok}")]
+        [format!(
+            "@report={id};t={T};pseudonym={pseudonym} REPORT {mailbox} {ok}"
+        )]
     );
 
     // Checks (5.8): not-found for a post not kept; invalid for a wrong
     // frank, a post that is not an application message, a malformed
     // report.
     let cases = [
-        (report_b64((11, k3, c3), &[], "b@x.org", ""), "ERR not-found"),
-        (report_b64((9, k3, c3), &[(4, k1, c1)], "b@x.org", ""), "ERR not-found"),
+        (
+            report_b64((11, k3, c3), &[], "b@x.org", ""),
+            "ERR not-found",
+        ),
+        (
+            report_b64((9, k3, c3), &[(4, k1, c1)], "b@x.org", ""),
+            "ERR not-found",
+        ),
         (
             report_b64((9, k3, b"TEXT edited\n"), &[], "b@x.org", ""),
             "ERR invalid the franking tag does not match",
@@ -861,7 +930,8 @@ async fn reports_are_checked_and_reach_the_operators() {
         ("AQID".to_owned(), "ERR invalid "),
     ];
     for (report, want) in cases {
-        h.send(&reporter, &format!("REPORT {mailbox} {report}")).await;
+        h.send(&reporter, &format!("REPORT {mailbox} {report}"))
+            .await;
         let got = reporter.lines();
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].starts_with(want), "{got:?} != {want}");
@@ -878,7 +948,10 @@ async fn reports_are_checked_and_reach_the_operators() {
     let ServerLine::Report(r) = &reports[0].line else {
         panic!("{reports:?}")
     };
-    assert_eq!(r.from.as_ref().map(|u| u.as_str()), Some("alice@example.org"));
+    assert_eq!(
+        r.from.as_ref().map(|u| u.as_str()),
+        Some("alice@example.org")
+    );
     assert_eq!(r.id.as_str(), id2);
     let (mut sam, _) = h.guest("sam").await;
     h.send(&sam, &format!("REPORT {mailbox} {short}")).await;
@@ -964,7 +1037,10 @@ async fn reports_are_rate_limited() {
     h.send(&alice, &line).await;
     let got = alice.lines();
     assert_eq!(got.len(), 3);
-    assert!(got[1].starts_with("OK") && got[2].starts_with("OK"), "{got:?}");
+    assert!(
+        got[1].starts_with("OK") && got[2].starts_with("OK"),
+        "{got:?}"
+    );
 }
 
 /// A typed check that report lines parse back, with `pseudonym=` (5.8).

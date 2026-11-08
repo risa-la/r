@@ -32,9 +32,9 @@ use risala_proto::names::Uid;
 use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
 use risala_proto::types::Presence;
 
+use super::super::Inner;
 use super::super::command::{Cx, Reply, err};
 use super::super::state::{ConnEntry, Who};
-use super::super::Inner;
 use super::shown_presence;
 use crate::handler::{ConnId, OutLine};
 
@@ -156,8 +156,11 @@ impl Book {
 fn has_connection(inner: &Inner, uid: &Uid) -> bool {
     let reg = inner.reg();
     reg.by_uid.get(uid).is_some_and(|ids| {
-        ids.iter()
-            .any(|id| reg.conns.get(id).is_some_and(|c| matches!(c.who, Who::SignedIn(_))))
+        ids.iter().any(|id| {
+            reg.conns
+                .get(id)
+                .is_some_and(|c| matches!(c.who, Who::SignedIn(_)))
+        })
     })
 }
 
@@ -345,17 +348,22 @@ pub(super) async fn set(cx: &Cx, on: bool) -> Reply {
 /// a USER line for each identity on it.
 pub(super) async fn watch(cx: &Cx, uids: Vec<Uid>) -> Reply {
     let mut seen = BTreeSet::new();
-    let uids: Vec<Uid> = uids.into_iter().filter(|u| seen.insert(u.clone())).collect();
+    let uids: Vec<Uid> = uids
+        .into_iter()
+        .filter(|u| seen.insert(u.clone()))
+        .collect();
     if uids.len() > MAX_WATCH {
-        return Err(err(ErrorCode::TooLong)
-            .with_message(format!("at most {MAX_WATCH} uids")));
+        return Err(err(ErrorCode::TooLong).with_message(format!("at most {MAX_WATCH} uids")));
     }
     let shown: Vec<(Uid, Presence)> = {
         let mut book = cx.inner.misc.presence.book();
         book.unwatch(cx.conn);
         if !uids.is_empty() {
             for uid in &uids {
-                book.watchers.entry(uid.clone()).or_default().insert(cx.conn);
+                book.watchers
+                    .entry(uid.clone())
+                    .or_default()
+                    .insert(cx.conn);
             }
             book.watching.insert(cx.conn, seen);
         }

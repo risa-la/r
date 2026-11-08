@@ -156,7 +156,10 @@ async fn info(cx: &Cx) -> Reply {
 /// The public room `room`, as a connection of kind `who` may see it: a
 /// guest does not see rooms whose `guests` setting is `none`, as in LIST
 /// (6.1).
-async fn visible_room(cx: &Cx, room: Room) -> Result<PublicRoomRecord, risala_proto::server::ErrResponse> {
+async fn visible_room(
+    cx: &Cx,
+    room: Room,
+) -> Result<PublicRoomRecord, risala_proto::server::ErrResponse> {
     let found = cx.db(move |store| store.public_room(&room)).await?;
     match found {
         // 6.1 says only that a guest's LIST leaves such rooms out; INFO and
@@ -231,9 +234,11 @@ async fn members(cx: &Cx, room: Room) -> Reply {
 pub(crate) fn to_operators(inner: &Inner, line: &ServerLine, except: Option<ConnId>) {
     let out = crate::handler::OutLine::new(risala_proto::server::ServerMessage::new(line.clone()));
     let reg = inner.reg();
-    for conn in reg.conns.iter().filter_map(|(id, conn)| {
-        (Some(*id) != except && !conn.detached).then_some(conn)
-    }) {
+    for conn in reg
+        .conns
+        .iter()
+        .filter_map(|(id, conn)| (Some(*id) != except && !conn.detached).then_some(conn))
+    {
         if let Who::SignedIn(device) = &conn.who
             && super::admin::is_operator(inner, &device.uid)
         {

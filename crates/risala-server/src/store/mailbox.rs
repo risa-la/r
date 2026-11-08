@@ -128,8 +128,7 @@ pub trait MailboxStore {
 
     /// Refuses the posts of `pseudonym` in `mailbox` until `until` (6.4,
     /// 10.4). Returns `false` if the server holds no such mailbox.
-    fn set_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp)
-    -> Result<bool>;
+    fn set_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp) -> Result<bool>;
 
     /// Lifts a mute (6.4, 10.4). Returns `false` if there was none.
     fn remove_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym) -> Result<bool>;
