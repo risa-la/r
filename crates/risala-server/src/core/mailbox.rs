@@ -1,6 +1,6 @@
 //! Mailboxes and delivery (5.2, 6.1, 6.4, 7): CREATE, POST, GROUPINFO,
-//! MUTE, UNMUTE, FOLLOW, UNFOLLOW and FETCH, the GONE and DROP lines, and
-//! retention.
+//! MUTE, UNMUTE, FOLLOW, UNFOLLOW, FETCH and TOKEN, the GONE and DROP
+//! lines, moves (7.8), retention and quotas (7.5).
 //!
 //! Not built yet: every command replies `ERR not-supported`. What is here
 //! is the followers of each mailbox, and GONE when a guest's session ends
@@ -86,8 +86,8 @@ impl State {
 #[derive(Debug, Default)]
 pub(crate) struct ConnState {}
 
-/// Handles CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW, UNFOLLOW and
-/// FETCH.
+/// Handles CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW, UNFOLLOW, FETCH
+/// and TOKEN.
 pub(super) async fn handle(_cx: &Cx, command: Command) -> Reply {
     match command {
         Command::Create { .. } // 5.2
@@ -97,7 +97,8 @@ pub(super) async fn handle(_cx: &Cx, command: Command) -> Reply {
         | Command::Unmute { .. } // 6.4
         | Command::Follow { .. } // 7.1
         | Command::Unfollow { .. } // 7.1
-        | Command::Fetch { .. } /* 7.1 */ => not_supported(),
+        | Command::Fetch { .. } // 7.1
+        | Command::Token { .. } /* 7.2 */ => not_supported(),
         other => misrouted("mailbox", &other),
     }
 }
@@ -139,6 +140,6 @@ pub(super) fn conn_closed(inner: &Arc<Inner>, id: ConnId, _conn: &ConnEntry) {
     inner.mailbox.forget(id);
 }
 
-/// The area's background work: expiring posts (7.5) and cids (7.6), and
-/// forgetting old token hashes (7.2).
+/// The area's background work: expiring posts (7.5) and cids (7.6),
+/// forgetting unused token sets (7.2), and ending mailboxes (7.5).
 pub(super) async fn maintain(_inner: Arc<Inner>) {}

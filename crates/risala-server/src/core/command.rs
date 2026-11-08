@@ -9,7 +9,7 @@
 //! |---|---|
 //! | ANON, GUEST (4.2), PING, PONG, QUIT (11) | `session` |
 //! | AUTH, REGISTER, KEYS PUT, PAIR, UNREGISTER, ADMIN UNREGISTER (4.6-4.9, 10.5) | `identity` |
-//! | CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW, UNFOLLOW, FETCH (5.2, 6.1, 6.4, 7.1) | `mailbox` |
+//! | CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW, UNFOLLOW, FETCH, TOKEN (5.2, 6.1, 6.4, 7.1, 7.2) | `mailbox` |
 //! | KEYPKG, WELCOME, BLOB, BACKUP, UPLOAD (12.5, 12.8, 12.12, 12.13, 5.6) | `keys` |
 //! | INFO, LIST, PRESENCE, WATCH, WHOIS, MEMBERS, PUSH, REPORT, RESOLVE (8, 6.1, 9, 5.8) | `misc` |
 //! | ADMIN, except ADMIN UNREGISTER (Section 10) | `admin` |
@@ -164,7 +164,8 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
         | Command::Unmute { .. }
         | Command::Follow { .. }
         | Command::Unfollow { .. }
-        | Command::Fetch { .. }) => mailbox::handle(&cx, command).await,
+        | Command::Fetch { .. }
+        | Command::Token { .. }) => mailbox::handle(&cx, command).await,
         command @ (Command::KeyPkg(_)
         | Command::Welcome(_)
         | Command::Blob { .. }

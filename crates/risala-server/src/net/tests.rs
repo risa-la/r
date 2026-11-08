@@ -319,9 +319,9 @@ async fn bad_lines_get_errors_with_their_ref() {
 }
 
 /// The line limits follow the connection's kind (2.3): a new connection
-/// may send a REGISTER of up to 64 KiB and no other long line; once it has
-/// a kind, the verbs that carry MLS data and key files may be long, and
-/// REGISTER may not.
+/// may send REGISTER, KEYS and PAIR of up to 64 KiB and no other long
+/// line; once it has a kind, the verbs that carry MLS data and records may
+/// be long, and REGISTER may not.
 #[tokio::test(start_paused = true)]
 async fn line_limits_follow_the_kind() {
     use risala_proto::frame::{MAX_CLIENT_LINE, MAX_REGISTER_LINE};

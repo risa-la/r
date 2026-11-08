@@ -241,7 +241,9 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     }
                 };
                 let Ok(permit) = shared.permits.clone().try_acquire_owned() else {
-                    tracing::warn!(%peer, "too many HTTPS connections, closing a new one");
+                    // No address at the default levels: anonymous devices
+                    // store blobs and files here (4.2).
+                    tracing::warn!("too many HTTPS connections, closing a new one");
                     continue;
                 };
                 let Some(slot) = AddressSlot::take(&shared, peer.ip()) else {

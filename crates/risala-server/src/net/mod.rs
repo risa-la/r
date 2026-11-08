@@ -281,7 +281,9 @@ async fn accept_loop<H: Handler>(listener: TcpListener, shared: Arc<Shared<H>>) 
             }
         };
         let Ok(permit) = shared.permits.clone().try_acquire_owned() else {
-            tracing::warn!(%peer, "too many connections, closing a new one");
+            // No address at the default levels: it may be an anonymous
+            // connection's (4.2).
+            tracing::warn!("too many connections, closing a new one");
             continue;
         };
         let _ = tcp.set_nodelay(true);
@@ -304,7 +306,7 @@ async fn connection<H: Handler>(
             Ok(Ok(tls)) => tls,
             Ok(Err(e)) => {
                 match tls::handshake_failure(&e) {
-                    Some(reason) => tracing::info!(%peer, reason, "TLS handshake refused"),
+                    Some(reason) => tracing::info!(reason, "TLS handshake refused"),
                     None => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
                 }
                 return;

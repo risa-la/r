@@ -34,6 +34,7 @@ fn samples() -> Vec<String> {
         format!("PAIR GET {BOX}"),
         "UNREGISTER alice@example.org".into(),
         format!("CREATE {BOX} {gid} {hash}"),
+        format!("CREATE {BOX} {gid} {hash} epoch=3"),
         format!("CREATE {BOX} {gid} {hash} #general {msg} {msg}"),
         format!("POST {BOX} {token} {msg}"),
         format!("POST {BOX} - {msg}"),
@@ -46,6 +47,7 @@ fn samples() -> Vec<String> {
         format!("FOLLOW {BOX}"),
         format!("UNFOLLOW {BOX}"),
         format!("FETCH {BOX} after=0"),
+        format!("TOKEN {BOX} 41 {token} {hash}"),
         "PRESENCE ON".into(),
         "PRESENCE OFF".into(),
         "WATCH alice@example.org,~sam".into(),
@@ -157,30 +159,47 @@ async fn section_13_by_hand() {
     let gid = b64(32);
     let hash = b64(48);
     let token = b64(32);
+    let msg = b64(100);
     let cases: Vec<(usize, String, &str)> = vec![
-        // Only INFO without a room, ANON, GUEST, AUTH, REGISTER, PING,
-        // PONG and QUIT before a kind (4.1).
+        // Only INFO without a room, ANON, GUEST, AUTH, REGISTER, KEYS PUT,
+        // PAIR, PING, PONG and QUIT before a kind (4.1).
         (NEW, "INFO #general".into(), "ERR not-authenticated"),
         (NEW, format!("FOLLOW {BOX}"), "ERR not-authenticated"),
         (NEW, "INFO".into(), "ERR not-supported"),
-        // A guest that may not send a command gets forbidden.
-        (GUEST, format!("CREATE {BOX} {gid} {hash}"), "ERR forbidden"),
-        (GUEST, "KEYS PUT AAAA".into(), "ERR forbidden"),
-        (GUEST, format!("FOLLOW {BOX}"), "ERR not-supported"),
-        // Conversations are for anonymous connections; the account's
-        // things for signed-in ones.
-        (ALICE, format!("FOLLOW {BOX}"), "ERR not-authenticated"),
+        (NEW, "KEYS PUT AAAA".into(), "ERR not-supported"),
+        (NEW, format!("PAIR GET {BOX}"), "ERR not-supported"),
+        // Once it has a kind, a command for another kind gets
+        // wrong-connection (4.1, Section 13).
+        (GUEST, "KEYS PUT AAAA".into(), "ERR wrong-connection"),
+        (
+            GUEST,
+            format!("CREATE {BOX} {gid} {hash} #general {msg} {msg}"),
+            "ERR wrong-connection",
+        ),
+        (ALICE, format!("FOLLOW {BOX}"), "ERR wrong-connection"),
         (
             ALICE,
             format!("UPLOAD {BOX} {token} 1"),
-            "ERR not-authenticated",
+            "ERR wrong-connection",
         ),
-        (ANON, "KEYPKG COUNT".into(), "ERR not-authenticated"),
-        (ANON, "BACKUP GET".into(), "ERR not-authenticated"),
-        (ANON, "ADMIN OPS".into(), "ERR not-authenticated"),
+        (
+            ALICE,
+            format!("TOKEN {BOX} 1 {token} {hash}"),
+            "ERR wrong-connection",
+        ),
+        (ANON, "KEYPKG COUNT".into(), "ERR wrong-connection"),
+        (ANON, "BACKUP GET".into(), "ERR wrong-connection"),
+        (ANON, "ADMIN OPS".into(), "ERR wrong-connection"),
+        (GUEST, "ADMIN OPS".into(), "ERR wrong-connection"),
+        // A guest may follow, and create a report conversation (4.2).
+        (GUEST, format!("FOLLOW {BOX}"), "ERR not-supported"),
+        (
+            GUEST,
+            format!("CREATE {BOX} {gid} {hash}"),
+            "ERR not-supported",
+        ),
         // ADMIN needs an operator (Section 10).
         (ALICE, "ADMIN OPS".into(), "ERR forbidden"),
-        (GUEST, "ADMIN OPS".into(), "ERR forbidden"),
         // BLOB from an anonymous connection needs box= and token= (12.12).
         (
             ANON,

@@ -276,9 +276,10 @@ impl ConnHandle {
 
     /// Records the connection's kind (4.1). From the next line on, the
     /// network layer applies that kind's line limits
-    /// ([`ConnectionKind::client_limits`], 2.3): the normal limit and a
-    /// 64 KiB REGISTER while it is new, long lines for the verbs that carry
-    /// MLS data or key files once it is anonymous, a guest or signed in.
+    /// ([`ConnectionKind::client_limits`], 2.3): the normal limit, and
+    /// 64 KiB for REGISTER, KEYS and PAIR, while it is new; long lines for
+    /// the verbs that carry MLS data or records once it is anonymous, a
+    /// guest or signed in.
     pub fn set_kind(&self, kind: ConnectionKind) {
         self.state.kind.store(kind_code(kind), Ordering::SeqCst);
     }

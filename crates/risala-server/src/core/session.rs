@@ -82,7 +82,7 @@ impl Inner {
             nonce: nonce.clone(),
             message: self.settings().welcome,
         });
-        tracing::debug!(conn = id.0, peer = %info.peer, "connection opened");
+        tracing::debug!(conn = id.0, "connection opened");
 
         let timer = tokio::runtime::Handle::try_current().ok().map(|rt| {
             let weak: Weak<Inner> = Arc::downgrade(self);

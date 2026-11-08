@@ -175,9 +175,9 @@ where
                                 return Ended::Quit;
                             }
                             // The limits follow the connection's kind (2.3):
-                            // a new connection's REGISTER may be 64 KiB, and
-                            // once it has a kind, the lines that carry MLS
-                            // data and key files may be long. Lines already
+                            // a new connection's REGISTER, KEYS and PAIR may
+                            // be 64 KiB, and once it has a kind, the lines
+                            // that carry MLS data and records may be long. Lines already
                             // split off keep the limit they were judged by.
                             let limits = handle.kind().client_limits();
                             if decoder.limits() != limits {

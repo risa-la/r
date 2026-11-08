@@ -44,9 +44,10 @@ async fn greeting_then_anon() {
     server.stop().await;
 }
 
-/// The line limits follow the kind (2.3): a new connection may send a
-/// REGISTER of up to 64 KiB and nothing else long; an anonymous one may
-/// send long POSTs, and REGISTER only within the normal limit.
+/// The line limits follow the kind (2.3): a new connection may send
+/// REGISTER, KEYS and PAIR of up to 64 KiB and nothing else long; an
+/// anonymous one may send long POSTs, and REGISTER only within the normal
+/// limit.
 #[tokio::test]
 async fn line_limits_follow_the_kind() {
     let server = TestServer::start().await;

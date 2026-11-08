@@ -22,7 +22,8 @@
 //!     UNREGISTER, hosted key files (4.6-4.9, 10.5).
 //!   - [`keylog`]: the key log (4.5), which has no commands.
 //!   - [`mailbox`]: CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW,
-//!     UNFOLLOW, FETCH, GONE and DROP lines, retention (5.2, 6.1, 6.4, 7).
+//!     UNFOLLOW, FETCH, TOKEN, GONE and DROP lines, moves, retention
+//!     (5.2, 6.1, 6.4, 7).
 //!   - [`keys`]: KEYPKG, WELCOME, BLOB, BACKUP, UPLOAD (5.6, 12.5, 12.8,
 //!     12.12, 12.13).
 //!   - [`misc`]: INFO, LIST, PRESENCE, WATCH, WHOIS, MEMBERS, PUSH,
