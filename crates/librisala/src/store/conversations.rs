@@ -27,7 +27,8 @@ pub(crate) const SCHEMA: &str = "
 -- 'creating' until its first commit won, 'active', 'leaving' after its
 -- PART, 'left' once removed, 'dropped' after DROP (6.1), 'failed' if
 -- creating it failed. last_resort: joined with a last-resort KeyPackage,
--- so it must commit a new leaf key before it sends (12.5).
+-- so it must commit a new leaf key before it sends (12.5). prev_token is
+-- the send token of the epoch before the current one, for TOKEN (7.2).
 CREATE TABLE conversations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     account       INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -48,6 +49,7 @@ CREATE TABLE conversations (
     last_resort   INTEGER NOT NULL DEFAULT 0,
     created       INTEGER NOT NULL,
     last_activity INTEGER,
+    prev_token    BLOB,
     UNIQUE (account, group_id)
 );
 
@@ -85,8 +87,8 @@ CREATE TABLE posts (
 
 -- The leaves of each group as this device knows them, refreshed from the
 -- group's tree after each commit (12.3, 12.7). device_id is NULL for a
--- guest's leaf. pseudonym is the one pinned for the leaf (7.3). counter
--- and last_message follow its messages, for gaps (7.4). display_name and
+-- guest's leaf. What is known of its messages is in sender_logs
+-- (messages.rs). display_name and
 -- updated come from its profile (8.2, 12.3). self_removed: it posted a
 -- SelfRemove (6.1). resync_seq: it posted RESYNC for the commit at that
 -- seq (12.7).
@@ -96,15 +98,19 @@ CREATE TABLE leaves (
     uid          TEXT NOT NULL,
     device_id    BLOB,
     signature_key BLOB NOT NULL,
-    pseudonym    BLOB,
-    counter      INTEGER NOT NULL DEFAULT 0,
-    last_message BLOB,
     display_name TEXT,
     updated      INTEGER,
     self_removed INTEGER NOT NULL DEFAULT 0,
     resync_seq   INTEGER,
     PRIMARY KEY (conv, leaf)
 ) WITHOUT ROWID;
+
+-- What the device saw of each group's recent commits, for the group
+-- checks that look back (12.7): risala-mls's History, as JSON.
+CREATE TABLE group_state (
+    conv    INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    history TEXT NOT NULL
+);
 
 -- The KeyPackages this device made and uploaded with KEYPKG ADD (12.5), by
 -- KeyPackageRef, so that a sealed Welcome can be opened with the right
@@ -461,12 +467,6 @@ pub struct LeafRow {
     pub device_id: Option<[u8; 48]>,
     /// Its signature key.
     pub signature_key: Vec<u8>,
-    /// Its pinned pseudonym (7.3).
-    pub pseudonym: Option<[u8; 16]>,
-    /// How many messages it has sent, as far as seen (12.9).
-    pub counter: u64,
-    /// Its newest message's id.
-    pub last_message: Option<[u8; 16]>,
     /// Its display name (8.2).
     pub display_name: Option<String>,
     /// Its profile's `updated`.
@@ -477,8 +477,8 @@ pub struct LeafRow {
     pub resync_seq: Option<u64>,
 }
 
-const LEAF_COLUMNS: &str = "leaf, uid, device_id, signature_key, pseudonym, counter, \
-     last_message, display_name, updated, self_removed, resync_seq";
+const LEAF_COLUMNS: &str =
+    "leaf, uid, device_id, signature_key, display_name, updated, self_removed, resync_seq";
 
 fn leaf_row(row: &Row<'_>) -> rusqlite::Result<LeafRaw> {
     Ok(LeafRaw {
@@ -486,13 +486,10 @@ fn leaf_row(row: &Row<'_>) -> rusqlite::Result<LeafRaw> {
         uid: row.get(1)?,
         device_id: row.get(2)?,
         signature_key: row.get(3)?,
-        pseudonym: row.get(4)?,
-        counter: row.get(5)?,
-        last_message: row.get(6)?,
-        display_name: row.get(7)?,
-        updated: row.get(8)?,
-        self_removed: row.get(9)?,
-        resync_seq: row.get(10)?,
+        display_name: row.get(4)?,
+        updated: row.get(5)?,
+        self_removed: row.get(6)?,
+        resync_seq: row.get(7)?,
     })
 }
 
@@ -501,9 +498,6 @@ struct LeafRaw {
     uid: String,
     device_id: Option<Vec<u8>>,
     signature_key: Vec<u8>,
-    pseudonym: Option<Vec<u8>>,
-    counter: i64,
-    last_message: Option<Vec<u8>>,
     display_name: Option<String>,
     updated: Option<i64>,
     self_removed: bool,
@@ -517,12 +511,6 @@ impl LeafRaw {
             uid: parse(&self.uid, "uid")?,
             device_id: self.device_id.map(|d| fixed(d, "device id")).transpose()?,
             signature_key: self.signature_key,
-            pseudonym: self.pseudonym.map(|p| fixed(p, "pseudonym")).transpose()?,
-            counter: self.counter as u64,
-            last_message: self
-                .last_message
-                .map(|m| fixed(m, "message id"))
-                .transpose()?,
             display_name: self.display_name,
             updated: self.updated.map(|u| u as u64),
             self_removed: self.self_removed,
@@ -818,6 +806,29 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Keeps the send token of the epoch just ended, for TOKEN (7.2).
+    pub(crate) fn set_prev_token(
+        &mut self,
+        id: ConversationId,
+        token: &[u8; 32],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE conversations SET prev_token = ?2 WHERE id = ?1",
+            params![id.0, &token[..]],
+        )?;
+        Ok(())
+    }
+
+    /// The send token of the epoch before the current one (7.2).
+    pub(crate) fn prev_token(&self, id: ConversationId) -> Result<Option<[u8; 32]>, StoreError> {
+        let token: Option<Vec<u8>> = self.conn().query_row(
+            "SELECT prev_token FROM conversations WHERE id = ?1",
+            [id.0],
+            |r| r.get(0),
+        )?;
+        Ok(token.and_then(|t| t.try_into().ok()))
+    }
+
     /// Clears the last-resort mark, once a new leaf key is committed (12.5).
     pub(crate) fn clear_last_resort(&mut self, id: ConversationId) -> Result<(), StoreError> {
         self.conn().execute(
@@ -827,20 +838,20 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Counts a message this leaf wrote (12.9), and returns its counter and
-    /// `previous`.
-    pub(crate) fn next_counter(
+    /// Keeps the leaf's send counter (12.9): how many messages it has
+    /// written, and the last one's id. Stored before the message is
+    /// posted, so that a crash never makes two messages with one counter.
+    pub(crate) fn set_send_counter(
         &mut self,
         id: ConversationId,
-        message_id: [u8; 16],
-    ) -> Result<(u64, Option<[u8; 16]>), StoreError> {
-        let conv = self.conversation(id)?;
-        let counter = conv.sent + 1;
+        written: u64,
+        last: Option<[u8; 16]>,
+    ) -> Result<(), StoreError> {
         self.conn().execute(
             "UPDATE conversations SET sent = ?2, last_sent = ?3 WHERE id = ?1",
-            params![id.0, counter as i64, &message_id[..]],
+            params![id.0, written as i64, last.as_ref().map(|l| &l[..])],
         )?;
-        Ok((counter, conv.last_sent))
+        Ok(())
     }
 
     /// Notes activity at `t`, for the chat list.
@@ -1182,11 +1193,6 @@ impl Tx<'_> {
         Ok(changed)
     }
 
-    /// The conversation's leaves.
-    pub(crate) fn leaves(&self, conv: ConversationId) -> Result<Vec<LeafRow>, StoreError> {
-        read::leaves(self.conn(), conv)
-    }
-
     /// One leaf.
     pub(crate) fn leaf(
         &self,
@@ -1194,36 +1200,6 @@ impl Tx<'_> {
         leaf: u32,
     ) -> Result<Option<LeafRow>, StoreError> {
         read::leaf(self.conn(), conv, leaf)
-    }
-
-    /// Pins a leaf's pseudonym (7.3).
-    pub(crate) fn pin_pseudonym(
-        &mut self,
-        conv: ConversationId,
-        leaf: u32,
-        pseudonym: [u8; 16],
-    ) -> Result<(), StoreError> {
-        self.conn().execute(
-            "UPDATE leaves SET pseudonym = ?3 WHERE conv = ?1 AND leaf = ?2",
-            params![conv.0, leaf, &pseudonym[..]],
-        )?;
-        Ok(())
-    }
-
-    /// Notes a leaf's newest message (12.9).
-    pub(crate) fn leaf_sent(
-        &mut self,
-        conv: ConversationId,
-        leaf: u32,
-        counter: u64,
-        message_id: [u8; 16],
-    ) -> Result<(), StoreError> {
-        self.conn().execute(
-            "UPDATE leaves SET counter = ?3, last_message = ?4
-             WHERE conv = ?1 AND leaf = ?2 AND counter < ?3",
-            params![conv.0, leaf, counter as i64, &message_id[..]],
-        )?;
-        Ok(())
     }
 
     /// Marks that a leaf posted a SelfRemove (6.1).
@@ -1250,6 +1226,45 @@ impl Tx<'_> {
         self.conn().execute(
             "UPDATE leaves SET resync_seq = ?3 WHERE conv = ?1 AND leaf = ?2",
             params![conv.0, leaf, seq as i64],
+        )?;
+        Ok(())
+    }
+
+    // ---- the group's history (12.7)
+
+    /// The group's [`History`](risala_mls::checks::History), for the
+    /// checks that look back.
+    pub(crate) fn group_history(
+        &self,
+        conv: ConversationId,
+    ) -> Result<risala_mls::checks::History, StoreError> {
+        let json: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT history FROM group_state WHERE conv = ?1",
+                [conv.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match json {
+            None => Ok(risala_mls::checks::History::default()),
+            Some(json) => serde_json::from_str(&json)
+                .map_err(|e| StoreError::Corrupt(format!("a group's history: {e}"))),
+        }
+    }
+
+    /// Keeps the group's history.
+    pub(crate) fn set_group_history(
+        &mut self,
+        conv: ConversationId,
+        history: &risala_mls::checks::History,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(history)
+            .map_err(|e| StoreError::Corrupt(format!("a group's history: {e}")))?;
+        self.conn().execute(
+            "INSERT INTO group_state (conv, history) VALUES (?1, ?2)
+             ON CONFLICT (conv) DO UPDATE SET history = excluded.history",
+            params![conv.0, json],
         )?;
         Ok(())
     }

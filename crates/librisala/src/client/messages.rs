@@ -312,6 +312,7 @@ impl Client {
                     guest: false,
                     crypto: &crypto,
                     hooks: &hooks,
+                    device_key: None,
                     now,
                     config: &config,
                 };

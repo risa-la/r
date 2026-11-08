@@ -7,39 +7,47 @@
 //! - [`apply_post`]: one post of a mailbox, in seq order: the first valid
 //!   commit of each epoch wins (7.2), messages are read (12.9).
 //! - [`join_welcome`]: a sealed Welcome (12.8).
-
-use std::time::{Duration, UNIX_EPOCH};
+//!
+//! The group checks and their [`History`](risala_mls::checks::History) are
+//! `risala_mls::checks`'s, and messages are read by
+//! `risala_mls::message::receive`, with the cache's [`MessageLog`] as its
+//! history.
 
 use risala_mls::aad::Pseudonym;
-use risala_mls::checks::{GroupView, JoinExpectation, check_commit};
+use risala_mls::checks::{CommitPost, GroupView, JoinExpectation};
 use risala_mls::conversation::{ConversationKind, RisalaConversation};
 use risala_mls::framing::{ContentType, read_post};
-use risala_mls::group::{self as mls_group, Changes, Incoming, ProcessError};
+use risala_mls::group::{self as mls_group, Changes, Incoming, ProposalKind};
 use risala_mls::identity::{DeviceId, RisalaIdentity};
-use risala_mls::keypackage::{check_key_package_contents, read_key_package, verify_key_package};
-use risala_mls::openmls::group::MlsGroup;
-use risala_mls::openmls::prelude::{
-    GroupId, KeyPackage, KeyPackageBundle, KeyPackageRef, LeafNodeIndex,
+use risala_mls::keypackage::{
+    check_key_package_contents, lifetime_acceptable_at, read_key_package, verify_key_package,
 };
+use risala_mls::message::{self as mls_message, MessageHistory as _, PostInfo, ReceiveError};
+use risala_mls::openmls::group::MlsGroup;
+use risala_mls::openmls::prelude::{GroupId, KeyPackage, LeafNodeIndex};
 use risala_mls::openmls_traits::OpenMlsProvider as _;
-use risala_mls::openmls_traits::storage::StorageProvider as _;
 use risala_mls::profile::RisalaProfile;
 use risala_mls::token::SendToken;
 use risala_proto::names::{BoxName, Uid};
+use risala_proto::time::Timestamp;
 
-use super::wire::{self, Intent, Then};
+use super::wire::{Fetched, Intent, Then};
 use super::{Ctx, EngineError, Note};
 use crate::store::Tx;
 use crate::store::conversations::{
     ConvKind, ConvRow, ConvState, ConversationId, MailboxRow, NewConversation, PostRow, TreeLeaf,
     is_blocked,
 };
-use crate::store::messages::{NewOutbox, OutboxKind, OutboxRow, OutboxState};
+use crate::store::messages::{MessageLog, NewOutbox, OutboxKind, OutboxRow, OutboxState};
 
 type Result<T> = std::result::Result<T, EngineError>;
 
 fn mls(e: impl std::fmt::Display) -> EngineError {
     EngineError::Mls(e.to_string())
+}
+
+fn ts(ms: u64) -> Timestamp {
+    Timestamp::from_unix_millis(ms).unwrap_or(Timestamp::MAX)
 }
 
 /// Loads a group by id. Another process may have changed it, so this is
@@ -101,12 +109,9 @@ pub(crate) fn own_identity(cx: &Ctx<'_>) -> Result<RisalaIdentity> {
     if cx.guest {
         return Ok(RisalaIdentity::guest(cx.uid.clone()));
     }
-    let key = cx
-        .hooks
-        .device_key(cx.account, cx.uid)
-        .ok_or(EngineError::Invalid(
-            "this device's device key is not available".into(),
-        ))?;
+    let key = cx.device_key.ok_or(EngineError::Invalid(
+        "this device's device key is not available".into(),
+    ))?;
     Ok(RisalaIdentity::device(
         cx.uid.clone(),
         DeviceId::of_device_key(key.public_key()),
@@ -134,7 +139,8 @@ pub(crate) fn display_name_key(account: crate::store::AccountId) -> String {
 }
 
 /// The own leaf's profile for a commit made now (12.3): the display name,
-/// and `updated` from the clock, never below the leaf's previous one.
+/// and `updated` from the clock. `risala_mls::group::commit` raises it to
+/// the leaf's previous one and sets the streak.
 fn own_profile(
     tx: &Tx<'_>,
     cx: &Ctx<'_>,
@@ -149,8 +155,7 @@ fn own_profile(
             None => display_name(tx, cx)?,
         },
     };
-    let updated = cx.now.max(previous.map_or(0, |p| p.updated));
-    RisalaProfile::new(&name, updated)
+    RisalaProfile::new(&name, cx.now)
         .ok_or(EngineError::Invalid("a display name over 128 bytes".into()))
 }
 
@@ -170,7 +175,7 @@ pub(crate) fn create(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     ext_for: impl FnOnce([u8; 16]) -> RisalaConversation,
-    adds: Vec<Vec<u8>>,
+    adds: Vec<Fetched>,
 ) -> Result<Created> {
     let box_bytes: [u8; 16] = risala_mls::primitives::random().map_err(|_| EngineError::Random)?;
     let ext = ext_for(box_bytes);
@@ -178,8 +183,9 @@ pub(crate) fn create(
     let name = display_name(tx, cx)?;
     let profile =
         RisalaProfile::new(&name, cx.now).ok_or(EngineError::Invalid("display name".into()))?;
-    let (group, _) =
-        mls_group::create_group(&tx.mls(cx.crypto), &identity, &profile, &ext).map_err(mls)?;
+    let (group, _, history) =
+        mls_group::create_group(&tx.mls(cx.crypto), &identity, &profile, &ext, cx.now)
+            .map_err(mls)?;
     let token_hash = SendToken::of_group(&group, cx.crypto.as_ref())
         .map_err(mls)?
         .hash();
@@ -211,6 +217,7 @@ pub(crate) fn create(
         last_resort: false,
         now: cx.now,
     })?;
+    tx.set_group_history(conv, &history)?;
     tx.add_mailbox(conv, &mailbox, true, 0, None)?;
     tx.sync_leaves(conv, &tree_leaves(&group))?;
     if !adds.is_empty() {
@@ -251,20 +258,29 @@ pub(crate) fn queue_intent(
     )?)
 }
 
+/// Reads and verifies a KeyPackage's MLSMessage.
+fn read_kp(cx: &Ctx<'_>, bytes: &[u8]) -> Option<KeyPackage> {
+    verify_key_package(cx.crypto.as_ref(), read_key_package(bytes).ok()?).ok()
+}
+
 /// A KeyPackage fetched with KEYPKG GET, read and checked as far as the
-/// group can (12.5, 12.7): valid MLS, of the suite, a device's credential,
-/// a profile and an acceptable lifetime. Its binding is checked against
-/// the key file through the hooks; one that cannot be checked yet is
-/// accepted, and the added leaf stays unconfirmed (12.7).
-pub(crate) fn check_fetched(cx: &Ctx<'_>, bytes: &[u8], uid: &Uid) -> Option<KeyPackage> {
-    let kp = verify_key_package(cx.crypto.as_ref(), read_key_package(bytes).ok()?).ok()?;
-    let now = UNIX_EPOCH + Duration::from_millis(cx.now);
-    let (identity, _) = check_key_package_contents(&kp, now).ok()?;
-    if &identity.uid != uid {
+/// group can (12.5, 12.7): valid MLS, of the suite, a device's credential
+/// of `uid`, a profile, and a lifetime acceptable now. Its binding is
+/// checked against the key file through the hooks; one that cannot be
+/// checked yet is accepted, and the added leaf stays unconfirmed (12.7).
+pub(crate) fn check_fetched(
+    tx: &Tx<'_>,
+    cx: &Ctx<'_>,
+    bytes: &[u8],
+    uid: &Uid,
+) -> Option<KeyPackage> {
+    let kp = read_kp(cx, bytes)?;
+    let (identity, _) = check_key_package_contents(&kp).ok()?;
+    if &identity.uid != uid || !lifetime_acceptable_at(kp.life_time(), cx.now) {
         return None;
     }
     let device = identity.device_id?;
-    if let Some(key) = cx.hooks.device_key_of(cx.account, uid, &device) {
+    if let Some(key) = cx.hooks.device_key_of(tx, cx.account, uid, &device) {
         // `None`: not a current device of the identity.
         let key = key?;
         risala_mls::keypackage::check_binding(&kp, &identity, &key).ok()?;
@@ -272,8 +288,8 @@ pub(crate) fn check_fetched(cx: &Ctx<'_>, bytes: &[u8], uid: &Uid) -> Option<Key
     Some(kp)
 }
 
-/// Whether a commit of this device is pending in the conversation: posted
-/// or about to be.
+/// Whether a commit of this device is pending in the conversation: made,
+/// and posted or about to be.
 pub(crate) fn has_pending_commit(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
     Ok(tx
         .pending_outbox(conv)?
@@ -281,21 +297,34 @@ pub(crate) fn has_pending_commit(tx: &Tx<'_>, conv: ConversationId) -> Result<bo
         .any(|o| o.kind == OutboxKind::Commit && o.post.is_some()))
 }
 
+/// What [`build_commit`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Built {
+    /// The commit is made, and pending.
+    Made,
+    /// There was nothing left to do; the row is done.
+    Nothing,
+    /// The leaf has started the last 3 epochs: it may commit again only
+    /// once its `updated` can be 10 minutes after its previous one, at
+    /// this time (12.7, streaks).
+    WaitUntil(u64),
+}
+
 /// Makes the commit of an outbox row from its intent, against the group
-/// as it is, and leaves it pending (7.2). Returns `false` if there is
-/// nothing left to do, and marks the row done.
+/// as it is, and leaves it pending (7.2).
 pub(crate) fn build_commit(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
     row: &OutboxRow,
-) -> Result<bool> {
+) -> Result<Built> {
     let intent = Intent::decode(row.intent.as_deref().unwrap_or_default())
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
     let mut group = load(tx, cx, &conv.group_id)?;
     if group.pending_commit().is_some() {
         mls_group::discard_own_commit(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
     }
+    let history = tx.group_history(conv.id)?;
     let view = GroupView::of(group.public_group());
     let own = group.own_leaf_index();
     let remove: Vec<LeafNodeIndex> = view
@@ -312,11 +341,8 @@ pub(crate) fn build_commit(
         .map(|leaf| leaf.index)
         .collect();
     let mut add = Vec::new();
-    for bytes in &intent.add {
-        let Ok(kp) = read_key_package(bytes) else {
-            continue;
-        };
-        let Ok(kp) = verify_key_package(cx.crypto.as_ref(), kp) else {
+    for fetched in &intent.add {
+        let Some(kp) = read_kp(cx, &fetched.key_package) else {
             continue;
         };
         let Ok(identity) = RisalaIdentity::from_credential(kp.leaf_node().credential()) else {
@@ -338,29 +364,66 @@ pub(crate) fn build_commit(
         ),
         None => None,
     };
-    let proposals = group.pending_proposals().next().is_some();
-    let meaningful = !add.is_empty()
-        || !remove.is_empty()
-        || conversation.is_some()
-        || intent.new_leaf_key
-        || intent.display_name.is_some()
-        || proposals
-        || intent == Intent::default()
-        || intent.then != Then::Nothing;
-    if !meaningful {
+    // An intent to add or remove leaves that are all added or removed
+    // already, and that does nothing else, needs no commit.
+    let membership = !intent.add.is_empty() || !intent.remove.is_empty();
+    if membership
+        && add.is_empty()
+        && remove.is_empty()
+        && conversation.is_none()
+        && !intent.new_leaf_key
+        && intent.display_name.is_none()
+        && intent.then == Then::Nothing
+        && group.pending_proposals().next().is_none()
+    {
         tx.update_outbox(row.id, OutboxState::Done, None, None, None)?;
-        return Ok(false);
+        return Ok(Built::Nothing);
+    }
+    // 12.7, streaks: a fourth commit in a row needs `updated` at least 10
+    // minutes after the previous one, unless it only removes leaves of
+    // the committer's own identity.
+    let previous = group.own_leaf_node().and_then(RisalaProfile::of_leaf);
+    let streak = history.expected_streak(own, previous.as_ref().map_or(0, |p| p.streak));
+    let own_removals_only = add.is_empty()
+        && conversation.is_none()
+        && !intent.new_leaf_key
+        && intent.display_name.is_none()
+        && !remove.is_empty()
+        && remove.iter().all(|i| {
+            view.leaf(*i)
+                .and_then(|l| l.identity.as_ref())
+                .is_some_and(|id| id.uid == *cx.uid)
+        });
+    if streak > risala_mls::checks::STREAK_LIMIT
+        && !own_removals_only
+        && let Some(previous) = &previous
+    {
+        let earliest = previous.updated + risala_mls::checks::UPDATED_SKEW_MS;
+        if cx.now < earliest {
+            return Ok(Built::WaitUntil(earliest));
+        }
     }
     let profile = own_profile(tx, cx, &group, intent.display_name.as_deref())?;
+    // 7.8: a move's box is derived from the exporter of the epoch the
+    // commit is made in.
+    let move_box = if intent.move_box {
+        let b = derived_box(cx, &group)?;
+        tx.set_outbox_move(row.id, &BoxName::from_bytes(b))?;
+        Some(b)
+    } else {
+        None
+    };
     let out = mls_group::commit(
         &tx.mls(cx.crypto),
         &mut group,
         Pseudonym(conv.pseudonym),
         &profile,
+        &history,
         Changes {
             add,
             remove,
             conversation,
+            move_box,
             new_leaf_key: intent.new_leaf_key,
         },
     )
@@ -379,7 +442,22 @@ pub(crate) fn build_commit(
         None,
         None,
     )?;
-    Ok(true)
+    Ok(Built::Made)
+}
+
+/// The exporter label of a moved mailbox's box (7.8, 15).
+pub(crate) const BOX_LABEL: &str = "risala/1 box";
+
+/// The box a group moves to from the epoch it is in (7.8):
+/// `MLS-Exporter("risala/1 box", "", 16)`.
+pub(crate) fn derived_box(cx: &Ctx<'_>, group: &MlsGroup) -> Result<[u8; 16]> {
+    let bytes = group
+        .export_secret(cx.crypto.as_ref(), BOX_LABEL, b"", 16)
+        .map_err(mls)?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| EngineError::Mls("an exporter of another length".into()))
 }
 
 /// Drops this device's pending commit, which lost or was refused, and
@@ -425,7 +503,7 @@ pub(crate) fn apply_post(
     if !conv.state.in_group() {
         return Ok(applied);
     }
-    let Ok((framing, _aad)) = read_post(&post.message) else {
+    let Ok((framing, _)) = read_post(&post.message) else {
         return Ok(applied);
     };
     if framing.group_id != conv.group_id.as_slice() {
@@ -447,6 +525,10 @@ pub(crate) fn apply_post(
     let post_epoch = framing.epoch;
     let mut group = load(tx, cx, &conv.group_id)?;
     let epoch = group.epoch().as_u64();
+    let commit_post = CommitPost {
+        t: post.t,
+        next: post.next,
+    };
 
     // This device's own post: matched by its bytes, since it cannot
     // decrypt its own PrivateMessages.
@@ -461,10 +543,25 @@ pub(crate) fn apply_post(
                         .as_deref()
                         .and_then(|i| Intent::decode(i).ok())
                         .unwrap_or_default();
-                    let removed = removed_without_readd(&group);
-                    mls_group::merge_own_commit(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
+                    let removed = group
+                        .pending_commit()
+                        .map(mls_message::removed_leaves)
+                        .unwrap_or_default();
+                    let removed_ids = removed_identities(&group, &removed);
+                    let old_token = SendToken::of_group(&group, cx.crypto.as_ref()).map_err(mls)?;
+                    let mut history = tx.group_history(conv.id)?;
+                    mls_group::merge_own_commit(
+                        &tx.mls(cx.crypto),
+                        &mut group,
+                        &mut history,
+                        &commit_post,
+                    )
+                    .map_err(mls)?;
+                    tx.set_group_history(conv.id, &history)?;
+                    tx.set_prev_token(conv.id, old_token.as_bytes())?;
+                    note_commit(tx, cx, conv.id, &mut group, epoch, post.t, &removed)?;
                     tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
-                    after_commit(tx, cx, conv, &group, post, true, removed, &mut applied)?;
+                    after_commit(tx, cx, conv, &group, post, true, removed_ids, &mut applied)?;
                     own_commit_won(tx, cx, conv, &row, &intent, &mut applied)?;
                 } else {
                     // A commit for an epoch it no longer holds: it lost.
@@ -505,51 +602,60 @@ pub(crate) fn apply_post(
                     return Ok(applied);
                 }
             };
-            // The group checks (12.7): next, then the rest.
-            // A device that the commit removes cannot compute the next
-            // epoch's token, and checks only that `next` is there: whether
-            // the others accept the commit no longer matters to it.
-            let next_ok = match post.next {
-                None => false,
-                Some(_) if commit.staged.self_removed() => true,
-                Some(next) => {
-                    mls_group::next_token_hash_ok(&commit.staged, cx.crypto.as_ref(), &next)
+            // The group checks (12.7), next included.
+            let mut history = tx.group_history(conv.id)?;
+            let verdict = match mls_group::check_received_commit(
+                &group,
+                &commit,
+                &history,
+                &commit_post,
+                cx.crypto.as_ref(),
+            ) {
+                Ok(verdict) => verdict,
+                Err(e) => {
+                    tracing::debug!(error = %e, seq = post.seq, "an invalid commit");
+                    applied.notes.push(Note::InvalidCommit {
+                        conv: conv.id,
+                        seq: post.seq,
+                        reason: e.to_string(),
+                    });
+                    return Ok(applied);
                 }
             };
-            if !next_ok {
-                tracing::debug!(seq = post.seq, "a commit with a wrong or missing next");
-                return Ok(applied);
+            // The key checks never make it invalid (12.7); their repairs
+            // are the identity area's (task C1).
+            {
+                let facts = cx.hooks.key_facts(tx, cx.account);
+                let report =
+                    mls_group::check_received_keys(&group, &commit, &verdict, facts.as_ref());
+                if report != risala_mls::checks::KeyReport::default() {
+                    tracing::info!(?report, "a commit whose key checks need a repair");
+                }
             }
-            let facts = cx.hooks.key_facts(tx, cx.account);
-            let at = UNIX_EPOCH + Duration::from_millis(post.t);
-            let view = GroupView::of(group.public_group());
-            if let Err(e) = check_commit(&view, &commit.view, facts.as_ref(), at) {
-                tracing::debug!(error = %e, seq = post.seq, "an invalid commit");
-                applied.notes.push(Note::InvalidCommit {
-                    conv: conv.id,
-                    seq: post.seq,
-                    reason: e.to_string(),
-                });
-                return Ok(applied);
-            }
-            drop(facts);
             let own_pending = tx
                 .pending_outbox(conv.id)?
                 .into_iter()
                 .find(|o| o.kind == OutboxKind::Commit && o.post.is_some());
-            let removed = removed_by_staged(&group, &commit.staged);
-            let previous_ext = mls_group::conversation(&group);
-            let active =
-                mls_group::apply_commit(&tx.mls(cx.crypto), &mut group, *commit).map_err(mls)?;
+            let removed = mls_message::removed_leaves(&commit.staged);
+            let removed_ids = removed_identities(&group, &removed);
+            let old_token = SendToken::of_group(&group, cx.crypto.as_ref()).map_err(mls)?;
+            let active = mls_group::apply_commit(
+                &tx.mls(cx.crypto),
+                &mut group,
+                *commit,
+                &verdict,
+                &mut history,
+                &commit_post,
+            )
+            .map_err(mls)?;
+            tx.set_group_history(conv.id, &history)?;
             if let Some(row) = own_pending {
                 // Another commit won the epoch: this device's lost (7.2).
                 tx.update_outbox(row.id, OutboxState::Lost, None, None, None)?;
-                if let Some(intent) = &row.intent {
+                if active && let Some(intent) = &row.intent {
                     let intent =
                         Intent::decode(intent).map_err(|e| EngineError::Invalid(e.to_string()))?;
-                    if active {
-                        queue_intent(tx, conv.id, &intent, cx.now)?;
-                    }
+                    queue_intent(tx, conv.id, &intent, cx.now)?;
                 }
             }
             if !active {
@@ -558,23 +664,36 @@ pub(crate) fn apply_post(
                 applied.notes.push(Note::Removed { conv: conv.id });
                 return Ok(applied);
             }
-            let _ = previous_ext;
-            after_commit(tx, cx, conv, &group, post, false, removed, &mut applied)?;
+            tx.set_prev_token(conv.id, old_token.as_bytes())?;
+            note_commit(tx, cx, conv.id, &mut group, epoch, post.t, &removed)?;
+            after_commit(tx, cx, conv, &group, post, false, removed_ids, &mut applied)?;
         }
         ContentType::Proposal => {
             if post_epoch != epoch {
                 return Ok(applied);
             }
             match mls_group::process_message(&tx.mls(cx.crypto), &mut group, &post.message) {
-                Ok(Incoming::Proposal { .. }) => {
-                    for queued in group.pending_proposals() {
-                        if let (
-                            risala_mls::openmls::prelude::Proposal::SelfRemove,
-                            risala_mls::openmls::prelude::Sender::Member(index),
-                        ) = (queued.proposal(), queued.sender())
-                        {
-                            tx.mark_self_removed(conv.id, index.u32())?;
+                Ok(Incoming::Proposal {
+                    kind,
+                    sender,
+                    reference,
+                    ..
+                }) => {
+                    match kind {
+                        ProposalKind::SelfRemove => {
+                            if let Some(sender) = sender {
+                                tx.mark_self_removed(conv.id, sender.u32())?;
+                            }
+                            let mut log = MessageLog::new(tx.conn(), conv.id);
+                            mls_message::note_self_removes(&group, &mut log);
+                            log.finish()?;
                         }
+                        ProposalKind::Update => {
+                            let mut history = tx.group_history(conv.id)?;
+                            history.note_update(&reference, post.t);
+                            tx.set_group_history(conv.id, &history)?;
+                        }
+                        ProposalKind::Join => {}
                     }
                     applied.notes.push(Note::Proposals { conv: conv.id });
                 }
@@ -583,103 +702,72 @@ pub(crate) fn apply_post(
             }
         }
         ContentType::Application => {
-            if post_epoch > epoch {
-                applied.notes.push(Note::Undecryptable {
-                    conv: conv.id,
-                    epoch: post_epoch,
-                });
-                return Ok(applied);
-            }
-            // Late messages (12.9): an epoch at most 2 behind, posted within
-            // an hour of the commit that ended it, as far as the cache
-            // knows when that was.
-            if post_epoch + 2 < epoch {
-                return Ok(applied);
-            }
-            if post_epoch < epoch
-                && let Some(ended) = conv.epoch_t
-                && post_epoch + 1 == epoch
-                && post.t > ended + 3_600_000
-            {
-                return Ok(applied);
-            }
-            let incoming =
-                mls_group::process_message(&tx.mls(cx.crypto), &mut group, &post.message);
-            match incoming {
-                Ok(Incoming::Application {
-                    sender,
-                    aad,
-                    content,
-                }) => {
+            let mut log = MessageLog::new(tx.conn(), conv.id);
+            let received = mls_message::receive(
+                &tx.mls(cx.crypto),
+                &mut group,
+                &post.message,
+                PostInfo {
+                    t: ts(post.t),
+                    live: false,
+                },
+                &mut log,
+            );
+            log.finish()?;
+            match received {
+                Ok(decrypted) => {
                     super::content::receive(
                         tx,
                         cx,
                         conv,
-                        super::content::Received {
-                            leaf: sender.u32(),
-                            pseudonym: aad.pseudonym.0,
-                            frank: aad.frank,
-                            body: &content,
-                            seq: Some(post.seq),
-                            t: post.t,
-                            epoch: post_epoch,
-                        },
+                        &group,
+                        decrypted,
+                        Some(post.seq),
+                        post.t,
                         &mut applied,
                     )?;
                 }
-                Ok(_) => {}
-                Err(ProcessError::Mls(e)) => {
-                    tracing::debug!(error = %e, seq = post.seq, "a message this device cannot read");
+                Err(ReceiveError::Process(e)) if post_epoch > epoch => {
+                    tracing::debug!(error = %e, "a message of a later epoch");
+                    applied.notes.push(Note::Undecryptable {
+                        conv: conv.id,
+                        epoch: post_epoch,
+                    });
                 }
-                Err(e) => tracing::debug!(error = %e, "a message this device cannot use"),
+                Err(ReceiveError::Storage(e)) => return Err(EngineError::Mls(format!("{e:?}"))),
+                Err(e) => tracing::debug!(error = %e, seq = post.seq, "a message not shown"),
             }
         }
     }
     Ok(applied)
 }
 
-/// The (uid, device) of every leaf that `staged` removes and does not
-/// add again, for the move of 7.8.
-fn removed_by_staged(
-    group: &MlsGroup,
-    staged: &risala_mls::openmls::group::StagedCommit,
-) -> Vec<RisalaIdentity> {
-    let view = GroupView::of(group.public_group());
-    let mut removed: Vec<RisalaIdentity> = Vec::new();
-    for queued in staged.queued_proposals() {
-        let index = match queued.proposal() {
-            risala_mls::openmls::prelude::Proposal::Remove(r) => Some(r.removed()),
-            risala_mls::openmls::prelude::Proposal::SelfRemove => match queued.sender() {
-                risala_mls::openmls::prelude::Sender::Member(i) => Some(*i),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(index) = index
-            && let Some(identity) = view.leaf(index).and_then(|l| l.identity.clone())
-        {
-            removed.push(identity);
-        }
-    }
-    let added: Vec<RisalaIdentity> = staged
-        .add_proposals()
-        .filter_map(|add| {
-            RisalaIdentity::from_credential(
-                add.add_proposal().key_package().leaf_node().credential(),
-            )
-            .ok()
-        })
-        .collect();
-    removed.retain(|r| !added.contains(r));
-    removed
+/// Notes a commit in the message history (12.9): the end of the epoch it
+/// ended, and its removed leaves; then deletes past epochs' secrets that
+/// are past the limits.
+fn note_commit(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: ConversationId,
+    group: &mut MlsGroup,
+    ended_epoch: u64,
+    t: u64,
+    removed: &[LeafNodeIndex],
+) -> Result<()> {
+    let mut log = MessageLog::new(tx.conn(), conv);
+    log.note_commit(ended_epoch, ts(t), removed);
+    mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(t)).map_err(mls)?;
+    log.finish()?;
+    Ok(())
 }
 
-/// [`removed_by_staged`] for this device's own pending commit.
-fn removed_without_readd(group: &MlsGroup) -> Vec<RisalaIdentity> {
-    match group.pending_commit() {
-        Some(staged) => removed_by_staged(group, staged),
-        None => Vec::new(),
-    }
+/// The identities of leaves, for the move of 7.8.
+fn removed_identities(group: &MlsGroup, removed: &[LeafNodeIndex]) -> Vec<RisalaIdentity> {
+    let view = GroupView::of(group.public_group());
+    removed
+        .iter()
+        .filter_map(|i| view.leaf(*i).and_then(|l| l.identity.clone()))
+        .collect()
 }
 
 /// Brings the cache in line with the group after a commit: its epoch,
@@ -711,7 +799,17 @@ fn after_commit(
             });
         }
     }
-    tx.sync_leaves(conv.id, &tree_leaves(group))?;
+    let tree = tree_leaves(group);
+    tx.sync_leaves(conv.id, &tree)?;
+    // 7.8: a removal that adds the same device back is no reason to move.
+    let removed: Vec<RisalaIdentity> = removed
+        .into_iter()
+        .filter(|id| {
+            !tree
+                .iter()
+                .any(|l| l.uid == id.uid && l.device_id == id.device_id.map(|d| d.0))
+        })
+        .collect();
     if conv.state == ConvState::Creating {
         tx.set_state(conv.id, ConvState::Active)?;
     }
@@ -725,6 +823,64 @@ fn after_commit(
         removed,
     });
     Ok(())
+}
+
+/// Leaves a conversation (6.1): a commit that removes this identity's
+/// other leaves, if it has any, followed by a SelfRemove once it wins;
+/// otherwise the SelfRemove alone.
+pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<()> {
+    let row = tx.conversation(conv)?;
+    if !row.state.in_group() || row.state == ConvState::Leaving {
+        return Ok(());
+    }
+    let own_leaves: Vec<(String, Option<[u8; 48]>)> =
+        crate::store::conversations::read::leaves(tx.conn(), conv)?
+            .into_iter()
+            .filter(|l| l.uid == *own)
+            .map(|l| (l.uid.to_string(), l.device_id))
+            .collect();
+    if own_leaves.len() > 1 {
+        // This device's own leaf is left out when the commit is made.
+        queue_intent(
+            tx,
+            conv,
+            &Intent {
+                remove: own_leaves,
+                then: Then::SelfRemove,
+                ..Intent::default()
+            },
+            now,
+        )?;
+    } else {
+        tx.set_state(conv, ConvState::Leaving)?;
+        queue_self_remove(tx, conv, now)?;
+    }
+    Ok(())
+}
+
+/// 5.1: devices keep one direct conversation per pair of identities. If
+/// `conv` is a second one, the one whose group id is lower stays, and this
+/// device leaves the other. Returns the one it leaves, if any.
+pub(crate) fn keep_one_direct(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: ConversationId,
+) -> Result<Option<ConversationId>> {
+    let row = tx.conversation(conv)?;
+    if row.kind != ConvKind::Direct {
+        return Ok(None);
+    }
+    let other = tx.conversations_of(cx.account)?.into_iter().find(|r| {
+        r.id != conv && r.kind == ConvKind::Direct && r.peer == row.peer && r.state.in_group()
+    });
+    let Some(other) = other else { return Ok(None) };
+    let higher = if other.group_id < row.group_id {
+        row.id
+    } else {
+        other.id
+    };
+    leave(tx, higher, cx.uid, cx.now)?;
+    Ok(Some(higher))
 }
 
 /// Queues a SelfRemove, made when it is posted (6.1).
@@ -753,25 +909,37 @@ fn own_commit_won(
         tx.clear_last_resort(conv.id)?;
     }
     if let Some(welcome) = &row.welcome {
-        let parts =
-            wire::split_welcome(welcome).map_err(|e| EngineError::Invalid(e.to_string()))?;
-        for bytes in &intent.add {
-            let Ok(kp) = read_key_package(bytes) else {
-                continue;
-            };
-            let Ok(kp) = verify_key_package(cx.crypto.as_ref(), kp) else {
+        // The KeyPackages the commit added, with their put secrets.
+        let mut kps = Vec::new();
+        let mut secrets = Vec::new();
+        for fetched in &intent.add {
+            let Some(kp) = read_kp(cx, &fetched.key_package) else {
                 continue;
             };
             let Ok(reference) = kp.hash_ref(cx.crypto.as_ref()) else {
                 continue;
             };
-            let Some(part) = parts.iter().find(|p| p.reference == reference.as_slice()) else {
-                continue;
-            };
-            let sealed = wire::seal_welcome(cx.crypto.as_ref(), &kp, part)
-                .map_err(|e| EngineError::Invalid(e.to_string()))?;
+            if risala_mls::welcome::split_welcome(welcome, &[reference.as_slice()]).is_ok() {
+                secrets.push((reference.as_slice().to_vec(), fetched.secret.clone()));
+                kps.push(kp);
+            }
+        }
+        let sealed = risala_mls::welcome::seal_welcomes(cx.crypto.as_ref(), welcome, &kps)
+            .map_err(|e| EngineError::Mls(e.to_string()))?;
+        for s in sealed {
+            let secret = secrets
+                .iter()
+                .find(|(r, _)| *r == s.key_package_ref)
+                .map(|(_, secret)| secret.clone())
+                .unwrap_or_default();
             let wait = super::random_below(cx.config.max_welcome_wait_ms)?;
-            tx.queue_welcome(conv.id, reference.as_slice(), &sealed, cx.now + wait)?;
+            tx.queue_welcome(
+                conv.id,
+                &s.key_package_ref,
+                &secret,
+                &s.sealed,
+                cx.now + wait,
+            )?;
         }
     }
     if intent.then == Then::SelfRemove {
@@ -802,12 +970,16 @@ pub(crate) fn encrypt(
     conv: &ConvRow,
     body: &[u8],
 ) -> Result<(Vec<u8>, u64)> {
-    let message =
-        wire::RisalaMessage::decode(body).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    let message = mls_message::RisalaMessage::decode(body)
+        .map_err(|e| EngineError::Invalid(e.to_string()))?;
     let mut group = load(tx, cx, &conv.group_id)?;
-    let aad = risala_mls::aad::RisalaAad::application(Pseudonym(conv.pseudonym), message.frank());
-    let post =
-        mls_group::encrypt_application(&tx.mls(cx.crypto), &mut group, &aad, body).map_err(mls)?;
+    let post = mls_message::encrypt(
+        &tx.mls(cx.crypto),
+        &mut group,
+        Pseudonym(conv.pseudonym),
+        &message,
+    )
+    .map_err(mls)?;
     Ok((post, group.epoch().as_u64()))
 }
 
@@ -828,25 +1000,11 @@ pub(crate) fn epoch_check(tx: &Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<[
         .ok_or(EngineError::Mls("a short epoch authenticator".into()))
 }
 
-/// A KeyPackageRef from its bytes: a `HashReference`, whose encoding is
-/// one vector.
-fn key_package_ref(bytes: &[u8]) -> Result<KeyPackageRef> {
-    use risala_mls::openmls::prelude::tls_codec::DeserializeBytes as _;
-    let mut encoded = Vec::with_capacity(bytes.len() + 2);
-    wire::write_varint(&mut encoded, bytes.len());
-    encoded.extend_from_slice(bytes);
-    KeyPackageRef::tls_deserialize_exact_bytes(&encoded)
-        .map_err(|e| EngineError::Mls(e.to_string()))
-}
-
 /// What [`join_welcome`] did.
 #[derive(Debug)]
 pub(crate) enum Joined {
     /// Joined the conversation.
-    Joined {
-        conv: ConversationId,
-        mailbox: BoxName,
-    },
+    Joined { conv: ConversationId },
     /// The Welcome is not for this device, or its group fails the checks
     /// of 12.7 or 5.7: delete it.
     Refused(String),
@@ -856,42 +1014,25 @@ pub(crate) enum Joined {
 /// its group if it passes the checks of 12.7 and is not refused for a
 /// block (5.7) (12.8).
 pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Result<Joined> {
-    let mut opened = None;
-    for reference in tx.key_package_refs(cx.account)? {
-        let kp_ref = key_package_ref(&reference)?;
-        let bundle: Option<KeyPackageBundle> = tx
-            .mls(cx.crypto)
-            .storage()
-            .key_package(&kp_ref)
-            .map_err(|e| EngineError::Mls(format!("{e:?}")))?;
-        let Some(bundle) = bundle else { continue };
-        if let Ok(welcome) = wire::open_welcome(
-            cx.crypto.as_ref(),
-            bundle.init_private_key(),
-            &reference,
-            sealed,
-        ) {
-            opened = Some((reference, welcome));
-            break;
-        }
-    }
-    let Some((reference, welcome)) = opened else {
-        return Ok(Joined::Refused(
-            "no KeyPackage of this device opens it".into(),
-        ));
+    let candidates = tx.key_package_refs(cx.account)?;
+    let opened = risala_mls::welcome::open_sealed_welcome(&tx.mls(cx.crypto), sealed, &candidates);
+    let (reference, welcome) = match opened {
+        Ok(opened) => opened,
+        Err(e) => return Ok(Joined::Refused(e.to_string())),
     };
     let expect = JoinExpectation {
         host: cx.host.to_owned(),
         own_uid: cx.uid.clone(),
         public_room: None,
     };
-    let joined = match mls_group::join_by_welcome(&tx.mls(cx.crypto), &welcome, None, &expect) {
-        Ok(joined) => joined,
-        Err(risala_mls::group::GroupError::Storage(e)) => {
-            return Err(EngineError::Mls(format!("{e:?}")));
-        }
-        Err(e) => return Ok(Joined::Refused(e.to_string())),
-    };
+    let joined =
+        match mls_group::join_by_welcome(&tx.mls(cx.crypto), &welcome, None, &expect, cx.now) {
+            Ok(joined) => joined,
+            Err(risala_mls::group::GroupError::Storage(e)) => {
+                return Err(EngineError::Mls(format!("{e:?}")));
+            }
+            Err(e) => return Ok(Joined::Refused(e.to_string())),
+        };
     let mut group = joined.group;
     let ext = mls_group::conversation(&group)
         .ok_or(EngineError::Mls("no conversation extension".into()))?;
@@ -931,6 +1072,7 @@ pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Resu
         last_resort: joined.last_resort,
         now: cx.now,
     })?;
+    tx.set_group_history(conv, &joined.history)?;
     // 7.4: follow after a random wait, so that the FOLLOW does not match
     // the WELCOME line.
     let wait = super::random_below(cx.config.max_follow_wait_ms)?;
@@ -949,7 +1091,7 @@ pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Resu
             cx.now,
         )?;
     }
-    Ok(Joined::Joined { conv, mailbox })
+    Ok(Joined::Joined { conv })
 }
 
 /// Makes `n` ordinary KeyPackages and, if `last_resort`, one of last
@@ -959,20 +1101,17 @@ pub(crate) fn make_key_packages(
     cx: &Ctx<'_>,
     n: usize,
     last_resort: bool,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let key = cx
-        .hooks
-        .device_key(cx.account, cx.uid)
-        .ok_or(EngineError::Invalid(
-            "this device's device key is not available".into(),
-        ))?;
+) -> Result<Vec<Vec<u8>>> {
+    let key = cx.device_key.ok_or(EngineError::Invalid(
+        "this device's device key is not available".into(),
+    ))?;
     let profile = RisalaProfile::new("", cx.now).expect("an empty name");
     let mut out = Vec::new();
     for i in 0..n + usize::from(last_resort) {
         let resort = i == n;
         let made = risala_mls::keypackage::make_key_package(
             &tx.mls(cx.crypto),
-            &key,
+            key,
             cx.uid,
             &profile,
             resort,
@@ -981,10 +1120,7 @@ pub(crate) fn make_key_packages(
         let reference = made.key_package.hash_ref(cx.crypto.as_ref()).map_err(mls)?;
         tx.add_key_package(cx.account, reference.as_slice(), resort, cx.now)?;
         let message = risala_mls::openmls::prelude::MlsMessageOut::from(made.key_package);
-        out.push((
-            reference.as_slice().to_vec(),
-            risala_mls::wire::to_bytes(&message),
-        ));
+        out.push(risala_mls::wire::to_bytes(&message));
     }
     Ok(out)
 }

@@ -88,7 +88,9 @@ CREATE TABLE gaps (
 -- again in each new epoch until applied, 6.1). epoch is the epoch post
 -- was made for. state: 'queued', 'sent' (POST in flight), 'posted' (OK
 -- seq=), 'done' (applied in order: won, or seen), 'lost' (a commit that
--- lost its epoch, or was refused). not_before delays a retry.
+-- lost its epoch, or was refused). not_before delays a retry. A move's
+-- commit (7.8) has its new box in move_box, and moved once CREATE made
+-- that mailbox.
 CREATE TABLE outbox (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     conv       INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -106,16 +108,46 @@ CREATE TABLE outbox (
     seq        INTEGER,
     attempts   INTEGER NOT NULL DEFAULT 0,
     not_before INTEGER,
-    created    INTEGER NOT NULL
+    created    INTEGER NOT NULL,
+    move_box   TEXT,
+    moved      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX outbox_conv ON outbox (conv, state);
 
+-- What the device knows of each leaf index's messages (12.9, 7.3, 7.4):
+-- risala-mls's SenderLog. pseudonym is the pinned one; last_counter and
+-- last_id the highest counter seen and its message; gaps the counters
+-- missing below it, as pairs of u64; left_group whether it posted a
+-- SelfRemove; removed_in the newest epoch a commit removing a leaf at this
+-- index ended.
+CREATE TABLE sender_logs (
+    conv         INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    leaf         INTEGER NOT NULL,
+    pseudonym    BLOB,
+    last_counter INTEGER,
+    last_id      BLOB,
+    gaps         BLOB NOT NULL,
+    left_group   INTEGER NOT NULL DEFAULT 0,
+    removed_in   INTEGER,
+    PRIMARY KEY (conv, leaf)
+) WITHOUT ROWID;
+
+-- The t of the commits that ended recent epochs (12.9, late messages).
+CREATE TABLE epoch_ends (
+    conv  INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    epoch INTEGER NOT NULL,
+    t     INTEGER NOT NULL,
+    PRIMARY KEY (conv, epoch)
+) WITHOUT ROWID;
+
 -- Sealed Welcomes waiting for their random time (12.8), each for one
--- KeyPackage by its ref. sent_at is set while WELCOME PUT is in flight.
+-- KeyPackage by its ref, with the put secret of its handout (12.5).
+-- in_flight is set while WELCOME PUT is in flight.
 CREATE TABLE welcomes_out (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     conv       INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     ref        BLOB NOT NULL,
+    secret     BLOB NOT NULL,
     welcome    BLOB NOT NULL,
     send_after INTEGER NOT NULL,
     in_flight  INTEGER NOT NULL DEFAULT 0
@@ -265,6 +297,10 @@ pub struct OutboxRow {
     pub attempts: u32,
     /// Not to be tried before this time.
     pub not_before: Option<u64>,
+    /// A move's new box (7.8).
+    pub move_box: Option<risala_proto::names::BoxName>,
+    /// Whether the move's new mailbox was created.
+    pub moved: bool,
 }
 
 /// What an outbox row holds.
@@ -340,7 +376,7 @@ impl OutboxState {
 }
 
 const OUTBOX_COLUMNS: &str = "id, conv, kind, message_id, body, epoch, post, next, groupinfo, \
-     welcome, intent, state, seq, attempts, not_before";
+     welcome, intent, state, seq, attempts, not_before, move_box, moved";
 
 type OutboxRaw = (OutboxRow, String, String);
 
@@ -362,6 +398,10 @@ fn outbox_row(row: &Row<'_>) -> rusqlite::Result<OutboxRaw> {
             seq: row.get::<_, Option<i64>>(12)?.map(|s| s as u64),
             attempts: row.get::<_, i64>(13)? as u32,
             not_before: row.get::<_, Option<i64>>(14)?.map(|t| t as u64),
+            move_box: row
+                .get::<_, Option<String>>(15)?
+                .and_then(|b| b.parse().ok()),
+            moved: row.get(16)?,
         },
         row.get(2)?,
         row.get(11)?,
@@ -404,6 +444,8 @@ pub struct WelcomeOut {
     pub conv: ConversationId,
     /// The KeyPackageRef.
     pub reference: Vec<u8>,
+    /// The put secret of its handout (12.5).
+    pub secret: Vec<u8>,
     /// The sealed Welcome.
     pub welcome: Vec<u8>,
 }
@@ -465,21 +507,6 @@ pub struct NewMessage<'a> {
 }
 
 impl Tx<'_> {
-    /// Whether the group has seen `message_id` (12.9, step 3).
-    pub(crate) fn message_seen(
-        &self,
-        conv: ConversationId,
-        message_id: &[u8; 16],
-    ) -> Result<bool, StoreError> {
-        let n: i64 = self.conn().query_row(
-            "SELECT (SELECT count(*) FROM messages WHERE conv = ?1 AND message_id = ?2)
-                  + (SELECT count(*) FROM seen WHERE conv = ?1 AND message_id = ?2)",
-            params![conv.0, &message_id[..]],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    }
-
     /// Notes a message id that is not stored as a message.
     pub(crate) fn mark_seen(
         &mut self,
@@ -839,6 +866,26 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Sets a move's new box (7.8).
+    pub(crate) fn set_outbox_move(
+        &mut self,
+        id: i64,
+        mailbox: &risala_proto::names::BoxName,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE outbox SET move_box = ?2, moved = 0 WHERE id = ?1",
+            params![id, mailbox.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Notes that a move's new mailbox was created (7.8).
+    pub(crate) fn set_moved(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn()
+            .execute("UPDATE outbox SET moved = 1 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// The outbox row whose last post is `post`, if any.
     pub(crate) fn outbox_by_post(
         &self,
@@ -863,12 +910,14 @@ impl Tx<'_> {
         &mut self,
         conv: ConversationId,
         reference: &[u8],
+        secret: &[u8],
         welcome: &[u8],
         send_after: u64,
     ) -> Result<(), StoreError> {
         self.conn().execute(
-            "INSERT INTO welcomes_out (conv, ref, welcome, send_after) VALUES (?1, ?2, ?3, ?4)",
-            params![conv.0, reference, welcome, send_after as i64],
+            "INSERT INTO welcomes_out (conv, ref, secret, welcome, send_after)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![conv.0, reference, secret, welcome, send_after as i64],
         )?;
         Ok(())
     }
@@ -883,7 +932,7 @@ impl Tx<'_> {
         let mut out = Vec::new();
         {
             let mut stmt = self.conn().prepare_cached(
-                "SELECT w.id, w.conv, w.ref, w.welcome FROM welcomes_out w
+                "SELECT w.id, w.conv, w.ref, w.secret, w.welcome FROM welcomes_out w
                  JOIN conversations c ON c.id = w.conv
                  WHERE c.account = ?1 AND w.in_flight = 0 AND w.send_after <= ?2 ORDER BY w.id",
             )?;
@@ -892,7 +941,8 @@ impl Tx<'_> {
                     id: r.get(0)?,
                     conv: ConversationId(r.get(1)?),
                     reference: r.get(2)?,
-                    welcome: r.get(3)?,
+                    secret: r.get(3)?,
+                    welcome: r.get(4)?,
                 })
             })?;
             for row in rows {
@@ -996,5 +1046,204 @@ impl Store {
     /// The gaps of a conversation (7.4).
     pub fn gap_rows(&self, conv: ConversationId) -> Result<Vec<GapRow>, StoreError> {
         self.read(|conn| read::gaps(conn, conv))
+    }
+}
+
+/// The message history of one group in the cache (12.9): risala-mls's
+/// [`MessageHistory`](risala_mls::message::MessageHistory), on a
+/// connection that may be a write transaction's. Its methods cannot fail,
+/// so the first error is kept in [`error`](Self::error) for the caller to
+/// check.
+pub(crate) struct MessageLog<'c> {
+    conn: &'c rusqlite::Connection,
+    conv: ConversationId,
+    /// The first error, if any.
+    pub error: Option<StoreError>,
+}
+
+impl<'c> MessageLog<'c> {
+    /// The log of `conv`, on `conn`.
+    pub(crate) fn new(conn: &'c rusqlite::Connection, conv: ConversationId) -> MessageLog<'c> {
+        MessageLog {
+            conn,
+            conv,
+            error: None,
+        }
+    }
+
+    fn keep<T: Default>(&mut self, r: Result<T, rusqlite::Error>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                self.error.get_or_insert(e.into());
+                T::default()
+            }
+        }
+    }
+
+    /// Gives back the first error.
+    pub(crate) fn finish(self) -> Result<(), StoreError> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+fn encode_gaps(gaps: &[(u64, u64)]) -> Vec<u8> {
+    gaps.iter()
+        .flat_map(|(a, b)| a.to_be_bytes().into_iter().chain(b.to_be_bytes()))
+        .collect()
+}
+
+fn decode_gaps(bytes: &[u8]) -> Vec<(u64, u64)> {
+    bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| {
+            let (a, b) = c.split_at(8);
+            (
+                u64::from_be_bytes(a.try_into().expect("8 bytes")),
+                u64::from_be_bytes(b.try_into().expect("8 bytes")),
+            )
+        })
+        .collect()
+}
+
+impl risala_mls::message::MessageHistory for MessageLog<'_> {
+    fn seen(&self, id: &risala_proto::content::MessageId) -> bool {
+        self.conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM messages WHERE conv = ?1 AND message_id = ?2)
+                      + (SELECT count(*) FROM seen WHERE conv = ?1 AND message_id = ?2)",
+                params![self.conv.0, &id.as_bytes()[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            // Unknown: treated as seen, so nothing is shown twice.
+            .unwrap_or(true)
+    }
+
+    fn add_seen(&mut self, id: risala_proto::content::MessageId) {
+        let r = self
+            .conn
+            .execute(
+                "INSERT INTO seen (conv, message_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                params![self.conv.0, &id.as_bytes()[..]],
+            )
+            .map(drop);
+        self.keep(r);
+    }
+
+    fn sender(
+        &self,
+        leaf: risala_mls::openmls::prelude::LeafNodeIndex,
+    ) -> risala_mls::message::SenderLog {
+        type Row = (
+            Option<Vec<u8>>,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Vec<u8>,
+            bool,
+            Option<i64>,
+        );
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT pseudonym, last_counter, last_id, gaps, left_group, removed_in
+                 FROM sender_logs WHERE conv = ?1 AND leaf = ?2",
+                params![self.conv.0, leaf.u32()],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap_or_default();
+        let Some((pseudonym, counter, id, gaps, left, removed_in)) = row else {
+            return risala_mls::message::SenderLog::default();
+        };
+        let fixed16 = |b: Vec<u8>| <[u8; 16]>::try_from(b.as_slice()).ok();
+        risala_mls::message::SenderLog {
+            pseudonym: pseudonym.and_then(fixed16).map(risala_mls::Pseudonym),
+            last: match (counter, id.and_then(fixed16)) {
+                (Some(c), Some(id)) => {
+                    Some((c as u64, risala_proto::content::MessageId::from_bytes(id)))
+                }
+                _ => None,
+            },
+            gaps: decode_gaps(&gaps),
+            left,
+            removed_in: removed_in.map(|e| e as u64),
+        }
+    }
+
+    fn set_sender(
+        &mut self,
+        leaf: risala_mls::openmls::prelude::LeafNodeIndex,
+        log: risala_mls::message::SenderLog,
+    ) {
+        let r = self
+            .conn
+            .execute(
+                "INSERT INTO sender_logs (conv, leaf, pseudonym, last_counter, last_id, gaps,
+                                          left_group, removed_in)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (conv, leaf) DO UPDATE SET pseudonym = excluded.pseudonym,
+                    last_counter = excluded.last_counter, last_id = excluded.last_id,
+                    gaps = excluded.gaps, left_group = excluded.left_group,
+                    removed_in = excluded.removed_in",
+                params![
+                    self.conv.0,
+                    leaf.u32(),
+                    log.pseudonym.map(|p| p.0.to_vec()),
+                    log.last.map(|(c, _)| c as i64),
+                    log.last.map(|(_, id)| id.as_bytes().to_vec()),
+                    encode_gaps(&log.gaps),
+                    log.left,
+                    log.removed_in.map(|e| e as i64),
+                ],
+            )
+            .map(drop);
+        self.keep(r);
+    }
+
+    fn epoch_end(&self, epoch: u64) -> Option<risala_proto::time::Timestamp> {
+        self.conn
+            .query_row(
+                "SELECT t FROM epoch_ends WHERE conv = ?1 AND epoch = ?2",
+                params![self.conv.0, epoch as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|t| risala_proto::time::Timestamp::from_unix_millis(t as u64))
+    }
+
+    fn set_epoch_end(&mut self, epoch: u64, t: risala_proto::time::Timestamp) {
+        let r = self
+            .conn
+            .execute(
+                "INSERT INTO epoch_ends (conv, epoch, t) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (conv, epoch) DO UPDATE SET t = excluded.t",
+                params![self.conv.0, epoch as i64, t.unix_millis() as i64],
+            )
+            .and_then(|_| {
+                // The rules of 12.9 look back two epochs; keep 16.
+                self.conn.execute(
+                    "DELETE FROM epoch_ends WHERE conv = ?1 AND epoch + 16 < ?2",
+                    params![self.conv.0, epoch as i64],
+                )
+            })
+            .map(drop);
+        self.keep(r);
     }
 }

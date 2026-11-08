@@ -1,219 +1,169 @@
 //! Messages in and out (5.3, 5.4, 5.7, 7.4, 7.7, 8.1, 12.9).
 //!
-//! [`receive`] takes a decrypted application message through the steps of
-//! 12.9 and acts on its lines; [`queue_lines`] writes a message to send.
-//! Lines of other areas go to the hooks: CHALLENGE, ANSWER, ATTEST and
-//! REVEAL to leaf confirmation (task C3); RECORD, ALERT, RECORDS,
-//! SIGNINGKEY, BACKUPKEY, PIN and SERVERS to identity (task C1); WANT,
-//! TRANSFER and REPORT to transfers and reports (task C4).
+//! [`receive`] takes a message that `risala_mls::message::receive` has
+//! decrypted and checked (12.9, steps 1 to 5) and acts on its lines;
+//! [`queue_lines`] writes a message to send. Lines of other areas go to
+//! the hooks: CHALLENGE, ANSWER, ATTEST and REVEAL to leaf confirmation
+//! (task C3); RECORD, ALERT, RECORDS, SIGNINGKEY, BACKUPKEY, PIN and
+//! SERVERS to identity (task C1); WANT, TRANSFER and REPORT to transfers
+//! and reports (task C4).
 
-use risala_mls::conversation::{ConfirmMode, Role, SendMode};
-use risala_proto::content::{Content, ContentLine, Conversation, Place, Target};
+use risala_mls::conversation::{Role, SendMode};
+use risala_mls::message::{Clock, Decrypted, Order, RisalaMessage, SendCounter, Trust};
+use risala_mls::openmls::group::MlsGroup;
+use risala_proto::content::{Content, ContentLine, MessageId, Target};
 use risala_proto::names::Uid;
-use risala_proto::types::ConfirmMode as LineConfirm;
+use risala_proto::time::Timestamp;
 
 use super::group::{self, Applied};
-use super::wire::RisalaMessage;
 use super::{Ctx, EngineError, Note};
 use crate::store::Tx;
-use crate::store::conversations::{ConvKind, ConvRow, ConversationId, is_blocked};
+use crate::store::conversations::{ConvKind, ConvRow, ConversationId, LeafRow, is_blocked};
 use crate::store::messages::{NewMessage, NewOutbox, OutboxKind};
 
 type Result<T> = std::result::Result<T, EngineError>;
 
-/// How far the sender's clock may be from the post's `t` before the
-/// message is marked (12.9, step 5).
-const CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
+type Targets = (Option<[u8; 16]>, Option<[u8; 16]>, Option<[u8; 16]>);
 
-/// A decrypted application message.
-#[derive(Debug)]
-pub(crate) struct Received<'a> {
-    /// The sending leaf.
-    pub leaf: u32,
-    /// The pseudonym in its RisalaAAD.
-    pub pseudonym: [u8; 16],
-    /// The `frank` in its RisalaAAD.
-    pub frank: Option<[u8; 48]>,
-    /// The RisalaMessage.
-    pub body: &'a [u8],
-    /// The post's seq; `None` for a live post.
-    pub seq: Option<u64>,
-    /// The post's `t`.
-    pub t: u64,
-    /// The epoch it was posted in.
-    pub epoch: u64,
-}
-
-/// The place of a conversation's lines (12.9).
-pub(crate) fn place(
-    conv: &ConvRow,
-    ext_confirm: Option<ConfirmMode>,
-    live: bool,
-    guest: bool,
-) -> Place {
-    let conversation = match conv.kind {
-        ConvKind::WithYourself => Conversation::WithYourself,
-        ConvKind::Direct => Conversation::Direct,
-        ConvKind::Private => Conversation::PrivateRoom(match ext_confirm {
-            Some(ConfirmMode::Epochal) => LineConfirm::Epochal,
-            _ => LineConfirm::Pairwise,
-        }),
-        ConvKind::Public => Conversation::PublicRoom,
-    };
-    Place {
-        conversation,
-        live,
-        guest,
+fn targets(target: Option<Target>) -> Targets {
+    match target {
+        Some(Target::Reply(id)) => (Some(*id.as_bytes()), None, None),
+        Some(Target::Edit(id)) => (None, Some(*id.as_bytes()), None),
+        Some(Target::React(id)) => (None, None, Some(*id.as_bytes())),
+        None => (None, None, None),
     }
 }
 
-/// Reads a message as 12.9 says, and acts on its lines.
+/// Acts on a message that passed the checks of 12.9 steps 1 to 5, posted
+/// at `seq` (`None` for a live post) with `t`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn receive(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
-    r: Received<'_>,
+    group: &MlsGroup,
+    d: Decrypted,
+    seq: Option<u64>,
+    t: u64,
     applied: &mut Applied,
 ) -> Result<()> {
-    let Ok(message) = RisalaMessage::decode(r.body) else {
-        return Ok(());
-    };
-    let Some(leaf) = tx.leaf(conv.id, r.leaf)? else {
-        // 12.9, late messages: a leaf that a commit with a lower seq has
-        // removed.
-        return Ok(());
-    };
-    if leaf.self_removed {
-        return Ok(());
-    }
+    let leaf_index = d.sender.u32();
+    let uid = d.identity.uid.clone();
     // 12.7: nothing from a leaf of a device removed by record.
-    if let Some(device) = leaf.device_id {
+    if let Some(device) = d.identity.device_id {
         let facts = cx.hooks.key_facts(tx, cx.account);
-        let removed = facts.device_removed(&leaf.uid, &risala_mls::identity::DeviceId(device));
-        if removed == risala_mls::checks::Fact::Known(true) {
+        if facts.device_removed(&uid, &device) == risala_mls::checks::Fact::Known(true) {
             return Ok(());
         }
     }
-    // Step 1: the pseudonym (7.3).
-    match leaf.pseudonym {
-        Some(pinned) if pinned != r.pseudonym => return Ok(()),
-        Some(_) => {}
-        None => {
-            if r.seq.is_some() {
-                tx.pin_pseudonym(conv.id, r.leaf, r.pseudonym)?;
-            }
-        }
-    }
-    // Step 2: the franking tag, in constant time.
-    let Some(frank) = r.frank else { return Ok(()) };
-    if !message.frank_ok(&frank) {
-        return Ok(());
-    }
-    // Step 3: a message id seen before is a replay.
-    if tx.message_seen(conv.id, &message.message_id)? {
-        return Ok(());
-    }
-    let Ok(content) = Content::parse(&message.content) else {
-        tx.mark_seen(conv.id, &message.message_id)?;
+    let Some(ext) = risala_mls::group::conversation(group) else {
         return Ok(());
     };
-    let live = r.seq.is_none();
-    let ext = group::load(tx, cx, &conv.group_id)
-        .ok()
-        .and_then(|g| risala_mls::group::conversation(&g));
-    let guest = leaf.uid.is_guest();
-    let where_ = place(conv, ext.as_ref().map(|e| e.confirm), live, guest);
+    let leaf = tx.leaf(conv.id, leaf_index)?.unwrap_or(LeafRow {
+        leaf: leaf_index,
+        uid: uid.clone(),
+        device_id: d.identity.device_id.map(|d| d.0),
+        signature_key: Vec::new(),
+        display_name: None,
+        updated: None,
+        self_removed: false,
+        resync_seq: None,
+    });
+    // Step 6: shown as verified only if the sender's leaf is confirmed
+    // (12.10).
+    let trust = d.trust(cx.hooks.leaf_confirmed(tx, conv.id, &leaf));
+    let place = d.place(&ext);
+    let message = &d.message;
+    let message_id = *message.message_id.as_bytes();
+    let hidden = is_blocked(&tx.blocks(cx.account)?, &uid);
 
-    if live {
-        // 8.1: only TYPING is live, and does not count.
-        if message.counter == 0
-            && content
-                .allowed(where_)
-                .any(|l| matches!(l, ContentLine::Typing))
-            && may_send(ext.as_ref(), &leaf.uid)
-            && !hidden(tx, cx, conv, &leaf.uid)?
+    if trust == Trust::Withheld {
+        // An epochal group's new pseudonym: nothing is shown until leaf
+        // confirmation (C3) checks the ATTEST that carries it (7.3, 12.10).
+        for line in message.content.allowed(place) {
+            if matches!(line, ContentLine::Attest { .. }) {
+                applied.notes.extend(
+                    cx.hooks
+                        .content_line(tx, conv.id, &leaf, line)
+                        .into_iter()
+                        .map(|a| Note::Hook(Box::new(a))),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if d.order == Order::Live {
+        // 8.1: only TYPING is live.
+        if message
+            .content
+            .allowed(place)
+            .any(|l| matches!(l, ContentLine::Typing))
+            && may_send(&ext, &uid)
+            && !hidden
         {
             applied.notes.push(Note::Typing {
                 conv: conv.id,
-                uid: leaf.uid.clone(),
+                uid: uid.clone(),
             });
         }
         return Ok(());
     }
 
-    // Step 4: counter and previous, for gaps (7.4).
-    if message.counter > leaf.counter + 1 {
-        let expired = false;
-        tx.add_gap(
-            conv.id,
-            &leaf.uid,
-            r.leaf,
-            leaf.counter + 1,
-            message.counter - 1,
-            expired,
-        )?;
-    } else if message.counter <= leaf.counter {
-        tx.fill_gap(conv.id, r.leaf, message.counter)?;
+    // Step 4: gaps (7.4).
+    match d.order {
+        Order::Gap { missing } => {
+            let last = message.counter - 1;
+            tx.add_gap(conv.id, &uid, leaf_index, last + 1 - missing, last, false)?;
+        }
+        Order::Late => tx.fill_gap(conv.id, leaf_index, message.counter)?,
+        _ => {}
     }
-    tx.leaf_sent(conv.id, r.leaf, message.counter, message.message_id)?;
-    // Step 5: the sender's clock.
-    let time_mismatch = message.time.abs_diff(r.t) > CLOCK_SKEW_MS;
-    // Step 6: verified only if the leaf is confirmed (12.10).
-    let verified = cx.hooks.leaf_confirmed(tx, conv.id, &leaf);
-    let hidden = hidden(tx, cx, conv, &leaf.uid)?;
-    let own_identity = leaf.uid == *cx.uid;
+    let time_mismatch = d.clock == Clock::Disagrees;
+    let verified = trust == Trust::Verified;
+    let own_identity = uid == *cx.uid;
 
     let mut shown = false;
-    for line in content.allowed(where_) {
+    for line in message.content.allowed(place) {
         match line {
             ContentLine::Text(text) => {
                 // 6.2, 5.3: in a room with `send mods`, only reactions from
-                // plain members; guests only where `guests write`.
+                // plain members. Guests' lines where `guests read` are
+                // already left out by `allowed`.
                 let reaction = matches!(text.target, Some(Target::React(_)));
-                if !reaction && !may_send(ext.as_ref(), &leaf.uid) {
+                if !reaction && !may_send(&ext, &uid) {
                     continue;
                 }
-                if guest
-                    && let Some(e) = &ext
-                    && e.guests != risala_mls::conversation::GuestMode::Write
-                {
-                    continue;
-                }
-                let (reply_to, edit_of, react_to) = match text.target {
-                    Some(Target::Reply(id)) => (Some(*id.as_bytes()), None, None),
-                    Some(Target::Edit(id)) => (None, Some(*id.as_bytes()), None),
-                    Some(Target::React(id)) => (None, None, Some(*id.as_bytes())),
-                    None => (None, None, None),
-                };
+                let (reply_to, edit_of, react_to) = targets(text.target);
                 let inserted = tx.insert_message(
                     conv.id,
                     &NewMessage {
-                        message_id: message.message_id,
-                        seq: r.seq,
-                        epoch: Some(r.epoch),
-                        sender: Some(&leaf.uid),
-                        leaf: Some(r.leaf),
+                        message_id,
+                        seq,
+                        epoch: Some(d.epoch),
+                        sender: Some(&uid),
+                        leaf: Some(leaf_index),
                         own: false,
                         sent: message.time,
-                        received: Some(r.t),
+                        received: Some(t),
                         verified,
                         time_mismatch,
                         hidden,
-                        content: Some(&message.content),
+                        content: Some(message.content.as_bytes()),
                         text: Some(&text.text),
                         reply_to,
                         edit_of,
                         react_to,
-                        frank_key: Some(message.frank_key),
+                        frank_key: Some(*message.frank_key.as_bytes()),
                         ..NewMessage::default()
                     },
                 )?;
                 if inserted {
                     shown = true;
                     // A DELETE that arrived first (5.4).
-                    for (by, with_role) in tx.kept_deletes(conv.id, &message.message_id)? {
-                        if by == leaf.uid || with_role {
-                            tx.erase_message(conv.id, &message.message_id)?;
+                    for (by, with_role) in tx.kept_deletes(conv.id, &message_id)? {
+                        if by == uid || with_role {
+                            tx.erase_message(conv.id, &message_id)?;
                         }
                     }
                 }
@@ -221,14 +171,17 @@ pub(crate) fn receive(
                 break;
             }
             ContentLine::Delete { id } => {
-                delete(tx, conv, ext.as_ref(), &leaf.uid, id.as_bytes())?;
+                delete(tx, conv, &ext, &uid, id.as_bytes())?;
             }
             ContentLine::Resync { mailbox: None, seq } => {
                 // 12.7: replace the leaf, after a random wait.
-                tx.mark_resync(conv.id, r.leaf, seq.get())?;
+                tx.mark_resync(conv.id, leaf_index, seq.get())?;
+                let mut history = tx.group_history(conv.id)?;
+                history.note_resync(d.sender, d.epoch);
+                tx.set_group_history(conv.id, &history)?;
                 applied.notes.push(Note::Resync {
                     conv: conv.id,
-                    leaf: r.leaf,
+                    leaf: leaf_index,
                 });
             }
             line if conv.kind == ConvKind::WithYourself => {
@@ -236,7 +189,7 @@ pub(crate) fn receive(
                 if !own_identity || !verified {
                     continue;
                 }
-                self_line(tx, cx, conv, line, applied)?;
+                self_line(tx, cx, conv, &leaf, line, applied)?;
             }
             line => {
                 applied.notes.extend(
@@ -248,10 +201,8 @@ pub(crate) fn receive(
             }
         }
     }
-    if !shown {
-        tx.mark_seen(conv.id, &message.message_id)?;
-    } else {
-        tx.touch(conv.id, message.time.min(r.t))?;
+    if shown {
+        tx.touch(conv.id, message.time.min(t))?;
         if !hidden {
             applied.notes.push(Note::NewMessage);
         }
@@ -261,31 +212,24 @@ pub(crate) fn receive(
 
 /// Whether `uid` may send TEXT lines and typing (6.2): every member unless
 /// the room is `send mods`.
-fn may_send(ext: Option<&risala_mls::conversation::RisalaConversation>, uid: &Uid) -> bool {
-    match ext {
-        Some(e) if e.send == SendMode::Mods => e.role(uid) >= Role::Mod,
-        _ => true,
-    }
-}
-
-/// Whether messages from `uid` are hidden here because of a block (5.7).
-fn hidden(tx: &Tx<'_>, cx: &Ctx<'_>, _conv: &ConvRow, uid: &Uid) -> Result<bool> {
-    Ok(is_blocked(&tx.blocks(cx.account)?, uid))
+fn may_send(ext: &risala_mls::conversation::RisalaConversation, uid: &Uid) -> bool {
+    ext.send != SendMode::Mods || ext.role(uid) >= Role::Mod
 }
 
 /// A DELETE (5.4): by the author, or in a room by an owner or moderator
-/// at the message's epoch and at its place in the order of posts, which
-/// for this device are the same extension, since it applies posts in
-/// order.
+/// at the message's epoch and at its place in the order of posts. This
+/// device applies posts in order, so the extension it holds is the one at
+/// the DELETE's place; the message's own epoch is almost always the same
+/// one.
 fn delete(
     tx: &mut Tx<'_>,
     conv: &ConvRow,
-    ext: Option<&risala_mls::conversation::RisalaConversation>,
+    ext: &risala_mls::conversation::RisalaConversation,
     by: &Uid,
     target: &[u8; 16],
 ) -> Result<()> {
     let room = matches!(conv.kind, ConvKind::Private | ConvKind::Public);
-    let with_role = room && ext.is_some_and(|e| e.role(by) >= Role::Mod);
+    let with_role = room && ext.role(by) >= Role::Mod;
     match tx.message(conv.id, target)? {
         Some(m) => {
             if m.sender == *by || with_role {
@@ -303,6 +247,7 @@ fn self_line(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
+    leaf: &LeafRow,
     line: &ContentLine,
     applied: &mut Applied,
 ) -> Result<()> {
@@ -322,9 +267,9 @@ fn self_line(
             if tx.mark_read(target.id, seq.get())? {
                 applied.notes.push(Note::Read);
             }
-            // 7.7: the epoch check. Compare only when this device holds
-            // the same epoch for that seq, which it knows for its own
-            // messages' epochs: here, when the seq is a message it has.
+            // 7.7: the epoch check, made when this device holds the epoch
+            // of the post at that seq, which it knows for the messages it
+            // stored.
             if let Some(epoch) = message_epoch_at(tx, target.id, seq.get())?
                 && epoch == target.epoch
                 && let Ok(own) = group::epoch_check(tx, cx, &target)
@@ -348,25 +293,22 @@ fn self_line(
             seq,
         } => {
             // 12.7: replace the sending device's leaf in that group, if
-            // this device holds it and a commit at that seq.
+            // this device holds it.
             if let Some(mb) = tx.mailbox(cx.account, mailbox)? {
                 applied.notes.push(Note::OwnResync {
                     conv: mb.conv,
                     seq: seq.get(),
-                    from: conv.id,
+                    device: leaf.device_id,
                 });
             }
         }
         other => {
-            let leaf = tx.leaves(conv.id)?.into_iter().find(|l| l.uid == *cx.uid);
-            if let Some(leaf) = leaf {
-                applied.notes.extend(
-                    cx.hooks
-                        .content_line(tx, conv.id, &leaf, other)
-                        .into_iter()
-                        .map(|a| Note::Hook(Box::new(a))),
-                );
-            }
+            applied.notes.extend(
+                cx.hooks
+                    .content_line(tx, conv.id, leaf, other)
+                    .into_iter()
+                    .map(|a| Note::Hook(Box::new(a))),
+            );
         }
     }
     Ok(())
@@ -387,9 +329,10 @@ fn message_epoch_at(tx: &Tx<'_>, conv: ConversationId, seq: u64) -> Result<Optio
     Ok(epoch.flatten().map(|e| e as u64))
 }
 
-/// Queues a message of `lines` to send in `conv` (12.9): counts it, and
-/// stores it as shown if it has a TEXT line. A live message (8.1) has
-/// counter 0 and does not count. Returns its id.
+/// Queues a message of `lines` to send in `conv` (12.9): written with the
+/// leaf's send counter, which is stored now, and stored as shown if it has
+/// a TEXT line. A live message (8.1) has counter 0 and does not count.
+/// Returns its id.
 ///
 /// Other areas use this to send their lines: CHALLENGE and ANSWER (C3),
 /// RECORD (C1), TRANSFER (C4).
@@ -406,55 +349,55 @@ pub(crate) fn queue_lines(
     if !row.state.in_group() {
         return Err(EngineError::Invalid("not in this conversation".into()));
     }
-    let mut message = RisalaMessage::new(0, None, now, content.as_bytes().to_vec())
-        .map_err(|_| EngineError::Random)?;
-    if !live {
-        let (counter, previous) = tx.next_counter(conv, message.message_id)?;
-        message.counter = counter;
-        message.previous = previous;
-    }
-    if let Some(ContentLine::Text(text)) = content
-        .lines()
-        .iter()
-        .find(|l| matches!(l, ContentLine::Text(_)))
-    {
-        let (reply_to, edit_of, react_to) = match text.target {
-            Some(Target::Reply(id)) => (Some(*id.as_bytes()), None, None),
-            Some(Target::Edit(id)) => (None, Some(*id.as_bytes()), None),
-            Some(Target::React(id)) => (None, None, Some(*id.as_bytes())),
-            None => (None, None, None),
+    let now_ts = Timestamp::from_unix_millis(now).unwrap_or(Timestamp::MAX);
+    let message = if live {
+        RisalaMessage::live(content, now_ts).map_err(|_| EngineError::Random)?
+    } else {
+        let mut counter = SendCounter {
+            written: row.sent,
+            last: row.last_sent.map(MessageId::from_bytes),
         };
+        let message = counter
+            .write(content, now_ts)
+            .map_err(|e| EngineError::Invalid(e.to_string()))?;
+        tx.set_send_counter(conv, counter.written, counter.last.map(|l| *l.as_bytes()))?;
+        message
+    };
+    let message_id = *message.message_id.as_bytes();
+    let text = message.content.lines().iter().find_map(|l| match l {
+        ContentLine::Text(t) => Some(t.clone()),
+        _ => None,
+    });
+    if let Some(text) = text {
+        let (reply_to, edit_of, react_to) = targets(text.target);
         tx.insert_message(
             conv,
             &NewMessage {
-                message_id: message.message_id,
+                message_id,
                 sender: Some(sender),
                 own: true,
                 sent: now,
                 verified: true,
-                content: Some(&message.content),
+                content: Some(message.content.as_bytes()),
                 text: Some(&text.text),
                 reply_to,
                 edit_of,
                 react_to,
-                frank_key: Some(message.frank_key),
+                frank_key: Some(*message.frank_key.as_bytes()),
                 ..NewMessage::default()
             },
         )?;
         tx.touch(conv, now)?;
     } else if !live {
-        tx.mark_seen(conv, &message.message_id)?;
+        tx.mark_seen(conv, &message_id)?;
     }
-    for line in content.lines() {
-        if let ContentLine::Delete { id } = line {
+    for line in message.content.lines() {
+        if let ContentLine::Delete { id } = line
+            && let Some(m) = tx.message(conv, id.as_bytes())?
+            && (m.sender == *sender || matches!(row.kind, ConvKind::Private | ConvKind::Public))
+        {
             // The device acts on its own DELETE at once (5.4).
-            let ext_role = true;
-            let _ = ext_role;
-            if let Some(m) = tx.message(conv, id.as_bytes())?
-                && (m.sender == *sender || matches!(row.kind, ConvKind::Private | ConvKind::Public))
-            {
-                tx.erase_message(conv, id.as_bytes())?;
-            }
+            tx.erase_message(conv, id.as_bytes())?;
         }
     }
     tx.queue_outbox(
@@ -465,11 +408,11 @@ pub(crate) fn queue_lines(
             OutboxKind::Message
         },
         &NewOutbox {
-            message_id: Some(message.message_id),
-            body: Some(message.encode()),
+            message_id: Some(message_id),
+            body: Some(message.encode().to_vec()),
             ..NewOutbox::default()
         },
         now,
     )?;
-    Ok(message.message_id)
+    Ok(message_id)
 }

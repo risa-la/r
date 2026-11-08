@@ -3,7 +3,7 @@
 //! yourself, commits racing for an epoch, leaving, gaps and catching up.
 
 mod scenarios;
-mod server;
+pub(crate) mod server;
 
 use std::collections::VecDeque;
 use std::sync::Arc;

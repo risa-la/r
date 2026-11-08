@@ -24,7 +24,7 @@ use super::{Client, Error, Event, Result};
 use crate::keys::KeyStore;
 use crate::store::Store;
 use crate::store::conversations::{ConvKind, ConvRow, ConvState};
-use crate::sync::conversations::wire::{Intent, Then};
+use crate::sync::conversations::wire::Intent;
 use crate::sync::conversations::{EngineError, Hooks, Job, JobId, content, group};
 
 /// The conversation area's errors.
@@ -381,8 +381,40 @@ impl Client {
         account: AccountId,
         after: Option<&str>,
     ) -> Result<Vec<PublicRoom>> {
-        let _ = (account, after);
-        not_implemented("list_public_rooms")
+        let after: Option<Room> = after
+            .map(|r| r.parse().map_err(|_| Error::invalid("room", r)))
+            .transpose()?;
+        let exec = self.exec(account)?;
+        // LIST says nothing about the device, so it goes on a connection
+        // that is not signed in (4.1).
+        let slot = if self.account(account)?.kind == crate::store::AccountKind::Guest {
+            crate::conn::Slot::Guest
+        } else {
+            crate::conn::Slot::Anonymous(0)
+        };
+        let response = exec
+            .request(
+                slot,
+                risala_proto::command::Command::List { after, limit: None },
+            )
+            .await?;
+        let (lines, _) = response.into_result().map_err(crate::conn::Error::from)?;
+        Ok(lines
+            .into_iter()
+            .filter_map(|l| match l.line {
+                risala_proto::server::ServerLine::Room {
+                    room,
+                    members,
+                    topic,
+                    ..
+                } => Some(PublicRoom {
+                    room,
+                    members,
+                    topic,
+                }),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Joins the public room `room`, as an identity or a guest (6.1).
@@ -432,37 +464,10 @@ impl Client {
     /// other leaves, if it has any, then a SelfRemove.
     pub async fn leave(&self, conversation: ConversationId) -> Result<()> {
         let row = self.conv_row(conversation)?;
-        if !row.state.in_group() {
-            return Ok(());
-        }
         let own = self.own_uid(row.account)?;
-        let leaves = self.store().leaf_rows(conversation)?;
-        let others: Vec<(String, Option<[u8; 48]>)> = leaves
-            .iter()
-            .filter(|l| l.uid == own)
-            .map(|l| (l.uid.to_string(), l.device_id))
-            .collect();
         let now = self.options().clock.now().unix_millis();
         self.store()
-            .write_with(|tx| {
-                if others.len() > 1 {
-                    // Its own leaf is skipped when the commit is made.
-                    group::queue_intent(
-                        tx,
-                        conversation,
-                        &Intent {
-                            remove: others.clone(),
-                            then: Then::SelfRemove,
-                            ..Intent::default()
-                        },
-                        now,
-                    )?;
-                } else {
-                    tx.set_state(conversation, ConvState::Leaving)?;
-                    group::queue_self_remove(tx, conversation, now)?;
-                }
-                Ok::<_, EngineError>(())
-            })
+            .write_with(|tx| group::leave(tx, conversation, &own, now))
             .map_err(Error::from)?;
         self.kick(row.account).await;
         Ok(())
@@ -755,3 +760,6 @@ impl Client {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

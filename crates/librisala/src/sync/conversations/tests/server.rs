@@ -14,7 +14,7 @@ use risala_mls::keypackage::{is_last_resort, read_key_package, verify_key_packag
 use risala_mls::primitives::sha384;
 use risala_proto::command::{Command, KeyPkgCommand, WelcomeCommand};
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{OrBlob, PostToken};
+use risala_proto::mls::{OrBlob, PostToken, WelcomeSecret};
 use risala_proto::names::{BoxName, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerMessage};
 
@@ -48,8 +48,9 @@ pub struct FakeServer {
     mailboxes: BTreeMap<String, Mailbox>,
     /// KeyPackages by (uid, device id).
     key_packages: BTreeMap<(String, Vec<u8>), Vec<StoredKp>>,
-    /// Refs handed out by KEYPKG GET, and whose device they are.
-    handed_out: HashMap<Vec<u8>, (String, Vec<u8>)>,
+    /// Refs handed out by KEYPKG GET: whose device, and the hash of the
+    /// put secret (12.5).
+    handed_out: HashMap<Vec<u8>, (DeviceKey, [u8; 48])>,
     /// Pending Welcomes, by device: (id, welcome).
     welcomes: HashMap<DeviceKey, Vec<(String, Vec<u8>)>>,
     next_welcome: u64,
@@ -149,18 +150,48 @@ impl FakeServer {
                 form,
             } => {
                 let b = mailbox.to_string();
-                match self.mailboxes.entry(b) {
-                    std::collections::btree_map::Entry::Occupied(_) => err(ErrorCode::NameTaken),
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        let mut tokens = HashMap::new();
-                        tokens.insert(form.first_epoch(), HashSet::from([*token_hash.as_bytes()]));
-                        slot.insert(Mailbox {
-                            group_id: group_id.as_bytes().to_vec(),
-                            posts: Vec::new(),
-                            tokens,
-                            followers: HashSet::new(),
+                // 7.8: a move's mailbox needs the group's old one, and a
+                // token of the epoch before.
+                let moving = match &form {
+                    risala_proto::command::CreateForm::Private { moving: Some(m) } => {
+                        Some(m.clone())
+                    }
+                    _ => None,
+                };
+                let refused =
+                    moving
+                        .as_ref()
+                        .and_then(|m| match self.mailboxes.get(&m.from.to_string()) {
+                            Some(old) if old.group_id == group_id.as_bytes() => {
+                                let ok = old
+                                    .tokens
+                                    .get(&(m.epoch.get() - 1))
+                                    .is_some_and(|set| set.contains(&sha384(m.token.as_bytes())));
+                                (!ok).then(|| err(ErrorCode::Stale))
+                            }
+                            _ => Some(err(ErrorCode::NotFound)),
                         });
-                        End::Ok(ok())
+                if let Some(refused) = refused {
+                    refused
+                } else {
+                    match self.mailboxes.entry(b) {
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            err(ErrorCode::NameTaken)
+                        }
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            let mut tokens = HashMap::new();
+                            tokens.insert(
+                                form.first_epoch(),
+                                HashSet::from([*token_hash.as_bytes()]),
+                            );
+                            slot.insert(Mailbox {
+                                group_id: group_id.as_bytes().to_vec(),
+                                posts: Vec::new(),
+                                tokens,
+                                followers: HashSet::new(),
+                            });
+                            End::Ok(ok())
+                        }
                     }
                 }
             }
@@ -339,21 +370,37 @@ impl FakeServer {
                             let k = list.remove(i);
                             (k.reference, k.bytes)
                         };
-                        self.handed_out.insert(reference, key.clone());
-                        lines.push(line(&format!("KEYPKG {} {}", uid, b64(&bytes))));
+                        let secret: [u8; 32] = risala_mls::primitives::random().unwrap();
+                        self.handed_out
+                            .insert(reference, (key.clone(), sha384(&secret)));
+                        lines.push(line(&format!(
+                            "KEYPKG {} {} {}",
+                            uid,
+                            b64(&bytes),
+                            b64(&secret)
+                        )));
                     }
                     End::Ok(ok())
                 }
             }
             Command::Welcome(WelcomeCommand::Put {
                 key_package_ref,
+                secret,
                 welcome,
             }) => match self
                 .handed_out
-                .remove(key_package_ref.as_bytes().as_slice())
+                .get(key_package_ref.as_bytes().as_slice())
+                .cloned()
             {
                 None => err(ErrorCode::NotFound),
-                Some(device) => {
+                // Only whoever fetched the KeyPackage delivers its Welcome
+                // (12.8).
+                Some((_, hash)) if !matches!(&secret, WelcomeSecret::Put(s) if sha384(s.as_bytes()) == hash) => {
+                    err(ErrorCode::Forbidden)
+                }
+                Some((device, _)) => {
+                    self.handed_out
+                        .remove(key_package_ref.as_bytes().as_slice());
                     let OrBlob::Inline(welcome) = welcome else {
                         panic!("no blobs")
                     };

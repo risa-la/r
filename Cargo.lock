@@ -1587,6 +1587,7 @@ dependencies = [
  "rustls",
  "rustls-platform-verifier",
  "rustls-webpki",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

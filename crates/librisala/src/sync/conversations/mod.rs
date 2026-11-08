@@ -42,7 +42,7 @@ pub(crate) mod group;
 pub(crate) mod wire;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -58,7 +58,7 @@ use risala_proto::content::ContentLine;
 use risala_proto::error::ErrorCode;
 use risala_proto::mls::{
     GroupId, KeyPackage as KeyPackageText, KeyPackageRef as RefText, MlsMessage, OrBlob, PostToken,
-    SendToken as SendTokenText, TokenHash, Welcome as WelcomeText,
+    PutSecret, SendToken as SendTokenText, TokenHash, Welcome as WelcomeText, WelcomeSecret,
 };
 use risala_proto::names::{BoxName, Uid};
 use risala_proto::server::{Post, ServerLine, ServerMessage};
@@ -158,6 +158,10 @@ impl KeyFacts for UnknownFacts {
     fn device_removed(&self, _: &Uid, _: &DeviceId) -> Fact<bool> {
         Fact::Unknown
     }
+
+    fn identity_retired(&self, _: &Uid) -> Fact<bool> {
+        Fact::Unknown
+    }
 }
 
 /// What the group engine needs from the other areas. Every method has a
@@ -166,6 +170,8 @@ pub(crate) trait Hooks: Send + Sync {
     /// This device's device key for `uid` (4.3), to make KeyPackages and
     /// bind them (12.3, 12.5), and to name the device in credentials.
     /// `None` for a guest, or until the identity area (C1) provides it.
+    /// It is the one hook called outside a transaction of the cache, so it
+    /// may read the cache; the engine keeps the key once found.
     fn device_key(&self, account: AccountId, uid: &Uid) -> Option<SigningKey> {
         let _ = (account, uid);
         None
@@ -176,11 +182,12 @@ pub(crate) trait Hooks: Send + Sync {
     /// that is not, `None` if it cannot tell yet (4.4, 4.5). Task C1.
     fn device_key_of(
         &self,
+        tx: &Tx<'_>,
         account: AccountId,
         uid: &Uid,
         device: &DeviceId,
     ) -> Option<Option<Vec<u8>>> {
-        let _ = (account, uid, device);
+        let _ = (tx, account, uid, device);
         None
     }
 
@@ -255,6 +262,9 @@ pub(crate) struct Ctx<'a> {
     pub guest: bool,
     pub crypto: &'a Arc<RisalaCrypto>,
     pub hooks: &'a dyn Hooks,
+    /// This device's device key for the account (4.3), found before the
+    /// transaction: hooks may read the cache, which a transaction holds.
+    pub device_key: Option<&'a SigningKey>,
     pub now: u64,
     pub config: &'a Config,
 }
@@ -302,7 +312,7 @@ pub(crate) enum Note {
     OwnResync {
         conv: ConversationId,
         seq: u64,
-        from: ConversationId,
+        device: Option<[u8; 48]>,
     },
     /// A read marker moved (7.7).
     Read,
@@ -378,7 +388,7 @@ pub enum Job {
 struct JobState {
     job: Job,
     waiting: usize,
-    key_packages: Vec<(Uid, Vec<u8>)>,
+    key_packages: Vec<(Uid, wire::Fetched)>,
     error: Option<String>,
 }
 
@@ -401,6 +411,13 @@ enum Pending {
     Create {
         job: Option<JobId>,
         conv: ConversationId,
+    },
+    CreateMove {
+        conv: ConversationId,
+        outbox: i64,
+    },
+    Token {
+        outbox: i64,
     },
     KeyPkgCount,
     KeyPkgAdd,
@@ -443,6 +460,7 @@ pub struct ConversationEngine {
     hooks: Arc<dyn Hooks>,
     clock: Arc<dyn Clock>,
     crypto: OnceLock<Arc<RisalaCrypto>>,
+    device_key: OnceLock<Arc<SigningKey>>,
     me: Option<Me>,
     ready: BTreeMap<Slot, ConnectionKind>,
     follows: HashMap<BoxName, Follow>,
@@ -488,6 +506,7 @@ impl ConversationEngine {
             hooks,
             clock,
             crypto: OnceLock::new(),
+            device_key: OnceLock::new(),
             me: None,
             ready: BTreeMap::new(),
             follows: HashMap::new(),
@@ -512,6 +531,19 @@ impl ConversationEngine {
         }
         let c = Arc::new(RisalaCrypto::new().map_err(|e| EngineError::Mls(e.to_string()))?);
         Ok(self.crypto.get_or_init(|| c).clone())
+    }
+
+    /// This device's device key for the account, from the hooks, kept once
+    /// found. Called outside transactions only.
+    fn device_key(&self, me: &Me) -> Option<Arc<SigningKey>> {
+        if me.guest {
+            return None;
+        }
+        if let Some(key) = self.device_key.get() {
+            return Some(key.clone());
+        }
+        let key = Arc::new(self.hooks.device_key(me.account, &me.uid)?);
+        Some(self.device_key.get_or_init(|| key).clone())
     }
 
     fn now(&self) -> u64 {
@@ -565,6 +597,7 @@ impl ConversationEngine {
     ) -> Result<T, EngineError> {
         let crypto = self.crypto()?;
         let now = self.now();
+        let key = self.device_key(me);
         let ctx = Ctx {
             account: me.account,
             uid: &me.uid,
@@ -572,6 +605,7 @@ impl ConversationEngine {
             guest: me.guest,
             crypto: &crypto,
             hooks: self.hooks.as_ref(),
+            device_key: key.as_deref(),
             now,
             config: &self.config,
         };
@@ -687,10 +721,17 @@ impl ConversationEngine {
                     if let ServerLine::KeyPkg {
                         uid: u,
                         key_package,
+                        secret,
                     } = &line.line
                         && *u == uid
                     {
-                        state.key_packages.push((uid.clone(), key_package.decode()));
+                        state.key_packages.push((
+                            uid.clone(),
+                            wire::Fetched {
+                                key_package: key_package.decode(),
+                                secret: secret.as_bytes().to_vec(),
+                            },
+                        ));
                     }
                 }
             }
@@ -735,20 +776,20 @@ impl ConversationEngine {
         let result = self.write(cx, &me, out, |tx, c| {
             let own = group::own_identity(c)?;
             // Checked KeyPackages, without this device's own.
-            let checked: Vec<(Uid, Vec<u8>, [u8; 48])> = state
+            let checked: Vec<(Uid, wire::Fetched, [u8; 48])> = state
                 .key_packages
                 .iter()
-                .filter_map(|(uid, bytes)| {
-                    let kp = group::check_fetched(c, bytes, uid)?;
+                .filter_map(|(uid, fetched)| {
+                    let kp = group::check_fetched(tx, c, &fetched.key_package, uid)?;
                     let identity = risala_mls::identity::RisalaIdentity::from_credential(
                         kp.leaf_node().credential(),
                     )
                     .ok()?;
                     let device = identity.device_id?.0;
-                    (identity != own).then(|| (uid.clone(), bytes.clone(), device))
+                    (identity != own).then(|| (uid.clone(), fetched.clone(), device))
                 })
                 .collect();
-            let kps_of = |filter: &dyn Fn(&Uid) -> bool| -> Vec<Vec<u8>> {
+            let kps_of = |filter: &dyn Fn(&Uid) -> bool| -> Vec<wire::Fetched> {
                 checked
                     .iter()
                     .filter(|(u, ..)| filter(u))
@@ -822,7 +863,7 @@ impl ConversationEngine {
                     Ok(Some((*conv, None)))
                 }
                 Job::Replace { conv, uid, device } => {
-                    let adds: Vec<Vec<u8>> = checked
+                    let adds: Vec<wire::Fetched> = checked
                         .iter()
                         .filter(|(u, _, d)| u == uid && d == device)
                         .map(|(_, b, _)| b.clone())
@@ -943,7 +984,7 @@ impl ConversationEngine {
     ) -> Result<(), EngineError> {
         match &message.line {
             ServerLine::Post(post) => self.on_post(cx, post, out),
-            ServerLine::Welcome { id, welcome } => {
+            ServerLine::Welcome { id, welcome, .. } => {
                 self.on_welcome(cx, id, welcome, out)?;
                 Ok(())
             }
@@ -1098,27 +1139,28 @@ impl ConversationEngine {
                 return Ok(Vec::new());
             }
             let mut group = group::load(tx, c, &conv.group_id)?;
-            let incoming = risala_mls::group::process_message(&tx.mls(c.crypto), &mut group, bytes);
             let mut applied = group::Applied::default();
-            if let Ok(risala_mls::group::Incoming::Application {
-                sender,
-                aad,
-                content,
-            }) = incoming
-            {
+            let mut log = crate::store::messages::MessageLog::new(tx.conn(), conv.id);
+            let received = risala_mls::message::receive(
+                &tx.mls(c.crypto),
+                &mut group,
+                bytes,
+                risala_mls::message::PostInfo {
+                    t: post.t,
+                    live: true,
+                },
+                &mut log,
+            );
+            log.finish()?;
+            if let Ok(decrypted) = received {
                 content::receive(
                     tx,
                     c,
                     &conv,
-                    content::Received {
-                        leaf: sender.u32(),
-                        pseudonym: aad.pseudonym.0,
-                        frank: aad.frank,
-                        body: &content,
-                        seq: None,
-                        t: post.t.unix_millis(),
-                        epoch: group.epoch().as_u64(),
-                    },
+                    &group,
+                    decrypted,
+                    None,
+                    post.t.unix_millis(),
                     &mut applied,
                 )?;
             }
@@ -1194,8 +1236,8 @@ impl ConversationEngine {
                     let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
                     self.resync_timers.entry((conv, leaf)).or_insert(now + wait);
                 }
-                Note::OwnResync { conv, seq, from } => {
-                    let _ = (seq, from);
+                Note::OwnResync { conv, seq, device } => {
+                    let _ = (seq, device);
                     // The sending device's leaf in that group is the own
                     // identity's leaf that is behind: replace each leaf of
                     // the own identity that posted nothing since; done as a
@@ -1237,7 +1279,29 @@ impl ConversationEngine {
                     self.proposal_timers.remove(&conv);
                     self.unprocessable.remove(&conv);
                     self.resynced.remove(&conv);
-                    let _ = (own, removed);
+                    if own && !removed.is_empty() {
+                        // 7.8: the device that removed a leaf moves the
+                        // group, once its removal has won. Public rooms do
+                        // not move.
+                        let r = self.write(cx, me, out, |tx, c| {
+                            let row = tx.conversation(conv)?;
+                            if row.kind != ConvKind::Public && row.state.in_group() {
+                                group::queue_intent(
+                                    tx,
+                                    conv,
+                                    &Intent {
+                                        move_box: true,
+                                        ..Intent::default()
+                                    },
+                                    c.now,
+                                )?;
+                            }
+                            Ok(())
+                        });
+                        if let Err(e) = r {
+                            tracing::warn!(error = %e, "could not queue a move");
+                        }
+                    }
                     let actions =
                         self.write(cx, me, out, |tx, _| Ok(self.hooks.leaves_changed(tx, conv)));
                     if let Ok(actions) = actions {
@@ -1484,6 +1548,44 @@ impl ConversationEngine {
                     }
                 }
             },
+            Pending::Token { outbox } => {
+                // Whatever the answer, post again; a second ERR stale
+                // means the group has moved on, and catching up shows it.
+                self.write(cx, &me, out, |tx, _| {
+                    tx.update_outbox(outbox, OutboxState::Queued, None, None, None)?;
+                    Ok(())
+                })?;
+            }
+            Pending::CreateMove { conv, outbox } => {
+                let created = match &response.end {
+                    End::Ok(_) => true,
+                    End::Err(e) => {
+                        tracing::warn!(code = %e.code, "the server refused a move's mailbox");
+                        false
+                    }
+                    End::Unparseable(_) => {
+                        // Try again on the next connection.
+                        return Ok(());
+                    }
+                };
+                self.write(cx, &me, out, |tx, c| {
+                    if created {
+                        tx.set_moved(outbox)?;
+                    } else {
+                        // The move is dropped, not made again (7.8 allows a
+                        // group not to move; the user is told by the log).
+                        let row = tx.conversation(conv)?;
+                        if let Ok(mut g) = group::load(tx, c, &row.group_id)
+                            && g.pending_commit().is_some()
+                        {
+                            risala_mls::group::discard_own_commit(&tx.mls(c.crypto), &mut g)
+                                .map_err(|e| EngineError::Mls(e.to_string()))?;
+                        }
+                        tx.update_outbox(outbox, OutboxState::Lost, None, None, None)?;
+                    }
+                    Ok(())
+                })?;
+            }
             Pending::KeyPkgCount => {
                 if let End::Ok(ok) = &response.end {
                     let count = ok.count().ok().flatten().unwrap_or(0);
@@ -1493,13 +1595,11 @@ impl ConversationEngine {
                     } else {
                         0
                     };
-                    if (n > 0 || !last_resort)
-                        && self.hooks.device_key(me.account, &me.uid).is_some()
-                    {
+                    if (n > 0 || !last_resort) && self.device_key(&me).is_some() {
                         let made = self.write(cx, &me, out, |tx, c| {
                             group::make_key_packages(tx, c, n, !last_resort)
                         })?;
-                        for (_, bytes) in made {
+                        for bytes in made {
                             let key_package = KeyPackageText::from_bytes(&bytes)
                                 .map_err(|e| EngineError::Invalid(e.to_string()))?;
                             self.send(
@@ -1520,7 +1620,7 @@ impl ConversationEngine {
             Pending::KeyPkgGet { job, uid } => self.job_reply(cx, job, uid, response, out),
             Pending::WelcomeList => {
                 for line in &response.lines {
-                    if let ServerLine::Welcome { id, welcome } = &line.line {
+                    if let ServerLine::Welcome { id, welcome, .. } = &line.line {
                         self.on_welcome(cx, id, welcome, out)?;
                     }
                 }
@@ -1580,12 +1680,22 @@ impl ConversationEngine {
                 End::Err(e) if e.code == ErrorCode::Stale => match row.kind {
                     OutboxKind::Commit => group::commit_lost(tx, c, &conv_row, &row)?,
                     _ => {
-                        // 7.2: a device that holds the previous epoch's token
-                        // puts the current one's hash back with TOKEN. The
-                        // engine keeps no past tokens yet, so it waits and
-                        // posts again after catching up.
-                        tx.update_outbox(outbox, OutboxState::Queued, None, None, Some(retry))?;
-                        repair = Some(());
+                        // 7.2: a device that holds the token of the epoch
+                        // before puts this epoch's hash back with TOKEN,
+                        // then posts again. If the post was for an older
+                        // epoch, catching up shows it.
+                        let (token, epoch) = group::send_token(tx, c, &conv_row)?;
+                        let token_repair = match (row.epoch, tx.prev_token(conv)?) {
+                            (Some(e), Some(prev)) if e == epoch && epoch > 0 => {
+                                Some((epoch - 1, prev, token.hash()))
+                            }
+                            _ => None,
+                        };
+                        tx.update_outbox(outbox, OutboxState::Sent, None, None, None)?;
+                        if token_repair.is_none() {
+                            tx.update_outbox(outbox, OutboxState::Queued, None, None, Some(retry))?;
+                        }
+                        repair = Some(token_repair);
                     }
                 },
                 End::Err(e) => {
@@ -1604,11 +1714,33 @@ impl ConversationEngine {
             }
             Ok(())
         })?;
-        if repair.is_some() {
-            // Catch up: a stale post usually means the group moved on.
-            if let Some(mb) = self.write(cx, me, out, |tx, _| Ok(tx.current_mailbox(conv).ok()))? {
-                self.fetch(&mb.mailbox, mb.sync_point, out);
+        match repair {
+            Some(Some((epoch, prev, hash))) => {
+                if let Some(mb) =
+                    self.write(cx, me, out, |tx, _| Ok(tx.current_mailbox(conv).ok()))?
+                {
+                    self.send(
+                        out,
+                        Target::Mailbox(mb.mailbox),
+                        Command::Token {
+                            mailbox: mb.mailbox,
+                            epoch,
+                            token: SendTokenText::from_bytes(prev),
+                            hash: TokenHash::from_bytes(hash),
+                        },
+                        Pending::Token { outbox },
+                    );
+                }
             }
+            Some(None) => {
+                // Catch up: a stale post usually means the group moved on.
+                if let Some(mb) =
+                    self.write(cx, me, out, |tx, _| Ok(tx.current_mailbox(conv).ok()))?
+                {
+                    self.fetch(&mb.mailbox, mb.sync_point, out);
+                }
+            }
+            None => {}
         }
         Ok(())
     }
@@ -1629,11 +1761,15 @@ impl ConversationEngine {
         let sealed = welcome.decode();
         let joined = self.write(cx, &me, out, |tx, c| group::join_welcome(tx, c, &sealed));
         let delete = match joined {
-            Ok(group::Joined::Joined { conv, mailbox }) => {
-                let _ = mailbox;
+            Ok(group::Joined::Joined { conv }) => {
                 out.push(Action::Emit(Event::Conversation(
                     ConversationEvent::Joined { conversation: conv },
                 )));
+                // 5.1: one direct conversation per pair.
+                let left = self.write(cx, &me, out, |tx, c| group::keep_one_direct(tx, c, conv))?;
+                if let Some(left) = left {
+                    tracing::info!(%left, "left a second direct conversation with the same identity");
+                }
                 let actions = self.write(cx, &me, out, |tx, _| {
                     Ok(self.hooks.leaves_changed(tx, conv))
                 })?;
@@ -1674,7 +1810,7 @@ impl ConversationEngine {
         {
             return Ok(());
         }
-        if self.hooks.device_key(me.account, &me.uid).is_none() {
+        if self.device_key(me).is_none() {
             return Ok(());
         }
         let has = self.write(cx, me, out, |tx, c| {
@@ -1783,7 +1919,8 @@ impl ConversationEngine {
             .inflight
             .values()
             .filter_map(|p| match p {
-                Pending::Post { conv, .. } => Some(*conv),
+                Pending::Post { conv, .. } | Pending::CreateMove { conv, .. } => Some(*conv),
+                Pending::Token { .. } => None,
                 _ => None,
             })
             .collect();
@@ -1810,6 +1947,35 @@ impl ConversationEngine {
             };
             for p in posts {
                 let token = SendTokenText::from_bytes(*p.token.as_bytes());
+                if let Some(create) = p.create {
+                    let next = p
+                        .next
+                        .ok_or(EngineError::Invalid("a move with no next".into()))?;
+                    let epoch = std::num::NonZeroU64::new(create.epoch)
+                        .ok_or(EngineError::Invalid("epoch 0".into()))?;
+                    let target = self.fresh(me);
+                    self.send(
+                        out,
+                        target,
+                        Command::Create {
+                            mailbox: create.mailbox,
+                            group_id: GroupId::from_bytes(create.group_id),
+                            token_hash: TokenHash::from_bytes(next),
+                            form: CreateForm::Private {
+                                moving: Some(risala_proto::command::mailbox::Move {
+                                    epoch,
+                                    from: create.from,
+                                    token,
+                                }),
+                            },
+                        },
+                        Pending::CreateMove {
+                            conv: conv.id,
+                            outbox: p.outbox,
+                        },
+                    );
+                    continue;
+                }
                 let message = MlsMessage::from_bytes(&p.post)
                     .map_err(|e| EngineError::Invalid(e.to_string()))?;
                 let command = Command::Post {
@@ -1856,6 +2022,10 @@ impl ConversationEngine {
                 target.clone(),
                 Command::Welcome(WelcomeCommand::Put {
                     key_package_ref: RefText::from_bytes(reference),
+                    secret: match <[u8; 32]>::try_from(w.secret.as_slice()) {
+                        Ok(s) => WelcomeSecret::Put(PutSecret::from_bytes(s)),
+                        Err(_) => WelcomeSecret::Proposal,
+                    },
                     welcome: OrBlob::Inline(welcome),
                 }),
                 Pending::WelcomePut { id: w.id },
@@ -1946,13 +2116,25 @@ impl ConversationEngine {
     }
 }
 
-/// A post to make.
+/// A post to make, or for a move, the new mailbox to create first
+/// (7.8).
 struct NextPost {
     outbox: i64,
     post: Vec<u8>,
     token: risala_mls::token::SendToken,
     next: Option<[u8; 48]>,
     live: bool,
+    create: Option<CreateMove>,
+}
+
+/// `CREATE <box> <group-id> <token-hash> epoch=<e> from=<old> token=<token>`
+/// for a move (5.2, 7.8): `token` is the send token of `epoch` - 1, and
+/// the token hash the move commit's `next`.
+struct CreateMove {
+    mailbox: BoxName,
+    group_id: [u8; 32],
+    epoch: u64,
+    from: BoxName,
 }
 
 /// What a conversation posts next, made now: its pending commit, or a
@@ -1984,10 +2166,15 @@ fn next_posts(
         }
         let row = row.clone();
         // A commit made for an earlier epoch lost: make it again.
-        if (row.post.is_none() || row.epoch != Some(epoch))
-            && !group::build_commit(tx, c, conv, &row)?
-        {
-            return Ok(Vec::new());
+        if row.post.is_none() || row.epoch != Some(epoch) {
+            match group::build_commit(tx, c, conv, &row)? {
+                group::Built::Made => {}
+                group::Built::Nothing => return Ok(Vec::new()),
+                group::Built::WaitUntil(t) => {
+                    tx.update_outbox(row.id, OutboxState::Queued, None, None, Some(t))?;
+                    return Ok(Vec::new());
+                }
+            }
         }
         let row = tx
             .outbox_row(row.id)?
@@ -1996,14 +2183,38 @@ fn next_posts(
             .post
             .clone()
             .ok_or(EngineError::Invalid("a commit with no post".into()))?;
-        tx.update_outbox(row.id, OutboxState::Sent, None, None, None)?;
         let (token, _) = group::send_token(tx, c, conv)?;
+        // 7.8: a move creates its new mailbox before it posts.
+        if let Some(mailbox) = row.move_box
+            && !row.moved
+        {
+            let group_id = conv
+                .group_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| EngineError::Invalid("a group id of another length".into()))?;
+            return Ok(vec![NextPost {
+                outbox: row.id,
+                post: Vec::new(),
+                token,
+                next: row.next,
+                live: false,
+                create: Some(CreateMove {
+                    mailbox,
+                    group_id,
+                    epoch: epoch + 1,
+                    from: tx.current_mailbox(conv.id)?.mailbox,
+                }),
+            }]);
+        }
+        tx.update_outbox(row.id, OutboxState::Sent, None, None, None)?;
         return Ok(vec![NextPost {
             outbox: row.id,
             post,
             token,
             next: row.next,
             live: false,
+            create: None,
         }]);
     }
     if let Some(row) = rows
@@ -2018,6 +2229,7 @@ fn next_posts(
             token,
             next: None,
             live: false,
+            create: None,
         }]);
     }
     // No messages until the conversation is created, while it has a
@@ -2044,6 +2256,7 @@ fn next_posts(
             token: token.clone(),
             next: None,
             live: row.kind == OutboxKind::Live,
+            create: None,
         });
     }
     Ok(out)

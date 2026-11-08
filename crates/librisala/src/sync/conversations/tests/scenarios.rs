@@ -200,6 +200,10 @@ fn private_room_invite_remove_and_topic() {
     net.tick();
     assert_eq!(net.convs(b)[0].topic, "Saturday");
 
+    // Alice has started the last three epochs: her next commit waits until
+    // ten minutes after her last (12.7, streaks).
+    net.advance(11 * 60 * 1000);
+    let now = net.clock.now().unix_millis();
     // Removing carol: her device is out, and reads nothing more.
     net.write(a, |tx| {
         group::queue_intent(
@@ -218,9 +222,24 @@ fn private_room_invite_remove_and_topic() {
     net.tick();
     assert_eq!(net.state(c, rc), ConvState::Left);
     assert_eq!(net.leaves(b, rb).len(), 2);
+    // The remover moves the group to a new mailbox (7.8), which carol
+    // never learns of: after another wait, since alice started the last
+    // three epochs again.
+    net.advance(11 * 60 * 1000);
+    let old_box = net.devices[c].store.mailbox_rows(rc).unwrap()[0].mailbox;
+    let new_box = net.devices[b].store.mailbox_rows(rb).unwrap()[0].clone();
+    assert!(new_box.current);
+    assert_ne!(new_box.mailbox, old_box);
+    assert_eq!(
+        net.devices[a].store.mailbox_rows(room).unwrap()[0].mailbox,
+        new_box.mailbox
+    );
     net.say(b, rb, "carol is gone");
     assert_eq!(net.texts(a, room).len(), 2);
     assert_eq!(net.texts(c, rc).len(), 1);
+    // Nothing more was posted to the old mailbox after the move.
+    let old_posts = net.server.posts(&old_box);
+    assert_eq!(old_posts.last().unwrap().1, ContentType::Commit);
 }
 
 #[test]
@@ -424,9 +443,10 @@ fn a_stale_post_is_sent_again() {
     let before = posts(&net);
     net.say(a, conv, "once");
     net.tick();
-    // Refused with ERR stale, then posted again after catching up (7.2,
-    // 12.9), and shown once.
+    // Refused with ERR stale, then posted again after TOKEN put the
+    // epoch's hash back (7.2, 12.9), and shown once.
     assert_eq!(posts(&net) - before, 2);
+    assert!(net.server.log.iter().any(|(c, v)| c.0 == a && v == "TOKEN"));
     assert_eq!(
         net.texts(b, cb),
         vec![("alice@example.org".into(), "once".into())]
@@ -670,4 +690,63 @@ fn a_leaf_is_refreshed_weekly() {
     // And not again the next day.
     net.advance(24 * 60 * 60 * 1000);
     assert_eq!(net.epoch(a, conv), 3);
+}
+
+#[test]
+fn two_direct_conversations_become_one() {
+    let (mut net, a, b) = alice_and_bob();
+    // Both start one at about the same time (5.1).
+    let ca = net
+        .job(
+            a,
+            Job::Direct {
+                peer: "bob@example.net".parse().unwrap(),
+            },
+        )
+        .unwrap();
+    // Bob's device does not see alice's yet: it makes its own, as if the
+    // Welcome had not arrived.
+    let bob_first = net.same_conv(b, a, ca).unwrap();
+    net.write(b, |tx| {
+        tx.set_state(bob_first, ConvState::Left)?;
+        Ok(())
+    });
+    let cb = net
+        .job(
+            b,
+            Job::Direct {
+                peer: "alice@example.org".parse().unwrap(),
+            },
+        )
+        .unwrap();
+    net.write(b, |tx| {
+        tx.set_state(bob_first, ConvState::Active)?;
+        Ok(())
+    });
+    net.tick();
+    net.tick();
+    // Alice joined bob's too, and left the one with the higher group id.
+    let active: Vec<_> = net
+        .convs(a)
+        .into_iter()
+        .filter(|c| {
+            c.kind == ConvKind::Direct && c.state.in_group() && c.state != ConvState::Leaving
+        })
+        .collect();
+    assert_eq!(active.len(), 1, "{active:?}");
+    let low = std::cmp::min(
+        net.devices[a]
+            .store
+            .conversation_row(ca)
+            .unwrap()
+            .unwrap()
+            .group_id,
+        net.devices[b]
+            .store
+            .conversation_row(cb)
+            .unwrap()
+            .unwrap()
+            .group_id,
+    );
+    assert_eq!(active[0].group_id, low);
 }
