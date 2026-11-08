@@ -89,6 +89,9 @@ impl Handler for Stub {
             tokio::time::sleep(self.delay).await;
         }
         let handle = self.handle(conn);
+        if matches!(req.command, Command::Guest { .. }) {
+            handle.set_signed_in();
+        }
         for n in 0..self.lines_per_command {
             let message = format!("{n:04} {}", "x".repeat(1019));
             handle.send(ServerMessage::new(ServerLine::Notice { message }));
@@ -312,6 +315,25 @@ async fn bad_lines_get_errors_with_their_ref() {
         .map(|r| r.ref_.as_ref().unwrap().to_string())
         .collect();
     assert_eq!(refs, ["t2", "t3", "r1"]);
+}
+
+/// Lines that carry MLS data may be long once the connection has signed
+/// in, and not before (2.3).
+#[tokio::test(start_paused = true)]
+async fn long_lines_once_signed_in() {
+    let mut pipe = Pipe::greeted(Stub::new()).await;
+    let data = "A".repeat(2 * risala_proto::frame::MAX_CLIENT_LINE);
+    let keypkg = format!("@ref=k KEYPKG ADD {data}\n");
+    pipe.send(keypkg.as_bytes()).await;
+    pipe.expect("@ref=k ERR too-long too long").await;
+    pipe.send(b"GUEST sam\n").await;
+    pipe.expect("OK verb=guest").await;
+    pipe.send(keypkg.as_bytes()).await;
+    pipe.expect("@ref=k OK verb=keypkg").await;
+    // Other verbs keep the normal limit.
+    pipe.send(format!("@ref=m MSG #general {data}\n").as_bytes())
+        .await;
+    pipe.expect("@ref=m ERR too-long too long").await;
 }
 
 #[tokio::test(start_paused = true)]

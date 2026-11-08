@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use risala_proto::command::Request;
 use risala_proto::error::ErrorCode;
-use risala_proto::frame::{MAX_SERVER_LINE, check_line_len};
+use risala_proto::frame::LineLimits;
 use risala_proto::server::{ErrResponse, ServerMessage};
 use risala_proto::time::Timestamp;
 use tokio::sync::{Notify, mpsc};
@@ -66,6 +66,9 @@ struct Encoded {
 impl OutLine {
     /// Encodes `msg` for the wire.
     ///
+    /// A line may be as long as 2.3 allows a server line: long if its verb
+    /// is one of those that carry MLS data, such as KEYPKG and WELCOME.
+    ///
     /// A message that cannot be written, or is too long for a server line
     /// (2.3), is a bug in the core. It is logged, and nothing is written
     /// for it; if it is a final response, `ERR internal` is written in its
@@ -75,7 +78,7 @@ impl OutLine {
         let problem = match msg.try_to_line() {
             Ok(line) => {
                 let text = line.to_string();
-                match check_line_len(&text, MAX_SERVER_LINE) {
+                match LineLimits::SERVER.check(&text) {
                     Ok(()) => {
                         let mut wire = text.into_bytes();
                         wire.push(b'\n');
@@ -186,6 +189,9 @@ pub struct ConnHandle {
 #[derive(Debug)]
 struct QueueState {
     killed: AtomicBool,
+    /// The connection has signed in, so the network layer takes long lines
+    /// from it (2.3).
+    signed_in: AtomicBool,
     /// Wakes the network layer when the connection is killed.
     kill: Notify,
     /// The bytes of the lines in the queue.
@@ -209,6 +215,7 @@ pub fn conn_channel(id: ConnId, lines: usize, bytes: usize) -> (ConnHandle, Conn
     let (tx, rx) = mpsc::channel(lines);
     let state = Arc::new(QueueState {
         killed: AtomicBool::new(false),
+        signed_in: AtomicBool::new(false),
         kill: Notify::new(),
         bytes: AtomicUsize::new(0),
         max_bytes: bytes,
@@ -254,6 +261,19 @@ impl ConnHandle {
         self.state.kill.notify_waiters();
         self.state.kill.notify_one();
         self.state.drained.notify_waiters();
+    }
+
+    /// Records that the connection has signed in, as a guest or an
+    /// identity. From the next line on, the network layer takes lines as
+    /// long as 2.3 allows a signed-in client; before, every line has the
+    /// normal limit.
+    pub fn set_signed_in(&self) {
+        self.state.signed_in.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`set_signed_in`](Self::set_signed_in) was called.
+    pub fn is_signed_in(&self) -> bool {
+        self.state.signed_in.load(Ordering::SeqCst)
     }
 
     /// Whether the connection has been killed or its receiver dropped.
@@ -393,6 +413,8 @@ pub trait Handler: Send + Sync + 'static {
 mod tests {
     use risala_proto::server::{OkResponse, ServerLine};
 
+    use risala_proto::frame::{MAX_LONG_CLIENT_LINE, MAX_LONG_SERVER_LINE, MAX_SERVER_LINE};
+
     use super::*;
 
     fn ok(n: usize) -> ServerMessage {
@@ -410,6 +432,32 @@ mod tests {
         // A line that is not final is just dropped.
         let notice = ServerMessage::new(ServerLine::Bye {
             message: "x".repeat(MAX_SERVER_LINE),
+        });
+        assert!(OutLine::new(notice).wire().is_empty());
+    }
+
+    /// Lines that carry MLS data may be long (2.3); others may not.
+    #[test]
+    fn mls_lines_may_be_long() {
+        use risala_proto::mls::KeyPackage;
+
+        let uid: risala_proto::names::Uid = "alice@example.org".parse().unwrap();
+        let line = |bytes: usize| {
+            ServerMessage::new(ServerLine::KeyPkg {
+                uid: uid.clone(),
+                key_package: KeyPackage::from_bytes(&vec![7; bytes]).unwrap(),
+            })
+        };
+        let long = OutLine::new(line(3 * MAX_SERVER_LINE));
+        assert!(long.size() > MAX_SERVER_LINE);
+        assert!(long.wire().starts_with(b"KEYPKG alice@example.org "));
+        // The longest KeyPackage a client may send (2.3).
+        let longest = OutLine::new(line(MAX_LONG_CLIENT_LINE / 4 * 3 - 3));
+        assert!(longest.size() > MAX_LONG_CLIENT_LINE);
+        assert!(longest.size() < MAX_LONG_SERVER_LINE);
+        // Other lines keep the normal limit.
+        let notice = ServerMessage::new(ServerLine::Notice {
+            message: "x".repeat(2 * MAX_SERVER_LINE),
         });
         assert!(OutLine::new(notice).wire().is_empty());
     }

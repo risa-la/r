@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use risala_proto::command::{Command, Request};
 use risala_proto::error::ParseError;
-use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE};
+use risala_proto::frame::{LineDecoder, LineLimits, MAX_CLIENT_LINE};
 use risala_proto::line::{Line, read_ref};
 use risala_proto::server::{ErrResponse, ServerLine, ServerMessage};
 use risala_proto::text::escape;
@@ -173,6 +173,12 @@ where
                             handler.command(id, req).await;
                             if quit {
                                 return Ended::Quit;
+                            }
+                            // Once signed in, lines that carry MLS data may
+                            // be long (2.3). Lines already split off keep the
+                            // normal limit they were judged by.
+                            if decoder.limits() != LineLimits::CLIENT && handle.is_signed_in() {
+                                decoder.set_limits(LineLimits::CLIENT);
                             }
                         }
                         Err((e, ref_)) => reply_parse_error(handle, &e, ref_),

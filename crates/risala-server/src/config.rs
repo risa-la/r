@@ -39,7 +39,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use risala_proto::frame::MAX_SERVER_LINE;
+use risala_proto::frame::{MAX_LONG_SERVER_LINE, MAX_SERVER_LINE};
 use risala_proto::names::{Domain, Identity};
 use serde::Deserialize;
 
@@ -298,9 +298,18 @@ impl Limits {
     }
 
     /// [`command_room`](Self::command_room) in bytes: that many lines of
-    /// the longest a server line may be ([`MAX_SERVER_LINE`]).
+    /// the longest a server line may be ([`MAX_SERVER_LINE`]), but at least
+    /// room for one long line ([`MAX_LONG_SERVER_LINE`], 2.3) and
+    /// [`FANOUT_ROOM`] lines besides. A command that sends several long
+    /// lines, such as KEYPKG GET or WELCOME LIST (Section 12), waits for
+    /// this much room again before each one after the first.
     pub fn command_room_bytes(&self) -> usize {
-        self.command_room().saturating_mul(MAX_SERVER_LINE)
+        let long = FANOUT_ROOM
+            .saturating_mul(MAX_SERVER_LINE)
+            .saturating_add(MAX_LONG_SERVER_LINE);
+        self.command_room()
+            .saturating_mul(MAX_SERVER_LINE)
+            .max(long)
     }
 }
 
@@ -463,7 +472,9 @@ impl Config {
         if l.out_queue_bytes < l.command_room_bytes() {
             return invalid(format!(
                 "limits.out_queue_bytes is {}, but must be at least {}: {} lines \
-                 (see limits.out_queue) of up to {MAX_SERVER_LINE} bytes",
+                 (see limits.out_queue) of up to {MAX_SERVER_LINE} bytes, or one line \
+                 of MLS data (up to {MAX_LONG_SERVER_LINE} bytes) and {FANOUT_ROOM} lines \
+                 for live events, whichever is more",
                 l.out_queue_bytes,
                 l.command_room_bytes(),
                 l.command_room(),
@@ -679,6 +690,16 @@ mod tests {
             (500 + REPLY_MARGIN + FANOUT_ROOM) * MAX_SERVER_LINE
         );
         invalid(|l| l.out_queue_bytes = 1 << 20, "out_queue_bytes");
+        // Short pages still leave room for one long line (2.3).
+        let short = Limits {
+            max_page: 10,
+            max_list: 10,
+            ..Limits::default()
+        };
+        assert_eq!(
+            short.command_room_bytes(),
+            MAX_LONG_SERVER_LINE + FANOUT_ROOM * MAX_SERVER_LINE
+        );
         assert!(
             with(|l| {
                 l.max_page = 1000;

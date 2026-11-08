@@ -462,6 +462,8 @@ impl Registry {
             timer.abort();
         }
         let handle = conn.handle.clone();
+        // Long lines from now on (2.3).
+        handle.set_signed_in();
         let user = self.user(uid);
         let first = {
             let mut state = user.lock();
