@@ -2,14 +2,14 @@
 
 The high-level plan for building risala: a Rust server, a Rust client
 library (librisala), and native apps for GNOME, Apple platforms and
-Android. [SPEC.md](SPEC.md) is the source of truth for the protocol.
-This file covers how we build it.
+Android. The spec ([`spec/`](spec/)) is the source of truth for the
+protocol. This file covers how we build it.
 
 ## 1. Principles
 
 - **The spec comes first.** If the code and the spec disagree, fix one of
   them on purpose. Don't let them drift. Spec changes are made in
-  SPEC.md first.
+  the spec (`spec/`) first.
 - **One protocol implementation.** Parsing, grammar and signing live in
   a single crate (`risala-proto`). The server and librisala both use it.
 - **Apps are thin.** Everything apps share lives in librisala:
@@ -17,6 +17,10 @@ This file covers how we build it.
   cache, timelines, rooms, moderation and admin. An app only draws the
   UI and supplies a few platform services (secure key storage, push
   tokens, notifications).
+- **Zero trust in the server** (2026-11-08). Devices never take the
+  server's word for anything they show or act on in an encrypted
+  conversation, or for whose keys are whose. Whatever the server can
+  still do, it can only do visibly, and Section 14 lists it.
 - **Tested from transcripts.** The server is tested with scripted line
   transcripts. Every example in the spec becomes a test. Using the
   protocol by hand with `openssl s_client` is no longer a goal: connecting
@@ -26,7 +30,7 @@ This file covers how we build it.
 
 ```
 risala/
-├── SPEC.md                the protocol (CC BY 4.0)
+├── spec/                  the protocol (CC BY 4.0), one file per section
 ├── README.md
 ├── PLAN.md
 ├── LICENSE                Apache-2.0, for the code
@@ -218,8 +222,9 @@ Each milestone ends with something that runs.
 | M4 | Server: rich messages and moderation | reply, edit, react, DELETE, RELATED; roles, ROLES, SET, INVITE, KICK, BAN; REPORT and RESOLVE; retention; all ADMIN commands |
 | M5 | librisala core and `risala-cli` | The CLI signs in, syncs, works offline from its cache and recovers from dropped connections without losing or duplicating messages |
 | M5a | End-to-end encryption | Post-quantum TLS and ML-DSA keys everywhere. KEYPKG, INIT, COMMIT, GROUPINFO, WELCOME, ENC and BACKUP in `risalad` and librisala, and direct conversations. Two CLI devices talk in an encrypted direct conversation and room; a new device of the same identity reads the whole history offline; a restore from a recovery key works; reports of encrypted messages verify |
+| M5b | Zero-trust redesign | The spec is rewritten as draft-03 in `spec/` for items 51-58, the code follows, and a fresh security review of the spec finds nothing above Low (item 59 has the order) |
 | M6 | FFI, shared theme and strings | `librisala-ffi` with UniFFI for Swift and Kotlin, platform key stores, one source for the theme's colors and metrics, and the shared strings in `l10n/`. The Apple app and an Android shell sign in, sync and show a timeline through the bindings |
-| M6a | Proof of work | The puzzle is in SPEC.md (item 42). `risalad` hands out puzzles and checks solutions with the interpreter; librisala solves them with the JIT where it can, on every hardware thread. By default a client cannot become a guest or register without solving one. The `openssl` smoke test moves to `risala-cli`. The `risala-pow` crate itself is done (3.2) |
+| M6a | Proof of work | The puzzle is in the spec (`spec/`, item 42). `risalad` hands out puzzles and checks solutions with the interpreter; librisala solves them with the JIT where it can, on every hardware thread. By default a client cannot become a guest or register without solving one. The `openssl` smoke test moves to `risala-cli`. The `risala-pow` crate itself is done (3.2) |
 | M7 | iOS and Android apps | Built side by side, with macOS coming along through the shared SwiftUI app. Onboarding (guest, registering with an invite, signing in, pairing a device by QR code, recovery), rooms, direct conversations and encryption. Day-to-day usable on phones against a real server |
 | M8 | Push and files | PUSH, the gateway, the iOS extension, FCM and UnifiedPush, then UPLOAD over HTTPS |
 | M9 | GNOME app | Day-to-day usable on Linux against a real server |
@@ -234,9 +239,10 @@ server.
 ## 5. Spec issues to settle
 
 These came out of reviewing draft-01 against what the clients need.
-Settle them in SPEC.md before or during the matching milestone.
+Settle them in the spec (`spec/`) before or during the matching
+milestone.
 
-Settled (now in SPEC.md):
+Settled (now in the spec, `spec/`):
 
 1. **Edits and reactions of older messages.** Added RELATED (7.3), which
    returns the edits and reactions for a range of messages, so that a
@@ -1311,6 +1317,475 @@ Open:
       the key file.
     - **Edits and reactions** count toward a verified message only if
       they are verified too.
+
+51. **Zero trust in the server** (1.1, 14), decided with the user on
+    2026-11-08 after a security review of the spec. Replaces parts of
+    items 19 and 22, as the items below say:
+    - Devices never take the server's word for anything they show or act
+      on, or for whose keys are whose. Whatever the server can still do,
+      it can only do visibly, and Section 14 lists it.
+    - Every conversation is end-to-end encrypted, public rooms too. There
+      are no plaintext rooms.
+    - The server learns as little metadata as v1 can manage: not who
+      sends, and not who is in a private conversation.
+    - Messages are deniable: a leaked message does not prove to anyone
+      else who wrote it.
+    - At least Signal's protections: per-message forward secrecy,
+      post-compromise security, post-quantum keys, sealed sending and key
+      transparency.
+    - Rooms of thousands of members.
+    - Operators cannot reset identities.
+
+52. **MLS for everything, with no history on the server** (2.3, 5, 7,
+    12, 15), decided with the user on 2026-11-08:
+    - **MLS for every conversation.** A Triple Ratchet (Signal's Double
+      Ratchet with its post-quantum SPQR) was weighed and dropped:
+      libsignal and SPQR are AGPL-3.0 and not on crates.io, it would be a
+      second protocol, and it does not reach thousands of members.
+    - **Per-message keys.** Messages are MLS application messages, with
+      a key per message that is deleted after use. History keys, KEY
+      lines and key backups (items 19 and 22) go.
+    - **No history on the server.** It keeps encrypted messages only
+      until devices fetch them, within retention. Newcomers to a room see
+      only what is sent after they join.
+    - **History moves between your own devices**: by transfer at
+      pairing, end to end, and optionally through an encrypted backup of
+      message history under the recovery key, kept on the server.
+    - **Large MLS objects** (trees, Welcomes, big commits) travel as
+      content-addressed blobs over HTTPS. Lines carry their hashes.
+    - **The weekly fresh-leaf commit** is a MUST.
+    - **Cipher suite `0x0020`**, the value
+      draft-ietf-mls-pq-ciphersuites-07 (2026-11-01) requests for X-Wing
+      (HPKE KEM `0x647a`), HKDF-SHA384, ChaCha20-Poly1305, SHA-384 and
+      ML-DSA-44. `0x0052` was OpenMLS's placeholder, and openmls_traits
+      0.6.0, the newest release, still uses it, so `crates/openmls-traits`
+      patches that one value until a release has `0x0020`. Builds check
+      the suite's value and algorithms, and devices reject MLS objects
+      with any other suite or version. Written in the spec (`spec/`) and
+      built.
+
+53. **Deniability** (5.8, 12), decided with the user on 2026-11-08:
+    - **Per-group leaf keys.** A device signs in MLS with a fresh key for
+      each group. Device and identity keys never sign anything that names
+      a message or a leaf key: the device key signs sign-ins, KeyPackage
+      device bindings and period-key certificates (item 60). This
+      replaces item 19's "the same key signs in and signs in MLS".
+    - **Direct conversations and private rooms up to about 256 members.**
+      Each pair of devices confirms the other's leaf key with a
+      post-quantum KEM challenge and a MAC, at the cost of one extra
+      flight.
+    - **Larger rooms** use epochal signatures (Hülsing and Weber, S&P
+      2021): daily keys whose private halves are published after the day.
+      Messages are deniable once the key is out. The construction needs
+      an outside review.
+    - **Reports.** Room moderators, who are members, can trust who wrote
+      a reported message. Operators get its content, proven by franking,
+      but not provable authorship. The reporter is told exactly who will
+      see it, and may add up to 10 earlier messages as franked context,
+      with the number left out between them.
+
+54. **Metadata** (4, 9, 12, 14), decided with the user on 2026-11-08:
+    - **Hidden membership.** Direct conversations and private rooms
+      encrypt their commits, so the server keeps no member lists. Devices
+      check commits themselves, and the first valid commit of an epoch
+      wins.
+    - **Public rooms show their membership**, so the server can check
+      their commits, hold the tree and serve light clients
+      (draft-ietf-mls-partial). Anyone can join them anyway.
+    - **Sealed sending.** Devices post over connections that do not sign
+      in, proving membership with a per-epoch send token from the group,
+      and carry a per-member pseudonym that the server can rate-limit or
+      mute without knowing who it is.
+    - **Push** goes through mailboxes: each device subscribes to each
+      conversation's mailbox with a tag that cannot be linked to its
+      identity. Bodies are encrypted to the device (Web Push encryption,
+      RFC 8291).
+    - **Spam.** Proof of work to connect anonymously and to join, limits
+      per pseudonym, and devices enforce room rules from the group's
+      moderators.
+    - **Sizes.** Private rooms up to 1,000 members (about 3,000
+      devices); public rooms up to 10,000, with light clients. Revisit
+      once ML-DSA and X-Wing are measured on phones.
+    - **No Tor in v1.** Section 14 says the server sees IP addresses and
+      timing.
+
+55. **Rooms** (5, 6, 8, 12), decided with the user on 2026-11-08:
+    - **No INVITE command.** Owners and moderators invite with a commit
+      that adds the invitee's devices.
+    - **Roles live in the group.** The owner and moderator lists are in
+      the conversation extension, changed only by an owner's commit.
+      Devices act on the group, not on KICK, PART or ROLE events, and
+      PART is a commit by the leaving device.
+    - **Gaps and deletes.** Each message carries a counter per sending
+      device and the id of that device's previous message, so devices
+      notice messages they did not get. Deleting is a signed, encrypted
+      instruction from the author or a moderator.
+    - **What devices show comes from inside the encryption**: the
+      sender's timestamp (large gaps from the server's time are
+      flagged), display names from a signed profile in the group, topics
+      from moderators, and typing and read markers as encrypted
+      messages. Presence stays with the server, and Section 14 says so.
+    - **Guests** join public rooms only, as members with throwaway keys,
+      shown as unverified, with proof of work to join.
+
+56. **Identity and keys** (4.4-4.7, 10.5, 12.12, 14), decided with the
+    user on 2026-11-08:
+    - **A master key** signs a device-signing key that every device
+      holds. The master key is the recovery key's signing key (items 40
+      and 43), and every identity gets a recovery key when it is made.
+    - **The key file is a chain of records**: a new device-signing key,
+      a device added or removed. Each is signed and holds the hash of the
+      one before. New contacts read it from the first record.
+    - **A witnessed log.** Every server keeps a Merkle log of the records
+      of the identities it hosts, and a self-hosted identity names the
+      log it uses. Clients accept records only with an inclusion proof
+      and a checkpoint cosigned by k of n public witnesses, and check that
+      checkpoints are consistent. It uses the C2SP formats
+      (tlog-checkpoint, signed-note, tlog-witness, tlog-tiles). Witnesses
+      and the log sign with ML-DSA-44 (signed-note type `0x06`); Ed25519
+      cosignatures are not accepted (item 60).
+    - **Own devices watch the log**, and alert every device of the
+      identity to a record they do not know. **A fork** (two records with
+      the same parent, or checkpoints that do not agree) stops sending to
+      that identity until the user resolves it.
+    - **Pairing.** The new device's QR code carries a one-time secret
+      that never reaches the server. The device that scans it sends the
+      master public key and the device-signing key, encrypted and
+      authenticated with that secret.
+    - **Hosted identities upload the whole signed key file.** The server
+      checks the signature and that the file extends what it has.
+    - **Removing a device** makes a new device-signing key, which needs
+      the recovery key.
+    - **No operator resets.** ADMIN ADDKEY goes. The recovery key is the
+      only way back after losing every device.
+    - **One safety number per identity**, over the master key and the uid
+      (`risala-fp-1`), as digits and a QR code. A new master key clears
+      "verified" and stops sending until the user acknowledges it. A new
+      device under the same master key is a notice.
+    - **The seed is the private key.** Imports derive the key from the
+      seed and reject a file whose expanded key does not match it.
+      Written in the spec (`spec/`, 4.3).
+
+    Open: the record and log formats, the checkpoint origins, the
+    witness list and k, how a self-hosted key file names its log, and how
+    devices fetch proofs.
+
+57. **Files** (5.6, 12.11), decided with the user on 2026-11-08:
+    - **`file-hash`**: the message carries the SHA-384 hash of the exact
+      bytes uploaded, so a swapped file fails, and so does framing
+      someone through a report. Reviewers' clients fetch a reported file
+      only when asked.
+    - **Chunks.** Files are encrypted in 64 KiB chunks with
+      ChaCha20-Poly1305, a counter nonce and a last-chunk flag. Devices
+      check `file-hash` first, then decrypt chunk by chunk.
+    - **Padding.** Files are padded with Padmé before encryption, so the
+      server sees only the padded size.
+
+    Open: where the real size goes.
+
+58. **Hygiene** (2.2, 4.2, 4.5, 9, 12, 14, 15), decided with the user
+    on 2026-11-08:
+    - Clients SHOULD sign with hedged ML-DSA.
+    - Implementations MUST run the X-Wing and FIPS 203 key checks before
+      encrypting to a key.
+    - Servers store only hashes of bearer secrets (guest tokens, upload
+      and push URLs) and compare them in constant time. Franking tags are
+      compared in constant time too, and never skipped, since they make
+      messages key-committing.
+    - **Everything is versioned**: labels carry `risala/1`, formats a
+      version byte, devices reject unknown versions, and clients accept
+      at most the current and the previous version, upgrading in order
+      (read, write, re-encrypt, then turn the old one off).
+    - **Server pins.** A pinned server whose certificate changes to
+      another that a CA vouches for gets a one-time notice. Users can turn
+      on a strict pin, after which any change needs their approval.
+
+59. **Order of the work (M5b)**, 2026-11-08:
+    1. **First sweep.** This set of items, cipher suite `0x0020` with the
+       openmls_traits patch, and the spec changes that stand on their own
+       today. The rest of the spec still describes M5a's design.
+    2. **The redesign as draft-03**, one area at a time: identity and the
+       key log (56); MLS application messages, transfer and backup (52);
+       deniability (53); metadata, sealed sending and push (54); rooms
+       and guests (55); files (57); hygiene and versions (58); then
+       Section 14 and a threat model.
+    3. **Measure** ML-DSA and X-Wing on phones before fixing the caps,
+       and have the epochal-signature construction reviewed.
+    4. **Code follows the spec**, starting with `risala-mls`.
+
+    Open: how much of M5a's code carries over.
+
+60. **Choices made while writing draft-03, to confirm with the user**
+    (2026-11-08). Draft-03 is in `spec/`, one file per section. These
+    fill in what items 51-58 left open; the questions at the end would
+    change a decision rather than fill one in, and are not in the spec
+    as decided.
+    - **Connections** (4.1, 4.2): three kinds, signed in (AUTH,
+      REGISTER), anonymous (a new `ANON` command) and guest. Account
+      things go on the signed-in one; posting, following and fetching
+      only on anonymous or guest ones.
+    - **Proof of work** (4.1): one placeholder paragraph naming ANON,
+      GUEST, REGISTER and joining public rooms. The rest is item 42's.
+    - **Mailboxes** (3.5, 5.2): a box is 16 random bytes in lower-case
+      base32 (26 characters), picked by the client at CREATE. CREATE has
+      a private form (anonymous) and a public-room form (signed in, so
+      room creation is limited per identity).
+    - **One POST command** for messages, commits and proposals (5.2).
+      The server reads group id, epoch, content type and authenticated
+      data from the MLS framing. Posts are `@seq;t POST <box> <message>`,
+      with no `from`.
+    - **RisalaAAD** in MLS `authenticated_data` (12.9): version,
+      pseudonym (16 bytes), `frank` (48 bytes on application messages)
+      and `next_token_hash` (48 bytes on commits).
+    - **Send tokens** (7.2): MLS-Exporter("risala/1 send", "", 32). The
+      server keeps SHA-384 hashes in a set per epoch, for the newest 16
+      epochs. Each commit adds its next hash. Outside public rooms it
+      accepts every commit with a valid token, and a committer fetches
+      after its `OK` to see whether it won. Public-room joins use `-`.
+    - **Pseudonyms** (7.3): 16 random bytes per leaf, picked by its
+      device, in the RisalaAAD. Devices pin the first one per leaf.
+      `MUTE`/`UNMUTE` (24 hours by default) for a public room's owners
+      and moderators on a signed-in connection, checked against the
+      extension; `ADMIN MUTE` for any mailbox. Private rooms have no
+      server mute, since the server knows no roles there.
+    - **Delivery** (7.1): FOLLOW, UNFOLLOW and FETCH (`after` only)
+      replace SYNC, HISTORY and RELATED. At least 1,000 followed
+      mailboxes per connection. A box is enough to read ciphertext; no
+      token is needed to read. `live=yes` posts (typing) are neither kept
+      nor pushed. `cid` is per mailbox, for 24 hours.
+    - **Retention** (7.5): at least 7 days, SHOULD be 30, no `forever`,
+      and no per-room retention setting.
+    - **Line limits** (2.3): long lines shrink from 8 MiB to 1 MiB, and
+      anything larger is a blob. REGISTER may be 64 KiB before sign-in.
+    - **Key file** (4.4): text, first line `risala-keys/1`, one
+      `log <vkey> <url>` line, then `<index> <record>` lines (`-` until
+      logged). Records are `master`, `signing` (new device-signing key,
+      plus removed device ids) and `device` (ML-DSA-44 device key, X-Wing
+      attestation key, label). Each has version, uid, `previous`
+      (SHA-384 of the previous Record) and a time in ms. Device id =
+      SHA-384 of the device key. Fetches may read 2 MiB (was 256 KiB).
+    - **RisalaSign** (4.3): MLS's SignWithLabel shape with a `risala/1 `
+      prefix; labels `record`, `keypackage`, `period` and `attest`.
+    - **Key log** (4.5): origin `<host>/risala-log/<n>`; entries are
+      encoded Records; tlog-tiles over HTTPS. C2SP assigns ML-DSA-44
+      only to timestamped cosignatures (signed-note type `0x06`), so the
+      log signs its checkpoints that way, under its origin's name.
+      Witnesses may cosign with Ed25519 (`0x04`) or ML-DSA-44 (`0x06`).
+      New records are in a witnessed checkpoint within an hour, and
+      there is at least one checkpoint a day.
+    - **Witness policy** (4.5): a list each client holds; the default is
+      at least three independent witnesses with k = 2, shipped with the
+      apps and editable.
+    - **Proofs** (4.5): devices compute them from the log's tiles. The
+      server has no proof command.
+    - **Self-hosted identities** (4.7): the key file names a log;
+      `KEYS PUT` to that server returns `RECORD <index> <hash>` lines,
+      and the user adds the indices. A server may refuse to log outside
+      identities.
+    - **KEYS PUT** (4.7) takes the whole chain and needs no sign-in,
+      since the records are signed; recovery uses this.
+      `REGISTER <name> <keyfile> <signature>`.
+    - **Forks and pins** (4.5): two records with the same `previous`,
+      two first `master` records, or inconsistent witnessed checkpoints.
+      A log fork marks every identity in it. A device pins each
+      identity's log as well as its master key; a new log counts as a new
+      master key.
+    - **Watching** (4.5): daily. Devices announce their own records with
+      `RECORD` in the conversation with themselves, and warn the others
+      with `ALERT`.
+    - **Master key derivation** (4.8): the HKDF info changes from
+      `risala identity ` (item 43) to `risala/1 identity `, for
+      versioned labels. AUTH keeps `risala-auth-1`, so Appendix B's
+      vector stays valid.
+    - **Pairing** (4.8): the QR text is `RISALA-PAIR:` plus base32 of
+      PairingCode (version, host, 32-byte secret, SHA-384 of the
+      NewDevice). The relay is `PAIR PUT/GET`, with ids and keys derived
+      by HKDF; data lasts 10 minutes. The existing device writes the new
+      device's record. The IdentityBundle carries the master public key,
+      the device-signing seed, the backup key and the transfer.
+    - **Removing a device** (4.8) also moves backups to the next
+      generation. The new device-signing key and backup key travel as
+      `SIGNINGKEY` and `BACKUPKEY` lines in the conversation with
+      yourself.
+    - **Recovery** (4.8, 12.7): a member's device adds a recovered
+      identity's new device if that identity's own devices have not,
+      after a random wait of up to an hour. A commit that removes an
+      identity's removed devices also adds its current ones.
+    - **Removed commands**: `UNREGISTER purge=yes`, `ADMIN KEYS`,
+      `ADDKEY`, `DELKEY` and `PURGE`. Hosted key files answer 410 after
+      unregistering, and their records stay in the log. `ADMIN DROP`
+      takes a room or a box. `ADMIN SET anon` is new.
+    - **Credential** (12.3): basic, holding a RisalaIdentity (version,
+      uid, device id). Guests have an empty device id.
+    - **Device binding** (12.3), extension `0xF2A2`: the device key signs
+      the uid and the KeyPackage's init and encryption keys. It goes in
+      KeyPackages, and in the leaf nodes of external commits.
+    - **Profile** (12.3, 8.2), leaf extension `0xF2A3`: display name, and
+      `updated` in ms. Names change by the member's own commit. NAME is
+      gone.
+    - **Conversation extension** (12.4): version, kind (direct, private
+      room, public room), host, box, name, topic, confirm, guests, send,
+      owners, mods and bans. The topic lives here and changes by commit
+      (owners and moderators); LIST shows it as read by the server.
+      Private room names are free text of up to 128 bytes, not unique.
+    - **Leaf caps** (6.1): 4,096 leaves in private rooms and 32,768 in
+      public rooms, alongside the 1,000 and 10,000 members.
+    - **Commits** (12.6) always have a path. Proposals are by value,
+      except SelfRemove and public-room external Add proposals, which go
+      by reference.
+    - **PART** (6.1): a commit that removes the identity's other leaves,
+      then a SelfRemove (draft-ietf-mls-extensions) for the device's own
+      leaf, which another member commits. See the questions below.
+    - **Public rooms** (6.1, 12.6): full clients join by external commit,
+      and light clients by external Add proposal. Full clients batch
+      pending proposals after a random wait of up to 10 minutes. Public
+      commits carry `groupinfo=`.
+    - **Light clients** (12.6), from draft-ietf-mls-partial-02:
+      `FETCH … leaf=<n>` returns AnnotatedCommits and `WELCOME GET …
+      light=yes` an AnnotatedWelcome. They rejoin weekly instead of
+      committing, and use a separate connection for fetching with
+      `leaf`.
+    - **Guests** (4.2, 6.1): a server `GONE <box> <uid>` line when a
+      session ends, and any member may remove a guest leaf.
+    - **Stale leaves** (12.7): a member may remove a leaf whose profile
+      `updated` is more than 35 days older than its own, and re-add the
+      device from a new KeyPackage. A device that fell behind retention
+      gets back this way.
+    - **Last-resort KeyPackage** (12.5): a device that joins with one
+      commits a new signature key before it sends.
+    - **Welcomes** (12.8): `WELCOME PUT <ref>` on any connection, only
+      for refs handed out by KEYPKG GET or in external proposals. A
+      random delay of up to a minute after the commit. `WELCOME GET`
+      for joins by proposal. Private groups' Welcomes carry the tree.
+      `KEYPKG GET` works on any connection.
+    - **RisalaMessage** (12.9): version, message_id, counter, previous,
+      time (ms), frank_key and content. Padding uses MLS's own, to
+      multiples of 256 bytes. Live messages have counter 0. The frank
+      still covers `content` only, but now travels in the RisalaAAD
+      rather than a tag. Times more than 10 minutes from the server's are
+      flagged. Past epochs' secrets are kept for "a few epochs".
+    - **Content lines** (12.9): TEXT, DELETE, TYPING, REPORT,
+      CHALLENGE/ANSWER, ATTEST/REVEAL, READ, BLOCK/UNBLOCK, RECORD/ALERT
+      and SIGNINGKEY/BACKUPKEY. Messages are referenced by `message_id`
+      only. Moderators may delete anyone's messages, as before.
+    - **Pairwise confirmation** (12.10): `CHALLENGE <leaf> <ct>` and
+      `ANSWER <leaf> <mac>`, with an HMAC-SHA-384 under
+      HKDF("risala/1 confirm") of the X-Wing secret, over the group id,
+      the hash of `ct` and both leaf keys' hashes. Newcomers challenge at
+      once; answers come within a minute, in the next message when
+      possible.
+    - **Threshold** (6.2, 12.10): pairwise up to 256 members. A private
+      room moves to epochal by an owner's commit at or before 256, one
+      way only. Public rooms are always epochal.
+    - **Epochal** (12.10): a period is a UTC day. The device key
+      certifies a fresh period key (PeriodCert). The leaf signature key
+      is rotated by a commit before the first message of each period.
+      ATTEST is sent in that message, and REVEAL after the period plus a
+      grace hour, within a day. Attestations are accepted only until the
+      grace hour ends, by the device's own clock. There is no
+      attestation chain, since there are no late readers.
+    - **Typing** (8.1): not sent in rooms of more than 100 members.
+    - **Presence** (8.3): `PRESENCE ON|OFF` (ON by default), a
+      per-connection `WATCH` list of at least 1,000 uids, WHOIS, and
+      MEMBERS for public rooms only. USER and MEMBER lose display names.
+    - **Blocks** (5.7): kept on devices, synced with BLOCK/UNBLOCK in the
+      conversation with yourself. Devices ignore Welcomes to groups that
+      hold someone blocked.
+    - **Reports** (5.8): to a room's moderators as REPORT lines in a
+      direct conversation with each owner and moderator. To operators as
+      `REPORT <box> <report>`, a RisalaReport with seq, frank key and
+      content for the target and up to 10 context posts, the claimed
+      author and a reason, on any connection. REPORTENC and
+      `REPORTS <room>` go; only operators review on the server.
+    - **Files** (5.6, 12.11): `UPLOAD <box> <token> <size>` adds a `del`
+      URL and drops type and name. The real size goes in a `file-size`
+      tag (and stays inside the plain text), which settles item 57's open
+      question. Files expire with retention, counted from upload.
+    - **Blobs** (12.12): `BLOB <hash> <size> [box= token=]`. A blob-ref is
+      `sha384:` plus 96 hex digits, fetched from INFO's `blobs=` prefix.
+      Servers allow at least 256 MiB, and keep a public room's current
+      tree.
+    - **History transfer** (12.13): a HistoryArchive (per conversation,
+      messages with sender, verified flag, both times, seq and content),
+      encrypted with the 12.11 file format and stored as a blob, with a
+      TransferRef in the IdentityBundle. `more` chains large ones.
+    - **Backups** (12.13): one current backup per identity, at most
+      daily, as a HistoryArchive blob whose key is wrapped under the
+      backup key of generation g (HKDF info `risala/1 backup <uid> <g>`).
+      `BACKUP PUT/GET/DEL`. The blob outlives retention.
+    - **Push** (9): `PUSH ADD <url> <tag> <key> <auth> [box=]`. Mailbox
+      subscriptions go on anonymous connections and account ones
+      (Welcomes) on signed-in ones, with a different URL for each.
+      Bodies are RFC 8291 `aes128gcm`, holding `NOTIFY <tag> <reason>`
+      with the reasons `message` and `welcome`. `FOLLOW quiet=<tag>`
+      holds pushes back. TTL is a day. Unread counts move to devices.
+    - **Safety numbers** (12.14): SHA-384 over the label `risala-fp-1`,
+      the uid and the master key, shown as 40 digits (eight 5-byte
+      chunks mod 100000) and as QR text `RISALA-FP:` plus base32.
+    - **New master key** (12.14): it stops sending in direct
+      conversations and private rooms, and only warns in public rooms.
+    - **INFO** (8.5) gains `anon`, `log` and `blobs`, and loses
+      `retention=forever`. The URI scheme drops `/<seq>` and covers
+      public rooms only.
+    - **Operators** have no rights in rooms. `ADMIN ROOMS` lists public
+      rooms only. Address bans now cover anonymous connections too.
+    - **Appendix A** is cut to checking a server and its fingerprint,
+      and Appendix D is now the threat model (the IRC appendix is gone).
+
+    Confirmed with the user on 2026-11-08, as written above, except for
+    the answers below to the questions the draft left open:
+
+    - **The device key** signs sign-ins, KeyPackage device bindings and
+      period-key certificates, never a message or a leaf key. This is
+      what item 53's "only signs in" means.
+    - **Epochal rooms rotate the leaf key every period**, so every active
+      sender commits once a day in each large room.
+    - **SelfRemove travels as a PrivateMessage** outside public rooms, a
+      deviation from draft-ietf-mls-extensions that keeps membership
+      hidden.
+    - **Pairwise confirmation covers senders only**: a device confirms a
+      leaf the first time that leaf sends, not when it joins. The
+      threshold stays at 256 members.
+    - **Witnesses must cosign with ML-DSA-44** (signed-note type `0x06`).
+      Ed25519 cosignatures are not accepted, which replaces that part of
+      item 56. The log signs its checkpoints with type `0x06` too.
+    - **Presence is off by default.**
+    - **Forks and new master keys** behave as written: a fork stops
+      sending in every conversation with that identity, rooms included;
+      a new master key stops sending outside public rooms and warns in
+      them.
+    - **A device that falls behind retention** gets the missed history
+      from the identity's other devices, as at pairing, besides the
+      35-day leaf replacement.
+    - **No 24-hour wait for key files.** A device applies a removal
+      without holding it back and flags the key as unconfirmed, so it
+      cannot fork from the group. This replaces item 50's wait.
+    - **Guests may open a direct conversation with a room's owners and
+      moderators**, only to report, with their throwaway key.
+    - **`last_resort` is the KeyPackage component `0x0004`**
+      (draft-ietf-mls-extensions-11), not the extension `0x000A`.
+      OpenMLS still uses the extension, so it needs a patch like the
+      cipher suite's.
+    - Kept as written: retention of at least 7 days (30 suggested), with
+      no per-room setting; operators with no rights inside rooms; no
+      typing above 100 members; 1 MiB lines, with blobs for anything
+      larger.
+
+    Notes, not decisions: draft-ietf-mls-partial-02 expires on
+    2026-11-08, so the light-client text may change with its next
+    revision; and item 42's proof-of-work text must also cover ANON and
+    joining public rooms.
+
+61. **What risala is called, and where the spec lives**, decided with the
+    user on 2026-11-08:
+    - risala is "a modern chat protocol". It is no longer described as
+      line-based or IRC-like, and the spec's appendix of differences from
+      IRC is gone. Lines remain the wire framing (2.3).
+    - The spec is a folder, `spec/`: `spec/README.md` holds the title,
+      abstract, conventions and contents, and each section and appendix
+      is a file of its own, with section numbers running across them.
+      The site stitches them into one page and serves the same text as
+      one file at `/spec.md`. The spec tests read the whole folder.
 
 ## 6. Decisions
 
