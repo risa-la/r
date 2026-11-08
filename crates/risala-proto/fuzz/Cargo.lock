@@ -147,6 +147,17 @@ dependencies = [
 
 [[package]]
 name = "crabgrind"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7459e07732f6de74001fcf73a3fdfbb0f368e4fd8e2392f4a2206a065e6e95"
+dependencies = [
+ "bindgen",
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
+name = "crabgrind"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "035c801dc4b418e1d857a6536dc88b4d1929c7a1fd163389766e18d322d34a84"
@@ -356,6 +367,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libcrux-hacl-rs"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66106db376ae249af86911aee048cf73ea1f394d6653026fc988dd22cf2a4ace"
+dependencies = [
+ "libcrux-macros 0.0.3",
+]
+
+[[package]]
+name = "libcrux-hkdf"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc94e651dca4d47edbcdd88bb2428ce16a2bd86b7a4e7170da87b505478f9839"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-hmac",
+ "libcrux-secrets 0.0.6",
+]
+
+[[package]]
+name = "libcrux-hmac"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "500ad9b32c715161b594172ca1fb11503a1c033b393ff4c0c33505ce51c1943c"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-macros 0.0.3",
+ "libcrux-sha2",
+ "libcrux-traits 0.0.8",
+]
+
+[[package]]
 name = "libcrux-intrinsics"
 version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -363,6 +406,16 @@ checksum = "de82722c9c7419a311e84ee902e9643a15e39a6fcaade87f21e94f8d0f30fa70"
 dependencies = [
  "core-models",
  "hax-lib 0.4.2",
+]
+
+[[package]]
+name = "libcrux-macros"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffd6aa2dcd5be681662001b81d493f1569c6d49a32361f470b0c955465cd0338"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -384,9 +437,9 @@ dependencies = [
  "core-models",
  "hax-lib 0.4.2",
  "libcrux-intrinsics",
- "libcrux-macros",
+ "libcrux-macros 0.0.4",
  "libcrux-platform",
- "libcrux-secrets",
+ "libcrux-secrets 0.0.7",
  "libcrux-sha3",
 ]
 
@@ -401,12 +454,33 @@ dependencies = [
 
 [[package]]
 name = "libcrux-secrets"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79054fc9037cb70d6a546cf094cea7d7df06af5e49d230ba24103d27ccc886f1"
+dependencies = [
+ "crabgrind 0.2.6",
+ "hax-lib 0.3.7",
+]
+
+[[package]]
+name = "libcrux-secrets"
 version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03c4ba47b3596f2771213ff162c792e9b93ddc0cdd178a2e407e00bb8ae4afcd"
 dependencies = [
- "crabgrind",
+ "crabgrind 0.3.1",
  "hax-lib 0.4.2",
+]
+
+[[package]]
+name = "libcrux-sha2"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "960e46e1be0b77098cc6ce82137864936ecad3a1b9fd4303dd51202ca140dd1e"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-macros 0.0.3",
+ "libcrux-traits 0.0.8",
 ]
 
 [[package]]
@@ -418,7 +492,17 @@ dependencies = [
  "hax-lib 0.4.2",
  "libcrux-intrinsics",
  "libcrux-platform",
- "libcrux-traits",
+ "libcrux-traits 0.0.9",
+]
+
+[[package]]
+name = "libcrux-traits"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fa7a21e8c2e8baa8b40f0b176740f2ca4baadd79d1b00e48d6b1e363c42085a"
+dependencies = [
+ "libcrux-secrets 0.0.6",
+ "rand",
 ]
 
 [[package]]
@@ -427,7 +511,7 @@ version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8958bb5c3780eb7c3355aeeb051629b830e47bfefd36befed93c81b53366bbc4"
 dependencies = [
- "libcrux-secrets",
+ "libcrux-secrets 0.0.7",
  "rand",
 ]
 
@@ -632,6 +716,7 @@ name = "risala-proto"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "libcrux-hkdf",
  "libcrux-ml-dsa",
  "sha2",
  "thiserror",
@@ -642,6 +727,7 @@ dependencies = [
 name = "risala-proto-fuzz"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "libfuzzer-sys",
  "risala-proto",
 ]

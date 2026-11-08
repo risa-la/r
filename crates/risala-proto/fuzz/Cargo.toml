@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+base64 = "0.23"
 risala-proto = { path = ".." }
 
 # Its own workspace, so the main one (which excludes this directory) never
