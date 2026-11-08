@@ -702,6 +702,16 @@ Open:
       Section 10.5 commands get `not-supported` on a server that hosts
       no identities.
 
+32. **Found while building M4's client** (3.2, 5.4, 5.8), confirmed with
+    the user on 2026-11-08:
+    - DELETE of a message that is already deleted gets `OK` with the seq
+      of the DELETE event that deleted it, so DELETE is safe to resend.
+    - DELETE may carry an `id` tag with the conversation's id. A
+      different id gets `not-found`. Clients send it when deleting in a
+      room they can no longer read.
+    - RESOLVED goes to every reviewer connection except the sender's,
+      including the resolver's other devices.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

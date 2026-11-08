@@ -345,7 +345,7 @@ its command.
 | `deleted` | server | none | The event's content was removed (5.4) |
 | `retry` | server | seconds | With `ERR rate-limited` or `ERR unavailable`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
-| `id` | server | id | On a JOIN event or a DROP line: the room's id (6.1, 10.4) |
+| `id` | server, client | id | On a JOIN event or a DROP line: the room's id (6.1, 10.4). On DELETE: the conversation's id the client expects (5.4) |
 | `frank` | client | base64 | On ENC: the franking commitment (12.8) |
 
 ### 3.3. Parameters
@@ -1067,7 +1067,18 @@ open report (5.8). What else happens depends on the target:
 - Deleting an edit makes the previous version current again.
 - Deleting a reaction removes it.
 
-Deleting a message that is already deleted gets `ERR not-found`.
+Deleting a message that is already deleted, by DELETE or along with
+the message it belongs to, gets `OK seq=<seq>` with the seq of the
+DELETE event that deleted it, and records nothing. So a client can
+resend a DELETE safely after a dropped connection (7.6). The rules on
+who may delete still apply first.
+
+A DELETE MAY carry an `id` tag with the conversation's id (5.1). If the
+conversation's id is different, the server replies `ERR not-found` and
+deletes nothing. A room can be dropped and created again (10.4) while a
+client cannot read it, for example after leaving, and the tag stops a
+seq from the old room naming a message in the new one. Clients SHOULD
+send it when they delete in a room they can no longer read.
 
 A deleted event keeps its place in history, so there are no gaps.
 HISTORY returns it with the `deleted` tag and empty text. It keeps its
@@ -1327,7 +1338,9 @@ RESOLVE <id>
   operators only.
 - **`RESOLVE <id>`** closes a report, and replies `OK`. Any of the
   report's reviewers may resolve it. The server sends `RESOLVED <id>` to
-  the other reviewers' connections, so that their lists stay current.
+  every reviewer's connections except the one that sent RESOLVE,
+  including the resolver's other devices, so that their lists stay
+  current.
 
 Resolving a report does nothing else. Reviewers act on a report with
 the ordinary commands, such as DELETE, KICK, BAN or ADMIN BAN, and then
