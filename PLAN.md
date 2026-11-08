@@ -1518,7 +1518,13 @@ Open:
        and have the epochal-signature construction reviewed.
     4. **Code follows the spec**, starting with `risala-mls`.
 
-    Open: how much of M5a's code carries over.
+    How much of M5a's code carries over, decided with the user on
+    2026-11-08: the protocol layers are rewritten to draft-03 (the line
+    types, the server's core and store, librisala's engine, store and
+    API), keeping the crypto, OpenMLS's storage, the network code,
+    `risala-keyfetch` and `risala-pow`. The schemas start again at
+    version 1, with no migrations from M5a. The working plan is
+    [docs/plans/M5b.md](docs/plans/M5b.md).
 
 60. **Choices made while writing draft-03, to confirm with the user**
     (2026-11-08). Draft-03 is in `spec/`, one file per section. These
@@ -1791,6 +1797,13 @@ Open:
       is a file of its own, with section numbers running across them.
       The site stitches them into one page and serves the same text as
       one file at `/spec.md`. The spec tests read the whole folder.
+
+62. **Choices made during M5b's run, to confirm with the user**
+    (2026-11-08 onwards). M5b ran overnight while the user was away, so
+    where the spec was silent or could not be built as written, the
+    agents chose the option that trusts the server least and is easiest
+    to change, and listed it here. None of these is settled until the
+    user confirms it.
 
 ## 6. Decisions
 
