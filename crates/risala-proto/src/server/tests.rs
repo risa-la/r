@@ -439,19 +439,27 @@ fn ok_values() {
 
 #[test]
 fn file_origins() {
-    // INFO's `files=` (8.5): `https://<host>[:<port>]`, nothing after.
+    // INFO's `files=` (8.5): `https://<host>[:<port>]`, nothing after, in
+    // one form.
     let origin = |s: &str| s.parse::<FileOrigin>();
-    for (s, canonical) in [
-        ("https://f.example", "https://f.example"),
-        ("HTTPS://F.Example:8443", "https://f.example:8443"),
-        ("https://203.0.113.7", "https://203.0.113.7"),
-        ("https://[2001:DB8::1]", "https://[2001:db8::1]"),
-        ("https://localhost:1", "https://localhost:1"),
+    for s in [
+        "https://f.example",
+        "https://f.example:8443",
+        "https://203.0.113.7",
+        "https://[2001:db8::1]",
+        "https://localhost:1",
     ] {
-        assert_eq!(origin(s).unwrap().to_string(), canonical, "{s}");
-        assert_eq!(origin(canonical), origin(s), "{s}");
+        assert_eq!(origin(s).unwrap().to_string(), s);
     }
     for s in [
+        // Not the one form: upper case, `:443`, an IPv6 address not as
+        // it is always written.
+        "HTTPS://f.example",
+        "https://F.Example:8443",
+        "https://f.example:443",
+        "https://[2001:DB8::1]",
+        "https://[2001:0db8::1]",
+        "https://1.2.3",
         "",
         "https://",
         "http://f.example",
@@ -474,7 +482,9 @@ fn file_origins() {
     let url = |s: &str| s.parse::<FileUrl>().unwrap();
     let o = origin("https://f.example").unwrap();
     assert!(o.contains(&url("https://f.example/get/1")));
+    // The URL's origin is found as 8.5 writes one (8.5's example).
     assert!(o.contains(&url("https://F.EXAMPLE:443/get/1")));
+    assert!(o.contains(&url("https://f.example:443/x")));
     assert!(o.contains(&url("https://f.example?x=1")));
     assert!(!o.contains(&url("https://f.example:8443/get/1")));
     assert!(!o.contains(&url("https://f.example.evil/get/1")));

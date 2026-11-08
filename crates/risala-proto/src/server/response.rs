@@ -145,8 +145,11 @@ impl AsRef<str> for Host {
 /// URLs must be on these origins, and devices download a file without
 /// asking only from them (12.11).
 ///
-/// Parsing folds the scheme and host to lower case. The host is a
-/// [`Host`], or an IPv6 address in brackets. A port is 1 to 65535.
+/// 8.5 writes an origin one way, and devices compare them byte for byte,
+/// so parsing accepts only that form: `https://`, the host in lower case,
+/// and `:` and the port only if it is not 443. The host is a host (3.5),
+/// an IPv4 address, or an IPv6 address in brackets, written as Rust's
+/// `Ipv6Addr` writes it. A port is 1 to 65535.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileOrigin {
     host: Host,
@@ -154,8 +157,10 @@ pub struct FileOrigin {
 }
 
 impl FileOrigin {
-    /// The origin `https://<host>[:<port>]`.
+    /// The origin `https://<host>[:<port>]`. Port 443 is left out, as
+    /// 8.5 writes origins.
     pub fn new(host: Host, port: Option<u16>) -> FileOrigin {
+        let port = port.filter(|&p| p != HTTPS_PORT);
         FileOrigin { host, port }
     }
 
@@ -169,19 +174,20 @@ impl FileOrigin {
         self.port
     }
 
-    /// Whether `url` is on this origin: same host, and same port, where
-    /// no port means 443 (RFC 6454). Used by devices before they
-    /// download a file without asking (5.6, 12.11).
+    /// Whether `url` is on this origin. A device finds the origin of the
+    /// URL the way 8.5 writes one, the host folded to lower case and
+    /// `:443` left out, and compares the two (5.6, 8.5, 12.11).
     pub fn contains(&self, url: &FileUrl) -> bool {
         // A `get` URL is `https://` and then the authority, up to the
         // first `/`, `?` or `#`.
         let rest = &url.as_str()["https://".len()..];
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        match format!("https://{}", &rest[..end]).parse::<FileOrigin>() {
-            Ok(other) => {
-                other.host == self.host && other.port.unwrap_or(443) == self.port.unwrap_or(443)
+        match parse_authority(&rest[..end]) {
+            Some((host, port)) => {
+                let port = port.filter(|&p| p != HTTPS_PORT);
+                is_origin_host(&host) && host == self.host && port == self.port
             }
-            Err(_) => false,
+            None => false,
         }
     }
 }
@@ -197,14 +203,27 @@ impl FromStr for FileOrigin {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<FileOrigin, ParseError> {
-        const WHAT: ParseError = bad("a files origin is https://<host>[:<port>]");
-        let rest = match s.get(..8) {
-            Some(scheme) if scheme.eq_ignore_ascii_case("https://") => &s[8..],
-            _ => return Err(WHAT),
-        };
+        const WHAT: ParseError = bad("a files origin is https://<host>[:<port>], in one form");
+        let rest = s.strip_prefix("https://").ok_or(WHAT)?;
         let (host, port) = parse_authority(rest).ok_or(WHAT)?;
-        Ok(FileOrigin { host, port })
+        let origin = FileOrigin { host, port };
+        // One written form (8.5): lower case, no `:443`, and an address
+        // written as it is always written.
+        if port == Some(HTTPS_PORT) || !is_origin_host(&origin.host) || origin.to_string() != s {
+            return Err(WHAT);
+        }
+        Ok(origin)
     }
+}
+
+/// The port an origin leaves out (8.5).
+const HTTPS_PORT: u16 = 443;
+
+/// Whether `host` may be the host of a `files=` origin (8.5): a host
+/// (3.5), or an IP address.
+fn is_origin_host(host: &Host) -> bool {
+    host.as_str().parse::<IpAddr>().is_ok()
+        || host.as_str().parse::<crate::names::ServerAddr>().is_ok()
 }
 
 /// Reads `<host>[:<port>]` (2.1): a [`Host`], or an IPv6 address in
