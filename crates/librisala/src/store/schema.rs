@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -353,6 +353,15 @@ UPDATE convs SET activity = MAX(
 CREATE INDEX convs_activity ON convs (activity DESC, id);
 CREATE INDEX outbox_unsent ON outbox (account, conv, id) WHERE state != 'sent';
 ";
+
+/// Version 13: OpenMLS's state (SPEC 12, PLAN.md 42).
+///
+/// The `openmls_*` tables of `openmls_sqlite_storage`, which OpenMLS reads
+/// and writes through [`MlsStorage`](super::mls::MlsStorage): groups,
+/// KeyPackages, proposals and keys. They live in the cache, so that an MLS
+/// operation and the cache's own rows commit or roll back together. A
+/// later change to them comes as a new migration here.
+const V13: &str = openmls_sqlite_storage::SCHEMA;
 
 /// Brings the schema up to [`VERSION`].
 pub(super) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {

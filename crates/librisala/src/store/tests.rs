@@ -1507,7 +1507,8 @@ fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
         [1_800_000_000_003, 1_800_000_000_001, 0]
     );
 
-    // The same cache as version 11 had it, migrated again.
+    // The same cache as version 11 had it, migrated to version 12 again.
+    // The later versions' tables stay as they are.
     {
         let conn = keyed(&path);
         conn.execute_batch(
@@ -1517,7 +1518,7 @@ fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
              ALTER TABLE convs DROP COLUMN favourite;",
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.execute_batch(schema::MIGRATIONS[11]).unwrap();
     }
     let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     let migrated: Vec<(ConvId, u64)> = store

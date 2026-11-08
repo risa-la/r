@@ -1653,6 +1653,11 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_libcrux_crypto",
+ "openmls_sqlite_storage",
+ "openmls_traits",
  "proptest",
  "rcgen",
  "risala-proto",

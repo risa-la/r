@@ -28,6 +28,7 @@
 mod chats;
 mod cipher;
 mod events;
+mod mls;
 mod outbox;
 mod people;
 mod read;
@@ -339,8 +340,20 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T, StoreError>,
     ) -> Result<(T, Vec<Change>), StoreError> {
+        self.write_with(f)
+    }
+
+    /// [`Store::write`] for `f` with an error type of its own, such as an
+    /// MLS operation's. Nothing is written if `f` fails: OpenMLS's state
+    /// on [`Tx::mls_storage`] rolls back with the rest.
+    pub(crate) fn write_with<T, E: From<StoreError>>(
+        &self,
+        f: impl FnOnce(&mut Tx<'_>) -> Result<T, E>,
+    ) -> Result<(T, Vec<Change>), E> {
         let mut conn = self.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
         let mut w = Tx::new(tx);
         let out = f(&mut w)?;
         let changes = w.finish()?;
