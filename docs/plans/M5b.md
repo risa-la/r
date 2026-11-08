@@ -204,7 +204,7 @@ four writing code at once.
   epochs, pseudonyms, `live`, `groupinfo`, `cid` for 24 hours),
   FOLLOW/UNFOLLOW/FETCH, GROUPINFO and a public room's current tree,
   MUTE/UNMUTE, GONE, DROP, retention (7.5). Needs SV0, M1.
-- [~] **SV4. Keys, Welcomes, blobs and backups** (12.5, 12.8, 12.12,
+- [x] **SV4. Keys, Welcomes, blobs and backups** (12.5, 12.8, 12.12,
   12.13, 5.6): KEYPKG, WELCOME PUT/GET/LIST/DEL, BLOB and the HTTPS
   blob store, BACKUP, UPLOAD with `del` URLs, bearer secrets stored as
   hashes and compared in constant time. Needs SV0.
