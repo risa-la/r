@@ -778,6 +778,15 @@ impl SyncEngine {
     pub(super) fn issue(&mut self, command: Command, pending: Pending) -> ReqId {
         let req = ReqId(self.next_req);
         self.next_req += 1;
+        // 12.10: the recovery key never joins a group. Every command goes
+        // through here, so none of these leaves a connection signed in
+        // with it, whatever asked for it.
+        if self.e2ee.as_ref().is_some_and(|e| e.recovery_connection())
+            && !super::e2ee::recovery_may_send(&command)
+        {
+            warn!(verb = command.verb(), "not sent on the recovery key's connection");
+            return req;
+        }
         self.pending.insert(req, pending);
         self.out.send.push(Outgoing { req, command });
         req

@@ -1791,6 +1791,19 @@ impl SyncEngine {
     }
 }
 
+/// Whether a connection signed in with the recovery key may send
+/// `command`: never KEYPKG ADD, INIT, COMMIT or ENC, so that the recovery
+/// key never joins a group (12.10).
+pub(crate) fn recovery_may_send(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::KeyPkg(KeyPkgCommand::Add { .. })
+            | Command::Init { .. }
+            | Command::Commit { .. }
+            | Command::Enc { .. }
+    )
+}
+
 /// The next stored COMMIT event of `row` after seq `after`, if every event
 /// up to it is stored (12.5): its seq, epoch and commit.
 fn next_commit(

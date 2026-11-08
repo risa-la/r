@@ -664,13 +664,14 @@ impl Client {
             .await
             .map_err(fail)?;
         // 12.10: this connection is signed in with the recovery key, and
-        // uploads no KeyPackages.
+        // sends KEY commands only.
+        let session = RecoverySession(session);
         let result = async {
             session.auth(&identity, &signing).await.map_err(fail)?;
             let lines = answered(
                 &server_name,
                 session
-                    .request(Command::Key(risala_proto::command::KeyCommand::List))
+                    .key(risala_proto::command::KeyCommand::List)
                     .await
                     .map_err(fail)?,
             )?;
@@ -685,10 +686,10 @@ impl Client {
                 answered(
                     &server_name,
                     session
-                        .request(Command::Key(risala_proto::command::KeyCommand::Add {
+                        .key(risala_proto::command::KeyCommand::Add {
                             key: device.clone(),
                             label: String::new(),
-                        }))
+                        })
                         .await
                         .map_err(fail)?,
                 )?;
@@ -699,7 +700,7 @@ impl Client {
                     answered(
                         &server_name,
                         session
-                            .request(Command::Key(risala_proto::command::KeyCommand::Del { key }))
+                            .key(risala_proto::command::KeyCommand::Del { key })
                             .await
                             .map_err(fail)?,
                     )?;
@@ -708,13 +709,35 @@ impl Client {
             Ok::<(), ClientError>(())
         }
         .await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), session.quit("")).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), session.0.quit("")).await;
         result?;
         let (k, id, rk) = (keys, identity.clone(), recovery);
         blocking(self.runtime(), move || save_recovery_key(&*k, &id, &rk)).await?;
         let account = self.add_identity(server, identity.as_str())?;
         account.connect().await?;
         Ok(account)
+    }
+}
+
+/// A connection signed in with the recovery key (12.10). It can send only
+/// KEY commands, so it never uploads KeyPackages, starts or changes a
+/// group, or sends ENC: the recovery key never joins a group.
+struct RecoverySession(Session);
+
+impl RecoverySession {
+    async fn auth(
+        &self,
+        identity: &Identity,
+        key: &risala_proto::auth::SecretKey,
+    ) -> Result<(), crate::conn::Error> {
+        self.0.auth(identity, key).await.map(|_| ())
+    }
+
+    async fn key(
+        &self,
+        command: risala_proto::command::KeyCommand,
+    ) -> Result<crate::conn::Response, crate::conn::Error> {
+        self.0.request(Command::Key(command)).await
     }
 }
 

@@ -2150,3 +2150,101 @@ fn a_rejected_room_is_not_started_again() {
     net.run();
     assert_eq!(net.sent_to(a, "INIT", "#secret"), 1);
 }
+
+#[test]
+fn the_recovery_keys_connection_never_joins_a_group() {
+    use risala_proto::types::{HistoryMode, SendMode};
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let _b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+    let room: Room = "#secret".parse().unwrap();
+    net.room(a, "#secret");
+
+    // The same cache signs in with the recovery key (12.10). Whatever it is
+    // asked to do, it sends no KEYPKG ADD, INIT, COMMIT or ENC.
+    let recovery = risala_mls::RecoveryKey::from_bytes([7; 32]);
+    let identity = uid("alice@example.org").to_identity().unwrap();
+    let dev = &mut net.devs[a];
+    let mut engine = SyncEngine::signed_in_as(
+        dev.store.clone(),
+        dev.account,
+        dev.uid.clone(),
+        SyncConfig {
+            lazy_gap: None,
+            fetch_blocks: false,
+            ..SyncConfig::default()
+        },
+    );
+    engine
+        .set_device_key(Arc::new(recovery.signing_key(&identity)), true)
+        .unwrap();
+    dev.engine = engine;
+    dev.queue.clear();
+    let start = net.log.len();
+    let out = net.devs[a].engine.start().unwrap();
+    net.devs[a].absorb(out);
+    net.run();
+    net.send(a, "bob@example.net", "from the recovery key");
+    let _ = net.devs[a]
+        .engine
+        .encrypt_room(&room, HistoryMode::Shared, SendMode::All);
+    let out = net.devs[a].engine.share_recovery_key(&recovery).unwrap();
+    net.devs[a].absorb(out);
+    net.run();
+    let forbidden = ["KEYPKG ADD", "INIT", "COMMIT", "ENC"];
+    let sent: Vec<&String> = net.log[start..]
+        .iter()
+        .filter(|(d, _)| *d == a)
+        .map(|(_, l)| l)
+        .filter(|l| {
+            let l = l.split(' ').filter(|w| !w.starts_with('@')).collect::<Vec<_>>().join(" ");
+            forbidden.iter().any(|f| l.starts_with(f))
+        })
+        .collect();
+    assert!(sent.is_empty(), "{sent:?}");
+
+    // Not even when asked directly.
+    let conv: Conv = "bob@example.net".parse().unwrap();
+    let c = net.conv_of(_b, "alice@example.org").unwrap();
+    let payload = net.convs[c]
+        .events
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::Enc { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let group_info = net.convs[c].group_info.clone().unwrap();
+    let tree = net.convs[c].tree.clone().unwrap();
+    let commands = [
+        Command::KeyPkg(KeyPkgCommand::Add {
+            key_package: net.packages[&_b][0].clone(),
+        }),
+        Command::Init {
+            conv: conv.clone(),
+            group_info: group_info.clone(),
+            tree,
+        },
+        Command::Commit {
+            conv: conv.clone(),
+            commit: net.a_commit_of(c),
+            group_info,
+            welcome: None,
+        },
+        Command::Enc {
+            conv,
+            epoch: 0,
+            payload,
+            frank: None,
+            file: None,
+            cid: None,
+        },
+    ];
+    for command in commands {
+        assert!(!crate::sync::e2ee::recovery_may_send(&command));
+        let out = net.devs[a].engine.request(command);
+        assert!(out.send.is_empty());
+    }
+}
