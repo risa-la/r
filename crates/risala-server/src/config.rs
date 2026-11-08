@@ -44,6 +44,10 @@
 //!
 //! [witness]
 //! enabled = false
+//!
+//! [files]
+//! url = "https://chat.example.org"
+//! max_upload = 104857600
 //! ```
 
 use std::net::SocketAddr;
@@ -99,6 +103,8 @@ pub struct Config {
     pub witness: WitnessConfig,
     /// Push notifications (Section 9).
     pub push: PushConfig,
+    /// Blobs, uploaded files and backups (5.6, 12.12, 12.13).
+    pub files: FilesConfig,
 }
 
 /// The key log (4.5): its URL, its number, and the witnesses asked to
@@ -206,6 +212,72 @@ impl Default for PushConfig {
             max_per_mailbox: 4_096,
             max_per_connection: 1024,
             max_per_device: 16,
+        }
+    }
+}
+
+/// Blobs (12.12), uploaded files (5.6) and backups (12.13): where they are
+/// kept, the URLs they are reached at, and their limits.
+///
+/// Their bytes travel over HTTPS, through the listener of `[http]`. Without
+/// one, and without `url`, the server offers no blobs or uploads: BLOB,
+/// UPLOAD and BACKUP PUT get `ERR not-supported`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesConfig {
+    /// The origin clients reach the HTTPS listener at, `https://<host>` or
+    /// `https://<host>:<port>`, from which the `put`, `get` and `del` URLs
+    /// and the `blobs` prefix (8.5) are made. The default is
+    /// `https://<hostname>`, with the port of the first address in
+    /// `http.listen` unless it is 443. Set it when a proxy stands in front
+    /// of the listener.
+    pub url: Option<String>,
+    /// Where the bytes of blobs and files are kept. The default is
+    /// `<state_dir>/files`.
+    pub dir: Option<PathBuf>,
+    /// The largest file UPLOAD accepts, in bytes (5.6). 0 offers no
+    /// uploads (`upload=no`, 8.5).
+    pub max_upload: u64,
+    /// The largest blob BLOB accepts, in bytes (12.12): at least
+    /// [`MIN_MAX_BLOB`], 256 MiB.
+    pub max_blob: u64,
+    /// The most bytes of files and blobs kept for one mailbox (7.5),
+    /// reported by INFO as `quota=` (8.5). More get `ERR rate-limited`.
+    pub quota: u64,
+    /// The most bytes one network address may ask to store with UPLOAD
+    /// and BLOB in an hour (7.5). IPv6 addresses count by their /64. 0
+    /// means no limit.
+    pub address_bytes_per_hour: u64,
+    /// The most bytes one identity may ask to store with BLOB in a day
+    /// (12.12). 0 means no limit.
+    pub identity_bytes_per_day: u64,
+    /// The most bytes one identity's backup may name, its lists included
+    /// (12.13). Larger backups get `ERR too-long`.
+    pub max_backup: u64,
+    /// The most blobs one backup may name besides its first archive
+    /// (12.13): its list is read in one piece. More get `ERR too-long`.
+    pub max_backup_blobs: u64,
+    /// The most Welcomes pending for one device (12.8). More get
+    /// `ERR rate-limited`.
+    pub max_pending_welcomes: u64,
+}
+
+/// The least [`FilesConfig::max_blob`] may be: 256 MiB (12.12).
+pub const MIN_MAX_BLOB: u64 = 256 * 1024 * 1024;
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        FilesConfig {
+            url: None,
+            dir: None,
+            max_upload: 100 * 1024 * 1024,
+            max_blob: MIN_MAX_BLOB,
+            quota: 4 * 1024 * 1024 * 1024,
+            address_bytes_per_hour: 8 * 1024 * 1024 * 1024,
+            identity_bytes_per_day: 16 * 1024 * 1024 * 1024,
+            max_backup: 16 * 1024 * 1024 * 1024,
+            max_backup_blobs: 100_000,
+            max_pending_welcomes: 1000,
         }
     }
 }
@@ -487,6 +559,7 @@ impl Default for Config {
             log: LogConfig::default(),
             witness: WitnessConfig::default(),
             push: PushConfig::default(),
+            files: FilesConfig::default(),
         }
     }
 }
@@ -702,6 +775,29 @@ impl Config {
                 ));
             }
         }
+        let f = &self.files;
+        if f.max_blob < MIN_MAX_BLOB {
+            return invalid(format!(
+                "files.max_blob is {}, but must be at least {MIN_MAX_BLOB} (12.12)",
+                f.max_blob
+            ));
+        }
+        if let Some(url) = &f.url
+            && url.parse::<risala_proto::server::FileOrigin>().is_err()
+        {
+            return invalid(format!(
+                "files.url {url:?} is not https://<host> or https://<host>:<port>"
+            ));
+        }
+        for (name, value) in [
+            ("quota", f.quota),
+            ("max_backup", f.max_backup),
+            ("max_pending_welcomes", f.max_pending_welcomes),
+        ] {
+            if value == 0 {
+                return invalid(format!("files.{name} must be at least 1"));
+            }
+        }
         let mut warnings = crate::core::keylog::check_config(self).map_err(ConfigError::Invalid)?;
         if k.allow_private {
             warnings.push(
@@ -749,6 +845,15 @@ impl Config {
     /// The path of the SQLite database.
     pub fn database_path(&self) -> PathBuf {
         self.state_dir.join("risala.db")
+    }
+
+    /// Where blobs and files are kept: `files.dir`, or
+    /// `<state_dir>/files`.
+    pub fn files_dir(&self) -> PathBuf {
+        self.files
+            .dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("files"))
     }
 
     /// The key file directory: `http.key_dir`, or `<state_dir>/keys`.

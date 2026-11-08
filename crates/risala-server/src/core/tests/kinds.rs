@@ -121,9 +121,9 @@ fn built(command: &Command) -> bool {
 /// Section 13 if the kind may not send it, `forbidden` for ADMIN from
 /// someone who is not an operator (Section 10), `OK` for PING, and
 /// `not-supported` for every area's commands that are not built yet.
-/// `None` for the identity area's, which `identity.rs` tests, and the misc
-/// and admin areas' (see [`built`]): they get past the kind check, and
-/// answer for themselves.
+/// `None` for the identity and keys areas', which their own tests check,
+/// and the misc and admin areas' (see [`built`]): they get past the kind
+/// check, and answer for themselves.
 fn expected(request: &Request, kind: ConnectionKind, operator: bool) -> Option<String> {
     let code = match request.command.check_kind(kind) {
         Err(code) => code.to_string(),
@@ -135,7 +135,12 @@ fn expected(request: &Request, kind: ConnectionKind, operator: bool) -> Option<S
             | Command::KeysPut { .. }
             | Command::Pair(_)
             | Command::Unregister { .. }
-            | Command::Admin(AdminCommand::Unregister { .. }) => return None,
+            | Command::Admin(AdminCommand::Unregister { .. })
+            | Command::KeyPkg(_)
+            | Command::Welcome(_)
+            | Command::Blob { .. }
+            | Command::Backup(_)
+            | Command::Upload { .. } => return None,
             command if built(command) => return None,
             _ => "not-supported".into(),
         },
