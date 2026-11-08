@@ -531,7 +531,9 @@ impl Tx<'_> {
         key: &PublicKey,
     ) -> Result<(), StoreError> {
         self.conn().execute(
-            "INSERT OR IGNORE INTO device_keys (account, key_id, uid, key) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO device_keys (account, key_id, uid, key, seen)
+             VALUES (?1, ?2, ?3, ?4,
+                     (SELECT COALESCE(MAX(seen), 0) + 1 FROM device_keys WHERE account = ?1))",
             params![account.0, key_id(key), uid.as_str(), &key.as_bytes()[..]],
         )?;
         Ok(())
@@ -1167,7 +1169,7 @@ impl super::Store {
                      o.state
                  FROM device_keys d
                  LEFT JOIN own_devices o ON o.account = d.account AND o.key_id = d.key_id
-                 WHERE d.account = ?1 AND d.uid = ?2 ORDER BY d.rowid",
+                 WHERE d.account = ?1 AND d.uid = ?2 ORDER BY d.seen, d.key_id",
             )?;
             let rows = stmt.query_map(params![account.0, uid.as_str()], |r| {
                 Ok((

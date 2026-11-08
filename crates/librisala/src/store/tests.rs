@@ -1686,3 +1686,30 @@ fn a_cache_in_the_clear_is_encrypted_on_open() {
     let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
     kept(&store, account);
 }
+
+#[test]
+fn device_keys_come_oldest_first() {
+    use risala_proto::auth::SecretKey;
+    let (store, account, _) = setup();
+    let alice = uid("alice@example.org");
+    let keys: Vec<_> = [9u8, 3, 7]
+        .iter()
+        .map(|s| SecretKey::from_seed([*s; 32]).public_key())
+        .collect();
+    store
+        .write(|tx| {
+            for k in &keys {
+                tx.note_device_key(account, &alice, k)?;
+            }
+            // Seeing one again keeps its place.
+            tx.note_device_key(account, &alice, &keys[0])
+        })
+        .unwrap();
+    let listed: Vec<_> = store
+        .device_keys(account, &alice)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.key)
+        .collect();
+    assert_eq!(listed, keys);
+}

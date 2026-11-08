@@ -10,7 +10,9 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
+pub(super) const MIGRATIONS: &[&str] = &[
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -476,6 +478,13 @@ CREATE TABLE own_devices (
     state   TEXT NOT NULL CHECK (state IN ('new', 'confirmed', 'sent', 'declined')),
     PRIMARY KEY (account, key_id)
 ) WITHOUT ROWID;
+";
+
+/// Version 15: `device_keys.seen` orders an identity's device keys by
+/// when this device first saw them, since the table has no rowid. Keys
+/// from before it have NULL, and come first.
+const V15: &str = "
+ALTER TABLE device_keys ADD COLUMN seen INTEGER;
 ";
 
 /// Brings the schema up to [`VERSION`].
