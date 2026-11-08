@@ -216,6 +216,26 @@ keywords! {
 }
 
 keywords! {
+    /// The `send` setting of a room (6.2): who may send messages. The
+    /// order is by restriction: `All < Mods`.
+    pub enum SendMode {
+        /// `all`: every member allowed to post. The default.
+        All = "all",
+        /// `mods`: an announcement room. Only owners, moderators and
+        /// operators send messages; plain members and guests may react.
+        Mods = "mods",
+    }
+    error = "send is all or mods";
+}
+
+impl Default for SendMode {
+    /// `all`, the default (6.2).
+    fn default() -> SendMode {
+        SendMode::All
+    }
+}
+
+keywords! {
     /// The value of HISTORY's `only=` option (7.2): which events to
     /// return.
     pub enum HistoryOnly {
@@ -718,6 +738,10 @@ pub enum RoomSetting {
     /// owner changes it with a COMMIT; a SET of it gets `ERR encrypted`
     /// or `ERR forbidden` (6.2).
     History(HistoryMode),
+    /// `send`: `all` or `mods`, who may send messages (6.2). In an
+    /// encrypted room an owner changes it with a COMMIT; a SET of it gets
+    /// `ERR encrypted` there.
+    Send(SendMode),
     /// A key this crate does not know, folded to lower case, with its value
     /// kept as escaped text.
     Other {
@@ -745,6 +769,7 @@ impl RoomSetting {
             "retention" => RoomSetting::Retention(value.trim_end_matches(' ').parse()?),
             "e2ee" => RoomSetting::E2ee(parse_yes_no(value.trim_end_matches(' '))?),
             "history" => RoomSetting::History(value.trim_end_matches(' ').parse()?),
+            "send" => RoomSetting::Send(value.trim_end_matches(' ').parse()?),
             _ => RoomSetting::Other {
                 key,
                 value: value.to_owned(),
@@ -761,6 +786,7 @@ impl RoomSetting {
             RoomSetting::Retention(_) => "retention",
             RoomSetting::E2ee(_) => "e2ee",
             RoomSetting::History(_) => "history",
+            RoomSetting::Send(_) => "send",
             RoomSetting::Other { key, .. } => key,
         }
     }
@@ -774,6 +800,7 @@ impl RoomSetting {
             RoomSetting::Retention(retention) => Cow::Owned(retention.to_string()),
             RoomSetting::E2ee(e2ee) => Cow::Borrowed(yes_no(*e2ee)),
             RoomSetting::History(history) => Cow::Borrowed(history.as_str()),
+            RoomSetting::Send(send) => Cow::Borrowed(send.as_str()),
             RoomSetting::Other { value, .. } => Cow::Borrowed(value),
         }
     }
@@ -1400,6 +1427,8 @@ mod tests {
                 "joined",
                 RoomSetting::History(HistoryMode::Joined),
             ),
+            ("send", "all", RoomSetting::Send(SendMode::All)),
+            ("send", "mods", RoomSetting::Send(SendMode::Mods)),
         ];
         for (key, value, setting) in cases {
             assert_eq!(RoomSetting::parse(key, value), Ok(setting.clone()));
@@ -1446,6 +1475,8 @@ mod tests {
             ("retention", "0"),
             ("retention", "forever"),
             ("retention", "30 days"),
+            ("send", "everyone"),
+            ("send", ""),
         ] {
             assert!(is_syntax(RoomSetting::parse(key, value)), "{key} {value}");
         }
