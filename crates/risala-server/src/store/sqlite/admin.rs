@@ -1,179 +1,155 @@
-//! [`AdminStore`] on SQLite.
+//! [`AdminStore`] on SQLite, and the tables of settings, operators and
+//! bans (Section 10).
 
 use rusqlite::params;
 
-use risala_proto::auth::PublicKey;
-use risala_proto::names::{ServerBanTarget, Uid};
+use risala_proto::names::Uid;
 use risala_proto::time::Timestamp;
+use risala_proto::types::ServerSetting;
 
-use super::{SqliteStore, hosted_keys_in, is_hosted, ms, parse, time};
-use crate::store::{AdminStore, KeyChange, Result, ServerBan};
+use super::SqliteStore;
+use crate::store::{AdminStore, Result, ServerSettings, StoreError, millis, parsed};
+
+/// The admin area's tables.
+pub(super) const SCHEMA: &str = "
+-- The settings of ADMIN SET (10.6), as on the wire. A setting with no row
+-- has its value from the configuration.
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) STRICT;
+
+-- Operators added with ADMIN OP (10.1). Those in the configuration are
+-- not stored here.
+CREATE TABLE operators (
+    uid TEXT PRIMARY KEY,
+    added INTEGER NOT NULL          -- ms
+) STRICT;
+
+-- Server bans (10.2): an identity, a domain (*@example.net) or an address
+-- or prefix, as ADMIN BANS lists them.
+CREATE TABLE server_bans (
+    target TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT '', -- escaped (3.4)
+    added INTEGER NOT NULL          -- ms
+) STRICT;
+";
 
 impl AdminStore for SqliteStore {
+    fn settings(&self, defaults: &ServerSettings) -> Result<ServerSettings> {
+        self.read(|tx| {
+            let mut settings = defaults.clone();
+            let mut select = tx.prepare_cached("SELECT key, value FROM settings ORDER BY key")?;
+            let rows = select.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (key, value) = row?;
+                let setting = ServerSetting::parse(&key, &value)
+                    .map_err(|e| StoreError::Corrupt(format!("setting {key} {value:?}: {e}")))?;
+                if !settings.apply(&setting) {
+                    return Err(StoreError::Corrupt(format!("unknown setting {key}")));
+                }
+            }
+            Ok(settings)
+        })
+    }
+
+    fn save_setting(&self, setting: &ServerSetting) -> Result<bool> {
+        if !setting.is_known() {
+            return Ok(false);
+        }
+        self.write(|tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                params![setting.key(), setting.value()],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn operators(&self) -> Result<Vec<Uid>> {
+        self.read(|tx| {
+            let mut select = tx.prepare_cached("SELECT uid FROM operators ORDER BY uid")?;
+            let rows = select.query_map([], |row| row.get::<_, String>(0))?;
+            rows.map(|uid| parsed("operator", &uid?)).collect()
+        })
+    }
+
     fn add_operator(&self, uid: &Uid, now: Timestamp) -> Result<bool> {
         self.write(|tx| {
-            let added = tx.execute(
-                "INSERT OR IGNORE INTO operators (uid, added) VALUES (?, ?)",
-                params![uid.as_str(), ms(now)],
-            )?;
-            Ok(added > 0)
+            Ok(tx.execute(
+                "INSERT INTO operators (uid, added) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                params![uid.as_str(), millis(now)],
+            )? == 1)
         })
     }
 
     fn remove_operator(&self, uid: &Uid) -> Result<bool> {
-        self.write(|tx| {
-            let removed = tx.execute("DELETE FROM operators WHERE uid = ?", [uid.as_str()])?;
-            Ok(removed > 0)
-        })
-    }
-
-    fn server_bans(&self) -> Result<Vec<ServerBan>> {
-        self.conn()
-            .prepare_cached("SELECT target, reason, t FROM server_bans ORDER BY target")?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .map(|r| {
-                let (target, reason, t) = r?;
-                Ok(ServerBan {
-                    target: parse("server ban", &target)?,
-                    reason,
-                    t: time(t)?,
-                })
-            })
-            .collect()
-    }
-
-    fn add_server_ban(&self, ban: &ServerBan) -> Result<()> {
-        self.write(|tx| {
-            tx.execute(
-                "INSERT OR REPLACE INTO server_bans (target, reason, t) VALUES (?, ?, ?)",
-                params![ban.target.to_string(), ban.reason, ms(ban.t)],
-            )?;
-            Ok(())
-        })
-    }
-
-    fn remove_server_ban(&self, target: &ServerBanTarget) -> Result<bool> {
-        self.write(|tx| {
-            let removed = tx.execute(
-                "DELETE FROM server_bans WHERE target = ?",
-                [target.to_string()],
-            )?;
-            Ok(removed > 0)
-        })
-    }
-
-    fn remove_any_hosted_key(&self, uid: &Uid, key: &PublicKey) -> Result<KeyChange> {
-        self.write(|tx| {
-            if !is_hosted(tx, uid)? {
-                return Ok(KeyChange::NotHosted);
-            }
-            let removed = tx.execute(
-                "DELETE FROM hosted_keys WHERE uid = ? AND key = ?",
-                params![uid.as_str(), key.to_string()],
-            )?;
-            if removed == 0 {
-                return Ok(KeyChange::NotFound);
-            }
-            // Its KeyPackages and Welcomes go with it (4.7).
-            super::e2ee::forget_device_in(tx, uid, key)?;
-            Ok(KeyChange::Done(hosted_keys_in(tx, uid)?))
-        })
+        self.write(|tx| Ok(tx.execute("DELETE FROM operators WHERE uid = ?", [uid.as_str()])? == 1))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use risala_proto::auth::SecretKey;
+    use risala_proto::types::Retention;
 
     use super::*;
-    use crate::store::Store;
 
-    fn t() -> Timestamp {
-        "2026-11-06T15:40:58.120Z".parse().unwrap()
+    fn defaults() -> ServerSettings {
+        ServerSettings {
+            anon: true,
+            guests: true,
+            registration: false,
+            retention: Retention::new(30).unwrap(),
+            welcome: "Hello".into(),
+        }
     }
 
-    fn uid(s: &str) -> Uid {
-        s.parse().unwrap()
+    #[test]
+    fn settings_outlast_the_configuration() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(store.settings(&defaults()).unwrap(), defaults());
+        for line in [
+            "anon no",
+            "guests no",
+            "registration open",
+            "retention 7",
+            "welcome  Two spaces ",
+        ] {
+            assert!(
+                store.save_setting(&line.parse().unwrap()).unwrap(),
+                "{line}"
+            );
+        }
+        let unknown: ServerSetting = "colour blue".parse().unwrap();
+        assert!(!store.save_setting(&unknown).unwrap());
+        assert_eq!(
+            store.settings(&defaults()).unwrap(),
+            ServerSettings {
+                anon: false,
+                guests: false,
+                registration: true,
+                retention: Retention::new(7).unwrap(),
+                // The welcome text keeps its spaces (10.6).
+                welcome: " Two spaces ".into(),
+            }
+        );
     }
 
     #[test]
     fn operators() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        assert!(s.add_operator(&uid("b@example.net"), t()).unwrap());
-        assert!(!s.add_operator(&uid("b@example.net"), t()).unwrap());
-        assert!(s.add_operator(&uid("a@example.net"), t()).unwrap());
-        assert_eq!(
-            s.operators().unwrap(),
-            [uid("a@example.net"), uid("b@example.net")]
-        );
-        assert!(s.remove_operator(&uid("b@example.net")).unwrap());
-        assert!(!s.remove_operator(&uid("b@example.net")).unwrap());
-        assert_eq!(s.operators().unwrap(), [uid("a@example.net")]);
-    }
-
-    #[test]
-    fn server_bans() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        for (target, reason) in [
-            ("spam@example.net", "first"),
-            ("2001:db8::/32", ""),
-            ("*@example.com", "domain"),
-            ("spam@example.net", "second"),
-            ("203.0.113.7", ""),
-        ] {
-            let ban = ServerBan {
-                target: target.parse().unwrap(),
-                reason: reason.into(),
-                t: t(),
-            };
-            s.add_server_ban(&ban).unwrap();
-        }
-        let listed: Vec<String> = s
-            .server_bans()
-            .unwrap()
-            .iter()
-            .map(|b| format!("{} {}", b.target, b.reason))
-            .collect();
-        assert_eq!(
-            listed,
-            [
-                "*@example.com domain",
-                "2001:db8::/32 ",
-                "203.0.113.7 ",
-                "spam@example.net second"
-            ]
-        );
-        let gone: ServerBanTarget = "2001:db8::/32".parse().unwrap();
-        assert!(s.remove_server_ban(&gone).unwrap());
-        assert!(!s.remove_server_ban(&gone).unwrap());
-        assert_eq!(s.server_bans().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn the_last_hosted_key_can_go() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        let alice = uid("alice@example.org");
-        let key = |n: u8| SecretKey::from_seed([n; 32]).public_key();
-        assert_eq!(
-            s.remove_any_hosted_key(&alice, &key(1)).unwrap(),
-            KeyChange::NotHosted
-        );
-        s.register(&alice, &key(1), t()).unwrap();
-        assert_eq!(
-            s.remove_any_hosted_key(&alice, &key(2)).unwrap(),
-            KeyChange::NotFound
-        );
-        assert_eq!(
-            s.remove_any_hosted_key(&alice, &key(1)).unwrap(),
-            KeyChange::Done(Vec::new())
-        );
-        // Still hosted, with no keys: locked (10.5).
-        assert_eq!(s.hosted_keys(&alice).unwrap(), Some(Vec::new()));
+        let store = SqliteStore::open_in_memory().unwrap();
+        let t = "2026-11-09T00:00:00.000Z".parse().unwrap();
+        let bob: Uid = "bob@example.org".parse().unwrap();
+        let alice: Uid = "alice@example.org".parse().unwrap();
+        assert!(store.operators().unwrap().is_empty());
+        assert!(store.add_operator(&bob, t).unwrap());
+        assert!(store.add_operator(&alice, t).unwrap());
+        assert!(!store.add_operator(&bob, t).unwrap());
+        assert_eq!(store.operators().unwrap(), [alice.clone(), bob.clone()]);
+        assert!(store.remove_operator(&bob).unwrap());
+        assert!(!store.remove_operator(&bob).unwrap());
+        assert_eq!(store.operators().unwrap(), [alice]);
     }
 }
