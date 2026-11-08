@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use risala_mls::{DeviceId, RisalaCrypto};
 use risala_proto::binary::read_blob_list;
-use risala_proto::command::{BackupCommand, BlobPermit, Command, KeyPkgCommand, WelcomeCommand};
+use risala_proto::command::{BackupCommand, Command, KeyPkgCommand, MailboxPermit, WelcomeCommand};
 use risala_proto::content::FileUrl;
 use risala_proto::error::ErrorCode;
 use risala_proto::frame::MAX_SERVER_LINE;
@@ -905,7 +905,7 @@ async fn check_quota(cx: &Cx, mailbox: BoxName, size: u64) -> Result<(), ErrResp
 }
 
 /// `BLOB <hash> <size> [box=<box> token=<token>]` (12.12).
-async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<BlobPermit>) -> Reply {
+async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<MailboxPermit>) -> Reply {
     let inner = &cx.inner;
     let Some(url) = inner.keys.url() else {
         return Err(err(ErrorCode::NotSupported));
