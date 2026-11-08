@@ -874,10 +874,10 @@ impl Conversation {
     /// room they have left, too: the entry then goes out once the account
     /// has synced. Fails with [`ClientError::NotJoined`] for a
     /// conversation the cache has no id for, since there is no message to
-    /// name. A message deleted already ends the entry as
-    /// [`OutboxStatus::Sent`](super::types::OutboxStatus::Sent) when the
-    /// cache has the DELETE event, and as failed with `not-found`
-    /// otherwise.
+    /// name. A message deleted already, by this DELETE sent before a
+    /// dropped connection or by someone else, ends the entry as
+    /// [`OutboxStatus::Sent`](super::types::OutboxStatus::Sent) with the
+    /// seq of the DELETE that deleted it (5.4).
     pub async fn delete(&self, seq: u64) -> Result<OutboxEntry, ClientError> {
         let seq = Seq::new(seq).ok_or_else(|| ClientError::Invalid("seq 0".into()))?;
         let (reply, rx) = oneshot::channel();

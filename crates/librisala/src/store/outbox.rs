@@ -10,7 +10,7 @@ use risala_proto::types::{Cid, FileUrl, Relation};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::events::Tx;
-use super::{AccountId, Change, ConvId, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
+use super::{AccountId, Change, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
 
 /// A message to send: MSG's text and tags (5.3, 5.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,21 +343,6 @@ impl Tx<'_> {
         let id = OutboxId(self.conn().last_insert_rowid());
         self.changed(Change::Outbox { id });
         Ok(id)
-    }
-
-    /// The seq of a stored DELETE event of message `target` (5.4), if one
-    /// is stored.
-    pub(crate) fn delete_of(&self, conv: ConvId, target: u64) -> Result<Option<Seq>, StoreError> {
-        let n: Option<i64> = self
-            .conn()
-            .query_row(
-                "SELECT MIN(seq) FROM events WHERE conv = ?1 AND target = ?2 AND verb = 'DELETE'",
-                params![conv.0, sql(target)],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        n.map(seq).transpose()
     }
 
     /// An outbox entry.

@@ -1981,7 +1981,7 @@ fn deleting_goes_through_the_outbox() {
 #[test]
 fn a_delete_is_sent_again_after_a_reconnect() {
     // DELETE has no cid (7.6), but sending it twice is safe: the second
-    // gets not-found (5.4). A guest sends it again too.
+    // gets OK with the first one's seq (5.4). A guest sends it again too.
     for me in [ALICE, "~sam"] {
         let mut h = H::new(me);
         h.joined("k1", 3);
@@ -1998,7 +1998,7 @@ fn a_delete_is_sent_again_after_a_reconnect() {
             &[ev(4, &format!("from={me} DELETE #general 3"))],
             "OK id=k1 more=0",
         );
-        h.reply(d, &[], "ERR not-found");
+        h.reply(d, &[], "OK seq=4");
         assert_eq!(
             h.store.outbox_item(id).unwrap().unwrap().state,
             OutboxState::Sent(seq(4)),
@@ -2008,16 +2008,39 @@ fn a_delete_is_sent_again_after_a_reconnect() {
 }
 
 #[test]
-fn a_delete_of_a_message_not_deleted_that_is_not_found_fails() {
+fn a_delete_that_is_not_found_fails() {
+    // A message deleted already gets OK (5.4), so not-found means the
+    // server deleted nothing: no such message, or another room by now.
+    // That holds even if the cache has a DELETE of it, from the old room.
     let mut h = H::new(ALICE);
     h.joined("k1", 3);
-    let (id, out) = h.engine.delete(&conv("#general"), seq(9)).unwrap();
+    h.line(&ev(4, "from=alice@example.org DELETE #general 3"));
+    for target in [9, 3] {
+        let (id, out) = h.engine.delete(&conv("#general"), seq(target)).unwrap();
+        h.absorb(out);
+        let d = h.expect(&format!("@id=k1 DELETE #general {target}"));
+        h.reply(d, &[], "ERR not-found");
+        assert_eq!(
+            h.store.outbox_item(id).unwrap().unwrap().state,
+            OutboxState::Failed(FailReason::Rejected(ErrorCode::NotFound)),
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn a_delete_of_a_message_someone_else_deleted_ends_as_sent() {
+    // 5.4: a moderator deleted it first; the OK names their DELETE.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (id, out) = h.engine.delete(&conv("#general"), seq(3)).unwrap();
     h.absorb(out);
-    let d = h.expect("@id=k1 DELETE #general 9");
-    h.reply(d, &[], "ERR not-found");
+    let d = h.expect("@id=k1 DELETE #general 3");
+    h.line(&ev(4, "from=bob@example.net DELETE #general 3"));
+    h.reply(d, &[], "OK seq=4");
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
-        OutboxState::Failed(FailReason::Rejected(ErrorCode::NotFound))
+        OutboxState::Sent(seq(4))
     );
 }
 

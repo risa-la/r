@@ -1360,8 +1360,11 @@ impl SyncEngine {
                 Outcome::Ok(ok) => match ok.seq().ok().flatten() {
                     Some(seq) => {
                         // 7.6: the OK names our own message. Check it if
-                        // the event is stored.
-                        if let Some(row) = tx.conv_by_name(account, &item.conv)?
+                        // the event is stored. A DELETE's OK may name an
+                        // earlier DELETE of the same message, by a
+                        // moderator for one (5.4).
+                        if item.delete.is_none()
+                            && let Some(row) = tx.conv_by_name(account, &item.conv)?
                             && let Some(author) = tx.author_of(row.id, seq.get())?
                             && author != me.as_str()
                         {
@@ -1374,15 +1377,6 @@ impl SyncEngine {
                 Outcome::Err(err) if err.code == ErrorCode::RateLimited => {
                     tx.outbox_requeue(outbox)?;
                     return Ok(Some(err.retry.unwrap_or(1)));
-                }
-                // A DELETE whose target is gone already: sent twice after a
-                // reconnect, or deleted by someone else first (5.4). If its
-                // DELETE event is stored, the message is deleted as asked.
-                Outcome::Err(err) if err.code == ErrorCode::NotFound && item.delete.is_some() => {
-                    match deleted_by(tx, account, &item)? {
-                        Some(done) => tx.outbox_sent(outbox, done)?,
-                        None => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
-                    }
                 }
                 Outcome::Err(err) => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
                 Outcome::Failed => tx.outbox_failed(outbox, FailReason::Unconfirmed)?,
@@ -1808,7 +1802,8 @@ impl SyncEngine {
                     // Sent on an earlier connection, with no answer. Only an
                     // identity's cid survives that, or a resumed guest
                     // session's, and only for 24 hours. A DELETE needs no
-                    // cid: sent twice, the second gets `not-found` (5.4).
+                    // cid: sent twice, the second gets `OK` with the first
+                    // one's seq (5.4).
                     let fresh = item
                         .first_sent
                         .is_some_and(|t| now.saturating_duration_since(t) < window);
@@ -1874,24 +1869,6 @@ impl SyncEngine {
             self.issue(command, Pending::Msg { outbox: item.id });
         }
         Ok(())
-    }
-}
-
-/// The seq of the stored DELETE event of the message an outbox DELETE
-/// targets, in the conversation it is bound to, if one is stored.
-fn deleted_by(
-    tx: &Tx<'_>,
-    account: AccountId,
-    item: &crate::store::OutboxItem,
-) -> Result<Option<Seq>, StoreError> {
-    let Some(target) = item.delete else {
-        return Ok(None);
-    };
-    match tx.conv_by_name(account, &item.conv)? {
-        Some(row) if row.conv_id.is_some() && row.conv_id == item.conv_id => {
-            tx.delete_of(row.id, target.get())
-        }
-        _ => Ok(None),
     }
 }
 
