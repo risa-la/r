@@ -533,14 +533,24 @@ impl Inner {
     }
 
     /// Locks a room. A room that does not exist, or that was dropped while
-    /// this waited for its lock, is `ERR not-found` (6.1, 10.4).
+    /// this waited for its lock and not made again, is `ERR not-found`
+    /// (6.1, 10.4).
     pub(super) async fn lock_room(&self, room: &Room) -> Result<ConvGuard, Fail> {
-        let entry = self.room_entry(room).ok_or_else(not_found)?;
-        let st = entry.lock_owned().await;
-        if st.dropped {
-            return Err(not_found());
+        let mut entry = self.room_entry(room).ok_or_else(not_found)?;
+        loop {
+            let st = entry.clone().lock_owned().await;
+            if !st.dropped {
+                return Ok(st);
+            }
+            // Dropped while this waited. A room from the configuration is
+            // made again at once (10.4): this command goes to the new one,
+            // as if it had come a moment later. DROP put it in the index
+            // before letting go of the old one's lock.
+            match self.room_entry(room) {
+                Some(new) if !Arc::ptr_eq(&new, &entry) => entry = new,
+                _ => return Err(not_found()),
+            }
         }
-        Ok(st)
     }
 
     /// JOIN (6.1). A room that does not exist is created for an identity

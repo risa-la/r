@@ -651,6 +651,66 @@ async fn commands_waiting_on_a_dropped_room_get_not_found() {
     assert_eq!(lines[1], "@ref=m ERR not-found no such room");
 }
 
+/// Commands waiting on a room from the configuration while it is dropped
+/// go to the room made again in its place, as if they had come a moment
+/// later.
+#[tokio::test]
+async fn commands_waiting_on_a_dropped_configured_room_go_to_the_new_one() {
+    let flaky = Arc::new(Flaky::new());
+    let mut c = config();
+    c.rooms = strings(&["#general", "#private"]);
+    c.operators = strings(&[OP]);
+    for room in &c.rooms {
+        flaky
+            .inner
+            .ensure_room(&room.parse().unwrap(), start())
+            .unwrap();
+    }
+    prepare(&flaky.inner);
+    let mut h = Harness::on(c, flaky.clone(), timers());
+    let mut bob = h.signed_in_as(BOB);
+    let op = h.signed_in_as(OP);
+    let old = h
+        .store
+        .room(&"#general".parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .id;
+
+    flaky.pause.arm("drop_room");
+    let (hub, id) = (h.hub.clone(), op.id);
+    let drop = tokio::spawn(async move {
+        hub.command(id, "admin drop #general".parse().unwrap())
+            .await
+    });
+    flaky.pause.reached().await;
+    let (hub, id) = (h.hub.clone(), bob.id);
+    let join = tokio::spawn(async move {
+        hub.command(id, "@ref=j join #general".parse().unwrap())
+            .await
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    flaky.pause.release();
+    drop.await.unwrap();
+    join.await.unwrap();
+    let new = h
+        .store
+        .room(&"#general".parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_ne!(new, old);
+    let lines = bob.lines();
+    assert_eq!(lines[0], format!("@id={old} DROP #general"), "{lines:?}");
+    assert_eq!(
+        lines.last().unwrap(),
+        &format!("@ref=j OK id={new} head=1"),
+        "{lines:?}"
+    );
+}
+
 /// HISTORY and RELATED whose query comes after a DROP that went through
 /// once they had checked the room: `not-found`, not an empty page with the
 /// old room's id.
