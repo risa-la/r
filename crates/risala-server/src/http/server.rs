@@ -9,8 +9,10 @@
 //! answered and then closed. `GET` and `HEAD` of a key file get it, with
 //! `Content-Type: text/plain; charset=utf-8`. Other paths get 404 and
 //! other methods 405. Requests have a size limit and a time limit, and
-//! nothing lists the directory. `route` is where the upload URLs of 5.6
-//! will go.
+//! nothing lists the directory.
+//!
+//! With [`with_files`](HttpServer::with_files), it also stores and serves
+//! blobs (12.12) and uploaded files (5.6): see [`super::files`].
 //!
 //! TLS is 1.3 only. Browsers and curl fetch these files too, so the key
 //! exchange groups are the usual ones (X25519MLKEM768 first, then X25519,
@@ -31,6 +33,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use super::KeyDir;
+use crate::core::keys::disk::Files;
 use crate::core::{HostedKeyFile, Hub};
 use crate::net::{self, Certificates};
 
@@ -100,6 +103,7 @@ pub struct HttpServer {
     certs: Certificates,
     reload: bool,
     keys: Arc<dyn KeyFiles>,
+    files: Option<Files>,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -145,7 +149,14 @@ impl HttpServer {
             certs,
             reload,
             keys,
+            files: None,
         })
+    }
+
+    /// Also stores and serves the hub's blobs and files (5.6, 12.12).
+    pub fn with_files(mut self, hub: &Hub) -> HttpServer {
+        self.files = Some(hub.files());
+        self
     }
 
     /// The addresses it listens on, with the ports the system chose.
@@ -166,6 +177,7 @@ impl HttpServer {
         let shared = Arc::new(Shared {
             acceptor: self.acceptor,
             keys: self.keys,
+            files: self.files,
             permits: Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS)),
             per_address: Mutex::new(HashMap::new()),
         });
@@ -187,6 +199,7 @@ impl HttpServer {
 struct Shared {
     acceptor: TlsAcceptor,
     keys: Arc<dyn KeyFiles>,
+    files: Option<Files>,
     permits: Arc<Semaphore>,
     /// How many connections each network address has open.
     per_address: Mutex<HashMap<IpAddr, usize>>,
@@ -290,7 +303,15 @@ async fn connection(
         }
     };
     let response = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, read_request(&mut tls)).await {
-        Ok(Ok(request)) => route(&request, &shared.keys).await,
+        Ok(Ok((request, body))) => match &shared.files {
+            // Blobs and files: their bodies and downloads are streamed, so
+            // they write their own responses (12.12, 5.6).
+            Some(files) if super::files::claims(&request.path) => {
+                super::files::serve(&mut tls, &request, body, files, peer).await;
+                return;
+            }
+            _ => route(&request, &shared.keys).await,
+        },
         Ok(Err(response)) => response,
         Err(_) => Response::error(408, "Request Timeout"),
     };
@@ -303,18 +324,27 @@ async fn connection(
 }
 
 /// The parts of a request the listener uses.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Request {
     pub(crate) method: String,
     /// The path, without any query.
     pub(crate) path: String,
     /// The body of a `POST` to the witness (4.10); empty otherwise.
     pub(crate) body: Vec<u8>,
+    /// `Content-Length`, if it was sent.
+    pub(crate) content_length: Option<u64>,
+    /// A `Transfer-Encoding` was sent.
+    pub(crate) transfer_encoding: bool,
+    /// `Expect: 100-continue` was sent.
+    pub(crate) expect_continue: bool,
 }
 
-/// Reads a request head and parses its request line. A request that
-/// cannot be served gets its error response.
-async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, Response> {
+/// Reads a request head and parses it. Returns the request and whatever
+/// of its body arrived with the head. A request that cannot be served
+/// gets its error response.
+async fn read_request<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(Request, Vec<u8>), Response> {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1024];
     let end = loop {
@@ -334,10 +364,19 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, R
     }
     let mut request =
         parse_request_line(&head[..end]).ok_or_else(|| Response::error(400, "Bad Request"))?;
+    parse_headers(&head[..end], &mut request).ok_or_else(|| Response::error(400, "Bad Request"))?;
+    // The body starts after the blank line: LF LF, or LF CR LF.
+    let body_start = match head.get(end + 1) {
+        Some(b'\r') => end + 3,
+        _ => end + 2,
+    };
     if request.method == "POST" && super::keylog::is_witness_path(&request.path) {
+        // The witness reads its whole body here (4.10); nothing is left.
         request.body = read_body(stream, &head, end).await?;
+        return Ok((request, Vec::new()));
     }
-    Ok(request)
+    let body = head.get(body_start..).unwrap_or_default().to_vec();
+    Ok((request, body))
 }
 
 /// Reads the body of a request whose head ends at `end` in `head`, by its
@@ -381,6 +420,40 @@ async fn read_body<S: AsyncRead + Unpin>(
     Ok(body)
 }
 
+/// Reads the headers the listener uses (RFC 9112 5, 6): `Content-Length`,
+/// which must be one number, given once or the same each time;
+/// `Transfer-Encoding`, which bodies here may not use; and `Expect`.
+/// `None` for a head that is not valid.
+fn parse_headers(head: &[u8], request: &mut Request) -> Option<()> {
+    let head = std::str::from_utf8(head).ok()?;
+    for line in head.split('\n').skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line.split_once(':')?;
+        if name.is_empty() || name.ends_with([' ', '\t']) {
+            return None;
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || value.len() > 19 || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let n: u64 = value.parse().ok()?;
+            if request.content_length.is_some_and(|m| m != n) {
+                return None;
+            }
+            request.content_length = Some(n);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            request.transfer_encoding = true;
+        } else if name.eq_ignore_ascii_case("expect") {
+            request.expect_continue |= value.eq_ignore_ascii_case("100-continue");
+        }
+    }
+    Some(())
+}
+
 /// Where the head ends: the index of the LF that ends its last line, if
 /// the blank line after it has arrived.
 fn head_end(buf: &[u8]) -> Option<usize> {
@@ -415,7 +488,7 @@ fn parse_request_line(head: &[u8]) -> Option<Request> {
     Some(Request {
         method: method.to_owned(),
         path: path.to_owned(),
-        body: Vec::new(),
+        ..Request::default()
     })
 }
 
@@ -549,7 +622,7 @@ pub(crate) async fn handle<S: AsyncRead + tokio::io::AsyncWrite + Unpin>(
     keys: &Arc<dyn KeyFiles>,
 ) {
     let response = match read_request(stream).await {
-        Ok(request) => route(&request, keys).await,
+        Ok((request, _)) => route(&request, keys).await,
         Err(response) => response,
     };
     let _ = stream.write_all(&response.to_bytes()).await;
@@ -576,7 +649,7 @@ mod tests {
             Some(Request {
                 method: "GET".into(),
                 path: "/.well-known/risala/alice".into(),
-                body: Vec::new(),
+                ..Request::default()
             })
         );
         assert!(parse("GET / HTTP/1.0").is_some());

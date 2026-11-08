@@ -141,6 +141,18 @@ impl Daemon {
                     Arc::new(hub.clone()),
                 )?)
             };
+            // Blobs and files go through the HTTPS listener (5.6, 12.12),
+            // at the origin `files.url` names, or else at the hostname and
+            // the listener's port.
+            let http = http.map(|http| {
+                let port = http.local_addrs().first().map_or(443, SocketAddr::port);
+                let url = match port {
+                    443 => format!("https://{}", hub.config().hostname),
+                    port => format!("https://{}:{port}", hub.config().hostname),
+                };
+                hub.set_files_url(&url);
+                http.with_files(&hub)
+            });
             Ok(Daemon {
                 server,
                 hub,
