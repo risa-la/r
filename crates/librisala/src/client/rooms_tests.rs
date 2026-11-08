@@ -1,8 +1,9 @@
-//! Rooms and reports against a scripted TLS server
-//! (5.4, 5.8, 6.2-6.4, 8.4, 8.5), through the client API.
+//! Rooms, reports and administration against a scripted TLS server
+//! (5.4, 5.8, 6.2-6.4, 8.4, 8.5, Section 10), through the client API.
 
 use super::people_tests::{ALICE, HOST, ev, quit, setup, sign_in, until, within};
 use super::*;
+use crate::conn::keys::tests::PUBLIC;
 
 const REPORTED: &str = "2026-11-06T15:44:10.230Z";
 
@@ -403,6 +404,204 @@ async fn rooms_and_reports() {
             .iter()
             .all(|m| m.outbox.is_none())
     );
+    server.done().await;
+}
+
+#[tokio::test]
+async fn admin_commands() {
+    let (client, server) = setup(|_, mut peer| async move {
+        sign_in(&mut peer).await;
+        peer.expect("@ref=2 SYNC").await;
+        peer.expect("@ref=3 BLOCKS").await;
+        peer.send("@ref=2 OK").await;
+        peer.send("@ref=3 OK").await;
+        let p = &mut peer;
+        let lines = |r: u32, ls: &[&str]| -> Vec<String> {
+            ls.iter().map(|l| format!("@ref={r} {l}")).collect()
+        };
+        answer(
+            p,
+            4,
+            "ADMIN OPS",
+            &lines(4, &["OP alice@example.org", "OP root@example.org"]),
+            "OK",
+        )
+        .await;
+        answer(p, 5, "ADMIN OP bob@example.net", &[], "OK").await;
+        answer(p, 6, "ADMIN DEOP bob@example.net", &[], "OK").await;
+        answer(p, 7, "ADMIN BAN *@evil.example spam wave", &[], "OK").await;
+        answer(p, 8, "ADMIN UNBAN *@evil.example", &[], "OK").await;
+        answer(
+            p,
+            9,
+            "ADMIN BANS",
+            &lines(9, &["SERVERBAN 203.0.113.7 flood", "SERVERBAN *@evil.example"]),
+            "OK",
+        )
+        .await;
+        answer(
+            p,
+            10,
+            "ADMIN WHO",
+            &lines(
+                10,
+                &[
+                    &format!("CONNECTION alice@example.org 203.0.113.7:51000 {REPORTED}"),
+                    &format!("CONNECTION - 2001:db8::1 {REPORTED}"),
+                ],
+            ),
+            "OK",
+        )
+        .await;
+        answer(p, 11, "ADMIN DISCONNECT ~sam bye", &[], "OK").await;
+        answer(
+            p,
+            12,
+            "ADMIN NOTICE down at 10",
+            &["NOTICE down at 10".into()],
+            "OK",
+        )
+        .await;
+        answer(
+            p,
+            13,
+            "ADMIN ROOMS limit=1",
+            &lines(13, &["ROOM #secret 2 hidden things"]),
+            "OK more=1",
+        )
+        .await;
+        answer(p, 14, "ADMIN DROP #secret gone", &[], "OK").await;
+        answer(p, 15, "ADMIN PURGE ~spammer hours=2", &[], "OK deleted=5").await;
+        answer(
+            p,
+            16,
+            "ADMIN REPORTS",
+            &[
+                format!(
+                    "@ref=16;report=w7c1m5;t={REPORTED};from=bob@example.net REPORT carol@example.com 2 rude"
+                ),
+                format!(
+                    "@ref=16;report=w7c1m5;{}",
+                    &ev(2, "from=carol@example.com MSG carol@example.com go away")[1..]
+                ),
+            ],
+            "OK",
+        )
+        .await;
+        answer(
+            p,
+            17,
+            "ADMIN KEYS alice@example.org",
+            &lines(17, &[&format!("KEY {PUBLIC} laptop")]),
+            "OK",
+        )
+        .await;
+        answer(
+            p,
+            18,
+            &format!("ADMIN ADDKEY bob@example.org {PUBLIC} phone"),
+            &[],
+            "OK",
+        )
+        .await;
+        answer(p, 19, &format!("ADMIN DELKEY bob@example.org {PUBLIC}"), &[], "OK").await;
+        answer(p, 20, "ADMIN UNREGISTER bob@example.org", &[], "OK").await;
+        answer(p, 21, "ADMIN SET retention 30", &[], "OK").await;
+        answer(p, 22, "ADMIN SET welcome hello there", &[], "ERR forbidden").await;
+        quit(peer).await;
+    })
+    .await;
+    let alice = client.add_identity(HOST, ALICE).unwrap();
+    let events = alice.subscribe();
+    within(alice.connect()).await.unwrap();
+    within(alice.wait_synced()).await.unwrap();
+    let admin = alice.admin();
+
+    assert_eq!(
+        within(admin.operators()).await.unwrap(),
+        ["alice@example.org", "root@example.org"]
+    );
+    within(admin.add_operator("bob@example.net")).await.unwrap();
+    within(admin.remove_operator("bob@example.net"))
+        .await
+        .unwrap();
+    within(admin.ban("*@evil.example", "spam wave"))
+        .await
+        .unwrap();
+    within(admin.unban("*@evil.example")).await.unwrap();
+    assert_eq!(
+        within(admin.bans()).await.unwrap(),
+        [
+            ServerBanInfo {
+                target: "203.0.113.7".into(),
+                reason: "flood".into()
+            },
+            ServerBanInfo {
+                target: "*@evil.example".into(),
+                reason: String::new()
+            }
+        ]
+    );
+    let who = within(admin.connections()).await.unwrap();
+    assert_eq!(who.len(), 2);
+    assert_eq!(
+        (who[0].uid.as_deref(), who[0].address.as_str(), who[0].port),
+        (Some(ALICE), "203.0.113.7", Some(51000))
+    );
+    assert_eq!(
+        (who[1].uid.as_deref(), who[1].address.as_str(), who[1].port),
+        (None, "2001:db8::1", None)
+    );
+    assert_eq!(who[1].since, REPORTED);
+    within(admin.disconnect("~sam", "bye")).await.unwrap();
+    within(admin.notice("down at 10")).await.unwrap();
+    let notice = until(&events, |e| match e {
+        AccountEvent::Notice { notice } => Some(notice.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(
+        notice,
+        Notice::Server {
+            text: "down at 10".into()
+        }
+    );
+    let rooms = within(admin.rooms(None, Some(1))).await.unwrap();
+    assert!(rooms.more);
+    assert_eq!(rooms.rooms[0].room, "#secret");
+    assert_eq!(rooms.rooms[0].topic, "hidden things");
+    within(admin.drop_room("#secret", "gone")).await.unwrap();
+    assert_eq!(within(admin.purge("~spammer", Some(2))).await.unwrap(), 5);
+    assert!(matches!(
+        admin.purge("~spammer", Some(0)).await,
+        Err(ClientError::Invalid(_))
+    ));
+    let reports = within(admin.reports()).await.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reporter.as_deref(), Some("bob@example.net"));
+    assert_eq!(reports[0].conversation, "carol@example.com");
+    assert_eq!(reports[0].message.as_ref().unwrap().text, "go away");
+    let keys = within(admin.keys(ALICE)).await.unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].label, "laptop");
+    assert!(keys[0].this_device);
+    within(admin.add_key("bob@example.org", PUBLIC, "phone"))
+        .await
+        .unwrap();
+    within(admin.remove_key("bob@example.org", PUBLIC))
+        .await
+        .unwrap();
+    within(admin.unregister("bob@example.org")).await.unwrap();
+    within(admin.set("retention", "30 ")).await.unwrap();
+    assert!(matches!(
+        admin.set("guests", "maybe").await,
+        Err(ClientError::Invalid(_))
+    ));
+    let err = within(admin.set("welcome", "hello there"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Some("forbidden"));
+    alice.disconnect().await;
     server.done().await;
 }
 

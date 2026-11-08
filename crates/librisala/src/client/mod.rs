@@ -61,8 +61,9 @@
 //!
 //! Room settings, roles, moderation, deleting and reports (5.4, 5.8,
 //! 6.2-6.4) are methods of [`Conversation`] and [`Account`]: see
-//! `rooms.rs`, from [`Conversation::set_setting`] on. NOTICE lines (8.4)
-//! arrive as [`Notice::Server`].
+//! `rooms.rs`, from [`Conversation::set_setting`] on. An operator's ADMIN
+//! commands (Section 10) are methods of [`Admin`], from [`Account::admin`].
+//! NOTICE lines (8.4) arrive as [`Notice::Server`].
 //!
 //! # Order
 //!
@@ -145,6 +146,7 @@
 //! by hand.
 
 mod account;
+mod admin;
 mod driver;
 mod identity;
 mod people;
@@ -175,6 +177,7 @@ use crate::store::{AccountId, Store};
 use crate::sync::SyncConfig;
 
 pub use account::{Account, AccountEvents, Conversation};
+pub use admin::Admin;
 pub use people::PresenceWatch;
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{

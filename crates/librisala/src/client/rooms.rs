@@ -18,7 +18,7 @@
 //! - **Reports** (5.8). [`Conversation::report`] reports a message.
 //!   Reviewers (a room's owners and moderators, and operators) receive
 //!   reports live as [`AccountEvent::Report`], list them with
-//!   [`Conversation::reports`],
+//!   [`Conversation::reports`] or [`Admin::reports`](super::Admin::reports),
 //!   and close them with [`Account::resolve_report`]; another reviewer's
 //!   resolution arrives as [`AccountEvent::ReportResolved`]. Reports are
 //!   never stored as events.
@@ -42,7 +42,7 @@ use super::types::{
 #[cfg(doc)]
 use super::types::AccountEvent;
 
-fn parse_uid(uid: &str) -> Result<Uid, ClientError> {
+pub(crate) fn parse_uid(uid: &str) -> Result<Uid, ClientError> {
     uid.trim()
         .parse()
         .map_err(|_| ClientError::Invalid(format!("uid {uid:?}")))
@@ -50,7 +50,7 @@ fn parse_uid(uid: &str) -> Result<Uid, ClientError> {
 
 /// An `OK` that lacks a value the command promises: the server broke the
 /// protocol.
-fn missing(what: &str) -> ClientError {
+pub(crate) fn missing(what: &str) -> ClientError {
     ClientError::Connection {
         kind: ConnectionErrorKind::Protocol,
         message: format!("the server's OK has no {what}"),

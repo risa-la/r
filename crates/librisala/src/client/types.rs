@@ -1440,7 +1440,8 @@ pub struct ReportedMessage {
 
 /// A report of a message (5.8), as its reviewers get it: live as
 /// [`AccountEvent::Report`], or from
-/// [`Conversation::reports`](super::Conversation::reports).
+/// [`Conversation::reports`](super::Conversation::reports) and
+/// [`Admin::reports`](super::Admin::reports).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportInfo {
     /// The report's id, for
@@ -1533,7 +1534,7 @@ impl ReportInfo {
     }
 }
 
-/// A server-wide ban (10.2).
+/// A server-wide ban (10.2), from [`Admin::bans`](super::Admin::bans).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerBanInfo {
     /// What is banned: an identity, `*@<domain>`, an address or a prefix.
@@ -1543,7 +1544,8 @@ pub struct ServerBanInfo {
     pub reason: String,
 }
 
-/// An open connection to the server (10.3).
+/// An open connection to the server (10.3), from
+/// [`Admin::connections`](super::Admin::connections).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionInfo {
     /// The uid it signed in as, or `None` if it has not signed in yet.

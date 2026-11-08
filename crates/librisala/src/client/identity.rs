@@ -68,7 +68,7 @@ fn no_key(identity: &Identity) -> ClientError {
 }
 
 /// Reads a public key the user typed or pasted (4.4).
-fn parse_public_key(input: &str) -> Result<(PublicKey, Option<String>), ClientError> {
+pub(crate) fn parse_public_key(input: &str) -> Result<(PublicKey, Option<String>), ClientError> {
     keys::parse_key_input(input).map_err(|e| {
         ClientError::keys(
             KeyErrorKind::BadKey,
