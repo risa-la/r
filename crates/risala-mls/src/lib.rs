@@ -23,6 +23,7 @@
 pub mod backup;
 pub mod conversation;
 pub mod crypto;
+pub mod file;
 pub mod group;
 pub mod history;
 pub mod keypackage;
@@ -37,6 +38,7 @@ pub use openmls_traits;
 pub use backup::{BackupError, BackupKey, RecoveryKey, RecoveryKeyError};
 pub use conversation::{ConversationError, ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto, verify_ml_dsa_44};
+pub use file::{BlobRef, BlobRefError, Decryptor, EncryptedFile, Encryptor, FileError, FileKey};
 pub use group::{
     Changes, CommitError, CreateGroupError, ExternalJoinError, commit, create_group,
     join_by_external_commit, key_package, stage_welcome,
