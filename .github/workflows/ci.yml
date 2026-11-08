@@ -18,6 +18,9 @@ jobs:
 
   # risala-pow's JIT against its interpreter, for many seeds and nonces.
   # The normal tests run a few hundred; this runs 320,000, in release.
+  # Then the tests again with Linux's memory-deny-write-execute on
+  # (PR_SET_MDWE, which execve keeps), so that mprotect refuses to make
+  # memory executable: the JIT must fall back to the interpreter.
   pow-jit:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -26,6 +29,80 @@ jobs:
       - uses: cachix/install-nix-action@v31
       - name: cargo test --release -p risala-pow -- --ignored
         run: nix develop --command cargo test --release -p risala-pow -- --ignored
+      - name: the JIT refused, under PR_SET_MDWE
+        run: |
+          set -euo pipefail
+          bin=$(nix develop --command cargo test -p risala-pow --lib --no-run --message-format=json |
+            jq -r 'select(.target.name == "risala_pow" and .executable != null) | .executable')
+          RISALA_POW_JIT_REFUSED=1 python3 -c '
+          import ctypes, os, sys
+          libc = ctypes.CDLL(None, use_errno=True)
+          if libc.prctl(65, 1, 0, 0, 0) != 0:  # PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN
+              sys.exit("prctl: errno %d" % ctypes.get_errno())
+          os.execv(sys.argv[1], sys.argv[1:])
+          ' "$bin"
+
+  # The same on aarch64 Linux: all the tests, the long one included, in
+  # release, with the aarch64 JIT.
+  pow-jit-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: cargo test --release -p risala-pow -- --include-ignored
+        run: nix develop --command cargo test --release -p risala-pow -- --include-ignored
+
+  # risala-pow on macOS, where the JIT maps its code with MAP_JIT: on
+  # Apple Silicon (aarch64), and on Intel (x86-64) through Rosetta 2.
+  # Rust comes from rustup, which the runner image has; the Nix dev shell
+  # would bring the whole risala toolchain for one crate.
+  #
+  # A plain test binary is not under the hardened runtime, so it may map
+  # JIT memory without an entitlement: the tests check the JIT runs. The
+  # same binary is then signed (ad hoc) with the hardened runtime, as an
+  # app would be: with the com.apple.security.cs.allow-jit entitlement
+  # the JIT must still run, and without it the system refuses JIT memory
+  # and the JIT must fall back to the interpreter.
+  pow-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: rustup
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - name: Rosetta 2
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
+      - name: cargo test --release -p risala-pow -- --include-ignored
+        run: cargo test --release -p risala-pow --target ${{ matrix.target }} -- --include-ignored
+      - name: the hardened runtime, with and without allow-jit
+        run: |
+          set -euo pipefail
+          bin=$(cargo test -p risala-pow --lib --target ${{ matrix.target }} --no-run --message-format=json |
+            jq -r 'select(.target.name == "risala_pow" and .executable != null) | .executable')
+          cat > allow-jit.entitlements <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --sign - --options runtime --entitlements allow-jit.entitlements "$bin"
+          codesign --display --verbose --entitlements - "$bin"
+          "$bin"
+          codesign --force --sign - --options runtime "$bin"
+          codesign --display --verbose --entitlements - "$bin"
+          RISALA_POW_JIT_REFUSED=1 "$bin"
 
   kani:
     runs-on: ubuntu-latest

@@ -10,19 +10,24 @@ authors.workspace = true
 
 [features]
 default = ["jit"]
-# Compile each function's programs to machine code, on x86-64 Linux and
-# macOS. Elsewhere, and where executable memory cannot be mapped, the
-# interpreter runs. It needs std there.
+# Compile each function's programs to machine code, on x86-64 and aarch64
+# Linux, Android and macOS. Elsewhere (iOS among them), and where
+# executable memory cannot be mapped, the interpreter runs. It needs std
+# there.
 jit = ["dep:libc"]
 
 [dependencies]
 sha2.workspace = true
 
-[target.'cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))'.dependencies]
+[target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), any(target_os = "linux", target_os = "android", target_os = "macos")))'.dependencies]
 libc = { workspace = true, optional = true }
 
-[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+# Both compilers are safe code, built and tested on every host, so each
+# decoder is too.
+[dev-dependencies]
 iced-x86.workspace = true
+yaxpeax-arm.workspace = true
+yaxpeax-arch.workspace = true
 
 # The workspace lints, except that unsafe code is denied rather than
 # forbidden: the JIT's module that maps executable memory and calls into it

@@ -56,9 +56,17 @@ impl Puzzle {
         }
     }
 
-    /// The same puzzle, making its functions with `backend`. A server
-    /// that must not map executable memory passes
-    /// [`Backend::Interpreter`].
+    /// The same puzzle, making its functions with `backend`.
+    ///
+    /// A server verifying solutions should pass [`Backend::Interpreter`].
+    /// [`Puzzle::verify`] makes a new function for every nonce, and making
+    /// a JIT function changes the protection of its code twice
+    /// (`mprotect`), which stalls every thread of the process: with 16
+    /// threads verifying at once, a JIT verify took about 73 µs against
+    /// about 25 µs with the interpreter, which scales with threads (on one
+    /// thread, 11 µs against 25 µs). The interpreter also maps no
+    /// executable memory at all. Clients keep the default, the JIT, for
+    /// [`Puzzle::solve`], where one function serves many nonces.
     #[must_use]
     pub const fn with_backend(mut self, backend: Backend) -> Self {
         self.backend = backend;

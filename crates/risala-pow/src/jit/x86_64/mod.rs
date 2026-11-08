@@ -80,8 +80,13 @@ use crate::hash::{LOOP_BUDGET, R8_SLOT, ROUNDS};
 use crate::program::{Instr, Op, PROGRAM_COUNT, Program};
 use asm::{Alu, Asm, Cond, Operation, Reg, Unary};
 
-/// The compiled function's type: `f(regs, scratchpad)`.
+/// The compiled function's type: `f(regs, scratchpad)`. Only x86-64 has
+/// this ABI; elsewhere the module is built for its tests alone.
+#[cfg(target_arch = "x86_64")]
 pub(crate) type Entry = unsafe extern "sysv64" fn(regs: *mut u64, scratchpad: *mut u8);
+
+/// What a code buffer is a slice of: bytes.
+pub(crate) type Unit = u8;
 
 /// The machine registers of R0 to R7.
 const R: [Reg; 8] = [

@@ -12,10 +12,12 @@
 use libfuzzer_sys::fuzz_target;
 use risala_pow::{Backend, HashWx, Scratchpad};
 
-/// Whether this build compiles functions on this platform.
+/// Whether this build compiles functions on this platform: x86-64 or
+/// little-endian aarch64, on Linux, Android or macOS.
 const JIT_BUILT: bool = cfg!(all(
-    target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos")
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "android", target_os = "macos")
 ));
 
 fuzz_target!(|data: &[u8]| {

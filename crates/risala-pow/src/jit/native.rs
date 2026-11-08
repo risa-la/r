@@ -12,8 +12,8 @@ use crate::hash::SCRATCHPAD_LEN;
 use crate::program::{PROGRAM_COUNT, Program};
 
 /// Spare code buffers a thread keeps for reuse. Reusing one costs two
-/// `mprotect` calls; a new one also costs `mmap`, `munmap` and the page
-/// faults of first use.
+/// `mprotect` calls (none with `MAP_JIT` on Apple Silicon); a new one
+/// also costs `mmap`, `munmap` and the page faults of first use.
 const SPARES_PER_THREAD: usize = 4;
 
 std::thread_local! {

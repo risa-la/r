@@ -59,6 +59,9 @@ proptest = "1"
 # An independent x86-64 decoder (MIT), to check every instruction encoding
 # risala-pow's JIT emits and to verify the code it compiles.
 iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+# An independent A64 decoder (0BSD), for the same checks of the aarch64 JIT.
+yaxpeax-arm = { version = "0.5", default-features = false, features = ["std"] }
+yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
 tempfile = "3"
 
 [workspace.lints.rust]

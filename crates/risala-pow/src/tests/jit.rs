@@ -1,9 +1,11 @@
 //! The JIT against the interpreter: same hash, same registers and same
 //! scratchpad, for every test vector and many random seeds and nonces.
 //!
-//! Where this build has no JIT, the JIT functions fall back to the
-//! interpreter and these tests still pass; [`jit_runs_where_supported`]
-//! checks that the JIT really runs on the platforms it is built for.
+//! Where this build has no JIT, or the system refuses executable memory,
+//! the JIT functions fall back to the interpreter and these tests still
+//! pass; [`jit_runs_where_supported`] and every function made here check
+//! that the JIT really runs on the platforms it is built for, and really
+//! falls back where it is refused.
 
 use std::thread;
 use std::vec::Vec;
@@ -14,18 +16,23 @@ use super::{HASH_VECTORS, PUZZLE_VECTORS, nz, unhex};
 use crate::hash::{Backend, HashWx, Scratchpad};
 use crate::puzzle::Puzzle;
 
-/// Whether this build compiles functions on this platform.
-const JIT_BUILT: bool = cfg!(all(
-    feature = "jit",
-    target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos")
-));
+/// Whether the JIT must run here: this build compiles functions on this
+/// platform, and the system is not known to refuse executable memory.
+/// `RISALA_POW_JIT_REFUSED` says it is: CI sets it to run the tests under
+/// macOS's hardened runtime without the allow-jit entitlement, where the
+/// JIT must fall back to the interpreter.
+fn jit_expected() -> bool {
+    crate::jit::BUILT && std::env::var_os("RISALA_POW_JIT_REFUSED").is_none()
+}
 
 fn jit(seed: &[u8; 32]) -> HashWx {
     let f = HashWx::with_backend(seed, Backend::Jit);
-    if JIT_BUILT {
-        assert_eq!(f.backend(), Backend::Jit);
-    }
+    let want = if jit_expected() {
+        Backend::Jit
+    } else {
+        Backend::Interpreter
+    };
+    assert_eq!(f.backend(), want);
     f
 }
 
@@ -92,7 +99,7 @@ const _: () = {
 
 #[test]
 fn jit_runs_where_supported() {
-    if JIT_BUILT {
+    if jit_expected() {
         assert_eq!(Backend::best_available(), Backend::Jit);
         assert_eq!(HashWx::new(&[0; 32]).backend(), Backend::Jit);
     } else {

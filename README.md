@@ -102,15 +102,20 @@ proofs that finish in under a minute are kept. CI runs them in the
 `risala-pow` has proofs in `crates/risala-pow/src/proofs.rs`. They cover
 every seed, not just small ones: every program is well formed, no
 instruction can panic, scratchpad reads and writes stay in bounds, and
-the puzzle's block arithmetic cannot overflow. Its x86-64 JIT has more,
-in `crates/risala-pow/src/jit/x86_64/proofs.rs`, for every program, not
+the puzzle's block arithmetic cannot overflow. Its JITs have more, in
+`crates/risala-pow/src/jit/x86_64/proofs.rs` and
+`crates/risala-pow/src/jit/aarch64/proofs.rs`, for every program, not
 only those a seed can make: the code of each program fits its size
 bound, so the encoder never fails or writes past its buffer; its
 branches go to its own start and end; every scratchpad access the
 encoder emits is masked just before, and the masks keep it in range;
-and the loop test decides as the interpreter does. The JIT's encodings
-are checked against an independent decoder in its unit tests, and
-`crates/risala-pow/fuzz` fuzzes it against the interpreter.
+and the loop test decides as the interpreter does. The JITs' encodings
+are checked against independent decoders (iced-x86, yaxpeax-arm) in
+their unit tests, which also run every compiled function through a
+static verifier; both compilers are built and tested on any host, and
+the aarch64 tests also evaluate whole compiled functions against the
+interpreter. `crates/risala-pow/fuzz` fuzzes the JIT against the
+interpreter.
 
 Kani is not in nixpkgs. Its release bundle and the nightly toolchain it
 downloads are ordinary Linux binaries, which run on NixOS through
@@ -136,9 +141,26 @@ cargo kani -p risala-proto --harness proofs::ip_prefix_v6
 cargo kani -p risala-pow -j 2 --output-format terse -Z unstable-options --harness-timeout 2m
 ```
 
-The full run takes about two minutes. Keep `-j` small: each proof runs
+The full run takes a few minutes (risala-pow's 28 proofs take under five
+one at a time; the slowest about 50 seconds). Keep `-j` small: each proof runs
 its own solver, which can use several gigabytes of memory, and an
 unbounded `-j` can overload a machine.
+
+### risala-pow's aarch64 JIT on x86-64
+
+On an x86-64 machine, the aarch64 JIT runs under qemu-user. With a Rust
+toolchain that has the `aarch64-unknown-linux-gnu` target, an aarch64
+cross linker (from Nix, `nixpkgs#pkgsCross.aarch64-multiplatform.stdenv.cc`)
+and `qemu-aarch64`:
+
+```
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-unknown-linux-gnu-gcc \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64 \
+cargo test -p risala-pow --target aarch64-unknown-linux-gnu
+```
+
+The tests check that the JIT, not the interpreter, ran. Timings under
+qemu mean nothing; CI runs the tests on aarch64 Linux and on macOS.
 
 ## Running a server
 

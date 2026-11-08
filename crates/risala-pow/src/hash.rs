@@ -28,9 +28,18 @@ pub(crate) const LOOP_BUDGET: u32 = 32;
 /// What runs a function's programs.
 ///
 /// Both give the same hash for every seed and nonce. The JIT is about ten
-/// times faster, and runs only on x86-64 Linux and macOS, with the `jit`
-/// feature (on by default), where the system allows executable memory.
-/// Elsewhere the interpreter runs, whatever is asked for.
+/// times faster per hash, and runs only on x86-64 and aarch64 Linux,
+/// Android and macOS, with the `jit` feature (on by default), where the
+/// system allows executable memory. Elsewhere, iOS among them, the
+/// interpreter runs, whatever is asked for.
+///
+/// The JIT is for solving, where one function hashes many nonces. A
+/// server verifying solutions from many threads should use
+/// [`Backend::Interpreter`]: each verify makes a new function, and making
+/// a JIT function changes page protections twice, which stalls every
+/// thread of the process. With 16 threads verifying at once, a JIT verify
+/// took about 73 µs against about 25 µs interpreted (on one thread, 11 µs
+/// against 25 µs). See the crate documentation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Backend {
