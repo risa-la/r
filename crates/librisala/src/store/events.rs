@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use risala_proto::names::{Conv, Id, Uid};
+use risala_proto::names::{Conv, Id, Seq, Uid};
 use risala_proto::server::{Event, EventBody, ServerLine, ServerMessage};
 use risala_proto::types::Relation;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -506,12 +506,7 @@ impl<'a> Tx<'a> {
                     self.touch(conv, t.get())?;
                 }
             },
-            EventBody::Delete { seq: t, .. } => {
-                self.mark_deleted(conv, t.get())?;
-                // Only messages have edits and reactions, so whatever names
-                // the target goes too, even if the target is not stored.
-                self.delete_related(conv, t.get())?;
-            }
+            EventBody::Delete { seq: t, .. } => self.apply_delete(row, *t)?,
             body => {
                 self.apply_state(conv, body, from, n)?;
                 self.changed(Change::Inserted { conv, seq });
@@ -668,6 +663,17 @@ impl<'a> Tx<'a> {
             });
         }
         Ok(())
+    }
+
+    /// Deletes stored message `target` of `row` as a DELETE event does
+    /// (5.4), with its edits and reactions. For a DELETE whose event is not
+    /// stored, such as the account's own in a room it has left, whose `OK`
+    /// is all it gets.
+    pub(crate) fn apply_delete(&mut self, row: &ConvRow, target: Seq) -> Result<(), StoreError> {
+        self.mark_deleted(row.id, target.get())?;
+        // Only messages have edits and reactions, so whatever names the
+        // target goes too, even if the target is not stored.
+        self.delete_related(row.id, target.get())
     }
 
     /// Marks stored MSG `n` deleted, erasing its text and file (5.4), and

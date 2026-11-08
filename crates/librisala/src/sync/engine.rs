@@ -1382,6 +1382,17 @@ impl SyncEngine {
                             warn!(%seq, "OK for a cid names someone else's event");
                         }
                         tx.outbox_sent(outbox, seq)?;
+                        // 5.4: an author may delete in a room they have
+                        // left, and then no DELETE event comes. The OK says
+                        // the message is deleted, in the room the entry is
+                        // bound to.
+                        if let Some(target) = item.delete
+                            && let Some(row) = tx.conv_by_name(account, &item.conv)?
+                            && row.conv_id.is_some()
+                            && row.conv_id == item.conv_id
+                        {
+                            tx.apply_delete(&row, target)?;
+                        }
                     }
                     None => tx.outbox_failed(outbox, FailReason::Unconfirmed)?,
                 },

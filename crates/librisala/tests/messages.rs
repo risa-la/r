@@ -363,6 +363,12 @@ async fn deletes_in_a_room_left_name_the_room_they_mean() {
         (Some(String::new()), false, true, vec![]),
     )
     .await;
+    // No DELETE event reaches alice, who left: her own cache applies the
+    // deletion when the OK comes.
+    assert_eq!(
+        shown(&a, first),
+        Some((Some(String::new()), false, true, vec![]))
+    );
 
     // The room is dropped and made again; alice, not a member, hears
     // nothing of it. Her DELETE of `second` names the old room's id.
@@ -385,6 +391,11 @@ async fn deletes_in_a_room_left_name_the_room_they_mean() {
         "{entry:?}"
     );
     assert_eq!(shown(&o, second), before);
+    // Nor in alice's cache.
+    assert_eq!(
+        shown(&a, second),
+        Some((Some("second".into()), false, false, vec![]))
+    );
     assert!(
         !server_history(&server, "#club")
             .await
