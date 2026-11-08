@@ -350,9 +350,10 @@ impl Account {
 
     /// Says whether the new device with key fingerprint `fingerprint` is
     /// the user's (12.9). A confirmed device gets every history key this
-    /// device holds, so that it reads the whole history; one that is not
-    /// gets none. Ask the user to compare the fingerprint with the one the
-    /// new device shows.
+    /// device holds, so that it reads the whole history, and the recovery
+    /// key if this device holds one, so that it backs up the keys it gets
+    /// later (12.10); one that is not gets none. Ask the user to compare
+    /// the fingerprint with the one the new device shows.
     pub async fn confirm_device(
         &self,
         fingerprint: &str,

@@ -1015,6 +1015,48 @@ fn a_confirmed_device_gets_the_history_keys() {
 }
 
 #[test]
+fn a_confirmed_device_gets_the_recovery_key() {
+    let mut net = Net::new();
+    let a1 = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a1, "bob@example.net", "before");
+    let recovery = risala_mls::RecoveryKey::from_bytes([7; 32]);
+    let out = net.devs[a1]
+        .engine
+        .set_recovery_key(Some(recovery.clone()))
+        .unwrap();
+    net.devs[a1].absorb(out);
+    net.run();
+
+    // A new device gets nothing before the user confirms it, and then the
+    // recovery key with the history keys (12.9, 12.10).
+    let a2 = net.device("alice@example.org", 3);
+    net.run();
+    assert_eq!(net.devs[a2].recovery, None);
+    let key = net.devs[a2].public();
+    let out = net.devs[a1].engine.confirm_device(&key, true).unwrap();
+    net.devs[a1].absorb(out);
+    net.run();
+    assert_eq!(net.devs[a2].recovery, Some(recovery.clone()));
+
+    // It backs up what it gets from then on, without the first device.
+    let alice = uid("alice@example.org");
+    let before = net.backups.keys().filter(|(u, _, _)| *u == alice).count();
+    let b2 = net.device("bob@example.net", 4);
+    net.run();
+    net.send(a2, "bob@example.net", "after");
+    assert!(
+        net.log
+            .iter()
+            .any(|(d, l)| *d == a2 && l.contains("BACKUP ADD")),
+        "the new device backs up"
+    );
+    assert!(net.backups.keys().filter(|(u, _, _)| *u == alice).count() > before);
+    let _ = (b, b2);
+}
+
+#[test]
 fn history_keys_are_backed_up_and_restored() {
     use crate::store::e2ee::EncState::Verified;
     let mut net = Net::new();

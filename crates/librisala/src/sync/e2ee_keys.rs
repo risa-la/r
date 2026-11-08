@@ -6,7 +6,8 @@
 //!   device first joined is old; a later one is new, and waits for the
 //!   user to confirm it on this device ([`SyncEngine::confirm_device`]).
 //!   Only then does this device send it every history key it holds, as KEY
-//!   lines in ENC in the conversation with itself (12.9).
+//!   lines in ENC in the conversation with itself (12.9), with the
+//!   recovery key as a RECOVERY line if this device holds it (12.10).
 //! - **Backups.** While the device holds the recovery key
 //!   ([`SyncEngine::set_recovery_key`]), it backs up each history key it
 //!   gets with BACKUP ADD, encrypted under the backup key (12.10).
@@ -148,7 +149,8 @@ impl SyncEngine {
 
     /// The user confirmed (`true`) or did not recognise (`false`) a new
     /// device of the identity, by its key (12.9, 12.12). Once confirmed,
-    /// this device sends it every history key it holds.
+    /// this device sends it every history key it holds, and the recovery
+    /// key if it holds one (12.10).
     pub fn confirm_device(
         &mut self,
         key: &PublicKey,
@@ -216,6 +218,7 @@ impl SyncEngine {
         }
         let account = self.account;
         let conv = Conv::Uid(self.me.clone());
+        let recovery = self.e2ee.as_ref().and_then(|e| e.recovery.clone());
         let found = self.e2ee_write(|tx| {
             let Some(row) = tx.conv_by_name(account, &conv)? else {
                 return Ok(None);
@@ -253,6 +256,11 @@ impl SyncEngine {
                         key: k.key,
                     });
                 }
+            }
+            // The recovery key too, so that the new device backs up the
+            // history keys it gets from now on (12.10, PLAN.md 46).
+            if let Some(recovery) = recovery {
+                lines.push(Control::Recovery(recovery));
             }
             Ok(Some((row, ready, lines)))
         })?;
