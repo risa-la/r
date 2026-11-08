@@ -12,14 +12,14 @@ use crate::conn::keys::tests::{PEM, SIGNATURE};
 use crate::conn::tests::server::{Peer, ScriptServer, ServerCert, TestCa};
 use crate::conn::{SessionOptions, roots_ca_verifier};
 
-const HOST: &str = "chat.example.org";
+pub(super) const HOST: &str = "chat.example.org";
 const NONCE: &str = "6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e";
-const ALICE: &str = "alice@example.org";
+pub(super) const ALICE: &str = "alice@example.org";
 const WAIT: Duration = Duration::from_secs(30);
 
 /// A client that trusts a self-signed server for `chat.example.org`,
 /// which runs `script` on its one connection, with alice's key.
-async fn setup<F, Fut>(script: F) -> (Client, ScriptServer)
+pub(super) async fn setup<F, Fut>(script: F) -> (Client, ScriptServer)
 where
     F: Fn(usize, Peer) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -57,12 +57,12 @@ where
     (client, server)
 }
 
-async fn within<T>(f: impl Future<Output = T>) -> T {
+pub(super) async fn within<T>(f: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT, f).await.expect("timed out")
 }
 
 /// Greets and accepts alice's AUTH (the signature of Appendix B).
-async fn sign_in(peer: &mut Peer) {
+pub(super) async fn sign_in(peer: &mut Peer) {
     peer.send(&format!("RISALA 1 {HOST} {NONCE}")).await;
     peer.expect(&format!("@ref=1 AUTH {ALICE} {SIGNATURE}"))
         .await;
@@ -70,7 +70,7 @@ async fn sign_in(peer: &mut Peer) {
 }
 
 /// Answers QUIT and closes.
-async fn quit(mut peer: Peer) {
+pub(super) async fn quit(mut peer: Peer) {
     let line = peer.recv().await.expect("QUIT");
     let r = line.strip_suffix(" QUIT").expect("QUIT");
     peer.send(&format!("{r} OK")).await;
@@ -78,13 +78,13 @@ async fn quit(mut peer: Peer) {
 }
 
 /// An event line for #general.
-fn ev(seq: u64, rest: &str) -> String {
+pub(super) fn ev(seq: u64, rest: &str) -> String {
     let t = risala_proto::time::Timestamp::from_unix_millis(1_800_000_000_000 + seq).unwrap();
     format!("@seq={seq};t={t};{rest}")
 }
 
 /// Waits for the first event that `f` picks.
-async fn until<T>(events: &AccountEvents, f: impl Fn(&AccountEvent) -> Option<T>) -> T {
+pub(super) async fn until<T>(events: &AccountEvents, f: impl Fn(&AccountEvent) -> Option<T>) -> T {
     within(async {
         loop {
             let event = events.next().await.expect("an event");

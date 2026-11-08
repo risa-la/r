@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use risala_proto::command::{Command, Request, RoomPage};
 use risala_proto::names::{BlockTarget, Conv, Room, Seq, Uid};
-use risala_proto::server::{ServerLine, ServerMessage};
+use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
 use risala_proto::text::{escape, unescape};
 use risala_proto::types::{Presence as WirePresence, Relation};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -143,6 +143,12 @@ pub(crate) enum Cmd {
         op: PeopleOp,
         reply: Reply<Vec<ServerMessage>>,
     },
+    /// Any other command, answered with its response lines and its OK
+    /// once it succeeds.
+    Request {
+        op: RequestOp,
+        reply: Reply<Answer>,
+    },
     Reconnect,
     Stop {
         reply: oneshot::Sender<()>,
@@ -159,6 +165,23 @@ pub(crate) enum PeopleOp {
     Block(BlockTarget),
     Unblock(BlockTarget),
     Blocks,
+}
+
+/// A command sent through the sync engine for the app, so that the events
+/// it causes are handled before its answer (5.2, 3.6).
+#[derive(Debug, Clone)]
+pub(crate) enum RequestOp {
+    /// INFO of a room (6.2), which the engine also checks the id of.
+    Info(Room),
+    /// A command the engine keeps nothing from.
+    Plain(Command),
+}
+
+/// A command's response lines and its OK (3.6).
+#[derive(Debug, Clone)]
+pub(crate) struct Answer {
+    pub lines: Vec<ServerMessage>,
+    pub ok: OkResponse,
 }
 
 impl AccountShared {
@@ -447,6 +470,22 @@ impl Account {
                 r = state.changed() => r.map_err(|_| ClientError::NotConnected)?,
             }
         }
+    }
+
+    /// Sends `command` in order with the sync engine's, and waits for its
+    /// answer. The command is checked first: one that cannot be sent as
+    /// it is fails with [`ClientError::Invalid`]. Needs a connection.
+    pub(crate) async fn request(&self, command: Command) -> Result<Answer, ClientError> {
+        Request::new(command.clone())
+            .validate()
+            .map_err(|e| ClientError::Invalid(format!("{}: {e}", command.verb())))?;
+        self.request_op(RequestOp::Plain(command)).await
+    }
+
+    pub(crate) async fn request_op(&self, op: RequestOp) -> Result<Answer, ClientError> {
+        let (reply, rx) = oneshot::channel();
+        self.shared.command(Cmd::Request { op, reply });
+        wait(rx).await
     }
 
     /// One page of the account's conversations from the cache, in byte

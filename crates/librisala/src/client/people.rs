@@ -431,7 +431,8 @@ impl Conversation {
             .collect()
     }
 
-    fn room(&self) -> Result<risala_proto::names::Room, ClientError> {
+    /// The room, or [`ClientError::Invalid`] for a direct conversation.
+    pub(crate) fn room(&self) -> Result<risala_proto::names::Room, ClientError> {
         match self.conv() {
             Conv::Room(room) => Ok(room.clone()),
             other => Err(ClientError::Invalid(format!("{other} is not a room"))),

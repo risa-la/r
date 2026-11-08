@@ -57,6 +57,13 @@
 //! methods of [`Account`] and [`Conversation`], with change events: see
 //! `people.rs`, from [`Account::set_display_name`] on.
 //!
+//! # Rooms, reports and administration
+//!
+//! Room settings, roles, moderation, deleting and reports (5.4, 5.8,
+//! 6.2-6.4) are methods of [`Conversation`] and [`Account`]: see
+//! `rooms.rs`, from [`Conversation::set_setting`] on. NOTICE lines (8.4)
+//! arrive as [`Notice::Server`].
+//!
 //! # Order
 //!
 //! The sync engine needs every server line in the order it arrived, with
@@ -141,6 +148,7 @@ mod account;
 mod driver;
 mod identity;
 mod people;
+mod rooms;
 mod timeline;
 pub mod types;
 mod typing;
@@ -149,6 +157,8 @@ mod typing;
 mod identity_tests;
 #[cfg(test)]
 mod people_tests;
+#[cfg(test)]
+mod rooms_tests;
 #[cfg(test)]
 mod tests;
 
@@ -168,11 +178,12 @@ pub use account::{Account, AccountEvents, Conversation};
 pub use people::PresenceWatch;
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
-    AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, ConversationInfo,
-    ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind, FailKind, KeyErrorKind,
-    KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice, OutboxEntry, OutboxStatus,
-    Presence, ReactionCount, RefusedKind, RoomList, RoomListing, ServerHello, Setting, TrustInfo,
-    Unregistered, UserInfo,
+    AccountEvent, BanInfo, ClientError, ConnectionErrorKind, ConnectionInfo, ConnectionState,
+    ConversationInfo, ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind,
+    FailKind, KeyErrorKind, KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice,
+    OutboxEntry, OutboxStatus, Presence, ReactionCount, RefusedKind, ReportInfo, ReportedMessage,
+    RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo, Setting,
+    TrustInfo, Unregistered, UserInfo,
 };
 
 use account::AccountShared;

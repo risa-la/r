@@ -8,19 +8,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
-use risala_proto::server::{ServerLine, ServerMessage};
+use risala_proto::server::{Report, ServerLine, ServerMessage};
 use risala_proto::text::unescape;
 use risala_proto::types::Ref;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::account::{AccountShared, Batch, Cmd, PeopleOp, Synced, check_draft};
+use super::account::{AccountShared, Answer, Batch, Cmd, PeopleOp, RequestOp, Synced, check_draft};
 use super::blocking;
 use super::people::user_info;
 use super::types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, DisconnectKind, KeyErrorKind,
-    Notice, OutboxEntry, Presence, RefusedKind, is_lasting_refusal,
+    Notice, OutboxEntry, Presence, RefusedKind, ReportInfo, is_lasting_refusal,
 };
 use crate::addr::TrustStore;
 use crate::conn::{
@@ -329,14 +329,16 @@ enum Input {
     Typing(Conv),
     StopTyping(Conv),
     People(PeopleOp),
+    Request(RequestOp),
     Resume,
 }
 
 /// What to do with an input's result, on the async side.
 enum Ctx {
     None,
-    /// A NOTICE line, to report after the changes before it.
-    Notice(String),
+    /// An event from a line the engine has no use for, such as NOTICE or
+    /// a report (8.4, 5.8), to report after the changes before it.
+    Event(Box<AccountEvent>),
     /// A JOIN the app asked for.
     Join(Room, Reply<()>),
     /// A JOIN after reconnecting (4.2).
@@ -347,6 +349,8 @@ enum Ctx {
     Done(Reply<()>),
     /// A command whose response lines the app waits for.
     Lines(Reply<Vec<ServerMessage>>),
+    /// A command whose response lines and OK the app waits for.
+    Answer(Reply<Answer>),
 }
 
 /// Someone waiting for a command's reply.
@@ -355,6 +359,8 @@ enum Waiter {
     Done(Option<Room>, Reply<()>),
     /// A command whose response lines the app wants.
     Lines(Reply<Vec<ServerMessage>>),
+    /// A command whose response lines and OK the app wants.
+    Answer(Reply<Answer>),
 }
 
 /// One signed-in connection.
@@ -374,6 +380,8 @@ struct Online<'a> {
     rejoining: HashMap<ReqId, Room>,
     /// Replies the session could not send a command for.
     synthetic: Vec<(Input, Ctx)>,
+    /// A REPORT or REPORTENC line whose copy has not arrived yet (5.8).
+    report: Option<(Id, Report)>,
     /// When to call [`SyncEngine::resume_outbox`] after `rate-limited`.
     resume_at: Option<Instant>,
 }
@@ -414,6 +422,7 @@ async fn online(
         reply_lines: HashMap::new(),
         rejoining: HashMap::new(),
         synthetic: Vec::new(),
+        report: None,
         resume_at: None,
     };
     let flow = on.run(&mut incoming, cmds).await;
@@ -517,17 +526,47 @@ impl Online<'_> {
     fn take(&mut self, item: Incoming, inputs: &mut Vec<(Input, Ctx)>) {
         match item {
             Incoming::Line(msg) => {
-                // A NOTICE is published in its place among the changes of
-                // the lines around it (8.4).
-                let ctx = match &msg.line {
-                    ServerLine::Notice { message } => Ctx::Notice(unescape(message).into_owned()),
-                    _ => Ctx::None,
+                // A NOTICE or a report is published in its place among the
+                // changes of the lines around it (8.4, 5.8).
+                let event = match &msg.line {
+                    ServerLine::Notice { message } => Some(AccountEvent::Notice {
+                        notice: Notice::Server {
+                            text: unescape(message).into_owned(),
+                        },
+                    }),
+                    // A report comes as two lines: the REPORT or REPORTENC
+                    // line, then the copy of the event.
+                    ServerLine::Report(report) => {
+                        if let Some(id) = &msg.report {
+                            self.report = Some((id.clone(), report.clone()));
+                        }
+                        None
+                    }
+                    ServerLine::ReportCopy(copy) => match (self.report.take(), &msg.report) {
+                        (Some((id, report)), Some(tag)) if id == *tag => {
+                            Some(AccountEvent::Report {
+                                report: ReportInfo::new(&id, &report, Some(copy)),
+                            })
+                        }
+                        _ => {
+                            debug!("a reported event with no REPORT line before it");
+                            None
+                        }
+                    },
+                    ServerLine::Resolved { id } => {
+                        Some(AccountEvent::ReportResolved { id: id.to_string() })
+                    }
+                    _ => None,
                 };
+                let ctx = event.map_or(Ctx::None, |e| Ctx::Event(Box::new(e)));
                 inputs.push((Input::Line(msg), ctx));
             }
             Incoming::Reply { ref_, response } => match self.refs.remove(&ref_) {
                 Some(req) => {
-                    if matches!(self.waiters.get(&req), Some(Waiter::Lines(_))) {
+                    if matches!(
+                        self.waiters.get(&req),
+                        Some(Waiter::Lines(_) | Waiter::Answer(_))
+                    ) {
                         self.reply_lines.insert(req, response.lines.clone());
                     }
                     inputs.push((Input::Reply(req, to_reply(response)), Ctx::None));
@@ -571,6 +610,7 @@ impl Online<'_> {
                 active: false,
             } => (Input::StopTyping(conv), Ctx::None),
             Cmd::People { op, reply } => (Input::People(op), Ctx::Lines(reply)),
+            Cmd::Request { op, reply } => (Input::Request(op), Ctx::Answer(reply)),
             Cmd::Reconnect | Cmd::Stop { .. } => return None,
         })
     }
@@ -650,10 +690,8 @@ impl Online<'_> {
         let mut not_again: Vec<Room> = Vec::new();
         let mut join_again: Vec<Room> = Vec::new();
         let mut events = events;
-        if let Ctx::Notice(text) = &ctx {
-            events.push(AccountEvent::Notice {
-                notice: Notice::Server { text: text.clone() },
-            });
+        if let Ctx::Event(event) = &ctx {
+            events.push((**event).clone());
         }
         for n in &out.notifications {
             match n {
@@ -663,7 +701,7 @@ impl Online<'_> {
                 _ => {}
             }
         }
-        let mut answers: Vec<Answer> = Vec::new();
+        let mut answers: Vec<Settled> = Vec::new();
         for done in out.completed {
             let result = match &done.outcome {
                 Outcome::Ok(_) => Ok(()),
@@ -697,11 +735,23 @@ impl Online<'_> {
                     {
                         join_again.push(room);
                     }
-                    answers.push(Answer::Done(reply, result));
+                    answers.push(Settled::Done(reply, result));
                 }
                 Some(Waiter::Lines(reply)) => {
                     let lines = self.reply_lines.remove(&done.req).unwrap_or_default();
-                    answers.push(Answer::Lines(reply, result.map(|()| lines)));
+                    answers.push(Settled::Lines(reply, result.map(|()| lines)));
+                }
+                Some(Waiter::Answer(reply)) => {
+                    let lines = self.reply_lines.remove(&done.req).unwrap_or_default();
+                    let result = match (&done.outcome, result) {
+                        (Outcome::Ok(ok), Ok(())) => Ok(Answer {
+                            lines,
+                            ok: ok.clone(),
+                        }),
+                        (_, Ok(())) => unreachable!("only OK succeeds"),
+                        (_, Err(e)) => Err(e),
+                    };
+                    answers.push(Settled::Answer(reply, result));
                 }
                 None => {}
             }
@@ -735,7 +785,7 @@ impl Online<'_> {
             self.shared.synced.send_modify(|s| s.idle = false);
         }
         match ctx {
-            Ctx::None | Ctx::Notice(_) => {}
+            Ctx::None | Ctx::Event(_) => {}
             Ctx::Join(room, reply) => match first_req {
                 Some(req) => {
                     self.waiters.insert(req, Waiter::Done(Some(room), reply));
@@ -771,13 +821,24 @@ impl Online<'_> {
                     let _ = reply.send(Err(ClientError::NotConnected));
                 }
             },
+            Ctx::Answer(reply) => match first_req {
+                Some(req) => {
+                    self.waiters.insert(req, Waiter::Answer(reply));
+                }
+                None => {
+                    let _ = reply.send(Err(ClientError::NotConnected));
+                }
+            },
         }
         for answer in answers {
             match answer {
-                Answer::Done(reply, result) => {
+                Settled::Done(reply, result) => {
                     let _ = reply.send(result);
                 }
-                Answer::Lines(reply, result) => {
+                Settled::Lines(reply, result) => {
+                    let _ = reply.send(result);
+                }
+                Settled::Answer(reply, result) => {
                     let _ = reply.send(result);
                 }
             }
@@ -786,12 +847,13 @@ impl Online<'_> {
 }
 
 /// An answer for the app, sent after the changes the command caused.
-enum Answer {
+enum Settled {
     Done(Reply<()>, Result<(), ClientError>),
     Lines(
         Reply<Vec<ServerMessage>>,
         Result<Vec<ServerMessage>, ClientError>,
     ),
+    Answer(Reply<Answer>, Result<Answer, ClientError>),
 }
 
 /// Whether timelines must read everything again: the blocks changed, so
@@ -931,6 +993,8 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
             PeopleOp::Unblock(target) => engine.unblock(&target),
             PeopleOp::Blocks => engine.blocks()?,
         },
+        Input::Request(RequestOp::Info(room)) => engine.info(&room),
+        Input::Request(RequestOp::Plain(command)) => engine.request(command),
         Input::Resume => engine.resume_outbox()?,
     };
     Ok((out, None))
@@ -947,7 +1011,10 @@ fn answer_err(ctx: Ctx, e: ClientError) {
         Ctx::Lines(reply) => {
             let _ = reply.send(Err(e));
         }
-        Ctx::None | Ctx::Notice(_) | Ctx::Rejoin(_) => {}
+        Ctx::Answer(reply) => {
+            let _ = reply.send(Err(e));
+        }
+        Ctx::None | Ctx::Event(_) | Ctx::Rejoin(_) => {}
     }
 }
 
@@ -1105,6 +1172,9 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
             let _ = reply.send(Err(ClientError::NotConnected));
         }
         Cmd::People { reply, .. } => {
+            let _ = reply.send(Err(ClientError::NotConnected));
+        }
+        Cmd::Request { reply, .. } => {
             let _ = reply.send(Err(ClientError::NotConnected));
         }
         // Nobody sees an offline user type.

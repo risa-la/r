@@ -23,7 +23,8 @@
 //! - The UI asks for work with [`SyncEngine::send`],
 //!   [`SyncEngine::join`], [`SyncEngine::part`], [`SyncEngine::mark_read`],
 //!   [`SyncEngine::load_older`], [`SyncEngine::fetch`] and
-//!   [`SyncEngine::download`]; and about people with
+//!   [`SyncEngine::download`], [`SyncEngine::delete`],
+//!   [`SyncEngine::info`] and [`SyncEngine::request`]; and about people with
 //!   [`SyncEngine::typing`], [`SyncEngine::set_name`],
 //!   [`SyncEngine::members`], [`SyncEngine::whois`], [`SyncEngine::block`],
 //!   [`SyncEngine::unblock`] and [`SyncEngine::blocks`].
@@ -216,7 +217,8 @@ pub enum Outcome {
 }
 
 /// The result of a command the UI asked for (JOIN, PART, INFO, READ, NAME,
-/// MEMBERS, WHOIS, BLOCK, UNBLOCK, BLOCKS).
+/// MEMBERS, WHOIS, BLOCK, UNBLOCK, BLOCKS, and those sent with
+/// [`SyncEngine::request`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completed {
     /// The request, as returned in [`Output::send`].

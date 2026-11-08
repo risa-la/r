@@ -138,6 +138,8 @@ enum Pending {
         roster: Option<(ConvId, i64, u64)>,
     },
     Whois,
+    /// A command the engine keeps nothing from ([`SyncEngine::request`]).
+    Plain,
     Block {
         target: BlockTarget,
         on: bool,
@@ -372,7 +374,7 @@ impl SyncEngine {
             Pending::Info { room, sent, floor } => {
                 self.on_info(req, &room, (sent, floor), reply)?
             }
-            Pending::Read | Pending::Typing => self.completed(req, reply.outcome),
+            Pending::Read | Pending::Typing | Pending::Plain => self.completed(req, reply.outcome),
             Pending::Msg { outbox } => self.on_msg(outbox, reply)?,
             Pending::Name { name } => self.on_name(req, &name, reply)?,
             Pending::Members { room, roster } => self.on_members(req, &room, roster, reply)?,
@@ -440,6 +442,16 @@ impl SyncEngine {
                 floor,
             },
         );
+        self.finish()
+    }
+
+    /// Sends a command the engine keeps nothing from, such as ROLE, KICK,
+    /// REPORT or an ADMIN command, in order with the engine's own, and
+    /// reports how it ended in [`Output::completed`]. The events it causes
+    /// arrive as live lines before its reply (5.2), and are handled like
+    /// any others, so they are stored by the time it completes.
+    pub fn request(&mut self, command: Command) -> Output {
+        self.issue(command, Pending::Plain);
         self.finish()
     }
 

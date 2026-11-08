@@ -1206,6 +1206,18 @@ pub enum AccountEvent {
         /// The room.
         conversation: String,
     },
+    /// A message was reported to the account as one of its reviewers (5.8):
+    /// it is an owner or moderator of the room, or an operator. Not an
+    /// event of the conversation, and not stored.
+    Report {
+        /// The report.
+        report: ReportInfo,
+    },
+    /// Another reviewer resolved report `id` (5.8).
+    ReportResolved {
+        /// The report's id.
+        id: String,
+    },
     /// The account's blocks changed, or whether it hides blocked people
     /// (5.7). While it hides them, rooms' messages and unread counts may
     /// change: [`Timeline`](super::Timeline)s reset themselves, and the
@@ -1339,4 +1351,209 @@ pub struct Unregistered {
     /// kept for an identity the server does not host, since the key is
     /// still in the identity's own key file and works on other servers.
     pub key_deleted: bool,
+}
+
+/// What INFO says about a room (6.2), from
+/// [`Conversation::room_info`](super::Conversation::room_info).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomInfo {
+    /// The room.
+    pub room: String,
+    /// Its id (5.1).
+    pub id: String,
+    /// How many members it has.
+    pub members: u64,
+    /// Its newest seq, or 0 if it has no events yet.
+    pub head: u64,
+    /// The account's role in it (6.3): `owner`, `mod`, `member`, or
+    /// `none` for no role and not a member.
+    pub role: String,
+    /// Whether the account is a member right now.
+    pub joined: bool,
+    /// Its settings, from the snapshot SET lines, in the order sent.
+    pub settings: Vec<Setting>,
+}
+
+/// An owner or moderator of a room (6.3), from
+/// [`Conversation::roles`](super::Conversation::roles).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleInfo {
+    /// Their uid.
+    pub uid: String,
+    /// `owner` or `mod`.
+    pub role: String,
+}
+
+/// A ban in a room (6.4), from [`Conversation::bans`](super::Conversation::bans).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanInfo {
+    /// The banned uid.
+    pub uid: String,
+    /// The reason, unescaped; empty if none.
+    pub reason: String,
+}
+
+/// What INFO says about the server (8.5), from
+/// [`Account::server_info`](super::Account::server_info).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// The protocol version.
+    pub version: u32,
+    /// Whether guests may connect.
+    pub guests: bool,
+    /// The identity domain for REGISTER, or `None` if registration is not
+    /// offered or closed (4.6).
+    pub registration: Option<String>,
+    /// How many days events are kept, or `None` for forever (7.5).
+    pub retention_days: Option<u32>,
+    /// Whether PUSH is supported (9).
+    pub push: bool,
+    /// The largest file UPLOAD accepts, in bytes, or `None` for no uploads
+    /// (5.6).
+    pub upload: Option<u64>,
+}
+
+/// A message as a report showed it (5.8): a copy for review, not an event
+/// of the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedMessage {
+    /// Its seq.
+    pub seq: u64,
+    /// When the server accepted it, in milliseconds since the Unix epoch.
+    pub time_ms: u64,
+    /// The same time as on the wire.
+    pub time: String,
+    /// Its author.
+    pub from: String,
+    /// Its text, unescaped, as it was when reported. Empty for an
+    /// encrypted message, whose content is in [`ReportInfo::line`].
+    pub text: String,
+    /// The message it replies to, if it is a reply (5.3).
+    pub reply_to: Option<u64>,
+    /// The message it edits, if it is an edit.
+    pub edit_of: Option<u64>,
+    /// The message it reacts to, if it is a reaction.
+    pub react_to: Option<u64>,
+    /// The copy as received, in canonical form, with its `report` tag.
+    pub line: String,
+}
+
+/// A report of a message (5.8), as its reviewers get it: live as
+/// [`AccountEvent::Report`], or from
+/// [`Conversation::reports`](super::Conversation::reports).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportInfo {
+    /// The report's id, for
+    /// [`Account::resolve_report`](super::Account::resolve_report).
+    pub id: String,
+    /// The conversation: a room, or for a direct conversation its author,
+    /// as the reporter sees it.
+    pub conversation: String,
+    /// The reported message's seq.
+    pub seq: u64,
+    /// When the report was made, in milliseconds since the Unix epoch.
+    pub time_ms: u64,
+    /// The same time as on the wire.
+    pub time: String,
+    /// Who reported it. Only operators are told; `None` for room owners
+    /// and moderators, so that reporters cannot be singled out.
+    pub reporter: Option<String>,
+    /// Why, unescaped; empty if no reason was given.
+    pub reason: String,
+    /// Whether it reports an encrypted message (REPORTENC, 12.8).
+    pub encrypted: bool,
+    /// The message as it was when reported, or `None` if the server sent
+    /// no copy.
+    pub message: Option<ReportedMessage>,
+    /// The REPORT or REPORTENC line as received, in canonical form.
+    pub line: String,
+}
+
+impl ReportInfo {
+    /// A report from its REPORT or REPORTENC line and the copy that
+    /// follows it, both tagged with report `id`.
+    pub(crate) fn new(
+        id: &risala_proto::names::Id,
+        report: &risala_proto::server::Report,
+        copy: Option<&risala_proto::server::Event>,
+    ) -> ReportInfo {
+        let line = ServerMessage::report_line(id.clone(), report.clone())
+            .to_line()
+            .to_string();
+        let message = copy.and_then(|e| {
+            let meta = e.meta.as_ref()?;
+            let (text, relation) = match &e.body {
+                EventBody::Msg(m) => (unescape(&m.text).into_owned(), m.relation),
+                _ => (String::new(), None),
+            };
+            use risala_proto::types::Relation as R;
+            let rel = |want: fn(&R) -> bool| relation.filter(want).map(|r| r.seq().get());
+            Some(ReportedMessage {
+                seq: meta.seq.get(),
+                time_ms: meta.t.unix_millis(),
+                time: meta.t.to_string(),
+                from: meta.from.to_string(),
+                text,
+                reply_to: rel(|r| matches!(r, R::Reply(_))),
+                edit_of: rel(|r| matches!(r, R::Edit(_))),
+                react_to: rel(|r| matches!(r, R::React(_))),
+                line: ServerMessage::report_copy(id.clone(), e.clone())
+                    .to_line()
+                    .to_string(),
+            })
+        });
+        ReportInfo {
+            id: id.to_string(),
+            conversation: report.conv.to_string(),
+            seq: report.seq.get(),
+            time_ms: report.t.unix_millis(),
+            time: report.t.to_string(),
+            reporter: report.from.as_ref().map(ToString::to_string),
+            reason: unescape(&report.reason).into_owned(),
+            encrypted: report.franking.is_some(),
+            message,
+            line,
+        }
+    }
+
+    /// The reports in a REPORTS or ADMIN REPORTS reply (5.8): each REPORT
+    /// or REPORTENC line, with the copy tagged with the same id.
+    pub(crate) fn from_lines(lines: &[ServerMessage]) -> Vec<ReportInfo> {
+        let mut out = Vec::new();
+        for (i, m) in lines.iter().enumerate() {
+            if let (ServerLine::Report(report), Some(id)) = (&m.line, &m.report) {
+                let copy = lines[i + 1..].iter().find_map(|c| match &c.line {
+                    ServerLine::ReportCopy(e) if c.report.as_ref() == Some(id) => Some(e),
+                    _ => None,
+                });
+                out.push(ReportInfo::new(id, report, copy));
+            }
+        }
+        out
+    }
+}
+
+/// A server-wide ban (10.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerBanInfo {
+    /// What is banned: an identity, `*@<domain>`, an address or a prefix.
+    /// A guest's ban is listed under its address.
+    pub target: String,
+    /// The reason, unescaped; empty if none.
+    pub reason: String,
+}
+
+/// An open connection to the server (10.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// The uid it signed in as, or `None` if it has not signed in yet.
+    pub uid: Option<String>,
+    /// The client's IP address.
+    pub address: String,
+    /// The client's port, if the server said.
+    pub port: Option<u16>,
+    /// When it was opened, in milliseconds since the Unix epoch.
+    pub since_ms: u64,
+    /// The same time as on the wire.
+    pub since: String,
 }
