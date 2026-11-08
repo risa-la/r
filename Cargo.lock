@@ -2348,6 +2348,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "risala-keylog"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "libcrux-ml-dsa",
+ "proptest",
+ "sha2 0.11.0",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "risala-mls"
 version = "0.0.0"
 dependencies = [

@@ -14,6 +14,7 @@ members = [
     "crates/risala-dev",
     "crates/openmls-sqlite-storage",
     "crates/risala-mls",
+    "crates/risala-keylog",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ risala-keyfetch = { path = "crates/risala-keyfetch" }
 # OpenMLS storage in SQLite, ported (see [patch.crates-io] below).
 openmls_sqlite_storage = { path = "crates/openmls-sqlite-storage" }
 risala-mls = { path = "crates/risala-mls" }
+risala-keylog = { path = "crates/risala-keylog" }
 
 base64 = "0.23"
 # ML-DSA (FIPS 204), Cryspen's formally verified libcrux implementation.
