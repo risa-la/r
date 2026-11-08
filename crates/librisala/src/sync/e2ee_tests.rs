@@ -220,6 +220,8 @@ struct Net {
     backups: HashMap<(Uid, String, u64), mls::BackupBlob>,
     /// Every command sent, as a line, by device.
     log: Vec<(usize, String)>,
+    /// Key files a device cannot fetch: the fetch fails (4.4).
+    unreachable: Vec<(usize, Uid)>,
 }
 
 impl Net {
@@ -236,6 +238,7 @@ impl Net {
             next_welcome: 1,
             backups: HashMap::new(),
             log: Vec::new(),
+            unreachable: Vec::new(),
         }
     }
 
@@ -277,6 +280,7 @@ impl Net {
                     let keys = self
                         .key_files
                         .get(&uid)
+                        .filter(|_| !self.unreachable.contains(&(d, uid.clone())))
                         .map(|k| k.iter().map(|k| (k.clone(), None)).collect());
                     let out = self.devs[d].engine.key_file(&uid, keys).unwrap();
                     self.devs[d].absorb(out);
@@ -929,6 +933,57 @@ fn removed_keys_lose_their_leaves() {
             .last()
             .map(|t| t.0.clone()),
         Some("two".to_owned())
+    );
+}
+
+#[test]
+fn a_removal_waits_for_a_key_file_that_cannot_be_fetched() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a, "bob@example.net", "one");
+    let b2 = net.device("bob@example.net", 3);
+    net.run();
+
+    // Bob's second key leaves his key file, and Alice's device removes its
+    // leaf. Bob's first device must check that against his key file
+    // (12.6), which it cannot fetch right now.
+    let bob = uid("bob@example.net");
+    let gone = net.devs[b2].public();
+    net.key_files.get_mut(&bob).unwrap().retain(|k| *k != gone);
+    net.unreachable.push((b, bob.clone()));
+    let listed: Vec<_> = net.key_files[&bob]
+        .iter()
+        .map(|k| (k.clone(), None))
+        .collect();
+    let out = net.devs[a]
+        .engine
+        .key_file(&bob, Some(listed.clone()))
+        .unwrap();
+    net.devs[a].absorb(out);
+    net.run();
+    let epoch = net.devs[a].group("bob@example.net").unwrap().epoch;
+
+    // It does not reject the commit: it waits, behind it (PLAN.md 46).
+    let group = net.devs[b].group("alice@example.org").unwrap();
+    assert_eq!(group.state, GroupState::Active);
+    assert!(group.epoch < epoch);
+    assert!(!net.devs[b].notes.contains(&Notification::GroupRejected {
+        conv: "alice@example.org".parse().unwrap()
+    }));
+
+    // Once the key file can be fetched, the commit is applied, and Bob
+    // reads what was sent after it.
+    net.unreachable.clear();
+    let out = net.devs[b].engine.key_file(&bob, Some(listed)).unwrap();
+    net.devs[b].absorb(out);
+    net.run();
+    assert_eq!(net.devs[b].group("alice@example.org").unwrap().epoch, epoch);
+    net.send(a, "bob@example.net", "two");
+    assert_eq!(
+        net.devs[b].texts("alice@example.org").last().unwrap().0,
+        "two"
     );
 }
 
