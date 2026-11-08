@@ -130,6 +130,12 @@ for (const doc of docs) {
     font: inherit;
     outline: none;
   }
+  /* iOS zooms into inputs smaller than 16px when they take focus. */
+  @media (pointer: coarse) {
+    input {
+      font-size: max(16px, 1em);
+    }
+  }
   input::placeholder {
     color: var(--text-tertiary);
   }
