@@ -19,7 +19,7 @@ SET #general guests write
 SET #general retention server
 SET #general e2ee no
 SET #general send all
-OK id=k3f9q2 head=8812
+OK id=k3f9q2 head=8812 role=member
 msg #general hello!
 @seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam MSG #general hello!
 OK seq=8813

@@ -324,13 +324,7 @@ impl Inner {
             Command::List(page) => self.list(uid, reply, page).await,
             Command::Join { room } => self.join(uid, reply, &room).await,
             Command::Part { room, reason } => self.part(uid, &room, reason).await,
-            Command::Msg {
-                conv,
-                text,
-                relation,
-                file,
-                cid,
-            } => self.msg(uid, conv, text, relation, file, cid).await,
+            command @ Command::Msg { .. } => self.msg(uid, command).await,
             Command::Sync => self.sync(uid, reply).await,
             Command::History {
                 conv,
@@ -571,9 +565,16 @@ impl Inner {
                             }
                             // The creator is its first member, and its JOIN
                             // is event 1 (6.1).
-                            send_settings(reply, room_of(&guard)?);
+                            let info = room_of(&guard)?;
+                            send_settings(reply, info);
                             let head = guard.head.map_or(0, u64::from);
-                            reply.line(OkResponse::new().with_id(&guard.id).with_head(head));
+                            // `role=owner`: the creator owns it (6.1).
+                            reply.line(
+                                OkResponse::new()
+                                    .with_id(&guard.id)
+                                    .with_head(head)
+                                    .with_role(info_role(info, uid, true)),
+                            );
                             return Ok(None);
                         }
                         // Someone else created it meanwhile: join theirs.
@@ -612,12 +613,18 @@ impl Inner {
             st.add_member(&entry, &user);
             Self::broadcast_event(st, &event);
         }
-        send_settings(reply, room_of(st)?);
+        let info = room_of(st)?;
+        send_settings(reply, info);
         // A member has joined, so there is an event.
         let head = st.head.map_or(0, u64::from);
         // Queued under the room lock, so no later event of the room can
-        // overtake it (3.6).
-        reply.line(OkResponse::new().with_id(&st.id).with_head(head));
+        // overtake it (3.6). `role=` as in INFO (6.1).
+        reply.line(
+            OkResponse::new()
+                .with_id(&st.id)
+                .with_head(head)
+                .with_role(info_role(info, uid, true)),
+        );
         Ok(None)
     }
 

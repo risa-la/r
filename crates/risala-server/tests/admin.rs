@@ -541,7 +541,7 @@ async fn rooms_and_drop_of_a_configured_room() {
     exchange(&mut s, "bob", "history #general", &["OK id={*} more=0"]).await;
     let ok = join(&mut s, "bob", "#general").await;
     assert_ne!(value(&ok, "id"), old_id);
-    assert!(ok.ends_with(" head=1"), "{ok}");
+    assert!(ok.ends_with(" head=1 role=member"), "{ok}");
     exchange(
         &mut s,
         "op",
@@ -949,7 +949,7 @@ async fn a_guest_in_a_dropped_room() {
     // The new room is empty; the guest is not in it.
     exchange(&mut s, "sam", "msg #general hi", &["ERR {..}"]).await;
     let ok = join(&mut s, "alice", "#general").await;
-    assert!(ok.ends_with(" head=1"), "{ok}");
+    assert!(ok.ends_with(" head=1 role=member"), "{ok}");
     // The guest's session ends: no PART in the new room.
     exchange(&mut s, "op", "admin disconnect ~sam", &["OK"]).await;
     until_closed(s.client("sam")).await;

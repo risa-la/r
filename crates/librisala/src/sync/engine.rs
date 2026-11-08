@@ -472,6 +472,7 @@ impl SyncEngine {
             relation: draft.relation,
             file: draft.file.clone(),
             cid: None,
+            id: None,
         });
         check
             .validate()
@@ -1292,6 +1293,9 @@ impl SyncEngine {
             && let Ok(Some(id)) = ok.id()
         {
             let head = ok.head().ok().flatten();
+            // 6.1: the account's own role, so a room's creator knows at
+            // once that it owns it. Older servers leave it out.
+            let role = ok.role().ok().flatten();
             let floor = self.head_floor(&conv, sent, floor);
             let account = self.account;
             self.write(|tx| {
@@ -1305,6 +1309,9 @@ impl SyncEngine {
                     {
                         tx.apply_snapshot(&row, e)?;
                     }
+                }
+                if let Some(role) = role {
+                    tx.set_own_role(&row, role.0)?;
                 }
                 Ok(())
             })?;
@@ -1932,6 +1939,10 @@ impl SyncEngine {
                     relation: item.draft.relation,
                     file: item.draft.file,
                     cid: Some(item.cid),
+                    // The id the entry is bound to, so that the server
+                    // sends nothing to a room created again under the same
+                    // name (5.3).
+                    id: item.conv_id.clone(),
                 },
             };
             self.sending.insert(item.id);

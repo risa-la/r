@@ -771,7 +771,7 @@ async fn commands_waiting_on_a_dropped_configured_room_go_to_the_new_one() {
     assert_eq!(lines[0], format!("@id={old} DROP #general"), "{lines:?}");
     assert_eq!(
         lines.last().unwrap(),
-        &format!("@ref=j OK id={new} head=1"),
+        &format!("@ref=j OK id={new} head=1 role=member"),
         "{lines:?}"
     );
 }

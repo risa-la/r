@@ -115,9 +115,9 @@ async fn a_moderator_invites_kicks_and_bans() {
         .unwrap(),
         None
     );
-    // Her cache learns that she owns the room she made from INFO, since
-    // JOIN does not say.
-    assert_eq!(club.info().unwrap().unwrap().role, Some(Role::Member));
+    // Her cache knows she owns the room she made from JOIN's answer
+    // (6.1), and INFO agrees.
+    assert_eq!(club.info().unwrap().unwrap().role, Some(Role::Owner));
     let info = within("INFO", club.room_info()).await.unwrap();
     assert_eq!(info.role, Some(Role::Owner));
     assert_eq!(club.info().unwrap().unwrap().role, Some(Role::Owner));
@@ -322,6 +322,11 @@ async fn reports_reach_reviewers_and_resolving_reaches_the_other_device() {
     let alice_b = second_device(&server, &alice).await;
     let bob = registered_in(&server, "bob", "#club").await;
     let club = alice.conversation("#club").unwrap();
+    // JOIN's answer told alice she created and owns #club (6.1), and bob
+    // that he is a plain member.
+    assert_eq!(club.info().unwrap().unwrap().role, Some(Role::Owner));
+    let b_info = bob.conversation("#club").unwrap().info().unwrap().unwrap();
+    assert_eq!(b_info.role, Some(Role::Member));
     within("ROLE", club.set_role("bob@chat.test", Role::Moderator))
         .await
         .unwrap();

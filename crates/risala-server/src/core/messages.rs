@@ -30,7 +30,7 @@ use risala_proto::error::ErrorCode;
 use risala_proto::names::{Conv, Id, Seq, Uid};
 use risala_proto::server::OkResponse;
 use risala_proto::time::Timestamp;
-use risala_proto::types::{Cid, DEFAULT_LIMIT, FileUrl, MAX_REACTION, Relation, Role};
+use risala_proto::types::{DEFAULT_LIMIT, MAX_REACTION, Relation, Role};
 
 use super::commands::{
     Fail, Outcome, Reply, check_read, fail, gone_is_not_found, not_supported, room_of,
@@ -118,15 +118,18 @@ impl Inner {
     }
 
     /// MSG (5.3), in rooms, with a `reply`, `edit` or `react` tag.
-    pub(super) async fn msg(
-        &self,
-        uid: &Uid,
-        conv: Conv,
-        text: String,
-        relation: Option<Relation>,
-        file: Option<FileUrl>,
-        cid: Option<Cid>,
-    ) -> Outcome {
+    pub(super) async fn msg(&self, uid: &Uid, command: Command) -> Outcome {
+        let Command::Msg {
+            conv,
+            text,
+            relation,
+            file,
+            cid,
+            id,
+        } = command
+        else {
+            return Err(not_supported());
+        };
         // M5a: direct conversations. M8: files.
         let Conv::Room(room) = conv else {
             return Err(not_supported());
@@ -155,6 +158,11 @@ impl Inner {
             if let Some(seq) = earlier {
                 return Ok(Some(OkResponse::new().with_seq(seq)));
             }
+        }
+        // Meant for an older room of the same name: nothing is sent there
+        // (5.3). After the cid, so a resend still gets its seq.
+        if id.is_some_and(|id| id != st.id) {
+            return Err(fail(ErrorCode::NotFound, "no such room"));
         }
 
         let member = st.is_member(uid);

@@ -1200,7 +1200,10 @@ async fn every_device_gets_the_events_of_its_rooms() {
     }
     // A JOIN from a member changes nothing.
     w.send(&phone, "join #general").await;
-    assert_eq!(phone.lines().last().unwrap(), &format!("OK id={id} head=3"));
+    assert_eq!(
+        phone.lines().last().unwrap(),
+        &format!("OK id={id} head=3 role=member")
+    );
     assert_eq!(laptop.lines(), Vec::<String>::new());
     // Leaving on one device leaves on all.
     w.send(&laptop, "part #general").await;
@@ -1290,7 +1293,7 @@ async fn joining_a_new_room_creates_it() {
             .into_iter()
             .map(|l| format!("@ref=j {l}")),
     );
-    expected.push(format!("@ref=j OK id={id} head=1"));
+    expected.push(format!("@ref=j OK id={id} head=1 role=owner"));
     assert_eq!(lines, expected);
     assert_eq!(phone.lines(), [join]);
     // The creator is the owner (6.3).

@@ -294,6 +294,9 @@ pub enum Command {
         file: Option<FileUrl>,
         /// The `cid` tag, for safe resending (7.6).
         cid: Option<Cid>,
+        /// The `id` tag: the conversation's id (5.1) the client expects.
+        /// The server sends nothing if it differs (5.3).
+        id: Option<Id>,
     },
     /// `DELETE <conv> <seq>` (5.4): delete a message.
     Delete {
@@ -1381,6 +1384,7 @@ fn parse_msg(tags: &Tags, mut p: Params<'_>) -> Result<Command, ParseError> {
     }
     let file: Option<FileUrl> = tag_value(tags, "file", "file needs a URL")?;
     let cid = tag_value(tags, "cid", "cid needs a value")?;
+    let id = tag_value(tags, "id", "id needs a value")?;
 
     if file.is_some() && matches!(relation, Some(Relation::Edit(_) | Relation::React(_))) {
         return Err(ParseError::BadSyntax("file cannot go with edit or react"));
@@ -1394,6 +1398,7 @@ fn parse_msg(tags: &Tags, mut p: Params<'_>) -> Result<Command, ParseError> {
         relation,
         file,
         cid,
+        id,
     })
 }
 
@@ -1676,6 +1681,7 @@ impl Command {
                 relation,
                 file,
                 cid,
+                id,
             } => {
                 if let Some(relation) = relation {
                     b.tag(relation.key(), relation.seq());
@@ -1685,6 +1691,9 @@ impl Command {
                 }
                 if let Some(cid) = cid {
                     b.tag("cid", cid);
+                }
+                if let Some(id) = id {
+                    b.tag("id", id);
                 }
                 b.token(conv).text(text);
             }
@@ -2355,7 +2364,8 @@ mod tests {
                 text: "hi  there ".into(),
                 relation: None,
                 file: None,
-                cid: None
+                cid: None,
+                id: None,
             }
         );
         let c = rt("MSG bob@example.net one\\ntwo").command;
@@ -2438,6 +2448,14 @@ mod tests {
         );
         is_syntax("@cid MSG #a x");
         is_syntax("@cid=short MSG #a x");
+        // The conversation's id (5.3), after the cid.
+        let c = canon(
+            &format!("@id=k3f9q2abcdef;cid={cid} msg #a x"),
+            &format!("@cid={cid};id=k3f9q2abcdef MSG #a x"),
+        )
+        .command;
+        assert!(matches!(c, Command::Msg { id: Some(ref i), .. } if i.as_str() == "k3f9q2abcdef"));
+        is_syntax("@id MSG #a x");
         rt(&format!("@cid={} MSG #a x", "c".repeat(64)));
         is_too_long(&format!("@cid={} MSG #a x", "c".repeat(65)));
     }
@@ -3320,6 +3338,7 @@ mod tests {
             relation: None,
             file: None,
             cid: None,
+            id: None,
         });
         assert!(matches!(
             empty_msg.try_to_line(),
@@ -3335,6 +3354,7 @@ mod tests {
                 relation: None,
                 file: Some("https://f.example/x".parse().unwrap()),
                 cid: None,
+                id: None,
             },
         };
         assert_eq!(c1_ref.validate(), Ok(()));
@@ -3357,6 +3377,7 @@ mod tests {
                 relation: Some(Relation::Reply(seq(4))),
                 file: Some(URL.parse().unwrap()),
                 cid: None,
+                id: None,
             },
         };
         assert_eq!(good.validate(), Ok(()));

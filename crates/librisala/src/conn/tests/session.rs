@@ -316,6 +316,7 @@ async fn responses_are_matched_with_live_events_interleaved() {
         relation: None,
         file: None,
         cid: None,
+        id: None,
     });
     let (history, msg) = tokio::join!(history, msg);
 
@@ -583,6 +584,7 @@ async fn invalid_requests_are_not_sent() {
             relation: None,
             file: None,
             cid: None,
+            id: None,
         })
         .await
         .unwrap_err();
@@ -594,6 +596,7 @@ async fn invalid_requests_are_not_sent() {
             relation: None,
             file: None,
             cid: None,
+            id: None,
         })
         .await
         .unwrap_err();

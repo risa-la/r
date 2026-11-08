@@ -193,11 +193,11 @@ async fn two_guests_chat() {
         "alice C: join #general
          alice S: @seq=1;t={{*}};from=~alice;id={{id}} JOIN #general
          {}
-         alice S: OK id={{id}} head=1
+         alice S: OK id={{id}} head=1 role=member
          bob C: JOIN #General
          bob S: @seq=2;t={{*}};from=~bob;id={{id}} JOIN #general
          {}
-         bob S: OK id={{id}} head=2
+         bob S: OK id={{id}} head=2 role=member
          alice S: @seq=2;t={{*}};from=~bob;id={{id}} JOIN #general
          alice C: msg #general hi bob!
          alice S: @seq=3;t={{*}};from=~alice MSG #general hi bob!
@@ -301,7 +301,7 @@ async fn join_again_part_and_come_back() {
 
          bob C: join #general
          {}
-         bob S: OK id={{id}} head=2
+         bob S: OK id={{id}} head=2 role=member
 
          bob C: part #general see you later
          bob S: @seq=3;t={{*}};from=~bob PART #general see you later
@@ -323,7 +323,7 @@ async fn join_again_part_and_come_back() {
         "bob C: join #general
          bob S: @seq=5;t={{*}};from=~bob;id={{id}} JOIN #general
          {}
-         bob S: OK id={{id}} head=5
+         bob S: OK id={{id}} head=5 role=member
          alice S: @seq=5;t={{*}};from=~bob;id={{id}} JOIN #general
          alice C: part #general
          alice S: @seq=6;t={{*}};from=~alice PART #general
@@ -461,7 +461,7 @@ async fn info_about_the_server_and_rooms() {
          C: join #general
          S: @seq=1;t={{*}};from=~sam;id={{id}} JOIN #general
          {}
-         S: OK id={{id}} head=1
+         S: OK id={{id}} head=1 role=member
          C: @ref=i INFO #general
          S: @ref=i SET #general topic
          S: @ref=i SET #general public yes
@@ -542,7 +542,7 @@ async fn forbidden_and_not_found() {
          ann S: SET #readonly retention server
          ann S: SET #readonly e2ee no
          ann S: SET #readonly send all
-         ann S: OK id={id} head=2
+         ann S: OK id={id} head=2 role=member
          C: join #readonly
          S: @seq=3;t={*};from=~sam;id={id} JOIN #readonly
          S: SET #readonly topic
@@ -551,7 +551,7 @@ async fn forbidden_and_not_found() {
          S: SET #readonly retention server
          S: SET #readonly e2ee no
          S: SET #readonly send all
-         S: OK id={id} head=3
+         S: OK id={id} head=3 role=member
          ann S: @seq=3;t={*};from=~sam;id={id} JOIN #readonly
          C: msg #readonly may I?
          S: ERR forbidden{..}
@@ -594,7 +594,7 @@ async fn an_empty_config_room_has_head_0() {
          C: join #empty
          S: @seq=1;t={{*}};from=~sam;id={{id}} JOIN #empty
          {}
-         S: OK id={{id}} head=1
+         S: OK id={{id}} head=1 role=member
          C: sync
          S: CONV #empty {{id}} 1 0
          S: OK",
@@ -1155,7 +1155,7 @@ async fn a_restart_keeps_rooms_ids_and_history() {
          S: SET #general retention server
          S: SET #general e2ee no
          S: SET #general send all
-         S: OK id={id} head=6
+         S: OK id={id} head=6 role=member
          C: msg #general after the restart
          S: @seq=7;t={*};from=~sam MSG #general after the restart
          S: OK seq=7",

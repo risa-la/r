@@ -822,7 +822,7 @@ async fn join_sends_the_event_settings_and_ok() {
             .iter()
             .map(|l| format!("@ref=j {l}")),
     );
-    want.push(format!("@ref=j OK id={id} head=1"));
+    want.push(format!("@ref=j OK id={id} head=1 role=member"));
     assert_eq!(lines, want);
 
     // A second member: both see the JOIN.
@@ -830,7 +830,7 @@ async fn join_sends_the_event_settings_and_ok() {
     h.send(&bob, "join #general").await;
     let mut want = vec![format!("@seq=2;t={T};from=~bob;id={id} JOIN #general")];
     want.extend(default_settings("#general"));
-    want.push(format!("OK id={id} head=2"));
+    want.push(format!("OK id={id} head=2 role=member"));
     assert_eq!(bob.lines(), want);
     assert_eq!(
         sam.lines(),
@@ -840,7 +840,7 @@ async fn join_sends_the_event_settings_and_ok() {
     // Joining again: the settings and the OK, with no event.
     h.send(&bob, "join #general").await;
     let mut want = default_settings("#general");
-    want.push(format!("OK id={id} head=2"));
+    want.push(format!("OK id={id} head=2 role=member"));
     assert_eq!(bob.lines(), want);
     assert_eq!(sam.lines(), Vec::<String>::new());
 }
@@ -869,7 +869,7 @@ async fn join_shows_current_settings() {
             "SET #general retention server".into(),
             "SET #general e2ee no".into(),
             "SET #general send all".into(),
-            format!("OK id={id} head=3"),
+            format!("OK id={id} head=3 role=member"),
         ]
     );
 }
@@ -898,7 +898,7 @@ async fn guests_cannot_join_everywhere() {
     let lines = sam.lines();
     assert_eq!(
         lines.last().unwrap(),
-        &format!("OK id={} head=2", value(&lines[0], "id"))
+        &format!("OK id={} head=2 role=member", value(&lines[0], "id"))
     );
     h.send(&sam, "msg #readonly hello?").await;
     assert_eq!(sam.lines(), ["ERR forbidden guests may not send here"]);
@@ -932,7 +932,10 @@ async fn part_reaches_everyone_then_stops_events() {
     );
     // Joining again gets the same room.
     h.send(&bob, "join #general").await;
-    assert_eq!(bob.lines().last().unwrap(), &format!("OK id={id} head=5"));
+    assert_eq!(
+        bob.lines().last().unwrap(),
+        &format!("OK id={id} head=5 role=member")
+    );
 }
 
 #[tokio::test]
@@ -1763,7 +1766,7 @@ async fn racing_joins_create_a_room_once() {
     );
     assert_eq!(
         second_lines.last().unwrap(),
-        &format!("@ref={} OK id={id} head=2", &second[..1])
+        &format!("@ref={} OK id={id} head=2 role=member", &second[..1])
     );
     // The creator is the owner (6.3); the other is a member.
     h.send(&alice, "info #new").await;
@@ -2502,7 +2505,7 @@ async fn the_overview_session() {
             "SET #general retention server".into(),
             "SET #general e2ee no".into(),
             "SET #general send all".into(),
-            format!("OK id={id} head=4"),
+            format!("OK id={id} head=4 role=member"),
         ]
     );
     h.send(&c, "history #general before=4 limit=2").await;

@@ -666,9 +666,8 @@ pub struct ConversationInfo {
     /// and [`Conversation::room_info`](super::Conversation::room_info). An
     /// owner or moderator keeps the role after leaving; otherwise it is
     /// [`Role::Member`] while the account is in the room. `None` for no
-    /// role and not in the room, and for a direct conversation. JOIN does
-    /// not say it, so after creating a room, ask `room_info` to learn that
-    /// the account owns it.
+    /// role and not in the room, and for a direct conversation. JOIN's
+    /// answer says it, so a room's creator is shown as its owner at once.
     pub role: Option<Role>,
     /// Whether the room is for announcements (`send mods`, 6.2): only its
     /// owners and moderators, and server operators, send messages, and

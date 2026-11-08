@@ -140,7 +140,7 @@ S: SET #general guests write
 S: SET #general retention server
 S: SET #general e2ee no
 S: SET #general send all
-S: OK id=k3f9q2 head=8812
+S: OK id=k3f9q2 head=8812 role=member
 C: history #general before=8812 limit=2
 S: @seq=8810;t=2026-11-06T15:30:11.004Z;from=alice@example.org MSG #general anyone around?
 S: @seq=8811;t=2026-11-06T15:31:40.950Z;from=bob@example.net MSG #general yep
@@ -346,7 +346,7 @@ its command.
 | `deleted` | server | none | The event's content was removed (5.4) |
 | `retry` | server | seconds | With `ERR rate-limited` or `ERR unavailable`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
-| `id` | server, client | id | On a JOIN event, a DROP line or a report's lines: the conversation's id (5.8, 6.1, 10.4). On DELETE: the conversation's id the client expects (5.4) |
+| `id` | server, client | id | On a JOIN event, a DROP line or a report's lines: the conversation's id (5.8, 6.1, 10.4). On MSG and DELETE: the conversation's id the client expects (5.3, 5.4) |
 | `frank` | client | base64 | On ENC: the franking commitment (12.8) |
 
 ### 3.3. Parameters
@@ -1033,6 +1033,14 @@ The target `<seq>` MUST be a message in the same conversation. It MUST
 NOT be deleted, and MUST NOT itself be an edit or a reaction. Otherwise
 the server replies `ERR not-found`. A reply may target another reply.
 
+A MSG MAY carry an `id` tag with the conversation's id (5.1), as DELETE
+may (5.4). If the conversation's id is different, the server replies
+`ERR not-found` and sends nothing. A room can be dropped and created
+again (10.4) between a client's last look at it and its message, and
+the tag keeps the message, or a reply's or edit's target seq, out of the
+new room. Clients SHOULD send it. The server checks the cid (7.6) first,
+so a message resent with its cid still gets its seq.
+
 A client that does not understand these tags still shows the text, so
 older clients degrade gracefully: an edit appears as a new message and a
 reaction as a short message.
@@ -1393,7 +1401,8 @@ then `OK more=<0 or 1>`
 JOIN <room>
 ```
 
-→ JOIN event, then snapshot SET lines, then `OK id=<id> head=<seq>`
+→ JOIN event, then snapshot SET lines, then
+`OK id=<id> head=<seq> role=<role>`
 
 Every JOIN event carries the room's id (5.1) in the `id` tag, live and in
 HISTORY. An identity's other devices also receive its JOIN, and one of
@@ -1404,8 +1413,10 @@ discards what it has stored, as in 7.1, before storing the event.
 
 - **The room exists and you may join it.** The server records a JOIN
   event, sends the room's settings as snapshot SET lines, and replies
-  `OK id=<id> head=<seq>`, where `<id>` is the room's id (5.1) and
-  `<seq>` its newest seq.
+  `OK id=<id> head=<seq> role=<role>`, where `<id>` is the room's id
+  (5.1), `<seq>` its newest seq, and `<role>` your role in it, as in
+  INFO (6.2). The creator of a room learns from it that they are its
+  owner.
 - **You are already a member.** The server sends the settings and the OK,
   but records no event.
 - **The room does not exist.** The server MAY create it, if the user is

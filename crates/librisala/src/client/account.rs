@@ -990,6 +990,7 @@ pub(crate) fn check_draft(conv: &Conv, draft: &Draft) -> Result<(), ClientError>
         relation: draft.relation,
         file: draft.file.clone(),
         cid: None,
+        id: None,
     })
     .validate()
     .map_err(|e| ClientError::Invalid(format!("message: {e}")))

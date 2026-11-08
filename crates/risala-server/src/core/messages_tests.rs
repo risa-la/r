@@ -939,3 +939,23 @@ async fn shortening_retention_expires_stored_events_at_once() {
     assert_eq!(op.lines(), ["OK"]);
     assert_eq!(stored(&h, "#general"), [format!("2 {ALICE} MSG")]);
 }
+
+/// MSG with the conversation's id (5.3): a different id sends nothing, and
+/// the cid comes first, so a resend still gets its seq.
+#[tokio::test]
+async fn msg_with_a_stale_id_sends_nothing() {
+    let mut h = Harness::new();
+    let (mut sam, id) = h.joined("sam", "#general").await;
+    let cid = "0123456789abcdef";
+    h.send(&sam, &format!("@id={id};cid={cid} msg #general hi"))
+        .await;
+    assert_eq!(sam.lines().last().unwrap(), "OK seq=2");
+    // The same cid with a stale id: the earlier seq, nothing new.
+    h.send(&sam, &format!("@id=k3f9q2abcdef;cid={cid} msg #general hi"))
+        .await;
+    assert_eq!(sam.lines(), ["OK seq=2"]);
+    // A new message meant for an older room of the same name.
+    h.send(&sam, "@id=k3f9q2abcdef msg #general hello").await;
+    assert_eq!(sam.lines(), ["ERR not-found no such room"]);
+    assert_eq!(stored(&h, "#general").len(), 2);
+}

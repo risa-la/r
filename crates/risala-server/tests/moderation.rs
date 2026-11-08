@@ -1289,7 +1289,10 @@ async fn removed_guests_leave_once() {
     assert!(answer[0].starts_with("ERR forbidden"), "{answer:?}");
     let mut kim = server.guest("kim").await;
     let answer = command(&mut kim, "join #r").await;
-    assert!(answer.last().unwrap().ends_with(" head=10"), "{answer:?}");
+    assert!(
+        answer.last().unwrap().ends_with(" head=10 role=member"),
+        "{answer:?}"
+    );
     server.stop().await;
 }
 
