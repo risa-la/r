@@ -1,0 +1,90 @@
+---
+// A shell session. Lines starting with "$ " are commands; the rest is output.
+// Rooms, people and fingerprints get the colors the client gives them.
+interface Props {
+  lines: string[];
+}
+const { lines } = Astro.props;
+
+type Seg = { text: string; role?: string };
+
+function role(word: string): string | undefined {
+  if (word.startsWith("#")) return "location";
+  if (/^<?~/.test(word)) return "mention";
+  if (/^sha256:/.test(word) || /^\[\d+\]$/.test(word) || /^\d\d:\d\d$/.test(word)) return "tertiary";
+}
+
+function words(text: string): Seg[] {
+  return text.split(/(\s+)/).map((w) => ({ text: w, role: role(w) }));
+}
+
+const parsed = lines.map((line) => {
+  if (!line.startsWith("$ ")) return { kind: "output", segs: words(line) };
+  const [program, command, ...rest] = line.slice(2).split(" ");
+  return {
+    kind: "command",
+    segs: [
+      { text: "$ ", role: "mode" },
+      { text: program, role: "program" },
+      ...(command ? [{ text: " " }, { text: command, role: "verb" }] : []),
+      ...(rest.length ? [{ text: " " }, ...words(rest.join(" "))] : []),
+    ],
+  };
+});
+---
+
+<pre class="transcript"><code>{
+  parsed.map(({ kind, segs }) => (
+    <span class:list={["line", kind]}>{segs.map((s) => (s.role ? <span class={s.role}>{s.text}</span> : s.text))}{"\n"}</span>
+  ))
+}</code></pre>
+
+<style>
+  .transcript {
+    margin: 0;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+  }
+  .line {
+    display: block;
+  }
+  /* Phones: wrap long commands rather than scroll sideways. */
+  @media (max-width: 640px) {
+    .transcript {
+      font-size: 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+  }
+  .command {
+    color: var(--text);
+  }
+  .command + .output,
+  .output + .command {
+    margin-top: 2px;
+  }
+  .output + .command {
+    margin-top: 10px;
+  }
+  .program {
+    font-weight: 700;
+  }
+  .verb {
+    color: var(--ink);
+    font-weight: 700;
+  }
+  .location {
+    color: var(--location);
+  }
+  .mention {
+    color: var(--mention);
+  }
+  .tertiary {
+    color: var(--text-tertiary);
+  }
+  .mode {
+    color: var(--mode);
+  }
+</style>

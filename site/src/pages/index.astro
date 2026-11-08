@@ -1,0 +1,233 @@
+---
+import { getCollection } from "astro:content";
+import Base from "../layouts/Base.astro";
+import Breadcrumb from "../components/Breadcrumb.astro";
+import Glyph from "../components/Glyph.astro";
+import Transcript from "../components/Transcript.astro";
+import { REPO_URL, docOrder, docTitle, docVersion } from "../docs";
+
+const docs = (await getCollection("docs"))
+  .sort((a, b) => docOrder(a.id, b.id))
+  .map((doc) => ({
+    id: doc.id,
+    title: docTitle(doc.id, doc.body),
+    version: docVersion(doc.body),
+  }));
+
+const session = [
+  "$ nix shell github:risa-la/r#risala",
+  "$ risala guest chat.example.org sam",
+  "signed in to chat.example.org as ~sam",
+  "$ risala join chat.example.org #general",
+  "joined #general (1 events stored)",
+  "$ risala send chat.example.org #general hello!",
+  "sent to #general as 2",
+  "$ risala log chat.example.org #general",
+  "[1] 05:39 * ~sam joined",
+  "[2] 05:39 <~sam> hello!",
+];
+
+const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" | "presence"; title: string; text: string }[] = [
+  { glyph: "#", tint: "location", title: "Independent servers", text: "No federation, and no server is special. Every conversation lives on exactly one server." },
+  { glyph: "@", tint: "mention", title: "Portable identity", text: "alice@example.org is whoever holds a key listed on example.org. The same identity works on any server." },
+  { glyph: "◆", tint: "ink", title: "End-to-end encrypted", text: "Direct conversations and private rooms use MLS. Devices keep their history keys, so encrypted history still syncs and works offline." },
+  { glyph: "Q", tint: "presence", title: "Post-quantum", text: "ML-KEM hybrid key exchange in TLS, X-Wing in MLS, and ML-DSA signatures for identities and devices." },
+  { glyph: "↺", tint: "ink", title: "Gapless history", text: "Every event has a sequence number, so a client that reconnects fetches exactly what it missed." },
+  { glyph: "$", tint: "mode", title: "Usable by hand", text: "Plain UTF-8 text lines. Everything outside encrypted conversations works from a terminal." },
+];
+---
+
+<Base>
+  <div class="home">
+    <section class="panel intro">
+      <img class="hudhud" src="/hudhud.png" alt="" width="901" height="1019" />
+      <div>
+        <h1>a chat protocol for independent servers</h1>
+        <p>
+          Rooms, guests, replies, reactions and stored history, in plain UTF-8 text lines over TLS.
+          Direct conversations and private rooms are end-to-end encrypted with MLS, using
+          post-quantum algorithms throughout.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="/spec/">▲ read the spec</a>
+          <a class="button" href={REPO_URL}>view source</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><Breadcrumb parts={[{ label: "features" }]} /></div>
+      <ul class="features">
+        {
+          features.map((f) => (
+            <li>
+              <Glyph symbol={f.glyph} tint={f.tint} />
+              <div>
+                <strong>{f.title}</strong>
+                <span>{f.text}</span>
+              </div>
+            </li>
+          ))
+        }
+      </ul>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><Breadcrumb parts={[{ label: "try it" }]} /></div>
+      <div class="panel-body"><Transcript lines={session} /></div>
+    </section>
+
+    <section class="panel docs">
+      <div class="panel-head"><Breadcrumb parts={[{ label: "documents" }]} /></div>
+      <div class="columns label" aria-hidden="true">
+        <span>id / title</span>
+        <span>version</span>
+      </div>
+      <ul>
+        {
+          docs.map((doc) => (
+            <li>
+              <a href={`/${doc.id}/`}>
+                <Glyph symbol="§" />
+                <span class="id">{doc.id}</span>
+                <span class="title">{doc.title}</span>
+                <span class="version">{doc.version}</span>
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+    </section>
+  </div>
+</Base>
+
+<style>
+  .home {
+    display: grid;
+    gap: var(--panel-inset);
+    margin: 0 auto;
+  }
+  .intro {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    align-items: center;
+    gap: 36px;
+    padding: 36px;
+  }
+  .hudhud {
+    width: auto;
+    height: 150px;
+    image-rendering: pixelated;
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 20px;
+    line-height: 1.35;
+    font-weight: 800;
+    text-transform: lowercase;
+  }
+  p {
+    margin: 0;
+    max-width: 60ch;
+    color: var(--text-tertiary);
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--inline);
+    margin-top: 24px;
+  }
+  .features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0 var(--inline);
+  }
+  .features li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--row-padding);
+    padding: var(--row-padding);
+  }
+  .features :global(.glyph) {
+    position: relative;
+    top: 4px;
+  }
+  .features div {
+    display: grid;
+  }
+  .features strong {
+    font-weight: 700;
+    font-size: 13px;
+  }
+  .features span {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  .columns,
+  .docs a {
+    display: grid;
+    grid-template-columns: var(--glyph) 14ch 1fr auto;
+    gap: 0 12px;
+    align-items: center;
+  }
+  .columns {
+    padding: 4px calc(var(--panel-padding) + var(--row-padding));
+    border-bottom: 1px solid var(--rule);
+  }
+  .columns span:first-child {
+    grid-column: 2 / 4;
+  }
+  ul {
+    list-style: none;
+    margin: 0;
+    padding: var(--inline);
+  }
+  .docs a {
+    padding: var(--row-padding);
+    border-radius: var(--row-radius);
+    color: var(--text);
+    text-decoration: none;
+  }
+  .docs a:hover {
+    background: color-mix(in srgb, var(--ink) 9%, transparent);
+  }
+  .id {
+    color: var(--mode);
+  }
+  .title {
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .version {
+    color: var(--text-tertiary);
+    font-size: 12px;
+  }
+  @media (max-width: 640px) {
+    .intro {
+      grid-template-columns: 1fr;
+      justify-items: center;
+      text-align: center;
+      padding: 28px var(--panel-padding);
+    }
+    .hudhud {
+      height: 110px;
+    }
+    .actions {
+      justify-content: center;
+    }
+    .columns {
+      display: none;
+    }
+    .docs a {
+      grid-template-columns: var(--glyph) 1fr auto;
+    }
+    .title {
+      white-space: normal;
+    }
+    .id {
+      display: none;
+    }
+  }
+</style>

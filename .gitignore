@@ -62,3 +62,8 @@ xcuserdata/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Site (Astro)
+site/node_modules/
+site/dist/
+site/.astro/

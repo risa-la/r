@@ -1,0 +1,32 @@
+---
+// The small mark at the start of a row: a rounded square for documents and
+// rooms, a circle for people. Decorative; the row's text names the thing.
+// After Glyph.swift.
+interface Props {
+  symbol: string;
+  kind?: "room" | "person";
+  tint?: "ink" | "mode" | "location" | "mention" | "presence" | "wax";
+}
+const { symbol, kind = "room", tint = "ink" } = Astro.props;
+---
+
+<span class:list={["glyph", kind]} style={`--tint: var(--${tint})`} aria-hidden="true">{symbol}</span>
+
+<style>
+  .glyph {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: var(--glyph);
+    height: var(--glyph);
+    border-radius: var(--glyph-radius);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--tint);
+    background: color-mix(in srgb, var(--tint) 18%, transparent);
+  }
+  .person {
+    border-radius: 50%;
+  }
+</style>

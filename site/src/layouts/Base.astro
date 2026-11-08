@@ -1,0 +1,126 @@
+---
+import "../styles/global.css";
+import JumpTo from "../components/JumpTo.astro";
+import ThemeToggle from "../components/ThemeToggle.astro";
+import { REPO_URL } from "../docs";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+const { title, description = "risala is a chat protocol for independent servers, made of plain UTF-8 text lines over TLS." } = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title ? `${title} · risala` : "risala"}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/png" href="/hudhud.png" />
+    <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#141518" media="(prefers-color-scheme: dark)" />
+    <script is:inline>
+      const appearance = localStorage.getItem("appearance");
+      if (appearance) document.documentElement.dataset.theme = appearance;
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">
+        <img src="/hudhud.png" alt="" width="22" height="25" />
+        <span>risala</span>
+      </a>
+      <nav aria-label="Site">
+        <a href="/spec/">spec</a>
+        <a href={REPO_URL}>source</a>
+      </nav>
+      <div class="tools">
+        <JumpTo />
+        <ThemeToggle />
+      </div>
+    </header>
+    <main>
+      <slot />
+    </main>
+    <footer>
+      <span>the spec is cc by 4.0</span>
+      <span aria-hidden="true">·</span>
+      <span>everything else apache-2.0</span>
+    </footer>
+  </body>
+</html>
+
+<style>
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    height: var(--topbar);
+    /* Line up with the panels below. */
+    padding: 0
+      max(
+        calc(var(--panel-inset) + var(--panel-padding)),
+        calc((100% - var(--site-width)) / 2 + var(--panel-padding))
+      );
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: var(--inline);
+    font-weight: 800;
+    color: var(--mode);
+    text-decoration: none;
+  }
+  .brand img {
+    image-rendering: pixelated;
+  }
+  nav {
+    display: flex;
+    gap: 16px;
+    font-size: 13px;
+  }
+  nav a {
+    color: var(--text-secondary);
+    text-decoration: none;
+  }
+  nav a:hover {
+    color: var(--text);
+  }
+  .tools {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  main {
+    flex: 1;
+    width: 100%;
+    max-width: calc(var(--site-width) + 2 * var(--panel-inset));
+    margin: 0 auto;
+    padding: 0 var(--panel-inset);
+  }
+  footer {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--inline);
+    padding: 24px var(--panel-padding);
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  @media (max-width: 560px) {
+    nav {
+      display: none;
+    }
+    .tools :global(kbd) {
+      display: none;
+    }
+  }
+</style>

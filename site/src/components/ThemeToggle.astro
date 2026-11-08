@@ -1,0 +1,38 @@
+---
+// Appearance follows the system unless the person picks light or dark,
+// as in the Apple client's settings.
+---
+
+<button class="button theme" type="button" aria-label="Appearance">system</button>
+
+<script>
+  const modes = ["system", "light", "dark"] as const;
+  const button = document.querySelector<HTMLButtonElement>("button.theme")!;
+  const show = () => {
+    const mode = localStorage.getItem("appearance") ?? "system";
+    button.textContent = mode;
+    button.setAttribute("aria-label", `Appearance: ${mode}`);
+  };
+  button.addEventListener("click", () => {
+    const current = localStorage.getItem("appearance") ?? "system";
+    const next = modes[(modes.indexOf(current as (typeof modes)[number]) + 1) % modes.length];
+    if (next === "system") {
+      localStorage.removeItem("appearance");
+      delete document.documentElement.dataset.theme;
+    } else {
+      localStorage.setItem("appearance", next);
+      document.documentElement.dataset.theme = next;
+    }
+    show();
+  });
+  show();
+</script>
+
+<style>
+  .theme {
+    min-height: 32px;
+    min-width: 8ch;
+    color: var(--text-tertiary);
+    background: transparent;
+  }
+</style>

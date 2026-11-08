@@ -1,0 +1,50 @@
+---
+// The heading of a panel: the app name, then where you are.
+// After Breadcrumb.swift.
+interface Props {
+  parts: { label: string; href?: string }[];
+}
+const { parts } = Astro.props;
+---
+
+<div class="breadcrumb" role="heading" aria-level="2">
+  <a class="root" href="/">risala</a>
+  {
+    parts.map(({ label, href }) => (
+      <>
+        <span class="sep" aria-hidden="true">/</span>
+        {href ? <a class="part" href={href}>{label}</a> : <span class="part">{label}</span>}
+      </>
+    ))
+  }
+</div>
+
+<style>
+  .breadcrumb {
+    display: flex;
+    gap: var(--inline);
+    min-width: 0;
+    font-weight: 700;
+    font-size: 13px;
+    text-transform: lowercase;
+    white-space: nowrap;
+  }
+  a {
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+  .root {
+    color: var(--mode);
+  }
+  .sep {
+    color: var(--rule);
+    font-weight: 400;
+  }
+  .part {
+    color: var(--location);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+</style>

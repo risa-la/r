@@ -1,0 +1,215 @@
+/*
+ * The terminal look of the Apple client (clients/apple, branch
+ * apple/terminal-foundations): framed panels on a surface, JetBrains Mono
+ * throughout, and a breadcrumb heading. Colors are the client's Palette
+ * colorsets, by role, with the same light and dark values. Text roles reach
+ * 4.5:1 on --panel in both appearances.
+ */
+
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/600.css";
+@import "@fontsource/jetbrains-mono/700.css";
+@import "@fontsource/jetbrains-mono/800.css";
+
+:root {
+  color-scheme: light;
+  --surface: #f2f2f7;
+  --panel: #ffffff;
+  --rule: #d8d9de;
+  --text: #1c1d21;
+  --text-secondary: #4a505b;
+  --text-tertiary: #666c78;
+  --ink: #22357a;
+  --on-ink: #ffffff;
+  --mode: #0e7383;
+  --location: #6a3bbf;
+  --mention: #875a00;
+  --presence: #1e7a3c;
+  --wax: #b4372b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface: #141518;
+    --panel: #1c1d21;
+    --rule: #2b2d33;
+    --text: #d7dae0;
+    --text-secondary: #a3a9b5;
+    --text-tertiary: #848b9a;
+    --ink: #8fa2f0;
+    --on-ink: #141518;
+    --mode: #5cc6d6;
+    --location: #b48cf2;
+    --mention: #e5c07b;
+    --presence: #7fd99a;
+    --wax: #e07a6f;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #141518;
+  --panel: #1c1d21;
+  --rule: #2b2d33;
+  --text: #d7dae0;
+  --text-secondary: #a3a9b5;
+  --text-tertiary: #848b9a;
+  --ink: #8fa2f0;
+  --on-ink: #141518;
+  --mode: #5cc6d6;
+  --location: #b48cf2;
+  --mention: #e5c07b;
+  --presence: #7fd99a;
+  --wax: #e07a6f;
+}
+
+/* Metrics, from the client's Layout.swift. */
+:root {
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --panel-inset: 8px;
+  --panel-radius: 14px;
+  --panel-padding: 16px;
+  --row-radius: 10px;
+  --row-padding: 10px;
+  --inline: 8px;
+  --glyph: 20px;
+  --glyph-radius: 6px;
+  --topbar: 52px;
+  /* The text column of a document, and the whole site's width: that column
+     in its panel, plus the contents sidebar beside it. */
+  --measure: 88ch;
+  --sidebar: 280px;
+  --site-width: calc(var(--measure) + 2 * var(--panel-padding) + var(--panel-inset) + var(--sidebar));
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-text-size-adjust: 100%;
+  scroll-padding-top: calc(var(--topbar) + 16px);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+a {
+  color: var(--ink);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+
+a:hover {
+  text-decoration-thickness: 2px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--ink) 28%, transparent);
+}
+
+/* Browsers give these their own monospace face and size; use ours. */
+pre,
+code,
+kbd,
+samp {
+  font-family: var(--mono);
+  font-size: 1em;
+}
+
+kbd {
+  font: inherit;
+  font-size: 11px;
+  padding: 0 5px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  color: var(--text-tertiary);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* A framed card, inset from the surface. */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: var(--panel-radius);
+  min-width: 0;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--inline);
+  padding: var(--panel-padding) var(--panel-padding) var(--inline);
+}
+
+.panel-body {
+  padding: var(--inline) var(--panel-padding) var(--panel-padding);
+}
+
+/* Small lowercase labels: column headings, metadata keys. */
+.label {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-transform: lowercase;
+}
+
+/* Buttons, after TerminalButtonStyle.swift. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--row-radius);
+  border: 0;
+  font: inherit;
+  font-size: 12px;
+  text-transform: lowercase;
+  text-decoration: none;
+  cursor: pointer;
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+.button:hover {
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  text-decoration: none;
+}
+
+.button.primary {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--on-ink);
+  background: var(--ink);
+}
+
+.button.primary:hover {
+  background: color-mix(in srgb, var(--ink) 88%, var(--text));
+}

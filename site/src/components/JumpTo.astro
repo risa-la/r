@@ -1,0 +1,162 @@
+---
+// Jump to any document or section. Opens with "/" or Cmd/Ctrl-K.
+import { getCollection, render } from "astro:content";
+import { docOrder, docTitle } from "../docs";
+
+const docs = (await getCollection("docs")).sort((a, b) => docOrder(a.id, b.id));
+const items: { title: string; context: string; href: string }[] = [];
+for (const doc of docs) {
+  const { headings } = await render(doc);
+  items.push({ title: docTitle(doc.id, doc.body), context: doc.id, href: `/${doc.id}/` });
+  for (const h of headings.filter((h) => (h.depth === 2 || h.depth === 3) && h.slug !== "contents")) {
+    items.push({ title: h.text, context: doc.id, href: `/${doc.id}/#${h.slug}` });
+  }
+}
+---
+
+<button class="button open" type="button" aria-haspopup="dialog">
+  jump to… <kbd>/</kbd>
+</button>
+
+<dialog class="jump panel" aria-label="Jump to">
+  <input type="search" placeholder="jump to a document or section" autocomplete="off" spellcheck="false" />
+  <ul role="listbox"></ul>
+  <script type="application/json" set:html={JSON.stringify(items)} />
+</dialog>
+
+<script>
+  type Item = { title: string; context: string; href: string };
+
+  const dialog = document.querySelector<HTMLDialogElement>("dialog.jump")!;
+  const input = dialog.querySelector("input")!;
+  const list = dialog.querySelector("ul")!;
+  const items: Item[] = JSON.parse(dialog.querySelector("script")!.textContent!);
+  let shown: Item[] = [];
+  let active = 0;
+
+  function draw() {
+    const q = input.value.trim().toLowerCase();
+    shown = items.filter((i) => `${i.context} ${i.title}`.toLowerCase().includes(q)).slice(0, 50);
+    active = Math.min(active, Math.max(shown.length - 1, 0));
+    list.replaceChildren(
+      ...shown.map((item, n) => {
+        const li = document.createElement("li");
+        li.setAttribute("role", "option");
+        li.setAttribute("aria-selected", String(n === active));
+        const a = document.createElement("a");
+        a.href = item.href;
+        a.tabIndex = -1;
+        const ctx = document.createElement("span");
+        ctx.className = "ctx";
+        ctx.textContent = item.context;
+        const title = document.createElement("span");
+        title.textContent = item.title;
+        a.append(ctx, title);
+        li.append(a);
+        li.addEventListener("mousemove", () => {
+          if (active !== n) {
+            active = n;
+            draw();
+          }
+        });
+        return li;
+      }),
+    );
+    list.children[active]?.scrollIntoView({ block: "nearest" });
+  }
+
+  function open() {
+    input.value = "";
+    active = 0;
+    draw();
+    dialog.showModal();
+  }
+
+  document.querySelector("button.open")!.addEventListener("click", open);
+  dialog.addEventListener("click", (e) => {
+    if (e.target === dialog) dialog.close();
+  });
+  input.addEventListener("input", () => {
+    active = 0;
+    draw();
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      active = (active + step + shown.length) % Math.max(shown.length, 1);
+      draw();
+    } else if (e.key === "Enter" && shown[active]) {
+      e.preventDefault();
+      dialog.close();
+      location.href = shown[active].href;
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (dialog.open) return;
+    const typing = (e.target as HTMLElement).closest("input, textarea, [contenteditable]");
+    if ((e.key === "/" && !typing) || (e.key === "k" && (e.metaKey || e.ctrlKey))) {
+      e.preventDefault();
+      open();
+    }
+  });
+</script>
+
+<style>
+  .open {
+    min-height: 32px;
+    color: var(--text-tertiary);
+    background: var(--panel);
+    border: 1px solid var(--rule);
+  }
+  .jump {
+    width: min(640px, calc(100vw - 2 * var(--panel-inset)));
+    margin: 12vh auto auto;
+    padding: 0;
+    color: var(--text);
+    overflow: hidden;
+  }
+  .jump::backdrop {
+    background: color-mix(in srgb, var(--surface) 70%, transparent);
+    backdrop-filter: blur(2px);
+  }
+  input {
+    width: 100%;
+    padding: var(--panel-padding);
+    border: 0;
+    border-bottom: 1px solid var(--rule);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    outline: none;
+  }
+  input::placeholder {
+    color: var(--text-tertiary);
+  }
+  ul {
+    list-style: none;
+    margin: 0;
+    padding: var(--inline);
+    max-height: 50vh;
+    overflow: auto;
+  }
+  ul:empty {
+    display: none;
+  }
+  ul :global(a) {
+    display: flex;
+    gap: 12px;
+    padding: 6px var(--row-padding);
+    border-radius: var(--row-radius);
+    color: var(--text);
+    text-decoration: none;
+  }
+  ul :global([aria-selected="true"] a) {
+    background: color-mix(in srgb, var(--ink) 14%, transparent);
+  }
+  ul :global(.ctx) {
+    flex: none;
+    width: 11ch;
+    color: var(--mode);
+  }
+</style>
