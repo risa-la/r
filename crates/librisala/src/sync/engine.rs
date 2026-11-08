@@ -415,7 +415,7 @@ impl SyncEngine {
                 first,
                 last,
             } => self.on_related(&conv, row, epoch, first, last, &reply)?,
-            Pending::E2ee(pending) => self.on_e2ee(req, pending, reply)?,
+            Pending::E2ee(pending) => self.on_e2ee(pending, reply)?,
         }
         Ok(self.finish())
     }
@@ -785,7 +785,10 @@ impl SyncEngine {
         if self.e2ee.as_ref().is_some_and(|e| e.recovery_connection())
             && !super::e2ee::recovery_may_send(&command)
         {
-            warn!(verb = command.verb(), "not sent on the recovery key's connection");
+            warn!(
+                verb = command.verb(),
+                "not sent on the recovery key's connection"
+            );
             return req;
         }
         self.pending.insert(req, pending);

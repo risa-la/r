@@ -549,7 +549,11 @@ impl Account {
                     .await?
                     .into_iter()
                     .filter(|k| k.label == "recovery")
-                    .filter_map(|k| super::identity::parse_public_key(&k.public_key).ok().map(|(k, _)| k))
+                    .filter_map(|k| {
+                        super::identity::parse_public_key(&k.public_key)
+                            .ok()
+                            .map(|(k, _)| k)
+                    })
                     .collect()
             } else {
                 self.shared()

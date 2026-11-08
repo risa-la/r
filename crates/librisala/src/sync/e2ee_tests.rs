@@ -24,9 +24,9 @@ use risala_proto::time::Timestamp;
 use super::*;
 use crate::addr::ServerAddr;
 use crate::e2ee::content::Control;
-use risala_mls::RisalaConversation;
 use crate::store::e2ee::GroupState;
 use crate::store::{AccountId, Draft, OutboxState, Store};
+use risala_mls::RisalaConversation;
 
 const T0: u64 = 1_800_000_000_000;
 
@@ -1619,7 +1619,9 @@ fn a_leaf_with_someone_elses_key_is_not_confirmed() {
             let row = tx
                 .conv_by_name(account, &"bob@example.net".parse().unwrap())?
                 .unwrap();
-            Ok(crate::e2ee::group::current_leaves(tx, &row).unwrap().unwrap())
+            Ok(crate::e2ee::group::current_leaves(tx, &row)
+                .unwrap()
+                .unwrap())
         })
         .unwrap()
         .0;
@@ -1670,10 +1672,7 @@ impl Net {
         let out = self.devs[b].engine.join(&room);
         self.devs[b].absorb(out);
         self.run();
-        assert_eq!(
-            self.devs[b].group(name).unwrap().state,
-            GroupState::Active
-        );
+        assert_eq!(self.devs[b].group(name).unwrap().state, GroupState::Active);
         c
     }
 }
@@ -1700,8 +1699,7 @@ fn a_room_group_with_an_outsider_is_not_joined_again() {
         .store
         .write(|tx| {
             let provider = device.provider(tx.mls_storage());
-            let conversation =
-                RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All);
+            let conversation = RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All);
             let group =
                 risala_mls::create_group(&provider, &device.signer(), &device.uid, &conversation)
                     .unwrap();
@@ -1776,7 +1774,12 @@ fn a_commit_that_fails_the_checks_and_mls_is_rejected() {
     let epoch = net.convs[s].epoch.unwrap() + 1;
     net.convs[s].epoch = Some(epoch);
     net.convs[s].group_info = Some(commit.group_info);
-    net.forge_commit(s, "bob@example.net", epoch, bad_membership_tag(&commit.commit));
+    net.forge_commit(
+        s,
+        "bob@example.net",
+        epoch,
+        bad_membership_tag(&commit.commit),
+    );
 
     // Alice's device rejects it, rather than join again (12.6).
     assert_eq!(
@@ -1911,8 +1914,14 @@ fn keys_wait_while_any_own_device_is_unconfirmed() {
     // Alice confirms her third device, and not yet her second: the second
     // would read the history keys too, so none are sent (12.9).
     net.confirm(a1, a3, true);
-    assert_eq!(net.devs[a2].store_enc_states("bob@example.net"), [Some(Pending)]);
-    assert_eq!(net.devs[a3].store_enc_states("bob@example.net"), [Some(Pending)]);
+    assert_eq!(
+        net.devs[a2].store_enc_states("bob@example.net"),
+        [Some(Pending)]
+    );
+    assert_eq!(
+        net.devs[a3].store_enc_states("bob@example.net"),
+        [Some(Pending)]
+    );
 
     // She declines the second. Its leaves are removed from every group,
     // and then the third gets the keys.
@@ -1924,7 +1933,9 @@ fn keys_wait_while_any_own_device_is_unconfirmed() {
             dev.store
                 .write(|tx| {
                     let row = tx.conv_by_name(account, &conv.parse().unwrap())?.unwrap();
-                    Ok(crate::e2ee::group::current_leaves(tx, &row).unwrap().unwrap())
+                    Ok(crate::e2ee::group::current_leaves(tx, &row)
+                        .unwrap()
+                        .unwrap())
                 })
                 .unwrap()
                 .0
@@ -1938,7 +1949,10 @@ fn keys_wait_while_any_own_device_is_unconfirmed() {
         net.devs[a3].texts("bob@example.net"),
         [("before".to_owned(), Some(Verified))]
     );
-    assert_eq!(net.devs[a2].store_enc_states("bob@example.net"), [Some(Pending)]);
+    assert_eq!(
+        net.devs[a2].store_enc_states("bob@example.net"),
+        [Some(Pending)]
+    );
 }
 
 #[test]
@@ -1998,7 +2012,10 @@ fn a_recovery_key_counts_only_while_the_key_file_lists_it() {
     // A recovery key whose signing key the key file does not list is
     // ignored (12.10).
     let unlisted = risala_mls::RecoveryKey::from_bytes([3; 32]);
-    let out = net.devs[a2].engine.set_recovery_key(Some(unlisted.clone())).unwrap();
+    let out = net.devs[a2]
+        .engine
+        .set_recovery_key(Some(unlisted.clone()))
+        .unwrap();
     net.devs[a2].absorb(out);
     let a1_conv: Conv = "alice@example.org".parse().unwrap();
     let account = net.devs[a2].account;
@@ -2020,7 +2037,10 @@ fn a_recovery_key_counts_only_while_the_key_file_lists_it() {
     // A listed one is taken by a device that holds none.
     let first = risala_mls::RecoveryKey::from_bytes([4; 32]);
     net.list_recovery("alice@example.org", &first);
-    let out = net.devs[a2].engine.set_recovery_key(Some(first.clone())).unwrap();
+    let out = net.devs[a2]
+        .engine
+        .set_recovery_key(Some(first.clone()))
+        .unwrap();
     net.devs[a2].absorb(out);
     let out = net.devs[a2].engine.share_recovery_key(&first).unwrap();
     net.devs[a2].absorb(out);
@@ -2030,13 +2050,20 @@ fn a_recovery_key_counts_only_while_the_key_file_lists_it() {
     // A device that holds one asks the user before replacing it.
     let second = risala_mls::RecoveryKey::from_bytes([5; 32]);
     net.list_recovery("alice@example.org", &second);
-    let out = net.devs[a2].engine.set_recovery_key(Some(second.clone())).unwrap();
+    let out = net.devs[a2]
+        .engine
+        .set_recovery_key(Some(second.clone()))
+        .unwrap();
     net.devs[a2].absorb(out);
     let out = net.devs[a2].engine.share_recovery_key(&second).unwrap();
     net.devs[a2].absorb(out);
     net.run();
     assert_eq!(net.devs[a1].recovery, Some(first));
-    assert!(net.devs[a1].notes.contains(&Notification::RecoveryKeyOffered));
+    assert!(
+        net.devs[a1]
+            .notes
+            .contains(&Notification::RecoveryKeyOffered)
+    );
     let out = net.devs[a1].engine.accept_recovery_key(true).unwrap();
     net.devs[a1].absorb(out);
     assert_eq!(net.devs[a1].recovery, Some(second));
@@ -2118,10 +2145,11 @@ fn a_rejected_room_is_not_started_again() {
     net.devs[a]
         .store
         .write_with(|tx| {
-            let row = tx.conv_by_name(account, &Conv::Room(room.clone()))?.unwrap();
+            let row = tx
+                .conv_by_name(account, &Conv::Room(room.clone()))?
+                .unwrap();
             let device =
-                crate::e2ee::Device::new(net.devs[a].uid.clone(), net.devs[a].key.clone())
-                    .unwrap();
+                crate::e2ee::Device::new(net.devs[a].uid.clone(), net.devs[a].key.clone()).unwrap();
             let conversation = RisalaConversation::room(
                 row.conv_id.as_ref().unwrap(),
                 HistoryMode::Shared,
@@ -2138,7 +2166,10 @@ fn a_rejected_room_is_not_started_again() {
         .encrypt_room(&room, HistoryMode::Shared, SendMode::All);
     net.run();
     assert_eq!(net.sent_to(a, "INIT", "#secret"), 0);
-    assert_eq!(net.devs[a].group("#secret").unwrap().state, GroupState::Rejected);
+    assert_eq!(
+        net.devs[a].group("#secret").unwrap().state,
+        GroupState::Rejected
+    );
 
     // Only the user's reset lets it start again.
     let out = net.devs[a]
@@ -2203,7 +2234,11 @@ fn the_recovery_keys_connection_never_joins_a_group() {
         .filter(|(d, _)| *d == a)
         .map(|(_, l)| l)
         .filter(|l| {
-            let l = l.split(' ').filter(|w| !w.starts_with('@')).collect::<Vec<_>>().join(" ");
+            let l = l
+                .split(' ')
+                .filter(|w| !w.starts_with('@'))
+                .collect::<Vec<_>>()
+                .join(" ");
             forbidden.iter().any(|f| l.starts_with(f))
         })
         .collect();
@@ -2281,7 +2316,13 @@ fn a_removal_waits_at_most_a_day_for_its_key_file() {
 
     // It tries again from time to time on the same connection.
     assert!(net.devs[b].retry.is_some());
-    let fetches = |net: &Net| net.devs[b].key_files_asked.iter().filter(|u| **u == bob).count();
+    let fetches = |net: &Net| {
+        net.devs[b]
+            .key_files_asked
+            .iter()
+            .filter(|u| **u == bob)
+            .count()
+    };
     let before = fetches(&net);
     net.devs[b].later(super::e2ee::KEY_FILE_RETRY);
     net.resume(b);

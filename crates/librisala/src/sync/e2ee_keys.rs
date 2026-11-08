@@ -263,7 +263,8 @@ pub(super) fn declined_leaf(
     uid: &Uid,
     key: &PublicKey,
 ) -> Result<bool, StoreError> {
-    Ok(uid == me && tx.own_device_state(account, &sender_key_id(key))? == Some(OwnDeviceState::Declined))
+    Ok(uid == me
+        && tx.own_device_state(account, &sender_key_id(key))? == Some(OwnDeviceState::Declined))
 }
 
 fn recovery_from(bytes: &[u8]) -> Result<RecoveryKey, StoreError> {
@@ -326,8 +327,6 @@ impl SyncEngine {
         Ok(self.finish())
     }
 
-
-
     /// Notes new devices of the identity in its conversation with itself,
     /// and sends history keys to those the user confirmed (12.9).
     pub(super) fn own_devices(&mut self, conv: &Conv) -> Result<(), SyncError> {
@@ -365,7 +364,9 @@ impl SyncEngine {
 
     /// The conversation with itself, its leaves, and whether KEY and
     /// RECOVERY lines may go there now (12.9).
-    fn self_conversation(&mut self) -> Result<Option<(ConvRow, Vec<group::Leaf>, bool)>, SyncError> {
+    fn self_conversation(
+        &mut self,
+    ) -> Result<Option<(ConvRow, Vec<group::Leaf>, bool)>, SyncError> {
         let Some(e) = self.e2ee.as_ref() else {
             return Ok(None);
         };
@@ -393,7 +394,11 @@ impl SyncEngine {
 
     /// Whether the identity's key file lists the signing key of `key` now
     /// (12.10): `None` if the device has not fetched it since `since`.
-    fn recovery_listed(&mut self, key: &RecoveryKey, since: i64) -> Result<Option<bool>, SyncError> {
+    fn recovery_listed(
+        &mut self,
+        key: &RecoveryKey,
+        since: i64,
+    ) -> Result<Option<bool>, SyncError> {
         let Some(identity) = self.me.to_identity() else {
             return Ok(Some(false));
         };
@@ -612,7 +617,9 @@ impl SyncEngine {
             // 12.10: ask before replacing the one the device holds.
             Some(true) if !asked => {
                 self.write(|tx| tx.set_recovery_offered(account, Some((&key, at)), true))?;
-                self.out.notifications.push(Notification::RecoveryKeyOffered);
+                self.out
+                    .notifications
+                    .push(Notification::RecoveryKeyOffered);
             }
             Some(true) => {}
         }

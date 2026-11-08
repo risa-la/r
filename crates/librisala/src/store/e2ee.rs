@@ -1252,19 +1252,17 @@ impl super::Store {
                 }
                 let wanted = match &row.name {
                     Conv::Uid(_) => true,
-                    Conv::Room(_) => {
-                        tx.group(row.id)?.is_some()
-                            || tx
-                                .conn()
-                                .query_row(
-                                    "SELECT value FROM room_settings WHERE conv = ?1 AND key = 'e2ee'",
-                                    [row.id.0],
-                                    |r| r.get::<_, String>(0),
-                                )
-                                .optional()?
-                                .as_deref()
-                                == Some("yes")
-                    }
+                    Conv::Room(_) => tx.group(row.id)?.is_some()
+                        || tx
+                            .conn()
+                            .query_row(
+                                "SELECT value FROM room_settings WHERE conv = ?1 AND key = 'e2ee'",
+                                [row.id.0],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .optional()?
+                            .as_deref()
+                            == Some("yes"),
                 };
                 let active = tx
                     .group(row.id)?

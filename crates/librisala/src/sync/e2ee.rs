@@ -41,13 +41,13 @@ use risala_proto::command::{Command, KeyPkgCommand, WelcomeCommand};
 use risala_proto::error::ErrorCode;
 use risala_proto::mls;
 use risala_proto::names::{Conv, Id, Seq, Uid};
-use risala_proto::server::{EventBody, ServerLine, ServerMessage};
+use risala_proto::server::{EventBody, ServerLine};
 use risala_proto::time::Timestamp;
 use rusqlite::{OptionalExtension, params};
 use tracing::{debug, warn};
 
 use super::engine::Pending;
-use super::{Notification, Outcome, Reply, ReqId, SyncEngine, SyncError};
+use super::{Notification, Outcome, Reply, SyncEngine, SyncError};
 use crate::e2ee::content::{Content, Control};
 use crate::e2ee::group::{self, Applied, Joined};
 use crate::e2ee::{Device, E2eeError};
@@ -438,13 +438,7 @@ impl SyncEngine {
     }
 
     /// Handles the reply to an encryption command.
-    pub(super) fn on_e2ee(
-        &mut self,
-        req: ReqId,
-        pending: E2eePending,
-        reply: Reply,
-    ) -> Result<(), SyncError> {
-        let _ = req;
+    pub(super) fn on_e2ee(&mut self, pending: E2eePending, reply: Reply) -> Result<(), SyncError> {
         match pending {
             E2eePending::KeyPkgCount => self.on_keypkg_count(&reply),
             E2eePending::Shared {
@@ -777,7 +771,8 @@ impl SyncEngine {
                     // here, the server left a commit out, and joining again
                     // would take whatever group it offers: the device
                     // stops following the group instead (12.6).
-                    let commit_seq = self.write(|tx| Ok(tx.group(row.id)?.map(|g| g.commit_seq)))?;
+                    let commit_seq =
+                        self.write(|tx| Ok(tx.group(row.id)?.map(|g| g.commit_seq)))?;
                     let expired = match commit_seq {
                         Some(from) => self.write(|tx| tx.events_missing(row.id, from, seq))?,
                         None => false,
@@ -1947,13 +1942,4 @@ fn room_setting(tx: &Tx<'_>, row: &ConvRow, key: &str) -> Result<Option<String>,
             |r| r.get(0),
         )
         .optional()?)
-}
-
-/// A line of a reply that the encryption engine reads.
-#[allow(dead_code)]
-fn is_e2ee_line(msg: &ServerMessage) -> bool {
-    matches!(
-        msg.line,
-        ServerLine::Welcome { .. } | ServerLine::KeyPkg { .. } | ServerLine::GroupInfo { .. }
-    )
 }
