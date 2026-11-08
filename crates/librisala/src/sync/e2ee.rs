@@ -117,6 +117,11 @@ pub(super) struct E2ee {
     /// Conversations whose INIT the server refused on this connection for
     /// a reason other than `stale`: not tried again on it.
     init_refused: HashSet<Conv>,
+    /// Invitations to encrypted rooms waiting for their commit: the
+    /// invitees' KeyPackages, kept until the server accepts it, so that a
+    /// commit refused as `stale`, or one that waited for another, is made
+    /// again (12.5, 12.6).
+    invites: HashMap<Conv, Vec<(KeyPackage, PublicKey)>>,
 }
 
 /// A WELCOME line (12.7).
@@ -202,6 +207,7 @@ impl E2ee {
             rejoined: HashSet::new(),
             to_share: HashSet::new(),
             init_refused: HashSet::new(),
+            invites: HashMap::new(),
         }
     }
 }
@@ -835,23 +841,34 @@ impl SyncEngine {
         match &reply.outcome {
             // The COMMIT event came before the OK and was applied.
             Outcome::Ok(_) => {
+                if purpose == Purpose::Invite {
+                    self.e2().invites.remove(conv);
+                }
                 self.e2ee_advance(conv)?;
                 if purpose == Purpose::Invite {
                     self.share_room_keys(conv)?;
                 }
+                self.retry_invite(conv)?;
                 self.flush_outbox()?;
             }
             Outcome::Err(err) => {
                 debug!(%conv, code = %err.code, ?purpose, "a commit was refused");
                 let _ = self.e2ee_write(|tx| group::commit_refused(tx, &dev, &row, commit))?;
-                if err.code != ErrorCode::Stale && purpose == Purpose::Join {
-                    return Ok(());
+                if err.code != ErrorCode::Stale {
+                    if purpose == Purpose::Invite {
+                        warn!(%conv, code = %err.code, "an invitation was refused");
+                        self.e2().invites.remove(conv);
+                    }
+                    if purpose == Purpose::Join {
+                        return Ok(());
+                    }
                 }
                 // 12.5: apply what came first, then try again if needed.
                 if let Some(e) = self.e2ee.as_mut() {
                     e.rejoined.remove(conv);
                 }
                 self.e2ee_advance(conv)?;
+                self.retry_invite(conv)?;
             }
             Outcome::Failed | Outcome::NotSent => {
                 let _ = self.e2ee_write(|tx| group::commit_refused(tx, &dev, &row, commit))?;
@@ -1061,11 +1078,42 @@ impl SyncEngine {
                 }
             }
         }
-        if purpose == Purpose::Invite && packages.is_empty() {
-            warn!(%conv, %uid, "no KeyPackages to invite with");
+        if purpose == Purpose::Invite {
+            if packages.is_empty() {
+                warn!(%conv, %uid, "no KeyPackages to invite with");
+            } else {
+                self.e2()
+                    .invites
+                    .entry(conv.clone())
+                    .or_default()
+                    .extend(packages);
+                self.retry_invite(conv)?;
+            }
+        } else {
+            self.add_devices(conv, packages, purpose)?;
         }
-        self.add_devices(conv, packages, purpose)?;
         self.check_keys(std::iter::once(uid.clone()))
+    }
+
+    /// Commits the invitations waiting for `conv`, unless another commit
+    /// of this device's is in flight there, whose answer tries again. Once
+    /// every invitee's device has a leaf, the invitations are done.
+    fn retry_invite(&mut self, conv: &Conv) -> Result<(), SyncError> {
+        let Some(e) = self.e2ee.as_ref() else {
+            return Ok(());
+        };
+        if e.busy.contains(conv) {
+            return Ok(());
+        }
+        let Some(packages) = e.invites.get(conv).cloned() else {
+            return Ok(());
+        };
+        self.add_devices(conv, packages, Purpose::Invite)?;
+        if !self.e2ee.as_ref().is_some_and(|e| e.busy.contains(conv)) {
+            // Nothing left to add, or it cannot be done.
+            self.e2().invites.remove(conv);
+        }
+        Ok(())
     }
 
     /// Commits the addition of devices that have no leaf yet (12.6).

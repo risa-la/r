@@ -656,3 +656,123 @@ async fn refreshing_shows_what_the_key_file_lists_now() {
         "{devices:?}"
     );
 }
+
+/// Alice's encrypted room `room`, with Bob invited and joined.
+async fn shared_room(alice: &Account, bob: &Account, room: &str) {
+    let conv = within("joining", alice.join(room)).await.unwrap();
+    within("INFO", conv.room_info()).await.unwrap();
+    within("encrypting", conv.encrypt(History::Shared, false))
+        .await
+        .unwrap();
+    within("syncing", alice.wait_synced()).await.unwrap();
+    within("inviting", conv.invite(&bob.uid())).await.unwrap();
+    within("invited", async {
+        loop {
+            match bob.join(room).await {
+                Ok(_) => break,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await;
+    within("syncing", bob.wait_synced()).await.unwrap();
+}
+
+/// Who sent each COMMIT and ENC of `conv` in `account`'s cache, in order.
+fn verbs(account: &Account, conv: &str) -> Vec<(String, String)> {
+    account
+        .conversation(conv)
+        .unwrap()
+        .export()
+        .unwrap()
+        .iter()
+        .filter_map(|l| {
+            let mut words = l.split(' ');
+            let tags = words.next()?;
+            let from = tags.split(';').find_map(|t| t.strip_prefix("from="))?;
+            let verb = words.next()?;
+            matches!(verb, "COMMIT" | "ENC").then(|| (from.to_owned(), verb.to_owned()))
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaving_an_encrypted_room_removes_the_leaves() {
+    let server = hosted_server(&[], |_| {}).await;
+    let alice = registered(&server, "alice").await;
+    let bob = registered(&server, "bob").await;
+    let carol = registered(&server, "carol").await;
+    shared_room(&alice, &bob, "#secret").await;
+    let room = alice.conversation("#secret").unwrap();
+    within("inviting", room.invite("carol@chat.test"))
+        .await
+        .unwrap();
+    within("invited", async {
+        while carol.join("#secret").await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    say(&bob, "#secret", "bob here").await;
+    reads(&carol, "#secret", &["bob here"]).await;
+
+    // Bob leaves. His leaves must go before anyone sends again (12.6):
+    // Alice's device, or Carol's, commits their removal first.
+    within("leaving", bob.part("#secret", "bye")).await.unwrap();
+    say(&alice, "#secret", "after bob").await;
+    let v = verbs(&alice, "#secret");
+    assert_eq!(v[v.len() - 2].1, "COMMIT", "{v:?}");
+    assert_ne!(v[v.len() - 2].0, "bob@chat.test", "{v:?}");
+    reads(&carol, "#secret", &["bob here", "after bob"]).await;
+
+    // Carol is kicked: the same.
+    within("kicking", room.kick("carol@chat.test", ""))
+        .await
+        .unwrap();
+    say(&alice, "#secret", "alone again").await;
+    let v = verbs(&alice, "#secret");
+    assert_eq!(v[v.len() - 2].1, "COMMIT", "{v:?}");
+    reads(&alice, "#secret", &["after bob", "alone again"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_offline_catches_up_on_commits() {
+    let server = hosted_server(&[], |_| {}).await;
+    let alice = registered(&server, "alice").await;
+    let bob = registered(&server, "bob").await;
+    say(&alice, "bob@chat.test", "one").await;
+    reads(&bob, "alice@chat.test", &["one"]).await;
+    within("stopping", bob.disconnect()).await;
+
+    // While Bob is away, the group moves on: Alice's second device joins,
+    // and both write in new epochs.
+    let alice2 = second_device(&server, &alice).await;
+    say(&alice2, "bob@chat.test", "two").await;
+    say(&alice, "bob@chat.test", "three").await;
+
+    // Bob catches up: the commits in order, then the messages (12.11).
+    within("signing in", bob.connect()).await.unwrap();
+    within("syncing", bob.wait_synced()).await.unwrap();
+    reads(&bob, "alice@chat.test", &["one", "two", "three"]).await;
+    say(&bob, "alice@chat.test", "four").await;
+    reads(&alice2, "bob@chat.test", &["two", "three", "four"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inviting_adds_every_device() {
+    let server = hosted_server(&[], |_| {}).await;
+    let alice = registered(&server, "alice").await;
+    let bob = registered(&server, "bob").await;
+    let bob2 = second_device(&server, &bob).await;
+    let alice2 = second_device(&server, &alice).await;
+    within("syncing", alice.wait_synced()).await.unwrap();
+    shared_room(&alice, &bob, "#secret").await;
+    say(&alice, "#secret", "to all of you").await;
+    // Every device of both reads it (12.6): Alice's second device joined
+    // its own identity's room by external commit, and Bob's two by the
+    // invitation's Welcome. Alice's invitation raced her second device's
+    // joining, and was made again after `stale` (12.5).
+    for who in [&bob, &bob2, &alice2] {
+        reads(who, "#secret", &["to all of you"]).await;
+    }
+}
