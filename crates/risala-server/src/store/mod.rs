@@ -35,7 +35,7 @@ use risala_proto::types::{
 };
 
 pub use admin::{AdminStore, ServerBan};
-pub use messages::MessageStore;
+pub use messages::{MessageStore, PurgeQuery, RelatedQuery};
 pub use moderation::ModerationStore;
 pub use reports::ReportStore;
 pub use sqlite::SqliteStore;

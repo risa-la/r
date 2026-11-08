@@ -2129,7 +2129,42 @@ impl Pause {
 // M4's store supertraits. Each area adds its delegating methods to its
 // own block.
 
-impl crate::store::MessageStore for Flaky {}
+impl crate::store::MessageStore for Flaky {
+    fn reaction(
+        &self,
+        c: ConvKey,
+        f: &Uid,
+        t: Seq,
+        x: &str,
+        s: Option<Timestamp>,
+    ) -> crate::store::Result<Option<Seq>> {
+        self.inner.reaction(c, f, t, x, s)
+    }
+    fn related(&self, c: ConvKey, q: crate::store::RelatedQuery) -> crate::store::Result<Page> {
+        self.inner.related(c, q)
+    }
+    fn authored_rooms(
+        &self,
+        a: &Uid,
+        s: Option<Timestamp>,
+    ) -> crate::store::Result<Vec<(ConvKey, Room)>> {
+        self.inner.authored_rooms(a, s)
+    }
+    fn purge(
+        &self,
+        c: ConvKey,
+        q: &crate::store::PurgeQuery,
+    ) -> crate::store::Result<Vec<StoredEvent>> {
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Corrupt("broken on purpose".into()));
+        }
+        self.inner.purge(c, q)
+    }
+    fn expire(&self, c: ConvKey, b: Timestamp, m: usize) -> crate::store::Result<u64> {
+        self.pause.at("expire");
+        self.inner.expire(c, b, m)
+    }
+}
 
 // (moderation)
 
