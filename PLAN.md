@@ -147,9 +147,15 @@ across the FFI boundary.
   each Android ABI, and Swift with an XCFramework for macOS and iOS.
   Async functions and callback interfaces carry timeline diffs and
   platform services.
+- **Theme:** every app follows the terminal design that the Apple app
+  and the website already use: the palette roles with light and dark
+  values, JetBrains Mono, framed panels and the breadcrumb heading. The
+  colors and metrics live in one place and each app uses them (M6), so
+  the apps stay native but look like one product.
+- **Strings:** the apps share their text through `l10n/` (see
+  Decisions), so the same screen says the same thing on every platform.
 - **GNOME:** gtk4-rs and libadwaita, using librisala directly with no
-  FFI. This is the first GUI client because it gives the fastest feedback
-  loop.
+  FFI. It comes after the phone apps (item 40).
 - **Apple:** a SwiftUI app shared between macOS and iOS, with a
   Notification Service Extension for push.
 - **Android:** Kotlin with Jetpack Compose. Push through FCM, and through
@@ -180,10 +186,14 @@ Each milestone ends with something that runs.
 | M4 | Server: rich messages and moderation | reply, edit, react, DELETE, RELATED; roles, ROLES, SET, INVITE, KICK, BAN; REPORT and RESOLVE; retention; all ADMIN commands |
 | M5 | librisala core and `risala-cli` | The CLI signs in, syncs, works offline from its cache and recovers from dropped connections without losing or duplicating messages |
 | M5a | End-to-end encryption | Post-quantum TLS and ML-DSA keys everywhere. KEYPKG, INIT, COMMIT, GROUPINFO, WELCOME, ENC and BACKUP in `risalad` and librisala, and direct conversations. Two CLI devices talk in an encrypted direct conversation and room; a new device of the same identity reads the whole history offline; a restore from a recovery key works; reports of encrypted messages verify |
-| M6 | GNOME app | Day-to-day usable on Linux against a real server |
-| M7 | FFI, Apple and Android apps | macOS first, then iOS, then Android, all on the same librisala |
-| M8 | Files and push | UPLOAD over HTTPS, PUSH, the gateway, the iOS extension, FCM and UnifiedPush |
-| M9 | Hardening and launch | Rate limits, load testing, fuzzing, the NixOS module, a public server and a docs site on risa.la |
+| M6 | FFI, shared theme and strings | `librisala-ffi` with UniFFI for Swift and Kotlin, platform key stores, one source for the theme's colors and metrics, and the shared strings in `l10n/`. The Apple app and an Android shell sign in, sync and show a timeline through the bindings |
+| M7 | iOS and Android apps | Built side by side, with macOS coming along through the shared SwiftUI app. Onboarding (guest, registering with an invite, signing in, pairing a device by QR code, recovery), rooms, direct conversations and encryption. Day-to-day usable on phones against a real server |
+| M8 | Push and files | PUSH, the gateway, the iOS extension, FCM and UnifiedPush, then UPLOAD over HTTPS |
+| M9 | GNOME app | Day-to-day usable on Linux against a real server |
+| M10 | Hardening and launch | Rate limits, load testing, fuzzing, the NixOS module, a public server and a docs site on risa.la |
+
+Phone apps come first (item 40). Push comes straight after them, since a
+phone app without notifications is hard to use day to day.
 
 M5 can start once M1 is done, alongside M2–M4. Its tests use the real
 server.
@@ -796,6 +806,53 @@ Open:
       different id gets `not-found`. The cid is checked first (7.6).
     - Done on a short branch, `m4-followups`, before M5a.
 
+40. **Onboarding and identity review** (4.4, 4.6, 4.7, 10.5, 10.6,
+    12.10, 14), decided with the user on 2026-11-08. Spec text still to
+    write, before M7:
+    - **Phone apps first.** After M5a: FFI and the shared theme (M6),
+      iOS and Android side by side (M7), push and files (M8), then GNOME
+      (M9) and launch (M10).
+    - **Pairing devices by QR code.** The new device shows a QR code
+      holding the identity, its public key and a label. A signed-in
+      device scans it and adds the key (KEY ADD, or shows the key file
+      line for a self-hosted identity). The format goes in a spec
+      appendix, so every app can pair with every other.
+    - **The recovery key also restores the identity.** An ML-DSA-44 key
+      is derived from the same 32-byte recovery secret and listed in the
+      key file with the label `recovery`. It never uploads KeyPackages,
+      so it never joins a conversation. With it, a person who lost every
+      device signs in on a new one, adds the new device's key and
+      removes the lost ones, then restores history from the backup. A
+      new recovery key replaces the old key file line. Section 14 says
+      that whoever holds the recovery key controls the identity.
+    - **Invite codes for registration.** Operators create and revoke
+      codes with ADMIN, REGISTER takes `invite=<code>`, and INFO says
+      when registration needs an invite. An invite link can carry the
+      server and the code.
+
+    Open:
+
+    - The QR payload, and whether it is a URI that invite links share.
+    - The HKDF label for the recovery signing key, and whether servers
+      treat the `recovery` key differently (for example, no KEYPKG).
+    - Invite codes: single-use or counted, expiry, the ADMIN verbs (room
+      INVITE already exists), and the error for a bad code.
+
+    App-level, no spec change:
+
+    - Apps are identity-first: a person picks an identity, such as
+      `alice@example.org`, and then the servers they use it on. The first
+      identity on a device is the default for new servers. librisala's
+      accounts stay (server, identity) pairs underneath.
+    - Key management goes to the server that hosts the identity. Other
+      servers answer `not-supported`, so librisala should remember the
+      host from REGISTER, or find it with KEY LIST.
+    - Device keys never leave the device: Keychain items are
+      `ThisDeviceOnly` and not synchronised, and Android keeps them out of
+      backups. A restored phone is a new device and pairs again.
+    - Onboarding says that direct conversations need both people on the
+      same server, since there is no federation (5.1).
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
@@ -814,5 +871,21 @@ Open:
 - **Rooms from the configuration** (M4): ADMIN DROP of a room named in
   `rooms` creates it again at once, empty and with a new id, so the
   configuration stays true.
+- **Shared strings** (M6), decided with the user on 2026-11-08: the
+  apps' text lives in Fluent files, `l10n/<locale>/*.ftl`, keyed by id
+  (`pair-device-title`), with a comment for translators on each message.
+  English is the source, and Arabic comes along from the start, as in
+  the Apple app now. A generator in the workspace writes each platform's
+  own files from them: a String Catalog for Apple, `strings.xml` for
+  Android and `.po` for GNOME. CI checks that the generated files match.
+  - Messages use only plain text, named variables and plural selectors
+    on numbers, which every platform format can express. The generator
+    refuses anything else.
+  - Text that only one platform shows, such as macOS menus, may stay in
+    that app's own files.
+  - librisala returns structured values, such as error kinds and event
+    types, never English text, so that apps word everything themselves.
+  - The Apple app moves from English text keys to the shared ids, through
+    generated Swift constants. Its AGENTS.md changes with it in M6.
 - **The Apple app** keeps its current deployment targets (iOS 18 and
   macOS 15) for now.
