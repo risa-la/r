@@ -13,6 +13,11 @@ use librisala::client::{
 };
 use risala_server::testing::{Proxy, TestServer};
 
+/// The key the tests' caches are encrypted with.
+fn key() -> librisala::store::DatabaseKey {
+    librisala::store::DatabaseKey::from_bytes([9; 32])
+}
+
 /// Waits until the account's conversation has `text` from someone else.
 async fn wait_for_text(conv: &librisala::client::Conversation, text: &str) {
     within(&format!("waiting for {text:?}"), async {
@@ -193,7 +198,7 @@ async fn reads_work_offline_after_the_server_stops() {
         post(&mut ann, "#general", &format!("m{i}")).await;
     }
     {
-        let client = Client::open(&path, options(5)).unwrap();
+        let client = Client::open(&path, &key(), options(5)).unwrap();
         let addr = addr_of(server.addr());
         client
             .accept_fingerprint(&addr, &server.fingerprint().to_string())
@@ -217,7 +222,7 @@ async fn reads_work_offline_after_the_server_stops() {
     }
 
     // Another process opens the same cache with no server at all.
-    let client = Client::open(&path, options(5)).unwrap();
+    let client = Client::open(&path, &key(), options(5)).unwrap();
     let accounts = client.accounts().unwrap();
     assert_eq!(accounts.len(), 1);
     let sam = &accounts[0];
@@ -447,7 +452,7 @@ async fn a_new_run_of_the_app_resumes_the_session() {
     let server = TestServer::builder().room("#a").start().await;
     let addr = addr_of(server.addr());
     for run in 0..3 {
-        let client = Client::open(&path, options(50)).unwrap();
+        let client = Client::open(&path, &key(), options(50)).unwrap();
         client
             .accept_fingerprint(&addr, &server.fingerprint().to_string())
             .unwrap();
@@ -709,7 +714,7 @@ async fn a_message_another_process_queued_is_sent_once_noticed() {
     let path = dir.path().join("cache.db");
     let server = TestServer::builder().room("#general").start().await;
     let addr = addr_of(server.addr());
-    let app = Client::open(&path, options(50)).unwrap();
+    let app = Client::open(&path, &key(), options(50)).unwrap();
     app.accept_fingerprint(&addr, &server.fingerprint().to_string())
         .unwrap();
     let sam = app.add_guest(&addr, "sam").unwrap();
@@ -718,7 +723,7 @@ async fn a_message_another_process_queued_is_sent_once_noticed() {
     within("sync", sam.wait_synced()).await.unwrap();
     app.check_for_external_changes().unwrap();
 
-    let extension = Client::open(&path, options(50)).unwrap();
+    let extension = Client::open(&path, &key(), options(50)).unwrap();
     let other = extension.account(&addr, "~sam").unwrap().unwrap();
     let queued = other
         .conversation("#general")

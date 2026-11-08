@@ -26,6 +26,7 @@
 //! them off the runtime's worker threads.
 
 mod chats;
+mod cipher;
 mod events;
 mod outbox;
 mod people;
@@ -44,6 +45,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::addr::ServerAddr;
 use risala_proto::names::Uid;
 
+pub use cipher::DatabaseKey;
 pub(crate) use outbox::Claim;
 pub use outbox::{Draft, FailReason, OutboxItem, OutboxState};
 pub use read::{ConversationSummary, Member, Reaction, TimelineItem};
@@ -75,6 +77,14 @@ pub enum StoreError {
     /// The cache's file could not be created.
     #[error("cache file: {0}")]
     File(#[from] std::io::Error),
+    /// The cache could not be read with the key given: the key is wrong,
+    /// or the file is not a cache.
+    #[error("the cache's key is wrong, or the file is not a risala cache")]
+    WrongKey,
+    /// This build's SQLite is not SQLCipher, so the cache cannot be
+    /// encrypted. Nothing was written.
+    #[error("this build's SQLite cannot encrypt the cache: it is not SQLCipher")]
+    NoCipher,
 }
 
 macro_rules! row_id {
@@ -231,23 +241,34 @@ impl Store {
     /// Opens the cache at `path`, creating it if needed, and brings its
     /// schema up to date.
     ///
+    /// The file is encrypted with `key` (SQLCipher, PLAN.md 42), which
+    /// must be the same every time. A wrong key gives
+    /// [`StoreError::WrongKey`]. A cache from before encryption, in the
+    /// clear, is encrypted with `key` first, keeping all it holds.
+    ///
     /// On Unix a new cache is readable and writable by its owner only
     /// (0600), whatever the umask: it holds private history and a guest's
     /// session token (4.2). SQLite gives the `-wal` and `-shm` files the
     /// same mode. An existing file keeps its mode.
-    pub fn open(path: impl AsRef<Path>) -> Result<Store, StoreError> {
+    pub fn open(path: impl AsRef<Path>, key: &DatabaseKey) -> Result<Store, StoreError> {
         let path = path.as_ref();
         create_private(path)?;
-        let mut store = Store::setup(Connection::open(path)?)?;
+        cipher::encrypt_plaintext(path, key)?;
+        let writer = Connection::open(path)?;
+        writer.busy_timeout(BUSY_TIMEOUT)?;
+        cipher::key(&writer, key)?;
+        let mut store = Store::setup(writer)?;
         // After the writer, which has set WAL mode and the schema.
         let reader = Connection::open(path)?;
         reader.busy_timeout(BUSY_TIMEOUT)?;
+        cipher::key(&reader, key)?;
         reader.pragma_update(None, "query_only", "ON")?;
         store.reader = Some(Arc::new(Mutex::new(reader)));
         Ok(store)
     }
 
-    /// A cache in memory, for tests and short-lived tools.
+    /// A cache in memory, for tests and short-lived tools. It is never
+    /// written to disk, so it has no key.
     pub fn open_in_memory() -> Result<Store, StoreError> {
         Store::setup(Connection::open_in_memory()?)
     }

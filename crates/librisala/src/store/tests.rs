@@ -83,7 +83,7 @@ fn text(store: &Store, conv: ConvId, n: u64) -> (String, bool) {
 fn trust_records() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     let a = addr();
     assert_eq!(TrustStore::get(&store, &a).unwrap(), None);
     store.set(&a, TrustRecord::Ca).unwrap();
@@ -93,7 +93,7 @@ fn trust_records() {
     drop(store);
 
     // The record survives reopening.
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     assert_eq!(
         TrustStore::get(&store, &a).unwrap(),
         Some(TrustRecord::Pinned(fp))
@@ -116,7 +116,11 @@ fn reads_do_not_wait_for_writes() {
     // another process's lock. Reads use their own connection, and see
     // what was committed before.
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path().join("cache.db")).unwrap();
+    let store = Store::open(
+        dir.path().join("cache.db"),
+        &crate::store::DatabaseKey::for_tests(),
+    )
+    .unwrap();
     let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
     let (entered_tx, entered) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel::<()>();
@@ -155,8 +159,8 @@ fn reads_do_not_wait_for_writes() {
 fn schema_versions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    drop(Store::open(&path).unwrap());
-    let conn = rusqlite::Connection::open(&path).unwrap();
+    drop(Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap());
+    let conn = keyed(&path);
     let version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
@@ -168,7 +172,10 @@ fn schema_versions() {
     conn.pragma_update(None, "user_version", schema::VERSION + 1)
         .unwrap();
     drop(conn);
-    assert!(matches!(Store::open(&path), Err(StoreError::TooNew(_))));
+    assert!(matches!(
+        Store::open(&path, &crate::store::DatabaseKey::for_tests()),
+        Err(StoreError::TooNew(_))
+    ));
 }
 
 #[test]
@@ -177,8 +184,8 @@ fn two_processes() {
     // extension would have.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let a = Store::open(&path).unwrap();
-    let b = Store::open(&path).unwrap();
+    let a = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
+    let b = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     let account = a.account(&addr(), &uid("alice@example.org")).unwrap();
     assert_eq!(
         b.account(&addr(), &uid("alice@example.org")).unwrap(),
@@ -971,7 +978,7 @@ fn a_version_4_cache_with_data_migrates() {
         )
         .unwrap();
     }
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
     assert_eq!(account, AccountId(1));
     assert_eq!(
@@ -1044,7 +1051,7 @@ fn version_2_caches_mark_own_events_by_the_account_uid() {
         )
         .unwrap();
     }
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     assert_eq!(store.unread(ConvId(1)).unwrap(), 1);
     let account = store.account(&addr(), &uid("~sam")).unwrap();
     assert_eq!(account, AccountId(1));
@@ -1187,7 +1194,7 @@ fn only_the_owner_can_read_a_new_cache() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     let account = store.account(&addr(), &uid("~sam")).unwrap();
     store
         .set_guest_session(account, Some((&"sam".parse().unwrap(), &id("t1"))))
@@ -1203,7 +1210,7 @@ fn only_the_owner_can_read_a_new_cache() {
     assert_eq!(files, 3, "WAL mode keeps -wal and -shm while open");
     drop(store);
     // Opening it again works, and leaves the mode alone.
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     assert_eq!(store.accounts().unwrap().len(), 1);
 }
 
@@ -1238,7 +1245,7 @@ fn a_version_11_cache_gets_activity_from_its_messages_and_outbox() {
         )
         .unwrap();
     }
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     // Messages and messages queued count; reactions and joins do not, and
     // when a conversation entered the cache is not known.
     assert_eq!(store.activity(ConvId(1)).unwrap(), Some(100));
@@ -1449,7 +1456,7 @@ fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
     let fresh = {
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
         let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
         for target in ["troll@example.com", "*@spam.example"] {
             let target: risala_proto::names::BlockTarget = target.parse().unwrap();
@@ -1502,7 +1509,7 @@ fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
 
     // The same cache as version 11 had it, migrated again.
     {
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        let conn = keyed(&path);
         conn.execute_batch(
             "DROP INDEX convs_activity;
              DROP INDEX outbox_unsent;
@@ -1512,7 +1519,7 @@ fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
         .unwrap();
         conn.pragma_update(None, "user_version", 11).unwrap();
     }
-    let store = Store::open(&path).unwrap();
+    let store = Store::open(&path, &crate::store::DatabaseKey::for_tests()).unwrap();
     let migrated: Vec<(ConvId, u64)> = store
         .chat_rows(&ChatQuery::default(), None, 10)
         .unwrap()
@@ -1520,4 +1527,161 @@ fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
         .map(|r| (r.id, r.activity))
         .collect();
     assert_eq!(migrated, fresh);
+}
+
+/// A plain connection to an encrypted cache, keyed with the test key.
+fn keyed(path: &std::path::Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    cipher::key(&conn, &DatabaseKey::for_tests()).unwrap();
+    conn
+}
+
+/// Everything on disk for the cache at `path`: the file, and its -wal.
+fn on_disk(path: &std::path::Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap();
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    bytes.extend(std::fs::read(wal).unwrap_or_default());
+    bytes
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// A guest session and a queued message: what an old cache must keep.
+fn fill(store: &Store) -> AccountId {
+    let account = store.account(&addr(), &uid("~sam")).unwrap();
+    store
+        .set_guest_session(
+            account,
+            Some((&"sam".parse().unwrap(), &id("secret-token"))),
+        )
+        .unwrap();
+    store
+        .write(|tx| {
+            tx.queue(
+                account,
+                &room(),
+                Some(&id("k1")),
+                &Draft::text("unsent words"),
+                Timestamp::MIN,
+            )
+        })
+        .unwrap();
+    account
+}
+
+fn kept(store: &Store, account: AccountId) {
+    assert_eq!(
+        store.guest_session(account).unwrap(),
+        Some(("sam".parse().unwrap(), id("secret-token")))
+    );
+    let pending = store.write(|tx| tx.outbox_pending(account)).unwrap().0;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].draft.text, "unsent words");
+}
+
+#[test]
+fn the_cache_is_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
+    let account = fill(&store);
+    // Neither the file nor its -wal holds anything in the clear, while
+    // open or after.
+    for _ in 0..2 {
+        let disk = on_disk(&path);
+        assert!(!disk.starts_with(b"SQLite format 3"));
+        for secret in [&b"secret-token"[..], b"unsent words", b"chat.example.org"] {
+            assert!(!contains(&disk, secret));
+        }
+    }
+    drop(store);
+    let disk = on_disk(&path);
+    assert!(!contains(&disk, b"unsent words"));
+
+    // SQLite without the key cannot read it.
+    let plain = rusqlite::Connection::open(&path).unwrap();
+    let err = plain
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+        .unwrap_err();
+    assert_eq!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::NotADatabase)
+    );
+    drop(plain);
+
+    let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
+    kept(&store, account);
+    // Reads go through the reader, which has the key too.
+    assert_eq!(store.accounts().unwrap().len(), 1);
+}
+
+#[test]
+fn a_wrong_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let account = fill(&Store::open(&path, &DatabaseKey::for_tests()).unwrap());
+
+    let wrong = DatabaseKey::generate().unwrap();
+    assert_ne!(wrong.as_bytes(), DatabaseKey::for_tests().as_bytes());
+    let err = Store::open(&path, &wrong).unwrap_err();
+    assert!(matches!(err, StoreError::WrongKey), "{err:?}");
+    assert!(err.to_string().contains("key"), "{err}");
+
+    // The attempt changed nothing.
+    let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
+    kept(&store, account);
+}
+
+#[test]
+fn a_file_that_is_no_cache_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    std::fs::write(&path, [0x5a; 4096]).unwrap();
+    let err = Store::open(&path, &DatabaseKey::for_tests()).unwrap_err();
+    assert!(matches!(err, StoreError::WrongKey), "{err:?}");
+}
+
+#[test]
+fn a_cache_in_the_clear_is_encrypted_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    // A cache as librisala wrote it before encryption: WAL mode, the
+    // current schema.
+    let old = Store::setup(rusqlite::Connection::open(&path).unwrap()).unwrap();
+    let account = fill(&old);
+    assert!(on_disk(&path).starts_with(b"SQLite format 3\0"));
+
+    // While another connection has it open, it is left alone.
+    assert!(Store::open(&path, &DatabaseKey::for_tests()).is_err());
+    assert!(on_disk(&path).starts_with(b"SQLite format 3\0"));
+    drop(old);
+
+    // A copy left by an attempt that was cut short goes.
+    let leftover = dir.path().join("cache.db.encrypting");
+    std::fs::write(&leftover, b"half a copy").unwrap();
+
+    let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
+    kept(&store, account);
+    assert!(!leftover.exists());
+    let disk = on_disk(&path);
+    assert!(!disk.starts_with(b"SQLite format 3"));
+    assert!(!contains(&disk, b"unsent words"));
+    let version: u32 = keyed(&path)
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, schema::VERSION);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    drop(store);
+
+    // Opening it again finds it encrypted.
+    let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
+    kept(&store, account);
 }

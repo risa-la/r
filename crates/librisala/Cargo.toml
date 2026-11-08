@@ -15,12 +15,22 @@ tokio-rustls.workspace = true
 webpki.workspace = true
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
-rusqlite.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 base64.workspace = true
 zeroize.workspace = true
+
+# SQLCipher, to encrypt the cache (PLAN.md 42). On Apple platforms it uses
+# CommonCrypto. Elsewhere it uses OpenSSL's libcrypto, built from source
+# and linked statically, since Android has no libcrypto for apps and plain
+# cargo builds need no OpenSSL headers. Nix builds set OPENSSL_NO_VENDOR to
+# link nixpkgs' OpenSSL instead.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
 rcgen.workspace = true

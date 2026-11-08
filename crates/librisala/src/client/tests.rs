@@ -403,8 +403,18 @@ async fn writes_from_another_process_reach_timelines() {
     // The app and its notification extension share one cache file.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let app = Client::open(&path, ClientOptions::default()).unwrap();
-    let extension = Client::open(&path, ClientOptions::default()).unwrap();
+    let app = Client::open(
+        &path,
+        &crate::store::DatabaseKey::for_tests(),
+        ClientOptions::default(),
+    )
+    .unwrap();
+    let extension = Client::open(
+        &path,
+        &crate::store::DatabaseKey::for_tests(),
+        ClientOptions::default(),
+    )
+    .unwrap();
     let sam = app.add_guest(SERVER, "sam").unwrap();
     let general = sam.conversation("#general").unwrap();
     store_events(
@@ -1556,7 +1566,12 @@ async fn the_chat_list_spans_accounts_newest_first() {
 async fn writes_from_another_process_reach_chat_lists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache.db");
-    let extension = Client::open(&path, ClientOptions::default()).unwrap();
+    let extension = Client::open(
+        &path,
+        &crate::store::DatabaseKey::for_tests(),
+        ClientOptions::default(),
+    )
+    .unwrap();
     let sam = extension.add_guest(SERVER, "sam").unwrap();
     let alice = extension
         .add_identity("chat.example.net", "alice@example.org")
@@ -1568,7 +1583,12 @@ async fn writes_from_another_process_reach_chat_lists() {
         &[event(1, "from=~bob MSG #general hi")],
     );
     // The app shows the chat list before it has a handle to any account.
-    let app = Client::open(&path, ClientOptions::default()).unwrap();
+    let app = Client::open(
+        &path,
+        &crate::store::DatabaseKey::for_tests(),
+        ClientOptions::default(),
+    )
+    .unwrap();
     let list = app.chat_list(ChatFilter::default(), 10).unwrap();
     assert_eq!(names(&list.items()), ["#general"]);
 

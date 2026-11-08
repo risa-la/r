@@ -188,7 +188,7 @@ use risala_proto::names::{Identity, Uid};
 use crate::addr::{ServerAddr, TrustStore};
 use crate::conn::keys::KeyStore;
 use crate::conn::{Backoff, Session, SessionOptions};
-use crate::store::{AccountId, Store};
+use crate::store::{AccountId, DatabaseKey, Store};
 use crate::sync::SyncConfig;
 
 pub use account::{Account, AccountEvents, Conversation};
@@ -308,12 +308,17 @@ impl Drop for OwnedRuntime {
 }
 
 impl Client {
-    /// Opens the cache at `path`, creating it if needed.
+    /// Opens the cache at `path`, creating it if needed, encrypted with
+    /// `key` (see [`Store::open`]).
     ///
     /// For M7 (bindings): this takes a `Path`; the FFI surface will want a
     /// string.
-    pub fn open(path: &Path, options: ClientOptions) -> Result<Client, ClientError> {
-        Client::with_store(Store::open(path)?, options)
+    pub fn open(
+        path: &Path,
+        key: &DatabaseKey,
+        options: ClientOptions,
+    ) -> Result<Client, ClientError> {
+        Client::with_store(Store::open(path, key)?, options)
     }
 
     /// A client with its cache in memory, for tests and short-lived tools.

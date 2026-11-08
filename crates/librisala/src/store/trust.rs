@@ -97,7 +97,11 @@ mod tests {
     #[test]
     fn pinning_keeps_any_record_there_is() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let store = Store::open(
+            dir.path().join("cache.db"),
+            &crate::store::DatabaseKey::for_tests(),
+        )
+        .unwrap();
         let a: ServerAddr = "chat.example.org".parse().unwrap();
         let (fp, other) = (
             Fingerprint::from_bytes([7; 32]),

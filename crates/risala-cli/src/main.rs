@@ -2,8 +2,9 @@
 //!
 //! Everything it learns is kept in a state directory (by default
 //! `$XDG_STATE_HOME/risala`, or `~/.local/state/risala`): the cache
-//! `cache.db`, with trust records, accounts, history and the outbox, and
-//! device keys under `keys/`. So `log` and `export` work with no
+//! `cache.db`, with trust records, accounts, history and the outbox,
+//! encrypted with the key in `cache.key`, and device keys under `keys/`.
+//! Losing `cache.key` loses the cache. So `log` and `export` work with no
 //! connection. A guest resumes its session on each run (4.2), so running
 //! commands one after another adds no JOIN or PART to its rooms. Once its
 //! session has ended, its rooms are joined again.
@@ -42,6 +43,7 @@ use librisala::client::{
     TimelineDiff, TrustInfo,
 };
 use librisala::conn::keys::FileKeyStore;
+use librisala::store::{DatabaseKey, Store, StoreError};
 
 /// How long to wait for a server before giving up.
 const WAIT: Duration = Duration::from_secs(30);
@@ -466,6 +468,58 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     options.open(path)?.write_all(bytes)
 }
 
+/// The file in the state directory that holds the cache's key.
+const CACHE_KEY: &str = "cache.key";
+
+/// The key `cache.db` is encrypted with (PLAN.md 42): 32 bytes in
+/// `cache.key`, random ones made on first use. The file is its owner's
+/// only (0600) on Unix, and one that group or others can read is refused,
+/// as for device keys.
+fn cache_key(dir: &Path) -> Result<DatabaseKey, String> {
+    let path = dir.join(CACHE_KEY);
+    match read_cache_key(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        other => return other.map_err(|e| format!("reading {}: {e}", path.display())),
+    }
+    let key = DatabaseKey::generate().map_err(|e| e.to_string())?;
+    // Written whole under another name and then linked in place, so that
+    // another risala starting at the same time never reads half a key,
+    // and the first one made wins.
+    let tmp = dir.join(format!(".{CACHE_KEY}.{}.tmp", std::process::id()));
+    let made = write_private(&tmp, key.as_bytes())
+        .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|()| std::fs::hard_link(&tmp, &path));
+    let _ = std::fs::remove_file(&tmp);
+    match made {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_cache_key(&path).map_err(|e| format!("reading {}: {e}", path.display()))
+        }
+        Err(e) => Err(format!("writing {}: {e}", path.display())),
+    }
+}
+
+fn read_cache_key(path: &Path) -> std::io::Result<DatabaseKey> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(
+                "others can read it; make it its owner's only with chmod 600",
+            ));
+        }
+    }
+    let mut key = zeroize::Zeroizing::new([0; 32]);
+    let mut rest = [0; 1];
+    file.read_exact(&mut key[..])
+        .ok()
+        .filter(|()| matches!(file.read(&mut rest), Ok(0)))
+        .ok_or_else(|| std::io::Error::other("not a key: it must be 32 bytes"))?;
+    Ok(DatabaseKey::from_bytes(*key))
+}
+
 struct Ctx {
     client: Client,
     account: Option<String>,
@@ -480,7 +534,23 @@ fn open(dir: &Path, own: bool, account: Option<String>) -> Res<Ctx> {
         keys: Some(std::sync::Arc::new(FileKeyStore::new(&keys_dir))),
         ..ClientOptions::default()
     };
-    match Client::open(&dir.join("cache.db"), options) {
+    let key = match cache_key(dir) {
+        Ok(key) => key,
+        Err(e) => return fail(e),
+    };
+    let store = match Store::open(dir.join("cache.db"), &key) {
+        Ok(store) => store,
+        Err(StoreError::WrongKey) => {
+            return fail(format!(
+                "{CACHE_KEY} in {} does not open cache.db: it is not the key the cache was \
+                 made with. If that key is lost, move cache.db away to start afresh; its \
+                 history and unsent messages go with it",
+                dir.display()
+            ));
+        }
+        Err(e) => return fail(format!("opening the cache in {}: {e}", dir.display())),
+    };
+    match Client::with_store(store, options) {
         Ok(client) => Ok(Ctx { client, account }),
         Err(e) => fail(format!("opening the cache in {}: {e}", dir.display())),
     }

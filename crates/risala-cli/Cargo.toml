@@ -26,6 +26,8 @@ tempfile.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+# Reads the cache's file, which has SQLCipher through librisala.
+rusqlite.workspace = true
 risala-server = { path = "../risala-server" }
 
 [lints]

@@ -63,7 +63,11 @@ impl H {
     /// as another process would.
     fn on_disk(me: &str) -> H {
         let dir = Arc::new(tempfile::tempdir().unwrap());
-        let store = Store::open(dir.path().join("cache.db")).unwrap();
+        let store = Store::open(
+            dir.path().join("cache.db"),
+            &crate::store::DatabaseKey::for_tests(),
+        )
+        .unwrap();
         let mut h = H::on(store, me, None, 50);
         h.file = Some(dir);
         h
@@ -110,7 +114,11 @@ impl H {
     /// opens the cache again if it is a file.
     fn sharing(other: &H) -> H {
         let store = match &other.file {
-            Some(dir) => Store::open(dir.path().join("cache.db")).unwrap(),
+            Some(dir) => Store::open(
+                dir.path().join("cache.db"),
+                &crate::store::DatabaseKey::for_tests(),
+            )
+            .unwrap(),
             None => other.store.clone(),
         };
         let engine = SyncEngine::new(store.clone(), other.account, other.config.clone()).unwrap();

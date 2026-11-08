@@ -46,6 +46,15 @@
           # Vendored crates, shared by the package and every cargo check.
           cargoDeps = rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
 
+          # librisala's cache is SQLCipher (PLAN.md 42). Off Apple platforms
+          # it needs OpenSSL's libcrypto; plain cargo builds compile their
+          # own, and Nix links nixpkgs' instead.
+          sqlcipher = {
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [ pkgs.openssl ];
+            env.OPENSSL_NO_VENDOR = "1";
+          };
+
           # A derivation that runs a cargo command over the workspace and
           # produces an empty output.
           cargoCheck =
@@ -54,11 +63,15 @@
               {
                 pname = "risala-${name}";
                 inherit version src cargoDeps;
+                inherit (sqlcipher) buildInputs env;
                 auditable = false;
                 doCheck = false;
                 installPhase = "touch $out";
               }
               // args
+              // {
+                nativeBuildInputs = sqlcipher.nativeBuildInputs ++ (args.nativeBuildInputs or [ ]);
+              }
             );
         in
         {
@@ -86,6 +99,7 @@
             librisala = rustPlatform.buildRustPackage {
               pname = "librisala";
               inherit version src cargoDeps;
+              inherit (sqlcipher) nativeBuildInputs buildInputs env;
               cargoBuildFlags = [
                 "-p"
                 "librisala"

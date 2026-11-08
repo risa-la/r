@@ -310,6 +310,92 @@ async fn the_state_is_its_owners_only() {
 }
 
 #[tokio::test]
+async fn the_cache_is_encrypted_with_a_key_in_the_state() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let server = TestServer::builder().start().await;
+    let addr = format!("127.0.0.1:{}", server.addr().port());
+    let fp = server.fingerprint().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let key_file = state.join("cache.key");
+
+    // First use makes the key: 32 bytes, its owner's only.
+    ok(&state, &["trust", &addr, &fp]).await;
+    ok(&state, &["guest", &addr, "sam"]).await;
+    let key = std::fs::read(&key_file).unwrap();
+    assert_eq!(key.len(), 32);
+    assert_eq!(mode(&key_file), 0o600);
+    let cache = std::fs::read(state.join("cache.db")).unwrap();
+    assert!(!cache.starts_with(b"SQLite format 3"));
+
+    // Later runs use it.
+    assert!(ok(&state, &["whoami"]).await.contains("~sam"));
+    assert_eq!(std::fs::read(&key_file).unwrap(), key);
+
+    // Another key does not open the cache, and says so.
+    std::fs::write(&key_file, [0x42; 32]).unwrap();
+    let out = risala(&state, &["whoami"]).await;
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("cache.key") && err.contains("does not open"),
+        "{err}"
+    );
+    assert!(!err.contains("hmac"), "{err}");
+
+    // Nor does a key that others can read, or one of the wrong size.
+    std::fs::write(&key_file, &key).unwrap();
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = stderr(&risala(&state, &["whoami"]).await);
+    assert!(err.contains("chmod 600"), "{err}");
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&key_file, &key[..31]).unwrap();
+    let err = stderr(&risala(&state, &["whoami"]).await);
+    assert!(err.contains("32 bytes"), "{err}");
+
+    std::fs::write(&key_file, &key).unwrap();
+    assert!(ok(&state, &["whoami"]).await.contains("~sam"));
+}
+
+#[tokio::test]
+async fn a_cache_from_before_encryption_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    std::fs::set_permissions(state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let path = state.join("cache.db");
+    {
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE kept (what TEXT);
+             INSERT INTO kept VALUES ('unsent words');",
+        )
+        .unwrap();
+    }
+
+    let out = risala(state, &["whoami"]).await;
+    assert!(stderr(&out).contains("no accounts"), "{}", stderr(&out));
+
+    // The file is encrypted now, with the key the CLI made, and holds what
+    // it held.
+    let cache = std::fs::read(&path).unwrap();
+    assert!(!cache.starts_with(b"SQLite format 3"));
+    let key: String = std::fs::read(state.join("cache.key"))
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\""))
+        .unwrap();
+    let what: String = conn
+        .query_row("SELECT what FROM kept", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(what, "unsent words");
+}
+
+#[tokio::test]
 async fn keygen_and_keyline() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path();
