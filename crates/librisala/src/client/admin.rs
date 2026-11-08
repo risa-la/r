@@ -22,6 +22,7 @@ use risala_proto::text::{escape, unescape};
 use risala_proto::types::ServerSetting;
 
 use super::account::{Account, parse_room};
+use super::blocking;
 use super::rooms::{missing, parse_uid};
 use super::types::{
     ClientError, ConnectionInfo, KeyInfo, ReportInfo, RoomList, RoomListing, ServerBanInfo,
@@ -252,13 +253,13 @@ impl Admin {
     /// `this_device` is set on this device's own key for that identity.
     pub async fn keys(&self, uid: &str) -> Result<Vec<KeyInfo>, ClientError> {
         let uid = parse_uid(uid)?;
-        let mine = self
-            .account
-            .client()
-            .device_key(uid.as_str())
-            .ok()
-            .flatten()
-            .map(|k| k.public_key);
+        // A platform key store may block, waiting for the user.
+        let client = self.account.client();
+        let id = uid.to_string();
+        let mine = blocking(&self.account.shared().rt, move || {
+            client.device_key(&id).ok().flatten().map(|k| k.public_key)
+        })
+        .await;
         let answer = self.run(AdminCommand::Keys { uid }).await?;
         Ok(answer
             .lines

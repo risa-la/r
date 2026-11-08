@@ -875,3 +875,65 @@ async fn a_notice_comes_after_the_changes_before_it() {
     sam.disconnect().await;
     server.done().await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn admin_keys_does_not_block_the_runtime() {
+    // As loading_a_key_does_not_block_the_runtime, for the key ADMIN KEYS
+    // marks as this device's (10.5).
+    use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
+    let ca = TestCa::new();
+    let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, mut peer: Peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 GUEST sam").await;
+        peer.send("@ref=1 OK uid=~sam token=t1").await;
+        peer.expect("@ref=2 SYNC").await;
+        peer.send("@ref=2 OK").await;
+        peer.expect("@ref=3 ADMIN KEYS alice@example.org").await;
+        peer.send("@ref=3 OK").await;
+        while let Some(line) = peer.recv().await {
+            if let Some(r) = line.strip_suffix(" QUIT") {
+                peer.send(&format!("{r} OK")).await;
+                break;
+            }
+        }
+        peer.close().await;
+    })
+    .await;
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let keys = Arc::new(SlowKeys {
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+        released: Default::default(),
+    });
+    let client = Client::open_in_memory(ClientOptions {
+        session: crate::conn::SessionOptions {
+            ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
+            connect_to: Some(server.addr),
+            ..crate::conn::SessionOptions::default()
+        },
+        keys: Some(keys.clone()),
+        ..ClientOptions::default()
+    })
+    .unwrap();
+    let sam = client.add_guest("chat.test", "sam").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), sam.connect())
+        .await
+        .expect("connecting")
+        .unwrap();
+    tokio::spawn(async move {
+        entered.await.unwrap();
+        release.send(()).unwrap();
+    });
+    let listed = tokio::time::timeout(
+        Duration::from_secs(30),
+        sam.admin().keys("alice@example.org"),
+    )
+    .await
+    .expect("ADMIN KEYS")
+    .unwrap();
+    assert!(listed.is_empty());
+    assert!(keys.released.load(std::sync::atomic::Ordering::SeqCst));
+    sam.disconnect().await;
+    server.done().await;
+}
