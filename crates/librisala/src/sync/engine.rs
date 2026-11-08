@@ -476,6 +476,27 @@ impl SyncEngine {
         Ok((id, self.finish()))
     }
 
+    /// Queues `DELETE <conv> <seq>` (5.4) in the outbox, bound to the
+    /// conversation's stored id like a message (7.6), since the seq names
+    /// a message of that conversation only. Returns the outbox entry.
+    ///
+    /// It goes out once the id is confirmed on this connection, or, for a
+    /// room the account is no longer in, once SYNC has been answered with
+    /// the id still stored: authors may delete their own messages in rooms
+    /// they have left (5.4). See [`delete_left`] for that rule.
+    pub fn delete(&mut self, conv: &Conv, seq: Seq) -> Result<(OutboxId, Output), SyncError> {
+        let (account, now) = (self.account, self.now());
+        let id = self.write(|tx| {
+            let Some(bound) = tx.conv_by_name(account, conv)?.and_then(|r| r.conv_id) else {
+                return Ok(None);
+            };
+            tx.queue_delete(account, conv, &bound, seq, now).map(Some)
+        })?;
+        let id = id.ok_or_else(|| SyncError::NotJoined(conv.clone()))?;
+        self.flush_outbox()?;
+        Ok((id, self.finish()))
+    }
+
     /// Sends queued messages that were waiting, for example after
     /// [`Output::retry_after`].
     pub fn resume_outbox(&mut self) -> Result<Output, SyncError> {
@@ -1342,6 +1363,15 @@ impl SyncEngine {
                     tx.outbox_requeue(outbox)?;
                     return Ok(Some(err.retry.unwrap_or(1)));
                 }
+                // A DELETE whose target is gone already: sent twice after a
+                // reconnect, or deleted by someone else first (5.4). If its
+                // DELETE event is stored, the message is deleted as asked.
+                Outcome::Err(err) if err.code == ErrorCode::NotFound && item.delete.is_some() => {
+                    match deleted_by(tx, account, &item)? {
+                        Some(done) => tx.outbox_sent(outbox, done)?,
+                        None => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
+                    }
+                }
                 Outcome::Err(err) => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
                 Outcome::Failed => tx.outbox_failed(outbox, FailReason::Unconfirmed)?,
                 // Never sent, so it is not "maybe sent".
@@ -1746,6 +1776,9 @@ impl SyncEngine {
             .iter()
             .filter_map(|(c, l)| Some((c.clone(), l.confirmed.clone()?)))
             .collect();
+        // Rooms the account is not in can be told apart from rooms not
+        // confirmed yet only once SYNC has answered (7.1).
+        let synced = self.syncing.is_none() && !self.want_sync;
         let to_send = self.write(|tx| {
             let mut to_send = Vec::new();
             for item in tx.outbox_pending(account)? {
@@ -1762,11 +1795,12 @@ impl SyncEngine {
                     }
                     // Sent on an earlier connection, with no answer. Only an
                     // identity's cid survives that, or a resumed guest
-                    // session's, and only for 24 hours.
+                    // session's, and only for 24 hours. A DELETE needs no
+                    // cid: sent twice, the second gets `not-found` (5.4).
                     let fresh = item
                         .first_sent
                         .is_some_and(|t| now.saturating_duration_since(t) < window);
-                    if !cids_hold || !fresh {
+                    if item.delete.is_none() && (!cids_hold || !fresh) {
                         tx.outbox_failed(item.id, FailReason::Unconfirmed)?;
                         continue;
                     }
@@ -1774,14 +1808,17 @@ impl SyncEngine {
                 // The id confirmed on this connection, if the store still
                 // has it: another process sharing the store may have
                 // learned that the room changed.
-                let stored = tx
-                    .conv_by_name(account, &item.conv)?
-                    .and_then(|r| r.conv_id);
+                let row = tx.conv_by_name(account, &item.conv)?;
+                let left = row.as_ref().is_some_and(|r| !r.joined);
+                let stored = row.and_then(|r| r.conv_id);
                 let live = confirmed
                     .get(&item.conv)
                     .filter(|id| stored.as_ref() == Some(*id));
                 match (&item.conv_id, live) {
                     (Some(bound), Some(id)) if bound == id => {}
+                    (Some(bound), None)
+                        if item.delete.is_some()
+                            && delete_left(synced, left, stored.as_ref(), bound) => {}
                     (Some(_), Some(_)) => {
                         // The room was dropped and created again (7.6).
                         tx.outbox_failed(item.id, FailReason::RoomChanged)?;
@@ -1804,18 +1841,54 @@ impl SyncEngine {
             Ok(to_send)
         })?;
         for item in to_send {
-            let command = Command::Msg {
-                conv: item.conv,
-                text: item.draft.text,
-                relation: item.draft.relation,
-                file: item.draft.file,
-                cid: Some(item.cid),
+            let command = match item.delete {
+                Some(seq) => Command::Delete {
+                    conv: item.conv,
+                    seq,
+                },
+                None => Command::Msg {
+                    conv: item.conv,
+                    text: item.draft.text,
+                    relation: item.draft.relation,
+                    file: item.draft.file,
+                    cid: Some(item.cid),
+                },
             };
             self.sending.insert(item.id);
             self.issue(command, Pending::Msg { outbox: item.id });
         }
         Ok(())
     }
+}
+
+/// The seq of the stored DELETE event of the message an outbox DELETE
+/// targets, in the conversation it is bound to, if one is stored.
+fn deleted_by(
+    tx: &Tx<'_>,
+    account: AccountId,
+    item: &crate::store::OutboxItem,
+) -> Result<Option<Seq>, StoreError> {
+    let Some(target) = item.delete else {
+        return Ok(None);
+    };
+    match tx.conv_by_name(account, &item.conv)? {
+        Some(row) if row.conv_id.is_some() && row.conv_id == item.conv_id => {
+            tx.delete_of(row.id, target.get())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether a DELETE bound to `bound` may be sent for a room that is not
+/// confirmed on this connection (5.4): SYNC has answered, the cache says
+/// the account is not in the room, and still has the id the DELETE is
+/// bound to. Authors may delete their own messages in rooms they have
+/// left, but the server cannot confirm the room's id to someone who no
+/// longer reads it, so a room dropped and created again since it was last
+/// seen cannot be told apart here. The server deletes only the sender's
+/// own messages in a room they cannot read.
+fn delete_left(synced: bool, left: bool, stored: Option<&Id>, bound: &Id) -> bool {
+    synced && left && stored == Some(bound)
 }
 
 /// Learns a conversation's id and head from a reply (7.1). The head is

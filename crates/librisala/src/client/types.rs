@@ -912,7 +912,9 @@ pub enum OutboxStatus {
     Queued,
     /// Sent, with no answer yet.
     Sending,
-    /// The server accepted it as event `seq`.
+    /// The server accepted it as event `seq`. For a DELETE whose message
+    /// was deleted already, for example by a moderator first, `seq` is
+    /// that earlier DELETE event (5.4).
     Sent {
         /// The seq.
         seq: u64,
@@ -975,6 +977,9 @@ pub struct OutboxEntry {
     pub created_ms: u64,
     /// The message it replies to, if it is a reply (5.3).
     pub reply_to: Option<u64>,
+    /// For a DELETE (5.4), the message it deletes; `text` is then empty.
+    /// `None` for a message.
+    pub deletes: Option<u64>,
 }
 
 impl From<OutboxItem> for OutboxEntry {
@@ -1015,6 +1020,7 @@ impl From<OutboxItem> for OutboxEntry {
                 Some(risala_proto::types::Relation::Reply(s)) => Some(s.get()),
                 _ => None,
             },
+            deletes: item.delete.map(|s| s.get()),
         }
     }
 }

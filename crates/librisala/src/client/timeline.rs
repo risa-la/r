@@ -256,9 +256,10 @@ impl State {
     }
 
     /// Whether an outbox entry is shown as an item: a message or a reply
-    /// that has not been sent yet, or failed.
+    /// that has not been sent yet, or failed. Not a DELETE (5.4).
     fn shows(item: &OutboxItem) -> bool {
         !matches!(item.state, OutboxState::Sent(_))
+            && item.delete.is_none()
             && matches!(item.draft.relation, None | Some(Relation::Reply(_)))
     }
 

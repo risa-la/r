@@ -340,6 +340,49 @@ fn delete_before_its_target() {
 }
 
 #[test]
+fn related_placeholders_remove_edits_and_reactions() {
+    // 7.3: RELATED returns deleted edits and reactions as placeholders, so
+    // that a client can remove ones it has stored (5.4).
+    let (store, _, conv) = setup();
+    store_all(
+        &store,
+        conv,
+        &[
+            ev(1, "from=bob@example.net MSG #general lunch?"),
+            ev(2, "from=bob@example.net;edit=1 MSG #general lunch at 12?"),
+            ev(3, "from=bob@example.net;edit=1 MSG #general lunch at 1?"),
+            ev(4, "from=carol@example.com;react=1 MSG #general 🍕"),
+        ],
+    );
+    assert_eq!(text(&store, conv, 1), ("lunch at 1?".into(), false));
+    let changes = store_all(
+        &store,
+        conv,
+        &[
+            ev(3, "from=bob@example.net;edit=1;deleted MSG #general"),
+            ev(4, "from=carol@example.com;react=1;deleted MSG #general"),
+        ],
+    );
+    // The previous version is current again, and the reaction is gone.
+    assert_eq!(text(&store, conv, 1), ("lunch at 12?".into(), false));
+    let item = store.message(conv, seq(1)).unwrap().unwrap();
+    assert_eq!(item.edit, Some(seq(2)));
+    assert!(item.reactions.is_empty());
+    assert!(changes.contains(&Change::Updated { conv, seq: seq(1) }));
+    for line in &store.export(conv).unwrap()[2..] {
+        assert!(line.contains(";deleted MSG"), "{line}");
+        assert!(!line.contains("lunch") && !line.contains('🍕'), "{line}");
+    }
+    // A placeholder for an edit not stored yet is stored as one.
+    store_all(
+        &store,
+        conv,
+        &[ev(5, "from=bob@example.net;edit=1;deleted MSG #general")],
+    );
+    assert_eq!(text(&store, conv, 1), ("lunch at 12?".into(), false));
+}
+
+#[test]
 fn sync_point_follows_stored_events() {
     let (store, _, conv) = setup();
     let msg = |n| ev(n, "from=bob@example.net MSG #general hi");

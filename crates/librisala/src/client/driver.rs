@@ -321,6 +321,7 @@ enum Input {
     Join(Room),
     Part(Room, String),
     Send(Conv, Draft),
+    Delete(Conv, Seq),
     MarkRead(Conv, Seq),
     LoadOlder(Conv),
     Download(Conv),
@@ -559,6 +560,7 @@ impl Online<'_> {
                 (Input::Part(room, reason), Ctx::Part(reply))
             }
             Cmd::Send { conv, draft, reply } => (Input::Send(conv, draft), Ctx::Send(reply)),
+            Cmd::Delete { conv, seq, reply } => (Input::Delete(conv, seq), Ctx::Send(reply)),
             Cmd::MarkRead { conv, seq, reply } => (Input::MarkRead(conv, seq), Ctx::Done(reply)),
             Cmd::LoadOlder { conv, reply } => (Input::LoadOlder(conv), Ctx::Done(reply)),
             Cmd::Download { conv, reply } => (Input::Download(conv), Ctx::Done(reply)),
@@ -908,6 +910,10 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
             let (id, out) = engine.send(&conv, &draft)?;
             return Ok((out, Some(id)));
         }
+        Input::Delete(conv, seq) => {
+            let (id, out) = engine.delete(&conv, seq)?;
+            return Ok((out, Some(id)));
+        }
         Input::MarkRead(conv, seq) => engine.mark_read(&conv, seq)?,
         Input::LoadOlder(conv) => engine.load_older(&conv)?,
         Input::Download(conv) => engine.download(&conv)?,
@@ -1053,6 +1059,11 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
             let result = blocking(&shared.rt, move || queue_offline(&s, &conv, &draft)).await;
             let _ = reply.send(result);
         }
+        Cmd::Delete { conv, seq, reply } => {
+            let s = shared.clone();
+            let result = blocking(&shared.rt, move || delete_offline(&s, &conv, seq)).await;
+            let _ = reply.send(result);
+        }
         Cmd::MarkRead { conv, seq, reply } => {
             let s = shared.clone();
             let result = blocking(&shared.rt, move || {
@@ -1121,6 +1132,21 @@ fn queue_offline(
         }
         tx.queue(account, conv, bound.as_ref(), draft, now)
             .map(Some)
+    })?;
+    publish_changes(shared, changes);
+    id.ok_or_else(|| ClientError::NotJoined(conv.to_string()))
+}
+
+/// Queues a DELETE with no connection, bound to the stored id (5.4, 7.6),
+/// as [`SyncEngine::delete`] does.
+fn delete_offline(shared: &AccountShared, conv: &Conv, seq: Seq) -> Result<OutboxId, ClientError> {
+    let account = shared.id;
+    let now = shared.options.sync.clock.now();
+    let (id, changes) = shared.store.write(|tx| {
+        let Some(bound) = tx.conv_by_name(account, conv)?.and_then(|r| r.conv_id) else {
+            return Ok(None);
+        };
+        tx.queue_delete(account, conv, &bound, seq, now).map(Some)
     })?;
     publish_changes(shared, changes);
     id.ok_or_else(|| ClientError::NotJoined(conv.to_string()))

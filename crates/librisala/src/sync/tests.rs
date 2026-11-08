@@ -1950,3 +1950,122 @@ fn a_guest_signed_in_under_a_numbered_name_knows_its_own_join() {
         .unwrap();
     assert!(!engine.is_live(&conv("#general")));
 }
+
+#[test]
+fn deleting_goes_through_the_outbox() {
+    // 5.4: DELETE is bound to the room's id and sent once it is confirmed.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    let (id, out) = h.engine.delete(&conv("#general"), seq(2)).unwrap();
+    h.absorb(out);
+    h.idle();
+    let item = h.store.outbox_item(id).unwrap().unwrap();
+    assert_eq!(item.delete, Some(seq(2)));
+    assert_eq!(item.conv_id, Some("k1".parse().unwrap()));
+    h.reply(r, &["CONV #general k1 3 0"], "OK");
+    let d = h.expect("DELETE #general 2");
+    h.line(&ev(4, "from=alice@example.org DELETE #general 2"));
+    h.reply(d, &[], "OK seq=4");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Sent(seq(4))
+    );
+    // Nothing is queued for a conversation with no id.
+    assert!(matches!(
+        h.engine.delete(&conv("#nowhere"), seq(1)),
+        Err(SyncError::NotJoined(_))
+    ));
+}
+
+#[test]
+fn a_delete_is_sent_again_after_a_reconnect() {
+    // DELETE has no cid (7.6), but sending it twice is safe: the second
+    // gets not-found (5.4). A guest sends it again too.
+    for me in [ALICE, "~sam"] {
+        let mut h = H::new(me);
+        h.joined("k1", 3);
+        let (id, out) = h.engine.delete(&conv("#general"), seq(3)).unwrap();
+        h.absorb(out);
+        h.expect("DELETE #general 3");
+        // The connection drops before the OK; the DELETE went through.
+        let r = h.reconnect();
+        h.reply(r, &["CONV #general k1 4 0"], "OK");
+        let fill = h.expect("HISTORY #general after=3 limit=50");
+        let d = h.expect("DELETE #general 3");
+        h.reply_s(
+            fill,
+            &[ev(4, &format!("from={me} DELETE #general 3"))],
+            "OK id=k1 more=0",
+        );
+        h.reply(d, &[], "ERR not-found");
+        assert_eq!(
+            h.store.outbox_item(id).unwrap().unwrap().state,
+            OutboxState::Sent(seq(4)),
+            "{me}"
+        );
+    }
+}
+
+#[test]
+fn a_delete_of_a_message_not_deleted_that_is_not_found_fails() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (id, out) = h.engine.delete(&conv("#general"), seq(9)).unwrap();
+    h.absorb(out);
+    let d = h.expect("DELETE #general 9");
+    h.reply(d, &[], "ERR not-found");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::Rejected(ErrorCode::NotFound))
+    );
+}
+
+#[test]
+fn authors_delete_in_rooms_they_left() {
+    // 5.4: an author may delete their own messages after leaving. The
+    // room is not confirmed on the connection, so the DELETE waits until
+    // SYNC says the account is not in it, with the id still stored.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    h.reply(r, &[], "OK");
+    assert!(!h.conv("#general").joined);
+    let (id, out) = h.engine.delete(&conv("#general"), seq(2)).unwrap();
+    h.absorb(out);
+    let d = h.expect("DELETE #general 2");
+    h.reply(d, &[], "OK seq=7");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Sent(seq(7))
+    );
+
+    // Queued while not known to have left, it goes out once SYNC answers.
+    let r = h.reconnect();
+    let (id, out) = h.engine.delete(&conv("#general"), seq(1)).unwrap();
+    h.absorb(out);
+    h.idle();
+    h.reply(r, &[], "OK");
+    h.expect("DELETE #general 1");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Sending
+    );
+}
+
+#[test]
+fn a_delete_for_a_dropped_room_is_never_sent() {
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    let (gone, out) = h.engine.delete(&conv("#general"), seq(2)).unwrap();
+    h.absorb(out);
+    // The room was dropped and created again: seq 2 is another message.
+    h.reply(r, &["CONV #general k2 1 0"], "OK");
+    h.expect("HISTORY #general after=0 limit=50");
+    h.idle();
+    assert_eq!(
+        h.store.outbox_item(gone).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::RoomChanged)
+    );
+}

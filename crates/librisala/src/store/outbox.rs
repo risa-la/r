@@ -1,5 +1,5 @@
 //! The outbox: messages waiting to be sent, with the cid that makes
-//! resending safe (7.6).
+//! resending safe (7.6), and deletions of messages (5.4).
 
 use std::fmt;
 
@@ -10,7 +10,7 @@ use risala_proto::types::{Cid, FileUrl, Relation};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::events::Tx;
-use super::{AccountId, Change, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
+use super::{AccountId, Change, ConvId, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
 
 /// A message to send: MSG's text and tags (5.3, 5.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,8 +136,11 @@ pub struct OutboxItem {
     pub conv_id: Option<Id>,
     /// Its cid (7.6).
     pub cid: Cid,
-    /// What to send.
+    /// What to send. Empty for a DELETE.
     pub draft: Draft,
+    /// For `DELETE <conv> <seq>` (5.4), the message to delete; then
+    /// `draft` is empty. `None` for a message.
+    pub delete: Option<Seq>,
     /// Where it is.
     pub state: OutboxState,
     /// When it was queued.
@@ -150,7 +153,7 @@ pub struct OutboxItem {
 
 const OUTBOX_COLS: &str =
     "id, account, conv, conv_id, cid, text, rel, target, file_url, state, seq, error, created,
-     first_sent, claim, claimed_at";
+     first_sent, claim, claimed_at, verb";
 
 type RawItem = (
     (i64, i64, String, Option<String>, String, String),
@@ -167,6 +170,7 @@ type RawItem = (
         Option<i64>,
         Option<String>,
         Option<i64>,
+        String,
     ),
 );
 
@@ -181,7 +185,14 @@ fn raw_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
             r.get(5)?,
         ),
         (r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
-        (r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?),
+        (
+            r.get(11)?,
+            r.get(12)?,
+            r.get(13)?,
+            r.get(14)?,
+            r.get(15)?,
+            r.get(16)?,
+        ),
     ))
 }
 
@@ -194,11 +205,16 @@ fn finish_item(raw: RawItem) -> Result<OutboxItem, StoreError> {
     let (
         (id, account, conv, conv_id, cid, text),
         (rel, target, file, state, n),
-        (error, created, first, claim, claimed_at),
+        (error, created, first, claim, claimed_at, verb),
     ) = raw;
-    let relation = match (rel, target) {
-        (Some(key), Some(t)) => Relation::new(&key, seq(t)?),
+    let relation = match (&rel, target) {
+        (Some(key), Some(t)) => Relation::new(key, seq(t)?),
         _ => None,
+    };
+    let delete = match (verb.as_str(), target) {
+        ("MSG", _) => None,
+        ("DELETE", Some(t)) => Some(seq(t)?),
+        _ => return Err(StoreError::Corrupt(format!("bad outbox verb {verb:?}"))),
     };
     let state = match state.as_str() {
         "queued" => OutboxState::Queued,
@@ -218,6 +234,7 @@ fn finish_item(raw: RawItem) -> Result<OutboxItem, StoreError> {
             relation,
             file: file.map(|f| parse(&f, "file URL")).transpose()?,
         },
+        delete,
         state,
         created: time(created)?,
         first_sent: first.map(time).transpose()?,
@@ -297,6 +314,50 @@ impl Tx<'_> {
         let id = OutboxId(self.conn().last_insert_rowid());
         self.changed(Change::Outbox { id });
         Ok(id)
+    }
+
+    /// Adds `DELETE <conv> <target>` to the outbox (5.4), bound to
+    /// `conv_id` like a message (7.6): the seq names a message of that
+    /// conversation, and of no other with the same name.
+    pub(crate) fn queue_delete(
+        &mut self,
+        account: AccountId,
+        conv: &Conv,
+        conv_id: &Id,
+        target: Seq,
+        now: Timestamp,
+    ) -> Result<OutboxId, StoreError> {
+        let cid = new_cid()?;
+        self.conn().execute(
+            "INSERT INTO outbox (account, conv, conv_id, cid, text, target, state, created, verb)
+             VALUES (?1, ?2, ?3, ?4, '', ?5, 'queued', ?6, 'DELETE')",
+            params![
+                account.0,
+                conv.as_str(),
+                conv_id.as_str(),
+                cid.as_str(),
+                sql(target.get()),
+                now.unix_millis() as i64,
+            ],
+        )?;
+        let id = OutboxId(self.conn().last_insert_rowid());
+        self.changed(Change::Outbox { id });
+        Ok(id)
+    }
+
+    /// The seq of a stored DELETE event of message `target` (5.4), if one
+    /// is stored.
+    pub(crate) fn delete_of(&self, conv: ConvId, target: u64) -> Result<Option<Seq>, StoreError> {
+        let n: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT MIN(seq) FROM events WHERE conv = ?1 AND target = ?2 AND verb = 'DELETE'",
+                params![conv.0, sql(target)],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        n.map(seq).transpose()
     }
 
     /// An outbox entry.

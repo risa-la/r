@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -276,6 +276,16 @@ ALTER TABLE blocks ADD COLUMN changed INTEGER NOT NULL DEFAULT 0;
 /// on its own meanwhile, even after a restart.
 const V8: &str = "
 ALTER TABLE accounts ADD COLUMN unregister_lost INTEGER;
+";
+
+/// Version 9: DELETE in the outbox (5.4).
+///
+/// `outbox.verb` is `MSG` for a message, or `DELETE` for a deletion of
+/// message `target`, which has no text, relation or file. A DELETE entry
+/// still gets a cid, to keep the column's constraints, but never sends
+/// it: DELETE has no `cid` tag (7.6).
+const V9: &str = "
+ALTER TABLE outbox ADD COLUMN verb TEXT NOT NULL DEFAULT 'MSG' CHECK (verb IN ('MSG', 'DELETE'));
 ";
 
 /// Brings the schema up to [`VERSION`].
