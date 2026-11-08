@@ -171,8 +171,8 @@ fn content_line() -> impl Strategy<Value = String> {
         1 => report_line(),
         1 => (any::<u32>(), fixed(1120)).prop_map(|(l, c)| format!("CHALLENGE {l} {c}")),
         1 => (any::<u32>(), fixed(48)).prop_map(|(l, m)| format!("ANSWER {l} {m}")),
-        1 => (any::<u32>(), fixed(1312), fixed(2420), fixed(2420))
-            .prop_map(|(p, k, c, a)| format!("ATTEST {p} {k} {c} {a}")),
+        1 => (any::<u32>(), fixed(1312), fixed(2420), fixed(2420), fixed(16))
+            .prop_map(|(p, k, c, a, s)| format!("ATTEST {p} {k} {c} {a} {s}")),
         1 => (any::<u32>(), fixed(32)).prop_map(|(p, s)| format!("REVEAL {p} {s}")),
         1 => (boxname(), 1..=i64::MAX as u64).prop_map(|(b, s)| format!("READ {b} {s}")),
         1 => block_target().prop_map(|t| format!("BLOCK {t}")),

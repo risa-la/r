@@ -63,10 +63,11 @@ fn every_verb_round_trips() {
         format!("CHALLENGE 3 {}", b64(CHALLENGE_LEN, 10)),
         format!("ANSWER 0 {}", b64(CONFIRM_MAC_LEN, 11)),
         format!(
-            "ATTEST 20401 {} {} {}",
+            "ATTEST 20401 {} {} {} {}",
             b64(1312, 12),
             b64(2420, 13),
-            b64(2420, 14)
+            b64(2420, 14),
+            b64(16, 15)
         ),
         format!("REVEAL 20401 {}", b64(SEED_LEN, 15)),
         format!("READ {BOX} 9120"),
@@ -420,8 +421,23 @@ fn value_rules() {
         format!("CHALLENGE 1 {}", b64(CHALLENGE_LEN - 1, 1)),
         format!("ANSWER 1 {}", b64(32, 1)),
         format!(
-            "ATTEST 1 {} {} {}",
+            "ATTEST 1 {} {} {} {}",
             b64(1311, 1),
+            b64(2420, 1),
+            b64(2420, 1),
+            b64(16, 1)
+        ),
+        // The pseudonym is 16 bytes, and required (12.10).
+        format!(
+            "ATTEST 1 {} {} {} {}",
+            b64(1312, 1),
+            b64(2420, 1),
+            b64(2420, 1),
+            b64(15, 1)
+        ),
+        format!(
+            "ATTEST 1 {} {} {}",
+            b64(1312, 1),
             b64(2420, 1),
             b64(2420, 1)
         ),
@@ -653,7 +669,7 @@ fn hand_built_lines_are_checked() {
 
 fn sample_lines() -> Vec<ContentLine> {
     let content: Content = format!(
-        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig}\nREVEAL 1 {seed}\nREAD {BOX} 1\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
+        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nREAD {BOX} 1\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
         id = id(1),
         ct = b64(CHALLENGE_LEN, 1),
         mac = b64(48, 1),
@@ -662,6 +678,7 @@ fn sample_lines() -> Vec<ContentLine> {
         seed = b64(32, 1),
         h = hash('a'),
         tr = b64(TRANSFER_REF_LEN, 1),
+        ps = b64(16, 1),
     )
     .parse()
     .unwrap();

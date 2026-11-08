@@ -77,6 +77,7 @@ use crate::auth::{PublicKey, Signature};
 use crate::error::ParseError;
 use crate::frame::is_forbidden_control;
 use crate::line::{Line, LineBuilder, Params, Tags};
+use crate::mls::Pseudonym;
 use crate::names::{BlobRef, BlockTarget, BoxName, Domain, Identity, Seq};
 use crate::parse::{
     bad, last, limit, number, number_u32, opt_tok, parse_tag, required_tag, tag_value, text_max,
@@ -277,8 +278,9 @@ pub enum ContentLine {
         /// The MAC over the ConfirmContent.
         mac: ConfirmMac,
     },
-    /// `ATTEST <period> <period-key> <certificate> <attestation>`: binds
-    /// the sender's leaf to its device for one period (12.10).
+    /// `ATTEST <period> <period-key> <certificate> <attestation>
+    /// <pseudonym>`: binds the sender's leaf to its device for one period,
+    /// and announces the leaf's pseudonym for it (12.10, 7.3).
     Attest {
         /// The period: a UTC day, numbered from 1970-01-01 as 0.
         period: u32,
@@ -288,6 +290,10 @@ pub enum ContentLine {
         certificate: Signature,
         /// The AttestContent's signature by the period key.
         attestation: Signature,
+        /// The leaf's pseudonym for the period. Devices check that it is
+        /// the one in the RisalaAAD of the message that carries the line
+        /// (12.10).
+        pseudonym: Pseudonym,
     },
     /// `REVEAL <period> <seed>`: publishes a period key once its period is
     /// over (12.10).
@@ -548,11 +554,13 @@ impl ContentLine {
                 let period = number_u32(&mut p)?;
                 let period_key = tok(&mut p)?;
                 let certificate = tok(&mut p)?;
+                let attestation = tok(&mut p)?;
                 ContentLine::Attest {
                     period,
                     period_key,
                     certificate,
-                    attestation: last(p)?,
+                    attestation,
+                    pseudonym: last(p)?,
                 }
             }
             "REVEAL" => {
@@ -699,11 +707,13 @@ impl ContentLine {
                 period_key,
                 certificate,
                 attestation,
+                pseudonym,
             } => {
                 b.token(period)
                     .token(period_key)
                     .token(certificate)
-                    .token(attestation);
+                    .token(attestation)
+                    .token(pseudonym);
             }
             ContentLine::Reveal { period, seed } => {
                 b.token(period).token(seed);

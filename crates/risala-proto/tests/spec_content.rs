@@ -97,6 +97,7 @@ fn instantiate(syntax: &str) -> String {
         ("<period-key>", b64(1312)),
         ("<certificate>", b64(2420)),
         ("<attestation>", b64(2420)),
+        ("<pseudonym>", b64(16)),
         ("<seed>", b64(SEED_LEN)),
         ("<target>", "*@example.net".into()),
         ("<hashes>", format!("{hash} {hash}")),
