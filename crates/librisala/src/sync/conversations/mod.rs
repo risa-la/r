@@ -281,6 +281,33 @@ pub(crate) trait Hooks: Send + Sync {
         let _ = (tx, conv, outbox, body);
         super::confirm::Outgoing::Keep
     }
+
+    /// Posts of `mailbox` after `after` and before `before` expired before
+    /// the device fetched them (7.4): transfers (C4) ask the identity's
+    /// other devices for them with WANT (12.13).
+    fn posts_expired(
+        &self,
+        tx: &mut Tx<'_>,
+        account: AccountId,
+        mailbox: &BoxName,
+        after: u64,
+        before: u64,
+    ) -> Vec<Action> {
+        let _ = (tx, account, mailbox, after, before);
+        Vec::new()
+    }
+
+    /// The `quiet` tag for FOLLOW of `mailbox` (7.1, 9.2), from push (C4).
+    /// `None` leaves it out, as devices SHOULD.
+    fn follow_quiet(
+        &self,
+        store: &crate::store::Store,
+        account: AccountId,
+        mailbox: &BoxName,
+    ) -> Option<risala_proto::types::PushTag> {
+        let _ = (store, account, mailbox);
+        None
+    }
 }
 
 /// The hooks of no other area.
@@ -1534,14 +1561,24 @@ impl ConversationEngine {
                     _ => None,
                 };
                 if let Some(to) = expired_to {
-                    self.write(cx, &me, out, |tx, c| {
+                    let asked = self.write(cx, &me, out, |tx, c| {
+                        let mut asked = Vec::new();
                         if let Some(mb) = tx.mailbox(c.account, &mailbox)?
                             && mb.sync_point < to
                         {
                             tx.set_sync(mb.conv, &mailbox, to, None)?;
+                            // 12.13: ask the identity's other devices (C4).
+                            asked = c.hooks.posts_expired(
+                                tx,
+                                c.account,
+                                &mailbox,
+                                mb.sync_point,
+                                to + 1,
+                            );
                         }
-                        Ok(())
+                        Ok(asked)
                     })?;
+                    out.extend(asked);
                     self.advance(cx, &me, &mailbox, out)?;
                 }
                 if more {
@@ -1947,7 +1984,7 @@ impl ConversationEngine {
                 Target::Mailbox(mailbox),
                 Command::Follow {
                     mailbox,
-                    quiet: None,
+                    quiet: self.hooks.follow_quiet(&cx.store, cx.account, &mailbox),
                 },
                 Pending::Follow { mailbox },
             );

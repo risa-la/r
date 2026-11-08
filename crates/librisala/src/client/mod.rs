@@ -90,6 +90,13 @@ pub struct ClientOptions {
     /// HTTPS fetches of key files and key logs (4.4, 4.5). `None` uses
     /// `risala-keyfetch` with `ca_verifier`, or the platform's CA check.
     pub https: Option<Arc<dyn identity::Https>>,
+    /// HTTPS for files and blobs (5.6, 12.12). `None` uses
+    /// [`files::TlsFileHttps`] with `ca_verifier`, or the platform's CA
+    /// check (task C4).
+    pub file_https: Option<Arc<dyn files::FileHttps>>,
+    /// Where fetched files are saved. `None` uses `risala-files` in the
+    /// system's temporary directory (task C4).
+    pub download_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ClientOptions {
@@ -104,6 +111,8 @@ impl Default for ClientOptions {
             anonymous_connections: 1,
             clock: Arc::new(SystemClock),
             https: None,
+            file_https: None,
+            download_dir: None,
         }
     }
 }

@@ -199,9 +199,59 @@ pub(crate) struct ClientHooks {
     keys: Arc<dyn KeyStore>,
     /// Leaf confirmation (task C3).
     confirm: Arc<crate::sync::confirm::Confirm>,
+    /// The time, for C4's lines.
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 impl Hooks for ClientHooks {
+    /// WANT, TRANSFER and REPORT go to transfers and reports (C4).
+    fn content_line(
+        &self,
+        tx: &mut crate::store::Tx<'_>,
+        conv: ConversationId,
+        leaf: &crate::store::conversations::LeafRow,
+        line: &risala_proto::content::ContentLine,
+    ) -> Vec<crate::sync::Action> {
+        use risala_proto::content::ContentLine as L;
+        match line {
+            L::Want { .. } | L::Transfer(_) | L::Report(_) => {
+                let now = self.clock.now().unix_millis();
+                crate::sync::transfer::content_line(tx, conv, leaf, line, now).unwrap_or_else(|e| {
+                    tracing::info!(error = %e, "a transfer or report line");
+                    Vec::new()
+                })
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Expired posts are asked for with WANT (C4, 12.13).
+    fn posts_expired(
+        &self,
+        tx: &mut crate::store::Tx<'_>,
+        account: AccountId,
+        mailbox: &risala_proto::names::BoxName,
+        after: u64,
+        before: u64,
+    ) -> Vec<crate::sync::Action> {
+        let now = self.clock.now().unix_millis();
+        crate::sync::transfer::posts_expired(tx, account, mailbox, after, Some(before), now)
+            .unwrap_or_else(|e| {
+                tracing::info!(error = %e, "asking for expired posts");
+                Vec::new()
+            })
+    }
+
+    /// FOLLOW's `quiet`, from push (C4).
+    fn follow_quiet(
+        &self,
+        store: &Store,
+        account: AccountId,
+        mailbox: &risala_proto::names::BoxName,
+    ) -> Option<risala_proto::types::PushTag> {
+        crate::sync::push::follow_quiet(store, account, mailbox)
+    }
+
     fn device_key(&self, _: AccountId, uid: &Uid) -> Option<risala_mls::mldsa::SigningKey> {
         let key_id: Option<String> = self
             .store
@@ -335,6 +385,7 @@ impl Client {
             store: self.store().clone(),
             keys: self.options().keys.clone(),
             confirm: self.confirm_service(),
+            clock: self.options().clock.clone(),
         })
     }
 

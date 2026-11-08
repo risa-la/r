@@ -173,6 +173,15 @@ pub(crate) fn receive(
                 )?;
                 if inserted {
                     shown = true;
+                    // What transfers carry besides the content (C4, 12.13).
+                    crate::sync::transfer::note_message(
+                        tx,
+                        conv.id,
+                        &message_id,
+                        message.counter,
+                        message.previous.map(|p| *p.as_bytes()),
+                        d.identity.device_id.map(|d| d.0),
+                    )?;
                     // A DELETE that arrived first (5.4).
                     for (by, with_role) in tx.kept_deletes(conv.id, &message_id)? {
                         if by == uid || with_role {
@@ -396,6 +405,15 @@ pub(crate) fn queue_lines(
                 frank_key: Some(*message.frank_key.as_bytes()),
                 ..NewMessage::default()
             },
+        )?;
+        // What transfers carry besides the content (C4, 12.13).
+        crate::sync::transfer::note_message(
+            tx,
+            conv,
+            &message_id,
+            message.counter,
+            message.previous.map(|p| *p.as_bytes()),
+            None,
         )?;
         tx.touch(conv, now)?;
     } else if !live {

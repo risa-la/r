@@ -1570,6 +1570,7 @@ dependencies = [
 name = "librisala"
 version = "0.0.0"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "getrandom 0.4.3",
  "openmls",

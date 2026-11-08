@@ -308,6 +308,27 @@ impl Exec {
         }
     }
 
+    /// Sends a command on the connection `target` names and waits for its
+    /// response, for API calls and task C4's worker: a connection of its
+    /// own for [`Target::Own`].
+    pub(crate) async fn request_on(&self, target: Target, command: Command) -> Result<Response> {
+        if let Target::Own(kind) = target {
+            return single_use(
+                &self.addr,
+                self.trust.clone(),
+                self.options.clone(),
+                kind,
+                command,
+            )
+            .await
+            .map_err(Error::from);
+        }
+        let slot = self
+            .slot_for(&target)
+            .ok_or(Error::Internal("no connection for that command".into()))?;
+        self.request(slot, command).await
+    }
+
     /// Sends a command on a slot and waits for its response, for API
     /// calls that are not an engine's (PRESENCE, WATCH).
     pub(crate) async fn request(&self, slot: Slot, command: Command) -> Result<Response> {
@@ -406,11 +427,13 @@ impl Client {
             guest,
             exec: exec.clone(),
         };
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn(run.run(events)),
             tokio::spawn(replies_task(exec.clone(), replies_rx)),
             tokio::spawn(ticker(exec.clone(), self.options().clock.clone())),
         ];
+        // Task C4: files, transfers and backups.
+        tasks.extend(self.spawn_transfer_worker(account, exec.clone()));
         let this = RunningAccount {
             connections,
             exec,
