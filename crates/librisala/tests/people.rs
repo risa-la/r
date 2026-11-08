@@ -1,105 +1,26 @@
 //! Identities with two devices against a real server: read markers,
 //! typing, names, members, presence and blocks (5.7, 7.4, 8.1-8.3).
 //!
-//! **Ignored until the M3 wave-2 server lands.** The server on this branch
-//! does not yet support READ, TYPING, NAME, MEMBERS, WHOIS, PRESENCE or
-//! BLOCK. Run them with `cargo test -p librisala --test people --
-//! --ignored` once it does.
-//!
 //! The identities are hosted by the test server: device A registers them
-//! (4.6), and adds device B's key with KEY ADD (4.7). The server is called
-//! `chat.test`, which is also its identity domain, and the clients connect
-//! to its address on 127.0.0.1 while sending `chat.test` in SNI.
+//! (4.6), and adds device B's key with KEY ADD (4.7), as in `common`.
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use librisala::client::{
-    Account, AccountEvent, AccountEvents, Client, ClientOptions, Presence, TimelineDiff,
-};
-use librisala::conn::keys::MemoryKeyStore;
+use librisala::client::{Account, AccountEvent, Presence, TimelineDiff};
 use risala_server::testing::TestServer;
-
-const HOST: &str = "chat.test";
 
 /// A server hosting identities under `chat.test`, with #general.
 async fn server() -> TestServer {
-    TestServer::builder()
-        .hostname(HOST)
-        .room("#general")
-        .configure(|c| {
-            c.identity_domain = Some(HOST.to_owned());
-            c.server.registration = true;
-            c.limits.registrations_per_hour = 0;
-        })
-        .start()
-        .await
-}
-
-/// A device: a client of its own, with its own key store, that trusts the
-/// server. Returns it and the server address to use.
-fn device(server: &TestServer) -> (Client, String) {
-    let mut options: ClientOptions = options(50);
-    options.session.connect_to = Some(server.addr());
-    options.keys = Some(Arc::new(MemoryKeyStore::default()));
-    let client = Client::open_in_memory(options).unwrap();
-    let addr = format!("{HOST}:{}", server.addr().port());
-    client
-        .accept_fingerprint(&addr, &server.fingerprint().to_string())
-        .unwrap();
-    (client, addr)
+    hosted_server(&["#general"], |_| {}).await
 }
 
 /// Registers `<name>@chat.test` on a new device, signs it in and joins
 /// #general.
 async fn registered(server: &TestServer, name: &str) -> Account {
-    let (client, addr) = device(server);
-    let account = within("REGISTER", client.register(&addr, name))
-        .await
-        .unwrap();
-    within("signing in", account.connect()).await.unwrap();
-    within("joining", account.join("#general")).await.unwrap();
-    within("syncing", account.wait_synced()).await.unwrap();
-    account
-}
-
-/// A second device of `account`'s identity: a new key, added from the
-/// first device (4.7), signed in.
-async fn second_device(server: &TestServer, account: &Account) -> Account {
-    let (client, addr) = device(server);
-    let uid = account.uid();
-    client.create_device_key(&uid, false).await.unwrap();
-    let line = client.key_line(&uid, "phone").unwrap();
-    within("KEY ADD", account.add_key(&line, "")).await.unwrap();
-    let other = client.add_identity(&addr, &uid).unwrap();
-    within("signing in", other.connect()).await.unwrap();
-    within("syncing", other.wait_synced()).await.unwrap();
-    other
-}
-
-/// Waits until `f` holds, checking after each event.
-async fn until(what: &str, events: &AccountEvents, f: impl Fn() -> bool) {
-    within(what, async {
-        while !f() {
-            let _ = tokio::time::timeout(Duration::from_millis(200), events.next()).await;
-        }
-    })
-    .await;
-}
-
-/// Waits for the first event that `f` picks.
-async fn event<T>(what: &str, events: &AccountEvents, f: impl Fn(&AccountEvent) -> Option<T>) -> T {
-    within(what, async {
-        loop {
-            if let Some(t) = f(&events.next().await.expect("an event")) {
-                return t;
-            }
-        }
-    })
-    .await
+    registered_in(server, name, "#general").await
 }
 
 fn unread(account: &Account) -> u64 {

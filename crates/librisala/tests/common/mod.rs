@@ -6,7 +6,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use librisala::client::{Client, ClientOptions};
+use librisala::client::{Account, AccountEvent, AccountEvents, Client, ClientOptions};
 use librisala::conn::{Backoff, SessionOptions, roots_ca_verifier};
 use librisala::proto::server::{ServerLine, ServerMessage};
 use librisala::sync::SyncConfig;
@@ -152,4 +152,120 @@ impl Rng {
     pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.next() % (hi - lo)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Identities the test server hosts
+
+/// The test server's hostname and identity domain. The clients connect to
+/// its address on 127.0.0.1 while sending `chat.test` in SNI.
+pub const HOST: &str = "chat.test";
+
+/// A server that hosts identities under `chat.test`, with `rooms`, and
+/// `f` applied to its configuration.
+pub async fn hosted_server(
+    rooms: &[&str],
+    f: impl FnOnce(&mut risala_server::config::Config),
+) -> TestServer {
+    let mut builder = TestServer::builder().hostname(HOST);
+    for room in rooms {
+        builder = builder.room(room);
+    }
+    builder
+        .configure(|c| {
+            c.identity_domain = Some(HOST.to_owned());
+            c.server.registration = true;
+            c.limits.registrations_per_hour = 0;
+            f(c);
+        })
+        .start()
+        .await
+}
+
+/// A device: a client of its own, with its own key store, that trusts the
+/// server and reaches it at `at`. Returns it and the server address to
+/// use.
+pub fn device_at(server: &TestServer, at: SocketAddr) -> (Client, String) {
+    let mut options: ClientOptions = options(50);
+    options.session.connect_to = Some(at);
+    options.keys = Some(std::sync::Arc::new(
+        librisala::conn::keys::MemoryKeyStore::default(),
+    ));
+    let client = Client::open_in_memory(options).unwrap();
+    let addr = format!("{HOST}:{}", server.addr().port());
+    client
+        .accept_fingerprint(&addr, &server.fingerprint().to_string())
+        .unwrap();
+    (client, addr)
+}
+
+/// A device that reaches the server directly.
+pub fn device(server: &TestServer) -> (Client, String) {
+    device_at(server, server.addr())
+}
+
+/// Registers `<name>@chat.test` on a new device reaching the server at
+/// `at`, and signs it in.
+pub async fn registered_at(server: &TestServer, at: SocketAddr, name: &str) -> Account {
+    let (client, addr) = device_at(server, at);
+    let account = within("REGISTER", client.register(&addr, name))
+        .await
+        .unwrap();
+    within("signing in", account.connect()).await.unwrap();
+    within("syncing", account.wait_synced()).await.unwrap();
+    account
+}
+
+/// Registers `<name>@chat.test` on a new device and signs it in.
+pub async fn registered(server: &TestServer, name: &str) -> Account {
+    registered_at(server, server.addr(), name).await
+}
+
+/// Registers `<name>@chat.test` on a new device, signs it in and joins
+/// `room`.
+pub async fn registered_in(server: &TestServer, name: &str, room: &str) -> Account {
+    let account = registered(server, name).await;
+    within("joining", account.join(room)).await.unwrap();
+    within("syncing", account.wait_synced()).await.unwrap();
+    account
+}
+
+/// A second device of `account`'s identity: a new key, added from the
+/// first device (4.7), signed in.
+pub async fn second_device(server: &TestServer, account: &Account) -> Account {
+    let (client, addr) = device(server);
+    let uid = account.uid();
+    client.create_device_key(&uid, false).await.unwrap();
+    let line = client.key_line(&uid, "phone").unwrap();
+    within("KEY ADD", account.add_key(&line, "")).await.unwrap();
+    let other = client.add_identity(&addr, &uid).unwrap();
+    within("signing in", other.connect()).await.unwrap();
+    within("syncing", other.wait_synced()).await.unwrap();
+    other
+}
+
+/// Waits until `f` holds, checking after each event.
+pub async fn until(what: &str, events: &AccountEvents, f: impl Fn() -> bool) {
+    within(what, async {
+        while !f() {
+            let _ = tokio::time::timeout(Duration::from_millis(200), events.next()).await;
+        }
+    })
+    .await;
+}
+
+/// Waits for the first event that `f` picks.
+pub async fn event<T>(
+    what: &str,
+    events: &AccountEvents,
+    f: impl Fn(&AccountEvent) -> Option<T>,
+) -> T {
+    within(what, async {
+        loop {
+            if let Some(t) = f(&events.next().await.expect("an event")) {
+                return t;
+            }
+        }
+    })
+    .await
 }
