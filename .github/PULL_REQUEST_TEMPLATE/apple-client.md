@@ -21,18 +21,34 @@
      If upload or a runtime is unavailable, explicitly report what is pending.
      Label each image with device, OS version, and screen/state.
      Include before/after for existing screens when practical.
+     Show dark and light appearance for each affected screen.
      Add iPad captures when its layout is affected.
      For localization changes, include English and Arabic RTL coverage.
      For non-UI changes, replace this section with "Not applicable: <reason>".
+
+     Always lay screenshots out in a table, never one under another: a column
+     per appearance or state (dark/light, before/after, English/Arabic) and a
+     row per screen. Give each image a fixed width with
+     <img src="…" width="…" alt="…"> so the columns line up: about 200 for
+     iPhone, 300 for macOS, 420 for iPad. Put the device and OS version under
+     the heading, and the screen and state in the column headers.
      -->
 
 ### iPhone
 
-<!-- Drop screenshot here. -->
+<!-- Device, OS version. -->
+
+| Screen, dark | Screen, light |
+| --- | --- |
+| <!-- img --> | <!-- img --> |
 
 ### macOS
 
-<!-- Drop screenshot here. -->
+<!-- macOS version. -->
+
+| Screen, dark | Screen, light |
+| --- | --- |
+| <!-- img --> | <!-- img --> |
 
 ## Library integration
 
