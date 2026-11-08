@@ -47,13 +47,14 @@ CREATE TABLE token_hashes (
 ) STRICT, WITHOUT ROWID;
 
 -- Kept posts (5.2), until they expire (7.5): their box, seq, time and
--- message only (4.2).
+-- message, and a commit's next, only (4.2).
 CREATE TABLE posts (
     box BLOB NOT NULL REFERENCES mailboxes (box) ON DELETE CASCADE,
     seq INTEGER NOT NULL CHECK (seq >= 1),
     t INTEGER NOT NULL,             -- ms, when the server accepted it
     message BLOB,                   -- the MLSMessage, or NULL if it is a blob
     blob BLOB CHECK (length(blob) = 48), -- the blob's hash, if it is one (12.12)
+    next BLOB CHECK (length(next) = 48), -- a commit's next= token hash (5.2, 7.2)
     UNIQUE (box, seq),
     CHECK ((message IS NULL) != (blob IS NULL))
 ) STRICT;

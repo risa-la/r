@@ -12,7 +12,7 @@
 //! - `token_hashes`: the sets of send token hashes, per mailbox and epoch,
 //!   with when each hash was added and last used, for their bounds (7.2).
 //! - `posts`: kept posts until they expire (7.5), with their box, seq,
-//!   time and message only (4.2, 5.2).
+//!   time and message, and a commit's `next`, only (4.2, 5.2).
 //! - `cids`: client post ids for 24 hours (7.6).
 //! - `public_rooms`: the public state of each public room's group, its
 //!   GroupInfo and ratchet tree as of the newest epoch, and what LIST,
