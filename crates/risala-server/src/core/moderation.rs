@@ -227,10 +227,13 @@ impl Inner {
             RoomSetting::Guests(GuestAccess::None) => self.part_guests(st).await,
             // `guests read` needs nothing more: MSG and TYPING check the
             // setting as they come.
+            // A shorter period applies to stored events at once (6.2,
+            // 7.5). The setting stands even if this fails; the hourly
+            // run catches up.
             RoomSetting::Retention(_) => {
-                // TODO(M4 rebase): run task A's retention now, so that a
-                // shorter period applies to stored events at once (6.2,
-                // 7.5).
+                if let Err(e) = self.expire_conv(st).await {
+                    tracing::error!(conv = %st.id, "expiring events failed: {e}");
+                }
             }
             _ => {}
         }

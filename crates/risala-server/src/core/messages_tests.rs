@@ -892,3 +892,38 @@ fn the_store_finds_reactions_and_authored_rooms() {
     assert_eq!(s.related(a, all).unwrap().events.len(), 1);
     assert_eq!(s.related(key("#b"), all).unwrap().events.len(), 0);
 }
+
+#[tokio::test]
+async fn shortening_retention_expires_stored_events_at_once() {
+    let day = |n: u32| start().checked_sub(DAY * n).unwrap();
+    let mut c = with_retention("30");
+    c.operators = vec![OP.into()];
+    let mut h = Harness::with(c, |s| {
+        for room in ["#general", "#short"] {
+            put_at(s, room, ALICE, msg("old"), day(20));
+            put_at(s, room, ALICE, msg("new"), day(1));
+        }
+        put(
+            s,
+            "#short",
+            ALICE,
+            EventKind::Role {
+                uid: ALICE.parse().unwrap(),
+                role: Role::Owner,
+            },
+        );
+    });
+    // SET of a room's retention (6.2): only that room.
+    let mut alice = h.signed_in_as(ALICE);
+    alice.lines();
+    h.send(&alice, "set #short retention 7").await;
+    assert_eq!(alice.lines().last().unwrap(), "OK seq=4");
+    assert_eq!(stored(&h, "#short").len(), 3);
+    assert_eq!(stored(&h, "#general").len(), 2);
+    // ADMIN SET of the server's (10.6): every room.
+    let mut op = h.signed_in_as(OP);
+    op.lines();
+    h.send(&op, "admin set retention 10").await;
+    assert_eq!(op.lines(), ["OK"]);
+    assert_eq!(stored(&h, "#general"), [format!("2 {ALICE} MSG")]);
+}

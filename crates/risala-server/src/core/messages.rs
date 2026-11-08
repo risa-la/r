@@ -428,8 +428,6 @@ impl Inner {
     /// Expires a conversation's old events now (7.5), holding the lock the
     /// caller holds. For SET of a room's `retention` (6.2), which applies
     /// to events already stored. Returns how many expired.
-    // TODO(M4 rebase): SET of `retention` (6.2) calls this.
-    #[allow(dead_code)]
     pub(super) async fn expire_conv(&self, st: &ConvState) -> Result<u64, StoreError> {
         let mut total = 0;
         loop {

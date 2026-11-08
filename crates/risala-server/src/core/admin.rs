@@ -586,10 +586,13 @@ impl Inner {
                     self.end_guest_session(&guest, BYE_GUESTS_OFF).await;
                 }
             }
+            // A shorter period applies to stored events at once (7.5,
+            // 10.6). The setting stands even if this fails; the hourly
+            // run catches up.
             ServerSetting::Retention(_) => {
-                // TODO(M4 rebase): run task A's retention pass now, so a
-                // shorter period applies to stored events at once (7.5,
-                // 10.6).
+                if let Err(e) = self.expire_all().await {
+                    tracing::error!("expiring events failed: {e}");
+                }
             }
             _ => {}
         }
