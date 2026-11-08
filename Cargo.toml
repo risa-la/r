@@ -53,6 +53,9 @@ rustls-platform-verifier = "0.7"
 # Mozilla's CA roots, for fetching key files (SPEC 4.4). Already in the tree
 # through rustls-platform-verifier.
 webpki-root-certs = "1"
+# P-256, HKDF and AES-128-GCM for push bodies (SPEC 9.3, RFC 8291). Already
+# in the tree as rustls's provider.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }

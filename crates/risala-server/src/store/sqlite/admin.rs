@@ -3,7 +3,7 @@
 
 use rusqlite::params;
 
-use risala_proto::names::Uid;
+use risala_proto::names::{ServerBanTarget, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::ServerSetting;
 
@@ -88,6 +88,53 @@ impl AdminStore for SqliteStore {
     fn remove_operator(&self, uid: &Uid) -> Result<bool> {
         self.write(|tx| Ok(tx.execute("DELETE FROM operators WHERE uid = ?", [uid.as_str()])? == 1))
     }
+
+    fn server_bans(&self) -> Result<Vec<(ServerBanTarget, String)>> {
+        self.read(|tx| {
+            let mut select =
+                tx.prepare_cached("SELECT target, reason FROM server_bans ORDER BY added, rowid")?;
+            let rows = select.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.map(|row| {
+                let (target, reason) = row?;
+                Ok((parsed("server ban", &target)?, reason))
+            })
+            .collect()
+        })
+    }
+
+    fn add_server_ban(
+        &self,
+        target: &ServerBanTarget,
+        reason: &str,
+        now: Timestamp,
+    ) -> Result<bool> {
+        self.write(|tx| {
+            let target = target.to_string();
+            let updated = tx.execute(
+                "UPDATE server_bans SET reason = ? WHERE target = ?",
+                params![reason, target],
+            )?;
+            if updated > 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO server_bans (target, reason, added) VALUES (?, ?, ?)",
+                params![target, reason, millis(now)],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn remove_server_ban(&self, target: &ServerBanTarget) -> Result<bool> {
+        self.write(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM server_bans WHERE target = ?",
+                [target.to_string()],
+            )? == 1)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -151,5 +198,24 @@ mod tests {
         assert!(store.remove_operator(&bob).unwrap());
         assert!(!store.remove_operator(&bob).unwrap());
         assert_eq!(store.operators().unwrap(), [alice]);
+    }
+
+    #[test]
+    fn server_bans() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let t = "2026-11-09T00:00:00.000Z".parse().unwrap();
+        let spam: ServerBanTarget = "spam@example.net".parse().unwrap();
+        let net: ServerBanTarget = "2001:db8::/32".parse().unwrap();
+        assert!(store.server_bans().unwrap().is_empty());
+        assert!(store.add_server_ban(&spam, "spam", t).unwrap());
+        assert!(store.add_server_ban(&net, "", t).unwrap());
+        assert!(!store.add_server_ban(&spam, "more spam", t).unwrap());
+        assert_eq!(
+            store.server_bans().unwrap(),
+            [(spam.clone(), "more spam".into()), (net.clone(), String::new())]
+        );
+        assert!(store.remove_server_ban(&spam).unwrap());
+        assert!(!store.remove_server_ban(&spam).unwrap());
+        assert_eq!(store.server_bans().unwrap(), [(net, String::new())]);
     }
 }

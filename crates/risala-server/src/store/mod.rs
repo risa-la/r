@@ -45,8 +45,13 @@ pub use admin::{AdminStore, ServerSettings};
 pub use identity::IdentityStore;
 pub use keylog::{CheckpointRow, KeyLogStore, LogEntry, LogKeyRow, LoggedRecord, WitnessLogRow};
 pub use keys::{BackupRecord, KeysStore};
-pub use mailbox::{Created, MailboxRecord, MailboxStore, NewMailbox};
-pub use misc::MiscStore;
+pub use mailbox::{
+    Created, KeptPost, MailboxRecord, MailboxStore, NewMailbox, PublicRoomRecord,
+};
+pub use misc::{
+    MiscStore, NewPushSubscription, NewReport, PushAdded, PushSubscription, PushTarget,
+    StoredReport,
+};
 pub use sqlite::{SCHEMA_VERSION, SqliteStore};
 
 /// An error from the store.

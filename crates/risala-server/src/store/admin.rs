@@ -10,7 +10,7 @@
 //!   configuration are not stored.
 //! - `server_bans`: identity, domain and address bans (10.2).
 
-use risala_proto::names::Uid;
+use risala_proto::names::{ServerBanTarget, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Retention, ServerSetting};
 
@@ -67,4 +67,16 @@ pub trait AdminStore {
     /// Removes an operator added with ADMIN OP (10.1). Returns `false` if
     /// it was not one.
     fn remove_operator(&self, uid: &Uid) -> Result<bool>;
+
+    /// Every server ban (10.2), with its reason, escaped, in the order
+    /// they were made. A guest's ban is stored under its address.
+    fn server_bans(&self) -> Result<Vec<(ServerBanTarget, String)>>;
+
+    /// Adds a server ban at `now`, or replaces the reason of the same one
+    /// (10.2). Returns `false` if it was already there.
+    fn add_server_ban(&self, target: &ServerBanTarget, reason: &str, now: Timestamp)
+    -> Result<bool>;
+
+    /// Lifts a server ban (10.2). Returns `false` if there was none.
+    fn remove_server_ban(&self, target: &ServerBanTarget) -> Result<bool>;
 }

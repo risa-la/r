@@ -4,12 +4,15 @@
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use sha2::{Digest as _, Sha384};
 
-use risala_proto::mls::GroupId;
-use risala_proto::names::{BoxName, Uid};
+use risala_proto::mls::{GroupId, Pseudonym};
+use risala_proto::names::{BlobRef, BoxName, Room, Uid};
+use risala_proto::time::Timestamp;
+use risala_proto::types::Role;
 
 use super::{SqliteStore, from_sql_u64, sql_u64};
 use crate::store::{
-    Created, MailboxRecord, MailboxStore, NewMailbox, Result, fixed, millis, parsed, timestamp,
+    Created, KeptPost, MailboxRecord, MailboxStore, NewMailbox, PublicRoomRecord, Result,
+    StoreError, fixed, millis, parsed, timestamp,
 };
 
 /// The mailbox area's tables.
@@ -233,6 +236,154 @@ impl MailboxStore for SqliteStore {
                 .collect()
         })
     }
+
+    // What the misc and admin areas read and change (SV5). TODO(SV3):
+    // reconcile with the mailbox area's own methods when they meet.
+
+    fn public_rooms(
+        &self,
+        after: Option<&Room>,
+        limit: u64,
+        for_guest: bool,
+    ) -> Result<(Vec<PublicRoomRecord>, bool)> {
+        self.read(|tx| {
+            let mut select = tx.prepare_cached(
+                "SELECT room, box, members, topic, guests, epoch FROM public_rooms
+                 WHERE room > ? AND (? = 0 OR guests != 'none')
+                 ORDER BY room LIMIT ?",
+            )?;
+            let mut rows = select.query(params![
+                after.map_or("", Room::as_str),
+                for_guest,
+                sql_u64(limit.saturating_add(1))
+            ])?;
+            let mut rooms = Vec::new();
+            while let Some(row) = rows.next()? {
+                rooms.push(public_room(row)?);
+            }
+            let more = rooms.len() as u64 > limit;
+            rooms.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok((rooms, more))
+        })
+    }
+
+    fn public_room(&self, room: &Room) -> Result<Option<PublicRoomRecord>> {
+        self.read(|tx| {
+            let mut select = tx.prepare_cached(
+                "SELECT room, box, members, topic, guests, epoch FROM public_rooms WHERE room = ?",
+            )?;
+            let mut rows = select.query([room.as_str()])?;
+            rows.next()?.map(public_room).transpose()
+        })
+    }
+
+    fn room_members(&self, mailbox: &BoxName) -> Result<Vec<(Uid, Role)>> {
+        self.read(|tx| {
+            let mut select =
+                tx.prepare_cached("SELECT uid, role FROM room_members WHERE box = ? ORDER BY uid")?;
+            let rows = select.query_map([&mailbox.as_bytes()[..]], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.map(|row| {
+                let (uid, role) = row?;
+                Ok((parsed("member", &uid)?, parsed("role", &role)?))
+            })
+            .collect()
+        })
+    }
+
+    fn kept_post(&self, mailbox: &BoxName, seq: u64) -> Result<Option<KeptPost>> {
+        self.read(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT t, message, blob FROM posts WHERE box = ? AND seq = ?",
+                    params![&mailbox.as_bytes()[..], sql_u64(seq)],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((t, message, blob)) = row else {
+                return Ok(None);
+            };
+            let message = match (message, blob) {
+                (Some(message), None) => Ok(message),
+                (None, Some(blob)) => Err(BlobRef::from_hash(fixed("blob", &blob)?)),
+                _ => return Err(StoreError::Corrupt("a post is a message or a blob".into())),
+            };
+            Ok(Some(KeptPost {
+                t: timestamp(t)?,
+                message,
+            }))
+        })
+    }
+
+    fn drop_mailbox(&self, mailbox: &BoxName) -> Result<bool> {
+        self.write(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM mailboxes WHERE box = ?",
+                [&mailbox.as_bytes()[..]],
+            )? > 0)
+        })
+    }
+
+    fn set_mute(
+        &self,
+        mailbox: &BoxName,
+        pseudonym: &Pseudonym,
+        until: Timestamp,
+    ) -> Result<bool> {
+        self.write(|tx| {
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM mailboxes WHERE box = ?",
+                    [&mailbox.as_bytes()[..]],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                tx.execute(
+                    "INSERT OR REPLACE INTO mutes (box, pseudonym, until) VALUES (?, ?, ?)",
+                    params![
+                        &mailbox.as_bytes()[..],
+                        &pseudonym.as_bytes()[..],
+                        millis(until)
+                    ],
+                )?;
+            }
+            Ok(exists)
+        })
+    }
+
+    fn remove_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym) -> Result<bool> {
+        self.write(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM mutes WHERE box = ? AND pseudonym = ?",
+                params![&mailbox.as_bytes()[..], &pseudonym.as_bytes()[..]],
+            )? > 0)
+        })
+    }
+}
+
+/// Reads a row of `room, box, members, topic, guests, epoch` from
+/// `public_rooms`.
+fn public_room(row: &rusqlite::Row<'_>) -> Result<PublicRoomRecord> {
+    let room: String = row.get(0)?;
+    let mailbox: Vec<u8> = row.get(1)?;
+    let guests: String = row.get(4)?;
+    Ok(PublicRoomRecord {
+        room: parsed("room", &room)?,
+        mailbox: BoxName::from_bytes(fixed("box", &mailbox)?),
+        members: from_sql_u64("members", row.get(2)?)?,
+        topic: row.get(3)?,
+        guests: parsed("guests", &guests)?,
+        epoch: from_sql_u64("epoch", row.get(5)?)?,
+    })
 }
 
 #[cfg(test)]

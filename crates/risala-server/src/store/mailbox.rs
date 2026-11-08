@@ -24,9 +24,10 @@
 //! Nothing here says which connection or address made a mailbox, a post
 //! or a token hash (4.2).
 
-use risala_proto::mls::{GroupId, TokenHash};
-use risala_proto::names::{BoxName, Room, Uid};
+use risala_proto::mls::{GroupId, Pseudonym, TokenHash};
+use risala_proto::names::{BlobRef, BoxName, Room, Uid};
 use risala_proto::time::Timestamp;
+use risala_proto::types::{GuestAccess, Role};
 
 use super::Result;
 
@@ -94,4 +95,68 @@ pub trait MailboxStore {
     /// The public rooms in whose group `uid` has a leaf, as boxes (6.1).
     /// When a guest's session ends, they get GONE (4.2).
     fn rooms_with_member(&self, uid: &Uid) -> Result<Vec<BoxName>>;
+
+    // What the misc and admin areas read and change (SV5: LIST, INFO,
+    // MEMBERS, REPORT, ADMIN ROOMS, DROP, MUTE). TODO(SV3): reconcile with
+    // the mailbox area's own methods when they meet.
+
+    /// A page of public rooms in order of name (6.1, 10.4): at most
+    /// `limit` rooms whose names sort after `after`, leaving out rooms
+    /// whose `guests` setting is `none` if `for_guest`. The flag says
+    /// whether more rooms follow.
+    fn public_rooms(
+        &self,
+        after: Option<&Room>,
+        limit: u64,
+        for_guest: bool,
+    ) -> Result<(Vec<PublicRoomRecord>, bool)>;
+
+    /// The public room `room`, if there is one (6.1).
+    fn public_room(&self, room: &Room) -> Result<Option<PublicRoomRecord>>;
+
+    /// The uids with a leaf in a public room's group, with their roles, in
+    /// order of uid (8.3).
+    fn room_members(&self, mailbox: &BoxName) -> Result<Vec<(Uid, Role)>>;
+
+    /// The kept post `seq` of `mailbox`, if it is still kept (5.8).
+    fn kept_post(&self, mailbox: &BoxName, seq: u64) -> Result<Option<KeptPost>>;
+
+    /// Deletes a mailbox with all of its posts, and its public room if it
+    /// is one (10.4). Its box stays used (5.2). Returns whether there was
+    /// one.
+    fn drop_mailbox(&self, mailbox: &BoxName) -> Result<bool>;
+
+    /// Refuses the posts of `pseudonym` in `mailbox` until `until` (6.4,
+    /// 10.4). Returns `false` if the server holds no such mailbox.
+    fn set_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp)
+    -> Result<bool>;
+
+    /// Lifts a mute (6.4, 10.4). Returns `false` if there was none.
+    fn remove_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym) -> Result<bool>;
+}
+
+/// A public room, as LIST, INFO and MEMBERS see it (6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicRoomRecord {
+    /// Its name.
+    pub room: Room,
+    /// Its mailbox.
+    pub mailbox: BoxName,
+    /// The number of identities and guests with a leaf in its group.
+    pub members: u64,
+    /// Its topic, escaped; empty if none.
+    pub topic: String,
+    /// Its `guests` setting (6.2).
+    pub guests: GuestAccess,
+    /// Its group's current epoch.
+    pub epoch: u64,
+}
+
+/// A kept post (5.2), as REPORT reads it (5.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptPost {
+    /// When the server accepted it.
+    pub t: Timestamp,
+    /// The MLSMessage, or the blob that holds it (12.12).
+    pub message: Result<Vec<u8>, BlobRef>,
 }
