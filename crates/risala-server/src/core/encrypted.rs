@@ -38,7 +38,7 @@
 //! the owner role. Operators without it count as plain members here, as
 //! for an owner's commit that changes `history` or `send`, since devices
 //! check the role from the room's events and cannot always know who is
-//! an operator (6.3, 12.5, PLAN.md 5 item 44).
+//! an operator (6.3, 12.5, PLAN.md 5 item 45).
 
 use std::sync::Arc;
 
