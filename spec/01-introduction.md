@@ -15,7 +15,8 @@ said.
 
 - **Zero trust in the server.** Devices never take the server's word for
   anything they show or act on, or for whose keys are whose. Whatever a
-  server can still do, it can only do visibly, and Section 14 lists it.
+  server can still do is listed in Section 14, and devices see most of
+  it.
 - **Everything encrypted.** Every conversation is end-to-end encrypted,
   public rooms included. There are no plaintext rooms. Each message has
   its own key, which devices delete once they have used it.
@@ -25,9 +26,11 @@ said.
 - **Little metadata.** The server does not learn who sends a message, or
   who is in a direct conversation or a private room (Section 7). What it
   still learns is listed in Section 14 and Appendix D.
-- **At least Signal's protections.** Per-message forward secrecy,
+- **Signal's kinds of protection.** Per-message forward secrecy,
   post-compromise security, post-quantum keys, sealed sending and key
-  transparency.
+  transparency. Where they are weaker than Signal's, for example
+  post-compromise security that heals with each commit rather than each
+  round trip, Section 14 says so.
 - **Post-quantum.** Connections and conversations use hybrid
   post-quantum key exchange, so recorded traffic stays secret against a
   future quantum computer. Signatures use ML-DSA.

@@ -25,6 +25,8 @@ group, never from the server.
 A conversation lives on one server, the one its mailbox is on. Every
 identity in it needs to have signed in to that server at least once, so
 that its devices have KeyPackages there (12.5). There is no federation.
+Guests (4.2) have no KeyPackages: they join public rooms, and start the
+report conversations of 5.8, with a throwaway leaf.
 
 Devices keep at most one direct conversation for each pair of
 identities on a server, and one conversation with yourself. If they find
@@ -172,8 +174,8 @@ DELETE <id>
 
 A DELETE line in a message asks every device to delete message `<id>`
 of the same conversation. Devices act on it only if its sender is the
-author of `<id>`, or, in a room, an owner or moderator at the epoch of
-the DELETE (6.3).
+author of `<id>`, or, in a room, an owner or moderator both at the epoch
+of the DELETE and at its place in the order of posts (6.3, 12.9).
 
 Devices that act on it erase the stored text of the target, and of its
 edits and reactions, and show a placeholder in its place. Deleting an
@@ -234,8 +236,11 @@ Rules:
 - **The `put` URL** works for one upload within 10 minutes. The server
   MUST reject a body whose length differs from `<size>`.
 - **Size.** A file larger than the server allows gets `ERR too-long`.
-- **Storage.** The URLs may point anywhere. A server can keep files on
-  its own disk or hand out presigned URLs for object storage.
+- **Storage.** A server can keep files on its own disk or hand out
+  presigned URLs for object storage. Its `get` URLs MUST be on the
+  origins that INFO lists as `files` (8.5). Devices download a file
+  without asking only from those origins of the conversation's own
+  server (12.11).
 - **`get` URLs** MUST use `https`, MUST NOT contain `;`, and MUST be at
   most 512 bytes. They are capabilities: anyone who has one can
   download the file. They MUST therefore contain at least 128 bits of
@@ -244,7 +249,10 @@ Rules:
   deletes the file. A device that deletes a message it sent with a file
   (5.4) SHOULD delete the file this way.
 - **Expiry.** Files expire with the server's retention period (7.5),
-  counted from the upload.
+  counted from the upload. A moderator's DELETE (5.4) cannot remove a
+  file: it stays on the server until it expires, unless its uploader
+  deletes it. A file named in an open report is kept until the report
+  is resolved (5.8).
 
 ### 5.7. Blocking
 
@@ -255,8 +263,12 @@ identity's other devices with BLOCK and UNBLOCK lines in the
 conversation with itself (12.9). While the user has blocked someone,
 their devices:
 
-- ignore Welcomes (12.8) that add them to a conversation with the
-  blocked person, and leave such a conversation if someone adds them;
+- ignore Welcomes (12.8) that add them to a direct conversation with
+  the blocked person, or to a room in which the blocked person already
+  has a leaf, and leave such a conversation if they are added to it
+  anyway. A blocked person who joins a room the user is already in does
+  not make the user's devices leave: they treat that person's messages
+  as the next item says;
 - do not show the blocked person's messages, typing or reactions in
   direct conversations, and SHOULD offer to hide them in rooms;
 - do not notify the user of anything the blocked person sends.
@@ -289,11 +301,23 @@ with each owner and moderator of the room (12.9):
 The moderator's device shows the reported message and its context from
 its own copies, with their authors as it confirmed them (12.10).
 
-Guests report the same way. A guest may start a direct conversation
-with an owner or moderator of a room it is in, using its throwaway key
-(4.2), only to send REPORT lines. The moderator's device shows it as a
-report from that guest, and ignores any other content line the guest
-sends there.
+**Guests** report the same way, in a **report conversation**: a direct
+conversation between the guest uid and an owner or moderator of a
+public room it is in (12.7). The guest's device creates it with its
+throwaway leaf (4.2), fetches the moderator's KeyPackages, creates the
+mailbox and sends the Welcomes as any device does (12.5, 5.2, 12.8).
+In it:
+
+- The moderator's devices join only if the moderator accepts, and only
+  for a public room on that server that allows guests and in which
+  their identity is an owner or moderator (12.7).
+- They act only on REPORT lines from the guest whose `box` is such a
+  room, show each as a report from that guest uid, and ignore every
+  other content line the guest sends there.
+- They show that the guest uid is not tied to the guest of that name
+  they may have seen in the room, since guest names are reused (4.2).
+- Clients SHOULD limit how many report conversations from guests they
+  accept, and MAY leave one once its reports have been dealt with.
 
 **To the server's operators.** Operators are not members, and cannot
 confirm who wrote a message: deniability (12.10) means that nothing a
@@ -325,30 +349,42 @@ struct {
 } RisalaReport;
 ```
 
-The server checks that every post named is still kept in `<box>`, that
-it is an application message, and that HMAC-SHA-384(`frank_key`,
-`content`) [RFC2104] equals the franking tag in its RisalaAAD (12.9),
-comparing in constant time. Otherwise it replies `ERR invalid`, or
-`ERR not-found` for a post it no longer has. So the content can only be
+The server checks that:
+
+- every post named is still kept in `<box>` (`ERR not-found`), and is
+  an application message;
+- HMAC-SHA-384(`frank_key`, `content`) [RFC2104] equals the franking
+  tag in the post's RisalaAAD (12.9), compared in constant time;
+- there are at most 10 context posts, their seqs are strictly
+  increasing, and each is lower than the target's;
+- `author` is a uid (3.5), and `reason` UTF-8 of at most 512 bytes.
+
+Otherwise it replies `ERR invalid`. So the content can only be
 what was posted. The seqs show how many posts lie between the messages,
 which the reporter does not choose. REPORT works on any kind of
 connection: a reporter who is signed in tells the operators who they
 are.
 
 When a report is made, the server keeps copies of the posts it names
-until the report is resolved, even if they expire in the meantime. It
-SHOULD discard them once the report is resolved, and MAY close reports
-on its own after a time it chooses. Servers SHOULD rate-limit reports.
+until the report is resolved, even if they expire in the meantime. If
+the content of a post it names has a TEXT line whose `file` is a `get`
+URL of this server (5.6), the server keeps that file too, even if its
+uploader deletes it or it expires. The content is in the clear in the
+report, so the server can read the URL. It SHOULD discard these copies
+once the report is resolved, and MAY close reports on its own after a
+time it chooses. Servers SHOULD rate-limit reports.
 
 Operators receive each report as one line:
 
 ```
-@report=<id>;t=<timestamp>[;from=<uid>] REPORT <box> <report>
+@report=<id>;t=<timestamp>;pseudonym=<pseudonym>[;from=<uid>] REPORT <box> <report>
 ```
 
 `t` is when the report was made, and `from` the reporter, if they were
-signed in. The server sends it to every operator's signed-in connections
-when the report is made.
+signed in. `pseudonym` is the pseudonym in the target post's RisalaAAD
+(7.3), in base64 with padding, so that an operator can mute it. The
+server sends the line to every operator's signed-in connections when
+the report is made.
 
 ```
 ADMIN REPORTS
@@ -363,7 +399,13 @@ RESOLVE <id>
   is not an operator gets `ERR not-found`, as for an id that does not
   exist.
 
-Operators act on a report with the commands of Section 10, such as
-ADMIN MUTE, ADMIN DROP or ADMIN BAN, and then resolve it. They act on
-mailboxes, rooms and accounts, since they cannot attribute a single
-message.
+**`author` is not evidence.** It is the reporter's claim. A member can
+post something abusive, then report it naming someone else as its
+author, and the franking still checks. So:
+
+- Operators act on a report with the commands of Section 10, and then
+  resolve it: they mute the target's pseudonym (ADMIN MUTE), or drop
+  the mailbox or room (ADMIN DROP).
+- Operators MUST NOT ban or unregister an identity (10.2, 10.5) on
+  reports alone, only on evidence from outside them.
+- An operator's client shows `author` as claimed by the reporter.

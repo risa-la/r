@@ -51,6 +51,9 @@ ADMIN BANS
 | A connected guest | `~sam` | Bans the network address the guest is connected from |
 | A network address or prefix | `203.0.113.7`, `2001:db8::/32` | No anonymous or guest connection can be opened from it |
 
+- **Reports are not evidence.** Operators MUST NOT ban an identity on
+  reports alone, since a report's `author` is only the reporter's claim
+  (5.8).
 - **Identity and domain bans.** AUTH and REGISTER reply `ERR forbidden`
   for a banned identity. They check the signature first, and reply
   `ERR auth-failed` if it does not verify, so that only someone holding
@@ -123,7 +126,9 @@ ADMIN REPORTS
     operator resolves them (5.8).
   - A dropped room's name becomes free. A new room with that name is a
     new group with a new mailbox. Links that name the old room (Section
-    15) lead to the new one, which devices see is a different group.
+    15) lead to the new one. Devices that were in the old room, and
+    links that carry its group id, see that it is a different group, and
+    ask the user before joining (6.1).
   - The box and group id of a dropped mailbox are never used again
     (5.2).
 - **`ADMIN MUTE`** and **`ADMIN UNMUTE`** work like MUTE and UNMUTE

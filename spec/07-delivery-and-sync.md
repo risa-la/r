@@ -126,11 +126,14 @@ If the first post returned is later than L + 1, the posts in between
 have expired. If they include commits, the device can no longer follow
 the group (7.5).
 
-The server cannot leave out a single message unnoticed: each message
-carries its sender's counter and the id of the sender's previous message
-(12.9), so devices see a gap in any one sender's messages. A gap that
-retention explains is shown as expired. Any other gap is shown as
-messages that the server held back.
+Each message carries its sender's counter and the id of the sender's
+previous message (12.9). So devices notice a gap in a sender's messages
+once a later message from that sender arrives. A gap that retention
+explains is shown as expired, and one that a transfer from the
+identity's own devices fills is not shown (12.13). Any other gap is
+shown as messages that the server held back. The server can still hold
+back a sender's last messages, or everything a sender posts from some
+point on, without anyone noticing (Section 14).
 
 A device that finds the head lower than its sync point discards its
 sync point for that mailbox and starts again from 0. This cannot happen
@@ -153,9 +156,10 @@ reports do not expire (5.8).
 
 A device that has been offline for longer than the retention period
 misses commits, and cannot follow its groups any more. In a public room
-it joins again (6.1). In other conversations, the members' devices
-replace its leaf (12.7): the device then gets a Welcome, as a new device
-does.
+it joins again (6.1). In other conversations, its identity's other
+devices replace its leaf at once, and other members' devices after 35
+days (12.7): the device then gets a Welcome, as a new device does, and
+asks its own devices for what it missed (12.13).
 
 Retention is also the limit of what the server holds: once a post has
 expired, nobody can fetch it, even with every key.

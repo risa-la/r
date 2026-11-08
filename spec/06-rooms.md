@@ -69,6 +69,15 @@ as in 12.7, and joins in one of two ways:
   commits it (below), and the device then fetches its Welcome with
   WELCOME GET (12.8).
 
+A device remembers the group id of each public room it has joined, by
+host and room name. Before it joins a room of the same name again, or
+one that a link names (Section 15), it compares the group id. If it
+differs, it tells the user that the name now leads to a different
+group, and joins only if they choose to. A link MAY carry the group id,
+which the device then checks too. A device that joins again a room it
+was in also checks its roles and settings (12.7, "Rejoining a public
+room").
+
 A guest joins the same way, with a leaf whose credential names its guest
 uid (12.3). The server refuses a join (`ERR forbidden`) by a banned
 identity, by a guest where `guests` is `none`, or by a device whose key
@@ -131,7 +140,7 @@ is no SET command.
 | `topic` | text up to 512 bytes, may be empty | empty | owners, moderators |
 | `guests` | `none`, `read` or `write` | `write` in public rooms, `none` in private ones | owners, in public rooms only |
 | `send` | `all` or `mods` | `all` | owners |
-| `confirm` | `pairwise` or `epochal` | `pairwise` in private rooms, `epochal` in public ones | owners, from `pairwise` to `epochal` only |
+| `confirm` | `pairwise` or `epochal` | `pairwise` in private rooms, `epochal` in public ones | owners, from `pairwise` to `epochal` only; anyone, in the commit that takes the room past 256 members |
 | `owners`, `mods` | lists of uids | the creator is the only owner | owners (6.3) |
 | `bans` | a list of uids | empty | owners, moderators (6.4) |
 
@@ -146,7 +155,9 @@ is no SET command.
   (5.3, 8.1).
 - `confirm`: how devices confirm whose leaf is whose (12.10). A private
   room that grows past 256 members moves to `epochal`, in the commit
-  that takes it over 256 or before. It does not move back.
+  that takes it over 256 or before. It does not move back. Since the
+  move is forced, whoever makes the commit that takes the room past 256,
+  such as a moderator who invites someone, changes `confirm` in it.
 
 Devices refuse a commit that changes a field it may not change, or any
 other field of the extension (12.7). In a public room the server
@@ -159,9 +170,9 @@ member. The `owners` and `mods` lists of the conversation extension say
 which. Whoever creates a room is its first owner. Guests are always
 plain members, and cannot be added to either list.
 
-A role belongs to the identity, not to its leaves, and stays when it
-leaves the room. Coming back to a private room still takes an
-invitation.
+A role belongs to the identity, not to its leaves. It stays when the
+identity leaves the room of its own accord, but not when it is banned
+(6.4). Coming back to a private room still takes an invitation.
 
 | Action | member | mod | owner |
 |---|---|---|---|
@@ -175,8 +186,16 @@ invitation.
 
 - A room always keeps at least one owner. Devices refuse a commit that
   removes the last one from `owners`, or kicks or bans them.
-- Devices check the role of whoever sent a message or made a commit
-  against the extension as it was at that epoch.
+- **A room whose owners are gone.** If no identity in `owners` has a
+  leaf in the group, for example because the last owner left, a
+  moderator may do what an owner may, including adding itself to
+  `owners`. Without moderators either, the room's settings can no
+  longer change.
+- Devices check the role of whoever made a commit against the extension
+  of the epoch the commit is for. They check the role behind a message
+  against that epoch's extension and against the newest one applied at
+  the message's place in the order of posts, so that a kick or a
+  demotion takes effect at once (12.9).
 - Server operators have no role in rooms, and no way to act as one,
   since devices take roles only from the group. They can mute and drop
   (Section 10).
@@ -187,12 +206,17 @@ Owners and moderators moderate with commits:
 
 - **Kick** is a commit that removes every leaf of an identity. They may
   be invited again, or join a public room again.
-- **Ban** is a kick that also adds the identity's uid to `bans`. Devices
-  refuse a commit that adds a leaf of a banned identity, and in public
-  rooms the server refuses it too. Banning a guest uid has little
-  effect, because guest names get reused: mute its pseudonym instead
-  (below), or ask an operator to ban its network address (10.2).
+- **Ban** is a kick that also adds the identity's uid to `bans`, and
+  takes it out of `owners` and `mods`. Devices refuse a ban that leaves
+  the uid in either list, and a commit that adds a leaf of a banned
+  identity. In public rooms the server refuses both too. Banning a
+  guest uid has little effect, because guest names get reused: mute its
+  pseudonym instead (below), or ask an operator to ban its network
+  address (10.2).
 - **Unban** is a commit that takes a uid out of `bans`.
+- **Kicking a moderator.** A kick leaves roles as they are, since a
+  kicked member may be invited back. An owner who kicks a moderator for
+  abuse SHOULD take them out of `mods` in the same commit.
 
 Moderators may kick and ban only plain members. Owners may act on
 anyone except the last owner (6.3).
@@ -210,10 +234,11 @@ UNMUTE <box> <pseudonym>
 
 `<pseudonym>` is 16 bytes in base64 with padding. The command needs a
 signed-in connection whose identity is an owner or moderator in the
-public room's conversation extension, which the server holds
-(`ERR forbidden`). The server refuses that pseudonym's posts in that
-mailbox for `<n>` hours, 24 by default, or until UNMUTE. A mute is a
-stopgap until a moderator's device bans the member. A pseudonym belongs
-to one leaf, so a member who joins again with a new leaf has a new one.
+public room's conversation extension, which the server holds, and has at
+least one leaf in the room's group (`ERR forbidden`). The server refuses
+that pseudonym's posts in that mailbox for `<n>` hours, 24 by default,
+or until UNMUTE. A mute is a stopgap until a moderator's device bans the
+member. A pseudonym belongs to one leaf, so a member who joins again
+with a new leaf has a new one.
 
 For moderation across a whole server, see Section 10.
