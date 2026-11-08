@@ -51,8 +51,8 @@ CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>
 → `OK`
 
 Creates a mailbox, for a group in epoch 0. The client picks `<box>`
-from 16 new random bytes. `<group-id>` is the group's id, in base64 with
-padding, and `<token-hash>` the SHA-384 hash of the group's send token
+from 16 new random bytes. `<group-id>` is the group's 32-byte id (12.6),
+in base64 with padding, and `<token-hash>` the SHA-384 hash of the group's send token
 for epoch 0 (7.2), in base64 with padding.
 
 - **The first form** creates the mailbox of a direct conversation or a
@@ -82,7 +82,7 @@ identity creates public rooms. Servers MAY require proof of work for
 CREATE (4.1).
 
 ```
-POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
+POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>] [next=<hash>]
 ```
 
 → the post, then `OK seq=<seq>`; with `live=yes`, `OK`
@@ -91,7 +91,9 @@ Posts an MLS message (12.2) to a mailbox. `<message>` is the MLSMessage
 in base64 with padding, or a blob-ref (12.12) if it is too large for a
 line. `<token>` is the group's send token for the message's epoch, in
 base64 with padding, or `-` for a join of a public room (6.1).
-`<groupinfo>` is base64 with padding, or a blob-ref.
+`<groupinfo>` is base64 with padding, or a blob-ref. `<hash>` is the
+SHA-384 hash of the send token of the epoch that a commit creates, in
+base64 with padding (7.2, 12.6).
 
 The server reads the group id, epoch, content type and authenticated
 data from the message's framing, which MLS leaves in the clear, and
@@ -104,7 +106,8 @@ checks that:
    `0x0020` and its version `mls10` (12.2). Its authenticated data is a
    RisalaAAD (12.9) with the fields its content type needs, and a
    pseudonym of 16 bytes in a PrivateMessage and an empty one in a
-   PublicMessage (`ERR invalid`).
+   PublicMessage. A commit has `next`, and nothing else does
+   (`ERR invalid`).
 3. The SHA-384 hash of `<token>` is one of the token hashes it holds for
    the message's epoch (7.2), compared in constant time
    (`ERR stale`). A token of `-` is allowed only for an external commit
@@ -116,23 +119,33 @@ checks that:
    per pseudonym, since anyone who holds the token can post under any
    pseudonym.
 5. In a public room, a commit or proposal passes the checks of 12.6.
+   A PublicMessage there may come on a signed-in connection, and a
+   commit or Update proposal by an identity's leaf MUST (12.6). Every
+   other post needs an anonymous or guest connection.
 
 The server then gives the post the mailbox's next sequence number,
 keeps it until it expires (7.5), and sends it to every connection that
 follows the mailbox, as an **event line**:
 
 ```
-@seq=<seq>;t=<timestamp> POST <box> <message>
+@seq=<seq>;t=<timestamp> POST <box> <message> [next=<hash>]
 ```
 
-`t` is when the server accepted it. The line does not repeat the token.
-A commit also gives the server a hash of the next epoch's send token
-(7.2). The server stores the post as 4.2 says: with its box, seq, time
-and message only.
+`t` is when the server accepted it. The line does not repeat the token,
+but repeats a commit's `next`, which the server adds to the next
+epoch's token set (7.2), and which every device checks (12.7). The
+server stores the post as 4.2 says: with its box, seq, time, message
+and, for a commit, `next`, only.
+
+```
+C: POST ujzdegxdncf32epf3dhodzdoci 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= AAEAAwBA… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
+S: @seq=9310;t=2026-11-09T08:12:44.051Z POST ujzdegxdncf32epf3dhodzdoci AAEAAwBA… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
+S: OK seq=9310
+```
 
 With `live=yes`, the post is not kept: it gets no seq, goes only to the
-connections that follow the mailbox now, without `seq`, and is not
-pushed. Typing notifications are live (8.1). Only application messages
+connections that follow the mailbox now, with `t` but without `seq`,
+and is not pushed. Typing notifications are live (8.1). Only application messages
 may be live (`ERR invalid`).
 
 A commit in a public room carries its new GroupInfo as `groupinfo`

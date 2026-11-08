@@ -81,14 +81,15 @@ S: OK more=0
 C: groupinfo ujzdegxdncf32epf3dhodzdoci
 S: GROUPINFO ujzdegxdncf32epf3dhodzdoci 4410 9120 AAEABA… sha384:5d0c9a1e…
 S: OK
-C: post ujzdegxdncf32epf3dhodzdoci - AAEAAQ… groupinfo=AAEABA…
+C: post ujzdegxdncf32epf3dhodzdoci - AAEAAQ…
 S: OK seq=9121
 C: follow ujzdegxdncf32epf3dhodzdoci
 S: OK head=9121
+S: @seq=9122;t=2026-11-08T15:40:51.208Z POST ujzdegxdncf32epf3dhodzdoci AAEAAw… next=OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
 C: post ujzdegxdncf32epf3dhodzdoci 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= AAEAAg…
-S: @seq=9122;t=2026-11-08T15:41:02.377Z POST ujzdegxdncf32epf3dhodzdoci AAEAAg…
-S: OK seq=9122
-S: @seq=9123;t=2026-11-08T15:41:09.512Z POST ujzdegxdncf32epf3dhodzdoci AAEAAg…
+S: @seq=9123;t=2026-11-08T15:41:02.377Z POST ujzdegxdncf32epf3dhodzdoci AAEAAg…
+S: OK seq=9123
+S: @seq=9124;t=2026-11-08T15:41:09.512Z POST ujzdegxdncf32epf3dhodzdoci AAEAAg…
 ```
 
 In this session:
@@ -97,10 +98,13 @@ In this session:
    connection: it will not say who it is.
 2. It lists the public rooms. `#general` has the mailbox
    `ujzdegxdncf32epf3dhodzdoci`.
-3. It fetches the room's group information, and joins the room's MLS
-   group by posting an external commit, with the group's new
-   GroupInfo. A join needs no send token (`-`).
+3. It fetches the room's group information, and asks to join the
+   room's MLS group by posting an external proposal. A join needs no
+   send token (`-`).
 4. It follows the mailbox, so that new posts reach it as they arrive.
+   A member's device commits the proposal, and the client fetches its
+   Welcome on a connection of its own (not shown). The commit carries
+   the hash of the new epoch's send token (`next`).
 5. It posts an encrypted message, proving with a send token that it is
    a member of the group in the current epoch.
 6. It receives another member's message. The server does not know who

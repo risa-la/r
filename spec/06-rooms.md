@@ -60,15 +60,15 @@ of a large room is always a blob. A mailbox that is not a public room
 gets `ERR not-found`.
 
 **Joining a public room.** A device fetches GROUPINFO, checks the group
-as in 12.7, and joins in one of two ways:
-
-- **By external commit,** if it is a full client, one that keeps the
-  whole tree. It posts the external commit with the token `-` (5.2).
-- **By external proposal,** if it is a light client (12.6). It posts an
-  external Add proposal (`new_member_proposal` [RFC9420]) holding a
-  KeyPackage of its own, with the token `-`. A full client in the room
-  commits it (below), and the device then fetches its Welcome with
-  WELCOME GET (12.8).
+as in 12.7, and joins by external proposal: it posts an external Add
+proposal (`new_member_proposal` [RFC9420]) holding a KeyPackage that it
+makes for this join, with no device binding (12.3), with the token `-`
+(5.2). A full client in the room commits it (below), and the device then
+fetches its Welcome with WELCOME GET (12.8). Every device joins this
+way, full client or light client (12.6), identity or guest. An external
+commit is used only to resync a room that its devices could not follow
+(12.7), so that nobody who is not yet a member can force the room's
+devices to join again.
 
 A device remembers the group id of each public room it has joined, by
 host and room name. Before it joins a room of the same name again, or
@@ -80,15 +80,19 @@ was in also checks its roles and settings (12.7, "Rejoining a public
 room").
 
 A guest joins the same way, with a leaf whose credential names its guest
-uid (12.3). The server refuses a join (`ERR forbidden`) by a banned
-identity, by a guest where `guests` is `none`, or by a device whose key
-is not current in its identity's key file. It MAY ask for proof of work
-first (4.1).
+uid (12.3), from its guest connection. The server refuses a join
+(`ERR forbidden`) whose credential names a banned identity, or a guest
+where `guests` is `none`. It does not check that a joining identity's
+device is current, since the join carries no device binding: anyone may
+post a join whose credential names any device, and devices treat the
+leaf as unverified, like a guest's, until it attests (12.10). The
+server MAY ask for proof of work first (4.1).
 
-Full clients in a public room commit pending join proposals, and
-pending SelfRemove proposals (below). Each one waits a random time of up
-to 10 minutes after the oldest pending proposal, then commits them all
-at once, unless another commit has done so first. A room in which no
+Full clients in a public room commit pending join proposals, Update
+proposals (12.10) and SelfRemove proposals (below), at most 256 devices
+in a commit. Each one waits a random time of up to 10 minutes after the
+oldest pending proposal, then commits them all at once, unless another
+commit has done so first. A room in which no
 full client is online cannot admit anyone by proposal. An owner can keep
 a full client online for the room, for example on a desktop.
 
@@ -109,10 +113,13 @@ with only your own devices.
 leaves of every other device of its identity, and a SelfRemove proposal
 [MLS-EXT] for its own leaf, which it posts right after. An MLS member
 cannot remove itself in its own commit, so another member's device
-commits the SelfRemove, and SHOULD do so within a few minutes. Devices
-treat the identity as having left once they have seen both. A device
-whose identity has no other leaves in the group sends only the
-SelfRemove.
+commits the SelfRemove, and SHOULD do so within a few minutes. A
+proposal belongs to its epoch, so if a commit that leaves the SelfRemove
+out wins the epoch, the leaving device posts the SelfRemove again in the
+new epoch, and so on, until a commit removes its leaf. Devices treat the
+identity as having left once they have seen both, and do not add its
+devices back meanwhile (12.7). A device whose identity has no other
+leaves in the group sends only the SelfRemove.
 
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
 private room, coming back always takes a new invitation.
@@ -210,8 +217,11 @@ Owners and moderators moderate with commits:
 - **Ban** is a kick that also adds the identity's uid to `bans`, and
   takes it out of `owners` and `mods`. Devices refuse a ban that leaves
   the uid in either list, and a commit that adds a leaf of a banned
-  identity. In public rooms the server refuses both too. Banning a
-  guest uid has little effect, because guest names get reused: mute its
+  identity. In public rooms the server refuses both too, by the uids in
+  credentials, which it does not check there (6.1): someone banned can
+  still join under another uid, but then never attests, and devices
+  treat their leaf as a guest's (12.10). Banning a guest uid has little
+  effect, because guest names get reused: mute its
   pseudonym instead (below), or ask an operator to ban its network
   address (10.2).
 - **Unban** is a commit that takes a uid out of `bans`.

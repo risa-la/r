@@ -58,9 +58,8 @@ epoch number:
 - CREATE gives the hash for the mailbox's first epoch: 0, or the epoch
   of a move (5.2, 7.8).
 - A commit that the server accepts for epoch `e`, posted with a token of
-  epoch `e`, or with `-` as an external commit in a public room (6.1),
-  adds the `next_token_hash` of its RisalaAAD (12.9) to the set of epoch
-  `e+1`.
+  epoch `e`, or with `-` as an external commit in a public room (12.7),
+  adds its `next` (5.2) to the set of epoch `e+1`.
 - TOKEN (below) adds a hash to the set of epoch `e+1`, for anyone who
   holds a token of epoch `e`.
 - POST checks a post's token against the set of the post's epoch.
@@ -85,17 +84,18 @@ C: TOKEN ujzdegxdncf32epf3dhodzdoci 41 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8
 S: OK
 ```
 
-So the hash that a commit carries is one entry among others, and
-devices do not check it (12.6): members add the right hash themselves.
+Every device checks a commit's `next`, and a commit whose `next` is
+wrong is invalid (12.7). So the set of the epoch that a valid commit
+creates always holds that epoch's hash, unless the server has dropped it
+(below). TOKEN is how members put it back:
 
-- A device whose commit the server has accepted SHOULD send TOKEN with
-  the hash of the send token of the epoch its commit creates, right
-  after the commit's `OK`, on the same connection.
 - A device that holds the token of epoch `e`, and whose post for epoch
   `e+1` gets `ERR stale`, sends TOKEN with its hash of epoch `e+1`'s
-  token, then posts again. This is how the next epoch gets the right
-  hash when a commit carried a wrong one, for example an external
-  commit made by someone who wants the room to stall.
+  token, then posts again. This is how an epoch gets its hash back when
+  someone who holds a token of the epoch before has pushed it out of
+  the set with hashes of no use (below).
+- It also repairs a moved mailbox whose first epoch has a wrong hash
+  (7.8).
 
 A member can add hashes that are of no use, but gains nothing by it,
 since it can post already.
@@ -125,21 +125,31 @@ every commit that carries a valid token. Devices then decide:
   each epoch, the first commit whose checks pass (12.7) is the one they
   apply. They ignore later commits for the same epoch, and invalid ones,
   and messages of epochs that those commits would have started.
-- **The checks are the same everywhere.** They depend only on the group
-  and on facts that never go away once they exist, such as records in a
-  key log. So every device that sees the same posts picks the same
-  commit, however late it looks.
+- **The checks are the same everywhere.** Whether a commit is valid
+  depends only on its group checks (12.7): the group's state, the commit,
+  and the `t` and `next` of its post. Checks against key files and the
+  key log never make a commit invalid, since devices fetch those at
+  different times; they only lead to repairs by later commits. So every
+  device that sees the same posts picks the same commit, however late it
+  looks.
 - **A committer checks that it won.** After the `OK` of its commit, a
   device fetches the posts before it. If an earlier commit for the same
   epoch is valid, its own lost: it applies the winner, and makes its
-  change again if it is still needed.
+  change again if it is still needed. Until it knows that its commit
+  won, it MUST NOT send Welcomes for it (12.8), nor post anything in the
+  epoch it creates, which would be lost with it.
 
-A commit whose `next_token_hash` is wrong is still valid: it costs the
-group one TOKEN. A removed member still holds the token of the epoch in
-which it was removed, so the server would accept its posts there, and
-the commits it chains from them. In direct conversations and private
-rooms, the group therefore moves to a new mailbox after a removal
-(7.8).
+This holds only if the server shows every device the same posts in the
+same order. A server that shows different devices different commits for
+an epoch splits the group, and each side sees only that the other has
+gone quiet. Devices look for signs of it (12.7, 7.7), but cannot prevent
+it (Section 14).
+
+A removed member still holds the token of the epoch in which it was
+removed, so the server would accept its posts there, and the commits it
+chains from them, each of which names the hash of a token it chose. In
+direct conversations and private rooms, the group therefore moves to a
+new mailbox after a removal (7.8).
 
 ### 7.3. Pseudonyms
 
@@ -149,12 +159,13 @@ PrivateMessage it posts in the group. A PublicMessage, whose sender the
 server reads anyway (12.6), carries an empty pseudonym, so that it does
 not tie the pseudonym to the leaf.
 
-- A pseudonym belongs to its leaf from the commit that adds the leaf
-  until the commit that removes it. Committing a fresh leaf (12.7) does
-  not change it, except in groups whose `confirm` is `epochal`.
+- A pseudonym belongs to its leaf, at its leaf index, from the commit
+  that adds the leaf until the commit that removes it. A fresh leaf
+  node, by commit or Update (12.3), does not change it, except in groups
+  whose `confirm` is `epochal`.
 - In an **epochal group** (12.10), pseudonyms last one period. A device
-  picks a new pseudonym whenever it commits the new leaf key of a
-  period, and announces it in that period's ATTEST line. So the
+  picks a new pseudonym whenever its new leaf key of a period takes
+  effect, and announces it in that period's ATTEST line. So the
   pseudonyms of different periods cannot be linked to each other from
   the posts.
 
@@ -172,8 +183,7 @@ ATTEST line for the current period, which must match the pseudonym of
 the message that carries it. It ignores PrivateMessages from the leaf
 that carry another. So a member cannot dodge a mute by changing it,
 short of a new leaf, which needs an invitation in a private room and a
-new external join in a public one, or, in an epochal group, the next
-period.
+new join in a public one, or, in an epochal group, the next period.
 
 ### 7.4. Catching Up
 
@@ -317,10 +327,12 @@ A device that has shown a conversation up to a post tells the identity's
 other devices with a READ line (12.9) in the conversation with itself:
 
 ```
-READ <box> <seq>
+READ <box> <seq> <check>
 ```
 
-Read markers only move forward. Devices use them for unread counts and
+`<check>` is a short check of the epoch the device was in at `<seq>`
+(12.9), so that an identity's devices notice if the server has put them
+in different branches of a group (7.2). Read markers only move forward. Devices use them for unread counts and
 to clear notifications that another device has already shown. Nobody
 else sees them, and the server cannot read them.
 
@@ -341,7 +353,9 @@ do not move: their box is public, and anyone not banned may join.
   the removal, any member's device commits it, after a random wait of up
   to 10 minutes, unless another has done so first. When an identity
   leaves (6.1), the move follows the commit of its SelfRemove, and its
-  own devices never make it. A group MAY also move at other times, for
+  own devices never make it. Devices SHOULD NOT let this move lapse
+  after removing someone for abuse, who is the member most likely to
+  flood the old mailbox. A group MAY also move at other times, for
   example when its mailbox is flooded.
 - **How.** The device picks a new box (5.2) and makes a commit in the
   epoch that the removal created, or a later one, holding one

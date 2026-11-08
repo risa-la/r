@@ -50,7 +50,8 @@ as long as nothing sent on it names the device. So:
   are KEYS PUT (4.7), PAIR PUT and PAIR GET (4.8), WELCOME GET (12.8),
   FETCH with `leaf` (12.6), and every PublicMessage it posts: in a
   public room, every commit, external commit and proposal, whose sender
-  the server can read (12.6). A light client keeps one such connection
+  the server can read (12.6). Commits and Update proposals there go on
+  its signed-in connection, where the server checks them (12.6). A light client keeps one such connection
   open for its fetches with `leaf`, and uses it for nothing else.
 - A device MUST store the blobs and files that a post or a Welcome
   refers to over an anonymous connection (5.6, 12.12), never over its
@@ -100,7 +101,8 @@ over. So:
   connection, or any link between such a connection and a signed-in
   connection, a post, a follow, a mailbox, a token, a blob, an upload, a
   Welcome, a report or a push subscription.
-- A post is stored with its box, seq, time and message only (5.2). A
+- A post is stored with its box, seq, time and message only, and a
+  commit with its `next` (5.2). A
   mailbox, blob, upload, Welcome or mailbox push subscription is stored
   without the connection or address that made it.
 - State kept per network address for rate limits and quotas is kept in
