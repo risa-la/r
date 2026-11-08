@@ -20,19 +20,20 @@
 //! all under the room's lock. A KICK or BAN reaches its target before the
 //! target stops receiving the room (6.4).
 
+use std::ops::Bound;
 use std::sync::Arc;
 
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{Room, Uid};
-use risala_proto::server::{Event, EventBody, OkResponse, ServerLine, ServerMessage};
+use risala_proto::server::{Event, EventBody, OkResponse, ServerMessage};
 use risala_proto::types::{GuestAccess, Role, RoomRetention, RoomSetting};
 
 use super::Inner;
 use super::commands::{
     Asker, Fail, Outcome, Reply, check_read, fail, not_found, not_supported, room_of, visible,
 };
-use super::state::{ConvState, RoomInfo};
+use super::state::{ConvGuard, ConvState, RoomInfo};
 use crate::handler::OutLine;
 use crate::store::{EventKind, NewEvent, StoredEvent};
 
@@ -309,29 +310,66 @@ impl Inner {
         Ok(Some(OkResponse::new().with_seq(event.seq)))
     }
 
+    /// How many snapshot lines ROLES and BANS queue at a time: as many as
+    /// the room the network layer keeps for a response holds, with the
+    /// `OK`.
+    fn snapshot_chunk(&self) -> usize {
+        self.config.limits.reply_lines().saturating_sub(1).max(1)
+    }
+
+    /// Waits, without the room's lock, until the connection has room for
+    /// the next chunk of ROLES or BANS, then locks the room again. `None`
+    /// if the connection went away, `Some(None)` if the room was dropped
+    /// meanwhile: it is gone, and so are its roles and bans.
+    async fn next_chunk(&self, reply: &Reply, guard: ConvGuard) -> Option<Option<ConvGuard>> {
+        let entry = ConvGuard::mutex(&guard).clone();
+        drop(guard);
+        if !self.wait_for_reply_room(&reply.handle).await {
+            return None;
+        }
+        let guard = entry.lock_owned().await;
+        Some((!guard.dropped).then_some(guard))
+    }
+
     /// ROLES (6.3): the owners and moderators, members or not, for anyone
     /// who may read the room (7.2).
+    ///
+    /// Each chunk of lines is queued under the room's lock, so that they
+    /// agree with the ROLE events the connection receives (3.6): a ROLE
+    /// event sent before a line is covered by it. A long list goes in
+    /// chunks, each read afresh after the one before, in uid order.
     async fn roles(&self, uid: &Uid, reply: &Reply, room: &Room) -> Outcome {
-        let lines: Vec<ServerLine> = {
-            let st = self.lock_room(room).await?;
-            let info = room_of(&st)?;
-            check_read(info, self.asker(uid, st.is_member(uid)))?;
-            info.roles
-                .iter()
-                .map(|(holder, role)| {
-                    Event::snapshot(EventBody::Role {
-                        room: info.room.clone(),
-                        uid: holder.clone(),
-                        role: *role,
-                    })
-                    .into()
-                })
-                .collect()
-        };
-        if !self.reply_all(reply, lines).await {
-            return Ok(None);
+        let chunk = self.snapshot_chunk();
+        let mut guard = self.lock_room(room).await?;
+        let mut after: Option<Uid> = None;
+        loop {
+            let info = room_of(&guard)?;
+            check_read(info, self.asker(uid, guard.is_member(uid)))?;
+            let from = after.as_ref().map_or(Bound::Unbounded, Bound::Excluded);
+            let rest: Vec<(Uid, Role)> = info
+                .roles
+                .range::<Uid, _>((from, Bound::Unbounded))
+                .take(chunk + 1)
+                .map(|(holder, role)| (holder.clone(), *role))
+                .collect();
+            let more = rest.len() > chunk;
+            for (holder, role) in rest.into_iter().take(chunk) {
+                after = Some(holder.clone());
+                reply.line(Event::snapshot(EventBody::Role {
+                    room: info.room.clone(),
+                    uid: holder,
+                    role,
+                }));
+            }
+            if !more {
+                return Ok(Some(OkResponse::new()));
+            }
+            guard = match self.next_chunk(reply, guard).await {
+                None => return Ok(None),
+                Some(None) => return Ok(Some(OkResponse::new())),
+                Some(Some(guard)) => guard,
+            };
         }
-        Ok(Some(OkResponse::new()))
     }
 
     /// INVITE (6.4).
@@ -457,30 +495,42 @@ impl Inner {
     }
 
     /// BANS (6.4): the room's bans as snapshot BAN lines.
+    ///
+    /// Read and queued under the room's lock, a chunk at a time, as ROLES
+    /// does, so that the list agrees with the BAN and UNBAN events the
+    /// connection receives (3.6).
     async fn bans(&self, uid: &Uid, reply: &Reply, room: &Room) -> Outcome {
-        let lines: Vec<ServerLine> = {
-            let st = self.lock_room(room).await?;
-            let info = room_of(&st)?;
-            check_rights(info, self.asker(uid, st.is_member(uid)), Role::Mod)?;
-            let key = st.key;
-            // Read under the lock, so the list covers every BAN and UNBAN
-            // this connection has received.
+        let chunk = self.snapshot_chunk();
+        let mut guard = self.lock_room(room).await?;
+        let mut after: Option<Uid> = None;
+        loop {
+            let info = room_of(&guard)?;
+            check_rights(info, self.asker(uid, guard.is_member(uid)), Role::Mod)?;
+            let key = guard.key;
             let bans = self.db(move |s| s.room_bans(key)).await?;
-            bans.into_iter()
-                .map(|(banned, reason)| {
-                    Event::snapshot(EventBody::Ban {
-                        room: info.room.clone(),
-                        uid: banned,
-                        reason,
-                    })
-                    .into()
-                })
-                .collect()
-        };
-        if !self.reply_all(reply, lines).await {
-            return Ok(None);
+            let rest: Vec<(Uid, String)> = bans
+                .into_iter()
+                .filter(|(banned, _)| after.as_ref().is_none_or(|last| banned > last))
+                .take(chunk + 1)
+                .collect();
+            let more = rest.len() > chunk;
+            for (banned, reason) in rest.into_iter().take(chunk) {
+                after = Some(banned.clone());
+                reply.line(Event::snapshot(EventBody::Ban {
+                    room: info.room.clone(),
+                    uid: banned,
+                    reason,
+                }));
+            }
+            if !more {
+                return Ok(Some(OkResponse::new()));
+            }
+            guard = match self.next_chunk(reply, guard).await {
+                None => return Ok(None),
+                Some(None) => return Ok(Some(OkResponse::new())),
+                Some(Some(guard)) => guard,
+            };
         }
-        Ok(Some(OkResponse::new()))
     }
 }
 

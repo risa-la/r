@@ -7,6 +7,7 @@
 use risala_proto::types::{GuestAccess, Role, RoomSetting};
 
 use crate::core::tests::{Client, Harness, T, config, put, set, stored, strings};
+use crate::handler::Handler as _;
 use crate::store::{EventKind, SqliteStore, Store};
 
 const ALICE: &str = "alice@example.org";
@@ -1105,4 +1106,129 @@ async fn a_ban_reaches_its_target_only_if_they_could_see_the_room() {
         dave.lines(),
         [ev(9, ALICE, "BAN #general dave@example.net")]
     );
+}
+
+// ---------------------------------------------------------------------------
+// ROLES and BANS in chunks (3.6)
+
+/// `#general` with alice (owner) as a member, and twenty moderators and
+/// twenty bans, `m00` to `m19` and `b00` to `b19`, more than a chunk of
+/// lines (16 here). alice's connection has the smallest queue the limits
+/// allow, so a long response waits for her after its first chunk.
+async fn long_lists() -> (Harness, Client) {
+    let mut c = config();
+    c.rooms = strings(&["#general"]);
+    c.operators = vec![OP.into()];
+    c.limits.max_page = 1;
+    c.limits.max_list = 1;
+    c.limits.out_queue = c.limits.command_room();
+    c.limits.out_queue_bytes = c.limits.command_room_bytes();
+    let queue = c.limits.out_queue;
+    let mut h = Harness::with(c, |store| {
+        put(store, "#general", ALICE, EventKind::Join);
+        let role = |who: &str, role| EventKind::Role {
+            uid: who.parse().unwrap(),
+            role,
+        };
+        put(store, "#general", ALICE, role(ALICE, Role::Owner));
+        for n in 0..20 {
+            put(
+                store,
+                "#general",
+                ALICE,
+                role(&format!("m{n:02}@example.org"), Role::Mod),
+            );
+            let ban = EventKind::Ban {
+                uid: format!("b{n:02}@example.org").parse().unwrap(),
+                reason: String::new(),
+            };
+            put(store, "#general", ALICE, ban);
+        }
+    });
+    let mut alice = h.connect_sni(Some("chat.example.org"), queue);
+    alice.lines();
+    assert!(
+        h.hub
+            .inner
+            .reg()
+            .attach(alice.id, &ALICE.parse().unwrap(), None)
+    );
+    (h, alice)
+}
+
+/// Sends `line` as `c` in a task, lets it queue its first chunk and wait
+/// for room, makes `change` as the operator meanwhile, then reads every
+/// line up to the `OK`.
+async fn while_waiting(h: &mut Harness, c: &mut Client, line: &str, change: &str) -> Vec<String> {
+    let mut op = h.signed_in_as(OP);
+    let (hub, id, req) = (h.hub.clone(), c.id, line.parse().unwrap());
+    let task = tokio::spawn(async move { hub.command(id, req).await });
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!task.is_finished());
+    h.send(&op, change).await;
+    assert!(op.lines().last().unwrap().starts_with("OK seq="));
+    let mut lines = Vec::new();
+    while let Some(item) = c.rx.recv().await {
+        let crate::handler::Outgoing::Line(line) = item else {
+            panic!("closed: {item:?}");
+        };
+        let line = line.to_line().to_string();
+        let done = line.ends_with("OK");
+        lines.push(line);
+        if done {
+            break;
+        }
+    }
+    task.await.unwrap();
+    lines
+}
+
+/// A ROLE made while ROLES waits for the client after its first chunk:
+/// the event comes before the lines that would otherwise have been older
+/// than it, and they show the new role (3.6).
+#[tokio::test]
+async fn roles_in_chunks_agree_with_role_events() {
+    let (mut h, mut alice) = long_lists().await;
+    let lines = while_waiting(
+        &mut h,
+        &mut alice,
+        "roles #general",
+        "role #general m19@example.org owner",
+    )
+    .await;
+    let mut want = vec![format!("ROLE #general {ALICE} owner")];
+    for n in 0..15 {
+        want.push(format!("ROLE #general m{n:02}@example.org mod"));
+    }
+    want.push(ev(43, OP, "ROLE #general m19@example.org owner"));
+    for n in 15..19 {
+        want.push(format!("ROLE #general m{n:02}@example.org mod"));
+    }
+    want.push("ROLE #general m19@example.org owner".into());
+    want.push("OK".into());
+    assert_eq!(lines, want);
+}
+
+/// The same for an UNBAN while BANS waits.
+#[tokio::test]
+async fn bans_in_chunks_agree_with_unban_events() {
+    let (mut h, mut alice) = long_lists().await;
+    let lines = while_waiting(
+        &mut h,
+        &mut alice,
+        "bans #general",
+        "unban #general b19@example.org",
+    )
+    .await;
+    let mut want: Vec<String> = (0..16)
+        .map(|n| format!("BAN #general b{n:02}@example.org"))
+        .collect();
+    want.push(ev(43, OP, "UNBAN #general b19@example.org"));
+    for n in 16..19 {
+        want.push(format!("BAN #general b{n:02}@example.org"));
+    }
+    want.push("OK".into());
+    assert_eq!(lines, want);
 }
