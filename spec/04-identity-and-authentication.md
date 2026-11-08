@@ -214,9 +214,10 @@ log <vkey> <url>
   `log chat.example.org/risala-log/1+4d1e07a2+BhO3…Zw== https://chat.example.org/risala-log/1`.
 - The second line is a `log` line. Each `log` line names the log that
   holds the records listed after it, up to the next `log` line. There is
-  another one wherever the chain moves to another log (4.5): after a
-  `log` record, and where the log handed off to its successor. No `log`
-  line follows another, or ends the file.
+  another one before the first record that the chain puts in another log
+  (4.5), after a `log` record or at a hand-off. After a `log` record, it
+  may also end the file, to name the log that the next records go into.
+  No `log` line follows another.
 - A **record line** is `<index> <hash>` for a record that is in the log:
   `<index>` is its position in the log as a number (3.3), and `<hash>`
   its SHA-384 hash as a blob-ref (3.5). Indices increase within each
@@ -323,7 +324,10 @@ Parsing:
    form as [RFC9420] requires, and nothing after its last field. Its
    `version` is 1, and its `type` one of those above. An encoded Record
    is at most 16 KiB (16384 bytes).
-3. The chain has at most 4,096 records.
+3. The chain has at most 4,096 records. That is far above normal use,
+   but chains only grow, so a device tells its user once its identity's
+   chain passes 3,072 records, while there is room to move to a new
+   identity.
 
 Replaying, record by record, in order:
 
@@ -356,8 +360,8 @@ Replaying, record by record, in order:
     of the same host that this one handed off to (4.5).
 
 A record whose `time` is more than 10 minutes ahead of the reader's
-clock makes the fetch fail (below) rather than the file invalid, since
-the reader's clock may be the one that is wrong.
+clock makes the fetch an outage (below) rather than the file invalid,
+since the reader's clock may be the one that is wrong.
 
 Replaying the chain gives the identity's **current** master key,
 device-signing key, log, devices and generation. Only current devices
@@ -388,16 +392,18 @@ one of three states:
 
 - **Keys.** A 200 response, within the limits, whose body is a valid key
   file that extends the chain the reader holds (below). The identity's
-  keys are the current ones of the chain. A device that an accepted
-  record removes (4.5), and every device of an identity whose chain ends
-  with an accepted `retire` record, has been **removed by record**.
+  keys are the current ones of the chain. A device that a record
+  removes, and every device of an identity whose chain ends with a
+  `retire` record, has been **removed by record**, once the reader has
+  accepted that record (for a device, 4.5; a server takes it from a
+  valid key file that extends its pin, 4.6).
 - **Keys missing.** A 404 or 410 response, a body larger than 2 MiB, a
   file whose first line is not `risala-keys/1`, a file that is not
   valid, or one whose `<index> <hash>` lines do not match the log. None
-  of these is signed, so none of them removes anything: the identity
-  has no keys that anyone may use while they last, but nothing is taken
-  from it. Nobody signs in with its keys, and devices send nothing to it
-  and warn their users (12.14), but keep its leaves.
+  of these is signed, so none of them removes anything. While an
+  identity's keys are missing, nobody signs in with them, and devices
+  send nothing to the identity and warn their users (12.14), but keep
+  its leaves.
 - **Outage.** Anything else: no response, a DNS or TLS error, a timeout,
   a 5xx response, any other status, including a redirect, a failed fetch
   from the log, or a record time in the future. This says nothing about
@@ -505,11 +511,13 @@ key, by appending to its current log `n` a hand-off entry whose `next`
 names log `n`+1 (`<host>/risala-log/<n+1>`) and its key. After that
 entry, log `n` appends nothing more, and every chain whose records were
 going into log `n` continues in log `n`+1: its next record goes there,
-with no record of its own for the move. A reader follows a hand-off only
-when the hand-off entry is the last entry of a witnessed checkpoint of
-log `n`, with an inclusion proof. A log `n` > 1 without a hand-off from
-log `n`-1 is not valid: readers ignore it, and witnesses do not enrol it
-(4.10). A host that loses its log's key cannot hand off, and the chains
+with no record of its own for the move. Log `n`+1 holds the records of
+log `n` as the start of those chains, for KEYS PUT (4.7) and for the
+appending rules above, without appending them again. A reader follows a
+hand-off only when the hand-off entry is the last entry of a witnessed
+checkpoint of log `n`, with an inclusion proof. A log `n` > 1 without a
+hand-off from log `n`-1 is not valid: readers ignore it, and witnesses do
+not enrol it (4.10). A host that loses its log's key cannot hand off, and the chains
 in that log can grow no more, so operators MUST keep the key safe and
 backed up (Section 14).
 
@@ -800,16 +808,18 @@ connections as well as signed-in ones. The server checks that:
 - it extends what the server already has for that uid: records it
   already holds are skipped, and a different record in the place of one
   it holds is refused (`ERR forbidden`)
-- the chain puts each new record in this server's log (4.4, 4.5), and
-  the server either hosts the identity or logs other identities
-  (`ERR not-supported`)
+- the newest of `<records>` is one that the chain puts in this server's
+  log (4.4, replaying step 11), and the server either hosts the identity
+  or logs other identities (`ERR not-supported`)
 - for an identity it does not host, the identity's key file (4.4), which
   it fetches, names this log in its last `log` line and lists the new
   records, as `-` lines or by hash (`ERR forbidden`). So nobody can put
   an identity's records into a log that the identity does not name.
 - the chain stays within the limits of 4.4 (`ERR too-long`)
 
-It then appends the new records to its log (4.5). For an identity it
+It then appends to its log (4.5) each record that it did not hold and
+that the chain puts in this log. It keeps the records that belong to
+earlier logs of the chain only to check the chain. For an identity it
 hosts, it also publishes the new key file. `<index>` is a record's
 position in the log, and `<hash>` its SHA-384 hash as a blob-ref (3.5).
 Sending records the server already has again gets `OK` and no lines.
