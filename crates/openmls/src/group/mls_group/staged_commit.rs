@@ -939,6 +939,17 @@ impl StagedCommit {
         }
     }
 
+    /// risala: the non-blank parent nodes that the commit sets, from its
+    /// path or as the parents of added leaves, so that the application can
+    /// check their encryption keys before it merges the commit.
+    pub fn changed_parent_nodes(&self) -> Vec<&crate::treesync::ParentNode> {
+        let diff = match &self.state {
+            StagedCommitState::PublicState(state) => &state.staged_diff,
+            StagedCommitState::GroupMember(state) => &state.staged_diff,
+        };
+        diff.changed_parent_nodes().collect()
+    }
+
     /// Returns the credentials that the caller needs to verify are valid.
     pub fn credentials_to_verify(&self) -> impl Iterator<Item = &Credential> {
         let update_path_leaf_node_cred = if let Some(node) = self.update_path_leaf_node() {

@@ -89,6 +89,7 @@ fn commit(group: &GroupView, by: u32, proposals: Vec<ProposalView>) -> CommitVie
         proposals,
         path_leaf: Some(path),
         new_conversation: group.conversation.clone(),
+        parent_keys_ok: true,
     }
 }
 
@@ -826,6 +827,7 @@ fn external_commits() {
             proposals,
             path_leaf: Some(path),
             new_conversation: Ok(conv.clone()),
+            parent_keys_ok: true,
         }
     };
     let with = |indices: &[u32]| {

@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use openmls::group::{QueuedProposal, StagedCommit};
+use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::{
     KeyPackage, LeafNode, LeafNodeIndex, Proposal, ProposalOrRefType, PublicGroup, Sender,
 };
@@ -543,8 +544,9 @@ pub enum JoinError {
     #[error("the group is not the conversation expected")]
     WrongConversation,
     /// A leaf's credential is not a RisalaIdentity, a device's leaf has no
-    /// profile, or a leaf's encryption key fails the checks of 12.2.
-    #[error("a leaf without a RisalaIdentity or a profile, or with a bad key")]
+    /// profile, or a leaf's or parent node's encryption key, or a
+    /// GroupInfo's `external_pub`, fails the checks of 12.2.
+    #[error("a leaf without a RisalaIdentity or a profile, or a bad key")]
     Leaf,
     /// A leaf of a direct conversation belongs to someone else.
     #[error("a leaf of a direct conversation belongs to someone else")]
@@ -646,6 +648,29 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
     Ok(())
 }
 
+/// Whether every parent node of a group's tree has an encryption key that
+/// passes the checks of 12.2. A device checks this of every group it joins,
+/// by Welcome or by external commit, since a tree's parent nodes are keys
+/// that members' paths encrypt to (12.2); a commit's own parent nodes are
+/// checked with it ([`CommitView::parent_keys_ok`]).
+pub fn parent_keys_ok(group: &PublicGroup) -> bool {
+    group
+        .treesync()
+        .full_parents()
+        .all(|(_, node)| x_wing_public_key_ok(node.public_key().as_slice()))
+}
+
+/// Whether a GroupInfo's `external_pub`, if it has one, passes the checks
+/// of 12.2. A device rejects a GroupInfo whose key fails before it makes an
+/// external commit with it, and a server refuses one it is given (12.2):
+/// otherwise every resync and rejoin of a public room would fail.
+pub fn group_info_keys_ok(group_info: &VerifiableGroupInfo) -> bool {
+    group_info
+        .extensions()
+        .external_pub()
+        .is_none_or(|ext| x_wing_public_key_ok(ext.external_pub().as_slice()))
+}
+
 /// Whether a group of these leaves' uids is within the limits of 6.1 and
 /// 12.7: a direct conversation holds at most 128 leaves.
 fn within_limits<'a>(
@@ -725,6 +750,12 @@ pub struct CommitView {
     pub path_leaf: Option<LeafView>,
     /// The conversation extension of the epoch the commit creates.
     pub new_conversation: Result<RisalaConversation, ConversationError>,
+    /// Whether every parent node that the commit sets, from its path or as
+    /// the parents of the leaves it adds, has an encryption key that passes
+    /// the checks of 12.2. A device rejects a commit that carries a key
+    /// that fails, and a server one it is given (12.2): otherwise every
+    /// member whose path must encrypt to that node could no longer commit.
+    pub parent_keys_ok: bool,
 }
 
 impl CommitView {
@@ -748,6 +779,10 @@ impl CommitView {
             new_conversation: RisalaConversation::from_extensions(
                 staged.group_context().extensions(),
             ),
+            parent_keys_ok: staged
+                .changed_parent_nodes()
+                .into_iter()
+                .all(|node| x_wing_public_key_ok(node.public_key().as_slice())),
         }
     }
 
@@ -843,7 +878,8 @@ pub enum CommitError {
     Group,
     /// The committer's leaf, or an Update's, changes its credential, or its
     /// signature key where 12.3 does not allow it, or has no profile, or an
-    /// encryption key that fails the checks of 12.2.
+    /// encryption key that fails the checks of 12.2; or a parent node that
+    /// the commit sets has such a key.
     #[error("a leaf changes in a way 12.3 does not allow")]
     Leaf,
     /// A guest's leaf commits or proposes an Update in a public room, or
@@ -1016,7 +1052,7 @@ pub fn check_commit(
             None
         }
     };
-    if !path_leaf.encryption_key_ok {
+    if !path_leaf.encryption_key_ok || !commit.parent_keys_ok {
         return Err(CommitError::Leaf);
     }
     check_streak(group, commit, committer_uid, path_leaf)?;

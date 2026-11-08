@@ -65,7 +65,8 @@ use crate::aad::{
 use crate::binding::DEVICE_BINDING_EXTENSION;
 use crate::checks::{
     CommitError, CommitPost, CommitView, Committer, EpochState, External, GroupView, JoinError,
-    JoinExpectation, KeyFacts, KeyReport, Seen, Verdict, check_commit, check_join, key_checks,
+    JoinExpectation, KeyFacts, KeyReport, Seen, Verdict, check_commit, check_join,
+    group_info_keys_ok, key_checks, parent_keys_ok,
 };
 use crate::conversation::{
     CONVERSATION_EXTENSION, ConfirmMode, ConversationKind, RisalaConversation,
@@ -229,6 +230,18 @@ pub enum GroupError<E> {
 
 fn mls<E, T: std::fmt::Display>(e: T) -> GroupError<E> {
     GroupError::Mls(e.to_string())
+}
+
+/// An error of a group in scratch storage, as one of the device's storage.
+fn scratch_error<E, S: std::fmt::Debug>(e: GroupError<S>) -> GroupError<E> {
+    match e {
+        GroupError::Random => GroupError::Random,
+        GroupError::Storage(e) => GroupError::Mls(format!("scratch storage: {e:?}")),
+        GroupError::Group(e) => GroupError::Group(e),
+        GroupError::Wire(e) => GroupError::Wire(e),
+        GroupError::Join(e) => GroupError::Join(e),
+        GroupError::Mls(e) => GroupError::Mls(e),
+    }
 }
 
 /// The device's own leaf: its key, from storage.
@@ -966,7 +979,17 @@ pub fn join_by_welcome<P: OpenMlsProvider>(
     }
     let state = EpochState::started_by(started_by);
     let view = GroupView::of(group.public_group(), &state);
-    let checked = check_join(&view, expect).and_then(|()| Ok(view.conversation.clone()?.kind));
+    // The tree's parent nodes carry keys that members' paths encrypt to,
+    // checked as a leaf's are (12.2).
+    let checked = check_join(&view, expect)
+        .and_then(|()| {
+            if parent_keys_ok(group.public_group()) {
+                Ok(())
+            } else {
+                Err(JoinError::Leaf)
+            }
+        })
+        .and_then(|()| Ok(view.conversation.clone()?.kind));
     // Only a public room's Welcome comes without its tree, which the server
     // hands out with it (12.8).
     let checked = match checked {
@@ -996,24 +1019,33 @@ pub fn join_by_welcome<P: OpenMlsProvider>(
     })
 }
 
-/// A public room's group as the server holds it, or as a device sees it
-/// before it joins: from a GroupInfo and a ratchet tree (12.6), without
-/// checking the lifetimes of the leaves in the tree (12.5), with
-/// `storage` for OpenMLS's state.
+/// A public room's group as a device sees it before it joins: from a
+/// GroupInfo and a ratchet tree (12.6), without checking the lifetimes of
+/// the leaves in the tree (12.5), with `storage` for OpenMLS's state. The
+/// GroupInfo's `external_pub` and the tree's parent nodes must pass the
+/// checks of X-Wing keys (12.2): a device rejects a GroupInfo or tree that
+/// carries a key that fails ([`JoinError::Leaf`]).
 pub fn public_group<S: openmls::storage::PublicStorageProvider>(
     crypto: &impl OpenMlsCrypto,
     storage: &S,
     group_info: &[u8],
     tree: &[u8],
 ) -> Result<PublicGroup, GroupError<<S as openmls::storage::PublicStorageProvider>::Error>> {
+    let group_info = read_group_info(group_info)?;
+    if !group_info_keys_ok(&group_info) {
+        return Err(JoinError::Leaf.into());
+    }
     let (group, _) = PublicGroup::from_external(
         crypto,
         storage,
         read_tree(tree)?,
-        read_group_info(group_info)?,
+        group_info,
         ProposalStore::new(),
     )
     .map_err(mls)?;
+    if !parent_keys_ok(&group) {
+        return Err(JoinError::Leaf.into());
+    }
     Ok(group)
 }
 
@@ -1049,8 +1081,8 @@ pub fn join_public_room<P: OpenMlsProvider>(
     expect: &JoinExpectation,
 ) -> Result<JoinRequest, GroupError<P::StorageError>> {
     let scratch = MemoryStorage::default();
-    let public = public_group(provider.crypto(), &scratch, group_info, tree)
-        .map_err(|e| GroupError::Mls(e.to_string()))?;
+    let public =
+        public_group(provider.crypto(), &scratch, group_info, tree).map_err(scratch_error)?;
     let view = GroupView::of(&public, &EpochState::default());
     check_join(&view, expect)?;
     if view
@@ -1155,8 +1187,8 @@ pub fn external_commit<P: OpenMlsProvider>(
         ));
     }
     let scratch = MemoryStorage::default();
-    let public = public_group(provider.crypto(), &scratch, group_info, tree)
-        .map_err(|e| GroupError::Mls(e.to_string()))?;
+    let public =
+        public_group(provider.crypto(), &scratch, group_info, tree).map_err(scratch_error)?;
     let group_info = read_group_info(group_info)?;
     let signer = group_info.signer();
     let view = GroupView::of(&public, &EpochState::started_by(signer));

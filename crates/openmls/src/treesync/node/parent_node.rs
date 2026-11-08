@@ -174,7 +174,10 @@ impl ParentNode {
     }
 
     /// Return a reference to the `public_key` of this node.
-    pub(crate) fn public_key(&self) -> &HpkePublicKey {
+    ///
+    /// risala: public, so that the application can check the keys of a
+    /// tree's parent nodes.
+    pub fn public_key(&self) -> &HpkePublicKey {
         self.encryption_key.key()
     }
 

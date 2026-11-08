@@ -279,6 +279,13 @@ impl StagedPublicGroupDiff {
         &self.group_context
     }
 
+    /// risala: the non-blank parent nodes that the commit sets.
+    pub(crate) fn changed_parent_nodes(
+        &self,
+    ) -> impl Iterator<Item = &crate::treesync::ParentNode> {
+        self.staged_diff.changed_parent_nodes()
+    }
+
     /// Get the [`ConfirmationTag`] of the commit that produced this diff.
     pub(crate) fn confirmation_tag(&self) -> &ConfirmationTag {
         &self.confirmation_tag

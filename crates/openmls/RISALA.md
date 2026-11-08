@@ -1,10 +1,10 @@
 # openmls, patched for risala
 
-This is openmls 0.9.2 from crates.io, changed in five ways for risala:
+This is openmls 0.9.2 from crates.io, changed in six ways for risala:
 how it frames a SelfRemove proposal (draft-ietf-mls-extensions), where it
 checks KeyPackage lifetimes, removals in external commits, the
-authenticated data of join proposals, and `VerifiableGroupInfo::signer`,
-which is public. The root Cargo.toml puts it in place
+authenticated data of join proposals, `VerifiableGroupInfo::signer`,
+which is public, and access to the keys of parent nodes. The root Cargo.toml puts it in place
 of the crates.io release with `[patch.crates-io]`. Each place is marked
 `risala:`.
 
@@ -71,3 +71,23 @@ proposals carry a RisalaAAD like every other post.
 `VerifiableGroupInfo::signer` is public, so that a resync commit can
 remove the GroupInfo's signer, and a server can check that a public room's
 GroupInfo is signed by the committer.
+
+## The keys of parent nodes (the spec, 12.2)
+
+Devices reject a commit or Welcome that carries an X-Wing key that fails
+12.2's check, and servers one they are given, whether the key is a
+leaf's or a parent node's. OpenMLS checks neither, and exposes neither a
+staged commit's parent nodes nor a parent node's key.
+
+- `StagedCommit::changed_parent_nodes` returns the non-blank parent nodes
+  that a staged commit sets: its path's, and those an Add changes. It
+  reads them from the staged diff (`StagedAbDiff::changed_parents`,
+  `StagedTreeSyncDiff::changed_parent_nodes`,
+  `StagedPublicGroupDiff::changed_parent_nodes`, all crate-private).
+- `ParentNode::public_key` is public, so that the whole tree of a group
+  being joined (`PublicGroup::treesync().full_parents()`) can be checked.
+
+risala-mls checks them (`checks::CommitView::parent_keys_ok`,
+`checks::parent_keys_ok`) and tests that a commit's view reads its parent
+nodes. Drop the patch if OpenMLS checks HPKE public keys itself, or
+exposes the nodes another way.

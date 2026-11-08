@@ -82,6 +82,13 @@ pub(crate) struct StagedTreeSyncDiff {
 }
 
 impl StagedTreeSyncDiff {
+    /// risala: the non-blank parent nodes that the diff sets.
+    pub(crate) fn changed_parent_nodes(&self) -> impl Iterator<Item = &ParentNode> {
+        self.diff
+            .changed_parents()
+            .filter_map(|node| node.node().as_ref())
+    }
+
     pub(super) fn into_parts(
         self,
     ) -> (

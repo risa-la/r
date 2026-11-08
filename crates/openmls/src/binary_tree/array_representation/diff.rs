@@ -72,6 +72,12 @@ impl<L: Clone + Debug + Default, P: Clone + Debug + Default> StagedAbDiff<L, P> 
         self.size
     }
 
+    /// risala: the parent nodes that the diff sets, blank or not, so that
+    /// the keys a commit brings can be checked before it is merged.
+    pub(crate) fn changed_parents(&self) -> impl Iterator<Item = &P> {
+        self.parent_diff.values()
+    }
+
     /// Returns an iterator over a tuple of the leaf index and a reference to a
     /// leaf, sorted according to their position in the tree from left to right.
     pub(crate) fn leaves<'a>(

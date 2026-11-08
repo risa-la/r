@@ -2417,3 +2417,83 @@ fn serde_json_like(state: &EpochState) -> Vec<u8> {
     assert_eq!(&back, state);
     bytes
 }
+
+/// X-Wing keys of parent nodes and of a GroupInfo's `external_pub` are
+/// checked as a leaf's are (12.2): a commit reports the parent nodes it
+/// sets, a joined tree's parent nodes are checked, and a GroupInfo whose
+/// `external_pub` fails is refused before anyone encrypts to it.
+#[test]
+fn x_wing_keys_of_parent_nodes() {
+    let Room3 {
+        owen,
+        mia,
+        pat,
+        mut o,
+        mut m,
+        mut p,
+        facts,
+    } = private_room();
+    // Three leaves: the tree has parent nodes, all of them good.
+    assert!(o.public_group().treesync().full_parents().count() > 0);
+    assert!(crate::checks::parent_keys_ok(o.public_group()));
+    // A commit with a path sets parent nodes, and the view reads them.
+    let out = mia.commit(&mut m, Changes::default());
+    let (received, verdict) = pat.receive(&mut p, &out);
+    verdict.unwrap();
+    assert!(!received.staged.changed_parent_nodes().is_empty());
+    assert!(received.view.parent_keys_ok);
+    mia.merge(&mut m, &out);
+    pat.apply_received(&mut p, *received);
+    owen.apply(&mut o, &out, &facts);
+    // A view whose parent node failed is invalid, for devices and servers.
+    let (received, _) = owen.receive(&mut o, &pat.commit(&mut p, Changes::default()));
+    let mut bad = received.view.clone();
+    bad.parent_keys_ok = false;
+    assert_eq!(
+        crate::checks::check_commit(
+            &GroupView::of(o.public_group(), &owen.state(&o)),
+            &bad,
+            &CommitPost::at(now_ms(), Some([1; 48])),
+        ),
+        Err(CommitError::Leaf)
+    );
+
+    // A public room's GroupInfo whose external_pub has a coefficient of q
+    // or more: refused before a device joins or commits with it.
+    let (owen, o, _) = public_room(GuestMode::Write);
+    let (group_info, tree) = public_state(&owen, &o);
+    let info = crate::wire::read_group_info(&group_info).unwrap();
+    assert!(crate::checks::group_info_keys_ok(&info));
+    let key = info
+        .extensions()
+        .external_pub()
+        .unwrap()
+        .external_pub()
+        .as_slice()
+        .to_vec();
+    let at = group_info
+        .windows(key.len())
+        .position(|w| w == key)
+        .unwrap();
+    let mut forged = group_info.clone();
+    forged[at..at + 3].copy_from_slice(&[0xff; 3]);
+    let info = crate::wire::read_group_info(&forged).unwrap();
+    assert!(!crate::checks::group_info_keys_ok(&info));
+    let storage = MemoryStorage::default();
+    assert!(matches!(
+        public_group(owen.provider.crypto(), &storage, &forged, &tree),
+        Err(GroupError::Join(crate::checks::JoinError::Leaf))
+    ));
+    let dave = Device::new("dave@example.org", 4);
+    assert!(matches!(
+        join_public_room(
+            &dave.provider,
+            &dave.identity(),
+            Some(&dave.profile()),
+            &forged,
+            &tree,
+            &public_expect(&dave),
+        ),
+        Err(GroupError::Join(crate::checks::JoinError::Leaf))
+    ));
+}

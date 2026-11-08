@@ -21,6 +21,7 @@ use openmls_memory_storage::MemoryStorage;
 use risala_mls::RisalaCrypto;
 use risala_mls::checks::{
     CommitError, CommitView, EpochState, GroupView, JoinExpectation, check_commit, check_join,
+    group_info_keys_ok,
 };
 use risala_mls::conversation::{ConversationKind, GuestMode, RisalaConversation, Role as MlsRole};
 use risala_mls::framing::ContentType;
@@ -216,6 +217,13 @@ fn build(
     if extensions.external_pub().is_none() || extensions.ratchet_tree().is_some() {
         return Err(invalid(
             "a public room's GroupInfo has external_pub and no ratchet_tree",
+        ));
+    }
+    // Servers reject a GroupInfo that carries an X-Wing key that fails
+    // (12.2): resyncs and rejoins encrypt to it.
+    if !group_info_keys_ok(&verifiable) {
+        return Err(invalid(
+            "a GroupInfo's external_pub fails the X-Wing checks",
         ));
     }
     let signer = verifiable.signer();
