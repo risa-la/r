@@ -188,12 +188,20 @@ async fn info_follows_the_settings() {
     config.state_dir = std::env::temp_dir();
     let mut h = Harness::with(config, timers());
     let mut c = h.connect();
+    // A server with an identity domain keeps a key log (4.5), and INFO
+    // names it and its key.
+    let info = |c: &mut Client| {
+        let lines = c.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let key = value(&lines[0], "log-key");
+        assert!(key.starts_with("chat.example.org/risala-log/1+"), "{key}");
+        lines[0].replace(&format!(" log-key={key}"), "")
+    };
     h.send(&c, "INFO").await;
     assert_eq!(
-        c.lines(),
-        [
-            "OK version=1 anon=yes guests=no register=example.org log=no retention=7 push=no upload=no"
-        ]
+        info(&mut c),
+        "OK version=1 anon=yes guests=no register=example.org \
+         log=https://chat.example.org/risala-log/1 retention=7 push=no upload=no"
     );
     // Closed registration is register=no (8.5), and ADMIN SET shows at once.
     let mut op = h.signed_in_as("op@example.org");
@@ -202,8 +210,9 @@ async fn info_follows_the_settings() {
     assert_eq!(op.lines(), ["OK", "OK"]);
     h.send(&c, "INFO").await;
     assert_eq!(
-        c.lines(),
-        ["OK version=1 anon=no guests=no register=no log=no retention=7 push=no upload=no"]
+        info(&mut c),
+        "OK version=1 anon=no guests=no register=no \
+         log=https://chat.example.org/risala-log/1 retention=7 push=no upload=no"
     );
     // Without push, PUSH is not supported.
     let mut alice = h.signed_in_as("alice@example.org");

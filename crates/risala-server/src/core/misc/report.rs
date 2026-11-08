@@ -190,7 +190,10 @@ fn check_post(post: &ReportedPost, kept: &[u8]) -> Result<Pseudonym, PostCheck> 
     if !crate::secret::ct_eq(&expected, &tag) {
         return Err(PostCheck("the franking tag does not match"));
     }
-    Ok(Pseudonym::from_bytes(aad.pseudonym.0))
+    // An application message is a PrivateMessage, whose RisalaAAD has a
+    // pseudonym (7.3, 12.9).
+    let pseudonym = aad.pseudonym.ok_or(PostCheck("no pseudonym"))?;
+    Ok(Pseudonym::from_bytes(pseudonym.0))
 }
 
 /// The `get` URLs of files the content shares (5.6), which the server
