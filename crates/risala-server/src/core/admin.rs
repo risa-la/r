@@ -68,6 +68,21 @@ impl AdminState {
         })
     }
 
+    /// The bans that cover one of `operators`, the operators from the
+    /// configuration, with the operator: they do not apply to them (10.2),
+    /// but the server warns of them at start.
+    pub(crate) fn covering(&self, operators: &[Uid]) -> Vec<(Uid, ServerBanTarget)> {
+        let bans = self.bans();
+        operators
+            .iter()
+            .flat_map(|op| {
+                bans.keys()
+                    .filter(|t| t.covers_uid(op))
+                    .map(|t| (op.clone(), t.clone()))
+            })
+            .collect()
+    }
+
     fn bans(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<ServerBanTarget, String>> {
         self.bans.read().unwrap_or_else(|e| e.into_inner())
     }
@@ -151,8 +166,12 @@ impl Inner {
 
     /// Whether a server ban covers the identity `uid` (10.2), by identity
     /// or by domain. Guests are never covered: their bans go by address.
+    /// Nor are operators from the configuration, even by a ban made before
+    /// they were added to it (10.2).
     pub(super) fn uid_banned(&self, uid: &Uid) -> bool {
-        uid.is_identity() && self.admin_state.bans().keys().any(|t| t.covers_uid(uid))
+        uid.is_identity()
+            && !self.configured_operator(uid)
+            && self.admin_state.bans().keys().any(|t| t.covers_uid(uid))
     }
 
     /// `ERR forbidden` if a server ban covers the identity `uid` (10.2),
@@ -206,12 +225,19 @@ impl Inner {
     }
 
     /// ADMIN OP (10.1). Making an operator of one already is not an error.
-    /// The identity learns it at its next sign-in (4.5).
+    /// The identity learns it at its next sign-in (4.5). An identity a
+    /// server ban covers is `forbidden`: operators cannot be banned, so
+    /// the ban goes first (10.1, 10.2).
     async fn admin_op(&self, target: &Uid) -> Outcome {
         if !target.is_identity() {
             return Err(forbidden("guests cannot be operators"));
         }
         let _admin = self.admin_state.lock.lock().await;
+        if self.uid_banned(target) {
+            return Err(forbidden(
+                "that identity is banned from this server; lift the ban first",
+            ));
+        }
         if !self.configured_operator(target) {
             let (who, now) = (target.clone(), self.now());
             self.db(move |s| s.add_operator(&who, now)).await?;
@@ -305,7 +331,9 @@ impl Inner {
             self.end_guest_session(&guest, &bye).await;
         }
         respond(reply, "ADMIN", Ok(Some(OkResponse::new())));
-        self.detach_identities(|uid| target.covers_uid(uid), &bye);
+        // Operators were refused above; the configuration's are never
+        // covered (10.2).
+        self.detach_identities(|uid| self.uid_banned(uid) && target.covers_uid(uid), &bye);
         Ok(None)
     }
 

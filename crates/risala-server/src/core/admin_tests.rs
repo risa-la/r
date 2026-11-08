@@ -11,7 +11,7 @@ use risala_proto::names::Uid;
 use super::tests::{Client, Flaky, Harness, T, config, start, stored, timers};
 use super::*;
 use crate::handler::{ConnInfo, conn_channel};
-use crate::store::SqliteStore;
+use crate::store::{AdminStore as _, SqliteStore};
 
 /// The hostname clients connect to, as they send it in SNI.
 const HOST: &str = "chat.example.org";
@@ -573,6 +573,71 @@ async fn a_ban_that_covers_an_operator_is_refused() {
         );
     }
     assert_eq!(w.admin("admin bans").await, ["OK"]);
+}
+
+/// ADMIN OP of an identity a server ban covers is refused: lift the ban
+/// first (10.1, 10.2).
+#[tokio::test]
+async fn a_banned_identity_cannot_be_made_an_operator() {
+    let mut w = World::new();
+    assert_eq!(w.admin("admin ban *@spam.example").await, ["OK"]);
+    assert_eq!(
+        w.admin("admin op bob@spam.example").await,
+        ["ERR forbidden that identity is banned from this server; lift the ban first"]
+    );
+    assert_eq!(w.admin("admin ops").await, ["OP op@example.net", "OK"]);
+    assert_eq!(w.admin("admin unban *@spam.example").await, ["OK"]);
+    assert_eq!(w.admin("admin op bob@spam.example").await, ["OK"]);
+}
+
+/// Operators from the configuration may sign in, with AUTH or REGISTER,
+/// though a ban made before they were added to it covers them (10.2).
+/// The server warns of such bans at start. Others the bans cover may not.
+#[tokio::test]
+async fn bans_do_not_apply_to_configured_operators() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    store
+        .ensure_room(&"#general".parse().unwrap(), start())
+        .unwrap();
+    for target in ["*@example.net", "*@example.org"] {
+        store
+            .add_server_ban(&crate::store::ServerBan {
+                target: target.parse().unwrap(),
+                reason: String::new(),
+                t: start(),
+            })
+            .unwrap();
+    }
+    let mut c = admin_config();
+    c.operators = vec!["op@example.net".into(), "boss@example.org".into()];
+    let mut w = World::on(c, Arc::new(store));
+    let configured = [uid("op@example.net"), uid("boss@example.org")];
+    assert_eq!(
+        w.h.hub.inner.admin_state.covering(&configured),
+        [
+            (uid("op@example.net"), "*@example.net".parse().unwrap()),
+            (uid("boss@example.org"), "*@example.org".parse().unwrap()),
+        ]
+    );
+
+    w.fetcher
+        .set(&"op@example.net".parse().unwrap(), vec![public(1)]);
+    w.fetcher
+        .set(&"bob@example.net".parse().unwrap(), vec![public(2)]);
+    let (_op, ok) = w.auth("op@example.net", 1).await;
+    assert_eq!(ok, ["OK uid=op@example.net op=yes"]);
+    let (_bob, refused) = w.auth("bob@example.net", 2).await;
+    assert_eq!(
+        refused,
+        ["ERR forbidden this identity is banned from this server"]
+    );
+    let (_boss, ok) = w.register("boss", 3).await;
+    assert!(ok[0].starts_with("OK uid=boss@example.org"), "{ok:?}");
+    let (_alice, refused) = w.register("alice", 4).await;
+    assert_eq!(
+        refused,
+        ["ERR forbidden this identity is banned from this server"]
+    );
 }
 
 // ---------------------------------------------------------------------------

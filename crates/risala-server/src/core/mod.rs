@@ -416,6 +416,14 @@ impl Hub {
             .collect();
         let identity_domain = config.identity_domain();
         let admin_state = admin::AdminState::load(&*store)?;
+        let configured: Vec<Uid> = config.operators().iter().map(|op| op.to_uid()).collect();
+        for (operator, ban) in admin_state.covering(&configured) {
+            tracing::warn!(
+                %operator,
+                %ban,
+                "a server ban covers an operator from the configuration, and does not apply to them"
+            );
+        }
         // The key files of hosted identities, again, in case they were
         // lost or the publisher keeps them in memory (4.6), and none of
         // the names no longer hosted, in case removing one failed (4.8).
