@@ -105,8 +105,8 @@ CREATE TABLE leaves (
     PRIMARY KEY (conv, leaf)
 ) WITHOUT ROWID;
 
--- What the device saw of each group's recent commits, for the group
--- checks that look back (12.7): risala-mls's History, as JSON.
+-- What the group checks need of each group's current epoch (12.3,
+-- 12.7): risala-mls's EpochState, as JSON.
 CREATE TABLE group_state (
     conv    INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     history TEXT NOT NULL
@@ -1230,14 +1230,14 @@ impl Tx<'_> {
         Ok(())
     }
 
-    // ---- the group's history (12.7)
+    // ---- the epoch's state (12.7)
 
-    /// The group's [`History`](risala_mls::checks::History), for the
-    /// checks that look back.
+    /// The group's [`EpochState`](risala_mls::checks::EpochState), for the
+    /// group checks.
     pub(crate) fn group_history(
         &self,
         conv: ConversationId,
-    ) -> Result<risala_mls::checks::History, StoreError> {
+    ) -> Result<risala_mls::checks::EpochState, StoreError> {
         let json: Option<String> = self
             .conn()
             .query_row(
@@ -1247,20 +1247,20 @@ impl Tx<'_> {
             )
             .optional()?;
         match json {
-            None => Ok(risala_mls::checks::History::default()),
+            None => Ok(risala_mls::checks::EpochState::default()),
             Some(json) => serde_json::from_str(&json)
-                .map_err(|e| StoreError::Corrupt(format!("a group's history: {e}"))),
+                .map_err(|e| StoreError::Corrupt(format!("a group's epoch state: {e}"))),
         }
     }
 
-    /// Keeps the group's history.
+    /// Keeps the group's epoch state.
     pub(crate) fn set_group_history(
         &mut self,
         conv: ConversationId,
-        history: &risala_mls::checks::History,
+        history: &risala_mls::checks::EpochState,
     ) -> Result<(), StoreError> {
         let json = serde_json::to_string(history)
-            .map_err(|e| StoreError::Corrupt(format!("a group's history: {e}")))?;
+            .map_err(|e| StoreError::Corrupt(format!("a group's epoch state: {e}")))?;
         self.conn().execute(
             "INSERT INTO group_state (conv, history) VALUES (?1, ?2)
              ON CONFLICT (conv) DO UPDATE SET history = excluded.history",

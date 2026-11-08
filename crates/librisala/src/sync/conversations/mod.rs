@@ -162,6 +162,10 @@ impl KeyFacts for UnknownFacts {
     fn identity_retired(&self, _: &Uid) -> Fact<bool> {
         Fact::Unknown
     }
+
+    fn forked_or_missing(&self, _: &Uid) -> Fact<bool> {
+        Fact::Unknown
+    }
 }
 
 /// What the group engine needs from the other areas. Every method has a

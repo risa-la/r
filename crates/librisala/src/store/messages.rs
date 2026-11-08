@@ -124,6 +124,7 @@ CREATE TABLE sender_logs (
     conv         INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     leaf         INTEGER NOT NULL,
     pseudonym    BLOB,
+    pin_period   INTEGER,
     last_counter INTEGER,
     last_id      BLOB,
     gaps         BLOB NOT NULL,
@@ -133,11 +134,23 @@ CREATE TABLE sender_logs (
 ) WITHOUT ROWID;
 
 -- The t of the commits that ended recent epochs (12.9, late messages).
+-- applied is when, by the device's clock, it applied that commit.
 CREATE TABLE epoch_ends (
-    conv  INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    epoch INTEGER NOT NULL,
-    t     INTEGER NOT NULL,
+    conv    INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    epoch   INTEGER NOT NULL,
+    t       INTEGER,
+    applied INTEGER,
     PRIMARY KEY (conv, epoch)
+) WITHOUT ROWID;
+
+-- The derived pseudonyms of the leaves of recent past epochs, outside
+-- public rooms (7.3), to check their late messages (12.9).
+CREATE TABLE epoch_pseudonyms (
+    conv      INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    epoch     INTEGER NOT NULL,
+    leaf      INTEGER NOT NULL,
+    pseudonym BLOB NOT NULL,
+    PRIMARY KEY (conv, epoch, leaf)
 ) WITHOUT ROWID;
 
 -- Sealed Welcomes waiting for their random time (12.8), each for one
@@ -1147,11 +1160,12 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             Vec<u8>,
             bool,
             Option<i64>,
+            Option<i64>,
         );
         let row: Option<Row> = self
             .conn
             .query_row(
-                "SELECT pseudonym, last_counter, last_id, gaps, left_group, removed_in
+                "SELECT pseudonym, last_counter, last_id, gaps, left_group, removed_in, pin_period
                  FROM sender_logs WHERE conv = ?1 AND leaf = ?2",
                 params![self.conv.0, leaf.u32()],
                 |r| {
@@ -1162,17 +1176,19 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()
             .unwrap_or_default();
-        let Some((pseudonym, counter, id, gaps, left, removed_in)) = row else {
+        let Some((pseudonym, counter, id, gaps, left, removed_in, pin_period)) = row else {
             return risala_mls::message::SenderLog::default();
         };
         let fixed16 = |b: Vec<u8>| <[u8; 16]>::try_from(b.as_slice()).ok();
         risala_mls::message::SenderLog {
             pseudonym: pseudonym.and_then(fixed16).map(risala_mls::Pseudonym),
+            pin_period: pin_period.map(|p| p as u64),
             last: match (counter, id.and_then(fixed16)) {
                 (Some(c), Some(id)) => {
                     Some((c as u64, risala_proto::content::MessageId::from_bytes(id)))
@@ -1194,12 +1210,12 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             .conn
             .execute(
                 "INSERT INTO sender_logs (conv, leaf, pseudonym, last_counter, last_id, gaps,
-                                          left_group, removed_in)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                          left_group, removed_in, pin_period)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (conv, leaf) DO UPDATE SET pseudonym = excluded.pseudonym,
                     last_counter = excluded.last_counter, last_id = excluded.last_id,
                     gaps = excluded.gaps, left_group = excluded.left_group,
-                    removed_in = excluded.removed_in",
+                    removed_in = excluded.removed_in, pin_period = excluded.pin_period",
                 params![
                     self.conv.0,
                     leaf.u32(),
@@ -1209,6 +1225,7 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
                     encode_gaps(&log.gaps),
                     log.left,
                     log.removed_in.map(|e| e as i64),
+                    log.pin_period.map(|p| p as i64),
                 ],
             )
             .map(drop);
@@ -1220,12 +1237,87 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             .query_row(
                 "SELECT t FROM epoch_ends WHERE conv = ?1 AND epoch = ?2",
                 params![self.conv.0, epoch as i64],
-                |r| r.get::<_, i64>(0),
+                |r| r.get::<_, Option<i64>>(0),
             )
             .optional()
             .ok()
             .flatten()
+            .flatten()
             .and_then(|t| risala_proto::time::Timestamp::from_unix_millis(t as u64))
+    }
+
+    fn epoch_applied(&self, epoch: u64) -> Option<risala_proto::time::Timestamp> {
+        self.conn
+            .query_row(
+                "SELECT applied FROM epoch_ends WHERE conv = ?1 AND epoch = ?2",
+                params![self.conv.0, epoch as i64],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .and_then(|t| risala_proto::time::Timestamp::from_unix_millis(t as u64))
+    }
+
+    fn set_epoch_applied(&mut self, epoch: u64, now: risala_proto::time::Timestamp) {
+        let r = self
+            .conn
+            .execute(
+                "INSERT INTO epoch_ends (conv, epoch, applied) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (conv, epoch) DO UPDATE SET applied = excluded.applied",
+                params![self.conv.0, epoch as i64, now.unix_millis() as i64],
+            )
+            .map(drop);
+        self.keep(r);
+    }
+
+    fn epoch_pseudonym(
+        &self,
+        epoch: u64,
+        leaf: risala_mls::openmls::prelude::LeafNodeIndex,
+    ) -> Option<risala_mls::Pseudonym> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT pseudonym FROM epoch_pseudonyms WHERE conv = ?1 AND epoch = ?2 AND leaf = ?3",
+                params![self.conv.0, epoch as i64, leaf.u32()],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        bytes
+            .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
+            .map(risala_mls::Pseudonym)
+    }
+
+    fn set_epoch_pseudonyms(&mut self, pseudonyms: risala_mls::aad::EpochPseudonyms) {
+        let epoch = pseudonyms.epoch as i64;
+        let mut r = Ok(());
+        for (leaf, p) in &pseudonyms.leaves {
+            if r.is_ok() {
+                r = self
+                    .conn
+                    .execute(
+                        "INSERT INTO epoch_pseudonyms (conv, epoch, leaf, pseudonym)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT (conv, epoch, leaf) DO UPDATE SET pseudonym = excluded.pseudonym",
+                        params![self.conv.0, epoch, leaf, &p.0[..]],
+                    )
+                    .map(drop);
+            }
+        }
+        // A device holds the secrets of at most 2 past epochs (12.9).
+        let r = r.and_then(|_| {
+            self.conn
+                .execute(
+                    "DELETE FROM epoch_pseudonyms WHERE conv = ?1 AND epoch + 2 < ?2",
+                    params![self.conv.0, epoch],
+                )
+                .map(drop)
+        });
+        self.keep(r);
     }
 
     fn set_epoch_end(&mut self, epoch: u64, t: risala_proto::time::Timestamp) {

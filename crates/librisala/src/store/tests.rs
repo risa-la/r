@@ -43,6 +43,7 @@ fn a_new_cache_has_version_1_and_every_area() {
             "deletes",
             "devices",
             "epoch_ends",
+            "epoch_pseudonyms",
             "files",
             "forks",
             "gaps",

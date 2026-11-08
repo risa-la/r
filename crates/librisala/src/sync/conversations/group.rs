@@ -14,7 +14,7 @@
 //! history.
 
 use risala_mls::aad::Pseudonym;
-use risala_mls::checks::{CommitPost, GroupView, JoinExpectation};
+use risala_mls::checks::{EpochState, GroupView, JoinExpectation, Seen};
 use risala_mls::conversation::{ConversationKind, RisalaConversation};
 use risala_mls::framing::{ContentType, read_post};
 use risala_mls::group::{self as mls_group, Changes, Incoming, ProposalKind};
@@ -87,7 +87,7 @@ pub(crate) fn box_of(ext: &RisalaConversation) -> BoxName {
 
 /// The group's leaves, for the cache.
 pub(crate) fn tree_leaves(group: &MlsGroup) -> Vec<TreeLeaf> {
-    GroupView::of(group.public_group())
+    GroupView::of(group.public_group(), &EpochState::default())
         .leaves
         .into_iter()
         .filter_map(|leaf| {
@@ -183,9 +183,8 @@ pub(crate) fn create(
     let name = display_name(tx, cx)?;
     let profile =
         RisalaProfile::new(&name, cx.now).ok_or(EngineError::Invalid("display name".into()))?;
-    let (group, _, history) =
-        mls_group::create_group(&tx.mls(cx.crypto), &identity, &profile, &ext, cx.now)
-            .map_err(mls)?;
+    let (group, _, state) =
+        mls_group::create_group(&tx.mls(cx.crypto), &identity, &profile, &ext).map_err(mls)?;
     let token_hash = SendToken::of_group(&group, cx.crypto.as_ref())
         .map_err(mls)?
         .hash();
@@ -217,7 +216,7 @@ pub(crate) fn create(
         last_resort: false,
         now: cx.now,
     })?;
-    tx.set_group_history(conv, &history)?;
+    tx.set_group_history(conv, &state)?;
     tx.add_mailbox(conv, &mailbox, true, 0, None)?;
     tx.sync_leaves(conv, &tree_leaves(&group))?;
     if !adds.is_empty() {
@@ -324,8 +323,8 @@ pub(crate) fn build_commit(
     if group.pending_commit().is_some() {
         mls_group::discard_own_commit(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
     }
-    let history = tx.group_history(conv.id)?;
-    let view = GroupView::of(group.public_group());
+    let state = tx.group_history(conv.id)?;
+    let view = mls_group::view(&group, &state, cx.crypto.as_ref());
     let own = group.own_leaf_index();
     let remove: Vec<LeafNodeIndex> = view
         .leaves
@@ -383,7 +382,7 @@ pub(crate) fn build_commit(
     // minutes after the previous one, unless it only removes leaves of
     // the committer's own identity.
     let previous = group.own_leaf_node().and_then(RisalaProfile::of_leaf);
-    let streak = history.expected_streak(own, previous.as_ref().map_or(0, |p| p.streak));
+    let streak = view.expected_streak(cx.uid);
     let own_removals_only = add.is_empty()
         && conversation.is_none()
         && !intent.new_leaf_key
@@ -406,24 +405,21 @@ pub(crate) fn build_commit(
     let profile = own_profile(tx, cx, &group, intent.display_name.as_deref())?;
     // 7.8: a move's box is derived from the exporter of the epoch the
     // commit is made in.
-    let move_box = if intent.move_box {
-        let b = derived_box(cx, &group)?;
+    if intent.move_box {
+        let b = mls_group::moved_box::<()>(&group, cx.crypto.as_ref())
+            .map_err(|e| EngineError::Mls(e.to_string()))?;
         tx.set_outbox_move(row.id, &BoxName::from_bytes(b))?;
-        Some(b)
-    } else {
-        None
-    };
+    }
     let out = mls_group::commit(
         &tx.mls(cx.crypto),
         &mut group,
-        Pseudonym(conv.pseudonym),
         &profile,
-        &history,
+        &state,
         Changes {
             add,
             remove,
             conversation,
-            move_box,
+            move_box: intent.move_box,
             new_leaf_key: intent.new_leaf_key,
         },
     )
@@ -443,21 +439,6 @@ pub(crate) fn build_commit(
         None,
     )?;
     Ok(Built::Made)
-}
-
-/// The exporter label of a moved mailbox's box (7.8, 15).
-pub(crate) const BOX_LABEL: &str = "risala/1 box";
-
-/// The box a group moves to from the epoch it is in (7.8):
-/// `MLS-Exporter("risala/1 box", "", 16)`.
-pub(crate) fn derived_box(cx: &Ctx<'_>, group: &MlsGroup) -> Result<[u8; 16]> {
-    let bytes = group
-        .export_secret(cx.crypto.as_ref(), BOX_LABEL, b"", 16)
-        .map_err(mls)?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| EngineError::Mls("an exporter of another length".into()))
 }
 
 /// Drops this device's pending commit, which lost or was refused, and
@@ -525,10 +506,8 @@ pub(crate) fn apply_post(
     let post_epoch = framing.epoch;
     let mut group = load(tx, cx, &conv.group_id)?;
     let epoch = group.epoch().as_u64();
-    let commit_post = CommitPost {
-        t: post.t,
-        next: post.next,
-    };
+    let mut state = tx.group_history(conv.id)?;
+    let commit_post = state.post(post.t, post.next);
 
     // This device's own post: matched by its bytes, since it cannot
     // decrypt its own PrivateMessages.
@@ -549,17 +528,12 @@ pub(crate) fn apply_post(
                         .unwrap_or_default();
                     let removed_ids = removed_identities(&group, &removed);
                     let old_token = SendToken::of_group(&group, cx.crypto.as_ref()).map_err(mls)?;
-                    let mut history = tx.group_history(conv.id)?;
-                    mls_group::merge_own_commit(
-                        &tx.mls(cx.crypto),
-                        &mut group,
-                        &mut history,
-                        &commit_post,
-                    )
-                    .map_err(mls)?;
-                    tx.set_group_history(conv.id, &history)?;
+                    let merged =
+                        mls_group::merge_own_commit(&tx.mls(cx.crypto), &mut group, &mut state)
+                            .map_err(mls)?;
+                    tx.set_group_history(conv.id, &state)?;
                     tx.set_prev_token(conv.id, old_token.as_bytes())?;
-                    note_commit(tx, cx, conv.id, &mut group, epoch, post.t, &removed)?;
+                    note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
                     tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
                     after_commit(tx, cx, conv, &group, post, true, removed_ids, &mut applied)?;
                     own_commit_won(tx, cx, conv, &row, &intent, &mut applied)?;
@@ -603,11 +577,10 @@ pub(crate) fn apply_post(
                 }
             };
             // The group checks (12.7), next included.
-            let mut history = tx.group_history(conv.id)?;
             let verdict = match mls_group::check_received_commit(
                 &group,
                 &commit,
-                &history,
+                &state,
                 &commit_post,
                 cx.crypto.as_ref(),
             ) {
@@ -626,8 +599,19 @@ pub(crate) fn apply_post(
             // are the identity area's (task C1).
             {
                 let facts = cx.hooks.key_facts(tx, cx.account);
-                let report =
-                    mls_group::check_received_keys(&group, &commit, &verdict, facts.as_ref());
+                let seen = Seen {
+                    own_uid: cx.uid,
+                    resyncs: &[],
+                    impostors: &[],
+                };
+                let report = mls_group::check_received_keys(
+                    &group,
+                    &commit,
+                    &state,
+                    &verdict,
+                    facts.as_ref(),
+                    &seen,
+                );
                 if report != risala_mls::checks::KeyReport::default() {
                     tracing::info!(?report, "a commit whose key checks need a repair");
                 }
@@ -639,16 +623,11 @@ pub(crate) fn apply_post(
             let removed = mls_message::removed_leaves(&commit.staged);
             let removed_ids = removed_identities(&group, &removed);
             let old_token = SendToken::of_group(&group, cx.crypto.as_ref()).map_err(mls)?;
-            let active = mls_group::apply_commit(
-                &tx.mls(cx.crypto),
-                &mut group,
-                *commit,
-                &verdict,
-                &mut history,
-                &commit_post,
-            )
-            .map_err(mls)?;
-            tx.set_group_history(conv.id, &history)?;
+            let merged =
+                mls_group::apply_commit(&tx.mls(cx.crypto), &mut group, *commit, &mut state)
+                    .map_err(mls)?;
+            let active = merged.active;
+            tx.set_group_history(conv.id, &state)?;
             if let Some(row) = own_pending {
                 // Another commit won the epoch: this device's lost (7.2).
                 tx.update_outbox(row.id, OutboxState::Lost, None, None, None)?;
@@ -665,7 +644,7 @@ pub(crate) fn apply_post(
                 return Ok(applied);
             }
             tx.set_prev_token(conv.id, old_token.as_bytes())?;
-            note_commit(tx, cx, conv.id, &mut group, epoch, post.t, &removed)?;
+            note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
             after_commit(tx, cx, conv, &group, post, false, removed_ids, &mut applied)?;
         }
         ContentType::Proposal => {
@@ -679,6 +658,10 @@ pub(crate) fn apply_post(
                     reference,
                     ..
                 }) => {
+                    // 12.3: the times of the epoch's proposals, for the
+                    // commit that applies them.
+                    state.note_proposal(&reference, post.t);
+                    tx.set_group_history(conv.id, &state)?;
                     match kind {
                         ProposalKind::SelfRemove => {
                             if let Some(sender) = sender {
@@ -688,12 +671,7 @@ pub(crate) fn apply_post(
                             mls_message::note_self_removes(&group, &mut log);
                             log.finish()?;
                         }
-                        ProposalKind::Update => {
-                            let mut history = tx.group_history(conv.id)?;
-                            history.note_update(&reference, post.t);
-                            tx.set_group_history(conv.id, &history)?;
-                        }
-                        ProposalKind::Join => {}
+                        ProposalKind::Update | ProposalKind::Join => {}
                     }
                     applied.notes.push(Note::Proposals { conv: conv.id });
                 }
@@ -743,19 +721,18 @@ pub(crate) fn apply_post(
 }
 
 /// Notes a commit in the message history (12.9): the end of the epoch it
-/// ended, and its removed leaves; then deletes past epochs' secrets that
-/// are past the limits.
+/// ended, its removed leaves and that epoch's pseudonyms; then deletes past
+/// epochs' secrets that are past the limits.
 fn note_commit(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: ConversationId,
     group: &mut MlsGroup,
-    ended_epoch: u64,
+    merged: &mls_group::Applied,
     t: u64,
-    removed: &[LeafNodeIndex],
 ) -> Result<()> {
     let mut log = MessageLog::new(tx.conn(), conv);
-    log.note_commit(ended_epoch, ts(t), removed);
+    log.note_commit(merged, ts(t), ts(cx.now));
     mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(t)).map_err(mls)?;
     log.finish()?;
     Ok(())
@@ -763,7 +740,7 @@ fn note_commit(
 
 /// The identities of leaves, for the move of 7.8.
 fn removed_identities(group: &MlsGroup, removed: &[LeafNodeIndex]) -> Vec<RisalaIdentity> {
-    let view = GroupView::of(group.public_group());
+    let view = GroupView::of(group.public_group(), &EpochState::default());
     removed
         .iter()
         .filter_map(|i| view.leaf(*i).and_then(|l| l.identity.clone()))
@@ -957,8 +934,7 @@ pub(crate) fn make_self_remove(
     conv: &ConvRow,
 ) -> Result<(Vec<u8>, u64)> {
     let mut group = load(tx, cx, &conv.group_id)?;
-    let message = mls_group::self_remove(&tx.mls(cx.crypto), &mut group, Pseudonym(conv.pseudonym))
-        .map_err(mls)?;
+    let message = mls_group::self_remove(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
     Ok((message, group.epoch().as_u64()))
 }
 
@@ -973,13 +949,11 @@ pub(crate) fn encrypt(
     let message = mls_message::RisalaMessage::decode(body)
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
     let mut group = load(tx, cx, &conv.group_id)?;
-    let post = mls_message::encrypt(
-        &tx.mls(cx.crypto),
-        &mut group,
-        Pseudonym(conv.pseudonym),
-        &message,
-    )
-    .map_err(mls)?;
+    // Outside public rooms the pseudonym is derived from the epoch (7.3); a
+    // public room's is the period's, which leaf confirmation (C3) keeps.
+    let period = (conv.kind == ConvKind::Public).then_some(Pseudonym(conv.pseudonym));
+    let post =
+        mls_message::encrypt(&tx.mls(cx.crypto), &mut group, period, &message).map_err(mls)?;
     Ok((post, group.epoch().as_u64()))
 }
 
@@ -1025,14 +999,13 @@ pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Resu
         own_uid: cx.uid.clone(),
         public_room: None,
     };
-    let joined =
-        match mls_group::join_by_welcome(&tx.mls(cx.crypto), &welcome, None, &expect, cx.now) {
-            Ok(joined) => joined,
-            Err(risala_mls::group::GroupError::Storage(e)) => {
-                return Err(EngineError::Mls(format!("{e:?}")));
-            }
-            Err(e) => return Ok(Joined::Refused(e.to_string())),
-        };
+    let joined = match mls_group::join_by_welcome(&tx.mls(cx.crypto), &welcome, None, &expect) {
+        Ok(joined) => joined,
+        Err(risala_mls::group::GroupError::Storage(e)) => {
+            return Err(EngineError::Mls(format!("{e:?}")));
+        }
+        Err(e) => return Ok(Joined::Refused(e.to_string())),
+    };
     let mut group = joined.group;
     let ext = mls_group::conversation(&group)
         .ok_or(EngineError::Mls("no conversation extension".into()))?;
@@ -1072,7 +1045,7 @@ pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Resu
         last_resort: joined.last_resort,
         now: cx.now,
     })?;
-    tx.set_group_history(conv, &joined.history)?;
+    tx.set_group_history(conv, &joined.state)?;
     // 7.4: follow after a random wait, so that the FOLLOW does not match
     // the WELCOME line.
     let wait = super::random_below(cx.config.max_follow_wait_ms)?;

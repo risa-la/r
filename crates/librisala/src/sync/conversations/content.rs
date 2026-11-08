@@ -176,9 +176,6 @@ pub(crate) fn receive(
             ContentLine::Resync { mailbox: None, seq } => {
                 // 12.7: replace the leaf, after a random wait.
                 tx.mark_resync(conv.id, leaf_index, seq.get())?;
-                let mut history = tx.group_history(conv.id)?;
-                history.note_resync(d.sender, d.epoch);
-                tx.set_group_history(conv.id, &history)?;
                 applied.notes.push(Note::Resync {
                     conv: conv.id,
                     leaf: leaf_index,
