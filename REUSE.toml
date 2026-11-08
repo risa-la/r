@@ -31,6 +31,13 @@ precedence = "override"
 SPDX-FileCopyrightText = ["Copyright (c) OpenMLS Authors", "Copyright (c) 2026 Risala developers"]
 SPDX-License-Identifier = "MIT"
 
+# openmls, patched for how it frames SelfRemove, keeps its MIT license.
+[[annotations]]
+path = "crates/openmls/**"
+precedence = "override"
+SPDX-FileCopyrightText = ["Copyright (c) OpenMLS Authors", "Copyright (c) 2026 Risala developers"]
+SPDX-License-Identifier = "MIT"
+
 # Our port of openmls_sqlite_storage, which keeps its MIT license.
 [[annotations]]
 path = "crates/openmls-sqlite-storage/**"
