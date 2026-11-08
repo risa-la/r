@@ -525,10 +525,90 @@ fn replays_and_resends() {
     let _lost = alice.encrypt(&mut a, &stale);
     let commit = bob.commit(&mut b, Changes::default());
     alice.apply(&mut a, &commit, t0());
-    let resent = alice.encrypt(&mut a, &stale);
+    let (kept, resent) = encrypt_again(&alice.provider, &mut a, None, &stale).unwrap();
+    // Without an ATTEST line, the message goes again unchanged.
+    assert!(kept == stale);
     let got = bob.receive(&mut b, &resent).unwrap();
     assert_eq!(got.order, Order::Next);
     assert_eq!(got.message.counter, 2);
+}
+
+/// A message with an ATTEST line, sent again after `ERR stale`: the line's
+/// pseudonym is made again for the new epoch, so that it is still the
+/// one in the message's RisalaAAD (12.9, 12.10), and nothing else changes.
+#[test]
+fn resent_attest() {
+    use risala_proto::auth::{PublicKey, Signature};
+
+    let Direct {
+        mut alice,
+        mut bob,
+        mut a,
+        mut b,
+        ..
+    } = direct();
+    let attest = |pseudonym: Pseudonym| ContentLine::Attest {
+        period: 20_400,
+        period_key: PublicKey::from_bytes(&[1; 1312]),
+        certificate: Signature::from_bytes(&[2; 2420]),
+        attestation: Signature::from_bytes(&[3; 2420]),
+        pseudonym: risala_proto::mls::Pseudonym::from_bytes(pseudonym.0),
+    };
+    let attest_pseudonym = |message: &RisalaMessage| {
+        message
+            .content
+            .lines()
+            .iter()
+            .find_map(|line| match line {
+                ContentLine::Attest { pseudonym, .. } => Some(*pseudonym.as_bytes()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let old = alice.pseudonym(&a);
+    let content = Content::new(vec![
+        attest(old),
+        ContentLine::Text(risala_proto::content::Text::new("hello")),
+    ])
+    .unwrap();
+    let message = alice.counter.write(content, t0()).unwrap();
+    // In the same epoch, it goes unchanged.
+    let (same, _lost) = encrypt_again(&alice.provider, &mut a, None, &message).unwrap();
+    assert!(same == message);
+
+    // A commit moves the group on; the post got ERR stale.
+    let commit = bob.commit(&mut b, Changes::default());
+    alice.apply(&mut a, &commit, t0());
+    let new = alice.pseudonym(&a);
+    assert_ne!(new, old);
+    let (kept, resent) = encrypt_again(&alice.provider, &mut a, None, &message).unwrap();
+    assert_eq!(attest_pseudonym(&kept), new.0);
+    assert_eq!(kept.content.lines()[1], message.content.lines()[1]);
+    assert_eq!(
+        (kept.message_id, kept.counter, kept.previous, kept.time),
+        (
+            message.message_id,
+            message.counter,
+            message.previous,
+            message.time
+        )
+    );
+    assert!(kept.frank_key == message.frank_key);
+    assert_ne!(kept.frank(), message.frank());
+    // Bob reads it, with the ATTEST's pseudonym the message's.
+    let got = bob.receive(&mut b, &resent).unwrap();
+    assert!(got.message == kept);
+    assert_eq!(attest_pseudonym(&got.message), new.0);
+    assert_eq!(derived_pseudonym(&b, &bob, got.sender), new);
+    // Sent again in the same epoch, the kept message is unchanged.
+    let (again, _) = encrypt_again(&alice.provider, &mut a, None, &kept).unwrap();
+    assert!(again == kept);
+}
+
+/// The pseudonym the leaf at `leaf` has in `group`'s current epoch, as
+/// `device` derives it (7.3).
+fn derived_pseudonym(group: &MlsGroup, device: &Device, leaf: LeafNodeIndex) -> Pseudonym {
+    group::leaf_pseudonym::<()>(group, device.provider.crypto(), leaf).unwrap()
 }
 
 #[test]

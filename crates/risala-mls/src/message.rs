@@ -19,8 +19,8 @@
 //! TYPING), then encrypts it with [`encrypt`], which puts its frank in the
 //! RisalaAAD. A message is fixed once written: if its post gets
 //! `ERR stale`, or must go again for another reason (7.6), the device
-//! encrypts the same RisalaMessage again with [`encrypt`] in the current
-//! epoch.
+//! encrypts the same RisalaMessage again with [`encrypt_again`] in the
+//! current epoch, which re-makes only an ATTEST line's pseudonym (12.10).
 //!
 //! **Receiving.** [`receive`] takes an application message's post, checks
 //! the past-epoch limits, decrypts it with MLS (which checks its signature
@@ -62,7 +62,8 @@ use openmls::group::{MlsGroup, MlsGroupJoinConfig, PastEpochDeletion};
 use openmls::prelude::{LeafNodeIndex, Proposal, Sender, SenderRatchetConfiguration, StagedCommit};
 use openmls::storage::OpenMlsProvider;
 use risala_proto::content::{
-    Content, Conversation, MAX_CONTENT_LEN, MAX_REASON_LEN, MESSAGE_ID_LEN, MessageId, Place,
+    Content, ContentLine, Conversation, MAX_CONTENT_LEN, MAX_REASON_LEN, MESSAGE_ID_LEN, MessageId,
+    Place,
 };
 use risala_proto::error::ParseError;
 use risala_proto::names::Uid;
@@ -347,9 +348,8 @@ impl SendCounter {
 /// key, and pads it with zero bytes to a multiple of 256 bytes (the
 /// group's padding, [`group::PADDING_SIZE`]).
 ///
-/// The same message may be encrypted again, in a later epoch, when it
-/// must be posted again (7.6): its fields, and so its frank, stay the
-/// same.
+/// To post the same message again, in a later epoch (7.6), use
+/// [`encrypt_again`].
 pub fn encrypt<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
@@ -359,6 +359,73 @@ pub fn encrypt<P: OpenMlsProvider>(
     let pseudonym = group::sending_pseudonym(group, provider.crypto(), period)?;
     let aad = RisalaAad::application(pseudonym, message.frank());
     group::encrypt_application(provider, group, &aad, &message.encode())
+}
+
+/// Encrypts `message` again for a post that must go again, after
+/// `ERR stale` or for another reason (7.6, 12.9), in `group`'s current
+/// epoch, as [`encrypt`] does. Returns the message as sent, which the
+/// device keeps in place of `message`, and the post.
+///
+/// 12.9 keeps a RisalaMessage's fields fixed once written, but an ATTEST
+/// line carries the pseudonym of its message's RisalaAAD (12.10), which
+/// outside public rooms is derived from the epoch (7.3): sent unchanged in
+/// a later epoch, it would carry the old epoch's pseudonym, and receivers
+/// would refuse it. 12.9 and 12.10 do not say which wins. So this re-makes
+/// each ATTEST line whose pseudonym is not the one this post carries, and
+/// keeps every other field and line: the `message_id`, `counter`,
+/// `previous`, `time` and `frank_key` stay, so receivers that get both
+/// copies still show the message once (12.9, step 3), but the content and
+/// so the frank change. A message without such a line goes again
+/// unchanged, frank and all.
+pub fn encrypt_again<P: OpenMlsProvider>(
+    provider: &P,
+    group: &mut MlsGroup,
+    period: Option<Pseudonym>,
+    message: &RisalaMessage,
+) -> Result<(RisalaMessage, Vec<u8>), GroupError<P::StorageError>> {
+    let pseudonym = group::sending_pseudonym(group, provider.crypto(), period)?;
+    let message = with_attest_pseudonym(message, pseudonym);
+    let post = encrypt(provider, group, period, &message)?;
+    Ok((message, post))
+}
+
+/// `message` with the pseudonym of each of its ATTEST lines set to
+/// `pseudonym` (12.10), or `message` itself if they all have it already.
+fn with_attest_pseudonym(message: &RisalaMessage, pseudonym: Pseudonym) -> RisalaMessage {
+    let wanted = risala_proto::mls::Pseudonym::from_bytes(pseudonym.0);
+    let stale = |line: &ContentLine| matches!(line, ContentLine::Attest { pseudonym, .. } if *pseudonym != wanted);
+    if !message.content.lines().iter().any(stale) {
+        return message.clone();
+    }
+    let lines = message
+        .content
+        .lines()
+        .iter()
+        .map(|line| match line {
+            ContentLine::Attest {
+                period,
+                period_key,
+                certificate,
+                attestation,
+                ..
+            } => ContentLine::Attest {
+                period: *period,
+                period_key: period_key.clone(),
+                certificate: certificate.clone(),
+                attestation: attestation.clone(),
+                pseudonym: wanted,
+            },
+            other => other.clone(),
+        })
+        .collect();
+    // The device wrote the content with Content::new, and an ATTEST line
+    // with another pseudonym has the same length, so writing it again
+    // cannot fail.
+    let content = Content::new(lines).expect("content the device wrote, written again");
+    RisalaMessage {
+        content,
+        ..message.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------
