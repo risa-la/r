@@ -965,3 +965,6 @@ mod identity_tests;
 
 #[cfg(test)]
 mod social_tests;
+
+#[cfg(test)]
+mod admin_tests;
