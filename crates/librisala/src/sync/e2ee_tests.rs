@@ -43,6 +43,8 @@ struct Dev {
     engine: SyncEngine,
     queue: VecDeque<Outgoing>,
     key_files: VecDeque<Uid>,
+    /// Every key file the engine asked for.
+    key_files_asked: Vec<Uid>,
     notes: Vec<Notification>,
     recovery: Option<risala_mls::RecoveryKey>,
     /// The shortest [`Output::retry_after`] asked for.
@@ -68,6 +70,7 @@ impl Dev {
             engine,
             queue: VecDeque::new(),
             key_files: VecDeque::new(),
+            key_files_asked: Vec::new(),
             notes: Vec::new(),
             recovery: None,
             retry: None,
@@ -99,6 +102,7 @@ impl Dev {
 
     fn absorb(&mut self, out: Output) {
         self.queue.extend(out.send);
+        self.key_files_asked.extend(out.key_files.iter().cloned());
         self.key_files.extend(out.key_files);
         self.notes.extend(out.notifications);
         if out.recovery.is_some() {
@@ -2247,4 +2251,53 @@ fn the_recovery_keys_connection_never_joins_a_group() {
         let out = net.devs[a].engine.request(command);
         assert!(out.send.is_empty());
     }
+}
+
+#[test]
+fn a_removal_waits_at_most_a_day_for_its_key_file() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a, "bob@example.net", "one");
+    let b2 = net.device("bob@example.net", 3);
+    net.run();
+
+    // As above: Bob's first device cannot fetch his key file to check
+    // Alice's removal of his second device's leaf.
+    let bob = uid("bob@example.net");
+    let gone = net.devs[b2].public();
+    net.key_files.get_mut(&bob).unwrap().retain(|k| *k != gone);
+    net.unreachable.push((b, bob.clone()));
+    let listed: Vec<_> = net.key_files[&bob]
+        .iter()
+        .map(|k| (k.clone(), None))
+        .collect();
+    let out = net.devs[a].engine.key_file(&bob, Some(listed)).unwrap();
+    net.devs[a].absorb(out);
+    net.run();
+    let epoch = net.devs[a].group("bob@example.net").unwrap().epoch;
+    assert!(net.devs[b].group("alice@example.org").unwrap().epoch < epoch);
+
+    // It tries again from time to time on the same connection.
+    assert!(net.devs[b].retry.is_some());
+    let fetches = |net: &Net| net.devs[b].key_files_asked.iter().filter(|u| **u == bob).count();
+    let before = fetches(&net);
+    net.devs[b].later(super::e2ee::KEY_FILE_RETRY);
+    net.resume(b);
+    assert!(fetches(&net) > before);
+    assert!(net.devs[b].group("alice@example.org").unwrap().epoch < epoch);
+
+    // After a day it applies the commit, and warns (12.6).
+    net.devs[b].later(Duration::from_secs(24 * 3600));
+    net.resume(b);
+    assert_eq!(net.devs[b].group("alice@example.org").unwrap().epoch, epoch);
+    assert!(net.devs[b].notes.contains(&Notification::RemovalUnchecked {
+        conv: "alice@example.org".parse().unwrap()
+    }));
+    net.send(a, "bob@example.net", "two");
+    assert_eq!(
+        net.devs[b].texts("alice@example.org").last().unwrap().0,
+        "two"
+    );
 }

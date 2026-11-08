@@ -309,6 +309,9 @@ pub(crate) enum Applied {
         /// Leaves it added, for the key check (12.6): every leaf, for the
         /// device's own external commit.
         added: Vec<(Uid, PublicKey)>,
+        /// It removed a leaf for a reason only a key file that could not be
+        /// fetched for 24 hours would show (12.6). Warn the user.
+        unchecked: bool,
     },
     /// The device is not in the group any more.
     Removed,
@@ -325,6 +328,9 @@ struct Checks<'a> {
     row: &'a ConvRow,
     /// Identities whose key files were fetched for this commit.
     fresh: &'a HashSet<Uid>,
+    /// The commit waited 24 hours for key files that could not be fetched:
+    /// a removal only they could explain is applied (12.6).
+    unchecked: bool,
 }
 
 impl Checks<'_> {
@@ -383,7 +389,7 @@ fn check_commit(
     sender: &Sender,
     committer_credential: &Credential,
     staged: &StagedCommit,
-) -> Result<Vec<(Uid, PublicKey)>, E2eeError> {
+) -> Result<(Vec<(Uid, PublicKey)>, bool), E2eeError> {
     let before = leaves(group)?;
     let committer: Uid = credential_uid(committer_credential)
         .and_then(|u| u.parse().ok())
@@ -480,6 +486,7 @@ fn check_commit(
     }
 
     let mut need = Vec::new();
+    let mut unchecked = false;
     for remove in staged.remove_proposals() {
         let index = remove.remove_proposal().removed();
         let Some(leaf) = before.iter().find(|l| l.index == index) else {
@@ -496,6 +503,7 @@ fn check_commit(
         match checks.removal(tx, &committer, &leaf.uid, &leaf.key, &re_added) {
             Ok(true) => {}
             Ok(false) => return Err(E2eeError::Rejected("a removal for no reason")),
+            Err(E2eeError::KeyFiles(_)) if checks.unchecked => unchecked = true,
             Err(E2eeError::KeyFiles(uids)) => need.extend(uids),
             Err(e) => return Err(e),
         }
@@ -516,7 +524,7 @@ fn check_commit(
             }
         }
     }
-    Ok(added)
+    Ok((added, unchecked))
 }
 
 /// Applies the COMMIT event at `seq`, which starts `epoch` (12.5, 12.6),
@@ -531,14 +539,15 @@ fn check_commit(
 ///   broken, and may join again by external commit.
 /// - [`E2eeError::KeyFiles`]: a removal can be checked only against key
 ///   files fetched for it. `fresh` are the identities whose key files
-///   were.
+///   were. With `unchecked`, the commit waited 24 hours for them, and such
+///   a removal is applied.
 pub(crate) fn apply_commit(
     tx: &mut Tx<'_>,
     dev: &Device,
     row: &ConvRow,
     (seq, epoch): (u64, u64),
     commit: &mls::CommitMessage,
-    fresh: &HashSet<Uid>,
+    (fresh, unchecked): (&HashSet<Uid>, bool),
 ) -> Result<Applied, E2eeError> {
     let Some(g) = tx.group(row.id)? else {
         return Ok(Applied::Old);
@@ -562,6 +571,7 @@ pub(crate) fn apply_commit(
                 epoch,
                 own: true,
                 added: all,
+                unchecked: false,
             });
         }
         _ => return Ok(Applied::Old),
@@ -585,13 +595,14 @@ pub(crate) fn apply_commit(
             epoch,
             own: true,
             added: Vec::new(),
+            unchecked: false,
         });
     }
     let message = || wire::commit_from_wire(commit).map_err(|e| E2eeError::Mls(e.to_string()));
     // 12.6 first, on what the commit shows without the group's secrets,
     // so that one that fails the checks is rejected, never merely refused
     // by MLS (which would let the device join again).
-    let added = {
+    let (added, unchecked) = {
         let processed = group
             .public_group()
             .process_message(&*dev.crypto, message()?)
@@ -605,6 +616,7 @@ pub(crate) fn apply_commit(
             me: &dev.uid,
             row,
             fresh,
+            unchecked,
         };
         check_commit(tx, &checks, &group, &sender, &credential, &staged)?
     };
@@ -643,6 +655,7 @@ pub(crate) fn apply_commit(
         epoch,
         own: false,
         added,
+        unchecked,
     })
 }
 

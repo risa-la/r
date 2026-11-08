@@ -337,6 +337,43 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// The commit of `conv` that waits for a key file (12.6): its seq, and
+    /// since when, in Unix milliseconds.
+    pub(crate) fn commit_wait(&self, conv: ConvId) -> Result<Option<(u64, i64)>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT seq, since FROM commit_waits WHERE conv = ?1",
+                [conv.0],
+                |r| Ok((r.get::<_, i64>(0)?.max(0) as u64, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Notes that the commit at `seq` of `conv` waits for a key file, since
+    /// `now` unless it waited already.
+    pub(crate) fn set_commit_wait(
+        &mut self,
+        conv: ConvId,
+        seq: u64,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO commit_waits (conv, seq, since) VALUES (?1, ?2, ?3)
+             ON CONFLICT (conv) DO UPDATE SET seq = excluded.seq, since = excluded.since
+                 WHERE commit_waits.seq != excluded.seq",
+            params![conv.0, sql(seq), now],
+        )?;
+        Ok(())
+    }
+
+    /// No commit of `conv` waits any more.
+    pub(crate) fn clear_commit_wait(&mut self, conv: ConvId) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM commit_waits WHERE conv = ?1", [conv.0])?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // History keys
 

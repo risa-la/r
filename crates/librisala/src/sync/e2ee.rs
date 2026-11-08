@@ -72,6 +72,10 @@ pub(super) const KEY_FILE_AGE: Duration = Duration::from_secs(24 * 3600);
 /// or for a leaf that is not confirmed (12.6).
 pub(super) const KEY_FILE_RETRY: Duration = Duration::from_secs(5 * 60);
 
+/// How long a commit waits for a key file that cannot be fetched before
+/// the device applies it anyway, with a warning (12.6).
+pub(super) const KEY_FILE_WAIT: Duration = Duration::from_secs(24 * 3600);
+
 /// Clients should add at most this many devices in one commit (12.5).
 const MAX_ADDS: usize = 256;
 
@@ -108,6 +112,9 @@ pub(super) struct E2ee {
     /// Identities whose key files were fetched for a commit that waited
     /// for them, until a commit is applied (12.6).
     fresh: HashSet<Uid>,
+    /// When key files that commits wait for were last asked for again
+    /// after a failed fetch, by the engine's clock.
+    waits_retried: Option<Timestamp>,
     /// Conversations where ENC got `stale`: nothing is sent there until a
     /// commit is applied or made (12.6).
     held: HashSet<Conv>,
@@ -225,6 +232,7 @@ impl E2ee {
             fetching: HashSet::new(),
             waiting: HashMap::new(),
             fresh: HashSet::new(),
+            waits_retried: None,
             held: HashSet::new(),
             asked: HashSet::new(),
             deferred: Vec::new(),
@@ -725,15 +733,36 @@ impl SyncEngine {
                 .as_ref()
                 .map(|e| e.fresh.clone())
                 .unwrap_or_default();
-            let result = self.e2ee_write(|tx| {
-                group::apply_commit(tx, &dev, &row, (seq, epoch), &commit, &fresh)
+            // 12.6: a commit that waited a day for key files is applied.
+            let now = self.now_ms();
+            let unchecked = self.write(|tx| {
+                Ok(tx.commit_wait(row.id)?.is_some_and(|(s, since)| {
+                    s == seq && now.saturating_sub(since) >= KEY_FILE_WAIT.as_millis() as i64
+                }))
             })?;
+            let result = self.e2ee_write(|tx| {
+                group::apply_commit(tx, &dev, &row, (seq, epoch), &commit, (&fresh, unchecked))
+            })?;
+            if !matches!(result, Err(E2eeError::KeyFiles(_))) {
+                self.write(|tx| tx.clear_commit_wait(row.id))?;
+            }
             match result {
-                Ok(Applied::Merged { added, own, .. }) => {
+                Ok(Applied::Merged {
+                    added,
+                    own,
+                    unchecked,
+                    ..
+                }) => {
                     debug!(%conv, seq, epoch, own, "applied a commit");
                     if let Some(e) = self.e2ee.as_mut() {
                         e.held.remove(conv);
                         e.fresh.clear();
+                    }
+                    if unchecked {
+                        warn!(%conv, seq, "a removal applied without its key file");
+                        self.out
+                            .notifications
+                            .push(Notification::RemovalUnchecked { conv: conv.clone() });
                     }
                     self.check_keys(added.into_iter().map(|(u, _)| u))?;
                 }
@@ -767,6 +796,7 @@ impl SyncEngine {
                     return Ok(());
                 }
                 Err(E2eeError::KeyFiles(uids)) => {
+                    self.write(|tx| tx.set_commit_wait(row.id, seq, now))?;
                     let set: HashSet<Uid> = uids.iter().cloned().collect();
                     self.e2().waiting.insert(conv.clone(), set);
                     for uid in uids {
@@ -1586,19 +1616,30 @@ impl SyncEngine {
         let now = group::now_ms();
         let failed = keys.is_none();
         self.write(|tx| tx.key_file_fetched(account, uid, keys.as_deref(), now))?;
-        // Commits that waited for it, once it says something.
+        // Commits that waited for it, once it says something, or once they
+        // have waited a day (12.6).
+        let expired = self.expired_waits()?;
         let mut ready = Vec::new();
         if let Some(e) = self.e2ee.as_mut() {
             for (conv, uids) in &mut e.waiting {
                 if !failed && uids.remove(uid) {
                     e.fresh.insert(uid.clone());
                 }
-                if uids.is_empty() {
+                if uids.is_empty() || expired.contains(conv) {
                     ready.push(conv.clone());
                 }
             }
             for conv in &ready {
                 e.waiting.remove(conv);
+            }
+        }
+        if failed {
+            // Tried again from time to time on this connection, so that a
+            // conversation that only receives does not stall (12.6).
+            let at = self.now().checked_add(KEY_FILE_RETRY);
+            if let Some(at) = at {
+                let now = self.now();
+                self.resume_by(now, at);
             }
         }
         for conv in ready {
@@ -1616,6 +1657,72 @@ impl SyncEngine {
             self.try_share_recovery()?;
         }
         Ok(self.finish())
+    }
+
+    /// The engine's clock, in Unix milliseconds.
+    fn now_ms(&self) -> i64 {
+        self.now()
+            .to_system_time()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    }
+
+    /// The conversations whose commit has waited a day for key files
+    /// (12.6).
+    fn expired_waits(&mut self) -> Result<HashSet<Conv>, SyncError> {
+        let Some(e) = self.e2ee.as_ref() else {
+            return Ok(HashSet::new());
+        };
+        let convs: Vec<Conv> = e.waiting.keys().cloned().collect();
+        let (account, now) = (self.account, self.now_ms());
+        self.write(|tx| {
+            let mut out = HashSet::new();
+            for conv in convs {
+                if let Some(row) = tx.conv_by_name(account, &conv)?
+                    && let Some((_, since)) = tx.commit_wait(row.id)?
+                    && now.saturating_sub(since) >= KEY_FILE_WAIT.as_millis() as i64
+                {
+                    out.insert(conv);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Asks again for the key files that commits wait for, after a failed
+    /// fetch, at most every [`KEY_FILE_RETRY`]; a commit that has waited a
+    /// day is applied (12.6). Run when the engine is resumed.
+    pub(super) fn retry_waits(&mut self) -> Result<(), SyncError> {
+        let Some(e) = self.e2ee.as_ref() else {
+            return Ok(());
+        };
+        if e.waiting.is_empty() {
+            return Ok(());
+        }
+        let now = self.now();
+        if let Some(next) = e.waits_retried.and_then(|t| t.checked_add(KEY_FILE_RETRY))
+            && next > now
+        {
+            self.resume_by(now, next);
+            return Ok(());
+        }
+        self.e2().waits_retried = Some(now);
+        let expired = self.expired_waits()?;
+        for conv in &expired {
+            self.e2().waiting.remove(conv);
+        }
+        for conv in expired {
+            self.e2ee_advance(&conv)?;
+        }
+        let uids: HashSet<Uid> = self
+            .e2ee
+            .as_ref()
+            .map(|e| e.waiting.values().flatten().cloned().collect())
+            .unwrap_or_default();
+        for uid in uids {
+            self.fetch_key_file(&uid);
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

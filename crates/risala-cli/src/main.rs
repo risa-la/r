@@ -1648,6 +1648,10 @@ fn show_notice(notice: &Notice) -> String {
             "{conversation}: a change to its encryption failed this device's checks; nothing more \
              is sent there"
         ),
+        Notice::RemovalUnchecked { conversation } => format!(
+            "{conversation}: a device was removed for a reason this device could not check, as \
+             a key file could not be fetched for a day"
+        ),
         Notice::RecoveryKeyOffered => "another device of yours sent a new recovery key; to use \
              it in place of this device's, risala recovery accept SERVER"
             .to_owned(),

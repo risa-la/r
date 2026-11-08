@@ -11,7 +11,7 @@ use super::StoreError;
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
 pub(super) const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19,
 ];
 
 /// The schema version this build writes.
@@ -528,6 +528,18 @@ CREATE TABLE recovery_state (
     offered    BLOB,
     offered_at INTEGER,
     asked      INTEGER NOT NULL DEFAULT 0
+);
+";
+
+/// Version 19: `commit_waits` holds, for a conversation whose next commit
+/// waits for a key file that cannot be fetched (12.6), that commit's seq
+/// and since when it waits, in Unix milliseconds: after 24 hours it is
+/// applied.
+const V19: &str = "
+CREATE TABLE commit_waits (
+    conv  INTEGER PRIMARY KEY REFERENCES convs(id) ON DELETE CASCADE,
+    seq   INTEGER NOT NULL,
+    since INTEGER NOT NULL
 );
 ";
 

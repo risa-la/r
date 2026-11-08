@@ -547,6 +547,7 @@ impl SyncEngine {
     /// Sends queued messages that were waiting, for example after
     /// [`Output::retry_after`].
     pub fn resume_outbox(&mut self) -> Result<Output, SyncError> {
+        self.retry_waits()?;
         self.flush_outbox()?;
         Ok(self.finish())
     }

@@ -296,6 +296,14 @@ pub enum Notification {
         /// The device key's fingerprint (12.12).
         fingerprint: String,
     },
+    /// A commit removed a leaf of a conversation's group for a reason the
+    /// device could not check, since the key file that would show it could
+    /// not be fetched for 24 hours (12.6). The device applied it, as a
+    /// removal lets nobody new read. Warn the user.
+    RemovalUnchecked {
+        /// The conversation.
+        conv: Conv,
+    },
     /// Another device of the identity sent a recovery key that the key
     /// file lists, and this device holds a different one (12.10). Ask the
     /// user whether to replace it, and answer with

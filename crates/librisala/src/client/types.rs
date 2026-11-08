@@ -1248,6 +1248,14 @@ pub enum Notice {
         /// The device key's fingerprint, to compare on the other device.
         fingerprint: String,
     },
+    /// A leaf was removed from an encrypted conversation's group for a
+    /// reason this device could not check: the key file that would show it
+    /// could not be fetched for 24 hours (12.6). Removing a leaf lets
+    /// nobody new read. Warn the user.
+    RemovalUnchecked {
+        /// The conversation.
+        conversation: String,
+    },
     /// Another device of the identity sent a recovery key, and this device
     /// holds a different one (12.10). Ask the user whether to replace it,
     /// then answer with `Account::accept_recovery_key`.
@@ -1296,6 +1304,9 @@ impl Notice {
                 fingerprint: fingerprint.clone(),
             },
             N::RecoveryKeyOffered => Notice::RecoveryKeyOffered,
+            N::RemovalUnchecked { conv } => Notice::RemovalUnchecked {
+                conversation: conv.to_string(),
+            },
             N::KeyConflict { id, epoch } => Notice::KeyConflict {
                 id: id.to_string(),
                 epoch: *epoch,
