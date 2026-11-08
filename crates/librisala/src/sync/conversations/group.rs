@@ -370,6 +370,20 @@ pub(crate) fn build_commit(
         ),
         None => None,
     };
+    // An intent that only commits the pending proposals (6.1), made again
+    // after another commit won, needs no commit once none are left: the
+    // winner committed them.
+    if intent
+        == (Intent {
+            proposals: true,
+            ..Intent::default()
+        })
+        && remove.is_empty()
+        && group.pending_proposals().next().is_none()
+    {
+        tx.update_outbox(row.id, OutboxState::Done, None, None, None)?;
+        return Ok(Built::Nothing);
+    }
     // An intent to add or remove leaves that are all added or removed
     // already, and that does nothing else, needs no commit.
     let membership = !intent.add.is_empty() || !intent.remove.is_empty();
@@ -1174,11 +1188,56 @@ pub(crate) fn join_welcome(
         tx.used_key_package(cx.account, &reference)?;
         return Ok(Joined::Refused("someone the user blocked is in it".into()));
     }
-    if tx
-        .conversation_by_group(cx.account, group.group_id().as_slice())?
-        .is_some()
-    {
-        return Ok(Joined::Refused("a group this device is in already".into()));
+    if let Some(existing) = tx.conversation_by_group(cx.account, group.group_id().as_slice())? {
+        // 12.7: a device whose leaf was replaced from a new KeyPackage
+        // (RESYNC, a stale leaf, a refused Welcome) is welcomed into a group
+        // it has: the conversation goes on from the Welcome's epoch. The
+        // Welcome wrote the group over the old one; the old leaf's key goes.
+        let new_key = group
+            .own_leaf_node()
+            .map(|l| l.signature_key().as_slice().to_vec());
+        let own_device = cx
+            .device_key
+            .map(|k| *k.device_id().as_bytes());
+        for leaf in crate::store::conversations::read::leaves(tx.conn(), existing.id)? {
+            if leaf.uid == *cx.uid
+                && leaf.device_id == own_device
+                && Some(&leaf.signature_key) != new_key.as_ref()
+            {
+                risala_mls::mldsa::LeafKey::delete(
+                    &tx.mls_storage(),
+                    group.group_id().as_slice(),
+                    &leaf.signature_key,
+                )
+                .map_err(|e| EngineError::Mls(format!("{e:?}")))?;
+            }
+        }
+        let epoch = group.epoch().as_u64();
+        tx.set_group_history(existing.id, &joined.state)?;
+        tx.set_epoch(existing.id, epoch, None)?;
+        let room = (ext.kind == ConversationKind::PublicRoom).then(|| ext.name.clone());
+        tx.set_conversation_info(existing.id, &ext.name, &ext.topic, room.as_deref())?;
+        tx.set_state(existing.id, ConvState::Active)?;
+        tx.sync_leaves(existing.id, &tree_leaves(&group))?;
+        tx.used_key_package(cx.account, &reference)?;
+        tx.set_joined(existing.id, cx.now)?;
+        let mailbox = box_of(&ext);
+        if tx.current_mailbox(existing.id).map(|m| m.mailbox).ok() != Some(mailbox) {
+            tx.add_mailbox(existing.id, &mailbox, true, epoch, None)?;
+        }
+        if joined.last_resort {
+            tx.set_last_resort(existing.id)?;
+            queue_intent(
+                tx,
+                existing.id,
+                &Intent {
+                    new_leaf_key: true,
+                    ..Intent::default()
+                },
+                cx.now,
+            )?;
+        }
+        return Ok(Joined::Joined { conv: existing.id });
     }
     let kind = conv_kind(&ext, cx.uid);
     let peer = peer_of(&ext, cx.uid);
@@ -1206,6 +1265,7 @@ pub(crate) fn join_welcome(
     tx.add_mailbox(conv, &mailbox, true, 0, Some(cx.now + wait))?;
     tx.sync_leaves(conv, &tree_leaves(&group))?;
     tx.used_key_package(cx.account, &reference)?;
+    tx.set_joined(conv, cx.now)?;
     if joined.last_resort {
         // 12.5: a new leaf key before it sends anything.
         queue_intent(

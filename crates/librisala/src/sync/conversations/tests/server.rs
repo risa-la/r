@@ -114,8 +114,12 @@ pub struct FakeServer {
     pub stale_next: HashSet<String>,
     /// Welcomes of join proposals, by KeyPackageRef: id, Welcome, epoch.
     public_welcomes: HashMap<Vec<u8>, (String, Vec<u8>, u64)>,
-    /// Refuse WELCOME PUT with `ERR forbidden`.
-    pub refuse_welcomes: bool,
+    /// Refuse the next this many WELCOME PUTs with `ERR forbidden`.
+    pub refuse_welcomes: usize,
+    /// Send posts as blob-refs (12.12), with their bytes in `blobs`.
+    pub blob_posts: bool,
+    /// The blob store: bytes by hash.
+    pub blobs: std::sync::Arc<std::sync::Mutex<HashMap<[u8; 48], Vec<u8>>>>,
 }
 
 fn ok() -> OkResponse {
@@ -159,7 +163,9 @@ impl FakeServer {
             log: Vec::new(),
             stale_next: HashSet::new(),
             public_welcomes: HashMap::new(),
-            refuse_welcomes: false,
+            refuse_welcomes: 0,
+            blob_posts: false,
+            blobs: Default::default(),
         }
     }
 
@@ -315,6 +321,10 @@ impl FakeServer {
         command: Command,
     ) -> (Response, Vec<(ConnId, ServerMessage)>) {
         self.log.push((conn, command.verb().to_owned()));
+        let blobs = self.blob_posts.then(|| self.blobs.clone());
+        let post_line = |seq: u64, t: u64, mailbox: &str, bytes: &[u8], next| {
+            post_text(blobs.as_deref(), seq, t, mailbox, bytes, next)
+        };
         let mut lines = Vec::new();
         let mut live = Vec::new();
         let end = match command {
@@ -634,7 +644,10 @@ impl FakeServer {
                 Some((_, hash)) if !matches!(&secret, WelcomeSecret::Put(s) if sha384(s.as_bytes()) == hash) => {
                     err(ErrorCode::Forbidden)
                 }
-                Some(_) if self.refuse_welcomes => err(ErrorCode::Forbidden),
+                Some(_) if self.refuse_welcomes > 0 => {
+                    self.refuse_welcomes -= 1;
+                    err(ErrorCode::Forbidden)
+                }
                 Some((device, _)) => {
                     self.handed_out
                         .remove(key_package_ref.as_bytes().as_slice());
@@ -738,7 +751,10 @@ impl FakeServer {
                     None => err(ErrorCode::NotFound),
                     // 12.8: on the signed-in connection of the committer.
                     Some(_) if conn.1 != crate::conn::Slot::SignedIn => err(ErrorCode::Forbidden),
-                    Some(_) if self.refuse_welcomes => err(ErrorCode::Forbidden),
+                    Some(_) if self.refuse_welcomes > 0 => {
+                        self.refuse_welcomes -= 1;
+                        err(ErrorCode::Forbidden)
+                    }
                     Some(epoch) => {
                         let OrBlob::Inline(welcome) = welcome else {
                             panic!("no blobs")
@@ -792,6 +808,28 @@ fn post_line(seq: u64, t: u64, mailbox: &str, bytes: &[u8], next: Option<[u8; 48
         timestamp(t),
         b64(bytes)
     );
+    if let Some(n) = next {
+        s.push_str(&format!(" next={}", b64(&n)));
+    }
+    s
+}
+
+/// A POST line, its message inline or, with a blob store, as a blob-ref
+/// whose bytes go there (12.12).
+fn post_text(
+    blobs: Option<&std::sync::Mutex<HashMap<[u8; 48], Vec<u8>>>>,
+    seq: u64,
+    t: u64,
+    mailbox: &str,
+    bytes: &[u8],
+    next: Option<[u8; 48]>,
+) -> String {
+    let Some(blobs) = blobs else {
+        return post_line(seq, t, mailbox, bytes, next);
+    };
+    let blob = risala_proto::names::BlobRef::of(bytes);
+    blobs.lock().unwrap().insert(*blob.hash(), bytes.to_vec());
+    let mut s = format!("@seq={seq};t={} POST {mailbox} {blob}", timestamp(t));
     if let Some(n) = next {
         s.push_str(&format!(" next={}", b64(&n)));
     }

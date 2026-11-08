@@ -284,8 +284,10 @@ fn a_room_whose_server_took_an_invalid_commit_is_resynced() {
             5,
         )
         .expect("mallory joined");
+    net.tick();
     let epoch = net.epoch(alice, a);
     assert_eq!(net.epoch(mallory, m), epoch);
+    assert_eq!(net.epoch(bob, b), epoch);
     net.disconnect(mallory);
     let crypto = Arc::new(risala_mls::RisalaCrypto::new().unwrap());
     let (message, group_info, mailbox) = net.write(mallory, |tx| {

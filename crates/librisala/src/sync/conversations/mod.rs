@@ -714,6 +714,10 @@ pub struct ConversationEngine {
     blob_waiting: HashSet<BoxName>,
     /// Welcomes whose blob is being fetched (12.12).
     welcome_blobs: Vec<(risala_proto::names::Id, BlobRef)>,
+    /// Devices added again after a refused WELCOME PUT, once each, so
+    /// that a server that refuses every Welcome cannot loop the group
+    /// through commits (12.8).
+    readded: HashSet<(ConversationId, [u8; 48])>,
     started: bool,
     welcomes_listed: bool,
     self_requested: bool,
@@ -765,6 +769,7 @@ impl ConversationEngine {
             branch_warned: HashSet::new(),
             blob_waiting: HashSet::new(),
             welcome_blobs: Vec::new(),
+            readded: HashSet::new(),
             started: false,
             welcomes_listed: false,
             self_requested: false,
@@ -1383,13 +1388,16 @@ impl ConversationEngine {
                 }) = follow
                 {
                     self.advance(cx, &me, &post.mailbox, out)?;
-                    // A live post beyond a hole: fetch what is missing.
+                    // A live post beyond a hole: fetch what is missing. A
+                    // kept post right after the sync point is no hole: it
+                    // waits for its blob (12.12).
                     let behind = self.write(cx, &me, out, |tx, c| {
                         let Some(mb) = tx.mailbox(c.account, &post.mailbox)? else {
                             return Ok(None);
                         };
                         Ok(tx
                             .first_kept_seq(mb.conv, &post.mailbox)?
+                            .filter(|f| *f > mb.sync_point + 1)
                             .map(|_| mb.sync_point))
                     })?;
                     if let Some(sync) = behind {
@@ -1919,7 +1927,10 @@ impl ConversationEngine {
                         let Some(mb) = tx.mailbox(c.account, &mailbox)? else {
                             return Ok(None);
                         };
-                        Ok(tx.first_kept_seq(mb.conv, &mailbox)?.map(|_| mb.sync_point))
+                        Ok(tx
+                            .first_kept_seq(mb.conv, &mailbox)?
+                            .filter(|f| *f > mb.sync_point + 1)
+                            .map(|_| mb.sync_point))
                     })?;
                     match hole {
                         Some(sync) => self.fetch(&mailbox, sync, out),
@@ -2085,6 +2096,9 @@ impl ConversationEngine {
         let Some((uid, device)) = device else {
             return Ok(());
         };
+        if !self.readded.insert((conv, device)) {
+            return Ok(());
+        }
         let allowed = self.write(cx, me, out, |tx, c| {
             let row = tx.conversation(conv)?;
             if row.kind == ConvKind::Public || !row.state.in_group() {
@@ -2352,12 +2366,13 @@ impl ConversationEngine {
     fn pump(&mut self, cx: &Context, out: &mut Vec<Action>) -> Result<(), EngineError> {
         let me = self.me(cx)?;
         let now = self.now();
+        // Timers first: what they queue is posted in the same step.
+        self.timers_due(cx, &me, now, out)?;
         if self.conversing() {
             self.follow_due(cx, &me, now, out)?;
             self.post_due(cx, &me, out)?;
             self.welcomes_due(cx, &me, now, out)?;
         }
-        self.timers_due(cx, &me, now, out)?;
         Ok(())
     }
 
@@ -2638,7 +2653,15 @@ impl ConversationEngine {
                     && group.pending_proposals().next().is_some()
                     && row.state != ConvState::Leaving
                 {
-                    group::queue_intent(tx, conv, &Intent::default(), c.now)?;
+                    group::queue_intent(
+                        tx,
+                        conv,
+                        &Intent {
+                            proposals: true,
+                            ..Intent::default()
+                        },
+                        c.now,
+                    )?;
                 }
                 Ok(())
             })?;

@@ -557,6 +557,8 @@ fn self_lines_from_unconfirmed_leaves_are_ignored() {
         Arc::new(TestHooks {
             key,
             confirm: false,
+            blobs: net.server.blobs.clone(),
+            blob_mode: net.blob_mode.clone(),
         }),
         Arc::new(net.clock.clone()),
     );

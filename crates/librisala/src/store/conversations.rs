@@ -956,6 +956,15 @@ impl Tx<'_> {
         Ok(token.and_then(|t| t.try_into().ok()))
     }
 
+    /// Marks a conversation joined with a last-resort KeyPackage (12.5).
+    pub(crate) fn set_last_resort(&mut self, id: ConversationId) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE conversations SET last_resort = 1 WHERE id = ?1",
+            [id.0],
+        )?;
+        Ok(())
+    }
+
     /// Clears the last-resort mark, once a new leaf key is committed (12.5).
     pub(crate) fn clear_last_resort(&mut self, id: ConversationId) -> Result<(), StoreError> {
         self.conn().execute(

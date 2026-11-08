@@ -3,6 +3,7 @@
 //! yourself, commits racing for an epoch, leaving, gaps and catching up.
 
 mod public;
+mod recovery;
 mod scenarios;
 pub(crate) mod server;
 
@@ -33,6 +34,9 @@ const START: u64 = 1_794_182_400_000;
 struct TestHooks {
     key: SigningKey,
     confirm: bool,
+    blobs: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 48], Vec<u8>>>>,
+    /// What the blob store answers: 0 the blob, 1 waiting, 2 none.
+    blob_mode: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Hooks for TestHooks {
@@ -42,6 +46,17 @@ impl Hooks for TestHooks {
 
     fn leaf_confirmed(&self, _: &Tx<'_>, _: ConversationId, _: &LeafRow) -> bool {
         self.confirm
+    }
+
+    fn blob(&self, _: AccountId, blob: &BlobRef) -> BlobFetch {
+        match self.blob_mode.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => match self.blobs.lock().unwrap().get(blob.hash()) {
+                Some(bytes) => BlobFetch::Ready(bytes.clone()),
+                None => BlobFetch::Unavailable,
+            },
+            1 => BlobFetch::Waiting,
+            _ => BlobFetch::Unavailable,
+        }
     }
 }
 
@@ -70,6 +85,7 @@ struct Net {
     devices: Vec<Device>,
     queue: VecDeque<(usize, Owned)>,
     clock: ManualClock,
+    blob_mode: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Net {
@@ -79,6 +95,7 @@ impl Net {
             devices: Vec::new(),
             queue: VecDeque::new(),
             clock: ManualClock::new(START),
+            blob_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -106,7 +123,12 @@ impl Net {
         let account = store.add_account(&addr, kind, &uid).unwrap();
         let key = SigningKey::generate().unwrap();
         let device_id = key.device_id().as_bytes().to_vec();
-        let hooks = Arc::new(TestHooks { key, confirm: true });
+        let hooks = Arc::new(TestHooks {
+            key,
+            confirm: true,
+            blobs: self.server.blobs.clone(),
+            blob_mode: self.blob_mode.clone(),
+        });
         let engine = ConversationEngine::new(config, hooks, Arc::new(self.clock.clone()));
         let d = self.devices.len();
         self.server

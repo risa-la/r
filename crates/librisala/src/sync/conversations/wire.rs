@@ -141,6 +141,9 @@ pub struct Intent {
     /// A move to a new mailbox (7.8): the commit changes the box and
     /// nothing else. The box is derived when the commit is made.
     pub move_box: bool,
+    /// Made to commit the pending proposals (6.1): if it loses, and the
+    /// winner committed them, it is not made again.
+    pub proposals: bool,
 }
 
 /// What to do once a commit wins.
@@ -157,7 +160,7 @@ impl Intent {
     /// Encodes it.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
-        w.u8(2);
+        w.u8(3);
         let mut adds = Writer::new();
         for f in &self.add {
             adds.vector(&f.key_package).vector(&f.secret);
@@ -180,13 +183,14 @@ impl Intent {
         w.u8(u8::from(self.display_name.is_some()));
         w.vector(self.display_name.as_deref().unwrap_or_default().as_bytes());
         w.u8(u8::from(self.move_box));
+        w.u8(u8::from(self.proposals));
         w.into_bytes()
     }
 
     /// Reads one back.
     pub fn decode(bytes: &[u8]) -> Result<Intent, Malformed> {
         let mut r = Reader::new(bytes);
-        if r.u8()? != 2 {
+        if r.u8()? != 3 {
             return Err(Malformed("intent version"));
         }
         let mut a = Reader::new(r.vector()?);
@@ -218,6 +222,7 @@ impl Intent {
         let has_name = r.u8()? == 1;
         let name = String::from_utf8(r.vector()?.to_vec()).map_err(|_| Malformed("name"))?;
         let move_box = r.u8()? == 1;
+        let proposals = r.u8()? == 1;
         if !r.done() {
             return Err(Malformed("trailing bytes"));
         }
@@ -229,6 +234,7 @@ impl Intent {
             then,
             display_name: has_name.then_some(name),
             move_box,
+            proposals,
         })
     }
 }
@@ -272,6 +278,7 @@ mod tests {
             then: Then::SelfRemove,
             display_name: Some("Alice".into()),
             move_box: false,
+            proposals: true,
         };
         assert_eq!(Intent::decode(&intent.encode()).unwrap(), intent);
         let empty = Intent::default();
