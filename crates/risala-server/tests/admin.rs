@@ -975,3 +975,153 @@ async fn a_guest_in_a_dropped_room() {
     s.settled().await;
     server.stop().await;
 }
+
+/// What M4 stores survives a restart: room settings, roles, invitations,
+/// bans, deleted messages, reports, operators, server bans and server
+/// settings.
+#[tokio::test(flavor = "multi_thread")]
+async fn m4_state_survives_a_restart() {
+    let mut server = server().await;
+    let (mut s, ids) = people(&server, &["alice", "bob", "carol", "dave"]).await;
+    let ok = join(&mut s, "alice", "#p").await;
+    let id = value(&ok, "id");
+    for line in [
+        "set #p public no",
+        "set #p topic Private",
+        "set #p retention 7",
+        "set #p guests read",
+    ] {
+        let lines = command(s.client("alice"), line).await;
+        assert!(lines.last().unwrap().starts_with("OK seq="), "{lines:?}");
+    }
+    for who in ["bob", "carol"] {
+        command(s.client("alice"), &format!("invite #p {who}@example.org")).await;
+        expect(&mut s, who, &format!("*INVITE #p {who}@example.org")).await;
+    }
+    join(&mut s, "bob", "#p").await;
+    expect(&mut s, "alice", "*JOIN #p").await;
+    command(s.client("alice"), "role #p bob@example.org mod").await;
+    expect(&mut s, "bob", "*ROLE #p bob@example.org mod").await;
+    command(s.client("bob"), "part #p").await;
+    expect(&mut s, "alice", "*PART #p").await;
+    command(s.client("alice"), "ban #p dave@example.org troll").await;
+    exchange(&mut s, "alice", "msg #p gone soon", &["*", "OK seq=12"]).await;
+    exchange(&mut s, "alice", "msg #p rude", &["*", "OK seq=13"]).await;
+    exchange(&mut s, "alice", "delete #p 12", &["*", "OK seq=14"]).await;
+    // bob is a moderator, so a reviewer of his own report.
+    exchange(
+        &mut s,
+        "bob",
+        "report #p 13 rude",
+        &[
+            "@report={rid};t={*} REPORT #p 13 rude",
+            "*MSG #p rude",
+            "OK id={rid}",
+        ],
+    )
+    .await;
+    expect(&mut s, "alice", "*REPORT #p 13 rude").await;
+    expect(&mut s, "alice", "*MSG #p rude").await;
+    expect(&mut s, "op", "*REPORT #p 13 rude").await;
+    expect(&mut s, "op", "*MSG #p rude").await;
+    exchange(&mut s, "op", "admin op carol@example.org", &["OK"]).await;
+    exchange(&mut s, "op", "admin ban spam@example.net", &["OK"]).await;
+    exchange(&mut s, "op", "admin ban 198.51.100.0/24 proxies", &["OK"]).await;
+    exchange(&mut s, "op", "admin set retention 90", &["OK"]).await;
+    exchange(&mut s, "op", "admin set registration closed", &["OK"]).await;
+    exchange(&mut s, "op", "admin set welcome Hi", &["OK"]).await;
+    s.settled().await;
+    drop(s);
+
+    server.restart().await;
+    let mut s = Session::new();
+    for (name, who) in ["alice", "bob", "carol", "dave", "op"].iter().zip(&ids) {
+        s.add(name, server.sign_in(who).await);
+    }
+    exchange(
+        &mut s,
+        "alice",
+        "info #p",
+        &[
+            "SET #p topic Private",
+            "SET #p public no",
+            "SET #p guests read",
+            "SET #p retention 7",
+            "SET #p e2ee no",
+            &format!("OK id={id} members=1 head=14 role=owner joined=yes"),
+        ],
+    )
+    .await;
+    exchange(
+        &mut s,
+        "bob",
+        "roles #p",
+        &[
+            "ROLE #p alice@example.org owner",
+            "ROLE #p bob@example.org mod",
+            "OK",
+        ],
+    )
+    .await;
+    exchange(
+        &mut s,
+        "bob",
+        "bans #p",
+        &["BAN #p dave@example.org troll", "OK"],
+    )
+    .await;
+    // carol's invitation still lets her in; dave's ban keeps him out.
+    exchange(&mut s, "dave", "join #p", &["ERR {..}"]).await;
+    join(&mut s, "carol", "#p").await;
+    expect(&mut s, "alice", "*JOIN #p").await;
+    exchange(
+        &mut s,
+        "alice",
+        "history #p after=11 limit=2",
+        &[
+            "@seq=12;t={*};from=alice@example.org;deleted MSG #p",
+            "@seq=13;t={*};from=alice@example.org MSG #p rude",
+            "OK id={*} more=1",
+        ],
+    )
+    .await;
+    exchange(&mut s, "alice", "delete #p 12", &["OK seq=14"]).await;
+    exchange(
+        &mut s,
+        "bob",
+        "reports #p",
+        &[
+            "@report={rid};t={*} REPORT #p 13 rude",
+            "*MSG #p rude",
+            "OK",
+        ],
+    )
+    .await;
+    exchange(&mut s, "bob", "report #p 13 again", &["OK id={rid}"]).await;
+    // carol is still an operator; op is, from the configuration.
+    exchange(
+        &mut s,
+        "carol",
+        "admin ops",
+        &["OP carol@example.org", "OP op@example.com", "OK"],
+    )
+    .await;
+    exchange(
+        &mut s,
+        "op",
+        "admin bans",
+        &[
+            "SERVERBAN 198.51.100.0/24 proxies",
+            "SERVERBAN spam@example.net",
+            "OK",
+        ],
+    )
+    .await;
+    let info = server_info(&server).await;
+    assert!(info.contains(" register=no "), "{info}");
+    assert!(info.contains(" retention=90 "), "{info}");
+    let greeting = recv(&mut server.connect().await).await;
+    assert!(greeting.ends_with(" Hi"), "{greeting}");
+    s.settled().await;
+    server.stop().await;
+}
