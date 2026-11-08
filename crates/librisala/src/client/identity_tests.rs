@@ -428,17 +428,20 @@ enum AfterLost {
     Accept,
     /// The server refuses AUTH with `auth-failed`.
     Refuse,
-    /// Nobody answers: the server accepts no second connection.
+    /// Nobody answers: the second connection closes before the greeting.
     Nothing,
 }
 
 /// REGISTER for bob whose answer is lost, then what `after` says.
 async fn lost_register(after: AfterLost) -> (Setup, Result<Account, ClientError>) {
-    let conns = if after == AfterLost::Nothing { 1 } else { 2 };
     let sent: Arc<std::sync::Mutex<Option<risala_proto::auth::PublicKey>>> = Arc::default();
-    let s = setup(conns, move |i, mut peer| {
+    let s = setup(2, move |i, mut peer| {
         let sent = sent.clone();
         async move {
+            if i == 1 && after == AfterLost::Nothing {
+                peer.close().await;
+                return;
+            }
             greet(&mut peer).await;
             let nonce: Nonce = NONCE.parse().unwrap();
             if i == 0 {

@@ -162,10 +162,44 @@ impl Peer {
 
 /// A server on 127.0.0.1 and a random port that runs a script on each of
 /// the first `conns` connections.
+///
+/// It keeps listening after those, and counts any further connection as a
+/// failure, so a client that reconnects when the script did not expect it
+/// fails the test with "unexpected connection #n" rather than with a
+/// refused connection. [`done`](Self::done) reports the failures, a
+/// script's panic first, since it is most often the cause of the rest; if
+/// the test panics before calling it, on the thread that started the
+/// server, they are printed before the test's own panic message.
 pub struct ScriptServer {
     pub addr: SocketAddr,
     accept: JoinHandle<()>,
-    scripts: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// How many connections were accepted so far.
+    accepted: tokio::sync::watch::Receiver<usize>,
+    conns: usize,
+    state: Arc<Mutex<State>>,
+}
+
+/// What the scripts and the accept loop left for [`ScriptServer::done`].
+#[derive(Default)]
+struct State {
+    scripts: Vec<JoinHandle<()>>,
+    /// The scripts that panicked, by connection, with their messages.
+    panics: Vec<(usize, String)>,
+    /// Connections past the scripted ones, and accept errors.
+    failures: Vec<String>,
+    /// What else happened, shown with the failures: failed handshakes.
+    notes: Vec<String>,
+}
+
+/// The message of a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "(a panic without a message)".to_owned()
+    }
 }
 
 impl ScriptServer {
@@ -221,15 +255,52 @@ impl ScriptServer {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let scripts = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(Mutex::new(State::default()));
+        register(&state);
+        let (count, accepted) = tokio::sync::watch::channel(0);
         let script = Arc::new(script);
         let accept = {
-            let scripts = scripts.clone();
+            let state = state.clone();
             tokio::spawn(async move {
-                for i in 0..conns {
-                    let (tcp, _) = listener.accept().await.unwrap();
-                    let Ok(tls) = acceptor.accept(tcp).await else {
+                let mut i = 0;
+                loop {
+                    let tcp = match listener.accept().await {
+                        Ok((tcp, _)) => tcp,
+                        Err(e) => {
+                            // Such as running out of file descriptors: the
+                            // client's connection fails, and so the test.
+                            state
+                                .lock()
+                                .unwrap()
+                                .failures
+                                .push(format!("accept failed: {e}"));
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            continue;
+                        }
+                    };
+                    let n = i;
+                    i += 1;
+                    if n >= conns {
+                        state.lock().unwrap().failures.push(format!(
+                            "unexpected connection #{i}: the script expects {conns}"
+                        ));
+                        drop(tcp);
+                        count.send_replace(i);
                         continue;
+                    }
+                    count.send_replace(i);
+                    let tls = match acceptor.accept(tcp).await {
+                        Ok(tls) => tls,
+                        Err(e) => {
+                            // Expected when the client refuses the
+                            // certificate, so only a note for the failures.
+                            state
+                                .lock()
+                                .unwrap()
+                                .notes
+                                .push(format!("connection #{i}: the handshake failed: {e}"));
+                            continue;
+                        }
                     };
                     let (_, conn) = tls.get_ref();
                     let peer = Peer {
@@ -238,30 +309,172 @@ impl ScriptServer {
                         kx_group: conn.negotiated_key_exchange_group().map(|g| g.name()),
                         stream: BufReader::new(tls),
                     };
-                    let script = script.clone();
-                    let handle = tokio::spawn(async move { script(i, peer).await });
-                    scripts.lock().unwrap().push(handle);
+                    let run = tokio::spawn(script(n, peer));
+                    let watch = {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = run.await
+                                && e.is_panic()
+                            {
+                                let message = panic_message(&*e.into_panic());
+                                state.lock().unwrap().panics.push((n, message));
+                            }
+                        })
+                    };
+                    state.lock().unwrap().scripts.push(watch);
                 }
             })
         };
         ScriptServer {
             addr,
             accept,
-            scripts,
+            accepted,
+            conns,
+            state,
         }
     }
 
-    /// Waits for every connection and script, failing the test if a
-    /// script failed.
-    pub async fn done(self) {
-        self.accept.await.unwrap();
-        let scripts: Vec<_> = self.scripts.lock().unwrap().drain(..).collect();
+    /// Waits for every scripted connection and script, failing the test
+    /// if a script failed or the client connected more often than the
+    /// script expects.
+    pub async fn done(mut self) {
+        let conns = self.conns;
+        self.accepted
+            .wait_for(|n| *n >= conns)
+            .await
+            .expect("the accept loop ended");
+        let scripts: Vec<_> = self.state.lock().unwrap().scripts.drain(..).collect();
         for s in scripts {
-            if let Err(e) = s.await
-                && e.is_panic()
-            {
-                std::panic::resume_unwind(e.into_panic());
-            }
+            s.await.unwrap();
         }
+        let failures = self.failures();
+        self.accept.abort();
+        unregister(&self.state);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The failures so far, the scripts' panics first.
+    fn failures(&self) -> Vec<String> {
+        failures_of(&self.state.lock().unwrap())
+    }
+}
+
+/// The failures in `state`, the scripts' panics first, then with the
+/// notes if there are any.
+fn failures_of(state: &State) -> Vec<String> {
+    let mut panics = state.panics.clone();
+    panics.sort();
+    let mut failures: Vec<String> = panics
+        .into_iter()
+        .map(|(n, m)| format!("the script of connection #{} panicked: {m}", n + 1))
+        .chain(state.failures.iter().cloned())
+        .collect();
+    if !failures.is_empty() {
+        failures.extend(state.notes.iter().cloned());
+    }
+    failures
+}
+
+thread_local! {
+    /// The servers a test started on this thread, for the panic hook.
+    static SERVERS: std::cell::RefCell<Vec<std::sync::Weak<Mutex<State>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Registers a server started on this thread, so that if the test fails
+/// here before [`ScriptServer::done`], the failures the server saw are
+/// printed before the test's own panic: a script that panicked is most
+/// often why the client then failed.
+fn register(state: &Arc<Mutex<State>>) {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let failures: Vec<String> = SERVERS
+                .try_with(|servers| {
+                    servers
+                        .try_borrow()
+                        .map(|servers| {
+                            servers
+                                .iter()
+                                .filter_map(std::sync::Weak::upgrade)
+                                .filter_map(|s| s.try_lock().ok().map(|s| failures_of(&s)))
+                                .flatten()
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !failures.is_empty() {
+                eprintln!(
+                    "the script server failed first, which may be the cause:\n{}\n",
+                    failures.join("\n")
+                );
+            }
+            previous(info);
+        }));
+    });
+    SERVERS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.retain(|w| w.strong_count() > 0);
+        s.push(Arc::downgrade(state));
+    });
+}
+
+/// Forgets a server [`register`]ed on this thread.
+fn unregister(state: &Arc<Mutex<State>>) {
+    let _ = SERVERS.try_with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            s.retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(state)));
+        }
+    });
+}
+
+impl Drop for ScriptServer {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::tests::{connect, store};
+
+    #[tokio::test]
+    #[should_panic(expected = "unexpected connection #2: the script expects 1")]
+    async fn a_connection_past_the_script_fails_the_test() {
+        let ca = TestCa::new();
+        let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, peer: Peer| async move {
+            peer.close().await;
+        })
+        .await;
+        // Neither does TLS: the first still counts.
+        for _ in 0..2 {
+            drop(TcpStream::connect(server.addr).await.unwrap());
+        }
+        let mut accepted = server.accepted.clone();
+        accepted.wait_for(|n| *n >= 2).await.unwrap();
+        server.done().await;
+    }
+
+    #[tokio::test]
+    async fn a_script_panic_is_reported_before_what_followed() {
+        let ca = TestCa::new();
+        let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, _: Peer| async move {
+            panic!("boom");
+        })
+        .await;
+        assert!(connect(&ca, &server, &store()).await.is_err());
+        drop(TcpStream::connect(server.addr).await.unwrap());
+        let mut accepted = server.accepted.clone();
+        accepted.wait_for(|n| *n >= 2).await.unwrap();
+        let err = tokio::spawn(server.done()).await.unwrap_err();
+        let message = panic_message(&*err.into_panic());
+        assert_eq!(
+            message,
+            "the script of connection #1 panicked: boom\n\
+             unexpected connection #2: the script expects 1"
+        );
     }
 }
