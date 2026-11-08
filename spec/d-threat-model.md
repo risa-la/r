@@ -309,8 +309,8 @@ Each risk is marked **Mitigated**, where this document limits it, or
   invalid commit makes every device of a public room recover.
 - **Unused joins in public rooms** (Mitigated: owners and moderators
   remove them, and anyone after 8 days, 12.7). Joins that nobody uses
-  count towards a room's limits until then, bounded only by proof of
-  work and rate limits.
+  count towards a room's limits until then, bounded only by rate limits
+  until proof of work is specified (4.1).
 - **Time windows on the server's clock** (Open). Every time window of
   the group checks runs on the `t` the server gives posts, so that
   devices agree; a server that colludes with a member can shift them

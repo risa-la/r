@@ -246,7 +246,7 @@ opaque Uid<V>;
 struct {
     uint8 version;               // 1
     ConversationKind kind;
-    opaque host<V>;              // the server (below)
+    opaque host<V>;              // the server, as a server (3.5)
     opaque box[16];              // the mailbox
     opaque name<V>;
     opaque topic<V>;             // UTF-8, at most 512 bytes

@@ -321,8 +321,8 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   can remove the copy at once (12.7). Owners and moderators remove such
   leaves without kicking the uid they name, and any member may once
   they are 8 days old; until then, joins that nobody uses count towards
-  the room's limits, which only proof of work and rate limits bound
-  (4.1). An identity in the room can make a resync commit at any time,
+  the room's limits, which only rate limits bound until proof of work
+  is specified (4.1). An identity in the room can make a resync commit at any time,
   which removes the last committer's leaf until that device joins
   again; devices that had no trouble with the commit it undid name its
   maker. Apart from owners and moderators, who act within their roles,

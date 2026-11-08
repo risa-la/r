@@ -177,6 +177,9 @@ MLS and messages:
   (12.10)
 - the send token export and its hash, and a commit's POST with its
   `next` (7.2, 12.6)
+- the pseudonym export for a leaf index, and the box export of a
+  mailbox move (7.3, 7.8)
+- an AnnotatedWelcome and an AnnotatedCommit, from a fixed tree (12.6)
 - the group id, epoch, content type and RisalaAAD that a server reads
   from a PrivateMessage and from a PublicMessage (5.2)
 - PrivateMessage padding to a multiple of 256 bytes, and Padmé padding
@@ -198,9 +201,10 @@ MLS and messages:
   (12.10)
 - group checks as decisions: a group state and a post with a commit,
   and whether the commit is valid, for each group check of 12.7,
-  including the stale-leaf median, `streak` and the bounds on
-  `updated` (12.3, 12.7), since every implementation must reach the
-  same answer (7.2)
+  including the stale-leaf median with activity times, `streak` per
+  identity, the bounds on `updated`, signature key changes, copies,
+  removals for a check and the bulk limit (12.3, 12.7), since every
+  implementation must reach the same answer (7.2)
 
 Files, history and reports:
 

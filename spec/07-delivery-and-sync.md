@@ -87,7 +87,7 @@ wrong hash there leads to a resync (12.7), never to TOKEN: TOKEN for a
 public room's mailbox gets `ERR forbidden`.
 
 ```
-C: TOKEN ujzdegxdncf32epf3dhodzdoci 41 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
+C: TOKEN m4qkz7xw2rjv5tbnhc3pfyd6ea 41 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= OWLXhHTd2X+O1uwHQ2Ylsj9LLdW2htn4UhwDp6x6TDrnYCbdMAQ4Hu4/aEVDqmGm
 S: OK
 ```
 
