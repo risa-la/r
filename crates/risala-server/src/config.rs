@@ -35,6 +35,15 @@
 //! [http]
 //! listen = ["[::]:443"]
 //! key_dir = "/var/lib/risala/keys"
+//!
+//! [log]
+//! k = 2
+//! witnesses = [
+//!     { vkey = "witness.example/w+1234abcd+Bg…", url = "https://witness.example/w" },
+//! ]
+//!
+//! [witness]
+//! enabled = false
 //! ```
 
 use std::net::SocketAddr;
@@ -84,6 +93,82 @@ pub struct Config {
     pub keys: KeysConfig,
     /// The HTTPS listener and the key file directory (4.7).
     pub http: HttpConfig,
+    /// The key log and its witnesses (4.5).
+    pub log: LogConfig,
+    /// Acting as a witness for other servers' key logs (4.10).
+    pub witness: WitnessConfig,
+}
+
+/// The key log (4.5): its URL, its number, and the witnesses asked to
+/// cosign its checkpoints. The log is served by the HTTPS listener, at
+/// `/risala-log/<n>`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// Whether the server keeps a key log. The default is to keep one when
+    /// it has an `identity_domain`, since every server that hosts
+    /// identities must (4.5).
+    pub enabled: Option<bool>,
+    /// Where the HTTPS listener is reached, as `https://<host>[:<port>]`,
+    /// with no path. The log's URL prefix is this and `/risala-log/<n>`.
+    /// The default is `https://<hostname>`.
+    pub url: Option<String>,
+    /// The log's number, `<n>` in its origin `<hostname>/risala-log/<n>`.
+    /// Raising it hands the log off to the next one (4.5), one number at a
+    /// time; it can never go down. The default keeps the current log, or
+    /// starts log 1.
+    pub number: Option<u64>,
+    /// The witnesses asked to cosign each checkpoint (4.5, 4.10).
+    pub witnesses: Vec<LogWitness>,
+    /// How many cosignatures make a checkpoint witnessed, so that the log
+    /// serves it. The default is more than half of `witnesses`.
+    pub k: Option<usize>,
+    /// How often the log gets a new witnessed checkpoint when nothing is
+    /// added, in seconds: 60 to 43200. Devices want cosignatures less than
+    /// 24 hours old (4.5).
+    pub refresh_secs: u64,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            enabled: None,
+            url: None,
+            number: None,
+            witnesses: Vec::new(),
+            k: None,
+            refresh_secs: 3600,
+        }
+    }
+}
+
+/// A witness the key log sends its checkpoints to (4.5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogWitness {
+    /// The witness's signed-note verifier key, of type `0x06`.
+    pub vkey: String,
+    /// Its URL prefix, `https://…`, without a `/` at the end:
+    /// `add-checkpoint` and `risala/handoff` go under it.
+    pub url: String,
+}
+
+/// Acting as a witness for other servers' key logs (4.10), at
+/// `/risala-witness` on the HTTPS listener.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WitnessConfig {
+    /// Whether the server is a witness. Off by default.
+    pub enabled: bool,
+    /// The name of the witness's key. The default is
+    /// `<hostname>/risala-witness`.
+    pub name: Option<String>,
+    /// The verifier keys of the first logs (`<host>/risala-log/1`) the
+    /// witness enrols. An `add-checkpoint` request does not carry the log's
+    /// key, so the operator gives it here, from somewhere they trust (for
+    /// example the host's INFO `log-key=`). Later logs of a host enrol
+    /// through hand-offs, with no configuration (4.10).
+    pub logs: Vec<String>,
 }
 
 /// Fetching key files over HTTPS (4.4), to check sign-ins (4.5).
@@ -104,7 +189,8 @@ pub struct KeysConfig {
     pub cache_size: usize,
     /// PEM files of CA certificates to trust besides the public ones built
     /// in (Mozilla's). For tests and private deployments; 4.4 asks for
-    /// public CAs.
+    /// public CAs. The key log's requests to its witnesses (4.5) trust
+    /// them too.
     pub extra_roots: Vec<PathBuf>,
 }
 
@@ -335,6 +421,8 @@ impl Default for Config {
             limits: Limits::default(),
             keys: KeysConfig::default(),
             http: HttpConfig::default(),
+            log: LogConfig::default(),
+            witness: WitnessConfig::default(),
         }
     }
 }
@@ -528,7 +616,7 @@ impl Config {
                 ));
             }
         }
-        let mut warnings = Vec::new();
+        let mut warnings = crate::core::keylog::check_config(self).map_err(ConfigError::Invalid)?;
         if k.allow_private {
             warnings.push(
                 "keys.allow_private is on: key files may be fetched from loopback and \

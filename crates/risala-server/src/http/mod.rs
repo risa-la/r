@@ -11,10 +11,12 @@
 //!   hosted identities' key files to a directory (4.6).
 //! - [`server`]: [`HttpServer`], the optional HTTPS listener (`[http]` in
 //!   the configuration), which serves the hosted identities' key files at
-//!   `/.well-known/risala/<name>`, made from the hub's records.
+//!   `/.well-known/risala/<name>`, made from the hub's records, and the
+//!   hub's key log and witness ([`keylog`]).
 
 pub mod fetch;
 pub mod keydir;
+pub(crate) mod keylog;
 pub mod server;
 
 #[cfg(test)]

@@ -117,6 +117,8 @@ mod tests {
                 "uploads",
                 "used_ids",
                 "welcomes",
+                "witness_key",
+                "witness_logs",
             ]
         );
         // Every table is STRICT, so a value of the wrong type is refused.

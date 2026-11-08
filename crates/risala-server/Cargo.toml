@@ -20,6 +20,9 @@ path = "src/lib.rs"
 risala-proto.workspace = true
 risala-keyfetch.workspace = true
 risala-mls.workspace = true
+# The key log and witnessing (4.5, 4.10).
+risala-keylog.workspace = true
+webpki-root-certs.workspace = true
 rmp-serde.workspace = true
 tls_codec.workspace = true
 tokio.workspace = true

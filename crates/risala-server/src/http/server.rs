@@ -38,6 +38,12 @@ pub trait KeyFiles: Send + Sync + 'static {
     /// The key file of `<name>@<identity domain>`, or `None` if there is
     /// none to serve (404). Called on the blocking pool.
     fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>>;
+
+    /// The hub, whose key log and witness the listener also serves (4.5,
+    /// 4.10); `None` for key files from elsewhere.
+    fn hub(&self) -> Option<&Hub> {
+        None
+    }
 }
 
 /// The key files of the identities the hub hosts, made from its records
@@ -45,6 +51,10 @@ pub trait KeyFiles: Send + Sync + 'static {
 impl KeyFiles for Hub {
     fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
         self.hosted_key_file(name)
+    }
+
+    fn hub(&self) -> Option<&Hub> {
+        Some(self)
     }
 }
 
@@ -295,6 +305,8 @@ pub(crate) struct Request {
     pub(crate) method: String,
     /// The path, without any query.
     pub(crate) path: String,
+    /// The body of a `POST` to the witness (4.10); empty otherwise.
+    pub(crate) body: Vec<u8>,
 }
 
 /// Reads a request head and parses its request line. A request that
@@ -317,7 +329,51 @@ async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Request, R
     if end > MAX_REQUEST_HEAD {
         return Err(Response::error(431, "Request Header Fields Too Large"));
     }
-    parse_request_line(&head[..end]).ok_or_else(|| Response::error(400, "Bad Request"))
+    let mut request =
+        parse_request_line(&head[..end]).ok_or_else(|| Response::error(400, "Bad Request"))?;
+    if request.method == "POST" && super::keylog::is_witness_path(&request.path) {
+        request.body = read_body(stream, &head, end).await?;
+    }
+    Ok(request)
+}
+
+/// Reads the body of a request whose head ends at `end` in `head`, by its
+/// `Content-Length`, up to [`MAX_WITNESS_REQUEST`](super::keylog::MAX_WITNESS_REQUEST).
+async fn read_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    head: &[u8],
+    end: usize,
+) -> Result<Vec<u8>, Response> {
+    let text = std::str::from_utf8(&head[..end]).map_err(|_| Response::error(400, "Bad Request"))?;
+    let mut length = None;
+    for line in text.split('\n').skip(1) {
+        let line = line.trim_end_matches('\r');
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(Response::error(411, "Length Required"));
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                let n = value.trim().parse::<usize>();
+                length = Some(n.map_err(|_| Response::error(400, "Bad Request"))?);
+            }
+        }
+    }
+    let length = length.ok_or_else(|| Response::error(411, "Length Required"))?;
+    if length > super::keylog::MAX_WITNESS_REQUEST {
+        return Err(Response::error(413, "Content Too Large"));
+    }
+    // The blank line after the head is LF or CRLF.
+    let start = end + if head.get(end + 1) == Some(&b'\n') { 2 } else { 3 };
+    let mut body = head.get(start..).unwrap_or_default().to_vec();
+    body.truncate(length);
+    let mut chunk = [0u8; 4096];
+    while body.len() < length {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return Err(Response::error(400, "Bad Request")),
+            Ok(n) => body.extend_from_slice(&chunk[..n.min(length - body.len())]),
+        }
+    }
+    Ok(body)
 }
 
 /// Where the head ends: the index of the LF that ends its last line, if
@@ -354,6 +410,7 @@ fn parse_request_line(head: &[u8]) -> Option<Request> {
     Some(Request {
         method: method.to_owned(),
         path: path.to_owned(),
+        body: Vec::new(),
     })
 }
 
@@ -420,6 +477,23 @@ impl Route {
 
 /// Answers a request.
 async fn route(request: &Request, keys: &Arc<dyn KeyFiles>) -> Response {
+    if let Some(hub) = keys.hub()
+        && let Some(answer) =
+            super::keylog::route(hub, &request.method, &request.path, request.body.clone()).await
+    {
+        return Response {
+            status: answer.status,
+            reason: super::keylog::reason(answer.status),
+            content_type: answer.content_type,
+            extra: if answer.immutable {
+                vec![("Cache-Control", "public, max-age=31536000, immutable")]
+            } else {
+                vec![("Cache-Control", "no-cache")]
+            },
+            body: answer.body,
+            head_only: request.method == "HEAD",
+        };
+    }
     let head_only = match request.method.as_str() {
         "GET" => false,
         "HEAD" => true,
@@ -495,7 +569,8 @@ mod tests {
             parse("GET /.well-known/risala/alice?x=1 HTTP/1.1\r\nHost: a\r"),
             Some(Request {
                 method: "GET".into(),
-                path: "/.well-known/risala/alice".into()
+                path: "/.well-known/risala/alice".into(),
+                body: Vec::new(),
             })
         );
         assert!(parse("GET / HTTP/1.0").is_some());

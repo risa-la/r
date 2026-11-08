@@ -2427,6 +2427,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "risala-keyfetch",
+ "risala-keylog",
  "risala-mls",
  "risala-proto",
  "rmp-serde",
@@ -2443,6 +2444,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webpki-root-certs",
 ]
 
 [[package]]
