@@ -288,6 +288,55 @@ pub(crate) fn consistency_roots(
     Ok((fr, sr))
 }
 
+/// What a consistency path that a log's own hashes produced shows about
+/// two trees, used to tell a fork from a bad proof (SPEC 4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consistency {
+    /// The path leads to both roots.
+    Consistent,
+    /// The path leads to the new root but not to the old one. By the
+    /// collision resistance of SHA-256, the path's hashes are those of the
+    /// new tree, and its first `old` leaves do not have the old root: the
+    /// trees are not consistent.
+    Inconsistent,
+    /// The path does not lead to the new root, so it says nothing about
+    /// the trees; the hashes it came from were wrong.
+    Unproven,
+}
+
+/// Checks a path with its seed, the hash of the old tree's leaves as the
+/// new tree has them. For `0 < old < new`.
+pub(crate) fn check_seeded_path(
+    old: u64,
+    old_root: &Hash,
+    new: u64,
+    new_root: &Hash,
+    seeded_path: &[Hash],
+) -> Consistency {
+    match consistency_roots(old, new, seeded_path) {
+        Ok((_, sr)) if sr != *new_root => Consistency::Unproven,
+        Ok((fr, _)) if fr == *old_root => Consistency::Consistent,
+        Ok(_) => Consistency::Inconsistent,
+        Err(_) => Consistency::Unproven,
+    }
+}
+
+/// The consistency path from `old` to `new` with its seed in front when
+/// `old` is a power of two: the hash of the first `old` leaves as the new
+/// tree has them, read from `reader`. For `0 < old < new`.
+pub(crate) fn seeded_consistency_path<R: HashReader>(
+    old: u64,
+    new: u64,
+    reader: &mut R,
+) -> Result<Vec<Hash>, ProofError<R::Error>> {
+    let mut path = Vec::new();
+    if old.is_power_of_two() {
+        path.push(range_hash(0, old, reader)?);
+    }
+    path.extend(consistency_proof(old, new, reader)?);
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +605,45 @@ mod tests {
             verify_consistency(8, &root, 3, &old, &[]),
             Err(VerifyError::OutOfRange)
         );
+    }
+
+    #[test]
+    fn seeded_paths_tell_forks_from_bad_proofs() {
+        let leaves = reference_leaves();
+        let mut honest = Leaves(leaves.clone());
+        let mut forked_leaves = leaves.clone();
+        forked_leaves[1] = leaf_hash(b"other");
+        let mut forked = Leaves(forked_leaves);
+        for old in 1..8u64 {
+            let old_root = tree_hash(old, &mut honest).unwrap();
+            let new_root = tree_hash(8, &mut honest).unwrap();
+            let path = seeded_consistency_path(old, 8, &mut honest).unwrap();
+            assert_eq!(
+                check_seeded_path(old, &old_root, 8, &new_root, &path),
+                Consistency::Consistent
+            );
+
+            // The forked tree's view: an old root from the honest tree,
+            // and the new root and path from the forked one.
+            let forked_root = tree_hash(8, &mut forked).unwrap();
+            let fpath = seeded_consistency_path(old, 8, &mut forked).unwrap();
+            let want = if old >= 2 {
+                Consistency::Inconsistent
+            } else {
+                Consistency::Consistent
+            };
+            assert_eq!(
+                check_seeded_path(old, &old_root, 8, &forked_root, &fpath),
+                want,
+                "old {old}"
+            );
+
+            // A path for one tree checked against the other's root proves
+            // nothing.
+            assert_eq!(
+                check_seeded_path(old, &old_root, 8, &forked_root, &path),
+                Consistency::Unproven
+            );
+        }
     }
 }

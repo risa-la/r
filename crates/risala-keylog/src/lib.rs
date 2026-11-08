@@ -11,8 +11,11 @@
 //! - [`tile`]: tiles and entry bundles [TLOG-TILES], built by the server
 //!   and read by devices;
 //! - [`witness`]: the witness policy, k of n;
+//! - [`client`]: what a device does with a log: proofs against witnessed
+//!   checkpoints, keeping them consistent, and fork evidence;
 //! - [`addcheckpoint`]: the body of a witness's `add-checkpoint` request
 //!   [TLOG-WITNESS];
+//! - [`testlog`]: an in-memory log and witness, for tests.
 //!
 //! What an entry holds, an encoded Record (SPEC 4.4), is not this crate's
 //! business: entries are bytes here. The crate does no I/O; tiles come in
@@ -22,14 +25,17 @@
 
 pub mod addcheckpoint;
 pub mod checkpoint;
+pub mod client;
 pub mod cosig;
 pub mod merkle;
 pub mod note;
 pub mod proof;
+pub mod testlog;
 pub mod tile;
 pub mod witness;
 
 pub use checkpoint::{Checkpoint, LogOrigin, SignedCheckpoint};
+pub use client::{ForkEvidence, LogView, Seen};
 pub use cosig::{CosignatureVerifier, Cosigner};
 pub use merkle::{Hash, leaf_hash};
 pub use note::{Note, NoteSignature, VerifierKey};
