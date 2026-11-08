@@ -4,15 +4,20 @@
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use sha2::{Digest as _, Sha384};
 
-use risala_proto::mls::{GroupId, Pseudonym};
+use std::time::Duration;
+
+use risala_proto::mls::{GroupId, Pseudonym, TokenHash};
 use risala_proto::names::{BlobRef, BoxName, Room, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::Role;
 
 use super::{SqliteStore, from_sql_u64, sql_u64};
+use crate::secret::ct_eq;
+use crate::store::mailbox::{CID_LIFETIME, MAX_SET_HASHES, MAX_SETS};
 use crate::store::{
-    Created, KeptPost, MailboxRecord, MailboxStore, NewMailbox, PublicRoomRecord, Result,
-    StoreError, fixed, millis, parsed, timestamp,
+    Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom, PostBody,
+    Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomUpdate, StoreError, StoredPost,
+    fixed, millis, parsed, timestamp,
 };
 
 /// The mailbox area's tables.
@@ -34,7 +39,9 @@ CREATE TABLE mailboxes (
     first_epoch INTEGER NOT NULL DEFAULT 0 CHECK (first_epoch >= 0), -- 0, or a move's (7.8)
     moved_from BLOB REFERENCES mailboxes (box) ON DELETE SET NULL, -- for TOKEN (7.2, 7.8)
     created INTEGER NOT NULL,       -- ms
-    head INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0) -- the newest seq given out
+    head INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0), -- the newest seq given out
+    bytes INTEGER NOT NULL DEFAULT 0 CHECK (bytes >= 0), -- of its kept posts, for its quota (7.5)
+    active INTEGER NOT NULL         -- ms of its newest post, or of its creation (7.5)
 ) STRICT;
 CREATE INDEX mailboxes_group ON mailboxes (group_id, created);
 
@@ -47,7 +54,7 @@ CREATE TABLE token_hashes (
     added INTEGER NOT NULL,         -- ms
     used INTEGER,                   -- ms of the last post that used it
     PRIMARY KEY (box, epoch, hash)
-) STRICT, WITHOUT ROWID;
+) STRICT; -- with a rowid, the order hashes were added in
 
 -- Kept posts (5.2), until they expire (7.5): their box, seq, time and
 -- message, and a commit's next, only (4.2).
@@ -63,6 +70,13 @@ CREATE TABLE posts (
 ) STRICT;
 -- Retention expires each mailbox's posts oldest first (7.5).
 CREATE INDEX posts_t ON posts (t);
+-- The bytes of each mailbox's kept posts, for its quota (7.5).
+CREATE TRIGGER posts_bytes_in AFTER INSERT ON posts BEGIN
+    UPDATE mailboxes SET bytes = bytes + coalesce(length(NEW.message), 0) WHERE box = NEW.box;
+END;
+CREATE TRIGGER posts_bytes_out AFTER DELETE ON posts BEGIN
+    UPDATE mailboxes SET bytes = max(0, bytes - coalesce(length(OLD.message), 0)) WHERE box = OLD.box;
+END;
 
 -- Client post ids (7.6), for 24 hours.
 CREATE TABLE cids (
@@ -89,7 +103,8 @@ CREATE TABLE public_rooms (
     tree_is_blob INTEGER NOT NULL DEFAULT 0,
     members INTEGER NOT NULL DEFAULT 1, -- identities and guests with a leaf (6.1)
     topic TEXT NOT NULL DEFAULT '', -- escaped, from the conversation extension (6.2)
-    guests TEXT NOT NULL DEFAULT 'write' CHECK (guests IN ('none', 'read', 'write'))
+    guests TEXT NOT NULL DEFAULT 'write' CHECK (guests IN ('none', 'read', 'write')),
+    proposals BLOB NOT NULL DEFAULT x'' -- the epoch's pending proposals, each a u32 length and its bytes
 ) STRICT;
 
 -- The uids with a leaf in each public room's group (6.1, 8.3), and their
@@ -136,56 +151,216 @@ fn remember(tx: &Transaction<'_>, kind: i64, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The `before` of a time `ago` before `now`, in ms.
+fn ms_before(now: Timestamp, ago: Duration) -> i64 {
+    millis(now).saturating_sub(i64::try_from(ago.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Encodes a public room's pending proposals: each a u32 length and its
+/// bytes.
+fn encode_proposal(message: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(message.len()).unwrap_or(u32::MAX);
+    let mut out = Vec::with_capacity(4 + message.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(message);
+    out
+}
+
+/// Decodes what [`encode_proposal`] wrote, one after another.
+fn decode_proposals(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        let corrupt = || StoreError::Corrupt("a room's pending proposals".into());
+        let (len, rest) = bytes.split_first_chunk::<4>().ok_or_else(corrupt)?;
+        let len = u32::from_be_bytes(*len) as usize;
+        if rest.len() < len {
+            return Err(corrupt());
+        }
+        out.push(rest[..len].to_vec());
+        bytes = &rest[len..];
+    }
+    Ok(out)
+}
+
+/// Checks a new mailbox against the boxes and group ids seen before (5.2,
+/// 7.8): `Ok(moved_from)`, the newest mailbox of the group for a move, or
+/// why it cannot be created.
+fn check_new(tx: &Transaction<'_>, new: &NewMailbox) -> Result<Result<Option<Vec<u8>>, Created>> {
+    let mailbox = &new.mailbox.as_bytes()[..];
+    let group = &new.group_id.as_bytes()[..];
+    if used(tx, USED_BOX, mailbox)? {
+        return Ok(Err(Created::Taken));
+    }
+    if new.first_epoch == 0 {
+        if used(tx, USED_GROUP, group)? {
+            return Ok(Err(Created::Taken));
+        }
+        return Ok(Ok(None));
+    }
+    let newest = tx
+        .query_row(
+            "SELECT box FROM mailboxes WHERE group_id = ?
+             ORDER BY created DESC, rowid DESC LIMIT 1",
+            [group],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(newest.map(Some).ok_or(Created::NoGroup))
+}
+
+/// Inserts a mailbox that [`check_new`] allowed, and its first token set.
+fn insert_mailbox(
+    tx: &Transaction<'_>,
+    new: &NewMailbox,
+    moved_from: Option<Vec<u8>>,
+) -> Result<()> {
+    let mailbox = &new.mailbox.as_bytes()[..];
+    let group = &new.group_id.as_bytes()[..];
+    remember(tx, USED_BOX, mailbox)?;
+    remember(tx, USED_GROUP, group)?;
+    let created = millis(new.created);
+    tx.execute(
+        "INSERT INTO mailboxes (box, group_id, first_epoch, moved_from, created, active)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        params![
+            mailbox,
+            group,
+            sql_u64(new.first_epoch),
+            moved_from,
+            created,
+            created
+        ],
+    )?;
+    add_token(tx, mailbox, new.first_epoch, &new.token_hash, created)
+}
+
+/// [`MailboxStore::add_token`], in a transaction.
+fn add_token(
+    tx: &Transaction<'_>,
+    mailbox: &[u8],
+    epoch: u64,
+    hash: &TokenHash,
+    now: i64,
+) -> Result<()> {
+    let epoch = sql_u64(epoch);
+    let hash = &hash.as_bytes()[..];
+    let held = tx
+        .query_row(
+            "SELECT 1 FROM token_hashes WHERE box = ? AND epoch = ? AND hash = ?",
+            params![mailbox, epoch, hash],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if held {
+        return Ok(());
+    }
+    let in_set: i64 = tx.query_row(
+        "SELECT count(*) FROM token_hashes WHERE box = ? AND epoch = ?",
+        params![mailbox, epoch],
+        |row| row.get(0),
+    )?;
+    if in_set == 0 {
+        // A new set: the mailbox keeps the MAX_SETS used most recently.
+        let sets: i64 = tx.query_row(
+            "SELECT count(DISTINCT epoch) FROM token_hashes WHERE box = ?",
+            [mailbox],
+            |row| row.get(0),
+        )?;
+        if sets >= MAX_SETS as i64 {
+            tx.execute(
+                "DELETE FROM token_hashes WHERE box = ?1 AND epoch = (
+                     SELECT epoch FROM token_hashes WHERE box = ?1 GROUP BY epoch
+                     ORDER BY max(max(added, coalesce(used, 0))), epoch LIMIT 1)",
+                [mailbox],
+            )?;
+        }
+    } else if in_set >= MAX_SET_HASHES as i64 {
+        // A full set drops the hash added first among those no post has
+        // used, or the one a post used least recently.
+        tx.execute(
+            "DELETE FROM token_hashes WHERE rowid = (
+                 SELECT rowid FROM token_hashes WHERE box = ?1 AND epoch = ?2
+                 ORDER BY used IS NOT NULL, coalesce(used, added), rowid LIMIT 1)",
+            params![mailbox, epoch],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO token_hashes (box, epoch, hash, added) VALUES (?, ?, ?, ?)",
+        params![mailbox, epoch, hash, now],
+    )?;
+    Ok(())
+}
+
+/// Stores a public room's group as of `epoch_seq`, and its members.
+fn store_room_group(
+    tx: &Transaction<'_>,
+    mailbox: &[u8],
+    group: &RoomUpdate,
+    epoch_seq: u64,
+) -> Result<()> {
+    let members = group.members.len() as i64;
+    tx.execute(
+        "UPDATE public_rooms SET epoch = ?, epoch_seq = ?, group_info = ?, tree = ?,
+             members = ?, topic = ?, guests = ?, proposals = x''
+         WHERE box = ?",
+        params![
+            sql_u64(group.epoch),
+            sql_u64(epoch_seq),
+            &group.group_info,
+            &group.tree,
+            members,
+            &group.topic,
+            group.guests.to_string(),
+            mailbox
+        ],
+    )?;
+    tx.execute("DELETE FROM room_members WHERE box = ?", [mailbox])?;
+    let mut insert =
+        tx.prepare_cached("INSERT INTO room_members (box, uid, role) VALUES (?, ?, ?)")?;
+    for (uid, role) in &group.members {
+        insert.execute(params![mailbox, uid.as_str(), role.to_string()])?;
+    }
+    Ok(())
+}
+
 impl MailboxStore for SqliteStore {
     fn create_mailbox(&self, new: &NewMailbox) -> Result<Created> {
         self.write(|tx| {
-            let mailbox = &new.mailbox.as_bytes()[..];
-            let group = &new.group_id.as_bytes()[..];
-            if used(tx, USED_BOX, mailbox)? {
+            let moved_from = match check_new(tx, new)? {
+                Ok(from) => from,
+                Err(not) => return Ok(not),
+            };
+            insert_mailbox(tx, new, moved_from)?;
+            Ok(Created::Created)
+        })
+    }
+
+    fn create_room(&self, new: &NewMailbox, room: &NewRoom) -> Result<Created> {
+        self.write(|tx| {
+            let moved_from = match check_new(tx, new)? {
+                Ok(from) => from,
+                Err(not) => return Ok(not),
+            };
+            let taken = tx
+                .query_row(
+                    "SELECT 1 FROM public_rooms WHERE room = ?",
+                    [room.room.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if taken {
                 return Ok(Created::Taken);
             }
-            let moved_from: Option<Vec<u8>> = if new.first_epoch == 0 {
-                if used(tx, USED_GROUP, group)? {
-                    return Ok(Created::Taken);
-                }
-                None
-            } else {
-                let newest = tx
-                    .query_row(
-                        "SELECT box FROM mailboxes WHERE group_id = ?
-                         ORDER BY created DESC, rowid DESC LIMIT 1",
-                        [group],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                match newest {
-                    Some(from) => Some(from),
-                    None => return Ok(Created::NoGroup),
-                }
-            };
-            remember(tx, USED_BOX, mailbox)?;
-            remember(tx, USED_GROUP, group)?;
-            let created = millis(new.created);
+            insert_mailbox(tx, new, moved_from)?;
+            let mailbox = &new.mailbox.as_bytes()[..];
             tx.execute(
-                "INSERT INTO mailboxes (box, group_id, first_epoch, moved_from, created)
-                 VALUES (?, ?, ?, ?, ?)",
-                params![
-                    mailbox,
-                    group,
-                    sql_u64(new.first_epoch),
-                    moved_from,
-                    created
-                ],
+                "INSERT INTO public_rooms (box, room, creator, epoch, epoch_seq, group_info, tree)
+                 VALUES (?, ?, ?, 0, 0, x'', x'')",
+                params![mailbox, room.room.as_str(), room.creator.as_str()],
             )?;
-            tx.execute(
-                "INSERT INTO token_hashes (box, epoch, hash, added) VALUES (?, ?, ?, ?)",
-                params![
-                    mailbox,
-                    sql_u64(new.first_epoch),
-                    &new.token_hash.as_bytes()[..],
-                    created
-                ],
-            )?;
+            store_room_group(tx, mailbox, &room.group, 0)?;
             Ok(Created::Created)
         })
     }
@@ -227,6 +402,296 @@ impl MailboxStore for SqliteStore {
         })
     }
 
+    fn cid_post(&self, mailbox: &BoxName, cid: &str, since: Timestamp) -> Result<Option<u64>> {
+        self.read(|tx| {
+            let seq: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM cids WHERE box = ? AND cid = ? AND t >= ?",
+                    params![&mailbox.as_bytes()[..], cid, millis(since)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            seq.map(|seq| from_sql_u64("seq", seq)).transpose()
+        })
+    }
+
+    fn has_token(&self, mailbox: &BoxName, epoch: u64, hash: &TokenHash) -> Result<bool> {
+        self.read(|tx| {
+            let mut select = tx.prepare_cached(
+                "SELECT hash FROM token_hashes WHERE box = ? AND epoch = ? ORDER BY rowid",
+            )?;
+            let rows = select
+                .query_map(params![&mailbox.as_bytes()[..], sql_u64(epoch)], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+            // Every hash of the set is compared, each in constant time, so
+            // the time says nothing about which one matched (7.2).
+            let mut found = false;
+            for row in rows {
+                found |= ct_eq(&row?, &hash.as_bytes()[..]);
+            }
+            Ok(found)
+        })
+    }
+
+    fn add_token(
+        &self,
+        mailbox: &BoxName,
+        epoch: u64,
+        hash: &TokenHash,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.write(|tx| add_token(tx, &mailbox.as_bytes()[..], epoch, hash, millis(now)))
+    }
+
+    fn add_post(&self, post: &NewPost) -> Result<Posted> {
+        self.write(|tx| {
+            let mailbox = &post.mailbox.as_bytes()[..];
+            let head: Option<i64> = tx
+                .query_row(
+                    "SELECT head FROM mailboxes WHERE box = ?",
+                    [mailbox],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(head) = head else {
+                return Ok(Posted::NoMailbox);
+            };
+            let size = post.message.size();
+            if size > post.quota {
+                return Ok(Posted::OverQuota);
+            }
+            // Over its quota, the mailbox's oldest posts expire early (7.5).
+            loop {
+                let bytes: i64 = tx.query_row(
+                    "SELECT bytes FROM mailboxes WHERE box = ?",
+                    [mailbox],
+                    |row| row.get(0),
+                )?;
+                if from_sql_u64("bytes", bytes)?.saturating_add(size) <= post.quota {
+                    break;
+                }
+                let deleted = tx.execute(
+                    "DELETE FROM posts WHERE box = ?1 AND seq = (
+                         SELECT min(seq) FROM posts WHERE box = ?1)",
+                    [mailbox],
+                )?;
+                if deleted == 0 {
+                    break;
+                }
+            }
+            let seq = head + 1;
+            let t = millis(post.t);
+            let (message, blob) = match &post.message {
+                PostBody::Inline(bytes) => (Some(&bytes[..]), None),
+                PostBody::Blob(blob) => (None, Some(&blob.hash()[..])),
+            };
+            tx.execute(
+                "INSERT INTO posts (box, seq, t, message, blob, next) VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    mailbox,
+                    seq,
+                    t,
+                    message,
+                    blob,
+                    post.next.as_ref().map(|(_, next)| &next.as_bytes()[..])
+                ],
+            )?;
+            tx.execute(
+                "UPDATE mailboxes SET head = ?, active = ? WHERE box = ?",
+                params![seq, t, mailbox],
+            )?;
+            if let Some((epoch, hash)) = &post.token {
+                tx.execute(
+                    "UPDATE token_hashes SET used = ? WHERE box = ? AND epoch = ? AND hash = ?",
+                    params![t, mailbox, sql_u64(*epoch), &hash.as_bytes()[..]],
+                )?;
+            }
+            if let Some((epoch, next)) = &post.next {
+                add_token(tx, mailbox, epoch.saturating_add(1), next, t)?;
+            }
+            if let Some(cid) = &post.cid {
+                tx.execute(
+                    "INSERT INTO cids (box, cid, seq, t) VALUES (?, ?, ?, ?)
+                     ON CONFLICT (box, cid) DO UPDATE SET seq = excluded.seq, t = excluded.t",
+                    params![mailbox, cid, seq, t],
+                )?;
+            }
+            let seq = from_sql_u64("seq", seq)?;
+            match &post.room {
+                Some(RoomChange::Commit(group)) => store_room_group(tx, mailbox, group, seq)?,
+                Some(RoomChange::Proposal(message)) => {
+                    // SQLite's || makes text of blobs: append here.
+                    let mut proposals: Vec<u8> = tx.query_row(
+                        "SELECT proposals FROM public_rooms WHERE box = ?",
+                        [mailbox],
+                        |row| row.get(0),
+                    )?;
+                    proposals.extend_from_slice(&encode_proposal(message));
+                    tx.execute(
+                        "UPDATE public_rooms SET proposals = ? WHERE box = ?",
+                        params![proposals, mailbox],
+                    )?;
+                }
+                None => {}
+            }
+            Ok(Posted::Seq(seq))
+        })
+    }
+
+    fn posts(&self, mailbox: &BoxName, after: u64, limit: u64) -> Result<(Vec<StoredPost>, bool)> {
+        self.read(|tx| {
+            let mut select = tx.prepare_cached(
+                "SELECT seq, t, message, blob, next FROM posts
+                 WHERE box = ? AND seq > ? ORDER BY seq LIMIT ?",
+            )?;
+            let rows = select.query_map(
+                params![
+                    &mailbox.as_bytes()[..],
+                    sql_u64(after),
+                    sql_u64(limit.saturating_add(1))
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                },
+            )?;
+            let mut posts = Vec::new();
+            for row in rows {
+                let (seq, t, message, blob, next) = row?;
+                let message = match (message, blob) {
+                    (Some(bytes), _) => PostBody::Inline(bytes),
+                    (None, Some(blob)) => PostBody::Blob(BlobRef::from_hash(fixed("blob", &blob)?)),
+                    (None, None) => {
+                        return Err(StoreError::Corrupt("a post without a message".into()));
+                    }
+                };
+                posts.push(StoredPost {
+                    seq: from_sql_u64("seq", seq)?,
+                    t: timestamp(t)?,
+                    message,
+                    next: next
+                        .map(|next| fixed("next", &next).map(TokenHash::from_bytes))
+                        .transpose()?,
+                });
+            }
+            let more = posts.len() as u64 > limit;
+            posts.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            Ok((posts, more))
+        })
+    }
+
+    fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64> {
+        self.read(|tx| {
+            let bytes: Option<i64> = tx
+                .query_row(
+                    "SELECT bytes FROM mailboxes WHERE box = ?",
+                    [&mailbox.as_bytes()[..]],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            from_sql_u64("bytes", bytes.unwrap_or(0))
+        })
+    }
+
+    fn muted(&self, mailbox: &BoxName, pseudonym: &Pseudonym, now: Timestamp) -> Result<bool> {
+        self.read(|tx| {
+            Ok(tx
+                .query_row(
+                    "SELECT 1 FROM mutes WHERE box = ? AND pseudonym = ? AND until > ?",
+                    params![
+                        &mailbox.as_bytes()[..],
+                        &pseudonym.as_bytes()[..],
+                        millis(now)
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        })
+    }
+
+    fn mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp) -> Result<bool> {
+        self.write(|tx| {
+            let mailbox = &mailbox.as_bytes()[..];
+            let exists = tx
+                .query_row("SELECT 1 FROM mailboxes WHERE box = ?", [mailbox], |_| {
+                    Ok(())
+                })
+                .optional()?
+                .is_some();
+            if !exists {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO mutes (box, pseudonym, until) VALUES (?, ?, ?)
+                 ON CONFLICT (box, pseudonym) DO UPDATE SET until = excluded.until",
+                params![mailbox, &pseudonym.as_bytes()[..], millis(until)],
+            )?;
+            Ok(true)
+        })
+    }
+
+    fn unmute(&self, mailbox: &BoxName, pseudonym: &Pseudonym) -> Result<bool> {
+        self.write(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM mutes WHERE box = ? AND pseudonym = ?",
+                params![&mailbox.as_bytes()[..], &pseudonym.as_bytes()[..]],
+            )? > 0)
+        })
+    }
+
+    fn room_group(&self, mailbox: &BoxName) -> Result<Option<RoomGroup>> {
+        self.read(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT room, epoch, epoch_seq, group_info, tree, proposals
+                     FROM public_rooms WHERE box = ?",
+                    [&mailbox.as_bytes()[..]],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((room, epoch, epoch_seq, group_info, tree, proposals)) = row else {
+                return Ok(None);
+            };
+            Ok(Some(RoomGroup {
+                room: parsed("room", &room)?,
+                epoch: from_sql_u64("epoch", epoch)?,
+                epoch_seq: from_sql_u64("epoch seq", epoch_seq)?,
+                group_info,
+                tree,
+                proposals: decode_proposals(&proposals)?,
+            }))
+        })
+    }
+
+    fn room_member(&self, mailbox: &BoxName, uid: &Uid) -> Result<Option<Role>> {
+        self.read(|tx| {
+            let role: Option<String> = tx
+                .query_row(
+                    "SELECT role FROM room_members WHERE box = ? AND uid = ?",
+                    params![&mailbox.as_bytes()[..], uid.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            role.map(|role| parsed("role", &role)).transpose()
+        })
+    }
+
     fn rooms_with_member(&self, uid: &Uid) -> Result<Vec<BoxName>> {
         self.read(|tx| {
             let mut select =
@@ -237,8 +702,7 @@ impl MailboxStore for SqliteStore {
         })
     }
 
-    // What the misc and admin areas read and change (SV5). TODO(SV3):
-    // reconcile with the mailbox area's own methods when they meet.
+    // What the misc and admin areas read (SV5).
 
     fn public_rooms(
         &self,
@@ -322,15 +786,6 @@ impl MailboxStore for SqliteStore {
         })
     }
 
-    fn drop_mailbox(&self, mailbox: &BoxName) -> Result<bool> {
-        self.write(|tx| {
-            Ok(tx.execute(
-                "DELETE FROM mailboxes WHERE box = ?",
-                [&mailbox.as_bytes()[..]],
-            )? > 0)
-        })
-    }
-
     fn set_mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp) -> Result<bool> {
         self.write(|tx| {
             let exists = tx
@@ -363,6 +818,58 @@ impl MailboxStore for SqliteStore {
             )? > 0)
         })
     }
+
+    fn drop_mailbox(&self, mailbox: &BoxName) -> Result<bool> {
+        self.write(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM mailboxes WHERE box = ?",
+                [&mailbox.as_bytes()[..]],
+            )? > 0)
+        })
+    }
+
+    fn expire(&self, now: Timestamp, retention: Duration) -> Result<Expired> {
+        self.write(|tx| {
+            let before = ms_before(now, retention);
+            // Oldest first in each mailbox, stopping at its first post that
+            // is not old enough, even if a later one is older (7.5).
+            let posts = tx.execute(
+                "DELETE FROM posts WHERE t < ?1 AND seq < coalesce(
+                     (SELECT min(q.seq) FROM posts q WHERE q.box = posts.box AND q.t >= ?1),
+                     9223372036854775807)",
+                [before],
+            )?;
+            let cids = tx.execute(
+                "DELETE FROM cids WHERE t < ?",
+                [ms_before(now, CID_LIFETIME)],
+            )?;
+            let token_hashes = tx.execute(
+                "DELETE FROM token_hashes WHERE (box, epoch) IN (
+                     SELECT box, epoch FROM token_hashes GROUP BY box, epoch
+                     HAVING max(max(added, coalesce(used, 0))) < ?)",
+                [before],
+            )?;
+            let mutes = tx.execute("DELETE FROM mutes WHERE until <= ?", [millis(now)])?;
+            Ok(Expired {
+                posts,
+                cids,
+                token_hashes,
+                mutes,
+            })
+        })
+    }
+
+    fn idle_mailboxes(&self, before: Timestamp) -> Result<Vec<BoxName>> {
+        self.read(|tx| {
+            let mut select = tx.prepare_cached(
+                "SELECT box FROM mailboxes m WHERE active < ?
+                 AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.box = m.box) ORDER BY box",
+            )?;
+            let rows = select.query_map([millis(before)], |row| row.get::<_, Vec<u8>>(0))?;
+            rows.map(|row| Ok(BoxName::from_bytes(fixed("box", &row?)?)))
+                .collect()
+        })
+    }
 }
 
 /// Reads a row of `room, box, members, topic, guests, epoch` from
@@ -383,10 +890,56 @@ fn public_room(row: &rusqlite::Row<'_>) -> Result<PublicRoomRecord> {
 
 #[cfg(test)]
 mod tests {
-    use risala_proto::mls::TokenHash;
-    use risala_proto::time::Timestamp;
+    use risala_proto::types::GuestAccess;
 
     use super::*;
+
+    const T0: &str = "2026-11-09T00:00:00.000Z";
+
+    fn t(secs: u64) -> Timestamp {
+        T0.parse::<Timestamp>()
+            .unwrap()
+            .checked_add(Duration::from_secs(secs))
+            .unwrap()
+    }
+
+    fn hash(n: u8) -> TokenHash {
+        TokenHash::from_bytes([n; 48])
+    }
+
+    /// A post of `mailbox` at `t` seconds, of `size` bytes.
+    fn post(mailbox: BoxName, secs: u64, size: usize) -> NewPost {
+        NewPost {
+            mailbox,
+            t: t(secs),
+            message: PostBody::Inline(vec![7; size]),
+            token: None,
+            next: None,
+            cid: None,
+            quota: u64::MAX,
+            room: None,
+        }
+    }
+
+    fn seqs(store: &SqliteStore, mailbox: &BoxName) -> Vec<u64> {
+        let (posts, more) = store.posts(mailbox, 0, 1000).unwrap();
+        assert!(!more);
+        posts.iter().map(|p| p.seq).collect()
+    }
+
+    fn set(store: &SqliteStore, mailbox: &BoxName, epoch: u64) -> Vec<u8> {
+        let conn = store.raw();
+        let mut select = conn
+            .prepare("SELECT hash FROM token_hashes WHERE box = ? AND epoch = ? ORDER BY rowid")
+            .unwrap();
+        select
+            .query_map(params![&mailbox.as_bytes()[..], epoch as i64], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .unwrap()
+            .map(|h| h.unwrap()[0])
+            .collect()
+    }
 
     fn new_mailbox(n: u8) -> NewMailbox {
         NewMailbox {
@@ -506,5 +1059,312 @@ mod tests {
         );
         let room = store.mailbox(&new_mailbox(1).mailbox).unwrap().unwrap();
         assert_eq!(room.room.unwrap().as_str(), "#room1");
+    }
+
+    /// Posts get the next seq; a commit's next goes into the next epoch's
+    /// set and stays with the post; the token is marked used; a cid finds
+    /// its post (5.2, 7.2, 7.6).
+    #[test]
+    fn posts_and_what_comes_with_them() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        assert!(store.has_token(&m.mailbox, 0, &m.token_hash).unwrap());
+        assert!(!store.has_token(&m.mailbox, 0, &hash(2)).unwrap());
+        assert!(!store.has_token(&m.mailbox, 1, &m.token_hash).unwrap());
+
+        let mut first = post(m.mailbox, 1, 10);
+        first.token = Some((0, m.token_hash));
+        first.next = Some((0, hash(5)));
+        first.cid = Some("c".repeat(16));
+        assert_eq!(store.add_post(&first).unwrap(), Posted::Seq(1));
+        assert!(store.has_token(&m.mailbox, 1, &hash(5)).unwrap());
+        let used: Option<i64> = store
+            .raw()
+            .query_row("SELECT used FROM token_hashes WHERE epoch = 0", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(used, Some(millis(t(1))));
+        assert_eq!(
+            store.add_post(&post(m.mailbox, 2, 20)).unwrap(),
+            Posted::Seq(2)
+        );
+        let record = store.mailbox(&m.mailbox).unwrap().unwrap();
+        assert_eq!(record.head, 2);
+        assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 30);
+
+        let (posts, more) = store.posts(&m.mailbox, 0, 1).unwrap();
+        assert!(more);
+        assert_eq!(posts[0].seq, 1);
+        assert_eq!(posts[0].t, t(1));
+        assert_eq!(posts[0].next, Some(hash(5)));
+        assert_eq!(posts[0].message, PostBody::Inline(vec![7; 10]));
+        let (posts, more) = store.posts(&m.mailbox, 1, 50).unwrap();
+        assert!(!more);
+        assert_eq!((posts.len(), posts[0].next), (1, None));
+        assert!(store.posts(&m.mailbox, 2, 50).unwrap().0.is_empty());
+
+        assert_eq!(
+            store.cid_post(&m.mailbox, &"c".repeat(16), t(0)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store.cid_post(&m.mailbox, &"c".repeat(16), t(2)).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.cid_post(&m.mailbox, &"d".repeat(16), t(0)).unwrap(),
+            None
+        );
+
+        // A blob post counts nothing against the quota here (12.12).
+        let mut blob = post(m.mailbox, 3, 0);
+        blob.message = PostBody::Blob(BlobRef::from_hash([4; 48]));
+        assert_eq!(store.add_post(&blob).unwrap(), Posted::Seq(3));
+        assert_eq!(
+            store.posts(&m.mailbox, 2, 1).unwrap().0[0].message,
+            blob.message
+        );
+        assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 30);
+
+        assert_eq!(
+            store
+                .add_post(&post(BoxName::from_bytes([9; 16]), 1, 1))
+                .unwrap(),
+            Posted::NoMailbox
+        );
+    }
+
+    /// A full set drops the hash added first that no post has used, then
+    /// the one a post used least recently; a hash it holds changes nothing
+    /// (7.2).
+    #[test]
+    fn token_sets_are_bounded() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(200);
+        store.create_mailbox(&m).unwrap();
+        for n in 0..63 {
+            store
+                .add_token(&m.mailbox, 0, &hash(n), t(u64::from(n)))
+                .unwrap();
+        }
+        // The set has 64 hashes, the mailbox's own first.
+        assert_eq!(set(&store, &m.mailbox, 0).len(), 64);
+        store.add_token(&m.mailbox, 0, &hash(5), t(100)).unwrap();
+        assert_eq!(set(&store, &m.mailbox, 0).len(), 64);
+        // Posts use hashes 0 and 1, 1 before 0.
+        for (n, secs) in [(1, 200), (0, 201)] {
+            let mut p = post(m.mailbox, secs, 1);
+            p.token = Some((0, hash(n)));
+            store.add_post(&p).unwrap();
+        }
+        // New hashes push out the unused ones, oldest first: the
+        // mailbox's own, then 2, 3, ...
+        store.add_token(&m.mailbox, 0, &hash(100), t(300)).unwrap();
+        let held = set(&store, &m.mailbox, 0);
+        assert_eq!(held.len(), 64);
+        assert!(!held.contains(&200) && held.contains(&1) && held.contains(&2));
+        store.add_token(&m.mailbox, 0, &hash(102), t(301)).unwrap();
+        let held = set(&store, &m.mailbox, 0);
+        assert!(!held.contains(&2) && held.contains(&0) && held.contains(&3));
+        // Once every hash has been used, the least recently used goes.
+        for n in held.clone() {
+            if n != 0 && n != 1 {
+                let mut p = post(m.mailbox, 400, 1);
+                p.token = Some((0, hash(n)));
+                store.add_post(&p).unwrap();
+            }
+        }
+        store.add_token(&m.mailbox, 0, &hash(101), t(500)).unwrap();
+        let held = set(&store, &m.mailbox, 0);
+        assert!(!held.contains(&1) && held.contains(&0) && held.contains(&101));
+    }
+
+    /// A mailbox keeps the 256 sets used most recently (7.2).
+    #[test]
+    fn a_mailbox_keeps_256_sets() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        for epoch in 1..256 {
+            store
+                .add_token(&m.mailbox, epoch, &hash(2), t(epoch))
+                .unwrap();
+        }
+        // Epoch 0's set is the oldest, but a post uses it now.
+        let mut p = post(m.mailbox, 1000, 1);
+        p.token = Some((0, m.token_hash));
+        store.add_post(&p).unwrap();
+        store.add_token(&m.mailbox, 256, &hash(2), t(1001)).unwrap();
+        assert!(store.has_token(&m.mailbox, 0, &m.token_hash).unwrap());
+        assert!(!store.has_token(&m.mailbox, 1, &hash(2)).unwrap());
+        assert!(store.has_token(&m.mailbox, 2, &hash(2)).unwrap());
+        assert!(store.has_token(&m.mailbox, 256, &hash(2)).unwrap());
+    }
+
+    /// Over its quota, a mailbox's oldest posts expire early; a post larger
+    /// than the quota is refused (7.5).
+    #[test]
+    fn quotas() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        for secs in 0..4 {
+            let mut p = post(m.mailbox, secs, 30);
+            p.quota = 100;
+            store.add_post(&p).unwrap();
+        }
+        assert_eq!(seqs(&store, &m.mailbox), [2, 3, 4]);
+        assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 90);
+        let mut big = post(m.mailbox, 5, 101);
+        big.quota = 100;
+        assert_eq!(store.add_post(&big).unwrap(), Posted::OverQuota);
+        big.message = PostBody::Inline(vec![1; 100]);
+        assert_eq!(store.add_post(&big).unwrap(), Posted::Seq(5));
+        assert_eq!(seqs(&store, &m.mailbox), [5]);
+    }
+
+    /// Retention expires posts oldest first, stopping at the first that is
+    /// not old enough; cids last 24 hours; token sets go once unused for a
+    /// retention period; mutes end (6.4, 7.2, 7.5, 7.6).
+    #[test]
+    fn expiry() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        let day = 24 * 60 * 60;
+        // Seq 2 has an earlier time than seq 1, as a clock that went back
+        // would give it.
+        for secs in [10, 5, 20, 3 * day] {
+            let mut p = post(m.mailbox, secs, 1);
+            p.cid = Some(format!("{secs:016}"));
+            store.add_post(&p).unwrap();
+        }
+        store
+            .add_token(&m.mailbox, 1, &hash(3), t(2 * day))
+            .unwrap();
+        let pseudonym = Pseudonym::from_bytes([1; 16]);
+        assert!(store.mute(&m.mailbox, &pseudonym, t(day)).unwrap());
+        assert!(store.muted(&m.mailbox, &pseudonym, t(0)).unwrap());
+
+        let retention = Duration::from_secs(day);
+        let expired = store.expire(t(day + 15), retention).unwrap();
+        assert_eq!(seqs(&store, &m.mailbox), [3, 4]);
+        assert_eq!(expired.posts, 2);
+        assert_eq!(expired.cids, 2);
+        // Epoch 0's set was added at the mailbox's creation, and used by no
+        // post: it is gone. Epoch 1's is newer.
+        assert_eq!(expired.token_hashes, 1);
+        assert_eq!(expired.mutes, 1);
+        assert!(!store.muted(&m.mailbox, &pseudonym, t(0)).unwrap());
+        assert!(!store.has_token(&m.mailbox, 0, &m.token_hash).unwrap());
+        assert!(store.has_token(&m.mailbox, 1, &hash(3)).unwrap());
+
+        // A mailbox with no posts, idle since before the time asked about,
+        // may end (7.5).
+        assert!(store.idle_mailboxes(t(10 * day)).unwrap().is_empty());
+        store.expire(t(10 * day), retention).unwrap();
+        assert!(seqs(&store, &m.mailbox).is_empty());
+        assert!(store.idle_mailboxes(t(3 * day)).unwrap().is_empty());
+        assert_eq!(store.idle_mailboxes(t(3 * day + 1)).unwrap(), [m.mailbox]);
+        assert!(store.drop_mailbox(&m.mailbox).unwrap());
+        assert!(!store.drop_mailbox(&m.mailbox).unwrap());
+        assert_eq!(store.mailbox(&m.mailbox).unwrap(), None);
+        assert!(!store.mute(&m.mailbox, &pseudonym, t(day)).unwrap());
+        assert!(!store.unmute(&m.mailbox, &pseudonym).unwrap());
+    }
+
+    /// A public room: its group's state, members and pending proposals,
+    /// replaced by each commit; its name is taken until it is dropped
+    /// (5.2, 6.1, 12.6).
+    #[test]
+    fn public_rooms() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let alice: Uid = "alice@example.org".parse().unwrap();
+        let sam: Uid = "~sam".parse().unwrap();
+        let group = |epoch: u64, members: Vec<(Uid, Role)>| RoomUpdate {
+            epoch,
+            group_info: vec![epoch as u8; 3],
+            tree: vec![epoch as u8; 5],
+            members,
+            topic: "hello\\sthere".into(),
+            guests: GuestAccess::Read,
+        };
+        let room = NewRoom {
+            room: "#general".parse().unwrap(),
+            creator: alice.clone(),
+            group: group(0, vec![(alice.clone(), Role::Owner)]),
+        };
+        let m = new_mailbox(1);
+        assert_eq!(store.create_room(&m, &room).unwrap(), Created::Created);
+        assert_eq!(
+            store.create_room(&new_mailbox(2), &room).unwrap(),
+            Created::Taken
+        );
+        assert_eq!(store.mailbox(&new_mailbox(2).mailbox).unwrap(), None);
+        let record = store.mailbox(&m.mailbox).unwrap().unwrap();
+        assert_eq!(record.room, Some(room.room.clone()));
+        let state = store.room_group(&m.mailbox).unwrap().unwrap();
+        assert_eq!(
+            state,
+            RoomGroup {
+                room: room.room.clone(),
+                epoch: 0,
+                epoch_seq: 0,
+                group_info: vec![0; 3],
+                tree: vec![0; 5],
+                proposals: vec![],
+            }
+        );
+        assert_eq!(
+            store.room_member(&m.mailbox, &alice).unwrap(),
+            Some(Role::Owner)
+        );
+        assert_eq!(store.room_member(&m.mailbox, &sam).unwrap(), None);
+        assert_eq!(store.room_group(&new_mailbox(2).mailbox).unwrap(), None);
+
+        for message in [vec![1, 2, 3], vec![], vec![4; 300]] {
+            let mut p = post(m.mailbox, 1, 1);
+            p.room = Some(RoomChange::Proposal(message));
+            store.add_post(&p).unwrap();
+        }
+        let state = store.room_group(&m.mailbox).unwrap().unwrap();
+        assert_eq!(state.proposals, [vec![1, 2, 3], vec![], vec![4; 300]]);
+
+        let mut commit = post(m.mailbox, 2, 1);
+        commit.room = Some(RoomChange::Commit(group(
+            1,
+            vec![(alice.clone(), Role::Owner), (sam.clone(), Role::Member)],
+        )));
+        assert_eq!(store.add_post(&commit).unwrap(), Posted::Seq(4));
+        let state = store.room_group(&m.mailbox).unwrap().unwrap();
+        assert_eq!((state.epoch, state.epoch_seq), (1, 4));
+        assert_eq!(state.tree, vec![1; 5]);
+        assert!(state.proposals.is_empty());
+        assert_eq!(
+            store.room_member(&m.mailbox, &sam).unwrap(),
+            Some(Role::Member)
+        );
+        assert_eq!(store.rooms_with_member(&sam).unwrap(), [m.mailbox]);
+        let (members, topic, guests): (i64, String, String) = store
+            .raw()
+            .query_row("SELECT members, topic, guests FROM public_rooms", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (members, topic.as_str(), guests.as_str()),
+            (2, "hello\\sthere", "read")
+        );
+
+        // Dropping it frees the name, but not the box or group id.
+        assert!(store.drop_mailbox(&m.mailbox).unwrap());
+        assert!(store.rooms_with_member(&sam).unwrap().is_empty());
+        assert_eq!(store.create_room(&m, &room).unwrap(), Created::Taken);
+        assert_eq!(
+            store.create_room(&new_mailbox(3), &room).unwrap(),
+            Created::Created
+        );
     }
 }
