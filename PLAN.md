@@ -757,6 +757,16 @@ Open:
       conversation existing.
     - DELETE of an event that is not a message is `not-found`.
 
+37. **Found by the M4 client review** (librisala and the CLI only),
+    confirmed with the user on 2026-11-08:
+    - Item 34 applies to guests too after KICK, BAN, their own PART or
+      DROP. A guest's messages wait only when its room went missing
+      because its session ended, since the client then rejoins.
+    - librisala exposes `Account::is_operator()` from `op=yes`, and the
+      account's own role in each cached conversation. Roles are an enum
+      across the API.
+    - `risala admin drop` takes the room twice, like `admin unregister`.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
