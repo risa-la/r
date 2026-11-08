@@ -40,8 +40,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use librisala::client::{
     Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, Encryption,
-    EventKind, KeyErrorKind, KeyInfo, Label, Message, Notice, OutboxStatus, Presence, RefusedKind,
-    TimelineDiff, TrustInfo,
+    EventKind, KeyErrorKind, KeyInfo, Label, Message, Notice, OutboxEntry, OutboxStatus, Presence,
+    RefusedKind, TimelineDiff, TrustInfo,
 };
 use librisala::conn::keys::FileKeyStore;
 use librisala::store::{DatabaseKey, Store, StoreError};
@@ -722,13 +722,19 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             if let Err(e) = connected {
                 return queued_offline(e, "sent");
             }
-            let entry = within(account.wait_outbox(entry.id)).await?;
+            let entry = within(sent_or_held(&account, entry.id)).await?;
             match entry.status {
                 OutboxStatus::Sent { seq } => {
                     println!("sent to {} as {seq}", conv.name());
                     Ok(())
                 }
                 OutboxStatus::Failed { reason, .. } => fail(format!("not sent: {reason}")),
+                // 12.6: nobody could read it yet.
+                OutboxStatus::Held => fail(format!(
+                    "held until {} signs in on a device that can read it; \
+                     run risala sync later to send it",
+                    conv.name()
+                )),
                 _ => fail("queued; it will be sent on the next connection"),
             }
         }
@@ -754,6 +760,9 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                     OutboxStatus::Sent { .. } => {}
                     OutboxStatus::Failed { reason, .. } => {
                         println!("(not sent: {reason}) {what}")
+                    }
+                    OutboxStatus::Held => {
+                        println!("(held until {} signs in) {what}", conv.name())
                     }
                     _ => println!("(waiting to be sent) {what}"),
                 }
@@ -1242,6 +1251,31 @@ async fn identity_online(ctx: &Ctx, server: &str) -> Res<Account> {
 }
 
 /// Waits for a server, at most [`WAIT`].
+/// Waits until an outbox entry is sent or has failed, or is held until
+/// the other side of a direct conversation has a device that can read it
+/// (12.6), which may take days.
+async fn sent_or_held(account: &Account, id: i64) -> Result<OutboxEntry, ClientError> {
+    let events = account.subscribe();
+    loop {
+        let Some(entry) = account.outbox()?.into_iter().find(|e| e.id == id) else {
+            return Err(ClientError::Invalid(format!("outbox entry {id}")));
+        };
+        if entry.status.is_final() || entry.status == OutboxStatus::Held {
+            return Ok(entry);
+        }
+        loop {
+            use librisala::client::AccountEvent;
+            match events.next().await {
+                Some(AccountEvent::Outbox { entry }) if entry.id == id => break,
+                Some(AccountEvent::OutboxRemoved { id: gone }) if gone == id => break,
+                Some(AccountEvent::Lagged | AccountEvent::CacheChanged) => break,
+                Some(_) => {}
+                None => return Err(ClientError::NotConnected),
+            }
+        }
+    }
+}
+
 async fn within<T>(f: impl Future<Output = Result<T, ClientError>>) -> Res<T> {
     match tokio::time::timeout(WAIT, f).await {
         Ok(r) => r.or_else(explain),
@@ -1535,11 +1569,16 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
                     Some(AccountEvent::ReportResolved { id }) => {
                         eprintln!("risala: report {id} was resolved");
                     }
-                    Some(AccountEvent::Outbox { entry }) => {
-                        if let OutboxStatus::Failed { reason, .. } = entry.status {
+                    Some(AccountEvent::Outbox { entry }) => match entry.status {
+                        OutboxStatus::Failed { reason, .. } => {
                             eprintln!("risala: not sent ({reason}): {}", entry.text);
                         }
-                    }
+                        OutboxStatus::Held => eprintln!(
+                            "risala: held until {} signs in on a device that can read it: {}",
+                            entry.conversation, entry.text
+                        ),
+                        _ => {}
+                    },
                     // 8.1. Standard input is read a line at a time, so the
                     // terminal cannot tell when the user types: nothing is
                     // sent for that.

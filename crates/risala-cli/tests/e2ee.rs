@@ -503,3 +503,44 @@ async fn a_new_recovery_key_replaces_the_old_one() {
     assert!(!out.status.success(), "{}", stdout(&out));
     let _ = bob;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_waits_until_the_other_side_has_a_device() {
+    let net = Net::start(&[]).await;
+    let alice = net.registered("alice").await;
+    let addr = net.addr.clone();
+    // Bob registers elsewhere, and no device of his has KeyPackages yet.
+    let (bob_id, _raw) = net.server.register("bob").await;
+
+    // Alice's message is held: Bob could never read it (12.6).
+    let out = net
+        .run(&alice, &["send", &addr, "bob@chat.test", "hello", "bob"])
+        .await;
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("held until bob@chat.test signs in on a device that can read it"),
+        "{}",
+        stderr(&out)
+    );
+    let log = net.ok(&alice, &["log", &addr, "bob@chat.test"]).await;
+    assert!(
+        log.contains("(held until bob@chat.test signs in) hello bob"),
+        "{log}"
+    );
+
+    // Bob signs in on a device. Alice's next connection sends the message,
+    // and Bob reads it.
+    let bob = net.device().await;
+    let pem = bob.path().join("bob.pem");
+    std::fs::write(&pem, bob_id.key().to_pkcs8_pem()).unwrap();
+    let pem = pem.to_str().unwrap().to_owned();
+    net.ok(&bob, &["login", &addr, "bob@chat.test", "--key", &pem])
+        .await;
+    net.ok(&alice, &["sync", &addr]).await;
+    let log = net
+        .log_until(&bob, "alice@chat.test", &["<alice@chat.test> hello bob"])
+        .await;
+    assert!(!log.contains("held"), "{log}");
+    let log = net.ok(&alice, &["log", &addr, "bob@chat.test"]).await;
+    assert!(!log.contains("held until"), "{log}");
+}
