@@ -18,7 +18,7 @@ pub struct NewReport {
     /// The id (5.1) of the reported event's conversation, which may since
     /// have been dropped (10.4).
     pub conv_id: Id,
-    /// The room's name, or `None` in a direct conversation (M5a).
+    /// The room's name, or `None` in a direct conversation.
     pub room: Option<Room>,
     /// Who made the report.
     pub reporter: Uid,

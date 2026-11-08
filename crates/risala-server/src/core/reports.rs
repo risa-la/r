@@ -1,6 +1,11 @@
-//! Reports (5.8): REPORT, REPORTS, RESOLVE and `ADMIN REPORTS`, and the
-//! ADMIN commands about rooms (10.4): `ADMIN ROOMS` and `ADMIN DROP`.
-//! REPORTENC and reports in direct conversations wait for M5a.
+//! Reports (5.8): REPORT, REPORTENC, REPORTS, RESOLVE and
+//! `ADMIN REPORTS`, and the ADMIN commands about rooms (10.4):
+//! `ADMIN ROOMS` and `ADMIN DROP`.
+//!
+//! REPORTENC reports an ENC event, whose content the server cannot read:
+//! the reporter reveals its franking key and content, which the server
+//! checks against the event's `frank` tag. A report keeps them, and
+//! reviewers receive the ENC event without its payload (5.8, 12.8).
 //!
 //! # Reviewers
 //!
@@ -87,7 +92,7 @@ fn operators_only() -> Fail {
 
 /// The two lines of a report (5.8): the REPORT line, with `from` if
 /// `with_from`, and the copy of the reported event. Both carry the
-/// `report` tag, and the `id` tag with the conversation's id. A room is named by its name; a direct conversation (M5a)
+/// `report` tag, and the `id` tag with the conversation's id. A room is named by its name; a direct conversation
 /// by the author, as the reporter sees it.
 fn report_lines(
     id: &Id,

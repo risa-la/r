@@ -377,7 +377,7 @@ impl Inner {
                 AdminCommand::Reports | AdminCommand::Rooms(_) | AdminCommand::Drop { .. },
             )) => self.reports(uid, reply, command).await,
             Command::Admin(command) => self.admin(uid, reply, command).await,
-            // M5a: what the server keeps of encrypted conversations without
+            // What the server keeps of encrypted conversations without
             // reading it.
             command @ (Command::KeyPkg(_) | Command::Welcome(_) | Command::Backup(_)) => {
                 self.e2ee(uid, reply, command).await
@@ -386,8 +386,7 @@ impl Inner {
             | Command::Commit { .. }
             | Command::GroupInfo { .. }
             | Command::Enc { .. }) => self.encrypted(uid, reply, command).await,
-            // Later milestones, including `HISTORY only=commit` and the
-            // rest of Section 12.
+            // Later milestones: PUSH (M8).
             _ => Err(not_supported()),
         }
     }

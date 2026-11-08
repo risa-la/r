@@ -744,8 +744,7 @@ mod tests {
     fn welcomes_name_a_direct_conversation_by_the_other_participant() {
         let s = SqliteStore::open_in_memory().unwrap();
         let (alice, bob) = (uid("alice@example.org"), uid("bob@example.net"));
-        // Direct conversations have no store methods yet (M5a), so these
-        // are made by hand.
+        // Made by hand, without groups.
         let conn = s.conn();
         let make = |id: &str, a: &Uid, b: &Uid| {
             conn.execute(

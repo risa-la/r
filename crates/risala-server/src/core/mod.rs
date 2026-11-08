@@ -42,11 +42,15 @@
 //! # Encrypted conversations
 //!
 //! What the server keeps of them without reading it, KeyPackages (12.4),
-//! pending Welcomes (12.7) and key backups (12.10), is in `e2ee`.
+//! pending Welcomes (12.7) and key backups (12.10), is in `e2ee`. Their
+//! groups, INIT, COMMIT, GROUPINFO and ENC are in `encrypted`, on top of
+//! the checks that need MLS alone, in `mls`. The groups themselves are
+//! kept in the store, each as OpenMLS's `PublicGroup` (`store::groups`).
+//! Direct conversations (5.1) are always encrypted: INIT starts them.
 //!
 //! # Conversations and ordering
 //!
-//! Every conversation, a room now and a direct conversation from M5a, has
+//! Every conversation, a room or a direct conversation, has
 //! an entry with an async lock (`state::ConvEntry`). Its members are kept
 //! there, by conversation id (5.1), so a room that is dropped and created
 //! again starts with nobody in it. Appending an event happens under the
@@ -563,7 +567,7 @@ impl Hub {
     /// domain. Guests never block and are never blocked.
     ///
     /// Blocks have no effect in rooms on the server. This is the hook for
-    /// what they do: in direct conversations (M5a), and for push (M8, 9.2).
+    /// what they do: in direct conversations, and for push (M8, 9.2).
     pub async fn is_blocked(&self, by: &Uid, uid: &Uid) -> Result<bool, StoreError> {
         self.inner.is_blocked(by, uid).await
     }

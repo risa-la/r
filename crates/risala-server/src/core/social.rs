@@ -366,7 +366,7 @@ impl Inner {
     /// Whether the identity `by` has blocked `uid` (5.7), by identity or by
     /// domain. Guests are never blocked, and never block.
     ///
-    /// Blocks do nothing in rooms. M5a: neither side may send messages or
+    /// Blocks do nothing in rooms. Neither side may send messages or
     /// TYPING in a direct conversation while one has blocked the other,
     /// and the blocked person cannot start one. M8: mentions and replies
     /// from someone blocked are not notable (9.2).
