@@ -1,5 +1,6 @@
 //! Test vectors and edge cases.
 
+mod jit;
 mod listings;
 
 use core::num::NonZeroU64;

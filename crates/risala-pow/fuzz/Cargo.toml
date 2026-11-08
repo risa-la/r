@@ -1,0 +1,27 @@
+[package]
+name = "risala-pow-fuzz"
+description = "cargo-fuzz targets for risala-pow"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+risala-pow = { path = ".." }
+
+# Its own workspace, so the main one (which excludes this directory) never
+# builds it, and it keeps its own Cargo.lock.
+[workspace]
+members = ["."]
+
+# A seed and nonces: the JIT against the interpreter.
+[[bin]]
+name = "jit"
+path = "fuzz_targets/jit.rs"
+test = false
+doc = false
+bench = false

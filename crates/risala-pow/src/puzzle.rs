@@ -4,7 +4,7 @@ use core::num::NonZeroU64;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::hash::{HashWx, SEED_LEN, Scratchpad};
+use crate::hash::{Backend, HashWx, SEED_LEN, Scratchpad};
 
 /// Length of a puzzle challenge in bytes.
 pub const CHALLENGE_LEN: usize = 32;
@@ -16,16 +16,33 @@ pub const CHALLENGE_LEN: usize = 32;
 /// `T = floor((2^64 - 1) / d)`. The puzzle does not stop a
 /// solution being used twice and does not expire; the protocol around it
 /// must do both.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// It also holds the [`Backend`] its functions are made with, a local
+/// choice that is not part of the puzzle: two puzzles that differ only in
+/// it are equal.
+#[derive(Clone, Debug)]
 pub struct Puzzle {
     challenge: [u8; CHALLENGE_LEN],
     nonces_per_function: NonZeroU64,
     difficulty: NonZeroU64,
+    backend: Backend,
 }
+
+impl PartialEq for Puzzle {
+    fn eq(&self, other: &Self) -> bool {
+        self.challenge == other.challenge
+            && self.nonces_per_function == other.nonces_per_function
+            && self.difficulty == other.difficulty
+    }
+}
+
+impl Eq for Puzzle {}
 
 impl Puzzle {
     /// A puzzle with challenge c, n nonces per function and difficulty d.
-    /// The challenge should be random and must not repeat.
+    /// The challenge should be random and must not repeat. Its functions
+    /// are made with [`Backend::Jit`], which falls back to the
+    /// interpreter where there is no JIT.
     pub const fn new(
         challenge: [u8; CHALLENGE_LEN],
         nonces_per_function: NonZeroU64,
@@ -35,7 +52,22 @@ impl Puzzle {
             challenge,
             nonces_per_function,
             difficulty,
+            backend: Backend::Jit,
         }
+    }
+
+    /// The same puzzle, making its functions with `backend`. A server
+    /// that must not map executable memory passes
+    /// [`Backend::Interpreter`].
+    #[must_use]
+    pub const fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// The backend asked for. [`HashWx::backend`] tells which runs.
+    pub const fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// The challenge c.
@@ -73,7 +105,7 @@ impl Puzzle {
 
     /// The hash function of block b.
     pub fn function(&self, block: u64) -> HashWx {
-        HashWx::new(&self.seed(block))
+        HashWx::with_backend(&self.seed(block), self.backend)
     }
 
     /// The hash of a nonce under this puzzle: it makes the function for

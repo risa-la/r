@@ -102,7 +102,15 @@ proofs that finish in under a minute are kept. CI runs them in the
 `risala-pow` has proofs in `crates/risala-pow/src/proofs.rs`. They cover
 every seed, not just small ones: every program is well formed, no
 instruction can panic, scratchpad reads and writes stay in bounds, and
-the puzzle's block arithmetic cannot overflow.
+the puzzle's block arithmetic cannot overflow. Its x86-64 JIT has more,
+in `crates/risala-pow/src/jit/x86_64/proofs.rs`, for every program, not
+only those a seed can make: the code of each program fits its size
+bound, so the encoder never fails or writes past its buffer; its
+branches go to its own start and end; every scratchpad access the
+encoder emits is masked just before, and the masks keep it in range;
+and the loop test decides as the interpreter does. The JIT's encodings
+are checked against an independent decoder in its unit tests, and
+`crates/risala-pow/fuzz` fuzzes it against the interpreter.
 
 Kani is not in nixpkgs. Its release bundle and the nightly toolchain it
 downloads are ordinary Linux binaries, which run on NixOS through

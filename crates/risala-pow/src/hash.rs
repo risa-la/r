@@ -2,6 +2,7 @@
 
 use alloc::boxed::Box;
 
+use crate::jit::Jit;
 use crate::program::{PROGRAM_COUNT, Program, build_programs};
 use crate::stream::{WordStream, key_words, sip_round};
 
@@ -24,18 +25,52 @@ pub(crate) const ROUNDS: usize = 4;
 /// The loop budget C at the start of each round.
 pub(crate) const LOOP_BUDGET: u32 = 32;
 
+/// What runs a function's programs.
+///
+/// Both give the same hash for every seed and nonce. The JIT is about ten
+/// times faster, and runs only on x86-64 Linux and macOS, with the `jit`
+/// feature (on by default), where the system allows executable memory.
+/// Elsewhere the interpreter runs, whatever is asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Backend {
+    /// The portable interpreter, which needs no executable memory.
+    Interpreter,
+    /// Machine code compiled for the function, where available; else the
+    /// interpreter. The default.
+    #[default]
+    Jit,
+}
+
+impl Backend {
+    /// The backend [`HashWx::new`] uses here: [`Backend::Jit`] if this
+    /// build has a JIT for this platform and the system allows executable
+    /// memory, else [`Backend::Interpreter`]. The first call may map and
+    /// unmap a page to find out; later calls only read a flag.
+    pub fn best_available() -> Backend {
+        if crate::jit::available() {
+            Backend::Jit
+        } else {
+            Backend::Interpreter
+        }
+    }
+}
+
 /// A hash function made from a 32-byte seed: the 32 programs and the
-/// hashing key.
+/// hashing key, and the programs compiled to machine code if the JIT is
+/// used.
 ///
 /// Make it once per seed and hash many nonces with it. It
 /// never changes after it is
 /// made, so it can be shared between threads; each thread brings its own
-/// [`Scratchpad`].
+/// [`Scratchpad`]. Clones share the compiled code.
 #[derive(Clone, Debug)]
 pub struct HashWx {
     programs: [Program; PROGRAM_COUNT],
     /// The hashing key `seed[16..32]`, as two words.
     key: [u64; 2],
+    /// The compiled programs, if the JIT is used.
+    jit: Option<Jit>,
 }
 
 /// The 16392-byte scratchpad M of one hash in flight.
@@ -83,14 +118,39 @@ impl core::fmt::Debug for Scratchpad {
 }
 
 impl HashWx {
-    /// Makes the hash function for a seed. Every seed works.
+    /// Makes the hash function for a seed, compiled by the JIT where
+    /// available. Every seed works.
     pub fn new(seed: &[u8; SEED_LEN]) -> Self {
+        Self::with_backend(seed, Backend::Jit)
+    }
+
+    /// Makes the hash function for a seed with the given backend.
+    /// [`Backend::Interpreter`] never compiles; [`Backend::Jit`] compiles
+    /// where it can and falls back to the interpreter where it cannot,
+    /// such as where the system refuses executable memory.
+    /// [`HashWx::backend`] tells which runs.
+    pub fn with_backend(seed: &[u8; SEED_LEN], backend: Backend) -> Self {
         let (program_key, hash_key) = seed.split_at(16);
         let program_key: &[u8; 16] = program_key.try_into().expect("16 bytes");
         let hash_key: &[u8; 16] = hash_key.try_into().expect("16 bytes");
+        let programs = build_programs(key_words(program_key));
+        let jit = match backend {
+            Backend::Jit => crate::jit::compile(&programs),
+            Backend::Interpreter => None,
+        };
         HashWx {
-            programs: build_programs(key_words(program_key)),
+            programs,
             key: key_words(hash_key),
+            jit,
+        }
+    }
+
+    /// The backend that runs this function.
+    pub fn backend(&self) -> Backend {
+        if self.jit.is_some() {
+            Backend::Jit
+        } else {
+            Backend::Interpreter
         }
     }
 
@@ -106,10 +166,29 @@ impl HashWx {
     /// function can be shared by several threads, each with its own
     /// scratchpad, and so that hashing does not allocate.
     pub fn hash(&self, scratchpad: &mut Scratchpad, nonce: u64) -> u64 {
+        if let Some(jit) = &self.jit {
+            let mut regs = start_registers(self.key, nonce, &mut scratchpad.mem);
+            jit.run(&mut regs, &mut scratchpad.mem);
+            return finish(&regs);
+        }
         let mut m = Machine::start(self.key, nonce, &mut scratchpad.mem);
         m.write_phase(&self.programs);
         m.read_phase(&self.programs);
         m.finish()
+    }
+
+    /// R0 to R8 after the read phase, from the compiled code, or `None`
+    /// if this function is interpreted.
+    #[cfg(test)]
+    pub(crate) fn jit_registers(
+        &self,
+        scratchpad: &mut Scratchpad,
+        nonce: u64,
+    ) -> Option<[u64; 9]> {
+        let jit = self.jit.as_ref()?;
+        let mut regs = start_registers(self.key, nonce, &mut scratchpad.mem);
+        jit.run(&mut regs, &mut scratchpad.mem);
+        Some(regs)
     }
 
     /// Hashes one nonce with a fresh scratchpad. This allocates 16 KiB;
@@ -188,12 +267,7 @@ impl<'a> Machine<'a> {
     /// Sets up the registers from the stream with the
     /// hashing key and the nonce as tweak, then the R8 slot.
     fn start(key: [u64; 2], nonce: u64, mem: &'a mut [u8; SCRATCHPAD_LEN]) -> Self {
-        let mut stream = WordStream::new(key, nonce);
-        let [r0, r1, r2, r3] = stream.next_four();
-        let [r4, r5, r6, r7] = stream.next_four();
-        let r8 = ((r0 ^ r4) & !7) | 3;
-        // The R8 slot MUST be written for every nonce.
-        mem[R8_SLOT..].copy_from_slice(&r8.to_le_bytes());
+        let [r0, r1, r2, r3, r4, r5, r6, r7, r8] = start_registers(key, nonce, mem);
         Machine {
             r: [r0, r1, r2, r3, r4, r5, r6, r7],
             r8,
@@ -231,11 +305,7 @@ impl<'a> Machine<'a> {
     /// The finish: two SipRounds, then the hash.
     fn finish(self) -> u64 {
         let [r0, r1, r2, r3, r4, r5, r6, r7] = self.r;
-        let mut lo = [r0, r1, r2, r3];
-        let mut hi = [r4, r5, r6, r7];
-        sip_round(&mut lo);
-        sip_round(&mut hi);
-        lo[3] ^ hi[3] ^ self.r8
+        finish(&[r0, r1, r2, r3, r4, r5, r6, r7, self.r8])
     }
 
     /// One round: reset C, then run programs 0 to 31 in order.
@@ -309,6 +379,29 @@ impl<'a> Machine<'a> {
             .expect("a + 8 <= SCRATCHPAD_LEN");
         u64::from_le_bytes(*bytes)
     }
+}
+
+/// Sets up R0 to R8 from the stream with the hashing key and the nonce as
+/// tweak, and writes the R8 slot.
+#[inline(always)]
+fn start_registers(key: [u64; 2], nonce: u64, mem: &mut [u8; SCRATCHPAD_LEN]) -> [u64; 9] {
+    let mut stream = WordStream::new(key, nonce);
+    let [r0, r1, r2, r3] = stream.next_four();
+    let [r4, r5, r6, r7] = stream.next_four();
+    let r8 = ((r0 ^ r4) & !7) | 3;
+    // The R8 slot MUST be written for every nonce.
+    mem[R8_SLOT..].copy_from_slice(&r8.to_le_bytes());
+    [r0, r1, r2, r3, r4, r5, r6, r7, r8]
+}
+
+/// The finish from R0 to R8: two SipRounds, then the hash.
+#[inline(always)]
+fn finish(r: &[u64; 9]) -> u64 {
+    let mut lo = [r[0], r[1], r[2], r[3]];
+    let mut hi = [r[4], r[5], r[6], r[7]];
+    sip_round(&mut lo);
+    sip_round(&mut hi);
+    lo[3] ^ hi[3] ^ r[8]
 }
 
 /// Slot 9: whether the program goes back to slot 0. `LOOP` loops while

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["crates/risala-proto/fuzz"]
+exclude = ["crates/risala-proto/fuzz", "crates/risala-pow/fuzz"]
 members = [
     "crates/risala-proto",
     "crates/risala-server",
@@ -44,6 +44,9 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 rusqlite = { version = "0.41", features = ["bundled"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 getrandom = "0.4"
+# mmap and mprotect, for the executable memory of risala-pow's JIT. Already
+# in the tree through tokio and getrandom.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 tracing = "0.1"
@@ -53,6 +56,9 @@ librisala = { path = "crates/librisala" }
 
 # dev
 proptest = "1"
+# An independent x86-64 decoder (MIT), to check every instruction encoding
+# risala-pow's JIT emits and to verify the code it compiles.
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 tempfile = "3"
 
 [workspace.lints.rust]

@@ -16,6 +16,17 @@ jobs:
       - name: nix flake check
         run: nix flake check -L
 
+  # risala-pow's JIT against its interpreter, for many seeds and nonces.
+  # The normal tests run a few hundred; this runs 320,000, in release.
+  pow-jit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: cargo test --release -p risala-pow -- --ignored
+        run: nix develop --command cargo test --release -p risala-pow -- --ignored
+
   kani:
     runs-on: ubuntu-latest
     timeout-minutes: 30

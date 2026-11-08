@@ -8,8 +8,30 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = ["jit"]
+# Compile each function's programs to machine code, on x86-64 Linux and
+# macOS. Elsewhere, and where executable memory cannot be mapped, the
+# interpreter runs. It needs std there.
+jit = ["dep:libc"]
+
 [dependencies]
 sha2.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))'.dependencies]
+libc = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+iced-x86.workspace = true
+
+# The workspace lints, except that unsafe code is denied rather than
+# forbidden: the JIT's module that maps executable memory and calls into it
+# (src/jit/exec.rs) allows it, and nothing else may.
+[lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

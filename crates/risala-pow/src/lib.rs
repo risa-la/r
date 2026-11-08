@@ -1,12 +1,23 @@
 //! HashWX, a proof-of-work hash, and the puzzle built on it.
 //!
 //! A clean-room implementation of HashWX, under the Apache License 2.0.
-//! It interprets the generated programs and does not compile them to
-//! machine code, so it runs where executable memory is not allowed, such
-//! as iOS.
 //!
-//! It is `no_std`: it needs only `core` and `alloc`, for the boxed
-//! scratchpad.
+//! It has two backends (see [`Backend`]). The JIT compiles each
+//! function's programs to machine code, on x86-64 Linux and macOS with the
+//! `jit` feature (on by default). The interpreter runs everywhere,
+//! including where executable memory is not allowed, such as iOS, and
+//! wherever the JIT cannot run: the JIT falls back to it by itself.
+//! [`HashWx::with_backend`] and [`Puzzle::with_backend`] can force it.
+//!
+//! The JIT keeps strict W^X: a code buffer is writable or executable,
+//! never both, with guard pages around it. The compiled code reaches only
+//! its register file and the scratchpad, every scratchpad access masked
+//! into range, and jumps only to targets fixed at compile time. The
+//! crate's only unsafe code is the small module that maps the buffers
+//! and calls the code.
+//!
+//! Without the JIT the crate is `no_std`: it needs only `core` and
+//! `alloc`, for the boxed scratchpad. The JIT needs `std`.
 //!
 //! The parts:
 //!
@@ -30,10 +41,18 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
 extern crate std;
 
 mod hash;
+mod jit;
 mod program;
 mod puzzle;
 mod stream;
@@ -44,6 +63,6 @@ mod proofs;
 #[cfg(test)]
 mod tests;
 
-pub use hash::{HashWx, SCRATCHPAD_LEN, SEED_LEN, Scratchpad};
+pub use hash::{Backend, HashWx, SCRATCHPAD_LEN, SEED_LEN, Scratchpad};
 pub use program::{PROGRAM_COUNT, Program};
 pub use puzzle::{CHALLENGE_LEN, Puzzle};
