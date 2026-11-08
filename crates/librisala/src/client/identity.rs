@@ -1,951 +1,259 @@
-//! Identities (4.3-4.8): this device's keys, REGISTER, KEY and
-//! UNREGISTER, as methods of [`Client`] and [`Account`].
+//! Identities and devices (4.3-4.9, 12.14): creating an identity with its
+//! recovery key, pairing a device by QR text, removing a device,
+//! recovery, safety numbers, what the device knows of other identities,
+//! and the witness policy of the key logs (4.5).
 //!
-//! - **Device keys.** Each device has its own ML-DSA-44 key per identity,
-//!   kept in [`ClientOptions::keys`](super::ClientOptions::keys) under the
-//!   identity, such as `alice@example.org`. [`Client::create_device_key`]
-//!   makes one and [`Client::import_device_key`] reads one from PEM (App.
-//!   A). [`Client::key_line`] gives the line to publish in a self-hosted
-//!   identity's key file (4.4), at [`Client::key_file_url`].
-//! - **Signing in.** [`Client::add_identity`] adds the account, and
-//!   [`Account::connect`] signs in with AUTH (4.5). `auth-failed` is
-//!   final, since the same key fails the same way:
-//!   [`ConnectionState::Failed`](super::ConnectionState::Failed) with
-//!   [`RefusedKind::AuthFailed`], or [`RefusedKind::KeyRemoved`] if the
-//!   server accepted this key before. `unavailable` means the server could
-//!   not get the identity's key file, and the account tries again later
-//!   ([`RefusedKind::Unavailable`]).
-//! - **Registering.** [`Client::register`] creates `<name>@<domain>` on a
-//!   server that hosts identities, with this device's key (4.6). The
-//!   account is in the cache, marked pending, before REGISTER is sent;
-//!   if its answer is never seen, signing in settles it.
-//! - **Hosted identities' keys.** [`Account::keys`],
-//!   [`Account::add_key`] and [`Account::remove_key`] (4.7).
-//! - **Deleting.** [`Account::unregister`] (4.8).
-//!
-//! Refusals are [`ClientError::Refused`], with a [`RefusedKind`]; key
-//! store failures are [`ClientError::Keys`].
+//! Owned by task C1. Every method returns [`Error::NotImplemented`](super::Error::NotImplemented) until
+//! C1 builds it; the shapes are a starting point, which C1 may change.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use risala_proto::auth::{PublicKey, SecretKey};
-use risala_proto::command::{Command, KeyCommand};
-use risala_proto::error::ErrorCode;
-use risala_proto::keyfile::{KeyEntry, MAX_KEY_LABEL, well_known_url};
-use risala_proto::names::{Identity, Name, Uid};
-use risala_proto::server::{ServerLine, ServerMessage};
-use risala_proto::text::{escape, unescape};
-use tracing::warn;
+use zeroize::Zeroizing;
 
-use super::account::{Account, AccountShared};
-use super::types::{ClientError, DeviceKey, KeyErrorKind, KeyInfo, RefusedKind, Unregistered};
-use super::{Client, blocking, parse_server};
-use crate::addr::{ServerAddr, TrustStore};
-use crate::conn::keys::{self, KeyStore, KeyStoreError};
-use crate::conn::{self, CommandError, Session, SessionOptions};
-use crate::store::{AccountId, Store, StoreError};
+use super::error::not_implemented;
+use super::types::{AccountId, DeviceId, Timestamp, Uid};
+use super::{Client, Result};
+use crate::conn::Establish;
 
-/// How long QUIT may take after a one-off session.
-const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-fn parse_identity(identity: &str) -> Result<Identity, ClientError> {
-    identity
-        .trim()
-        .parse()
-        .map_err(|_| ClientError::Invalid(format!("identity {identity:?}")))
+/// The identity area's errors.
+#[derive(Debug, thiserror::Error)]
+pub enum IdentityError {
+    /// This device does not hold the identity.
+    #[error("this device does not hold {0}")]
+    NotHeld(Uid),
+    /// Sending to the identity is stopped until the user acts: it has a
+    /// new master key, or a fork was found (4.5, 12.14).
+    #[error("sending to {uid} is stopped: {reason:?}")]
+    Stopped {
+        /// The identity.
+        uid: Uid,
+        /// Why.
+        reason: StopReason,
+    },
 }
 
-fn store_error(e: KeyStoreError) -> ClientError {
-    ClientError::from_key_store(&e)
+/// Why sending to an identity is stopped (4.5, 12.14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// A new master key or a new log, not yet acknowledged.
+    NewMasterKey,
+    /// A fork in its records or its log.
+    Fork,
 }
 
-fn exists(identity: &Identity) -> ClientError {
-    ClientError::keys(
-        KeyErrorKind::Exists,
-        format!("{identity} already has a device key on this device"),
-    )
+/// What the identity area tells the UI, besides changes to the cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityEvent {
+    /// A record of one of the device's own identities that no device
+    /// announced, or an ALERT from another device (4.5): someone else may
+    /// control the identity.
+    Alert {
+        /// The identity.
+        uid: Uid,
+    },
+    /// A device to pair asks to be confirmed (4.8, step 2).
+    PairingRequest(PairingRequest),
 }
 
-fn no_key(identity: &Identity) -> ClientError {
-    ClientError::keys(KeyErrorKind::NoKey, format!("no device key for {identity}"))
+/// An identity just made, with the recovery key to show the user once
+/// (4.8). The recovery key is wiped when dropped.
+#[derive(Debug)]
+pub struct NewIdentity {
+    /// The identity.
+    pub uid: Uid,
+    /// Its account on the server it registered on.
+    pub account: AccountId,
+    /// The recovery key, as 52 characters of base32 in groups of four
+    /// (4.8).
+    pub recovery_key: Zeroizing<String>,
 }
 
-/// Reads a public key the user typed or pasted (4.4).
-pub(crate) fn parse_public_key(input: &str) -> Result<(PublicKey, Option<String>), ClientError> {
-    keys::parse_key_input(input).map_err(|e| {
-        ClientError::keys(
-            KeyErrorKind::BadKey,
-            format!("not an mldsa44 key or key file line: {e}"),
-        )
-    })
+/// An identity this device holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnIdentity {
+    /// The identity.
+    pub uid: Uid,
+    /// This device's id.
+    pub device: DeviceId,
 }
 
-/// The key stored for `identity`, or a new one, saved. Says whether it is
-/// new.
-fn load_or_create(
-    keys: &dyn KeyStore,
-    identity: &Identity,
-) -> Result<(SecretKey, bool), ClientError> {
-    if let Some(key) = keys.load(identity.as_str()).map_err(store_error)? {
-        return Ok((key, false));
-    }
-    let key = keys::generate_device_key()
-        .map_err(|e| ClientError::keys(KeyErrorKind::Failed, e.to_string()))?;
-    keys.save(identity.as_str(), &key).map_err(store_error)?;
-    Ok((key, true))
+/// A device of an identity (4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// Its id.
+    pub id: DeviceId,
+    /// Its label, usually its name.
+    pub label: String,
+    /// When the record that added it was made.
+    pub added: Timestamp,
+    /// Whether its record is accepted (4.5), not pending.
+    pub accepted: bool,
+    /// Whether it has been removed.
+    pub removed: bool,
+    /// Whether it is this device.
+    pub this_device: bool,
 }
 
-/// Runs `f` on the client's runtime, so that it may be awaited on any
-/// executor.
-async fn on_runtime<T: Send + 'static>(
-    client: &Client,
-    f: impl Future<Output = Result<T, ClientError>> + Send + 'static,
-) -> Result<T, ClientError> {
-    match client.runtime().spawn(f).await {
-        Ok(result) => result,
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(_) => Err(ClientError::NotConnected),
-    }
+/// What this device knows of an identity (4.5, 12.14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contact {
+    /// The identity.
+    pub uid: Uid,
+    /// Whether the user checked its safety number.
+    pub verified: bool,
+    /// Why sending to it is stopped, if it is.
+    pub stopped: Option<StopReason>,
+    /// Its current devices.
+    pub devices: Vec<Device>,
 }
 
-/// Opens a one-off connection and signs in as `identity` with `key`.
-async fn signed_in_session(
-    addr: &ServerAddr,
-    trust: Arc<dyn TrustStore>,
-    options: SessionOptions,
-    identity: &Identity,
-    key: &SecretKey,
-) -> Result<Session, ClientError> {
-    let server = addr.to_string();
-    let session = Session::connect(addr, trust, options)
-        .await
-        .map_err(|e| ClientError::from_sign_in(&server, &e))?;
-    session
-        .auth(identity, key)
-        .await
-        .map_err(|e| ClientError::from_sign_in(&server, &e))?;
-    Ok(session)
+/// An identity's safety number (12.14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyNumber {
+    /// 40 digits in eight groups of five.
+    pub digits: String,
+    /// The QR text, `RISALA-FP:` and base32.
+    pub qr: String,
 }
 
-/// Sends QUIT, waiting a little for the server to close.
-async fn quit(session: &Session) {
-    let _ = tokio::time::timeout(QUIT_TIMEOUT, session.quit("")).await;
+/// A pairing this device started as the new device (4.8, step 1): the QR
+/// text to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingOffer {
+    /// The QR text, `RISALA-PAIR:` and base32.
+    pub qr: String,
+}
+
+/// A new device asking to be paired, after scanning its QR code (4.8,
+/// step 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRequest {
+    /// The new device's label.
+    pub label: String,
+    /// The new device's id.
+    pub device: DeviceId,
 }
 
 impl Client {
-    /// The key store, or [`KeyErrorKind::NoKeyStore`].
-    pub(crate) fn key_store(&self) -> Result<Arc<dyn KeyStore>, ClientError> {
-        self.options()
-            .keys
-            .clone()
-            .ok_or_else(|| ClientError::keys(KeyErrorKind::NoKeyStore, "no key store"))
-    }
-
-    /// This device's key for `identity`, such as `alice@example.org`, if
-    /// the key store has one. It reads the key store, which may block for
-    /// a moment: call it off a UI thread.
-    pub fn device_key(&self, identity: &str) -> Result<Option<DeviceKey>, ClientError> {
-        let identity = parse_identity(identity)?;
-        let key = self
-            .key_store()?
-            .load(identity.as_str())
-            .map_err(store_error)?;
-        Ok(key.map(|k| DeviceKey::new(identity.as_str(), &k.public_key())))
-    }
-
-    /// Makes a new device key for `identity` and stores it (4.4). If the
-    /// identity already has one, it fails with [`KeyErrorKind::Exists`]
-    /// unless `replace` is set.
-    ///
-    /// Then publish its [`key_line`](Self::key_line) in the identity's key
-    /// file, or, for an identity a server hosts, add it from a device that
-    /// is signed in ([`Account::add_key`], 4.7).
-    pub async fn create_device_key(
+    /// Creates the identity `<name>@<the server's identity domain>`: a
+    /// recovery key, master key, device-signing key and this device's
+    /// keys, its first records, and REGISTER (4.7, 4.8).
+    pub async fn create_identity(
         &self,
-        identity: &str,
-        replace: bool,
-    ) -> Result<DeviceKey, ClientError> {
-        let identity = parse_identity(identity)?;
-        let keys = self.key_store()?;
-        blocking(self.runtime(), move || {
-            if !replace && keys.load(identity.as_str()).map_err(store_error)?.is_some() {
-                return Err(exists(&identity));
-            }
-            let key = keys::generate_device_key()
-                .map_err(|e| ClientError::keys(KeyErrorKind::Failed, e.to_string()))?;
-            keys.save(identity.as_str(), &key).map_err(store_error)?;
-            Ok(DeviceKey::new(identity.as_str(), &key.public_key()))
-        })
-        .await
+        server: &str,
+        name: &str,
+        device_label: &str,
+    ) -> Result<NewIdentity> {
+        let _ = (server, name, device_label);
+        not_implemented("create_identity")
     }
 
-    /// Stores a private key from PEM as the device key for `identity`. It
-    /// takes PKCS#8 in both forms Appendix A describes: the seed alone, or
-    /// the seed with the expanded key, which `openssl genpkey -algorithm
-    /// ML-DSA-44` writes.
-    ///
-    /// Importing the key already stored does nothing. A different key
-    /// fails with [`KeyErrorKind::Exists`] unless `replace` is set. A PEM
-    /// that is not such a key fails with [`KeyErrorKind::BadKey`].
-    pub async fn import_device_key(
+    /// The identities this device holds.
+    pub fn own_identities(&self) -> Result<Vec<OwnIdentity>> {
+        not_implemented("own_identities")
+    }
+
+    /// What this device knows of `uid`, fetching its key file if it has
+    /// none (4.4, 4.5).
+    pub async fn contact(&self, uid: &str) -> Result<Contact> {
+        let _ = uid;
+        not_implemented("contact")
+    }
+
+    /// Starts pairing this device to an identity (4.8, step 1), with
+    /// `server` as the relay.
+    pub async fn start_pairing(&self, server: &str, device_label: &str) -> Result<PairingOffer> {
+        let _ = (server, device_label);
+        not_implemented("start_pairing")
+    }
+
+    /// Waits for the other device to finish the pairing started with
+    /// [`start_pairing`](Self::start_pairing) (4.8, step 5), and returns
+    /// the identity this device now holds.
+    pub async fn finish_pairing(&self) -> Result<OwnIdentity> {
+        not_implemented("finish_pairing")
+    }
+
+    /// Reads a new device's QR text on a device of `uid` (4.8, step 2).
+    pub async fn scan_pairing(&self, uid: &str, qr: &str) -> Result<PairingRequest> {
+        let _ = (uid, qr);
+        not_implemented("scan_pairing")
+    }
+
+    /// Adds the device the user confirmed, and sends it the identity
+    /// (4.8, steps 3 and 4), with a history transfer if `transfer`.
+    pub async fn confirm_pairing(&self, uid: &str, transfer: bool) -> Result<()> {
+        let _ = (uid, transfer);
+        not_implemented("confirm_pairing")
+    }
+
+    /// Removes a device of `uid`, which needs the recovery key (4.8).
+    pub async fn remove_device(
         &self,
-        identity: &str,
-        pem: &str,
-        replace: bool,
-    ) -> Result<DeviceKey, ClientError> {
-        let identity = parse_identity(identity)?;
-        let key = SecretKey::from_pkcs8_pem(pem).map_err(|_| {
-            ClientError::keys(
-                KeyErrorKind::BadKey,
-                "not a PEM PKCS#8 ML-DSA-44 private key",
-            )
-        })?;
-        let keys = self.key_store()?;
-        blocking(self.runtime(), move || {
-            match keys.load(identity.as_str()).map_err(store_error)? {
-                Some(old) if old.public_key() == key.public_key() => {}
-                Some(_) if !replace => return Err(exists(&identity)),
-                _ => keys.save(identity.as_str(), &key).map_err(store_error)?,
-            }
-            Ok(DeviceKey::new(identity.as_str(), &key.public_key()))
-        })
-        .await
+        uid: &str,
+        device: DeviceId,
+        recovery_key: &str,
+    ) -> Result<()> {
+        let _ = (uid, device, recovery_key);
+        not_implemented("remove_device")
     }
 
-    /// Deletes this device's key for `identity` from the key store, for
-    /// example a key kept after [`RefusedKind::NotRegistered`]. Deleting a
-    /// key that is not there does nothing.
-    ///
-    /// If the identity's key file lists the key, signing in as it from
-    /// this device then needs a new key, and if it is the identity's only
-    /// key, nobody can sign in as it. Ask the user first.
-    pub async fn delete_device_key(&self, identity: &str) -> Result<(), ClientError> {
-        let identity = parse_identity(identity)?;
-        let keys = self.key_store()?;
-        blocking(self.runtime(), move || {
-            keys.delete(identity.as_str()).map_err(store_error)
-        })
-        .await
-    }
-
-    /// The key file line for this device's key for `identity`,
-    /// `mldsa44 <key> [<label>]`, without a line break (4.4). A
-    /// self-hosted identity publishes it in its key file, at
-    /// [`key_file_url`](Self::key_file_url). `label` is a note for people,
-    /// usually the device's name; empty for none.
-    pub fn key_line(&self, identity: &str, label: &str) -> Result<String, ClientError> {
-        let id = parse_identity(identity)?;
-        let key = self
-            .key_store()?
-            .load(id.as_str())
-            .map_err(store_error)?
-            .ok_or_else(|| no_key(&id))?;
-        keys::key_line(&key.public_key(), Some(label))
-            .map_err(|_| ClientError::Invalid(format!("label {label:?}")))
-    }
-
-    /// Where `identity`'s key file is published:
-    /// `https://<domain>/.well-known/risala/<name>` (4.3).
-    pub fn key_file_url(&self, identity: &str) -> Result<String, ClientError> {
-        let identity = parse_identity(identity)?;
-        Ok(well_known_url(identity.name(), identity.domain()))
-    }
-
-    /// Registers `<name>@<domain>` on `server`, which hosts identities
-    /// under `<domain>` (4.6), and adds it as an account. The account is
-    /// not started: call [`Account::start`] or [`Account::connect`].
-    ///
-    /// It asks INFO for the identity domain first (8.5). The device key is
-    /// the one the key store has for `<name>@<domain>`, or a new one,
-    /// stored before REGISTER is sent, so that it is not lost if the
-    /// answer is. A new key is deleted again only if the server refuses
-    /// REGISTER. The server publishes the identity's key file itself;
-    /// [`key_line`](Self::key_line) shows the line it holds.
-    ///
-    /// Refusals are [`ClientError::Refused`]:
-    /// [`RefusedKind::NoRegistration`], [`RefusedKind::NoHostname`] for
-    /// an IP address, [`RefusedKind::NameTaken`],
-    /// [`RefusedKind::Forbidden`] (closed, banned, or a limit with
-    /// `retry_after_secs`), [`RefusedKind::RateLimited`] and
-    /// [`RefusedKind::AuthFailed`]. A refused REGISTER leaves no account
-    /// behind.
-    ///
-    /// If the connection drops before REGISTER is answered, the identity
-    /// may or may not exist, and the key is kept (4.6). The client
-    /// connects again and signs in with the key to find out: if that
-    /// works, the registration went through and this returns the account
-    /// as usual. If the server refuses the key, the identity was not
-    /// created: [`RefusedKind::NotRegistered`], with the key still kept
-    /// for the user to decide on. If neither can be learned,
-    /// [`ClientError::Unconfirmed`], and the account is kept with the
-    /// REGISTER pending, as below.
-    ///
-    /// The account is added to the cache, marked as being registered,
-    /// before REGISTER is sent. So if this future is dropped, or the
-    /// process ends, before the answer is handled, the account is there
-    /// with the REGISTER pending, and signing in with the key settles it:
-    /// the next [`Account::connect`] or [`Account::start`] signs in as
-    /// usual if the registration went through. If the server refuses the
-    /// key, it fails with [`RefusedKind::NotRegistered`] and the account
-    /// is removed, the key kept. Calling `register` again for the same
-    /// name settles it the same way, and registers again if it did not go
-    /// through. The work runs on the client's runtime, so a dropped future
-    /// whose process goes on still finishes in the background.
-    ///
-    /// Only one REGISTER for an identity is under way at a time in a
-    /// client: another `register` for it meanwhile fails with
-    /// [`RefusedKind::RegisterPending`], and so does signing in as it.
-    pub async fn register(&self, server: &str, name: &str) -> Result<Account, ClientError> {
-        let addr = parse_server(server)?;
-        let name: Name = name
-            .trim()
-            .parse()
-            .map_err(|_| ClientError::Invalid(format!("name {name:?}")))?;
-        if addr.is_ip() {
-            return Err(ClientError::from_conn(
-                &addr.to_string(),
-                &conn::Error::NoSni,
-            ));
-        }
-        self.key_store()?;
-        let client = self.clone();
-        on_runtime(self, async move {
-            // An earlier REGISTER found not to have gone through is
-            // settled first, then this one is sent on a new connection.
-            match client.register_once(&addr, &name, false).await? {
-                Some(account) => Ok(account),
-                None => client
-                    .register_once(&addr, &name, true)
-                    .await?
-                    .ok_or_else(|| pending(&name)),
-            }
-        })
-        .await
-    }
-
-    /// Connects to `addr`, learns its identity domain and registers `name`
-    /// under it, recording that it is pending until the answer is known.
-    ///
-    /// If an earlier REGISTER for it is still pending, from a dropped
-    /// future or an ended process, it signs in instead to settle it, and
-    /// returns the account if it went through, or `None` if it did not,
-    /// to register again. `settled` says this call settled one already.
-    async fn register_once(
+    /// Recovers `uid` on this device from its recovery key, after losing
+    /// every device (4.8).
+    pub async fn recover(
         &self,
-        addr: &ServerAddr,
-        name: &Name,
-        settled: bool,
-    ) -> Result<Option<Account>, ClientError> {
-        let server = addr.to_string();
-        let fail = |e: conn::Error| ClientError::from_sign_in(&server, &e);
-        let keys = self.key_store()?;
-        let trust: Arc<dyn TrustStore> = Arc::new(self.store().clone());
-        let options = self.options().session.clone();
-        let session = Session::connect(addr, trust.clone(), options.clone())
-            .await
-            .map_err(fail)?;
-        let rt = self.runtime().clone();
-        let store = self.store().clone();
-        let prepared = async {
-            let domain = session.identity_domain().await.map_err(fail)?;
-            let identity = Identity::new(name, &domain);
-            let (k, id) = (keys.clone(), identity.clone());
-            let (key, created) = blocking(&rt, move || load_or_create(&*k, &id)).await?;
-            // Recorded before REGISTER goes, so that its answer is settled
-            // whatever happens next, even after a restart (4.6).
-            let (s, a, uid) = (store.clone(), addr.clone(), identity.to_uid());
-            let (id, earlier) = match blocking(&rt, move || s.begin_register(&a, &uid)).await {
-                Ok(began) => began,
-                Err(e) => {
-                    if created {
-                        delete_key(&rt, &keys, &identity).await;
-                    }
-                    return Err(e.into());
-                }
-            };
-            Ok((domain, identity, key, created, id, earlier))
-        }
-        .await;
-        let (domain, identity, key, created, id, earlier) = match prepared {
-            Ok(p) => p,
-            Err(e) => {
-                quit(&session).await;
-                return Err(e);
-            }
-        };
-        let account = self.handle(id, addr.clone(), identity.to_uid());
-        let Some(_claim) = Claim::new(account.shared()) else {
-            // Another REGISTER for it is under way in this client. Undo
-            // only a mark this call made, after one that ended meanwhile.
-            quit(&session).await;
-            if !earlier {
-                end_register(&rt, &store, id, false).await;
-            }
-            return Err(pending(name));
-        };
-
-        if earlier {
-            if settled {
-                // Pending again since this call settled it: another
-                // process is registering it.
-                quit(&session).await;
-                return Err(pending(name));
-            }
-            // Its answer was lost or never waited for. Sign in on this
-            // connection, whose nonce is unused, to learn whether it went
-            // through (4.5, 4.6).
-            warn!(%identity, "an earlier REGISTER is pending; signing in to settle it");
-            let signed_in = session.auth(&identity, &key).await;
-            quit(&session).await;
-            return match signed_in {
-                Ok(_) => self.registered(addr, &identity).await.map(Some),
-                Err(e) if e.is_auth_failed() => {
-                    end_register(&rt, &store, id, false).await;
-                    Ok(None)
-                }
-                Err(e) => Err(ClientError::Unconfirmed {
-                    uid: identity.to_string(),
-                    message: format!(
-                        "an earlier REGISTER of {identity} got no answer, and signing in to \
-                         check failed ({e}): whether it was registered is not known. The \
-                         account and this device's key for it are kept: connect it later to \
-                         find out"
-                    ),
-                }),
-            };
-        }
-
-        let sent = session.register_under(name, &domain, &key).await;
-        match sent {
-            Ok(_) => {
-                quit(&session).await;
-                self.registered(addr, &identity).await.map(Some)
-            }
-            Err(e) if certainly_not_registered(&e) => {
-                quit(&session).await;
-                end_register(&rt, &store, id, false).await;
-                if created {
-                    delete_key(&rt, &keys, &identity).await;
-                }
-                Err(fail(e))
-            }
-            Err(lost) => {
-                // The answer was lost: the identity may exist, with this key as
-                // its only key. Keep the key, and sign in to find out (4.6).
-                session.close();
-                warn!(error = %lost, %identity, "REGISTER got no answer; signing in to check");
-                match confirm_registration(addr, trust, options, &identity, &key, &lost).await {
-                    Ok(()) => self.registered(addr, &identity).await.map(Some),
-                    Err(e @ ClientError::Refused { .. }) => {
-                        end_register(&rt, &store, id, false).await;
-                        Err(e)
-                    }
-                    // Still pending: signing in settles it later.
-                    Err(e) => Err(e),
-                }
-            }
-        }
+        server: &str,
+        uid: &str,
+        recovery_key: &str,
+        device_label: &str,
+    ) -> Result<OwnIdentity> {
+        let _ = (server, uid, recovery_key, device_label);
+        not_implemented("recover")
     }
 
-    /// The account for `identity` on `addr`, whose REGISTER went through:
-    /// no longer pending, and added again if it was removed meanwhile.
-    async fn registered(
-        &self,
-        addr: &ServerAddr,
-        identity: &Identity,
-    ) -> Result<Account, ClientError> {
-        let (store, a, uid) = (self.store().clone(), addr.clone(), identity.to_uid());
-        let id = blocking(self.runtime(), move || {
-            let id = store.account(&a, &uid)?;
-            store.end_register(id, true)?;
-            Ok::<_, StoreError>(id)
-        })
-        .await?;
-        Ok(self.handle(id, addr.clone(), identity.to_uid()))
-    }
-}
-
-/// [`RefusedKind::RegisterPending`] for `name`.
-fn pending(name: &Name) -> ClientError {
-    ClientError::refused(
-        RefusedKind::RegisterPending,
-        format!("a registration of {name} on this server is already under way"),
-    )
-}
-
-/// Marks a REGISTER as under way in this client while it lives, so that
-/// a second one, or signing in, does not run alongside it.
-struct Claim(Arc<AccountShared>);
-
-impl Claim {
-    /// `None` if one is under way already.
-    fn new(shared: &Arc<AccountShared>) -> Option<Claim> {
-        (!shared.registering.swap(true, Ordering::SeqCst)).then(|| Claim(shared.clone()))
-    }
-}
-
-impl Drop for Claim {
-    fn drop(&mut self) {
-        self.0.registering.store(false, Ordering::SeqCst);
-    }
-}
-
-/// Settles a pending REGISTER in the cache. A failure is only logged: the
-/// REGISTER then stays pending, and signing in settles it later.
-async fn end_register(
-    rt: &tokio::runtime::Handle,
-    store: &Store,
-    account: AccountId,
-    registered: bool,
-) {
-    let store = store.clone();
-    if let Err(e) = blocking(rt, move || store.end_register(account, registered)).await {
-        warn!(error = %e, "settling a pending REGISTER");
-    }
-}
-
-/// Deletes the device key made for a registration that failed.
-async fn delete_key(rt: &tokio::runtime::Handle, keys: &Arc<dyn KeyStore>, identity: &Identity) {
-    let (keys, id) = (keys.clone(), identity.clone());
-    if let Err(e) = blocking(rt, move || keys.delete(id.as_str())).await {
-        warn!(error = %e, "deleting the key of a failed registration");
-    }
-}
-
-/// Whether REGISTER certainly did not create the identity: the server
-/// answered `ERR`, or the command was never sent.
-fn certainly_not_registered(e: &conn::Error) -> bool {
-    matches!(
-        e,
-        conn::Error::Rejected(conn::CommandError::Server(_))
-            | conn::Error::NoRegistration
-            | conn::Error::NoSni
-            | conn::Error::NonceUsed
-            | conn::Error::InvalidCommand(_)
-            | conn::Error::NoResponse
-    )
-}
-
-/// After REGISTER got no answer, signs in on a new connection as
-/// `identity` with the key it was sent with, to learn whether it was
-/// created (4.6). The key is kept whatever happens.
-async fn confirm_registration(
-    addr: &ServerAddr,
-    trust: Arc<dyn TrustStore>,
-    options: SessionOptions,
-    identity: &Identity,
-    key: &SecretKey,
-    lost: &conn::Error,
-) -> Result<(), ClientError> {
-    let unconfirmed = |why: String| ClientError::Unconfirmed {
-        uid: identity.to_string(),
-        message: format!(
-            "REGISTER got no answer ({lost}), and {why}: whether {identity} was registered \
-             is not known. The account and this device's key for it are kept: connect it later \
-             to find out"
-        ),
-    };
-    let session = match Session::connect(addr, trust, options).await {
-        Ok(session) => session,
-        Err(e) => return Err(unconfirmed(format!("connecting again failed ({e})"))),
-    };
-    let signed_in = session.auth(identity, key).await;
-    quit(&session).await;
-    match signed_in {
-        Ok(_) => Ok(()),
-        Err(e) if e.is_auth_failed() => Err(ClientError::refused(
-            RefusedKind::NotRegistered,
-            format!(
-                "REGISTER got no answer ({lost}), and the server refused to sign in with its \
-                 key: {identity} was not registered. This device's key for it is kept"
-            ),
-        )),
-        Err(e) => Err(unconfirmed(format!("signing in to check failed ({e})"))),
-    }
-}
-
-/// An `ERR` to a KEY or UNREGISTER command as a client error.
-/// `not-supported` to KEY means the server does not host the identity
-/// (4.7), and `forbidden` to KEY DEL that the key is the last one.
-fn refused(err: &risala_proto::server::ErrResponse, command: &Command) -> ClientError {
-    let kind = match (&err.code, command) {
-        (ErrorCode::NotSupported, Command::Key(_)) => RefusedKind::NotHosted,
-        (ErrorCode::Forbidden, Command::Key(KeyCommand::Del { .. })) => RefusedKind::LastKey,
-        _ => return ClientError::from_err(err).unwrap_or_else(|| ClientError::server(err)),
-    };
-    let mut e = ClientError::from_err(err).expect("a refusal");
-    if let ClientError::Refused { kind: k, .. } = &mut e {
-        *k = kind;
-    }
-    e
-}
-
-/// Sends `command` on `session`, and returns its response lines.
-async fn request(
-    server: &str,
-    session: &Session,
-    command: Command,
-) -> Result<Vec<ServerMessage>, ClientError> {
-    let response = session
-        .request(command.clone())
-        .await
-        .map_err(|e| ClientError::from_conn(server, &e))?;
-    match response.into_result() {
-        Ok((lines, _)) => Ok(lines),
-        Err(CommandError::Server(err)) => Err(refused(&err, &command)),
-        Err(e) => Err(ClientError::from_conn(server, &e.into())),
-    }
-}
-
-impl Account {
-    /// The account's identity, or [`RefusedKind::Guest`].
-    fn identity(&self) -> Result<Identity, ClientError> {
-        self.shared().uid.to_identity().ok_or_else(|| {
-            ClientError::refused(RefusedKind::Guest, "a guest has no keys or identity")
-        })
+    /// The safety number of `uid` (12.14).
+    pub fn safety_number(&self, uid: &str) -> Result<SafetyNumber> {
+        let _ = uid;
+        not_implemented("safety_number")
     }
 
-    /// This device's key for the account's identity, if the key store has
-    /// one. See [`Client::device_key`].
-    pub fn device_key(&self) -> Result<Option<DeviceKey>, ClientError> {
-        let identity = self.identity()?;
-        self.client().device_key(identity.as_str())
+    /// Marks `uid` as verified, from the QR text of its safety number
+    /// scanned from the other person's device (12.14), or after comparing
+    /// the digits when `qr` is `None`.
+    pub fn mark_verified(&self, uid: &str, qr: Option<&str>) -> Result<()> {
+        let _ = (uid, qr);
+        not_implemented("mark_verified")
     }
 
-    /// The public key of this device's key, if the key store has one.
-    async fn device_public_key(&self) -> Result<Option<PublicKey>, ClientError> {
-        let identity = self.identity()?;
-        let keys = self.client().key_store()?;
-        let rt = self.shared().rt.clone();
-        let key = blocking(&rt, move || {
-            keys.load(identity.as_str()).map_err(store_error)
-        })
-        .await?;
-        Ok(key.map(|k| k.public_key()))
+    /// Acknowledges a new master key of `uid` (4.5, 12.14), so that
+    /// sending starts again.
+    pub fn acknowledge_new_master_key(&self, uid: &str) -> Result<()> {
+        let _ = uid;
+        not_implemented("acknowledge_new_master_key")
     }
 
-    /// Sends a KEY command on the signed-in connection.
-    async fn key_command(&self, command: KeyCommand) -> Result<Vec<ServerMessage>, ClientError> {
-        self.identity()?;
-        let session = self.session()?;
-        request(&self.server(), &session, Command::Key(command)).await
+    /// Deletes everything the server keeps about the account's identity
+    /// (4.9).
+    pub async fn unregister(&self, account: AccountId) -> Result<()> {
+        let _ = account;
+        not_implemented("unregister")
     }
 
-    /// The keys of the account's identity, which the server hosts (KEY
-    /// LIST, 4.7). Needs a connection. An identity the server does not
-    /// host gets [`RefusedKind::NotHosted`]: its keys are in its own key
-    /// file.
-    pub async fn keys(&self) -> Result<Vec<KeyInfo>, ClientError> {
-        let lines = self.key_command(KeyCommand::List).await?;
-        let mine = self.device_public_key().await?;
-        Ok(lines
-            .into_iter()
-            .filter_map(|m| match m.line {
-                ServerLine::Key { key, label } => Some(KeyInfo {
-                    public_key: key.to_string(),
-                    label: unescape(&label).into_owned(),
-                    fingerprint: key.fingerprint().to_string(),
-                    this_device: mine.as_ref() == Some(&key),
-                }),
-                _ => None,
-            })
-            .collect())
+    /// The witness policy (4.5): the witnesses' verifier keys, and k.
+    pub fn witness_policy(&self) -> Result<(Vec<String>, usize)> {
+        not_implemented("witness_policy")
     }
 
-    /// Adds a key to the account's identity, which the server hosts (KEY
-    /// ADD, 4.7): usually a new device's, so that it can sign in. `key` is
-    /// the key file line the new device shows ([`Client::key_line`]), or
-    /// its key alone in base64. `label` names the device; if empty, the
-    /// line's own label is used. It is at most 64 bytes, counted escaped
-    /// (3.4), and has no line breaks (4.4, 4.7); a longer one fails with
-    /// [`ClientError::Invalid`] before anything is sent. Needs a
-    /// connection.
-    pub async fn add_key(&self, key: &str, label: &str) -> Result<KeyInfo, ClientError> {
-        let (key, line_label) = parse_public_key(key)?;
-        let label = match label.trim() {
-            "" => line_label.unwrap_or_default(),
-            l => l.to_owned(),
-        };
-        // Checks the label as a key file line would (4.4).
-        let entry = KeyEntry::new(key.clone(), Some(&label))
-            .map_err(|_| ClientError::Invalid(format!("label {label:?}")))?;
-        let label = entry.label().unwrap_or("").to_owned();
-        // KEY ADD counts the label escaped, as all text (3.4, 4.7).
-        let escaped = escape(&label);
-        if escaped.len() > MAX_KEY_LABEL {
-            return Err(ClientError::Invalid(format!(
-                "label {label:?}: over {MAX_KEY_LABEL} bytes once escaped"
-            )));
-        }
-        self.key_command(KeyCommand::Add {
-            key: key.clone(),
-            label: escaped,
-        })
-        .await?;
-        let mine = self.device_public_key().await?;
-        Ok(KeyInfo {
-            public_key: key.to_string(),
-            fingerprint: key.fingerprint().to_string(),
-            this_device: mine.as_ref() == Some(&key),
-            label,
-        })
+    /// Sets the witness policy (4.5).
+    pub fn set_witness_policy(&self, witnesses: &[String], k: usize) -> Result<()> {
+        let _ = (witnesses, k);
+        not_implemented("set_witness_policy")
     }
 
-    /// Removes a key from the account's identity, which the server hosts
-    /// (KEY DEL, 4.7). `key` is a key file line or the key alone. Needs a
-    /// connection.
-    ///
-    /// The server refuses to remove the last key:
-    /// [`RefusedKind::LastKey`]. Removing this device's own key signs it
-    /// out: the server closes its connections, and the account then
-    /// fails with [`RefusedKind::KeyRemoved`].
-    pub async fn remove_key(&self, key: &str) -> Result<(), ClientError> {
-        let (key, _) = parse_public_key(key)?;
-        self.key_command(KeyCommand::Del { key }).await?;
-        Ok(())
+    /// How the account's signed-in connection signs in: AUTH with this
+    /// device's key for the identity (4.6), for the driver.
+    pub(crate) async fn identity_sign_in(&self, account: AccountId) -> Result<Arc<dyn Establish>> {
+        let _ = account;
+        not_implemented("identity_sign_in")
     }
-
-    /// Forgets an UNREGISTER whose answer was lost: a later one settled
-    /// it.
-    async fn forget_lost_unregister(&self) {
-        *self
-            .shared()
-            .ran_before_unregister
-            .lock()
-            .expect("poisoned") = None;
-        let (store, id) = (self.shared().store.clone(), self.id());
-        if let Err(e) = blocking(&self.shared().rt, move || {
-            store.set_unregister_lost(id, None)
-        })
-        .await
-        {
-            warn!(error = %e, "forgetting a lost UNREGISTER");
-        }
-    }
-
-    /// Deletes the account's identity from the server (UNREGISTER, 4.8),
-    /// then the account and its cache. `uid` must be the account's own
-    /// uid, typed out by the user as a guard against mistakes; anything
-    /// else fails with [`RefusedKind::WrongUid`] and sends nothing. With
-    /// `purge`, the server also deletes every message the identity sent.
-    ///
-    /// The server leaves the identity's rooms and deletes what it keeps
-    /// about it. If it hosts the identity, which KEY LIST tells first
-    /// (4.7), it deletes its keys and key file too, so this device's key
-    /// is deleted from the key store as well. Otherwise the key is kept:
-    /// the identity's own key file is not the server's to change, and the
-    /// key works on other servers.
-    ///
-    /// The account stops first, and the command goes on a connection of
-    /// its own, so that the account cannot sign in again in between. If
-    /// the server refuses, or the command is never sent, an account that
-    /// was running starts again.
-    ///
-    /// If the connection drops after UNREGISTER is sent and before its
-    /// answer, the identity may be gone: this fails with
-    /// [`ClientError::Unconfirmed`], and the account stays stopped, so
-    /// that it does not sign in again and undo part of the request. The
-    /// cache remembers this, and [`start`](Self::start) and
-    /// [`connect`](Self::connect) refuse with
-    /// [`RefusedKind::UnregisterPending`] until it is settled. Call
-    /// `unregister` again to find out and finish: if the server then
-    /// refuses to sign in to an identity it hosted, it was deleted.
-    ///
-    /// The cache records this before UNREGISTER is sent, so the same holds
-    /// if this future is dropped, for example by a timeout, or the process
-    /// ends, before the answer.
-    pub async fn unregister(&self, uid: &str, purge: bool) -> Result<Unregistered, ClientError> {
-        let identity = self.identity()?;
-        let typed: Option<Uid> = uid.trim().parse().ok();
-        if typed.as_ref() != Some(&self.shared().uid) {
-            return Err(ClientError::refused(
-                RefusedKind::WrongUid,
-                format!("type {} to confirm", self.shared().uid),
-            ));
-        }
-        let client = self.client();
-        let keys = client.key_store()?;
-        let key = {
-            let (keys, identity) = (keys.clone(), identity.clone());
-            blocking(&self.shared().rt, move || {
-                keys.load(identity.as_str())
-                    .map_err(store_error)?
-                    .ok_or_else(|| no_key(&identity))
-            })
-            .await?
-        };
-        // An earlier UNREGISTER whose answer was lost, if any: whether the
-        // server hosted the identity.
-        let (store, id) = (self.shared().store.clone(), self.id());
-        let lost_before = blocking(&self.shared().rt, move || store.unregister_lost(id)).await?;
-        let ran_before = *self
-            .shared()
-            .ran_before_unregister
-            .lock()
-            .expect("poisoned");
-        let was_running = ran_before.unwrap_or_else(|| self.is_running());
-        self.disconnect().await;
-        // Kept until it is settled, even if this future is dropped.
-        *self
-            .shared()
-            .ran_before_unregister
-            .lock()
-            .expect("poisoned") = Some(was_running);
-
-        let addr = self.shared().server.clone();
-        let trust: Arc<dyn TrustStore> = Arc::new(self.shared().store.clone());
-        let options = self.shared().options.session.clone();
-        // Records, before UNREGISTER goes, that its answer may be lost, so
-        // that nothing signs in again whatever happens next (4.8).
-        let mark: Mark = {
-            let (store, id) = (self.shared().store.clone(), self.id());
-            Box::new(move |hosted| {
-                store.set_unregister_lost(id, Some(hosted || lost_before == Some(true)))
-            })
-        };
-        let outcome = {
-            let identity = identity.clone();
-            on_runtime(&client, async move {
-                Ok(unregister_on(&addr, trust, options, &identity, &key, purge, mark).await)
-            })
-            .await?
-        };
-        let hosted = match outcome {
-            Unregistering::Done { hosted } => hosted,
-            // The identity this server hosted is gone: an earlier
-            // UNREGISTER went through.
-            Unregistering::NotSent(e)
-                if lost_before == Some(true)
-                    && matches!(
-                        e,
-                        ClientError::Refused {
-                            kind: RefusedKind::AuthFailed,
-                            ..
-                        }
-                    ) =>
-            {
-                true
-            }
-            // Still not known whether the earlier one went through: stay
-            // stopped.
-            Unregistering::NotSent(e) if lost_before.is_some() => return Err(e),
-            // Signed in, so the identity is there, and nothing was deleted.
-            Unregistering::NotSent(e) | Unregistering::Refused(e) => {
-                self.forget_lost_unregister().await;
-                if was_running {
-                    self.start();
-                }
-                return Err(e);
-            }
-            // Recorded before UNREGISTER was sent.
-            Unregistering::Lost { error } => {
-                return Err(ClientError::Unconfirmed {
-                    uid: identity.to_string(),
-                    message: format!(
-                        "UNREGISTER got no answer ({error}): whether {identity} was deleted \
-                         is not known. The account is kept, stopped; unregister again to \
-                         finish"
-                    ),
-                });
-            }
-        };
-
-        *self
-            .shared()
-            .ran_before_unregister
-            .lock()
-            .expect("poisoned") = None;
-        client.remove_account(self).await?;
-        let mut key_deleted = false;
-        if hosted {
-            let id = identity.clone();
-            match blocking(&self.shared().rt, move || keys.delete(id.as_str())).await {
-                Ok(()) => key_deleted = true,
-                Err(e) => warn!(error = %e, "deleting the device key of an unregistered identity"),
-            }
-        }
-        Ok(Unregistered {
-            uid: identity.to_string(),
-            hosted,
-            key_deleted,
-        })
-    }
-}
-
-/// How UNREGISTER went.
-enum Unregistering {
-    /// The server answered `OK`.
-    Done { hosted: bool },
-    /// UNREGISTER was never sent: signing in or KEY LIST failed.
-    NotSent(ClientError),
-    /// The server refused UNREGISTER: nothing was deleted.
-    Refused(ClientError),
-    /// UNREGISTER was sent, and its answer lost.
-    Lost { error: ClientError },
-}
-
-/// Records in the cache that an UNREGISTER may have gone through, given
-/// whether the server hosts the identity.
-type Mark = Box<dyn FnOnce(bool) -> Result<(), StoreError> + Send>;
-
-/// Signs in on a connection of its own, asks KEY LIST whether the server
-/// hosts the identity (4.7), calls `mark`, and sends UNREGISTER (4.8).
-async fn unregister_on(
-    addr: &ServerAddr,
-    trust: Arc<dyn TrustStore>,
-    options: SessionOptions,
-    identity: &Identity,
-    key: &SecretKey,
-    purge: bool,
-    mark: Mark,
-) -> Unregistering {
-    let server = addr.to_string();
-    let session = match signed_in_session(addr, trust, options, identity, key).await {
-        Ok(session) => session,
-        Err(e) => return Unregistering::NotSent(e),
-    };
-    // KEY LIST tells whether the server hosts the identity (4.7). INFO
-    // does not: it says register=no while registration is closed.
-    let hosted = match request(&server, &session, Command::Key(KeyCommand::List)).await {
-        Ok(_) => true,
-        Err(ClientError::Refused {
-            kind: RefusedKind::NotHosted,
-            ..
-        }) => false,
-        Err(e) => {
-            quit(&session).await;
-            return Unregistering::NotSent(e);
-        }
-    };
-    let rt = tokio::runtime::Handle::current();
-    if let Err(e) = blocking(&rt, move || mark(hosted)).await {
-        quit(&session).await;
-        return Unregistering::NotSent(e.into());
-    }
-    let command = Command::Unregister {
-        uid: identity.to_uid(),
-        purge,
-    };
-    let outcome = match session.request(command.clone()).await {
-        Ok(response) => match response.into_result() {
-            Ok(_) => Unregistering::Done { hosted },
-            Err(CommandError::Server(err)) => Unregistering::Refused(refused(&err, &command)),
-            Err(e) => Unregistering::Lost {
-                error: ClientError::from_conn(&server, &e.into()),
-            },
-        },
-        Err(e @ conn::Error::InvalidCommand(_)) => {
-            Unregistering::NotSent(ClientError::from_conn(&server, &e))
-        }
-        Err(e) => Unregistering::Lost {
-            error: ClientError::from_conn(&server, &e),
-        },
-    };
-    match outcome {
-        // After OK the server closes the connection itself.
-        Unregistering::Done { .. } | Unregistering::Lost { .. } => session.close(),
-        _ => quit(&session).await,
-    }
-    outcome
 }

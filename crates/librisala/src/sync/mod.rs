@@ -1,411 +1,301 @@
-//! The sync engine: a state machine with no I/O that keeps the
-//! [`Store`](crate::store::Store) in step with a server (7.1-7.3, 7.6).
+//! The engines: sans-I/O state machines, one per area, that turn what
+//! arrives from the server into changes to the cache, and decide what to
+//! send. [`client::driver`](crate::client::driver) runs them on an
+//! account's connections.
 //!
-//! There is one [`SyncEngine`] per signed-in connection. Make a new one
-//! after every reconnect: everything it keeps in memory is about the
-//! connection, and everything else is in the store.
+//! Each area has an [`Engine`] in a module of its own, so that the area
+//! tasks of docs/plans/M5b.md can build them at the same time:
 //!
-//! # Driving it
+//! | Module | Task | What |
+//! |---|---|---|
+//! | [`identity`] | C1 | key files, daily checks, RECORD lines, pairing relay (4.4-4.8, 12.14) |
+//! | [`keylog`] | C1 | checkpoints, tiles, proofs, forks, watching (4.5) |
+//! | [`conversations`] | C2 | the group engine: FOLLOW, FETCH, posts, commits, Welcomes, KeyPackages (5-8, 12.5-12.9) |
+//! | [`confirm`] | C3 | confirming leaves (12.10) |
+//! | [`transfer`] | C4 | blobs, files, transfers, backups, reports (5.6, 5.8, 12.11-12.13) |
+//! | [`push`] | C4 | push subscriptions (Section 9) |
 //!
-//! - Call [`SyncEngine::start`] right after signing in.
-//! - Feed it every line the server sends, **in the order they arrive**:
-//!   - Lines that are not part of a response (live events, READ, DROP and
-//!     the rest) go to [`SyncEngine::handle_line`].
-//!   - When the final OK or ERR of a command the engine asked for arrives,
-//!     pass that command's `ref`-tagged lines and its final line to
-//!     [`SyncEngine::handle_reply`], at that point in the stream.
+//! # Shape
 //!
-//!   The order matters: a live event that arrived before a response's
-//!   final line must be handled before the response (3.6).
-//! - Every call returns an [`Output`]: commands to send, each with the
-//!   [`ReqId`] to answer it with, changes for the UI, and notifications.
-//!   Send the commands in the order given.
-//! - The UI asks for work with [`SyncEngine::send`],
-//!   [`SyncEngine::join`], [`SyncEngine::part`], [`SyncEngine::mark_read`],
-//!   [`SyncEngine::load_older`], [`SyncEngine::fetch`] and
-//!   [`SyncEngine::download`], [`SyncEngine::delete`],
-//!   [`SyncEngine::info`] and [`SyncEngine::request`]; and about people with
-//!   [`SyncEngine::typing`], [`SyncEngine::set_name`],
-//!   [`SyncEngine::members`], [`SyncEngine::whois`], [`SyncEngine::block`],
-//!   [`SyncEngine::unblock`] and [`SyncEngine::blocks`].
+//! An engine gets [`Input`]s, in the order they happened, and returns
+//! [`Action`]s for the driver to carry out. It reads and writes the cache
+//! itself, in short transactions, and keeps nothing persistent in memory
+//! between calls, since another process may change the cache (PLAN.md
+//! 3.4). Commands it sends carry a [`Token`] of its own; the reply comes
+//! back to the same engine as [`Input::Reply`] with that token.
 //!
-//! # People
-//!
-//! Display names (8.2), room members (8.3) and blocks (5.7) are stored.
-//! Typing (8.1) and presence (8.3) are true only while connected, so they
-//! are not: the engine reports them as [`Signal`]s, and the caller keeps
-//! them in memory.
-//! - If a call fails with a store error, drop the connection and the
-//!   engine, and start again after reconnecting.
-//!
-//! # What it guarantees
-//!
-//! These are the invariants of the TLA+ model in `proofs/sync`:
-//!
-//! - **No mixed history.** A conversation's stored events all come from
-//!   the conversation whose id is stored. Ids from SYNC, JOIN (event and
-//!   OK), INFO, HISTORY and RELATED are compared with the stored one, and
-//!   a different id discards the history first (7.1, 7.2, 6.1). So does a
-//!   head below the sync point the conversation had when the command was
-//!   sent (7.1), which keeps the outbox: the room is the same. Events
-//!   stored past that point, by this connection or by another process
-//!   sharing the cache, do not count. Live events are stored only
-//!   once the conversation's id is known on this connection (7.1 step 6).
-//! - **Truthful sync points.** The sync point is the seq up to which every
-//!   event the server still keeps is stored. It moves over HISTORY pages
-//!   and over stored events that directly follow it, never over a gap
-//!   (7.1 step 3). Catching up starts from it, so a connection that drops
-//!   halfway leaves nothing behind.
-//! - **Caught up means complete.** When a conversation has caught up, the
-//!   store holds every event the server keeps, with deletions applied.
-//! - **At most once.** Each outbox message has its own cid and is bound to
-//!   the conversation's id. Entries are picked and marked as sent in one
-//!   write transaction, with a claim naming the connection, so two
-//!   processes sharing the cache never send the same one, and neither
-//!   settles one the other still waits on. It is resent after a
-//!   reconnect only while that id still matches, only within 23 hours,
-//!   and only by an identity or by a guest whose session was resumed
-//!   ([`SyncEngine::set_resumed`]): a guest's cids count only within one
-//!   session (7.6).
+//! Live lines go to the engine of their area, as [`route`] says. Replies
+//! go to the engine that sent the command. [`Input::Ready`] and
+//! [`Input::Tick`] go to every engine.
 
-mod e2ee;
-mod e2ee_keys;
-mod engine;
-
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+pub mod confirm;
+pub mod conversations;
+pub mod identity;
+pub mod keylog;
+pub mod push;
+pub mod transfer;
 
 use risala_proto::command::Command;
-use risala_proto::names::{Conv, Room, Uid};
-use risala_proto::server::{ErrResponse, OkResponse, ServerLine, ServerMessage};
+use risala_proto::connection::ConnectionKind;
+use risala_proto::names::BoxName;
+use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
-use risala_proto::types::Presence;
 
-use crate::store::{Change, StoreError};
+use crate::client::Event;
+use crate::conn::{Response, Slot};
+use crate::store::{AccountId, Store};
 
-pub use e2ee_keys::OwnDeviceState;
-pub use engine::{SyncEngine, TYPING_REPEAT};
-
-/// Settings for a [`SyncEngine`].
-#[derive(Clone)]
-pub struct SyncConfig {
-    /// The `limit` for HISTORY and RELATED pages (7.2, 7.3).
-    pub page_size: u64,
-    /// When a conversation is more than this many events behind, fetch only
-    /// the newest page and load the rest as the user scrolls back (7.1 step
-    /// 4), or on [`SyncEngine::download`]. `None` always catches up fully.
-    pub lazy_gap: Option<u64>,
-    /// How long after first sending it an unanswered message may be sent
-    /// again. The server remembers cids for 24 hours (7.6).
-    pub resend_window: Duration,
-    /// How long a message another process sharing the cache sent stays
-    /// its own to settle (7.6). Until then this engine neither sends it
-    /// again nor marks it failed, since that process may still get its
-    /// `OK`. After it, the other connection is taken to be gone. Pick it
-    /// well above how long a connection may go without an answer before
-    /// its keepalive closes it (11).
-    pub claim_lease: Duration,
-    /// Where the time comes from.
-    pub clock: Clock,
-    /// For an identity, ask BLOCKS on each connection (5.7), so that
-    /// blocks made on the account's other devices are known. On by
-    /// default.
-    pub fetch_blocks: bool,
-    /// For an identity with a device key, run end-to-end encryption
-    /// (Section 12): KeyPackages, Welcomes, groups and encrypted messages.
-    /// On by default. Without it, nothing is sent to direct conversations
-    /// or encrypted rooms (12.3).
-    pub encryption: bool,
-    /// How often to ask KEYPKG GET again for the other participant of a
-    /// direct conversation whose messages are held because none of their
-    /// devices is in its group yet (12.6). Each new connection asks at
-    /// once.
-    pub peer_retry: Duration,
+/// The area a line belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Area {
+    /// The connection itself: the greeting, final responses, PING, BYE,
+    /// NOTICE and unknown lines. The driver handles them.
+    Connection,
+    /// RECORD and PAIR (4.7, 4.8).
+    Identity,
+    /// Posts, rooms, members, presence, Welcomes and KeyPackages (5-8,
+    /// 12.5, 12.8).
+    Conversations,
+    /// BACKUP and REPORT (5.8, 12.13).
+    Transfer,
+    /// PUSH (9.1).
+    Push,
+    /// The operator's lines: OP, SERVERBAN, CONNECTION and RESOLVED
+    /// (Section 10, 5.8).
+    Admin,
 }
 
-impl Default for SyncConfig {
-    fn default() -> SyncConfig {
-        SyncConfig {
-            page_size: risala_proto::types::DEFAULT_LIMIT,
-            lazy_gap: Some(500),
-            resend_window: Duration::from_secs(23 * 3600),
-            claim_lease: Duration::from_secs(300),
-            clock: Clock::system(),
-            fetch_blocks: true,
-            encryption: true,
-            peer_retry: Duration::from_secs(5 * 60),
+/// The area of a server line.
+pub fn route(line: &ServerLine) -> Area {
+    match line {
+        ServerLine::Greeting(_)
+        | ServerLine::Ok(_)
+        | ServerLine::Err(_)
+        | ServerLine::Ping { .. }
+        | ServerLine::Bye { .. }
+        | ServerLine::Notice { .. }
+        | ServerLine::Unknown(_) => Area::Connection,
+        ServerLine::Record { .. } | ServerLine::Pair { .. } => Area::Identity,
+        ServerLine::Post(_)
+        | ServerLine::Room { .. }
+        | ServerLine::GroupInfo { .. }
+        | ServerLine::Gone { .. }
+        | ServerLine::Drop { .. }
+        | ServerLine::User { .. }
+        | ServerLine::Member { .. }
+        | ServerLine::Presence { .. }
+        | ServerLine::KeyPkg { .. }
+        | ServerLine::Welcome { .. } => Area::Conversations,
+        ServerLine::Backup { .. } | ServerLine::Report(_) => Area::Transfer,
+        ServerLine::Push { .. } => Area::Push,
+        ServerLine::Op { .. }
+        | ServerLine::ServerBan { .. }
+        | ServerLine::Connection { .. }
+        | ServerLine::Resolved { .. } => Area::Admin,
+    }
+}
+
+/// An engine's own number for a command it sent, to match the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Token(pub u64);
+
+/// Which connection a command goes on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    /// The signed-in connection: what belongs to the account (4.1).
+    SignedIn,
+    /// The anonymous or guest connection that follows this mailbox, or
+    /// will (7.1).
+    Mailbox(BoxName),
+    /// Any anonymous or guest connection: for commands about no mailbox,
+    /// such as KEYPKG GET or WELCOME PUT.
+    Conversing,
+}
+
+/// What happened, for an engine.
+#[derive(Debug)]
+pub enum Input<'a> {
+    /// A connection is ready: anonymous, a guest or signed in.
+    Ready {
+        /// Which.
+        slot: Slot,
+        /// Its kind.
+        kind: ConnectionKind,
+    },
+    /// A connection closed. Commands sent on it get no reply.
+    Closed {
+        /// Which.
+        slot: Slot,
+    },
+    /// A live line, of this engine's area.
+    Line {
+        /// The connection it came on.
+        slot: Slot,
+        /// The line.
+        message: &'a ServerMessage,
+    },
+    /// The reply to a command this engine sent.
+    Reply {
+        /// The connection it came on.
+        slot: Slot,
+        /// The engine's token for the command.
+        token: Token,
+        /// The response.
+        response: &'a Response,
+    },
+    /// Time passed: for retries, daily checks and timeouts.
+    Tick {
+        /// The time now.
+        now: Timestamp,
+    },
+}
+
+/// What an engine asks the driver to do.
+#[derive(Debug)]
+pub enum Action {
+    /// Send a command, and give the reply back with `token`.
+    Send {
+        /// On which connection.
+        target: Target,
+        /// The command.
+        command: Command,
+        /// The engine's token for the reply.
+        token: Token,
+    },
+    /// Tell the UI.
+    Emit(Event),
+}
+
+/// What every engine is given besides its input.
+#[derive(Debug, Clone)]
+pub struct Context {
+    /// The cache.
+    pub store: Store,
+    /// The account the engine runs for.
+    pub account: AccountId,
+}
+
+/// One area's engine. Every method has a default that does nothing, so a
+/// new engine starts empty.
+pub trait Engine: Send {
+    /// Handles one input, and returns what to do.
+    fn handle(&mut self, cx: &Context, input: &Input<'_>) -> Vec<Action> {
+        let _ = (cx, input);
+        Vec::new()
+    }
+}
+
+/// Every area's engine, for one account.
+#[derive(Default)]
+pub struct Engines {
+    /// Task C1.
+    pub identity: identity::IdentityEngine,
+    /// Task C1.
+    pub keylog: keylog::KeyLogEngine,
+    /// Task C2.
+    pub conversations: conversations::ConversationEngine,
+    /// Task C3.
+    pub confirm: confirm::ConfirmEngine,
+    /// Task C4.
+    pub transfer: transfer::TransferEngine,
+    /// Task C4.
+    pub push: push::PushEngine,
+}
+
+impl std::fmt::Debug for Engines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engines").finish_non_exhaustive()
+    }
+}
+
+impl Engines {
+    /// Every engine, in a fixed order.
+    fn all(&mut self) -> [&mut dyn Engine; 6] {
+        [
+            &mut self.identity,
+            &mut self.keylog,
+            &mut self.conversations,
+            &mut self.confirm,
+            &mut self.transfer,
+            &mut self.push,
+        ]
+    }
+
+    /// Hands a live line to the engine of its area. Lines of the
+    /// connection's own area and the operator's are the driver's, and give
+    /// nothing here.
+    pub fn line(&mut self, cx: &Context, slot: Slot, message: &ServerMessage) -> Vec<Action> {
+        let input = Input::Line { slot, message };
+        match route(&message.line) {
+            Area::Identity => self.identity.handle(cx, &input),
+            Area::Conversations => self.conversations.handle(cx, &input),
+            Area::Transfer => self.transfer.handle(cx, &input),
+            Area::Push => self.push.handle(cx, &input),
+            Area::Connection | Area::Admin => Vec::new(),
         }
     }
-}
 
-impl fmt::Debug for SyncConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SyncConfig")
-            .field("page_size", &self.page_size)
-            .field("lazy_gap", &self.lazy_gap)
-            .field("resend_window", &self.resend_window)
-            .field("claim_lease", &self.claim_lease)
-            .field("fetch_blocks", &self.fetch_blocks)
-            .field("encryption", &self.encryption)
-            .field("peer_retry", &self.peer_retry)
-            .finish_non_exhaustive()
+    /// Hands an input to every engine, in order: [`Input::Ready`],
+    /// [`Input::Closed`] and [`Input::Tick`].
+    pub fn broadcast(&mut self, cx: &Context, input: &Input<'_>) -> Vec<Action> {
+        self.all()
+            .into_iter()
+            .flat_map(|engine| engine.handle(cx, input))
+            .collect()
     }
 }
 
-/// A source of the current time, replaceable in tests.
-#[derive(Clone)]
-pub struct Clock(Arc<dyn Fn() -> Timestamp + Send + Sync>);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Clock {
-    /// The system clock, [`Timestamp::now`].
-    pub fn system() -> Clock {
-        Clock(Arc::new(Timestamp::now))
+    fn area(line: &str) -> Area {
+        route(&line.parse::<ServerMessage>().unwrap().line)
     }
 
-    /// A clock that calls `f`.
-    pub fn new(f: impl Fn() -> Timestamp + Send + Sync + 'static) -> Clock {
-        Clock(Arc::new(f))
+    #[test]
+    fn lines_go_to_their_area() {
+        let blob = format!("sha384:{}", "0".repeat(96));
+        for (line, expected) in [
+            (
+                "RISALA 1 chat.test 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e",
+                Area::Connection,
+            ),
+            ("OK", Area::Connection),
+            ("ERR internal", Area::Connection),
+            ("NOTICE hi", Area::Connection),
+            ("PING x", Area::Connection),
+            ("BYE", Area::Connection),
+            ("FROB x", Area::Connection),
+            (
+                "@seq=1;t=2026-11-08T15:41:02.377Z POST ujzdegxdncf32epf3dhodzdoci AAEAAg==",
+                Area::Conversations,
+            ),
+            ("GONE ujzdegxdncf32epf3dhodzdoci ~sam", Area::Conversations),
+            ("DROP ujzdegxdncf32epf3dhodzdoci", Area::Conversations),
+            ("PRESENCE online alice@example.org", Area::Conversations),
+            (&format!("RECORD 7 {blob}"), Area::Identity),
+            ("OP alice@example.org", Area::Admin),
+        ] {
+            assert_eq!(area(line), expected, "{line}");
+        }
     }
 
-    /// The time now.
-    pub fn now(&self) -> Timestamp {
-        (self.0)()
-    }
-}
-
-/// Identifies a command the engine asked to send, so that its reply can be
-/// handed back with [`SyncEngine::handle_reply`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ReqId(u64);
-
-impl ReqId {
-    /// The number, unique within one engine.
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// A command to send.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Outgoing {
-    /// The id to pass back with its reply.
-    pub req: ReqId,
-    /// The command. Give it a `ref` if the session wants one (3.6).
-    pub command: Command,
-}
-
-/// The answer to one command: its `ref`-tagged lines and its final line
-/// (3.6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reply {
-    /// The lines before the final response, in order.
-    pub lines: Vec<ServerMessage>,
-    /// The final response.
-    pub outcome: Outcome,
-}
-
-impl Reply {
-    /// A reply from its lines and its final line. A final line that is
-    /// not OK or ERR gives [`Outcome::Failed`].
-    pub fn new(lines: Vec<ServerMessage>, last: ServerLine) -> Reply {
-        let outcome = match last {
-            ServerLine::Ok(ok) => Outcome::Ok(ok),
-            ServerLine::Err(err) => Outcome::Err(err),
-            _ => Outcome::Failed,
+    #[test]
+    fn empty_engines_do_nothing() {
+        let cx = Context {
+            store: Store::open_in_memory().unwrap(),
+            account: crate::store::AccountId(1),
         };
-        Reply { lines, outcome }
+        let mut engines = Engines::default();
+        let tick = Input::Tick {
+            now: Timestamp::MIN,
+        };
+        assert!(engines.broadcast(&cx, &tick).is_empty());
+        let post: ServerMessage =
+            "@seq=1;t=2026-11-08T15:41:02.377Z POST ujzdegxdncf32epf3dhodzdoci AAEAAg=="
+                .parse()
+                .unwrap();
+        assert!(engines.line(&cx, Slot::Anonymous(0), &post).is_empty());
     }
 }
-
-/// How a command ended (3.6).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// `OK`, with its result values.
-    Ok(OkResponse),
-    /// `ERR`.
-    Err(ErrResponse),
-    /// The final line could not be parsed, which counts as a general
-    /// failure (2.3).
-    Failed,
-    /// The command could not be written to the connection, for example
-    /// because the line would be too long, so the server never saw it.
-    NotSent,
-}
-
-/// The result of a command the UI asked for (JOIN, PART, INFO, READ, NAME,
-/// MEMBERS, WHOIS, BLOCK, UNBLOCK, BLOCKS, and those sent with
-/// [`SyncEngine::request`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Completed {
-    /// The request, as returned in [`Output::send`].
-    pub req: ReqId,
-    /// How it ended.
-    pub outcome: Outcome,
-}
-
-/// Something to tell the user that is not history (6.4, 7.1, 10.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Notification {
-    /// Someone invited the account to a room it is not in (6.4).
-    Invited {
-        /// The room.
-        room: Room,
-        /// Who sent the invitation.
-        by: Uid,
-    },
-    /// The account was kicked from a room (6.4).
-    Kicked {
-        /// The room.
-        room: Room,
-        /// Who kicked it.
-        by: Uid,
-        /// The reason, escaped; empty if none.
-        reason: String,
-    },
-    /// The account was banned from a room (6.4).
-    Banned {
-        /// The room.
-        room: Room,
-        /// Who banned it.
-        by: Uid,
-        /// The reason, escaped; empty if none.
-        reason: String,
-    },
-    /// A commit of an encrypted conversation failed a check of 12.6: the
-    /// device can no longer follow its group, and sends nothing more in it
-    /// (12.6). Warn the user.
-    GroupRejected {
-        /// The conversation.
-        conv: Conv,
-    },
-    /// Two different history keys arrived for one epoch (12.9). The one
-    /// kept is the device's own, then one from the identity's devices or
-    /// backup, then the first. Warn the user.
-    KeyConflict {
-        /// The conversation's id.
-        id: risala_proto::names::Id,
-        /// The epoch.
-        epoch: u64,
-    },
-    /// A new device of the identity joined its conversation with itself
-    /// (12.9, 12.12). It gets no history keys from this device until the
-    /// user confirms that it is theirs, with
-    /// [`SyncEngine::confirm_device`].
-    NewDevice {
-        /// The device key's fingerprint (12.12).
-        fingerprint: String,
-    },
-    /// A commit removed a leaf of a conversation's group for a reason the
-    /// device could not check, since the key file that would show it could
-    /// not be fetched for 24 hours (12.6). The device applied it, as a
-    /// removal lets nobody new read. Warn the user.
-    RemovalUnchecked {
-        /// The conversation.
-        conv: Conv,
-    },
-    /// Another device of the identity sent a recovery key that the key
-    /// file lists, and this device holds a different one (12.10). Ask the
-    /// user whether to replace it, and answer with
-    /// [`SyncEngine::accept_recovery_key`].
-    RecoveryKeyOffered,
-    /// SYNC no longer lists a conversation the account was in: it left, or
-    /// was kicked or banned, or the room was dropped (7.1). Its history is
-    /// kept.
-    Left {
-        /// The conversation.
-        conv: Conv,
-    },
-    /// An operator dropped a room (10.4). Its history was removed.
-    Dropped {
-        /// The room.
-        room: Room,
-        /// The reason, escaped; empty if none.
-        reason: String,
-    },
-}
-
-/// Something about people that the engine does not store, because it is
-/// only true while connected: typing and presence (8.1, 8.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Signal {
-    /// Someone is typing in a conversation (8.1). It lasts 6 seconds,
-    /// unless repeated.
-    Typing {
-        /// The conversation.
-        conv: Conv,
-        /// Who.
-        from: Uid,
-    },
-    /// Someone else's message arrived live, which ends their typing (8.1).
-    Spoke {
-        /// The conversation.
-        conv: Conv,
-        /// Who.
-        from: Uid,
-    },
-    /// A user's presence, from PRESENCE, MEMBER or USER (8.3).
-    Presence {
-        /// The user.
-        uid: Uid,
-        /// Their presence, as the server said it.
-        presence: Presence,
-    },
-}
-
-/// What a call to the engine produced.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Output {
-    /// Commands to send, in order.
-    pub send: Vec<Outgoing>,
-    /// Changes the store made, for the UI.
-    pub changes: Vec<Change>,
-    /// Things to tell the user.
-    pub notifications: Vec<Notification>,
-    /// Results of the commands the UI asked for.
-    pub completed: Vec<Completed>,
-    /// Call [`SyncEngine::resume_outbox`] after this long: the server asked
-    /// to wait before sending more messages (`rate-limited`), or another
-    /// process's claim on an outbox entry runs out then
-    /// ([`SyncConfig::claim_lease`]), and the entry is this engine's to
-    /// settle if that process has not.
-    pub retry_after: Option<Duration>,
-    /// Typing and presence, in the order they arrived.
-    pub signals: Vec<Signal>,
-    /// Identities whose key files to fetch (4.4, 12.12). Hand each back
-    /// with [`SyncEngine::key_file`].
-    pub key_files: Vec<Uid>,
-    /// A recovery key another device of the identity sent (12.10). Keep it
-    /// as the device key is kept.
-    pub recovery: Option<risala_mls::RecoveryKey>,
-}
-
-impl Output {
-    /// Whether there is nothing in it.
-    pub fn is_empty(&self) -> bool {
-        *self == Output::default()
-    }
-}
-
-/// The engine could not do what was asked.
-#[derive(Debug, thiserror::Error)]
-pub enum SyncError {
-    /// The store failed. Drop the connection and the engine.
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    /// The message is not valid: blank text, a reaction that is too long,
-    /// or a file with an edit or a reaction (5.3, 5.6).
-    #[error("invalid message: {0}")]
-    Invalid(String),
-    /// The account is not in this room, so there is nothing to bind a
-    /// message to (7.6).
-    #[error("not in {0}")]
-    NotJoined(Conv),
-}
-
-#[cfg(test)]
-mod e2ee_tests;
-#[cfg(test)]
-mod sim;
-#[cfg(test)]
-mod tests;

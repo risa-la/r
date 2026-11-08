@@ -1,1789 +1,211 @@
-//! Unit tests of the client layer that need no server: offline sends,
-//! the timeline's diffs and input checks. The end-to-end tests are in
-//! `tests/client.rs` and `tests/cuts.rs`.
+//! The client's C0 parts: accounts, trust, and running a guest account.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use risala_proto::names::{Conv, Seq};
-use risala_proto::server::{Event, ServerLine, ServerMessage};
-use risala_proto::time::Timestamp;
+use risala_proto::fingerprint::Fingerprint;
 
-use super::account::Batch;
 use super::*;
-use crate::store::{Draft, FailReason, Store, StoreError};
+use crate::addr::TrustRecord;
+use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
+use crate::conn::{Slot, roots_ca_verifier};
+use crate::store::AccountKind;
 
-const SERVER: &str = "chat.example.org";
-
-fn event(seq: u64, rest: &str) -> Event {
-    let t = Timestamp::from_unix_millis(1_800_000_000_000 + seq).unwrap();
-    match format!("@seq={seq};t={t};{rest}")
-        .parse::<ServerMessage>()
-        .unwrap()
-        .line
-    {
-        ServerLine::Event(e) => e,
-        other => panic!("{other:?}"),
-    }
+fn client() -> Client {
+    Client::open_in_memory(ClientOptions::default()).unwrap()
 }
 
-/// Stores events for `conv` as the sync engine would, and tells the
-/// account's subscribers, as its task does.
-fn store_events(account: &Account, conv: &str, id: &str, events: &[Event]) {
-    let shared = account.shared();
-    let conv: Conv = conv.parse().unwrap();
-    let account_id = shared.id;
-    let ((), changes) = shared
-        .store
-        .write(|tx| {
-            let mut row = tx.conv_or_create(account_id, &conv)?;
-            tx.learn_id(&mut row, &id.parse().unwrap(), None)?;
-            tx.set_joined(&mut row, true)?;
-            for e in events {
-                tx.store_event(&row, e)?;
-            }
-            Ok(())
-        })
+#[test]
+fn accounts() {
+    let c = client();
+    let sam = c.add_guest("Chat.Example.org", "sam").unwrap();
+    assert_eq!(sam.kind, AccountKind::Guest);
+    assert_eq!(sam.uid.as_str(), "~sam");
+    assert_eq!(sam.server.to_string(), "chat.example.org");
+    assert_eq!(c.add_guest("chat.example.org", "sam").unwrap(), sam);
+    let alice = c
+        .add_identity_account("chat.example.org:7000", "alice@example.org")
         .unwrap();
-    shared.publish(Batch {
-        reload: false,
-        changes,
-        events: Vec::new(),
-    });
-}
+    assert_eq!(alice.kind, AccountKind::Identity);
+    assert_eq!(c.accounts().unwrap(), [sam.clone(), alice.clone()]);
+    assert_eq!(c.account(alice.id).unwrap(), alice);
 
-fn guest() -> Account {
-    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
-    client.add_guest(SERVER, "sam").unwrap()
-}
-
-#[tokio::test]
-async fn invalid_input_is_refused() {
-    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
-    assert!(matches!(
-        client.add_guest("bad host!", "sam"),
-        Err(ClientError::Invalid(_))
-    ));
-    assert!(matches!(
-        client.add_guest(SERVER, "not a name"),
-        Err(ClientError::Invalid(_))
-    ));
-    assert!(matches!(
-        client.accept_fingerprint(SERVER, "sha256:nothex"),
-        Err(ClientError::Invalid(_))
-    ));
-    let sam = client.add_guest(SERVER, "sam").unwrap();
-    assert!(matches!(
-        sam.conversation("general"),
-        Err(ClientError::Invalid(_))
-    ));
-    assert!(matches!(
-        sam.join("general").await,
-        Err(ClientError::Invalid(_))
-    ));
-    // The same account is the same handle.
-    let again = client.add_guest(SERVER, "sam").unwrap();
-    assert!(Arc::ptr_eq(sam.shared(), again.shared()));
-    assert_eq!(client.accounts().unwrap().len(), 1);
-    assert_eq!(
-        client.account(SERVER, "~sam").unwrap().unwrap().id(),
-        sam.id()
-    );
-}
-
-#[tokio::test]
-async fn offline_sends_wait_in_the_outbox() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    // A room never joined has no id to bind a message to (7.6).
-    assert_eq!(
-        general.send("hi").await.unwrap_err(),
-        ClientError::NotJoined("#general".into())
-    );
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    let events = sam.subscribe();
-    let entry = general.send("hi\nthere").await.unwrap();
-    assert_eq!(entry.status, OutboxStatus::Queued);
-    assert_eq!(entry.text, "hi\nthere");
-    assert_eq!(entry.conversation, "#general");
-    match events.next().await.unwrap() {
-        AccountEvent::Outbox { entry: e } => assert_eq!(e, entry),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(sam.outbox().unwrap(), std::slice::from_ref(&entry));
-    // Blank text is refused (5.3).
-    assert!(matches!(
-        general.send(" \t").await,
-        Err(ClientError::Invalid(_))
-    ));
-    // Things that need a server say so.
-    assert_eq!(general.load_older().await, Err(ClientError::NotConnected));
-    assert_eq!(
-        sam.join("#dev").await.unwrap_err(),
-        ClientError::NotConnected
-    );
-    assert_eq!(sam.wait_synced().await, Err(ClientError::NotConnected));
-    // A guest that is offline is in no room: parting only stops the room
-    // being joined again.
-    let rooms = |a: &Account| a.shared().store.rejoin_rooms(a.id()).unwrap();
-    sam.shared()
-        .store
-        .set_rejoin(sam.id(), &"#general".parse().unwrap(), true)
-        .unwrap();
-    sam.part("#general", "").await.unwrap();
-    assert!(rooms(&sam).is_empty());
-    assert!(!general.info().unwrap().unwrap().joined);
-    // Its messages there fail, and new ones are refused (PLAN.md 5, item
-    // 37).
-    assert!(matches!(
-        sam.outbox().unwrap()[0].status,
-        OutboxStatus::Failed {
-            kind: FailKind::NotInRoom,
-            ..
-        }
-    ));
-    assert_eq!(
-        general.send("more").await.unwrap_err(),
-        ClientError::NotJoined("#general".into())
-    );
-    // The read marker moves in the cache.
-    general.mark_read(1).await.unwrap();
-    assert_eq!(general.info().unwrap().unwrap().read, 1);
-    // Removing an outbox entry.
-    sam.remove_outbox(entry.id).unwrap();
-    assert!(sam.outbox().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn offline_sends_to_a_room_left_are_refused() {
-    // PLAN.md 5, item 34: offline as online, nothing more goes to a room
-    // the identity has left, until it joins again.
-    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
-    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
-    store_events(
-        &alice,
-        "#general",
-        "k1",
-        &[event(1, "from=alice@example.org;id=k1 JOIN #general")],
-    );
-    let general = alice.conversation("#general").unwrap();
-    assert_eq!(
-        general.send("hi").await.unwrap().status,
-        OutboxStatus::Queued
-    );
-    let shared = alice.shared();
-    let account = shared.id;
-    shared
-        .store
-        .write(|tx| {
-            let mut row = tx
-                .conv_by_name(account, &"#general".parse().unwrap())?
-                .unwrap();
-            tx.set_joined(&mut row, false)
-        })
-        .unwrap();
-    assert_eq!(
-        general.send("again").await.unwrap_err(),
-        ClientError::NotJoined("#general".into())
-    );
-    // Deleting still goes through the outbox (5.4).
-    assert!(general.delete(1).await.is_ok());
-
-    // A guest's room that its client joins again after a new session
-    // takes messages (PLAN.md 5, item 37); another does not.
-    let sam = guest();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    let shared = sam.shared();
-    let account = shared.id;
-    shared
-        .store
-        .write(|tx| {
-            let mut row = tx
-                .conv_by_name(account, &"#general".parse().unwrap())?
-                .unwrap();
-            tx.set_joined(&mut row, false)
-        })
-        .unwrap();
-    let general = sam.conversation("#general").unwrap();
-    assert_eq!(
-        general.send("hi").await.unwrap_err(),
-        ClientError::NotJoined("#general".into())
-    );
-    shared
-        .store
-        .set_rejoin(account, &"#general".parse().unwrap(), true)
-        .unwrap();
-    assert_eq!(
-        general.send("hi").await.unwrap().status,
-        OutboxStatus::Queued
-    );
-}
-
-#[tokio::test]
-async fn the_timeline_reports_inserts_updates_and_resets() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    let timeline = general.timeline(3).unwrap();
-    assert!(timeline.items().is_empty());
-    let next = || async {
-        tokio::time::timeout(Duration::from_secs(5), timeline.next())
-            .await
-            .expect("diffs")
-            .expect("not closed")
-    };
-
-    // The conversation appears; its messages are inserted.
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[
-            event(1, "from=~ann;id=k1 JOIN #general"),
-            event(3, "from=~ann MSG #general three"),
-        ],
-    );
-    let diffs = next().await;
-    assert_eq!(diffs.len(), 2);
-    assert!(matches!(&diffs[1], TimelineDiff::Insert { index: 1, item } if item.seq == 3));
-    // An older one goes in its place.
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(2, "from=~ann MSG #general two")],
-    );
-    let diffs = next().await;
-    assert!(
-        matches!(&diffs[..], [TimelineDiff::Insert { index: 1, item }] if item.text.as_deref() == Some("two")),
-        "{diffs:?}"
-    );
-    // An edit and a reaction update their target, and are not items.
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[
-            event(4, "from=~ann;edit=3 MSG #general THREE"),
-            event(5, "from=~sam;react=3 MSG #general 👍"),
-        ],
-    );
-    let diffs = next().await;
-    let TimelineDiff::Update { index: 2, item } = diffs.last().unwrap() else {
-        panic!("{diffs:?}")
-    };
-    assert_eq!(item.text.as_deref(), Some("THREE"));
-    assert!(item.edited);
-    assert_eq!(item.reactions.len(), 1);
-    assert!(item.reactions[0].mine);
-    assert_eq!(timeline.items().len(), 3);
-    assert_eq!(
-        timeline.items(),
-        general.messages(None, 10).unwrap().messages
-    );
-
-    // A new id discards the history (7.1): a reset.
-    let shared = sam.shared();
-    let account = shared.id;
-    let ((), changes) = shared
-        .store
-        .write(|tx| {
-            let mut row = tx
-                .conv_by_name(account, &"#general".parse().unwrap())?
-                .unwrap();
-            tx.discard(&mut row, Some("k2".parse().unwrap()))?;
-            Ok(())
-        })
-        .unwrap();
-    shared.publish(Batch {
-        reload: false,
-        changes,
-        events: Vec::new(),
-    });
-    let diffs = next().await;
-    assert!(diffs.contains(&TimelineDiff::Reset { items: Vec::new() }));
-    assert!(timeline.items().is_empty());
-}
-
-#[tokio::test]
-async fn the_timeline_pages_back_through_the_cache() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    let events: Vec<Event> = (1..=10)
-        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
-        .collect();
-    store_events(&sam, "#general", "k1", &events);
-    let timeline = general.timeline(4).unwrap();
-    let seqs = |t: &Timeline| t.items().iter().map(|m| m.seq).collect::<Vec<_>>();
-    assert_eq!(seqs(&timeline), [7, 8, 9, 10]);
-    // An item below the window is not shown.
-    assert!(!timeline.paginate_back(4).await.unwrap());
-    let diffs = timeline.next().await.unwrap();
-    assert_eq!(diffs.len(), 4);
-    assert_eq!(seqs(&timeline), [3, 4, 5, 6, 7, 8, 9, 10]);
-    // The cache runs out; offline, nothing more comes.
-    assert!(timeline.paginate_back(4).await.unwrap());
-    assert_eq!(seqs(&timeline), (1..=10).collect::<Vec<_>>());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_timeline_loses_nothing_when_next_is_dropped() {
-    // A UI selects over the timeline and other things; a dropped next()
-    // must not lose the batch it was applying. Regression: it did.
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    let timeline = general.timeline(1000).unwrap();
-    let mut items = timeline.items();
-    let apply = |items: &mut Vec<Message>, diffs: Vec<TimelineDiff>| {
-        for diff in diffs {
-            match diff {
-                TimelineDiff::Insert { index, item } => items.insert(index as usize, item),
-                TimelineDiff::Update { index, item } => items[index as usize] = item,
-                TimelineDiff::Remove { index } => {
-                    items.remove(index as usize);
-                }
-                TimelineDiff::Reset { items: all } => *items = all,
-            }
-        }
-    };
-    for n in 1..=300u64 {
-        store_events(
-            &sam,
-            "#general",
-            "k1",
-            &[event(n, &format!("from=~ann MSG #general m{n}"))],
+    for (server, name) in [("", "sam"), ("chat.example.org", "~sam"), ("a b", "x")] {
+        assert!(
+            matches!(c.add_guest(server, name), Err(Error::Invalid { .. })),
+            "{server} {name}"
         );
-        // Start next() and drop it at once, sometimes mid-apply. What it
-        // did return counts.
-        if let Ok(Some(diffs)) = tokio::time::timeout(Duration::ZERO, timeline.next()).await {
-            apply(&mut items, diffs);
-        }
-        if n % 7 == 0 {
-            tokio::task::yield_now().await;
-        }
     }
-    while items.len() < 300 {
-        let diffs = tokio::time::timeout(Duration::from_secs(5), timeline.next())
-            .await
-            .expect("every change arrives")
-            .unwrap();
-        apply(&mut items, diffs);
-    }
-    assert_eq!(items, timeline.items());
-    assert_eq!(items, all_messages(&general));
+    assert!(matches!(
+        c.add_identity_account("chat.example.org", "~sam"),
+        Err(Error::Invalid { .. })
+    ));
 }
 
-/// Every message of a conversation in the cache, page by page.
-fn all_messages(conv: &Conversation) -> Vec<Message> {
-    let mut out: Vec<Message> = Vec::new();
-    let mut cursor = None;
+#[tokio::test]
+async fn removing_an_account() {
+    let c = client();
+    let sam = c.add_guest("chat.example.org", "sam").unwrap();
+    c.remove_account(sam.id).await.unwrap();
+    assert!(c.accounts().unwrap().is_empty());
+    assert!(matches!(c.account(sam.id), Err(Error::NoAccount)));
+}
+
+#[test]
+fn trust_decisions() {
+    let c = client();
+    let server = "chat.example.org";
+    let (a, b) = (
+        Fingerprint::from_bytes([1; 32]),
+        Fingerprint::from_bytes([2; 32]),
+    );
+    let mut events = c.subscribe();
+    assert_eq!(c.trust_record(server).unwrap(), None);
+    c.accept_fingerprint(server, &a.to_string()).unwrap();
+    assert!(matches!(events.try_recv(), Ok(Event::Changed(_))));
+    assert_eq!(
+        c.trust_record(server).unwrap(),
+        Some(TrustRecord::Pinned(a))
+    );
+    assert!(c.accept_fingerprint(server, &b.to_string()).is_err());
+    assert!(matches!(
+        c.accept_fingerprint(server, "sha256:xyz"),
+        Err(Error::Invalid { .. })
+    ));
+
+    c.set_strict_pin(server, &a.to_string()).unwrap();
+    assert_eq!(
+        c.trust_record(server).unwrap(),
+        Some(TrustRecord::Strict(a))
+    );
+    c.approve_new_pin(server, &a.to_string(), &b.to_string())
+        .unwrap();
+    assert_eq!(
+        c.trust_record(server).unwrap(),
+        Some(TrustRecord::Strict(b))
+    );
+    c.clear_strict_pin(server).unwrap();
+    assert_eq!(
+        c.trust_record(server).unwrap(),
+        Some(TrustRecord::Pinned(b))
+    );
+    assert!(c.pin_notices().unwrap().is_empty());
+    c.forget_trust(server).unwrap();
+    assert_eq!(c.trust_record(server).unwrap(), None);
+}
+
+#[tokio::test]
+async fn area_methods_say_they_are_not_implemented() {
+    let c = client();
+    let account = c.add_guest("chat.example.org", "sam").unwrap().id;
+    let conv = crate::store::conversations::ConversationId(1);
+    let message = types::MessageId([0; 16]);
+    let not_implemented = |r: Result<()>, name: &str| match r {
+        Err(Error::NotImplemented(n)) => assert_eq!(n, name),
+        other => panic!("{name}: {other:?}"),
+    };
+    not_implemented(
+        c.create_identity("chat.example.org", "alice", "laptop")
+            .await
+            .map(drop),
+        "create_identity",
+    );
+    not_implemented(c.own_identities().map(drop), "own_identities");
+    not_implemented(c.conversations(account).map(drop), "conversations");
+    not_implemented(c.send_text(conv, "hi", None).await.map(drop), "send_text");
+    not_implemented(c.leaf_status(conv).map(drop), "leaf_status");
+    not_implemented(c.fetch_file(conv, message).await.map(drop), "fetch_file");
+    not_implemented(c.backup_now(account).await.map(drop), "backup_now");
+    not_implemented(c.handle_push(b"").await.map(drop), "handle_push");
+    not_implemented(c.report_recipients(conv).map(drop), "report_recipients");
+}
+
+#[tokio::test]
+async fn an_identity_cannot_connect_until_it_can_sign_in() {
+    let c = client();
+    let alice = c
+        .add_identity_account("chat.example.org", "alice@example.org")
+        .unwrap();
+    assert!(matches!(
+        c.connect(alice.id).await,
+        Err(Error::NotImplemented("identity_sign_in"))
+    ));
+}
+
+/// The next connection event of `account`, skipping others.
+async fn next_state(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    account: crate::store::AccountId,
+) -> (Slot, ConnectionState) {
     loop {
-        let page = conv.messages(cursor, MAX_PAGE).unwrap();
-        let mut older = page.messages;
-        older.append(&mut out);
-        out = older;
-        match page.older {
-            Some(c) => cursor = Some(c),
-            None => return out,
-        }
-    }
-}
-
-#[tokio::test]
-async fn writes_from_another_process_reach_timelines() {
-    // The app and its notification extension share one cache file.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("cache.db");
-    let app = Client::open(
-        &path,
-        &crate::store::DatabaseKey::for_tests(),
-        ClientOptions::default(),
-    )
-    .unwrap();
-    let extension = Client::open(
-        &path,
-        &crate::store::DatabaseKey::for_tests(),
-        ClientOptions::default(),
-    )
-    .unwrap();
-    let sam = app.add_guest(SERVER, "sam").unwrap();
-    let general = sam.conversation("#general").unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    // The app's own writes do not count.
-    assert!(!app.check_for_external_changes().unwrap());
-
-    let timeline = general.timeline(50).unwrap();
-    assert_eq!(timeline.items().len(), 1);
-    let events = sam.subscribe();
-
-    // The extension stores a message. The app hears nothing of it...
-    let other = extension.add_guest(SERVER, "sam").unwrap();
-    store_events(
-        &other,
-        "#general",
-        "k1",
-        &[event(2, "from=~bob MSG #general hi")],
-    );
-    assert_eq!(general.messages(None, 50).unwrap().messages.len(), 2);
-    // ...until it checks.
-    assert!(app.check_for_external_changes().unwrap());
-    assert!(!app.check_for_external_changes().unwrap());
-    assert_eq!(events.next().await, Some(AccountEvent::CacheChanged));
-    match timeline.next().await.unwrap().as_slice() {
-        [TimelineDiff::Reset { items }] => {
-            assert_eq!(items.len(), 2);
-            assert_eq!(items[1].text.as_deref(), Some("hi"));
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(timeline.items().len(), 2);
-
-    // A refresh by hand does the same for one timeline.
-    store_events(
-        &other,
-        "#general",
-        "k1",
-        &[event(3, "from=~bob MSG #general again")],
-    );
-    timeline.refresh().await.unwrap();
-    match timeline.next().await.unwrap().as_slice() {
-        [TimelineDiff::Reset { items }] => assert_eq!(items.len(), 3),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn an_error_is_permanent_exactly_when_the_supervisor_stops_on_it() {
-    // The supervisor stops on conn::Error::is_permanent, and apps read
-    // ClientError::is_permanent (Account::connect). They must agree, for
-    // every code, with and without retry.
-    use crate::conn::{CommandError, Error};
-    use risala_proto::error::ErrorCode;
-    use risala_proto::server::ErrResponse;
-    let codes = [
-        "bad-syntax",
-        "unknown-command",
-        "too-long",
-        "not-authenticated",
-        "already-authenticated",
-        "auth-failed",
-        "unavailable",
-        "name-taken",
-        "not-found",
-        "forbidden",
-        "last-owner",
-        "not-supported",
-        "encrypted",
-        "stale",
-        "invalid",
-        "rate-limited",
-        "internal",
-        "some-future-code",
-    ];
-    for code in codes {
-        for retry in [None, Some(30)] {
-            let err = ErrResponse {
-                code: code.parse::<ErrorCode>().unwrap(),
-                retry,
-                message: String::new(),
-            };
-            let e = Error::Rejected(CommandError::Server(err));
-            let client = ClientError::from_sign_in(SERVER, &e);
-            assert_eq!(
-                client.is_permanent(),
-                e.is_permanent(),
-                "{code} retry={retry:?}: {client:?}"
-            );
-        }
-    }
-    for e in [
-        Error::Timeout,
-        Error::NoSni,
-        Error::NoRegistration,
-        Error::NonceUsed,
-        Error::UnsupportedVersion(2),
-        Error::Rejected(CommandError::Unparseable("ERR".into())),
-    ] {
-        let client = ClientError::from_sign_in(SERVER, &e);
-        assert_eq!(client.is_permanent(), e.is_permanent(), "{e:?}");
-    }
-}
-
-#[test]
-fn errors_carry_kinds_to_localize() {
-    use crate::conn::{CloseReason, Error};
-    let e = ClientError::from_conn("x", &Error::Timeout);
-    assert!(matches!(
-        e,
-        ClientError::Connection {
-            kind: ConnectionErrorKind::Timeout,
-            permanent: false,
-            ..
-        }
-    ));
-    let e = ClientError::from_conn(
-        "x",
-        &Error::KeyExchange(rustls::Error::General("no group".into())),
-    );
-    assert!(matches!(
-        e,
-        ClientError::Connection {
-            kind: ConnectionErrorKind::KeyExchange,
-            permanent: true,
-            ..
-        }
-    ));
-    let e = ClientError::from_conn("x", &Error::Closed(CloseReason::PingTimeout));
-    assert!(matches!(
-        e,
-        ClientError::Connection {
-            kind: ConnectionErrorKind::Closed,
-            ..
-        }
-    ));
-    assert_eq!(
-        DisconnectKind::of(&CloseReason::Server { bye: None }),
-        DisconnectKind::Server
-    );
-    // An ERR keeps its retry tag (3.2).
-    let err = "@retry=30 ERR rate-limited slow down"
-        .parse::<risala_proto::server::ServerMessage>()
-        .unwrap();
-    let ServerLine::Err(err) = err.line else {
-        panic!("{err:?}")
-    };
-    assert_eq!(
-        ClientError::server(&err),
-        ClientError::Server {
-            code: "rate-limited".into(),
-            message: "slow down".into(),
-            retry_after_secs: Some(30),
-        }
-    );
-
-    // Outbox failures: "room changed" and "dropped" differ by kind.
-    let store = Store::open_in_memory().unwrap();
-    let server = parse_server(SERVER).unwrap();
-    let account = store.account(&server, &"~sam".parse().unwrap()).unwrap();
-    let conv: Conv = "#general".parse().unwrap();
-    for (why, kind, maybe) in [
-        (FailReason::RoomChanged, FailKind::RoomChanged, false),
-        (FailReason::Dropped, FailKind::Dropped, false),
-        (FailReason::NotInRoom, FailKind::NotInRoom, false),
-        (FailReason::Unconfirmed, FailKind::Unconfirmed, true),
-        (FailReason::Invalid, FailKind::Invalid, false),
-        (
-            FailReason::Rejected(risala_proto::error::ErrorCode::Forbidden),
-            FailKind::Rejected,
-            false,
-        ),
-    ] {
-        let (id, _) = store
-            .write(|tx| {
-                let id = tx.queue(account, &conv, None, &Draft::text("hi"), Timestamp::MIN)?;
-                tx.outbox_failed(id, why.clone())?;
-                Ok(id)
-            })
-            .unwrap();
-        let entry = OutboxEntry::from(store.outbox_item(id).unwrap().unwrap());
-        match entry.status {
-            OutboxStatus::Failed {
-                kind: k,
-                maybe_sent,
-                ..
-            } => assert_eq!((k, maybe_sent), (kind, maybe), "{why:?}"),
-            other => panic!("{other:?}"),
-        }
-    }
-}
-
-#[test]
-fn messages_say_whether_they_are_the_accounts_own() {
-    // A guest signed in as ~sam2 (4.2): its messages are its own, and
-    // ~sam's are someone else's.
-    let sam = guest();
-    let shared = sam.shared();
-    let conv: Conv = "#general".parse().unwrap();
-    let account = shared.id;
-    shared
-        .store
-        .write(|tx| {
-            tx.signed_in_as(&"~sam2".parse().unwrap());
-            let mut row = tx.conv_or_create(account, &conv)?;
-            tx.learn_id(&mut row, &"k1".parse().unwrap(), None)?;
-            tx.store_event(&row, &event(1, "from=~sam2 MSG #general mine"))?;
-            tx.store_event(&row, &event(2, "from=~sam MSG #general theirs"))
-        })
-        .unwrap();
-    let own: Vec<(String, bool)> = sam
-        .conversation("#general")
-        .unwrap()
-        .messages(None, 10)
-        .unwrap()
-        .messages
-        .into_iter()
-        .map(|m| (m.text.unwrap(), m.own))
-        .collect();
-    assert_eq!(own, [("mine".into(), true), ("theirs".into(), false)]);
-}
-
-#[test]
-fn conversation_info_has_the_topic_and_settings() {
-    let sam = guest();
-    let shared = sam.shared();
-    let conv: Conv = "#general".parse().unwrap();
-    let account = shared.id;
-    let snapshot = |line: &str| match line.parse::<ServerMessage>().unwrap().line {
-        ServerLine::Event(e) => e,
-        other => panic!("{other:?}"),
-    };
-    shared
-        .store
-        .write(|tx| {
-            let mut row = tx.conv_or_create(account, &conv)?;
-            tx.learn_id(&mut row, &"k1".parse().unwrap(), Some(1))?;
-            tx.apply_snapshot(&row, &snapshot("SET #general topic Plans\\nfor now"))?;
-            tx.apply_snapshot(&row, &snapshot("SET #general guests write"))?;
-            tx.apply_snapshot(&row, &snapshot("SET #general public yes"))
-        })
-        .unwrap();
-    let general = sam.conversation("#general").unwrap();
-    assert!(!general.info().unwrap().unwrap().announcements);
-    shared
-        .store
-        .write(|tx| {
-            let row = tx.conv_or_create(account, &conv)?;
-            tx.apply_snapshot(&row, &snapshot("SET #general send mods"))
-        })
-        .unwrap();
-    assert!(general.info().unwrap().unwrap().announcements);
-    let info = sam
-        .conversation("#general")
-        .unwrap()
-        .info()
-        .unwrap()
-        .unwrap();
-    assert_eq!(info.topic, "Plans\nfor now");
-    let settings: Vec<(&str, &str)> = info
-        .settings
-        .iter()
-        .map(|s| (s.key.as_str(), s.value.as_str()))
-        .collect();
-    assert_eq!(
-        settings,
-        [
-            ("guests", "write"),
-            ("public", "yes"),
-            ("send", "mods"),
-            ("topic", "Plans\nfor now")
-        ]
-    );
-}
-
-#[tokio::test]
-async fn the_timeline_shows_the_outbox_until_sent() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    let timeline = general.timeline(50).unwrap();
-    let next = || async {
-        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+        let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
             .await
-            .expect("diffs")
-            .expect("not closed")
-    };
-
-    // Queued offline: a pending item after the stored ones.
-    let entry = general.send("hello").await.unwrap();
-    match next().await.as_slice() {
-        [TimelineDiff::Insert { index: 1, item }] => {
-            assert_eq!(item.seq, 0);
-            assert!(item.own);
-            assert_eq!(item.text.as_deref(), Some("hello"));
-            assert_eq!(item.outbox.as_ref().unwrap().status, OutboxStatus::Queued);
+            .expect("an event in time")
+            .expect("events");
+        if let Event::Connection(e) = event
+            && e.account == account
+        {
+            return (e.slot, e.state);
         }
-        other => panic!("{other:?}"),
-    }
-
-    // Sent: its event goes in among the stored ones, and the pending item
-    // goes.
-    let shared = sam.shared().clone();
-    let (account, conv) = (shared.id, "#general".parse::<Conv>().unwrap());
-    let ((), changes) = shared
-        .store
-        .write(|tx| {
-            let row = tx.conv_by_name(account, &conv)?.unwrap();
-            tx.store_event(&row, &event(2, "from=~sam MSG #general hello"))?;
-            tx.outbox_sent(crate::store::OutboxId(entry.id), Seq::new(2).unwrap())
-        })
-        .unwrap();
-    shared.publish(Batch {
-        reload: false,
-        changes,
-        events: Vec::new(),
-    });
-    // It lands where the entry was: one update, keeping the entry's id.
-    let queued_id = timeline.items()[1].id.clone();
-    match next().await.as_slice() {
-        [TimelineDiff::Update { index: 1, item }] => {
-            assert_eq!((item.seq, item.outbox.is_none()), (2, true));
-            assert_eq!(item.id, queued_id);
-        }
-        other => panic!("{other:?}"),
-    }
-    // The id is the cache's, not the timeline's: it survives a reload.
-    timeline.refresh().await.unwrap();
-    match next().await.as_slice() {
-        [TimelineDiff::Reset { items }] => assert_eq!(items[1].id, queued_id),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(
-        general.messages(None, 10).unwrap().messages[1].id,
-        queued_id
-    );
-
-    // Failed: updated in place, until the app removes it.
-    let entry = general.send("again").await.unwrap();
-    assert!(matches!(
-        next().await.as_slice(),
-        [TimelineDiff::Insert { index: 2, .. }]
-    ));
-    let ((), changes) = shared
-        .store
-        .write(|tx| tx.outbox_failed(crate::store::OutboxId(entry.id), FailReason::Unconfirmed))
-        .unwrap();
-    shared.publish(Batch {
-        reload: false,
-        changes,
-        events: Vec::new(),
-    });
-    match next().await.as_slice() {
-        [TimelineDiff::Update { index: 2, item }] => assert!(matches!(
-            item.outbox.as_ref().unwrap().status,
-            OutboxStatus::Failed {
-                kind: FailKind::Unconfirmed,
-                ..
-            }
-        )),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(timeline.items().len(), 3);
-    sam.remove_outbox(entry.id).unwrap();
-    assert!(matches!(
-        next().await.as_slice(),
-        [TimelineDiff::Remove { index: 2 }]
-    ));
-    assert_eq!(timeline.items().len(), 2);
-}
-
-/// Writes to the cache as the sync engine would, and tells the account's
-/// subscribers.
-fn write(account: &Account, f: impl FnOnce(&mut crate::store::Tx<'_>) -> Result<(), StoreError>) {
-    let shared = account.shared();
-    let ((), changes) = shared.store.write(f).unwrap();
-    shared.publish(Batch {
-        reload: false,
-        changes,
-        events: Vec::new(),
-    });
-}
-
-/// Stores `event` in `#general`.
-fn store_in_general(account: &Account, event: Event) {
-    let (id, conv) = (account.id(), "#general".parse::<Conv>().unwrap());
-    write(account, |tx| {
-        let row = tx.conv_by_name(id, &conv)?.unwrap();
-        tx.store_event(&row, &event)?;
-        Ok(())
-    });
-}
-
-/// Marks outbox entry `id` as being sent.
-fn sending(account: &Account, id: i64) {
-    let claim = crate::store::Claim {
-        instance: "test".into(),
-        connection: 1,
-    };
-    let now = Timestamp::from_unix_millis(1_800_000_000_000).unwrap();
-    write(account, |tx| {
-        tx.outbox_sending(crate::store::OutboxId(id), &claim, now)
-    });
-}
-
-fn sent(account: &Account, id: i64, seq: u64) {
-    write(account, |tx| {
-        tx.outbox_sent(crate::store::OutboxId(id), Seq::new(seq).unwrap())
-    });
-}
-
-#[tokio::test]
-async fn a_sent_message_keeps_its_id_whatever_the_order() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    let timeline = general.timeline(50).unwrap();
-    let next = || async {
-        tokio::time::timeout(Duration::from_secs(5), timeline.next())
-            .await
-            .expect("diffs")
-            .expect("not closed")
-    };
-    let ids = |t: &Timeline| t.items().into_iter().map(|m| m.id).collect::<Vec<_>>();
-
-    // The event comes before its OK (5.3), in another batch. It is held
-    // back, so the message is never shown twice, then takes the entry's
-    // place.
-    let entry = general.send("hello").await.unwrap();
-    next().await;
-    sending(&sam, entry.id);
-    next().await;
-    let id = timeline.items()[1].id.clone();
-    store_in_general(&sam, event(2, "from=~sam MSG #general hello"));
-    sent(&sam, entry.id, 2);
-    match next().await.as_slice() {
-        [TimelineDiff::Update { index: 1, item }] => {
-            assert_eq!((item.seq, &item.id), (2, &id));
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(ids(&timeline), ["e1".to_owned(), id]);
-
-    // Someone else's message lands between: a remove and an insert.
-    let entry = general.send("again").await.unwrap();
-    next().await;
-    let id = timeline.items()[2].id.clone();
-    store_in_general(&sam, event(4, "from=~ann MSG #general between"));
-    next().await;
-    write(&sam, |tx| {
-        let row = tx
-            .conv_by_name(sam.id(), &"#general".parse().unwrap())?
-            .unwrap();
-        tx.store_event(&row, &event(3, "from=~sam MSG #general again"))?;
-        tx.outbox_sent(crate::store::OutboxId(entry.id), Seq::new(3).unwrap())
-    });
-    match next().await.as_slice() {
-        [
-            TimelineDiff::Remove { index: 3 },
-            TimelineDiff::Insert { index: 2, item },
-        ] => assert_eq!(item.id, id),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(
-        timeline.items().iter().map(|m| m.seq).collect::<Vec<_>>(),
-        [1, 2, 3, 4]
-    );
-
-    // The OK comes for an event that is not stored yet: the entry goes,
-    // and the event arrives later with its id.
-    let entry = general.send("late").await.unwrap();
-    next().await;
-    let id = timeline.items()[4].id.clone();
-    sending(&sam, entry.id);
-    next().await;
-    sent(&sam, entry.id, 6);
-    assert_eq!(next().await, [TimelineDiff::Remove { index: 4 }]);
-    store_in_general(&sam, event(6, "from=~sam MSG #general late"));
-    match next().await.as_slice() {
-        [TimelineDiff::Insert { index: 4, item }] => assert_eq!(item.id, id),
-        other => panic!("{other:?}"),
     }
 }
 
 #[tokio::test]
-async fn a_held_message_shows_when_its_entry_fails() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    let timeline = general.timeline(50).unwrap();
-    let next = || async {
-        tokio::time::timeout(Duration::from_secs(5), timeline.next())
-            .await
-            .expect("diffs")
-            .expect("not closed")
-    };
-    let entry = general.send("hi").await.unwrap();
-    next().await;
-    sending(&sam, entry.id);
-    next().await;
-    // An own message with the same text, perhaps the entry's: held.
-    store_in_general(&sam, event(2, "from=~sam MSG #general hi"));
-    // The connection dropped before the OK: it is not the entry's after
-    // all, as far as anyone knows, so it shows under its own id.
-    write(&sam, |tx| {
-        tx.outbox_failed(crate::store::OutboxId(entry.id), FailReason::Unconfirmed)
-    });
-    match next().await.as_slice() {
-        [
-            TimelineDiff::Update {
-                index: 1,
-                item: failed,
-            },
-            TimelineDiff::Insert { index: 1, item },
-        ] => {
-            assert!(failed.outbox.is_some());
-            assert_eq!((item.seq, item.id.as_str()), (2, "e2"));
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(
-        timeline.items().iter().map(|m| m.seq).collect::<Vec<_>>(),
-        [1, 2, 0]
-    );
-}
-
-#[tokio::test]
-async fn the_timeline_knows_when_it_reaches_the_start() {
-    let sam = guest();
-    let general = sam.conversation("#general").unwrap();
-    // A conversation the cache does not know has nothing older.
-    assert!(general.timeline(4).unwrap().at_start());
-
-    // Events 5 to 10: 1 to 4 are not stored, and may be on the server.
-    let events: Vec<Event> = (5..=10)
-        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
-        .collect();
-    store_events(&sam, "#general", "k1", &events);
-    let timeline = general.timeline(4).unwrap();
-    assert!(!timeline.at_start());
-    // The cache runs out, but the server may have more.
-    assert!(timeline.paginate_back(4).await.unwrap());
-    assert!(!timeline.at_start());
-    let next = || async {
-        tokio::time::timeout(Duration::from_secs(5), timeline.next())
-            .await
-            .expect("diffs")
-            .expect("not closed")
-    };
-    assert_eq!(next().await.len(), 2);
-
-    // A HISTORY reply shows that 1 to 4 expired (7.5): the sync point
-    // moves past them. Nothing is inserted; an empty batch says so.
-    let (id, conv) = (sam.id(), "#general".parse::<Conv>().unwrap());
-    write(&sam, |tx| {
-        let mut row = tx.conv_by_name(id, &conv)?.unwrap();
-        tx.raise_sync_point(&mut row, 4)
-    });
-    assert!(next().await.is_empty());
-    assert!(timeline.at_start());
-
-    // History that starts at seq 1 is complete without a sync point.
-    let dev = sam.conversation("#dev").unwrap();
-    store_events(
-        &sam,
-        "#dev",
-        "k2",
-        &[
-            event(1, "from=~ann;id=k2 JOIN #dev"),
-            event(2, "from=~ann MSG #dev hi"),
-        ],
-    );
-    let timeline = dev.timeline(1).unwrap();
-    assert!(!timeline.at_start());
-    timeline.paginate_back(5).await.unwrap();
-    assert!(timeline.at_start());
-}
-
-#[test]
-fn reads_come_in_bounded_pages() {
-    let sam = guest();
-    let events: Vec<Event> = (1..=7)
-        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
-        .collect();
-    store_events(&sam, "#general", "k1", &events);
-    store_events(&sam, "#a", "k2", &[]);
-    store_events(&sam, "#b", "k3", &[]);
-    let general = sam.conversation("#general").unwrap();
-
-    // Messages, newest page first, then older ones by cursor.
-    let mut seqs = Vec::new();
-    let mut cursor = None;
-    loop {
-        let page = general.messages(cursor, 3).unwrap();
-        assert!(page.messages.len() <= 3);
-        let mut these: Vec<u64> = page.messages.iter().map(|m| m.seq).collect();
-        these.append(&mut seqs);
-        seqs = these;
-        match page.older {
-            Some(c) => cursor = Some(c),
-            None => break,
-        }
-    }
-    assert_eq!(seqs, [1, 2, 3, 4, 5, 6, 7]);
-    // A full last page says there is nothing older.
-    let page = general.messages(None, 7).unwrap();
-    assert_eq!((page.messages.len(), page.older), (7, None));
-    assert!(matches!(
-        general.messages(Some("bad".into()), 3),
-        Err(ClientError::Invalid(_))
-    ));
-
-    // Conversations, by name.
-    let first = sam.conversations(None, 2).unwrap();
-    let names: Vec<&str> = first
-        .conversations
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    assert_eq!(names, ["#a", "#b"]);
-    let rest = sam.conversations(first.next, 2).unwrap();
-    let names: Vec<&str> = rest.conversations.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!((names, rest.next), (vec!["#general"], None));
-
-    // The library caps what one page may ask for.
-    let many: Vec<Event> = (8..=8 + u64::from(MAX_PAGE))
-        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
-        .collect();
-    store_events(&sam, "#general", "k1", &many);
-    let page = general.messages(None, u32::MAX).unwrap();
-    assert_eq!(page.messages.len(), MAX_PAGE as usize);
-    assert!(page.older.is_some());
-    assert_eq!(
-        general.messages(None, 0).unwrap().messages.len(),
-        DEFAULT_PAGE as usize
-    );
-}
-
-/// A key store whose `load` blocks until released, as a platform key
-/// store waiting for the user might.
-struct SlowKeys {
-    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
-    released: std::sync::atomic::AtomicBool,
-}
-
-impl crate::conn::keys::KeyStore for SlowKeys {
-    fn load(
-        &self,
-        _id: &str,
-    ) -> Result<Option<risala_proto::auth::SecretKey>, crate::conn::keys::KeyStoreError> {
-        if let Some(entered) = self.entered.lock().unwrap().take() {
-            let _ = entered.send(());
-        }
-        let released = self
-            .release
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(20))
-            .is_ok();
-        self.released
-            .store(released, std::sync::atomic::Ordering::SeqCst);
-        Ok(None)
-    }
-
-    fn save(
-        &self,
-        _id: &str,
-        _key: &risala_proto::auth::SecretKey,
-    ) -> Result<(), crate::conn::keys::KeyStoreError> {
-        Ok(())
-    }
-
-    fn delete(&self, _id: &str) -> Result<(), crate::conn::keys::KeyStoreError> {
-        Ok(())
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn loading_a_key_does_not_block_the_runtime() {
-    // One worker thread: if load() ran on it, the task that releases it
-    // could not run until load() gave up.
-    let (entered_tx, entered) = tokio::sync::oneshot::channel();
-    let (release, release_rx) = std::sync::mpsc::channel();
-    let keys = Arc::new(SlowKeys {
-        entered: Mutex::new(Some(entered_tx)),
-        release: Mutex::new(release_rx),
-        released: Default::default(),
-    });
-    let client = Client::open_in_memory(ClientOptions {
-        // Scripted servers here expect exact command sequences; encryption
-        // (12) is tested on its own.
-        sync: crate::sync::SyncConfig {
-            encryption: false,
-            ..crate::sync::SyncConfig::default()
-        },
-        keys: Some(keys.clone()),
-        ..ClientOptions::default()
-    })
-    .unwrap();
-    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
-    tokio::spawn(async move {
-        entered.await.unwrap();
-        release.send(()).unwrap();
-    });
-    let err = alice.connect().await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            ClientError::Keys {
-                kind: KeyErrorKind::NoKey,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    assert!(keys.released.load(std::sync::atomic::Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn a_notice_comes_after_the_changes_before_it() {
-    // 8.4: a NOTICE is reported in arrival order, after what the lines
-    // before it changed, even when they arrive together.
-    use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
-    let ca = TestCa::new();
-    let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, mut peer: Peer| async move {
-        peer.greet().await;
-        peer.expect("@ref=1 GUEST sam").await;
-        peer.send("@ref=1 OK uid=~sam token=t1").await;
-        peer.expect("@ref=2 SYNC").await;
-        let t = Timestamp::from_unix_millis(1_800_000_000_001).unwrap();
-        peer.send(&format!(
-            "@ref=2 CONV #general k1 1 0\n@ref=2 OK\n\
-             @seq=1;t={t};from=~ann MSG #general hi\nNOTICE maintenance soon"
-        ))
-        .await;
-        while let Some(line) = peer.recv().await {
-            if let Some(r) = line.strip_suffix(" QUIT") {
-                peer.send(&format!("{r} OK")).await;
-                break;
-            }
-        }
-        peer.close().await;
-    })
-    .await;
-    let client = Client::open_in_memory(ClientOptions {
-        // Scripted servers here expect exact command sequences; encryption
-        // (12) is tested on its own.
-        sync: crate::sync::SyncConfig {
-            encryption: false,
-            ..crate::sync::SyncConfig::default()
-        },
-        session: crate::conn::SessionOptions {
-            ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
-            connect_to: Some(server.addr),
-            ..crate::conn::SessionOptions::default()
-        },
-        ..ClientOptions::default()
-    })
-    .unwrap();
-    let sam = client.add_guest("chat.test", "sam").unwrap();
-    let events = sam.subscribe();
-    sam.start();
-    let mut stored = false;
-    loop {
-        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
-            .await
-            .expect("events")
-            .expect("not closed");
-        match event {
-            AccountEvent::MessagesChanged { conversation } if conversation == "#general" => {
-                stored = true;
-            }
-            AccountEvent::Notice {
-                notice: Notice::Server { text },
-            } => {
-                assert_eq!(text, "maintenance soon");
-                assert!(stored, "the NOTICE came before the message before it");
-                break;
-            }
-            _ => {}
-        }
-    }
-    sam.disconnect().await;
-    server.done().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn admin_keys_does_not_block_the_runtime() {
-    // As loading_a_key_does_not_block_the_runtime, for the key ADMIN KEYS
-    // marks as this device's (10.5).
-    use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
-    let ca = TestCa::new();
-    let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, mut peer: Peer| async move {
-        peer.greet().await;
-        peer.expect("@ref=1 GUEST sam").await;
-        peer.send("@ref=1 OK uid=~sam token=t1").await;
-        peer.expect("@ref=2 SYNC").await;
-        peer.send("@ref=2 OK").await;
-        peer.expect("@ref=3 ADMIN KEYS alice@example.org").await;
-        peer.send("@ref=3 OK").await;
-        while let Some(line) = peer.recv().await {
-            if let Some(r) = line.strip_suffix(" QUIT") {
-                peer.send(&format!("{r} OK")).await;
-                break;
-            }
-        }
-        peer.close().await;
-    })
-    .await;
-    let (entered_tx, entered) = tokio::sync::oneshot::channel();
-    let (release, release_rx) = std::sync::mpsc::channel();
-    let keys = Arc::new(SlowKeys {
-        entered: Mutex::new(Some(entered_tx)),
-        release: Mutex::new(release_rx),
-        released: Default::default(),
-    });
-    let client = Client::open_in_memory(ClientOptions {
-        // Scripted servers here expect exact command sequences; encryption
-        // (12) is tested on its own.
-        sync: crate::sync::SyncConfig {
-            encryption: false,
-            ..crate::sync::SyncConfig::default()
-        },
-        session: crate::conn::SessionOptions {
-            ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
-            connect_to: Some(server.addr),
-            ..crate::conn::SessionOptions::default()
-        },
-        keys: Some(keys.clone()),
-        ..ClientOptions::default()
-    })
-    .unwrap();
-    let sam = client.add_guest("chat.test", "sam").unwrap();
-    tokio::time::timeout(Duration::from_secs(30), sam.connect())
-        .await
-        .expect("connecting")
-        .unwrap();
-    tokio::spawn(async move {
-        entered.await.unwrap();
-        release.send(()).unwrap();
-    });
-    let listed = tokio::time::timeout(
-        Duration::from_secs(30),
-        sam.admin().keys("alice@example.org"),
-    )
-    .await
-    .expect("ADMIN KEYS")
-    .unwrap();
-    assert!(listed.is_empty());
-    assert!(keys.released.load(std::sync::atomic::Ordering::SeqCst));
-    sam.disconnect().await;
-    server.done().await;
-}
-
-#[tokio::test]
-async fn a_room_missing_from_a_resumed_session_is_not_joined_again() {
-    // 4.2: a resumed session is still in its rooms, so one missing from
-    // SYNC was left while the connection was down. Its messages fail and
-    // it comes off the rooms to join again (PLAN.md 5, item 37).
-    use crate::conn::tests::server::{Peer, ScriptServer, TestCa};
+async fn a_guest_connects_and_keeps_its_session() {
     let ca = TestCa::new();
     let server = ScriptServer::start(ca.issue("chat.test"), 2, |i, mut peer: Peer| async move {
         peer.greet().await;
-        if i == 0 {
-            // A new session: the client joins #general again first.
-            peer.expect("@ref=1 GUEST sam").await;
-            peer.send("@ref=1 OK uid=~sam token=t1").await;
-            peer.expect("@ref=2 JOIN #general").await;
-            peer.send("@ref=2 OK id=k1 head=1").await;
-            peer.expect("@ref=3 SYNC").await;
-            peer.send("@ref=3 CONV #general k1 1 0\n@ref=3 OK").await;
-            // The connection drops; the session waits to be resumed.
-            peer.close().await;
-            return;
-        }
-        peer.expect("@ref=1 GUEST sam token=t1").await;
-        peer.send("@ref=1 OK uid=~sam token=t2 resumed=yes").await;
-        peer.expect("@ref=2 SYNC").await;
-        peer.send("@ref=2 OK").await;
-        while let Some(line) = peer.recv().await {
-            if let Some(r) = line.strip_suffix(" QUIT") {
-                peer.send(&format!("{r} OK")).await;
-                break;
+        match i {
+            0 => {
+                peer.expect("@ref=1 GUEST sam").await;
+                peer.send("@ref=1 OK uid=~sam token=tok1aaaaaaaaaaaaaaaa")
+                    .await;
+                peer.close().await;
+            }
+            _ => {
+                // The next connection resumes the session (4.2).
+                peer.expect("@ref=1 GUEST sam token=tok1aaaaaaaaaaaaaaaa")
+                    .await;
+                peer.send("@ref=1 OK uid=~sam token=tok2aaaaaaaaaaaaaaaa resumed=yes")
+                    .await;
+                peer.expect_eof().await;
             }
         }
-        peer.close().await;
     })
     .await;
-    let client = Client::open_in_memory(ClientOptions {
-        // Scripted servers here expect exact command sequences; encryption
-        // (12) is tested on its own.
-        sync: crate::sync::SyncConfig {
-            encryption: false,
-            ..crate::sync::SyncConfig::default()
-        },
+    let options = ClientOptions {
+        ca_verifier: Some(roots_ca_verifier([ca.cert.clone()]).unwrap()),
         session: crate::conn::SessionOptions {
-            ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
             connect_to: Some(server.addr),
-            ..crate::conn::SessionOptions::default()
+            ..Default::default()
         },
         backoff: crate::conn::Backoff {
-            initial: Duration::from_millis(5),
+            initial: Duration::from_millis(10),
             max: Duration::from_millis(20),
             stable_after: Duration::from_secs(3600),
         },
         ..ClientOptions::default()
-    })
-    .unwrap();
-    let sam = client.add_guest("chat.test", "sam").unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~sam;id=k1 JOIN #general")],
-    );
-    let general_room: risala_proto::names::Room = "#general".parse().unwrap();
-    sam.shared()
-        .store
-        .set_rejoin(sam.id(), &general_room, true)
-        .unwrap();
-    let events = sam.subscribe();
-    sam.start();
-    // Online, synced, then disconnected and online again: SYNC no longer
-    // lists #general.
-    let mut online = 0;
-    while online < 2 {
-        let event = tokio::time::timeout(Duration::from_secs(30), events.next())
-            .await
-            .expect("events")
-            .expect("not closed");
-        if let AccountEvent::State {
-            state: ConnectionState::Online { .. },
-        } = event
-        {
-            online += 1;
+    };
+    let c = Client::open_in_memory(options).unwrap();
+    let sam = c.add_guest("chat.test", "sam").unwrap();
+    let mut events = c.subscribe();
+    c.connect(sam.id).await.unwrap();
+    // Connecting again does nothing.
+    c.connect(sam.id).await.unwrap();
+
+    let mut ready = 0;
+    while ready < 2 {
+        let (slot, state) = next_state(&mut events, sam.id).await;
+        assert_eq!(slot, Slot::Guest);
+        if state == ConnectionState::Ready {
+            ready += 1;
         }
     }
-    tokio::time::timeout(Duration::from_secs(30), sam.wait_synced())
-        .await
-        .expect("syncing")
-        .unwrap();
-    let general = sam.conversation("#general").unwrap();
-    assert!(!general.info().unwrap().unwrap().joined);
-    assert!(
-        sam.shared()
-            .store
-            .rejoin_rooms(sam.id())
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        general.send("hi").await.unwrap_err(),
-        ClientError::NotJoined("#general".into())
-    );
-    sam.disconnect().await;
+    // Ready comes after the session is saved: the resumed one's token.
+    let (name, token) = c.store().guest_session(sam.id).unwrap().unwrap();
+    assert_eq!(name.as_str(), "sam");
+    assert_eq!(token.to_string(), "tok2aaaaaaaaaaaaaaaa");
+    // The trust record is CA (2.2).
+    assert_eq!(c.trust_record("chat.test").unwrap(), Some(TrustRecord::Ca));
+    c.disconnect(sam.id).await.unwrap();
     server.done().await;
-}
-
-/// The next batch of a chat list, or a panic after a while.
-async fn next_chats(list: &ChatList) -> ChatListBatch {
-    tokio::time::timeout(Duration::from_secs(5), list.next())
-        .await
-        .expect("a batch")
-        .expect("not closed")
-}
-
-fn names(items: &[ChatSummary]) -> Vec<String> {
-    items.iter().map(|c| c.conversation.clone()).collect()
-}
-
-fn counts(unread_chats: u64, total: u64) -> ChatCounts {
-    ChatCounts {
-        unread_chats,
-        total,
-    }
-}
-
-#[tokio::test]
-async fn the_chat_list_spans_accounts_newest_first() {
-    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
-    let sam = client.add_guest(SERVER, "sam").unwrap();
-    let alice = client
-        .add_identity("chat.example.net", "alice@example.org")
-        .unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=bob@example.org MSG #general hi")],
-    );
-    store_events(
-        &alice,
-        "#rust",
-        "k2",
-        &[
-            event(2, "from=carol@example.org;id=k2 JOIN #rust"),
-            event(3, "from=carol@example.org MSG #rust ownership\\nis hard"),
-            event(4, "from=carol@example.org;react=3 MSG #rust x"),
-        ],
-    );
-    let list = client.chat_list(ChatFilter::default(), 10).unwrap();
-    let items = list.items();
-    assert_eq!(names(&items), ["#rust", "#general"]);
-    let rust = &items[0];
-    assert_eq!(
-        (rust.account.server.as_str(), rust.account.uid.as_str()),
-        ("chat.example.net", "alice@example.org")
-    );
-    assert_eq!(
-        (rust.kind, rust.guest, rust.home_server),
-        (ChatKind::Room, false, false)
-    );
-    assert_eq!(rust.name.name, "#rust");
-    assert_eq!(rust.activity_ms, 1_800_000_000_003);
-    let last = rust.last.as_ref().unwrap();
-    // The newest message, not the reaction after it.
-    assert_eq!(
-        (last.text.as_str(), last.own),
-        ("ownership\nis hard", false)
-    );
-    assert_eq!(last.from.name, "carol@example.org");
-    assert_eq!((last.delivery, rust.unread), (Delivery::Sent, 1));
-    // A guest is at home where it is.
-    assert!(items[1].home_server);
-    assert_eq!(list.counts(), counts(2, 2));
-
-    // A new message moves its row to the top: a remove and an insert.
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(5, "from=bob@example.org MSG #general again")],
-    );
-    let batch = next_chats(&list).await;
-    match batch.diffs.as_slice() {
-        [
-            ChatListDiff::Remove { index: 1 },
-            ChatListDiff::Insert { index: 0, item },
-        ] => {
-            assert_eq!(item.last.as_ref().unwrap().text, "again");
-            assert_eq!(item.unread, 2);
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(names(&list.items()), ["#general", "#rust"]);
-
-    // A window of one keeps its size: the row pushed out goes.
-    let one = client.chat_list(ChatFilter::default(), 1).unwrap();
-    assert_eq!(names(&one.items()), ["#general"]);
-    store_events(
-        &alice,
-        "#rust",
-        "k2",
-        &[event(6, "from=carol@example.org MSG #rust borrow")],
-    );
-    match next_chats(&one).await.diffs.as_slice() {
-        [
-            ChatListDiff::Insert { index: 0, item },
-            ChatListDiff::Remove { index: 1 },
-        ] => {
-            assert_eq!(item.conversation, "#rust");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(one.counts().total, 2);
-    one.load_more(5).await.unwrap();
-    match next_chats(&one).await.diffs.as_slice() {
-        [ChatListDiff::Insert { index: 1, item }] => assert_eq!(item.conversation, "#general"),
-        other => panic!("{other:?}"),
-    }
-
-    // Favourites: an update in place, then a filter that shows them.
-    sam.conversation("#general")
-        .unwrap()
-        .set_favourite(true)
-        .unwrap();
-    let batch = next_chats(&one).await;
-    match batch.diffs.as_slice() {
-        [ChatListDiff::Update { index: 1, item }] => assert!(item.favourite),
-        other => panic!("{other:?}"),
-    }
-    one.set_filter(ChatFilter {
-        favourites: true,
-        ..ChatFilter::default()
-    })
-    .await
-    .unwrap();
-    let batch = next_chats(&one).await;
-    match batch.diffs.as_slice() {
-        [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#general"]),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!(batch.counts, counts(1, 1));
-    assert!(matches!(
-        sam.conversation("#nowhere").unwrap().set_favourite(true),
-        Err(ClientError::NotJoined(_))
-    ));
-
-    // A group tab: one server's conversations.
-    let net = client
-        .chat_list(
-            ChatFilter {
-                server: Some("CHAT.example.net".into()),
-                ..ChatFilter::default()
-            },
-            10,
-        )
-        .unwrap();
-    assert_eq!(names(&net.items()), ["#rust"]);
-    assert!(matches!(
-        client.chat_list(
-            ChatFilter {
-                server: Some("not a server".into()),
-                ..ChatFilter::default()
-            },
-            10
-        ),
-        Err(ClientError::Invalid(_))
-    ));
-
-    // Reading a conversation takes it off the unread toggle.
-    let unread = client
-        .chat_list(
-            ChatFilter {
-                unread: true,
-                ..ChatFilter::default()
-            },
-            10,
-        )
-        .unwrap();
-    assert_eq!(unread.counts(), counts(2, 2));
-    alice
-        .conversation("#rust")
-        .unwrap()
-        .mark_read(6)
-        .await
-        .unwrap();
-    let batch = next_chats(&unread).await;
-    assert_eq!(batch.diffs, [ChatListDiff::Remove { index: 0 }]);
-    assert_eq!(batch.counts, counts(1, 1));
-
-    // A removed account's conversations leave.
-    client.remove_account(&alice).await.unwrap();
-    loop {
-        if let [ChatListDiff::Reset { items }] = next_chats(&list).await.diffs.as_slice() {
-            assert_eq!(names(items), ["#general"]);
-            break;
-        }
-    }
-}
-
-#[tokio::test]
-async fn writes_from_another_process_reach_chat_lists() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("cache.db");
-    let extension = Client::open(
-        &path,
-        &crate::store::DatabaseKey::for_tests(),
-        ClientOptions::default(),
-    )
-    .unwrap();
-    let sam = extension.add_guest(SERVER, "sam").unwrap();
-    let alice = extension
-        .add_identity("chat.example.net", "alice@example.org")
-        .unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=~bob MSG #general hi")],
-    );
-    // The app shows the chat list before it has a handle to any account.
-    let app = Client::open(
-        &path,
-        &crate::store::DatabaseKey::for_tests(),
-        ClientOptions::default(),
-    )
-    .unwrap();
-    let list = app.chat_list(ChatFilter::default(), 10).unwrap();
-    assert_eq!(names(&list.items()), ["#general"]);
-
-    store_events(
-        &alice,
-        "#rust",
-        "k2",
-        &[event(2, "from=carol@example.org MSG #rust hello")],
-    );
-    assert!(app.check_for_external_changes().unwrap());
-    match next_chats(&list).await.diffs.as_slice() {
-        [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#rust", "#general"]),
-        other => panic!("{other:?}"),
-    }
-
-    // With handles to both accounts, it is still one reset.
-    app.accounts().unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(3, "from=~bob MSG #general again")],
-    );
-    assert!(app.check_for_external_changes().unwrap());
-    match next_chats(&list).await.diffs.as_slice() {
-        [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#general", "#rust"]),
-        other => panic!("{other:?}"),
-    }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), list.next())
-            .await
-            .is_err()
-    );
-}
-
-/// A client whose clock is just after the test events' times, so that
-/// what it queues is newer than what is stored.
-fn clocked_guest() -> Account {
-    let options = ClientOptions {
-        sync: crate::sync::SyncConfig {
-            clock: crate::sync::Clock::new(|| {
-                Timestamp::from_unix_millis(1_800_000_001_000).unwrap()
-            }),
-            ..crate::sync::SyncConfig::default()
-        },
-        ..ClientOptions::default()
-    };
-    let client = Client::open_in_memory(options).unwrap();
-    client.add_guest(SERVER, "sam").unwrap()
-}
-
-#[tokio::test]
-async fn a_failed_message_is_retried_in_its_place() {
-    let sam = clocked_guest();
-    let general = sam.conversation("#general").unwrap();
-    store_events(
-        &sam,
-        "#general",
-        "k1",
-        &[event(1, "from=bob@example.org MSG #general hi")],
-    );
-    let list = sam.client().chat_list(ChatFilter::default(), 10).unwrap();
-    let preview = |list: &ChatList| list.items()[0].last.clone().unwrap();
-
-    let first = general.send("one").await.unwrap();
-    let second = general.send("two").await.unwrap();
-    // The newest message in the outbox is the preview.
-    while preview(&list).text != "two" {
-        next_chats(&list).await;
-    }
-    assert_eq!(
-        (preview(&list).own, preview(&list).delivery),
-        (true, Delivery::Sending)
-    );
-    assert_eq!(list.items()[0].activity_ms, 1_800_000_001_000);
-
-    // Only a failed entry can be retried.
-    assert!(matches!(
-        sam.retry_outbox(first.id),
-        Err(ClientError::Invalid(_))
-    ));
-    write(&sam, |tx| {
-        tx.outbox_failed(crate::store::OutboxId(second.id), FailReason::Unconfirmed)
-    });
-    let timeline = general.timeline(50).unwrap();
-    while preview(&list).delivery == Delivery::Sending {
-        next_chats(&list).await;
-    }
-    assert_eq!(
-        preview(&list).delivery,
-        Delivery::Failed { maybe_sent: true }
-    );
-
-    sam.retry_outbox(second.id).unwrap();
-    // The timeline shows it queued again, where it was, with its id.
-    let next = tokio::time::timeout(Duration::from_secs(5), timeline.next())
-        .await
-        .unwrap()
-        .unwrap();
-    match next.as_slice() {
-        [TimelineDiff::Update { index: 2, item }] => {
-            assert_eq!(item.id, format!("o{}", second.id));
-            assert_eq!(item.outbox.as_ref().unwrap().status, OutboxStatus::Queued);
-        }
-        other => panic!("{other:?}"),
-    }
-    let ids: Vec<i64> = sam.outbox().unwrap().iter().map(|e| e.id).collect();
-    assert_eq!(ids, [first.id, second.id]);
-    while preview(&list).delivery != Delivery::Sending {
-        next_chats(&list).await;
-    }
-    // Entries of another account are not this one's to retry.
-    let other = sam.client().add_guest(SERVER, "kim").unwrap();
-    assert!(matches!(
-        other.retry_outbox(second.id),
-        Err(ClientError::Invalid(_))
-    ));
-}
-
-#[test]
-fn a_direct_chat_is_named_by_the_other_persons_label() {
-    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
-    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
-    store_events(
-        &alice,
-        "bob@example.org",
-        "d1",
-        &[event(1, "from=bob@example.org MSG bob@example.org hi")],
-    );
-    store_events(
-        &alice,
-        "~kim",
-        "d2",
-        &[event(2, "from=~kim MSG ~kim hello")],
-    );
-    let (account, bob, me) = (
-        alice.id(),
-        "bob@example.org".parse().unwrap(),
-        "alice@example.org".parse().unwrap(),
-    );
-    // Bob calls himself what alice calls herself.
-    write(&alice, |tx| {
-        tx.set_user_name(account, &bob, "Alice")?;
-        tx.set_user_name(account, &me, "Alice")?;
-        Ok(())
-    });
-    let items = client.chat_list(ChatFilter::default(), 10).unwrap().items();
-    assert_eq!(names(&items), ["~kim", "bob@example.org"]);
-    let (kim, bob) = (&items[0], &items[1]);
-    assert_eq!(
-        (kim.kind, kim.guest, kim.topic.as_str()),
-        (ChatKind::Direct, true, "")
-    );
-    assert_eq!(kim.name.name, "~kim");
-    assert_eq!((bob.kind, bob.guest), (ChatKind::Direct, false));
-    let shown = Label {
-        name: "Alice".into(),
-        uid: Some("bob@example.org".into()),
-    };
-    assert_eq!(bob.name, shown);
-    assert_eq!(bob.last.as_ref().unwrap().from, shown);
-    // The rooms toggle leaves them out.
-    let rooms = client
-        .chat_list(
-            ChatFilter {
-                rooms: true,
-                ..ChatFilter::default()
-            },
-            10,
-        )
-        .unwrap();
-    assert!(rooms.items().is_empty());
-    assert_eq!(rooms.counts().total, 0);
 }

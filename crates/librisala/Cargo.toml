@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 risala-proto.workspace = true
 risala-mls.workspace = true
+risala-keylog.workspace = true
 risala-keyfetch.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
@@ -43,7 +44,6 @@ openmls.workspace = true
 openmls_libcrux_crypto.workspace = true
 openmls_basic_credential.workspace = true
 openmls_traits.workspace = true
-risala-server = { path = "../risala-server" }
 
 [lints]
 workspace = true
