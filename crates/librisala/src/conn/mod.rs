@@ -25,11 +25,21 @@
 //! - [`ServerConnections`]: one account's connections to one server, one
 //!   signed-in and some anonymous ones, or one guest connection, with
 //!   [`MailboxSlots`] to spread the mailboxes it follows.
+//! - [`single_use`]: a connection of its own for one command that names
+//!   the device, such as KEYS PUT, PAIR or WELCOME GET (4.1, "Keeping
+//!   connections apart").
+//!
+//! Every connection, single-use ones included, has its own TLS session
+//! and never resumes one (2.1). The same rule holds for the HTTPS
+//! requests a device makes for risala (key files, tiles, uploads, blobs),
+//! which the area tasks add: no resumption, and no HTTPS connection
+//! shared between requests that belong to different risala connections.
 
 mod error;
 mod pins;
 mod pool;
 mod session;
+mod single;
 mod supervisor;
 mod tls;
 
@@ -41,6 +51,7 @@ pub use pins::{accept_fingerprint, approve_new_pin, clear_strict_pin, set_strict
 pub use pool::{ConnectionPlan, MailboxSlots, PoolEvent, ServerConnections, Slot};
 pub use risala_proto::connection::ConnectionKind;
 pub use session::{End, Incoming, Response, Session, SessionInfo, SessionOptions, auth_command};
+pub use single::{SingleUse, single_use};
 pub use supervisor::{
     Anonymous, Backoff, BoxFuture, Establish, GuestSession, GuestSignIn, IdentitySignIn,
     Supervisor, SupervisorEvent,

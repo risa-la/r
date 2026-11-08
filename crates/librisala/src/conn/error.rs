@@ -67,9 +67,10 @@ pub enum Error {
     #[error("the connection is still becoming anonymous, a guest or signed in")]
     KindPending,
     /// This kind of connection may not send the command (Section 13), so
-    /// it was not sent. Above all, this keeps a device from posting,
-    /// following or fetching on its signed-in connection, which would
-    /// tell the server who it is (4.1).
+    /// it was not sent: the server would answer `wrong-connection`, or
+    /// `not-authenticated` on a new connection. Above all, this keeps a
+    /// device from following or fetching on its signed-in connection,
+    /// which would tell the server who it is (4.1).
     #[error("a {kind} connection may not send {verb}")]
     WrongKind {
         /// The command's verb.
@@ -97,7 +98,8 @@ impl Error {
     /// registration, an invalid command or one for another kind of
     /// connection, and a sign-in refused
     /// with `auth-failed`, `forbidden` without a `retry` tag,
-    /// `not-supported`, `bad-syntax` or `unknown-command`. `auth-failed`
+    /// `not-supported`, `bad-syntax`, `unknown-command` or
+    /// `wrong-connection`. `auth-failed`
     /// means the signature did not verify against the keys the server
     /// got, and the same key fails the same way (4.6). Everything else
     /// may pass: `unavailable` (the server could not get the key file,
@@ -121,7 +123,8 @@ impl Error {
                 ErrorCode::AuthFailed
                 | ErrorCode::NotSupported
                 | ErrorCode::BadSyntax
-                | ErrorCode::UnknownCommand => true,
+                | ErrorCode::UnknownCommand
+                | ErrorCode::WrongConnection => true,
                 _ => false,
             },
             _ => false,

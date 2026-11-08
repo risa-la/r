@@ -188,8 +188,11 @@ impl Incoming {
 /// - [`request`](Self::request) sends any command that the connection's
 ///   kind may send (Section 13), and returns its [`Response`]. A command
 ///   the kind may not send is refused here with [`Error::WrongKind`] and
-///   never reaches the server: a POST on a signed-in connection would
-///   tell the server who posts (4.1). Requests may be made concurrently;
+///   never reaches the server: a FOLLOW or FETCH on a signed-in
+///   connection would tell the server who follows (4.1). POST passes on
+///   every kind, since a public room's PublicMessages may go on a
+///   signed-in connection (5.2, 12.6); which connection a post takes is
+///   the group engine's to decide. Requests may be made concurrently;
 ///   each gets a fresh `ref`, and responses are matched in order (3.6).
 /// - Every other line arrives on the queue from
 ///   [`take_incoming`](Self::take_incoming), in order: live posts,

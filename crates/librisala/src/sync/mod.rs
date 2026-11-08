@@ -107,9 +107,17 @@ pub enum Target {
     /// The anonymous or guest connection that follows this mailbox, or
     /// will (7.1).
     Mailbox(BoxName),
-    /// Any anonymous or guest connection: for commands about no mailbox,
-    /// such as KEYPKG GET or WELCOME PUT.
+    /// Any anonymous or guest connection, for commands about no mailbox
+    /// that say nothing about the device, such as LIST.
     Conversing,
+    /// The anonymous connection kept apart for WATCH (4.1, 8.3).
+    Watch,
+    /// A connection of its own, opened for this command and closed after
+    /// it (4.1, "Keeping connections apart"): for KEYS PUT, PAIR, WELCOME
+    /// GET, FETCH with `leaf` and a public room's PublicMessages, and
+    /// fresh for each CREATE, KEYPKG GET and WELCOME PUT. See
+    /// [`single_use`](crate::conn::single_use).
+    Own(crate::conn::SingleUse),
 }
 
 /// What happened, for an engine.

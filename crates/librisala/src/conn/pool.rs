@@ -35,6 +35,10 @@ pub enum Slot {
     SignedIn,
     /// The `n`th anonymous connection (4.2), from 0.
     Anonymous(usize),
+    /// The anonymous connection kept apart for WATCH and its PRESENCE
+    /// lines (4.1, 8.3), since whom a device watches says whom it talks
+    /// to.
+    Watch,
     /// The guest connection (4.2).
     Guest,
 }
@@ -57,6 +61,9 @@ pub struct ConnectionPlan {
     /// How many anonymous connections to keep. A device keeps at least
     /// one while it is online (4.1).
     pub anonymous: usize,
+    /// Whether to keep a separate anonymous connection for WATCH (4.1,
+    /// 8.3).
+    pub watch: bool,
     /// The guest connection's sign-in, for a guest:
     /// [`GuestSignIn`](super::GuestSignIn). A guest posts, follows and
     /// fetches on it, and has no other connection.
@@ -70,6 +77,7 @@ impl ConnectionPlan {
         ConnectionPlan {
             signed_in: Some(sign_in),
             anonymous: anonymous.max(1),
+            watch: false,
             guest: None,
         }
     }
@@ -79,18 +87,22 @@ impl ConnectionPlan {
         ConnectionPlan {
             signed_in: None,
             anonymous: 0,
+            watch: false,
             guest: Some(sign_in),
         }
     }
 
     /// The slots of the plan, in order: signed in, the anonymous ones,
-    /// then the guest.
+    /// the one for WATCH, then the guest.
     pub fn slots(&self) -> Vec<Slot> {
         let mut slots = Vec::new();
         if self.signed_in.is_some() {
             slots.push(Slot::SignedIn);
         }
         slots.extend((0..self.anonymous).map(Slot::Anonymous));
+        if self.watch {
+            slots.push(Slot::Watch);
+        }
         if self.guest.is_some() {
             slots.push(Slot::Guest);
         }
@@ -100,7 +112,7 @@ impl ConnectionPlan {
     fn establish(&self, slot: Slot) -> Arc<dyn Establish> {
         match slot {
             Slot::SignedIn => self.signed_in.clone().expect("a signed-in slot"),
-            Slot::Anonymous(_) => Arc::new(Anonymous),
+            Slot::Anonymous(_) | Slot::Watch => Arc::new(Anonymous),
             Slot::Guest => self.guest.clone().expect("a guest slot"),
         }
     }
@@ -253,10 +265,26 @@ impl MailboxSlots {
         self.by_box.get(mailbox).copied()
     }
 
-    /// The mailboxes connection `n` follows, in order: what it sends
-    /// FOLLOW for after each reconnect (7.4).
+    /// The mailboxes connection `n` follows, sorted.
     pub fn mailboxes(&self, n: usize) -> impl Iterator<Item = &BoxName> {
         self.connections.get(n).into_iter().flatten()
+    }
+
+    /// The mailboxes connection `n` follows, in a new random order: the
+    /// order to send FOLLOW in after each reconnect, so that it does not
+    /// link one session to the next (7.4).
+    pub fn follow_order(&self, n: usize) -> Vec<BoxName> {
+        let mut boxes: Vec<BoxName> = self.mailboxes(n).copied().collect();
+        // Fisher-Yates. If the system's random source fails, the sorted
+        // order is kept: it is the same for every device.
+        for i in (1..boxes.len()).rev() {
+            let Ok(r) = getrandom::u64() else {
+                break;
+            };
+            let j = usize::try_from(r % (i as u64 + 1)).unwrap_or(0);
+            boxes.swap(i, j);
+        }
+        boxes
     }
 
     /// Stops following `mailbox`. Returns the connection that followed
@@ -304,6 +332,12 @@ mod tests {
             ConnectionPlan::identity(sign_in.clone(), 0).slots(),
             [Slot::SignedIn, Slot::Anonymous(0)]
         );
+        let mut watching = ConnectionPlan::identity(sign_in.clone(), 1);
+        watching.watch = true;
+        assert_eq!(
+            watching.slots(),
+            [Slot::SignedIn, Slot::Anonymous(0), Slot::Watch]
+        );
         assert_eq!(ConnectionPlan::guest(sign_in).slots(), [Slot::Guest]);
     }
 
@@ -330,5 +364,22 @@ mod tests {
         assert_eq!(slots.release(&mailbox(1)), None);
         assert_eq!(slots.assign(&mailbox(6)), Some(0));
         assert_eq!(slots.mailboxes(9).count(), 0);
+    }
+
+    #[test]
+    fn follow_order_is_random() {
+        let mut slots = MailboxSlots::new(1, 100);
+        for n in 0..32 {
+            slots.assign(&mailbox(n));
+        }
+        let sorted: Vec<BoxName> = slots.mailboxes(0).copied().collect();
+        let orders: Vec<Vec<BoxName>> = (0..4).map(|_| slots.follow_order(0)).collect();
+        for order in &orders {
+            let mut again = order.clone();
+            again.sort();
+            assert_eq!(again, sorted);
+        }
+        // Four shuffles of 32 all sorted: about 1 in 10^140.
+        assert!(orders.iter().any(|o| *o != sorted));
     }
 }

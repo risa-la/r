@@ -233,9 +233,8 @@ async fn anon_makes_the_connection_anonymous() {
 
 #[tokio::test]
 async fn commands_go_only_on_connections_that_may_send_them() {
-    // Section 13: a new connection may not POST, an anonymous one may not
-    // send BACKUP GET, and nothing is sent; above all a signed-in
-    // connection never posts, follows or fetches (4.1).
+    // Section 13: a new connection may not POST, and nothing is sent;
+    // above all a signed-in connection never follows or fetches (4.1).
     let addr: ServerAddr = "chat.example.org".parse().unwrap();
     let (server, trust, ca) = run(&addr, |_, mut peer| async move {
         peer.send(&format!("RISALA 1 chat.example.org {NONCE}"))
@@ -266,8 +265,11 @@ async fn commands_go_only_on_connections_that_may_send_them() {
     session.auth(&identity, &key).await.unwrap();
     assert_eq!(session.kind(), ConnectionKind::SignedIn);
     assert!(session.is_operator());
+    // POST passes on a signed-in connection, for a public room's
+    // PublicMessages (5.2, 12.6); which connection a post takes is the
+    // group engine's to decide.
+    drop(post);
     for command in [
-        post,
         cmd(&format!("FOLLOW {BOX}")),
         cmd(&format!("FETCH {BOX} after=0")),
         cmd("ANON"),
@@ -794,5 +796,54 @@ async fn sent_commands_without_a_reply_end_with_the_queue() {
         session.send(Command::Anon),
         Err(Error::WrongKind { verb: "ANON", .. })
     ));
+    server.done().await;
+}
+
+#[tokio::test]
+async fn single_use_connections_carry_one_command() {
+    // 4.1: a command that names the device goes on a connection of its
+    // own, which closes after it.
+    let addr = chat_test();
+    let cert = ServerCert::self_signed(addr.host());
+    let trust = store();
+    trust
+        .set(&addr, TrustRecord::Pinned(cert.fingerprint))
+        .unwrap();
+    let server = ScriptServer::start(cert, 2, |i, mut peer: Peer| async move {
+        peer.greet().await;
+        if i == 0 {
+            // A new connection may send PAIR (4.1).
+            peer.expect(&format!("@ref=1 PAIR GET {BOX}")).await;
+            peer.send("@ref=1 ERR not-found").await;
+        } else {
+            peer.expect("@ref=1 ANON").await;
+            peer.send("@ref=1 OK").await;
+            peer.expect("@ref=2 KEYPKG GET alice@example.org").await;
+            peer.send("@ref=2 OK").await;
+        }
+        peer.expect_eof().await;
+    })
+    .await;
+    let ca = TestCa::new();
+    let pair = crate::conn::single_use(
+        &addr,
+        trust.clone(),
+        options(&ca, &server),
+        crate::conn::SingleUse::New,
+        cmd(&format!("PAIR GET {BOX}")),
+    )
+    .await
+    .unwrap();
+    assert!(!pair.is_ok());
+    let keypkg = crate::conn::single_use(
+        &addr,
+        trust,
+        options(&ca, &server),
+        crate::conn::SingleUse::Anonymous,
+        cmd("KEYPKG GET alice@example.org"),
+    )
+    .await
+    .unwrap();
+    assert!(keypkg.is_ok());
     server.done().await;
 }
