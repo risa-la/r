@@ -572,9 +572,9 @@ The group checks:
   - a leaf that an impostor repair removes (below);
   - outside public rooms, any other leaf, **for a key check**: its device
     has been removed by record (4.4), its identity's chain ends with a
-    `retire` record, or its device binding does not verify. Each device
-    makes that check itself afterwards (below). An identity whose keys
-    are missing (4.4) loses no leaf for that;
+    `retire` record, its device binding does not verify, or its identity
+    is forked or has its keys missing (12.14). Each device makes that
+    check itself afterwards (below);
   - in a public room, a leaf that has the same uid and `device_id` as a
     later leaf and is **inactive**: its `updated`, or the `t` of the
     commit that added it if that is later, is more than 48 hours before
@@ -636,7 +636,10 @@ device checks:
   A device MUST NOT show a message, or act on a line, from a leaf of a
   device removed by record (12.9).
 - **Removals for a key check.** Each leaf removed for a key check fails
-  it.
+  it. A removal because the identity was forked or had its keys missing
+  never fails: what one device saw of a key file or a log, another may
+  not see. It stands, as one the device could not check, and the device
+  warns if it does not see the same itself.
 
 Public rooms have no key checks, since their leaves carry no device
 binding: attestation does that work there (12.10).
@@ -818,10 +821,10 @@ identity's groups gets added:
 
 A device adds another identity's devices only from a key file that
 extends the head it holds for that identity (4.5), never a device it has
-once seen removed by record, and none while the identity is stale (4.5)
-or its keys are missing (4.4), or while the identity has a SelfRemove in
-the group that no commit has applied yet (6.1). In a public room, devices
-join by themselves (6.1), and nobody adds them.
+once seen removed by record, and none while the identity is stale (4.5),
+forked (4.5) or its keys are missing (4.4), or while the identity has a
+SelfRemove in the group that no commit has applied yet (6.1). In a
+public room, devices join by themselves (6.1), and nobody adds them.
 
 **Replacing stale leaves.** A device that has been offline for longer
 than retention cannot catch up from the server (7.5). Its leaves are
@@ -1102,23 +1105,34 @@ each ending in LF. The rules of 2.3 for characters apply to these lines,
 but its length limits do not: TEXT has its own limit (5.3), and the
 content as a whole is at most 4 MiB (4194304 bytes). Devices ignore
 lines with verbs they do not know, and lines in a conversation where
-the table does not allow them.
+the table does not allow them. Also:
+
+- Content lines end in LF alone. Content that holds a CR, or any other
+  character that 2.3 forbids, or that does not end in LF, is not valid
+  content: the device treats the message as one it could not read.
+- A line whose verb is known but which does not follow that verb's
+  syntax is ignored, and the rest of the message stands.
+- A live message (5.2) holds only a TYPING line, and a kept one never
+  does. A device ignores any other line in a live message, and a TYPING
+  line in a kept one.
+- File tags go only on a TEXT line that is a new message or a reply,
+  never on an edit or a reaction. A device ignores them there.
 
 | Line | Where | Section |
 |---|---|---|
 | `[@<tags>] TEXT <text...>` | any conversation | 5.3 |
 | `DELETE <id>` | any conversation | 5.4 |
 | `TYPING` | any conversation, live | 8.1 |
-| `[@<tags>] REPORT [<reason...>]` | a direct conversation, to a room's moderator | 5.8 |
+| `@box=<box>;target=<id>[;context=<ids>] REPORT [<reason...>]` | a direct conversation with an owner or moderator of a room, never the conversation with yourself | 5.8 |
 | `CHALLENGE <leaf> <ciphertext>`, `ANSWER <leaf> <mac>` | groups whose `confirm` is `pairwise` | 12.10 |
 | `ATTEST <period> <period-key> <certificate> <attestation> <pseudonym>`, `REVEAL <period> <seed>` | groups whose `confirm` is `epochal` | 12.10 |
 | `RESYNC <seq>` | direct conversations and private rooms | 12.7 |
 | `READ <box> <seq> <check>`, `RESYNC <box> <seq>` | the conversation with yourself | 7.7, 12.7 |
 | `BLOCK <target>`, `UNBLOCK <target>` | the conversation with yourself | 5.7 |
-| `RECORD <hash>`, `ALERT <hash>`, `RECORDS [<hashes>]` | the conversation with yourself | 4.5 |
+| `RECORD <hash>`, `ALERT <hash>`, `RECORDS [<hashes...>]` | the conversation with yourself | 4.5 |
 | `SIGNINGKEY <seed>`, `BACKUPKEY <generation> <key>` | the conversation with yourself | 4.8, 12.13 |
 | `WANT <box> <after> <before>`, `TRANSFER <ref>` | the conversation with yourself | 12.13 |
-| `SERVERS <hosts>` | the conversation with yourself | 12.13 |
+| `SERVERS <hosts...>` | the conversation with yourself | 12.13 |
 | `PIN <uid> <master> <origin> <head> <verified>` | the conversation with yourself | 4.5, 12.14 |
 
 A TEXT line may carry these tags:
@@ -1158,7 +1172,8 @@ The lines of the conversation with yourself:
 - `RECORDS` without hashes asks the identity's other devices which
   records they know were announced (4.5). A device answers with
   `RECORDS` followed by the hashes, as blob-refs separated by spaces, of
-  every record of the chain that it knows was announced with RECORD.
+  every record of the chain that it knows was announced with RECORD, or
+  with `RECORDS -` if it knows of none.
 - In SIGNINGKEY, `<seed>` is the new device-signing key's 32-byte seed,
   in base64 with padding. A device accepts it only if the seed derives
   the device-signing key of the newest `signing` or `master` record of
@@ -1166,8 +1181,9 @@ The lines of the conversation with yourself:
 - In BACKUPKEY, `<key>` is a backup key (12.13), in base64 with padding.
   A device accepts it only if `<generation>` is the chain's generation
   (4.4).
-- `SERVERS` lists the hosts of the servers the identity uses, separated
-  by spaces, its home first (12.13). A device that starts or stops using
+- `SERVERS` lists the servers the identity uses, each as a server
+  (3.5), separated by spaces, at least one and without repeats, its home
+  first (12.13). A device that starts or stops using
   a server sends the new list. Every device keeps KeyPackages on each
   of them (12.5).
 - `PIN` carries a pin (4.5) and the verified mark (12.14) of another
@@ -1543,7 +1559,7 @@ struct {
 
 struct {
     opaque group_id<V>;
-    opaque host<V>;              // the server, in lower case
+    opaque host<V>;              // the server, as a server (3.5)
     opaque box[16];
     ArchivedMessage messages<V>; // in seq order, oldest first
 } ArchivedConversation;
@@ -1579,12 +1595,17 @@ struct {
   and chooses to include, the archiving device encrypts the file again
   as a new file under a new random key, with the label `risala/1 file`,
   stores it as a blob (12.12), and lists it in `files` under the
-  original `file-hash`. A device that reads a TEXT line whose
-  `file-hash` is listed fetches that blob, rather than the `file` URL,
-  checks its hash against `blob_hash`, and decrypts and checks it as a
-  file (12.11) under `key`. A device SHOULD reuse the same blob and key
-  for the same file in later backups, so that it uploads each file
-  once.
+  original `file-hash`. A device that reads, in the same transfer or
+  backup, a TEXT line whose `file-hash` is listed fetches that blob,
+  rather than the `file` URL, checks its hash against `blob_hash`, and
+  decrypts and checks it as a file (12.11) under `key`. Nothing ties
+  `blob_hash` to the original file, so the device uses an ArchivedFile
+  only for the messages of the transfer or backup that lists it, which
+  it shows as copied or restored (below), and shows such a file as
+  copied or restored too. It never keeps the mapping for, or uses it
+  on, a message it received itself. A device SHOULD reuse the same blob
+  and key for the same file in later backups, so that it uploads each
+  file once.
 - **Encryption.** Each archive is encrypted as a file (12.11), with the
   label `risala/1 archive`, under a new random 32-byte key, and stored
   as a blob. A TransferRef names the blob by its hash, and holds the
@@ -1596,8 +1617,11 @@ struct {
   **first** archive is the one that the IdentityBundle, the TRANSFER
   line or the backup names. Its `more` lists the TransferRefs of all
   the others, in order. They have an empty `more`, and the same `uid`
-  and `made` as the first, and a device rejects any that does not. The
-  first archive may hold conversations and files of its own, or none.
+  and `made` as the first. An archive that does not, which only a faulty
+  or dishonest device makes, since the server cannot read or forge an
+  archive, makes the device reject the whole transfer or backup, and
+  tell the user. The first archive may hold conversations and files of
+  its own, or none.
 - **Merging.** A conversation may span archives. A device reads the
   first archive, then the others in the order of `more`, and joins the
   ArchivedConversations that have the same `group_id`, `host` and `box`
@@ -1627,7 +1651,8 @@ TRANSFER <ref>
 - **`WANT`**, in the conversation with yourself, says that the device
   lacks the posts of mailbox `<box>` whose seqs are greater than
   `<after>` and less than `<before>`, each in decimal. `<before>` is `-`
-  if the device does not know where the gap ends.
+  if the device does not know where the gap ends. A WANT whose range
+  holds no seq, because `<before>` is at most `<after>` + 1, is ignored.
 - **`TRANSFER`** answers it. A device of the identity that holds some of
   those messages SHOULD send them as archives, with `TRANSFER <ref>` in
   the conversation with yourself, where `<ref>` is the TransferRef of
@@ -1641,9 +1666,9 @@ these rules, since a device that sends one may have been compromised:
   seqs lie in a range it has asked for with WANT and not yet filled.
 - It never replaces or changes a message it holds, and skips archived
   messages whose `message_id` it has already seen in the group.
-- It shows each message it applies as copied from the device that sent
-  it, by that device's label, and the `verified` flag as that device's
-  verification, never as its own.
+- It shows each message it applies, and each file of the transfer, as
+  copied from the device that sent it, by that device's label, and the
+  `verified` flag as that device's verification, never as its own.
 - It matches each message to its sender's leaf by `device_id`, and
   takes its `counter` and `previous` into its record of that leaf's
   messages, so that a gap the transfer fills is not shown as held back
@@ -1709,13 +1734,16 @@ BACKUP DEL
 - **`BACKUP PUT`** stores a backup, and replies `OK`. `<hash>` is the
   blob-ref of the first archive, and `<key>` the WrappedKey in base64
   with padding. `files` is the blob-ref of a **list**: a blob that holds
-  the 48-byte hashes of every other blob of the backup, the archives in
-  `more` and the files in `files`, one after another without anything
-  between them. It is needed only if there are any.
+  a `version` byte, `0x01`, and then the 48-byte hashes of every other
+  blob of the backup, the archives in `more` and then the files in
+  `files`, one after another without anything between them. It is
+  needed only if there are any.
   - Every blob it names, directly or in the list, must still be stored
-    on the server (`ERR not-found`). A list whose length is not a
-    multiple of 48 bytes, or a wrapped key that is not 61 bytes starting
-    with `0x01`, gets `ERR invalid`.
+    on the server (`ERR not-found`). A list whose first byte is not
+    `0x01`, or whose length is not 1 plus a multiple of 48 bytes, and a
+    wrapped key whose first byte is not `0x01`, get `ERR invalid`. A
+    wrapped key that is not 61 bytes long gets `ERR bad-syntax`, as any
+    value of the wrong length does (3.7).
   - From then on, the server keeps every blob the backup names for as
     long as it is the current backup, whatever the retention period. It
     replaces the identity's previous backup, and deletes the blobs of
@@ -1774,13 +1802,29 @@ A device does not take the server's word for which keys belong to whom:
   for each sender in a public room whose leaf it has confirmed in the
   current period (12.10). It spreads these fetches over the day at
   random times, and checks the identity's freshness each time (4.5).
-- After a fetch, it removes the leaves of devices removed by record, and
-  adds devices that have none (12.7). If the identity's keys are missing
-  (4.4), it removes nothing, but stops sending in each direct
-  conversation and private room where the identity has a leaf, shows a
-  warning in public rooms, and tells the user that the identity's key
-  file is missing, until a valid key file is back. An outage changes
-  nothing.
+- After a fetch, outside public rooms, it removes the leaves of devices
+  removed by record, and adds devices that have none (12.7). In a public
+  room, devices join by themselves (6.1), and their leaves carry no
+  device binding to check (12.10). An outage changes nothing.
+- An identity whose keys are missing (4.4), or that is forked (4.5), is
+  one the device cannot check. Until a valid key file is back, or the
+  user resolves the fork, the device tells the user why, and:
+  - in a direct conversation with the identity, sends no messages. It
+    still makes commits, including those that remove or repair leaves;
+  - in a room, treats the identity's leaves as unverified, hides what
+    they send, showing that it hid a message from an identity it cannot
+    check, and keeps sending;
+  - in a room that is not public, removes the identity's leaves, for
+    that key check (12.7). Removing a leaf never lets anyone new read,
+    and it keeps an identity that may be in someone else's hands from
+    reading what the room sends next. The identity's devices are added
+    again once its keys are back and no fork is known (12.7);
+  - in a public room, which has no key checks, if its identity is an
+    owner or moderator, SHOULD ban the uid of a forked identity (6.4),
+    and MAY kick one whose keys are missing.
+
+  So an identity that forks its own chain, or takes its key file down,
+  stops only its own direct conversations, not the rooms it is in.
 - These fetches tell the host of each key file and log which network
   addresses look up which identities, and how often (Section 14). A
   device SHOULD fetch whole entry bundles and tiles rather than single
@@ -1832,8 +1876,8 @@ the owner's own devices watching it (4.5), and a new one is a notice.
 - A **new master key** (4.5) clears "verified". In a direct
   conversation and in a private room, the device stops sending until the
   user acknowledges the new key. In a public room, it shows a warning.
-- A fork or a rollback (4.5) stops sending as 4.5 says, whether or not
-  the identity was verified.
+- A fork or a rollback (4.5) is treated as above, whether or not the
+  identity was verified.
 - The pins and verified marks of an identity's devices are kept in step
   with PIN lines (12.9), so that a new device does not meet its user's
   contacts afresh.

@@ -62,7 +62,9 @@ that hosts an identity.
 
 - Can: publish a key file with a new chain, an older one, or none at
   all. With no key file, or an invalid one, it makes devices stop
-  sending to the identity and warn their users. Show someone meeting the
+  sending in direct conversations with the identity, hide its messages
+  in rooms, remove its leaves from rooms that are not public until the
+  file is back, and warn their users (12.14). Show someone meeting the
   identity for the first time a chain of its own in a log on another
   host, which only safety numbers catch (Section 14). Sign in as the
   identity on servers that have not seen it before, and use its account
@@ -70,10 +72,10 @@ that hosts an identity.
   cached key file.
 - Cannot: change the keys of an identity that a device already knows
   unseen: a new chain is a new master key, a fork or a rollback, and
-  devices stop sending until their users act (4.5, 12.14). Add a device
-  unseen by the identity's own devices. Make anyone remove the identity
-  from a conversation. Sign a record of an existing chain without its
-  keys.
+  devices stop trusting it until their users act (4.5, 12.14). Add a
+  device unseen by the identity's own devices. Make anyone remove the
+  identity from a conversation for good, which takes a `retire` record
+  (4.9). Sign a record of an existing chain without its keys.
 
 **A key log and its witnesses.**
 
@@ -83,7 +85,10 @@ that hosts an identity.
   different people. Lose its key, after which its identities' chains
   cannot grow.
 - Cannot: change a record, which the identity's keys sign. Show two
-  trees while fewer than k of a client's witnesses collude.
+  trees while fewer than k of a client's witnesses collude. Enrol a log
+  under another host's origin at a witness, which fetches the first
+  key from that host's own HTTPS server (4.10), unless it controls that
+  host's name, or a certificate for it, at that moment.
 
 **A member of a conversation,** including a moderator or owner.
 
@@ -103,7 +108,9 @@ that hosts an identity.
   hash in public beforehand. Post abuse and report it to operators as
   someone else's. Once removed, watch the old mailbox and post junk
   there, until the group moves (7.8), which it does right after the
-  removal.
+  removal. Fork its own chain, or take its key file down, which stops
+  only its own direct conversations, and has its leaves hidden in rooms
+  and removed from rooms that are not public (12.14).
 - Cannot: post as another member to the other members, make another
   member's leaf look confirmed, give a moderator control of an owner's
   leaf by an invitation, read anything sent after it is removed,
@@ -119,7 +126,8 @@ that hosts an identity.
   `write`. Join a public room under a credential that names someone
   else's device, which devices then treat as a guest's leaf. Open a report conversation with an owner or moderator of such
   a room, if they accept it, to send reports (5.8). Use up server
-  resources within proof of work, rate limits and quotas.
+  resources within rate limits and quotas, and, once it is specified,
+  proof of work (4.1).
 - Cannot: take part in private rooms or in other direct conversations,
   send anything but reports in a report conversation, or appear as
   anything but an unverified guest. Commit in a public room, or force
@@ -154,8 +162,12 @@ that hosts an identity.
 
 - Can: read the new device's public keys, and spoil the pairing by
   storing something under its ids first, so that it starts again.
+  Answer the pairing first, with a bundle for an identity of its own,
+  which the new device shows by uid before it does anything, and which
+  the scanning device reports (4.8).
 - Cannot: read the reply, which is sealed to the new device's own key
-  (4.8).
+  (4.8), or pair the new device into its own identity without the user
+  confirming that identity.
 
 **Push services and gateways.**
 
@@ -214,6 +226,10 @@ Each risk is marked **Mitigated**, where this document limits it, or
   message is deniable only once its period key is out, up to a day and
   an hour later, and a member who timestamps a message in public before
   then can prove it later.
+- **Enrolment by host name** (Mitigated: witnesses fetch a host's first
+  log key from the host itself, 4.10). Whoever controls a host's name,
+  or holds a certificate for it, when a witness first enrols its log
+  holds that origin at that witness for good.
 - **Few post-quantum witnesses** (Open). Clients count only ML-DSA-44
   cosignatures (4.5), and few public witnesses may offer them at first.
   Until enough do, a client's witness list is short, and k colluding
@@ -307,7 +323,8 @@ claims that depend on it.
 - **Witnesses.** Fewer than k of each client's n witnesses collude with
   a log (4.5).
 - **The WebPKI** issues certificates for a domain only to whoever
-  controls it, for fetching key files (4.4).
+  controls it, for fetching key files (4.4) and for witnesses enrolling
+  a host's first log (4.10).
 - **Devices** keep their stored keys and history away from other
   software, and their clocks within minutes of the right time, and
   never more than an hour off, which epochal confirmation needs
@@ -344,3 +361,12 @@ claims that depend on it.
   leaf node (12.3); a committer's Welcomes only once it has won (12.8);
   past-epoch and skipped-key limits, and resends (12.9); read markers
   that check the epoch (7.7).
+- **draft-03, review round 2** (2026-11-09), identity and the rest:
+  witnesses enrol a host's first log from the key its HTTPS server
+  publishes, and log URLs follow from origins (4.4, 4.5, 4.10); one
+  definition of a fresh checkpoint (4.5); forked identities and missing
+  key files stop only direct conversations, and their leaves are
+  removed from rooms that are not public (4.5, 12.14); the new device
+  confirms its identity at pairing (4.8); server addresses written one
+  way (2.1, 3.5); proof of work not required until it is specified
+  (4.1); archived files scoped to their transfer (12.13).

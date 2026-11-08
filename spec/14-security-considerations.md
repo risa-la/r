@@ -68,7 +68,12 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 - **Pairing.** The pairing QR code holds a secret that the server never
   sees, and the reply is sealed to a key that never leaves the new
   device (4.8). So someone who sees the QR code, even together with the
-  server, learns nothing from the reply.
+  server, learns nothing from the reply. They can still answer first,
+  with a bundle for an identity of their own, since the QR code holds
+  all they need to build one. The new device then shows that identity's
+  uid and devices, and asks its user to confirm before it does anything,
+  and the device that scanned the code tells its user that someone else
+  answered (4.8).
 
 - **Deniability.** Nothing an identity publishes signs a message or a
   leaf key (4.3, 12.3), and members confirm leaves in ways that convince
@@ -295,7 +300,7 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   (4.5). Whoever controls the identity's domain can publish a key file
   with a new chain, or an older one, but every device that knows the
   identity sees a new master key, a fork or a rollback, and stops
-  sending to it until the user acknowledges it (12.14). A server that
+  trusting it until the user acts (12.14). A server that
   hosts an identity holds none of its keys, and can do no more than the
   domain's controller. No operator can reset an identity.
 
@@ -318,12 +323,22 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   then remove its leaves, and undo what they did in the last 24 hours,
   as for an impostor (12.7).
 
-- **Missing key files.** A key file that is gone or invalid is
-  unsigned, so it removes nobody (4.4): devices stop sending to the
-  identity and warn their users. So the host of a key file can make an
-  identity unreachable, visibly, but cannot make anyone remove it from
-  a conversation. Only a `retire` record, which needs the recovery key,
-  does that (4.9).
+- **Missing key files and forks.** A key file that is gone or invalid
+  is unsigned, so it removes no device by record (4.4). Devices cannot
+  check such an identity, nor one whose chain or log has forked (4.5),
+  so they stop sending in direct conversations with it, hide what its
+  leaves send in rooms, and remove its leaves from rooms that are not
+  public (12.14). So the host of a key file can make an identity
+  unreachable, visibly, and push it out of private rooms until the file
+  is back, when its devices are added again; only a `retire` record,
+  which needs the recovery key, removes it for good (4.9). And an
+  identity that forks its own chain, or takes down its own key file,
+  stops only its direct conversations: a room goes on without it. The
+  cost is that, in rooms, a device keeps sending while the identity's
+  leaves are being removed, so those leaves can read what is sent in
+  between. Devices that see the key file or log differently can also
+  disagree about such a removal, and one may add the identity back
+  while another removes it again (12.7), which each device shows.
 
 - **Accounts on other servers.** A server that has never seen an
   identity takes its first chain from whoever controls the identity's
@@ -335,25 +350,31 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   gap above. None of it lets anyone read a conversation, since devices
   check every record themselves.
 
-- **The key log.** A log could show different trees to different
-  people. Witnesses refuse to cosign a checkpoint that is not consistent
-  with the last one they saw, so this needs k witnesses to collude; and
-  each witness enrols one key per origin, with k more than half a
-  client's list, so two keys of one log cannot both be witnessed for
-  one client (4.10). A log or a key file host that withholds a record
-  leaves it pending for devices that know of it. Devices that do not
-  know of it find it through the uid's hint within a day, unless the
-  log leaves it out of the hint as well; then the owner's devices find
-  it in their weekly read of the whole log (4.5), and contacts see the
-  identity as stale after 7 days without a fresh witnessed view.
-  Watching costs each device a few bytes a day for the hint, and the
-  size of the log's new entries each week. A log lists every uid whose
-  records it holds, so anyone can list the identities a server hosts. A
-  log that is unreachable stops devices from accepting new records of
-  its identities, but not from using the ones they already accepted. A
-  host that loses its log's key cannot hand off to a new log (4.5), and
-  its identities can then add or remove no device, so the key needs a
-  backup kept offline.
+- **The key log.** A log could show different trees to different people.
+  Witnesses refuse to cosign a checkpoint that is not consistent with
+  the last one they saw, so this needs k witnesses to collude; and each
+  witness enrols one key per origin, with k more than half a client's
+  list, so two keys of one log cannot both be witnessed for one client
+  (4.10). A witness enrols a host's first log only under the key that
+  the host's own HTTPS server publishes (4.10), so nobody can claim
+  another host's origin first, unless they control the host's name, or
+  get a certificate for it, at the moment of enrolment. A host whose
+  name was hijacked at that moment is locked out of that witness for
+  good, unless its operator has a manual procedure to replace the key,
+  which cannot change what devices accept. A log or a key file host that
+  withholds a record leaves it pending for devices that know of it.
+  Devices that do not know of it find it through the uid's hint within a
+  day, unless the log leaves it out of the hint as well; then the
+  owner's devices find it in their weekly read of the whole log (4.5),
+  and contacts see the identity as stale after 7 days without a fresh
+  witnessed view. Watching costs each device a few bytes a day for the
+  hint, and the size of the log's new entries each week. A log lists
+  every uid whose records it holds, so anyone can list the identities a
+  server hosts. A log that is unreachable stops devices from accepting
+  new records of its identities, but not from using the ones they
+  already accepted. A host that loses its log's key cannot hand off to a
+  new log (4.5), and its identities can then add or remove no device, so
+  the key needs a backup kept offline.
 
 - **Trust on first use.** Someone can intercept the first connection to
   a server that has a self-signed certificate. Users can compare the
@@ -376,12 +397,14 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Server secrets.** Guest tokens (4.2), send tokens (7.2), `put`,
   `get` and `del` URLs (5.6, 12.12) and pairing ids (4.8) work for
-  whoever holds them. Servers SHOULD store only a hash of each, look it
-  up by a part that is not secret, and compare the secret part in
-  constant time. Franking tags are compared in constant time too (5.8,
-  12.9). Push URLs and their keys (Section 9) are kept in the clear,
-  since the server must send to them and encrypt to them. PUSH DEL looks
-  a subscription up by a hash of its URL.
+  whoever holds them. Servers SHOULD store only a hash of each, and look
+  it up by that hash, or by a part that is not secret where it has one,
+  comparing any secret part in constant time. These secrets carry at
+  least 128 bits of randomness, so a lookup by hash does not leak them
+  through its timing. Franking tags are compared in constant time too
+  (5.8, 12.9). Push URLs and their keys (Section 9) are kept in the
+  clear, since the server must send to them and encrypt to them. PUSH
+  DEL looks a subscription up by a hash of its URL.
 
 - **Requests from the server.** Fetching key files and sending pushes
   both mean connecting to hosts that users choose. The rules in Sections
@@ -401,9 +424,10 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   pseudonym, since anyone who holds a group's token can post under any
   pseudonym (5.2). It bounds what anyone can store: mailboxes have
   quotas and end when unused (7.5), token sets are bounded (7.2), and so
-  are push subscriptions (9.1). It can require proof of work to open
-  anonymous connections, to become a guest, to register, to create
-  mailboxes, to fetch KeyPackages and to join public rooms (4.1). Room
+  are push subscriptions (9.1). A later draft will let it require proof
+  of work to open anonymous connections, to become a guest, to register,
+  to create mailboxes, to fetch KeyPackages and to join public rooms
+  (4.1). Until then, only rate limits stand in the way of bots. Room
   moderators remove spammers with commits, and ask the server to mute a
   pseudonym in the meantime (6.4). Operators can ban network addresses
   for anonymous and guest connections (10.2).

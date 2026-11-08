@@ -132,7 +132,10 @@ ADMIN REPORTS
   - The box and group id of a dropped mailbox are never used again
     (5.2).
 - **`ADMIN MUTE`** and **`ADMIN UNMUTE`** work like MUTE and UNMUTE
-  (6.4), for any mailbox.
+  (6.4), for any mailbox. A mute ends at the end of the current period
+  only in a group whose `confirm` is `epochal` (6.2, 12.10). In other
+  groups it lasts `<n>` hours or until ADMIN UNMUTE, and stops mattering
+  once the pseudonym is no longer used (7.3).
 - **`ADMIN REPORTS`** lists every open report (5.8).
 
 There is no command that deletes what one person has posted, since the
@@ -151,7 +154,9 @@ ADMIN UNREGISTER <uid>
     file and answers 410 for it, unless its chain ends with a `retire`
     record (4.9). Its records stay in the log. An operator has none of
     the identity's keys, so this only makes its keys missing to others
-    (4.4): their devices stop sending to it and warn, but remove nothing.
+    (4.4): their devices stop sending to it in direct conversations,
+    take its leaves out of private rooms until its keys are back, and
+    warn (12.14), but remove none of its devices by record.
   - The name cannot be registered again: the log refuses a second first
     `master` record for it (4.5, 4.9).
   - For an identity the server does not host, it also clears the
