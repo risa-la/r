@@ -55,12 +55,12 @@ use super::identity::unavailable;
 use super::keys::FetchError;
 use super::mls::{CheckedCommit, Device, check_commit, check_init, tree_of};
 use super::moderation::rights;
-use super::state::ConvState;
+use super::state::{ConvEntry, ConvState};
 use super::{Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::OutLine;
 use crate::store::{
-    Appended, EventKind, GroupCommit, GroupInit, GroupMeta, NewEvent, NewWelcome, StoreError,
-    StoredEvent,
+    Appended, DirectInit, EventKind, GroupCommit, GroupInit, GroupMeta, NewEvent, NewWelcome,
+    StoreError, StoredEvent,
 };
 
 /// Runs `f` on the blocking pool.
@@ -187,9 +187,87 @@ impl Inner {
                 self.init_room(uid, reply, key, &room, group_info, tree)
                     .await
             }
-            // Step 5: direct conversations.
-            Conv::Uid(_) => Err(not_supported()),
+            Conv::Uid(other) => {
+                self.init_direct(uid, reply, key, other, group_info, tree)
+                    .await
+            }
         }
+    }
+
+    /// INIT of a direct conversation (5.1, 12.5), which starts it.
+    async fn init_direct(
+        &self,
+        uid: &Uid,
+        reply: &Reply,
+        key: PublicKey,
+        other: Uid,
+        group_info: GroupInfo,
+        tree: RatchetTree,
+    ) -> Outcome {
+        // Only with identities the server knows (5.1).
+        let unknown = || fail(ErrorCode::NotFound, "no such identity");
+        if !other.is_identity() {
+            return Err(unknown());
+        }
+        let who = other.clone();
+        if self.db(move |s| s.identity(&who)).await?.is_none() {
+            return Err(unknown());
+        }
+        // Someone blocked cannot start one (5.7).
+        if other != *uid && self.is_blocked(&other, uid).await? {
+            return Err(forbidden("you may not start a conversation with them"));
+        }
+        if self.direct_entry(uid, &other).is_some() {
+            return Err(stale("the conversation has a group already"));
+        }
+        let crypto = self.mls.clone();
+        let (who, them) = (uid.clone(), other.clone());
+        let new = blocking(move || {
+            let device = Device {
+                uid: &who,
+                key: &key,
+            };
+            check_init(&crypto, device, &group_info, &tree, |c| {
+                c.is_direct(&who, &them)
+            })
+        })
+        .await?;
+
+        let _creating = self.create_lock.lock().await;
+        let (a, b, now) = (uid.clone(), other.clone(), self.now());
+        let (record, leaves) = (new.record, new.leaves);
+        let started = self
+            .db(move |s| s.init_direct(&a, &b, &record, &leaves, now))
+            .await?;
+        let record = match started {
+            DirectInit::Done(record) => record,
+            DirectInit::Exists => return Err(stale("the conversation has a group already")),
+            DirectInit::IdTaken => {
+                return Err(fail(ErrorCode::Invalid, "that group id was used before"));
+            }
+        };
+        let pair = (record.a.clone(), record.b.clone());
+        let entry = Arc::new(ConvEntry::new(ConvState::direct(record)));
+        let st = entry
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| Fail::Store(StoreError::Task("a new conversation was locked".into())));
+        let mut st = st?;
+        {
+            let mut reg = self.reg();
+            for who in [&pair.0, &pair.1] {
+                let user = reg.user(who);
+                st.add_member(&entry, &user);
+            }
+        }
+        self.directs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pair, entry);
+        drop(_creating);
+        tracing::debug!(conv = %st.id, "direct conversation started");
+        reply.line(OkResponse::new().with_id(&st.id).with_epoch(0));
+        Ok(None)
     }
 
     /// INIT of a room (12.3, 12.5).
@@ -299,24 +377,22 @@ impl Inner {
         welcome: Option<Welcome>,
     ) -> Outcome {
         let key = self.device_key(uid, reply.handle.id())?;
-        let room = match conv {
-            Conv::Room(room) => room,
-            // Step 5: direct conversations.
-            Conv::Uid(_) => return Err(not_supported()),
-        };
-        let mut guard = self.lock_room(&room).await?;
+        let mut guard = self.lock_conv(uid, &conv).await?;
         let st = &mut *guard;
-        let info = room_of(st)?;
-        let a = self.asker(uid, st.is_member(uid));
-        if !visible(info, a) {
-            return Err(not_found());
-        }
-        if st.group.is_none() {
-            return Err(forbidden("the room is not encrypted"));
-        }
-        // Rule 3: a member or invitee.
-        if !st.is_member(uid) && !info.invites.contains(uid) {
-            return Err(forbidden("only members and invitees change the group"));
+        // Rule 3 for a direct conversation: its participants, which are
+        // the only ones who can name it (5.2).
+        if let Some(info) = st.room_info() {
+            let a = self.asker(uid, st.is_member(uid));
+            if !visible(info, a) {
+                return Err(not_found());
+            }
+            if st.group.is_none() {
+                return Err(forbidden("the room is not encrypted"));
+            }
+            // Rule 3: a member or invitee.
+            if !st.is_member(uid) && !info.invites.contains(uid) {
+                return Err(forbidden("only members and invitees change the group"));
+            }
         }
         let conv_key = st.key;
         let record = self
@@ -345,7 +421,13 @@ impl Inner {
         })
         .await;
         let (checked, commit, welcome) = checked?;
-        let invited = self.check_room_commit(st, uid, &key, &checked).await?;
+        let invited = match st.room_info() {
+            Some(_) => self.check_room_commit(st, uid, &key, &checked).await?,
+            None => {
+                self.check_direct_commit(st, uid, &key, &checked).await?;
+                Vec::new()
+            }
+        };
         self.store_commit(
             st, uid, reply, from_epoch, checked, commit, welcome, invited,
         )
@@ -410,6 +492,50 @@ impl Inner {
         }
         invited.sort();
         Ok(invited)
+    }
+
+    /// The rules of a commit in a direct conversation that need its
+    /// participants and key files (12.5, 12.6): devices of its
+    /// participants only, and no change to its extensions.
+    async fn check_direct_commit(
+        &self,
+        st: &ConvState,
+        uid: &Uid,
+        key: &PublicKey,
+        checked: &CheckedCommit,
+    ) -> Result<(), Fail> {
+        let (a, b) = st.participants().ok_or_else(not_found)?;
+        // A participant may join by external commit with no leaf yet.
+        if checked.external && !self.key_listed(uid, key, true).await? {
+            return Err(forbidden("the device's key is not in its key file"));
+        }
+        for (target, target_key) in &checked.adds {
+            if target != a && target != b {
+                return Err(forbidden(&format!(
+                    "{target} is not a participant of this conversation"
+                )));
+            }
+            if !self.key_listed(target, target_key, true).await? {
+                return Err(forbidden(&format!(
+                    "a key of {target} that is not in its key file"
+                )));
+            }
+        }
+        for removed in checked.removes.iter().filter(|r| !r.justified) {
+            let leaf = &removed.leaf;
+            if self.key_listed(&leaf.uid, &leaf.key, false).await? {
+                return Err(forbidden(&format!(
+                    "no reason to remove a leaf of {}",
+                    leaf.uid
+                )));
+            }
+        }
+        if checked.extensions.is_some() {
+            return Err(forbidden(
+                "only a room's owners change the group's extensions",
+            ));
+        }
+        Ok(())
     }
 
     /// Stores an accepted commit with its events and Welcome, then sends
@@ -523,12 +649,7 @@ impl Inner {
     /// ENC (12.8).
     async fn enc(&self, uid: &Uid, reply: &Reply, conv: Conv, enc: Enc) -> Outcome {
         let key = self.device_key(uid, reply.handle.id())?;
-        let room = match conv {
-            Conv::Room(room) => room,
-            // Step 5: direct conversations.
-            Conv::Uid(_) => return Err(not_supported()),
-        };
-        let mut guard = self.lock_room(&room).await?;
+        let mut guard = self.lock_conv(uid, &conv).await?;
         let st = &mut *guard;
         // A message that was already sent gets its seq again (7.6), before
         // any other check, as for MSG.
@@ -539,8 +660,10 @@ impl Inner {
                 return Ok(Some(OkResponse::new().with_seq(seq)));
             }
         }
+        let Some(info) = st.room_info() else {
+            return self.enc_direct(st, uid, &key, enc).await;
+        };
         let member = st.is_member(uid);
-        let info = room_of(st)?;
         check_read(info, self.asker(uid, member))?;
         if !member {
             return Err(forbidden("join the room first"));
@@ -561,6 +684,27 @@ impl Inner {
         };
         self.check_enc(st, uid, &key, group, &enc, !gone.is_empty())
             .await?;
+        self.append_enc(st, uid, enc).await
+    }
+
+    /// ENC in a direct conversation (12.8), whose lock the caller holds.
+    async fn enc_direct(
+        &self,
+        st: &mut ConvState,
+        uid: &Uid,
+        key: &PublicKey,
+        enc: Enc,
+    ) -> Outcome {
+        let (a, b) = st.participants().ok_or_else(not_found)?;
+        let other = if a == uid { b.clone() } else { a.clone() };
+        // Neither side sends while one has blocked the other (5.7).
+        if other != *uid
+            && (self.is_blocked(uid, &other).await? || self.is_blocked(&other, uid).await?)
+        {
+            return Err(forbidden("one of you has blocked the other"));
+        }
+        let group = st.group.ok_or(StoreError::NoConversation)?;
+        self.check_enc(st, uid, key, group, &enc, false).await?;
         self.append_enc(st, uid, enc).await
     }
 
@@ -638,27 +782,25 @@ impl Inner {
 
     /// GROUPINFO (12.5).
     async fn group_info(&self, uid: &Uid, reply: &Reply, conv: Conv) -> Outcome {
-        let room = match conv {
-            Conv::Room(room) => room,
-            // Step 5: direct conversations.
-            Conv::Uid(_) => return Err(not_supported()),
-        };
-        let st = self.lock_room(&room).await?;
-        let info = room_of(&st)?;
-        if !visible(info, self.asker(uid, st.is_member(uid))) {
-            return Err(not_found());
-        }
-        if st.group.is_none() {
-            return Err(fail(ErrorCode::NotFound, "the room has no group"));
-        }
-        if !st.is_member(uid) && !info.invites.contains(uid) {
-            return Err(forbidden("only members and invitees join the group"));
+        let st = self.lock_conv(uid, &conv).await?;
+        // Any participant of a direct conversation may ask.
+        let room = st.room_info();
+        if let Some(info) = room {
+            if !visible(info, self.asker(uid, st.is_member(uid))) {
+                return Err(not_found());
+            }
+            if st.group.is_none() {
+                return Err(fail(ErrorCode::NotFound, "the room has no group"));
+            }
+            if !st.is_member(uid) && !info.invites.contains(uid) {
+                return Err(forbidden("only members and invitees join the group"));
+            }
         }
         let conv_key = st.key;
         let (leaf_uids, record) = self
             .db(move |s| Ok((s.leaf_uids(conv_key)?, s.group(conv_key)?)))
             .await?;
-        if !leaf_uids.contains(uid) {
+        if room.is_some() && !leaf_uids.contains(uid) {
             return Err(forbidden(
                 "only an identity with a leaf joins by external commit",
             ));

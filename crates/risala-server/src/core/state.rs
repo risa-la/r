@@ -28,7 +28,7 @@ use risala_proto::types::{Cid, Role};
 
 use super::presence::PresenceBook;
 use crate::handler::{ConnHandle, ConnId, ConnInfo, OutLine};
-use crate::store::{CID_WINDOW_MS, ConvKey, GroupMeta, RoomRecord, RoomSettings};
+use crate::store::{CID_WINDOW_MS, ConvKey, DirectRecord, GroupMeta, RoomRecord, RoomSettings};
 
 /// A conversation the hub knows, behind its async lock. The lock is held
 /// while an event is assigned its seq, stored and queued for every
@@ -72,11 +72,14 @@ pub(crate) struct ConvState {
     pub(crate) group: Option<GroupMeta>,
 }
 
-/// The kinds of conversation (5.1). Direct conversations come with M5a.
+/// The kinds of conversation (5.1).
 #[derive(Debug)]
 pub(crate) enum ConvKind {
     /// A room (Section 6).
     Room(RoomInfo),
+    /// A direct conversation between `a` and `b`, `a <= b`, the same uid
+    /// for a conversation with yourself (5.1).
+    Direct { a: Uid, b: Uid },
 }
 
 /// What only rooms have.
@@ -114,10 +117,29 @@ impl ConvState {
         }
     }
 
+    /// The state of a stored direct conversation, with no members yet:
+    /// the caller adds its participants.
+    pub(crate) fn direct(record: DirectRecord) -> ConvState {
+        ConvState {
+            key: record.key,
+            id: record.id,
+            head: record.head,
+            dropped: false,
+            members: BTreeMap::new(),
+            marker_moved: 0,
+            group: record.group,
+            kind: ConvKind::Direct {
+                a: record.a,
+                b: record.b,
+            },
+        }
+    }
+
     /// The room part, for a conversation that is a room.
     pub(crate) fn room_info(&self) -> Option<&RoomInfo> {
         match &self.kind {
             ConvKind::Room(info) => Some(info),
+            ConvKind::Direct { .. } => None,
         }
     }
 
@@ -125,13 +147,25 @@ impl ConvState {
     pub(crate) fn room_info_mut(&mut self) -> Option<&mut RoomInfo> {
         match &mut self.kind {
             ConvKind::Room(info) => Some(info),
+            ConvKind::Direct { .. } => None,
         }
     }
 
-    /// The conversation's name as `uid` sees it (5.2).
-    pub(crate) fn name_for(&self, _uid: &Uid) -> Conv {
+    /// The participants, for a direct conversation (5.1).
+    pub(crate) fn participants(&self) -> Option<(&Uid, &Uid)> {
+        match &self.kind {
+            ConvKind::Room(_) => None,
+            ConvKind::Direct { a, b } => Some((a, b)),
+        }
+    }
+
+    /// The conversation's name as `uid` sees it (5.2): a room's name, or
+    /// for a direct conversation the other participant, or `uid` itself
+    /// in a conversation with yourself.
+    pub(crate) fn name_for(&self, uid: &Uid) -> Conv {
         match &self.kind {
             ConvKind::Room(info) => Conv::Room(info.room.clone()),
+            ConvKind::Direct { a, b } => Conv::Uid(if a == uid { b.clone() } else { a.clone() }),
         }
     }
 
@@ -171,6 +205,17 @@ impl ConvState {
     pub(crate) fn broadcast(&self, line: &OutLine) {
         for user in self.members.values() {
             user.send(line);
+        }
+    }
+
+    /// Queues the line `make` writes for each member, for every connection
+    /// of that member: in a direct conversation each side's lines name the
+    /// other (5.2).
+    pub(crate) fn broadcast_each(&self, make: impl Fn(&Uid) -> Option<OutLine>) {
+        for (uid, user) in &self.members {
+            if let Some(line) = make(uid) {
+                user.send(&line);
+            }
         }
     }
 }

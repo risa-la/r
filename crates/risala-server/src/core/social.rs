@@ -16,7 +16,7 @@ use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
 use risala_proto::types::{Presence, Role};
 
 use super::Inner;
-use super::commands::{Fail, Outcome, Reply, check_read, fail, not_supported, room_of};
+use super::commands::{Fail, Outcome, Reply, check_read, fail, room_of};
 use super::moderation::{may_send_messages, only_moderators_send};
 use super::state::UserEntry;
 use crate::handler::OutLine;
@@ -39,12 +39,10 @@ impl Inner {
     /// The marker may be set in any room the account may read (7.2), so
     /// that a public room read without joining can have one too.
     pub(super) async fn read(&self, uid: &Uid, reply: &Reply, conv: Conv, seq: Seq) -> Outcome {
-        let Conv::Room(room) = conv else {
-            // M5a: direct conversations.
-            return Err(not_supported());
-        };
-        let mut st = self.lock_room(&room).await?;
-        check_read(room_of(&st)?, self.asker(uid, st.is_member(uid)))?;
+        let mut st = self.lock_conv(uid, &conv).await?;
+        if let Some(info) = st.room_info() {
+            check_read(info, self.asker(uid, st.is_member(uid)))?;
+        }
         let (key, who) = (st.key, uid.clone());
         let marker = self.db(move |s| s.set_read_marker(key, &who, seq)).await?;
         // Sent under the room's lock, so that two devices moving the marker
@@ -73,7 +71,7 @@ impl Inner {
     /// `limits.typing_interval_ms`; those in between get `OK` too, since a
     /// typing notification lasts 6 seconds anyway.
     ///
-    /// Blocks do not apply in rooms (5.7). M5a: in direct conversations,
+    /// Blocks do not apply in rooms (5.7). In direct conversations,
     /// neither side may send TYPING while one has blocked the other
     /// ([`is_blocked`](Self::is_blocked)).
     pub(super) async fn typing(&self, uid: &Uid, reply: &Reply, conv: Conv) -> Outcome {
@@ -83,8 +81,7 @@ impl Inner {
             Conv::Uid(_) if uid.is_guest() => {
                 return Err(fail(ErrorCode::NotFound, "no such conversation"));
             }
-            // M5a: direct conversations.
-            Conv::Uid(_) => return Err(not_supported()),
+            Conv::Uid(other) => return self.typing_direct(uid, reply, &other).await,
         };
         let st = self.lock_room(&room).await?;
         let member = st.is_member(uid);
@@ -117,6 +114,37 @@ impl Inner {
                     user.send(&line);
                 }
             }
+        }
+        Ok(Some(OkResponse::new()))
+    }
+
+    /// TYPING in a direct conversation (5.7, 8.1).
+    async fn typing_direct(&self, uid: &Uid, reply: &Reply, other: &Uid) -> Outcome {
+        let st = self.lock_direct(uid, other).await?;
+        if other != uid
+            && (self.is_blocked(uid, other).await? || self.is_blocked(other, uid).await?)
+        {
+            return Err(fail(
+                ErrorCode::Forbidden,
+                "one of you has blocked the other",
+            ));
+        }
+        let pass = self
+            .reg()
+            .conns
+            .get_mut(&reply.handle.id())
+            .is_some_and(|c| c.may_type(&st.id, self.typing_interval));
+        if pass {
+            // Under the conversation's lock, so that it cannot overtake a
+            // message from the same user, which ends it (8.1).
+            st.broadcast_each(|who| {
+                (who != uid).then(|| {
+                    OutLine::new(ServerMessage::new(ServerLine::Typing {
+                        from: uid.clone(),
+                        conv: st.name_for(who),
+                    }))
+                })
+            });
         }
         Ok(Some(OkResponse::new()))
     }

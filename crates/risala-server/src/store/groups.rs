@@ -377,8 +377,54 @@ pub struct CommitStored {
     pub welcome_ids: Vec<Id>,
 }
 
+/// A direct conversation (5.1), as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectRecord {
+    /// The store's key for it.
+    pub key: ConvKey,
+    /// Its id (5.1).
+    pub id: Id,
+    /// Its participants, `a <= b`, the same uid for a conversation with
+    /// yourself.
+    pub a: Uid,
+    /// See `a`.
+    pub b: Uid,
+    /// The newest seq, or `None` before the first event.
+    pub head: Option<Seq>,
+    /// Where its group is. Every direct conversation has one: INIT starts
+    /// it (5.1).
+    pub group: Option<GroupMeta>,
+}
+
+/// The result of [`GroupStore::init_direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectInit {
+    /// The conversation was started with its group.
+    Done(DirectRecord),
+    /// The conversation exists already, and so does its group
+    /// (`ERR stale`, 12.5).
+    Exists,
+    /// The group id was used before (`ERR invalid`, 12.5).
+    IdTaken,
+}
+
 /// The groups of encrypted conversations (12.5, 12.6, 12.8).
 pub trait GroupStore {
+    /// Every direct conversation, by key.
+    fn directs(&self) -> Result<Vec<DirectRecord>>;
+
+    /// Starts the direct conversation of `a` and `b`, which may be the same
+    /// uid, with its group in epoch 0 (5.1, 12.5), in one transaction.
+    /// Nothing is stored unless both are new.
+    fn init_direct(
+        &self,
+        a: &Uid,
+        b: &Uid,
+        group: &GroupRecord,
+        leaves: &[GroupLeaf],
+        now: risala_proto::time::Timestamp,
+    ) -> Result<DirectInit>;
+
     /// A conversation's group, or `None` if it has none.
     fn group(&self, conv: ConvKey) -> Result<Option<GroupRecord>>;
 
@@ -400,6 +446,11 @@ pub trait GroupStore {
     /// devices it removes (12.7), all in one transaction. `None` if the
     /// group is no longer in `from_epoch`, and then nothing is stored.
     fn commit_group(&self, conv: ConvKey, commit: &GroupCommit) -> Result<Option<CommitStored>>;
+
+    /// A page of the conversation's COMMIT events, as
+    /// [`Store::history`](super::Store::history) pages all events
+    /// (`HISTORY only=commit`, 7.2, 12.11).
+    fn commits(&self, conv: ConvKey, query: super::HistoryQuery) -> Result<super::Page>;
 
     /// Whether the device `uid` and `key` has a leaf in the group (12.8).
     fn has_leaf(&self, conv: ConvKey, uid: &Uid, key: &PublicKey) -> Result<bool>;

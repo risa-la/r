@@ -136,9 +136,19 @@ impl Inner {
         else {
             return Err(not_supported());
         };
-        // M5a: direct conversations. M8: files.
-        let Conv::Room(room) = conv else {
-            return Err(not_supported());
+        // Direct conversations are always encrypted (5.1, 12.3), once the
+        // other side is an identity the server knows. M8: files.
+        let room = match conv {
+            Conv::Room(room) => room,
+            Conv::Uid(other) => {
+                let known = other.is_identity()
+                    && (self.direct_entry(uid, &other).is_some()
+                        || self.db(move |s| s.identity(&other)).await?.is_some());
+                if !known {
+                    return Err(fail(ErrorCode::NotFound, "no such identity"));
+                }
+                return Err(fail(ErrorCode::Encrypted, "send with ENC"));
+            }
         };
         if file.is_some() {
             return Err(not_supported());
@@ -285,13 +295,10 @@ impl Inner {
         }
     }
 
-    /// DELETE (5.4), in rooms.
+    /// DELETE (5.4). In a direct conversation, only the author deletes.
+    /// Guests never get here with one (4.2).
     async fn delete(&self, uid: &Uid, conv: Conv, target: Seq, id: Option<Id>) -> Outcome {
-        // M5a: direct conversations. Guests never get here with one (4.2).
-        let Conv::Room(room) = conv else {
-            return Err(not_supported());
-        };
-        let mut guard = self.lock_room(&room).await?;
+        let mut guard = self.lock_conv(uid, &conv).await?;
         let st = &mut *guard;
         // A seq meant for an older room of the same name names nothing
         // here (5.4).
@@ -307,6 +314,15 @@ impl Inner {
         // Authors may delete their own messages even where they can no
         // longer read, so this comes before the reading rules (5.4).
         let own = event.as_ref().is_some_and(|e| self.is_author(uid, key, e));
+        if !own && st.room_info().is_none() {
+            return match event {
+                None => Err(no_message()),
+                Some(_) => Err(fail(
+                    ErrorCode::Forbidden,
+                    "only the author may delete a message here",
+                )),
+            };
+        }
         if !own {
             let info = room_of(st)?;
             check_read(info, self.asker(uid, st.is_member(uid)))?;
@@ -355,7 +371,7 @@ impl Inner {
         Ok(Some(OkResponse::new().with_seq(event.seq)))
     }
 
-    /// RELATED (7.3), in rooms.
+    /// RELATED (7.3).
     async fn related(
         &self,
         uid: &Uid,
@@ -363,14 +379,14 @@ impl Inner {
         conv: Conv,
         mut query: RelatedQuery,
     ) -> Outcome {
-        // M5a: direct conversations. Guests never get here with one (4.2).
-        let Conv::Room(room) = conv else {
-            return Err(not_supported());
-        };
-        let (key, id) = {
-            let st = self.lock_room(&room).await?;
-            check_read(room_of(&st)?, self.asker(uid, st.is_member(uid)))?;
-            (st.key, st.id.clone())
+        // Guests never get here with a direct conversation (4.2). In one,
+        // RELATED finds nothing, since it returns no ENC events (12.11).
+        let (key, id, name) = {
+            let st = self.lock_conv(uid, &conv).await?;
+            if let Some(info) = st.room_info() {
+                check_read(info, self.asker(uid, st.is_member(uid)))?;
+            }
+            (st.key, st.id.clone(), st.name_for(uid))
         };
         query.limit = query.limit.min(self.config.limits.max_page).max(1);
         let page = self
@@ -382,7 +398,7 @@ impl Inner {
         let lines = page
             .events
             .iter()
-            .map(|event| event.to_event(room.clone(), &id))
+            .map(|event| event.to_event(name.clone(), &id))
             .collect::<Result<Vec<_>, _>>()?;
         for line in lines {
             reply.line(line);
@@ -472,13 +488,15 @@ impl Inner {
     /// Expires one batch of a conversation's events whose lock the caller
     /// holds. Returns how many.
     async fn expire_batch(&self, st: &ConvState) -> Result<u64, StoreError> {
-        let Some(info) = st.room_info() else {
-            return Ok(0);
-        };
         if st.dropped || st.head.is_none() {
             return Ok(0);
         }
-        let Some(before) = self.expiry_cutoff(&info.settings) else {
+        // A direct conversation follows the server's period (7.5).
+        let cutoff = match st.room_info() {
+            Some(info) => self.expiry_cutoff(&info.settings),
+            None => self.expiry_cutoff(&RoomSettings::new()),
+        };
+        let Some(before) = cutoff else {
             return Ok(0);
         };
         let key = st.key;
@@ -506,13 +524,20 @@ impl Inner {
     /// conversation that fails is logged, the others still expire, and
     /// the first error is returned.
     pub(super) async fn expire_all(&self) -> Result<u64, StoreError> {
-        let entries: Vec<_> = self
+        let mut entries: Vec<_> = self
             .rooms
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
             .collect();
+        entries.extend(
+            self.directs
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned(),
+        );
         let (mut total, mut first_error) = (0, None);
         for entry in entries {
             loop {

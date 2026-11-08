@@ -2416,6 +2416,19 @@ impl crate::store::E2eeStore for Flaky {
 // (the rest)
 
 impl crate::store::GroupStore for Flaky {
+    fn directs(&self) -> crate::store::Result<Vec<crate::store::DirectRecord>> {
+        self.inner.directs()
+    }
+    fn init_direct(
+        &self,
+        a: &Uid,
+        b: &Uid,
+        g: &crate::store::GroupRecord,
+        l: &[crate::store::GroupLeaf],
+        t: Timestamp,
+    ) -> crate::store::Result<crate::store::DirectInit> {
+        self.inner.init_direct(a, b, g, l, t)
+    }
     fn group(&self, c: ConvKey) -> crate::store::Result<Option<crate::store::GroupRecord>> {
         self.inner.group(c)
     }
@@ -2435,6 +2448,9 @@ impl crate::store::GroupStore for Flaky {
         g: &crate::store::GroupCommit,
     ) -> crate::store::Result<Option<crate::store::CommitStored>> {
         self.inner.commit_group(c, g)
+    }
+    fn commits(&self, c: ConvKey, q: HistoryQuery) -> crate::store::Result<Page> {
+        self.inner.commits(c, q)
     }
     fn has_leaf(&self, c: ConvKey, u: &Uid, k: &PublicKey) -> crate::store::Result<bool> {
         self.inner.has_leaf(c, u, k)

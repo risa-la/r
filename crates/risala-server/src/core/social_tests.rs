@@ -186,9 +186,9 @@ async fn read_markers_need_a_room_one_may_read() {
     let mut bob = h.signed_in_as(BOB);
     h.send(&bob, "read #other 1").await;
     assert_eq!(bob.lines(), ["OK"]);
-    // M5a: direct conversations.
+    // A direct conversation that has not started (5.1).
     h.send(&alice, "read bob@example.org 1").await;
-    assert_eq!(alice.lines(), ["ERR not-supported not supported yet"]);
+    assert_eq!(alice.lines(), ["ERR not-found no such conversation"]);
     // Guests have no read markers (7.4).
     let mut sam = h.guest("sam").await;
     h.send(&sam, "read #general 1").await;
@@ -274,9 +274,9 @@ async fn typing_needs_membership_and_write_access() {
     let mut dave = h.signed_in_as(DAVE);
     h.send(&dave, "typing #private").await;
     assert_eq!(dave.lines(), ["ERR not-found no such room"]);
-    // M5a: direct conversations.
+    // A direct conversation that has not started (5.1).
     h.send(&bob, "typing alice@example.org").await;
-    assert_eq!(bob.lines(), ["ERR not-supported not supported yet"]);
+    assert_eq!(bob.lines(), ["ERR not-found no such conversation"]);
 
     let (mut sam, _) = h.joined("sam", "#quiet").await;
     h.send(&sam, "typing #quiet").await;

@@ -1031,3 +1031,257 @@ async fn enc_waits_for_leaves_that_must_go() {
     ga1.merge_pending_commit(&a1.provider).unwrap();
     assert!(w.ask(&mut c1, &a1.enc("#r", &ga1, "TEXT hi\n")).await[1].starts_with("OK seq="));
 }
+
+// ---------------------------------------------------------------------------
+// Direct conversations (5.1, 5.2, 12.5, 12.6)
+
+#[tokio::test]
+async fn direct_conversations_start_with_init() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let me = RisalaConversation::direct(&a1.uid, &uid(BOB));
+
+    // Not before INIT, and MSG never.
+    assert_eq!(
+        w.ask(&mut c1, "history bob@example.net").await,
+        ["ERR not-found no such conversation"]
+    );
+    assert_eq!(
+        w.ask(&mut c1, "msg bob@example.net hi").await,
+        ["ERR encrypted send with ENC"]
+    );
+    assert_eq!(
+        w.ask(&mut c1, "msg nobody@example.net hi").await,
+        ["ERR not-found no such identity"]
+    );
+    // Only with identities the server knows, and named right.
+    let group = a1.create(&RisalaConversation::direct(
+        &a1.uid,
+        &uid("nobody@example.net"),
+    ));
+    assert_eq!(
+        w.ask(&mut c1, &a1.init_line("nobody@example.net", &group))
+            .await,
+        ["ERR not-found no such identity"]
+    );
+    assert_eq!(
+        w.ask(&mut c1, &a1.init_line(BOB, &group)).await,
+        ["ERR invalid the conversation extension names another conversation"]
+    );
+    // Not by someone blocked.
+    w.ask(&mut cb, "block alice@example.org").await;
+    let mut ga1 = a1.create(&me);
+    assert_eq!(
+        w.ask(&mut c1, &a1.init_line(BOB, &ga1)).await,
+        ["ERR forbidden you may not start a conversation with them"]
+    );
+    w.ask(&mut cb, "unblock alice@example.org").await;
+
+    let lines = w.ask(&mut c1, &a1.init_line(BOB, &ga1)).await;
+    let id = ok_value(&lines, "id");
+    assert_eq!(lines, [format!("OK id={id} epoch=0")]);
+    // Bob's INIT comes second.
+    let gb = b5.create(&me);
+    assert_eq!(
+        w.ask(&mut cb, &b5.init_line(ALICE, &gb)).await,
+        ["ERR stale the conversation has a group already"]
+    );
+
+    // Alice adds Bob's device and her own second one (12.6).
+    let a2 = Device::new(ALICE, 2);
+    let mut c2 = w.connect(&a2);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b5.kp(), a2.kp()],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line(BOB)).await;
+    assert_eq!(
+        short(&lines),
+        [
+            &format!("COMMIT bob@example.net 1 {}", &sent.commit.as_str()[..12]),
+            "OK seq=1 epoch=1",
+        ]
+    );
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    // Each side's lines name the other (5.2).
+    let lines = cb.lines();
+    assert!(untagged(&lines[0]).starts_with("COMMIT alice@example.org 1 "));
+    let mut gb5 = b5.join(find(&lines, "WELCOME alice@example.org "));
+    let lines = c2.lines();
+    assert!(untagged(&lines[0]).starts_with("COMMIT bob@example.net 1 "));
+    let ga2 = a2.join(find(&lines, "WELCOME bob@example.net "));
+    assert_eq!(ga2.epoch().as_u64(), 1);
+
+    // SYNC lists it for both, by the other's name.
+    let lines = w.ask(&mut cb, "sync").await;
+    assert!(
+        lines.contains(&format!("CONV alice@example.org {id} 1 0")),
+        "{lines:?}"
+    );
+    let lines = w.ask(&mut c2, "sync").await;
+    assert!(lines.contains(&format!("CONV bob@example.net {id} 1 0")));
+
+    // ENC both ways.
+    let lines = w
+        .ask(&mut cb, &b5.enc(ALICE, &gb5, "TEXT hi alice\n"))
+        .await;
+    assert_eq!(lines.last().unwrap(), "OK seq=2");
+    let event = find(&c1.lines(), "ENC bob@example.net 1 ").to_owned();
+    assert_eq!(a1.read(&ga1, &event), "TEXT hi alice\n");
+    assert!(find(&lines, "ENC alice@example.org 1 ").contains("from=bob@example.net"));
+    // READ and TYPING.
+    assert_eq!(w.ask(&mut cb, "read alice@example.org 2").await, ["OK"]);
+    assert_eq!(w.ask(&mut cb, "typing alice@example.org").await, ["OK"]);
+    assert_eq!(untagged(&c1.lines()[0]), "TYPING bob@example.net");
+    // Blocks stop ENC and TYPING both ways (5.7).
+    w.ask(&mut c1, "block bob@example.net").await;
+    assert_eq!(
+        w.ask(&mut cb, &b5.enc(ALICE, &gb5, "TEXT hi\n")).await,
+        ["ERR forbidden one of you has blocked the other"]
+    );
+    assert_eq!(
+        w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await,
+        ["ERR forbidden one of you has blocked the other"]
+    );
+    assert_eq!(
+        w.ask(&mut cb, "typing alice@example.org").await,
+        ["ERR forbidden one of you has blocked the other"]
+    );
+    w.ask(&mut c1, "unblock bob@example.net").await;
+
+    // Only the author deletes.
+    assert_eq!(
+        w.ask(&mut c1, "delete bob@example.net 2").await,
+        ["ERR forbidden only the author may delete a message here"]
+    );
+    let lines = w.ask(&mut cb, "delete alice@example.org 2").await;
+    assert_eq!(lines.last().unwrap(), "OK seq=3");
+    assert_eq!(untagged(&c1.lines()[0]), "DELETE bob@example.net 2");
+
+    // HISTORY, and its COMMIT events only.
+    let lines = w.ask(&mut c1, "history bob@example.net after=0").await;
+    assert_eq!(
+        short(&lines),
+        [
+            &format!("COMMIT bob@example.net 1 {}", &sent.commit.as_str()[..12]),
+            "ENC bob@example.net 1",
+            "DELETE bob@example.net 2",
+            &format!("OK id={id} more=0"),
+        ]
+    );
+    let lines = w
+        .ask(&mut cb, "history alice@example.org after=0 only=commit")
+        .await;
+    assert_eq!(lines.len(), 2);
+    assert!(untagged(&lines[0]).starts_with("COMMIT alice@example.org 1 "));
+
+    // Only participants' devices may be added, and GroupContextExtensions
+    // is for rooms.
+    let c7 = Device::new(CAROL, 7);
+    let sent = b5.commit(
+        &mut gb5,
+        Changes {
+            add: vec![c7.kp()],
+            ..Changes::default()
+        },
+    );
+    assert_eq!(
+        w.ask(&mut cb, &sent.line(ALICE)).await,
+        ["ERR forbidden carol@example.org is not a participant of this conversation"]
+    );
+    gb5.clear_pending_commit(b5.provider.storage()).unwrap();
+    let mut changed = me.clone();
+    changed.history = HistoryMode::Joined;
+    let sent = b5.commit(
+        &mut gb5,
+        Changes {
+            conversation: Some(changed),
+            ..Changes::default()
+        },
+    );
+    assert_eq!(
+        w.ask(&mut cb, &sent.line(ALICE)).await,
+        ["ERR forbidden only a room's owners change the group's extensions"]
+    );
+    gb5.clear_pending_commit(b5.provider.storage()).unwrap();
+
+    // Bob's second device joins by external commit, with no leaf of its
+    // own: a participant may (12.6).
+    w.fetcher.set(&identity(BOB), vec![key(5), key(6)]);
+    let b6 = Device::new(BOB, 6);
+    let mut cb6 = w.connect(&b6);
+    let gi = w.ask(&mut cb6, "groupinfo alice@example.org").await;
+    assert!(gi[0].starts_with("GROUPINFO alice@example.org 1 1 "));
+    let (_, sent) = b6.join_external(&gi[0]);
+    let lines = w.ask(&mut cb6, &sent.line(ALICE)).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=4 epoch=2");
+    // Carol cannot even name it.
+    let mut cc = w.connect(&c7);
+    assert_eq!(
+        w.ask(&mut cc, "groupinfo alice@example.org").await,
+        ["ERR not-found no such conversation"]
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_with_yourself() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let mut g = a1.create(&RisalaConversation::direct(&a1.uid, &a1.uid));
+    let lines = w.ask(&mut c1, &a1.init_line(ALICE, &g)).await;
+    assert!(lines[0].starts_with("OK id="));
+    let a2 = Device::new(ALICE, 2);
+    let mut c2 = w.connect(&a2);
+    let sent = a1.commit(
+        &mut g,
+        Changes {
+            add: vec![a2.kp()],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line(ALICE)).await;
+    assert!(untagged(&lines[0]).starts_with("COMMIT alice@example.org 1 "));
+    let lines = c2.lines();
+    let g2 = a2.join(find(&lines, "WELCOME alice@example.org "));
+    let lines = w.ask(&mut c2, "sync").await;
+    assert!(lines[0].starts_with("CONV alice@example.org "));
+    g.merge_pending_commit(&a1.provider).unwrap();
+    w.ask(&mut c1, &a1.enc(ALICE, &g, "KEY x 0 y\n")).await;
+    assert_eq!(
+        a2.read(&g2, find(&c2.lines(), "ENC alice@example.org 1")),
+        "KEY x 0 y\n"
+    );
+}
+
+#[tokio::test]
+async fn direct_conversations_outlive_a_restart() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let g = a1.create(&RisalaConversation::direct(&a1.uid, &uid(CAROL)));
+    let id = ok_value(&w.ask(&mut c1, &a1.init_line(CAROL, &g)).await, "id");
+    let hub = Hub::build(
+        config(),
+        w.h.store.clone(),
+        w.h.clock.clone(),
+        timers(),
+        KeyServices::default(),
+    )
+    .unwrap();
+    w.h.hub = hub;
+    let mut c7 = w.connect(&Device::new(CAROL, 7));
+    // With no event yet, SYNC cannot list it: a CONV line's head is at
+    // least 1 (7.1). GROUPINFO finds it.
+    assert_eq!(w.ask(&mut c7, "sync").await, ["OK"]);
+    let lines = w.ask(&mut c7, "groupinfo alice@example.org").await;
+    assert!(lines[0].starts_with("GROUPINFO alice@example.org 0 0 "));
+    let lines = w.ask(&mut c7, "history alice@example.org").await;
+    assert_eq!(lines, [format!("OK id={id} more=0")]);
+}

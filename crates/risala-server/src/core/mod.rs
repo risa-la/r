@@ -255,6 +255,10 @@ pub(crate) struct Inner {
     /// Every room, by name. A room is added at run time only while
     /// `create_lock` is held, so two JOINs cannot both create it.
     rooms: RwLock<BTreeMap<Room, Arc<ConvEntry>>>,
+    /// Every direct conversation, by its participants in order (5.1). One
+    /// is added at run time only while `create_lock` is held, so two INITs
+    /// cannot both start it.
+    directs: RwLock<HashMap<(Uid, Uid), Arc<ConvEntry>>>,
     create_lock: tokio::sync::Mutex<()>,
     reg: Mutex<Registry>,
     sign_in_timeout: Duration,
@@ -447,7 +451,20 @@ impl Hub {
             }
             rooms.insert(room, entry);
         }
-        tracing::info!(rooms = rooms.len(), "hub started");
+        let mut directs = HashMap::new();
+        for record in store.directs()? {
+            let pair = (record.a.clone(), record.b.clone());
+            let entry = Arc::new(ConvEntry::new(ConvState::direct(record)));
+            {
+                let mut st = entry.try_lock().expect("a new conversation is not locked");
+                for uid in [&pair.0, &pair.1] {
+                    let user = reg.user(uid);
+                    st.add_member(&entry, &user);
+                }
+            }
+            directs.insert(pair, entry);
+        }
+        tracing::info!(rooms = rooms.len(), directs = directs.len(), "hub started");
 
         let operators: BTreeSet<Uid> = config
             .operators()
@@ -491,6 +508,7 @@ impl Hub {
                     clock,
                     settings: RwLock::new(settings),
                     rooms: RwLock::new(rooms),
+                    directs: RwLock::new(directs),
                     create_lock: tokio::sync::Mutex::new(()),
                     reg: Mutex::new(reg),
                     sign_in_timeout: timers.sign_in,
@@ -734,6 +752,20 @@ impl Inner {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(room)
+            .cloned()
+    }
+
+    /// The direct conversation of `a` and `b`, in either order (5.1).
+    fn direct_entry(&self, a: &Uid, b: &Uid) -> Option<Arc<ConvEntry>> {
+        let pair = if a <= b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        self.directs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pair)
             .cloned()
     }
 

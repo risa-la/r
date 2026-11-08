@@ -13,7 +13,7 @@ use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{
     ErrResponse, Event, EventBody, OkResponse, Register, ServerLine, ServerMessage, Upload,
 };
-use risala_proto::types::{DEFAULT_LIMIT, DEFAULT_LIST_LIMIT, InfoRole, Ref, Role};
+use risala_proto::types::{DEFAULT_LIMIT, DEFAULT_LIST_LIMIT, HistoryOnly, InfoRole, Ref, Role};
 
 use super::state::{ConvEntry, ConvGuard, ConvState, RoomInfo};
 use super::{Inner, SignIn, SignInRefused, TOKEN_LEN};
@@ -342,8 +342,12 @@ impl Inner {
                 after,
                 before,
                 limit,
-                only: None,
-            } => self.history(uid, reply, conv, after, before, limit).await,
+                only,
+            } => {
+                let commits = only == Some(HistoryOnly::Commit);
+                self.history(uid, reply, conv, after, before, limit, commits)
+                    .await
+            }
             Command::Read { conv, seq } => self.read(uid, reply, conv, seq).await,
             Command::Typing { conv } => self.typing(uid, reply, conv).await,
             Command::Name { display_name } => self.name(uid, reply, display_name).await,
@@ -534,16 +538,23 @@ impl Inner {
     /// (5.2). The event is already stored, so an event that cannot be
     /// shown is only logged.
     ///
-    /// M5a: a direct conversation's lines name the other participant, so
-    /// they are written once per receiver (5.2).
+    /// A direct conversation's lines name the other participant, so they
+    /// are written once per receiver (5.2).
     pub(super) fn broadcast_event(st: &ConvState, event: &StoredEvent) {
-        let Some(info) = st.room_info() else {
+        if let Some(info) = st.room_info() {
+            match event.to_event(info.room.clone(), &st.id) {
+                Ok(line) => st.broadcast(&OutLine::new(ServerMessage::new(line))),
+                Err(e) => tracing::error!(room = %info.room, "cannot send an event: {e}"),
+            }
             return;
-        };
-        match event.to_event(info.room.clone(), &st.id) {
-            Ok(line) => st.broadcast(&OutLine::new(ServerMessage::new(line))),
-            Err(e) => tracing::error!(room = %info.room, "cannot send an event: {e}"),
         }
+        st.broadcast_each(|uid| match event.to_event(st.name_for(uid), &st.id) {
+            Ok(line) => Some(OutLine::new(ServerMessage::new(line))),
+            Err(e) => {
+                tracing::error!(conv = %st.id, "cannot send an event: {e}");
+                None
+            }
+        });
     }
 
     /// Locks a room. A room that does not exist, or that was dropped while
@@ -564,6 +575,25 @@ impl Inner {
                 Some(new) if !Arc::ptr_eq(&new, &entry) => entry = new,
                 _ => return Err(not_found()),
             }
+        }
+    }
+
+    /// Locks the direct conversation of `uid` and `other` (5.1), or
+    /// `ERR not-found` if it has not started. Direct conversations are
+    /// never dropped.
+    pub(super) async fn lock_direct(&self, uid: &Uid, other: &Uid) -> Result<ConvGuard, Fail> {
+        let entry = self
+            .direct_entry(uid, other)
+            .ok_or_else(|| fail(ErrorCode::NotFound, "no such conversation"))?;
+        Ok(entry.lock_owned().await)
+    }
+
+    /// Locks the conversation `conv` names for `uid`: a room, or a direct
+    /// conversation (5.1).
+    pub(super) async fn lock_conv(&self, uid: &Uid, conv: &Conv) -> Result<ConvGuard, Fail> {
+        match conv {
+            Conv::Room(room) => self.lock_room(room).await,
+            Conv::Uid(other) => self.lock_direct(uid, other).await,
         }
     }
 
@@ -805,7 +835,9 @@ impl Inner {
     /// if `uid` is still a member there.
     pub(super) async fn auto_part(&self, conv: Arc<ConvEntry>, uid: &Uid) {
         let mut st = conv.lock_owned().await;
-        if st.dropped || !st.is_member(uid) {
+        // A direct conversation has no PART: the identity is just gone
+        // from it (4.8).
+        if st.dropped || !st.is_member(uid) || st.room_info().is_none() {
             // Not a member here any more: just make sure the user's list
             // agrees, so that the caller's loop ends.
             if st.remove_member(uid).is_none()
@@ -916,7 +948,9 @@ impl Inner {
         !handle.is_closed()
     }
 
-    /// HISTORY (7.2).
+    /// HISTORY (7.2), with `only=commit` (12.11): a room the asker may
+    /// read, or one of its direct conversations.
+    #[allow(clippy::too_many_arguments)]
     async fn history(
         &self,
         uid: &Uid,
@@ -925,28 +959,30 @@ impl Inner {
         after: Option<u64>,
         before: Option<Seq>,
         limit: Option<NonZeroU64>,
+        commits: bool,
     ) -> Outcome {
-        let room = match conv {
-            Conv::Room(room) => room,
-            // Guests have no direct conversations (4.2).
-            Conv::Uid(_) if uid.is_guest() => {
-                return Err(fail(ErrorCode::NotFound, "no such conversation"));
-            }
-            // M3: direct conversations.
-            Conv::Uid(_) => return Err(not_supported()),
-        };
-        let (key, id) = {
-            let st = self.lock_room(&room).await?;
-            check_read(room_of(&st)?, self.asker(uid, st.is_member(uid)))?;
-            (st.key, st.id.clone())
-        };
+        // Guests have no direct conversations (4.2); they were answered
+        // `not-found` before this.
+        let st = self.lock_conv(uid, &conv).await?;
+        if let Some(info) = st.room_info() {
+            check_read(info, self.asker(uid, st.is_member(uid)))?;
+        }
+        let (key, id) = (st.key, st.id.clone());
+        let name = st.name_for(uid);
+        drop(st);
         let query = HistoryQuery {
             after,
             before,
             limit: page_limit(limit, DEFAULT_LIMIT, self.config.limits.max_page),
         };
         let page = self
-            .db(move |s| s.history(key, query))
+            .db(move |s| {
+                if commits {
+                    s.commits(key, query)
+                } else {
+                    s.history(key, query)
+                }
+            })
             .await
             .map_err(gone_is_not_found)?;
         // Every line is made before any is sent, so that bad data gives
@@ -954,7 +990,7 @@ impl Inner {
         let lines = page
             .events
             .iter()
-            .map(|event| event.to_event(room.clone(), &id))
+            .map(|event| event.to_event(name.clone(), &id))
             .collect::<Result<Vec<_>, _>>()?;
         for line in lines {
             reply.line(line);

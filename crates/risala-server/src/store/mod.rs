@@ -46,8 +46,8 @@ pub use e2ee::{
     PendingWelcome,
 };
 pub use groups::{
-    CommitStored, GroupCommit, GroupInit, GroupLeaf, GroupMeta, GroupParts, GroupRecord,
-    GroupState, GroupStateError, GroupStore, NewWelcome,
+    CommitStored, DirectInit, DirectRecord, GroupCommit, GroupInit, GroupLeaf, GroupMeta,
+    GroupParts, GroupRecord, GroupState, GroupStateError, GroupStore, NewWelcome,
 };
 pub use messages::{MessageStore, PurgeQuery, RelatedQuery};
 pub use moderation::ModerationStore;

@@ -435,12 +435,12 @@ async fn a_clock_stepping_back_does_not_make_a_guest_the_author() {
 }
 
 #[tokio::test]
-async fn delete_in_a_direct_conversation_waits_for_m5a() {
+async fn a_direct_conversation_starts_with_init() {
     let mut h = Harness::new();
     let mut alice = h.signed_in_as(ALICE);
     h.send(&alice, &format!("delete {BOB} 1")).await;
     h.send(&alice, &format!("related {BOB} 1 2")).await;
-    assert_eq!(alice.lines(), ["ERR not-supported not supported yet"; 2]);
+    assert_eq!(alice.lines(), ["ERR not-found no such conversation"; 2]);
 }
 
 #[tokio::test]

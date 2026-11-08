@@ -4,12 +4,19 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use risala_proto::auth::PublicKey;
 use risala_proto::names::Uid;
+use risala_proto::time::Timestamp;
+
+/// Rolls back a new direct conversation whose group id was used before.
+const GROUP_ID_TAKEN: &str = "the group id was used before";
 
 use super::e2ee::{add_welcomes_in, prune_welcome_commits};
-use super::{SqliteStore, append_in, conv_exists, corrupt, parse, seq, sql_epoch, sql_seq};
+use super::{
+    SqliteStore, append_in, conv_exists, corrupt, ms, parse, seq, sql_epoch, sql_seq, take_id,
+};
 use crate::store::{
-    Appended, CommitStored, ConvKey, GroupCommit, GroupInit, GroupLeaf, GroupMeta, GroupParts,
-    GroupRecord, GroupStore, NewEvent, Result, StoreError,
+    Appended, CommitStored, ConvKey, DirectInit, DirectRecord, GroupCommit, GroupInit, GroupLeaf,
+    GroupMeta, GroupParts, GroupRecord, GroupStore, HistoryQuery, NewEvent, Page, Result,
+    StoreError,
 };
 
 fn epoch(n: i64) -> Result<u64> {
@@ -65,7 +72,120 @@ fn append_all(
         .collect()
 }
 
+/// Stores a new group of `conv` in `tx`, unless its id was used before.
+/// Returns whether it was stored.
+fn insert_group(
+    tx: &Transaction<'_>,
+    conv: ConvKey,
+    group: &GroupRecord,
+    leaves: &[GroupLeaf],
+) -> Result<bool> {
+    let fresh = tx.execute(
+        "INSERT OR IGNORE INTO group_ids (group_id) VALUES (?)",
+        [&group.group_id],
+    )?;
+    if fresh == 0 {
+        return Ok(false);
+    }
+    let p = &group.parts;
+    tx.execute(
+        "INSERT INTO groups (conv, group_id, epoch, seq, group_info, tree, context, \
+         interim_hash, confirmation_tag) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+        params![
+            conv.0,
+            group.group_id,
+            sql_epoch(group.meta.epoch),
+            group.group_info.as_str(),
+            p.tree,
+            p.context,
+            p.interim_hash,
+            p.confirmation_tag
+        ],
+    )?;
+    write_leaves(tx, conv, leaves)?;
+    Ok(true)
+}
+
 impl GroupStore for SqliteStore {
+    fn directs(&self) -> Result<Vec<DirectRecord>> {
+        let conn = self.conn();
+        let rows = conn
+            .prepare_cached(
+                "SELECT conv, id, uid_a, uid_b, head FROM conversations \
+                 WHERE kind = 'direct' ORDER BY conv",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(conv, id, a, b, head)| {
+                let key = ConvKey(conv);
+                Ok(DirectRecord {
+                    key,
+                    id: parse("id", &id)?,
+                    a: parse("participant", &a)?,
+                    b: parse("participant", &b)?,
+                    head: super::head(head)?,
+                    group: group_meta(&conn, key)?,
+                })
+            })
+            .collect()
+    }
+
+    fn init_direct(
+        &self,
+        a: &Uid,
+        b: &Uid,
+        group: &GroupRecord,
+        leaves: &[GroupLeaf],
+        now: Timestamp,
+    ) -> Result<DirectInit> {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        self.write(|tx| {
+            let exists = tx
+                .prepare_cached(
+                    "SELECT 1 FROM conversations WHERE kind = 'direct' AND uid_a = ? AND uid_b = ?",
+                )?
+                .query_row(params![a.as_str(), b.as_str()], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if exists {
+                return Ok(DirectInit::Exists);
+            }
+            let id = take_id(tx, "conversation", now)?;
+            tx.execute(
+                "INSERT INTO conversations (id, kind, uid_a, uid_b, head, created) \
+                 VALUES (?, 'direct', ?, ?, 0, ?)",
+                params![id.as_str(), a.as_str(), b.as_str(), ms(now)],
+            )?;
+            let key = ConvKey(tx.last_insert_rowid());
+            if !insert_group(tx, key, group, leaves)? {
+                // Nothing of the conversation is kept: the transaction
+                // rolls back.
+                return Err(StoreError::Corrupt(GROUP_ID_TAKEN.into()));
+            }
+            Ok(DirectInit::Done(DirectRecord {
+                key,
+                id,
+                a: a.clone(),
+                b: b.clone(),
+                head: None,
+                group: Some(group.meta),
+            }))
+        })
+        .or_else(|e| match e {
+            StoreError::Corrupt(m) if m == GROUP_ID_TAKEN => Ok(DirectInit::IdTaken),
+            e => Err(e),
+        })
+    }
+
     fn group(&self, conv: ConvKey) -> Result<Option<GroupRecord>> {
         let conn = self.conn();
         type Row = (
@@ -128,29 +248,9 @@ impl GroupStore for SqliteStore {
             if group_meta(tx, conv)?.is_some() {
                 return Ok(GroupInit::Exists);
             }
-            let fresh = tx.execute(
-                "INSERT OR IGNORE INTO group_ids (group_id) VALUES (?)",
-                [&group.group_id],
-            )?;
-            if fresh == 0 {
+            if !insert_group(tx, conv, group, leaves)? {
                 return Ok(GroupInit::IdTaken);
             }
-            let p = &group.parts;
-            tx.execute(
-                "INSERT INTO groups (conv, group_id, epoch, seq, group_info, tree, context, \
-                 interim_hash, confirmation_tag) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
-                params![
-                    conv.0,
-                    group.group_id,
-                    sql_epoch(group.meta.epoch),
-                    group.group_info.as_str(),
-                    p.tree,
-                    p.context,
-                    p.interim_hash,
-                    p.confirmation_tag
-                ],
-            )?;
-            write_leaves(tx, conv, leaves)?;
             if end_invites {
                 tx.execute("DELETE FROM invites WHERE conv = ?", [conv.0])?;
             }
@@ -205,6 +305,10 @@ impl GroupStore for SqliteStore {
             };
             Ok(Some(CommitStored { seqs, welcome_ids }))
         })
+    }
+
+    fn commits(&self, conv: ConvKey, query: HistoryQuery) -> Result<Page> {
+        self.history_of(conv, query, true)
     }
 
     fn has_leaf(&self, conv: ConvKey, uid: &Uid, key: &PublicKey) -> Result<bool> {

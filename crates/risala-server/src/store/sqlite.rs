@@ -112,6 +112,60 @@ impl SqliteStore {
         tx.commit()?;
         Ok(value)
     }
+
+    /// A page of events (7.2), or with `commits` of COMMIT events only
+    /// (`only=commit`, 12.11).
+    pub(super) fn history_of(&self, conv: ConvKey, q: HistoryQuery, commits: bool) -> Result<Page> {
+        let only = if commits { "AND e.verb = 'COMMIT'" } else { "" };
+        let limit = q.limit.clamp(1, i64::MAX as u64 - 1);
+        let fetch = (limit + 1) as i64;
+        let before = q.before.map_or(i64::MAX, sql_seq);
+        // Under the same lock as the query, so that a page is never read
+        // from a conversation dropped meanwhile, as an empty one.
+        let conn = self.conn();
+        conv_exists(&conn, conv)?;
+        let rows = match q.after {
+            Some(after) => {
+                let after = i64::try_from(after).unwrap_or(i64::MAX);
+                conn.prepare_cached(&format!(
+                    "SELECT {EVENT_COLUMNS} WHERE e.conv = ? AND e.seq > ? AND e.seq < ? {only} \
+                     ORDER BY e.seq ASC LIMIT ?"
+                ))?
+                .query_map(params![conv.0, after, before, fetch], event_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut rows = conn
+                    .prepare_cached(&format!(
+                        "SELECT {EVENT_COLUMNS} WHERE e.conv = ? AND e.seq < ? {only} \
+                         ORDER BY e.seq DESC LIMIT ?"
+                    ))?
+                    .query_map(params![conv.0, before, fetch], event_from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows.reverse();
+                rows
+            }
+        };
+        drop(conn);
+        let more = rows.len() as u64 > limit;
+        let mut events = rows
+            .into_iter()
+            .map(EventRow::finish)
+            .collect::<Result<Vec<_>>>()?;
+        if more {
+            match q.after {
+                // The extra row is the one after the page...
+                Some(_) => {
+                    events.pop();
+                }
+                // ...or the one before it.
+                None => {
+                    events.remove(0);
+                }
+            }
+        }
+        Ok(Page { events, more })
+    }
 }
 
 /// Creates the database file at `path` with mode 0600 if it is missing,
@@ -930,54 +984,7 @@ impl Store for SqliteStore {
     }
 
     fn history(&self, conv: ConvKey, q: HistoryQuery) -> Result<Page> {
-        let limit = q.limit.clamp(1, i64::MAX as u64 - 1);
-        let fetch = (limit + 1) as i64;
-        let before = q.before.map_or(i64::MAX, sql_seq);
-        // Under the same lock as the query, so that a page is never read
-        // from a conversation dropped meanwhile, as an empty one.
-        let conn = self.conn();
-        conv_exists(&conn, conv)?;
-        let rows = match q.after {
-            Some(after) => {
-                let after = i64::try_from(after).unwrap_or(i64::MAX);
-                conn.prepare_cached(&format!(
-                    "SELECT {EVENT_COLUMNS} WHERE e.conv = ? AND e.seq > ? AND e.seq < ? \
-                     ORDER BY e.seq ASC LIMIT ?"
-                ))?
-                .query_map(params![conv.0, after, before, fetch], event_from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-            }
-            None => {
-                let mut rows = conn
-                    .prepare_cached(&format!(
-                        "SELECT {EVENT_COLUMNS} WHERE e.conv = ? AND e.seq < ? \
-                         ORDER BY e.seq DESC LIMIT ?"
-                    ))?
-                    .query_map(params![conv.0, before, fetch], event_from_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                rows.reverse();
-                rows
-            }
-        };
-        drop(conn);
-        let more = rows.len() as u64 > limit;
-        let mut events = rows
-            .into_iter()
-            .map(EventRow::finish)
-            .collect::<Result<Vec<_>>>()?;
-        if more {
-            match q.after {
-                // The extra row is the one after the page...
-                Some(_) => {
-                    events.pop();
-                }
-                // ...or the one before it.
-                None => {
-                    events.remove(0);
-                }
-            }
-        }
-        Ok(Page { events, more })
+        self.history_of(conv, q, false)
     }
 
     fn cid_seq(&self, conv: ConvKey, from: &Uid, cid: &Cid, now: Timestamp) -> Result<Option<Seq>> {
