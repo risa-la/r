@@ -191,8 +191,8 @@ pub use types::{
     ConversationInfo, ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind,
     FailKind, KeyErrorKind, KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice,
     OutboxEntry, OutboxStatus, Presence, ReactionCount, RefusedKind, ReportInfo, ReportedMessage,
-    RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo, Setting,
-    TrustInfo, Unregistered, UserInfo,
+    Role, RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo,
+    Setting, TrustInfo, Unregistered, UserInfo,
 };
 
 use account::AccountShared;

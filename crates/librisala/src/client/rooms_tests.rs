@@ -216,13 +216,8 @@ async fn rooms_and_reports() {
     assert_eq!(general.info().unwrap().unwrap().topic, "lunch at noon");
     let info = within(general.room_info()).await.unwrap();
     assert_eq!(
-        (
-            info.id.as_str(),
-            info.members,
-            info.head,
-            info.role.as_str()
-        ),
-        ("k1", 3, 4, "owner")
+        (info.id.as_str(), info.members, info.head, info.role),
+        ("k1", 3, 4, Some(Role::Owner))
     );
     assert!(info.joined);
     assert_eq!(info.settings.len(), 2);
@@ -245,12 +240,12 @@ async fn rooms_and_reports() {
 
     // 6.3.
     assert_eq!(
-        within(general.set_role("bob@example.net", "mod"))
+        within(general.set_role("bob@example.net", Role::Moderator))
             .await
             .unwrap(),
         Some(5)
     );
-    let roles: Vec<(String, String)> = within(general.roles())
+    let roles: Vec<(String, Role)> = within(general.roles())
         .await
         .unwrap()
         .into_iter()
@@ -259,12 +254,16 @@ async fn rooms_and_reports() {
     assert_eq!(
         roles,
         [
-            ("alice@example.org".into(), "owner".into()),
-            ("bob@example.net".into(), "mod".into())
+            ("alice@example.org".into(), Role::Owner),
+            ("bob@example.net".into(), Role::Moderator)
         ]
     );
+    // Roles read and write as the wire has them.
+    assert_eq!("mod".parse::<Role>().unwrap(), Role::Moderator);
+    assert_eq!(Role::Moderator.to_string(), "mod");
+    assert!(Role::Owner > Role::Moderator && Role::Moderator.can_moderate());
     assert!(matches!(
-        general.set_role("bob@example.net", "king").await,
+        "king".parse::<Role>(),
         Err(ClientError::Invalid(_))
     ));
 

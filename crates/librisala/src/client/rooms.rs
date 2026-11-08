@@ -34,10 +34,12 @@ use risala_proto::command::Command;
 use risala_proto::names::{Id, Seq, Uid};
 use risala_proto::server::{EventBody, OkResponse, Register, ServerLine, Upload};
 use risala_proto::text::{escape, unescape};
-use risala_proto::types::{Role, RoomSetting};
+use risala_proto::types::RoomSetting;
 
 use super::account::{Account, Answer, Conversation, RequestOp};
-use super::types::{BanInfo, ClientError, ReportInfo, RoleInfo, RoomInfo, ServerInfo, Setting};
+use super::types::{
+    BanInfo, ClientError, ReportInfo, Role, RoleInfo, RoomInfo, ServerInfo, Setting,
+};
 
 #[cfg(doc)]
 use super::types::AccountEvent;
@@ -100,11 +102,7 @@ impl Conversation {
                 .to_string(),
             members: ok.members().ok().flatten().unwrap_or(0),
             head: ok.head().ok().flatten().unwrap_or(0),
-            role: ok
-                .role()
-                .ok()
-                .flatten()
-                .map_or_else(|| "none".to_owned(), |r| r.to_string()),
+            role: ok.role().ok().flatten().and_then(|r| r.0).map(Role::of),
             joined: ok.joined().ok().flatten().unwrap_or(false),
             settings,
         })
@@ -135,20 +133,19 @@ impl Conversation {
         self.set_setting("topic", topic).await
     }
 
-    /// Sets `uid`'s role in the room (ROLE, 6.3): `owner`, `mod` or
-    /// `member`. Owners only. Returns the ROLE event's seq, or `None` if
+    /// Sets `uid`'s role in the room (ROLE, 6.3). Owners only. Returns the ROLE event's seq, or `None` if
     /// they had that role already, when nothing is recorded. The room's
     /// only owner cannot change their own role (`last-owner`).
-    pub async fn set_role(&self, uid: &str, role: &str) -> Result<Option<u64>, ClientError> {
+    pub async fn set_role(&self, uid: &str, role: Role) -> Result<Option<u64>, ClientError> {
         let room = self.room()?;
         let uid = parse_uid(uid)?;
-        let role: Role = role
-            .trim()
-            .parse()
-            .map_err(|_| ClientError::Invalid(format!("role {role:?}")))?;
         let answer = self
             .account()
-            .request(Command::Role { room, uid, role })
+            .request(Command::Role {
+                room,
+                uid,
+                role: role.to_proto(),
+            })
             .await?;
         Ok(seq_if_any(&answer.ok))
     }
@@ -170,7 +167,7 @@ impl Conversation {
                 ServerLine::Event(e) => match &e.body {
                     EventBody::Role { room: r, uid, role } if *r == room => Some(RoleInfo {
                         uid: uid.to_string(),
-                        role: role.to_string(),
+                        role: Role::of(*role),
                     }),
                     _ => None,
                 },

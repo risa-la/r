@@ -10,7 +10,7 @@ mod common;
 use common::*;
 use librisala::client::{
     Account, AccountEvent, AccountEvents, ClientError, Conversation, EventKind, Notice,
-    OutboxStatus, ReportInfo,
+    OutboxStatus, ReportInfo, Role,
 };
 use risala_server::testing::TestServer;
 
@@ -96,7 +96,7 @@ async fn a_moderator_invites_kicks_and_bans() {
     within("SET", club.set_setting("public", "no"))
         .await
         .unwrap();
-    within("ROLE", club.set_role("bob@chat.test", "mod"))
+    within("ROLE", club.set_role("bob@chat.test", Role::Moderator))
         .await
         .unwrap();
     // Changing nothing records nothing: a plain OK, with no seq.
@@ -107,9 +107,12 @@ async fn a_moderator_invites_kicks_and_bans() {
         None
     );
     assert_eq!(
-        within("ROLE again", club.set_role("bob@chat.test", "mod"))
-            .await
-            .unwrap(),
+        within(
+            "ROLE again",
+            club.set_role("bob@chat.test", Role::Moderator)
+        )
+        .await
+        .unwrap(),
         None
     );
     let roles = within("ROLES", club.roles()).await.unwrap();
@@ -118,8 +121,8 @@ async fn a_moderator_invites_kicks_and_bans() {
     assert_eq!(
         roles,
         [
-            ("alice@chat.test".to_owned(), "owner".to_owned()),
-            ("bob@chat.test".to_owned(), "mod".to_owned())
+            ("alice@chat.test".to_owned(), Role::Owner),
+            ("bob@chat.test".to_owned(), Role::Moderator)
         ]
     );
     let b_club = bob.conversation("#club").unwrap();
@@ -160,7 +163,7 @@ async fn a_moderator_invites_kicks_and_bans() {
     // She may see INFO before joining (6.2).
     let info = within("INFO", c_club.room_info()).await.unwrap();
     assert!(!info.joined);
-    assert_eq!(info.role, "none");
+    assert_eq!(info.role, None);
 
     within("joining", carol.join("#club")).await.unwrap();
     within("syncing", carol.wait_synced()).await.unwrap();
@@ -179,9 +182,9 @@ async fn a_moderator_invites_kicks_and_bans() {
     assert_eq!(
         roles,
         [
-            ("alice@chat.test".to_owned(), "owner".to_owned()),
-            ("bob@chat.test".to_owned(), "mod".to_owned()),
-            ("carol@chat.test".to_owned(), "member".to_owned())
+            ("alice@chat.test".to_owned(), Role::Owner),
+            ("bob@chat.test".to_owned(), Role::Moderator),
+            ("carol@chat.test".to_owned(), Role::Member)
         ]
     );
     let c_b_club = carol_b.conversation("#club").unwrap();
@@ -309,7 +312,7 @@ async fn reports_reach_reviewers_and_resolving_reaches_the_other_device() {
     let alice_b = second_device(&server, &alice).await;
     let bob = registered_in(&server, "bob", "#club").await;
     let club = alice.conversation("#club").unwrap();
-    within("ROLE", club.set_role("bob@chat.test", "mod"))
+    within("ROLE", club.set_role("bob@chat.test", Role::Moderator))
         .await
         .unwrap();
     // The operator is not in the room; reports reach it anyway.
@@ -453,7 +456,7 @@ async fn an_operator_drops_a_room_and_every_client_removes_it() {
     let bob = registered_in(&server, "bob", "#club").await;
     let carol = registered_in(&server, "carol", "#club").await;
     let club = alice.conversation("#club").unwrap();
-    within("ROLE", club.set_role("bob@chat.test", "mod"))
+    within("ROLE", club.set_role("bob@chat.test", Role::Moderator))
         .await
         .unwrap();
     let last = say(&carol, "#club", "hello").await;

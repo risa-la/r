@@ -2,7 +2,7 @@
 //! 5.8, 6.2-6.4, 8.5).
 
 use clap::Subcommand;
-use librisala::client::{OutboxStatus, ReportInfo};
+use librisala::client::{OutboxStatus, ReportInfo, Role};
 
 use super::{Ctx, Res, explain, fail, online, pick, queued_offline, try_connect, within};
 
@@ -151,7 +151,7 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
                         info.id,
                         info.members,
                         info.head,
-                        info.role,
+                        info.role.map_or("none", Role::as_str),
                         if info.joined { "" } else { ", not joined" }
                     );
                     for s in info.settings {
@@ -210,7 +210,8 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
         } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
-            match within(conv.set_role(&uid, &role)).await? {
+            let role: Role = role.parse().or_else(explain)?;
+            match within(conv.set_role(&uid, role)).await? {
                 Some(seq) => println!("{uid} is now {role} ({seq})"),
                 None => println!("{uid} is {role} already"),
             }

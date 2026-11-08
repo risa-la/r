@@ -1301,13 +1301,75 @@ pub struct UserInfo {
     pub presence: Presence,
 }
 
+/// A role in a room (6.3), ordered by rank: `Member < Moderator < Owner`.
+/// Its text form is the wire's: `member`, `mod` or `owner`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    /// `member`: sends messages and manages their own.
+    Member,
+    /// `mod`: also deletes others' messages, sets the topic, invites,
+    /// kicks and bans.
+    Moderator,
+    /// `owner`: may do everything, including changing settings and roles.
+    Owner,
+}
+
+impl Role {
+    /// The role as the wire writes it: `member`, `mod` or `owner`.
+    pub fn as_str(self) -> &'static str {
+        self.to_proto().as_str()
+    }
+
+    /// Whether this role may moderate: delete others' messages, set the
+    /// topic, INVITE, KICK, BAN, UNBAN and BANS (6.3).
+    pub fn can_moderate(self) -> bool {
+        self >= Role::Moderator
+    }
+
+    pub(crate) fn of(role: risala_proto::types::Role) -> Role {
+        use risala_proto::types::Role as R;
+        match role {
+            R::Member => Role::Member,
+            R::Mod => Role::Moderator,
+            R::Owner => Role::Owner,
+        }
+    }
+
+    pub(crate) fn to_proto(self) -> risala_proto::types::Role {
+        use risala_proto::types::Role as R;
+        match self {
+            Role::Member => R::Member,
+            Role::Moderator => R::Mod,
+            Role::Owner => R::Owner,
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = ClientError;
+
+    /// Reads `member`, `mod` or `owner`, as the wire writes them.
+    fn from_str(s: &str) -> Result<Role, ClientError> {
+        s.trim()
+            .parse()
+            .map(Role::of)
+            .map_err(|_| ClientError::Invalid(format!("role {s:?}")))
+    }
+}
+
 /// A member of a room (8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberInfo {
     /// Their uid.
     pub uid: String,
-    /// Their role (6.3): `owner`, `mod` or `member`.
-    pub role: String,
+    /// Their role (6.3).
+    pub role: Role,
     /// Their display name, as in [`UserInfo::display_name`]; `None` if
     /// none or not known.
     pub display_name: Option<String>,
@@ -1384,9 +1446,9 @@ pub struct RoomInfo {
     pub members: u64,
     /// Its newest seq, or 0 if it has no events yet.
     pub head: u64,
-    /// The account's role in it (6.3): `owner`, `mod`, `member`, or
-    /// `none` for no role and not a member.
-    pub role: String,
+    /// The account's role in it (6.3), or `None` if it holds no role and
+    /// is not a member. An owner or moderator who has left keeps the role.
+    pub role: Option<Role>,
     /// Whether the account is a member right now.
     pub joined: bool,
     /// Its settings, from the snapshot SET lines, in the order sent.
@@ -1399,8 +1461,8 @@ pub struct RoomInfo {
 pub struct RoleInfo {
     /// Their uid.
     pub uid: String,
-    /// `owner` or `mod`.
-    pub role: String,
+    /// [`Role::Owner`] or [`Role::Moderator`].
+    pub role: Role,
 }
 
 /// A ban in a room (6.4), from [`Conversation::bans`](super::Conversation::bans).

@@ -41,7 +41,7 @@ use tokio::sync::oneshot;
 use super::account::{Account, AccountShared, Cmd, Conversation, PeopleOp, wait};
 use super::blocking;
 use super::driver::publish_changes;
-use super::types::{ClientError, Label, MemberInfo, Presence, RefusedKind, UserInfo};
+use super::types::{ClientError, Label, MemberInfo, Presence, RefusedKind, Role, UserInfo};
 use crate::store::StoreError;
 
 #[cfg(doc)]
@@ -475,7 +475,7 @@ impl Conversation {
             {
                 members.push(MemberInfo {
                     uid: uid.to_string(),
-                    role: role.as_str().to_owned(),
+                    role: Role::of(role),
                     display_name: shown_name(Some(&name)),
                     label: unlabelled(),
                     presence: Presence::of(Some(&presence)),
@@ -508,11 +508,7 @@ impl Conversation {
             .into_iter()
             .map(|m| MemberInfo {
                 uid: m.uid.to_string(),
-                role: m
-                    .role
-                    .unwrap_or(risala_proto::types::Role::Member)
-                    .as_str()
-                    .to_owned(),
+                role: m.role.map_or(Role::Member, Role::of),
                 display_name: shown_name(names.get(&m.uid).map(String::as_str)),
                 label: unlabelled(),
                 presence: Presence::of(presence.get(&m.uid)),
