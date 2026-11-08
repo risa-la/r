@@ -104,10 +104,11 @@ use its device key, or any key it uses elsewhere, as a leaf key.
   credential of the committer's leaf. A device of another identity, or
   another device, means a new leaf.
 - **The signature key changes only** in a group whose `confirm` is
-  `epochal`, once per period in which the device sends (12.10), and once
-  right after a device joins with its last-resort KeyPackage (12.5). In
-  both cases the device commits a fresh leaf of its own with a new
-  signature key, and deletes the old one. Otherwise a new signature key
+  `epochal`, once per period in which the device sends or sent the
+  period before (12.10), and once right after a device joins with its
+  last-resort KeyPackage (12.5). In both cases the device commits a
+  fresh leaf of its own with a new signature key, and deletes the old
+  one. Otherwise a new signature key
   means a new leaf.
 - Two leaves of a group never share a signature key [RFC9420].
 
@@ -234,8 +235,9 @@ first, which lists the extension types `0xF2A1`, `0xF2A2` and `0xF2A3`,
 the proposal type `self_remove` and the credential type `basic`; then
 the conversation extension. A commit may change only the fields that
 6.2 and 6.3 allow, through a GroupContextExtensions proposal, and never
-`version`, `kind`, `host` or `box`, nor the `name` of a direct
-conversation or a public room.
+`version`, `kind` or `host`, nor the `name` of a direct conversation or
+a public room. `box` changes only when a direct conversation or a
+private room moves to a new mailbox (7.8).
 
 ### 12.5. Key Packages
 
@@ -266,14 +268,15 @@ KEYPKG GET <uid>
   whether it holds a last-resort one. It needs a signed-in connection.
 - **`KEYPKG GET`** sends one `KEYPKG <uid> <keypackage>` line for each
   current device of `<uid>` (4.4) that has a KeyPackage, then `OK`. It
-  works on any kind of connection, and a device SHOULD send it on an
-  anonymous one, since it shows whom the device is about to talk to. A
-  uid the server does not know gets `ERR not-found`. An identity whose
-  keys are missing to the server (4.4, 4.6) has no current devices, so
-  it gets no KEYPKG lines. If the server
-  cannot fetch the key file (4.4) and has no cached copy still valid, it
-  replies `ERR unavailable` rather than hand out KeyPackages of devices
-  that may have been removed.
+  works on any kind of connection. Since it shows whom the device is
+  about to talk to, a device SHOULD send it on a fresh anonymous
+  connection for each identity it fetches, rather than one after another
+  on the same connection (4.1). A uid the server does not know gets
+  `ERR not-found`. An identity whose keys are missing to the server
+  (4.4, 4.6) has no current devices, so it gets no KEYPKG lines. If the
+  server cannot fetch the key file (4.4) and has no cached copy still
+  valid, it replies `ERR unavailable` rather than hand out KeyPackages of
+  devices that may have been removed.
 
 Each KeyPackage has a leaf key of its own, so that each group a device
 joins gets a different one (12.3). The server hands out each ordinary
@@ -290,8 +293,11 @@ anything (12.3).
 
 A device SHOULD keep about ten ordinary KeyPackages on the server, and
 upload more when KEYPKG COUNT reports fewer than five. Servers delete
-KeyPackages whose lifetime has ended, and SHOULD rate-limit KEYPKG GET,
-since every request uses KeyPackages up.
+KeyPackages whose lifetime has ended. Every KEYPKG GET uses KeyPackages
+up, and once a device's ordinary ones are gone, groups fall back to its
+last-resort one. So servers MUST rate-limit KEYPKG GET per network
+address and per `<uid>` asked for (`ERR rate-limited`), and SHOULD
+require proof of work for it on anonymous and guest connections (4.1).
 
 **Lifetimes.** A KeyPackage's lifetime is acceptable if the current time
 is within it, and it spans at most 12 weeks and one hour (7261200
@@ -333,10 +339,15 @@ SelfRemove and, in an external commit, ExternalInit. A client that adds
 many devices SHOULD split them over several commits of at most 256
 devices each, bearing in mind that a leaf's fourth commit in a row has
 to wait (12.7). A commit too large for a line travels as a blob (12.12).
+A commit's size, like a Welcome's, shows roughly how large the group
+is, so commits and proposals sent as PrivateMessages SHOULD be padded
+with MLS's padding, so that the length of their PrivateMessageContent
+is a Padmé length (12.11).
 
-Each commit's RisalaAAD carries the hash of the next epoch's send token
-(7.2). Devices check it once they have applied the commit, and treat a
-commit whose hash is wrong as invalid.
+Each commit's RisalaAAD carries a hash of the next epoch's send token
+(7.2), which the server adds to that epoch's set. Devices do not check
+it: a wrong hash does not make a commit invalid, since members add the
+right one with TOKEN (7.2).
 
 **Public rooms.** The server holds the public state of a public room's
 group: its ratchet tree and its GroupInfo, as of the newest epoch. It
@@ -380,17 +391,18 @@ not hold the tree:
 - It joins by external proposal (6.1), and fetches its Welcome with
   `WELCOME GET <ref> light=yes`, which returns an AnnotatedWelcome that
   the server builds from the tree it holds.
-- It fetches with `FETCH <box> after=<seq> leaf=<n>`, where `<n>` is its
-  leaf index. The server then returns each commit as an AnnotatedCommit
-  for that leaf.
+- It fetches with `FETCH <box> after=<position> leaf=<n>`, where `<n>`
+  is its leaf index. The server then returns each commit as an
+  AnnotatedCommit for that leaf.
 - It checks the membership proofs in these, as [MLS-PARTIAL] requires,
   and gets members and roles from them and from MEMBERS (8.3).
 - It cannot commit. It replaces its leaf at least weekly, by joining
   again with a new leaf and posting a SelfRemove of the old one.
 
 A light client tells the server its leaf index, which the server can
-tie to its identity in a public room. It SHOULD use a separate anonymous
-connection for fetching with `leaf` and for posting (Section 14).
+tie to its identity in a public room. So it MUST fetch with `leaf` on an
+anonymous connection that it uses for nothing else, and post on others
+(4.1).
 
 ### 12.7. Membership
 
@@ -471,7 +483,10 @@ and the device ignores it (7.2):
 - **Extensions.** A GroupContextExtensions proposal changes only the
   fields of the conversation extension that the committer may change
   (6.2, 6.3), and the other extension is unchanged. A commit that adds a
-  uid to `bans` also takes it out of `owners` and `mods` (6.4).
+  uid to `bans` also takes it out of `owners` and `mods` (6.4). In a
+  direct conversation or a private room, any member may instead change
+  `box` alone, to move the mailbox (7.8), in a commit with no other
+  proposal.
 - **Leaves.** The commit's path keeps the committer's credential, and
   changes its signature key only as 12.3 allows. The committer's new
   `updated` and `streak` are as 12.3 requires.
@@ -486,8 +501,6 @@ and the device ignores it (7.2):
 - **External commits** appear only in public rooms, and add only the
   joiner.
 - **Size.** The group stays within the limits of 6.1.
-- **Next token.** The RisalaAAD's `next_token_hash` matches the epoch
-  the commit creates (12.6).
 
 A device that sees a commit by a leaf of its own identity that removes
 another leaf of its identity, whose device is still current, without
@@ -625,11 +638,17 @@ WELCOME GET <ref> [light=yes]
 - **`WELCOME PUT`** hands the server a Welcome for the KeyPackage whose
   KeyPackageRef [RFC9420] is `<ref>`, 48 bytes in base64 with padding,
   and replies `OK`. It works on any kind of connection, and the
-  committer SHOULD send it on an anonymous one. The server accepts it
-  only for a KeyPackage it handed out with KEYPKG GET, or one in an
-  external Add proposal in a public room (`ERR not-found`). A Welcome
-  that adds several devices is sent once for each of their refs, or
-  once as a blob that each PUT names.
+  committer SHOULD send each one on a fresh anonymous connection (4.1).
+  The server accepts it only for a KeyPackage it handed out with KEYPKG
+  GET, or one in an external Add proposal in a public room
+  (`ERR not-found`), and only once for each: once for each ref it
+  handed out, and for a last-resort KeyPackage, once for each KEYPKG GET
+  that handed it out. A server MUST limit how many Welcomes are pending
+  for each device (`ERR rate-limited`).
+- `<welcome>` is a SealedWelcome (below) for a KeyPackage handed out by
+  KEYPKG GET, and the MLSMessage that holds the Welcome for one in an
+  external Add proposal. Either is in base64 with padding, or a
+  blob-ref (12.12) if it is too large for a line.
 - For a KeyPackage uploaded with KEYPKG ADD, the server sends
   `WELCOME <id> <welcome>` to the device's signed-in connections at
   once, and pushes to its account subscriptions (9.2). **`WELCOME
@@ -645,9 +664,44 @@ WELCOME GET <ref> [light=yes]
   device or guest that joined a public room anonymously can fetch it.
   With `light=yes`, `<welcome>` is an AnnotatedWelcome (12.6).
 
-A committer SHOULD wait a random time of up to a minute after its
-commit's `OK` before it sends the Welcomes, so that the server cannot
-easily tie the new device to the commit by timing. In a direct
+**One Welcome per device.** An MLS Welcome lists, in the clear, the
+KeyPackageRef of every device it adds, and the part that every new
+member decrypts is the same for all of them. Sent as it is, it would
+tell the server exactly which devices were added together, and so who
+shares a new direct conversation or private room. So for each device
+added from a KeyPackage that KEYPKG GET handed out, the committer:
+
+1. Makes a Welcome of its own, whose `secrets` holds only that device's
+   entry.
+2. Seals it to the device, so that no two devices' copies share any
+   bytes: HPKE SealBase [RFC9180] with the cipher suite's HPKE (12.2),
+   to the KeyPackage's `init_key`, with info `risala/1 welcome` and the
+   KeyPackageRef as associated data. The plain text is the MLSMessage
+   that holds the Welcome, followed by zero bytes up to the Padmé length
+   (12.11) of the MLSMessage's length.
+
+```
+struct {
+    uint8 version;               // 1
+    opaque kem_output<V>;
+    opaque ciphertext<V>;
+} SealedWelcome;
+```
+
+The device opens it with its KeyPackage's init private key, checks that
+the bytes after the MLSMessage are all zero, and hands the Welcome to
+MLS. A sealed Welcome too large for a line is a blob of its own. In a
+large private room each new device then has a copy of the tree to
+itself, which costs the committer one upload of the tree per device.
+
+Welcomes for external Add proposals in a public room, whose membership
+the server knows anyway, are not sealed, so that the server can build
+an AnnotatedWelcome from them (12.6).
+
+A committer sends each sealed Welcome after a random wait of its own, of
+up to 10 minutes after its commit's `OK`, chosen independently for each
+Welcome, so that the server cannot easily tell by timing which devices
+were added together, or tie them to the commit. In a direct
 conversation or a private room, the Welcome's GroupInfo MUST carry the
 `ratchet_tree` extension, since the server does not hold the tree.
 
@@ -670,7 +724,7 @@ it for members:
 ```
 struct {
     uint8 version;               // 1
-    opaque pseudonym[16];        // the leaf's pseudonym (7.3)
+    opaque pseudonym<V>;         // 16 bytes in a PrivateMessage, empty in a PublicMessage (7.3)
     opaque frank<V>;             // 48 bytes in an application message, otherwise empty
     opaque next_token_hash<V>;   // 48 bytes in a commit, otherwise empty
 } RisalaAAD;
@@ -713,8 +767,8 @@ key used only for this message, which every device deletes once it has
 decrypted it. To receive a message, a device decrypts it with MLS, which
 also checks its signature, and then:
 
-1. Checks that the RisalaAAD's pseudonym is the one it first saw from
-   that leaf (7.3).
+1. Checks that the RisalaAAD's pseudonym is the one it pinned for that
+   leaf, or pins it (7.3).
 2. Checks that HMAC-SHA-384(`frank_key`, `content`) equals `frank`,
    comparing in constant time. ChaCha20-Poly1305 is not key-committing,
    so this check is what makes sure that no message decrypts to
@@ -766,7 +820,7 @@ the table does not allow them.
 | `TYPING` | any conversation, live | 8.1 |
 | `[@<tags>] REPORT [<reason...>]` | a direct conversation, to a room's moderator | 5.8 |
 | `CHALLENGE <leaf> <ciphertext>`, `ANSWER <leaf> <mac>` | groups whose `confirm` is `pairwise` | 12.10 |
-| `ATTEST <period> <period-key> <certificate> <attestation>`, `REVEAL <period> <seed>` | groups whose `confirm` is `epochal` | 12.10 |
+| `ATTEST <period> <period-key> <certificate> <attestation> <pseudonym>`, `REVEAL <period> <seed>` | groups whose `confirm` is `epochal` | 12.10 |
 | `READ <box> <seq>` | the conversation with yourself | 7.7 |
 | `BLOCK <target>`, `UNBLOCK <target>` | the conversation with yourself | 5.7 |
 | `RECORD <hash>`, `ALERT <hash>`, `RECORDS [<hashes>]` | the conversation with yourself | 4.5 |
@@ -911,12 +965,22 @@ deniable once the key is out.
 - **A new leaf key each period.** Before its first message of a period
   in an epochal group, the device commits a fresh leaf with a new
   signature key (12.3), and deletes the old one. So no leaf key is used
-  in more than one period.
+  in more than one period. It also picks a new pseudonym (7.3).
+- **When to rotate.** In a public room, the server sees who makes each
+  commit (12.6). A commit made just before the first post under a new
+  pseudonym would tie the two. So a device that sent in the group in the
+  period before commits its new leaf at a random time in the first 12
+  hours of the period, whether or not it has anything to send yet, and
+  not just before its first message. A device that has to send before
+  then, or that did not send in the period before, commits first, and
+  the server may then link the commit to its first post by timing
+  (Section 14).
 - **Attesting.** In its first message after that commit, the device
-  sends `ATTEST <period> <period-key> <certificate> <attestation>`.
-  `<period>` is in decimal, and the rest are the period key, the
-  certificate's signature and RisalaSign(period key, "attest",
-  AttestContent), each in base64 with padding.
+  sends `ATTEST <period> <period-key> <certificate> <attestation>
+  <pseudonym>`. `<period>` is in decimal, and the rest are the period
+  key, the certificate's signature, RisalaSign(period key, "attest",
+  AttestContent) and the leaf's pseudonym for the period, each in base64
+  with padding. The pseudonym is the one in that message's RisalaAAD.
 - **Revealing.** Once the period and a grace hour after it are over, the
   device sends `REVEAL <period> <seed>`, the period key's 32-byte seed
   in base64 with padding, in each group where it attested in that
@@ -1035,9 +1099,14 @@ BLOB <hash> <size> [box=<box> token=<token>]
 
 - `<hash>` is the blob-ref, and `<size>` the blob's size in bytes. The
   blob holds the raw bytes of the object, without base64.
-- On an anonymous connection, `box` and `token` are required, and are
-  checked as for POST (5.2), so that only members of some group can
-  store blobs. On a signed-in connection they are not needed.
+- On an anonymous or guest connection, `box` and `token` are required,
+  and are checked as for POST (5.2), so that only members of some group
+  can store blobs. The blob counts against that mailbox's quota and the
+  network address's limits (7.5). On a signed-in connection they are not
+  needed, and the blob counts against the identity's limits. A device
+  stores there only blobs that belong to the account, such as backups
+  and history transfers (12.13), and never one that a post or a Welcome
+  names (4.1).
 - The client sends the blob in an HTTP PUT request to the `put` URL,
   which works for one upload within 10 minutes. The server MUST reject a
   body whose length differs from `<size>`, or whose SHA-384 hash differs
@@ -1050,10 +1119,11 @@ BLOB <hash> <size> [box=<box> token=<token>]
 
 Anyone fetches a blob with an HTTP GET request to the `blobs` URL prefix
 of INFO (8.5), followed by the 96 hex digits of its hash. The fetcher
-MUST check the hash of what it gets before it uses it. Blobs expire with
-retention (7.5), except that the server keeps the tree of a public
-room's current epoch for as long as it is current, and the blobs of an
-identity's current backup for as long as it is current (12.13).
+MUST check the hash of what it gets before it uses it. Blobs expire
+with retention (7.5), counted from the last BLOB command that named
+them, except that the server keeps the tree of a public room's current
+epoch for as long as it is current, and the blobs of an identity's
+current backup for as long as it is current (12.13).
 
 Blobs are public to anyone who knows their hash. Everything a device
 stores in one is either public already, such as a public room's tree,

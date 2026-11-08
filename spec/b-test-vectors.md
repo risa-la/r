@@ -156,6 +156,8 @@ made by an implementation of this document, which does not exist yet:
   from a PrivateMessage and from a PublicMessage (5.2)
 - an RFC 8291 push body and the `NOTIFY` line inside it (9.3)
 - the period number of a given time (12.10)
+- a SealedWelcome, from a fixed KeyPackage, Welcome and HPKE
+  randomness (12.8)
 - a RisalaIdentity credential, a DeviceBinding and a RisalaProfile
   (12.3)
 - a RisalaConversation extension for each kind of conversation (12.4)

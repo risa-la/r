@@ -3,9 +3,8 @@
 Commands a client can send, and the kinds of connection (4.1) that may
 send them. "New" is a connection that has not yet become anonymous, a
 guest or signed in. A connection that sends a command its kind may not
-use gets `ERR not-authenticated` if it is new, anonymous or signed in
-and the command needs another kind, and `ERR forbidden` if it is a
-guest.
+use gets `ERR not-authenticated` if it is new, and
+`ERR wrong-connection` otherwise.
 
 | Command | Section | New | Anonymous | Guest | Signed in |
 |---|---|---|---|---|---|
@@ -17,7 +16,7 @@ guest.
 | `KEYS PUT <after> <records>` | 4.7 | ✓ | ✓ | | ✓ |
 | `PAIR PUT <id> <data>` / `PAIR GET <id>` | 4.8 | ✓ | ✓ | | ✓ |
 | `UNREGISTER <uid>` | 4.9 | | | | ✓ |
-| `CREATE <box> <group-id> <token-hash>` | 5.2 | | ✓ | | |
+| `CREATE <box> <group-id> <token-hash> [epoch=]` | 5.2, 7.8 | | ✓ | ✓ | |
 | `CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>` | 5.2 | | | | ✓ |
 | `POST <box> <token> <message> [live=] [groupinfo=]` | 5.2 | | ✓ | ✓ | |
 | `UPLOAD <box> <token> <size>` | 5.6 | | ✓ | | |
@@ -27,12 +26,13 @@ guest.
 | `MUTE <box> <pseudonym> [hours=]` / `UNMUTE <box> <pseudonym>` | 6.4 | | | | ✓ |
 | `FOLLOW <box> [quiet=]` / `UNFOLLOW <box>` | 7.1 | | ✓ | ✓ | |
 | `FETCH <box> after= [limit=] [leaf=]` | 7.1 | | ✓ | ✓ | |
+| `TOKEN <box> <epoch> <token> <hash>` | 7.2 | | ✓ | ✓ | |
 | `PRESENCE ON` / `PRESENCE OFF` | 8.3 | | | | ✓ |
 | `WATCH [<uids>]` / `WHOIS <uid>` / `MEMBERS <room>` | 8.3 | | ✓ | ✓ | ✓ |
 | `PUSH ADD <url> <tag> <key> <auth> box=` / `PUSH DEL <url> box=` | 9.1 | | ✓ | | |
 | `PUSH ADD <url> <tag> <key> <auth>` / `PUSH DEL <url>` / `PUSH LIST` | 9.1 | | | | ✓ |
 | `KEYPKG ADD <keypackage>` / `KEYPKG COUNT` | 12.5 | | | | ✓ |
-| `KEYPKG GET <uid>` | 12.5 | | ✓ | | ✓ |
+| `KEYPKG GET <uid>` | 12.5 | | ✓ | ✓ | ✓ |
 | `WELCOME PUT <ref> <welcome>` / `WELCOME GET <ref> [light=]` | 12.8 | | ✓ | ✓ | ✓ |
 | `WELCOME LIST` / `WELCOME DEL <id>` | 12.8 | | | | ✓ |
 | `BLOB <hash> <size> [box=] [token=]` | 12.12 | | ✓ | ✓ | ✓ |
