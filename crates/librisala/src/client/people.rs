@@ -317,6 +317,7 @@ impl Account {
             .ok_or_else(|| ClientError::Server {
                 code: "not-found".into(),
                 message: format!("no USER line for {uid}"),
+                retry_after_secs: None,
             })
     }
 

@@ -466,6 +466,21 @@ fn errors_carry_kinds_to_localize() {
         DisconnectKind::of(&CloseReason::Server { bye: None }),
         DisconnectKind::Server
     );
+    // An ERR keeps its retry tag (3.2).
+    let err = "@retry=30 ERR rate-limited slow down"
+        .parse::<risala_proto::server::ServerMessage>()
+        .unwrap();
+    let ServerLine::Err(err) = err.line else {
+        panic!("{err:?}")
+    };
+    assert_eq!(
+        ClientError::server(&err),
+        ClientError::Server {
+            code: "rate-limited".into(),
+            message: "slow down".into(),
+            retry_after_secs: Some(30),
+        }
+    );
 
     // Outbox failures: "room changed" and "dropped" differ by kind.
     let store = Store::open_in_memory().unwrap();

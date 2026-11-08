@@ -94,6 +94,9 @@ pub enum ClientError {
         code: String,
         /// The message for people, unescaped; empty if none.
         message: String,
+        /// The `retry` tag, in seconds, if the server sent one (3.2): wait
+        /// this long before trying again, as after `rate-limited`.
+        retry_after_secs: Option<u64>,
     },
     /// The server's answer broke the protocol, for example an `OK`
     /// without a value the command promises, such as REPORT's `id` (3.2).
@@ -340,6 +343,7 @@ impl ClientError {
         ClientError::Server {
             code: err.code.to_string(),
             message: unescape(&err.message).into_owned(),
+            retry_after_secs: err.retry,
         }
     }
 

@@ -395,6 +395,10 @@ fn explain<T>(e: ClientError) -> Res<T> {
             }
         }
         ClientError::Unconfirmed { message, .. } => fail(format!("{message}.")),
+        ClientError::Server {
+            retry_after_secs: Some(secs),
+            ..
+        } => fail_with(exit_code(&e), format!("{e}; try again in {secs} seconds")),
         _ => fail_with(exit_code(&e), e),
     }
 }
