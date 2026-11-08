@@ -219,6 +219,11 @@
                 rust-analyzer
                 cargo-nextest
                 cargo-fuzz
+                # Coverage for the verification page (verification/). It
+                # needs a rustup toolchain too: see verification/collect.sh.
+                # cargo-llvm-cov's own tests fail in the Nix sandbox (they
+                # run cargo on test projects), so skip them.
+                (cargo-llvm-cov.overrideAttrs { doCheck = false; })
 
                 # Native deps and tools
                 pkg-config
