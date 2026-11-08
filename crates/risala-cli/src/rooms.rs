@@ -98,8 +98,12 @@ pub(crate) fn show_report(r: &ReportInfo) -> String {
     if let Some(by) = &r.reporter {
         s.push_str(&format!(" by {by}"));
     }
-    if r.encrypted {
-        s.push_str(" (encrypted)");
+    // 5.8: the revealed content counts only if it matches the commitment.
+    match (r.encrypted, r.franking) {
+        (true, Some(true)) => s.push_str(" (encrypted, content verified)"),
+        (true, Some(false)) => s.push_str(" (encrypted, content does NOT match the message)"),
+        (true, None) => s.push_str(" (encrypted)"),
+        (false, _) => {}
     }
     if !r.reason.is_empty() {
         s.push_str(&format!(": {}", r.reason));
@@ -228,8 +232,15 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
         RoomCommand::Invite { server, room, uid } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
+            let encrypted = conv.info().or_else(explain)?.is_some_and(|i| i.encrypted);
             match within(conv.invite(&uid)).await? {
                 Some(seq) => println!("invited {uid} ({seq})"),
+                // 12.6: in an encrypted room, inviting is a commit that
+                // adds the invitee's devices, and the INVITE event follows.
+                None if encrypted => {
+                    within(account.wait_synced()).await?;
+                    println!("invited {uid}, and added their devices to the room's group");
+                }
                 None => println!("{uid} is a member already"),
             }
             Ok(())
