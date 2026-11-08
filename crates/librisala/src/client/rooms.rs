@@ -180,9 +180,20 @@ impl Conversation {
     /// join a private room. Moderators and owners. Returns the INVITE
     /// event's seq, or `None` if they are a member already, when nothing
     /// is recorded.
+    ///
+    /// In an encrypted room, this adds the invitee's devices to the room's
+    /// group with a commit instead, and the server records the INVITE
+    /// event that follows it (12.6). It returns `None` once the commit is
+    /// on its way; the INVITE event arrives in the timeline.
     pub async fn invite(&self, uid: &str) -> Result<Option<u64>, ClientError> {
         let room = self.room()?;
         let uid = parse_uid(uid)?;
+        if self.info()?.is_some_and(|i| i.encrypted) {
+            self.account()
+                .e2ee(super::account::E2eeOp::Invite { room, uid })
+                .await?;
+            return Ok(None);
+        }
         let answer = self
             .account()
             .request(Command::Invite { room, uid })
@@ -261,12 +272,15 @@ impl Conversation {
     /// the same id. Your own messages get `forbidden`.
     pub async fn report(&self, seq: u64, reason: &str) -> Result<String, ClientError> {
         let seq = Seq::new(seq).ok_or_else(|| ClientError::Invalid("seq 0".into()))?;
+        // 5.8: an encrypted message is reported with REPORTENC, which
+        // reveals its content and franking key to the reviewers.
+        let franking = self.franking(seq)?;
         let answer = self
             .account()
             .request(Command::Report {
                 conv: self.conv().clone(),
                 seq,
-                franking: None,
+                franking,
                 reason: escape(reason.trim()),
             })
             .await?;

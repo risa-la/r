@@ -1124,6 +1124,12 @@ async fn loading_a_key_does_not_block_the_runtime() {
         released: Default::default(),
     });
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         keys: Some(keys.clone()),
         ..ClientOptions::default()
     })
@@ -1174,6 +1180,12 @@ async fn a_notice_comes_after_the_changes_before_it() {
     })
     .await;
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         session: crate::conn::SessionOptions {
             ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
             connect_to: Some(server.addr),
@@ -1240,6 +1252,12 @@ async fn admin_keys_does_not_block_the_runtime() {
         released: Default::default(),
     });
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         session: crate::conn::SessionOptions {
             ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
             connect_to: Some(server.addr),
@@ -1306,6 +1324,12 @@ async fn a_room_missing_from_a_resumed_session_is_not_joined_again() {
     })
     .await;
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         session: crate::conn::SessionOptions {
             ca_verifier: Some(crate::conn::roots_ca_verifier([ca.cert.clone()]).unwrap()),
             connect_to: Some(server.addr),

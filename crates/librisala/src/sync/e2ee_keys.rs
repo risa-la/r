@@ -55,7 +55,6 @@ impl OwnDeviceState {
     }
 
     /// Reads `own_devices.state`.
-    #[expect(dead_code, reason = "the client API reads it next")]
     pub(crate) fn parse(s: &str) -> Option<OwnDeviceState> {
         Some(match s {
             "new" => OwnDeviceState::New,
@@ -138,8 +137,9 @@ impl SyncEngine {
         Ok(self.finish())
     }
 
-    /// [`set_recovery_key`](Self::set_recovery_key) without sending.
-    pub(super) fn keep_recovery_key(&mut self, key: Option<RecoveryKey>) {
+    /// [`set_recovery_key`](Self::set_recovery_key) without sending
+    /// anything yet, before [`start`](Self::start).
+    pub fn keep_recovery_key(&mut self, key: Option<RecoveryKey>) {
         if let Some(e) = self.e2ee.as_mut() {
             e.recovery = key;
             e.backups_failed.clear();

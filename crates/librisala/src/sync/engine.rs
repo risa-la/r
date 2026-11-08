@@ -203,7 +203,7 @@ pub struct SyncEngine {
     /// A guest's session was resumed on this connection (4.2), so its
     /// cids carry over (7.6).
     resumed: bool,
-    config: SyncConfig,
+    pub(super) config: SyncConfig,
     next_req: u64,
     pending: HashMap<ReqId, Pending>,
     convs: HashMap<Conv, Live>,

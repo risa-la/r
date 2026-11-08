@@ -17,9 +17,10 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::account::{
-    AccountShared, Answer, Batch, Cmd, PeopleOp, RequestOp, Synced, check_draft, finished,
+    AccountShared, Answer, Batch, Cmd, E2eeOp, PeopleOp, RequestOp, Synced, check_draft, finished,
 };
 use super::blocking;
+use super::e2ee::{HttpsKeyFiles, KeyFileEntry, KeyFiles, load_recovery_key, save_recovery_key};
 use super::people::user_info;
 use super::types::{
     AccountEvent, ClientError, ConnectionErrorKind, ConnectionState, DisconnectKind, KeyErrorKind,
@@ -125,7 +126,7 @@ async fn drive(
     let sign_in = blocking(&shared.rt, move || sign_in_for(&s, token)).await;
     // The fingerprint of an identity's device key, and whether the server
     // accepted it before (4.5).
-    let (sign_in, key) = match sign_in {
+    let (sign_in, key, device) = match sign_in {
         Ok(s) => s,
         Err(error) => {
             shared.set_state_for(generation, ConnectionState::Failed { error });
@@ -180,8 +181,15 @@ async fn drive(
                         if let Some(token) = &guest_token {
                             save_guest_session(shared, token.get()).await;
                         }
-                        let flow =
-                            online(shared, generation, uid, resumed, session.clone(), incoming, cmds);
+                        let flow = online(
+                            shared,
+                            generation,
+                            (uid, device.clone()),
+                            resumed,
+                            session.clone(),
+                            incoming,
+                            cmds,
+                        );
                         match flow.await {
                             Flow::Disconnected => session.close(),
                             Flow::Reconnect => supervisor.reconnect_now(),
@@ -341,10 +349,21 @@ async fn was_accepted(shared: &AccountShared, key: &str) -> bool {
 /// How the account signs in: a guest by name, resuming the session in
 /// `guest_token`, or an identity with its key. For an identity, also the
 /// fingerprint of its key.
+/// How to sign in, the device key's fingerprint, and for an identity the
+/// device key and recovery key, for encryption (12).
+type SignInFor = (Arc<dyn SignIn>, Option<String>, Option<DeviceKeys>);
+
+/// An identity's keys on this device (12.2, 12.10).
+#[derive(Clone)]
+pub(crate) struct DeviceKeys {
+    pub key: Arc<risala_proto::auth::SecretKey>,
+    pub recovery: Option<risala_mls::RecoveryKey>,
+}
+
 fn sign_in_for(
     shared: &AccountShared,
     guest_token: Option<Arc<GuestToken>>,
-) -> Result<(Arc<dyn SignIn>, Option<String>), ClientError> {
+) -> Result<SignInFor, ClientError> {
     let uid = &shared.uid;
     if uid.is_guest() {
         let name = uid
@@ -352,7 +371,7 @@ fn sign_in_for(
             .parse()
             .map_err(|_| ClientError::Invalid(format!("guest name {:?}", uid.name())))?;
         let sign_in = GuestSignIn::resuming(name, guest_token.unwrap_or_default());
-        return Ok((Arc::new(sign_in), None));
+        return Ok((Arc::new(sign_in), None, None));
     }
     let identity = uid
         .to_identity()
@@ -388,9 +407,15 @@ fn sign_in_for(
             message: format!("no key for {identity}"),
         })?;
     let fingerprint = key.public_key().fingerprint().to_string();
+    let recovery = load_recovery_key(&**keys, &identity)?;
+    let device = DeviceKeys {
+        key: Arc::new(key.clone()),
+        recovery,
+    };
     Ok((
         Arc::new(IdentitySignIn::new(identity, key)),
         Some(fingerprint),
+        Some(device),
     ))
 }
 
@@ -415,6 +440,10 @@ enum Input {
     People(PeopleOp),
     Request(RequestOp),
     Resume,
+    /// An encryption operation (12).
+    E2ee(E2eeOp),
+    /// A key file the engine asked for (12.12).
+    KeyFile(Uid, Option<Vec<KeyFileEntry>>),
 }
 
 /// What to do with an input's result, on the async side.
@@ -472,12 +501,17 @@ struct Online<'a> {
     /// When to call [`SyncEngine::resume_outbox`]: the earliest
     /// [`Output::retry_after`](sync::Output::retry_after) asked for.
     resume_at: Option<Instant>,
+    /// Where key files come from (12.12).
+    key_files: Arc<dyn KeyFiles>,
+    /// Fetched key files go back to the engine through here.
+    key_files_tx: mpsc::UnboundedSender<(Uid, Option<Vec<KeyFileEntry>>)>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn online(
     shared: &Arc<AccountShared>,
     generation: u64,
-    uid: Uid,
+    (uid, device): (Uid, Option<DeviceKeys>),
     resumed: bool,
     session: Arc<Session>,
     mut incoming: mpsc::Receiver<Incoming>,
@@ -503,7 +537,22 @@ async fn online(
         shared.options.sync.clone(),
     );
     engine.set_resumed(resumed);
+    // End-to-end encryption, for an identity (12).
+    if let Some(device) = &device {
+        match engine.set_device_key(device.key.clone(), false) {
+            Ok(()) => engine.keep_recovery_key(device.recovery.clone()),
+            Err(e) => warn!(error = %e, "no encryption on this connection"),
+        }
+    }
+    let (key_files_tx, key_files_rx) = mpsc::unbounded_channel();
+    let key_files: Arc<dyn KeyFiles> = shared
+        .options
+        .key_files
+        .clone()
+        .unwrap_or_else(|| Arc::new(HttpsKeyFiles::new()));
     let mut on = Online {
+        key_files,
+        key_files_tx,
         shared,
         generation,
         resumed,
@@ -517,7 +566,8 @@ async fn online(
         reports: Vec::new(),
         resume_at: None,
     };
-    let flow = on.run(&mut incoming, cmds).await;
+    let mut key_files_rx = key_files_rx;
+    let flow = on.run(&mut incoming, cmds, &mut key_files_rx).await;
     // Reports whose copies never came are still reports.
     let events: Vec<AccountEvent> = on.reports.drain(..).map(uncopied).collect();
     shared.publish(Batch {
@@ -539,6 +589,7 @@ impl Online<'_> {
         &mut self,
         incoming: &mut mpsc::Receiver<Incoming>,
         cmds: &mut mpsc::UnboundedReceiver<Cmd>,
+        key_files: &mut mpsc::UnboundedReceiver<(Uid, Option<Vec<KeyFileEntry>>)>,
     ) -> Flow {
         // A guest whose session is new is in no room: it joins its rooms
         // again first, so that SYNC lists them. A resumed session is still
@@ -610,6 +661,9 @@ impl Online<'_> {
                 () = resume => {
                     self.resume_at = None;
                     vec![(Input::Resume, Ctx::None)]
+                }
+                Some((uid, keys)) = key_files.recv() => {
+                    vec![(Input::KeyFile(uid, keys), Ctx::None)]
                 }
                 () = typing_due => {
                     expire_typing(self.shared);
@@ -740,6 +794,7 @@ impl Online<'_> {
             Cmd::People { op, reply } => (Input::People(op), Ctx::Lines(reply)),
             Cmd::Request { op, reply } => (Input::Request(op), Ctx::Answer(reply)),
             Cmd::ResumeOutbox => (Input::Resume, Ctx::None),
+            Cmd::E2ee { op, reply } => (Input::E2ee(op), Ctx::Done(reply)),
             Cmd::Reconnect | Cmd::Stop { .. } => return None,
         })
     }
@@ -812,6 +867,38 @@ impl Online<'_> {
                     };
                     self.synthetic.push((Input::Reply(o.req, reply), Ctx::None));
                 }
+            }
+        }
+        // Key files the engine needs (12.12), fetched off the engine.
+        for uid in &out.key_files {
+            let Some(identity) = uid.to_identity() else {
+                continue;
+            };
+            let (files, tx, uid) = (
+                self.key_files.clone(),
+                self.key_files_tx.clone(),
+                uid.clone(),
+            );
+            self.shared.rt.spawn(async move {
+                let keys = files.fetch(identity).await;
+                let _ = tx.send((uid, keys));
+            });
+        }
+        // A recovery key from another device (12.10), kept as the device
+        // key is.
+        if let Some(recovery) = &out.recovery
+            && let (Some(keys), Some(identity)) = (
+                self.shared.options.keys.clone(),
+                self.shared.uid.to_identity(),
+            )
+        {
+            let recovery = recovery.clone();
+            let saved = blocking(&self.shared.rt, move || {
+                save_recovery_key(&*keys, &identity, &recovery)
+            })
+            .await;
+            if let Err(e) = saved {
+                warn!(error = %e, "keeping the recovery key");
             }
         }
         if let Some(wait) = out.retry_after {
@@ -1137,6 +1224,18 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
         Input::Request(RequestOp::Info(room)) => engine.info(&room),
         Input::Request(RequestOp::Plain(command)) => engine.request(command),
         Input::Resume => engine.resume_outbox()?,
+        Input::KeyFile(uid, keys) => engine.key_file(&uid, keys)?,
+        Input::E2ee(op) => match op {
+            E2eeOp::EncryptRoom {
+                room,
+                history,
+                send,
+            } => engine.encrypt_room(&room, history, send)?,
+            E2eeOp::Invite { room, uid } => engine.invite(&room, &uid)?,
+            E2eeOp::ConfirmDevice { key, confirmed } => engine.confirm_device(&key, confirmed)?,
+            E2eeOp::SetRecovery(key) => engine.set_recovery_key(key)?,
+            E2eeOp::ShareRecovery(key) => engine.share_recovery_key(&key)?,
+        },
     };
     Ok((out, None))
 }
@@ -1320,6 +1419,9 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
             let _ = reply.send(Err(ClientError::NotConnected));
         }
         Cmd::Request { reply, .. } => {
+            let _ = reply.send(Err(ClientError::NotConnected));
+        }
+        Cmd::E2ee { reply, .. } => {
             let _ = reply.send(Err(ClientError::NotConnected));
         }
         // Nobody sees an offline user type.

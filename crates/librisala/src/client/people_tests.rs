@@ -38,6 +38,12 @@ where
     let server = ScriptServer::start(cert, conns, script).await;
     let unrelated = TestCa::new();
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         session: SessionOptions {
             ca_verifier: Some(roots_ca_verifier([unrelated.cert.clone()]).unwrap()),
             connect_to: Some(server.addr),

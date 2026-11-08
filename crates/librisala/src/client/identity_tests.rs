@@ -42,6 +42,12 @@ where
     let keys = Arc::new(MemoryKeyStore::default());
     let unrelated = TestCa::new();
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         session: SessionOptions {
             ca_verifier: Some(roots_ca_verifier([unrelated.cert.clone()]).unwrap()),
             connect_to: Some(server.addr),
@@ -243,6 +249,12 @@ async fn device_keys() {
 
     let keys = Arc::new(MemoryKeyStore::default());
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         keys: Some(keys.clone()),
         ..ClientOptions::default()
     })
@@ -311,6 +323,12 @@ async fn key_store_failures_keep_their_kind() {
     let dir = tempfile::tempdir().unwrap();
     let files = crate::conn::keys::FileKeyStore::new(dir.path());
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         keys: Some(Arc::new(files.clone())),
         ..ClientOptions::default()
     })
@@ -346,6 +364,12 @@ async fn key_store_failures_keep_their_kind() {
 async fn no_sign_in_as_an_identity_over_an_ip_address() {
     let keys = Arc::new(MemoryKeyStore::default());
     let client = Client::open_in_memory(ClientOptions {
+        // Scripted servers here expect exact command sequences; encryption
+        // (12) is tested on its own.
+        sync: crate::sync::SyncConfig {
+            encryption: false,
+            ..crate::sync::SyncConfig::default()
+        },
         keys: Some(keys.clone()),
         ..ClientOptions::default()
     })
@@ -548,6 +572,12 @@ async fn kill_while_registering(s: &Setup, read: &tokio::sync::Notify) {
     let killed = Client::with_store(
         s.client.store().clone(),
         ClientOptions {
+            // Scripted servers here expect exact command sequences; encryption
+            // (12) is tested on its own.
+            sync: crate::sync::SyncConfig {
+                encryption: false,
+                ..crate::sync::SyncConfig::default()
+            },
             runtime: Some(rt.handle().clone()),
             ..s.client.options().clone()
         },

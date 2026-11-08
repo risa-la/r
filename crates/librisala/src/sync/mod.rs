@@ -112,6 +112,11 @@ pub struct SyncConfig {
     /// blocks made on the account's other devices are known. On by
     /// default.
     pub fetch_blocks: bool,
+    /// For an identity with a device key, run end-to-end encryption
+    /// (Section 12): KeyPackages, Welcomes, groups and encrypted messages.
+    /// On by default. Without it, nothing is sent to direct conversations
+    /// or encrypted rooms (12.3).
+    pub encryption: bool,
 }
 
 impl Default for SyncConfig {
@@ -123,6 +128,7 @@ impl Default for SyncConfig {
             claim_lease: Duration::from_secs(300),
             clock: Clock::system(),
             fetch_blocks: true,
+            encryption: true,
         }
     }
 }
@@ -135,6 +141,7 @@ impl fmt::Debug for SyncConfig {
             .field("resend_window", &self.resend_window)
             .field("claim_lease", &self.claim_lease)
             .field("fetch_blocks", &self.fetch_blocks)
+            .field("encryption", &self.encryption)
             .finish_non_exhaustive()
     }
 }

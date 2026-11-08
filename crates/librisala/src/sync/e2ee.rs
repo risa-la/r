@@ -114,6 +114,9 @@ pub(super) struct E2ee {
     /// Rooms whose earlier history keys wait to be sent to a new member
     /// (12.9).
     to_share: HashSet<Conv>,
+    /// Conversations whose INIT the server refused on this connection for
+    /// a reason other than `stale`: not tried again on it.
+    init_refused: HashSet<Conv>,
 }
 
 /// A WELCOME line (12.7).
@@ -198,6 +201,7 @@ impl E2ee {
             deferred: Vec::new(),
             rejoined: HashSet::new(),
             to_share: HashSet::new(),
+            init_refused: HashSet::new(),
         }
     }
 }
@@ -237,7 +241,7 @@ impl SyncEngine {
         key: std::sync::Arc<risala_proto::auth::SecretKey>,
         recovery: bool,
     ) -> Result<(), SyncError> {
-        if self.guest {
+        if self.guest || !self.config.encryption {
             return Ok(());
         }
         let dev =
@@ -865,11 +869,9 @@ impl SyncEngine {
         let Conv::Uid(other) = conv else {
             return Ok(());
         };
-        if self
-            .e2ee
-            .as_ref()
-            .is_some_and(|e| e.busy.contains(conv) || !e.welcomes_listed)
-        {
+        if self.e2ee.as_ref().is_some_and(|e| {
+            e.busy.contains(conv) || !e.welcomes_listed || e.init_refused.contains(conv)
+        }) {
             return Ok(());
         }
         let account = self.account;
@@ -994,7 +996,9 @@ impl SyncEngine {
                 // external commit; its id comes with SYNC once the
                 // commit is an event. A conversation whose only event is
                 // its INIT has no head yet, so SYNC cannot list it.
-                if err.code == ErrorCode::Stale && !self.e2().rejoined.contains(conv) {
+                if err.code != ErrorCode::Stale {
+                    self.e2().init_refused.insert(conv.clone());
+                } else if !self.e2().rejoined.contains(conv) {
                     self.e2().busy.insert(conv.clone());
                     self.e2().rejoined.insert(conv.clone());
                     self.issue(

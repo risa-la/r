@@ -163,6 +163,7 @@ mod account;
 mod admin;
 pub(crate) mod chats;
 mod driver;
+mod e2ee;
 mod identity;
 mod people;
 mod rooms;
@@ -191,9 +192,14 @@ use crate::conn::{Backoff, Session, SessionOptions};
 use crate::store::{AccountId, DatabaseKey, Store};
 use crate::sync::SyncConfig;
 
+pub use crate::sync::OwnDeviceState;
 pub use account::{Account, AccountEvents, Conversation};
 pub use admin::Admin;
 pub use chats::{ChatList, ChatListBatch, ChatListDiff};
+pub use e2ee::{
+    DeviceInfo, History, HttpsKeyFiles, KeyFileEntry, KeyFileFuture, KeyFiles, MemoryKeyFiles,
+    NewRecoveryKey,
+};
 pub use people::PresenceWatch;
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
@@ -232,6 +238,10 @@ pub struct ClientOptions {
     /// over its platform's store and passes it wrapped in
     /// [`PlatformKeys`](crate::conn::keys::PlatformKeys).
     pub keys: Option<Arc<dyn KeyStore>>,
+    /// Where identities' key files come from, to check the devices in
+    /// encrypted conversations (4.4, 12.12). `None`: over HTTPS, with
+    /// [`HttpsKeyFiles`].
+    pub key_files: Option<Arc<dyn KeyFiles>>,
     /// The tokio runtime to run on. `None`: the runtime current when the
     /// client is made, or else one of the client's own. See the [module
     /// docs](self).
@@ -246,6 +256,7 @@ impl Default for ClientOptions {
             sync: SyncConfig::default(),
             rejoin_guest_rooms: true,
             keys: None,
+            key_files: None,
             runtime: None,
         }
     }
@@ -259,6 +270,7 @@ impl std::fmt::Debug for ClientOptions {
             .field("sync", &self.sync)
             .field("rejoin_guest_rooms", &self.rejoin_guest_rooms)
             .field("keys", &self.keys.as_ref().map(|_| ".."))
+            .field("key_files", &self.key_files.as_ref().map(|_| ".."))
             .field("runtime", &self.runtime.as_ref().map(|_| ".."))
             .finish()
     }

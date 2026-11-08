@@ -176,9 +176,37 @@ pub(crate) enum Cmd {
     /// Send what the outbox holds that can go now, such as entries another
     /// process sharing the cache queued. Nothing to answer.
     ResumeOutbox,
+    /// An encryption operation (12), answered once the engine has taken
+    /// it.
+    E2ee {
+        op: E2eeOp,
+        reply: Reply<()>,
+    },
     Stop {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// An encryption operation of the sync engine (12).
+#[derive(Debug, Clone)]
+pub(crate) enum E2eeOp {
+    /// Make a room encrypted (12.3, 12.5).
+    EncryptRoom {
+        room: Room,
+        history: risala_proto::types::HistoryMode,
+        send: risala_proto::types::SendMode,
+    },
+    /// Invite to a room: by commit if it is encrypted (6.4, 12.6).
+    Invite { room: Room, uid: Uid },
+    /// The user confirmed, or not, a new device of the identity (12.9).
+    ConfirmDevice {
+        key: risala_proto::auth::PublicKey,
+        confirmed: bool,
+    },
+    /// The identity's recovery key, to back up under (12.10).
+    SetRecovery(Option<risala_mls::RecoveryKey>),
+    /// Send the recovery key to the identity's other devices (12.10).
+    ShareRecovery(risala_mls::RecoveryKey),
 }
 
 /// A command about people, sent through the sync engine so that its reply

@@ -305,31 +305,6 @@ impl Tx<'_> {
             .optional()?;
         raw.map(finish_group).transpose()
     }
-    #[expect(
-        dead_code,
-        reason = "key sharing, backups and reports (12.9, 12.10, 5.8) come next"
-    )]
-    /// Every group of an account, with its conversation.
-    pub(crate) fn groups(
-        &self,
-        account: AccountId,
-    ) -> Result<Vec<(ConvRow, GroupRow)>, StoreError> {
-        let ids: Vec<i64> = {
-            let mut stmt = self.conn().prepare_cached(
-                "SELECT g.conv FROM mls_groups g JOIN convs c ON c.id = g.conv
-                 WHERE c.account = ?1 ORDER BY g.conv",
-            )?;
-            stmt.query_map([account.0], |r| r.get(0))?
-                .collect::<Result<_, _>>()?
-        };
-        let mut out = Vec::new();
-        for id in ids {
-            if let (Some(row), Some(group)) = (self.conv(ConvId(id))?, self.group(ConvId(id))?) {
-                out.push((row, group));
-            }
-        }
-        Ok(out)
-    }
 
     /// Stores a group, replacing the conversation's earlier one.
     pub(crate) fn save_group(&mut self, group: &GroupRow) -> Result<(), StoreError> {
@@ -1107,10 +1082,6 @@ impl Tx<'_> {
             None => Ok(None),
         }
     }
-    #[expect(
-        dead_code,
-        reason = "key sharing, backups and reports (12.9, 12.10, 5.8) come next"
-    )]
     /// The decrypted content and franking key of ENC event `n`, for
     /// REPORTENC (5.8).
     pub(crate) fn franking(&self, conv: ConvId, n: u64) -> Result<Option<Franking>, StoreError> {
@@ -1125,6 +1096,19 @@ impl Tx<'_> {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    /// Whether stored event `n` is an ENC event.
+    pub(crate) fn is_enc(&self, conv: ConvId, n: u64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT verb FROM events WHERE conv = ?1 AND seq = ?2",
+                params![conv.0, sql(n)],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v == "ENC"))
     }
 
     /// The `message_id` of decrypted message `n`, to refer to it (12.8).
@@ -1154,6 +1138,63 @@ impl Tx<'_> {
 
 /// A decrypted message's content and franking key, for REPORTENC (5.8).
 pub(crate) type Franking = (Vec<u8>, Vec<u8>);
+
+/// A device key the account knows (12.12), for [`Store::device_keys`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceKeyRow {
+    pub key: PublicKey,
+    pub label: Option<String>,
+    pub listed: Option<bool>,
+    /// Whether a group the device was in had a leaf with it.
+    pub in_group: bool,
+    /// For the account's own identity, the user's word on it (12.9).
+    pub state: Option<crate::sync::OwnDeviceState>,
+}
+
+impl super::Store {
+    /// The device keys of `uid` that the account has seen in groups and key
+    /// files (12.12), in the order it first saw them.
+    pub(crate) fn device_keys(
+        &self,
+        account: AccountId,
+        uid: &Uid,
+    ) -> Result<Vec<DeviceKeyRow>, StoreError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT d.key, d.label, d.listed,
+                     EXISTS (SELECT 1 FROM epoch_leaves l
+                             WHERE l.account = d.account AND l.key_id = d.key_id),
+                     o.state
+                 FROM device_keys d
+                 LEFT JOIN own_devices o ON o.account = d.account AND o.key_id = d.key_id
+                 WHERE d.account = ?1 AND d.uid = ?2 ORDER BY d.rowid",
+            )?;
+            let rows = stmt.query_map(params![account.0, uid.as_str()], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<bool>>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (key, label, listed, in_group, state) = row?;
+                out.push(DeviceKeyRow {
+                    key: public_key_from(&key)?,
+                    label,
+                    listed,
+                    in_group,
+                    state: state
+                        .as_deref()
+                        .and_then(crate::sync::OwnDeviceState::parse),
+                });
+            }
+            Ok(out)
+        })
+    }
+}
 
 /// What decrypting one event gave.
 enum Opened {
