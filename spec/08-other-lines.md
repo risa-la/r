@@ -143,5 +143,6 @@ INFO is allowed before signing in. It returns these values:
 | `push=yes` or `push=no` | Whether PUSH is supported |
 | `upload=<bytes>` or `upload=no` | The largest file UPLOAD accepts, or `no` if the server offers no uploads (5.6) |
 | `blobs=<url>` | The URL prefix that blobs are fetched from (12.12) |
+| `files=<origins>` | The origins of the server's `get` URLs (5.6), as `https://<host>[:<port>]`, separated by commas. Present only with uploads |
 
 `INFO <room>` is described in Section 6.1.

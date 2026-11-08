@@ -76,7 +76,9 @@ the guest resumes it (see below). Once it ends, another guest may take
 the same name, so a guest uid says nothing about who someone is over
 time. For this reason guests:
 
-- cannot take part in direct conversations or private rooms
+- cannot take part in private rooms, or in direct conversations other
+  than the report conversations above, in which they may only send
+  REPORT lines (5.8, 12.7)
 - cannot create rooms, hold roles, upload files or register for push
 - join a public room's group with a throwaway leaf key, whose credential
   names the guest uid (12.3). Devices show guests as unverified.
@@ -704,8 +706,10 @@ publishes a `signing` record that removes every device and names a new
 device-signing key, then a `device` record for itself. For an identity
 that a server hosts, it uses KEYS PUT, which needs no sign-in. It then
 signs in, and the members of the identity's conversations add the new
-device (12.7). It restores history from the backup, if there is one
-(12.13).
+device (12.7). The new `signing` record moves backups to the next
+generation (12.13). The device restores history from the backup of the
+generation before, if there is one, and makes a new backup in the new
+generation.
 
 **No resets.** No operator can do any of this for someone. A server that
 hosts an identity holds none of its private keys, and the domain's

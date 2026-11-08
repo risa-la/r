@@ -4,10 +4,13 @@
   is not yet registered with IANA.
 - **ALPN identifier:** `risala/1`.
 - **Well-known URI suffix:** `risala` [RFC8615], for key files (4.3).
-- **URI scheme:** `risala://<host>[:<port>][/<room>]`, where `<room>` is
-  a public room written without its `#`. For example,
-  `risala://chat.example.org/general` points to `#general`. Private
-  conversations have no links, since their boxes are secret.
+- **URI scheme:** `risala://<host>[:<port>][/<room>[?g=<group-id>]]`,
+  where `<room>` is a public room written without its `#`, and
+  `<group-id>` is the room's 32-byte group id in lower-case base32
+  [RFC4648] without padding, 52 characters. For example,
+  `risala://chat.example.org/general` points to `#general`. A device
+  that follows a link with `g` joins only the group with that id (6.1).
+  Private conversations have no links, since their boxes are secret.
 - **MLS cipher suite:** `0x0020`, for the algorithms of 12.2: X-Wing
   (HPKE KEM `0x647a`), HKDF-SHA384 (`0x0002`), ChaCha20-Poly1305
   (`0x0003`), SHA-384 and ML-DSA-44. This is the value that
@@ -38,7 +41,8 @@
     followed by the uid (4.8, 12.13), `risala/1 pair new id`,
     `risala/1 pair new key`, `risala/1 pair old id` and
     `risala/1 pair old key` (4.8), and `risala/1 confirm` (12.10);
-  - the associated data `risala/1 pair` (4.8) and the prefix
+  - the associated data `risala/1 pair` (4.8), `risala/1 file` and
+    `risala/1 archive` (12.11, 12.13), and the prefix
     `risala/1 backup ` (12.13);
   - the sign-in prefix `risala-auth-1` (4.6), and the safety number label
     `risala-fp-1` (12.14).

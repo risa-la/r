@@ -36,7 +36,7 @@ guest.
 | `WELCOME PUT <ref> <welcome>` / `WELCOME GET <ref> [light=]` | 12.8 | | ✓ | ✓ | ✓ |
 | `WELCOME LIST` / `WELCOME DEL <id>` | 12.8 | | | | ✓ |
 | `BLOB <hash> <size> [box=] [token=]` | 12.12 | | ✓ | ✓ | ✓ |
-| `BACKUP PUT <generation> <hash> <key>` / `BACKUP GET` / `BACKUP DEL` | 12.13 | | | | ✓ |
+| `BACKUP PUT <generation> <hash> <key> [files=]` / `BACKUP GET` / `BACKUP DEL` | 12.13 | | | | ✓ |
 | `ADMIN OPS` / `OP <uid>` / `DEOP <uid>` | 10.1 | | | | ✓ |
 | `ADMIN BAN <target> [<reason...>]` / `UNBAN <target>` / `BANS` | 10.2 | | | | ✓ |
 | `ADMIN WHO` / `DISCONNECT <uid> [<reason...>]` / `NOTICE <message...>` | 10.3 | | | | ✓ |
@@ -68,7 +68,7 @@ Lines a server can send:
 | `PUSH <url> <tag>` | response to PUSH LIST | 9.1 |
 | `KEYPKG <uid> <keypackage>` | response to KEYPKG GET | 12.5 |
 | `WELCOME <id> <welcome>` | a Welcome, live or in response to WELCOME LIST or WELCOME GET | 12.8 |
-| `BACKUP <generation> <hash> <key>` | response to BACKUP GET | 12.13 |
+| `BACKUP <generation> <hash> <key> [files=<list>]` | response to BACKUP GET | 12.13 |
 | `NOTICE <message...>` | information | 8.4 |
 | `OP <uid>` | response to ADMIN OPS | 10.1 |
 | `SERVERBAN <target> [<reason...>]` | response to ADMIN BANS | 10.2 |

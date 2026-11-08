@@ -52,6 +52,7 @@ cannot see them.
 | `cid` | client | tag value, at most 64 bytes | Client post id for safe resending (7.6) |
 | `retry` | server | seconds | With `ERR rate-limited` or `ERR unavailable`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
+| `pseudonym` | server | base64 | On a report: the target post's pseudonym (5.8) |
 
 ### 3.3. Parameters
 
