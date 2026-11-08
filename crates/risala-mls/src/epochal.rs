@@ -1010,7 +1010,12 @@ mod tests {
         // the chain, the ATTEST is not valid.
         let later = at(period_start(period + 4));
         let mut seen = RevealRegistry::new();
-        seen.record(&identity, period + 3, &ring.seed(period + 3).unwrap(), later);
+        seen.record(
+            &identity,
+            period + 3,
+            &ring.seed(period + 3).unwrap(),
+            later,
+        );
         assert_eq!(
             check_attest(&attest, &check, &seen),
             Err(AttestError::Revealed)
@@ -1068,7 +1073,12 @@ mod tests {
         seen.record(&identity, 100, &ring.seed(100).unwrap(), during);
         seen.record(&identity, 4_000_000_000, &[9; 32], during);
         assert!(seen.devices.is_empty() || seen.devices[0].reveals.is_empty());
-        seen.record(&identity, 100, &ring.seed(100).unwrap(), at(reveal_from(100)));
+        seen.record(
+            &identity,
+            100,
+            &ring.seed(100).unwrap(),
+            at(reveal_from(100)),
+        );
         assert_eq!(seen.devices[0].reveals.len(), 1);
     }
 

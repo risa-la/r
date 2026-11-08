@@ -555,6 +555,14 @@ struct Leaf {
     impostor: Option<ImpostorReason>,
     want: Option<Want>,
     open: Option<Open>,
+    /// The challenge dropped when the leaf's signature key last changed
+    /// (12.10). An ANSWER to it may still come, made before the answerer
+    /// saw the change or with its new key: it is ignored rather than
+    /// checked against the newer challenge, which it would fail, so that a
+    /// device that rotates its leaf after a last-resort join is not taken
+    /// for an impostor.
+    #[serde(default)]
+    dropped: Option<Open>,
     deadline: Option<Deadline>,
     /// Challenged as a new leaf of the device's own identity.
     own_identity: bool,
@@ -574,6 +582,7 @@ impl Leaf {
             impostor: None,
             want: None,
             open: None,
+            dropped: None,
             deadline: None,
             own_identity: false,
             unanswered_reported: false,
@@ -789,7 +798,9 @@ impl Confirmer {
                         leaf.key = info.signature_key.clone();
                         leaf.key_hash = sha384(&info.signature_key).to_vec();
                         leaf.confirmed = false;
-                        leaf.open = None;
+                        if let Some(open) = leaf.open.take() {
+                            leaf.dropped = Some(open);
+                        }
                         leaf.pending_attest = None;
                         // Leaves challenged at once are challenged again
                         // at once (a choice: 12.10 does not say).
@@ -867,7 +878,11 @@ impl Confirmer {
             self.attest_send_by = Some(ms(now) + random_below(URGENT_WITHIN_MS));
         }
         // Open challenges keep the key they were sent with, which is what
-        // the answerer sees as their signer (12.10).
+        // the answerer sees as their signer (12.10). Answers not yet sent
+        // bind the old key, and challengers drop their challenges when they
+        // see the new one: they would only be checked against a newer
+        // challenge, and fail it.
+        self.answers.clear();
     }
 
     /// Leaf `leaf` made an authority commit, or sent a line that only a
@@ -1045,6 +1060,24 @@ impl Confirmer {
         if leaf.impostor.is_some() {
             return None;
         }
+        // An answer to the challenge dropped when the leaf's key changed,
+        // made with its old key or its new one: the answerer had not seen
+        // the newer challenge yet. It is ignored, not checked against the
+        // newer one (12.10).
+        if let Some(dropped) = &leaf.dropped
+            && [&dropped.answerer_key, &leaf.key].into_iter().any(|key| {
+                check_answer(
+                    &dropped.ss,
+                    &self.group_id,
+                    &dropped.ciphertext,
+                    key,
+                    &dropped.challenger_key,
+                    mac.as_bytes(),
+                )
+            })
+        {
+            return None;
+        }
         // No open challenge, or one to an older key: nothing to check.
         let open = leaf.open.take_if(|o| o.answerer_key == leaf.key)?;
         if check_answer(
@@ -1055,6 +1088,7 @@ impl Confirmer {
             &open.challenger_key,
             mac.as_bytes(),
         ) {
+            leaf.dropped = None;
             leaf.confirmed = true;
             leaf.want = None;
             leaf.deadline = None;
@@ -1130,10 +1164,7 @@ impl Confirmer {
                 // A certificate that verified under the device key: REVEALs
                 // whose seeds derive its key are then never pushed out by
                 // forged ones (12.10).
-                if !matches!(
-                    result,
-                    Err(AttestError::Guest | AttestError::Certificate)
-                ) {
+                if !matches!(result, Err(AttestError::Guest | AttestError::Certificate)) {
                     device
                         .reveals
                         .note_certified(&identity, attest.period, &attest.period_key[..]);
@@ -2583,6 +2614,102 @@ mod tests {
         let leaves = [rotated, dave.leaf.clone()];
         dave.cm().set_leaves(&leaves, at(now));
         assert_eq!(dave.state(&carol, now), LeafState::Unconfirmed);
+    }
+
+    /// A new device of the user's own identity that joined from its
+    /// last-resort KeyPackage, was challenged at once, and then rotated its
+    /// leaf key (12.3, 12.5) is not an impostor: an ANSWER to the dropped
+    /// challenge, made with its old key or its new one, is ignored, not
+    /// checked against the newer challenge (12.10, CR-M3).
+    #[test]
+    fn last_resort_rotation_is_not_an_impostor() {
+        let mut dir = Dir::default();
+        let mut b = Node::new("alice@example.org", 1, 0);
+        let mut bob = Node::new("bob@example.net", 2, 1);
+        let mut a = Node::new("alice@example.org", 3, 2);
+        for n in [&b, &bob, &a] {
+            n.register(&mut dir);
+        }
+        let now = t0();
+        group(&mut [&mut b, &mut bob], ConfirmMode::Pairwise, false, now);
+        // A joins; B challenges its new leaf at once.
+        let leaves = [b.leaf.clone(), bob.leaf.clone(), a.leaf.clone()];
+        b.cm().set_leaves(&leaves, at(now));
+        a.confirmer = Some(Confirmer::new(
+            GROUP,
+            ConfirmMode::Pairwise,
+            false,
+            &a.leaf,
+            a.pseudonym,
+            &leaves,
+            at(now),
+        ));
+        let ch1 = b.send(&dir, vec![], now + MIN).unwrap();
+        assert_eq!(challenges(&ch1), vec![a.leaf.index]);
+        // A answers with its KeyPackage's key, but B sees the rotation
+        // before the answer.
+        a.receive(&dir, &b, &ch1, now + MIN, now + MIN);
+        let old_answer = a.send(&dir, vec![], now + 2 * MIN).unwrap();
+        assert_eq!(answers(&old_answer), vec![b.leaf.index]);
+        let new_key = SigningKey::from_seed([88; 32]);
+        a.leaf.signature_key = new_key.public_key().to_vec();
+        let pseudonym = a.pseudonym;
+        a.cm()
+            .own_leaf_changed(new_key.public_key(), pseudonym, at(now + 2 * MIN));
+        let leaves = [b.leaf.clone(), bob.leaf.clone(), a.leaf.clone()];
+        b.cm().set_leaves(&leaves, at(now + 2 * MIN));
+        // B challenges the new key at once.
+        let ch2 = b.send(&dir, vec![], now + 3 * MIN).unwrap();
+        assert_eq!(challenges(&ch2), vec![a.leaf.index]);
+        // The old answer arrives: ignored, not a wrong answer.
+        assert_eq!(
+            b.receive(&dir, &a, &old_answer, now + 3 * MIN, now + 3 * MIN),
+            vec![]
+        );
+        assert_eq!(b.state(&a, now + 3 * MIN), LeafState::Unconfirmed);
+        // An answer to the dropped challenge made with the new key (A read
+        // ch1 again, as a resend, after rotating) is ignored too.
+        a.receive(&dir, &b, &ch1, now + 3 * MIN, now + 3 * MIN);
+        let late = a.send(&dir, vec![], now + 4 * MIN).unwrap();
+        assert_eq!(
+            b.receive(&dir, &a, &late, now + 4 * MIN, now + 4 * MIN),
+            vec![]
+        );
+        // A answers the new challenge: confirmed.
+        a.receive(&dir, &b, &ch2, now + 4 * MIN, now + 4 * MIN);
+        let answer = a.send(&dir, vec![], now + 5 * MIN).unwrap();
+        assert_eq!(
+            b.receive(&dir, &a, &answer, now + 5 * MIN, now + 5 * MIN),
+            vec![Event::Confirmed { leaf: a.leaf.index }]
+        );
+        // A's answers made before a rotation are not sent after it.
+        let mut c = Node::new("alice@example.org", 4, 3);
+        c.register(&mut dir);
+        let leaves = [
+            b.leaf.clone(),
+            bob.leaf.clone(),
+            a.leaf.clone(),
+            c.leaf.clone(),
+        ];
+        b.cm().set_leaves(&leaves, at(now + 6 * MIN));
+        c.confirmer = Some(Confirmer::new(
+            GROUP,
+            ConfirmMode::Pairwise,
+            false,
+            &c.leaf,
+            c.pseudonym,
+            &leaves,
+            at(now + 6 * MIN),
+        ));
+        let ch = b.send(&dir, vec![], now + 7 * MIN).unwrap();
+        c.receive(&dir, &b, &ch, now + 7 * MIN, now + 7 * MIN);
+        let pseudonym = c.pseudonym;
+        c.cm()
+            .own_leaf_changed(&[9; 1312], pseudonym, at(now + 7 * MIN));
+        assert!(
+            c.send(&dir, vec![], now + 8 * MIN)
+                .is_none_or(|content| answers(&content).is_empty())
+        );
     }
 
     /// An unanswered challenge goes again, unchanged, when the leaf shows
