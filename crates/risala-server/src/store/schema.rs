@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -297,6 +297,73 @@ const V3: &str = r#"
 -- file any more, so it is dropped. Labels are stored escaped, which is
 -- the form the limit counts (3.4).
 UPDATE hosted_keys SET label = '' WHERE length(CAST(label AS BLOB)) > 64;
+"#;
+
+/// Version 4: rooms can be dropped (10.4). Conversation keys are never
+/// reused, and reports outlive their room (5.8).
+pub(super) const V4: &str = r#"
+-- A room's key could be given again to the next conversation if the room
+-- was the newest, since `conv` was a plain INTEGER PRIMARY KEY. ADMIN DROP
+-- deletes rooms, and the hub may still hold a dropped room's key for a
+-- moment (a HISTORY on its way, 7.2), so keys must never be reused:
+-- AUTOINCREMENT ensures it.
+CREATE TABLE conversations_v4 (
+    conv    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id      TEXT NOT NULL UNIQUE REFERENCES used_ids (id),
+    kind    TEXT NOT NULL CHECK (kind IN ('room', 'direct')),
+    room    TEXT UNIQUE,
+    uid_a   TEXT,
+    uid_b   TEXT,
+    head    INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0),
+    created INTEGER NOT NULL,
+    CHECK ((kind = 'room') = (room IS NOT NULL)),
+    CHECK ((kind = 'direct') = (uid_a IS NOT NULL AND uid_b IS NOT NULL)),
+    CHECK (uid_a IS NULL OR uid_a <= uid_b),
+    UNIQUE (uid_a, uid_b)
+);
+INSERT INTO conversations_v4 (conv, id, kind, room, uid_a, uid_b, head, created)
+    SELECT conv, id, kind, room, uid_a, uid_b, head, created FROM conversations;
+DROP TABLE conversations;
+ALTER TABLE conversations_v4 RENAME TO conversations;
+
+-- Reports named their conversation by its key, with ON DELETE CASCADE, so
+-- ADMIN DROP would have deleted them. An open report must stay until an
+-- operator resolves it (10.4), so a report now names the conversation by
+-- its id, which is never reused, and a room by its name, which the REPORT
+-- line needs once the room is gone. `room` is NULL for a direct
+-- conversation, whose REPORT line names the author (5.8). `n` is the
+-- order reports were made in, for paging REPORTS and ADMIN REPORTS.
+CREATE TABLE reports_v4 (
+    n            INTEGER PRIMARY KEY,
+    id           TEXT NOT NULL UNIQUE REFERENCES used_ids (id),
+    conv_id      TEXT NOT NULL REFERENCES used_ids (id),
+    room         TEXT,
+    seq          INTEGER NOT NULL CHECK (seq >= 1),
+    reporter     TEXT NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
+    t            INTEGER NOT NULL,
+    ev_t         INTEGER NOT NULL,
+    ev_author    TEXT NOT NULL,
+    ev_relation  TEXT CHECK (ev_relation IN ('reply', 'edit', 'react')),
+    ev_target    INTEGER,
+    ev_file_url  TEXT,
+    ev_file_type TEXT,
+    ev_file_size INTEGER,
+    ev_text      TEXT NOT NULL,
+    UNIQUE (conv_id, seq, reporter)
+);
+INSERT INTO reports_v4 (id, conv_id, room, seq, reporter, reason, t, ev_t, ev_author,
+                        ev_relation, ev_target, ev_file_url, ev_file_type, ev_file_size,
+                        ev_text)
+    SELECT r.id, c.id, c.room, r.seq, r.reporter, r.reason, r.t, r.ev_t, r.ev_author,
+           r.ev_relation, r.ev_target, r.ev_file_url, r.ev_file_type, r.ev_file_size,
+           r.ev_text
+    FROM reports r JOIN conversations c ON c.conv = r.conv
+    ORDER BY r.t, r.id;
+DROP TABLE reports;
+ALTER TABLE reports_v4 RENAME TO reports;
+-- REPORTS <room> (5.8).
+CREATE INDEX reports_conv ON reports (conv_id, n);
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.

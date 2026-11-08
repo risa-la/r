@@ -2179,7 +2179,55 @@ impl crate::store::ModerationStore for Flaky {
 
 // (reports)
 
-impl crate::store::ReportStore for Flaky {}
+impl crate::store::ReportStore for Flaky {
+    fn report_of(
+        &self,
+        c: &risala_proto::names::Id,
+        s: Seq,
+        r: &Uid,
+    ) -> crate::store::Result<Option<risala_proto::names::Id>> {
+        self.inner.report_of(c, s, r)
+    }
+    fn add_report(
+        &self,
+        r: &crate::store::NewReport,
+    ) -> crate::store::Result<crate::store::ReportAdded> {
+        self.pause.at("add_report");
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Corrupt("broken on purpose".into()));
+        }
+        self.inner.add_report(r)
+    }
+    fn report(
+        &self,
+        id: &risala_proto::names::Id,
+    ) -> crate::store::Result<Option<crate::store::ReportRecord>> {
+        self.inner.report(id)
+    }
+    fn reports(
+        &self,
+        c: Option<&risala_proto::names::Id>,
+        after: u64,
+        limit: u64,
+    ) -> crate::store::Result<Vec<crate::store::ReportRecord>> {
+        self.inner.reports(c, after, limit)
+    }
+    fn resolve_report(&self, id: &risala_proto::names::Id) -> crate::store::Result<bool> {
+        self.inner.resolve_report(id)
+    }
+    fn drop_room(
+        &self,
+        c: ConvKey,
+        recreate: bool,
+        t: Timestamp,
+    ) -> crate::store::Result<Option<RoomRecord>> {
+        self.pause.at("drop_room");
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Corrupt("broken on purpose".into()));
+        }
+        self.inner.drop_room(c, recreate, t)
+    }
+}
 
 // (admin)
 

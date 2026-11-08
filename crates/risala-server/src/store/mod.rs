@@ -37,7 +37,7 @@ use risala_proto::types::{
 pub use admin::{AdminStore, ServerBan};
 pub use messages::{MessageStore, PurgeQuery, RelatedQuery};
 pub use moderation::ModerationStore;
-pub use reports::ReportStore;
+pub use reports::{NewReport, ReportAdded, ReportRecord, ReportStore};
 pub use sqlite::SqliteStore;
 
 /// How long a cid protects against a resent message (7.6).
