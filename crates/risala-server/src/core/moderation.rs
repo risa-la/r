@@ -111,19 +111,29 @@ pub(super) fn only_moderators_send() -> Fail {
     )
 }
 
-fn needed_for(setting: &RoomSetting) -> Result<Role, Fail> {
+fn needed_for(setting: &RoomSetting, encrypted: bool) -> Result<Role, Fail> {
+    let in_group = || {
+        fail(
+            ErrorCode::Encrypted,
+            "the room's group holds this setting; an owner changes it with COMMIT",
+        )
+    };
     match setting {
         RoomSetting::Topic(_) => Ok(Role::Mod),
-        // M5a: `send` gets `ERR encrypted` in an encrypted room, where a
-        // COMMIT changes it (6.2).
+        // An encrypted room is private for good (12.3).
+        RoomSetting::Public(_) | RoomSetting::Guests(_) if encrypted => Err(fail(
+            ErrorCode::Forbidden,
+            "an encrypted room stays private and closed to guests",
+        )),
+        // In an encrypted room, a COMMIT changes `send` (6.2, 12.5).
+        RoomSetting::Send(_) if encrypted => Err(in_group()),
         RoomSetting::Public(_)
         | RoomSetting::Guests(_)
         | RoomSetting::Retention(_)
         | RoomSetting::Send(_) => Ok(Role::Owner),
         // Only INIT turns encryption on, and nothing turns it off.
         RoomSetting::E2ee(_) => Err(fail(ErrorCode::Forbidden, "e2ee is set by INIT only")),
-        // M5a: `ERR encrypted` in an encrypted room, where a COMMIT
-        // changes it. No room is encrypted yet.
+        RoomSetting::History(_) if encrypted => Err(in_group()),
         RoomSetting::History(_) => Err(fail(
             ErrorCode::Forbidden,
             "history exists only in encrypted rooms",
@@ -216,9 +226,7 @@ impl Inner {
         if !visible(info, a) {
             return Err(not_found());
         }
-        let needed = needed_for(&setting)?;
-        // M5a: SET of `public` or `guests` in an encrypted room gets
-        // `ERR forbidden` (6.2).
+        let needed = needed_for(&setting, info.settings.e2ee)?;
         check_rights(info, a, needed)?;
         if let RoomSetting::Retention(RoomRetention::Days(days)) = &setting
             && let Some(server) = self.settings().retention.days()
@@ -405,7 +413,14 @@ impl Inner {
         if info.bans.contains(&target) {
             return Err(fail(ErrorCode::Forbidden, "banned; unban first"));
         }
-        // M5a: `ERR encrypted` in an encrypted room, where a COMMIT invites.
+        // In an encrypted room, a COMMIT that adds the invitee's devices
+        // invites (12.3, 12.6).
+        if info.settings.e2ee {
+            return Err(fail(
+                ErrorCode::Encrypted,
+                "invite by adding the invitee's devices with COMMIT",
+            ));
+        }
         // A member needs no invitation, and someone invited already needs
         // no second one: nothing is recorded (6.4).
         if st.is_member(&target) || info.invites.contains(&target) {

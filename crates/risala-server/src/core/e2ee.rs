@@ -30,15 +30,14 @@
 //!
 //! # Welcomes
 //!
-//! [`Inner::store_welcomes`] is what COMMIT calls, once it has accepted a
-//! commit that adds devices (12.5): it stores the Welcome, with the tree
-//! of the new epoch, as pending for each device, and sends it to the
-//! device's connections. The store keeps the commit's Welcome and tree
+//! COMMIT stores the Welcome of a commit that adds devices, with the tree
+//! of the new epoch, as pending for each device, in the transaction of the
+//! commit (12.5), then sends it to the devices' connections with
+//! [`Inner::send_welcomes`]. The store keeps the commit's Welcome and tree
 //! while any of its devices has it pending (12.7; PLAN.md 5, item 22,
 //! change P), and a device deletes its Welcome only once it has joined.
-//! The server also deletes the pending Welcomes of a device whose leaf is
-//! removed (12.7). That comes with COMMIT, which knows when a leaf goes;
-//! the store has no call for it yet.
+//! COMMIT also deletes the pending Welcomes of the conversation for each
+//! device whose leaf it removes (12.7).
 //!
 //! WELCOME LIST sends the pending Welcomes one at a time, waiting for room
 //! in the connection's queue before each after the first, since each may
@@ -63,7 +62,7 @@ use risala_mls::RisalaCrypto;
 use risala_proto::auth::PublicKey;
 use risala_proto::command::{BackupCommand, Command, KeyPkgCommand, WelcomeCommand};
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{BackupBlob, DEFAULT_BACKUP_LIMIT, KeyPackage, RatchetTree, Welcome};
+use risala_proto::mls::{BackupBlob, DEFAULT_BACKUP_LIMIT, KeyPackage};
 use risala_proto::names::{Id, Identity, Seq, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
@@ -74,7 +73,7 @@ use super::keys::FetchError;
 use super::state::ConvState;
 use super::{Hub, Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::{ConnId, OutLine};
-use crate::store::{BackupAdded, KeyPackageAdded, NewKeyPackage, StoreError};
+use crate::store::{BackupAdded, KeyPackageAdded, NewKeyPackage, NewWelcome, StoreError};
 
 /// The window of `limits.key_package_gets_per_hour` (12.4).
 pub(super) const KEYPKG_GET_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -217,7 +216,7 @@ impl Inner {
     }
 
     /// The key connection `id` of `uid` signed in with (4.5).
-    fn device_key(&self, uid: &Uid, id: ConnId) -> Result<PublicKey, Fail> {
+    pub(super) fn device_key(&self, uid: &Uid, id: ConnId) -> Result<PublicKey, Fail> {
         let user = self.reg().users.get(uid).cloned();
         user.and_then(|user| {
             user.lock()
@@ -398,48 +397,35 @@ impl Inner {
         }
     }
 
-    /// Stores the Welcome of an accepted commit, whose COMMIT event is
-    /// `seq` in the conversation `st`, with the ratchet tree of the epoch
-    /// it started, as pending for each of `devices`, and sends a WELCOME
-    /// line to each device's connections (12.5, 12.7).
+    /// Sends the WELCOME line of an accepted commit, whose COMMIT event is
+    /// `seq` in the conversation `st`, to the connections of each device
+    /// it adds (12.5, 12.7). `ids` are the ids the store gave each device's
+    /// Welcome, in the order of `welcome.devices`; COMMIT stores them in
+    /// the transaction of the commit, so a Welcome is never lost after the
+    /// commit is accepted.
     ///
     /// For COMMIT, which calls it holding the conversation's lock, after it
     /// has queued the COMMIT event. A connection whose queue has no room
     /// for the line is dropped, as for any live line; the device gets the
     /// Welcome from WELCOME LIST when it connects again.
-    #[allow(dead_code)] // COMMIT is not built yet.
-    pub(super) async fn store_welcomes(
-        &self,
-        st: &ConvState,
-        seq: Seq,
-        welcome: Welcome,
-        tree: RatchetTree,
-        devices: Vec<(Uid, PublicKey)>,
-    ) -> Result<(), StoreError> {
-        let key = st.key;
-        let ids = {
-            let (welcome, tree, devices) = (welcome.clone(), tree.clone(), devices.clone());
-            self.db(move |s| s.add_welcomes(key, seq, &welcome, &tree, &devices))
-                .await?
-        };
-        for ((uid, device), id) in devices.into_iter().zip(ids) {
-            let Some(user) = self.reg().users.get(&uid).cloned() else {
+    pub(super) fn send_welcomes(&self, st: &ConvState, seq: Seq, welcome: &NewWelcome, ids: &[Id]) {
+        for ((uid, device), id) in welcome.devices.iter().zip(ids) {
+            let Some(user) = self.reg().users.get(uid).cloned() else {
                 continue;
             };
             let line = OutLine::new(ServerMessage::new(ServerLine::Welcome {
-                conv: st.name_for(&uid),
-                id,
+                conv: st.name_for(uid),
+                id: id.clone(),
                 seq,
-                welcome: welcome.clone(),
-                tree: tree.clone(),
+                welcome: welcome.welcome.clone(),
+                tree: welcome.tree.clone(),
             }));
             for conn in &user.lock().conns {
-                if conn.key.as_ref() == Some(&device) {
+                if conn.key.as_ref() == Some(device) {
                     conn.handle.send_line(line.clone());
                 }
             }
         }
-        Ok(())
     }
 
     /// WELCOME LIST (12.7).

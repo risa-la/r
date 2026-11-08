@@ -311,23 +311,28 @@ fn tree(len: usize) -> RatchetTree {
     RatchetTree::from_bytes(&vec![7; len]).unwrap()
 }
 
-/// What COMMIT will do: stores a Welcome for `devices` in `#general`, as
-/// added by the commit whose event is `seq`.
+/// What COMMIT does with a Welcome: stores it for `devices` in
+/// `#general`, as added by the commit whose event is `seq`, and sends it.
 async fn store_welcome(w: &World, seq: u64, n: u8, tree: &RatchetTree, devices: &[(&str, u8)]) {
     let room: Room = "#general".parse().unwrap();
     let st = w.h.hub.inner.lock_room(&room).await.unwrap();
-    let devices = devices.iter().map(|(who, n)| (uid(who), key(*n))).collect();
-    w.h.hub
-        .inner
-        .store_welcomes(
-            &st,
-            Seq::new(seq).unwrap(),
-            welcome(n),
-            tree.clone(),
-            devices,
-        )
-        .await
-        .unwrap();
+    let welcome = crate::store::NewWelcome {
+        welcome: welcome(n),
+        tree: tree.clone(),
+        devices: devices.iter().map(|(who, n)| (uid(who), key(*n))).collect(),
+    };
+    let seq = Seq::new(seq).unwrap();
+    let ids =
+        w.h.store
+            .add_welcomes(
+                st.key,
+                seq,
+                &welcome.welcome,
+                &welcome.tree,
+                &welcome.devices,
+            )
+            .unwrap();
+    w.h.hub.inner.send_welcomes(&st, seq, &welcome, &ids);
 }
 
 /// The id of a WELCOME line.

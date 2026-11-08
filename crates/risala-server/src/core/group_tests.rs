@@ -7,15 +7,21 @@
 //! system's time, since OpenMLS stamps KeyPackages with it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use openmls_memory_storage::MemoryStorage;
-use risala_mls::Provider;
+use risala_mls::openmls::group::MlsGroup;
+use risala_mls::openmls::prelude::{
+    KeyPackage, LeafNodeIndex, ProcessedMessageContent, ProtocolMessage,
+};
 use risala_mls::openmls_traits::OpenMlsProvider as _;
 use risala_mls::wire;
+use risala_mls::{Changes, Provider, RisalaConversation};
 use risala_proto::auth::{PublicKey, SecretKey};
 use risala_proto::mls;
 use risala_proto::names::{Identity, Uid};
 use risala_proto::time::Timestamp;
+use risala_proto::types::{HistoryMode, SendMode};
 
 use super::tests::{Client, Harness, config, timers};
 use super::*;
@@ -71,6 +77,154 @@ impl Device {
                 .unwrap();
         wire::key_package_to_wire(bundle.key_package()).unwrap()
     }
+
+    /// A new KeyPackage of this device, to add it with.
+    pub(super) fn kp(&self) -> KeyPackage {
+        risala_mls::key_package(&self.provider, &self.signer(), &self.uid, false)
+            .unwrap()
+            .key_package()
+            .clone()
+    }
+
+    /// A new group with this device alone in it.
+    pub(super) fn create(&self, conversation: &RisalaConversation) -> MlsGroup {
+        risala_mls::create_group(&self.provider, &self.signer(), &self.uid, conversation).unwrap()
+    }
+
+    /// The INIT line for `group`, of the conversation `conv`.
+    pub(super) fn init_line(&self, conv: &str, group: &MlsGroup) -> String {
+        let gi = group
+            .export_group_info(self.provider.crypto(), &self.signer(), false)
+            .unwrap();
+        let gi = wire::group_info_to_wire(&gi).unwrap();
+        let tree = wire::tree_to_wire(&group.export_ratchet_tree()).unwrap();
+        format!("init {conv} {gi} {tree}")
+    }
+
+    /// A commit of `changes`, left pending in `group`.
+    pub(super) fn commit(&self, group: &mut MlsGroup, changes: Changes) -> Sent {
+        let bundle = risala_mls::commit(&self.provider, group, &self.signer(), changes).unwrap();
+        Sent::of(bundle.into_messages())
+    }
+
+    /// Joins by the Welcome and tree of a WELCOME line.
+    pub(super) fn join(&self, line: &str) -> MlsGroup {
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert_eq!(parts[0], "WELCOME", "{line}");
+        let welcome: mls::Welcome = parts[4].parse().unwrap();
+        let tree: mls::RatchetTree = parts[5].parse().unwrap();
+        risala_mls::stage_welcome(
+            &self.provider,
+            wire::welcome_from_wire(&welcome).unwrap(),
+            wire::tree_from_wire(&tree).unwrap(),
+        )
+        .unwrap()
+        .into_group(&self.provider)
+        .unwrap()
+    }
+
+    /// Joins by external commit, from a GROUPINFO line.
+    pub(super) fn join_external(&self, line: &str) -> (MlsGroup, Sent) {
+        let parts: Vec<&str> = line.split(' ').collect();
+        assert_eq!(parts[0], "GROUPINFO", "{line}");
+        let gi: mls::GroupInfo = parts[4].parse().unwrap();
+        let tree: mls::RatchetTree = parts[5].parse().unwrap();
+        let (group, bundle) = risala_mls::join_by_external_commit(
+            &self.provider,
+            &self.signer(),
+            &self.uid,
+            wire::group_info_from_wire(&gi).unwrap(),
+            wire::tree_from_wire(&tree).unwrap(),
+        )
+        .unwrap();
+        (group, Sent::of(bundle.into_messages()))
+    }
+
+    /// Applies the commit of a COMMIT event line.
+    pub(super) fn apply(&self, group: &mut MlsGroup, line: &str) {
+        let commit: mls::CommitMessage = line.rsplit(' ').next().unwrap().parse().unwrap();
+        let message: ProtocolMessage = wire::commit_from_wire(&commit).unwrap();
+        let processed = group.process_message(&self.provider, message).unwrap();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("not a commit");
+        };
+        group.merge_staged_commit(&self.provider, *staged).unwrap();
+    }
+
+    /// The leaf of `key` in `group`.
+    pub(super) fn leaf(group: &MlsGroup, key: &PublicKey) -> LeafNodeIndex {
+        group
+            .members()
+            .find(|m| m.signature_key == key.as_bytes())
+            .unwrap()
+            .index
+    }
+}
+
+/// What a device sends with COMMIT.
+pub(super) struct Sent {
+    pub(super) commit: mls::CommitMessage,
+    pub(super) group_info: mls::GroupInfo,
+    pub(super) welcome: Option<mls::Welcome>,
+}
+
+impl Sent {
+    fn of(
+        (commit, welcome, group_info): (
+            risala_mls::openmls::prelude::MlsMessageOut,
+            Option<risala_mls::openmls::prelude::MlsMessageOut>,
+            Option<risala_mls::openmls::prelude::MlsMessageOut>,
+        ),
+    ) -> Sent {
+        Sent {
+            commit: wire::commit_to_wire(&commit).unwrap(),
+            group_info: wire::group_info_to_wire(&group_info.unwrap()).unwrap(),
+            welcome: welcome.map(|w| wire::welcome_to_wire(&w).unwrap()),
+        }
+    }
+
+    /// The COMMIT line, with the Welcome if there is one.
+    pub(super) fn line(&self, conv: &str) -> String {
+        match &self.welcome {
+            Some(w) => format!("commit {conv} {} {} {w}", self.commit, self.group_info),
+            None => format!("commit {conv} {} {}", self.commit, self.group_info),
+        }
+    }
+
+    /// The COMMIT line without its Welcome.
+    pub(super) fn line_without_welcome(&self, conv: &str) -> String {
+        format!("commit {conv} {} {}", self.commit, self.group_info)
+    }
+}
+
+/// A line without its tags.
+pub(super) fn untagged(line: &str) -> &str {
+    match line.strip_prefix('@') {
+        Some(rest) => rest.split_once(' ').map_or(rest, |(_, l)| l),
+        None => line,
+    }
+}
+
+/// The lines without their tags, with long values cut to 12 characters.
+pub(super) fn short(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| {
+            untagged(l)
+                .split(' ')
+                .map(|w| if w.len() > 40 { &w[..12] } else { w })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// The line of `lines` that starts with `start`, once its tags are gone.
+pub(super) fn find<'a>(lines: &'a [String], start: &str) -> &'a str {
+    lines
+        .iter()
+        .find(|l| untagged(l).starts_with(start))
+        .unwrap_or_else(|| panic!("no {start:?} in {:?}", short(lines)))
 }
 
 /// A hub that hosts `example.org`, where alice is registered with keys 1,
@@ -129,6 +283,12 @@ impl World {
 
     pub(super) async fn send(&self, c: &Client, line: &str) {
         self.h.send(c, line).await;
+    }
+
+    /// Sends `line` from `c`, and returns what `c` got.
+    pub(super) async fn ask(&self, c: &mut Client, line: &str) -> Vec<String> {
+        self.h.send(c, line).await;
+        c.lines()
     }
 }
 
@@ -210,5 +370,421 @@ fn lifetimes_agree() {
     assert_eq!(
         MAX_KEY_PACKAGE_LIFETIME,
         risala_mls::group::MAX_LIFETIME_SPAN
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted rooms: INIT, COMMIT and GROUPINFO (12.3, 12.5, 12.6)
+
+/// The value of `key=` in the last line of `lines`.
+fn ok_value(lines: &[String], key: &str) -> String {
+    super::tests::value(lines.last().unwrap(), key)
+}
+
+/// `#r`, created by alice's device 1 and encrypted by it, with `history`
+/// and `send` as given. Returns the room's id and alice's group.
+async fn encrypted_room(
+    w: &mut World,
+    a1: &Device,
+    c: &mut Client,
+    history: HistoryMode,
+    send: SendMode,
+) -> (risala_proto::names::Id, MlsGroup) {
+    let lines = w.ask(c, "join #r").await;
+    let id: risala_proto::names::Id = ok_value(&lines, "id").parse().unwrap();
+    let group = a1.create(&RisalaConversation::room(&id, history, send));
+    let lines = w.ask(c, &a1.init_line("#r", &group)).await;
+    assert_eq!(lines.last().unwrap(), &format!("OK id={id} epoch=0"));
+    (id, group)
+}
+
+#[tokio::test]
+async fn init_encrypts_a_room_for_good() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c = w.connect(&a1);
+    let lines = w.ask(&mut c, "join #r").await;
+    let id: risala_proto::names::Id = ok_value(&lines, "id").parse().unwrap();
+
+    // The extension must name this room.
+    let other = a1.create(&RisalaConversation::room(
+        &"zzzz".parse().unwrap(),
+        HistoryMode::Shared,
+        SendMode::All,
+    ));
+    assert_eq!(
+        w.ask(&mut c, &a1.init_line("#r", &other)).await,
+        ["ERR invalid the conversation extension names another conversation"]
+    );
+    let direct = a1.create(&RisalaConversation::direct(&a1.uid, &uid(BOB)));
+    assert_eq!(
+        w.ask(&mut c, &a1.init_line("#r", &direct)).await,
+        ["ERR invalid the conversation extension names another conversation"]
+    );
+    // Another device's group.
+    let a2 = Device::new(ALICE, 2);
+    let theirs = a2.create(&RisalaConversation::room(
+        &id,
+        HistoryMode::Shared,
+        SendMode::All,
+    ));
+    assert_eq!(
+        w.ask(&mut c, &a2.init_line("#r", &theirs)).await,
+        ["ERR invalid the leaf is not this device's"]
+    );
+    // Not while another identity is a member.
+    let mut c7 = w.connect(&Device::new(CAROL, 7));
+    w.ask(&mut c7, "join #r").await;
+    c.lines();
+    let group = a1.create(&RisalaConversation::room(
+        &id,
+        HistoryMode::Joined,
+        SendMode::Mods,
+    ));
+    assert_eq!(
+        w.ask(&mut c, &a1.init_line("#r", &group)).await,
+        ["ERR forbidden a room is encrypted while its owner is its only member"]
+    );
+    w.ask(&mut c7, "part #r").await;
+    c.lines();
+    // An invitation made before is ended by INIT.
+    w.ask(&mut c, "invite #r bob@example.net").await;
+
+    let lines = w.ask(&mut c, &a1.init_line("#r", &group)).await;
+    assert_eq!(
+        short(&lines),
+        [
+            "SET #r public no",
+            "SET #r guests none",
+            "SET #r e2ee yes",
+            "SET #r history joined",
+            "SET #r send mods",
+            &format!("OK id={id} epoch=0"),
+        ]
+    );
+    // Once only, and the same group id never again.
+    assert_eq!(
+        w.ask(&mut c, &a1.init_line("#r", &group)).await,
+        ["ERR stale the room is encrypted already"]
+    );
+    let info = w.ask(&mut c, "info #r").await;
+    assert_eq!(
+        short(&info)[..7],
+        [
+            "SET #r topic",
+            "SET #r public no",
+            "SET #r guests none",
+            "SET #r retention server",
+            "SET #r e2ee yes",
+            "SET #r history joined",
+            "SET #r send mods",
+        ]
+    );
+    for (line, error) in [
+        (
+            "set #r public yes",
+            "ERR forbidden an encrypted room stays private and closed to guests",
+        ),
+        (
+            "set #r guests read",
+            "ERR forbidden an encrypted room stays private and closed to guests",
+        ),
+        ("set #r e2ee no", "ERR forbidden e2ee is set by INIT only"),
+        (
+            "set #r history shared",
+            "ERR encrypted the room's group holds this setting; an owner changes it with COMMIT",
+        ),
+        (
+            "set #r send all",
+            "ERR encrypted the room's group holds this setting; an owner changes it with COMMIT",
+        ),
+        (
+            "invite #r carol@example.org",
+            "ERR encrypted invite by adding the invitee's devices with COMMIT",
+        ),
+        ("msg #r hello", "ERR encrypted send with ENC"),
+    ] {
+        assert_eq!(w.ask(&mut c, line).await, [error], "{line}");
+    }
+    // The invitation INIT ended does not let bob in.
+    let mut b5 = w.connect(&Device::new(BOB, 5));
+    assert_eq!(
+        w.ask(&mut b5, "join #r").await,
+        ["ERR not-found no such room"]
+    );
+    assert_eq!(
+        w.ask(&mut c, "set #r topic still works").await.len(),
+        2,
+        "the topic is not in the group"
+    );
+}
+
+#[tokio::test]
+async fn commits_add_invite_and_remove_devices() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let (_, mut ga1) =
+        encrypted_room(&mut w, &a1, &mut c1, HistoryMode::Shared, SendMode::All).await;
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+
+    // A commit that adds bob's device invites bob (12.6).
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b5.kp()],
+            ..Changes::default()
+        },
+    );
+    // Without its Welcome, or with one it does not need.
+    assert_eq!(
+        w.ask(&mut c1, &sent.line_without_welcome("#r")).await,
+        ["ERR invalid a commit that adds devices comes with a Welcome"]
+    );
+    let lines = w.ask(&mut c1, &sent.line("#r")).await;
+    assert_eq!(
+        short(&lines),
+        [
+            &format!("COMMIT #r 1 {}", &sent.commit.as_str()[..12]),
+            "INVITE #r bob@example.net",
+            "OK seq=6 epoch=1",
+        ]
+    );
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    // Bob gets the INVITE and his Welcome, and joins the group and room.
+    let lines = cb.lines();
+    assert_eq!(untagged(&lines[0]), "INVITE #r bob@example.net");
+    let welcome = find(&lines, "WELCOME #r ");
+    assert!(welcome.contains(" 6 "), "{welcome}");
+    let mut gb5 = b5.join(welcome);
+    assert_eq!(gb5.epoch().as_u64(), 1);
+    let lines = w.ask(&mut cb, "join #r").await;
+    assert!(untagged(&lines[0]).starts_with("JOIN #r"), "{lines:?}");
+    c1.lines();
+
+    // A stale commit: bob commits for epoch 1 after alice moved on.
+    let sent = a1.commit(&mut ga1, Changes::default());
+    let stale = b5.commit(&mut gb5, Changes::default());
+    let lines = w.ask(&mut c1, &sent.line("#r")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=9 epoch=2");
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    let commit = find(&cb.lines(), "COMMIT #r 2").to_owned();
+    assert_eq!(
+        w.ask(&mut cb, &stale.line("#r")).await,
+        ["ERR stale the commit is for epoch 1, and the group is in epoch 2"]
+    );
+    gb5.clear_pending_commit(b5.provider.storage()).unwrap();
+    b5.apply(&mut gb5, &commit);
+    // The GroupInfo of another commit.
+    let one = a1.commit(&mut ga1, Changes::default());
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+    let two = a1.commit(&mut ga1, Changes::default());
+    let mixed = format!("commit #r {} {}", two.commit, one.group_info);
+    assert_eq!(
+        w.ask(&mut c1, &mixed).await,
+        ["ERR invalid the GroupInfo is not for the commit's new epoch"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+
+    // Alice may not remove bob's leaf while he is a member.
+    let bob_leaf = Device::leaf(&ga1, &b5.secret.public_key());
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            remove: vec![bob_leaf],
+            ..Changes::default()
+        },
+    );
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR forbidden no reason to remove a leaf of bob@example.net"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+    // Once he has left, she must.
+    w.ask(&mut cb, "part #r").await;
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            remove: vec![bob_leaf],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line("#r")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=11 epoch=3");
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    // Bob is gone, so he gets nothing more of the room.
+    assert!(cb.lines().iter().all(|l| !l.contains("COMMIT")));
+}
+
+#[tokio::test]
+async fn commits_are_refused_by_the_rules() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let (id, mut ga1) =
+        encrypted_room(&mut w, &a1, &mut c1, HistoryMode::Shared, SendMode::All).await;
+
+    // From another device of the committer's identity, or another
+    // identity that is not in the room.
+    let a2 = Device::new(ALICE, 2);
+    let mut c2 = w.connect(&a2);
+    let sent = a1.commit(&mut ga1, Changes::default());
+    assert_eq!(
+        w.ask(&mut c2, &sent.line("#r")).await,
+        ["ERR forbidden the committer is not this connection's device"]
+    );
+    let mut c5 = w.connect(&Device::new(BOB, 5));
+    assert_eq!(
+        w.ask(&mut c5, &sent.line("#r")).await,
+        ["ERR not-found no such room"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+
+    // A key that is not in its identity's key file: bob's device 9.
+    let b9 = Device::new(BOB, 9);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b9.kp()],
+            ..Changes::default()
+        },
+    );
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR forbidden a key of bob@example.net that is not in its key file"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+
+    // A KeyPackage whose lifetime is over at the server's time.
+    w.h.clock.advance(Duration::from_secs(13 * 7 * 86400));
+    let b5 = Device::new(BOB, 5);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b5.kp()],
+            ..Changes::default()
+        },
+    );
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR invalid an added KeyPackage's lifetime is not acceptable"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+    w.h.clock.set(Timestamp::now());
+
+    // Renaming the conversation, or changing it as a plain member.
+    let renamed = RisalaConversation::room(
+        &"other".parse().unwrap(),
+        HistoryMode::Shared,
+        SendMode::All,
+    );
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            conversation: Some(renamed),
+            ..Changes::default()
+        },
+    );
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR forbidden GroupContextExtensions changes only history and send"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+
+    // Changing the committer's credential in its path (12.2).
+    let mut bundle = ga1
+        .commit_builder()
+        .force_self_update(true)
+        .leaf_node_parameters(
+            risala_mls::openmls::prelude::LeafNodeParameters::builder()
+                .with_credential_with_key(risala_mls::credential_with_key(
+                    CAROL,
+                    &a1.secret.public_key(),
+                ))
+                .build(),
+        )
+        .load_psks(a1.provider.storage())
+        .unwrap()
+        .create_group_info(true)
+        .build(
+            a1.provider.rand(),
+            a1.provider.crypto(),
+            &a1.signer(),
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&a1.provider)
+        .unwrap();
+    let _ = &mut bundle;
+    let sent = Sent::of(bundle.into_messages());
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR forbidden a commit keeps the credential and key of the committer's leaf"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+
+    // The owner changes `history` and `send`, which the server records.
+    let changed = RisalaConversation::room(&id, HistoryMode::Joined, SendMode::Mods);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            conversation: Some(changed),
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line("#r")).await;
+    assert_eq!(
+        short(&lines)[1..],
+        [
+            "SET #r history joined",
+            "SET #r send mods",
+            "OK seq=6 epoch=1"
+        ]
+    );
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+}
+
+#[tokio::test]
+async fn devices_join_by_external_commit() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let (_, mut ga1) =
+        encrypted_room(&mut w, &a1, &mut c1, HistoryMode::Shared, SendMode::All).await;
+
+    // Alice's second device: a member, whose identity has a leaf.
+    let a2 = Device::new(ALICE, 2);
+    let mut c2 = w.connect(&a2);
+    let gi = w.ask(&mut c2, "groupinfo #r").await;
+    assert_eq!(gi.last().unwrap(), "OK");
+    assert!(gi[0].starts_with("GROUPINFO #r 0 0 "), "{}", &gi[0][..30]);
+    let (mut ga2, sent) = a2.join_external(&gi[0]);
+    let lines = w.ask(&mut c2, &sent.line("#r")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=6 epoch=1");
+    let commit = find(&c1.lines(), "COMMIT #r 1").to_owned();
+    a1.apply(&mut ga1, &commit);
+    assert_eq!(ga1.members().count(), 2);
+
+    // The same device again, as after a reinstall: its old leaf goes.
+    let a2b = Device::new(ALICE, 2);
+    let gi = w.ask(&mut c2, "groupinfo #r").await;
+    assert!(gi[0].starts_with("GROUPINFO #r 1 6 "));
+    let (_, sent) = a2b.join_external(&gi[0]);
+    let lines = w.ask(&mut c2, &sent.line("#r")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=7 epoch=2");
+    let commit = find(&c1.lines(), "COMMIT #r 2").to_owned();
+    a1.apply(&mut ga1, &commit);
+    assert_eq!(ga1.members().count(), 2);
+    // The stale state of the old one is behind.
+    let stale = a2.commit(&mut ga2, Changes::default());
+    assert!(w.ask(&mut c2, &stale.line("#r")).await[0].starts_with("ERR stale"),);
+
+    // Carol, a member with no leaf, may not join by herself.
+    let c7 = Device::new(CAROL, 7);
+    let mut cc = w.connect(&c7);
+    assert_eq!(
+        w.ask(&mut cc, "groupinfo #r").await,
+        ["ERR not-found no such room"]
     );
 }

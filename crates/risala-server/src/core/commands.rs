@@ -145,10 +145,21 @@ pub(super) fn check_read(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
 /// the role `owner` or `mod`; operators may join any room (6.3). Guests
 /// need the room's `guests` setting to let them in.
 ///
-/// M5a: joining an encrypted room always takes an invitation.
+/// Joining an encrypted room always takes an invitation, made by adding
+/// the joiner's devices to its group, for owners, moderators and operators
+/// too (6.1, 12.6).
 fn check_join(info: &RoomInfo, a: Asker<'_>) -> Result<(), Fail> {
     if !visible(info, a) {
         return Err(not_found());
+    }
+    if info.settings.e2ee {
+        if info.invites.contains(a.uid) {
+            return Ok(());
+        }
+        return Err(fail(
+            ErrorCode::Forbidden,
+            "joining an encrypted room takes an invitation",
+        ));
     }
     if a.uid.is_guest() && !info.settings.guests.allows_read() {
         return Err(fail(ErrorCode::Forbidden, "guests may not enter this room"));
@@ -367,6 +378,9 @@ impl Inner {
             command @ (Command::KeyPkg(_) | Command::Welcome(_) | Command::Backup(_)) => {
                 self.e2ee(uid, reply, command).await
             }
+            command @ (Command::Init { .. }
+            | Command::Commit { .. }
+            | Command::GroupInfo { .. }) => self.encrypted(uid, reply, command).await,
             // Later milestones, including `HISTORY only=commit` and the
             // rest of Section 12.
             _ => Err(not_supported()),
@@ -739,11 +753,39 @@ impl Inner {
         Ok(Some(guard))
     }
 
-    /// PART (6.1).
+    /// PART (6.1). An invitee of an encrypted room declines the invitation
+    /// with it (12.6).
     async fn part(&self, uid: &Uid, room: &Room, reason: String) -> Outcome {
         let mut st = self.lock_room(room).await?;
         if !st.is_member(uid) {
-            return Err(fail(ErrorCode::NotFound, "not a member"));
+            let invited = st
+                .room_info()
+                .is_some_and(|info| info.settings.e2ee && info.invites.contains(uid));
+            if !invited {
+                return Err(fail(ErrorCode::NotFound, "not a member"));
+            }
+            let event = NewEvent {
+                t: self.now(),
+                from: uid.clone(),
+                kind: EventKind::Part { reason },
+                cid: None,
+            };
+            let (_, event) = self.append(&mut st, event).await?;
+            if let Some(info) = st.room_info_mut() {
+                info.invites.remove(uid);
+            }
+            Self::broadcast_event(&st, &event);
+            // The invitee is not a member, so the room's fan-out does not
+            // reach its other devices.
+            if let Some(user) = self.reg().users.get(uid).cloned()
+                && let Some(info) = st.room_info()
+            {
+                match event.to_event(info.room.clone(), &st.id) {
+                    Ok(line) => user.send(&OutLine::new(ServerMessage::new(line))),
+                    Err(e) => tracing::error!(room = %info.room, "cannot send an event: {e}"),
+                }
+            }
+            return Ok(Some(OkResponse::new()));
         }
         let event = NewEvent {
             t: self.now(),

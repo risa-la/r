@@ -575,6 +575,8 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
             for sql in [
                 "DELETE FROM members WHERE conv = ? AND uid = ?",
                 "DELETE FROM guest_members WHERE conv = ? AND uid = ?",
+                // An invitee of an encrypted room declines (12.6).
+                "DELETE FROM invites WHERE conv = ? AND uid = ?",
             ] {
                 tx.execute(sql, params![conv, event.from.as_str()])?;
             }

@@ -70,9 +70,11 @@
 mod admin;
 mod commands;
 mod e2ee;
+mod encrypted;
 mod identity;
 pub mod keys;
 mod messages;
+mod mls;
 mod moderation;
 mod presence;
 mod rate;

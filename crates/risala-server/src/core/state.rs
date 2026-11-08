@@ -28,7 +28,7 @@ use risala_proto::types::{Cid, Role};
 
 use super::presence::PresenceBook;
 use crate::handler::{ConnHandle, ConnId, ConnInfo, OutLine};
-use crate::store::{CID_WINDOW_MS, ConvKey, RoomRecord, RoomSettings};
+use crate::store::{CID_WINDOW_MS, ConvKey, GroupMeta, RoomRecord, RoomSettings};
 
 /// A conversation the hub knows, behind its async lock. The lock is held
 /// while an event is assigned its seq, stored and queued for every
@@ -67,6 +67,9 @@ pub(crate) struct ConvState {
     /// marker at once, then reads one again under this lock if it moved
     /// since (3.6, 7.1).
     pub(crate) marker_moved: u64,
+    /// Where its group is, if it is encrypted (12.5). Changed only by INIT
+    /// and COMMIT, with the stored group.
+    pub(crate) group: Option<GroupMeta>,
 }
 
 /// The kinds of conversation (5.1). Direct conversations come with M5a.
@@ -100,6 +103,7 @@ impl ConvState {
             dropped: false,
             members: BTreeMap::new(),
             marker_moved: 0,
+            group: record.group,
             kind: ConvKind::Room(RoomInfo {
                 room: record.room,
                 settings: record.settings,

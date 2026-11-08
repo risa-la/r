@@ -177,6 +177,10 @@ impl Inner {
         if !member {
             return Err(fail(ErrorCode::Forbidden, "join the room first"));
         }
+        // Messages are sent with ENC there (12.3).
+        if info.settings.e2ee {
+            return Err(fail(ErrorCode::Encrypted, "send with ENC"));
+        }
         // Reactions too (6.3).
         if uid.is_guest() && !info.settings.guests.allows_write() {
             return Err(fail(ErrorCode::Forbidden, "guests may not send here"));
