@@ -32,11 +32,10 @@ use risala_proto::names::{Domain, Identity, Name};
 /// Makes a new device key from 32 bytes of the OS's secure random source
 /// (4.4).
 pub fn generate_device_key() -> Result<SecretKey, getrandom::Error> {
-    let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)?;
-    let key = SecretKey::from_seed(seed);
-    seed.fill(0);
-    Ok(key)
+    let mut seed = zeroize::Zeroizing::new([0u8; SEED_LEN]);
+    getrandom::fill(&mut *seed)?;
+    // from_seed wipes the copy it is given, and `seed` is wiped on drop.
+    Ok(SecretKey::from_seed(*seed))
 }
 
 /// The key file line for a device's key, `mldsa44 <key> [<label>]`,
@@ -170,6 +169,16 @@ pub fn key_seed(key: &SecretKey) -> zeroize::Zeroizing<[u8; SEED_LEN]> {
     seed
 }
 
+/// `bytes` as a seed, in a copy wiped when dropped, if they are 32 bytes.
+fn seed_from(bytes: &[u8]) -> Option<zeroize::Zeroizing<[u8; SEED_LEN]>> {
+    if bytes.len() != SEED_LEN {
+        return None;
+    }
+    let mut seed = zeroize::Zeroizing::new([0u8; SEED_LEN]);
+    seed.copy_from_slice(bytes);
+    Some(seed)
+}
+
 /// Why a [`PlatformKeyStore`] failed. Plain, with owned messages, so that
 /// Swift and Kotlin code can return one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -246,12 +255,12 @@ impl KeyStore for PlatformKeys {
         let Some(bytes) = self.0.load(id.to_owned())? else {
             return Ok(None);
         };
-        let mut bytes = zeroize::Zeroizing::new(bytes);
-        let seed: [u8; SEED_LEN] = bytes.as_slice().try_into().map_err(|_| {
+        let bytes = zeroize::Zeroizing::new(bytes);
+        let seed = seed_from(&bytes).ok_or_else(|| {
             KeyStoreError::BadKey(format!("{id}: {} bytes, not a 32-byte seed", bytes.len()))
         })?;
-        zeroize::Zeroize::zeroize(&mut *bytes);
-        Ok(Some(SecretKey::from_seed(seed)))
+        // from_seed wipes the copy it is given.
+        Ok(Some(SecretKey::from_seed(*seed)))
     }
 
     fn save(&self, id: &str, key: &SecretKey) -> Result<(), KeyStoreError> {
@@ -282,16 +291,13 @@ impl PlatformKeyStore for AsPlatform {
     }
 
     fn save(&self, identity: String, seed: Vec<u8>) -> Result<(), PlatformKeyError> {
-        let mut seed = zeroize::Zeroizing::new(seed);
-        let bytes: [u8; SEED_LEN] =
-            seed.as_slice()
-                .try_into()
-                .map_err(|_| PlatformKeyError::BadKey {
-                    message: format!("{} bytes, not a 32-byte seed", seed.len()),
-                })?;
-        zeroize::Zeroize::zeroize(&mut *seed);
+        let seed = zeroize::Zeroizing::new(seed);
+        let bytes = seed_from(&seed).ok_or_else(|| PlatformKeyError::BadKey {
+            message: format!("{} bytes, not a 32-byte seed", seed.len()),
+        })?;
+        // from_seed wipes the copy it is given.
         self.0
-            .save(&identity, &SecretKey::from_seed(bytes))
+            .save(&identity, &SecretKey::from_seed(*bytes))
             .map_err(platform_error)
     }
 
