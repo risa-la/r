@@ -3,7 +3,7 @@
 use clap::Subcommand;
 
 use super::rooms::show_report;
-use super::{Ctx, Res, fail_with, online, show_key, within};
+use super::{Ctx, Res, fail_with, online, print_room, show_key, within};
 
 #[derive(Subcommand)]
 pub(crate) enum AdminCommand {
@@ -177,11 +177,7 @@ pub(crate) async fn run(ctx: &Ctx, command: AdminCommand) -> Res {
             loop {
                 let page = within(admin.rooms(after.take(), None)).await?;
                 for room in &page.rooms {
-                    if room.topic.is_empty() {
-                        println!("{} ({} members)", room.room, room.members);
-                    } else {
-                        println!("{} ({} members): {}", room.room, room.members, room.topic);
-                    }
+                    print_room(&room.room, room.members, &room.topic);
                 }
                 match page.rooms.last() {
                     Some(last) if page.more => after = Some(last.room.clone()),

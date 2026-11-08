@@ -514,11 +514,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             loop {
                 let page = within(account.list_rooms(after.take(), None)).await?;
                 for room in &page.rooms {
-                    if room.topic.is_empty() {
-                        println!("{} ({} members)", room.room, room.members);
-                    } else {
-                        println!("{} ({} members): {}", room.room, room.members, room.topic);
-                    }
+                    print_room(&room.room, room.members, &room.topic);
                 }
                 match page.rooms.last() {
                     Some(last) if page.more => after = Some(last.room.clone()),
@@ -1389,5 +1385,15 @@ fn uid_of(account: &Account) -> String {
     match account.state() {
         librisala::client::ConnectionState::Online { uid } => uid,
         _ => account.uid(),
+    }
+}
+
+/// One room of LIST or ADMIN ROOMS (6.1, 10.4).
+pub(crate) fn print_room(room: &str, members: u64, topic: &str) {
+    let people = if members == 1 { "member" } else { "members" };
+    if topic.is_empty() {
+        println!("{room} ({members} {people})");
+    } else {
+        println!("{room} ({members} {people}): {topic}");
     }
 }

@@ -140,7 +140,7 @@ async fn an_operator_reviews_moderates_and_administers() {
     let who = ok(state, &["admin", "who", &addr]).await;
     assert!(who.contains("~ann 127.0.0.1:"), "{who}");
     let rooms = ok(state, &["admin", "rooms", &addr]).await;
-    assert!(rooms.contains("#general (1 members): be nice"), "{rooms}");
+    assert!(rooms.contains("#general (1 member): be nice"), "{rooms}");
     ok(state, &["admin", "set", &addr, "welcome", "hello", "again"]).await;
     let out = ok(state, &["admin", "drop", &addr, "#general", "closing"]).await;
     assert!(out.contains("dropped #general"), "{out}");
