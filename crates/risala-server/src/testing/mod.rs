@@ -74,6 +74,15 @@
 //! [`presence`](TestServerBuilder::presence) changes them: a client signed
 //! in as an identity gets `PRESENCE` lines a second after people who share
 //! a room with it come online, and 30 seconds after they go.
+//!
+//! # Operators and time
+//!
+//! [`operator`](TestServerBuilder::operator) names an operator in the
+//! configuration (10.1). [`manual_clock`](TestServerBuilder::manual_clock)
+//! stops the server's clock, which stamps events (3.2) and decides what
+//! has expired (7.5): move it with [`TestServer::advance`], and expire old
+//! events at once with [`TestServer::expire_now`] instead of waiting for
+//! the background task.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -87,7 +96,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, Limits};
-use crate::core::{KeyServices, Timers};
+use crate::core::{Clock, Hub, KeyServices, ManualClock, SystemClock, Timers};
 use crate::daemon::{Daemon, RunError};
 use crate::http::{HttpsKeyFetcher, KeyDir};
 use crate::store::{SqliteStore, Store as _};
@@ -120,6 +129,7 @@ pub struct TestServerBuilder {
     guest_resume: Option<Duration>,
     presence: Option<(Duration, Duration)>,
     key_domains: Vec<String>,
+    clock: Option<std::sync::Arc<ManualClock>>,
 }
 
 impl fmt::Debug for TestServerBuilder {
@@ -212,6 +222,26 @@ impl TestServerBuilder {
         self
     }
 
+    /// Makes `identity` one of the server's operators, in the
+    /// configuration (`operators`, 10.1), so that ADMIN DEOP cannot remove
+    /// it. It still has to sign in: register it, or name its domain with
+    /// [`key_domains`](Self::key_domains).
+    pub fn operator(mut self, identity: &str) -> Self {
+        self.config.operators.push(identity.to_owned());
+        self
+    }
+
+    /// Stops the server's clock at the current time. It moves only with
+    /// [`TestServer::advance`], and stays where it is across
+    /// [`restart`](TestServer::restart). Events are stamped with it (3.2),
+    /// retention (7.5) and the rate limits that count per hour or per day
+    /// measure time by it. Timers for connections, guest sessions and
+    /// presence still run on real time.
+    pub fn manual_clock(mut self) -> Self {
+        self.clock = Some(std::sync::Arc::new(ManualClock::new(Timestamp::now())));
+        self
+    }
+
     /// Changes anything else in the configuration. `listen` and
     /// `state_dir` are replaced when the server starts.
     pub fn configure(mut self, f: impl FnOnce(&mut Config)) -> Self {
@@ -266,6 +296,7 @@ impl TestServerBuilder {
         };
         let mut server = TestServer {
             config,
+            clock: self.clock,
             timers,
             addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             fingerprint: None,
@@ -320,6 +351,7 @@ fn prepare_store(config: &Config, prepare: Vec<Prepare>) {
 #[derive(Debug)]
 pub struct TestServer {
     config: Config,
+    clock: Option<std::sync::Arc<ManualClock>>,
     timers: Timers,
     addr: SocketAddr,
     fingerprint: Option<Fingerprint>,
@@ -330,6 +362,7 @@ pub struct TestServer {
 
 #[derive(Debug)]
 struct Running {
+    hub: Hub,
     stop: oneshot::Sender<()>,
     task: JoinHandle<Result<(), RunError>>,
 }
@@ -351,6 +384,7 @@ impl TestServer {
             guest_resume: None,
             presence: None,
             key_domains: Vec::new(),
+            clock: None,
         }
     }
 
@@ -540,6 +574,34 @@ impl TestServer {
         (client, nonce)
     }
 
+    /// Moves the server's clock forward by `by`. Needs
+    /// [`manual_clock`](TestServerBuilder::manual_clock).
+    pub fn advance(&self, by: Duration) {
+        self.clock
+            .as_ref()
+            .expect("the test server has no manual_clock")
+            .advance(by);
+    }
+
+    /// The server's time now: the [manual clock](TestServerBuilder::manual_clock)'s
+    /// if it has one.
+    pub fn now(&self) -> Timestamp {
+        self.clock.as_ref().map_or_else(Timestamp::now, |c| c.now())
+    }
+
+    /// Expires old events now (7.5), as the background task does every few
+    /// minutes, and returns how many expired. Time is the
+    /// [manual clock](TestServerBuilder::manual_clock)'s if there is one.
+    pub async fn expire_now(&self) -> u64 {
+        self.running
+            .as_ref()
+            .expect("the test server is running")
+            .hub
+            .expire_now()
+            .await
+            .expect("expiring events")
+    }
+
     /// Stops the server and starts it again on the same directory and
     /// address, as after a restart of `risalad`. Connections are closed
     /// with `BYE server shutting down` (11), and guest sessions end, so
@@ -577,14 +639,18 @@ impl TestServer {
         let mut config = self.config.clone();
         // After a restart, listen on the same port again.
         config.listen = vec![self.addr];
-        let daemon = match &self.keys {
-            None => Daemon::bind_with(config, self.timers).await,
-            Some(keys) => {
-                let services = key_services(&config, keys).await;
-                Daemon::bind_full(config, self.timers, Some(services)).await
-            }
-        }
-        .expect("starting the test server");
+        let services = match &self.keys {
+            None => None,
+            Some(keys) => Some(key_services(&config, keys).await),
+        };
+        let clock: std::sync::Arc<dyn Clock> = match &self.clock {
+            Some(clock) => clock.clone(),
+            None => std::sync::Arc::new(SystemClock),
+        };
+        let daemon = Daemon::bind_clock(config, self.timers, services, clock)
+            .await
+            .expect("starting the test server");
+        let hub = daemon.hub().clone();
         self.addr = daemon.local_addrs()[0];
         let fingerprint = daemon.fingerprint();
         if let Some(old) = self.fingerprint {
@@ -595,7 +661,7 @@ impl TestServer {
         let task = tokio::spawn(daemon.run(async {
             let _ = stopped.await;
         }));
-        self.running = Some(Running { stop, task });
+        self.running = Some(Running { hub, stop, task });
     }
 
     async fn shut_down(&mut self) {

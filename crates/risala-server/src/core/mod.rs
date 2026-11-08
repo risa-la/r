@@ -281,21 +281,23 @@ impl Hub {
     /// 4.6).
     pub fn open_with_keys(config: Config, keys: KeyServices) -> Result<Hub, HubError> {
         let timers = Timers::from_config(&config);
-        Hub::open_with(config, timers, keys)
+        Hub::open_with(config, timers, keys, Arc::new(SystemClock))
     }
 
-    /// [`Hub::open`] with timers that need not follow the configuration.
+    /// [`Hub::open`] with timers that need not follow the configuration,
+    /// and a clock of your choosing.
     pub(crate) fn open_with(
         config: Config,
         timers: Timers,
         keys: KeyServices,
+        clock: Arc<dyn Clock>,
     ) -> Result<Hub, HubError> {
         create_state_dir(&config.state_dir).map_err(|source| HubError::Io {
             path: config.state_dir.clone(),
             source,
         })?;
         let store = SqliteStore::open(&config.database_path())?;
-        Hub::build(config, Arc::new(store), Arc::new(SystemClock), timers, keys)
+        Hub::build(config, Arc::new(store), clock, timers, keys)
     }
 
     /// Starts the hub on `store`.

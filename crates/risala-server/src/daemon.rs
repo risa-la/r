@@ -28,7 +28,8 @@ use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
 use crate::core::{
-    BYE_SHUTDOWN, CID_PRUNE_PERIOD, EXPIRE_PERIOD, Hub, HubError, KeyServices, Timers,
+    BYE_SHUTDOWN, CID_PRUNE_PERIOD, Clock, EXPIRE_PERIOD, Hub, HubError, KeyServices,
+    SystemClock, Timers,
 };
 use crate::http::{self, HttpServer, KeyDir};
 use crate::net;
@@ -99,6 +100,16 @@ impl Daemon {
         timers: Timers,
         keys: Option<KeyServices>,
     ) -> Result<Daemon, RunError> {
+        Daemon::bind_clock(config, timers, keys, Arc::new(SystemClock)).await
+    }
+
+    /// [`Daemon::bind_full`] with a clock of your choosing, for tests.
+    pub(crate) async fn bind_clock(
+        config: Config,
+        timers: Timers,
+        keys: Option<KeyServices>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Daemon, RunError> {
         // Opening SQLite, reading certificates and generating a key all
         // block, so keep them off the runtime's worker threads.
         tokio::task::spawn_blocking(move || {
@@ -109,7 +120,7 @@ impl Daemon {
                     KeyServices::shared(http::fetch::from_config(&config.keys)?, key_dir.clone())
                 }
             };
-            let hub = Hub::open_with(config, timers, keys)?;
+            let hub = Hub::open_with(config, timers, keys, clock)?;
             let server = net::Server::bind(hub.config(), Arc::new(hub.clone()))?;
             let config = hub.config();
             let http = if config.http.listen.is_empty() {
@@ -163,6 +174,11 @@ impl Daemon {
     /// The configuration the server runs with.
     pub fn config(&self) -> &Config {
         self.hub.config()
+    }
+
+    /// The hub, for tests that act on it directly.
+    pub(crate) fn hub(&self) -> &Hub {
+        &self.hub
     }
 
     /// The addresses the HTTPS listener listens on, in the order of
