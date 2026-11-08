@@ -141,7 +141,12 @@ async fn trust_guest_join_send_log_sync_and_export() {
     // So does deleting (5.4).
     let out = risala(state, &["delete", &addr, "#general", seq]).await;
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("offline"), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("connection failed"), "{err}");
+    assert!(
+        err.contains("queued; it will be deleted on the next connection"),
+        "{err}"
+    );
     let log = ok(state, &["log", &addr, "#general", "-n", "1"]).await;
     assert!(
         log.contains(&format!("(waiting to be sent) (delete {seq})")),
