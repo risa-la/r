@@ -17,6 +17,7 @@ nonisolated struct RoomListSubscription: Sendable {
     /// Cached rooms, read without waiting for connection, authentication, or sync.
     let initial: [Room]
     /// Each element replaces the whole list, such as after a join, a part, or a new
-    /// conversation. Cancelling the consuming task ends the subscription.
+    /// conversation. Cancelling the consuming task ends the subscription; any other
+    /// end, with or without an error, means updates stopped and the list may be stale.
     let updates: AsyncThrowingStream<[Room], any Error>
 }

@@ -10,7 +10,7 @@ struct RoomsView: View {
     let retry: () -> Void
 
     var body: some View {
-        withBreadcrumb {
+        withHeader {
             if showsStatus && model.rooms.isEmpty {
                 RoomsStatusView(state: model.state, retry: retry)
             } else {
@@ -42,20 +42,27 @@ struct RoomsView: View {
     }
 
     @ContentBuilder
-    private func withBreadcrumb(@ContentBuilder _ content: () -> some View) -> some View {
+    private func withHeader(@ContentBuilder _ content: () -> some View) -> some View {
         if #available(iOS 26, macOS 26, *) {
-            content().safeAreaBar(edge: .top, spacing: 0) { breadcrumb }
+            content().safeAreaBar(edge: .top, spacing: 0) { header }
         } else {
             content().safeAreaInset(edge: .top, spacing: 0) {
-                breadcrumb.background(.panel)
+                header.background(.panel)
             }
         }
     }
 
-    private var breadcrumb: some View {
-        Breadcrumb(location: Text("Chats"))
-            .padding(.horizontal, Layout.panelContentPadding)
-            .padding(.top, Layout.panelContentPadding)
-            .padding(.bottom, Layout.inlineSpacing)
+    /// The breadcrumb, then a notice while the rooms may be out of date.
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Breadcrumb(location: Text("Chats"))
+                .padding(.top, Layout.panelContentPadding)
+                .padding(.bottom, Layout.inlineSpacing)
+            if model.isStale {
+                RoomsStaleNotice(retry: retry)
+                    .padding(.bottom, Layout.inlineSpacing)
+            }
+        }
+        .padding(.horizontal, Layout.panelContentPadding)
     }
 }

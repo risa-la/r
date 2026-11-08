@@ -9,7 +9,9 @@ struct RoomsStatusView: View {
         switch state {
         // Cached chats show whether or not a server is connected, so reaching
         // this state without a session still means there is nothing to show.
-        case .disconnected, .empty:
+        // Stale rooms reach here only when there were none; the rooms pane
+        // says they may be out of date.
+        case .disconnected, .empty, .stale:
             HudhudMessage(
                 title: Text("No chats yet"),
                 message: Text("Hudhud is holding a letter with nowhere to take it.")

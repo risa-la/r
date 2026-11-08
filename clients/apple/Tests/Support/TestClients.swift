@@ -128,6 +128,14 @@ final class TestChatClient: ChatClient {
         }
     }
 
+    /// Ends every room subscription with `error`, or without one as if the library stopped.
+    func endRooms(throwing error: (any Error)? = nil) {
+        for listener in roomListeners {
+            listener.finish(throwing: error)
+        }
+        roomListeners.removeAll()
+    }
+
     func makeMessage(_ text: String, delivery: Message.Delivery = .sent) -> Message {
         nextMessageID += 1
         return Message(

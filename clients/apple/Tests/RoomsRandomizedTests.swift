@@ -19,7 +19,8 @@ struct RoomsRandomizedTests {
 
         for step in 0..<50 {
             if let current = follower {
-                switch run.pick(3) {
+                let action = run.pick(5)
+                switch action {
                 case 0:
                     let list = pickRooms(&run)
                     run.record("\(step): update to \(list.count) rooms")
@@ -36,7 +37,20 @@ struct RoomsRandomizedTests {
                     await current.value
                     follower = nil
                     guard model.state == before else {
-                        run.fail("Cancelling hid the rooms")
+                        run.fail("Cancelling changed the rooms or marked them stale")
+                        return
+                    }
+                    continue
+                case 2, 3:
+                    // A stream that ends without an error stops updates just the same.
+                    let failing = action == 2
+                    run.record("\(step): updates \(failing ? "fail" : "end")")
+                    let before = model.state
+                    client.endRooms(throwing: failing ? CocoaError(.fileReadUnknown) : nil)
+                    await current.value
+                    follower = nil
+                    guard model.state == .stale(shown(before)) else {
+                        run.fail("Stopped updates hid the rooms or did not mark them stale")
                         return
                     }
                     continue
@@ -82,9 +96,11 @@ struct RoomsRandomizedTests {
             follower = outcome < 2 ? observer : nil
             let valid: Bool
             switch outcome {
+            // A new snapshot replaces stale rooms.
             case 0, 1: valid = settled == expected(outcome == 0 ? [] : list)
-            // Rooms already shown stay readable when subscribing again fails or stops.
-            case 2: valid = settled == (reloading ? before : .failed)
+            // Rooms already shown stay readable when subscribing again fails, marked
+            // stale, and unchanged when it is cancelled.
+            case 2: valid = settled == (reloading ? .stale(shown(before)) : .failed)
             default: valid = settled == (reloading ? before : .idle)
             }
             guard valid, model.state == settled else {
@@ -100,5 +116,13 @@ struct RoomsRandomizedTests {
 
     private func expected(_ rooms: [Room]) -> RoomsViewModel.State {
         rooms.isEmpty ? .empty : .loaded(rooms)
+    }
+
+    /// The rooms on screen in `state`.
+    private func shown(_ state: RoomsViewModel.State) -> [Room] {
+        switch state {
+        case .loaded(let rooms), .stale(let rooms): rooms
+        default: []
+        }
     }
 }
