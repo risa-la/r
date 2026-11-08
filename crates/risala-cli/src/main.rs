@@ -29,6 +29,7 @@
 //! registration closed), or a certificate or key needs your decision.
 
 mod admin;
+mod e2ee;
 mod rooms;
 
 use std::io::Write as _;
@@ -38,8 +39,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use librisala::client::{
-    Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, EventKind,
-    KeyErrorKind, KeyInfo, Label, Message, Notice, OutboxStatus, Presence, RefusedKind,
+    Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, Encryption,
+    EventKind, KeyErrorKind, KeyInfo, Label, Message, Notice, OutboxStatus, Presence, RefusedKind,
     TimelineDiff, TrustInfo,
 };
 use librisala::conn::keys::FileKeyStore;
@@ -190,6 +191,8 @@ enum Command {
     },
     #[command(flatten)]
     Rooms(rooms::RoomCommand),
+    #[command(flatten)]
+    E2ee(e2ee::E2eeCommand),
     /// Administer the server, as one of its operators (Section 10).
     Admin {
         #[command(subcommand)]
@@ -762,6 +765,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         }
         Command::Chat { server, room } => chat(ctx, &server, &room).await,
         Command::Rooms(command) => rooms::run(ctx, command).await,
+        Command::E2ee(command) => e2ee::run(ctx, command).await,
         Command::Admin { command } => admin::run(ctx, command).await,
         Command::Read {
             server,
@@ -1293,9 +1297,17 @@ fn show(m: &Message) -> String {
     let time = m.time.get(11..16).unwrap_or(&m.time);
     let text = m.text.as_deref().unwrap_or("");
     let subject = m.subject.as_deref().unwrap_or("");
-    let body = match m.kind {
-        EventKind::Message if m.deleted => "(deleted)".to_owned(),
-        EventKind::Message => {
+    let body = match (m.kind, m.encryption) {
+        (EventKind::Message, _) if m.deleted => "(deleted)".to_owned(),
+        // 12.8: an encrypted message waits for its epoch's key, or could
+        // not be read, and then its text is not shown.
+        (EventKind::Message, Some(Encryption::Waiting)) => {
+            format!("<{}> (encrypted; waiting for its key)", m.from)
+        }
+        (EventKind::Message, Some(Encryption::Failed { .. })) => {
+            format!("<{}> (encrypted; could not be read)", m.from)
+        }
+        (EventKind::Message, _) => {
             let mut s = text.replace('\n', "\n    ");
             if let Some(to) = m.reply_to {
                 s = format!("(re {to}) {s}");
@@ -1306,8 +1318,19 @@ fn show(m: &Message) -> String {
             for r in &m.reactions {
                 s.push_str(&format!(" [{} {}]", r.reaction, r.count));
             }
+            if m.encryption == Some(Encryption::Unverified) {
+                s.push_str(" (unverified)");
+            }
             format!("<{}> {s}", m.from)
         }
+        _ => show_event(m, text, subject),
+    };
+    format!("[{}] {time} {body}", m.seq)
+}
+
+/// The text of an event that is not a message.
+fn show_event(m: &Message, text: &str, subject: &str) -> String {
+    match m.kind {
         EventKind::Join => format!("* {} joined", m.from),
         EventKind::Part if text.is_empty() => format!("* {} left", m.from),
         EventKind::Part => format!("* {} left ({text})", m.from),
@@ -1327,8 +1350,7 @@ fn show(m: &Message) -> String {
         EventKind::Unban => format!("* {} unbanned {subject}", m.from),
         EventKind::Role => format!("* {} made {subject} {text}", m.from),
         _ => format!("* {}", m.line),
-    };
-    format!("[{}] {time} {body}", m.seq)
+    }
 }
 
 /// Every conversation of an account, page by page.
@@ -1512,6 +1534,17 @@ fn show_notice(notice: &Notice) -> String {
         }
         Notice::RejoinFailed { room, error } => format!("could not join {room} again: {error}"),
         Notice::Server { text } => format!("notice: {text}"),
+        Notice::NewDevice { fingerprint } => format!(
+            "a new device of yours: {fingerprint}; if it is yours, risala confirm SERVER {fingerprint}"
+        ),
+        Notice::EncryptionStopped { conversation } => format!(
+            "{conversation}: a change to its encryption failed this device's checks; nothing more \
+             is sent there"
+        ),
+        Notice::KeyConflict { id, epoch } => format!(
+            "two different keys arrived for epoch {epoch} of conversation {id}; someone may be \
+             tampering with it"
+        ),
     }
 }
 
