@@ -859,6 +859,26 @@ Open:
     - Onboarding says that direct conversations need both people on the
       same server, since there is no federation (5.1).
 
+41. **Follow-ups from the review of main** (7.6, 4.4), decided with the
+    user on 2026-11-08. No spec change:
+    - **One message in flight per conversation.** The outbox sends the
+      next message to a conversation only after the previous one's OK
+      or ERR, and holds everything after `rate-limited` until the retry
+      time. Order is always kept; a burst to one room takes a round trip
+      per message.
+    - **Stable message ids.** A message sent through the outbox keeps
+      the id `o<outbox id>` once it is stored; every other item is
+      `e<seq>`. While an entry is sending, an own event with the same
+      text and reply target waits for the OK rather than showing twice.
+      A server that changed the text would show the message twice until
+      the OK, which is accepted.
+    - **Key-file cache sites** stay as they are: the per-site share can
+      be split with subdomains of short domains under two-letter TLDs.
+      Revisit in hardening.
+    - The Apple app's adapter contract follows librisala's timeline
+      (diffs by index, paging through the timeline, start of history).
+      It lands once it builds on a Mac.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
