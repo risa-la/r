@@ -191,12 +191,23 @@ pub fn device_at(server: &TestServer, at: SocketAddr) -> (Client, String) {
     options.keys = Some(std::sync::Arc::new(
         librisala::conn::keys::MemoryKeyStore::default(),
     ));
+    options.key_files = key_files(server);
     let client = Client::open_in_memory(options).unwrap();
     let addr = format!("{HOST}:{}", server.addr().port());
     client
         .accept_fingerprint(&addr, &server.fingerprint().to_string())
         .unwrap();
     (client, addr)
+}
+
+/// Key files fetched over HTTPS from the test server's key file host,
+/// where it publishes the identities it hosts (4.6, 12.12); `None` for a
+/// server that hosts none.
+pub fn key_files(server: &TestServer) -> Option<std::sync::Arc<dyn librisala::client::KeyFiles>> {
+    server.config().identity_domain.as_ref()?;
+    Some(std::sync::Arc::new(
+        librisala::client::HttpsKeyFiles::with_options(server.key_server().fetch_options()),
+    ))
 }
 
 /// A device that reaches the server directly.

@@ -19,6 +19,7 @@
 
 #![warn(missing_docs)]
 
+pub use risala_keyfetch as keyfetch;
 pub use risala_proto as proto;
 
 pub mod addr;

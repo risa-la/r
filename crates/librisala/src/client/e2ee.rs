@@ -76,6 +76,12 @@ impl HttpsKeyFiles {
             ..FetchOptions::default()
         })))
     }
+
+    /// A fetcher with options of its own: other roots or a resolver, as
+    /// tests and tools need.
+    pub fn with_options(options: FetchOptions) -> HttpsKeyFiles {
+        HttpsKeyFiles(Arc::new(KeyFetcher::new(options)))
+    }
 }
 
 impl Default for HttpsKeyFiles {
