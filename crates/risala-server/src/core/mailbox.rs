@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use risala_mls::framing::{ContentType, Sender, read_post};
-use risala_proto::command::{Command, CreateForm};
+use risala_proto::command::{Command, CreateForm, Move};
 use risala_proto::error::ErrorCode;
 use risala_proto::mls::{
     GroupId, GroupInfo, MlsMessage, OrBlob, PostToken, Pseudonym, SendToken, TokenHash,
@@ -352,8 +352,8 @@ pub(super) async fn handle(cx: &Cx, command: Command) -> Reply {
             token_hash,
             form,
         } => match form {
-            CreateForm::Private { .. } => {
-                create(cx, mailbox, group_id, token_hash, form.first_epoch()).await
+            CreateForm::Private { moving } => {
+                create(cx, mailbox, group_id, token_hash, moving).await
             }
             CreateForm::Public(public) => {
                 room::create(cx, mailbox, group_id, token_hash, public).await
@@ -411,15 +411,16 @@ async fn mailbox(cx: &Cx, mailbox: BoxName) -> Result<MailboxRecord, ErrResponse
         .ok_or_else(|| err(ErrorCode::NotFound))
 }
 
-/// `CREATE <box> <group-id> <token-hash> [epoch=<epoch>]` (5.2, 7.8): the
-/// mailbox of a direct conversation or a private room, or with `epoch`, of
-/// a group that moves.
+/// `CREATE <box> <group-id> <token-hash> [epoch=<epoch> from=<box>
+/// token=<token>]` (5.2, 7.8): the mailbox of a direct conversation or a
+/// private room, or with the options, of a group that moves from `from`,
+/// which only a holder of a send token of the epoch before can create.
 async fn create(
     cx: &Cx,
     mailbox: BoxName,
     group_id: GroupId,
     token_hash: TokenHash,
-    first_epoch: u64,
+    moving: Option<Move>,
 ) -> Reply {
     let inner = &cx.inner;
     let now = inner.now();
@@ -427,10 +428,33 @@ async fn create(
         .mailbox
         .creates
         .take(cx, inner.config.limits.creates_per_hour, now)?;
+    let (first_epoch, moved_from) = match &moving {
+        None => (0, None),
+        Some(Move { epoch, from, token }) => {
+            let (epoch, from, hash) = (epoch.get(), *from, token.hash());
+            let held = cx
+                .db(move |store| {
+                    let Some(old) = store.mailbox(&from)? else {
+                        return Ok(None);
+                    };
+                    if old.group_id != group_id {
+                        return Ok(None);
+                    }
+                    store.has_token(&from, epoch - 1, &hash).map(Some)
+                })
+                .await?;
+            match held {
+                None => return Err(err(ErrorCode::NotFound)),
+                Some(false) => return Err(err(ErrorCode::Stale)),
+                Some(true) => (epoch, Some(from)),
+            }
+        }
+    };
     let new = NewMailbox {
         mailbox,
         group_id,
         first_epoch,
+        moved_from,
         token_hash,
         created: now,
     };

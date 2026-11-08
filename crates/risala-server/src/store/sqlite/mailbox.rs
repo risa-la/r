@@ -193,6 +193,26 @@ fn decode_proposals(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
 fn check_new(tx: &Transaction<'_>, new: &NewMailbox) -> Result<Result<Option<Vec<u8>>, Created>> {
     let mailbox = &new.mailbox.as_bytes()[..];
     let group = &new.group_id.as_bytes()[..];
+    // A move comes from a mailbox of the same group (7.8).
+    let moved_from = match (new.first_epoch, &new.moved_from) {
+        (0, _) => None,
+        (_, None) => return Ok(Err(Created::NoGroup)),
+        (_, Some(from)) => {
+            let from = &from.as_bytes()[..];
+            let same_group = tx
+                .query_row(
+                    "SELECT 1 FROM mailboxes WHERE box = ? AND group_id = ?",
+                    params![from, group],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !same_group {
+                return Ok(Err(Created::NoGroup));
+            }
+            Some(from.to_vec())
+        }
+    };
     if used(tx, USED_BOX, mailbox)? {
         // A move to a box that is already the group's mailbox from that
         // epoch changes nothing (7.8).
@@ -211,21 +231,10 @@ fn check_new(tx: &Transaction<'_>, new: &NewMailbox) -> Result<Result<Option<Vec
             Created::Taken
         }));
     }
-    if new.first_epoch == 0 {
-        if used(tx, USED_GROUP, group)? {
-            return Ok(Err(Created::Taken));
-        }
-        return Ok(Ok(None));
+    if new.first_epoch == 0 && used(tx, USED_GROUP, group)? {
+        return Ok(Err(Created::Taken));
     }
-    let newest = tx
-        .query_row(
-            "SELECT box FROM mailboxes WHERE group_id = ?
-             ORDER BY created DESC, rowid DESC LIMIT 1",
-            [group],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(newest.map(Some).ok_or(Created::NoGroup))
+    Ok(Ok(moved_from))
 }
 
 /// Inserts a mailbox that [`check_new`] allowed, and its first token set.
@@ -1016,6 +1025,7 @@ mod tests {
             mailbox: BoxName::from_bytes([n; 16]),
             group_id: GroupId::from_bytes([n; 32]),
             first_epoch: 0,
+            moved_from: None,
             token_hash: TokenHash::from_bytes([n; 48]),
             created: "2026-11-09T00:00:00.000Z".parse::<Timestamp>().unwrap(),
         }
@@ -1064,32 +1074,52 @@ mod tests {
     }
 
     /// A group that moves gets a new mailbox with the same group id,
-    /// linked to the newest one it had (7.8).
+    /// linked to the one it moves from (7.8).
     #[test]
     fn groups_move_to_new_mailboxes() {
         let store = SqliteStore::open_in_memory().unwrap();
         let first = new_mailbox(1);
-        let moved = |n: u8, epoch: u64| NewMailbox {
+        let moved = |n: u8, epoch: u64, from: u8| NewMailbox {
             mailbox: BoxName::from_bytes([n; 16]),
             first_epoch: epoch,
+            moved_from: Some(BoxName::from_bytes([from; 16])),
             ..first.clone()
         };
-        // No mailbox of the group yet.
+        // No mailbox to move from yet, or none named.
         assert_eq!(
-            store.create_mailbox(&moved(2, 5)).unwrap(),
+            store.create_mailbox(&moved(2, 5, 1)).unwrap(),
             Created::NoGroup
         );
         store.create_mailbox(&first).unwrap();
+        let unnamed = NewMailbox {
+            moved_from: None,
+            ..moved(2, 5, 1)
+        };
+        assert_eq!(store.create_mailbox(&unnamed).unwrap(), Created::NoGroup);
+        // Another group's mailbox is no mailbox of this one.
+        store.create_mailbox(&new_mailbox(7)).unwrap();
         assert_eq!(
-            store.create_mailbox(&moved(2, 5)).unwrap(),
+            store.create_mailbox(&moved(2, 5, 7)).unwrap(),
+            Created::NoGroup
+        );
+        assert_eq!(
+            store.create_mailbox(&moved(2, 5, 1)).unwrap(),
             Created::Created
         );
-        let second = store.mailbox(&moved(2, 5).mailbox).unwrap().unwrap();
+        let second = store.mailbox(&moved(2, 5, 1).mailbox).unwrap().unwrap();
         assert_eq!(second.first_epoch, 5);
         assert_eq!(second.moved_from, Some(first.mailbox));
         assert_eq!(second.group_id, first.group_id);
         // A box is never used again, moves included.
-        assert_eq!(store.create_mailbox(&moved(2, 9)).unwrap(), Created::Taken);
+        assert_eq!(
+            store.create_mailbox(&moved(2, 9, 1)).unwrap(),
+            Created::Taken
+        );
+        // A move from the moved mailbox.
+        assert_eq!(
+            store.create_mailbox(&moved(3, 9, 2)).unwrap(),
+            Created::Created
+        );
         // The first epoch's set has the hash.
         let epoch: i64 = store
             .raw()
@@ -1275,6 +1305,7 @@ mod tests {
         let moved = NewMailbox {
             mailbox: BoxName::from_bytes([2; 16]),
             first_epoch: 5,
+            moved_from: Some(first.mailbox),
             ..first.clone()
         };
         assert_eq!(store.create_mailbox(&moved).unwrap(), Created::Created);
@@ -1284,11 +1315,15 @@ mod tests {
             ..moved.clone()
         };
         assert_eq!(store.create_mailbox(&other_epoch).unwrap(), Created::Taken);
+        // Another group cannot move from this one's mailbox.
         let other_group = NewMailbox {
             group_id: GroupId::from_bytes([9; 32]),
             ..moved.clone()
         };
-        assert_eq!(store.create_mailbox(&other_group).unwrap(), Created::Taken);
+        assert_eq!(
+            store.create_mailbox(&other_group).unwrap(),
+            Created::NoGroup
+        );
         // Without epoch, a box seen before is taken.
         assert_eq!(store.create_mailbox(&first).unwrap(), Created::Taken);
     }

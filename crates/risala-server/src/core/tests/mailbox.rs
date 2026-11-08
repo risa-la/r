@@ -244,7 +244,7 @@ impl Direct {
 }
 
 /// CREATE's first form, and the boxes and group ids it never takes twice
-/// (5.2); with `epoch`, a group that moves (7.8).
+/// (5.2); with `epoch`, `from` and `token`, a group that moves (7.8).
 #[tokio::test]
 async fn create() {
     let mut h = Harness::new();
@@ -252,55 +252,76 @@ async fn create() {
     let (mut guest, _) = h.guest("sam").await;
     let gid1 = GroupId::from_bytes([1; 32]);
     let gid2 = GroupId::from_bytes([2; 32]);
-    let token = hash([9; 48]);
+    // The send token of epoch 0, and its hash.
+    let token0 = risala_proto::mls::SendToken::from_bytes([5; 32]);
+    let hash0 = token0.hash();
     let (m1, m2, m3) = (mailbox(1), mailbox(2), mailbox(3));
-    h.send(&anon, &format!("CREATE {m1} {gid1} {token}")).await;
+    h.send(&anon, &format!("CREATE {m1} {gid1} {hash0}")).await;
     assert_eq!(anon.lines(), ["OK"]);
     // A guest creates its report conversation's mailbox the same way (4.2).
-    h.send(&guest, &format!("CREATE {m2} {gid2} {token}")).await;
+    h.send(&guest, &format!("CREATE {m2} {gid2} {hash0}")).await;
     assert_eq!(guest.lines(), ["OK"]);
     for line in [
-        format!("CREATE {m1} {} {token}", GroupId::from_bytes([3; 32])),
-        format!("CREATE {m3} {gid1} {token}"),
-        format!("CREATE {m1} {gid1} {token} epoch=4"),
+        format!("CREATE {m1} {} {hash0}", GroupId::from_bytes([3; 32])),
+        format!("CREATE {m3} {gid1} {hash0}"),
+        format!("CREATE {m1} {gid1} {hash0} epoch=1 from={m1} token={token0}"),
     ] {
         h.send(&anon, &line).await;
         assert_eq!(anon.lines(), ["ERR name-taken"], "{line}");
     }
-    // A move needs a mailbox of the group (7.8).
-    h.send(
-        &anon,
-        &format!(
-            "CREATE {m3} {} {token} epoch=4",
-            GroupId::from_bytes([3; 32])
+    // A move needs `from` to be a mailbox of the group, and a token of the
+    // epoch before in its set (7.8).
+    let wrong = risala_proto::mls::SendToken::from_bytes([6; 32]);
+    for (line, want) in [
+        (
+            format!(
+                "CREATE {m3} {gid1} {hash0} epoch=1 from={} token={token0}",
+                mailbox(9)
+            ),
+            "ERR not-found",
         ),
-    )
-    .await;
-    assert_eq!(anon.lines(), ["ERR not-found"]);
-    h.send(&anon, &format!("CREATE {m3} {gid1} {token} epoch=4"))
-        .await;
+        (
+            format!("CREATE {m3} {gid1} {hash0} epoch=1 from={m2} token={token0}"),
+            "ERR not-found",
+        ),
+        (
+            format!("CREATE {m3} {gid1} {hash0} epoch=1 from={m1} token={wrong}"),
+            "ERR stale",
+        ),
+        (
+            format!("CREATE {m3} {gid1} {hash0} epoch=2 from={m1} token={token0}"),
+            "ERR stale",
+        ),
+    ] {
+        h.send(&anon, &line).await;
+        assert_eq!(anon.lines(), [want], "{line}");
+    }
+    let hash1 = hash([8; 48]);
+    let moving = format!("CREATE {m3} {gid1} {hash1} epoch=1 from={m1} token={token0}");
+    h.send(&anon, &moving).await;
     assert_eq!(anon.lines(), ["OK"]);
     // Two members who both move create the same box: OK, and nothing
     // changes (7.8).
-    h.send(&guest, &format!("CREATE {m3} {gid1} {token} epoch=4"))
-        .await;
+    h.send(&guest, &moving).await;
     assert_eq!(guest.lines(), ["OK"]);
-    h.send(&guest, &format!("CREATE {m3} {gid1} {token} epoch=5"))
-        .await;
-    assert_eq!(guest.lines(), ["ERR name-taken"]);
     let record = h.store.mailbox(&m3).unwrap().unwrap();
-    assert_eq!((record.first_epoch, record.moved_from), (4, Some(m1)));
+    assert_eq!((record.first_epoch, record.moved_from), (1, Some(m1)));
+    assert!(
+        h.store
+            .has_token(&m3, 1, &TokenHash::from_bytes([8; 48]))
+            .unwrap()
+    );
     // A box is never used again, even once its mailbox is gone (5.2).
     assert!(drop_mailbox(h.inner(), &m2, "").await.unwrap());
     h.send(
         &anon,
-        &format!("CREATE {m2} {} {token}", GroupId::from_bytes([5; 32])),
+        &format!("CREATE {m2} {} {hash0}", GroupId::from_bytes([5; 32])),
     )
     .await;
     assert_eq!(anon.lines(), ["ERR name-taken"]);
     // A signed-in connection creates only public rooms (13).
     let mut alice = h.signed_in_as("alice@example.org");
-    h.send(&alice, &format!("CREATE {} {gid1} {token}", mailbox(4)))
+    h.send(&alice, &format!("CREATE {} {gid1} {hash0}", mailbox(4)))
         .await;
     assert_eq!(alice.lines(), ["ERR wrong-connection"]);
 }
@@ -652,13 +673,15 @@ async fn moves() {
     d.alice.merge(&mut d.a, &out);
     // The mover gives a wrong hash for epoch 2.
     let new = mailbox(2);
-    h.send(
-        &anon,
-        &format!("CREATE {new} {} {} epoch=2", gid(&d.a), hash([6; 48])),
-    )
-    .await;
+    let (group, old) = (gid(&d.a), d.m);
+    let create = |m: BoxName| {
+        format!(
+            "CREATE {m} {group} {} epoch=2 from={old} token={token1}",
+            hash([6; 48]),
+        )
+    };
+    h.send(&anon, &create(new)).await;
     assert_eq!(anon.lines(), ["OK"]);
-    let _ = out;
     let message = d.alice.send(&mut d.a, b"moved");
     let token2 = d.alice.token(&d.a);
     let hash2 = d.alice.token_hash(&d.a);
@@ -679,16 +702,15 @@ async fn moves() {
     assert_eq!(anon.lines(), ["ERR stale"]);
     // Once the old mailbox is gone, nothing can be checked against it.
     let newer = mailbox(3);
-    h.send(
-        &anon,
-        &format!("CREATE {newer} {} {} epoch=2", gid(&d.a), hash([6; 48])),
-    )
-    .await;
+    h.send(&anon, &create(newer)).await;
     assert_eq!(anon.lines(), ["OK"]);
-    assert!(drop_mailbox(h.inner(), &new, "").await.unwrap());
+    assert!(drop_mailbox(h.inner(), &d.m, "").await.unwrap());
     h.send(&anon, &format!("TOKEN {newer} 1 {token1} {hash2}"))
         .await;
     assert_eq!(anon.lines(), ["ERR stale"]);
+    // Nor can a move come from it.
+    h.send(&anon, &create(mailbox(4))).await;
+    assert_eq!(anon.lines(), ["ERR not-found"]);
 }
 
 /// A cid makes resending safe: within 24 hours the same cid gets the
@@ -1088,6 +1110,7 @@ async fn follow_limit() {
                 mailbox: BoxName::from_bytes(bytes),
                 group_id: GroupId::from_bytes(gid),
                 first_epoch: 0,
+                moved_from: None,
                 token_hash: TokenHash::from_bytes([1; 48]),
                 created: T.parse().unwrap(),
             })
@@ -1182,6 +1205,7 @@ fn public_room(h: &Harness, n: u8, room: &str, members: &[&str]) -> BoxName {
             mailbox,
             group_id: GroupId::from_bytes([n; 32]),
             first_epoch: 0,
+            moved_from: None,
             token_hash: TokenHash::from_bytes([n; 48]),
             created: T.parse().unwrap(),
         })

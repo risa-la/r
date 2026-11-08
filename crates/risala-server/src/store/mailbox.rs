@@ -70,6 +70,8 @@ pub struct NewMailbox {
     /// The epoch it starts at: 0 for a new group, or the epoch of a move
     /// (7.8).
     pub first_epoch: u64,
+    /// For a move, the mailbox the group moves from (7.8).
+    pub moved_from: Option<BoxName>,
     /// The hash of the group's send token for that epoch (7.2).
     pub token_hash: TokenHash,
     /// When it was created.
@@ -84,7 +86,7 @@ pub enum Created {
     /// The box was seen before, or, for a new group, the group id was, or,
     /// for a public room, its name is in use (`ERR name-taken`, 5.2).
     Taken,
-    /// A move, but the server holds no mailbox of the group
+    /// A move, but the server holds no mailbox `moved_from` of the group
     /// (`ERR not-found`, 7.8).
     NoGroup,
     /// A move whose box is already the mailbox of that group from that
@@ -271,7 +273,7 @@ pub struct Expired {
 pub trait MailboxStore {
     /// Creates a mailbox (5.2): for a new group, unless its box or group
     /// id was seen before; or, with a first epoch over 0, for a group that
-    /// moves from the newest mailbox the server holds of it (7.8), unless
+    /// moves from `moved_from`, a mailbox of the same group (7.8), unless
     /// its box was seen before. The first epoch's set of token hashes gets
     /// `token_hash`.
     fn create_mailbox(&self, new: &NewMailbox) -> Result<Created>;

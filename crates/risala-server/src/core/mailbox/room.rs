@@ -402,6 +402,7 @@ pub(super) async fn create(
         mailbox,
         group_id,
         first_epoch: 0,
+        moved_from: None,
         token_hash,
         created: now,
     };
