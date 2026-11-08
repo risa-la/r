@@ -103,8 +103,10 @@ impl Client {
         let new_device = NewDevice::sign(content, &device, rnd()?);
         let secret = PairingSecret::generate().map_err(rng)?;
         let relay = secret.relay();
-        let data = relay.seal_new_device(&new_device);
         let code = secret.code(host, &new_device);
+        let data = relay
+            .seal_new_device(&new_device, &code)
+            .map_err(pairing_error)?;
 
         // The keys wait under a name of their own until the identity is
         // known.

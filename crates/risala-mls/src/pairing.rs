@@ -184,7 +184,10 @@ impl PairingSecret {
     }
 
     /// The PairingCode the new device shows (4.8): pairing through `host`,
-    /// with this secret, for `new_device`.
+    /// with this secret, for `new_device`. A device MUST make one code per
+    /// secret: the relay seals only the NewDevice its code names
+    /// ([`Relay::seal_new_device`]), under a nonce of zeros, so two codes
+    /// for two NewDevices would reuse it.
     pub fn code(&self, host: ServerAddr, new_device: &NewDevice) -> PairingCode {
         PairingCode {
             host,
@@ -327,11 +330,24 @@ impl Relay {
 
     /// Encrypts the new device's NewDevice, and returns the encoded
     /// SealedNewDevice, for `PAIR PUT new_id`. The key encrypts this one
-    /// message only: the same NewDevice gives the same bytes, which is what
-    /// a repeated PAIR PUT sends, and to send another the device starts
-    /// again with a new secret.
-    pub fn seal_new_device(&self, new_device: &NewDevice) -> Vec<u8> {
-        self.seal_new_device_bytes(new_device.encoded())
+    /// message only, under a nonce of zeros (4.8): the same NewDevice gives
+    /// the same bytes, which is what a repeated PAIR PUT sends, and to send
+    /// another the device starts again with a new secret. So sealing is
+    /// bound to `code`, the PairingCode of this relay's secret: it refuses
+    /// any NewDevice other than the one whose hash the code carries
+    /// ([`PairingError::Hash`]), since sealing two under one key would
+    /// reuse the nonce. Signing is hedged, so a NewDevice signed again is
+    /// another one.
+    pub fn seal_new_device(
+        &self,
+        new_device: &NewDevice,
+        code: &PairingCode,
+    ) -> Result<Vec<u8>, PairingError> {
+        let same_secret = PairingSecret::of_code(code).relay().new_id == self.new_id;
+        if !same_secret || !ct_eq(&sha384(new_device.encoded()), &code.keys_hash) {
+            return Err(PairingError::Hash);
+        }
+        Ok(self.seal_new_device_bytes(new_device.encoded()))
     }
 
     fn seal_new_device_bytes(&self, new_device: &[u8]) -> Vec<u8> {
@@ -761,17 +777,37 @@ mod tests {
         let code = code_of(&device);
         let relay = PairingSecret::of_code(&code).relay();
         assert_eq!(PairingSecret::of_code(&code), secret());
-        let data = relay.seal_new_device(&device);
+        let data = relay.seal_new_device(&device, &code).unwrap();
         // A SealedNewDevice: the version, the ciphertext's two-byte length,
         // then the ciphertext and its tag (4.8).
         assert_eq!(data.len(), 1 + 2 + new_device_bytes.len() + 16);
         assert_eq!(data[0], PAIRING_VERSION);
         assert_eq!(relay.open_new_device(&data, &code), Ok(device.clone()));
         // A repeated PAIR PUT sends the same bytes.
-        assert_eq!(relay.seal_new_device(&device), data);
+        assert_eq!(relay.seal_new_device(&device, &code).unwrap(), data);
+        // Only the NewDevice the code names is sealed, so the zero nonce is
+        // never used twice under one key (4.8): not another device's, nor
+        // the same content signed again, nor under another secret's code.
+        let other_device = new_device(10, &pairing_key(4));
+        assert_eq!(
+            relay.seal_new_device(&other_device, &code),
+            Err(PairingError::Hash)
+        );
+        assert_eq!(
+            relay.seal_new_device(&other_device, &code_of(&other_device)),
+            Ok(relay.seal_new_device_bytes(other_device.encoded()))
+        );
+        let elsewhere = PairingCode {
+            secret: Zeroizing::new([9; 32]),
+            ..code.clone()
+        };
+        assert_eq!(
+            relay.seal_new_device(&device, &elsewhere),
+            Err(PairingError::Hash)
+        );
         // Swapped keys: the server swapped the NewDevice for another, even
         // a well-signed one.
-        let other = relay.seal_new_device(&new_device(10, &pairing_key(4)));
+        let other = relay.seal_new_device_bytes(other_device.encoded());
         assert_eq!(
             relay.open_new_device(&other, &code),
             Err(PairingError::Hash)
@@ -824,14 +860,20 @@ mod tests {
         // another key, or with its attestation key as its pairing key.
         let forged = NewDevice::sign_deterministic(device.content().clone(), &device_key(10));
         assert_eq!(
-            relay.open_new_device(&relay.seal_new_device(&forged), &code_of(&forged)),
+            relay.open_new_device(
+                &relay.seal_new_device_bytes(forged.encoded()),
+                &code_of(&forged)
+            ),
             Err(PairingError::Signature)
         );
         let mut reused = device.content().clone();
         reused.pairing_key = reused.keys.attestation_key.clone();
         let reused = NewDevice::sign_deterministic(reused, &device_key(9));
         assert_eq!(
-            relay.open_new_device(&relay.seal_new_device(&reused), &code_of(&reused)),
+            relay.open_new_device(
+                &relay.seal_new_device_bytes(reused.encoded()),
+                &code_of(&reused)
+            ),
             Err(PairingError::Key("pairing key"))
         );
     }
@@ -1056,7 +1098,10 @@ mod tests {
         let secret = PairingSecret::generate().unwrap();
         let code = secret.code("example.org".parse().unwrap(), &device);
         let relay = secret.relay();
-        let put_new = (relay.new_id(), relay.seal_new_device(&device));
+        let put_new = (
+            relay.new_id(),
+            relay.seal_new_device(&device, &code).unwrap(),
+        );
         let qr = code.to_qr_text();
 
         // The other device scans the code, checks the keys, and replies.
@@ -1114,7 +1159,12 @@ mod tests {
         ck.hex("old_id", relay.old_id().as_bytes());
         ck.eq("old_id as a box", relay.old_id().to_string());
         ck.hex("old_key", &relay.old_key[..]);
-        let sealed_new = relay.seal_new_device(&new_device);
+        let sealed_new = relay
+            .seal_new_device(
+                &new_device,
+                &secret().code("chat.example.org".parse().unwrap(), &new_device),
+            )
+            .unwrap();
         ck.file(
             "SealedNewDevice of B.9's NewDevice",
             "sealed-newdevice.bin",
