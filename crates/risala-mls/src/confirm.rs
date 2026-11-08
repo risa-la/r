@@ -150,9 +150,19 @@ impl std::fmt::Debug for AttestationKey {
     }
 }
 
-/// An X-Wing shared secret, wiped when dropped.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// An X-Wing shared secret, wiped when dropped. `==` compares in constant
+/// time.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SharedSecret([u8; SHARED_SECRET_LEN]);
+
+impl PartialEq for SharedSecret {
+    /// Constant time.
+    fn eq(&self, other: &SharedSecret) -> bool {
+        crate::primitives::ct_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedSecret {}
 
 impl SharedSecret {
     fn from_slice(bytes: &[u8]) -> Option<SharedSecret> {

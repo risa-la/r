@@ -516,7 +516,9 @@ pub trait MessageHistory {
     }
 }
 
-/// A [`MessageHistory`] in memory.
+/// A [`MessageHistory`] in memory, for tests and short-lived tools: the ids
+/// of every message it has seen stay for as long as it lives, so a device
+/// keeps its history in its store instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryHistory {
     seen: BTreeSet<MessageId>,

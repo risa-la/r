@@ -1,9 +1,10 @@
-//! Building a KeyPackage or an external commit twice, so that its leaf
-//! can carry a device binding (12.3) of keys OpenMLS makes inside.
+//! Building a KeyPackage twice, so that its leaf can carry a device
+//! binding (12.3) of keys OpenMLS makes inside. (Public rooms' joins and
+//! external commits carry no binding, so only KeyPackages need this.)
 //!
 //! A device binding signs the init key and the leaf's encryption key, and
-//! sits in the KeyPackage's or the leaf node's extensions, which OpenMLS
-//! signs together with those keys. OpenMLS draws the keys from the
+//! sits in the KeyPackage's leaf node's extensions, which OpenMLS signs
+//! together with those keys. OpenMLS draws the keys from the
 //! provider's random source while it builds, and takes the extensions
 //! before. So this crate builds once with a random source seeded with
 //! fresh randomness, against a throwaway storage, to learn the keys; signs

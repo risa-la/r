@@ -21,9 +21,19 @@ pub const SEND_TOKEN_LABEL: &str = "risala/1 send";
 /// The length of a send token (7.2).
 pub const SEND_TOKEN_LEN: usize = 32;
 
-/// An epoch's send token (7.2). `Debug` does not show it.
-#[derive(Clone, PartialEq, Eq)]
+/// An epoch's send token (7.2), a bearer secret. `Debug` does not show it,
+/// and `==` compares in constant time.
+#[derive(Clone)]
 pub struct SendToken(Zeroizing<[u8; SEND_TOKEN_LEN]>);
+
+impl PartialEq for SendToken {
+    /// Constant time.
+    fn eq(&self, other: &SendToken) -> bool {
+        ct_eq(&self.0[..], &other.0[..])
+    }
+}
+
+impl Eq for SendToken {}
 
 impl std::fmt::Debug for SendToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -405,9 +405,19 @@ pub fn check_attest(
 // A device's own period keys
 
 /// A 32-byte seed that is wiped when dropped. Serialised as its bytes, for
-/// the device's store, which must keep it secret.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// the device's store, which must keep it secret. `==` compares in
+/// constant time.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Seed(pub(crate) [u8; SEED_LEN]);
+
+impl PartialEq for Seed {
+    /// Constant time.
+    fn eq(&self, other: &Seed) -> bool {
+        crate::primitives::ct_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Seed {}
 
 impl Drop for Seed {
     fn drop(&mut self) {
