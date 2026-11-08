@@ -13,7 +13,7 @@ use risala_mls::mldsa::SigningKey;
 
 use super::types::{ConversationId, DeviceId, Uid};
 use super::{Client, Result};
-use crate::keys::{KeyStore, key_seed};
+use crate::keys::{KeyNames, KeyStore};
 use crate::store::Tx;
 use crate::store::confirm::LeafConfirmation;
 use crate::sync::confirm::{Confirm, DevicesTable, OwnKeys};
@@ -127,8 +127,8 @@ pub struct ConfirmWarning {
 }
 
 /// This device's keys for leaf confirmation, from the platform key store:
-/// the device key under the identity's `key_id`, and the attestation key
-/// under `<key_id>.attest`, as the identity area (task C1) names them.
+/// the device key and the attestation key under the identity's `key_id`,
+/// as the identity area (task C1) names them ([`KeyNames`]).
 pub(crate) struct ClientKeys {
     keys: Arc<dyn KeyStore>,
 }
@@ -150,14 +150,15 @@ impl ClientKeys {
 
 impl OwnKeys for ClientKeys {
     fn device_key(&self, tx: &Tx<'_>, uid: &Uid) -> Option<SigningKey> {
-        let key = self.keys.load(&Self::key_id(tx, uid)?).ok()??;
-        Some(SigningKey::from_seed(*key_seed(&key)))
+        let names = KeyNames::new(Self::key_id(tx, uid)?);
+        let seed = self.keys.load_seed(&names.device()).ok()??;
+        Some(SigningKey::from_seed(*seed))
     }
 
     fn attestation_key(&self, tx: &Tx<'_>, uid: &Uid) -> Option<AttestationKey> {
-        let id = format!("{}.attest", Self::key_id(tx, uid)?);
-        let key = self.keys.load(&id).ok()??;
-        Some(AttestationKey::from_seed(key_seed(&key)))
+        let names = KeyNames::new(Self::key_id(tx, uid)?);
+        let seed = self.keys.load_seed(&names.attestation()).ok()??;
+        Some(AttestationKey::from_seed(seed))
     }
 }
 

@@ -4,6 +4,10 @@
 use super::*;
 use crate::store::Store;
 
+fn host() -> risala_proto::names::ServerAddr {
+    "chat.test".parse().unwrap()
+}
+
 fn uid(s: &str) -> Uid {
     s.parse().unwrap()
 }
@@ -34,7 +38,7 @@ fn status(store: &Store, identity: &RisalaIdentity) -> DeviceStatus {
 fn the_devices_table_names_current_devices() {
     let store = Store::open_in_memory().unwrap();
     let key = SigningKey::from_seed([7; 32]);
-    let device = DeviceId::of_device_key(key.public_key());
+    let device = key.device_id();
     let alice = RisalaIdentity::device(uid("alice@example.org"), device);
     assert_eq!(status(&store, &alice), DeviceStatus::Unknown);
 
@@ -42,10 +46,10 @@ fn the_devices_table_names_current_devices() {
     store
         .write(|tx| {
             tx.conn().execute(
-                "INSERT INTO devices (uid, device_id, device_key, attestation_key, label, added_by)
-                 VALUES ('alice@example.org', ?1, ?2, ?3, 'phone', x'00')",
+                "INSERT INTO devices (uid, device_id, device_key, attestation_key, label, added, state)
+                 VALUES ('alice@example.org', ?1, ?2, ?3, 'phone', 0, 'current')",
                 rusqlite::params![
-                    &device.0[..],
+                    &device.as_bytes()[..],
                     &key.public_key()[..],
                     attestation.public_key()
                 ],
@@ -62,12 +66,15 @@ fn the_devices_table_names_current_devices() {
     );
 
     // A device id that is not the hash of the key listed for it.
-    let wrong = RisalaIdentity::device(uid("alice@example.org"), DeviceId([0; 48]));
+    let wrong = RisalaIdentity::device(
+        uid("alice@example.org"),
+        risala_mls::identity::DeviceId::from_bytes([0; 48]),
+    );
     store
         .write(|tx| {
             tx.conn().execute(
-                "INSERT INTO devices (uid, device_id, device_key, attestation_key, label, added_by)
-                 VALUES ('alice@example.org', ?1, ?2, ?3, 'other', x'00')",
+                "INSERT INTO devices (uid, device_id, device_key, attestation_key, label, added, state)
+                 VALUES ('alice@example.org', ?1, ?2, ?3, 'other', 0, 'current')",
                 rusqlite::params![
                     &[0u8; 48][..],
                     &key.public_key()[..],
@@ -79,14 +86,20 @@ fn the_devices_table_names_current_devices() {
         .unwrap();
     assert_eq!(status(&store, &wrong), DeviceStatus::NotCurrent);
 
+    // Its record still pending (4.5): not known yet.
+    let set = |state: &str| {
+        store
+            .write(|tx| {
+                tx.conn()
+                    .execute("UPDATE devices SET state = ?1", [state])?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    set("pending");
+    assert_eq!(status(&store, &alice), DeviceStatus::Unknown);
     // Removed by a record.
-    store
-        .write(|tx| {
-            tx.conn()
-                .execute("UPDATE devices SET removed_by = x'01'", [])?;
-            Ok(())
-        })
-        .unwrap();
+    set("removed");
     assert_eq!(status(&store, &alice), DeviceStatus::NotCurrent);
     // A guest has no device.
     assert_eq!(
@@ -104,7 +117,7 @@ fn who_may_remove_an_impostor() {
     let owner = uid("owner@example.org");
     let moderator = uid("mod@example.org");
     let member = uid("member@example.org");
-    let mut room = RisalaConversation::private_room("chat.test", [1; 16], "room", &owner);
+    let mut room = RisalaConversation::private_room(host(), [1; 16], "room", &owner);
     room.mods.push(moderator.clone());
     let owner_leaf = leaf("owner@example.org");
     let mod_leaf = leaf("mod@example.org");
@@ -120,11 +133,11 @@ fn who_may_remove_an_impostor() {
     // Its own identity's leaf.
     assert!(may_remove(&room, &member, &member_leaf));
 
-    let direct = RisalaConversation::direct("chat.test", [1; 16], &owner, &member);
+    let direct = RisalaConversation::direct(host(), [1; 16], &owner, &member);
     assert!(may_remove(&direct, &member, &owner_leaf));
 
     let public =
-        RisalaConversation::public_room("chat.test", [1; 16], &"#lobby".parse().unwrap(), &owner);
+        RisalaConversation::public_room(host(), [1; 16], &"#lobby".parse().unwrap(), &owner);
     assert!(!may_remove(&public, &owner, &member_leaf));
 }
 

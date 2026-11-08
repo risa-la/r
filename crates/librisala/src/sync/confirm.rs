@@ -35,7 +35,7 @@ use risala_mls::confirm::{
 };
 use risala_mls::conversation::{ConfirmMode, ConversationKind, RisalaConversation, Role};
 use risala_mls::epochal::{self, PeriodKeyring, RevealRegistry};
-use risala_mls::identity::{DeviceId, RisalaIdentity};
+use risala_mls::identity::RisalaIdentity;
 use risala_mls::message::{Decrypted, MessageHistory as _, Order, PseudonymCheck, RisalaMessage};
 use risala_mls::mldsa::SigningKey;
 use risala_mls::openmls::group::MlsGroup;
@@ -94,57 +94,39 @@ pub(crate) trait Directory: Send + Sync {
     fn device(&self, tx: &Tx<'_>, identity: &RisalaIdentity) -> DeviceStatus;
 }
 
-/// The devices of the `devices` table, which the identity area (task C1)
-/// fills from accepted records. Until C1's own view is wired in (task C5),
-/// this reads the columns both its sketch and C1's table have, and treats
-/// a row as current unless it says otherwise (`state` in C1's table,
-/// `removed_by` in the sketch).
+/// The devices the identity area (task C1) keeps, from accepted records
+/// (4.4, 4.5): a device is current once its record is accepted, not known
+/// while it is pending, and not current once removed. C5 may replace this
+/// with C1's own checks of the key file.
 #[derive(Debug, Default)]
 pub(crate) struct DevicesTable;
 
 impl Directory for DevicesTable {
     fn device(&self, tx: &Tx<'_>, identity: &RisalaIdentity) -> DeviceStatus {
-        use rusqlite::OptionalExtension as _;
+        use crate::store::identity::DeviceState;
         let Some(device) = identity.device_id else {
             return DeviceStatus::NotCurrent;
         };
-        let row = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM devices WHERE uid = ?1 AND device_id = ?2",
-                rusqlite::params![identity.uid.as_str(), &device.0[..]],
-                |r| {
-                    let device_key: Vec<u8> = r.get("device_key")?;
-                    let attestation_key: Vec<u8> = r.get("attestation_key")?;
-                    // Some(true): current; Some(false): not; None: pending.
-                    let current = match r.get::<_, String>("state") {
-                        Ok(state) => match state.as_str() {
-                            "current" => Some(true),
-                            "pending" => None,
-                            _ => Some(false),
-                        },
-                        Err(_) => match r.get::<_, Option<Vec<u8>>>("removed_by") {
-                            Ok(Some(_)) => Some(false),
-                            _ => Some(true),
-                        },
-                    };
-                    Ok((device_key, attestation_key, current))
-                },
-            )
-            .optional();
-        match row {
-            Ok(Some((device_key, attestation_key, Some(true)))) => {
-                // The device id is the hash of its device key (4.4).
-                if DeviceId::of_device_key(&device_key) != device {
-                    return DeviceStatus::NotCurrent;
-                }
-                DeviceStatus::Current {
-                    device_key,
-                    attestation_key,
-                }
-            }
-            Ok(Some((_, _, Some(false)))) => DeviceStatus::NotCurrent,
-            _ => DeviceStatus::Unknown,
+        let Ok(devices) = tx.devices(identity.uid.as_str()) else {
+            return DeviceStatus::Unknown;
+        };
+        let Some(row) = devices
+            .into_iter()
+            .find(|d| d.device_id == *device.as_bytes())
+        else {
+            return DeviceStatus::Unknown;
+        };
+        // The device id is the hash of its device key (4.4).
+        if risala_mls::primitives::sha384(&row.device_key)[..] != device.as_bytes()[..] {
+            return DeviceStatus::NotCurrent;
+        }
+        match row.state {
+            DeviceState::Current => DeviceStatus::Current {
+                device_key: row.device_key,
+                attestation_key: row.attestation_key,
+            },
+            DeviceState::Pending => DeviceStatus::Unknown,
+            DeviceState::Removed => DeviceStatus::NotCurrent,
         }
     }
 }

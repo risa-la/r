@@ -205,9 +205,10 @@ impl World {
         let key = generate_device_key().unwrap();
         keys.save(uid, &key).unwrap();
         let attest = generate_device_key().unwrap();
-        keys.save(&format!("{uid}.attest"), &attest).unwrap();
+        keys.save(&crate::keys::KeyNames::new(uid).attestation(), &attest)
+            .unwrap();
         let signing = risala_mls::mldsa::SigningKey::from_seed(*key_seed(&key));
-        let device = risala_mls::identity::DeviceId::of_device_key(signing.public_key());
+        let device = signing.device_id();
         let attestation_key = AttestationKey::from_seed(key_seed(&attest))
             .public_key()
             .to_vec();
@@ -215,7 +216,7 @@ impl World {
             .lock()
             .unwrap()
             .devices
-            .insert(uid.to_owned(), device.0.to_vec());
+            .insert(uid.to_owned(), device.as_bytes().to_vec());
         let options = ClientOptions {
             keys,
             ca_verifier: Some(roots_ca_verifier([self.ca.cert.clone()]).unwrap()),
@@ -232,8 +233,9 @@ impl World {
             .store()
             .write(|tx| {
                 tx.conn().execute(
-                    "INSERT INTO identities (uid, device_id, key_id, created) VALUES (?1, ?2, ?3, 0)",
-                    rusqlite::params![uid, &device.0[..], uid],
+                    "INSERT INTO identities (uid, device_id, key_id, home, created)
+                     VALUES (?1, ?2, ?3, 'chat.test', 0)",
+                    rusqlite::params![uid, &device.as_bytes()[..], uid],
                 )?;
                 Ok(())
             })
@@ -252,7 +254,7 @@ impl World {
             uid: uid.to_owned(),
             client,
             account,
-            device_id: device.0,
+            device_id: *device.as_bytes(),
             device_key: signing.public_key().to_vec(),
             attestation_key,
         }
@@ -329,25 +331,17 @@ impl World {
 }
 
 /// Tells `p`'s cache of another device, as the identity area does once it
-/// has accepted its record (4.4, 4.5): the columns of the identity area's
-/// sketch, or of its own table.
+/// has accepted its record (4.4, 4.5).
 fn add_device(p: &Person, uid: &str, device_id: &[u8], device_key: &[u8], attestation_key: &[u8]) {
     p.client
         .store()
         .write(|tx| {
-            let sketch = tx.conn().execute(
-                "INSERT INTO devices (uid, device_id, device_key, attestation_key, label, added_by)
-                 VALUES (?1, ?2, ?3, ?4, 'test', x'00')",
+            tx.conn().execute(
+                "INSERT INTO devices
+                     (uid, device_id, device_key, attestation_key, label, added, state)
+                 VALUES (?1, ?2, ?3, ?4, 'test', 0, 'current')",
                 rusqlite::params![uid, device_id, device_key, attestation_key],
-            );
-            if sketch.is_err() {
-                tx.conn().execute(
-                    "INSERT INTO devices
-                         (uid, device_id, device_key, attestation_key, label, added, state)
-                     VALUES (?1, ?2, ?3, ?4, 'test', 0, 'current')",
-                    rusqlite::params![uid, device_id, device_key, attestation_key],
-                )?;
-            }
+            )?;
             Ok(())
         })
         .unwrap();
