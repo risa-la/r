@@ -145,12 +145,20 @@ messages (5.4), and posts expire with retention (7.5).
 ADMIN UNREGISTER <uid>
 ```
 
-- **`ADMIN UNREGISTER`** deletes a hosted identity (4.7), as UNREGISTER
-  (4.9) does: the server stops publishing its key file and answers 410
-  for it, and closes its connections. Its records stay in the log.
-  - The server SHOULD NOT let anyone register the same name again. Other
-    servers and devices would take the new owner for the old one, or see
-    a fork (4.5).
+- **`ADMIN UNREGISTER`** deletes an identity, as UNREGISTER (4.9) does,
+  and closes its connections.
+  - For a hosted identity (4.7), the server stops publishing its key
+    file and answers 410 for it, unless its chain ends with a `retire`
+    record (4.9). Its records stay in the log. An operator has none of
+    the identity's keys, so this only makes its keys missing to others
+    (4.4): their devices stop sending to it and warn, but remove nothing.
+  - The name cannot be registered again: the log refuses a second first
+    `master` record for it (4.5, 4.9).
+  - For an identity the server does not host, it also clears the
+    server's pin (4.6), so that the identity can sign in again with
+    whatever chain its domain now serves. Operators do this after
+    checking with the identity's owner, since a chain that does not
+    extend the pin may be an attack.
 
 Operators cannot add or remove an identity's keys, and so cannot help
 someone who has lost every device and the recovery key. That person

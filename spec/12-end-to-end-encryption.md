@@ -268,7 +268,9 @@ KEYPKG GET <uid>
   current device of `<uid>` (4.4) that has a KeyPackage, then `OK`. It
   works on any kind of connection, and a device SHOULD send it on an
   anonymous one, since it shows whom the device is about to talk to. A
-  uid the server does not know gets `ERR not-found`. If the server
+  uid the server does not know gets `ERR not-found`. An identity whose
+  keys are missing to the server (4.4, 4.6) has no current devices, so
+  it gets no KEYPKG lines. If the server
   cannot fetch the key file (4.4) and has no cached copy still valid, it
   replies `ERR unavailable` rather than hand out KeyPackages of devices
   that may have been removed.
@@ -436,9 +438,10 @@ epoch the commit is for. A commit that fails any of them is invalid,
 and the device ignores it (7.2):
 
 - **Adds.** Each added KeyPackage is valid MLS with an acceptable
-  lifetime (12.5), and its device binding verifies under the device key
-  of a device that the credential's identity has added in its key file
-  and whose record is in the key log (4.5). Who may add:
+  lifetime (12.5). Its device binding verifies under the device key of a
+  current device (4.4) of the credential's identity, whose record the
+  device has accepted (4.5), and its `device_id` is the credential's
+  `device_id`. Who may add:
   - a device of the committer's own identity, by anyone in the group;
   - in a direct conversation, a device of either participant, and of
     nobody else;
@@ -447,9 +450,17 @@ and the device ignores it (7.2):
     invitation), never of a banned one;
   - in a public room, a guest by external commit or proposal, if
     `guests` is not `none`.
+- **Committer.** The committer's device has not been removed by record
+  (4.4) in its identity's chain, as far as the device has accepted it.
+  A commit, proposal or application message from a leaf of a device
+  removed by record is invalid, and a device MUST NOT show such a
+  message (12.9).
 - **Removes.** Each removed leaf is:
-  - a leaf of the committer's own identity;
-  - a leaf whose device has been removed from its identity's key file;
+  - a leaf of the committer's own identity, if the committer's device is
+    current;
+  - a leaf whose device has been removed by record (4.4), which includes
+    every leaf of an identity whose chain ends with a `retire` record.
+    An identity whose keys are missing (4.4) loses no leaf for that;
   - in a room, a leaf of an identity that an owner or moderator kicks or
     bans, as 6.3 and 6.4 allow;
   - a leaf that has posted a SelfRemove;
@@ -477,6 +488,11 @@ and the device ignores it (7.2):
 - **Size.** The group stays within the limits of 6.1.
 - **Next token.** The RisalaAAD's `next_token_hash` matches the epoch
   the commit creates (12.6).
+
+A device that sees a commit by a leaf of its own identity that removes
+another leaf of its identity, whose device is still current, without
+adding that device again in the same commit, tells the user, as for
+ALERT (4.5): it may be a stolen device racing its own removal (4.8).
 
 Some of these checks need a key file or the key log. A device never
 holds a commit back for them: the first valid commit of an epoch wins
@@ -526,19 +542,27 @@ A device that joins a public room for the first time has nothing to
 compare with, and takes the roles that the GroupInfo shows (Section
 14).
 
-**Adding devices.** Every device of an identity that is current, logged
-and has no leaf in one of the identity's groups gets added:
+**Adding devices.** Every device of an identity that is current, whose
+record has been accepted (4.5), and that has no leaf in one of the
+identity's groups gets added:
 
-- A device of the same identity adds it, as soon as it learns of it, for
-  example right after pairing (4.8).
+- A device of the same identity adds it as soon as it has accepted its
+  record, which is usually within a minute of pairing (4.5, 4.8), not
+  before: members who cannot yet accept the record would see a leaf
+  they cannot check, and stop sending.
 - Otherwise, any member's device that finds it, when it checks key
   files (12.14), adds it after a random wait of up to an hour, unless
   someone has done so first. This is how a device that recovered an
   identity (4.8) gets back into its conversations.
-- A device that commits the removal of an identity's removed devices
-  adds that identity's current devices without a leaf in the same
-  commit, so that the identity never drops out of the group by
+- A device that commits the removal of an identity's devices removed by
+  record adds that identity's current devices without a leaf in the
+  same commit, so that the identity never drops out of the group by
   accident.
+
+A device adds another identity's devices only from a key file that
+extends the head it holds for that identity (4.5), never a device it has
+once seen removed by record, and none while the identity is stale (4.5)
+or its keys are missing (4.4).
 
 **Replacing stale leaves.** A device that has been offline for longer
 than retention cannot catch up from the server (7.5). Its leaves are
@@ -745,9 +769,11 @@ the table does not allow them.
 | `ATTEST <period> <period-key> <certificate> <attestation>`, `REVEAL <period> <seed>` | groups whose `confirm` is `epochal` | 12.10 |
 | `READ <box> <seq>` | the conversation with yourself | 7.7 |
 | `BLOCK <target>`, `UNBLOCK <target>` | the conversation with yourself | 5.7 |
-| `RECORD <hash>`, `ALERT <hash>` | the conversation with yourself | 4.5 |
+| `RECORD <hash>`, `ALERT <hash>`, `RECORDS [<hashes>]` | the conversation with yourself | 4.5 |
 | `SIGNINGKEY <seed>`, `BACKUPKEY <generation> <key>` | the conversation with yourself | 4.8, 12.13 |
 | `WANT <box> <after> <before>`, `TRANSFER <ref>` | the conversation with yourself | 12.13 |
+| `SERVERS <hosts>` | the conversation with yourself | 12.13 |
+| `PIN <uid> <master> <origin> <head> <verified>` | the conversation with yourself | 4.5, 12.14 |
 
 A TEXT line may carry these tags:
 
@@ -767,14 +793,41 @@ For example, a reply as it appears inside the encryption:
 @reply=0Jx1HkY3x9z2b5R0qWm1fA== TEXT see you at 12
 ```
 
-In RECORD and ALERT, `<hash>` is a record's SHA-384 hash as a blob-ref
-(3.5). In SIGNINGKEY, `<seed>` is the new device-signing key's 32-byte
-seed, and in BACKUPKEY, `<key>` is a backup key (12.13), each in base64
-with padding. Devices accept the lines of the conversation with
-yourself only from leaves of their own identity that they have
-confirmed (12.10), and send SIGNINGKEY and BACKUPKEY only while every
-leaf in that conversation is confirmed, since every leaf there reads
-them.
+The lines of the conversation with yourself:
+
+- In RECORD and ALERT, `<hash>` is a record's SHA-384 hash as a blob-ref
+  (3.5).
+- `RECORDS` without hashes asks the identity's other devices which
+  records they know were announced (4.5). A device answers with
+  `RECORDS` followed by the hashes, as blob-refs separated by spaces, of
+  every record of the chain that it knows was announced with RECORD.
+- In SIGNINGKEY, `<seed>` is the new device-signing key's 32-byte seed,
+  in base64 with padding. A device accepts it only if the seed derives
+  the device-signing key of the newest `signing` or `master` record of
+  the chain that it has accepted, and ignores it otherwise.
+- In BACKUPKEY, `<key>` is a backup key (12.13), in base64 with padding.
+  A device accepts it only if `<generation>` is the chain's generation
+  (4.4).
+- `SERVERS` lists the hosts of the servers the identity uses, separated
+  by spaces, its home first (12.13). A device that starts or stops using
+  a server sends the new list. Every device keeps KeyPackages on each
+  of them (12.5).
+- `PIN` carries a pin (4.5) and the verified mark (12.14) of another
+  identity: `<master>` is the SHA-384 hash of the pinned master key and
+  `<head>` the hash of the head record, each as a blob-ref; `<origin>`
+  is the pinned log's origin; and `<verified>` is `yes` or `no`. A
+  device sends it when it pins an identity or a pin or mark changes,
+  and for every identity it has pinned when a new device of its own
+  identity joins the conversation with yourself. A device that receives
+  it still checks the identity's records itself: it takes the master
+  key and log as its pin if it has none, treats a different master key
+  than its own pin as a new master key (12.14), and moves its head
+  forward only to records it has accepted.
+
+Devices accept the lines of the conversation with yourself only from
+leaves of their own identity that they have confirmed (12.10), and send
+SIGNINGKEY and BACKUPKEY only while every leaf in that conversation is
+confirmed, since every leaf there reads them.
 
 ### 12.10. Confirming Leaves
 
@@ -1015,12 +1068,14 @@ history of a conversation exists only on its members' devices. It
 reaches a new device in two ways: from the identity's other devices,
 and from a backup.
 
-**The conversation with yourself.** An identity's devices share a
-direct conversation of their own (5.1) on each server they use. They
-use it to keep each other up to date: read markers (7.7), blocks (5.7),
-records they make (4.5), new device-signing keys (4.8), backup keys
-(below), and requests for history and transfers (below), as lines
-inside the encryption (12.9).
+**The conversation with yourself.** An identity's devices share one
+direct conversation of their own (5.1), on the identity's **home**
+server: the first in its SERVERS list (12.9) and in the IdentityBundle's
+`hosts` (4.8). They use it to keep each other up to date: the servers
+they use, read markers (7.7), blocks (5.7), records they make (4.5),
+pins (12.14), new device-signing keys (4.8), backup keys (below), and
+requests for history and transfers (below), as lines inside the
+encryption (12.9).
 
 **History archives.** History travels as HistoryArchives:
 
@@ -1161,10 +1216,17 @@ key can read it. Servers MUST support backups.
   generation, since the removed or lost device knew the old backup key.
 - **Backup keys.** A backup key is derived from the recovery key with
   HKDF-SHA384 [RFC5869]: HKDF-Expand(HKDF-Extract("", recovery key),
-  info, 32), where `info` is `risala/1 backup `, the uid, a space, and
-  the generation in decimal. Every device keeps the current
-  generation's backup key, which it got at pairing or in a BACKUPKEY
-  line, but never the recovery key.
+  info, 32), where `info` is `risala/1 backup `, the uid, a space, and a
+  **generation** number in decimal. The generation is the chain's
+  (4.4), so no server can choose it: it starts at 0, and each `signing`
+  record and each later `master` record moves to the next one. So
+  removing a device, recovering an identity and changing the recovery
+  key all move to the next generation (4.8), since the removed device
+  knew the old key. The device that publishes the record that moves to
+  a new generation MUST replace the current backup at once with one
+  under it. Every device
+  keeps the current generation's backup key, which it got at pairing or
+  in a BACKUPKEY line, but never the recovery key.
 - **Making a backup.** At most once a day, one device of the identity
   builds archives of everything it has, with the files it chooses, and
   stores them as blobs. It then wraps the first archive's key under the
@@ -1227,7 +1289,9 @@ the identity (4.8):
    comes from the log, not from the server, so a server cannot hand it
    a backup made with a key that a removed or lost device holds.
 3. It derives that generation's backup key, checks that the wrapped
-   key's `version` is 1, unwraps it, and opens the archives.
+   key's `version` is 1, unwraps it, and opens the archives. A backup
+   made before the recovery key was changed (4.8) needs the old recovery
+   key.
 4. It shows when the backup was made, from the first archive's `made`,
    which the wrap covers through the blob's hash. Within one generation
    the server can still hand out an older backup than the newest
@@ -1249,13 +1313,28 @@ A device does not take the server's word for which keys belong to whom:
 
 - It fetches key files itself, under the rules of 4.4, and checks every
   record it acts on against the key log (4.5).
-- For each identity it shares a conversation with, it SHOULD fetch the
-  key file again at least once a day. It then removes the leaves of
-  devices that have been removed, and adds devices that have none
-  (12.7). A failed fetch changes nothing.
+- It SHOULD fetch the key file again at least once a day for each
+  identity it shares a direct conversation or a private room with, and
+  for each sender in a public room whose leaf it has confirmed in the
+  current period (12.10). It spreads these fetches over the day at
+  random times, and checks the identity's freshness each time (4.5).
+- After a fetch, it removes the leaves of devices removed by record, and
+  adds devices that have none (12.7). If the identity's keys are missing
+  (4.4), it removes nothing, but stops sending in each direct
+  conversation and private room where the identity has a leaf, shows a
+  warning in public rooms, and tells the user that the identity's key
+  file is missing, until a valid key file is back. An outage changes
+  nothing.
+- These fetches tell the host of each key file and log which network
+  addresses look up which identities, and how often (Section 14). A
+  device SHOULD fetch whole entry bundles and tiles rather than single
+  entries, so that a log learns less about which records it reads.
 - Clients SHOULD show each identity's devices, and tell the user when one
   is added or removed. A new device under the same master key is a
-  notice, not a warning.
+  notice, not a warning. A device is shown by its label, the date of its
+  record and a short id, the first 8 characters of its device id in
+  lower-case base32 [RFC4648], since a label alone can imitate another
+  device. Labels are compared and shown as display names are (8.2).
 
 **Safety numbers.** Each identity has one **safety number**, which
 covers its master key and its uid, and so all of its devices:
@@ -1285,11 +1364,20 @@ struct {
 
 Two people compare safety numbers through another channel, for example
 in person, by scanning each other's codes. A client then marks the
-identity as **verified**.
+identity as **verified**. A device that has just met an identity cannot
+tell whether the chain it was shown is the one the identity's owner
+watches (4.3, Section 14), so users SHOULD compare safety numbers before
+they trust a new direct conversation, and clients SHOULD suggest it.
+
+Verifying a safety number vouches for the identity's master key. The
+devices added under it are trusted on the strength of the key log and of
+the owner's own devices watching it (4.5), and a new one is a notice.
 
 - A **new master key** (4.5) clears "verified". In a direct
   conversation and in a private room, the device stops sending until the
   user acknowledges the new key. In a public room, it shows a warning.
-- A new log for the identity counts as a new master key (4.5).
-- A fork (4.5) stops sending as 4.5 says, whether or not the identity was
-  verified.
+- A fork or a rollback (4.5) stops sending as 4.5 says, whether or not
+  the identity was verified.
+- The pins and verified marks of an identity's devices are kept in step
+  with PIN lines (12.9), so that a new device does not meet its user's
+  contacts afresh.

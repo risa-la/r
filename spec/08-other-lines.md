@@ -138,7 +138,8 @@ INFO is allowed before signing in. It returns these values:
 | `anon=yes` or `anon=no` | Whether anonymous connections are allowed (4.2). A server that allows none cannot carry conversations |
 | `guests=yes` or `guests=no` | Whether guests are allowed |
 | `register=<domain>` or `register=no` | The identity domain for REGISTER, or `no` if the server offers no registration or it is closed right now |
-| `log=<url>` or `log=no` | The URL prefix of the server's key log (4.5), or `no` if it keeps none |
+| `log=<url>` or `log=no` | The URL prefix of the server's current key log (4.5), or `no` if it keeps none |
+| `log-key=<vkey>` | The signed-note verifier key of that log (4.4), present only with `log=<url>` |
 | `retention=<days>` | How long posts, files and blobs are kept (7.5) |
 | `push=yes` or `push=no` | Whether PUSH is supported |
 | `upload=<bytes>` or `upload=no` | The largest file UPLOAD accepts, or `no` if the server offers no uploads (5.6) |

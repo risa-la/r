@@ -32,11 +32,16 @@
   Neither is assigned by IANA yet. [MLS-EXT] replaced the earlier
   `last_resort` extension (`0x000A`) with them in draft-11.
 - **Signed-note signature type** of the key log's own checkpoint
-  signature: `0x06`, timestamped ML-DSA-44 [SIGNED-NOTE] (4.5).
+  signature and of its witnesses' cosignatures: `0x06`, timestamped
+  ML-DSA-44 [SIGNED-NOTE] [TLOG-COSIGNATURE] (4.5, 4.10).
+- **Key file record types** (4.4): `master` 1, `signing` 2, `device` 3,
+  `log` 4 and `retire` 5. **Key log entry types** (4.5): `record` 1 and
+  `handoff` 2. The value 0 of each is reserved.
 - **Labels.** All of them carry the protocol version (2.4):
   - the MLS exporter label `risala/1 send` (7.2);
-  - the RisalaSign labels `record` (4.4), `keypackage` (12.3), `period`
-    and `attest` (12.10), each signed with the prefix `risala/1 ` (4.3);
+  - the RisalaSign labels `record` (4.4), `pair` (4.8), `keypackage`
+    (12.3), `period` and `attest` (12.10), each signed with the prefix
+    `risala/1 ` (4.3);
   - the HKDF info strings `risala/1 identity ` and `risala/1 backup `
     followed by the uid (4.8, 12.13), `risala/1 pair new id`,
     `risala/1 pair new key`, `risala/1 pair old id` and
@@ -44,8 +49,12 @@
   - the associated data `risala/1 pair` (4.8), `risala/1 file` and
     `risala/1 archive` (12.11, 12.13), and the prefix
     `risala/1 backup ` (12.13);
+  - the HPKE `info` and `psk_id` `risala/1 pair` (4.8);
   - the sign-in prefix `risala-auth-1` (4.6), and the safety number label
     `risala-fp-1` (12.14).
 - **Text formats:** the key file's first line `risala-keys/1` (4.4), the
   QR code prefixes `RISALA-PAIR:` (4.8) and `RISALA-FP:` (12.14), and the
   key log origin path `/risala-log/<n>` (4.5).
+- **HTTPS paths:** under a key log's URL prefix, `risala/uid/<hash>` and
+  `risala/next` (4.5); under a witness's URL prefix, `risala/handoff`
+  (4.10).

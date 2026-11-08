@@ -30,9 +30,9 @@ kind until it closes:
   guest name for public rooms.
 
 Until it becomes one of them, the server accepts only INFO without a
-room, ANON, GUEST, AUTH, REGISTER, PING, PONG and QUIT. It replies
-`ERR not-authenticated` to anything else, and to a command that needs a
-kind of connection this one is not (Section 13).
+room, ANON, GUEST, AUTH, REGISTER, KEYS PUT, PAIR, PING, PONG and QUIT.
+It replies `ERR not-authenticated` to anything else, and to a command
+that needs a kind of connection this one is not (Section 13).
 
 A device keeps one signed-in connection and at least one anonymous
 connection open while it is online. Section 14 says what the server can

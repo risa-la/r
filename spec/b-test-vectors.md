@@ -138,13 +138,19 @@ Test vectors for the formats below will be added. They need values
 made by an implementation of this document, which does not exist yet:
 
 - RisalaSign (4.3), and the encoding and signature of each kind of
-  Record (4.4)
-- a whole key file, valid and invalid (4.4)
-- a key log entry, a checkpoint with the log's ML-DSA-44 signature, and
-  an inclusion and a consistency proof (4.5)
-- the derivation of the master key from a recovery key (4.8)
+  Record (4.4), with a LogKey and its `log` line, and a device id
+- a whole key file, valid, and one that fails for each rule of 4.4's
+  parsing and replaying, and a chain's generation (4.4)
+- a key log entry of each type, a checkpoint with the log's ML-DSA-44
+  signature, an inclusion and a consistency proof, a hand-off, and a
+  `risala/uid/` hint (4.5, 4.10)
+- the `<keyfile>` of REGISTER and the `<records>` of KEYS PUT (4.7)
+- a recovery key in its text form, and the derivation of the master key
+  from it (4.8)
 - a PairingCode and its QR text, the keys and ids derived from the
-  pairing secret, and an encrypted NewDevice and IdentityBundle (4.8)
+  pairing secret, a signed NewDevice and its encryption, and a
+  SealedBundle from a fixed X-Wing seed and encapsulation randomness
+  (4.8)
 - the send token export and its hash (7.2)
 - the group id, epoch, content type and RisalaAAD that a server reads
   from a PrivateMessage and from a PublicMessage (5.2)

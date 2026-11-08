@@ -76,13 +76,22 @@
   RFC 9420, July 2023.
 - [RFC9525] Saint-Andre, P. and R. Salz, "Service Identity in TLS",
   RFC 9525, November 2023.
-- [SIGNED-NOTE] C2SP, "signed-note", https://c2sp.org/signed-note.
-- [TLOG-CHECKPOINT] C2SP, "tlog-checkpoint",
-  https://c2sp.org/tlog-checkpoint.
-- [TLOG-COSIGNATURE] C2SP, "tlog-cosignature",
+- [SIGNED-NOTE] C2SP, "signed-note", version 1, as of November 2026,
+  https://c2sp.org/signed-note.
+- [TLOG-CHECKPOINT] C2SP, "tlog-checkpoint", version 1, as of November
+  2026, https://c2sp.org/tlog-checkpoint.
+- [TLOG-COSIGNATURE] C2SP, "tlog-cosignature", version 1 with ML-DSA-44
+  cosignatures (type `0x06`), as of November 2026,
   https://c2sp.org/tlog-cosignature.
-- [TLOG-TILES] C2SP, "tlog-tiles", https://c2sp.org/tlog-tiles.
-- [TLOG-WITNESS] C2SP, "tlog-witness", https://c2sp.org/tlog-witness.
+- [TLOG-TILES] C2SP, "tlog-tiles", version 1, as of November 2026,
+  https://c2sp.org/tlog-tiles.
+- [TLOG-WITNESS] C2SP, "tlog-witness", version 1, as of November 2026,
+  https://c2sp.org/tlog-witness.
+
+  C2SP specifications are versioned by tags such as
+  `tlog-cosignature@v1.1.0`. Implementations pin the tag of each that
+  they implement, and a later tag of one of them takes a new version of
+  this document.
 - [XWING] Connolly, D., Schwabe, P., and B. Westerbaan, "X-Wing: general-
   purpose hybrid post-quantum KEM", Internet-Draft
   draft-connolly-cfrg-xwing-kem-06, work in progress.

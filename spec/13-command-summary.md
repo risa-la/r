@@ -14,8 +14,8 @@ guest.
 | `GUEST <name> [token=]` | 4.2 | ✓ | | | |
 | `AUTH <identity> <signature>` | 4.6 | ✓ | | | |
 | `REGISTER <name> <keyfile> <signature>` | 4.7 | ✓ | | | |
-| `KEYS PUT <keyfile>` | 4.7 | | ✓ | | ✓ |
-| `PAIR PUT <id> <data>` / `PAIR GET <id>` | 4.8 | | ✓ | | ✓ |
+| `KEYS PUT <after> <records>` | 4.7 | ✓ | ✓ | | ✓ |
+| `PAIR PUT <id> <data>` / `PAIR GET <id>` | 4.8 | ✓ | ✓ | | ✓ |
 | `UNREGISTER <uid>` | 4.9 | | | | ✓ |
 | `CREATE <box> <group-id> <token-hash>` | 5.2 | | ✓ | | |
 | `CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>` | 5.2 | | | | ✓ |

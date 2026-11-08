@@ -104,11 +104,11 @@ After the TLS handshake, both sides exchange lines.
   relays a client's text.
 - **Long lines.** Lines that carry MLS data, key files or reports
   (Sections 4, 5.8 and 12) may be longer:
-  - From a client, a line whose verb is CREATE, KEYPKG, KEYS, POST,
-    REPORT or WELCOME may be up to 1 MiB (1048576 bytes) including the
-    LF.
-  - From a server, a line whose verb is GROUPINFO, KEYPKG, POST, REPORT
-    or WELCOME may be up to 1 MiB plus 16384 bytes.
+  - From a client, a line whose verb is CREATE, KEYPKG, KEYS, PAIR,
+    POST, REPORT or WELCOME may be up to 1 MiB (1048576 bytes)
+    including the LF.
+  - From a server, a line whose verb is GROUPINFO, KEYPKG, PAIR, POST,
+    REPORT or WELCOME may be up to 1 MiB plus 16384 bytes.
   - Anything larger travels as a blob over HTTPS, and the line carries
     its hash instead (12.12).
   - The data that makes these lines long always comes after the verb.
@@ -118,7 +118,8 @@ After the TLS handshake, both sides exchange lines.
     does not end within the normal limit is too long.
   - Before a connection has signed in, or become anonymous or a guest
     (4.1), the server applies the normal limits to every line, except
-    that REGISTER may be up to 65536 bytes, for its key file (4.7).
+    that REGISTER, KEYS and PAIR may be up to 65536 bytes, for their
+    records (4.7) and pairing messages (4.8).
   - The lines inside an encrypted message have their own limits (12.9).
 - **Bad lines.** A server that receives a line that is too long MUST
   discard everything up to the next LF and reply `ERR too-long`. It MAY
@@ -144,7 +145,8 @@ whose ALPN identifier is `risala/1` (2.1).
   older version that its peer did not ask for.
 - Every label that this document puts in front of signed, MACed or
   derived bytes starts with `risala/1 `, such as `risala/1 send` (7.2).
-  The one older label, `risala-auth-1` (4.6), carries its version too.
+  The two older labels, `risala-auth-1` (4.6) and `risala-fp-1`
+  (12.14), carry their version too.
 - Every binary structure that this document defines to be sent or
   stored on its own starts with a one-byte `version`, which is 1 here.
   Structures that are only signed, MACed or hashed carry the version in
