@@ -411,6 +411,7 @@ impl Inner {
             Err(SignInRefused::NameTaken) => {
                 Err(fail(ErrorCode::NameTaken, "a guest has that name"))
             }
+            Err(SignInRefused::Forbidden(why)) => Err(fail(ErrorCode::Forbidden, why)),
             Err(SignInRefused::Gone) => Ok(None),
         }
     }

@@ -210,6 +210,7 @@ impl Inner {
         };
         let (host, nonce) = self.host_and_nonce(challenge)?;
         let uid = identity.to_uid();
+        self.check_not_banned(&uid)?;
         // Held from here to the end, so that an UNREGISTER that starts
         // meanwhile marks this very entry, and the sign-in sees it (4.8).
         let user = self.pin(&uid);
@@ -337,6 +338,8 @@ impl Inner {
                 // and the row touched above, once this lets go of the lock.
                 return Err(being_deleted());
             }
+            // A server ban made meanwhile (10.2): see `admin`.
+            self.check_not_banned(uid)?;
             if !reg.attach(id, uid, Some(key)) {
                 // The connection closed meanwhile.
                 return Ok(None);
@@ -360,7 +363,7 @@ impl Inner {
 
     /// Closes the connections of `uid` signed in with a device key for
     /// which `removed` is true, with BYE (4.4, 4.7).
-    fn close_keys(&self, uid: &Uid, removed: impl Fn(&PublicKey) -> bool) {
+    pub(super) fn close_keys(&self, uid: &Uid, removed: impl Fn(&PublicKey) -> bool) {
         let mut reg = self.reg();
         let Some(user) = reg.users.get(uid).cloned() else {
             return;
@@ -460,6 +463,7 @@ impl Inner {
                 )
             })?;
         let uid = Identity::new(&name, &domain).to_uid();
+        self.check_not_banned(&uid)?;
         // The signature proves the client holds the key (4.6).
         if verify(host, nonce, uid.clone(), signature, vec![key.clone()])
             .await
@@ -588,7 +592,7 @@ impl Inner {
     /// Publishes the key file after a change to its keys (4.6, 4.7). The
     /// change is stored either way; a failure to publish is
     /// `ERR internal`, and the next change or restart publishes again.
-    async fn republish(&self, uid: &Uid, keys: Vec<HostedKey>) -> Outcome {
+    pub(super) async fn republish(&self, uid: &Uid, keys: Vec<HostedKey>) -> Outcome {
         match self.publish(uid, keys).await {
             Ok(()) => Ok(Some(OkResponse::new())),
             Err(_) => Err(fail(

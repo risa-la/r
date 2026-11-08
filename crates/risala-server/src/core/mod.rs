@@ -232,6 +232,9 @@ pub(crate) struct Inner {
     identity_domain: Option<Domain>,
     /// The operators (10.1): from the configuration, and from the store.
     operators: RwLock<BTreeSet<Uid>>,
+    /// Server bans (10.2), and the lock the ADMIN commands change things
+    /// under.
+    admin_state: admin::AdminState,
     /// Held while the keys of a hosted identity change and its key file is
     /// published, so that the files are published in the order of the
     /// changes.
@@ -406,6 +409,7 @@ impl Hub {
             .chain(store.operators()?)
             .collect();
         let identity_domain = config.identity_domain();
+        let admin_state = admin::AdminState::load(&*store)?;
         // The key files of hosted identities, again, in case they were
         // lost or the publisher keeps them in memory (4.6), and none of
         // the names no longer hosted, in case removing one failed (4.8).
@@ -436,6 +440,7 @@ impl Hub {
                     keys,
                     identity_domain,
                     operators: RwLock::new(operators),
+                    admin_state,
                     keys_lock: tokio::sync::Mutex::new(()),
                     registrations: rate::WindowLimit::new(identity::REGISTRATION_WINDOW),
                     room_creations: rate::WindowLimit::new(commands::ROOM_CREATION_WINDOW),
@@ -847,8 +852,12 @@ impl Inner {
         new_token: Id,
     ) -> Result<SignIn, SignInRefused> {
         let mut reg = self.reg();
-        if !reg.conns.contains_key(&id) {
+        let Some(conn) = reg.conns.get(&id) else {
             return Err(SignInRefused::Gone);
+        };
+        // Under the registry's lock: see `admin`.
+        if let Some(why) = self.guest_refused(conn.info.peer.ip()) {
+            return Err(SignInRefused::Forbidden(why));
         }
         let resumed = match reg.sessions.get_mut(uid) {
             Some(session) if !session.ending && token.is_some_and(|t| session.token_is(t)) => {
@@ -906,6 +915,8 @@ pub(crate) enum SignInRefused {
     NameTaken,
     /// The connection has closed.
     Gone,
+    /// Guests are not allowed, or not from this address (10.2, 10.6).
+    Forbidden(&'static str),
 }
 
 impl Handler for Hub {

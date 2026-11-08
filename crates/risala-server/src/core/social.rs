@@ -348,7 +348,7 @@ impl Inner {
     /// Queues the lines of a response that may be longer than the room the
     /// network layer keeps for one, in chunks, as SYNC does. Returns
     /// `false` if the connection went away meanwhile.
-    async fn reply_all(&self, reply: &Reply, lines: Vec<ServerLine>) -> bool {
+    pub(super) async fn reply_all(&self, reply: &Reply, lines: Vec<ServerLine>) -> bool {
         let chunk = self.config.limits.reply_lines().saturating_sub(1).max(1);
         for (n, line) in lines.into_iter().enumerate() {
             if n > 0 && n % chunk == 0 && !self.wait_for_reply_room(&reply.handle).await {
