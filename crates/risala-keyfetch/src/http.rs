@@ -251,6 +251,29 @@ impl<S: AsyncRead + Unpin> Reader<'_, S> {
         }
     }
 
+    /// Reads the line ending, CRLF or LF, that follows a chunk's data. The
+    /// CR may come at the end of one read and the LF in the next.
+    async fn chunk_end(&mut self) -> Result<(), FetchError> {
+        loop {
+            match self.buf.as_slice() {
+                [b'\n', ..] => {
+                    self.buf.drain(..1);
+                    return Ok(());
+                }
+                [b'\r', b'\n', ..] => {
+                    self.buf.drain(..2);
+                    return Ok(());
+                }
+                [] | [b'\r'] => {
+                    if !self.fill().await? {
+                        return Err(FetchError::BadResponse("chunked body cut short"));
+                    }
+                }
+                _ => return Err(FetchError::BadResponse("chunk not followed by CRLF")),
+            }
+        }
+    }
+
     /// Takes `n` bytes, which must arrive before the stream ends.
     async fn take(&mut self, n: usize) -> Result<Vec<u8>, FetchError> {
         while self.buf.len() < n {
@@ -312,11 +335,7 @@ impl<S: AsyncRead + Unpin> Reader<'_, S> {
                 return Err(TooLarge);
             }
             body.extend(self.take(size).await?);
-            if !self.line(0).await?.is_empty() {
-                return Err(Failed(FetchError::BadResponse(
-                    "chunk not followed by CRLF",
-                )));
-            }
+            self.chunk_end().await?;
         }
     }
 }
@@ -401,6 +420,77 @@ mod tests {
         )
         .await;
         assert_eq!(ok(r), "ok");
+    }
+
+    /// A stream whose reads return the pieces it holds, one each, and
+    /// which takes whatever is written to it.
+    struct Pieces(std::collections::VecDeque<Vec<u8>>);
+
+    impl AsyncRead for Pieces {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(mut piece) = self.0.pop_front() {
+                let n = piece.len().min(buf.remaining());
+                buf.put_slice(&piece[..n]);
+                if n < piece.len() {
+                    self.0.push_front(piece.split_off(n));
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Pieces {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A chunked body reads the same however the reads split it: between
+    /// a chunk's CR and LF too.
+    #[tokio::test]
+    async fn chunked_bodies_split_anywhere() {
+        let response: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+            5;x=y\r\nhello\r\n1\r\n \r\n5\nworld\n0\r\nX-T: 1\r\n\r\n";
+        let want = Ok(Got::Body(b"hello world".to_vec()));
+        for i in 1..response.len() {
+            let reads = [response[..i].to_vec(), response[i..].to_vec()];
+            let got = get(&mut Pieces(reads.into()), "example.org", "/", 100).await;
+            assert_eq!(got, want, "split at {i}");
+        }
+        let mut bytes = Pieces(response.iter().map(|&b| vec![b]).collect());
+        assert_eq!(get(&mut bytes, "example.org", "/", 100).await, want);
+        // What follows a chunk's data is still checked.
+        let bad: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhix\r\n0\r\n\r\n";
+        for i in 1..bad.len() {
+            let reads = [bad[..i].to_vec(), bad[i..].to_vec()];
+            let got = get(&mut Pieces(reads.into()), "example.org", "/", 100).await;
+            assert_eq!(
+                got,
+                Err(FetchError::BadResponse("chunk not followed by CRLF")),
+                "split at {i}"
+            );
+        }
     }
 
     #[tokio::test]
