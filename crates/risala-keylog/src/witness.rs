@@ -11,9 +11,10 @@
 //! A witnessed checkpoint is **fresh** when k of the cosignatures that
 //! count are less than 24 hours old (SPEC 4.5, "Freshness"). Logs get a
 //! new witnessed checkpoint at least daily, so a device whose newest
-//! checkpoint of a log is not fresh treats the log's new records as
-//! pending, and does not count an identity's view as refreshed (SPEC
-//! 4.10).
+//! checkpoint of a log is not fresh does not count an identity's view as
+//! refreshed (SPEC 4.10). It still accepts records that a witnessed
+//! checkpoint includes: accepting needs a witnessed checkpoint, not a
+//! fresh one (SPEC 4.5).
 
 use std::collections::BTreeSet;
 
@@ -116,8 +117,8 @@ pub enum WitnessError {
     /// [TLOG-CHECKPOINT] forbids.
     #[error("two signatures from one key")]
     DuplicateSignature,
-    /// A signature from a key the device knows does not verify, so the
-    /// whole note is rejected [SIGNED-NOTE].
+    /// The log's own signature does not verify. (A witness's cosignature
+    /// that does not verify only does not count, SPEC 4.5.)
     #[error("the signature of {0} does not verify")]
     BadSignature(String),
     /// The log has not signed it.
@@ -342,9 +343,13 @@ impl WitnessPolicy {
                 continue;
             }
             for sig in sigs.iter().filter(|s| w.matches(s)) {
-                let ts = w
-                    .verify(cp, sig)
-                    .map_err(|_| WitnessError::BadSignature(w.name().to_owned()))?;
+                // A cosignature that does not verify simply does not count
+                // (SPEC 4.5): otherwise whoever can add a line to a
+                // checkpoint in transit or in a cache could make a fully
+                // witnessed one fail.
+                let Ok(ts) = w.verify(cp, sig) else {
+                    continue;
+                };
                 if freshness.counts(ts) {
                     cosigned.push((w.name().to_owned(), ts));
                 }
@@ -553,13 +558,24 @@ mod tests {
     fn rejects_bad_known_signatures() {
         let s = setup();
         let at = Freshness::at(NOW);
+        // A witness's cosignature that does not verify does not count, but
+        // does not spoil the others (SPEC 4.5).
         let mut sc = signed(&s, &cp(), &[(0, NOW), (1, NOW)]);
+        let mut bad = s.witnesses[2].cosign(&cp(), NOW, [0; 32]);
+        bad.signature[100] ^= 1;
+        sc.push_signature(bad).unwrap();
+        let witnessed = s
+            .policy
+            .verify(&s.key, sc.to_text().as_bytes(), at)
+            .unwrap();
+        assert_eq!(witnessed.witnesses().len(), 2);
+        let mut sc = signed(&s, &cp(), &[(0, NOW)]);
         let mut bad = s.witnesses[2].cosign(&cp(), NOW, [0; 32]);
         bad.signature[100] ^= 1;
         sc.push_signature(bad).unwrap();
         assert_eq!(
             s.policy.verify(&s.key, sc.to_text().as_bytes(), at),
-            Err(WitnessError::BadSignature("witness2.example/w".into()))
+            Err(WitnessError::NotEnoughWitnesses { have: 1, need: 2 })
         );
 
         // A bad log signature.

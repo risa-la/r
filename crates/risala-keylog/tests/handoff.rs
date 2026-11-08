@@ -92,7 +92,6 @@ fn a_host_hands_off_and_a_device_follows() {
         i1,
         &h1,
         &mut set.reader(size),
-        NOW,
     )
     .unwrap();
     assert_eq!(got, r1);
@@ -105,7 +104,6 @@ fn a_host_hands_off_and_a_device_follows() {
             i1,
             &h0,
             &mut set.reader(size),
-            NOW
         ),
         Err(AcceptError::WrongRecord)
     );
@@ -185,7 +183,6 @@ fn a_host_hands_off_and_a_device_follows() {
             i0,
             &h0,
             &mut set.reader(cp1.checkpoint().size()),
-            NOW + 30 * 24 * HOUR,
         ),
         Ok(r0)
     );
@@ -208,11 +205,12 @@ fn a_host_hands_off_and_a_device_follows() {
             i2,
             &h2,
             &mut set.reader(1),
-            NOW + HOUR,
         ),
         Ok(r2.clone())
     );
-    // A day later, without a new checkpoint, log 2's records are pending.
+    // A day later, without a new checkpoint, log 2's view is not fresh, but
+    // its records are still accepted: that needs a witnessed checkpoint,
+    // not a fresh one (SPEC 4.5).
     assert_eq!(
         accept_record(
             &mut view2,
@@ -221,11 +219,11 @@ fn a_host_hands_off_and_a_device_follows() {
             i2,
             &h2,
             &mut set.reader(1),
-            NOW + 25 * HOUR,
         ),
-        Err(AcceptError::NotFresh)
+        Ok(r2.clone())
     );
-    // A new checkpoint makes them fresh again.
+    assert!(!view2.is_fresh(NOW + 25 * HOUR));
+    // A new checkpoint makes the view fresh again.
     let served2 = publish(&log2, &mut ws, NOW + 25 * HOUR);
     let cp2 = policy
         .verify(
@@ -242,7 +240,6 @@ fn a_host_hands_off_and_a_device_follows() {
             i2,
             &h2,
             &mut set.reader(1),
-            NOW + 25 * HOUR,
         ),
         Ok(r2)
     );

@@ -437,11 +437,11 @@ pub fn accept_entry<R: HashReader>(
 /// it is in `checkpoint`'s tree, which is consistent with the newest the
 /// device has seen.
 ///
-/// Last, the view must be fresh at `now` ([`LogView::is_fresh`]): if the
-/// newest checkpoint the device has of the log does not have k
-/// cosignatures less than 24 hours old, the record stays pending (SPEC
-/// 4.10), with [`AcceptError::NotFresh`]. The view keeps a newer
-/// consistent checkpoint even then.
+/// Accepting a record needs a witnessed checkpoint, not a fresh one (SPEC
+/// 4.5): freshness ([`LogView::is_fresh`]) matters for refreshing an
+/// identity's view and for watching one's own records, not here. So a log
+/// whose witnesses are slow for a day does not leave every record in it
+/// pending, and every device removing its leaves (12.7).
 ///
 /// Step 1 (the key file is valid and extends the device's head) and step 5
 /// (the device accepted each hand-off between the log the chain names and
@@ -453,7 +453,6 @@ pub fn accept_record<R: HashReader>(
     index: u64,
     hash: &[u8; RECORD_HASH_LEN],
     reader: &mut R,
-    now: u64,
 ) -> Result<Vec<u8>, AcceptError<R::Error>> {
     let record = match LogEntry::decode(entry).map_err(AcceptError::Entry)? {
         LogEntry::Record(r) => r,
@@ -463,9 +462,6 @@ pub fn accept_record<R: HashReader>(
         return Err(AcceptError::WrongRecord);
     }
     accept_entry(view, checkpoint, entry, index, reader)?;
-    if !view.is_fresh(now) {
-        return Err(AcceptError::NotFresh);
-    }
     Ok(record)
 }
 
@@ -546,8 +542,4 @@ pub enum AcceptError<E> {
     /// The hand-off is not the checkpoint's last entry.
     #[error("the hand-off is not the checkpoint's last entry")]
     NotLastEntry,
-    /// The view of the log is not fresh, so the record stays pending (SPEC
-    /// 4.10).
-    #[error("no fresh witnessed checkpoint of the log; the record is pending")]
-    NotFresh,
 }

@@ -518,7 +518,6 @@ mod tests {
             0,
             record.hash().hash(),
             &mut set.reader(1),
-            now(),
         )
         .unwrap();
         // The hint, over HTTPS too.

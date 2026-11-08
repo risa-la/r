@@ -471,7 +471,6 @@ async fn a_witnessed_checkpoint_proves_records() {
             index,
             record.hash().hash(),
             &mut set.reader(260),
-            now(&hub),
         )
         .unwrap();
         assert_eq!(got, record.encoded());
@@ -702,16 +701,7 @@ async fn a_hand_off_end_to_end() {
     )
     .await;
     let e = entry(&hub, 2, 0, 1).await;
-    accept_record(
-        &mut view2,
-        w2,
-        &e,
-        0,
-        r.hash().hash(),
-        &mut set.reader(1),
-        now(&hub),
-    )
-    .unwrap();
+    accept_record(&mut view2, w2, &e, 0, r.hash().hash(), &mut set.reader(1)).unwrap();
 
     // Log 1 is done: later rounds leave it alone, and witnesses cosign no
     // larger tree of it.
