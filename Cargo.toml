@@ -6,6 +6,7 @@ members = [
     "crates/risala-server",
     "crates/librisala", "crates/risala-cli",
     "crates/risala-keyfetch",
+    "crates/risala-pow",
 ]
 
 [workspace.package]

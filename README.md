@@ -99,6 +99,11 @@ address, every day from 1970 to 9999, every name of a few bytes. Only
 proofs that finish in under a minute are kept. CI runs them in the
 `kani` job.
 
+`risala-pow` has proofs in `crates/risala-pow/src/proofs.rs`. They cover
+every seed, not just small ones: every program is well formed, no
+instruction can panic, scratchpad reads and writes stay in bounds, and
+the puzzle's block arithmetic cannot overflow.
+
 Kani is not in nixpkgs. Its release bundle and the nightly toolchain it
 downloads are ordinary Linux binaries, which run on NixOS through
 nix-ld. Install them somewhere outside the repository, so nothing global
@@ -120,6 +125,7 @@ Then, with the same variables set, from the repository root:
 ```
 cargo kani -p risala-proto -j 2 --output-format terse -Z unstable-options --harness-timeout 2m
 cargo kani -p risala-proto --harness proofs::ip_prefix_v6
+cargo kani -p risala-pow -j 2 --output-format terse -Z unstable-options --harness-timeout 2m
 ```
 
 The full run takes about two minutes. Keep `-j` small: each proof runs

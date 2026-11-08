@@ -1304,6 +1304,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "risala-pow"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "risala-proto"
 version = "0.0.0"
 dependencies = [
