@@ -85,7 +85,10 @@ CREATE TABLE gaps (
 -- 'live' (the same, posted with live=yes), 'commit' (post is the commit,
 -- next its next hash, welcome the Welcome, intent what it does so that it
 -- can be made again if it loses, 7.2), 'proposal' (a SelfRemove, posted
--- again in each new epoch until applied, 6.1). epoch is the epoch post
+-- again in each new epoch until applied, 6.1), 'update' (an Update
+-- proposal of the own leaf in an epochal group, body the seed of its new
+-- leaf key if it has one, groupinfo its ProposalRef once made, 12.10), 'external' (an external commit to a public room, already
+-- merged here, posted with the token `-`, 12.7). epoch is the epoch post
 -- was made for. state: 'queued', 'sent' (POST in flight), 'posted' (OK
 -- seq=), 'done' (applied in order: won, or seen), 'lost' (a commit that
 -- lost its epoch, or was refused). not_before delays a retry. A move's
@@ -94,7 +97,8 @@ CREATE TABLE gaps (
 CREATE TABLE outbox (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     conv       INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    kind       TEXT NOT NULL CHECK (kind IN ('message', 'live', 'commit', 'proposal')),
+    kind       TEXT NOT NULL
+               CHECK (kind IN ('message', 'live', 'commit', 'proposal', 'update', 'external')),
     message_id BLOB,
     body       BLOB,
     epoch      INTEGER,
@@ -163,7 +167,9 @@ CREATE TABLE welcomes_out (
     secret     BLOB NOT NULL,
     welcome    BLOB NOT NULL,
     send_after INTEGER NOT NULL,
-    in_flight  INTEGER NOT NULL DEFAULT 0
+    in_flight  INTEGER NOT NULL DEFAULT 0,
+    uid        TEXT,
+    device     BLOB
 );
 ";
 
@@ -327,6 +333,10 @@ pub enum OutboxKind {
     Commit,
     /// A proposal, a SelfRemove.
     Proposal,
+    /// An Update proposal of the own leaf, in an epochal group (12.10).
+    Update,
+    /// An external commit to a public room, merged already (12.7).
+    External,
 }
 
 impl OutboxKind {
@@ -336,6 +346,8 @@ impl OutboxKind {
             OutboxKind::Live => "live",
             OutboxKind::Commit => "commit",
             OutboxKind::Proposal => "proposal",
+            OutboxKind::Update => "update",
+            OutboxKind::External => "external",
         }
     }
 
@@ -345,6 +357,8 @@ impl OutboxKind {
             "live" => OutboxKind::Live,
             "commit" => OutboxKind::Commit,
             "proposal" => OutboxKind::Proposal,
+            "update" => OutboxKind::Update,
+            "external" => OutboxKind::External,
             other => return Err(StoreError::Corrupt(format!("outbox kind {other:?}"))),
         })
     }
@@ -461,6 +475,9 @@ pub struct WelcomeOut {
     pub secret: Vec<u8>,
     /// The sealed Welcome.
     pub welcome: Vec<u8>,
+    /// The added device, by uid and device id, to add again if the server
+    /// refuses the Welcome (12.8); `None` for a public room's.
+    pub device: Option<(Uid, [u8; 48])>,
 }
 
 /// A gap in a sender's messages (7.4).
@@ -918,7 +935,8 @@ impl Tx<'_> {
 
     // ---- Welcomes to send
 
-    /// Queues a sealed Welcome, to send after `send_after` (12.8).
+    /// Queues a Welcome, to send after `send_after` (12.8), for the device
+    /// `device` if it is known.
     pub(crate) fn queue_welcome(
         &mut self,
         conv: ConversationId,
@@ -926,11 +944,34 @@ impl Tx<'_> {
         secret: &[u8],
         welcome: &[u8],
         send_after: u64,
+        device: Option<(&Uid, &[u8; 48])>,
     ) -> Result<(), StoreError> {
         self.conn().execute(
-            "INSERT INTO welcomes_out (conv, ref, secret, welcome, send_after)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![conv.0, reference, secret, welcome, send_after as i64],
+            "INSERT INTO welcomes_out (conv, ref, secret, welcome, send_after, uid, device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                conv.0,
+                reference,
+                secret,
+                welcome,
+                send_after as i64,
+                device.map(|(u, _)| u.as_str()),
+                device.map(|(_, d)| &d[..])
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Notes an Update proposal's ProposalRef, kept in its row's
+    /// `groupinfo` (12.3, 12.10).
+    pub(crate) fn set_outbox_reference(
+        &mut self,
+        id: i64,
+        reference: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE outbox SET groupinfo = ?2 WHERE id = ?1",
+            params![id, reference],
         )?;
         Ok(())
     }
@@ -945,17 +986,24 @@ impl Tx<'_> {
         let mut out = Vec::new();
         {
             let mut stmt = self.conn().prepare_cached(
-                "SELECT w.id, w.conv, w.ref, w.secret, w.welcome FROM welcomes_out w
-                 JOIN conversations c ON c.id = w.conv
+                "SELECT w.id, w.conv, w.ref, w.secret, w.welcome, w.uid, w.device
+                 FROM welcomes_out w JOIN conversations c ON c.id = w.conv
                  WHERE c.account = ?1 AND w.in_flight = 0 AND w.send_after <= ?2 ORDER BY w.id",
             )?;
             let rows = stmt.query_map(params![account.0, now as i64], |r| {
+                let uid: Option<String> = r.get(5)?;
+                let device: Option<Vec<u8>> = r.get(6)?;
+                let device = match (uid.and_then(|u| u.parse().ok()), device) {
+                    (Some(u), Some(d)) => <[u8; 48]>::try_from(d.as_slice()).ok().map(|d| (u, d)),
+                    _ => None,
+                };
                 Ok(WelcomeOut {
                     id: r.get(0)?,
                     conv: ConversationId(r.get(1)?),
                     reference: r.get(2)?,
                     secret: r.get(3)?,
                     welcome: r.get(4)?,
+                    device,
                 })
             })?;
             for row in rows {

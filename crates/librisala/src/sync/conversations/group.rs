@@ -216,6 +216,12 @@ pub(crate) fn create(
     tx.set_group_history(conv, &state)?;
     tx.add_mailbox(conv, &mailbox, true, 0, None)?;
     tx.sync_leaves(conv, &tree_leaves(&group))?;
+    if kind == ConvKind::Public {
+        // 6.1, 12.7: the room's group id by name, and its extension, to
+        // compare before joining again.
+        tx.set_room_group(cx.account, &ext.name, &group_id)?;
+        tx.set_kept_ext(conv, &ext.encode())?;
+    }
     if !adds.is_empty() {
         queue_intent(
             tx,
@@ -336,6 +342,10 @@ pub(crate) fn build_commit(
         })
         .map(|leaf| leaf.index)
         .collect();
+    let mut remove = remove;
+    if conv.kind == ConvKind::Public {
+        public_cleanup(&view, own, cx, &mut remove);
+    }
     let mut add = Vec::new();
     for fetched in &intent.add {
         let Some(kp) = read_kp(cx, &fetched.key_package) else {
@@ -479,6 +489,14 @@ pub(crate) fn apply_post(
 ) -> Result<Applied> {
     let mut applied = Applied::default();
     if !conv.state.in_group() {
+        // 6.1: a public room being joined: each commit may be the one that
+        // added the join's leaf.
+        if conv.state == ConvState::Joining
+            && let Ok((framing, _)) = read_post(&post.message)
+            && framing.content_type == ContentType::Commit
+        {
+            applied.notes.push(Note::JoinCheck { conv: conv.id });
+        }
         return Ok(applied);
     }
     let Ok((framing, _)) = read_post(&post.message) else {
@@ -562,6 +580,20 @@ pub(crate) fn apply_post(
                     tx.message_posted(conv.id, &id, post.seq, post_epoch, post.t)?;
                 }
             }
+            // Merged when it was made; the server took it (12.7).
+            OutboxKind::External => {
+                tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
+            }
+            OutboxKind::Update => {
+                // 12.3: a commit that applies it is judged by its post's t.
+                if post_epoch == epoch
+                    && let Some(reference) = &row.groupinfo
+                {
+                    state.note_proposal(reference, post.t);
+                    tx.set_group_history(conv.id, &state)?;
+                }
+                tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
+            }
         }
         return Ok(applied);
     }
@@ -582,10 +614,20 @@ pub(crate) fn apply_post(
                     // It fails MLS here: invalid for this device (12.7,
                     // "Commits a device cannot process").
                     tracing::debug!(error = %e, seq = post.seq, "a commit this device cannot process");
-                    applied.notes.push(Note::Unprocessable {
-                        conv: conv.id,
-                        epoch,
-                        seq: post.seq,
+                    applied.notes.push(if conv.kind == ConvKind::Public {
+                        // 12.7: the server took it, so the room cannot go
+                        // on from this epoch.
+                        Note::PublicStuck {
+                            conv: conv.id,
+                            epoch,
+                            seq: post.seq,
+                        }
+                    } else {
+                        Note::Unprocessable {
+                            conv: conv.id,
+                            epoch,
+                            seq: post.seq,
+                        }
                     });
                     return Ok(applied);
                 }
@@ -606,6 +648,13 @@ pub(crate) fn apply_post(
                         seq: post.seq,
                         reason: e.to_string(),
                     });
+                    if conv.kind == ConvKind::Public {
+                        applied.notes.push(Note::PublicStuck {
+                            conv: conv.id,
+                            epoch,
+                            seq: post.seq,
+                        });
+                    }
                     return Ok(applied);
                 }
             };
@@ -629,6 +678,16 @@ pub(crate) fn apply_post(
                 if report != risala_mls::checks::KeyReport::default() {
                     tracing::info!(?report, "a commit whose key checks need a repair");
                 }
+            }
+            // 12.7: a resync commit undoes a commit this device applied
+            // without trouble: possible abuse, by whoever made it.
+            if verdict.external == Some(risala_mls::checks::External::Resync)
+                && let Some(by) = commit.view.committer_uid()
+            {
+                applied.notes.push(Note::ResyncByOther {
+                    conv: conv.id,
+                    by: by.clone(),
+                });
             }
             let own_pending = tx
                 .pending_outbox(conv.id)?
@@ -671,6 +730,8 @@ pub(crate) fn apply_post(
                 return Ok(applied);
             }
             tx.set_prev_token(conv.id, old_token.as_bytes())?;
+            // 12.8: another leaf commits in this device's epoch.
+            tx.set_branch_seen(conv.id)?;
             note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
             after_commit(tx, cx, conv, &group, post, false, removed_ids, &mut applied)?;
             applied.notes.extend(
@@ -727,6 +788,9 @@ pub(crate) fn apply_post(
             log.finish()?;
             match received {
                 Ok(decrypted) => {
+                    if decrypted.epoch == epoch && decrypted.sender != group.own_leaf_index() {
+                        tx.set_branch_seen(conv.id)?;
+                    }
                     super::content::receive(
                         tx,
                         cx,
@@ -738,7 +802,7 @@ pub(crate) fn apply_post(
                         &mut applied,
                     )?;
                 }
-                Err(ReceiveError::Process(e)) if post_epoch > epoch => {
+                Err(ReceiveError::Process(e)) if post_epoch >= epoch => {
                     tracing::debug!(error = %e, "a message of a later epoch");
                     applied.notes.push(Note::Undecryptable {
                         conv: conv.id,
@@ -797,6 +861,10 @@ fn after_commit(
     if let Some(ext) = mls_group::conversation(group) {
         let room = (ext.kind == ConversationKind::PublicRoom).then(|| ext.name.clone());
         tx.set_conversation_info(conv.id, &ext.name, &ext.topic, room.as_deref())?;
+        if ext.kind == ConversationKind::PublicRoom {
+            // 12.7: the extension of the newest epoch applied and checked.
+            tx.set_kept_ext(conv.id, &ext.encode())?;
+        }
         // A move (7.8): the group's box changed.
         let new_box = box_of(&ext);
         let current = tx.current_mailbox(conv.id)?;
@@ -918,8 +986,18 @@ fn own_commit_won(
     if intent.new_leaf_key {
         tx.clear_last_resort(conv.id)?;
     }
-    if let Some(welcome) = &row.welcome {
-        // The KeyPackages the commit added, with their put secrets.
+    if conv.kind == ConvKind::Public {
+        // 12.8: one Welcome, not sealed, for every device the commit adds
+        // by join proposal, put under each one's ref on the signed-in
+        // connection, with the secret `-`, at once.
+        if let Some(welcome) = &row.welcome {
+            for reference in welcome_refs(welcome)? {
+                tx.queue_welcome(conv.id, &reference, &[], welcome, cx.now, None)?;
+            }
+        }
+    } else if let Some(welcome) = &row.welcome {
+        // The KeyPackages the commit added, with their put secrets and
+        // devices.
         let mut kps = Vec::new();
         let mut secrets = Vec::new();
         for fetched in &intent.add {
@@ -929,18 +1007,25 @@ fn own_commit_won(
             let Ok(reference) = kp.hash_ref(cx.crypto.as_ref()) else {
                 continue;
             };
+            let device = RisalaIdentity::from_credential(kp.leaf_node().credential())
+                .ok()
+                .and_then(|id| Some((id.uid, *id.device_id?.as_bytes())));
             if risala_mls::welcome::split_welcome(welcome, &[reference.as_slice()]).is_ok() {
-                secrets.push((reference.as_slice().to_vec(), fetched.secret.clone()));
+                secrets.push((
+                    reference.as_slice().to_vec(),
+                    fetched.secret.clone(),
+                    device,
+                ));
                 kps.push(kp);
             }
         }
         let sealed = risala_mls::welcome::seal_welcomes(cx.crypto.as_ref(), welcome, &kps)
             .map_err(|e| EngineError::Mls(e.to_string()))?;
         for s in sealed {
-            let secret = secrets
+            let (secret, device) = secrets
                 .iter()
-                .find(|(r, _)| *r == s.key_package_ref)
-                .map(|(_, secret)| secret.clone())
+                .find(|(r, ..)| *r == s.key_package_ref)
+                .map(|(_, secret, device)| (secret.clone(), device.clone()))
                 .unwrap_or_default();
             let wait = super::random_below(cx.config.max_welcome_wait_ms)?;
             tx.queue_welcome(
@@ -949,6 +1034,7 @@ fn own_commit_won(
                 &secret,
                 &s.sealed,
                 cx.now + wait,
+                device.as_ref().map(|(u, d)| (u, d)),
             )?;
         }
     }
@@ -983,8 +1069,13 @@ pub(crate) fn encrypt(
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
     let mut group = load(tx, cx, &conv.group_id)?;
     // Outside public rooms the pseudonym is derived from the epoch (7.3); a
-    // public room's is the period's, which leaf confirmation (C3) keeps.
-    let period = (conv.kind == ConvKind::Public).then_some(Pseudonym(conv.pseudonym));
+    // public room's is the period's: 16 random bytes, new each period
+    // (12.10), which leaf confirmation (C3) announces in ATTEST.
+    let period = if conv.kind == ConvKind::Public {
+        Some(period_pseudonym(tx, cx, conv)?)
+    } else {
+        None
+    };
     let post =
         mls_message::encrypt(&tx.mls(cx.crypto), &mut group, period, &message).map_err(mls)?;
     Ok((post, group.epoch().as_u64()))
@@ -1020,7 +1111,16 @@ pub(crate) enum Joined {
 /// Opens a sealed Welcome with one of this device's KeyPackages, and joins
 /// its group if it passes the checks of 12.7 and is not refused for a
 /// block (5.7) (12.8).
-pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Result<Joined> {
+///
+/// A guest's report conversation (12.7) is joined only if the user accepts
+/// it, `accept_report`: until then this fails with [`EngineError::Hold`],
+/// which rolls the transaction back, and the caller holds the Welcome.
+pub(crate) fn join_welcome(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    sealed: &[u8],
+    accept_report: bool,
+) -> Result<Joined> {
     let candidates = tx.key_package_refs(cx.account)?;
     let opened = risala_mls::welcome::open_sealed_welcome(&tx.mls(cx.crypto), sealed, &candidates);
     let (reference, welcome) = match opened {
@@ -1042,6 +1142,27 @@ pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Resu
     let mut group = joined.group;
     let ext = mls_group::conversation(&group)
         .ok_or(EngineError::Mls("no conversation extension".into()))?;
+    // 12.7: a guest's report conversation, only if the user accepts it, and
+    // only for an owner or moderator of a public room here that lets guests
+    // in.
+    if ext.kind == ConversationKind::Direct
+        && let Some(guest) = ext
+            .direct_participants()
+            .unwrap_or_default()
+            .into_iter()
+            .find(Uid::is_guest)
+    {
+        if cx.guest || !takes_reports(tx, cx)? {
+            mls_group::forget_group(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
+            tx.used_key_package(cx.account, &reference)?;
+            return Ok(Joined::Refused(
+                "a guest's report conversation this device does not take".into(),
+            ));
+        }
+        if !accept_report {
+            return Err(EngineError::Hold(guest));
+        }
+    }
     // 5.7: a direct conversation with someone blocked, or a room in which
     // someone blocked has a leaf.
     let blocks = tx.blocks(cx.account)?;
@@ -1129,4 +1250,161 @@ pub(crate) fn make_key_packages(
         out.push(risala_mls::wire::to_bytes(&message));
     }
     Ok(out)
+}
+
+/// The GroupInfo and ratchet tree of a new public room, in epoch 0, for
+/// its CREATE (5.2, 12.6): the GroupInfo carries `external_pub` and no
+/// tree, and is signed by this device's leaf.
+pub(crate) fn public_create_info(
+    tx: &Tx<'_>,
+    cx: &Ctx<'_>,
+    group_id: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let group = load(tx, cx, group_id)?;
+    let key = mls_group::own_leaf_key(&tx.mls(cx.crypto), &group).map_err(mls)?;
+    let info = group
+        .export_group_info(cx.crypto.as_ref(), &key, false)
+        .map_err(mls)?;
+    Ok((
+        risala_mls::wire::to_bytes(&info),
+        risala_mls::wire::tree_to_bytes(&group.export_ratchet_tree()),
+    ))
+}
+
+/// What a full client removes from a public room in its next commit
+/// besides what it was asked to (6.1, 12.7): its own earlier leaves, those
+/// of the same device that it joined with before, as leaves of its own
+/// identity; and, within the bulk limit, copies and leaves that have
+/// neither committed nor been Updated for more than 8 days. The 8 days are
+/// judged by the device's clock, an hour late, since the group checks use
+/// the post's `t`.
+fn public_cleanup(
+    view: &GroupView,
+    own: LeafNodeIndex,
+    cx: &Ctx<'_>,
+    remove: &mut Vec<LeafNodeIndex>,
+) {
+    let own_identity = view.leaf(own).and_then(|l| l.identity.clone());
+    for leaf in &view.leaves {
+        if leaf.index != own
+            && leaf.identity.is_some()
+            && leaf.identity == own_identity
+            && !remove.contains(&leaf.index)
+        {
+            remove.push(leaf.index);
+        }
+    }
+    let others = |remove: &[LeafNodeIndex]| {
+        remove
+            .iter()
+            .filter(|i| view.leaf(**i).and_then(|l| l.uid()) != Some(cx.uid))
+            .count()
+    };
+    let limit = view.bulk_limit();
+    let margin = 60 * 60 * 1000;
+    for leaf in &view.leaves {
+        if others(remove) >= limit {
+            break;
+        }
+        if leaf.index == own || remove.contains(&leaf.index) {
+            continue;
+        }
+        let updated = leaf.profile.as_ref().map_or(0, |p| p.updated);
+        let unused = leaf.from_key_package
+            && updated + risala_mls::checks::UNUSED_AFTER_MS + margin < cx.now;
+        if view.is_copy(leaf) || unused {
+            remove.push(leaf.index);
+        }
+    }
+}
+
+/// The KeyPackageRefs of the devices a Welcome adds (12.8).
+pub(crate) fn welcome_refs(welcome: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let welcome = risala_mls::wire::read_welcome(welcome).map_err(mls)?;
+    Ok(welcome
+        .secrets()
+        .iter()
+        .map(|s| s.new_member().as_slice().to_vec())
+        .collect())
+}
+
+/// A public room's pseudonym for the current period (7.3): 16 random
+/// bytes, picked anew when a period (12.10) begins.
+pub(crate) fn period_pseudonym(tx: &mut Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<Pseudonym> {
+    let period = risala_mls::epochal::period_of(ts(cx.now));
+    if tx.public_state(conv.id)?.pseudonym_period == i64::from(period) {
+        return Ok(Pseudonym(conv.pseudonym));
+    }
+    let pseudonym = Pseudonym::generate().map_err(|_| EngineError::Random)?;
+    tx.set_pseudonym(conv.id, &pseudonym.0, period)?;
+    Ok(pseudonym)
+}
+
+/// Whether this device may take a guest's report conversation (12.7): its
+/// identity is an owner or moderator of a public room on this server
+/// whose `guests` is not `none`.
+pub(crate) fn takes_reports(tx: &Tx<'_>, cx: &Ctx<'_>) -> Result<bool> {
+    for row in tx.conversations_of(cx.account)? {
+        if row.kind != ConvKind::Public || !row.state.in_group() {
+            continue;
+        }
+        let Ok(group) = load(tx, cx, &row.group_id) else {
+            continue;
+        };
+        if let Some(ext) = mls_group::conversation(&group)
+            && ext.host == *cx.host
+            && ext.guests != risala_mls::conversation::GuestMode::None
+            && ext.role(cx.uid) >= risala_mls::conversation::Role::Mod
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Queues an Update proposal of this device's own leaf in an epochal
+/// group (12.10), with `new_key` as its new leaf key if there is one. It
+/// is made when it is posted, in the epoch the group is then in, and on a
+/// public room's signed-in connection (12.6). For leaf confirmation (task
+/// C3), which decides when a period's new leaf key takes effect.
+#[allow(dead_code)]
+pub(crate) fn queue_update(
+    tx: &mut Tx<'_>,
+    conv: ConversationId,
+    new_key: Option<&risala_mls::mldsa::LeafKey>,
+    now: u64,
+) -> Result<i64> {
+    Ok(tx.queue_outbox(
+        conv,
+        OutboxKind::Update,
+        &NewOutbox {
+            body: new_key.map(|k| k.seed().to_vec()),
+            ..NewOutbox::default()
+        },
+        now,
+    )?)
+}
+
+/// Makes the Update proposal of an outbox row, to post now (12.10).
+pub(crate) fn make_update(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: &ConvRow,
+    row: &OutboxRow,
+) -> Result<(Vec<u8>, u64)> {
+    let mut group = load(tx, cx, &conv.group_id)?;
+    let new_key = match &row.body {
+        Some(seed) => Some(risala_mls::mldsa::LeafKey::from_seed(
+            seed.as_slice()
+                .try_into()
+                .map_err(|_| EngineError::Invalid("a leaf key seed".into()))?,
+        )),
+        None => None,
+    };
+    let profile = own_profile(tx, cx, &group, None)?;
+    let made =
+        mls_group::propose_update(&tx.mls(cx.crypto), &mut group, &profile, new_key.as_ref())
+            .map_err(mls)?;
+    tx.set_outbox_reference(row.id, &made.reference)?;
+    Ok((made.message, group.epoch().as_u64()))
 }

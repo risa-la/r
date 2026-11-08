@@ -18,7 +18,6 @@ use risala_mls::conversation::{RisalaConversation, Role as GroupRole};
 use risala_proto::content::ContentLine;
 use risala_proto::types::Role;
 
-use super::error::not_implemented;
 use super::types::{AccountId, ConversationId, Room, Timestamp, Uid};
 use super::{Client, Error, Event, Result};
 use crate::keys::KeyStore;
@@ -109,6 +108,60 @@ pub enum ConversationEvent {
     MaybeSplit {
         /// The conversation.
         conversation: ConversationId,
+    },
+    /// A day after joining, this device has seen nobody else post in its
+    /// epoch while posts it cannot read arrive: it may have joined a branch
+    /// of the group that nobody follows, and has uploaded fresh KeyPackages
+    /// to be added again (12.8).
+    MaybeOtherBranch {
+        /// The conversation.
+        conversation: ConversationId,
+    },
+    /// The server accepted a commit in a public room that this device holds
+    /// invalid (12.7). The device resyncs the room or joins it again.
+    InvalidCommitAccepted {
+        /// The conversation.
+        conversation: ConversationId,
+    },
+    /// The server changed a public room in a way no commit this device
+    /// checked explains (12.7, "Rejoining a public room"). The device joins
+    /// it again only if the user accepts, with
+    /// [`Client::accept_room_change`].
+    RoomChanged {
+        /// The conversation.
+        conversation: ConversationId,
+        /// What changed: `owners`, `mods`, `bans`, `guests`, `send` or
+        /// `topic`.
+        fields: Vec<String>,
+    },
+    /// Someone resynced a public room that this device followed without
+    /// trouble (12.7): possible abuse, by `by`, whom owners and moderators
+    /// can ban.
+    Resynced {
+        /// The conversation.
+        conversation: ConversationId,
+        /// Who made the resync commit.
+        by: Uid,
+    },
+    /// The server refused a Welcome this device sent (12.8): it cannot know
+    /// who holds the added device's place, and adds it again where it may.
+    WelcomeRefused {
+        /// The conversation.
+        conversation: ConversationId,
+        /// The added device's identity, if known.
+        uid: Option<Uid>,
+    },
+    /// A guest wants to report something to this identity, an owner or
+    /// moderator of a public room here (5.8, 12.7). Accept with
+    /// [`Client::accept_report`], or decline with
+    /// [`Client::decline_report`].
+    ReportOffered {
+        /// The account.
+        account: AccountId,
+        /// The offer.
+        offer: i64,
+        /// The guest.
+        guest: Uid,
     },
 }
 
@@ -491,14 +544,16 @@ impl Client {
         .await
     }
 
-    /// Creates the public room `room` on the account's server (6.1).
+    /// Creates the public room `room` on the account's server (6.1): this
+    /// device's identity is its first owner. Other devices, this
+    /// identity's included, join it by themselves.
     pub async fn create_public_room(
         &self,
         account: AccountId,
         room: &str,
     ) -> Result<ConversationId> {
-        let _ = (account, room);
-        not_implemented("create_public_room")
+        let room: Room = room.parse().map_err(|_| Error::invalid("room", room))?;
+        self.run_job(account, Job::PublicRoom { room }).await
     }
 
     /// Public rooms on the account's server, after `after` (6.1).
@@ -543,10 +598,93 @@ impl Client {
             .collect())
     }
 
-    /// Joins the public room `room`, as an identity or a guest (6.1).
+    /// Joins the public room `room`, as an identity or a guest (6.1), by
+    /// external proposal: returns once a member's device has committed it
+    /// and the Welcome is in, which can take up to 10 minutes. Fails if the
+    /// name now leads to another group than the one this account joined
+    /// before; [`join_public_room_anew`](Self::join_public_room_anew) joins
+    /// it anyway.
     pub async fn join_public_room(&self, account: AccountId, room: &str) -> Result<ConversationId> {
-        let _ = (account, room);
-        not_implemented("join_public_room")
+        let room: Room = room.parse().map_err(|_| Error::invalid("room", room))?;
+        self.run_job(
+            account,
+            Job::JoinPublic {
+                room,
+                new_group: false,
+            },
+        )
+        .await
+    }
+
+    /// Joins the public room `room` even though its name now leads to
+    /// another group than the one joined before, once the user chose to
+    /// (6.1).
+    pub async fn join_public_room_anew(
+        &self,
+        account: AccountId,
+        room: &str,
+    ) -> Result<ConversationId> {
+        let room: Room = room.parse().map_err(|_| Error::invalid("room", room))?;
+        self.run_job(
+            account,
+            Job::JoinPublic {
+                room,
+                new_group: true,
+            },
+        )
+        .await
+    }
+
+    /// The user accepts that the server changed a public room
+    /// ([`ConversationEvent::RoomChanged`]), and the device joins it again
+    /// (12.7, "Rejoining a public room").
+    pub async fn accept_room_change(&self, conversation: ConversationId) -> Result<()> {
+        let row = self.conv_row(conversation)?;
+        if row.kind != ConvKind::Public {
+            return Err(Error::Conversation(ConversationError::NotAllowed));
+        }
+        self.store()
+            .write_with(|tx| {
+                tx.set_accept_change(conversation, true)?;
+                Ok::<_, EngineError>(())
+            })
+            .map_err(Error::from)?;
+        let exec = self.exec(row.account)?;
+        exec.with_conversations(|e, cx| ((), e.rejoin(cx, conversation)))
+            .await;
+        Ok(())
+    }
+
+    /// As a guest, starts a report conversation with `uid`, an owner or
+    /// moderator of a public room here (5.8, 12.7): a direct conversation
+    /// in which only REPORT lines from the guest count.
+    pub async fn report_conversation(
+        &self,
+        account: AccountId,
+        uid: &str,
+    ) -> Result<ConversationId> {
+        let peer: Uid = uid.parse().map_err(|_| Error::invalid("uid", uid))?;
+        self.run_job(account, Job::Report { peer }).await
+    }
+
+    /// Accepts a guest's report conversation
+    /// ([`ConversationEvent::ReportOffered`]), and joins it (12.7).
+    pub async fn accept_report(&self, account: AccountId, offer: i64) -> Result<ConversationId> {
+        let exec = self.exec(account)?;
+        exec.with_conversations(|e, cx| e.accept_report(cx, offer))
+            .await
+            .map_err(|e| Error::Conversation(ConversationError::Failed(e)))
+    }
+
+    /// Declines a guest's report conversation (12.7).
+    pub fn decline_report(&self, offer: i64) -> Result<()> {
+        self.store()
+            .write_with(|tx| {
+                tx.drop_held_welcome(offer)?;
+                Ok::<_, EngineError>(())
+            })
+            .map_err(Error::from)?;
+        Ok(())
     }
 
     /// Queues a commit in a conversation, and lets the engine send it.

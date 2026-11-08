@@ -39,7 +39,12 @@
 
 pub(crate) mod content;
 pub(crate) mod group;
+pub(crate) mod public;
+mod recovery;
+mod rooms;
 pub(crate) mod wire;
+
+use recovery::may_replace;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -60,7 +65,7 @@ use risala_proto::mls::{
     GroupId, KeyPackage as KeyPackageText, KeyPackageRef as RefText, MlsMessage, OrBlob, PostToken,
     PutSecret, SendToken as SendTokenText, TokenHash, Welcome as WelcomeText, WelcomeSecret,
 };
-use risala_proto::names::{BoxName, Uid};
+use risala_proto::names::{BlobRef, BoxName, Room, Uid};
 use risala_proto::server::{Post, ServerLine, ServerMessage};
 
 use super::{Action, Context, Engine, Input, Target, Token};
@@ -113,6 +118,20 @@ pub struct Config {
     /// none, once the signed-in connection is up and its Welcomes are in
     /// (5.1, 12.13).
     pub self_conversation: bool,
+    /// How often a join of a public room looks at the room's GroupInfo
+    /// when no commit came to prompt it (6.1): 5 minutes. Each commit in
+    /// the room prompts a look at once.
+    pub join_poll_ms: u64,
+    /// The server's retention period (7.5, 8.5), for replacing the own
+    /// identity's stale leaves (12.7): 7 days unless INFO says otherwise.
+    pub retention_ms: u64,
+    /// How long after another member's removal any member moves the
+    /// mailbox if nobody has (7.8): 10 minutes, then a random wait of up to
+    /// `max_commit_wait_ms`.
+    pub move_fallback_ms: u64,
+    /// How long a RESYNC may go unanswered before the device asks its own
+    /// devices with `RESYNC <box> <seq>` (12.7): an hour.
+    pub resync_escalate_ms: u64,
 }
 
 impl Default for Config {
@@ -127,6 +146,10 @@ impl Default for Config {
             retry_ms: 5_000,
             refresh_after_ms: risala_mls::checks::REFRESH_AFTER_MS,
             self_conversation: true,
+            join_poll_ms: 5 * 60 * 1000,
+            retention_ms: 7 * 24 * 60 * 60 * 1000,
+            move_fallback_ms: 10 * 60 * 1000,
+            resync_escalate_ms: 60 * 60 * 1000,
         }
     }
 }
@@ -139,6 +162,7 @@ impl Config {
             max_welcome_wait_ms: 0,
             max_commit_wait_ms: 0,
             retry_ms: 0,
+            join_poll_ms: 60_000,
             ..Config::default()
         }
     }
@@ -308,6 +332,28 @@ pub(crate) trait Hooks: Send + Sync {
         let _ = (store, account, mailbox);
         None
     }
+
+    /// The bytes of a blob (12.12), for a post, a GroupInfo, a tree or a
+    /// Welcome that came as a blob-ref. The blob store is task C4's (and the
+    /// server's SV4b): it fetches the blob from INFO's `blobs` URL prefix,
+    /// and answers [`BlobFetch::Waiting`] until it has it, when the engine
+    /// asks again on a later tick. The engine checks the hash itself. It is
+    /// called outside a transaction of the cache.
+    fn blob(&self, account: AccountId, blob: &BlobRef) -> BlobFetch {
+        let _ = (account, blob);
+        BlobFetch::Unavailable
+    }
+}
+
+/// What [`Hooks::blob`] has of a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobFetch {
+    /// Its bytes.
+    Ready(Vec<u8>),
+    /// Being fetched: ask again later.
+    Waiting,
+    /// No blob store, or the blob is gone.
+    Unavailable,
 }
 
 /// The hooks of no other area.
@@ -331,6 +377,19 @@ pub(crate) enum EngineError {
     /// No randomness.
     #[error("no randomness")]
     Random,
+    /// A Welcome to a guest's report conversation, to hold until the user
+    /// accepts it (12.7).
+    #[error("a report conversation from {0}, held for the user")]
+    Hold(Uid),
+    /// The server changed a public room in a way no commit the device
+    /// checked explains: it joins again only if the user accepts (12.7).
+    #[error("the server changed the room: {fields:?}")]
+    RoomChanged {
+        /// The conversation.
+        conv: ConversationId,
+        /// What changed.
+        fields: Vec<String>,
+    },
 }
 
 /// What an engine step works with.
@@ -404,6 +463,19 @@ pub(crate) enum Note {
     NewMessage,
     /// An action from a hook.
     Hook(Box<Action>),
+    /// A commit in a public room being joined: did it add the join's leaf
+    /// (6.1)?
+    JoinCheck { conv: ConversationId },
+    /// The server took a commit in a public room that this device cannot
+    /// apply: it resyncs or joins again (12.7).
+    PublicStuck {
+        conv: ConversationId,
+        epoch: u64,
+        seq: u64,
+    },
+    /// A resync commit undid a commit this device applied without trouble
+    /// (12.7): possible abuse.
+    ResyncByOther { conv: ConversationId, by: Uid },
 }
 
 /// A random number below `max`, or 0.
@@ -461,6 +533,51 @@ pub enum Job {
         /// Its device.
         device: [u8; 48],
     },
+    /// Replace several stale leaves in one commit (12.7): remove each, and
+    /// add the same devices again from new KeyPackages, those that KEYPKG
+    /// GET returns one for.
+    ReplaceAll {
+        /// The conversation.
+        conv: ConversationId,
+        /// The leaves, by identity and device.
+        leaves: Vec<(Uid, [u8; 48])>,
+    },
+    /// Create the public room `room` (6.1).
+    PublicRoom {
+        /// Its name.
+        room: Room,
+    },
+    /// Join the public room `room` by external proposal (6.1), as an
+    /// identity or a guest. Done once the Welcome is in.
+    JoinPublic {
+        /// Its name.
+        room: Room,
+        /// Join even if the name now leads to another group than the one
+        /// joined before (6.1).
+        new_group: bool,
+    },
+    /// A guest's report conversation with `peer`, an owner or moderator of
+    /// a public room here (5.8, 12.7).
+    Report {
+        /// The identity.
+        peer: Uid,
+    },
+}
+
+/// Why the engine asked for a public room's GroupInfo (6.1, 12.7).
+#[derive(Debug, Clone)]
+enum RoomPurpose {
+    /// To join it.
+    Join {
+        job: JobId,
+        room: Room,
+        new_group: bool,
+    },
+    /// To see whether a commit added a join's leaf.
+    Check { conv: ConversationId },
+    /// The device cannot follow the room from `epoch`: resync or join
+    /// again.
+    Stuck { conv: ConversationId, epoch: u64 },
 }
 
 #[derive(Debug)]
@@ -508,6 +625,22 @@ enum Pending {
     WelcomeDel,
     WelcomePut {
         id: i64,
+        conv: ConversationId,
+        device: Option<(Uid, [u8; 48])>,
+    },
+    RoomInfo {
+        job: JobId,
+        room: Room,
+        new_group: bool,
+    },
+    GroupInfo {
+        purpose: RoomPurpose,
+    },
+    JoinPost {
+        conv: ConversationId,
+    },
+    WelcomeGet {
+        conv: ConversationId,
     },
 }
 
@@ -558,6 +691,29 @@ pub struct ConversationEngine {
     unprocessable: HashMap<ConversationId, (u64, u64)>,
     /// Conversations for which RESYNC was posted.
     resynced: HashSet<ConversationId>,
+    /// When RESYNC was posted, and the seq it named, to ask the own
+    /// devices after an hour (12.7).
+    resync_since: HashMap<ConversationId, (u64, u64)>,
+    /// Jobs waiting for a public room's Welcome, by conversation (6.1).
+    join_jobs: HashMap<ConversationId, JobId>,
+    /// When to look at a joining room's GroupInfo next (6.1).
+    join_checks: HashMap<ConversationId, u64>,
+    /// Joining rooms whose GROUPINFO or WELCOME GET is in flight.
+    join_inflight: HashSet<ConversationId>,
+    /// Public rooms this device cannot follow: the epoch it holds, and
+    /// when to resync or join again (12.7).
+    stuck: HashMap<ConversationId, (u64, u64)>,
+    /// When any member moves the mailbox after another's removal, and the
+    /// box it was in then (7.8).
+    move_timers: HashMap<ConversationId, (u64, BoxName)>,
+    /// Leaves being replaced, so that each is replaced once (12.7).
+    replacing: HashSet<(ConversationId, u32)>,
+    /// Conversations whose "branch nobody follows" was told (12.8).
+    branch_warned: HashSet<ConversationId>,
+    /// Mailboxes whose next post waits for its blob (12.12).
+    blob_waiting: HashSet<BoxName>,
+    /// Welcomes whose blob is being fetched (12.12).
+    welcome_blobs: Vec<(risala_proto::names::Id, BlobRef)>,
     started: bool,
     welcomes_listed: bool,
     self_requested: bool,
@@ -599,6 +755,16 @@ impl ConversationEngine {
             resync_timers: HashMap::new(),
             unprocessable: HashMap::new(),
             resynced: HashSet::new(),
+            resync_since: HashMap::new(),
+            join_jobs: HashMap::new(),
+            join_checks: HashMap::new(),
+            join_inflight: HashSet::new(),
+            stuck: HashMap::new(),
+            move_timers: HashMap::new(),
+            replacing: HashSet::new(),
+            branch_warned: HashSet::new(),
+            blob_waiting: HashSet::new(),
+            welcome_blobs: Vec::new(),
             started: false,
             welcomes_listed: false,
             self_requested: false,
@@ -744,8 +910,16 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let me = self.me(cx)?;
-        if me.guest {
+        // Guests join public rooms and make report conversations, and do
+        // nothing else (4.2, 5.8, 6.1).
+        let for_guests = matches!(job, Job::JoinPublic { .. } | Job::Report { .. });
+        if me.guest && !for_guests {
             return Err(EngineError::Invalid("guests cannot do this".into()));
+        }
+        if !me.guest && matches!(job, Job::Report { .. }) {
+            return Err(EngineError::Invalid(
+                "only guests make report conversations".into(),
+            ));
         }
         let mut uids: Vec<Uid> = match &job {
             Job::Direct { peer } => vec![peer.clone(), me.uid.clone()],
@@ -757,6 +931,25 @@ impl ConversationEngine {
             Job::WithYourself => vec![me.uid.clone()],
             Job::Invite { uids, .. } => uids.clone(),
             Job::Replace { uid, .. } => vec![uid.clone()],
+            Job::ReplaceAll { leaves, .. } => leaves.iter().map(|(u, _)| u.clone()).collect(),
+            Job::Report { peer } => vec![peer.clone()],
+            Job::PublicRoom { room } => return self.create_public(cx, &me, id, room.clone(), out),
+            Job::JoinPublic { room, new_group } => {
+                // 6.1: INFO finds the room's box, then GROUPINFO its group.
+                self.send(
+                    out,
+                    Target::Conversing,
+                    Command::Info {
+                        room: Some(room.clone()),
+                    },
+                    Pending::RoomInfo {
+                        job: id,
+                        room: room.clone(),
+                        new_group: *new_group,
+                    },
+                );
+                return Ok(());
+            }
         };
         uids.sort();
         uids.dedup();
@@ -947,6 +1140,50 @@ impl ConversationEngine {
                     }
                     Ok(Some((*conv, None)))
                 }
+                Job::Report { peer } => {
+                    // 12.7: the guest's throwaway leaf, and the identity's
+                    // devices, added in the first commit.
+                    if !checked.iter().any(|(u, ..)| u == peer) {
+                        return Err(EngineError::Invalid(format!(
+                            "{peer} has no devices to add"
+                        )));
+                    }
+                    let adds = kps_of(&|u| u == peer);
+                    let made = group::create(
+                        tx,
+                        c,
+                        |b| RisalaConversation::direct(c.host.clone(), b, c.uid, peer),
+                        adds,
+                    )?;
+                    Ok(Some((made.conv, Some(made))))
+                }
+                Job::ReplaceAll { conv, leaves } => {
+                    let mut adds = Vec::new();
+                    for (uid, device) in leaves {
+                        if let Some((_, f, _)) =
+                            checked.iter().find(|(u, _, d)| u == uid && d == device)
+                        {
+                            adds.push(f.clone());
+                        }
+                    }
+                    group::queue_intent(
+                        tx,
+                        *conv,
+                        &Intent {
+                            add: adds,
+                            remove: leaves
+                                .iter()
+                                .map(|(u, d)| (u.to_string(), Some(*d)))
+                                .collect(),
+                            ..Intent::default()
+                        },
+                        c.now,
+                    )?;
+                    Ok(Some((*conv, None)))
+                }
+                Job::PublicRoom { .. } | Job::JoinPublic { .. } => {
+                    Err(EngineError::Invalid("not a job with KeyPackages".into()))
+                }
                 Job::Replace { conv, uid, device } => {
                     let adds: Vec<wire::Fetched> = checked
                         .iter()
@@ -1095,6 +1332,7 @@ impl ConversationEngine {
                 }
                 Ok(())
             }
+            ServerLine::Gone { mailbox, uid } => self.on_gone(cx, mailbox, uid, out),
             ServerLine::Presence { presence, uids } => {
                 out.push(Action::Emit(Event::Conversation(
                     ConversationEvent::Presence {
@@ -1116,25 +1354,16 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let me = self.me(cx)?;
-        let OrBlob::Inline(message) = &post.message else {
-            // Blobs are task C4's (12.12): a post too large for a line is
-            // skipped for now, and shows as a gap if it was a message.
-            tracing::debug!("a post in a blob, not fetched yet");
-            if let Some(seq) = post.seq {
-                self.keep(
-                    cx,
-                    &me,
-                    &post.mailbox,
-                    seq.get(),
-                    post.t.unix_millis(),
-                    Vec::new(),
-                    None,
-                    out,
-                )?;
-            }
-            return Ok(());
+        let (bytes, blob) = match &post.message {
+            OrBlob::Inline(message) => (message.decode(), None),
+            // 12.12: a post too large for a line is kept with its hash,
+            // and fetched through the blob store when its turn comes.
+            OrBlob::Blob(blob) => (Vec::new(), Some(*blob.hash())),
         };
-        let bytes = message.decode();
+        if blob.is_some() && post.seq.is_none() {
+            // A live post is never a blob worth waiting for.
+            return Ok(());
+        }
         match post.seq {
             Some(seq) => {
                 let next = post.next.map(|n| *n.as_bytes());
@@ -1144,7 +1373,7 @@ impl ConversationEngine {
                     &post.mailbox,
                     seq.get(),
                     post.t.unix_millis(),
-                    bytes,
+                    (bytes, blob),
                     next,
                     out,
                 )?;
@@ -1181,7 +1410,7 @@ impl ConversationEngine {
         mailbox: &BoxName,
         seq: u64,
         t: u64,
-        message: Vec<u8>,
+        (message, blob): (Vec<u8>, Option<[u8; 48]>),
         next: Option<[u8; 48]>,
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
@@ -1195,6 +1424,7 @@ impl ConversationEngine {
                         t,
                         message,
                         next,
+                        blob,
                     },
                 )?;
             }
@@ -1265,6 +1495,36 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         loop {
+            // 12.12: the next post came as a blob-ref: fetch it first.
+            let blob = self.write(cx, me, out, |tx, c| {
+                let Some(mb) = tx.mailbox(c.account, mailbox)? else {
+                    return Ok(None);
+                };
+                let Some(post) = tx.post_at(mb.conv, mailbox, mb.sync_point + 1)? else {
+                    return Ok(None);
+                };
+                Ok(post
+                    .blob
+                    .filter(|_| post.message.is_empty())
+                    .map(|b| (mb.conv, post.seq, b)))
+            })?;
+            if let Some((conv, seq, hash)) = blob {
+                match self.get_blob(me, &BlobRef::from_hash(hash)) {
+                    rooms::Got::Bytes(bytes) => {
+                        self.write(cx, me, out, |tx, _| {
+                            Ok(tx.set_post_message(conv, mailbox, seq, &bytes)?)
+                        })?;
+                    }
+                    rooms::Got::Waiting => {
+                        self.blob_waiting.insert(*mailbox);
+                        return Ok(());
+                    }
+                    // Skipped: it shows as a gap if it was a message.
+                    rooms::Got::Unavailable => {
+                        tracing::debug!("a post in a blob, and no blob store");
+                    }
+                }
+            }
             let step = self.write(cx, me, out, |tx, c| {
                 let Some(mb) = tx.mailbox(c.account, mailbox)? else {
                     return Ok(None);
@@ -1322,17 +1582,43 @@ impl ConversationEngine {
                     self.resync_timers.entry((conv, leaf)).or_insert(now + wait);
                 }
                 Note::OwnResync { conv, seq, device } => {
-                    let _ = (seq, device);
-                    // The sending device's leaf in that group is the own
-                    // identity's leaf that is behind: replace each leaf of
-                    // the own identity that posted nothing since; done as a
-                    // RESYNC by leaf once the leaf is known. Not built yet.
-                    tracing::debug!(?conv, "RESYNC from another own device");
+                    // 12.7: another device of this identity cannot follow
+                    // the group of `conv` since the commit at `seq`:
+                    // replace its leaf there, after a random wait.
+                    let _ = seq;
+                    let leaf = device.and_then(|device| {
+                        self.write(cx, me, out, |tx, c| {
+                            Ok(crate::store::conversations::read::leaves(tx.conn(), conv)?
+                                .into_iter()
+                                .find(|l| l.uid == *c.uid && l.device_id == Some(device))
+                                .map(|l| l.leaf))
+                        })
+                        .ok()
+                        .flatten()
+                    });
+                    if let Some(leaf) = leaf {
+                        let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
+                        self.resync_timers.entry((conv, leaf)).or_insert(now + wait);
+                    }
                 }
+                Note::JoinCheck { conv } => {
+                    self.join_checks.insert(conv, now);
+                }
+                Note::PublicStuck { conv, epoch, seq } => {
+                    let _ = seq;
+                    self.on_stuck(conv, epoch, out);
+                }
+                Note::ResyncByOther { conv, by } => out.push(Action::Emit(Event::Conversation(
+                    ConversationEvent::Resynced {
+                        conversation: conv,
+                        by,
+                    },
+                ))),
                 Note::Unprocessable { conv, epoch, seq } => {
                     self.unprocessable.insert(conv, (epoch, seq));
                 }
                 Note::Undecryptable { conv, epoch } => {
+                    self.check_branch(cx, me, conv, out);
                     if let Some((held, seq)) = self.unprocessable.get(&conv).copied()
                         && epoch == held + 1
                         && self.resynced.insert(conv)
@@ -1355,8 +1641,11 @@ impl ConversationEngine {
                             )?;
                             Ok(())
                         });
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, "could not queue RESYNC");
+                        match r {
+                            Ok(()) => {
+                                self.resync_since.insert(conv, (now, seq));
+                            }
+                            Err(e) => tracing::warn!(error = %e, "could not queue RESYNC"),
                         }
                     }
                 }
@@ -1364,6 +1653,31 @@ impl ConversationEngine {
                     self.proposal_timers.remove(&conv);
                     self.unprocessable.remove(&conv);
                     self.resynced.remove(&conv);
+                    self.resync_since.remove(&conv);
+                    self.replacing.retain(|(c, _)| *c != conv);
+                    if !own
+                        && !removed.is_empty()
+                        && !removed.iter().any(|id| id.uid == me.uid)
+                        && !self.move_timers.contains_key(&conv)
+                    {
+                        // 7.8: if no move has won within 10 minutes of
+                        // another member's removal, any member makes it.
+                        let r = self.write(cx, me, out, |tx, _| {
+                            let row = tx.conversation(conv)?;
+                            Ok(
+                                (row.kind != ConvKind::Public && row.state == ConvState::Active)
+                                    .then(|| tx.current_mailbox(conv).ok())
+                                    .flatten(),
+                            )
+                        });
+                        if let Ok(Some(mb)) = r {
+                            let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
+                            self.move_timers.insert(
+                                conv,
+                                (now + self.config.move_fallback_ms + wait, mb.mailbox),
+                            );
+                        }
+                    }
                     if own && !removed.is_empty() {
                         // 7.8: the device that removed a leaf moves the
                         // group, once its removal has won. Public rooms do
@@ -1399,7 +1713,7 @@ impl ConversationEngine {
                     })));
                 }
                 Note::Moved { conv, mailbox } => {
-                    let _ = conv;
+                    self.move_timers.remove(&conv);
                     self.follows.remove(&mailbox);
                 }
                 Note::InvalidCommit { conv, seq, reason } => {
@@ -1536,9 +1850,9 @@ impl ConversationEngine {
                         if seq > l {
                             first_after_l = Some(first_after_l.map_or(seq, |f: u64| f.min(seq)));
                         }
-                        let (bytes, next) = match &post.message {
-                            OrBlob::Inline(m) => (m.decode(), post.next.map(|n| *n.as_bytes())),
-                            OrBlob::Blob(_) => (Vec::new(), None),
+                        let message = match &post.message {
+                            OrBlob::Inline(m) => (m.decode(), None),
+                            OrBlob::Blob(b) => (Vec::new(), Some(*b.hash())),
                         };
                         self.keep(
                             cx,
@@ -1546,8 +1860,8 @@ impl ConversationEngine {
                             &mailbox,
                             seq,
                             post.t.unix_millis(),
-                            bytes,
-                            next,
+                            message,
+                            post.next.map(|n| *n.as_bytes()),
                             out,
                         )?;
                     }
@@ -1723,19 +2037,64 @@ impl ConversationEngine {
                 self.maybe_self_conversation(cx, &me, out)?;
             }
             Pending::WelcomeDel => {}
-            Pending::WelcomePut { id } => {
-                let sent = match &response.end {
-                    End::Ok(_) => true,
-                    // The server will never take it (12.8).
-                    End::Err(e) if e.code == ErrorCode::NotFound => true,
-                    _ => false,
-                };
+            Pending::WelcomePut { id, conv, device } => {
+                // 12.8: a refusal other than `rate-limited` means the
+                // device cannot know who holds the added device's place.
+                let refused = matches!(&response.end,
+                    End::Err(e) if e.code != ErrorCode::RateLimited);
+                let sent = matches!(response.end, End::Ok(_)) || refused;
                 let retry = now + self.config.retry_ms.max(1_000);
                 self.write(cx, &me, out, |tx, _| {
                     tx.welcome_done(id, sent, retry)?;
                     Ok(())
                 })?;
+                if refused {
+                    self.welcome_refused(cx, &me, conv, device, out)?;
+                }
             }
+            Pending::RoomInfo {
+                job,
+                room,
+                new_group,
+            } => self.on_room_info(job, room, new_group, response, out),
+            Pending::GroupInfo { purpose } => self.on_group_info(cx, purpose, response, out)?,
+            Pending::JoinPost { conv } => self.on_join_post(conv, response, out),
+            Pending::WelcomeGet { conv } => self.on_welcome_get(cx, conv, response, out)?,
+        }
+        Ok(())
+    }
+
+    /// A WELCOME PUT was refused (12.8): tell the user, and, where the Adds
+    /// checks let this device, remove the leaf and add the device again
+    /// from a new KeyPackage. A public room's joiner proposes again by
+    /// itself.
+    fn welcome_refused(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        device: Option<(Uid, [u8; 48])>,
+        out: &mut Vec<Action>,
+    ) -> Result<(), EngineError> {
+        out.push(Action::Emit(Event::Conversation(
+            ConversationEvent::WelcomeRefused {
+                conversation: conv,
+                uid: device.as_ref().map(|(u, _)| u.clone()),
+            },
+        )));
+        let Some((uid, device)) = device else {
+            return Ok(());
+        };
+        let allowed = self.write(cx, me, out, |tx, c| {
+            let row = tx.conversation(conv)?;
+            if row.kind == ConvKind::Public || !row.state.in_group() {
+                return Ok(false);
+            }
+            Ok(may_replace(tx, c, &row, &uid)?)
+        })?;
+        if allowed {
+            let (_, actions) = self.start(cx, Job::Replace { conv, uid, device });
+            out.extend(actions);
         }
         Ok(())
     }
@@ -1754,6 +2113,7 @@ impl ConversationEngine {
         let now = self.now();
         let retry = now + self.config.retry_ms;
         let mut repair = None;
+        let mut rejoin = false;
         self.write(cx, me, out, |tx, c| {
             let Some(row) = tx.outbox_row(outbox)? else {
                 return Ok(());
@@ -1772,6 +2132,18 @@ impl ConversationEngine {
                         }
                     }
                 }
+                // 12.7: a refused external commit: join by proposal.
+                End::Err(e) if row.kind == OutboxKind::External => {
+                    tracing::info!(code = %e.code, "the server refused an external commit");
+                    tx.update_outbox(outbox, OutboxState::Lost, None, None, None)?;
+                    public::external_lost(tx, c, conv)?;
+                    rejoin = true;
+                }
+                // A commit already decided, when its post came back or a
+                // winner was applied first, is not made again twice.
+                End::Err(_)
+                    if row.kind == OutboxKind::Commit
+                        && matches!(row.state, OutboxState::Lost | OutboxState::Done) => {}
                 End::Err(e) if e.code == ErrorCode::Stale => match row.kind {
                     OutboxKind::Commit => group::commit_lost(tx, c, &conv_row, &row)?,
                     _ => {
@@ -1837,6 +2209,29 @@ impl ConversationEngine {
             }
             None => {}
         }
+        if rejoin {
+            let epoch = self.write(cx, me, out, |tx, _| Ok(tx.conversation(conv)?.epoch))?;
+            self.stuck.insert(conv, (epoch, now));
+        }
+        // 12.7: an external commit the server took: the device is in.
+        if matches!(response.end, End::Ok(_))
+            && let Some(job) = self.join_jobs.remove(&conv)
+        {
+            let external = self.write(cx, me, out, |tx, _| {
+                Ok(tx
+                    .outbox_row(outbox)?
+                    .is_some_and(|r| r.kind == OutboxKind::External))
+            })?;
+            if external {
+                self.join_checks.remove(&conv);
+                out.push(job_done(job, Some(conv), None));
+                out.push(Action::Emit(Event::Conversation(
+                    ConversationEvent::Joined { conversation: conv },
+                )));
+            } else {
+                self.join_jobs.insert(conv, job);
+            }
+        }
         Ok(())
     }
 
@@ -1848,13 +2243,27 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let me = self.me(cx)?;
-        let OrBlob::Inline(welcome) = welcome else {
-            // A Welcome in a blob needs the blob store (12.12), task C4.
-            tracing::info!("a Welcome in a blob, not fetched yet");
-            return Ok(());
+        let sealed = match welcome {
+            OrBlob::Inline(welcome) => welcome.decode(),
+            OrBlob::Blob(blob) => match self.get_blob(&me, blob) {
+                rooms::Got::Bytes(bytes) => bytes,
+                rooms::Got::Waiting => {
+                    // 12.12: asked again on a later tick.
+                    if !self.welcome_blobs.iter().any(|(i, _)| i == id) {
+                        self.welcome_blobs.push((id.clone(), *blob));
+                    }
+                    return Ok(());
+                }
+                rooms::Got::Unavailable => {
+                    tracing::info!("a Welcome in a blob, and no blob store");
+                    return Ok(());
+                }
+            },
         };
-        let sealed = welcome.decode();
-        let joined = self.write(cx, &me, out, |tx, c| group::join_welcome(tx, c, &sealed));
+        self.welcome_blobs.retain(|(i, _)| i != id);
+        let joined = self.write(cx, &me, out, |tx, c| {
+            group::join_welcome(tx, c, &sealed, false)
+        });
         let delete = match joined {
             Ok(group::Joined::Joined { conv }) => {
                 out.push(Action::Emit(Event::Conversation(
@@ -1873,6 +2282,20 @@ impl ConversationEngine {
             }
             Ok(group::Joined::Refused(why)) => {
                 tracing::info!(%why, "a Welcome refused");
+                true
+            }
+            Err(EngineError::Hold(guest)) => {
+                // 12.7: a guest's report conversation waits for the user.
+                let held = self.write(cx, &me, out, |tx, c| {
+                    Ok(tx.hold_welcome(c.account, &sealed, &guest, c.now)?)
+                })?;
+                out.push(Action::Emit(Event::Conversation(
+                    ConversationEvent::ReportOffered {
+                        account: me.account,
+                        offer: held,
+                        guest,
+                    },
+                )));
                 true
             }
             Err(e) => {
@@ -2020,8 +2443,14 @@ impl ConversationEngine {
             })
             .collect();
         let convs = self.write(cx, me, out, |tx, c| Ok(tx.conversations_of(c.account)?))?;
+        let signed_in = self.signed_in();
         for conv in convs {
             if !conv.state.in_group() || in_flight.contains(&conv.id) {
+                continue;
+            }
+            // 12.7: a public room this device cannot follow posts nothing
+            // until it has resynced or joined again.
+            if self.stuck.contains_key(&conv.id) {
                 continue;
             }
             let Some(mailbox) =
@@ -2032,7 +2461,9 @@ impl ConversationEngine {
             if !self.caught_up(&mailbox.mailbox) {
                 continue;
             }
-            let posts = self.write(cx, me, out, |tx, c| next_posts(tx, c, &conv, now));
+            let posts = self.write(cx, me, out, |tx, c| {
+                next_posts(tx, c, &conv, now, signed_in)
+            });
             let posts = match posts {
                 Ok(posts) => posts,
                 Err(e) => {
@@ -2073,18 +2504,38 @@ impl ConversationEngine {
                 }
                 let message = MlsMessage::from_bytes(&p.post)
                     .map_err(|e| EngineError::Invalid(e.to_string()))?;
+                // TODO(C4): a commit or GroupInfo too large for a line goes
+                // as a blob (12.12), stored over an anonymous connection.
+                let groupinfo = match &p.groupinfo {
+                    Some(g) => Some(OrBlob::Inline(
+                        risala_proto::mls::GroupInfo::from_bytes(g)
+                            .map_err(|e| EngineError::Invalid(e.to_string()))?,
+                    )),
+                    None => None,
+                };
                 let command = Command::Post {
                     mailbox: mailbox.mailbox,
-                    token: PostToken::Send(token),
+                    token: if p.external {
+                        PostToken::Join
+                    } else {
+                        PostToken::Send(token)
+                    },
                     message: OrBlob::Inline(message),
                     live: p.live,
-                    groupinfo: None,
+                    groupinfo,
                     next: p.next.map(TokenHash::from_bytes),
                     cid: None,
                 };
+                // 12.6: a public room's commits and Updates come from the
+                // signed-in connection of the device the credential names.
+                let target = if p.signed_in {
+                    Target::SignedIn
+                } else {
+                    Target::Mailbox(mailbox.mailbox)
+                };
                 self.send(
                     out,
-                    Target::Mailbox(mailbox.mailbox),
+                    target,
                     command,
                     Pending::Post {
                         conv: conv.id,
@@ -2105,8 +2556,27 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let due = self.write(cx, me, out, |tx, c| Ok(tx.due_welcomes(c.account, now)?))?;
-        let target = self.fresh(me);
+        let signed_in = self.signed_in();
         for w in due {
+            // 12.8: a public room's Welcome, for a join proposal, goes on
+            // the signed-in connection of the device that committed it; a
+            // sealed one on a fresh anonymous connection.
+            let public = w.secret.len() != 32;
+            if public && !signed_in {
+                let retry = now + self.config.retry_ms.max(1_000);
+                self.write(
+                    cx,
+                    me,
+                    out,
+                    |tx, _| Ok(tx.welcome_done(w.id, false, retry)?),
+                )?;
+                continue;
+            }
+            let target = if public {
+                Target::SignedIn
+            } else {
+                self.fresh(me)
+            };
             let Ok(reference) = <[u8; 48]>::try_from(w.reference.as_slice()) else {
                 continue;
             };
@@ -2123,7 +2593,11 @@ impl ConversationEngine {
                     },
                     welcome: OrBlob::Inline(welcome),
                 }),
-                Pending::WelcomePut { id: w.id },
+                Pending::WelcomePut {
+                    id: w.id,
+                    conv: w.conv,
+                    device: w.device.clone(),
+                },
             );
         }
         Ok(())
@@ -2144,6 +2618,10 @@ impl ConversationEngine {
             .collect();
         for conv in due {
             self.proposal_timers.remove(&conv);
+            // 6.1: only full clients of identities commit proposals.
+            if me.guest {
+                continue;
+            }
             self.write(cx, me, out, |tx, c| {
                 let row = tx.conversation(conv)?;
                 if !row.state.in_group() || group::has_pending_commit(tx, conv)? {
@@ -2173,6 +2651,9 @@ impl ConversationEngine {
             .collect();
         for (conv, leaf) in due {
             self.resync_timers.remove(&(conv, leaf));
+            if me.guest || !self.replacing.insert((conv, leaf)) {
+                continue;
+            }
             let target = self.write(cx, me, out, |tx, _| {
                 let Some(l) = tx.leaf(conv, leaf)? else {
                     return Ok(None);
@@ -2180,13 +2661,32 @@ impl ConversationEngine {
                 Ok(l.device_id.map(|d| (l.uid, d)))
             })?;
             if let Some((uid, device)) = target {
-                let (_, actions) = self.start(cx, Job::Replace { conv, uid, device });
-                out.extend(actions);
+                // 12.7: the leaf's own identity first; others only where
+                // the checks let them, and plain members only warn.
+                if self.answers_resync(cx, me, conv, &uid, out) {
+                    let (_, actions) = self.start(cx, Job::Replace { conv, uid, device });
+                    out.extend(actions);
+                } else {
+                    tracing::info!(%uid, "a member asked to be replaced; left to others");
+                }
             }
         }
-        // 12.7: the weekly fresh-leaf commit, checked every ten minutes.
-        if now >= self.last_refresh_check + 600_000 {
+        self.rooms_due(cx, me, now, out)?;
+        self.recovery_due(cx, me, now, out)?;
+        // 12.12: Welcomes and posts whose blobs were being fetched.
+        let waiting: Vec<(risala_proto::names::Id, BlobRef)> = self.welcome_blobs.clone();
+        for (id, blob) in waiting {
+            self.on_welcome(cx, &id, &OrBlob::Blob(blob), out)?;
+        }
+        let waiting: Vec<BoxName> = self.blob_waiting.drain().collect();
+        for mailbox in waiting {
+            self.advance(cx, me, &mailbox, out)?;
+        }
+        // 12.7: the weekly fresh-leaf commit, checked every ten minutes. A
+        // guest's leaf never commits (12.6).
+        if now >= self.last_refresh_check + 600_000 && !me.guest {
             self.last_refresh_check = now;
+            self.replace_stale(cx, me, now, out)?;
             let refresh_after = self.config.refresh_after_ms;
             self.write(cx, me, out, |tx, c| {
                 for row in tx.conversations_of(c.account)? {
@@ -2220,6 +2720,12 @@ struct NextPost {
     next: Option<[u8; 48]>,
     live: bool,
     create: Option<CreateMove>,
+    /// A public room commit's GroupInfo (12.6).
+    groupinfo: Option<Vec<u8>>,
+    /// An external commit, posted with the token `-` (12.7).
+    external: bool,
+    /// On the signed-in connection (12.6).
+    signed_in: bool,
 }
 
 /// `CREATE <box> <group-id> <token-hash> epoch=<e> from=<old> token=<token>`
@@ -2241,10 +2747,59 @@ fn next_posts(
     c: &Ctx<'_>,
     conv: &ConvRow,
     now: u64,
+    signed_in: bool,
 ) -> Result<Vec<NextPost>, EngineError> {
-    let rows = tx.pending_outbox(conv.id)?;
+    let mut rows = tx.pending_outbox(conv.id)?;
     let waiting = |r: &OutboxRow| r.not_before.is_some_and(|t| t > now);
     if rows.iter().any(|r| r.state == OutboxState::Sent) {
+        return Ok(Vec::new());
+    }
+    let public = conv.kind == ConvKind::Public;
+    // 12.6: a guest's leaf never commits, nor proposes an Update.
+    if c.guest && public {
+        for r in rows
+            .iter()
+            .filter(|r| matches!(r.kind, OutboxKind::Commit | OutboxKind::Update))
+        {
+            tx.update_outbox(r.id, OutboxState::Lost, None, None, None)?;
+        }
+        rows.retain(|r| !matches!(r.kind, OutboxKind::Commit | OutboxKind::Update));
+    }
+    // An external commit (12.7), merged already: posted with `-`.
+    if let Some(row) = rows
+        .iter()
+        .find(|r| r.kind == OutboxKind::External && r.state == OutboxState::Queued)
+    {
+        if !signed_in {
+            return Ok(Vec::new());
+        }
+        let (token, _) = group::send_token(tx, c, conv)?;
+        tx.update_outbox(row.id, OutboxState::Sent, None, None, None)?;
+        return Ok(vec![NextPost {
+            outbox: row.id,
+            post: row.post.clone().unwrap_or_default(),
+            token,
+            next: row.next,
+            live: false,
+            create: None,
+            groupinfo: row.groupinfo.clone(),
+            external: true,
+            signed_in: true,
+        }]);
+    }
+    if rows
+        .iter()
+        .any(|r| r.kind == OutboxKind::External && r.state == OutboxState::Posted)
+    {
+        return Ok(Vec::new());
+    }
+    // A public room's commits go on the signed-in connection (12.6).
+    if public
+        && !signed_in
+        && rows
+            .iter()
+            .any(|r| matches!(r.kind, OutboxKind::Commit | OutboxKind::Update))
+    {
         return Ok(Vec::new());
     }
     // A commit posted and not yet applied: wait for it to win or lose.
@@ -2294,6 +2849,9 @@ fn next_posts(
                 token,
                 next: row.next,
                 live: false,
+                groupinfo: None,
+                external: false,
+                signed_in: false,
                 create: Some(CreateMove {
                     mailbox,
                     group_id,
@@ -2310,6 +2868,9 @@ fn next_posts(
             next: row.next,
             live: false,
             create: None,
+            groupinfo: row.groupinfo.clone(),
+            external: false,
+            signed_in: public,
         }]);
     }
     if let Some(row) = rows
@@ -2325,6 +2886,28 @@ fn next_posts(
             next: None,
             live: false,
             create: None,
+            groupinfo: None,
+            external: false,
+            signed_in: false,
+        }]);
+    }
+    if let Some(row) = rows
+        .iter()
+        .find(|r| r.kind == OutboxKind::Update && r.state == OutboxState::Queued && !waiting(r))
+    {
+        let row = row.clone();
+        let (post, epoch) = group::make_update(tx, c, conv, &row)?;
+        tx.update_outbox(row.id, OutboxState::Sent, Some((&post, epoch)), None, None)?;
+        return Ok(vec![NextPost {
+            outbox: row.id,
+            post,
+            token,
+            next: None,
+            live: false,
+            create: None,
+            groupinfo: None,
+            external: false,
+            signed_in: public,
         }]);
     }
     // No messages until the conversation is created, while it has a
@@ -2360,6 +2943,9 @@ fn next_posts(
             next: None,
             live: row.kind == OutboxKind::Live,
             create: None,
+            groupinfo: None,
+            external: false,
+            signed_in: false,
         });
     }
     Ok(out)

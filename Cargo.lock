@@ -1576,6 +1576,7 @@ dependencies = [
  "openmls",
  "openmls_basic_credential",
  "openmls_libcrux_crypto",
+ "openmls_memory_storage",
  "openmls_sqlite_storage",
  "openmls_traits",
  "proptest",

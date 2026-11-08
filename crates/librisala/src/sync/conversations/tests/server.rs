@@ -4,8 +4,11 @@
 //! and Welcome areas (tasks SV3, SV4) land on `m5b`.
 //!
 //! It checks what a server can check without a group's secrets: framing,
-//! group ids, token hashes per epoch, `next` on commits only. It does not
-//! check public rooms' commits.
+//! group ids, token hashes per epoch, `next` on commits only. Public rooms
+//! (6.1, 12.6) keep their group as an outsider sees it: commits and
+//! proposals must be valid MLS for it, one commit per epoch, commits on a
+//! signed-in connection with `groupinfo=`, joins with the token `-`. It
+//! does not make the group checks of 12.7, which `risalad` makes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -34,6 +37,54 @@ struct Mailbox {
     posts: Vec<KeptPost>,
     tokens: HashMap<u64, HashSet<[u8; 48]>>,
     followers: HashSet<ConnId>,
+    room: Option<FakeRoom>,
+}
+
+/// A public room's group as the server holds it (12.6).
+struct FakeRoom {
+    name: String,
+    group: risala_mls::openmls::prelude::PublicGroup,
+    storage: openmls_memory_storage::MemoryStorage,
+    group_info: Vec<u8>,
+    tree: Vec<u8>,
+    /// The seq of the commit that started the current epoch.
+    epoch_seq: u64,
+    /// The tree of each epoch, for Welcomes (12.6).
+    trees: HashMap<u64, Vec<u8>>,
+    /// The refs of KeyPackages that accepted commits added from join
+    /// proposals, and the epoch each commit started.
+    added: HashMap<Vec<u8>, u64>,
+}
+
+impl FakeRoom {
+    fn build(
+        crypto: &risala_mls::RisalaCrypto,
+        name: String,
+        group_info: Vec<u8>,
+        tree: Vec<u8>,
+    ) -> Option<FakeRoom> {
+        let storage = openmls_memory_storage::MemoryStorage::default();
+        let group = risala_mls::group::public_group(crypto, &storage, &group_info, &tree).ok()?;
+        let epoch = group.group_context().epoch().as_u64();
+        Some(FakeRoom {
+            name,
+            group,
+            storage,
+            trees: HashMap::from([(epoch, tree.clone())]),
+            group_info,
+            tree,
+            epoch_seq: 0,
+            added: HashMap::new(),
+        })
+    }
+
+    fn epoch(&self) -> u64 {
+        self.group.group_context().epoch().as_u64()
+    }
+
+    fn members(&self) -> u64 {
+        self.group.members().count() as u64
+    }
 }
 
 struct StoredKp {
@@ -61,6 +112,10 @@ pub struct FakeServer {
     pub log: Vec<(ConnId, String)>,
     /// Refuse the next POST of this mailbox with `ERR stale`.
     pub stale_next: HashSet<String>,
+    /// Welcomes of join proposals, by KeyPackageRef: id, Welcome, epoch.
+    public_welcomes: HashMap<Vec<u8>, (String, Vec<u8>, u64)>,
+    /// Refuse WELCOME PUT with `ERR forbidden`.
+    pub refuse_welcomes: bool,
 }
 
 fn ok() -> OkResponse {
@@ -103,6 +158,126 @@ impl FakeServer {
             crypto: risala_mls::RisalaCrypto::new().unwrap(),
             log: Vec::new(),
             stale_next: HashSet::new(),
+            public_welcomes: HashMap::new(),
+            refuse_welcomes: false,
+        }
+    }
+
+    /// The members and epoch of a public room.
+    pub fn room(&self, name: &str) -> Option<(u64, u64)> {
+        self.mailboxes
+            .values()
+            .filter_map(|m| m.room.as_ref())
+            .find(|r| r.name == name)
+            .map(|r| (r.members(), r.epoch()))
+    }
+
+    /// The live lines a server sends when a guest's session ends (6.1):
+    /// `GONE <box> <uid>` to the followers of each public room the guest
+    /// has a leaf in.
+    pub fn gone(&self, uid: &str) -> Vec<(ConnId, ServerMessage)> {
+        let mut out = Vec::new();
+        for (b, m) in &self.mailboxes {
+            let Some(room) = &m.room else { continue };
+            let has = room.group.members().any(|member| {
+                risala_mls::identity::RisalaIdentity::from_credential(&member.credential)
+                    .is_ok_and(|id| id.uid.as_str() == uid)
+            });
+            if has {
+                for f in &m.followers {
+                    out.push((*f, line(&format!("GONE {b} {uid}"))));
+                }
+            }
+        }
+        out
+    }
+
+    /// The checks of 12.6 that the engine's posts to a public room must
+    /// pass here: the current epoch, valid MLS for the room's group, a
+    /// commit on a signed-in connection with its GroupInfo, `-` only for
+    /// joins and external commits. Returns the error, if any.
+    fn check_room_post(
+        &mut self,
+        mailbox: &str,
+        conn: ConnId,
+        bytes: &[u8],
+        epoch: u64,
+        token_is_join: bool,
+        groupinfo: Option<Vec<u8>>,
+    ) -> Option<End> {
+        use risala_mls::openmls::prelude::{ProcessedMessageContent, Sender};
+        let crypto = &self.crypto;
+        let m = self.mailboxes.get_mut(mailbox)?;
+        let room = m.room.as_mut()?;
+        if epoch != room.epoch() {
+            return Some(err(ErrorCode::Stale));
+        }
+        let Ok(protocol) = risala_mls::wire::read_protocol_message(bytes) else {
+            return Some(err(ErrorCode::Invalid));
+        };
+        let processed = match room.group.process_message(crypto, protocol) {
+            Ok(p) => p,
+            Err(_) => return Some(err(ErrorCode::Invalid)),
+        };
+        let sender = processed.sender().clone();
+        match processed.into_content() {
+            ProcessedMessageContent::ExternalJoinProposalMessage(queued) => {
+                if !token_is_join {
+                    return Some(err(ErrorCode::Invalid));
+                }
+                room.group.add_proposal(&room.storage, *queued).ok()?;
+                None
+            }
+            ProcessedMessageContent::ProposalMessage(queued) => {
+                if token_is_join {
+                    return Some(err(ErrorCode::Invalid));
+                }
+                room.group.add_proposal(&room.storage, *queued).ok()?;
+                None
+            }
+            ProcessedMessageContent::StagedCommitMessage(staged) => {
+                let external = matches!(sender, Sender::NewMemberCommit);
+                if token_is_join != external {
+                    return Some(err(ErrorCode::Invalid));
+                }
+                // 12.6, point 4: from a signed-in connection.
+                if conn.1 != crate::conn::Slot::SignedIn {
+                    return Some(err(ErrorCode::Forbidden));
+                }
+                let Some(group_info) = groupinfo else {
+                    return Some(err(ErrorCode::Invalid));
+                };
+                let added: Vec<Vec<u8>> = staged
+                    .add_proposals()
+                    .filter_map(|q| {
+                        q.add_proposal()
+                            .key_package()
+                            .hash_ref(crypto)
+                            .ok()
+                            .map(|r| r.as_slice().to_vec())
+                    })
+                    .collect();
+                if room.group.merge_commit(&room.storage, *staged).is_err() {
+                    return Some(err(ErrorCode::Invalid));
+                }
+                let tree = risala_mls::wire::tree_to_bytes(&room.group.export_ratchet_tree());
+                let Some(mut fresh) =
+                    FakeRoom::build(crypto, room.name.clone(), group_info, tree.clone())
+                else {
+                    return Some(err(ErrorCode::Invalid));
+                };
+                let new_epoch = fresh.epoch();
+                fresh.trees = std::mem::take(&mut room.trees);
+                fresh.trees.insert(new_epoch, tree);
+                fresh.added = std::mem::take(&mut room.added);
+                for r in added {
+                    fresh.added.insert(r, new_epoch);
+                }
+                fresh.epoch_seq = m.posts.len() as u64 + 1;
+                *room = fresh;
+                None
+            }
+            _ => Some(err(ErrorCode::Invalid)),
         }
     }
 
@@ -171,6 +346,42 @@ impl FakeServer {
                             }
                             _ => Some(err(ErrorCode::NotFound)),
                         });
+                let public = match &form {
+                    risala_proto::command::CreateForm::Public(p) => {
+                        let (OrBlob::Inline(gi), OrBlob::Inline(tree)) = (&p.groupinfo, &p.tree)
+                        else {
+                            panic!("no blobs")
+                        };
+                        Some((p.room.to_string(), gi.decode(), tree.decode()))
+                    }
+                    _ => None,
+                };
+                let room = match public {
+                    Some((name, gi, tree)) => {
+                        if conn.1 != crate::conn::Slot::SignedIn {
+                            return (
+                                Response {
+                                    lines,
+                                    end: err(ErrorCode::WrongConnection),
+                                },
+                                live,
+                            );
+                        }
+                        match FakeRoom::build(&self.crypto, name, gi, tree) {
+                            Some(room) => Some(room),
+                            None => {
+                                return (
+                                    Response {
+                                        lines,
+                                        end: err(ErrorCode::Invalid),
+                                    },
+                                    live,
+                                );
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 if let Some(refused) = refused {
                     refused
                 } else {
@@ -189,6 +400,7 @@ impl FakeServer {
                                 posts: Vec::new(),
                                 tokens,
                                 followers: HashSet::new(),
+                                room,
                             });
                             End::Ok(ok())
                         }
@@ -201,11 +413,34 @@ impl FakeServer {
                 message,
                 live: is_live,
                 next,
+                groupinfo,
                 ..
             } => {
                 let b = mailbox.to_string();
                 let stale = self.stale_next.remove(&b);
+                // 12.6: a public room's commits and proposals.
+                let public = self.mailboxes.get(&b).is_some_and(|m| m.room.is_some());
+                let refused = match (&message, public) {
+                    (OrBlob::Inline(msg), true) => {
+                        let bytes = msg.decode();
+                        match read_post(&bytes) {
+                            Ok((framing, _))
+                                if framing.content_type != ContentType::Application =>
+                            {
+                                let gi = groupinfo.as_ref().map(|g| match g {
+                                    OrBlob::Inline(g) => g.decode(),
+                                    OrBlob::Blob(_) => panic!("no blobs"),
+                                });
+                                let join = matches!(token, PostToken::Join);
+                                self.check_room_post(&b, conn, &bytes, framing.epoch, join, gi)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
                 match self.mailboxes.get_mut(&b) {
+                    _ if refused.is_some() => refused.unwrap(),
                     None => err(ErrorCode::NotFound),
                     Some(m) => {
                         let OrBlob::Inline(message) = message else {
@@ -225,7 +460,8 @@ impl FakeServer {
                                         .tokens
                                         .get(&epoch)
                                         .is_some_and(|set| set.contains(&sha384(t.as_bytes()))),
-                                    PostToken::Join => false,
+                                    // Checked above, for public rooms only.
+                                    PostToken::Join => m.room.is_some(),
                                 };
                                 if is_commit != next.is_some()
                                     || (is_live && framing.content_type != ContentType::Application)
@@ -387,7 +623,7 @@ impl FakeServer {
                 key_package_ref,
                 secret,
                 welcome,
-            }) => match self
+            }) if !matches!(secret, WelcomeSecret::Proposal) => match self
                 .handed_out
                 .get(key_package_ref.as_bytes().as_slice())
                 .cloned()
@@ -398,6 +634,7 @@ impl FakeServer {
                 Some((_, hash)) if !matches!(&secret, WelcomeSecret::Put(s) if sha384(s.as_bytes()) == hash) => {
                     err(ErrorCode::Forbidden)
                 }
+                Some(_) if self.refuse_welcomes => err(ErrorCode::Forbidden),
                 Some((device, _)) => {
                     self.handed_out
                         .remove(key_package_ref.as_bytes().as_slice());
@@ -433,6 +670,109 @@ impl FakeServer {
                 }
                 End::Ok(ok())
             }
+            Command::List { .. } => {
+                let mut rooms: Vec<(&String, &Mailbox)> = self
+                    .mailboxes
+                    .iter()
+                    .filter(|(_, m)| m.room.is_some())
+                    .collect();
+                rooms.sort_by(|a, b| {
+                    a.1.room
+                        .as_ref()
+                        .unwrap()
+                        .name
+                        .cmp(&b.1.room.as_ref().unwrap().name)
+                });
+                for (b, m) in rooms {
+                    let room = m.room.as_ref().unwrap();
+                    lines.push(line(&format!("ROOM {} {b} {}", room.name, room.members())));
+                }
+                End::Ok(ok().with_more(false))
+            }
+            Command::Info { room: Some(name) } => {
+                match self
+                    .mailboxes
+                    .iter()
+                    .find(|(_, m)| m.room.as_ref().is_some_and(|r| r.name == name.as_str()))
+                {
+                    Some((b, m)) => {
+                        let room = m.room.as_ref().unwrap();
+                        End::Ok(
+                            ok().with_mailbox(&b.parse().unwrap())
+                                .with_members(room.members())
+                                .with_epoch(room.epoch()),
+                        )
+                    }
+                    None => err(ErrorCode::NotFound),
+                }
+            }
+            Command::GroupInfo { mailbox } => match self
+                .mailboxes
+                .get(&mailbox.to_string())
+                .and_then(|m| m.room.as_ref())
+            {
+                Some(room) => {
+                    lines.push(line(&format!(
+                        "GROUPINFO {mailbox} {} {} {} {}",
+                        room.epoch(),
+                        room.epoch_seq,
+                        b64(&room.group_info),
+                        b64(&room.tree)
+                    )));
+                    End::Ok(ok())
+                }
+                None => err(ErrorCode::NotFound),
+            },
+            Command::Welcome(WelcomeCommand::Put {
+                key_package_ref,
+                secret: WelcomeSecret::Proposal,
+                welcome,
+            }) => {
+                let reference = key_package_ref.as_bytes().to_vec();
+                let epoch = self
+                    .mailboxes
+                    .values()
+                    .filter_map(|m| m.room.as_ref())
+                    .find_map(|r| r.added.get(&reference).copied());
+                match epoch {
+                    None => err(ErrorCode::NotFound),
+                    // 12.8: on the signed-in connection of the committer.
+                    Some(_) if conn.1 != crate::conn::Slot::SignedIn => err(ErrorCode::Forbidden),
+                    Some(_) if self.refuse_welcomes => err(ErrorCode::Forbidden),
+                    Some(epoch) => {
+                        let OrBlob::Inline(welcome) = welcome else {
+                            panic!("no blobs")
+                        };
+                        let id = format!("w{}", self.next_welcome);
+                        self.next_welcome += 1;
+                        self.public_welcomes
+                            .insert(reference, (id, welcome.decode(), epoch));
+                        End::Ok(ok())
+                    }
+                }
+            }
+            Command::Welcome(WelcomeCommand::Get {
+                key_package_ref, ..
+            }) => match self
+                .public_welcomes
+                .get(key_package_ref.as_bytes().as_slice())
+            {
+                Some((id, welcome, epoch)) => {
+                    let tree = self
+                        .mailboxes
+                        .values()
+                        .filter_map(|m| m.room.as_ref())
+                        .find_map(|r| r.trees.get(epoch).cloned())
+                        .unwrap_or_default();
+                    lines.push(line(&format!(
+                        "WELCOME {id} {} tree={}",
+                        b64(welcome),
+                        b64(&tree)
+                    )));
+                    End::Ok(ok())
+                }
+                None => err(ErrorCode::NotFound),
+            },
             other => panic!("the fake server does not do {}", other.verb()),
         };
         (Response { lines, end }, live)

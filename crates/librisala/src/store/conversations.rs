@@ -26,9 +26,19 @@ pub(crate) const SCHEMA: &str = "
 -- read_seq is the read marker (7.7) on the current mailbox. state:
 -- 'creating' until its first commit won, 'active', 'leaving' after its
 -- PART, 'left' once removed, 'dropped' after DROP (6.1), 'failed' if
--- creating it failed. last_resort: joined with a last-resort KeyPackage,
--- so it must commit a new leaf key before it sends (12.5). prev_token is
--- the send token of the epoch before the current one, for TOKEN (7.2).
+-- creating it failed, 'joining' while a public room's join proposal
+-- waits for its commit and Welcome, or while the device joins a public
+-- room again that it could not follow (6.1, 12.7). last_resort: joined
+-- with a last-resort KeyPackage, so it must commit a new leaf key before
+-- it sends (12.5). prev_token is the send token of the epoch before the
+-- current one, for TOKEN (7.2). kept_ext is a public room's conversation
+-- extension of the newest epoch the device applied and checked itself,
+-- to compare before it joins again (12.7, Rejoining a public room);
+-- accept_change: the user chose to join again although the server
+-- changed it. pseudonym_period is the period (12.10) of a public room's
+-- pseudonym (7.3). joined_at is when the device joined by Welcome, and
+-- branch_seen whether it has since seen a post of another leaf in its
+-- epoch (12.8, a branch nobody follows).
 CREATE TABLE conversations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     account       INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -45,11 +55,17 @@ CREATE TABLE conversations (
     last_sent     BLOB,
     read_seq      INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT 'active'
-                  CHECK (state IN ('creating', 'active', 'leaving', 'left', 'dropped', 'failed')),
+                  CHECK (state IN ('creating', 'active', 'leaving', 'left', 'dropped', 'failed',
+                                   'joining')),
     last_resort   INTEGER NOT NULL DEFAULT 0,
     created       INTEGER NOT NULL,
     last_activity INTEGER,
     prev_token    BLOB,
+    kept_ext      BLOB,
+    accept_change INTEGER NOT NULL DEFAULT 0,
+    pseudonym_period INTEGER NOT NULL DEFAULT -1,
+    joined_at     INTEGER,
+    branch_seen   INTEGER NOT NULL DEFAULT 1,
     UNIQUE (account, group_id)
 );
 
@@ -74,7 +90,9 @@ CREATE INDEX mailboxes_box ON mailboxes (box);
 
 -- Posts received or fetched but not yet applied, by mailbox and seq
 -- (7.2, 7.4). They are applied in seq order once every earlier one has
--- been, then deleted. next is a commit's (5.2).
+-- been, then deleted. next is a commit's (5.2). blob is the hash of a
+-- post that came as a blob-ref (12.12), whose message is empty until the
+-- blob is fetched.
 CREATE TABLE posts (
     conv    INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     box     TEXT NOT NULL,
@@ -82,6 +100,7 @@ CREATE TABLE posts (
     t       INTEGER NOT NULL,
     message BLOB NOT NULL,
     next    BLOB,
+    blob    BLOB,
     PRIMARY KEY (conv, box, seq)
 ) WITHOUT ROWID;
 
@@ -122,6 +141,48 @@ CREATE TABLE key_packages (
     created     INTEGER NOT NULL,
     PRIMARY KEY (account, ref)
 ) WITHOUT ROWID;
+
+-- Joins of public rooms by external proposal (6.1), until the Welcome
+-- is in: the room, its box and group id, the conversation (a 'joining'
+-- row), the KeyPackage made for the join (an MLSMessage) and its
+-- KeyPackageRef, the epoch the proposal was last posted for, when it was
+-- first posted (for an owner's or moderator's rejoin after 30 minutes,
+-- 12.7), and, once a commit has added it, the epoch and seq of the
+-- commit that did (12.8).
+CREATE TABLE joins (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account     INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    conv        INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    room        TEXT NOT NULL,
+    box         TEXT NOT NULL,
+    key_package BLOB NOT NULL,
+    ref         BLOB NOT NULL,
+    epoch       INTEGER NOT NULL,
+    proposed_at INTEGER NOT NULL,
+    added_epoch INTEGER,
+    added_seq   INTEGER,
+    UNIQUE (conv)
+);
+
+-- The group id of each public room the account has joined, by name
+-- (6.1), to tell the user when a name leads to another group.
+CREATE TABLE room_groups (
+    account  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    room     TEXT NOT NULL,
+    group_id BLOB NOT NULL,
+    PRIMARY KEY (account, room)
+) WITHOUT ROWID;
+
+-- Welcomes to a guest's report conversation (12.7, 5.8), held until the
+-- user accepts or declines them: the server's id, the sealed Welcome, and
+-- the guest.
+CREATE TABLE held_welcomes (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    account  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    welcome  BLOB NOT NULL,
+    guest    TEXT NOT NULL,
+    received INTEGER NOT NULL
+);
 
 -- Blocks (5.7), per account, synced with BLOCK and UNBLOCK in the
 -- conversation with yourself. target is a uid or `*@<domain>`.
@@ -198,6 +259,9 @@ pub enum ConvState {
     Dropped,
     /// Creating it failed.
     Failed,
+    /// Joining a public room by proposal, or again after the device could
+    /// not follow it (6.1, 12.7).
+    Joining,
 }
 
 impl ConvState {
@@ -209,6 +273,7 @@ impl ConvState {
             ConvState::Left => "left",
             ConvState::Dropped => "dropped",
             ConvState::Failed => "failed",
+            ConvState::Joining => "joining",
         }
     }
 
@@ -220,6 +285,7 @@ impl ConvState {
             "left" => ConvState::Left,
             "dropped" => ConvState::Dropped,
             "failed" => ConvState::Failed,
+            "joining" => ConvState::Joining,
             other => return Err(StoreError::Corrupt(format!("conversation state {other:?}"))),
         })
     }
@@ -454,6 +520,67 @@ pub struct PostRow {
     pub message: Vec<u8>,
     /// A commit's `next` (5.2).
     pub next: Option<[u8; 48]>,
+    /// The hash of a post that came as a blob-ref (12.12): `message` is
+    /// empty until the blob is fetched.
+    pub blob: Option<[u8; 48]>,
+}
+
+/// A join of a public room by external proposal (6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinRow {
+    /// Its id.
+    pub id: i64,
+    /// The account.
+    pub account: AccountId,
+    /// The conversation, in state `joining`.
+    pub conv: ConversationId,
+    /// The room.
+    pub room: String,
+    /// Its box.
+    pub mailbox: BoxName,
+    /// The KeyPackage made for the join, as an MLSMessage.
+    pub key_package: Vec<u8>,
+    /// Its KeyPackageRef.
+    pub reference: Vec<u8>,
+    /// The epoch the proposal was last posted for.
+    pub epoch: u64,
+    /// When it was first posted.
+    pub proposed_at: u64,
+    /// The epoch of the commit that added it, once seen.
+    pub added_epoch: Option<u64>,
+    /// The seq of that commit, if known.
+    pub added_seq: Option<u64>,
+}
+
+/// A Welcome to a guest's report conversation, held for the user (12.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldWelcome {
+    /// Its id.
+    pub id: i64,
+    /// The account.
+    pub account: AccountId,
+    /// The sealed Welcome.
+    pub welcome: Vec<u8>,
+    /// The guest who made the conversation.
+    pub guest: Uid,
+    /// When it arrived.
+    pub received: u64,
+}
+
+/// What the cache keeps of a public room beside its row (12.7, 7.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PublicState {
+    /// The extension of the newest epoch applied and checked here.
+    pub kept_ext: Option<Vec<u8>>,
+    /// Whether the user chose to join again although the server changed
+    /// the room.
+    pub accept_change: bool,
+    /// The period of the pseudonym, or -1.
+    pub pseudonym_period: i64,
+    /// When the device joined by Welcome.
+    pub joined_at: Option<u64>,
+    /// Whether it has seen a post of another leaf in its epoch since.
+    pub branch_seen: bool,
 }
 
 /// A leaf of a group, as the cache keeps it.
@@ -627,7 +754,7 @@ pub(crate) mod read {
             "SELECT m.conv, m.box, m.current, m.first_epoch, m.sync_point, m.head,
                     m.follow_after, m.unfollow_at
              FROM mailboxes m JOIN conversations c ON c.id = m.conv
-             WHERE c.account = ?1 AND c.state IN ('creating', 'active', 'leaving')
+             WHERE c.account = ?1 AND c.state IN ('creating', 'active', 'leaving', 'joining')
              ORDER BY m.conv, m.current DESC",
             [account.0],
             mailbox_row,
@@ -1032,7 +1159,8 @@ impl Tx<'_> {
             return Ok(false);
         }
         let n = self.conn().execute(
-            "INSERT INTO posts (conv, box, seq, t, message, next) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO posts (conv, box, seq, t, message, next, blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT DO NOTHING",
             params![
                 conv.0,
@@ -1040,7 +1168,8 @@ impl Tx<'_> {
                 post.seq as i64,
                 post.t as i64,
                 post.message,
-                post.next.as_ref().map(|n| &n[..])
+                post.next.as_ref().map(|n| &n[..]),
+                post.blob.as_ref().map(|n| &n[..])
             ],
         )?;
         Ok(n > 0)
@@ -1055,7 +1184,8 @@ impl Tx<'_> {
     ) -> Result<Option<PostRow>, StoreError> {
         self.conn()
             .query_row(
-                "SELECT seq, t, message, next FROM posts WHERE conv = ?1 AND box = ?2 AND seq = ?3",
+                "SELECT seq, t, message, next, blob FROM posts
+                 WHERE conv = ?1 AND box = ?2 AND seq = ?3",
                 params![conv.0, mailbox.to_string(), seq as i64],
                 |r| {
                     Ok((
@@ -1063,16 +1193,18 @@ impl Tx<'_> {
                         r.get::<_, i64>(1)?,
                         r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
                     ))
                 },
             )
             .optional()?
-            .map(|(seq, t, message, next)| {
+            .map(|(seq, t, message, next, blob)| {
                 Ok(PostRow {
                     seq: seq as u64,
                     t: t as u64,
                     message,
                     next: next.map(|n| fixed(n, "next")).transpose()?,
+                    blob: blob.map(|n| fixed(n, "blob")).transpose()?,
                 })
             })
             .transpose()
@@ -1344,6 +1476,312 @@ impl Tx<'_> {
     pub(crate) fn blocks(&self, account: AccountId) -> Result<Vec<String>, StoreError> {
         read::blocks(self.conn(), account)
     }
+    // ---- public rooms (6.1, 7.3, 12.7, 12.8)
+
+    /// Puts the bytes of a post fetched from its blob (12.12).
+    pub(crate) fn set_post_message(
+        &mut self,
+        conv: ConversationId,
+        mailbox: &BoxName,
+        seq: u64,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE posts SET message = ?4, blob = NULL WHERE conv = ?1 AND box = ?2 AND seq = ?3",
+            params![conv.0, mailbox.to_string(), seq as i64, message],
+        )?;
+        Ok(())
+    }
+
+    /// What the cache keeps of a public room beside its row.
+    pub(crate) fn public_state(&self, conv: ConversationId) -> Result<PublicState, StoreError> {
+        Ok(self.conn().query_row(
+            "SELECT kept_ext, accept_change, pseudonym_period, joined_at, branch_seen
+             FROM conversations WHERE id = ?1",
+            [conv.0],
+            |r| {
+                Ok(PublicState {
+                    kept_ext: r.get(0)?,
+                    accept_change: r.get(1)?,
+                    pseudonym_period: r.get(2)?,
+                    joined_at: r.get::<_, Option<i64>>(3)?.map(|t| t as u64),
+                    branch_seen: r.get(4)?,
+                })
+            },
+        )?)
+    }
+
+    /// Keeps a public room's extension, applied and checked here (12.7).
+    pub(crate) fn set_kept_ext(
+        &mut self,
+        conv: ConversationId,
+        ext: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE conversations SET kept_ext = ?2 WHERE id = ?1",
+            params![conv.0, ext],
+        )?;
+        Ok(())
+    }
+
+    /// Notes whether the user chose to join a public room again although
+    /// the server changed it (12.7).
+    pub(crate) fn set_accept_change(
+        &mut self,
+        conv: ConversationId,
+        accept: bool,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE conversations SET accept_change = ?2 WHERE id = ?1",
+            params![conv.0, accept],
+        )?;
+        Ok(())
+    }
+
+    /// Sets a public room's pseudonym for a period (7.3).
+    pub(crate) fn set_pseudonym(
+        &mut self,
+        conv: ConversationId,
+        pseudonym: &[u8; 16],
+        period: u32,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE conversations SET pseudonym = ?2, pseudonym_period = ?3 WHERE id = ?1",
+            params![conv.0, &pseudonym[..], i64::from(period)],
+        )?;
+        Ok(())
+    }
+
+    /// Notes that the device joined by Welcome at `t`, and has seen no post
+    /// of another leaf in its epoch yet (12.8).
+    pub(crate) fn set_joined(&mut self, conv: ConversationId, t: u64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE conversations SET joined_at = ?2, branch_seen = 0 WHERE id = ?1",
+            params![conv.0, t as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Notes that the device has seen a post of another leaf in its epoch
+    /// (12.8). Returns whether that is new.
+    pub(crate) fn set_branch_seen(&mut self, conv: ConversationId) -> Result<bool, StoreError> {
+        let n = self.conn().execute(
+            "UPDATE conversations SET branch_seen = 1 WHERE id = ?1 AND branch_seen = 0",
+            [conv.0],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Adds a join of a public room (6.1), or starts a conversation's join
+    /// again.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_join(
+        &mut self,
+        account: AccountId,
+        conv: ConversationId,
+        room: &str,
+        mailbox: &BoxName,
+        key_package: &[u8],
+        reference: &[u8],
+        epoch: u64,
+        now: u64,
+    ) -> Result<i64, StoreError> {
+        self.conn().execute(
+            "INSERT INTO joins (account, conv, room, box, key_package, ref, epoch, proposed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (conv) DO UPDATE SET key_package = excluded.key_package,
+                 ref = excluded.ref, epoch = excluded.epoch,
+                 proposed_at = excluded.proposed_at, added_epoch = NULL, added_seq = NULL",
+            params![
+                account.0,
+                conv.0,
+                room,
+                mailbox.to_string(),
+                key_package,
+                reference,
+                epoch as i64,
+                now as i64
+            ],
+        )?;
+        Ok(self
+            .conn()
+            .query_row("SELECT id FROM joins WHERE conv = ?1", [conv.0], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// The account's joins.
+    pub(crate) fn joins(&self, account: AccountId) -> Result<Vec<JoinRow>, StoreError> {
+        query_all(
+            self.conn(),
+            &format!("SELECT {JOIN_COLUMNS} FROM joins WHERE account = ?1 ORDER BY id"),
+            [account.0],
+            join_row,
+            |r| r,
+        )
+    }
+
+    /// The join of a conversation, if there is one.
+    pub(crate) fn join_of(&self, conv: ConversationId) -> Result<Option<JoinRow>, StoreError> {
+        self.conn()
+            .query_row(
+                &format!("SELECT {JOIN_COLUMNS} FROM joins WHERE conv = ?1"),
+                [conv.0],
+                join_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Notes the epoch a join's proposal was posted again for.
+    pub(crate) fn set_join_epoch(&mut self, id: i64, epoch: u64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE joins SET epoch = ?2 WHERE id = ?1",
+            params![id, epoch as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Notes that a commit has added the join's leaf, by `epoch` at the
+    /// latest, with the seq of the commit that started that epoch.
+    pub(crate) fn set_join_added(
+        &mut self,
+        id: i64,
+        epoch: u64,
+        seq: Option<u64>,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE joins SET added_epoch = coalesce(added_epoch, ?2),
+                              added_seq = coalesce(added_seq, ?3)
+             WHERE id = ?1",
+            params![id, epoch as i64, seq.map(|s| s as i64)],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a join, once joined or given up.
+    pub(crate) fn delete_join(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM joins WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// The group id the account last joined a public room of this name
+    /// with (6.1).
+    pub(crate) fn room_group(
+        &self,
+        account: AccountId,
+        room: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT group_id FROM room_groups WHERE account = ?1 AND room = ?2",
+                params![account.0, room],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Remembers the group id of a public room the account joined (6.1).
+    pub(crate) fn set_room_group(
+        &mut self,
+        account: AccountId,
+        room: &str,
+        group_id: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO room_groups (account, room, group_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account, room) DO UPDATE SET group_id = excluded.group_id",
+            params![account.0, room, group_id],
+        )?;
+        Ok(())
+    }
+
+    /// Holds a Welcome to a guest's report conversation for the user
+    /// (12.7). Returns its id; the same Welcome is held once.
+    pub(crate) fn hold_welcome(
+        &mut self,
+        account: AccountId,
+        welcome: &[u8],
+        guest: &Uid,
+        now: u64,
+    ) -> Result<i64, StoreError> {
+        let existing: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT id FROM held_welcomes WHERE account = ?1 AND welcome = ?2",
+                params![account.0, welcome],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        self.conn().execute(
+            "INSERT INTO held_welcomes (account, welcome, guest, received) VALUES (?1, ?2, ?3, ?4)",
+            params![account.0, welcome, guest.as_str(), now as i64],
+        )?;
+        Ok(self.conn().last_insert_rowid())
+    }
+
+    /// A held Welcome.
+    pub(crate) fn held_welcome(&self, id: i64) -> Result<Option<HeldWelcome>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT id, account, welcome, guest, received FROM held_welcomes WHERE id = ?1",
+                [id],
+                held_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Deletes a held Welcome.
+    pub(crate) fn drop_held_welcome(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM held_welcomes WHERE id = ?1", [id])?;
+        Ok(())
+    }
+}
+
+const JOIN_COLUMNS: &str = "id, account, conv, room, box, key_package, ref, epoch, proposed_at, \
+     added_epoch, added_seq";
+
+fn join_row(r: &Row<'_>) -> rusqlite::Result<Result<JoinRow, StoreError>> {
+    let mailbox: String = r.get(4)?;
+    let mailbox = match parse(&mailbox, "box") {
+        Ok(m) => m,
+        Err(e) => return Ok(Err(e)),
+    };
+    Ok(Ok(JoinRow {
+        id: r.get(0)?,
+        account: AccountId(r.get(1)?),
+        conv: ConversationId(r.get(2)?),
+        room: r.get(3)?,
+        mailbox,
+        key_package: r.get(5)?,
+        reference: r.get(6)?,
+        epoch: r.get::<_, i64>(7)? as u64,
+        proposed_at: r.get::<_, i64>(8)? as u64,
+        added_epoch: r.get::<_, Option<i64>>(9)?.map(|e| e as u64),
+        added_seq: r.get::<_, Option<i64>>(10)?.map(|s| s as u64),
+    }))
+}
+
+fn held_row(r: &Row<'_>) -> rusqlite::Result<Result<HeldWelcome, StoreError>> {
+    let guest: String = r.get(3)?;
+    let guest = match parse(&guest, "uid") {
+        Ok(g) => g,
+        Err(e) => return Ok(Err(e)),
+    };
+    Ok(Ok(HeldWelcome {
+        id: r.get(0)?,
+        account: AccountId(r.get(1)?),
+        welcome: r.get(2)?,
+        guest,
+        received: r.get::<_, i64>(4)? as u64,
+    }))
 }
 
 /// Whether `uid` is covered by one of `blocks` (5.7): the uid itself, or

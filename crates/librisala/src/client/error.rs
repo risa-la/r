@@ -66,8 +66,3 @@ impl Error {
         }
     }
 }
-
-/// The result of an API method whose area task has not built it yet.
-pub(crate) fn not_implemented<T>(what: &'static str) -> Result<T> {
-    Err(Error::NotImplemented(what))
-}

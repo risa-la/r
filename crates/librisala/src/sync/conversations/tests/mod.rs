@@ -2,6 +2,7 @@
 //! [`server`]: direct conversations, private rooms, the conversation with
 //! yourself, commits racing for an epoch, leaving, gaps and catching up.
 
+mod public;
 mod scenarios;
 pub(crate) mod server;
 
@@ -53,6 +54,7 @@ struct Device {
     device_id: Vec<u8>,
     events: Vec<Event>,
     online: bool,
+    guest: bool,
 }
 
 enum Owned {
@@ -96,9 +98,12 @@ impl Net {
         let uid: Uid = uid.parse().unwrap();
         let store = Store::open_in_memory().unwrap();
         let addr: ServerAddr = "chat.example.org".parse().unwrap();
-        let account = store
-            .add_account(&addr, AccountKind::Identity, &uid)
-            .unwrap();
+        let kind = if uid.is_guest() {
+            AccountKind::Guest
+        } else {
+            AccountKind::Identity
+        };
+        let account = store.add_account(&addr, kind, &uid).unwrap();
         let key = SigningKey::generate().unwrap();
         let device_id = key.device_id().as_bytes().to_vec();
         let hooks = Arc::new(TestHooks { key, confirm: true });
@@ -116,13 +121,35 @@ impl Net {
             device_id,
             events: Vec::new(),
             online: false,
+            guest: false,
         });
+        d
+    }
+
+    /// Adds a second device of the identity of device `of`.
+    fn device_of(&mut self, name: &'static str, of: usize) -> usize {
+        let uid = self.devices[of].uid.to_string();
+        let uid: &'static str = Box::leak(uid.into_boxed_str());
+        self.device(name, uid)
+    }
+
+    /// Adds a guest, `~<name>` (4.2): no device key, one guest connection.
+    fn guest(&mut self, name: &'static str, uid: &str) -> usize {
+        let d = self.device(name, uid);
+        self.devices[d].guest = true;
+        self.server.signed_in.remove(&(d, Slot::SignedIn));
         d
     }
 
     /// Brings a device's connections up: signed in, and one anonymous.
     fn connect(&mut self, d: usize) {
         self.devices[d].online = true;
+        if self.devices[d].guest {
+            self.queue
+                .push_back((d, Owned::Ready(Slot::Guest, ConnectionKind::Guest)));
+            self.run();
+            return;
+        }
         self.queue
             .push_back((d, Owned::Ready(Slot::SignedIn, ConnectionKind::SignedIn)));
         self.queue.push_back((
@@ -135,6 +162,12 @@ impl Net {
     /// Takes a device's connections down.
     fn disconnect(&mut self, d: usize) {
         self.devices[d].online = false;
+        if self.devices[d].guest {
+            self.server.close((d, Slot::Guest));
+            self.queue.push_back((d, Owned::Closed(Slot::Guest)));
+            self.run();
+            return;
+        }
         self.server.close((d, Slot::Anonymous(0)));
         self.queue.push_back((d, Owned::Closed(Slot::Anonymous(0))));
         self.queue.push_back((d, Owned::Closed(Slot::SignedIn)));
@@ -204,6 +237,9 @@ impl Net {
                 } => {
                     let slot = match target {
                         Target::SignedIn => Slot::SignedIn,
+                        Target::Mailbox(_) | Target::Conversing if self.devices[d].guest => {
+                            Slot::Guest
+                        }
                         Target::Mailbox(_) | Target::Conversing => Slot::Anonymous(0),
                         Target::Watch => Slot::Watch,
                         Target::Own(_) => SINGLE_USE_SLOT,
@@ -352,5 +388,85 @@ impl Net {
             .unwrap()
             .unwrap()
             .state
+    }
+}
+
+impl Net {
+    /// Starts a job, and lets the network and the clock run for up to
+    /// `minutes` minutes, a minute at a time, until it is done.
+    fn job_over(&mut self, d: usize, job: Job, minutes: u64) -> Result<ConversationId, String> {
+        let cx = self.cx(d);
+        let (id, actions) = self.devices[d].engine.start(&cx, job);
+        self.act(d, actions);
+        self.run();
+        self.tick();
+        for _ in 0..=minutes {
+            if let Some(r) = self.job_result(d, id) {
+                return r;
+            }
+            self.advance(60_000);
+        }
+        Err(format!("{}: the job did not finish", self.devices[d].name))
+    }
+
+    fn job_result(&self, d: usize, id: JobId) -> Option<Result<ConversationId, String>> {
+        self.devices[d].events.iter().find_map(|event| match event {
+            Event::Conversation(ConversationEvent::JobDone {
+                job,
+                conversation,
+                error,
+            }) if *job == id => Some(match (conversation, error) {
+                (Some(c), None) => Ok(*c),
+                (_, Some(e)) => Err(e.clone()),
+                _ => Err("no result".into()),
+            }),
+            _ => None,
+        })
+    }
+
+    /// Delivers live lines from the server, as if it sent them.
+    fn deliver(&mut self, lines: Vec<(server::ConnId, ServerMessage)>) {
+        for ((to, slot), line) in lines {
+            self.queue.push_back((to, Owned::Line(slot, line)));
+        }
+        self.run();
+    }
+
+    /// Pins the pseudonym that device `sender` sends under in `conv` (its
+    /// conversation there) at device `d`, as leaf confirmation (task C3)
+    /// does once it has checked the sender's ATTEST (7.3, 12.10).
+    fn pin(&self, d: usize, conv_d: ConversationId, sender: usize, conv_s: ConversationId) {
+        use risala_mls::message::MessageHistory as _;
+        let row = self.devices[sender]
+            .store
+            .conversation_row(conv_s)
+            .unwrap()
+            .unwrap();
+        let leaf = self.devices[d]
+            .store
+            .leaf_rows(conv_d)
+            .unwrap()
+            .into_iter()
+            .find(|l| {
+                l.uid == self.devices[sender].uid
+                    && (self.devices[sender].guest
+                        || l.device_id.map(|x| x.to_vec())
+                            == Some(self.devices[sender].device_id.clone()))
+            })
+            .expect("the sender's leaf")
+            .leaf;
+        self.write(d, |tx| {
+            let mut log = crate::store::messages::MessageLog::new(tx.conn(), conv_d);
+            log.pin(
+                risala_mls::openmls::prelude::LeafNodeIndex::new(leaf),
+                risala_mls::aad::Pseudonym(row.pseudonym),
+            );
+            log.finish()?;
+            Ok(())
+        });
+    }
+
+    fn events(&self, d: usize) -> &[Event] {
+        &self.devices[d].events
     }
 }

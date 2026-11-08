@@ -94,23 +94,6 @@ fn trust_decisions() {
 }
 
 #[tokio::test]
-async fn area_methods_say_they_are_not_implemented() {
-    let c = client();
-    let account = c.add_guest("chat.example.org", "sam").unwrap().id;
-    let conv = crate::store::conversations::ConversationId(1);
-    let message = types::MessageId([0; 16]);
-    let not_implemented = |r: Result<()>, name: &str| match r {
-        Err(Error::NotImplemented(n)) => assert_eq!(n, name),
-        other => panic!("{name}: {other:?}"),
-    };
-    not_implemented(
-        c.join_public_room(account, "#general").await.map(drop),
-        "join_public_room",
-    );
-    let _ = (message, conv);
-}
-
-#[tokio::test]
 async fn an_identity_this_device_does_not_hold_cannot_connect() {
     let c = client();
     let alice = c

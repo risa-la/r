@@ -28,6 +28,8 @@ base64.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
 openmls_sqlite_storage.workspace = true
+# A public room's group as an outsider sees it, before joining (6.1, 12.7).
+openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 
 # SQLCipher, to encrypt the cache (PLAN.md 43). On Apple platforms it uses
 # CommonCrypto. Elsewhere it uses OpenSSL's libcrypto, built from source
@@ -48,8 +50,9 @@ openmls.workspace = true
 openmls_libcrux_crypto.workspace = true
 openmls_basic_credential.workspace = true
 openmls_traits.workspace = true
-# A whole risalad for the identity tests (tests/identity_server.rs), and
-# its push bodies, decrypted by the client (client/push.rs).
+# A whole risalad for the identity and conversation tests
+# (tests/identity_server.rs, client/conversations/server_tests.rs), and its
+# push bodies, decrypted by the client (client/push.rs).
 risala-server = { path = "../risala-server" }
 risala-keylog.workspace = true
 
