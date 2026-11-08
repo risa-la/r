@@ -35,8 +35,23 @@ use risala_proto::types::{GuestAccess, Role};
 
 use super::Result;
 
-/// The most hashes in one set of send token hashes (7.2).
-pub const MAX_SET_HASHES: usize = 64;
+/// The most hashes that commits and CREATE add to one set of send token
+/// hashes (7.2).
+pub const MAX_SET_NEXT_HASHES: usize = 16;
+
+/// The most hashes that TOKEN adds to one set of send token hashes (7.2).
+pub const MAX_SET_TOKEN_HASHES: usize = 64;
+
+/// Who added a hash to a set of send token hashes (7.2): a set keeps the
+/// two apart, each part with its own bound, so that TOKEN never pushes
+/// out a hash that a commit added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddedBy {
+    /// A commit's `next`, or CREATE.
+    Commit,
+    /// TOKEN.
+    Token,
+}
 
 /// The most sets of send token hashes the server keeps for one mailbox: it
 /// keeps those used most recently (7.2).
@@ -72,6 +87,9 @@ pub enum Created {
     /// A move, but the server holds no mailbox of the group
     /// (`ERR not-found`, 7.8).
     NoGroup,
+    /// A move whose box is already the mailbox of that group from that
+    /// epoch: nothing changes (`OK`, 7.8).
+    Exists,
 }
 
 /// A mailbox, as stored.
@@ -266,9 +284,11 @@ pub trait MailboxStore {
     /// and BLOB (5.6, 12.12).
     fn has_token_any(&self, mailbox: &BoxName, hash: &TokenHash) -> Result<bool>;
 
-    /// Adds `hash` to the set of `epoch` of `mailbox` at `now`, within the
-    /// bounds of 7.2: a set holds at most [`MAX_SET_HASHES`], and a full
-    /// set drops the hash added first among those no post has used, or if
+    /// Adds `hash`, which TOKEN brings, to the set of `epoch` of `mailbox`
+    /// at `now`, within the bounds of 7.2: the part of a set that TOKEN
+    /// added holds at most [`MAX_SET_TOKEN_HASHES`], and the part that
+    /// commits and CREATE added at most [`MAX_SET_NEXT_HASHES`]; a full
+    /// part drops the hash added first among those no post has used, or if
     /// every one has been used, the one a post used least recently; a
     /// mailbox keeps at most [`MAX_SETS`] sets, and drops the one used
     /// least recently. A hash the set holds already changes nothing.

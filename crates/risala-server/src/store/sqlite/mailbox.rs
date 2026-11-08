@@ -13,7 +13,9 @@ use risala_proto::types::Role;
 
 use super::{SqliteStore, from_sql_u64, sql_u64};
 use crate::secret::ct_eq;
-use crate::store::mailbox::{CID_LIFETIME, MAX_SET_HASHES, MAX_SETS};
+use crate::store::mailbox::{
+    AddedBy, CID_LIFETIME, MAX_SET_NEXT_HASHES, MAX_SET_TOKEN_HASHES, MAX_SETS,
+};
 use crate::store::{
     Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom, PostBody,
     Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomUpdate, StoreError, StoredPost,
@@ -45,14 +47,16 @@ CREATE TABLE mailboxes (
 ) STRICT;
 CREATE INDEX mailboxes_group ON mailboxes (group_id, created);
 
--- The sets of send token hashes (7.2), per mailbox and epoch: at most 64
--- hashes a set, each with when it was added and last used by a post.
+-- The sets of send token hashes (7.2), per mailbox and epoch: at most 16
+-- hashes that commits and CREATE added and 64 that TOKEN added, each with
+-- when it was added and last used by a post.
 CREATE TABLE token_hashes (
     box BLOB NOT NULL REFERENCES mailboxes (box) ON DELETE CASCADE,
     epoch INTEGER NOT NULL CHECK (epoch >= 0),
     hash BLOB NOT NULL CHECK (length(hash) = 48),
     added INTEGER NOT NULL,         -- ms
     used INTEGER,                   -- ms of the last post that used it
+    token INTEGER NOT NULL DEFAULT 0 CHECK (token IN (0, 1)), -- 1 if TOKEN added it, 0 a commit or CREATE
     PRIMARY KEY (box, epoch, hash)
 ) STRICT; -- with a rowid, the order hashes were added in
 
@@ -189,7 +193,22 @@ fn check_new(tx: &Transaction<'_>, new: &NewMailbox) -> Result<Result<Option<Vec
     let mailbox = &new.mailbox.as_bytes()[..];
     let group = &new.group_id.as_bytes()[..];
     if used(tx, USED_BOX, mailbox)? {
-        return Ok(Err(Created::Taken));
+        // A move to a box that is already the group's mailbox from that
+        // epoch changes nothing (7.8).
+        let same = new.first_epoch > 0
+            && tx
+                .query_row(
+                    "SELECT 1 FROM mailboxes WHERE box = ? AND group_id = ? AND first_epoch = ?",
+                    params![mailbox, group, sql_u64(new.first_epoch)],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+        return Ok(Err(if same {
+            Created::Exists
+        } else {
+            Created::Taken
+        }));
     }
     if new.first_epoch == 0 {
         if used(tx, USED_GROUP, group)? {
@@ -231,7 +250,14 @@ fn insert_mailbox(
             created
         ],
     )?;
-    add_token(tx, mailbox, new.first_epoch, &new.token_hash, created)
+    add_token(
+        tx,
+        mailbox,
+        new.first_epoch,
+        &new.token_hash,
+        AddedBy::Commit,
+        created,
+    )
 }
 
 /// [`MailboxStore::add_token`], in a transaction.
@@ -240,8 +266,13 @@ fn add_token(
     mailbox: &[u8],
     epoch: u64,
     hash: &TokenHash,
+    by: AddedBy,
     now: i64,
 ) -> Result<()> {
+    let (part, max) = match by {
+        AddedBy::Commit => (0, MAX_SET_NEXT_HASHES),
+        AddedBy::Token => (1, MAX_SET_TOKEN_HASHES),
+    };
     let epoch = sql_u64(epoch);
     let hash = &hash.as_bytes()[..];
     let held = tx
@@ -260,6 +291,11 @@ fn add_token(
         params![mailbox, epoch],
         |row| row.get(0),
     )?;
+    let in_part: i64 = tx.query_row(
+        "SELECT count(*) FROM token_hashes WHERE box = ? AND epoch = ? AND token = ?",
+        params![mailbox, epoch, part],
+        |row| row.get(0),
+    )?;
     if in_set == 0 {
         // A new set: the mailbox keeps the MAX_SETS used most recently.
         let sets: i64 = tx.query_row(
@@ -275,19 +311,19 @@ fn add_token(
                 [mailbox],
             )?;
         }
-    } else if in_set >= MAX_SET_HASHES as i64 {
-        // A full set drops the hash added first among those no post has
+    } else if in_part >= max as i64 {
+        // A full part drops the hash added first among those no post has
         // used, or the one a post used least recently.
         tx.execute(
             "DELETE FROM token_hashes WHERE rowid = (
-                 SELECT rowid FROM token_hashes WHERE box = ?1 AND epoch = ?2
+                 SELECT rowid FROM token_hashes WHERE box = ?1 AND epoch = ?2 AND token = ?3
                  ORDER BY used IS NOT NULL, coalesce(used, added), rowid LIMIT 1)",
-            params![mailbox, epoch],
+            params![mailbox, epoch, part],
         )?;
     }
     tx.execute(
-        "INSERT INTO token_hashes (box, epoch, hash, added) VALUES (?, ?, ?, ?)",
-        params![mailbox, epoch, hash, now],
+        "INSERT INTO token_hashes (box, epoch, hash, added, token) VALUES (?, ?, ?, ?, ?)",
+        params![mailbox, epoch, hash, now, part],
     )?;
     Ok(())
 }
@@ -455,7 +491,16 @@ impl MailboxStore for SqliteStore {
         hash: &TokenHash,
         now: Timestamp,
     ) -> Result<()> {
-        self.write(|tx| add_token(tx, &mailbox.as_bytes()[..], epoch, hash, millis(now)))
+        self.write(|tx| {
+            add_token(
+                tx,
+                &mailbox.as_bytes()[..],
+                epoch,
+                hash,
+                AddedBy::Token,
+                millis(now),
+            )
+        })
     }
 
     fn add_post(&self, post: &NewPost) -> Result<Posted> {
@@ -522,7 +567,14 @@ impl MailboxStore for SqliteStore {
                 )?;
             }
             if let Some((epoch, next)) = &post.next {
-                add_token(tx, mailbox, epoch.saturating_add(1), next, t)?;
+                add_token(
+                    tx,
+                    mailbox,
+                    epoch.saturating_add(1),
+                    next,
+                    AddedBy::Commit,
+                    t,
+                )?;
             }
             if let Some(cid) = &post.cid {
                 tx.execute(
@@ -1152,49 +1204,89 @@ mod tests {
         );
     }
 
-    /// A full set drops the hash added first that no post has used, then
-    /// the one a post used least recently; a hash it holds changes nothing
-    /// (7.2).
+    /// A set keeps what commits and CREATE added apart from what TOKEN
+    /// added, at most 16 and 64; a full part drops the hash added first
+    /// that no post has used, then the one a post used least recently; a
+    /// hash the set holds already changes nothing (7.2).
     #[test]
     fn token_sets_are_bounded() {
         let store = SqliteStore::open_in_memory().unwrap();
         let m = new_mailbox(200);
         store.create_mailbox(&m).unwrap();
-        for n in 0..63 {
+        // TOKEN's part: 64 hashes, besides CREATE's.
+        for n in 0..64 {
             store
                 .add_token(&m.mailbox, 0, &hash(n), t(u64::from(n)))
                 .unwrap();
         }
-        // The set has 64 hashes, the mailbox's own first.
-        assert_eq!(set(&store, &m.mailbox, 0).len(), 64);
+        assert_eq!(set(&store, &m.mailbox, 0).len(), 65);
         store.add_token(&m.mailbox, 0, &hash(5), t(100)).unwrap();
-        assert_eq!(set(&store, &m.mailbox, 0).len(), 64);
+        assert_eq!(set(&store, &m.mailbox, 0).len(), 65);
         // Posts use hashes 0 and 1, 1 before 0.
         for (n, secs) in [(1, 200), (0, 201)] {
             let mut p = post(m.mailbox, secs, 1);
             p.token = Some((0, hash(n)));
             store.add_post(&p).unwrap();
         }
-        // New hashes push out the unused ones, oldest first: the
-        // mailbox's own, then 2, 3, ...
+        // New hashes push out TOKEN's unused ones, oldest first, never
+        // CREATE's.
         store.add_token(&m.mailbox, 0, &hash(100), t(300)).unwrap();
+        store.add_token(&m.mailbox, 0, &hash(101), t(301)).unwrap();
         let held = set(&store, &m.mailbox, 0);
-        assert_eq!(held.len(), 64);
-        assert!(!held.contains(&200) && held.contains(&1) && held.contains(&2));
-        store.add_token(&m.mailbox, 0, &hash(102), t(301)).unwrap();
-        let held = set(&store, &m.mailbox, 0);
-        assert!(!held.contains(&2) && held.contains(&0) && held.contains(&3));
-        // Once every hash has been used, the least recently used goes.
+        assert_eq!(held.len(), 65);
+        assert!(held.contains(&200) && held.contains(&0) && held.contains(&1));
+        assert!(!held.contains(&2) && !held.contains(&3) && held.contains(&4));
+        // Once every one of TOKEN's hashes has been used, the least
+        // recently used goes.
         for n in held.clone() {
-            if n != 0 && n != 1 {
+            if n != 0 && n != 1 && n != 200 {
                 let mut p = post(m.mailbox, 400, 1);
                 p.token = Some((0, hash(n)));
                 store.add_post(&p).unwrap();
             }
         }
-        store.add_token(&m.mailbox, 0, &hash(101), t(500)).unwrap();
+        store.add_token(&m.mailbox, 0, &hash(102), t(500)).unwrap();
         let held = set(&store, &m.mailbox, 0);
-        assert!(!held.contains(&1) && held.contains(&0) && held.contains(&101));
+        assert!(!held.contains(&1) && held.contains(&0) && held.contains(&102));
+
+        // Commits' part: 16 hashes. TOKEN's hashes do not count.
+        for n in 0..17u8 {
+            let mut p = post(m.mailbox, 600 + u64::from(n), 1);
+            p.next = Some((0, hash(150 + n)));
+            store.add_post(&p).unwrap();
+            store.add_token(&m.mailbox, 1, &hash(n), t(600)).unwrap();
+        }
+        let held = set(&store, &m.mailbox, 1);
+        assert_eq!(held.len(), 16 + 17);
+        assert!(!held.contains(&150) && held.contains(&151) && held.contains(&166));
+    }
+
+    /// A move to a box that is already the group's mailbox from that epoch
+    /// changes nothing (7.8).
+    #[test]
+    fn moving_twice_to_the_same_box() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = new_mailbox(1);
+        store.create_mailbox(&first).unwrap();
+        let moved = NewMailbox {
+            mailbox: BoxName::from_bytes([2; 16]),
+            first_epoch: 5,
+            ..first.clone()
+        };
+        assert_eq!(store.create_mailbox(&moved).unwrap(), Created::Created);
+        assert_eq!(store.create_mailbox(&moved).unwrap(), Created::Exists);
+        let other_epoch = NewMailbox {
+            first_epoch: 6,
+            ..moved.clone()
+        };
+        assert_eq!(store.create_mailbox(&other_epoch).unwrap(), Created::Taken);
+        let other_group = NewMailbox {
+            group_id: GroupId::from_bytes([9; 32]),
+            ..moved.clone()
+        };
+        assert_eq!(store.create_mailbox(&other_group).unwrap(), Created::Taken);
+        // Without epoch, a box seen before is taken.
+        assert_eq!(store.create_mailbox(&first).unwrap(), Created::Taken);
     }
 
     /// A mailbox keeps the 256 sets used most recently (7.2).

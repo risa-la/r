@@ -435,7 +435,7 @@ async fn create(
         created: now,
     };
     match cx.db(move |store| store.create_mailbox(&new)).await? {
-        Created::Created => Ok(OkResponse::new()),
+        Created::Created | Created::Exists => Ok(OkResponse::new()),
         Created::Taken => Err(err(ErrorCode::NameTaken)),
         Created::NoGroup => Err(err(ErrorCode::NotFound)),
     }
@@ -708,9 +708,16 @@ async fn handle_token(
     let _lock = inner.mailbox.lock(mailbox).await;
     let now = inner.now();
     let record = self::mailbox(cx, mailbox).await?;
-    let Some(next_epoch) = epoch.checked_add(1) else {
+    // In a public room, the server takes one commit an epoch, so a wrong
+    // hash leads to a resync, never to TOKEN (7.2, 12.7).
+    if record.room.is_some() {
+        return Err(err(ErrorCode::Forbidden).with_message("not in a public room"));
+    }
+    // An epoch of 2^63-1 has no next epoch (3.3, 7.2).
+    let next_epoch = epoch.saturating_add(1);
+    if next_epoch > Seq::MAX.get() {
         return Err(err(ErrorCode::Stale));
-    };
+    }
     // For the epoch just before a moved mailbox's first, the token is
     // checked against the set of the mailbox the group moved from (7.8).
     let checked_in = if next_epoch == record.first_epoch {
@@ -769,11 +776,14 @@ async fn fetch(
     limit: Option<u64>,
     leaf: Option<u32>,
 ) -> Reply {
+    let record = self::mailbox(cx, mailbox).await?;
     if leaf.is_some() {
+        if record.room.is_none() {
+            return Err(err(ErrorCode::Invalid).with_message("leaf is for public rooms"));
+        }
         // Light clients (12.6) are not in this version (docs/plans/M5b.md).
         return Err(err(ErrorCode::NotSupported).with_message("light clients"));
     }
-    self::mailbox(cx, mailbox).await?;
     let cap = cx.inner.config.limits.max_page.max(MIN_FETCH_LIMIT_CAP);
     let limit = limit.unwrap_or(DEFAULT_FETCH_LIMIT).min(cap);
     let (posts, more) = cx

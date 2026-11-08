@@ -338,7 +338,7 @@ pub(super) async fn create(
     let host = inner.config.hostname.clone();
     let room = public.room.clone();
     let (cache, update) = blocking(move || {
-        let (group, storage, _) = build(&crypto, &group_info, &tree)?;
+        let (group, storage, signer) = build(&crypto, &group_info, &tree)?;
         let context = group.group_context();
         if context.epoch().as_u64() != 0 || context.group_id().as_slice() != group_id.as_bytes() {
             return Err(invalid("not the group of the CREATE, in epoch 0"));
@@ -357,6 +357,10 @@ pub(super) async fn create(
         let [leaf] = &view.leaves[..] else {
             return Err(invalid("a new room's group has one leaf"));
         };
+        // Its GroupInfo is signed by that leaf (5.2).
+        if leaf.index != signer {
+            return Err(invalid("the GroupInfo is not signed by the one leaf"));
+        }
         if !leaf
             .identity
             .as_ref()
@@ -412,7 +416,7 @@ pub(super) async fn create(
             );
             Ok(OkResponse::new())
         }
-        Created::Taken => Err(err(ErrorCode::NameTaken)),
+        Created::Taken | Created::Exists => Err(err(ErrorCode::NameTaken)),
         Created::NoGroup => Err(err(ErrorCode::NotFound)),
     }
 }

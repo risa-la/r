@@ -239,6 +239,14 @@ async fn create() {
     h.send(&anon, &format!("CREATE {m3} {gid1} {token} epoch=4"))
         .await;
     assert_eq!(anon.lines(), ["OK"]);
+    // Two members who both move create the same box: OK, and nothing
+    // changes (7.8).
+    h.send(&guest, &format!("CREATE {m3} {gid1} {token} epoch=4"))
+        .await;
+    assert_eq!(guest.lines(), ["OK"]);
+    h.send(&guest, &format!("CREATE {m3} {gid1} {token} epoch=5"))
+        .await;
+    assert_eq!(guest.lines(), ["ERR name-taken"]);
     let record = h.store.mailbox(&m3).unwrap().unwrap();
     assert_eq!((record.first_epoch, record.moved_from), (4, Some(m1)));
     // A box is never used again, even once its mailbox is gone (5.2).
@@ -365,9 +373,9 @@ async fn post_follow_and_fetch() {
         h.send(&watcher, &line).await;
         assert_eq!(watcher.lines(), ["ERR not-found"], "{line}");
     }
-    // Light clients are not in this version (12.6).
+    // `leaf` is for public rooms (7.1).
     h.send(&watcher, &format!("FETCH {m} after=0 leaf=3")).await;
-    assert_eq!(watcher.lines(), ["ERR not-supported light clients"]);
+    assert_eq!(watcher.lines(), ["ERR invalid leaf is for public rooms"]);
 }
 
 /// FETCH returns at most `limit` posts, 50 by default, and the server's
@@ -577,6 +585,13 @@ async fn send_tokens() {
         check_token(h.inner(), &mailbox(99), &proto(&token1)).await,
         Err(ErrorCode::NotFound)
     );
+    // An epoch of 2^63-1 has no next epoch (7.2).
+    h.send(
+        &anon,
+        &format!("TOKEN {m} 9223372036854775807 {token2} {hash2}"),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR stale"]);
     // A guest may send TOKEN; a signed-in connection may not (13).
     let (mut guest, _) = h.guest("sam").await;
     h.send(&guest, &format!("TOKEN {m} 2 {token2} {}", hash([5; 48])))
@@ -1435,6 +1450,14 @@ async fn public_room_commits() {
     h.send(&signed, &format!("POST {m} {token1} {message}"))
         .await;
     assert_eq!(signed.lines(), ["ERR wrong-connection"]);
+
+    // TOKEN is not for public rooms (7.2); light clients are not in this
+    // version (12.6).
+    h.send(&anon, &format!("TOKEN {m} 1 {token1} {}", hash([3; 48])))
+        .await;
+    assert_eq!(anon.lines(), ["ERR forbidden not in a public room"]);
+    h.send(&anon, &format!("FETCH {m} after=0 leaf=0")).await;
+    assert_eq!(anon.lines(), ["ERR not-supported light clients"]);
 
     // Once restarted, the hub rebuilds the room's group from the store.
     h.inner().mailbox.forget_room(&m);
