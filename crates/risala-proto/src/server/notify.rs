@@ -6,7 +6,19 @@ use std::str::FromStr;
 use crate::error::ParseError;
 use crate::line::Line;
 use crate::parse::tok;
-use crate::types::{NotifyReason, PushTag};
+use crate::types::{MAX_PUSH_REASON, MAX_PUSH_TAG, NotifyReason, PushReason, PushTag};
+
+/// The size a server pads every push body to, with the record padding of
+/// RFC 8188, before it encrypts it (9.3). Every body fits: see
+/// [`MAX_NOTIFY_BODY`].
+pub const NOTIFY_PADDED_LEN: usize = 128;
+
+/// The longest push body, `NOTIFY <tag> <reason>` and its LF, with the
+/// longest tag and reason (9.1, 9.3). It leaves room in
+/// [`NOTIFY_PADDED_LEN`] for RFC 8188's padding delimiter.
+pub const MAX_NOTIFY_BODY: usize = "NOTIFY  \n".len() + MAX_PUSH_TAG + MAX_PUSH_REASON;
+
+const _: () = assert!(MAX_NOTIFY_BODY < NOTIFY_PADDED_LEN);
 
 /// A push body (9.3): one line, `NOTIFY <tag> <reason>`, ending with LF.
 ///
@@ -57,6 +69,16 @@ impl Notify {
     pub fn to_body(&self) -> String {
         format!("{}\n", self.to_line())
     }
+
+    /// The push's `Urgency` header (RFC 8030, 9.3): `high` for a
+    /// `welcome` push, `normal` for a `message` push, and `normal` for a
+    /// reason of a later version, which this version does not send.
+    pub fn urgency(&self) -> &'static str {
+        match self.reason {
+            NotifyReason::Known(PushReason::Welcome) => "high",
+            _ => "normal",
+        }
+    }
 }
 
 impl fmt::Display for Notify {
@@ -97,6 +119,12 @@ mod tests {
             ("NOTIFY t mention\n", NotifyReason::Other("mention".into())),
         ] {
             let notify: Notify = body.parse().unwrap();
+            let urgency = if body.contains("welcome") {
+                "high"
+            } else {
+                "normal"
+            };
+            assert_eq!(notify.urgency(), urgency);
             assert_eq!(notify.reason, reason);
             assert_eq!(notify.to_body(), body);
         }
@@ -105,6 +133,14 @@ mod tests {
         // draft-02's unread count is gone (9.3).
         assert!("NOTIFY t message 3\n".parse::<Notify>().is_err());
         assert!("NOTIFY t\n".parse::<Notify>().is_err());
+        // The longest body fits the padded size (9.3).
+        let longest = Notify {
+            tag: "x".repeat(MAX_PUSH_TAG).parse().unwrap(),
+            reason: NotifyReason::Other("r".repeat(MAX_PUSH_REASON)),
+        };
+        assert_eq!(longest.to_body().len(), MAX_NOTIFY_BODY);
+        assert!(longest.to_body().len() < NOTIFY_PADDED_LEN);
+        assert_eq!(longest.urgency(), "normal");
         assert!(matches!(
             "PUSH t message".parse::<Notify>(),
             Err(ParseError::UnknownVerb(_))

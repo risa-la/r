@@ -406,14 +406,17 @@ pub enum Command {
         /// The mailbox.
         mailbox: BoxName,
     },
-    /// `FETCH <box> after=<seq> [limit=<n>] [leaf=<n>]`: the earliest
+    /// `FETCH <box> after=<position> [limit=<n>] [leaf=<n>]`: the earliest
     /// posts after a seq (7.1).
     Fetch {
         /// The mailbox.
         mailbox: BoxName,
-        /// Posts after this seq; may be 0. Required.
+        /// Posts after this position (3.5): a seq, or 0 for the place
+        /// before the first post. Required.
         after: u64,
-        /// At most this many posts; at least 1, default 50.
+        /// At most this many posts; at least 1, default 50. A server may
+        /// cap it, but not below [`MIN_FETCH_LIMIT_CAP`](crate::types::MIN_FETCH_LIMIT_CAP)
+        /// (7.1).
         limit: Option<NonZeroU64>,
         /// A light client's leaf index in a public room (12.6).
         leaf: Option<u32>,

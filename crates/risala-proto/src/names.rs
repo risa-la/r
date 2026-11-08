@@ -1318,6 +1318,18 @@ mod tests {
     }
 
     #[test]
+    fn box_last_characters() {
+        // 3.5: the last character's two unused bits are zero, so it is
+        // one of `a e i m q u y 4`; any other is bad-syntax.
+        let alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+        for c in alphabet.chars() {
+            let s = format!("{}{c}", "a".repeat(25));
+            let parsed = s.parse::<BoxName>();
+            assert_eq!(parsed.is_ok(), "aeimquy4".contains(c), "{s}");
+        }
+    }
+
+    #[test]
     fn box_round_trips_every_last_character() {
         for last in 0..=255u8 {
             let mut bytes = [0x5a; 16];

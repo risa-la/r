@@ -46,6 +46,15 @@ pub const MAX_PUSH_URL: usize = 512;
 pub const MAX_WELCOME: usize = 512;
 /// The number of posts FETCH returns when `limit` is not given (7.1).
 pub const DEFAULT_FETCH_LIMIT: u64 = 50;
+/// The lowest cap a server may put on FETCH's `limit` (7.1).
+pub const MIN_FETCH_LIMIT_CAP: u64 = 50;
+/// The most hashes a mailbox's token set for one epoch holds (7.2).
+pub const MAX_TOKEN_SET: usize = 64;
+/// The fewest token sets of a mailbox a server keeps, when it keeps fewer
+/// than every set used within a retention period (7.2).
+pub const MIN_TOKEN_SETS: usize = 256;
+/// The most context posts a RisalaReport names (5.8).
+pub const MAX_REPORT_CONTEXT: usize = 10;
 /// The number of rooms LIST and ADMIN ROOMS return when `limit` is not
 /// given (6.1, 10.4).
 pub const DEFAULT_LIST_LIMIT: u64 = 100;

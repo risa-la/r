@@ -23,10 +23,10 @@ use risala_proto::mls::{
     RatchetTree, SendToken, TokenHash, Welcome, is_strict_base64,
 };
 use risala_proto::names::{
-    BlobRef, BlockTarget, BoxName, Domain, Id, Identity, IpPrefix, Name, PairId, Room, Seq,
-    ServerBanTarget, Uid,
+    BlobRef, BlockTarget, BoxName, Domain, Id, Identity, IpPrefix, Link, Name, PairId, Room,
+    Seq, ServerBanTarget, Uid,
 };
-use risala_proto::server::{Host, Log, Register, Upload};
+use risala_proto::server::{FileOrigin, Host, Log, Register, Upload};
 use risala_proto::text::{escape, mentions, unescape};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
@@ -90,6 +90,8 @@ fuzz_target!(|data: &[u8]| {
     round_trip::<Register>(s);
     round_trip::<Log>(s);
     round_trip::<Upload>(s);
+    round_trip::<FileOrigin>(s);
+    round_trip::<Link>(s);
 
     round_trip::<KeyPackage>(s);
     round_trip::<GroupInfo>(s);

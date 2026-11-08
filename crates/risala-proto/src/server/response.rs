@@ -420,7 +420,8 @@ impl OkResponse {
         self.typed("seq", str::parse)
     }
 
-    /// `head=`: a mailbox's newest seq, from FOLLOW, or `0` if it has none
+    /// `head=`: a mailbox's newest position (3.5), from FOLLOW: its newest
+    /// seq, or `0` if it has none
     /// (7.1).
     pub fn head(&self) -> Result<Option<u64>, ParseError> {
         self.typed("head", |v| Ok(Seq::parse_or_zero(v)?.map_or(0, Seq::get)))

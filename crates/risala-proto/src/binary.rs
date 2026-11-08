@@ -18,6 +18,7 @@ use crate::error::{ErrorCode, ParseError};
 use crate::mls::{
     MAX_BASE64_LEN, blob_type, check_blob, decoded_len, fixed_type, is_strict_base64, secret_type,
 };
+use crate::names::{BLOB_HASH_LEN, BlobRef};
 
 /// The length of a WrappedKey (12.13): a one-byte `version`, a 12-byte
 /// nonce, then a 32-byte key encrypted with its 16-byte tag.
@@ -112,6 +113,22 @@ secret_type!(
     "a push auth secret is 16 bytes of base64"
 );
 
+/// Reads the list blob of BACKUP PUT's `files=` (12.13): the 48-byte
+/// hashes of the backup's other blobs, one after another. A length that
+/// is not a multiple of 48 is `ERR invalid`.
+pub fn read_blob_list(bytes: &[u8]) -> Result<Vec<BlobRef>, ErrorCode> {
+    let (hashes, rest) = bytes.as_chunks::<BLOB_HASH_LEN>();
+    if !rest.is_empty() {
+        return Err(ErrorCode::Invalid);
+    }
+    Ok(hashes.iter().copied().map(BlobRef::from_hash).collect())
+}
+
+/// Writes the list blob of BACKUP PUT's `files=` (12.13).
+pub fn write_blob_list(refs: &[BlobRef]) -> Vec<u8> {
+    refs.iter().flat_map(|r| *r.hash()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +153,12 @@ mod tests {
             let key = WrappedKey::from_bytes(bad).unwrap();
             assert_eq!(key.check(), Err(ErrorCode::Invalid), "{bad:?}");
         }
+        let refs = [BlobRef::of(b"a"), BlobRef::of(b"b")];
+        let list = write_blob_list(&refs);
+        assert_eq!(list.len(), 96);
+        assert_eq!(read_blob_list(&list), Ok(refs.to_vec()));
+        assert_eq!(read_blob_list(&[]), Ok(vec![]));
+        assert_eq!(read_blob_list(&list[1..]), Err(ErrorCode::Invalid));
         let records: EncodedRecords = "AQ==".parse().unwrap();
         assert_eq!(records.decode(), [1]);
         assert!("".parse::<PairData>().is_err());

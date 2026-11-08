@@ -92,7 +92,7 @@ pub mod notify;
 pub mod response;
 
 pub use mailbox::{Post, Report};
-pub use notify::Notify;
+pub use notify::{MAX_NOTIFY_BODY, NOTIFY_PADDED_LEN, Notify};
 pub use response::{ErrResponse, FileOrigin, Greeting, Host, Log, OkResponse, Register, Upload};
 
 // ---------------------------------------------------------------------------
