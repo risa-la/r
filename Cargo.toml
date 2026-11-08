@@ -8,6 +8,8 @@ members = [
     "crates/risala-keyfetch",
     "crates/risala-pow",
     "crates/risala-dev",
+
+    "crates/openmls-sqlite-storage",
 ]
 
 [workspace.package]
@@ -21,6 +23,7 @@ authors = ["Risala developers <dev@risa.la>"]
 [workspace.dependencies]
 risala-proto = { path = "crates/risala-proto" }
 risala-keyfetch = { path = "crates/risala-keyfetch" }
+risala-mls-storage = { path = "crates/openmls-sqlite-storage" }
 
 base64 = "0.23"
 # ML-DSA (FIPS 204), Cryspen's formally verified libcrux implementation.
@@ -56,7 +59,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 librisala = { path = "crates/librisala" }
 
+# MLS (SPEC 12), as chosen by the spike (PLAN.md 22). OpenMLS is pinned
+# exactly, since the server and devices check what it does not (12.5, 12.6).
+openmls = { version = "=0.9.2", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_libcrux_crypto = { version = "0.4", features = ["draft-ietf-mls-pq-ciphersuites"] }
+# MessagePack, the codec for MLS state in SQLite (crates/openmls-sqlite-storage).
+rmp-serde = "1"
+
 # dev
+openmls_basic_credential = "0.6"
 proptest = "1"
 # An independent x86-64 decoder (MIT), to check every instruction encoding
 # risala-pow's JIT emits and to verify the code it compiles.
@@ -65,6 +77,13 @@ iced-x86 = { version = "1.22", default-features = false, features = ["std", "dec
 yaxpeax-arm = { version = "0.5", default-features = false, features = ["std"] }
 yaxpeax-arch = { version = "0.3", default-features = false, features = ["std"] }
 tempfile = "3"
+
+# Our port of openmls_sqlite_storage, to rusqlite 0.41. OpenMLS lists the
+# upstream crate as an optional dependency, and Cargo refuses its older
+# libsqlite3-sys next to ours even with the feature off. The port takes its
+# place everywhere.
+[patch.crates-io]
+openmls_sqlite_storage = { path = "crates/openmls-sqlite-storage" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

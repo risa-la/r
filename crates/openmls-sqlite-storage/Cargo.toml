@@ -1,0 +1,31 @@
+[package]
+name = "openmls_sqlite_storage"
+description = "OpenMLS storage in SQLite: openmls_sqlite_storage, ported to the workspace's rusqlite"
+# The upstream version it was ported from, so that it can patch it.
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+repository.workspace = true
+authors = ["OpenMLS Authors", "Risala developers <dev@risa.la>"]
+
+[dependencies]
+openmls_traits.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+openmls.workspace = true
+openmls_libcrux_crypto.workspace = true
+openmls_basic_credential.workspace = true
+
+# Upstream's features, which OpenMLS refers to. risala uses none of them.
+[features]
+draft-ietf-mls-pq-ciphersuites = ["openmls_traits/draft-ietf-mls-pq-ciphersuites"]
+extensions-draft = []
+virtual-clients-draft = []
+
+[lints]
+workspace = true
