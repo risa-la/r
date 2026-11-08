@@ -2199,6 +2199,7 @@ dependencies = [
 name = "risala-mls"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "hpke-rs",
  "hpke-rs-crypto",
