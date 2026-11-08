@@ -26,7 +26,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 # The patched port in crates/openmls-sqlite-storage (see the root Cargo.toml).
-openmls_sqlite_storage = "0.3"
+openmls_sqlite_storage.workspace = true
 openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 rusqlite.workspace = true
 # HPKE with the KEM id spelled out, to pin what the provider sends (SPEC 12.2).

@@ -24,7 +24,8 @@ authors = ["Risala developers <dev@risa.la>"]
 [workspace.dependencies]
 risala-proto = { path = "crates/risala-proto" }
 risala-keyfetch = { path = "crates/risala-keyfetch" }
-risala-mls-storage = { path = "crates/openmls-sqlite-storage" }
+# The patched port (see [patch.crates-io] below).
+openmls_sqlite_storage = "0.3"
 risala-mls = { path = "crates/risala-mls" }
 
 base64 = "0.23"
