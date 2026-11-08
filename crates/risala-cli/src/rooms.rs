@@ -185,8 +185,10 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
         RoomCommand::Topic { server, room, text } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
-            let seq = within(conv.set_topic(&text.join(" "))).await?;
-            println!("topic set ({seq})");
+            match within(conv.set_topic(&text.join(" "))).await? {
+                Some(seq) => println!("topic set ({seq})"),
+                None => println!("the topic is that already"),
+            }
             Ok(())
         }
         RoomCommand::Set {
@@ -197,8 +199,10 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
         } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
-            let seq = within(conv.set_setting(&key, &value.join(" "))).await?;
-            println!("{key} set ({seq})");
+            match within(conv.set_setting(&key, &value.join(" "))).await? {
+                Some(seq) => println!("{key} set ({seq})"),
+                None => println!("{key} is that already"),
+            }
             Ok(())
         }
         RoomCommand::Role {
@@ -209,8 +213,10 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
         } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
-            let seq = within(conv.set_role(&uid, &role)).await?;
-            println!("{uid} is now {role} ({seq})");
+            match within(conv.set_role(&uid, &role)).await? {
+                Some(seq) => println!("{uid} is now {role} ({seq})"),
+                None => println!("{uid} is {role} already"),
+            }
             Ok(())
         }
         RoomCommand::Roles { server, room } => {
@@ -250,8 +256,10 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
         } => {
             let account = online(ctx, &server).await?;
             let conv = account.conversation(&room).or_else(explain)?;
-            let seq = within(conv.ban(&uid, &reason.join(" "))).await?;
-            println!("banned {uid} ({seq})");
+            match within(conv.ban(&uid, &reason.join(" "))).await? {
+                Some(seq) => println!("banned {uid} ({seq})"),
+                None => println!("{uid} was banned already; the reason is updated"),
+            }
             Ok(())
         }
         RoomCommand::Unban { server, room, uid } => {

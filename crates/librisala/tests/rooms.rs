@@ -99,6 +99,19 @@ async fn a_moderator_invites_kicks_and_bans() {
     within("ROLE", club.set_role("bob@chat.test", "mod"))
         .await
         .unwrap();
+    // Changing nothing records nothing: a plain OK, with no seq.
+    assert_eq!(
+        within("SET again", club.set_setting("public", "no"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        within("ROLE again", club.set_role("bob@chat.test", "mod"))
+            .await
+            .unwrap(),
+        None
+    );
     let roles = within("ROLES", club.roles()).await.unwrap();
     let mut roles: Vec<_> = roles.into_iter().map(|r| (r.uid, r.role)).collect();
     roles.sort();
@@ -255,11 +268,18 @@ async fn a_moderator_invites_kicks_and_bans() {
         }
     );
     assert!(!joined(&c_club));
+    // BAN again records nothing, and replaces the reason.
+    assert_eq!(
+        within("BAN again", b_club.ban("carol@chat.test", "flood"))
+            .await
+            .unwrap(),
+        None
+    );
     let bans = within("BANS", b_club.bans()).await.unwrap();
     assert_eq!(bans.len(), 1);
     assert_eq!(
         (bans[0].uid.as_str(), bans[0].reason.as_str()),
-        ("carol@chat.test", "spam")
+        ("carol@chat.test", "flood")
     );
     // A banned identity cannot be invited, and cannot join.
     assert_eq!(code(b_club.invite("carol@chat.test").await), "forbidden");

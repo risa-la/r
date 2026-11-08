@@ -209,7 +209,10 @@ async fn rooms_and_reports() {
     assert!(page.messages.iter().all(|m| m.outbox.is_none()));
 
     // 6.2.
-    assert_eq!(within(general.set_topic("lunch at noon")).await.unwrap(), 4);
+    assert_eq!(
+        within(general.set_topic("lunch at noon")).await.unwrap(),
+        Some(4)
+    );
     assert_eq!(general.info().unwrap().unwrap().topic, "lunch at noon");
     let info = within(general.room_info()).await.unwrap();
     assert_eq!(
@@ -245,7 +248,7 @@ async fn rooms_and_reports() {
         within(general.set_role("bob@example.net", "mod"))
             .await
             .unwrap(),
-        5
+        Some(5)
     );
     let roles: Vec<(String, String)> = within(general.roles())
         .await
@@ -282,7 +285,7 @@ async fn rooms_and_reports() {
     );
     assert_eq!(
         within(general.ban("troll@example.com", "")).await.unwrap(),
-        8
+        Some(8)
     );
     let bans = within(general.bans()).await.unwrap();
     assert_eq!(

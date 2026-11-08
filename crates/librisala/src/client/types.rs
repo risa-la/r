@@ -95,6 +95,11 @@ pub enum ClientError {
         /// The message for people, unescaped; empty if none.
         message: String,
     },
+    /// The server's answer broke the protocol, for example an `OK`
+    /// without a value the command promises, such as REPORT's `id` (3.2).
+    /// The command may have taken effect.
+    #[error("{0}")]
+    BadAnswer(String),
     /// The account is not signed in, and this needs a connection.
     #[error("not connected")]
     NotConnected,
@@ -400,6 +405,7 @@ impl ClientError {
             ),
             ClientError::AlreadyTrusted { .. }
             | ClientError::Unconfirmed { .. }
+            | ClientError::BadAnswer(_)
             | ClientError::NotConnected
             | ClientError::NotJoined(_)
             | ClientError::Store(_) => false,

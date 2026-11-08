@@ -24,7 +24,9 @@
 //!   never stored as events.
 //!
 //! Commands that record an event answer once the event has been handled,
-//! so the timeline shows it by then. They return its seq. Each needs a
+//! so the timeline shows it by then. They return its seq; SET, ROLE, BAN
+//! and INVITE return `None` when they change nothing and so record
+//! nothing. Each needs a
 //! connection; the server's refusals are [`ClientError::Server`], with
 //! codes such as `forbidden`, `not-found` or `last-owner`.
 
@@ -35,9 +37,7 @@ use risala_proto::text::{escape, unescape};
 use risala_proto::types::{Role, RoomSetting};
 
 use super::account::{Account, Answer, Conversation, RequestOp};
-use super::types::{
-    BanInfo, ClientError, ConnectionErrorKind, ReportInfo, RoleInfo, RoomInfo, ServerInfo, Setting,
-};
+use super::types::{BanInfo, ClientError, ReportInfo, RoleInfo, RoomInfo, ServerInfo, Setting};
 
 #[cfg(doc)]
 use super::types::AccountEvent;
@@ -51,20 +51,18 @@ pub(crate) fn parse_uid(uid: &str) -> Result<Uid, ClientError> {
 /// An `OK` that lacks a value the command promises: the server broke the
 /// protocol.
 pub(crate) fn missing(what: &str) -> ClientError {
-    ClientError::Connection {
-        kind: ConnectionErrorKind::Protocol,
-        message: format!("the server's OK has no {what}"),
-        permanent: false,
-    }
+    ClientError::BadAnswer(format!("the server's OK has no {what}"))
 }
 
 /// The `seq` of an `OK seq=<seq>`.
 pub(crate) fn seq_of(ok: &OkResponse) -> Result<u64, ClientError> {
-    ok.seq()
-        .ok()
-        .flatten()
-        .map(Seq::get)
-        .ok_or_else(|| missing("seq"))
+    seq_if_any(ok).ok_or_else(|| missing("seq"))
+}
+
+/// The `seq` of an `OK` that may have none: commands that record nothing
+/// when they change nothing answer a plain `OK` (6.2-6.4).
+fn seq_if_any(ok: &OkResponse) -> Option<u64> {
+    ok.seq().ok().flatten().map(Seq::get)
 }
 
 impl Conversation {
@@ -113,13 +111,14 @@ impl Conversation {
     }
 
     /// Changes a room setting (SET, 6.2), such as `public` to `no`, and
-    /// returns the SET event's seq. `value` is plain text: a keyword or a
+    /// returns the SET event's seq, or `None` if the setting had that
+    /// value already, when nothing is recorded. `value` is plain text: a keyword or a
     /// number (`yes`, `read`, `30`, `server`), or the topic. Moderators
     /// may set the topic; owners the rest. An unknown key goes to the
     /// server as it is, which answers `not-supported`; a known key with a
     /// bad value fails with [`ClientError::Invalid`] before anything is
     /// sent.
-    pub async fn set_setting(&self, key: &str, value: &str) -> Result<u64, ClientError> {
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<Option<u64>, ClientError> {
         let room = self.room()?;
         let setting = RoomSetting::parse(key.trim(), &escape(value))
             .map_err(|e| ClientError::Invalid(format!("setting {key}: {e}")))?;
@@ -127,19 +126,20 @@ impl Conversation {
             .account()
             .request(Command::Set { room, setting })
             .await?;
-        seq_of(&answer.ok)
+        Ok(seq_if_any(&answer.ok))
     }
 
     /// Sets the room's topic, or clears it with an empty one (6.2). Returns
-    /// the SET event's seq.
-    pub async fn set_topic(&self, topic: &str) -> Result<u64, ClientError> {
+    /// the SET event's seq, or `None` if the topic was that already.
+    pub async fn set_topic(&self, topic: &str) -> Result<Option<u64>, ClientError> {
         self.set_setting("topic", topic).await
     }
 
     /// Sets `uid`'s role in the room (ROLE, 6.3): `owner`, `mod` or
-    /// `member`. Owners only. Returns the ROLE event's seq. The room's only
-    /// owner cannot change their own role (`last-owner`).
-    pub async fn set_role(&self, uid: &str, role: &str) -> Result<u64, ClientError> {
+    /// `member`. Owners only. Returns the ROLE event's seq, or `None` if
+    /// they had that role already, when nothing is recorded. The room's
+    /// only owner cannot change their own role (`last-owner`).
+    pub async fn set_role(&self, uid: &str, role: &str) -> Result<Option<u64>, ClientError> {
         let room = self.room()?;
         let uid = parse_uid(uid)?;
         let role: Role = role
@@ -150,7 +150,7 @@ impl Conversation {
             .account()
             .request(Command::Role { room, uid, role })
             .await?;
-        seq_of(&answer.ok)
+        Ok(seq_if_any(&answer.ok))
     }
 
     /// The room's owners and moderators, whether or not they are members
@@ -190,7 +190,7 @@ impl Conversation {
             .account()
             .request(Command::Invite { room, uid })
             .await?;
-        Ok(answer.ok.seq().ok().flatten().map(Seq::get))
+        Ok(seq_if_any(&answer.ok))
     }
 
     /// Removes a member from the room (KICK, 6.4); they may join again.
@@ -208,8 +208,10 @@ impl Conversation {
     }
 
     /// Bans `uid` from the room (BAN, 6.4), removing them if they are a
-    /// member. Returns the BAN event's seq.
-    pub async fn ban(&self, uid: &str, reason: &str) -> Result<u64, ClientError> {
+    /// member. Returns the BAN event's seq, or `None` if they were banned
+    /// already and are not a member, when nothing is recorded but the
+    /// ban's reason is replaced.
+    pub async fn ban(&self, uid: &str, reason: &str) -> Result<Option<u64>, ClientError> {
         let room = self.room()?;
         let uid = parse_uid(uid)?;
         let reason = escape(reason.trim());
@@ -217,7 +219,7 @@ impl Conversation {
             .account()
             .request(Command::Ban { room, uid, reason })
             .await?;
-        seq_of(&answer.ok)
+        Ok(seq_if_any(&answer.ok))
     }
 
     /// Lifts a ban (UNBAN, 6.4). Returns the UNBAN event's seq.
