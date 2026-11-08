@@ -151,6 +151,26 @@ async fn a_moderator_invites_kicks_and_bans() {
 
     within("joining", carol.join("#club")).await.unwrap();
     within("syncing", carol.wait_synced()).await.unwrap();
+    // The JOIN's snapshot told her cache the settings, and the members
+    // she learns carry their roles.
+    let settings = c_club.info().unwrap().unwrap().settings;
+    assert!(
+        settings
+            .iter()
+            .any(|s| s.key == "public" && s.value == "no"),
+        "{settings:?}"
+    );
+    let members = within("MEMBERS", c_club.members()).await.unwrap();
+    let mut roles: Vec<_> = members.into_iter().map(|m| (m.uid, m.role)).collect();
+    roles.sort();
+    assert_eq!(
+        roles,
+        [
+            ("alice@chat.test".to_owned(), "owner".to_owned()),
+            ("bob@chat.test".to_owned(), "mod".to_owned()),
+            ("carol@chat.test".to_owned(), "member".to_owned())
+        ]
+    );
     let c_b_club = carol_b.conversation("#club").unwrap();
     until("carol's other device joins too", &events_b, || {
         joined(&c_b_club)
@@ -167,6 +187,9 @@ async fn a_moderator_invites_kicks_and_bans() {
     assert_eq!(code(b_club.kick("alice@chat.test", "").await), "forbidden");
     assert_eq!(code(b_club.ban("alice@chat.test", "").await), "forbidden");
 
+    let members = within("MEMBERS", b_club.members()).await.unwrap();
+    assert!(members.iter().any(|m| m.uid == "carol@chat.test"));
+
     // Bob kicks carol: both her devices stop treating the room as joined,
     // and the KICK is not stored as her history.
     let kicked = within("KICK", b_club.kick("carol@chat.test", "calm down"))
@@ -182,6 +205,15 @@ async fn a_moderator_invites_kicks_and_bans() {
             }
         );
     }
+    // The cached members follow: she is no longer one, in anyone's cache.
+    until("bob's cache drops carol", &bob.subscribe(), || {
+        !b_club
+            .cached_members()
+            .unwrap()
+            .iter()
+            .any(|m| m.uid == "carol@chat.test")
+    })
+    .await;
     for conv in [&c_club, &c_b_club] {
         assert!(!joined(conv));
         assert!(!kinds(conv).contains(&(EventKind::Kick, Some("carol@chat.test".into()))));
@@ -696,5 +728,65 @@ async fn admin_commands_round_trip() {
         .await
         .unwrap();
     assert_eq!(code(admin.keys("carol@chat.test").await), "not-found");
+    server.stop().await;
+}
+
+/// ADMIN BAN of a connected guest bans its address and closes its
+/// connection; the client stops trying until the user connects again.
+/// `ADMIN SET guests no` ends guest sessions the same way (10.2, 10.6).
+#[tokio::test]
+async fn server_wide_bans_and_closing_to_guests_stop_a_guest_client() {
+    let server = server().await;
+    let op = registered(&server, "op").await;
+    let admin = op.admin();
+    let (client, addr) = trusting_client(&server, server.addr(), 50);
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    within("connecting", sam.connect()).await.unwrap();
+    within("joining", sam.join("#general")).await.unwrap();
+    within("syncing", sam.wait_synced()).await.unwrap();
+
+    let events = sam.subscribe();
+    within("ADMIN BAN", admin.ban("~sam", "spam"))
+        .await
+        .unwrap();
+    let bans = within("BANS", admin.bans()).await.unwrap();
+    assert_eq!(bans.len(), 1);
+    assert_eq!(
+        (bans[0].target.as_str(), bans[0].reason.as_str()),
+        ("127.0.0.1", "spam")
+    );
+    until("sam gives up", &events, || {
+        matches!(
+            sam.state(),
+            librisala::client::ConnectionState::Failed { .. }
+        )
+    })
+    .await;
+    let err = within("connecting", sam.connect()).await.unwrap_err();
+    assert_eq!(err.code(), Some("forbidden"), "{err:?}");
+
+    within("ADMIN UNBAN", admin.unban("127.0.0.1"))
+        .await
+        .unwrap();
+    within("connecting", sam.connect()).await.unwrap();
+    within("syncing", sam.wait_synced()).await.unwrap();
+
+    let events = sam.subscribe();
+    within("ADMIN SET", admin.set("guests", "no"))
+        .await
+        .unwrap();
+    until("sam gives up", &events, || {
+        matches!(
+            sam.state(),
+            librisala::client::ConnectionState::Failed { .. }
+        )
+    })
+    .await;
+    assert!(within("connecting", sam.connect()).await.is_err());
+    within("ADMIN SET", admin.set("guests", "yes"))
+        .await
+        .unwrap();
+    within("connecting", sam.connect()).await.unwrap();
+    client.shutdown().await;
     server.stop().await;
 }
