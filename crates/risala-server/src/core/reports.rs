@@ -214,14 +214,16 @@ impl Inner {
         };
         let st = self.lock_room(&room).await?;
         let info = room_of(&st)?;
-        // Anyone who can read the message may report it (5.8, 7.2).
-        check_read(info, self.asker(uid, st.is_member(uid)))?;
         let (key, conv_id) = (st.key, st.id.clone());
-
+        // A report made before gets its id again, before every other check,
+        // so that a client may resend it safely: even if the message was
+        // deleted, or the reporter can no longer read the room, since (5.8).
         let (c, who) = (conv_id.clone(), uid.clone());
         if let Some(id) = self.db(move |s| s.report_of(&c, seq, &who)).await? {
             return Ok(Some(OkResponse::new().with_id(&id)));
         }
+        // Anyone who can read the message may report it (5.8, 7.2).
+        check_read(info, self.asker(uid, st.is_member(uid)))?;
         let event = self.db(move |s| s.event(key, seq)).await?;
         let Some(event) = event.filter(|e| !e.deleted && matches!(e.kind, EventKind::Msg { .. }))
         else {

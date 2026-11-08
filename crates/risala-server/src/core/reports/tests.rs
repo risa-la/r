@@ -278,6 +278,34 @@ async fn guests_report_only_where_they_may_read() {
     );
 }
 
+/// A report sent again gets its id again, even once the reporter can no
+/// longer read the room (5.8).
+#[tokio::test]
+async fn a_resent_report_gets_its_id_after_the_reporter_lost_access() {
+    let mut h = harness();
+    let mut sam = h.guest("sam").await;
+    let id = report(&h, &mut sam, "report #general 5 spam").await;
+    let room: Room = "#general".parse().unwrap();
+    let entry = h.hub.inner.room_entry(&room).unwrap();
+    entry.lock().await.room_info_mut().unwrap().settings.guests =
+        risala_proto::types::GuestAccess::None;
+    expect(
+        &h,
+        &mut sam,
+        "report #general 5 spam",
+        &format!("OK id={id}"),
+    )
+    .await;
+    // Another message is refused.
+    expect(
+        &h,
+        &mut sam,
+        "report #general 6",
+        "ERR forbidden guests may not enter this room",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn reports_are_rate_limited() {
     let mut h = harness();
