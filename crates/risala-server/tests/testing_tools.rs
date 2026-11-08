@@ -194,3 +194,86 @@ async fn identities_survive_a_restart() {
     let _alice = server.sign_in(&alice).await;
     let _bob = server.sign_in(&bob).await;
 }
+
+/// A server on a state directory of your choosing keeps its identities,
+/// history and certificate when another starts on the directory, and
+/// leaves the directory in place.
+#[tokio::test]
+async fn a_state_dir_is_kept_across_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let builder = || {
+        TestServer::builder()
+            .identity_domain("example.org")
+            .state_dir(&state)
+    };
+    let alice = risala_server::testing::TestIdentity::new("alice@example.org");
+    let server = builder().start().await;
+    let fingerprint = server.fingerprint();
+    let addr = server.addr();
+    let mut conn = server.register_as(&alice).await;
+    conn.send("@ref=j JOIN #kept").await.unwrap();
+    loop {
+        if conn.expect_line().await.unwrap().starts_with("@ref=j OK ") {
+            break;
+        }
+    }
+    server.stop().await;
+    assert!(state.join("risala.db").exists());
+
+    // The same port again, chosen explicitly this time.
+    let server = builder().listen(addr).start().await;
+    assert_eq!(server.addr(), addr);
+    assert_eq!(server.fingerprint(), fingerprint);
+    let mut conn = server.sign_in(&alice).await;
+    conn.send("@ref=j JOIN #kept").await.unwrap();
+    let answer = loop {
+        let line = conn.expect_line().await.unwrap();
+        if line.starts_with("@ref=j OK ") {
+            break line;
+        }
+    };
+    // Already a member, so no new event: the head is still the first JOIN.
+    assert!(answer.contains(" head=1 "), "{answer}");
+    server.stop().await;
+    assert!(state.join("risala.db").exists());
+}
+
+/// A clock stopped in the past stamps events with the time it is set to,
+/// then follows the system clock without going back.
+#[tokio::test]
+async fn a_manual_clock_can_start_in_the_past_and_then_follow_the_system() {
+    use risala_proto::time::Timestamp;
+    use std::time::Duration;
+
+    let week = Duration::from_secs(7 * 24 * 60 * 60);
+    let start = Timestamp::now().checked_sub(week * 2).unwrap();
+    let server = TestServer::builder()
+        .identity_domain("example.org")
+        .manual_clock_at(start)
+        .start()
+        .await;
+    assert_eq!(server.now(), start);
+    let later = start.checked_add(week).unwrap();
+    server.set_time(later);
+    let (_alice, mut conn) = server.register("alice").await;
+    conn.send("JOIN #past").await.unwrap();
+    let join = conn.expect_line().await.unwrap();
+    assert!(join.contains(&format!("t={later}")), "{join}");
+
+    server.follow_system_clock();
+    let now = server.now();
+    assert!(now > later.checked_add(week).unwrap(), "{now}");
+    assert!(now <= Timestamp::now());
+}
+
+#[tokio::test]
+#[should_panic(expected = "the clock does not go back")]
+async fn a_manual_clock_is_not_set_back() {
+    let server = TestServer::builder().manual_clock().start().await;
+    let earlier = server
+        .now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap();
+    server.set_time(earlier);
+}

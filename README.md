@@ -58,6 +58,7 @@ and in what order.
 | `risala-keyfetch` | Rust | Fetches key files over HTTPS for the server (SPEC 4.4) |
 | `librisala` | Rust | The shared client library: connection, identity, sync, history cache, rooms, messages, moderation |
 | `risala-cli` | Rust | A small terminal client and key tool, built on librisala |
+| `risala-dev` | Rust | A local server filled with development data, for the apps |
 | [`clients/apple`](clients/apple) | Swift, SwiftUI | macOS and iOS client, just started |
 | GNOME app | Rust, gtk4-rs, libadwaita | Linux client, planned |
 | Android app | Kotlin | Android client, planned |
@@ -87,6 +88,42 @@ cargo build
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+```
+
+### Development data
+
+`risala-dev` runs a local server filled with realistic conversations,
+for the apps and the CLI to run against. Run it from the repository root:
+
+```
+nix run .#dev -- busy            # or: cargo run -p risala-dev -- busy
+nix run .#dev -- busy --live     # bots keep posting, editing, reacting and joining
+nix run .#dev -- huge --reset    # delete the state and seed again
+```
+
+The scenarios are `empty` (the account, in no conversation), `busy`
+(about 40 rooms: Arabic, English and mixed text, very long names and
+messages, 0 to 1,200 unread, edits, reactions, deletions, an
+announcements room, rooms with no messages, and a room the account is
+kicked from the first time it comes online) and `huge` (3,000 rooms).
+They are made from a fixed seed, so every run looks the same, and seeded
+through the protocol with the server's clock set back, so history has
+real dates over several weeks.
+
+State lives in `.dev/`, which git ignores: the database and certificate,
+and for clients `.dev/me.json` (the server's address, its fingerprint and
+the account, `me@risala.test`) and `.dev/me.pem` (the account's device
+key). Later runs serve the same state, so an app's cache and pinned
+fingerprint stay valid; after `--reset`, clear them. The server listens
+on `127.0.0.1:7473` as `localhost`, which the iOS simulator reaches. For a
+phone, add `--listen 0.0.0.0 --hostname <mac>.local`. On start it prints
+what to point a client at, including the `risala-cli` commands to sign
+in:
+
+```
+risala --state /tmp/risala-dev-cli trust localhost:7473 <fingerprint from me.json>
+risala --state /tmp/risala-dev-cli login localhost:7473 me@risala.test --key .dev/me.pem
+risala --state /tmp/risala-dev-cli sync
 ```
 
 ### Model checking with Kani

@@ -145,31 +145,52 @@ impl Clock for SystemClock {
     }
 }
 
-/// A clock that moves only when told to, for tests.
+/// A clock that moves only when told to, for tests, until
+/// [`follow_system`](Self::follow_system) lets it run.
 #[derive(Debug)]
-pub struct ManualClock(AtomicU64);
+pub struct ManualClock {
+    /// The time it is stopped at, in ms since the Unix epoch.
+    ms: AtomicU64,
+    /// Whether it follows the system clock.
+    follows: std::sync::atomic::AtomicBool,
+}
 
 impl ManualClock {
     /// A clock stopped at `t`.
     pub fn new(t: Timestamp) -> ManualClock {
-        ManualClock(AtomicU64::new(t.unix_millis()))
+        ManualClock {
+            ms: AtomicU64::new(t.unix_millis()),
+            follows: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     /// Sets the time.
     pub fn set(&self, t: Timestamp) {
-        self.0.store(t.unix_millis(), Ordering::SeqCst);
+        self.ms.store(t.unix_millis(), Ordering::SeqCst);
     }
 
     /// Moves the time forward.
     pub fn advance(&self, d: Duration) {
         let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        self.0.fetch_add(ms, Ordering::SeqCst);
+        self.ms.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    /// From now on, the time is the system clock's, but never earlier than
+    /// the time the clock was stopped at, so it does not go back.
+    pub fn follow_system(&self) {
+        self.follows.store(true, Ordering::SeqCst);
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
-        Timestamp::from_unix_millis(self.0.load(Ordering::SeqCst)).unwrap_or(Timestamp::MAX)
+        let stopped =
+            Timestamp::from_unix_millis(self.ms.load(Ordering::SeqCst)).unwrap_or(Timestamp::MAX);
+        if self.follows.load(Ordering::SeqCst) {
+            stopped.max(Timestamp::now())
+        } else {
+            stopped
+        }
     }
 }
 

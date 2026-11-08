@@ -83,6 +83,25 @@
 //! has expired (7.5): move it with [`TestServer::advance`], and expire old
 //! events at once with [`TestServer::expire_now`] instead of waiting for
 //! the background task.
+//!
+//! # Development servers
+//!
+//! `risala-dev` runs a server from this module for the apps to develop
+//! against, which needs a few options that tests do not. Each is off
+//! unless asked for, so a test server stays as described above.
+//!
+//! - [`state_dir`](TestServerBuilder::state_dir) keeps the database, the
+//!   self-signed certificate and the hosted identities' key files in a
+//!   directory of your choosing, which is not deleted. A server started
+//!   again on it has the same events, identities and certificate
+//!   fingerprint, so a client's cache and pinned fingerprint stay valid.
+//! - [`listen`](TestServerBuilder::listen) chooses the address and port.
+//! - [`manual_clock_at`](TestServerBuilder::manual_clock_at) stops the
+//!   clock at a time in the past, [`TestServer::set_time`] moves it to each
+//!   event's time, and [`TestServer::follow_system_clock`] lets it run on
+//!   the system clock once history is in place.
+//! - [`TestServer::register_as`] registers a hosted identity with a key of
+//!   your choosing, so that a client can be given the key.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -130,6 +149,8 @@ pub struct TestServerBuilder {
     presence: Option<(Duration, Duration)>,
     key_domains: Vec<String>,
     clock: Option<std::sync::Arc<ManualClock>>,
+    state_dir: Option<PathBuf>,
+    listen: Option<SocketAddr>,
 }
 
 impl fmt::Debug for TestServerBuilder {
@@ -237,8 +258,35 @@ impl TestServerBuilder {
     /// retention (7.5) and the rate limits that count per hour or per day
     /// measure time by it. Timers for connections, guest sessions and
     /// presence still run on real time.
-    pub fn manual_clock(mut self) -> Self {
-        self.clock = Some(std::sync::Arc::new(ManualClock::new(Timestamp::now())));
+    pub fn manual_clock(self) -> Self {
+        self.manual_clock_at(Timestamp::now())
+    }
+
+    /// Like [`manual_clock`](Self::manual_clock), with the clock stopped at
+    /// `t` instead of now, for history with past dates. Move it with
+    /// [`TestServer::set_time`] or [`TestServer::advance`], and let it run
+    /// with [`TestServer::follow_system_clock`].
+    pub fn manual_clock_at(mut self, t: Timestamp) -> Self {
+        self.clock = Some(std::sync::Arc::new(ManualClock::new(t)));
+        self
+    }
+
+    /// Keeps the server's state in `dir`, created if missing, instead of a
+    /// temporary directory: the database, the self-signed certificate and
+    /// its key, and the hosted identities' key files. The directory is not
+    /// deleted when the server stops, and a server started on it again
+    /// carries on with what is there, with the same certificate
+    /// fingerprint. For development servers (see the [module
+    /// documentation](self)); tests should leave it out.
+    pub fn state_dir(mut self, dir: &Path) -> Self {
+        self.state_dir = Some(dir.to_owned());
+        self
+    }
+
+    /// Listens on `addr` instead of `127.0.0.1` with a port the system
+    /// chooses. Port 0 still lets the system choose.
+    pub fn listen(mut self, addr: SocketAddr) -> Self {
+        self.listen = Some(addr);
         self
     }
 
@@ -261,10 +309,27 @@ impl TestServerBuilder {
 
     /// Starts the server and returns once it accepts connections.
     pub async fn start(self) -> TestServer {
-        let dir = TempDir::new();
         let mut config = self.config;
-        config.state_dir = dir.path().to_owned();
-        config.listen = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+        let dir = match self.state_dir {
+            Some(path) => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                builder.create(&path).expect("creating the state directory");
+                config.state_dir = path;
+                None
+            }
+            None => {
+                let dir = TempDir::new();
+                config.state_dir = dir.path().to_owned();
+                Some(dir)
+            }
+        };
+        let addr = self
+            .listen
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+        config.listen = vec![addr];
         if !self.prepare.is_empty() {
             let config = config.clone();
             let prepare = self.prepare;
@@ -298,11 +363,11 @@ impl TestServerBuilder {
             config,
             clock: self.clock,
             timers,
-            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            addr,
             fingerprint: None,
             running: None,
             keys,
-            dir: Some(dir),
+            dir,
         };
         server.launch().await;
         server
@@ -385,10 +450,13 @@ impl TestServer {
             presence: None,
             key_domains: Vec::new(),
             clock: None,
+            state_dir: None,
+            listen: None,
         }
     }
 
-    /// The address the server listens on, on `127.0.0.1`. It stays the
+    /// The address the server listens on: on `127.0.0.1` unless
+    /// [`listen`](TestServerBuilder::listen) chose another. It stays the
     /// same across [`restart`](Self::restart).
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -411,7 +479,8 @@ impl TestServer {
     }
 
     /// The directory holding the database and the certificate. It is
-    /// deleted when the server is dropped or stopped.
+    /// deleted when the server is dropped or stopped, unless it was given
+    /// with [`state_dir`](TestServerBuilder::state_dir).
     pub fn state_dir(&self) -> &Path {
         &self.config.state_dir
     }
@@ -546,6 +615,16 @@ impl TestServer {
             .clone()
             .expect("the test server has no identity_domain");
         let who = TestIdentity::new(&format!("{name}@{domain}"));
+        let client = self.register_as(&who).await;
+        (who, client)
+    }
+
+    /// Connects and registers `who` (4.6), with its key. Returns the
+    /// connection, signed in. Panics unless REGISTER succeeds; `who` must
+    /// be under the server's
+    /// [`identity_domain`](TestServerBuilder::identity_domain).
+    pub async fn register_as(&self, who: &TestIdentity) -> TestClient {
+        let name = who.identity().name();
         let (mut client, nonce) = self.connect_for_sign_in().await;
         client
             .send(&who.register_line(&self.config.hostname, &nonce))
@@ -557,7 +636,7 @@ impl TestServer {
             format!("OK uid={}", who.identity()),
             "answer to REGISTER {name}"
         );
-        (who, client)
+        client
     }
 
     /// Connects and reads the greeting. Returns the client and the
@@ -581,6 +660,32 @@ impl TestServer {
             .as_ref()
             .expect("the test server has no manual_clock")
             .advance(by);
+    }
+
+    /// Sets the server's clock to `t`, which events from now on are stamped
+    /// with. Needs [`manual_clock`](TestServerBuilder::manual_clock) or
+    /// [`manual_clock_at`](TestServerBuilder::manual_clock_at). Panics if
+    /// `t` is earlier than the clock's time, since events are stamped in
+    /// order.
+    pub fn set_time(&self, t: Timestamp) {
+        let clock = self
+            .clock
+            .as_ref()
+            .expect("the test server has no manual_clock");
+        assert!(t >= clock.now(), "the clock does not go back");
+        clock.set(t);
+    }
+
+    /// Lets the [manual clock](TestServerBuilder::manual_clock) run on the
+    /// system clock from now on, never going back: when it is ahead of the
+    /// system clock, it waits there until the system clock passes it.
+    /// [`set_time`](Self::set_time) and [`advance`](Self::advance) can
+    /// still move it forward.
+    pub fn follow_system_clock(&self) {
+        self.clock
+            .as_ref()
+            .expect("the test server has no manual_clock")
+            .follow_system();
     }
 
     /// The server's time now: the [manual clock](TestServerBuilder::manual_clock)'s

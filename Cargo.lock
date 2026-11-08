@@ -1323,6 +1323,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "risala-dev"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "risala-proto",
+ "risala-server",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "risala-keyfetch"
 version = "0.0.0"
 dependencies = [
