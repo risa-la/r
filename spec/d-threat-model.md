@@ -23,7 +23,8 @@ active.
   mailboxes each connection follows, push subscriptions, the size and
   pseudonym of each post, sign-ins, KeyPackage fetches and how many
   devices each identity has, watched presence, and which device got a
-  Welcome. See file uploads and who downloads them, the size and timing
+  Welcome. Learn, from key file
+  and log fetches, who looks up the identities it hosts. See file uploads and who downloads them, the size and timing
   of blobs and backups, and backup generations. See the members,
   display names and topic of public rooms. Join a public room under an
   identity of its own and read it from then on, in view of its members.
@@ -50,19 +51,28 @@ active.
 **The controller of an identity's domain**, which includes the server
 that hosts an identity.
 
-- Can: publish a key file with a new chain, or no key file at all.
-  Stop the identity from signing in to servers that have no cached key
-  file.
-- Cannot: do any of that unseen. A new chain is a new master key or a
-  fork to everyone who knows the identity, and their devices stop
-  sending to it until their users act (4.5, 12.14). Sign a record of an
-  existing chain without its keys.
+- Can: publish a key file with a new chain, an older one, or none at
+  all. With no key file, or an invalid one, it makes devices stop
+  sending to the identity and warn their users. Show someone meeting the
+  identity for the first time a chain of its own in a log on another
+  host, which only safety numbers catch (Section 14). Sign in as the
+  identity on servers that have not seen it before, and use its account
+  there. Stop the identity from signing in to servers that have no
+  cached key file.
+- Cannot: change the keys of an identity that a device already knows
+  unseen: a new chain is a new master key, a fork or a rollback, and
+  devices stop sending until their users act (4.5, 12.14). Add a device
+  unseen by the identity's own devices. Make anyone remove the identity
+  from a conversation. Sign a record of an existing chain without its
+  keys.
 
 **A key log and its witnesses.**
 
-- Can: refuse or delay records, which then stay pending (4.5). A log
-  and k colluding witnesses can show different trees to different
-  people.
+- Can: refuse or delay records, which then stay pending (4.5). Leave a
+  record out of its hints, which the owner's devices catch within a week
+  (4.5). A log and k colluding witnesses can show different trees to
+  different people. Lose its key, after which its identities' chains
+  cannot grow.
 - Cannot: change a record, which the identity's keys sign. Show two
   trees while fewer than k of a client's witnesses collude.
 
@@ -100,15 +110,18 @@ that hosts an identity.
 
 - Can: read the history stored on it, and everything sent to its groups
   until its leaves are removed. Use its device-signing key to add a
-  device, which the key log shows. Read the backups made with the backup
-  key it holds, and make backups with it, until the next generation.
+  device, which the key log shows. Remove the identity's other devices
+  from groups, and add itself back, until the record that removes it is
+  accepted, which the identity's devices see (12.7). Read the backups
+  made with the backup key it holds, and make backups with it, until the
+  owner moves to the next generation and replaces it.
   Send the identity's other devices made-up history for gaps they ask
   it to fill, which they show as copied from it.
 - Cannot: read messages whose keys the device had already deleted, or
   messages sent after the device's leaves are removed, or after the
   device itself commits fresh keys, once the attacker has lost access
-  (post-compromise security). Remove the identity's other devices, which
-  needs the recovery key.
+  (post-compromise security). Remove the identity's other devices from
+  its key file, which needs the recovery key.
 
 **Someone who gets the recovery key.**
 
@@ -117,6 +130,13 @@ that hosts an identity.
   server is not trusted to delete them.
 - Cannot: read conversations without joining them as a new device, which
   the identity's contacts see.
+
+**Someone who sees a pairing QR code,** with or without the server.
+
+- Can: read the new device's public keys, and spoil the pairing by
+  storing something under its ids first, so that it starts again.
+- Cannot: read the reply, which is sealed to the new device's own key
+  (4.8).
 
 **Push services and gateways.**
 
@@ -174,6 +194,11 @@ Each risk is marked **Mitigated**, where this document limits it, or
   device gets a Welcome, and whose presence is watched.
 - **The key log lists identities** (Open). Anyone can list the uids
   whose records a log holds.
+- **First contact** (Open). Meeting an identity for the first time
+  relies on safety numbers when its domain's controller is malicious
+  (Section 14).
+- **Key file fetches show contacts** (Open) to the host of each key
+  file and log.
 - **Backups are not forward secret** (Open). Whoever gets the recovery
   key reads every backup the server kept. Within a generation, a server
   can serve an older backup, and a device shows only its age.
@@ -242,4 +267,5 @@ claims that depend on it.
   conversations for guests (5.8, 12.7); reports are not evidence
   against an identity (5.8); downloads only from the server's own
   origins without asking (12.11); this appendix's risk statuses and
-  assumptions.
+  assumptions; the log pinned in the chain, chain heads, three key file
+  states, `retire` records, sealed pairing and witnessing (4.3-4.10).

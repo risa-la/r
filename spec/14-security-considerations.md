@@ -65,6 +65,11 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   password, offline. Devices never keep it (4.8). Changing it means a
   new master key, which every contact sees as such (12.14).
 
+- **Pairing.** The pairing QR code holds a secret that the server never
+  sees, and the reply is sealed to a key that never leaves the new
+  device (4.8). So someone who sees the QR code, even together with the
+  server, learns nothing from the reply.
+
 - **Deniability.** Nothing an identity publishes signs a message or a
   leaf key (4.3, 12.3), and members confirm leaves in ways that convince
   only themselves (12.10). So a message that leaks does not prove to a
@@ -112,6 +117,12 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     someone watches (8.3);
   - that an identity has an account on the server: sign-ins, KeyPackages,
     backups and its records in the key log;
+  - for the identities whose key files or logs it serves, which network
+    addresses fetch which identity's key file and records, and how often
+    (12.14). Every device fetches its contacts' key files daily, so this
+    shows who is in touch with whom, which sealed sending otherwise
+    hides. The host of a self-hosted identity's key file learns the
+    same;
   - in a public room, its members and their display names, the leaf of
     each light client (12.6), and its topic;
   - whether an identity is online, unless it has turned that off (8.3);
@@ -178,22 +189,67 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Who can add a device.** Any device of an identity holds the
   device-signing key, and so can add a device. That shows in the key
-  log, where the identity's own devices look for it and warn (4.5).
-  Whoever controls the identity's domain can publish a key file with a
-  new chain, but every device that knows the identity sees a new master
-  key or a fork, and stops sending to it until the user acknowledges it
-  (12.14). A server that hosts an identity holds none of its keys, and
-  can do no more than the domain's controller. No operator can reset an
-  identity.
+  log, which the chain names and the identity's own devices watch daily
+  (4.5). Whoever controls the identity's domain can publish a key file
+  with a new chain, or an older one, but every device that knows the
+  identity sees a new master key, a fork or a rollback, and stops
+  sending to it until the user acknowledges it (12.14). A server that
+  hosts an identity holds none of its keys, and can do no more than the
+  domain's controller. No operator can reset an identity.
+
+- **First contact.** A device that meets an identity for the first time
+  cannot tell whether the chain it is shown is the one the identity's
+  owner watches. Within one host, logs form a hand-off chain (4.5,
+  4.10), so a second chain for an identity in its own host's logs shows
+  up in the log its devices watch. But the controller of the identity's
+  domain can show a first-time contact a chain of its own in a log on
+  another host, which the owner never reads. Only comparing safety
+  numbers catches that (12.14), which is why clients suggest it for new
+  direct conversations. A monitor service that indexes every log by uid
+  could close this gap, and is left for a later version.
+
+- **A stolen device.** Until the `signing` record that removes it is
+  accepted, a stolen device is current: it can remove its identity's
+  other leaves from groups and add itself back. The identity's devices
+  show this as an alert (12.7), and its removal stands once the record
+  is accepted, which logs SHOULD witness within a minute (4.5).
+
+- **Missing key files.** A key file that is gone or invalid is
+  unsigned, so it removes nobody (4.4): devices stop sending to the
+  identity and warn their users. So the host of a key file can make an
+  identity unreachable, visibly, but cannot make anyone remove it from
+  a conversation. Only a `retire` record, which needs the recovery key,
+  does that (4.9).
+
+- **Accounts on other servers.** A server that has never seen an
+  identity takes its first chain from whoever controls the identity's
+  domain, and pins it (4.6). Before that pin exists, the domain's
+  controller can serve that server a chain of its own and sign in there
+  as the identity: delete its KeyPackages, Welcomes, push registrations
+  and backup on that server, and lock its devices out. A server that
+  checks records against the key log narrows this to the first-contact
+  gap above. None of it lets anyone read a conversation, since devices
+  check every record themselves.
 
 - **The key log.** A log could show different trees to different
   people. Witnesses refuse to cosign a checkpoint that is not consistent
-  with the last one they saw, so this needs k witnesses to collude. A
-  log that withholds a record leaves it pending (4.5), which devices
-  see. A log lists every uid whose records it holds, so anyone can list
-  the identities a server hosts. A log that is unreachable stops devices
-  from accepting new records of its identities, but not from using the
-  ones they already accepted.
+  with the last one they saw, so this needs k witnesses to collude; and
+  each witness enrols one key per origin, with k more than half a
+  client's list, so two keys of one log cannot both be witnessed for
+  one client (4.10). A log or a key file host that withholds a record
+  leaves it pending for devices that know of it. Devices that do not
+  know of it find it through the uid's hint within a day, unless the
+  log leaves it out of the hint as well; then the owner's devices find
+  it in their weekly read of the whole log (4.5), and contacts see the
+  identity as stale after 7 days without a fresh witnessed view.
+  Watching costs each device a few bytes a day for the hint, and the
+  size of the log's new entries each week. A log lists every uid whose
+  records it holds, so anyone can list the identities a server hosts. A
+  log that is unreachable stops devices from accepting new records of
+  its identities, but not from using the ones they already accepted. A
+  host that loses its log's key cannot hand off to a new log (4.5), and
+  its identities can then add or remove no device, so the key needs a
+  backup kept offline.
 
 - **Trust on first use.** Someone can intercept the first connection to
   a server that has a self-signed certificate. Users can compare the
