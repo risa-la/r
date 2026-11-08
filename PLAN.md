@@ -962,6 +962,52 @@ Open:
       kept the same way. The Secure Enclave and StrongBox cannot hold
       ML-DSA keys themselves, so they only wrap the stored secrets. The
       CLI keeps the database key in its private state directory.
+    - **How the storage and SQLCipher were built** (implementation only,
+      no spec change):
+      - The port of `openmls_sqlite_storage` is tested with real groups:
+        two devices on their own files, two connections on one file,
+        rollback of a merged commit and of a Welcome, and each kind of
+        row written and deleted. It needed no fixes.
+      - **Crypto under SQLCipher.** On Apple platforms rusqlite's
+        `bundled-sqlcipher` uses CommonCrypto, so the apps ship no
+        OpenSSL. Elsewhere it needs OpenSSL's libcrypto, and librisala
+        uses `bundled-sqlcipher-vendored-openssl`, which builds OpenSSL
+        from source and links it statically: Android has no libcrypto
+        for apps, and plain cargo builds then need no OpenSSL headers.
+        Nix builds set `OPENSSL_NO_VENDOR` and link nixpkgs' OpenSSL;
+        distributions packaging the GNOME app can do the same. The
+        `libtomcrypt` that `sqlcipher-src` carries is not usable through
+        libsqlite3-sys yet.
+      - **The server.** Cargo builds one SQLite per build, so when the
+        server is built together with librisala, as in the workspace's
+        tests, it gets SQLCipher's SQLite (now 3.53.4, against 3.54.1).
+        That is accepted: without a key SQLCipher reads and writes
+        ordinary SQLite files, and the server's tests pass on it.
+        `risalad` built alone (`-p risala-server`, as the Nix package
+        is) keeps plain SQLite.
+      - **The key.** A raw 256-bit key (`PRAGMA key = "x'...'"`), so
+        SQLCipher skips its passphrase KDF and opening a connection stays
+        cheap for the iOS notification extension. Every connection is
+        keyed before anything reads it, and a key that does not open the
+        file is its own error, not a corrupt cache. A build without
+        SQLCipher is refused, rather than writing in the clear.
+      - **Caches from before encryption** are encrypted when opened,
+        with `sqlcipher_export` into a new file that then replaces the
+        old one, so the outbox's unsent messages are kept. A write lock
+        on the old file keeps a second process from doing the same at
+        once. The old file's blocks are freed, not overwritten.
+      - The CLI keeps the key as 32 bytes in `cache.key`, made on first
+        use, mode 0600; one that others can read is refused, as for
+        device keys. Losing it loses the cache.
+      - The MLS tables are schema version 12 of the cache. MLS operations
+        run in the cache's own write transaction (`BEGIN IMMEDIATE`), on
+        a provider whose storage is that transaction, so the MLS state
+        and the cache's rows commit or roll back together.
+      - For M6: an encrypted WAL database in an iOS app group container
+        may need SQLCipher's plain-text header
+        (`cipher_plaintext_header_size`), so that iOS does not end the
+        app for holding its lock while suspended. Check this when the
+        app shares the cache with its notification extension.
 
 43. **Found while building M5a's foundation and server storage** (3.7,
     12.2, 12.4, 12.7, 12.10), decided with the user on 2026-11-08:
