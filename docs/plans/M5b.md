@@ -218,7 +218,7 @@ four writing code at once.
 - [x] **C0. Scaffold.** New store (schema version 1), the signed-in
   connection plus anonymous connections for posting and fetching, the
   client API's shape, module stubs per area below. Needs P1.
-- [~] **C1. Identity** (4.3-4.9, 12.14): creating an identity with its
+- [x] **C1. Identity** (4.3-4.9, 12.14): creating an identity with its
   recovery key, the key file chain, verifying records against the key
   log (witness policy, proofs from tiles, consistency, forks, daily
   watching, RECORD/ALERT), pairing by QR text, recovery, removing a
