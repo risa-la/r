@@ -154,7 +154,7 @@ four writing code at once.
 
 ### M. `risala-mls`
 
-- [~] **M1. Groups** (12.1-12.8): RisalaIdentity credentials, per-group
+- [x] **M1. Groups** (12.1-12.8): RisalaIdentity credentials, per-group
   leaf keys, the device binding (`0xF2A2`), profile (`0xF2A3`) and
   conversation (12.4) extensions, KeyPackages (with `last_resort` as
   the component `0x0004`: patch OpenMLS as `crates/openmls-traits` was
