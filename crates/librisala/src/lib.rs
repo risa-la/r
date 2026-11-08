@@ -10,7 +10,10 @@
 //! - [`conn`]: TLS with trust on first use, sessions, sign-in, keys.
 //! - [`store`]: the SQLite cache: servers, trust, conversations, events,
 //!   read markers, the outbox.
-//! - [`sync`]: the sans-I/O sync engine (7.1-7.3, 7.6).
+//! - [`sync`]: the sans-I/O sync engine (7.1-7.3, 7.6), with the
+//!   encryption engine of Section 12 inside it.
+//! - `e2ee`: MLS groups, content lines, history keys and backups
+//!   (Section 12), on the store's transactions.
 //! - [`client`]: the API apps use: [`Client`](client::Client),
 //!   accounts, conversations and timelines, driving the three above.
 
@@ -21,5 +24,6 @@ pub use risala_proto as proto;
 pub mod addr;
 pub mod client;
 pub mod conn;
+pub(crate) mod e2ee;
 pub mod store;
 pub mod sync;

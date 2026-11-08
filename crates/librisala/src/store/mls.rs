@@ -14,9 +14,11 @@
 //! an `MlsGroup` across transactions.
 
 use openmls_sqlite_storage::{MsgPack, SqliteStorageProvider};
+use risala_mls::openmls::group::MlsGroup;
+use risala_mls::openmls::prelude::GroupId;
 use rusqlite::Connection;
 
-use super::Tx;
+use super::{ConvId, StoreError, Tx};
 
 /// OpenMLS storage on one of the cache's connections, usually a write
 /// transaction. Its codec is MessagePack.
@@ -25,12 +27,32 @@ pub(crate) type MlsStorage<'a> = SqliteStorageProvider<MsgPack, &'a Connection>;
 impl Tx<'_> {
     /// OpenMLS storage inside this transaction, for the provider of an MLS
     /// operation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the group engine (M5a) uses it")
-    )]
     pub(crate) fn mls_storage(&self) -> MlsStorage<'_> {
         SqliteStorageProvider::new(self.conn())
+    }
+
+    /// Forgets a conversation's group: librisala's row, and OpenMLS's state
+    /// of the group. The history keys stay.
+    pub(crate) fn forget_group(&mut self, conv: ConvId) -> Result<(), StoreError> {
+        let Some(group) = self.group(conv)? else {
+            return Ok(());
+        };
+        self.delete_mls_state(&group.group_id)?;
+        self.delete_group(conv)
+    }
+
+    /// Deletes OpenMLS's state of a group, if it has any.
+    pub(crate) fn delete_mls_state(&mut self, group_id: &[u8]) -> Result<(), StoreError> {
+        let storage = self.mls_storage();
+        let id = GroupId::from_slice(group_id);
+        let group = MlsGroup::load(&storage, &id)
+            .map_err(|e| StoreError::Corrupt(format!("an MLS group does not load: {e}")))?;
+        if let Some(mut group) = group {
+            group
+                .delete(&storage)
+                .map_err(|e| StoreError::Corrupt(format!("an MLS group does not delete: {e}")))?;
+        }
+        Ok(())
     }
 }
 

@@ -199,11 +199,11 @@ pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
     AccountEvent, AccountRef, BanInfo, ChatCounts, ChatFilter, ChatKind, ChatPreview, ChatSummary,
     ClientError, ConnectionErrorKind, ConnectionInfo, ConnectionState, ConversationInfo,
-    ConversationPage, DEFAULT_PAGE, Delivery, DeviceKey, DisconnectKind, EventKind, FailKind,
-    KeyErrorKind, KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice, OutboxEntry,
-    OutboxStatus, Presence, ReactionCount, RefusedKind, ReportInfo, ReportedMessage, Role,
-    RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo, Setting,
-    TrustInfo, Unregistered, UserInfo,
+    ConversationPage, DEFAULT_PAGE, Delivery, DeviceKey, DisconnectKind, Encryption, EventKind,
+    FailKind, KeyErrorKind, KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice,
+    OutboxEntry, OutboxStatus, Presence, ReactionCount, RefusedKind, ReportInfo, ReportedMessage,
+    Role, RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo,
+    Setting, TrustInfo, Unregistered, UserInfo,
 };
 
 use account::AccountShared;

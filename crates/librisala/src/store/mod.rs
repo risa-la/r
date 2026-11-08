@@ -27,8 +27,9 @@
 
 mod chats;
 mod cipher;
+pub(crate) mod e2ee;
 mod events;
-mod mls;
+pub(crate) mod mls;
 mod outbox;
 mod people;
 mod read;
@@ -47,12 +48,13 @@ use crate::addr::ServerAddr;
 use risala_proto::names::Uid;
 
 pub use cipher::DatabaseKey;
+pub use e2ee::{DecryptFailure, EncState};
 pub(crate) use outbox::Claim;
 pub use outbox::{Draft, FailReason, OutboxItem, OutboxState};
 pub use read::{ConversationSummary, Member, Reaction, TimelineItem};
 
 pub(crate) use chats::{ChatKey, ChatQuery, ChatRow, key_order};
-pub(crate) use events::{ConvRow, Tx};
+pub(crate) use events::{ConvRow, Tx, stored_event};
 
 /// How long a write waits for another process's transaction to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

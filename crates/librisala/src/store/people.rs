@@ -14,7 +14,7 @@ use super::{AccountId, Change, ConvId, Store, StoreError, parse};
 /// account blocked, in a room, while the account hides blocked people
 /// (5.7). A domain block covers the domain's subdomains. The account's own
 /// messages are never hidden.
-pub(super) const HIDDEN: &str = "(e.verb = 'MSG' AND e.own = 0 AND EXISTS (
+pub(super) const HIDDEN: &str = "(e.verb IN ('MSG', 'ENC') AND e.own = 0 AND EXISTS (
     SELECT 1 FROM convs hc
     JOIN accounts ha ON ha.id = hc.account
     JOIN blocks b ON b.account = ha.id

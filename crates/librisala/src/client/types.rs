@@ -682,6 +682,10 @@ pub struct ConversationInfo {
     /// an app whether to offer a message box. A message sent anyway is
     /// refused by the server, and its outbox entry fails as `Rejected`.
     pub announcements: bool,
+    /// Whether the conversation is end-to-end encrypted (12.3): every
+    /// direct conversation, and rooms made encrypted with INIT. Its
+    /// messages carry [`Message::encryption`].
+    pub encrypted: bool,
 }
 
 /// One room setting (6.2), such as `public` = `yes`.
@@ -726,6 +730,7 @@ impl From<ConversationSummary> for ConversationInfo {
             announcements: c
                 .settings
                 .contains(&RoomSetting::Send(risala_proto::types::SendMode::Mods)),
+            encrypted: c.encrypted,
         }
     }
 }
@@ -855,6 +860,40 @@ pub struct Message {
     /// or failed. Then `seq` is 0, the time is when it was queued, and
     /// `line` is empty. `None` for a stored event.
     pub outbox: Option<OutboxEntry>,
+    /// For an encrypted message (12.8), how reading it went. `None` for a
+    /// message of an unencrypted conversation, and for one in the outbox.
+    pub encryption: Option<Encryption>,
+}
+
+/// How an encrypted message was read (12.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encryption {
+    /// Its signature verified against its sender's device.
+    Verified,
+    /// It was sent in an epoch this device was not in, and its sender's
+    /// key is not known here, as after a restore from a backup (12.8, 12.10).
+    /// Show it marked as unverified.
+    Unverified,
+    /// Not decrypted yet: the key of its epoch is not here yet. `text` is
+    /// `None`.
+    Waiting,
+    /// It could not be read, and its text is not shown (`None`).
+    Failed {
+        /// Why, for the app to word.
+        reason: crate::store::DecryptFailure,
+    },
+}
+
+impl Encryption {
+    fn of(state: crate::store::EncState) -> Encryption {
+        use crate::store::EncState;
+        match state {
+            EncState::Verified => Encryption::Verified,
+            EncState::Unverified => Encryption::Unverified,
+            EncState::Pending => Encryption::Waiting,
+            EncState::Failed(reason) => Encryption::Failed { reason },
+        }
+    }
 }
 
 /// The [`Message::id`] of a message sent from outbox entry `id`.
@@ -889,6 +928,7 @@ impl Message {
             reactions: Vec::new(),
             line: String::new(),
             outbox: Some(entry),
+            encryption: None,
         }
     }
 
@@ -914,6 +954,13 @@ impl From<TimelineItem> for Message {
                     Some(risala_proto::types::Relation::Reply(s)) => Some(s.get()),
                     _ => None,
                 },
+            ),
+            // 12.8: the text and reply of a decrypted TEXT line.
+            EventBody::Enc(_) => (
+                EventKind::Message,
+                item.text.as_deref().map(|t| unescape(t).into_owned()),
+                None,
+                item.reply_to.map(|s| s.get()),
             ),
             EventBody::Join { .. } => (EventKind::Join, None, None, None),
             EventBody::Part { reason, .. } => (EventKind::Part, opt_text(reason), None, None),
@@ -967,6 +1014,7 @@ impl From<TimelineItem> for Message {
                 .collect(),
             line,
             outbox: None,
+            encryption: item.enc.map(Encryption::of),
         }
     }
 }
@@ -1177,6 +1225,30 @@ pub enum Notice {
         /// The text, unescaped.
         text: String,
     },
+    /// The device can no longer follow an encrypted conversation's group:
+    /// a change to it failed the device's checks (12.6). Nothing more is
+    /// sent there. Warn the user.
+    EncryptionStopped {
+        /// The conversation.
+        conversation: String,
+    },
+    /// A new device of the identity joined (12.9, 12.12). Ask the user
+    /// whether it is theirs, then confirm it with
+    /// `Account::confirm_device`: only then does this device send it the
+    /// keys to read earlier history.
+    NewDevice {
+        /// The device key's fingerprint, to compare on the other device.
+        fingerprint: String,
+    },
+    /// Two different history keys arrived for one epoch of a conversation
+    /// (12.9). Warn the user: someone may be trying to show them messages
+    /// that were not sent there.
+    KeyConflict {
+        /// The conversation's id (5.1).
+        id: String,
+        /// The epoch.
+        epoch: u64,
+    },
 }
 
 impl Notice {
@@ -1204,6 +1276,16 @@ impl Notice {
             N::Dropped { room, reason } => Notice::Dropped {
                 room: room.to_string(),
                 reason: un(reason),
+            },
+            N::GroupRejected { conv } => Notice::EncryptionStopped {
+                conversation: conv.to_string(),
+            },
+            N::NewDevice { fingerprint } => Notice::NewDevice {
+                fingerprint: fingerprint.clone(),
+            },
+            N::KeyConflict { id, epoch } => Notice::KeyConflict {
+                id: id.to_string(),
+                epoch: *epoch,
             },
         }
     }

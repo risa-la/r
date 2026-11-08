@@ -68,6 +68,8 @@
 //!   ([`SyncEngine::set_resumed`]): a guest's cids count only within one
 //!   session (7.6).
 
+mod e2ee;
+mod e2ee_keys;
 mod engine;
 
 use std::fmt;
@@ -82,6 +84,7 @@ use risala_proto::types::Presence;
 
 use crate::store::{Change, StoreError};
 
+pub use e2ee_keys::OwnDeviceState;
 pub use engine::{SyncEngine, TYPING_REPEAT};
 
 /// Settings for a [`SyncEngine`].
@@ -255,6 +258,30 @@ pub enum Notification {
         /// The reason, escaped; empty if none.
         reason: String,
     },
+    /// A commit of an encrypted conversation failed a check of 12.6: the
+    /// device can no longer follow its group, and sends nothing more in it
+    /// (12.6). Warn the user.
+    GroupRejected {
+        /// The conversation.
+        conv: Conv,
+    },
+    /// Two different history keys arrived for one epoch (12.9). The one
+    /// kept is the device's own, then one from the identity's devices or
+    /// backup, then the first. Warn the user.
+    KeyConflict {
+        /// The conversation's id.
+        id: risala_proto::names::Id,
+        /// The epoch.
+        epoch: u64,
+    },
+    /// A new device of the identity joined its conversation with itself
+    /// (12.9, 12.12). It gets no history keys from this device until the
+    /// user confirms that it is theirs, with
+    /// [`SyncEngine::confirm_device`].
+    NewDevice {
+        /// The device key's fingerprint (12.12).
+        fingerprint: String,
+    },
     /// SYNC no longer lists a conversation the account was in: it left, or
     /// was kicked or banned, or the room was dropped (7.1). Its history is
     /// kept.
@@ -318,6 +345,12 @@ pub struct Output {
     pub retry_after: Option<Duration>,
     /// Typing and presence, in the order they arrived.
     pub signals: Vec<Signal>,
+    /// Identities whose key files to fetch (4.4, 12.12). Hand each back
+    /// with [`SyncEngine::key_file`].
+    pub key_files: Vec<Uid>,
+    /// A recovery key another device of the identity sent (12.10). Keep it
+    /// as the device key is kept.
+    pub recovery: Option<risala_mls::RecoveryKey>,
 }
 
 impl Output {
@@ -343,6 +376,8 @@ pub enum SyncError {
     NotJoined(Conv),
 }
 
+#[cfg(test)]
+mod e2ee_tests;
 #[cfg(test)]
 mod sim;
 #[cfg(test)]

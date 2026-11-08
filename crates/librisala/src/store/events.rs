@@ -9,6 +9,7 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::Relation;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use super::e2ee::DECRYPTED;
 use super::{AccountId, Change, ConvId, StoreError, opt_id, parse, seq, sql};
 use crate::addr::ServerAddr;
 
@@ -337,6 +338,9 @@ impl<'a> Tx<'a> {
             self.tx
                 .execute(&format!("DELETE FROM {table} WHERE conv = ?1"), [row.id.0])?;
         }
+        // The group belonged to the conversation that is gone (12.5). Its
+        // history keys stay, under that conversation's id.
+        self.forget_group(row.id)?;
         if let Some(old) = row.conv_id.take()
             && new_id.as_ref() != Some(&old)
         {
@@ -468,9 +472,12 @@ impl<'a> Tx<'a> {
         let conv = row.id;
         let n = meta.seq.get();
         if self.has_event(conv, n)? {
-            if let EventBody::Msg(m) = &event.body
-                && m.deleted
-            {
+            let deleted = match &event.body {
+                EventBody::Msg(m) => m.deleted,
+                EventBody::Enc(e) => e.deleted,
+                _ => false,
+            };
+            if deleted {
                 self.mark_deleted(conv, n)?;
             }
             return Ok(false);
@@ -492,14 +499,21 @@ impl<'a> Tx<'a> {
                 make_placeholder(m);
             }
         }
+        if let EventBody::Enc(e) = &mut event.body
+            && !e.deleted
+            && self.delete_event_for(conv, n)?
+        {
+            make_enc_placeholder(e);
+        }
         let line = event_line(&event)?;
         let c = Columns::of(&event);
         self.tx.execute(
             "INSERT INTO events (conv, seq, t, author, verb, rel, target, deleted, text,
-                 file_url, file_type, file_size, subject, line, own)
+                 file_url, file_type, file_size, subject, line, own, enc, mls_epoch)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                  ?4 = COALESCE(?15, (SELECT a.uid FROM convs c
-                                     JOIN accounts a ON a.id = c.account WHERE c.id = ?1)))",
+                                     JOIN accounts a ON a.id = c.account WHERE c.id = ?1)),
+                 ?16, ?17)",
             params![
                 conv.0,
                 sql(n),
@@ -516,6 +530,8 @@ impl<'a> Tx<'a> {
                 c.subject,
                 line,
                 self.me.as_ref().map(Uid::as_str),
+                c.enc,
+                c.mls_epoch.map(sql),
             ],
         )?;
 
@@ -718,7 +734,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Whether a stored DELETE names `seq`.
-    fn delete_event_for(&self, conv: ConvId, seq: u64) -> Result<bool, StoreError> {
+    pub(super) fn delete_event_for(&self, conv: ConvId, seq: u64) -> Result<bool, StoreError> {
         Ok(self
             .tx
             .query_row(
@@ -731,7 +747,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Whether stored event `seq` is deleted.
-    fn is_deleted(&self, conv: ConvId, seq: u64) -> Result<bool, StoreError> {
+    pub(super) fn is_deleted(&self, conv: ConvId, seq: u64) -> Result<bool, StoreError> {
         Ok(self
             .tx
             .query_row(
@@ -757,7 +773,7 @@ impl<'a> Tx<'a> {
     }
 
     /// Records an Updated change for `seq` if it is a stored timeline item.
-    fn touch(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
+    pub(super) fn touch(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
         if self.has_event(conv, n)? {
             self.changed(Change::Updated {
                 conv,
@@ -782,7 +798,7 @@ impl<'a> Tx<'a> {
     /// applies what follows: deleting a message deletes its edits and
     /// reactions, deleting an edit brings back the previous version, and
     /// deleting a reaction removes it.
-    fn mark_deleted(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
+    pub(super) fn mark_deleted(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
         type Row = (String, bool, String, Option<String>, Option<i64>);
         let row: Option<Row> = self
             .tx
@@ -795,16 +811,21 @@ impl<'a> Tx<'a> {
         let Some((verb, deleted, line, rel, target)) = row else {
             return Ok(());
         };
-        if verb != "MSG" || deleted {
+        if !matches!(verb.as_str(), "MSG" | "ENC") || deleted {
             return Ok(());
         }
         let mut event = stored_event(&line)?;
-        if let EventBody::Msg(m) = &mut event.body {
-            make_placeholder(m);
+        match &mut event.body {
+            EventBody::Msg(m) => make_placeholder(m),
+            EventBody::Enc(e) => make_enc_placeholder(e),
+            _ => {}
         }
+        // 5.4: the text goes, and for ENC the content and the franking key
+        // too. A deleted ENC event is no longer waiting to be decrypted.
         self.tx.execute(
             "UPDATE events SET deleted = 1, text = '', file_url = NULL, file_type = NULL,
-                 file_size = NULL, line = ?3
+                 file_size = NULL, line = ?3, content = NULL, frank_key = NULL,
+                 enc = CASE WHEN enc = 'pending' THEN NULL ELSE enc END
              WHERE conv = ?1 AND seq = ?2",
             params![conv.0, sql(n), event_line(&event)?],
         )?;
@@ -845,17 +866,36 @@ impl<'a> Tx<'a> {
 
     /// Recomputes the current text of message `n`: its newest edit by the
     /// same author that is not deleted, or its own text (5.3).
-    fn refresh_message(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
-        let base: Option<(Option<String>, bool, String, Option<String>)> = self
+    pub(super) fn refresh_message(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
+        type Base = (
+            Option<String>,
+            bool,
+            String,
+            Option<String>,
+            String,
+            Option<Vec<u8>>,
+        );
+        let base: Option<Base> = self
             .tx
             .query_row(
-                "SELECT rel, deleted, author, text FROM events
-                 WHERE conv = ?1 AND seq = ?2 AND verb = 'MSG'",
+                &format!(
+                    "SELECT rel, deleted, author, text, verb, message_id FROM events
+                     WHERE conv = ?1 AND seq = ?2 AND (verb = 'MSG' OR {DECRYPTED})"
+                ),
                 params![conv.0, sql(n)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((rel, deleted, author, text)) = base else {
+        let Some((rel, deleted, author, text, verb, mid)) = base else {
             return Ok(());
         };
         if matches!(rel.as_deref(), Some("edit" | "react")) {
@@ -864,14 +904,19 @@ impl<'a> Tx<'a> {
         let (text, edit) = if deleted {
             (String::new(), None)
         } else {
+            // An encrypted edit counts only if it names the message by its
+            // id too (12.8), and only its author's (12.11).
             let edit: Option<(i64, String)> = self
                 .tx
                 .query_row(
-                    "SELECT seq, text FROM events
-                     WHERE conv = ?1 AND target = ?2 AND rel = 'edit' AND deleted = 0
-                         AND author = ?3
-                     ORDER BY seq DESC LIMIT 1",
-                    params![conv.0, sql(n), author],
+                    &format!(
+                        "SELECT seq, text FROM events
+                         WHERE conv = ?1 AND target = ?2 AND rel = 'edit' AND deleted = 0
+                             AND author = ?3 AND verb = ?4
+                             AND (verb = 'MSG' OR ({DECRYPTED} AND target_mid = ?5))
+                         ORDER BY seq DESC LIMIT 1"
+                    ),
+                    params![conv.0, sql(n), author, verb, mid],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -891,17 +936,22 @@ impl<'a> Tx<'a> {
 
     /// Recomputes the reaction counts of message `n` (5.3). Each person
     /// counts once per reaction.
-    fn refresh_reactions(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
+    pub(super) fn refresh_reactions(&mut self, conv: ConvId, n: u64) -> Result<(), StoreError> {
         self.tx.execute(
             "DELETE FROM reactions WHERE conv = ?1 AND target = ?2",
             params![conv.0, sql(n)],
         )?;
+        // An encrypted reaction counts only if it names the message by its
+        // id too (12.8).
         self.tx.execute(
             "INSERT INTO reactions (conv, target, reaction, count, mine)
              SELECT e.conv, e.target, e.text, COUNT(DISTINCT e.author),
                  MAX(CASE WHEN e.own THEN e.seq END)
              FROM events e
+             LEFT JOIN events b ON b.conv = e.conv AND b.seq = e.target
              WHERE e.conv = ?1 AND e.target = ?2 AND e.rel = 'react' AND e.deleted = 0
+                 AND (e.verb = 'MSG' OR (e.enc IN ('verified', 'unverified')
+                     AND b.message_id IS NOT NULL AND e.target_mid = b.message_id))
              GROUP BY e.text",
             params![conv.0, sql(n)],
         )?;
@@ -915,6 +965,15 @@ fn make_placeholder(m: &mut risala_proto::server::Message) {
     m.deleted = true;
     m.text.clear();
     m.file = None;
+}
+
+/// Turns an ENC event into the placeholder HISTORY sends for a deleted
+/// one: no payload, no `frank`, no file (5.4).
+fn make_enc_placeholder(e: &mut risala_proto::server::Encrypted) {
+    e.deleted = true;
+    e.payload = None;
+    e.frank = None;
+    e.file = None;
 }
 
 /// The line to store for an event: canonical form, without `ref`.
@@ -946,6 +1005,10 @@ struct Columns {
     file_type: Option<String>,
     file_size: Option<u64>,
     subject: Option<String>,
+    /// `pending` for an ENC event with a payload (12.8).
+    enc: Option<&'static str>,
+    /// The epoch of an ENC event, or the one a COMMIT event started.
+    mls_epoch: Option<u64>,
 }
 
 impl Columns {
@@ -959,6 +1022,8 @@ impl Columns {
             file_type: None,
             file_size: None,
             subject: None,
+            enc: None,
+            mls_epoch: None,
         };
         match &event.body {
             EventBody::Msg(m) => {
@@ -978,12 +1043,22 @@ impl Columns {
             | EventBody::Ban { uid, .. }
             | EventBody::Unban { uid, .. }
             | EventBody::Role { uid, .. } => c.subject = Some(uid.as_str().to_owned()),
-            // Encrypted conversations (12) keep only the stored line for now.
-            EventBody::Join { .. }
-            | EventBody::Part { .. }
-            | EventBody::Set { .. }
-            | EventBody::Enc(_)
-            | EventBody::Commit { .. } => {}
+            // The text of an ENC event is filled in once it is decrypted
+            // (12.8).
+            EventBody::Enc(e) => {
+                c.deleted = e.deleted;
+                c.mls_epoch = Some(e.epoch);
+                if !e.deleted && e.payload.is_some() {
+                    c.enc = Some("pending");
+                }
+                if let Some(f) = &e.file {
+                    c.file_url = Some(f.url.as_str().to_owned());
+                    c.file_type = f.media_type.as_ref().map(|t| t.as_str().to_owned());
+                    c.file_size = f.size;
+                }
+            }
+            EventBody::Commit { epoch, .. } => c.mls_epoch = Some(*epoch),
+            EventBody::Join { .. } | EventBody::Part { .. } | EventBody::Set { .. } => {}
         }
         c
     }

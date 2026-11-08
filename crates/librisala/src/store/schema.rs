@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -362,6 +362,121 @@ CREATE INDEX outbox_unsent ON outbox (account, conv, id) WHERE state != 'sent';
 /// operation and the cache's own rows commit or roll back together. A
 /// later change to them comes as a new migration here.
 const V13: &str = openmls_sqlite_storage::SCHEMA;
+
+/// Version 14: end-to-end encryption (SPEC 12), around OpenMLS's own
+/// tables.
+///
+/// - The columns added to `events`:
+///   - `enc`, for an ENC event (12.8): `pending` until it is decrypted,
+///     then `verified`, `unverified` (a restored epoch whose sender's key
+///     is not known, 12.8 step 4), `failed` (the content must not be
+///     shown; `enc_error` says why), `control` (KEY and RECOVERY lines,
+///     not a message) or `ignored` (a message the room's rules drop,
+///     12.11). NULL for every other verb, and for a deleted placeholder.
+///   - `mls_epoch`: the epoch of an ENC event, or the epoch a COMMIT event
+///     started.
+///   - `message_id`, `content` and `frank_key`: a decrypted message's id,
+///     content lines and franking key, kept for replies, edits, reactions
+///     and reports (5.8, 12.8). `target_mid` is the `target` a reply,
+///     edit or reaction names; `rel` and `target` are filled in as for MSG,
+///     and the derived tables follow them only while the target's
+///     `message_id` is `target_mid`.
+/// - `mls_groups`: the group of each encrypted conversation the account
+///   is in: OpenMLS's group id, the epoch and the seq of the COMMIT event
+///   that started it, and its state. `init` while INIT waits for its
+///   answer; `active`; `rejected` after a commit failed a check of 12.6,
+///   when the device stops sending and never joins again; `broken` after
+///   MLS itself refused a commit, when it may join again by external
+///   commit (12.6); `left` once the account is no longer in the group,
+///   when only its history keys are kept. `pending` is a commit sent and
+///   not answered yet, in
+///   base64, and `refreshed` when the device last committed a fresh leaf
+///   (12.6), in Unix milliseconds.
+/// - `history_keys`: every history key the account holds (12.9), by the
+///   conversation's id, with where it came from and the seq of the COMMIT
+///   event that started the epoch, if known (0 for epoch 0). `backed_up`
+///   is the key id of the backup key it was last backed up under (12.10).
+///   `send` is the room's `send` value in the group at that epoch, for an
+///   epoch the device was in (12.11); NULL if not known.
+/// - `epoch_leaves`: the signature keys of each epoch's leaves that the
+///   device was in, by key id (SHA-384), for 12.8 step 4.
+/// - `device_keys`: device keys the account has seen in groups and key
+///   files (12.8 step 4, 12.12), by key id. `listed` says whether the
+///   identity's key file listed the key when last fetched (NULL: never
+///   checked). `key_files` says when each identity's key file was last
+///   fetched and tried.
+/// - `own_devices`: the identity's other devices, and whether the user
+///   confirmed each one, so that this device sends it history keys
+///   (12.9): `new`, `confirmed`, `sent` or `declined`.
+const V14: &str = "
+ALTER TABLE events ADD COLUMN enc TEXT
+    CHECK (enc IN ('pending', 'verified', 'unverified', 'failed', 'control', 'ignored'));
+ALTER TABLE events ADD COLUMN enc_error TEXT;
+ALTER TABLE events ADD COLUMN mls_epoch INTEGER;
+ALTER TABLE events ADD COLUMN message_id BLOB;
+ALTER TABLE events ADD COLUMN target_mid BLOB;
+ALTER TABLE events ADD COLUMN content BLOB;
+ALTER TABLE events ADD COLUMN frank_key BLOB;
+CREATE INDEX events_enc_pending ON events (conv, mls_epoch) WHERE enc = 'pending';
+CREATE INDEX events_message_id ON events (conv, message_id) WHERE message_id IS NOT NULL;
+CREATE INDEX events_commits ON events (conv, mls_epoch) WHERE verb = 'COMMIT';
+
+CREATE TABLE mls_groups (
+    conv       INTEGER PRIMARY KEY REFERENCES convs(id) ON DELETE CASCADE,
+    group_id   BLOB NOT NULL,
+    epoch      INTEGER NOT NULL,
+    commit_seq INTEGER NOT NULL,
+    state      TEXT NOT NULL CHECK (state IN ('init', 'active', 'rejected', 'broken', 'left')),
+    pending    TEXT,
+    refreshed  INTEGER NOT NULL
+);
+
+CREATE TABLE history_keys (
+    account    INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    conv_id    TEXT NOT NULL,
+    epoch      INTEGER NOT NULL,
+    key        BLOB NOT NULL,
+    source     TEXT NOT NULL CHECK (source IN ('own', 'device', 'backup', 'member')),
+    commit_seq INTEGER,
+    backed_up  BLOB,
+    send       TEXT CHECK (send IN ('all', 'mods')),
+    PRIMARY KEY (account, conv_id, epoch)
+) WITHOUT ROWID;
+
+CREATE TABLE epoch_leaves (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    conv_id TEXT NOT NULL,
+    epoch   INTEGER NOT NULL,
+    uid     TEXT NOT NULL,
+    key_id  BLOB NOT NULL,
+    PRIMARY KEY (account, conv_id, epoch, key_id)
+) WITHOUT ROWID;
+
+CREATE TABLE device_keys (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    key_id  BLOB NOT NULL,
+    uid     TEXT NOT NULL,
+    key     BLOB NOT NULL,
+    listed  INTEGER,
+    label   TEXT,
+    PRIMARY KEY (account, key_id)
+) WITHOUT ROWID;
+
+CREATE TABLE key_files (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    uid     TEXT NOT NULL,
+    fetched INTEGER,
+    tried   INTEGER NOT NULL,
+    PRIMARY KEY (account, uid)
+) WITHOUT ROWID;
+
+CREATE TABLE own_devices (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    key_id  BLOB NOT NULL,
+    state   TEXT NOT NULL CHECK (state IN ('new', 'confirmed', 'sent', 'declined')),
+    PRIMARY KEY (account, key_id)
+) WITHOUT ROWID;
+";
 
 /// Brings the schema up to [`VERSION`].
 pub(super) fn migrate(conn: &mut Connection) -> Result<(), StoreError> {

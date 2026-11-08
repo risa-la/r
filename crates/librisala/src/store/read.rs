@@ -6,6 +6,7 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{Role, RoomSetting};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::e2ee::EncState;
 use super::events::stored_event;
 use super::people::HIDDEN;
 use super::{AccountId, ConvId, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
@@ -46,6 +47,9 @@ pub struct ConversationSummary {
     /// `member` while the account is in the room. `None` otherwise, and
     /// for a direct conversation.
     pub role: Option<Role>,
+    /// Whether it is end-to-end encrypted (12.3): a direct conversation, or
+    /// a room the account holds a group for.
+    pub encrypted: bool,
 }
 
 impl ConversationSummary {
@@ -84,6 +88,12 @@ pub struct TimelineItem {
     /// (7.6). `None` for an event the account did not send through this
     /// cache's outbox, and until the OK arrives.
     pub outbox: Option<OutboxId>,
+    /// For an ENC event (12.8), how far reading it got: `None` for every
+    /// other event, and for a deleted one.
+    pub enc: Option<EncState>,
+    /// The message it replies to: a MSG's `reply` tag, or the `reply` of a
+    /// decrypted TEXT line whose target is that message (5.3, 12.8).
+    pub reply_to: Option<Seq>,
 }
 
 /// The count of one reaction on a message.
@@ -118,7 +128,8 @@ fn summary_sql() -> String {
         "SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
             {},
             (SELECT MAX(seq) FROM events e WHERE e.conv = c.id),
-            (SELECT m.role FROM room_members m WHERE m.conv = c.id AND m.uid = a.uid)
+            (SELECT m.role FROM room_members m WHERE m.conv = c.id AND m.uid = a.uid),
+            substr(c.name, 1, 1) != '#' OR EXISTS (SELECT 1 FROM mls_groups g WHERE g.conv = c.id)
         FROM convs c JOIN accounts a ON a.id = c.account",
         unread_sql()
     )
@@ -129,7 +140,8 @@ fn summary_sql() -> String {
 fn unread_messages_sql() -> String {
     format!(
         "FROM events e
-         WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
+         WHERE e.conv = c.id AND e.seq > c.read
+             AND (e.verb = 'MSG' OR (e.verb = 'ENC' AND e.enc IN ('verified', 'unverified')))
              AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0
              AND NOT {HIDDEN}"
     )
@@ -164,19 +176,20 @@ pub(super) fn has_unread_sql() -> String {
 type RawSummary = (
     (i64, i64, String, Option<String>, bool),
     (i64, i64, i64, i64, Option<i64>),
-    Option<String>,
+    (Option<String>, bool),
 );
 
 fn raw_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawSummary> {
     Ok((
         (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
         (r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?),
-        r.get(10)?,
+        (r.get(10)?, r.get(11)?),
     ))
 }
 
 fn finish_summary(raw: RawSummary) -> Result<ConversationSummary, StoreError> {
-    let ((id, account, name, conv_id, joined), (sp, head, read, unread, newest), role) = raw;
+    let ((id, account, name, conv_id, joined), (sp, head, read, unread, newest), (role, encrypted)) =
+        raw;
     let name: Conv = parse(&name, "conversation")?;
     let stored: Option<Role> = role.map(|r| parse(&r, "role")).transpose()?;
     let role = match stored {
@@ -198,6 +211,7 @@ fn finish_summary(raw: RawSummary) -> Result<ConversationSummary, StoreError> {
         newest: newest.map(seq).transpose()?,
         settings: Vec::new(),
         role,
+        encrypted,
     })
 }
 
@@ -280,13 +294,16 @@ fn reactions(conn: &Connection, conv: ConvId, target: i64) -> Result<Vec<Reactio
 }
 
 type RawItem = (
-    i64,
-    String,
-    bool,
-    Option<String>,
-    Option<i64>,
-    bool,
-    Option<i64>,
+    (
+        i64,
+        String,
+        bool,
+        Option<String>,
+        Option<i64>,
+        bool,
+        Option<i64>,
+    ),
+    (Option<String>, Option<String>, Option<String>, Option<i64>),
 );
 
 /// The last column is the outbox entry an own event was sent from: the
@@ -298,24 +315,35 @@ const ITEM: &str = "
             SELECT MIN(o.id) FROM outbox o JOIN convs c ON c.id = e.conv
             WHERE o.account = c.account AND o.conv = c.name AND o.state = 'sent'
                 AND o.seq = e.seq AND o.conv_id = c.conv_id AND o.verb = 'MSG'
-        ) END
+        ) END,
+        e.enc, e.enc_error, e.rel, e.target
     FROM events e LEFT JOIN message_state m ON m.conv = e.conv AND m.seq = e.seq";
 
 /// Timeline items only: no DELETE, edit or reaction. Messages hidden
 /// because their author is blocked (5.7) are left out too.
+///
+/// COMMIT events change the group, not the timeline (12.5), and ENC
+/// events that hold KEY or RECOVERY lines, or that the room's rules
+/// ignore, are not messages (12.8, 12.11).
 fn is_item() -> String {
-    format!("e.verb != 'DELETE' AND (e.rel IS NULL OR e.rel = 'reply') AND NOT {HIDDEN}")
+    format!(
+        "e.verb NOT IN ('DELETE', 'COMMIT') AND (e.rel IS NULL OR e.rel = 'reply')
+         AND (e.enc IS NULL OR e.enc NOT IN ('control', 'ignored')) AND NOT {HIDDEN}"
+    )
 }
 
 fn raw_timeline(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawItem> {
     Ok((
-        r.get(0)?,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        r.get(4)?,
-        r.get(5)?,
-        r.get(6)?,
+        (
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        ),
+        (r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?),
     ))
 }
 
@@ -324,18 +352,31 @@ fn finish_timeline(
     conv: ConvId,
     raw: RawItem,
 ) -> Result<TimelineItem, StoreError> {
-    let (n, line, deleted, text, edit, own, outbox) = raw;
+    let ((n, line, deleted, text, edit, own, outbox), (enc, enc_error, rel, target)) = raw;
     let event = stored_event(&line)?;
     let meta = event
         .meta
         .clone()
         .ok_or_else(|| StoreError::Corrupt(format!("stored event without seq: {line:?}")))?;
-    let is_msg = matches!(event.body, risala_proto::server::EventBody::Msg(_));
+    let enc = EncState::from_columns(enc.as_deref(), enc_error.as_deref());
+    // An ENC event is a message too, with text once it is decrypted and
+    // may be shown (12.8).
+    let is_msg = matches!(
+        event.body,
+        risala_proto::server::EventBody::Msg(_) | risala_proto::server::EventBody::Enc(_)
+    );
+    let readable = !matches!(enc, Some(EncState::Pending | EncState::Failed(_)));
+    let reply_to = match (rel.as_deref(), target) {
+        (Some("reply"), Some(t)) => Some(seq(t)?),
+        _ => None,
+    };
     Ok(TimelineItem {
+        enc,
+        reply_to,
         seq: meta.seq,
         t: meta.t,
         from: meta.from,
-        text: if is_msg {
+        text: if is_msg && readable {
             Some(text.unwrap_or_default())
         } else {
             None

@@ -1660,6 +1660,8 @@ dependencies = [
  "openmls_traits",
  "proptest",
  "rcgen",
+ "risala-keyfetch",
+ "risala-mls",
  "risala-proto",
  "risala-server",
  "rusqlite",

@@ -1381,7 +1381,15 @@ fn one_message_per_conversation_is_in_flight() {
     // Were two in flight and the first turned away with rate-limited, the
     // second could land first. Other conversations do not wait.
     let mut h = H::new(ALICE);
-    h.joined("k1", 3);
+    let r = h.start();
+    h.reply(r, &["CONV #general k1 1 0", "CONV #other k2 1 0"], "OK");
+    let limit = h.config.page_size;
+    for (room, id) in [("#general", "k1"), ("#other", "k2")] {
+        let r = h.expect(&format!("HISTORY {room} after=0 limit={limit}"));
+        let page = [ev(1, &format!("from=bob@example.net MSG {room} m1"))];
+        h.reply_s(r, &page, &format!("OK id={id} more=0"));
+    }
+    h.idle();
     let send = |h: &mut H, to: &str, text: &str| {
         let (id, out) = h.engine.send(&conv(to), &Draft::text(text)).unwrap();
         h.absorb(out);
@@ -1389,23 +1397,23 @@ fn one_message_per_conversation_is_in_flight() {
     };
     let one = send(&mut h, "#general", "one");
     let two = send(&mut h, "#general", "two");
-    send(&mut h, "bob@example.net", "hi bob");
+    send(&mut h, "#other", "hi other");
     let (r1, _) = h.expect_msg("one");
-    let (r3, _) = h.expect_msg("hi bob");
+    let (r3, _) = h.expect_msg("hi other");
     h.idle();
     assert_eq!(
         h.store.outbox_item(two).unwrap().unwrap().state,
         OutboxState::Queued
     );
-    h.reply(r1, &[], "OK seq=4");
+    h.reply(r1, &[], "OK seq=2");
     assert_eq!(
         h.store.outbox_item(one).unwrap().unwrap().state,
-        OutboxState::Sent(seq(4))
+        OutboxState::Sent(seq(2))
     );
     let (r2, _) = h.expect_msg("two");
     h.idle();
-    h.reply(r2, &[], "OK seq=5");
-    h.reply(r3, &[], "OK id=d1 seq=1");
+    h.reply(r2, &[], "OK seq=3");
+    h.reply(r3, &[], "OK seq=2");
     h.idle();
 }
 
@@ -1421,13 +1429,18 @@ fn bad_drafts() {
         h.engine.send(&conv("#elsewhere"), &Draft::text("hi")),
         Err(SyncError::NotJoined(_))
     ));
-    // A direct conversation with no id starts with its first message.
-    let (_, out) = h
+    // A direct conversation is always encrypted (12.3): never MSG. With
+    // no device key, its message waits.
+    let (id, out) = h
         .engine
         .send(&conv("bob@example.net"), &Draft::text("hi"))
         .unwrap();
     h.absorb(out);
-    h.expect_msg("hi");
+    h.idle();
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Queued
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -78,7 +78,7 @@ struct Live {
 
 /// Which slot a HISTORY request occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Slot {
+pub(super) enum Slot {
     /// Catching up, from [`SyncEngine::check_fill`].
     Auto,
     /// [`SyncEngine::load_older`].
@@ -89,7 +89,7 @@ enum Slot {
 
 /// The shape of a HISTORY request, which says what its page proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Page {
+pub(super) enum Page {
     /// `after=<after>`: forward from the sync point (7.1 step 3).
     Forward { after: u64 },
     /// No bounds: the newest page (7.1 step 4).
@@ -100,7 +100,7 @@ enum Page {
 
 /// A request in flight, and what to do with its reply.
 #[derive(Debug, Clone)]
-enum Pending {
+pub(super) enum Pending {
     Sync {
         /// [`SyncEngine::ticks`] when it was sent.
         sent: u64,
@@ -168,6 +168,8 @@ enum Pending {
         first: Seq,
         last: Seq,
     },
+    /// An encryption command (12).
+    E2ee(super::e2ee::E2eePending),
 }
 
 /// What a page did to the store.
@@ -194,10 +196,10 @@ enum PageResult {
 /// docs](super).
 #[derive(Debug)]
 pub struct SyncEngine {
-    store: Store,
-    account: AccountId,
-    me: Uid,
-    guest: bool,
+    pub(super) store: Store,
+    pub(super) account: AccountId,
+    pub(super) me: Uid,
+    pub(super) guest: bool,
     /// A guest's session was resumed on this connection (4.2), so its
     /// cids carry over (7.6).
     resumed: bool,
@@ -209,9 +211,9 @@ pub struct SyncEngine {
     syncing: Option<ReqId>,
     /// A SYNC was answered on this connection, so the cache knows which
     /// rooms the account is in (7.1).
-    listed: bool,
+    pub(super) listed: bool,
     /// Send SYNC again once the one in flight is answered.
-    want_sync: bool,
+    pub(super) want_sync: bool,
     /// Outbox entries sent on this connection and not answered yet.
     sending: HashSet<OutboxId>,
     /// The server answered `rate-limited`: no message goes before this.
@@ -222,7 +224,9 @@ pub struct SyncEngine {
     ticks: u64,
     /// When TYPING was last sent for each conversation (8.1).
     typing_sent: HashMap<Conv, Timestamp>,
-    out: Output,
+    /// End-to-end encryption, for an identity's device (12).
+    pub(super) e2ee: Option<super::e2ee::E2ee>,
+    pub(super) out: Output,
 }
 
 impl SyncEngine {
@@ -264,6 +268,7 @@ impl SyncEngine {
             held_until: None,
             ticks: 0,
             typing_sent: HashMap::new(),
+            e2ee: None,
             out: Output::default(),
         }
     }
@@ -307,6 +312,9 @@ impl SyncEngine {
         if !self.guest && self.config.fetch_blocks {
             self.request_blocks()?;
         }
+        // KEYPKG COUNT and WELCOME LIST, after SYNC, so that the Welcomes
+        // find their conversations' ids (12.4, 12.7).
+        self.e2ee_start();
         self.flush_outbox()?;
         Ok(self.finish())
     }
@@ -351,6 +359,7 @@ impl SyncEngine {
                 }
             }
             ServerLine::Drop { id, room, reason } => self.on_drop(Some(id), room, reason)?,
+            ServerLine::Welcome { .. } => self.e2ee_line(&msg.line)?,
             // A block made or lifted on another device of the account
             // (5.7): one target at a time, never the whole list.
             ServerLine::Block { target } | ServerLine::Unblock { target } if !self.guest => {
@@ -404,6 +413,7 @@ impl SyncEngine {
                 first,
                 last,
             } => self.on_related(&conv, row, epoch, first, last, &reply)?,
+            Pending::E2ee(pending) => self.on_e2ee(req, pending, reply)?,
         }
         Ok(self.finish())
     }
@@ -436,6 +446,13 @@ impl SyncEngine {
 
     /// Asks for a room's information (6.2), which also checks its id.
     pub fn info(&mut self, room: &Room) -> Output {
+        self.issue_info(room);
+        self.finish()
+    }
+
+    /// Sends `INFO <room>`, as [`info`](Self::info) does, for the engine's
+    /// own use.
+    pub(super) fn issue_info(&mut self, room: &Room) {
         let command = Command::Info {
             room: Some(room.clone()),
         };
@@ -449,7 +466,6 @@ impl SyncEngine {
                 floor,
             },
         );
-        self.finish()
     }
 
     /// Sends a command the engine keeps nothing from, such as ROLE, KICK,
@@ -733,7 +749,7 @@ impl SyncEngine {
     }
 
     /// Ends a call: sends SYNC if one is wanted, and hands over the output.
-    fn finish(&mut self) -> Output {
+    pub(super) fn finish(&mut self) -> Output {
         if self.want_sync && self.syncing.is_none() {
             self.want_sync = false;
             self.request_sync();
@@ -741,7 +757,7 @@ impl SyncEngine {
         std::mem::take(&mut self.out)
     }
 
-    fn write<T>(
+    pub(super) fn write<T>(
         &mut self,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T, StoreError>,
     ) -> Result<T, SyncError> {
@@ -757,7 +773,7 @@ impl SyncEngine {
         Ok(t)
     }
 
-    fn issue(&mut self, command: Command, pending: Pending) -> ReqId {
+    pub(super) fn issue(&mut self, command: Command, pending: Pending) -> ReqId {
         let req = ReqId(self.next_req);
         self.next_req += 1;
         self.pending.insert(req, pending);
@@ -857,7 +873,7 @@ impl SyncEngine {
     }
 
     /// The id of `conv` was learned on this connection.
-    fn confirm(&mut self, conv: &Conv, id: Id) {
+    pub(super) fn confirm(&mut self, conv: &Conv, id: Id) {
         let live = self.live(conv);
         if live.failed_for.as_ref() != Some(&id) {
             live.failures = 0;
@@ -995,6 +1011,13 @@ impl SyncEngine {
             self.left(&conv)?;
         }
         self.check_fill(&conv)?;
+        if stored {
+            // Commits to apply and messages to decrypt (12.5, 12.8).
+            self.e2ee_advance(&conv)?;
+            if matches!(event.body, EventBody::Commit { .. }) {
+                self.flush_outbox()?;
+            }
+        }
         if joined_here {
             self.flush_outbox()?;
         }
@@ -1168,6 +1191,7 @@ impl SyncEngine {
                 self.check_fill(conv)?;
             }
         }
+        self.e2ee_all()?;
         self.flush_outbox()
     }
 
@@ -1322,6 +1346,7 @@ impl SyncEngine {
             })?;
             self.confirm(&conv, id);
             self.check_fill(&conv)?;
+            self.e2ee_learned(&conv)?;
             self.flush_outbox()?;
         }
         self.completed(req, reply.outcome);
@@ -1347,6 +1372,8 @@ impl SyncEngine {
             let head = ok.head().ok().flatten();
             let floor = self.head_floor(&conv, sent, floor);
             let (account, session_ended) = (self.account, self.session_ended());
+            // An invitee's Welcome waits for the room's id (12.6, 12.7).
+            let invited = self.has_deferred(&conv);
             self.write(|tx| {
                 let row = if joined {
                     Some(tx.conv_or_create(account, &conv)?)
@@ -1371,6 +1398,9 @@ impl SyncEngine {
                     if row.conv_id.as_ref().is_some_and(|old| *old != id) {
                         tx.discard(&mut row, None)?;
                     }
+                    if invited && row.conv_id.is_none() {
+                        tx.learn_id(&mut row, &id, None)?;
+                    }
                     tx.set_joined(&mut row, false)?;
                     left_outbox(tx, session_ended, &row)?;
                 }
@@ -1386,9 +1416,11 @@ impl SyncEngine {
             if joined {
                 self.confirm(&conv, id);
                 self.check_fill(&conv)?;
+                self.e2ee_learned(&conv)?;
                 self.flush_outbox()?;
             } else {
                 self.live(&conv).confirmed = None;
+                self.e2ee_learned(&conv)?;
             }
         }
         self.completed(req, reply.outcome);
@@ -1400,6 +1432,7 @@ impl SyncEngine {
         let account = self.account;
         let me = self.me.clone();
         let now = self.now();
+        let mut stale = None;
         let retry = self.write(|tx| {
             let Some(item) = tx.outbox_item(outbox)? else {
                 return Ok(None);
@@ -1437,6 +1470,12 @@ impl SyncEngine {
                     tx.outbox_requeue(outbox)?;
                     return Ok(Some(err.retry.unwrap_or(1)));
                 }
+                // 12.6, 12.8: the group moved on, or has a leaf to remove.
+                // The message waits for the group, and is encrypted again.
+                Outcome::Err(err) if err.code == ErrorCode::Stale => {
+                    tx.outbox_requeue(outbox)?;
+                    stale = Some(item.conv.clone());
+                }
                 Outcome::Err(err) => tx.outbox_failed(outbox, FailReason::Rejected(err.code))?,
                 Outcome::Failed => tx.outbox_failed(outbox, FailReason::Unconfirmed)?,
                 // Never sent, so it is not "maybe sent".
@@ -1449,6 +1488,9 @@ impl SyncEngine {
                 .checked_add(Duration::from_secs(secs))
                 .unwrap_or(Timestamp::MAX);
             self.held_until = Some(self.held_until.map_or(until, |h| h.max(until)));
+        }
+        if let Some(conv) = stale {
+            self.enc_stale(&conv)?;
         }
         // The conversation's next message may go now, or once the hold
         // ends.
@@ -1576,6 +1618,8 @@ impl SyncEngine {
                 if let Some((first, last)) = related {
                     self.related(conv, row_id, epoch, first, last, None);
                 }
+                self.e2ee_advance(conv)?;
+                self.flush_outbox()?;
             }
         }
         self.check_fill(conv)
@@ -1664,7 +1708,7 @@ impl SyncEngine {
 
     /// Starts catching `conv` up if it is behind and nothing is in flight
     /// (7.1 steps 3 and 4).
-    fn check_fill(&mut self, conv: &Conv) -> Result<(), SyncError> {
+    pub(super) fn check_fill(&mut self, conv: &Conv) -> Result<(), SyncError> {
         let Some(live) = self.convs.get(conv) else {
             return Ok(());
         };
@@ -1675,11 +1719,12 @@ impl SyncEngine {
         let found = self.write(|tx| match tx.conv_by_name(account, conv)? {
             Some(row) => {
                 let newest = tx.max_seq(row.id)?;
-                Ok(Some((row, newest)))
+                let encrypted = tx.is_encrypted(&row)?;
+                Ok(Some((row, newest, encrypted)))
             }
             None => Ok(None),
         })?;
-        let Some((row, newest)) = found else {
+        let Some((row, newest, encrypted)) = found else {
             return Ok(());
         };
         if !self.matches_confirmed(conv, &row) {
@@ -1698,7 +1743,11 @@ impl SyncEngine {
             live.download = false;
             return Ok(());
         }
-        let lazy = !live.download && lazy_gap.is_some_and(|gap| goal - row.sync_point > gap);
+        // An encrypted conversation's commits are applied in order, once
+        // every event before them is stored (12.5, 12.6): no newest page
+        // first.
+        let lazy =
+            !live.download && !encrypted && lazy_gap.is_some_and(|gap| goal - row.sync_point > gap);
         let page = if lazy {
             if newest >= top || live.newest_for == Some(goal) {
                 // The newest events are here; the rest loads on demand.
@@ -1839,7 +1888,7 @@ impl SyncEngine {
     /// ([`SyncConfig::claim_lease`]); [`Output::retry_after`] then says
     /// when the claim runs out, so that the entry is settled even if that
     /// process went away.
-    fn flush_outbox(&mut self) -> Result<(), SyncError> {
+    pub(super) fn flush_outbox(&mut self) -> Result<(), SyncError> {
         let account = self.account;
         let now = self.now();
         let window = self.config.resend_window;
@@ -1851,6 +1900,22 @@ impl SyncEngine {
         let claim = self.claim.clone();
         let store = self.store.clone();
         let in_flight = self.sending.clone();
+        let held: HashSet<Conv> = self
+            .e2ee
+            .as_ref()
+            .map(|_| {
+                self.convs
+                    .keys()
+                    .filter(|c| self.enc_held(c))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let e2ee_on = self.has_e2ee();
+        // Direct conversations with no group, to start (12.6).
+        let mut to_start: Vec<Conv> = Vec::new();
+        // Identities whose key files would confirm a group's leaves.
+        let mut unconfirmed: Vec<Uid> = Vec::new();
         let confirmed: HashMap<Conv, Id> = self
             .convs
             .iter()
@@ -1947,24 +2012,68 @@ impl SyncEngine {
                     (None, Some(id)) => tx.outbox_bind(item.id, id)?,
                     (Some(_), None) => continue,
                     (None, None) => {
-                        // A direct conversation that has not started: its
-                        // first message starts it (5.1). Wait if it has an
-                        // id now.
-                        if stored.is_some() || item.conv.is_room() {
+                        // A direct conversation that has not started: INIT
+                        // starts it (5.1, 12.6), and the message waits.
+                        if stored.is_none() && !item.conv.is_room() && item.delete.is_none() {
+                            to_start.push(item.conv.clone());
+                        }
+                        continue;
+                    }
+                }
+                // 12.3: never MSG to a direct conversation, or to a room
+                // the account holds a group for. Those go as ENC.
+                let mut plan = None;
+                if item.delete.is_none() {
+                    let row = tx.conv_by_name(account, &item.conv)?;
+                    let encrypted = match &row {
+                        Some(row) => tx.is_encrypted(row)?,
+                        None => !item.conv.is_room(),
+                    };
+                    if encrypted {
+                        if !e2ee_on || item.draft.file.is_some() {
+                            // No device key here, or a file, which is not
+                            // encrypted yet (12.11): it waits.
                             continue;
+                        }
+                        let Some(row) = row else { continue };
+                        match SyncEngine::enc_ready(
+                            tx,
+                            &row,
+                            item.draft.relation,
+                            held.contains(&item.conv),
+                        )? {
+                            super::e2ee::EncReady::Go(p) => plan = Some(p),
+                            super::e2ee::EncReady::Wait => {
+                                if tx.group(row.id)?.is_none() && !item.conv.is_room() {
+                                    to_start.push(item.conv.clone());
+                                }
+                                continue;
+                            }
+                            super::e2ee::EncReady::Unconfirmed(uids) => {
+                                unconfirmed.extend(uids);
+                                continue;
+                            }
+                            super::e2ee::EncReady::Fail => {
+                                tx.outbox_failed(item.id, FailReason::Invalid)?;
+                                continue;
+                            }
                         }
                     }
                 }
                 tx.outbox_sending(item.id, &claim, now)?;
                 busy.insert(item.conv.clone());
-                to_send.push(item);
+                to_send.push((item, plan));
             }
             Ok(to_send)
         })?;
+        for conv in to_start {
+            self.start_direct(&conv)?;
+        }
+        self.check_unconfirmed(unconfirmed)?;
         if let Some(at) = lapses {
             self.resume_by(now, at);
         }
-        for item in to_send {
+        for (item, plan) in to_send {
             let command = match item.delete {
                 // The id the entry is bound to, so that the server deletes
                 // nothing in a room created again under the same name
@@ -1974,16 +2083,34 @@ impl SyncEngine {
                     seq,
                     id: item.conv_id.clone(),
                 },
-                None => Command::Msg {
-                    conv: item.conv,
-                    text: item.draft.text,
-                    relation: item.draft.relation,
-                    file: item.draft.file,
-                    cid: Some(item.cid),
-                    // The id the entry is bound to, so that the server
-                    // sends nothing to a room created again under the same
-                    // name (5.3).
-                    id: item.conv_id.clone(),
+                None => match plan {
+                    // 12.8: encrypted under the current epoch's key.
+                    Some(plan) => match self.encrypt_draft(&plan, &item.draft) {
+                        Ok(enc) => Command::Enc {
+                            conv: item.conv,
+                            epoch: plan.epoch,
+                            payload: enc.payload,
+                            frank: Some(enc.frank),
+                            file: None,
+                            cid: Some(item.cid),
+                        },
+                        Err(e) => {
+                            warn!(error = %e, "encrypting a message");
+                            self.write(|tx| tx.outbox_failed(item.id, FailReason::Invalid))?;
+                            continue;
+                        }
+                    },
+                    None => Command::Msg {
+                        conv: item.conv,
+                        text: item.draft.text,
+                        relation: item.draft.relation,
+                        file: item.draft.file,
+                        cid: Some(item.cid),
+                        // The id the entry is bound to, so that the server
+                        // sends nothing to a room created again under the
+                        // same name (5.3).
+                        id: item.conv_id.clone(),
+                    },
                 },
             };
             self.sending.insert(item.id);
