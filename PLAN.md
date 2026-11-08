@@ -1101,6 +1101,42 @@ Open:
       It is neither applied nor rejected, since a failed fetch says
       nothing about the keys (4.4).
 
+47. **Found while testing M5a end to end** (5.8, 12.6, 12.12), on
+    2026-11-08. Implementation only, no spec change; item 46's
+    decisions are built and tested:
+    - librisala's encryption is tested end to end against `risalad`, with
+      key files fetched over HTTPS from the test server's key file host.
+      That found: the list of an identity's devices failed on every call;
+      a message to a new direct conversation queued before WELCOME LIST
+      was answered never started it; and an invitation to an encrypted
+      room was lost when its commit got `stale`. The device now keeps the
+      invitees' KeyPackages until the server accepts the commit.
+    - **The CLI finishes encryption work before exiting.** Each command
+      waits, for up to 30 seconds, until its accounts' connections have
+      nothing in flight, so that KeyPackage uploads, joins and key
+      sharing are not cut short; `register` signs in once, so that others
+      can add the new device at once. Debug builds take
+      `RISALA_TEST_CONNECT` and `RISALA_TEST_KEY_HOST` (with
+      `RISALA_TEST_KEY_CA`), so that its tests reach a test server under
+      a made-up name.
+    - **Reviewers check REPORTENC.** librisala checks the revealed content
+      against the copy's `frank` tag (5.8), and shows its text only if it
+      matches; the CLI says which.
+    - **Key files on demand.** `Account::refresh_devices` fetches a key
+      file now, and the CLI's `devices` uses it, so that a key just added,
+      such as a new recovery key, is listed.
+
+    Open:
+
+    - **A direct conversation whose other side has no KeyPackages.** If
+      KEYPKG GET returns none for the other participant, the device sends
+      INIT and its message anyway. The other side's device later joins by
+      external commit, and can never read what came before, since in a
+      direct conversation history keys come only from its own identity's
+      devices (12.9). Should a device hold its messages until the other
+      participant has a leaf, or should the spec say that such messages
+      are lost?
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
