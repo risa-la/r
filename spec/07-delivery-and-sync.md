@@ -191,8 +191,8 @@ A device catches up like this:
    while the response says `more=1`. F is L less a random number of
    posts, from 0 to 20, and not less than 0, so that the sync points a
    device sends do not single it out. The posts up to L that come back
-   are duplicates (step 3). After each page, the sync point moves to
-   the last seq in it, and on over any stored posts that directly
+   are duplicates (step 3). After each page, the sync point moves
+   forward to the last seq in it, and on over any stored posts that directly
    follow. If the response holds no post after L and says `more=0`,
    every post after L up to the head has expired (7.5), and the sync
    point moves to that head.
