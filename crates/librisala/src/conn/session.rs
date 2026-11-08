@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use risala_proto::auth::SecretKey;
-use risala_proto::command::{Command, Request};
+use risala_proto::command::{Command, GuestToken, Request};
 use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, MAX_SERVER_LINE, check_line_len};
 use risala_proto::line::read_ref;
 use risala_proto::names::{Domain, Id, Identity, Name, Uid};
@@ -477,7 +477,7 @@ impl Session {
         let ok = self
             .request_ok(Command::Guest {
                 name: name.clone(),
-                token: token.cloned(),
+                token: token.cloned().map(GuestToken),
             })
             .await?;
         let new_token = ok.token().ok().flatten();

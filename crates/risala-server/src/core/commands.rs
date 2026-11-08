@@ -285,7 +285,7 @@ impl Inner {
         };
         match (command, uid) {
             (Command::Info { room: None }, _) => Ok(Some(self.info())),
-            (Command::Guest { name, token }, None) => self.guest(id, name, token),
+            (Command::Guest { name, token }, None) => self.guest(id, name, token.map(|t| t.0)),
             (
                 Command::Auth {
                     identity,

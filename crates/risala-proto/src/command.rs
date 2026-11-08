@@ -225,6 +225,39 @@ impl fmt::Display for Request {
 // ---------------------------------------------------------------------------
 // Command
 
+/// The token that resumes a guest session (4.2), as GUEST carries it: an
+/// [`Id`] that is a secret. Its `Debug` output leaves the token out, so
+/// that a command written to a log does not give the session away.
+/// `Display` writes it, for the line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GuestToken(pub Id);
+
+impl fmt::Debug for GuestToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("GuestToken(..)")
+    }
+}
+
+impl fmt::Display for GuestToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for GuestToken {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<GuestToken, ParseError> {
+        s.parse().map(GuestToken)
+    }
+}
+
+impl From<Id> for GuestToken {
+    fn from(id: Id) -> GuestToken {
+        GuestToken(id)
+    }
+}
+
 /// A client command: one variant per row of the first table in Section 13.
 ///
 /// Optional text is an empty `String` when absent. Text is escaped, as on
@@ -245,7 +278,7 @@ pub enum Command {
         name: Name,
         /// `token=`: the token from the `OK` of the session's last GUEST,
         /// to resume it (4.2). A secret: never log it.
-        token: Option<Id>,
+        token: Option<GuestToken>,
     },
     /// `AUTH <uid> <signature>` (4.5): sign in as an identity.
     ///
@@ -2243,6 +2276,10 @@ mod tests {
         is_syntax("GUEST token=abc");
         is_syntax("GUEST ~sam");
         is_too_long(&format!("GUEST {}", "a".repeat(33)));
+        // The token is a secret: Debug leaves it out.
+        let debug = format!("{c:?} {:?}", Request::new(c.clone()));
+        assert!(!debug.contains("ab-9_x"), "{debug}");
+        assert!(debug.contains("GuestToken(..)"), "{debug}");
     }
 
     #[test]

@@ -1236,9 +1236,35 @@ impl AsRef<str> for Host {
 /// assert_eq!(ok.more()?, None);
 /// # Ok::<(), risala_proto::error::ParseError>(())
 /// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Debug` leaves out the value of `token=`, a guest session's secret
+/// (4.2), so that a response written to a log does not give it away.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct OkResponse {
     values: Vec<(String, String)>,
+}
+
+/// The keys whose values [`OkResponse`]'s `Debug` leaves out.
+const SECRET_KEYS: [&str; 1] = ["token"];
+
+impl fmt::Debug for OkResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let values: Vec<(&str, &str)> = self
+            .values
+            .iter()
+            .map(|(k, v)| {
+                let shown = if SECRET_KEYS.contains(&k.as_str()) {
+                    ".."
+                } else {
+                    v.as_str()
+                };
+                (k.as_str(), shown)
+            })
+            .collect();
+        f.debug_struct("OkResponse")
+            .field("values", &values)
+            .finish()
+    }
 }
 
 impl OkResponse {
@@ -1259,6 +1285,7 @@ impl OkResponse {
         let value = value.to_string();
         match self.try_with(key, &value) {
             Ok(ok) => ok,
+            Err(e) if SECRET_KEYS.contains(&key) => panic!("bad OK value {key}=..: {e}"),
             Err(e) => panic!("bad OK value {key}={value}: {e}"),
         }
     }
@@ -2778,6 +2805,15 @@ mod tests {
         canonical("OK  SEQ=1 ", "OK seq=1");
         syntax("OK yes");
         syntax("OK seq=1 seq=2");
+    }
+
+    #[test]
+    fn ok_debug_leaves_out_the_guest_token() {
+        let m = round_trip("OK uid=~sam token=s3cr3t");
+        let debug = format!("{m:?}");
+        assert!(!debug.contains("s3cr3t"), "{debug}");
+        assert!(debug.contains("\"uid\", \"~sam\""), "{debug}");
+        assert!(debug.contains("\"token\", \"..\""), "{debug}");
     }
 
     #[test]
