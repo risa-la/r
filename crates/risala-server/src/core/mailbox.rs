@@ -35,7 +35,7 @@ use risala_proto::error::ErrorCode;
 use risala_proto::mls::{
     GroupId, GroupInfo, MlsMessage, OrBlob, PostToken, Pseudonym, SendToken, TokenHash,
 };
-use risala_proto::names::{BlobRef, BoxName, Seq, Uid};
+use risala_proto::names::{BoxName, Seq, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, Post, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{DEFAULT_FETCH_LIMIT, MIN_FETCH_LIMIT_CAP, PushTag, Role};
@@ -44,7 +44,7 @@ use tokio::sync::OwnedMutexGuard;
 use super::command::{Cx, Reply, err, misrouted};
 use super::rate::{WindowLimit, network};
 use super::state::{ConnEntry, Who};
-use super::{Inner, misc};
+use super::{Inner, keys, misc};
 use crate::config::Config;
 use crate::handler::{ConnId, OutLine};
 use crate::store::{
@@ -507,18 +507,9 @@ fn aad_pseudonym(aad: &risala_mls::RisalaAad) -> Option<[u8; 16]> {
     aad.pseudonym.map(|p| p.0)
 }
 
-/// The bytes of a message or GroupInfo that a line names as a blob
-/// (12.12), if the server holds it.
-///
-/// The blob store belongs to the keys area (docs/plans/M5b.md, SV4), which
-/// does not yet say how to read a blob's bytes: until it does, no blob is
-/// found, and a post or CREATE that names one gets `ERR not-found`.
-pub(super) async fn blob_bytes(_inner: &Inner, _blob: &BlobRef) -> Option<Vec<u8>> {
-    None
-}
-
-/// The bytes of a message or GroupInfo in a line: decoded, or read from
-/// its blob (`ERR not-found`).
+/// The bytes of a message, GroupInfo or tree in a line: decoded, or read
+/// from its blob in the keys area's store (12.12): `ERR not-found` if the
+/// server holds no such blob.
 pub(super) async fn line_bytes<T>(
     inner: &Inner,
     value: &OrBlob<T>,
@@ -526,9 +517,12 @@ pub(super) async fn line_bytes<T>(
 ) -> Result<Vec<u8>, ErrResponse> {
     match value {
         OrBlob::Inline(inline) => Ok(decode(inline)),
-        OrBlob::Blob(blob) => blob_bytes(inner, blob)
+        OrBlob::Blob(blob) => keys::blob_bytes(inner, blob, inner.config.files.max_blob)
             .await
-            .ok_or_else(|| err(ErrorCode::NotFound).with_message("no such blob")),
+            .map_err(|why| match why {
+                keys::NoBlob::NotFound => err(ErrorCode::NotFound).with_message("no such blob"),
+                why => ErrResponse::from(why),
+            }),
     }
 }
 

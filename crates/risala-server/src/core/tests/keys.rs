@@ -943,6 +943,24 @@ async fn blobs_are_stored_once_and_checked() {
     assert_eq!(anon.lines(), ["OK exists=yes"]);
 }
 
+/// A post that names a blob is read from the blob store (12.12): one the
+/// server holds reaches POST's checks, here of its framing.
+#[tokio::test]
+async fn posts_read_their_blobs() {
+    let mut h = keys();
+    h.mailbox();
+    let mut anon = h.anon().await;
+    let missing = BlobRef::of(b"no post");
+    h.send(&anon, &format!("POST {BOX} {} {missing}", token()))
+        .await;
+    assert_eq!(anon.lines(), ["ERR not-found no such blob"]);
+    let hash = h.store_blob(&mut anon, b"not an MLS message").await;
+    h.send(&anon, &format!("POST {BOX} {} {hash}", token()))
+        .await;
+    let lines = anon.lines();
+    assert!(lines[0].starts_with("ERR invalid"), "{lines:?}");
+}
+
 #[tokio::test]
 async fn put_urls_last_ten_minutes() {
     let mut h = keys();
