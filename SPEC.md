@@ -2818,6 +2818,10 @@ not check the lifetimes of leaves already in the tree (12.4).
   the conversation's events show that its identity left, was kicked or
   banned, or declined an invitation
 
+If the device needs the leaf's key file to see the reason, and the key
+file cannot be fetched right now (4.4), it neither applies nor rejects
+the commit: it waits, and tries the key file again from time to time.
+
 It also applies the key check to every leaf that the commit adds or
 changes. A device that rejects a commit can no longer follow the group.
 It SHOULD warn the user, and stop sending in that conversation.
@@ -3177,7 +3181,14 @@ History keys reach a device in three ways:
    a device of their own (Section 14), so a device MUST NOT send history
    keys to a new device until the user has confirmed on it that the new
    device is theirs, for example by comparing fingerprints (12.12). Once
-   one device has sent the keys, the others MAY skip it.
+   one device has sent the keys, the others MAY skip it. A device that
+   holds the recovery key (12.10) sends it to the confirmed device too,
+   as a RECOVERY line.
+
+   Any device of an identity that cannot see the identity's conversation
+   with itself, in SYNC or by GROUPINFO, creates it with INIT. If another
+   device got there first, the INIT gets `ERR stale`, and the device
+   joins that group instead (12.6).
 3. **From other members of a room.** When the `history` field of the
    room's conversation extension (12.2) is `shared`, the device that adds
    a new identity (12.6) also sends, in ENC messages in the room right
@@ -3223,7 +3234,8 @@ instead. Backups are optional for users. Servers MUST support them.
   with the recovery key, so that the recovery key never joins a group.
 - A client that creates a recovery key shows it to the user once, and
   sends it to the identity's other devices as a RECOVERY line, in base64
-  with padding, in the conversation with itself. Devices MUST ignore
+  with padding, in the conversation with itself. Devices that the user
+  confirms later get it the same way (12.9). Devices MUST ignore
   RECOVERY lines in any other conversation. A newer RECOVERY line
   replaces an older one.
 - Every device that holds the recovery key backs up each history key it

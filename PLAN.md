@@ -1091,6 +1091,16 @@ Open:
     - **SET of `send` or `history` in an encrypted room** gets
       `forbidden` without the owner role, and `encrypted` with it.
 
+46. **Found while building librisala's engine** (12.6, 12.9, 12.10),
+    decided with the user on 2026-11-08:
+    - **The conversation with yourself** is created by any device that
+      cannot see it. One that loses the race gets `stale` and joins.
+    - **A confirmed new device gets the recovery key** as well as the
+      history keys, so that it backs up what it gets later.
+    - **A removal that needs an unreachable key file** waits and retries.
+      It is neither applied nor rejected, since a failed fetch says
+      nothing about the keys (4.4).
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
