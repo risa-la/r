@@ -3,17 +3,15 @@
 //! Every connection to a cache file is keyed with [`key`] before anything
 //! else reads it. The key is a raw 256-bit key, so SQLCipher skips its
 //! passphrase KDF, and opening a connection stays cheap for a notification
-//! extension. A cache from before encryption is encrypted in place on open,
-//! by [`encrypt_plaintext`], so that an outbox with unsent messages is kept.
+//! extension. A cache in the clear is not read: it is
+//! [`StoreError::WrongKey`].
 
 use std::fmt;
-use std::io::{self, Read as _};
-use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension as _};
 use zeroize::Zeroizing;
 
-use super::{BUSY_TIMEOUT, StoreError, create_private};
+use super::StoreError;
 
 /// The 256-bit key a cache file is encrypted with.
 ///
@@ -88,113 +86,4 @@ pub(super) fn key(conn: &Connection, key: &DatabaseKey) -> Result<(), StoreError
         }
         Err(e) => Err(e.into()),
     }
-}
-
-/// The first 16 bytes of every SQLite file in the clear. An encrypted file
-/// starts with a random salt instead.
-const PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
-
-/// Whether the file at `path` is a database in the clear. A file that is
-/// missing or empty is a new cache.
-///
-/// A database in WAL mode always has its header in the main file, since
-/// the header records the mode, so the `-wal` file need not be read.
-fn is_plaintext(path: &Path) -> io::Result<bool> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let mut header = [0; 16];
-    match file.read_exact(&mut header) {
-        Ok(()) => Ok(header == *PLAINTEXT_HEADER),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// `path` with `suffix` added to its file name.
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// Encrypts the cache at `path` with `key` if it is in the clear, as caches
-/// made before encryption are. Does nothing otherwise.
-///
-/// The database is copied into a new encrypted file with
-/// `sqlcipher_export`, which then replaces it, so that a crash leaves
-/// either the old file or the new one. While it runs, a write transaction
-/// on the old file keeps other processes from writing to it, or encrypting
-/// it at the same time.
-///
-/// The old file's blocks are freed, not overwritten, so what it held may
-/// stay on the disk until they are reused.
-pub(super) fn encrypt_plaintext(path: &Path, key: &DatabaseKey) -> Result<(), StoreError> {
-    if !is_plaintext(path)? {
-        return Ok(());
-    }
-    let mut lock = Connection::open(path)?;
-    lock.busy_timeout(BUSY_TIMEOUT)?;
-    // Leaving WAL mode moves what the -wal file holds into the database and
-    // removes it, so that the encrypted file never meets the old -wal.
-    // SQLite refuses while another process has the file open.
-    let mode: String =
-        lock.pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))?;
-    if !mode.eq_ignore_ascii_case("delete") || with_suffix(path, "-wal").exists() {
-        return Err(StoreError::Corrupt(format!(
-            "could not take the cache out of WAL mode to encrypt it (journal mode {mode})"
-        )));
-    }
-    let guard = lock.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    // Another process may have encrypted it while this one waited.
-    if !is_plaintext(path)? {
-        return Ok(());
-    }
-    let version: u32 = guard.pragma_query_value(None, "user_version", |row| row.get(0))?;
-
-    // Left over from an attempt that was cut short, if any; only the
-    // holder of the lock above touches it.
-    let new = with_suffix(path, ".encrypting");
-    for stale in [new.clone(), with_suffix(&new, "-journal")] {
-        match std::fs::remove_file(&stale) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-    }
-    create_private(&new)?;
-
-    let export = (|| -> Result<(), StoreError> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        let attach = Zeroizing::new(format!(
-            "ATTACH DATABASE ?1 AS encrypted KEY {}",
-            // "x'<hex>'", the same literal PRAGMA key takes.
-            &key.pragma()["PRAGMA key = ".len()..]
-        ));
-        let new = new
-            .to_str()
-            .ok_or_else(|| StoreError::Corrupt("the cache's path is not valid UTF-8".to_owned()))?;
-        conn.execute(&attach, [new])?;
-        conn.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))?;
-        conn.pragma_update(Some("encrypted"), "user_version", version)?;
-        conn.execute_batch("DETACH DATABASE encrypted")?;
-        Ok(())
-    })();
-    if let Err(e) = export {
-        let _ = std::fs::remove_file(&new);
-        return Err(e);
-    }
-
-    std::fs::rename(&new, path)?;
-    #[cfg(unix)]
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    // Releases the lock only now, so that a process that waited for it
-    // finds the encrypted file.
-    drop(guard);
-    tracing::info!(path = %path.display(), "encrypted the cache");
-    Ok(())
 }
