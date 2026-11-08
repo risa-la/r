@@ -2,8 +2,9 @@
 //! NOTIFY push body (9.3).
 //!
 //! Every line in the second table of Section 13 parses into a
-//! [`ServerMessage`]: an envelope with the `ref` (3.6) and `report` (5.8)
-//! tags, around a [`ServerLine`]. Events and snapshots (5.2) share one
+//! [`ServerMessage`]: an envelope with the `ref` (3.6) tag, and the
+//! `report` and `id` tags of a report's lines (5.8), around a
+//! [`ServerLine`]. Events and snapshots (5.2) share one
 //! type, [`Event`], whose [`meta`](Event::meta) is `None` for a snapshot.
 //!
 //! ```
@@ -65,7 +66,11 @@
 //!   metadata a server left out; without `file` they are ignored.
 //! - **Reports (5.8).** REPORT and REPORTENC lines are one type,
 //!   [`Report`], whose `franking` is `Some` for REPORTENC. Nothing ties a
-//!   REPORTENC line to an ENC copy, since they are separate lines.
+//!   REPORTENC line to an ENC copy, since they are separate lines. The
+//!   copy is a MSG or ENC event, the only ones that can be reported. The
+//!   `id` tag with the conversation's id is optional on both lines, though
+//!   a server sends it, so that lines from servers that leave it out still
+//!   parse; on any other line but JOIN and DROP it is not read.
 //! - **Length limits** stated by the spec are applied as on commands, so a
 //!   correct server never trips them: a topic (ROOM, SET) or a report
 //!   reason of 512 bytes, a display name (MEMBER, USER, NAME) of 128, and
@@ -85,7 +90,8 @@
 //!   folded (3.5). Serialising writes the canonical form, so a parsed line
 //!   in canonical form serialises back byte for byte.
 //!
-//! Tags are written in this order: `ref`, `report`, then `seq`, `t`,
+//! Tags are written in this order: `ref`, `report`, `id` on a report's
+//! lines, then `seq`, `t`,
 //! `from`, the relation (`reply`, `edit` or `react`) or `frank`, `file`,
 //! `file-type`, `file-size` and `deleted`, then `id` on JOIN and DROP, or
 //! `retry` on ERR. This reproduces every example
@@ -128,15 +134,23 @@ const fn bad(what: &'static str) -> ParseError {
 ///   lines and on [`ServerLine::ReportCopy`], the reported event sent with
 ///   them, and both need it. On any other line it is kept but means
 ///   nothing.
+/// - `report_conv` is the `id` tag of those two lines: the id of the
+///   conversation the report is about (5.1, 5.8), so that a report from a
+///   room that was dropped and made again (10.4) is not taken for one
+///   about the new room. It is read only on those two lines, and only
+///   written on them.
 ///
-/// For [`ServerLine::Unknown`], these two tags are taken out of the line
-/// and kept here, so that a client can still match a `ref` (3.6).
+/// For [`ServerLine::Unknown`], `ref` and `report` are taken out of the
+/// line and kept here, so that a client can still match a `ref` (3.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerMessage {
     /// The `ref` tag (3.6).
     pub ref_: Option<Ref>,
     /// The `report` tag: the id of the report the line belongs to (5.8).
     pub report: Option<Id>,
+    /// The `id` tag of a report's lines: the id of the conversation the
+    /// report is about (5.8).
+    pub report_conv: Option<Id>,
     /// The line itself.
     pub line: ServerLine,
 }
@@ -147,6 +161,7 @@ impl ServerMessage {
         ServerMessage {
             ref_: None,
             report: None,
+            report_conv: None,
             line: line.into(),
         }
     }
@@ -164,11 +179,13 @@ impl ServerMessage {
         self
     }
 
-    /// The REPORT or REPORTENC line of report `id` (5.8).
+    /// The REPORT or REPORTENC line of report `id` (5.8). Set the
+    /// conversation's id with [`with_report_conv`](Self::with_report_conv).
     pub fn report_line(id: Id, report: Report) -> ServerMessage {
         ServerMessage {
             ref_: None,
             report: Some(id),
+            report_conv: None,
             line: ServerLine::Report(report),
         }
     }
@@ -180,8 +197,16 @@ impl ServerMessage {
         ServerMessage {
             ref_: None,
             report: Some(id),
+            report_conv: None,
             line: ServerLine::ReportCopy(event),
         }
+    }
+
+    /// Sets the `id` tag of a report's line (5.8): the id of the
+    /// conversation the report is about.
+    pub fn with_report_conv(mut self, id: Id) -> ServerMessage {
+        self.report_conv = Some(id);
+        self
     }
 
     /// Parses a line from the server (Section 13).
@@ -224,7 +249,16 @@ impl ServerMessage {
                 ServerLine::Unknown(rest)
             }),
         };
-        Ok(ServerMessage { ref_, report, line })
+        let report_conv = match line {
+            ServerLine::Report(_) | ServerLine::ReportCopy(_) => parse_tag::<Id>(tags, "id")?,
+            _ => None,
+        };
+        Ok(ServerMessage {
+            ref_,
+            report,
+            report_conv,
+            line,
+        })
     }
 
     /// Serialises the message, in canonical form.
@@ -265,6 +299,9 @@ impl ServerMessage {
     /// Writes the line without checking that it parses back.
     fn write_line(&self) -> Result<Line, ParseError> {
         if let ServerLine::Unknown(line) = &self.line {
+            if self.report_conv.is_some() {
+                return Err(bad("only a report's lines carry its conversation's id"));
+            }
             let mut tags = Tags::new();
             if let Some(ref_) = &self.ref_ {
                 tags.insert("ref", Some(ref_.as_str()))?;
@@ -289,6 +326,14 @@ impl ServerMessage {
         match &self.line {
             ServerLine::Report(_) | ServerLine::ReportCopy(_) if self.report.is_none() => {
                 return Err(bad("a report line needs the report tag"));
+            }
+            ServerLine::Report(_) | ServerLine::ReportCopy(_) => {
+                if let Some(id) = &self.report_conv {
+                    b.tag("id", id);
+                }
+            }
+            _ if self.report_conv.is_some() => {
+                return Err(bad("only a report's lines carry its conversation's id"));
             }
             _ => {}
         }
@@ -1739,8 +1784,9 @@ impl Event {
         self.meta.is_none()
     }
 
-    /// Checks what a reviewer's copy needs (5.8): `seq`, `t` and `from`,
-    /// and for ENC, an empty payload and no `deleted` flag.
+    /// Checks what a reviewer's copy needs (5.8): a MSG or ENC event with
+    /// `seq`, `t` and `from`, and for ENC, an empty payload and no
+    /// `deleted` flag.
     fn check_copy(&self) -> Result<(), ParseError> {
         if self.meta.is_none() {
             return Err(bad("a reported event has seq, t and from"));
@@ -1749,7 +1795,9 @@ impl Event {
             EventBody::Enc(enc) if enc.deleted || enc.payload.is_some() => Err(bad(
                 "a reported ENC event has an empty payload and is not deleted",
             )),
-            _ => Ok(()),
+            EventBody::Msg(_) | EventBody::Enc(_) => Ok(()),
+            // Only messages can be reported (5.8).
+            _ => Err(bad("a reported event is a MSG or ENC event")),
         }
     }
 
@@ -3316,9 +3364,10 @@ mod tests {
     #[test]
     fn reports() {
         let m = round_trip(
-            "@report=p4x8n2;t=2026-11-06T15:44:10.230Z;from=bob@example.net REPORT #general 8816 spam",
+            "@report=p4x8n2;id=k3f9q2;t=2026-11-06T15:44:10.230Z;from=bob@example.net REPORT #general 8816 spam",
         );
         assert_eq!(m.report.as_ref().map(Id::as_str), Some("p4x8n2"));
+        assert_eq!(m.report_conv.as_ref().map(Id::as_str), Some("k3f9q2"));
         assert!(!m.is_report_copy());
         let ServerLine::Report(r) = &m.line else {
             panic!()
@@ -3335,13 +3384,30 @@ mod tests {
         assert_eq!(r.conv, Conv::Uid(uid("~spammer")));
 
         let m = round_trip(
-            "@report=p4x8n2;seq=8816;t=2026-11-06T15:43:58.019Z;from=~spammer MSG #general cheap pills at …",
+            "@report=p4x8n2;id=k3f9q2;seq=8816;t=2026-11-06T15:43:58.019Z;from=~spammer MSG #general cheap pills at …",
         );
         assert!(m.is_report_copy());
+        assert_eq!(m.report_conv.as_ref().map(Id::as_str), Some("k3f9q2"));
         let ServerLine::ReportCopy(e) = &m.line else {
             panic!()
         };
         assert_eq!(e.meta.as_ref().unwrap().seq, seq(8816));
+
+        // The conversation's id may be missing, and is written after
+        // `report` whatever order it came in.
+        let m = round_trip(&format!("@report=p4x8n2;seq=3;t={T};from=~x MSG #a hi"));
+        assert_eq!(m.report_conv, None);
+        canonical(
+            &format!("@t={T};id=k3f9q2;report=p4x8n2 REPORT #a 3"),
+            &format!("@report=p4x8n2;id=k3f9q2;t={T} REPORT #a 3"),
+        );
+        syntax(&format!("@report=p4;id=Bad!;t={T} REPORT #a 3"));
+        // Only messages are reported, so a copy is a MSG or ENC event.
+        syntax(&format!("@report=p4;id=k3f9q2;seq=1;t={T};from=~x JOIN #a"));
+        syntax(&format!("@report=p4;seq=2;t={T};from=~x PART #a"));
+        // On other lines, `id` is not the report's.
+        let m = canonical("@id=k3f9q2 OK id=k3f9q2", "OK id=k3f9q2");
+        assert_eq!(m.report_conv, None);
 
         // REPORTENC carries the franking key and content of an ENC event.
         let key = FrankKey::from_bytes([4; 32]);
@@ -3406,7 +3472,7 @@ mod tests {
             format!("@report=r1;t={T} REPORT #a 2")
         );
         assert!(
-            ServerMessage::new(ServerLine::Report(report))
+            ServerMessage::new(ServerLine::Report(report.clone()))
                 .try_to_line()
                 .is_err()
         );
@@ -3418,16 +3484,39 @@ mod tests {
             },
             Message::new(room("#a"), "bad").into(),
         );
-        let m = ServerMessage::report_copy(id, ev.clone());
+        let m = ServerMessage::report_copy(id.clone(), ev.clone());
         assert_eq!(
             m.to_line().to_string(),
             format!("@report=r1;seq=2;t={T};from=~x MSG #a bad")
         );
         assert!(
-            ServerMessage::new(ServerLine::ReportCopy(ev))
+            ServerMessage::new(ServerLine::ReportCopy(ev.clone()))
                 .try_to_line()
                 .is_err()
         );
+        let conv: Id = "k3f9q2".parse().unwrap();
+        let m = ServerMessage::report_line(id.clone(), report).with_report_conv(conv.clone());
+        assert_eq!(
+            m.to_line().to_string(),
+            format!("@report=r1;id=k3f9q2;t={T} REPORT #a 2")
+        );
+        let m = ServerMessage::report_copy(id, ev).with_report_conv(conv.clone());
+        assert_eq!(
+            m.to_line().to_string(),
+            format!("@report=r1;id=k3f9q2;seq=2;t={T};from=~x MSG #a bad")
+        );
+        // Only on a report's lines.
+        for line in [
+            ServerLine::Ok(OkResponse::new()),
+            ServerLine::Unknown(Line::parse("FUTURE x").unwrap()),
+        ] {
+            assert!(
+                ServerMessage::new(line)
+                    .with_report_conv(conv.clone())
+                    .try_to_line()
+                    .is_err()
+            );
+        }
     }
 
     #[test]
