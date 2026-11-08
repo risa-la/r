@@ -22,17 +22,50 @@ use crate::primitives::HASH_LEN;
 /// The length of a pseudonym (7.3).
 pub const PSEUDONYM_LEN: usize = 16;
 
-/// A leaf's pseudonym (7.3): 16 random bytes its device picks when it
-/// creates the leaf, and, in an epochal group, each period.
+/// The MLS exporter label of pseudonyms outside public rooms (7.3, 15).
+pub const PSEUDONYM_LABEL: &str = "risala/1 pseudonym";
+
+/// A leaf's pseudonym (7.3). Outside public rooms it is derived in each
+/// epoch, from the epoch's exporter and the leaf's index
+/// ([`crate::group::leaf_pseudonym`]); in a public room, it is 16 random
+/// bytes that the device picks for each period ([`Pseudonym::generate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pseudonym(pub [u8; PSEUDONYM_LEN]);
 
 impl Pseudonym {
-    /// A new random pseudonym, for a new leaf.
+    /// A new random pseudonym, for a public room's leaf in a new period.
     pub fn generate() -> Result<Pseudonym, getrandom::Error> {
         let mut bytes = [0; PSEUDONYM_LEN];
         getrandom::fill(&mut bytes)?;
         Ok(Pseudonym(bytes))
+    }
+}
+
+/// The exporter context of a leaf's pseudonym (7.3): its leaf index as a
+/// `uint32`.
+pub fn pseudonym_context(leaf_index: u32) -> [u8; 4] {
+    leaf_index.to_be_bytes()
+}
+
+/// The pseudonyms of every leaf of one epoch, outside a public room (7.3),
+/// which a device keeps after the epoch ends, for as long as it keeps the
+/// epoch's secrets, to check late messages of the epoch (12.9): the
+/// exporter that derives them is gone once the epoch is over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpochPseudonyms {
+    /// The epoch.
+    pub epoch: u64,
+    /// Each leaf's pseudonym, by leaf index.
+    pub leaves: Vec<(u32, Pseudonym)>,
+}
+
+impl EpochPseudonyms {
+    /// The pseudonym of the leaf at `leaf_index` in this epoch.
+    pub fn of(&self, leaf_index: u32) -> Option<Pseudonym> {
+        self.leaves
+            .iter()
+            .find(|(index, _)| *index == leaf_index)
+            .map(|(_, pseudonym)| *pseudonym)
     }
 }
 

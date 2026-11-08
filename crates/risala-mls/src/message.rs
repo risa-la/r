@@ -30,15 +30,18 @@
 //! sender that has left, are errors: the device MUST NOT show the content.
 //! The rest come back in a [`Decrypted`], which says what the caller still
 //! has to check: whether the sender's leaf is confirmed (12.10, step 6,
-//! [`Decrypted::trust`]), and in an epochal group, a new pseudonym's ATTEST
+//! [`Decrypted::trust`]), and in a public room, a new pseudonym's ATTEST
 //! ([`PseudonymCheck::NeedsAttest`]).
 //!
-//! What a device remembers about a group's messages (pins, counters, seen
-//! ids, the times of the commits that ended past epochs) is the caller's,
-//! behind [`MessageHistory`]; [`MemoryHistory`] keeps it in memory. After
+//! What a device remembers about a group's messages (public rooms' pins,
+//! counters, seen ids, the times of the commits that ended past epochs,
+//! and past epochs' pseudonyms) is the caller's, behind
+//! [`MessageHistory`]; [`MemoryHistory`] keeps it in memory. After
 //! applying a commit, the caller calls [`MessageHistory::note_commit`] with
-//! the commit's `t` and [`removed_leaves`], and after applying any post,
-//! [`expire_past_epochs`].
+//! what [`group::apply_commit`] or [`group::merge_own_commit`] returned,
+//! the commit's `t` and its own clock; after applying any post,
+//! [`expire_past_epochs`]; and from time to time, whatever arrives,
+//! [`expire_past_epochs_by_clock`].
 //!
 //! **Franking makes messages key-committing.** ChaCha20-Poly1305 is not
 //! key-committing, so without the frank a sender could make one ciphertext
@@ -67,7 +70,8 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{ConfirmMode as LineConfirmMode, MAX_REPORT_CONTEXT};
 use zeroize::Zeroizing;
 
-use crate::aad::{Pseudonym, RisalaAad};
+use crate::aad::{EpochPseudonyms, Pseudonym, RisalaAad};
+use crate::checks::PERIOD_MS;
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::conversation::{ConfirmMode, ConversationKind, RisalaConversation, Role};
 use crate::framing::{ContentType, read_post};
@@ -95,6 +99,10 @@ pub const MAX_PAST_EPOCHS: u64 = 2;
 /// How long after the commit that ended a message's epoch its post may be,
 /// by `t`, for a device to decrypt it (12.9).
 pub const PAST_EPOCH_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// How long after it applied the commit that ended an epoch a device keeps
+/// the epoch's secrets, by its own clock, whatever posts arrive (12.9).
+pub const PAST_EPOCH_KEEP: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// How many generations a device keeps the keys of skipped messages
 /// behind the newest it has seen from a sender, and how far ahead of it it
@@ -332,9 +340,12 @@ impl SendCounter {
 }
 
 /// Encrypts `message` as an MLS application message of `group`'s current
-/// epoch (12.9, step 5), with a RisalaAAD of `pseudonym` and the message's
-/// frank. MLS signs it with the leaf key, and pads it with zero bytes to a
-/// multiple of 256 bytes (the group's padding, [`group::PADDING_SIZE`]).
+/// epoch (12.9, step 5), with a RisalaAAD of the leaf's pseudonym and the
+/// message's frank. The pseudonym is derived from the epoch outside public
+/// rooms, where `period` is `None`, and in a public room is `period`, the
+/// one the device picked for the period (7.3). MLS signs it with the leaf
+/// key, and pads it with zero bytes to a multiple of 256 bytes (the
+/// group's padding, [`group::PADDING_SIZE`]).
 ///
 /// The same message may be encrypted again, in a later epoch, when it
 /// must be posted again (7.6): its fields, and so its frank, stay the
@@ -342,9 +353,10 @@ impl SendCounter {
 pub fn encrypt<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
-    pseudonym: Pseudonym,
+    period: Option<Pseudonym>,
     message: &RisalaMessage,
 ) -> Result<Vec<u8>, GroupError<P::StorageError>> {
+    let pseudonym = group::sending_pseudonym(group, provider.crypto(), period)?;
     let aad = RisalaAad::application(pseudonym, message.frank());
     group::encrypt_application(provider, group, &aad, &message.encode())
 }
@@ -357,8 +369,12 @@ pub fn encrypt<P: OpenMlsProvider>(
 /// ([`MessageHistory::note_commit`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SenderLog {
-    /// The pinned pseudonym (7.3).
+    /// In a public room, the pinned pseudonym (7.3). Outside public rooms
+    /// pseudonyms are derived for each epoch, and never pinned.
     pub pseudonym: Option<Pseudonym>,
+    /// For a guest's leaf in a public room, the period (12.10) its
+    /// pseudonym was pinned in, from its first message of that period.
+    pub pin_period: Option<u64>,
     /// The highest counter seen from the leaf, and its message's id.
     pub last: Option<(u64, MessageId)>,
     /// The counters not yet seen below `last`, as inclusive ranges in
@@ -388,15 +404,30 @@ pub trait MessageHistory {
     fn epoch_end(&self, epoch: u64) -> Option<Timestamp>;
     /// Remembers the `t` of the commit that ended `epoch`.
     fn set_epoch_end(&mut self, epoch: u64, t: Timestamp);
+    /// When, by the device's clock, it applied the commit that ended
+    /// `epoch`.
+    fn epoch_applied(&self, epoch: u64) -> Option<Timestamp>;
+    /// Remembers when, by the device's clock, it applied the commit that
+    /// ended `epoch`.
+    fn set_epoch_applied(&mut self, epoch: u64, now: Timestamp);
+    /// The pseudonym of the leaf at `leaf` in the past epoch `epoch`,
+    /// outside public rooms (7.3), if the device kept that epoch's.
+    fn epoch_pseudonym(&self, epoch: u64, leaf: LeafNodeIndex) -> Option<Pseudonym>;
+    /// Keeps the pseudonyms of an epoch that has ended, for as long as the
+    /// device keeps its secrets (12.9). Older ones may go.
+    fn set_epoch_pseudonyms(&mut self, pseudonyms: EpochPseudonyms);
 
-    /// Notes a commit the device applied, which ended `ended_epoch` and
-    /// whose post has `t`, and removed `removed` (from
-    /// [`removed_leaves`]). Their logs start again, so a new leaf at the
-    /// same index has its own pin and counters, and messages of the
-    /// removed leaves are ignored from now on, even of earlier epochs.
-    fn note_commit(&mut self, ended_epoch: u64, t: Timestamp, removed: &[LeafNodeIndex]) {
+    /// Notes a commit the device applied, at `now` by its own clock, whose
+    /// post has `t`, from what applying it returned. The logs of the leaves
+    /// it removed start again, so a new leaf at the same index has its own
+    /// pin and counters, and messages of the removed leaves are ignored
+    /// from now on, even of earlier epochs.
+    fn note_commit(&mut self, applied: &group::Applied, t: Timestamp, now: Timestamp) {
+        let ended_epoch = applied.ended_epoch;
         self.set_epoch_end(ended_epoch, t);
-        for &leaf in removed {
+        self.set_epoch_applied(ended_epoch, now);
+        self.set_epoch_pseudonyms(applied.pseudonyms.clone());
+        for &leaf in &applied.removed {
             self.set_sender(
                 leaf,
                 SenderLog {
@@ -407,9 +438,9 @@ pub trait MessageHistory {
         }
     }
 
-    /// Pins `pseudonym` for the leaf at `leaf`: in an epochal group, once
-    /// the leaf's ATTEST for the current period has been checked and
-    /// carries it (7.3, 12.10).
+    /// Pins `pseudonym` for the leaf at `leaf`: in a public room, once the
+    /// leaf's ATTEST for the current period has been checked and carries it
+    /// (7.3, 12.10).
     fn pin(&mut self, leaf: LeafNodeIndex, pseudonym: Pseudonym) {
         let mut log = self.sender(leaf);
         log.pseudonym = Some(pseudonym);
@@ -423,6 +454,8 @@ pub struct MemoryHistory {
     seen: BTreeSet<MessageId>,
     senders: BTreeMap<u32, SenderLog>,
     epoch_ends: BTreeMap<u64, Timestamp>,
+    epoch_applied: BTreeMap<u64, Timestamp>,
+    pseudonyms: BTreeMap<u64, EpochPseudonyms>,
 }
 
 impl MessageHistory for MemoryHistory {
@@ -452,6 +485,28 @@ impl MessageHistory for MemoryHistory {
         while self.epoch_ends.len() > 16 {
             self.epoch_ends.pop_first();
         }
+    }
+
+    fn epoch_applied(&self, epoch: u64) -> Option<Timestamp> {
+        self.epoch_applied.get(&epoch).copied()
+    }
+
+    fn set_epoch_applied(&mut self, epoch: u64, now: Timestamp) {
+        self.epoch_applied.insert(epoch, now);
+        while self.epoch_applied.len() > 16 {
+            self.epoch_applied.pop_first();
+        }
+    }
+
+    fn epoch_pseudonym(&self, epoch: u64, leaf: LeafNodeIndex) -> Option<Pseudonym> {
+        self.pseudonyms.get(&epoch)?.of(leaf.u32())
+    }
+
+    fn set_epoch_pseudonyms(&mut self, pseudonyms: EpochPseudonyms) {
+        // Messages of at most MAX_PAST_EPOCHS past epochs are read (12.9).
+        let oldest = pseudonyms.epoch.saturating_sub(MAX_PAST_EPOCHS - 1);
+        self.pseudonyms.insert(pseudonyms.epoch, pseudonyms);
+        self.pseudonyms.retain(|epoch, _| *epoch >= oldest);
     }
 }
 
@@ -576,6 +631,16 @@ pub fn expire_past_epochs<P: OpenMlsProvider>(
         }
         keep = back;
     }
+    keep_past_epochs(provider, group, keep)
+}
+
+/// Keeps the secrets of the newest `keep` past epochs of `group`, with their
+/// skipped messages' keys, and deletes the rest.
+fn keep_past_epochs<P: OpenMlsProvider>(
+    provider: &P,
+    group: &mut MlsGroup,
+    keep: u64,
+) -> Result<(), GroupError<P::StorageError>> {
     let keep = usize::try_from(keep).expect("at most 2");
     // A cut-off before any secret was stored deletes nothing by time; the
     // count does the work.
@@ -585,6 +650,37 @@ pub fn expire_past_epochs<P: OpenMlsProvider>(
             PastEpochDeletion::before_timestamp(SystemTime::UNIX_EPOCH).max_past_epochs(keep),
         )
         .map_err(|e| GroupError::Mls(e.to_string()))
+}
+
+/// Deletes the secrets of every past epoch whose ending commit the device
+/// applied more than 2 hours before `now`, by its own clock, with the keys
+/// kept for its skipped messages (12.9). Call it from time to time,
+/// whatever posts arrive, and before [`receive`]: otherwise a group that
+/// goes quiet, or a server that holds back later posts, would keep them on
+/// the device. A past epoch whose ending the device has no time for goes
+/// too. This depends on when the device fetched, so it changes only what
+/// devices show, never which commit is valid.
+pub fn expire_past_epochs_by_clock<P: OpenMlsProvider>(
+    provider: &P,
+    group: &mut MlsGroup,
+    history: &impl MessageHistory,
+    now: Timestamp,
+) -> Result<(), GroupError<P::StorageError>> {
+    let current = group.epoch().as_u64();
+    let mut keep = 0;
+    for back in 1..=MAX_PAST_EPOCHS {
+        let Some(epoch) = current.checked_sub(back) else {
+            break;
+        };
+        let fresh = history
+            .epoch_applied(epoch)
+            .is_some_and(|applied| now.saturating_duration_since(applied) <= PAST_EPOCH_KEEP);
+        if !fresh {
+            break;
+        }
+        keep = back;
+    }
+    keep_past_epochs(provider, group, keep)
 }
 
 // ---------------------------------------------------------------------------
@@ -603,38 +699,44 @@ pub struct PostInfo {
 /// The pseudonym check (7.3, 12.9 step 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudonymCheck {
-    /// It is the leaf's pinned pseudonym.
+    /// Outside public rooms: it is the one derived for the leaf from the
+    /// message's epoch.
+    Derived,
+    /// In a public room: it is the leaf's pinned pseudonym.
     Pinned,
-    /// The leaf had none pinned, and this one is now (pairwise groups).
+    /// In a public room, a guest's leaf had none pinned for the period, and
+    /// this one is now, from its first message of the period.
     NewlyPinned,
-    /// In an epochal group, it is not the pseudonym pinned for the leaf
-    /// (or none is): it is pinned only by the leaf's ATTEST for the
-    /// current period (7.3, 12.10). The caller shows nothing of the
-    /// message unless its content has that ATTEST, valid and carrying
-    /// this pseudonym, and then pins it with [`MessageHistory::pin`].
+    /// In a public room, an identity's leaf: it is not the pseudonym pinned
+    /// for the leaf (or none is), and is pinned only by the leaf's ATTEST
+    /// for the current period (7.3, 12.10). The caller shows nothing of the
+    /// message unless its content has that ATTEST, valid and carrying this
+    /// pseudonym, and then pins it with [`MessageHistory::pin`].
     NeedsAttest(Pseudonym),
 }
 
-/// Checks `pseudonym`, from a PrivateMessage of the leaf whose log is
-/// `log`, against its pin (7.3, 12.9 step 1), in a group whose `confirm`
-/// is `confirm`. `None` if the device ignores the message: in a pairwise
-/// group, another pseudonym than the pinned one.
+/// Checks `pseudonym`, from a PrivateMessage of a public room's leaf whose
+/// log is `log`, posted in `period` (12.10), against its pin (7.3, 12.9
+/// step 1). `guest` says whether the leaf is a guest's, which never
+/// attests, and so is pinned by its first message of each period. `None`
+/// if the device ignores the message: a guest's, under another pseudonym
+/// than the one pinned for the period.
 ///
-/// [`receive`] does this for application messages. The pin is the
-/// pseudonym of the first PrivateMessage from the leaf, of any kind, so
-/// callers check PrivateMessage commits and proposals from a member leaf
-/// with it too, and pin a [`PseudonymCheck::NewlyPinned`] one with
-/// [`MessageHistory::pin`].
+/// Outside public rooms pseudonyms are derived for each epoch, and checked
+/// as [`receive`] does, never pinned.
 pub fn check_pseudonym(
-    confirm: ConfirmMode,
     log: &SenderLog,
     pseudonym: Pseudonym,
+    guest: bool,
+    period: u64,
 ) -> Option<PseudonymCheck> {
-    match (confirm, log.pseudonym) {
-        (_, Some(pinned)) if pinned == pseudonym => Some(PseudonymCheck::Pinned),
-        (ConfirmMode::Pairwise, Some(_)) => None,
-        (ConfirmMode::Pairwise, None) => Some(PseudonymCheck::NewlyPinned),
-        (ConfirmMode::Epochal, _) => Some(PseudonymCheck::NeedsAttest(pseudonym)),
+    match log.pseudonym {
+        Some(pinned) if pinned == pseudonym && (!guest || log.pin_period == Some(period)) => {
+            Some(PseudonymCheck::Pinned)
+        }
+        _ if !guest => Some(PseudonymCheck::NeedsAttest(pseudonym)),
+        Some(_) if log.pin_period == Some(period) => None,
+        _ => Some(PseudonymCheck::NewlyPinned),
     }
 }
 
@@ -775,7 +877,8 @@ pub enum ReceiveError<E> {
     /// Not a RisalaMessage.
     #[error(transparent)]
     Malformed(MessageError),
-    /// Step 1: not the pseudonym pinned for the leaf.
+    /// Step 1: not the leaf's pseudonym for the message's epoch, or in a
+    /// public room, not the one pinned for it.
     #[error("not the leaf's pseudonym")]
     Pseudonym,
     /// Step 2: the frank does not match the content.
@@ -836,9 +939,10 @@ pub fn receive<P: OpenMlsProvider>(
     if !past_epoch_readable(epoch, current, info.t, history.epoch_end(epoch)) {
         return Err(ReceiveError::TooOld);
     }
-    let confirm = group::conversation(group)
+    let public = group::conversation(group)
         .ok_or(ReceiveError::Process(ProcessError::Group))?
-        .confirm;
+        .kind
+        == ConversationKind::PublicRoom;
 
     // MLS decrypts it, checks its signature, and deletes its key.
     let (sender, aad, content) = match group::process_message(provider, group, post) {
@@ -864,9 +968,29 @@ pub fn receive<P: OpenMlsProvider>(
     let message = RisalaMessage::decode(&content).map_err(ReceiveError::Malformed)?;
 
     // Step 1. An application message is a PrivateMessage, whose RisalaAAD
-    // always has a pseudonym (12.9).
+    // always has a pseudonym (12.9). Outside public rooms it is derived
+    // from the message's epoch (7.3): the group's current one, or one the
+    // device kept from an epoch that has ended.
     let aad_pseudonym = aad.pseudonym.ok_or(ReceiveError::Pseudonym)?;
-    let pseudonym = check_pseudonym(confirm, &log, aad_pseudonym).ok_or(ReceiveError::Pseudonym)?;
+    let period = info.t.unix_millis() / PERIOD_MS;
+    let pseudonym = if public {
+        check_pseudonym(&log, aad_pseudonym, identity.is_guest(), period)
+            .ok_or(ReceiveError::Pseudonym)?
+    } else {
+        let expected = if epoch == current {
+            Some(group::leaf_pseudonym::<P::StorageError>(
+                group,
+                provider.crypto(),
+                sender,
+            )?)
+        } else {
+            history.epoch_pseudonym(epoch, sender)
+        };
+        if expected != Some(aad_pseudonym) {
+            return Err(ReceiveError::Pseudonym);
+        }
+        PseudonymCheck::Derived
+    };
     // Step 2. Never skipped: it is what makes the message key-committing.
     let frank = aad.frank.ok_or(ReceiveError::Frank)?;
     if !message
@@ -899,6 +1023,7 @@ pub fn receive<P: OpenMlsProvider>(
 
     if pseudonym == PseudonymCheck::NewlyPinned {
         log.pseudonym = Some(aad_pseudonym);
+        log.pin_period = Some(period);
     }
     history.set_sender(sender, log);
     history.add_seen(message.message_id);

@@ -291,7 +291,7 @@ pub(crate) fn make_join_key_package_with<P: OpenMlsProvider>(
     })
 }
 
-fn build_key_package<P: OpenMlsProvider>(
+pub(crate) fn build_key_package<P: OpenMlsProvider>(
     provider: &P,
     leaf_key: &LeafKey,
     credential: openmls::prelude::CredentialWithKey,

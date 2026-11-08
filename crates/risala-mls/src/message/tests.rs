@@ -6,11 +6,12 @@ use std::time::{Duration, SystemTime};
 
 use openmls::group::MlsGroup;
 use openmls_memory_storage::MemoryStorage;
+use openmls_traits::OpenMlsProvider as _;
 use risala_proto::content::ContentLine;
 
 use super::*;
 use crate::Provider;
-use crate::checks::{CommitPost, History as MlsHistory, JoinExpectation, Verdict};
+use crate::checks::{EpochState, JoinExpectation};
 use crate::group::{
     Changes, apply_commit, commit, create_group, join_by_welcome, merge_own_commit, self_remove,
 };
@@ -32,15 +33,6 @@ fn t0() -> Timestamp {
 
 fn at(minutes: u64) -> Timestamp {
     t0().checked_add(Duration::from_secs(minutes * 60)).unwrap()
-}
-
-/// The post of a commit, for the group's [`MlsHistory`], which these tests
-/// do not keep.
-fn post(out: &crate::group::CommitOutput) -> CommitPost {
-    CommitPost {
-        t: now_ms(),
-        next: Some(out.next_token_hash),
-    }
 }
 
 fn now_ms() -> u64 {
@@ -65,13 +57,12 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// One device: its storage, its leaf's pseudonym and counter, and what it
-/// remembers of the group's messages.
+/// One device: its storage, its leaf's counter, and what it remembers of
+/// the group's messages. Its pseudonyms are derived (7.3).
 struct Device {
     uid: Uid,
     key: SigningKey,
     provider: Provider<MemoryStorage>,
-    pseudonym: Pseudonym,
     counter: SendCounter,
     history: MemoryHistory,
 }
@@ -82,10 +73,14 @@ impl Device {
             uid: uid.parse().unwrap(),
             key: SigningKey::from_seed([seed; 32]),
             provider: Provider::new(MemoryStorage::default()).unwrap(),
-            pseudonym: Pseudonym::generate().unwrap(),
             counter: SendCounter::default(),
             history: MemoryHistory::default(),
         }
+    }
+
+    /// The device's pseudonym in the group's current epoch (7.3).
+    fn pseudonym(&self, group: &MlsGroup) -> Pseudonym {
+        group::own_pseudonym::<()>(group, self.provider.crypto()).unwrap()
     }
 
     fn identity(&self) -> RisalaIdentity {
@@ -112,7 +107,6 @@ impl Device {
             &self.identity(),
             &self.profile(),
             conversation,
-            now_ms(),
         )
         .unwrap()
         .0
@@ -124,7 +118,7 @@ impl Device {
             own_uid: self.uid.clone(),
             public_room: None,
         };
-        join_by_welcome(&self.provider, welcome, None, &expect, now_ms())
+        join_by_welcome(&self.provider, welcome, None, &expect)
             .unwrap()
             .group
     }
@@ -134,44 +128,30 @@ impl Device {
         let out = commit(
             &self.provider,
             group,
-            self.pseudonym,
             &self.profile(),
-            &MlsHistory::default(),
+            &EpochState::default(),
             changes,
         )
         .unwrap();
-        merge_own_commit(
-            &self.provider,
-            group,
-            &mut MlsHistory::default(),
-            &post(&out),
-        )
-        .unwrap();
+        merge_own_commit(&self.provider, group, &mut EpochState::default()).unwrap();
         out.message
     }
 
     /// Processes and applies another device's commit, noting it with `t`.
     fn apply(&mut self, group: &mut MlsGroup, message: &[u8], t: Timestamp) {
-        let ended = group.epoch().as_u64();
+        self.apply_now(group, message, t, t);
+    }
+
+    /// The same, applied at `now` by the device's clock.
+    fn apply_now(&mut self, group: &mut MlsGroup, message: &[u8], t: Timestamp, now: Timestamp) {
         let Incoming::Commit(received) =
             group::process_message(&self.provider, group, message).unwrap()
         else {
             panic!("not a commit");
         };
-        let removed = removed_leaves(&received.staged);
-        apply_commit(
-            &self.provider,
-            group,
-            *received,
-            &Verdict::default(),
-            &mut MlsHistory::default(),
-            &CommitPost {
-                t: now_ms(),
-                next: None,
-            },
-        )
-        .unwrap();
-        self.history.note_commit(ended, t, &removed);
+        let applied =
+            apply_commit(&self.provider, group, *received, &mut EpochState::default()).unwrap();
+        self.history.note_commit(&applied, t, now);
     }
 
     /// Writes a message at `t0`.
@@ -180,7 +160,7 @@ impl Device {
     }
 
     fn encrypt(&self, group: &mut MlsGroup, message: &RisalaMessage) -> Vec<u8> {
-        encrypt(&self.provider, group, self.pseudonym, message).unwrap()
+        encrypt(&self.provider, group, None, message).unwrap()
     }
 
     /// Writes and encrypts a message.
@@ -231,22 +211,15 @@ fn direct() -> Direct {
     let out = commit(
         &alice.provider,
         &mut a,
-        alice.pseudonym,
         &alice.profile(),
-        &MlsHistory::default(),
+        &EpochState::default(),
         Changes {
             add: vec![bob.key_package(), alice2.key_package()],
             ..Changes::default()
         },
     )
     .unwrap();
-    merge_own_commit(
-        &alice.provider,
-        &mut a,
-        &mut MlsHistory::default(),
-        &post(&out),
-    )
-    .unwrap();
+    merge_own_commit(&alice.provider, &mut a, &mut EpochState::default()).unwrap();
     let welcome = out.welcome.unwrap();
     let b = bob.join(&welcome);
     let a2 = alice2.join(&welcome);
@@ -286,7 +259,7 @@ fn round_trip_between_members() {
         assert_eq!(got.message.content.as_str(), "TEXT hello bob\n");
         assert_eq!(got.message.counter, 1);
         assert_eq!(got.message.previous, None);
-        assert_eq!(got.pseudonym, PseudonymCheck::NewlyPinned);
+        assert_eq!(got.pseudonym, PseudonymCheck::Derived);
         assert_eq!(got.order, Order::First { earlier: 0 });
         assert_eq!(got.clock, Clock::Agrees);
         // Step 6: confirmation is the caller's (12.10).
@@ -294,16 +267,14 @@ fn round_trip_between_members() {
         assert_eq!(got.trust(true), Trust::Verified);
         assert_eq!(got.place(&conversation), Place::new(Conversation::Direct));
     }
-    assert_eq!(
-        bob.history.sender(a.own_leaf_index()).pseudonym,
-        Some(alice.pseudonym)
-    );
+    // Outside public rooms nothing is pinned (7.3).
+    assert_eq!(bob.history.sender(a.own_leaf_index()).pseudonym, None);
 
     let (sent2, post) = alice.send(&mut a, "second");
     assert_eq!(sent2.counter, 2);
     assert_eq!(sent2.previous, Some(sent.message_id));
     let got = bob.receive(&mut b, &post).unwrap();
-    assert_eq!(got.pseudonym, PseudonymCheck::Pinned);
+    assert_eq!(got.pseudonym, PseudonymCheck::Derived);
     assert_eq!(got.order, Order::Next);
     assert_eq!(alice2.receive(&mut a2, &post).unwrap().order, Order::Next);
 
@@ -373,7 +344,7 @@ fn bad_frank() {
     let id = message.message_id;
 
     // A frank that is not of the content.
-    let wrong = RisalaAad::application(alice.pseudonym, [0; FRANK_LEN]);
+    let wrong = RisalaAad::application(alice.pseudonym(&a), [0; FRANK_LEN]);
     let post =
         group::encrypt_application(&alice.provider, &mut a, &wrong, &message.encode()).unwrap();
     assert!(matches!(
@@ -384,7 +355,7 @@ fn bad_frank() {
     // The frank of other content under the same key: a message that
     // would decrypt to one thing and report as another.
     let other = message.frank_key.frank(b"TEXT something else\n");
-    let swapped = RisalaAad::application(alice.pseudonym, other);
+    let swapped = RisalaAad::application(alice.pseudonym(&a), other);
     let post =
         group::encrypt_application(&alice.provider, &mut a, &swapped, &message.encode()).unwrap();
     assert!(matches!(
@@ -414,22 +385,114 @@ fn wrong_pseudonym() {
     let (_, post) = alice.send(&mut a, "first");
     bob.receive(&mut b, &post).unwrap();
 
-    // Another pseudonym from the same leaf is ignored (7.3).
+    // Another pseudonym from the same leaf is ignored (7.3), and so is
+    // another leaf's: only the one derived for the sender counts.
     let message = alice.write("dodging a mute");
-    let other = encrypt(
-        &alice.provider,
-        &mut a,
-        Pseudonym::generate().unwrap(),
-        &message,
-    )
-    .unwrap();
-    assert!(matches!(
-        bob.receive(&mut b, &other),
-        Err(ReceiveError::Pseudonym)
-    ));
-    // The same message under the pinned one counts.
+    let bob_pseudonym = bob.pseudonym(&b);
+    for pseudonym in [Pseudonym::generate().unwrap(), bob_pseudonym] {
+        let other = encrypt_raw(&alice, &mut a, pseudonym, &message);
+        assert!(matches!(
+            bob.receive(&mut b, &other),
+            Err(ReceiveError::Pseudonym)
+        ));
+    }
+    // A device cannot send under another one by mistake.
+    assert!(encrypt(&alice.provider, &mut a, Some(bob_pseudonym), &message).is_err());
+    let aad = RisalaAad::application(bob_pseudonym, message.frank());
+    assert!(group::encrypt_application(&alice.provider, &mut a, &aad, &message.encode()).is_err());
+    // The same message under the derived one counts.
     let post = alice.encrypt(&mut a, &message);
     assert_eq!(bob.receive(&mut b, &post).unwrap().order, Order::Next);
+}
+
+/// Encrypts `message` under any pseudonym, as a misbehaving device could.
+fn encrypt_raw(
+    device: &Device,
+    group: &mut MlsGroup,
+    pseudonym: Pseudonym,
+    message: &RisalaMessage,
+) -> Vec<u8> {
+    let key = group::own_leaf_key(&device.provider, group).unwrap();
+    group.set_aad(RisalaAad::application(pseudonym, message.frank()).encode());
+    let out = group
+        .create_message(&device.provider, &key, &message.encode())
+        .unwrap();
+    crate::wire::to_bytes(&out)
+}
+
+/// Pseudonyms change with every epoch outside public rooms (7.3), and a
+/// late message of a past epoch is checked against that epoch's (12.9).
+#[test]
+fn derived_pseudonyms() {
+    let Direct {
+        mut alice,
+        mut bob,
+        mut a,
+        mut b,
+        ..
+    } = direct();
+    let before = alice.pseudonym(&a);
+    // Both sides derive the same, from the leaf index as a uint32.
+    let index = a.own_leaf_index();
+    assert_eq!(
+        group::leaf_pseudonym::<()>(&b, bob.provider.crypto(), index).unwrap(),
+        before
+    );
+    let exported = a
+        .export_secret(
+            alice.provider.crypto(),
+            "risala/1 pseudonym",
+            &index.u32().to_be_bytes(),
+            16,
+        )
+        .unwrap();
+    assert_eq!(before.0.to_vec(), exported);
+    let (_, late) = alice.send(&mut a, "late");
+    let message = alice.write("someone else's");
+    let wrong = encrypt_raw(&alice, &mut a, bob.pseudonym(&b), &message);
+    let commit = alice.commit(&mut a, Changes::default());
+    bob.apply(&mut b, &commit, t0());
+    assert_ne!(alice.pseudonym(&a), before);
+    // The late message, of the past epoch, under that epoch's pseudonym.
+    let got = bob.receive_at(&mut b, &late, at(10), false).unwrap();
+    assert_eq!(got.pseudonym, PseudonymCheck::Derived);
+    // Under another leaf's pseudonym of that epoch: refused.
+    assert!(matches!(
+        bob.receive_at(&mut b, &wrong, at(10), false),
+        Err(ReceiveError::Pseudonym)
+    ));
+    // And the current epoch's.
+    let (_, current) = alice.send(&mut a, "current");
+    assert_eq!(
+        bob.receive(&mut b, &current).unwrap().pseudonym,
+        PseudonymCheck::Derived
+    );
+}
+
+/// Past epochs' secrets go 2 hours after the device applied the commit that
+/// ended them, by its own clock, whatever posts arrive (12.9).
+#[test]
+fn past_epochs_by_clock() {
+    let Direct {
+        mut alice,
+        mut bob,
+        mut a,
+        mut b,
+        ..
+    } = direct();
+    let (_, x1) = alice.send(&mut a, "x1");
+    let (_, x2) = alice.send(&mut a, "x2");
+    let commit = alice.commit(&mut a, Changes::default());
+    bob.apply_now(&mut b, &commit, t0(), t0());
+    // Within 2 hours by the clock: kept.
+    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(120)).unwrap();
+    bob.receive_at(&mut b, &x1, at(10), false).unwrap();
+    // After: gone, though the posts' `t` would allow the message.
+    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(121)).unwrap();
+    assert!(matches!(
+        bob.receive_at(&mut b, &x2, at(10), false),
+        Err(ReceiveError::Process(_))
+    ));
 }
 
 #[test]
@@ -754,7 +817,7 @@ fn self_removed_sender() {
         ..
     } = direct();
     let (_, after) = alice2.send(&mut a2, "after leaving");
-    let proposal = self_remove(&alice2.provider, &mut a2, alice2.pseudonym).unwrap();
+    let proposal = self_remove(&alice2.provider, &mut a2).unwrap();
     for (device, group) in [(&mut bob, &mut b), (&mut alice, &mut a)] {
         let Incoming::Proposal { .. } =
             group::process_message(&device.provider, group, &proposal).unwrap()
@@ -771,54 +834,82 @@ fn self_removed_sender() {
     assert!(alice.history.sender(a2.own_leaf_index()).left);
 }
 
+/// A private room past 256 identities is epochal, but its pseudonyms are
+/// derived like any other outside public rooms (7.3): no ATTEST pins them.
 #[test]
-fn epochal_pseudonyms() {
+fn epochal_private_rooms_derive() {
     let mut owen = Device::new("owen@example.org", 1);
-    let mut mia = Device::new("mia@example.org", 2);
+    let mia = Device::new("mia@example.org", 2);
     let mut conversation = RisalaConversation::private_room(HOST, BOX, "Friends", &owen.uid);
     conversation.confirm = ConfirmMode::Epochal;
     let mut o = owen.create(&conversation);
     let out = commit(
         &owen.provider,
         &mut o,
-        owen.pseudonym,
         &owen.profile(),
-        &MlsHistory::default(),
+        &EpochState::default(),
         Changes {
             add: vec![mia.key_package()],
             ..Changes::default()
         },
     )
     .unwrap();
-    merge_own_commit(
-        &owen.provider,
-        &mut o,
-        &mut MlsHistory::default(),
-        &post(&out),
-    )
-    .unwrap();
+    merge_own_commit(&owen.provider, &mut o, &mut EpochState::default()).unwrap();
+    let mut mia = mia;
     let mut m = mia.join(&out.welcome.unwrap());
-
-    // Nothing is pinned until the leaf's ATTEST is checked (7.3, 12.10).
     let (_, post) = mia.send(&mut m, "hello");
     let got = owen.receive(&mut o, &post).unwrap();
-    assert_eq!(got.pseudonym, PseudonymCheck::NeedsAttest(mia.pseudonym));
-    assert_eq!(got.trust(true), Trust::Withheld);
+    assert_eq!(got.pseudonym, PseudonymCheck::Derived);
+    assert_eq!(got.trust(true), Trust::Verified);
     assert_eq!(
         got.place(&conversation).conversation,
         Conversation::PrivateRoom(LineConfirmMode::Epochal)
     );
-    owen.history.pin(got.sender, mia.pseudonym);
-    let (_, post) = mia.send(&mut m, "again");
-    let got = owen.receive(&mut o, &post).unwrap();
-    assert_eq!(got.pseudonym, PseudonymCheck::Pinned);
-    assert_eq!(got.trust(false), Trust::Unverified);
-    // A new period's pseudonym waits for that period's ATTEST.
-    mia.pseudonym = Pseudonym::generate().unwrap();
-    let (_, post) = mia.send(&mut m, "next period");
+}
+
+/// Public rooms pin a pseudonym per period (7.3): an identity's by its
+/// ATTEST, a guest's by its first message of the period.
+#[test]
+fn public_room_pins() {
+    let p1 = Pseudonym([1; 16]);
+    let p2 = Pseudonym([2; 16]);
+    let mut log = SenderLog::default();
+    // An identity's leaf: nothing is pinned until its ATTEST is checked.
     assert_eq!(
-        owen.receive(&mut o, &post).unwrap().pseudonym,
-        PseudonymCheck::NeedsAttest(mia.pseudonym)
+        check_pseudonym(&log, p1, false, 7),
+        Some(PseudonymCheck::NeedsAttest(p1))
+    );
+    log.pseudonym = Some(p1);
+    assert_eq!(
+        check_pseudonym(&log, p1, false, 7),
+        Some(PseudonymCheck::Pinned)
+    );
+    // A new period's pseudonym waits for that period's ATTEST.
+    assert_eq!(
+        check_pseudonym(&log, p2, false, 8),
+        Some(PseudonymCheck::NeedsAttest(p2))
+    );
+    // A guest's leaf: its first message of the period pins it, and others
+    // in that period are ignored, until the next period.
+    let mut guest = SenderLog::default();
+    assert_eq!(
+        check_pseudonym(&guest, p1, true, 7),
+        Some(PseudonymCheck::NewlyPinned)
+    );
+    guest.pseudonym = Some(p1);
+    guest.pin_period = Some(7);
+    assert_eq!(
+        check_pseudonym(&guest, p1, true, 7),
+        Some(PseudonymCheck::Pinned)
+    );
+    assert_eq!(check_pseudonym(&guest, p2, true, 7), None);
+    assert_eq!(
+        check_pseudonym(&guest, p2, true, 8),
+        Some(PseudonymCheck::NewlyPinned)
+    );
+    assert_eq!(
+        check_pseudonym(&guest, p1, true, 8),
+        Some(PseudonymCheck::NewlyPinned)
     );
 }
 

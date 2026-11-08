@@ -28,11 +28,12 @@
 //! - [`keypackage`]: making KeyPackages, and the checks of KEYPKG ADD
 //!   (12.5).
 //! - [`group`]: creating groups, joining by Welcome and by a public room's
-//!   join proposal, commits, Update proposals, SelfRemove, resync commits,
-//!   mailbox moves, past epochs, and processing posts (12.6-12.9, 6.1,
-//!   7.8).
+//!   join proposal, commits, Update proposals, SelfRemove, resync commits
+//!   and rejoins, mailbox moves, derived pseudonyms and boxes, past epochs,
+//!   and processing posts (12.6-12.9, 6.1, 7.3, 7.8).
 //! - [`checks`]: the checks of joining, and the group and key checks of
-//!   every commit, with the [`History`](checks::History) they look back on
+//!   every commit, which depend only on the group's state in the epoch
+//!   ([`EpochState`](checks::EpochState)), the commit and its posts
 //!   (12.7).
 //! - [`welcome`]: one sealed Welcome per added device (12.8).
 //! - [`message`]: RisalaMessage, franking, counters, late messages and
@@ -77,7 +78,7 @@ pub mod wire;
 pub use openmls;
 pub use openmls_traits;
 
-pub use aad::{Pseudonym, RisalaAad};
+pub use aad::{EpochPseudonyms, Pseudonym, RisalaAad};
 pub use archive::{
     ArchiveError, ArchivedConversation, ArchivedFile, ArchivedMessage, HistoryArchive,
     OpenedTransfer, SealedArchive, TransferRef, open_transfer, seal_transfer,
@@ -86,7 +87,7 @@ pub use backup::{
     Backup, BackupError, BackupKey, BackupUpload, RecoveryKey, RecoveryKeyError, WrappedKey,
 };
 pub use binding::DeviceBinding;
-pub use checks::{CommitPost, History};
+pub use checks::{CommitPost, EpochState};
 pub use confirm::{AttestationKey, Confirmer, LeafState};
 pub use conversation::{ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto};

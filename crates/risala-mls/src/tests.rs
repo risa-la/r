@@ -1,10 +1,10 @@
 //! Groups made with this crate, end to end, with in-memory storage:
 //! KeyPackages and KEYPKG ADD's checks, direct conversations, private
 //! rooms with roles, SelfRemove, competing commits, `next`, streaks,
-//! stale leaves, RESYNC, impostor repairs, mailbox moves, Update proposals,
-//! public rooms joined by proposal, resync commits, last-resort
-//! KeyPackages, sealed Welcomes, past epochs, and the framing the server
-//! reads of each message.
+//! stale leaves, RESYNC repairs, impostor removals, mailbox moves, derived
+//! pseudonyms, Update proposals, public rooms joined by proposal, copies,
+//! resync commits and rejoins, last-resort KeyPackages, sealed Welcomes,
+//! past epochs, and the framing the server reads of each message.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,8 +18,8 @@ use risala_proto::names::{Room, Uid};
 
 use crate::aad::{Pseudonym, RisalaAad};
 use crate::checks::{
-    CommitError, CommitPost, Fact, History, JoinExpectation, KeyFacts, KeyReport, PERIOD_MS,
-    UPDATED_SKEW_MS, Verdict, needs_refresh,
+    CommitError, CommitPost, EpochState, External, Fact, GroupView, JoinExpectation, KeyFacts,
+    KeyReport, PERIOD_MS, Seen, UPDATED_SKEW_MS, Verdict, needs_refresh,
 };
 use crate::conversation::{ConfirmMode, ConversationKind, GuestMode, RisalaConversation};
 use crate::framing::{ContentType, MlsMessage, Sender, read_message, read_post};
@@ -50,14 +50,14 @@ fn uid(s: &str) -> Uid {
     s.parse().unwrap()
 }
 
-/// One device, with its own storage, and the history of each of its
-/// groups by group id.
+/// One device, with its own storage, the state of each of its groups' epoch
+/// by group id, and its pseudonym for public rooms.
 struct Device {
     uid: Uid,
     device_key: Option<SigningKey>,
     provider: Provider<MemoryStorage>,
-    pseudonym: Pseudonym,
-    histories: RefCell<BTreeMap<Vec<u8>, History>>,
+    period_pseudonym: Pseudonym,
+    states: RefCell<BTreeMap<Vec<u8>, EpochState>>,
 }
 
 impl Device {
@@ -68,8 +68,8 @@ impl Device {
             uid,
             device_key,
             provider: Provider::new(MemoryStorage::default()).unwrap(),
-            pseudonym: Pseudonym::generate().unwrap(),
-            histories: RefCell::default(),
+            period_pseudonym: Pseudonym::generate().unwrap(),
+            states: RefCell::default(),
         }
     }
 
@@ -80,8 +80,8 @@ impl Device {
             uid: self.uid.clone(),
             device_key: self.device_key.clone(),
             provider: Provider::new(MemoryStorage::default()).unwrap(),
-            pseudonym: Pseudonym::generate().unwrap(),
-            histories: RefCell::default(),
+            period_pseudonym: Pseudonym::generate().unwrap(),
+            states: RefCell::default(),
         }
     }
 
@@ -140,18 +140,34 @@ impl Device {
         }
     }
 
-    fn history(&self, group: &MlsGroup) -> History {
-        self.histories
+    fn state(&self, group: &MlsGroup) -> EpochState {
+        self.states
             .borrow()
             .get(group.group_id().as_slice())
             .cloned()
             .unwrap_or_default()
     }
 
-    fn set_history(&self, group: &MlsGroup, history: History) {
-        self.histories
+    fn set_state(&self, group: &MlsGroup, state: EpochState) {
+        self.states
             .borrow_mut()
-            .insert(group.group_id().as_slice().to_vec(), history);
+            .insert(group.group_id().as_slice().to_vec(), state);
+    }
+
+    /// What this device saw itself, for the key checks: nothing.
+    fn seen(&self) -> Seen<'_> {
+        Seen {
+            own_uid: &self.uid,
+            resyncs: &[],
+            impostors: &[],
+        }
+    }
+
+    /// The device's pseudonym in `group` now (7.3).
+    fn pseudonym(&self, group: &MlsGroup) -> Pseudonym {
+        let period = (conversation(group).unwrap().kind == ConversationKind::PublicRoom)
+            .then_some(self.period_pseudonym);
+        sending_pseudonym::<()>(group, self.provider.crypto(), period).unwrap()
     }
 
     fn create(&self, conversation: &RisalaConversation) -> MlsGroup {
@@ -159,15 +175,14 @@ impl Device {
     }
 
     fn create_at(&self, conversation: &RisalaConversation, t: u64) -> MlsGroup {
-        let (group, _, history) = create_group(
+        let (group, _, state) = create_group(
             &self.provider,
             &self.identity(),
             &self.profile_at(t),
             conversation,
-            t,
         )
         .unwrap();
-        self.set_history(&group, history);
+        self.set_state(&group, state);
         group
     }
 
@@ -179,22 +194,22 @@ impl Device {
         commit(
             &self.provider,
             group,
-            self.pseudonym,
             &self.profile_at(updated),
-            &self.history(group),
+            &self.state(group),
             changes,
         )
         .unwrap()
     }
 
-    fn merge(&self, group: &mut MlsGroup, out: &CommitOutput) {
-        self.merge_at(group, out, now_ms());
+    fn merge(&self, group: &mut MlsGroup, _out: &CommitOutput) {
+        let mut state = self.state(group);
+        let applied = merge_own_commit(&self.provider, group, &mut state).unwrap();
+        assert!(applied.active);
+        self.set_state(group, state);
     }
 
-    fn merge_at(&self, group: &mut MlsGroup, out: &CommitOutput, t: u64) {
-        let mut history = self.history(group);
-        merge_own_commit(&self.provider, group, &mut history, &post(out, t)).unwrap();
-        self.set_history(group, history);
+    fn merge_at(&self, group: &mut MlsGroup, out: &CommitOutput, _t: u64) {
+        self.merge(group, out);
     }
 
     fn join(&self, welcome: &[u8]) -> MlsGroup {
@@ -206,12 +221,13 @@ impl Device {
             Some(_) => public_expect(self),
             None => self.expect(),
         };
-        let joined = join_by_welcome(&self.provider, welcome, tree, &expect, now_ms()).unwrap();
-        self.set_history(&joined.group, joined.history);
+        let joined = join_by_welcome(&self.provider, welcome, tree, &expect).unwrap();
+        self.set_state(&joined.group, joined.state);
         joined.group
     }
 
-    /// Processes a commit and makes the group checks, without applying it.
+    /// Processes a commit and makes the group checks, without applying it,
+    /// with the times of the epoch's proposals that this device noted.
     fn receive_post(
         &self,
         group: &mut MlsGroup,
@@ -222,11 +238,12 @@ impl Device {
         else {
             panic!("not a commit");
         };
+        let state = self.state(group);
         let verdict = check_received_commit(
             group,
             &received,
-            &self.history(group),
-            post,
+            &state,
+            &state.post(post.t, post.next),
             self.provider.crypto(),
         );
         (received, verdict)
@@ -240,18 +257,23 @@ impl Device {
         self.receive_post(group, &out.message, &post(out, now_ms()))
     }
 
-    fn apply_received(
+    fn apply_received(&self, group: &mut MlsGroup, received: ReceivedCommit) -> bool {
+        let mut state = self.state(group);
+        let applied = apply_commit(&self.provider, group, received, &mut state).unwrap();
+        self.set_state(group, state);
+        applied.active
+    }
+
+    /// The key checks of a received commit, with what this device saw.
+    fn keys(
         &self,
-        group: &mut MlsGroup,
-        received: ReceivedCommit,
+        group: &MlsGroup,
+        received: &ReceivedCommit,
         verdict: &Verdict,
-        post: &CommitPost,
-    ) -> bool {
-        let mut history = self.history(group);
-        let active =
-            apply_commit(&self.provider, group, received, verdict, &mut history, post).unwrap();
-        self.set_history(group, history);
-        active
+        facts: &dyn KeyFacts,
+        seen: &Seen<'_>,
+    ) -> KeyReport {
+        check_received_keys(group, received, &self.state(group), verdict, facts, seen)
     }
 
     /// Processes, checks and applies a commit that must be valid, at `t`.
@@ -265,8 +287,8 @@ impl Device {
         let post = post(out, t);
         let (received, verdict) = self.receive_post(group, &out.message, &post);
         let verdict = verdict.unwrap();
-        let report = check_received_keys(group, &received, &verdict, facts);
-        self.apply_received(group, *received, &verdict, &post);
+        let report = self.keys(group, &received, &verdict, facts, &self.seen());
+        self.apply_received(group, *received);
         (verdict, report)
     }
 
@@ -275,7 +297,7 @@ impl Device {
     }
 
     fn send(&self, group: &mut MlsGroup, text: &[u8]) -> Vec<u8> {
-        let aad = RisalaAad::application(self.pseudonym, [7; 48]);
+        let aad = RisalaAad::application(self.pseudonym(group), [7; 48]);
         encrypt_application(&self.provider, group, &aad, text).unwrap()
     }
 
@@ -288,7 +310,7 @@ impl Device {
         }
     }
 
-    /// Processes a proposal post, noting an Update's time.
+    /// Processes a proposal post, noting its time.
     fn propose_in(&self, group: &mut MlsGroup, message: &[u8], t: u64) -> ProposalKind {
         let Incoming::Proposal {
             kind, reference, ..
@@ -296,20 +318,15 @@ impl Device {
         else {
             panic!("not a proposal");
         };
-        if kind == ProposalKind::Update {
-            let mut history = self.history(group);
-            history.note_update(&reference, t);
-            self.set_history(group, history);
-        }
+        let mut state = self.state(group);
+        state.note_proposal(&reference, t);
+        self.set_state(group, state);
         kind
     }
 }
 
 fn post(out: &CommitOutput, t: u64) -> CommitPost {
-    CommitPost {
-        t,
-        next: Some(out.next_token_hash),
-    }
+    CommitPost::at(t, Some(out.next_token_hash))
 }
 
 /// Key files and the key log, as the tests set them up.
@@ -359,6 +376,13 @@ impl KeyFacts for Facts {
     }
 
     fn identity_retired(&self, _: &Uid) -> Fact<bool> {
+        if self.unknown {
+            return Fact::Unknown;
+        }
+        Fact::Known(false)
+    }
+
+    fn forked_or_missing(&self, _: &Uid) -> Fact<bool> {
         if self.unknown {
             return Fact::Unknown;
         }
@@ -506,7 +530,8 @@ fn direct_conversation() {
     assert_eq!(framing.epoch, 0);
     assert_eq!(framing.group_id, a.group_id().as_slice());
     // The RisalaAAD has no next token hash (12.9); it travels as `next=`.
-    assert_eq!(aad, RisalaAad::handshake(alice.pseudonym));
+    // Its pseudonym is Alice's leaf's, derived from the epoch (7.3).
+    assert_eq!(aad, RisalaAad::handshake(alice.pseudonym(&a)));
     assert!(out.group_info.is_none());
     assert_eq!(out.added.len(), 2);
     let welcome = out.welcome.clone().unwrap();
@@ -559,35 +584,48 @@ fn direct_conversation() {
     assert_eq!(verdict, Err(CommitError::Add));
     discard_own_commit(&alice.provider, &mut a).unwrap();
 
-    // Alice may remove Bob's leaf "for a key check" (12.7): the group
-    // checks pass, and each device's key check decides whether to repair.
+    // Alice may remove Bob's leaf "for a check" (12.7): the group checks
+    // pass, it is an authority commit, and each device's key check looks
+    // for a reason it can see.
     let bob_leaf = b.own_leaf_index();
     let out = alice.commit(&mut a, remove(vec![bob_leaf]));
     let post = post(&out, now_ms());
     let (received, verdict) = alice2.receive_post(&mut a2, &out.message, &post);
     let verdict = verdict.unwrap();
-    assert_eq!(verdict.key_check_removals, vec![bob_leaf]);
-    assert!(!verdict.authority);
-    // Bob's device is current: the key check fails, and the repair adds it
-    // back.
-    let report = check_received_keys(&a2, &received, &verdict, &facts);
+    assert_eq!(verdict.check_removals, vec![bob_leaf]);
+    assert!(verdict.authority);
+    // Alice's other device sees no reason: the removal stands, as one it
+    // could not check, with a warning naming Alice.
+    let report = alice2.keys(&a2, &received, &verdict, &facts, &alice2.seen());
+    assert_eq!(report.unexplained_removals, vec![bob_leaf]);
+    assert!(report.failed_removals.is_empty());
+    // Bob's own device knows its device is current: the removal failed,
+    // and Bob's identity adds it back.
+    let (bob_received, bob_verdict) = bob.receive_post(&mut b, &out.message, &post);
+    let report = bob.keys(
+        &b,
+        &bob_received,
+        &bob_verdict.unwrap(),
+        &facts,
+        &bob.seen(),
+    );
     assert_eq!(report.failed_removals, vec![bob.identity()]);
-    // Unknown: the removal stands with a warning.
+    // Unknown: still nothing Bob's device can conclude.
     let unknown = Facts {
         unknown: true,
         ..Facts::default()
     };
-    let report = check_received_keys(&a2, &received, &verdict, &unknown);
-    assert_eq!(report.unchecked_removals, vec![bob_leaf]);
+    let report = alice2.keys(&a2, &received, &verdict, &unknown, &alice2.seen());
+    assert_eq!(report.unexplained_removals, vec![bob_leaf]);
     assert!(report.committer_unchecked);
-    // Known removed by record: nothing to repair.
+    // Known removed by record: a reason, nothing to report.
     let mut removed = Facts::with(&[&alice, &alice2, &bob]);
     removed.removed.insert((bob.uid.clone(), bob.device_id()));
     assert_eq!(
-        check_received_keys(&a2, &received, &verdict, &removed),
+        alice2.keys(&a2, &received, &verdict, &removed, &alice2.seen()),
         KeyReport::default()
     );
-    alice2.apply_received(&mut a2, *received, &verdict, &post);
+    alice2.apply_received(&mut a2, *received);
     alice.merge(&mut a, &out);
     assert_eq!(a.members().count(), 2);
 
@@ -620,44 +658,31 @@ fn next_token_and_updated() {
     let (received, verdict) = bob.receive(&mut b, &out);
     verdict.unwrap();
     // A wrong `next`, or none, makes the commit invalid (12.6, 12.7).
-    let wrong = CommitPost {
-        t,
-        next: Some([9; 48]),
-    };
-    let none = CommitPost { t, next: None };
+    let wrong = CommitPost::at(t, Some([9; 48]));
+    let none = CommitPost::at(t, None);
     for post in [wrong, none] {
         assert_eq!(
-            check_received_commit(
-                &b,
-                &received,
-                &bob.history(&b),
-                &post,
-                bob.provider.crypto()
-            ),
+            check_received_commit(&b, &received, &bob.state(&b), &post, bob.provider.crypto()),
             Err(CommitError::NextToken)
         );
     }
     // `updated` more than 10 minutes from the post's `t` (12.3).
-    let far = CommitPost {
-        t: t + UPDATED_SKEW_MS + 60_000,
-        next: Some(out.next_token_hash),
-    };
+    let far = CommitPost::at(t + UPDATED_SKEW_MS + 60_000, Some(out.next_token_hash));
     assert_eq!(
-        check_received_commit(&b, &received, &bob.history(&b), &far, bob.provider.crypto()),
+        check_received_commit(&b, &received, &bob.state(&b), &far, bob.provider.crypto()),
         Err(CommitError::Updated)
     );
-    bob.apply_received(&mut b, *received, &Verdict::default(), &post(&out, t));
+    bob.apply_received(&mut b, *received);
     alice.merge(&mut a, &out);
     // `updated` below the leaf's previous one.
     let out = alice.commit(&mut a, Changes::default());
     discard_own_commit(&alice.provider, &mut a).unwrap();
-    let history = alice.history(&a);
+    let state = alice.state(&a);
     let back = commit(
         &alice.provider,
         &mut a,
-        alice.pseudonym,
         &alice.profile_at(t - 60_000),
-        &history,
+        &state,
         Changes::default(),
     )
     .unwrap();
@@ -687,7 +712,7 @@ fn streaks() {
     let mut b = bob.join(out.welcome.as_ref().unwrap());
     // Bob joined with the GroupInfo Alice signed: he knows she started the
     // epoch.
-    assert_eq!(bob.history(&b).started_by, Some(a.own_leaf_index().u32()));
+    assert_eq!(bob.state(&b).started_by, Some(a.own_leaf_index().u32()));
     for expected in [2, 3] {
         let out = alice.commit_at(&mut a, Changes::default(), t0);
         bob.apply_at(&mut b, &out, &facts, t0);
@@ -726,13 +751,7 @@ fn welcome_checks() {
     // Alice (wrongly) adds Bob to her conversation with Carol: Bob refuses
     // to join, since it is not his conversation (12.7).
     let out = alice.commit(&mut a, add(vec![bob.key_package(false)]));
-    let err = join_by_welcome(
-        &bob.provider,
-        &out.welcome.unwrap(),
-        None,
-        &bob.expect(),
-        now_ms(),
-    );
+    let err = join_by_welcome(&bob.provider, &out.welcome.unwrap(), None, &bob.expect());
     assert!(matches!(
         err,
         Err(GroupError::Join(crate::checks::JoinError::NotAParticipant))
@@ -742,13 +761,7 @@ fn welcome_checks() {
     let conv = RisalaConversation::direct("other.example", BOX, &alice.uid, &bob.uid);
     let mut a = alice.create(&conv);
     let out = alice.commit(&mut a, add(vec![bob.key_package(false)]));
-    let err = join_by_welcome(
-        &bob.provider,
-        &out.welcome.unwrap(),
-        None,
-        &bob.expect(),
-        now_ms(),
-    );
+    let err = join_by_welcome(&bob.provider, &out.welcome.unwrap(), None, &bob.expect());
     assert!(matches!(
         err,
         Err(GroupError::Join(
@@ -887,16 +900,11 @@ fn private_room_roles() {
     mia.apply(&mut m, &out, &facts);
     pat.apply(&mut p, &out, &facts);
     let out = mia.commit(&mut m, add(vec![rhea.key_package(false)]));
-    // Owen, who saw every commit since the start, refuses it; Pat, who
-    // joined since, cannot tell whether Rhea had a leaf in the last 16
-    // epochs, and applies it (12.7).
-    let (_, verdict) = owen.receive(&mut o, &out);
-    assert_eq!(verdict, Err(CommitError::Add));
-    let (_, verdict) = pat.receive(&mut p, &out);
-    assert_eq!(
-        verdict.unwrap().unchecked,
-        vec!["adding back a device of the last 16 epochs"]
-    );
+    // Every device refuses it alike, whenever it joined (12.7).
+    for (device, group) in [(&owen, &mut o), (&pat, &mut p)] {
+        let (_, verdict) = device.receive(group, &out);
+        assert_eq!(verdict, Err(CommitError::Add));
+    }
     discard_own_commit(&mia.provider, &mut m).unwrap();
 
     // A moderator may invite a plain identity and set the topic: an
@@ -924,11 +932,11 @@ fn private_room_roles() {
     let mia_leaf = m.own_leaf_index();
     let out = mia.commit(&mut m, remove(vec![owen_leaf]));
     let verdict = pat.receive(&mut p, &out).1.unwrap();
-    // Owen's last commit, which changed `mods`, was an authority commit
-    // within 24 hours, so any member may remove his leaf as an impostor
-    // repair (12.7); devices that confirmed his leaf tell their users.
-    assert_eq!(verdict.repairs, vec![owen_leaf]);
-    assert!(verdict.key_check_removals.is_empty());
+    // Not as a kick: but any member may remove a leaf for a check (12.7),
+    // an authority commit, which devices that confirmed Owen's leaf show
+    // as abuse, naming Mia.
+    assert_eq!(verdict.check_removals, vec![owen_leaf]);
+    assert!(verdict.authority);
     discard_own_commit(&mia.provider, &mut m).unwrap();
 
     let mut ban = conversation(&o).unwrap();
@@ -955,11 +963,12 @@ fn private_room_roles() {
     );
     owen.merge(&mut o, &out);
     let verdict = pat.apply(&mut p, &out, &facts);
-    assert!(verdict.key_check_removals.is_empty() && verdict.authority);
+    assert!(verdict.check_removals.is_empty() && verdict.authority);
     assert!(conversation(&p).unwrap().bans.contains(&mia.uid));
     // Mia's device sees it was removed.
     let (received, verdict) = mia.receive(&mut m, &out);
-    assert!(!mia.apply_received(&mut m, *received, &verdict.unwrap(), &post(&out, now_ms())));
+    verdict.unwrap();
+    assert!(!mia.apply_received(&mut m, *received));
 }
 
 #[test]
@@ -975,7 +984,8 @@ fn self_remove_and_leaving() {
     } = private_room();
     // Pat leaves: a SelfRemove, as a PrivateMessage (12.6, 6.1).
     let pat_leaf = p.own_leaf_index();
-    let proposal = self_remove(&pat.provider, &mut p, pat.pseudonym).unwrap();
+    let pat_pseudonym = pat.pseudonym(&p);
+    let proposal = self_remove(&pat.provider, &mut p).unwrap();
     private_framing(&proposal, ContentType::Proposal);
     for (device, group) in [(&owen, &mut o), (&mia, &mut m)] {
         let Incoming::Proposal {
@@ -984,7 +994,7 @@ fn self_remove_and_leaving() {
         else {
             panic!("not a proposal");
         };
-        assert_eq!(aad.pseudonym, Some(pat.pseudonym));
+        assert_eq!(aad.pseudonym, Some(pat_pseudonym));
         assert_eq!(kind, ProposalKind::SelfRemove);
         assert_eq!(sender, Some(pat_leaf));
     }
@@ -1001,7 +1011,8 @@ fn self_remove_and_leaving() {
         .signature_key()
         .as_slice()
         .to_vec();
-    assert!(!pat.apply_received(&mut p, *received, &verdict.unwrap(), &post(&out, now_ms())));
+    verdict.unwrap();
+    assert!(!pat.apply_received(&mut p, *received));
     assert!(
         LeafKey::load(pat.provider.storage(), p.group_id().as_slice(), &pat_key)
             .unwrap()
@@ -1017,7 +1028,7 @@ fn self_remove_and_leaving() {
 
     // The owner is gone: the moderator may do what an owner may (6.3).
     let owen_leaf = o.own_leaf_index();
-    let proposal = self_remove(&owen.provider, &mut o, owen.pseudonym).unwrap();
+    let proposal = self_remove(&owen.provider, &mut o).unwrap();
     process_message(&mia.provider, &mut m, &proposal).unwrap();
     let out = mia.commit(&mut m, Changes::default());
     mia.merge(&mut m, &out);
@@ -1107,22 +1118,42 @@ fn stale_leaves() {
     owen.apply_at(&mut o, &out, &facts, now);
     mia.apply_at(&mut m, &out, &facts, now);
     // The upper median of 40 days ago, today and today is today.
-    let view = crate::checks::GroupView::of(p.public_group());
-    assert_eq!(view.median_updated(), Some(now));
-    assert_eq!(view.stale_leaves(), vec![o.own_leaf_index()]);
-    assert_eq!(view.max_stale_removals(), 1);
-    // Pat, a plain member, removes Owen's leaf as stale: a group reason,
-    // not a key check.
+    let view = GroupView::of(p.public_group(), &pat.state(&p));
+    assert_eq!(view.median_activity(now), Some(now));
+    assert_eq!(view.stale_leaves(now), vec![o.own_leaf_index()]);
+    assert_eq!(view.bulk_limit(), 1);
+    // Pat, a plain member, removes Owen's leaf as stale and adds his device
+    // again from a new KeyPackage (12.7): a group reason, not a check,
+    // though Owen is an owner, whom Pat could not invite.
     let owen_leaf = o.own_leaf_index();
-    let out = pat.commit(&mut p, remove(vec![owen_leaf]));
+    let out = pat.commit(
+        &mut p,
+        Changes {
+            remove: vec![owen_leaf],
+            add: vec![owen.again().key_package(false)],
+            ..Changes::default()
+        },
+    );
     let verdict = mia.receive(&mut m, &out).1.unwrap();
-    assert!(verdict.key_check_removals.is_empty());
+    assert!(verdict.check_removals.is_empty());
+    assert!(!verdict.authority);
     discard_own_commit(&pat.provider, &mut p).unwrap();
-    // Mia's leaf is not stale: removing it is a key-check removal.
+    // Mia's leaf is not stale: removing it is a removal for a check, and
+    // she may not be added back by Pat in the same commit.
     let mia_leaf = m.own_leaf_index();
     let out = pat.commit(&mut p, remove(vec![mia_leaf]));
     let verdict = owen.receive(&mut o, &out).1.unwrap();
-    assert_eq!(verdict.key_check_removals, vec![mia_leaf]);
+    assert_eq!(verdict.check_removals, vec![mia_leaf]);
+    discard_own_commit(&pat.provider, &mut p).unwrap();
+    let out = pat.commit(
+        &mut p,
+        Changes {
+            remove: vec![mia_leaf],
+            add: vec![mia.again().key_package(false)],
+            ..Changes::default()
+        },
+    );
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Add));
 
     // The weekly refresh (12.7).
     let own = RisalaProfile::new("", now_ms() - 8 * 24 * HOUR).unwrap();
@@ -1176,41 +1207,37 @@ fn lifetimes_at_the_post() {
     }
     assert_eq!(
         crate::checks::check_commit(
-            &crate::checks::GroupView::of(b.public_group()),
+            &GroupView::of(b.public_group(), &bob.state(&b)),
             &view,
-            &bob.history(&b),
-            &CommitPost {
-                t: now_ms(),
-                next: Some(out.next_token_hash)
-            },
+            &CommitPost::at(now_ms(), Some(out.next_token_hash)),
         ),
         Err(CommitError::KeyPackage(KeyPackageError::Lifetime))
     );
-    bob.apply_received(&mut b, *received, &Verdict::default(), &post(&out, then));
+    bob.apply_received(&mut b, *received);
     alice.merge_at(&mut a, &out, then);
     // Carol joins, though her leaf's lifetime is over (12.5).
     let c = carol.join(out.welcome.as_ref().unwrap());
     assert_eq!(c.members().count(), 3);
 }
 
-/// RESYNC (12.7): a leaf that posted RESYNC in the last 16 epochs may be
-/// removed by anyone together with an Add of the same device.
+/// RESYNC (12.7): the device's own identity replaces its leaf; if it has no
+/// other leaf, an owner or moderator does, as a removal for a check and an
+/// Add its role allows; plain members only warn.
 #[test]
-fn resync_lines() {
+fn resync_repairs() {
     let Room3 {
         owen,
         mia,
         pat,
         mut o,
-        m,
+        mut m,
         mut p,
-        facts,
+        mut facts,
     } = private_room();
-    // Mia's device could not process a commit, and posts RESYNC. Pat, a
-    // plain member, replaces her leaf.
+    // Mia's device could not process a commit, and posts RESYNC.
     let mia_leaf = m.own_leaf_index();
-    let replace = |group: &mut MlsGroup| {
-        pat.commit(
+    let replace = |device: &Device, group: &mut MlsGroup| {
+        device.commit(
             group,
             Changes {
                 remove: vec![mia_leaf],
@@ -1219,33 +1246,69 @@ fn resync_lines() {
             },
         )
     };
-    // Without a RESYNC, the removal is one for a key check.
-    let out = replace(&mut p);
-    let verdict = owen.receive(&mut o, &out).1.unwrap();
-    assert_eq!(verdict.key_check_removals, vec![mia_leaf]);
+    // Mia has no other leaf, so Pat, a plain member, may not: he could hold
+    // the new leaf himself (12.7).
+    let out = replace(&pat, &mut p);
+    assert_eq!(owen.receive(&mut o, &out).1, Err(CommitError::Add));
     discard_own_commit(&pat.provider, &mut p).unwrap();
-    // With RESYNC noted in this epoch, it is a group reason.
-    for (device, group) in [(&owen, &o), (&pat, &p)] {
-        let mut history = device.history(group);
-        history.note_resync(mia_leaf, group.epoch().as_u64());
-        device.set_history(group, history);
-    }
-    let out = replace(&mut p);
-    let (received, verdict) = owen.receive(&mut o, &out);
+    // Owen, an owner, may: his role lets him remove all of Mia's leaves,
+    // and invite her (a moderator, whom only owners invite).
+    let out = replace(&owen, &mut o);
+    let (received, verdict) = pat.receive(&mut p, &out);
     let verdict = verdict.unwrap();
-    assert!(verdict.key_check_removals.is_empty());
-    // Its key check has nothing to repair: the device is back.
+    assert!(verdict.check_removals.is_empty());
+    assert!(verdict.authority);
+    // The device re-added in the same commit: nothing to report.
     assert_eq!(
-        check_received_keys(&o, &received, &verdict, &facts),
+        pat.keys(&p, &received, &verdict, &facts, &pat.seen()),
         KeyReport::default()
     );
+    discard_own_commit(&owen.provider, &mut o).unwrap();
+
+    // With a second device of Mia's in the room, her own identity repairs.
+    let mia2 = Device::new("mia@example.org", 12);
+    facts.add(&mia2);
+    let out = pat.commit(&mut p, add(vec![mia2.key_package(false)]));
+    pat.merge(&mut p, &out);
+    owen.apply(&mut o, &out, &facts);
+    mia.apply(&mut m, &out, &facts);
+    let mut m2 = mia2.join(out.welcome.as_ref().unwrap());
+    let out = replace(&mia2, &mut m2);
+    let verdict = pat.receive(&mut p, &out).1.unwrap();
+    assert!(verdict.check_removals.is_empty());
+    // Pat, removing Mia's leaf without re-adding it, needs a reason he can
+    // see: the RESYNC he read is one.
+    discard_own_commit(&mia2.provider, &mut m2).unwrap();
+    let out = pat.commit(&mut p, remove(vec![mia_leaf]));
+    let (received2, verdict2) = owen.receive(&mut o, &out);
+    let verdict2 = verdict2.unwrap();
+    let resyncs = [mia_leaf];
+    let saw = Seen {
+        own_uid: &owen.uid,
+        resyncs: &resyncs,
+        impostors: &[],
+    };
+    assert_eq!(
+        owen.keys(&o, &received2, &verdict2, &facts, &saw),
+        KeyReport::default()
+    );
+    assert_eq!(
+        owen.keys(&o, &received2, &verdict2, &facts, &owen.seen())
+            .unexplained_removals,
+        vec![mia_leaf]
+    );
+    // Mia's other device finds no reason at all, and her device is current:
+    // the removal failed, and it adds the device again.
+    let (received3, verdict3) = mia2.receive(&mut m2, &out);
+    let report = mia2.keys(&m2, &received3, &verdict3.unwrap(), &facts, &mia2.seen());
+    assert_eq!(report.failed_removals, vec![mia.identity()]);
 }
 
-/// An impostor repair (12.7): any member removes a leaf of another
-/// identity, puts back the fields its commits changed, and adds back the
-/// devices they removed.
+/// Impostors (12.7): any member removes the leaf, for a check, and that
+/// undoes nothing; undoing takes ordinary commits by those whose role
+/// allows each change.
 #[test]
-fn impostor_repairs() {
+fn impostor_removals() {
     let Room3 {
         owen,
         mia,
@@ -1278,26 +1341,49 @@ fn impostor_repairs() {
     mia.merge(&mut m, &out);
     owen.apply(&mut o, &out, &facts);
     assert!(pat.apply(&mut p, &out, &facts).authority);
-    // Pat, a plain member, repairs: removes Mia's leaf, puts the topic
-    // back, and adds Quinn back.
+    // Pat, a plain member, finds her an impostor and removes her leaf.
     let mia_leaf = m.own_leaf_index();
+    let out = pat.commit(&mut p, remove(vec![mia_leaf]));
+    let (received, verdict) = owen.receive(&mut o, &out);
+    let verdict = verdict.unwrap();
+    assert_eq!(verdict.check_removals, vec![mia_leaf]);
+    // Owen sees no reason himself: it stands, with a warning naming Pat.
+    assert_eq!(
+        owen.keys(&o, &received, &verdict, &facts, &owen.seen())
+            .unexplained_removals,
+        vec![mia_leaf]
+    );
+    // Pat's device, to which she is an impostor, has its reason.
+    let impostors = [mia_leaf];
+    let saw = Seen {
+        own_uid: &pat.uid,
+        resyncs: &[],
+        impostors: &impostors,
+    };
+    let own_commit = crate::checks::CommitView::of(
+        &openmls::prelude::Sender::Member(p.own_leaf_index()),
+        p.pending_commit().unwrap(),
+        p.pending_proposals(),
+    );
+    assert_eq!(
+        crate::checks::key_checks(
+            &GroupView::of(p.public_group(), &pat.state(&p)),
+            &own_commit,
+            &verdict,
+            &facts,
+            &saw
+        ),
+        KeyReport::default()
+    );
+    // The removal undoes nothing: putting the topic back or adding Quinn
+    // again in the same commit is not Pat's to do.
+    discard_own_commit(&pat.provider, &mut p).unwrap();
     let mut back = conversation(&p).unwrap();
     back.topic = String::new();
-    let repair = Changes {
-        remove: vec![mia_leaf],
-        add: vec![quinn.key_package(false)],
-        conversation: Some(back.clone()),
-        ..Changes::default()
-    };
-    let out = pat.commit(&mut p, repair);
-    let verdict = owen.receive(&mut o, &out).1.unwrap();
-    assert_eq!(verdict.repairs, vec![mia_leaf]);
-    assert!(verdict.authority);
-    discard_own_commit(&pat.provider, &mut p).unwrap();
-    // Without the removal, the same changes are not Pat's to make.
     let out = pat.commit(
         &mut p,
         Changes {
+            remove: vec![mia_leaf],
             add: vec![quinn.key_package(false)],
             conversation: Some(back.clone()),
             ..Changes::default()
@@ -1305,25 +1391,22 @@ fn impostor_repairs() {
     );
     assert!(owen.receive(&mut o, &out).1.is_err());
     discard_own_commit(&pat.provider, &mut p).unwrap();
-    // Nor may a repair change a field the impostor did not.
-    let mut other = back.clone();
-    other.name = "Ours".into();
-    let out = pat.commit(
-        &mut p,
+    // The owner undoes it in one ordinary commit, as his role allows.
+    let out = owen.commit(
+        &mut o,
         Changes {
             remove: vec![mia_leaf],
-            conversation: Some(other),
+            add: vec![quinn.key_package(false)],
+            conversation: Some(back),
             ..Changes::default()
         },
     );
-    assert!(matches!(
-        owen.receive(&mut o, &out).1,
-        Err(CommitError::Extension(_))
-    ));
+    let verdict = pat.receive(&mut p, &out).1.unwrap();
+    assert!(verdict.authority);
 }
 
-/// Moving the mailbox (7.8): any member, a commit that changes `box`
-/// alone.
+/// Moving the mailbox (7.8): any member, a commit that changes `box` alone,
+/// to the box derived from the epoch's exporter.
 #[test]
 fn mailbox_moves() {
     let Room3 {
@@ -1334,17 +1417,38 @@ fn mailbox_moves() {
         facts,
         ..
     } = private_room();
+    let derived = moved_box::<()>(&o, owen.provider.crypto()).unwrap();
+    let exported = o
+        .export_secret(owen.provider.crypto(), "risala/1 box", b"", 16)
+        .unwrap();
+    assert_eq!(derived.to_vec(), exported);
+    // A move to any other box is invalid.
+    let mut elsewhere = conversation(&p).unwrap();
+    elsewhere.mailbox = [0x77; 16];
     let out = pat.commit(
         &mut p,
         Changes {
-            move_box: Some([0x77; 16]),
+            conversation: Some(elsewhere),
+            ..Changes::default()
+        },
+    );
+    assert!(matches!(
+        owen.receive(&mut o, &out).1,
+        Err(CommitError::Extension(_))
+    ));
+    discard_own_commit(&pat.provider, &mut p).unwrap();
+    let out = pat.commit(
+        &mut p,
+        Changes {
+            move_box: true,
             ..Changes::default()
         },
     );
     pat.merge(&mut p, &out);
     let verdict = owen.apply(&mut o, &out, &facts);
     assert!(!verdict.authority);
-    assert_eq!(conversation(&o).unwrap().mailbox, [0x77; 16]);
+    assert_eq!(conversation(&o).unwrap().mailbox, derived);
+    assert_eq!(conversation(&p).unwrap().mailbox, derived);
 }
 
 /// Update proposals in an epochal group (12.10): a leaf rotates its key
@@ -1361,7 +1465,7 @@ fn update_proposals() {
         facts,
     } = private_room();
     // Updates are not allowed in a pairwise group.
-    assert!(propose_update(&pat.provider, &mut p, pat.pseudonym, &pat.profile(), None).is_err());
+    assert!(propose_update(&pat.provider, &mut p, &pat.profile(), None).is_err());
     // The owner moves the room to epochal.
     let mut epochal = conversation(&o).unwrap();
     epochal.confirm = ConfirmMode::Epochal;
@@ -1382,12 +1486,15 @@ fn update_proposals() {
     let update = propose_update(
         &pat.provider,
         &mut p,
-        pat.pseudonym,
         &pat.profile_at(next_day),
         Some(&new_key),
     )
     .unwrap();
     private_framing(&update.message, ContentType::Proposal);
+    // Pat notes the `t` of his own proposal's post too, once posted.
+    let mut state = pat.state(&p);
+    state.note_proposal(&update.reference, next_day);
+    pat.set_state(&p, state);
     assert_eq!(
         owen.propose_in(&mut o, &update.message, next_day),
         ProposalKind::Update
@@ -1421,7 +1528,6 @@ fn update_proposals() {
     let update = propose_update(
         &pat.provider,
         &mut p,
-        pat.pseudonym,
         &pat.profile_at(next_day + HOUR),
         Some(&again),
     )
@@ -1455,23 +1561,21 @@ fn last_resort_key_packages() {
         out_a.welcome.as_ref().unwrap(),
         None,
         &bob.expect(),
-        now_ms(),
     )
     .unwrap();
     assert!(joined.last_resort);
     let mut b1 = joined.group;
-    bob.set_history(&b1, joined.history);
+    bob.set_state(&b1, joined.state);
     let joined = join_by_welcome(
         &bob.provider,
         out_c.welcome.as_ref().unwrap(),
         None,
         &bob.expect(),
-        now_ms(),
     )
     .unwrap();
     assert!(joined.last_resort);
     let mut b2 = joined.group;
-    bob.set_history(&b2, joined.history);
+    bob.set_state(&b2, joined.state);
     // Both leaves share the leaf key, so Bob commits a new one in each
     // before he sends (12.3).
     let shared = b1.own_leaf_node().unwrap().signature_key().clone();
@@ -1623,13 +1727,12 @@ fn public_room_joins() {
     assert_eq!(s.members().count(), 3);
     // A guest's leaf may not commit in a public room (12.6).
     let mut s = s;
-    let history = sam.history(&s);
+    let state = sam.state(&s);
     let out = commit(
         &sam.provider,
         &mut s,
-        sam.pseudonym,
         &sam.profile(),
-        &history,
+        &state,
         Changes::default(),
     )
     .unwrap();
@@ -1637,67 +1740,276 @@ fn public_room_joins() {
     assert_eq!(verdict, Err(CommitError::Guest));
     // Nobody adds a device to a public room by value (6.1).
     let erin = Device::new("erin@example.org", 5);
-    let history = owen.history(&o);
+    let state = owen.state(&o);
     assert!(
         commit(
             &owen.provider,
             &mut o,
-            owen.pseudonym,
             &owen.profile(),
-            &history,
+            &state,
             add(vec![erin.key_package(false)])
+        )
+        .is_err()
+    );
+    // Public rooms do not move (7.8).
+    assert!(
+        commit(
+            &owen.provider,
+            &mut o,
+            &owen.profile(),
+            &state,
+            Changes {
+                move_box: true,
+                ..Changes::default()
+            }
         )
         .is_err()
     );
 }
 
-/// A public room's earlier leaf of a device that joined again may be
-/// removed once inactive for 48 hours (12.7).
+/// The server's side of a public room (12.6): its group and the state of
+/// its epoch.
+struct Server {
+    crypto: RisalaCrypto,
+    storage: MemoryStorage,
+    group: PublicGroup,
+    state: EpochState,
+}
+
+impl Server {
+    /// The server, holding `device`'s view of the room.
+    fn of(device: &Device, group: &MlsGroup) -> Server {
+        let crypto = RisalaCrypto::new().unwrap();
+        let storage = MemoryStorage::default();
+        let (group_info, tree) = public_state(device, group);
+        let public = public_group(&crypto, &storage, &group_info, &tree).unwrap();
+        Server {
+            crypto,
+            storage,
+            group: public,
+            state: device.state(group),
+        }
+    }
+
+    /// Checks a commit as the server does; if `keep`, takes it.
+    fn sees(
+        &mut self,
+        message: &[u8],
+        t: u64,
+        next: [u8; 48],
+        keep: bool,
+    ) -> Result<Verdict, CommitError> {
+        use openmls::prelude::ProcessedMessageContent;
+        let processed = self
+            .group
+            .process_message(
+                &self.crypto,
+                crate::wire::read_protocol_message(message).unwrap(),
+            )
+            .unwrap();
+        let sender = processed.sender().clone();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("not a commit");
+        };
+        let view = crate::checks::CommitView::of(&sender, &staged, std::iter::empty());
+        let verdict = crate::checks::check_commit(
+            &GroupView::of(&self.group, &self.state),
+            &view,
+            &self.state.post(t, Some(next)),
+        )?;
+        if keep {
+            let key = staged
+                .update_path_leaf_node()
+                .map(|leaf| leaf.signature_key().as_slice().to_vec());
+            self.group.merge_commit(&self.storage, *staged).unwrap();
+            // The committer started the new epoch; an external committer by
+            // its new leaf.
+            let started = match sender {
+                openmls::prelude::Sender::Member(index) => index,
+                _ => {
+                    self.group
+                        .members()
+                        .find(|m| Some(&m.signature_key) == key.as_ref())
+                        .unwrap()
+                        .index
+                }
+            };
+            self.state = EpochState::started_by(started);
+        }
+        Ok(verdict)
+    }
+
+    fn tree(&self) -> Vec<u8> {
+        tree_to_bytes(&self.group.export_ratchet_tree())
+    }
+}
+
+/// A public room's Welcome carries no tree; the joiner takes the one that
+/// WELCOME GET hands out with it, and MLS checks it against the tree hash
+/// in the Welcome's group context (12.6, 12.8).
 #[test]
-fn public_room_inactive_leaves() {
+fn public_room_welcome_trees() {
     let (owen, mut o, _) = public_room(GuestMode::Write);
     let dave = Device::new("dave@example.org", 4);
-    let facts = Facts::default();
-    let d = join_room(&dave, (&owen, &mut o), vec![], &facts);
-    let dave_leaf = d.own_leaf_index();
-    let dave2 = dave.again();
-    let d2 = join_room(&dave2, (&owen, &mut o), vec![], &facts);
-    assert_eq!(d2.members().count(), 3);
-    // Owen removes Dave's earlier leaf: not while it is active. The server,
-    // which saw every commit, refuses it; so does Owen's own history.
-    let check_as_owen = |o: &MlsGroup, out: &CommitOutput, t: u64| {
-        let view = crate::checks::GroupView::of(o.public_group());
-        let staged = o.pending_commit().unwrap();
-        let commit_view = crate::checks::CommitView::of(
-            &openmls::prelude::Sender::Member(o.own_leaf_index()),
-            staged,
-            o.pending_proposals(),
-        );
-        crate::checks::check_commit(&view, &commit_view, &owen.history(o), &post(out, t))
-    };
-    let out = owen.commit(&mut o, remove(vec![dave_leaf]));
-    assert_eq!(check_as_owen(&o, &out, now_ms()), Err(CommitError::Remove));
-    // Dave's second device joined since, and cannot rule out a resync in
-    // the last 24 hours that Dave's first leaf did not follow: it applies
-    // the commit (12.7).
-    let mut d2 = d2;
-    let (_, verdict) = dave2.receive(&mut d2, &out);
-    assert_eq!(verdict.unwrap().unchecked, vec!["a removal after a resync"]);
-    discard_own_commit(&owen.provider, &mut o).unwrap();
-    // 49 hours later, it is inactive, for everyone.
-    let later = now_ms() + 49 * HOUR;
-    let out = owen.commit_at(&mut o, remove(vec![dave_leaf]), later);
-    assert_eq!(
-        check_as_owen(&o, &out, later).unwrap().unchecked,
-        Vec::<&str>::new()
+    let erin = Device::new("erin@example.org", 5);
+    let frank = Device::new("frank@example.org", 6);
+    let (group_info, tree) = public_state(&owen, &o);
+    for device in [&dave, &erin, &frank] {
+        let join = join_public_room(
+            &device.provider,
+            &device.identity(),
+            Some(&device.profile()),
+            &group_info,
+            &tree,
+            &public_expect(device),
+        )
+        .unwrap();
+        owen.propose_in(&mut o, &join.message, now_ms());
+    }
+    // One commit, and one Welcome for the whole batch (12.8).
+    let out = owen.commit(&mut o, Changes::default());
+    assert_eq!(out.added.len(), 3);
+    let welcome = out.welcome.clone().unwrap();
+    owen.merge(&mut o, &out);
+    // Without a tree, Erin cannot join.
+    assert!(join_by_welcome(&erin.provider, &welcome, None, &public_expect(&erin)).is_err());
+    // The tree of the epoch before the commit does not match the hash.
+    assert!(
+        join_by_welcome(
+            &frank.provider,
+            &welcome,
+            Some(&tree),
+            &public_expect(&frank)
+        )
+        .is_err()
     );
-    let (_, verdict) = dave2.receive_post(&mut d2, &out.message, &post(&out, later));
-    assert_eq!(verdict.unwrap().unchecked, Vec::<&str>::new());
+    let right = tree_to_bytes(&o.export_ratchet_tree());
+    let d = dave.join_with_tree(&welcome, Some(&right));
+    assert_eq!(d.members().count(), 4);
+    assert_eq!(dave.state(&d).started_by, Some(o.own_leaf_index().u32()));
+
+    // Outside public rooms the Welcome carries the tree, and a tree from
+    // the server is refused.
+    let alice = Device::new("alice@example.org", 1);
+    let bob = Device::new("bob@example.org", 2);
+    let mut a = alice.create(&RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid));
+    let out = alice.commit(&mut a, add(vec![bob.key_package(false)]));
+    alice.merge(&mut a, &out);
+    let tree = tree_to_bytes(&a.export_ratchet_tree());
+    assert!(matches!(
+        join_by_welcome(
+            &bob.provider,
+            out.welcome.as_ref().unwrap(),
+            Some(&tree),
+            &bob.expect()
+        ),
+        Err(GroupError::Group(_))
+    ));
+}
+
+/// Outside public rooms, a commit or proposal carries its sender's
+/// pseudonym for the epoch (7.3), and devices refuse any other.
+#[test]
+fn handshake_pseudonyms() {
+    let Room3 {
+        owen,
+        pat,
+        mut o,
+        mut p,
+        ..
+    } = private_room();
+    // A SelfRemove under another pseudonym, as a faulty device could post.
+    let key = own_leaf_key(&pat.provider, &p).unwrap();
+    p.set_aad(RisalaAad::handshake(owen.pseudonym(&o)).encode());
+    let forged = p.leave_group_via_self_remove(&pat.provider, &key).unwrap();
+    assert!(matches!(
+        process_message(&owen.provider, &mut o, &to_bytes(&forged)),
+        Err(ProcessError::Pseudonym)
+    ));
+    // Every leaf's pseudonym differs, and changes with each epoch.
+    let before = owen.pseudonym(&o);
+    assert_ne!(before, pat.pseudonym(&p));
+    let pseudonyms = epoch_pseudonyms::<()>(&o, owen.provider.crypto()).unwrap();
+    assert_eq!(pseudonyms.epoch, o.epoch().as_u64());
+    assert_eq!(pseudonyms.of(o.own_leaf_index().u32()), Some(before));
+    assert_eq!(pseudonyms.leaves.len(), 3);
+}
+
+/// Copies in a public room (12.7): a device that joined again has its
+/// earlier leaf removed, by anyone, once its new leaf has committed.
+#[test]
+fn public_room_copies() {
+    let (owen, mut o, _) = public_room(GuestMode::Write);
+    let dave = Device::new("dave@example.org", 4);
+    let erin = Device::new("erin@example.org", 5);
+    let facts = Facts::default();
+    let mut d = join_room(&dave, (&owen, &mut o), vec![], &facts);
+    let mut e = join_room(&erin, (&owen, &mut o), vec![(&dave, &mut d)], &facts);
+    // Dave's first device commits once, so its leaf is in use.
+    let t = now_ms();
+    let out = dave.commit_at(&mut d, Changes::default(), t);
+    dave.merge(&mut d, &out);
+    owen.apply_at(&mut o, &out, &facts, t);
+    erin.apply_at(&mut e, &out, &facts, t);
+    let dave_leaf = d.own_leaf_index();
+    // Dave joins again from a new device state: two leaves of one device.
+    let dave2 = dave.again();
+    let mut d2 = join_room(
+        &dave2,
+        (&owen, &mut o),
+        vec![(&erin, &mut e), (&dave, &mut d)],
+        &facts,
+    );
+    let dave2_leaf = d2.own_leaf_index();
+    // Erin, a plain member, may not remove Dave's earlier leaf yet: the new
+    // one has not committed, so the earlier is no copy.
+    let out = erin.commit_at(&mut e, remove(vec![dave_leaf]), t);
+    assert_eq!(
+        owen.receive_post(&mut o, &out.message, &post(&out, t)).1,
+        Err(CommitError::Remove)
+    );
+    discard_own_commit(&erin.provider, &mut e).unwrap();
+    // Nor the new one, which has never committed, before 8 days; Owen, an
+    // owner, may, without kicking Dave.
+    let out = erin.commit_at(&mut e, remove(vec![dave2_leaf]), t);
+    assert_eq!(
+        owen.receive_post(&mut o, &out.message, &post(&out, t)).1,
+        Err(CommitError::Remove)
+    );
+    discard_own_commit(&erin.provider, &mut e).unwrap();
+    let out = owen.commit_at(&mut o, remove(vec![dave2_leaf]), t);
+    assert!(
+        erin.receive_post(&mut e, &out.message, &post(&out, t))
+            .1
+            .unwrap()
+            .authority
+    );
+    discard_own_commit(&owen.provider, &mut o).unwrap();
+    // The new leaf commits: now anyone may remove the earlier one as a copy.
+    let t2 = t + 60_000;
+    let out = dave2.commit_at(&mut d2, Changes::default(), t2);
+    dave2.merge(&mut d2, &out);
+    for (device, group) in [(&owen, &mut o), (&erin, &mut e), (&dave, &mut d)] {
+        device.apply_at(group, &out, &facts, t2);
+    }
+    let out = erin.commit_at(&mut e, remove(vec![dave_leaf]), t2);
+    let verdict = owen
+        .receive_post(&mut o, &out.message, &post(&out, t2))
+        .1
+        .unwrap();
+    assert!(!verdict.authority);
+    discard_own_commit(&erin.provider, &mut e).unwrap();
+    // Dave's new device may too, as its own identity's.
+    let out = dave2.commit_at(&mut d2, remove(vec![dave_leaf]), t2);
+    owen.receive_post(&mut o, &out.message, &post(&out, t2))
+        .1
+        .unwrap();
 }
 
 /// A resync commit (12.7): after the server accepted a commit that the
 /// devices hold invalid, one device rejoins by external commit, removing
-/// the committer.
+/// the committer; an owner whose proposals nobody commits rejoins by
+/// external commit too; nobody else commits externally.
 #[test]
 fn public_room_resync() {
     let (owen, mut o, _) = public_room(GuestMode::Write);
@@ -1706,12 +2018,8 @@ fn public_room_resync() {
     let facts = Facts::default();
     let mut d = join_room(&dave, (&owen, &mut o), vec![], &facts);
     let mut e = join_room(&erin, (&owen, &mut o), vec![(&dave, &mut d)], &facts);
-    let crypto = RisalaCrypto::new().unwrap();
-    // The server holds the room's public state and its history.
-    let (group_info, tree) = public_state(&owen, &o);
-    let storage = MemoryStorage::default();
-    let mut server = public_group(&crypto, &storage, &group_info, &tree).unwrap();
-    let mut server_history = owen.history(&o);
+    // The server holds the room's public state.
+    let mut server = Server::of(&owen, &o);
 
     // Dave commits with a wrong `next`. The server cannot tell, and
     // accepts it; Owen and Erin refuse it.
@@ -1722,154 +2030,125 @@ fn public_room_resync() {
         let (_, verdict) = device.receive(group, &bad);
         assert_eq!(verdict, Err(CommitError::NextToken));
     }
-    let server_sees =
-        |server: &mut PublicGroup, history: &mut History, out: &[u8], post: &CommitPost| {
-            use openmls::prelude::ProcessedMessageContent;
-            let processed = server
-                .process_message(&crypto, crate::wire::read_protocol_message(out).unwrap())
-                .unwrap();
-            let sender = processed.sender().clone();
-            let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content()
-            else {
-                panic!("not a commit");
-            };
-            let before = crate::checks::GroupView::of(server);
-            let view = crate::checks::CommitView::of(&sender, &staged, std::iter::empty());
-            let verdict = crate::checks::check_commit(&before, &view, history, post).unwrap();
-            server.merge_commit(&storage, *staged).unwrap();
-            let after = crate::checks::GroupView::of(server);
-            history.record(&before, &view, &verdict, &after, post);
-            verdict
-        };
     let t = now_ms();
-    server_sees(
-        &mut server,
-        &mut server_history,
-        &bad.message,
-        &post(&bad, t),
-    );
-    dave.merge_at(&mut d, &bad, t);
+    server.sees(&bad.message, t, [0; 48], true).unwrap();
+    dave.merge(&mut d, &bad);
     assert_ne!(right, [0; 48]);
+    assert_eq!(server.state.started_by, Some(d.own_leaf_index().u32()));
 
     // Erin resyncs from the server's GroupInfo, signed by Dave, after
     // checking that the server changed no roles or settings (12.7).
     let dave_leaf = d.own_leaf_index();
     let owen_leaf = o.own_leaf_index();
     let group_info = bad.group_info.clone().unwrap();
-    let tree = tree_to_bytes(&server.export_ratchet_tree());
+    let tree = server.tree();
     let kept = conversation(&e).unwrap();
     let scratch = MemoryStorage::default();
-    let theirs =
-        crate::checks::GroupView::of(&public_group(&crypto, &scratch, &group_info, &tree).unwrap())
-            .conversation
-            .unwrap();
+    let theirs = GroupView::of(
+        &public_group(&server.crypto, &scratch, &group_info, &tree).unwrap(),
+        &EpochState::default(),
+    )
+    .conversation
+    .unwrap();
     assert!(kept.unexplained_changes(&theirs).is_empty());
     let erin2 = erin.again();
-    let resync = resync_public_room(
+    let resync = external_commit(
         &erin2.provider,
         &erin.identity(),
         &erin.profile_at(t),
         &group_info,
         &tree,
         &public_expect(&erin),
+        External::Resync,
         &[],
-        t,
     )
     .unwrap();
     let (framing, aad) = read_post(&resync.message).unwrap();
     assert_eq!(framing.sender, Some(Sender::NewMemberCommit));
     assert_eq!(aad, RisalaAad::public());
-    let resync_post = CommitPost {
-        t,
-        next: Some(resync.next_token_hash),
-    };
     // The server checks it as a resync commit, which removes Dave.
-    let verdict = server_sees(
-        &mut server,
-        &mut server_history,
-        &resync.message,
-        &resync_post,
-    );
-    assert!(verdict.resync);
+    let verdict = server
+        .sees(&resync.message, t, resync.next_token_hash, true)
+        .unwrap();
+    assert_eq!(verdict.external, Some(External::Resync));
     let dave_identity = dave.identity();
-    let server_view = crate::checks::GroupView::of(&server);
-    assert!(server_view.leaf(dave_leaf).is_some());
+    let server_view = GroupView::of(&server.group, &server.state);
     assert!(
         server_view
             .leaves
             .iter()
             .all(|leaf| leaf.identity.as_ref() != Some(&dave_identity))
     );
+    assert_eq!(
+        server.state.started_by,
+        Some(resync.group.own_leaf_index().u32())
+    );
     // Dave's device, which applied its own commit, sees that it was
     // removed.
+    let resync_post = CommitPost::at(t, Some(resync.next_token_hash));
     let (received, verdict) = dave.receive_post(&mut d, &resync.message, &resync_post);
-    let verdict = verdict.unwrap();
-    assert!(verdict.resync);
-    assert!(!dave.apply_received(&mut d, *received, &verdict, &resync_post));
+    assert_eq!(verdict.unwrap().external, Some(External::Resync));
+    assert!(!dave.apply_received(&mut d, *received));
+    let r = resync.group;
+    erin2.set_state(&r, resync.state);
+    let _ = dave_leaf;
 
-    // Within 24 hours, Erin's new leaf, a plain member's, may remove
-    // Owen's, which could not follow: it has neither committed nor been
-    // added since the resync commit. A day later it may not.
-    let mut r = resync.group;
-    erin2.set_history(&r, resync.history);
-    for (when, ok) in [(t + HOUR, true), (t + 25 * HOUR, false)] {
-        let out = erin2.commit_at(&mut r, remove(vec![owen_leaf]), when);
-        let processed = server
-            .process_message(
-                &crypto,
-                crate::wire::read_protocol_message(&out.message).unwrap(),
-            )
-            .unwrap();
-        let sender = processed.sender().clone();
-        let openmls::prelude::ProcessedMessageContent::StagedCommitMessage(staged) =
-            processed.into_content()
-        else {
-            panic!("not a commit");
-        };
-        let view = crate::checks::CommitView::of(&sender, &staged, std::iter::empty());
-        let verdict = crate::checks::check_commit(
-            &crate::checks::GroupView::of(&server),
-            &view,
-            &server_history,
-            &post(&out, when),
-        );
-        assert_eq!(verdict.is_ok(), ok, "{verdict:?}");
-        discard_own_commit(&erin2.provider, &mut r).unwrap();
-    }
-    // An external commit that is not a resync, here by an identity with no
-    // leaf, is refused.
+    // Owen's device cannot follow either. Owen, an owner, rejoins by
+    // external commit, removing his own earlier leaf (12.7).
     let (group_info, tree) = public_state(&erin2, &r);
-    let frank = Device::new("frank@example.org", 6);
-    let join = resync_public_room(
-        &frank.provider,
-        &frank.identity(),
-        &frank.profile(),
+    let owen2 = owen.again();
+    let rejoin = external_commit(
+        &owen2.provider,
+        &owen.identity(),
+        &owen.profile_at(t),
         &group_info,
         &tree,
-        &public_expect(&frank),
-        &[],
-        t,
+        &public_expect(&owen),
+        External::Rejoin,
+        &[owen_leaf],
     )
     .unwrap();
-    let mut owen_view = server_history.clone();
-    owen_view.since_epoch = 0;
-    let processed = server.process_message(
-        &crypto,
-        crate::wire::read_protocol_message(&join.message).unwrap(),
+    let verdict = server
+        .sees(&rejoin.message, t, rejoin.next_token_hash, false)
+        .unwrap();
+    assert_eq!(verdict.external, Some(External::Rejoin));
+    // Frank, with no leaf and no role, may do neither.
+    let frank = Device::new("frank@example.org", 6);
+    for kind in [External::Resync, External::Rejoin] {
+        let join = external_commit(
+            &frank.provider,
+            &frank.identity(),
+            &frank.profile(),
+            &group_info,
+            &tree,
+            &public_expect(&frank),
+            kind,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            server.sees(&join.message, t, join.next_token_hash, false),
+            Err(CommitError::External)
+        );
+    }
+    // Nor may Erin "rejoin" without removing the leaf that started the
+    // epoch: she has no role.
+    let erin3 = erin.again();
+    let join = external_commit(
+        &erin3.provider,
+        &erin.identity(),
+        &erin.profile_at(t),
+        &group_info,
+        &tree,
+        &public_expect(&erin),
+        External::Rejoin,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        server.sees(&join.message, t, join.next_token_hash, false),
+        Err(CommitError::External)
     );
-    // The server's group is an epoch behind Erin's own (her commits above
-    // were discarded), so it may not process it; check from Erin's side.
-    drop(processed);
-    let (_, verdict) = erin2.receive_post(
-        &mut r,
-        &join.message,
-        &CommitPost {
-            t,
-            next: Some(join.next_token_hash),
-        },
-    );
-    assert_eq!(verdict, Err(CommitError::External));
-    let _ = (owen_view, &owen);
 }
 
 /// What a server does with a public room's commit (12.6): it holds the
@@ -1914,14 +2193,14 @@ fn server_checks_public_commits() {
     let storage = MemoryStorage::default();
     let mut public = public_group(&crypto, &storage, &group_info, &tree).unwrap();
     assert_eq!(public.members().count(), 2);
-    let mut history = owen.history(&o);
+    let mut state = owen.state(&o);
 
     let mut d = dave.join_with_tree(
         out.welcome.as_ref().unwrap(),
         Some(&tree_to_bytes(&o.export_ratchet_tree())),
     );
     let server_sees =
-        |public: &PublicGroup, message: &[u8], history: &History, post: &CommitPost| {
+        |public: &PublicGroup, message: &[u8], state: &EpochState, post: &CommitPost| {
             let processed = public
                 .process_message(&crypto, read_protocol_message(message).unwrap())
                 .unwrap();
@@ -1931,8 +2210,8 @@ fn server_checks_public_commits() {
                 panic!("not a commit");
             };
             let view = CommitView::of(&sender, &staged, std::iter::empty());
-            let verdict = check_commit(&GroupView::of(public), &view, history, post);
-            (staged, view, verdict)
+            let verdict = check_commit(&GroupView::of(public, state), &view, post);
+            (staged, verdict)
         };
     // A member's commit that changes what it may not is refused.
     let mut guests = conversation(&d).unwrap();
@@ -1944,30 +2223,23 @@ fn server_checks_public_commits() {
             ..Changes::default()
         },
     );
-    let (_, _, verdict) = server_sees(&public, &out.message, &history, &post(&out, now_ms()));
+    let (_, verdict) = server_sees(&public, &out.message, &state, &post(&out, now_ms()));
     assert!(matches!(verdict, Err(CommitError::Extension(_))));
     discard_own_commit(&dave.provider, &mut d).unwrap();
     // Dave's refresh is fine, and the server keeps the new state.
     let out = dave.commit(&mut d, Changes::default());
     let t = now_ms();
-    let before = GroupView::of(&public);
-    let (staged, view, verdict) = server_sees(&public, &out.message, &history, &post(&out, t));
-    let verdict = verdict.unwrap();
+    let (staged, verdict) = server_sees(&public, &out.message, &state, &post(&out, t));
+    verdict.unwrap();
     public.merge_commit(&storage, *staged).unwrap();
-    history.record(
-        &before,
-        &view,
-        &verdict,
-        &GroupView::of(&public),
-        &post(&out, t),
-    );
+    state = EpochState::started_by(d.own_leaf_index());
     dave.merge(&mut d, &out);
     owen.apply(&mut o, &out, &Facts::default());
     assert_eq!(
         tree_to_bytes(&public.export_ratchet_tree()),
         tree_to_bytes(&o.export_ratchet_tree())
     );
-    assert_eq!(history.started_by, Some(d.own_leaf_index().u32()));
+    assert_eq!(state, owen.state(&o));
     // The GroupInfo's signer is the committer.
     let info = crate::wire::read_group_info(out.group_info.as_ref().unwrap()).unwrap();
     assert_eq!(info.signer(), d.own_leaf_index());
@@ -2029,7 +2301,7 @@ fn sqlite_storage() {
     let out = alice.commit(&mut a, add(vec![kp]));
     alice.merge(&mut a, &out);
 
-    let (group_id, mut history) = {
+    let (group_id, mut state) = {
         let tx = db.transaction().unwrap();
         let provider = Provider::with_crypto(
             crypto.clone(),
@@ -2040,14 +2312,13 @@ fn sqlite_storage() {
             out.welcome.as_ref().unwrap(),
             None,
             &bob.expect(),
-            now_ms(),
         )
         .unwrap();
         assert!(joined.last_resort);
         let id = joined.group.group_id().clone();
         drop(provider);
         tx.commit().unwrap();
-        (id, joined.history)
+        (id, joined.state)
     };
 
     // A commit in a transaction that is rolled back leaves nothing behind;
@@ -2066,44 +2337,45 @@ fn sqlite_storage() {
         let out = commit(
             &provider,
             &mut b,
-            bob.pseudonym,
             &bob.profile(),
-            &history,
+            &state,
             Changes {
                 new_leaf_key: true,
                 ..Changes::default()
             },
         )
         .unwrap();
-        let mut h = history.clone();
-        merge_own_commit(&provider, &mut b, &mut h, &post(&out, now_ms())).unwrap();
+        let mut next = state.clone();
+        merge_own_commit(&provider, &mut b, &mut next).unwrap();
+        let own = b.own_leaf_index();
         drop(provider);
         if keep {
             tx.commit().unwrap();
-            history = h;
+            state = next;
+            assert_eq!(state.started_by, Some(own.u32()));
             alice.apply(&mut a, &out, &Facts::with(&[&alice, &bob]));
         } else {
             tx.rollback().unwrap();
         }
     }
-    assert_eq!(history.commits.len(), 1);
-    // The history round-trips through serde, as librisala keeps it.
-    let json = serde_json_like(&history);
+    // The epoch's state round-trips through serde, as librisala keeps it.
+    let json = serde_json_like(&state);
     assert!(!json.is_empty());
     let provider = Provider::with_crypto(crypto, SqliteStorageProvider::<MsgPack, _>::new(&db));
     let mut b = MlsGroup::load(provider.storage(), &group_id)
         .unwrap()
         .unwrap();
     assert_eq!(b.epoch().as_u64(), 2);
-    let aad = RisalaAad::application(bob.pseudonym, [1; 48]);
+    let pseudonym = own_pseudonym::<()>(&b, provider.crypto()).unwrap();
+    let aad = RisalaAad::application(pseudonym, [1; 48]);
     let message = encrypt_application(&provider, &mut b, &aad, b"from sqlite").unwrap();
     assert_eq!(alice.read(&mut a, &message).1, b"from sqlite");
 }
 
-/// The History serialises, for librisala to keep with the group.
-fn serde_json_like(history: &History) -> Vec<u8> {
-    let bytes = serde_json::to_vec(history).unwrap();
-    let back: History = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(&back, history);
+/// The EpochState serialises, for librisala to keep with the group.
+fn serde_json_like(state: &EpochState) -> Vec<u8> {
+    let bytes = serde_json::to_vec(state).unwrap();
+    let back: EpochState = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(&back, state);
     bytes
 }

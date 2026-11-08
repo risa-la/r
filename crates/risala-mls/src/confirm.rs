@@ -841,8 +841,17 @@ impl Confirmer {
             .count()
     }
 
-    /// This device's leaf has a new signature key, and in an epochal
-    /// group, a new pseudonym (12.3, 7.3), now in effect.
+    /// This device's leaf has a new pseudonym (7.3), with no new key:
+    /// outside public rooms, call it after every commit, with the
+    /// pseudonym derived from the new epoch
+    /// ([`crate::group::own_pseudonym`]), since ATTEST carries the
+    /// pseudonym of the message it is in (12.10).
+    pub fn pseudonym_changed(&mut self, pseudonym: Pseudonym) {
+        self.own.pseudonym = pseudonym.0;
+    }
+
+    /// This device's leaf has a new signature key, and in a public room, a
+    /// new pseudonym (12.3, 7.3), now in effect.
     pub fn own_leaf_changed(&mut self, signature_key: &[u8], pseudonym: Pseudonym, now: Timestamp) {
         self.own.key = signature_key.to_vec();
         self.own.pseudonym = pseudonym.0;

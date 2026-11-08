@@ -18,9 +18,11 @@
 //!   messages for at most 1,000 generations, and pads messages to 256
 //!   bytes (12.9).
 //!
-//! Each operation that posts sets the RisalaAAD (12.9): the leaf's
-//! pseudonym (7.3), which the caller keeps with the group, in a
-//! PrivateMessage, and none in a public room's PublicMessages.
+//! Each operation that posts sets the RisalaAAD (12.9): in a
+//! PrivateMessage outside public rooms, the leaf's pseudonym derived from
+//! the epoch ([`leaf_pseudonym`], 7.3); none in a public room's
+//! PublicMessages; and in a public room's application messages, the
+//! period's random pseudonym, which the caller keeps.
 //!
 //! **Commits and the first valid commit.** A device makes a commit with
 //! [`commit`], which leaves it pending, and posts it with
@@ -32,8 +34,9 @@
 //! [`ReceivedCommit`] to check with [`check_received_commit`] (the group
 //! checks, with the post's `t` and `next`) and [`check_received_keys`]
 //! (the key checks), then apply with [`apply_commit`], or to drop if it is
-//! invalid. The caller keeps a [`History`] with each group for the checks
-//! that look back, which these functions update.
+//! invalid. The caller keeps an [`EpochState`] with each group, which
+//! these functions update; the group checks depend on nothing else the
+//! device remembers (12.7).
 
 use openmls::group::{
     CommitBuilderStageError, CreateCommitError, ExternalCommitBuilderError,
@@ -55,11 +58,14 @@ use openmls_traits::random::OpenMlsRand;
 use openmls_traits::storage::StorageProvider as _;
 
 use crate::CIPHERSUITE;
-use crate::aad::{AadError, Pseudonym, RisalaAad};
+use crate::aad::{
+    AadError, EpochPseudonyms, PSEUDONYM_LABEL, PSEUDONYM_LEN, Pseudonym, RisalaAad,
+    pseudonym_context,
+};
 use crate::binding::DEVICE_BINDING_EXTENSION;
 use crate::checks::{
-    CommitError, CommitPost, CommitView, GroupView, History, JoinError, JoinExpectation, KeyFacts,
-    KeyReport, ResyncState, Verdict, check_commit, check_join, key_checks,
+    CommitError, CommitPost, CommitView, Committer, EpochState, External, GroupView, JoinError,
+    JoinExpectation, KeyFacts, KeyReport, Seen, Verdict, check_commit, check_join, key_checks,
 };
 use crate::conversation::{
     CONVERSATION_EXTENSION, ConfirmMode, ConversationKind, RisalaConversation,
@@ -77,13 +83,18 @@ use crate::wire::{WireError, read_group_info, read_protocol_message, read_tree, 
 
 /// How many past epochs a device keeps the secrets of, at most (12.9).
 /// [`crate::message::expire_past_epochs`] deletes them sooner, an hour
-/// after the commit that ended them.
+/// after the commit that ended them by the posts' `t`, and
+/// [`crate::message::expire_past_epochs_by_clock`] 2 hours after the device
+/// applied it.
 pub const MAX_PAST_EPOCHS: usize = 2;
 
 /// How many generations behind the newest one a device keeps the keys of
 /// skipped messages for, from each sender, and how far ahead it accepts a
 /// message: 1,000 (12.9).
 pub const MAX_SKIPPED_GENERATIONS: u32 = 1_000;
+
+/// The MLS exporter label of the box a mailbox moves to (7.8, 15).
+pub const BOX_LABEL: &str = "risala/1 box";
 
 /// The multiple of bytes that PrivateMessage contents are padded to
 /// (12.9).
@@ -179,16 +190,6 @@ pub fn join_config(kind: ConversationKind) -> MlsGroupJoinConfig {
         .build()
 }
 
-/// The RisalaAAD of a commit or proposal in a group of `kind` (12.9, 7.3):
-/// the pseudonym in a PrivateMessage, none in a public room's
-/// PublicMessage.
-pub fn handshake_aad(kind: ConversationKind, pseudonym: Pseudonym) -> RisalaAad {
-    match kind {
-        ConversationKind::PublicRoom => RisalaAad::public(),
-        _ => RisalaAad::handshake(pseudonym),
-    }
-}
-
 /// The parameters of a leaf this device commits or proposes: the
 /// capabilities and the profile. A device binding is checked only where
 /// a leaf enters a group from a KeyPackage (12.3), so later leaf nodes
@@ -272,17 +273,102 @@ fn own_profile(group: &MlsGroup) -> Option<RisalaProfile> {
     group.own_leaf_node().and_then(RisalaProfile::of_leaf)
 }
 
+/// The pseudonym of the leaf at `index` in `group`'s current epoch, outside
+/// public rooms (7.3): MLS-Exporter("risala/1 pseudonym", leaf_index as a
+/// `uint32`, 16).
+pub fn leaf_pseudonym<E>(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+    index: LeafNodeIndex,
+) -> Result<Pseudonym, GroupError<E>> {
+    let bytes = group
+        .export_secret(
+            crypto,
+            PSEUDONYM_LABEL,
+            &pseudonym_context(index.u32()),
+            PSEUDONYM_LEN,
+        )
+        .map_err(mls)?;
+    Ok(Pseudonym(
+        bytes.try_into().expect("the exporter gives 16 bytes"),
+    ))
+}
+
+/// This device's own pseudonym in `group`'s current epoch, outside public
+/// rooms (7.3).
+pub fn own_pseudonym<E>(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<Pseudonym, GroupError<E>> {
+    leaf_pseudonym(group, crypto, group.own_leaf_index())
+}
+
+/// The pseudonyms of every leaf of `group`'s current epoch (7.3), to keep
+/// once the epoch is over (12.9); none in a public room, whose pseudonyms
+/// are not derived.
+pub fn epoch_pseudonyms<E>(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<EpochPseudonyms, GroupError<E>> {
+    let mut out = EpochPseudonyms {
+        epoch: group.epoch().as_u64(),
+        leaves: Vec::new(),
+    };
+    if kind_of::<E>(group)? == ConversationKind::PublicRoom {
+        return Ok(out);
+    }
+    for member in group.members() {
+        out.leaves.push((
+            member.index.u32(),
+            leaf_pseudonym(group, crypto, member.index)?,
+        ));
+    }
+    Ok(out)
+}
+
+/// The box that a move made in `group`'s current epoch goes to (7.8):
+/// MLS-Exporter("risala/1 box", "", 16).
+pub fn moved_box<E>(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<[u8; 16], GroupError<E>> {
+    let bytes = group
+        .export_secret(crypto, BOX_LABEL, b"", 16)
+        .map_err(mls)?;
+    Ok(bytes.try_into().expect("the exporter gives 16 bytes"))
+}
+
+/// `group` as of its current epoch, for the group checks (12.7): its public
+/// state, the leaf that started the epoch, and the box a move would go to.
+pub fn view(group: &MlsGroup, state: &EpochState, crypto: &impl OpenMlsCrypto) -> GroupView {
+    let mut view = GroupView::of(group.public_group(), state);
+    view.moved_box = moved_box::<()>(group, crypto).ok();
+    view
+}
+
+/// The RisalaAAD of a commit or proposal this device makes in `group` now
+/// (12.9, 7.3).
+fn own_handshake_aad<E>(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+    kind: ConversationKind,
+) -> Result<RisalaAad, GroupError<E>> {
+    Ok(match kind {
+        ConversationKind::PublicRoom => RisalaAad::public(),
+        _ => RisalaAad::handshake(own_pseudonym(group, crypto)?),
+    })
+}
+
 /// Creates the group of a new conversation (12.6): a new random 32-byte
 /// group id, this device the only member with a new leaf key, and
 /// `conversation` in the group context. The leaf key is stored with the
-/// group. The [`History`] starts at `t`, the device's clock.
+/// group, and the [`EpochState`] is the first epoch's.
 pub fn create_group<P: OpenMlsProvider>(
     provider: &P,
     identity: &RisalaIdentity,
     profile: &RisalaProfile,
     conversation: &RisalaConversation,
-    t: u64,
-) -> Result<(MlsGroup, LeafKey, History), GroupError<P::StorageError>> {
+) -> Result<(MlsGroup, LeafKey, EpochState), GroupError<P::StorageError>> {
     conversation
         .check()
         .map_err(|e| GroupError::Group(e.to_string()))?;
@@ -316,7 +402,7 @@ pub fn create_group<P: OpenMlsProvider>(
             identity.credential_with_key(leaf_key.public_key()),
         )
         .map_err(|e: NewGroupError<_>| mls(e))?;
-    Ok((group, leaf_key, History::created(t)))
+    Ok((group, leaf_key, EpochState::created()))
 }
 
 /// What a commit changes (12.6, 12.7). Proposals pending in the group are
@@ -333,9 +419,9 @@ pub struct Changes {
     /// A new conversation extension (6.2, 6.3, 6.4).
     pub conversation: Option<RisalaConversation>,
     /// A move to a new mailbox (7.8): a commit that changes the `box` of
-    /// the conversation extension and nothing else, with no other
-    /// proposal.
-    pub move_box: Option<[u8; 16]>,
+    /// the conversation extension to the one derived from the current
+    /// epoch ([`moved_box`]) and nothing else, with no other proposal.
+    pub move_box: bool,
     /// Whether to commit a new leaf key: right after joining with a
     /// last-resort KeyPackage, and, in an epochal group, once a period if
     /// an Update proposal has not been committed within 30 minutes
@@ -370,16 +456,15 @@ pub struct CommitOutput {
 /// pending in `group`. The committer's leaf gets `profile`, whose
 /// `updated` should be the current time (12.3), raised to the leaf's
 /// previous one if that is later, and the `streak` that 12.3 gives, from
-/// `history`. Post the commit with `next=`; then [`merge_own_commit`] if
-/// it wins, or [`discard_own_commit`].
+/// `state`. Post the commit with `next=`; then [`merge_own_commit`] if it
+/// wins, or [`discard_own_commit`].
 ///
 /// With no changes, it is the weekly fresh-leaf commit (12.7).
 pub fn commit<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
-    pseudonym: Pseudonym,
     profile: &RisalaProfile,
-    history: &History,
+    state: &EpochState,
     changes: Changes,
 ) -> Result<CommitOutput, GroupError<P::StorageError>> {
     let current =
@@ -390,13 +475,13 @@ pub fn commit<P: OpenMlsProvider>(
     let identity = own_identity(group)?;
     let own_index = group.own_leaf_index();
     let previous = own_profile(group);
-    let mut profile = profile
-        .clone()
-        .with_streak(history.expected_streak(own_index, previous.as_ref().map_or(0, |p| p.streak)));
+    let streak = GroupView::of(group.public_group(), state).expected_streak(&identity.uid);
+    let mut profile = profile.clone().with_streak(streak);
     if let Some(previous) = &previous {
         profile.updated = profile.updated.max(previous.updated);
     }
-    group.set_aad(handshake_aad(kind, pseudonym).encode());
+    let aad = own_handshake_aad(group, provider.crypto(), kind)?;
+    group.set_aad(aad.encode());
     let group_id = group.group_id().as_slice().to_vec();
     let Changes {
         add,
@@ -411,28 +496,31 @@ pub fn commit<P: OpenMlsProvider>(
         ));
     }
     let new_conversation = match (new_conversation, move_box) {
-        (Some(_), Some(_)) => {
+        (Some(_), true) => {
             return Err(GroupError::Group(
                 "a move changes nothing but the box".into(),
             ));
         }
-        (Some(c), None) => Some(c),
-        (None, Some(mailbox)) => {
+        (Some(c), false) => Some(c),
+        (None, true) => {
             if !add.is_empty() || !remove.is_empty() || new_leaf_key {
                 return Err(GroupError::Group("a move has no other proposal".into()));
             }
+            if kind == ConversationKind::PublicRoom {
+                return Err(GroupError::Group("public rooms do not move".into()));
+            }
             let mut moved = current.clone();
-            moved.mailbox = mailbox;
+            moved.mailbox = moved_box(group, provider.crypto())?;
             Some(moved)
         }
-        (None, None) => None,
+        (None, false) => None,
     };
     let mut builder = group
         .commit_builder()
         .propose_adds(add)
         .propose_removals(remove)
         .force_self_update(true)
-        .consume_proposal_store(move_box.is_none())
+        .consume_proposal_store(!move_box)
         .leaf_node_parameters(leaf_parameters(&profile));
     if let Some(conversation) = new_conversation {
         builder = builder
@@ -513,25 +601,53 @@ pub fn commit<P: OpenMlsProvider>(
     })
 }
 
+/// What applying a commit did, for the caller's records of the group's
+/// messages ([`crate::message::MessageHistory::note_commit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// Whether this device's leaf is still in the group.
+    pub active: bool,
+    /// The epoch the commit ended.
+    pub ended_epoch: u64,
+    /// The leaves it removed, by Remove and SelfRemove.
+    pub removed: Vec<LeafNodeIndex>,
+    /// The pseudonyms of the ended epoch's leaves, outside public rooms
+    /// (7.3), to check its late messages (12.9).
+    pub pseudonyms: EpochPseudonyms,
+}
+
+/// What a commit's merge needs to know from before it.
+struct BeforeMerge {
+    ended_epoch: u64,
+    removed: Vec<LeafNodeIndex>,
+    pseudonyms: EpochPseudonyms,
+}
+
+fn before_merge<E>(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<BeforeMerge, GroupError<E>> {
+    Ok(BeforeMerge {
+        ended_epoch: group.epoch().as_u64(),
+        removed: crate::message::removed_leaves(staged),
+        pseudonyms: epoch_pseudonyms(group, crypto)?,
+    })
+}
+
 /// Merges this device's pending commit, once it has won its epoch (7.2),
-/// records it in `history` with its post, and deletes the leaf key it
-/// replaced, if any.
+/// moves `state` to the new epoch, which this device started, and deletes
+/// the leaf key it replaced, if any.
 pub fn merge_own_commit<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
-    history: &mut History,
-    post: &CommitPost,
-) -> Result<(), GroupError<P::StorageError>> {
-    let before = GroupView::of(group.public_group());
-    let view = {
+    state: &mut EpochState,
+) -> Result<Applied, GroupError<P::StorageError>> {
+    let before = {
         let staged = group
             .pending_commit()
             .ok_or_else(|| GroupError::Group("no pending commit".into()))?;
-        CommitView::of(
-            &Sender::Member(group.own_leaf_index()),
-            staged,
-            group.pending_proposals(),
-        )
+        before_merge(group, staged, provider.crypto())?
     };
     let old_key = group
         .own_leaf_node()
@@ -539,11 +655,7 @@ pub fn merge_own_commit<P: OpenMlsProvider>(
     group
         .merge_pending_commit(provider)
         .map_err(|e: MergePendingCommitError<_>| mls(e))?;
-    let after = GroupView::of(group.public_group());
-    // The device's own commit passed its checks when it made it; they are
-    // run again here only for what the history keeps of it.
-    let verdict = check_commit(&before, &view, history, post).unwrap_or_default();
-    history.record(&before, &view, &verdict, &after, post);
+    *state = EpochState::started_by(group.own_leaf_index());
     let new_key = group
         .own_leaf_node()
         .map(|leaf| leaf.signature_key().as_slice().to_vec());
@@ -553,7 +665,12 @@ pub fn merge_own_commit<P: OpenMlsProvider>(
         LeafKey::delete(provider.storage(), group.group_id().as_slice(), &old)
             .map_err(GroupError::Storage)?;
     }
-    Ok(())
+    Ok(Applied {
+        active: true,
+        ended_epoch: before.ended_epoch,
+        removed: before.removed,
+        pseudonyms: before.pseudonyms,
+    })
 }
 
 /// Drops this device's pending commit, which lost its epoch or which the
@@ -588,11 +705,11 @@ pub fn discard_own_commit<P: OpenMlsProvider>(
 pub fn self_remove<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
-    pseudonym: Pseudonym,
 ) -> Result<Vec<u8>, GroupError<P::StorageError>> {
     let kind = kind_of(group)?;
     let leaf_key = own_leaf_key(provider, group)?;
-    group.set_aad(handshake_aad(kind, pseudonym).encode());
+    let aad = own_handshake_aad(group, provider.crypto(), kind)?;
+    group.set_aad(aad.encode());
     let message = group
         .leave_group_via_self_remove(provider, &leaf_key)
         .map_err(|e: LeaveGroupError<_>| mls(e))?;
@@ -616,6 +733,10 @@ pub struct UpdateOutput {
 /// group, and the old one deleted once a commit applies the Update
 /// ([`apply_commit`]).
 ///
+/// Once it is posted, note its post's `t` with
+/// [`EpochState::note_proposal`], as for others' proposals: a commit that
+/// applies it is judged by that `t` (12.3).
+///
 /// A proposal belongs to its epoch: if a commit leaves it out, propose it
 /// again, with the same `new_key`, in the new epoch. If none has applied
 /// it after 30 minutes, a full client commits its fresh leaf itself
@@ -624,7 +745,6 @@ pub struct UpdateOutput {
 pub fn propose_update<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
-    pseudonym: Pseudonym,
     profile: &RisalaProfile,
     new_key: Option<&LeafKey>,
 ) -> Result<UpdateOutput, GroupError<P::StorageError>> {
@@ -641,7 +761,8 @@ pub fn propose_update<P: OpenMlsProvider>(
     if let Some(previous) = own_profile(group) {
         profile.updated = profile.updated.max(previous.updated);
     }
-    group.set_aad(handshake_aad(current.kind, pseudonym).encode());
+    let aad = own_handshake_aad(group, provider.crypto(), current.kind)?;
+    group.set_aad(aad.encode());
     let (message, reference) = match new_key {
         Some(new) => {
             new.store(provider.storage(), group.group_id().as_slice())
@@ -668,7 +789,7 @@ pub fn propose_update<P: OpenMlsProvider>(
 /// The leaves of this device's identity other than its own, which it
 /// removes with a commit before its SelfRemove when it leaves (6.1).
 pub fn own_identity_other_leaves(group: &MlsGroup) -> Vec<LeafNodeIndex> {
-    let view = GroupView::of(group.public_group());
+    let view = GroupView::of(group.public_group(), &EpochState::default());
     let own = group.own_leaf_index();
     let Some(uid) = view
         .leaf(own)
@@ -683,9 +804,32 @@ pub fn own_identity_other_leaves(group: &MlsGroup) -> Vec<LeafNodeIndex> {
         .collect()
 }
 
+/// The pseudonym this device's leaf sends under in `group` now (7.3):
+/// outside public rooms the one derived from the epoch, and in a public
+/// room `period`, the random one the device picked for the period, which
+/// it must give.
+pub fn sending_pseudonym<E>(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+    period: Option<Pseudonym>,
+) -> Result<Pseudonym, GroupError<E>> {
+    match (kind_of(group)?, period) {
+        (ConversationKind::PublicRoom, Some(pseudonym)) => Ok(pseudonym),
+        (ConversationKind::PublicRoom, None) => Err(GroupError::Group(
+            "a public room's messages carry the period's pseudonym".into(),
+        )),
+        (_, None) => own_pseudonym(group, crypto),
+        (_, Some(_)) => Err(GroupError::Group(
+            "pseudonyms are derived outside public rooms".into(),
+        )),
+    }
+}
+
 /// Encrypts an application message whose RisalaAAD is `aad`, for
 /// [`crate`]'s callers that build RisalaMessages (12.9). The sending leaf
-/// signs it, and MLS pads it to a multiple of 256 bytes.
+/// signs it, and MLS pads it to a multiple of 256 bytes. Outside public
+/// rooms, the AAD's pseudonym must be the leaf's for the current epoch
+/// ([`sending_pseudonym`]).
 pub fn encrypt_application<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
@@ -694,6 +838,13 @@ pub fn encrypt_application<P: OpenMlsProvider>(
 ) -> Result<Vec<u8>, GroupError<P::StorageError>> {
     if aad.check_for(ContentType::Application, true).is_err() {
         return Err(GroupError::Group("not an application message's AAD".into()));
+    }
+    if kind_of(group)? != ConversationKind::PublicRoom
+        && aad.pseudonym != Some(own_pseudonym(group, provider.crypto())?)
+    {
+        return Err(GroupError::Group(
+            "not the leaf's pseudonym for the epoch".into(),
+        ));
     }
     let leaf_key = own_leaf_key(provider, group)?;
     group.set_aad(aad.encode());
@@ -714,17 +865,18 @@ pub struct Joined {
     /// [`Changes::new_leaf_key`], or in an epochal group [`propose_update`]
     /// with a new key.
     pub last_resort: bool,
-    /// The group's history from the Welcome's epoch on.
-    pub history: History,
+    /// The state of the Welcome's epoch: its GroupInfo's signer started it.
+    pub state: EpochState,
 }
 
 /// Joins a group by Welcome (12.8): decrypts it with one of this device's
-/// KeyPackages, takes the tree from the Welcome's GroupInfo or from `tree`
-/// (a public room's, from GROUPINFO), skips the lifetimes of leaves
-/// already in the tree (12.5), and checks the group as 12.7 says. A group
-/// that fails is deleted from storage again, and the error says why. `t`
-/// is when the device joins, by the first post it applies or its clock,
-/// for the [`History`].
+/// KeyPackages, takes the tree from the Welcome's GroupInfo, or in a public
+/// room from `tree`, the tree that WELCOME GET's `tree=` carries (12.8),
+/// which MLS checks against the tree hash in the Welcome's group context,
+/// skips the lifetimes of leaves already in the tree (12.5), and checks the
+/// group as 12.7 says. A group that fails is deleted from storage again,
+/// and the error says why. Outside public rooms the Welcome must carry the
+/// tree, and `tree` must be `None`.
 ///
 /// If no leaf has the signature key of the KeyPackage the device was added
 /// from, someone may have added it with a key of their own: the error is
@@ -739,8 +891,8 @@ pub fn join_by_welcome<P: OpenMlsProvider>(
     welcome: &[u8],
     tree: Option<&[u8]>,
     expect: &JoinExpectation,
-    t: u64,
 ) -> Result<Joined, GroupError<P::StorageError>> {
+    let from_server = tree.is_some();
     let welcome = read_welcome(welcome)?;
     let tree = tree.map(read_tree).transpose()?;
     // A last-resort KeyPackage is kept: find it before OpenMLS deletes it.
@@ -812,8 +964,17 @@ pub fn join_by_welcome<P: OpenMlsProvider>(
         LeafKey::delete(provider.storage(), KEY_PACKAGE_SCOPE, &own_key)
             .map_err(GroupError::Storage)?;
     }
-    let view = GroupView::of(group.public_group());
+    let state = EpochState::started_by(started_by);
+    let view = GroupView::of(group.public_group(), &state);
     let checked = check_join(&view, expect).and_then(|()| Ok(view.conversation.clone()?.kind));
+    // Only a public room's Welcome comes without its tree, which the server
+    // hands out with it (12.8).
+    let checked = match checked {
+        Ok(kind) if from_server && kind != ConversationKind::PublicRoom => Err(GroupError::Group(
+            "a tree from the server outside a public room".into(),
+        )),
+        other => other.map_err(GroupError::from),
+    };
     let kind = match checked {
         Ok(kind) => kind,
         Err(e) => {
@@ -822,22 +983,16 @@ pub fn join_by_welcome<P: OpenMlsProvider>(
             group
                 .delete(provider.storage())
                 .map_err(GroupError::Storage)?;
-            return Err(e.into());
+            return Err(e);
         }
     };
     group
         .set_configuration(provider.storage(), &join_config(kind))
         .map_err(GroupError::Storage)?;
-    let history = History::joined(
-        group.epoch().as_u64(),
-        started_by.u32(),
-        t,
-        group.own_leaf_index().u32(),
-    );
     Ok(Joined {
         group,
         last_resort: keep.is_some(),
-        history,
+        state,
     })
 }
 
@@ -896,7 +1051,7 @@ pub fn join_public_room<P: OpenMlsProvider>(
     let scratch = MemoryStorage::default();
     let public = public_group(provider.crypto(), &scratch, group_info, tree)
         .map_err(|e| GroupError::Mls(e.to_string()))?;
-    let view = GroupView::of(&public);
+    let view = GroupView::of(&public, &EpochState::default());
     check_join(&view, expect)?;
     if view
         .conversation
@@ -951,7 +1106,7 @@ pub fn join_proposal<P: OpenMlsProvider>(
     Ok(crate::wire::to_bytes(&message))
 }
 
-/// A resync commit, made and pending the server's answer (12.7).
+/// An external commit, made and pending the server's answer (12.7).
 #[derive(Debug)]
 pub struct ExternalJoin {
     /// The group, already in the new epoch. If the server refuses the
@@ -966,49 +1121,58 @@ pub struct ExternalJoin {
     pub group_info: Vec<u8>,
     /// The hash of the new epoch's send token, for `next=` (5.2, 12.6).
     pub next_token_hash: [u8; HASH_LEN],
-    /// The group's history from the new epoch on.
-    pub history: History,
+    /// The state of the new epoch, which this device started.
+    pub state: EpochState,
 }
 
-/// Makes a resync commit for a public room whose devices could not apply
-/// a commit that the server accepted (12.7): an external commit against
-/// GROUPINFO's GroupInfo and tree, checked as 12.7 says, that removes the
-/// GroupInfo's signer, the leaf whose commit could not be applied, and
-/// the leaves in `inactive_own`, this device's own earlier leaves that are
-/// inactive, and nothing else. `identity` must be an identity's that has a
-/// leaf in the room. Before calling it, compare the GroupInfo's extension
-/// with the one kept for the room
-/// ([`RisalaConversation::unexplained_changes`]).
+/// Makes an external commit for a public room (12.7), against GROUPINFO's
+/// GroupInfo and tree, checked as 12.7 says, that adds this device's own
+/// leaf and removes `own_leaves`, earlier leaves of its own identity:
+///
+/// - [`External::Resync`]: for a room whose devices could not apply a
+///   commit that the server accepted. It also removes the GroupInfo's
+///   signer, the leaf whose commit could not be applied. `identity` must be
+///   an identity's that has a leaf in the room.
+/// - [`External::Rejoin`]: an owner's or moderator's, whose join proposal
+///   no commit applied within 30 minutes. It removes nothing else.
+///
+/// Before calling it, compare the GroupInfo's extension with the one kept
+/// for the room ([`RisalaConversation::unexplained_changes`]).
 #[allow(clippy::too_many_arguments)]
-pub fn resync_public_room<P: OpenMlsProvider>(
+pub fn external_commit<P: OpenMlsProvider>(
     provider: &P,
     identity: &RisalaIdentity,
     profile: &RisalaProfile,
     group_info: &[u8],
     tree: &[u8],
     expect: &JoinExpectation,
-    inactive_own: &[LeafNodeIndex],
-    t: u64,
+    kind: External,
+    own_leaves: &[LeafNodeIndex],
 ) -> Result<ExternalJoin, GroupError<P::StorageError>> {
     if identity.is_guest() {
         return Err(GroupError::Group(
-            "only an identity's device resyncs".into(),
+            "only an identity's device commits externally".into(),
         ));
     }
     let scratch = MemoryStorage::default();
     let public = public_group(provider.crypto(), &scratch, group_info, tree)
         .map_err(|e| GroupError::Mls(e.to_string()))?;
-    check_join(&GroupView::of(&public), expect)?;
     let group_info = read_group_info(group_info)?;
     let signer = group_info.signer();
-    let mut removals = vec![signer];
-    removals.extend(inactive_own.iter().filter(|i| **i != signer));
+    let view = GroupView::of(&public, &EpochState::started_by(signer));
+    check_join(&view, expect)?;
+    let mut removals: Vec<LeafNodeIndex> = own_leaves.to_vec();
+    if kind == External::Resync && !removals.contains(&signer) {
+        removals.push(signer);
+    }
     let tree = read_tree(tree)?;
     let leaf_key = LeafKey::generate().map_err(|_| GroupError::Random)?;
     leaf_key
         .store(provider.storage(), group_info.group_id().as_slice())
         .map_err(GroupError::Storage)?;
-    let profile = profile.clone().with_streak(1);
+    let profile = profile
+        .clone()
+        .with_streak(view.expected_streak(&identity.uid));
     let (group, bundle) = MlsGroup::external_commit_builder()
         .with_ratchet_tree(tree)
         .with_config(join_config(ConversationKind::PublicRoom))
@@ -1034,19 +1198,14 @@ pub fn resync_public_room<P: OpenMlsProvider>(
         .hash();
     let (message, _welcome, group_info) = bundle.into_messages();
     let group_info = group_info.ok_or_else(|| GroupError::Mls("no GroupInfo".into()))?;
-    let own = group.own_leaf_index().u32();
-    let mut history = History::joined(group.epoch().as_u64(), own, t, own);
-    history.resync = Some(ResyncState {
-        t,
-        active: [own].into(),
-    });
+    let state = EpochState::started_by(group.own_leaf_index());
     Ok(ExternalJoin {
         group,
         leaf_key,
         message: crate::wire::to_bytes(&message),
         group_info: crate::wire::to_bytes(&group_info),
         next_token_hash,
-        history,
+        state,
     })
 }
 
@@ -1068,8 +1227,7 @@ pub struct ReceivedCommit {
 pub enum ProposalKind {
     /// A SelfRemove (6.1).
     SelfRemove,
-    /// An Update of its sender's leaf, in an epochal group (12.10). Note
-    /// its post's `t` with [`History::note_update`].
+    /// An Update of its sender's leaf, in an epochal group (12.10).
     Update,
     /// An external Add proposal, a join of a public room (6.1).
     Join,
@@ -1087,7 +1245,8 @@ pub enum Incoming {
         /// The decrypted content, a RisalaMessage (12.9).
         content: Vec<u8>,
     },
-    /// A proposal, now pending in the group until a commit covers it.
+    /// A proposal, now pending in the group until a commit covers it. Note
+    /// its post's `t` with [`EpochState::note_proposal`] (12.3).
     Proposal {
         /// The RisalaAAD.
         aad: RisalaAad,
@@ -1126,16 +1285,23 @@ pub enum ProcessError<E> {
     /// (12.6), or the group is not acceptable.
     #[error("not acceptable in this group")]
     Group,
+    /// A PrivateMessage commit or proposal, outside a public room, whose
+    /// pseudonym is not its sender's for the epoch (7.3).
+    #[error("not the sender's pseudonym")]
+    Pseudonym,
     /// Storage failed.
     #[error("storage: {0:?}")]
     Storage(E),
 }
 
 /// Processes an incoming post of `group` (12.6, 12.9). A commit comes back
-/// unapplied, to check with [`check_received_commit`].
+/// unapplied, to check with [`check_received_commit`]. A PrivateMessage
+/// commit or proposal outside a public room must carry its sender's
+/// pseudonym for the epoch (7.3).
 ///
 /// Application messages go through [`crate::message::receive`], which also
-/// deletes past epochs' secrets once 12.9 says they must go.
+/// checks their pseudonyms, of past epochs too, and deletes past epochs'
+/// secrets once 12.9 says they must go.
 pub fn process_message<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
@@ -1172,6 +1338,7 @@ pub fn process_message<P: OpenMlsProvider>(
             let Sender::Member(index) = queued.sender().clone() else {
                 return Err(ProcessError::Proposal);
             };
+            check_handshake_pseudonym(provider, group, kind, index, &aad)?;
             let proposal_kind = match queued.proposal() {
                 Proposal::SelfRemove => ProposalKind::SelfRemove,
                 Proposal::Update(_) if current.confirm == ConfirmMode::Epochal => {
@@ -1208,6 +1375,9 @@ pub fn process_message<P: OpenMlsProvider>(
         }
         ProcessedMessageContent::StagedCommitMessage(staged) => {
             let aad = RisalaAad::decode_for(&aad_bytes, ContentType::Commit, private)?;
+            if let Sender::Member(index) = sender {
+                check_handshake_pseudonym(provider, group, kind, index, &aad)?;
+            }
             let view = CommitView::of(&sender, &staged, group.pending_proposals());
             Ok(Incoming::Commit(Box::new(ReceivedCommit {
                 staged,
@@ -1221,20 +1391,42 @@ pub fn process_message<P: OpenMlsProvider>(
     }
 }
 
+/// Checks that a member's PrivateMessage commit or proposal carries its
+/// sender's pseudonym for the epoch (7.3); public rooms' handshake messages
+/// are PublicMessages, with none.
+fn check_handshake_pseudonym<P: OpenMlsProvider>(
+    provider: &P,
+    group: &MlsGroup,
+    kind: ConversationKind,
+    sender: LeafNodeIndex,
+    aad: &RisalaAad,
+) -> Result<(), ProcessError<P::StorageError>> {
+    if kind == ConversationKind::PublicRoom {
+        return Ok(());
+    }
+    let expected = leaf_pseudonym::<P::StorageError>(group, provider.crypto(), sender)
+        .map_err(|e| ProcessError::Mls(e.to_string()))?;
+    if aad.pseudonym == Some(expected) {
+        Ok(())
+    } else {
+        Err(ProcessError::Pseudonym)
+    }
+}
+
 /// The group checks of a received commit (12.7), against the group as of
-/// its epoch, the device's `history`, and its post's `t` and `next`, which
-/// must be the hash of the send token of the epoch the commit creates
-/// (12.6). An error means the commit is invalid: the device ignores it, and
-/// the messages of the epoch it would have started (7.2).
+/// its epoch with its `state`, and the posts of the commit and of the
+/// proposals it applies ([`EpochState::post`]), whose `next` must be the
+/// hash of the send token of the epoch the commit creates (12.6). An error
+/// means the commit is invalid: the device ignores it, and the messages of
+/// the epoch it would have started (7.2).
 pub fn check_received_commit(
     group: &MlsGroup,
     commit: &ReceivedCommit,
-    history: &History,
+    state: &EpochState,
     post: &CommitPost,
     crypto: &impl OpenMlsCrypto,
 ) -> Result<Verdict, CommitError> {
-    let view = GroupView::of(group.public_group());
-    let verdict = check_commit(&view, &commit.view, history, post)?;
+    let verdict = check_commit(&view(group, state, crypto), &commit.view, post)?;
     // A device the commit removes has no keys for the new epoch, and so
     // cannot check its token; the others can.
     if commit.staged.self_removed() {
@@ -1247,19 +1439,23 @@ pub fn check_received_commit(
 }
 
 /// The key checks of a received commit that passed the group checks
-/// (12.7), against the group as of its epoch: call it before
-/// [`apply_commit`]. They never make the commit invalid.
+/// (12.7), against the group as of its epoch, with what the device itself
+/// saw: call it before [`apply_commit`]. They never make the commit
+/// invalid.
 pub fn check_received_keys(
     group: &MlsGroup,
     commit: &ReceivedCommit,
+    state: &EpochState,
     verdict: &Verdict,
     facts: &dyn KeyFacts,
+    seen: &Seen<'_>,
 ) -> KeyReport {
     key_checks(
-        &GroupView::of(group.public_group()),
+        &GroupView::of(group.public_group(), state),
         &commit.view,
         verdict,
         facts,
+        seen,
     )
 }
 
@@ -1284,33 +1480,48 @@ pub fn next_token_hash_matches(
     SendToken::of_group(group, crypto).is_ok_and(|token| ct_eq(&token.hash(), claimed))
 }
 
-/// Applies a commit that passed the group checks, with their `verdict`,
-/// and records it in `history` with its post. Returns whether this
-/// device's leaf is still in the group; if not, its leaf key is deleted,
-/// and the caller deletes the group with [`forget_group`] once it no
-/// longer needs it. If the commit applied this device's own Update with a
-/// new signature key, the old key is deleted.
+/// Applies a commit that passed the group checks, and moves `state` to the
+/// new epoch, which the committer started. [`Applied::active`] says
+/// whether this device's leaf is still in the group; if not, its leaf key
+/// is deleted, and the caller deletes the group with [`forget_group`] once
+/// it no longer needs it. If the commit applied this device's own Update
+/// with a new signature key, the old key is deleted.
 pub fn apply_commit<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
     commit: ReceivedCommit,
-    verdict: &Verdict,
-    history: &mut History,
-    post: &CommitPost,
-) -> Result<bool, GroupError<P::StorageError>> {
+    state: &mut EpochState,
+) -> Result<Applied, GroupError<P::StorageError>> {
     // Another commit won this epoch: this device's own, if any, lost.
     if group.pending_commit().is_some() {
         discard_own_commit(provider, group)?;
     }
-    let before = GroupView::of(group.public_group());
+    let before = before_merge(group, &commit.staged, provider.crypto())?;
+    let committer = match commit.view.committer {
+        Committer::Member(index) => Some(index),
+        Committer::External => None,
+    };
+    // An external commit's joiner has a new leaf: found by its key.
+    let joiner_key = commit
+        .staged
+        .update_path_leaf_node()
+        .map(|leaf| leaf.signature_key().as_slice().to_vec());
     let own_key = group
         .own_leaf_node()
         .map(|leaf| leaf.signature_key().as_slice().to_vec());
     group
         .merge_staged_commit(provider, *commit.staged)
         .map_err(|e: MergeCommitError<_>| mls(e))?;
-    let after = GroupView::of(group.public_group());
-    history.record(&before, &commit.view, verdict, &after, post);
+    let started_by = committer.or_else(|| {
+        group
+            .members()
+            .find(|member| Some(&member.signature_key) == joiner_key.as_ref())
+            .map(|member| member.index)
+    });
+    *state = EpochState {
+        started_by: started_by.map(|index| index.u32()),
+        proposal_times: Vec::new(),
+    };
     let active = group.is_active();
     let new_key = group
         .own_leaf_node()
@@ -1322,7 +1533,12 @@ pub fn apply_commit<P: OpenMlsProvider>(
         LeafKey::delete(provider.storage(), group.group_id().as_slice(), &key)
             .map_err(GroupError::Storage)?;
     }
-    Ok(active)
+    Ok(Applied {
+        active,
+        ended_epoch: before.ended_epoch,
+        removed: before.removed,
+        pseudonyms: before.pseudonyms,
+    })
 }
 
 /// Deletes a group this device has left or been removed from, with its
