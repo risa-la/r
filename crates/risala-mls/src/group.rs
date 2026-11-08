@@ -938,7 +938,9 @@ pub fn next_token_hash_ok(
 }
 
 /// Applies a commit that passed the checks. Returns whether this device's
-/// leaf is still in the group; if not, delete the group and its leaf key.
+/// leaf is still in the group; if not, its leaf key is deleted, and the
+/// caller deletes the group with [`forget_group`] once it no longer needs
+/// it.
 pub fn apply_commit<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
@@ -948,10 +950,36 @@ pub fn apply_commit<P: OpenMlsProvider>(
     if group.pending_commit().is_some() {
         discard_own_commit(provider, group)?;
     }
+    let own_key = group
+        .own_leaf_node()
+        .map(|leaf| leaf.signature_key().as_slice().to_vec());
     group
         .merge_staged_commit(provider, *commit.staged)
         .map_err(|e: MergeCommitError<_>| mls(e))?;
-    Ok(group.is_active())
+    let active = group.is_active();
+    // Removed: the leaf key goes now, since the leaf is no longer in the
+    // tree to find it by.
+    if !active && let Some(key) = own_key {
+        LeafKey::delete(provider.storage(), group.group_id().as_slice(), &key)
+            .map_err(GroupError::Storage)?;
+    }
+    Ok(active)
+}
+
+/// Deletes a group this device has left or been removed from, with its
+/// leaf key, from storage.
+pub fn forget_group<P: OpenMlsProvider>(
+    provider: &P,
+    group: &mut MlsGroup,
+) -> Result<(), GroupError<P::StorageError>> {
+    if group.is_active()
+        && let Some(leaf) = group.own_leaf_node()
+    {
+        let key = leaf.signature_key().as_slice().to_vec();
+        LeafKey::delete(provider.storage(), group.group_id().as_slice(), &key)
+            .map_err(GroupError::Storage)?;
+    }
+    group.delete(provider.storage()).map_err(GroupError::Storage)
 }
 
 /// The leaf node of `index` in `group`.

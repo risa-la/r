@@ -564,7 +564,14 @@ fn self_remove_and_leaving() {
     assert_eq!(m.members().count(), 2);
     let (received, verdict) = pat.receive(&mut p, &out.message, &facts);
     verdict.unwrap();
+    let pat_key = p.own_leaf_node().unwrap().signature_key().as_slice().to_vec();
     assert!(!apply_commit(&pat.provider, &mut p, *received).unwrap());
+    assert!(
+        LeafKey::load(pat.provider.storage(), p.group_id().as_slice(), &pat_key)
+            .unwrap()
+            .is_none()
+    );
+    forget_group(&pat.provider, &mut p).unwrap();
 
     // Removing someone else's leaf by value needs a reason: Mia may not
     // remove Owen's, nor may a member remove a moderator's.
@@ -1054,4 +1061,91 @@ fn server_checks_public_commits() {
     );
     let (_, verdict) = server_sees(&public, &out.message, &facts);
     assert!(matches!(verdict, Err(CommitError::Extension(_))));
+}
+
+/// librisala keeps OpenMLS's state in SQLite, inside its own transactions:
+/// groups, KeyPackages and leaf keys round-trip there, and a rolled-back
+/// commit leaves nothing behind.
+#[test]
+fn sqlite_storage() {
+    use openmls_sqlite_storage::{MsgPack, SCHEMA, SqliteStorageProvider};
+    use std::sync::Arc;
+
+    let alice = Device::new("alice@example.org", 1);
+    let bob = Device::new("bob@example.org", 2);
+    let crypto = Arc::new(RisalaCrypto::new().unwrap());
+    let mut db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch(SCHEMA).unwrap();
+    let conv = RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid);
+
+    // A KeyPackage made in SQLite, used by a Welcome later.
+    let kp = {
+        let tx = db.transaction().unwrap();
+        let provider =
+            Provider::with_crypto(crypto.clone(), SqliteStorageProvider::<MsgPack, _>::new(&*tx));
+        let kp = make_key_package(
+            &provider,
+            bob.device_key.as_ref().unwrap(),
+            &bob.uid,
+            &RisalaProfile::new("", now_ms()).unwrap(),
+            true,
+        )
+        .unwrap()
+        .key_package;
+        drop(provider);
+        tx.commit().unwrap();
+        kp
+    };
+    let mut a = alice.create(&conv);
+    let out = alice.commit(&mut a, add(vec![kp]));
+    merge_own_commit(&alice.provider, &mut a).unwrap();
+
+    let group_id = {
+        let tx = db.transaction().unwrap();
+        let provider =
+            Provider::with_crypto(crypto.clone(), SqliteStorageProvider::<MsgPack, _>::new(&*tx));
+        let joined =
+            join_by_welcome(&provider, out.welcome.as_ref().unwrap(), None, &bob.expect()).unwrap();
+        assert!(joined.last_resort);
+        let id = joined.group.group_id().clone();
+        drop(provider);
+        tx.commit().unwrap();
+        id
+    };
+
+    // A commit in a transaction that is rolled back leaves nothing behind;
+    // one that is committed is there next time, with its new leaf key.
+    for keep in [false, true] {
+        let tx = db.transaction().unwrap();
+        let provider =
+            Provider::with_crypto(crypto.clone(), SqliteStorageProvider::<MsgPack, _>::new(&*tx));
+        let mut b = MlsGroup::load(provider.storage(), &group_id).unwrap().unwrap();
+        assert_eq!(b.epoch().as_u64(), 1);
+        own_leaf_key(&provider, &b).unwrap();
+        let out = commit(
+            &provider,
+            &mut b,
+            bob.pseudonym,
+            &bob.profile(),
+            Changes {
+                new_leaf_key: true,
+                ..Changes::default()
+            },
+        )
+        .unwrap();
+        merge_own_commit(&provider, &mut b).unwrap();
+        drop(provider);
+        if keep {
+            tx.commit().unwrap();
+            alice.apply(&mut a, &out.message, &Facts::with(&[&alice, &bob]));
+        } else {
+            tx.rollback().unwrap();
+        }
+    }
+    let provider = Provider::with_crypto(crypto, SqliteStorageProvider::<MsgPack, _>::new(&db));
+    let mut b = MlsGroup::load(provider.storage(), &group_id).unwrap().unwrap();
+    assert_eq!(b.epoch().as_u64(), 2);
+    let aad = RisalaAad::application(bob.pseudonym, [1; 48]);
+    let message = encrypt_application(&provider, &mut b, &aad, b"from sqlite").unwrap();
+    assert_eq!(alice.read(&mut a, &message).1, b"from sqlite");
 }

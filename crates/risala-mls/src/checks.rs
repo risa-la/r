@@ -26,6 +26,7 @@ use openmls::treesync::LeafNodeSource;
 use risala_proto::names::{Room, Uid};
 
 use crate::binding::DeviceBinding;
+use crate::crypto::x_wing_public_key_ok;
 use crate::conversation::{
     ConfirmMode, ConversationError, ConversationKind, GuestMode, RisalaConversation, Role,
 };
@@ -91,6 +92,8 @@ pub struct LeafView {
     /// Whether it has not committed since it was added: it still holds the
     /// leaf node of its KeyPackage.
     pub from_key_package: bool,
+    /// Whether its encryption key passes the checks of 12.2.
+    pub encryption_key_ok: bool,
 }
 
 impl LeafView {
@@ -102,6 +105,7 @@ impl LeafView {
             profile: RisalaProfile::of_leaf(leaf),
             signature_key: leaf.signature_key().as_slice().to_vec(),
             from_key_package: matches!(leaf.leaf_node_source(), LeafNodeSource::KeyPackage(_)),
+            encryption_key_ok: x_wing_public_key_ok(&encryption_key_bytes(leaf.encryption_key())),
         }
     }
 
@@ -183,9 +187,9 @@ pub enum JoinError {
     /// It names another server, or another room or box than expected.
     #[error("the group is not the conversation expected")]
     WrongConversation,
-    /// A leaf's credential is not a RisalaIdentity, or a device's leaf has
-    /// no profile.
-    #[error("a leaf without a RisalaIdentity or a profile")]
+    /// A leaf's credential is not a RisalaIdentity, a device's leaf has no
+    /// profile, or a leaf's encryption key fails the checks of 12.2.
+    #[error("a leaf without a RisalaIdentity or a profile, or with a bad key")]
     Leaf,
     /// A leaf of a direct conversation belongs to someone else.
     #[error("a leaf of a direct conversation belongs to someone else")]
@@ -234,7 +238,7 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
     }
     for leaf in &group.leaves {
         let identity = leaf.identity.as_ref().ok_or(JoinError::Leaf)?;
-        if !identity.is_guest() && leaf.profile.is_none() {
+        if (!identity.is_guest() && leaf.profile.is_none()) || !leaf.encryption_key_ok {
             return Err(JoinError::Leaf);
         }
         if conversation.is_banned(&identity.uid) {
@@ -425,7 +429,8 @@ pub enum CommitError {
     #[error("the group's conversation extension is not acceptable")]
     Group,
     /// The committer's leaf changes its credential, or its signature key
-    /// where 12.3 does not allow it, or has no profile.
+    /// where 12.3 does not allow it, or has no profile, or an encryption
+    /// key that fails the checks of 12.2.
     #[error("the committer's leaf changes in a way 12.3 does not allow")]
     Leaf,
     /// The conversation extension changes in a way the committer may not
@@ -533,7 +538,8 @@ pub fn check_commit(
             None
         }
     };
-    if !path_identity.is_guest() && path_leaf.profile.is_none() {
+    if (!path_identity.is_guest() && path_leaf.profile.is_none()) || !path_leaf.encryption_key_ok
+    {
         return Err(CommitError::Leaf);
     }
     let committer_uid = &path_identity.uid;
@@ -840,6 +846,7 @@ mod tests {
             profile: Some(RisalaProfile::new("", updated).unwrap()),
             signature_key: vec![index as u8; 4],
             from_key_package: false,
+            encryption_key_ok: true,
         }
     }
 
@@ -935,6 +942,9 @@ mod tests {
         let mut no_profile = commit(&g, 2, 2000, vec![]);
         no_profile.path_leaf.as_mut().unwrap().profile = None;
         assert_eq!(check(&g, &no_profile), Err(CommitError::Leaf));
+        let mut bad_key = commit(&g, 2, 2000, vec![]);
+        bad_key.path_leaf.as_mut().unwrap().encryption_key_ok = false;
+        assert_eq!(check(&g, &bad_key), Err(CommitError::Leaf));
 
         // A new signature key: not in a pairwise group, once the leaf has
         // committed; yes while it holds its KeyPackage's leaf (12.3).
@@ -1105,6 +1115,9 @@ mod tests {
         let mut no_profile = g.clone();
         no_profile.leaves[1].profile = None;
         assert_eq!(check_join(&no_profile, &expect), Err(JoinError::Leaf));
+        let mut bad_key = g.clone();
+        bad_key.leaves[3].encryption_key_ok = false;
+        assert_eq!(check_join(&bad_key, &expect), Err(JoinError::Leaf));
         let mut no_identity = g.clone();
         no_identity.leaves[1].identity = None;
         assert_eq!(check_join(&no_identity, &expect), Err(JoinError::Leaf));

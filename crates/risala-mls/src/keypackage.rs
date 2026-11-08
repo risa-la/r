@@ -338,19 +338,23 @@ pub fn check_key_package_contents(
         // proposal is checked by `check_guest_key_package`.
         return Err(KeyPackageError::Credential);
     }
-    check_leaf_parts(key_package, now)?;
+    check_leaf_parts(key_package, now, true)?;
     let last_resort = is_last_resort(key_package).map_err(|_| KeyPackageError::Dictionary)?;
     Ok((identity, last_resort))
 }
 
-/// The checks every KeyPackage gets, a guest's too: capabilities, profile,
-/// HPKE keys and lifetime.
-fn check_leaf_parts(key_package: &KeyPackage, now: SystemTime) -> Result<(), KeyPackageError> {
+/// The checks every KeyPackage gets, a guest's too: capabilities, HPKE keys
+/// and lifetime, and a profile for a device's (12.3).
+fn check_leaf_parts(
+    key_package: &KeyPackage,
+    now: SystemTime,
+    needs_profile: bool,
+) -> Result<(), KeyPackageError> {
     let leaf = key_package.leaf_node();
     if !has_capabilities(leaf.capabilities()) {
         return Err(KeyPackageError::Capabilities);
     }
-    if RisalaProfile::of_leaf(leaf).is_none() {
+    if needs_profile && RisalaProfile::of_leaf(leaf).is_none() {
         return Err(KeyPackageError::Profile);
     }
     if !x_wing_public_key_ok(key_package.hpke_init_key().as_slice())
@@ -378,7 +382,7 @@ pub fn check_guest_key_package(
     if !identity.is_guest() {
         return Err(KeyPackageError::Credential);
     }
-    check_leaf_parts(key_package, now)?;
+    check_leaf_parts(key_package, now, false)?;
     Ok(identity)
 }
 
