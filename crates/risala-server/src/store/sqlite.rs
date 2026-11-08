@@ -1038,14 +1038,17 @@ impl Store for SqliteStore {
         .transpose()
     }
 
-    fn touch_identity(&self, uid: &Uid, now: Timestamp) -> Result<()> {
+    fn touch_identity(&self, uid: &Uid, now: Timestamp) -> Result<bool> {
         self.write(|tx| {
+            let known = tx
+                .prepare_cached("SELECT 1 FROM identities WHERE uid = ?")?
+                .exists([uid.as_str()])?;
             tx.execute(
                 "INSERT INTO identities (uid, first_seen, last_seen) VALUES (?1, ?2, ?2) \
                  ON CONFLICT (uid) DO UPDATE SET last_seen = MAX(last_seen, ?2)",
                 params![uid.as_str(), ms(now)],
             )?;
-            Ok(())
+            Ok(!known)
         })
     }
 

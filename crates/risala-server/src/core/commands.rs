@@ -578,13 +578,23 @@ impl Inner {
     }
 
     /// Locks the direct conversation of `uid` and `other` (5.1), or
-    /// `ERR not-found` if it has not started. Direct conversations are
-    /// never dropped.
+    /// `ERR not-found` if it has not started, or `uid` is not one of its
+    /// participants. Direct conversations are never dropped.
+    ///
+    /// The participants are the conversation's members: the two
+    /// identities of the pair that the server knows. An identity that
+    /// unregistered is not one (4.8), until it signs in again
+    /// ([`Inner::rejoin_directs`]). This is the one check of it, for every
+    /// command on a direct conversation, as SYNC lists the members'
+    /// conversations.
     pub(super) async fn lock_direct(&self, uid: &Uid, other: &Uid) -> Result<ConvGuard, Fail> {
-        let entry = self
-            .direct_entry(uid, other)
-            .ok_or_else(|| fail(ErrorCode::NotFound, "no such conversation"))?;
-        Ok(entry.lock_owned().await)
+        let unknown = || fail(ErrorCode::NotFound, "no such conversation");
+        let entry = self.direct_entry(uid, other).ok_or_else(unknown)?;
+        let st = entry.lock_owned().await;
+        if !st.is_member(uid) {
+            return Err(unknown());
+        }
+        Ok(st)
     }
 
     /// Locks the conversation `conv` names for `uid`: a room, or a direct

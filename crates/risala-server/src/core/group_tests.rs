@@ -282,6 +282,42 @@ impl World {
         c
     }
 
+    /// A connection signed in as `d`'s identity with AUTH (4.5), as a
+    /// device does.
+    pub(super) async fn sign_in(&mut self, d: &Device) -> Client {
+        let mut c = self.h.connect();
+        let nonce: risala_proto::auth::Nonce = {
+            let greeting = &self.h.hub.inner.reg().conns[&c.id];
+            greeting.nonce.clone().unwrap()
+        };
+        let sig = d
+            .secret
+            .sign_challenge("chat.example.org", &nonce, d.uid.as_str());
+        let lines = self.ask(&mut c, &format!("auth {} {sig}", d.uid)).await;
+        assert_eq!(lines, [format!("OK uid={}", d.uid)]);
+        c
+    }
+
+    /// Starts the hub again on the same store and key files.
+    pub(super) fn restart(&mut self) {
+        let mut c = config();
+        c.identity_domain = Some("example.org".into());
+        let keys = KeyServices::shared(self.fetcher.clone(), Arc::new(NoPublisher));
+        self.h.hub = Hub::build(
+            c,
+            self.h.store.clone(),
+            self.h.clock.clone(),
+            timers(),
+            keys,
+        )
+        .unwrap();
+    }
+
+    /// Whether the hub has an entry for `who` in its registry.
+    pub(super) fn has_entry(&self, who: &str) -> bool {
+        self.h.hub.inner.reg().users.contains_key(&uid(who))
+    }
+
     pub(super) async fn send(&self, c: &Client, line: &str) {
         self.h.send(c, line).await;
     }
@@ -2103,4 +2139,80 @@ async fn an_identity_not_hosted_that_unregisters_leaves_no_leaf_to_wait_for() {
     // leaf in a direct conversation (rule 4): it must not hold up ENC.
     let lines = w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await;
     assert_eq!(lines.last().unwrap(), "OK seq=2");
+}
+
+#[tokio::test]
+async fn an_identity_not_hosted_comes_back_to_its_direct_conversations() {
+    for restart in [false, true] {
+        let mut w = World::new();
+        let a1 = Device::new(ALICE, 1);
+        let mut c1 = w.connect(&a1);
+        let b5 = Device::new(BOB, 5);
+        let mut cb = w.connect(&b5);
+        let (ga1, _) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+        let id = w.ask(&mut c1, "sync").await[0]
+            .split(' ')
+            .nth(2)
+            .unwrap()
+            .to_owned();
+        w.ask(&mut cb, "unregister bob@example.net").await;
+        if restart {
+            w.restart();
+            c1 = w.connect(&a1);
+        }
+        // Alice keeps it (4.8), and Bob is not in it until he comes back.
+        assert_eq!(
+            w.ask(&mut c1, "sync").await,
+            [format!("CONV bob@example.net {id} 1 0"), "OK".to_owned()],
+            "restart: {restart}"
+        );
+        assert!(!w.has_entry(BOB), "restart: {restart}");
+
+        // He signs in again: it is his again, for every command.
+        let mut cb = w.sign_in(&b5).await;
+        assert_eq!(
+            w.ask(&mut cb, "sync").await,
+            [format!("CONV alice@example.org {id} 1 0"), "OK".to_owned()],
+            "restart: {restart}"
+        );
+        let lines = w.ask(&mut cb, "groupinfo alice@example.org").await;
+        assert!(lines[0].starts_with("GROUPINFO alice@example.org 1 1 "));
+        let lines = w.ask(&mut cb, "history alice@example.org").await;
+        assert_eq!(lines.last().unwrap(), &format!("OK id={id} more=0"));
+        // Alice's messages reach him.
+        let lines = w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await;
+        assert_eq!(lines.last().unwrap(), "OK seq=2");
+        let got = cb.lines();
+        assert!(
+            untagged(&got[0]).starts_with("ENC alice@example.org 1 "),
+            "{:?}",
+            short(&got)
+        );
+
+        // And it stays so across a restart.
+        w.restart();
+        let mut cb = w.connect(&b5);
+        assert_eq!(
+            w.ask(&mut cb, "sync").await,
+            [format!("CONV alice@example.org {id} 2 0"), "OK".to_owned()],
+            "restart: {restart}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_hosted_identity_that_unregistered_has_no_entry_after_a_restart() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let c7d = Device::new(CAROL, 7);
+    let mut c7 = w.connect(&c7d);
+    direct(&mut w, &a1, &mut c1, &c7d, &mut c7).await;
+    let lines = w.ask(&mut c7, "unregister carol@example.org").await;
+    assert_eq!(lines, ["OK", "<close> BYE identity deleted"]);
+    w.restart();
+    assert!(!w.has_entry(CAROL));
+    let mut c1 = w.connect(&a1);
+    let lines = w.ask(&mut c1, "sync").await;
+    assert!(lines[0].starts_with("CONV carol@example.org "), "{lines:?}");
 }

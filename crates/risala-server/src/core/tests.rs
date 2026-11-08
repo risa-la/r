@@ -2543,7 +2543,7 @@ impl Store for Flaky {
     fn identity(&self, u: &Uid) -> crate::store::Result<Option<crate::store::IdentityRecord>> {
         self.inner.identity(u)
     }
-    fn touch_identity(&self, u: &Uid, t: Timestamp) -> crate::store::Result<()> {
+    fn touch_identity(&self, u: &Uid, t: Timestamp) -> crate::store::Result<bool> {
         self.pause.at("touch_identity");
         self.inner.touch_identity(u, t)
     }

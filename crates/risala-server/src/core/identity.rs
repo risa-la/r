@@ -20,7 +20,7 @@ use risala_proto::text::unescape;
 use super::commands::{Fail, Outcome, Reply, fail, respond};
 use super::keys::{FetchError, KeyFilePublisher};
 use super::rate::network;
-use super::state::UserEntry;
+use super::state::{ConvEntry, UserEntry};
 use super::{Inner, KEY_FETCH_TIMEOUT, UNAVAILABLE_RETRY};
 use crate::handler::ConnId;
 use crate::store::{HostedKey, KeyChange, Registered};
@@ -328,7 +328,7 @@ impl Inner {
             }
         }
         let (who, now) = (uid.clone(), self.now());
-        self.db(move |s| s.touch_identity(&who, now)).await?;
+        let new = self.db(move |s| s.touch_identity(&who, now)).await?;
         {
             let mut reg = self.reg();
             if user.lock().ending {
@@ -343,6 +343,11 @@ impl Inner {
                 return Ok(None);
             }
         }
+        drop(_keys);
+        if new {
+            // Before the reply, so that its SYNC lists them.
+            self.rejoin_directs(user).await;
+        }
         tracing::debug!(conn = id.0, "signed in as an identity");
         let ok = OkResponse::new().with_uid(uid);
         Ok(Some(if self.is_operator(uid) {
@@ -350,6 +355,40 @@ impl Inner {
         } else {
             ok
         }))
+    }
+
+    /// Makes the identity of `user`, which the server did not know until
+    /// it signed in just now, a participant again of the direct
+    /// conversations it was in before it unregistered (4.8): they belong
+    /// to the pair (5.1). The store keeps them, and that the identity is
+    /// known, so a restart agrees ([`Hub::build`](super::Hub::build)).
+    ///
+    /// Each is changed under its lock, as UNREGISTER's [`auto_part`]
+    /// takes it, and under the registry's, as UNREGISTER marks the entry
+    /// ending: one that began meanwhile either finds the conversation in
+    /// the user's list, or is seen here and nothing is added.
+    ///
+    /// [`auto_part`]: Inner::auto_part
+    pub(super) async fn rejoin_directs(&self, user: &Arc<UserEntry>) {
+        let uid = &user.uid;
+        let entries: Vec<Arc<ConvEntry>> = self
+            .directs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((a, b), _)| a == uid || b == uid)
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        for entry in entries {
+            let mut st = entry.lock().await;
+            let _reg = self.reg();
+            if user.lock().ending {
+                return;
+            }
+            if !st.is_member(uid) {
+                st.add_member(&entry, user);
+            }
+        }
     }
 
     /// Closes the connections of `uid` whose device key is not in `keys`

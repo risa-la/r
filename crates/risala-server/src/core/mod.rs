@@ -456,14 +456,28 @@ impl Hub {
             rooms.insert(room, entry);
         }
         let mut directs = HashMap::new();
+        // Its participants are the identities of the pair that the server
+        // knows: one that unregistered is not, until it signs in again
+        // (4.8; `Inner::rejoin_directs`).
+        let mut known: HashMap<Uid, bool> = HashMap::new();
         for record in store.directs()? {
             let pair = (record.a.clone(), record.b.clone());
             let entry = Arc::new(ConvEntry::new(ConvState::direct(record)));
             {
                 let mut st = entry.try_lock().expect("a new conversation is not locked");
                 for uid in [&pair.0, &pair.1] {
-                    let user = reg.user(uid);
-                    st.add_member(&entry, &user);
+                    let is_known = match known.get(uid) {
+                        Some(&k) => k,
+                        None => {
+                            let k = store.identity(uid)?.is_some();
+                            known.insert(uid.clone(), k);
+                            k
+                        }
+                    };
+                    if is_known {
+                        let user = reg.user(uid);
+                        st.add_member(&entry, &user);
+                    }
                 }
             }
             directs.insert(pair, entry);

@@ -623,8 +623,9 @@ pub trait Store:
     fn identity(&self, uid: &Uid) -> Result<Option<IdentityRecord>>;
 
     /// Records that `uid` signed in at `now`: it is known to the server
-    /// from now on (5.1).
-    fn touch_identity(&self, uid: &Uid, now: Timestamp) -> Result<()>;
+    /// from now on (5.1). Returns whether it was not known before: new,
+    /// or back after UNREGISTER (4.8).
+    fn touch_identity(&self, uid: &Uid, now: Timestamp) -> Result<bool>;
 
     /// Creates the hosted identity `uid` with `key` as its only key (4.6),
     /// unless the identity exists or its uid was retired (4.8, 10.5).
