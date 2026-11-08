@@ -9,8 +9,8 @@ use risala_proto::types::{Relation, Role, RoomRetention, RoomSetting};
 use super::tests::{Client, Flaky, Harness, T, config, put, seq, set, start, timers, value};
 use crate::config::Config;
 use crate::store::{
-    ConvKey, EventKind, HistoryQuery, MessageStore, NewEvent, PurgeQuery, RelatedQuery,
-    SqliteStore, Store,
+    AuthoredConv, ConvKey, EventKind, HistoryQuery, MessageStore, NewEvent, PurgeQuery,
+    RelatedQuery, SqliteStore, Store,
 };
 
 const ALICE: &str = "alice@example.org";
@@ -886,7 +886,7 @@ async fn unregister_with_purge_deletes_every_message() {
 // The store
 
 #[test]
-fn the_store_finds_reactions_and_authored_rooms() {
+fn the_store_finds_reactions_and_authored_conversations() {
     let s = SqliteStore::open_in_memory().unwrap();
     for room in ["#a", "#b", "#c"] {
         s.ensure_room(&room.parse().unwrap(), start()).unwrap();
@@ -899,17 +899,20 @@ fn the_store_finds_reactions_and_authored_rooms() {
     let key = |room: &str| s.room(&room.parse().unwrap()).unwrap().unwrap().key;
     let sam = "~sam".parse().unwrap();
     let rooms: Vec<String> = s
-        .authored_rooms(&sam, None)
+        .authored_convs(&sam, None)
         .unwrap()
         .into_iter()
-        .map(|(k, room)| {
+        .map(|(k, conv)| {
+            let AuthoredConv::Room(room) = conv else {
+                panic!("not a room: {conv:?}");
+            };
             assert_eq!(k, key(room.as_str()));
             room.to_string()
         })
         .collect();
     assert_eq!(rooms, ["#a"]);
     let later = start().checked_add(Duration::from_millis(1)).unwrap();
-    assert!(s.authored_rooms(&sam, Some(later)).unwrap().is_empty());
+    assert!(s.authored_convs(&sam, Some(later)).unwrap().is_empty());
 
     let a = key("#a");
     assert_eq!(

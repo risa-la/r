@@ -1468,3 +1468,146 @@ async fn reportenc_reveals_content_that_matches_its_commitment() {
         ["ERR invalid REPORTENC is for ENC events"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADMIN PURGE (10.4) and UNREGISTER purge=yes (4.8)
+
+/// Starts the direct conversation of `a1` and `b5`, with a leaf each.
+async fn direct(
+    w: &mut World,
+    a1: &Device,
+    c1: &mut Client,
+    b5: &Device,
+    cb: &mut Client,
+) -> (MlsGroup, MlsGroup) {
+    let mut ga1 = a1.create(&RisalaConversation::direct(&a1.uid, &b5.uid));
+    let peer = b5.uid.to_string();
+    w.ask(c1, &a1.init_line(&peer, &ga1)).await;
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b5.kp()],
+            ..Changes::default()
+        },
+    );
+    w.ask(c1, &sent.line(&peer)).await;
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    let gb5 = b5.join(find(&cb.lines(), "WELCOME"));
+    c1.lines();
+    (ga1, gb5)
+}
+
+#[tokio::test]
+async fn admin_purge_reaches_direct_conversations_and_enc() {
+    let mut w = World::new();
+    w.h.hub.inner.operators.write().unwrap().insert(uid(CAROL));
+    let mut op = w.connect(&Device::new(CAROL, 7));
+    let Pair {
+        a1,
+        mut c1,
+        ga1,
+        b5,
+        mut cb,
+        gb5,
+    } = pair(&mut w, SendMode::All).await;
+    let (gd1, gd5) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+    // In the room: 9 and 10 are Bob's, 11 Alice's.
+    for content in ["TEXT one\n", "TEXT two\n"] {
+        w.ask(&mut cb, &b5.enc("#r", &gb5, content)).await;
+    }
+    w.ask(&mut c1, &a1.enc("#r", &ga1, "TEXT mine\n")).await;
+    // In the direct conversation: 2 is Bob's, 3 Alice's, 4 Bob's.
+    w.ask(&mut cb, &b5.enc(ALICE, &gd5, "TEXT hi\n")).await;
+    w.ask(&mut c1, &a1.enc(BOB, &gd1, "TEXT hello\n")).await;
+    w.ask(&mut cb, &b5.enc(ALICE, &gd5, "TEXT bye\n")).await;
+    c1.lines();
+    cb.lines();
+
+    let lines = w.ask(&mut op, "admin purge bob@example.net").await;
+    assert_eq!(lines, ["OK deleted=4"]);
+    // Rooms first, then direct conversations, each named for whoever
+    // receives the line (5.2), with the operator as `from`.
+    let from = format!("from={CAROL} ");
+    let lines = c1.lines();
+    assert_eq!(
+        short(&lines),
+        [
+            "DELETE #r 9",
+            "DELETE #r 10",
+            "DELETE bob@example.net 2",
+            "DELETE bob@example.net 4",
+        ]
+    );
+    assert!(lines.iter().all(|l| l.contains(&from)), "{lines:?}");
+    assert_eq!(
+        short(&cb.lines()),
+        [
+            "DELETE #r 9",
+            "DELETE #r 10",
+            "DELETE alice@example.org 2",
+            "DELETE alice@example.org 4",
+        ]
+    );
+    // The placeholders lose their payload and `frank` (5.4); Alice's
+    // message stays.
+    let lines = w
+        .ask(&mut c1, "history bob@example.net after=1 limit=3")
+        .await;
+    assert!(
+        lines[0].ends_with(";deleted ENC bob@example.net 1"),
+        "{}",
+        lines[0]
+    );
+    assert!(!lines[0].contains("frank="));
+    assert!(
+        lines[1].contains(";frank=") && untagged(&lines[1]).starts_with("ENC bob@example.net 1 ")
+    );
+    assert!(
+        lines[2].ends_with(";deleted ENC bob@example.net 1"),
+        "{}",
+        lines[2]
+    );
+    let lines = w.ask(&mut c1, "history #r after=8 limit=3").await;
+    assert!(lines[0].ends_with(";deleted ENC #r 1"), "{}", lines[0]);
+    assert!(lines[1].ends_with(";deleted ENC #r 1"), "{}", lines[1]);
+    assert!(lines[2].contains(";frank="), "{}", lines[2]);
+    // Nothing left.
+    assert_eq!(
+        w.ask(&mut op, "admin purge bob@example.net").await,
+        ["OK deleted=0"]
+    );
+}
+
+#[tokio::test]
+async fn unregister_with_purge_reaches_direct_conversations() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let (gd1, gd5) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+    // 2 is Bob's, 3 Alice's.
+    w.ask(&mut cb, &b5.enc(ALICE, &gd5, "TEXT hi\n")).await;
+    w.ask(&mut c1, &a1.enc(BOB, &gd1, "TEXT hello\n")).await;
+    c1.lines();
+    cb.lines();
+
+    // Bob's connections are out of the conversation before the purge, as
+    // they are out of rooms.
+    let lines = w.ask(&mut cb, "unregister bob@example.net purge=yes").await;
+    assert_eq!(lines, ["OK", "<close> BYE identity deleted"]);
+    // The DELETE has Bob as `from` (4.8), and Alice keeps the
+    // conversation, with her own message.
+    let lines = c1.lines();
+    assert_eq!(short(&lines), ["DELETE bob@example.net 2"]);
+    assert!(lines[0].contains(&format!(";from={BOB} ")), "{}", lines[0]);
+    let lines = w.ask(&mut c1, "history bob@example.net after=1").await;
+    assert!(
+        lines[0].ends_with(";deleted ENC bob@example.net 1"),
+        "{}",
+        lines[0]
+    );
+    assert!(!lines[0].contains("frank="));
+    assert!(lines[1].contains(";frank="), "{}", lines[1]);
+    assert!(untagged(&lines[2]).starts_with("DELETE bob@example.net 2"));
+}

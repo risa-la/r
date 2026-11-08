@@ -49,7 +49,7 @@ pub use groups::{
     CommitStored, DirectInit, DirectRecord, GroupCommit, GroupInit, GroupLeaf, GroupMeta,
     GroupParts, GroupRecord, GroupState, GroupStateError, GroupStore, NewWelcome,
 };
-pub use messages::{MessageStore, PurgeQuery, RelatedQuery};
+pub use messages::{AuthoredConv, MessageStore, PurgeQuery, RelatedQuery};
 pub use moderation::ModerationStore;
 pub use reports::{NewReport, ReportAdded, ReportRecord, ReportStore};
 pub use sqlite::SqliteStore;

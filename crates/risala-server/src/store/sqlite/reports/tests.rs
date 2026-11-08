@@ -278,7 +278,7 @@ fn a_dropped_room_is_gone_before_its_events_are() {
     assert_eq!(store.room(&room("#general")).unwrap(), None);
     assert_eq!(store.rooms().unwrap(), []);
     assert_eq!(
-        store.authored_rooms(&uid("bob@example.net"), None).unwrap(),
+        store.authored_convs(&uid("bob@example.net"), None).unwrap(),
         []
     );
 

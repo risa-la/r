@@ -2178,12 +2178,12 @@ impl crate::store::MessageStore for Flaky {
         self.pause.at("related");
         self.inner.related(c, q)
     }
-    fn authored_rooms(
+    fn authored_convs(
         &self,
         a: &Uid,
         s: Option<Timestamp>,
-    ) -> crate::store::Result<Vec<(ConvKey, Room)>> {
-        self.inner.authored_rooms(a, s)
+    ) -> crate::store::Result<Vec<(ConvKey, crate::store::AuthoredConv)>> {
+        self.inner.authored_convs(a, s)
     }
     fn purge(
         &self,

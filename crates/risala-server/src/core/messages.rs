@@ -40,8 +40,8 @@ use super::state::{ConvState, RoomInfo};
 use super::{Hub, Inner};
 use crate::handler::ConnId;
 use crate::store::{
-    Appended, ConvKey, EventKind, NewEvent, PurgeQuery, RelatedQuery, RoomSettings, StoreError,
-    StoredEvent,
+    Appended, AuthoredConv, ConvKey, EventKind, NewEvent, PurgeQuery, RelatedQuery, RoomSettings,
+    StoreError, StoredEvent,
 };
 
 /// How often [`Hub::expire_every`] runs in `risalad` (7.5). Periods are
@@ -420,17 +420,16 @@ impl Inner {
         Ok(Some(OkResponse::new().with_deleted(deleted)))
     }
 
-    /// Deletes the messages `author` sent, in every conversation, as DELETE
-    /// does (5.4), with `by` as the `from` of each DELETE event: all of
-    /// them, or with `since`, those sent at or after it. Returns how many
-    /// DELETE events were recorded. For ADMIN PURGE (10.4), and UNREGISTER
+    /// Deletes the messages `author` sent, MSG and ENC events, in every
+    /// conversation, rooms and direct conversations alike, as DELETE does
+    /// (5.4), with `by` as the `from` of each DELETE event: all of them,
+    /// or with `since`, those sent at or after it. Returns how many DELETE
+    /// events were recorded. For ADMIN PURGE (10.4), and UNREGISTER
     /// `purge=yes` (4.8), where `by` is `author`.
     ///
-    /// Takes each room's lock in turn, a batch at a time, so the caller
-    /// must hold none. In each room, it deletes only what was there when it
-    /// started, so it ends even if the author keeps sending.
-    ///
-    /// M5a: direct conversations.
+    /// Takes each conversation's lock in turn, a batch at a time, so the
+    /// caller must hold none. In each, it deletes only what was there when
+    /// it started, so it ends even if the author keeps sending.
     pub(super) async fn purge(
         &self,
         author: &Uid,
@@ -438,17 +437,22 @@ impl Inner {
         since: Option<Timestamp>,
     ) -> Result<u64, StoreError> {
         let who = author.clone();
-        let rooms = self.db(move |s| s.authored_rooms(&who, since)).await?;
+        let convs = self.db(move |s| s.authored_convs(&who, since)).await?;
         let mut count = 0;
-        for (key, room) in rooms {
-            let Some(entry) = self.room_entry(&room) else {
+        for (key, conv) in convs {
+            let entry = match &conv {
+                AuthoredConv::Room(room) => self.room_entry(room),
+                AuthoredConv::Direct(a, b) => self.direct_entry(a, b),
+            };
+            let Some(entry) = entry else {
                 continue;
             };
             let mut upto = None;
             loop {
                 let mut st = entry.lock().await;
                 // Dropped meanwhile, perhaps created again (10.4): its
-                // messages are gone already.
+                // messages are gone already. Direct conversations are
+                // never dropped.
                 if st.dropped || st.key != key {
                     break;
                 }

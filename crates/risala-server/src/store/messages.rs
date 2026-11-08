@@ -23,10 +23,19 @@ pub struct RelatedQuery {
     pub limit: u64,
 }
 
+/// A conversation that [`MessageStore::authored_convs`] finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoredConv {
+    /// A room.
+    Room(Room),
+    /// A direct conversation, by its participants in order (5.1).
+    Direct(Uid, Uid),
+}
+
 /// What [`MessageStore::purge`] deletes (4.8, 10.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgeQuery {
-    /// Whose messages: those whose `from` is this uid. For a guest uid,
+    /// Whose messages: MSG and ENC events whose `from` is this uid. For a guest uid,
     /// every message sent under the name.
     pub author: Uid,
     /// Only messages sent at or after this time, if given.
@@ -72,18 +81,18 @@ pub trait MessageStore {
     /// [`StoreError::NoConversation`]: super::StoreError::NoConversation
     fn related(&self, conv: ConvKey, query: RelatedQuery) -> Result<Page>;
 
-    /// The rooms in which `author` has messages that are not deleted, sent
-    /// at or after `since` if given, in name order (4.8, 10.4).
-    ///
-    /// M5a: direct conversations.
-    fn authored_rooms(
+    /// The conversations in which `author` has messages (MSG or ENC) that
+    /// are not deleted, sent at or after `since` if given (4.8, 10.4):
+    /// rooms in name order, then direct conversations in the order they
+    /// started. Rooms being dropped are left out.
+    fn authored_convs(
         &self,
         author: &Uid,
         since: Option<Timestamp>,
-    ) -> Result<Vec<(ConvKey, Room)>>;
+    ) -> Result<Vec<(ConvKey, AuthoredConv)>>;
 
-    /// Deletes messages of `query.author` in one conversation, as DELETE
-    /// does (5.4), oldest first: for each, appends a DELETE event and
+    /// Deletes messages (MSG and ENC events) of `query.author` in one
+    /// conversation, as DELETE does (5.4), oldest first: for each, appends a DELETE event and
     /// applies it, all in one transaction. A message that an earlier one
     /// of these deletions took with it, such as an edit of a deleted
     /// message, gets no DELETE of its own.
