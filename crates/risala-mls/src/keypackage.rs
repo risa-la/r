@@ -158,10 +158,21 @@ mod tests {
     #[test]
     fn hpke_keys_must_be_x_wing_sized() {
         assert!(hpke_public_key_ok(&[1; X_WING_PUBLIC_KEY_LEN]));
-        assert!(encryption_key_ok(&EncryptionKey::from(vec![1; X_WING_PUBLIC_KEY_LEN])));
-        for len in [0, 10, 1184, X_WING_PUBLIC_KEY_LEN - 1, X_WING_PUBLIC_KEY_LEN + 1] {
+        assert!(encryption_key_ok(&EncryptionKey::from(
+            vec![1; X_WING_PUBLIC_KEY_LEN]
+        )));
+        for len in [
+            0,
+            10,
+            1184,
+            X_WING_PUBLIC_KEY_LEN - 1,
+            X_WING_PUBLIC_KEY_LEN + 1,
+        ] {
             assert!(!hpke_public_key_ok(&vec![1; len]), "{len}");
-            assert!(!encryption_key_ok(&EncryptionKey::from(vec![1; len])), "{len}");
+            assert!(
+                !encryption_key_ok(&EncryptionKey::from(vec![1; len])),
+                "{len}"
+            );
         }
     }
 }

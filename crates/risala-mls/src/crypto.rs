@@ -352,13 +352,27 @@ mod tests {
     #[test]
     fn hpke_refuses_x_wing_keys_of_the_wrong_length() {
         let crypto = RisalaCrypto::new().unwrap();
-        let pair = crypto.derive_hpke_keypair(CIPHERSUITE.hpke_config(), &[7; 32]).unwrap();
+        let pair = crypto
+            .derive_hpke_keypair(CIPHERSUITE.hpke_config(), &[7; 32])
+            .unwrap();
         assert_eq!(pair.public.len(), X_WING_PUBLIC_KEY_LEN);
-        assert!(crypto.hpke_seal(CIPHERSUITE.hpke_config(), &pair.public, b"", b"", b"hi").is_ok());
-        for len in [0, 10, 1184, X_WING_PUBLIC_KEY_LEN - 1, X_WING_PUBLIC_KEY_LEN + 1] {
+        assert!(
+            crypto
+                .hpke_seal(CIPHERSUITE.hpke_config(), &pair.public, b"", b"", b"hi")
+                .is_ok()
+        );
+        for len in [
+            0,
+            10,
+            1184,
+            X_WING_PUBLIC_KEY_LEN - 1,
+            X_WING_PUBLIC_KEY_LEN + 1,
+        ] {
             let pk = vec![1; len];
             assert_eq!(
-                crypto.hpke_seal(CIPHERSUITE.hpke_config(), &pk, b"", b"", b"hi").err(),
+                crypto
+                    .hpke_seal(CIPHERSUITE.hpke_config(), &pk, b"", b"", b"hi")
+                    .err(),
                 Some(CryptoError::InvalidLength),
                 "{len}"
             );
