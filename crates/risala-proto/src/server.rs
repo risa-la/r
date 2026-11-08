@@ -389,9 +389,10 @@ pub enum ServerLine {
     /// KICK, BAN, UNBAN, SET, ROLE, ENC or COMMIT.
     Event(Event),
     /// The copy of a reported event that follows a [`Report`](Self::Report)
-    /// line, with the same `report` tag (5.8). It always has its `seq`, `t`
-    /// and `from`. Clients must not treat it as a new event in the
-    /// conversation. A reported ENC event has an empty payload and keeps
+    /// line, with the same `report` tag (5.8). It is a MSG or ENC event
+    /// that is not deleted, and always has its `seq`, `t` and `from`.
+    /// Clients must not treat it as a new event in the conversation. A
+    /// reported ENC event has an empty payload and keeps
     /// its `frank`; its content is on the REPORTENC line
     /// ([`Report::franking`]).
     ReportCopy(Event),
@@ -1796,6 +1797,8 @@ impl Event {
             EventBody::Enc(enc) if enc.deleted || enc.payload.is_some() => Err(bad(
                 "a reported ENC event has an empty payload and is not deleted",
             )),
+            // The target of a report is not deleted (5.8).
+            EventBody::Msg(msg) if msg.deleted => Err(bad("a reported MSG event is not deleted")),
             EventBody::Msg(_) | EventBody::Enc(_) => Ok(()),
             // Only messages can be reported (5.8).
             _ => Err(bad("a reported event is a MSG or ENC event")),
@@ -3452,6 +3455,8 @@ mod tests {
         syntax(&format!("@report=p4;t={T} REPORT #general"));
         syntax(&format!("@report=p4;t={T};from=nobody REPORT #general 1"));
         syntax("@report=p4 MSG #general hi");
+        // The reported message is not deleted (5.8), MSG or ENC.
+        syntax(&format!("@report=p4;seq=3;t={T};from=~x;deleted MSG #a"));
         assert_eq!(
             err(&format!("@report=p4;t={T} REPORT #a 1 {}", "x".repeat(513))),
             ParseError::TooLong
