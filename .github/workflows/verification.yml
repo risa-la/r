@@ -1,0 +1,291 @@
+name: Verification
+
+# Runs the tools behind the verification page (verification/README.md):
+# test coverage, fuzzing, Kani and TLC, and the Apple client's tests.
+# Each job runs one step of verification/collect.sh and uploads its raw
+# results; the last job puts them together as the `verification-raw`
+# artifact. The site build (site.yml) downloads the newest one from a
+# successful run on main. It never runs the tools itself.
+
+on:
+  push:
+    branches:
+      - main
+      # To try the workflow before review. Drop this line before merging.
+      - verification
+    # The site does not change any result.
+    paths-ignore:
+      - "site/**"
+  schedule:
+    # Nightly. It also grows the fuzz corpus.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz:
+        description: Grow the fuzz corpus, 10 minutes per target, as the nightly run does
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Pushes replace a run still in progress, so they do not pile up. The
+# nightly run has its own group and is never cancelled by a push.
+concurrency:
+  group: verification-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  KANI_VERSION: 0.68.0
+
+jobs:
+  # Unit and integration tests under cargo llvm-cov. collect.sh records
+  # failing tests rather than failing, since the page reports them; the
+  # job fails only when there is no coverage to report.
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      # Coverage builds of the whole workspace take more disk than the
+      # runner has free. Drop toolchains the job does not use.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: cachix/install-nix-action@v31
+      # Coverage needs a Rust whose coverage runtime matches its LLVM,
+      # which nixpkgs' rustc does not have (see collect.sh). Use rustup's,
+      # with its LLVM tools, for the instrumented builds.
+      - name: rustup toolchain for coverage
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools
+          echo "COVERAGE_TOOLCHAIN=$(rustup run stable rustc --print sysroot)" >>"$GITHUB_ENV"
+      - name: collect.sh tests
+        run: nix develop --command verification/collect.sh tests
+      - name: the coverage was written
+        run: |
+          for f in unit integration; do
+            test -s "target/verification/raw/tests/$f.json" || { echo "::error::no $f coverage"; exit 1; }
+          done
+          cat target/verification/raw/tests/*-status.json
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: raw-tests
+          path: target/verification/raw/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The fuzz corpus is kept out of git, in the Actions cache, with
+  # stats.json beside it (how long each target has been fuzzed). The
+  # nightly run fuzzes each target for 10 minutes and saves the grown
+  # corpus; other runs only restore it and measure its coverage.
+  #
+  # A cache entry cannot be changed, so each saving run writes a new one
+  # (fuzz-corpus-<run id>), and a restore takes the newest by prefix.
+  # GitHub evicts entries unused for 7 days, and the oldest once the
+  # repository's caches pass 10 GB. If the nightly run stops for a week
+  # (GitHub pauses schedules in repositories without activity for 60
+  # days), the corpus and its time are lost and start again from zero;
+  # the page then shows the smaller time.
+  #
+  # Only runs on main save: a branch's cache entries are visible to that
+  # branch alone, while main's are visible to every branch.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      GROW: ${{ github.event_name == 'schedule' || inputs.fuzz == true }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      # One path per crate with fuzz targets (collect.sh's FUZZ_TARGETS).
+      - name: restore the fuzz corpus
+        id: corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            crates/risala-proto/fuzz/corpus
+            crates/risala-pow/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: collect.sh fuzz-run 600
+        id: fuzz
+        if: env.GROW == 'true'
+        run: nix develop --command verification/collect.sh fuzz-run 600
+      # With no saved corpus (the first run, or a branch, or after the
+      # cache was evicted), fuzz briefly so there is a corpus to measure.
+      # The page shows the time, so it does not overstate it.
+      - name: collect.sh fuzz-run 60, to seed an empty corpus
+        id: seed
+        if: env.GROW != 'true' && steps.corpus.outputs.cache-matched-key == ''
+        run: nix develop --command verification/collect.sh fuzz-run 60
+      # Saved even when a target crashed, so the other targets' progress
+      # is kept.
+      - name: save the fuzz corpus
+        if: ${{ !cancelled() && env.GROW == 'true' && github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            crates/risala-proto/fuzz/corpus
+            crates/risala-pow/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+      # A crash fails the job, so the run is not published. Keep the input.
+      - name: upload crashing inputs
+        if: ${{ failure() && (steps.fuzz.outcome == 'failure' || steps.seed.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes
+          path: crates/*/fuzz/artifacts/
+          if-no-files-found: ignore
+      # Coverage needs a Rust whose coverage runtime matches its LLVM,
+      # which nixpkgs' rustc does not have (see collect.sh). Use rustup's,
+      # with its LLVM tools, for the instrumented builds.
+      - name: rustup toolchain for coverage
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools
+          echo "COVERAGE_TOOLCHAIN=$(rustup run stable rustc --print sysroot)" >>"$GITHUB_ENV"
+      - name: collect.sh fuzz-cover
+        if: ${{ !cancelled() }}
+        run: nix develop --command verification/collect.sh fuzz-cover
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: raw-fuzz
+          path: target/verification/raw/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Kani is not in nixpkgs, so it is installed with cargo, on the runner's
+  # rustup. `cargo kani setup` then fetches Kani's bundle and the nightly
+  # toolchain it needs. Proofs that fail are recorded, not fatal.
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: cache cargo-kani
+        id: kani-bin
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+          key: kani-verifier-${{ env.KANI_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: install Kani ${{ env.KANI_VERSION }}
+        run: |
+          if [ "${{ steps.kani-bin.outputs.cache-hit }}" != true ]; then
+            cargo install --locked kani-verifier --version "$KANI_VERSION"
+          fi
+          cargo kani setup
+          cargo kani --version
+      - name: collect.sh kani
+        run: verification/collect.sh kani
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: raw-kani
+          path: target/verification/raw/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # TLC on the models in proofs/. AsWritten.cfg is expected to find a
+  # violation; collect.sh records the result and the page compares it with
+  # what config.json expects.
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: collect.sh tla
+        run: nix develop --command verification/collect.sh tla
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: raw-tla
+          path: target/verification/raw/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The Apple client's tests with coverage, through xcodebuild and xccov.
+  # When the Apple build breaks, the rest of the page still publishes: the
+  # job may fail without failing the run, and the page then shows no Swift
+  # results.
+  swift:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      # The Xcode that clients/apple/nix/toolchain.nix names, when the
+      # image has it.
+      - name: select Xcode
+        run: |
+          want=$(sed -n 's/^ *version = "\(.*\)";/\1/p' clients/apple/nix/toolchain.nix)
+          app=/Applications/Xcode_$want.app
+          if [ ! -d "$app" ]; then
+            app=$(find /Applications -maxdepth 1 -name "Xcode_$want*.app" | sort | head -1)
+          fi
+          if [ -n "$app" ] && [ -d "$app" ]; then
+            sudo xcode-select -s "$app"
+          else
+            echo "::warning::Xcode $want is not on this runner; using the default Xcode"
+          fi
+          xcodebuild -version
+      - name: collect.sh swift
+        run: verification/collect.sh swift
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: raw-swift
+          path: target/verification/raw/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Puts the jobs' results in one tree (raw/tests, raw/fuzz, raw/kani,
+  # raw/tla, raw/swift) with raw/meta.json, checks that assemble.ts reads
+  # it, and uploads it for the site. It runs even when a job failed, so
+  # the partial results can be looked at; the site only takes successful
+  # runs.
+  collect:
+    needs: [tests, fuzz, kani, tla, swift]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # All history: assemble.ts reads draft-02 of the spec from git.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: raw-*
+          path: raw
+          merge-multiple: true
+      - name: raw/meta.json
+        env:
+          COMMIT: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p raw
+          jq -n --arg commit "$COMMIT" --arg runUrl "$RUN_URL" \
+            --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{commit: $commit, runUrl: $runUrl, generated: $generated}' >raw/meta.json
+          cat raw/meta.json
+          find raw -maxdepth 2 | sort
+      - name: the assembler's tests
+        run: node --test verification/lib.test.ts
+      - name: assemble.ts reads the results
+        run: |
+          node verification/assemble.ts --raw raw --out "$RUNNER_TEMP/verification-data" |
+            tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: verification-raw
+          path: raw/
+          retention-days: 30

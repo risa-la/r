@@ -3,6 +3,10 @@ name: Site
 # Builds the website in site/ and publishes it to GitHub Pages at risa.la.
 # The site reads the spec from spec/, so changes to it publish too. Pull
 # requests build without publishing.
+#
+# The verification page's results come from the Verification workflow
+# (verification.yml): each time it finishes on main, the site is built
+# again with its results. The build only downloads them.
 
 on:
   push:
@@ -10,12 +14,18 @@ on:
     paths:
       - "site/**"
       - "spec/**"
+      - "verification/**"
       - ".github/workflows/site.yml"
   pull_request:
     paths:
       - "site/**"
       - "spec/**"
+      - "verification/**"
       - ".github/workflows/site.yml"
+  workflow_run:
+    workflows: [Verification]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -29,12 +39,51 @@ concurrency:
 
 jobs:
   build:
+    # After a failed Verification run there is nothing new to show.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read # to download the Verification workflow's results
     defaults:
       run:
         working-directory: site
     steps:
+      # All history: the page lists the sources of the commit that was
+      # verified, and assemble.ts reads draft-02 of the spec from git.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The newest results from a successful Verification run on main,
+      # and that run's commit checked out beside this one, so that line
+      # numbers match the results. Without results (the first run, a fork,
+      # or results older than their 30 days), the site builds anyway and
+      # the page says there are none.
+      - name: download the verification results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          raw=$RUNNER_TEMP/verification-raw
+          root=$RUNNER_TEMP/verified
+          mkdir -p "$raw"
+          run=$(gh run list --workflow verification.yml --branch main --status success \
+            --limit 1 --json databaseId,headSha --jq '.[0] // empty | "\(.databaseId) \(.headSha)"' || true)
+          if [ -n "$run" ]; then
+            read -r id sha <<<"$run"
+            if gh run download "$id" --name verification-raw --dir "$raw" &&
+              git worktree add --detach "$root" "$sha"; then
+              echo "results of run $id, commit $sha"
+              echo "VERIFY_ROOT=$root" >>"$GITHUB_ENV"
+            else
+              echo "::warning::could not use the results of run $id; building without them"
+              rm -rf "$raw" && mkdir -p "$raw"
+            fi
+          else
+            echo "::warning::no successful Verification run on main; building without results"
+          fi
+          echo "VERIFY_RAW=$raw" >>"$GITHUB_ENV"
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -42,15 +91,20 @@ jobs:
           cache-dependency-path: site/package-lock.json
       - run: npm ci
       - run: npm run check
+      # prebuild runs verification/assemble.ts, which reads VERIFY_ROOT
+      # and VERIFY_RAW.
       - run: npm run build
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site/dist
 
+  # A workflow_run event runs on the default branch, so its github.ref is
+  # refs/heads/main and it deploys too.
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       pages: write
       id-token: write
