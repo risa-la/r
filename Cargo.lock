@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "librisala"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "risala-cli"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "clap",
  "librisala",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "risala-keyfetch"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "rcgen",
  "risala-proto",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "risala-proto"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "base64",
  "libcrux-ml-dsa",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "risala-server"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "proptest",

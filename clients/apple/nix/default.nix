@@ -21,7 +21,7 @@
         platform:
         pkgs.stdenvNoCC.mkDerivation {
           pname = "risala-${platform}";
-          version = "0.1.0-xcode-${toolchain.version}-${toolchain.build}";
+          version = "0.0.0-xcode-${toolchain.version}-${toolchain.build}";
           src = source;
           # Apple SDKs and tools are supplied by the host, not the Nix store.
           __noChroot = true;
