@@ -3212,6 +3212,67 @@ mod tests {
         assert_eq!(hex(&mac), PINNED_MAC);
     }
 
+    /// Appendix B.12: the same vectors, checked against the appendix.
+    #[test]
+    fn appendix_b() {
+        let mut ck = crate::appendix::Checker::open("B.12 ");
+        let attestation_seed = [0x55; 32];
+        let randomness = [0x66; ENCAPSULATION_RANDOMNESS_LEN];
+        let group_id = [0x33; 32];
+        let answerer = SigningKey::from_seed([0x44; 32]);
+        let challenger = SigningKey::from_seed([0x77; 32]);
+        ck.hex("attestation key seed", &attestation_seed);
+        ck.hex("encapsulation randomness", &randomness);
+        ck.hex("group id", &group_id);
+        ck.hex("answerer leaf key seed", &[0x44; 32]);
+        ck.eq("answerer leaf index", "3");
+        ck.hex("challenger leaf key seed", &[0x77; 32]);
+        ck.eq("challenger leaf index", "7");
+        ck.gap();
+        let key = AttestationKey::from_seed(Zeroizing::new(attestation_seed));
+        let (ct, ss) = encapsulate_derand(key.public_key(), &randomness).unwrap();
+        assert_eq!(key.decapsulate(&ct).unwrap(), ss);
+        let (a, c) = (answerer.public_key(), challenger.public_key());
+        let mac = confirm_mac(&ss, &group_id, &ct[..], a, c);
+        ck.file(
+            "attestation key",
+            "confirm-attestation-key.bin",
+            key.public_key(),
+        );
+        ck.file("ciphertext", "confirm-ciphertext.bin", &ct[..]);
+        ck.hex("shared secret", ss.as_bytes());
+        ck.hex("ConfirmContent", &confirm_content(&group_id, &ct[..], a, c));
+        ck.hex("K", &confirm_key(&ss)[..]);
+        ck.hex("MAC", &mac);
+        let challenge = ContentLine::Challenge {
+            leaf: 3,
+            ciphertext: ChallengeCiphertext::from_bytes(&ct),
+        };
+        ck.file(
+            "the CHALLENGE line",
+            "confirm-challenge.txt",
+            challenge.to_line().unwrap().as_bytes(),
+        );
+        let answer = ContentLine::Answer {
+            leaf: 7,
+            mac: ConfirmMac::from_bytes(mac),
+        };
+        ck.eq("the ANSWER line", answer.to_line().unwrap());
+        assert!(check_answer(&ss, &group_id, &ct[..], a, c, &mac));
+        ck.gap();
+        let mut flipped = mac;
+        flipped[HASH_LEN - 1] ^= 1;
+        ck.rejected(
+            "the MAC with its last bit flipped",
+            !check_answer(&ss, &group_id, &ct[..], a, c, &flipped),
+        );
+        ck.rejected(
+            "the MAC checked with the two leaf keys swapped",
+            !check_answer(&ss, &group_id, &ct[..], c, a, &mac),
+        );
+        ck.finish();
+    }
+
     const PINNED_CT_HASH: &str = "b8c1cec58b43296f6b98a7bed384aa7063cde506a717cd87971fb04c7a9b3c176fc4c6c879dbf005710376c91e9c2994";
     const PINNED_SS: &str = "1447f492fbfefd103aeeafaea5e8f44b540f9adf1caae810f659f45cdfce17fd";
     const PINNED_MAC: &str = "2fa54ceb6262059f0aaaec1ee90f9675c30293931c3e1bfdf4654690caf73c39edf45c74af74172137a68edcb12a8904";

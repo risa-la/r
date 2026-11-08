@@ -1443,6 +1443,44 @@ mod tests {
         assert_eq!(hex(&bytes), ARCHIVE_VECTOR);
     }
 
+    /// Appendix B.16: [`sample`] and its TransferRef, checked against the
+    /// appendix.
+    #[test]
+    fn appendix_b() {
+        let mut ck = crate::appendix::Checker::open("B.16 ");
+        let archive = sample();
+        let more = &archive.more[0];
+        ck.eq("TransferRef blob", more.blob.to_string());
+        ck.hex("TransferRef key", more.key.as_bytes());
+        ck.gap();
+        let transfer = more.to_bytes();
+        ck.hex("TransferRef", &transfer[..]);
+        let bytes = archive.encode();
+        ck.hex("HistoryArchive", &bytes);
+        assert_eq!(TransferRef::from_bytes(&transfer[..]), Ok(more.clone()));
+        assert_eq!(HistoryArchive::decode(&bytes), Ok(archive.clone()));
+        ck.gap();
+        let mut version = bytes.to_vec();
+        version[0] = 2;
+        ck.rejected(
+            "the HistoryArchive with version 2",
+            HistoryArchive::decode(&version).is_err(),
+        );
+        let mut longer = bytes.to_vec();
+        longer.push(0);
+        ck.rejected(
+            "the HistoryArchive with a byte after it",
+            HistoryArchive::decode(&longer).is_err(),
+        );
+        let mut version = transfer.to_vec();
+        version[0] = 2;
+        ck.rejected(
+            "the TransferRef with version 2",
+            TransferRef::from_bytes(&version).is_err(),
+        );
+        ck.finish();
+    }
+
     const ARCHIVE_VECTOR: &str = "0111616c696365406578616d706c652e6f72670000019a63259a004186200101\
      0101010101010101010101010101010101010101010101010101010101010b65\
      78616d706c652e6f726701010101010101010101010101010101410901010101\

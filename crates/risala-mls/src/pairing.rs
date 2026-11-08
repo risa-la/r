@@ -1410,6 +1410,98 @@ mod tests {
         assert_eq!(relay.open_bundle(&fixed, &key), Ok(b));
     }
 
+    /// Appendix B.11: the keys and ids from the pairing secret, and a
+    /// SealedBundle, checked against the appendix.
+    #[test]
+    fn appendix_b() {
+        let mut ck = crate::appendix::Checker::open("B.11 ");
+        let relay = secret().relay();
+        let key = pairing_key(3);
+        let b = IdentityBundle {
+            master_key: vec![0x50; MASTER_KEY_LEN],
+            ..bundle(true)
+        };
+        ck.hex("secret", secret().as_bytes());
+        ck.hex("pairing key seed", &[3; 32]);
+        ck.eq("uid", b.uid.to_string());
+        assert!(b.master_key.iter().all(|&x| x == 0x50));
+        ck.eq("master_key", format!("{} bytes of 50", b.master_key.len()));
+        ck.hex("signing_seed", &b.signing_seed[..]);
+        ck.eq("backup_generation", b.backup.generation().to_string());
+        ck.hex("backup_key", b.backup.as_bytes());
+        ck.hex("record_hash", &b.record_hash);
+        ck.eq(
+            "hosts",
+            b.hosts
+                .iter()
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let transfer = b.transfer.as_ref().unwrap();
+        ck.eq("transfer blob", transfer.blob.to_string());
+        ck.hex("transfer key", transfer.key.as_bytes());
+        ck.gap();
+        ck.hex("new_id", relay.new_id().as_bytes());
+        ck.eq("new_id as a box", relay.new_id().to_string());
+        ck.hex("new_key", &relay.new_key[..]);
+        ck.hex("old_id", relay.old_id().as_bytes());
+        ck.eq("old_id as a box", relay.old_id().to_string());
+        ck.hex("old_key", &relay.old_key[..]);
+        ck.file("pairing key", "pairing-key.bin", key.public_key());
+        let encoded = b.encode();
+        ck.file("IdentityBundle", "identity-bundle.bin", &encoded);
+        assert_eq!(IdentityBundle::decode(&encoded), Ok(b.clone()));
+        let sealed = unhex(SEALED_BUNDLE_VECTOR);
+        assert_eq!(relay.open_bundle(&sealed, &key), Ok(b.clone()));
+        ck.file("a SealedBundle of it", "sealed-bundle.bin", &sealed);
+        ck.gap();
+        let mut version = sealed.clone();
+        version[0] = 2;
+        ck.rejected(
+            "the SealedBundle with version 2",
+            relay.open_bundle(&version, &key).is_err(),
+        );
+        let other = PairingSecret::from_bytes([1; 32]).relay();
+        ck.rejected(
+            "the SealedBundle opened with the old_key of the secret 32 bytes of 01",
+            other.open_bundle(&sealed, &key).is_err(),
+        );
+        ck.rejected(
+            "the SealedBundle opened with the pairing key of seed 32 bytes of 04",
+            relay.open_bundle(&sealed, &pairing_key(4)).is_err(),
+        );
+        let no_hosts = IdentityBundle {
+            hosts: vec![],
+            ..b.clone()
+        };
+        ck.rejected(
+            "the IdentityBundle with no hosts",
+            IdentityBundle::decode(&no_hosts.encode()).is_err(),
+        );
+        let repeated = IdentityBundle {
+            hosts: vec![b.hosts[0].clone(), b.hosts[1].clone(), b.hosts[0].clone()],
+            ..b.clone()
+        };
+        ck.rejected(
+            "the IdentityBundle with hosts chat.example.org example.net chat.example.org",
+            IdentityBundle::decode(&repeated.encode()).is_err(),
+        );
+        let mut version = encoded.to_vec();
+        version[0] = 2;
+        ck.rejected(
+            "the IdentityBundle with version 2",
+            IdentityBundle::decode(&version).is_err(),
+        );
+        ck.finish();
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2)
+            .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+            .collect()
+    }
+
     const PAIRING_VECTOR: [&str; 8] = [
         "38395018115278eecb70023050f20bb2",
         "f730c19cdb093a583cf927c2e8dac3c2c45c75ee3f8b89dcd7a1ed16e4ad6931",

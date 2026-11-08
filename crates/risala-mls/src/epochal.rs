@@ -1075,4 +1075,121 @@ mod tests {
         println!("sha384(certificate) = {}", hex(&sha384(&cert_sig)));
         println!("sha384(attestation) = {}", hex(&sha384(&attest_sig)));
     }
+    /// Appendix B.13: [`vectors`], checked against the appendix.
+    #[test]
+    fn appendix_b() {
+        use crate::risala_sign::sign_content;
+        use libcrux_ml_dsa::ml_dsa_44 as mldsa;
+
+        let det_sign = |seed: [u8; 32], label: &str, content: &[u8]| -> Vec<u8> {
+            let pair = mldsa::generate_key_pair(seed);
+            mldsa::sign(
+                &pair.signing_key,
+                &sign_content(label, content),
+                b"",
+                [0; 32],
+            )
+            .unwrap()
+            .as_ref()
+            .to_vec()
+        };
+        let mut ck = crate::appendix::Checker::open("B.13 ");
+        let last_seed = [0x22; 32];
+        let device_seed = [0x11; 32];
+        let group_id = [0x33; 32];
+        let period = 20767;
+        let noon = 1_794_225_600_000;
+        ck.eq("time", noon.to_string());
+        ck.eq("last period of the chain", "20855");
+        ck.hex("its seed", &last_seed);
+        ck.eq("uid", "alice@example.org");
+        ck.hex("device key seed", &device_seed);
+        ck.eq("period", period.to_string());
+        ck.hex("group id", &group_id);
+        ck.hex("leaf key seed", &[0x44; 32]);
+        ck.gap();
+        ck.eq("period of the time", period_of_ms(noon).to_string());
+        ck.hex("seed of period 20854", &previous_seed(&last_seed)[..]);
+        let seed = seed_before(&last_seed, 20855 - period);
+        ck.hex("seed of period 20767", &seed[..]);
+        let period_key = SigningKey::from_seed(*seed);
+        ck.file("period key", "period-key.bin", period_key.public_key());
+        let device_key = SigningKey::from_seed(device_seed);
+        let device_id = DeviceId::of_device_key(device_key.public_key());
+        ck.hex("device id", device_id.as_bytes());
+        let cert = PeriodCert {
+            uid: "alice@example.org",
+            device_id: &device_id,
+            period,
+            period_key: period_key.public_key(),
+        };
+        let cert_bytes = cert.encode();
+        ck.file("PeriodCert", "periodcert.bin", &cert_bytes);
+        let cert_sig = det_sign(device_seed, PERIOD_LABEL, &cert_bytes);
+        assert!(cert.verify(device_key.public_key(), &cert_sig));
+        ck.file("certificate", "period-certificate.bin", &cert_sig);
+        let leaf = SigningKey::from_seed([0x44; 32]);
+        let content = AttestContent {
+            group_id: &group_id,
+            period,
+            leaf_key_hash: sha384(leaf.public_key()),
+        };
+        let content_bytes = content.encode();
+        ck.hex("AttestContent", &content_bytes);
+        let attest_sig = det_sign(*seed, ATTEST_LABEL, &content_bytes);
+        assert!(content.verify(period_key.public_key(), &attest_sig));
+        ck.file("attestation", "attestation.bin", &attest_sig);
+        let mut ring = PeriodKeyring::new();
+        ring.start_chain_with(20766, last_seed);
+        assert_eq!(*ring.seed(period).unwrap(), *seed);
+        ck.eq(
+            "the REVEAL line",
+            ring.reveal(period).unwrap().to_line().unwrap(),
+        );
+        assert!(seed_derives(&seed, period, period, period_key.public_key()));
+        assert!(seed_derives(
+            &last_seed,
+            20855,
+            period,
+            period_key.public_key()
+        ));
+        ck.gap();
+        let other_leaf = SigningKey::from_seed([0x45; 32]);
+        let wrong = AttestContent {
+            leaf_key_hash: sha384(other_leaf.public_key()),
+            ..content
+        };
+        ck.rejected(
+            "the attestation checked for a leaf key from the seed 32 bytes of 45",
+            !wrong.verify(period_key.public_key(), &attest_sig),
+        );
+        // Period 20767 runs from 1794268800000, and its grace hour ends at
+        // 1794358800000.
+        assert_eq!(period_start(period), 1_794_268_800_000);
+        assert_eq!(grace_end(period), 1_794_358_800_000);
+        assert!(within_period_or_grace(period, 1_794_268_800_000));
+        assert!(within_period_or_grace(period, 1_794_358_800_000 - 1));
+        ck.rejected(
+            "an ATTEST for period 20767 posted at 1794268799999",
+            !within_period_or_grace(period, 1_794_268_799_999),
+        );
+        ck.rejected(
+            "an ATTEST for period 20767 posted at 1794358800000",
+            !within_period_or_grace(period, 1_794_358_800_000),
+        );
+        ck.rejected(
+            "a REVEAL of period 20767 with the seed 32 bytes of 23",
+            !seed_derives(&[0x23; 32], period, period, period_key.public_key()),
+        );
+        ck.rejected(
+            "a REVEAL of period 20767 with the seed of period 20766",
+            !seed_derives(
+                &previous_seed(&seed),
+                period - 1,
+                period,
+                period_key.public_key(),
+            ),
+        );
+        ck.finish();
+    }
 }

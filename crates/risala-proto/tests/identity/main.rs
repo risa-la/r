@@ -3,6 +3,8 @@
 //! recovery keys, pairing and safety numbers. `vectors.rs` prints
 //! Appendix B's test vectors.
 
+#[path = "../common/appendix.rs"]
+mod appendix;
 mod chains;
 mod formats;
 mod keyfiles;

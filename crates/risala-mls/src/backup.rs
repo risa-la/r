@@ -953,6 +953,59 @@ mod tests {
         );
     }
 
+    /// Appendix B.17: [`vector`], checked against the appendix.
+    #[test]
+    fn appendix_b() {
+        let mut ck = crate::appendix::Checker::open("B.17 ");
+        let recovery = RecoveryKey::from_bytes(std::array::from_fn(|i| i as u8));
+        let blob = BlobRef::of(b"backup");
+        let file_key = FileKey::from_bytes(std::array::from_fn(|i| 0x40 + i as u8));
+        let nonce: [u8; AEAD_NONCE_LEN] = std::array::from_fn(|i| 0xa0 + i as u8);
+        ck.hex("recovery key", recovery.as_bytes());
+        ck.eq("uid", alice().to_string());
+        ck.hex("archive", b"backup");
+        ck.hex("file key", file_key.as_bytes());
+        ck.hex("nonce", &nonce);
+        ck.gap();
+        for g in [0, 1, 3] {
+            ck.hex(
+                &format!("backup key of generation {g}"),
+                recovery.backup_key(&alice(), g).as_bytes(),
+            );
+        }
+        let g0 = recovery.backup_key(&alice(), 0);
+        ck.eq("blob-ref of the archive", blob.to_string());
+        let aad = g0.associated_data(&alice(), &blob);
+        ck.eq("associated data", String::from_utf8(aad).expect("ASCII"));
+        let wrapped = g0.wrap_with_nonce(&alice(), &blob, &file_key, nonce);
+        ck.hex("WrappedKey under generation 0", wrapped.as_bytes());
+        assert_eq!(g0.unwrap(&alice(), &blob, &wrapped), Ok(file_key));
+        ck.gap();
+        let g1 = recovery.backup_key(&alice(), 1);
+        ck.rejected(
+            "the WrappedKey unwrapped under generation 1",
+            g1.unwrap(&alice(), &blob, &wrapped).is_err(),
+        );
+        // The key of generation 0, but told it is generation 1: the
+        // associated data names the generation.
+        let g0_as_1 = BackupKey::from_bytes(1, *g0.as_bytes());
+        ck.rejected(
+            "the WrappedKey unwrapped with generation 0's key as generation 1",
+            g0_as_1.unwrap(&alice(), &blob, &wrapped).is_err(),
+        );
+        let bob: Identity = "bob@example.org".parse().unwrap();
+        ck.rejected(
+            "the WrappedKey unwrapped for uid bob@example.org",
+            g0.unwrap(&bob, &blob, &wrapped).is_err(),
+        );
+        ck.rejected(
+            "the WrappedKey unwrapped for the blob-ref of backup2",
+            g0.unwrap(&alice(), &BlobRef::of(b"backup2"), &wrapped)
+                .is_err(),
+        );
+        ck.finish();
+    }
+
     // The backup keys and the recovery text are unchanged from M4: only
     // the wrapped key gained its version byte.
     const BACKUP_VECTOR: [&str; 5] = [

@@ -1216,3 +1216,106 @@ fn report_vector() {
     }
     println!("RisalaReport: {}", hex(&encoded));
 }
+
+const CONTENT_1: &str = "TEXT hello\n";
+const CONTENT_2: &str = "@reply=0Jx1HkY3x9z2b5R0qWm1fA== TEXT see you at 12\n";
+
+fn key_1() -> FrankKey {
+    FrankKey::from_bytes((0..32).collect::<Vec<u8>>().try_into().unwrap())
+}
+
+/// Appendix B.14: franks and a RisalaMessage (12.9).
+#[test]
+fn appendix_b_message() {
+    let mut ck = crate::appendix::Checker::open("B.14 ");
+    let key_2 = FrankKey::from_bytes([0x42; 32]);
+    let message = vector_message();
+    ck.hex("frank key 1", key_1().as_bytes());
+    ck.hex("content 1", CONTENT_1.as_bytes());
+    ck.hex("frank key 2", key_2.as_bytes());
+    ck.hex("content 2", CONTENT_2.as_bytes());
+    ck.hex("message_id", message.message_id.as_bytes());
+    ck.eq("counter", message.counter.to_string());
+    ck.hex("previous", message.previous.as_ref().unwrap().as_bytes());
+    ck.eq("time", message.time.to_string());
+    ck.gap();
+    let frank_1 = key_1().frank(CONTENT_1.as_bytes());
+    ck.hex("frank of content 1", &frank_1);
+    ck.hex("frank of content 2", &key_2.frank(CONTENT_2.as_bytes()));
+    let encoded = message.encode();
+    ck.hex("RisalaMessage", &encoded);
+    assert_eq!(message.frank(), frank_1);
+    assert_eq!(RisalaMessage::decode(&encoded), Ok(message.clone()));
+    ck.gap();
+    ck.rejected(
+        "the frank of content 1 checked against content 2",
+        !key_1().matches(CONTENT_2.as_bytes(), &frank_1),
+    );
+    let mut flipped = frank_1;
+    flipped[FRANK_LEN - 1] ^= 1;
+    ck.rejected(
+        "the frank of content 1 with its last bit flipped",
+        !key_1().matches(CONTENT_1.as_bytes(), &flipped),
+    );
+    ck.rejected(
+        "the frank of content 1 checked with frank key 2",
+        !key_2.matches(CONTENT_1.as_bytes(), &frank_1),
+    );
+    let mut version = encoded.to_vec();
+    version[0] = 2;
+    ck.rejected(
+        "the RisalaMessage with version 2",
+        RisalaMessage::decode(&version).is_err(),
+    );
+    ck.finish();
+}
+
+/// Appendix B.18: a RisalaReport (5.8).
+#[test]
+fn appendix_b_report() {
+    let mut ck = crate::appendix::Checker::open("B.18 ");
+    let post = |seq: u64, key: &FrankKey, content: &str| ReportedPost {
+        seq,
+        frank_key: key.clone(),
+        content: content.as_bytes().to_vec(),
+    };
+    let key_2 = FrankKey::from_bytes([0x42; 32]);
+    let report = RisalaReport {
+        target: post(7, &key_1(), CONTENT_1),
+        context: vec![post(5, &key_2, CONTENT_2)],
+        author: "alice@example.org".parse().unwrap(),
+        reason: "spam".into(),
+    };
+    ck.eq("target seq", "7");
+    ck.eq("context seq", "5");
+    ck.eq("author", report.author.to_string());
+    ck.eq("reason", report.reason.as_str());
+    ck.gap();
+    let encoded = report.encode();
+    ck.hex("RisalaReport", &encoded);
+    assert_eq!(RisalaReport::decode(&encoded), Ok(report.clone()));
+    assert_eq!(report.check(), Ok(()));
+    let franks = [
+        key_1().frank(CONTENT_1.as_bytes()),
+        key_2.frank(CONTENT_2.as_bytes()),
+    ];
+    for (reported, frank) in report.posts().zip(&franks) {
+        assert!(reported.matches(frank));
+    }
+    ck.gap();
+    let mut same = report.clone();
+    same.context[0].seq = 7;
+    ck.rejected("the report with context seq 7", same.check().is_err());
+    let mut two = report.clone();
+    two.context = vec![post(5, &key_2, CONTENT_2), post(4, &key_2, CONTENT_2)];
+    ck.rejected(
+        "the report with context seqs 5 then 4",
+        two.check().is_err(),
+    );
+    let wrong = post(7, &key_2, CONTENT_1);
+    ck.rejected(
+        "the target with frank key 2, checked against the frank of content 1",
+        !wrong.matches(&franks[0]),
+    );
+    ck.finish();
+}

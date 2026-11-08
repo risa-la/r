@@ -1152,4 +1152,101 @@ mod tests {
         assert_eq!(upload.len(), 67617);
         assert_eq!(hash.to_string(), FILE_VECTOR_TWO_CHUNKS);
     }
+    /// Appendix B.15: [`vector`] and its cases that must fail, checked
+    /// against the appendix.
+    #[test]
+    fn appendix_b() {
+        let mut ck = crate::appendix::Checker::open("B.15 ");
+        let file_1 = b"hello, risala\n";
+        let file_2 = counting(65529);
+        ck.hex("file key", key().as_bytes());
+        ck.hex("file 1", file_1);
+        ck.eq("file 2", "65529 bytes, byte i being i modulo 251");
+        ck.gap();
+        let (upload_1, hash_1) = enc(&key(), file_1);
+        ck.hex("upload of file 1", &upload_1);
+        ck.eq("file-hash of file 1", hash_1.to_base64());
+        ck.eq("blob-ref of file 1", hash_1.to_string());
+        let (archive_1, archive_hash) = encrypt_with_key(&key(), Label::Archive, file_1);
+        ck.hex("file 1 as an archive", &archive_1);
+        let (upload_2, hash_2) = enc(&key(), &file_2);
+        ck.eq("length of the upload of file 2", upload_2.len().to_string());
+        ck.eq("blob-ref of file 2", hash_2.to_string());
+        assert_eq!(
+            decrypt(&key(), Label::File, &hash_1, &upload_1)
+                .unwrap()
+                .as_slice(),
+            file_1
+        );
+        assert_eq!(
+            decrypt(&key(), Label::Archive, &archive_hash, &archive_1)
+                .unwrap()
+                .as_slice(),
+            file_1
+        );
+        assert_eq!(
+            decrypt(&key(), Label::File, &hash_2, &upload_2)
+                .unwrap()
+                .as_slice(),
+            &file_2[..]
+        );
+        ck.gap();
+        let fails = |upload: &[u8]| decrypt_unhashed(&key(), upload).is_err();
+        let mut version = upload_1.clone();
+        version[0] = 2;
+        ck.rejected("the upload of file 1 with version byte 2", fails(&version));
+        ck.rejected(
+            "file 1 as an archive, decrypted as a file",
+            decrypt(&key(), Label::File, &archive_hash, &archive_1).is_err(),
+        );
+        let chunks = [chunk(&upload_2, 0), chunk(&upload_2, 1)];
+        ck.rejected(
+            "the upload of file 2 cut after its first chunk",
+            fails(&upload_of(&chunks[..1])),
+        );
+        ck.rejected(
+            "the upload of file 2 with its two chunks swapped",
+            fails(&upload_of(&[chunks[1], chunks[0]])),
+        );
+        ck.rejected(
+            "the upload of file 2 with its first chunk again after the last",
+            fails(&upload_of(&[chunks[0], chunks[1], chunks[0]])),
+        );
+        // Both chunks sealed with the last-chunk flag.
+        let plain = [
+            &(file_2.len() as u64).to_be_bytes()[..],
+            &file_2,
+            &vec![0; 67584 - 8 - file_2.len()],
+        ]
+        .concat();
+        let mut flagged = vec![UPLOAD_VERSION];
+        for (i, part) in plain.chunks(CHUNK_LEN).enumerate() {
+            flagged.extend(seal(
+                key().as_bytes(),
+                &chunk_nonce(i as u64, true),
+                Label::File.as_bytes(),
+                part,
+            ));
+        }
+        assert_eq!(flagged.len(), upload_2.len());
+        assert!(fails(&flagged));
+        ck.file(
+            "file 2 with the last-chunk flag on its first chunk too",
+            "file-flagged.bin",
+            &flagged,
+        );
+        ck.gap();
+        let plain = |len: u64, body: &[u8]| [&len.to_be_bytes()[..], body].concat();
+        let bad = [
+            ("length 1, h, then the padding byte 01", plain(1, b"h\x01")),
+            ("length 1, h, then 3 zero bytes", plain(1, b"h\0\0\0")),
+            ("length 3, then hi", plain(3, b"hi")),
+        ];
+        for (name, plain) in bad {
+            let upload = seal_plaintext(&plain);
+            assert!(fails(&upload), "{name}");
+            ck.hex(name, &upload);
+        }
+        ck.finish();
+    }
 }
