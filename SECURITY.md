@@ -11,7 +11,7 @@ see. Please do not report vulnerabilities in public issues, pull
 requests or discussions.
 
 This covers the code in this repository and the protocol itself. A flaw
-in [SPEC.md](SPEC.md) that any correct implementation would share is a
+in the spec ([`spec/`](spec/README.md)) that any correct implementation would share is a
 vulnerability too.
 
 A useful report says:

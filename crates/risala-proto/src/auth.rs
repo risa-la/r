@@ -855,9 +855,9 @@ pub(crate) mod tests {
     const SIGNED: &str = "risala-auth-1\nchat.example.org\n\
         6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e\nalice@example.org\n";
 
-    /// The AUTH command at the end of Appendix B, read from SPEC.md.
+    /// The AUTH command in Appendix B, read from the spec.
     fn spec_auth_line() -> &'static str {
-        include_str!("../../../SPEC.md")
+        include_str!("../../../spec/b-test-vectors.md")
             .lines()
             .rev()
             .find(|l| l.starts_with("AUTH alice@example.org "))

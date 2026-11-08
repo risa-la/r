@@ -1,4 +1,4 @@
-//! Every example line in SPEC.md and README.md parses as a raw [`Line`]
+//! Every example line in the spec (`spec/`) parses as a raw [`Line`]
 //! and displays back unchanged (SPEC 3.1-3.3).
 
 mod common;
@@ -12,14 +12,10 @@ fn collects_examples() {
     let all = spec_examples();
     let count = |f: &dyn Fn(&Example) -> bool| all.iter().filter(|e| f(e)).count();
     let spec = count(&|e| e.source == Source::Spec);
-    let readme = count(&|e| e.source == Source::Readme);
     let client = count(&|e| e.dir == Dir::Client);
     let server = count(&|e| e.dir == Dir::Server);
-    eprintln!(
-        "{} examples: {spec} from SPEC.md, {readme} from README.md; {client} client, {server} server",
-        all.len()
-    );
-    assert!(spec >= 41, "only {spec} examples in SPEC.md");
+    eprintln!("{spec} examples in the spec: {client} client, {server} server");
+    assert!(spec >= 41, "only {spec} examples in the spec");
     assert!(client >= 10, "only {client} client examples");
     assert!(server >= 30, "only {server} server examples");
 }
@@ -105,41 +101,6 @@ fn examples_survive_the_decoder() {
 }
 
 #[test]
-fn readme_session_directions() {
-    use Dir::{Client as C, Server as S};
-    let readme: Vec<Example> = spec_examples()
-        .into_iter()
-        .filter(|e| e.source == Source::Readme)
-        .collect();
-    let dirs: Vec<Dir> = readme.iter().map(|e| e.dir).collect();
-    // The greeting, `guest sam`, OK, `join #general`, the JOIN event,
-    // six SET snapshots, OK, `msg #general hello!`, the MSG event, OK.
-    assert_eq!(
-        dirs,
-        [S, C, S, C, S, S, S, S, S, S, S, S, C, S, S],
-        "{readme:#?}"
-    );
-    assert!(readme[0].line.starts_with("RISALA 1 "));
-}
-
-#[test]
-fn readme_agrees_with_spec() {
-    // Lines that appear in both documents are sent by the same side.
-    let all = spec_examples();
-    let mut shared = 0;
-    for readme in all.iter().filter(|e| e.source == Source::Readme) {
-        for spec in all
-            .iter()
-            .filter(|e| e.source == Source::Spec && e.line == readme.line)
-        {
-            assert_eq!(readme.dir, spec.dir, "{readme} vs {spec}");
-            shared += 1;
-        }
-    }
-    assert!(shared >= 5, "only {shared} README lines found in SPEC.md");
-}
-
-#[test]
 fn specific_examples_are_present() {
     let all = spec_examples();
     let find = |needle: &str| {
@@ -180,13 +141,8 @@ fn specific_examples_are_present() {
 #[test]
 fn spec_lines_point_at_the_example() {
     let spec_lines: Vec<&str> = common::SPEC.split('\n').collect();
-    let readme_lines: Vec<&str> = common::README.split('\n').collect();
     for e in spec_examples() {
-        let doc = match e.source {
-            Source::Spec => &spec_lines,
-            Source::Readme => &readme_lines,
-        };
-        let text = doc[e.spec_line - 1];
+        let text = spec_lines[e.spec_line - 1];
         assert!(text.ends_with(&e.line), "{e} vs {text:?}");
     }
 }

@@ -1,49 +1,41 @@
 # risala
 
-risala is a chat protocol for independent servers, made of plain UTF-8
-text lines over TLS. Think "modern IRC": rooms, guests and a terminal
-you can type into, plus stored history, portable identities, replies,
-edits, reactions, file sharing, push notifications and end-to-end
-encryption.
+risala is a modern chat protocol for independent servers. Every
+conversation is end-to-end encrypted, public rooms included, and the
+server is trusted with as little as possible: it carries encrypted
+messages without learning who sent them, and keeps no history.
 
-```
-$ openssl s_client -connect chat.example.org:7472 -quiet
-RISALA 1 chat.example.org 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e Welcome!
-guest sam
-OK uid=~sam token=q7m2x9k4b8n1v5c3z6l0w2e4r7t9y1u3
-join #general
-@seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general
-SET #general topic General chat. Be kind.
-SET #general public yes
-SET #general guests write
-SET #general retention server
-SET #general e2ee no
-SET #general send all
-OK id=k3f9q2 head=8812 role=member
-msg #general hello!
-@seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam MSG #general hello!
-OK seq=8813
-```
+- **Zero trust in the server.** Devices check membership, roles and
+  keys themselves, and never take the server's word for whose keys are
+  whose. What a server can still do is listed in the spec.
+- **Everything encrypted.** Direct conversations, private rooms and
+  public rooms all use MLS, with a new key for every message.
+- **Deniable.** A message that leaks does not prove to anyone else who
+  wrote it.
+- **Little metadata.** Devices post without signing in, so the server
+  does not learn who sends a message, or who is in a direct
+  conversation or a private room. It still sees network addresses and
+  timing, and the members of public rooms.
+- **No history on the server.** Encrypted messages wait only until
+  devices have had time to fetch them. History moves between your own
+  devices, and into an optional backup that only your recovery key
+  opens.
+- **Portable identity, witnessed keys.** `alice@example.org` is whoever
+  controls the key file at `https://example.org/.well-known/risala/alice`.
+  Every key is also in a transparency log checked by public witnesses,
+  and no operator can reset an identity.
+- **Post-quantum.** Hybrid ML-KEM in TLS, X-Wing in MLS, and ML-DSA
+  signatures.
+- **Independent servers and large rooms.** No federation, and no server
+  is special. Private rooms hold up to 1,000 members and public rooms up
+  to 10,000, with guests.
 
-- **Usable by hand.** Everything outside encrypted conversations works
-  from `openssl s_client`.
-- **Small where it can be.** A client for public rooms needs only TLS
-  and ML-DSA. Encrypted conversations need MLS.
-- **Independent servers.** No federation, and no server is special.
-  Every conversation lives on exactly one server.
-- **Portable identity.** `alice@example.org` is whoever holds a key
-  listed at `https://example.org/.well-known/risala/alice`. The same
-  identity works on any server.
-- **History.** Every event has a sequence number, so a client that
-  reconnects fetches exactly what it missed.
-- **End-to-end encrypted** direct conversations and private rooms, using
-  MLS. Devices keep their history keys, so encrypted history still syncs
-  and works offline.
-- **Post-quantum.** Hybrid ML-KEM key exchange for TLS and MLS, and
-  ML-DSA signatures.
-
-The protocol is defined in [SPEC.md](SPEC.md) (draft-02). Anything in it
-may still change.
+The protocol is defined in the spec ([`spec/`](spec/)), now at draft-03.
+Anything in it may still change. Draft-03 is a design: the code here
+still implements most of draft-02, which had plaintext public rooms and
+history kept on the server, and is being moved to draft-03 (PLAN.md,
+item 59). Its new constructions, such as deniable leaf confirmation,
+epochal signatures and send tokens, have not been reviewed yet.
 
 ## This repository
 
@@ -55,7 +47,7 @@ and in what order.
 |---|---|---|
 | `risala-proto` | Rust | The protocol's lines, names and keys, with no I/O |
 | `risalad` | Rust | The server (`crates/risala-server`) |
-| `risala-keyfetch` | Rust | Fetches key files over HTTPS for the server (SPEC 4.4) |
+| `risala-keyfetch` | Rust | Fetches key files over HTTPS for the server (spec 4.4) |
 | `librisala` | Rust | The shared client library: connection, identity, sync, history cache, rooms, messages, moderation |
 | `risala-cli` | Rust | A small terminal client and key tool, built on librisala |
 | `risala-dev` | Rust | A local server filled with development data, for the apps |
@@ -250,17 +242,17 @@ cargo run -p risala-server -- --config risalad.toml
 (default `info`), for example `RUST_LOG=debug`. SIGINT and SIGTERM shut
 it down cleanly: every connection gets `BYE server shutting down`.
 
-**Connecting.** Any TLS 1.3 client with the post-quantum key exchange
-X25519MLKEM768 works (Section 2.1 of the spec), such as `openssl` 3.5 or
-later:
+**Connecting.** Clients need TLS 1.3 with the post-quantum key exchange
+X25519MLKEM768 (Section 2.1 of the spec). Today's `risalad` still speaks
+draft-02, so `risala-cli` is the client to use with it. To look at a
+server from a terminal, `openssl` 3.5 or later works:
 
 ```
 openssl s_client -connect localhost:7472 -quiet
 ```
 
-Then type `guest sam`, `join #general` and `msg #general hello!`, as in
-the session at the top of this file.
-[Section 12 of the spec](SPEC.md#12-command-summary) lists every
+Then type `info`.
+[Section 13 of the spec](spec/13-command-summary.md) lists every
 command.
 
 **Checking the fingerprint.** On start, `risalad` logs the fingerprint
@@ -282,8 +274,8 @@ openssl s_client -connect localhost:7472 </dev/null 2>/dev/null \
 ```
 
 The hex digits it prints, after `sha256:`, are the fingerprint.
-[Appendix A of the spec](SPEC.md#appendix-a-using-risala-by-hand) also
-shows how to make a key and sign in with nothing but `openssl`.
+[Appendix A of the spec](spec/a-checking-a-server-by-hand.md) shows the
+same check.
 
 ## Contributing and security
 
@@ -295,7 +287,7 @@ described in [SECURITY.md](SECURITY.md).
 
 Copyright (c) 2026 Risala developers.
 
-The protocol specification ([SPEC.md](SPEC.md)) is licensed under
+The protocol specification (the spec, [`spec/`](spec/)) is licensed under
 [CC BY 4.0](LICENSES/CC-BY-4.0.txt). The code and everything else are
 licensed under the [Apache License 2.0](LICENSES/Apache-2.0.txt). The
 repository follows the [REUSE](https://reuse.software) specification;

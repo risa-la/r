@@ -1,6 +1,6 @@
 //! Helpers for the end-to-end tests: transcripts played against a
-//! [`TestServer`] over TLS, and the example sessions of SPEC.md and
-//! README.md.
+//! [`TestServer`] over TLS, and the example sessions of the spec
+//! (`spec/`).
 //!
 //! A transcript is written as in the spec, one line each:
 //!
@@ -21,13 +21,31 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use risala_proto::server::ServerMessage;
 use risala_server::store::{EventKind, NewEvent, SqliteStore, Store as _};
 use risala_server::testing::TestClient;
 
-/// The text of SPEC.md.
-pub const SPEC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SPEC.md"));
+/// The whole spec: `spec/README.md`, then the folder's other files in
+/// name order, as its contents list them.
+pub static SPEC: LazyLock<String> = LazyLock::new(|| {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("the spec folder, spec/")
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".md"))
+        .collect();
+    names.sort_by_key(|n| (n != "README.md", n.clone()));
+    let mut spec = String::new();
+    for n in names {
+        spec.push_str(&std::fs::read_to_string(format!("{dir}/{n}")).unwrap());
+        if !spec.ends_with('\n') {
+            spec.push('\n');
+        }
+    }
+    spec
+});
 
 /// The text of README.md.
 pub const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
@@ -341,7 +359,7 @@ fn mask(line: &str) -> String {
         text = parts.join(" ");
     }
     if text.starts_with("OK uid=~") {
-        // OK uid=~<name> token=<token> (4.2). The example in SPEC.md 1.4
+        // OK uid=~<name> token=<token> (4.2). The draft-02 example in 1.4
         // leaves the token out.
         let uid = text.split(' ').nth(1).unwrap_or_default();
         text = format!("OK {uid} token={{*}}");
@@ -377,11 +395,11 @@ fn code_blocks(doc: &str) -> Vec<Vec<&str>> {
 }
 
 /// The `C:` and `S:` lines of the first code block that has any, after
-/// the heading that starts with `heading` in SPEC.md.
+/// the heading that starts with `heading` in the spec.
 pub fn spec_example(heading: &str) -> Example {
     let start = SPEC
         .find(&format!("\n{heading}"))
-        .unwrap_or_else(|| panic!("SPEC.md has no heading {heading:?}"));
+        .unwrap_or_else(|| panic!("the spec has no heading {heading:?}"));
     let lines: Vec<String> = code_blocks(&SPEC[start..])
         .into_iter()
         .map(|block| {
@@ -396,33 +414,3 @@ pub fn spec_example(heading: &str) -> Example {
     Example { lines }
 }
 
-/// The session in README.md: the lines after `$ openssl s_client` in its
-/// first code block. The direction comes from the verb's case: people
-/// type lower case, and servers send upper case (3.1).
-pub fn readme_example() -> Example {
-    let block = code_blocks(README)
-        .into_iter()
-        .find(|b| b.iter().any(|l| l.starts_with("$ openssl s_client")))
-        .expect("README.md has an openssl session");
-    let lines = block
-        .into_iter()
-        .skip_while(|l| !l.starts_with("$ openssl s_client"))
-        .skip(1)
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let verb = l
-                .strip_prefix('@')
-                .and_then(|l| l.split_once(' '))
-                .map_or(l, |(_, rest)| rest)
-                .split(' ')
-                .next()
-                .unwrap();
-            if verb.bytes().all(|b| b.is_ascii_uppercase()) {
-                format!("S: {l}")
-            } else {
-                format!("C: {l}")
-            }
-        })
-        .collect();
-    Example { lines }
-}

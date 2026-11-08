@@ -1,4 +1,4 @@
-//! Every `S:` example in SPEC.md and README.md parses as a typed
+//! Every `S:` example in the spec (`spec/`) parses as a typed
 //! [`ServerMessage`] and serialises back byte for byte (SPEC Section 13).
 //!
 //! Base64 values that the spec shortens with `…` (12.1) are first made

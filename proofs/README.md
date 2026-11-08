@@ -1,9 +1,9 @@
 # Proofs
 
-Formal models of parts of the risala protocol. They model
-[SPEC.md](../SPEC.md), not the Rust code. Each model checks claims that
-the spec makes, or that a client relies on, over every possible
-interleaving of events, within small bounds.
+Formal models of parts of the risala protocol. They model the spec as of
+draft-02, not the Rust code; [`spec/`](../spec/README.md) now holds
+draft-03. Each model checks claims that the spec makes, or that a client
+relies on, over every possible interleaving of events, within small bounds.
 
 The tools come with the dev shell (`nix develop`), as `tlc`.
 

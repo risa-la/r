@@ -1,4 +1,5 @@
-//! The risala protocol, as defined in SPEC.md (draft-02).
+//! The risala protocol, as defined in the spec (`spec/`). The code still
+//! implements draft-02; draft-03 is the redesign of PLAN.md item 59.
 //!
 //! This crate has no networking and no async code. It parses and
 //! serialises lines, validates names, escapes text and builds and checks

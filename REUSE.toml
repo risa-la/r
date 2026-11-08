@@ -12,7 +12,7 @@ SPDX-License-Identifier = "Apache-2.0"
 # The protocol specification. Later matches win, so this overrides the
 # Apache-2.0 default above.
 [[annotations]]
-path = "SPEC.md"
+path = "spec/**"
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (c) 2026 Risala developers"
 SPDX-License-Identifier = "CC-BY-4.0"

@@ -2,7 +2,7 @@
 
 The working plan for the Apple app's chat list, the library support it
 needs, and the developer data the apps are built against.
-[SPEC.md](../../SPEC.md) (draft-02) is the source of truth.
+The spec ([`spec/`](../../spec/README.md)) is the source of truth; this plan was written against draft-02.
 [M2-M5.md](M2-M5.md)'s "Conventions" still apply to the Rust parts.
 
 Decided with the user on 2026-11-08:

@@ -1,0 +1,219 @@
+## 6. Rooms
+
+### 6.1. Joining and Leaving
+
+A room is **public** or **private** from the moment it is created, and
+stays so (12.4).
+
+| | Private room | Public room |
+|---|---|---|
+| Members | at most 1,000 identities and 4,096 leaves | at most 10,000 identities and 32,768 leaves |
+| Who may join | only those invited (below) | anyone not banned, and guests if the room allows them |
+| Listed by LIST | no | yes |
+| Membership | hidden from the server: commits are encrypted | visible to the server, which checks commits (12.6) |
+| Leaf confirmation | pairwise up to 256 members, then epochal (12.10) | epochal (12.10) |
+
+Devices refuse a commit that takes a room over its limits, and in public
+rooms the server refuses it too (12.6, 12.7). These limits will be
+revisited once ML-DSA and X-Wing have been measured on phones.
+
+```
+LIST [after=<room>] [limit=<n>]
+```
+
+→ one `ROOM <room> <box> <members> [<topic...>]` line per public room,
+then `OK more=<0 or 1>`
+
+- `<members>` is the number of identities and guests with a leaf in the
+  room's group, and `<topic...>` the topic in its conversation extension
+  (6.2). The server reads both from the group, which it holds for public
+  rooms. A device checks them once it has joined.
+- A guest's LIST leaves out rooms whose `guests` setting is `none`.
+- Rooms come in order of name, compared byte by byte.
+- **`after`** returns only rooms whose names sort after `<room>`, which
+  need not exist. To fetch the next page, send LIST again with `after`
+  set to the last room returned.
+- **`limit`** is at least 1 and defaults to 100. A server MAY return
+  fewer rooms than asked for. `more=1` means there are more rooms after
+  the last one returned.
+
+```
+INFO <room>
+```
+
+→ `OK box=<box> members=<n> epoch=<epoch>`
+
+Looks up one public room by name. A name that is not a public room on
+this server gets `ERR not-found`.
+
+```
+GROUPINFO <box>
+```
+
+→ `GROUPINFO <box> <epoch> <seq> <groupinfo> <tree>`, then `OK`
+
+Returns a public room's current GroupInfo and ratchet tree, as the
+server holds them (12.6). `<seq>` is the seq of the commit that started
+the epoch, or `0` in epoch 0. `<groupinfo>` and `<tree>` are each base64
+with padding, or a blob-ref (12.12): the tree of a large room is always
+a blob. A mailbox that is not a public room gets `ERR not-found`.
+
+**Joining a public room.** A device fetches GROUPINFO, checks the group
+as in 12.7, and joins in one of two ways:
+
+- **By external commit,** if it is a full client, one that keeps the
+  whole tree. It posts the external commit with the token `-` (5.2).
+- **By external proposal,** if it is a light client (12.6). It posts an
+  external Add proposal (`new_member_proposal` [RFC9420]) holding a
+  KeyPackage of its own, with the token `-`. A full client in the room
+  commits it (below), and the device then fetches its Welcome with
+  WELCOME GET (12.8).
+
+A guest joins the same way, with a leaf whose credential names its guest
+uid (12.3). The server refuses a join (`ERR forbidden`) by a banned
+identity, by a guest where `guests` is `none`, or by a device whose key
+is not current in its identity's key file. It MAY ask for proof of work
+first (4.1).
+
+Full clients in a public room commit pending join proposals, and
+pending SelfRemove proposals (below). Each one waits a random time of up
+to 10 minutes after the oldest pending proposal, then commits them all
+at once, unless another commit has done so first. A room in which no
+full client is online cannot admit anyone by proposal. An owner can keep
+a full client online for the room, for example on a desktop.
+
+**Joining a private room.** Only by invitation. An owner or moderator
+invites someone by fetching KeyPackages of the invitee's devices
+(12.5), and committing an Add of each of them (12.7). The invitee's
+devices get Welcomes (12.8), and their client shows the invitation. The
+invitee accepts by following the mailbox and taking part, and declines
+by leaving (below). There is no INVITE command, and the server does not
+know about invitations.
+
+**Starting a direct conversation.** A device creates the group and the
+mailbox, and adds the other participant's devices and its own other
+devices (12.7). A conversation with yourself is started the same way,
+with only your own devices.
+
+**Leaving.** A device leaves a group with a commit that removes the
+leaves of every other device of its identity, and a SelfRemove proposal
+[MLS-EXT] for its own leaf, which it posts right after. An MLS member
+cannot remove itself in its own commit, so another member's device
+commits the SelfRemove, and SHOULD do so within a few minutes. Devices
+treat the identity as having left once they have seen both. A device
+whose identity has no other leaves in the group sends only the
+SelfRemove.
+
+Devices ignore messages from a leaf that has posted a SelfRemove. In a
+private room, coming back always takes a new invitation.
+
+**Guests.** When a guest's session ends (4.2), the server sends
+`GONE <box> <uid>` to the connections that follow each public room the
+guest had a leaf in. A full client then removes the guest's leaf in its
+next commit. A GONE line is not a post, and devices act on it only for
+guest leaves, since removing one never lets anyone new read.
+
+**Dropped rooms.** When an operator drops a room or a mailbox (10.4),
+the server sends `DROP <box> [<reason...>]` to the connections that
+follow it. The conversation cannot go on there. Clients SHOULD tell the
+user, and MAY keep what they have stored.
+
+### 6.2. Settings
+
+A room's settings live in its conversation extension (12.4), where
+every device reads them. They change only by a commit that carries a
+GroupContextExtensions proposal, made by someone the table allows. There
+is no SET command.
+
+| Field | Values | Default | Who may change it |
+|---|---|---|---|
+| `name` | private rooms: text up to 128 bytes; public rooms: the room name (3.5) | | owners, in private rooms only |
+| `topic` | text up to 512 bytes, may be empty | empty | owners, moderators |
+| `guests` | `none`, `read` or `write` | `write` in public rooms, `none` in private ones | owners, in public rooms only |
+| `send` | `all` or `mods` | `all` | owners |
+| `confirm` | `pairwise` or `epochal` | `pairwise` in private rooms, `epochal` in public ones | owners, from `pairwise` to `epochal` only |
+| `owners`, `mods` | lists of uids | the creator is the only owner | owners (6.3) |
+| `bans` | a list of uids | empty | owners, moderators (6.4) |
+
+- `guests none`: guests cannot join. `guests read`: guests may join, and
+  devices ignore their TEXT lines and typing. `guests write`: guests may
+  also send. If guests start sending spam, an owner can switch the room
+  to `read`.
+- Changing `guests` to `none` also removes the guests' leaves, in the
+  same commit.
+- `send mods`: the room is for announcements. Devices ignore TEXT lines
+  from plain members and guests, other than reactions, and their typing
+  (5.3, 8.1).
+- `confirm`: how devices confirm whose leaf is whose (12.10). A private
+  room that grows past 256 members moves to `epochal`, in the commit
+  that takes it over 256 or before. It does not move back.
+
+Devices refuse a commit that changes a field it may not change, or any
+other field of the extension (12.7). In a public room the server
+refuses it too.
+
+### 6.3. Roles
+
+Each identity in a room is an `owner`, a `mod` (moderator) or a plain
+member. The `owners` and `mods` lists of the conversation extension say
+which. Whoever creates a room is its first owner. Guests are always
+plain members, and cannot be added to either list.
+
+A role belongs to the identity, not to its leaves, and stays when it
+leaves the room. Coming back to a private room still takes an
+invitation.
+
+| Action | member | mod | owner |
+|---|---|---|---|
+| Send messages; edit, react to and delete your own | ✓ | ✓ | ✓ |
+| Send messages in a room with `send mods` (6.2) | | ✓ | ✓ |
+| Delete anyone's messages (5.4) | | ✓ | ✓ |
+| Set `topic` | | ✓ | ✓ |
+| Invite (6.1); kick, ban and unban plain members (6.4) | | ✓ | ✓ |
+| Kick, ban and unban moderators and owners | | | ✓ |
+| Change `name`, `guests`, `send`, `confirm`, `owners` and `mods` | | | ✓ |
+
+- A room always keeps at least one owner. Devices refuse a commit that
+  removes the last one from `owners`, or kicks or bans them.
+- Devices check the role of whoever sent a message or made a commit
+  against the extension as it was at that epoch.
+- Server operators have no role in rooms, and no way to act as one,
+  since devices take roles only from the group. They can mute and drop
+  (Section 10).
+
+### 6.4. Moderation
+
+Owners and moderators moderate with commits:
+
+- **Kick** is a commit that removes every leaf of an identity. They may
+  be invited again, or join a public room again.
+- **Ban** is a kick that also adds the identity's uid to `bans`. Devices
+  refuse a commit that adds a leaf of a banned identity, and in public
+  rooms the server refuses it too. Banning a guest uid has little
+  effect, because guest names get reused: mute its pseudonym instead
+  (below), or ask an operator to ban its network address (10.2).
+- **Unban** is a commit that takes a uid out of `bans`.
+
+Moderators may kick and ban only plain members. Owners may act on
+anyone except the last owner (6.3).
+
+**Muting.** In a public room, the server can refuse the posts of a
+pseudonym (7.3) without knowing whose it is. An owner or moderator whose
+device sees abuse from a member asks for it:
+
+```
+MUTE <box> <pseudonym> [hours=<n>]
+UNMUTE <box> <pseudonym>
+```
+
+→ `OK`
+
+`<pseudonym>` is 16 bytes in base64 with padding. The command needs a
+signed-in connection whose identity is an owner or moderator in the
+public room's conversation extension, which the server holds
+(`ERR forbidden`). The server refuses that pseudonym's posts in that
+mailbox for `<n>` hours, 24 by default, or until UNMUTE. A mute is a
+stopgap until a moderator's device bans the member. A pseudonym belongs
+to one leaf, so a member who joins again with a new leaf has a new one.
+
+For moderation across a whole server, see Section 10.

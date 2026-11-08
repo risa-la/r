@@ -1,4 +1,4 @@
-//! The example sessions of SPEC.md and README.md, played over TLS against
+//! The example sessions of the spec and README.md, played over TLS against
 //! a whole server: those of M2, as far as guests can go, and those of M4's
 //! sections (5.4, 5.8, 7.3). Sections 5.3, 6.2-6.4 and 10 have none, and
 //! REPORTENC's (5.8) waits for encryption (M5a).
@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{Session, msg, put, readme_example, spec_example};
+use common::{Session, msg, put, spec_example};
 use risala_proto::names::Seq;
 use risala_proto::types::{Relation, RoomSetting};
 use risala_server::store::{EventKind, SqliteStore};
@@ -86,17 +86,6 @@ async fn overview_session_and_refs() {
     .await;
 
     s.play(&spec_example("### 3.6. Responses").script()).await;
-    s.settled().await;
-    server.stop().await;
-}
-
-/// The session at the top of README.md.
-#[tokio::test(flavor = "multi_thread")]
-async fn readme_session() {
-    let server = example_server().await;
-    let mut s = Session::new();
-    s.add("sam", server.connect().await);
-    s.play(&readme_example().script()).await;
     s.settled().await;
     server.stop().await;
 }

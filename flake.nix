@@ -31,14 +31,14 @@
           version = (lib.importTOML ./Cargo.toml).workspace.package.version;
 
           # Only what cargo needs, so editing docs does not force a rebuild.
-          # The proto tests read SPEC.md and README.md from the repo root.
+          # The spec tests read spec/, and a server test reads README.md.
           src = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [
               ./Cargo.toml
               ./Cargo.lock
               ./crates
-              ./SPEC.md
+              ./spec
               ./README.md
             ];
           };

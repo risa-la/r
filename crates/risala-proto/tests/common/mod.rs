@@ -1,14 +1,11 @@
-//! Example lines from SPEC.md and README.md, shared by the spec tests.
+//! Example lines from the spec (`spec/`), shared by the spec tests.
 //!
-//! [`spec_examples`] collects:
+//! The spec is `spec/README.md` followed by the folder's other files in
+//! name order, as its contents list them. [`spec_examples`] collects:
 //!
-//! - every `C:` and `S:` line inside a fenced code block in SPEC.md, with
-//!   the prefix removed. Other lines in those blocks, such as
+//! - every `C:` and `S:` line inside a fenced code block, with the prefix
+//!   removed. Other lines in those blocks, such as
 //!   "(the client PUTs ...)" or "$ openssl ...", are skipped.
-//! - the session in README.md: the lines after `$ openssl s_client` in
-//!   its first code block. They have no prefix, so the direction comes
-//!   from the verb's case: the person typing uses lower case, and servers
-//!   send verbs in upper case (3.1).
 //! - the `AUTH` command in Appendix B.
 //!
 //! The extractor panics on anything it does not understand, such as an
@@ -18,12 +15,50 @@
 #![allow(dead_code)]
 
 use std::fmt;
+use std::sync::LazyLock;
 
-/// The text of SPEC.md.
-pub const SPEC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SPEC.md"));
+/// The whole spec: its files joined in reading order (see [`spec_files`]).
+pub static SPEC: LazyLock<String> =
+    LazyLock::new(|| spec_files().iter().map(|(_, text)| text.as_str()).collect());
 
-/// The text of README.md.
-pub const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+/// The files of `spec/`, each with its text: `README.md` first, then the
+/// rest in name order (`01-…` to `16-…`, then the appendices `a-…` on).
+pub fn spec_files() -> &'static [(String, String)] {
+    static FILES: LazyLock<Vec<(String, String)>> = LazyLock::new(|| {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("the spec folder, spec/")
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        names.sort_by_key(|n| (n != "README.md", n.clone()));
+        names
+            .into_iter()
+            .map(|n| {
+                let mut text = std::fs::read_to_string(format!("{dir}/{n}")).unwrap();
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                (format!("spec/{n}"), text)
+            })
+            .collect()
+    });
+    &FILES
+}
+
+/// Where line `n` (1-based) of [`SPEC`] comes from: its file, and its
+/// line number in that file.
+pub fn spec_location(n: usize) -> (&'static str, usize) {
+    let mut start = 0;
+    for (name, text) in spec_files() {
+        let lines = text.matches('\n').count();
+        if n <= start + lines {
+            return (name, n - start);
+        }
+        start += lines;
+    }
+    ("spec", n)
+}
 
 /// Who sent an example line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -34,22 +69,12 @@ pub enum Dir {
     Server,
 }
 
-/// Which document an example comes from.
+/// Which document an example comes from. Only the spec has examples:
+/// README.md's hand-typed session went with item 42 of PLAN.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
-    /// SPEC.md.
+    /// The spec (`spec/`).
     Spec,
-    /// README.md.
-    Readme,
-}
-
-impl Source {
-    pub fn file_name(self) -> &'static str {
-        match self {
-            Source::Spec => "SPEC.md",
-            Source::Readme => "README.md",
-        }
-    }
 }
 
 /// One example line.
@@ -59,7 +84,8 @@ pub struct Example {
     pub dir: Dir,
     /// The line, without prefix and without line ending.
     pub line: String,
-    /// The 1-based line number in `source`.
+    /// The 1-based line number in [`SPEC`]; [`spec_location`] turns it
+    /// into a file and a line in it.
     pub spec_line: usize,
     /// The document it comes from.
     pub source: Source,
@@ -128,29 +154,24 @@ pub fn expand_shortened(line: &str) -> String {
 }
 
 impl fmt::Display for Example {
-    /// `SPEC.md:117: S: RISALA 1 ...`, for test failure messages.
+    /// `spec/01-introduction.md:117: S: RISALA 1 ...`, for test failure
+    /// messages.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let prefix = match self.dir {
             Dir::Client => "C",
             Dir::Server => "S",
         };
-        write!(
-            f,
-            "{}:{}: {prefix}: {}",
-            self.source.file_name(),
-            self.spec_line,
-            self.line
-        )
+        let (file, line) = spec_location(self.spec_line);
+        write!(f, "{file}:{line}: {prefix}: {}", self.line)
     }
 }
 
-/// Every example line, in document order: SPEC.md (including Appendix
-/// B's AUTH command, in place), then README.md.
+/// Every example line, in document order, including Appendix B's AUTH
+/// command in place.
 pub fn spec_examples() -> Vec<Example> {
-    let mut examples = spec_md_examples(SPEC);
-    examples.extend(appendix_b_auth(SPEC));
+    let mut examples = spec_md_examples(&SPEC);
+    examples.extend(appendix_b_auth(&SPEC));
     examples.sort_by_key(|e| e.spec_line);
-    examples.extend(readme_examples(README));
     examples
 }
 
@@ -224,7 +245,7 @@ fn fence(line: &str) -> Option<(char, usize, &str)> {
     Some((c, n, rest[n..].trim()))
 }
 
-/// The `C:` and `S:` lines in the code blocks of SPEC.md.
+/// The `C:` and `S:` lines in the code blocks of the spec.
 fn spec_md_examples(doc: &str) -> Vec<Example> {
     let mut examples = Vec::new();
     for block in code_blocks(doc) {
@@ -243,8 +264,8 @@ fn spec_md_examples(doc: &str) -> Vec<Example> {
             };
             assert!(
                 !example.is_empty() && !example.starts_with(' '),
-                "SPEC.md:{}: malformed example {:?}",
-                line.number,
+                "{:?}: malformed example {:?}",
+                spec_location(line.number),
                 line.text
             );
             examples.push(Example {
@@ -264,7 +285,7 @@ fn appendix_b_auth(doc: &str) -> Vec<Example> {
     let start = doc
         .split('\n')
         .position(|l| l.starts_with("## Appendix B"))
-        .expect("SPEC.md has no Appendix B")
+        .expect("the spec has no Appendix B")
         + 1;
     let end = doc
         .split('\n')
@@ -288,33 +309,6 @@ fn appendix_b_auth(doc: &str) -> Vec<Example> {
         1,
         "expected one AUTH command in Appendix B, found {examples:?}"
     );
-    examples
-}
-
-/// The session in README.md: the lines after `$ openssl s_client` in the
-/// code block that contains it. Panics if there is no such block, or if a
-/// line's direction cannot be told from its verb.
-fn readme_examples(doc: &str) -> Vec<Example> {
-    let block = code_blocks(doc)
-        .into_iter()
-        .find(|b| b.iter().any(|l| l.text.starts_with("$ openssl s_client")))
-        .expect("README.md has no openssl session");
-    let mut lines = block
-        .into_iter()
-        .skip_while(|l| !l.text.starts_with("$ openssl s_client"));
-    lines.next();
-    let examples: Vec<Example> = lines
-        .filter(|l| !l.text.trim().is_empty())
-        .map(|l| Example {
-            dir: direction_by_shape(l.text).unwrap_or_else(|| {
-                panic!("README.md:{}: cannot tell who sent {:?}", l.number, l.text)
-            }),
-            line: l.text.to_owned(),
-            spec_line: l.number,
-            source: Source::Readme,
-        })
-        .collect();
-    assert!(!examples.is_empty(), "README.md's session has no lines");
     examples
 }
 
