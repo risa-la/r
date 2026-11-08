@@ -2041,3 +2041,66 @@ fn rule_four_on_crafted_proposals() {
         Err("ERR invalid a Remove of a blank leaf".into())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Keys that leave a key file and come back, and identities that unregister
+// and come back (4.4, 4.8, 12.6)
+
+#[tokio::test]
+async fn a_key_listed_again_need_not_leave_its_groups() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let (mut ga1, _) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+    // Key 5 leaves Bob's key file, which COMMIT finds as it adds 6.
+    w.fetcher.set(&identity(BOB), vec![key(6)]);
+    let b6 = Device::new(BOB, 6);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b6.kp()],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line(BOB)).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=2 epoch=2");
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    // Then it comes back. A commit that removes its leaf is refused, as
+    // the key is listed (rule 4), and the fetch shows it is listed.
+    w.fetcher.set(&identity(BOB), vec![key(5), key(6)]);
+    let leaf = Device::leaf(&ga1, &key(5));
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            remove: vec![leaf],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line(BOB)).await;
+    assert!(
+        lines.last().unwrap().starts_with("ERR forbidden"),
+        "{lines:?}"
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+    // So nothing waits for its leaf to go: ENC goes through.
+    let lines = w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=3");
+}
+
+#[tokio::test]
+async fn an_identity_not_hosted_that_unregisters_leaves_no_leaf_to_wait_for() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let (ga1, _) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+    let lines = w.ask(&mut cb, "unregister bob@example.net").await;
+    assert_eq!(lines, ["OK", "<close> BYE identity deleted"]);
+    // Bob's key file still lists key 5, so no commit could remove its
+    // leaf in a direct conversation (rule 4): it must not hold up ENC.
+    let lines = w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=2");
+}

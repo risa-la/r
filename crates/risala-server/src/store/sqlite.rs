@@ -1069,6 +1069,11 @@ impl Store for SqliteStore {
                 "INSERT INTO hosted_keys (uid, key, label, added) VALUES (?, ?, '', ?)",
                 params![uid.as_str(), key.to_string(), ms(now)],
             )?;
+            // Listed again: its leaves need not go (12.6).
+            tx.execute(
+                "DELETE FROM removed_keys WHERE uid = ? AND device_key = ?",
+                params![uid.as_str(), key.to_string()],
+            )?;
             Ok(Registered::Done)
         })
     }
@@ -1153,12 +1158,18 @@ impl Store for SqliteStore {
 
     fn forget_identity(&self, uid: &Uid, retire: bool, now: Timestamp) -> Result<()> {
         self.write(|tx| {
-            // Its keys are gone, and so must its leaves be (4.8, 12.6).
-            tx.execute(
-                "INSERT OR IGNORE INTO removed_keys (uid, device_key) \
-                 SELECT DISTINCT uid, device_key FROM group_leaves WHERE uid = ?",
-                [uid.as_str()],
-            )?;
+            // A hosted identity's keys are gone, and so must its leaves be
+            // (4.8, 12.6). Another identity's key file still lists its
+            // keys, which may come back: it is again a participant of its
+            // direct conversations (4.8), and in rooms its leaves go
+            // because it is no longer a member.
+            if is_hosted(tx, uid)? {
+                tx.execute(
+                    "INSERT OR IGNORE INTO removed_keys (uid, device_key) \
+                     SELECT DISTINCT uid, device_key FROM group_leaves WHERE uid = ?",
+                    [uid.as_str()],
+                )?;
+            }
             for sql in [
                 // Hosted keys go with it (ON DELETE CASCADE).
                 "DELETE FROM identities WHERE uid = ?",

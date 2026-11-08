@@ -193,6 +193,11 @@ pub trait E2eeStore {
     /// notes that its leaves must be removed (12.6).
     fn forget_device(&self, uid: &Uid, key: &PublicKey) -> Result<()>;
 
+    /// Notes that the keys `keys` of `uid` are in its key file again, as
+    /// one fetched just now lists them (4.4): their leaves need not be
+    /// removed after all (12.6).
+    fn relist_keys(&self, uid: &Uid, keys: &[PublicKey]) -> Result<()>;
+
     // ---- Backups (12.10) ----
 
     /// Stores the blob of epoch `epoch` of the conversation with id

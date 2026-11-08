@@ -380,10 +380,17 @@ impl Inner {
     }
 
     /// [`forget_device`](Self::forget_device) for each device of `uid`
-    /// with KeyPackages or Welcomes whose key is not in `keys`, the keys of
-    /// a key file fetched just now (4.4). Takes `keys_lock`.
+    /// with KeyPackages, Welcomes or leaves whose key is not in `keys`, the
+    /// keys of a key file fetched just now (4.4). The keys it lists are
+    /// taken off the list of removed keys, so that a key that left the
+    /// file and came back does not leave its leaves marked for good
+    /// (12.6). Takes `keys_lock`.
     pub(super) async fn forget_unlisted_devices(&self, uid: &Uid, keys: &[PublicKey]) {
         let _keys = self.keys_lock.lock().await;
+        let (who, listed) = (uid.clone(), keys.to_vec());
+        if let Err(e) = self.db(move |s| s.relist_keys(&who, &listed)).await {
+            tracing::error!(%uid, "taking listed keys off the removed keys failed: {e}");
+        }
         let who = uid.clone();
         let stored = match self.db(move |s| s.stored_devices(&who)).await {
             Ok(stored) => stored,

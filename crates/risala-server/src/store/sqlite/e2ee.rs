@@ -363,6 +363,17 @@ impl E2eeStore for SqliteStore {
         })
     }
 
+    fn relist_keys(&self, uid: &Uid, keys: &[PublicKey]) -> Result<()> {
+        self.write(|tx| {
+            let mut delete =
+                tx.prepare_cached("DELETE FROM removed_keys WHERE uid = ? AND device_key = ?")?;
+            for key in keys {
+                delete.execute(params![uid.as_str(), key.to_string()])?;
+            }
+            Ok(())
+        })
+    }
+
     fn add_backup(
         &self,
         uid: &Uid,

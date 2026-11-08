@@ -2399,6 +2399,9 @@ impl crate::store::E2eeStore for Flaky {
     fn forget_device(&self, u: &Uid, k: &PublicKey) -> crate::store::Result<()> {
         self.inner.forget_device(u, k)
     }
+    fn relist_keys(&self, u: &Uid, k: &[PublicKey]) -> crate::store::Result<()> {
+        self.inner.relist_keys(u, k)
+    }
     fn add_backup(
         &self,
         u: &Uid,
