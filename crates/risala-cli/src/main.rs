@@ -1648,6 +1648,9 @@ fn show_notice(notice: &Notice) -> String {
             "{conversation}: a change to its encryption failed this device's checks; nothing more \
              is sent there"
         ),
+        Notice::RecoveryKeyOffered => "another device of yours sent a new recovery key; to use \
+             it in place of this device's, risala recovery accept SERVER"
+            .to_owned(),
         Notice::KeyConflict { id, epoch } => format!(
             "two different keys arrived for epoch {epoch} of conversation {id}; someone may be \
              tampering with it"

@@ -437,15 +437,27 @@ async fn a_declined_device_gets_nothing() {
     reads(&bob, "alice@chat.test", &["before"]).await;
     let alice2 = second_device(&server, &alice).await;
     let new = fingerprint(&alice2);
-    within("declining", alice.confirm_device(&new, false))
+    let declined = within("declining", alice.confirm_device(&new, false))
+        .await
+        .unwrap()
+        .expect("a declined device");
+    assert_eq!(declined.fingerprint, new);
+    within("syncing", alice.wait_synced()).await.unwrap();
+    // Its leaves are removed (12.9): it does not read what comes after.
+    say(&bob, "alice@chat.test", "after").await;
+    reads(&alice, "bob@chat.test", &["before", "after"]).await;
+    within("syncing", alice2.wait_synced()).await.unwrap();
+    assert!(
+        !texts(&alice2, "bob@chat.test")
+            .iter()
+            .any(|(t, _)| t == "after"),
+        "{:?}",
+        texts(&alice2, "bob@chat.test")
+    );
+    // Removing its key, as offered, is up to the user.
+    within("removing", alice.remove_key(&declined.key_file_line))
         .await
         .unwrap();
-    say(&bob, "alice@chat.test", "after").await;
-    reads(&alice2, "bob@chat.test", &["after"]).await;
-    assert_eq!(
-        states(&alice2, "bob@chat.test"),
-        [Some(Encryption::Waiting), Some(Encryption::Verified)]
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

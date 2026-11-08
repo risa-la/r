@@ -443,7 +443,8 @@ async fn devices_lists_and_declines() {
     let out = net
         .ok(&alice, &["confirm", &addr, &fingerprint, "--decline"])
         .await;
-    assert!(out.contains("gets no history keys"), "{out}");
+    assert!(out.contains("gets no keys"), "{out}");
+    assert!(out.contains("keys del"), "{out}");
     let devices = net.ok(&alice, &["devices", &addr]).await;
     assert!(
         devices

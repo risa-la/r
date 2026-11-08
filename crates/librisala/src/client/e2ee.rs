@@ -185,6 +185,18 @@ pub struct DeviceInfo {
     pub this_device: bool,
 }
 
+/// A device of the identity the user declined ([`Account::confirm_device`]).
+/// Its leaves are removed, but its key can still sign in and join groups
+/// until it leaves the key file (12.9): offer to remove it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclinedDevice {
+    /// The key's fingerprint.
+    pub fingerprint: String,
+    /// Its key file line, for [`Account::remove_key`] or to remove from a
+    /// key file the server does not host (4.4).
+    pub key_file_line: String,
+}
+
 /// A recovery key just made ([`Account::create_recovery_key`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRecoveryKey {
@@ -381,16 +393,25 @@ impl Account {
     }
 
     /// Says whether the new device with key fingerprint `fingerprint` is
-    /// the user's (12.9). A confirmed device gets every history key this
-    /// device holds, so that it reads the whole history, and the recovery
-    /// key if this device holds one, so that it backs up the keys it gets
-    /// later (12.10); one that is not gets none. Ask the user to compare
-    /// the fingerprint with the one the new device shows.
+    /// the user's (12.9). Ask the user to compare the fingerprint with the
+    /// one the new device shows.
+    ///
+    /// A confirmed device gets every history key this device holds, so
+    /// that it reads the whole history, and the recovery key if this device
+    /// holds one, so that it backs up the keys it gets later (12.10). No
+    /// keys go to any device while another device of the identity waits
+    /// for this answer, since every one of them would read them.
+    ///
+    /// A declined device gets nothing, and this device removes its leaves
+    /// from every encrypted conversation. Its key stays in the key file
+    /// until removed: the answer is a [`DeclinedDevice`] with the key
+    /// file line, to offer removing it with
+    /// [`remove_key`](Self::remove_key) or by editing the key file.
     pub async fn confirm_device(
         &self,
         fingerprint: &str,
         confirmed: bool,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Option<DeclinedDevice>, ClientError> {
         let fingerprint = fingerprint.trim().to_lowercase();
         let key = self
             .shared()
@@ -401,7 +422,21 @@ impl Account {
             .find(|d| d.key.fingerprint().to_string() == fingerprint)
             .ok_or_else(|| ClientError::Invalid(format!("device {fingerprint}")))?
             .key;
-        self.e2ee(E2eeOp::ConfirmDevice { key, confirmed }).await
+        let line = keys::key_line(&key, None)
+            .map_err(|_| ClientError::Invalid("a key file line".into()))?;
+        self.e2ee(E2eeOp::ConfirmDevice { key, confirmed }).await?;
+        Ok((!confirmed).then_some(DeclinedDevice {
+            fingerprint,
+            key_file_line: line,
+        }))
+    }
+
+    /// Answers [`Notice::RecoveryKeyOffered`](super::Notice::RecoveryKeyOffered):
+    /// with `true`, the recovery key another device of the identity sent
+    /// replaces the one this device holds, and the history keys are backed
+    /// up under it (12.10); with `false`, it is dropped. Needs a connection.
+    pub async fn accept_recovery_key(&self, accept: bool) -> Result<(), ClientError> {
+        self.e2ee(E2eeOp::AcceptRecovery(accept)).await
     }
 
     /// Makes a new recovery key (12.10), and returns it to show the user

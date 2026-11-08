@@ -1248,6 +1248,10 @@ pub enum Notice {
         /// The device key's fingerprint, to compare on the other device.
         fingerprint: String,
     },
+    /// Another device of the identity sent a recovery key, and this device
+    /// holds a different one (12.10). Ask the user whether to replace it,
+    /// then answer with `Account::accept_recovery_key`.
+    RecoveryKeyOffered,
     /// Two different history keys arrived for one epoch of a conversation
     /// (12.9). Warn the user: someone may be trying to show them messages
     /// that were not sent there.
@@ -1291,6 +1295,7 @@ impl Notice {
             N::NewDevice { fingerprint } => Notice::NewDevice {
                 fingerprint: fingerprint.clone(),
             },
+            N::RecoveryKeyOffered => Notice::RecoveryKeyOffered,
             N::KeyConflict { id, epoch } => Notice::KeyConflict {
                 id: id.to_string(),
                 epoch: *epoch,

@@ -247,6 +247,9 @@ pub(crate) struct Cascade {
 pub(crate) struct Received {
     /// Who sent it.
     pub from: Uid,
+    /// The key id of the device that signed it, if its signature verified
+    /// (12.8).
+    pub key_id: Option<Vec<u8>>,
     /// The line.
     pub line: Control,
 }
@@ -735,9 +738,14 @@ impl Tx<'_> {
                         });
                         // Lines from another device of the identity, or in
                         // a room, from a member; the caller decides.
+                        let key_id = message
+                            .sender
+                            .is_some()
+                            .then(|| message.sender_key_id.to_vec());
                         if verified || meta.from != *me {
                             received.extend(lines.into_iter().map(|line| Received {
                                 from: meta.from.clone(),
+                                key_id: key_id.clone(),
                                 line,
                             }));
                         }
@@ -750,10 +758,11 @@ impl Tx<'_> {
 
     /// Decrypts what it can in the conversations `start`, then in every
     /// conversation that a KEY line among them gave a key for, and so on
-    /// (12.8, 12.9). KEY lines are taken only from the identity's own
-    /// devices in the conversation with itself, or in a room for that
-    /// room's own id; RECOVERY lines only in the conversation with itself
-    /// (12.10).
+    /// (12.8, 12.9). KEY lines are taken only in the conversation with
+    /// itself, from the identity's devices that the user confirmed or that
+    /// were there when this device joined, or in a room for that room's
+    /// own id; RECOVERY lines only in the conversation with itself, from
+    /// those devices too (12.10).
     pub(crate) fn decrypt_cascade(
         &mut self,
         account: AccountId,
@@ -771,10 +780,16 @@ impl Tx<'_> {
                 continue;
             };
             for r in self.decrypt_pending(&row, me)? {
+                let trusted = match (&row.name, &r.key_id) {
+                    (Conv::Uid(u), Some(key_id)) if u == me && r.from == *me => {
+                        self.trusted_own_device(account, key_id)?
+                    }
+                    _ => false,
+                };
                 match r.line {
                     Control::Key { id, epoch, key } => {
                         let source = match &row.name {
-                            Conv::Uid(u) if u == me && r.from == *me => KeySource::Device,
+                            Conv::Uid(u) if u == me && trusted => KeySource::Device,
                             Conv::Room(_) if row.conv_id.as_ref() == Some(&id) => KeySource::Member,
                             _ => continue,
                         };
@@ -791,7 +806,7 @@ impl Tx<'_> {
                         }
                     }
                     Control::Recovery(key) => {
-                        if matches!(&row.name, Conv::Uid(u) if u == me) && r.from == *me {
+                        if trusted {
                             out.recovery = Some(key);
                         }
                     }

@@ -197,7 +197,7 @@ pub use account::{Account, AccountEvents, Conversation};
 pub use admin::Admin;
 pub use chats::{ChatList, ChatListBatch, ChatListDiff};
 pub use e2ee::{
-    DeviceInfo, History, HttpsKeyFiles, KeyFileEntry, KeyFileFuture, KeyFiles, MemoryKeyFiles,
+    DeclinedDevice, DeviceInfo, History, HttpsKeyFiles, KeyFileEntry, KeyFileFuture, KeyFiles, MemoryKeyFiles,
     NewRecoveryKey,
 };
 pub use people::PresenceWatch;

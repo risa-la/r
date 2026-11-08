@@ -207,6 +207,9 @@ pub(crate) enum E2eeOp {
     SetRecovery(Option<risala_mls::RecoveryKey>),
     /// Send the recovery key to the identity's other devices (12.10).
     ShareRecovery(risala_mls::RecoveryKey),
+    /// The user's answer about a recovery key another device offered
+    /// (12.10).
+    AcceptRecovery(bool),
     /// An identity's key file, fetched now (12.12): `None` if the fetch
     /// failed.
     KeyFile(Uid, Option<Vec<super::e2ee::KeyFileEntry>>),

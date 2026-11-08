@@ -11,7 +11,7 @@ use super::StoreError;
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
 pub(super) const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18,
 ];
 
 /// The schema version this build writes.
@@ -514,6 +514,21 @@ ALTER TABLE device_keys_v16 RENAME TO device_keys;
 /// outsider when it joins a room's group (12.6). 0 if none is stored.
 const V17: &str = "
 ALTER TABLE room_members ADD COLUMN invited_seq INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Version 18: `recovery_state` holds, for an identity's account, a
+/// recovery key still to send to its other devices (`unshared`), and one
+/// another device sent that waits for the key file or the user
+/// (`offered`, since `offered_at`, in Unix milliseconds; `asked` once the
+/// user was asked), so that neither is lost with the connection (12.10).
+const V18: &str = "
+CREATE TABLE recovery_state (
+    account    INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    unshared   BLOB,
+    offered    BLOB,
+    offered_at INTEGER,
+    asked      INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// Brings the schema up to [`VERSION`].

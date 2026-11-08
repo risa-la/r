@@ -296,6 +296,11 @@ pub enum Notification {
         /// The device key's fingerprint (12.12).
         fingerprint: String,
     },
+    /// Another device of the identity sent a recovery key that the key
+    /// file lists, and this device holds a different one (12.10). Ask the
+    /// user whether to replace it, and answer with
+    /// [`SyncEngine::accept_recovery_key`].
+    RecoveryKeyOffered,
     /// SYNC no longer lists a conversation the account was in: it left, or
     /// was kicked or banned, or the room was dropped (7.1). Its history is
     /// kept.

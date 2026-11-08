@@ -300,7 +300,8 @@ pub(crate) enum Applied {
         epoch: u64,
         /// It was this device's own commit.
         own: bool,
-        /// Leaves it added, for the key check (12.6).
+        /// Leaves it added, for the key check (12.6): every leaf, for the
+        /// device's own external commit.
         added: Vec<(Uid, PublicKey)>,
     },
     /// The device is not in the group any more.
@@ -545,10 +546,16 @@ pub(crate) fn apply_commit(
                 return Err(E2eeError::Mls("the external commit's epoch".into()));
             }
             enter_epoch(tx, dev, row, &group, seq, GroupState::Active, now_ms())?;
+            // Every leaf of a group joined this way gets the key check
+            // (12.6).
+            let all = leaves(&group)?
+                .into_iter()
+                .map(|l| (l.uid, l.key))
+                .collect();
             return Ok(Applied::Merged {
                 epoch,
                 own: true,
-                added: Vec::new(),
+                added: all,
             });
         }
         _ => return Ok(Applied::Old),

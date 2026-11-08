@@ -47,7 +47,9 @@ pub(crate) enum E2eeCommand {
     Confirm {
         server: String,
         fingerprint: String,
-        /// The device is not yours: send it nothing.
+        /// The device is not yours: send it nothing, and remove it from
+        /// your encrypted conversations. Its key stays in your key file
+        /// until you remove it (keys del).
         #[arg(long)]
         decline: bool,
     },
@@ -74,6 +76,14 @@ pub(crate) enum RecoveryCommand {
     /// Make a new recovery key, print it once, and back up every history
     /// key under it. Keep it like a password: it can sign in as you.
     Create { server: String },
+    /// Answer another device's offer of a recovery key in place of the one
+    /// this device holds (12.10). --decline keeps the one it holds.
+    Accept {
+        server: String,
+        /// Keep this device's recovery key.
+        #[arg(long)]
+        decline: bool,
+    },
     /// Restore the history keys from the backups, with the recovery key.
     Restore {
         server: String,
@@ -167,12 +177,35 @@ pub(crate) async fn run(ctx: &Ctx, command: E2eeCommand) -> Res {
         } => {
             let account = online(ctx, &server).await?;
             within(account.wait_synced()).await?;
-            within(account.confirm_device(&fingerprint, !decline)).await?;
+            let declined = within(account.confirm_device(&fingerprint, !decline)).await?;
+            within(account.wait_synced()).await?;
+            match declined {
+                Some(d) => {
+                    println!(
+                        "{} gets no keys from this device, and is removed from your encrypted \
+                         conversations",
+                        d.fingerprint
+                    );
+                    println!(
+                        "its key can still sign in until you remove it: risala keys del {server} {}",
+                        d.fingerprint
+                    );
+                }
+                None => println!("{fingerprint} gets the history keys from this device"),
+            }
+            Ok(())
+        }
+        E2eeCommand::Recovery {
+            command: RecoveryCommand::Accept { server, decline },
+        } => {
+            let account = online(ctx, &server).await?;
+            within(account.wait_synced()).await?;
+            within(account.accept_recovery_key(!decline)).await?;
             within(account.wait_synced()).await?;
             if decline {
-                println!("{fingerprint} gets no history keys from this device");
+                println!("this device keeps its recovery key");
             } else {
-                println!("{fingerprint} gets the history keys from this device");
+                println!("this device now holds the recovery key it was sent, if one was offered");
             }
             Ok(())
         }

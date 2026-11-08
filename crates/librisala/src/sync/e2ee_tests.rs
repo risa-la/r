@@ -23,6 +23,7 @@ use risala_proto::time::Timestamp;
 
 use super::*;
 use crate::addr::ServerAddr;
+use crate::e2ee::content::Control;
 use crate::store::e2ee::GroupState;
 use crate::store::{AccountId, Draft, OutboxState, Store};
 
@@ -1281,6 +1282,7 @@ fn a_confirmed_device_gets_the_recovery_key() {
     net.run();
     net.send(a1, "bob@example.net", "before");
     let recovery = risala_mls::RecoveryKey::from_bytes([7; 32]);
+    net.list_recovery("alice@example.org", &recovery);
     let out = net.devs[a1]
         .engine
         .set_recovery_key(Some(recovery.clone()))
@@ -1826,4 +1828,211 @@ fn a_rejected_group_stays_rejected_under_a_new_id() {
         GroupState::Rejected
     );
     assert_eq!(net.sent_to(a, "GROUPINFO", "bob@example.net"), 0);
+}
+
+impl Net {
+    /// Lists the signing key of `recovery` in `who`'s key file (12.10).
+    fn list_recovery(&mut self, who: &str, recovery: &risala_mls::RecoveryKey) {
+        let id = uid(who).to_identity().unwrap();
+        self.key_files
+            .entry(uid(who))
+            .or_default()
+            .push(recovery.signing_key(&id).public_key());
+    }
+
+    fn confirm(&mut self, d: usize, of: usize, yes: bool) {
+        let key = self.devs[of].public();
+        let out = self.devs[d].engine.confirm_device(&key, yes).unwrap();
+        self.devs[d].absorb(out);
+        self.run();
+    }
+
+    /// Whether device `d`'s account holds a history key for epoch `epoch`
+    /// of conversation `id`.
+    fn holds_key(&self, d: usize, id: &str, epoch: u64) -> bool {
+        let dev = &self.devs[d];
+        let account = dev.account;
+        let id: Id = id.parse().unwrap();
+        dev.store
+            .write(|tx| Ok(tx.history_key(account, &id, epoch)?.is_some()))
+            .unwrap()
+            .0
+    }
+}
+
+#[test]
+fn an_unconfirmed_device_does_not_get_the_recovery_key() {
+    let mut net = Net::new();
+    let a1 = net.device("alice@example.org", 1);
+    let _b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a1, "bob@example.net", "before");
+    let recovery = risala_mls::RecoveryKey::from_bytes([7; 32]);
+    net.list_recovery("alice@example.org", &recovery);
+    let out = net.devs[a1]
+        .engine
+        .set_recovery_key(Some(recovery.clone()))
+        .unwrap();
+    net.devs[a1].absorb(out);
+    let a2 = net.device("alice@example.org", 3);
+    net.run();
+
+    // Every leaf of the conversation with herself reads what is sent
+    // there, so the recovery key waits while a device is not confirmed
+    // (12.9, 12.10).
+    let out = net.devs[a1].engine.share_recovery_key(&recovery).unwrap();
+    net.devs[a1].absorb(out);
+    net.run();
+    assert_eq!(net.devs[a2].recovery, None);
+
+    // Once she confirms it, it gets the key.
+    net.confirm(a1, a2, true);
+    assert_eq!(net.devs[a2].recovery, Some(recovery));
+}
+
+#[test]
+fn keys_wait_while_any_own_device_is_unconfirmed() {
+    use crate::store::e2ee::EncState::{Pending, Verified};
+    let mut net = Net::new();
+    let a1 = net.device("alice@example.org", 1);
+    let _b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a1, "bob@example.net", "before");
+    let a2 = net.device("alice@example.org", 3);
+    net.run();
+    let a3 = net.device("alice@example.org", 4);
+    net.run();
+
+    // Alice confirms her third device, and not yet her second: the second
+    // would read the history keys too, so none are sent (12.9).
+    net.confirm(a1, a3, true);
+    assert_eq!(net.devs[a2].store_enc_states("bob@example.net"), [Some(Pending)]);
+    assert_eq!(net.devs[a3].store_enc_states("bob@example.net"), [Some(Pending)]);
+
+    // She declines the second. Its leaves are removed from every group,
+    // and then the third gets the keys.
+    net.confirm(a1, a2, false);
+    for conv in ["alice@example.org", "bob@example.net"] {
+        let leaves = {
+            let dev = &net.devs[a1];
+            let account = dev.account;
+            dev.store
+                .write(|tx| {
+                    let row = tx.conv_by_name(account, &conv.parse().unwrap())?.unwrap();
+                    Ok(crate::e2ee::group::current_leaves(tx, &row).unwrap().unwrap())
+                })
+                .unwrap()
+                .0
+        };
+        assert!(
+            !leaves.iter().any(|l| l.key == net.devs[a2].public()),
+            "{conv} keeps the declined device's leaf"
+        );
+    }
+    assert_eq!(
+        net.devs[a3].texts("bob@example.net"),
+        [("before".to_owned(), Some(Verified))]
+    );
+    assert_eq!(net.devs[a2].store_enc_states("bob@example.net"), [Some(Pending)]);
+}
+
+#[test]
+fn keys_from_an_unconfirmed_device_are_ignored() {
+    let mut net = Net::new();
+    let a1 = net.device("alice@example.org", 1);
+    let _b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a1, "bob@example.net", "before");
+    let a2 = net.device("alice@example.org", 3);
+    net.run();
+
+    // The new device, which Alice has not confirmed, sends a history key
+    // and a recovery key in the conversation with herself.
+    let recovery = risala_mls::RecoveryKey::from_bytes([9; 32]);
+    net.list_recovery("alice@example.org", &recovery);
+    let conv: Conv = "alice@example.org".parse().unwrap();
+    let account = net.devs[a2].account;
+    let row = net.devs[a2]
+        .store
+        .write(|tx| tx.conv_by_name(account, &conv))
+        .unwrap()
+        .0
+        .unwrap();
+    let lines = vec![
+        Control::Key {
+            id: "c7777777".parse().unwrap(),
+            epoch: 0,
+            key: risala_mls::HistoryKey::from_bytes([1; 48]),
+        },
+        Control::Recovery(recovery),
+    ];
+    assert!(
+        net.devs[a2]
+            .engine
+            .send_control_for(&conv, &row, lines, None)
+            .unwrap()
+    );
+    let out = net.devs[a2].engine.resume_outbox().unwrap();
+    net.devs[a2].absorb(out);
+    net.run();
+
+    // Alice's first device takes neither (12.9, 12.10).
+    assert!(!net.holds_key(a1, "c7777777", 0));
+    assert_eq!(net.devs[a1].recovery, None);
+}
+
+#[test]
+fn a_recovery_key_counts_only_while_the_key_file_lists_it() {
+    let mut net = Net::new();
+    let a1 = net.device("alice@example.org", 1);
+    net.run();
+    let a2 = net.device("alice@example.org", 3);
+    net.run();
+    net.confirm(a1, a2, true);
+
+    // A recovery key whose signing key the key file does not list is
+    // ignored (12.10).
+    let unlisted = risala_mls::RecoveryKey::from_bytes([3; 32]);
+    let out = net.devs[a2].engine.set_recovery_key(Some(unlisted.clone())).unwrap();
+    net.devs[a2].absorb(out);
+    let a1_conv: Conv = "alice@example.org".parse().unwrap();
+    let account = net.devs[a2].account;
+    let row = net.devs[a2]
+        .store
+        .write(|tx| tx.conv_by_name(account, &a1_conv))
+        .unwrap()
+        .0
+        .unwrap();
+    net.devs[a2]
+        .engine
+        .send_control_for(&a1_conv, &row, vec![Control::Recovery(unlisted)], None)
+        .unwrap();
+    let out = net.devs[a2].engine.resume_outbox().unwrap();
+    net.devs[a2].absorb(out);
+    net.run();
+    assert_eq!(net.devs[a1].recovery, None);
+
+    // A listed one is taken by a device that holds none.
+    let first = risala_mls::RecoveryKey::from_bytes([4; 32]);
+    net.list_recovery("alice@example.org", &first);
+    let out = net.devs[a2].engine.set_recovery_key(Some(first.clone())).unwrap();
+    net.devs[a2].absorb(out);
+    let out = net.devs[a2].engine.share_recovery_key(&first).unwrap();
+    net.devs[a2].absorb(out);
+    net.run();
+    assert_eq!(net.devs[a1].recovery, Some(first.clone()));
+
+    // A device that holds one asks the user before replacing it.
+    let second = risala_mls::RecoveryKey::from_bytes([5; 32]);
+    net.list_recovery("alice@example.org", &second);
+    let out = net.devs[a2].engine.set_recovery_key(Some(second.clone())).unwrap();
+    net.devs[a2].absorb(out);
+    let out = net.devs[a2].engine.share_recovery_key(&second).unwrap();
+    net.devs[a2].absorb(out);
+    net.run();
+    assert_eq!(net.devs[a1].recovery, Some(first));
+    assert!(net.devs[a1].notes.contains(&Notification::RecoveryKeyOffered));
+    let out = net.devs[a1].engine.accept_recovery_key(true).unwrap();
+    net.devs[a1].absorb(out);
+    assert_eq!(net.devs[a1].recovery, Some(second));
 }

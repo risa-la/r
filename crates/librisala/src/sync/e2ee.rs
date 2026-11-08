@@ -90,6 +90,12 @@ pub(super) struct E2ee {
     pub(super) backups_failed: Vec<(Id, u64)>,
     /// History keys are on their way to the identity's new devices.
     pub(super) sharing_keys: bool,
+    /// The recovery key is on its way to the identity's other devices.
+    pub(super) sharing_recovery: bool,
+    /// Since when, in Unix milliseconds, a recovery key waits to be sent
+    /// on this connection: the key file must have been fetched after it
+    /// to say whether it lists the key (12.10).
+    pub(super) share_since: i64,
     /// WELCOME LIST has been answered on this connection.
     welcomes_listed: bool,
     /// Conversations with an INIT, GROUPINFO or COMMIT of this device's in
@@ -114,7 +120,7 @@ pub(super) struct E2ee {
     rejoined: HashSet<Conv>,
     /// Rooms whose earlier history keys wait to be sent to a new member
     /// (12.9).
-    to_share: HashSet<Conv>,
+    pub(super) to_share: HashSet<Conv>,
     /// Conversations whose INIT the server refused on this connection for
     /// a reason other than `stale`: not tried again on it.
     init_refused: HashSet<Conv>,
@@ -182,11 +188,13 @@ pub(super) enum E2eePending {
         uid: Uid,
         purpose: Purpose,
     },
-    /// An ENC of KEY lines (12.9) or a RECOVERY line (12.10). With
-    /// `devices`, the last one to the identity's confirmed devices, by
-    /// key id.
+    /// An ENC of KEY lines (12.9) or a RECOVERY line (12.10) in `conv`.
+    /// With `devices`, the last one to the identity's confirmed devices, by
+    /// key id. With `recovery`, it holds the recovery key.
     Shared {
+        conv: Conv,
         devices: Option<Vec<Vec<u8>>>,
+        recovery: bool,
     },
     /// BACKUP ADD of one history key (12.10).
     BackupAdd {
@@ -210,6 +218,8 @@ impl E2ee {
             backing_up: Vec::new(),
             backups_failed: Vec::new(),
             sharing_keys: false,
+            sharing_recovery: false,
+            share_since: group::now_ms(),
             welcomes_listed: false,
             busy: HashSet::new(),
             fetching: HashSet::new(),
@@ -410,7 +420,11 @@ impl SyncEngine {
         let _ = req;
         match pending {
             E2eePending::KeyPkgCount => self.on_keypkg_count(&reply),
-            E2eePending::Shared { devices } => self.on_shared(devices, &reply),
+            E2eePending::Shared {
+                conv,
+                devices,
+                recovery,
+            } => self.on_shared(conv, devices, recovery, &reply),
             E2eePending::BackupAdd { id, epoch, key_id } => {
                 self.on_backup_add(id, epoch, key_id, &reply)
             }
@@ -767,22 +781,24 @@ impl SyncEngine {
         let account = self.account;
         let me = self.me.clone();
         let cascade = self.write(|tx| tx.decrypt_cascade(account, &me, vec![conv.clone()]))?;
-        self.after_cascade(cascade);
-        Ok(())
+        self.after_cascade(cascade)
     }
 
     /// Reports what decrypting led to: conflicting keys (12.9), and a
     /// recovery key from another device (12.10).
-    pub(super) fn after_cascade(&mut self, cascade: crate::store::e2ee::Cascade) {
+    pub(super) fn after_cascade(
+        &mut self,
+        cascade: crate::store::e2ee::Cascade,
+    ) -> Result<(), SyncError> {
         for (id, epoch) in cascade.conflicts {
             self.out
                 .notifications
                 .push(Notification::KeyConflict { id, epoch });
         }
         if let Some(key) = cascade.recovery {
-            self.keep_recovery_key(Some(key.clone()));
-            self.out.recovery = Some(key);
+            self.recovery_received(key)?;
         }
+        Ok(())
     }
 
     /// Joins the conversation's group by external commit, if it should be
@@ -1397,9 +1413,17 @@ impl SyncEngine {
         }
         let last = commands.len().saturating_sub(1);
         let mut devices = devices;
+        let recovery = lines.iter().any(|l| matches!(l, Control::Recovery(_)));
         for (i, command) in commands.into_iter().enumerate() {
             let devices = if i == last { devices.take() } else { None };
-            self.issue(command, Pending::E2ee(E2eePending::Shared { devices }));
+            self.issue(
+                command,
+                Pending::E2ee(E2eePending::Shared {
+                    conv: conv.clone(),
+                    devices,
+                    recovery: recovery && i == last,
+                }),
+            );
         }
         Ok(true)
     }
@@ -1420,7 +1444,7 @@ impl SyncEngine {
         {
             return Ok(());
         }
-        let account = self.account;
+        let (account, me) = (self.account, self.me.clone());
         let now = group::now_ms();
         let made = self.e2ee_write(|tx| {
             let Some(row) = tx.conv_by_name(account, conv)? else {
@@ -1443,7 +1467,8 @@ impl SyncEngine {
             let mut remove: Vec<LeafNodeIndex> = Vec::new();
             for leaf in &leaves {
                 let gone = tx.key_listed(account, &leaf.uid, &leaf.key)? == Some(false)
-                    || (row.name.is_room() && tx.left_room(row.id, &leaf.uid)?);
+                    || (row.name.is_room() && tx.left_room(row.id, &leaf.uid)?)
+                    || super::e2ee_keys::declined_leaf(tx, (account, &me), &leaf.uid, &leaf.key)?;
                 if gone && leaf.key != dev.key.public_key() {
                     remove.push(leaf.index);
                 }
@@ -1519,7 +1544,7 @@ impl SyncEngine {
         self.e2ee.as_ref().is_some_and(|e| !e.fetching.is_empty())
     }
 
-    fn fetch_key_file(&mut self, uid: &Uid) {
+    pub(super) fn fetch_key_file(&mut self, uid: &Uid) {
         if self.e2().fetching.insert(uid.clone()) {
             self.out.key_files.push(uid.clone());
         }
@@ -1565,6 +1590,11 @@ impl SyncEngine {
             // leaves.
             self.e2ee_all()?;
             self.flush_outbox()?;
+        }
+        if *uid == self.me && self.has_e2ee() {
+            // A recovery key waiting for the key file (12.10).
+            self.consider_offered_recovery()?;
+            self.try_share_recovery()?;
         }
         Ok(self.finish())
     }
