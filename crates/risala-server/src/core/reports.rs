@@ -37,6 +37,7 @@ use risala_proto::types::DEFAULT_LIST_LIMIT;
 
 use super::Inner;
 use super::commands::{Fail, Outcome, Reply, check_read, fail, not_found, not_supported, room_of};
+use super::messages::BATCH;
 use super::rate::{WindowLimit, network};
 use super::state::{ConvEntry, ConvState, RoomInfo};
 use crate::handler::OutLine;
@@ -519,11 +520,21 @@ impl Inner {
     /// every member gets `@id=<id> DROP <room> [<reason>]`, and the members
     /// are removed, as if kicked. A room from the configuration is created
     /// again at once, empty and with a new id (PLAN.md section 6).
+    ///
+    /// A large room's events go first, oldest first, a batch at a time, so
+    /// that other rooms get the store in between. The room's lock is held
+    /// throughout, so commands that need it find the room whole or gone.
+    /// A HISTORY or RELATED already past the lock may find the oldest
+    /// events gone, as if they had expired (7.5). If this fails, or the
+    /// server stops, in between, the room stays in that state and no DROP
+    /// was sent: the operator drops it again.
     async fn drop_room(&self, room: &Room, reason: String) -> Outcome {
         let mut st = self.lock_room(room).await?;
+        let key = st.key;
+        while self.db(move |s| s.trim_room(key, BATCH)).await? == BATCH as u64 {}
         let creating = self.create_lock.lock().await;
         let recreate = self.configured(room);
-        let (key, now) = (st.key, self.now());
+        let now = self.now();
         let new = self.db(move |s| s.drop_room(key, recreate, now)).await?;
 
         st.dropped = true;

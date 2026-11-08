@@ -841,6 +841,85 @@ async fn history_and_related_racing_a_drop_get_not_found() {
     }
 }
 
+/// A large room's events go a batch at a time before the room itself.
+/// Commands waiting for the room meanwhile find it dropped. A drop that
+/// fails after some batches leaves the room with its newest events.
+#[tokio::test]
+async fn a_large_room_is_dropped_a_batch_at_a_time() {
+    use crate::core::messages::BATCH;
+    for fails in [false, true] {
+        let flaky = Arc::new(Flaky::new());
+        let mut c = config();
+        c.rooms = strings(&["#general", "#private"]);
+        c.operators = strings(&[OP]);
+        for room in &c.rooms {
+            flaky
+                .inner
+                .ensure_room(&room.parse().unwrap(), start())
+                .unwrap();
+        }
+        prepare(&flaky.inner);
+        let temp: Room = "#temp".parse().unwrap();
+        let key = flaky.inner.room(&temp).unwrap().unwrap().key;
+        for n in 0..2 * BATCH + 10 {
+            flaky
+                .inner
+                .append(
+                    key,
+                    &crate::store::NewEvent {
+                        t: start(),
+                        from: uid(BOB),
+                        kind: msg(None, &format!("filler {n}")),
+                        cid: None,
+                    },
+                )
+                .unwrap();
+        }
+        let head = flaky.inner.room(&temp).unwrap().unwrap().head.unwrap();
+        let mut h = Harness::on(c, flaky.clone(), timers());
+        let mut bob = h.signed_in_as(BOB);
+        let mut op = h.signed_in_as(OP);
+        flaky
+            .broken
+            .store(fails, std::sync::atomic::Ordering::SeqCst);
+
+        flaky.pause.arm("trim_room");
+        let (hub, id) = (h.hub.clone(), op.id);
+        let drop =
+            tokio::spawn(async move { hub.command(id, "admin drop #temp".parse().unwrap()).await });
+        flaky.pause.reached().await;
+        let (hub, id) = (h.hub.clone(), bob.id);
+        let msg = tokio::spawn(async move {
+            hub.command(id, "@ref=m msg #temp hi".parse().unwrap())
+                .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        flaky.pause.release();
+        drop.await.unwrap();
+        msg.await.unwrap();
+        let first = flaky.inner.event(key, seq(1)).unwrap();
+        let last = flaky.inner.event(key, head).unwrap();
+        assert!(first.is_none(), "fails={fails}");
+        if fails {
+            assert_eq!(op.lines(), ["ERR internal internal error"]);
+            // The broken store fails bob's MSG too, but no DROP came.
+            assert_eq!(bob.lines(), ["@ref=m ERR internal internal error"]);
+            assert!(last.is_some());
+            assert!(flaky.inner.room(&temp).unwrap().is_some());
+        } else {
+            assert_eq!(op.lines(), ["OK"]);
+            let lines = bob.lines();
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].ends_with(" DROP #temp"));
+            assert_eq!(lines[1], "@ref=m ERR not-found no such room");
+            assert!(last.is_none());
+            assert_eq!(flaky.inner.room(&temp).unwrap(), None);
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_drop_that_fails_changes_nothing() {
     let flaky = Arc::new(Flaky::new());

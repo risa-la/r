@@ -86,4 +86,12 @@ pub trait ReportStore {
     /// [`ensure_room`]: super::Store::ensure_room
     fn drop_room(&self, key: ConvKey, recreate: bool, now: Timestamp)
     -> Result<Option<RoomRecord>>;
+
+    /// Deletes up to `max` of the oldest events of the room `key`, always
+    /// leaving its newest `max`, and returns how many it deleted. ADMIN
+    /// DROP calls it until it deletes fewer than `max`, before
+    /// [`drop_room`](Self::drop_room), so that no one transaction deletes
+    /// a large room's events. Seen from outside, the deleted events have
+    /// expired (7.5). Seqs are not reused: the head stays.
+    fn trim_room(&self, key: ConvKey, max: usize) -> Result<u64>;
 }

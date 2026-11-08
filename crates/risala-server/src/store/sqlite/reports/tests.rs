@@ -192,6 +192,49 @@ fn dropping_a_configured_room_creates_it_again() {
 }
 
 #[test]
+fn trimming_a_room_deletes_its_oldest_events_and_keeps_the_newest() {
+    let (store, record) = store();
+    // Events 1 and 2, and five more.
+    for n in 0..5 {
+        store
+            .append(
+                record.key,
+                &NewEvent {
+                    t: t("2026-11-06T15:50:00.000Z"),
+                    from: uid("bob@example.net"),
+                    kind: EventKind::Msg {
+                        relation: None,
+                        file: None,
+                        text: format!("more {n}"),
+                    },
+                    cid: None,
+                },
+            )
+            .unwrap();
+    }
+    let seqs = |store: &SqliteStore| -> Vec<u64> {
+        (1..=7)
+            .filter(|&n| {
+                store
+                    .event(record.key, Seq::new(n).unwrap())
+                    .unwrap()
+                    .is_some()
+            })
+            .collect()
+    };
+    assert_eq!(store.trim_room(record.key, 0).unwrap(), 0);
+    assert_eq!(store.trim_room(record.key, 3).unwrap(), 3);
+    assert_eq!(seqs(&store), [4, 5, 6, 7]);
+    assert_eq!(store.trim_room(record.key, 3).unwrap(), 1);
+    assert_eq!(seqs(&store), [5, 6, 7]);
+    assert_eq!(store.trim_room(record.key, 3).unwrap(), 0);
+    assert_eq!(store.trim_room(record.key, 10).unwrap(), 0);
+    // The head stays.
+    let head = store.room(&room("#general")).unwrap().unwrap().head;
+    assert_eq!(head, Some(Seq::new(7).unwrap()));
+}
+
+#[test]
 fn migration_4_keeps_open_reports() {
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     let v4 = schema::MIGRATIONS

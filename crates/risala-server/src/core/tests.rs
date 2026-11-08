@@ -2262,6 +2262,10 @@ impl crate::store::ReportStore for Flaky {
         }
         self.inner.drop_room(c, recreate, t)
     }
+    fn trim_room(&self, c: ConvKey, m: usize) -> crate::store::Result<u64> {
+        self.pause.at("trim_room");
+        self.inner.trim_room(c, m)
+    }
 }
 
 // (admin)

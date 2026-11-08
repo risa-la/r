@@ -234,6 +234,36 @@ impl ReportStore for SqliteStore {
                 .map(Some)
         })
     }
+
+    fn trim_room(&self, key: ConvKey, max: usize) -> Result<u64> {
+        let Some(offset) = max.checked_sub(1) else {
+            return Ok(0);
+        };
+        let (max, offset) = (
+            i64::try_from(max).unwrap_or(i64::MAX),
+            i64::try_from(offset).unwrap_or(i64::MAX),
+        );
+        self.write(|tx| {
+            // The oldest of the newest `max` events stays, with all after it.
+            let keep: Option<i64> = tx
+                .query_row(
+                    "SELECT seq FROM events WHERE conv = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+                    params![key.0, offset],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(keep) = keep else {
+                return Ok(0);
+            };
+            // Their text goes with them (ON DELETE CASCADE).
+            let n = tx.execute(
+                "DELETE FROM events WHERE conv = ?1 AND seq IN \
+                 (SELECT seq FROM events WHERE conv = ?1 AND seq < ?2 ORDER BY seq LIMIT ?3)",
+                params![key.0, keep, max],
+            )?;
+            Ok(n as u64)
+        })
+    }
 }
 
 #[cfg(test)]

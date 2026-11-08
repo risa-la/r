@@ -47,10 +47,10 @@ use crate::store::{
 /// whole days, so an event outlives its period by at most this.
 pub const EXPIRE_PERIOD: Duration = Duration::from_secs(60 * 60);
 
-/// The most events one store transaction expires, or deletes in a purge,
-/// so that transactions stay short and other commands get the room's lock
-/// in between.
-const BATCH: usize = 500;
+/// The most events one store transaction expires, or deletes in a purge
+/// or an ADMIN DROP, so that transactions stay short and other commands
+/// get the store, and for expiry and purges the room's lock, in between.
+pub(super) const BATCH: usize = 500;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
