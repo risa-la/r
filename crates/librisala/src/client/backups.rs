@@ -36,6 +36,7 @@ use risala_proto::server::ServerLine;
 use tokio::sync::broadcast;
 
 use super::files::{Commands, Jobs, TransferError, TransferEvent, ok, proto_ref, wakes_worker};
+use super::identity::IdentityEvent;
 use super::types::{AccountId, ConversationId, DeviceId, MessageId, Timestamp};
 use super::{Client, Error, Event, Result};
 use crate::conn::End;
@@ -398,46 +399,29 @@ impl Jobs {
 
     // ---- backups
 
-    /// The identity's current generation and backup key, from the
-    /// identity area's record of them (C1: the `identities` row and the
-    /// key store's `<key_id>.backup`, 12.13).
+    /// The identity's current generation and backup key, as the identity
+    /// area (C1) keeps them: the generation in the identity's row, the key
+    /// in the key store (12.13).
     fn backup_key(&self) -> Result<Option<BackupKey>> {
-        let row: Option<(String, u32)> = self.store.read(|conn| {
-            use rusqlite::OptionalExtension as _;
-            Ok(conn
-                .query_row(
-                    "SELECT key_id, backup_generation FROM identities WHERE uid = ?1",
-                    [self.uid.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?)
-        })?;
-        let Some((key_id, generation)) = row else {
+        let Some(own) = self.store.own_identity(self.uid.as_str())? else {
             return Ok(None);
         };
-        let Some(key) = self.keys.load(&format!("{key_id}.backup"))? else {
+        let names = crate::keys::KeyNames::new(&own.key_id);
+        let Some(seed) = self.keys.load_seed(&names.backup())? else {
             return Ok(None);
         };
-        let seed = crate::keys::key_seed(&key);
-        Ok(Some(BackupKey::from_bytes(generation, *seed)))
+        Ok(Some(BackupKey::from_bytes(own.backup_generation, *seed)))
     }
 
     /// The generation a recovered identity may restore: the one current
-    /// just before its recovery record (12.13). The identity area keeps
-    /// the chain's generation, from the key file checked against the log,
-    /// in the identity's row; the recovery record moved it on by one.
+    /// just before its newest `signing` record, from the chain this device
+    /// accepted, never from the server (12.13), as the identity area (C1)
+    /// computes it.
     fn restorable_generation(&self) -> Result<Option<u32>> {
-        let generation: Option<u32> = self.store.read(|conn| {
-            use rusqlite::OptionalExtension as _;
-            Ok(conn
-                .query_row(
-                    "SELECT backup_generation FROM identities WHERE uid = ?1",
-                    [self.uid.as_str()],
-                    |r| r.get(0),
-                )
-                .optional()?)
-        })?;
-        Ok(generation.and_then(|g| g.checked_sub(1)))
+        let identity = self.identity()?;
+        let rows = self.store.records(identity.as_str())?;
+        Ok(crate::sync::identity::kept_chain(&identity, &rows, false)
+            .and_then(|chain| chain.generation().checked_sub(1)))
     }
 
     /// Makes a backup now (12.13): archives of everything, with the files
@@ -514,6 +498,18 @@ impl Jobs {
         Ok(())
     }
 
+    /// The identity moved to a new generation on this device (4.8): the
+    /// device MUST replace the current backup at once with one under it,
+    /// if the identity keeps one (12.13): backups are on here, or the
+    /// server has one.
+    pub(crate) async fn backup_for_new_generation(&self) -> Result<()> {
+        let on = self.store.setting(&setting(self.uid.as_str()))?.as_deref() == Some("on");
+        if on || self.backup_get().await?.is_some() {
+            self.backup_now().await?;
+        }
+        Ok(())
+    }
+
     /// The identity's backup on the server: BACKUP GET (12.13).
     pub(crate) async fn backup_get(&self) -> Result<Option<Backup>> {
         let response = self
@@ -552,13 +548,22 @@ impl Jobs {
 
     /// Restores the backup after recovery, following 12.13's steps.
     pub(crate) async fn restore(&self, recovery_key: &str) -> Result<Restored> {
-        let uid = self.identity()?;
-        let recovery = RecoveryKey::parse(recovery_key)
-            .map_err(|_| Error::invalid("recovery key", "(hidden)"))?;
         // 1. The generation from the chain, not from the server.
         let generation = self
             .restorable_generation()?
             .ok_or(TransferError::NoBackup)?;
+        self.restore_generation(recovery_key, generation).await
+    }
+
+    /// Steps 2 to 5 of restoring (12.13), for the generation step 1 gave.
+    pub(crate) async fn restore_generation(
+        &self,
+        recovery_key: &str,
+        generation: u32,
+    ) -> Result<Restored> {
+        let uid = self.identity()?;
+        let recovery = RecoveryKey::parse(recovery_key)
+            .map_err(|_| Error::invalid("recovery key", "(hidden)"))?;
         // 2. BACKUP GET, refusing any other generation.
         let backup = self.backup_get().await?.ok_or(TransferError::NoBackup)?;
         if backup.generation != generation {
@@ -650,7 +655,13 @@ impl Jobs {
 /// The account's worker: does the area's work when the cache changes, and
 /// every 30 seconds, until the account disconnects.
 pub(crate) async fn worker(jobs: Jobs, mut events: broadcast::Receiver<Event>) {
+    let mut new_generation = false;
     loop {
+        if std::mem::take(&mut new_generation)
+            && let Err(e) = jobs.backup_for_new_generation().await
+        {
+            tracing::info!(error = %e, "the new generation's backup failed; will retry");
+        }
         jobs.run_due().await;
         let wait = tokio::time::sleep(WORKER_PERIOD);
         tokio::pin!(wait);
@@ -659,6 +670,14 @@ pub(crate) async fn worker(jobs: Jobs, mut events: broadcast::Receiver<Event>) {
                 () = &mut wait => break,
                 event = events.recv() => match event {
                     Ok(Event::Changed(change)) if wakes_worker(&change) => break,
+                    // 4.8, 12.13: C1 tells this device's account that it
+                    // moved the identity to a new generation.
+                    Ok(Event::Identity(IdentityEvent::NewGeneration { uid, .. }))
+                        if uid == jobs.uid =>
+                    {
+                        new_generation = true;
+                        break;
+                    }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
@@ -766,6 +785,51 @@ impl Client {
             .store_transfer(Selection::All, true)
             .await?
             .map(|s| s.first.to_bytes().to_vec()))
+    }
+
+    /// The history transfer for a device being paired (4.8, 12.13), built
+    /// on the connected account of `uid` on its home server, where the
+    /// blobs are stored. `None` if there is none to send, or the account
+    /// is not connected: the pairing goes on without history.
+    pub(crate) async fn transfer_for_pairing(
+        &self,
+        uid: &Identity,
+        home: &str,
+    ) -> Option<TransferRef> {
+        let account = self
+            .accounts()
+            .ok()?
+            .into_iter()
+            .find(|a| a.uid.as_str() == uid.as_str() && a.server.to_string() == home)?;
+        let jobs = self.jobs(account.id).ok()?;
+        match jobs.store_transfer(Selection::All, true).await {
+            Ok(stored) => stored.map(|s| s.first),
+            Err(e) => {
+                tracing::info!(error = %e, "no history transfer for the new device");
+                None
+            }
+        }
+    }
+
+    /// Keeps the IdentityBundle's transfer on the new device, on its
+    /// account on the home server (4.8, step 5): fetched once it connects,
+    /// and applied as the device is added to conversations. The bundle
+    /// does not name the device that sent it, so its messages show as
+    /// copied from another device of the identity.
+    pub(crate) fn keep_pairing_transfer(
+        &self,
+        uid: &Identity,
+        home: &crate::addr::ServerAddr,
+        transfer: &TransferRef,
+    ) -> Result<()> {
+        let Some(account) = self
+            .accounts()?
+            .into_iter()
+            .find(|a| a.uid.as_str() == uid.as_str() && a.server == *home)
+        else {
+            return Ok(());
+        };
+        self.receive_pairing_transfer(account.id, &transfer.to_bytes()[..], None, None)
     }
 
     /// Keeps the IdentityBundle's transfer on the new device (4.8, step

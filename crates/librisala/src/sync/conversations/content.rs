@@ -180,7 +180,7 @@ pub(crate) fn receive(
                         &message_id,
                         message.counter,
                         message.previous.map(|p| *p.as_bytes()),
-                        d.identity.device_id.map(|d| d.0),
+                        d.identity.device_id.map(|d| *d.as_bytes()),
                     )?;
                     // A DELETE that arrived first (5.4).
                     for (by, with_role) in tx.kept_deletes(conv.id, &message_id)? {

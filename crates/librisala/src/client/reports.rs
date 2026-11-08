@@ -339,7 +339,7 @@ impl Client {
                     Command::Blob {
                         hash,
                         size: bytes.len() as u64,
-                        permit: Some(risala_proto::command::BlobPermit {
+                        permit: Some(risala_proto::command::MailboxPermit {
                             mailbox,
                             token: risala_proto::mls::SendToken::from_bytes(*token.as_bytes()),
                         }),

@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use risala_proto::binary::{PushAuth, PushKey};
-use risala_proto::command::{Command, PushCommand};
+use risala_proto::command::{Command, MailboxPermit, PushCommand};
 use risala_proto::connection::ConnectionKind;
 use risala_proto::error::ErrorCode;
 use risala_proto::names::BoxName;
@@ -91,9 +91,8 @@ pub(crate) fn new_keys() -> Result<NewKeys, EngineError> {
 }
 
 /// PUSH ADD (9.1). A mailbox subscription carries `box=` and a send token
-/// of the group: until the proto change that adds `token=` to PUSH ADD
-/// lands on `m5b`, only `box=` is sent.
-fn push_add(
+/// of the group, so that only members can make or renew one.
+pub(crate) fn push_add(
     row: &SubscriptionRow,
     permit: Option<(BoxName, risala_mls::token::SendToken)>,
 ) -> Option<Command> {
@@ -101,17 +100,20 @@ fn push_add(
     let tag: PushTag = row.tag.parse().ok()?;
     let key = PushKey::from_bytes(row.p256dh.as_slice().try_into().ok()?);
     let auth = PushAuth::from_bytes(row.auth.as_slice().try_into().ok()?);
-    let mailbox = permit.map(|(mailbox, _token)| mailbox);
+    let permit = permit.map(|(mailbox, token)| MailboxPermit {
+        mailbox,
+        token: risala_proto::mls::SendToken::from_bytes(*token.as_bytes()),
+    });
     Some(Command::Push(PushCommand::Add {
         url,
         tag,
         key,
         auth,
-        mailbox,
+        permit,
     }))
 }
 
-fn push_del(row: &SubscriptionRow) -> Option<Command> {
+pub(crate) fn push_del(row: &SubscriptionRow) -> Option<Command> {
     Some(Command::Push(PushCommand::Del {
         url: row.url.parse().ok()?,
         mailbox: match &row.mailbox {

@@ -23,12 +23,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
+use risala_mls::DeviceId;
 use risala_mls::RisalaCrypto;
 use risala_mls::archive::{ArchivedConversation, ArchivedFile, ArchivedMessage, HistoryArchive};
 use risala_mls::conversation::{RisalaConversation, Role};
-use risala_mls::identity::DeviceId;
 use risala_proto::content::{Content, ContentLine};
-use risala_proto::names::{BoxName, Domain, Identity, Seq, Uid};
+use risala_proto::names::{BoxName, Identity, Seq, ServerAddr, Uid};
 use risala_proto::server::ServerLine;
 
 use super::conversations::{EngineError, content};
@@ -109,58 +109,33 @@ pub(crate) fn account_of(tx: &Tx<'_>, account: AccountId) -> Result<(String, Uid
     Ok((addr, uid))
 }
 
-/// The host part of a server address, as archives name servers (12.13).
-pub(crate) fn host_of(addr: &str) -> Result<Domain> {
-    let host = addr
-        .parse::<crate::addr::ServerAddr>()
-        .map(|a| a.host().to_ascii_lowercase())
-        .map_err(|_| EngineError::Invalid(format!("bad server {addr:?}")))?;
-    host.parse()
-        .map_err(|_| EngineError::Invalid(format!("not a domain: {host:?}")))
+/// A server address as archives name servers (3.5, 12.13), from the
+/// account's server as stored.
+pub(crate) fn host_of(addr: &str) -> Result<ServerAddr> {
+    addr.parse()
+        .map_err(|_| EngineError::Invalid(format!("bad server {addr:?}")))
 }
 
-/// This device's device id for `uid`, if it holds the identity.
+/// This device's device id for `uid`, if it holds the identity (C1).
 pub(crate) fn own_device(tx: &Tx<'_>, uid: &str) -> Result<Option<[u8; 48]>> {
-    use rusqlite::OptionalExtension as _;
-    let id: Option<Vec<u8>> = tx
-        .conn()
-        .query_row(
-            "SELECT device_id FROM identities WHERE uid = ?1",
-            [uid],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(StoreError::from)?;
-    Ok(id.and_then(|i| i.try_into().ok()))
+    Ok(crate::store::identity::read_own(tx.conn(), uid)?.map(|o| o.device_id))
 }
 
 /// The label of `uid`'s device, as this device knows it (4.4).
 pub(crate) fn device_label(tx: &Tx<'_>, uid: &str, device: &[u8; 48]) -> Result<Option<String>> {
-    use rusqlite::OptionalExtension as _;
     Ok(tx
-        .conn()
-        .query_row(
-            "SELECT label FROM devices WHERE uid = ?1 AND device_id = ?2",
-            rusqlite::params![uid, &device[..]],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(StoreError::from)?)
+        .devices(uid)?
+        .into_iter()
+        .find(|d| d.device_id == *device)
+        .map(|d| d.label))
 }
 
-/// Whether the identity has a device besides this one, as far as this
-/// device knows (4.4).
+/// Whether the identity has a current device besides this one, as far as
+/// this device knows (4.4).
 fn has_other_devices(tx: &Tx<'_>, uid: &str, own: Option<&[u8; 48]>) -> Result<bool> {
-    let n: i64 = tx
-        .conn()
-        .query_row(
-            "SELECT count(*) FROM devices WHERE uid = ?1 AND removed_by IS NULL
-             AND device_id IS NOT ?2",
-            rusqlite::params![uid, own.map(|d| &d[..])],
-            |r| r.get(0),
-        )
-        .map_err(StoreError::from)?;
-    Ok(n > 0)
+    Ok(tx.devices(uid)?.iter().any(|d| {
+        d.state == crate::store::identity::DeviceState::Current && Some(&d.device_id) != own
+    }))
 }
 
 /// The account's conversation with yourself, if the device is in it.
@@ -481,7 +456,7 @@ pub(crate) fn collect(
                 device_id: if m.sender.is_guest() {
                     None
                 } else {
-                    device_id.map(DeviceId)
+                    device_id.map(DeviceId::from_bytes)
                 },
                 counter: meta.counter,
                 previous: meta.previous,
@@ -726,7 +701,7 @@ fn apply_conversation(
         };
         let leaf = m
             .device_id
-            .and_then(|d| leaves.iter().find(|l| l.device_id == Some(d.0)));
+            .and_then(|d| leaves.iter().find(|l| l.device_id == Some(*d.as_bytes())));
         let mut shown = false;
         for line in content.lines() {
             match line {
@@ -820,7 +795,7 @@ fn apply_conversation(
             &MessageMeta {
                 counter: m.counter,
                 previous: m.previous,
-                device_id: m.device_id.map(|d| d.0),
+                device_id: m.device_id.map(|d| *d.as_bytes()),
                 origin: origin.clone(),
                 vouched: m.verified,
             },

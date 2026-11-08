@@ -23,6 +23,8 @@
 //!   deleted, the worker deletes the file with its `del` URL (5.6).
 
 mod http;
+#[cfg(test)]
+mod server_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -404,6 +406,44 @@ impl Jobs {
 
     // ---- files
 
+    /// Uploads an encrypted file for the conversation of `mailbox` (5.6):
+    /// UPLOAD with a send token of its group, on the anonymous connection
+    /// that follows it, then a PUT. Returns the `get` and `del` URLs.
+    pub(crate) async fn upload(
+        &self,
+        mailbox: risala_proto::names::BoxName,
+        token: [u8; 32],
+        upload: &[u8],
+    ) -> Result<(FileUrl, Option<String>)> {
+        let response = self
+            .command(
+                Target::Mailbox(mailbox),
+                Command::Upload {
+                    mailbox,
+                    token: risala_proto::mls::SendToken::from_bytes(token),
+                    size: upload.len() as u64,
+                },
+            )
+            .await?;
+        let values = ok(&response)?;
+        let put = values
+            .put_url()
+            .ok_or(Error::Internal("UPLOAD without a put URL".into()))?
+            .to_owned();
+        let get: FileUrl = values
+            .get_url()
+            .ok()
+            .flatten()
+            .and_then(|u| u.as_str().parse().ok())
+            .ok_or(Error::Internal("UPLOAD without a valid get URL".into()))?;
+        let del = values.del_url().map(str::to_owned);
+        self.https
+            .put(&put, upload)
+            .await
+            .map_err(TransferError::from)?;
+        Ok((get, del))
+    }
+
     /// Encrypts `file` and shares it in `conv` (5.6, 12.11): UPLOAD on the
     /// mailbox's anonymous connection, PUT, then a message with the file's
     /// tags. Returns the message's id.
@@ -444,32 +484,9 @@ impl Jobs {
             })
             .map_err(engine)?
             .0;
-        let response = self
-            .command(
-                Target::Mailbox(mailbox),
-                Command::Upload {
-                    mailbox,
-                    token: risala_proto::mls::SendToken::from_bytes(*token.as_bytes()),
-                    size,
-                },
-            )
+        let (get, del) = self
+            .upload(mailbox, *token.as_bytes(), &encrypted.upload)
             .await?;
-        let values = ok(&response)?;
-        let put = values
-            .put_url()
-            .ok_or(Error::Internal("UPLOAD without a put URL".into()))?
-            .to_owned();
-        let get: FileUrl = values
-            .get_url()
-            .ok()
-            .flatten()
-            .and_then(|u| u.as_str().parse().ok())
-            .ok_or(Error::Internal("UPLOAD without a valid get URL".into()))?;
-        let del = values.del_url().map(str::to_owned);
-        self.https
-            .put(&put, &encrypted.upload)
-            .await
-            .map_err(TransferError::from)?;
         self.emit(Event::Transfer(TransferEvent::Progress {
             message: None,
             done: size,

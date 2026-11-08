@@ -296,6 +296,13 @@ impl Client {
                     .add_account(&addr, AccountKind::Identity, &uid.to_uid())?;
             }
         }
+        // Task C4: the history transfer, fetched once the home account
+        // connects, and applied as the device is added to conversations.
+        if let Some(transfer) = &bundle.transfer
+            && let Some(home) = from_wire(home)
+        {
+            self.keep_pairing_transfer(&uid, &home, transfer)?;
+        }
         Ok(OwnIdentity {
             uid: to_uid(&uid),
             device: DeviceId(*ours.device_id().as_bytes()),
@@ -359,10 +366,10 @@ impl Client {
     /// [`scan_pairing`](Self::scan_pairing), and sends it the identity
     /// (4.8, steps 3 and 4): a `device` record signed by the
     /// device-signing key, published with KEYS PUT, and the IdentityBundle
-    /// sealed to the new device on the relay. History transfer
-    /// (`transfer`) is the backups area's (task C4), and not sent yet.
+    /// sealed to the new device on the relay. With `transfer`, the bundle
+    /// carries the history of this device's conversations on the home
+    /// server (12.13, task C4), if the account there is connected.
     pub async fn confirm_pairing(&self, uid: &str, transfer: bool) -> Result<()> {
-        let _ = transfer;
         let identity = parse_identity(uid)?;
         let own = self.own_row(&identity)?;
         let row = self
@@ -451,7 +458,11 @@ impl Client {
                     backup: risala_mls::BackupKey::from_bytes(own.backup_generation, *backup),
                     record_hash: *record.hash().hash(),
                     hosts,
-                    transfer: None,
+                    // Task C4: archives of this device's history (12.13).
+                    transfer: match transfer {
+                        true => self.transfer_for_pairing(&identity, &own.home).await,
+                        false => None,
+                    },
                 };
                 let mls_device =
                     risala_mls::NewDevice::decode(&row.new_device).map_err(pairing_error)?;

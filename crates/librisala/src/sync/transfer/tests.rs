@@ -358,7 +358,7 @@ impl Net {
             .add_account(&addr, AccountKind::Identity, &uid)
             .unwrap();
         let key = SigningKey::generate().unwrap();
-        let device_id = risala_mls::identity::DeviceId::of_device_key(key.public_key()).0;
+        let device_id = *key.device_id().as_bytes();
         let hooks = Arc::new(C4Hooks {
             key,
             clock: self.clock.clone(),
@@ -377,11 +377,15 @@ impl Net {
             .insert((d, Slot::SignedIn), (uid.to_string(), device_id.to_vec()));
         store
             .write(|tx| {
-                tx.conn().execute(
-                    "INSERT INTO identities (uid, device_id, key_id, created) VALUES (?1, ?2, ?1, 0)",
-                    rusqlite::params![uid.as_str(), &device_id[..]],
-                )?;
-                Ok(())
+                tx.add_own(&crate::store::identity::OwnRow {
+                    uid: uid.to_string(),
+                    device_id,
+                    key_id: uid.to_string(),
+                    home: "chat.example.org".into(),
+                    backup_generation: 0,
+                    created: 0,
+                    told_full: false,
+                })
             })
             .unwrap();
         self.devices.push(Device {
@@ -400,21 +404,22 @@ impl Net {
             .filter(|&o| self.devices[o].uid == uid)
             .collect();
         for &o in &same {
-            for &p in &same {
-                let (id, label) = (self.devices[p].device_id, self.devices[p].name);
-                self.devices[o]
-                    .store
-                    .write(|tx| {
-                        tx.conn().execute(
-                            "INSERT OR IGNORE INTO devices
-                                 (uid, device_id, device_key, attestation_key, label, added_by)
-                             VALUES (?1, ?2, x'00', x'00', ?3, x'00')",
-                            rusqlite::params![uid.as_str(), &id[..], label],
-                        )?;
-                        Ok(())
-                    })
-                    .unwrap();
-            }
+            let rows: Vec<crate::store::identity::DeviceRow> = same
+                .iter()
+                .map(|&p| crate::store::identity::DeviceRow {
+                    device_id: self.devices[p].device_id,
+                    device_key: vec![0],
+                    attestation_key: vec![0],
+                    label: self.devices[p].name.into(),
+                    added: 0,
+                    state: crate::store::identity::DeviceState::Current,
+                })
+                .collect();
+            let uid = uid.to_string();
+            self.devices[o]
+                .store
+                .write(|tx| tx.put_devices(&uid, &rows))
+                .unwrap();
         }
         d
     }
@@ -1074,17 +1079,14 @@ fn give_backup_key(net: &Net, d: usize, recovery: &RecoveryKey, generation: u32)
     let uid: Identity = dev.uid.as_str().parse().unwrap();
     let key = recovery.backup_key(&uid, generation);
     dev.keys
-        .save(
-            &format!("{}.backup", dev.uid),
-            &risala_proto::auth::SecretKey::from_seed(*key.as_bytes()),
+        .save_seed(
+            &crate::keys::KeyNames::new(dev.uid.as_str()).backup(),
+            key.as_bytes(),
         )
         .unwrap();
+    let uid = dev.uid.to_string();
     dev.store
-        .write(|tx| {
-            tx.conn()
-                .execute("UPDATE identities SET backup_generation = ?1", [generation])?;
-            Ok(())
-        })
+        .write(|tx| tx.set_backup_generation(&uid, generation))
         .unwrap();
 }
 
@@ -1130,14 +1132,14 @@ fn backups_are_made_daily_and_on_a_new_generation_and_restored() {
     let a4 = net.device("alice4", uid);
     net.connect(a4);
     give_backup_key(&net, a4, &recovery, 1);
-    let restored = block_on(net.jobs(a4).restore(&recovery.to_display())).unwrap();
+    let restored = block_on(net.jobs(a4).restore_generation(&recovery.to_display(), 0)).unwrap();
     assert!(restored.waiting >= 1, "{restored:?}");
     assert_eq!(restored.made.unix_millis(), START + BACKUP_DAY);
     // The wrong recovery key does not open it.
     let a5 = net.device("alice5", uid);
     give_backup_key(&net, a5, &recovery, 1);
     let wrong = RecoveryKey::generate().unwrap();
-    let err = block_on(net.jobs(a5).restore(&wrong.to_display())).unwrap_err();
+    let err = block_on(net.jobs(a5).restore_generation(&wrong.to_display(), 0)).unwrap_err();
     assert!(
         matches!(
             err,
@@ -1153,7 +1155,7 @@ fn backups_are_made_daily_and_on_a_new_generation_and_restored() {
     assert_eq!(third.0, 1);
     // A device that may restore only generation 0 refuses it: the
     // generation comes from the chain, not the server (12.13).
-    let err = block_on(net.jobs(a5).restore(&recovery.to_display())).unwrap_err();
+    let err = block_on(net.jobs(a5).restore_generation(&recovery.to_display(), 0)).unwrap_err();
     assert!(
         matches!(err, crate::client::Error::Transfer(TransferError::NoBackup)),
         "{err}"
@@ -1173,7 +1175,7 @@ fn restored_conversations_wait_for_the_device_to_join() {
     let a3 = net.device("alice3", "alice@example.org");
     net.connect(a3);
     give_backup_key(&net, a3, &recovery, 1);
-    block_on(net.jobs(a3).restore(&recovery.to_display())).unwrap();
+    block_on(net.jobs(a3).restore_generation(&recovery.to_display(), 0)).unwrap();
     net.job(
         a1,
         Job::Invite {
@@ -1471,12 +1473,11 @@ fn push_subscriptions_follow_the_conversations() {
     let mailbox = store.mailbox_rows(conv).unwrap()[0].mailbox;
     assert!(
         all.iter()
-            .any(|(t, c, _)| *t == Target::SignedIn && c.contains("mailbox: None"))
+            .any(|(t, c, _)| *t == Target::SignedIn && c.contains("permit: None"))
     );
-    assert!(
-        all.iter()
-            .any(|(t, c, _)| *t == Target::Mailbox(mailbox) && c.contains(&mailbox.to_string()))
-    );
+    assert!(all.iter().any(|(t, c, _)| *t == Target::Mailbox(mailbox)
+        && c.contains(&mailbox.to_string())
+        && c.contains("token")));
     // Every subscription has its own URL and tag.
     let subs = store.subscription_rows().unwrap();
     let tags: std::collections::HashSet<_> = subs.iter().map(|s| s.tag.clone()).collect();
