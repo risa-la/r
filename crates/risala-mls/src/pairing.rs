@@ -7,12 +7,14 @@
 //!
 //! - `new_id` = HKDF-Expand(PRK, "risala/1 pair new id", 16) and
 //!   `new_key` = HKDF-Expand(PRK, "risala/1 pair new key", 32), for the
-//!   new device's message, its encoded [`NewDevice`];
+//!   new device's message, its encoded [`NewDevice`] encrypted and sent
+//!   as a SealedNewDevice;
 //! - `old_id` and `old_key` the same way with `old`, for the reply, a
 //!   [`SealedBundle`].
 //!
 //! The NewDevice is encrypted with ChaCha20-Poly1305 under `new_key`, a
-//! nonce of 12 zero bytes and the associated data `risala/1 pair`. It is
+//! nonce of 12 zero bytes and the associated data `risala/1 pair`, and the
+//! ciphertext is wrapped in a SealedNewDevice with a version byte. It is
 //! signed by the new device key (RisalaSign, label `pair`) and carries a
 //! new X-Wing **pairing key**. The [`IdentityBundle`] is sealed to that key
 //! with HPKE [RFC9180] in mode_psk, with 12.2's KEM, KDF and AEAD (X-Wing
@@ -32,6 +34,7 @@
 //! ```text
 //! struct { DeviceKeys keys; opaque pairing_key<V>; } NewDeviceContent;
 //! struct { uint8 version; NewDeviceContent content; opaque signature<V>; } NewDevice;
+//! struct { uint8 version; opaque ciphertext<V>; } SealedNewDevice;
 //! opaque Host<V>;
 //! struct {
 //!     uint8 version; opaque uid<V>; opaque master_key<V>;
@@ -49,7 +52,7 @@ use hpke_rs_crypto::HpkeCrypto as _;
 use hpke_rs_crypto::types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
 use hpke_rs_libcrux::HpkeLibcrux;
 use risala_proto::auth::{PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, Signature};
-use risala_proto::names::{Domain, Identity};
+use risala_proto::names::{Identity, ServerAddr};
 use zeroize::Zeroizing;
 
 use crate::archive::{ArchiveError, Reader, TRANSFER_REF_LEN, TransferRef, Writer};
@@ -82,8 +85,8 @@ pub const ENC_LEN: usize = 1120;
 /// The most bytes of a device's label (4.4).
 pub const MAX_LABEL_LEN: usize = 64;
 
-/// The version of a NewDevice, IdentityBundle, SealedBundle and
-/// PairingCode (4.8).
+/// The version of a NewDevice, SealedNewDevice, IdentityBundle,
+/// SealedBundle and PairingCode (4.8).
 pub const PAIRING_VERSION: u8 = 1;
 
 /// The associated data of the NewDevice's encryption, and the HPKE info
@@ -284,15 +287,21 @@ impl Relay {
         self.old_id
     }
 
-    /// Encrypts the new device's encoded NewDevice, for `PAIR PUT new_id`.
-    /// The key encrypts this one message only: the same NewDevice gives the
-    /// same bytes, which is what a repeated PAIR PUT sends, and to send
-    /// another the device starts again with a new secret.
+    /// Encrypts the new device's encoded NewDevice, and returns the
+    /// encoded SealedNewDevice, for `PAIR PUT new_id`. The key encrypts
+    /// this one message only: the same NewDevice gives the same bytes,
+    /// which is what a repeated PAIR PUT sends, and to send another the
+    /// device starts again with a new secret.
     pub fn seal_new_device(&self, new_device: &[u8]) -> Vec<u8> {
-        seal(&self.new_key, &ZERO_NONCE, PAIR_LABEL, new_device)
+        let ciphertext = seal(&self.new_key, &ZERO_NONCE, PAIR_LABEL, new_device);
+        let mut w = Writer::default();
+        w.u8(PAIRING_VERSION);
+        w.vector(&ciphertext);
+        w.0.to_vec()
     }
 
-    /// Opens the data of `PAIR new_id` (4.8, step 2): decrypts it, checks
+    /// Opens the data of `PAIR new_id` (4.8, step 2): reads the
+    /// SealedNewDevice, rejecting a `version` other than 1, decrypts it, checks
     /// in constant time that its SHA-384 hash is the PairingCode's
     /// `keys_hash`, reads it, and checks its signature and keys
     /// ([`NewDevice::decode`]). The checks of 4.4 that need the identity's
@@ -302,8 +311,15 @@ impl Relay {
         data: &[u8],
         keys_hash: &[u8; HASH_LEN],
     ) -> Result<NewDevice, PairingError> {
-        let new_device =
-            open(&self.new_key, &ZERO_NONCE, PAIR_LABEL, data).ok_or(PairingError::Decrypt)?;
+        let mut r = Reader(data);
+        let version = r.u8()?;
+        if version != PAIRING_VERSION {
+            return Err(PairingError::Version(version));
+        }
+        let ciphertext = r.vector()?;
+        r.end()?;
+        let new_device = open(&self.new_key, &ZERO_NONCE, PAIR_LABEL, ciphertext)
+            .ok_or(PairingError::Decrypt)?;
         if !ct_eq(&sha384(&new_device), keys_hash) {
             return Err(PairingError::Hash);
         }
@@ -580,9 +596,10 @@ pub struct IdentityBundle {
     pub backup: BackupKey,
     /// SHA-384 of the new device's `device` record (4.4).
     pub record_hash: [u8; HASH_LEN],
-    /// The servers the identity uses, in lower case, its home first
-    /// (12.13). Never empty, without repeats.
-    pub hosts: Vec<Domain>,
+    /// The servers the identity uses, each a server address in its one
+    /// written form (2.1), its home first (12.13). Never empty, without
+    /// repeats.
+    pub hosts: Vec<ServerAddr>,
     /// The history transfer, if any (12.13).
     pub transfer: Option<TransferRef>,
 }
@@ -601,7 +618,7 @@ impl IdentityBundle {
         w.bytes(&self.record_hash);
         w.nested(|w| {
             for host in &self.hosts {
-                w.vector(host.as_str().as_bytes());
+                w.vector(host.to_string().as_bytes());
             }
         });
         match &self.transfer {
@@ -612,8 +629,8 @@ impl IdentityBundle {
     }
 
     /// Reads an encoded bundle: version 1, a uid in lower case, a master
-    /// key of 1312 bytes, at least one host, each in lower case and none
-    /// twice, a transfer that is empty or one TransferRef of version 1,
+    /// key of 1312 bytes, at least one host, each a server address in its
+    /// one written form (2.1) and none twice, a transfer that is empty or one TransferRef of version 1,
     /// and nothing after it.
     pub fn decode(bytes: &[u8]) -> Result<IdentityBundle, PairingError> {
         let mut r = Reader(bytes);
@@ -630,12 +647,12 @@ impl IdentityBundle {
         let generation = r.u32()?;
         let backup = BackupKey::from_bytes(generation, r.array::<BACKUP_KEY_LEN>()?);
         let record_hash = r.array::<HASH_LEN>()?;
-        let mut hosts: Vec<Domain> = Vec::new();
+        let mut hosts: Vec<ServerAddr> = Vec::new();
         let mut list = Reader(r.vector()?);
         while !list.0.is_empty() {
-            let host = canonical::<Domain>(list.vector()?, "hosts")?;
-            // The home server comes first, and a list with repeats is not
-            // one a device makes (a choice; 4.8 does not say).
+            let host = server_addr(list.vector()?, "hosts")?;
+            // The home server comes first, and the list has no repeats
+            // (4.8).
             if hosts.contains(&host) {
                 return Err(PairingError::Malformed("hosts"));
             }
@@ -702,8 +719,9 @@ impl fmt::Debug for IdentityBundle {
 /// in risala-proto. These are its bytes only, until that lands.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PairingCode {
-    /// The server used for pairing.
-    pub host: Domain,
+    /// The server used for pairing, as a server address in its one
+    /// written form (2.1), which may carry a port.
+    pub host: ServerAddr,
     /// The one-time pairing secret.
     pub secret: PairingSecret,
     /// SHA-384 of the encoded NewDevice.
@@ -713,7 +731,7 @@ pub struct PairingCode {
 impl PairingCode {
     /// The code for pairing through `host`, with `secret`, for
     /// `new_device`.
-    pub fn new(host: Domain, secret: PairingSecret, new_device: &NewDevice) -> PairingCode {
+    pub fn new(host: ServerAddr, secret: PairingSecret, new_device: &NewDevice) -> PairingCode {
         PairingCode {
             host,
             secret,
@@ -725,21 +743,21 @@ impl PairingCode {
     pub fn encode(&self) -> Zeroizing<Vec<u8>> {
         let mut w = Writer::default();
         w.u8(PAIRING_VERSION);
-        w.vector(self.host.as_str().as_bytes());
+        w.vector(self.host.to_string().as_bytes());
         w.bytes(self.secret.as_bytes());
         w.bytes(&self.keys_hash);
         w.0
     }
 
-    /// Reads an encoded code: version 1, a host in lower case, and
-    /// nothing after the hash.
+    /// Reads an encoded code: version 1, a host that is a server address
+    /// in its one written form (2.1), and nothing after the hash.
     pub fn decode(bytes: &[u8]) -> Result<PairingCode, PairingError> {
         let mut r = Reader(bytes);
         let version = r.u8()?;
         if version != PAIRING_VERSION {
             return Err(PairingError::Version(version));
         }
-        let host = canonical::<Domain>(r.vector()?, "host")?;
+        let host = server_addr(r.vector()?, "host")?;
         let secret = PairingSecret(Zeroizing::new(r.array()?));
         let keys_hash = r.array()?;
         r.end()?;
@@ -749,6 +767,15 @@ impl PairingCode {
             keys_hash,
         })
     }
+}
+
+/// A server address in its one written form (2.1): parsing it is strict,
+/// so the text is already the one form.
+fn server_addr(bytes: &[u8], what: &'static str) -> Result<ServerAddr, PairingError> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(PairingError::Malformed(what))
 }
 
 /// A name in the exact form it is sent in: UTF-8 that parses and is
@@ -1054,7 +1081,10 @@ mod tests {
         let code = PairingCode::new("example.org".parse().unwrap(), secret(), &device);
         let relay = code.secret.relay();
         let data = relay.seal_new_device(&new_device_bytes);
-        assert_eq!(data.len(), new_device_bytes.len() + 16);
+        // A SealedNewDevice: the version, the ciphertext's two-byte length,
+        // then the ciphertext and its tag (4.8).
+        assert_eq!(data.len(), 1 + 2 + new_device_bytes.len() + 16);
+        assert_eq!(data[0], PAIRING_VERSION);
         assert_eq!(relay.open_new_device(&data, &code.keys_hash), Ok(device));
         // A repeated PAIR PUT sends the same bytes.
         assert_eq!(relay.seal_new_device(&new_device_bytes), data);
@@ -1067,17 +1097,34 @@ mod tests {
         );
         // Changed, under another secret, or without the associated data.
         let mut changed = data.clone();
-        changed[0] ^= 1;
+        *changed.last_mut().unwrap() ^= 1;
         assert_eq!(
             relay.open_new_device(&changed, &code.keys_hash),
             Err(PairingError::Decrypt)
         );
+        // Another version, bytes after the ciphertext, the bare ciphertext.
+        let mut v2 = data.clone();
+        v2[0] = 2;
+        assert_eq!(
+            relay.open_new_device(&v2, &code.keys_hash),
+            Err(PairingError::Version(2))
+        );
+        let mut longer = data.clone();
+        longer.push(0);
+        assert!(matches!(
+            relay.open_new_device(&longer, &code.keys_hash),
+            Err(PairingError::Malformed(_))
+        ));
+        assert!(relay.open_new_device(&data[3..], &code.keys_hash).is_err());
         let stranger = PairingSecret::from_bytes([9; 32]).relay();
         assert_eq!(
             stranger.open_new_device(&data, &code.keys_hash),
             Err(PairingError::Decrypt)
         );
-        let no_aad = seal(&relay.new_key, &ZERO_NONCE, b"", &new_device_bytes);
+        let mut no_aad = Writer::default();
+        no_aad.u8(PAIRING_VERSION);
+        no_aad.vector(&seal(&relay.new_key, &ZERO_NONCE, b"", &new_device_bytes));
+        let no_aad = no_aad.0.to_vec();
         assert_eq!(
             relay.open_new_device(&no_aad, &code.keys_hash),
             Err(PairingError::Decrypt)
@@ -1246,6 +1293,17 @@ mod tests {
         assert!(build(&master, &hosts, &[]).is_ok());
         assert!(build(&master, &hosts, &transfer[..]).is_ok());
         assert!(build(&master, &["example.org"], &[]).is_ok());
+        // Servers with ports and single labels are servers (2.1).
+        assert!(build(&master, &["chat.example.org:7000", "localhost"], &[]).is_ok());
+        // The default port written out, or an IP address, are not in the
+        // one written form.
+        for host in ["chat.example.org:7472", "192.0.2.1", "chat.example.org."] {
+            assert_eq!(
+                build(&master, &[host], &[]),
+                Err(PairingError::Malformed("hosts")),
+                "{host}"
+            );
+        }
         assert_eq!(
             build(&master[..1311], &hosts, &[]),
             Err(PairingError::Malformed("master_key"))
@@ -1306,6 +1364,12 @@ mod tests {
             PairingCode::decode(&b),
             Err(PairingError::Malformed("host"))
         );
+        // A host with a port other than 7472 (2.1, 4.8).
+        let ported = PairingCode {
+            host: "chat.example.org:7000".parse().unwrap(),
+            ..code.clone()
+        };
+        assert_eq!(PairingCode::decode(&ported.encode()), Ok(ported));
     }
 
     /// The whole exchange, as two devices run it.
@@ -1511,8 +1575,8 @@ mod tests {
          c5e3a062ed8f861842998228a16ba507",
         "6724886199a6839cb44935a19138c3470964797ec10151f3527a3af44766f84b\
          61c5bef0775a4f412d844c2d3fde9e04",
-        "741362b04dfb726dc606cfc6789a0757c4523d1386f480f2719e61a1025dc9db\
-         8acd9857340db487075f21ab558be01f",
+        "a95c35fa425d3fbc4b6a8d6a2c47affe5dd4d82f0354c2a7166066a472539a86\
+         628e71623e5f1d23a7258fa58da0112d",
         "b40b00f93adf73c5a83e2107f0c2955829bb80520f016565444a6effa3f24c81\
          4efe898183acbf5db3c12fc69c2a73f1",
     ];

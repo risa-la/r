@@ -350,13 +350,12 @@ impl BackupKey {
         let key = self.wrap(uid, &first.blob, &first.key)?;
         // The hashes of every other blob: the archives in `more`, then the
         // files in `files` (12.13).
-        let others: Vec<u8> = archives[1..]
+        let others: Vec<BlobRef> = archives[1..]
             .iter()
             .map(|a| a.transfer.blob)
             .chain(file_blobs)
-            .flat_map(|h| *h.as_bytes())
             .collect();
-        let list = (!others.is_empty()).then_some(others);
+        let list = (!others.is_empty()).then(|| write_list(&others));
         Ok(BackupUpload {
             backup: Backup {
                 generation: self.generation,
@@ -472,17 +471,33 @@ pub struct BackupUpload {
     pub backup: Backup,
     /// The archives' blobs, the first one first.
     pub archives: Vec<Vec<u8>>,
-    /// The list blob: the 48-byte hashes of every other blob, the archives
-    /// after the first then the files, if there are any. Its hash is
-    /// `backup.files`.
+    /// The list blob: the version byte `0x01`, then the 48-byte hashes of
+    /// every other blob, the archives after the first then the files, if
+    /// there are any. Its hash is `backup.files`.
     pub list: Option<Vec<u8>>,
 }
 
-/// Reads the list blob of BACKUP PUT's `files` (12.13): 48-byte hashes,
-/// one after another. `None` if its length is not a multiple of 48, which
-/// a server answers with `ERR invalid`.
+/// The `version` byte that starts the list blob of BACKUP PUT's `files`
+/// (12.13).
+pub const LIST_VERSION: u8 = 1;
+
+/// Writes the list blob of BACKUP PUT's `files` (12.13): the version byte
+/// [`LIST_VERSION`], then the 48-byte hashes one after another.
+pub fn write_list(blobs: &[BlobRef]) -> Vec<u8> {
+    std::iter::once(LIST_VERSION)
+        .chain(blobs.iter().flat_map(|h| *h.as_bytes()))
+        .collect()
+}
+
+/// Reads the list blob of BACKUP PUT's `files` (12.13): the version byte
+/// [`LIST_VERSION`], then 48-byte hashes, one after another. `None` if the
+/// first byte is not `0x01`, or if the length is not 1 plus a multiple of
+/// 48, which a server answers with `ERR invalid`.
 pub fn read_list(list: &[u8]) -> Option<Vec<BlobRef>> {
-    let (hashes, rest) = list.as_chunks::<HASH_LEN>();
+    let (&LIST_VERSION, hashes) = list.split_first()? else {
+        return None;
+    };
+    let (hashes, rest) = hashes.as_chunks::<HASH_LEN>();
     rest.is_empty()
         .then(|| hashes.iter().map(|h| BlobRef::from_bytes(*h)).collect())
 }
@@ -907,11 +922,23 @@ mod tests {
             assert_eq!(entry.decrypt(blob).unwrap().len(), 300);
         }
 
-        // Lists of other lengths are not lists.
-        assert_eq!(read_list(&[]), Some(vec![]));
-        assert_eq!(read_list(&[0; 47]), None);
-        assert_eq!(read_list(&[0; 97]), None);
-        assert_eq!(read_list(&[0; 96]).map(|l| l.len()), Some(2));
+        // A list starts with its version byte, then whole hashes (12.13).
+        assert_eq!(list[0], LIST_VERSION);
+        assert_eq!(list.len(), 1 + 48 * named.len());
+        let list_of = |n: usize| {
+            let mut l = vec![1];
+            l.resize(n, 0);
+            l
+        };
+        assert_eq!(read_list(&[1]), Some(vec![]));
+        assert_eq!(read_list(&[]), None);
+        assert_eq!(read_list(&list_of(48)), None);
+        assert_eq!(read_list(&list_of(98)), None);
+        assert_eq!(read_list(&list_of(97)).map(|l| l.len()), Some(2));
+        let mut v2 = list_of(97);
+        v2[0] = 2;
+        assert_eq!(read_list(&v2), None);
+        assert_eq!(read_list(&[0; 96]), None);
     }
 
     /// Fixed-input vectors for Appendix B.
