@@ -139,7 +139,6 @@ S: SET #general public yes
 S: SET #general guests write
 S: SET #general retention server
 S: SET #general e2ee no
-S: SET #general send all
 S: OK id=k3f9q2 head=8812
 C: history #general before=8812 limit=2
 S: @seq=8810;t=2026-11-06T15:30:11.004Z;from=alice@example.org MSG #general anyone around?
