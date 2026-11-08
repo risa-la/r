@@ -75,9 +75,13 @@ pub trait ReportStore {
     /// Returns whether it was open.
     fn resolve_report(&self, id: &Id) -> Result<bool>;
 
-    /// Deletes the room `key` with everything in it (10.4): its events,
-    /// settings, memberships, roles, invitations, bans, read markers and
-    /// cids. Reports stay. Its id is never used again.
+    /// Drops the room `key` (10.4), in one transaction: from then on the
+    /// store treats `key` as gone, as if the room had been deleted, and
+    /// its name is free. Its settings, memberships, roles, invitations,
+    /// bans, read markers and cids are deleted. Reports stay. Its id is
+    /// never used again. Its events are left for
+    /// [`clear_dropped`](Self::clear_dropped), so that no one transaction
+    /// deletes a large room's events; nothing can read them meanwhile.
     ///
     /// With `recreate`, a room of the same name is created again in the
     /// same transaction, empty and with a new id, as [`ensure_room`] does,
@@ -87,11 +91,16 @@ pub trait ReportStore {
     fn drop_room(&self, key: ConvKey, recreate: bool, now: Timestamp)
     -> Result<Option<RoomRecord>>;
 
-    /// Deletes up to `max` of the oldest events of the room `key`, always
-    /// leaving its newest `max`, and returns how many it deleted. ADMIN
-    /// DROP calls it until it deletes fewer than `max`, before
-    /// [`drop_room`](Self::drop_room), so that no one transaction deletes
-    /// a large room's events. Seen from outside, the deleted events have
-    /// expired (7.5). Seqs are not reused: the head stays.
-    fn trim_room(&self, key: ConvKey, max: usize) -> Result<u64>;
+    /// Deletes up to `max` of the oldest events of the room `key`, which
+    /// [`drop_room`](Self::drop_room) dropped, and returns how many it
+    /// deleted. If that is fewer than `max`, none are left, and what
+    /// remains of the room goes too, in the same transaction. Called until
+    /// it deletes fewer than `max`. Does nothing to a room that was not
+    /// dropped.
+    fn clear_dropped(&self, key: ConvKey, max: usize) -> Result<u64>;
+
+    /// The rooms that were dropped, but whose events
+    /// [`clear_dropped`](Self::clear_dropped) has not finished deleting:
+    /// a drop that failed, or that the server stopped in.
+    fn dropped_rooms(&self) -> Result<Vec<ConvKey>>;
 }

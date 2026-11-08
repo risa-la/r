@@ -2084,6 +2084,9 @@ pub(super) struct Flaky {
     pub(super) inner: SqliteStore,
     pub(super) broken: AtomicBool,
     pub(super) pause: Pause,
+    /// Holds a call after it has done its work rather than before, for
+    /// the few methods that use it, while `pause` may hold another.
+    pub(super) after: Pause,
 }
 
 impl Flaky {
@@ -2092,6 +2095,7 @@ impl Flaky {
             inner: SqliteStore::open_in_memory().unwrap(),
             broken: AtomicBool::new(false),
             pause: Pause::default(),
+            after: Pause::default(),
         }
     }
 }
@@ -2262,9 +2266,17 @@ impl crate::store::ReportStore for Flaky {
         }
         self.inner.drop_room(c, recreate, t)
     }
-    fn trim_room(&self, c: ConvKey, m: usize) -> crate::store::Result<u64> {
-        self.pause.at("trim_room");
-        self.inner.trim_room(c, m)
+    fn clear_dropped(&self, c: ConvKey, m: usize) -> crate::store::Result<u64> {
+        self.pause.at("clear_dropped");
+        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Corrupt("broken on purpose".into()));
+        }
+        let n = self.inner.clear_dropped(c, m);
+        self.after.at("clear_dropped");
+        n
+    }
+    fn dropped_rooms(&self) -> crate::store::Result<Vec<ConvKey>> {
+        self.inner.dropped_rooms()
     }
 }
 

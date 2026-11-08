@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -381,6 +381,43 @@ CREATE INDEX read_markers_uid ON read_markers (uid);
 -- the rooms it holds a role or invitation in reads invitations too.
 CREATE INDEX invites_uid ON invites (uid);
 CREATE INDEX cids_author ON cids (author);
+"#;
+
+/// Version 7: a room being dropped (10.4) is marked, so that it is gone
+/// for everyone at once, while its events are deleted a batch at a time.
+pub(super) const V7: &str = r#"
+-- ADMIN DROP marks the room `dropping`, frees its name (`room` is NULL)
+-- and deletes its settings, memberships, roles, invitations, bans, read
+-- markers and cids, in one transaction. From then on the room is gone:
+-- nothing reads or writes a conversation that is dropping. Its events
+-- and uploads are deleted afterwards, a batch per transaction, and the
+-- row last. A drop cut off before that is finished when the server
+-- starts. Only rooms are dropped.
+CREATE TABLE conversations_v7 (
+    conv     INTEGER PRIMARY KEY AUTOINCREMENT,
+    id       TEXT NOT NULL UNIQUE REFERENCES used_ids (id),
+    kind     TEXT NOT NULL CHECK (kind IN ('room', 'direct')),
+    room     TEXT UNIQUE,
+    uid_a    TEXT,
+    uid_b    TEXT,
+    head     INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0),
+    created  INTEGER NOT NULL,
+    dropping INTEGER NOT NULL DEFAULT 0 CHECK (dropping IN (0, 1)),
+    CHECK (dropping = 0 OR (kind = 'room' AND room IS NULL)),
+    CHECK (dropping = 1 OR (kind = 'room') = (room IS NOT NULL)),
+    CHECK ((kind = 'direct') = (uid_a IS NOT NULL AND uid_b IS NOT NULL)),
+    CHECK (uid_a IS NULL OR uid_a <= uid_b),
+    UNIQUE (uid_a, uid_b)
+);
+INSERT INTO conversations_v7 (conv, id, kind, room, uid_a, uid_b, head, created)
+    SELECT conv, id, kind, room, uid_a, uid_b, head, created FROM conversations;
+-- Keys are never reused (version 4), even if the newest conversation was
+-- dropped: the new table goes on from where the old one was.
+DELETE FROM sqlite_sequence WHERE name = 'conversations_v7';
+INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'conversations_v7', seq FROM sqlite_sequence WHERE name = 'conversations';
+DROP TABLE conversations;
+ALTER TABLE conversations_v7 RENAME TO conversations;
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.

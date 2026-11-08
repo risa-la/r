@@ -10,7 +10,7 @@ use crate::core::tests::{
     Client, Flaky, Harness, T, config, put, set, start, strings, timers, value,
 };
 use crate::handler::Handler as _;
-use crate::store::{EventKind, SqliteStore, Store};
+use crate::store::{EventKind, ReportStore as _, SqliteStore, Store};
 
 const ALICE: &str = "alice@example.org";
 const BOB: &str = "bob@example.net";
@@ -839,83 +839,169 @@ async fn history_and_related_racing_a_drop_get_not_found() {
     }
 }
 
-/// A large room's events go a batch at a time before the room itself.
-/// Commands waiting for the room meanwhile find it dropped. A drop that
-/// fails after some batches leaves the room with its newest events.
+/// A store as `prepare` makes it, with `#temp` holding more than two
+/// batches of events, and the configuration for it, with an operator.
+/// Returns `#temp`'s key and head.
+fn large_temp(flaky: &Flaky) -> (crate::config::Config, crate::store::ConvKey, Seq) {
+    use crate::core::messages::BATCH;
+    let mut c = config();
+    c.rooms = strings(&["#general", "#private"]);
+    c.operators = strings(&[OP]);
+    for room in &c.rooms {
+        flaky
+            .inner
+            .ensure_room(&room.parse().unwrap(), start())
+            .unwrap();
+    }
+    prepare(&flaky.inner);
+    let temp: Room = "#temp".parse().unwrap();
+    let key = flaky.inner.room(&temp).unwrap().unwrap().key;
+    for n in 0..2 * BATCH + 10 {
+        flaky
+            .inner
+            .append(
+                key,
+                &crate::store::NewEvent {
+                    t: start(),
+                    from: uid(BOB),
+                    kind: msg(None, &format!("filler {n}")),
+                    cid: None,
+                },
+            )
+            .unwrap();
+    }
+    let head = flaky.inner.room(&temp).unwrap().unwrap().head.unwrap();
+    (c, key, head)
+}
+
+/// A large room's events go a batch at a time, after the room itself is
+/// gone, and then nothing of it is left.
 #[tokio::test]
 async fn a_large_room_is_dropped_a_batch_at_a_time() {
-    use crate::core::messages::BATCH;
-    for fails in [false, true] {
+    let flaky = Arc::new(Flaky::new());
+    let (c, key, head) = large_temp(&flaky);
+    let mut h = Harness::on(c, flaky.clone(), timers());
+    let mut bob = h.signed_in_as(BOB);
+    let mut op = h.signed_in_as(OP);
+
+    // Held after the first batch: the room is gone already.
+    flaky.after.arm("clear_dropped");
+    let (hub, id) = (h.hub.clone(), op.id);
+    let dropping =
+        tokio::spawn(async move { hub.command(id, "admin drop #temp".parse().unwrap()).await });
+    flaky.after.reached().await;
+    assert!(flaky.inner.event(key, seq(1)).unwrap().is_none());
+    assert!(flaky.inner.event(key, head).unwrap().is_some());
+    assert_eq!(flaky.inner.dropped_rooms().unwrap(), [key]);
+    let lines = bob.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with(" DROP #temp"));
+    h.send(&bob, "@ref=m msg #temp hi").await;
+    assert_eq!(bob.lines(), ["@ref=m ERR not-found no such room"]);
+    flaky.after.release();
+    dropping.await.unwrap();
+
+    assert_eq!(op.lines(), ["OK"]);
+    assert!(flaky.inner.event(key, head).unwrap().is_none());
+    assert_eq!(flaky.inner.dropped_rooms().unwrap(), []);
+    assert_eq!(flaky.inner.room(&"#temp".parse().unwrap()).unwrap(), None);
+}
+
+/// HISTORY and RELATED that checked the room before a drop, and query the
+/// store while its events are being deleted, find the room gone, never
+/// with only its newest events.
+#[tokio::test]
+async fn history_and_related_racing_a_batched_drop_never_see_part_of_the_room() {
+    for (method, line) in [
+        ("history", "@ref=q history #temp after=0"),
+        ("related", "@ref=q related #temp 1 2000"),
+    ] {
         let flaky = Arc::new(Flaky::new());
-        let mut c = config();
-        c.rooms = strings(&["#general", "#private"]);
-        c.operators = strings(&[OP]);
-        for room in &c.rooms {
-            flaky
-                .inner
-                .ensure_room(&room.parse().unwrap(), start())
-                .unwrap();
-        }
-        prepare(&flaky.inner);
-        let temp: Room = "#temp".parse().unwrap();
-        let key = flaky.inner.room(&temp).unwrap().unwrap().key;
-        for n in 0..2 * BATCH + 10 {
-            flaky
-                .inner
-                .append(
-                    key,
-                    &crate::store::NewEvent {
-                        t: start(),
-                        from: uid(BOB),
-                        kind: msg(None, &format!("filler {n}")),
-                        cid: None,
-                    },
-                )
-                .unwrap();
-        }
-        let head = flaky.inner.room(&temp).unwrap().unwrap().head.unwrap();
+        let (c, key, head) = large_temp(&flaky);
         let mut h = Harness::on(c, flaky.clone(), timers());
         let mut bob = h.signed_in_as(BOB);
         let mut op = h.signed_in_as(OP);
-        flaky
-            .broken
-            .store(fails, std::sync::atomic::Ordering::SeqCst);
 
-        flaky.pause.arm("trim_room");
-        let (hub, id) = (h.hub.clone(), op.id);
-        let drop =
-            tokio::spawn(async move { hub.command(id, "admin drop #temp".parse().unwrap()).await });
+        // The query is past the room's lock, and about to read the store.
+        flaky.pause.arm(method);
+        let (hub, id, req) = (h.hub.clone(), bob.id, line.parse().unwrap());
+        let query = tokio::spawn(async move { hub.command(id, req).await });
         flaky.pause.reached().await;
-        let (hub, id) = (h.hub.clone(), bob.id);
-        let msg = tokio::spawn(async move {
-            hub.command(id, "@ref=m msg #temp hi".parse().unwrap())
-                .await
-        });
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        // The drop is under way: some of the events are gone.
+        flaky.after.arm("clear_dropped");
+        let (hub, id) = (h.hub.clone(), op.id);
+        let dropping =
+            tokio::spawn(async move { hub.command(id, "admin drop #temp".parse().unwrap()).await });
+        flaky.after.reached().await;
+        assert!(
+            flaky.inner.event(key, seq(1)).unwrap().is_none(),
+            "{method}"
+        );
+        assert!(flaky.inner.event(key, head).unwrap().is_some(), "{method}");
         flaky.pause.release();
-        drop.await.unwrap();
-        msg.await.unwrap();
-        let first = flaky.inner.event(key, seq(1)).unwrap();
-        let last = flaky.inner.event(key, head).unwrap();
-        assert!(first.is_none(), "fails={fails}");
-        if fails {
-            assert_eq!(op.lines(), ["ERR internal internal error"]);
-            // The broken store fails bob's MSG too, but no DROP came.
-            assert_eq!(bob.lines(), ["@ref=m ERR internal internal error"]);
-            assert!(last.is_some());
-            assert!(flaky.inner.room(&temp).unwrap().is_some());
-        } else {
-            assert_eq!(op.lines(), ["OK"]);
-            let lines = bob.lines();
-            assert_eq!(lines.len(), 2, "{lines:?}");
-            assert!(lines[0].ends_with(" DROP #temp"));
-            assert_eq!(lines[1], "@ref=m ERR not-found no such room");
-            assert!(last.is_none());
-            assert_eq!(flaky.inner.room(&temp).unwrap(), None);
-        }
+        query.await.unwrap();
+        flaky.after.release();
+        dropping.await.unwrap();
+
+        assert_eq!(op.lines(), ["OK"], "{method}");
+        let lines = bob.lines();
+        assert_eq!(lines.len(), 2, "{method}: {lines:?}");
+        assert!(lines[0].ends_with(" DROP #temp"), "{method}: {lines:?}");
+        assert_eq!(lines[1], "@ref=q ERR not-found no such room", "{method}");
     }
+}
+
+/// A drop whose deleting of events fails partway has still dropped the
+/// room: the members are told, and the operator gets `OK`. The rest is
+/// deleted when the server starts again.
+#[tokio::test]
+async fn a_drop_cut_off_partway_is_finished_at_startup() {
+    let flaky = Arc::new(Flaky::new());
+    let (c, key, head) = large_temp(&flaky);
+    let mut h = Harness::on(c.clone(), flaky.clone(), timers());
+    let mut bob = h.signed_in_as(BOB);
+    let mut op = h.signed_in_as(OP);
+
+    // The store breaks after the first batch.
+    flaky.after.arm("clear_dropped");
+    let (hub, id) = (h.hub.clone(), op.id);
+    let dropping =
+        tokio::spawn(async move { hub.command(id, "admin drop #temp".parse().unwrap()).await });
+    flaky.after.reached().await;
+    flaky
+        .broken
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    flaky.after.release();
+    dropping.await.unwrap();
+    flaky
+        .broken
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(op.lines(), ["OK"]);
+    let lines = bob.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with(" DROP #temp"));
+    assert!(flaky.inner.event(key, seq(1)).unwrap().is_none());
+    assert!(flaky.inner.event(key, head).unwrap().is_some());
+    assert_eq!(flaky.inner.dropped_rooms().unwrap(), [key]);
+    // Gone for everyone meanwhile.
+    for cmd in ["history #temp", "admin rooms after=#private"] {
+        h.send(&op, cmd).await;
+    }
+    assert_eq!(op.lines(), ["ERR not-found no such room", "OK more=0"]);
+    h.send(&bob, "sync").await;
+    let lines = bob.lines();
+    assert!(lines.iter().all(|l| !l.contains("#temp")), "{lines:?}");
+
+    // The server starts again on the same store.
+    drop(h);
+    let mut h = Harness::on(c, flaky.clone(), timers());
+    assert!(flaky.inner.event(key, head).unwrap().is_none());
+    assert_eq!(flaky.inner.dropped_rooms().unwrap(), []);
+    assert_eq!(flaky.inner.room(&"#temp".parse().unwrap()).unwrap(), None);
+    let mut op = h.signed_in_as(OP);
+    h.send(&op, "admin rooms after=#private").await;
+    assert_eq!(op.lines(), ["OK more=0"]);
 }
 
 #[tokio::test]

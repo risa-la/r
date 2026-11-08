@@ -304,6 +304,7 @@ impl Hub {
     ///
     /// - The server settings (10.6) come from the store. Settings it does
     ///   not have yet come from `config.server`.
+    /// - A room drop (10.4) that was cut off is finished first.
     /// - The rooms in `config.rooms` are created if missing, with no owner
     ///   and no events.
     ///
@@ -379,6 +380,7 @@ impl Hub {
             settings.welcome.clear();
         }
 
+        finish_drops(&*store)?;
         let now = clock.now();
         for name in &config.rooms {
             let room: Room = name
@@ -609,6 +611,25 @@ fn create_state_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(dir)
+}
+
+/// Finishes the drops (10.4) that a crash, or a failing store, cut off
+/// after the room was dropped but before all its events were deleted.
+/// Those rooms are gone already, and their members were told, or, if the
+/// server stopped, find them missing from SYNC (7.1); only their events
+/// are left, which nothing reads.
+fn finish_drops(store: &dyn Store) -> Result<(), StoreError> {
+    let keys = store.dropped_rooms()?;
+    if !keys.is_empty() {
+        tracing::info!(
+            rooms = keys.len(),
+            "deleting the events of rooms whose drop was cut off"
+        );
+    }
+    for key in keys {
+        while store.clear_dropped(key, messages::BATCH)? == messages::BATCH as u64 {}
+    }
+    Ok(())
 }
 
 /// Records a PART, with no reason, for every guest still in a room when

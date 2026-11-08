@@ -625,7 +625,10 @@ fn append_in(tx: &Transaction<'_>, conv: ConvKey, event: &NewEvent) -> Result<Ap
         return Ok(Appended::Duplicate(earlier));
     }
     let next: i64 = tx
-        .prepare_cached("UPDATE conversations SET head = head + 1 WHERE conv = ? RETURNING head")?
+        .prepare_cached(
+            "UPDATE conversations SET head = head + 1 WHERE conv = ? AND dropping = 0 \
+             RETURNING head",
+        )?
         .query_row([conv], |row| row.get(0))
         .optional()?
         .ok_or(StoreError::NoConversation)?;
@@ -668,9 +671,10 @@ fn append_in(tx: &Transaction<'_>, conv: ConvKey, event: &NewEvent) -> Result<Ap
     Ok(Appended::New(seq(next)?))
 }
 
-/// [`StoreError::NoConversation`] unless the conversation `conv` exists.
+/// [`StoreError::NoConversation`] unless the conversation `conv` exists,
+/// and is not being dropped (10.4).
 pub(super) fn conv_exists(conn: &Connection, conv: ConvKey) -> Result<()> {
-    conn.prepare_cached("SELECT 1 FROM conversations WHERE conv = ?")?
+    conn.prepare_cached("SELECT 1 FROM conversations WHERE conv = ? AND dropping = 0")?
         .query_row([conv.0], |_| Ok(()))
         .optional()?
         .ok_or(StoreError::NoConversation)
@@ -823,7 +827,9 @@ impl Store for SqliteStore {
     fn rooms(&self) -> Result<Vec<RoomRecord>> {
         let conn = self.conn();
         let rows = conn
-            .prepare_cached(&format!("SELECT {ROOM_COLUMNS} ORDER BY c.room"))?
+            .prepare_cached(&format!(
+                "SELECT {ROOM_COLUMNS} WHERE c.dropping = 0 ORDER BY c.room"
+            ))?
             .query_map([], room_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.into_iter().map(|r| r.finish(&conn)).collect()
@@ -1129,7 +1135,7 @@ impl Store for SqliteStore {
     fn set_read_marker(&self, conv: ConvKey, uid: &Uid, s: Seq) -> Result<Option<ReadMarker>> {
         self.write(|tx| {
             let head: i64 = tx
-                .prepare_cached("SELECT head FROM conversations WHERE conv = ?")?
+                .prepare_cached("SELECT head FROM conversations WHERE conv = ? AND dropping = 0")?
                 .query_row([conv.0], |row| row.get(0))
                 .optional()?
                 .ok_or(StoreError::NoConversation)?;

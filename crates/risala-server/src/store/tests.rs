@@ -250,11 +250,12 @@ CREATE TABLE conversations_new (
     uid_b   TEXT,
     head    INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0),
     created INTEGER NOT NULL,
+    dropping INTEGER NOT NULL DEFAULT 0,
     note    TEXT NOT NULL DEFAULT '',
     UNIQUE (uid_a, uid_b)
 );
-INSERT INTO conversations_new (conv, id, kind, room, uid_a, uid_b, head, created)
-    SELECT conv, id, kind, room, uid_a, uid_b, head, created FROM conversations;
+INSERT INTO conversations_new (conv, id, kind, room, uid_a, uid_b, head, created, dropping)
+    SELECT conv, id, kind, room, uid_a, uid_b, head, created, dropping FROM conversations;
 DROP TABLE conversations;
 ALTER TABLE conversations_new RENAME TO conversations;
 "#;

@@ -209,15 +209,31 @@ impl ReportStore for SqliteStore {
         self.write(|tx| {
             let room: Option<String> = tx
                 .query_row(
-                    "SELECT room FROM conversations WHERE conv = ? AND kind = 'room'",
+                    "SELECT room FROM conversations WHERE conv = ? AND kind = 'room' \
+                     AND dropping = 0",
                     [key.0],
                     |row| row.get(0),
                 )
                 .optional()?;
             let room = room.ok_or(StoreError::NoConversation)?;
-            // Everything in the room goes with it (ON DELETE CASCADE); the
-            // id stays in used_ids, and reports name it, not the key.
-            tx.execute("DELETE FROM conversations WHERE conv = ?", [key.0])?;
+            // What a room has a row of per member, or per setting. Its
+            // events, and their cids and uploads, go in `clear_dropped`.
+            for table in [
+                "room_settings",
+                "members",
+                "guest_members",
+                "roles",
+                "invites",
+                "room_bans",
+                "read_markers",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE conv = ?"), [key.0])?;
+            }
+            // The id stays in used_ids, and reports name it, not the key.
+            tx.execute(
+                "UPDATE conversations SET dropping = 1, room = NULL WHERE conv = ?",
+                [key.0],
+            )?;
             if !recreate {
                 return Ok(None);
             }
@@ -235,34 +251,58 @@ impl ReportStore for SqliteStore {
         })
     }
 
-    fn trim_room(&self, key: ConvKey, max: usize) -> Result<u64> {
-        let Some(offset) = max.checked_sub(1) else {
+    fn clear_dropped(&self, key: ConvKey, max: usize) -> Result<u64> {
+        if max == 0 {
             return Ok(0);
-        };
-        let (max, offset) = (
-            i64::try_from(max).unwrap_or(i64::MAX),
-            i64::try_from(offset).unwrap_or(i64::MAX),
-        );
+        }
+        let max = i64::try_from(max).unwrap_or(i64::MAX);
         self.write(|tx| {
-            // The oldest of the newest `max` events stays, with all after it.
-            let keep: Option<i64> = tx
+            let dropping: Option<bool> = tx
                 .query_row(
-                    "SELECT seq FROM events WHERE conv = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
-                    params![key.0, offset],
+                    "SELECT dropping FROM conversations WHERE conv = ?",
+                    [key.0],
                     |row| row.get(0),
                 )
                 .optional()?;
-            let Some(keep) = keep else {
+            if dropping != Some(true) {
                 return Ok(0);
-            };
-            // Their text goes with them (ON DELETE CASCADE).
-            let n = tx.execute(
-                "DELETE FROM events WHERE conv = ?1 AND seq IN \
-                 (SELECT seq FROM events WHERE conv = ?1 AND seq < ?2 ORDER BY seq LIMIT ?3)",
-                params![key.0, keep, max],
+            }
+            // The newest of the oldest `max` events goes, with all before
+            // it, and their text (ON DELETE CASCADE), cids and uploads.
+            let upto: Option<i64> = tx.query_row(
+                "SELECT max(seq) FROM (SELECT seq FROM events WHERE conv = ? ORDER BY seq LIMIT ?)",
+                params![key.0, max],
+                |row| row.get(0),
             )?;
+            let mut n = 0;
+            if let Some(upto) = upto {
+                n = tx.execute(
+                    "DELETE FROM events WHERE conv = ? AND seq <= ?",
+                    params![key.0, upto],
+                )? as i64;
+                for table in ["cids", "uploads"] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE conv = ? AND seq <= ?"),
+                        params![key.0, upto],
+                    )?;
+                }
+            }
+            if n < max {
+                // That was the last: the row goes, with anything still
+                // naming it (ON DELETE CASCADE), such as uploads never
+                // attached to a message.
+                tx.execute("DELETE FROM conversations WHERE conv = ?", [key.0])?;
+            }
             Ok(n as u64)
         })
+    }
+
+    fn dropped_rooms(&self) -> Result<Vec<ConvKey>> {
+        self.conn()
+            .prepare_cached("SELECT conv FROM conversations WHERE dropping = 1 ORDER BY conv")?
+            .query_map([], |row| row.get(0).map(ConvKey))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
     }
 }
 

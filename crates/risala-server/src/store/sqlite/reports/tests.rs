@@ -1,5 +1,6 @@
-//! Tests of [`ReportStore`] on SQLite, and of migration 4, which lets
-//! reports outlive their room.
+//! Tests of [`ReportStore`] on SQLite, of migration 4, which lets
+//! reports outlive their room, and of migration 7, which marks a room
+//! being dropped.
 
 use risala_proto::names::Room;
 use risala_proto::types::Relation;
@@ -158,6 +159,8 @@ fn dropping_a_room_keeps_its_reports() {
         None
     );
     assert_eq!(store.room(&room("#general")).unwrap(), None);
+    assert_eq!(store.clear_dropped(record.key, 100).unwrap(), 3);
+    assert_eq!(store.clear_dropped(record.key, 100).unwrap(), 0);
     assert_eq!(store.event(record.key, Seq::new(1).unwrap()).unwrap(), None);
     let left = store.report(&id).unwrap().unwrap().report;
     assert_eq!(left.conv_id, record.id);
@@ -192,21 +195,29 @@ fn dropping_a_configured_room_creates_it_again() {
 }
 
 #[test]
-fn trimming_a_room_deletes_its_oldest_events_and_keeps_the_newest() {
+fn a_dropped_room_is_gone_before_its_events_are() {
+    use crate::store::{HistoryQuery, MessageStore, RelatedQuery};
     let (store, record) = store();
-    // Events 1 and 2, and five more.
-    for n in 0..5 {
+    let key = record.key;
+    // Events 1 and 2, a reaction to 1, and four more.
+    let mut more = vec![EventKind::Msg {
+        relation: Some(Relation::React(Seq::new(1).unwrap())),
+        file: None,
+        text: "+1".into(),
+    }];
+    more.extend((0..4).map(|n| EventKind::Msg {
+        relation: None,
+        file: None,
+        text: format!("more {n}"),
+    }));
+    for kind in more {
         store
             .append(
-                record.key,
+                key,
                 &NewEvent {
                     t: t("2026-11-06T15:50:00.000Z"),
                     from: uid("bob@example.net"),
-                    kind: EventKind::Msg {
-                        relation: None,
-                        file: None,
-                        text: format!("more {n}"),
-                    },
+                    kind,
                     cid: None,
                 },
             )
@@ -214,24 +225,115 @@ fn trimming_a_room_deletes_its_oldest_events_and_keeps_the_newest() {
     }
     let seqs = |store: &SqliteStore| -> Vec<u64> {
         (1..=7)
-            .filter(|&n| {
-                store
-                    .event(record.key, Seq::new(n).unwrap())
-                    .unwrap()
-                    .is_some()
-            })
+            .filter(|&n| store.event(key, Seq::new(n).unwrap()).unwrap().is_some())
             .collect()
     };
-    assert_eq!(store.trim_room(record.key, 0).unwrap(), 0);
-    assert_eq!(store.trim_room(record.key, 3).unwrap(), 3);
+    let gone = |r: Result<()>| matches!(r, Err(StoreError::NoConversation));
+    let history = HistoryQuery {
+        after: Some(0),
+        before: None,
+        limit: 100,
+    };
+    let related = RelatedQuery {
+        first: Seq::new(1).unwrap(),
+        last: Seq::new(7).unwrap(),
+        after: 0,
+        limit: 100,
+    };
+    let one = Seq::new(1).unwrap();
+    assert_eq!(store.history(key, history).unwrap().events.len(), 7);
+    assert_eq!(store.related(key, related).unwrap().events.len(), 1);
+    assert_eq!(store.clear_dropped(key, 3).unwrap(), 0);
+    assert_eq!(seqs(&store), [1, 2, 3, 4, 5, 6, 7]);
+
+    assert_eq!(
+        store
+            .drop_room(key, false, t("2026-11-06T16:00:00.000Z"))
+            .unwrap(),
+        None
+    );
+    // Gone for everyone, though its events are still there.
+    assert_eq!(seqs(&store), [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(store.dropped_rooms().unwrap(), [key]);
+    assert!(gone(store.history(key, history).map(|_| ())));
+    assert!(gone(store.related(key, related).map(|_| ())));
+    let join = NewEvent {
+        t: t("2026-11-06T16:00:00.000Z"),
+        from: uid("bob@example.net"),
+        kind: EventKind::Join,
+        cid: None,
+    };
+    assert!(gone(store.append(key, &join).map(|_| ())));
+    assert!(gone(
+        store
+            .set_read_marker(key, &uid("bob@example.net"), one)
+            .map(|_| ())
+    ));
+    assert!(gone(
+        store
+            .drop_room(key, false, t("2026-11-06T16:00:00.000Z"))
+            .map(|_| ())
+    ));
+    assert_eq!(store.room(&room("#general")).unwrap(), None);
+    assert_eq!(store.rooms().unwrap(), []);
+    assert_eq!(
+        store.authored_rooms(&uid("bob@example.net"), None).unwrap(),
+        []
+    );
+
+    // A batch at a time, oldest first, and then the room.
+    assert_eq!(store.clear_dropped(key, 0).unwrap(), 0);
+    assert_eq!(store.clear_dropped(key, 3).unwrap(), 3);
     assert_eq!(seqs(&store), [4, 5, 6, 7]);
-    assert_eq!(store.trim_room(record.key, 3).unwrap(), 1);
-    assert_eq!(seqs(&store), [5, 6, 7]);
-    assert_eq!(store.trim_room(record.key, 3).unwrap(), 0);
-    assert_eq!(store.trim_room(record.key, 10).unwrap(), 0);
-    // The head stays.
-    let head = store.room(&room("#general")).unwrap().unwrap().head;
-    assert_eq!(head, Some(Seq::new(7).unwrap()));
+    assert!(gone(store.history(key, history).map(|_| ())));
+    assert_eq!(store.clear_dropped(key, 3).unwrap(), 3);
+    assert_eq!(seqs(&store), [7]);
+    assert_eq!(store.dropped_rooms().unwrap(), [key]);
+    assert_eq!(store.clear_dropped(key, 3).unwrap(), 1);
+    assert_eq!(seqs(&store), Vec::<u64>::new());
+    assert_eq!(store.dropped_rooms().unwrap(), []);
+    assert!(gone(store.history(key, history).map(|_| ())));
+    assert_eq!(store.clear_dropped(key, 3).unwrap(), 0);
+}
+
+/// Migration 7 keeps the conversations, and a dropped room's key is still
+/// not given to the next conversation.
+#[test]
+fn migration_7_keeps_conversation_keys() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let v7 = schema::MIGRATIONS
+        .iter()
+        .position(|m| *m == schema::V7)
+        .unwrap();
+    schema::migrate_with(&mut conn, &schema::MIGRATIONS[..v7]).unwrap();
+    conn.execute_batch(
+        "INSERT INTO used_ids VALUES ('c1', 'conversation', 0), ('c2', 'conversation', 0);
+         INSERT INTO conversations (id, kind, room, head, created)
+             VALUES ('c1', 'room', '#general', 4, 0);
+         INSERT INTO conversations (id, kind, room, created) VALUES ('c2', 'room', '#gone', 0);
+         DELETE FROM conversations WHERE id = 'c2';",
+    )
+    .unwrap();
+    schema::migrate_with(&mut conn, schema::MIGRATIONS).unwrap();
+    let kept: (i64, String, i64, bool) = conn
+        .query_row(
+            "SELECT conv, room, head, dropping FROM conversations WHERE id = 'c1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(kept, (1, "#general".to_owned(), 4, false));
+    conn.execute_batch(
+        "INSERT INTO used_ids VALUES ('c3', 'conversation', 0);
+         INSERT INTO conversations (id, kind, room, created) VALUES ('c3', 'room', '#new', 0);",
+    )
+    .unwrap();
+    let key: i64 = conn
+        .query_row("SELECT conv FROM conversations WHERE id = 'c3'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(key, 3);
 }
 
 #[test]

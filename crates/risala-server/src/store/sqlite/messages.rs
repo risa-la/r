@@ -111,7 +111,7 @@ impl MessageStore for SqliteStore {
     ) -> Result<Vec<(ConvKey, Room)>> {
         self.conn()
             .prepare_cached(
-                "SELECT c.conv, c.room FROM conversations c WHERE c.kind = 'room' \
+                "SELECT c.conv, c.room FROM conversations c WHERE c.kind = 'room' AND c.dropping = 0 \
                  AND EXISTS (SELECT 1 FROM events e WHERE e.conv = c.conv \
                  AND e.author = ? AND e.t >= ? AND e.verb = 'MSG' AND e.deleted = 0) \
                  ORDER BY c.room",

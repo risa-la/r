@@ -41,7 +41,7 @@ use super::messages::BATCH;
 use super::rate::{WindowLimit, network};
 use super::state::{ConvEntry, ConvState, RoomInfo};
 use crate::handler::OutLine;
-use crate::store::{EventKind, NewReport, ReportAdded, ReportRecord, StoreError};
+use crate::store::{ConvKey, EventKind, NewReport, ReportAdded, ReportRecord, StoreError};
 
 /// The window of `limits.reports_per_hour` (5.8).
 pub(super) const REPORT_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -521,20 +521,19 @@ impl Inner {
     /// are removed, as if kicked. A room from the configuration is created
     /// again at once, empty and with a new id (PLAN.md section 6).
     ///
-    /// A large room's events go first, oldest first, a batch at a time, so
-    /// that other rooms get the store in between. The room's lock is held
-    /// throughout, so commands that need it find the room whole or gone.
-    /// A HISTORY or RELATED already past the lock may find the oldest
-    /// events gone, as if they had expired (7.5). If this fails, or the
-    /// server stops, in between, the room stays in that state and no DROP
-    /// was sent: the operator drops it again.
+    /// The room is gone for everyone at once: one store transaction drops
+    /// it, and from then on a HISTORY or RELATED already past the lock
+    /// finds it gone (`not-found`) too, never part of it. Its events are
+    /// deleted afterwards, holding no lock, a batch at a time, so that
+    /// other rooms get the store in between. If that fails, or the server
+    /// stops first, the rest goes when the server starts again
+    /// ([`finish_drops`](super::finish_drops)); the drop itself has
+    /// happened, so the operator still gets `OK`.
     async fn drop_room(&self, room: &Room, reason: String) -> Outcome {
         let mut st = self.lock_room(room).await?;
-        let key = st.key;
-        while self.db(move |s| s.trim_room(key, BATCH)).await? == BATCH as u64 {}
         let creating = self.create_lock.lock().await;
         let recreate = self.configured(room);
-        let now = self.now();
+        let (key, now) = (st.key, self.now());
         let new = self.db(move |s| s.drop_room(key, recreate, now)).await?;
 
         st.dropped = true;
@@ -574,13 +573,27 @@ impl Inner {
         }
         drop(creating);
         drop(st);
-        let mut reg = self.reg();
-        for uid in &members {
-            reg.release(uid);
+        {
+            let mut reg = self.reg();
+            for uid in &members {
+                reg.release(uid);
+            }
         }
-        drop(reg);
         tracing::info!(%room, recreated = recreate, "room dropped");
+        if let Err(e) = self.clear_dropped(key).await {
+            tracing::error!(
+                %room,
+                "deleting a dropped room's events failed, so they go when the server starts: {e}"
+            );
+        }
         Ok(Some(OkResponse::new()))
+    }
+
+    /// Deletes the events of the room `key`, which was dropped, a batch at
+    /// a time, and then what remains of it.
+    async fn clear_dropped(&self, key: ConvKey) -> Result<(), StoreError> {
+        while self.db(move |s| s.clear_dropped(key, BATCH)).await? == BATCH as u64 {}
+        Ok(())
     }
 }
 
