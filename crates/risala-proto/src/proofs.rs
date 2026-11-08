@@ -19,7 +19,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::frame::{check_line_len, is_forbidden_control};
 use crate::names::{IpPrefix, ServerBanTarget};
-use crate::types::{RoomRetention, ServerRetention};
+use crate::types::Retention;
 
 /// A few non-ASCII characters: 2-, 3- and 4-byte UTF-8, a C1 control
 /// (U+0085) and the first character after the C1 range (U+00A0).
@@ -180,28 +180,16 @@ fn ip_prefix_v6_mapped_addresses_match_ipv4() {
     assert_eq!(p.contains(IpAddr::V4(v4)), p.contains(mapped));
 }
 
-/// The effective retention (7.5) is the shorter of the room's and the
-/// server's, and `None` (forever) only when neither sets one.
+/// A retention period is at least 7 days (7.5, 10.6), and keeps the
+/// number it was made from.
 #[kani::proof]
-fn room_retention_effective() {
-    let room = if kani::any() {
-        RoomRetention::Server
-    } else {
-        RoomRetention::Days(kani::any())
-    };
-    let server = if kani::any() {
-        ServerRetention::Forever
-    } else {
-        ServerRetention::Days(kani::any())
-    };
-    let got = room.effective(server);
-    match (room, server) {
-        (RoomRetention::Server, ServerRetention::Forever) => assert_eq!(got, None),
-        (RoomRetention::Server, ServerRetention::Days(s)) => assert_eq!(got, Some(s)),
-        (RoomRetention::Days(r), ServerRetention::Forever) => assert_eq!(got, Some(r)),
-        (RoomRetention::Days(r), ServerRetention::Days(s)) => {
-            let g = got.unwrap();
-            assert!(g <= r && g <= s && (g == r || g == s));
+fn retention_is_at_least_seven_days() {
+    let days: u32 = kani::any();
+    match Retention::new(days) {
+        Some(r) => {
+            assert!(days >= 7);
+            assert_eq!(r.days(), days);
         }
+        None => assert!(days < 7),
     }
 }

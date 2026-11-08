@@ -44,7 +44,7 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-/// Whether escaped MSG text counts as empty (5.3): once unescaped, it has
+/// Whether the escaped text of a TEXT line counts as empty (5.3): once unescaped, it has
 /// nothing but spaces, TABs and line breaks.
 pub fn is_blank(escaped: &str) -> bool {
     unescape(escaped)

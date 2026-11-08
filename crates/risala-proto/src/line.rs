@@ -3,18 +3,20 @@
 //! This layer works on raw strings. It knows the grammar of 3.1, the tag
 //! rules of 3.2 and how 3.3 splits parameters into tokens, options and
 //! text, but not what any verb means. The typed layers in
-//! [`command`](crate::command) and [`server`](crate::server) build on it.
+//! [`command`](crate::command) and [`server`](crate::server) build on it,
+//! and so do the lines inside encrypted messages (12.9), which have the
+//! same format.
 //!
 //! Parsing:
 //!
 //! ```
 //! use risala_proto::line::Line;
 //!
-//! let line = Line::parse("@ref=7 history #general after=8811 limit=2")?;
-//! assert!(line.verb_is("HISTORY"));
+//! let line = Line::parse("@ref=7 fetch ujzdegxdncf32epf3dhodzdoci after=9120 limit=2")?;
+//! assert!(line.verb_is("FETCH"));
 //! assert_eq!(line.tags().get("ref"), Some("7"));
 //! let mut params = line.params();
-//! assert_eq!(params.token()?, "#general");
+//! assert_eq!(params.token()?, "ujzdegxdncf32epf3dhodzdoci");
 //! let options = params.options()?;
 //! assert_eq!(options.get("limit"), Some("2"));
 //! # Ok::<(), risala_proto::error::ParseError>(())
@@ -25,12 +27,13 @@
 //! ```
 //! use risala_proto::line::Line;
 //!
-//! let line = Line::builder("MSG")
-//!     .tag("reply", 8810)
+//! let line = Line::builder("ADMIN")
+//!     .tag("ref", 3)
+//!     .token("DROP")
 //!     .token("#general")
-//!     .text("hi there")
+//!     .text("spam, mostly")
 //!     .build()?;
-//! assert_eq!(line.to_string(), "@reply=8810 MSG #general hi there");
+//! assert_eq!(line.to_string(), "@ref=3 ADMIN DROP #general spam, mostly");
 //! # Ok::<(), risala_proto::error::ParseError>(())
 //! ```
 //!
@@ -427,10 +430,11 @@ impl FromStr for Line {
 /// ```
 /// use risala_proto::line::Line;
 ///
-/// let line = Line::parse("MSG #general  hi there")?;
+/// let line = Line::parse("ADMIN BAN ~sam  flooding")?;
 /// let mut params = line.params();
-/// assert_eq!(params.token()?, "#general");
-/// assert_eq!(params.text(), " hi there");
+/// assert_eq!(params.token()?, "BAN");
+/// assert_eq!(params.token()?, "~sam");
+/// assert_eq!(params.text(), " flooding");
 /// # Ok::<(), risala_proto::error::ParseError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

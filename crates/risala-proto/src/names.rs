@@ -1,5 +1,6 @@
-//! Names (SPEC 3.5): uids, rooms, conversations, sequence numbers and ids,
-//! plus the targets of BLOCK (5.7) and ADMIN BAN (10.2).
+//! Names (SPEC 3.5): uids, rooms, mailboxes (boxes), sequence numbers,
+//! ids and blob-refs, plus the targets of BLOCK (5.7) and ADMIN BAN
+//! (10.2).
 //!
 //! Every type here checks itself: a [`Room`] value is always a valid room.
 //! Parsing (`FromStr`) folds ASCII upper case to lower case, as 3.5 makes
@@ -249,8 +250,8 @@ name_type!(
 );
 
 name_type!(
-    /// An `id` (3.5): 1 to 64 characters of `a-z 0-9 - _`. Conversations
-    /// (5.1) and reports (5.8) have ids.
+    /// An `id` (3.5): 1 to 64 characters of `a-z 0-9 - _`. Reports (5.8),
+    /// Welcomes (12.8) and guest tokens (4.2) are ids.
     Id,
     id_shape
 );
@@ -379,80 +380,207 @@ impl Room {
 
 // ---------------------------------------------------------------------------
 
-/// A `conv` (3.5, 5.1): a room, or the other person in a direct
-/// conversation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Conv {
-    /// A room, such as `#general`.
-    Room(Room),
-    /// A direct conversation, named by the other participant's uid (5.2).
-    Uid(Uid),
-}
+/// The lower-case base32 alphabet of RFC 4648 (3.5).
+const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-impl Conv {
-    /// The wire form, in lower case (3.5).
-    pub fn as_str(&self) -> &str {
-        match self {
-            Conv::Room(room) => room.as_str(),
-            Conv::Uid(uid) => uid.as_str(),
-        }
-    }
-
-    /// Whether this is a room (5.1).
-    pub fn is_room(&self) -> bool {
-        matches!(self, Conv::Room(_))
-    }
-
-    /// The room, if this is one (5.1).
-    pub fn room(&self) -> Option<&Room> {
-        match self {
-            Conv::Room(room) => Some(room),
-            Conv::Uid(_) => None,
-        }
-    }
-
-    /// The other participant, if this is a direct conversation (5.1, 5.2).
-    pub fn uid(&self) -> Option<&Uid> {
-        match self {
-            Conv::Uid(uid) => Some(uid),
-            Conv::Room(_) => None,
-        }
+/// The value of a base32 character, already folded to lower case.
+fn base32_value(c: u8) -> Option<u8> {
+    match c {
+        b'a'..=b'z' => Some(c - b'a'),
+        b'2'..=b'7' => Some(c - b'2' + 26),
+        _ => None,
     }
 }
 
-impl fmt::Display for Conv {
+/// The 26 characters of 16 bytes in lower-case base32, without padding.
+fn base32_encode(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(BOX_LEN);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for &b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(char::from(BASE32[(acc >> bits) as usize & 31]));
+        }
+    }
+    // 128 bits leave 3, padded with two zero bits to a last character.
+    out.push(char::from(BASE32[(acc << (5 - bits)) as usize & 31]));
+    out
+}
+
+/// Reads 16 bytes from 26 characters of base32, folding ASCII upper case
+/// (3.5). The two bits after the last byte must be zero, so that every
+/// value has one spelling. Any other length, character or trailing bits
+/// are `BadSyntax` (3.7).
+fn base32_decode(s: &str, what: &'static str) -> Result<[u8; 16], ParseError> {
+    let b = s.as_bytes();
+    if b.len() != BOX_LEN {
+        return Err(ParseError::BadSyntax(what));
+    }
+    let mut out = [0u8; 16];
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut i = 0;
+    for &c in b {
+        let v = base32_value(c.to_ascii_lowercase()).ok_or(ParseError::BadSyntax(what))?;
+        acc = (acc << 5) | u32::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out[i] = (acc >> bits) as u8;
+            i += 1;
+        }
+    }
+    if acc & ((1 << bits) - 1) != 0 {
+        return Err(ParseError::BadSyntax(what));
+    }
+    Ok(out)
+}
+
+/// The length of a `box` in characters: 16 bytes in base32 (3.5).
+pub const BOX_LEN: usize = 26;
+
+/// Defines a newtype over 16 bytes written as a `box` (3.5).
+macro_rules! box_type {
+    ($(#[$meta:meta])* $ty:ident, $what:literal) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $ty([u8; 16]);
+
+        impl $ty {
+            /// Makes the value from its 16 bytes.
+            pub const fn from_bytes(bytes: [u8; 16]) -> $ty {
+                $ty(bytes)
+            }
+
+            /// The 16 bytes.
+            pub const fn as_bytes(&self) -> &[u8; 16] {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $ty {
+            /// The 26 characters of lower-case base32 (3.5).
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&base32_encode(&self.0))
+            }
+        }
+
+        impl fmt::Debug for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({self})", stringify!($ty))
+            }
+        }
+
+        impl FromStr for $ty {
+            type Err = ParseError;
+
+            fn from_str(s: &str) -> Result<$ty, ParseError> {
+                base32_decode(s, $what).map($ty)
+            }
+        }
+    };
+}
+
+box_type!(
+    /// A `box` (3.5, 5.2): the name of a mailbox, 16 random bytes written
+    /// as 26 characters of lower-case base32 (RFC 4648) without padding,
+    /// such as `ujzdegxdncf32epf3dhodzdoci`.
+    ///
+    /// Parsing folds ASCII upper case, as for every name (3.5). A value of
+    /// the wrong length, a character outside `a-z 2-7`, or non-zero bits
+    /// after the 16th byte are `BadSyntax` (3.7), so each mailbox has
+    /// exactly one spelling.
+    BoxName,
+    "a box is 26 characters of base32"
+);
+
+box_type!(
+    /// The `<id>` of PAIR PUT, PAIR GET and the PAIR line (4.8): 16 bytes
+    /// derived from a pairing secret, written as a box (3.5).
+    PairId,
+    "a pairing id is 26 characters of base32"
+);
+
+/// The length of a SHA-384 hash, the hash a [`BlobRef`] names (12.12).
+pub const BLOB_HASH_LEN: usize = 48;
+
+/// A `blob-ref` (3.5, 12.12): `sha384:` followed by 96 lower-case hex
+/// digits, the SHA-384 hash of a blob's bytes. RECORD lines name records
+/// the same way (4.7).
+///
+/// Parsing folds ASCII upper case, as for every name (3.5). Any number of
+/// digits other than 96, or a character that is not a hex digit, is
+/// `BadSyntax` (3.7).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlobRef([u8; BLOB_HASH_LEN]);
+
+impl BlobRef {
+    /// The prefix of every blob-ref (3.5).
+    pub const PREFIX: &'static str = "sha384:";
+
+    /// The blob-ref of `bytes`: their SHA-384 hash (12.12).
+    pub fn of(bytes: &[u8]) -> BlobRef {
+        use sha2::{Digest as _, Sha384};
+        BlobRef(Sha384::digest(bytes).into())
+    }
+
+    /// Makes the value from the hash.
+    pub const fn from_hash(hash: [u8; BLOB_HASH_LEN]) -> BlobRef {
+        BlobRef(hash)
+    }
+
+    /// The hash.
+    pub const fn hash(&self) -> &[u8; BLOB_HASH_LEN] {
+        &self.0
+    }
+
+    /// The 96 hex digits without the prefix, as they follow the `blobs`
+    /// URL prefix of INFO in a blob's URL (8.5, 12.12).
+    pub fn hex(&self) -> String {
+        let mut out = String::with_capacity(2 * BLOB_HASH_LEN);
+        for b in self.0 {
+            out.push(char::from(b"0123456789abcdef"[usize::from(b >> 4)]));
+            out.push(char::from(b"0123456789abcdef"[usize::from(b & 15)]));
+        }
+        out
+    }
+}
+
+impl fmt::Display for BlobRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        write!(f, "{}{}", BlobRef::PREFIX, self.hex())
     }
 }
 
-impl FromStr for Conv {
+impl fmt::Debug for BlobRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BlobRef({self})")
+    }
+}
+
+impl FromStr for BlobRef {
     type Err = ParseError;
 
-    fn from_str(s: &str) -> Result<Conv, ParseError> {
-        if s.starts_with('#') {
-            s.parse().map(Conv::Room)
-        } else {
-            s.parse().map(Conv::Uid)
+    fn from_str(s: &str) -> Result<BlobRef, ParseError> {
+        const WHAT: ParseError = ParseError::BadSyntax("a blob-ref is sha384: and 96 hex digits");
+        let prefix = s.get(..BlobRef::PREFIX.len()).ok_or(WHAT)?;
+        if !prefix.eq_ignore_ascii_case(BlobRef::PREFIX) {
+            return Err(WHAT);
         }
-    }
-}
-
-impl From<Room> for Conv {
-    fn from(room: Room) -> Conv {
-        Conv::Room(room)
-    }
-}
-
-impl From<Uid> for Conv {
-    fn from(uid: Uid) -> Conv {
-        Conv::Uid(uid)
-    }
-}
-
-impl From<Identity> for Conv {
-    fn from(identity: Identity) -> Conv {
-        Conv::Uid(identity.into())
+        let hex = &s.as_bytes()[BlobRef::PREFIX.len()..];
+        if hex.len() != 2 * BLOB_HASH_LEN {
+            return Err(WHAT);
+        }
+        let digit = |c: u8| (c as char).to_digit(16).ok_or(WHAT);
+        let mut out = [0u8; BLOB_HASH_LEN];
+        let (pairs, _) = hex.as_chunks::<2>();
+        for (byte, [hi, lo]) in out.iter_mut().zip(pairs) {
+            *byte = (digit(*hi)? << 4 | digit(*lo)?) as u8;
+        }
+        Ok(BlobRef(out))
     }
 }
 
@@ -461,13 +589,14 @@ impl From<Identity> for Conv {
 /// A sequence number (3.5, 5.2): 1 to 2^63-1, written in decimal with no
 /// leading zeros.
 ///
-/// Some places in the protocol write `0` for "none", such as the `<read>`
-/// of a CONV line (7.1). [`Seq::parse_or_zero`] reads those.
+/// Some places in the protocol write `0` for "none", such as FETCH's
+/// `after=0` and FOLLOW's `head=0` (7.1), and GROUPINFO's `<seq>` in
+/// epoch 0 (6.1). [`Seq::parse_or_zero`] reads those.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Seq(u64);
 
 impl Seq {
-    /// The first event of every conversation (5.2).
+    /// The first post of every mailbox (5.2).
     pub const FIRST: Seq = Seq(1);
     /// The largest sequence number, 2^63-1 (3.5).
     pub const MAX: Seq = Seq(i64::MAX as u64);
@@ -491,8 +620,8 @@ impl Seq {
         Seq::new(self.0 + 1)
     }
 
-    /// Parses a sequence number, or `0` meaning none, as in CONV's
-    /// `<read>` (7.1).
+    /// Parses a sequence number, or `0` meaning none, as in FETCH's
+    /// `after=` (7.1).
     pub fn parse_or_zero(s: &str) -> Result<Option<Seq>, ParseError> {
         if s == "0" {
             Ok(None)
@@ -994,23 +1123,86 @@ mod tests {
     }
 
     #[test]
-    fn conv() {
-        let room: Conv = "#General".parse().unwrap();
-        assert!(room.is_room());
-        assert_eq!(room.as_str(), "#general");
-        assert_eq!(room.room().unwrap().bare(), "general");
-        assert_eq!(room.uid(), None);
+    fn box_grammar() {
+        // The spec's example box (1.4, 3.6).
+        let b: BoxName = "ujzdegxdncf32epf3dhodzdoci".parse().unwrap();
+        assert_eq!(b.to_string(), "ujzdegxdncf32epf3dhodzdoci");
+        assert_eq!(ok::<BoxName>("UJZDEGXDNCF32EPF3DHODZDOCI"), b.to_string());
+        assert_eq!(BoxName::from_bytes(*b.as_bytes()), b);
+        assert_eq!(
+            BoxName::from_bytes([0; 16]).to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            BoxName::from_bytes([0xff; 16]).to_string(),
+            format!("{}4", "7".repeat(25))
+        );
+        // RFC 4648's test vector, the first 5 bytes "foobar" give
+        // "mzxw6ytb".
+        let mut bytes = [0u8; 16];
+        bytes[..6].copy_from_slice(b"foobar");
+        assert!(
+            BoxName::from_bytes(bytes)
+                .to_string()
+                .starts_with("mzxw6ytboi")
+        );
+        for len in [0, 25, 27, 32] {
+            syntax::<BoxName>(&"a".repeat(len));
+        }
+        // Characters outside a-z 2-7, padding, and trailing bits that are
+        // not zero (the last character carries 3 bits and 2 zero bits).
+        for s in [
+            "ujzdegxdncf32epf3dhodzdoc1",
+            "ujzdegxdncf32epf3dhodzdoc8",
+            "ujzdegxdncf32epf3dhodzdoc=",
+            "ujzdegxdncf32epf3dhodzdocj",
+            "ujzdegxdncf32epf3dhodzdocb",
+            "ujzdegxdncf32epf3dhodzdoc-",
+            "ujzdegxdncf32epf3dhodzdocé",
+        ] {
+            syntax::<BoxName>(s);
+        }
+        assert_eq!(ok::<PairId>("aaaaaaaaaaaaaaaaaaaaaaaaaa"), "a".repeat(26));
+    }
 
-        let dm: Conv = "Bob@Example.net".parse().unwrap();
-        assert!(!dm.is_room());
-        assert_eq!(dm.to_string(), "bob@example.net");
-        assert!(dm.uid().unwrap().is_identity());
+    #[test]
+    fn box_round_trips_every_last_character() {
+        for last in 0..=255u8 {
+            let mut bytes = [0x5a; 16];
+            bytes[15] = last;
+            let b = BoxName::from_bytes(bytes);
+            let s = b.to_string();
+            assert_eq!(s.len(), BOX_LEN);
+            assert_eq!(s.parse::<BoxName>(), Ok(b));
+        }
+    }
 
-        let guest: Conv = "~sam".parse().unwrap();
-        assert_eq!(guest, Conv::Uid("~sam".parse().unwrap()));
-
-        for s in ["", "#", "sam", "@x.y", "*@example.net"] {
-            syntax::<Conv>(s);
+    #[test]
+    fn blob_ref_grammar() {
+        let hex = "5d0c9a1e".repeat(12);
+        let s = format!("sha384:{hex}");
+        let r: BlobRef = s.parse().unwrap();
+        assert_eq!(r.to_string(), s);
+        assert_eq!(r.hex(), hex);
+        assert_eq!(r.hash()[..4], [0x5d, 0x0c, 0x9a, 0x1e]);
+        assert_eq!(ok::<BlobRef>(&s.to_ascii_uppercase()), s);
+        // SHA-384 of the empty string.
+        assert_eq!(
+            BlobRef::of(b"").to_string(),
+            "sha384:38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"
+        );
+        for bad in [
+            String::new(),
+            "sha384:".into(),
+            hex.clone(),
+            format!("sha256:{hex}"),
+            format!("sha384:{}", &hex[1..]),
+            format!("sha384:{hex}0"),
+            format!("sha384:{}g", &hex[1..]),
+            format!("sha384: {}", &hex[1..]),
+            format!("sha384:{}…", &hex[3..]),
+        ] {
+            syntax::<BlobRef>(&bad);
         }
     }
 

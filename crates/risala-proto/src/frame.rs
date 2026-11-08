@@ -7,20 +7,27 @@
 //!
 //! # Long lines
 //!
-//! Lines that carry MLS data or encrypted content (Section 12) may be much
-//! longer than others. From a client, a line whose verb is one of
-//! [`CLIENT_LONG_VERBS`] may be up to [`MAX_LONG_CLIENT_LINE`] bytes; from
-//! a server, one whose verb is one of [`SERVER_LONG_VERBS`] may be up to
-//! [`MAX_LONG_SERVER_LINE`]. Every other line keeps the normal limit.
-//! [`LineLimits`] holds both limits of one direction and its long verbs.
+//! Lines that carry MLS data, key files or reports (Sections 4, 5.8 and
+//! 12) may be longer than others. From a client, a line whose verb is one
+//! of [`CLIENT_LONG_VERBS`] may be up to [`MAX_LONG_CLIENT_LINE`] bytes,
+//! 1 MiB; from a server, one whose verb is one of [`SERVER_LONG_VERBS`]
+//! may be up to [`MAX_LONG_SERVER_LINE`]. Every other line keeps the
+//! normal limit. [`LineLimits`] holds both limits of one direction and its
+//! long verbs.
 //!
 //! The long data always comes after the verb, so the start of every line,
 //! up to the end of its verb, must fit the normal limit, tags included
 //! (2.3). The decoder reads the verb as the line arrives: until the verb
 //! has ended, the normal limit applies, and once it shows that the line
-//! is long, the long limit does. A server applies only the normal limits
-//! before a connection signs in (2.3), with [`LineLimits::uniform`], and
-//! switches with [`LineDecoder::set_limits`].
+//! is long, the long limit does.
+//!
+//! Before a connection has signed in, or become anonymous or a guest, a
+//! server applies the normal limit to every line except REGISTER, which
+//! may be up to [`MAX_REGISTER_LINE`] bytes for its key file (2.3, 4.7):
+//! [`LineLimits::NEW_CONNECTION`]. It switches to [`LineLimits::CLIENT`]
+//! with [`LineDecoder::set_limits`] once the connection has a kind, as
+//! [`ConnectionKind::client_limits`](crate::connection::ConnectionKind::client_limits)
+//! says.
 
 use std::collections::VecDeque;
 
@@ -35,31 +42,32 @@ pub const MAX_CLIENT_LINE: usize = 8192;
 pub const MAX_SERVER_LINE: usize = 16384;
 
 /// The longest line a client may send whose verb is one of
-/// [`CLIENT_LONG_VERBS`]: 8 MiB, including the LF (2.3).
-pub const MAX_LONG_CLIENT_LINE: usize = 8 * 1024 * 1024;
+/// [`CLIENT_LONG_VERBS`]: 1 MiB, including the LF (2.3).
+pub const MAX_LONG_CLIENT_LINE: usize = 1024 * 1024;
 
 /// The longest line a server may send whose verb is one of
-/// [`SERVER_LONG_VERBS`]: 8 MiB plus 16384 bytes, including the LF (2.3).
+/// [`SERVER_LONG_VERBS`]: 1 MiB plus 16384 bytes, including the LF (2.3).
 /// The difference leaves room for the tags a server adds.
 pub const MAX_LONG_SERVER_LINE: usize = MAX_LONG_CLIENT_LINE + MAX_SERVER_LINE;
 
-/// The verbs of client lines that may be long (2.3), in upper case: the
-/// commands that carry MLS data or encrypted content.
-pub const CLIENT_LONG_VERBS: [&str; 5] = ["COMMIT", "ENC", "INIT", "KEYPKG", "REPORTENC"];
+/// The longest REGISTER line a new connection may send, including the LF:
+/// 64 KiB, for its key file (2.3, 4.7).
+pub const MAX_REGISTER_LINE: usize = 65536;
+
+/// The verbs of client lines that may be long once the connection has a
+/// kind (2.3), in upper case: the commands that carry MLS data, key files
+/// or reports.
+pub const CLIENT_LONG_VERBS: [&str; 6] = ["CREATE", "KEYPKG", "KEYS", "POST", "REPORT", "WELCOME"];
 
 /// The verbs of server lines that may be long (2.3), in upper case.
-/// Servers never send INIT.
-pub const SERVER_LONG_VERBS: [&str; 6] = [
-    "COMMIT",
-    "ENC",
-    "GROUPINFO",
-    "KEYPKG",
-    "REPORTENC",
-    "WELCOME",
-];
+pub const SERVER_LONG_VERBS: [&str; 5] = ["GROUPINFO", "KEYPKG", "POST", "REPORT", "WELCOME"];
 
-/// The length of the longest verb in [`CLIENT_LONG_VERBS`] and
-/// [`SERVER_LONG_VERBS`]. A longer verb is never long.
+/// The one verb a new connection may send long (2.3, 4.7).
+pub const NEW_CONNECTION_LONG_VERBS: [&str; 1] = ["REGISTER"];
+
+/// The length of the longest verb in [`CLIENT_LONG_VERBS`],
+/// [`SERVER_LONG_VERBS`] and [`NEW_CONNECTION_LONG_VERBS`]. A longer verb
+/// is never long.
 const LONGEST_LONG_VERB: usize = 9;
 
 fn contains_verb(verbs: &[&str], verb: &[u8]) -> bool {
@@ -80,19 +88,28 @@ pub struct LineLimits {
     /// than `normal`.
     pub long: usize,
     /// The verbs of lines that may be long, in upper case, at most
-    /// nine letters each: [`CLIENT_LONG_VERBS`] or
-    /// [`SERVER_LONG_VERBS`]. Verbs are matched case-insensitively.
+    /// nine letters each, such as [`CLIENT_LONG_VERBS`]. Verbs are
+    /// matched case-insensitively.
     pub long_verbs: &'static [&'static str],
 }
 
 impl LineLimits {
-    /// The limits of lines from a client (2.3): what a server's decoder
-    /// applies once the connection has signed in, and what a client
-    /// checks before it sends.
+    /// The limits of lines from a client once its connection is
+    /// anonymous, a guest or signed in (2.3): what a server's decoder then
+    /// applies, and what a client checks before it sends.
     pub const CLIENT: LineLimits = LineLimits {
         normal: MAX_CLIENT_LINE,
         long: MAX_LONG_CLIENT_LINE,
         long_verbs: &CLIENT_LONG_VERBS,
+    };
+
+    /// The limits of lines from a client on a new connection (2.3): the
+    /// normal limit for every line, except REGISTER, which may be up to
+    /// [`MAX_REGISTER_LINE`].
+    pub const NEW_CONNECTION: LineLimits = LineLimits {
+        normal: MAX_CLIENT_LINE,
+        long: MAX_REGISTER_LINE,
+        long_verbs: &NEW_CONNECTION_LONG_VERBS,
     };
 
     /// The limits of lines from a server (2.3): what a client's decoder
@@ -103,9 +120,7 @@ impl LineLimits {
         long_verbs: &SERVER_LONG_VERBS,
     };
 
-    /// The same limit for every line, with no long verbs. A server's
-    /// decoder uses `uniform(MAX_CLIENT_LINE)` until the connection signs
-    /// in (2.3).
+    /// The same limit for every line, with no long verbs.
     pub const fn uniform(max_len: usize) -> LineLimits {
         LineLimits {
             normal: max_len,
@@ -322,9 +337,10 @@ impl LineDecoder {
         LineDecoder::with_limits(LineLimits::uniform(max_len))
     }
 
-    /// Creates a decoder with these limits: [`LineLimits::CLIENT`] on a
-    /// server once the connection has signed in, [`LineLimits::SERVER`]
-    /// on a client (2.3).
+    /// Creates a decoder with these limits: [`LineLimits::NEW_CONNECTION`]
+    /// on a server until the connection has a kind, then
+    /// [`LineLimits::CLIENT`], and [`LineLimits::SERVER`] on a client
+    /// (2.3).
     pub fn with_limits(limits: LineLimits) -> Self {
         LineDecoder {
             limits: LineLimits {
@@ -338,7 +354,8 @@ impl LineDecoder {
         }
     }
 
-    /// Changes the limits, for example when a connection signs in (2.3).
+    /// Changes the limits, for example when a connection becomes
+    /// anonymous, a guest or signed in (2.3).
     /// Lines already complete keep the verdict they had. The line in
     /// progress is judged by the new limits from the next byte on; if it
     /// already holds more bytes than they allow, it is reported as too
@@ -771,34 +788,49 @@ mod tests {
 
     #[test]
     fn long_limits() {
-        assert_eq!(MAX_LONG_CLIENT_LINE, 8_388_608);
-        assert_eq!(MAX_LONG_SERVER_LINE, 8_388_608 + 16_384);
-        for verb in CLIENT_LONG_VERBS.iter().chain(&SERVER_LONG_VERBS) {
+        assert_eq!(MAX_LONG_CLIENT_LINE, 1_048_576);
+        assert_eq!(MAX_LONG_SERVER_LINE, 1_048_576 + 16_384);
+        assert_eq!(MAX_REGISTER_LINE, 65_536);
+        for verb in CLIENT_LONG_VERBS
+            .iter()
+            .chain(&SERVER_LONG_VERBS)
+            .chain(&NEW_CONNECTION_LONG_VERBS)
+        {
             assert!(verb.len() <= LONGEST_LONG_VERB);
             assert_eq!(verb.to_ascii_uppercase(), *verb);
         }
         let client = LineLimits::CLIENT;
         let server = LineLimits::SERVER;
-        for verb in ["COMMIT", "ENC", "KEYPKG", "REPORTENC", "reportenc", "Enc"] {
+        let new = LineLimits::NEW_CONNECTION;
+        for verb in ["KEYPKG", "POST", "REPORT", "WELCOME", "post", "Report"] {
             assert!(client.is_long_verb(verb), "{verb}");
             assert!(server.is_long_verb(verb), "{verb}");
+            assert!(!new.is_long_verb(verb), "{verb}");
         }
-        // Clients send INIT; servers send GROUPINFO and WELCOME lines.
-        assert!(client.is_long_verb("INIT"));
-        assert!(!server.is_long_verb("INIT"));
-        for verb in ["GROUPINFO", "WELCOME"] {
-            assert!(!client.is_long_verb(verb));
-            assert!(server.is_long_verb(verb));
+        // Clients send CREATE and KEYS; servers send GROUPINFO.
+        for verb in ["CREATE", "KEYS"] {
+            assert!(client.is_long_verb(verb));
+            assert!(!server.is_long_verb(verb));
         }
-        for verb in ["MSG", "REPORT", "ENCX", "BACKUP", ""] {
+        assert!(!client.is_long_verb("GROUPINFO"));
+        assert!(server.is_long_verb("GROUPINFO"));
+        // REGISTER is long only on a new connection (2.3).
+        assert!(new.is_long_verb("register"));
+        assert!(!client.is_long_verb("REGISTER"));
+        for verb in [
+            "MSG", "ENC", "COMMIT", "INIT", "POSTS", "BACKUP", "BLOB", "",
+        ] {
             assert!(!client.is_long_verb(verb), "{verb}");
             assert!(!server.is_long_verb(verb), "{verb}");
+            assert!(!new.is_long_verb(verb), "{verb}");
         }
-        assert_eq!(client.for_verb("enc"), MAX_LONG_CLIENT_LINE);
-        assert_eq!(client.for_verb("MSG"), MAX_CLIENT_LINE);
-        assert_eq!(server.for_verb("COMMIT"), MAX_LONG_SERVER_LINE);
-        assert_eq!(LineLimits::uniform(10).for_verb("ENC"), 10);
-        assert!(!LineLimits::uniform(10).is_long_verb("ENC"));
+        assert_eq!(client.for_verb("post"), MAX_LONG_CLIENT_LINE);
+        assert_eq!(client.for_verb("LIST"), MAX_CLIENT_LINE);
+        assert_eq!(server.for_verb("WELCOME"), MAX_LONG_SERVER_LINE);
+        assert_eq!(new.for_verb("REGISTER"), MAX_REGISTER_LINE);
+        assert_eq!(new.for_verb("POST"), MAX_CLIENT_LINE);
+        assert_eq!(LineLimits::uniform(10).for_verb("POST"), 10);
+        assert!(!LineLimits::uniform(10).is_long_verb("POST"));
     }
 
     /// Small limits that behave like the real ones: normal 16, long 64.
@@ -826,43 +858,52 @@ mod tests {
 
     #[test]
     fn long_verbs_get_the_long_limit() {
-        let enc = format!("ENC #r 1 {}", "A".repeat(40));
-        let msg = format!("MSG #r {}", "a".repeat(40));
-        let input = format!("{enc}\n{msg}\nPING\n");
+        let post = format!("POST b 1 {}", "A".repeat(40));
+        let list = format!("LIST {}", "a".repeat(40));
+        let input = format!("{post}\n{list}\nPING\n");
         assert_eq!(
             decode_small(input.as_bytes()),
-            vec![ok(&enc), Err(ParseError::TooLong), ok("PING")]
+            vec![ok(&post), Err(ParseError::TooLong), ok("PING")]
         );
 
         // Case-insensitive, after tags and runs of spaces.
-        let enc = format!("@ref=1   enc #r 1 {}", "A".repeat(30));
-        assert_eq!(decode_small(format!("{enc}\n").as_bytes()), vec![ok(&enc)]);
-        let report = format!("reportenc #r 1 {}", "A".repeat(30));
+        let post = format!("@ref=1   post b 1 {}", "A".repeat(30));
+        assert_eq!(
+            decode_small(format!("{post}\n").as_bytes()),
+            vec![ok(&post)]
+        );
+        let report = format!("report b {}", "A".repeat(30));
         assert_eq!(
             decode_small(format!("{report}\n").as_bytes()),
             vec![ok(&report)]
         );
 
         // A long line over the long limit.
-        let enc = format!("ENC #r 1 {}", "A".repeat(60));
+        let post = format!("POST b 1 {}", "A".repeat(60));
         assert_eq!(
-            decode_small(format!("{enc}\nPING\n").as_bytes()),
+            decode_small(format!("{post}\nPING\n").as_bytes()),
             vec![Err(ParseError::TooLong), ok("PING")]
         );
 
         // Exactly at each limit: 15 and 63 bytes plus the LF fit.
-        let msg = format!("MSG #r {}", "a".repeat(8));
-        assert_eq!(msg.len(), 15);
-        assert_eq!(decode_small(format!("{msg}\n").as_bytes()), vec![ok(&msg)]);
+        let list = format!("LIST {}", "a".repeat(10));
+        assert_eq!(list.len(), 15);
         assert_eq!(
-            decode_small(format!("{msg}a\n").as_bytes()),
+            decode_small(format!("{list}\n").as_bytes()),
+            vec![ok(&list)]
+        );
+        assert_eq!(
+            decode_small(format!("{list}a\n").as_bytes()),
             vec![Err(ParseError::TooLong)]
         );
-        let enc = format!("ENC #r 1 {}", "A".repeat(54));
-        assert_eq!(enc.len(), 63);
-        assert_eq!(decode_small(format!("{enc}\n").as_bytes()), vec![ok(&enc)]);
+        let post = format!("POST b 1 {}", "A".repeat(54));
+        assert_eq!(post.len(), 63);
         assert_eq!(
-            decode_small(format!("{enc}A\n").as_bytes()),
+            decode_small(format!("{post}\n").as_bytes()),
+            vec![ok(&post)]
+        );
+        assert_eq!(
+            decode_small(format!("{post}A\n").as_bytes()),
             vec![Err(ParseError::TooLong)]
         );
     }
@@ -870,26 +911,26 @@ mod tests {
     #[test]
     fn the_verb_must_end_within_the_normal_limit() {
         // Up to the end of the verb, the normal limit applies, tags
-        // included (2.3): 12 bytes of tags, a space and ENC end at index
+        // included (2.3): 11 bytes of tags, a space and POST end at index
         // 16, one byte too late.
-        let tags = format!("@ref={}", "a".repeat(7));
-        assert_eq!(tags.len(), 12);
-        let late = format!("{tags} ENC #r 1 {}", "A".repeat(20));
-        assert_eq!(late.find(" #r"), Some(16));
+        let tags = format!("@ref={}", "a".repeat(6));
+        assert_eq!(tags.len(), 11);
+        let late = format!("{tags} POST b 1 {}", "A".repeat(20));
+        assert_eq!(late.find(" b 1"), Some(16));
         assert_eq!(
             decode_small(format!("{late}\nPING\n").as_bytes()),
             vec![Err(ParseError::TooLong), ok("PING")]
         );
         assert_eq!(SMALL.check(&late), Err(ParseError::TooLong));
         // One byte shorter, and the verb ends at index 15.
-        let early = format!("@ref=aaaaaa ENC #r 1 {}", "A".repeat(20));
+        let early = format!("@ref=aaaaa POST b 1 {}", "A".repeat(20));
         assert_eq!(
             decode_small(format!("{early}\n").as_bytes()),
             vec![ok(&early)]
         );
         assert_eq!(SMALL.check(&early), Ok(()));
         // The same with runs of spaces before the verb.
-        let spaced = format!("@ref=1{}ENC #r 1 {}", " ".repeat(10), "A".repeat(20));
+        let spaced = format!("@ref=1{}POST b 1 {}", " ".repeat(10), "A".repeat(20));
         assert_eq!(
             decode_small(format!("{spaced}\n").as_bytes()),
             vec![Err(ParseError::TooLong)]
@@ -898,7 +939,7 @@ mod tests {
         // Tags longer than the normal limit are too long whatever follows,
         // and the decoder holds no more than the normal limit of them.
         let tags = format!("@x-big={}", "A".repeat(30));
-        let input = format!("{tags} REPORTENC #r 1\n{tags} MSG #r hi\nPING\n");
+        let input = format!("{tags} REPORT b 1\n{tags} LIST\nPING\n");
         assert_eq!(
             decode_small(input.as_bytes()),
             vec![
@@ -927,15 +968,16 @@ mod tests {
     fn verbs_that_only_look_long() {
         // A longer verb that starts with a long one, a verb that is too
         // long to be one, a line with no verb at all, a verb that is long
-        // only from the other side, and REPORT, which is never long.
+        // only from the other side, and LIST, which is never long.
         let cases = [
-            format!("ENCRYPT {}", "a".repeat(20)),
-            format!("REPORTENCX {}", "a".repeat(20)),
+            format!("POSTS {}", "a".repeat(20)),
+            format!("WELCOMEXYZ {}", "a".repeat(20)),
             format!("@ref=1 {}", "a".repeat(20)),
-            format!(" ENC {}", "a".repeat(20)),
-            format!("1ENC {}", "a".repeat(20)),
-            format!("WELCOME {}", "a".repeat(20)),
-            format!("REPORT #r 1 {}", "a".repeat(20)),
+            format!(" POST {}", "a".repeat(20)),
+            format!("1POST {}", "a".repeat(20)),
+            format!("GROUPINFO {}", "a".repeat(20)),
+            format!("REGISTER {}", "a".repeat(20)),
+            format!("LIST {}", "a".repeat(20)),
         ];
         for line in cases {
             assert_eq!(
@@ -946,55 +988,89 @@ mod tests {
             assert_eq!(SMALL.check(&line), Err(ParseError::TooLong), "{line:?}");
         }
         // A verb alone on its line.
-        assert_eq!(decode_small(b"ENC\n"), vec![ok("ENC")]);
-        assert_eq!(SMALL.check("ENC"), Ok(()));
+        assert_eq!(decode_small(b"POST\n"), vec![ok("POST")]);
+        assert_eq!(SMALL.check("POST"), Ok(()));
     }
 
     #[test]
     fn limits_can_change() {
-        // A server: normal limits until sign-in, then long lines.
+        // A server: normal limits until the connection has a kind, then
+        // long lines.
         let mut d = LineDecoder::new(16);
-        let enc = format!("ENC #r 1 {}", "A".repeat(30));
-        d.push(format!("{enc}\n").as_bytes());
+        let post = format!("POST b 1 {}", "A".repeat(30));
+        d.push(format!("{post}\n").as_bytes());
         assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
         d.set_limits(SMALL);
         assert_eq!(d.limits(), SMALL);
         assert_eq!(d.max_len(), 16);
-        d.push(format!("{enc}\n").as_bytes());
-        assert_eq!(d.next_line(), Some(ok(&enc)));
+        d.push(format!("{post}\n").as_bytes());
+        assert_eq!(d.next_line(), Some(ok(&post)));
 
         // The line in progress is judged by the new limits.
         let mut d = LineDecoder::new(16);
-        d.push(b"ENC #r 1 ");
+        d.push(b"POST b 1 ");
         d.set_limits(SMALL);
         d.push(format!("{}\n", "A".repeat(30)).as_bytes());
         assert_eq!(
             d.next_line(),
-            Some(Ok(format!("ENC #r 1 {}", "A".repeat(30))))
+            Some(Ok(format!("POST b 1 {}", "A".repeat(30))))
         );
     }
 
     #[test]
+    fn new_connections_allow_only_a_long_register() {
+        // 2.3: before a connection has a kind, REGISTER may be 64 KiB and
+        // every other line has the normal limit.
+        let new = LineLimits::NEW_CONNECTION;
+        let register = format!("REGISTER alice {} sig", "A".repeat(60_000));
+        assert_eq!(new.check(&register), Ok(()));
+        assert_eq!(
+            LineLimits::CLIENT.check(&register),
+            Err(ParseError::TooLong)
+        );
+        let at_limit = format!("REGISTER {}", "A".repeat(MAX_REGISTER_LINE - 10));
+        assert_eq!(at_limit.len(), MAX_REGISTER_LINE - 1);
+        assert_eq!(new.check(&at_limit), Ok(()));
+        assert_eq!(new.check(&format!("{at_limit}A")), Err(ParseError::TooLong));
+        let post = format!("POST b 1 {}", "A".repeat(MAX_CLIENT_LINE));
+        assert_eq!(new.check(&post), Err(ParseError::TooLong));
+        assert_eq!(LineLimits::CLIENT.check(&post), Ok(()));
+
+        let mut d = LineDecoder::with_limits(new);
+        d.push(format!("{register}\n{post}\nPING\n").as_bytes());
+        assert_eq!(d.next_line(), Some(Ok(register)));
+        assert_eq!(d.next_line(), Some(Err(ParseError::TooLong)));
+        assert_eq!(d.next_line(), Some(ok("PING")));
+    }
+
+    #[test]
     fn check_by_verb() {
-        let long = format!("ENC #r 1 {}", "A".repeat(MAX_CLIENT_LINE));
+        let long = format!("POST b 1 {}", "A".repeat(MAX_CLIENT_LINE));
         assert_eq!(LineLimits::CLIENT.check(&long), Ok(()));
         assert_eq!(
             check_line_len(&long, MAX_CLIENT_LINE),
             Err(ParseError::TooLong)
         );
-        let msg = format!("MSG #r {}", "a".repeat(MAX_CLIENT_LINE));
-        assert_eq!(LineLimits::CLIENT.check(&msg), Err(ParseError::TooLong));
-        let report = format!("@ref=1 reportenc #r 1 {}", "x".repeat(9000));
+        let list = format!("LIST {}", "a".repeat(MAX_CLIENT_LINE));
+        assert_eq!(LineLimits::CLIENT.check(&list), Err(ParseError::TooLong));
+        let report = format!("@ref=1 report b {}", "x".repeat(9000));
         assert_eq!(LineLimits::CLIENT.check(&report), Ok(()));
-        let report = format!("@ref=1 report #r 1 {}", "x".repeat(9000));
-        assert_eq!(LineLimits::CLIENT.check(&report), Err(ParseError::TooLong));
+        let backup = format!("@ref=1 backup put {}", "x".repeat(9000));
+        assert_eq!(LineLimits::CLIENT.check(&backup), Err(ParseError::TooLong));
         // Long tags before a long verb.
-        let tags = format!("@x-big={} ENC #r 1 AAAA", "A".repeat(MAX_CLIENT_LINE));
+        let tags = format!("@x-big={} POST b 1 AAAA", "A".repeat(MAX_CLIENT_LINE));
         assert_eq!(LineLimits::CLIENT.check(&tags), Err(ParseError::TooLong));
         // GROUPINFO lines are long only from a server.
-        let gi = format!("GROUPINFO #r 1 0 {}", "A".repeat(MAX_SERVER_LINE));
+        let gi = format!("GROUPINFO b 1 0 {}", "A".repeat(MAX_SERVER_LINE));
         assert_eq!(LineLimits::SERVER.check(&gi), Ok(()));
         assert_eq!(LineLimits::CLIENT.check(&gi), Err(ParseError::TooLong));
+        // Exactly 1 MiB, LF included, fits; one byte more does not.
+        let max = format!("POST {}", "A".repeat(MAX_LONG_CLIENT_LINE - 6));
+        assert_eq!(LineLimits::CLIENT.check(&max), Ok(()));
+        assert_eq!(
+            LineLimits::CLIENT.check(&format!("{max}A")),
+            Err(ParseError::TooLong)
+        );
     }
 
     #[test]

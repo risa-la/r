@@ -1,5 +1,4 @@
-//! The risala protocol, as defined in the spec (`spec/`). The code still
-//! implements draft-02; draft-03 is the redesign of PLAN.md item 59.
+//! The risala protocol, as defined in the spec (`spec/`, draft-03).
 //!
 //! This crate has no networking and no async code. It parses and
 //! serialises lines, validates names, escapes text and builds and checks
@@ -11,29 +10,33 @@
 //! - [`frame`]: splitting a byte stream into lines, line limits (2.3).
 //! - [`line`](mod@line): one line as tags, verb and parameters (3.1-3.3).
 //! - [`text`]: text escaping (3.4) and mentions (5.5).
-//! - [`names`]: uids, rooms, conversations, seqs and ids (3.5).
+//! - [`names`]: uids, rooms, boxes, seqs, ids and blob-refs (3.5).
 //! - [`time`](mod@time): timestamps (3.5).
-//! - [`types`]: small shared values: roles, settings, presence, relations.
-//! - [`mls`]: MLS data, franking tags and backup blobs, as opaque values
-//!   (12).
-//! - [`auth`]: the sign-in challenge and ML-DSA-44 keys (4.5, App. B).
+//! - [`types`]: small shared values: roles, presence, settings, push.
+//! - [`mls`]: MLS objects and the values derived from them, as opaque
+//!   values (5.2, 7, 12).
+//! - [`binary`]: other binary values: key file records, pairing data,
+//!   reports, wrapped backup keys and push keys (4.7, 4.8, 5.8, 9.1,
+//!   12.13).
+//! - [`connection`]: kinds of connection, and their line limits (4.1, 13).
+//! - [`auth`]: the sign-in challenge and ML-DSA-44 keys (4.6, App. B).
 //! - [`keyfile`]: key files (4.4).
 //! - [`fingerprint`]: certificate fingerprints for trust on first use (2.2).
-//! - [`command`]: typed commands, client to server (4-12).
-//! - [`server`]: typed server lines, server to client (4-12).
 
 #![warn(missing_docs)]
 
 pub mod auth;
-pub mod command;
+pub mod binary;
+pub mod connection;
 pub mod error;
 pub mod fingerprint;
 pub mod frame;
 pub mod keyfile;
 pub mod line;
+mod m5a;
 pub mod mls;
 pub mod names;
-pub mod server;
+mod parse;
 pub mod text;
 pub mod time;
 pub mod types;

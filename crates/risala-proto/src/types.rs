@@ -1,7 +1,8 @@
-//! Small values shared by commands and server lines: roles (6.3), presence
-//! (8.3), guest access and retention (6.2, 10.6), relations (5.3), the
-//! `ref` and `cid` tags (3.2, 7.6), settings (6.2, 10.6), push reasons
-//! (9.3) and the protocol's length limits.
+//! Small values shared by commands and server lines: roles (6.3), the
+//! settings of a conversation that the spec names (6.2), presence (8.3),
+//! the server's retention period and settings (8.5, 10.6), the `ref` and
+//! `cid` tags (3.2, 7.6), push tags, URLs and reasons (9.1, 9.3), file URLs
+//! and media types (5.6, 12.9) and the protocol's length limits.
 //!
 //! Keywords are case-insensitive (3.5): parsing folds ASCII upper case, and
 //! `Display` writes lower case.
@@ -13,7 +14,9 @@ use std::str::FromStr;
 
 use crate::error::ParseError;
 use crate::line::{is_tag_value, is_tag_value_char, is_token};
-use crate::names::Seq;
+
+#[doc(hidden)]
+pub use crate::m5a::HistoryMode;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -24,11 +27,12 @@ pub const MAX_TAG_TOKEN: usize = 64;
 pub const MIN_CID_CHARS: usize = 16;
 /// The longest reaction text, in bytes, escaped (5.3).
 pub const MAX_REACTION: usize = 64;
-/// The longest room topic, in bytes, escaped (6.2).
+/// The longest room topic, in bytes, escaped (6.2), as in ROOM lines
+/// (6.1).
 pub const MAX_TOPIC: usize = 512;
-/// The longest REPORT reason, in bytes, escaped (5.8).
+/// The longest report reason, in bytes (5.8).
 pub const MAX_REPORT_REASON: usize = 512;
-/// The longest display name, in bytes, escaped (8.2).
+/// The longest display name, in bytes (8.2).
 pub const MAX_DISPLAY_NAME: usize = 128;
 /// The longest file `get` URL, in bytes (5.6).
 pub const MAX_FILE_URL: usize = 512;
@@ -40,12 +44,16 @@ pub const MAX_PUSH_REASON: usize = 32;
 pub const MAX_PUSH_URL: usize = 512;
 /// The longest welcome text, in bytes (4.1, 10.6).
 pub const MAX_WELCOME: usize = 512;
-/// The number of events HISTORY and RELATED return when `limit` is not
-/// given (7.2, 7.3).
-pub const DEFAULT_LIMIT: u64 = 50;
+/// The number of posts FETCH returns when `limit` is not given (7.1).
+pub const DEFAULT_FETCH_LIMIT: u64 = 50;
 /// The number of rooms LIST and ADMIN ROOMS return when `limit` is not
 /// given (6.1, 10.4).
 pub const DEFAULT_LIST_LIMIT: u64 = 100;
+/// How long MUTE and ADMIN MUTE mute a pseudonym when `hours` is not
+/// given (6.4, 10.4).
+pub const DEFAULT_MUTE_HOURS: u64 = 24;
+/// The shortest retention period a server may have, in days (7.5, 10.6).
+pub const MIN_RETENTION_DAYS: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Numbers and yes/no
@@ -67,14 +75,6 @@ pub fn parse_u64(s: &str) -> Result<u64, ParseError> {
         Ok(n) if n <= i64::MAX as u64 => Ok(n),
         _ => Err(ParseError::BadSyntax("number is out of range")),
     }
-}
-
-/// Parses a number of days, at least 1, for the `retention` settings (6.2,
-/// 10.6).
-fn parse_days(s: &str) -> Result<NonZeroU32, ParseError> {
-    let n = parse_u64(s)?;
-    let n = u32::try_from(n).map_err(|_| ParseError::BadSyntax("too many days"))?;
-    NonZeroU32::new(n).ok_or(ParseError::BadSyntax("retention must be at least 1 day"))
 }
 
 /// Parses `yes` or `no`, in any case, as used by `public` (6.2), `guests`
@@ -154,13 +154,14 @@ macro_rules! keywords {
 }
 
 keywords! {
-    /// A role in a room (6.3). The order is by rank: `Member < Mod < Owner`.
+    /// A role in a room (6.3), as in MEMBER lines (8.3). The order is by
+    /// rank: `Member < Mod < Owner`.
     pub enum Role {
-        /// `member`: can send messages and manage their own.
+        /// `member`: a plain member, or a guest.
         Member = "member",
-        /// `mod`: can also delete messages, set the topic and moderate.
+        /// `mod`: a moderator, in the room's `mods` list.
         Mod = "mod",
-        /// `owner`: can do everything, including changing roles.
+        /// `owner`: in the room's `owners` list.
         Owner = "owner",
     }
     error = "a role is owner, mod or member";
@@ -168,7 +169,8 @@ keywords! {
 
 impl Role {
     /// Whether this role may moderate: delete others' messages, set the
-    /// topic, INVITE, KICK, BAN, UNBAN and BANS (6.3).
+    /// topic, invite, kick, ban and unban plain members, and ask the
+    /// server to MUTE (6.3, 6.4).
     pub fn can_moderate(self) -> bool {
         self >= Role::Mod
     }
@@ -202,20 +204,6 @@ impl GuestAccess {
 }
 
 keywords! {
-    /// The `history` setting of an encrypted room (6.2, 12.9): whether new
-    /// members get the keys to read earlier messages.
-    pub enum HistoryMode {
-        /// `shared`: devices that add a new member also send it the
-        /// history keys of earlier epochs. The default.
-        Shared = "shared",
-        /// `joined`: new members read only what is sent after they are
-        /// added.
-        Joined = "joined",
-    }
-    error = "history is shared or joined";
-}
-
-keywords! {
     /// The `send` setting of a room (6.2): who may send messages. The
     /// order is by restriction: `All < Mods`.
     pub enum SendMode {
@@ -235,23 +223,6 @@ impl Default for SendMode {
     }
 }
 
-keywords! {
-    /// The value of HISTORY's `only=` option (7.2): which events to
-    /// return.
-    pub enum HistoryOnly {
-        /// `commit`: only COMMIT events (12.11).
-        Commit = "commit",
-    }
-    error = "only is commit";
-}
-
-impl Default for HistoryMode {
-    /// `shared`, the default (6.2).
-    fn default() -> HistoryMode {
-        HistoryMode::Shared
-    }
-}
-
 impl Default for GuestAccess {
     /// `write`, the default for new rooms (6.2).
     fn default() -> GuestAccess {
@@ -260,21 +231,28 @@ impl Default for GuestAccess {
 }
 
 keywords! {
-    /// The `<reason>` of a NOTIFY push (9.2, 9.3).
-    pub enum PushReason {
-        /// `dm`: a message in a direct conversation.
-        Dm = "dm",
-        /// `mention`: a mention in a room.
-        Mention = "mention",
-        /// `reply`: a reply to one of the user's messages.
-        Reply = "reply",
-        /// `message`: a message in an encrypted room, where the server
-        /// cannot see mentions or replies (9.2, 12.11).
-        Message = "message",
-        /// `read`: the unread count went down.
-        Read = "read",
+    /// The `confirm` setting of a room (6.2, 12.10): how devices confirm
+    /// whose leaf is whose. It only moves from `pairwise` to `epochal`.
+    pub enum ConfirmMode {
+        /// `pairwise`: CHALLENGE and ANSWER between pairs of devices. The
+        /// default in private rooms.
+        Pairwise = "pairwise",
+        /// `epochal`: ATTEST and REVEAL with period keys. The default in
+        /// public rooms.
+        Epochal = "epochal",
     }
-    error = "a push reason is dm, mention, reply, message or read";
+    error = "confirm is pairwise or epochal";
+}
+
+keywords! {
+    /// The `<reason>` of a NOTIFY push (9.3).
+    pub enum PushReason {
+        /// `message`: a mailbox subscription's mailbox has a new post.
+        Message = "message",
+        /// `welcome`: an account subscription's device has a new Welcome.
+        Welcome = "welcome",
+    }
+    error = "a push reason is message or welcome";
 }
 
 /// The `<reason>` of a NOTIFY line as received (9.3): a [`PushReason`],
@@ -338,54 +316,6 @@ impl FromStr for NotifyReason {
     }
 }
 
-/// The `role=` result of `INFO <room>` (6.2): a [`Role`], or `none` for
-/// someone who is neither a member nor holds a role. `InfoRole(None)` is
-/// `none`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct InfoRole(pub Option<Role>);
-
-impl InfoRole {
-    /// The keyword as written on the wire (6.2).
-    pub const fn as_str(self) -> &'static str {
-        match self.0 {
-            Some(role) => role.as_str(),
-            None => "none",
-        }
-    }
-}
-
-impl fmt::Display for InfoRole {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for InfoRole {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<InfoRole, ParseError> {
-        if s.eq_ignore_ascii_case("none") {
-            Ok(InfoRole(None))
-        } else {
-            s.parse()
-                .map(|role| InfoRole(Some(role)))
-                .map_err(|_| ParseError::BadSyntax("a role is owner, mod, member or none"))
-        }
-    }
-}
-
-impl From<Option<Role>> for InfoRole {
-    fn from(role: Option<Role>) -> InfoRole {
-        InfoRole(role)
-    }
-}
-
-impl From<Role> for InfoRole {
-    fn from(role: Role) -> InfoRole {
-        InfoRole(Some(role))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Presence
 
@@ -441,166 +371,51 @@ impl FromStr for Presence {
 // ---------------------------------------------------------------------------
 // Retention
 
-/// A room's `retention` setting (6.2): `server`, or a number of days.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
-pub enum RoomRetention {
-    /// `server`: follow the server's retention period. The default.
-    #[default]
-    Server,
-    /// Delete events older than this many days. At least 1.
-    Days(NonZeroU32),
-}
-
-impl RoomRetention {
-    /// The period that applies to the room, given the server's: whichever
-    /// is shorter (7.5). `None` means events are kept forever.
-    pub fn effective(self, server: ServerRetention) -> Option<NonZeroU32> {
-        match (self, server.days()) {
-            (RoomRetention::Days(room), Some(server)) => Some(room.min(server)),
-            (RoomRetention::Days(room), None) => Some(room),
-            (RoomRetention::Server, server) => server,
-        }
-    }
-}
-
-impl fmt::Display for RoomRetention {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RoomRetention::Server => f.write_str("server"),
-            RoomRetention::Days(days) => write!(f, "{days}"),
-        }
-    }
-}
-
-impl FromStr for RoomRetention {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<RoomRetention, ParseError> {
-        if s.eq_ignore_ascii_case("server") {
-            Ok(RoomRetention::Server)
-        } else {
-            parse_days(s).map(RoomRetention::Days)
-        }
-    }
-}
-
-/// The server's retention period (8.5, 10.6): `forever`, or a number of
-/// days.
+/// The server's retention period (7.5, 8.5, 10.6): a number of days, at
+/// least [`MIN_RETENTION_DAYS`].
+///
+/// A smaller number is `BadSyntax`, since 10.6 defines the value as "a
+/// number of days, at least 7".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ServerRetention {
-    /// `forever`: events are never deleted for age.
-    Forever,
-    /// Delete events older than this many days. At least 1.
-    Days(NonZeroU32),
-}
+pub struct Retention(NonZeroU32);
 
-impl ServerRetention {
-    /// The number of days, or `None` for `forever` (10.6).
-    pub fn days(self) -> Option<NonZeroU32> {
-        match self {
-            ServerRetention::Forever => None,
-            ServerRetention::Days(days) => Some(days),
-        }
-    }
-}
+impl Retention {
+    /// The shortest period allowed, 7 days.
+    pub const MIN: Retention = Retention(NonZeroU32::new(MIN_RETENTION_DAYS).unwrap());
 
-impl fmt::Display for ServerRetention {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ServerRetention::Forever => f.write_str("forever"),
-            ServerRetention::Days(days) => write!(f, "{days}"),
-        }
-    }
-}
-
-impl FromStr for ServerRetention {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<ServerRetention, ParseError> {
-        if s.eq_ignore_ascii_case("forever") {
-            Ok(ServerRetention::Forever)
+    /// A period of `days` days, or `None` if it is under 7.
+    pub const fn new(days: u32) -> Option<Retention> {
+        if days >= MIN_RETENTION_DAYS {
+            match NonZeroU32::new(days) {
+                Some(days) => Some(Retention(days)),
+                None => None,
+            }
         } else {
-            parse_days(s).map(ServerRetention::Days)
+            None
         }
+    }
+
+    /// The number of days.
+    pub const fn days(self) -> u32 {
+        self.0.get()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Relations
-
-/// The relation a message has to an earlier one, from its `reply`, `edit`
-/// or `react` tag (5.3). A message carries at most one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Relation {
-    /// `reply=<seq>`: a reply to message `<seq>`.
-    Reply(Seq),
-    /// `edit=<seq>`: replaces the text of message `<seq>`.
-    Edit(Seq),
-    /// `react=<seq>`: a reaction to message `<seq>`.
-    React(Seq),
-}
-
-impl Relation {
-    /// The tag keys that carry a relation (3.2, 5.3).
-    pub const KEYS: [&'static str; 3] = ["reply", "edit", "react"];
-
-    /// The relation for tag `key` with target `seq`, or `None` if `key` is
-    /// not a relation tag. Tag keys are lower case (3.1).
-    pub fn new(key: &str, seq: Seq) -> Option<Relation> {
-        match key {
-            "reply" => Some(Relation::Reply(seq)),
-            "edit" => Some(Relation::Edit(seq)),
-            "react" => Some(Relation::React(seq)),
-            _ => None,
-        }
-    }
-
-    /// Parses the tag `key=value`. `Ok(None)` if `key` is not a relation
-    /// tag; an error if it is one but `value` is not a seq (5.3).
-    pub fn from_tag(key: &str, value: Option<&str>) -> Result<Option<Relation>, ParseError> {
-        if !Relation::KEYS.contains(&key) {
-            return Ok(None);
-        }
-        let seq = value
-            .ok_or(ParseError::BadSyntax("a relation tag needs a seq"))?
-            .parse()?;
-        Ok(Relation::new(key, seq))
-    }
-
-    /// The tag key: `reply`, `edit` or `react` (5.3).
-    pub fn key(self) -> &'static str {
-        match self {
-            Relation::Reply(_) => "reply",
-            Relation::Edit(_) => "edit",
-            Relation::React(_) => "react",
-        }
-    }
-
-    /// The target message (5.3).
-    pub fn seq(self) -> Seq {
-        match self {
-            Relation::Reply(seq) | Relation::Edit(seq) | Relation::React(seq) => seq,
-        }
-    }
-}
-
-impl fmt::Display for Relation {
-    /// Writes the tag, `key=seq`.
+impl fmt::Display for Retention {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}={}", self.key(), self.seq())
+        write!(f, "{}", self.0)
     }
 }
 
-impl FromStr for Relation {
+impl FromStr for Retention {
     type Err = ParseError;
 
-    /// Parses the tag, `key=seq`.
-    fn from_str(s: &str) -> Result<Relation, ParseError> {
-        let (key, value) = s
-            .split_once('=')
-            .ok_or(ParseError::BadSyntax("a relation is key=seq"))?;
-        Relation::from_tag(key, Some(value))?
-            .ok_or(ParseError::BadSyntax("a relation is reply, edit or react"))
+    fn from_str(s: &str) -> Result<Retention, ParseError> {
+        let n = parse_u64(s)?;
+        u32::try_from(n)
+            .ok()
+            .and_then(Retention::new)
+            .ok_or(ParseError::BadSyntax("retention is at least 7 days"))
     }
 }
 
@@ -716,118 +531,6 @@ fn write_setting(f: &mut fmt::Formatter<'_>, key: &str, value: &str) -> fmt::Res
     }
 }
 
-/// A room setting, as in `SET <room> <key> [<value...>]` (6.2).
-///
-/// Unknown keys are kept in [`RoomSetting::Other`], so that a server can
-/// reply `ERR not-supported` rather than `ERR bad-syntax`. A known key with
-/// a bad value is a syntax error.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RoomSetting {
-    /// `topic`: escaped text (3.4) of up to 512 bytes, possibly empty.
-    Topic(String),
-    /// `public`: `yes` or `no`.
-    Public(bool),
-    /// `guests`: `none`, `read` or `write`.
-    Guests(GuestAccess),
-    /// `retention`: `server` or a number of days.
-    Retention(RoomRetention),
-    /// `e2ee`: `yes` or `no`, whether the room is end-to-end encrypted
-    /// (12.3). Only INIT turns it on; a SET of it gets `ERR forbidden`.
-    E2ee(bool),
-    /// `history`: `shared` or `joined`, in encrypted rooms only (12.9). An
-    /// owner changes it with a COMMIT; a SET of it gets `ERR encrypted`
-    /// or `ERR forbidden` (6.2).
-    History(HistoryMode),
-    /// `send`: `all` or `mods`, who may send messages (6.2). In an
-    /// encrypted room an owner changes it with a COMMIT; a SET of it gets
-    /// `ERR encrypted` there.
-    Send(SendMode),
-    /// A key this crate does not know, folded to lower case, with its value
-    /// kept as escaped text.
-    Other {
-        /// The key: one token, lower case.
-        key: String,
-        /// The value, exactly as received.
-        value: String,
-    },
-}
-
-impl RoomSetting {
-    /// Parses a setting from its key token and its value text (6.2). The
-    /// key is case-insensitive. The value is the text parameter, still
-    /// escaped; keyword values are case-insensitive, and a topic is kept
-    /// exactly as given.
-    pub fn parse(key: &str, value: &str) -> Result<RoomSetting, ParseError> {
-        let key = keyword_token(key, "a setting key is one token")?;
-        Ok(match key.as_str() {
-            "topic" if value.len() > MAX_TOPIC => return Err(ParseError::TooLong),
-            "topic" => RoomSetting::Topic(value.to_owned()),
-            // Keyword values ignore trailing spaces (6.2), which are easy
-            // to type by hand.
-            "public" => RoomSetting::Public(parse_yes_no(value.trim_end_matches(' '))?),
-            "guests" => RoomSetting::Guests(value.trim_end_matches(' ').parse()?),
-            "retention" => RoomSetting::Retention(value.trim_end_matches(' ').parse()?),
-            "e2ee" => RoomSetting::E2ee(parse_yes_no(value.trim_end_matches(' '))?),
-            "history" => RoomSetting::History(value.trim_end_matches(' ').parse()?),
-            "send" => RoomSetting::Send(value.trim_end_matches(' ').parse()?),
-            _ => RoomSetting::Other {
-                key,
-                value: value.to_owned(),
-            },
-        })
-    }
-
-    /// The key, in lower case (6.2).
-    pub fn key(&self) -> &str {
-        match self {
-            RoomSetting::Topic(_) => "topic",
-            RoomSetting::Public(_) => "public",
-            RoomSetting::Guests(_) => "guests",
-            RoomSetting::Retention(_) => "retention",
-            RoomSetting::E2ee(_) => "e2ee",
-            RoomSetting::History(_) => "history",
-            RoomSetting::Send(_) => "send",
-            RoomSetting::Other { key, .. } => key,
-        }
-    }
-
-    /// The value as written on the wire (6.2).
-    pub fn value(&self) -> Cow<'_, str> {
-        match self {
-            RoomSetting::Topic(topic) => Cow::Borrowed(topic),
-            RoomSetting::Public(public) => Cow::Borrowed(yes_no(*public)),
-            RoomSetting::Guests(guests) => Cow::Borrowed(guests.as_str()),
-            RoomSetting::Retention(retention) => Cow::Owned(retention.to_string()),
-            RoomSetting::E2ee(e2ee) => Cow::Borrowed(yes_no(*e2ee)),
-            RoomSetting::History(history) => Cow::Borrowed(history.as_str()),
-            RoomSetting::Send(send) => Cow::Borrowed(send.as_str()),
-            RoomSetting::Other { value, .. } => Cow::Borrowed(value),
-        }
-    }
-
-    /// Whether this crate knows the key (6.2).
-    pub fn is_known(&self) -> bool {
-        !matches!(self, RoomSetting::Other { .. })
-    }
-}
-
-impl fmt::Display for RoomSetting {
-    /// Writes `key value`, or just `key` when the value is empty.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_setting(f, self.key(), &self.value())
-    }
-}
-
-impl FromStr for RoomSetting {
-    type Err = ParseError;
-
-    /// Parses `key value...`, splitting at the first space.
-    fn from_str(s: &str) -> Result<RoomSetting, ParseError> {
-        let (key, value) = split_setting(s);
-        RoomSetting::parse(key, value)
-    }
-}
-
 /// A server setting, as in `ADMIN SET <key> [<value...>]` (10.6).
 ///
 /// Unknown keys are kept in [`ServerSetting::Other`], so that a server can
@@ -835,14 +538,17 @@ impl FromStr for RoomSetting {
 /// error.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ServerSetting {
+    /// `anon`: `yes` or `no`, whether anonymous connections may be opened.
+    Anon(bool),
     /// `guests`: `yes` or `no`, whether guests may connect.
     Guests(bool),
     /// `registration`: `open` (true) or `closed` (false), whether REGISTER
     /// is accepted.
     Registration(bool),
-    /// `retention`: `forever` or a number of days.
-    Retention(ServerRetention),
-    /// `welcome`: escaped text (3.4) for the greeting (4.1), possibly empty.
+    /// `retention`: a number of days, at least 7.
+    Retention(Retention),
+    /// `welcome`: escaped text (3.4) for the greeting (4.1), possibly
+    /// empty, at most 512 bytes.
     Welcome(String),
     /// A key this crate does not know, folded to lower case, with its value
     /// kept as escaped text.
@@ -857,13 +563,13 @@ pub enum ServerSetting {
 impl ServerSetting {
     /// Parses a setting from its key token and its value text (10.6). The
     /// key is case-insensitive. The value is the text parameter, still
-    /// escaped; keyword values are case-insensitive, and a welcome message
-    /// is kept exactly as given.
+    /// escaped. Keyword and number values ignore trailing spaces and are
+    /// case-insensitive; the welcome text is kept exactly as given.
     pub fn parse(key: &str, value: &str) -> Result<ServerSetting, ParseError> {
         let key = keyword_token(key, "a setting key is one token")?;
-        // Keyword values ignore trailing spaces (10.6); text values do not.
         let keyword = value.trim_end_matches(' ');
         Ok(match key.as_str() {
+            "anon" => ServerSetting::Anon(parse_yes_no(keyword)?),
             "guests" => ServerSetting::Guests(parse_yes_no(keyword)?),
             "registration" if keyword.eq_ignore_ascii_case("open") => {
                 ServerSetting::Registration(true)
@@ -887,6 +593,7 @@ impl ServerSetting {
     /// The key, in lower case (10.6).
     pub fn key(&self) -> &str {
         match self {
+            ServerSetting::Anon(_) => "anon",
             ServerSetting::Guests(_) => "guests",
             ServerSetting::Registration(_) => "registration",
             ServerSetting::Retention(_) => "retention",
@@ -898,7 +605,7 @@ impl ServerSetting {
     /// The value as written on the wire (10.6).
     pub fn value(&self) -> Cow<'_, str> {
         match self {
-            ServerSetting::Guests(guests) => Cow::Borrowed(yes_no(*guests)),
+            ServerSetting::Anon(flag) | ServerSetting::Guests(flag) => Cow::Borrowed(yes_no(*flag)),
             ServerSetting::Registration(true) => Cow::Borrowed("open"),
             ServerSetting::Registration(false) => Cow::Borrowed("closed"),
             ServerSetting::Retention(retention) => Cow::Owned(retention.to_string()),
@@ -933,7 +640,8 @@ impl FromStr for ServerSetting {
 // ---------------------------------------------------------------------------
 // URLs and media types (5.6, 9.1)
 
-/// The value of a MSG's `file` tag: a `get` URL from UPLOAD (5.6).
+/// A file's `get` URL from UPLOAD (5.6), as in the `file` tag of a TEXT
+/// line inside an encrypted message (12.9).
 ///
 /// It uses `https`, contains no `;` and is at most 512 bytes
 /// ([`MAX_FILE_URL`]), so that it fits in a tag. The scheme is matched
@@ -1036,7 +744,8 @@ fn check_https(s: &str, what: &'static str) -> Result<(), ParseError> {
 /// 4.2).
 pub const MAX_MEDIA_TYPE_PART: usize = 127;
 
-/// The `<type>` of UPLOAD (5.6): a media type such as `image/png`.
+/// A media type such as `image/png`, as in the `file-type` tag of a TEXT
+/// line (12.9).
 ///
 /// It is checked loosely, following the `restricted-name` of RFC 6838:
 /// `type/subtype`, where each part is 1 to 127 characters of
@@ -1109,31 +818,40 @@ mod tests {
     #[test]
     fn keyword_settings_ignore_trailing_spaces() {
         assert_eq!(
-            RoomSetting::parse("public", "yes  "),
-            Ok(RoomSetting::Public(true))
-        );
-        assert_eq!(
             ServerSetting::parse("registration", "closed "),
             Ok(ServerSetting::Registration(false))
         );
+        assert_eq!(
+            ServerSetting::parse("retention", "30  "),
+            Ok(ServerSetting::Retention(Retention::new(30).unwrap()))
+        );
         // Text keeps its spaces.
         assert_eq!(
-            RoomSetting::parse("topic", "hi "),
-            Ok(RoomSetting::Topic("hi ".into()))
+            ServerSetting::parse("welcome", "hi "),
+            Ok(ServerSetting::Welcome("hi ".into()))
         );
-        assert!(RoomSetting::parse("public", " yes").is_err());
+        assert!(ServerSetting::parse("anon", " yes").is_err());
     }
 
     #[test]
     fn notify_reasons() {
         assert_eq!(
-            "Mention".parse::<NotifyReason>(),
-            Ok(NotifyReason::Known(PushReason::Mention))
+            "Message".parse::<NotifyReason>(),
+            Ok(NotifyReason::Known(PushReason::Message))
+        );
+        assert_eq!(
+            "welcome".parse::<NotifyReason>(),
+            Ok(NotifyReason::Known(PushReason::Welcome))
         );
         let other: NotifyReason = "Invite".parse().unwrap();
         assert_eq!(other, NotifyReason::Other("invite".into()));
         assert_eq!(other.to_string(), "invite");
         assert_eq!(other.known(), None);
+        // draft-02's reasons are unknown now.
+        assert_eq!(
+            "dm".parse::<NotifyReason>(),
+            Ok(NotifyReason::Other("dm".into()))
+        );
         assert!("a b".parse::<NotifyReason>().is_err());
         assert!("a_b".parse::<NotifyReason>().is_err());
         assert_eq!(
@@ -1153,14 +871,6 @@ mod tests {
             Err(ParseError::TooLong)
         );
         assert!("http://push.example/n/x".parse::<PushUrl>().is_err());
-    }
-
-    fn days(n: u32) -> NonZeroU32 {
-        NonZeroU32::new(n).unwrap()
-    }
-
-    fn seq(n: u64) -> Seq {
-        Seq::new(n).unwrap()
     }
 
     fn is_syntax<T: fmt::Debug>(r: Result<T, ParseError>) -> bool {
@@ -1212,14 +922,6 @@ mod tests {
         assert!(!Role::Member.can_moderate());
         assert!(Role::Mod.can_moderate());
         assert!(Role::Owner.can_moderate());
-
-        assert_eq!("none".parse::<InfoRole>(), Ok(InfoRole(None)));
-        assert_eq!("NONE".parse::<InfoRole>(), Ok(InfoRole(None)));
-        assert_eq!("mod".parse::<InfoRole>(), Ok(InfoRole(Some(Role::Mod))));
-        assert_eq!(InfoRole(None).to_string(), "none");
-        assert_eq!(InfoRole::from(Role::Owner).to_string(), "owner");
-        assert_eq!(InfoRole::from(None), InfoRole(None));
-        assert!(is_syntax("admin".parse::<InfoRole>()));
     }
 
     #[test]
@@ -1236,13 +938,24 @@ mod tests {
     }
 
     #[test]
+    fn conversation_settings() {
+        assert_eq!(SendMode::default(), SendMode::All);
+        assert_eq!("Mods".parse::<SendMode>(), Ok(SendMode::Mods));
+        for &c in ConfirmMode::ALL {
+            assert_eq!(c.to_string().parse::<ConfirmMode>(), Ok(c));
+        }
+        assert!(ConfirmMode::Pairwise < ConfirmMode::Epochal);
+        assert!(is_syntax("both".parse::<ConfirmMode>()));
+    }
+
+    #[test]
     fn push_reasons() {
         for &r in PushReason::ALL {
             assert_eq!(r.to_string().parse::<PushReason>(), Ok(r));
         }
-        assert_eq!(PushReason::ALL.len(), 5);
-        assert_eq!("DM".parse::<PushReason>(), Ok(PushReason::Dm));
-        assert!(is_syntax("edit".parse::<PushReason>()));
+        assert_eq!(PushReason::ALL.len(), 2);
+        assert_eq!("WELCOME".parse::<PushReason>(), Ok(PushReason::Welcome));
+        assert!(is_syntax("mention".parse::<PushReason>()));
     }
 
     #[test]
@@ -1262,92 +975,30 @@ mod tests {
 
     #[test]
     fn retention() {
-        assert_eq!("server".parse(), Ok(RoomRetention::Server));
-        assert_eq!("SERVER".parse(), Ok(RoomRetention::Server));
-        assert_eq!("30".parse(), Ok(RoomRetention::Days(days(30))));
-        assert_eq!("1".parse(), Ok(RoomRetention::Days(days(1))));
+        assert_eq!("7".parse(), Ok(Retention::MIN));
+        assert_eq!("30".parse::<Retention>().map(Retention::days), Ok(30));
         assert_eq!(
-            "4294967295".parse(),
-            Ok(RoomRetention::Days(days(u32::MAX)))
+            "4294967295".parse::<Retention>().map(Retention::days),
+            Ok(u32::MAX)
         );
         for s in [
             "0",
-            "00",
-            "030",
+            "1",
+            "6",
+            "07",
             "-1",
             "4294967296",
             "forever",
+            "server",
             "",
             " 30",
             "30 ",
         ] {
-            assert!(is_syntax(s.parse::<RoomRetention>()), "{s:?}");
+            assert!(is_syntax(s.parse::<Retention>()), "{s:?}");
         }
-        assert_eq!(RoomRetention::Days(days(7)).to_string(), "7");
-        assert_eq!(RoomRetention::Server.to_string(), "server");
-        assert_eq!(RoomRetention::default(), RoomRetention::Server);
-
-        assert_eq!("forever".parse(), Ok(ServerRetention::Forever));
-        assert_eq!("Forever".parse(), Ok(ServerRetention::Forever));
-        assert_eq!("365".parse(), Ok(ServerRetention::Days(days(365))));
-        for s in ["0", "server", "", "07"] {
-            assert!(is_syntax(s.parse::<ServerRetention>()), "{s:?}");
-        }
-        assert_eq!(ServerRetention::Forever.to_string(), "forever");
-        assert_eq!(ServerRetention::Days(days(365)).to_string(), "365");
-
-        let forever = ServerRetention::Forever;
-        let year = ServerRetention::Days(days(365));
-        assert_eq!(RoomRetention::Server.effective(forever), None);
-        assert_eq!(RoomRetention::Server.effective(year), Some(days(365)));
-        assert_eq!(
-            RoomRetention::Days(days(30)).effective(forever),
-            Some(days(30))
-        );
-        assert_eq!(
-            RoomRetention::Days(days(30)).effective(year),
-            Some(days(30))
-        );
-        assert_eq!(
-            RoomRetention::Days(days(900)).effective(year),
-            Some(days(365))
-        );
-    }
-
-    #[test]
-    fn relations() {
-        assert_eq!(
-            Relation::from_tag("reply", Some("8810")),
-            Ok(Some(Relation::Reply(seq(8810))))
-        );
-        assert_eq!(
-            Relation::from_tag("edit", Some("4000")),
-            Ok(Some(Relation::Edit(seq(4000))))
-        );
-        assert_eq!(
-            Relation::from_tag("react", Some("1")),
-            Ok(Some(Relation::React(seq(1))))
-        );
-        assert_eq!(Relation::from_tag("file", Some("x")), Ok(None));
-        assert_eq!(Relation::from_tag("ref", None), Ok(None));
-        assert!(Relation::from_tag("reply", None).is_err());
-        assert!(Relation::from_tag("reply", Some("0")).is_err());
-        assert!(Relation::from_tag("reply", Some("x")).is_err());
-        // Tag keys are lower case by grammar (3.1).
-        assert_eq!(Relation::from_tag("Reply", Some("1")), Ok(None));
-
-        let r: Relation = "react=8813".parse().unwrap();
-        assert_eq!(r, Relation::React(seq(8813)));
-        assert_eq!(r.key(), "react");
-        assert_eq!(r.seq(), seq(8813));
-        assert_eq!(r.to_string(), "react=8813");
-        for s in ["react", "react=", "seq=1", "=1", "reply=01"] {
-            assert!(is_syntax(s.parse::<Relation>()), "{s:?}");
-        }
-        for key in Relation::KEYS {
-            assert_eq!(Relation::new(key, seq(5)).unwrap().key(), key);
-        }
-        assert_eq!(Relation::new("x", seq(5)), None);
+        assert_eq!(Retention::new(6), None);
+        assert_eq!(Retention::new(7), Some(Retention::MIN));
+        assert_eq!(Retention::new(90).unwrap().to_string(), "90");
     }
 
     #[test]
@@ -1394,125 +1045,18 @@ mod tests {
     }
 
     #[test]
-    fn room_settings() {
-        // The SET lines of 1.4.
-        let cases = [
-            (
-                "topic",
-                "General chat. Be kind.",
-                RoomSetting::Topic("General chat. Be kind.".into()),
-            ),
-            ("public", "yes", RoomSetting::Public(true)),
-            ("guests", "write", RoomSetting::Guests(GuestAccess::Write)),
-            (
-                "retention",
-                "server",
-                RoomSetting::Retention(RoomRetention::Server),
-            ),
-            (
-                "retention",
-                "30",
-                RoomSetting::Retention(RoomRetention::Days(days(30))),
-            ),
-            ("public", "no", RoomSetting::Public(false)),
-            ("e2ee", "no", RoomSetting::E2ee(false)),
-            ("e2ee", "yes", RoomSetting::E2ee(true)),
-            (
-                "history",
-                "shared",
-                RoomSetting::History(HistoryMode::Shared),
-            ),
-            (
-                "history",
-                "joined",
-                RoomSetting::History(HistoryMode::Joined),
-            ),
-            ("send", "all", RoomSetting::Send(SendMode::All)),
-            ("send", "mods", RoomSetting::Send(SendMode::Mods)),
-        ];
-        for (key, value, setting) in cases {
-            assert_eq!(RoomSetting::parse(key, value), Ok(setting.clone()));
-            assert_eq!(setting.key(), key);
-            assert_eq!(setting.value(), value);
-            assert!(setting.is_known());
-            let line = format!("{key} {value}");
-            assert_eq!(setting.to_string(), line);
-            assert_eq!(line.parse::<RoomSetting>(), Ok(setting));
-        }
-
-        // Keys and keyword values fold; topics are kept exactly.
-        assert_eq!(
-            RoomSetting::parse("PUBLIC", "Yes"),
-            Ok(RoomSetting::Public(true))
-        );
-        assert_eq!(
-            RoomSetting::parse("Topic", "  Two  Spaces\\n"),
-            Ok(RoomSetting::Topic("  Two  Spaces\\n".into()))
-        );
-        assert_eq!(
-            RoomSetting::parse("guests", "NONE"),
-            Ok(RoomSetting::Guests(GuestAccess::None))
-        );
-
-        // An empty topic clears it.
-        let empty = RoomSetting::parse("topic", "").unwrap();
-        assert_eq!(empty, RoomSetting::Topic(String::new()));
-        assert_eq!(empty.to_string(), "topic");
-        assert_eq!("topic".parse::<RoomSetting>(), Ok(empty));
-
-        // Topic length.
-        assert!(RoomSetting::parse("topic", &"t".repeat(512)).is_ok());
-        assert_eq!(
-            RoomSetting::parse("topic", &"t".repeat(513)),
-            Err(ParseError::TooLong)
-        );
-
-        // Known keys with bad values are syntax errors.
-        for (key, value) in [
-            ("public", "maybe"),
-            ("public", ""),
-            ("guests", "all"),
-            ("retention", "0"),
-            ("retention", "forever"),
-            ("retention", "30 days"),
-            ("send", "everyone"),
-            ("send", ""),
-        ] {
-            assert!(is_syntax(RoomSetting::parse(key, value)), "{key} {value}");
-        }
-        assert!(is_syntax(RoomSetting::parse("", "x")));
-        assert!(is_syntax(RoomSetting::parse("a b", "x")));
-
-        // Unknown keys are kept.
-        let other = RoomSetting::parse("Slowmode", "10 Seconds").unwrap();
-        assert_eq!(
-            other,
-            RoomSetting::Other {
-                key: "slowmode".into(),
-                value: "10 Seconds".into()
-            }
-        );
-        assert!(!other.is_known());
-        assert_eq!(other.to_string(), "slowmode 10 Seconds");
-        assert_eq!("slowmode 10 Seconds".parse::<RoomSetting>(), Ok(other));
-    }
-
-    #[test]
     fn server_settings() {
         let cases = [
+            ("anon", "yes", ServerSetting::Anon(true)),
+            ("anon", "no", ServerSetting::Anon(false)),
             ("guests", "yes", ServerSetting::Guests(true)),
             ("guests", "no", ServerSetting::Guests(false)),
             ("registration", "open", ServerSetting::Registration(true)),
             ("registration", "closed", ServerSetting::Registration(false)),
             (
                 "retention",
-                "forever",
-                ServerSetting::Retention(ServerRetention::Forever),
-            ),
-            (
-                "retention",
                 "90",
-                ServerSetting::Retention(ServerRetention::Days(days(90))),
+                ServerSetting::Retention(Retention::new(90).unwrap()),
             ),
             (
                 "welcome",
@@ -1537,11 +1081,17 @@ mod tests {
             ServerSetting::parse("welcome", ""),
             Ok(ServerSetting::Welcome(String::new()))
         );
+        assert_eq!(
+            ServerSetting::parse("welcome", &"w".repeat(513)),
+            Err(ParseError::TooLong)
+        );
         for (key, value) in [
+            ("anon", "maybe"),
             ("guests", "write"),
             ("registration", "yes"),
             ("registration", ""),
-            ("retention", "server"),
+            ("retention", "forever"),
+            ("retention", "6"),
             ("retention", "0"),
         ] {
             assert!(is_syntax(ServerSetting::parse(key, value)), "{key} {value}");

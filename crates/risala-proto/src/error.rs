@@ -3,50 +3,57 @@
 use std::fmt;
 use std::str::FromStr;
 
-/// An error code, as sent in `ERR <code> [<message...>]` (3.7).
+/// An error code, as sent in `ERR <code> [<message...>]` (3.7), in the
+/// order of the table there.
 ///
 /// Clients must treat an unknown code as a general failure, so unknown
 /// codes are kept in [`ErrorCode::Other`] rather than rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
-    /// `bad-syntax`
+    /// `bad-syntax`: the line could not be parsed, or has the wrong
+    /// parameters.
     BadSyntax,
-    /// `unknown-command`
+    /// `unknown-command`: the verb, or a verb's subcommand, is not known
+    /// (3.8).
     UnknownCommand,
-    /// `too-long`
+    /// `too-long`: the line or one of its parameters is too long, or a
+    /// file, blob or KeyPackage is too large.
     TooLong,
-    /// `not-authenticated`
+    /// `not-authenticated`: the command needs another kind of connection
+    /// (4.1, Section 13).
     NotAuthenticated,
-    /// `already-authenticated`
+    /// `already-authenticated`: the connection is already anonymous, a
+    /// guest or signed in.
     AlreadyAuthenticated,
-    /// `auth-failed`: the signature did not verify against the keys the
-    /// server got (4.5). Clients do not retry it.
+    /// `auth-failed`: the signature did not verify against the identity's
+    /// keys, or the connection's SNI does not name this server (4.6).
+    /// Clients do not retry it.
     AuthFailed,
-    /// `unavailable`: the server could not get the identity's key file, so
-    /// it could not check the signature (4.5). Clients retry it with
-    /// backoff.
-    Unavailable,
-    /// `name-taken`
+    /// `name-taken`: the guest name, identity name, room name or mailbox
+    /// is already in use.
     NameTaken,
-    /// `not-found`
+    /// `not-found`: the room, mailbox, user, post or blob does not exist,
+    /// or is not visible to you.
     NotFound,
-    /// `forbidden`
+    /// `forbidden`: not allowed because of permissions, a ban, a mute or
+    /// server policy. Also what a guest gets for a command guests may not
+    /// send (Section 13).
     Forbidden,
-    /// `last-owner`
-    LastOwner,
-    /// `not-supported`
+    /// `not-supported`: the server does not offer this feature.
     NotSupported,
-    /// `encrypted`: the conversation is encrypted, so the command cannot be
-    /// used in it (12.3).
-    Encrypted,
-    /// `stale`: the conversation's group is not in the state the command
-    /// needs (12.5, 12.6).
+    /// `stale`: the send token is not valid for that epoch, or the epoch
+    /// is too old (7.2, 12.6).
     Stale,
-    /// `invalid`: MLS data or a franking commitment did not verify
-    /// (Section 12).
+    /// `invalid`: MLS data, a key file, a signature or a franking
+    /// commitment did not verify, or something required is missing
+    /// (Sections 4, 5.8 and 12).
     Invalid,
-    /// `rate-limited`
+    /// `rate-limited`: too many requests; the `retry` tag says when to try
+    /// again.
     RateLimited,
+    /// `unavailable`: the server could not get an identity's key file
+    /// (4.6, 12.5). Clients retry it with backoff.
+    Unavailable,
     /// `internal`
     Internal,
     /// A code this crate does not know. Always lower case, never empty,
@@ -64,16 +71,14 @@ impl ErrorCode {
             ErrorCode::NotAuthenticated => "not-authenticated",
             ErrorCode::AlreadyAuthenticated => "already-authenticated",
             ErrorCode::AuthFailed => "auth-failed",
-            ErrorCode::Unavailable => "unavailable",
             ErrorCode::NameTaken => "name-taken",
             ErrorCode::NotFound => "not-found",
             ErrorCode::Forbidden => "forbidden",
-            ErrorCode::LastOwner => "last-owner",
             ErrorCode::NotSupported => "not-supported",
-            ErrorCode::Encrypted => "encrypted",
             ErrorCode::Stale => "stale",
             ErrorCode::Invalid => "invalid",
             ErrorCode::RateLimited => "rate-limited",
+            ErrorCode::Unavailable => "unavailable",
             ErrorCode::Internal => "internal",
             ErrorCode::Other(code) => code,
         }
@@ -101,16 +106,14 @@ impl FromStr for ErrorCode {
             "not-authenticated" => ErrorCode::NotAuthenticated,
             "already-authenticated" => ErrorCode::AlreadyAuthenticated,
             "auth-failed" => ErrorCode::AuthFailed,
-            "unavailable" => ErrorCode::Unavailable,
             "name-taken" => ErrorCode::NameTaken,
             "not-found" => ErrorCode::NotFound,
             "forbidden" => ErrorCode::Forbidden,
-            "last-owner" => ErrorCode::LastOwner,
             "not-supported" => ErrorCode::NotSupported,
-            "encrypted" => ErrorCode::Encrypted,
             "stale" => ErrorCode::Stale,
             "invalid" => ErrorCode::Invalid,
             "rate-limited" => ErrorCode::RateLimited,
+            "unavailable" => ErrorCode::Unavailable,
             "internal" => ErrorCode::Internal,
             _ => ErrorCode::Other(lower),
         })
@@ -167,21 +170,28 @@ mod tests {
             "not-authenticated",
             "already-authenticated",
             "auth-failed",
-            "unavailable",
             "name-taken",
             "not-found",
             "forbidden",
-            "last-owner",
             "not-supported",
-            "encrypted",
             "stale",
             "invalid",
             "rate-limited",
+            "unavailable",
             "internal",
         ] {
             let parsed: ErrorCode = code.parse().unwrap();
             assert!(!matches!(parsed, ErrorCode::Other(_)), "{code}");
             assert_eq!(parsed.to_string(), code);
+        }
+    }
+
+    #[test]
+    fn dropped_codes_are_unknown() {
+        // draft-02's codes that draft-03 drops (3.7).
+        for code in ["last-owner", "encrypted"] {
+            let parsed: ErrorCode = code.parse().unwrap();
+            assert_eq!(parsed, ErrorCode::Other(code.into()));
         }
     }
 
