@@ -35,7 +35,7 @@ async fn a_device_keeps_key_packages_on_the_server() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backups_restore_history_keys() {
-    let server = hosted_server(&["#general"], |_| {}).await;
+    let server = hosted_server(&[], |_| {}).await;
     let (carol, mut raw) = server.register("carol").await;
     // Carol's key on a librisala device too.
     let (client, addr) = device(&server);
@@ -45,21 +45,34 @@ async fn backups_restore_history_keys() {
         .unwrap();
     let account = client.add_identity(&addr, "carol@chat.test").unwrap();
     within("signing in", account.connect()).await.unwrap();
-    let general = within("joining", account.join("#general")).await.unwrap();
-    within("syncing", account.wait_synced()).await.unwrap();
-    let id: Id = general
-        .info()
-        .unwrap()
-        .unwrap()
-        .id
-        .unwrap()
-        .parse()
+    let vault = within("joining", account.join("#vault")).await.unwrap();
+    within("INFO", vault.room_info()).await.unwrap();
+    // The server takes backups only for a group's epochs (12.10).
+    within("encrypting", vault.encrypt(History::Shared, false))
+        .await
         .unwrap();
+    within("syncing", account.wait_synced()).await.unwrap();
+    let id: Id = vault.info().unwrap().unwrap().id.unwrap().parse().unwrap();
 
-    // Another device of Carol's backed up three epochs' keys (12.10).
+    // The server has the group once GROUPINFO finds it.
+    within("the group", async {
+        loop {
+            raw.send("GROUPINFO #vault").await.unwrap();
+            let (_, last) = until_final(&mut raw).await;
+            if last.starts_with("OK") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    // Another device of Carol's backed up the key of the group's epoch 0
+    // (12.10). The group has not reached epoch 1 yet, so its key is
+    // refused.
     let recovery = RecoveryKey::from_bytes([5; 32]);
     let backup = recovery.backup_key(carol.identity());
-    for epoch in 0..3u8 {
+    for epoch in 0..2u8 {
         let blob = backup
             .seal(&id, u64::from(epoch), &HistoryKey::from_bytes([epoch; 48]))
             .unwrap();
@@ -67,7 +80,11 @@ async fn backups_restore_history_keys() {
             .await
             .unwrap();
         let (_, ok) = until_final(&mut raw).await;
-        assert_eq!(ok, "OK");
+        if epoch == 0 {
+            assert_eq!(ok, "OK");
+        } else {
+            assert!(ok.starts_with("ERR forbidden"), "{ok}");
+        }
     }
 
     // A recovery key that matches no backup is refused.
@@ -80,7 +97,7 @@ async fn backups_restore_history_keys() {
     let n = within("restoring", account.restore_backup(&recovery.to_display()))
         .await
         .unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(n, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
