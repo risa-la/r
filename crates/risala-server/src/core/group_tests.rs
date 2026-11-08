@@ -412,10 +412,17 @@ async fn only_the_owner_role_encrypts_a_room() {
     let mut cc = w.connect(&c7);
     w.ask(&mut cc, "join #o").await;
     w.ask(&mut ca, "part #o").await;
-    let group = c7.create(&RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All));
+    let group = c7.create(&RisalaConversation::room(
+        &id,
+        HistoryMode::Shared,
+        SendMode::All,
+    ));
     cc.lines();
     assert_eq!(
-        w.ask(&mut cc, &c7.init_line("#o", &group)).await.last().unwrap(),
+        w.ask(&mut cc, &c7.init_line("#o", &group))
+            .await
+            .last()
+            .unwrap(),
         "ERR forbidden only owners may encrypt a room"
     );
     // With the role, the operator may.
@@ -1126,9 +1133,15 @@ async fn direct_conversations_start_with_init() {
     assert_eq!(lines, [format!("OK id={id} epoch=0")]);
     // With no events yet, SYNC lists it for both with head 0 (7.1).
     let lines = w.ask(&mut c1, "sync").await;
-    assert!(lines.contains(&format!("CONV bob@example.net {id} 0 0")), "{lines:?}");
+    assert!(
+        lines.contains(&format!("CONV bob@example.net {id} 0 0")),
+        "{lines:?}"
+    );
     let lines = w.ask(&mut cb, "sync").await;
-    assert!(lines.contains(&format!("CONV alice@example.org {id} 0 0")), "{lines:?}");
+    assert!(
+        lines.contains(&format!("CONV alice@example.org {id} 0 0")),
+        "{lines:?}"
+    );
     // Bob's INIT comes second.
     let gb = b5.create(&me);
     assert_eq!(
