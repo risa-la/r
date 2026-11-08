@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
-use risala_proto::server::{Report, ServerLine, ServerMessage};
+use risala_proto::server::{Event, Report, ServerLine, ServerMessage};
 use risala_proto::text::unescape;
 use risala_proto::types::Ref;
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +35,17 @@ const BATCH: usize = 256;
 
 /// How long QUIT may take when stopping.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The most reports that wait for their copies (5.8). More, and the
+/// oldest is published without one.
+const MAX_PENDING_REPORTS: usize = 64;
+
+/// A report published without the copy of its event, which never came.
+fn uncopied((id, report): (Id, Report)) -> AccountEvent {
+    AccountEvent::Report {
+        report: ReportInfo::new(&id, &report, None),
+    }
+}
 
 type Reply<T> = oneshot::Sender<Result<T, ClientError>>;
 
@@ -336,9 +347,9 @@ enum Input {
 /// What to do with an input's result, on the async side.
 enum Ctx {
     None,
-    /// An event from a line the engine has no use for, such as NOTICE or
+    /// Events from a line the engine has no use for, such as NOTICE or
     /// a report (8.4, 5.8), to report after the changes before it.
-    Event(Box<AccountEvent>),
+    Events(Vec<AccountEvent>),
     /// A JOIN the app asked for.
     Join(Room, Reply<()>),
     /// A JOIN after reconnecting (4.2).
@@ -380,8 +391,9 @@ struct Online<'a> {
     rejoining: HashMap<ReqId, Room>,
     /// Replies the session could not send a command for.
     synthetic: Vec<(Input, Ctx)>,
-    /// A REPORT or REPORTENC line whose copy has not arrived yet (5.8).
-    report: Option<(Id, Report)>,
+    /// REPORT and REPORTENC lines whose copies have not arrived yet
+    /// (5.8), oldest first, by report id.
+    reports: Vec<(Id, Report)>,
     /// When to call [`SyncEngine::resume_outbox`] after `rate-limited`.
     resume_at: Option<Instant>,
 }
@@ -422,10 +434,17 @@ async fn online(
         reply_lines: HashMap::new(),
         rejoining: HashMap::new(),
         synthetic: Vec::new(),
-        report: None,
+        reports: Vec::new(),
         resume_at: None,
     };
     let flow = on.run(&mut incoming, cmds).await;
+    // Reports whose copies never came are still reports.
+    let events: Vec<AccountEvent> = on.reports.drain(..).map(uncopied).collect();
+    shared.publish(Batch {
+        reload: false,
+        changes: Vec::new(),
+        events,
+    });
     *shared.session.lock().expect("poisoned") = None;
     shared.synced.send_modify(|s| s.idle = false);
     forget_people(shared);
@@ -528,37 +547,30 @@ impl Online<'_> {
             Incoming::Line(msg) => {
                 // A NOTICE or a report is published in its place among the
                 // changes of the lines around it (8.4, 5.8).
-                let event = match &msg.line {
-                    ServerLine::Notice { message } => Some(AccountEvent::Notice {
+                let events = match &msg.line {
+                    ServerLine::Notice { message } => vec![AccountEvent::Notice {
                         notice: Notice::Server {
                             text: unescape(message).into_owned(),
                         },
-                    }),
-                    // A report comes as two lines: the REPORT or REPORTENC
-                    // line, then the copy of the event.
-                    ServerLine::Report(report) => {
-                        if let Some(id) = &msg.report {
-                            self.report = Some((id.clone(), report.clone()));
-                        }
-                        None
-                    }
-                    ServerLine::ReportCopy(copy) => match (self.report.take(), &msg.report) {
-                        (Some((id, report)), Some(tag)) if id == *tag => {
-                            Some(AccountEvent::Report {
-                                report: ReportInfo::new(&id, &report, Some(copy)),
-                            })
-                        }
-                        _ => {
-                            debug!("a reported event with no REPORT line before it");
-                            None
-                        }
+                    }],
+                    ServerLine::Report(report) => match &msg.report {
+                        Some(id) => self.report_line(id, report),
+                        None => Vec::new(),
+                    },
+                    ServerLine::ReportCopy(copy) => match &msg.report {
+                        Some(id) => self.report_copy(id, copy),
+                        None => Vec::new(),
                     },
                     ServerLine::Resolved { id } => {
-                        Some(AccountEvent::ReportResolved { id: id.to_string() })
+                        vec![AccountEvent::ReportResolved { id: id.to_string() }]
                     }
-                    _ => None,
+                    _ => Vec::new(),
                 };
-                let ctx = event.map_or(Ctx::None, |e| Ctx::Event(Box::new(e)));
+                let ctx = if events.is_empty() {
+                    Ctx::None
+                } else {
+                    Ctx::Events(events)
+                };
                 inputs.push((Input::Line(msg), ctx));
             }
             Incoming::Reply { ref_, response } => match self.refs.remove(&ref_) {
@@ -573,6 +585,39 @@ impl Online<'_> {
                 }
                 None => debug!(%ref_, "reply to no request of the engine"),
             },
+        }
+    }
+
+    /// A REPORT or REPORTENC line (5.8), which waits for the copy of the
+    /// event that follows it, tagged with the same report id. Returns the
+    /// reports to publish without a copy: one this line replaces, and the
+    /// oldest if too many wait.
+    fn report_line(&mut self, id: &Id, report: &Report) -> Vec<AccountEvent> {
+        let mut events = Vec::new();
+        if let Some(i) = self.reports.iter().position(|(r, _)| r == id) {
+            events.push(uncopied(self.reports.remove(i)));
+        }
+        if self.reports.len() >= MAX_PENDING_REPORTS {
+            events.push(uncopied(self.reports.remove(0)));
+        }
+        self.reports.push((id.clone(), report.clone()));
+        events
+    }
+
+    /// The copy of a reported event (5.8): completes the report it is
+    /// tagged with.
+    fn report_copy(&mut self, id: &Id, copy: &Event) -> Vec<AccountEvent> {
+        match self.reports.iter().position(|(r, _)| r == id) {
+            Some(i) => {
+                let (id, report) = self.reports.remove(i);
+                vec![AccountEvent::Report {
+                    report: ReportInfo::new(&id, &report, Some(copy)),
+                }]
+            }
+            None => {
+                debug!(%id, "a reported event with no REPORT line before it");
+                Vec::new()
+            }
         }
     }
 
@@ -660,7 +705,7 @@ impl Online<'_> {
         out: Output,
         sent: Option<OutboxId>,
         events: Vec<AccountEvent>,
-        ctx: Ctx,
+        mut ctx: Ctx,
     ) {
         let first_req = out.send.first().map(|o| o.req);
         for o in out.send {
@@ -690,8 +735,8 @@ impl Online<'_> {
         let mut not_again: Vec<Room> = Vec::new();
         let mut join_again: Vec<Room> = Vec::new();
         let mut events = events;
-        if let Ctx::Event(event) = &ctx {
-            events.push((**event).clone());
+        if let Ctx::Events(more) = &mut ctx {
+            events.append(more);
         }
         for n in &out.notifications {
             match n {
@@ -785,7 +830,7 @@ impl Online<'_> {
             self.shared.synced.send_modify(|s| s.idle = false);
         }
         match ctx {
-            Ctx::None | Ctx::Event(_) => {}
+            Ctx::None | Ctx::Events(_) => {}
             Ctx::Join(room, reply) => match first_req {
                 Some(req) => {
                     self.waiters.insert(req, Waiter::Done(Some(room), reply));
@@ -1014,7 +1059,7 @@ fn answer_err(ctx: Ctx, e: ClientError) {
         Ctx::Answer(reply) => {
             let _ = reply.send(Err(e));
         }
-        Ctx::None | Ctx::Event(_) | Ctx::Rejoin(_) => {}
+        Ctx::None | Ctx::Events(_) | Ctx::Rejoin(_) => {}
     }
 }
 

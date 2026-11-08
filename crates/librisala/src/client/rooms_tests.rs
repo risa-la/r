@@ -721,3 +721,54 @@ async fn invitations_kicks_bans_and_drops_are_notices() {
     alice.disconnect().await;
     server.done().await;
 }
+
+#[tokio::test]
+async fn live_reports_wait_for_their_copies_by_id() {
+    // 5.8: each report's two lines carry its id, so reports whose lines
+    // interleave each get their own copy, and one whose copy never comes
+    // is still published, without it.
+    let (client, server) = setup(|_, mut peer| async move {
+        synced(&mut peer).await;
+        let p = &mut peer;
+        let report =
+            |id: &str, seq: u64| format!("@report={id};t={REPORTED} REPORT #general {seq}");
+        let copy = |id: &str, seq: u64, from: &str| {
+            format!(
+                "@report={id};{}",
+                &ev(seq, &format!("from={from} MSG #general hi {seq}"))[1..]
+            )
+        };
+        p.send(&report("a1a1a1", 1)).await;
+        p.send(&report("b2b2b2", 2)).await;
+        p.send(&copy("b2b2b2", 2, "alice@example.org")).await;
+        p.send(&copy("a1a1a1", 1, "bob@example.net")).await;
+        p.send(&report("c3c3c3", 1)).await;
+        p.send("NOTICE done").await;
+        quit(peer).await;
+    })
+    .await;
+    let alice = client.add_identity(HOST, ALICE).unwrap();
+    let events = alice.subscribe();
+    within(alice.connect()).await.unwrap();
+    let report = || {
+        until(&events, |e| match e {
+            AccountEvent::Report { report } => Some(report.clone()),
+            _ => None,
+        })
+    };
+    let b = report().await;
+    let a = report().await;
+    assert_eq!((b.id.as_str(), b.seq), ("b2b2b2", 2));
+    assert_eq!(b.message.unwrap().text, "hi 2");
+    assert_eq!((a.id.as_str(), a.seq), ("a1a1a1", 1));
+    assert_eq!(a.message.unwrap().from, "bob@example.net");
+    until(&events, |e| {
+        matches!(e, AccountEvent::Notice { .. }).then_some(())
+    })
+    .await;
+    // c's copy has not come when the connection ends.
+    alice.disconnect().await;
+    let c = report().await;
+    assert_eq!((c.id.as_str(), c.seq, c.message), ("c3c3c3", 1, None));
+    server.done().await;
+}
