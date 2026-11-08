@@ -32,7 +32,8 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Forward secrecy and post-compromise security.** Each message has its
   own key, which devices delete once they have used it (12.9), and
-  devices delete past epochs' secrets soon after. So a device stolen
+  devices delete a past epoch's secrets once 2 more epochs have started
+  or an hour has passed since it ended (12.9). So a device stolen
   today does not decrypt what the server stored earlier. Commits give
   post-compromise security: once a device has committed a fresh leaf,
   which it does at least weekly (12.7), keys stolen earlier do not
@@ -46,13 +47,23 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   SHOULD keep their stores encrypted under keys held in hardware.
 
 - **Backups.** A backup (12.13) is readable by whoever has the recovery
-  key, and is not forward secret: it can be read until it is replaced or
-  deleted. The server holds only the encrypted backup.
+  key, and is not forward secret. The server is not trusted to delete
+  what it is told to, so whoever gets the recovery key can read every
+  backup the server has kept, replaced and deleted ones included. The
+  server holds only encrypted blobs. A restoring device takes the
+  backup's generation from the key log, so the server cannot hand it a
+  backup made with the key of a removed or lost device. Within one
+  generation, the server can hand it an older backup than the newest,
+  and the device only shows when the backup was made. Someone who
+  steals a device can make a backup in that device's generation until
+  the device is removed, and a device that restores it shows its
+  messages as they were backed up, marked as restored.
 
 - **Recovery keys.** The recovery key derives the master key, which can
   replace every device of the identity, and the backup keys. Whoever
   holds it controls the identity, so it should be stored like a
-  password, offline. Devices never keep it (4.8).
+  password, offline. Devices never keep it (4.8). Changing it means a
+  new master key, which every contact sees as such (12.14).
 
 - **Deniability.** Nothing an identity publishes signs a message or a
   leaf key (4.3, 12.3), and members confirm leaves in ways that convince
@@ -103,26 +114,67 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     backups and its records in the key log;
   - in a public room, its members and their display names, the leaf of
     each light client (12.6), and its topic;
-  - whether an identity is online, unless it has turned that off (8.3).
+  - whether an identity is online, unless it has turned that off (8.3);
+  - how many devices an identity has, since KEYPKG GET answers one line
+    per device, and KEYPKG COUNT and sign-ins are per device;
+  - for files: how many are uploaded to each mailbox, their padded
+    sizes and when, and for each download, which network address fetched
+    which file, and when. Downloads can tie addresses to a mailbox, and
+    so help the server guess who is in a private conversation;
+  - for blobs: when an identity's devices store large ones, such as at
+    pairing or in a transfer, and their sizes;
+  - for backups: their size and how often they are made, and their
+    generation, which counts how many times the identity has removed a
+    device or recovered;
+  - from a guest's report conversation (5.8), which guest contacted
+    which owners or moderators, through the KeyPackages it asked for.
   Appendix D lists these as accepted risks.
 
 - **What the server can still do.** It can withhold, delay or reorder
-  posts, refuse posts and commits, and drop mailboxes. Devices notice a
-  gap in any one member's messages (7.4), and replayed messages (12.9),
-  but cannot tell a mailbox the server hides entirely from one where
-  nothing is said. In a public room it can accept a commit that members'
-  devices reject, which makes them join again (12.6). It is the
-  authority for public room names, and can make up a room or hide one,
-  but cannot change what the members of a room see inside it. Until a
-  device has joined a public room, the topic and member count that LIST
-  shows are the server's word.
+  posts, refuse posts and commits, and drop mailboxes:
+  - Devices notice a gap in a member's messages once a later message
+    from that member arrives (7.4), and they notice replayed messages
+    (12.9). They do not notice if the server holds back a member's last
+    messages, or everything a member posts from some point on, and
+    cannot tell a mailbox the server hides entirely from one where
+    nothing is said.
+  - In direct conversations and private rooms it chooses, by the order
+    of posts, which of two commits for the same epoch wins (7.2), for
+    example an owner's demotion of a moderator or that moderator's own
+    commit. It can also refuse a commit forever, such as the removal of
+    a kicked member. The committer sees this, the other members do not.
+    Commit streaks (12.7) keep one member from winning every epoch on
+    its own, but not with the server's help.
+  - In a public room it can accept a commit that members' devices
+    reject. Devices that were in the room warn their users, and do not
+    take the room's new roles silently (12.7). Devices that join the
+    room afterwards cannot tell, so a server can set the roles and
+    settings that newcomers to a public room see.
+  - It is the authority for public room names, and can make up a room,
+    hide one, or put a different group under a name. Devices that know
+    the room, or follow a link that carries its group id, notice the
+    change (6.1). Until a device has joined a public room, the topic and
+    member count that LIST shows are the server's word.
+  - It can send a false GONE that makes members' devices remove a
+    guest's leaf, or hold one back, so that a reused guest name appears
+    twice (6.1).
+  - Within a generation, it can serve an older backup (above).
 
 - **Insiders.** A member can read the conversation, and can leak it. A
   member can post invalid commits, which cost every device some work
   and which devices ignore (7.2); send tokens, limits per pseudonym and
   proof of work bound how many. A member can take part in confirming
   leaves only for itself: it cannot make another member's leaf look
-  confirmed.
+  confirmed. Any member can remove others' leaves that are stale, more
+  than 35 days behind the group's median (12.7), at most a tenth of the
+  group in one commit, and must add those devices again if they have
+  KeyPackages. A member can commit in at most 3 epochs in a row before
+  it has to wait about 10 minutes (12.7). A removed or demoted member
+  loses its role from the commit that removes or demotes it (12.9).
+  A compromised device of an identity can, until it is removed, send
+  that identity's other devices made-up history for the gaps they ask
+  it to fill. They show it as copied from that device, and never let it
+  replace what they hold (12.13).
 
 - **Who can add a device.** Any device of an identity holds the
   device-signing key, and so can add a device. That shows in the key
@@ -197,8 +249,9 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Reports.** Moderators of a room see who wrote a reported message,
   from their own copy. Operators see what it said, proven by franking,
-  but only the reporter's claim of who wrote it, so they act on rooms,
-  mailboxes and accounts rather than on single messages (5.8). The
+  but only the reporter's claim of who wrote it. A member can report its
+  own post as someone else's, so operators act on pseudonyms, mailboxes
+  and rooms, and never ban an identity on reports alone (5.8). The
   reporter is told who will see the report. Operators learn who reported
   only if the reporter was signed in.
 
@@ -212,13 +265,21 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Deletion** removes a message from devices that honour it, not from
   copies that people have already made, nor from the server, which
-  holds the ciphertext until it expires.
+  holds the ciphertext until it expires. A file stays fetchable with its
+  `get` URL until it expires, unless its uploader deletes it, even after
+  a moderator deletes its message.
 
 - **Files.** `get` URLs are capabilities (5.6). Anyone a URL is passed to
   can download the file, but gets only ciphertext of a padded size
   (12.11). People will open these URLs in web browsers, so servers
   SHOULD serve files from a domain that is used for nothing else, and
-  with the header `X-Content-Type-Options: nosniff`.
+  with the header `X-Content-Type-Options: nosniff`. A member can share
+  a file whose URL is on a host of its own, which would learn the
+  address of everyone who fetches it, so devices fetch such a file only
+  when their user asks (12.11). ChaCha20-Poly1305 is not
+  key-committing, but every recipient gets the same key in the franked
+  content, and `file-hash` commits to the ciphertext, so a file cannot
+  decrypt differently for different recipients.
 
 - **Sizes.** Private rooms of 1,000 members and public rooms of 10,000
   (6.1) are limits chosen before ML-DSA and X-Wing have been measured on

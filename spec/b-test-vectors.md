@@ -146,6 +146,10 @@ made by an implementation of this document, which does not exist yet:
 - a PairingCode and its QR text, the keys and ids derived from the
   pairing secret, and an encrypted NewDevice and IdentityBundle (4.8)
 - the send token export and its hash (7.2)
+- the group id, epoch, content type and RisalaAAD that a server reads
+  from a PrivateMessage and from a PublicMessage (5.2)
+- an RFC 8291 push body and the `NOTIFY` line inside it (9.3)
+- the period number of a given time (12.10)
 - a RisalaIdentity credential, a DeviceBinding and a RisalaProfile
   (12.3)
 - a RisalaConversation extension for each kind of conversation (12.4)
@@ -155,8 +159,27 @@ made by an implementation of this document, which does not exist yet:
   encapsulation randomness (12.10)
 - a PeriodCert, an AttestContent and their signatures, and a REVEAL
   (12.10)
-- an encrypted file of two chunks with Padmé padding (12.11)
-- a HistoryArchive, a TransferRef, a backup key of a given generation
-  and a wrapped backup key (12.13)
+- an encrypted file of two chunks with Padmé padding, and a history
+  archive encrypted under its own label (12.11)
+- a HistoryArchive split over two archives with `more`, with an
+  ArchivedFile, a TransferRef, a backup key of a given generation and a
+  WrappedKey (12.13)
 - a safety number, as digits and as QR text (12.14)
-- a RisalaReport (5.8)
+- a RisalaReport, and a ReportedPost whose `frank_key` is wrong (5.8)
+
+Each format also needs cases that MUST fail, so that implementations
+can show that they reject them:
+
+- a file cut short at a chunk boundary, two chunks swapped, the
+  last-chunk flag on a middle chunk, an extra chunk after the last, a
+  wrong version byte, an archive decrypted with the file label, padding
+  that is not zero, a plain text longer than Padmé of 8 plus its length,
+  and a length larger than the plain text (12.11)
+- a franking tag that does not match (12.9)
+- a wrapped backup key unwrapped with the wrong generation, uid or
+  blob-ref (12.13)
+- a split archive whose later part has a `more` of its own (12.13)
+
+For the cipher suite (12.2), implementations run the known-answer tests
+published with X-Wing [XWING], ML-KEM [FIPS203] and ML-DSA [FIPS204],
+and those of RFC 8439 for ChaCha20-Poly1305 and RFC 5869 for HKDF.

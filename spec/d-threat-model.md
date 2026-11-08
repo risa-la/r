@@ -21,19 +21,30 @@ active.
 
 - Can: see every connection's network address and timing, which
   mailboxes each connection follows, push subscriptions, the size and
-  pseudonym of each post, sign-ins, KeyPackage fetches, watched
-  presence, and which device got a Welcome. See the members, display
-  names and topic of public rooms. Join a public room under an identity
-  of its own and read it from then on, in view of its members. Withhold,
-  delay and reorder posts, refuse service, drop mailboxes and rooms,
-  and mute pseudonyms. Link anonymous connections to signed-in ones by
-  address and timing (Section 14).
+  pseudonym of each post, sign-ins, KeyPackage fetches and how many
+  devices each identity has, watched presence, and which device got a
+  Welcome. See file uploads and who downloads them, the size and timing
+  of blobs and backups, and backup generations. See the members,
+  display names and topic of public rooms. Join a public room under an
+  identity of its own and read it from then on, in view of its members.
+  Withhold, delay and reorder posts, refuse service, drop mailboxes and
+  rooms, and mute pseudonyms. Hold back a member's last messages
+  unnoticed. Choose which of two concurrent commits wins in a private
+  conversation, and refuse a commit forever. Set the roles and settings
+  that newcomers to a public room see, by accepting a commit that
+  members' devices reject, which they warn about. Swap the group behind
+  a public room's name, which devices that knew the room notice. Send
+  or hold back GONE for guests. Serve an older backup of the same
+  generation. Link anonymous connections to signed-in ones by address
+  and timing (Section 14).
 - Cannot: read any message, file, private display name or topic. Learn
   who sent a post, or who is in a direct conversation or a private room,
-  except by the links above. Add anyone to a conversation, change a
-  room's roles or settings, change or forge a message, replay one
-  unnoticed, or hide a gap in one member's messages. Reset an identity
-  or add a device to one. Read history, since it keeps none beyond
+  except by the links above. Add anyone to a conversation, change the
+  roles or settings of a room for its members' devices, change or forge
+  a message, replay one unnoticed, or hide a gap in one member's
+  messages once a later message from that member arrives. Reset an
+  identity or add a device to one. Serve a backup of an older generation
+  to a restoring device. Read history, since it keeps none beyond
   retention.
 
 **The controller of an identity's domain**, which includes the server
@@ -59,28 +70,40 @@ that hosts an identity.
 
 - Can: read and leak the conversation from when it joined. Post invalid
   commits, which cost others some work (7.2). Within its role, invite,
-  kick, ban, delete and change settings. Make a transcript that proves
-  nothing to others, since members can forge each other's messages for
-  third parties. In an epochal group, prove a message to others until
-  its period key is published, or later if it timestamped the message's
-  hash in public beforehand.
+  kick, ban, delete and change settings. Remove others' stale leaves,
+  within the limits of 12.7. Commit in up to 3 epochs in a row, then
+  about once every 10 minutes. Make a transcript that proves nothing to
+  others, since members can forge each other's messages for third
+  parties. In an epochal group, prove a message to others until its
+  period key is published, or later if it timestamped the message's
+  hash in public beforehand. Post abuse and report it to operators as
+  someone else's.
 - Cannot: post as another member to the other members, make another
   member's leaf look confirmed, read anything sent after it is removed,
-  or add new identities to a room without a role that allows it.
+  post or act on a role it has lost after the commit that removed or
+  demoted it, or add new identities to a room without a role that
+  allows it. Get anyone banned by operators on a report alone. Learn a
+  member's network address by sharing a file from a host of its own,
+  unless that member chooses to fetch it.
 
 **A guest,** or anyone who opens anonymous connections.
 
 - Can: join public rooms that allow guests, and post where `guests` is
-  `write`. Use up server resources within proof of work and rate limits.
-- Cannot: take part in direct conversations or private rooms, or appear
-  as anything but an unverified guest.
+  `write`. Open a report conversation with an owner or moderator of such
+  a room, if they accept it, to send reports (5.8). Use up server
+  resources within proof of work and rate limits.
+- Cannot: take part in private rooms or in other direct conversations,
+  send anything but reports in a report conversation, or appear as
+  anything but an unverified guest.
 
 **Someone who steals a device,** or compromises one for a while.
 
 - Can: read the history stored on it, and everything sent to its groups
   until its leaves are removed. Use its device-signing key to add a
-  device, which the key log shows. Read the backup made with the backup
-  key it holds, until the next generation.
+  device, which the key log shows. Read the backups made with the backup
+  key it holds, and make backups with it, until the next generation.
+  Send the identity's other devices made-up history for gaps they ask
+  it to fill, which they show as copied from it.
 - Cannot: read messages whose keys the device had already deleted, or
   messages sent after the device's leaves are removed, or after the
   device itself commits fresh keys, once the attacker has lost access
@@ -89,8 +112,9 @@ that hosts an identity.
 
 **Someone who gets the recovery key.**
 
-- Can: control the identity: replace its devices, and read its newest
-  backup.
+- Can: control the identity: replace its devices, and read every backup
+  the server has kept, including replaced and deleted ones, since the
+  server is not trusted to delete them.
 - Cannot: read conversations without joining them as a new device, which
   the identity's contacts see.
 
@@ -121,34 +145,101 @@ that hosts an identity.
 
 ### D.3. Accepted Risks
 
-- **No Tor in this version.** The server sees every connection's network
-  address and timing, and can link anonymous connections to signed-in
-  ones by them. On small servers, sealed sending hides little from an
-  operator who looks.
-- **Presence stays on the server.** It knows when each identity is
-  online. Presence is off by default; an identity that turns it on is
-  shown to anyone on the server who asks (8.3).
-- **Public rooms show their membership** to the server and to anyone who
-  joins, so that the server can check commits and serve light clients.
-  A light client also tells the server its leaf.
-- **Delayed deniability in large rooms.** In epochal groups, a message is
-  deniable only once its period key is out, up to a day and an hour
-  later, and a member who timestamps a message in public before then
-  can prove it later.
-- **Few post-quantum witnesses.** Clients count only ML-DSA-44
+Each risk is marked **Mitigated**, where this document limits it, or
+**Open**, where it stands as written.
+
+- **No Tor in this version** (Open). The server sees every connection's
+  network address and timing, and can link anonymous connections to
+  signed-in ones by them. On small servers, sealed sending hides little
+  from an operator who looks.
+- **Presence stays on the server** (Mitigated: off by default). It knows
+  when each identity is online. Presence is off by default; an identity
+  that turns it on is shown to anyone on the server who asks (8.3).
+- **Public rooms show their membership** (Open) to the server and to
+  anyone who joins, so that the server can check commits and serve light
+  clients. A light client also tells the server its leaf.
+- **Delayed deniability in large rooms** (Open). In epochal groups, a
+  message is deniable only once its period key is out, up to a day and
+  an hour later, and a member who timestamps a message in public before
+  then can prove it later.
+- **Few post-quantum witnesses** (Open). Clients count only ML-DSA-44
   cosignatures (4.5), and few public witnesses may offer them at first.
   Until enough do, a client's witness list is short, and k colluding
   witnesses are easier to find.
-- **Classical parts.** TLS certificates and push encryption still use
-  classical algorithms.
-- **Metadata from KeyPackages, Welcomes and watch lists.** The server
-  sees whose KeyPackages are fetched, which device gets a Welcome, and
-  whose presence is watched.
-- **The key log lists identities.** Anyone can list the uids whose
-  records a log holds.
-- **Backups are not forward secret.**
-- **New constructions.** Pairwise and epochal confirmation, send tokens
-  with "the first valid commit wins", and pseudonyms are this document's
-  own, and have not yet been reviewed or formally modelled.
-- **Sizes are not yet measured.** The room limits may change once ML-DSA
-  and X-Wing have been measured on phones.
+- **Classical parts** (Open). TLS certificates and push encryption still
+  use classical algorithms.
+- **Metadata from KeyPackages, Welcomes and watch lists** (Mitigated:
+  devices fetch KeyPackages on anonymous connections). The server sees
+  whose KeyPackages are fetched, how many devices an identity has, which
+  device gets a Welcome, and whose presence is watched.
+- **The key log lists identities** (Open). Anyone can list the uids
+  whose records a log holds.
+- **Backups are not forward secret** (Open). Whoever gets the recovery
+  key reads every backup the server kept. Within a generation, a server
+  can serve an older backup, and a device shows only its age.
+- **New constructions** (Open until reviewed). Pairwise and epochal
+  confirmation, send tokens with "the first valid commit wins", and
+  pseudonyms are this document's own, and have not yet been reviewed or
+  formally modelled. So are commit streaks and the stale-leaf median
+  (12.7).
+- **Sizes are not yet measured** (Open). The room limits may change once
+  ML-DSA and X-Wing have been measured on phones.
+- **Metadata from files, blobs and backups** (Open). The server sees
+  uploads per mailbox and who downloads them, the size and timing of
+  blobs and backups, and how often an identity moves to a new backup
+  generation.
+- **Withheld tails and commit order** (Mitigated: gaps show once a later
+  message arrives, and streaks limit one committer). The server can hold
+  back a member's last messages unnoticed, choose between concurrent
+  commits in private conversations, and refuse a commit forever.
+- **Public room roles for newcomers** (Mitigated: members' devices
+  warn). A server that accepts an invalid commit sets the roles that
+  devices joining afterwards see.
+- **Guest names are reused** (Open). A server can forge or withhold
+  GONE, and a guest uid in a report conversation says nothing about
+  which guest of that name was in the room.
+
+### D.4. Assumptions
+
+The claims above rest on these assumptions. If one fails, so do the
+claims that depend on it.
+
+- **ML-DSA-44** [FIPS204] is existentially unforgeable under chosen
+  message attack: key file records, sign-ins, device bindings, leaf
+  signatures, period certificates and the key log's checkpoints.
+- **X-Wing** [XWING] is IND-CCA secure as long as either ML-KEM-768 or
+  X25519 holds, and, for the deniability of pairwise confirmation,
+  plaintext-aware, so that a ciphertext does not show who made it.
+- **ChaCha20-Poly1305** [RFC8439] is IND-CPA and INT-CTXT secure under
+  keys that are never used with the same nonce twice: messages, files,
+  archives, pairing messages and wrapped backup keys.
+- **HMAC-SHA-384** [RFC2104] is a PRF, and, for franking, a binding
+  commitment to the content under its key.
+- **SHA-384** is collision resistant: `file-hash`, blob-refs, device
+  ids, record chains and send token hashes.
+- **HKDF-SHA384** [RFC5869] is a PRF and a randomness extractor: master
+  keys, backup keys, pairing keys and confirmation keys.
+- **MLS** [RFC9420] gives its stated security with this cipher suite,
+  and the OpenMLS implementation follows it.
+- **Witnesses.** Fewer than k of each client's n witnesses collude with
+  a log (4.5).
+- **The WebPKI** issues certificates for a domain only to whoever
+  controls it, for fetching key files (4.4).
+- **Devices** keep their stored keys and history away from other
+  software, and their clocks within minutes of the right time.
+
+### D.5. Changes
+
+- **draft-03** (2026-11-08): the zero-trust redesign. First version of
+  this appendix.
+- **draft-03, review round 1** (2026-11-09): commit streaks and the
+  stale-leaf median (12.3, 12.7); seq-ordered roles and a bounded
+  past-epoch window (12.9); checks before rejoining a public room
+  (12.7); backup generations from the key log, and restored and
+  transferred history marked as such (12.13); WANT before a transfer;
+  files in archives as blobs; version bytes and labels for files,
+  archives, TransferRefs and wrapped keys (12.11, 12.13); report
+  conversations for guests (5.8, 12.7); reports are not evidence
+  against an identity (5.8); downloads only from the server's own
+  origins without asking (12.11); this appendix's risk statuses and
+  assumptions.

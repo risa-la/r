@@ -73,4 +73,4 @@ Section 12.9, in the file for Section 12.
 | [a-checking-a-server-by-hand.md](a-checking-a-server-by-hand.md) | Appendix A | Checking a server and its fingerprint from a terminal |
 | [b-test-vectors.md](b-test-vectors.md) | Appendix B | Test vectors, and the ones still to come |
 | [c-push-gateways.md](c-push-gateways.md) | Appendix C | How push works with Apple's and Google's services (informative) |
-| [d-threat-model.md](d-threat-model.md) | Appendix D | Adversaries, what each can and cannot do, non-goals and accepted risks (informative) |
+| [d-threat-model.md](d-threat-model.md) | Appendix D | Adversaries, what each can and cannot do, non-goals, accepted risks, assumptions and changes (informative) |
