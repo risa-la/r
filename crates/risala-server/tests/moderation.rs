@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Session, command, value};
+use common::{Session, command, exchange, expect, join, value};
 use risala_server::testing::{TestIdentity, TestServer};
 
 /// Presence changes held for an hour, so that no PRESENCE line turns up.
@@ -50,39 +50,6 @@ async fn people_and_op(server: &TestServer, names: &[&str]) -> (Session, TestIde
     let op = server.identity("op@example.net");
     s.add("op", server.sign_in(&op).await);
     (s, op)
-}
-
-/// `who` joins `room`, and its JOIN, the settings and the OK are read.
-/// Returns the OK.
-async fn join(s: &mut Session, who: &str, room: &str) -> String {
-    let lines = command(s.client(who), &format!("join {room}")).await;
-    let ok = lines.last().unwrap().clone();
-    assert!(ok.starts_with("OK id="), "{who}: {lines:?}");
-    ok
-}
-
-/// Reads one line from `who` and checks it against the pattern.
-async fn expect(s: &mut Session, who: &str, want: &str) {
-    let got = common::recv(s.client(who)).await;
-    s.check(who, want, &got);
-}
-
-/// Sends `line` as `who`, and checks that every line up to the final OK or
-/// ERR matches `want`, in order. A pattern that starts with `*` matches a
-/// line that ends with the rest, and `*` alone matches any line.
-async fn exchange(s: &mut Session, who: &str, line: &str, want: &[&str]) {
-    s.client(who).send(line).await.unwrap();
-    for w in want {
-        let got = common::recv(s.client(who)).await;
-        if let Some(end) = w.strip_prefix('*') {
-            assert!(
-                got.ends_with(end),
-                "{who}: {line}: expected\n  {w}\ngot\n  {got}"
-            );
-        } else {
-            s.check(who, w, &got);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

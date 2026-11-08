@@ -125,6 +125,39 @@ impl Session {
     }
 }
 
+/// `who` joins `room`, and its JOIN, the settings and the OK are read.
+/// Returns the OK.
+pub async fn join(s: &mut Session, who: &str, room: &str) -> String {
+    let lines = command(s.client(who), &format!("join {room}")).await;
+    let ok = lines.last().unwrap().clone();
+    assert!(ok.starts_with("OK id="), "{who}: {lines:?}");
+    ok
+}
+
+/// Reads one line from `who` and checks it against the pattern.
+pub async fn expect(s: &mut Session, who: &str, want: &str) {
+    let got = recv(s.client(who)).await;
+    s.check(who, want, &got);
+}
+
+/// Sends `line` as `who`, and checks that every line up to the final OK or
+/// ERR matches `want`, in order. A pattern that starts with `*` matches a
+/// line that ends with the rest, and `*` alone matches any line.
+pub async fn exchange(s: &mut Session, who: &str, line: &str, want: &[&str]) {
+    s.client(who).send(line).await.unwrap();
+    for w in want {
+        let got = recv(s.client(who)).await;
+        if let Some(end) = w.strip_prefix('*') {
+            assert!(
+                got.ends_with(end),
+                "{who}: {line}: expected\n  {w}\ngot\n  {got}"
+            );
+        } else {
+            s.check(who, w, &got);
+        }
+    }
+}
+
 /// Receives a line, checking that it parses as a server line.
 pub async fn recv(client: &mut TestClient) -> String {
     let line = client.expect_line().await.unwrap();
