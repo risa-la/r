@@ -137,7 +137,11 @@ impl PublicGroup {
             ratchet_tree,
             verifiable_group_info,
             proposal_store,
-            LeafNodeLifetimePolicy::Verify,
+            // risala: the lifetimes of leaves already in the tree are not
+            // checked (the spec, 12.5), so that one device offline past its
+            // KeyPackage's lifetime does not stop a server from taking the
+            // room's state.
+            LeafNodeLifetimePolicy::Skip,
         )?;
 
         public_group

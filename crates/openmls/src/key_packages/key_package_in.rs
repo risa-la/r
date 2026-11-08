@@ -138,6 +138,29 @@ impl KeyPackageIn {
         crypto: &impl OpenMlsCrypto,
         protocol_version: ProtocolVersion,
     ) -> Result<KeyPackage, KeyPackageVerifyError> {
+        self.validate_inner(crypto, protocol_version, true)
+    }
+
+    /// risala: as [`Self::validate`], but without checking the lifetime
+    /// against the clock. Used for the KeyPackages of Add proposals in
+    /// messages a member or a server processes: risala checks their
+    /// lifetimes against the time of the post that carries them, so that
+    /// every device reaches the same answer however late it processes the
+    /// commit (the spec, 12.5). A lifetime must still be present.
+    pub(crate) fn validate_without_lifetime(
+        self,
+        crypto: &impl OpenMlsCrypto,
+        protocol_version: ProtocolVersion,
+    ) -> Result<KeyPackage, KeyPackageVerifyError> {
+        self.validate_inner(crypto, protocol_version, false)
+    }
+
+    fn validate_inner(
+        self,
+        crypto: &impl OpenMlsCrypto,
+        protocol_version: ProtocolVersion,
+        check_lifetime: bool,
+    ) -> Result<KeyPackage, KeyPackageVerifyError> {
         // We first need to verify the LeafNode inside the KeyPackage
         let leaf_node = self.payload.leaf_node.clone().into_verifiable_leaf_node();
 
@@ -193,7 +216,11 @@ impl KeyPackageIn {
 
         // Ensure validity of the life time extension in the leaf node.
         if let Some(life_time) = key_package.payload.leaf_node.life_time() {
-            life_time.validate()?;
+            // risala: the clock is not checked here for Add proposals; see
+            // `validate_without_lifetime`.
+            if check_lifetime {
+                life_time.validate()?;
+            }
         } else {
             // This assumes that we only verify key packages with leaf nodes
             // that were created for the key package.

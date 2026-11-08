@@ -162,6 +162,17 @@ impl AuthenticatedContent {
         epoch: GroupEpoch,
         signer: &impl Signer,
     ) -> Result<Self, LibraryError> {
+        Self::new_join_proposal_with_aad(proposal, group_id, epoch, vec![], signer)
+    }
+
+    /// risala: a join proposal with authenticated data.
+    pub(crate) fn new_join_proposal_with_aad(
+        proposal: Proposal,
+        group_id: GroupId,
+        epoch: GroupEpoch,
+        aad: Vec<u8>,
+        signer: &impl Signer,
+    ) -> Result<Self, LibraryError> {
         let body = FramedContentBody::Proposal(proposal);
 
         let content_tbs = FramedContentTbs::new(
@@ -169,7 +180,7 @@ impl AuthenticatedContent {
             group_id,
             epoch,
             Sender::NewMemberProposal,
-            vec![].into(),
+            aad.into(),
             body,
         );
 

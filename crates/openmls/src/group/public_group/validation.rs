@@ -402,7 +402,12 @@ impl PublicGroup {
             }
 
             // https://validation.openmls.tech/#valn0202
-            self.validate_leaf_node(add_proposal.add_proposal().key_package().leaf_node())?;
+            // risala: without the lifetime, which risala checks against the
+            // time of the post that carries the commit (the spec, 12.5).
+            self.validate_leaf_node_inner(
+                add_proposal.add_proposal().key_package().leaf_node(),
+                LeafNodeLifetimePolicy::Skip,
+            )?;
         }
         Ok(())
     }

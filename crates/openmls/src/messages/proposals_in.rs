@@ -174,7 +174,10 @@ impl AddProposalIn {
         protocol_version: ProtocolVersion,
         ciphersuite: Ciphersuite,
     ) -> Result<AddProposal, ValidationError> {
-        let key_package = self.key_package.validate(crypto, protocol_version)?;
+        // risala: lifetimes are checked by risala against the post's time.
+        let key_package = self
+            .key_package
+            .validate_without_lifetime(crypto, protocol_version)?;
         // Verify that the ciphersuite is valid
         if key_package.ciphersuite() != ciphersuite {
             return Err(ValidationError::InvalidAddProposalCiphersuite);

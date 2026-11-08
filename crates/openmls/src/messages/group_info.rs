@@ -97,7 +97,9 @@ impl VerifiableGroupInfo {
     /// Get (unverified) signer of the verifiable group info.
     ///
     /// Note: This method should only be used when necessary to verify the group info signature.
-    pub(crate) fn signer(&self) -> LeafNodeIndex {
+    // risala: public, for a resync commit and the server's check of a
+    // public room's GroupInfo (the spec, 12.6, 12.7).
+    pub fn signer(&self) -> LeafNodeIndex {
         self.payload.signer
     }
 

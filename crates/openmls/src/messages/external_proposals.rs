@@ -60,6 +60,30 @@ impl JoinProposal {
     }
 }
 
+impl JoinProposal {
+    /// risala: as [`JoinProposal::new`], with `aad` as the proposal's
+    /// authenticated data, since risala puts a RisalaAAD on everything a
+    /// device posts (the spec, 12.9).
+    pub fn new_with_aad<Storage: StorageProvider>(
+        key_package: KeyPackage,
+        group_id: GroupId,
+        epoch: GroupEpoch,
+        aad: Vec<u8>,
+        signer: &impl Signer,
+    ) -> Result<MlsMessageOut, ProposeAddMemberError<Storage::Error>> {
+        AuthenticatedContent::new_join_proposal_with_aad(
+            Proposal::add(AddProposal { key_package }),
+            group_id,
+            epoch,
+            aad,
+            signer,
+        )
+        .map(PublicMessage::from)
+        .map(MlsMessageOut::from)
+        .map_err(ProposeAddMemberError::from)
+    }
+}
+
 impl ExternalProposal {
     /// Creates an external GroupContextExtensions proposal. For delivery services requesting to update the group context extensions.
     /// This proposal will have to be committed later by a group member.

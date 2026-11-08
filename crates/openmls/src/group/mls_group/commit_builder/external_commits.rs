@@ -75,6 +75,8 @@ pub struct ExternalCommitBuilder {
     config: MlsGroupJoinConfig,
     validate_lifetimes: LeafNodeLifetimePolicy,
     aad: Vec<u8>,
+    // risala: other leaves the external commit removes (a resync commit).
+    removals: Vec<LeafNodeIndex>,
 }
 
 impl MlsGroup {
@@ -122,6 +124,17 @@ impl ExternalCommitBuilder {
         self
     }
 
+    /// risala: has the external commit remove these leaves too, by value.
+    /// RFC 9420 lets an external commit remove only the joiner's own earlier
+    /// leaf; risala's resync commit also removes the leaf whose commit the
+    /// room's devices could not apply (the spec, 12.7), and the members
+    /// check that it removes nothing else. OpenMLS leaves that check to the
+    /// application when it processes an external commit.
+    pub fn with_removals(mut self, removals: Vec<LeafNodeIndex>) -> Self {
+        self.removals = removals;
+        self
+    }
+
     /// Skip the validation of lifetimes in leaf nodes in the ratchet tree.
     /// Note that only the leaf nodes are checked that were never updated.
     ///
@@ -151,6 +164,7 @@ impl ExternalCommitBuilder {
             mut config,
             aad,
             validate_lifetimes,
+            removals,
         } = self;
 
         let group_ciphersuite = verifiable_group_info.ciphersuite();
@@ -267,8 +281,18 @@ impl ExternalCommitBuilder {
             ))
         });
 
+        // risala: the other removals, unless they name that leaf already.
+        let own_removed = match &remove_proposal {
+            Some(Proposal::Remove(r)) => Some(r.removed),
+            _ => None,
+        };
+        let extra_removals = removals
+            .into_iter()
+            .filter(move |index| Some(*index) != own_removed)
+            .map(|removed| Proposal::remove(RemoveProposal { removed }));
         let inline_proposals = inline_proposals
             .chain(remove_proposal)
+            .chain(extra_removals)
             .map(|p| {
                 QueuedProposal::from_proposal_and_sender(
                     ciphersuite,
