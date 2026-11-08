@@ -795,6 +795,46 @@ async fn unregister_deletes_a_hosted_identity() {
     );
 }
 
+/// Two hosted operators deleting each other at once do not wait for each
+/// other for ever: each waits for the other's connections to finish their
+/// commands, so the second to come is refused.
+#[tokio::test]
+async fn two_operators_unregistering_each_other() {
+    let mut w = World::new();
+    let (mut ann, _) = w.register("ann", 1).await;
+    let (mut ben, _) = w.register("ben", 2).await;
+    for who in ["ann", "ben"] {
+        assert_eq!(
+            w.admin(&format!("admin op {who}@example.org")).await,
+            ["OK"]
+        );
+    }
+    let a: Request = "admin unregister ben@example.org".parse().unwrap();
+    let b: Request = "admin unregister ann@example.org".parse().unwrap();
+    let both = async { tokio::join!(w.h.hub.command(ann.id, a), w.h.hub.command(ben.id, b)) };
+    tokio::time::timeout(std::time::Duration::from_secs(10), both)
+        .await
+        .expect("the two UNREGISTERs wait for each other");
+
+    let (ann_lines, ben_lines) = (ann.lines(), ben.lines());
+    let refused = || {
+        vec![
+            "ERR forbidden the identity is being deleted".to_owned(),
+            "<close> BYE identity deleted".to_owned(),
+        ]
+    };
+    let (deleted, kept) = if ann_lines == ["OK"] {
+        assert_eq!(ben_lines, refused());
+        ("ben@example.org", "ann@example.org")
+    } else {
+        assert_eq!(ann_lines, refused());
+        assert_eq!(ben_lines, ["OK"]);
+        ("ann@example.org", "ben@example.org")
+    };
+    assert!(w.h.store.identity(&uid(deleted)).unwrap().is_none());
+    assert!(w.h.store.identity(&uid(kept)).unwrap().is_some());
+}
+
 // ---------------------------------------------------------------------------
 // Server settings (10.6)
 

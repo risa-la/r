@@ -729,6 +729,7 @@ impl Inner {
                 uid: None,
                 detached: false,
                 gate: Arc::default(),
+                unregistering: false,
                 sign_in_timer: timer,
                 typing: HashMap::new(),
             },

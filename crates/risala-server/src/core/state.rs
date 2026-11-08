@@ -313,6 +313,11 @@ pub(crate) struct ConnEntry {
     /// Held by each command while it runs, and by the clean-up after the
     /// connection closes, so that the clean-up never overlaps a command.
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
+    /// The connection is running an UNREGISTER or ADMIN UNREGISTER (4.8,
+    /// 10.5), which waits for the gates of the deleted identity's
+    /// connections. Set and read under the registry's lock, so that two
+    /// such commands never wait for each other's gates.
+    pub(crate) unregistering: bool,
     /// The task that closes the connection if it does not sign in (4.1).
     pub(crate) sign_in_timer: Option<tokio::task::AbortHandle>,
     /// When the connection last had a TYPING passed on, by conversation id

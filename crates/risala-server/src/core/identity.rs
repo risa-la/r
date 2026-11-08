@@ -41,6 +41,12 @@ const UNPUBLISH_RETRIES: [Option<Duration>; 3] = [
 /// The window of `limits.registrations_per_hour` (13).
 pub(super) const REGISTRATION_WINDOW: Duration = Duration::from_secs(60 * 60);
 
+/// UNREGISTER of an identity that is being deleted already, or whose
+/// connections are deleting one (4.8, 10.5).
+fn being_deleted() -> Fail {
+    fail(ErrorCode::Forbidden, "the identity is being deleted")
+}
+
 fn auth_failed(message: &str) -> Fail {
     fail(ErrorCode::AuthFailed, message)
 }
@@ -627,14 +633,28 @@ impl Inner {
             let mut reg = self.reg();
             let user = reg.user(uid);
             let conns: Vec<ConnId> = {
-                let mut state = user.lock();
+                let state = user.lock();
                 if state.ending {
                     // Another device is deleting it already.
-                    return Err(fail(ErrorCode::Forbidden, "the identity is being deleted"));
+                    return Err(being_deleted());
                 }
-                state.ending = true;
                 state.conns.iter().map(|c| c.handle.id()).collect()
             };
+            // This waits for the gates of the identity's connections below.
+            // If one of them is itself deleting an identity, perhaps this
+            // one's, it may be waiting for this connection's gate: refuse,
+            // rather than wait for each other for ever. Both look under the
+            // registry's lock, so the second to come is refused.
+            let busy = conns
+                .iter()
+                .any(|conn| *conn != me && reg.conns.get(conn).is_some_and(|c| c.unregistering));
+            if busy {
+                return Err(being_deleted());
+            }
+            user.lock().ending = true;
+            if let Some(entry) = reg.conns.get_mut(&me) {
+                entry.unregistering = true;
+            }
             let mut gates = Vec::new();
             for conn in conns {
                 if let Some(entry) = reg.conns.get_mut(&conn) {
@@ -651,7 +671,8 @@ impl Inner {
         // BLOCK or MSG that stores something for the identity, must not
         // store it after it has been forgotten. Holding their gates, this
         // waits for them, and they start nothing new until it is done.
-        // None of them waits for anything this holds, so this ends.
+        // None of them waits for anything this holds, an UNREGISTER having
+        // been refused above, so this ends.
         let mut held = Vec::with_capacity(gates.len());
         for gate in gates {
             held.push(gate.lock_owned().await);
@@ -669,6 +690,9 @@ impl Inner {
             let conns: Vec<ConnId> = user.lock().conns.iter().map(|c| c.handle.id()).collect();
             for conn in conns {
                 reg.detach(conn, BYE_UNREGISTERED);
+            }
+            if let Some(entry) = reg.conns.get_mut(&me) {
+                entry.unregistering = false;
             }
             // The entry stays marked, so that a sign-in that pinned it
             // before now fails (4.8). The registry forgets it, so that a
