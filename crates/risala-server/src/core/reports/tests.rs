@@ -209,6 +209,26 @@ async fn what_may_be_reported() {
     report(&h, &mut sam, "report #general 8").await;
 }
 
+/// A guest may report a message sent under its name before its session
+/// started: another guest's (5.3).
+#[tokio::test]
+async fn a_guest_may_report_an_earlier_guests_message_under_its_name() {
+    let mut h = harness();
+    h.clock.advance(std::time::Duration::from_secs(1));
+    let mut spammer = h.guest("spammer").await;
+    report(&h, &mut spammer, "report #general 5").await;
+    h.send(&spammer, "join #general").await;
+    h.send(&spammer, "msg #general mine").await;
+    spammer.lines();
+    expect(
+        &h,
+        &mut spammer,
+        "report #general 9",
+        "ERR forbidden you cannot report your own message",
+    )
+    .await;
+}
+
 async fn expect(h: &Harness, c: &mut Client, cmd: &str, want: &str) {
     h.send(c, cmd).await;
     assert_eq!(c.lines(), [want], "{cmd}");

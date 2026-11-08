@@ -227,7 +227,9 @@ impl Inner {
         else {
             return Err(fail(ErrorCode::NotFound, "no such message"));
         };
-        if event.from == *uid {
+        // A guest's name may have been someone else's before its session
+        // (5.3): their messages are not its own.
+        if self.is_author(uid, &event) {
             return Err(fail(
                 ErrorCode::Forbidden,
                 "you cannot report your own message",
