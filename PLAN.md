@@ -1131,6 +1131,24 @@ Open:
       has a leaf, retrying KEYPKG GET from time to time and on
       reconnect, or until that device joins by external commit.
       Messages sent before then could never be read by the other side.
+      Built as: the rule holds whenever the group's current epoch has no
+      leaf of the other participant, including after all of theirs were
+      removed. The entries stay queued, in order, and show as
+      `OutboxStatus::Held` once KEYPKG GET on the connection found
+      nothing. It is asked again every five minutes
+      (`SyncConfig::peer_retry`) and at once on each connection. A device
+      of theirs that signs in usually joins first, by external commit,
+      since SYNC lists the conversation with head 0. The CLI's `send`
+      says the message is held, and `log` shows it.
+    - **Key files count as work in flight.** `wait_synced` also waits for
+      key files being fetched, so that a CLI command does not end between
+      applying a commit and sending what waited for its leaves to be
+      confirmed.
+    - **The flaky typing test** was another program on the machine
+      probing new ports on 127.0.0.1 with HTTP, which the scripted test
+      server counted as the client connecting again. It now ignores
+      connections that do not start with TLS. The client was right: it
+      never reconnected after `disconnect`.
 
 48. **Server follow-ups for M5a** (4.8, 10.4, 12.5, 12.6), on 2026-11-08.
     Implementation choices, no spec change:
