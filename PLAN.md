@@ -788,6 +788,14 @@ Open:
     operator. The `id` tag of report lines is optional when parsing, so
     older servers' lines still parse.
 
+39. **Follow-ups from the M4 client fixes** (3.2, 5.3, 6.1), confirmed
+    with the user on 2026-11-08:
+    - JOIN's OK carries `role=`, as INFO's does, so a room's creator
+      learns at once that it owns the room.
+    - MSG may carry `id` with the conversation's id, as DELETE may. A
+      different id gets `not-found`. The cid is checked first (7.6).
+    - Done on a short branch, `m4-followups`, before M5a.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
