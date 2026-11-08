@@ -7,6 +7,13 @@ struct SentMessage: Equatable {
     let text: String
 }
 
+struct OutboxAction: Equatable {
+    enum Kind { case retry, discard }
+    let kind: Kind
+    let messageID: Message.ID
+    let roomID: Room.ID
+}
+
 /// Suspends each call until the test finishes it; `starts` signals when a call begins.
 @MainActor
 final class PendingCalls<Value: Sendable> {
@@ -34,11 +41,33 @@ final class PendingCalls<Value: Sendable> {
     }
 }
 
-/// An in-memory library: sends append to room history and reach every subscribed timeline.
+/// One timeline subscription: it shows a room's history from `lowest` up.
+@MainActor
+private final class FakeTimeline {
+    let roomID: Room.ID
+    let continuation: AsyncThrowingStream<TimelineBatch, any Error>.Continuation
+    var lowest: Int
+
+    init(
+        roomID: Room.ID, continuation: AsyncThrowingStream<TimelineBatch, any Error>.Continuation,
+        lowest: Int
+    ) {
+        self.roomID = roomID
+        self.continuation = continuation
+        self.lowest = lowest
+    }
+
+    var isAtStart: Bool { lowest == 0 }
+
+    func yield(_ changes: [TimelineChange]) {
+        continuation.yield(TimelineBatch(changes: changes, isAtStart: isAtStart))
+    }
+}
+
+/// An in-memory library: sends append to room history and reach every subscribed timeline
+/// as index changes, the way librisala reports them.
 @MainActor
 final class TestChatClient: ChatClient {
-    private typealias Changes = AsyncThrowingStream<TimelineChange, any Error>
-
     /// Room loads always wait for the test.
     let roomLoads = PendingCalls<[Room]>()
     let sends = PendingCalls<Void>()
@@ -48,8 +77,11 @@ final class TestChatClient: ChatClient {
     private let holdsSends: Bool
     private let holdsOlderPages: Bool
     private(set) var sent: [SentMessage] = []
+    private(set) var outboxActions: [OutboxAction] = []
+    private(set) var olderRequests = 0
     private var history: [Room.ID: [Message]] = [:]
-    private var subscribers: [Room.ID: [Changes.Continuation]] = [:]
+    private var timelines: [FakeTimeline] = []
+    private var roomListeners: [AsyncThrowingStream<[Room], any Error>.Continuation] = []
     private var nextMessageID = 0
 
     init(holdsSends: Bool = false, holdsOlderPages: Bool = false) {
@@ -58,69 +90,128 @@ final class TestChatClient: ChatClient {
         (subscriptions, subscribed) = AsyncStream.makeStream(of: Room.ID.self)
     }
 
+    /// Adds history without telling subscribers, as a change they missed would.
     func seed(_ texts: [String], in roomID: Room.ID) {
-        history[roomID, default: []] += texts.map(makeMessage)
+        history[roomID, default: []] += texts.map { makeMessage($0) }
     }
 
     /// Delivers a message from another participant.
     func receive(_ text: String, in roomID: Room.ID) {
-        let message = makeMessage(text)
-        history[roomID, default: []].append(message)
-        push(.appended([message]), to: roomID)
+        append(makeMessage(text), to: roomID)
     }
 
-    func push(_ change: TimelineChange, to roomID: Room.ID) {
-        for subscriber in subscribers[roomID, default: []] {
-            subscriber.yield(change)
+    /// Adds the account's message that failed to send.
+    @discardableResult
+    func addFailed(_ text: String, in roomID: Room.ID) -> Message {
+        let message = makeMessage(text, delivery: .failed(possiblySent: false))
+        append(message, to: roomID)
+        return message
+    }
+
+    func push(_ batch: TimelineBatch, to roomID: Room.ID) {
+        for timeline in timelines where timeline.roomID == roomID {
+            timeline.continuation.yield(batch)
         }
     }
 
     func failTimeline(in roomID: Room.ID, with error: any Error) {
-        for subscriber in subscribers.removeValue(forKey: roomID) ?? [] {
-            subscriber.finish(throwing: error)
+        for timeline in timelines where timeline.roomID == roomID {
+            timeline.continuation.finish(throwing: error)
+        }
+        timelines.removeAll { $0.roomID == roomID }
+    }
+
+    /// Replaces the room list for every room subscriber.
+    func pushRooms(_ rooms: [Room]) {
+        for listener in roomListeners {
+            listener.yield(rooms)
         }
     }
 
-    func makeMessage(_ text: String) -> Message {
+    func makeMessage(_ text: String, delivery: Message.Delivery = .sent) -> Message {
         nextMessageID += 1
         return Message(
             id: Message.ID(rawValue: "m\(nextMessageID)"), author: "test", text: text,
-            sentAt: Date(timeIntervalSince1970: 0))
+            sentAt: Date(timeIntervalSince1970: 0), isOwn: delivery != .sent,
+            delivery: delivery)
     }
 
     // Witnesses default to the protocol's nonisolated requirements; keep them on MainActor.
-    @MainActor func loadRooms() async throws -> [Room] {
-        try await roomLoads.wait()
+    @MainActor func rooms() async throws -> RoomListSubscription {
+        let initial = try await roomLoads.wait()
+        let (updates, continuation) = AsyncThrowingStream<[Room], any Error>.makeStream()
+        roomListeners.append(continuation)
+        return RoomListSubscription(initial: initial, updates: updates)
     }
 
     @MainActor func timeline(in roomID: Room.ID, limit: Int) async throws -> TimelineSubscription {
-        let (changes, continuation) = Changes.makeStream()
-        subscribers[roomID, default: []].append(continuation)
+        let (batches, continuation) = AsyncThrowingStream<TimelineBatch, any Error>.makeStream()
+        let all = history[roomID, default: []]
+        let timeline = FakeTimeline(
+            roomID: roomID, continuation: continuation, lowest: max(0, all.count - limit))
+        timelines.append(timeline)
         subscribed.yield(roomID)
-        let initial = page(in: roomID, before: history[roomID, default: []].count, limit: limit)
-        return TimelineSubscription(initial: initial, changes: changes)
-    }
-
-    @MainActor func messages(in roomID: Room.ID, before cursor: PageCursor, limit: Int) async throws
-        -> MessagePage
-    {
-        if holdsOlderPages { try await olderPages.wait() }
-        return page(in: roomID, before: Int(cursor.rawValue) ?? 0, limit: limit)
+        return TimelineSubscription(
+            initial: Array(all[timeline.lowest...]),
+            isAtStart: timeline.isAtStart,
+            batches: batches,
+            loadOlder: { [self, timeline] limit in
+                try await self.loadOlder(timeline, limit: limit)
+            })
     }
 
     @MainActor func send(_ text: String, to roomID: Room.ID) async throws {
         if holdsSends { try await sends.wait() }
         sent.append(SentMessage(roomID: roomID, text: text))
-        let message = makeMessage(text)
-        history[roomID, default: []].append(message)
-        push(.appended([message]), to: roomID)
+        append(makeMessage(text), to: roomID)
     }
 
-    /// Cursors are history offsets, opaque to the model under test.
-    private func page(in roomID: Room.ID, before end: Int, limit: Int) -> MessagePage {
-        let start = max(0, end - limit)
-        return MessagePage(
-            messages: Array(history[roomID, default: []][start..<end]),
-            olderCursor: start > 0 ? PageCursor(rawValue: String(start)) : nil)
+    /// Marks the message as sending again, in place.
+    @MainActor func retry(_ messageID: Message.ID, in roomID: Room.ID) async throws {
+        outboxActions.append(OutboxAction(kind: .retry, messageID: messageID, roomID: roomID))
+        guard let index = history[roomID]?.firstIndex(where: { $0.id == messageID }),
+            let old = history[roomID]?[index]
+        else { return }
+        let message = Message(
+            id: old.id, author: old.author, text: old.text, sentAt: old.sentAt, isOwn: true,
+            delivery: .sending)
+        history[roomID]?[index] = message
+        for timeline in timelines where timeline.roomID == roomID && index >= timeline.lowest {
+            timeline.yield([.update(message, at: index - timeline.lowest)])
+        }
+    }
+
+    @MainActor func discard(_ messageID: Message.ID, in roomID: Room.ID) async throws {
+        outboxActions.append(OutboxAction(kind: .discard, messageID: messageID, roomID: roomID))
+        guard let index = history[roomID]?.firstIndex(where: { $0.id == messageID }) else {
+            return
+        }
+        history[roomID]?.remove(at: index)
+        for timeline in timelines where timeline.roomID == roomID {
+            if index >= timeline.lowest {
+                timeline.yield([.remove(at: index - timeline.lowest)])
+            } else {
+                timeline.lowest -= 1
+            }
+        }
+    }
+
+    private func append(_ message: Message, to roomID: Room.ID) {
+        history[roomID, default: []].append(message)
+        let index = history[roomID, default: []].count - 1
+        for timeline in timelines where timeline.roomID == roomID {
+            timeline.yield([.insert(message, at: index - timeline.lowest)])
+        }
+    }
+
+    /// Delivers the page below the subscription's window as inserts at the top.
+    private func loadOlder(_ timeline: FakeTimeline, limit: Int) async throws {
+        olderRequests += 1
+        if holdsOlderPages { try await olderPages.wait() }
+        let all = history[timeline.roomID, default: []]
+        let lowest = max(0, timeline.lowest - limit)
+        let page = all[lowest..<timeline.lowest]
+        timeline.lowest = lowest
+        timeline.yield(page.enumerated().map { TimelineChange.insert($0.element, at: $0.offset) })
     }
 }

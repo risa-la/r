@@ -41,7 +41,7 @@ struct RootView: View {
             default: break
             }
         }
-        .task(id: roomsLoadAttempt) { await rooms.load() }
+        .task(id: roomsLoadAttempt) { await rooms.observe() }
     }
 
     private var selection: Binding<Room.ID?> {

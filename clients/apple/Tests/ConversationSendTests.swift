@@ -81,6 +81,38 @@ struct ConversationSendTests {
         #expect(model.draft == "hello")
     }
 
+    /// Catches a failed message whose retry or removal goes to the wrong message or room,
+    /// or that can be retried when it has not failed.
+    @Test(.timeLimit(.minutes(1)))
+    func failedMessagesCanBeRetriedOrRemoved() async {
+        let client = TestChatClient()
+        let roomID = rooms[0].id
+        let first = client.addFailed("lost", in: roomID)
+        let second = client.addFailed("lost too", in: roomID)
+        let model = ConversationViewModel(client: client)
+        model.select(rooms[0])
+        let observing = Task { await model.observeTimeline() }
+        #expect(await eventually { model.messages.map(\.id) == [first.id, second.id] })
+
+        await model.retry(model.messages[0])
+        #expect(await eventually { model.messages.first?.delivery == .sending })
+        #expect(model.messages.first?.id == first.id)
+        // Sending again, so there is nothing to retry or remove.
+        await model.retry(model.messages[0])
+        await model.discard(model.messages[0])
+
+        await model.discard(model.messages[1])
+        #expect(await eventually { model.messages.map(\.id) == [first.id] })
+        #expect(
+            client.outboxActions == [
+                OutboxAction(kind: .retry, messageID: first.id, roomID: roomID),
+                OutboxAction(kind: .discard, messageID: second.id, roomID: roomID),
+            ])
+        #expect(model.busyMessages.isEmpty)
+        observing.cancel()
+        await observing.value
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func cancellationKeepsDraftWithoutError() async {
         let client = TestChatClient(holdsSends: true)

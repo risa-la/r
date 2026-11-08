@@ -407,6 +407,342 @@
           }
         }
       }
+    },
+    "This message was deleted.": {
+      "comment": "Placeholder for a deleted message.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This message was deleted."
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "حُذفت هذه الرسالة."
+          }
+        }
+      }
+    },
+    "edited": {
+      "comment": "Marker after the time of an edited message.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "edited"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "معدّلة"
+          }
+        }
+      }
+    },
+    "Sending…": {
+      "comment": "Status of the account's message that the server has not stored yet.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sending…"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "جارٍ الإرسال…"
+          }
+        }
+      }
+    },
+    "Not sent.": {
+      "comment": "Status of the account's message that failed to send.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not sent."
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "لم تُرسل."
+          }
+        }
+      }
+    },
+    "May not have been sent.": {
+      "comment": "Status of the account's message whose connection dropped before the server answered.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "May not have been sent."
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ربما لم تُرسل."
+          }
+        }
+      }
+    },
+    "Remove": {
+      "comment": "Button that removes a message that failed to send, without sending it.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "إزالة"
+          }
+        }
+      }
+    },
+    "%lld people reacted %@": {
+      "comment": "Accessibility label for a reaction on a message; %lld is how many people, %@ the reaction, usually an emoji.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%1$lld person reacted %2$@"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%1$lld people reacted %2$@"
+                }
+              }
+            }
+          }
+        },
+        "ar": {
+          "variations": {
+            "plural": {
+              "zero": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "لم يتفاعل أحد بـ %2$@"
+                }
+              },
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "تفاعل شخص واحد بـ %2$@"
+                }
+              },
+              "two": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "تفاعل شخصان بـ %2$@"
+                }
+              },
+              "few": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "تفاعل %1$lld أشخاص بـ %2$@"
+                }
+              },
+              "many": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "تفاعل %1$lld شخصًا بـ %2$@"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "تفاعل %1$lld شخص بـ %2$@"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%@ joined": {
+      "comment": "Timeline event; %@ is a person.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ joined"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ انضم"
+          }
+        }
+      }
+    },
+    "%@ left": {
+      "comment": "Timeline event; %@ is a person.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ left"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ غادر"
+          }
+        }
+      }
+    },
+    "%@ invited %@": {
+      "comment": "Timeline event; the first %@ invited the second.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ invited %2$@"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ دعا %2$@"
+          }
+        }
+      }
+    },
+    "%@ removed %@": {
+      "comment": "Timeline event; the first %@ removed the second from the room.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ removed %2$@"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ أخرج %2$@"
+          }
+        }
+      }
+    },
+    "%@ banned %@": {
+      "comment": "Timeline event; the first %@ banned the second from the room.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ banned %2$@"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ حظر %2$@"
+          }
+        }
+      }
+    },
+    "%@ unbanned %@": {
+      "comment": "Timeline event; the first %@ lifted the second's ban.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ unbanned %2$@"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ رفع الحظر عن %2$@"
+          }
+        }
+      }
+    },
+    "%@ changed the room settings": {
+      "comment": "Timeline event; %@ is a person.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ changed the room settings"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ غيّر إعدادات الغرفة"
+          }
+        }
+      }
+    },
+    "%@ changed the role of %@": {
+      "comment": "Timeline event; the first %@ changed the second's role in the room.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ changed the role of %2$@"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ غيّر دور %2$@"
+          }
+        }
+      }
+    },
+    "%@ did something this app cannot show yet": {
+      "comment": "Timeline event of a kind this app does not know; %@ is a person.",
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ did something this app cannot show yet"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ قام بشيء لا يستطيع هذا التطبيق عرضه بعد"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

@@ -17,6 +17,8 @@ final class RoomsViewModel {
 
     private static let logger = Logger(subsystem: "la.risa.apple", category: "rooms")
     private let client: (any ChatClient)?
+    /// Counts `observe()` calls; only the latest one changes the state.
+    private var observation = 0
     private(set) var state: State
 
     var rooms: [Room] {
@@ -28,24 +30,40 @@ final class RoomsViewModel {
         state = client == nil ? .disconnected : .idle
     }
 
-    func load() async {
+    /// Loads the cached rooms, then follows changes to them until cancelled; run it
+    /// from a view-owned task. Rooms already shown stay while it subscribes again,
+    /// and a later call takes over from an earlier one.
+    func observe() async {
         guard let client else { return }
-        switch state {
-        case .disconnected, .loading, .loaded, .empty: return
-        case .idle, .failed: break
+        observation += 1
+        let current = observation
+        if state == .idle || state == .failed {
+            state = .loading
         }
-        state = .loading
         do {
-            let rooms = try await client.loadRooms()
+            let subscription = try await client.rooms()
+            guard observation == current else { return }
             try Task.checkCancellation()
-            state = rooms.isEmpty ? .empty : .loaded(rooms)
+            show(subscription.initial)
+            for try await rooms in subscription.updates {
+                guard observation == current else { return }
+                try Task.checkCancellation()
+                show(rooms)
+            }
         } catch {
-            if Task.isCancelled || error is CancellationError {
-                state = .idle
-            } else {
-                Self.logger.error("loadRooms failed; code=\((error as NSError).code)")
-                state = .failed
+            guard observation == current else { return }
+            let cancelled = Task.isCancelled || error is CancellationError
+            if state == .loading {
+                state = cancelled ? .idle : .failed
+            }
+            if !cancelled {
+                // Rooms already shown stay readable; the next observe() follows again.
+                Self.logger.error("rooms failed; code=\((error as NSError).code)")
             }
         }
+    }
+
+    private func show(_ rooms: [Room]) {
+        state = rooms.isEmpty ? .empty : .loaded(rooms)
     }
 }

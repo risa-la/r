@@ -100,10 +100,11 @@ binding signatures.
 
 | Capability | Required behavior at the Apple adapter boundary |
 | --- | --- |
-| Initial rooms | Return local room summaries without waiting for connection/authentication/sync. Distinguish no cached rooms from unavailable or failed storage. Paginate large room collections. |
-| Initial timeline | Read a bounded recent page for the selected room. Start with a requested limit of 50; the library enforces a maximum and returns an opaque older-page cursor. |
-| Older messages | Fetch only when requested. Preserve library-provided ordering and stable identifiers; do not rebuild history or generate replacement IDs in Swift. |
-| Live updates | Provide an ordered snapshot plus subsequent changes without a subscription gap. Define revision/reset behavior so reconnects cannot silently miss or duplicate updates. Bound buffering and provide a resnapshot path if a consumer falls behind. |
+| Initial rooms | Return local room summaries without waiting for connection/authentication/sync, then each changed room list (joins, parts, new conversations). Distinguish no cached rooms from unavailable or failed storage. Paginate large room collections. Room IDs identify the account too. |
+| Initial timeline | Read a bounded recent window for the selected room. Start with a requested limit of 50; the library enforces a maximum. Report whether the window reaches the start of the conversation's history. |
+| Older messages | Fetch only when requested, through the timeline subscription; older items arrive as its changes. Preserve library-provided ordering and stable identifiers, including an outgoing message's ID once the server stores it; do not rebuild history or generate replacement IDs in Swift. |
+| Live updates | Provide an ordered snapshot plus subsequent batches of index changes (reset, insert, update, remove) without a subscription gap. Edits, deletions, reactions, and history filled in mid-timeline arrive as such changes. Bound buffering; reset when a consumer falls behind or a reconnect may have missed changes. A batch that does not fit makes the client subscribe again. |
+| Outgoing messages | Show accepted messages as sending until stored. A message that fails after acceptance stays, marked failed, until the person retries or removes it. |
 | Connection status | Report connection/sync progress separately from cached content. Reconnecting or refresh failure must not blank an already-readable timeline. |
 | Cancellation | Cancel obsolete page reads/subscriptions when changing rooms or closing windows. Discard late results from previous selections. Cancelling one window must not tear down the shared session. |
 | Execution | No blocking storage/FFI work on MainActor. Async APIs must actually suspend or execute work on the library executor; async syntax alone is insufficient. |

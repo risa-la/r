@@ -83,7 +83,7 @@ struct ConversationRandomizedTests {
                     model.draft == draft,
                     model.canSend == canSend,
                     client.sent == expectedSends,
-                    await eventually({ model.messages.map(\.text) == visible })
+                    await eventually({ model.messages.compactMap(\.text) == visible })
                 else {
                     run.fail("Conversation invariant failed in window \(index)")
                     return

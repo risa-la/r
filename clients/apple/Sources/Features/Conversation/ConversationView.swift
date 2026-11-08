@@ -51,9 +51,13 @@ struct ConversationView: View {
             MessageTimeline(
                 messages: model.messages,
                 sendRevision: model.sendRevision,
-                canLoadOlder: model.canLoadOlder,
+                hasOlder: model.hasOlderMessages,
                 isLoadingOlder: model.isLoadingOlder,
-                loadOlder: model.loadOlderMessages
+                busyMessages: model.busyMessages,
+                loadOlder: model.loadOlderMessages,
+                // Like sends, these survive the room view disappearing.
+                retry: { message in _ = Task { [model] in await model.retry(message) } },
+                discard: { message in _ = Task { [model] in await model.discard(message) } }
             )
         }
     }

@@ -10,4 +10,7 @@ import SwiftUI
 enum Colors {
     static let content: HierarchicalShapeStyle = .primary
     static let supportingContent: HierarchicalShapeStyle = .secondary
+    /// Something went wrong, such as a message that was not sent. Pair it with a
+    /// word or symbol.
+    static let failure: Color = .red
 }
