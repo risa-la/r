@@ -15,9 +15,6 @@ use std::str::FromStr;
 use crate::error::ParseError;
 use crate::line::{is_tag_value, is_tag_value_char, is_token};
 
-#[doc(hidden)]
-pub use crate::m5a::HistoryMode;
-
 // ---------------------------------------------------------------------------
 // Limits
 

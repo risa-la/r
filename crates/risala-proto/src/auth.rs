@@ -476,18 +476,6 @@ impl SecretKey {
         signature
     }
 
-    /// Signs an MLS SignContent [RFC9420, 5.1.2] for SignWithLabel, with
-    /// the deterministic variant of ML-DSA.Sign: the signatures a device
-    /// makes in MLS (12.2) and on encrypted messages (12.8).
-    ///
-    /// `sign_content` must be exactly one encoded SignContent whose label
-    /// starts with [`MLS_LABEL_PREFIX`]; anything else gets `None`. So the
-    /// key signs only the challenge bytes of 4.5 and MLS SignContent,
-    /// which cannot be read as each other (12.2).
-    pub fn sign_mls(&self, sign_content: &[u8]) -> Option<Signature> {
-        is_mls_sign_content(sign_content).then(|| self.sign(sign_content, [0; 32]))
-    }
-
     /// RisalaSign (4.3): signs the RisalaSignContent of `label` and
     /// `content` with the hedged variant of ML-DSA.Sign, which mixes in
     /// `rnd`. Pass 32 bytes from a cryptographically secure random
@@ -519,44 +507,6 @@ impl SecretKey {
             .expect("ML-DSA-44 signing with an empty context does not fail");
         Signature::from_bytes(signature.as_ref())
     }
-}
-
-/// The start of every label that MLS signs with, in SignContent
-/// [RFC9420, 5.1.2] (12.2, 12.8).
-pub const MLS_LABEL_PREFIX: &str = "MLS 1.0 ";
-
-/// Whether `bytes` is exactly one encoded SignContent, `opaque label<V>`
-/// then `opaque content<V>` [RFC9420, 5.1.2], whose label starts with
-/// [`MLS_LABEL_PREFIX`].
-fn is_mls_sign_content(bytes: &[u8]) -> bool {
-    let Some((label, rest)) = split_mls_vector(bytes) else {
-        return false;
-    };
-    let Some((_content, rest)) = split_mls_vector(rest) else {
-        return false;
-    };
-    rest.is_empty() && label.starts_with(MLS_LABEL_PREFIX.as_bytes())
-}
-
-/// Splits a variable-size vector [RFC9420, 2.1.2] off the front of
-/// `bytes`: its contents, then what follows.
-fn split_mls_vector(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (&first, rest) = bytes.split_first()?;
-    let high = usize::from(first & 0x3f);
-    let (len, rest) = match first >> 6 {
-        0 => (high, rest),
-        1 => {
-            let (&b, rest) = rest.split_first()?;
-            (high << 8 | usize::from(b), rest)
-        }
-        2 => {
-            let (b, rest) = rest.split_first_chunk::<3>()?;
-            let len = high << 24 | usize::from(b[0]) << 16 | usize::from(b[1]) << 8;
-            (len | usize::from(b[2]), rest)
-        }
-        _ => return None,
-    };
-    (len <= rest.len()).then(|| rest.split_at(len))
 }
 
 /// A key pair expanded from a seed by ML-DSA.KeyGen_internal (FIPS 204,
@@ -1032,48 +982,6 @@ pub(crate) mod tests {
         let spec_sig: Signature = SIGNATURE.parse().unwrap();
         assert!(public.verify_challenge(HOST, &nonce(), UID, &spec_sig));
         assert!(public.verify_challenge("CHAT.example.org", &nonce(), "ALICE@example.org", &sig));
-    }
-
-    #[test]
-    fn signs_only_mls_sign_content() {
-        let key = appendix_b_key();
-        let public = key.public_key();
-        let verifies = |message: &[u8], sig: &Signature| {
-            let vk = mldsa::MLDSA44VerificationKey::new(*public.as_bytes());
-            let sig = mldsa::MLDSA44Signature::new(*sig.as_bytes());
-            mldsa::verify(&vk, message, b"", &sig).is_ok()
-        };
-
-        // SignContent { label = "MLS 1.0 risala message", content }, with
-        // one-byte length prefixes, then with a two-byte one for content.
-        let mut short = vec![22];
-        short.extend_from_slice(b"MLS 1.0 risala message");
-        let mut long = short.clone();
-        short.push(3);
-        short.extend_from_slice(b"abc");
-        long.extend_from_slice(&[0x41, 0x00]);
-        long.extend_from_slice(&[7; 256]);
-        for content in [&short, &long] {
-            let sig = key.sign_mls(content).unwrap();
-            assert!(verifies(content, &sig));
-            // Deterministic.
-            assert_eq!(key.sign_mls(content), Some(sig));
-        }
-
-        // The challenge bytes, a label without the prefix, trailing or
-        // missing bytes, and a four-byte length past the end all fail.
-        assert_eq!(key.sign_mls(SIGNED.as_bytes()), None);
-        let mut other = vec![8];
-        other.extend_from_slice(b"MLS 1.1 ");
-        other.push(0);
-        assert_eq!(key.sign_mls(&other), None);
-        let mut trailing = short.clone();
-        trailing.push(0);
-        assert_eq!(key.sign_mls(&trailing), None);
-        assert_eq!(key.sign_mls(&short[..short.len() - 1]), None);
-        assert_eq!(key.sign_mls(&[0x80, 0, 0, 9, 1]), None);
-        assert_eq!(key.sign_mls(&[0xc0]), None);
-        assert_eq!(key.sign_mls(&[]), None);
     }
 
     #[test]

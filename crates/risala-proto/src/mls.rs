@@ -31,14 +31,6 @@ use crate::error::ParseError;
 use crate::frame::MAX_LONG_CLIENT_LINE;
 use crate::names::BlobRef;
 
-#[doc(hidden)]
-pub use crate::m5a::{
-    BACKUP_BLOB_LEN, BACKUP_INFO_PREFIX, BackupBlob, Ciphertext, CommitMessage, Content,
-    DEFAULT_BACKUP_LIMIT, FRANK_KEY_LEN, FRANK_LEN, Frank, FrankKey, Franking, HISTORY_KEY_LABEL,
-    HISTORY_KEY_LEN, MAX_GROUP_LEAVES, MESSAGE_KEY_LABEL, MESSAGE_SIGNATURE_LABEL, MIN_PAYLOAD_LEN,
-    RECOVERY_SIGNING_INFO_PREFIX,
-};
-
 /// The MLS cipher suite of every conversation: X-Wing, HKDF-SHA384,
 /// ChaCha20-Poly1305, SHA-384 and ML-DSA-44 (12.2, 15). It is the value
 /// draft-ietf-mls-pq-ciphersuites-07 requests.

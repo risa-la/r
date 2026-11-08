@@ -53,7 +53,6 @@ pub mod fingerprint;
 pub mod frame;
 pub mod keyfile;
 pub mod line;
-mod m5a;
 pub mod mls;
 pub mod names;
 pub mod pairing;

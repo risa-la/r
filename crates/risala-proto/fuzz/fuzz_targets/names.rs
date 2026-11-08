@@ -17,7 +17,6 @@ use risala_proto::command::DropTarget;
 use risala_proto::error::ErrorCode;
 use risala_proto::fingerprint::Fingerprint;
 use risala_proto::frame::check_line;
-use risala_proto::keyfile::m5a::KeyEntry;
 use risala_proto::mls::{
     GroupId, GroupInfo, KeyPackage, KeyPackageRef, MlsMessage, OrBlob, PostToken, Pseudonym,
     RatchetTree, SendToken, TokenHash, Welcome, is_strict_base64,
@@ -122,7 +121,6 @@ fuzz_target!(|data: &[u8]| {
     round_trip::<Signature>(s);
     round_trip::<Nonce>(s);
     round_trip::<Fingerprint>(s);
-    round_trip::<KeyEntry>(s);
 
     let _ = Seq::parse_or_zero(s);
     let _ = Room::from_bare(s);

@@ -1,13 +1,10 @@
 //! Property tests for keys: the sign-in challenge and ML-DSA-44 values
-//! (SPEC 4.6, App. B), M5a's key files and fingerprints (2.2). M5a's key
-//! file tests go when `keyfile::m5a` does; draft-03's key files are
-//! tested in `props_identity.rs`.
+//! (SPEC 4.6, App. B) and fingerprints (2.2). Key files are tested in
+//! `props_identity.rs`.
 
-use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use proptest::collection::vec;
-use proptest::option;
 use proptest::prelude::*;
 use proptest::sample::Index;
 use risala_proto::auth::{
@@ -16,9 +13,6 @@ use risala_proto::auth::{
 };
 use risala_proto::error::ParseError;
 use risala_proto::fingerprint::Fingerprint;
-use risala_proto::keyfile::m5a::{
-    KeyEntry, KeyFile, MAX_KEY_FILE_BYTES, MAX_KEY_LABEL, MAX_KEY_LINE_BYTES, MAX_KEYS, SkipReason,
-};
 
 /// Explicit case counts keep `cargo test` fast in debug builds. Set
 /// `PROPTEST_CASES` to run every property with that many cases instead.
@@ -37,7 +31,7 @@ fn config(cases: u32) -> ProptestConfig {
 }
 
 /// Public keys made once, since deriving keys is slow in debug builds.
-/// More than `MAX_KEYS`, so that key files can overflow.
+/// Keys made from 96 seeds.
 const POOL_SIZE: usize = 96;
 
 fn pool() -> &'static [PublicKey] {
@@ -55,270 +49,6 @@ fn pool() -> &'static [PublicKey] {
 
 fn pool_key() -> impl Strategy<Value = PublicKey> {
     (0..POOL_SIZE).prop_map(|i| pool()[i].clone())
-}
-
-/// A character a person might put in a label: no control characters
-/// other than TAB.
-fn label_char() -> impl Strategy<Value = char> {
-    prop_oneof![
-        2 => Just(' '),
-        1 => Just('\t'),
-        8 => prop::char::range('!', '~'),
-        1 => prop::sample::select(vec!['é', '\u{a0}', '\u{2028}', '\u{3000}', '👋', 'م']),
-        1 => any::<char>().prop_filter("not a control character", |c| !c.is_control()),
-    ]
-}
-
-/// The label as `KeyEntry::new` keeps it: trimmed of spaces and TABs.
-fn trimmed(label: &str) -> &str {
-    label.trim_matches([' ', '\t'])
-}
-
-/// A label as a person might write one: printable text with spaces and
-/// TABs, including around it, at most `MAX_KEY_LABEL` bytes once
-/// trimmed (4.4).
-fn label() -> impl Strategy<Value = String> {
-    vec(label_char(), 0..40)
-        .prop_map(String::from_iter)
-        .prop_filter("fits the label limit", |l| {
-            trimmed(l).len() <= MAX_KEY_LABEL
-        })
-}
-
-/// A label over `MAX_KEY_LABEL` bytes once trimmed (4.4).
-fn long_label() -> impl Strategy<Value = String> {
-    vec(label_char(), 17..100)
-        .prop_map(String::from_iter)
-        .prop_filter("over the label limit", |l| trimmed(l).len() > MAX_KEY_LABEL)
-}
-
-/// Blanks around fields, as 4.4's lenient parsing allows.
-fn blanks(min: usize) -> impl Strategy<Value = String> {
-    vec(prop_oneof![Just(' '), Just('\t')], min..min + 3).prop_map(String::from_iter)
-}
-
-/// The key type, in any case.
-fn key_type() -> impl Strategy<Value = String> {
-    prop::sample::select(vec!["mldsa44", "MLDSA44", "MlDsa44", "mLdSa44"]).prop_map(str::to_owned)
-}
-
-/// One line of a generated key file.
-#[derive(Debug, Clone)]
-enum KfLine {
-    Entry {
-        key: usize,
-        label: Option<String>,
-        line: String,
-    },
-    Comment(String),
-    Blank(String),
-    OtherType(String),
-    Malformed(String),
-}
-
-fn kf_line() -> impl Strategy<Value = KfLine> {
-    let entry = (
-        0..POOL_SIZE,
-        option::of(label()),
-        blanks(0),
-        key_type(),
-        blanks(1),
-        blanks(1),
-        blanks(0),
-    )
-        .prop_map(|(key, label, before, kt, sep1, sep2, after)| {
-            let mut line = format!("{before}{kt}{sep1}{}", pool()[key]);
-            if let Some(label) = &label {
-                line.push_str(&sep2);
-                line.push_str(label);
-            }
-            line.push_str(&after);
-            KfLine::Entry { key, label, line }
-        });
-    let malformed =
-        (0..POOL_SIZE, 0..7usize, key_type(), long_label()).prop_map(|(key, how, kt, long)| {
-            let k = pool()[key].to_string();
-            KfLine::Malformed(match how {
-                0 => kt,
-                1 => format!("{kt} {}", &k[..k.len() - 1]),
-                2 => format!("{kt} {k}A"),
-                3 => format!("{kt} {}", k.replace('=', "A")),
-                4 => format!("{kt} {k} bad\u{1}label"),
-                5 => format!("{kt} {k} {long}"),
-                _ => format!("{kt} {}", "A".repeat(PUBLIC_KEY_BASE64_LEN)),
-            })
-        });
-    prop_oneof![
-        8 => entry,
-        1 => "[ \t]{0,2}#[ -~]{0,20}".prop_map(KfLine::Comment),
-        1 => "[ \t]{0,3}".prop_map(KfLine::Blank),
-        1 => "(ed25519|mldsa65|mldsa44x|ssh-ed25519)[ \t][ -~]{0,30}".prop_map(KfLine::OtherType),
-        1 => malformed,
-    ]
-}
-
-fn kf_text(line: &KfLine) -> &str {
-    match line {
-        KfLine::Entry { line, .. } => line,
-        KfLine::Comment(s) | KfLine::Blank(s) | KfLine::OtherType(s) | KfLine::Malformed(s) => s,
-    }
-}
-
-/// Checks the invariants of any parsed key file: no more than
-/// `MAX_KEYS`, no repeated keys, and every entry's display line parses
-/// back as the same entry, alone or as a whole file.
-fn check_key_file(file: &KeyFile) -> Result<(), TestCaseError> {
-    prop_assert!(file.keys().len() <= MAX_KEYS);
-    let distinct: HashSet<_> = file.public_keys().collect();
-    prop_assert_eq!(distinct.len(), file.keys().len());
-    let mut lines = String::new();
-    for entry in file.keys() {
-        let line = entry.to_string();
-        prop_assert_eq!(line.parse::<KeyEntry>(), Ok(entry.clone()));
-        prop_assert!(!line.contains(['\n', '\r']));
-        prop_assert!(entry.label().is_none_or(|l| l.len() <= MAX_KEY_LABEL));
-        prop_assert!(line.len() + 2 <= MAX_KEY_LINE_BYTES);
-        lines.push_str(&line);
-        lines.push('\n');
-    }
-    let again = KeyFile::parse(&lines)?;
-    prop_assert_eq!(again.keys(), file.keys());
-    prop_assert!(again.skipped().is_empty());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Key files
-
-proptest! {
-    #![proptest_config(config(256))]
-
-    /// A key entry displays as one key file line that parses back to the
-    /// same entry, and the label is trimmed as `KeyEntry::new` documents
-    /// (4.4).
-    #[test]
-    fn key_entry_round_trips(
-        key in pool_key(),
-        label in option::of(label()),
-        before in blanks(0),
-        sep in blanks(1),
-        kt in key_type(),
-    ) {
-        let entry = KeyEntry::new(key.clone(), label.as_deref())?;
-        let want = label.as_deref().map(trimmed).filter(|l| !l.is_empty());
-        prop_assert_eq!(entry.label(), want);
-        prop_assert_eq!(entry.key(), &key);
-        let line = entry.to_string();
-        prop_assert_eq!(line.parse::<KeyEntry>(), Ok(entry.clone()));
-
-        // The same entry written loosely, and inside a file with CRLF.
-        let loose = format!("{before}{kt}{sep}{key}{sep}{}{before}", want.unwrap_or(""));
-        prop_assert_eq!(loose.parse::<KeyEntry>(), Ok(entry.clone()));
-        let file = KeyFile::parse(&format!("# comment\r\n\r\n{loose}\r\n"))?;
-        prop_assert_eq!(file.keys(), std::slice::from_ref(&entry));
-    }
-
-    /// A label with a control character other than TAB inside it is
-    /// rejected (4.4).
-    #[test]
-    fn key_entry_rejects_control_characters(
-        key in pool_key(),
-        a in "[a-z]{1,5}",
-        b in "[a-z]{1,5}",
-        c in prop_oneof![prop::char::range('\0', '\x08'), prop::char::range('\n', '\x1f'), Just('\x7f'), Just('\u{85}')],
-    ) {
-        let label = format!("{a}{c}{b}");
-        prop_assert!(matches!(KeyEntry::new(key, Some(&label)), Err(ParseError::BadSyntax(_))));
-    }
-
-    /// A label over 64 bytes once trimmed is `TooLong`, alone or on a key
-    /// file line, and a key file skips that line as malformed (4.4).
-    #[test]
-    fn key_entry_rejects_long_labels(key in pool_key(), label in long_label()) {
-        prop_assert_eq!(KeyEntry::new(key.clone(), Some(&label)), Err(ParseError::TooLong));
-        let line = format!("mldsa44 {key} {label}");
-        prop_assert_eq!(line.parse::<KeyEntry>(), Err(ParseError::TooLong));
-        let file = KeyFile::parse(&line)?;
-        prop_assert!(file.keys().is_empty());
-        prop_assert_eq!(&file.skipped()[0].reason, &SkipReason::Malformed(ParseError::TooLong));
-    }
-
-    /// A generated key file keeps exactly the first `MAX_KEYS` distinct
-    /// valid keys, in order, with their labels, and lists every other
-    /// line that is not blank or a comment as skipped (4.4).
-    #[test]
-    fn key_file_matches_model(lines in vec(kf_line(), 0..100), crlf in any::<bool>(), bom in any::<bool>()) {
-        let sep = if crlf { "\r\n" } else { "\n" };
-        let mut text = if bom { "\u{feff}".to_owned() } else { String::new() };
-        text.push_str(&lines.iter().map(kf_text).collect::<Vec<_>>().join(sep));
-
-        let mut want = Vec::new();
-        let mut want_skipped = Vec::new();
-        let mut seen = HashSet::new();
-        for (i, line) in lines.iter().enumerate() {
-            let line_no = i + 1;
-            match line {
-                KfLine::Entry { key, label, .. } => {
-                    if !seen.insert(*key) {
-                        want_skipped.push((line_no, "duplicate"));
-                    } else if want.len() == MAX_KEYS {
-                        want_skipped.push((line_no, "too many"));
-                    } else {
-                        want.push(KeyEntry::new(pool()[*key].clone(), label.as_deref())?);
-                    }
-                }
-                KfLine::Comment(_) | KfLine::Blank(_) => {}
-                KfLine::OtherType(_) => want_skipped.push((line_no, "other")),
-                KfLine::Malformed(_) => want_skipped.push((line_no, "malformed")),
-            }
-        }
-
-        let file = KeyFile::parse(&text)?;
-        prop_assert_eq!(file.keys(), want.as_slice());
-        let got_skipped: Vec<(usize, &str)> = file
-            .skipped()
-            .iter()
-            .map(|s| {
-                let kind = match s.reason {
-                    SkipReason::Duplicate => "duplicate",
-                    SkipReason::TooMany => "too many",
-                    SkipReason::OtherKeyType(_) => "other",
-                    SkipReason::Malformed(_) => "malformed",
-                };
-                (s.line, kind)
-            })
-            .collect();
-        prop_assert_eq!(got_skipped, want_skipped);
-        check_key_file(&file)?;
-    }
-
-    /// Any text either is over the size limit or parses into a key file
-    /// that keeps its invariants (4.4).
-    #[test]
-    fn any_key_file_is_safe(
-        text in prop_oneof![
-            any::<String>(),
-            vec(prop_oneof![
-                kf_line().prop_map(|l| kf_text(&l).to_owned()),
-                any::<String>(),
-                "[mMlLdDsSaA4 \t\r#A-Za-z0-9+/=]{0,60}",
-            ], 0..20).prop_map(|lines| lines.join("\n")),
-        ]
-    ) {
-        let file = KeyFile::parse(&text)?;
-        check_key_file(&file)?;
-    }
-}
-
-#[test]
-fn key_file_over_the_limit_is_too_long() {
-    let line = format!("mldsa44 {}\n", pool()[0]);
-    let text = line.repeat(MAX_KEY_FILE_BYTES / line.len() + 1);
-    assert!(text.len() > MAX_KEY_FILE_BYTES);
-    assert_eq!(KeyFile::parse(&text), Err(ParseError::TooLong));
-    let at_limit = &text[..MAX_KEY_FILE_BYTES];
-    let file = KeyFile::parse(at_limit).unwrap();
-    assert_eq!(file.keys().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +205,6 @@ proptest! {
         if let Ok(f) = s.parse::<Fingerprint>() {
             prop_assert_eq!(f.to_string(), s.to_ascii_lowercase());
         }
-        let _ = s.parse::<KeyEntry>();
         let _ = SecretKey::from_pkcs8_pem(&s);
     }
 

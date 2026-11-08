@@ -16,8 +16,6 @@
 //! for an HTTP response, under 4.4's rules for what is an outage and what
 //! makes the keys missing.
 
-pub mod m5a;
-
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
