@@ -102,8 +102,10 @@ impl KeyPkgCommand {
     /// The kinds of connection that may send it (Section 13).
     pub fn kinds(&self) -> Kinds {
         match self {
-            // Section 13's table; 12.5 says "any kind of connection".
-            KeyPkgCommand::Get { .. } => ANON | SIGNED,
+            // Section 13's table, guests included for their report
+            // conversations (4.2, 5.8); 12.5 says "any kind of
+            // connection", but new connections are not in the table.
+            KeyPkgCommand::Get { .. } => HAVING_A_KIND,
             _ => SIGNED,
         }
     }
@@ -173,15 +175,20 @@ pub struct BlobPermit {
 /// `BACKUP PUT`, `BACKUP GET` and `BACKUP DEL` (12.13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupCommand {
-    /// `BACKUP PUT <generation> <hash> <key>`: stores a backup, replacing
-    /// the identity's previous one.
+    /// `BACKUP PUT <generation> <hash> <key> [files=<list>]`: stores a
+    /// backup, replacing the identity's previous one.
     Put {
         /// The generation of the backup key that wraps `key`.
         generation: u32,
-        /// The blob-ref of the encrypted archive.
+        /// The blob-ref of the first archive.
         hash: BlobRef,
-        /// The archive's key, wrapped under the backup key.
+        /// The archives' key, a WrappedKey under the backup key. Its
+        /// length and version are the server's to check
+        /// ([`WrappedKey::check`], `ERR invalid`).
         key: WrappedKey,
+        /// `files=`: the blob-ref of the list of the backup's other blobs,
+        /// 48-byte hashes one after another. Needed only if there are any.
+        files: Option<BlobRef>,
     },
     /// `BACKUP GET`: replies with a BACKUP line, or `ERR not-found`.
     Get,
@@ -314,11 +321,13 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<Command, ParseEr
                 "PUT" => {
                     let generation = number_u32(&mut p)?;
                     let hash = tok(&mut p)?;
-                    let key = last(p)?;
+                    let key = tok(&mut p)?;
+                    let options = options(p, &["files"])?;
                     BackupCommand::Put {
                         generation,
                         hash,
                         key,
+                        files: opt(&options, "files")?,
                     }
                 }
                 "GET" => {
@@ -428,9 +437,13 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
                 generation,
                 hash,
                 key,
+                files,
             } = backup
             {
                 b.token(generation).token(hash).token(key);
+                if let Some(files) = files {
+                    b.option("files", files);
+                }
             }
         }
         _ => return false,

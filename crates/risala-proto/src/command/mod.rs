@@ -101,7 +101,7 @@ pub mod mailbox;
 pub use account::{BackupCommand, BlobPermit, KeyPkgCommand, PushCommand, WelcomeCommand};
 pub use admin::{AdminCommand, DropTarget};
 pub use identity::{GuestToken, PairCommand};
-pub use mailbox::PublicRoom;
+pub use mailbox::{CreateForm, PublicRoom};
 
 // ---------------------------------------------------------------------------
 // Request
@@ -300,18 +300,21 @@ pub enum Command {
     },
 
     // ---- 5.2
-    /// `CREATE <box> <group-id> <token-hash> [<room> <groupinfo> <tree>]`:
-    /// creates a mailbox for a group in epoch 0 (5.2). With the last
-    /// three tokens, it creates a public room (6.1).
+    /// `CREATE <box> <group-id> <token-hash> [epoch=<epoch>]` or
+    /// `CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>`:
+    /// creates a mailbox for a group in epoch 0 (5.2), or in epoch
+    /// `epoch` for a group that moves (7.8). The second form creates a
+    /// public room (6.1).
     Create {
         /// The new mailbox, from 16 new random bytes.
         mailbox: BoxName,
         /// The group's id.
         group_id: GroupId,
-        /// The SHA-384 hash of the group's send token for epoch 0.
+        /// The SHA-384 hash of the group's send token for the mailbox's
+        /// first epoch: 0, or `epoch`.
         token_hash: TokenHash,
-        /// The public room it creates, for the second form.
-        public: Option<PublicRoom>,
+        /// The second form's public room, or the first form's `epoch=`.
+        form: CreateForm,
     },
     /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]`:
     /// posts an MLS message to a mailbox (5.2).
@@ -414,6 +417,21 @@ pub enum Command {
         limit: Option<NonZeroU64>,
         /// A light client's leaf index in a public room (12.6).
         leaf: Option<u32>,
+    },
+
+    // ---- 7.2
+    /// `TOKEN <box> <epoch> <token> <hash>`: adds `hash` to the token set
+    /// of epoch `epoch + 1`, for a holder of a send token of `epoch`
+    /// (7.2).
+    Token {
+        /// The mailbox.
+        mailbox: BoxName,
+        /// The epoch of `token`.
+        epoch: u64,
+        /// A send token of `epoch`, checked as for POST (5.2).
+        token: SendToken,
+        /// The SHA-384 hash of a send token of `epoch + 1`.
+        hash: TokenHash,
     },
 
     // ---- 8.3
@@ -532,6 +550,7 @@ impl Command {
             Command::Follow { .. } => "FOLLOW",
             Command::Unfollow { .. } => "UNFOLLOW",
             Command::Fetch { .. } => "FETCH",
+            Command::Token { .. } => "TOKEN",
             Command::Presence { .. } => "PRESENCE",
             Command::Watch { .. } => "WATCH",
             Command::Whois { .. } => "WHOIS",
@@ -572,6 +591,11 @@ impl Command {
     /// Where a row depends on the command's parameters, so does the
     /// answer: INFO with a room, the two forms of CREATE, and PUSH with
     /// and without `box=`.
+    ///
+    /// Section 13 is followed where other sections say "any kind of
+    /// connection" more loosely: KEYPKG GET (12.5), WELCOME PUT and GET
+    /// (12.8), and WATCH, WHOIS and MEMBERS (8.3) are not for new
+    /// connections, the narrower reading.
     pub fn kinds(&self) -> Kinds {
         match self {
             Command::Info { room: None } => Kinds::ALL,
@@ -580,18 +604,25 @@ impl Command {
             | Command::Guest { .. }
             | Command::Auth { .. }
             | Command::Register { .. } => NEW,
-            Command::KeysPut { .. } | Command::Pair(_) => ANON | SIGNED,
+            Command::KeysPut { .. } | Command::Pair(_) => NEW | ANON | SIGNED,
             Command::Unregister { .. } => SIGNED,
-            Command::Create { public: None, .. } => ANON,
             Command::Create {
-                public: Some(_), ..
+                form: CreateForm::Private { .. },
+                ..
+            } => CONVERSING,
+            Command::Create {
+                form: CreateForm::Public(_),
+                ..
             } => SIGNED,
             Command::Post { .. } => CONVERSING,
             Command::Upload { .. } => ANON,
             Command::Report { .. } | Command::List { .. } => HAVING_A_KIND,
             Command::GroupInfo { .. } => CONVERSING,
             Command::Mute { .. } | Command::Unmute { .. } => SIGNED,
-            Command::Follow { .. } | Command::Unfollow { .. } | Command::Fetch { .. } => CONVERSING,
+            Command::Follow { .. }
+            | Command::Unfollow { .. }
+            | Command::Fetch { .. }
+            | Command::Token { .. } => CONVERSING,
             Command::Presence { .. } => SIGNED,
             Command::Watch { .. } | Command::Whois { .. } | Command::Members { .. } => {
                 HAVING_A_KIND
@@ -610,9 +641,10 @@ impl Command {
     ///
     /// - `already-authenticated` for ANON, GUEST, AUTH and REGISTER on a
     ///   connection that is already anonymous, a guest or signed in;
-    /// - `forbidden` for anything else a guest may not send;
-    /// - `not-authenticated` for anything else a new, anonymous or
-    ///   signed-in connection may not send;
+    /// - `not-authenticated` for anything else a new connection may not
+    ///   send (4.1);
+    /// - `wrong-connection` for anything else an anonymous, guest or
+    ///   signed-in connection may not send (3.7, 4.1, 13);
     /// - `bad-syntax` for a BLOB without `box=` and `token=` from an
     ///   anonymous or guest connection, which needs them (12.12).
     ///

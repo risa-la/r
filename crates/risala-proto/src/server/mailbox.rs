@@ -5,7 +5,7 @@ use super::ServerLine;
 use crate::binary::ReportData;
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params, Tags};
-use crate::mls::{MlsMessage, OrBlob};
+use crate::mls::{MlsMessage, OrBlob, Pseudonym};
 use crate::names::{BoxName, Id, Seq, Uid};
 use crate::parse::{bad, last, number, parse_tag, required_tag, text_max, tok};
 use crate::time::Timestamp;
@@ -51,13 +51,18 @@ impl Post {
 }
 
 /// A report to the operators (5.8):
-/// `@report=<id>;t=<timestamp>[;from=<uid>] REPORT <box> <report>`.
+/// `@report=<id>;t=<timestamp>;pseudonym=<pseudonym>[;from=<uid>] REPORT <box> <report>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// The `report` tag: the report's id.
     pub id: Id,
     /// The `t` tag: when the report was made.
     pub t: Timestamp,
+    /// The `pseudonym` tag: the pseudonym in the target post's RisalaAAD
+    /// (7.3), so that an operator can mute it with ADMIN MUTE. The target
+    /// is an application message, a PrivateMessage, so its pseudonym is
+    /// always 16 bytes (5.2).
+    pub pseudonym: Pseudonym,
     /// The `from` tag: the reporter, if they were signed in.
     pub from: Option<Uid>,
     /// The mailbox the reported posts are in.
@@ -129,12 +134,14 @@ pub(super) fn parse(
         "REPORT" => |tags, mut p| {
             let id = required_tag(tags, "report")?;
             let t = required_tag(tags, "t")?;
+            let pseudonym = required_tag(tags, "pseudonym")?;
             let from = parse_tag(tags, "from")?;
             let mailbox = tok(&mut p)?;
             let report = last(p)?;
             Ok(ServerLine::Report(Report {
                 id,
                 t,
+                pseudonym,
                 from,
                 mailbox,
                 report,
@@ -186,7 +193,9 @@ pub(super) fn write(line: &ServerLine, b: &mut LineBuilder) -> bool {
             b.token(mailbox).text(reason);
         }
         ServerLine::Report(report) => {
-            b.tag("report", &report.id).tag("t", report.t);
+            b.tag("report", &report.id)
+                .tag("t", report.t)
+                .tag("pseudonym", report.pseudonym);
             if let Some(from) = &report.from {
                 b.tag("from", from);
             }

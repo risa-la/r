@@ -4,7 +4,8 @@
 //! Every line in the second table of Section 13 parses into a
 //! [`ServerMessage`]: an envelope with the `ref` tag (3.6) around a
 //! [`ServerLine`]. Tags that belong to one kind of line, such as a post's
-//! `seq` and `t` (5.2) or a report's `report`, `t` and `from` (5.8), live
+//! `seq` and `t` (5.2) or a report's `report`, `t`, `pseudonym` and `from`
+//! (5.8), live
 //! in that line's type.
 //!
 //! ```
@@ -46,12 +47,13 @@
 //!   a PRESENCE line. They are not read, so their values are not checked
 //!   either. Serialising leaves them out.
 //! - **Tags that are read are checked.** A bad `ref`, `seq`, `t`,
-//!   `report`, `from` or `retry` value is an error, as is one of these
-//!   tags without a value.
+//!   `report`, `pseudonym`, `from` or `retry` value is an error, as is
+//!   one of these tags without a value.
 //! - **Posts (5.2).** A kept post has `seq` and `t`. A live post
 //!   (`live=yes`) has no `seq`; whether it has `t` the spec does not say,
 //!   so `t` is optional without `seq` and required with it.
-//! - **Reports (5.8)** need `report` and `t`; `from` is optional.
+//! - **Reports (5.8)** need `report`, `t` and `pseudonym`; `from` is
+//!   optional.
 //! - **MLS data and other binary values** are opaque: they only have to
 //!   be strict base64 of the right length, or a blob-ref where the spec
 //!   allows one ([`OrBlob`]).
@@ -68,8 +70,8 @@
 //!   folded (3.5). Serialising writes the canonical form, so a parsed line
 //!   in canonical form serialises back byte for byte.
 //!
-//! Tags are written in this order: `ref`, then `report`, `seq`, `t` and
-//! `from`, or `retry` on ERR. This reproduces every example in the spec.
+//! Tags are written in this order: `ref`, then `report`, `seq`, `t`,
+//! `pseudonym` and `from`, or `retry` on ERR. This reproduces every example in the spec.
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -91,7 +93,7 @@ pub mod response;
 
 pub use mailbox::{Post, Report};
 pub use notify::Notify;
-pub use response::{ErrResponse, Greeting, Host, Log, OkResponse, Register, Upload};
+pub use response::{ErrResponse, FileOrigin, Greeting, Host, Log, OkResponse, Register, Upload};
 
 // ---------------------------------------------------------------------------
 // The envelope
@@ -374,18 +376,22 @@ pub enum ServerLine {
     Welcome {
         /// The id the server gave it, for WELCOME DEL.
         id: Id,
-        /// The Welcome, AnnotatedWelcome or a blob that holds it.
+        /// The SealedWelcome, Welcome, AnnotatedWelcome or a blob that
+        /// holds it (12.6, 12.8).
         welcome: OrBlob<Welcome>,
     },
-    /// `BACKUP <generation> <hash> <key>`: in response to BACKUP GET
-    /// (12.13).
+    /// `BACKUP <generation> <hash> <key> [files=<list>]`: in response to
+    /// BACKUP GET (12.13).
     Backup {
         /// The generation of the backup key that wraps `key`.
         generation: u32,
-        /// The blob-ref of the encrypted archive.
+        /// The blob-ref of the first archive.
         hash: BlobRef,
-        /// The archive's key, wrapped.
+        /// The archives' key, a WrappedKey. A device checks its version
+        /// before it unwraps it ([`WrappedKey::check`]).
         key: WrappedKey,
+        /// `files=`: the blob-ref of the list of the backup's other blobs.
+        files: Option<BlobRef>,
     },
     /// `NOTICE <message...>`: information for people (8.4).
     Notice {

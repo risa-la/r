@@ -8,7 +8,7 @@ use super::ServerLine;
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params};
 use crate::names::Uid;
-use crate::parse::{last, number, number_u32, tok};
+use crate::parse::{last, number, number_u32, opt, options, tok};
 
 /// Parses the lines of this module; `None` for any other verb.
 pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<ServerLine, ParseError>> {
@@ -68,11 +68,13 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<ServerLine, Pars
         "BACKUP" => |mut p| {
             let generation = number_u32(&mut p)?;
             let hash = tok(&mut p)?;
-            let key = last(p)?;
+            let key = tok(&mut p)?;
+            let options = options(p, &["files"])?;
             Ok(ServerLine::Backup {
                 generation,
                 hash,
                 key,
+                files: opt(&options, "files")?,
             })
         },
         _ => return None,
@@ -117,8 +119,12 @@ pub(super) fn write(line: &ServerLine, b: &mut LineBuilder) -> bool {
             generation,
             hash,
             key,
+            files,
         } => {
             b.token(generation).token(hash).token(key);
+            if let Some(files) = files {
+                b.option("files", files);
+            }
         }
         _ => return false,
     }

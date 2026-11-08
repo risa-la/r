@@ -84,7 +84,7 @@ fn every_form() -> Vec<String> {
     );
     let key = zeros(65);
     let auth = zeros(16);
-    let wrapped = zeros(60);
+    let wrapped = zeros(61);
     vec![
         "INFO".into(),
         "INFO #general".into(),
@@ -98,6 +98,8 @@ fn every_form() -> Vec<String> {
         format!("PAIR GET {BOX}"),
         "UNREGISTER alice@example.org".into(),
         format!("CREATE {BOX} {gid} {th}"),
+        format!("CREATE {BOX} {gid} {th} epoch=1"),
+        format!("CREATE {BOX} {gid} {th} epoch=9223372036854775807"),
         format!("CREATE {BOX} {gid} {th} #general AAEABA== AAEC"),
         format!("CREATE {BOX} {gid} {th} #general {blob} {blob}"),
         format!("POST {BOX} {tok} AAEAAQ=="),
@@ -117,6 +119,8 @@ fn every_form() -> Vec<String> {
         format!("UNFOLLOW {BOX}"),
         format!("FETCH {BOX} after=0"),
         format!("FETCH {BOX} after=9120 limit=2 leaf=7"),
+        format!("TOKEN {BOX} 0 {tok} {th}"),
+        format!("TOKEN {BOX} 41 {tok} {th}"),
         "PRESENCE ON".into(),
         "PRESENCE OFF".into(),
         "WATCH".into(),
@@ -141,6 +145,7 @@ fn every_form() -> Vec<String> {
         format!("BLOB {blob} 0 box={BOX} token={tok}"),
         format!("BACKUP PUT 0 {blob} {wrapped}"),
         format!("BACKUP PUT 4294967295 {blob} {wrapped}"),
+        format!("BACKUP PUT 1 {blob} {wrapped} files={blob}"),
         "BACKUP GET".into(),
         "BACKUP DEL".into(),
         "ADMIN OPS".into(),
@@ -230,6 +235,7 @@ fn every_verb_is_covered() {
         "FOLLOW",
         "UNFOLLOW",
         "FETCH",
+        "TOKEN",
         "PRESENCE ON",
         "PRESENCE OFF",
         "WATCH",
@@ -338,6 +344,26 @@ fn arity() {
         "UNREGISTER".into(),
         format!("CREATE {BOX} {}", group_id()),
         format!("CREATE {BOX} {} {} #general", group_id(), token_hash()),
+        format!("CREATE {BOX} {} {} epoch=0", group_id(), token_hash()),
+        format!("CREATE {BOX} {} {} epoch=-1", group_id(), token_hash()),
+        format!("CREATE {BOX} {} {} epoch=01", group_id(), token_hash()),
+        format!(
+            "CREATE {BOX} {} {} epoch=1 epoch=2",
+            group_id(),
+            token_hash()
+        ),
+        format!("CREATE {BOX} {} {} room=#general", group_id(), token_hash()),
+        format!("CREATE {BOX} {} {} 7", group_id(), token_hash()),
+        format!(
+            "CREATE {BOX} {} {} #general AAEABA== AAEC epoch=1",
+            group_id(),
+            token_hash()
+        ),
+        format!(
+            "CREATE {BOX} {} {} epoch=1 #general AAEABA== AAEC",
+            group_id(),
+            token_hash()
+        ),
         format!(
             "CREATE {BOX} {} {} #general AAEABA==",
             group_id(),
@@ -364,6 +390,15 @@ fn arity() {
         format!("FETCH {BOX} after=0 limit=0"),
         format!("FETCH {BOX} after=0 leaf=4294967296"),
         format!("FETCH {BOX} after=0 leaf=-1"),
+        "TOKEN".into(),
+        format!("TOKEN {BOX} 41 {}", token()),
+        format!("TOKEN {BOX} 41 {} {} x", token(), token_hash()),
+        format!("TOKEN {BOX} -1 {} {}", token(), token_hash()),
+        format!("TOKEN {BOX} 01 {} {}", token(), token_hash()),
+        format!("TOKEN {BOX} 41 - {}", token_hash()),
+        format!("TOKEN {BOX} 41 {} {}", token_hash(), token_hash()),
+        format!("TOKEN {BOX} 41 {} {}", token(), token()),
+        format!("TOKEN {BOX} epoch=41 {} {}", token(), token_hash()),
         "PRESENCE".into(),
         "PRESENCE ON now".into(),
         "WATCH a@b.org c@d.org".into(),
@@ -385,7 +420,10 @@ fn arity() {
         format!("BLOB {} 1 box={BOX}", blob()),
         format!("BLOB {} 1 token={}", blob(), token()),
         format!("BACKUP PUT 0 {}", blob()),
-        format!("BACKUP PUT 4294967296 {} {}", blob(), zeros(60)),
+        format!("BACKUP PUT 4294967296 {} {}", blob(), zeros(61)),
+        format!("BACKUP PUT 0 {} {} {}", blob(), zeros(61), blob()),
+        format!("BACKUP PUT 0 {} {} files={}", blob(), zeros(61), zeros(48)),
+        format!("BACKUP PUT 0 {} {} hash={}", blob(), zeros(61), blob()),
         "BACKUP GET x".into(),
         "ADMIN".into(),
         "ADMIN OPS x".into(),
@@ -446,8 +484,8 @@ fn values_have_their_grammar() {
         ),
         format!("WELCOME PUT {} AAEABg==", zeros(32)),
         "WELCOME DEL w.7".into(),
-        format!("BACKUP PUT 0 {} {}", blob(), zeros(48)),
-        format!("BACKUP PUT 0 sha256:{} {}", "5d".repeat(32), zeros(60)),
+        format!("BACKUP PUT 0 {} AAE", blob()),
+        format!("BACKUP PUT 0 sha256:{} {}", "5d".repeat(32), zeros(61)),
         "ADMIN DROP general".into(),
         "ADMIN BAN 999.1.1.1".into(),
         "INFO general".into(),
@@ -655,11 +693,12 @@ fn table() -> Vec<(String, &'static str)> {
         ("GUEST sam".into(), "n"),
         (format!("AUTH alice@example.org {sig}"), "n"),
         (format!("REGISTER alice AQ== {sig}"), "n"),
-        ("KEYS PUT AQAB".into(), "as"),
-        (format!("PAIR PUT {BOX} AAEC"), "as"),
-        (format!("PAIR GET {BOX}"), "as"),
+        ("KEYS PUT AQAB".into(), "nas"),
+        (format!("PAIR PUT {BOX} AAEC"), "nas"),
+        (format!("PAIR GET {BOX}"), "nas"),
         ("UNREGISTER alice@example.org".into(), "s"),
-        (format!("CREATE {BOX} {gid} {th}"), "a"),
+        (format!("CREATE {BOX} {gid} {th}"), "ag"),
+        (format!("CREATE {BOX} {gid} {th} epoch=12"), "ag"),
         (
             format!("CREATE {BOX} {gid} {th} #general AAEABA== AAEC"),
             "s",
@@ -674,6 +713,7 @@ fn table() -> Vec<(String, &'static str)> {
         (format!("FOLLOW {BOX}"), "ag"),
         (format!("UNFOLLOW {BOX}"), "ag"),
         (format!("FETCH {BOX} after=0"), "ag"),
+        (format!("TOKEN {BOX} 41 {tok} {th}"), "ag"),
         ("PRESENCE ON".into(), "s"),
         ("PRESENCE OFF".into(), "s"),
         ("WATCH a@b.org".into(), "ags"),
@@ -689,13 +729,13 @@ fn table() -> Vec<(String, &'static str)> {
         ("PUSH LIST".into(), "s"),
         ("KEYPKG ADD AAEABQ==".into(), "s"),
         ("KEYPKG COUNT".into(), "s"),
-        ("KEYPKG GET bob@example.net".into(), "as"),
+        ("KEYPKG GET bob@example.net".into(), "ags"),
         (format!("WELCOME PUT {r} AAEABg=="), "ags"),
         (format!("WELCOME GET {r}"), "ags"),
         ("WELCOME LIST".into(), "s"),
         ("WELCOME DEL w7".into(), "s"),
         (format!("BLOB {blob} 1 box={BOX} token={tok}"), "ags"),
-        (format!("BACKUP PUT 0 {blob} {}", zeros(60)), "s"),
+        (format!("BACKUP PUT 0 {blob} {}", zeros(61)), "s"),
         ("BACKUP GET".into(), "s"),
         ("BACKUP DEL".into(), "s"),
         ("ADMIN OPS".into(), "s"),
@@ -732,10 +772,10 @@ fn kinds_follow_section_13() {
                 Ok(())
             } else if c.sets_kind() {
                 Err(ErrorCode::AlreadyAuthenticated)
-            } else if kind == Guest {
-                Err(ErrorCode::Forbidden)
-            } else {
+            } else if kind == New {
                 Err(ErrorCode::NotAuthenticated)
+            } else {
+                Err(ErrorCode::WrongConnection)
             };
             assert_eq!(c.check_kind(kind), want, "{s} on {kind}");
         }
@@ -763,7 +803,8 @@ fn every_form_is_in_the_table() {
 #[test]
 fn new_connections() {
     // 4.1: until it has a kind, a connection may send only INFO without a
-    // room, ANON, GUEST, AUTH, REGISTER, PING, PONG and QUIT.
+    // room, ANON, GUEST, AUTH, REGISTER, KEYS PUT, PAIR, PING, PONG and
+    // QUIT.
     let allowed: Vec<String> = every_form()
         .into_iter()
         .filter(|s| parse(s).unwrap().command.check_kind(New).is_ok())
@@ -776,7 +817,7 @@ fn new_connections() {
     assert_eq!(
         verbs,
         [
-            "INFO", "ANON", "GUEST", "AUTH", "REGISTER", "PING", "PONG", "QUIT"
+            "INFO", "ANON", "GUEST", "AUTH", "REGISTER", "KEYS", "PAIR", "PING", "PONG", "QUIT"
         ]
     );
     assert!(!allowed.contains(&"INFO #general".to_owned()));

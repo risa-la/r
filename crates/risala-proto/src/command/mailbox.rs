@@ -1,6 +1,8 @@
-//! The commands of Sections 5 to 7: CREATE and POST (5.2), UPLOAD (5.6),
-//! REPORT (5.8), LIST, INFO and GROUPINFO (6.1, 8.5), MUTE and UNMUTE
-//! (6.4), and FOLLOW, UNFOLLOW and FETCH (7.1).
+//! The commands of Sections 5 to 7: CREATE and POST (5.2, 7.8), UPLOAD
+//! (5.6), REPORT (5.8), LIST, INFO and GROUPINFO (6.1, 8.5), MUTE and
+//! UNMUTE (6.4), FOLLOW, UNFOLLOW and FETCH (7.1), and TOKEN (7.2).
+
+use std::num::NonZeroU64;
 
 use super::Command;
 use crate::error::ParseError;
@@ -10,6 +12,35 @@ use crate::names::{Room, Seq};
 use crate::parse::{
     bad, flag_opt, last, number, opt, opt_tok, options, parse_tag, positive_opt, tok,
 };
+
+/// The two forms of CREATE (5.2), after `<box> <group-id> <token-hash>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateForm {
+    /// `[epoch=<epoch>]`: the mailbox of a direct conversation or a
+    /// private room, on an anonymous or guest connection.
+    Private {
+        /// `epoch=`: the first epoch of the new mailbox of a group that is
+        /// moving (7.8), greater than 0. `None` for a new group, which
+        /// starts at epoch 0.
+        epoch: Option<NonZeroU64>,
+    },
+    /// `<room> <groupinfo> <tree>`: a public room, on a signed-in
+    /// connection (6.1).
+    Public(PublicRoom),
+}
+
+impl CreateForm {
+    /// The first form without `epoch=`: a new group's mailbox.
+    pub const NEW: CreateForm = CreateForm::Private { epoch: None };
+
+    /// The epoch the mailbox starts at: 0, or `epoch=` (5.2, 7.8).
+    pub fn first_epoch(&self) -> u64 {
+        match self {
+            CreateForm::Private { epoch: Some(e) } => e.get(),
+            _ => 0,
+        }
+    }
+}
 
 /// What the second form of CREATE adds: the public room it creates
 /// (5.2, 6.1).
@@ -35,21 +66,33 @@ pub(super) fn parse(verb: &str, tags: &Tags, p: Params<'_>) -> Option<Result<Com
             let mailbox = tok(&mut p)?;
             let group_id = tok(&mut p)?;
             let token_hash = tok(&mut p)?;
-            // Three tokens, or six (5.2); anything in between is too few.
-            let public = match opt_tok(&mut p)? {
-                None => None,
-                Some(room) => Some(PublicRoom {
-                    room,
-                    groupinfo: tok(&mut p)?,
-                    tree: tok(&mut p)?,
-                }),
+            // The second form's room starts with `#`, which an option key
+            // never does (3.3, 3.5). Anything else is the first form's
+            // options.
+            let mut peek = p;
+            let form = match peek.opt_token()? {
+                Some(room) if room.starts_with('#') => {
+                    let public = PublicRoom {
+                        room: room.parse()?,
+                        groupinfo: tok(&mut peek)?,
+                        tree: tok(&mut peek)?,
+                    };
+                    peek.end()?;
+                    CreateForm::Public(public)
+                }
+                _ => {
+                    let options = options(p, &["epoch"])?;
+                    // `epoch` is "a number greater than 0" (5.2).
+                    CreateForm::Private {
+                        epoch: positive_opt(&options, "epoch")?,
+                    }
+                }
             };
-            p.end()?;
             Ok(Command::Create {
                 mailbox,
                 group_id,
                 token_hash,
-                public,
+                form,
             })
         },
         "POST" => |tags, mut p| {
@@ -115,6 +158,18 @@ pub(super) fn parse(verb: &str, tags: &Tags, p: Params<'_>) -> Option<Result<Com
             })
         },
         "UNFOLLOW" => |_, p| Ok(Command::Unfollow { mailbox: last(p)? }),
+        "TOKEN" => |_, mut p| {
+            let mailbox = tok(&mut p)?;
+            let epoch = number(&mut p)?;
+            let token = tok(&mut p)?;
+            let hash = last(p)?;
+            Ok(Command::Token {
+                mailbox,
+                epoch,
+                token,
+                hash,
+            })
+        },
         "FETCH" => |_, mut p| {
             let mailbox = tok(&mut p)?;
             let options = options(p, &["after", "limit", "leaf"])?;
@@ -152,13 +207,19 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
             mailbox,
             group_id,
             token_hash,
-            public,
+            form,
         } => {
             b.token(mailbox).token(group_id).token(token_hash);
-            if let Some(public) = public {
-                b.token(&public.room)
-                    .token(&public.groupinfo)
-                    .token(&public.tree);
+            match form {
+                CreateForm::Private { epoch: None } => {}
+                CreateForm::Private { epoch: Some(epoch) } => {
+                    b.option("epoch", epoch);
+                }
+                CreateForm::Public(public) => {
+                    b.token(&public.room)
+                        .token(&public.groupinfo)
+                        .token(&public.tree);
+                }
             }
         }
         Command::Post {
@@ -200,6 +261,14 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
         }
         Command::GroupInfo { mailbox } | Command::Unfollow { mailbox } => {
             b.token(mailbox);
+        }
+        Command::Token {
+            mailbox,
+            epoch,
+            token,
+            hash,
+        } => {
+            b.token(mailbox).token(epoch).token(token).token(hash);
         }
         Command::Mute {
             mailbox,

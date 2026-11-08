@@ -2,10 +2,12 @@
 
 use super::*;
 use crate::error::ErrorCode;
-use crate::types::{PushReason, Retention};
+use crate::types::{FileUrl, PushReason, Retention};
 
 const BOX: &str = "ujzdegxdncf32epf3dhodzdoci";
 const T: &str = "2026-11-08T15:41:02.377Z";
+/// A pseudonym: 16 bytes in base64 (7.3).
+const PS: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 
 /// Valid base64 of `bytes` zero bytes.
 fn zeros(bytes: usize) -> String {
@@ -70,8 +72,8 @@ fn every_line() -> Vec<String> {
         "MEMBER #general ~sam member offline".into(),
         "PRESENCE online alice@example.org,bob@example.net".into(),
         "PRESENCE offline carol@example.com".into(),
-        format!("@report=r7;t={T} REPORT {BOX} AQIDBA=="),
-        format!("@report=r7;t={T};from=alice@example.org REPORT {BOX} AQIDBA=="),
+        format!("@report=r7;t={T};pseudonym={PS} REPORT {BOX} AQIDBA=="),
+        format!("@report=r7;t={T};pseudonym={PS};from=alice@example.org REPORT {BOX} AQIDBA=="),
         "RESOLVED r7".into(),
         format!("RECORD 0 {blob}"),
         format!("RECORD 812 {blob}"),
@@ -80,7 +82,8 @@ fn every_line() -> Vec<String> {
         "KEYPKG bob@example.net AAEABQ==".into(),
         "WELCOME w7k2 AAEABg==".into(),
         format!("WELCOME w7k2 {blob}"),
-        format!("BACKUP 3 {blob} {}", zeros(60)),
+        format!("BACKUP 3 {blob} {}", zeros(61)),
+        format!("BACKUP 3 {blob} {} files={blob}", zeros(61)),
         "NOTICE Back in 5 minutes.".into(),
         "OP carol@example.com".into(),
         "SERVERBAN *@example.net".into(),
@@ -185,7 +188,7 @@ fn posts() {
 #[test]
 fn reports() {
     let msg = rt(&format!(
-        "@report=r7;t={T};from=alice@example.org REPORT {BOX} AQIDBA=="
+        "@report=r7;t={T};pseudonym={PS};from=alice@example.org REPORT {BOX} AQIDBA=="
     ));
     let ServerLine::Report(report) = &msg.line else {
         panic!()
@@ -195,9 +198,18 @@ fn reports() {
         report.from.as_ref().map(Uid::as_str),
         Some("alice@example.org")
     );
-    syntax(&format!("@t={T} REPORT {BOX} AQIDBA=="));
-    syntax(&format!("@report=r7 REPORT {BOX} AQIDBA=="));
-    syntax(&format!("@report=r7;t={T};from=x REPORT {BOX} AQIDBA=="));
+    assert_eq!(report.pseudonym.to_string(), PS);
+    syntax(&format!("@t={T};pseudonym={PS} REPORT {BOX} AQIDBA=="));
+    syntax(&format!("@report=r7;pseudonym={PS} REPORT {BOX} AQIDBA=="));
+    // 5.8: the pseudonym is required, and is 16 bytes.
+    syntax(&format!("@report=r7;t={T} REPORT {BOX} AQIDBA=="));
+    syntax(&format!("@report=r7;t={T};pseudonym REPORT {BOX} AQIDBA=="));
+    syntax(&format!(
+        "@report=r7;t={T};pseudonym=AAAA REPORT {BOX} AQIDBA=="
+    ));
+    syntax(&format!(
+        "@report=r7;t={T};pseudonym={PS};from=x REPORT {BOX} AQIDBA=="
+    ));
 }
 
 #[test]
@@ -225,8 +237,10 @@ fn bad_lines() {
         "PUSH http://push.example/a t".into(),
         "KEYPKG bob@example.net".into(),
         "WELCOME w7".into(),
-        format!("BACKUP 4294967296 {} {}", blob(), zeros(60)),
-        format!("BACKUP 1 {} {}", blob(), zeros(59)),
+        format!("BACKUP 4294967296 {} {}", blob(), zeros(61)),
+        format!("BACKUP 1 {} AAE", blob()),
+        format!("BACKUP 1 {} {} files=AAEC", blob(), zeros(61)),
+        format!("BACKUP 1 {} {} {}", blob(), zeros(61), blob()),
         "NOTICE".into(),
         "OP".into(),
         "SERVERBAN".into(),
@@ -297,8 +311,14 @@ fn ok_values() {
         .with_log(&Log::Url("https://chat.example.org/log/".into()))
         .with_retention(Retention::new(30).unwrap())
         .with_push(true)
-        .with_upload(Upload::MaxBytes(1 << 20));
+        .with_upload(Upload::MaxBytes(1 << 20))
+        .with_quota(1 << 30);
     let ok = ok
+        .with_files(&[
+            "https://f.example".parse().unwrap(),
+            "https://[2001:db8::1]:8443".parse().unwrap(),
+        ])
+        .unwrap()
         .with_blobs("https://chat.example.org/blobs/")
         .unwrap()
         .with_upload_urls(
@@ -347,6 +367,14 @@ fn ok_values() {
         "https://f.example/get/1"
     );
     assert_eq!(ok.del_url(), Some("https://f.example/del/1"));
+    assert_eq!(ok.quota(), Ok(Some(1 << 30)));
+    assert_eq!(
+        ok.value("files"),
+        Some("https://f.example,https://[2001:db8::1]:8443")
+    );
+    let files = ok.files().unwrap().unwrap();
+    assert!(files[0].contains(&ok.get_url().unwrap().unwrap()));
+    assert!(!files[1].contains(&ok.get_url().unwrap().unwrap()));
     // The guest token stays out of Debug.
     assert!(!format!("{ok:?}").contains("k3f9q2"));
 
@@ -370,6 +398,55 @@ fn ok_values() {
     assert!(ok.retention().is_err());
     assert!(ok.log().is_err());
     assert_eq!(ok.value("unknown"), Some("1"));
+    assert!(OkResponse::new().with_files(&[]).is_err());
+}
+
+#[test]
+fn file_origins() {
+    // INFO's `files=` (8.5): `https://<host>[:<port>]`, nothing after.
+    let origin = |s: &str| s.parse::<FileOrigin>();
+    for (s, canonical) in [
+        ("https://f.example", "https://f.example"),
+        ("HTTPS://F.Example:8443", "https://f.example:8443"),
+        ("https://203.0.113.7", "https://203.0.113.7"),
+        ("https://[2001:DB8::1]", "https://[2001:db8::1]"),
+        ("https://localhost:1", "https://localhost:1"),
+    ] {
+        assert_eq!(origin(s).unwrap().to_string(), canonical, "{s}");
+        assert_eq!(origin(canonical), origin(s), "{s}");
+    }
+    for s in [
+        "",
+        "https://",
+        "http://f.example",
+        "https://f.example/",
+        "https://f.example/files",
+        "https://f.example:",
+        "https://f.example:0",
+        "https://f.example:65536",
+        "https://f.example:08",
+        "https://f_x.example",
+        "https://2001:db8::1",
+        "https://[2001:db8::1",
+        "https://[f.example]",
+        "https://:443",
+    ] {
+        assert!(origin(s).is_err(), "{s}");
+    }
+    // A `get` URL is on an origin with the same host and port, 443 by
+    // default (5.6).
+    let url = |s: &str| s.parse::<FileUrl>().unwrap();
+    let o = origin("https://f.example").unwrap();
+    assert!(o.contains(&url("https://f.example/get/1")));
+    assert!(o.contains(&url("https://F.EXAMPLE:443/get/1")));
+    assert!(o.contains(&url("https://f.example?x=1")));
+    assert!(!o.contains(&url("https://f.example:8443/get/1")));
+    assert!(!o.contains(&url("https://f.example.evil/get/1")));
+    assert!(!o.contains(&url("https://evil@f.example/get/1")));
+    assert!(!o.contains(&url("https://g.example/f.example")));
+    let o = origin("https://f.example:8443").unwrap();
+    assert!(o.contains(&url("https://f.example:8443/x")));
+    assert!(!o.contains(&url("https://f.example/x")));
 }
 
 #[test]

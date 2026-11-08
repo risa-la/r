@@ -499,13 +499,13 @@ token_type!(
 );
 
 token_type!(
-    /// The `<tag>` of PUSH ADD, PUSH lines and NOTIFY (9.1, 9.3): an opaque
-    /// token of 1 to 64 bytes, without spaces or control characters.
-    /// Case-sensitive.
+    /// The `<tag>` of PUSH ADD, PUSH lines, NOTIFY and FOLLOW's `quiet`
+    /// (9.1, 9.3, 7.1): 1 to 64 characters of printable ASCII
+    /// (%x21-7E). Case-sensitive: servers compare tags byte for byte.
     PushTag,
     |s| {
-        if s.is_empty() || s.chars().any(|c| c == ' ' || c.is_control()) {
-            Err(ParseError::BadSyntax("a push tag is one token"))
+        if s.is_empty() || !s.bytes().all(|b| matches!(b, 0x21..=0x7e)) {
+            Err(ParseError::BadSyntax("a push tag is printable ASCII"))
         } else if s.len() > MAX_PUSH_TAG {
             Err(ParseError::TooLong)
         } else {
@@ -1039,7 +1039,9 @@ mod tests {
             assert_eq!(s.parse::<PushTag>().unwrap().as_str(), s);
         }
         assert_eq!("x".repeat(65).parse::<PushTag>(), Err(ParseError::TooLong));
-        for s in ["", "a b", "a\tb", "a\x00"] {
+        // 9.1: printable ASCII only.
+        assert_eq!("!~".parse::<PushTag>().unwrap().as_str(), "!~");
+        for s in ["", "a b", "a\tb", "a\x00", "é", "a\x7f", "\u{a0}"] {
             assert!(is_syntax(s.parse::<PushTag>()), "{s:?}");
         }
     }

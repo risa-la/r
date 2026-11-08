@@ -19,9 +19,13 @@ pub enum ErrorCode {
     /// `too-long`: the line or one of its parameters is too long, or a
     /// file, blob or KeyPackage is too large.
     TooLong,
-    /// `not-authenticated`: the command needs another kind of connection
-    /// (4.1, Section 13).
+    /// `not-authenticated`: the connection is new, and the command needs
+    /// ANON, GUEST, AUTH or REGISTER first (4.1).
     NotAuthenticated,
+    /// `wrong-connection`: the command needs another kind of connection
+    /// than this one, which is anonymous, a guest or signed in (4.1,
+    /// Section 13).
+    WrongConnection,
     /// `already-authenticated`: the connection is already anonymous, a
     /// guest or signed in.
     AlreadyAuthenticated,
@@ -36,8 +40,7 @@ pub enum ErrorCode {
     /// or is not visible to you.
     NotFound,
     /// `forbidden`: not allowed because of permissions, a ban, a mute or
-    /// server policy. Also what a guest gets for a command guests may not
-    /// send (Section 13).
+    /// server policy.
     Forbidden,
     /// `not-supported`: the server does not offer this feature.
     NotSupported,
@@ -69,6 +72,7 @@ impl ErrorCode {
             ErrorCode::UnknownCommand => "unknown-command",
             ErrorCode::TooLong => "too-long",
             ErrorCode::NotAuthenticated => "not-authenticated",
+            ErrorCode::WrongConnection => "wrong-connection",
             ErrorCode::AlreadyAuthenticated => "already-authenticated",
             ErrorCode::AuthFailed => "auth-failed",
             ErrorCode::NameTaken => "name-taken",
@@ -104,6 +108,7 @@ impl FromStr for ErrorCode {
             "unknown-command" => ErrorCode::UnknownCommand,
             "too-long" => ErrorCode::TooLong,
             "not-authenticated" => ErrorCode::NotAuthenticated,
+            "wrong-connection" => ErrorCode::WrongConnection,
             "already-authenticated" => ErrorCode::AlreadyAuthenticated,
             "auth-failed" => ErrorCode::AuthFailed,
             "name-taken" => ErrorCode::NameTaken,
@@ -168,6 +173,7 @@ mod tests {
             "unknown-command",
             "too-long",
             "not-authenticated",
+            "wrong-connection",
             "already-authenticated",
             "auth-failed",
             "name-taken",

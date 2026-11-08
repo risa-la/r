@@ -17,8 +17,8 @@ use crate::frame::LineLimits;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConnectionKind {
     /// Has not yet become anonymous, a guest or signed in. It may send
-    /// only INFO without a room, ANON, GUEST, AUTH, REGISTER, PING, PONG
-    /// and QUIT.
+    /// only INFO without a room, ANON, GUEST, AUTH, REGISTER, KEYS PUT,
+    /// PAIR, PING, PONG and QUIT.
     New,
     /// Became anonymous with ANON (4.2). Used for conversations: posting,
     /// following and fetching.
@@ -41,8 +41,9 @@ impl ConnectionKind {
     ];
 
     /// The limits a server applies to lines from a connection of this
-    /// kind (2.3): the normal limit and a 64 KiB REGISTER on a new
-    /// connection, long lines for the long verbs otherwise.
+    /// kind (2.3): the normal limit, and 64 KiB for REGISTER, KEYS and
+    /// PAIR, on a new connection; long lines for the long verbs
+    /// otherwise.
     pub const fn client_limits(self) -> LineLimits {
         match self {
             ConnectionKind::New => LineLimits::NEW_CONNECTION,
@@ -51,16 +52,16 @@ impl ConnectionKind {
     }
 
     /// The error for a command that this kind may not send, but another
-    /// kind may (Section 13): `forbidden` for a guest, `not-authenticated`
-    /// otherwise.
+    /// kind may (3.7, 4.1, Section 13): `not-authenticated` for a new
+    /// connection, `wrong-connection` otherwise.
     ///
     /// ANON, GUEST, AUTH and REGISTER on a connection that already has a
     /// kind get `already-authenticated` instead (3.7), which
     /// [`Command::check_kind`](crate::command::Command::check_kind) says.
     pub const fn refusal(self) -> ErrorCode {
         match self {
-            ConnectionKind::Guest => ErrorCode::Forbidden,
-            _ => ErrorCode::NotAuthenticated,
+            ConnectionKind::New => ErrorCode::NotAuthenticated,
+            _ => ErrorCode::WrongConnection,
         }
     }
 
@@ -171,13 +172,13 @@ mod tests {
 
     #[test]
     fn refusals() {
-        assert_eq!(ConnectionKind::Guest.refusal(), ErrorCode::Forbidden);
+        assert_eq!(ConnectionKind::New.refusal(), ErrorCode::NotAuthenticated);
         for kind in [
-            ConnectionKind::New,
             ConnectionKind::Anonymous,
+            ConnectionKind::Guest,
             ConnectionKind::SignedIn,
         ] {
-            assert_eq!(kind.refusal(), ErrorCode::NotAuthenticated);
+            assert_eq!(kind.refusal(), ErrorCode::WrongConnection);
         }
     }
 

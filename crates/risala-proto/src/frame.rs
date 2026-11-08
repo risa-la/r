@@ -22,8 +22,9 @@
 //! is long, the long limit does.
 //!
 //! Before a connection has signed in, or become anonymous or a guest, a
-//! server applies the normal limit to every line except REGISTER, which
-//! may be up to [`MAX_REGISTER_LINE`] bytes for its key file (2.3, 4.7):
+//! server applies the normal limit to every line except REGISTER, KEYS
+//! and PAIR, which may be up to [`MAX_REGISTER_LINE`] bytes for their
+//! records and pairing messages (2.3, 4.7, 4.8):
 //! [`LineLimits::NEW_CONNECTION`]. It switches to [`LineLimits::CLIENT`]
 //! with [`LineDecoder::set_limits`] once the connection has a kind, as
 //! [`ConnectionKind::client_limits`](crate::connection::ConnectionKind::client_limits)
@@ -50,20 +51,25 @@ pub const MAX_LONG_CLIENT_LINE: usize = 1024 * 1024;
 /// The difference leaves room for the tags a server adds.
 pub const MAX_LONG_SERVER_LINE: usize = MAX_LONG_CLIENT_LINE + MAX_SERVER_LINE;
 
-/// The longest REGISTER line a new connection may send, including the LF:
-/// 64 KiB, for its key file (2.3, 4.7).
+/// The longest REGISTER, KEYS or PAIR line a new connection may send,
+/// including the LF: 64 KiB, for their records and pairing messages
+/// (2.3, 4.7, 4.8).
 pub const MAX_REGISTER_LINE: usize = 65536;
 
 /// The verbs of client lines that may be long once the connection has a
-/// kind (2.3), in upper case: the commands that carry MLS data, key files
-/// or reports.
-pub const CLIENT_LONG_VERBS: [&str; 6] = ["CREATE", "KEYPKG", "KEYS", "POST", "REPORT", "WELCOME"];
+/// kind (2.3), in upper case: the commands that carry MLS data, records,
+/// pairing messages or reports.
+pub const CLIENT_LONG_VERBS: [&str; 7] = [
+    "CREATE", "KEYPKG", "KEYS", "PAIR", "POST", "REPORT", "WELCOME",
+];
 
 /// The verbs of server lines that may be long (2.3), in upper case.
-pub const SERVER_LONG_VERBS: [&str; 5] = ["GROUPINFO", "KEYPKG", "POST", "REPORT", "WELCOME"];
+pub const SERVER_LONG_VERBS: [&str; 6] =
+    ["GROUPINFO", "KEYPKG", "PAIR", "POST", "REPORT", "WELCOME"];
 
-/// The one verb a new connection may send long (2.3, 4.7).
-pub const NEW_CONNECTION_LONG_VERBS: [&str; 1] = ["REGISTER"];
+/// The verbs a new connection may send up to [`MAX_REGISTER_LINE`]
+/// bytes long (2.3, 4.7, 4.8).
+pub const NEW_CONNECTION_LONG_VERBS: [&str; 3] = ["KEYS", "PAIR", "REGISTER"];
 
 /// The length of the longest verb in [`CLIENT_LONG_VERBS`],
 /// [`SERVER_LONG_VERBS`] and [`NEW_CONNECTION_LONG_VERBS`]. A longer verb
@@ -104,8 +110,8 @@ impl LineLimits {
     };
 
     /// The limits of lines from a client on a new connection (2.3): the
-    /// normal limit for every line, except REGISTER, which may be up to
-    /// [`MAX_REGISTER_LINE`].
+    /// normal limit for every line, except REGISTER, KEYS and PAIR, which
+    /// may be up to [`MAX_REGISTER_LINE`].
     pub const NEW_CONNECTION: LineLimits = LineLimits {
         normal: MAX_CLIENT_LINE,
         long: MAX_REGISTER_LINE,
@@ -807,6 +813,14 @@ mod tests {
             assert!(server.is_long_verb(verb), "{verb}");
             assert!(!new.is_long_verb(verb), "{verb}");
         }
+        // PAIR is long both ways, and up to 64 KiB on a new connection,
+        // like KEYS (2.3, 4.8).
+        for verb in ["PAIR", "pair"] {
+            assert!(client.is_long_verb(verb));
+            assert!(server.is_long_verb(verb));
+            assert_eq!(new.for_verb(verb), MAX_REGISTER_LINE);
+        }
+        assert_eq!(new.for_verb("KEYS"), MAX_REGISTER_LINE);
         // Clients send CREATE and KEYS; servers send GROUPINFO.
         for verb in ["CREATE", "KEYS"] {
             assert!(client.is_long_verb(verb));

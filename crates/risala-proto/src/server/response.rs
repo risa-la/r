@@ -1,7 +1,7 @@
 //! The greeting (4.1) and the final responses OK and ERR (3.6, 3.7).
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
 
 use super::ServerLine;
@@ -136,6 +136,107 @@ impl FromStr for Host {
 impl AsRef<str> for Host {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+/// One of the origins in INFO's `files=` (8.5, 5.6): `https://<host>`
+/// or `https://<host>:<port>`, with nothing after it. A server's `get`
+/// URLs must be on these origins, and devices download a file without
+/// asking only from them (12.11).
+///
+/// Parsing folds the scheme and host to lower case. The host is a
+/// [`Host`], or an IPv6 address in brackets. A port is 1 to 65535.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileOrigin {
+    host: Host,
+    port: Option<u16>,
+}
+
+impl FileOrigin {
+    /// The origin `https://<host>[:<port>]`.
+    pub fn new(host: Host, port: Option<u16>) -> FileOrigin {
+        FileOrigin { host, port }
+    }
+
+    /// The host, in lower case.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// The port, if one is written.
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// Whether `url` is on this origin: same host, and same port, where
+    /// no port means 443 (RFC 6454). Used by devices before they
+    /// download a file without asking (5.6, 12.11).
+    pub fn contains(&self, url: &FileUrl) -> bool {
+        // A `get` URL is `https://` and then the authority, up to the
+        // first `/`, `?` or `#`.
+        let rest = &url.as_str()["https://".len()..];
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        match format!("https://{}", &rest[..end]).parse::<FileOrigin>() {
+            Ok(other) => {
+                other.host == self.host && other.port.unwrap_or(443) == self.port.unwrap_or(443)
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for FileOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("https://")?;
+        if self.host.as_str().contains(':') {
+            write!(f, "[{}]", self.host)?;
+        } else {
+            f.write_str(self.host.as_str())?;
+        }
+        if let Some(port) = self.port {
+            write!(f, ":{port}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for FileOrigin {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<FileOrigin, ParseError> {
+        const WHAT: ParseError = bad("a files origin is https://<host>[:<port>]");
+        let rest = match s.get(..8) {
+            Some(scheme) if scheme.eq_ignore_ascii_case("https://") => &s[8..],
+            _ => return Err(WHAT),
+        };
+        let (host, port) = match rest.strip_prefix('[') {
+            Some(v6) => {
+                let (addr, after) = v6.split_once(']').ok_or(WHAT)?;
+                let addr: Ipv6Addr = addr.parse().map_err(|_| WHAT)?;
+                let port = match after {
+                    "" => None,
+                    _ => Some(after.strip_prefix(':').ok_or(WHAT)?),
+                };
+                (Host(addr.to_string()), port)
+            }
+            None => {
+                let (host, port) = match rest.split_once(':') {
+                    Some((host, port)) => (host, Some(port)),
+                    None => (rest, None),
+                };
+                if host.is_empty() {
+                    return Err(WHAT);
+                }
+                (host.parse().map_err(|_| WHAT)?, port)
+            }
+        };
+        let port = port
+            .map(|p| match parse_u64(p) {
+                Ok(n @ 1..=65535) => Ok(n as u16),
+                _ => Err(WHAT),
+            })
+            .transpose()?;
+        Ok(FileOrigin { host, port })
     }
 }
 
@@ -450,6 +551,18 @@ impl OkResponse {
         self.value("blobs")
     }
 
+    /// `quota=`: the most a mailbox may hold at once, in bytes, from INFO
+    /// (7.5, 8.5).
+    pub fn quota(&self) -> Result<Option<u64>, ParseError> {
+        self.typed("quota", parse_u64)
+    }
+
+    /// `files=`: the origins of the server's `get` URLs, from INFO (5.6,
+    /// 8.5). One or more, separated by commas.
+    pub fn files(&self) -> Result<Option<Vec<FileOrigin>>, ParseError> {
+        self.typed("files", |v| v.split(',').map(str::parse).collect())
+    }
+
     /// Sets `seq=`.
     pub fn with_seq(self, seq: Seq) -> OkResponse {
         self.with("seq", seq)
@@ -587,6 +700,21 @@ impl OkResponse {
     /// Sets `blobs=`. Fails if it is not a token.
     pub fn with_blobs(self, blobs: &str) -> Result<OkResponse, ParseError> {
         self.try_with("blobs", blobs)
+    }
+
+    /// Sets `quota=`.
+    pub fn with_quota(self, quota: u64) -> OkResponse {
+        self.with("quota", quota)
+    }
+
+    /// Sets `files=`. Fails if `files` is empty: a server without uploads
+    /// leaves the value out (8.5).
+    pub fn with_files(self, files: &[FileOrigin]) -> Result<OkResponse, ParseError> {
+        if files.is_empty() {
+            return Err(bad("files= lists at least one origin"));
+        }
+        let list: Vec<String> = files.iter().map(ToString::to_string).collect();
+        self.try_with("files", list.join(","))
     }
 }
 

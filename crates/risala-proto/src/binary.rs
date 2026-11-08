@@ -14,14 +14,17 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use zeroize::Zeroizing;
 
-use crate::error::ParseError;
+use crate::error::{ErrorCode, ParseError};
 use crate::mls::{
     MAX_BASE64_LEN, blob_type, check_blob, decoded_len, fixed_type, is_strict_base64, secret_type,
 };
 
-/// The length of a wrapped backup key: a 12-byte nonce, then a 32-byte key
-/// encrypted with its 16-byte tag (12.13).
-pub const WRAPPED_KEY_LEN: usize = 60;
+/// The length of a WrappedKey (12.13): a one-byte `version`, a 12-byte
+/// nonce, then a 32-byte key encrypted with its 16-byte tag.
+pub const WRAPPED_KEY_LEN: usize = 61;
+
+/// The `version` byte that starts a WrappedKey (12.13).
+pub const WRAPPED_KEY_VERSION: u8 = 1;
 
 /// The length of a push subscription's P-256 public key, uncompressed
 /// (9.1).
@@ -57,13 +60,40 @@ blob_type!(
     "a report is base64"
 );
 
-fixed_type!(
-    /// The `<key>` of BACKUP PUT and the BACKUP line (12.13): a backup's
-    /// random key, wrapped under the backup key of its generation.
+blob_type!(
+    /// The `<key>` of BACKUP PUT and the BACKUP line (12.13): a
+    /// WrappedKey, a backup's random key wrapped under the backup key of
+    /// its generation.
+    ///
+    /// Any base64 parses: 12.13 makes a key that is not
+    /// [`WRAPPED_KEY_LEN`] bytes starting with [`WRAPPED_KEY_VERSION`]
+    /// `ERR invalid`, not `ERR bad-syntax`. [`WrappedKey::check`] is that
+    /// check.
     WrappedKey,
-    WRAPPED_KEY_LEN,
-    "a wrapped key is 60 bytes of base64"
+    "a wrapped key is base64"
 );
+
+impl WrappedKey {
+    /// Encodes a WrappedKey's bytes.
+    pub fn from_array(bytes: &[u8; WRAPPED_KEY_LEN]) -> WrappedKey {
+        WrappedKey::from_bytes(bytes).expect("61 bytes fit a line")
+    }
+
+    /// The check of BACKUP PUT (12.13): `ERR invalid` unless the key is
+    /// [`WRAPPED_KEY_LEN`] bytes and starts with
+    /// [`WRAPPED_KEY_VERSION`].
+    pub fn check(&self) -> Result<(), ErrorCode> {
+        match self.decode().as_slice() {
+            [WRAPPED_KEY_VERSION, ..] if self.decoded_len() == WRAPPED_KEY_LEN => Ok(()),
+            _ => Err(ErrorCode::Invalid),
+        }
+    }
+
+    /// The key's bytes, if it passes [`WrappedKey::check`].
+    pub fn to_array(&self) -> Option<[u8; WRAPPED_KEY_LEN]> {
+        self.decode().try_into().ok()
+    }
+}
 
 fixed_type!(
     /// The `<key>` of PUSH ADD (9.1): the subscription's P-256 public key,
@@ -88,9 +118,11 @@ mod tests {
 
     #[test]
     fn lengths() {
-        let key = WrappedKey::from_bytes([1; WRAPPED_KEY_LEN]);
-        assert_eq!(key.to_string().len(), 80);
-        assert_eq!(key.to_string().parse::<WrappedKey>(), Ok(key));
+        let key = WrappedKey::from_array(&[1; WRAPPED_KEY_LEN]);
+        assert_eq!(key.to_string().len(), 84);
+        assert_eq!(key.to_string().parse::<WrappedKey>(), Ok(key.clone()));
+        assert_eq!(key.check(), Ok(()));
+        assert_eq!(key.to_array(), Some([1; WRAPPED_KEY_LEN]));
         let push = PushKey::from_bytes([4; PUSH_KEY_LEN]);
         assert_eq!(push.to_string().len(), 88);
         assert_eq!(push.to_string().parse::<PushKey>(), Ok(push));
@@ -98,6 +130,12 @@ mod tests {
         let auth = PushAuth::from_bytes([5; PUSH_AUTH_LEN]);
         assert_eq!(auth.to_string().parse::<PushAuth>(), Ok(auth.clone()));
         assert_eq!(format!("{auth:?}"), "PushAuth(..)");
+        // 12.13: a wrong length or version is `ERR invalid`, not a parse
+        // error.
+        for bad in [&[1u8; 60][..], &[1; 62], &[2; 61], &[0; 61]] {
+            let key = WrappedKey::from_bytes(bad).unwrap();
+            assert_eq!(key.check(), Err(ErrorCode::Invalid), "{bad:?}");
+        }
         let records: EncodedRecords = "AQ==".parse().unwrap();
         assert_eq!(records.decode(), [1]);
         assert!("".parse::<PairData>().is_err());

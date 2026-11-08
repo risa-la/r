@@ -139,7 +139,8 @@ fn command() -> impl Strategy<Value = String> {
         (boxname(), data()).prop_map(|(i, d)| format!("PAIR PUT {i} {d}")),
         boxname().prop_map(|i| format!("PAIR GET {i}")),
         uid().prop_map(|u| format!("UNREGISTER {u}")),
-        (boxname(), fixed(32), fixed(48)).prop_map(|(b, g, h)| format!("CREATE {b} {g} {h}")),
+        (boxname(), fixed(32), fixed(48), opt("epoch", positive()))
+            .prop_map(|(b, g, h, e)| format!("CREATE {b} {g} {h}{e}")),
         (
             boxname(),
             fixed(32),
@@ -171,6 +172,8 @@ fn command() -> impl Strategy<Value = String> {
         (boxname(), fixed(16)).prop_map(|(b, p)| format!("UNMUTE {b} {p}")),
         (boxname(), opt("quiet", "[!-~]{1,64}")).prop_map(|(b, q)| format!("FOLLOW {b}{q}")),
         boxname().prop_map(|b| format!("UNFOLLOW {b}")),
+        (boxname(), number(), fixed(32), fixed(48))
+            .prop_map(|(b, e, t, h)| format!("TOKEN {b} {e} {t} {h}")),
         (
             boxname(),
             number(),
@@ -212,8 +215,13 @@ fn command() -> impl Strategy<Value = String> {
                 let p = p.map_or(String::new(), |(b, t)| format!(" box={b} token={t}"));
                 format!("BLOB {h} {n}{p}")
             }),
-        (any::<u32>(), blob_ref(), fixed(60))
-            .prop_map(|(g, h, k)| format!("BACKUP PUT {g} {h} {k}")),
+        (
+            any::<u32>(),
+            blob_ref(),
+            fixed(61),
+            opt("files", blob_ref())
+        )
+            .prop_map(|(g, h, k, f)| format!("BACKUP PUT {g} {h} {k}{f}")),
         Just("BACKUP GET".to_owned()),
         Just("BACKUP DEL".to_owned()),
         admin(),
@@ -321,13 +329,14 @@ fn server_line() -> impl Strategy<Value = String> {
         (
             id(),
             timestamp(),
+            fixed(16),
             proptest::option::of(uid()),
             boxname(),
             data()
         )
-            .prop_map(|(i, t, f, b, r)| {
+            .prop_map(|(i, t, p, f, b, r)| {
                 let f = f.map_or(String::new(), |f| format!(";from={f}"));
-                format!("@report={i};t={t}{f} REPORT {b} {r}")
+                format!("@report={i};t={t};pseudonym={p}{f} REPORT {b} {r}")
             }),
         id().prop_map(|i| format!("RESOLVED {i}")),
         (number(), blob_ref()).prop_map(|(i, h)| format!("RECORD {i} {h}")),
@@ -335,7 +344,13 @@ fn server_line() -> impl Strategy<Value = String> {
         (push_url(), "[!-~]{1,64}").prop_map(|(u, t)| format!("PUSH {u} {t}")),
         (uid(), data()).prop_map(|(u, k)| format!("KEYPKG {u} {k}")),
         (id(), or_blob()).prop_map(|(i, w)| format!("WELCOME {i} {w}")),
-        (any::<u32>(), blob_ref(), fixed(60)).prop_map(|(g, h, k)| format!("BACKUP {g} {h} {k}")),
+        (
+            any::<u32>(),
+            blob_ref(),
+            fixed(61),
+            opt("files", blob_ref())
+        )
+            .prop_map(|(g, h, k, f)| format!("BACKUP {g} {h} {k}{f}")),
         required_text().prop_map(|t| format!("NOTICE {t}")),
         uid().prop_map(|u| format!("OP {u}")),
         (identity(), opt_text()).prop_map(|(t, r)| format!("SERVERBAN {t}{r}")),
@@ -404,11 +419,11 @@ fn word() -> impl Strategy<Value = String> {
         4 => prop::sample::select(vec![
             "INFO", "ANON", "GUEST", "AUTH", "REGISTER", "KEYS", "PUT", "GET", "PAIR", "CREATE",
             "POST", "UPLOAD", "REPORT", "LIST", "GROUPINFO", "MUTE", "UNMUTE", "FOLLOW",
-            "UNFOLLOW", "FETCH", "PRESENCE", "ON", "OFF", "WATCH", "WHOIS", "MEMBERS", "PUSH",
+            "UNFOLLOW", "FETCH", "TOKEN", "PRESENCE", "ON", "OFF", "WATCH", "WHOIS", "MEMBERS", "PUSH",
             "ADD", "DEL", "KEYPKG", "COUNT", "WELCOME", "BLOB", "BACKUP", "ADMIN", "SET", "BAN",
             "DROP", "RESOLVE", "PING", "PONG", "QUIT", "OK", "ERR", "RISALA", "ROOM", "GONE",
             "USER", "MEMBER", "RESOLVED", "RECORD", "NOTICE", "OP", "SERVERBAN", "CONNECTION",
-            "BYE", "-", "0", "1", "after=0", "limit=1", "live=yes", "light=yes", "box=",
+            "BYE", "-", "0", "1", "after=0", "limit=1", "live=yes", "light=yes", "box=", "epoch=1", "files=",
             "token=", "#general", "~sam", "alice@example.org", "@ref=1", "@seq=1;t=x",
             "AAAA", "AA==", "anon",
         ])
