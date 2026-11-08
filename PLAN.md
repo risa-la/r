@@ -743,6 +743,20 @@ Open:
     - ADMIN BAN of a target that covers an operator, the sender
       included, gets `forbidden`. DEOP first.
 
+36. **Found by the M4 server review** (3.6, 5.4, 5.8, 6.4, 10.1, 10.2),
+    confirmed with the user on 2026-11-08:
+    - ADMIN OP of an identity covered by a server ban is `forbidden`.
+      Operators from the configuration are exempt from server bans at
+      sign-in, and the server warns at start if a ban covers one.
+    - Both lines of a report carry `id` with the conversation's id.
+    - INVITE of someone already invited records nothing: plain `OK`.
+    - An address ban also ends guest sessions waiting to be resumed
+      whose last connection came from inside it (4.2 over 10.2).
+    - ROLES and BANS snapshot lines follow the 3.6 consistency rule.
+    - A resent REPORT gets its id before every check but the
+      conversation existing.
+    - DELETE of an event that is not a message is `not-found`.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

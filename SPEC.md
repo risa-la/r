@@ -345,7 +345,7 @@ its command.
 | `deleted` | server | none | The event's content was removed (5.4) |
 | `retry` | server | seconds | With `ERR rate-limited` or `ERR unavailable`: when to try again |
 | `report` | server | id | The report that a line belongs to (5.8) |
-| `id` | server, client | id | On a JOIN event or a DROP line: the room's id (6.1, 10.4). On DELETE: the conversation's id the client expects (5.4) |
+| `id` | server, client | id | On a JOIN event, a DROP line or a report's lines: the conversation's id (5.8, 6.1, 10.4). On DELETE: the conversation's id the client expects (5.4) |
 | `frank` | client | base64 | On ENC: the franking commitment (12.8) |
 
 ### 3.3. Parameters
@@ -476,8 +476,9 @@ ERR <code> [<message...>]
   command it cannot parse, as long as it can still read a valid `ref`
   from the line's tags.
 - **Consistent with live events.** A line that reports the state of a
-  conversation, meaning a CONV line from SYNC or the `OK` of JOIN or
-  `INFO <room>`, agrees with the live events the connection receives.
+  conversation, meaning a CONV line from SYNC, the `OK` of JOIN or
+  `INFO <room>`, or the snapshot lines of ROLES and BANS, agrees with
+  the live events the connection receives.
   Every event of that conversation sent to the connection before the
   line is covered by it, and every event sent after it is newer. The
   same holds for read markers: the `<read>` on a CONV line covers every
@@ -1055,7 +1056,8 @@ DELETE <conv> <seq>
 
 Deletes message `<seq>`. The author may delete their own messages. In
 rooms, moderators and owners may delete any message (6.3). Only MSG
-and ENC events can be deleted.
+and ENC events can be deleted: DELETE of any other event gets
+`ERR not-found`.
 
 The author may delete their own messages in a room even after they can
 no longer read it, for example after leaving a private room or being
@@ -1269,9 +1271,10 @@ its content to the reviewers (below). Rules for both:
   `ERR invalid`.
 - `<reason...>` is free text of up to 512 bytes.
 - If the same uid reports the same message again, the server replies
-  with the existing report's id. It checks this before the rules above
-  about the message, so the reply is the same even if the message has
-  been deleted since, and a client can resend a report safely.
+  with the existing report's id. It checks this before every other rule
+  except that the conversation exists, so the reply is the same even if
+  the message has been deleted since or the reporter can no longer read
+  the conversation, and a client can resend a report safely.
 - Servers SHOULD rate-limit reports.
 
 When a report is made, the server keeps a copy of the reported event
@@ -1284,11 +1287,13 @@ close reports on its own after a time it chooses.
 Reviewers receive each report as two lines: a REPORT or REPORTENC line
 with the same parameters as the command, and the reported event as it
 was when it was reported. Both carry the `report` tag with the report's
-id:
+id, and the `id` tag with the conversation's id (5.1), so that a report
+from a room that was dropped and created again (10.4) is not taken for
+one about the new room:
 
 ```
-S: @report=p4x8n2;t=2026-11-06T15:44:10.230Z;from=bob@example.net REPORT #general 8816 spam
-S: @report=p4x8n2;seq=8816;t=2026-11-06T15:43:58.019Z;from=~spammer MSG #general cheap pills at …
+S: @report=p4x8n2;id=k3f9q2;t=2026-11-06T15:44:10.230Z;from=bob@example.net REPORT #general 8816 spam
+S: @report=p4x8n2;id=k3f9q2;seq=8816;t=2026-11-06T15:43:58.019Z;from=~spammer MSG #general cheap pills at …
 ```
 
 - On the REPORT or REPORTENC line, `t` is when the report was made, and
@@ -1333,8 +1338,8 @@ S: OK id=w7c1m5
 The server's operators then receive:
 
 ```
-S: @report=w7c1m5;t=2026-11-07T10:20:41.118Z;from=bob@example.net REPORTENC alice@example.org 2 g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4= VEVYVCBz… harassment
-S: @report=w7c1m5;seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m… ENC alice@example.org 1
+S: @report=w7c1m5;id=d8m4x1;t=2026-11-07T10:20:41.118Z;from=bob@example.net REPORTENC alice@example.org 2 g6310tyvzbFYtF+zfJzNGwhM3CbuWJ83hbt4OL35Zb4= VEVYVCBz… harassment
+S: @report=w7c1m5;id=d8m4x1;seq=2;t=2026-11-07T10:02:12.003Z;from=alice@example.org;frank=hT3m… ENC alice@example.org 1
 ```
 
 ```
@@ -1601,7 +1606,8 @@ BANS <room>
   invitee is banned, and someone who is banned cannot be invited
   (`ERR forbidden`): unban them first. Guests cannot be invited.
   Inviting someone who is
-  already a member records nothing, and gets a plain `OK`. So a client
+  already a member, or already invited, records nothing, and gets a
+  plain `OK`. So a client
   that receives an INVITE for its own account knows the server does not
   count it as a member, and SHOULD send SYNC if it thought it was one.
 - `KICK` removes a member. They may join again. KICK of someone who is
@@ -2184,7 +2190,8 @@ ADMIN DEOP <uid>
 
 - **`ADMIN OPS`** sends one `OP <uid>` line per operator, then OK.
 - **`ADMIN OP`** makes an identity an operator. Guests cannot be
-  operators.
+  operators. ADMIN OP of an identity covered by a server ban (10.2) gets
+  `ERR forbidden`: lift the ban first.
 - **`ADMIN DEOP`** removes an operator. Operators named in the server's
   configuration cannot be removed this way (`ERR forbidden`). DEOP of
   someone who is not an operator gets `ERR not-found`.
@@ -2220,7 +2227,8 @@ of these:
   happen to share an address with a spammer, such as at a university or
   on a mobile network, are not affected. Ban identities one at a time or
   by domain instead. A new address ban also ends the sessions of the
-  guests connected from inside it, with BYE.
+  guests connected from inside it, with BYE, and the sessions waiting
+  to be resumed (4.2) whose last connection came from inside it.
 - **Banning a guest** bans the address it is connected from: the
   IPv4 address itself, or the IPv6 `/64` that contains it, since one
   IPv6 user usually holds a whole `/64`. It also closes the guest's
@@ -2232,7 +2240,9 @@ of these:
 - **Operators cannot be banned.** ADMIN BAN of a target that covers an
   operator, including the one sending it, gets `ERR forbidden`. Remove
   the operator with ADMIN DEOP first. Operators named in the server's
-  configuration cannot be banned this way at all.
+  configuration cannot be banned this way at all, and server bans do not
+  apply to them when they sign in, even one made before they were added
+  to the configuration.
 - **`ADMIN BANS`** sends one `SERVERBAN <target> [<reason...>]` line per
   ban, then OK.
 
