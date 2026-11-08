@@ -18,6 +18,7 @@
 //! never touches the registry.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use risala_proto::auth::{Nonce, PublicKey};
@@ -366,6 +367,10 @@ pub(crate) struct GuestSession {
     /// The connection that has the session, or `None` while it waits to be
     /// resumed.
     pub(crate) conn: Option<ConnId>,
+    /// The address of the session's connection, or of its last one while
+    /// it waits to be resumed: an address ban covering it ends the session
+    /// (10.2).
+    pub(crate) address: IpAddr,
     pub(crate) cids: CidCache,
     /// Counts the times the session started waiting, so that a resume
     /// period that has been cut short cannot end a later one.

@@ -494,6 +494,29 @@ async fn address_and_prefix_bans_stop_guests() {
     w.guest_from("ann", "198.51.100.1:4000").await;
 }
 
+/// An address ban ends the sessions waiting to be resumed whose last
+/// connection came from inside it, with their PARTs, and leaves the others
+/// (10.2).
+#[tokio::test]
+async fn an_address_ban_ends_waiting_sessions_from_inside_it() {
+    let mut w = World::new();
+    let mut bob = w.h.signed_in_as("bob@example.net");
+    w.h.send(&bob, "join #general").await;
+    for (name, peer) in [("ann", "198.51.100.1:4000"), ("sam", HOME)] {
+        let c = w.guest_from(name, peer).await;
+        w.h.send(&c, "join #general").await;
+        w.h.close(c).await;
+    }
+    bob.lines();
+    assert_eq!(w.h.hub.guest_sessions(), [uid("~ann"), uid("~sam")]);
+    assert_eq!(w.admin("admin ban 198.51.100.0/24").await, ["OK"]);
+    assert_eq!(
+        bob.lines(),
+        [format!("@seq=4;t={T};from=~ann PART #general")]
+    );
+    assert_eq!(w.h.hub.guest_sessions(), [uid("~sam")]);
+}
+
 /// A ban made while an AUTH has checked the signature but not signed the
 /// connection in yet: the AUTH is refused.
 #[tokio::test]

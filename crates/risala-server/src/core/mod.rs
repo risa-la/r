@@ -863,14 +863,16 @@ impl Inner {
         let Some(conn) = reg.conns.get(&id) else {
             return Err(SignInRefused::Gone);
         };
+        let peer = conn.info.peer.ip();
         // Under the registry's lock: see `admin`.
-        if let Some(why) = self.guest_refused(conn.info.peer.ip()) {
+        if let Some(why) = self.guest_refused(peer) {
             return Err(SignInRefused::Forbidden(why));
         }
         let resumed = match reg.sessions.get_mut(uid) {
             Some(session) if !session.ending && token.is_some_and(|t| session.token_is(t)) => {
                 session.token = new_token.clone();
                 session.epoch += 1;
+                session.address = peer;
                 if let Some(expiry) = session.expiry.take() {
                     expiry.abort();
                 }
@@ -894,6 +896,7 @@ impl Inner {
                     GuestSession {
                         token: new_token,
                         conn: Some(id),
+                        address: peer,
                         cids: Default::default(),
                         epoch: 0,
                         expiry: None,

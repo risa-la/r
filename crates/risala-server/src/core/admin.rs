@@ -258,7 +258,8 @@ impl Inner {
     ///   stored and listed under it.
     /// - An address or prefix ban, the guest's included, ends the sessions
     ///   of the guests connected from inside it, with BYE and their PARTs
-    ///   (4.2).
+    ///   (4.2), and of those waiting to be resumed whose last connection
+    ///   came from inside it.
     ///
     /// Banning again replaces the reason. The guests' PARTs come before
     /// the `OK`, since this command caused them (3.6); the BYE to any
@@ -317,18 +318,14 @@ impl Inner {
     }
 
     /// The guests whose sessions have a connection from an address that
-    /// `target` covers (10.2).
+    /// `target` covers, or wait to be resumed and had their last one from
+    /// such an address (10.2).
     fn guests_covered(&self, target: &ServerBanTarget) -> Vec<Uid> {
         let reg = self.reg();
         let mut guests: Vec<Uid> = reg
             .sessions
             .iter()
-            .filter(|(_, session)| {
-                session
-                    .conn
-                    .and_then(|id| reg.conns.get(&id))
-                    .is_some_and(|c| target.covers_address(c.info.peer.ip()))
-            })
+            .filter(|(_, session)| target.covers_address(session.address))
             .map(|(uid, _)| uid.clone())
             .collect();
         guests.sort();
