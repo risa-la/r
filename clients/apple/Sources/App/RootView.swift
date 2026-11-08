@@ -15,13 +15,21 @@ struct RootView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            RoomsView(model: rooms, selection: selection, showsStatus: isCompact) {
-                roomsLoadAttempt += 1
+        Group {
+            // With nothing to list, one pane holds the state; an empty sidebar
+            // beside it would only look broken.
+            if rooms.rooms.isEmpty {
+                RoomsView(model: rooms, selection: selection, showsStatus: true, retry: retry)
+            } else {
+                NavigationSplitView {
+                    RoomsView(
+                        model: rooms, selection: selection, showsStatus: isCompact, retry: retry
+                    )
+                    .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
+                } detail: {
+                    ConversationView(model: conversation)
+                }
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
-        } detail: {
-            detail
         }
         .onChange(of: selectedRoom, initial: true) {
             conversation.select(selectedRoom)
@@ -57,14 +65,8 @@ struct RootView: View {
         #endif
     }
 
-    @ContentBuilder
-    private var detail: some View {
-        switch rooms.state {
-        case .loaded:
-            ConversationView(model: conversation)
-        default:
-            RoomsStatusView(state: rooms.state) { roomsLoadAttempt += 1 }
-        }
+    private func retry() {
+        roomsLoadAttempt += 1
     }
 }
 
