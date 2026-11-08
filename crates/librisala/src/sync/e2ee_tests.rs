@@ -768,6 +768,37 @@ fn a_direct_conversation_is_encrypted_both_ways() {
 }
 
 #[test]
+fn a_message_queued_offline_starts_its_conversation() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    // Alice writes to Bob while offline: the message waits in the outbox.
+    let dev = &net.devs[a];
+    let account = dev.account;
+    dev.store
+        .write(|tx| {
+            tx.queue(
+                account,
+                &"bob@example.net".parse().unwrap(),
+                None,
+                &Draft::text("written offline"),
+                Timestamp::now(),
+            )
+        })
+        .unwrap();
+    // On the next connection, INIT waits for WELCOME LIST, and then the
+    // conversation starts and the message goes (12.6, 12.7).
+    reconnect(&mut net, a);
+    assert_eq!(net.sent_to(a, "INIT", "bob@example.net"), 1);
+    use crate::store::e2ee::EncState::Verified;
+    assert_eq!(
+        net.devs[b].texts("alice@example.org"),
+        [("written offline".to_owned(), Some(Verified))]
+    );
+}
+
+#[test]
 fn a_new_device_joins_by_external_commit() {
     let mut net = Net::new();
     let a = net.device("alice@example.org", 1);

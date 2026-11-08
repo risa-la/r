@@ -403,7 +403,10 @@ impl SyncEngine {
                 if let Some(e) = self.e2ee.as_mut() {
                     e.welcomes_listed = true;
                 }
-                self.e2ee_all()
+                self.e2ee_all()?;
+                // Messages to direct conversations that have not started
+                // waited for this: INIT may go now (12.6).
+                self.flush_outbox()
             }
             E2eePending::Init { conv } => self.on_init(&conv, reply),
             E2eePending::Commit {
