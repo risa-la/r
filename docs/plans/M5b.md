@@ -111,7 +111,7 @@ four writing code at once.
     the threat model).
 - [x] **S2. Fix round 1.** Fixes go into `spec/`, and new choices into
   PLAN.md item 62. Needs S1.
-- [~] **S3. Review again** with two fresh reviewers over the whole spec,
+- [x] **S3. Review again** with two fresh reviewers over the whole spec,
   then fix. At most three rounds in all; what remains above Low after
   that is listed for the user.
 
