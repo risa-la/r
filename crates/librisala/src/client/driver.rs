@@ -12,11 +12,13 @@ use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{Event, Report, ServerLine, ServerMessage};
 use risala_proto::text::unescape;
 use risala_proto::types::Ref;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::account::{AccountShared, Answer, Batch, Cmd, PeopleOp, RequestOp, Synced, check_draft};
+use super::account::{
+    AccountShared, Answer, Batch, Cmd, PeopleOp, RequestOp, Synced, check_draft, finished,
+};
 use super::blocking;
 use super::people::user_info;
 use super::types::{
@@ -50,29 +52,37 @@ fn uncopied((id, report, conv): (Id, Report, Option<Id>)) -> AccountEvent {
 
 type Reply<T> = oneshot::Sender<Result<T, ClientError>>;
 
-/// Runs the account until it is stopped or fails for good.
+/// Runs the account until it is stopped or fails for good. A task started
+/// while an earlier one was stopping first waits for `previous` to end.
+/// `done` closes when this task ends.
+///
+/// Only the account's current task, the one in its slot, touches the
+/// session, `synced` and the state ([`AccountShared::if_current`]).
 pub(crate) async fn run(
     shared: Arc<AccountShared>,
     generation: u64,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    previous: Option<watch::Receiver<()>>,
+    done: watch::Sender<()>,
 ) {
-    let stop_reply = drive(&shared, &mut cmds).await;
+    let _done = done;
+    if let Some(previous) = previous {
+        finished(previous).await;
+    }
+    // Stopped before it began: the queued Stop is answered offline.
+    let stop_reply = if shared.is_stopping(generation) {
+        None
+    } else {
+        drive(&shared, generation, &mut cmds).await
+    };
     // Whatever is still queued is handled offline; later commands find
     // the queue closed and are handled offline too.
     cmds.close();
     while let Ok(cmd) = cmds.try_recv() {
         offline(&shared, cmd).await;
     }
-    *shared.session.lock().expect("poisoned") = None;
-    shared.synced.send_modify(|s| s.idle = false);
-    {
-        let mut driver = shared.driver.lock().expect("poisoned");
-        if driver.as_ref().is_some_and(|d| d.generation == generation) {
-            *driver = None;
-        }
-    }
+    shared.retire(generation, stop_reply.is_some());
     if let Some(reply) = stop_reply {
-        shared.set_state(ConnectionState::Offline);
         let _ = reply.send(());
     }
 }
@@ -91,6 +101,7 @@ enum Flow {
 /// asked to stop.
 async fn drive(
     shared: &Arc<AccountShared>,
+    generation: u64,
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Option<oneshot::Sender<()>> {
     let server = shared.server.to_string();
@@ -117,7 +128,7 @@ async fn drive(
     let (sign_in, key) = match sign_in {
         Ok(s) => s,
         Err(error) => {
-            shared.set_state(ConnectionState::Failed { error });
+            shared.set_state_for(generation, ConnectionState::Failed { error });
             return None;
         }
     };
@@ -135,9 +146,11 @@ async fn drive(
                 let event = event?;
                 match event {
                     SupervisorEvent::Connecting { attempt } => {
-                        shared.set_state(ConnectionState::Connecting { attempt });
+                        shared.set_state_for(generation, ConnectionState::Connecting { attempt });
                     }
-                    SupervisorEvent::Connected { .. } => shared.set_state(ConnectionState::SigningIn),
+                    SupervisorEvent::Connected { .. } => {
+                        shared.set_state_for(generation, ConnectionState::SigningIn);
+                    }
                     SupervisorEvent::SignedIn { uid, session, incoming } => {
                         if let Some(key) = &key {
                             note_accepted(shared, key).await;
@@ -148,7 +161,9 @@ async fn drive(
                         if let Some(token) = &guest_token {
                             save_guest_session(shared, token.get()).await;
                         }
-                        match online(shared, uid, resumed, session.clone(), incoming, cmds).await {
+                        let flow =
+                            online(shared, generation, uid, resumed, session.clone(), incoming, cmds);
+                        match flow.await {
                             Flow::Disconnected => session.close(),
                             Flow::Reconnect => supervisor.reconnect_now(),
                             Flow::Stop(reply) => {
@@ -161,7 +176,7 @@ async fn drive(
                         }
                     }
                     SupervisorEvent::Disconnected { reason } => {
-                        shared.set_state(ConnectionState::Disconnected {
+                        shared.set_state_for(generation, ConnectionState::Disconnected {
                             kind: DisconnectKind::of(&reason),
                             reason: match &reason {
                                 conn::CloseReason::Server { bye: Some(bye) } => unescape(bye).into_owned(),
@@ -174,7 +189,7 @@ async fn drive(
                         // Account::connect promises apps that the account
                         // stops exactly on permanent errors.
                         debug_assert!(!error.as_ref().is_some_and(ClientError::is_permanent));
-                        shared.set_state(ConnectionState::Waiting {
+                        shared.set_state_for(generation, ConnectionState::Waiting {
                             retry_in_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                             error,
                         });
@@ -197,7 +212,7 @@ async fn drive(
                             );
                         }
                         debug_assert!(error.is_permanent(), "{error:?}");
-                        shared.set_state(ConnectionState::Failed { error });
+                        shared.set_state_for(generation, ConnectionState::Failed { error });
                         return None;
                     }
                     SupervisorEvent::Stopped => return None,
@@ -381,6 +396,8 @@ enum Waiter {
 /// One signed-in connection.
 struct Online<'a> {
     shared: &'a Arc<AccountShared>,
+    /// The task's generation, for [`AccountShared::if_current`].
+    generation: u64,
     /// A guest's session was resumed on this connection (4.2).
     resumed: bool,
     session: Arc<Session>,
@@ -404,6 +421,7 @@ struct Online<'a> {
 
 async fn online(
     shared: &Arc<AccountShared>,
+    generation: u64,
     uid: Uid,
     resumed: bool,
     session: Arc<Session>,
@@ -411,15 +429,17 @@ async fn online(
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Flow {
     debug!(server = %shared.server, %uid, "signed in");
-    *shared.session.lock().expect("poisoned") = Some(session.clone());
-    shared.synced.send_modify(|s| {
-        *s = Synced {
-            connection: s.connection + 1,
-            idle: false,
-        }
-    });
-    shared.set_state(ConnectionState::Online {
-        uid: uid.to_string(),
+    shared.if_current(generation, || {
+        *shared.session.lock().expect("poisoned") = Some(session.clone());
+        shared.synced.send_modify(|s| {
+            *s = Synced {
+                connection: s.connection + 1,
+                idle: false,
+            }
+        });
+        shared.set_state(ConnectionState::Online {
+            uid: uid.to_string(),
+        });
     });
     let mut engine = SyncEngine::signed_in_as(
         shared.store.clone(),
@@ -430,6 +450,7 @@ async fn online(
     engine.set_resumed(resumed);
     let mut on = Online {
         shared,
+        generation,
         resumed,
         session,
         engine: Some(engine),
@@ -449,8 +470,10 @@ async fn online(
         changes: Vec::new(),
         events,
     });
-    *shared.session.lock().expect("poisoned") = None;
-    shared.synced.send_modify(|s| s.idle = false);
+    shared.if_current(generation, || {
+        *shared.session.lock().expect("poisoned") = None;
+        shared.synced.send_modify(|s| s.idle = false);
+    });
     forget_people(shared);
     // Waiters still open get NotConnected when dropped.
     flow
@@ -699,7 +722,10 @@ impl Online<'_> {
             inputs = std::mem::take(&mut self.synthetic);
         }
         let idle = self.refs.is_empty() && !self.engine.as_ref().is_some_and(SyncEngine::is_busy);
-        self.shared.synced.send_modify(|s| s.idle = idle);
+        let shared = self.shared;
+        shared.if_current(self.generation, || {
+            shared.synced.send_modify(|s| s.idle = idle)
+        });
         Ok(())
     }
 

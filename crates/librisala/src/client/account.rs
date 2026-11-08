@@ -86,11 +86,27 @@ pub(crate) struct Watching {
     pub users: HashMap<Uid, usize>,
 }
 
-/// A running account task.
+/// An account task, running or stopping.
 pub(crate) struct DriverHandle {
     pub generation: u64,
     pub cmds: mpsc::UnboundedSender<Cmd>,
-    pub task: tokio::task::JoinHandle<()>,
+    /// Closes when the task ends: its sender lives in the task.
+    pub done: watch::Receiver<()>,
+    /// [`Account::disconnect`] asked it to stop. It stays here until it
+    /// ends, or until [`Account::start`] puts in its place a task that
+    /// waits for it to end.
+    pub stopping: bool,
+}
+
+impl DriverHandle {
+    fn is_finished(&self) -> bool {
+        self.done.has_changed().is_err()
+    }
+}
+
+/// Waits until the task whose `done` this is has ended.
+pub(crate) async fn finished(mut done: watch::Receiver<()>) {
+    while done.changed().await.is_ok() {}
 }
 
 type Reply<T> = oneshot::Sender<Result<T, ClientError>>;
@@ -246,18 +262,66 @@ impl AccountShared {
         self.uid.is_guest()
     }
 
-    /// Whether the account's task is running.
+    /// Whether the account's task is running, and not stopping.
     pub fn is_running(&self) -> bool {
         self.driver_queue().is_some()
     }
 
-    /// The running task's command queue, if a task is running.
+    /// The running task's command queue, if a task is running and not
+    /// stopping.
     fn driver_queue(&self) -> Option<mpsc::UnboundedSender<Cmd>> {
         let driver = self.driver.lock().expect("poisoned");
         driver
             .as_ref()
-            .filter(|d| !d.task.is_finished())
+            .filter(|d| !d.stopping && !d.is_finished())
             .map(|d| d.cmds.clone())
+    }
+
+    /// Runs `f` if the task of `generation` is the account's current one,
+    /// and says whether it was. The slot stays locked meanwhile, so that
+    /// [`Account::start`] cannot put a new task in between: a task that
+    /// was replaced never touches the session, the state or `synced`.
+    /// `f` must not lock the slot.
+    pub(crate) fn if_current(&self, generation: u64, f: impl FnOnce()) -> bool {
+        let driver = self.driver.lock().expect("poisoned");
+        let current = driver.as_ref().is_some_and(|d| d.generation == generation);
+        if current {
+            f();
+        }
+        current
+    }
+
+    /// Changes the state, if the task of `generation` is the current one.
+    pub(crate) fn set_state_for(&self, generation: u64, state: ConnectionState) {
+        self.if_current(generation, || self.set_state(state));
+    }
+
+    /// Whether the task of `generation` is the current one, and was asked
+    /// to stop.
+    pub(crate) fn is_stopping(&self, generation: u64) -> bool {
+        let driver = self.driver.lock().expect("poisoned");
+        driver
+            .as_ref()
+            .is_some_and(|d| d.generation == generation && d.stopping)
+    }
+
+    /// Ends the turn of the task of `generation`, if it is the current
+    /// one: it leaves the slot, and the session goes. If it was asked to
+    /// stop, or `stopped`, the account goes offline. Returns whether it
+    /// was current.
+    pub(crate) fn retire(&self, generation: u64, stopped: bool) -> bool {
+        let mut driver = self.driver.lock().expect("poisoned");
+        let Some(d) = driver.as_ref().filter(|d| d.generation == generation) else {
+            return false;
+        };
+        let stopped = stopped || d.stopping;
+        *driver = None;
+        *self.session.lock().expect("poisoned") = None;
+        self.synced.send_modify(|s| s.idle = false);
+        if stopped {
+            self.set_state(ConnectionState::Offline);
+        }
+        true
     }
 
     /// Hands a command to the task, or handles it offline if none runs.
@@ -363,25 +427,43 @@ impl Account {
     /// Starts keeping a connection up in the background, signing in and
     /// syncing on each one. Does nothing if it is already running. It runs
     /// on the client's runtime, so this may be called from any thread.
+    ///
+    /// Called while a [`disconnect`](Self::disconnect) is under way, it
+    /// starts a new task that waits for the old one to end before it
+    /// connects, so that the two never overlap.
     pub fn start(&self) {
         let mut driver = self.shared.driver.lock().expect("poisoned");
-        if driver.as_ref().is_some_and(|d| !d.task.is_finished()) {
-            return;
+        let previous = match driver.as_ref() {
+            Some(d) if d.is_finished() => None,
+            Some(d) if d.stopping => Some(d.done.clone()),
+            Some(_) => return,
+            None => None,
+        };
+        if previous.is_some() {
+            // The stopping task's session is going; it no longer touches
+            // these once replaced.
+            *self.shared.session.lock().expect("poisoned") = None;
+            self.shared.synced.send_modify(|s| s.idle = false);
         }
         let generation = self.shared.next_driver.fetch_add(1, Ordering::SeqCst);
         let (cmds, rx) = mpsc::unbounded_channel();
+        let (done_tx, done) = watch::channel(());
         // Before the task runs, so that a stale Failed is not read as the
         // outcome of this start.
         self.shared
             .set_state(ConnectionState::Connecting { attempt: 0 });
-        let task = self
-            .shared
-            .rt
-            .spawn(driver::run(self.shared.clone(), generation, rx));
+        self.shared.rt.spawn(driver::run(
+            self.shared.clone(),
+            generation,
+            rx,
+            previous,
+            done_tx,
+        ));
         *driver = Some(DriverHandle {
             generation,
             cmds,
-            task,
+            done,
+            stopping: false,
         });
     }
 
@@ -428,17 +510,31 @@ impl Account {
 
     /// Asks the server to close the connection (QUIT, 11), and stops.
     /// The account goes offline; reads still work from the cache.
+    ///
+    /// The task is marked as stopping until it has ended. A
+    /// [`start`](Self::start) or [`connect`](Self::connect) meanwhile
+    /// starts a new task, which connects once the old one has ended; the
+    /// account then stays with the new task, and does not go offline.
     pub async fn disconnect(&self) {
-        let driver = self.shared.driver.lock().expect("poisoned").take();
-        let Some(driver) = driver else {
-            return;
+        let (generation, done) = {
+            let mut driver = self.shared.driver.lock().expect("poisoned");
+            let Some(d) = driver.as_mut() else {
+                return;
+            };
+            if !d.stopping {
+                d.stopping = true;
+                // What counts is that the task ends, so its answer is not
+                // awaited.
+                let (reply, _) = oneshot::channel();
+                let _ = d.cmds.send(Cmd::Stop { reply });
+            }
+            (d.generation, d.done.clone())
         };
-        let (tx, rx) = oneshot::channel();
-        if driver.cmds.send(Cmd::Stop { reply: tx }).is_ok() {
-            let _ = rx.await;
-        }
-        let _ = driver.task.await;
-        self.shared.set_state(ConnectionState::Offline);
+        finished(done).await;
+        // The task leaves its slot and goes offline as it ends, unless a
+        // newer one took its place. This covers one that ended otherwise,
+        // such as by a panic.
+        self.shared.retire(generation, true);
     }
 
     /// Skips the wait before the next attempt, or replaces the current

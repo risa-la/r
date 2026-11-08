@@ -661,3 +661,41 @@ async fn a_guest_whose_session_ended_does_not_resend() {
     client.shutdown().await;
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connecting_while_a_disconnect_is_under_way_stays_online() {
+    // The old connection's task is still quitting when the app starts the
+    // account again: the new one must not be marked offline when the old
+    // one ends.
+    let server = TestServer::builder().room("#general").start().await;
+    let (client, addr) = trusting_client(&server, server.addr(), 50);
+    let sam = client.add_guest(&addr, "sam").unwrap();
+    for round in 0..5 {
+        within("connect", sam.connect()).await.unwrap();
+        within("sync", sam.wait_synced()).await.unwrap();
+        // Begin disconnecting: poll it once, so that the stop is under way,
+        // then start again before it has finished.
+        let mut stopping = Box::pin(sam.disconnect());
+        tokio::select! {
+            biased;
+            () = &mut stopping => {}
+            () = std::future::ready(()) => {}
+        }
+        within("connect again", sam.connect())
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        within("the old task ending", stopping).await;
+        // Let anything the old task would still do happen.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(sam.state().is_online(), "round {round}: {:?}", sam.state());
+        within("sync", sam.wait_synced()).await.unwrap();
+        within("list", sam.list_rooms(None, None))
+            .await
+            .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+    }
+    // A disconnect with nothing after it still ends offline.
+    sam.disconnect().await;
+    assert_eq!(sam.state(), ConnectionState::Offline);
+    client.shutdown().await;
+    server.stop().await;
+}
