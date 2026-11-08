@@ -664,6 +664,7 @@ impl KeyFetcher {
     async fn get(&self, identity: &Identity) -> Result<Answer, FetchError> {
         let inner = &*self.inner;
         let _permits = self.permits(identity.domain()).await?;
+        let deadline = tokio::time::Instant::now() + inner.timeout;
         let work = async {
             let domain = identity.domain();
             let path = format!("/.well-known/risala/{}", identity.name());
@@ -672,7 +673,7 @@ impl KeyFetcher {
                 .resolve(domain)
                 .await
                 .map_err(|e| FetchError::Resolve(e.to_string()))?;
-            let tcp = self.connect(&addrs).await?;
+            let tcp = self.connect(&addrs, deadline).await?;
             let name = ServerName::try_from(domain.to_owned())
                 .map_err(|e| FetchError::Tls(e.to_string()))?;
             let mut stream = inner
@@ -714,19 +715,37 @@ impl KeyFetcher {
     /// socket is actually connected to, which is one this function chose
     /// from the resolved list: nothing is resolved again later, so DNS
     /// rebinding cannot slip a different address in.
-    async fn connect(&self, addrs: &[SocketAddr]) -> Result<TcpStream, FetchError> {
+    ///
+    /// Each attempt gets an equal share of the time left before
+    /// `deadline`, so that an address that never answers, often an IPv6
+    /// one, does not use up the whole fetch.
+    async fn connect(
+        &self,
+        addrs: &[SocketAddr],
+        deadline: tokio::time::Instant,
+    ) -> Result<TcpStream, FetchError> {
         let guarded = !self.inner.allow_private;
         let mut refused = None;
         let mut error = None;
+        let mut candidates = Vec::with_capacity(addrs.len());
         for &addr in addrs {
             if guarded && guard::is_special(addr.ip()) {
                 refused.get_or_insert(addr.ip());
-                continue;
+            } else {
+                candidates.push(addr);
             }
-            let tcp = match TcpStream::connect(addr).await {
-                Ok(tcp) => tcp,
-                Err(e) => {
+        }
+        for (i, &addr) in candidates.iter().enumerate() {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let share = left / u32::try_from(candidates.len() - i).unwrap_or(u32::MAX);
+            let tcp = match tokio::time::timeout(share, TcpStream::connect(addr)).await {
+                Ok(Ok(tcp)) => tcp,
+                Ok(Err(e)) => {
                     error = Some(e.to_string());
+                    continue;
+                }
+                Err(_) => {
+                    error = Some(format!("{addr}: timed out"));
                     continue;
                 }
             };

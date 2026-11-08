@@ -385,6 +385,43 @@ async fn time_limit() {
     assert!(format!("{:?}", KeyFetcher::new(options)).contains("KeyFetcher"));
 }
 
+/// An address that never answers gets only its share of the time limit:
+/// the next one is still tried in time.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_address_that_never_answers_does_not_use_up_the_time() {
+    let ca = TestCa::new();
+    let server = Server::start(&ca, &["example.test"], Arc::new(|_| ok(&line(1)))).await;
+    // A listener whose queue of connections is full, since it accepts
+    // none: Linux drops further SYNs, so connecting to it hangs.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let full = socket.listen(1).unwrap();
+    let full_addr = full.local_addr().unwrap();
+    let mut queued = Vec::new();
+    for _ in 0..16 {
+        let connect = tokio::net::TcpStream::connect(full_addr);
+        match tokio::time::timeout(Duration::from_millis(200), connect).await {
+            Ok(Ok(tcp)) => queued.push(tcp),
+            _ => break,
+        }
+    }
+    assert!(queued.len() < 16, "the listener's queue never filled up");
+    let mut options = options(&ca, &server, &[]);
+    options.resolver =
+        Arc::new(StaticResolver::new().with("example.test", [full_addr, server.addr]));
+    options.timeout = Duration::from_secs(4);
+    let fetcher = KeyFetcher::new(options);
+    let started = Instant::now();
+    assert_eq!(
+        fetcher.fetch(&id("alice@example.test"), false).await,
+        Ok(vec![key(1)])
+    );
+    // About half the limit went to the first address.
+    assert!(started.elapsed() >= Duration::from_millis(1900));
+    drop(full);
+}
+
 #[tokio::test]
 async fn address_guard() {
     let ca = TestCa::new();
