@@ -19,6 +19,8 @@
 //!   reports, wrapped backup keys and push keys (4.7, 4.8, 5.8, 9.1,
 //!   12.13).
 //! - [`connection`]: kinds of connection, and their line limits (4.1, 13).
+//! - [`content`]: the lines inside encrypted messages, and where each
+//!   counts (12.9).
 //! - [`command`]: typed commands, client to server (4-12, 13).
 //! - [`server`]: typed server lines, server to client (4-12, 13), and the
 //!   NOTIFY push body (9.3).
@@ -32,6 +34,7 @@ pub mod auth;
 pub mod binary;
 pub mod command;
 pub mod connection;
+pub mod content;
 pub mod error;
 pub mod fingerprint;
 pub mod frame;
