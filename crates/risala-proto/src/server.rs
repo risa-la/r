@@ -1403,7 +1403,8 @@ impl OkResponse {
         self.typed("members", parse_u64)
     }
 
-    /// `role=`: your role in the room, from `INFO <room>` (6.2).
+    /// `role=`: your role in the room, from `INFO <room>` (6.2) and JOIN
+    /// (6.1).
     pub fn role(&self) -> Result<Option<InfoRole>, ParseError> {
         self.typed("role", str::parse)
     }
@@ -1542,7 +1543,7 @@ impl OkResponse {
         self.with("members", members)
     }
 
-    /// Adds `role=` (6.2).
+    /// Adds `role=`, for INFO (6.2) and JOIN (6.1).
     pub fn with_role(self, role: InfoRole) -> OkResponse {
         self.with("role", role)
     }

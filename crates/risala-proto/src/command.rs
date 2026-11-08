@@ -32,11 +32,12 @@
 //!   `"KEY FOO"`, so the server replies `ERR unknown-command` (3.8). A
 //!   missing subcommand (`ADMIN` alone) is `BadSyntax`.
 //! - **Tags (3.2).** `ref` applies to every command. MSG also reads
-//!   `reply`, `edit`, `react`, `file` and `cid` (5.3, 5.6, 7.6), and ENC
-//!   reads `frank`, `file` and `cid` (12.8). Every other tag is ignored,
-//!   including those tags on other commands. A tag this module reads must have a valid value: a
-//!   `ref` or `cid` over 64 bytes is `TooLong`, a missing or malformed
-//!   value is `BadSyntax`.
+//!   `reply`, `edit`, `react`, `file`, `cid` and `id` (5.3, 5.6, 7.6),
+//!   DELETE reads `id` (5.4), and ENC reads `frank`, `file` and `cid`
+//!   (12.8). Every other tag is ignored, including those tags on other
+//!   commands. A tag this module reads must have a valid value: a `ref`
+//!   or `cid` over 64 bytes is `TooLong`, a missing or malformed value is
+//!   `BadSyntax`.
 //! - **MLS data (Section 12)** is opaque here: KeyPackages, GroupInfo,
 //!   commits, Welcomes, ratchet trees and ENC payloads only have to be
 //!   strict base64 ([`mls`](crate::mls)). Whether they verify is for the
@@ -66,9 +67,10 @@
 //!
 //! [`Request::to_line`] writes the canonical form: the verb (and
 //! subcommand) in upper case, single spaces, tags in the order `ref`,
-//! then the relation or `frank`, then `file`, then `cid`, and options in the order the spec's syntax line
-//! lists them. Optional options are left out when
-//! they are absent, and so is `purge=` when it is false.
+//! then the relation or `frank`, then `file`, then `cid`, then `id`, and
+//! options in the order the spec's syntax line lists them. Optional
+//! options are left out when they are absent, and so is `purge=` when it
+//! is false.
 //!
 //! The fields of [`Command`] are public, so a request built by hand can
 //! hold values that a parsed one never does. [`Request::validate`] checks
