@@ -333,7 +333,10 @@ mod tests {
             assert!(read_message(bytes).is_err());
         }
         // Every byte value at every position of a valid message.
-        let bytes = private(2, &RisalaAad::handshake(crate::aad::Pseudonym([0; 16])).encode());
+        let bytes = private(
+            2,
+            &RisalaAad::handshake(crate::aad::Pseudonym([0; 16])).encode(),
+        );
         for i in 0..bytes.len() {
             for v in [0u8, 0x3f, 0x40, 0x7f, 0x80, 0xbf, 0xc0, 0xff] {
                 let mut b = bytes.clone();

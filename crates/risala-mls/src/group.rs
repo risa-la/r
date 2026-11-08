@@ -34,18 +34,17 @@ use std::time::SystemTime;
 use openmls::group::{
     CommitBuilderStageError, CreateCommitError, ExternalCommitBuilderError,
     ExternalCommitBuilderFinalizeError, LeaveGroupError, MergeCommitError, MergePendingCommitError,
-    MlsGroup, MlsGroupJoinConfig, NewGroupError,
-    PURE_CIPHERTEXT_WIRE_FORMAT_POLICY, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, ProcessMessageError,
-    StagedCommit, StagedWelcome, WelcomeError, WireFormatPolicy,
+    MlsGroup, MlsGroupJoinConfig, NewGroupError, PURE_CIPHERTEXT_WIRE_FORMAT_POLICY,
+    PURE_PLAINTEXT_WIRE_FORMAT_POLICY, ProcessMessageError, StagedCommit, StagedWelcome,
+    WelcomeError, WireFormatPolicy,
 };
-use openmls::storage::OpenMlsProvider;
 use openmls::prelude::{
     Capabilities, CreateMessageError, CredentialType, ExportSecretError, Extension, Extensions,
     GroupContext, GroupId, KeyPackage, KeyPackageBundle, LeafNode, LeafNodeIndex,
     LeafNodeParameters, NewSignerBundle, ProcessedMessageContent, Proposal, ProposalOrRefType,
-    ProposalType,
-    ProtocolVersion, RequiredCapabilitiesExtension, Sender,
+    ProposalType, ProtocolVersion, RequiredCapabilitiesExtension, Sender,
 };
+use openmls::storage::OpenMlsProvider;
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::random::OpenMlsRand;
@@ -117,7 +116,11 @@ pub fn has_capabilities(capabilities: &Capabilities) -> bool {
 /// `basic` credentials.
 pub fn required_capabilities() -> RequiredCapabilitiesExtension {
     RequiredCapabilitiesExtension::new(
-        &[CONVERSATION_EXTENSION, DEVICE_BINDING_EXTENSION, PROFILE_EXTENSION],
+        &[
+            CONVERSATION_EXTENSION,
+            DEVICE_BINDING_EXTENSION,
+            PROFILE_EXTENSION,
+        ],
         &[ProposalType::SelfRemove],
         &[CredentialType::Basic],
     )
@@ -205,8 +208,8 @@ pub fn own_leaf_key<P: OpenMlsProvider>(
         group.group_id().as_slice(),
         leaf.signature_key().as_slice(),
     )
-        .map_err(GroupError::Storage)?
-        .ok_or_else(|| GroupError::Group("own leaf key not in storage".into()))
+    .map_err(GroupError::Storage)?
+    .ok_or_else(|| GroupError::Group("own leaf key not in storage".into()))
 }
 
 /// The conversation extension of a group.
@@ -379,7 +382,12 @@ pub fn commit<P: OpenMlsProvider>(
             },
             by_reference_ok,
         ),
-        None => builder.build(provider.rand(), provider.crypto(), &leaf_key, by_reference_ok),
+        None => builder.build(
+            provider.rand(),
+            provider.crypto(),
+            &leaf_key,
+            by_reference_ok,
+        ),
     }
     .map_err(|e: CreateCommitError| mls(e))?;
     let bundle = complete
@@ -655,7 +663,9 @@ pub fn join_by_external_commit<P: OpenMlsProvider>(
     expect: &JoinExpectation,
 ) -> Result<ExternalJoin, GroupError<P::StorageError>> {
     if identity.is_guest() != device_key.is_none() {
-        return Err(GroupError::Group("a device key for a device, none for a guest".into()));
+        return Err(GroupError::Group(
+            "a device key for a device, none for a guest".into(),
+        ));
     }
     let group_info = read_group_info(group_info)?;
     let tree = read_tree(tree)?;
@@ -904,7 +914,11 @@ pub fn process_message<P: OpenMlsProvider>(
         ProcessedMessageContent::StagedCommitMessage(staged) => {
             let aad = RisalaAad::decode_for(&aad_bytes, ContentType::Commit)?;
             let view = CommitView::of(&sender, &staged, group.pending_proposals());
-            Ok(Incoming::Commit(Box::new(ReceivedCommit { staged, view, aad })))
+            Ok(Incoming::Commit(Box::new(ReceivedCommit {
+                staged,
+                view,
+                aad,
+            })))
         }
         ProcessedMessageContent::OwnPrivateMessage => Ok(Incoming::Own),
         #[allow(unreachable_patterns)]
@@ -983,7 +997,9 @@ pub fn forget_group<P: OpenMlsProvider>(
         LeafKey::delete(provider.storage(), group.group_id().as_slice(), &key)
             .map_err(GroupError::Storage)?;
     }
-    group.delete(provider.storage()).map_err(GroupError::Storage)
+    group
+        .delete(provider.storage())
+        .map_err(GroupError::Storage)
 }
 
 /// The leaf node of `index` in `group`.

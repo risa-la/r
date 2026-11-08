@@ -170,7 +170,10 @@ mod tests {
 
         let guest = RisalaIdentity::guest(uid("~sam"));
         assert_eq!(guest.encode(), b"\x01\x04~sam\x00");
-        assert_eq!(RisalaIdentity::decode(b"\x01\x04~sam\x00"), Ok(guest.clone()));
+        assert_eq!(
+            RisalaIdentity::decode(b"\x01\x04~sam\x00"),
+            Ok(guest.clone())
+        );
         assert!(guest.is_guest());
 
         let credential = id.to_credential();

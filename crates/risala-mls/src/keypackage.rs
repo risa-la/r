@@ -26,9 +26,9 @@ use openmls::prelude::{
     KeyPackageNewError, KeyPackageVerifyError, Lifetime, MlsMessageBodyIn, MlsMessageIn,
     ProtocolVersion, UnknownExtension,
 };
+use openmls::storage::OpenMlsProvider;
 use openmls::treesync::EncryptionKey;
 use openmls_memory_storage::MemoryStorage;
-use openmls::storage::OpenMlsProvider;
 use openmls_traits::crypto::OpenMlsCrypto;
 use risala_proto::names::Uid;
 use tls_codec::Deserialize as _;
@@ -167,8 +167,8 @@ pub fn make_key_package<P: OpenMlsProvider>(
         DeviceId::of_device_key(device_key.public_key()),
     );
     let credential = identity.credential_with_key(leaf_key.public_key());
-    let leaf_extensions = Extensions::single(profile.to_extension())
-        .expect("a profile is valid in a leaf node");
+    let leaf_extensions =
+        Extensions::single(profile.to_extension()).expect("a profile is valid in a leaf node");
     // First the keys, to bind them (see crate::seeded), then the real one.
     let seed = SeededRand::fresh().map_err(|_| NewKeyPackageError::Random)?;
     let scratch = MemoryStorage::default();
@@ -330,8 +330,8 @@ pub fn check_key_package_contents(
         return Err(KeyPackageError::CipherSuite);
     }
     let leaf = key_package.leaf_node();
-    let identity =
-        RisalaIdentity::from_credential(leaf.credential()).map_err(|_| KeyPackageError::Credential)?;
+    let identity = RisalaIdentity::from_credential(leaf.credential())
+        .map_err(|_| KeyPackageError::Credential)?;
     if identity.is_guest() {
         // Guests have no device key to bind with, and join public rooms by
         // external commit (6.1). A guest KeyPackage for an external
@@ -441,9 +441,9 @@ pub fn check_key_package(
 ) -> Result<CheckedKeyPackage, KeyPackageError> {
     match crate::framing::read_message(bytes) {
         Ok(crate::framing::MlsMessage::KeyPackage) => {}
-        Err(
-            crate::framing::FramingError::CipherSuite | crate::framing::FramingError::Version,
-        ) => return Err(KeyPackageError::CipherSuite),
+        Err(crate::framing::FramingError::CipherSuite | crate::framing::FramingError::Version) => {
+            return Err(KeyPackageError::CipherSuite);
+        }
         _ => return Err(KeyPackageError::Malformed),
     }
     let key_package = verify_key_package(crypto, read_key_package(bytes)?)?;
@@ -488,7 +488,10 @@ mod tests {
     #[test]
     fn lifetimes() {
         let now = SystemTime::now();
-        assert!(lifetime_acceptable(&Lifetime::new(KEY_PACKAGE_LIFETIME), now));
+        assert!(lifetime_acceptable(
+            &Lifetime::new(KEY_PACKAGE_LIFETIME),
+            now
+        ));
         assert!(!lifetime_acceptable(
             &Lifetime::new(KEY_PACKAGE_LIFETIME + 1),
             now

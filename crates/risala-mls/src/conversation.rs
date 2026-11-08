@@ -247,7 +247,9 @@ fn direct_name(a: &Uid, b: &Uid) -> String {
 fn host_ok(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= MAX_HOST_LEN
-        && host.bytes().all(|b| b.is_ascii_graphic() && !b.is_ascii_uppercase())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !b.is_ascii_uppercase())
 }
 
 impl RisalaConversation {
@@ -538,7 +540,11 @@ impl RisalaConversation {
     /// identity's leaves, that `guests none` removes the guests', and the
     /// 256-member threshold are checked with the commit (see
     /// [`crate::checks`]).
-    pub fn check_change(&self, new: &RisalaConversation, committer: &Uid) -> Result<(), ChangeError> {
+    pub fn check_change(
+        &self,
+        new: &RisalaConversation,
+        committer: &Uid,
+    ) -> Result<(), ChangeError> {
         new.check()?;
         if new.kind != self.kind {
             return Err(ChangeError::Fixed("kind"));
@@ -579,7 +585,9 @@ impl RisalaConversation {
                 return Err(ChangeError::NotAllowed("owners"));
             }
             if !(self.confirm == ConfirmMode::Pairwise && new.confirm == ConfirmMode::Epochal) {
-                return Err(ChangeError::Fixed("confirm, except from pairwise to epochal"));
+                return Err(ChangeError::Fixed(
+                    "confirm, except from pairwise to epochal",
+                ));
             }
         }
         if (!same_set(&new.owners, &self.owners) || !same_set(&new.mods, &self.mods)) && !owner {
@@ -645,7 +653,10 @@ mod tests {
         let conv = RisalaConversation::direct("Chat.Example.org", BOX, &a, &b);
         assert_eq!(conv.host, "chat.example.org");
         assert_eq!(conv.name, "alice@example.org bob@example.net");
-        assert_eq!(conv, RisalaConversation::direct("chat.example.org", BOX, &b, &a));
+        assert_eq!(
+            conv,
+            RisalaConversation::direct("chat.example.org", BOX, &b, &a)
+        );
         assert_eq!(conv.check(), Ok(()));
         assert_eq!(conv.direct_participants(), Some(vec![b.clone(), a.clone()]));
 
@@ -697,7 +708,16 @@ mod tests {
         assert_eq!(RisalaConversation::decode(&encoded), Ok(conv.clone()));
 
         // Every enum value outside its range, and other damage.
-        for (offset, value) in [(0, 2), (1, 0), (1, 4), (46, 0), (46, 3), (47, 0), (47, 4), (48, 3)] {
+        for (offset, value) in [
+            (0, 2),
+            (1, 0),
+            (1, 4),
+            (46, 0),
+            (46, 3),
+            (47, 0),
+            (47, 4),
+            (48, 3),
+        ] {
             let mut bad = encoded.clone();
             bad[offset] = value;
             assert!(RisalaConversation::decode(&bad).is_err(), "{offset}");

@@ -126,7 +126,10 @@ impl DeviceBinding {
 
     /// The extension, for a KeyPackage or a leaf node.
     pub fn to_extension(&self) -> Extension {
-        Extension::Unknown(DEVICE_BINDING_EXTENSION_TYPE, UnknownExtension(self.encode()))
+        Extension::Unknown(
+            DEVICE_BINDING_EXTENSION_TYPE,
+            UnknownExtension(self.encode()),
+        )
     }
 
     /// Reads the binding from a KeyPackage's or leaf node's extensions:
@@ -169,10 +172,8 @@ mod tests {
         assert_eq!(&encoded[1..49], binding.device_id.as_bytes());
         assert_eq!(&encoded[49..51], &[0x49, 0x74]); // 2420
         assert_eq!(DeviceBinding::decode(&encoded), Ok(binding.clone()));
-        let extensions = Extensions::<openmls::prelude::KeyPackage>::single(
-            binding.to_extension(),
-        )
-        .unwrap();
+        let extensions =
+            Extensions::<openmls::prelude::KeyPackage>::single(binding.to_extension()).unwrap();
         assert_eq!(
             DeviceBinding::from_extensions(&extensions),
             Some(Ok(binding))

@@ -133,7 +133,11 @@ impl RisalaAad {
             ContentType::Proposal => self.frank.is_none() && self.next_token_hash.is_none(),
             ContentType::Commit => self.frank.is_none(),
         };
-        if ok { Ok(()) } else { Err(AadError::WrongFields) }
+        if ok {
+            Ok(())
+        } else {
+            Err(AadError::WrongFields)
+        }
     }
 
     /// Reads a RisalaAAD and checks it against the content type.

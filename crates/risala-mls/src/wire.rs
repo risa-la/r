@@ -8,8 +8,8 @@
 
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::{
-    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolMessage, ProtocolVersion,
-    RatchetTreeIn, Welcome,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolMessage, ProtocolVersion, RatchetTreeIn,
+    Welcome,
 };
 use openmls::treesync::RatchetTree;
 use tls_codec::{Deserialize as _, Serialize as _};

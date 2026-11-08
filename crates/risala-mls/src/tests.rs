@@ -99,13 +99,25 @@ impl Device {
     }
 
     fn create(&self, conversation: &RisalaConversation) -> MlsGroup {
-        create_group(&self.provider, &self.identity(), &self.profile(), conversation)
-            .unwrap()
-            .0
+        create_group(
+            &self.provider,
+            &self.identity(),
+            &self.profile(),
+            conversation,
+        )
+        .unwrap()
+        .0
     }
 
     fn commit(&self, group: &mut MlsGroup, changes: Changes) -> CommitOutput {
-        commit(&self.provider, group, self.pseudonym, &self.profile(), changes).unwrap()
+        commit(
+            &self.provider,
+            group,
+            self.pseudonym,
+            &self.profile(),
+            changes,
+        )
+        .unwrap()
     }
 
     fn join(&self, welcome: &[u8]) -> MlsGroup {
@@ -121,8 +133,7 @@ impl Device {
         message: &[u8],
         facts: &dyn KeyFacts,
     ) -> (Box<ReceivedCommit>, Result<Verdict, CommitError>) {
-        let Incoming::Commit(received) =
-            process_message(&self.provider, group, message).unwrap()
+        let Incoming::Commit(received) = process_message(&self.provider, group, message).unwrap()
         else {
             panic!("not a commit");
         };
@@ -238,13 +249,20 @@ fn key_packages_and_keypkg_add() {
     let leaf_key = kp.leaf_node().signature_key().as_slice().to_vec();
     assert_ne!(leaf_key, key);
     assert!(
-        LeafKey::load(alice.provider.storage(), crate::mldsa::KEY_PACKAGE_SCOPE, &leaf_key)
-            .unwrap()
-            .is_some()
+        LeafKey::load(
+            alice.provider.storage(),
+            crate::mldsa::KEY_PACKAGE_SCOPE,
+            &leaf_key
+        )
+        .unwrap()
+        .is_some()
     );
     // Each KeyPackage has a leaf key of its own.
     let other = alice.key_package(false);
-    assert_ne!(other.leaf_node().signature_key(), kp.leaf_node().signature_key());
+    assert_ne!(
+        other.leaf_node().signature_key(),
+        kp.leaf_node().signature_key()
+    );
 
     let last = to_bytes(&alice.key_package(true).into());
     assert!(
@@ -295,7 +313,10 @@ fn direct_conversation() {
     assert_eq!(conversation(&a), Some(conv.clone()));
 
     // Alice adds Bob's device and her own other device.
-    let out = alice.commit(&mut a, add(vec![bob.key_package(false), alice2.key_package(false)]));
+    let out = alice.commit(
+        &mut a,
+        add(vec![bob.key_package(false), alice2.key_package(false)]),
+    );
     private_framing(&out.message, ContentType::Commit);
     let (framing, aad) = read_post(&out.message).unwrap();
     assert_eq!(framing.epoch, 0);
@@ -321,7 +342,10 @@ fn direct_conversation() {
     // Messages both ways, as PrivateMessages with the RisalaAAD.
     let message = alice.send(&mut a, b"hello bob");
     private_framing(&message, ContentType::Application);
-    assert_eq!(bob.read(&mut b, &message), (a.own_leaf_index(), b"hello bob".to_vec()));
+    assert_eq!(
+        bob.read(&mut b, &message),
+        (a.own_leaf_index(), b"hello bob".to_vec())
+    );
     assert_eq!(alice2.read(&mut a2, &message).1, b"hello bob");
     let reply = bob.send(&mut b, b"hi");
     assert_eq!(alice.read(&mut a, &reply).1, b"hi");
@@ -329,10 +353,15 @@ fn direct_conversation() {
     // A fresh-leaf commit by Bob (12.7) is valid for the others.
     let out = bob.commit(&mut b, Changes::default());
     merge_own_commit(&bob.provider, &mut b).unwrap();
-    assert_eq!(alice.apply(&mut a, &out.message, &facts), Verdict::default());
+    assert_eq!(
+        alice.apply(&mut a, &out.message, &facts),
+        Verdict::default()
+    );
     alice2.apply(&mut a2, &out.message, &facts);
     assert_eq!(
-        SendToken::of_group(&a, alice.provider.crypto()).unwrap().hash(),
+        SendToken::of_group(&a, alice.provider.crypto())
+            .unwrap()
+            .hash(),
         out.next_token_hash
     );
 
@@ -400,7 +429,9 @@ fn welcome_checks() {
     let err = join_by_welcome(&bob.provider, &out.welcome.unwrap(), None, &bob.expect());
     assert!(matches!(
         err,
-        Err(GroupError::Join(crate::checks::JoinError::WrongConversation))
+        Err(GroupError::Join(
+            crate::checks::JoinError::WrongConversation
+        ))
     ));
 }
 
@@ -423,7 +454,10 @@ fn private_room() -> Room3 {
     let mut conv = RisalaConversation::private_room(HOST, BOX, "Friends", &owen.uid);
     conv.mods.push(mia.uid.clone());
     let mut o = owen.create(&conv);
-    let out = owen.commit(&mut o, add(vec![mia.key_package(false), pat.key_package(false)]));
+    let out = owen.commit(
+        &mut o,
+        add(vec![mia.key_package(false), pat.key_package(false)]),
+    );
     merge_own_commit(&owen.provider, &mut o).unwrap();
     let welcome = out.welcome.unwrap();
     let m = mia.join(&welcome);
@@ -564,7 +598,12 @@ fn self_remove_and_leaving() {
     assert_eq!(m.members().count(), 2);
     let (received, verdict) = pat.receive(&mut p, &out.message, &facts);
     verdict.unwrap();
-    let pat_key = p.own_leaf_node().unwrap().signature_key().as_slice().to_vec();
+    let pat_key = p
+        .own_leaf_node()
+        .unwrap()
+        .signature_key()
+        .as_slice()
+        .to_vec();
     assert!(!apply_commit(&pat.provider, &mut p, *received).unwrap());
     assert!(
         LeafKey::load(pat.provider.storage(), p.group_id().as_slice(), &pat_key)
@@ -611,8 +650,14 @@ fn competing_commits() {
     // Owen knows he won.
     merge_own_commit(&owen.provider, &mut o).unwrap();
     let token = SendToken::of_group(&o, owen.provider.crypto()).unwrap();
-    assert_eq!(SendToken::of_group(&m, mia.provider.crypto()).unwrap(), token);
-    assert_eq!(SendToken::of_group(&p, pat.provider.crypto()).unwrap(), token);
+    assert_eq!(
+        SendToken::of_group(&m, mia.provider.crypto()).unwrap(),
+        token
+    );
+    assert_eq!(
+        SendToken::of_group(&p, pat.provider.crypto()).unwrap(),
+        token
+    );
     assert_eq!(first.next_token_hash, token.hash());
     assert_ne!(second.next_token_hash, token.hash());
     // They all read each other in the new epoch.
@@ -670,7 +715,10 @@ fn stale_leaves() {
     // The weekly refresh (12.7).
     let own = RisalaProfile::new("", now_ms() - 8 * 24 * 3600 * 1000).unwrap();
     assert!(needs_refresh(&own, now_ms()));
-    assert!(!needs_refresh(&RisalaProfile::new("", now_ms()).unwrap(), now_ms()));
+    assert!(!needs_refresh(
+        &RisalaProfile::new("", now_ms()).unwrap(),
+        now_ms()
+    ));
 }
 
 #[test]
@@ -690,12 +738,12 @@ fn last_resort_key_packages() {
     let out_c = carol.commit(&mut c, add(vec![last]));
     merge_own_commit(&carol.provider, &mut c).unwrap();
 
-    let joined = join_by_welcome(&bob.provider, &out_a.welcome.unwrap(), None, &bob.expect())
-        .unwrap();
+    let joined =
+        join_by_welcome(&bob.provider, &out_a.welcome.unwrap(), None, &bob.expect()).unwrap();
     assert!(joined.last_resort);
     let mut b1 = joined.group;
-    let joined = join_by_welcome(&bob.provider, &out_c.welcome.unwrap(), None, &bob.expect())
-        .unwrap();
+    let joined =
+        join_by_welcome(&bob.provider, &out_c.welcome.unwrap(), None, &bob.expect()).unwrap();
     assert!(joined.last_resort);
     let mut b2 = joined.group;
     // Both leaves share the leaf key, so Bob commits a new one in each
@@ -719,9 +767,13 @@ fn last_resort_key_packages() {
     // KeyPackage keeps its own.
     for group in [&b1, &b2] {
         assert!(
-            LeafKey::load(bob.provider.storage(), group.group_id().as_slice(), shared.as_slice())
-                .unwrap()
-                .is_none()
+            LeafKey::load(
+                bob.provider.storage(),
+                group.group_id().as_slice(),
+                shared.as_slice()
+            )
+            .unwrap()
+            .is_none()
         );
     }
     assert!(
@@ -757,7 +809,10 @@ fn public_state(device: &Device, group: &MlsGroup) -> (Vec<u8>, Vec<u8>) {
     let group_info = group
         .export_group_info(device.provider.crypto(), &leaf_key, false)
         .unwrap();
-    (to_bytes(&group_info), tree_to_bytes(&group.export_ratchet_tree()))
+    (
+        to_bytes(&group_info),
+        tree_to_bytes(&group.export_ratchet_tree()),
+    )
 }
 
 fn public_expect(device: &Device) -> JoinExpectation {
@@ -802,7 +857,9 @@ fn public_room_external_joins() {
     assert!(join.earlier_leaves.is_empty());
     let mut d = join.group;
     assert_eq!(
-        SendToken::of_group(&d, dave.provider.crypto()).unwrap().hash(),
+        SendToken::of_group(&d, dave.provider.crypto())
+            .unwrap()
+            .hash(),
         join.next_token_hash
     );
 
@@ -931,7 +988,9 @@ fn public_room_refusals() {
     );
     assert!(matches!(
         err,
-        Err(GroupError::Join(crate::checks::JoinError::WrongConversation))
+        Err(GroupError::Join(
+            crate::checks::JoinError::WrongConversation
+        ))
     ));
 
     // A banned identity's external commit is refused.
@@ -1081,8 +1140,10 @@ fn sqlite_storage() {
     // A KeyPackage made in SQLite, used by a Welcome later.
     let kp = {
         let tx = db.transaction().unwrap();
-        let provider =
-            Provider::with_crypto(crypto.clone(), SqliteStorageProvider::<MsgPack, _>::new(&*tx));
+        let provider = Provider::with_crypto(
+            crypto.clone(),
+            SqliteStorageProvider::<MsgPack, _>::new(&*tx),
+        );
         let kp = make_key_package(
             &provider,
             bob.device_key.as_ref().unwrap(),
@@ -1102,10 +1163,17 @@ fn sqlite_storage() {
 
     let group_id = {
         let tx = db.transaction().unwrap();
-        let provider =
-            Provider::with_crypto(crypto.clone(), SqliteStorageProvider::<MsgPack, _>::new(&*tx));
-        let joined =
-            join_by_welcome(&provider, out.welcome.as_ref().unwrap(), None, &bob.expect()).unwrap();
+        let provider = Provider::with_crypto(
+            crypto.clone(),
+            SqliteStorageProvider::<MsgPack, _>::new(&*tx),
+        );
+        let joined = join_by_welcome(
+            &provider,
+            out.welcome.as_ref().unwrap(),
+            None,
+            &bob.expect(),
+        )
+        .unwrap();
         assert!(joined.last_resort);
         let id = joined.group.group_id().clone();
         drop(provider);
@@ -1117,9 +1185,13 @@ fn sqlite_storage() {
     // one that is committed is there next time, with its new leaf key.
     for keep in [false, true] {
         let tx = db.transaction().unwrap();
-        let provider =
-            Provider::with_crypto(crypto.clone(), SqliteStorageProvider::<MsgPack, _>::new(&*tx));
-        let mut b = MlsGroup::load(provider.storage(), &group_id).unwrap().unwrap();
+        let provider = Provider::with_crypto(
+            crypto.clone(),
+            SqliteStorageProvider::<MsgPack, _>::new(&*tx),
+        );
+        let mut b = MlsGroup::load(provider.storage(), &group_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(b.epoch().as_u64(), 1);
         own_leaf_key(&provider, &b).unwrap();
         let out = commit(
@@ -1143,7 +1215,9 @@ fn sqlite_storage() {
         }
     }
     let provider = Provider::with_crypto(crypto, SqliteStorageProvider::<MsgPack, _>::new(&db));
-    let mut b = MlsGroup::load(provider.storage(), &group_id).unwrap().unwrap();
+    let mut b = MlsGroup::load(provider.storage(), &group_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(b.epoch().as_u64(), 2);
     let aad = RisalaAad::application(bob.pseudonym, [1; 48]);
     let message = encrypt_application(&provider, &mut b, &aad, b"from sqlite").unwrap();

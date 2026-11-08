@@ -81,10 +81,7 @@ impl<'a> Reader<'a> {
     }
 
     pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
-        let (&first, rest) = self
-            .bytes
-            .split_first()
-            .ok_or(DecodeError("too short"))?;
+        let (&first, rest) = self.bytes.split_first().ok_or(DecodeError("too short"))?;
         self.bytes = rest;
         Ok(first)
     }
@@ -200,9 +197,16 @@ mod tests {
     #[test]
     fn vectors_are_bounds_checked() {
         let mut w = Writer::new();
-        w.u8(1).vector(b"abc").fixed(&7u32.to_be_bytes()).u64(9).fixed(b"xy");
+        w.u8(1)
+            .vector(b"abc")
+            .fixed(&7u32.to_be_bytes())
+            .u64(9)
+            .fixed(b"xy");
         let bytes = w.into_bytes();
-        assert_eq!(bytes, b"\x01\x03abc\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00\x09xy");
+        assert_eq!(
+            bytes,
+            b"\x01\x03abc\x00\x00\x00\x07\x00\x00\x00\x00\x00\x00\x00\x09xy"
+        );
         let mut r = Reader::new(&bytes);
         assert_eq!(r.u8(), Ok(1));
         assert_eq!(r.vector(), Ok(&b"abc"[..]));

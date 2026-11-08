@@ -230,7 +230,9 @@ struct StorageId(Vec<u8>);
 impl StorageId {
     fn new(scope: &[u8], public_key: &[u8]) -> StorageId {
         let mut w = crate::codec::Writer::new();
-        w.vector(b"risala leaf key").vector(scope).vector(public_key);
+        w.vector(b"risala leaf key")
+            .vector(scope)
+            .vector(public_key);
         StorageId(w.into_bytes())
     }
 }
@@ -268,7 +270,8 @@ mod tests {
 
     fn sign_content(label: &[u8], content: &[u8]) -> Vec<u8> {
         let mut w = crate::codec::Writer::new();
-        w.vector(&[MLS_LABEL_PREFIX, label].concat()).vector(content);
+        w.vector(&[MLS_LABEL_PREFIX, label].concat())
+            .vector(content);
         w.into_bytes()
     }
 

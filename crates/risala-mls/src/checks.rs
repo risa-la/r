@@ -26,10 +26,10 @@ use openmls::treesync::LeafNodeSource;
 use risala_proto::names::{Room, Uid};
 
 use crate::binding::DeviceBinding;
-use crate::crypto::x_wing_public_key_ok;
 use crate::conversation::{
     ConfirmMode, ConversationError, ConversationKind, GuestMode, RisalaConversation, Role,
 };
+use crate::crypto::x_wing_public_key_ok;
 use crate::identity::{DeviceId, RisalaIdentity};
 use crate::keypackage::{
     KeyPackageError, check_binding, check_guest_key_package, check_key_package_contents,
@@ -147,7 +147,9 @@ impl GroupView {
 
     /// The leaves of `uid`.
     pub fn leaves_of<'a>(&'a self, uid: &'a Uid) -> impl Iterator<Item = &'a LeafView> + 'a {
-        self.leaves.iter().filter(move |leaf| leaf.uid() == Some(uid))
+        self.leaves
+            .iter()
+            .filter(move |leaf| leaf.uid() == Some(uid))
     }
 
     /// The leaves whose profile's `updated` is more than 35 days older than
@@ -492,7 +494,10 @@ pub fn check_commit(
     facts: &dyn KeyFacts,
     now: SystemTime,
 ) -> Result<Verdict, CommitError> {
-    let old = group.conversation.as_ref().map_err(|_| CommitError::Group)?;
+    let old = group
+        .conversation
+        .as_ref()
+        .map_err(|_| CommitError::Group)?;
     let new = commit
         .new_conversation
         .as_ref()
@@ -529,7 +534,9 @@ pub fn check_commit(
                 .iter()
                 .any(|p| matches!(p, ProposalView::ExternalInit))
             {
-                return Err(CommitError::Proposal("an ExternalInit in a member's commit"));
+                return Err(CommitError::Proposal(
+                    "an ExternalInit in a member's commit",
+                ));
             }
             Some(old_leaf)
         }
@@ -538,8 +545,7 @@ pub fn check_commit(
             None
         }
     };
-    if (!path_identity.is_guest() && path_leaf.profile.is_none()) || !path_leaf.encryption_key_ok
-    {
+    if (!path_identity.is_guest() && path_leaf.profile.is_none()) || !path_leaf.encryption_key_ok {
         return Err(CommitError::Leaf);
     }
     let committer_uid = &path_identity.uid;
@@ -562,14 +568,13 @@ pub fn check_commit(
             return Err(CommitError::Proposal("a leaf removed twice"));
         }
     }
-    let removed_uids: BTreeMap<&Uid, usize> =
-        removed
-            .iter()
-            .filter_map(|i| group.leaf(*i)?.uid())
-            .fold(BTreeMap::new(), |mut counts, uid| {
-                *counts.entry(uid).or_default() += 1;
-                counts
-            });
+    let removed_uids: BTreeMap<&Uid, usize> = removed
+        .iter()
+        .filter_map(|i| group.leaf(*i)?.uid())
+        .fold(BTreeMap::new(), |mut counts, uid| {
+            *counts.entry(uid).or_default() += 1;
+            counts
+        });
     for proposal in &commit.proposals {
         let ProposalView::Remove(index) = proposal else {
             continue;
@@ -721,10 +726,13 @@ fn check_external(
         .iter()
         .filter(|p| matches!(p, ProposalView::ExternalInit))
         .count();
-    if inits != 1 || commit
-        .proposals
-        .iter()
-        .any(|p| matches!(p, ProposalView::Add { .. } | ProposalView::GroupContextExtensions))
+    if inits != 1
+        || commit.proposals.iter().any(|p| {
+            matches!(
+                p,
+                ProposalView::Add { .. } | ProposalView::GroupContextExtensions
+            )
+        })
     {
         return Err(CommitError::External);
     }
@@ -738,7 +746,10 @@ fn check_external(
             Ok(())
         };
     };
-    let binding = commit.path_binding.as_ref().ok_or(CommitError::NotCurrentDevice)?;
+    let binding = commit
+        .path_binding
+        .as_ref()
+        .ok_or(CommitError::NotCurrentDevice)?;
     match facts.current_device_key(&joiner.uid, &device_id) {
         Fact::Known(Some(key)) => {
             if !binding.verify(&key, &joiner.uid, b"", &commit.path_encryption_key) {
@@ -795,9 +806,7 @@ fn check_add(
             ConversationKind::Direct => old
                 .direct_participants()
                 .is_some_and(|participants| participants.contains(uid)),
-            _ => {
-                group.leaves_of(uid).next().is_some() || old.role(committer) >= Role::Mod
-            }
+            _ => group.leaves_of(uid).next().is_some() || old.role(committer) >= Role::Mod,
         }
     };
     if !allowed {
@@ -853,12 +862,9 @@ mod tests {
     fn room(kind: ConversationKind) -> RisalaConversation {
         let owner = uid("o@x.org");
         let mut conv = match kind {
-            ConversationKind::PublicRoom => RisalaConversation::public_room(
-                "h.org",
-                [0; 16],
-                &"#r".parse().unwrap(),
-                &owner,
-            ),
+            ConversationKind::PublicRoom => {
+                RisalaConversation::public_room("h.org", [0; 16], &"#r".parse().unwrap(), &owner)
+            }
             _ => RisalaConversation::private_room("h.org", [0; 16], "R", &owner),
         };
         conv.mods.push(uid("m@x.org"));
@@ -879,7 +885,12 @@ mod tests {
     }
 
     /// A commit by leaf `by` that refreshes its leaf at time `updated`.
-    fn commit(group: &GroupView, by: u32, updated: u64, proposals: Vec<ProposalView>) -> CommitView {
+    fn commit(
+        group: &GroupView,
+        by: u32,
+        updated: u64,
+        proposals: Vec<ProposalView>,
+    ) -> CommitView {
         let mut path = group.leaf(LeafNodeIndex::new(by)).unwrap().clone();
         path.profile = Some(RisalaProfile::new("", updated).unwrap());
         path.from_key_package = false;
@@ -908,7 +919,10 @@ mod tests {
     #[test]
     fn paths_and_proposal_kinds() {
         let g = group(&room(ConversationKind::PrivateRoom));
-        assert_eq!(check(&g, &commit(&g, 2, 2000, vec![])), Ok(Verdict::default()));
+        assert_eq!(
+            check(&g, &commit(&g, 2, 2000, vec![])),
+            Ok(Verdict::default())
+        );
         let mut no_path = commit(&g, 2, 2000, vec![]);
         no_path.path_leaf = None;
         assert_eq!(check(&g, &no_path), Err(CommitError::NoPath));
@@ -934,10 +948,8 @@ mod tests {
         let conv = room(ConversationKind::PrivateRoom);
         let g = group(&conv);
         let mut other = commit(&g, 2, 2000, vec![]);
-        other.path_leaf.as_mut().unwrap().identity = Some(RisalaIdentity::device(
-            uid("p@x.org"),
-            DeviceId([9; 48]),
-        ));
+        other.path_leaf.as_mut().unwrap().identity =
+            Some(RisalaIdentity::device(uid("p@x.org"), DeviceId([9; 48])));
         assert_eq!(check(&g, &other), Err(CommitError::Leaf));
         let mut no_profile = commit(&g, 2, 2000, vec![]);
         no_profile.path_leaf.as_mut().unwrap().profile = None;
@@ -1039,7 +1051,8 @@ mod tests {
         let mut none = commit(&g, 0, 2000, vec![ProposalView::GroupContextExtensions]);
         none.new_conversation.as_mut().unwrap().guests = GuestMode::None;
         assert_eq!(check(&g, &none), Err(CommitError::LeftBehind));
-        none.proposals.push(ProposalView::Remove(LeafNodeIndex::new(4)));
+        none.proposals
+            .push(ProposalView::Remove(LeafNodeIndex::new(4)));
         assert!(check(&g, &none).is_ok());
         // A ban must remove the identity's leaves.
         let mut ban = commit(&g, 1, 2000, vec![ProposalView::GroupContextExtensions]);
@@ -1075,16 +1088,25 @@ mod tests {
         let g = crowd(&conv, 256, 1);
         assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
         let g = crowd(&conv, 257, 1);
-        assert_eq!(check(&g, &commit(&g, 0, 2000, vec![])), Err(CommitError::TooLarge));
+        assert_eq!(
+            check(&g, &commit(&g, 0, 2000, vec![])),
+            Err(CommitError::TooLarge)
+        );
         let mut epochal = conv.clone();
         epochal.confirm = ConfirmMode::Epochal;
         let g = crowd(&epochal, 257, 1);
         assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
         // 1,000 identities and 4,096 leaves in a private room (6.1).
         let g = crowd(&epochal, 1001, 1);
-        assert_eq!(check(&g, &commit(&g, 0, 2000, vec![])), Err(CommitError::TooLarge));
+        assert_eq!(
+            check(&g, &commit(&g, 0, 2000, vec![])),
+            Err(CommitError::TooLarge)
+        );
         let g = crowd(&epochal, 400, 11);
-        assert_eq!(check(&g, &commit(&g, 0, 2000, vec![])), Err(CommitError::TooLarge));
+        assert_eq!(
+            check(&g, &commit(&g, 0, 2000, vec![])),
+            Err(CommitError::TooLarge)
+        );
         let public = room(ConversationKind::PublicRoom);
         let g = crowd(&public, 1001, 1);
         assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
@@ -1102,7 +1124,10 @@ mod tests {
         assert_eq!(check_join(&g, &expect), Ok(()));
         let mut other_host = expect.clone();
         other_host.host = "x.org".into();
-        assert_eq!(check_join(&g, &other_host), Err(JoinError::WrongConversation));
+        assert_eq!(
+            check_join(&g, &other_host),
+            Err(JoinError::WrongConversation)
+        );
         let mut public = expect.clone();
         public.public_room = Some(("#r".parse().unwrap(), [0; 16]));
         assert_eq!(check_join(&g, &public), Err(JoinError::WrongConversation));
@@ -1110,7 +1135,12 @@ mod tests {
         guest.leaves.push(leaf(4, "~sam", 1));
         assert_eq!(check_join(&guest, &expect), Err(JoinError::Guest));
         let mut banned = g.clone();
-        banned.conversation.as_mut().unwrap().bans.push(uid("p@x.org"));
+        banned
+            .conversation
+            .as_mut()
+            .unwrap()
+            .bans
+            .push(uid("p@x.org"));
         assert_eq!(check_join(&banned, &expect), Err(JoinError::Banned));
         let mut no_profile = g.clone();
         no_profile.leaves[1].profile = None;
