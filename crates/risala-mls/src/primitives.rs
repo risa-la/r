@@ -1,5 +1,5 @@
 //! The primitives of cipher suite `0x0020` that risala uses outside MLS
-//! itself (12.8-12.10): SHA-384, HKDF-SHA384, HMAC-SHA-384 and
+//! itself (12.9-12.13): SHA-384, HKDF-SHA384, HMAC-SHA-384 and
 //! ChaCha20-Poly1305, from the same libcrux crates as the provider, and the
 //! labelled functions of [RFC9420] built from them.
 
@@ -10,20 +10,20 @@ use zeroize::Zeroizing;
 pub const HASH_LEN: usize = 48;
 
 /// The key, nonce and tag lengths of ChaCha20-Poly1305 [RFC8439].
-pub(crate) const AEAD_KEY_LEN: usize = libcrux_chacha20poly1305::KEY_LEN;
-pub(crate) const AEAD_NONCE_LEN: usize = libcrux_chacha20poly1305::NONCE_LEN;
-pub(crate) const AEAD_TAG_LEN: usize = libcrux_chacha20poly1305::TAG_LEN;
+pub const AEAD_KEY_LEN: usize = libcrux_chacha20poly1305::KEY_LEN;
+pub const AEAD_NONCE_LEN: usize = libcrux_chacha20poly1305::NONCE_LEN;
+pub const AEAD_TAG_LEN: usize = libcrux_chacha20poly1305::TAG_LEN;
 
 /// The prefix of every MLS label [RFC9420, 5.1.2, 8].
-pub use risala_proto::auth::MLS_LABEL_PREFIX;
+pub const MLS_LABEL_PREFIX: &str = "MLS 1.0 ";
 
 /// SHA-384.
-pub(crate) fn sha384(data: &[u8]) -> [u8; HASH_LEN] {
+pub fn sha384(data: &[u8]) -> [u8; HASH_LEN] {
     <sha2::Sha384 as sha2::Digest>::digest(data).into()
 }
 
 /// HKDF-Extract with SHA-384 [RFC5869].
-pub(crate) fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; HASH_LEN]> {
+pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; HASH_LEN]> {
     let mut prk = Zeroizing::new([0; HASH_LEN]);
     libcrux_hkdf::extract(libcrux_hkdf::Algorithm::Sha384, &mut prk[..], salt, ikm)
         .expect("the PRK is one hash long and the inputs are small");
@@ -34,20 +34,20 @@ pub(crate) fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; HASH_LEN]>
 ///
 /// `prk` must be at least 48 bytes, and `okm` at most 255 times that. The
 /// callers in this crate pass fixed lengths that are.
-pub(crate) fn hkdf_expand(prk: &[u8], info: &[u8], okm: &mut [u8]) {
+pub fn hkdf_expand(prk: &[u8], info: &[u8], okm: &mut [u8]) {
     libcrux_hkdf::expand(libcrux_hkdf::Algorithm::Sha384, okm, prk, info)
         .expect("PRK and output lengths are fixed by the callers");
 }
 
 /// HMAC-SHA-384 [RFC2104].
-pub(crate) fn hmac_sha384(key: &[u8], data: &[u8]) -> [u8; HASH_LEN] {
+pub fn hmac_sha384(key: &[u8], data: &[u8]) -> [u8; HASH_LEN] {
     let tag = libcrux_hmac::hmac(libcrux_hmac::Algorithm::Sha384, key, data, None);
     tag.try_into().expect("HMAC-SHA-384 gives 48 bytes")
 }
 
 /// ChaCha20-Poly1305 encryption [RFC8439]: the ciphertext followed by the
 /// 16-byte tag.
-pub(crate) fn seal(
+pub fn seal(
     key: &[u8; AEAD_KEY_LEN],
     nonce: &[u8; AEAD_NONCE_LEN],
     aad: &[u8],
@@ -61,7 +61,7 @@ pub(crate) fn seal(
 
 /// ChaCha20-Poly1305 decryption [RFC8439] of a ciphertext that ends in its
 /// tag, or `None` if it does not verify.
-pub(crate) fn open(
+pub fn open(
     key: &[u8; AEAD_KEY_LEN],
     nonce: &[u8; AEAD_NONCE_LEN],
     aad: &[u8],
@@ -75,12 +75,12 @@ pub(crate) fn open(
 
 /// Whether two secrets of the same length are equal, in time that does
 /// not depend on where they differ.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// `N` bytes from the operating system's secure random source.
-pub(crate) fn random<const N: usize>() -> Result<[u8; N], getrandom::Error> {
+pub fn random<const N: usize>() -> Result<[u8; N], getrandom::Error> {
     let mut out = [0; N];
     getrandom::fill(&mut out)?;
     Ok(out)

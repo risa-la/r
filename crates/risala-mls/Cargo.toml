@@ -1,6 +1,6 @@
 [package]
 name = "risala-mls"
-description = "The MLS layer of risala (SPEC 12): the cipher suite's provider, device signers, groups, history keys, encrypted messages and backups"
+description = "The MLS layer of risala (SPEC 12): the cipher suite's provider, leaf keys, credentials and extensions, KeyPackages, groups and their checks, and the framing the server reads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,6 @@ authors.workspace = true
 
 [dependencies]
 risala-proto.workspace = true
-base64.workspace = true
 openmls.workspace = true
 openmls_traits.workspace = true
 openmls_libcrux_crypto.workspace = true
@@ -23,11 +22,14 @@ sha2.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+serde.workspace = true
+# A throwaway storage, for the first of the two builds that bind a leaf's
+# keys (src/seeded.rs).
+openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 
 [dev-dependencies]
 # The patched port in crates/openmls-sqlite-storage (see the root Cargo.toml).
 openmls_sqlite_storage.workspace = true
-openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 rusqlite.workspace = true
 # HPKE with the KEM id spelled out, to pin what the provider sends (SPEC 12.2).
 hpke-rs = "0.7"

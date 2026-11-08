@@ -1,147 +1,499 @@
-//! The conversation extension, `0xF2A1` (12.2, 15).
+//! The conversation extension, `0xF2A1` (12.4, 6.2, 6.3, 15).
 //!
 //! Every group carries it in its group context. It ties the group to one
-//! conversation, and holds the room's `history` (12.9) and `send` (6.2)
-//! settings, so that the server can neither swap groups nor change the
-//! settings behind the members' backs:
+//! conversation, mailbox and server, and holds the room's roles and
+//! settings:
 //!
 //! ```text
 //! struct {
-//!     ConversationKind kind;     // direct(1), room(2)
+//!     uint8 version;               // 1
+//!     ConversationKind kind;       // direct(1), private_room(2), public_room(3)
+//!     opaque host<V>;              // the server, in lower case
+//!     opaque box[16];              // the mailbox
 //!     opaque name<V>;
-//!     HistoryMode history;       // shared(1), joined(2)
-//!     SendMode send;             // all(1), mods(2)
+//!     opaque topic<V>;             // UTF-8, at most 512 bytes
+//!     ConfirmMode confirm;         // pairwise(1), epochal(2)
+//!     GuestMode guests;            // none(1), read(2), write(3)
+//!     SendMode send;               // all(1), mods(2)
+//!     Uid owners<V>;
+//!     Uid mods<V>;
+//!     Uid bans<V>;
 //! } RisalaConversation;
 //! ```
+//!
+//! [`RisalaConversation::decode`] reads the structure,
+//! [`RisalaConversation::check`] checks that it is well formed (12.4), and
+//! [`RisalaConversation::check_change`] that a commit changes only what its
+//! committer may (6.2, 6.3, 6.4).
 
-use openmls::prelude::{Extension, Extensions, GroupContext, UnknownExtension};
-use risala_proto::mls::CONVERSATION_EXTENSION_TYPE;
-use risala_proto::names::{Id, Uid};
-use risala_proto::types::{HistoryMode, SendMode};
-use tls_codec::{Deserialize as _, Serialize as _, TlsDeserialize, TlsSerialize, TlsSize, VLBytes};
+use openmls::prelude::{
+    Extension, ExtensionType, Extensions, GroupContext, RequiredCapabilitiesExtension,
+    UnknownExtension,
+};
+use risala_proto::names::{Room, Uid};
 
-/// The kind of conversation a group belongs to (12.2).
+use crate::codec::{DecodeError, Reader, Writer};
+
+/// The extension type of the conversation extension (12.4, 15).
+pub const CONVERSATION_EXTENSION_TYPE: u16 = 0xF2A1;
+
+/// The conversation extension's type, as OpenMLS names it.
+pub const CONVERSATION_EXTENSION: ExtensionType =
+    ExtensionType::Unknown(CONVERSATION_EXTENSION_TYPE);
+
+/// The length of a mailbox's box (5.2, 12.4).
+pub const BOX_LEN: usize = 16;
+
+/// The longest topic, in bytes (12.4).
+pub const MAX_TOPIC_LEN: usize = 512;
+
+/// The longest private room name, in bytes (12.4).
+pub const MAX_PRIVATE_NAME_LEN: usize = 128;
+
+/// The longest host name accepted, in bytes.
+const MAX_HOST_LEN: usize = 255;
+
+/// The kind of conversation a group belongs to (12.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConversationKind {
-    /// A direct conversation, `direct(1)`.
+    /// `direct(1)`.
     Direct,
-    /// A room, `room(2)`.
-    Room,
+    /// `private_room(2)`.
+    PrivateRoom,
+    /// `public_room(3)`.
+    PublicRoom,
 }
 
-/// The conversation extension of a group (12.2).
+/// How the group's devices confirm leaves (12.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfirmMode {
+    /// `pairwise(1)`.
+    Pairwise,
+    /// `epochal(2)`.
+    Epochal,
+}
+
+/// Whether guests may join a public room, and send (6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuestMode {
+    /// `none(1)`.
+    None,
+    /// `read(2)`.
+    Read,
+    /// `write(3)`.
+    Write,
+}
+
+/// Who may send (6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SendMode {
+    /// `all(1)`.
+    All,
+    /// `mods(2)`.
+    Mods,
+}
+
+/// An identity's role in a room (6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Role {
+    /// A plain member, or a guest.
+    Member,
+    /// A moderator.
+    Mod,
+    /// An owner.
+    Owner,
+}
+
+/// The conversation extension of a group (12.4).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RisalaConversation {
-    /// Direct conversation or room.
+    /// Direct conversation, private room or public room. It never changes.
     pub kind: ConversationKind,
-    /// For a direct conversation, its participants' uids, sorted and
-    /// joined by a space, or one uid for a conversation with yourself. For
-    /// a room, its id (5.1).
+    /// The server, in lower case. It never changes.
+    pub host: String,
+    /// The mailbox (`box`). It never changes.
+    pub mailbox: [u8; BOX_LEN],
+    /// For a direct conversation, the participants' uids, sorted and joined
+    /// by a space, or one uid; for a private room, its name; for a public
+    /// room, its room name, such as `#general`.
     pub name: String,
-    /// The room's `history` setting, `shared` for a direct conversation.
-    pub history: HistoryMode,
-    /// The room's `send` setting, `all` for a direct conversation.
+    /// The topic, empty in a direct conversation.
+    pub topic: String,
+    /// How leaves are confirmed.
+    pub confirm: ConfirmMode,
+    /// Whether guests may join.
+    pub guests: GuestMode,
+    /// Who may send.
     pub send: SendMode,
+    /// The owners.
+    pub owners: Vec<Uid>,
+    /// The moderators.
+    pub mods: Vec<Uid>,
+    /// The banned identities.
+    pub bans: Vec<Uid>,
 }
 
-/// Why a conversation extension is not acceptable (12.2).
+/// Why a conversation extension is not acceptable (12.4).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConversationError {
-    /// The group context has no `0xF2A1` extension.
+    /// The group context has no conversation extension.
     #[error("the group has no conversation extension")]
     Missing,
-    /// The extension's data is not one RisalaConversation with known
-    /// values and a UTF-8 name.
-    #[error("the conversation extension is malformed")]
-    Malformed,
+    /// The group context's extensions are not exactly
+    /// `required_capabilities` then the conversation extension, as 12.4
+    /// says.
+    #[error("the group context's extensions are not risala's")]
+    Extensions,
+    /// The extension is not one RisalaConversation of version 1 with known
+    /// values.
+    #[error(transparent)]
+    Malformed(#[from] DecodeError),
+    /// The extension is well formed, but breaks a rule of 12.4.
+    #[error("the conversation extension is not acceptable: {0}")]
+    Invalid(&'static str),
 }
 
-/// The extension as it is encoded.
-#[derive(TlsSerialize, TlsDeserialize, TlsSize)]
-struct Wire {
-    kind: u8,
-    name: VLBytes,
-    history: u8,
-    send: u8,
+/// Why a change to the conversation extension is not allowed (6.2, 6.3,
+/// 6.4, 12.4).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChangeError {
+    /// The new extension is not well formed.
+    #[error(transparent)]
+    Invalid(#[from] ConversationError),
+    /// A field changed that never changes, or not in this kind of
+    /// conversation.
+    #[error("the field {0} may not change")]
+    Fixed(&'static str),
+    /// The committer's role does not allow this change.
+    #[error("only {0} may change this")]
+    NotAllowed(&'static str),
+}
+
+fn kind_value(kind: ConversationKind) -> u8 {
+    match kind {
+        ConversationKind::Direct => 1,
+        ConversationKind::PrivateRoom => 2,
+        ConversationKind::PublicRoom => 3,
+    }
+}
+
+fn confirm_value(confirm: ConfirmMode) -> u8 {
+    match confirm {
+        ConfirmMode::Pairwise => 1,
+        ConfirmMode::Epochal => 2,
+    }
+}
+
+fn guests_value(guests: GuestMode) -> u8 {
+    match guests {
+        GuestMode::None => 1,
+        GuestMode::Read => 2,
+        GuestMode::Write => 3,
+    }
+}
+
+fn send_value(send: SendMode) -> u8 {
+    match send {
+        SendMode::All => 1,
+        SendMode::Mods => 2,
+    }
+}
+
+fn write_uids(w: &mut Writer, uids: &[Uid]) {
+    let mut inner = Writer::new();
+    for uid in uids {
+        inner.vector(uid.as_str().as_bytes());
+    }
+    w.vector(&inner.into_bytes());
+}
+
+fn read_uid(bytes: &[u8]) -> Result<Uid, DecodeError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| DecodeError("uid is not UTF-8"))?;
+    let uid: Uid = text.parse().map_err(|_| DecodeError("not a uid"))?;
+    if uid.as_str() != text {
+        return Err(DecodeError("uid not in lower case"));
+    }
+    Ok(uid)
+}
+
+fn read_uids(bytes: &[u8]) -> Result<Vec<Uid>, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let mut uids = Vec::new();
+    while r.remaining() > 0 {
+        uids.push(read_uid(r.vector()?)?);
+    }
+    Ok(uids)
+}
+
+fn utf8(bytes: &[u8], what: &'static str) -> Result<String, DecodeError> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| DecodeError(what))
+}
+
+/// The name of the direct conversation between `a` and `b` (12.4).
+fn direct_name(a: &Uid, b: &Uid) -> String {
+    let (a, b) = (a.as_str(), b.as_str());
+    match a.as_bytes().cmp(b.as_bytes()) {
+        std::cmp::Ordering::Equal => a.to_owned(),
+        std::cmp::Ordering::Less => format!("{a} {b}"),
+        std::cmp::Ordering::Greater => format!("{b} {a}"),
+    }
+}
+
+/// Whether `host` is a server name in lower case: printable ASCII without
+/// spaces or upper case. 12.4 says only "in lower case"; the device also
+/// compares it with the server it is on (12.7).
+fn host_ok(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_HOST_LEN
+        && host.bytes().all(|b| b.is_ascii_graphic() && !b.is_ascii_uppercase())
 }
 
 impl RisalaConversation {
-    /// The extension of the direct conversation between `a` and `b`, which
-    /// may be the same uid for a conversation with yourself (12.2). The
-    /// order of `a` and `b` does not matter.
-    pub fn direct(a: &Uid, b: &Uid) -> RisalaConversation {
-        let (a, b) = (a.as_str(), b.as_str());
-        let name = match a.cmp(b) {
-            std::cmp::Ordering::Equal => a.to_owned(),
-            std::cmp::Ordering::Less => format!("{a} {b}"),
-            std::cmp::Ordering::Greater => format!("{b} {a}"),
-        };
+    /// The extension of the direct conversation between `a` and `b`, on
+    /// `host` with mailbox `mailbox` (12.4). `a` and `b` may be the same
+    /// uid, for a conversation with yourself; their order does not matter.
+    pub fn direct(host: &str, mailbox: [u8; BOX_LEN], a: &Uid, b: &Uid) -> RisalaConversation {
         RisalaConversation {
             kind: ConversationKind::Direct,
-            name,
-            history: HistoryMode::Shared,
+            host: host.to_ascii_lowercase(),
+            mailbox,
+            name: direct_name(a, b),
+            topic: String::new(),
+            confirm: ConfirmMode::Pairwise,
+            guests: GuestMode::None,
             send: SendMode::All,
+            owners: Vec::new(),
+            mods: Vec::new(),
+            bans: Vec::new(),
         }
     }
 
-    /// The extension of the room with id `id`, and the given settings
-    /// (12.2).
-    pub fn room(id: &Id, history: HistoryMode, send: SendMode) -> RisalaConversation {
+    /// The extension of a new private room named `name`, whose only owner
+    /// is `creator` (12.4, 6.2): pairwise, no guests, everyone sends.
+    pub fn private_room(
+        host: &str,
+        mailbox: [u8; BOX_LEN],
+        name: &str,
+        creator: &Uid,
+    ) -> RisalaConversation {
         RisalaConversation {
-            kind: ConversationKind::Room,
-            name: id.as_str().to_owned(),
-            history,
-            send,
+            kind: ConversationKind::PrivateRoom,
+            host: host.to_ascii_lowercase(),
+            mailbox,
+            name: name.to_owned(),
+            topic: String::new(),
+            confirm: ConfirmMode::Pairwise,
+            guests: GuestMode::None,
+            send: SendMode::All,
+            owners: vec![creator.clone()],
+            mods: Vec::new(),
+            bans: Vec::new(),
+        }
+    }
+
+    /// The extension of a new public room `room`, whose only owner is
+    /// `creator` (12.4, 6.2): epochal, guests may write, everyone sends.
+    pub fn public_room(
+        host: &str,
+        mailbox: [u8; BOX_LEN],
+        room: &Room,
+        creator: &Uid,
+    ) -> RisalaConversation {
+        RisalaConversation {
+            kind: ConversationKind::PublicRoom,
+            host: host.to_ascii_lowercase(),
+            mailbox,
+            name: room.as_str().to_owned(),
+            topic: String::new(),
+            confirm: ConfirmMode::Epochal,
+            guests: GuestMode::Write,
+            send: SendMode::All,
+            owners: vec![creator.clone()],
+            mods: Vec::new(),
+            bans: Vec::new(),
         }
     }
 
     /// The extension's data.
     pub fn encode(&self) -> Vec<u8> {
-        Wire {
-            kind: match self.kind {
-                ConversationKind::Direct => 1,
-                ConversationKind::Room => 2,
-            },
-            name: self.name.as_bytes().into(),
-            history: match self.history {
-                HistoryMode::Shared => 1,
-                HistoryMode::Joined => 2,
-            },
-            send: match self.send {
-                SendMode::All => 1,
-                SendMode::Mods => 2,
-            },
-        }
-        .tls_serialize_detached()
-        .expect("a name fits a variable-size vector")
+        let mut w = Writer::new();
+        w.u8(1)
+            .u8(kind_value(self.kind))
+            .vector(self.host.as_bytes())
+            .fixed(&self.mailbox)
+            .vector(self.name.as_bytes())
+            .vector(self.topic.as_bytes())
+            .u8(confirm_value(self.confirm))
+            .u8(guests_value(self.guests))
+            .u8(send_value(self.send));
+        write_uids(&mut w, &self.owners);
+        write_uids(&mut w, &self.mods);
+        write_uids(&mut w, &self.bans);
+        w.into_bytes()
     }
 
-    /// Reads the extension's data. It must be exactly one
-    /// RisalaConversation, with values the enums define and a UTF-8 name.
-    pub fn decode(data: &[u8]) -> Result<RisalaConversation, ConversationError> {
-        let wire = Wire::tls_deserialize_exact(data).map_err(|_| ConversationError::Malformed)?;
-        let kind = match wire.kind {
+    /// Reads the extension's data: exactly one RisalaConversation of
+    /// version 1, with values its enums define, UTF-8 text and uids in
+    /// lower case. Whether it is well formed is [`check`](Self::check)'s.
+    pub fn decode(bytes: &[u8]) -> Result<RisalaConversation, DecodeError> {
+        let mut r = Reader::new(bytes);
+        if r.u8()? != 1 {
+            return Err(DecodeError("unknown RisalaConversation version"));
+        }
+        let kind = match r.u8()? {
             1 => ConversationKind::Direct,
-            2 => ConversationKind::Room,
-            _ => return Err(ConversationError::Malformed),
+            2 => ConversationKind::PrivateRoom,
+            3 => ConversationKind::PublicRoom,
+            _ => return Err(DecodeError("unknown conversation kind")),
         };
-        let history = match wire.history {
-            1 => HistoryMode::Shared,
-            2 => HistoryMode::Joined,
-            _ => return Err(ConversationError::Malformed),
+        let host = utf8(r.vector()?, "host is not UTF-8")?;
+        let mailbox = r.array::<BOX_LEN>()?;
+        let name = utf8(r.vector()?, "name is not UTF-8")?;
+        let topic = utf8(r.vector()?, "topic is not UTF-8")?;
+        let confirm = match r.u8()? {
+            1 => ConfirmMode::Pairwise,
+            2 => ConfirmMode::Epochal,
+            _ => return Err(DecodeError("unknown confirm mode")),
         };
-        let send = match wire.send {
+        let guests = match r.u8()? {
+            1 => GuestMode::None,
+            2 => GuestMode::Read,
+            3 => GuestMode::Write,
+            _ => return Err(DecodeError("unknown guest mode")),
+        };
+        let send = match r.u8()? {
             1 => SendMode::All,
             2 => SendMode::Mods,
-            _ => return Err(ConversationError::Malformed),
+            _ => return Err(DecodeError("unknown send mode")),
         };
-        let name = String::from_utf8(wire.name.into()).map_err(|_| ConversationError::Malformed)?;
+        let owners = read_uids(r.vector()?)?;
+        let mods = read_uids(r.vector()?)?;
+        let bans = read_uids(r.vector()?)?;
+        r.finish()?;
         Ok(RisalaConversation {
             kind,
+            host,
+            mailbox,
             name,
-            history,
+            topic,
+            confirm,
+            guests,
             send,
+            owners,
+            mods,
+            bans,
         })
+    }
+
+    /// Checks that the extension is well formed (12.4, 6.2).
+    pub fn check(&self) -> Result<(), ConversationError> {
+        let invalid = |why| Err(ConversationError::Invalid(why));
+        if !host_ok(&self.host) {
+            return invalid("host is not a lower-case server name");
+        }
+        if self.topic.len() > MAX_TOPIC_LEN {
+            return invalid("topic longer than 512 bytes");
+        }
+        for list in [&self.owners, &self.mods, &self.bans] {
+            if list.iter().any(Uid::is_guest) {
+                return invalid("a guest in owners, mods or bans");
+            }
+            // 12.4 does not say so, but a list that names a uid twice has
+            // no use, and two encodings of the same lists could tell
+            // devices apart.
+            for (i, uid) in list.iter().enumerate() {
+                if list[..i].contains(uid) {
+                    return invalid("a uid twice in one list");
+                }
+            }
+        }
+        if self.owners.iter().any(|uid| self.mods.contains(uid)) {
+            return invalid("a uid in both owners and mods");
+        }
+        match self.kind {
+            ConversationKind::Direct => {
+                // "owners holds at least one uid" (12.4) cannot apply here,
+                // since the lists of a direct conversation are empty.
+                let participants = self.direct_participants();
+                if participants.is_none() {
+                    return invalid("not the name of a direct conversation");
+                }
+                if !self.topic.is_empty()
+                    || self.confirm != ConfirmMode::Pairwise
+                    || self.guests != GuestMode::None
+                    || self.send != SendMode::All
+                    || !self.owners.is_empty()
+                    || !self.mods.is_empty()
+                    || !self.bans.is_empty()
+                {
+                    return invalid("settings a direct conversation does not have");
+                }
+            }
+            ConversationKind::PrivateRoom => {
+                if self.name.is_empty() || self.name.len() > MAX_PRIVATE_NAME_LEN {
+                    return invalid("private room name not 1 to 128 bytes");
+                }
+                if self.guests != GuestMode::None {
+                    return invalid("guests in a private room");
+                }
+                if self.owners.is_empty() {
+                    return invalid("no owner");
+                }
+            }
+            ConversationKind::PublicRoom => {
+                match self.name.parse::<Room>() {
+                    Ok(room) if room.as_str() == self.name => {}
+                    _ => return invalid("not a room name"),
+                }
+                if self.confirm != ConfirmMode::Epochal {
+                    return invalid("a public room that is not epochal");
+                }
+                if self.owners.is_empty() {
+                    return invalid("no owner");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The participants of a direct conversation: one uid, or two in byte
+    /// order. `None` if the name is not that, or this is a room.
+    ///
+    /// A participant may be a guest uid: guests may open a direct
+    /// conversation with a room's owners and moderators, to report (4.2,
+    /// 5.8).
+    pub fn direct_participants(&self) -> Option<Vec<Uid>> {
+        if self.kind != ConversationKind::Direct {
+            return None;
+        }
+        let parts: Vec<&str> = self.name.split(' ').collect();
+        let uids = parts
+            .iter()
+            .map(|part| read_uid(part.as_bytes()).ok())
+            .collect::<Option<Vec<Uid>>>()?;
+        match uids.as_slice() {
+            [_] => Some(uids),
+            [a, b] if a.as_str().as_bytes() < b.as_str().as_bytes() => Some(uids),
+            _ => None,
+        }
+    }
+
+    /// The role of `uid` in a room (6.3). Guests are always plain members.
+    pub fn role(&self, uid: &Uid) -> Role {
+        if self.owners.contains(uid) {
+            Role::Owner
+        } else if self.mods.contains(uid) {
+            Role::Mod
+        } else {
+            Role::Member
+        }
+    }
+
+    /// Whether `uid` is banned (6.4).
+    pub fn is_banned(&self, uid: &Uid) -> bool {
+        self.bans.contains(uid)
     }
 
     /// The extension, for a group context.
@@ -149,32 +501,124 @@ impl RisalaConversation {
         Extension::Unknown(CONVERSATION_EXTENSION_TYPE, UnknownExtension(self.encode()))
     }
 
-    /// Reads the extension from a group context's extensions.
+    /// Reads the extension from a group context's extensions, and checks
+    /// that the extensions are exactly what 12.4 says:
+    /// `required_capabilities` as [`crate::group::required_capabilities`]
+    /// makes it, then a well-formed conversation extension, and nothing
+    /// else.
     pub fn from_extensions(
         extensions: &Extensions<GroupContext>,
     ) -> Result<RisalaConversation, ConversationError> {
-        let extension = extensions
-            .unknown(CONVERSATION_EXTENSION_TYPE)
-            .ok_or(ConversationError::Missing)?;
-        RisalaConversation::decode(&extension.0)
+        let mut iter = extensions.iter();
+        let (Some(first), Some(second), None) = (iter.next(), iter.next(), iter.next()) else {
+            return Err(match extensions.unknown(CONVERSATION_EXTENSION_TYPE) {
+                None => ConversationError::Missing,
+                Some(_) => ConversationError::Extensions,
+            });
+        };
+        let Extension::RequiredCapabilities(required) = first else {
+            return Err(ConversationError::Extensions);
+        };
+        if !same_required_capabilities(required, &crate::group::required_capabilities()) {
+            return Err(ConversationError::Extensions);
+        }
+        let Extension::Unknown(CONVERSATION_EXTENSION_TYPE, data) = second else {
+            return Err(ConversationError::Missing);
+        };
+        let conversation = RisalaConversation::decode(&data.0)?;
+        conversation.check()?;
+        Ok(conversation)
     }
 
-    /// Whether this names the direct conversation between `a` and `b`
-    /// (12.6).
-    pub fn is_direct(&self, a: &Uid, b: &Uid) -> bool {
-        *self == RisalaConversation::direct(a, b)
+    /// Checks a commit's change from `self`, the extension as of the epoch
+    /// the commit is for, to `new`, by a committer whose uid is `committer`
+    /// (6.2, 6.3, 6.4, 12.4, 12.7).
+    ///
+    /// This covers the extension alone. That a ban also removes the
+    /// identity's leaves, that `guests none` removes the guests', and the
+    /// 256-member threshold are checked with the commit (see
+    /// [`crate::checks`]).
+    pub fn check_change(&self, new: &RisalaConversation, committer: &Uid) -> Result<(), ChangeError> {
+        new.check()?;
+        if new.kind != self.kind {
+            return Err(ChangeError::Fixed("kind"));
+        }
+        if new.host != self.host {
+            return Err(ChangeError::Fixed("host"));
+        }
+        if new.mailbox != self.mailbox {
+            return Err(ChangeError::Fixed("box"));
+        }
+        let role = self.role(committer);
+        let owner = role == Role::Owner;
+        let mod_or_owner = role >= Role::Mod;
+        if new.name != self.name {
+            if self.kind != ConversationKind::PrivateRoom {
+                return Err(ChangeError::Fixed("name"));
+            }
+            if !owner {
+                return Err(ChangeError::NotAllowed("owners"));
+            }
+        }
+        if new.topic != self.topic && !mod_or_owner {
+            return Err(ChangeError::NotAllowed("owners and moderators"));
+        }
+        if new.guests != self.guests {
+            if self.kind != ConversationKind::PublicRoom {
+                return Err(ChangeError::Fixed("guests"));
+            }
+            if !owner {
+                return Err(ChangeError::NotAllowed("owners"));
+            }
+        }
+        if new.send != self.send && !owner {
+            return Err(ChangeError::NotAllowed("owners"));
+        }
+        if new.confirm != self.confirm {
+            if !owner {
+                return Err(ChangeError::NotAllowed("owners"));
+            }
+            if !(self.confirm == ConfirmMode::Pairwise && new.confirm == ConfirmMode::Epochal) {
+                return Err(ChangeError::Fixed("confirm, except from pairwise to epochal"));
+            }
+        }
+        if (!same_set(&new.owners, &self.owners) || !same_set(&new.mods, &self.mods)) && !owner {
+            return Err(ChangeError::NotAllowed("owners"));
+        }
+        if !same_set(&new.bans, &self.bans) {
+            if !mod_or_owner {
+                return Err(ChangeError::NotAllowed("owners and moderators"));
+            }
+            // Moderators ban and unban plain members only (6.3, 6.4), by
+            // their role as of the epoch the commit is for.
+            let changed = new
+                .bans
+                .iter()
+                .filter(|uid| !self.bans.contains(uid))
+                .chain(self.bans.iter().filter(|uid| !new.bans.contains(uid)));
+            for uid in changed {
+                if !owner && self.role(uid) != Role::Member {
+                    return Err(ChangeError::NotAllowed("owners"));
+                }
+            }
+        }
+        Ok(())
     }
+}
 
-    /// Whether this names the room with id `id` (12.6).
-    pub fn is_room(&self, id: &Id) -> bool {
-        self.kind == ConversationKind::Room && self.name == id.as_str()
-    }
+fn same_set(a: &[Uid], b: &[Uid]) -> bool {
+    a.len() == b.len() && a.iter().all(|uid| b.contains(uid))
+}
 
-    /// Whether `other` differs from this one only in `history` and `send`,
-    /// the fields an owner's commit may change (12.5, 12.6).
-    pub fn same_conversation(&self, other: &RisalaConversation) -> bool {
-        self.kind == other.kind && self.name == other.name
-    }
+/// Whether two `required_capabilities` extensions list the same things in
+/// the same order.
+fn same_required_capabilities(
+    a: &RequiredCapabilitiesExtension,
+    b: &RequiredCapabilitiesExtension,
+) -> bool {
+    a.extension_types() == b.extension_types()
+        && a.proposal_types() == b.proposal_types()
+        && a.credential_types() == b.credential_types()
 }
 
 #[cfg(test)]
@@ -185,65 +629,193 @@ mod tests {
         s.parse().unwrap()
     }
 
-    #[test]
-    fn direct_names() {
-        let a = uid("bob@example.net");
-        let b = uid("alice@example.org");
-        let conv = RisalaConversation::direct(&a, &b);
-        assert_eq!(conv.name, "alice@example.org bob@example.net");
-        assert_eq!(conv, RisalaConversation::direct(&b, &a));
-        assert_eq!(conv.history, HistoryMode::Shared);
-        assert_eq!(conv.send, SendMode::All);
-        assert!(conv.is_direct(&a, &b));
-        assert!(!conv.is_direct(&a, &a));
+    const BOX: [u8; 16] = [0xab; 16];
 
-        let me = RisalaConversation::direct(&a, &a);
-        assert_eq!(me.name, "bob@example.net");
-        // Upper case is folded by the uid itself.
-        assert_eq!(me, RisalaConversation::direct(&uid("Bob@Example.NET"), &a));
+    fn room() -> RisalaConversation {
+        let mut conv =
+            RisalaConversation::private_room("chat.example.org", BOX, "Friends", &uid("o@x.org"));
+        conv.mods.push(uid("m@x.org"));
+        conv
     }
 
-    /// The spike's encoding of `room r7x2k9qp, shared`, with `send all`.
     #[test]
-    fn encoding() {
-        let id: Id = "r7x2k9qp".parse().unwrap();
-        let conv = RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All);
-        assert_eq!(conv.encode(), b"\x02\x08r7x2k9qp\x01\x01");
-        assert_eq!(RisalaConversation::decode(&conv.encode()), Ok(conv.clone()));
-        assert!(conv.is_room(&id));
-        assert!(!conv.is_room(&"other".parse().unwrap()));
+    fn direct() {
+        let a = uid("bob@example.net");
+        let b = uid("alice@example.org");
+        let conv = RisalaConversation::direct("Chat.Example.org", BOX, &a, &b);
+        assert_eq!(conv.host, "chat.example.org");
+        assert_eq!(conv.name, "alice@example.org bob@example.net");
+        assert_eq!(conv, RisalaConversation::direct("chat.example.org", BOX, &b, &a));
+        assert_eq!(conv.check(), Ok(()));
+        assert_eq!(conv.direct_participants(), Some(vec![b.clone(), a.clone()]));
 
-        let mods = RisalaConversation::room(&id, HistoryMode::Joined, SendMode::Mods);
-        assert_eq!(mods.encode(), b"\x02\x08r7x2k9qp\x02\x02");
-        assert!(conv.same_conversation(&mods));
-        assert_ne!(conv, mods);
+        let me = RisalaConversation::direct("chat.example.org", BOX, &a, &a);
+        assert_eq!(me.name, "bob@example.net");
+        assert_eq!(me.direct_participants(), Some(vec![a.clone()]));
+        assert_eq!(me.check(), Ok(()));
 
-        for bad in [
-            &b"\x02\x08r7x2k9qp\x01\x01\x00"[..],
-            b"\x02\x08r7x2k9qp\x01",
-            b"\x00\x08r7x2k9qp\x01\x01",
-            b"\x03\x08r7x2k9qp\x01\x01",
-            b"\x02\x08r7x2k9qp\x00\x01",
-            b"\x02\x08r7x2k9qp\x01\x03",
-            b"\x02\x02\xff\xfe\x01\x01",
-            b"",
+        // A guest may be a participant (4.2, 5.8).
+        let guest = RisalaConversation::direct("chat.example.org", BOX, &uid("~sam"), &b);
+        assert_eq!(guest.name, "alice@example.org ~sam");
+        assert_eq!(guest.check(), Ok(()));
+
+        for name in [
+            "bob@example.net alice@example.org",
+            "alice@example.org alice@example.org",
+            "alice@example.org  bob@example.net",
+            "Alice@example.org",
+            "a b c",
+            "",
         ] {
-            assert_eq!(
-                RisalaConversation::decode(bad),
-                Err(ConversationError::Malformed),
-                "{bad:?}"
-            );
+            let mut bad = conv.clone();
+            bad.name = name.to_owned();
+            assert!(bad.check().is_err(), "{name}");
+        }
+        for change in [
+            |c: &mut RisalaConversation| c.topic = "t".into(),
+            |c: &mut RisalaConversation| c.confirm = ConfirmMode::Epochal,
+            |c: &mut RisalaConversation| c.send = SendMode::Mods,
+            |c: &mut RisalaConversation| c.owners.push("a@b.org".parse().unwrap()),
+        ] {
+            let mut bad = conv.clone();
+            change(&mut bad);
+            assert!(bad.check().is_err());
         }
     }
 
     #[test]
-    fn extensions() {
-        let conv = RisalaConversation::direct(&uid("a@example.org"), &uid("b@example.org"));
-        let extensions = Extensions::single(conv.to_extension()).unwrap();
-        assert_eq!(RisalaConversation::from_extensions(&extensions), Ok(conv));
-        assert_eq!(
-            RisalaConversation::from_extensions(&Extensions::empty()),
-            Err(ConversationError::Missing)
+    fn encoding() {
+        let mut conv = room();
+        conv.topic = "hi".into();
+        conv.bans.push(uid("b@x.org"));
+        let encoded = conv.encode();
+        let mut expected = b"\x01\x02\x10chat.example.org".to_vec();
+        expected.extend_from_slice(&BOX);
+        expected.extend_from_slice(b"\x07Friends\x02hi\x01\x01\x01");
+        expected.extend_from_slice(b"\x08\x07o@x.org\x08\x07m@x.org\x08\x07b@x.org");
+        assert_eq!(encoded, expected);
+        assert_eq!(RisalaConversation::decode(&encoded), Ok(conv.clone()));
+
+        // Every enum value outside its range, and other damage.
+        for (offset, value) in [(0, 2), (1, 0), (1, 4), (46, 0), (46, 3), (47, 0), (47, 4), (48, 3)] {
+            let mut bad = encoded.clone();
+            bad[offset] = value;
+            assert!(RisalaConversation::decode(&bad).is_err(), "{offset}");
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(RisalaConversation::decode(&trailing).is_err());
+        assert!(RisalaConversation::decode(&encoded[..encoded.len() - 1]).is_err());
+        let mut upper = encoded.clone();
+        let at = upper.len() - 7;
+        upper[at] = b'B';
+        assert!(RisalaConversation::decode(&upper).is_err());
+    }
+
+    #[test]
+    fn well_formed_rooms() {
+        assert_eq!(room().check(), Ok(()));
+        let public = RisalaConversation::public_room(
+            "chat.example.org",
+            BOX,
+            &"#general".parse().unwrap(),
+            &uid("o@x.org"),
         );
+        assert_eq!(public.check(), Ok(()));
+        assert_eq!(public.guests, GuestMode::Write);
+
+        type Change = fn(&mut RisalaConversation);
+        let checks: [(Change, bool); 11] = [
+            (|c| c.owners.clear(), true),
+            (|c| c.mods.push("o@x.org".parse().unwrap()), true),
+            (|c| c.bans.push("~sam".parse().unwrap()), true),
+            (|c| c.mods.push("m@x.org".parse().unwrap()), true),
+            (|c| c.topic = "x".repeat(513), true),
+            (|c| c.topic = "x".repeat(512), false),
+            (|c| c.host = "Chat.example.org".into(), true),
+            (|c| c.host = String::new(), true),
+            (|c| c.name = String::new(), true),
+            (|c| c.name = "x".repeat(129), true),
+            (|c| c.guests = GuestMode::Read, true),
+        ];
+        for (i, (change, fails)) in checks.iter().enumerate() {
+            let mut conv = room();
+            change(&mut conv);
+            assert_eq!(conv.check().is_err(), *fails, "{i}");
+        }
+        let mut bad = public.clone();
+        bad.confirm = ConfirmMode::Pairwise;
+        assert!(bad.check().is_err());
+        let mut bad = public.clone();
+        bad.name = "general".into();
+        assert!(bad.check().is_err());
+    }
+
+    #[test]
+    fn roles_and_changes() {
+        let old = room();
+        let (owner, moderator, member) = (uid("o@x.org"), uid("m@x.org"), uid("p@x.org"));
+        assert_eq!(old.role(&owner), Role::Owner);
+        assert_eq!(old.role(&moderator), Role::Mod);
+        assert_eq!(old.role(&member), Role::Member);
+
+        let ok = |change: fn(&mut RisalaConversation), who: &Uid| {
+            let mut new = old.clone();
+            change(&mut new);
+            old.check_change(&new, who)
+        };
+        // Topic: owners and moderators.
+        let topic = |c: &mut RisalaConversation| c.topic = "new".into();
+        assert_eq!(ok(topic, &owner), Ok(()));
+        assert_eq!(ok(topic, &moderator), Ok(()));
+        assert!(ok(topic, &member).is_err());
+        // Name, send, confirm and roles: owners.
+        for change in [
+            (|c: &mut RisalaConversation| c.name = "Other".into()) as fn(&mut _),
+            |c| c.send = SendMode::Mods,
+            |c| c.confirm = ConfirmMode::Epochal,
+            |c| c.mods.push("p@x.org".parse().unwrap()),
+            |c| c.owners.push("p@x.org".parse().unwrap()),
+        ] {
+            assert_eq!(ok(change, &owner), Ok(()));
+            assert!(ok(change, &moderator).is_err());
+        }
+        // Bans: moderators only of plain members.
+        let ban_member = |c: &mut RisalaConversation| c.bans.push("p@x.org".parse().unwrap());
+        let ban_mod = |c: &mut RisalaConversation| c.bans.push("m@x.org".parse().unwrap());
+        assert_eq!(ok(ban_member, &moderator), Ok(()));
+        assert!(ok(ban_member, &member).is_err());
+        assert!(ok(ban_mod, &moderator).is_err());
+        assert_eq!(ok(ban_mod, &owner), Ok(()));
+        // Never kind, host or box; confirm only to epochal; not the last
+        // owner; guests only in public rooms.
+        for change in [
+            (|c: &mut RisalaConversation| c.kind = ConversationKind::PublicRoom) as fn(&mut _),
+            |c| c.host = "other.org".into(),
+            |c| c.mailbox = [0; 16],
+            |c| c.owners.clear(),
+            |c| c.guests = GuestMode::Read,
+        ] {
+            assert!(ok(change, &owner).is_err());
+        }
+        let mut epochal = old.clone();
+        epochal.confirm = ConfirmMode::Epochal;
+        assert!(epochal.check_change(&old, &owner).is_err());
+
+        let public = RisalaConversation::public_room(
+            "chat.example.org",
+            BOX,
+            &"#general".parse().unwrap(),
+            &owner,
+        );
+        let mut renamed = public.clone();
+        renamed.name = "#other".into();
+        assert_eq!(
+            public.check_change(&renamed, &owner),
+            Err(ChangeError::Fixed("name"))
+        );
+        let mut read = public.clone();
+        read.guests = GuestMode::Read;
+        assert_eq!(public.check_change(&read, &owner), Ok(()));
     }
 }

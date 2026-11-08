@@ -1,126 +1,104 @@
-//! MLS values on the wire (12.2): between OpenMLS's types and the base64
-//! values of `risala_proto::mls`.
+//! MLS values as bytes (12.2): `<keypackage>`, `<groupinfo>`, `<message>`
+//! and `<welcome>` are each an MLSMessage, and `<tree>` is the data of a
+//! `ratchet_tree` extension. Lines carry them in base64, or as blobs
+//! (12.12); that is the caller's.
 //!
-//! `<keypackage>`, `<groupinfo>`, `<commit>` and `<welcome>` are each an
-//! MLSMessage, and `<tree>` is the data of a `ratchet_tree` extension. Each
-//! must decode to exactly one value of the expected kind, with nothing
-//! after it.
+//! Each must decode to exactly one value of the expected kind, of `mls10`
+//! and, where it says, the suite `0x0020` (12.2).
 
-use openmls::messages::group_info::{GroupInfo, VerifiableGroupInfo};
+use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::{
-    KeyPackage, KeyPackageIn, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolMessage,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolMessage, ProtocolVersion,
     RatchetTreeIn, Welcome,
 };
 use openmls::treesync::RatchetTree;
-use risala_proto::error::ParseError;
-use risala_proto::mls;
 use tls_codec::{Deserialize as _, Serialize as _};
 
-/// Why a value from the wire is not what it should be.
+use crate::CIPHERSUITE;
+
+/// Why bytes are not the MLS value expected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    /// The bytes are not one MLSMessage of protocol version `mls10`, or one
-    /// ratchet tree.
+    /// Not one well-formed value.
     #[error("not a valid {0}")]
     Malformed(&'static str),
-    /// The MLSMessage holds another kind of value.
+    /// Another kind of MLSMessage.
     #[error("the MLSMessage is not a {0}")]
     WrongKind(&'static str),
-    /// The value is too long for a line (2.3).
-    #[error("too long for a line")]
-    TooLong,
+    /// Another protocol version than `mls10`, or another suite than
+    /// `0x0020` (12.2).
+    #[error("another protocol version or cipher suite")]
+    CipherSuite,
 }
 
-impl From<ParseError> for WireError {
-    fn from(_: ParseError) -> WireError {
-        WireError::TooLong
-    }
-}
-
-fn encode(message: &MlsMessageOut) -> Vec<u8> {
+/// An MLSMessage from OpenMLS, as bytes.
+pub fn to_bytes(message: &MlsMessageOut) -> Vec<u8> {
     message
         .tls_serialize_detached()
         .expect("OpenMLS serialises what it builds")
 }
 
 fn decode(bytes: &[u8], what: &'static str) -> Result<MlsMessageBodyIn, WireError> {
-    MlsMessageIn::tls_deserialize_exact(bytes)
-        .map(MlsMessageIn::extract)
-        .map_err(|_| WireError::Malformed(what))
-}
-
-/// A KeyPackage as `<keypackage>`, for KEYPKG ADD (12.4).
-pub fn key_package_to_wire(key_package: &KeyPackage) -> Result<mls::KeyPackage, WireError> {
-    Ok(mls::KeyPackage::from_bytes(&encode(&MlsMessageOut::from(
-        key_package.clone(),
-    )))?)
-}
-
-/// Reads a `<keypackage>`. It is not checked yet: see
-/// [`check_key_package`](crate::check_key_package).
-pub fn key_package_from_wire(value: &mls::KeyPackage) -> Result<KeyPackageIn, WireError> {
-    match decode(&value.decode(), "KeyPackage")? {
-        MlsMessageBodyIn::KeyPackage(key_package) => Ok(key_package),
-        _ => Err(WireError::WrongKind("KeyPackage")),
+    let message =
+        MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| WireError::Malformed(what))?;
+    // The version is the first field of every MLSMessage.
+    if bytes.get(..2) != Some(&[0, 1]) {
+        return Err(WireError::CipherSuite);
     }
+    Ok(message.extract())
 }
 
-/// A GroupInfo from OpenMLS, as `<groupinfo>` (12.5).
-pub fn group_info_to_wire(group_info: &MlsMessageOut) -> Result<mls::GroupInfo, WireError> {
-    Ok(mls::GroupInfo::from_bytes(&encode(group_info))?)
-}
-
-/// A GroupInfo from a commit, as `<groupinfo>` (12.5).
-pub fn signed_group_info_to_wire(group_info: &GroupInfo) -> Result<mls::GroupInfo, WireError> {
-    group_info_to_wire(&MlsMessageOut::from(group_info.clone()))
-}
-
-/// Reads a `<groupinfo>`. Its signature is not checked yet.
-pub fn group_info_from_wire(value: &mls::GroupInfo) -> Result<VerifiableGroupInfo, WireError> {
-    match decode(&value.decode(), "GroupInfo")? {
-        MlsMessageBodyIn::GroupInfo(group_info) => Ok(group_info),
+/// Reads a `<groupinfo>` (12.6). Its signature is not checked yet.
+pub fn read_group_info(bytes: &[u8]) -> Result<VerifiableGroupInfo, WireError> {
+    match decode(bytes, "GroupInfo")? {
+        MlsMessageBodyIn::GroupInfo(group_info) => {
+            if group_info.ciphersuite() != CIPHERSUITE {
+                return Err(WireError::CipherSuite);
+            }
+            Ok(group_info)
+        }
         _ => Err(WireError::WrongKind("GroupInfo")),
     }
 }
 
-/// A commit from OpenMLS, as `<commit>` (12.5).
-pub fn commit_to_wire(commit: &MlsMessageOut) -> Result<mls::CommitMessage, WireError> {
-    Ok(mls::CommitMessage::from_bytes(&encode(commit))?)
-}
-
-/// Reads a `<commit>`. It must be a PublicMessage (12.5); whether it holds
-/// a commit is up to processing it.
-pub fn commit_from_wire(value: &mls::CommitMessage) -> Result<ProtocolMessage, WireError> {
-    match decode(&value.decode(), "commit")? {
+/// Reads a `<message>`: a PublicMessage or PrivateMessage of `mls10`.
+pub fn read_protocol_message(bytes: &[u8]) -> Result<ProtocolMessage, WireError> {
+    match decode(bytes, "message")? {
         MlsMessageBodyIn::PublicMessage(message) => Ok(message.into()),
-        _ => Err(WireError::WrongKind("PublicMessage")),
+        MlsMessageBodyIn::PrivateMessage(message) => Ok(message.into()),
+        _ => Err(WireError::WrongKind("PublicMessage or PrivateMessage")),
     }
 }
 
-/// A Welcome from OpenMLS, as `<welcome>` (12.5, 12.7).
-pub fn welcome_to_wire(welcome: &MlsMessageOut) -> Result<mls::Welcome, WireError> {
-    Ok(mls::Welcome::from_bytes(&encode(welcome))?)
-}
-
-/// Reads a `<welcome>` (12.7).
-pub fn welcome_from_wire(value: &mls::Welcome) -> Result<Welcome, WireError> {
-    match decode(&value.decode(), "Welcome")? {
-        MlsMessageBodyIn::Welcome(welcome) => Ok(welcome),
+/// Reads a `<welcome>` (12.8).
+pub fn read_welcome(bytes: &[u8]) -> Result<Welcome, WireError> {
+    match decode(bytes, "Welcome")? {
+        MlsMessageBodyIn::Welcome(welcome) => {
+            if welcome.ciphersuite() != CIPHERSUITE {
+                return Err(WireError::CipherSuite);
+            }
+            Ok(welcome)
+        }
         _ => Err(WireError::WrongKind("Welcome")),
     }
 }
 
-/// A ratchet tree as `<tree>` (12.2).
-pub fn tree_to_wire(tree: &RatchetTree) -> Result<mls::RatchetTree, WireError> {
-    let bytes = tree
-        .tls_serialize_detached()
-        .expect("OpenMLS serialises what it builds");
-    Ok(mls::RatchetTree::from_bytes(&bytes)?)
+/// A Welcome from OpenMLS, as `<welcome>` bytes.
+pub fn welcome_to_bytes(welcome: &Welcome) -> Vec<u8> {
+    to_bytes(&MlsMessageOut::from_welcome(
+        welcome.clone(),
+        ProtocolVersion::Mls10,
+    ))
 }
 
-/// Reads a `<tree>` (12.2). OpenMLS checks it against the group when it
-/// is used.
-pub fn tree_from_wire(value: &mls::RatchetTree) -> Result<RatchetTreeIn, WireError> {
-    RatchetTreeIn::tls_deserialize_exact(value.decode())
-        .map_err(|_| WireError::Malformed("ratchet tree"))
+/// A ratchet tree as `<tree>` bytes (12.2).
+pub fn tree_to_bytes(tree: &RatchetTree) -> Vec<u8> {
+    tree.tls_serialize_detached()
+        .expect("OpenMLS serialises what it builds")
+}
+
+/// Reads a `<tree>` (12.2). OpenMLS checks it against the group when it is
+/// used.
+pub fn read_tree(bytes: &[u8]) -> Result<RatchetTreeIn, WireError> {
+    RatchetTreeIn::tls_deserialize_exact(bytes).map_err(|_| WireError::Malformed("ratchet tree"))
 }

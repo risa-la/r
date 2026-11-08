@@ -2,9 +2,9 @@
 //!
 //! `openmls_libcrux_crypto` has X-Wing, ChaCha20-Poly1305 and SHA-384, but
 //! signs only with Ed25519. [`RisalaCrypto`] passes every call through to
-//! it and adds ML-DSA-44 from `libcrux-ml-dsa`, the crate that signs in
-//! (4.5), so a binary carries one ML-DSA (PLAN.md 22). Drop the ML-DSA
-//! part once upstream supports it.
+//! it and adds ML-DSA-44 verification from `libcrux-ml-dsa`, the crate
+//! that signs in (4.6), so a binary carries one ML-DSA (PLAN.md 22). Drop
+//! the ML-DSA part once upstream supports it.
 //!
 //! HPKE uses the KEM `0x647a` (X-Wing), HKDF-SHA384 and ChaCha20-Poly1305
 //! (12.2). OpenMLS names its X-Wing KEM `0x004D` inside, but the libcrux
@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use libcrux_ml_dsa::ml_dsa_44 as mldsa;
 use openmls_libcrux_crypto::CryptoProvider as Libcrux;
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::crypto::OpenMlsCrypto;
@@ -25,10 +24,10 @@ use openmls_traits::types::{
     AeadType, Ciphersuite, CryptoError, ExporterSecret, HashType, HpkeCiphertext, HpkeConfig,
     HpkeKemType, HpkeKeyPair, KemOutput, SignatureScheme,
 };
-use risala_proto::auth::{PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN};
 use tls_codec::SecretVLBytes;
 
 use crate::CIPHERSUITE;
+use crate::mldsa::{PUBLIC_KEY_LEN, SIGNATURE_LEN, verify};
 
 /// The crypto and randomness of the OpenMLS provider: libcrux, with
 /// ML-DSA-44 added (12.2).
@@ -53,29 +52,6 @@ impl std::fmt::Debug for RisalaCrypto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RisalaCrypto")
     }
-}
-
-/// Checks an ML-DSA-44 signature over `message`, with an empty context, as
-/// every signature in risala is (4.5, 12.2). It accepts both the hedged
-/// and the deterministic variant.
-pub fn verify_ml_dsa_44(public_key: &PublicKey, message: &[u8], signature: &[u8]) -> bool {
-    verify_raw(public_key.as_bytes(), message, signature)
-}
-
-fn verify_raw(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
-    let (Ok(public_key), Ok(signature)) = (
-        <[u8; PUBLIC_KEY_LEN]>::try_from(public_key),
-        <[u8; SIGNATURE_LEN]>::try_from(signature),
-    ) else {
-        return false;
-    };
-    mldsa::verify(
-        &mldsa::MLDSA44VerificationKey::new(public_key),
-        message,
-        b"",
-        &mldsa::MLDSA44Signature::new(signature),
-    )
-    .is_ok()
 }
 
 impl OpenMlsCrypto for RisalaCrypto {
@@ -147,8 +123,10 @@ impl OpenMlsCrypto for RisalaCrypto {
         self.inner.aead_decrypt(alg, key, ct_tag, nonce, aad)
     }
 
-    /// Refused for ML-DSA-44: device keys are made by librisala, and their
-    /// seeds never pass through OpenMLS (12.2).
+    /// Refused for ML-DSA-44: leaf keys are made by [`LeafKey`], and their
+    /// seeds stay out of OpenMLS's crypto (12.3).
+    ///
+    /// [`LeafKey`]: crate::LeafKey
     fn signature_key_gen(&self, alg: SignatureScheme) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
         if alg == SignatureScheme::MLDSA44 {
             return Err(CryptoError::UnsupportedSignatureScheme);
@@ -169,17 +147,17 @@ impl OpenMlsCrypto for RisalaCrypto {
         if pk.len() != PUBLIC_KEY_LEN || signature.len() != SIGNATURE_LEN {
             return Err(CryptoError::InvalidLength);
         }
-        if verify_raw(pk, data, signature) {
+        if verify(pk, data, signature) {
             Ok(())
         } else {
             Err(CryptoError::InvalidSignature)
         }
     }
 
-    /// Refused for ML-DSA-44: devices sign with [`DeviceSigner`], which
-    /// signs only MLS content (12.2), and whose key stays out of OpenMLS.
+    /// Refused for ML-DSA-44: leaves sign with [`LeafKey`], which signs only
+    /// MLS content (12.3).
     ///
-    /// [`DeviceSigner`]: crate::DeviceSigner
+    /// [`LeafKey`]: crate::LeafKey
     fn sign(&self, alg: SignatureScheme, data: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if alg == SignatureScheme::MLDSA44 {
             return Err(CryptoError::UnsupportedSignatureScheme);
@@ -256,17 +234,44 @@ impl OpenMlsCrypto for RisalaCrypto {
     }
 }
 
-/// The length of an X-Wing public key: ML-KEM-768's 1184 bytes and
-/// X25519's 32.
+/// The length of an X-Wing public key: ML-KEM-768's 1184 bytes, then
+/// X25519's 32 (12.2).
 pub const X_WING_PUBLIC_KEY_LEN: usize = 1216;
 
-/// Refuses an X-Wing public key of the wrong length, before libcrux-kem
-/// 0.0.9 slices it and panics on a short one (RUSTSEC-2026-0331). Anyone
-/// can put such a key in a KeyPackage, a leaf or a GroupInfo's
-/// `external_pub`, and OpenMLS does not check its length, so without this a
-/// device that encrypts to it would crash.
+/// The length of an ML-KEM-768 encapsulation key.
+const ML_KEM_768_PUBLIC_KEY_LEN: usize = 1184;
+
+/// ML-KEM's modulus q [FIPS203].
+const ML_KEM_Q: u16 = 3329;
+
+/// Whether `key` is an X-Wing public key that may be encrypted to (12.2):
+/// 1216 bytes, whose ML-KEM-768 part passes FIPS 203's encapsulation key
+/// check (7.2): each of its 768 coefficients, 12 bits each in the first
+/// 1152 bytes, is below q, so that decoding and encoding it again gives
+/// the same bytes. The X25519 part needs no check.
+pub fn x_wing_public_key_ok(key: &[u8]) -> bool {
+    if key.len() != X_WING_PUBLIC_KEY_LEN {
+        return false;
+    }
+    // The first 384 * k = 1152 bytes hold the coefficients of t-hat; the
+    // last 32 of the ML-KEM part are rho, which is not checked.
+    key[..ML_KEM_768_PUBLIC_KEY_LEN - 32]
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .all(|b| {
+            let first = u16::from(b[0]) | (u16::from(b[1]) & 0x0f) << 8;
+            let second = u16::from(b[1]) >> 4 | u16::from(b[2]) << 4;
+            first < ML_KEM_Q && second < ML_KEM_Q
+        })
+}
+
+/// Refuses an X-Wing public key that fails [`x_wing_public_key_ok`] before
+/// encrypting to it (12.2). libcrux-kem 0.0.9 also slices a short key and
+/// panics (RUSTSEC-2026-0331); anyone can put such a key in a KeyPackage,
+/// a leaf or a GroupInfo's `external_pub`.
 fn check_hpke_public_key(config: &HpkeConfig, pk: &[u8]) -> Result<(), CryptoError> {
-    if config.0 == HpkeKemType::XWingKemDraft6 && pk.len() != X_WING_PUBLIC_KEY_LEN {
+    if config.0 == HpkeKemType::XWingKemDraft6 && !x_wing_public_key_ok(pk) {
         return Err(CryptoError::InvalidLength);
     }
     Ok(())
@@ -345,7 +350,41 @@ impl<S: StorageProvider<CURRENT_VERSION>> OpenMlsProvider for Provider<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use risala_proto::auth::{SEED_LEN, SecretKey};
+    use crate::mldsa::SigningKey;
+
+    /// FIPS 203's encapsulation key check (12.2): a coefficient of q or
+    /// more fails, anywhere in t-hat, while rho and the X25519 key are not
+    /// checked.
+    #[test]
+    fn x_wing_key_check() {
+        let crypto = RisalaCrypto::new().unwrap();
+        let pair = crypto
+            .derive_hpke_keypair(CIPHERSUITE.hpke_config(), &[7; 32])
+            .unwrap();
+        assert!(x_wing_public_key_ok(&pair.public));
+        assert!(x_wing_public_key_ok(&[0; X_WING_PUBLIC_KEY_LEN]));
+        // 0xff in the last 64 bytes is rho and X25519.
+        let mut tail = vec![0; X_WING_PUBLIC_KEY_LEN];
+        tail[1152..].fill(0xff);
+        assert!(x_wing_public_key_ok(&tail));
+        // Coefficient 3329 (0xd01) as the first and as the second of a pair.
+        for (at, bytes) in [(0, [0x01, 0x0d, 0x00]), (1149, [0x00, 0x10, 0xd0])] {
+            let mut bad = pair.public.clone();
+            bad[at..at + 3].copy_from_slice(&bytes);
+            assert!(!x_wing_public_key_ok(&bad), "{at}");
+            assert_eq!(
+                crypto
+                    .hpke_seal(CIPHERSUITE.hpke_config(), &bad, b"", b"", b"hi")
+                    .err(),
+                Some(CryptoError::InvalidLength)
+            );
+        }
+        // 3328 is the largest coefficient.
+        let mut max = vec![0; X_WING_PUBLIC_KEY_LEN];
+        max[..3].copy_from_slice(&[0x00, 0x0d, 0xd0]);
+        assert!(x_wing_public_key_ok(&max));
+        assert!(!x_wing_public_key_ok(&[0xff; X_WING_PUBLIC_KEY_LEN]));
+    }
 
     /// A short X-Wing public key, as anyone can put in a KeyPackage, leaf or
     /// GroupInfo, is an error rather than a panic (RUSTSEC-2026-0331).
@@ -396,13 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn ml_dsa_verifies_device_signatures_and_never_signs() {
+    fn ml_dsa_verifies_and_never_signs() {
         let crypto = RisalaCrypto::new().unwrap();
-        let seed = [9; SEED_LEN];
-        let key = SecretKey::from_seed(seed);
-        let public = key.public_key().as_bytes().to_vec();
+        let seed = [9; 32];
+        let key = SigningKey::from_seed(seed);
+        let public = key.public_key().to_vec();
 
-        // Only the device signer signs, and only MLS content (12.2).
+        // Only leaf keys sign, outside OpenMLS's crypto (12.3).
         assert_eq!(
             crypto.signature_key_gen(SignatureScheme::MLDSA44),
             Err(CryptoError::UnsupportedSignatureScheme)
@@ -412,12 +451,11 @@ mod tests {
             crypto.sign(SignatureScheme::MLDSA44, &content, &seed),
             Err(CryptoError::UnsupportedSignatureScheme)
         );
-        let ours = key.sign_mls(&content).unwrap().as_bytes().to_vec();
+        let ours = key.sign(&content).to_vec();
         assert_eq!(
             crypto.verify_signature(SignatureScheme::MLDSA44, &content, &public, &ours),
             Ok(())
         );
-        assert!(verify_ml_dsa_44(&key.public_key(), &content, &ours));
         assert_eq!(
             crypto.verify_signature(SignatureScheme::MLDSA44, b"other", &public, &ours),
             Err(CryptoError::InvalidSignature)
@@ -426,7 +464,10 @@ mod tests {
             crypto.verify_signature(SignatureScheme::MLDSA44, &content, &public[1..], &ours),
             Err(CryptoError::InvalidLength)
         );
-        assert!(!verify_ml_dsa_44(&key.public_key(), &content, &ours[1..]));
+        assert_eq!(
+            crypto.verify_signature(SignatureScheme::MLDSA44, &content, &public, &ours[1..]),
+            Err(CryptoError::InvalidLength)
+        );
     }
 
     /// HPKE in the suite uses the KEM `0x647a`, X-Wing (12.2, PLAN.md 22),
