@@ -15,7 +15,7 @@ async fn not_built_yet() {
         .await;
     assert_eq!(new.lines(), ["ERR not-supported", "ERR not-supported"]);
     let mut anon = h.anon().await;
-    h.send(&anon, "KEYS PUT AAAA").await;
+    h.send(&anon, "KEYS PUT - AAAA").await;
     h.send(&anon, "PAIR GET ujzdegxdncf32epf3dhodzdoci").await;
     assert_eq!(anon.lines(), ["ERR not-supported", "ERR not-supported"]);
     let mut alice = h.signed_in_as("alice@example.org");

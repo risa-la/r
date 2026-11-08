@@ -29,7 +29,7 @@ fn samples() -> Vec<String> {
         "INFO #general".into(),
         format!("AUTH alice@example.org {signature}"),
         format!("REGISTER alice {} {signature}", b64(10)),
-        format!("KEYS PUT {}", b64(10)),
+        format!("KEYS PUT - {}", b64(10)),
         format!("PAIR PUT {BOX} {}", b64(40)),
         format!("PAIR GET {BOX}"),
         "UNREGISTER alice@example.org".into(),
@@ -166,11 +166,11 @@ async fn section_13_by_hand() {
         (NEW, "INFO #general".into(), "ERR not-authenticated"),
         (NEW, format!("FOLLOW {BOX}"), "ERR not-authenticated"),
         (NEW, "INFO".into(), "ERR not-supported"),
-        (NEW, "KEYS PUT AAAA".into(), "ERR not-supported"),
+        (NEW, "KEYS PUT - AAAA".into(), "ERR not-supported"),
         (NEW, format!("PAIR GET {BOX}"), "ERR not-supported"),
         // Once it has a kind, a command for another kind gets
         // wrong-connection (4.1, Section 13).
-        (GUEST, "KEYS PUT AAAA".into(), "ERR wrong-connection"),
+        (GUEST, "KEYS PUT - AAAA".into(), "ERR wrong-connection"),
         (
             GUEST,
             format!("CREATE {BOX} {gid} {hash} #general {msg} {msg}"),

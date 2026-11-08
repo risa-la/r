@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use risala_keyfetch::{FetchOptions, Roots, StaticResolver};
 use risala_proto::auth::{Nonce, PublicKey, SecretKey, Signature};
-use risala_proto::keyfile::KeyEntry;
+use risala_proto::keyfile::m5a::KeyEntry;
 use risala_proto::names::{Identity, Name, Uid};
 use rustls::pki_types::CertificateDer;
 use tokio::task::JoinHandle;

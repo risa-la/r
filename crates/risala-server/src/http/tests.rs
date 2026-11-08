@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use risala_keyfetch::{FetchOptions, KeyFetcher, Roots, StaticResolver};
 use risala_proto::auth::{PublicKey, SecretKey};
-use risala_proto::keyfile::KeyEntry;
+use risala_proto::keyfile::m5a::KeyEntry;
 use risala_proto::names::{Identity, Name};
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

@@ -11,7 +11,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use risala_proto::keyfile::KeyEntry;
+use risala_proto::keyfile::m5a::KeyEntry;
 use risala_proto::names::Name;
 
 use crate::keyfiles::KeyFilePublisher;
@@ -193,7 +193,7 @@ fn sync_dir(dir: &Path) {
 mod tests {
     use super::*;
     use risala_proto::auth::SecretKey;
-    use risala_proto::keyfile::KeyFile;
+    use risala_proto::keyfile::m5a::KeyFile;
 
     fn entry(seed: u8, label: Option<&str>) -> KeyEntry {
         KeyEntry::new(SecretKey::from_seed([seed; 32]).public_key(), label).unwrap()

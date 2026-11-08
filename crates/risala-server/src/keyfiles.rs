@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use risala_proto::auth::PublicKey;
-use risala_proto::keyfile::KeyEntry;
+use risala_proto::keyfile::m5a::KeyEntry;
 use risala_proto::names::{Identity, Name};
 
 /// How long AUTH waits for an identity's key file (4.4) before it gives
