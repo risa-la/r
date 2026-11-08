@@ -94,7 +94,7 @@ four writing code at once.
 
 ### S. Spec review (item 59, steps 2 and 3)
 
-- [ ] **S1. Review draft-03, round 1.** Four reviewers at once, each on
+- [~] **S1. Review draft-03, round 1.** Four reviewers at once, each on
   one area, against `../soatok-review.md`'s checklist (section 8), the
   decisions in items 51-61, and the spec's own consistency (every
   command in 13 defined where it points, every format specified to the
@@ -117,7 +117,7 @@ four writing code at once.
 
 ### P. `risala-proto`
 
-- [ ] **P1. Lines for draft-03.** Rewrite `Command`, `ServerLine` and
+- [~] **P1. Lines for draft-03.** Rewrite `Command`, `ServerLine` and
   their parameter types to the tables in section 13: add ANON, CREATE,
   POST, FOLLOW, UNFOLLOW, FETCH, KEYS PUT, PAIR, MUTE, GROUPINFO,
   WATCH, BLOB, BACKUP, PRESENCE ON/OFF, GONE, DROP, RECORD and the new
@@ -138,7 +138,7 @@ four writing code at once.
   numbers (`risala-fp-1`, 40 digits, `RISALA-FP:`), chain checks
   (extends, forks). Owns `crates/risala-proto/src/keyfile.rs`,
   `fingerprint.rs`, `auth.rs` and new modules for records and pairing.
-- [ ] **P3. The key log crate, `crates/risala-keylog`** (4.5): C2SP
+- [~] **P3. The key log crate, `crates/risala-keylog`** (4.5): C2SP
   tlog-checkpoint, signed-note with ML-DSA-44 cosignatures (type
   `0x06`) for the log and its witnesses, tlog-tiles (tile paths,
   hashing, building and reading tiles), inclusion and consistency
@@ -154,7 +154,7 @@ four writing code at once.
 
 ### M. `risala-mls`
 
-- [ ] **M1. Groups** (12.1-12.8): RisalaIdentity credentials, per-group
+- [~] **M1. Groups** (12.1-12.8): RisalaIdentity credentials, per-group
   leaf keys, the device binding (`0xF2A2`), profile (`0xF2A3`) and
   conversation (12.4) extensions, KeyPackages (with `last_resort` as
   the component `0x0004`: patch OpenMLS as `crates/openmls-traits` was
@@ -175,7 +175,7 @@ four writing code at once.
   X-Wing and HMAC-SHA-384 under `risala/1 confirm`, confirming senders
   only, the 256-member threshold; PeriodCert, per-period leaf keys, ATTEST and REVEAL. Owns
   `crates/risala-mls/src/confirm.rs` and `epochal.rs`. Needs M1.
-- [ ] **M4. Files, blobs, transfer and backups** (12.11-12.13, 4.8):
+- [x] **M4. Files, blobs, transfer and backups** (12.11-12.13, 4.8):
   the 64 KiB chunked ChaCha20-Poly1305 format with Padmé and
   `file-hash`, blob refs, HistoryArchive, TransferRef, IdentityBundle
   and its encryption under the pairing secret, backups wrapped under
