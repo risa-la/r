@@ -806,3 +806,312 @@ fn check_add(
     }
     Ok(identity)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoFacts;
+
+    impl KeyFacts for NoFacts {
+        fn current_device_key(&self, _: &Uid, _: &DeviceId) -> Fact<Option<Vec<u8>>> {
+            Fact::Known(None)
+        }
+
+        fn device_removed(&self, _: &Uid, _: &DeviceId) -> Fact<bool> {
+            Fact::Known(false)
+        }
+    }
+
+    fn uid(s: &str) -> Uid {
+        s.parse().unwrap()
+    }
+
+    fn leaf(index: u32, who: &str, updated: u64) -> LeafView {
+        let uid = uid(who);
+        let identity = if uid.is_guest() {
+            RisalaIdentity::guest(uid)
+        } else {
+            RisalaIdentity::device(uid, DeviceId([index as u8; 48]))
+        };
+        LeafView {
+            index: LeafNodeIndex::new(index),
+            identity: Some(identity),
+            profile: Some(RisalaProfile::new("", updated).unwrap()),
+            signature_key: vec![index as u8; 4],
+            from_key_package: false,
+        }
+    }
+
+    fn room(kind: ConversationKind) -> RisalaConversation {
+        let owner = uid("o@x.org");
+        let mut conv = match kind {
+            ConversationKind::PublicRoom => RisalaConversation::public_room(
+                "h.org",
+                [0; 16],
+                &"#r".parse().unwrap(),
+                &owner,
+            ),
+            _ => RisalaConversation::private_room("h.org", [0; 16], "R", &owner),
+        };
+        conv.mods.push(uid("m@x.org"));
+        conv
+    }
+
+    /// Owner o (leaf 0), moderator m (1), member p (2 and 3).
+    fn group(conv: &RisalaConversation) -> GroupView {
+        GroupView {
+            conversation: Ok(conv.clone()),
+            leaves: vec![
+                leaf(0, "o@x.org", 1000),
+                leaf(1, "m@x.org", 1000),
+                leaf(2, "p@x.org", 1000),
+                leaf(3, "p@x.org", 1000),
+            ],
+        }
+    }
+
+    /// A commit by leaf `by` that refreshes its leaf at time `updated`.
+    fn commit(group: &GroupView, by: u32, updated: u64, proposals: Vec<ProposalView>) -> CommitView {
+        let mut path = group.leaf(LeafNodeIndex::new(by)).unwrap().clone();
+        path.profile = Some(RisalaProfile::new("", updated).unwrap());
+        path.from_key_package = false;
+        CommitView {
+            committer: Committer::Member(LeafNodeIndex::new(by)),
+            proposals,
+            path_leaf: Some(path),
+            path_binding: None,
+            path_encryption_key: Vec::new(),
+            new_conversation: group.conversation.clone(),
+            pending_self_removes: Vec::new(),
+        }
+    }
+
+    fn check(group: &GroupView, commit: &CommitView) -> Result<Verdict, CommitError> {
+        check_commit(group, commit, &NoFacts, SystemTime::now())
+    }
+
+    fn remove(indices: &[u32]) -> Vec<ProposalView> {
+        indices
+            .iter()
+            .map(|i| ProposalView::Remove(LeafNodeIndex::new(*i)))
+            .collect()
+    }
+
+    #[test]
+    fn paths_and_proposal_kinds() {
+        let g = group(&room(ConversationKind::PrivateRoom));
+        assert_eq!(check(&g, &commit(&g, 2, 2000, vec![])), Ok(Verdict::default()));
+        let mut no_path = commit(&g, 2, 2000, vec![]);
+        no_path.path_leaf = None;
+        assert_eq!(check(&g, &no_path), Err(CommitError::NoPath));
+        let odd = commit(&g, 2, 2000, vec![ProposalView::NotAllowed("x")]);
+        assert_eq!(check(&g, &odd), Err(CommitError::Proposal("x")));
+        let init = commit(&g, 2, 2000, vec![ProposalView::ExternalInit]);
+        assert!(matches!(check(&g, &init), Err(CommitError::Proposal(_))));
+        // The extension changes only through a proposal.
+        let mut sneaky = commit(&g, 0, 2000, vec![]);
+        sneaky.new_conversation.as_mut().unwrap().topic = "t".into();
+        assert!(matches!(check(&g, &sneaky), Err(CommitError::Extension(_))));
+        let mut topic = sneaky.clone();
+        topic.proposals.push(ProposalView::GroupContextExtensions);
+        assert_eq!(check(&g, &topic), Ok(Verdict::default()));
+        // External commits only in public rooms.
+        let mut external = commit(&g, 2, 2000, vec![ProposalView::ExternalInit]);
+        external.committer = Committer::External;
+        assert_eq!(check(&g, &external), Err(CommitError::External));
+    }
+
+    #[test]
+    fn leaves_keep_their_credential_and_key() {
+        let conv = room(ConversationKind::PrivateRoom);
+        let g = group(&conv);
+        let mut other = commit(&g, 2, 2000, vec![]);
+        other.path_leaf.as_mut().unwrap().identity = Some(RisalaIdentity::device(
+            uid("p@x.org"),
+            DeviceId([9; 48]),
+        ));
+        assert_eq!(check(&g, &other), Err(CommitError::Leaf));
+        let mut no_profile = commit(&g, 2, 2000, vec![]);
+        no_profile.path_leaf.as_mut().unwrap().profile = None;
+        assert_eq!(check(&g, &no_profile), Err(CommitError::Leaf));
+
+        // A new signature key: not in a pairwise group, once the leaf has
+        // committed; yes while it holds its KeyPackage's leaf (12.3).
+        let mut rotate = commit(&g, 2, 2000, vec![]);
+        rotate.path_leaf.as_mut().unwrap().signature_key = vec![42; 4];
+        assert_eq!(check(&g, &rotate), Err(CommitError::Leaf));
+        let mut fresh = g.clone();
+        fresh.leaves[2].from_key_package = true;
+        assert_eq!(check(&fresh, &rotate), Ok(Verdict::default()));
+
+        // In an epochal group, once per period by the profiles' times.
+        let mut epochal = conv.clone();
+        epochal.confirm = ConfirmMode::Epochal;
+        let g = group(&epochal);
+        let same_day = |updated| {
+            let mut c = commit(&g, 2, updated, vec![]);
+            c.path_leaf.as_mut().unwrap().signature_key = vec![42; 4];
+            check(&g, &c)
+        };
+        assert_eq!(same_day(PERIOD_MS - 1), Err(CommitError::Leaf));
+        assert_eq!(same_day(PERIOD_MS), Ok(Verdict::default()));
+    }
+
+    #[test]
+    fn removes_and_kicks() {
+        let conv = room(ConversationKind::PrivateRoom);
+        let g = group(&conv);
+        // Your own leaves, a SelfRemove's, a stale one.
+        assert!(check(&g, &commit(&g, 2, 2000, remove(&[3]))).is_ok());
+        assert_eq!(
+            check(&g, &commit(&g, 0, 2000, remove(&[1]))),
+            Ok(Verdict::default()),
+            "an owner kicks a moderator"
+        );
+        let mut pending = commit(&g, 2, 2000, remove(&[0]));
+        assert_eq!(check(&g, &pending), Err(CommitError::Remove));
+        pending.pending_self_removes.push(LeafNodeIndex::new(0));
+        assert!(check(&g, &pending).is_ok());
+        let stale = 1000 + STALE_AFTER_MS + 1;
+        assert!(check(&g, &commit(&g, 2, stale, remove(&[0]))).is_ok());
+        assert!(check(&g, &commit(&g, 2, stale - 1, remove(&[0]))).is_err());
+        // A kick removes every leaf of the identity.
+        assert!(check(&g, &commit(&g, 1, 2000, remove(&[2, 3]))).is_ok());
+        assert_eq!(
+            check(&g, &commit(&g, 1, 2000, remove(&[2]))),
+            Err(CommitError::Remove)
+        );
+        // Moderators kick plain members only; nobody kicks the last owner.
+        assert_eq!(
+            check(&g, &commit(&g, 1, 2000, remove(&[0]))),
+            Err(CommitError::Remove)
+        );
+        let mut two_owners = conv.clone();
+        two_owners.owners.push(uid("m@x.org"));
+        two_owners.mods.clear();
+        let g2 = group(&two_owners);
+        assert!(check(&g2, &commit(&g2, 1, 2000, remove(&[0]))).is_ok());
+        let g1 = group(&conv);
+        assert_eq!(
+            check(&g1, &commit(&g1, 1, 2000, remove(&[0]))),
+            Err(CommitError::Remove)
+        );
+        // A leaf removed twice.
+        let twice = commit(
+            &g,
+            2,
+            2000,
+            vec![
+                ProposalView::Remove(LeafNodeIndex::new(3)),
+                ProposalView::SelfRemove(LeafNodeIndex::new(3)),
+            ],
+        );
+        assert!(matches!(check(&g, &twice), Err(CommitError::Proposal(_))));
+        // In a direct conversation, nobody is kicked.
+        let direct = RisalaConversation::direct("h.org", [0; 16], &uid("o@x.org"), &uid("p@x.org"));
+        let mut gd = group(&direct);
+        gd.leaves.remove(1);
+        assert_eq!(
+            check(&gd, &commit(&gd, 0, 2000, remove(&[2, 3]))),
+            Err(CommitError::Remove)
+        );
+    }
+
+    #[test]
+    fn guests_and_bans() {
+        let conv = room(ConversationKind::PublicRoom);
+        let mut g = group(&conv);
+        g.leaves.push(leaf(4, "~sam", 1000));
+        // Anyone may remove a guest leaf (6.1).
+        assert!(check(&g, &commit(&g, 2, 2000, remove(&[4]))).is_ok());
+        // Guests none must remove the guests in the same commit.
+        let mut none = commit(&g, 0, 2000, vec![ProposalView::GroupContextExtensions]);
+        none.new_conversation.as_mut().unwrap().guests = GuestMode::None;
+        assert_eq!(check(&g, &none), Err(CommitError::LeftBehind));
+        none.proposals.push(ProposalView::Remove(LeafNodeIndex::new(4)));
+        assert!(check(&g, &none).is_ok());
+        // A ban must remove the identity's leaves.
+        let mut ban = commit(&g, 1, 2000, vec![ProposalView::GroupContextExtensions]);
+        ban.new_conversation
+            .as_mut()
+            .unwrap()
+            .bans
+            .push(uid("p@x.org"));
+        assert_eq!(check(&g, &ban), Err(CommitError::LeftBehind));
+        ban.proposals.extend(remove(&[2, 3]));
+        assert!(check(&g, &ban).is_ok());
+    }
+
+    fn crowd(conv: &RisalaConversation, identities: u32, per: u32) -> GroupView {
+        let mut leaves = vec![leaf(0, "o@x.org", 1000)];
+        for i in 1..identities {
+            for j in 0..per {
+                let mut l = leaf(i * per + j, &format!("u{i}@x.org"), 1000);
+                l.index = LeafNodeIndex::new(i * per + j);
+                leaves.push(l);
+            }
+        }
+        GroupView {
+            conversation: Ok(conv.clone()),
+            leaves,
+        }
+    }
+
+    #[test]
+    fn limits() {
+        let conv = room(ConversationKind::PrivateRoom);
+        // 256 members while pairwise is fine, 257 is not (6.2).
+        let g = crowd(&conv, 256, 1);
+        assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
+        let g = crowd(&conv, 257, 1);
+        assert_eq!(check(&g, &commit(&g, 0, 2000, vec![])), Err(CommitError::TooLarge));
+        let mut epochal = conv.clone();
+        epochal.confirm = ConfirmMode::Epochal;
+        let g = crowd(&epochal, 257, 1);
+        assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
+        // 1,000 identities and 4,096 leaves in a private room (6.1).
+        let g = crowd(&epochal, 1001, 1);
+        assert_eq!(check(&g, &commit(&g, 0, 2000, vec![])), Err(CommitError::TooLarge));
+        let g = crowd(&epochal, 400, 11);
+        assert_eq!(check(&g, &commit(&g, 0, 2000, vec![])), Err(CommitError::TooLarge));
+        let public = room(ConversationKind::PublicRoom);
+        let g = crowd(&public, 1001, 1);
+        assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
+    }
+
+    #[test]
+    fn joining() {
+        let conv = room(ConversationKind::PrivateRoom);
+        let expect = JoinExpectation {
+            host: "h.org".into(),
+            own_uid: uid("p@x.org"),
+            public_room: None,
+        };
+        let g = group(&conv);
+        assert_eq!(check_join(&g, &expect), Ok(()));
+        let mut other_host = expect.clone();
+        other_host.host = "x.org".into();
+        assert_eq!(check_join(&g, &other_host), Err(JoinError::WrongConversation));
+        let mut public = expect.clone();
+        public.public_room = Some(("#r".parse().unwrap(), [0; 16]));
+        assert_eq!(check_join(&g, &public), Err(JoinError::WrongConversation));
+        let mut guest = g.clone();
+        guest.leaves.push(leaf(4, "~sam", 1));
+        assert_eq!(check_join(&guest, &expect), Err(JoinError::Guest));
+        let mut banned = g.clone();
+        banned.conversation.as_mut().unwrap().bans.push(uid("p@x.org"));
+        assert_eq!(check_join(&banned, &expect), Err(JoinError::Banned));
+        let mut no_profile = g.clone();
+        no_profile.leaves[1].profile = None;
+        assert_eq!(check_join(&no_profile, &expect), Err(JoinError::Leaf));
+        let mut no_identity = g.clone();
+        no_identity.leaves[1].identity = None;
+        assert_eq!(check_join(&no_identity, &expect), Err(JoinError::Leaf));
+        let big = crowd(&conv, 1001, 1);
+        assert_eq!(check_join(&big, &expect), Err(JoinError::TooLarge));
+        // Stale leaves and the weekly refresh.
+        assert_eq!(g.stale_leaves(1000 + STALE_AFTER_MS + 1).len(), 4);
+        assert!(g.stale_leaves(1000 + STALE_AFTER_MS).is_empty());
+    }
+}

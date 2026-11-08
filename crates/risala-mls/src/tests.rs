@@ -979,3 +979,79 @@ fn public_room_refusals() {
     // already; the checks would refuse it too.
     assert!(process_message(&alice.provider, &mut a, &join.message).is_err());
 }
+
+/// What a server does with a public room's commit (12.6): it holds the
+/// public group, built from the GroupInfo and tree, checks each commit with
+/// the same functions as the devices, and keeps the new state.
+#[test]
+fn server_checks_public_commits() {
+    use openmls::group::{ProposalStore, PublicGroup};
+    use openmls::prelude::ProcessedMessageContent;
+
+    use crate::checks::{CommitView, GroupView, check_commit};
+    use crate::wire::{read_group_info, read_protocol_message, read_tree};
+
+    let (owen, mut o, group_info, tree, _) = public_room(GuestMode::Write);
+    let crypto = RisalaCrypto::new().unwrap();
+    let storage = MemoryStorage::default();
+    let (mut public, _) = PublicGroup::from_external(
+        &crypto,
+        &storage,
+        read_tree(&tree).unwrap(),
+        read_group_info(&group_info).unwrap(),
+        ProposalStore::new(),
+    )
+    .unwrap();
+
+    let dave = Device::new("dave@example.org", 4);
+    let facts = Facts::with(&[&owen, &dave]);
+    let join = join_by_external_commit(
+        &dave.provider,
+        &dave.identity(),
+        dave.device_key.as_ref(),
+        &dave.profile(),
+        dave.pseudonym,
+        &group_info,
+        &tree,
+        &public_expect(&dave),
+    )
+    .unwrap();
+    let server_sees = |public: &PublicGroup, message: &[u8], facts: &Facts| {
+        let processed = public
+            .process_message(&crypto, read_protocol_message(message).unwrap())
+            .unwrap();
+        let sender = processed.sender().clone();
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            panic!("not a commit");
+        };
+        let view = CommitView::of(&sender, &staged, std::iter::empty());
+        let verdict = check_commit(&GroupView::of(public), &view, facts, SystemTime::now());
+        (staged, verdict)
+    };
+    // Without Dave's device in the log, the server cannot accept it.
+    let (_, verdict) = server_sees(&public, &join.message, &Facts::with(&[&owen]));
+    assert_eq!(verdict, Err(CommitError::NotCurrentDevice));
+    let (staged, verdict) = server_sees(&public, &join.message, &facts);
+    verdict.unwrap();
+    public.merge_commit(&storage, *staged).unwrap();
+    owen.apply(&mut o, &join.message, &facts);
+    assert_eq!(public.members().count(), 2);
+    assert_eq!(
+        tree_to_bytes(&public.export_ratchet_tree()),
+        tree_to_bytes(&o.export_ratchet_tree())
+    );
+
+    // A member's commit that changes what it may not is refused.
+    let mut d = join.group;
+    let mut guests = conversation(&d).unwrap();
+    guests.guests = GuestMode::None;
+    let out = dave.commit(
+        &mut d,
+        Changes {
+            conversation: Some(guests),
+            ..Changes::default()
+        },
+    );
+    let (_, verdict) = server_sees(&public, &out.message, &facts);
+    assert!(matches!(verdict, Err(CommitError::Extension(_))));
+}
