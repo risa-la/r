@@ -1240,8 +1240,17 @@ fn queue_offline(
     check_draft(conv, draft)?;
     let account = shared.id;
     let now = shared.options.sync.clock.now();
+    let guest = shared.is_guest();
     let (id, changes) = shared.store.write(|tx| {
-        let bound = tx.conv_by_name(account, conv)?.and_then(|r| r.conv_id);
+        let row = tx.conv_by_name(account, conv)?;
+        // Nothing more goes to a room the account has left until it joins
+        // again (PLAN.md 5, item 34).
+        if let Some(row) = &row
+            && !tx.messages_wait(row, guest)?
+        {
+            return Ok(None);
+        }
+        let bound = row.and_then(|r| r.conv_id);
         if bound.is_none() && conv.is_room() {
             return Ok(None);
         }

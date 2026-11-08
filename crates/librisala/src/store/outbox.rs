@@ -9,7 +9,7 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, FileUrl, Relation};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::events::Tx;
+use super::events::{ConvRow, Tx};
 use super::{AccountId, Change, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
 
 /// A message to send: MSG's text and tags (5.3, 5.6).
@@ -430,6 +430,15 @@ impl Tx<'_> {
         )?;
         self.changed(Change::Outbox { id });
         Ok(())
+    }
+
+    /// Whether messages for `row` may be queued, and wait in the outbox,
+    /// rather than fail with [`FailReason::NotInRoom`] (PLAN.md 5, item
+    /// 34): always for a room the account is in and for a direct
+    /// conversation, and for a guest, which rejoins its rooms by itself
+    /// after a reconnect.
+    pub(crate) fn messages_wait(&self, row: &ConvRow, guest: bool) -> Result<bool, StoreError> {
+        Ok(guest || !row.name.is_room() || row.joined)
     }
 
     /// Fails the messages of `conv` still waiting to be sent, not DELETEs:

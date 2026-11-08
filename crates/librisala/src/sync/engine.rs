@@ -475,10 +475,11 @@ impl SyncEngine {
         let (account, now, guest) = (self.account, self.now(), self.guest);
         let id = self.write(|tx| {
             let row = tx.conv_by_name(account, conv)?;
-            // An identity that has left a room sends nothing more to it
-            // until it joins again (PLAN.md 5, item 34). A guest rejoins its
-            // rooms by itself after a reconnect, so its messages wait.
-            if !guest && conv.is_room() && row.as_ref().is_some_and(|r| !r.joined) {
+            // Nothing more goes to a room the account has left until it
+            // joins again (PLAN.md 5, item 34).
+            if let Some(row) = &row
+                && !tx.messages_wait(row, guest)?
+            {
                 return Ok(None);
             }
             let bound = row.and_then(|r| r.conv_id);
@@ -1796,6 +1797,7 @@ impl SyncEngine {
         let lease = self.config.claim_lease;
         // A guest's cids count only within its session (7.6).
         let cids_hold = !self.guest || self.resumed;
+        let guest = self.guest;
         let claim = self.claim.clone();
         let store = self.store.clone();
         let in_flight = self.sending.clone();
@@ -1835,6 +1837,17 @@ impl SyncEngine {
                 // has it: another process sharing the store may have
                 // learned that the room changed.
                 let row = tx.conv_by_name(account, &item.conv)?;
+                // A message queued for a room the account is not in, perhaps
+                // while offline, fails as it would have when the account
+                // left (PLAN.md 5, item 34).
+                if item.delete.is_none()
+                    && item.state == OutboxState::Queued
+                    && let Some(row) = &row
+                    && !tx.messages_wait(row, guest)?
+                {
+                    tx.outbox_failed(item.id, FailReason::NotInRoom)?;
+                    continue;
+                }
                 let left = row.as_ref().is_some_and(|r| !r.joined);
                 let stored = row.and_then(|r| r.conv_id);
                 let live = confirmed

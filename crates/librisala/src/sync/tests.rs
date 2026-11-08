@@ -2168,3 +2168,37 @@ fn a_guests_messages_wait_for_its_rooms() {
             .is_ok()
     );
 }
+
+#[test]
+fn a_message_queued_for_a_room_left_fails_when_flushed() {
+    // A message queued without the check, for example by another version
+    // of the client, for a room the identity has left, fails rather than
+    // waiting (PLAN.md 5, item 34).
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let r = h.reconnect();
+    h.reply(r, &[], "OK");
+    assert!(!h.conv("#general").joined);
+    let (msg, _) = h
+        .store
+        .write(|tx| {
+            let bound = tx
+                .conv_by_name(h.account, &conv("#general"))?
+                .and_then(|r| r.conv_id);
+            tx.queue(
+                h.account,
+                &conv("#general"),
+                bound.as_ref(),
+                &Draft::text("hi"),
+                Timestamp::from_unix_millis(T0).unwrap(),
+            )
+        })
+        .unwrap();
+    let out = h.engine.resume_outbox().unwrap();
+    h.absorb(out);
+    h.idle();
+    assert_eq!(
+        h.store.outbox_item(msg).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::NotInRoom)
+    );
+}

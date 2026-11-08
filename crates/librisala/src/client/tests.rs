@@ -147,6 +147,42 @@ async fn offline_sends_wait_in_the_outbox() {
 }
 
 #[tokio::test]
+async fn offline_sends_to_a_room_left_are_refused() {
+    // PLAN.md 5, item 34: offline as online, nothing more goes to a room
+    // the identity has left, until it joins again.
+    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
+    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
+    store_events(
+        &alice,
+        "#general",
+        "k1",
+        &[event(1, "from=alice@example.org;id=k1 JOIN #general")],
+    );
+    let general = alice.conversation("#general").unwrap();
+    assert_eq!(
+        general.send("hi").await.unwrap().status,
+        OutboxStatus::Queued
+    );
+    let shared = alice.shared();
+    let account = shared.id;
+    shared
+        .store
+        .write(|tx| {
+            let mut row = tx
+                .conv_by_name(account, &"#general".parse().unwrap())?
+                .unwrap();
+            tx.set_joined(&mut row, false)
+        })
+        .unwrap();
+    assert_eq!(
+        general.send("again").await.unwrap_err(),
+        ClientError::NotJoined("#general".into())
+    );
+    // Deleting still goes through the outbox (5.4).
+    assert!(general.delete(1).await.is_ok());
+}
+
+#[tokio::test]
 async fn the_timeline_reports_inserts_updates_and_resets() {
     let sam = guest();
     let general = sam.conversation("#general").unwrap();
