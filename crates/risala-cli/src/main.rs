@@ -532,25 +532,11 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             text,
         } => {
             let account = pick(ctx, &server)?;
-            let connected = match tokio::time::timeout(WAIT, account.connect()).await {
-                Ok(r) => r.map(drop),
-                Err(_) => Err(ClientError::NotConnected),
-            };
+            let connected = try_connect(&account).await;
             let conv = account.conversation(&conversation).or_else(explain)?;
             let entry = conv.send(&text.join(" ")).await.or_else(explain)?;
-            match connected {
-                Ok(()) => {}
-                // Connecting again will not help until the user acts.
-                Err(e) if e.is_permanent() => {
-                    let _: Res = explain(e);
-                    return fail(
-                        "queued, but it cannot be sent until that is fixed; then run risala sync",
-                    );
-                }
-                Err(e) => {
-                    eprintln!("risala: {e}");
-                    return fail("queued; it will be sent on the next connection");
-                }
+            if let Err(e) = connected {
+                return queued_offline(e, "sent");
             }
             let entry = within(account.wait_outbox(entry.id)).await?;
             match entry.status {
@@ -1146,6 +1132,30 @@ async fn connect(ctx: &Ctx, account: &Account) -> Res<String> {
 }
 
 /// The account on `server`, signed in.
+/// Connects for a command that queues in the outbox, which it does
+/// whether or not this works, so the error is kept for after.
+async fn try_connect(account: &Account) -> Result<(), ClientError> {
+    match tokio::time::timeout(WAIT, account.connect()).await {
+        Ok(r) => r.map(drop),
+        Err(_) => Err(ClientError::NotConnected),
+    }
+}
+
+/// Explains why an entry was queued but not `done` (`sent`, `deleted`),
+/// after [`try_connect`] failed with `e`.
+fn queued_offline(e: ClientError, done: &str) -> Res {
+    if e.is_permanent() {
+        // Connecting again will not help until the user acts.
+        let _: Res = explain(e);
+        fail(format!(
+            "queued, but it cannot be {done} until that is fixed; then run risala sync"
+        ))
+    } else {
+        eprintln!("risala: {e}");
+        fail(format!("queued; it will be {done} on the next connection"))
+    }
+}
+
 async fn online(ctx: &Ctx, server: &str) -> Res<Account> {
     let account = pick(ctx, server)?;
     connect(ctx, &account).await?;

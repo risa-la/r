@@ -413,4 +413,14 @@ async fn trust_conflicts_permanent_failures_and_large_rooms() {
     assert!(err.contains("does not match"), "{err}");
     assert!(err.contains("cannot be sent until that is fixed"), "{err}");
     assert!(!err.contains("next connection"), "{err}");
+    // Nor does a delete, and it says why.
+    let out = risala(state, &["delete", &addr, "#general", "1"]).await;
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("does not match"), "{err}");
+    assert!(
+        err.contains("cannot be deleted until that is fixed"),
+        "{err}"
+    );
+    assert!(!err.contains("next connection"), "{err}");
 }

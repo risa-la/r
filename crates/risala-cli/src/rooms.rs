@@ -4,7 +4,7 @@
 use clap::Subcommand;
 use librisala::client::{OutboxStatus, ReportInfo};
 
-use super::{Ctx, Res, explain, fail, online, pick, within};
+use super::{Ctx, Res, explain, fail, online, pick, queued_offline, try_connect, within};
 
 #[derive(Subcommand)]
 pub(crate) enum RoomCommand {
@@ -123,14 +123,11 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
             seq,
         } => {
             let account = pick(ctx, &server)?;
-            let connected = matches!(
-                tokio::time::timeout(super::WAIT, account.connect()).await,
-                Ok(Ok(_))
-            );
+            let connected = try_connect(&account).await;
             let conv = account.conversation(&conversation).or_else(explain)?;
             let entry = conv.delete(seq).await.or_else(explain)?;
-            if !connected {
-                return fail("offline; the deletion goes out on the next connection");
+            if let Err(e) = connected {
+                return queued_offline(e, "deleted");
             }
             let entry = within(account.wait_outbox(entry.id)).await?;
             match entry.status {
@@ -139,7 +136,7 @@ pub(crate) async fn run(ctx: &Ctx, command: RoomCommand) -> Res {
                     Ok(())
                 }
                 OutboxStatus::Failed { reason, .. } => fail(format!("not deleted: {reason}")),
-                _ => fail("queued; it goes out on the next connection"),
+                _ => fail("queued; it will be deleted on the next connection"),
             }
         }
         RoomCommand::Info { server, room } => {
