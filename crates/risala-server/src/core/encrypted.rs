@@ -57,7 +57,9 @@ use risala_mls::conversation::RisalaConversation;
 use risala_proto::auth::PublicKey;
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{Ciphertext, CommitMessage, Frank, GroupInfo, RatchetTree, Welcome};
+use risala_proto::mls::{
+    Ciphertext, CommitMessage, Frank, GroupInfo, MAX_GROUP_LEAVES, RatchetTree, Welcome,
+};
 use risala_proto::names::{Conv, Room, Seq, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine, ServerMessage};
 use risala_proto::types::{Cid, FileUrl, GuestAccess, Role, RoomSetting};
@@ -419,6 +421,7 @@ impl Inner {
                 &group_info,
                 welcome.as_ref(),
                 now,
+                MAX_GROUP_LEAVES,
             )
             .map(|checked| (checked, commit, welcome))
         })

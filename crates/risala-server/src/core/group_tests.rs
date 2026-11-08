@@ -23,6 +23,7 @@ use risala_proto::names::{Identity, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{HistoryMode, SendMode};
 
+use super::commands::Fail;
 use super::tests::{Client, Harness, config, timers};
 use super::*;
 use crate::store::SqliteStore;
@@ -1776,4 +1777,267 @@ async fn key_files_fetched_for_commit_show_removed_keys() {
     ga1.merge_pending_commit(&a1.provider).unwrap();
     let lines = w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await;
     assert_eq!(lines.last().unwrap(), "OK seq=4");
+}
+
+// ---------------------------------------------------------------------------
+// More refusals of COMMIT (12.5)
+
+/// An error as its ERR line, without tags.
+fn err(e: &risala_proto::server::ErrResponse) -> String {
+    format!("ERR {} {}", e.code, e.message)
+}
+
+#[tokio::test]
+async fn commits_refuse_proposals_by_reference_other_kinds_and_wrong_tags() {
+    use risala_mls::openmls::prelude::{
+        LeafNodeParameters, MlsMessageBodyIn, MlsMessageIn, PreSharedKeyProposal, Proposal,
+        tls_codec::Deserialize as _, tls_codec::Serialize as _,
+    };
+    use risala_mls::openmls::schedule::{ExternalPsk, PreSharedKeyId, Psk};
+
+    let mut w = World::new();
+    let Pair {
+        a1,
+        mut c1,
+        mut ga1,
+        b5,
+        mut gb5,
+        ..
+    } = pair(&mut w, SendMode::All).await;
+
+    // Bob's device proposes an Update of its leaf, as a proposal of its own
+    // that Alice's device commits by reference.
+    let (proposal, _) = gb5
+        .propose_self_update(&b5.provider, &b5.signer(), LeafNodeParameters::default())
+        .unwrap();
+    let proposal = MlsMessageIn::tls_deserialize_exact(proposal.tls_serialize_detached().unwrap())
+        .unwrap()
+        .try_into_protocol_message()
+        .unwrap();
+    let ProcessedMessageContent::ProposalMessage(queued) = ga1
+        .process_message(&a1.provider, proposal)
+        .unwrap()
+        .into_content()
+    else {
+        panic!("not a proposal");
+    };
+    ga1.store_pending_proposal(a1.provider.storage(), *queued)
+        .unwrap();
+    let sent = a1.commit(&mut ga1, Changes::default());
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR forbidden proposals are inside the commit, by value"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+    ga1.clear_pending_proposals(a1.provider.storage()).unwrap();
+    gb5.clear_pending_proposals(b5.provider.storage()).unwrap();
+
+    // A PreSharedKey proposal by value.
+    let psk = PreSharedKeyId::new(
+        risala_mls::CIPHERSUITE,
+        a1.provider.rand(),
+        Psk::External(ExternalPsk::new(b"risala test".to_vec())),
+    )
+    .unwrap();
+    psk.store(&a1.provider, &[7; 32]).unwrap();
+    let bundle = ga1
+        .commit_builder()
+        .add_proposal(Proposal::PreSharedKey(Box::new(PreSharedKeyProposal::new(
+            psk,
+        ))))
+        .load_psks(a1.provider.storage())
+        .unwrap()
+        .create_group_info(true)
+        .build(
+            a1.provider.rand(),
+            a1.provider.crypto(),
+            &a1.signer(),
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&a1.provider)
+        .unwrap();
+    let sent = Sent::of(bundle.into_messages());
+    assert_eq!(
+        w.ask(&mut c1, &sent.line("#r")).await,
+        ["ERR forbidden a kind of proposal that is not allowed: PreSharedKey"]
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+
+    // A confirmation tag that is not the GroupInfo's, and nothing else
+    // wrong: the tag is outside the commit's signature, so only its bytes
+    // change.
+    let sent = a1.commit(&mut ga1, Changes::default());
+    let bytes = sent.commit.decode();
+    let message = MlsMessageIn::tls_deserialize_exact(&bytes).unwrap();
+    let MlsMessageBodyIn::PublicMessage(public) = message.extract() else {
+        panic!("not a PublicMessage");
+    };
+    let tag = public
+        .confirmation_tag()
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+    let at = bytes
+        .windows(tag.len())
+        .position(|w| w == tag.as_slice())
+        .unwrap();
+    let mut changed = bytes.clone();
+    changed[at + tag.len() - 1] ^= 1;
+    let wrong = Sent {
+        commit: mls::CommitMessage::from_bytes(&changed).unwrap(),
+        group_info: sent.group_info.clone(),
+        welcome: None,
+    };
+    assert_eq!(
+        w.ask(&mut c1, &wrong.line("#r")).await,
+        ["ERR invalid the GroupInfo's confirmation tag is not the commit's"]
+    );
+    // The commit as it was is accepted.
+    let lines = w.ask(&mut c1, &sent.line("#r")).await;
+    assert!(lines.last().unwrap().starts_with("OK seq="), "{lines:?}");
+}
+
+/// Rule 5 of 12.5, with a smaller limit than 512, so that the test needs
+/// only a few leaves.
+#[tokio::test]
+async fn commits_keep_groups_small_enough() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let (_, mut ga1) =
+        encrypted_room(&mut w, &a1, &mut c1, HistoryMode::Shared, SendMode::All).await;
+    let (a2, a3) = (Device::new(ALICE, 2), Device::new(ALICE, 3));
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![a2.kp(), a3.kp()],
+            ..Changes::default()
+        },
+    );
+    let conv = w.h.store.room(&"#r".parse().unwrap()).unwrap().unwrap().key;
+    let record = w.h.store.group(conv).unwrap().unwrap();
+    let crypto = w.h.hub.inner.mls.clone();
+    let check = |max| {
+        let device = super::mls::Device {
+            uid: &a1.uid,
+            key: &key(1),
+        };
+        super::mls::check_commit(
+            &crypto,
+            &record,
+            device,
+            &sent.commit,
+            &sent.group_info,
+            sent.welcome.as_ref(),
+            std::time::SystemTime::now(),
+            max,
+        )
+    };
+    match check(2) {
+        Err(Fail::Err(e)) => assert_eq!(err(&e), "ERR forbidden a group has at most 2 leaves"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(check(3).unwrap().leaves.len(), 3);
+    // The hub's limit is 512.
+    let lines = w.ask(&mut c1, &sent.line("#r")).await;
+    assert!(lines.last().unwrap().starts_with("OK seq="), "{lines:?}");
+}
+
+/// Rule 4 of 12.5 on crafted proposals, for those that OpenMLS will not
+/// build: an external commit that removes another device's leaf, or more
+/// than one leaf.
+#[test]
+fn rule_four_on_crafted_proposals() {
+    use super::mls::{Device as Committer, Seen, check_proposals};
+    use risala_mls::openmls::prelude::ProposalType;
+
+    let me = uid(ALICE);
+    let device = Committer {
+        uid: &me,
+        key: &key(2),
+    };
+    let before = RisalaConversation::direct(&me, &uid(BOB));
+    let leaf = |who: &str, n: u8| Some(Some((uid(who), key(n))));
+    let check = |proposals: Vec<(bool, Seen<'_>)>, external: bool| {
+        check_proposals(proposals, external, device, &[], &before)
+            .map(|(removes, _)| {
+                removes
+                    .iter()
+                    .map(|r| (r.leaf.index, r.justified))
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| match e {
+                Fail::Err(e) => err(&e),
+                Fail::Store(e) => panic!("{e}"),
+            })
+    };
+    let forbidden = |m: &str| Err(format!("ERR forbidden {m}"));
+
+    // An external commit removes the joiner's earlier leaf, and no other.
+    assert_eq!(
+        check(
+            vec![
+                (true, Seen::ExternalInit),
+                (true, Seen::Remove(0, leaf(ALICE, 2)))
+            ],
+            true
+        ),
+        Ok(vec![(0, true)])
+    );
+    for other in [leaf(ALICE, 1), leaf(BOB, 5)] {
+        assert_eq!(
+            check(
+                vec![(true, Seen::ExternalInit), (true, Seen::Remove(0, other))],
+                true
+            ),
+            forbidden("an external commit removes only the joiner's earlier leaf")
+        );
+    }
+    assert_eq!(
+        check(
+            vec![
+                (true, Seen::ExternalInit),
+                (true, Seen::Remove(0, leaf(ALICE, 2))),
+                (true, Seen::Remove(3, leaf(ALICE, 2))),
+            ],
+            true
+        ),
+        forbidden("an external commit removes at most one leaf")
+    );
+    // A member's commit may remove others; whether it may is the hub's.
+    assert_eq!(
+        check(
+            vec![
+                (true, Seen::Remove(0, leaf(ALICE, 1))),
+                (true, Seen::Remove(1, leaf(BOB, 5)))
+            ],
+            false
+        ),
+        Ok(vec![(0, true), (1, false)])
+    );
+    // By reference, other kinds, and ExternalInit outside an external
+    // commit.
+    assert_eq!(
+        check(vec![(false, Seen::Remove(1, leaf(BOB, 5)))], false),
+        forbidden("proposals are inside the commit, by value")
+    );
+    for kind in [
+        ProposalType::Update,
+        ProposalType::PreSharedKey,
+        ProposalType::Reinit,
+    ] {
+        assert_eq!(
+            check(vec![(true, Seen::Other(kind))], false),
+            forbidden(&format!("a kind of proposal that is not allowed: {kind:?}"))
+        );
+    }
+    assert_eq!(
+        check(vec![(true, Seen::ExternalInit)], false),
+        forbidden("ExternalInit is only in an external commit")
+    );
+    assert_eq!(
+        check(vec![(true, Seen::Remove(4, None))], false),
+        Err("ERR invalid a Remove of a blank leaf".into())
+    );
 }

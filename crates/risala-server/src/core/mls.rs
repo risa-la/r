@@ -26,15 +26,15 @@ use risala_mls::openmls::ciphersuite::signable::Verifiable as _;
 use risala_mls::openmls::messages::group_info::VerifiableGroupInfo;
 use risala_mls::openmls::prelude::{ConfirmationTag, ProposalStore};
 use risala_mls::openmls::prelude::{
-    ContentType, GroupContext, LeafNodeIndex, MlsMessageBodyIn, MlsMessageIn,
-    OpenMlsSignaturePublicKey, ProcessedMessageContent, Proposal, ProposalOrRefType,
-    ProtocolVersion, PublicGroup, Sender,
+    ContentType, Extensions, GroupContext, LeafNodeIndex, MlsMessageBodyIn, MlsMessageIn,
+    OpenMlsSignaturePublicKey, ProcessedMessageContent, Proposal, ProposalOrRefType, ProposalType,
+    ProtocolVersion, PublicGroup, PublicProcessMessageError, Sender, StageCommitError,
 };
 use risala_mls::signer::{credential_uid, signature_key};
 use risala_mls::{CIPHERSUITE, RisalaCrypto, wire};
 use risala_proto::auth::PublicKey;
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{self, MAX_GROUP_LEAVES};
+use risala_proto::mls;
 use risala_proto::names::Uid;
 use tls_codec::{Deserialize as _, Serialize as _, VLBytes};
 
@@ -309,10 +309,13 @@ fn check_commit_group_info(
 ///    commit removes at most the joiner's own earlier leaf, a key it adds
 ///    that has a leaf has that leaf removed, and a GroupContextExtensions
 ///    changes only `history` and `send` (`ERR forbidden`)
-/// 5. the group has at most 512 leaves after it (`ERR forbidden`)
+/// 5. the group has at most `max_leaves` leaves after it, which is
+///    [`MAX_GROUP_LEAVES`](risala_proto::mls::MAX_GROUP_LEAVES) but in tests
+///    (`ERR forbidden`)
 ///
 /// What needs the conversation's membership or key files is left to the
 /// hub.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn check_commit(
     crypto: &RisalaCrypto,
     record: &GroupRecord,
@@ -321,6 +324,7 @@ pub(super) fn check_commit(
     gi_value: &mls::GroupInfo,
     welcome: Option<&mls::Welcome>,
     now: SystemTime,
+    max_leaves: usize,
 ) -> Result<CheckedCommit, Fail> {
     let state = GroupState::from_parts(record.parts.clone());
     let group_id = risala_mls::openmls::prelude::GroupId::from_slice(&record.group_id);
@@ -355,9 +359,16 @@ pub(super) fn check_commit(
 
     // Rule 2: OpenMLS checks the signatures, the tree, its parent hashes
     // and the proposals as far as it can.
+    // A proposal by reference names one the server never has, since there
+    // are no separate proposals: that is rule 4's refusal, not rule 2's.
     let processed = group
         .process_message(crypto, message)
-        .map_err(|e| invalid(&format!("the commit is not valid: {e}")))?;
+        .map_err(|e| match e {
+            PublicProcessMessageError::InvalidCommit(StageCommitError::MissingProposal) => {
+                forbidden(BY_VALUE)
+            }
+            e => invalid(&format!("the commit is not valid: {e}")),
+        })?;
     let sender = processed.sender().clone();
     let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
         return Err(invalid("not a commit"));
@@ -436,57 +447,26 @@ pub(super) fn check_commit(
     // Rule 4: the proposals.
     let before = RisalaConversation::from_extensions(group.group_context().extensions())
         .map_err(|e| invalid(&e.to_string()))?;
-    let mut removes = Vec::new();
-    let mut extensions = None;
     let added_keys: Vec<&PublicKey> = adds.iter().map(|(_, k)| k).collect();
-    for queued in staged.queued_proposals() {
-        if queued.proposal_or_ref_type() != ProposalOrRefType::Proposal {
-            return Err(forbidden("proposals are inside the commit, by value"));
-        }
-        match queued.proposal() {
-            Proposal::Add(_) => {}
+    let seen = staged.queued_proposals().map(|queued| {
+        let by_value = queued.proposal_or_ref_type() == ProposalOrRefType::Proposal;
+        let proposal = match queued.proposal() {
+            Proposal::Add(_) => Seen::Add,
             Proposal::Remove(remove) => {
                 let leaf = group
                     .leaf(remove.removed())
-                    .ok_or_else(|| invalid("a Remove of a blank leaf"))?;
-                let (uid, key) = leaf_of(leaf.credential(), leaf.signature_key().as_slice())
-                    .ok_or_else(|| invalid("a removed leaf is not a device"))?;
-                if external && key != *device.key {
-                    return Err(forbidden(
-                        "an external commit removes only the joiner's earlier leaf",
-                    ));
-                }
-                let justified = external || uid == *device.uid || added_keys.contains(&&key);
-                removes.push(Removed {
-                    leaf: GroupLeaf {
-                        index: remove.removed().u32(),
-                        uid,
-                        key,
-                    },
-                    justified,
-                });
+                    .map(|leaf| leaf_of(leaf.credential(), leaf.signature_key().as_slice()));
+                Seen::Remove(remove.removed().u32(), leaf)
             }
             Proposal::GroupContextExtensions(proposal) => {
-                let new =
-                    RisalaConversation::from_extensions(proposal.extensions()).map_err(|_| {
-                        forbidden("GroupContextExtensions keeps the conversation extension")
-                    })?;
-                if !new.same_conversation(&before)
-                    || proposal.extensions() != &group_context_extensions(&new)
-                {
-                    return Err(forbidden(
-                        "GroupContextExtensions changes only history and send",
-                    ));
-                }
-                extensions = Some(new);
+                Seen::GroupContextExtensions(proposal.extensions())
             }
-            Proposal::ExternalInit(_) if external => {}
-            _ => return Err(forbidden("a kind of proposal that is not allowed")),
-        }
-    }
-    if external && removes.len() > 1 {
-        return Err(forbidden("an external commit removes at most one leaf"));
-    }
+            Proposal::ExternalInit(_) => Seen::ExternalInit,
+            other => Seen::Other(other.proposal_type()),
+        };
+        (by_value, proposal)
+    });
+    let (removes, extensions) = check_proposals(seen, external, device, &added_keys, &before)?;
     // A key that has a leaf is added only with that leaf removed.
     for (_, key) in &adds {
         if let Some(member) = group.members().find(|m| m.signature_key == key.as_bytes())
@@ -510,8 +490,10 @@ pub(super) fn check_commit(
         .map_err(|e| state_error(format!("{e:?}")))?;
     // Rule 5.
     let leaves = leaves(&group)?;
-    if leaves.len() > MAX_GROUP_LEAVES {
-        return Err(forbidden("a group has at most 512 leaves"));
+    if leaves.len() > max_leaves {
+        return Err(forbidden(&format!(
+            "a group has at most {max_leaves} leaves"
+        )));
     }
     let tree = wire::tree_to_wire(&group.export_ratchet_tree())
         .map_err(|_| invalid("the new ratchet tree is too long for a line"))?;
@@ -534,6 +516,90 @@ pub(super) fn check_commit(
         leaves,
         tree,
     })
+}
+
+/// Why rule 4 refuses a proposal by reference (12.5).
+const BY_VALUE: &str = "proposals are inside the commit, by value";
+
+/// A proposal of a commit, as rule 4 of 12.5 sees it.
+#[derive(Debug, Clone)]
+pub(super) enum Seen<'a> {
+    Add,
+    /// A Remove of the leaf at this index: whose device it is, `None` for
+    /// a blank leaf, and `Some(None)` for a leaf that is not a device of
+    /// an identity.
+    Remove(u32, Option<Option<(Uid, PublicKey)>>),
+    /// A GroupContextExtensions, with its extensions.
+    GroupContextExtensions(&'a Extensions<GroupContext>),
+    ExternalInit,
+    /// Any other kind.
+    Other(ProposalType),
+}
+
+/// Checks a commit's proposals, each with whether it is by value, under
+/// rule 4 of 12.5: all by value, of the kinds allowed, an external commit
+/// removing at most one leaf, the joiner's own, and a GroupContextExtensions
+/// that keeps the conversation and changes only `history` and `send`.
+/// `device` is the committer, `added` the keys the commit adds, and
+/// `before` the conversation extension before it.
+///
+/// Returns the leaves removed, each with whether the commit itself shows
+/// why, and the new conversation extension if there is one.
+pub(super) fn check_proposals<'a>(
+    proposals: impl IntoIterator<Item = (bool, Seen<'a>)>,
+    external: bool,
+    device: Device<'_>,
+    added: &[&PublicKey],
+    before: &RisalaConversation,
+) -> Result<(Vec<Removed>, Option<RisalaConversation>), Fail> {
+    let mut removes = Vec::new();
+    let mut extensions = None;
+    for (by_value, proposal) in proposals {
+        if !by_value {
+            return Err(forbidden(BY_VALUE));
+        }
+        match proposal {
+            Seen::Add => {}
+            Seen::Remove(index, leaf) => {
+                let leaf = leaf.ok_or_else(|| invalid("a Remove of a blank leaf"))?;
+                let (uid, key) = leaf.ok_or_else(|| invalid("a removed leaf is not a device"))?;
+                if external && key != *device.key {
+                    return Err(forbidden(
+                        "an external commit removes only the joiner's earlier leaf",
+                    ));
+                }
+                let justified = external || uid == *device.uid || added.contains(&&key);
+                removes.push(Removed {
+                    leaf: GroupLeaf { index, uid, key },
+                    justified,
+                });
+            }
+            Seen::GroupContextExtensions(proposed) => {
+                let new = RisalaConversation::from_extensions(proposed).map_err(|_| {
+                    forbidden("GroupContextExtensions keeps the conversation extension")
+                })?;
+                if !new.same_conversation(before) || proposed != &group_context_extensions(&new) {
+                    return Err(forbidden(
+                        "GroupContextExtensions changes only history and send",
+                    ));
+                }
+                extensions = Some(new);
+            }
+            Seen::ExternalInit if external => {}
+            Seen::ExternalInit => {
+                return Err(forbidden("ExternalInit is only in an external commit"));
+            }
+            Seen::Other(kind) => {
+                return Err(forbidden(&format!(
+                    "a kind of proposal that is not allowed: {kind:?}"
+                )));
+            }
+        }
+    }
+    if external && removes.len() > 1 {
+        return Err(forbidden("an external commit removes at most one leaf"));
+    }
+    Ok((removes, extensions))
 }
 
 /// The current ratchet tree of a stored group, for GROUPINFO (12.5).
