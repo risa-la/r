@@ -782,6 +782,12 @@ Open:
     - Milestone: M4 for unencrypted rooms (server, librisala, CLI). The
       encrypted part is specified now and built in M5a.
 
+    Implementation choices recorded without a spec change: librisala
+    leaves refusing a member's message in an announcement room to the
+    server, since it cannot always know offline whether the account is an
+    operator. The `id` tag of report lines is optional when parsing, so
+    older servers' lines still parse.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

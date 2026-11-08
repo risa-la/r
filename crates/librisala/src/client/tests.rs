@@ -651,6 +651,16 @@ fn conversation_info_has_the_topic_and_settings() {
             tx.apply_snapshot(&row, &snapshot("SET #general public yes"))
         })
         .unwrap();
+    let general = sam.conversation("#general").unwrap();
+    assert!(!general.info().unwrap().unwrap().announcements);
+    shared
+        .store
+        .write(|tx| {
+            let row = tx.conv_or_create(account, &conv)?;
+            tx.apply_snapshot(&row, &snapshot("SET #general send mods"))
+        })
+        .unwrap();
+    assert!(general.info().unwrap().unwrap().announcements);
     let info = sam
         .conversation("#general")
         .unwrap()
@@ -668,6 +678,7 @@ fn conversation_info_has_the_topic_and_settings() {
         [
             ("guests", "write"),
             ("public", "yes"),
+            ("send", "mods"),
             ("topic", "Plans\nfor now")
         ]
     );

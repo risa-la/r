@@ -670,6 +670,13 @@ pub struct ConversationInfo {
     /// not say it, so after creating a room, ask `room_info` to learn that
     /// the account owns it.
     pub role: Option<Role>,
+    /// Whether the room is for announcements (`send mods`, 6.2): only its
+    /// owners and moderators, and server operators, send messages, and
+    /// everyone else may only react. With [`role`](Self::role) and
+    /// [`Account::is_operator`](super::Account::is_operator), this tells
+    /// an app whether to offer a message box. A message sent anyway is
+    /// refused by the server, and its outbox entry fails as `Rejected`.
+    pub announcements: bool,
 }
 
 /// One room setting (6.2), such as `public` = `yes`.
@@ -711,6 +718,9 @@ impl From<ConversationSummary> for ConversationInfo {
                 })
                 .collect(),
             role: c.role.map(Role::of),
+            announcements: c
+                .settings
+                .contains(&RoomSetting::Send(risala_proto::types::SendMode::Mods)),
         }
     }
 }
@@ -1541,6 +1551,11 @@ pub struct ReportInfo {
     /// The conversation: a room, or for a direct conversation its author,
     /// as the reporter sees it.
     pub conversation: String,
+    /// The conversation's id (5.1), from the report's `id` tag. A report
+    /// whose id is not the one stored for the room is about an older room
+    /// of the same name, dropped since (10.4), and its seq names nothing
+    /// in the room as it is now.
+    pub conversation_id: Option<String>,
     /// The reported message's seq.
     pub seq: u64,
     /// When the report was made, in milliseconds since the Unix epoch.
@@ -1567,9 +1582,14 @@ impl ReportInfo {
     pub(crate) fn new(
         id: &risala_proto::names::Id,
         report: &risala_proto::server::Report,
+        conv: Option<&risala_proto::names::Id>,
         copy: Option<&risala_proto::server::Event>,
     ) -> ReportInfo {
-        let line = ServerMessage::report_line(id.clone(), report.clone())
+        let tagged = |m: ServerMessage| match conv {
+            Some(conv) => m.with_report_conv(conv.clone()),
+            None => m,
+        };
+        let line = tagged(ServerMessage::report_line(id.clone(), report.clone()))
             .to_line()
             .to_string();
         let message = copy.and_then(|e| {
@@ -1589,7 +1609,7 @@ impl ReportInfo {
                 reply_to: rel(|r| matches!(r, R::Reply(_))),
                 edit_of: rel(|r| matches!(r, R::Edit(_))),
                 react_to: rel(|r| matches!(r, R::React(_))),
-                line: ServerMessage::report_copy(id.clone(), e.clone())
+                line: tagged(ServerMessage::report_copy(id.clone(), e.clone()))
                     .to_line()
                     .to_string(),
             })
@@ -1597,6 +1617,7 @@ impl ReportInfo {
         ReportInfo {
             id: id.to_string(),
             conversation: report.conv.to_string(),
+            conversation_id: conv.map(ToString::to_string),
             seq: report.seq.get(),
             time_ms: report.t.unix_millis(),
             time: report.t.to_string(),
@@ -1618,7 +1639,7 @@ impl ReportInfo {
                     ServerLine::ReportCopy(e) if c.report.as_ref() == Some(id) => Some(e),
                     _ => None,
                 });
-                out.push(ReportInfo::new(id, report, copy));
+                out.push(ReportInfo::new(id, report, m.report_conv.as_ref(), copy));
             }
         }
         out

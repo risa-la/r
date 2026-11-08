@@ -42,9 +42,9 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PENDING_REPORTS: usize = 64;
 
 /// A report published without the copy of its event, which never came.
-fn uncopied((id, report): (Id, Report)) -> AccountEvent {
+fn uncopied((id, report, conv): (Id, Report, Option<Id>)) -> AccountEvent {
     AccountEvent::Report {
-        report: ReportInfo::new(&id, &report, None),
+        report: ReportInfo::new(&id, &report, conv.as_ref(), None),
     }
 }
 
@@ -397,7 +397,7 @@ struct Online<'a> {
     synthetic: Vec<(Input, Ctx)>,
     /// REPORT and REPORTENC lines whose copies have not arrived yet
     /// (5.8), oldest first, by report id.
-    reports: Vec<(Id, Report)>,
+    reports: Vec<(Id, Report, Option<Id>)>,
     /// When to call [`SyncEngine::resume_outbox`] after `rate-limited`.
     resume_at: Option<Instant>,
 }
@@ -558,7 +558,7 @@ impl Online<'_> {
                         },
                     }],
                     ServerLine::Report(report) => match &msg.report {
-                        Some(id) => self.report_line(id, report),
+                        Some(id) => self.report_line(id, report, msg.report_conv.as_ref()),
                         None => Vec::new(),
                     },
                     ServerLine::ReportCopy(copy) => match &msg.report {
@@ -596,26 +596,27 @@ impl Online<'_> {
     /// event that follows it, tagged with the same report id. Returns the
     /// reports to publish without a copy: one this line replaces, and the
     /// oldest if too many wait.
-    fn report_line(&mut self, id: &Id, report: &Report) -> Vec<AccountEvent> {
+    fn report_line(&mut self, id: &Id, report: &Report, conv: Option<&Id>) -> Vec<AccountEvent> {
         let mut events = Vec::new();
-        if let Some(i) = self.reports.iter().position(|(r, _)| r == id) {
+        if let Some(i) = self.reports.iter().position(|(r, _, _)| r == id) {
             events.push(uncopied(self.reports.remove(i)));
         }
         if self.reports.len() >= MAX_PENDING_REPORTS {
             events.push(uncopied(self.reports.remove(0)));
         }
-        self.reports.push((id.clone(), report.clone()));
+        self.reports
+            .push((id.clone(), report.clone(), conv.cloned()));
         events
     }
 
     /// The copy of a reported event (5.8): completes the report it is
     /// tagged with.
     fn report_copy(&mut self, id: &Id, copy: &Event) -> Vec<AccountEvent> {
-        match self.reports.iter().position(|(r, _)| r == id) {
+        match self.reports.iter().position(|(r, _, _)| r == id) {
             Some(i) => {
-                let (id, report) = self.reports.remove(i);
+                let (id, report, conv) = self.reports.remove(i);
                 vec![AccountEvent::Report {
-                    report: ReportInfo::new(&id, &report, Some(copy)),
+                    report: ReportInfo::new(&id, &report, conv.as_ref(), Some(copy)),
                 }]
             }
             None => {

@@ -338,6 +338,7 @@ async fn reports_reach_reviewers_and_resolving_reaches_the_other_device() {
     let events: Vec<AccountEvents> = reviewers.iter().map(|a| a.subscribe()).collect();
     let others = [carol.subscribe(), dave.subscribe()];
     let c_club = carol.conversation("#club").unwrap();
+    let club_id = c_club.info().unwrap().unwrap().id.unwrap();
     let id = within("REPORT", c_club.report(spam, "spam")).await.unwrap();
     // Reporting again gets the same id; your own message is forbidden.
     assert_eq!(
@@ -351,6 +352,8 @@ async fn reports_reach_reviewers_and_resolving_reaches_the_other_device() {
         let r = report(&format!("{} gets the report", who.uid()), e).await;
         assert_eq!(r.id, id);
         assert_eq!(r.conversation, "#club");
+        // The room's id, so an older room's reports can be told apart.
+        assert_eq!(r.conversation_id, Some(club_id.clone()));
         assert_eq!(r.seq, spam);
         assert_eq!(r.reason, "spam");
         assert!(!r.encrypted);
@@ -378,6 +381,7 @@ async fn reports_reach_reviewers_and_resolving_reaches_the_other_device() {
     // The lists: room reviewers without the reporter, operators with it.
     let listed = within("REPORTS", a_club.reports()).await.unwrap();
     assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].conversation_id, Some(club_id.clone()));
     assert_eq!(
         (listed[0].id.as_str(), &listed[0].reporter),
         (id.as_str(), &None)
