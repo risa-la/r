@@ -5,7 +5,7 @@ import Testing
 
 @MainActor
 struct ConversationRandomizedTests {
-    private let rooms = TestFixtures.rooms
+    private let rooms = TestFixtures.chats
 
     @Test(.timeLimit(.minutes(1)), arguments: RandomizedRun.seeds)
     func conversationActions(seed: UInt64) async {
@@ -58,7 +58,7 @@ struct ConversationRandomizedTests {
                     let text = drafts[window][selected].trimmingCharacters(
                         in: .whitespacesAndNewlines)
                     if !text.isEmpty {
-                        expectedSends.append(SentMessage(roomID: rooms[selected].id, text: text))
+                        expectedSends.append(SentMessage(chatID: rooms[selected].id, text: text))
                         drafts[window][selected] = ""
                     }
                 }
@@ -76,10 +76,10 @@ struct ConversationRandomizedTests {
                 let visible =
                     selected.map { room in
                         index == 2
-                            ? [] : expectedSends.filter { $0.roomID == rooms[room].id }.map(\.text)
+                            ? [] : expectedSends.filter { $0.chatID == rooms[room].id }.map(\.text)
                     } ?? []
                 let model = windows[index]
-                guard model.room?.id == selected.map({ rooms[$0].id }),
+                guard model.chat?.id == selected.map({ rooms[$0].id }),
                     model.draft == draft,
                     model.canSend == canSend,
                     client.sent == expectedSends,

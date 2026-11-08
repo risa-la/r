@@ -43,6 +43,30 @@ nonisolated struct Message: Identifiable, Hashable, Sendable {
         case failed(possiblySent: Bool)
     }
 
+    /// The message a reply answers, as the timeline quotes it above the reply.
+    nonisolated struct Reply: Hashable, Sendable {
+        let author: String
+        /// The answered message's text; empty when it was deleted.
+        let text: String
+    }
+
+    /// A thread under the message: its replies show elsewhere, so the timeline sums
+    /// them up.
+    nonisolated struct Thread: Hashable, Sendable {
+        let replyCount: Int
+        let lastReplyAt: Date
+    }
+
+    /// A file sent with the message.
+    nonisolated struct Attachment: Hashable, Sendable {
+        /// The file's name; user content, shown as is.
+        let name: String
+        let byteCount: Int64
+        let isImage: Bool
+        /// A small rendition of an image, if one is available yet.
+        let thumbnail: URL?
+    }
+
     let id: ID
     let author: String
     let kind: Kind
@@ -58,6 +82,9 @@ nonisolated struct Message: Identifiable, Hashable, Sendable {
     let isDeleted: Bool
     let reactions: [Reaction]
     let delivery: Delivery
+    let reply: Reply?
+    let thread: Thread?
+    let attachment: Attachment?
 
     init(
         id: ID,
@@ -70,7 +97,10 @@ nonisolated struct Message: Identifiable, Hashable, Sendable {
         isEdited: Bool = false,
         isDeleted: Bool = false,
         reactions: [Reaction] = [],
-        delivery: Delivery = .sent
+        delivery: Delivery = .sent,
+        reply: Reply? = nil,
+        thread: Thread? = nil,
+        attachment: Attachment? = nil
     ) {
         self.id = id
         self.author = author
@@ -83,5 +113,13 @@ nonisolated struct Message: Identifiable, Hashable, Sendable {
         self.isDeleted = isDeleted
         self.reactions = reactions
         self.delivery = delivery
+        self.reply = reply
+        self.thread = thread
+        self.attachment = attachment
+    }
+
+    /// Guest names start with `~`; they show as guests in the timeline.
+    var isGuestAuthor: Bool {
+        author.hasPrefix("~")
     }
 }

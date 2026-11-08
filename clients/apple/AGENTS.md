@@ -7,13 +7,14 @@
   Use the Nix-pinned SweetPad CLI for builds and tests (see `README.md`).
   Tests run hosted in the app through `@testable import Risala`.
 - Keep protocol logic, persistence, and history caching in librisala. The client
-  owns presentation and a thin library adapter. No demo data.
+  owns presentation and a thin library adapter. No demo data in Release builds:
+  preview data lives in `Development/` (`DEVELOPMENT_ASSET_PATHS`), behind `#if DEBUG`.
 - Use lightweight MVVM by feature: views own layout and temporary UI state;
   observable feature models (`*ViewModel`) own presentation, actions, and
-  subscription lifetimes. Plain data types keep domain names (`Room`, `Message`).
+  subscription lifetimes. Plain data types keep domain names (`Chat`, `Message`).
   Keep features under `Sources/Features`, the adapter under `Sources/Client`,
   and composition under `Sources/App`. Navigation and feature models belong to
-  each window; share only the library session. Preserve drafts across room switches.
+  each window; share only the library session. Preserve drafts across chat switches.
 - Use `@Observable`, `@State`, and `@Bindable`. The app target defaults to
   MainActor isolation with approachable concurrency, so omit `@MainActor` there.
   Mark adapter-boundary types `nonisolated` and `Sendable`; run blocking FFI or
@@ -44,13 +45,19 @@ Measure responsive launch and useful cached content separately in Release builds
 
 Keep typography, color, and layout roles in `Sources/Design`, reusable
 view styling in `Sources/Design/Styles`, and views shared across features
-(breadcrumb, glyph, Hudhud) in `Sources/Design/Components`. Use these roles
+(identity chip, mode bar, Hudhud) in `Sources/Design/Components`. Use these roles
 in feature views; keep feature-specific components with their feature. Preserve
 native controls and semantic fonts/colors. Avoid fixed RGB values in views.
 
 The app is moving to the terminal look in the Paper file's TUI mockups: framed
-panels, JetBrains Mono, and a breadcrumb heading. The mode shows in the composer
-prompt; there is no status line. Its colors live
+panels, JetBrains Mono, and a breadcrumb heading. The mode shows in the mode bar
+at the bottom (`ModeBar`): the mode, a prompt, and the person's identity chips. It
+never carries connection or other status, which stays on the rows it concerns. The
+chat list sets names and messages in the system face and everything structural
+(times, counts, servers, tabs, filters) in JetBrains Mono. JetBrains Mono has no
+Arabic, and its fallback breaks Arabic letters apart: Arabic user content goes
+through `Text(terminal:)`, and an Arabic interface uses the system face for the
+terminal roles (`Typography`). Its colors live
 in `Resources/Assets.xcassets/Palette` with light and dark variants; dark values
 come from the mockups. Name colorsets by role and use Xcode's generated symbols
 (`.foregroundStyle(.textTertiary)`) rather than wrapping them; avoid names

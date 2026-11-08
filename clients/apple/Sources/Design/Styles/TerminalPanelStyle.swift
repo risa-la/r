@@ -21,3 +21,25 @@ extension View {
         modifier(TerminalPanelStyle())
     }
 }
+
+// A pane on a large screen: a framed panel on the window's surface. The focused
+// pane's frame is a step brighter; its prompt also shows the mode.
+private struct PaneStyle: ViewModifier {
+    let isFocused: Bool
+    private let shape = RoundedRectangle(cornerRadius: Layout.panelCornerRadius)
+
+    func body(content: Content) -> some View {
+        content
+            .background(.panel)
+            .clipShape(shape)
+            .overlay {
+                shape.strokeBorder(isFocused ? Color.textTertiary.opacity(0.45) : Color.rule)
+            }
+    }
+}
+
+extension View {
+    func pane(isFocused: Bool) -> some View {
+        modifier(PaneStyle(isFocused: isFocused))
+    }
+}

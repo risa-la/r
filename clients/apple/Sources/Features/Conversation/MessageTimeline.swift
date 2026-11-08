@@ -1,7 +1,12 @@
 import SwiftUI
 
+/// A chat's messages as a terminal timeline, newest at the bottom: day lines, a
+/// "new" line where the unread messages start, and messages grouped by author. It
+/// follows new messages while at the bottom and loads older ones at the top.
 struct MessageTimeline: View {
     let messages: [Message]
+    /// Where the "new" line goes.
+    var firstUnread: Message.ID? = nil
     let sendRevision: Int
     /// Whether older messages may exist, whether or not a request is in flight.
     let hasOlder: Bool
@@ -22,22 +27,32 @@ struct MessageTimeline: View {
     var body: some View {
         let tolerance = Layout.timelineEdgeTolerance
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: Layout.timelineItemSpacing) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 if isLoadingOlder {
                     ProgressView()
                         .frame(maxWidth: .infinity)
+                        .padding(.bottom, Layout.timelineEntrySpacing)
                 }
-                ForEach(messages) { message in
-                    MessageRow(
-                        message: message,
-                        isBusy: busyMessages.contains(message.id),
-                        retry: { retry(message) },
-                        discard: { discard(message) }
-                    )
+                let entries = TimelineEntry.entries(for: messages, firstUnread: firstUnread)
+                ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                    self.entry(entry)
+                        .padding(.top, index == 0 ? 0 : spacing(before: entry))
                 }
             }
             .scrollTargetLayout()
-            .padding()
+            .frame(maxWidth: Layout.timelineMaxWidth)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 14)
+            .frame(maxWidth: .infinity)
+        }
+        // The top edge fades rather than cutting a line in half.
+        .mask {
+            VStack(spacing: 0) {
+                LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 28)
+                Color.black
+            }
         }
         .scrollPosition($position)
         .onScrollGeometryChange(for: ScrollEdges.self) { geometry in
@@ -75,11 +90,47 @@ struct MessageTimeline: View {
         }
         .overlay(alignment: .bottomTrailing) {
             if hasNewMessages {
-                Button("New messages", systemImage: "arrow.down") { scrollToLatest() }
-                    .buttonStyle(.borderedProminent)
-                    .padding()
+                Button(action: scrollToLatest) {
+                    HStack(spacing: 6) {
+                        Text(verbatim: "↓").accessibilityHidden(true)
+                        Text("New messages")
+                    }
+                    .font(Typography.terminalSmall.weight(.bold))
+                    .foregroundStyle(.ink)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.panel, in: .rect(cornerRadius: 8))
+                    .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.rule) }
+                    .minimumTouchTarget()
+                }
+                .buttonStyle(.plain)
+                .padding()
             }
         }
+    }
+
+    @ViewBuilder
+    private func entry(_ entry: TimelineEntry) -> some View {
+        switch entry {
+        case .day(let date):
+            TimelineDivider(label: DayLabel(date: date), isNew: false)
+        case .new:
+            TimelineDivider(label: Text("new"), isNew: true)
+        case .message(let message, let continuesGroup):
+            MessageRow(
+                message: message,
+                continuesGroup: continuesGroup,
+                isBusy: busyMessages.contains(message.id),
+                retry: { retry(message) },
+                discard: { discard(message) }
+            )
+        }
+    }
+
+    /// Lines in a group sit close; everything else has room around it.
+    private func spacing(before entry: TimelineEntry) -> CGFloat {
+        if case .message(_, true) = entry { return 2 }
+        return Layout.timelineEntrySpacing
     }
 
     private func requestOlder() {
@@ -110,5 +161,46 @@ private nonisolated struct ScrollEdges: Equatable {
         nearTop = offset + geometry.contentInsets.top <= tolerance
         nearBottom = geometry.contentSize.height - visibleBottom <= tolerance
         contentHeight = geometry.contentSize.height
+    }
+}
+
+/// A line across the timeline with a label at its trailing end: `──── today`, or the
+/// "new" line in ink.
+private struct TimelineDivider<Label: View>: View {
+    let label: Label
+    let isNew: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Rectangle()
+                .fill(isNew ? Color.ink.opacity(0.35) : Color.rule)
+                .frame(height: 1)
+                .accessibilityHidden(true)
+            label
+                .font(Typography.timelineDivider)
+                .foregroundStyle(isNew ? .ink : .textTertiary)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// `today`, `yesterday`, or the date, in lowercase like the rest of the terminal.
+private struct DayLabel: View {
+    let date: Date
+
+    var body: some View {
+        Group {
+            if Calendar.current.isDateInToday(date) {
+                Text("today")
+            } else if Calendar.current.isDateInYesterday(date) {
+                Text("yesterday")
+            } else {
+                Text(date, format: .dateTime.weekday(.wide).day().month(.wide))
+            }
+        }
+        .textCase(.lowercase)
     }
 }

@@ -1,17 +1,8 @@
 import Foundation
 
-/// One change to a timeline's items, to apply in order. Indices refer to the items
-/// as they are after the changes before it.
-nonisolated enum TimelineChange: Hashable, Sendable {
-    /// Replaces every item, such as after a reconnect or when the consumer fell behind.
-    case reset([Message])
-    /// Inserts an item; later items move up.
-    case insert(Message, at: Int)
-    /// Replaces the item at an index with a newer state of the same item; the ID stays.
-    case update(Message, at: Int)
-    /// Removes the item at an index; later items move down.
-    case remove(at: Int)
-}
+/// One change to a timeline's items. Edits, deletions, reactions, and history filled
+/// in mid-timeline arrive as updates and insertions.
+typealias TimelineChange = ListChange<Message>
 
 /// Changes the library made together; apply all of them, or none.
 nonisolated struct TimelineBatch: Sendable {
@@ -32,4 +23,7 @@ nonisolated struct TimelineSubscription: Sendable {
     /// Asks for up to `limit` older messages, from the cache first and then the
     /// server. Returns once requested; the messages arrive as `batches`.
     let loadOlder: @Sendable (_ limit: Int) async throws -> Void
+    /// The first message after the read marker when the timeline opened, where the
+    /// timeline says "new"; `nil` when everything was read.
+    var firstUnread: Message.ID? = nil
 }

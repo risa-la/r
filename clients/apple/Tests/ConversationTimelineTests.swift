@@ -5,8 +5,8 @@ import Testing
 
 @MainActor
 struct ConversationTimelineTests {
-    private let room = TestFixtures.rooms[0]
-    private let otherRoom = TestFixtures.rooms[1]
+    private let room = TestFixtures.chats[0]
+    private let otherRoom = TestFixtures.chats[1]
 
     /// Batches that cannot apply to the items they follow.
     nonisolated enum Misfit: CaseIterable {
@@ -32,6 +32,39 @@ struct ConversationTimelineTests {
         let replacement = client.makeMessage("after reset")
         client.push(TimelineBatch(changes: [.reset([replacement])], isAtStart: true), to: room.id)
         #expect(await eventually { texts(model) == ["after reset"] })
+        observing.cancel()
+        await observing.value
+    }
+
+    /// Catches a "new" line that follows the read marker as messages arrive, or that
+    /// stays behind when another chat opens.
+    @Test(.timeLimit(.minutes(1)))
+    func keepsTheReadMarkerTheTimelineOpenedWith() async {
+        let client = TestChatClient()
+        client.seed(["read", "unread"], in: room.id)
+        client.seed(["other"], in: otherRoom.id)
+        let marker = Message.ID(rawValue: "m2")
+        client.firstUnread[room.id] = marker
+        let model = ConversationViewModel(client: client)
+        var subscriptions = client.subscriptions.makeAsyncIterator()
+        model.select(room)
+        var observing = Task { await model.observeTimeline() }
+        _ = await subscriptions.next()
+        #expect(await eventually { model.firstUnread == marker })
+
+        client.firstUnread[room.id] = nil
+        client.receive("newer", in: room.id)
+        #expect(await eventually { texts(model) == ["read", "unread", "newer"] })
+        #expect(model.firstUnread == marker)
+
+        observing.cancel()
+        await observing.value
+        model.select(otherRoom)
+        #expect(model.firstUnread == nil)
+        observing = Task { await model.observeTimeline() }
+        _ = await subscriptions.next()
+        #expect(await eventually { texts(model) == ["other"] })
+        #expect(model.firstUnread == nil)
         observing.cancel()
         await observing.value
     }
@@ -123,7 +156,7 @@ struct ConversationTimelineTests {
         client.receive("late", in: room.id)
         // The stale subscription stops at its first change after the switch.
         await stale.value
-        #expect(model.room?.id == otherRoom.id)
+        #expect(model.chat?.id == otherRoom.id)
         #expect(model.messages.isEmpty)
     }
 

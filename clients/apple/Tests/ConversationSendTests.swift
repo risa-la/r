@@ -6,7 +6,7 @@ import Testing
 @MainActor
 struct ConversationSendTests {
     private enum SendError: Error { case unavailable }
-    private let rooms = TestFixtures.rooms
+    private let rooms = TestFixtures.chats
 
     @Test(.timeLimit(.minutes(1)))
     func failureKeepsDraftAndAllowsRetry() async {
@@ -33,7 +33,7 @@ struct ConversationSendTests {
         await retry.value
         #expect(model.draft.isEmpty)
         #expect(!model.sendFailed)
-        #expect(client.sent == [SentMessage(roomID: rooms[0].id, text: "hello")])
+        #expect(client.sent == [SentMessage(chatID: rooms[0].id, text: "hello")])
         #expect(model.sendRevision == 1)
     }
 
@@ -60,7 +60,7 @@ struct ConversationSendTests {
         #expect(model.sendRevision == 0)
         model.select(rooms[0])
         #expect(model.draft == (edit ? "hello" : ""))
-        #expect(client.sent == [SentMessage(roomID: rooms[0].id, text: "hello")])
+        #expect(client.sent == [SentMessage(chatID: rooms[0].id, text: "hello")])
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -105,8 +105,8 @@ struct ConversationSendTests {
         #expect(await eventually { model.messages.map(\.id) == [first.id] })
         #expect(
             client.outboxActions == [
-                OutboxAction(kind: .retry, messageID: first.id, roomID: roomID),
-                OutboxAction(kind: .discard, messageID: second.id, roomID: roomID),
+                OutboxAction(kind: .retry, messageID: first.id, chatID: roomID),
+                OutboxAction(kind: .discard, messageID: second.id, chatID: roomID),
             ])
         #expect(model.busyMessages.isEmpty)
         observing.cancel()
