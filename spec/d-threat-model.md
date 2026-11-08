@@ -44,7 +44,10 @@ active.
   generation. Link a device's anonymous connections to its signed-in
   one by address and timing, and then every mailbox it follows. In a
   quiet public room, tie a pseudonym to the commit made just before its
-  first post (Section 14).
+  first post (Section 14). With a member's help, open or close the time
+  windows of the group checks through the `t` it gives posts. Leave
+  members out of what a light client is told, which it shows only as
+  the server's word (12.6).
 - Cannot: read any message, file, private display name or topic. Learn
   who sent a post, or who is in a direct conversation or a private room,
   except by the links above. Keep those links in what it stores, if it
@@ -94,31 +97,44 @@ that hosts an identity.
 
 - Can: read and leak the conversation from when it joined. Post invalid
   commits, which cost others some work (7.2), and in a public room make
-  every device resync, after which it can be banned (12.7). Remove a
-  leaf by claiming that a key check fails for it, or by repairing it as
-  an impostor, which devices undo and attribute (12.7). Hold a leaf of
-  a device it adds, in that device's name, until devices confirm the
-  leaf or find it out, about an hour after it first uses a role.
-  Within its role, invite, kick, ban, delete and change settings. Remove others' stale leaves,
-  within the limits of 12.7. Commit in up to 3 epochs in a row, then
-  about once every 10 minutes. Make a transcript that proves nothing to
-  others, since members can forge each other's messages for third
-  parties. In an epochal group, prove a message to others until its
-  period key is published, or later if it timestamped the message's
-  hash in public beforehand. Post abuse and report it to operators as
-  someone else's. Once removed, watch the old mailbox and post junk
-  there, until the group moves (7.8), which it does right after the
-  removal. Fork its own chain, or take its key file down, which stops
-  only its own direct conversations, and has its leaves hidden in rooms
-  and removed from rooms that are not public (12.14).
+  every device resync, after which it can be banned (12.7). In a public
+  room, make a resync commit, which removes one other leaf and which
+  devices that did not need it attribute. Outside public rooms, remove
+  the leaves of one other identity per commit by claiming that a check
+  fails for them, which devices attribute (12.7); a plain member who
+  removes all of an identity's leaves keeps it out of a room until an
+  owner or moderator adds it back. Hold a leaf of a device it adds, in
+  that device's name, until devices confirm the leaf or find it out,
+  about an hour after it first uses a role. Within its role, invite,
+  kick, ban, delete and change settings. Remove others' stale leaves,
+  and in a public room copies and joins that nobody uses, within the
+  limits of 12.7. With its identity's other devices, commit in up to 3
+  epochs in a row, then about once every 10 minutes. Move its group's
+  mailbox, to the box that the group's secrets derive (7.8). Make a
+  transcript that proves nothing to others, since members can forge each
+  other's messages for third parties. In an epochal group, prove a
+  message to others until its period key is published, or later if it
+  timestamped the message's hash in public beforehand. Post abuse and
+  report it to operators as someone else's. Once removed, watch the old
+  mailbox and post junk there, until the group moves (7.8), which it
+  does right after the removal. Fork its own chain, or take its key
+  file down, which stops only its own direct conversations, and has its
+  leaves hidden in rooms and removed from rooms that are not public
+  (12.14).
 - Cannot: post as another member to the other members, make another
   member's leaf look confirmed, give a moderator control of an owner's
-  leaf by an invitation, read anything sent after it is removed,
-  post or act on a role it has lost after the commit that removed or
-  demoted it, or add new identities to a room without a role that
-  allows it. Get anyone banned by operators on a report alone. Learn a
-  member's network address by sharing a file from a host of its own,
-  unless that member chooses to fetch it.
+  leaf by an invitation, read anything sent after it is removed, post or
+  act on a role it has lost after the commit that removed or demoted it,
+  or add new identities to a room without a role that allows it. Undo
+  moderation without the role that it needed, by calling a leaf an
+  impostor or otherwise. Give devices that joined recently a different
+  view of the group than older ones, since group checks depend only on
+  the group's state (12.7). Empty a public room, or keep its owners and
+  moderators out of it. Move its group to a mailbox that cannot be used,
+  or deliver a Welcome for a device that someone else added (12.8). Get
+  anyone banned by operators on a report alone. Learn a member's network
+  address by sharing a file from a host of its own, unless that member
+  chooses to fetch it.
 
 **A guest,** or anyone who opens anonymous connections.
 
@@ -130,8 +146,9 @@ that hosts an identity.
   proof of work (4.1).
 - Cannot: take part in private rooms or in other direct conversations,
   send anything but reports in a report conversation, or appear as
-  anything but an unverified guest. Commit in a public room, or force
-  its devices to join again.
+  anything but an unverified guest. Commit in a public room, force
+  its devices to join again, or block joins to it by delivering
+  Welcomes first (12.8). Change a TOKEN set of a public room (7.2).
 
 **Someone who steals a device,** or compromises one for a while.
 
@@ -261,9 +278,10 @@ Each risk is marked **Mitigated**, where this document limits it, or
   confirmation, send tokens with "the first valid commit wins", and
   pseudonyms are this document's own, and have not yet been reviewed or
   formally modelled. So are commit streaks and the stale-leaf median,
-  group checks and key checks with their repairs, impostor repairs,
-  RESYNC and resync commits (12.7), chained period seeds (12.10), and
-  `next`, TOKEN and mailbox moves (7.2, 7.8).
+  group checks and key checks with their repairs, removals for a check,
+  RESYNC, resync commits and rejoins (12.7), chained period seeds
+  (12.10), derived pseudonyms (7.3), and `next`, TOKEN and derived
+  mailbox moves (7.2, 7.8).
 - **Sizes are not yet measured** (Open). The room limits may change once
   ML-DSA and X-Wing have been measured on phones.
 - **Metadata from files, blobs and backups** (Open). The server sees
@@ -276,14 +294,27 @@ Each risk is marked **Mitigated**, where this document limits it, or
   compare epochs through read markers (12.7, 7.7), but cannot end the
   split.
 - **Leaves held by whoever added them** (Mitigated: challenged at their
-  first use of a role, removed and undone within about an hour, 12.7).
-  A member who adds a device can hold its leaf until devices confirm
-  it, and any member can remove a leaf as an impostor, which devices
-  that confirmed it attribute.
+  first use of a role, removed within about an hour, 12.7). A member
+  who adds a device can hold its leaf until devices confirm it. Undoing
+  what such a leaf did takes ordinary commits by those whose role
+  allows each change.
+- **Removals for a check** (Mitigated: one identity per commit, streaks
+  per identity, and attribution, 12.7). In a direct conversation or a
+  private room, any member can remove another identity's leaves by
+  claiming a check that the group cannot make, and in a room, if it
+  removes all of them, only owners and moderators can add them back.
 - **Resyncs in public rooms** (Mitigated: only identities commit, from
-  their signed-in connections, and recovery is one commit and batches,
-  12.7). A member's invalid commit makes every device of a public room
-  recover.
+  their signed-in connections, a resync removes one leaf and is
+  attributed, and recovery is one commit and batches, 12.7). A member's
+  invalid commit makes every device of a public room recover.
+- **Unused joins in public rooms** (Mitigated: owners and moderators
+  remove them, and anyone after 8 days, 12.7). Joins that nobody uses
+  count towards a room's limits until then, bounded only by proof of
+  work and rate limits.
+- **Time windows on the server's clock** (Open). Every time window of
+  the group checks runs on the `t` the server gives posts, so that
+  devices agree; a server that colludes with a member can shift them
+  (Section 14).
 - **Archivers in public rooms** (Open). Anyone can join a public room, so
   an archiver that timestamps what it sees defeats delayed deniability
   for it (Section 14).
@@ -370,3 +401,17 @@ claims that depend on it.
   confirms its identity at pairing (4.8); server addresses written one
   way (2.1, 3.5); proof of work not required until it is specified
   (4.1); archived files scoped to their transfer (12.13).
+- **draft-03, review round 2** (2026-11-09), groups and MLS: group checks that
+  depend only on the group's state, the commit and its post, with no
+  look-backs; removals for a check limited to one identity a commit,
+  and impostor removals that undo nothing; copies and unused joins in
+  public rooms, with no resync window, a bulk limit, and rejoins by
+  owners and moderators; streaks per identity; signature key changes
+  decided from the tree; activity times capped at the post's `t`
+  (12.3, 12.7); per-epoch pseudonyms outside public rooms (7.3); put
+  secrets for Welcomes, and public-room Welcomes only from the
+  committer, with the server keeping their trees (12.5, 12.6, 12.8);
+  derived mailbox boxes and CREATE `from` (7.8, 5.2); TOKEN apart from
+  commits' hashes and not in public rooms (7.2); past-epoch secrets
+  deleted 2 hours after the commit (12.9); pending records failing
+  after 2 hours; the light client's wire format (12.6).

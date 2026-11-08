@@ -15,9 +15,12 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   or reports to moderators. Anyone can join a public room, so a server
   that wants to read one can join it under an identity of its own, like
   anyone else. Its leaf then shows in the room's membership, which is
-  public. Encryption still keeps a public room's messages from an
-  operator who does not join, or who is compelled to hand over what it
-  stores, and keeps the server from changing them.
+  public, to every full client. A light client shows only the members
+  it holds proofs for, and the server's member list only as the
+  server's word, since the server could leave its own leaf out (12.6).
+  Encryption still keeps a public room's messages from an operator who
+  does not join, or who is compelled to hand over what it stores, and
+  keeps the server from changing them.
 
 - **Post-quantum.** Connections use a hybrid key exchange (2.1), and
   groups X-Wing (12.2). Both stay secret as long as either their
@@ -32,8 +35,10 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 
 - **Forward secrecy and post-compromise security.** Each message has its
   own key, which devices delete once they have used it (12.9), and
-  devices delete a past epoch's secrets once 2 more epochs have started
-  or an hour has passed since it ended (12.9). So a device stolen
+  devices delete a past epoch's secrets once they have applied the third
+  epoch after it, once posts arrive more than an hour after the commit
+  that ended it, and in any case 2 hours after they applied that
+  commit, by their own clocks (12.9). So a device stolen
   today does not decrypt what the server stored earlier. Commits give
   post-compromise security: once a device has committed a fresh leaf,
   which it does at least weekly (12.7), keys stolen earlier do not
@@ -87,7 +92,12 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     can prove later that it existed while only its sender could have
     signed it. Anyone can join a public room, so a bot that joins every
     public room and timestamps every ATTEST and message it sees defeats
-    delayed deniability for everything it archived.
+    delayed deniability for everything it archived. A new leaf key each
+    period limits what a revealed period key lets anyone forge, but does
+    not keep the periods apart: in a public room, the Updates that bring
+    each period's leaf key are public and signed with the key before, so
+    one timestamped ATTEST ties a leaf to its device in every period
+    (12.10).
   - Public rooms carry no device bindings (12.3), so their public
     commits tie no leaf key to a device: whose leaf is whose rests only
     on attestation, which becomes forgeable once the period key is out.
@@ -107,10 +117,10 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   - Pairwise confirmation, epochal confirmation with its chained seeds,
     send tokens with `next` and TOKEN and "the first valid commit wins"
     (7.2), the split of commit checks into group checks and key checks
-    with their repairs, impostor repairs, RESYNC and resync commits
-    (12.7), pseudonyms (7.3) and mailbox moves (7.8) are risala's own
-    constructions. They need a formal model and an outside review before
-    they are relied on.
+    with their repairs, removals for a check, RESYNC, resync commits and
+    rejoins (12.7), derived pseudonyms (7.3) and derived mailbox moves
+    (7.8) are risala's own constructions. They need a formal model and an
+    outside review before they are relied on.
   - Epochal confirmation assumes that devices' clocks are never off by
     more than an hour (12.10). Group checks never use a device's clock,
     only the server's `t` on posts (12.7).
@@ -132,13 +142,16 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     sessions (2.1), which would link connections even across addresses.
   - which connections follow which mailboxes, which mailboxes one
     connection follows, and each post's pseudonym, size within its
-    padding, and time. A device's set of mailboxes, its sync points, its
-    `quiet` tags and its `cid`s stay much the same from one session to
-    the next. So once any one of them is tied to its identity, by
-    address, by timing, or by an identifying command sent on the wrong
-    connection (4.1), every conversation the device follows is, past and
-    future. 7.4 makes them less stable. Spreading a device's mailboxes
-    over several connections is left for a version with Tor.
+    padding, and time. Outside public rooms, a leaf's pseudonym changes
+    with every commit (7.3), so it groups that leaf's posts only within
+    an epoch, a week at most; in a public room, within a period. A
+    device's set of mailboxes, its sync points, its `quiet` tags and its
+    `cid`s stay much the same from one session to the next. So once any
+    one of them is tied to its identity, by address, by timing, or by an
+    identifying command sent on the wrong connection (4.1), every
+    conversation the device follows is, past and future. 7.4 makes them
+    less stable. Spreading a device's mailboxes over several connections
+    is left for a version with Tor.
   - which push subscriptions follow which mailbox (9.1), and, through
     their URLs and timing, which subscriptions may belong to one device;
   - which device gets a Welcome, and when (12.8). Welcomes are sealed to
@@ -227,6 +240,17 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   - It can send a false GONE that makes members' devices remove a
     guest's leaf, or hold one back, so that a reused guest name appears
     twice (6.1).
+  - Every time window in the group checks runs on the server's `t`,
+    so that all devices agree (12.7): KeyPackage lifetimes, the bounds
+    on `updated` and the streak's 10 minutes, stale leaves, and the 8
+    days after which anyone may remove a public-room leaf that never
+    committed. A server that colludes with a member can open or close
+    any of these, for example accept an expired KeyPackage or make a
+    leaf stale early. Devices warn when the `t` of commits disagrees
+    with their own clock by more than an hour (12.7).
+  - It can leave members out of the list that MEMBERS gives a light
+    client (8.3), which shows that list only as the server's word
+    (12.6).
   - Within a generation, it can serve an older backup (above).
 
 - **Insiders.** A member can read the conversation, and can leak it. A
@@ -239,14 +263,33 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   each from its own signed-in connection, so the member who did it is
   known, and can be banned; guests and anyone not yet a member cannot
   do it, since they join only by proposal (6.1).
-- **Removals that devices undo.** Whether a commit is valid never
-  depends on key files (12.7), so in a direct conversation or a private
-  room any member can remove any leaf by claiming that a key check
-  fails for it. Every device checks the claim, warns, and adds the
-  device back if it was false, but the device misses what was said in
-  between until its own devices fill the gap (12.13). The same goes for
-  a member who encrypts a commit's path secrets so that a few devices
-  cannot follow: they post RESYNC, and are added back (12.7).
+- **Removals for a check.** Whether a commit is valid never depends on
+  key files (12.7), so in a direct conversation or a private room any
+  member can remove the leaves of one other identity in a commit, by
+  claiming that a key check fails for them, that a leaf is an impostor,
+  or that it asked to be replaced. Every device checks a key-check
+  claim and warns, and devices that had confirmed a removed leaf name
+  whoever removed it. The removed devices come back only as the group
+  checks allow, which never depend on history: through their identity's
+  own devices if some are still in the group, the other participant of
+  a direct conversation, or, in a room, an owner or moderator. So a
+  plain member who removes all of an identity's leaves keeps it out
+  until one of those acts, and while no owner or moderator device is
+  online. One identity per commit and commit streaks per identity
+  (12.7) mean that emptying a room takes a member many commits over
+  hours, in view of every device; the group recovers as long as a
+  device that can check and add back remains in it. A device that was
+  removed misses what was said in between until its own devices fill
+  the gap (12.13). The same goes for a member who encrypts a commit's
+  path secrets so that a few devices cannot follow: they post RESYNC,
+  and their identity's devices, or an owner or moderator, add them back
+  (12.7).
+  A later version may carry a bounded history of recent commits in the
+  group context, which every commit updates and joiners read from the
+  GroupInfo, so that plain members could again add back what a false
+  removal took out, and undo an impostor's commits, without the group
+  checks depending on anything a joiner lacks. This version keeps every
+  group check to the current state, and leaves such repairs to roles.
 - **Leaves held by whoever added them.** A device binding covers the
   keys that others encrypt to, not the leaf's signature key (12.3). So
   the member who adds a device, or the server that hands out its
@@ -258,41 +301,60 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   with that identity's role, until devices confirm it (12.10). Devices
   challenge such a leaf as soon as it uses a role, and the identity's
   own devices challenge every new leaf of it, so within about an hour
-  devices find it out, remove it, and undo what its commits did in the
-  last 24 hours (12.7). Its messages show as unverified throughout. An
-  invitation never hands a moderator an owner's leaf, since only owners
-  invite owners and moderators. Any member can also make such a repair
-  against a leaf that is not an impostor; devices that had confirmed
-  that leaf then name the member who did it, and its identity adds its
-  device back.
+  devices find it out and remove it (12.7). Removing it does not undo
+  what its commits did: the identity's own devices, or the room's other
+  owners and moderators, undo that with ordinary commits, within their
+  roles. Its messages show as unverified throughout. An invitation never
+  hands a moderator an owner's leaf, since only owners invite owners and
+  moderators. Any member can also remove, as an impostor, a leaf that
+  is not one; devices that had confirmed that leaf then name the member
+  who did it, and its identity adds its device back. Calling a leaf an
+  impostor gives no power to undo what it did, so a member cannot
+  reverse an owner's moderation that way.
 - **Public rooms.** Anyone can join a public room under a credential
   that names any device (12.3). Such a leaf never attests, so devices
-  treat it as a guest's, it cannot commit, since the server takes
-  commits only from the device a credential names (12.6), and it cannot
-  push the device it names out of the room, since an earlier leaf of
-  the same device is removed only once it has been inactive for 48
-  hours, while the device itself can remove the copy at once (12.7). An identity in the room can make a resync commit at any
-  time, which removes the last committer's leaf until that device joins
-  again. A member, or
-  anyone who joins a public room, can also add useless hashes to a token
-  set (7.2), and post under another member's pseudonym, which the
-  server cannot tell apart, though members' devices ignore such posts
-  (7.3). A member can move its group's mailbox (7.8). A removed member
-  keeps the old box and its last token: it can watch the old mailbox
-  and post junk there until the group moves, which it does right after
-  the removal. A blocked person in a direct conversation stays in it,
-  and so sees its activity. A member can take part in confirming leaves
-  only for itself: it cannot make another member's leaf look
-  confirmed. Any member can remove others' leaves that are stale, more
-  than 35 days behind the group's median (12.7), at most a tenth of the
-  group in one commit, and must add those devices again if they have
-  KeyPackages. A member can commit in at most 3 epochs in a row before
-  it has to wait about 10 minutes (12.7). A removed or demoted member
-  loses its role from the commit that removes or demotes it (12.9).
-  A compromised device of an identity can, until it is removed, send
-  that identity's other devices made-up history for the gaps they ask
-  it to fill. They show it as copied from that device, and never let it
-  replace what they hold (12.13).
+  treat it as a guest's. It cannot commit or propose an Update, since
+  the server takes those only from the device a credential names
+  (12.6), and so it cannot push the device it names out of the room: a
+  copy of a leaf is removed only once the other leaf has committed or
+  been Updated, which only the named device can do, while that device
+  can remove the copy at once (12.7). Owners and moderators remove such
+  leaves without kicking the uid they name, and any member may once
+  they are 8 days old; until then, joins that nobody uses count towards
+  the room's limits, which only proof of work and rate limits bound
+  (4.1). An identity in the room can make a resync commit at any time,
+  which removes the last committer's leaf until that device joins
+  again; devices that had no trouble with the commit it undid name its
+  maker. Apart from owners and moderators, who act within their roles,
+  a commit removes at most a tenth of a room's leaves, and only leaves
+  that are stale, guests', copies or never used, so no member can empty
+  a public room. A hostile member that is the only full client online
+  can hold back joins, but owners and moderators can still get in by
+  external commit (12.7). Anyone who joins a public room can post under
+  another member's pseudonym, which the server cannot tell apart,
+  though members' devices ignore such posts (7.3).
+- **Other insiders.** In a direct conversation or a private room, a
+  member can add useless hashes to a token set with TOKEN, but cannot
+  push out the hashes that commits added (7.2). A member can move its
+  group's mailbox, but only to the box that the group's secrets derive
+  for that epoch (7.8). A removed member keeps the old box and its last
+  token: it can watch the old mailbox and post junk there until the
+  group moves, which it does right after the removal. A blocked person
+  in a direct conversation stays in it, and so sees its activity. A
+  member can take part in confirming leaves only for itself: it cannot
+  make another member's leaf look confirmed. Any member can remove
+  others' leaves that are stale, more than 35 days behind the group's
+  median (12.7), at most a tenth of the group in one commit, and outside
+  public rooms must add those devices again if they have KeyPackages. No
+  leaf counts as newer than the post that carries the commit, so joiners
+  cannot drag the median forward. The devices of one identity can
+  together commit in at most 3 epochs in a row before they have to wait
+  about 10 minutes (12.7). A removed or demoted member loses its role
+  from the commit that removes or demotes it (12.9). A compromised
+  device of an identity can, until it is removed, send that identity's
+  other devices made-up history for the gaps they ask it to fill. They
+  show it as copied from that device, and never let it replace what they
+  hold (12.13).
 
 - **Who can add a device.** Any device of an identity holds the
   device-signing key, and so can add a device. That shows in the key
@@ -320,8 +382,8 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   other leaves from groups and add itself back. The identity's devices
   show this as an alert (12.7), and its removal stands once the record
   is accepted, which logs SHOULD witness within a minute (4.5). Devices
-  then remove its leaves, and undo what they did in the last 24 hours,
-  as for an impostor (12.7).
+  then remove its leaves, as for an impostor, and the identity's other
+  devices undo what it did, within the identity's role (12.7).
 
 - **Missing key files and forks.** A key file that is gone or invalid
   is unsigned, so it removes no device by record (4.4). Devices cannot
@@ -395,16 +457,18 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   other signature uses RisalaSign (4.3) or MLS's own labels, so that no
   signature made for one purpose is valid for another.
 
-- **Server secrets.** Guest tokens (4.2), send tokens (7.2), `put`,
-  `get` and `del` URLs (5.6, 12.12) and pairing ids (4.8) work for
-  whoever holds them. Servers SHOULD store only a hash of each, and look
-  it up by that hash, or by a part that is not secret where it has one,
-  comparing any secret part in constant time. These secrets carry at
-  least 128 bits of randomness, so a lookup by hash does not leak them
-  through its timing. Franking tags are compared in constant time too
-  (5.8, 12.9). Push URLs and their keys (Section 9) are kept in the
-  clear, since the server must send to them and encrypt to them. PUSH
-  DEL looks a subscription up by a hash of its URL.
+- **Server secrets.** Guest tokens (4.2), send tokens (7.2), put secrets
+  (12.5), `put`, `get` and `del` URLs (5.6, 12.12) and pairing ids (4.8)
+  work for whoever holds them. Servers SHOULD store only a hash of each,
+  and look it up by that hash, or by a part that is not secret where it
+  has one, such as the mailbox and epoch of a send token or the
+  KeyPackageRef of a put secret, comparing any secret part in constant
+  time. These secrets carry at least 128 bits of randomness, so a lookup
+  by hash does not leak them through its timing. Franking tags are
+  compared in constant time too (5.8, 12.9). Push URLs and their keys
+  (Section 9) are kept in the clear, since the server must send to them
+  and encrypt to them. PUSH DEL looks a subscription up by a hash of its
+  URL.
 
 - **Requests from the server.** Fetching key files and sending pushes
   both mean connecting to hosts that users choose. The rules in Sections
