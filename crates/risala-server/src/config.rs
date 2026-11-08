@@ -25,6 +25,7 @@
 //!
 //! [limits]
 //! registrations_per_hour = 5
+//! reports_per_hour = 30
 //! presence_offline_secs = 30
 //!
 //! [keys]
@@ -228,6 +229,11 @@ pub struct Limits {
     /// of identities. Further creations get `ERR rate-limited`. Operators
     /// are not limited. 0 means no limit.
     pub rooms_per_day: u32,
+    /// The most reports one uid may make in an hour (5.8: servers SHOULD
+    /// rate-limit reports). Further REPORTs get `ERR rate-limited`. A
+    /// report repeated, which gets the existing id, does not count. 0 means
+    /// no limit.
+    pub reports_per_hour: u32,
     /// Seconds after an identity's last connection closes before the
     /// people who share a conversation with it are told it is offline
     /// (8.3: about 30). A connection that opens meanwhile cancels it, and
@@ -353,6 +359,7 @@ impl Default for Limits {
             max_list: 500,
             registrations_per_hour: 5,
             rooms_per_day: 10,
+            reports_per_hour: 30,
             presence_offline_secs: 30,
             presence_batch_ms: 1000,
             typing_interval_ms: 1000,
@@ -567,6 +574,7 @@ mod tests {
         assert!(!c.server.registration);
         assert_eq!(c.room_creation, RoomCreation::Identities);
         assert_eq!(c.limits.registrations_per_hour, 5);
+        assert_eq!(c.limits.reports_per_hour, 30);
         assert_eq!(c.limits.presence_offline_secs, 30);
         assert_eq!(c.limits.presence_batch_ms, 1000);
         assert_eq!(c.limits.typing_interval_ms, 1000);

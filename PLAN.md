@@ -712,6 +712,22 @@ Open:
     - RESOLVED goes to every reviewer connection except the sender's,
       including the resolver's other devices.
 
+33. **Found while building M4's messages and reports** (5.3, 5.4, 5.8,
+    10.4), confirmed with the user on 2026-11-08:
+    - A guest is the author only of what it sent in its current session,
+      so someone reusing a guest name cannot edit or delete an earlier
+      guest's messages.
+    - ADMIN DROP also reaches owners and moderators who are not members.
+    - Smaller ones: editing someone else's message is `forbidden`.
+      `deleted=` counts DELETE events recorded. Repeated reactions are
+      compared as escaped bytes. RESOLVE by a non-reviewer is
+      `not-found`. A repeated REPORT gets its id before the message is
+      checked. A guest reusing a name may get the earlier guest's report
+      id back; this is accepted.
+
+    Implementation choice: the report rate limit is
+    `limits.reports_per_hour` in the configuration, 30 by default.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

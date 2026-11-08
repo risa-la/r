@@ -1011,7 +1011,7 @@ the event. A `reply` may also carry a `file` (5.6).
 
 - `reply=<seq>` replies to message `<seq>`.
 - `edit=<seq>` replaces the text of message `<seq>`. Only the author of
-  `<seq>` may edit it. An edit is a message in its own right, with its
+  `<seq>` may edit it (`ERR forbidden`). An edit is a message in its own right, with its
   own seq. Clients show the text of the newest edit in the original's
   place. They MAY also show every earlier version. All versions stay in
   history, and anyone who can read the conversation can see them.
@@ -1019,7 +1019,13 @@ the event. A `reply` may also carry a `file` (5.6).
   usually a single emoji, and MUST be at most 64 bytes. To take a
   reaction back, delete it (5.4). If a user sends the same reaction to
   the same message twice, the server SHOULD reply OK with the existing
-  reaction's seq and not create a new event.
+  reaction's seq and not create a new event. Reactions are the same if
+  their escaped text (3.4) is the same, byte for byte.
+
+A guest is the author only of the messages it sent in its current guest
+session (4.2), since guest names get reused. Someone who takes a name
+later may not edit or delete what an earlier guest sent under it, except
+as a moderator.
 
 The target `<seq>` MUST be a message in the same conversation. It MUST
 NOT be deleted, and MUST NOT itself be an edit or a reaction. Otherwise
@@ -1258,7 +1264,9 @@ its content to the reviewers (below). Rules for both:
   `ERR invalid`.
 - `<reason...>` is free text of up to 512 bytes.
 - If the same uid reports the same message again, the server replies
-  with the existing report's id.
+  with the existing report's id. It checks this before the rules above
+  about the message, so the reply is the same even if the message has
+  been deleted since, and a client can resend a report safely.
 - Servers SHOULD rate-limit reports.
 
 When a report is made, the server keeps a copy of the reported event
@@ -1340,7 +1348,8 @@ RESOLVE <id>
   report's reviewers may resolve it. The server sends `RESOLVED <id>` to
   every reviewer's connections except the one that sent RESOLVE,
   including the resolver's other devices, so that their lists stay
-  current.
+  current. RESOLVE by someone who is not one of the report's reviewers
+  gets `ERR not-found`, as for an id that does not exist.
 
 Resolving a report does nothing else. Reviewers act on a report with
 the ordinary commands, such as DELETE, KICK, BAN or ADMIN BAN, and then
@@ -2255,7 +2264,9 @@ ADMIN REPORTS
     roles, invitations and bans are deleted too, and so are its group,
     GroupInfo and pending Welcomes if it is encrypted (Section 12).
   - The server sends `@id=<id> DROP <room> [<reason...>]` to every
-    connection in the room, where `<id>` is the dropped room's id (5.1).
+    connection in the room, and to the connections of its owners and
+    moderators who are not members, where `<id>` is the dropped room's
+    id (5.1).
     No event is recorded, since the room's events are gone. A client
     ignores a DROP whose id is not the one it has stored for the room,
     since it may be about an older room of the same name.
@@ -2276,7 +2287,9 @@ ADMIN REPORTS
   - With `hours=<n>`, only messages from the last `<n>` hours are
     deleted. For a guest uid, the purge covers messages sent under that
     name, which is why `hours` is useful there.
-  - The server replies `OK deleted=<count>`.
+  - The server replies `OK deleted=<count>`, the number of DELETE
+    events it recorded. Edits and reactions deleted along with their
+    message are not counted.
 - **`ADMIN REPORTS`** lists every open report (5.8).
 
 ### 10.5. Hosted Identities

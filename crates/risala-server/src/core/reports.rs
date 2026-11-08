@@ -41,12 +41,7 @@ use super::state::{ConvEntry, ConvState, RoomInfo};
 use crate::handler::OutLine;
 use crate::store::{EventKind, NewReport, ReportAdded, ReportRecord, StoreError};
 
-/// The most reports one uid may make in [`REPORT_WINDOW`] (5.8: servers
-/// SHOULD rate-limit reports). Further REPORTs get `ERR rate-limited`. A
-/// report repeated, which gets the existing id, does not count.
-pub(super) const REPORTS_PER_WINDOW: u32 = 30;
-
-/// The window of [`REPORTS_PER_WINDOW`].
+/// The window of `limits.reports_per_hour` (5.8).
 pub(super) const REPORT_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// What the hub keeps in memory for reports.
@@ -231,7 +226,7 @@ impl Inner {
         let slot = self
             .report_book
             .made
-            .take(uid.clone(), REPORTS_PER_WINDOW, self.now())
+            .take(uid.clone(), self.config.limits.reports_per_hour, self.now())
             .map_err(|retry| {
                 Fail::Err(
                     ErrResponse::new(ErrorCode::RateLimited)
@@ -492,6 +487,16 @@ impl Inner {
             reason,
         }));
         st.broadcast(&line);
+        // Owners and moderators who have left hear of it too, so that their
+        // clients forget the room (PLAN.md 5, item 33).
+        if let Some(info) = st.room_info() {
+            let reg = self.reg();
+            for holder in info.roles.keys().filter(|u| !st.is_member(u)) {
+                if let Some(user) = reg.users.get(holder) {
+                    user.send(&line);
+                }
+            }
+        }
         let members: Vec<Uid> = st.members.keys().cloned().collect();
         for uid in &members {
             st.remove_member(uid);

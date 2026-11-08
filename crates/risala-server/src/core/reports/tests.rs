@@ -267,7 +267,7 @@ async fn reports_are_rate_limited() {
         .unwrap()
         .unwrap()
         .key;
-    for n in 0..super::REPORTS_PER_WINDOW {
+    for n in 0..30 {
         h.store
             .append(
                 key,
@@ -282,7 +282,7 @@ async fn reports_are_rate_limited() {
     }
     let mut sam = h.guest("sam").await;
     // Events 5 to 7, and the 30 just added: 33 messages.
-    for n in 5..5 + u64::from(super::REPORTS_PER_WINDOW) {
+    for n in 5..5 + 30u64 {
         report(&h, &mut sam, &format!("report #general {n}")).await;
     }
     // Repeating one is not a new report.
@@ -524,8 +524,9 @@ async fn dropping_a_room_removes_everyone_and_keeps_reports() {
     assert_eq!(alice.lines(), dropped);
     assert_eq!(bob.lines(), dropped);
     assert_eq!(sam.lines(), dropped);
-    // Dave holds a role, but is not a member.
-    assert_eq!(dave.lines(), none());
+    // Dave holds a role, but is not a member: he hears of it too (PLAN.md
+    // 5, item 33).
+    assert_eq!(dave.lines(), dropped);
 
     // The room is gone from everyone's SYNC.
     h.send(&sam, "sync").await;
