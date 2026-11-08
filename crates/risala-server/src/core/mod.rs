@@ -39,6 +39,11 @@
 //! opens and its last one closes, and changes go out in batches, with a
 //! delay before `offline`.
 //!
+//! # Encrypted conversations
+//!
+//! What the server keeps of them without reading it, KeyPackages (12.4),
+//! pending Welcomes (12.7) and key backups (12.10), is in `e2ee`.
+//!
 //! # Conversations and ordering
 //!
 //! Every conversation, a room now and a direct conversation from M5a, has
@@ -64,6 +69,7 @@
 
 mod admin;
 mod commands;
+mod e2ee;
 mod identity;
 pub mod keys;
 mod messages;
@@ -92,6 +98,7 @@ use crate::store::{self, ServerSettings, SqliteStore, Store, StoreError};
 
 use risala_proto::names::{Domain, Id, Uid};
 
+pub use e2ee::{KEY_PACKAGE_PRUNE_PERIOD, MAX_BACKUP_KEYS_PER_EPOCH, MAX_KEY_PACKAGE_LIFETIME};
 pub use keys::{
     FetchError, FetchedKeys, KeyFetcher, KeyFilePublisher, KeyServices, MemoryFetcher,
     MemoryPublisher, NoFetcher, NoPublisher,
@@ -283,6 +290,9 @@ pub(crate) struct Inner {
     /// Reports (5.8): the lock their lines are sent under, and the rate
     /// limit.
     report_book: reports::ReportBook,
+    /// The KEYPKG GETs each identity sent in the last hour (12.4), for
+    /// `limits.key_package_gets_per_hour`.
+    key_package_gets: rate::WindowLimit<Uid>,
 }
 
 impl Hub {
@@ -486,6 +496,7 @@ impl Hub {
                     typing_interval: timers.typing_interval,
                     markers_moved: AtomicU64::new(0),
                     report_book: reports::ReportBook::new(),
+                    key_package_gets: rate::WindowLimit::new(e2ee::KEYPKG_GET_WINDOW),
                 }
             }),
         })
@@ -1037,3 +1048,6 @@ mod admin_tests;
 
 #[cfg(test)]
 mod messages_tests;
+
+#[cfg(test)]
+mod e2ee_tests;

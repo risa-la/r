@@ -28,8 +28,8 @@ use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
 use crate::core::{
-    BYE_SHUTDOWN, CID_PRUNE_PERIOD, Clock, EXPIRE_PERIOD, Hub, HubError, KeyServices, SystemClock,
-    Timers,
+    BYE_SHUTDOWN, CID_PRUNE_PERIOD, Clock, EXPIRE_PERIOD, Hub, HubError, KEY_PACKAGE_PRUNE_PERIOD,
+    KeyServices, SystemClock, Timers,
 };
 use crate::http::{self, HttpServer, KeyDir};
 use crate::net;
@@ -203,13 +203,20 @@ impl Daemon {
     ///
     /// Meanwhile, cids older than 24 hours are forgotten every
     /// [`CID_PRUNE_PERIOD`] (7.6), old events expire every
-    /// [`EXPIRE_PERIOD`] (7.5), and the HTTPS listener, if there is one,
-    /// serves key files. It stops when this returns.
+    /// [`EXPIRE_PERIOD`] (7.5), KeyPackages whose lifetimes have ended are
+    /// deleted every [`KEY_PACKAGE_PRUNE_PERIOD`] (12.4), and the HTTPS
+    /// listener, if there is one, serves key files. It stops when this
+    /// returns.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RunError> {
         let _pruner = AbortOnDrop(tokio::spawn(
             self.hub.clone().prune_cids_every(CID_PRUNE_PERIOD),
         ));
         let _expirer = AbortOnDrop(tokio::spawn(self.hub.clone().expire_every(EXPIRE_PERIOD)));
+        let _key_packages = AbortOnDrop(tokio::spawn(
+            self.hub
+                .clone()
+                .prune_key_packages_every(KEY_PACKAGE_PRUNE_PERIOD),
+        ));
         let _http = self.http.map(|http| {
             AbortOnDrop(tokio::spawn(async move {
                 if let Err(e) = http.run(std::future::pending()).await {

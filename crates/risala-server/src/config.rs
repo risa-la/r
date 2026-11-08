@@ -253,6 +253,14 @@ pub struct Limits {
     /// The most blocks one account may have (5.7). BLOCK beyond it gets
     /// `ERR forbidden`.
     pub max_blocks: usize,
+    /// The most ordinary KeyPackages the server keeps for one device
+    /// (12.4: devices keep about ten). KEYPKG ADD beyond it gets
+    /// `ERR forbidden`. A device's last-resort KeyPackage does not count.
+    pub max_key_packages: usize,
+    /// The most KEYPKG GET one identity may send in an hour (12.4: servers
+    /// SHOULD rate-limit it, since each one uses KeyPackages up). Further
+    /// ones get `ERR rate-limited`. 0 means no limit.
+    pub key_package_gets_per_hour: u32,
 }
 
 /// The most lines a command's response has besides a full page of events
@@ -375,6 +383,8 @@ impl Default for Limits {
             presence_batch_ms: 1000,
             typing_interval_ms: 1000,
             max_blocks: 1000,
+            max_key_packages: 100,
+            key_package_gets_per_hour: 600,
         }
     }
 }
@@ -448,6 +458,7 @@ impl Config {
             ("max_list", l.max_list),
             ("presence_batch_ms", l.presence_batch_ms),
             ("max_blocks", l.max_blocks as u64),
+            ("max_key_packages", l.max_key_packages as u64),
         ] {
             if value == 0 {
                 return invalid(format!("limits.{name} must be at least 1"));
@@ -592,6 +603,8 @@ mod tests {
         assert_eq!(c.limits.presence_batch_ms, 1000);
         assert_eq!(c.limits.typing_interval_ms, 1000);
         assert_eq!(c.limits.max_blocks, 1000);
+        assert_eq!(c.limits.max_key_packages, 100);
+        assert_eq!(c.limits.key_package_gets_per_hour, 600);
     }
 
     #[test]
@@ -672,6 +685,7 @@ mod tests {
         invalid(|l| l.max_list = 0, "max_list");
         invalid(|l| l.presence_batch_ms = 0, "presence_batch_ms");
         invalid(|l| l.max_blocks = 0, "max_blocks");
+        invalid(|l| l.max_key_packages = 0, "max_key_packages");
         assert!(with(|l| l.presence_offline_secs = 0).is_ok());
         assert!(with(|l| l.typing_interval_ms = 0).is_ok());
         invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");

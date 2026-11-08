@@ -55,7 +55,7 @@ fn auth_failed(message: &str) -> Fail {
 /// `ERR unavailable` (4.5): the key file could not be had, so the
 /// signature could not be checked. Try again later, unless the server
 /// fetches no key files at all.
-fn unavailable(e: &FetchError) -> Fail {
+pub(super) fn unavailable(e: &FetchError) -> Fail {
     let err = ErrResponse::new(ErrorCode::Unavailable)
         .with_message("could not get the identity's key file; try again later");
     Fail::Err(match e {
@@ -351,7 +351,7 @@ impl Inner {
     /// Closes the connections of `uid` whose device key is not in `keys`
     /// (4.4): a key file fetched for AUTH no longer lists them, or the
     /// file is gone.
-    fn close_removed_keys(&self, uid: &Uid, keys: &[PublicKey]) {
+    pub(super) fn close_removed_keys(&self, uid: &Uid, keys: &[PublicKey]) {
         self.close_keys(uid, |key| !keys.contains(key));
     }
 
