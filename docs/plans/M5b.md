@@ -229,7 +229,7 @@ four writing code at once.
   wins, Welcomes, membership and roles in the group, PART, deletes,
   gaps, profiles, topics, typing and read markers, blocks, guests in
   public rooms. Needs C0, M1, M2.
-- [~] **C3. Confirming leaves** in the engine (12.10). Needs C2, M3.
+- [x] **C3. Confirming leaves** in the engine (12.10). Needs C2, M3.
 - [~] **C4. Transfer, backups, files, push and reports** (4.8,
   12.11-12.13, 9, 5.8). Needs C2, M4.
 - [ ] **C5. `risala-cli` and `risala-dev`** follow the new API, and the
