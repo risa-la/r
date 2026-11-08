@@ -89,17 +89,17 @@ pub(super) fn room_of(st: &ConvState) -> Result<&RoomInfo, Fail> {
 /// Who is asking about a room, as its access rules see it (6.1, 6.3).
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Asker<'a> {
-    uid: &'a Uid,
+    pub(super) uid: &'a Uid,
     /// A member of the room right now.
-    member: bool,
+    pub(super) member: bool,
     /// A server operator (10.1).
-    operator: bool,
+    pub(super) operator: bool,
 }
 
 /// Whether the asker can know that the room exists (6.1): it is public, or
 /// the asker is a member, holds a role or an invitation in it, or is an
 /// operator. Guests cannot be invited, hold roles or be operators (4.2).
-fn visible(info: &RoomInfo, a: Asker<'_>) -> bool {
+pub(super) fn visible(info: &RoomInfo, a: Asker<'_>) -> bool {
     a.member
         || info.settings.public
         || a.operator
@@ -482,7 +482,7 @@ impl Inner {
 
     /// Appends an event to a room whose lock the caller holds, and records
     /// its seq as the head. Nothing is sent.
-    async fn append(
+    pub(super) async fn append(
         &self,
         st: &mut ConvState,
         event: NewEvent,
