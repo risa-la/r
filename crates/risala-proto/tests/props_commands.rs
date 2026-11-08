@@ -161,11 +161,12 @@ fn command() -> impl Strategy<Value = String> {
             or_blob(),
             any::<bool>(),
             opt("groupinfo", or_blob()),
+            opt("next", fixed(48)),
         )
-            .prop_map(|(cid, b, t, m, live, g)| {
+            .prop_map(|(cid, b, t, m, live, g, n)| {
                 let cid = cid.map_or(String::new(), |c| format!("@cid={c} "));
                 let live = if live { " live=yes" } else { "" };
-                format!("{cid}POST {b} {t} {m}{live}{g}")
+                format!("{cid}POST {b} {t} {m}{live}{g}{n}")
             }),
         (boxname(), fixed(32), number()).prop_map(|(b, t, n)| format!("UPLOAD {b} {t} {n}")),
         (boxname(), data()).prop_map(|(b, r)| format!("REPORT {b} {r}")),
@@ -306,13 +307,16 @@ fn server_line() -> impl Strategy<Value = String> {
                 format!("{r}ERR {c}{m}")
             }),
         (
-            proptest::option::of((positive(), timestamp())),
+            proptest::option::of(positive()),
+            timestamp(),
             boxname(),
-            or_blob()
+            or_blob(),
+            opt("next", fixed(48)),
         )
-            .prop_map(|(st, b, m)| {
-                let tags = st.map_or(String::new(), |(s, t)| format!("@seq={s};t={t} "));
-                format!("{tags}POST {b} {m}")
+            .prop_map(|(s, t, b, m, n)| {
+                // Every post has t; a live one has no seq (5.2).
+                let seq = s.map_or(String::new(), |s| format!("seq={s};"));
+                format!("@{seq}t={t} POST {b} {m}{n}")
             }),
         (room(), boxname(), number(), opt_text())
             .prop_map(|(r, b, n, t)| format!("ROOM {r} {b} {n}{t}")),
@@ -427,7 +431,7 @@ fn word() -> impl Strategy<Value = String> {
             "ADD", "DEL", "KEYPKG", "COUNT", "WELCOME", "BLOB", "BACKUP", "ADMIN", "SET", "BAN",
             "DROP", "RESOLVE", "PING", "PONG", "QUIT", "OK", "ERR", "RISALA", "ROOM", "GONE",
             "USER", "MEMBER", "RESOLVED", "RECORD", "NOTICE", "OP", "SERVERBAN", "CONNECTION",
-            "BYE", "-", "0", "1", "after=0", "limit=1", "live=yes", "light=yes", "box=", "epoch=1", "files=",
+            "BYE", "-", "0", "1", "after=0", "limit=1", "live=yes", "light=yes", "next=", "box=", "epoch=1", "files=",
             "token=", "#general", "~sam", "alice@example.org", "@ref=1", "@seq=1;t=x",
             "AAAA", "AA==", "anon",
         ])

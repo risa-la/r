@@ -35,6 +35,10 @@ pub const CONFIRM_MAC_LEN: usize = 48;
 /// device-signing key's in SIGNINGKEY (4.8, 12.10).
 pub const SEED_LEN: usize = 32;
 
+/// The length of READ's `<check>`: the first 8 bytes of an
+/// `epoch_authenticator` (12.9).
+pub const EPOCH_CHECK_LEN: usize = 8;
+
 /// The length of a backup key (12.13).
 pub const BACKUP_KEY_LEN: usize = 32;
 
@@ -71,6 +75,25 @@ fixed_type!(
     MESSAGE_ID_LEN,
     "a message id is 16 bytes of base64"
 );
+
+fixed_type!(
+    /// The `<check>` of READ (12.9, 7.7): the first 8 bytes of the
+    /// `epoch_authenticator` (RFC 9420) of the epoch the device had
+    /// applied at the READ's seq. An identity's devices compare it with
+    /// their own, to notice a server splitting the group (12.7).
+    EpochCheck,
+    EPOCH_CHECK_LEN,
+    "an epoch check is 8 bytes of base64"
+);
+
+impl EpochCheck {
+    /// The check of an epoch: the first 8 bytes of its
+    /// `epoch_authenticator`. `None` if it is shorter than 8 bytes.
+    pub fn of_authenticator(authenticator: &[u8]) -> Option<EpochCheck> {
+        let bytes = authenticator.get(..EPOCH_CHECK_LEN)?;
+        Some(EpochCheck::from_bytes(bytes.try_into().ok()?))
+    }
+}
 
 fixed_type!(
     /// The `<mac>` of ANSWER (12.10): HMAC-SHA-384 over a ConfirmContent.

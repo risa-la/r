@@ -16,8 +16,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use common::{SPEC, code_blocks, spec_files};
 use risala_proto::content::{
-    BACKUP_KEY_LEN, CHALLENGE_LEN, CONFIRM_MAC_LEN, Content, ContentLine, MESSAGE_ID_LEN, SEED_LEN,
-    TRANSFER_REF_LEN, VERBS,
+    BACKUP_KEY_LEN, CHALLENGE_LEN, CONFIRM_MAC_LEN, Content, ContentLine, EPOCH_CHECK_LEN,
+    MESSAGE_ID_LEN, SEED_LEN, TRANSFER_REF_LEN, VERBS,
 };
 
 /// Lines in code blocks that have a content verb but are not content
@@ -88,6 +88,7 @@ fn instantiate(syntax: &str) -> String {
         ("<reason...>", "spam".into()),
         ("<box>", "ujzdegxdncf32epf3dhodzdoci".into()),
         ("<seq>", "9120".into()),
+        ("<check>", b64(EPOCH_CHECK_LEN)),
         ("<ids>", format!("{id},{id}")),
         ("<id>", id),
         ("<leaf>", "3".into()),

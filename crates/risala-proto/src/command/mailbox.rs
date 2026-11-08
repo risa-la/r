@@ -100,13 +100,14 @@ pub(super) fn parse(verb: &str, tags: &Tags, p: Params<'_>) -> Option<Result<Com
             let mailbox = tok(&mut p)?;
             let token = tok(&mut p)?;
             let message = tok(&mut p)?;
-            let options = options(p, &["live", "groupinfo"])?;
+            let options = options(p, &["live", "groupinfo", "next"])?;
             Ok(Command::Post {
                 mailbox,
                 token,
                 message,
                 live: flag_opt(&options, "live")?,
                 groupinfo: opt(&options, "groupinfo")?,
+                next: opt(&options, "next")?,
                 cid,
             })
         },
@@ -228,6 +229,7 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
             message,
             live,
             groupinfo,
+            next,
             cid,
         } => {
             if let Some(cid) = cid {
@@ -239,6 +241,9 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
             }
             if let Some(groupinfo) = groupinfo {
                 b.option("groupinfo", groupinfo);
+            }
+            if let Some(next) = next {
+                b.option("next", next);
             }
         }
         Command::Upload {

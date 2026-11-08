@@ -174,7 +174,10 @@ fn content_line() -> impl Strategy<Value = String> {
         1 => (any::<u32>(), fixed(1312), fixed(2420), fixed(2420), fixed(16))
             .prop_map(|(p, k, c, a, s)| format!("ATTEST {p} {k} {c} {a} {s}")),
         1 => (any::<u32>(), fixed(32)).prop_map(|(p, s)| format!("REVEAL {p} {s}")),
-        1 => (boxname(), 1..=i64::MAX as u64).prop_map(|(b, s)| format!("READ {b} {s}")),
+        1 => (boxname(), 1..=i64::MAX as u64, fixed(8))
+            .prop_map(|(b, s, c)| format!("READ {b} {s} {c}")),
+        1 => (1..=i64::MAX as u64).prop_map(|s| format!("RESYNC {s}")),
+        1 => (boxname(), 1..=i64::MAX as u64).prop_map(|(b, s)| format!("RESYNC {b} {s}")),
         1 => block_target().prop_map(|t| format!("BLOCK {t}")),
         1 => block_target().prop_map(|t| format!("UNBLOCK {t}")),
         1 => blob_ref().prop_map(|h| format!("RECORD {h}")),

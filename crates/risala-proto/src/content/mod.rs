@@ -4,8 +4,8 @@
 //! A [`Content`] is one or more lines in the format of Section 3, each
 //! ending in LF, that only the conversation's members can read: TEXT
 //! (5.3), DELETE (5.4), TYPING (8.1), REPORT (5.8), CHALLENGE and ANSWER,
-//! ATTEST and REVEAL (12.10), and the lines of the conversation with
-//! yourself: READ (7.7), BLOCK and UNBLOCK (5.7), RECORD, ALERT and
+//! ATTEST and REVEAL (12.10), RESYNC (12.7), and the lines of the
+//! conversation with yourself: READ (7.7), RESYNC with a box (12.7), BLOCK and UNBLOCK (5.7), RECORD, ALERT and
 //! RECORDS (4.5), SIGNINGKEY and BACKUPKEY (4.8, 12.13), WANT, TRANSFER
 //! and SERVERS (12.13), and PIN (4.5, 12.14).
 //!
@@ -90,9 +90,9 @@ mod values;
 
 pub use values::{
     BACKUP_KEY_LEN, BackupKey, CHALLENGE_LEN, CONFIRM_MAC_LEN, ChallengeCiphertext, ConfirmMac,
-    FILE_HASH_LEN, FILE_KEY_LEN, FileHash, FileKey, FileRef, FileUrl, LogOrigin, MAX_FILE_URL_LEN,
-    MAX_MEDIA_NAME_LEN, MAX_ORIGIN_LEN, MESSAGE_ID_LEN, MediaType, MessageId, ORIGIN_PATH,
-    PeriodSeed, SEED_LEN, SigningSeed, TRANSFER_REF_LEN, TransferRef,
+    EPOCH_CHECK_LEN, EpochCheck, FILE_HASH_LEN, FILE_KEY_LEN, FileHash, FileKey, FileRef, FileUrl,
+    LogOrigin, MAX_FILE_URL_LEN, MAX_MEDIA_NAME_LEN, MAX_ORIGIN_LEN, MESSAGE_ID_LEN, MediaType,
+    MessageId, ORIGIN_PATH, PeriodSeed, SEED_LEN, SigningSeed, TRANSFER_REF_LEN, TransferRef,
 };
 
 /// The most bytes a message's content may have (12.9).
@@ -303,13 +303,26 @@ pub enum ContentLine {
         /// The period key's seed.
         seed: PeriodSeed,
     },
-    /// `READ <box> <seq>`: the sending device has shown mailbox `<box>` up
-    /// to `<seq>` (7.7).
+    /// `RESYNC <seq>` in a direct conversation or a private room, or
+    /// `RESYNC <box> <seq>` in the conversation with yourself: the sending
+    /// device could not process the commit at `<seq>`, and asks for its
+    /// leaf to be replaced (12.7, 12.9).
+    Resync {
+        /// The mailbox of the group, in the conversation with yourself
+        /// only; `None` in the group itself.
+        mailbox: Option<BoxName>,
+        /// The seq of the commit the device could not process.
+        seq: Seq,
+    },
+    /// `READ <box> <seq> <check>`: the sending device has shown mailbox
+    /// `<box>` up to `<seq>` (7.7).
     Read {
         /// The conversation's mailbox.
         mailbox: BoxName,
         /// The last post shown.
         seq: Seq,
+        /// A check of the epoch the device had applied at `<seq>` (12.9).
+        check: EpochCheck,
     },
     /// `BLOCK <target>`: the user blocked an identity or a domain (5.7).
     Block(BlockTarget),
@@ -498,6 +511,7 @@ pub const VERBS: &[&str] = &[
     "ANSWER",
     "ATTEST",
     "REVEAL",
+    "RESYNC",
     "READ",
     "BLOCK",
     "UNBLOCK",
@@ -571,12 +585,31 @@ impl ContentLine {
                     seed: last(p)?,
                 }
             }
+            "RESYNC" => {
+                let mut p = p;
+                let first = p.token()?;
+                match p.opt_token()? {
+                    None => ContentLine::Resync {
+                        mailbox: None,
+                        seq: first.parse()?,
+                    },
+                    Some(seq) => {
+                        p.end()?;
+                        ContentLine::Resync {
+                            mailbox: Some(first.parse()?),
+                            seq: seq.parse()?,
+                        }
+                    }
+                }
+            }
             "READ" => {
                 let mut p = p;
                 let mailbox = tok(&mut p)?;
+                let seq = tok(&mut p)?;
                 ContentLine::Read {
                     mailbox,
-                    seq: last(p)?,
+                    seq,
+                    check: last(p)?,
                 }
             }
             "BLOCK" => ContentLine::Block(last(p)?),
@@ -644,6 +677,7 @@ impl ContentLine {
             ContentLine::Answer { .. } => "ANSWER",
             ContentLine::Attest { .. } => "ATTEST",
             ContentLine::Reveal { .. } => "REVEAL",
+            ContentLine::Resync { .. } => "RESYNC",
             ContentLine::Read { .. } => "READ",
             ContentLine::Block(_) => "BLOCK",
             ContentLine::Unblock(_) => "UNBLOCK",
@@ -718,8 +752,18 @@ impl ContentLine {
             ContentLine::Reveal { period, seed } => {
                 b.token(period).token(seed);
             }
-            ContentLine::Read { mailbox, seq } => {
-                b.token(mailbox).token(seq);
+            ContentLine::Resync { mailbox, seq } => {
+                if let Some(mailbox) = mailbox {
+                    b.token(mailbox);
+                }
+                b.token(seq);
+            }
+            ContentLine::Read {
+                mailbox,
+                seq,
+                check,
+            } => {
+                b.token(mailbox).token(seq).token(check);
             }
             ContentLine::Block(target) | ContentLine::Unblock(target) => {
                 b.token(target);
@@ -788,6 +832,9 @@ impl ContentLine {
     ///   identity.
     /// - CHALLENGE and ANSWER count only where `confirm` is `pairwise`,
     ///   and ATTEST and REVEAL only where it is `epochal`.
+    /// - `RESYNC <seq>` counts only in direct conversations and private
+    ///   rooms, and `RESYNC <box> <seq>` only in the conversation with
+    ///   yourself (12.7). Public rooms resync by external commit instead.
     /// - READ, BLOCK, UNBLOCK, RECORD, ALERT, RECORDS, SIGNINGKEY,
     ///   BACKUPKEY, WANT, TRANSFER, SERVERS and PIN count only in the
     ///   conversation with yourself.
@@ -827,7 +874,13 @@ impl ContentLine {
             ContentLine::Attest { .. } | ContentLine::Reveal { .. } => {
                 place.conversation.confirm() == ConfirmMode::Epochal
             }
-            ContentLine::Read { .. }
+            ContentLine::Resync { mailbox: None, .. } => {
+                matches!(place.conversation, Direct | PrivateRoom(_))
+            }
+            ContentLine::Resync {
+                mailbox: Some(_), ..
+            }
+            | ContentLine::Read { .. }
             | ContentLine::Block(_)
             | ContentLine::Unblock(_)
             | ContentLine::Record(_)

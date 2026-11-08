@@ -70,7 +70,9 @@ fn every_verb_round_trips() {
             b64(16, 15)
         ),
         format!("REVEAL 20401 {}", b64(SEED_LEN, 15)),
-        format!("READ {BOX} 9120"),
+        format!("READ {BOX} 9120 {}", b64(EPOCH_CHECK_LEN, 19)),
+        "RESYNC 9121".to_owned(),
+        format!("RESYNC {BOX} 9121"),
         "BLOCK spam@example.net".to_owned(),
         "UNBLOCK *@example.net".to_owned(),
         format!("RECORD {}", hash('a')),
@@ -398,6 +400,10 @@ fn arity() {
         format!("CHALLENGE {}", b64(CHALLENGE_LEN, 1)),
         format!("ANSWER 1 {} x", b64(48, 1)),
         format!("READ {BOX}"),
+        format!("READ {BOX} 1"),
+        format!("READ {BOX} 1 {} x", b64(EPOCH_CHECK_LEN, 1)),
+        "RESYNC".to_owned(),
+        format!("RESYNC {BOX} 1 2"),
         "BLOCK".to_owned(),
         "RECORD".to_owned(),
         format!("BACKUPKEY {}", b64(32, 1)),
@@ -442,7 +448,14 @@ fn value_rules() {
             b64(2420, 1)
         ),
         format!("REVEAL -1 {}", b64(32, 1)),
-        format!("READ {BOX} 0"),
+        format!("READ {BOX} 0 {}", b64(EPOCH_CHECK_LEN, 1)),
+        // The check is 8 bytes (12.9).
+        format!("READ {BOX} 1 {}", b64(EPOCH_CHECK_LEN + 1, 1)),
+        format!("READ {BOX} 1 {}", b64(EPOCH_CHECK_LEN - 1, 1)),
+        "RESYNC 0".to_owned(),
+        "RESYNC x".to_owned(),
+        format!("RESYNC {BOX} 0"),
+        "RESYNC general 1".to_owned(),
         "BLOCK ~sam".to_owned(),
         format!("SIGNINGKEY {}", b64(33, 1)),
         format!("TRANSFER {}", b64(80, 1)),
@@ -669,7 +682,7 @@ fn hand_built_lines_are_checked() {
 
 fn sample_lines() -> Vec<ContentLine> {
     let content: Content = format!(
-        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nREAD {BOX} 1\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
+        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nRESYNC 1\nRESYNC {BOX} 1\nREAD {BOX} 1 {check}\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
         id = id(1),
         ct = b64(CHALLENGE_LEN, 1),
         mac = b64(48, 1),
@@ -679,6 +692,7 @@ fn sample_lines() -> Vec<ContentLine> {
         h = hash('a'),
         tr = b64(TRANSFER_REF_LEN, 1),
         ps = b64(16, 1),
+        check = b64(EPOCH_CHECK_LEN, 1),
     )
     .parse()
     .unwrap();
@@ -698,6 +712,7 @@ fn allowed(place: Place) -> Vec<&'static str> {
 fn where_lines_count() {
     use Conversation::*;
     let ourselves = [
+        "RESYNC",
         "READ",
         "BLOCK",
         "UNBLOCK",
@@ -716,18 +731,21 @@ fn where_lines_count() {
     assert_eq!(allowed(Place::new(WithYourself)), with_yourself);
     assert_eq!(
         allowed(Place::new(Direct)),
-        ["TEXT", "DELETE", "REPORT", "CHALLENGE", "ANSWER"]
+        ["TEXT", "DELETE", "REPORT", "CHALLENGE", "ANSWER", "RESYNC"]
     );
     assert_eq!(
         allowed(Place::new(PrivateRoom(ConfirmMode::Pairwise))),
-        ["TEXT", "DELETE", "CHALLENGE", "ANSWER"]
+        ["TEXT", "DELETE", "CHALLENGE", "ANSWER", "RESYNC"]
     );
-    for epochal in [PrivateRoom(ConfirmMode::Epochal), PublicRoom] {
-        assert_eq!(
-            allowed(Place::new(epochal)),
-            ["TEXT", "DELETE", "ATTEST", "REVEAL"]
-        );
-    }
+    assert_eq!(
+        allowed(Place::new(PrivateRoom(ConfirmMode::Epochal))),
+        ["TEXT", "DELETE", "ATTEST", "REVEAL", "RESYNC"]
+    );
+    // Public rooms resync by external commit, not RESYNC (12.7).
+    assert_eq!(
+        allowed(Place::new(PublicRoom)),
+        ["TEXT", "DELETE", "ATTEST", "REVEAL"]
+    );
 }
 
 #[test]
@@ -773,7 +791,7 @@ fn guests() {
 
 #[test]
 fn content_allowed() {
-    let content: Content = "TEXT hi\nREAD ujzdegxdncf32epf3dhodzdoci 4\nFROB\n"
+    let content: Content = "TEXT hi\nREAD ujzdegxdncf32epf3dhodzdoci 4 AAAAAAAAAAA=\nFROB\n"
         .parse()
         .unwrap();
     let direct: Vec<_> = content.allowed(Place::new(Conversation::Direct)).collect();
@@ -785,4 +803,42 @@ fn content_allowed() {
             .count(),
         2
     );
+}
+
+#[test]
+fn resync_and_read_check() {
+    // `RESYNC <seq>` in the group, `RESYNC <box> <seq>` with yourself
+    // (12.9).
+    let ContentLine::Resync { mailbox, seq } = round_trip("RESYNC 9121") else {
+        panic!()
+    };
+    assert_eq!((mailbox, seq.get()), (None, 9121));
+    let ContentLine::Resync { mailbox, seq } = round_trip(&format!("RESYNC {BOX} 7")) else {
+        panic!()
+    };
+    assert_eq!(mailbox.map(|m| m.to_string()).as_deref(), Some(BOX));
+    assert_eq!(seq.get(), 7);
+    let resync = |mailbox: Option<BoxName>| ContentLine::Resync {
+        mailbox,
+        seq: Seq::FIRST,
+    };
+    let with_yourself = Place::new(Conversation::WithYourself);
+    let direct = Place::new(Conversation::Direct);
+    assert!(resync(None).allowed_in(direct));
+    assert!(!resync(None).allowed_in(with_yourself));
+    assert!(resync(Some(BOX.parse().unwrap())).allowed_in(with_yourself));
+    assert!(!resync(Some(BOX.parse().unwrap())).allowed_in(direct));
+
+    // READ's check is the first 8 bytes of the epoch_authenticator.
+    let authenticator: Vec<u8> = (1..=48).collect();
+    let check = EpochCheck::of_authenticator(&authenticator).unwrap();
+    assert_eq!(check.as_bytes(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(EpochCheck::of_authenticator(&[0; 7]), None);
+    let ContentLine::Read { check: read, .. } = round_trip(&format!(
+        "READ {BOX} 3 {}",
+        BASE64.encode(&authenticator[..8])
+    )) else {
+        panic!()
+    };
+    assert_eq!(read, check);
 }

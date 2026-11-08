@@ -49,9 +49,8 @@
 //! - **Tags that are read are checked.** A bad `ref`, `seq`, `t`,
 //!   `report`, `pseudonym`, `from` or `retry` value is an error, as is
 //!   one of these tags without a value.
-//! - **Posts (5.2).** A kept post has `seq` and `t`. A live post
-//!   (`live=yes`) has no `seq`; whether it has `t` the spec does not say,
-//!   so `t` is optional without `seq` and required with it.
+//! - **Posts (5.2).** Every post has `t`; a kept post also has `seq`, a
+//!   live one (`live=yes`) does not. A commit's post repeats its `next`.
 //! - **Reports (5.8)** need `report`, `t` and `pseudonym`; `from` is
 //!   optional.
 //! - **MLS data and other binary values** are opaque: they only have to

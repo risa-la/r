@@ -107,6 +107,8 @@ fn every_form() -> Vec<String> {
         format!("POST {BOX} - AAEAAQ== groupinfo=AAEABA=="),
         format!("POST {BOX} {tok} {blob} live=yes"),
         format!("@cid=q2r8sv0alm3nb7xk POST {BOX} {tok} AAEAAQ=="),
+        format!("POST {BOX} {tok} AAEAAQ== next={th}"),
+        format!("POST {BOX} - AAEAAQ== groupinfo=AAEABA== next={th}"),
         format!("UPLOAD {BOX} {tok} 48213"),
         format!("REPORT {BOX} AQIDBA=="),
         "LIST".into(),
@@ -463,6 +465,9 @@ fn values_have_their_grammar() {
         format!("POST {BOX} - AAEAAQ="),
         format!("POST {BOX} - sha384:abc"),
         format!("POST {BOX} - AAEAAQ== groupinfo=AAE"),
+        // next is a token hash: 48 bytes (5.2).
+        format!("POST {BOX} - AAEAAQ== next={}", zeros(32)),
+        format!("POST {BOX} - AAEAAQ== next=-"),
         format!("UPLOAD {BOX} {} -1", token()),
         format!("UPLOAD {BOX} {} 1.5", token()),
         format!("MUTE {BOX} {}", zeros(15)),
@@ -708,7 +713,9 @@ fn table() -> Vec<(String, &'static str)> {
             format!("CREATE {BOX} {gid} {th} #general AAEABA== AAEC"),
             "s",
         ),
-        (format!("POST {BOX} {tok} AAEAAQ=="), "ag"),
+        // Signed in: only a public room's PublicMessages, which the
+        // server tells from the framing (5.2, 12.6, 13).
+        (format!("POST {BOX} {tok} AAEAAQ=="), "ags"),
         (format!("UPLOAD {BOX} {tok} 1"), "a"),
         (format!("REPORT {BOX} AQIDBA=="), "ags"),
         ("LIST".into(), "ags"),

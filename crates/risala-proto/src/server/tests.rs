@@ -57,8 +57,8 @@ fn every_line() -> Vec<String> {
         "@retry=30 ERR rate-limited slow down".into(),
         format!("@seq=9122;t={T} POST {BOX} AAEAAg=="),
         format!("@seq=9122;t={T} POST {BOX} {blob}"),
-        format!("POST {BOX} AAEAAg=="),
         format!("@t={T} POST {BOX} AAEAAg=="),
+        format!("@seq=9122;t={T} POST {BOX} AAEAAg== next={}", zeros(48)),
         format!("ROOM #general {BOX} 812 General chat. Be kind."),
         format!("ROOM #general {BOX} 0"),
         format!("GROUPINFO {BOX} 4410 9120 AAEABA== {blob}"),
@@ -164,20 +164,36 @@ fn posts() {
     assert_eq!(post.seq, Seq::new(9121));
     assert!(!post.is_live());
     assert_eq!(post.mailbox.to_string(), BOX);
-    // A live post has no seq (5.2).
-    let live = rt(&format!("POST {BOX} AAEAAQ=="));
+    assert_eq!(post.next, None);
+    // A live post has t but no seq (5.2).
+    let live = rt(&format!("@t={T} POST {BOX} AAEAAQ=="));
     let ServerLine::Post(post) = &live.line else {
         panic!()
     };
     assert!(post.is_live());
-    // A kept post has t.
+    // Every post has t (5.2).
     syntax(&format!("@seq=1 POST {BOX} AAEAAQ=="));
+    syntax(&format!("POST {BOX} AAEAAQ=="));
+    // A commit's post repeats its next (5.2).
+    let next = zeros(48);
+    let msg = rt(&format!("@seq=9;t={T} POST {BOX} AAEAAQ== next={next}"));
+    let ServerLine::Post(post) = &msg.line else {
+        panic!()
+    };
+    assert_eq!(post.next.map(|n| n.to_string()), Some(next.clone()));
+    // next is a 48-byte hash; nothing else may follow the message.
+    syntax(&format!(
+        "@seq=9;t={T} POST {BOX} AAEAAQ== next={}",
+        zeros(32)
+    ));
+    syntax(&format!("@seq=9;t={T} POST {BOX} AAEAAQ== next="));
+    syntax(&format!("@seq=9;t={T} POST {BOX} AAEAAQ== live=yes"));
     syntax(&format!("@seq=0;t={T} POST {BOX} AAEAAQ=="));
     syntax(&format!("@seq;t={T} POST {BOX} AAEAAQ=="));
     syntax(&format!("@seq=1;t=yesterday POST {BOX} AAEAAQ=="));
-    syntax(&format!("POST {BOX}"));
-    syntax(&format!("POST {BOX} AAEAAQ== extra"));
-    syntax("POST general AAEAAQ==");
+    syntax(&format!("@t={T} POST {BOX}"));
+    syntax(&format!("@t={T} POST {BOX} AAEAAQ== extra"));
+    syntax(&format!("@t={T} POST general AAEAAQ=="));
     // Tags in canonical order, others dropped.
     rt_as(
         &format!("@x-y=1;t={T};seq=5 POST {BOX} AAEAAQ=="),
@@ -502,6 +518,19 @@ fn hand_built_lines_are_checked() {
     assert_eq!(
         post.to_line().to_string(),
         format!("@seq=1;t={T} POST {BOX} AAEAAQ==")
+    );
+    let next: crate::mls::TokenHash = zeros(48).parse().unwrap();
+    let live = ServerMessage::new(
+        Post::live(
+            T.parse().unwrap(),
+            BOX.parse().unwrap(),
+            "AAEAAQ==".parse().unwrap(),
+        )
+        .with_next(next),
+    );
+    assert_eq!(
+        live.to_line().to_string(),
+        format!("@t={T} POST {BOX} AAEAAQ== next={}", zeros(48))
     );
     let notify = Notify {
         tag: "t".parse().unwrap(),

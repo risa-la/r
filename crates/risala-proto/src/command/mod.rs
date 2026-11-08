@@ -321,8 +321,8 @@ pub enum Command {
         /// The second form's public room, or the first form's `epoch=`.
         form: CreateForm,
     },
-    /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]`:
-    /// posts an MLS message to a mailbox (5.2).
+    /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
+    /// [next=<hash>]`: posts an MLS message to a mailbox (5.2).
     Post {
         /// The mailbox.
         mailbox: BoxName,
@@ -336,6 +336,12 @@ pub enum Command {
         /// `groupinfo=`: the new GroupInfo of a commit in a public room
         /// (12.6).
         groupinfo: Option<OrBlob<GroupInfo>>,
+        /// `next=`: the SHA-384 hash of the send token of the epoch that a
+        /// commit creates (5.2, 7.2). Required on commits and refused on
+        /// anything else, which only the server can tell from the
+        /// message's framing (`ERR invalid`), so the parser just carries
+        /// it.
+        next: Option<TokenHash>,
         /// The `cid` tag, for safe resending (7.6).
         cid: Option<Cid>,
     },
@@ -622,7 +628,13 @@ impl Command {
                 form: CreateForm::Public(_),
                 ..
             } => SIGNED,
-            Command::Post { .. } => CONVERSING,
+            // A signed-in connection may post a public room's
+            // PublicMessages, and MUST post commits and Update proposals
+            // by an identity's leaf there; every other post needs an
+            // anonymous or guest connection (5.2 point 5, 12.6, 13). Only
+            // the server can tell, from the message's framing and the
+            // mailbox, so all three kinds pass here.
+            Command::Post { .. } => HAVING_A_KIND,
             Command::Upload { .. } => ANON,
             Command::Report { .. } | Command::List { .. } => HAVING_A_KIND,
             Command::GroupInfo { .. } => CONVERSING,

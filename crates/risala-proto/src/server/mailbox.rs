@@ -5,43 +5,63 @@ use super::ServerLine;
 use crate::binary::ReportData;
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params, Tags};
-use crate::mls::{MlsMessage, OrBlob, Pseudonym};
+use crate::mls::{MlsMessage, OrBlob, Pseudonym, TokenHash};
 use crate::names::{BoxName, Id, Seq, Uid};
-use crate::parse::{bad, last, number, parse_tag, required_tag, text_max, tok};
+use crate::parse::{last, number, opt, options, parse_tag, required_tag, text_max, tok};
 use crate::time::Timestamp;
 use crate::types::MAX_TOPIC;
 
-/// A post (5.2): `@seq=<seq>;t=<timestamp> POST <box> <message>`, sent
-/// live to the connections that follow the mailbox, or in response to
-/// FETCH (7.1).
+/// A post (5.2): `@seq=<seq>;t=<timestamp> POST <box> <message>
+/// [next=<hash>]`, sent live to the connections that follow the mailbox,
+/// or in response to FETCH (7.1).
 ///
-/// A live post, from `POST ... live=yes`, has no `seq` (5.2).
+/// A live post, from `POST ... live=yes`, has `t` but no `seq` (5.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Post {
     /// The `seq` tag: the post's position in its mailbox, or `None` for a
     /// live post, which is not kept.
     pub seq: Option<Seq>,
-    /// The `t` tag: when the server accepted the post. Every kept post has
-    /// it.
-    ///
-    /// The spec does not say whether a live post has `t` (5.2), so it is
-    /// optional only when `seq` is absent.
-    pub t: Option<Timestamp>,
+    /// The `t` tag: when the server accepted the post. Every post has it,
+    /// live ones too (5.2).
+    pub t: Timestamp,
     /// The mailbox.
     pub mailbox: BoxName,
     /// The MLSMessage, or a blob-ref if it is too large for a line.
     pub message: OrBlob<MlsMessage>,
+    /// `next=`: a commit's hash of the next epoch's send token, repeated
+    /// from its POST (5.2, 7.2). Devices check it after applying the
+    /// commit (12.7); that only commits carry it is theirs to check too,
+    /// since the parser cannot read the message's content type.
+    pub next: Option<TokenHash>,
 }
 
 impl Post {
-    /// A kept post, with its `seq` and `t`.
+    /// A kept post, with its `seq` and `t`, and no `next`.
     pub fn new(seq: Seq, t: Timestamp, mailbox: BoxName, message: OrBlob<MlsMessage>) -> Post {
         Post {
             seq: Some(seq),
-            t: Some(t),
+            t,
             mailbox,
             message,
+            next: None,
         }
+    }
+
+    /// A live post (5.2): `t` but no `seq`.
+    pub fn live(t: Timestamp, mailbox: BoxName, message: OrBlob<MlsMessage>) -> Post {
+        Post {
+            seq: None,
+            t,
+            mailbox,
+            message,
+            next: None,
+        }
+    }
+
+    /// The same post with a commit's `next` (5.2).
+    pub fn with_next(mut self, next: TokenHash) -> Post {
+        self.next = Some(next);
+        self
     }
 
     /// Whether this is a live post (5.2): one without a `seq`.
@@ -80,17 +100,17 @@ pub(super) fn parse(
     let parse: fn(&Tags, Params<'_>) -> Result<ServerLine, ParseError> = match verb {
         "POST" => |tags, mut p| {
             let seq = parse_tag(tags, "seq")?;
-            let t = parse_tag(tags, "t")?;
-            if seq.is_some() && t.is_none() {
-                return Err(bad("a post with seq has t"));
-            }
+            // Every post has `t`, a live one too (5.2).
+            let t = required_tag(tags, "t")?;
             let mailbox = tok(&mut p)?;
-            let message = last(p)?;
+            let message = tok(&mut p)?;
+            let options = options(p, &["next"])?;
             Ok(ServerLine::Post(Post {
                 seq,
                 t,
                 mailbox,
                 message,
+                next: opt(&options, "next")?,
             }))
         },
         "ROOM" => |_, mut p| {
@@ -160,10 +180,11 @@ pub(super) fn write(line: &ServerLine, b: &mut LineBuilder) -> bool {
             if let Some(seq) = post.seq {
                 b.tag("seq", seq);
             }
-            if let Some(t) = post.t {
-                b.tag("t", t);
-            }
+            b.tag("t", post.t);
             b.token(post.mailbox).token(&post.message);
+            if let Some(next) = &post.next {
+                b.option("next", next);
+            }
         }
         ServerLine::Room {
             room,
