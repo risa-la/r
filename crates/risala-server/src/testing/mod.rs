@@ -1,7 +1,7 @@
 //! A whole server for tests, here and in other crates.
 //!
 //! **For tests only.** [`TestServer`] runs a real `risalad` (the
-//! [`Hub`](crate::core::Hub) behind the [network layer](crate::net)) in
+//! [`Hub`] behind the [network layer](crate::net)) in
 //! the current tokio runtime, on `127.0.0.1` with a port the system
 //! chooses, with its database and a generated self-signed certificate in a
 //! temporary directory. [`TestClient`] talks to it line by line over TLS,

@@ -158,7 +158,7 @@ enum Command {
         #[arg(long)]
         show: bool,
     },
-    /// Register a new identity, <name>@<domain>, on a server that hosts
+    /// Register a new identity, `<name>@<domain>`, on a server that hosts
     /// identities, and add it as an account. Prints the uid and this device's
     /// key file line.
     Register {

@@ -94,8 +94,9 @@ pub(crate) enum AdminCommand {
         /// The uid again.
         confirm: String,
     },
-    /// Change a server setting (10.6): guests yes|no, registration
-    /// open|closed, retention <days>|forever, or welcome <text>.
+    /// Change a server setting (10.6): `guests yes|no`,
+    /// `registration open|closed`, `retention <days>|forever`, or
+    /// `welcome <text>`.
     Set {
         server: String,
         key: String,

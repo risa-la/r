@@ -42,7 +42,7 @@
 //! # Conversations and ordering
 //!
 //! Every conversation, a room now and a direct conversation from M5a, has
-//! an entry with an async lock ([`state::ConvEntry`]). Its members are kept
+//! an entry with an async lock (`state::ConvEntry`). Its members are kept
 //! there, by conversation id (5.1), so a room that is dropped and created
 //! again starts with nobody in it. Appending an event happens under the
 //! lock: the seq is assigned and the event stored in one store
@@ -54,7 +54,7 @@
 //! its sender gets them first (3.6).
 //!
 //! Fan-out does not take the registry's lock: each member's entry
-//! ([`state::UserEntry`]) holds its connections. See [`state`] for the
+//! (`state::UserEntry`) holds its connections. See `state` for the
 //! order the locks are taken in.
 //!
 //! Each command runs in its own task, holding its connection's gate. The

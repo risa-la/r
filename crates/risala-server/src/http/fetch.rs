@@ -1,5 +1,5 @@
 //! Fetching key files for AUTH (4.4, 4.5): the hub's
-//! [`KeyFetcher`](crate::core::KeyFetcher), implemented by
+//! [`KeyFetcher`], implemented by
 //! [`risala_keyfetch`].
 
 use std::io;

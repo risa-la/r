@@ -8,7 +8,7 @@
 //! answered and then closed. `GET` and `HEAD` of a key file get it, with
 //! `Content-Type: text/plain; charset=utf-8`. Other paths get 404 and
 //! other methods 405. Requests have a size limit and a time limit, and
-//! nothing lists the directory. [`route`] is where the upload URLs of 5.6
+//! nothing lists the directory. `route` is where the upload URLs of 5.6
 //! will go.
 //!
 //! TLS is 1.3 only. Browsers and curl fetch these files too, so the key

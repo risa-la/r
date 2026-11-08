@@ -28,8 +28,8 @@ pub(crate) enum RoomCommand {
         /// The topic; the words are joined with spaces.
         text: Vec<String>,
     },
-    /// Change a room setting (6.2): public yes|no, guests none|read|write,
-    /// retention <days>|server, or topic <text>.
+    /// Change a room setting (6.2): `public yes|no`, `guests none|read|write`,
+    /// `retention <days>|server`, or `topic <text>`.
     Set {
         server: String,
         room: String,
