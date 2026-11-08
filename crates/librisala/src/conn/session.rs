@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use risala_proto::auth::SecretKey;
 use risala_proto::command::{Command, GuestToken, Request};
-use risala_proto::frame::{LineDecoder, MAX_CLIENT_LINE, MAX_SERVER_LINE, check_line_len};
+use risala_proto::frame::{LineDecoder, LineLimits, MAX_CLIENT_LINE, check_line_len};
 use risala_proto::line::read_ref;
 use risala_proto::names::{Domain, Id, Identity, Name, Uid};
 use risala_proto::server::{
@@ -281,7 +281,11 @@ impl Session {
         };
         let (stream, verified) = tls::connect(addr, &trust, ca, options.connect_to).await?;
         let (mut rd, wr) = tokio::io::split(stream);
-        let mut decoder = LineDecoder::new(MAX_SERVER_LINE);
+        // 2.3: lines that carry MLS data, such as WELCOME, GROUPINFO and
+        // KEYPKG, may be up to 8 MiB. A server sends them only once the
+        // connection has signed in; reading them at any time costs nothing
+        // more than the limit.
+        let mut decoder = LineDecoder::with_limits(LineLimits::SERVER);
         let greeting = read_greeting(&mut rd, &mut decoder).await;
         let greeting = match greeting {
             Ok(g) => g,
@@ -436,7 +440,13 @@ impl Session {
             .try_to_line()
             .map_err(Error::InvalidCommand)?
             .to_string();
-        check_line_len(&line, MAX_CLIENT_LINE).map_err(Error::InvalidCommand)?;
+        // 2.3: once signed in, commands that carry MLS data may be long.
+        if st.uid.is_some() {
+            LineLimits::CLIENT.check(&line)
+        } else {
+            check_line_len(&line, MAX_CLIENT_LINE)
+        }
+        .map_err(Error::InvalidCommand)?;
         if self.out.send(Outgoing::Line(line)).is_err() {
             return Err(Error::Closed(CloseReason::Local));
         }
