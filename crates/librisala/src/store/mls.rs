@@ -13,7 +13,10 @@
 //! `MlsGroup::load` inside every transaction that uses it, and never keep
 //! an `MlsGroup` across transactions.
 
+use std::sync::Arc;
+
 use openmls_sqlite_storage::{MsgPack, SqliteStorageProvider};
+use risala_mls::RisalaCrypto;
 use rusqlite::Connection;
 
 use super::Tx;
@@ -23,16 +26,31 @@ pub(crate) const SCHEMA: &str = openmls_sqlite_storage::SCHEMA;
 
 /// OpenMLS storage on one of the cache's connections, usually a write
 /// transaction. Its codec is MessagePack.
-#[allow(dead_code, reason = "for the group engine, task C2")]
 pub(crate) type MlsStorage<'a> = SqliteStorageProvider<MsgPack, &'a Connection>;
+
+/// The OpenMLS provider of an operation: risala's crypto (12.2), shared,
+/// and the cache's storage on one connection.
+pub(crate) type MlsProvider<'a> = risala_mls::Provider<MlsStorage<'a>>;
 
 impl Tx<'_> {
     /// OpenMLS storage inside this transaction, for the provider of an MLS
     /// operation.
-    #[allow(dead_code, reason = "for the group engine, task C2")]
     pub(crate) fn mls_storage(&self) -> MlsStorage<'_> {
         SqliteStorageProvider::new(self.conn())
     }
+
+    /// An OpenMLS provider inside this transaction.
+    pub(crate) fn mls(&self, crypto: &Arc<RisalaCrypto>) -> MlsProvider<'_> {
+        risala_mls::Provider::with_crypto(crypto.clone(), self.mls_storage())
+    }
+}
+
+/// An OpenMLS provider on a read connection, for reads of a group.
+pub(crate) fn read_provider<'a>(
+    conn: &'a Connection,
+    crypto: &Arc<RisalaCrypto>,
+) -> MlsProvider<'a> {
+    risala_mls::Provider::with_crypto(crypto.clone(), SqliteStorageProvider::new(conn))
 }
 
 #[cfg(test)]
