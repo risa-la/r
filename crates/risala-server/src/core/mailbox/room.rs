@@ -20,8 +20,7 @@ use std::time::Duration;
 use openmls_memory_storage::MemoryStorage;
 use risala_mls::RisalaCrypto;
 use risala_mls::checks::{
-    CommitError, CommitPost, CommitView, GroupView, History, JoinExpectation, check_commit,
-    check_join,
+    CommitError, CommitView, EpochState, GroupView, JoinExpectation, check_commit, check_join,
 };
 use risala_mls::conversation::{ConversationKind, GuestMode, RisalaConversation, Role as MlsRole};
 use risala_mls::framing::ContentType;
@@ -70,8 +69,9 @@ struct RoomCache {
     group: PublicGroup,
     /// OpenMLS's state of the group: its pending proposals.
     storage: MemoryStorage,
-    /// What the server saw of the group's recent commits (12.7).
-    history: History,
+    /// What the group checks need of the epoch besides the tree: the leaf
+    /// that started it, and its proposals' times (12.7).
+    state: EpochState,
 }
 
 /// The public rooms' groups in memory, and the limit on rooms created.
@@ -142,18 +142,18 @@ impl Rooms {
     }
 }
 
-/// A room's history (12.7), as the store keeps it.
-fn encode_history(history: &History) -> Result<Vec<u8>, ErrResponse> {
-    rmp_serde::to_vec(history).map_err(|e| {
-        tracing::error!("encoding a public room's history: {e}");
+/// A room's epoch state (12.7), as the store keeps it.
+fn encode_state(state: &EpochState) -> Result<Vec<u8>, ErrResponse> {
+    rmp_serde::to_vec(state).map_err(|e| {
+        tracing::error!("encoding a public room's epoch state: {e}");
         err(ErrorCode::Internal)
     })
 }
 
-/// A room's history (12.7), read back from the store.
-fn decode_history(bytes: &[u8]) -> Result<History, ErrResponse> {
+/// A room's epoch state (12.7), read back from the store.
+fn decode_state(bytes: &[u8]) -> Result<EpochState, ErrResponse> {
     rmp_serde::from_slice(bytes).map_err(|e| {
-        tracing::error!("reading a public room's history: {e}");
+        tracing::error!("reading a public room's epoch state: {e}");
         err(ErrorCode::Internal)
     })
 }
@@ -239,7 +239,7 @@ fn rebuild(crypto: &RisalaCrypto, stored: &RoomGroup) -> Result<RoomCache, ErrRe
         proposals: stored.proposals.len(),
         group,
         storage,
-        history: decode_history(&stored.history)?,
+        state: decode_state(&stored.state)?,
     })
 }
 
@@ -258,9 +258,9 @@ fn room_update(
     group: &PublicGroup,
     conversation: &RisalaConversation,
     group_info: Vec<u8>,
-    history: &History,
+    state: &EpochState,
 ) -> Result<RoomUpdate, ErrResponse> {
-    let view = GroupView::of(group);
+    let view = GroupView::of(group, state);
     let members: BTreeMap<Uid, Role> = view
         .leaves
         .iter()
@@ -278,7 +278,7 @@ fn room_update(
             GuestMode::Read => GuestAccess::Read,
             GuestMode::Write => GuestAccess::Write,
         },
-        history: encode_history(history)?,
+        state: encode_state(state)?,
     })
 }
 
@@ -353,7 +353,8 @@ pub(super) async fn create(
         if context.epoch().as_u64() != 0 || context.group_id().as_slice() != group_id.as_bytes() {
             return Err(invalid("not the group of the CREATE, in epoch 0"));
         }
-        let view = GroupView::of(&group);
+        let state = EpochState::created();
+        let view = GroupView::of(&group, &state);
         check_join(
             &view,
             &JoinExpectation {
@@ -384,15 +385,14 @@ pub(super) async fn create(
         {
             return Err(invalid("a public room with the creator as an owner"));
         }
-        let history = History::created(ms(now));
-        let update = room_update(&group, &conversation, group_info, &history)?;
+        let update = room_update(&group, &conversation, group_info, &state)?;
         Ok((
             RoomCache {
                 epoch: 0,
                 proposals: 0,
                 group,
                 storage,
-                history,
+                state,
             },
             update,
         ))
@@ -470,11 +470,8 @@ pub(super) async fn check_post(
         let sender = processed.sender().clone();
         match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) if commit => {
-                let view = GroupView::of(&room.group);
-                let post = CommitPost {
-                    t: ms(now),
-                    next: next.map(|next| *next.as_bytes()),
-                };
+                let view = GroupView::of(&room.group, &room.state);
+                let post = room.state.post(ms(now), next.map(|next| *next.as_bytes()));
                 let pending = room
                     .group
                     .queued_proposals(&room.storage)
@@ -490,8 +487,7 @@ pub(super) async fn check_post(
                 if committer.is_guest() {
                     return Err(forbidden("a guest's leaf does not commit"));
                 }
-                let verdict = check_commit(&view, &commit_view, &room.history, &post)
-                    .map_err(commit_error)?;
+                check_commit(&view, &commit_view, &post).map_err(commit_error)?;
                 // 4. From the leaf's own device.
                 if !is_device(&who, &committer) {
                     return Err(forbidden(
@@ -523,14 +519,10 @@ pub(super) async fn check_post(
                 if signer_key.is_none() || signer_key != new_signature_key {
                     return Err(invalid("the GroupInfo is not signed by the committer"));
                 }
-                room.history.record(
-                    &view,
-                    &commit_view,
-                    &verdict,
-                    &GroupView::of(&room.group),
-                    &post,
-                );
-                let update = room_update(&room.group, &conversation, group_info, &room.history)?;
+                // The committer, which signed the GroupInfo, started the
+                // new epoch (12.3).
+                room.state = EpochState::started_by(signer);
+                let update = room_update(&room.group, &conversation, group_info, &room.state)?;
                 room.epoch = update.epoch;
                 room.proposals = 0;
                 Ok(CheckedPost {
@@ -542,7 +534,7 @@ pub(super) async fn check_post(
                 let MlsSender::Member(index) = sender else {
                     return Err(invalid("a proposal from outside the group"));
                 };
-                let leaf = GroupView::of(&room.group)
+                let leaf = GroupView::of(&room.group, &room.state)
                     .leaf(index)
                     .and_then(|leaf| leaf.identity.clone())
                     .ok_or_else(|| invalid("a proposal from no leaf"))?;
@@ -561,19 +553,19 @@ pub(super) async fn check_post(
                                 "an identity's Update comes from its device's signed-in connection",
                             ));
                         }
-                        let reference = queued.proposal_reference_ref().as_slice().to_vec();
-                        room.history.note_update(&reference, ms(now));
                     }
                     _ => return Err(invalid("a proposal that is not posted on its own")),
                 }
-                keep_proposal(room, *queued, message)
+                keep_proposal(room, *queued, message, now)
             }
             ProcessedMessageContent::ExternalJoinProposalMessage(queued) if !commit => {
                 let Proposal::Add(add) = queued.proposal() else {
                     return Err(invalid("a join proposal that is not an Add"));
                 };
                 let key_package = add.key_package();
-                let conversation = GroupView::of(&room.group).conversation.map_err(invalid)?;
+                let conversation = GroupView::of(&room.group, &room.state)
+                    .conversation
+                    .map_err(invalid)?;
                 // A KeyPackage made for this join, with no device binding,
                 // within its lifetime at the post's time (6.1, 12.3, 12.5).
                 let (identity, _) = check_key_package_contents(key_package).map_err(invalid)?;
@@ -594,7 +586,7 @@ pub(super) async fn check_post(
                 } else if conversation.is_banned(&identity.uid) {
                     return Err(forbidden("banned"));
                 }
-                keep_proposal(room, *queued, message)
+                keep_proposal(room, *queued, message, now)
             }
             _ => Err(invalid("not a commit or proposal as its content type says")),
         }
@@ -607,7 +599,11 @@ fn keep_proposal(
     mut room: RoomCache,
     queued: risala_mls::openmls::group::QueuedProposal,
     message: Vec<u8>,
+    now: Timestamp,
 ) -> Result<CheckedPost, ErrResponse> {
+    // A commit that applies it is judged by its post's time (12.3, 12.7).
+    let reference = queued.proposal_reference_ref().as_slice().to_vec();
+    room.state.note_proposal(&reference, ms(now));
     room.group
         .add_proposal(&room.storage, queued)
         .map_err(|e| invalid(format!("{e:?}")))?;
@@ -615,7 +611,7 @@ fn keep_proposal(
     Ok(CheckedPost {
         change: RoomChange::Proposal {
             message,
-            history: encode_history(&room.history)?,
+            state: encode_state(&room.state)?,
         },
         group: room,
     })
@@ -639,6 +635,8 @@ fn commit_error(e: CommitError) -> ErrResponse {
         | CommitError::Extension(_)
         | CommitError::Add
         | CommitError::Remove
+        | CommitError::CheckRemovals
+        | CommitError::Bulk
         | CommitError::SameDevice
         | CommitError::LeftBehind
         | CommitError::TooLarge => forbidden(e),

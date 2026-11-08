@@ -8,10 +8,11 @@ use risala_mls::conversation::{GuestMode, RisalaConversation};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use risala_mls::checks::{CommitPost, History};
+use risala_mls::checks::EpochState;
 use risala_mls::group::{
     Changes, CommitOutput, commit, create_group, encrypt_application, join_by_welcome,
     join_proposal, merge_own_commit, own_leaf_key, process_message, propose_update,
+    sending_pseudonym,
 };
 use risala_mls::identity::{DeviceId, RisalaIdentity};
 use risala_mls::keypackage::make_join_key_package;
@@ -41,7 +42,7 @@ struct Dev {
     key: SigningKey,
     provider: Provider<MemoryStorage>,
     pseudonym: risala_mls::Pseudonym,
-    histories: RefCell<HashMap<Vec<u8>, History>>,
+    states: RefCell<HashMap<Vec<u8>, EpochState>>,
 }
 
 /// The time now, in ms, as devices and the group checks take it.
@@ -56,7 +57,7 @@ impl Dev {
             key: SigningKey::from_seed([seed; 32]),
             provider: Provider::new(MemoryStorage::default()).unwrap(),
             pseudonym: risala_mls::Pseudonym([seed; 16]),
-            histories: RefCell::default(),
+            states: RefCell::default(),
         }
     }
 
@@ -77,30 +78,29 @@ impl Dev {
             .key_package
     }
 
-    fn history(&self, group: &MlsGroup) -> History {
-        self.histories
+    fn state(&self, group: &MlsGroup) -> EpochState {
+        self.states
             .borrow()
             .get(group.group_id().as_slice())
             .cloned()
             .unwrap_or_default()
     }
 
-    fn set_history(&self, group: &MlsGroup, history: History) {
-        self.histories
+    fn set_state(&self, group: &MlsGroup, state: EpochState) {
+        self.states
             .borrow_mut()
-            .insert(group.group_id().as_slice().to_vec(), history);
+            .insert(group.group_id().as_slice().to_vec(), state);
     }
 
     fn create(&self, conversation: &RisalaConversation) -> MlsGroup {
-        let (group, _, history) = create_group(
+        let (group, _, state) = create_group(
             &self.provider,
             &self.identity(),
             &self.profile(),
             conversation,
-            now_ms(),
         )
         .unwrap();
-        self.set_history(&group, history);
+        self.set_state(&group, state);
         group
     }
 
@@ -108,23 +108,18 @@ impl Dev {
         commit(
             &self.provider,
             group,
-            self.pseudonym,
             &self.profile(),
-            &self.history(group),
+            &self.state(group),
             changes,
         )
         .unwrap()
     }
 
     /// Merges this device's pending commit, which won (7.2).
-    fn merge(&self, group: &mut MlsGroup, out: &CommitOutput) {
-        let mut history = self.history(group);
-        let post = CommitPost {
-            t: now_ms(),
-            next: Some(out.next_token_hash),
-        };
-        merge_own_commit(&self.provider, group, &mut history, &post).unwrap();
-        self.set_history(group, history);
+    fn merge(&self, group: &mut MlsGroup, _out: &CommitOutput) {
+        let mut state = self.state(group);
+        merge_own_commit(&self.provider, group, &mut state).unwrap();
+        self.set_state(group, state);
     }
 
     fn join(&self, welcome: &[u8]) -> MlsGroup {
@@ -133,8 +128,8 @@ impl Dev {
             own_uid: self.uid.clone(),
             public_room: None,
         };
-        let joined = join_by_welcome(&self.provider, welcome, None, &expect, now_ms()).unwrap();
-        self.set_history(&joined.group, joined.history);
+        let joined = join_by_welcome(&self.provider, welcome, None, &expect).unwrap();
+        self.set_state(&joined.group, joined.state);
         joined.group
     }
 
@@ -150,9 +145,22 @@ impl Dev {
         TokenHash::from_bytes(token.hash()).to_string()
     }
 
+    /// The pseudonym this device sends under in `group` now (7.3): derived
+    /// from the epoch outside public rooms, its own for the period in one.
+    fn pseudonym_in(&self, group: &MlsGroup) -> risala_mls::Pseudonym {
+        let public = risala_mls::group::conversation(group)
+            .is_some_and(|c| c.kind == risala_mls::ConversationKind::PublicRoom);
+        sending_pseudonym::<()>(
+            group,
+            self.provider.crypto(),
+            public.then_some(self.pseudonym),
+        )
+        .unwrap()
+    }
+
     /// An application message, in base64.
     fn send(&self, group: &mut MlsGroup, text: &[u8]) -> String {
-        let aad = RisalaAad::application(self.pseudonym, [7; 48]);
+        let aad = RisalaAad::application(self.pseudonym_in(group), [7; 48]);
         b64(&encrypt_application(&self.provider, group, &aad, text).unwrap())
     }
 
@@ -810,7 +818,9 @@ async fn muted_pseudonyms() {
     let mut h = Harness::new();
     let mut anon = h.anon().await;
     let mut d = Direct::new(&h, &mut anon, 1).await;
-    let pseudonym = Pseudonym::from_bytes(d.bob.pseudonym.0);
+    // Outside public rooms, the pseudonym of Bob's leaf in this epoch
+    // (7.3).
+    let pseudonym = Pseudonym::from_bytes(d.bob.pseudonym_in(&d.b).0);
     let until: Timestamp = "2026-11-09T13:00:00.000Z".parse().unwrap();
     assert!(h.store.set_mute(&d.m, &pseudonym, until).unwrap());
     let message = d.bob.send(&mut d.b, b"spam");
@@ -1758,14 +1768,8 @@ async fn public_room_updates() {
     let m = room.m;
     let mut anon = h.anon().await;
     let token0 = room.owen.token(&room.o);
-    let update = propose_update(
-        &room.owen.provider,
-        &mut room.o,
-        room.owen.pseudonym,
-        &room.owen.profile(),
-        None,
-    )
-    .unwrap();
+    let update =
+        propose_update(&room.owen.provider, &mut room.o, &room.owen.profile(), None).unwrap();
     let message = b64(&update.message);
     h.send(&anon, &format!("POST {m} {token0} {message}")).await;
     assert_eq!(

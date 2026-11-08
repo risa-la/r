@@ -109,7 +109,7 @@ CREATE TABLE public_rooms (
     topic TEXT NOT NULL DEFAULT '', -- escaped, from the conversation extension (6.2)
     guests TEXT NOT NULL DEFAULT 'write' CHECK (guests IN ('none', 'read', 'write')),
     proposals BLOB NOT NULL DEFAULT x'', -- the epoch's pending proposals, each a u32 length and its bytes
-    history BLOB NOT NULL DEFAULT x'' -- the group's recent commits, for the group checks (12.7)
+    epoch_state BLOB NOT NULL DEFAULT x'' -- what the group checks need of the epoch (12.7)
 ) STRICT;
 
 -- The uids with a leaf in each public room's group (6.1, 8.3), and their
@@ -348,7 +348,7 @@ fn store_room_group(
     let members = group.members.len() as i64;
     tx.execute(
         "UPDATE public_rooms SET epoch = ?, epoch_seq = ?, group_info = ?, tree = ?,
-             members = ?, topic = ?, guests = ?, proposals = x'', history = ?
+             members = ?, topic = ?, guests = ?, proposals = x'', epoch_state = ?
          WHERE box = ?",
         params![
             sql_u64(group.epoch),
@@ -358,7 +358,7 @@ fn store_room_group(
             members,
             &group.topic,
             group.guests.to_string(),
-            &group.history,
+            &group.state,
             mailbox
         ],
     )?;
@@ -597,7 +597,7 @@ impl MailboxStore for SqliteStore {
             let seq = from_sql_u64("seq", seq)?;
             match &post.room {
                 Some(RoomChange::Commit(group)) => store_room_group(tx, mailbox, group, seq)?,
-                Some(RoomChange::Proposal { message, history }) => {
+                Some(RoomChange::Proposal { message, state }) => {
                     // SQLite's || makes text of blobs: append here.
                     let mut proposals: Vec<u8> = tx.query_row(
                         "SELECT proposals FROM public_rooms WHERE box = ?",
@@ -606,8 +606,8 @@ impl MailboxStore for SqliteStore {
                     )?;
                     proposals.extend_from_slice(&encode_proposal(message));
                     tx.execute(
-                        "UPDATE public_rooms SET proposals = ?, history = ? WHERE box = ?",
-                        params![proposals, history, mailbox],
+                        "UPDATE public_rooms SET proposals = ?, epoch_state = ? WHERE box = ?",
+                        params![proposals, state, mailbox],
                     )?;
                 }
                 None => {}
@@ -697,7 +697,7 @@ impl MailboxStore for SqliteStore {
         self.read(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT room, epoch, epoch_seq, group_info, tree, proposals, history
+                    "SELECT room, epoch, epoch_seq, group_info, tree, proposals, epoch_state
                      FROM public_rooms WHERE box = ?",
                     [&mailbox.as_bytes()[..]],
                     |row| {
@@ -713,7 +713,7 @@ impl MailboxStore for SqliteStore {
                     },
                 )
                 .optional()?;
-            let Some((room, epoch, epoch_seq, group_info, tree, proposals, history)) = row else {
+            let Some((room, epoch, epoch_seq, group_info, tree, proposals, state)) = row else {
                 return Ok(None);
             };
             Ok(Some(RoomGroup {
@@ -723,7 +723,7 @@ impl MailboxStore for SqliteStore {
                 group_info,
                 tree,
                 proposals: decode_proposals(&proposals)?,
-                history,
+                state,
             }))
         })
     }
@@ -1407,7 +1407,7 @@ mod tests {
             members,
             topic: "hello\\sthere".into(),
             guests: GuestAccess::Read,
-            history: vec![epoch as u8; 2],
+            state: vec![epoch as u8; 2],
         };
         let room = NewRoom {
             room: "#general".parse().unwrap(),
@@ -1433,7 +1433,7 @@ mod tests {
                 group_info: vec![0; 3],
                 tree: vec![0; 5],
                 proposals: vec![],
-                history: vec![0; 2],
+                state: vec![0; 2],
             }
         );
         assert_eq!(
@@ -1446,14 +1446,14 @@ mod tests {
         for message in [vec![1, 2, 3], vec![], vec![4; 300]] {
             let mut p = post(m.mailbox, 1, 1);
             p.room = Some(RoomChange::Proposal {
-                history: vec![9; message.len() % 7],
+                state: vec![9; message.len() % 7],
                 message,
             });
             store.add_post(&p).unwrap();
         }
         let state = store.room_group(&m.mailbox).unwrap().unwrap();
         assert_eq!(state.proposals, [vec![1, 2, 3], vec![], vec![4; 300]]);
-        assert_eq!(state.history, vec![9; 300 % 7]);
+        assert_eq!(state.state, vec![9; 300 % 7]);
 
         let mut commit = post(m.mailbox, 2, 1);
         commit.room = Some(RoomChange::Commit(group(
@@ -1465,7 +1465,7 @@ mod tests {
         assert_eq!((state.epoch, state.epoch_seq), (1, 4));
         assert_eq!(state.tree, vec![1; 5]);
         assert!(state.proposals.is_empty());
-        assert_eq!(state.history, vec![1; 2]);
+        assert_eq!(state.state, vec![1; 2]);
         assert_eq!(
             store.room_member(&m.mailbox, &sam).unwrap(),
             Some(Role::Member)
