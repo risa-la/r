@@ -45,6 +45,9 @@ openmls.workspace = true
 openmls_libcrux_crypto.workspace = true
 openmls_basic_credential.workspace = true
 openmls_traits.workspace = true
+# A whole risalad for the identity tests (tests/identity_server.rs).
+risala-server = { path = "../risala-server" }
+risala-keylog.workspace = true
 
 [lints]
 workspace = true

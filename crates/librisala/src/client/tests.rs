@@ -104,13 +104,6 @@ async fn area_methods_say_they_are_not_implemented() {
         other => panic!("{name}: {other:?}"),
     };
     not_implemented(
-        c.create_identity("chat.example.org", "alice", "laptop")
-            .await
-            .map(drop),
-        "create_identity",
-    );
-    not_implemented(c.own_identities().map(drop), "own_identities");
-    not_implemented(
         c.join_public_room(account, "#general").await.map(drop),
         "join_public_room",
     );
@@ -122,14 +115,15 @@ async fn area_methods_say_they_are_not_implemented() {
 }
 
 #[tokio::test]
-async fn an_identity_cannot_connect_until_it_can_sign_in() {
+async fn an_identity_this_device_does_not_hold_cannot_connect() {
     let c = client();
     let alice = c
         .add_identity_account("chat.example.org", "alice@example.org")
         .unwrap();
+    // Task C1: signing in needs the identity's keys on this device.
     assert!(matches!(
         c.connect(alice.id).await,
-        Err(Error::NotImplemented("identity_sign_in"))
+        Err(Error::Identity(identity::IdentityError::NotHeld(_)))
     ));
 }
 

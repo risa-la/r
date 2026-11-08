@@ -87,6 +87,9 @@ pub struct ClientOptions {
     pub anonymous_connections: usize,
     /// The time.
     pub clock: Arc<dyn Clock>,
+    /// HTTPS fetches of key files and key logs (4.4, 4.5). `None` uses
+    /// `risala-keyfetch` with `ca_verifier`, or the platform's CA check.
+    pub https: Option<Arc<dyn identity::Https>>,
 }
 
 impl Default for ClientOptions {
@@ -100,6 +103,7 @@ impl Default for ClientOptions {
             backoff: Backoff::default(),
             anonymous_connections: 1,
             clock: Arc::new(SystemClock),
+            https: None,
         }
     }
 }

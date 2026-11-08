@@ -569,8 +569,25 @@ impl Session {
     /// the greeting's host, and the greeting's nonce. Fails with
     /// [`Error::NoSni`] over an IP address (2.1).
     pub async fn auth(&self, identity: &Identity, key: &SecretKey) -> Result<Uid, Error> {
+        self.auth_hedged(identity, key, [0; 32]).await
+    }
+
+    /// [`auth`](Self::auth) with the hedged variant of ML-DSA, which
+    /// signers SHOULD use (4.6, PLAN.md 58): `rnd` is 32 fresh random
+    /// bytes. All zeros gives the deterministic variant.
+    pub async fn auth_hedged(
+        &self,
+        identity: &Identity,
+        key: &SecretKey,
+        rnd: [u8; 32],
+    ) -> Result<Uid, Error> {
         let sni = self.info.sni.as_deref().ok_or(Error::NoSni)?;
-        let command = auth_command(sni, &self.info.greeting.nonce, identity, key);
+        let signature =
+            key.sign_challenge_hedged(sni, &self.info.greeting.nonce, identity.as_str(), rnd);
+        let command = Command::Auth {
+            identity: identity.clone(),
+            signature,
+        };
         let uid = identity.to_uid();
         let sets = Some((ConnectionKind::SignedIn, Some(uid.clone())));
         self.request_setting(command, sets).await?.ok()?;
@@ -606,9 +623,24 @@ impl Session {
         records: EncodedRecords,
         key: &SecretKey,
     ) -> Result<Uid, Error> {
+        self.register_hedged(name, domain, records, key, [0; 32])
+            .await
+    }
+
+    /// [`register`](Self::register) with the hedged variant of ML-DSA, as
+    /// [`auth_hedged`](Self::auth_hedged).
+    pub async fn register_hedged(
+        &self,
+        name: &Name,
+        domain: &Domain,
+        records: EncodedRecords,
+        key: &SecretKey,
+        rnd: [u8; 32],
+    ) -> Result<Uid, Error> {
         let sni = self.info.sni.as_deref().ok_or(Error::NoSni)?;
         let identity = Identity::new(name, domain);
-        let signature = key.sign_challenge(sni, &self.info.greeting.nonce, identity.as_str());
+        let signature =
+            key.sign_challenge_hedged(sni, &self.info.greeting.nonce, identity.as_str(), rnd);
         let command = Command::Register {
             name: name.clone(),
             records,
