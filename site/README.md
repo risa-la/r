@@ -11,13 +11,14 @@ npm run check    # type-check
 
 ## Documents
 
-The site publishes `SPEC.md` straight from the repository; there is no copy
-here. `PLAN.md` and `docs/plans` are for coding agents and stay off the site.
-`src/docs.ts` lists which files are published, their order, and any title
-that differs from the file's first heading. Links between published
-documents become links between pages, and links to any other repository file
-point at GitHub (`src/lib/doc-links.ts`). The spec's version comes from its
-header block.
+The site publishes the spec straight from `spec/` in the repository; there
+is no copy here. `src/spec.ts` stitches its files into one page,
+`spec/README.md` first and the rest in name order, and `/spec.md` serves the
+same text as one file to download. `PLAN.md` and `docs/plans` are for coding
+agents and stay off the site. `src/docs.ts` holds the spec's title and page
+order. Links into `spec/` become links to their section on the spec page, and
+links to any other repository file point at GitHub (`src/lib/doc-links.ts`).
+The spec's version comes from its header block.
 
 ## Look
 
@@ -36,7 +37,7 @@ a document or section.
 ## Deploying
 
 `.github/workflows/site.yml` builds the site and publishes it to GitHub Pages
-on every push to `main` that touches `site/` or `SPEC.md`. Pull requests
+on every push to `main` that touches `site/` or `spec/`. Pull requests
 build without publishing.
 
 The custom domain is set in the repository's Settings → Pages, not with a

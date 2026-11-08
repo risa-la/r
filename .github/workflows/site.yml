@@ -1,20 +1,20 @@
 name: Site
 
 # Builds the website in site/ and publishes it to GitHub Pages at risa.la.
-# The site reads SPEC.md from the repository root, so changes to it publish
-# too. Pull requests build without publishing.
+# The site reads the spec from spec/, so changes to it publish too. Pull
+# requests build without publishing.
 
 on:
   push:
     branches: [main]
     paths:
       - "site/**"
-      - "SPEC.md"
+      - "spec/**"
       - ".github/workflows/site.yml"
   pull_request:
     paths:
       - "site/**"
-      - "SPEC.md"
+      - "spec/**"
       - ".github/workflows/site.yml"
   workflow_dispatch:
 

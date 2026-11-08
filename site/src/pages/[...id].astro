@@ -13,12 +13,14 @@ const { doc } = Astro.props;
 const { Content, headings } = await render(doc);
 const title = docTitle(doc.id, doc.body);
 const version = docVersion(doc.body);
-const source = doc.filePath?.replace(/^\.\.\//, "");
+// The spec is stitched from a folder; its source is the folder itself.
+const source = doc.id === "spec" ? "spec/" : doc.filePath?.replace(/^\.\.\//, "");
+const sourceUrl = source?.endsWith("/") ? `${REPO_URL}/tree/main/${source}` : `${REPO_URL}/blob/main/${source}`;
 // The sidebar replaces the document's own contents list on wide screens.
 const contents = headings.filter((h) => (h.depth === 2 || h.depth === 3) && h.slug !== "contents");
 ---
 
-<Base title={title}>
+<Base title={title} description="The risala spec: a modern chat protocol in which every conversation is end-to-end encrypted, deniable and post-quantum.">
   <div class="layout">
     <article class="panel doc">
       <header>
@@ -38,7 +40,17 @@ const contents = headings.filter((h) => (h.depth === 2 || h.depth === 3) && h.sl
               <div>
                 <dt class="label">source</dt>
                 <dd>
-                  <a href={`${REPO_URL}/blob/main/${source}`}>{source}</a>
+                  <a href={sourceUrl}>{source}</a>
+                </dd>
+              </div>
+            )
+          }
+          {
+            doc.id === "spec" && (
+              <div>
+                <dt class="label">one file</dt>
+                <dd>
+                  <a href="/spec.md" download="risala-spec.md">spec.md</a>
                 </dd>
               </div>
             )

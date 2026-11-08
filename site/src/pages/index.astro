@@ -28,25 +28,25 @@ const session = [
 ];
 
 const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" | "presence"; title: string; text: string }[] = [
-  { glyph: "#", tint: "location", title: "Independent servers", text: "No federation, and no server is special. Every conversation lives on exactly one server." },
-  { glyph: "@", tint: "mention", title: "Portable identity", text: "alice@example.org is whoever holds a key listed on example.org. The same identity works on any server." },
-  { glyph: "◆", tint: "ink", title: "End-to-end encrypted", text: "Direct conversations and private rooms use MLS. Devices keep their history keys, so encrypted history still syncs and works offline." },
+  { glyph: "◆", tint: "ink", title: "Everything encrypted", text: "Direct conversations, private rooms and public rooms all use MLS, with a new key for every message. Messages are deniable: one that leaks does not prove who wrote it." },
+  { glyph: "!", tint: "mode", title: "Zero trust in the server", text: "Devices check membership, roles and keys themselves. The server carries messages without learning who sent them, or who is in a private conversation." },
+  { glyph: "↺", tint: "ink", title: "No history on the server", text: "Encrypted messages wait only until devices fetch them. History moves between your own devices, with an optional backup only your recovery key opens." },
+  { glyph: "@", tint: "mention", title: "Portable identity", text: "alice@example.org is whoever controls a key file on example.org, and every key is in a log that public witnesses check." },
   { glyph: "Q", tint: "presence", title: "Post-quantum", text: "ML-KEM hybrid key exchange in TLS, X-Wing in MLS, and ML-DSA signatures for identities and devices." },
-  { glyph: "↺", tint: "ink", title: "Gapless history", text: "Every event has a sequence number, so a client that reconnects fetches exactly what it missed." },
-  { glyph: "$", tint: "mode", title: "Usable by hand", text: "Plain UTF-8 text lines. Everything outside encrypted conversations works from a terminal." },
+  { glyph: "#", tint: "location", title: "Independent servers", text: "No federation, and no server is special. Private rooms of up to 1,000 members, public rooms of up to 10,000." },
 ];
 ---
 
-<Base>
+<Base description="risala is a modern chat protocol for independent servers, in which every conversation is end-to-end encrypted and the server keeps no history.">
   <div class="home">
     <section class="panel intro">
       <img class="hudhud" src="/hudhud.png" alt="" width="901" height="1019" />
       <div>
-        <h1>a chat protocol for independent servers</h1>
+        <h1>a modern chat protocol for independent servers</h1>
         <p>
-          Rooms, guests, replies, reactions and stored history, in plain UTF-8 text lines over TLS.
-          Direct conversations and private rooms are end-to-end encrypted with MLS, using
-          post-quantum algorithms throughout.
+          Rooms, direct conversations, guests, replies and reactions, with every conversation
+          end-to-end encrypted, public rooms included. The server keeps no history and does not
+          learn who sends what. The spec is at draft-03, a design that the code is being moved to.
         </p>
         <div class="actions">
           <a class="button primary" href="/spec/">▲ read the spec</a>

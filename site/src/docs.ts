@@ -1,20 +1,18 @@
 // The documents the site publishes. They stay where they are in the
-// repository; the site reads them from there.
+// repository; the site reads them from there. For now there is one, the
+// spec, stitched from spec/ (see spec.ts and content.config.ts).
 
 export const REPO_URL = "https://github.com/risa-la/r";
-
-/** Paths relative to the repository root. */
-export const DOC_PATTERNS = ["SPEC.md"];
 
 /** Documents listed first, in this order; the rest follow by id. */
 const PINNED = ["spec"];
 
 /** Titles that differ from the document's first heading. */
 const TITLES: Record<string, string> = {
-  spec: "A Line-Based Chat Protocol",
+  spec: "A Modern Chat Protocol",
 };
 
-/** `SPEC.md` is `spec`; a file under `docs/` drops that prefix. */
+/** A file's page id: lower case, without `.md`, and without a `docs/` prefix. */
 export function docId(file: string): string {
   return file
     .replace(/^docs\//, "")

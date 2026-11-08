@@ -1,13 +1,14 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { REPO_URL, docId } from "../docs";
+import { REPO_URL } from "../docs";
+import { specAnchor } from "../spec";
 
 // Documents link to each other by file path (`../../PLAN.md#4-milestones`).
-// Point those links at the site's pages, and any other repository file at
-// its source on GitHub.
+// Point links into spec/ at their place on the spec's one page, and any
+// other repository file at its source on GitHub.
 
 const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
-const published = /^SPEC\.md$/;
+const specFile = /^spec\/([^/]+\.md)$/;
 
 export function siteUrl(href: string, fileURL: URL | undefined): string | undefined {
   if (!fileURL || /^([a-z]+:|#|\/)/i.test(href)) return;
@@ -15,10 +16,12 @@ export function siteUrl(href: string, fileURL: URL | undefined): string | undefi
   const file = path.resolve(path.dirname(fileURLToPath(fileURL)), target);
   const rel = path.relative(repoRoot, file).split(path.sep).join("/");
   if (rel.startsWith("..")) return;
-  const suffix = hash ? `#${hash}` : "";
-  return published.test(rel)
-    ? `/${docId(rel)}/${suffix}`
-    : `${REPO_URL}/blob/main/${rel}${suffix}`;
+  const spec = rel.match(specFile);
+  if (spec) {
+    const anchor = hash || specAnchor(spec[1]);
+    return anchor ? `/spec/#${anchor}` : "/spec/";
+  }
+  return `${REPO_URL}/blob/main/${rel}${hash ? `#${hash}` : ""}`;
 }
 
 type Ctx = {
