@@ -11,7 +11,7 @@ use risala_proto::time::Timestamp;
 
 use super::account::Batch;
 use super::*;
-use crate::store::{Draft, FailReason, Store};
+use crate::store::{Draft, FailReason, Store, StoreError};
 
 const SERVER: &str = "chat.example.org";
 
@@ -731,13 +731,25 @@ async fn the_timeline_shows_the_outbox_until_sent() {
         changes,
         events: Vec::new(),
     });
+    // It lands where the entry was: one update, keeping the entry's id.
+    let queued_id = timeline.items()[1].id.clone();
     match next().await.as_slice() {
-        [
-            TimelineDiff::Insert { index: 1, item },
-            TimelineDiff::Remove { index: 2 },
-        ] => assert_eq!((item.seq, item.outbox.is_none()), (2, true)),
+        [TimelineDiff::Update { index: 1, item }] => {
+            assert_eq!((item.seq, item.outbox.is_none()), (2, true));
+            assert_eq!(item.id, queued_id);
+        }
         other => panic!("{other:?}"),
     }
+    // The id is the cache's, not the timeline's: it survives a reload.
+    timeline.refresh().await.unwrap();
+    match next().await.as_slice() {
+        [TimelineDiff::Reset { items }] => assert_eq!(items[1].id, queued_id),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        general.messages(None, 10).unwrap().messages[1].id,
+        queued_id
+    );
 
     // Failed: updated in place, until the app removes it.
     let entry = general.send("again").await.unwrap();
@@ -771,6 +783,223 @@ async fn the_timeline_shows_the_outbox_until_sent() {
         [TimelineDiff::Remove { index: 2 }]
     ));
     assert_eq!(timeline.items().len(), 2);
+}
+
+/// Writes to the cache as the sync engine would, and tells the account's
+/// subscribers.
+fn write(account: &Account, f: impl FnOnce(&mut crate::store::Tx<'_>) -> Result<(), StoreError>) {
+    let shared = account.shared();
+    let ((), changes) = shared.store.write(f).unwrap();
+    shared.publish(Batch {
+        reload: false,
+        changes,
+        events: Vec::new(),
+    });
+}
+
+/// Stores `event` in `#general`.
+fn store_in_general(account: &Account, event: Event) {
+    let (id, conv) = (account.id(), "#general".parse::<Conv>().unwrap());
+    write(account, |tx| {
+        let row = tx.conv_by_name(id, &conv)?.unwrap();
+        tx.store_event(&row, &event)?;
+        Ok(())
+    });
+}
+
+/// Marks outbox entry `id` as being sent.
+fn sending(account: &Account, id: i64) {
+    let claim = crate::store::Claim {
+        instance: "test".into(),
+        connection: 1,
+    };
+    let now = Timestamp::from_unix_millis(1_800_000_000_000).unwrap();
+    write(account, |tx| {
+        tx.outbox_sending(crate::store::OutboxId(id), &claim, now)
+    });
+}
+
+fn sent(account: &Account, id: i64, seq: u64) {
+    write(account, |tx| {
+        tx.outbox_sent(crate::store::OutboxId(id), Seq::new(seq).unwrap())
+    });
+}
+
+#[tokio::test]
+async fn a_sent_message_keeps_its_id_whatever_the_order() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let timeline = general.timeline(50).unwrap();
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("diffs")
+            .expect("not closed")
+    };
+    let ids = |t: &Timeline| t.items().into_iter().map(|m| m.id).collect::<Vec<_>>();
+
+    // The event comes before its OK (5.3), in another batch. It is held
+    // back, so the message is never shown twice, then takes the entry's
+    // place.
+    let entry = general.send("hello").await.unwrap();
+    next().await;
+    sending(&sam, entry.id);
+    next().await;
+    let id = timeline.items()[1].id.clone();
+    store_in_general(&sam, event(2, "from=~sam MSG #general hello"));
+    sent(&sam, entry.id, 2);
+    match next().await.as_slice() {
+        [TimelineDiff::Update { index: 1, item }] => {
+            assert_eq!((item.seq, &item.id), (2, &id));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ids(&timeline), ["e1".to_owned(), id]);
+
+    // Someone else's message lands between: a remove and an insert.
+    let entry = general.send("again").await.unwrap();
+    next().await;
+    let id = timeline.items()[2].id.clone();
+    store_in_general(&sam, event(4, "from=~ann MSG #general between"));
+    next().await;
+    write(&sam, |tx| {
+        let row = tx
+            .conv_by_name(sam.id(), &"#general".parse().unwrap())?
+            .unwrap();
+        tx.store_event(&row, &event(3, "from=~sam MSG #general again"))?;
+        tx.outbox_sent(crate::store::OutboxId(entry.id), Seq::new(3).unwrap())
+    });
+    match next().await.as_slice() {
+        [
+            TimelineDiff::Remove { index: 3 },
+            TimelineDiff::Insert { index: 2, item },
+        ] => assert_eq!(item.id, id),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        timeline.items().iter().map(|m| m.seq).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+
+    // The OK comes for an event that is not stored yet: the entry goes,
+    // and the event arrives later with its id.
+    let entry = general.send("late").await.unwrap();
+    next().await;
+    let id = timeline.items()[4].id.clone();
+    sending(&sam, entry.id);
+    next().await;
+    sent(&sam, entry.id, 6);
+    assert_eq!(next().await, [TimelineDiff::Remove { index: 4 }]);
+    store_in_general(&sam, event(6, "from=~sam MSG #general late"));
+    match next().await.as_slice() {
+        [TimelineDiff::Insert { index: 4, item }] => assert_eq!(item.id, id),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_held_message_shows_when_its_entry_fails() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~sam;id=k1 JOIN #general")],
+    );
+    let timeline = general.timeline(50).unwrap();
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("diffs")
+            .expect("not closed")
+    };
+    let entry = general.send("hi").await.unwrap();
+    next().await;
+    sending(&sam, entry.id);
+    next().await;
+    // An own message with the same text, perhaps the entry's: held.
+    store_in_general(&sam, event(2, "from=~sam MSG #general hi"));
+    // The connection dropped before the OK: it is not the entry's after
+    // all, as far as anyone knows, so it shows under its own id.
+    write(&sam, |tx| {
+        tx.outbox_failed(crate::store::OutboxId(entry.id), FailReason::Unconfirmed)
+    });
+    match next().await.as_slice() {
+        [
+            TimelineDiff::Update {
+                index: 1,
+                item: failed,
+            },
+            TimelineDiff::Insert { index: 1, item },
+        ] => {
+            assert!(failed.outbox.is_some());
+            assert_eq!((item.seq, item.id.as_str()), (2, "e2"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        timeline.items().iter().map(|m| m.seq).collect::<Vec<_>>(),
+        [1, 2, 0]
+    );
+}
+
+#[tokio::test]
+async fn the_timeline_knows_when_it_reaches_the_start() {
+    let sam = guest();
+    let general = sam.conversation("#general").unwrap();
+    // A conversation the cache does not know has nothing older.
+    assert!(general.timeline(4).unwrap().at_start());
+
+    // Events 5 to 10: 1 to 4 are not stored, and may be on the server.
+    let events: Vec<Event> = (5..=10)
+        .map(|n| event(n, &format!("from=~ann MSG #general m{n}")))
+        .collect();
+    store_events(&sam, "#general", "k1", &events);
+    let timeline = general.timeline(4).unwrap();
+    assert!(!timeline.at_start());
+    // The cache runs out, but the server may have more.
+    assert!(timeline.paginate_back(4).await.unwrap());
+    assert!(!timeline.at_start());
+    let next = || async {
+        tokio::time::timeout(Duration::from_secs(5), timeline.next())
+            .await
+            .expect("diffs")
+            .expect("not closed")
+    };
+    assert_eq!(next().await.len(), 2);
+
+    // A HISTORY reply shows that 1 to 4 expired (7.5): the sync point
+    // moves past them. Nothing is inserted; an empty batch says so.
+    let (id, conv) = (sam.id(), "#general".parse::<Conv>().unwrap());
+    write(&sam, |tx| {
+        let mut row = tx.conv_by_name(id, &conv)?.unwrap();
+        tx.raise_sync_point(&mut row, 4)
+    });
+    assert!(next().await.is_empty());
+    assert!(timeline.at_start());
+
+    // History that starts at seq 1 is complete without a sync point.
+    let dev = sam.conversation("#dev").unwrap();
+    store_events(
+        &sam,
+        "#dev",
+        "k2",
+        &[
+            event(1, "from=~ann;id=k2 JOIN #dev"),
+            event(2, "from=~ann MSG #dev hi"),
+        ],
+    );
+    let timeline = dev.timeline(1).unwrap();
+    assert!(!timeline.at_start());
+    timeline.paginate_back(5).await.unwrap();
+    assert!(timeline.at_start());
 }
 
 #[test]

@@ -9,7 +9,7 @@ use tokio::sync::{Notify, broadcast};
 
 use super::account::{Batch, Conversation};
 use super::blocking;
-use super::types::{ClientError, Message, OutboxEntry, page_size};
+use super::types::{ClientError, Message, OutboxEntry, OutboxStatus, page_size};
 use crate::store::{
     AccountId, Change, ConvId, OutboxId, OutboxItem, OutboxState, Store, StoreError,
 };
@@ -31,7 +31,9 @@ pub enum TimelineDiff {
         /// The item.
         item: Message,
     },
-    /// The item at `index` changed: edited, deleted or reacted to.
+    /// The item at `index` changed: edited, deleted or reacted to, or an
+    /// outbox entry was replaced by its stored event. Its
+    /// [`id`](Message::id) stays the same.
     Update {
         /// Where.
         index: u32,
@@ -50,21 +52,34 @@ pub enum TimelineDiff {
 ///
 /// After the stored messages come the account's messages still in the
 /// outbox (7.6), queued, sending or failed, oldest first. They have seq 0
-/// and [`Message::outbox`] set. When one is sent, it is removed and its
-/// event is inserted in its place among the stored ones; when it fails, it
-/// is updated, and stays until the app removes it with
-/// [`Account::remove_outbox`](super::Account::remove_outbox). Edits and
-/// reactions in the outbox are not shown as items.
+/// and [`Message::outbox`] set. When one is sent, its stored event takes
+/// its place with the same [`Message::id`]: an [`Update`] when it stays
+/// at the same index, as it does unless others' messages came in between,
+/// or else a [`Remove`] of the entry and an [`Insert`] among the stored
+/// ones. When it fails, it is updated, and stays until the app removes it
+/// with [`Account::remove_outbox`](super::Account::remove_outbox). Edits
+/// and reactions in the outbox are not shown as items.
+///
+/// The server sends a message's event before the OK that names it (5.3).
+/// While an entry is being sent, an own event with the same text that
+/// arrives is held back until the OK says whether it is the entry's, so
+/// that the message is never shown twice. If the OK names an event that
+/// is not stored yet, the entry is removed, and the event is inserted
+/// with the entry's id when it arrives.
 ///
 /// It starts with the newest messages in the cache. Messages that arrive
 /// later are inserted in seq order, so a page of older history that
 /// catching up stores shows up in its place. [`paginate_back`] widens the
-/// window into older messages, from the cache and then from the server.
+/// window into older messages, from the cache and then from the server,
+/// until [`at_start`](Self::at_start).
 ///
 /// Get one from [`Conversation::timeline`]. Read the starting items with
 /// [`items`](Self::items), then call [`next`](Self::next) in a loop.
 ///
 /// [`paginate_back`]: Self::paginate_back
+/// [`Update`]: TimelineDiff::Update
+/// [`Remove`]: TimelineDiff::Remove
+/// [`Insert`]: TimelineDiff::Insert
 pub struct Timeline {
     conv: Conversation,
     state: Arc<Mutex<State>>,
@@ -93,8 +108,13 @@ struct State {
     items: Vec<Message>,
     /// Messages in the outbox, after the stored items, by outbox id.
     outbox: Vec<Message>,
+    /// Own stored messages not shown yet, by seq: each may be the event of
+    /// an outbox entry being sent, whose OK has not come.
+    held: Vec<Message>,
     /// The lowest seq in the window. `None`: every stored item is in it.
     floor: Option<u64>,
+    /// See [`Timeline::at_start`].
+    at_start: bool,
     /// Diffs from [`Timeline::paginate_back`] for [`Timeline::next`].
     pending: VecDeque<Vec<TimelineDiff>>,
 }
@@ -113,7 +133,9 @@ impl Timeline {
             row: None,
             items: Vec::new(),
             outbox: Vec::new(),
+            held: Vec::new(),
             floor: None,
+            at_start: false,
             pending: VecDeque::new(),
         };
         state.load(page_size(limit))?;
@@ -136,8 +158,23 @@ impl Timeline {
         self.state.lock().expect("poisoned").all()
     }
 
-    /// The next changes, in order. Waits until there are some. `None` once
-    /// the account has been removed.
+    /// Whether the window reaches the start of the conversation's history:
+    /// it holds every stored item, and the server keeps nothing older that
+    /// the cache lacks, because the sync point reaches the oldest item
+    /// (7.1), older events having expired (7.5) or never existed. Then
+    /// [`paginate_back`](Self::paginate_back) has nothing to add.
+    ///
+    /// It is `true` for a conversation the cache does not know, and turns
+    /// `false` when one is stored with history still to load. It reflects
+    /// every batch queued for [`next`](Self::next), so read it after each
+    /// one; a batch with no diffs means only this changed.
+    pub fn at_start(&self) -> bool {
+        self.state.lock().expect("poisoned").at_start
+    }
+
+    /// The next changes, in order. Waits until there are some, or until
+    /// [`at_start`](Self::at_start) changes, which comes as an empty batch.
+    /// `None` once the account has been removed.
     ///
     /// It is cancel-safe: if the future is dropped, as in a
     /// `tokio::select!` loop, no change is lost; the next call returns it.
@@ -167,12 +204,13 @@ impl Timeline {
                     blocking(&self.rt, move || {
                         let _rx = rx;
                         let mut st = state.lock().expect("poisoned");
+                        let was_at_start = st.at_start;
                         let diffs = match &reload {
                             Some(batch) => st.apply(&batch.changes),
                             None => st.reload(),
                         };
                         match diffs {
-                            Ok(diffs) if diffs.is_empty() => {}
+                            Ok(diffs) if diffs.is_empty() && st.at_start == was_at_start => {}
                             Ok(diffs) => st.pending.push_back(diffs),
                             Err(e) => tracing::warn!(error = %e, "timeline: reading the cache"),
                         }
@@ -213,14 +251,16 @@ impl Timeline {
     ///
     /// When the cache has no more, it asks the server for the page below
     /// (see [`Conversation::load_older`]), whose messages arrive through
-    /// `next` too, and returns `true`.
+    /// `next` too, and returns `true`. That is not the start of the
+    /// history; see [`at_start`](Self::at_start) for that.
     pub async fn paginate_back(&self, count: u32) -> Result<bool, ClientError> {
         let state = self.state.clone();
         let notify = self.notify.clone();
         let exhausted = blocking(&self.rt, move || -> Result<bool, StoreError> {
             let mut st = state.lock().expect("poisoned");
+            let was_at_start = st.at_start;
             let (diffs, exhausted) = st.older(page_size(count))?;
-            if !diffs.is_empty() {
+            if !diffs.is_empty() || st.at_start != was_at_start {
                 st.pending.push_back(diffs);
                 notify.notify_one();
             }
@@ -255,6 +295,26 @@ impl State {
         all
     }
 
+    /// Recomputes [`Timeline::at_start`].
+    fn check_start(&mut self) -> Result<(), StoreError> {
+        self.at_start = match (self.floor, self.resolve()?) {
+            (Some(_), _) => false,
+            (None, None) => true,
+            (None, Some(row)) => {
+                let lowest = self
+                    .items
+                    .first()
+                    .into_iter()
+                    .chain(self.held.first())
+                    .map(|m| m.seq)
+                    .min()
+                    .and_then(Seq::new);
+                self.store.complete_below(row, lowest)?
+            }
+        };
+        Ok(())
+    }
+
     /// Whether an outbox entry is shown as an item: a message or a reply
     /// that has not been sent yet, or failed. Not a DELETE (5.4).
     fn shows(item: &OutboxItem) -> bool {
@@ -274,6 +334,114 @@ impl State {
         Ok(())
     }
 
+    /// Whether own stored `item` may be the event of an outbox entry being
+    /// sent: one with the same text and reply.
+    fn awaits(&self, item: &Message) -> bool {
+        self.outbox.iter().any(|m| {
+            m.outbox
+                .as_ref()
+                .is_some_and(|e| e.status == OutboxStatus::Sending)
+                && m.text == item.text
+                && m.reply_to == item.reply_to
+        })
+    }
+
+    /// Shows stored item `item` at its seq: an insert, or an update of the
+    /// item there. An update that changes the id is a remove and an insert.
+    fn put(&mut self, item: Message, diffs: &mut Vec<TimelineDiff>) {
+        match self.items.binary_search_by_key(&item.seq, |m| m.seq) {
+            Ok(i) => {
+                let index = i as u32;
+                if self.items[i].id != item.id {
+                    diffs.push(TimelineDiff::Remove { index });
+                    diffs.push(TimelineDiff::Insert {
+                        index,
+                        item: item.clone(),
+                    });
+                } else {
+                    diffs.push(TimelineDiff::Update {
+                        index,
+                        item: item.clone(),
+                    });
+                }
+                self.items[i] = item;
+            }
+            Err(i) => {
+                self.items.insert(i, item.clone());
+                diffs.push(TimelineDiff::Insert {
+                    index: i as u32,
+                    item,
+                });
+            }
+        }
+    }
+
+    /// Shows a stored item that was inserted or changed. The event of an
+    /// outbox entry that is shown takes its place; an own message that
+    /// may be one is held back until its OK.
+    fn stored(&mut self, item: Message, diffs: &mut Vec<TimelineDiff>) {
+        if let Ok(h) = self.held.binary_search_by_key(&item.seq, |m| m.seq) {
+            if item.unclaimed_own() && self.awaits(&item) {
+                self.held[h] = item;
+                return;
+            }
+            self.held.remove(h);
+        }
+        if let Some(i) = self.outbox.iter().position(|m| m.id == item.id) {
+            self.replace_outbox(i, item, diffs);
+            return;
+        }
+        let shown = self
+            .items
+            .binary_search_by_key(&item.seq, |m| m.seq)
+            .is_ok();
+        if !shown && item.unclaimed_own() && self.awaits(&item) {
+            let at = self
+                .held
+                .binary_search_by_key(&item.seq, |m| m.seq)
+                .unwrap_or_else(|i| i);
+            self.held.insert(at, item);
+            return;
+        }
+        self.put(item, diffs);
+    }
+
+    /// Puts stored item `item`, the event of the outbox item at `i`, in its
+    /// place: an update when it lands at the same index, else a remove and
+    /// an insert.
+    fn replace_outbox(&mut self, i: usize, item: Message, diffs: &mut Vec<TimelineDiff>) {
+        let base = self.items.len();
+        self.outbox.remove(i);
+        match self.items.binary_search_by_key(&item.seq, |m| m.seq) {
+            Err(k) if i == 0 && k == base => {
+                self.items.push(item.clone());
+                diffs.push(TimelineDiff::Update {
+                    index: base as u32,
+                    item,
+                });
+            }
+            _ => {
+                diffs.push(TimelineDiff::Remove {
+                    index: (base + i) as u32,
+                });
+                self.put(item, diffs);
+            }
+        }
+    }
+
+    /// Shows the held messages that no entry being sent may claim any more.
+    fn release(&mut self, diffs: &mut Vec<TimelineDiff>) {
+        let mut h = 0;
+        while h < self.held.len() {
+            if self.awaits(&self.held[h]) {
+                h += 1;
+            } else {
+                let item = self.held.remove(h);
+                self.put(item, diffs);
+            }
+        }
+    }
+
     /// Applies a change to an outbox entry.
     fn outbox_changed(
         &mut self,
@@ -287,6 +455,25 @@ impl State {
         let at = self
             .outbox
             .binary_search_by_key(&id.get(), |m| m.outbox.as_ref().map_or(0, |o| o.id));
+        // Sent: its event takes its place, if it is stored and in the
+        // window with the entry's id.
+        if let (Some(OutboxState::Sent(seq)), Ok(i), Some(row)) =
+            (item.as_ref().map(|i| &i.state), at, self.resolve()?)
+        {
+            let seq = *seq;
+            let in_window = self.floor.is_none_or(|f| seq.get() >= f);
+            if in_window && let Some(event) = self.store.message(row, seq)? {
+                let event = Message::from(event);
+                if event.id == self.outbox[i].id {
+                    if let Ok(h) = self.held.binary_search_by_key(&event.seq, |m| m.seq) {
+                        self.held.remove(h);
+                    }
+                    self.replace_outbox(i, event, diffs);
+                    self.release(diffs);
+                    return Ok(());
+                }
+            }
+        }
         let base = self.items.len();
         match (item.filter(State::shows), at) {
             (Some(item), Ok(i)) => {
@@ -313,27 +500,30 @@ impl State {
             }
             (None, Err(_)) => {}
         }
+        self.release(diffs);
         Ok(())
     }
 
     fn load(&mut self, limit: u32) -> Result<(), StoreError> {
         self.items.clear();
+        self.held.clear();
         self.floor = None;
         self.load_outbox()?;
-        let Some(row) = self.resolve()? else {
-            return Ok(());
-        };
-        let items = self.store.timeline(row, None, limit as usize)?;
-        if items.len() >= limit as usize {
-            self.floor = items.first().map(|i| i.seq.get());
+        if let Some(row) = self.resolve()? {
+            let items = self.store.timeline(row, None, limit as usize)?;
+            if items.len() >= limit as usize {
+                self.floor = items.first().map(|i| i.seq.get());
+            }
+            self.items = items.into_iter().map(Message::from).collect();
         }
-        self.items = items.into_iter().map(Message::from).collect();
-        Ok(())
+        self.check_start()
     }
 
-    /// Reads the window again, after missed changes.
+    /// Reads the window again, after missed changes. Messages held back
+    /// for their OK are shown: the cache no longer says which came when.
     fn reload(&mut self) -> Result<Vec<TimelineDiff>, StoreError> {
         self.row = None;
+        self.held.clear();
         self.load_outbox()?;
         match self.resolve()? {
             Some(row) => {
@@ -361,6 +551,7 @@ impl State {
             }
             None => self.items.clear(),
         }
+        self.check_start()?;
         Ok(vec![TimelineDiff::Reset { items: self.all() }])
     }
 
@@ -385,27 +576,36 @@ impl State {
             })
             .collect();
         self.items.splice(0..0, older);
+        self.check_start()?;
         Ok((diffs, exhausted))
     }
 
     fn apply(&mut self, changes: &[Change]) -> Result<Vec<TimelineDiff>, StoreError> {
         let mut diffs = Vec::new();
+        // Whether the conversation changed, which may move the start.
+        let mut touched = false;
         for change in changes {
             let row = self.resolve()?;
             match *change {
                 Change::Cleared { conv } if Some(conv) == row => {
                     self.items.clear();
+                    self.held.clear();
                     self.floor = None;
+                    touched = true;
                     diffs.push(TimelineDiff::Reset { items: self.all() });
                 }
                 Change::ConversationRemoved { conv, .. } if Some(conv) == row => {
                     self.items.clear();
+                    self.held.clear();
                     self.floor = None;
                     self.row = None;
+                    touched = true;
                     diffs.push(TimelineDiff::Reset { items: self.all() });
                 }
+                Change::Conversation { conv } if Some(conv) == row => touched = true,
                 Change::Outbox { id } => self.outbox_changed(id, &mut diffs)?,
                 Change::Inserted { conv, seq } if Some(conv) == row => {
+                    touched = true;
                     if self.floor.is_some_and(|f| seq.get() < f) {
                         continue;
                     }
@@ -413,45 +613,34 @@ impl State {
                         // An edit, reaction or DELETE: it updates others.
                         continue;
                     };
-                    let item = Message::from(item);
-                    match self.items.binary_search_by_key(&seq.get(), |m| m.seq) {
-                        Ok(i) => {
-                            self.items[i] = item.clone();
-                            diffs.push(TimelineDiff::Update {
-                                index: i as u32,
-                                item,
-                            });
-                        }
-                        Err(i) => {
-                            self.items.insert(i, item.clone());
-                            diffs.push(TimelineDiff::Insert {
-                                index: i as u32,
-                                item,
-                            });
-                        }
-                    }
+                    self.stored(Message::from(item), &mut diffs);
                 }
                 Change::Updated { conv, seq } if Some(conv) == row => {
-                    let Ok(i) = self.items.binary_search_by_key(&seq.get(), |m| m.seq) else {
+                    touched = true;
+                    let by_seq = |m: &Message| m.seq;
+                    let held = self.held.binary_search_by_key(&seq.get(), by_seq);
+                    let shown = self.items.binary_search_by_key(&seq.get(), by_seq);
+                    if held.is_err() && shown.is_err() {
                         continue;
-                    };
+                    }
                     match self.store.message(conv, seq)? {
-                        Some(item) => {
-                            let item = Message::from(item);
-                            self.items[i] = item.clone();
-                            diffs.push(TimelineDiff::Update {
-                                index: i as u32,
-                                item,
-                            });
-                        }
+                        Some(item) => self.stored(Message::from(item), &mut diffs),
                         None => {
-                            self.items.remove(i);
-                            diffs.push(TimelineDiff::Remove { index: i as u32 });
+                            if let Ok(h) = held {
+                                self.held.remove(h);
+                            }
+                            if let Ok(i) = shown {
+                                self.items.remove(i);
+                                diffs.push(TimelineDiff::Remove { index: i as u32 });
+                            }
                         }
                     }
                 }
                 _ => {}
             }
+        }
+        if touched {
+            self.check_start()?;
         }
         Ok(diffs)
     }

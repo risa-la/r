@@ -805,6 +805,14 @@ pub struct ReactionCount {
 /// edits, deletion and reactions applied (5.3, 5.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    /// A stable id, unique within the conversation's timeline, for a UI to
+    /// key its rows by. It is opaque: compare it, but do not parse it.
+    ///
+    /// A message sent through the outbox (7.6) keeps one id from when it
+    /// is queued: once the server accepts it, its stored event has the
+    /// entry's id, so the UI moves the row rather than adding a new one.
+    /// Every other event's id comes from its seq.
+    pub id: String,
     /// Its seq.
     pub seq: u64,
     /// When the server accepted it, in milliseconds since the Unix epoch.
@@ -843,6 +851,16 @@ pub struct Message {
     pub outbox: Option<OutboxEntry>,
 }
 
+/// The [`Message::id`] of a message sent from outbox entry `id`.
+fn outbox_message_id(id: i64) -> String {
+    format!("o{id}")
+}
+
+/// The [`Message::id`] of any other stored event.
+fn event_message_id(seq: u64) -> String {
+    format!("e{seq}")
+}
+
 impl Message {
     /// A message in the outbox, shown as a timeline item from `uid`.
     pub(crate) fn outgoing(entry: OutboxEntry, uid: &str) -> Message {
@@ -850,6 +868,7 @@ impl Message {
             .map(|t| t.to_string())
             .unwrap_or_default();
         Message {
+            id: outbox_message_id(entry.id),
             seq: 0,
             time_ms: entry.created_ms,
             time,
@@ -865,6 +884,16 @@ impl Message {
             line: String::new(),
             outbox: Some(entry),
         }
+    }
+
+    /// Whether this is a stored event whose id is still its seq's, though
+    /// the account may have sent it through the outbox and be waiting for
+    /// the OK that names it (7.6).
+    pub(crate) fn unclaimed_own(&self) -> bool {
+        self.own
+            && self.outbox.is_none()
+            && self.kind == EventKind::Message
+            && self.id == event_message_id(self.seq)
     }
 }
 
@@ -906,6 +935,10 @@ impl From<TimelineItem> for Message {
             .to_line()
             .to_string();
         Message {
+            id: item.outbox.map_or_else(
+                || event_message_id(item.seq.get()),
+                |o| outbox_message_id(o.get()),
+            ),
             seq: item.seq.get(),
             time_ms: item.t.unix_millis(),
             time: item.t.to_string(),
