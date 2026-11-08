@@ -343,7 +343,7 @@ impl ScriptServer {
             .wait_for(|n| *n >= conns)
             .await
             .expect("the accept loop ended");
-        let scripts: Vec<_> = self.state.lock().unwrap().scripts.drain(..).collect();
+        let scripts = std::mem::take(&mut self.state.lock().unwrap().scripts);
         for s in scripts {
             s.await.unwrap();
         }
