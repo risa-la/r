@@ -68,6 +68,10 @@ pub const MESSAGE_KEY_LABEL: &str = "risala message key";
 /// The HKDF info prefix of backup keys, followed by the uid (12.10, 15).
 pub const BACKUP_INFO_PREFIX: &str = "risala backup ";
 
+/// The HKDF info prefix of the recovery signing key, the ML-DSA-44 key a
+/// recovery key gives, followed by the uid (12.10, PLAN.md 42).
+pub const RECOVERY_SIGNING_INFO_PREFIX: &str = "risala identity ";
+
 /// The most base64 characters any MLS value may have: the longest line a
 /// client may send (2.3). Longer values are `TooLong`.
 pub const MAX_BASE64_LEN: usize = MAX_LONG_CLIENT_LINE;
