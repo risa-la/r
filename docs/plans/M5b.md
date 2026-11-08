@@ -130,7 +130,7 @@ four writing code at once.
   spec tests (`tests/spec_*.rs`) pass over every example in `spec/`.
   Owns `crates/risala-proto/src/` except the files P2 and P4 own, its
   tests and fuzz targets.
-- [ ] **P2. Key files and identity formats** (4.3, 4.4, 4.8, 12.14):
+- [x] **P2. Key files and identity formats** (4.3, 4.4, 4.8, 12.14):
   `risala-keys/1` key files, the Record kinds (`master`, `signing`,
   `device`) with `previous` chaining, RisalaSign and its labels, the
   master key's derivation from the recovery key (`risala/1 identity `),
