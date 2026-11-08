@@ -380,7 +380,6 @@ pub(crate) fn post_kept(inner: &Arc<Inner>, mailbox: BoxName) {
 /// The device `device` of `uid` got a Welcome (12.8, 9.2): the keys area's
 /// WELCOME PUT calls this. Each of the device's account subscriptions gets
 /// a push, unless one is on its way.
-#[allow(dead_code, reason = "called by the keys area's WELCOME PUT (SV4)")]
 pub(crate) fn welcome_arrived(inner: &Arc<Inner>, uid: &Uid, device: DeviceId) {
     if !inner.config.push.enabled {
         return;

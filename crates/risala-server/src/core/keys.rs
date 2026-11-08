@@ -53,7 +53,7 @@ use risala_proto::time::Timestamp;
 use super::command::{Cx, Reply, err, misrouted};
 use super::rate::{WindowLimit, network};
 use super::state::{ConnEntry, Who};
-use super::{Hub, Inner, identity, mailbox};
+use super::{Hub, Inner, identity, mailbox, misc};
 use crate::config::Config;
 use crate::handler::{ConnHandle, ConnId};
 use crate::secret::{SecretHash, random_bytes, random_token};
@@ -659,8 +659,12 @@ async fn welcome_put(
         for handle in device_conns(inner, &uid, &device) {
             handle.send(ServerMessage::new(line.clone()));
         }
-        // TODO(SV5): push to the device's account subscriptions (9.2)
-        // with the reason `welcome`, once the push area is built.
+        // And a push to its account subscriptions (9.2).
+        misc::welcome_arrived(
+            inner,
+            &uid,
+            risala_proto::record::DeviceId::from_bytes(device),
+        );
     }
     Ok(OkResponse::new())
 }
