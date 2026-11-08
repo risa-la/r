@@ -143,3 +143,26 @@ pub(super) fn conn_closed(inner: &Arc<Inner>, id: ConnId, _conn: &ConnEntry) {
 /// The area's background work: expiring posts (7.5) and cids (7.6),
 /// forgetting unused token sets (7.2), and ending mailboxes (7.5).
 pub(super) async fn maintain(_inner: Arc<Inner>) {}
+
+/// The most a mailbox may hold at once, for INFO's `quota=` (7.5, 8.5), or
+/// `None` while the server sets none.
+///
+/// TODO(SV3): a stub added by SV5 (INFO) until quotas are built.
+pub(crate) fn quota(_inner: &Inner) -> Option<u64> {
+    None
+}
+
+/// The mailbox was dropped (10.4): nobody follows it any more.
+///
+/// TODO(SV3): added by SV5 for ADMIN DROP.
+pub(crate) fn dropped(inner: &Inner, mailbox: &BoxName) {
+    let mut follows = inner.mailbox.follows();
+    for conn in follows.by_box.remove(mailbox).unwrap_or_default() {
+        if let Some(boxes) = follows.by_conn.get_mut(&conn) {
+            boxes.remove(mailbox);
+            if boxes.is_empty() {
+                follows.by_conn.remove(&conn);
+            }
+        }
+    }
+}

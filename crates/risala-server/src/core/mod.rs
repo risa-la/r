@@ -175,6 +175,15 @@ pub(crate) struct Timers {
     pub(crate) presence_offline: Duration,
     /// How long presence changes are collected before they are sent (8.3).
     pub(crate) presence_batch: Duration,
+    /// The longest random delay before each subscription's push (9.2: 10
+    /// seconds by default).
+    pub(crate) push_delay: Duration,
+    /// The shortest time between two pushes to one subscription or URL
+    /// (9.2: 10 seconds).
+    pub(crate) push_interval: Duration,
+    /// How long a connection that follows with `quiet` has to show it is
+    /// alive before a push goes out anyway (9.2: 10 seconds).
+    pub(crate) push_liveness: Duration,
 }
 
 impl Timers {
@@ -185,6 +194,9 @@ impl Timers {
             guest_resume: Duration::from_secs(l.guest_resume_secs),
             presence_offline: Duration::from_secs(l.presence_offline_secs),
             presence_batch: Duration::from_millis(l.presence_batch_ms),
+            push_delay: Duration::from_secs(10),
+            push_interval: Duration::from_secs(10),
+            push_liveness: Duration::from_secs(10),
         }
     }
 }

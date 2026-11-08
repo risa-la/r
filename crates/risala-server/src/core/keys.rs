@@ -52,3 +52,56 @@ pub(super) fn conn_closed(_inner: &Arc<Inner>, _id: ConnId, _conn: &ConnEntry) {
 /// The area's background work: deleting KeyPackages whose lifetime has
 /// ended (12.5), and Welcomes, blobs and files past retention (7.5).
 pub(super) async fn maintain(_inner: Arc<Inner>) {}
+
+/// What INFO says about files and blobs (8.5): `upload=`, `blobs=` and
+/// `files=`.
+#[derive(Debug, Clone)]
+pub(crate) struct FilesInfo {
+    /// The largest upload, or `no`.
+    pub(crate) upload: risala_proto::server::Upload,
+    /// The URL prefix blobs are fetched from, if the server stores blobs.
+    pub(crate) blobs: Option<String>,
+    /// The origins of `get` URLs, only with uploads.
+    pub(crate) files: Vec<risala_proto::server::FileOrigin>,
+}
+
+/// INFO's `upload=`, `blobs=` and `files=` (8.5).
+///
+/// TODO(SV4): a stub added by SV5 (INFO) until uploads and blobs are
+/// built: no uploads, and no blob store.
+pub(crate) fn info(_inner: &Inner) -> FilesInfo {
+    FilesInfo {
+        upload: risala_proto::server::Upload::No,
+        blobs: None,
+        files: Vec::new(),
+    }
+}
+
+/// The bytes of the blob `blob`, if the server holds it (12.12), for a
+/// report of a post stored as a blob (5.8).
+///
+/// TODO(SV4): a stub added by SV5 (REPORT) until blobs are built.
+pub(crate) async fn blob_bytes(
+    _inner: &Inner,
+    _blob: &risala_proto::names::BlobRef,
+) -> Option<Vec<u8>> {
+    None
+}
+
+/// Keeps the uploaded files behind `urls` that are this server's, even if
+/// their uploader deletes them or they expire, until the report `report`
+/// is resolved (5.8).
+///
+/// TODO(SV4): a stub added by SV5 (REPORT) until uploads are built.
+pub(crate) async fn keep_files_for_report(
+    _inner: &Inner,
+    _report: &risala_proto::names::Id,
+    _urls: &[risala_proto::content::FileUrl],
+) {
+}
+
+/// The report `report` was resolved: the files it kept expire as usual
+/// again (5.8).
+///
+/// TODO(SV4): a stub added by SV5 (RESOLVE) until uploads are built.
+pub(crate) async fn release_files_for_report(_inner: &Inner, _report: &risala_proto::names::Id) {}

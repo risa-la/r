@@ -147,6 +147,8 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
             close_after: std::sync::Mutex::new(None),
         }
     };
+    // A line arrived: a connection that follows quietly is alive (9.2).
+    misc::heard(inner, id);
     if let Err(code) = command.check_kind(cx.who.kind()) {
         finish(&cx, Err(err(code)));
         return;
@@ -166,7 +168,20 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
         | Command::Register { .. }
         | Command::KeysPut { .. }
         | Command::Pair(_)
-        | Command::Unregister { .. }) => identity::handle(&cx, command).await,
+        | Command::Unregister { .. }) => {
+            let reply = identity::handle(&cx, command).await;
+            // A sign-in may bring an identity online (8.3).
+            if reply.is_ok() && cx.device().is_none() {
+                let uid = match inner.reg().conns.get(&id).map(|c| &c.who) {
+                    Some(Who::SignedIn(device)) => Some(device.uid.clone()),
+                    _ => None,
+                };
+                if let Some(uid) = uid {
+                    misc::signed_in(inner, &uid).await;
+                }
+            }
+            reply
+        }
         command @ (Command::Create { .. }
         | Command::Post { .. }
         | Command::GroupInfo { .. }

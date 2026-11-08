@@ -81,19 +81,39 @@ fn samples() -> Vec<String> {
         "ADMIN OPS".into(),
         "ADMIN BAN spam@example.net spam".into(),
         format!("ADMIN DROP {BOX}"),
-        "ADMIN SET guests no".into(),
+        // Not `guests no`, which would end the guest connection's session.
+        "ADMIN SET welcome hi".into(),
         "ADMIN UNREGISTER bob@example.org".into(),
         "RESOLVE r1".into(),
         "PING".into(),
     ]
 }
 
+/// Whether the command's area is built (misc and admin, SV5), so that its
+/// answer is its own: these tests check only that it got past the kind
+/// check. The areas' own tests check the answers.
+fn built(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Info { .. }
+            | Command::List { .. }
+            | Command::Presence { .. }
+            | Command::Watch { .. }
+            | Command::Whois { .. }
+            | Command::Members { .. }
+            | Command::Push(_)
+            | Command::Report { .. }
+            | Command::Resolve { .. }
+    ) || matches!(command, Command::Admin(a) if !matches!(a, AdminCommand::Unregister { .. }))
+}
+
 /// What the hub answers `request` on a connection of `kind`: the error of
 /// Section 13 if the kind may not send it, `forbidden` for ADMIN from
 /// someone who is not an operator (Section 10), `OK` for PING, and
 /// `not-supported` for every area's commands that are not built yet.
-/// `None` for the identity area's, which `identity.rs` tests: they get
-/// past the kind check, and answer for themselves.
+/// `None` for the identity area's, which `identity.rs` tests, and the misc
+/// and admin areas' (see [`built`]): they get past the kind check, and
+/// answer for themselves.
 fn expected(request: &Request, kind: ConnectionKind, operator: bool) -> Option<String> {
     let code = match request.command.check_kind(kind) {
         Err(code) => code.to_string(),
@@ -106,6 +126,7 @@ fn expected(request: &Request, kind: ConnectionKind, operator: bool) -> Option<S
             | Command::Pair(_)
             | Command::Unregister { .. }
             | Command::Admin(AdminCommand::Unregister { .. }) => return None,
+            command if built(command) => return None,
             _ => "not-supported".into(),
         },
     };
@@ -184,7 +205,11 @@ async fn section_13_by_hand() {
         // PAIR, PING, PONG and QUIT before a kind (4.1).
         (NEW, "INFO #general".into(), "ERR not-authenticated"),
         (NEW, format!("FOLLOW {BOX}"), "ERR not-authenticated"),
-        (NEW, "INFO".into(), "ERR not-supported"),
+        (
+            NEW,
+            "INFO".into(),
+            "OK version=1 anon=yes guests=yes register=no log=no retention=30 push=yes upload=no",
+        ),
         (
             NEW,
             "KEYS PUT - AAAA".into(),
@@ -247,11 +272,11 @@ async fn admin_commands_reach_their_area() {
     let mut h = Harness::new();
     let mut op = h.signed_in_as("op@example.org");
     for (line, want) in [
-        ("ADMIN OPS", "ERR not-supported"),
-        ("ADMIN UNREGISTER alice@example.org", "ERR not-found"),
+        ("ADMIN OPS", &["OP op@example.org", "OK"][..]),
+        ("ADMIN UNREGISTER alice@example.org", &["ERR not-found"][..]),
     ] {
         h.send(&op, line).await;
-        assert_eq!(op.lines(), [want], "{line}");
+        assert_eq!(op.lines(), want, "{line}");
     }
     // The route itself is the one the command table names.
     let unregister: Request = "ADMIN UNREGISTER a@example.org".parse().unwrap();
