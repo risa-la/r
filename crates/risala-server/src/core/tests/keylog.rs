@@ -25,7 +25,7 @@ use super::super::keylog::{
 use super::super::{Clock as _, Hub, ManualClock};
 use super::{T, config, timers};
 use crate::config::{Config, LogWitness};
-use crate::keyfiles::KeyServices;
+use crate::keyfiles::{KeyServices, MemoryFetcher, NoPublisher};
 use crate::store::{KeyLogStore as _, SqliteStore};
 
 const HOST: &str = "chat.example.org";
@@ -111,15 +111,33 @@ fn hub_on(config: Config, store: SqliteStore, clock: &Arc<ManualClock>) -> Hub {
     .unwrap()
 }
 
-/// A hub in witness mode that enrols log 1 of `chat.example.org`.
+/// The key file of log 1, as `chat.example.org` serves it (4.5).
+fn log1_key_file() -> String {
+    risala_keylog::hint::log_key_body(&risala_keylog::LogKey::from_vkey_str(&log1_vkey()).unwrap())
+}
+
+/// A hub in witness mode, which fetches the key of log 1 of
+/// `chat.example.org` from a [`MemoryFetcher`] that serves it, to enrol it
+/// (4.10).
 fn witness_hub(clock: &Arc<ManualClock>) -> Hub {
     let mut c = config();
     c.hostname = "witness-b.test".into();
     c.witness.enabled = true;
-    c.witness.logs = vec![log1_vkey()];
     let store = SqliteStore::open_in_memory().unwrap();
     store.witness_seed(HUB_W_SEED, T.parse().unwrap()).unwrap();
-    hub_on(c, store, clock)
+    let fetcher = MemoryFetcher::new();
+    let file = log1_key_file();
+    fetcher.serve_log(&format!("https://{}", origin(1)), move |path| {
+        (path == "risala/key").then(|| file.clone().into_bytes())
+    });
+    Hub::build(
+        c,
+        Arc::new(store),
+        clock.clone(),
+        timers(),
+        KeyServices::shared(Arc::new(fetcher), Arc::new(NoPublisher)),
+    )
+    .unwrap()
 }
 
 /// The witnesses, as the log reaches them: requests go straight to the
@@ -134,8 +152,15 @@ struct Witnesses {
 
 impl Witnesses {
     fn new(clock: &Arc<ManualClock>) -> Arc<Witnesses> {
+        let mut test = TestWitness::new(TEST_W, &TEST_W_SEED);
+        // chat.example.org serves log 1's key, for witnesses to enrol it
+        // (4.10).
+        test.key_files().serve(
+            &format!("https://{}/risala/key", origin(1)),
+            Some(log1_key_file().into_bytes()),
+        );
         Arc::new(Witnesses {
-            test: Mutex::new(TestWitness::new(TEST_W, &TEST_W_SEED)),
+            test: Mutex::new(test),
             hub: witness_hub(clock),
             clock: clock.clone(),
             down: Mutex::new(HashSet::new()),
@@ -155,14 +180,7 @@ impl Witnesses {
         let mut w = self.test.lock().unwrap();
         let now = self.clock.now().unix_millis() / 1000;
         let answer = match path {
-            "add-checkpoint" => {
-                // The operator gave the test witness log 1's key.
-                let log1 = risala_keylog::LogKey::from_vkey_str(&log1_vkey()).unwrap();
-                let req = AddCheckpoint::parse(body).unwrap();
-                let key = (req.checkpoint.checkpoint().origin() == origin(1)).then_some(&log1);
-                w.add_checkpoint_body(body, key, now)
-                    .map(String::into_bytes)
-            }
+            "add-checkpoint" => w.add_checkpoint_body(body, now).map(String::into_bytes),
             "risala/handoff" => w.handoff_body(body).map(|()| Vec::new()),
             _ => return (404, Vec::new()),
         };
@@ -287,6 +305,13 @@ async fn the_log_starts_empty_with_its_own_key() {
     assert_eq!(get(&hub, "/risala-log/01/checkpoint").await.0, 404);
     assert_eq!(get(&hub, "/risala-log/1/risala/next").await.0, 404);
     assert_eq!(hub.serve_log("/.well-known/risala/a").await, None);
+    // The log's key file, from the start, for witnesses to enrol it (4.5,
+    // 4.10).
+    let (status, body) = get(&hub, "/risala-log/1/risala/key").await;
+    assert_eq!(status, 200);
+    let served = risala_keylog::hint::parse_log_key(&body, &origin(1).parse().unwrap()).unwrap();
+    assert_eq!(served.verifier().vkey().to_string(), key.vkey());
+    assert_eq!(get(&hub, "/risala-log/2/risala/key").await.0, 404);
 
     // A server without an identity domain keeps no log by default.
     let plain = hub_on(config(), SqliteStore::open_in_memory().unwrap(), &clock);
@@ -729,9 +754,11 @@ async fn the_witness_answers_by_the_rules() {
         let w = witness.clone();
         async move { w.witness_request(path, body).await.unwrap() }
     };
+    // Log 1 of a host that serves no key file: 503, and the log tries
+    // again later (4.10).
     assert_eq!(
         ask("/risala-witness/add-checkpoint", body).await.status,
-        404
+        503
     );
     assert_eq!(
         ask("/risala-witness/add-checkpoint", b"junk".to_vec())
@@ -751,7 +778,7 @@ async fn the_witness_answers_by_the_rules() {
         None
     );
 
-    // Log 1 of chat.example.org, which the operator configured, enrols;
+    // Log 1 of chat.example.org, whose key file its host serves, enrols;
     // then a request from the wrong old size gets 409 with the size.
     let log = risala_keylog::testlog::MemoryLog::new(&origin(1).parse().unwrap(), &LOG_SEED);
     let enrol = AddCheckpoint {
@@ -820,20 +847,9 @@ fn log_and_witness_configuration() {
     assert!(
         bad(&|c| {
             c.witness.enabled = true;
-            c.witness.logs = vec!["nonsense".into()];
+            c.witness.name = Some("not a key name".into());
         })
-        .contains("witness.logs")
-    );
-    let log2 = Cosigner::from_seed(&origin(2), &[2; 32])
-        .unwrap()
-        .vkey()
-        .to_string();
-    assert!(
-        bad(&|c| {
-            c.witness.enabled = true;
-            c.witness.logs = vec![log2.clone()];
-        })
-        .contains("hand-off")
+        .contains("witness.name")
     );
     // The whole configuration refuses it too.
     let mut c = both();

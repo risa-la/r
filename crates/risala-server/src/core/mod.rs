@@ -350,7 +350,7 @@ impl Hub {
         let identity_domain = config.identity_domain();
         let inner = Inner {
             identity: identity::State::load(&config, &*store)?,
-            keylog: keylog::State::load(&config, &store, &*clock)?,
+            keylog: keylog::State::load(&config, &store, &*clock, key_files.fetcher.clone())?,
             mailbox: mailbox::State::load(&config, &*store)?,
             keys: keys::State::load(&config, &*store)?,
             misc: misc::State::load(&config, &*store)?,

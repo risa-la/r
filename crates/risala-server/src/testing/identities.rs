@@ -292,21 +292,17 @@ impl TestChain {
     /// The key file of the chain with every record unlogged, as `- `
     /// lines (4.4), each log at `https://<origin>`.
     pub fn key_file(&self) -> String {
-        KeyFile::from_chain(&self.chain(), &|_| None, &|log| {
-            format!("https://{}", log.origin())
-        })
-        .expect("a test chain makes a key file")
-        .to_text()
+        KeyFile::from_chain(&self.chain(), &|_| None)
+            .expect("a test chain makes a key file")
+            .to_text()
     }
 
     /// The key file of the chain with the records at the positions
     /// `logged` gives listed by their index (4.4).
     pub fn key_file_logged(&self, logged: &dyn Fn(usize) -> Option<u64>) -> String {
-        KeyFile::from_chain(&self.chain(), logged, &|log| {
-            format!("https://{}", log.origin())
-        })
-        .expect("a test chain makes a key file")
-        .to_text()
+        KeyFile::from_chain(&self.chain(), logged)
+            .expect("a test chain makes a key file")
+            .to_text()
     }
 }
 

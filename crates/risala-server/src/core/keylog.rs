@@ -12,8 +12,8 @@
 //!
 //! **Serving.** The HTTPS listener serves each log the server has run
 //! under `/risala-log/<n>`: its checkpoint, hash tiles and entry bundles
-//! [TLOG-TILES], and the hints `risala/uid/<hash>` and `risala/next`
-//! ([`Hub::serve_log`]). The URL prefix of the current log, and its
+//! [TLOG-TILES], the hints `risala/uid/<hash>` and `risala/next`, and its
+//! key file `risala/key` ([`Hub::serve_log`]). The URL prefix of the current log, and its
 //! verifier key, are what INFO reports as `log=` and `log-key=`
 //! ([`State::url`], [`State::vkey`]).
 //!
@@ -35,8 +35,13 @@
 //!
 //! **Witness mode.** With `[witness] enabled`, the server is also a
 //! witness for other servers' logs (4.10), at `/risala-witness`: a
-//! [`WitnessCore`] over the store ([`Hub::witness_request`]).
+//! [`WitnessCore`] over the store ([`Hub::witness_request`]). It enrols a
+//! host's first log with the key it fetches from
+//! `https://<host>/risala-log/1/risala/key`, through the hub's
+//! [`KeyFetcher`](crate::keyfiles::KeyFetcher), and each later log with the
+//! key of the hand-off it took.
 
+use crate::keyfiles::DynKeyFetcher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
@@ -47,14 +52,14 @@ use risala_keylog::addcheckpoint::AddCheckpoint;
 use risala_keylog::checkpoint::{Checkpoint, LogOrigin, SignedCheckpoint};
 use risala_keylog::cosig::{CosignatureVerifier, Cosigner};
 use risala_keylog::handoff::HandoffRequest;
-use risala_keylog::hint::{NEXT_PATH, UID_PATH, UidHint, next_body};
+use risala_keylog::hint::{KEY_PATH, NEXT_PATH, UID_PATH, UidHint, log_key_body, next_body};
 use risala_keylog::merkle::{Hash, leaf_hash};
 use risala_keylog::note::NoteSignature;
 use risala_keylog::proof::{consistency_proof, inclusion_proof, tree_hash};
 use risala_keylog::tile::{HashTiles, TILE_WIDTH, TileId, TileKind, encode_bundle};
 use risala_keylog::witnessing::{
-    CoreError, Handoff, LogState, MIN_INTERVAL, WitnessConfig as CoreConfig, WitnessCore,
-    WitnessRefusal, WitnessStore,
+    CoreError, Handoff, LogKeyFetcher, LogState, MIN_INTERVAL, WitnessConfig as CoreConfig,
+    WitnessCore, WitnessRefusal, WitnessStore,
 };
 use risala_proto::auth::PublicKey;
 use risala_proto::chain::Handoffs;
@@ -193,10 +198,8 @@ fn settings(config: &Config) -> Result<Option<Settings>, String> {
     }))
 }
 
-/// The witness's name and the first logs it enrols, from `[witness]`.
-fn witness_settings(
-    config: &Config,
-) -> Result<Option<(String, Vec<risala_keylog::LogKey>)>, String> {
+/// The witness's name, from `[witness]`.
+fn witness_settings(config: &Config) -> Result<Option<String>, String> {
     let w = &config.witness;
     if !w.enabled {
         return Ok(None);
@@ -208,19 +211,7 @@ fn witness_settings(
     if !risala_keylog::note::is_valid_key_name(&name) {
         return Err(format!("witness.name {name:?} is not a key name"));
     }
-    let mut logs = Vec::new();
-    for vkey in &w.logs {
-        let key = risala_keylog::LogKey::from_vkey_str(vkey)
-            .map_err(|e| format!("witness.logs: {vkey:?} is not a key log's verifier key: {e}"))?;
-        if key.origin().number() != 1 {
-            return Err(format!(
-                "witness.logs: {} is not a first log; later logs enrol by hand-off (4.10)",
-                key.origin()
-            ));
-        }
-        logs.push(key);
-    }
-    Ok(Some((name, logs)))
+    Ok(Some(name))
 }
 
 /// Checks `[log]` and `[witness]`, and returns warnings, for
@@ -358,9 +349,39 @@ impl Run {
 
 /// The server as a witness.
 struct WitnessSide {
-    core: Mutex<WitnessCore<StoreWitness>>,
-    /// The first logs it enrols, by origin.
-    enrols: HashMap<String, risala_keylog::LogKey>,
+    core: Mutex<WitnessCore<StoreWitness, HubLogKeys>>,
+}
+
+/// How the witness fetches the key file of a host's first log (4.10):
+/// through the hub's key fetcher, under the rules for fetching key files
+/// (4.4). The witness calls it on the blocking pool, holding its lock, for
+/// at most [`KEY_FETCH_TIMEOUT`](crate::keyfiles::KEY_FETCH_TIMEOUT), and
+/// at most once a minute for each origin.
+struct HubLogKeys(Arc<dyn DynKeyFetcher>);
+
+impl LogKeyFetcher for HubLogKeys {
+    fn fetch_log_key(&mut self, url: &str) -> Option<Vec<u8>> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let fetch = tokio::time::timeout(
+            crate::keyfiles::KEY_FETCH_TIMEOUT,
+            self.0.fetch_log_boxed(url),
+        );
+        match handle.block_on(fetch) {
+            Ok(Ok(crate::keyfiles::UrlBody::Ok(body))) => Some(body),
+            Ok(Ok(_)) => {
+                tracing::info!(url, "no log key file to enrol (4.10)");
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::info!(url, error = %e, "fetching a log key file failed (4.10)");
+                None
+            }
+            Err(_) => {
+                tracing::info!(url, "fetching a log key file timed out (4.10)");
+                None
+            }
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -385,6 +406,7 @@ impl State {
         config: &Config,
         store: &Arc<dyn Store>,
         clock: &dyn Clock,
+        fetcher: Arc<dyn DynKeyFetcher>,
     ) -> Result<State, StoreError> {
         let now = clock.now();
         let log = match settings(config).map_err(StoreError::Setup)? {
@@ -392,20 +414,19 @@ impl State {
             None => None,
         };
         let witness = match witness_settings(config).map_err(StoreError::Setup)? {
-            Some((name, logs)) => {
+            Some(name) => {
                 let seed = store.witness_seed(random_seed()?, now)?;
                 let cosigner = Cosigner::from_seed(&name, &seed)
                     .map_err(|e| StoreError::Setup(format!("witness key: {e}")))?;
-                let core =
-                    WitnessCore::new(cosigner, StoreWitness(store.clone()), CoreConfig::default());
+                let core = WitnessCore::new(
+                    cosigner,
+                    StoreWitness(store.clone()),
+                    HubLogKeys(fetcher),
+                    CoreConfig::default(),
+                );
                 tracing::info!(vkey = %core.vkey(), "acting as a key log witness (4.10)");
-                let enrols = logs
-                    .into_iter()
-                    .map(|k| (k.origin().to_string(), k))
-                    .collect();
                 Some(WitnessSide {
                     core: Mutex::new(core),
-                    enrols,
                 })
             }
             None => None,
@@ -1223,6 +1244,13 @@ impl Hub {
                     None => Answer::status(404),
                 });
             }
+            // Every log serves its key, for witnesses to enrol it (4.5).
+            if rest == KEY_PATH {
+                return Some(match risala_keylog::LogKey::new(run.cosigner.verifier()) {
+                    Ok(key) => Answer::ok(TEXT, log_key_body(&key).into_bytes()),
+                    Err(_) => Answer::status(500),
+                });
+            }
             if rest.starts_with(UID_PATH) {
                 None
             } else {
@@ -1318,12 +1346,7 @@ impl Hub {
             let Ok(rnd) = crate::secret::random_bytes() else {
                 return Answer::status(500);
             };
-            let key = witness.enrols.get(req.checkpoint.checkpoint().origin());
-            let mut core = lock(&witness.core);
-            let result = match key {
-                Some(key) => core.enrol(key, &req, now, rnd),
-                None => core.add_checkpoint(&req, now, rnd),
-            };
+            let result = lock(&witness.core).add_checkpoint(&req, now, rnd);
             match result {
                 Ok(sigs) => Answer::ok(
                     TEXT,

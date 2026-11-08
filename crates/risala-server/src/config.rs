@@ -164,13 +164,11 @@ pub struct WitnessConfig {
     pub enabled: bool,
     /// The name of the witness's key. The default is
     /// `<hostname>/risala-witness`.
+    ///
+    /// Enrolment needs no configuration: the witness fetches the key of a
+    /// host's first log from `https://<host>/risala-log/1/risala/key`, and
+    /// takes later logs' keys from hand-offs (4.10).
     pub name: Option<String>,
-    /// The verifier keys of the first logs (`<host>/risala-log/1`) the
-    /// witness enrols. An `add-checkpoint` request does not carry the log's
-    /// key, so the operator gives it here, from somewhere they trust (for
-    /// example the host's INFO `log-key=`). Later logs of a host enrol
-    /// through hand-offs, with no configuration (4.10).
-    pub logs: Vec<String>,
 }
 
 /// Push notifications (Section 9): PUSH ADD, and sending pushes over

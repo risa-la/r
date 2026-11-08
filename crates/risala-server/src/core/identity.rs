@@ -646,16 +646,10 @@ fn close_devices(inner: &Inner, uid: &Uid, keep: impl Fn(&PublicKey) -> bool) {
 // ---------------------------------------------------------------------------
 // The key log (4.5), through the key log area
 
-/// The URL prefix of a key log: `https://` and its origin (4.5).
-fn log_url(log: &LogKey) -> String {
-    format!("https://{}", log.origin())
-}
-
 /// The server's current key log, as a key file's `log` line names it
-/// (4.4), if it keeps one.
+/// (4.4), at `https://` and its origin, if it keeps one.
 pub(super) fn current_log(inner: &Inner) -> Option<LogLine> {
-    let key = inner.keylog.current_log()?;
-    LogLine::new(key.clone(), &log_url(&key))
+    Some(LogLine::new(inner.keylog.current_log()?))
 }
 
 /// Logs `records` of `identity`, in chain order, and returns the index of
@@ -868,12 +862,8 @@ pub(super) fn hosted_key_file(inner: &Inner, name: &Name) -> std::io::Result<Hos
         return Ok(HostedKeyFile::Gone);
     }
     let stored = store.chain_records(&hosted.identity).map_err(io)?;
-    let file = KeyFile::from_chain(
-        &chain,
-        &|i| stored.get(i).and_then(|r| r.log_index),
-        &|log| log_url(log),
-    )
-    .map_err(|e| std::io::Error::other(format!("the key file of {name}: {e}")))?;
+    let file = KeyFile::from_chain(&chain, &|i| stored.get(i).and_then(|r| r.log_index))
+        .map_err(|e| std::io::Error::other(format!("the key file of {name}: {e}")))?;
     Ok(HostedKeyFile::File(file.to_text().into_bytes()))
 }
 

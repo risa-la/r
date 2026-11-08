@@ -299,14 +299,14 @@ mod tests {
         config.witness.enabled = true;
         let hub = Hub::new(config, crate::store::SqliteStore::open_in_memory().unwrap()).unwrap();
         let keys: Arc<dyn super::super::KeyFiles> = Arc::new(hub);
-        // A request for a log the witness does not know: 404 once the body
-        // parses, 400 if it does not.
+        // A request for a log the witness does not know, that does not
+        // enrol it: 404 once the body parses, 400 if it does not.
         let log = risala_keylog::testlog::MemoryLog::new(
             &"other.example/risala-log/1".parse().unwrap(),
             &[3; 32],
         );
         let body = risala_keylog::addcheckpoint::AddCheckpoint {
-            old_size: 0,
+            old_size: 1,
             proof: vec![],
             checkpoint: log.checkpoint(100),
         }
@@ -411,12 +411,25 @@ mod tests {
 
         let mut wc = base("witness");
         wc.witness.enabled = true;
-        wc.witness.logs = vec![log_vkey.clone()];
         SqliteStore::open(&wc.database_path())
             .unwrap()
             .witness_seed(witness_seed, t)
             .unwrap();
-        let witness = Daemon::bind(wc).await.unwrap();
+        // The witness fetches log 1's key from `https://localhost/...`, on
+        // port 443 (4.10), which the test cannot listen on: it gets the
+        // file the log serves from memory instead.
+        let key_file = risala_keylog::hint::log_key_body(
+            &risala_keylog::LogKey::from_vkey_str(&log_vkey).unwrap(),
+        );
+        let fetcher = crate::keyfiles::MemoryFetcher::new();
+        fetcher.serve_log("https://localhost/risala-log/1", move |path| {
+            (path == "risala/key").then(|| key_file.clone().into_bytes())
+        });
+        let keys = crate::keyfiles::KeyServices::shared(
+            Arc::new(fetcher),
+            Arc::new(crate::keyfiles::NoPublisher),
+        );
+        let witness = Daemon::bind_with_keys(wc, keys).await.unwrap();
         let witness_port = witness.http_addrs()[0].port();
         let (stop_w, stopped_w) = tokio::sync::oneshot::channel::<()>();
         let witness_task = tokio::spawn(witness.run(async {
@@ -512,7 +525,14 @@ mod tests {
         let hint = risala_keylog::hint::uid_hint_path("alice@example.org");
         assert_eq!(
             client.get(&format!("{prefix}/{hint}")).await.unwrap(),
-            (200, b"0\n".to_vec())
+            (200, b"risala-hint/1\n0\n".to_vec())
+        );
+        // And the log's key file, which the witness enrolled it with.
+        let (status, data) = client.get(&format!("{prefix}/risala/key")).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            risala_keylog::hint::parse_log_key(&data, &"localhost/risala-log/1".parse().unwrap()),
+            Ok(risala_keylog::LogKey::from_vkey_str(&log_vkey).unwrap())
         );
         // The witness answers nothing but POSTs under its path.
         let w = format!("https://localhost:{witness_port}/risala-witness/add-checkpoint");
