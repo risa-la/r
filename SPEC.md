@@ -1453,8 +1453,8 @@ SET <room> <key> [<value...>]
   server removes them from the room, recording a PART for each. Their
   sessions and their other rooms are not affected (4.2).
 - `retention <days>`: events older than this many days are deleted
-  (7.5). The value MUST be at least 1, and MUST NOT be longer than the
-  server's own retention period (`ERR forbidden`). Shortening it also
+  (7.5). The value MUST be at least 1 (`ERR bad-syntax`), and MUST NOT
+  be longer than the server's own retention period (`ERR forbidden`). Shortening it also
   applies to events already stored.
 - `retention server`: the room follows the server's retention period.
 - `e2ee yes`: the room is end-to-end encrypted (Section 12). INIT turns
@@ -1474,7 +1474,8 @@ SET <room> <key> [<value...>]
 
 Keyword and number values ignore trailing spaces, so `SET #r public yes `
 works. A topic keeps its spaces. An unknown key gets
-`ERR not-supported`.
+`ERR not-supported`. Setting a key to the value it already has records
+nothing, and gets a plain `OK`.
 
 ```
 INFO <room>
@@ -1509,6 +1510,8 @@ membership:
   without an invitation, even in a private room, and have the role back.
   An encrypted room is the exception: there, coming back always takes a
   new invitation (12.6).
+- They keep the role's rights while they are away, for example to read
+  the room, change its settings or moderate it.
 - KICK and BAN take the role away.
 - A room therefore never loses its owners because they left.
 
@@ -1522,7 +1525,10 @@ membership:
 | ROLE | | | ✓ |
 
 - Moderators may kick and ban only plain members. Owners may act on
-  anyone, including other owners.
+  anyone, including other owners. Server operators count as owners here,
+  so moderators cannot kick or ban them.
+- A room's only owner cannot KICK or BAN themselves
+  (`ERR last-owner`), since the room would be left without one.
 - Guests in a room with `guests read` cannot send messages, reactions or
   typing notifications.
 - Server operators (Section 10) have owner rights in every room, and may
@@ -1536,9 +1542,12 @@ ROLE <room> <uid> <role>
 → ROLE event, then `OK seq=<seq>`
 
 The target must be an identity that is a member of the room, or that
-holds the role `owner` or `mod` in it. Setting the role of someone who
+holds the role `owner` or `mod` in it (`ERR not-found`). Guests cannot
+hold roles (`ERR forbidden`). Setting the role of someone who
 has left to `member` takes their role away. If an owner is the room's
 only owner, they cannot change their own role (`ERR last-owner`).
+Setting the role someone already has records nothing, and gets a plain
+`OK`.
 
 ```
 ROLES <room>
@@ -1562,7 +1571,9 @@ BANS <room>
 - `INVITE` records an INVITE event, which lets an identity join a private
   room. The event also goes to the invitee's connections, so their
   client can offer to join. The invitation lasts until it is used or the
-  invitee is banned. Guests cannot be invited. Inviting someone who is
+  invitee is banned, and someone who is banned cannot be invited
+  (`ERR forbidden`): unban them first. Guests cannot be invited.
+  Inviting someone who is
   already a member records nothing, and gets a plain `OK`. So a client
   that receives an INVITE for its own account knows the server does not
   count it as a member, and SHOULD send SYNC if it thought it was one.
@@ -1571,13 +1582,19 @@ BANS <room>
   the role of someone who has left, use ROLE (6.3) or BAN.
 - `BAN` removes a member, if they are one, and stops them from joining.
   Banning a guest uid has little effect, because guest names get reused.
-  A server MAY ban the guest's network address instead.
-- `UNBAN` lifts a ban.
+  A server MAY ban the guest's network address instead. BAN of someone
+  who is already banned, and not a member, records nothing: it replaces
+  the ban's reason, and gets a plain `OK`.
+- `UNBAN` lifts a ban. UNBAN of someone who is not banned gets
+  `ERR not-found`.
 - `BANS` lists the current bans as snapshot `BAN <room> <uid>
   [<reason...>]` lines, then OK.
 
 INVITE, KICK, BAN and UNBAN reply `OK seq=<seq>`. The KICK or BAN event
-also goes to its target, before the target stops receiving the room.
+also goes to its target, before the target stops receiving the room. A
+BAN event reaches a target who is not a member only if they could see
+the room before the ban (6.1), so that a ban made in advance does not
+reveal a private room.
 An INVITE event that reaches an invitee who is not a member, and a KICK
 or BAN event that reaches its target, are notifications. They do not
 make the receiver a member, and a client that is not a member does not
@@ -2142,7 +2159,8 @@ ADMIN DEOP <uid>
 - **`ADMIN OP`** makes an identity an operator. Guests cannot be
   operators.
 - **`ADMIN DEOP`** removes an operator. Operators named in the server's
-  configuration cannot be removed this way (`ERR forbidden`).
+  configuration cannot be removed this way (`ERR forbidden`). DEOP of
+  someone who is not an operator gets `ERR not-found`.
 
 A server's first operators come from its configuration. An identity
 learns it is an operator from the `op=yes` value when it signs in (4.5).
@@ -2166,18 +2184,22 @@ of these:
 | A network address or prefix | `203.0.113.7`, `2001:db8::/32` | No guest can connect from it |
 
 - **Identity and domain bans.** AUTH and REGISTER reply `ERR forbidden`
-  for a banned identity. A banned identity's open connections are closed
-  with BYE. A domain ban is useful because one domain can mint any
+  for a banned identity. They check the signature first, and reply
+  `ERR auth-failed` if it does not verify, so that only someone holding
+  the identity's key learns that it is banned. A banned identity's open
+  connections are closed with BYE. A domain ban is useful because one domain can mint any
   number of identities.
 - **Address bans** apply only to guests. People with identities who
   happen to share an address with a spammer, such as at a university or
   on a mobile network, are not affected. Ban identities one at a time or
-  by domain instead.
+  by domain instead. A new address ban also ends the sessions of the
+  guests connected from inside it, with BYE.
 - **Banning a guest** bans the address it is connected from: the
   IPv4 address itself, or the IPv6 `/64` that contains it, since one
   IPv6 user usually holds a whole `/64`. It also closes the guest's
-  connection. BANS lists the
-  ban under the address it applies to.
+  connection. BANS lists the ban under the address it applies to, and
+  ADMIN UNBAN takes that address, not the guest's uid.
+- **`ADMIN UNBAN`** of a target that is not banned gets `ERR not-found`.
 - **Banning deletes nothing.** Use ADMIN PURGE (10.4) to remove what a
   user has sent.
 - **`ADMIN BANS`** sends one `SERVERBAN <target> [<reason...>]` line per
@@ -2198,6 +2220,8 @@ ADMIN NOTICE <message...>
   shown with the uid `-`.
 - **`ADMIN DISCONNECT`** closes every connection of `<uid>`, sending
   `BYE` with the reason. The user can reconnect; ban them to stop that.
+  For a guest, it also ends a session waiting to be resumed (4.2). A uid
+  with no connection and no session gets `ERR not-found`.
 - **`ADMIN NOTICE`** sends `NOTICE <message...>` to every open connection.
 
 ### 10.4. Rooms and Content
@@ -2284,8 +2308,9 @@ As in 6.2, keyword and number values ignore trailing spaces, and the
 welcome text keeps them.
 
 - Changes take effect immediately and show in INFO (8.5).
-- Setting `guests` to `no` also ends the sessions of the guests already
-  connected: each gets `BYE`, and leaves its rooms as in 4.2.
+- Setting `guests` to `no` also ends every guest session: guests
+  connected now get `BYE`, sessions waiting to be resumed (4.2) end too,
+  and every guest leaves its rooms as in 4.2.
 - Shortening `retention` also applies to events already stored.
 - Settings not listed here are left to the server's configuration.
 

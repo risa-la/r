@@ -2137,6 +2137,9 @@ impl crate::store::ModerationStore for Flaky {
     fn room_bans(&self, c: ConvKey) -> crate::store::Result<Vec<(Uid, String)>> {
         self.inner.room_bans(c)
     }
+    fn set_room_ban_reason(&self, c: ConvKey, u: &Uid, r: &str) -> crate::store::Result<()> {
+        self.inner.set_room_ban_reason(c, u, r)
+    }
 }
 
 // (reports)

@@ -83,6 +83,16 @@ fn check_outranks(have: Role, target: Role) -> Result<(), Fail> {
 
 /// The role a SET of `setting` takes (6.2), or the error for a key that
 /// nobody may set.
+/// Refuses KICK or BAN of yourself as the room's only owner, which would
+/// leave it with none (6.3, PLAN.md 5, item 31).
+fn check_not_last_owner(info: &RoomInfo, asker: &Uid, target: &Uid) -> Result<(), Fail> {
+    let owners = info.roles.values().filter(|r| **r == Role::Owner).count();
+    if asker == target && info.roles.get(target) == Some(&Role::Owner) && owners == 1 {
+        return Err(fail(ErrorCode::LastOwner, "you are the only owner"));
+    }
+    Ok(())
+}
+
 fn needed_for(setting: &RoomSetting) -> Result<Role, Fail> {
     match setting {
         RoomSetting::Topic(_) => Ok(Role::Mod),
@@ -199,6 +209,12 @@ impl Inner {
             ));
         }
 
+        // Setting the value a room already has records nothing (PLAN.md 5,
+        // item 31).
+        if info.settings.to_settings().contains(&setting) {
+            return Ok(Some(OkResponse::new()));
+        }
+
         let event = self
             .record(st, uid, EventKind::Set(setting.clone()))
             .await?;
@@ -270,6 +286,10 @@ impl Inner {
         if target == *uid && held == Some(Role::Owner) && role != Role::Owner && owners == 1 {
             return Err(fail(ErrorCode::LastOwner, "you are the only owner"));
         }
+        // The role they already have records nothing (PLAN.md 5, item 31).
+        if held.unwrap_or(Role::Member) == role {
+            return Ok(Some(OkResponse::new()));
+        }
 
         let kind = EventKind::Role {
             uid: target.clone(),
@@ -320,6 +340,10 @@ impl Inner {
         if target.is_guest() {
             return Err(fail(ErrorCode::Forbidden, "guests cannot be invited"));
         }
+        // An invitation and a ban never coexist (6.4).
+        if info.bans.contains(&target) {
+            return Err(fail(ErrorCode::Forbidden, "banned; unban first"));
+        }
         // M5a: `ERR encrypted` in an encrypted room, where a COMMIT invites.
         // A member needs no invitation: nothing is recorded (6.4).
         if st.is_member(&target) {
@@ -349,6 +373,7 @@ impl Inner {
             return Err(fail(ErrorCode::NotFound, "not a member"));
         }
         check_outranks(have, rights(info, self.asker(&target, true)))?;
+        check_not_last_owner(info, uid, &target)?;
 
         let kind = EventKind::Kick {
             uid: target.clone(),
@@ -373,6 +398,20 @@ impl Inner {
         let member = st.is_member(&target);
         let have = check_rights(info, self.asker(uid, st.is_member(uid)), Role::Mod)?;
         check_outranks(have, rights(info, self.asker(&target, member)))?;
+        check_not_last_owner(info, uid, &target)?;
+        // BAN of someone already banned, and gone, records nothing and only
+        // replaces the reason (PLAN.md 5, item 31). An operator may be in a
+        // room they are banned from (6.3), so a member is banned again.
+        if info.bans.contains(&target) && !member {
+            let conv = st.key;
+            self.db(move |s| s.set_room_ban_reason(conv, &target, &reason))
+                .await?;
+            return Ok(Some(OkResponse::new()));
+        }
+        // Only someone who could see the room hears of the ban, so that a
+        // ban made in advance does not reveal a private room (PLAN.md 5,
+        // item 31).
+        let could_see = visible(info, self.asker(&target, member));
 
         let kind = EventKind::Ban {
             uid: target.clone(),
@@ -385,7 +424,9 @@ impl Inner {
             info.invites.remove(&target);
         }
         Self::broadcast_event(st, &event);
-        self.notify(st, &event, &target);
+        if could_see {
+            self.notify(st, &event, &target);
+        }
         st.remove_member(&target);
         Ok(Some(OkResponse::new().with_seq(event.seq)))
     }

@@ -293,6 +293,10 @@ async fn identity_and_domain_bans() {
         refused,
         ["ERR forbidden this identity is banned from this server"]
     );
+    // Only someone holding a key learns of the ban: the signature is
+    // checked first (PLAN.md 5, item 31).
+    let (_c, refused) = w.auth("bob@spam.example", 9).await;
+    assert_eq!(refused, ["ERR auth-failed the signature did not verify"]);
     // `spam.example` itself is a domain, not an identity, and
     // `notspam.example` is not a subdomain.
     w.fetcher

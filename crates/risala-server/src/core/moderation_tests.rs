@@ -402,14 +402,14 @@ async fn the_only_owner_cannot_change_their_own_role() {
     // Setting it to owner again changes nothing, and is allowed.
     assert_eq!(
         last(&h, &mut alice, "role #general alice@example.org owner").await,
-        "OK seq=9"
+        "OK"
     );
     // With a second owner, either may step down.
     h.send(&alice, "role #general bob@example.org owner").await;
     alice.lines();
     assert_eq!(
         last(&h, &mut alice, "role #general alice@example.org mod").await,
-        "OK seq=11"
+        "OK seq=10"
     );
     bob.lines();
     assert_eq!(
@@ -982,4 +982,108 @@ async fn a_failed_store_changes_nothing() {
     let room = h.store.room(&general).unwrap().unwrap();
     assert!(room.invites.is_empty());
     assert_eq!(room.settings.guests, GuestAccess::Write);
+}
+
+// ---------------------------------------------------------------------------
+// Decided while building M4 (PLAN.md 5, item 31)
+
+#[tokio::test]
+async fn changes_that_change_nothing_record_nothing() {
+    let mut h = harness();
+    let [mut alice, mut bob] = sign_in(&mut h, [ALICE, BOB]);
+    assert_eq!(
+        last(&h, &mut alice, "set #general topic hello").await,
+        "OK seq=9"
+    );
+    bob.lines();
+    // The same value, a role already held, and a ban again: plain OK, and
+    // no event reaches anyone.
+    for cmd in [
+        "set #general topic hello",
+        "set #general public yes",
+        "role #general bob@example.org mod",
+        "role #general carol@example.net member",
+    ] {
+        h.send(&alice, cmd).await;
+        assert_eq!(alice.lines(), ["OK"], "{cmd}");
+        assert_eq!(bob.lines(), none(), "{cmd}");
+    }
+    assert_eq!(
+        last(&h, &mut alice, "ban #general dave@example.net spam").await,
+        "OK seq=10"
+    );
+    bob.lines();
+    // BAN again only replaces the reason.
+    h.send(&alice, "ban #general dave@example.net lots of spam")
+        .await;
+    assert_eq!(alice.lines(), ["OK"]);
+    assert_eq!(bob.lines(), none());
+    h.send(&alice, "bans #general").await;
+    assert_eq!(
+        alice.lines(),
+        ["BAN #general dave@example.net lots of spam", "OK"]
+    );
+    // The next event takes the next seq: none was used up.
+    assert_eq!(
+        last(&h, &mut alice, "set #general topic bye").await,
+        "OK seq=11"
+    );
+}
+
+#[tokio::test]
+async fn a_banned_identity_cannot_be_invited() {
+    let mut h = harness();
+    let [mut alice] = sign_in(&mut h, [ALICE]);
+    h.send(&alice, "ban #private dave@example.net").await;
+    alice.lines();
+    assert_eq!(
+        last(&h, &mut alice, "invite #private dave@example.net").await,
+        "ERR forbidden banned; unban first"
+    );
+    h.send(&alice, "unban #private dave@example.net").await;
+    alice.lines();
+    assert_eq!(
+        last(&h, &mut alice, "invite #private dave@example.net").await,
+        "OK seq=6"
+    );
+}
+
+#[tokio::test]
+async fn the_only_owner_cannot_kick_or_ban_themselves() {
+    let mut h = harness();
+    let [mut alice] = sign_in(&mut h, [ALICE]);
+    for cmd in [
+        "kick #general alice@example.org",
+        "ban #general alice@example.org",
+    ] {
+        assert_eq!(
+            last(&h, &mut alice, cmd).await,
+            "ERR last-owner you are the only owner",
+            "{cmd}"
+        );
+    }
+    // With a second owner, they may.
+    h.send(&alice, "role #general bob@example.org owner").await;
+    alice.lines();
+    assert_eq!(
+        last(&h, &mut alice, "kick #general alice@example.org").await,
+        "OK seq=10"
+    );
+}
+
+#[tokio::test]
+async fn a_ban_reaches_its_target_only_if_they_could_see_the_room() {
+    let mut h = harness();
+    let [mut alice, mut dave] = sign_in(&mut h, [ALICE, DAVE]);
+    // Dave has never been able to see #private: the ban is silent.
+    h.send(&alice, "ban #private dave@example.net").await;
+    assert_eq!(alice.lines().last().unwrap(), "OK seq=4");
+    assert_eq!(dave.lines(), none());
+    // #general is public, so he hears of that one.
+    h.send(&alice, "ban #general dave@example.net").await;
+    alice.lines();
+    assert_eq!(
+        dave.lines(),
+        [ev(9, ALICE, "BAN #general dave@example.net")]
+    );
 }

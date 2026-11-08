@@ -210,7 +210,9 @@ impl Inner {
         };
         let (host, nonce) = self.host_and_nonce(challenge)?;
         let uid = identity.to_uid();
-        self.check_not_banned(&uid)?;
+        // Server bans (10.2) are checked in `finish_sign_in`, after the
+        // signature, so that only the identity's owner learns of a ban
+        // (PLAN.md 5, item 31).
         // Held from here to the end, so that an UNREGISTER that starts
         // meanwhile marks this very entry, and the sign-in sees it (4.8).
         let user = self.pin(&uid);
@@ -463,7 +465,6 @@ impl Inner {
                 )
             })?;
         let uid = Identity::new(&name, &domain).to_uid();
-        self.check_not_banned(&uid)?;
         // The signature proves the client holds the key (4.6).
         if verify(host, nonce, uid.clone(), signature, vec![key.clone()])
             .await
@@ -471,6 +472,8 @@ impl Inner {
         {
             return Err(auth_failed("the signature did not verify"));
         }
+        // Only after the signature, as in AUTH (PLAN.md 5, item 31).
+        self.check_not_banned(&uid)?;
         {
             let _keys = self.keys_lock.lock().await;
             let (who, first) = (uid.clone(), key.clone());

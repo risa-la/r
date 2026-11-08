@@ -17,6 +17,14 @@ impl ModerationStore for SqliteStore {
             })
             .collect()
     }
+
+    fn set_room_ban_reason(&self, conv: ConvKey, uid: &Uid, reason: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE room_bans SET reason = ? WHERE conv = ? AND uid = ?",
+            rusqlite::params![reason, conv.0, uid.as_str()],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

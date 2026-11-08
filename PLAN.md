@@ -680,6 +680,28 @@ Open:
     - `ADMIN SET guests no` ends the sessions of guests already
       connected, with BYE.
 
+31. **Found while building M4's moderation and ADMIN** (6.2-6.4,
+    10.1-10.3, 10.6), confirmed with the user on 2026-11-08:
+    - A BAN event reaches a non-member only if they could see the room
+      before, so a ban made in advance does not reveal a private room.
+    - INVITE of a banned identity gets `forbidden`: unban first.
+    - The only owner cannot KICK or BAN themselves (`last-owner`).
+    - A new address ban ends the sessions of guests connected from
+      inside it.
+    - Operators count as owners, so moderators cannot kick or ban them.
+    - AUTH and REGISTER check server bans after the signature, so only
+      the key's holder learns of a ban.
+    - SET to the current value, ROLE to the current role, and BAN of
+      someone already banned (and gone) record nothing and get a plain
+      `OK`. BAN again replaces the reason.
+    - Smaller ones: UNBAN, ADMIN UNBAN, ADMIN DEOP and ADMIN DISCONNECT
+      of nothing get `not-found`. ADMIN UNBAN takes the address a guest
+      ban is listed under. `ADMIN SET guests no` also ends sessions
+      waiting to be resumed. Role-holders who left keep their rights.
+      ROLE of a guest is `forbidden`. `SET retention 0` is `bad-syntax`.
+      Section 10.5 commands get `not-supported` on a server that hosts
+      no identities.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

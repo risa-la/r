@@ -16,4 +16,9 @@ pub trait ModerationStore {
     /// The bans of a room (6.4), in uid order, each with its reason,
     /// escaped (3.4); empty if none. For BANS.
     fn room_bans(&self, conv: ConvKey) -> Result<Vec<(Uid, String)>>;
+
+    /// Replaces the reason of an existing room ban, escaped (3.4), without
+    /// recording an event: BAN of someone already banned (PLAN.md 5, item
+    /// 31). Does nothing if `uid` is not banned.
+    fn set_room_ban_reason(&self, conv: ConvKey, uid: &Uid, reason: &str) -> Result<()>;
 }
