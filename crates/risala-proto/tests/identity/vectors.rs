@@ -428,7 +428,6 @@ pub fn vectors() -> Vec<(String, String)> {
     )
     .encode();
     add("entry.handoff.hex", hex(&handoff));
-    add("hint.uid.path", risala_proto::record::uid_hint_path(&f.uid));
 
     // Key files (4.4).
     add("keyfile.two_unlogged", key_file(&f, 2, 0));
@@ -539,4 +538,4 @@ fn vectors_check() {
 }
 
 /// SHA-256 of every vector, as `name=value` lines.
-const VECTORS_SHA256: &str = "f7afeb224cb11e9529832ffea6cecf2ab125a89363435dffc190db11c2dc9b42";
+const VECTORS_SHA256: &str = "3aedd253a09206f95b01226000a24d16ea39ddd53d0aa3323ca9427bb45733ff";

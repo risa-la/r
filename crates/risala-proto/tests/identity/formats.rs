@@ -9,8 +9,7 @@ use risala_proto::pairing::{
 };
 use risala_proto::record::{
     LogEntry, LogKey, MAX_RECORD_LEN, Record, RecordBody, RecordContent, RecordError,
-    XWingPublicKey, decode_records, encode_records, parse_next_hint, parse_origin, parse_uid_hint,
-    uid_hint_path, write_uid_hint,
+    XWingPublicKey, decode_records, encode_records, parse_origin,
 };
 use risala_proto::recovery::RecoveryKey;
 use risala_proto::safety::{SAFETY_QR_PREFIX, SafetyNumber};
@@ -379,29 +378,24 @@ fn log_entries() {
 }
 
 #[test]
-fn log_hints() {
-    use sha2::Digest as _;
-    let hash: String = sha2::Sha256::digest(b"alice@example.org")
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    assert_eq!(uid_hint_path(&alice()), format!("risala/uid/{hash}"));
-    assert_eq!(parse_uid_hint(b"0\n7\n12\n"), Some(vec![0, 7, 12]));
-    assert_eq!(write_uid_hint(&[0, 7, 12]), "0\n7\n12\n");
-    assert_eq!(parse_uid_hint(b""), Some(vec![]));
-    for bad in [
-        &b"0\n7"[..],
-        b"7\n0\n",
-        b"7\n7\n",
-        b"01\n",
-        b"\n",
-        b"1\r\n",
-        b"a\n",
-    ] {
-        assert_eq!(parse_uid_hint(bad), None, "{bad:?}");
-    }
-    assert_eq!(parse_next_hint(b"41\n"), Some(41));
-    assert_eq!(parse_next_hint(b"41"), None);
+fn log_entries_match_the_key_log() {
+    // The key log crate writes the same LogEntry bytes (4.5).
+    let b = Builder::new(&log1());
+    let ours = LogEntry::Record(b.records[0].clone()).encode();
+    let theirs = risala_keylog::entry::LogEntry::record(b.records[0].encoded())
+        .unwrap()
+        .encode();
+    assert_eq!(ours, theirs);
+    assert_eq!(
+        risala_keylog::entry::record_hash(b.records[0].encoded()),
+        *b.records[0].hash().hash()
+    );
+    let next = log_on("chat.example.org", 2, 201);
+    let ours = LogEntry::Handoff(next.clone()).encode();
+    let key = risala_keylog::LogKey::from_vkey_str(&next.vkey()).unwrap();
+    let theirs = risala_keylog::entry::LogEntry::Handoff(key).encode();
+    assert_eq!(ours, theirs);
+    assert_eq!(LogEntry::decode(&theirs).unwrap(), LogEntry::Handoff(next));
 }
 
 #[test]

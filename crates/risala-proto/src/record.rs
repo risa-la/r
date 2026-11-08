@@ -25,6 +25,10 @@
 //! field, version 1, a known type, and every key the right length and
 //! form (4.4, parsing step 2 and replaying step 5). How records chain is
 //! [`chain`](crate::chain)'s job.
+//!
+//! `risala-keylog` reads and writes the same LogEntry bytes, holding the
+//! Record as bytes, and has the log's hints (4.5); this crate decodes the
+//! Record inside.
 
 use std::fmt;
 use std::sync::Arc;
@@ -916,52 +920,6 @@ impl LogEntry {
     pub fn is_record(&self, hash: &BlobRef) -> bool {
         matches!(self, LogEntry::Record(record) if record.hash() == *hash)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Log hints
-
-/// The path, under a log's URL prefix, of a uid's hint (4.5):
-/// `risala/uid/` and the SHA-256 hash of the uid in lower-case hex.
-pub fn uid_hint_path(uid: &Identity) -> String {
-    format!(
-        "risala/uid/{}",
-        crate::auth::hex_lower(&Sha256::digest(uid.as_str().as_bytes()))
-    )
-}
-
-/// The path, under a log's URL prefix, of its hand-off hint (4.5).
-pub const NEXT_HINT_PATH: &str = "risala/next";
-
-/// Reads a uid hint (4.5): indices as numbers (3.3), one per line, in
-/// increasing order, each ending with LF. An empty body is no indices.
-/// Anything else is `None`.
-pub fn parse_uid_hint(body: &[u8]) -> Option<Vec<u64>> {
-    let text = std::str::from_utf8(body).ok()?;
-    let mut out: Vec<u64> = Vec::new();
-    if text.is_empty() {
-        return Some(out);
-    }
-    let lines = text.strip_suffix('\n')?;
-    for line in lines.split('\n') {
-        let n = crate::types::parse_u64(line).ok()?;
-        if out.last().is_some_and(|&last| last >= n) {
-            return None;
-        }
-        out.push(n);
-    }
-    Some(out)
-}
-
-/// Writes a uid hint (4.5).
-pub fn write_uid_hint(indices: &[u64]) -> String {
-    indices.iter().map(|i| format!("{i}\n")).collect()
-}
-
-/// Reads a hand-off hint (4.5): one number and an LF.
-pub fn parse_next_hint(body: &[u8]) -> Option<u64> {
-    let text = std::str::from_utf8(body).ok()?.strip_suffix('\n')?;
-    crate::types::parse_u64(text).ok()
 }
 
 /// SHA-384 of `bytes`, as a fixed array.
