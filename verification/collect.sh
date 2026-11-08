@@ -148,7 +148,14 @@ step_fuzz_cover() {
     fi
     echo "== coverage of $crate $target"
     (cd "$cdir" && fuzz coverage --sanitizer none "$target" "fuzz/corpus/$target")
-    local bin=$cdir/fuzz/target/$host/coverage/$host/release/$target
+    # cargo fuzz puts the coverage build under the crate's target folder,
+    # or fuzz/'s, depending on its version: find it.
+    local bin
+    bin=$(find "$cdir/target" "$cdir/fuzz/target" -path "*/coverage/$host/release/$target" -type f 2>/dev/null | head -1)
+    if [ -z "$bin" ]; then
+      echo "no coverage build of $crate $target" >&2
+      return 1
+    fi
     "${LLVM_COV:-llvm-cov}" export -format=text \
       -instr-profile="$cdir/fuzz/coverage/$target/coverage.profdata" \
       -ignore-filename-regex='/(\.cargo|rustc|nix/store)/' \
