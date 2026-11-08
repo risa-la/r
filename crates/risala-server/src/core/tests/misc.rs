@@ -1084,17 +1084,17 @@ async fn reports_are_rate_limited() {
         got[0].starts_with("@retry=") && got[0].ends_with("ERR rate-limited"),
         "{got:?}"
     );
-    // A failed report does not use up a slot; an identity has its own.
+    // An identity has its own slots, and a failed report uses one up
+    // too: the server read the posts it names all the same.
     let mut alice = h.signed_in_as("alice@example.org");
     h.send(&alice, &format!("REPORT {mailbox} AQID")).await;
     h.send(&alice, &line).await;
     h.send(&alice, &line).await;
     let got = alice.lines();
     assert_eq!(got.len(), 3);
-    assert!(
-        got[1].starts_with("OK") && got[2].starts_with("OK"),
-        "{got:?}"
-    );
+    assert!(got[0].starts_with("ERR invalid"), "{got:?}");
+    assert!(got[1].starts_with("OK"), "{got:?}");
+    assert!(got[2].ends_with("ERR rate-limited"), "{got:?}");
 }
 
 /// A typed check that report lines parse back, with `pseudonym=` (5.8).
@@ -1104,4 +1104,58 @@ fn report_lines_parse_back() {
         .parse()
         .unwrap();
     assert!(matches!(line.line, ServerLine::Report(_)));
+}
+
+/// A reported post that is a blob is checked from its first bytes, which
+/// hold the franking tag, and the report keeps the blob until it is
+/// resolved (5.8, 12.12).
+#[tokio::test]
+async fn reports_of_blob_posts() {
+    let mut h = Harness::with(report_config(30), timers());
+    let mailbox = add_mailbox(&h, 1);
+    let key = [4; 32];
+    let content: &[u8] = b"TEXT big\n";
+    let tag: [u8; 48] = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA384, &key), content)
+        .as_ref()
+        .try_into()
+        .unwrap();
+    let aad = RisalaAad::application(MlsPseudonym([8; 16]), tag);
+    let mut w = Writer::new();
+    w.fixed(&1u16.to_be_bytes()).fixed(&2u16.to_be_bytes());
+    w.vector(&[4; 32]).u64(7).u8(1).vector(&aad.encode());
+    w.vector(b"sender").vector(&[0x55; 200_000]);
+    let message = w.finish();
+    let blob = hold_blob(&h, &message, Some(&mailbox));
+    h.store
+        .raw()
+        .execute(
+            "INSERT INTO posts (box, seq, t, blob) VALUES (?, 1, 1794225600000, ?)",
+            rusqlite::params![&mailbox.as_bytes()[..], &blob.hash()[..]],
+        )
+        .unwrap();
+    let mut reporter = h.anon().await;
+    let wrong = report_b64((1, [5; 32], content), &[], "b@x.org", "");
+    h.send(&reporter, &format!("REPORT {mailbox} {wrong}"))
+        .await;
+    assert!(reporter.lines()[0].starts_with("ERR invalid"));
+    let ok = report_b64((1, key, content), &[], "b@x.org", "");
+    h.send(&reporter, &format!("REPORT {mailbox} {ok}")).await;
+    let lines = reporter.lines();
+    assert!(lines[0].starts_with("OK id="), "{lines:?}");
+    let id = value(&lines[0], "id");
+    let kept = |h: &Harness| -> i64 {
+        h.store
+            .raw()
+            .query_row(
+                "SELECT count(*) FROM blob_keeps WHERE hash = ?",
+                [&blob.hash()[..]],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(kept(&h), 1);
+    let mut op = h.signed_in_as("op@example.org");
+    h.send(&op, &format!("RESOLVE {id}")).await;
+    assert_eq!(op.lines().last().unwrap(), "OK");
+    assert_eq!(kept(&h), 0);
 }

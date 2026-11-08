@@ -1084,3 +1084,118 @@ async fn pair_limits() {
     ids.h.send(&anon, &format!("PAIR PUT {PAIR_ID} AAAA")).await;
     assert!(anon.raw_lines()[0].ends_with("ERR rate-limited"));
 }
+
+// ---------------------------------------------------------------------------
+// Limits on KEYS PUT and AUTH (4.4, 4.6, 4.7)
+
+/// KEYS PUT is limited per network address (4.7: MUST), and every one
+/// whose records decode uses up a slot.
+#[tokio::test]
+async fn keys_put_is_rate_limited() {
+    let mut config = id_config();
+    config.limits.keys_puts_per_hour = 2;
+    let mut ids = Ids::with(config);
+    let (chain, _) = TestChain::new("erin@example.net", &ids.log().log);
+    ids.fetcher.set(chain.identity(), chain.key_file());
+    let mut anon = ids.h.anon().await;
+    ids.h.send(&anon, &chain.keys_put_line(0)).await;
+    assert_eq!(anon.lines().last().unwrap(), "OK");
+    // Records the server has: OK, but a slot all the same.
+    ids.h.send(&anon, &chain.keys_put_line(0)).await;
+    assert_eq!(anon.lines(), ["OK"]);
+    ids.h.send(&anon, &chain.keys_put_line(0)).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+    // Another network address has its own.
+    let mut far = ids.h.connect_from("198.51.100.9:4000");
+    ids.h.send(&far, "ANON").await;
+    ids.h.send(&far, &chain.keys_put_line(0)).await;
+    assert_eq!(far.lines(), ["OK", "OK"]);
+}
+
+/// The server logs so many new outside identities a day per registered
+/// domain, and none if it logs only those it hosts (4.5, 4.7).
+#[tokio::test]
+async fn outside_identities_are_limited() {
+    let mut config = id_config();
+    config.limits.outside_identities_per_day = 1;
+    let mut ids = Ids::with(config);
+    let log = ids.log().log;
+    let (mut erin, _) = TestChain::new("erin@example.net", &log);
+    let (frank, _) = TestChain::new("frank@sub.example.net", &log);
+    let (gina, _) = TestChain::new("gina@example.com", &log);
+    for chain in [&erin, &frank, &gina] {
+        ids.fetcher.set(chain.identity(), chain.key_file());
+    }
+    let mut anon = ids.h.anon().await;
+    ids.h.send(&anon, &erin.keys_put_line(0)).await;
+    assert_eq!(anon.lines().last().unwrap(), "OK");
+    // A second new identity under example.net today.
+    ids.h.send(&anon, &frank.keys_put_line(0)).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+    // Another registered domain, and more records of one already logged.
+    ids.h.send(&anon, &gina.keys_put_line(0)).await;
+    assert_eq!(anon.lines().last().unwrap(), "OK");
+    erin.add_device("phone");
+    ids.fetcher.set(erin.identity(), erin.key_file());
+    ids.h.send(&anon, &erin.keys_put_line(2)).await;
+    assert_eq!(anon.lines().last().unwrap(), "OK");
+    // A day later, another.
+    ids.h.clock.advance(Duration::from_secs(24 * 60 * 60));
+    ids.h.send(&anon, &frank.keys_put_line(0)).await;
+    assert_eq!(anon.lines().last().unwrap(), "OK");
+
+    // A server that logs only the identities it hosts.
+    let mut config = id_config();
+    config.limits.log_outside_identities = false;
+    let mut ids = Ids::with(config);
+    let (erin, _) = TestChain::new("erin@example.net", &ids.log().log);
+    ids.fetcher.set(erin.identity(), erin.key_file());
+    let mut anon = ids.h.anon().await;
+    ids.h.send(&anon, &erin.keys_put_line(0)).await;
+    assert!(anon.lines()[0].starts_with("ERR not-supported"));
+    assert!(ids.fetcher.calls().is_empty());
+}
+
+/// KEYS PUT fetches an outside identity's key file without holding the
+/// lock that REGISTER, KEYS PUT and UNREGISTER take, so a slow key server
+/// holds up nobody else (4.7).
+#[tokio::test]
+async fn keys_put_fetches_outside_the_lock() {
+    let mut ids = Ids::new();
+    let (chain, _) = TestChain::new("erin@example.net", &ids.log().log);
+    let held = ids.fetcher.hold(chain.identity(), chain.key_file());
+    let mut anon = ids.h.anon().await;
+    let (alice, device) = TestChain::new("alice@example.org", &ids.log().log);
+    let (mut c, nonce) = ids.connect();
+    let register = alice.register_line(&device, "chat.example.org", &nonce);
+    let h = &ids.h;
+    let put = chain.keys_put_line(0);
+    let both = async {
+        tokio::join!(h.send(&anon, &put), async {
+            // REGISTER finishes while KEYS PUT waits for the key file.
+            h.send(&c, &register).await;
+            held.notify_one();
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), both)
+        .await
+        .expect("REGISTER waited for KEYS PUT's fetch");
+    assert_eq!(c.lines(), ["OK uid=alice@example.org"]);
+    assert_eq!(anon.lines().last().unwrap(), "OK");
+}
+
+/// AUTHs that may fetch a key file are limited per network address; a
+/// hosted identity's are not (4.4, 4.6).
+#[tokio::test]
+async fn fetching_auths_are_rate_limited() {
+    let mut config = id_config();
+    config.limits.fetching_auths_per_hour = 1;
+    let mut ids = Ids::with(config);
+    let (chain, device) = outside("bob");
+    ids.fetcher.set(chain.identity(), chain.key_file());
+    assert_eq!(ids.auth(&device).await.1, ["OK uid=bob@example.net"]);
+    let lines = ids.auth(&device).await.1;
+    assert!(lines[0].ends_with("ERR rate-limited"), "{lines:?}");
+    let (_, _, alice) = ids.register("alice").await;
+    assert_eq!(ids.auth(&alice).await.1, ["OK uid=alice@example.org"]);
+}

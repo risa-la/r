@@ -250,6 +250,31 @@ impl Client {
     }
 }
 
+/// Makes the server hold `bytes` as a blob, as a finished BLOB and `put`
+/// would, counted against `mailbox` (12.12). Returns its hash.
+pub(super) fn hold_blob(
+    h: &Harness,
+    bytes: &[u8],
+    mailbox: Option<&risala_proto::names::BoxName>,
+) -> risala_proto::names::BlobRef {
+    let hash = risala_proto::names::BlobRef::of(bytes);
+    crate::core::keys::disk::write_blob(&h.inner().keys, &hash, bytes).unwrap();
+    h.store
+        .raw()
+        .execute(
+            "INSERT INTO blobs (hash, size, stored, box) VALUES (?, ?, ?, ?)
+             ON CONFLICT (hash) DO NOTHING",
+            rusqlite::params![
+                &hash.hash()[..],
+                bytes.len() as i64,
+                h.inner().now().unix_millis() as i64,
+                mailbox.map(|m| m.as_bytes().to_vec())
+            ],
+        )
+        .unwrap();
+    hash
+}
+
 /// `line` with the value after `key` (such as `" token="`) replaced by
 /// `shown`, up to the next space.
 fn hide(line: &str, key: &str, shown: &str) -> String {

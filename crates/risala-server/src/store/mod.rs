@@ -22,7 +22,8 @@
 //! Conventions, for every area:
 //!
 //! - Times are `INTEGER` milliseconds since the Unix epoch ([`millis`],
-//!   [`timestamp`]). Binary values (boxes, hashes, MLS objects) are
+//!   [`timestamp`]); those kept only for retention and order are rounded
+//!   down to the hour ([`coarse`]). Binary values (boxes, hashes, MLS objects) are
 //!   `BLOB`s of their raw bytes, never base64. Uids and rooms are `TEXT`
 //!   in lower case.
 //! - Bearer secrets are stored only as hashes ([`crate::secret`]).
@@ -109,6 +110,21 @@ impl<T> Store for T where
 /// A time as stored: milliseconds since the Unix epoch.
 pub fn millis(t: Timestamp) -> i64 {
     i64::try_from(t.unix_millis()).unwrap_or(i64::MAX)
+}
+
+/// How finely the store keeps times that only retention and ordering need
+/// (4.2): to the hour.
+pub const COARSE: u64 = 60 * 60 * 1000;
+
+/// A time as stored where it is kept only for retention, expiry and
+/// order, rounded down to the hour, so that a database read later does
+/// not show to the millisecond when a mailbox was made, a token hash
+/// added, a KeyPackage handed out or a Welcome put, which together could
+/// name a private group's members (4.2, item 54 of PLAN.md). Posts' times
+/// stay exact: they are sent to devices (5.2).
+pub fn coarse(t: Timestamp) -> i64 {
+    let ms = t.unix_millis();
+    i64::try_from(ms - ms % COARSE).unwrap_or(i64::MAX)
 }
 
 /// A stored time, read back.

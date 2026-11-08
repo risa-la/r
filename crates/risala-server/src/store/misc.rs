@@ -103,8 +103,10 @@ pub struct NewReport {
     pub pseudonym: Pseudonym,
     /// The reporter, if signed in.
     pub from: Option<Uid>,
-    /// Copies of the posts it names: seq, time and MLSMessage.
-    pub posts: Vec<(u64, Timestamp, Vec<u8>)>,
+    /// Copies of the posts it names: seq, time and MLSMessage. A post
+    /// whose message is a blob is kept by its hash: the blob then stays
+    /// until the report is resolved (12.12).
+    pub posts: Vec<(u64, Timestamp, super::PostBody)>,
 }
 
 /// An open report, as the operators see it (5.8).

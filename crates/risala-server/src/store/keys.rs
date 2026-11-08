@@ -147,12 +147,13 @@ pub struct HandoutRow {
 pub enum PutWelcome {
     /// Stored, with this id.
     Stored(String),
-    /// It replaced the Welcome with this id, which had not been fetched.
+    /// It replaced the Welcome with this id, which its device had not
+    /// deleted.
     Replaced(String),
     /// The handout already has this very Welcome: nothing changed.
     Same,
-    /// The handout's Welcome has been fetched or deleted, and this is
-    /// another one.
+    /// The handout's Welcome has been deleted by its device (WELCOME DEL)
+    /// or expired, and this is another one.
     Taken,
     /// The handout is gone (`ERR not-found`).
     NotFound,
@@ -364,7 +365,8 @@ pub trait KeysStore {
     fn delete_welcome(&self, uid: &Uid, device: &DeviceBytes, id: &str) -> Result<()>;
 
     /// The Welcome for the KeyPackage of an external proposal, with its
-    /// epoch's tree, if it has arrived; it counts as fetched from now on.
+    /// epoch's tree, if it has arrived. Reading it changes nothing: anyone
+    /// may ask, since the KeyPackageRefs of external proposals are public.
     fn room_welcome(&self, key_package_ref: &RefBytes) -> Result<Option<RoomWelcome>>;
 
     // ---- Blobs (12.12)
@@ -388,6 +390,10 @@ pub trait KeysStore {
     /// A blob's bytes are stored, at `now`. If the server already held it,
     /// retention counts from now.
     fn blob_stored(&self, put: &BlobPut, now: Timestamp) -> Result<()>;
+
+    /// The bytes the server stores for everyone: blobs, `put` URLs not
+    /// yet used, uploaded files and kept posts (7.5), for its own cap.
+    fn stored_total(&self) -> Result<u64>;
 
     /// The bytes of files and blobs kept for `mailbox`, and of `put` URLs
     /// for it that are not yet used (7.5).

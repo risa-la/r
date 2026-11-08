@@ -70,6 +70,8 @@ pub(crate) struct State {
     creates: Limit,
     posts: Limit,
     commits: Limit,
+    /// Join proposals with `-`, per network address (6.1, 12.6).
+    joins: WindowLimit<IpAddr>,
     /// Public rooms' groups (12.6).
     rooms: room::Rooms,
 }
@@ -107,14 +109,32 @@ impl Limit {
     /// address, and keeps both, or fails with `ERR rate-limited` and the
     /// seconds to wait.
     fn take(&self, cx: &Cx, max: u32, now: Timestamp) -> Result<(), ErrResponse> {
+        self.slots(cx, max, now)?.keep();
+        Ok(())
+    }
+
+    /// Takes a slot of `max` for the connection and for its network
+    /// address, given back unless [`Slots::keep`] is called.
+    fn slots(&self, cx: &Cx, max: u32, now: Timestamp) -> Result<Slots<'_>, ErrResponse> {
         let conn = self.conns.take(cx.conn, max, now).map_err(rate_limited)?;
         let address = self
             .addresses
             .take(network(cx.peer.ip()), max, now)
             .map_err(rate_limited)?;
-        conn.into_iter().for_each(|slot| slot.keep());
-        address.into_iter().for_each(|slot| slot.keep());
-        Ok(())
+        Ok(Slots { conn, address })
+    }
+}
+
+/// The slots [`Limit::slots`] took.
+struct Slots<'a> {
+    conn: Option<super::rate::Slot<'a, ConnId>>,
+    address: Option<super::rate::Slot<'a, IpAddr>>,
+}
+
+impl Slots<'_> {
+    fn keep(self) {
+        self.conn.into_iter().for_each(|slot| slot.keep());
+        self.address.into_iter().for_each(|slot| slot.keep());
     }
 }
 
@@ -131,6 +151,7 @@ impl State {
             creates: Limit::new(HOUR),
             posts: Limit::new(MINUTE),
             commits: Limit::new(HOUR),
+            joins: WindowLimit::new(HOUR),
             rooms: room::Rooms::new(),
         })
     }
@@ -211,6 +232,12 @@ impl State {
     #[cfg(test)]
     pub(crate) fn forget_room(&self, mailbox: &BoxName) {
         self.rooms.forget(mailbox);
+    }
+
+    /// Whether the public room's group is kept in memory (12.6).
+    #[cfg(test)]
+    pub(crate) fn room_cached(&self, mailbox: &BoxName) -> bool {
+        self.rooms.is_cached(mailbox)
     }
 
     /// Whether any connection follows `mailbox`.
@@ -436,23 +463,97 @@ fn aad_pseudonym(aad: &risala_mls::RisalaAad) -> Option<[u8; 16]> {
     aad.pseudonym.map(|p| p.0)
 }
 
-/// The bytes of a message, GroupInfo or tree in a line: decoded, or read
-/// from its blob in the keys area's store (12.12): `ERR not-found` if the
-/// server holds no such blob.
+/// The bytes of a public room's message, GroupInfo or tree in a line,
+/// which the server reads whole to check them (12.6): decoded, or read
+/// from its blob in the keys area's store (12.12), up to
+/// `limits.max_room_blob`: `ERR not-found` if the server holds no such
+/// blob, `ERR too-long` past the limit.
 pub(super) async fn line_bytes<T>(
     inner: &Inner,
     value: &OrBlob<T>,
     decode: impl FnOnce(&T) -> Vec<u8>,
-) -> Result<Vec<u8>, ErrResponse> {
+) -> Result<keys::BlobBytes, ErrResponse> {
     match value {
-        OrBlob::Inline(inline) => Ok(decode(inline)),
-        OrBlob::Blob(blob) => keys::blob_bytes(inner, blob, inner.config.files.max_blob)
+        OrBlob::Inline(inline) => Ok(keys::BlobBytes::inline(decode(inline))),
+        OrBlob::Blob(blob) => keys::blob_bytes(inner, blob, inner.config.limits.max_room_blob)
             .await
-            .map_err(|why| match why {
-                keys::NoBlob::NotFound => err(ErrorCode::NotFound).with_message("no such blob"),
-                why => ErrResponse::from(why),
-            }),
+            .map_err(no_blob),
     }
+}
+
+/// The answer when a line's blob cannot be read.
+fn no_blob(why: keys::NoBlob) -> ErrResponse {
+    match why {
+        keys::NoBlob::NotFound => err(ErrorCode::NotFound).with_message("no such blob"),
+        why => ErrResponse::from(why),
+    }
+}
+
+/// How much of a blob POST reads to find a message's framing (5.2): its
+/// group id, epoch, content type, RisalaAAD and the lengths after them
+/// take a few hundred bytes.
+const FRAMING_PREFIX: usize = 16 * 1024;
+
+/// A PrivateMessage of `size` bytes in all, from its first bytes: those
+/// bytes up to its ciphertext's length, and a ciphertext of one byte in
+/// place of its own. It reads as the message does for its framing (5.2),
+/// whose checks do not look into the ciphertext, so the server need not
+/// hold the whole message. `None` if `prefix` is not the start of a
+/// well-formed PrivateMessage of exactly `size` bytes.
+pub(super) fn private_message_stub(prefix: &[u8], size: u64) -> Option<Vec<u8>> {
+    // version (2 bytes), then wire_format mls_private_message (2).
+    if prefix.get(2..4)? != [0, 2] {
+        return None;
+    }
+    let mut at = 4;
+    let vector = |at: &mut usize| -> Option<()> {
+        let (len, took) = keys::varint(prefix.get(*at..)?)?;
+        *at = at.checked_add(took)?.checked_add(len)?;
+        (*at <= prefix.len()).then_some(())
+    };
+    vector(&mut at)?; // group_id
+    at += 8 + 1; // epoch, content_type
+    vector(&mut at)?; // authenticated_data
+    vector(&mut at)?; // encrypted_sender_data
+    let (len, took) = keys::varint(prefix.get(at..)?)?;
+    let end = (at as u64)
+        .checked_add(took as u64)?
+        .checked_add(len as u64)?;
+    if end != size || len == 0 {
+        return None;
+    }
+    let mut stub = prefix[..at].to_vec();
+    stub.extend_from_slice(&[1, 0]);
+    Some(stub)
+}
+
+/// The bytes of a post's message to read its framing from (5.2), and,
+/// for a PublicMessage, which the server checks whole (12.6), the whole
+/// message. A message in a blob is not read whole otherwise: only its
+/// first bytes, so that POST never holds a large blob for a message it
+/// does not check.
+async fn post_bytes(
+    inner: &Inner,
+    message: &OrBlob<MlsMessage>,
+    public_room: bool,
+) -> Result<keys::BlobBytes, ErrResponse> {
+    let OrBlob::Blob(blob) = message else {
+        return line_bytes(inner, message, MlsMessage::decode).await;
+    };
+    let (prefix, size) = keys::blob_prefix(inner, blob, FRAMING_PREFIX)
+        .await
+        .map_err(no_blob)?;
+    if prefix.len() as u64 == size {
+        return Ok(keys::BlobBytes::inline(prefix));
+    }
+    if let Some(stub) = private_message_stub(&prefix, size) {
+        return Ok(keys::BlobBytes::inline(stub));
+    }
+    if !public_room {
+        // Not a PrivateMessage, and outside a public room a post is one.
+        return Err(err(ErrorCode::Invalid).with_message("not a PrivateMessage"));
+    }
+    line_bytes(inner, message, MlsMessage::decode).await
 }
 
 /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
@@ -487,11 +588,21 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     }
     // 1. The mailbox exists, and the message is of its group.
     let record = record.ok_or_else(|| err(ErrorCode::NotFound))?;
-    let bytes = line_bytes(inner, &post.message, MlsMessage::decode).await?;
+    let public_room = record.room.is_some();
+    let limits = &inner.config.limits;
+    // A post whose message is a blob uses up its slot before the server
+    // reads any of the blob, whatever then becomes of it, so that failing
+    // posts cannot make the server read blobs for nothing.
+    let blob = matches!(post.message, OrBlob::Blob(_));
+    if blob {
+        inner.mailbox.posts.take(cx, limits.posts_per_minute, now)?;
+    }
+    let (bytes, _held) = post_bytes(inner, &post.message, public_room)
+        .await?
+        .into_parts();
     // 2. The framing.
     let framing = read_framing(&bytes, &record.group_id)?;
     let invalid = |what: &str| Err(err(ErrorCode::Invalid).with_message(what));
-    let public_room = record.room.is_some();
     let commit = framing.content_type == ContentType::Commit;
     if !framing.private && !public_room {
         return invalid("a PublicMessage outside a public room");
@@ -541,6 +652,20 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
             Some((epoch, hash))
         }
     };
+    // Join proposals, which need no membership, have a limit of their own
+    // per network address, far below that of posts (6.1, 12.6); kept once
+    // the post's other limits pass.
+    let join_slot = if matches!(post.token, PostToken::Join)
+        && framing.sender == Some(Sender::NewMemberProposal)
+    {
+        inner
+            .mailbox
+            .joins
+            .take(network(cx.peer.ip()), limits.joins_per_hour, now)
+            .map_err(rate_limited)?
+    } else {
+        None
+    };
     // 4. Mutes and limits.
     if let Some(pseudonym) = framing.pseudonym {
         let muted = cx
@@ -550,13 +675,45 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
             return Err(err(ErrorCode::Forbidden).with_message("muted"));
         }
     }
-    let limits = &inner.config.limits;
-    inner.mailbox.posts.take(cx, limits.posts_per_minute, now)?;
-    if commit {
-        inner
-            .mailbox
-            .commits
-            .take(cx, limits.commits_per_hour, now)?;
+    // At most so many proposals from one network address pending in one
+    // epoch of a public room (12.6).
+    let proposal_from = (public_room && framing.content_type == ContentType::Proposal)
+        .then(|| network(cx.peer.ip()));
+    if let Some(from) = proposal_from
+        && !inner.mailbox.rooms.may_propose(
+            mailbox,
+            framing.epoch,
+            from,
+            limits.pending_per_address,
+        )
+    {
+        return Err(rate_limited(60));
+    }
+    // A post and a commit use up their slots together, or neither.
+    let post_slots = if blob {
+        None
+    } else {
+        Some(
+            inner
+                .mailbox
+                .posts
+                .slots(cx, limits.posts_per_minute, now)?,
+        )
+    };
+    let commit_slots = if commit {
+        Some(
+            inner
+                .mailbox
+                .commits
+                .slots(cx, limits.commits_per_hour, now)?,
+        )
+    } else {
+        None
+    };
+    post_slots.into_iter().for_each(Slots::keep);
+    commit_slots.into_iter().for_each(Slots::keep);
+    if let Some(slot) = join_slot {
+        slot.keep();
     }
     let message = match &post.message {
         OrBlob::Inline(_) => PostBody::Inline(bytes.clone()),
@@ -571,6 +728,10 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         let groupinfo = match &post.groupinfo {
             Some(groupinfo) => Some(line_bytes(inner, groupinfo, GroupInfo::decode).await?),
             None => None,
+        };
+        let (groupinfo, _held_info) = match groupinfo.map(keys::BlobBytes::into_parts) {
+            Some((bytes, held)) => (Some(bytes), held),
+            None => (None, None),
         };
         Some(room::check_post(cx, &record, &framing, bytes, groupinfo, post.next, now).await?)
     } else {
@@ -599,12 +760,16 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         cid,
         quota,
         room: room.as_ref().map(|room| room.change.clone()),
+        handshake: framing.content_type != ContentType::Application,
     };
     let seq = match cx.db(move |store| store.add_post(&new)).await? {
         Posted::Seq(seq) => seq,
         Posted::OverQuota => return Err(rate_limited(HOUR.as_secs())),
         Posted::NoMailbox => return Err(err(ErrorCode::NotFound)),
     };
+    if let Some(from) = proposal_from {
+        inner.mailbox.rooms.proposed(mailbox, framing.epoch, from);
+    }
     if let Some(room) = room
         && let Some(joins) = inner.mailbox.rooms.applied(mailbox, room)
     {
@@ -756,15 +921,47 @@ async fn fetch(
         // Light clients (12.6) are not in this version (docs/plans/M5b.md).
         return Err(err(ErrorCode::NotSupported).with_message("light clients"));
     }
-    let cap = cx.inner.config.limits.max_page.max(MIN_FETCH_LIMIT_CAP);
+    let limits = &cx.inner.config.limits;
+    let cap = limits.max_page.max(MIN_FETCH_LIMIT_CAP);
     let limit = limit.unwrap_or(DEFAULT_FETCH_LIMIT).min(cap);
-    let (posts, more) = cx
+    let (posts, mut more) = cx
         .db(move |store| store.posts(&mailbox, after, limit))
         .await?;
-    for post in posts {
+    // A page stops once its lines pass a budget of bytes, with `more=1`,
+    // so that a page of long posts never overflows the connection's queue
+    // (7.1 lets the server return fewer posts than asked for).
+    let budget = fetch_budget(limits);
+    let mut queued = 0;
+    for (i, post) in posts.into_iter().enumerate() {
+        let size = post_line_bytes(&post);
+        if i > 0 {
+            if queued + size > budget {
+                more = true;
+                break;
+            }
+            // Room for one long line, as KEYPKG GET and WELCOME LIST wait.
+            cx.wait_for_room().await;
+        }
+        queued += size;
         cx.send(post_line(mailbox, post)?);
     }
     Ok(OkResponse::new().with("more", u8::from(more)))
+}
+
+/// The most bytes of POST lines one FETCH queues (7.1): half of what a
+/// connection's queue holds, and at most 8 MiB.
+fn fetch_budget(limits: &crate::config::Limits) -> usize {
+    (limits.out_queue_bytes / 2).min(8 * 1024 * 1024)
+}
+
+/// About how many bytes the POST line of `post` takes: its message in
+/// base64, and room for the rest of the line.
+fn post_line_bytes(post: &StoredPost) -> usize {
+    const REST: usize = 256;
+    match &post.message {
+        PostBody::Inline(bytes) => bytes.len().div_ceil(3) * 4 + REST,
+        PostBody::Blob(_) => REST,
+    }
 }
 
 /// A kept post as a POST line (5.2).
@@ -876,13 +1073,25 @@ pub(super) fn conn_closed(inner: &Arc<Inner>, id: ConnId, _conn: &ConnEntry) {
 pub(super) async fn maintain(inner: Arc<Inner>) {
     let mut every = tokio::time::interval(MAINTAIN_EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut rounds: u64 = 0;
     loop {
         every.tick().await;
         if let Err(e) = run_maintenance(&inner).await {
             tracing::error!("mailbox maintenance: {e}");
         }
+        // Every so often, what expiry deleted leaves the write-ahead log
+        // too (4.2).
+        rounds += 1;
+        if rounds.is_multiple_of(CHECKPOINT_EVERY)
+            && let Err(e) = inner.db(|store| store.checkpoint()).await
+        {
+            tracing::error!("checkpointing the database: {e}");
+        }
     }
 }
+
+/// How many maintenance rounds go between checkpoints of the database.
+const CHECKPOINT_EVERY: u64 = 10;
 
 /// One round of [`maintain`].
 pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
@@ -902,8 +1111,15 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
         if inner.mailbox.followed(&mailbox) {
             continue;
         }
-        // With its token sets and push subscriptions (7.5).
-        inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
+        // With its token sets and push subscriptions (7.5), if it is still
+        // idle now that no post can come in: one may have since the list
+        // was read.
+        if !inner
+            .db(move |store| store.drop_idle_mailbox(&mailbox, before))
+            .await?
+        {
+            continue;
+        }
         inner.mailbox.rooms.forget(&mailbox);
         keys::room_ended(inner, mailbox).await?;
         misc::mailbox_dropped(inner, mailbox).await;
@@ -912,23 +1128,24 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
 }
 
 /// Files or blobs of `mailbox` will take `files` bytes of its quota (7.5):
-/// its oldest posts expire early until its posts fit in the rest. Under
+/// its oldest posts expire early until its posts fit in the rest, but
+/// never its commits and proposals. Returns whether they fit then. Under
 /// the mailbox's lock, so that it does not run within a POST. The keys
 /// area calls this for UPLOAD and BLOB.
 pub(crate) async fn make_room(
     inner: &Inner,
     mailbox: BoxName,
     files: u64,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let _lock = inner.mailbox.lock(mailbox).await;
     let max = inner.config.limits.mailbox_quota.saturating_sub(files);
-    let expired = inner
+    let (expired, fits) = inner
         .db(move |store| store.trim_posts(&mailbox, max))
         .await?;
     if expired > 0 {
         tracing::debug!(expired, "posts expired early for files");
     }
-    Ok(())
+    Ok(fits)
 }
 
 /// The role that lets an identity mute in a public room (6.4).

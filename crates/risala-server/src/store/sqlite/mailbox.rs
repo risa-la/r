@@ -19,7 +19,7 @@ use crate::store::mailbox::{
 use crate::store::{
     Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom,
     PostBody, Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomUpdate, StoreError,
-    StoredPost, fixed, millis, parsed, timestamp,
+    StoredPost, coarse, fixed, millis, parsed, timestamp,
 };
 
 /// The mailbox area's tables.
@@ -40,10 +40,10 @@ CREATE TABLE mailboxes (
     group_id BLOB NOT NULL,         -- shared by the mailboxes a group moved through
     first_epoch INTEGER NOT NULL DEFAULT 0 CHECK (first_epoch >= 0), -- 0, or a move's (7.8)
     moved_from BLOB REFERENCES mailboxes (box) ON DELETE SET NULL, -- for TOKEN (7.2, 7.8)
-    created INTEGER NOT NULL,       -- ms
+    created INTEGER NOT NULL,       -- ms, to the hour (4.2)
     head INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0), -- the newest seq given out
     bytes INTEGER NOT NULL DEFAULT 0 CHECK (bytes >= 0), -- of its kept posts, for its quota (7.5)
-    active INTEGER NOT NULL         -- ms of its newest post, or of its creation (7.5)
+    active INTEGER NOT NULL         -- ms of its newest post, or of its creation, to the hour (7.5)
 ) STRICT;
 CREATE INDEX mailboxes_group ON mailboxes (group_id, created);
 
@@ -54,8 +54,8 @@ CREATE TABLE token_hashes (
     box BLOB NOT NULL REFERENCES mailboxes (box) ON DELETE CASCADE,
     epoch INTEGER NOT NULL CHECK (epoch >= 0),
     hash BLOB NOT NULL CHECK (length(hash) = 48),
-    added INTEGER NOT NULL,         -- ms
-    used INTEGER,                   -- ms of the last post that used it
+    added INTEGER NOT NULL,         -- ms, to the hour (4.2)
+    used INTEGER,                   -- ms of the last post that used it, to the hour
     token INTEGER NOT NULL DEFAULT 0 CHECK (token IN (0, 1)), -- 1 if TOKEN added it, 0 a commit or CREATE
     PRIMARY KEY (box, epoch, hash)
 ) STRICT; -- with a rowid, the order hashes were added in
@@ -69,6 +69,8 @@ CREATE TABLE posts (
     message BLOB,                   -- the MLSMessage, or NULL if it is a blob
     blob BLOB CHECK (length(blob) = 48), -- the blob's hash, if it is one (12.12)
     next BLOB CHECK (length(next) = 48), -- a commit's next= token hash (5.2, 7.2)
+    handshake INTEGER NOT NULL DEFAULT 0 CHECK (handshake IN (0, 1)), -- 1 for a commit or
+                                    -- proposal, which do not expire early (7.5)
     UNIQUE (box, seq),
     CHECK ((message IS NULL) != (blob IS NULL))
 ) STRICT;
@@ -108,9 +110,17 @@ CREATE TABLE public_rooms (
     members INTEGER NOT NULL DEFAULT 1, -- identities and guests with a leaf (6.1)
     topic TEXT NOT NULL DEFAULT '', -- escaped, from the conversation extension (6.2)
     guests TEXT NOT NULL DEFAULT 'write' CHECK (guests IN ('none', 'read', 'write')),
-    proposals BLOB NOT NULL DEFAULT x'', -- the epoch's pending proposals, each a u32 length and its bytes
     epoch_state BLOB NOT NULL DEFAULT x'' -- what the group checks need of the epoch (12.7)
 ) STRICT;
+
+-- The proposals pending in each public room's current epoch (12.6), one
+-- row each, in the order they were posted.
+CREATE TABLE room_proposals (
+    box BLOB NOT NULL REFERENCES public_rooms (box) ON DELETE CASCADE,
+    n INTEGER NOT NULL CHECK (n >= 0), -- its place in the epoch's proposals
+    message BLOB NOT NULL,          -- the MLSMessage
+    PRIMARY KEY (box, n)
+) STRICT, WITHOUT ROWID;
 
 -- The uids with a leaf in each public room's group (6.1, 8.3), and their
 -- roles in its conversation extension (6.3).
@@ -159,32 +169,6 @@ fn remember(tx: &Transaction<'_>, kind: i64, bytes: &[u8]) -> Result<()> {
 /// The `before` of a time `ago` before `now`, in ms.
 fn ms_before(now: Timestamp, ago: Duration) -> i64 {
     millis(now).saturating_sub(i64::try_from(ago.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// Encodes a public room's pending proposals: each a u32 length and its
-/// bytes.
-fn encode_proposal(message: &[u8]) -> Vec<u8> {
-    let len = u32::try_from(message.len()).unwrap_or(u32::MAX);
-    let mut out = Vec::with_capacity(4 + message.len());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(message);
-    out
-}
-
-/// Decodes what [`encode_proposal`] wrote, one after another.
-fn decode_proposals(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
-    while !bytes.is_empty() {
-        let corrupt = || StoreError::Corrupt("a room's pending proposals".into());
-        let (len, rest) = bytes.split_first_chunk::<4>().ok_or_else(corrupt)?;
-        let len = u32::from_be_bytes(*len) as usize;
-        if rest.len() < len {
-            return Err(corrupt());
-        }
-        out.push(rest[..len].to_vec());
-        bytes = &rest[len..];
-    }
-    Ok(out)
 }
 
 /// Checks a new mailbox against the boxes and group ids seen before (5.2,
@@ -247,7 +231,7 @@ fn insert_mailbox(
     let group = &new.group_id.as_bytes()[..];
     remember(tx, USED_BOX, mailbox)?;
     remember(tx, USED_GROUP, group)?;
-    let created = millis(new.created);
+    let created = coarse(new.created);
     tx.execute(
         "INSERT INTO mailboxes (box, group_id, first_epoch, moved_from, created, active)
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -348,7 +332,7 @@ fn store_room_group(
     let members = group.members.len() as i64;
     tx.execute(
         "UPDATE public_rooms SET epoch = ?, epoch_seq = ?, group_info = ?, tree = ?,
-             members = ?, topic = ?, guests = ?, proposals = x'', epoch_state = ?
+             members = ?, topic = ?, guests = ?, epoch_state = ?
          WHERE box = ?",
         params![
             sql_u64(group.epoch),
@@ -362,6 +346,7 @@ fn store_room_group(
             mailbox
         ],
     )?;
+    tx.execute("DELETE FROM room_proposals WHERE box = ?", [mailbox])?;
     tx.execute("DELETE FROM room_members WHERE box = ?", [mailbox])?;
     let mut insert =
         tx.prepare_cached("INSERT INTO room_members (box, uid, role) VALUES (?, ?, ?)")?;
@@ -371,28 +356,36 @@ fn store_room_group(
     Ok(())
 }
 
-/// Expires the oldest posts of `mailbox` until it keeps at most `max`
-/// bytes of posts (7.5). Returns how many expired.
-fn trim_posts(tx: &Transaction<'_>, mailbox: &[u8], max: u64) -> Result<usize> {
+/// The bytes of the posts `mailbox` keeps (7.5).
+fn post_bytes(tx: &Transaction<'_>, mailbox: &[u8]) -> Result<u64> {
+    let bytes: Option<i64> = tx
+        .query_row(
+            "SELECT bytes FROM mailboxes WHERE box = ?",
+            [mailbox],
+            |row| row.get(0),
+        )
+        .optional()?;
+    from_sql_u64("bytes", bytes.unwrap_or(0))
+}
+
+/// Expires the oldest posts of `mailbox` that are not commits or
+/// proposals until it keeps at most `max` bytes of posts (7.5). Commits
+/// and proposals never expire early: a device that missed one could not
+/// read anything after it. Returns how many expired, and whether the
+/// posts now fit.
+fn trim_posts(tx: &Transaction<'_>, mailbox: &[u8], max: u64) -> Result<(usize, bool)> {
     let mut expired = 0;
     loop {
-        let bytes: Option<i64> = tx
-            .query_row(
-                "SELECT bytes FROM mailboxes WHERE box = ?",
-                [mailbox],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if from_sql_u64("bytes", bytes.unwrap_or(0))? <= max {
-            return Ok(expired);
+        if post_bytes(tx, mailbox)? <= max {
+            return Ok((expired, true));
         }
         let deleted = tx.execute(
             "DELETE FROM posts WHERE box = ?1 AND seq = (
-                 SELECT min(seq) FROM posts WHERE box = ?1)",
+                 SELECT min(seq) FROM posts WHERE box = ?1 AND handshake = 0)",
             [mailbox],
         )?;
         if deleted == 0 {
-            return Ok(expired);
+            return Ok((expired, false));
         }
         expired += deleted;
     }
@@ -536,7 +529,7 @@ impl MailboxStore for SqliteStore {
                 epoch,
                 hash,
                 AddedBy::Token,
-                millis(now),
+                coarse(now),
             )
         })
     }
@@ -558,8 +551,13 @@ impl MailboxStore for SqliteStore {
             if size > post.quota {
                 return Ok(Posted::OverQuota);
             }
-            // Over its quota, the mailbox's oldest posts expire early (7.5).
-            trim_posts(tx, mailbox, post.quota - size)?;
+            // Over its quota, the mailbox's oldest posts expire early (7.5),
+            // but not its commits and proposals: if those alone fill it, the
+            // post waits until they expire.
+            let (_, fits) = trim_posts(tx, mailbox, post.quota - size)?;
+            if !fits {
+                return Ok(Posted::OverQuota);
+            }
             let seq = head + 1;
             let t = millis(post.t);
             let (message, blob) = match &post.message {
@@ -567,24 +565,28 @@ impl MailboxStore for SqliteStore {
                 PostBody::Blob(blob) => (None, Some(&blob.hash()[..])),
             };
             tx.execute(
-                "INSERT INTO posts (box, seq, t, message, blob, next) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO posts (box, seq, t, message, blob, next, handshake)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![
                     mailbox,
                     seq,
                     t,
                     message,
                     blob,
-                    post.next.as_ref().map(|(_, next)| &next.as_bytes()[..])
+                    post.next.as_ref().map(|(_, next)| &next.as_bytes()[..]),
+                    post.handshake
                 ],
             )?;
+            // Times kept only for retention and order are coarse (4.2).
+            let hour = coarse(post.t);
             tx.execute(
                 "UPDATE mailboxes SET head = ?, active = ? WHERE box = ?",
-                params![seq, t, mailbox],
+                params![seq, hour, mailbox],
             )?;
             if let Some((epoch, hash)) = &post.token {
                 tx.execute(
                     "UPDATE token_hashes SET used = ? WHERE box = ? AND epoch = ? AND hash = ?",
-                    params![t, mailbox, sql_u64(*epoch), &hash.as_bytes()[..]],
+                    params![hour, mailbox, sql_u64(*epoch), &hash.as_bytes()[..]],
                 )?;
             }
             if let Some((epoch, next)) = &post.next {
@@ -594,7 +596,7 @@ impl MailboxStore for SqliteStore {
                     epoch.saturating_add(1),
                     next,
                     AddedBy::Commit,
-                    t,
+                    hour,
                 )?;
             }
             if let Some(cid) = &post.cid {
@@ -608,16 +610,14 @@ impl MailboxStore for SqliteStore {
             match &post.room {
                 Some(RoomChange::Commit(group)) => store_room_group(tx, mailbox, group, seq)?,
                 Some(RoomChange::Proposal { message, state }) => {
-                    // SQLite's || makes text of blobs: append here.
-                    let mut proposals: Vec<u8> = tx.query_row(
-                        "SELECT proposals FROM public_rooms WHERE box = ?",
-                        [mailbox],
-                        |row| row.get(0),
-                    )?;
-                    proposals.extend_from_slice(&encode_proposal(message));
                     tx.execute(
-                        "UPDATE public_rooms SET proposals = ?, epoch_state = ? WHERE box = ?",
-                        params![proposals, state, mailbox],
+                        "INSERT INTO room_proposals (box, n, message) VALUES (?1, (
+                             SELECT count(*) FROM room_proposals WHERE box = ?1), ?2)",
+                        params![mailbox, message],
+                    )?;
+                    tx.execute(
+                        "UPDATE public_rooms SET epoch_state = ? WHERE box = ?",
+                        params![state, mailbox],
                     )?;
                 }
                 None => {}
@@ -674,19 +674,10 @@ impl MailboxStore for SqliteStore {
     }
 
     fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64> {
-        self.read(|tx| {
-            let bytes: Option<i64> = tx
-                .query_row(
-                    "SELECT bytes FROM mailboxes WHERE box = ?",
-                    [&mailbox.as_bytes()[..]],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            from_sql_u64("bytes", bytes.unwrap_or(0))
-        })
+        self.read(|tx| post_bytes(tx, &mailbox.as_bytes()[..]))
     }
 
-    fn trim_posts(&self, mailbox: &BoxName, max: u64) -> Result<usize> {
+    fn trim_posts(&self, mailbox: &BoxName, max: u64) -> Result<(usize, bool)> {
         self.write(|tx| trim_posts(tx, &mailbox.as_bytes()[..], max))
     }
 
@@ -711,7 +702,7 @@ impl MailboxStore for SqliteStore {
         self.read(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT room, epoch, epoch_seq, group_info, tree, proposals, epoch_state
+                    "SELECT room, epoch, epoch_seq, group_info, tree, epoch_state
                      FROM public_rooms WHERE box = ?",
                     [&mailbox.as_bytes()[..]],
                     |row| {
@@ -722,21 +713,25 @@ impl MailboxStore for SqliteStore {
                             row.get::<_, Vec<u8>>(3)?,
                             row.get::<_, Vec<u8>>(4)?,
                             row.get::<_, Vec<u8>>(5)?,
-                            row.get::<_, Vec<u8>>(6)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((room, epoch, epoch_seq, group_info, tree, proposals, state)) = row else {
+            let Some((room, epoch, epoch_seq, group_info, tree, state)) = row else {
                 return Ok(None);
             };
+            let mut select =
+                tx.prepare_cached("SELECT message FROM room_proposals WHERE box = ? ORDER BY n")?;
+            let proposals = select
+                .query_map([&mailbox.as_bytes()[..]], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(Some(RoomGroup {
                 room: parsed("room", &room)?,
                 epoch: from_sql_u64("epoch", epoch)?,
                 epoch_seq: from_sql_u64("epoch seq", epoch_seq)?,
                 group_info,
                 tree,
-                proposals: decode_proposals(&proposals)?,
+                proposals,
                 state,
             }))
         })
@@ -922,6 +917,16 @@ impl MailboxStore for SqliteStore {
         })
     }
 
+    fn drop_idle_mailbox(&self, mailbox: &BoxName, before: Timestamp) -> Result<bool> {
+        self.write(|tx| {
+            Ok(tx.execute(
+                "DELETE FROM mailboxes WHERE box = ?1 AND active < ?2
+                 AND NOT EXISTS (SELECT 1 FROM posts WHERE box = ?1)",
+                params![&mailbox.as_bytes()[..], millis(before)],
+            )? > 0)
+        })
+    }
+
     fn idle_mailboxes(&self, before: Timestamp) -> Result<Vec<BoxName>> {
         self.read(|tx| {
             let mut select = tx.prepare_cached(
@@ -981,6 +986,7 @@ mod tests {
             cid: None,
             quota: u64::MAX,
             room: None,
+            handshake: false,
         }
     }
 
@@ -1171,7 +1177,8 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(used, Some(millis(t(1))));
+        // To the hour (4.2).
+        assert_eq!(used, Some(coarse(t(1))));
         assert_eq!(
             store.add_post(&post(m.mailbox, 2, 20)).unwrap(),
             Posted::Seq(2)
@@ -1228,6 +1235,9 @@ mod tests {
     /// hash the set holds already changes nothing (7.2).
     #[test]
     fn token_sets_are_bounded() {
+        // Times of token hashes are kept to the hour (4.2): these are hours.
+        let t = |hours: u64| t(hours * 3600);
+        let post = |m: BoxName, hours: u64, size: usize| post(m, hours * 3600, size);
         let store = SqliteStore::open_in_memory().unwrap();
         let m = new_mailbox(200);
         store.create_mailbox(&m).unwrap();
@@ -1315,6 +1325,9 @@ mod tests {
     /// A mailbox keeps the 256 sets used most recently (7.2).
     #[test]
     fn a_mailbox_keeps_256_sets() {
+        // Times of token sets are kept to the hour (4.2): these are hours.
+        let t = |hours: u64| t(hours * 3600);
+        let post = |m: BoxName, hours: u64, size: usize| post(m, hours * 3600, size);
         let store = SqliteStore::open_in_memory().unwrap();
         let m = new_mailbox(1);
         store.create_mailbox(&m).unwrap();
@@ -1365,12 +1378,61 @@ mod tests {
         for secs in 0..4 {
             store.add_post(&post(m.mailbox, secs, 30)).unwrap();
         }
-        assert_eq!(store.trim_posts(&m.mailbox, 120).unwrap(), 0);
-        assert_eq!(store.trim_posts(&m.mailbox, 70).unwrap(), 2);
+        assert_eq!(store.trim_posts(&m.mailbox, 120).unwrap(), (0, true));
+        assert_eq!(store.trim_posts(&m.mailbox, 70).unwrap(), (2, true));
         assert_eq!(seqs(&store, &m.mailbox), [3, 4]);
-        assert_eq!(store.trim_posts(&m.mailbox, 0).unwrap(), 2);
+        assert_eq!(store.trim_posts(&m.mailbox, 0).unwrap(), (2, true));
         assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 0);
-        assert_eq!(store.trim_posts(&new_mailbox(2).mailbox, 0).unwrap(), 0);
+        assert_eq!(
+            store.trim_posts(&new_mailbox(2).mailbox, 0).unwrap(),
+            (0, true)
+        );
+    }
+
+    /// Commits and proposals never expire early (7.5): application
+    /// messages go first, and a post that does not fit beside the commits
+    /// and proposals is refused.
+    #[test]
+    fn early_expiry_spares_commits_and_proposals() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        // seq 1 a commit, 2 a message, 3 a proposal, 4 a message.
+        for (secs, handshake) in [(0, true), (1, false), (2, true), (3, false)] {
+            let mut p = post(m.mailbox, secs, 30);
+            p.handshake = handshake;
+            store.add_post(&p).unwrap();
+        }
+        assert_eq!(store.trim_posts(&m.mailbox, 90).unwrap(), (1, true));
+        assert_eq!(seqs(&store, &m.mailbox), [1, 3, 4]);
+        assert_eq!(store.trim_posts(&m.mailbox, 0).unwrap(), (1, false));
+        assert_eq!(seqs(&store, &m.mailbox), [1, 3]);
+        // A post over the quota with only commits and proposals left.
+        let mut p = post(m.mailbox, 4, 30);
+        p.quota = 80;
+        assert_eq!(store.add_post(&p).unwrap(), Posted::OverQuota);
+        p.quota = 90;
+        assert_eq!(store.add_post(&p).unwrap(), Posted::Seq(5));
+        assert_eq!(seqs(&store, &m.mailbox), [1, 3, 5]);
+    }
+
+    /// The idle clean-up deletes a mailbox only if it is still idle in the
+    /// same transaction (7.5).
+    #[test]
+    fn idle_mailboxes_are_dropped_only_while_idle() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        let later = t(40 * 24 * 3600);
+        assert_eq!(store.idle_mailboxes(later).unwrap(), [m.mailbox]);
+        // A post arrives after the list was read.
+        store.add_post(&post(m.mailbox, 39 * 24 * 3600, 1)).unwrap();
+        assert!(!store.drop_idle_mailbox(&m.mailbox, later).unwrap());
+        assert!(store.mailbox(&m.mailbox).unwrap().is_some());
+        let n = new_mailbox(2);
+        store.create_mailbox(&n).unwrap();
+        assert!(store.drop_idle_mailbox(&n.mailbox, later).unwrap());
+        assert!(store.mailbox(&n.mailbox).unwrap().is_none());
     }
 
     /// Retention expires posts oldest first, stopping at the first that is

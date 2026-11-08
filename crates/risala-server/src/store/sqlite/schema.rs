@@ -115,6 +115,7 @@ mod tests {
                 "report_posts",
                 "reports",
                 "room_members",
+                "room_proposals",
                 "room_trees",
                 "server_bans",
                 "settings",

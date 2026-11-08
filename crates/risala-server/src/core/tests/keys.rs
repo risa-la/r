@@ -801,11 +801,12 @@ async fn welcomes_for_external_proposals_come_from_the_committer_with_the_tree()
         format!("WELCOME {id} {} tree={tree}", mls_welcome(2))
     );
     assert_eq!(lines[1], "OK");
-    // Fetched: only the same Welcome again is taken.
+    // Anyone may send WELCOME GET, so it does not stop the committer
+    // replacing the Welcome (12.8); the same one again changes nothing.
     h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(3)))
         .await;
-    assert_eq!(b.lines(), ["ERR forbidden"]);
-    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(2)))
+    assert_eq!(b.lines(), ["OK"]);
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(3)))
         .await;
     assert_eq!(b.lines(), ["OK"]);
     // Light clients are not built (12.6).
@@ -1475,4 +1476,82 @@ fn servers_allow_blobs_of_at_least_256_mib() {
     assert!(c.validate().is_err());
     c.files.url = Some("https://files.example.org:8443".into());
     assert!(c.validate().is_ok());
+}
+
+/// A BLOB for a blob the server holds keeps it stored for another
+/// retention period, so it counts against the address's window as
+/// storing it would (7.5, 12.12).
+#[tokio::test]
+async fn blobs_kept_alive_count_against_the_address() {
+    let mut h = keys_with(|c| c.limits.address_bytes_per_hour = 25_000);
+    h.mailbox();
+    let mut anon = h.anon().await;
+    let bytes = vec![3; 10_000];
+    let hash = h.store_blob(&mut anon, &bytes).await;
+    let again = format!("BLOB {hash} 10000 box={BOX} token={}", token());
+    h.send(&anon, &again).await;
+    assert_eq!(anon.lines(), ["OK exists=yes"]);
+    h.send(&anon, &again).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+}
+
+/// Above `limits.max_stored_bytes`, the server stores nothing more, for
+/// anyone (7.5).
+#[tokio::test]
+async fn the_server_stores_at_most_its_cap() {
+    let mut h = keys_with(|c| c.limits.max_stored_bytes = 30_000);
+    h.mailbox();
+    let mut anon = h.anon().await;
+    h.store_blob(&mut anon, &[1; 20_000]).await;
+    h.send(
+        &anon,
+        &format!(
+            "BLOB {} 20000 box={BOX} token={}",
+            BlobRef::of(&[2; 20_000]),
+            token()
+        ),
+    )
+    .await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+    // From another address too, and after a maintenance round counts what
+    // is stored again.
+    crate::core::keys::expire(h.inner()).await.unwrap();
+    let mut far = h.connect_from("198.51.100.9:4000");
+    h.send(&far, "ANON").await;
+    h.send(&far, &format!("UPLOAD {BOX} {} 20000", token()))
+        .await;
+    assert_eq!(far.lines()[1], "@retry=3600 ERR rate-limited");
+}
+
+/// Handouts and Welcomes are stored with their times to the hour only, so
+/// that a database read later does not show when a group was made from
+/// whose KeyPackages (4.2).
+#[tokio::test]
+async fn handouts_and_welcomes_keep_coarse_times() {
+    let mut h = keys();
+    let bob = Dev::new("bob@example.net", 1);
+    h.key_file(&[&bob]);
+    let mut b = h.sign_in(&bob);
+    let kp_ref = h.add_key_package(&mut b, &bob, false).await;
+    let mut anon = h.anon().await;
+    let got = h.keypkg_get(&mut anon, "bob@example.net").await;
+    let secret = &got[0].1;
+    h.send(
+        &anon,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(1)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK"]);
+    let hour = crate::store::coarse(h.inner().now());
+    let times: (i64, i64) = h
+        .store
+        .raw()
+        .query_row(
+            "SELECT h.handed, w.received FROM handed_out h JOIN welcomes w ON w.handed = h.id",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(times, (hour, hour));
+    assert_eq!(hour % (60 * 60 * 1000), 0);
 }

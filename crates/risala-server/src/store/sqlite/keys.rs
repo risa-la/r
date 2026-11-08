@@ -15,7 +15,9 @@ use crate::store::keys::{
     Handout, HandoutRow, KeyPackageCount, NewKeyPackage, PutWelcome, RefBytes, RoomJoins,
     RoomWelcome, StoredWelcome, UploadRecord,
 };
-use crate::store::{BackupRecord, KeysStore, Result, StoreError, fixed, millis, parsed, timestamp};
+use crate::store::{
+    BackupRecord, KeysStore, Result, StoreError, coarse, fixed, millis, parsed, timestamp,
+};
 
 /// The keys area's tables.
 pub(super) const SCHEMA: &str = "
@@ -72,7 +74,7 @@ CREATE TABLE handed_out (
                                     -- of an external proposal's commit,
     committer_uid TEXT,             -- and the identity and device id of the
     committer BLOB CHECK (length(committer) = 48), -- device that made it
-    handed INTEGER NOT NULL,        -- ms; forgotten after retention (7.5)
+    handed INTEGER NOT NULL,        -- ms, to the hour (4.2); forgotten after retention (7.5)
     welcomed BLOB CHECK (length(welcomed) = 48), -- the hash of the Welcome put for it
     CHECK ((device IS NULL) != (tree IS NULL)),
     CHECK ((device IS NULL) = (uid IS NULL) AND (device IS NULL) = (secret_hash IS NULL)),
@@ -90,8 +92,9 @@ CREATE TABLE welcomes (
     handed INTEGER NOT NULL UNIQUE REFERENCES handed_out (id) ON DELETE CASCADE,
     welcome BLOB NOT NULL,          -- the Welcome, or its blob's hash
     is_blob INTEGER NOT NULL DEFAULT 0 CHECK (is_blob IN (0, 1)),
-    received INTEGER NOT NULL,      -- ms; deleted after retention (7.5)
-    fetched INTEGER NOT NULL DEFAULT 0 CHECK (fetched IN (0, 1)) -- WELCOME GET returned it
+    received INTEGER NOT NULL,      -- ms, to the hour (4.2); deleted after retention (7.5)
+    fetched INTEGER NOT NULL DEFAULT 0 CHECK (fetched IN (0, 1)) -- unused: WELCOME GET does not
+                                    -- freeze a Welcome, since anyone may send it
 ) STRICT;
 CREATE INDEX welcomes_received ON welcomes (received);
 
@@ -457,7 +460,7 @@ impl KeysStore for SqliteStore {
                         uid.as_str(),
                         &device[..],
                         &secret.as_bytes()[..],
-                        millis(now)
+                        coarse(now)
                     ],
                 )?;
                 out.push(HandedKeyPackage {
@@ -520,7 +523,7 @@ impl KeysStore for SqliteStore {
                         id,
                         joins.committer_uid.as_str(),
                         &joins.committer[..],
-                        millis(now)
+                        coarse(now)
                     ],
                 )?;
             }
@@ -619,7 +622,7 @@ impl KeysStore for SqliteStore {
                 Some((existing, _)) => {
                     tx.execute(
                         "UPDATE welcomes SET welcome = ?, is_blob = ?, received = ? WHERE id = ?",
-                        params![bytes, is_blob, millis(now), existing],
+                        params![bytes, is_blob, coarse(now), existing],
                     )?;
                     PutWelcome::Replaced(existing)
                 }
@@ -640,7 +643,7 @@ impl KeysStore for SqliteStore {
                     tx.execute(
                         "INSERT INTO welcomes (id, handed, welcome, is_blob, received)
                          VALUES (?, ?, ?, ?, ?)",
-                        params![id, handout, bytes, is_blob, millis(now)],
+                        params![id, handout, bytes, is_blob, coarse(now)],
                     )?;
                     PutWelcome::Stored(id.to_owned())
                 }
@@ -677,7 +680,7 @@ impl KeysStore for SqliteStore {
     }
 
     fn room_welcome(&self, key_package_ref: &RefBytes) -> Result<Option<RoomWelcome>> {
-        self.write(|tx| {
+        self.read(|tx| {
             let row = tx
                 .query_row(
                     "SELECT w.id, w.welcome, w.is_blob, t.tree, t.is_blob FROM welcomes w
@@ -697,7 +700,9 @@ impl KeysStore for SqliteStore {
             let Some((welcome, tree, is_blob)) = row else {
                 return Ok(None);
             };
-            tx.execute("UPDATE welcomes SET fetched = 1 WHERE id = ?", [&welcome.0])?;
+            // Not marked fetched: a KeyPackageRef of an external proposal
+            // is public, so anyone may GET it, and that must not stop the
+            // committer replacing its Welcome (12.8).
             Ok(Some(RoomWelcome {
                 welcome: stored_welcome(welcome)?,
                 tree: or_blob("tree blob", tree, is_blob)?,
@@ -829,6 +834,20 @@ impl KeysStore for SqliteStore {
                       + (SELECT coalesce(sum(size), 0) FROM blob_puts WHERE box = ?1)
                       + (SELECT coalesce(sum(size), 0) FROM uploads WHERE box = ?1)",
                 [b],
+                |row| row.get(0),
+            )?;
+            from_sql_u64("bytes", total)
+        })
+    }
+
+    fn stored_total(&self) -> Result<u64> {
+        self.read(|tx| {
+            let total: i64 = tx.query_row(
+                "SELECT (SELECT coalesce(sum(size), 0) FROM blobs)
+                      + (SELECT coalesce(sum(size), 0) FROM blob_puts)
+                      + (SELECT coalesce(sum(size), 0) FROM uploads)
+                      + (SELECT coalesce(sum(bytes), 0) FROM mailboxes)",
+                [],
                 |row| row.get(0),
             )?;
             from_sql_u64("bytes", total)
@@ -1409,14 +1428,15 @@ mod tests {
             store.room_welcome(&[9; 48]).unwrap().unwrap().tree,
             OrBlob::Inline(vec![1, 2])
         );
-        // Fetched: only the same Welcome is taken now.
+        // WELCOME GET does not freeze it: the committer may still replace
+        // it, since anyone may send WELCOME GET (12.8).
         let h = handouts[0].id;
-        assert_eq!(
+        assert!(matches!(
             store
                 .put_welcome(h, "x", &OrBlob::Inline(vec![6]), &[6; 48], 0, t(T0))
                 .unwrap(),
-            PutWelcome::Taken
-        );
+            PutWelcome::Replaced(_)
+        ));
         // 24 hours after its commit, a tree goes with its Welcomes, and the
         // blob the server made of it with them.
         let expired = store

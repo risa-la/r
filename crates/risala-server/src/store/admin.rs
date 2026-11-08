@@ -83,4 +83,10 @@ pub trait AdminStore {
 
     /// Lifts a server ban (10.2). Returns `false` if there was none.
     fn remove_server_ban(&self, target: &ServerBanTarget) -> Result<bool>;
+
+    /// Moves what was written into the database file proper, and empties
+    /// the write-ahead log, so that rows deleted to honour 4.2 and
+    /// retention (7.5) do not stay there. The hub calls this after its
+    /// maintenance rounds.
+    fn checkpoint(&self) -> Result<()>;
 }

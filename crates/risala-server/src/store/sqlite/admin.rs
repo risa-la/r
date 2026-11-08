@@ -36,6 +36,10 @@ CREATE TABLE server_bans (
 ";
 
 impl AdminStore for SqliteStore {
+    fn checkpoint(&self) -> Result<()> {
+        SqliteStore::checkpoint(self)
+    }
+
     fn settings(&self, defaults: &ServerSettings) -> Result<ServerSettings> {
         self.read(|tx| {
             let mut settings = defaults.clone();

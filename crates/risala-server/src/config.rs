@@ -201,6 +201,16 @@ pub struct PushConfig {
     /// The most account subscriptions one device may have (9.1). At least
     /// 1.
     pub max_per_device: usize,
+    /// The most mailbox subscriptions one network address may add in an
+    /// hour (9.1). IPv6 addresses count by their /64. 0 means no limit.
+    pub adds_per_hour: u32,
+    /// The most pushes on their way at once, to everyone (9.1): further
+    /// ones wait. At least 1.
+    pub max_in_flight: usize,
+    /// The most pushes sent to one host in a second, whatever their paths
+    /// (9.1), so that subscriptions cannot point the server at a host to
+    /// flood it. Further ones wait. At least 1.
+    pub per_host_per_second: u32,
 }
 
 impl Default for PushConfig {
@@ -212,6 +222,9 @@ impl Default for PushConfig {
             max_per_mailbox: 4_096,
             max_per_connection: 1024,
             max_per_device: 16,
+            adds_per_hour: 1024,
+            max_in_flight: 256,
+            per_host_per_second: 50,
         }
     }
 }
@@ -473,6 +486,53 @@ pub struct Limits {
     pub commits_per_hour: u32,
     /// The most mailboxes one connection may follow (7.1): at least 1,000.
     pub max_follows: usize,
+    /// The most bytes the server stores in all: blobs, uploaded files and
+    /// kept posts (7.5). Above it, POST, UPLOAD and BLOB get
+    /// `ERR rate-limited` for everyone until enough expires, so that a few
+    /// addresses cannot fill the disk. 0 means no limit.
+    pub max_stored_bytes: u64,
+    /// The most bytes of blobs the server reads into memory at once, for
+    /// everyone (12.12): a public room's commits, GroupInfos and trees and
+    /// KEYS PUT's records. Readers wait for room beyond it. At least 1 MiB.
+    pub blob_memory: u64,
+    /// The largest blob a public room's commit or proposal, GroupInfo or
+    /// tree may be (6.1, 12.12), since the server reads these whole to
+    /// check them. Other posts' blobs are not read, only their framing.
+    pub max_room_blob: u64,
+    /// The most KEYS PUT one network address may send in an hour (4.7: a
+    /// server MUST rate-limit it per network address). 0 means no limit.
+    pub keys_puts_per_hour: u32,
+    /// Whether the server logs identities it does not host whose key files
+    /// name its log (4.7). Off, their KEYS PUT gets `ERR not-supported`.
+    pub log_outside_identities: bool,
+    /// The most identities the server does not host that it starts to log
+    /// in a day, per registered domain (the last two labels of the
+    /// identity's domain), since each one adds entries to the log for
+    /// ever (4.5, 4.7). Further ones get `ERR rate-limited`. 0 means no
+    /// limit.
+    pub outside_identities_per_day: u32,
+    /// The most risala connections one network address may have open at
+    /// once (4.2). IPv6 addresses count by their /64. Others are closed as
+    /// soon as they are accepted. 0 means no limit.
+    pub connections_per_address: usize,
+    /// The most guest sessions one network address may have at once,
+    /// those waiting to be resumed included (4.2). Further GUESTs get
+    /// `ERR rate-limited`. 0 means no limit.
+    pub guests_per_address: usize,
+    /// The most AUTHs of identities whose key file is not cached that one
+    /// network address may send in an hour, since each one may make the
+    /// server fetch a key file (4.4, 4.6). Further ones get
+    /// `ERR rate-limited`. 0 means no limit.
+    pub fetching_auths_per_hour: u32,
+    /// The most join proposals with `-` one network address may post in
+    /// an hour, to all public rooms together (6.1, 12.6). Further ones get
+    /// `ERR rate-limited`. 0 means no limit.
+    pub joins_per_hour: u32,
+    /// The most proposals from one network address that may be pending in
+    /// one epoch of a public room (12.6), so that one address cannot fill
+    /// the epoch's proposals and keep others from joining. 0 means no
+    /// limit.
+    pub pending_per_address: u32,
 }
 
 /// The most lines a command's response has besides a full page of posts
@@ -609,6 +669,17 @@ impl Default for Limits {
             posts_per_minute: 600,
             commits_per_hour: 600,
             max_follows: 4096,
+            max_stored_bytes: 256 * 1024 * 1024 * 1024,
+            blob_memory: 1024 * 1024 * 1024,
+            max_room_blob: 16 * 1024 * 1024,
+            keys_puts_per_hour: 60,
+            log_outside_identities: true,
+            outside_identities_per_day: 100,
+            connections_per_address: 64,
+            guests_per_address: 16,
+            fetching_auths_per_hour: 120,
+            joins_per_hour: 30,
+            pending_per_address: 8,
         }
     }
 }
@@ -682,6 +753,7 @@ impl Config {
             ("max_list", l.max_list),
             ("presence_batch_ms", l.presence_batch_ms),
             ("max_key_packages", l.max_key_packages as u64),
+            ("max_room_blob", l.max_room_blob),
         ] {
             if value == 0 {
                 return invalid(format!("limits.{name} must be at least 1"));
@@ -704,6 +776,9 @@ impl Config {
                 "limits.max_key_package_bytes is {}, but must be at least {MIN_KEY_PACKAGE_BYTES} (12.5)",
                 l.max_key_package_bytes
             ));
+        }
+        if l.blob_memory < 1024 * 1024 {
+            return invalid("limits.blob_memory must be at least 1 MiB".into());
         }
         if l.max_follows < MIN_FOLLOWS {
             return invalid(format!(
@@ -747,6 +822,8 @@ impl Config {
             ("max_per_mailbox", p.max_per_mailbox),
             ("max_per_connection", p.max_per_connection),
             ("max_per_device", p.max_per_device),
+            ("max_in_flight", p.max_in_flight),
+            ("per_host_per_second", p.per_host_per_second as usize),
         ] {
             if value == 0 {
                 return invalid(format!("push.{name} must be at least 1 (9.1)"));

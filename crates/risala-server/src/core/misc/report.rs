@@ -42,7 +42,11 @@ use super::super::command::{Cx, Reply, err};
 use super::super::rate::{WindowLimit, network};
 use super::super::state::Who;
 use super::super::{admin, keys};
-use crate::store::{KeptPost, NewReport, StoredReport};
+use crate::store::{KeptPost, NewReport, PostBody, StoredReport};
+
+/// How much of a reported post that is a blob the server reads: enough
+/// for its framing and RisalaAAD, which hold the franking tag (12.9).
+const REPORT_PREFIX: usize = 16 * 1024;
 
 /// The most context posts a report may name (5.8).
 pub(crate) const MAX_CONTEXT: usize = 10;
@@ -232,10 +236,16 @@ pub(super) async fn report(cx: &Cx, mailbox: BoxName, data: ReportData) -> Reply
         _ => Reporter::Network(network(cx.peer.ip())),
     };
     let max = inner.config.limits.reports_per_hour;
-    let slot = match inner.misc.reports.limit.take(reporter, max, inner.now()) {
-        Ok(slot) => slot,
+    // Every REPORT uses up its slot, whatever becomes of it: one that fails
+    // has made the server read posts all the same.
+    match inner.misc.reports.limit.take(reporter, max, inner.now()) {
+        Ok(slot) => {
+            if let Some(slot) = slot {
+                slot.keep();
+            }
+        }
         Err(retry) => return Err(err(ErrorCode::RateLimited).with_retry(retry)),
-    };
+    }
     let report = RisalaReport::decode(&data.decode())
         .map_err(|why| err(ErrorCode::Invalid).with_message(why))?;
     // Every post named must still be kept (5.8).
@@ -253,19 +263,31 @@ pub(super) async fn report(cx: &Cx, mailbox: BoxName, data: ReportData) -> Reply
         let Some(kept) = kept else {
             return Err(err(ErrorCode::NotFound));
         };
-        let message = match kept.message {
-            Ok(message) => message,
-            Err(blob) => keys::blob_bytes(inner, &blob, inner.config.files.max_blob)
-                .await
-                .map_err(ErrResponse::from)?,
+        // The franking tag is in the RisalaAAD, near the start: a post
+        // that is a blob is checked from its first bytes, and kept by its
+        // hash, never read whole (12.12).
+        let (framing, copy) = match kept.message {
+            Ok(message) => (message.clone(), PostBody::Inline(message)),
+            Err(blob) => {
+                let (prefix, size) = keys::blob_prefix(inner, &blob, REPORT_PREFIX)
+                    .await
+                    .map_err(ErrResponse::from)?;
+                let framing = if prefix.len() as u64 == size {
+                    prefix
+                } else {
+                    super::super::mailbox::private_message_stub(&prefix, size)
+                        .ok_or_else(|| err(ErrorCode::Invalid).with_message("not an MLS message"))?
+                };
+                (framing, PostBody::Blob(blob))
+            }
         };
-        match check_post(post, &message) {
+        match check_post(post, &framing) {
             Ok(p) => {
                 pseudonym.get_or_insert(p);
             }
             Err(PostCheck(why)) => return Err(err(ErrorCode::Invalid).with_message(why)),
         }
-        copies.push((post.seq, kept.t, message));
+        copies.push((post.seq, kept.t, copy));
     }
     let pseudonym = pseudonym.expect("a report names its target");
     let id: Id = crate::secret::random_token(26)
@@ -293,9 +315,6 @@ pub(super) async fn report(cx: &Cx, mailbox: BoxName, data: ReportData) -> Reply
         posts: copies,
     };
     cx.db(move |store| store.add_report(&new)).await?;
-    if let Some(slot) = slot {
-        slot.keep();
-    }
     // Files the posts share stay until the report is resolved (5.8).
     let urls: Vec<FileUrl> = report.posts().flat_map(|p| file_urls(&p.content)).collect();
     if !urls.is_empty() {

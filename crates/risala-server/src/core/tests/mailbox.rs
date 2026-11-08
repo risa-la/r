@@ -915,6 +915,27 @@ async fn rate_limits() {
     h.send(&far, &format!("TOKEN {} 1 {token1} {}", d.m, hash([9; 48])))
         .await;
     assert!(far.lines()[0].ends_with("ERR rate-limited"));
+    // A commit over its limit does not use up a post's slot either: the
+    // two slots are taken together, or neither.
+    let first = d.alice.send(&mut d.a, b"first");
+    let second = d.alice.send(&mut d.a, b"second");
+    let out = d.alice.commit(&mut d.a, Changes::default());
+    h.send(
+        &far,
+        &format!(
+            "POST {} {token1} {} next={}",
+            d.m,
+            b64(&out.message),
+            hash(out.next_token_hash)
+        ),
+    )
+    .await;
+    assert!(far.lines()[0].ends_with("ERR rate-limited"));
+    for message in [first, second] {
+        h.send(&far, &format!("POST {} {token1} {message}", d.m))
+            .await;
+        assert!(far.lines()[0].starts_with("OK seq="));
+    }
 }
 
 /// The bytes one address stores in an hour (7.5).
@@ -985,8 +1006,10 @@ async fn quotas() {
     }
     h.send(&anon, &format!("FETCH {} after=0", d.m)).await;
     let lines = anon.lines();
-    // The oldest posts expired early; the newest are all there.
-    assert!(!lines[0].starts_with("@seq=1;"));
+    // The oldest messages expired early, but not the commit (seq 1); the
+    // newest are all there.
+    assert!(lines[0].starts_with("@seq=1;"), "{lines:?}");
+    assert!(!lines[1].starts_with("@seq=2;"), "{lines:?}");
     assert!(lines[lines.len() - 2].starts_with("@seq=21;"));
     let big = d.alice.send(&mut d.a, &[9; 70_000]);
     h.send(
@@ -1002,13 +1025,16 @@ async fn quotas() {
 /// and its posts get what they leave.
 #[tokio::test]
 async fn one_quota_for_posts_and_files() {
+    const QUOTA: u64 = 100_000;
     let mut config = config();
-    config.limits.mailbox_quota = 60_000;
+    config.limits.mailbox_quota = QUOTA;
     config.limits.posts_per_minute = 0;
     let mut h = Harness::with(config, timers());
     h.hub.set_files_url("https://chat.example.org");
     let mut anon = h.anon().await;
     let mut d = Direct::new(&h, &mut anon, 1).await;
+    // The commit that added Bob, which never expires early.
+    let commit = h.store.mailbox_bytes(&d.m).unwrap();
     for i in 0..20u8 {
         let message = d.alice.send(&mut d.a, &[i; 1000]);
         h.send(
@@ -1019,17 +1045,24 @@ async fn one_quota_for_posts_and_files() {
         assert!(anon.lines()[0].starts_with("OK seq="));
     }
     let posts = h.store.mailbox_bytes(&d.m).unwrap();
-    assert!(posts > 20_000, "{posts}");
-    // A blob that fits beside the posts only if some expire.
+    assert!(posts > commit + 20_000, "{posts}");
+    // A blob that fits beside the posts only if some expire: it leaves the
+    // posts the commit and 10,000 bytes.
+    let room = commit + 10_000;
     let token = d.alice.token(&d.a);
     let blob = |b: &[u8]| risala_proto::names::BlobRef::of(b);
     h.send(
         &anon,
-        &format!("BLOB {} 50000 box={} token={token}", blob(b"a"), d.m),
+        &format!(
+            "BLOB {} {} box={} token={token}",
+            blob(b"a"),
+            QUOTA - room,
+            d.m
+        ),
     )
     .await;
     assert!(anon.raw_lines()[0].starts_with("OK put="));
-    assert!(h.store.mailbox_bytes(&d.m).unwrap() <= 10_000);
+    assert!(h.store.mailbox_bytes(&d.m).unwrap() <= room);
     // Another that does not fit beside it.
     h.send(
         &anon,
@@ -1046,7 +1079,21 @@ async fn one_quota_for_posts_and_files() {
     h.send(&anon, &format!("POST {} {token} {small}", d.m))
         .await;
     assert!(anon.lines()[0].starts_with("OK seq="));
-    assert!(h.store.mailbox_bytes(&d.m).unwrap() <= 10_000);
+    assert!(h.store.mailbox_bytes(&d.m).unwrap() <= room);
+    // Once only the commit is left, a blob that does not fit beside it
+    // is refused rather than the commit expired (7.5).
+    h.send(
+        &anon,
+        &format!(
+            "BLOB {} {} box={} token={token}",
+            blob(b"c"),
+            room - commit + 1,
+            d.m
+        ),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["ERR rate-limited"]);
+    assert!(h.store.mailbox_bytes(&d.m).unwrap() >= commit);
 }
 
 /// POST, UPLOAD and BLOB share one window per network address (7.5).
@@ -1619,6 +1666,7 @@ async fn public_room_welcomes() {
             crate::core::keys::blob_bytes(h.inner(), &blob, u64::MAX)
                 .await
                 .unwrap()
+                .bytes
         }
         inline => inline
             .parse::<risala_proto::mls::RatchetTree>()
@@ -2012,4 +2060,335 @@ async fn public_room_updates() {
             .proposals
             .is_empty()
     );
+}
+
+// ---- Resource limits (the code review's findings)
+
+/// The owner's device commits whatever proposals it has, and posts the
+/// commit; the server must take it.
+async fn commit_pending(h: &Harness, room: &mut PublicRoomSetup, seq: u64) {
+    let token = room.owen.token(&room.o);
+    let out = room.owen.commit(&mut room.o, Changes::default());
+    h.send(
+        &room.signed,
+        &format!(
+            "POST {} {token} {} next={} groupinfo={}",
+            room.m,
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(out.group_info.as_ref().unwrap())
+        ),
+    )
+    .await;
+    assert_eq!(room.signed.lines(), [format!("OK seq={seq}")]);
+    room.owen.merge(&mut room.o, &out);
+}
+
+/// The owner's device takes a join proposal the server accepted.
+fn take_proposal(room: &mut PublicRoomSetup, message: &str) {
+    let bytes = message.parse::<MlsMessage>().unwrap().decode();
+    process_message(&room.owen.provider, &mut room.o, &bytes).unwrap();
+}
+
+/// A post whose message is a blob is read only as far as its framing:
+/// a PrivateMessage of any size posts, a blob that is not one is refused,
+/// and the post's slot is used up before the blob is read, so that posts
+/// that fail cost their sender too (5.2, 12.12).
+#[tokio::test]
+async fn blob_posts_are_read_only_to_their_framing() {
+    let mut config = config();
+    config.limits.posts_per_minute = 4;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    // A message much larger than what POST reads of a blob.
+    let big = d.alice.send(&mut d.a, &[5; 100_000]);
+    let bytes = big.parse::<MlsMessage>().unwrap().decode();
+    assert!(bytes.len() > 64 * 1024);
+    let blob = hold_blob(&h, &bytes, Some(&d.m));
+    let token = d.alice.token(&d.a);
+    h.send(&anon, &format!("POST {} {token} {blob}", d.m)).await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+    h.send(&anon, &format!("FETCH {} after=1", d.m)).await;
+    let lines = anon.lines();
+    assert!(lines[0].ends_with(&format!(" {blob}")), "{lines:?}");
+    // Not a PrivateMessage.
+    let junk = hold_blob(&h, &[7; 70_000], Some(&d.m));
+    h.send(&anon, &format!("POST {} {token} {junk}", d.m)).await;
+    assert!(anon.lines()[0].starts_with("ERR invalid"));
+    // A wrong token: refused, but the slot is used up all the same.
+    let wrong = d.bob.token(&d.b).replace('A', "B");
+    let wrong = if wrong == token {
+        token.replace('B', "C")
+    } else {
+        wrong
+    };
+    h.send(&anon, &format!("POST {} {wrong} {blob}", d.m)).await;
+    assert!(anon.lines()[0].starts_with("ERR"));
+    h.send(&anon, &format!("POST {} {token} {blob}", d.m)).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+}
+
+/// The framing of a PrivateMessage in a blob, from its first bytes: the
+/// lengths must add up to the blob's size (5.2).
+#[test]
+fn private_message_stubs() {
+    use crate::core::mailbox::private_message_stub;
+    use risala_proto::codec::Writer;
+    let message = |ciphertext: &[u8]| {
+        let mut w = Writer::new();
+        w.fixed(&1u16.to_be_bytes()).fixed(&2u16.to_be_bytes());
+        w.vector(&[4; 32]).u64(7).u8(1).vector(b"aad");
+        w.vector(b"sender").vector(ciphertext);
+        w.finish()
+    };
+    let whole = message(&[9; 50_000]);
+    let prefix = &whole[..1000];
+    let stub = private_message_stub(prefix, whole.len() as u64).unwrap();
+    let read = |bytes: &[u8]| {
+        let (framing, _) = risala_mls::framing::read_message(bytes)
+            .map(|m| match m {
+                risala_mls::framing::MlsMessage::Message(f) => {
+                    (f.epoch, f.authenticated_data.to_vec())
+                }
+                other => panic!("{other:?}"),
+            })
+            .unwrap();
+        framing
+    };
+    assert_eq!(read(&stub), read(&whole));
+    // The wrong size, or a PublicMessage, gives none.
+    assert!(private_message_stub(prefix, whole.len() as u64 + 1).is_none());
+    assert!(private_message_stub(prefix, whole.len() as u64 - 1).is_none());
+    let mut public = whole.clone();
+    public[3] = 1;
+    assert!(private_message_stub(&public[..1000], whole.len() as u64).is_none());
+    assert!(private_message_stub(&whole[..10], whole.len() as u64).is_none());
+}
+
+/// A post to a public room that fails its checks leaves the room's group
+/// in memory, so that it is not rebuilt for the next post (12.6).
+#[tokio::test]
+async fn failed_room_posts_keep_the_group_in_memory() {
+    let mut h = harness_now();
+    let room = create_room(&mut h, 1).await;
+    let m = room.m;
+    assert!(h.inner().mailbox.room_cached(&m));
+    let mut anon = h.anon().await;
+    let dave = Dev::new("dave@example.org", 4);
+    let good = join(&dave, &dave.identity(), &room);
+    // Its signature, at the end, broken.
+    let mut bytes = good.parse::<MlsMessage>().unwrap().decode();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    h.send(&anon, &format!("POST {m} - {}", b64(&bytes))).await;
+    assert!(anon.lines()[0].starts_with("ERR invalid"));
+    assert!(h.inner().mailbox.room_cached(&m));
+    h.send(&anon, &format!("POST {m} - {good}")).await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+    assert!(h.inner().mailbox.room_cached(&m));
+}
+
+/// FETCH stops a page of long posts at a budget of bytes, with `more=1`,
+/// so that the page fits in the connection's queue (7.1).
+#[tokio::test]
+async fn fetch_pages_stop_at_a_byte_budget() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    for i in 0..14u8 {
+        let message = d.alice.send(&mut d.a, &vec![i; 700_000]);
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+        )
+        .await;
+        assert!(anon.lines()[0].starts_with("OK seq="));
+    }
+    h.send(&anon, &format!("FETCH {} after=0 limit=50", d.m))
+        .await;
+    let lines = anon.lines();
+    let posts = lines.len() - 1;
+    assert_eq!(lines[posts], "OK more=1");
+    let bytes: usize = lines[..posts].iter().map(|l| l.len()).sum();
+    assert!(bytes <= 8 * 1024 * 1024, "{bytes}");
+    assert!(posts < 15, "{posts}");
+    // The rest come with the next page.
+    h.send(&anon, &format!("FETCH {} after={posts} limit=50", d.m))
+        .await;
+    let rest = anon.lines();
+    assert_eq!(rest.last().unwrap(), "OK more=0");
+    assert_eq!(posts + rest.len() - 1, 15);
+}
+
+/// The server refuses joins of public rooms, by proposal or by external
+/// commit, from identities it bans (10.2); and a guest connection posts
+/// no join but its own guest's (12.6).
+#[tokio::test]
+async fn server_bans_and_guests_in_public_room_joins() {
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let mut anon = h.anon().await;
+    let dave = Dev::new("dave@example.org", 4);
+    let dave_join = join(&dave, &dave.identity(), &room);
+    // From a guest's connection.
+    let (mut sam_conn, _) = h.guest("sam").await;
+    h.send(&sam_conn, &format!("POST {m} - {dave_join}")).await;
+    assert_eq!(
+        sam_conn.lines(),
+        ["ERR forbidden a guest connection joins only its own guest"]
+    );
+    // Dave joins, and the owner commits it.
+    h.send(&anon, &format!("POST {m} - {dave_join}")).await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+    take_proposal(&mut room, &dave_join);
+    commit_pending(&h, &mut room, 2).await;
+    // The server bans Dave's identity, and Mallory's domain.
+    let mut op = h.signed_in_as("op@example.org");
+    h.send(&op, "ADMIN BAN dave@example.org").await;
+    h.send(&op, "ADMIN BAN *@evil.example").await;
+    assert_eq!(op.lines(), ["OK", "OK"]);
+    let mallory = Dev::new("mallory@evil.example", 6);
+    let mallory_join = join(&mallory, &mallory.identity(), &room);
+    h.send(&anon, &format!("POST {m} - {mallory_join}")).await;
+    assert_eq!(anon.lines(), ["ERR forbidden banned from this server"]);
+    // Dave's device resyncs (12.7): refused while he is banned.
+    let resync = resync_commit(&h, &mut anon, &dave, &room).await;
+    let mut dave_conn = dave.sign_in(&mut h);
+    h.send(&dave_conn, &resync).await;
+    assert_eq!(dave_conn.lines(), ["ERR forbidden banned from this server"]);
+    h.send(&op, "ADMIN UNBAN dave@example.org").await;
+    assert_eq!(op.lines(), ["OK"]);
+    h.send(&dave_conn, &resync).await;
+    assert_eq!(dave_conn.lines(), ["OK seq=3"]);
+}
+
+/// A resync commit (12.7): a member's device whose group cannot follow
+/// joins again by external commit against GROUPINFO, which removes the
+/// leaf that signed the GroupInfo. The server checks it as one, from the
+/// member's own signed-in connection, and the room's epoch moves on.
+#[tokio::test]
+async fn public_room_resync_commits() {
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let mut anon = h.anon().await;
+    let dave = Dev::new("dave@example.org", 4);
+    let dave_join = join(&dave, &dave.identity(), &room);
+    h.send(&anon, &format!("POST {m} - {dave_join}")).await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+    take_proposal(&mut room, &dave_join);
+    commit_pending(&h, &mut room, 2).await;
+    let resync = resync_commit(&h, &mut anon, &dave, &room).await;
+    // Not from an anonymous connection, nor from another device's.
+    h.send(&anon, &resync).await;
+    assert!(anon.lines()[0].starts_with("ERR forbidden"));
+    let mut dave_conn = dave.sign_in(&mut h);
+    h.send(&dave_conn, &resync).await;
+    assert_eq!(dave_conn.lines(), ["OK seq=3"]);
+    // The owner's leaf, which signed the GroupInfo, is gone; Dave's is in.
+    let role = |uid: &str| h.store.room_member(&m, &uid.parse().unwrap()).unwrap();
+    assert_eq!(role("owen@example.org"), None);
+    assert!(role("dave@example.org").is_some());
+    h.send(&anon, &format!("GROUPINFO {m}")).await;
+    let lines = anon.lines();
+    assert!(
+        lines[0].starts_with(&format!("GROUPINFO {m} 2 3 ")),
+        "{lines:?}"
+    );
+    // The same commit again is for an old epoch now.
+    h.send(&dave_conn, &resync).await;
+    assert_eq!(dave_conn.lines(), ["ERR stale"]);
+}
+
+/// Dave's resync commit against the room's GROUPINFO, as a POST line.
+async fn resync_commit(
+    h: &Harness,
+    anon: &mut Client,
+    dave: &Dev,
+    room: &PublicRoomSetup,
+) -> String {
+    let m = room.m;
+    h.send(anon, &format!("GROUPINFO {m}")).await;
+    let lines = anon.lines();
+    assert_eq!(lines[1], "OK");
+    let words: Vec<&str> = lines[0].split(' ').collect();
+    let group_info = words[4].parse::<MlsMessage>().unwrap().decode();
+    let tree = words[5]
+        .parse::<risala_proto::mls::RatchetTree>()
+        .unwrap()
+        .decode();
+    let expect = risala_mls::checks::JoinExpectation {
+        host: host(),
+        own_uid: dave.uid.clone(),
+        public_room: Some(("#general".parse().unwrap(), *m.as_bytes())),
+    };
+    let fresh = Dev::new(dave.uid.as_str(), 40);
+    let resync = risala_mls::group::external_commit(
+        &fresh.provider,
+        &dave.identity(),
+        &dave.profile(),
+        &group_info,
+        &tree,
+        &expect,
+        risala_mls::checks::External::Resync,
+        &[],
+    )
+    .unwrap();
+    format!(
+        "POST {m} - {} next={} groupinfo={}",
+        b64(&resync.message),
+        hash(resync.next_token_hash),
+        b64(&resync.group_info)
+    )
+}
+
+/// Join proposals have their own limit per network address, and one
+/// address may have only so many proposals pending in one epoch (6.1,
+/// 12.6).
+#[tokio::test]
+async fn join_proposals_are_limited_per_address() {
+    let mut h = Harness::with(
+        {
+            let mut c = config();
+            c.limits.joins_per_hour = 3;
+            c.limits.pending_per_address = 2;
+            c
+        },
+        timers(),
+    );
+    h.clock.set(Timestamp::now());
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let mut anon = h.anon().await;
+    let devs: Vec<Dev> = (0..5)
+        .map(|i| Dev::new(&format!("j{i}@example.org"), 10 + i))
+        .collect();
+    let joins: Vec<String> = devs.iter().map(|d| join(d, &d.identity(), &room)).collect();
+    for join in &joins[..2] {
+        h.send(&anon, &format!("POST {m} - {join}")).await;
+        assert!(anon.lines()[0].starts_with("OK seq="));
+    }
+    // Two of this address's proposals are pending in the epoch.
+    h.send(&anon, &format!("POST {m} - {}", joins[2])).await;
+    assert_eq!(anon.lines(), ["@retry=60 ERR rate-limited"]);
+    // Another address may still propose.
+    let mut other = h.connect_from("198.51.100.9:4000");
+    h.send(&other, "ANON").await;
+    other.lines();
+    h.send(&other, &format!("POST {m} - {}", joins[2])).await;
+    assert_eq!(other.lines(), ["OK seq=3"]);
+    // Once a commit starts a new epoch, the first address may propose
+    // again, until its joins for the hour are used up.
+    for join in &joins[..3] {
+        take_proposal(&mut room, join);
+    }
+    commit_pending(&h, &mut room, 4).await;
+    let fresh = join(&devs[3], &devs[3].identity(), &room);
+    h.send(&anon, &format!("POST {m} - {fresh}")).await;
+    assert_eq!(anon.lines(), ["OK seq=5"]);
+    let more = join(&devs[4], &devs[4].identity(), &room);
+    h.send(&anon, &format!("POST {m} - {more}")).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
 }

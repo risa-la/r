@@ -16,9 +16,10 @@
 //!   time and message, and a commit's `next`, only (4.2, 5.2).
 //! - `cids`: client post ids for 24 hours (7.6).
 //! - `public_rooms`: the public state of each public room's group, its
-//!   GroupInfo and ratchet tree as of the newest epoch and the proposals
-//!   pending in it, and what LIST, INFO and the join checks read from it
-//!   (6.1, 6.2, 12.6).
+//!   GroupInfo and ratchet tree as of the newest epoch, and what LIST,
+//!   INFO and the join checks read from it (6.1, 6.2, 12.6).
+//! - `room_proposals`: the proposals pending in each room's epoch, one
+//!   row each.
 //! - `room_members`: the uids with a leaf in each public room, and their
 //!   roles (6.1, 8.3), for MEMBERS, MUTE and GONE.
 //! - `mutes`: muted pseudonyms per mailbox, until a time (6.4, 10.4).
@@ -244,6 +245,9 @@ pub struct NewPost {
     pub quota: u64,
     /// What it changes in a public room.
     pub room: Option<RoomChange>,
+    /// Whether it is a commit or proposal, which never expires early
+    /// (7.5): a device that missed one could read nothing after it.
+    pub handshake: bool,
 }
 
 /// What [`MailboxStore::add_post`] did.
@@ -251,7 +255,8 @@ pub struct NewPost {
 pub enum Posted {
     /// It is kept with this seq.
     Seq(u64),
-    /// It is larger than the quota on its own (`ERR rate-limited`, 7.5).
+    /// It does not fit the quota, even once every post that may expire
+    /// early has (`ERR rate-limited`, 7.5).
     OverQuota,
     /// The mailbox is gone.
     NoMailbox,
@@ -326,10 +331,11 @@ pub trait MailboxStore {
     /// The bytes of the posts `mailbox` keeps (7.5).
     fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64>;
 
-    /// Expires the oldest posts of `mailbox` early until it keeps at most
-    /// `max` bytes of posts, to make room within its quota for files and
-    /// blobs (7.5). Returns how many expired.
-    fn trim_posts(&self, mailbox: &BoxName, max: u64) -> Result<usize>;
+    /// Expires the oldest posts of `mailbox` early, but never commits or
+    /// proposals, until it keeps at most `max` bytes of posts, to make
+    /// room within its quota for files and blobs (7.5). Returns how many
+    /// expired, and whether its posts now fit in `max`.
+    fn trim_posts(&self, mailbox: &BoxName, max: u64) -> Result<(usize, bool)>;
 
     /// Whether `pseudonym` is muted in `mailbox` at `now` (6.4).
     fn muted(&self, mailbox: &BoxName, pseudonym: &Pseudonym, now: Timestamp) -> Result<bool>;
@@ -392,6 +398,11 @@ pub trait MailboxStore {
     /// since `before`: once nobody follows them either, their group cannot
     /// go on there, and they may end (7.5).
     fn idle_mailboxes(&self, before: Timestamp) -> Result<Vec<BoxName>>;
+
+    /// Deletes `mailbox` as [`drop_mailbox`](Self::drop_mailbox) does, if
+    /// it is still idle as [`idle_mailboxes`](Self::idle_mailboxes) says,
+    /// checked in the same transaction. Returns whether it did.
+    fn drop_idle_mailbox(&self, mailbox: &BoxName, before: Timestamp) -> Result<bool>;
 }
 
 /// A public room, as LIST, INFO and MEMBERS see it (6.1).

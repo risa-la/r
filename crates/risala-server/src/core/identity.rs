@@ -115,6 +115,13 @@ pub(crate) struct State {
     registrations: WindowLimit<IpAddr>,
     /// PAIR PUTs per network address.
     pair_puts: WindowLimit<IpAddr>,
+    /// KEYS PUTs per network address (4.7).
+    keys_puts: WindowLimit<IpAddr>,
+    /// Identities the server does not host that it started to log, per
+    /// registered domain, in the last day (4.5, 4.7).
+    outside: WindowLimit<String>,
+    /// AUTHs that may fetch a key file, per network address (4.4, 4.6).
+    fetching_auths: WindowLimit<IpAddr>,
     /// The chains the store holds, replayed, by identity.
     chains: Mutex<HashMap<Identity, Arc<Chain>>>,
     /// The chains last read from key files, by identity, with the hash of
@@ -135,6 +142,9 @@ impl State {
             write: tokio::sync::Mutex::new(()),
             registrations: WindowLimit::new(Duration::from_secs(60 * 60)),
             pair_puts: WindowLimit::new(PAIR_WINDOW),
+            keys_puts: WindowLimit::new(Duration::from_secs(60 * 60)),
+            outside: WindowLimit::new(Duration::from_secs(24 * 60 * 60)),
+            fetching_auths: WindowLimit::new(Duration::from_secs(60 * 60)),
             chains: Mutex::new(HashMap::new()),
             reads: Mutex::new(HashMap::new()),
         })
@@ -242,15 +252,35 @@ async fn auth(cx: &Cx, identity: &Identity, signature: &Signature) -> Reply {
             .find(|key| key.verify_challenge(&host, &nonce, identity.as_str(), signature))
             .cloned()
     };
+    // An AUTH that may make the server fetch a key file uses up a slot of
+    // its address's limit, given back if the file was cached (4.4, 4.6).
+    let slot = if at_identity_domain(&cx.inner, identity) {
+        None
+    } else {
+        cx.inner
+            .identity
+            .fetching_auths
+            .take(
+                network(cx.peer.ip()),
+                cx.inner.config.limits.fetching_auths_per_hour,
+                cx.inner.now(),
+            )
+            .map_err(|retry| err(ErrorCode::RateLimited).with_retry(retry))?
+    };
     let mut view = keys_of(&cx.inner, identity, false).await;
     // A signature that does not verify against a cached file, or a cached
     // file that is not accepted, gets the file fetched again once (4.4).
-    let retry = match &view {
-        View::Keys { chain, cached } => *cached && verifies(chain).is_none(),
-        View::Missing { cached, .. } | View::Outage { cached, .. } => *cached,
+    let (retry, fetched) = match &view {
+        View::Keys { chain, cached } => (*cached && verifies(chain).is_none(), !*cached),
+        View::Missing { cached, .. } | View::Outage { cached, .. } => (*cached, !*cached),
     };
     if retry {
         view = keys_of(&cx.inner, identity, true).await;
+    }
+    if (retry || fetched)
+        && let Some(slot) = slot
+    {
+        slot.keep();
     }
     let key = match &view {
         View::Keys { chain, .. } => verifies(chain),
@@ -895,7 +925,7 @@ pub const MAX_RECORDS_BLOB: u64 = 16 * 1024 * 1024;
 /// The bytes of a blob that KEYS PUT names (12.12), from the keys area's
 /// blob store: `ERR not-found` if it holds no such blob, `ERR too-long`
 /// past [`MAX_RECORDS_BLOB`].
-async fn blob_bytes(inner: &Arc<Inner>, hash: &BlobRef) -> Result<Vec<u8>, ErrResponse> {
+async fn blob_bytes(inner: &Arc<Inner>, hash: &BlobRef) -> Result<keys::BlobBytes, ErrResponse> {
     keys::blob_bytes(inner, hash, MAX_RECORDS_BLOB)
         .await
         .map_err(|why| match why {
@@ -904,48 +934,22 @@ async fn blob_bytes(inner: &Arc<Inner>, hash: &BlobRef) -> Result<Vec<u8>, ErrRe
         })
 }
 
-/// `KEYS PUT <after> <records>` (4.7).
-async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRecords) -> Reply {
-    let inner = &cx.inner;
-    let Some(log) = current_log(inner) else {
-        return Err(fail(
-            ErrorCode::NotSupported,
-            "this server keeps no key log",
-        ));
-    };
-    let bytes = match records {
-        KeysPutRecords::Inline(records) => records.decode(),
-        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash).await?,
-    };
-    let records = decode(&bytes)?;
-    let identity = records[0].content().uid.clone();
-    let hosted = at_identity_domain(inner, &identity);
-
-    let _write = inner.identity.write.lock().await;
-    let (inner2, id2) = (inner.clone(), identity.clone());
-    let (held, registered) = cx
-        .db(move |store| {
-            let registered = match id2.name().parse::<Name>() {
-                Ok(name) => store.hosted(&name)?.is_some(),
-                Err(_) => false,
-            };
-            Ok((stored_chain(&inner2, store, &id2)?, registered))
-        })
-        .await?;
-    // An identity at the identity domain is one the server hosts, once
-    // registered: nobody else's chain goes into the log under its name.
-    // (4.7 does not say; a choice to confirm.)
-    if hosted && !registered {
-        return Err(fail(ErrorCode::Forbidden, "not registered here"));
+/// The registered domain an outside identity counts against, for the
+/// daily limit on outside identities newly logged: the last two labels
+/// of its domain (as the witness's limit by host does, 4.10).
+fn registered_domain(identity: &Identity) -> String {
+    let domain = identity.domain();
+    let labels: Vec<&str> = domain.rsplitn(3, '.').collect();
+    match labels[..] {
+        [last, second, ..] => format!("{second}.{last}"),
+        _ => domain.to_owned(),
     }
-    let put = keys_put(
-        held.as_deref(),
-        after,
-        &records,
-        &log.log,
-        &inner.keylog.handoffs(),
-    )
-    .map_err(|e| match e {
+}
+
+/// What [`keys_put`] makes of KEYS PUT's records against the chain held:
+/// the error it answers with, as KEYS PUT words it.
+fn keys_put_error(e: KeysPutError) -> ErrResponse {
+    match e {
         KeysPutError::NotFound => fail(ErrorCode::NotFound, "the record <after> names is not held"),
         KeysPutError::Invalid(e) => fail(ErrorCode::Invalid, &e.to_string()),
         KeysPutError::Forbidden => fail(
@@ -957,21 +961,111 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
             ErrorCode::NotSupported,
             "the newest record does not go into this server's log",
         ),
-    })?;
+    }
+}
+
+/// `KEYS PUT <after> <records>` (4.7).
+///
+/// It is limited per network address (`limits.keys_puts_per_hour`), and a
+/// slot is used up by every KEYS PUT whose records decode, since the
+/// server then checks their signatures. For an identity it does not host,
+/// the server fetches the key file before it takes the lock that every
+/// chain change holds, so that a slow key server holds up nobody else; it
+/// then checks again under the lock against the chain held by then.
+async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRecords) -> Reply {
+    let inner = &cx.inner;
+    let Some(log) = current_log(inner) else {
+        return Err(fail(
+            ErrorCode::NotSupported,
+            "this server keeps no key log",
+        ));
+    };
+    let limits = &inner.config.limits;
+    let now = inner.now();
+    let slot = inner
+        .identity
+        .keys_puts
+        .take(network(cx.peer.ip()), limits.keys_puts_per_hour, now)
+        .map_err(|retry| err(ErrorCode::RateLimited).with_retry(retry))?;
+    let bytes = match records {
+        KeysPutRecords::Inline(records) => records.decode(),
+        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash).await?.bytes,
+    };
+    let records = decode(&bytes)?;
+    if let Some(slot) = slot {
+        slot.keep();
+    }
+    let identity = records[0].content().uid.clone();
+    let hosted = at_identity_domain(inner, &identity);
+    if !hosted && !limits.log_outside_identities {
+        return Err(fail(
+            ErrorCode::NotSupported,
+            "this server logs only the identities it hosts",
+        ));
+    }
+
+    let read_held = || {
+        let (inner2, id2) = (inner.clone(), identity.clone());
+        cx.db(move |store| {
+            let registered = match id2.name().parse::<Name>() {
+                Ok(name) => store.hosted(&name)?.is_some(),
+                Err(_) => false,
+            };
+            Ok((stored_chain(&inner2, store, &id2)?, registered))
+        })
+    };
+    let check = |held: Option<&Chain>| {
+        keys_put(held, after, &records, &log.log, &inner.keylog.handoffs()).map_err(keys_put_error)
+    };
+
+    // For an identity the server does not host: its key file, fetched
+    // before the lock, against the records new to the chain held now.
+    let outside = if hosted {
+        None
+    } else {
+        let (held, _) = read_held().await?;
+        let put = check(held.as_deref())?;
+        if put.first_new >= put.chain.len() {
+            // Records the server already has: OK and no lines.
+            return Ok(OkResponse::new());
+        }
+        // A new outside identity adds to the log for ever: so many a day
+        // per registered domain (4.5).
+        let new_identity = held.is_none();
+        let domain_slot = if new_identity {
+            inner
+                .identity
+                .outside
+                .take(
+                    registered_domain(&identity),
+                    limits.outside_identities_per_day,
+                    now,
+                )
+                .map_err(|retry| err(ErrorCode::RateLimited).with_retry(retry))?
+        } else {
+            None
+        };
+        let file = fetch_outside_file(inner, &identity).await?;
+        Some((file, domain_slot))
+    };
+
+    let _write = inner.identity.write.lock().await;
+    let (held, registered) = read_held().await?;
+    // An identity at the identity domain is one the server hosts, once
+    // registered: nobody else's chain goes into the log under its name.
+    // (4.7 does not say; a choice to confirm.)
+    if hosted && !registered {
+        return Err(fail(ErrorCode::Forbidden, "not registered here"));
+    }
+    let put = check(held.as_deref())?;
     let held_len = held.as_ref().map_or(0, |c| c.len());
     if put.first_new >= put.chain.len() {
         // Records the server already has: OK and no lines.
         return Ok(OkResponse::new());
     }
     check_times(inner, &put.chain)?;
-    if !hosted {
-        check_named_here(
-            inner,
-            &identity,
-            &log,
-            &put.chain.records()[put.first_new..],
-        )
-        .await?;
+    if let Some((file, _)) = &outside {
+        check_named_here(file, &log, &put.chain.records()[put.first_new..])?;
     }
 
     let to_log: Vec<Record> = put
@@ -1024,20 +1118,21 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
             tracing::error!("forgetting a removed device's KeyPackages: {e}");
         }
     }
+    if let Some((_, Some(slot))) = outside {
+        slot.keep();
+    }
     for (index, hash) in lines {
         cx.send(ServerLine::Record { index, hash });
     }
     Ok(OkResponse::new())
 }
 
-/// For an identity the server does not host: its key file names this log
-/// in its last `log` line, and lists the new records (4.7).
-async fn check_named_here(
+/// The key file of an identity the server does not host (4.4, 4.7),
+/// fetched afresh.
+async fn fetch_outside_file(
     inner: &Arc<Inner>,
     identity: &Identity,
-    log: &LogLine,
-    new: &[Record],
-) -> Result<(), ErrResponse> {
+) -> Result<KeyFile, ErrResponse> {
     let fetch = inner.key_files.fetcher.fetch_boxed(identity, true);
     let fetched = match tokio::time::timeout(KEY_FETCH_TIMEOUT, fetch).await {
         Ok(Ok(fetched)) => fetched,
@@ -1054,13 +1149,17 @@ async fn check_named_here(
             ));
         }
     };
-    let forbidden = |why: &str| Err(fail(ErrorCode::Forbidden, why));
+    let forbidden = |why: &str| fail(ErrorCode::Forbidden, why);
     let Body::File(bytes) = fetched.body else {
-        return forbidden("the identity has no key file");
+        return Err(forbidden("the identity has no key file"));
     };
-    let Ok(file) = KeyFile::parse(&bytes) else {
-        return forbidden("the identity's key file is not valid");
-    };
+    KeyFile::parse(&bytes).map_err(|_| forbidden("the identity's key file is not valid"))
+}
+
+/// For an identity the server does not host: its key file names this log
+/// in its last `log` line, and lists the new records (4.7).
+fn check_named_here(file: &KeyFile, log: &LogLine, new: &[Record]) -> Result<(), ErrResponse> {
+    let forbidden = |why: &str| Err(fail(ErrorCode::Forbidden, why));
     if file.last_log().log != log.log {
         return forbidden("the identity's key file does not name this log");
     }

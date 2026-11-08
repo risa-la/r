@@ -1,14 +1,17 @@
 //! The SQLite implementation of [`Store`](super::Store).
 //!
-//! [`SqliteStore`] holds one connection behind a mutex, in WAL mode with
-//! `synchronous=FULL` and foreign keys on. Each area implements its trait
-//! in its own file, next to the SQL of its tables (`SCHEMA`), with the
-//! helpers here: [`SqliteStore::read`] and [`SqliteStore::write`] run a
-//! closure in a transaction. An area's functions that take a
-//! [`Connection`] can be called from another area's transaction, for
-//! work that spans areas.
+//! [`SqliteStore`] holds one writing connection behind a mutex, in WAL
+//! mode with `synchronous=FULL`, `secure_delete` and foreign keys on, and
+//! for a database on disk a few more connections that only read, so that
+//! reads do not wait behind writes (WAL lets readers run beside the
+//! writer). Each area implements its trait in its own file, next to the
+//! SQL of its tables (`SCHEMA`), with the helpers here:
+//! [`SqliteStore::read`] and [`SqliteStore::write`] run a closure in a
+//! transaction. An area's functions that take a [`Connection`] can be
+//! called from another area's transaction, for work that spans areas.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -29,10 +32,19 @@ pub use schema::SCHEMA_VERSION;
 /// How long a statement waits for another process's lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many connections only read, besides the one that writes, for a
+/// database on disk.
+pub const READERS: usize = 4;
+
 /// The store on a SQLite database (see the [module](self) docs).
 #[derive(Debug)]
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    /// Connections that only read (`query_only`); empty for a database in
+    /// memory, whose reads use `conn`.
+    readers: Vec<Mutex<Connection>>,
+    /// The reader to try first next, so that reads spread over them.
+    next_reader: AtomicUsize,
 }
 
 impl SqliteStore {
@@ -47,7 +59,15 @@ impl SqliteStore {
     pub fn open(path: &Path) -> Result<SqliteStore> {
         private_files(path)
             .map_err(|e| StoreError::Setup(format!("making {} private: {e}", path.display())))?;
-        SqliteStore::setup(Connection::open(path)?, true)
+        let mut store = SqliteStore::setup(Connection::open(path)?, true)?;
+        for _ in 0..READERS {
+            let reader = Connection::open(path)?;
+            reader.busy_timeout(BUSY_TIMEOUT)?;
+            reader.pragma_update(None, "foreign_keys", "ON")?;
+            reader.pragma_update(None, "query_only", "ON")?;
+            store.readers.push(Mutex::new(reader));
+        }
+        Ok(store)
     }
 
     /// A store in memory, for tests.
@@ -75,10 +95,25 @@ impl SqliteStore {
             )));
         }
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Deleted rows are overwritten, so that what the server deletes to
+        // honour 4.2 and retention (7.5) is not left in free pages for
+        // whoever later reads the file.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         schema::create(&mut conn)?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),
+            readers: Vec::new(),
+            next_reader: AtomicUsize::new(0),
         })
+    }
+
+    /// Copies the write-ahead log into the database and truncates it, so
+    /// that deleted rows do not stay in the `-wal` file either (4.2). It
+    /// does nothing while readers need the log; the next call tries again.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
     }
 
     /// The connection, for one area's statements.
@@ -88,10 +123,29 @@ impl SqliteStore {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A connection to read with: a free reader if there is one, otherwise
+    /// the next one in turn (or the writer, in memory).
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        if self.readers.is_empty() {
+            return self.conn();
+        }
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        let n = self.readers.len();
+        for i in 0..n {
+            if let Ok(conn) = self.readers[(start + i) % n].try_lock() {
+                return conn;
+            }
+        }
+        self.readers[start % n]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs `f` in a DEFERRED transaction, which sees one snapshot of the
-    /// database, and does not write.
+    /// database, and does not write: on a connection that only reads, for
+    /// a database on disk.
     fn read<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
-        let mut conn = self.conn();
+        let mut conn = self.reader();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let value = f(&tx)?;
         tx.finish()?;

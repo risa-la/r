@@ -33,8 +33,12 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+use tokio::io::AsyncReadExt as _;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use risala_mls::{DeviceId, RisalaCrypto};
 use risala_proto::binary::read_blob_list;
@@ -118,14 +122,24 @@ pub(crate) struct State {
     /// BLOB together (7.5), and per identity with BLOB (12.12).
     address_bytes: ByteWindow<IpAddr>,
     identity_bytes: ByteWindow<Uid>,
+    /// The bytes of blobs held in memory at once, in KiB, for everyone:
+    /// readers of large blobs wait for room rather than add up.
+    memory: Arc<Semaphore>,
+    /// The KiB [`memory`](Self::memory) started with.
+    memory_kib: u64,
+    /// The bytes the server stores in all, as of the last maintenance
+    /// round, plus what was asked to be stored since
+    /// (`limits.max_stored_bytes`).
+    stored: AtomicU64,
 }
 
 impl State {
     /// Loads the area's state when the hub starts.
-    pub(crate) fn load(config: &Config, _store: &dyn Store) -> Result<State, StoreError> {
+    pub(crate) fn load(config: &Config, store: &dyn Store) -> Result<State, StoreError> {
         let crypto = RisalaCrypto::new()
             .map_err(|e| StoreError::Setup(format!("the MLS crypto provider: {e:?}")))?;
         let hour = Duration::from_secs(60 * 60);
+        let memory_kib = (config.limits.blob_memory / 1024).clamp(1, Semaphore::MAX_PERMITS as u64);
         Ok(State {
             crypto: Arc::new(crypto),
             dir: config.files_dir(),
@@ -136,6 +150,9 @@ impl State {
             gets_by_uid: WindowLimit::new(hour),
             address_bytes: ByteWindow::new(hour),
             identity_bytes: ByteWindow::new(24 * hour),
+            memory: Arc::new(Semaphore::new(memory_kib as usize)),
+            memory_kib,
+            stored: AtomicU64::new(store.stored_total()?),
         })
     }
 
@@ -470,7 +487,7 @@ pub const SEALED_WELCOME_VERSION: u8 = 1;
 
 /// Reads an MLS variable-length integer [RFC9420, 2.1.2] at the start of
 /// `bytes`: the value and the bytes it took. Only minimal encodings.
-fn varint(bytes: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn varint(bytes: &[u8]) -> Option<(usize, usize)> {
     let first = *bytes.first()?;
     let (len, value) = match first >> 6 {
         0 => (1, u32::from(first & 0x3f)),
@@ -573,10 +590,12 @@ fn welcome_line(
 ///
 /// A ref the server knows, but with a secret that matches none of its
 /// handouts, or `-` from another device, gets `ERR forbidden`. A second,
-/// different Welcome for a handout replaces the first while it has not
-/// been fetched (deleted with WELCOME DEL, or returned by WELCOME GET);
-/// after that it gets `ERR forbidden` too, and the same Welcome again gets
-/// `OK` (12.8 is silent on both; a choice to confirm).
+/// different Welcome for a handout replaces the first until its device
+/// deletes it with WELCOME DEL; after that it gets `ERR forbidden` too,
+/// and the same Welcome again gets `OK` (12.8 is silent on both; a choice
+/// to confirm). WELCOME GET does not count as fetching: the refs of
+/// external proposals are public, so anyone could otherwise stop the
+/// committer from replacing a room's Welcome.
 async fn welcome_put(
     cx: &Cx,
     kp_ref: KeyPackageRef,
@@ -585,29 +604,6 @@ async fn welcome_put(
 ) -> Reply {
     let inner = &cx.inner;
     let now = inner.now();
-    let for_room = matches!(secret, WelcomeSecret::Proposal);
-    let (stored, digest) = match welcome {
-        OrBlob::Inline(welcome) => {
-            let bytes = welcome.decode();
-            let fits = if for_room {
-                is_mls_welcome(&bytes)
-            } else {
-                is_sealed_welcome(&bytes)
-            };
-            if !fits {
-                return Err(err(ErrorCode::Invalid));
-            }
-            let digest = *BlobRef::of(&bytes).hash();
-            (OrBlob::Inline(bytes), digest)
-        }
-        OrBlob::Blob(blob) => {
-            let hash = blob;
-            if cx.db(move |store| store.blob(&hash)).await?.is_none() {
-                return Err(err(ErrorCode::NotFound));
-            }
-            (OrBlob::Blob(blob), *blob.hash())
-        }
-    };
     let key = *kp_ref.as_bytes();
     let handouts = cx.db(move |store| store.handouts(&key)).await?;
     if handouts.is_empty() {
@@ -643,6 +639,30 @@ async fn welcome_put(
     };
     let Some(chosen) = chosen.cloned() else {
         return Err(err(ErrorCode::Forbidden));
+    };
+    // Then the Welcome itself, in the order 12.8 lists the checks.
+    let for_room = matches!(secret, WelcomeSecret::Proposal);
+    let (stored, digest) = match welcome {
+        OrBlob::Inline(welcome) => {
+            let bytes = welcome.decode();
+            let fits = if for_room {
+                is_mls_welcome(&bytes)
+            } else {
+                is_sealed_welcome(&bytes)
+            };
+            if !fits {
+                return Err(err(ErrorCode::Invalid));
+            }
+            let digest = *BlobRef::of(&bytes).hash();
+            (OrBlob::Inline(bytes), digest)
+        }
+        OrBlob::Blob(blob) => {
+            let hash = blob;
+            if cx.db(move |store| store.blob(&hash)).await?.is_none() {
+                return Err(err(ErrorCode::NotFound));
+            }
+            (OrBlob::Blob(blob), *blob.hash())
+        }
     };
     let id = random_token(ID_LEN).map_err(internal)?;
     let max = inner.config.files.max_pending_welcomes;
@@ -809,12 +829,43 @@ impl From<NoBlob> for ErrResponse {
     }
 }
 
-/// The bytes of the blob `hash` that a line names (12.12), if the server
-/// holds it and it has not expired, and it has at most `max` bytes. The
-/// identity area calls this for KEYS PUT, reports for a post stored as a
-/// blob (5.8), and the mailbox area may for the messages, GroupInfos and
-/// trees its lines name.
-pub(crate) async fn blob_bytes(inner: &Inner, hash: &BlobRef, max: u64) -> Result<Vec<u8>, NoBlob> {
+/// A blob's bytes in memory, which count against `limits.blob_memory`
+/// until dropped.
+#[derive(Debug)]
+pub(crate) struct BlobBytes {
+    /// The bytes.
+    pub(crate) bytes: Vec<u8>,
+    held: Option<OwnedSemaphorePermit>,
+}
+
+impl BlobBytes {
+    /// Bytes that came in a line, not from a blob: they count against
+    /// nothing.
+    pub(crate) fn inline(bytes: Vec<u8>) -> BlobBytes {
+        BlobBytes { bytes, held: None }
+    }
+
+    /// The bytes, and what keeps them counted: hold it while the bytes
+    /// are in use.
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Option<OwnedSemaphorePermit>) {
+        (self.bytes, self.held)
+    }
+}
+
+impl std::ops::Deref for BlobBytes {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.bytes
+    }
+}
+
+/// The blob `hash`, if the server holds it and it has not expired, with at
+/// most `max` bytes: its record.
+async fn live_blob(
+    inner: &Inner,
+    hash: &BlobRef,
+    max: u64,
+) -> Result<crate::store::keys::BlobRecord, NoBlob> {
     let now = inner.now();
     let start = retention_start(inner, now);
     let h = *hash;
@@ -832,8 +883,36 @@ pub(crate) async fn blob_bytes(inner: &Inner, hash: &BlobRef, max: u64) -> Resul
     if record.size > max {
         return Err(NoBlob::TooLong);
     }
-    match tokio::fs::read(inner.keys.blob_path(hash)).await {
-        Ok(bytes) if BlobRef::of(&bytes) == *hash => Ok(bytes),
+    Ok(record)
+}
+
+/// The bytes of the blob `hash` that a line names (12.12), if the server
+/// holds it and it has not expired, and it has at most `max` bytes. The
+/// identity area calls this for KEYS PUT, and the mailbox area for a
+/// public room's commits, GroupInfos and trees.
+///
+/// Every caller's blobs share `limits.blob_memory`: a reader waits until
+/// the blob fits beside the others in memory, so that many large blobs
+/// read at once do not exhaust the server's memory.
+pub(crate) async fn blob_bytes(
+    inner: &Inner,
+    hash: &BlobRef,
+    max: u64,
+) -> Result<BlobBytes, NoBlob> {
+    let keys = &inner.keys;
+    let record = live_blob(inner, hash, max.min(keys.memory_kib.saturating_mul(1024))).await?;
+    let kib = u32::try_from(record.size.div_ceil(1024).max(1)).map_err(|_| NoBlob::TooLong)?;
+    let held = keys
+        .memory
+        .clone()
+        .acquire_many_owned(kib)
+        .await
+        .map_err(|_| NoBlob::Internal)?;
+    match tokio::fs::read(keys.blob_path(hash)).await {
+        Ok(bytes) if BlobRef::of(&bytes) == *hash => Ok(BlobBytes {
+            bytes,
+            held: Some(held),
+        }),
         Ok(_) => {
             tracing::error!("keys: the file of blob {hash} does not hold it");
             Err(NoBlob::Internal)
@@ -844,6 +923,32 @@ pub(crate) async fn blob_bytes(inner: &Inner, hash: &BlobRef, max: u64) -> Resul
             Err(NoBlob::Internal)
         }
     }
+}
+
+/// The first `n` bytes of the blob `hash` that a line names (12.12), at
+/// most, and its whole size: enough to read an MLS message's framing
+/// without holding the message (5.2, 5.8). The server checked the blob's
+/// hash when it was stored, so its file is taken as it is.
+pub(crate) async fn blob_prefix(
+    inner: &Inner,
+    hash: &BlobRef,
+    n: usize,
+) -> Result<(Vec<u8>, u64), NoBlob> {
+    let record = live_blob(inner, hash, u64::MAX).await?;
+    let file = match tokio::fs::File::open(inner.keys.blob_path(hash)).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NoBlob::NotFound),
+        Err(e) => {
+            tracing::error!("keys: reading blob {hash}: {e}");
+            return Err(NoBlob::Internal);
+        }
+    };
+    let mut prefix = Vec::with_capacity(n.min(64 * 1024));
+    if let Err(e) = file.take(n as u64).read_to_end(&mut prefix).await {
+        tracing::error!("keys: reading blob {hash}: {e}");
+        return Err(NoBlob::Internal);
+    }
+    Ok((prefix, record.size))
 }
 
 /// The device `device` has left `uid` (4.4, 4.8): its KeyPackages and
@@ -873,13 +978,28 @@ async fn check_token(cx: &Cx, mailbox: &BoxName, token: &SendToken) -> Result<()
 /// Counts `bytes` that the network address `ip` asks to store against its
 /// window, which POST, UPLOAD and BLOB share (7.5): `ERR rate-limited`
 /// when it is full. The mailbox area calls this for POST.
+///
+/// The bytes also count against what the whole server stores
+/// (`limits.max_stored_bytes`): above it, nothing more is stored, for
+/// anyone, until enough expires (`ERR rate-limited`).
 pub(crate) fn charge_address(inner: &Inner, ip: IpAddr, bytes: u64) -> Result<(), ErrResponse> {
-    let max = inner.config.limits.address_bytes_per_hour;
-    inner
-        .keys
-        .address_bytes
-        .charge(network(ip), bytes, max, inner.now())
-        .map_err(rate_limited)
+    let limits = &inner.config.limits;
+    let keys = &inner.keys;
+    let cap = limits.max_stored_bytes;
+    if cap > 0 && keys.stored.load(Ordering::Relaxed).saturating_add(bytes) > cap {
+        tracing::warn!("the server stores limits.max_stored_bytes: refusing more");
+        return Err(rate_limited(60 * 60));
+    }
+    keys.address_bytes
+        .charge(
+            network(ip),
+            bytes,
+            limits.address_bytes_per_hour,
+            inner.now(),
+        )
+        .map_err(rate_limited)?;
+    keys.stored.fetch_add(bytes, Ordering::Relaxed);
+    Ok(())
 }
 
 /// The bytes of files and blobs kept for `mailbox` (7.5), those on their
@@ -908,9 +1028,14 @@ async fn check_quota(cx: &Cx, mailbox: BoxName, size: u64) -> Result<(), ErrResp
         return Err(err(ErrorCode::RateLimited));
     }
     charge_address(&cx.inner, cx.peer.ip(), size)?;
-    mailbox::make_room(&cx.inner, mailbox, files)
+    let fits = mailbox::make_room(&cx.inner, mailbox, files)
         .await
         .map_err(internal)?;
+    // The mailbox's commits and proposals, which never expire early, leave
+    // no room for it (7.5).
+    if !fits {
+        return Err(err(ErrorCode::RateLimited));
+    }
     Ok(())
 }
 
@@ -938,9 +1063,17 @@ async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<MailboxPermit>) 
         // is a malformed command for this kind of connection.
         (None, None) => return Err(err(ErrorCode::BadSyntax)),
     };
-    let touched = hash;
-    if cx.db(move |store| store.touch_blob(&touched, now)).await? {
-        return Ok(OkResponse::new().with_exists());
+    // A blob the server holds lives on from now (12.12). That keeps its
+    // bytes stored for another retention period, so it counts against the
+    // address's window as storing it would (7.5): otherwise anyone could
+    // keep any blob forever for nothing.
+    let held = hash;
+    if let Some(record) = cx.db(move |store| store.blob(&held)).await? {
+        charge_address(inner, cx.peer.ip(), record.size)?;
+        let touched = hash;
+        if cx.db(move |store| store.touch_blob(&touched, now)).await? {
+            return Ok(OkResponse::new().with_exists());
+        }
     }
     let uid = match (&mailbox, cx.device()) {
         (Some(mailbox), _) => {
@@ -1269,6 +1402,9 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
         for id in &expired.uploads {
             disk::remove_quietly(&keys.upload_path(id));
         }
+        // What the server stores, counted again from the store.
+        keys.stored
+            .store(inner.store.stored_total()?, Ordering::Relaxed);
         Ok(())
     })
     .await

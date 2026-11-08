@@ -15,7 +15,7 @@ use super::SqliteStore;
 use crate::store::misc::{
     NewPushSubscription, NewReport, PushAdded, PushSubscription, PushTarget, StoredReport,
 };
-use crate::store::{MiscStore, Result, StoreError, fixed, millis, parsed, timestamp};
+use crate::store::{MiscStore, PostBody, Result, StoreError, fixed, millis, parsed, timestamp};
 
 /// The misc area's tables.
 pub(super) const SCHEMA: &str = "
@@ -63,15 +63,23 @@ CREATE TABLE reports (
 CREATE INDEX reports_t ON reports (t);
 
 -- Copies of the posts a report names, kept until it is resolved even if
--- they expire (5.8, 7.5).
+-- they expire (5.8, 7.5). A post that is a blob is kept by its hash, and
+-- the blob by blob_keeps, as 'report ' and the report's id.
 CREATE TABLE report_posts (
     report TEXT NOT NULL REFERENCES reports (id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     t INTEGER NOT NULL,             -- ms
-    message BLOB NOT NULL,          -- the MLSMessage
-    PRIMARY KEY (report, seq)
+    message BLOB,                   -- the MLSMessage, or NULL if it is a blob
+    blob BLOB CHECK (length(blob) = 48), -- the blob's hash, if it is one
+    PRIMARY KEY (report, seq),
+    CHECK ((message IS NULL) != (blob IS NULL))
 ) STRICT;
 ";
+
+/// What keeps the blobs a report's posts are, in `blob_keeps` (12.12).
+fn report_owner(id: &Id) -> String {
+    format!("report {id}")
+}
 
 /// The columns [`subscription`] reads, in order.
 const SUB_COLUMNS: &str = "id, url, tag, key, auth, box, uid, device, failing_since";
@@ -336,15 +344,28 @@ impl MiscStore for SqliteStore {
                 ],
             )?;
             let mut insert = tx.prepare_cached(
-                "INSERT OR IGNORE INTO report_posts (report, seq, t, message) VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO report_posts (report, seq, t, message, blob)
+                 VALUES (?, ?, ?, ?, ?)",
             )?;
             for (seq, t, message) in &report.posts {
+                let (bytes, blob) = match message {
+                    PostBody::Inline(bytes) => (Some(&bytes[..]), None),
+                    PostBody::Blob(blob) => (None, Some(&blob.hash()[..])),
+                };
                 insert.execute(params![
                     report.id.as_str(),
                     super::sql_u64(*seq),
                     millis(*t),
-                    message
+                    bytes,
+                    blob
                 ])?;
+                // The blob stays until the report is resolved.
+                if let Some(blob) = blob {
+                    tx.execute(
+                        "INSERT INTO blob_keeps (owner, hash) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                        params![report_owner(&report.id), blob],
+                    )?;
+                }
             }
             Ok(())
         })
@@ -377,7 +398,11 @@ impl MiscStore for SqliteStore {
     }
 
     fn resolve_report(&self, id: &Id) -> Result<bool> {
-        self.write(|tx| Ok(tx.execute("DELETE FROM reports WHERE id = ?", [id.as_str()])? > 0))
+        self.write(|tx| {
+            // Its blobs expire as usual from now on (12.12).
+            tx.execute("DELETE FROM blob_keeps WHERE owner = ?", [report_owner(id)])?;
+            Ok(tx.execute("DELETE FROM reports WHERE id = ?", [id.as_str()])? > 0)
+        })
     }
 }
 
@@ -486,7 +511,18 @@ mod tests {
             t: t("2026-11-09T00:00:00.000Z"),
             pseudonym: Pseudonym::from_bytes([9; 16]),
             from: Some("alice@example.org".parse().unwrap()),
-            posts: vec![(3, t("2026-11-08T00:00:00.000Z"), vec![1, 2])],
+            posts: vec![
+                (
+                    3,
+                    t("2026-11-08T00:00:00.000Z"),
+                    PostBody::Inline(vec![1, 2]),
+                ),
+                (
+                    4,
+                    t("2026-11-08T00:00:00.000Z"),
+                    PostBody::Blob(risala_proto::names::BlobRef::of(b"blob")),
+                ),
+            ],
         };
         store.add_report(&report).unwrap();
         let open = store.open_reports().unwrap();
@@ -494,7 +530,16 @@ mod tests {
         assert_eq!(open[0].id, report.id);
         assert_eq!(open[0].from, report.from);
         assert_eq!(open[0].pseudonym, report.pseudonym);
+        // The blob post's blob is kept while the report is open.
+        let keeps = |store: &SqliteStore| -> i64 {
+            store
+                .raw()
+                .query_row("SELECT count(*) FROM blob_keeps", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(keeps(&store), 1);
         assert!(store.resolve_report(&report.id).unwrap());
+        assert_eq!(keeps(&store), 0);
         assert!(!store.resolve_report(&report.id).unwrap());
         assert!(store.open_reports().unwrap().is_empty());
         let copies: i64 = store
