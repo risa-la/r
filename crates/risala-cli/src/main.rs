@@ -17,9 +17,17 @@
 //! `members` and `whois` show members and presence, and `block`,
 //! `unblock` and `blocks` manage blocks. `chat` shows who is typing.
 //!
+//! Rooms: `delete` deletes a message, `info`, `topic` and `set` show and
+//! change settings, `role` and `roles` manage roles, `invite`, `kick`,
+//! `ban`, `unban` and `bans` moderate, and `report`, `reports` and
+//! `resolve` handle reports. `chat` shows notices and reports as they
+//! arrive.
+//!
 //! Exit codes: 0 done, 1 failed, 2 bad arguments, 3 needs you to act
 //! first: the server refused (a key it does not accept, a name taken,
 //! registration closed), or a certificate or key needs your decision.
+
+mod rooms;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,8 +37,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use librisala::client::{
     Account, Client, ClientError, ClientOptions, Conversation, ConversationInfo, EventKind,
-    KeyErrorKind, KeyInfo, Label, Message, OutboxStatus, Presence, RefusedKind, TimelineDiff,
-    TrustInfo,
+    KeyErrorKind, KeyInfo, Label, Message, Notice, OutboxStatus, Presence, RefusedKind,
+    TimelineDiff, TrustInfo,
 };
 use librisala::conn::keys::FileKeyStore;
 
@@ -177,6 +185,8 @@ enum Command {
         #[arg(long)]
         label: Option<String>,
     },
+    #[command(flatten)]
+    Rooms(rooms::RoomCommand),
     /// Manage the keys of an identity the server hosts (4.7).
     Keys {
         #[command(subcommand)]
@@ -560,12 +570,16 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 println!("{}", show(&m));
             }
             for e in conv.outbox().or_else(explain)? {
+                let what = match e.deletes {
+                    Some(seq) => format!("(delete {seq})"),
+                    None => e.text,
+                };
                 match e.status {
                     OutboxStatus::Sent { .. } => {}
                     OutboxStatus::Failed { reason, .. } => {
-                        println!("(not sent: {reason}) {}", e.text)
+                        println!("(not sent: {reason}) {what}")
                     }
-                    _ => println!("(waiting to be sent) {}", e.text),
+                    _ => println!("(waiting to be sent) {what}"),
                 }
             }
             if !info.caught_up {
@@ -637,6 +651,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             Ok(())
         }
         Command::Chat { server, room } => chat(ctx, &server, &room).await,
+        Command::Rooms(command) => rooms::run(ctx, command).await,
         Command::Read {
             server,
             conversation,
@@ -1134,6 +1149,7 @@ async fn online(ctx: &Ctx, server: &str) -> Res<Account> {
 fn show(m: &Message) -> String {
     let time = m.time.get(11..16).unwrap_or(&m.time);
     let text = m.text.as_deref().unwrap_or("");
+    let subject = m.subject.as_deref().unwrap_or("");
     let body = match m.kind {
         EventKind::Message if m.deleted => "(deleted)".to_owned(),
         EventKind::Message => {
@@ -1153,6 +1169,20 @@ fn show(m: &Message) -> String {
         EventKind::Part if text.is_empty() => format!("* {} left", m.from),
         EventKind::Part => format!("* {} left ({text})", m.from),
         EventKind::Set => format!("* {} set {text}", m.from),
+        EventKind::Invite => format!("* {} invited {subject}", m.from),
+        EventKind::Kick | EventKind::Ban => {
+            let verb = if m.kind == EventKind::Kick {
+                "kicked"
+            } else {
+                "banned"
+            };
+            match text {
+                "" => format!("* {} {verb} {subject}", m.from),
+                why => format!("* {} {verb} {subject} ({why})", m.from),
+            }
+        }
+        EventKind::Unban => format!("* {} unbanned {subject}", m.from),
+        EventKind::Role => format!("* {} made {subject} {text}", m.from),
         _ => format!("* {}", m.line),
     };
     format!("[{}] {time} {body}", m.seq)
@@ -1261,7 +1291,14 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
                 use librisala::client::AccountEvent;
                 match event {
                     Some(AccountEvent::State { state }) => eprintln!("risala: {state:?}"),
-                    Some(AccountEvent::Notice { notice }) => eprintln!("risala: {notice:?}"),
+                    Some(AccountEvent::Notice { notice }) => eprintln!("risala: {}", show_notice(&notice)),
+                    // 5.8: this account reviews the room's reports.
+                    Some(AccountEvent::Report { report }) => {
+                        eprintln!("risala: report {}", rooms::show_report(&report));
+                    }
+                    Some(AccountEvent::ReportResolved { id }) => {
+                        eprintln!("risala: report {id} was resolved");
+                    }
                     Some(AccountEvent::Outbox { entry }) => {
                         if let OutboxStatus::Failed { reason, .. } = entry.status {
                             eprintln!("risala: not sent ({reason}): {}", entry.text);
@@ -1304,6 +1341,32 @@ async fn chat(ctx: &Ctx, server: &str, room: &str) -> Res {
     let _ = tokio::time::timeout(Duration::from_secs(5), account.wait_synced()).await;
     account.disconnect().await;
     Ok(())
+}
+
+/// A notice as the terminal shows it (6.4, 7.1, 8.4, 10.4).
+fn show_notice(notice: &Notice) -> String {
+    let because = |why: &str| {
+        if why.is_empty() {
+            String::new()
+        } else {
+            format!(" ({why})")
+        }
+    };
+    match notice {
+        Notice::Invited { room, by } => format!("{by} invited you to {room}"),
+        Notice::Kicked { room, by, reason } => {
+            format!("{by} kicked you from {room}{}", because(reason))
+        }
+        Notice::Banned { room, by, reason } => {
+            format!("{by} banned you from {room}{}", because(reason))
+        }
+        Notice::Left { conversation } => format!("you are no longer in {conversation}"),
+        Notice::Dropped { room, reason } => {
+            format!("{room} was deleted by the server{}", because(reason))
+        }
+        Notice::RejoinFailed { room, error } => format!("could not join {room} again: {error}"),
+        Notice::Server { text } => format!("notice: {text}"),
+    }
 }
 
 /// A person as the terminal shows them (8.2): the name, then the uid in

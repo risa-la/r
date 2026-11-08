@@ -138,6 +138,15 @@ async fn trust_guest_join_send_log_sync_and_export() {
     assert!(stderr(&out).contains("queued"), "{}", stderr(&out));
     let log = ok(state, &["log", &addr, "#general", "-n", "1"]).await;
     assert!(log.contains("(waiting to be sent) later"), "{log}");
+    // So does deleting (5.4).
+    let out = risala(state, &["delete", &addr, "#general", seq]).await;
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("offline"), "{}", stderr(&out));
+    let log = ok(state, &["log", &addr, "#general", "-n", "1"]).await;
+    assert!(
+        log.contains(&format!("(waiting to be sent) (delete {seq})")),
+        "{log}"
+    );
 }
 
 #[tokio::test]
