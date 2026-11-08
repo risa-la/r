@@ -41,11 +41,6 @@ pub(crate) fn err(code: ErrorCode) -> ErrResponse {
     ErrResponse::new(code)
 }
 
-/// `ERR not-supported`: what every command of an area not built yet gets.
-pub(crate) fn not_supported() -> Reply {
-    Err(err(ErrorCode::NotSupported))
-}
-
 /// The reply of an area to a command that is not its own: a bug in
 /// [`route`], logged, and `ERR internal` to the client.
 pub(crate) fn misrouted(area: &str, command: &Command) -> Reply {

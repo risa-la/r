@@ -821,7 +821,7 @@ impl KeysStore for SqliteStore {
         })
     }
 
-    fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64> {
+    fn mailbox_file_bytes(&self, mailbox: &BoxName) -> Result<u64> {
         self.read(|tx| {
             let b = &mailbox.as_bytes()[..];
             let total: i64 = tx.query_row(
@@ -1014,7 +1014,7 @@ impl KeysStore for SqliteStore {
         })
     }
 
-    fn expire(&self, t: &ExpiryTimes) -> Result<Expired> {
+    fn expire_keys(&self, t: &ExpiryTimes) -> Result<Expired> {
         self.write(|tx| {
             let now = millis(t.now);
             let retention = millis(t.retention);
@@ -1399,7 +1399,9 @@ mod tests {
         );
         // 24 hours after its commit, a tree goes with its Welcomes, and the
         // blob the server made of it with them.
-        let expired = store.expire(&times(later(30), t(T0), later(30))).unwrap();
+        let expired = store
+            .expire_keys(&times(later(30), t(T0), later(30)))
+            .unwrap();
         assert_eq!(expired.blobs, vec![tree]);
         assert!(store.blob(&tree).unwrap().is_none());
         assert!(store.handouts(&[7; 48]).unwrap().is_empty());
@@ -1412,7 +1414,9 @@ mod tests {
             .add_room_joins(&joins(6, vec![[10; 48]], OrBlob::Blob(other)), later(100))
             .unwrap();
         assert!(store.touch_blob(&other, later(200)).unwrap());
-        let expired = store.expire(&times(later(300), t(T0), later(300))).unwrap();
+        let expired = store
+            .expire_keys(&times(later(300), t(T0), later(300)))
+            .unwrap();
         assert!(expired.blobs.is_empty());
         let blob = store.blob(&other).unwrap().unwrap();
         assert!(!blob.kept);
@@ -1432,13 +1436,13 @@ mod tests {
             expires: later(600),
         };
         store.add_blob_put(&put(1)).unwrap();
-        assert_eq!(store.mailbox_bytes(&mailbox).unwrap(), 100);
+        assert_eq!(store.mailbox_file_bytes(&mailbox).unwrap(), 100);
         assert_eq!(store.blob_put("p1").unwrap(), Some(put(1)));
         assert!(store.claim_blob_put("p1").unwrap());
         assert!(!store.claim_blob_put("p1").unwrap());
         store.blob_stored(&put(1), t(T0)).unwrap();
         store.blob_stored(&put(2), t(T0)).unwrap();
-        assert_eq!(store.mailbox_bytes(&mailbox).unwrap(), 200);
+        assert_eq!(store.mailbox_file_bytes(&mailbox).unwrap(), 200);
         assert!(
             store
                 .set_blob_keeps("backup a", &[BlobRef::of(&[1])])
@@ -1455,8 +1459,11 @@ mod tests {
             unclaimed: later(0),
             unfinished: later(0),
         };
-        assert_eq!(store.expire(&times(10)).unwrap(), Expired::default());
-        assert_eq!(store.expire(&times(60)).unwrap().blobs, [BlobRef::of(&[2])]);
+        assert_eq!(store.expire_keys(&times(10)).unwrap(), Expired::default());
+        assert_eq!(
+            store.expire_keys(&times(60)).unwrap().blobs,
+            [BlobRef::of(&[2])]
+        );
         assert!(store.blob(&BlobRef::of(&[1])).unwrap().is_some());
         // Once nothing keeps it, it goes too.
         assert_eq!(
@@ -1499,7 +1506,7 @@ mod tests {
         assert!(!store.delete_upload("a").unwrap());
         assert!(store.upload("a").unwrap().unwrap().deleted);
         let expired = store
-            .expire(&ExpiryTimes {
+            .expire_keys(&ExpiryTimes {
                 now: later(700),
                 retention: later(100),
                 room_trees: later(0),

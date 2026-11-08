@@ -884,7 +884,9 @@ pub(crate) fn charge_address(inner: &Inner, ip: IpAddr, bytes: u64) -> Result<()
     reason = "called by the mailbox area (docs/plans/M5b.md, SV3)"
 )]
 pub(crate) async fn stored_bytes(inner: &Inner, mailbox: BoxName) -> Result<u64, StoreError> {
-    inner.db(move |store| store.mailbox_bytes(&mailbox)).await
+    inner
+        .db(move |store| store.mailbox_file_bytes(&mailbox))
+        .await
 }
 
 /// Checks that `mailbox` has room for `size` more bytes (7.5).
@@ -893,7 +895,9 @@ pub(crate) async fn stored_bytes(inner: &Inner, mailbox: BoxName) -> Result<u64,
 /// once the mailbox area has a way to count them.
 async fn check_quota(cx: &Cx, mailbox: BoxName, size: u64) -> Result<(), ErrResponse> {
     let quota = cx.inner.config.files.quota;
-    let used = cx.db(move |store| store.mailbox_bytes(&mailbox)).await?;
+    let used = cx
+        .db(move |store| store.mailbox_file_bytes(&mailbox))
+        .await?;
     if used.saturating_add(size) > quota {
         return Err(err(ErrorCode::RateLimited));
     }
@@ -1227,7 +1231,7 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
         // Blob rows and files go together, under the lock that a finishing
         // upload of the same blob also takes.
         let _guard = keys.lock_fs();
-        let expired = inner.store.expire(&times)?;
+        let expired = inner.store.expire_keys(&times)?;
         for hash in &expired.blobs {
             disk::remove_quietly(&keys.blob_path(hash));
         }

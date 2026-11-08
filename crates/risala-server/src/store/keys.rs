@@ -391,7 +391,7 @@ pub trait KeysStore {
 
     /// The bytes of files and blobs kept for `mailbox`, and of `put` URLs
     /// for it that are not yet used (7.5).
-    fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64>;
+    fn mailbox_file_bytes(&self, mailbox: &BoxName) -> Result<u64>;
 
     /// Keeps `hashes` for `owner` whatever the retention, replacing what
     /// `owner` kept before. Returns the blobs `owner` kept before that
@@ -457,5 +457,5 @@ pub trait KeysStore {
     /// blobs and files past retention, and public rooms' trees past their
     /// 24 hours with their Welcomes, and the blobs the server made of
     /// them. Returns the blobs and files whose bytes are to be removed.
-    fn expire(&self, times: &ExpiryTimes) -> Result<Expired>;
+    fn expire_keys(&self, times: &ExpiryTimes) -> Result<Expired>;
 }

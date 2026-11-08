@@ -15,7 +15,7 @@ use risala_mls::{Provider, RisalaProfile, SigningKey};
 use risala_proto::auth::PublicKey;
 use risala_proto::binary::{WRAPPED_KEY_LEN, WrappedKey, write_blob_list};
 use risala_proto::mls::{
-    GroupId, KeyPackage, KeyPackageRef, PutSecret, RatchetTree, SendToken, TokenHash, Welcome,
+    GroupId, KeyPackage, KeyPackageRef, PutSecret, RatchetTree, SendToken, Welcome,
 };
 use risala_proto::names::{BlobRef, BoxName, Identity, Uid};
 use tls_codec::Serialize as _;
@@ -253,8 +253,9 @@ impl Keys {
                 mailbox: BOX.parse().unwrap(),
                 group_id: GroupId::from_bytes([1; 32]),
                 first_epoch: 0,
-                token_hash: TokenHash::from_bytes([2; 48]),
+                token_hash: token().hash(),
                 created: self.inner().now(),
+                moved_from: None,
             })
             .unwrap();
     }
@@ -994,8 +995,9 @@ async fn blob_sizes_and_quotas_are_limited() {
             mailbox: other,
             group_id: GroupId::from_bytes([3; 32]),
             first_epoch: 0,
-            token_hash: TokenHash::from_bytes([2; 48]),
+            token_hash: token().hash(),
             created: h.inner().now(),
+            moved_from: None,
         })
         .unwrap();
     h.send(

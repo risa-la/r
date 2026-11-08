@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use risala_proto::mls::{GroupId, SendToken, TokenHash};
+use risala_proto::mls::{GroupId, SendToken};
 use risala_proto::names::BlobRef;
 use risala_server::store::{MailboxStore as _, NewMailbox};
 use risala_server::testing::{TestClient, TestServer};
@@ -36,8 +36,9 @@ async fn server() -> TestServer {
                     mailbox: BOX.parse().unwrap(),
                     group_id: GroupId::from_bytes([1; 32]),
                     first_epoch: 0,
-                    token_hash: TokenHash::from_bytes([2; 48]),
+                    token_hash: token().hash(),
                     created: risala_proto::time::Timestamp::now(),
+                    moved_from: None,
                 })
                 .unwrap();
         })
