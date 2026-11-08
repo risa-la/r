@@ -624,7 +624,7 @@ fn content_errors() {
 fn content_size_limit() {
     // Lines have no length limit of their own (12.9), but the content as
     // a whole does.
-    let line = format!("@box={BOX};target={} REPORT\n", id(1));
+    let line = format!("@box={BOX};target={} REPORT {}\n", id(1), "r".repeat(400));
     let mut raw = line.repeat(MAX_CONTENT_LEN / line.len());
     raw.push_str(&"x".repeat(MAX_CONTENT_LEN - raw.len() - 1));
     raw.push('\n');
@@ -636,6 +636,26 @@ fn content_size_limit() {
     let mut lines = content.lines().to_vec();
     lines.push(ContentLine::Typing);
     assert_eq!(Content::new(lines), Err(ParseError::TooLong));
+}
+
+/// A content of many short lines would take about a hundred times its
+/// size in memory once parsed, so it has at most MAX_CONTENT_LINES lines.
+#[test]
+fn content_line_limit() {
+    let raw = "\n".repeat(MAX_CONTENT_LINES);
+    assert_eq!(
+        Content::parse(raw.as_bytes()).unwrap().lines().len(),
+        MAX_CONTENT_LINES
+    );
+    let raw = "\n".repeat(MAX_CONTENT_LINES + 1);
+    assert_eq!(Content::parse(raw.as_bytes()), Err(ParseError::TooLong));
+    let raw = "TYPING\n".repeat(MAX_CONTENT_LINES + 1);
+    assert_eq!(Content::parse(raw.as_bytes()), Err(ParseError::TooLong));
+    assert_eq!(
+        Content::new(vec![ContentLine::Typing; MAX_CONTENT_LINES + 1]),
+        Err(ParseError::TooLong)
+    );
+    assert!(Content::new(vec![ContentLine::Typing; MAX_CONTENT_LINES]).is_ok());
 }
 
 #[test]

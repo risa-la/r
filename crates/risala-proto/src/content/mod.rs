@@ -98,6 +98,14 @@ pub use values::{
 /// The most bytes a message's content may have (12.9).
 pub const MAX_CONTENT_LEN: usize = 4 * 1024 * 1024;
 
+/// The most lines a content may have. 12.9 sets no such limit, only 4 MiB
+/// in all; this one keeps a message of short lines from taking about a
+/// hundred times its size in memory on every device that reads it. No
+/// message comes near it: the most lines a device sends at once are a
+/// CHALLENGE and an ANSWER for each leaf of a private room (4,096 at most,
+/// 6.1), and a few more. (A choice to confirm: the spec is silent.)
+pub const MAX_CONTENT_LINES: usize = 16_384;
+
 /// The most bytes of escaped text a TEXT line may have (5.3).
 pub const MAX_TEXT_LEN: usize = 8192;
 
@@ -135,7 +143,8 @@ impl Content {
     /// Parses the bytes of a RisalaMessage's `content` (12.9).
     ///
     /// Errors, for bytes that are not lines at all: `InvalidUtf8`;
-    /// `TooLong` beyond 4 MiB; `ControlChar` for a control character
+    /// `TooLong` beyond 4 MiB or [`MAX_CONTENT_LINES`] lines; `ControlChar`
+    /// for a control character
     /// other than TAB, CR included; and `BadSyntax` for empty content or
     /// content that does not end in LF. Lines that do not parse are kept
     /// as [`ContentLine::Ignored`].
@@ -148,6 +157,11 @@ impl Content {
             return Err(bad("content has at least one line"));
         }
         let body = s.strip_suffix('\n').ok_or(bad("content ends with LF"))?;
+        // Counted before any line is parsed, so that the memory it takes
+        // stays bounded.
+        if body.bytes().filter(|&b| b == b'\n').count() >= MAX_CONTENT_LINES {
+            return Err(ParseError::TooLong);
+        }
         let lines = body
             .split('\n')
             .map(|raw| {
@@ -168,11 +182,15 @@ impl Content {
     /// (see the [module documentation](self)).
     ///
     /// Errors: `BadSyntax` for no lines; `TooLong` if the content would
-    /// be longer than 4 MiB; and the error of the first line that cannot
+    /// be longer than 4 MiB or [`MAX_CONTENT_LINES`] lines; and the error
+    /// of the first line that cannot
     /// be written as it is, as [`ContentLine::to_line`] gives it.
     pub fn new(lines: Vec<ContentLine>) -> Result<Content, ParseError> {
         if lines.is_empty() {
             return Err(bad("content has at least one line"));
+        }
+        if lines.len() > MAX_CONTENT_LINES {
+            return Err(ParseError::TooLong);
         }
         let mut bytes = Zeroizing::new(String::new());
         for line in &lines {
