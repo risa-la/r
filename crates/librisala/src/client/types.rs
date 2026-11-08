@@ -1646,8 +1646,10 @@ pub struct ReportedMessage {
     pub time: String,
     /// Its author.
     pub from: String,
-    /// Its text, unescaped, as it was when reported. Empty for an
-    /// encrypted message, whose content is in [`ReportInfo::line`].
+    /// Its text, unescaped, as it was when reported. For an encrypted
+    /// message, the text of the content the reporter revealed, once it
+    /// checks against the message's franking commitment
+    /// ([`ReportInfo::franking`]); empty otherwise.
     pub text: String,
     /// The message it replies to, if it is a reply (5.3).
     pub reply_to: Option<u64>,
@@ -1689,6 +1691,11 @@ pub struct ReportInfo {
     pub reason: String,
     /// Whether it reports an encrypted message (REPORTENC, 12.8).
     pub encrypted: bool,
+    /// For an encrypted message, whether the content the reporter revealed
+    /// is what its author sent: HMAC-SHA-384 of it under the franking key
+    /// equals the copy's `frank` tag (5.8). `None` for REPORT, or without
+    /// a copy.
+    pub franking: Option<bool>,
     /// The message as it was when reported, or `None` if the server sent
     /// no copy.
     pub message: Option<ReportedMessage>,
@@ -1712,10 +1719,32 @@ impl ReportInfo {
         let line = tagged(ServerMessage::report_line(id.clone(), report.clone()))
             .to_line()
             .to_string();
+        // 5.8: the revealed content counts only if it matches the
+        // commitment on the copy of the ENC event.
+        let franking = match (&report.franking, copy.map(|e| &e.body)) {
+            (Some(f), Some(EventBody::Enc(enc))) => {
+                Some(enc.frank.as_ref().is_some_and(|frank| f.verifies(frank)))
+            }
+            (Some(_), Some(_)) => Some(false),
+            _ => None,
+        };
+        let revealed = report
+            .franking
+            .as_ref()
+            .filter(|_| franking == Some(true))
+            .and_then(
+                |f| match crate::e2ee::content::Content::parse(&f.content.decode()) {
+                    Ok(crate::e2ee::content::Content::Text(t)) => {
+                        Some((unescape(&t.text).into_owned(), t.target.map(|t| t.relation)))
+                    }
+                    _ => None,
+                },
+            );
         let message = copy.and_then(|e| {
             let meta = e.meta.as_ref()?;
             let (text, relation) = match &e.body {
                 EventBody::Msg(m) => (unescape(&m.text).into_owned(), m.relation),
+                EventBody::Enc(_) => revealed.clone().unwrap_or_default(),
                 _ => (String::new(), None),
             };
             use risala_proto::types::Relation as R;
@@ -1744,6 +1773,7 @@ impl ReportInfo {
             reporter: report.from.as_ref().map(ToString::to_string),
             reason: unescape(&report.reason).into_owned(),
             encrypted: report.franking.is_some(),
+            franking,
             message,
             line,
         }
