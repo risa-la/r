@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(text.len(), 64);
         assert_eq!(HistoryKey::from_base64(&text), Some(key));
         assert_eq!(HistoryKey::from_base64(&text[..60]), None);
-        assert_eq!(HistoryKey::from_base64(&format!("{}AAAA", &*text)), None);
+        assert_eq!(HistoryKey::from_base64(&format!("{}AAAA", *text)), None);
         assert_eq!(
             format!("{:?}", HistoryKey::from_bytes([9; 48])),
             "HistoryKey(…)"
