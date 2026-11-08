@@ -33,11 +33,15 @@ openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphe
 hpke-rs = "0.7"
 hpke-rs-crypto = "0.7"
 hpke-rs-libcrux = "0.7"
+# X-Wing as a KEM on its own, for leaf challenges (SPEC 12.10): the same
+# libcrux-kem that hpke-rs-libcrux and openmls_libcrux_crypto use.
+libcrux-kem = "=0.0.9"
 
 [dev-dependencies]
 # The patched port in crates/openmls-sqlite-storage (see the root Cargo.toml).
 openmls_sqlite_storage.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

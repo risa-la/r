@@ -32,6 +32,10 @@
 //! - [`checks`]: the checks of joining and of every commit (12.7).
 //! - [`message`]: RisalaMessage, franking, counters, late messages and
 //!   reports (12.9, 5.4, 5.8).
+//! - [`confirm`]: confirming leaves, pairwise by CHALLENGE and ANSWER,
+//!   and the state machine for both ways (12.10).
+//! - [`epochal`]: period keys, ATTEST and REVEAL (12.10). The construction
+//!   still needs an outside review (PLAN.md item 53).
 //!
 //! OpenMLS is patched in two places (`crates/openmls-traits/RISALA.md`,
 //! `crates/openmls/RISALA.md`): the suite's value is `0x0020`, and
@@ -43,8 +47,10 @@ pub mod backup;
 pub mod binding;
 pub mod checks;
 pub mod codec;
+pub mod confirm;
 pub mod conversation;
 pub mod crypto;
+pub mod epochal;
 pub mod file;
 pub mod framing;
 pub mod group;
@@ -72,6 +78,7 @@ pub use backup::{
     Backup, BackupError, BackupKey, BackupUpload, RecoveryKey, RecoveryKeyError, WrappedKey,
 };
 pub use binding::DeviceBinding;
+pub use confirm::{AttestationKey, Confirmer, LeafState};
 pub use conversation::{ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto};
 pub use file::{
