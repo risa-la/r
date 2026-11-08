@@ -1206,3 +1206,318 @@ fn only_the_owner_can_read_a_new_cache() {
     let store = Store::open(&path).unwrap();
     assert_eq!(store.accounts().unwrap().len(), 1);
 }
+
+#[test]
+fn a_version_11_cache_gets_activity_from_its_messages_and_outbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for m in &schema::MIGRATIONS[..11] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.execute_batch(
+            "INSERT INTO servers (id, addr) VALUES (1, 'chat.example.org');
+             INSERT INTO accounts (id, server, uid) VALUES (1, 1, 'alice@example.org');
+             INSERT INTO convs (id, account, name, conv_id) VALUES
+                 (1, 1, '#a', 'k1'), (2, 1, '#b', 'k2'), (3, 1, '#c', 'k3');
+             INSERT INTO events (conv, seq, t, author, verb, text, line) VALUES
+                 (1, 1, 100, 'bob@example.net', 'MSG', 'hi',
+                  '@seq=1;t=1970-01-01T00:00:00.100Z;from=bob@example.net MSG #a hi');
+             INSERT INTO events (conv, seq, t, author, verb, rel, target, text, line) VALUES
+                 (1, 2, 500, 'bob@example.net', 'MSG', 'react', 1, 'x',
+                  '@seq=2;t=1970-01-01T00:00:00.500Z;from=bob@example.net;react=1 MSG #a x');
+             INSERT INTO events (conv, seq, t, author, verb, line) VALUES
+                 (2, 1, 700, 'bob@example.net', 'JOIN',
+                  '@seq=1;t=1970-01-01T00:00:00.700Z;from=bob@example.net JOIN #b k2');
+             INSERT INTO outbox (account, conv, conv_id, cid, text, state, created) VALUES
+                 (1, '#b', 'k2', 'Abcdefghijklmnopqrstu1', 'later', 'queued', 300);
+             INSERT INTO outbox (account, conv, conv_id, cid, text, rel, target, state, created)
+                 VALUES (1, '#b', 'k2', 'Abcdefghijklmnopqrstu2', 'x', 'react', 1, 'queued', 900);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    // Messages and messages queued count; reactions and joins do not, and
+    // when a conversation entered the cache is not known.
+    assert_eq!(store.activity(ConvId(1)).unwrap(), Some(100));
+    assert_eq!(store.activity(ConvId(2)).unwrap(), Some(300));
+    assert_eq!(store.activity(ConvId(3)).unwrap(), Some(0));
+    let order: Vec<i64> = store
+        .chat_rows(&ChatQuery::default(), None, 10)
+        .unwrap()
+        .iter()
+        .map(|r| r.id.get())
+        .collect();
+    assert_eq!(order, [2, 1, 3]);
+    assert!(
+        store
+            .chat_rows(&ChatQuery::default(), None, 10)
+            .unwrap()
+            .iter()
+            .all(|r| !r.favourite)
+    );
+    // The new columns work on the old data.
+    store.set_favourite(ConvId(3), true).unwrap();
+    let favourites = ChatQuery {
+        favourites: true,
+        ..ChatQuery::default()
+    };
+    let rows = store.chat_rows(&favourites, None, 10).unwrap();
+    assert_eq!(rows.iter().map(|r| r.id.get()).collect::<Vec<_>>(), [3]);
+}
+
+#[test]
+fn activity_follows_messages_the_outbox_and_when_a_conversation_arrives() {
+    let store = Store::open_in_memory().unwrap();
+    let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
+    let t = |ms: u64| Timestamp::from_unix_millis(1_800_000_000_000 + ms).unwrap();
+    let activity = |conv| store.activity(conv).unwrap().unwrap() - 1_800_000_000_000;
+    // Entering the cache: the transaction's clock.
+    let (conv, _) = store
+        .write(|tx| {
+            tx.at(t(0));
+            let mut row = tx.conv_or_create(account, &room())?;
+            tx.learn_id(&mut row, &id("k1"), Some(0))?;
+            tx.set_joined(&mut row, true)?;
+            Ok(row)
+        })
+        .unwrap();
+    assert_eq!(activity(conv.id), 0);
+    let store_ev = |e: Event| {
+        store
+            .write(|tx| {
+                let row = tx.conv(conv.id)?.unwrap();
+                tx.store_event(&row, &e)
+            })
+            .unwrap();
+    };
+    // A message moves it forward; an older one from history does not move
+    // it back.
+    store_ev(ev(5, "from=bob@example.net MSG #general hi"));
+    assert_eq!(activity(conv.id), 5);
+    store_ev(ev(3, "from=bob@example.net MSG #general older"));
+    assert_eq!(activity(conv.id), 5);
+    // Reactions, edits, joins and deletions do not count.
+    store_ev(ev(6, "from=bob@example.net;react=5 MSG #general x"));
+    store_ev(ev(7, "from=bob@example.net;edit=5 MSG #general hey"));
+    store_ev(ev(8, "from=carol@example.net;id=k1 JOIN #general"));
+    store_ev(ev(9, "from=bob@example.net DELETE #general 5"));
+    assert_eq!(activity(conv.id), 5);
+    // A reply counts.
+    store_ev(ev(10, "from=bob@example.net;reply=3 MSG #general yes"));
+    assert_eq!(activity(conv.id), 10);
+    // A message hidden as a blocked person's does not.
+    let troll: risala_proto::names::BlockTarget = "troll@example.com".parse().unwrap();
+    store
+        .write(|tx| tx.change_block(account, &troll, true).map(drop))
+        .unwrap();
+    store.set_hide_blocked(account, true).unwrap();
+    store_ev(ev(11, "from=troll@example.com MSG #general boo"));
+    assert_eq!(activity(conv.id), 10);
+    // A message queued counts; a reaction or a DELETE queued does not.
+    store
+        .write(|tx| {
+            tx.queue(
+                account,
+                &room(),
+                Some(&id("k1")),
+                &Draft::text("mine"),
+                t(20),
+            )?;
+            let react = Draft {
+                text: "x".into(),
+                relation: Some(Relation::React(seq(10))),
+                file: None,
+            };
+            tx.queue(account, &room(), Some(&id("k1")), &react, t(30))?;
+            tx.queue_delete(account, &room(), &id("k1"), seq(10), t(40))
+        })
+        .unwrap();
+    assert_eq!(activity(conv.id), 20);
+    // A direct conversation queued for before it is in the cache starts
+    // from its message, if that is newer.
+    let bob: Conv = "bob@example.net".parse().unwrap();
+    let (direct, _) = store
+        .write(|tx| {
+            tx.queue(account, &bob, None, &Draft::text("hello"), t(50))?;
+            tx.at(t(45));
+            tx.conv_or_create(account, &bob).map(|r| r.id)
+        })
+        .unwrap();
+    assert_eq!(activity(direct), 50);
+    let order: Vec<ConvId> = store
+        .chat_rows(&ChatQuery::default(), None, 10)
+        .unwrap()
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(order, [direct, conv.id]);
+}
+
+#[test]
+fn a_failed_entry_goes_back_in_the_queue_and_a_removed_one_names_its_conversation() {
+    let (store, account, conv) = setup();
+    let now = Timestamp::from_unix_millis(1_800_000_000_000).unwrap();
+    let claim = Claim {
+        instance: "test".into(),
+        connection: 1,
+    };
+    let (ids, _) = store
+        .write(|tx| {
+            let a = tx.queue(account, &room(), Some(&id("k1")), &Draft::text("a"), now)?;
+            let b = tx.queue(account, &room(), Some(&id("k1")), &Draft::text("b"), now)?;
+            tx.outbox_sending(a, &claim, now)?;
+            tx.outbox_failed(a, FailReason::Unconfirmed)?;
+            Ok((a, b))
+        })
+        .unwrap();
+    let (a, b) = ids;
+    let before = store.outbox_item(a).unwrap().unwrap();
+    assert!(before.first_sent.is_some());
+    // Only a failed entry is retried.
+    assert_eq!(store.retry_outbox(b).unwrap(), (false, Vec::new()));
+    let (retried, changes) = store.retry_outbox(a).unwrap();
+    assert!(retried);
+    assert_eq!(changes, [Change::Outbox { id: a }]);
+    let after = store.outbox_item(a).unwrap().unwrap();
+    assert_eq!(after.state, OutboxState::Queued);
+    // Same entry, same cid, in its place before b, and as if never sent.
+    assert_eq!(
+        (after.id, &after.cid, after.created),
+        (a, &before.cid, before.created)
+    );
+    assert_eq!((after.first_sent, after.claim), (None, None));
+    let order: Vec<OutboxId> = store
+        .outbox(account)
+        .unwrap()
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(order, [a, b]);
+    // Removing one says which conversation lost it.
+    assert_eq!(
+        store.remove_outbox(b).unwrap(),
+        [Change::Conversation { conv }, Change::Outbox { id: b }]
+    );
+}
+
+#[test]
+fn favourites_change_only_when_they_change() {
+    let (store, _, conv) = setup();
+    assert_eq!(
+        store.set_favourite(conv, true).unwrap(),
+        [Change::Conversation { conv }]
+    );
+    assert!(store.chat_row(conv).unwrap().unwrap().favourite);
+    assert!(store.set_favourite(conv, true).unwrap().is_empty());
+    store.set_favourite(conv, false).unwrap();
+    assert!(!store.chat_row(conv).unwrap().unwrap().favourite);
+}
+
+#[test]
+fn an_edit_reaction_or_delete_before_its_target_still_reports_a_change() {
+    // Each fills its place in the history, so the unread count of the
+    // gap above the sync point drops, and a chat list must hear of it.
+    let (store, _, conv) = setup();
+    store
+        .write(|tx| {
+            let mut row = tx.conv(conv)?.unwrap();
+            tx.note_head(&mut row, 10)
+        })
+        .unwrap();
+    assert_eq!(store.unread(conv).unwrap(), 10);
+    let lines = [
+        "from=bob@example.net;edit=2 MSG #general hey",
+        "from=bob@example.net;react=2 MSG #general x",
+        "from=bob@example.net DELETE #general 3",
+    ];
+    for (i, rest) in lines.into_iter().enumerate() {
+        let n = 5 + i as u64;
+        assert_eq!(
+            store_all(&store, conv, &[ev(n, rest)]),
+            [Change::Conversation { conv }],
+            "{rest}"
+        );
+        assert_eq!(store.unread(conv).unwrap(), 10 - 1 - i as u64, "{rest}");
+    }
+}
+
+#[test]
+fn a_migrated_cache_sorts_as_a_fresh_one_with_blocked_people() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let fresh = {
+        let store = Store::open(&path).unwrap();
+        let account = store.account(&addr(), &uid("alice@example.org")).unwrap();
+        for target in ["troll@example.com", "*@spam.example"] {
+            let target: risala_proto::names::BlockTarget = target.parse().unwrap();
+            store
+                .write(|tx| tx.change_block(account, &target, true).map(drop))
+                .unwrap();
+        }
+        store.set_hide_blocked(account, true).unwrap();
+        let rooms: [(&str, &[&str]); 3] = [
+            // The newest message is a blocked person's.
+            ("#a", &["bob@example.net", "troll@example.com"]),
+            // From under a blocked domain.
+            ("#b", &["bob@example.net", "x@mail.spam.example"]),
+            // Only blocked people's.
+            ("#c", &["troll@example.com"]),
+        ];
+        let mut n = 0;
+        for (name, authors) in rooms {
+            let conv: Conv = name.parse().unwrap();
+            let (row, _) = store
+                .write(|tx| {
+                    // Entered the cache before any message, as a migrated
+                    // one is taken to have.
+                    tx.at(Timestamp::from_unix_millis(0).unwrap());
+                    let mut row = tx.conv_or_create(account, &conv)?;
+                    tx.learn_id(&mut row, &id(&format!("k{}", &name[1..])), None)?;
+                    Ok(row)
+                })
+                .unwrap();
+            let events: Vec<Event> = authors
+                .iter()
+                .map(|a| {
+                    n += 1;
+                    ev(n, &format!("from={a} MSG {name} hi"))
+                })
+                .collect();
+            store_all(&store, row.id, &events);
+        }
+        store
+            .chat_rows(&ChatQuery::default(), None, 10)
+            .unwrap()
+            .iter()
+            .map(|r| (r.id, r.activity))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        fresh.iter().map(|(_, a)| *a).collect::<Vec<_>>(),
+        [1_800_000_000_003, 1_800_000_000_001, 0]
+    );
+
+    // The same cache as version 11 had it, migrated again.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX convs_activity;
+             DROP INDEX outbox_unsent;
+             ALTER TABLE convs DROP COLUMN activity;
+             ALTER TABLE convs DROP COLUMN favourite;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let migrated: Vec<(ConvId, u64)> = store
+        .chat_rows(&ChatQuery::default(), None, 10)
+        .unwrap()
+        .iter()
+        .map(|r| (r.id, r.activity))
+        .collect();
+    assert_eq!(migrated, fresh);
+}

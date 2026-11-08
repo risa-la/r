@@ -1342,6 +1342,7 @@ fn queue_offline(
     let now = shared.options.sync.clock.now();
     let guest = shared.is_guest();
     let (id, changes) = shared.store.write(|tx| {
+        tx.at(now);
         let row = tx.conv_by_name(account, conv)?;
         // Nothing more goes to a room the account has left until it joins
         // again (PLAN.md 5, items 34 and 37).

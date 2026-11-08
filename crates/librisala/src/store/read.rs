@@ -116,17 +116,48 @@ pub struct Member {
 fn summary_sql() -> String {
     format!(
         "SELECT c.id, c.account, c.name, c.conv_id, c.joined, c.sync_point, c.head, c.read,
-            (SELECT COUNT(*) FROM events e
-             WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
-                 AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0
-                 AND NOT {HIDDEN})
-            + MAX(0, c.head - MAX(c.read, c.sync_point)
-                - (SELECT COUNT(*) FROM events e
-                   WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point)
-                       AND e.seq <= c.head)),
+            {},
             (SELECT MAX(seq) FROM events e WHERE e.conv = c.id),
             (SELECT m.role FROM room_members m WHERE m.conv = c.id AND m.uid = a.uid)
-        FROM convs c JOIN accounts a ON a.id = c.account"
+        FROM convs c JOIN accounts a ON a.id = c.account",
+        unread_sql()
+    )
+}
+
+/// SQL: the stored events `e` of the conversation `c` that are unread
+/// messages, as [`ConversationSummary::unread`] describes them.
+fn unread_messages_sql() -> String {
+    format!(
+        "FROM events e
+         WHERE e.conv = c.id AND e.seq > c.read AND e.verb = 'MSG'
+             AND (e.rel IS NULL OR e.rel = 'reply') AND e.deleted = 0 AND e.own = 0
+             AND NOT {HIDDEN}"
+    )
+}
+
+/// SQL: how many events after the read marker and the sync point, up to
+/// the head, are not stored. Below 0 when the read marker is past the
+/// head.
+const UNREAD_GAP: &str = "(c.head - MAX(c.read, c.sync_point)
+    - (SELECT COUNT(*) FROM events e
+       WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point) AND e.seq <= c.head))";
+
+/// SQL: the unread count of the conversation `c`, as
+/// [`ConversationSummary::unread`] describes it.
+pub(super) fn unread_sql() -> String {
+    format!(
+        "((SELECT COUNT(*) {}) + MAX(0, {UNREAD_GAP}))",
+        unread_messages_sql()
+    )
+}
+
+/// SQL: whether [`unread_sql`] is above 0. It stops at the first unread
+/// message rather than counting them all, which matters when it is asked
+/// of every conversation at once.
+pub(super) fn has_unread_sql() -> String {
+    format!(
+        "(EXISTS (SELECT 1 {}) OR {UNREAD_GAP} > 0)",
+        unread_messages_sql()
     )
 }
 

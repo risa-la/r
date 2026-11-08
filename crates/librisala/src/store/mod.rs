@@ -9,6 +9,7 @@
 //!   [`Change`]s it made, for the UI.
 //! - **Reads** are public: [`Store::conversations`], [`Store::timeline`],
 //!   [`Store::unread`], [`Store::export`] and the like. They work offline.
+//!   The chat list's reads, across every account, are the client layer's.
 //! - **Trust records**: [`Store`] implements [`TrustStore`](crate::addr::TrustStore).
 //!
 //! Two processes may open the same file at once, for example an app and its
@@ -24,6 +25,7 @@
 //! has one connection for both. Calls block, so async code should make
 //! them off the runtime's worker threads.
 
+mod chats;
 mod events;
 mod outbox;
 mod people;
@@ -46,6 +48,7 @@ pub(crate) use outbox::Claim;
 pub use outbox::{Draft, FailReason, OutboxItem, OutboxState};
 pub use read::{ConversationSummary, Member, Reaction, TimelineItem};
 
+pub(crate) use chats::{ChatKey, ChatQuery, ChatRow, key_order};
 pub(crate) use events::{ConvRow, Tx};
 
 /// How long a write waits for another process's transaction to finish.

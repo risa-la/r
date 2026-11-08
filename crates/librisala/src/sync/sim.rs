@@ -13,6 +13,12 @@
 //! A connection's replies can be staged: computed, but sent later, so live
 //! events from other connections get ahead of them, as on a real server
 //! that reads a page and then queues it.
+//!
+//! Each store also has a chat list, as an app shows it, fed every change
+//! the engines on that store report. Device 0's store also holds a guest
+//! account on another server, so the list spans servers. After every
+//! step, applying the list's diffs must give the rows and counts of a
+//! fresh list with the same filter and window.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -31,7 +37,9 @@ use risala_proto::types::{Relation, RoomSetting};
 
 use super::{Clock, Outcome, Reply, ReqId, SyncConfig, SyncEngine};
 use crate::addr::ServerAddr;
-use crate::store::{AccountId, Draft, OutboxState, Store};
+use crate::client::chats::{ChatListDiff, ChatState};
+use crate::client::{ChatCounts, ChatSummary};
+use crate::store::{AccountId, Change, ChatQuery, Draft, OutboxState, Store};
 
 pub(super) const ME: &str = "alice@example.org";
 const BOB: &str = "bob@example.org";
@@ -162,6 +170,44 @@ struct Device {
     conn: Option<Conn>,
 }
 
+/// A chat list on one store, with the rows its diffs give.
+struct List {
+    state: ChatState,
+    /// The rows and counts as an app applying the diffs has them.
+    shown: Vec<ChatSummary>,
+    counts: ChatCounts,
+}
+
+impl List {
+    fn new(store: &Store) -> List {
+        let state = ChatState::new(store.clone(), ChatQuery::default(), 1).unwrap();
+        List {
+            shown: state.items(),
+            counts: state.counts(),
+            state,
+        }
+    }
+
+    fn show(&mut self, diffs: Vec<ChatListDiff>) {
+        for diff in diffs {
+            match diff {
+                ChatListDiff::Reset { items } => self.shown = items,
+                ChatListDiff::Insert { index, item } => self.shown.insert(index as usize, item),
+                ChatListDiff::Update { index, item } => self.shown[index as usize] = item,
+                ChatListDiff::Remove { index } => {
+                    self.shown.remove(index as usize);
+                }
+            }
+        }
+        self.counts = self.state.counts();
+    }
+
+    fn apply(&mut self, changes: &[Change]) {
+        let diffs = self.state.apply(changes).unwrap();
+        self.show(diffs);
+    }
+}
+
 /// One action of the simulation. Numbers are taken modulo what they
 /// choose from.
 #[derive(Debug, Clone)]
@@ -193,6 +239,10 @@ pub(super) enum Action {
     Fetch(u8, u8, u8),
     Download(u8, u8),
     MarkRead(u8, u8),
+    // The user, in the chat list.
+    Favourite(u8, u8),
+    ListFilter(u8, u8),
+    ListMore(u8),
 }
 
 pub(super) struct World {
@@ -202,6 +252,8 @@ pub(super) struct World {
     /// (cid, incarnation) to seq: cids match within one id (7.6).
     cids: HashMap<(String, usize), u64>,
     devices: Vec<Device>,
+    /// The chat lists of devices 0 (whose store device 2 shares) and 1.
+    lists: [List; 2],
     config: SyncConfig,
     sends: u32,
     /// Engine calls that failed.
@@ -240,12 +292,34 @@ impl World {
                 conn: None,
             });
         }
+        // Another account on another server, with one room, in the middle
+        // of the chat list until alice's rooms move past it.
+        let other: ServerAddr = "other.example".parse().unwrap();
+        let sam = shared.account(&other, &uid("~sam")).unwrap();
+        shared
+            .write(|tx| {
+                tx.at(Timestamp::from_unix_millis(1_799_999_999_000).unwrap());
+                let mut row = tx.conv_or_create(sam, &"#z".parse().unwrap())?;
+                tx.learn_id(&mut row, &"z1".parse().unwrap(), Some(1))?;
+                tx.set_joined(&mut row, true)?;
+                let line: ServerMessage = "@seq=1;t=2027-01-15T08:00:00.010Z;from=~kim MSG #z hi"
+                    .parse()
+                    .unwrap();
+                let ServerLine::Event(e) = line.line else {
+                    unreachable!()
+                };
+                tx.store_event(&row, &e)?;
+                tx.raise_sync_point(&mut row, 1)
+            })
+            .unwrap();
+        let lists = [List::new(&devices[0].store), List::new(&devices[1].store)];
         let mut w = World {
             incs: Vec::new(),
             clock,
             max_page,
             cids: HashMap::new(),
             devices,
+            lists,
             config,
             sends: 0,
             errors: Vec::new(),
@@ -558,6 +632,7 @@ impl World {
                 return;
             }
         };
+        self.lists[list_of(d)].apply(&out.changes);
         let now = Timestamp::from_unix_millis(self.clock.load(Ordering::SeqCst)).unwrap();
         let dev = &self.devices[d];
         for o in &out.send {
@@ -600,6 +675,20 @@ impl World {
 
     fn device(&self, d: u8) -> usize {
         usize::from(d) % DEVICES
+    }
+
+    /// The chat filter numbered `n`: a server or none, and each toggle.
+    fn filter(n: u8) -> ChatQuery {
+        ChatQuery {
+            server: match n % 3 {
+                0 => None,
+                1 => Some("chat.example.org".into()),
+                _ => Some("other.example".into()),
+            },
+            unread: n & 4 != 0,
+            favourites: n & 8 != 0,
+            rooms: n & 16 != 0,
+        }
     }
 
     pub(super) fn step(&mut self, action: &Action) {
@@ -789,6 +878,30 @@ impl World {
                     self.user(d, |e| e.mark_read(&conv, seq));
                 }
             }
+            Action::Favourite(d, r) => {
+                let d = self.device(d);
+                let dev = &self.devices[d];
+                let conv = Conv::Room(room(r));
+                if let Some(c) = dev.store.conversation(dev.account, &conv).unwrap() {
+                    let on = !dev
+                        .store
+                        .chat_row(c.id)
+                        .unwrap()
+                        .is_some_and(|row| row.favourite);
+                    let changes = dev.store.set_favourite(c.id, on).unwrap();
+                    self.lists[list_of(d)].apply(&changes);
+                }
+            }
+            Action::ListFilter(d, n) => {
+                let list = &mut self.lists[list_of(self.device(d))];
+                let diffs = list.state.set_query(World::filter(n)).unwrap();
+                list.show(diffs);
+            }
+            Action::ListMore(d) => {
+                let list = &mut self.lists[list_of(self.device(d))];
+                let diffs = list.state.widen(1).unwrap();
+                list.show(diffs);
+            }
         }
     }
 
@@ -848,6 +961,17 @@ impl World {
     /// Checks what must hold after every step.
     pub(super) fn check(&self) {
         assert!(self.errors.is_empty(), "engine errors: {:?}", self.errors);
+        // A chat list's diffs give what reading it afresh gives.
+        for (n, list) in self.lists.iter().enumerate() {
+            let fresh = ChatState::new(
+                self.devices[n].store.clone(),
+                list.state.query().clone(),
+                list.state.limit(),
+            )
+            .unwrap();
+            assert_eq!(list.shown, fresh.items(), "chat list {n}: rows");
+            assert_eq!(list.counts, fresh.counts(), "chat list {n}: counts");
+        }
         // At most one event per outbox message per conversation id (7.6).
         for i in &self.incs {
             let mut seen = BTreeSet::new();
@@ -1033,6 +1157,11 @@ impl World {
     }
 }
 
+/// The chat list of device `d`'s store.
+fn list_of(d: usize) -> usize {
+    if d == 2 { 0 } else { d }
+}
+
 fn action() -> impl Strategy<Value = Action> {
     let b = any::<u8>;
     prop_oneof![
@@ -1059,6 +1188,9 @@ fn action() -> impl Strategy<Value = Action> {
         1 => (b(), b(), b()).prop_map(|(d, r, s)| Action::Fetch(d, r, s)),
         1 => (b(), b()).prop_map(|(d, r)| Action::Download(d, r)),
         1 => (b(), b()).prop_map(|(d, r)| Action::MarkRead(d, r)),
+        1 => (b(), b()).prop_map(|(d, r)| Action::Favourite(d, r)),
+        1 => (b(), b()).prop_map(|(d, n)| Action::ListFilter(d, n)),
+        1 => b().prop_map(Action::ListMore),
     ]
 }
 
