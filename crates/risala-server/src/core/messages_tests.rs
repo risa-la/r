@@ -329,6 +329,12 @@ async fn moderators_owners_and_operators_delete_anyones_messages() {
             format!("@seq=11;t={T};from={OP} DELETE #general 3"),
         ]
     );
+    // Only messages, for them too: a ROLE, a JOIN and a DELETE are
+    // `not-found` (5.4).
+    for target in [5, 7, 9] {
+        h.send(&op, &format!("delete #general {target}")).await;
+        assert_eq!(op.lines(), ["ERR not-found no such message"], "{target}");
+    }
 }
 
 #[tokio::test]
