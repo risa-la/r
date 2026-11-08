@@ -1,5 +1,12 @@
 //! Keeping a connection up: reconnects with exponential backoff and
-//! jitter, signing in again each time, and reporting what happens.
+//! jitter, giving each new connection its kind again (4.1), and reporting
+//! what happens.
+//!
+//! A [`Supervisor`] keeps one connection up. What it does after the
+//! greeting is an [`Establish`]: [`Anonymous`] sends ANON, [`GuestSignIn`]
+//! GUEST and [`IdentitySignIn`] AUTH. A device runs one supervisor per
+//! connection it keeps, as [`ServerConnections`](super::ServerConnections)
+//! does.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -7,8 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use risala_proto::auth::SecretKey;
+use risala_proto::command::GuestToken;
+use risala_proto::connection::ConnectionKind;
 use risala_proto::error::ErrorCode;
-use risala_proto::names::{Id, Identity, MAX_NAME_LEN, Name, Uid};
+use risala_proto::names::{Identity, MAX_NAME_LEN, Name, Uid};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -17,17 +26,36 @@ use super::session::{Incoming, Session, SessionInfo, SessionOptions};
 use super::tls;
 use crate::addr::{ServerAddr, TrustStore};
 
-/// A boxed future, for [`SignIn`].
+/// A boxed future, for [`Establish`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// How a [`Supervisor`] signs in on each new connection.
-pub trait SignIn: Send + Sync {
-    /// Signs `session` in and returns the uid. An error that
+/// What a [`Supervisor`] does on each new connection, after the greeting:
+/// make it anonymous, a guest or signed in (4.1).
+pub trait Establish: Send + Sync {
+    /// The kind of connection this makes.
+    fn kind(&self) -> ConnectionKind;
+
+    /// Gives `session` its kind. An error that
     /// [`is_permanent`](Error::is_permanent), such as `auth-failed`,
-    /// stops the supervisor. Others, such as `unavailable` (4.5), are
+    /// stops the supervisor. Others, such as `unavailable` (4.6), are
     /// tried again with backoff, waiting at least as long as their
     /// `retry` tag says.
-    fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>>;
+    fn establish<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<(), Error>>;
+}
+
+/// Makes each connection anonymous with ANON (4.2), for posting,
+/// following and fetching (Section 7).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Anonymous;
+
+impl Establish for Anonymous {
+    fn kind(&self) -> ConnectionKind {
+        ConnectionKind::Anonymous
+    }
+
+    fn establish<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(session.anon())
+    }
 }
 
 /// The guest session (4.2) a [`GuestSignIn`] resumes: the name it got and
@@ -36,24 +64,24 @@ pub trait SignIn: Send + Sync {
 ///
 /// The token is a secret: [`Debug`](std::fmt::Debug) leaves it out.
 #[derive(Default)]
-pub struct GuestToken {
-    session: std::sync::Mutex<Option<(Name, Id)>>,
+pub struct GuestSession {
+    session: std::sync::Mutex<Option<(Name, GuestToken)>>,
     /// Whether the last sign-in resumed its session.
     resumed: std::sync::atomic::AtomicBool,
 }
 
-impl std::fmt::Debug for GuestToken {
+impl std::fmt::Debug for GuestSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GuestToken")
+        f.debug_struct("GuestSession")
             .field("name", &self.get().map(|(name, _)| name))
             .finish_non_exhaustive()
     }
 }
 
-impl GuestToken {
+impl GuestSession {
     /// A holder with `session` in it, as [`set`](Self::set) leaves it.
-    pub fn new(session: Option<(Name, Id)>) -> GuestToken {
-        GuestToken {
+    pub fn new(session: Option<(Name, GuestToken)>) -> GuestSession {
+        GuestSession {
             session: std::sync::Mutex::new(session),
             resumed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -61,14 +89,14 @@ impl GuestToken {
 
     /// Whether the last sign-in resumed the stored session (`resumed=yes`,
     /// 4.2), rather than starting a new one. Read it after
-    /// [`SupervisorEvent::SignedIn`]: then the connection's guest has the
-    /// session's cids, and may send again what got no `OK` (7.6).
+    /// [`SupervisorEvent::Ready`]: then the guest is still in its public
+    /// rooms' groups, and its cids carry over (7.6).
     pub fn resumed(&self) -> bool {
         self.resumed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The name and token of the session to resume, if any.
-    pub fn get(&self) -> Option<(Name, Id)> {
+    pub fn get(&self) -> Option<(Name, GuestToken)> {
         self.session
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -76,13 +104,13 @@ impl GuestToken {
     }
 
     /// Records the session signed in to, or forgets it.
-    pub fn set(&self, session: Option<(Name, Id)>) {
+    pub fn set(&self, session: Option<(Name, GuestToken)>) {
         *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
     }
 }
 
-/// Signs in as the guest `~<name>` (4.2), resuming the last session when
-/// it can.
+/// Becomes the guest `~<name>` (4.2), resuming the last session when it
+/// can.
 ///
 /// - If [`session`](Self::session) holds a session, it sends
 ///   `GUEST <that name> token=<token>` first. The server resumes the
@@ -94,14 +122,14 @@ impl GuestToken {
 ///
 /// Either way, the name and the new token from the `OK` go into
 /// [`session`](Self::session), with whether the server resumed the session
-/// ([`GuestToken::resumed`]), and the uid is in
-/// [`SupervisorEvent::SignedIn`].
+/// ([`GuestSession::resumed`]), and the uid is the session's
+/// [`Session::uid`].
 #[derive(Debug, Clone)]
 pub struct GuestSignIn {
     /// The name the user chose, without `~`.
     pub name: Name,
     /// The session to resume, updated by each sign-in.
-    pub session: Arc<GuestToken>,
+    pub session: Arc<GuestSession>,
 }
 
 impl GuestSignIn {
@@ -109,14 +137,14 @@ impl GuestSignIn {
     /// connection.
     pub const MAX_NAMES: u32 = 9;
 
-    /// Signs in as `~<name>`, with no session to resume yet.
+    /// Becomes `~<name>`, with no session to resume yet.
     pub fn new(name: Name) -> GuestSignIn {
         GuestSignIn::resuming(name, Arc::default())
     }
 
-    /// Signs in as `~<name>`, resuming the session in `session` if there
-    /// is one.
-    pub fn resuming(name: Name, session: Arc<GuestToken>) -> GuestSignIn {
+    /// Becomes `~<name>`, resuming the session in `session` if there is
+    /// one.
+    pub fn resuming(name: Name, session: Arc<GuestSession>) -> GuestSignIn {
         GuestSignIn { name, session }
     }
 
@@ -138,7 +166,7 @@ impl GuestSignIn {
     }
 
     /// Records the session `GUEST <name>` signed in to.
-    fn signed_in(&self, name: &Name, token: Option<Id>, resumed: bool) {
+    fn signed_in(&self, name: &Name, token: Option<GuestToken>, resumed: bool) {
         self.session.set(token.map(|t| (name.clone(), t)));
         self.session
             .resumed
@@ -150,15 +178,19 @@ fn name_taken(e: &Error) -> bool {
     matches!(e, Error::Rejected(CommandError::Server(e)) if e.code == ErrorCode::NameTaken)
 }
 
-impl SignIn for GuestSignIn {
-    fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>> {
+impl Establish for GuestSignIn {
+    fn kind(&self) -> ConnectionKind {
+        ConnectionKind::Guest
+    }
+
+    fn establish<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             let resumed = self.session.get();
             if let Some((name, token)) = &resumed {
                 match session.guest_session(name, Some(token)).await {
-                    Ok((uid, token, resumed)) => {
+                    Ok((_, token, resumed)) => {
                         self.signed_in(name, token, resumed);
-                        return Ok(uid);
+                        return Ok(());
                     }
                     Err(e) if name_taken(&e) => {}
                     Err(e) => return Err(e),
@@ -175,9 +207,9 @@ impl SignIn for GuestSignIn {
                 }
                 match session.guest_session(&name, None).await {
                     Err(e) if name_taken(&e) && n < Self::MAX_NAMES => n += 1,
-                    Ok((uid, token, _)) => {
+                    Ok((_, token, _)) => {
                         self.signed_in(&name, token, false);
-                        return Ok(uid);
+                        return Ok(());
                     }
                     Err(e) => return Err(e),
                 }
@@ -186,16 +218,17 @@ impl SignIn for GuestSignIn {
     }
 }
 
-/// Signs in as an identity with a device key (4.5).
+/// Signs in as an identity with the device key of one of its current
+/// devices (4.6), for what belongs to the account (4.1).
 ///
 /// `auth-failed` is final: the server checked the signature against the
-/// keys it got, and the same key fails the same way (4.5). `unavailable`
+/// keys it got, and the same key fails the same way (4.6). `unavailable`
 /// means the server could not get the key file, and is tried again.
 #[derive(Debug, Clone)]
 pub struct IdentitySignIn {
     /// The identity.
     pub identity: Identity,
-    /// The device key, listed in the identity's key file.
+    /// The device key, of a current device in the identity's key file.
     pub key: SecretKey,
 }
 
@@ -206,9 +239,16 @@ impl IdentitySignIn {
     }
 }
 
-impl SignIn for IdentitySignIn {
-    fn sign_in<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<Uid, Error>> {
-        Box::pin(session.auth(&self.identity, &self.key))
+impl Establish for IdentitySignIn {
+    fn kind(&self) -> ConnectionKind {
+        ConnectionKind::SignedIn
+    }
+
+    fn establish<'a>(&'a self, session: &'a Session) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(async move {
+            session.auth(&self.identity, &self.key).await?;
+            Ok(())
+        })
     }
 }
 
@@ -264,23 +304,27 @@ pub enum SupervisorEvent {
         /// Failures in a row so far.
         attempt: u32,
     },
-    /// TLS is up and the greeting has arrived; signing in.
+    /// TLS is up and the greeting has arrived; establishing the kind.
     Connected {
         /// The new connection.
         info: SessionInfo,
     },
-    /// Signed in. The session is ready for commands, and its incoming
-    /// lines arrive on `incoming`. Catch up with SYNC (7.1) now.
-    SignedIn {
-        /// The uid signed in as.
-        uid: Uid,
+    /// The connection is anonymous, a guest or signed in. The session is
+    /// ready for commands, and its incoming lines arrive on `incoming`.
+    /// Follow and catch up now (7.4).
+    Ready {
+        /// The connection's kind.
+        kind: ConnectionKind,
+        /// The uid of a guest or signed-in connection; `None` for an
+        /// anonymous one.
+        uid: Option<Uid>,
         /// The session. The supervisor keeps a handle to close it.
         session: Arc<Session>,
         /// The session's incoming queue: lines, and the replies to
         /// commands sent with [`Session::send`], in arrival order.
         incoming: mpsc::Receiver<Incoming>,
     },
-    /// The signed-in connection closed.
+    /// The connection closed.
     Disconnected {
         /// Why.
         reason: CloseReason,
@@ -290,7 +334,7 @@ pub enum SupervisorEvent {
         /// How long.
         delay: Duration,
         /// The error that ended the last attempt, if it failed before
-        /// signing in.
+        /// the connection was ready.
         error: Option<Error>,
     },
     /// Gave up: the error cannot pass without the user (a trust error,
@@ -305,7 +349,7 @@ pub enum SupervisorEvent {
     Stopped,
 }
 
-/// Keeps one connection to one server up, signing in each time.
+/// Keeps one connection to one server up, giving it its kind each time.
 ///
 /// It runs as a task. Events arrive on the receiver returned by
 /// [`spawn`](Self::spawn); the supervisor waits for the app to read
@@ -327,7 +371,7 @@ impl Supervisor {
         addr: ServerAddr,
         trust: Arc<dyn TrustStore>,
         options: SessionOptions,
-        sign_in: Arc<dyn SignIn>,
+        establish: Arc<dyn Establish>,
         backoff: Backoff,
     ) -> (Supervisor, mpsc::Receiver<SupervisorEvent>) {
         let (events_tx, events_rx) = mpsc::channel(16);
@@ -338,7 +382,7 @@ impl Supervisor {
             addr,
             trust,
             options,
-            sign_in,
+            establish,
             backoff,
             events: events_tx,
             stop: stop_rx,
@@ -391,7 +435,7 @@ struct Run {
     addr: ServerAddr,
     trust: Arc<dyn TrustStore>,
     options: SessionOptions,
-    sign_in: Arc<dyn SignIn>,
+    establish: Arc<dyn Establish>,
     backoff: Backoff,
     events: mpsc::Sender<SupervisorEvent>,
     stop: watch::Receiver<bool>,
@@ -433,12 +477,13 @@ impl Run {
             let mut error = None;
             let mut hint = Duration::ZERO;
             match attempt {
-                Ok((session, uid)) => {
+                Ok(session) => {
                     let session = Arc::new(session);
                     let incoming = session.take_incoming().expect("a new session");
                     let started = Instant::now();
-                    self.emit(SupervisorEvent::SignedIn {
-                        uid,
+                    self.emit(SupervisorEvent::Ready {
+                        kind: session.kind(),
+                        uid: session.uid(),
                         session: session.clone(),
                         incoming,
                     })
@@ -465,7 +510,7 @@ impl Run {
                 Err(e) if e.is_permanent() => {
                     return self.emit(SupervisorEvent::Failed { error: e }).await;
                 }
-                // Includes `unavailable` (4.5): at least `retry`, and
+                // Includes `unavailable` (4.6): at least `retry`, and
                 // longer after each failure.
                 Err(e) => {
                     failures = failures.saturating_add(1);
@@ -493,8 +538,8 @@ impl Run {
         }
     }
 
-    /// Connects and signs in once.
-    async fn attempt(&self) -> Result<(Session, Uid), Error> {
+    /// Connects and establishes the kind once.
+    async fn attempt(&self) -> Result<Session, Error> {
         let session =
             Session::connect(&self.addr, self.trust.clone(), self.options.clone()).await?;
         self.emit(SupervisorEvent::Connected {
@@ -502,7 +547,16 @@ impl Run {
         })
         .await
         .map_err(|_| Error::Closed(CloseReason::Local))?;
-        let uid = self.sign_in.sign_in(&session).await?;
-        Ok((session, uid))
+        self.establish.establish(&session).await?;
+        // An Establish that did not give the connection its kind is a bug.
+        if session.kind() != self.establish.kind() {
+            session.close();
+            return Err(Error::Closed(CloseReason::Protocol(format!(
+                "the connection is {}, not {}",
+                session.kind(),
+                self.establish.kind()
+            ))));
+        }
+        Ok(session)
     }
 }

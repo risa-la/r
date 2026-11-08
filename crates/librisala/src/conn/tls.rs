@@ -2,20 +2,33 @@
 //!
 //! [`TrustVerifier`] decides whether to accept a server's certificate:
 //!
-//! 1. A certificate that the CA verifier accepts for the hostname is
-//!    accepted, and "CA" is recorded, replacing any pin. It is never
-//!    compared against a pin.
-//! 2. Any other certificate is handled by trust on first use, by the
-//!    fingerprint of its SubjectPublicKeyInfo:
-//!    - no record: refused with [`TrustError::Unknown`], so the app can
-//!      ask the user;
-//!    - a matching pin: accepted;
-//!    - a different pin, or "CA": refused with [`TrustError::Mismatch`].
+//! - With a **strict pin** (2.2, PLAN.md 58), every certificate, CA-valid
+//!   or not, must have the pinned fingerprint. Any other is refused with
+//!   [`TrustError::StrictMismatch`], for the user to approve or not.
+//! - Otherwise:
+//!   1. A certificate that the CA verifier accepts for the hostname is
+//!      accepted, and "CA" is recorded, replacing any pin. It is never
+//!      compared against a pin. A pin replaced this way by a certificate
+//!      with another key leaves a [`PinChange`] notice, to tell the user
+//!      once.
+//!   2. Any other certificate is handled by trust on first use, by the
+//!      fingerprint of its SubjectPublicKeyInfo:
+//!      - no record: refused with [`TrustError::Unknown`], so the app can
+//!        ask the user;
+//!      - a matching pin: accepted;
+//!      - a different pin, or "CA": refused with [`TrustError::Mismatch`].
 //!
 //! Handshake signatures are verified in every case, against the key in
 //! the certificate the server showed. A new record is written only after
 //! the handshake has finished, so a server that shows someone else's
 //! CA-valid certificate without holding its key cannot replace a pin.
+//!
+//! **No resumption.** Every connection makes a fresh `ClientConfig` with
+//! TLS session resumption turned off, so it sends no session ticket or
+//! PSK from an earlier connection. A resumed session would skip the
+//! certificate check, and would also let the server link a device's
+//! anonymous connections to each other and to its signed-in one (4.1,
+//! Section 14).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -31,7 +44,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::error::{Error, TrustError};
-use crate::addr::{ServerAddr, TrustRecord, TrustStore, TrustStoreError};
+use crate::addr::{PinChange, Replaced, ServerAddr, TrustRecord, TrustStore, TrustStoreError};
 
 /// The check for rule 1 of 2.2: whether a certificate is CA-valid for the
 /// hostname. Any [`ServerCertVerifier`] will do. Only its
@@ -155,47 +168,28 @@ pub fn certificate_fingerprint(cert: &CertificateDer<'_>) -> Result<Fingerprint,
     ))
 }
 
-/// Records the fingerprint the user accepted for a server that had no
-/// record (2.2), after a [`TrustError::Unknown`].
-///
-/// It refuses to replace a record that differs: after a mismatch the user
-/// must delete the record explicitly, with
-/// [`TrustStore::forget`](crate::addr::TrustStore::forget), first. Doing
-/// it again with the same fingerprint is fine. The check and the write are
-/// one step ([`TrustStore::pin_if_unknown`]), so a record written
-/// meanwhile is never replaced.
-///
-/// The trust store may block (SQLite), so call this off the async
-/// runtime's worker threads, or through `spawn_blocking`.
-pub fn accept_fingerprint(
-    trust: &dyn TrustStore,
-    addr: &ServerAddr,
-    fingerprint: Fingerprint,
-) -> Result<(), Error> {
-    match trust.pin_if_unknown(addr, fingerprint)? {
-        None => Ok(()),
-        Some(TrustRecord::Pinned(fp)) if fp == fingerprint => Ok(()),
-        Some(recorded) => Err(TrustError::Mismatch {
-            recorded,
-            presented: fingerprint,
-            ca_error: "a different record exists".into(),
-        }
-        .into()),
-    }
-}
-
 /// How a server's certificate was accepted (2.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
     /// The fingerprint of the certificate's public key. Known even for a
     /// CA-valid certificate, for display.
     pub fingerprint: Fingerprint,
-    /// The record that now applies: `Ca`, or `Pinned` with a pin that
-    /// matched.
+    /// The record that now applies: `Ca`, or a pin that matched.
     pub record: TrustRecord,
-    /// Whether `record` is new and must be stored once the handshake has
-    /// finished.
-    pub changed: bool,
+    /// The record before this connection, if `record` is new and must be
+    /// stored once the handshake has finished: `Some(previous)`, where
+    /// `previous` is `None` for no record. `None` if nothing changes.
+    pub replaces: Option<Option<TrustRecord>>,
+    /// A pin that a CA-valid certificate with another key replaced (2.2),
+    /// which the user is told about once.
+    pub pin_change: Option<PinChange>,
+}
+
+impl Verified {
+    /// Whether the record is new and must be stored.
+    pub fn changed(&self) -> bool {
+        self.replaces.is_some()
+    }
 }
 
 /// The [`ServerCertVerifier`] of 2.2, for one connection to one server.
@@ -245,22 +239,45 @@ impl TrustVerifier {
         now: UnixTime,
     ) -> Result<Verified, TrustError> {
         let fingerprint = certificate_fingerprint(end_entity)?;
+        let ca = self
+            .ca
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        // A strict pin: every certificate must match it, CA-valid or not.
+        if let Some(TrustRecord::Strict(pin)) = &self.record {
+            if *pin == fingerprint {
+                return Ok(Verified {
+                    fingerprint,
+                    record: TrustRecord::Strict(fingerprint),
+                    replaces: None,
+                    pin_change: None,
+                });
+            }
+            return Err(TrustError::StrictMismatch {
+                pinned: *pin,
+                presented: fingerprint,
+                ca_error: ca.err(),
+            });
+        }
         // Rule 1: CA-valid. Never compared against a pin.
-        let ca_error = match self.ca.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
-            Ok(_) => {
+        let ca_error = match ca {
+            Ok(()) => {
+                let pin_change = match &self.record {
+                    Some(TrustRecord::Pinned(old)) if *old != fingerprint => Some(PinChange {
+                        old: *old,
+                        new: fingerprint,
+                    }),
+                    _ => None,
+                };
                 return Ok(Verified {
                     fingerprint,
                     record: TrustRecord::Ca,
-                    changed: self.record != Some(TrustRecord::Ca),
+                    replaces: (self.record != Some(TrustRecord::Ca)).then(|| self.record.clone()),
+                    pin_change,
                 });
             }
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
         // Rule 2: trust on first use.
         match &self.record {
@@ -271,7 +288,8 @@ impl TrustVerifier {
             Some(TrustRecord::Pinned(pin)) if *pin == fingerprint => Ok(Verified {
                 fingerprint,
                 record: TrustRecord::Pinned(fingerprint),
-                changed: false,
+                replaces: None,
+                pin_change: None,
             }),
             Some(recorded) => Err(TrustError::Mismatch {
                 recorded: recorded.clone(),
@@ -364,8 +382,9 @@ pub(crate) async fn connect(
         .with_custom_certificate_verifier(verifier.clone())
         .with_no_client_auth();
     config.alpn_protocols = vec![risala_proto::ALPN.to_vec()];
-    // Every connection is checked in full; a resumed session would skip
-    // the certificate.
+    // Every connection is checked in full, and none is linked to another
+    // by a session ticket (4.1, Section 14): no resumption, and a config
+    // of its own, so no session cache is shared.
     config.resumption = Resumption::disabled();
     config.enable_sni = true;
 
@@ -391,9 +410,26 @@ pub(crate) async fn connect(
         }
     };
     let (stream, verified) = stream;
-    if verified.changed {
-        let (trust, addr, record) = (trust.clone(), addr.clone(), verified.record.clone());
-        blocking(move || trust.set(&addr, record)).await?;
+    if let Some(previous) = verified.replaces.clone() {
+        let (trust, addr, record, notice) = (
+            trust.clone(),
+            addr.clone(),
+            verified.record.clone(),
+            verified.pin_change.clone(),
+        );
+        let replaced = {
+            let record = record.clone();
+            blocking(move || trust.replace(&addr, previous.as_ref(), record, notice)).await?
+        };
+        match replaced {
+            Replaced::Done => {}
+            // Another connection wrote the same record meanwhile.
+            Replaced::Found(Some(found)) if found == record => {}
+            // The record changed while this connection checked against
+            // the old one, for example because the user set a strict pin:
+            // do not overwrite it, and let the caller connect again.
+            Replaced::Found(_) => return Err(TrustError::RecordChanged.into()),
+        }
     }
     Ok((stream, verified))
 }

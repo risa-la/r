@@ -7,7 +7,9 @@ mod trust;
 
 use std::sync::Arc;
 
-use crate::addr::{MemoryTrustStore, ServerAddr, TrustStore};
+use crate::addr::{
+    MemoryTrustStore, Replaced, ServerAddr, TrustRecord, TrustStore, TrustStoreError,
+};
 
 use super::{Session, SessionOptions, roots_ca_verifier};
 use server::{ScriptServer, TestCa};
@@ -37,4 +39,19 @@ async fn connect(
     trust: &Arc<dyn TrustStore>,
 ) -> Result<Session, super::Error> {
     Session::connect(&chat_test(), trust.clone(), options(ca, server)).await
+}
+
+/// Sets a record whatever was there, as tests need to.
+pub(crate) trait SetRecord {
+    fn set(&self, addr: &ServerAddr, record: TrustRecord) -> Result<(), TrustStoreError>;
+}
+
+impl SetRecord for dyn TrustStore {
+    fn set(&self, addr: &ServerAddr, record: TrustRecord) -> Result<(), TrustStoreError> {
+        let current = self.get(addr)?;
+        match self.replace(addr, current.as_ref(), record, None)? {
+            Replaced::Done => Ok(()),
+            Replaced::Found(_) => Err(TrustStoreError("changed meanwhile".into())),
+        }
+    }
 }

@@ -1,7 +1,7 @@
 //! Server addresses (2.1) and the trust records of 2.2.
 //!
 //! These types are shared by [`crate::conn`], which checks certificates,
-//! and [`crate::store`], which keeps the records.
+//! and [`crate::store`], which keeps the records. Owned by task C0.
 
 use std::fmt;
 use std::str::FromStr;
@@ -14,7 +14,7 @@ use risala_proto::fingerprint::Fingerprint;
 /// The host is normalized as 2.1 says: lower-cased, with one trailing `.`
 /// dropped, so `Chat.Example.org.` and `chat.example.org` are the same
 /// server. The normalized host is what the client sends in SNI, the key of
-/// the trust record (2.2) and what it signs in AUTH (4.5). An IP address
+/// the trust record (2.2) and what it signs in AUTH (4.6). An IP address
 /// is allowed, but cannot sign in as an identity (2.1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerAddr {
@@ -128,33 +128,100 @@ impl fmt::Display for ServerAddr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TrustRecord {
     /// The server showed a CA-valid certificate. From now on it must keep
-    /// doing so.
+    /// doing so, or match a pin the user accepts.
     Ca,
-    /// The user accepted this fingerprint on first use.
+    /// The user accepted this fingerprint on first use. A CA-valid
+    /// certificate replaces it with [`Ca`](Self::Ca), with a one-time
+    /// [`PinChange`] notice.
     Pinned(Fingerprint),
+    /// A strict pin the user set (2.2, PLAN.md 58): every certificate,
+    /// CA-valid or not, must have this fingerprint, and a different one
+    /// needs the user's approval.
+    Strict(Fingerprint),
 }
 
-/// Somewhere to keep trust records, one per server address.
+impl TrustRecord {
+    /// The pinned fingerprint, strict or not.
+    pub fn pin(&self) -> Option<&Fingerprint> {
+        match self {
+            TrustRecord::Ca => None,
+            TrustRecord::Pinned(fp) | TrustRecord::Strict(fp) => Some(fp),
+        }
+    }
+}
+
+impl fmt::Display for TrustRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrustRecord::Ca => f.write_str("CA"),
+            TrustRecord::Pinned(fp) => write!(f, "pinned {fp}"),
+            TrustRecord::Strict(fp) => write!(f, "strictly pinned {fp}"),
+        }
+    }
+}
+
+/// A pin replaced by "CA" because the server showed a CA-valid
+/// certificate with another key (2.2). The client tells the user once,
+/// showing both fingerprints, since whoever can get a certificate for
+/// the name could be behind the change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PinChange {
+    /// The fingerprint that was pinned.
+    pub old: Fingerprint,
+    /// The fingerprint of the CA-valid certificate that replaced it.
+    pub new: Fingerprint,
+}
+
+/// What [`TrustStore::replace`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// The record was the one expected, and has been replaced.
+    Done,
+    /// The record was not the one expected, so nothing was written. It
+    /// holds the record found.
+    Found(Option<TrustRecord>),
+}
+
+/// Somewhere to keep trust records, one per server address, and the
+/// notices of pins replaced by "CA" (2.2).
 ///
 /// [`crate::store`] implements it on SQLite. Tests can use
-/// [`MemoryTrustStore`].
+/// [`MemoryTrustStore`]. Calls may block.
 pub trait TrustStore: Send + Sync {
     /// The record for `addr`, if any.
     fn get(&self, addr: &ServerAddr) -> Result<Option<TrustRecord>, TrustStoreError>;
-    /// Sets the record for `addr`, replacing any other.
-    fn set(&self, addr: &ServerAddr, record: TrustRecord) -> Result<(), TrustStoreError>;
+    /// Replaces the record for `addr` with `new` if it is still
+    /// `expected` (`None`: no record), in one step, so that a record
+    /// written meanwhile by another connection or process is never
+    /// overwritten. With `notice`, the notice is kept in the same step,
+    /// replacing any earlier one for `addr`.
+    fn replace(
+        &self,
+        addr: &ServerAddr,
+        expected: Option<&TrustRecord>,
+        new: TrustRecord,
+        notice: Option<PinChange>,
+    ) -> Result<Replaced, TrustStoreError>;
+    /// Deletes the record for `addr`, as the user must do explicitly after
+    /// a mismatch (2.2). Its notice goes too.
+    fn forget(&self, addr: &ServerAddr) -> Result<(), TrustStoreError>;
+    /// The notices not yet dismissed, by server.
+    fn notices(&self) -> Result<Vec<(ServerAddr, PinChange)>, TrustStoreError>;
+    /// Dismisses the notice for `addr`, once the user has seen it.
+    fn dismiss_notice(&self, addr: &ServerAddr) -> Result<(), TrustStoreError>;
+
     /// Records `Pinned(fingerprint)` for `addr` if it has no record, and
-    /// returns the record it had before, if any. The check and the write
-    /// are one step, so that a record written meanwhile, by another
-    /// connection or process, is never replaced.
+    /// returns the record it had before, if any.
     fn pin_if_unknown(
         &self,
         addr: &ServerAddr,
         fingerprint: Fingerprint,
-    ) -> Result<Option<TrustRecord>, TrustStoreError>;
-    /// Deletes the record for `addr`, as the user must do explicitly after
-    /// a mismatch (2.2).
-    fn forget(&self, addr: &ServerAddr) -> Result<(), TrustStoreError>;
+    ) -> Result<Option<TrustRecord>, TrustStoreError> {
+        match self.replace(addr, None, TrustRecord::Pinned(fingerprint), None)? {
+            Replaced::Done => Ok(None),
+            Replaced::Found(found) => Ok(found),
+        }
+    }
 }
 
 /// A trust store failed to read or write.
@@ -164,36 +231,63 @@ pub struct TrustStoreError(pub String);
 
 /// A [`TrustStore`] in memory, for tests and short-lived tools.
 #[derive(Debug, Default)]
-pub struct MemoryTrustStore(std::sync::Mutex<std::collections::HashMap<ServerAddr, TrustRecord>>);
+pub struct MemoryTrustStore(std::sync::Mutex<MemoryTrust>);
+
+/// What a [`MemoryTrustStore`] holds.
+#[derive(Debug, Default)]
+pub struct MemoryTrust {
+    records: std::collections::HashMap<ServerAddr, TrustRecord>,
+    notices: std::collections::BTreeMap<ServerAddr, PinChange>,
+}
+
+impl MemoryTrustStore {
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryTrust> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 impl TrustStore for MemoryTrustStore {
     fn get(&self, addr: &ServerAddr) -> Result<Option<TrustRecord>, TrustStoreError> {
-        Ok(self.0.lock().expect("poisoned").get(addr).cloned())
+        Ok(self.lock().records.get(addr).cloned())
     }
 
-    fn set(&self, addr: &ServerAddr, record: TrustRecord) -> Result<(), TrustStoreError> {
-        self.0
-            .lock()
-            .expect("poisoned")
-            .insert(addr.clone(), record);
-        Ok(())
-    }
-
-    fn pin_if_unknown(
+    fn replace(
         &self,
         addr: &ServerAddr,
-        fingerprint: Fingerprint,
-    ) -> Result<Option<TrustRecord>, TrustStoreError> {
-        let mut records = self.0.lock().expect("poisoned");
-        if let Some(old) = records.get(addr) {
-            return Ok(Some(old.clone()));
+        expected: Option<&TrustRecord>,
+        new: TrustRecord,
+        notice: Option<PinChange>,
+    ) -> Result<Replaced, TrustStoreError> {
+        let mut t = self.lock();
+        let found = t.records.get(addr);
+        if found != expected {
+            return Ok(Replaced::Found(found.cloned()));
         }
-        records.insert(addr.clone(), TrustRecord::Pinned(fingerprint));
-        Ok(None)
+        t.records.insert(addr.clone(), new);
+        if let Some(notice) = notice {
+            t.notices.insert(addr.clone(), notice);
+        }
+        Ok(Replaced::Done)
     }
 
     fn forget(&self, addr: &ServerAddr) -> Result<(), TrustStoreError> {
-        self.0.lock().expect("poisoned").remove(addr);
+        let mut t = self.lock();
+        t.records.remove(addr);
+        t.notices.remove(addr);
+        Ok(())
+    }
+
+    fn notices(&self) -> Result<Vec<(ServerAddr, PinChange)>, TrustStoreError> {
+        Ok(self
+            .lock()
+            .notices
+            .iter()
+            .map(|(a, n)| (a.clone(), n.clone()))
+            .collect())
+    }
+
+    fn dismiss_notice(&self, addr: &ServerAddr) -> Result<(), TrustStoreError> {
+        self.lock().notices.remove(addr);
         Ok(())
     }
 }

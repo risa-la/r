@@ -118,6 +118,8 @@ pub struct Peer {
     pub alpn: Option<Vec<u8>>,
     /// The key exchange group of the handshake.
     pub kx_group: Option<NamedGroup>,
+    /// Whether the handshake was full or resumed.
+    pub handshake: Option<rustls::HandshakeKind>,
 }
 
 impl Peer {
@@ -313,6 +315,7 @@ impl ScriptServer {
                             sni: conn.server_name().map(str::to_owned),
                             alpn: conn.alpn_protocol().map(<[u8]>::to_vec),
                             kx_group: conn.negotiated_key_exchange_group().map(|g| g.name()),
+                            handshake: conn.handshake_kind(),
                             stream: BufReader::new(tls),
                         };
                         let run = tokio::spawn(script(n, peer));

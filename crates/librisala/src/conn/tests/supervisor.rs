@@ -9,10 +9,11 @@ use risala_proto::error::ErrorCode;
 use tokio::sync::mpsc;
 
 use super::server::{Peer, ScriptServer, ServerCert, TestCa};
-use super::{chat_test, options, store};
+use super::{SetRecord, chat_test, options, store};
 use crate::addr::{TrustRecord, TrustStore};
 use crate::conn::{
-    Backoff, CloseReason, CommandError, Error, GuestSignIn, GuestToken, IdentitySignIn, Supervisor,
+    Anonymous, Backoff, CloseReason, CommandError, ConnectionKind, ConnectionPlan, Error,
+    GuestSession, GuestSignIn, IdentitySignIn, ServerConnections, Slot, Supervisor,
     SupervisorEvent, TrustError,
 };
 
@@ -60,7 +61,7 @@ async fn a_held_supervisor_does_not_connect_again() {
     let (supervisor, mut events) =
         Supervisor::spawn(chat_test(), trust, options(&ca, &server), guest(), fast());
     let session = loop {
-        if let SupervisorEvent::SignedIn { session, .. } = next(&mut events).await {
+        if let SupervisorEvent::Ready { session, .. } = next(&mut events).await {
             break session;
         }
     };
@@ -86,7 +87,7 @@ async fn reconnects_and_signs_in_again() {
             // Signed in, then the connection drops.
             0 => {
                 peer.send("@ref=1 OK uid=~sam").await;
-                peer.expect("@ref=2 SYNC").await;
+                peer.expect("@ref=2 LIST").await;
                 peer.send("@ref=2 OK").await;
                 peer.close().await;
             }
@@ -114,11 +115,20 @@ async fn reconnects_and_signs_in_again() {
         next(&mut events).await,
         SupervisorEvent::Connected { .. }
     ));
-    let SupervisorEvent::SignedIn { uid, session, .. } = next(&mut events).await else {
+    let SupervisorEvent::Ready {
+        uid: Some(uid),
+        session,
+        ..
+    } = next(&mut events).await
+    else {
         panic!()
     };
     assert_eq!(uid.as_str(), "~sam");
-    assert!(session.request(Command::Sync).await.unwrap().is_ok());
+    let list = Command::List {
+        after: None,
+        limit: None,
+    };
+    assert!(session.request(list).await.unwrap().is_ok());
     let SupervisorEvent::Disconnected { reason } = next(&mut events).await else {
         panic!()
     };
@@ -156,7 +166,7 @@ async fn reconnects_and_signs_in_again() {
         next(&mut events).await,
         SupervisorEvent::Connected { .. }
     ));
-    let SupervisorEvent::SignedIn { session, .. } = next(&mut events).await else {
+    let SupervisorEvent::Ready { session, .. } = next(&mut events).await else {
         panic!()
     };
 
@@ -231,7 +241,7 @@ async fn guest_name_taken_tries_numbered_names() {
         next(&mut events).await,
         SupervisorEvent::Connected { .. }
     ));
-    let SupervisorEvent::SignedIn { uid, .. } = next(&mut events).await else {
+    let SupervisorEvent::Ready { uid: Some(uid), .. } = next(&mut events).await else {
         panic!()
     };
     assert_eq!(uid.as_str(), "~sam3");
@@ -293,7 +303,7 @@ async fn guests_resume_their_session_with_its_token() {
     })
     .await;
     let ca = TestCa::new();
-    let token = Arc::new(GuestToken::default());
+    let token = Arc::new(GuestSession::default());
     let sign_in = Arc::new(GuestSignIn::resuming("sam".parse().unwrap(), token.clone()));
     let (supervisor, mut events) =
         Supervisor::spawn(chat_test(), trust, options(&ca, &server), sign_in, fast());
@@ -304,7 +314,7 @@ async fn guests_resume_their_session_with_its_token() {
         ("~sam2", session("sam2", "t3"), false),
     ] {
         loop {
-            if let SupervisorEvent::SignedIn { uid: got, .. } = next(&mut events).await {
+            if let SupervisorEvent::Ready { uid: Some(got), .. } = next(&mut events).await {
                 assert_eq!(got.as_str(), uid);
                 break;
             }
@@ -406,7 +416,7 @@ async fn forbidden_with_retry_passes() {
     next(&mut events).await;
     assert!(matches!(
         next(&mut events).await,
-        SupervisorEvent::SignedIn { .. }
+        SupervisorEvent::Ready { .. }
     ));
     supervisor.stop().await;
     server.done().await;
@@ -414,7 +424,7 @@ async fn forbidden_with_retry_passes() {
 
 /// Signs in as alice with the key of Appendix B.
 fn alice() -> Arc<IdentitySignIn> {
-    let key = SecretKey::from_pkcs8_pem(crate::conn::keys::tests::PEM).unwrap();
+    let key = SecretKey::from_pkcs8_pem(crate::keys::tests::PEM).unwrap();
     Arc::new(IdentitySignIn::new(
         "alice@example.org".parse().unwrap(),
         key,
@@ -424,7 +434,7 @@ fn alice() -> Arc<IdentitySignIn> {
 #[tokio::test]
 async fn unavailable_is_retried_and_auth_failed_is_final() {
     // Connection 0 gets unavailable with retry=1, 1 signs in and drops,
-    // and 2 gets auth-failed, which is final at once (4.5).
+    // and 2 gets auth-failed, which is final at once (4.6).
     let cert = ServerCert::self_signed("chat.test");
     let trust = pinned(&cert).await;
     let server = ScriptServer::start(cert, 3, |i, mut peer: Peer| async move {
@@ -469,7 +479,7 @@ async fn unavailable_is_retried_and_auth_failed_is_final() {
                 supervisor.reconnect_now();
             }
             SupervisorEvent::Waiting { error: None, .. } => {}
-            SupervisorEvent::SignedIn { .. } => seen.push("signed in"),
+            SupervisorEvent::Ready { .. } => seen.push("signed in"),
             SupervisorEvent::Disconnected { .. } => seen.push("dropped"),
             SupervisorEvent::Failed { error } => {
                 assert!(error.is_auth_failed());
@@ -539,7 +549,7 @@ async fn reconnect_now_skips_the_wait() {
     next(&mut events).await;
     assert!(matches!(
         next(&mut events).await,
-        SupervisorEvent::SignedIn { .. }
+        SupervisorEvent::Ready { .. }
     ));
     supervisor.stop().await;
     server.done().await;
@@ -560,4 +570,96 @@ fn backoff_doubles_with_jitter() {
             assert!(d >= full / 2 && d <= full, "{failures}: {d:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn anonymous_connections_send_anon() {
+    let cert = ServerCert::self_signed("chat.test");
+    let trust = pinned(&cert).await;
+    let server = ScriptServer::start(cert, 1, |_, mut peer: Peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 ANON").await;
+        peer.send("@ref=1 OK").await;
+        peer.expect_eof().await;
+    })
+    .await;
+    let ca = TestCa::new();
+    let (supervisor, mut events) = Supervisor::spawn(
+        chat_test(),
+        trust,
+        options(&ca, &server),
+        Arc::new(Anonymous),
+        fast(),
+    );
+    let (kind, uid, session) = loop {
+        if let SupervisorEvent::Ready {
+            kind, uid, session, ..
+        } = next(&mut events).await
+        {
+            break (kind, uid, session);
+        }
+    };
+    assert_eq!(kind, ConnectionKind::Anonymous);
+    assert_eq!(uid, None);
+    assert_eq!(session.kind(), ConnectionKind::Anonymous);
+    supervisor.stop().await;
+    server.done().await;
+}
+
+#[tokio::test]
+async fn an_identity_keeps_a_signed_in_and_an_anonymous_connection() {
+    // 4.1: one signed-in connection for the account, and an anonymous one
+    // for conversations. Which connects first is up to chance.
+    let cert = ServerCert::self_signed("chat.example.org");
+    let addr: crate::addr::ServerAddr = "chat.example.org".parse().unwrap();
+    let trust = store();
+    trust
+        .replace(&addr, None, TrustRecord::Pinned(cert.fingerprint), None)
+        .unwrap();
+    let server = ScriptServer::start(cert, 2, |_, mut peer: Peer| async move {
+        peer.greet().await;
+        let line = peer.recv().await.unwrap();
+        if line == "@ref=1 ANON" {
+            peer.send("@ref=1 OK").await;
+        } else {
+            assert!(line.starts_with("@ref=1 AUTH alice@example.org "), "{line}");
+            peer.send("@ref=1 OK uid=alice@example.org").await;
+        }
+        peer.expect_eof().await;
+    })
+    .await;
+    let ca = TestCa::new();
+    let plan = ConnectionPlan::identity(alice(), 1);
+    let (connections, mut events) =
+        ServerConnections::spawn(addr, trust, options(&ca, &server), &plan, fast()).await;
+    assert_eq!(connections.slots(), [Slot::SignedIn, Slot::Anonymous(0)]);
+    let mut ready = Vec::new();
+    while ready.len() < 2 {
+        let event = events.recv().await.unwrap();
+        if let SupervisorEvent::Ready { kind, uid, .. } = event.event {
+            ready.push((event.slot, kind.as_str(), uid.map(|u| u.to_string())));
+        }
+    }
+    ready.sort();
+    assert_eq!(
+        ready,
+        [
+            (
+                Slot::SignedIn,
+                "signed in",
+                Some("alice@example.org".to_owned())
+            ),
+            (Slot::Anonymous(0), "anonymous", None),
+        ]
+    );
+    connections.stop().await;
+    // Every supervisor reported Stopped, and the queue ended.
+    let mut stopped = 0;
+    while let Some(event) = events.recv().await {
+        if matches!(event.event, SupervisorEvent::Stopped) {
+            stopped += 1;
+        }
+    }
+    assert_eq!(stopped, 2);
+    server.done().await;
 }

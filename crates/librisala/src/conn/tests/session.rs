@@ -10,13 +10,48 @@ use risala_proto::error::ErrorCode;
 use risala_proto::server::{ServerLine, ServerMessage};
 
 use super::server::{Peer, ScriptServer, ServerCert, TestCa};
-use super::{chat_test, options, store};
+use super::{SetRecord, chat_test, options, store};
 use crate::addr::{ServerAddr, TrustRecord, TrustStore};
-use crate::conn::{CloseReason, CommandError, End, Error, Incoming, Session, SessionOptions};
+use crate::conn::{
+    CloseReason, CommandError, ConnectionKind, End, Error, Incoming, Session, SessionOptions,
+};
 
 // Appendix B.
-use crate::conn::keys::tests::{PEM, PUBLIC, SIGNATURE};
+use crate::keys::tests::{PEM, SIGNATURE};
 const NONCE: &str = "6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e";
+
+/// A mailbox and a send token, for commands.
+const BOX: &str = "ujzdegxdncf32epf3dhodzdoci";
+const TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+/// A command from its line.
+fn cmd(line: &str) -> Command {
+    Command::parse(&risala_proto::line::Line::parse(line).unwrap()).unwrap()
+}
+
+/// An anonymous session on a pinned server running `script`, whose first
+/// command is ANON.
+async fn anonymous<F, Fut>(script: F) -> (Session, ScriptServer)
+where
+    F: Fn(Peer) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let addr = chat_test();
+    let script = Arc::new(script);
+    let (server, trust, ca) = run(&addr, move |_, mut peer| {
+        let script = script.clone();
+        async move {
+            peer.greet().await;
+            peer.expect("@ref=1 ANON").await;
+            peer.send("@ref=1 OK").await;
+            script(peer).await;
+        }
+    })
+    .await;
+    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
+    session.anon().await.unwrap();
+    (session, server)
+}
 
 /// A pinned self-signed server at `addr` running `script` once.
 async fn run<F, Fut>(addr: &ServerAddr, script: F) -> (ScriptServer, Arc<dyn TrustStore>, TestCa)
@@ -149,26 +184,112 @@ async fn guest_sign_in() {
     let (server, trust, ca) = run(&addr, |_, mut peer| async move {
         peer.greet().await;
         peer.expect("@ref=1 GUEST sam").await;
-        peer.send("@ref=1 OK uid=~sam").await;
-        peer.expect("@ref=2 GUEST sam").await;
-        peer.send("@ref=2 ERR already-authenticated").await;
+        peer.send("@ref=1 OK uid=~sam token=k3f9q2").await;
+        // The second GUEST never reaches the server.
+        peer.expect("@ref=2 LIST").await;
+        peer.send("@ref=2 OK").await;
         peer.expect_eof().await;
     })
     .await;
     let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
+    assert_eq!(session.kind(), ConnectionKind::New);
     let name = "sam".parse().unwrap();
-    let uid = session.guest(&name).await.unwrap();
+    let (uid, token, resumed) = session.guest_session(&name, None).await.unwrap();
     assert_eq!(uid.as_str(), "~sam");
+    assert_eq!(token.unwrap().to_string(), "k3f9q2");
+    assert!(!resumed);
     assert_eq!(session.uid(), Some(uid));
+    assert_eq!(session.kind(), ConnectionKind::Guest);
     let err = session.guest(&name).await.unwrap_err();
     assert!(
-        matches!(&err, Error::Rejected(e) if e.code() == Some(&ErrorCode::AlreadyAuthenticated)),
+        matches!(
+            err,
+            Error::WrongKind {
+                verb: "GUEST",
+                kind: ConnectionKind::Guest
+            }
+        ),
         "{err:?}"
     );
+    assert!(err.is_permanent());
+    let list = cmd("LIST");
+    assert!(session.request(list).await.unwrap().is_ok());
     drop(session);
     server.done().await;
 }
 
+#[tokio::test]
+async fn anon_makes_the_connection_anonymous() {
+    let (session, server) = anonymous(|mut peer| async move {
+        peer.expect_eof().await;
+    })
+    .await;
+    assert_eq!(session.kind(), ConnectionKind::Anonymous);
+    assert_eq!(session.uid(), None);
+    assert!(!session.is_operator());
+    drop(session);
+    server.done().await;
+}
+
+#[tokio::test]
+async fn commands_go_only_on_connections_that_may_send_them() {
+    // Section 13: a new connection may not POST, an anonymous one may not
+    // send BACKUP GET, and nothing is sent; above all a signed-in
+    // connection never posts, follows or fetches (4.1).
+    let addr: ServerAddr = "chat.example.org".parse().unwrap();
+    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
+        peer.send(&format!("RISALA 1 chat.example.org {NONCE}"))
+            .await;
+        peer.expect(&format!("@ref=1 AUTH alice@example.org {SIGNATURE}"))
+            .await;
+        peer.send("@ref=1 OK uid=alice@example.org op=yes").await;
+        peer.expect("@ref=2 BACKUP GET").await;
+        peer.send("@ref=2 ERR not-found").await;
+        peer.expect_eof().await;
+    })
+    .await;
+    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
+    let post = cmd(&format!("POST {BOX} {TOKEN} AAEAAg=="));
+    let err = session.request(post.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::WrongKind {
+                verb: "POST",
+                kind: ConnectionKind::New
+            }
+        ),
+        "{err:?}"
+    );
+    let key = SecretKey::from_pkcs8_pem(PEM).unwrap();
+    let identity = "alice@example.org".parse().unwrap();
+    session.auth(&identity, &key).await.unwrap();
+    assert_eq!(session.kind(), ConnectionKind::SignedIn);
+    assert!(session.is_operator());
+    for command in [
+        post,
+        cmd(&format!("FOLLOW {BOX}")),
+        cmd(&format!("FETCH {BOX} after=0")),
+        cmd("ANON"),
+    ] {
+        let verb = command.verb();
+        let err = session.request(command).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::WrongKind {
+                    kind: ConnectionKind::SignedIn,
+                    ..
+                }
+            ),
+            "{verb}: {err:?}"
+        );
+    }
+    let backup = session.request(cmd("BACKUP GET")).await.unwrap();
+    assert!(!backup.is_ok());
+    drop(session);
+    server.done().await;
+}
 #[tokio::test]
 async fn auth_signs_with_the_sni_host() {
     // The greeting names another host. The client signs the host it sent
@@ -230,11 +351,9 @@ async fn register_signs_the_new_uid() {
         peer.send(&format!("RISALA 1 chat.example.org {NONCE}"))
             .await;
         peer.expect("@ref=1 INFO").await;
-        peer.send(
-            "@ref=1 OK version=1 guests=yes register=example.org retention=forever push=no upload=no",
-        )
-        .await;
-        peer.expect(&format!("@ref=2 REGISTER alice {PUBLIC} {SIGNATURE}"))
+        peer.send("@ref=1 OK version=1 register=example.org").await;
+        // The same signed bytes as AUTH for alice@example.org (4.7).
+        peer.expect(&format!("@ref=2 REGISTER alice AQ== {SIGNATURE}"))
             .await;
         peer.send("@ref=2 OK uid=alice@example.org").await;
         peer.expect_eof().await;
@@ -242,15 +361,22 @@ async fn register_signs_the_new_uid() {
     .await;
     let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let key = SecretKey::from_pkcs8_pem(PEM).unwrap();
+    let domain = session.identity_domain().await.unwrap();
+    assert_eq!(domain.as_str(), "example.org");
     let uid = session
-        .register(&"alice".parse().unwrap(), &key)
+        .register(
+            &"alice".parse().unwrap(),
+            &domain,
+            "AQ==".parse().unwrap(),
+            &key,
+        )
         .await
         .unwrap();
     assert_eq!(uid.as_str(), "alice@example.org");
+    assert_eq!(session.kind(), ConnectionKind::SignedIn);
     drop(session);
     server.done().await;
 }
-
 #[tokio::test]
 async fn register_needs_an_identity_domain() {
     let addr: ServerAddr = "chat.example.org".parse().unwrap();
@@ -263,98 +389,82 @@ async fn register_needs_an_identity_domain() {
     })
     .await;
     let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
-    let key = SecretKey::from_pkcs8_pem(PEM).unwrap();
-    let err = session
-        .register(&"alice".parse().unwrap(), &key)
-        .await
-        .unwrap_err();
+    let err = session.identity_domain().await.unwrap_err();
     assert!(matches!(err, Error::NoRegistration), "{err:?}");
     drop(session);
     server.done().await;
 }
-
 #[tokio::test]
-async fn responses_are_matched_with_live_events_interleaved() {
-    let addr = chat_test();
-    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
-        peer.greet().await;
-        peer.expect("@ref=1 HISTORY #general after=8811 limit=2")
+async fn responses_are_matched_with_live_posts_interleaved() {
+    let (session, server) = anonymous(|mut peer| async move {
+        peer.expect(&format!("@ref=2 FETCH {BOX} after=8811 limit=2"))
             .await;
-        peer.expect("@ref=2 MSG #general hello").await;
-        // Live events and response lines, interleaved (3.6).
-        peer.send("@seq=8814;t=2026-11-06T15:41:03.000Z;from=~ann MSG #general first live")
+        peer.expect(&format!("@ref=3 POST {BOX} {TOKEN} AAEAAw=="))
             .await;
-        peer.send("@ref=1;seq=8812;t=2026-11-06T15:40:58.120Z;from=~sam;id=k3f9q2 JOIN #general")
-            .await;
-        peer.send("PRESENCE online ~bob").await;
-        peer.send(
-            "@ref=1;seq=8813;t=2026-11-06T15:41:02.377Z;from=~sam;reply=8810 MSG #general hi",
-        )
+        // Live posts and response lines, interleaved (3.6).
+        peer.send(&format!(
+            "@seq=8814;t=2026-11-06T15:41:03.000Z POST {BOX} AAEABA=="
+        ))
         .await;
-        peer.send("@ref=1 OK id=k3f9q2 more=1").await;
-        // The event MSG caused comes before its OK.
-        peer.send("@seq=8815;t=2026-11-06T15:41:04.000Z;from=~me MSG #general hello")
-            .await;
-        peer.send("@ref=2 OK seq=8815").await;
+        peer.send(&format!(
+            "@ref=2;seq=8812;t=2026-11-06T15:40:58.120Z POST {BOX} AAEAAQ=="
+        ))
+        .await;
+        peer.send("PRESENCE online bob@example.org").await;
+        peer.send(&format!(
+            "@ref=2;seq=8813;t=2026-11-06T15:41:02.377Z POST {BOX} AAEAAg=="
+        ))
+        .await;
+        peer.send("@ref=2 OK more=1").await;
+        // The post a POST made comes before its OK.
+        peer.send(&format!(
+            "@seq=8815;t=2026-11-06T15:41:04.000Z POST {BOX} AAEAAw=="
+        ))
+        .await;
+        peer.send("@ref=3 OK seq=8815").await;
         peer.expect_eof().await;
     })
     .await;
-    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let mut incoming = session.take_incoming().unwrap();
     assert!(session.take_incoming().is_none());
 
-    let history = session.request(Command::History {
-        conv: "#general".parse().unwrap(),
-        after: Some(8811),
-        before: None,
-        limit: std::num::NonZeroU64::new(2),
-        only: None,
-    });
-    let msg = session.request(Command::Msg {
-        conv: "#general".parse().unwrap(),
-        text: "hello".into(),
-        relation: None,
-        file: None,
-        cid: None,
-        id: None,
-    });
-    let (history, msg) = tokio::join!(history, msg);
+    let fetch = session.request(cmd(&format!("FETCH {BOX} after=8811 limit=2")));
+    let post = session.request(cmd(&format!("POST {BOX} {TOKEN} AAEAAw==")));
+    let (fetch, post) = tokio::join!(fetch, post);
 
-    let history = history.unwrap();
-    let seqs: Vec<u64> = history
+    let fetch = fetch.unwrap();
+    let seqs: Vec<u64> = fetch
         .lines
         .iter()
         .map(|m| match &m.line {
-            ServerLine::Event(e) => e.meta.as_ref().unwrap().seq.get(),
+            ServerLine::Post(p) => p.seq.unwrap().get(),
             other => panic!("{other:?}"),
         })
         .collect();
     assert_eq!(seqs, [8812, 8813]);
     assert!(
-        history
+        fetch
             .lines
             .iter()
-            .all(|m| m.ref_.as_ref().unwrap().as_str() == "1")
+            .all(|m| m.ref_.as_ref().unwrap().as_str() == "2")
     );
-    let ok = history.ok().unwrap();
-    assert_eq!(ok.more().unwrap(), Some(true));
-    assert_eq!(ok.value("id"), Some("k3f9q2"));
+    assert_eq!(fetch.ok().unwrap().more().unwrap(), Some(true));
 
-    let msg = msg.unwrap();
-    assert!(msg.lines.is_empty());
-    assert_eq!(msg.ok().unwrap().seq().unwrap().unwrap().get(), 8815);
+    let post = post.unwrap();
+    assert!(post.lines.is_empty());
+    assert_eq!(post.ok().unwrap().seq().unwrap().unwrap().get(), 8815);
 
     // Everything else arrived in order, and was queued before the
     // responses returned.
-    let verbs: Vec<String> = (0..3)
+    let lines: Vec<String> = (0..3)
         .map(|_| line(incoming.try_recv().unwrap()).to_line().to_string())
         .collect();
     assert_eq!(
-        verbs,
+        lines,
         [
-            "@seq=8814;t=2026-11-06T15:41:03.000Z;from=~ann MSG #general first live",
-            "PRESENCE online ~bob",
-            "@seq=8815;t=2026-11-06T15:41:04.000Z;from=~me MSG #general hello",
+            format!("@seq=8814;t=2026-11-06T15:41:03.000Z POST {BOX} AAEABA=="),
+            "PRESENCE online bob@example.org".to_owned(),
+            format!("@seq=8815;t=2026-11-06T15:41:04.000Z POST {BOX} AAEAAw=="),
         ]
     );
     assert!(incoming.try_recv().is_err());
@@ -363,7 +473,6 @@ async fn responses_are_matched_with_live_events_interleaved() {
     assert!(incoming.recv().await.is_none());
     server.done().await;
 }
-
 #[tokio::test]
 async fn unparseable_final_responses_end_their_command() {
     let addr = chat_test();
@@ -563,41 +672,29 @@ async fn slow_reader_overflows() {
 
 #[tokio::test]
 async fn invalid_requests_are_not_sent() {
-    let addr = chat_test();
-    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
-        peer.greet().await;
-        peer.expect("@ref=1 PING").await;
-        peer.send("@ref=1 OK").await;
+    let (session, server) = anonymous(|mut peer| async move {
+        peer.expect("@ref=2 PING").await;
+        peer.send("@ref=2 OK").await;
         peer.expect_eof().await;
     })
     .await;
-    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let err = session
         .request(Command::Pong { token: "x".into() })
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoResponse), "{err:?}");
+    // Text with a line break cannot be written.
     let err = session
-        .request(Command::Msg {
-            conv: "#a".parse().unwrap(),
-            text: String::new(),
-            relation: None,
-            file: None,
-            cid: None,
-            id: None,
+        .request(Command::Quit {
+            message: "a\nb".into(),
         })
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InvalidCommand(_)), "{err:?}");
+    // POST may be long (2.3), but not over 1 MiB.
+    let big = "A".repeat(1024 * 1024);
     let err = session
-        .request(Command::Msg {
-            conv: "#a".parse().unwrap(),
-            text: "x".repeat(9000),
-            relation: None,
-            file: None,
-            cid: None,
-            id: None,
-        })
+        .request(cmd(&format!("POST {BOX} {TOKEN} {big}")))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InvalidCommand(_)), "{err:?}");
@@ -612,63 +709,60 @@ async fn invalid_requests_are_not_sent() {
     drop(session);
     server.done().await;
 }
-
 #[tokio::test]
 async fn sent_replies_keep_their_place_among_live_lines() {
-    let addr = chat_test();
-    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
-        peer.greet().await;
-        peer.expect("@ref=1 SYNC").await;
-        peer.expect("@ref=2 PING").await;
-        peer.expect("@ref=3 HISTORY #a after=0").await;
-        peer.send("@seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one")
-            .await;
-        peer.send("@ref=1 CONV #a k3f9q2 2 0").await;
-        peer.send("@seq=2;t=2026-11-06T15:41:04.000Z;from=~ann MSG #a two")
-            .await;
-        peer.send("@ref=1 OK").await;
-        peer.send("@seq=3;t=2026-11-06T15:41:05.000Z;from=~ann MSG #a three")
-            .await;
-        peer.send("@ref=2 OK").await;
-        peer.send("@ref=3;seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one")
-            .await;
-        peer.send("@ref=3 ERR internal").await;
+    let (session, server) = anonymous(|mut peer| async move {
+        peer.expect(&format!("@ref=2 FOLLOW {BOX}")).await;
+        peer.expect("@ref=3 PING").await;
+        peer.expect(&format!("@ref=4 FETCH {BOX} after=0")).await;
+        peer.send(&format!(
+            "@seq=1;t=2026-11-06T15:41:03.000Z POST {BOX} AAEAAQ=="
+        ))
+        .await;
+        peer.send("@ref=2 OK head=1").await;
+        peer.send(&format!(
+            "@seq=2;t=2026-11-06T15:41:05.000Z POST {BOX} AAEAAg=="
+        ))
+        .await;
+        peer.send("@ref=3 OK").await;
+        peer.send(&format!(
+            "@ref=4;seq=1;t=2026-11-06T15:41:03.000Z POST {BOX} AAEAAQ=="
+        ))
+        .await;
+        peer.send("@ref=4 ERR internal").await;
         peer.send("NOTICE done").await;
         peer.expect_eof().await;
     })
     .await;
-    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let mut incoming = session.take_incoming().unwrap();
-    assert_eq!(session.send(Command::Sync).unwrap().as_str(), "1");
+    assert_eq!(
+        session
+            .send(cmd(&format!("FOLLOW {BOX}")))
+            .unwrap()
+            .as_str(),
+        "2"
+    );
     // A request() in between gets its response through its future.
     let ping = session.request(Command::Ping { token: None });
-    let history = async {
-        session.send(Command::History {
-            conv: "#a".parse().unwrap(),
-            after: Some(0),
-            before: None,
-            limit: None,
-            only: None,
-        })
-    };
-    let (ping, history) = tokio::join!(ping, history);
+    let fetch = async { session.send(cmd(&format!("FETCH {BOX} after=0"))) };
+    let (ping, fetch) = tokio::join!(ping, fetch);
     assert!(ping.unwrap().is_ok());
-    assert_eq!(history.unwrap().as_str(), "3");
+    assert_eq!(fetch.unwrap().as_str(), "4");
     let mut got = Vec::new();
-    for _ in 0..6 {
+    for _ in 0..5 {
         got.extend(show(incoming.recv().await.unwrap()));
     }
-    let ok = format!("{:?}", risala_proto::server::OkResponse::default());
     assert_eq!(
         got,
         [
-            "@seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one".to_owned(),
-            "@seq=2;t=2026-11-06T15:41:04.000Z;from=~ann MSG #a two".to_owned(),
-            "  @ref=1 CONV #a k3f9q2 2 0".to_owned(),
-            format!("reply 1 {ok}"),
-            "@seq=3;t=2026-11-06T15:41:05.000Z;from=~ann MSG #a three".to_owned(),
-            "  @ref=3;seq=1;t=2026-11-06T15:41:03.000Z;from=~ann MSG #a one".to_owned(),
-            "reply 3 ERR internal".to_owned(),
+            format!("@seq=1;t=2026-11-06T15:41:03.000Z POST {BOX} AAEAAQ=="),
+            format!(
+                "reply 2 {:?}",
+                risala_proto::server::OkResponse::new().with_head(1u64)
+            ),
+            format!("@seq=2;t=2026-11-06T15:41:05.000Z POST {BOX} AAEAAg=="),
+            format!("  @ref=4;seq=1;t=2026-11-06T15:41:03.000Z POST {BOX} AAEAAQ=="),
+            "reply 4 ERR internal".to_owned(),
             "NOTICE done".to_owned(),
         ]
     );
@@ -677,24 +771,28 @@ async fn sent_replies_keep_their_place_among_live_lines() {
     assert!(incoming.recv().await.is_none());
     server.done().await;
 }
-
 #[tokio::test]
 async fn sent_commands_without_a_reply_end_with_the_queue() {
-    let addr = chat_test();
-    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
-        peer.greet().await;
-        peer.expect("@ref=1 SYNC").await;
+    let (session, server) = anonymous(|mut peer| async move {
+        peer.expect(&format!("@ref=2 FOLLOW {BOX}")).await;
         peer.close().await;
     })
     .await;
-    let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let mut incoming = session.take_incoming().unwrap();
-    session.send(Command::Sync).unwrap();
+    session.send(cmd(&format!("FOLLOW {BOX}"))).unwrap();
     assert!(incoming.recv().await.is_none());
-    assert!(matches!(session.send(Command::Sync), Err(Error::Closed(_))));
+    assert!(matches!(
+        session.send(cmd(&format!("FOLLOW {BOX}"))),
+        Err(Error::Closed(_))
+    ));
     assert!(matches!(
         session.send(Command::Pong { token: "x".into() }),
         Err(Error::NoResponse)
+    ));
+    // ANON goes only through anon(), which knows the kind it gives.
+    assert!(matches!(
+        session.send(Command::Anon),
+        Err(Error::WrongKind { verb: "ANON", .. })
     ));
     server.done().await;
 }

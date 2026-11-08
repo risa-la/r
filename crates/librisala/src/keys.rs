@@ -1,21 +1,21 @@
-//! Device keys (4.3-4.6, PLAN.md 3.3): generating them, storing them
-//! through a platform trait, the key file line to publish, and the AUTH
-//! and REGISTER commands signed with them.
+//! Secret keys this device holds (4.3, PLAN.md 3.4): generating them,
+//! and storing them through a platform trait.
 //!
-//! Each device has its own ML-DSA-44 key. Apps keep keys in the platform's
-//! store (Keychain, Android Keystore, libsecret) by implementing
-//! [`PlatformKeyStore`], which passes a key as its 32-byte seed and so can
-//! be written in Swift or Kotlin, and handing it to the client wrapped in
-//! [`PlatformKeys`]. Rust code may implement [`KeyStore`] directly.
-//! [`FileKeyStore`] keeps PEM files for the CLI and for Linux until
-//! libsecret support exists, and [`MemoryKeyStore`] keeps keys in memory.
+//! Owned by task C1 (identity) in docs/plans/M5b.md. What is here is
+//! M5a's store of ML-DSA-44 device keys, which still fits: a key is its
+//! 32-byte seed (4.3), found by an id the app chooses. Apps keep keys in
+//! the platform's store (Keychain, Android Keystore, libsecret) by
+//! implementing [`PlatformKeyStore`], which passes a key as its seed and
+//! so can be written in Swift or Kotlin, and handing it to the client
+//! wrapped in [`PlatformKeys`]. Rust code may implement [`KeyStore`]
+//! directly. [`FileKeyStore`] keeps PEM files for the CLI, and
+//! [`MemoryKeyStore`] keeps keys in memory.
 //!
-//! Devices do not fetch key files yet. When they do, to check the members
-//! of encrypted conversations (12.12, M5), a key counts as removed only
-//! when a fetch returns a key file (200) that does not list it, or a gone
-//! answer (404 or 410). Any other outcome, from a timeout or a DNS or TLS
-//! error to a 5xx or a redirect, is a failed fetch: it keeps the cached
-//! copy and removes nothing, however long it lasts (4.4).
+//! Draft-03 gives a device more secrets than its device key (4.3): the
+//! identity's device-signing key, the attestation key (X-Wing), the
+//! current backup key (12.13) and per-group leaf keys (12.3, which
+//! OpenMLS keeps in the cache). C1 decides how they are named here, and
+//! may widen [`KeyStore`] from ML-DSA keys to plain 32-byte seeds.
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,81 +23,15 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use risala_proto::auth::{Nonce, PublicKey, SecretKey};
-use risala_proto::command::Command;
-use risala_proto::error::ParseError;
-use risala_proto::keyfile::KeyEntry;
-use risala_proto::names::{Domain, Identity, Name};
+use risala_proto::auth::SecretKey;
 
-/// Makes a new device key from 32 bytes of the OS's secure random source
-/// (4.4).
+/// Makes a new ML-DSA-44 key from 32 bytes of the OS's secure random
+/// source (4.3).
 pub fn generate_device_key() -> Result<SecretKey, getrandom::Error> {
     let mut seed = zeroize::Zeroizing::new([0u8; SEED_LEN]);
     getrandom::fill(&mut *seed)?;
     // from_seed wipes the copy it is given, and `seed` is wiped on drop.
     Ok(SecretKey::from_seed(*seed))
-}
-
-/// The key file line for a device's key, `mldsa44 <key> [<label>]`,
-/// without its LF (4.4). The label is usually the device's name.
-///
-/// Fails with `BadSyntax` if the label has a line break or another
-/// control character.
-pub fn key_line(key: &PublicKey, label: Option<&str>) -> Result<String, ParseError> {
-    Ok(KeyEntry::new(key.clone(), label)?.to_string())
-}
-
-/// Reads a public key given either as a key file line,
-/// `mldsa44 <key> [<label...>]` (4.4), or as the key alone in base64. The
-/// key alone may be wrapped over several lines, as Appendix B shows it.
-/// Returns the key, and the line's label if it has one.
-///
-/// This is what a user pastes from another device's "show my key" (4.7).
-pub fn parse_key_input(input: &str) -> Result<(PublicKey, Option<String>), ParseError> {
-    let input = input.trim();
-    let first = input.split([' ', '\t']).next().unwrap_or("");
-    if first.eq_ignore_ascii_case("mldsa44") {
-        let entry: KeyEntry = input.parse()?;
-        return Ok((entry.key().clone(), entry.label().map(str::to_owned)));
-    }
-    let key: String = input.split_whitespace().collect();
-    Ok((key.parse()?, None))
-}
-
-/// The AUTH command for `identity` (4.5).
-///
-/// `sni_host` must be the hostname this client sent in SNI, not the host
-/// in the greeting. `nonce` is the greeting's nonce.
-pub fn auth_command(
-    sni_host: &str,
-    nonce: &Nonce,
-    identity: &Identity,
-    key: &SecretKey,
-) -> Command {
-    let signature = key.sign_challenge(sni_host, nonce, identity.as_str());
-    Command::Auth {
-        identity: identity.clone(),
-        signature,
-    }
-}
-
-/// The REGISTER command for `<name>@<domain>`, with `key` as the first
-/// key (4.6). `domain` is the server's identity domain from INFO (8.5);
-/// the rest is as for [`auth_command`].
-pub fn register_command(
-    sni_host: &str,
-    nonce: &Nonce,
-    name: &Name,
-    domain: &Domain,
-    key: &SecretKey,
-) -> Command {
-    let uid = Identity::new(name, domain);
-    let signature = key.sign_challenge(sni_host, nonce, uid.as_str());
-    Command::Register {
-        name: name.clone(),
-        key: key.public_key(),
-        signature,
-    }
 }
 
 /// A key store failed.
@@ -575,84 +509,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn appendix_b_key_line() {
-        let key = appendix_b().public_key();
-        assert_eq!(
-            key_line(&key, Some("laptop")).unwrap(),
-            format!("mldsa44 {PUBLIC} laptop")
-        );
-        assert_eq!(key_line(&key, None).unwrap(), format!("mldsa44 {PUBLIC}"));
-        assert!(key_line(&key, Some("a\nb")).is_err());
-    }
-
-    #[test]
-    fn key_input() {
-        let key = appendix_b().public_key();
-        let line = format!("mldsa44 {PUBLIC} old laptop");
-        assert_eq!(
-            parse_key_input(&format!("  {line}\n")).unwrap(),
-            (key.clone(), Some("old laptop".to_owned()))
-        );
-        assert_eq!(
-            parse_key_input(&format!("MLDSA44\t{PUBLIC}")).unwrap(),
-            (key.clone(), None)
-        );
-        assert_eq!(parse_key_input(PUBLIC).unwrap(), (key.clone(), None));
-        // Wrapped at 64 characters, as in Appendix B.
-        let wrapped: Vec<&str> = PUBLIC
-            .as_bytes()
-            .chunks(64)
-            .map(|c| std::str::from_utf8(c).unwrap())
-            .collect();
-        assert_eq!(
-            parse_key_input(&wrapped.join("\n")).unwrap(),
-            (key.clone(), None)
-        );
-        for bad in [
-            "",
-            "mldsa44",
-            "ssh-ed25519 AAAA",
-            "mldsa44 abc",
-            &PUBLIC[1..],
-        ] {
-            assert!(parse_key_input(bad).is_err(), "{bad}");
-        }
+    fn appendix_b_public_key() {
+        assert_eq!(appendix_b().public_key().to_string(), PUBLIC);
     }
 
     #[test]
     fn appendix_b_auth_command() {
+        use risala_proto::auth::Nonce;
+        use risala_proto::names::Identity;
         let nonce: Nonce = "6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e".parse().unwrap();
         let identity: Identity = "alice@example.org".parse().unwrap();
-        let command = auth_command("chat.example.org", &nonce, &identity, &appendix_b());
+        let command =
+            crate::conn::auth_command("chat.example.org", &nonce, &identity, &appendix_b());
         assert_eq!(
             risala_proto::command::Request::new(command).to_string(),
             format!("AUTH alice@example.org {SIGNATURE}")
         );
-    }
-
-    #[test]
-    fn register_command_signs_the_new_uid() {
-        let nonce: Nonce = "6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e".parse().unwrap();
-        let key = appendix_b();
-        let command = register_command(
-            "chat.example.org",
-            &nonce,
-            &"alice".parse().unwrap(),
-            &"example.org".parse().unwrap(),
-            &key,
-        );
-        let Command::Register {
-            name,
-            key: public,
-            signature,
-        } = command
-        else {
-            panic!()
-        };
-        assert_eq!(name.as_str(), "alice");
-        assert_eq!(public, key.public_key());
-        // The same bytes as AUTH for alice@example.org (4.6).
-        assert_eq!(signature.to_string(), SIGNATURE);
     }
 
     #[test]

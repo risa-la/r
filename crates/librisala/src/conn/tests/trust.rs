@@ -3,10 +3,11 @@
 use risala_proto::fingerprint::Fingerprint;
 
 use super::server::{Peer, ScriptServer, ServerCert, TestCa};
-use super::{chat_test, connect, options, store};
-use crate::addr::TrustRecord;
+use super::{SetRecord, chat_test, connect, options, store};
+use crate::addr::{PinChange, TrustRecord};
 use crate::conn::{
-    Error, Session, SessionOptions, TrustError, Verified, accept_fingerprint, no_ca_verifier,
+    Error, Session, SessionOptions, TrustError, Verified, accept_fingerprint, approve_new_pin,
+    clear_strict_pin, no_ca_verifier, set_strict_pin,
 };
 
 /// A server that greets and then waits for the client to go.
@@ -47,7 +48,8 @@ async fn unknown_self_signed_is_refused_then_pinned() {
         Verified {
             fingerprint: fp,
             record: TrustRecord::Pinned(fp),
-            changed: false,
+            replaces: None,
+            pin_change: None,
         }
     );
     assert_eq!(
@@ -106,7 +108,8 @@ async fn ca_valid_is_accepted_and_recorded() {
         Verified {
             fingerprint: fp,
             record: TrustRecord::Ca,
-            changed: true,
+            replaces: Some(None),
+            pin_change: None,
         }
     );
     assert_eq!(trust.get(&chat_test()).unwrap(), Some(TrustRecord::Ca));
@@ -148,6 +151,7 @@ async fn pin_is_replaced_by_ca() {
     // and the pin is replaced.
     let ca = TestCa::new();
     let cert = ca.issue("chat.test");
+    let fp = cert.fingerprint;
     let server = greeter(cert, 1).await;
     let trust = store();
     trust
@@ -157,7 +161,120 @@ async fn pin_is_replaced_by_ca() {
     let session = connect(&ca, &server, &trust).await.unwrap();
     assert_eq!(session.info().verified.record, TrustRecord::Ca);
     assert_eq!(trust.get(&chat_test()).unwrap(), Some(TrustRecord::Ca));
+    // The user is told once (2.2): the notice is kept until dismissed.
+    let change = PinChange {
+        old: other_fingerprint(),
+        new: fp,
+    };
+    assert_eq!(session.info().verified.pin_change, Some(change.clone()));
+    assert_eq!(trust.notices().unwrap(), [(chat_test(), change)]);
+    trust.dismiss_notice(&chat_test()).unwrap();
+    assert!(trust.notices().unwrap().is_empty());
     drop(session);
+    server.done().await;
+}
+
+#[tokio::test]
+async fn a_pin_with_the_same_key_becomes_ca_without_a_notice() {
+    let ca = TestCa::new();
+    let cert = ca.issue("chat.test");
+    let fp = cert.fingerprint;
+    let server = greeter(cert, 1).await;
+    let trust = store();
+    trust.set(&chat_test(), TrustRecord::Pinned(fp)).unwrap();
+    let session = connect(&ca, &server, &trust).await.unwrap();
+    assert_eq!(session.info().verified.pin_change, None);
+    assert_eq!(trust.get(&chat_test()).unwrap(), Some(TrustRecord::Ca));
+    assert!(trust.notices().unwrap().is_empty());
+    drop(session);
+    server.done().await;
+}
+
+#[tokio::test]
+async fn a_strict_pin_refuses_another_key_even_when_ca_valid() {
+    // PLAN.md 58, 2.2: with a strict pin, a CA-valid certificate with
+    // another key needs the user's approval.
+    let ca = TestCa::new();
+    let old = ca.issue("chat.test");
+    let new = ca.issue("chat.test");
+    let (old_fp, new_fp) = (old.fingerprint, new.fingerprint);
+    let first = greeter(old, 1).await;
+    let trust = store();
+    let session = connect(&ca, &first, &trust).await.unwrap();
+    assert_eq!(trust.get(&chat_test()).unwrap(), Some(TrustRecord::Ca));
+    set_strict_pin(&*trust, &chat_test(), session.info().verified.fingerprint).unwrap();
+    drop(session);
+    first.done().await;
+
+    let second = greeter(new, 3).await;
+    let err = connect(&ca, &second, &trust).await.unwrap_err();
+    assert!(err.is_permanent());
+    let Error::Trust(TrustError::StrictMismatch {
+        pinned,
+        presented,
+        ca_error,
+    }) = err
+    else {
+        panic!("{err:?}")
+    };
+    assert_eq!((pinned, presented, ca_error), (old_fp, new_fp, None));
+    assert_eq!(
+        trust.get(&chat_test()).unwrap(),
+        Some(TrustRecord::Strict(old_fp))
+    );
+
+    // The user approves: the new key is pinned, strictly.
+    approve_new_pin(&*trust, &chat_test(), pinned, presented).unwrap();
+    let session = connect(&ca, &second, &trust).await.unwrap();
+    assert_eq!(session.info().verified.record, TrustRecord::Strict(new_fp));
+    assert_eq!(session.info().verified.replaces, None);
+    drop(session);
+
+    // Cleared, a CA-valid certificate is accepted under rule 1 again.
+    clear_strict_pin(&*trust, &chat_test()).unwrap();
+    let session = connect(&ca, &second, &trust).await.unwrap();
+    assert_eq!(session.info().verified.record, TrustRecord::Ca);
+    drop(session);
+    second.done().await;
+}
+
+#[tokio::test]
+async fn a_strict_pin_accepts_its_key_without_a_ca() {
+    let ca = TestCa::new();
+    let cert = ServerCert::self_signed("chat.test");
+    let fp = cert.fingerprint;
+    let server = greeter(cert, 1).await;
+    let trust = store();
+    trust.set(&chat_test(), TrustRecord::Strict(fp)).unwrap();
+    let session = connect(&ca, &server, &trust).await.unwrap();
+    assert_eq!(session.info().verified.record, TrustRecord::Strict(fp));
+    drop(session);
+    server.done().await;
+}
+
+#[tokio::test]
+async fn sessions_are_never_resumed() {
+    // Each connection makes a full handshake, so no TLS session ticket
+    // links a device's connections to each other (4.1, Section 14). The
+    // test server offers resumption.
+    let ca = TestCa::new();
+    let cert = ca.issue("chat.test");
+    let server = ScriptServer::start(cert, 3, |_, mut peer: Peer| async move {
+        assert_eq!(peer.handshake, Some(rustls::HandshakeKind::Full));
+        peer.greet().await;
+        peer.expect("@ref=1 PING").await;
+        peer.send("@ref=1 OK").await;
+        peer.expect_eof().await;
+    })
+    .await;
+    let trust = store();
+    for _ in 0..3 {
+        let session = connect(&ca, &server, &trust).await.unwrap();
+        // A round trip, so that the server has sent its tickets.
+        let ping = risala_proto::command::Command::Ping { token: None };
+        assert!(session.request(ping).await.unwrap().is_ok());
+        drop(session);
+    }
     server.done().await;
 }
 
@@ -280,7 +397,7 @@ async fn sni_and_alpn() {
         .unwrap();
     assert_eq!(session.info().sni, None);
     assert_eq!(rx.recv().await.unwrap().0, None);
-    let key = crate::conn::keys::generate_device_key().unwrap();
+    let key = crate::keys::generate_device_key().unwrap();
     let err = session
         .auth(&"alice@example.org".parse().unwrap(), &key)
         .await

@@ -2,6 +2,7 @@
 
 use std::io;
 
+use risala_proto::connection::ConnectionKind;
 use risala_proto::error::{ErrorCode, ParseError};
 use risala_proto::fingerprint::Fingerprint;
 use risala_proto::server::ErrResponse;
@@ -58,14 +59,29 @@ pub enum Error {
     #[error(transparent)]
     Rejected(#[from] CommandError),
     /// AUTH or REGISTER was already sent on this connection. Every AUTH or
-    /// REGISTER uses up the nonce; reconnect to try again (4.5).
+    /// REGISTER uses up the nonce; reconnect to try again (4.6).
     #[error("the sign-in nonce is used up; reconnect to try again")]
     NonceUsed,
+    /// ANON, GUEST, AUTH or REGISTER is still waiting for its answer, so
+    /// the connection's kind is not known yet (4.1).
+    #[error("the connection is still becoming anonymous, a guest or signed in")]
+    KindPending,
+    /// This kind of connection may not send the command (Section 13), so
+    /// it was not sent. Above all, this keeps a device from posting,
+    /// following or fetching on its signed-in connection, which would
+    /// tell the server who it is (4.1).
+    #[error("a {kind} connection may not send {verb}")]
+    WrongKind {
+        /// The command's verb.
+        verb: &'static str,
+        /// The connection's kind.
+        kind: ConnectionKind,
+    },
     /// The address is an IP address, so the client sent no SNI and cannot
-    /// sign in as an identity (2.1, 4.5).
+    /// sign in as an identity (2.1, 4.6).
     #[error("cannot sign in as an identity without a hostname (SNI)")]
     NoSni,
-    /// The server offers no registration (4.6, 8.5).
+    /// The server offers no registration (4.7, 8.5).
     #[error("the server offers no registration")]
     NoRegistration,
 }
@@ -75,26 +91,30 @@ impl Error {
     /// such as accepting a fingerprint or fixing a key. A reconnect
     /// supervisor stops on these.
     ///
-    /// Permanent: every [`TrustError`], a key exchange the server does
-    /// not support, an unsupported version, a missing
-    /// SNI, no registration, an invalid command, and a sign-in refused
+    /// Permanent: every [`TrustError`] but
+    /// [`RecordChanged`](TrustError::RecordChanged), a key exchange the
+    /// server does not support, an unsupported version, a missing SNI, no
+    /// registration, an invalid command or one for another kind of
+    /// connection, and a sign-in refused
     /// with `auth-failed`, `forbidden` without a `retry` tag,
     /// `not-supported`, `bad-syntax` or `unknown-command`. `auth-failed`
     /// means the signature did not verify against the keys the server
-    /// got, and the same key fails the same way (4.5). Everything else
+    /// got, and the same key fails the same way (4.6). Everything else
     /// may pass: `unavailable` (the server could not get the key file,
-    /// 4.5), `name-taken` (a guest's old session may not have ended yet,
+    /// 4.6), `name-taken` (a guest's old session may not have ended yet,
     /// and [`GuestSignIn`](super::GuestSignIn) has already tried other
     /// names), `rate-limited`, a `forbidden` with `retry` (a limit that
     /// passes with time) and `internal`.
     pub fn is_permanent(&self) -> bool {
         match self {
+            Error::Trust(TrustError::RecordChanged) => false,
             Error::Trust(_)
             | Error::KeyExchange(_)
             | Error::UnsupportedVersion(_)
             | Error::NoSni
             | Error::NoRegistration
             | Error::InvalidCommand(_)
+            | Error::WrongKind { .. }
             | Error::NoResponse => true,
             Error::Rejected(CommandError::Server(err)) => match err.code {
                 ErrorCode::Forbidden => err.retry.is_none(),
@@ -108,7 +128,7 @@ impl Error {
         }
     }
 
-    /// Whether the server answered `ERR auth-failed` (4.5).
+    /// Whether the server answered `ERR auth-failed` (4.6).
     pub fn is_auth_failed(&self) -> bool {
         matches!(
             self,
@@ -150,7 +170,7 @@ pub enum TrustError {
     /// The user must delete the record explicitly
     /// ([`TrustStore::forget`](crate::addr::TrustStore::forget)) before
     /// trying again.
-    #[error("server certificate {presented} does not match the record ({})", show(.recorded))]
+    #[error("server certificate {presented} does not match the record ({recorded})")]
     Mismatch {
         /// What is recorded for this server.
         recorded: TrustRecord,
@@ -159,16 +179,28 @@ pub enum TrustError {
         /// Why the certificate is not CA-valid.
         ca_error: String,
     },
+    /// The server has a strict pin (2.2), and the certificate has another
+    /// fingerprint, CA-valid or not. The app shows both and asks the user;
+    /// if the user approves, record it with
+    /// [`approve_new_pin`](super::approve_new_pin) and connect again.
+    #[error("server certificate {presented} does not match the strict pin {pinned}")]
+    StrictMismatch {
+        /// The strictly pinned fingerprint.
+        pinned: Fingerprint,
+        /// The fingerprint of the certificate the server showed.
+        presented: Fingerprint,
+        /// Why the certificate is not CA-valid, or `None` if it is.
+        ca_error: Option<String>,
+    },
     /// The certificate could not be read, so it has no fingerprint.
     #[error("bad server certificate: {0}")]
     BadCertificate(String),
-}
-
-fn show(record: &TrustRecord) -> String {
-    match record {
-        TrustRecord::Ca => "CA".to_owned(),
-        TrustRecord::Pinned(fp) => format!("pinned {fp}"),
-    }
+    /// The server's record changed while this connection was checked
+    /// against the old one, for example because the user set a strict pin
+    /// meanwhile. Nothing was written; connecting again checks against the
+    /// new record.
+    #[error("the server's trust record changed while connecting")]
+    RecordChanged,
 }
 
 /// Why a connection closed.
@@ -188,7 +220,7 @@ pub enum CloseReason {
     /// matched to commands (3.6).
     Protocol(String),
     /// The app did not read incoming lines fast enough and the queue
-    /// filled up. Reconnect and catch up with SYNC and HISTORY.
+    /// filled up. Reconnect and catch up with FETCH (7.4).
     Overflow,
     /// The app closed the connection.
     Local,

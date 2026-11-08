@@ -1,17 +1,19 @@
-//! A signed-in or signing-in connection to one server: the greeting (4.1),
-//! sign-in (4.2, 4.5, 4.6), commands matched to their responses (3.6) and
-//! keepalive (11).
+//! One connection to one server: the greeting (4.1), becoming anonymous,
+//! a guest or signed in (4.1, 4.2, 4.6, 4.7), commands matched to their
+//! responses (3.6) and keepalive (11).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use risala_proto::auth::SecretKey;
+use risala_proto::auth::{Nonce, SecretKey};
+use risala_proto::binary::EncodedRecords;
 use risala_proto::command::{Command, GuestToken, Request};
-use risala_proto::frame::{LineDecoder, LineLimits, MAX_CLIENT_LINE, check_line_len};
+use risala_proto::connection::ConnectionKind;
+use risala_proto::frame::{LineDecoder, LineLimits};
 use risala_proto::line::read_ref;
-use risala_proto::names::{Domain, Id, Identity, Name, Uid};
+use risala_proto::names::{Domain, Identity, Name, Uid};
 use risala_proto::server::{
     ErrResponse, Greeting, OkResponse, Register, ServerLine, ServerMessage,
 };
@@ -21,7 +23,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use super::error::{CloseReason, CommandError, Error};
-use super::keys;
 use super::tls::{self, CaVerifier, Verified};
 use crate::addr::{ServerAddr, TrustStore};
 
@@ -88,7 +89,7 @@ pub struct SessionInfo {
     /// The server address connected to.
     pub addr: ServerAddr,
     /// The hostname sent in SNI, in lower case: what AUTH and REGISTER
-    /// sign (4.5). `None` for an IP address, which sends no SNI (2.1).
+    /// sign (4.6). `None` for an IP address, which sends no SNI (2.1).
     pub sni: Option<String>,
     /// The server's greeting (4.1). Its `host` is informational only.
     pub greeting: Greeting,
@@ -116,8 +117,8 @@ pub enum End {
 /// returned (3.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
-    /// The response lines, such as the events of HISTORY or the ROOM
-    /// lines of LIST, with their `ref`.
+    /// The response lines, such as the posts of FETCH or the ROOM lines
+    /// of LIST, with their `ref`.
     pub lines: Vec<ServerMessage>,
     /// The final response.
     pub end: End,
@@ -152,8 +153,8 @@ impl Response {
 /// sent it (3.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
-    /// A line that is not part of a response: a live event, PRESENCE,
-    /// NOTICE, READ, TYPING, DROP, BYE or a line with an unknown verb.
+    /// A line that is not part of a response: a live post, WELCOME,
+    /// PRESENCE, GONE, DROP, NOTICE, BYE or a line with an unknown verb.
     Line(ServerMessage),
     /// The response to a command sent with [`Session::send`], placed where
     /// its final `OK` or `ERR` arrived. Every line before it in the queue
@@ -180,21 +181,24 @@ impl Incoming {
 /// One connection to a server (2, 3.6, 4, 11).
 ///
 /// - [`connect`](Self::connect) opens TLS with the checks of 2.2 and reads
-///   the greeting.
-/// - [`guest`](Self::guest), [`auth`](Self::auth) and
-///   [`register`](Self::register) sign in.
-/// - [`request`](Self::request) sends any command and returns its
-///   [`Response`]. Requests may be made concurrently; each gets a fresh
-///   `ref`, and responses are matched in order (3.6).
+///   the greeting. The connection is then [`New`](ConnectionKind::New).
+/// - [`anon`](Self::anon), [`guest`](Self::guest), [`auth`](Self::auth)
+///   and [`register`](Self::register) make it anonymous, a guest or
+///   signed in, once (4.1). [`kind`](Self::kind) says which it is.
+/// - [`request`](Self::request) sends any command that the connection's
+///   kind may send (Section 13), and returns its [`Response`]. A command
+///   the kind may not send is refused here with [`Error::WrongKind`] and
+///   never reaches the server: a POST on a signed-in connection would
+///   tell the server who posts (4.1). Requests may be made concurrently;
+///   each gets a fresh `ref`, and responses are matched in order (3.6).
 /// - Every other line arrives on the queue from
-///   [`take_incoming`](Self::take_incoming), in order: live events,
-///   PRESENCE, NOTICE, READ, TYPING, DROP, BYE and lines with unknown
+///   [`take_incoming`](Self::take_incoming), in order: live posts,
+///   WELCOME, PRESENCE, GONE, DROP, NOTICE, BYE and lines with unknown
 ///   verbs. Server PINGs are answered inside the session (11).
 /// - [`send`](Self::send) sends a command whose response arrives on that
 ///   same queue, as an [`Incoming::Reply`] at the point its final line
 ///   arrived. Use it when the order of responses relative to live lines
-///   matters, as it does for the sync engine (3.6, "Consistent with live
-///   events").
+///   matters, as it does for FOLLOW and its live posts (3.6, 7.1).
 ///
 /// Dropping the session closes the connection.
 pub struct Session {
@@ -210,6 +214,7 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("addr", &self.info.addr)
+            .field("kind", &self.kind())
             .field("uid", &self.uid())
             .finish_non_exhaustive()
     }
@@ -223,8 +228,13 @@ struct State {
     next_ref: u64,
     pending: VecDeque<Pending>,
     closed: Option<CloseReason>,
+    /// The connection's kind (4.1).
+    kind: ConnectionKind,
+    /// ANON, GUEST, AUTH or REGISTER is waiting for its answer.
+    kind_pending: bool,
+    /// The guest or identity uid, for a guest or signed-in connection.
     uid: Option<Uid>,
-    /// The sign-in's `OK` carried `op=yes` (4.5, 10.1).
+    /// The sign-in's `OK` carried `op=yes` (4.6, 10.1).
     operator: bool,
     nonce_used: bool,
 }
@@ -232,7 +242,9 @@ struct State {
 struct Pending {
     ref_: Ref,
     lines: Vec<ServerMessage>,
-    signs_in: bool,
+    /// For ANON, GUEST, AUTH and REGISTER: the kind and uid the
+    /// connection gets if the command succeeds.
+    sets: Option<(ConnectionKind, Option<Uid>)>,
     reply: ReplyTo,
 }
 
@@ -281,9 +293,9 @@ impl Session {
         };
         let (stream, verified) = tls::connect(addr, &trust, ca, options.connect_to).await?;
         let (mut rd, wr) = tokio::io::split(stream);
-        // 2.3: lines that carry MLS data, such as WELCOME, GROUPINFO and
-        // KEYPKG, may be up to 8 MiB. A server sends them only once the
-        // connection has signed in; reading them at any time costs nothing
+        // 2.3: lines that carry MLS data, such as POST, WELCOME, GROUPINFO
+        // and KEYPKG, may be long. A server sends them only once the
+        // connection has a kind; reading them at any time costs nothing
         // more than the limit.
         let mut decoder = LineDecoder::with_limits(LineLimits::SERVER);
         let greeting = read_greeting(&mut rd, &mut decoder).await;
@@ -320,6 +332,8 @@ impl Session {
                 next_ref: 1,
                 pending: VecDeque::new(),
                 closed: None,
+                kind: ConnectionKind::New,
+                kind_pending: false,
                 uid: None,
                 operator: false,
                 nonce_used: false,
@@ -360,14 +374,20 @@ impl Session {
         &self.info
     }
 
-    /// The uid this connection signed in as, once a GUEST, AUTH or
-    /// REGISTER has succeeded.
+    /// The connection's kind (4.1): new until ANON, GUEST, AUTH or
+    /// REGISTER succeeds.
+    pub fn kind(&self) -> ConnectionKind {
+        self.shared.state.lock().expect("poisoned").kind
+    }
+
+    /// The uid of a guest or signed-in connection, once GUEST, AUTH or
+    /// REGISTER has succeeded. An anonymous connection has none.
     pub fn uid(&self) -> Option<Uid> {
         self.shared.state.lock().expect("poisoned").uid.clone()
     }
 
     /// Whether the sign-in's `OK` said the identity is a server operator
-    /// (`op=yes`, 4.5, 10.1). `false` until signed in.
+    /// (`op=yes`, 4.6, 10.1). `false` until signed in.
     pub fn is_operator(&self) -> bool {
         self.shared.state.lock().expect("poisoned").operator
     }
@@ -384,16 +404,28 @@ impl Session {
     ///
     /// The command gets a fresh `ref`. It fails with
     /// [`Error::InvalidCommand`] if it cannot be written as a valid line,
-    /// [`Error::NoResponse`] for PONG, [`Error::NonceUsed`] for a second
-    /// AUTH or REGISTER (4.5), and [`Error::Closed`] if the connection
-    /// closes first. A server `ERR` is not an error here: it is in the
-    /// [`Response`].
+    /// [`Error::WrongKind`] if the connection's kind may not send it
+    /// (Section 13), [`Error::NoResponse`] for PONG,
+    /// [`Error::KindPending`] while ANON, GUEST, AUTH or REGISTER waits
+    /// for its answer, [`Error::NonceUsed`] for a second AUTH or REGISTER
+    /// (4.6), and [`Error::Closed`] if the connection closes first. A
+    /// server `ERR` is not an error here: it is in the [`Response`].
     ///
     /// When it returns, every incoming line that came before the final
-    /// response, such as the live event a MSG caused, is already queued.
+    /// response, such as the live post a POST caused, is already queued.
     pub async fn request(&self, command: Command) -> Result<Response, Error> {
+        self.request_setting(command, None).await
+    }
+
+    /// [`request`](Self::request), for a command that gives the
+    /// connection its kind and uid if it succeeds.
+    async fn request_setting(
+        &self,
+        command: Command,
+        sets: Option<(ConnectionKind, Option<Uid>)>,
+    ) -> Result<Response, Error> {
         let (tx, rx) = oneshot::channel();
-        self.enqueue(command, ReplyTo::Waiter(tx))?;
+        self.enqueue(command, ReplyTo::Waiter(tx), sets)?;
         match rx.await {
             Ok(result) => result,
             Err(_) => Err(Error::Closed(self.close_reason())),
@@ -409,18 +441,42 @@ impl Session {
     /// closes before the final response, no reply arrives: the queue ends
     /// instead.
     pub fn send(&self, command: Command) -> Result<Ref, Error> {
-        self.enqueue(command, ReplyTo::Queue)
+        if command.sets_kind() {
+            // Use anon(), guest(), auth() or register(), which know the
+            // kind and uid it gives.
+            return Err(Error::WrongKind {
+                verb: command.verb(),
+                kind: self.kind(),
+            });
+        }
+        self.enqueue(command, ReplyTo::Queue, None)
     }
 
     /// Writes a command with a fresh `ref` and records where its response
     /// goes.
-    fn enqueue(&self, command: Command, reply: ReplyTo) -> Result<Ref, Error> {
+    fn enqueue(
+        &self,
+        command: Command,
+        reply: ReplyTo,
+        sets: Option<(ConnectionKind, Option<Uid>)>,
+    ) -> Result<Ref, Error> {
         if !command.gets_response() {
             return Err(Error::NoResponse);
         }
         let mut st = self.shared.state.lock().expect("poisoned");
         if let Some(reason) = &st.closed {
             return Err(Error::Closed(reason.clone()));
+        }
+        if command.sets_kind() && st.kind_pending {
+            return Err(Error::KindPending);
+        }
+        // Section 13. A connection that has a kind and sends ANON, GUEST,
+        // AUTH or REGISTER again is refused here too.
+        if !command.kinds().contains(st.kind) {
+            return Err(Error::WrongKind {
+                verb: command.verb(),
+                kind: st.kind,
+            });
         }
         let uses_nonce = matches!(command, Command::Auth { .. } | Command::Register { .. });
         if uses_nonce && st.nonce_used {
@@ -431,7 +487,6 @@ impl Session {
             .to_string()
             .parse()
             .expect("a number is a valid ref");
-        let signs_in = command.signs_in();
         let request = Request {
             ref_: Some(ref_.clone()),
             command,
@@ -440,22 +495,21 @@ impl Session {
             .try_to_line()
             .map_err(Error::InvalidCommand)?
             .to_string();
-        // 2.3: once signed in, commands that carry MLS data may be long.
-        if st.uid.is_some() {
-            LineLimits::CLIENT.check(&line)
-        } else {
-            check_line_len(&line, MAX_CLIENT_LINE)
-        }
-        .map_err(Error::InvalidCommand)?;
+        // 2.3: the limits the server applies to this kind of connection.
+        st.kind
+            .client_limits()
+            .check(&line)
+            .map_err(Error::InvalidCommand)?;
         if self.out.send(Outgoing::Line(line)).is_err() {
             return Err(Error::Closed(CloseReason::Local));
         }
         st.next_ref += 1;
         st.nonce_used |= uses_nonce;
+        st.kind_pending |= sets.is_some();
         st.pending.push_back(Pending {
             ref_: ref_.clone(),
             lines: Vec::new(),
-            signs_in,
+            sets,
             reply,
         });
         Ok(ref_)
@@ -468,62 +522,59 @@ impl Session {
         Ok(response.into_result()?.1)
     }
 
-    /// Signs in as the guest `~<name>` (4.2), starting a new session.
+    /// Sends ANON: the connection becomes anonymous (4.2), for posting,
+    /// following and fetching (Section 7).
+    pub async fn anon(&self) -> Result<(), Error> {
+        let sets = Some((ConnectionKind::Anonymous, None));
+        self.request_setting(Command::Anon, sets).await?.ok()?;
+        Ok(())
+    }
+
+    /// Becomes the guest `~<name>` (4.2), starting a new session.
     pub async fn guest(&self, name: &Name) -> Result<Uid, Error> {
         Ok(self.guest_session(name, None).await?.0)
     }
 
-    /// Signs in as the guest `~<name>` (4.2). With `token`, the server
-    /// resumes that guest's session if the token is its current one, and
-    /// otherwise ignores it. Returns the uid, the session's new token,
-    /// which the next resume needs, and whether the session was resumed
-    /// (`resumed=yes`): then its cids carry over, and unanswered messages
-    /// may be sent again (7.6). The token is a secret.
+    /// Becomes the guest `~<name>` (4.2). With `token`, the server resumes
+    /// that guest's session if the token is its current one, and otherwise
+    /// ignores it. Returns the uid, the session's new token, which the next
+    /// resume needs, and whether the session was resumed (`resumed=yes`).
+    /// The token is a secret.
     pub async fn guest_session(
         &self,
         name: &Name,
-        token: Option<&Id>,
-    ) -> Result<(Uid, Option<Id>, bool), Error> {
-        let ok = self
-            .request_ok(Command::Guest {
-                name: name.clone(),
-                token: token.cloned().map(GuestToken),
-            })
-            .await?;
+        token: Option<&GuestToken>,
+    ) -> Result<(Uid, Option<GuestToken>, bool), Error> {
+        let uid = Uid::guest(name);
+        let command = Command::Guest {
+            name: name.clone(),
+            token: token.cloned(),
+        };
+        let sets = Some((ConnectionKind::Guest, Some(uid.clone())));
+        let response = self.request_setting(command, sets).await?;
+        let ok = response.ok()?;
         let new_token = ok.token().ok().flatten();
         // Only a resume can be resumed=yes; ignore it on a new session.
         let resumed = token.is_some() && ok.resumed().ok().flatten().unwrap_or(false);
-        Ok((signed_in_uid(&ok, Uid::guest(name)), new_token, resumed))
+        Ok((uid, new_token, resumed))
     }
 
-    /// Signs in as `identity` with a device key listed in its key file
-    /// (4.5).
+    /// Signs in as `identity` with the device key of one of its current
+    /// devices (4.6).
     ///
     /// The signed bytes use the hostname this client sent in SNI, never
     /// the greeting's host, and the greeting's nonce. Fails with
     /// [`Error::NoSni`] over an IP address (2.1).
     pub async fn auth(&self, identity: &Identity, key: &SecretKey) -> Result<Uid, Error> {
         let sni = self.info.sni.as_deref().ok_or(Error::NoSni)?;
-        let command = keys::auth_command(sni, &self.info.greeting.nonce, identity, key);
-        let ok = self.request_ok(command).await?;
-        Ok(signed_in_uid(&ok, identity.to_uid()))
+        let command = auth_command(sni, &self.info.greeting.nonce, identity, key);
+        let uid = identity.to_uid();
+        let sets = Some((ConnectionKind::SignedIn, Some(uid.clone())));
+        self.request_setting(command, sets).await?.ok()?;
+        Ok(uid)
     }
 
-    /// Creates the identity `<name>@<identity domain>` with `key` as its
-    /// first key, and signs in as it (4.6).
-    ///
-    /// The identity domain comes from INFO (8.5) first, through
-    /// [`identity_domain`](Self::identity_domain). Then it is
-    /// [`register_under`](Self::register_under).
-    pub async fn register(&self, name: &Name, key: &SecretKey) -> Result<Uid, Error> {
-        if self.info.sni.is_none() {
-            return Err(Error::NoSni);
-        }
-        let domain = self.identity_domain().await?;
-        self.register_under(name, &domain, key).await
-    }
-
-    /// The server's identity domain, from INFO's `register=` (4.6, 8.5).
+    /// The server's identity domain, from INFO's `register=` (4.7, 8.5).
     /// A server without registration (`register=no`, or no value that
     /// parses) gives [`Error::NoRegistration`].
     pub async fn identity_domain(&self) -> Result<Domain, Error> {
@@ -534,32 +585,43 @@ impl Session {
         }
     }
 
-    /// Sends `REGISTER <name> <key> <signature>` for the identity
-    /// `<name>@<domain>`, where `domain` is the server's identity domain
-    /// from [`identity_domain`](Self::identity_domain) (4.6).
+    /// Sends `REGISTER <name> <keyfile> <signature>` (4.7): creates the
+    /// identity `<name>@<domain>` with its first records, and signs in as
+    /// it with `key`, the device key of the `device` record among them.
+    /// `domain` is the server's identity domain, from
+    /// [`identity_domain`](Self::identity_domain).
     ///
-    /// It signs with the SNI hostname, as [`auth`](Self::auth) does, and
-    /// fails with [`Error::NoSni`] over an IP address (2.1). A server that
-    /// answers `not-supported` offers no registration after all:
-    /// [`Error::NoRegistration`].
-    pub async fn register_under(
+    /// It signs as [`auth`](Self::auth) does, and fails with
+    /// [`Error::NoSni`] over an IP address (2.1). A server that answers
+    /// `not-supported` offers no registration after all:
+    /// [`Error::NoRegistration`]. Building the records is the identity
+    /// code's (task C1).
+    pub async fn register(
         &self,
         name: &Name,
         domain: &Domain,
+        records: EncodedRecords,
         key: &SecretKey,
     ) -> Result<Uid, Error> {
         let sni = self.info.sni.as_deref().ok_or(Error::NoSni)?;
-        let command = keys::register_command(sni, &self.info.greeting.nonce, name, domain, key);
-        let ok = match self.request_ok(command).await {
-            Err(Error::Rejected(CommandError::Server(err)))
+        let identity = Identity::new(name, domain);
+        let signature = key.sign_challenge(sni, &self.info.greeting.nonce, identity.as_str());
+        let command = Command::Register {
+            name: name.clone(),
+            records,
+            signature,
+        };
+        let uid = identity.to_uid();
+        let sets = Some((ConnectionKind::SignedIn, Some(uid.clone())));
+        match self.request_setting(command, sets).await?.ok() {
+            Ok(_) => Ok(uid),
+            Err(CommandError::Server(err))
                 if err.code == risala_proto::error::ErrorCode::NotSupported =>
             {
-                return Err(Error::NoRegistration);
+                Err(Error::NoRegistration)
             }
-            other => other?,
-        };
-        let expected = Identity::new(name, domain).to_uid();
-        Ok(signed_in_uid(&ok, expected))
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Sends QUIT and waits for the server to close the connection (11).
@@ -606,12 +668,23 @@ impl Drop for Session {
     }
 }
 
-/// The uid an `OK` to a sign-in names, or the expected one if it names
-/// none that parses.
-fn signed_in_uid(ok: &OkResponse, expected: Uid) -> Uid {
-    match ok.uid() {
-        Ok(Some(uid)) => uid,
-        _ => expected,
+/// The AUTH command for `identity` (4.6): an ML-DSA-44 signature with the
+/// device key over the sign-in bytes.
+///
+/// `sni_host` must be the hostname this client sent in SNI, not the host
+/// in the greeting. `nonce` is the greeting's nonce. It signs with the
+/// deterministic variant, so that Appendix B's vector can be checked; the
+/// spec's SHOULD for the hedged one is task C1's to weigh.
+pub fn auth_command(
+    sni_host: &str,
+    nonce: &Nonce,
+    identity: &Identity,
+    key: &SecretKey,
+) -> Command {
+    let signature = key.sign_challenge(sni_host, nonce, identity.as_str());
+    Command::Auth {
+        identity: identity.clone(),
+        signature,
     }
 }
 
@@ -780,7 +853,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
         st.pending.push_back(Pending {
             ref_,
             lines: Vec::new(),
-            signs_in: false,
+            sets: None,
             reply: ReplyTo::Keepalive,
         });
         Ok(())
@@ -881,12 +954,16 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
             ));
         }
         let pending = st.pending.pop_front().expect("checked");
-        if pending.signs_in
-            && let End::Ok(ok) = &end
-            && let Ok(Some(uid)) = ok.uid()
-        {
-            st.uid = Some(uid);
-            st.operator = ok.op().ok().flatten().unwrap_or(false);
+        if pending.sets.is_some() {
+            st.kind_pending = false;
+        }
+        // The uid is the one asked for, whatever the OK names: a server
+        // cannot sign the connection in as someone else (4.6).
+        if let (Some((kind, uid)), End::Ok(ok)) = (&pending.sets, &end) {
+            st.kind = *kind;
+            st.uid = uid.clone();
+            st.operator =
+                *kind == ConnectionKind::SignedIn && ok.op().ok().flatten().unwrap_or(false);
         }
         drop(st);
         let response = Response {
