@@ -11,7 +11,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Session, command, exchange, expect, join, value};
+use common::{Session, command, exchange, expect, join, until_closed, value};
 use risala_server::testing::{TestIdentity, TestServer};
 
 /// Presence changes held for an hour, so that no PRESENCE line turns up.
@@ -1180,5 +1180,107 @@ async fn reports_are_rate_limited() {
         expect(&mut s, "alice", "*").await;
     }
     s.settled().await;
+    server.stop().await;
+}
+
+/// A guest removed from a room by KICK, BAN or `guests none` is no longer
+/// in it when its session ends: no second PART is recorded, then or after
+/// a restart (4.2, 6.2, 6.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_guests_leave_once() {
+    let mut server = server().await;
+    let (alice, conn) = server.register("alice").await;
+    let op = server.identity("op@example.net");
+    let mut s = Session::new();
+    s.add("alice", conn);
+    s.add("op", server.sign_in(&op).await);
+    let ok = join(&mut s, "alice", "#r").await;
+    s.bind("id", &value(&ok, "id"));
+    for (n, guest) in ["kim", "lee", "max"].into_iter().enumerate() {
+        s.add(guest, server.guest(guest).await);
+        join(&mut s, guest, "#r").await;
+        expect(
+            &mut s,
+            "alice",
+            &format!("@seq={};t={{*}};from=~{guest};id={{id}} JOIN #r", n + 2),
+        )
+        .await;
+    }
+    // Each guest also sees the later JOINs.
+    expect(&mut s, "kim", "@seq=3;t={*};from=~lee;id={id} JOIN #r").await;
+    expect(&mut s, "kim", "@seq=4;t={*};from=~max;id={id} JOIN #r").await;
+    expect(&mut s, "lee", "@seq=4;t={*};from=~max;id={id} JOIN #r").await;
+
+    exchange(
+        &mut s,
+        "alice",
+        "kick #r ~kim",
+        &["*KICK #r ~kim", "OK seq=5"],
+    )
+    .await;
+    for who in ["kim", "lee", "max"] {
+        expect(
+            &mut s,
+            who,
+            "@seq=5;t={*};from=alice@example.org KICK #r ~kim",
+        )
+        .await;
+    }
+    exchange(
+        &mut s,
+        "alice",
+        "ban #r ~lee",
+        &["*BAN #r ~lee", "OK seq=6"],
+    )
+    .await;
+    for who in ["lee", "max"] {
+        expect(
+            &mut s,
+            who,
+            "@seq=6;t={*};from=alice@example.org BAN #r ~lee",
+        )
+        .await;
+    }
+    // The ban is of the uid only.
+    exchange(&mut s, "alice", "bans #r", &["BAN #r ~lee", "OK"]).await;
+    exchange(
+        &mut s,
+        "alice",
+        "set #r guests none",
+        &[
+            "*SET #r guests none",
+            "@seq=8;t={*};from=~max PART #r",
+            "OK seq=7",
+        ],
+    )
+    .await;
+    expect(&mut s, "max", "*SET #r guests none").await;
+    expect(&mut s, "max", "@seq=8;t={*};from=~max PART #r").await;
+
+    // kim's session ends now, the others' at the restart.
+    exchange(&mut s, "op", "admin disconnect ~kim", &["OK"]).await;
+    until_closed(s.client("kim")).await;
+    s.take("kim");
+    exchange(&mut s, "alice", "set #r guests write", &["*", "OK seq=9"]).await;
+    s.settled().await;
+    drop(s);
+    server.restart().await;
+    let mut conn = server.sign_in(&alice).await;
+    let page = command(&mut conn, "history #r after=8").await;
+    assert_eq!(page.len(), 2, "{page:?}");
+    assert!(page[0].ends_with(" SET #r guests write"), "{page:?}");
+    assert!(page[1].starts_with("OK id="), "{page:?}");
+    let info = command(&mut conn, "info #r").await;
+    assert!(
+        info.last().unwrap().contains(" members=1 head=9 "),
+        "{info:?}"
+    );
+    // lee's name is still banned; kim may come back.
+    let mut lee = server.guest("lee").await;
+    let answer = command(&mut lee, "join #r").await;
+    assert!(answer[0].starts_with("ERR forbidden"), "{answer:?}");
+    let mut kim = server.guest("kim").await;
+    let answer = command(&mut kim, "join #r").await;
+    assert!(answer.last().unwrap().ends_with(" head=10"), "{answer:?}");
     server.stop().await;
 }
