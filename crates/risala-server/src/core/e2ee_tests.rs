@@ -1,8 +1,8 @@
 //! Transcript tests of KEYPKG (12.4), WELCOME (12.7) and BACKUP (12.10),
 //! through the [`Handler`] trait.
 //!
-//! KEYPKG ADD cannot check a KeyPackage yet, so KeyPackages are put in
-//! through the store, as are Welcomes, which COMMIT stores once it exists.
+//! KeyPackages are put in through the store, as are Welcomes, so that
+//! these tests need no MLS: `group_tests` has real ones.
 //! Devices sign in without AUTH, each with a key made from a fixed seed.
 
 use std::sync::Arc;
@@ -140,16 +140,14 @@ async fn guests_may_not_use_them() {
 // ---------------------------------------------------------------------------
 // KEYPKG (12.4)
 
-/// KEYPKG ADD waits for the MLS checks (`check_key_package`).
+/// KEYPKG ADD refuses what is not a KeyPackage (12.4). Real ones are in
+/// `group_tests`.
 #[tokio::test]
-async fn keypkg_add_cannot_check_key_packages_yet() {
+async fn keypkg_add_refuses_what_is_not_a_key_package() {
     let mut w = World::new();
     let mut a1 = w.device(ALICE, 1);
     w.send(&a1, "keypkg add AAEABQAB").await;
-    assert_eq!(
-        a1.lines(),
-        ["ERR not-supported this server cannot check KeyPackages yet"]
-    );
+    assert_eq!(a1.lines(), ["ERR invalid not a valid KeyPackage"]);
     w.send(&a1, "keypkg count").await;
     assert_eq!(a1.lines(), ["OK count=0 last-resort=no"]);
 }

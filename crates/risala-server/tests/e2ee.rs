@@ -2,9 +2,8 @@
 //! over TLS against a whole server: KEYPKG (12.4), WELCOME (12.7) and
 //! BACKUP (12.10), with the long lines that carry MLS data (2.3).
 //!
-//! KEYPKG ADD cannot check a KeyPackage until the server has MLS, so the
-//! KeyPackages here are put into the server's database directly, through
-//! a second connection to it. The hub's own tests (`src/core/e2ee_tests.rs`)
+//! Most KeyPackages here are put into the server's database directly,
+//! through a second connection to it, so that their sizes can be chosen. The hub's own tests (`src/core/e2ee_tests.rs`)
 //! cover each rule at every edge.
 
 mod common;
@@ -27,7 +26,7 @@ async fn server() -> TestServer {
 }
 
 /// Stores a KeyPackage of `len` bytes, all `n`, for `who`'s device, as
-/// KEYPKG ADD will once it can check one.
+/// KEYPKG ADD does once it has checked one.
 fn put_key_package(server: &TestServer, who: &TestIdentity, n: u8, len: usize) -> KeyPackage {
     let store = SqliteStore::open(&server.config().database_path()).unwrap();
     let key_package = KeyPackage::from_bytes(&vec![n; len]).unwrap();
@@ -47,7 +46,7 @@ fn put_key_package(server: &TestServer, who: &TestIdentity, n: u8, len: usize) -
 }
 
 /// A long KEYPKG line is too long before sign-in, and reaches the hub
-/// after it (2.3), which cannot check KeyPackages yet.
+/// after it (2.3), which finds it is no KeyPackage.
 #[tokio::test]
 async fn key_packages_are_long_lines_once_signed_in() {
     let server = server().await;
@@ -59,10 +58,7 @@ async fn key_packages_are_long_lines_once_signed_in() {
 
     let (_alice, mut laptop) = server.register("alice").await;
     let lines = command(&mut laptop, &format!("keypkg add {data}")).await;
-    assert_eq!(
-        lines,
-        ["ERR not-supported this server cannot check KeyPackages yet"]
-    );
+    assert_eq!(lines, ["ERR invalid not a valid KeyPackage"]);
     server.stop().await;
 }
 

@@ -17,9 +17,8 @@
 //!
 //! # KeyPackages
 //!
-//! KEYPKG ADD checks a KeyPackage with [`check_key_package`], which needs
-//! MLS and so answers `ERR not-supported` until group processing comes.
-//! Everything after it is in place. KEYPKG GET hands out each ordinary
+//! KEYPKG ADD checks a KeyPackage with [`check_key_package`] (12.4).
+//! KEYPKG GET hands out each ordinary
 //! KeyPackage once, then the last-resort one (12.4). It leaves out devices
 //! whose keys are not in the identity's key file: the server's own records
 //! for a hosted identity, or else the file as the fetcher has it, fetched
@@ -60,6 +59,7 @@
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use risala_mls::RisalaCrypto;
 use risala_proto::auth::PublicKey;
 use risala_proto::command::{BackupCommand, Command, KeyPkgCommand, WelcomeCommand};
 use risala_proto::error::ErrorCode;
@@ -109,41 +109,52 @@ pub(super) struct CheckedKeyPackage {
 /// device `uid` and `device_key` at `now`. Runs on the blocking pool,
 /// since it verifies ML-DSA signatures.
 ///
-/// **Not built yet**: it needs the MLS library (`risala-mls`), and so
-/// replies `ERR not-supported` for now. Once built, it decodes
-/// `key_package` as an MLSMessage holding a KeyPackage, and checks that:
+/// [`risala_mls::check_key_package`] decodes `key_package` as an
+/// MLSMessage holding a KeyPackage, and checks that:
 ///
-/// - its protocol version is `mls10`, and its cipher suite is
-///   [`CIPHER_SUITE`](risala_proto::mls::CIPHER_SUITE), `0x0052` (12.2)
+/// - its protocol version is `mls10`, and its cipher suite is `0x0052`
+///   (12.2)
 /// - its leaf's credential is a `basic` credential whose identity is
 ///   `uid`, in lower case, in UTF-8 (12.2)
 /// - its leaf's signature key is `device_key`, the raw 1312-byte ML-DSA-44
 ///   key the connection signed in with (4.5, 12.2)
-/// - its leaf's capabilities list the cipher suite, the conversation
-///   extension type
-///   [`CONVERSATION_EXTENSION_TYPE`](risala_proto::mls::CONVERSATION_EXTENSION_TYPE),
-///   `0xF2A1`, and the `last_resort` extension type `0x000A` (12.2)
-/// - its leaf's source is `key_package`, with a lifetime that is
-///   acceptable at `now`: `not_before <= now <= not_after`, spanning at
-///   most [`MAX_KEY_PACKAGE_LIFETIME`] seconds (12.4)
-/// - the leaf's signature and the KeyPackage's signature verify under the
-///   signature key, and the rest of the checks of RFC 9420, section 10.1
-///   hold, such as `init_key` differing from the leaf's `encryption_key`
+/// - its leaf's capabilities list the cipher suite, `basic` credentials,
+///   the conversation extension `0xF2A1` and `last_resort` `0x000A` (12.2)
+/// - its lifetime is acceptable at `now`: `not_before <= now <=
+///   not_after`, spanning at most [`MAX_KEY_PACKAGE_LIFETIME`] seconds
+///   (12.4)
+/// - its signatures verify, and the rest of the checks of RFC 9420,
+///   section 10.1 hold, such as `init_key` differing from the leaf's
+///   `encryption_key`
 ///
 /// It then returns the KeyPackage's ref, the end of its lifetime, and
 /// whether it carries the `last_resort` extension. A KeyPackage that fails
 /// any check gets `ERR invalid`.
 pub(super) fn check_key_package(
+    crypto: &RisalaCrypto,
     key_package: &KeyPackage,
     uid: &Uid,
     device_key: &PublicKey,
     now: Timestamp,
 ) -> Result<CheckedKeyPackage, Fail> {
-    let _ = (key_package, uid, device_key, now);
-    Err(fail(
-        ErrorCode::NotSupported,
-        "this server cannot check KeyPackages yet",
-    ))
+    let checked =
+        risala_mls::check_key_package(crypto, key_package, uid, device_key, now.to_system_time())
+            .map_err(|e| fail(ErrorCode::Invalid, &e.to_string()))?;
+    let kp_ref = checked
+        .key_package
+        .hash_ref(crypto)
+        .map_err(|_| fail(ErrorCode::Invalid, "the KeyPackage has no ref"))?;
+    // A lifetime past the end of time cannot be acceptable now.
+    let not_after = checked
+        .not_after
+        .checked_mul(1000)
+        .and_then(Timestamp::from_unix_millis)
+        .ok_or_else(|| fail(ErrorCode::Invalid, "the KeyPackage's lifetime is too long"))?;
+    Ok(CheckedKeyPackage {
+        kp_ref: kp_ref.as_slice().to_vec(),
+        not_after,
+        last_resort: checked.last_resort,
+    })
 }
 
 fn rate_limited(retry: u64) -> Fail {
@@ -231,7 +242,8 @@ impl Inner {
         let now = self.now();
         let checked = {
             let (kp, who, k) = (key_package.clone(), uid.clone(), key.clone());
-            tokio::task::spawn_blocking(move || check_key_package(&kp, &who, &k, now))
+            let crypto = self.mls.clone();
+            tokio::task::spawn_blocking(move || check_key_package(&crypto, &kp, &who, &k, now))
                 .await
                 .map_err(|e| Fail::Store(StoreError::Task(e.to_string())))??
         };

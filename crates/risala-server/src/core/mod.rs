@@ -224,6 +224,9 @@ pub enum HubError {
     /// A value in the configuration is not valid.
     #[error("configuration: {0}")]
     Config(String),
+    /// The MLS crypto provider could not start (12.2).
+    #[error("MLS crypto: {0}")]
+    Crypto(String),
 }
 
 /// The core of the server. Implements [`Handler`].
@@ -293,6 +296,9 @@ pub(crate) struct Inner {
     /// The KEYPKG GETs each identity sent in the last hour (12.4), for
     /// `limits.key_package_gets_per_hour`.
     key_package_gets: rate::WindowLimit<Uid>,
+    /// The crypto of cipher suite `0x0052` (12.2), for checking
+    /// KeyPackages and commits. Shared by every MLS operation.
+    mls: Arc<risala_mls::RisalaCrypto>,
 }
 
 impl Hub {
@@ -448,6 +454,9 @@ impl Hub {
             .chain(store.operators()?)
             .collect();
         let identity_domain = config.identity_domain();
+        let mls = Arc::new(
+            risala_mls::RisalaCrypto::new().map_err(|e| HubError::Crypto(format!("{e:?}")))?,
+        );
         let admin_state = admin::AdminState::load(&*store)?;
         let configured: Vec<Uid> = config.operators().iter().map(|op| op.to_uid()).collect();
         for (operator, ban) in admin_state.covering(&configured) {
@@ -497,6 +506,7 @@ impl Hub {
                     markers_moved: AtomicU64::new(0),
                     report_book: reports::ReportBook::new(),
                     key_package_gets: rate::WindowLimit::new(e2ee::KEYPKG_GET_WINDOW),
+                    mls,
                 }
             }),
         })
@@ -1051,3 +1061,6 @@ mod messages_tests;
 
 #[cfg(test)]
 mod e2ee_tests;
+
+#[cfg(test)]
+mod group_tests;
