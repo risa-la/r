@@ -129,6 +129,12 @@ async fn trust_guest_join_send_log_sync_and_export() {
     assert!(stderr(&out).contains("offline"), "{}", stderr(&out));
     let exported = std::fs::read_to_string(&file).unwrap();
     assert_eq!(exported, online_export);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "an export is private history");
+    }
     assert!(exported.lines().all(|l| l.starts_with("@seq=")));
     assert!(exported.contains(" MSG #general welcome back\\nsam\n"));
 
@@ -265,6 +271,42 @@ async fn sending_twice_resumes_the_guest_session() {
     let history = sam_events(&mut ann, "#general").await;
     assert_eq!(history, ["JOIN", "MSG", "MSG", "MSG", "PART"]);
     server.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_state_is_its_owners_only() {
+    // The cache holds private history and guest session tokens (4.2).
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let open = |p: &Path| std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755));
+    let dir = tempfile::tempdir().unwrap();
+
+    // A new directory given with --state, and its parents.
+    let state = dir.path().join("new/state");
+    risala(&state, &["whoami"]).await;
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&state.join("cache.db")), 0o600);
+
+    // One that is already there is the user's: left as it is.
+    let mine = dir.path().join("mine");
+    std::fs::create_dir(&mine).unwrap();
+    open(&mine).unwrap();
+    risala(&mine, &["whoami"]).await;
+    assert_eq!(mode(&mine), 0o755);
+    assert_eq!(mode(&mine.join("cache.db")), 0o600);
+
+    // The default one is risala's own: made private if it was not.
+    let xdg = dir.path().join("xdg");
+    std::fs::create_dir_all(xdg.join("risala")).unwrap();
+    open(&xdg.join("risala")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_risala"));
+    cmd.env("XDG_STATE_HOME", &xdg).arg("whoami");
+    tokio::task::spawn_blocking(move || cmd.output().expect("running risala"))
+        .await
+        .unwrap();
+    assert_eq!(mode(&xdg.join("risala")), 0o700);
+    assert_eq!(mode(&xdg.join("risala/cache.db")), 0o600);
 }
 
 #[tokio::test]

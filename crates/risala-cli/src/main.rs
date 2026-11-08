@@ -404,18 +404,66 @@ fn explain<T>(e: ClientError) -> Res<T> {
 }
 
 /// The state directory: `--state`, `$XDG_STATE_HOME/risala` or
-/// `~/.local/state/risala`.
-fn state_dir(arg: Option<PathBuf>) -> Res<PathBuf> {
+/// `~/.local/state/risala`, and whether it is a default one, which is
+/// risala's own.
+fn state_dir(arg: Option<PathBuf>) -> Res<(PathBuf, bool)> {
     if let Some(dir) = arg {
-        return Ok(dir);
+        return Ok((dir, false));
     }
     if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        return Ok(PathBuf::from(dir).join("risala"));
+        return Ok((PathBuf::from(dir).join("risala"), true));
     }
     match std::env::var_os("HOME").filter(|d| !d.is_empty()) {
-        Some(home) => Ok(PathBuf::from(home).join(".local/state/risala")),
+        Some(home) => Ok((PathBuf::from(home).join(".local/state/risala"), true)),
         None => fail("no state directory: set HOME or XDG_STATE_HOME, or pass --state"),
     }
+}
+
+/// Creates the state directory if needed, on Unix for its owner only
+/// (0700): the cache holds private history and guest session tokens
+/// (4.2). Its parents are made as usual. A default directory that is
+/// already there is made its owner's only too; one given with `--state`
+/// is the user's, and is left as it is.
+fn make_state_dir(dir: &Path, own: bool) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    if own {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = own;
+    Ok(())
+}
+
+/// Writes `bytes` to the file at `path`. A new file is its owner's only
+/// (0600) on Unix, since it holds private history; one that is already
+/// there keeps its mode.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
 struct Ctx {
@@ -423,8 +471,8 @@ struct Ctx {
     account: Option<String>,
 }
 
-fn open(dir: &Path, account: Option<String>) -> Res<Ctx> {
-    if let Err(e) = std::fs::create_dir_all(dir) {
+fn open(dir: &Path, own: bool, account: Option<String>) -> Res<Ctx> {
+    if let Err(e) = make_state_dir(dir, own) {
         return fail(format!("creating {}: {e}", dir.display()));
     }
     let keys_dir = dir.join("keys");
@@ -439,8 +487,8 @@ fn open(dir: &Path, account: Option<String>) -> Res<Ctx> {
 }
 
 async fn run(cli: Cli) -> Res {
-    let dir = state_dir(cli.state)?;
-    let ctx = open(&dir, cli.account)?;
+    let (dir, own) = state_dir(cli.state)?;
+    let ctx = open(&dir, own, cli.account)?;
     let result = command(&ctx, cli.command).await;
     ctx.client.shutdown().await;
     result
@@ -627,7 +675,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
             match output {
                 Some(path) => {
-                    if let Err(e) = std::fs::write(&path, text) {
+                    if let Err(e) = write_private(&path, text.as_bytes()) {
                         return fail(format!("writing {}: {e}", path.display()));
                     }
                     eprintln!(

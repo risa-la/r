@@ -1071,3 +1071,30 @@ fn display_names() {
     store.remove_account(account).unwrap();
     assert_eq!(store.user_name(account, &bob).unwrap(), None);
 }
+
+#[cfg(unix)]
+#[test]
+fn only_the_owner_can_read_a_new_cache() {
+    // It holds private history and guest session tokens (4.2).
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let store = Store::open(&path).unwrap();
+    let account = store.account(&addr(), &uid("~sam")).unwrap();
+    store
+        .set_guest_session(account, Some((&"sam".parse().unwrap(), &id("t1"))))
+        .unwrap();
+    let mut files = 0;
+    for name in ["cache.db", "cache.db-wal", "cache.db-shm"] {
+        let Ok(meta) = std::fs::metadata(dir.path().join(name)) else {
+            continue;
+        };
+        files += 1;
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{name}");
+    }
+    assert_eq!(files, 3, "WAL mode keeps -wal and -shm while open");
+    drop(store);
+    // Opening it again works, and leaves the mode alone.
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.accounts().unwrap().len(), 1);
+}

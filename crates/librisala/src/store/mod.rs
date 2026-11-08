@@ -69,6 +69,9 @@ pub enum StoreError {
     /// An account, conversation or outbox entry does not exist.
     #[error("not found: {0}")]
     NotFound(&'static str),
+    /// The cache's file could not be created.
+    #[error("cache file: {0}")]
+    File(#[from] std::io::Error),
 }
 
 macro_rules! row_id {
@@ -175,6 +178,33 @@ pub enum Change {
     },
 }
 
+/// Creates the file at `path` with mode 0600 on Unix, if there is none.
+/// SQLite takes an empty file for a new database.
+fn create_private(path: &Path) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        // Not a file: SQLite's name for a database in memory.
+        if path.as_os_str() == ":memory:" {
+            return Ok(());
+        }
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path);
+        match created {
+            // The umask may have cleared bits of the mode asked for.
+            Ok(file) => file.set_permissions(std::fs::Permissions::from_mode(0o600))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// The client's SQLite cache. See the [module docs](self).
 #[derive(Clone)]
 pub struct Store {
@@ -197,8 +227,14 @@ impl fmt::Debug for Store {
 impl Store {
     /// Opens the cache at `path`, creating it if needed, and brings its
     /// schema up to date.
+    ///
+    /// On Unix a new cache is readable and writable by its owner only
+    /// (0600), whatever the umask: it holds private history and a guest's
+    /// session token (4.2). SQLite gives the `-wal` and `-shm` files the
+    /// same mode. An existing file keeps its mode.
     pub fn open(path: impl AsRef<Path>) -> Result<Store, StoreError> {
         let path = path.as_ref();
+        create_private(path)?;
         let mut store = Store::setup(Connection::open(path)?)?;
         // After the writer, which has set WAL mode and the schema.
         let reader = Connection::open(path)?;
