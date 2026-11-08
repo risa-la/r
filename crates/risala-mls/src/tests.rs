@@ -2497,3 +2497,44 @@ fn x_wing_keys_of_parent_nodes() {
         Err(GroupError::Join(crate::checks::JoinError::Leaf))
     ));
 }
+
+/// The length of a PrivateMessage's PrivateMessageContent: its ciphertext
+/// less the AEAD tag.
+fn private_content_len(message: &[u8]) -> usize {
+    let mut r = crate::codec::Reader::new(message);
+    r.u16().unwrap(); // version
+    r.u16().unwrap(); // wire format
+    r.vector().unwrap(); // group id
+    r.u64().unwrap(); // epoch
+    r.u8().unwrap(); // content type
+    r.vector().unwrap(); // authenticated data
+    r.vector().unwrap(); // encrypted sender data
+    let ciphertext = r.vector().unwrap();
+    r.finish().unwrap();
+    ciphertext.len() - 16
+}
+
+/// Commits and proposals sent as PrivateMessages are padded so that their
+/// PrivateMessageContent has a Padmé length (12.6, 12.11), through a patch
+/// of OpenMLS; application messages keep blocks of 256 bytes (12.9).
+#[test]
+fn handshake_padding() {
+    let Room3 {
+        owen,
+        mia,
+        mut o,
+        mut m,
+        facts,
+        ..
+    } = private_room();
+    let out = owen.commit(&mut o, Changes::default());
+    let len = private_content_len(&out.message);
+    assert_eq!(Some(len as u64), crate::file::padme(len as u64));
+    owen.merge(&mut o, &out);
+    mia.apply(&mut m, &out, &facts);
+    let message = mia.send(&mut m, b"hello");
+    assert_eq!(
+        (private_content_len(&message) + 16) % crate::group::PADDING_SIZE,
+        0
+    );
+}

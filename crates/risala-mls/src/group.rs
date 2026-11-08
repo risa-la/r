@@ -97,8 +97,10 @@ pub const MAX_SKIPPED_GENERATIONS: u32 = 1_000;
 /// The MLS exporter label of the box a mailbox moves to (7.8, 15).
 pub const BOX_LABEL: &str = "risala/1 box";
 
-/// The multiple of bytes that PrivateMessage contents are padded to
-/// (12.9).
+/// The multiple of bytes that application messages' PrivateMessage
+/// contents, with their AEAD tag, are padded to (12.9). Commits and
+/// proposals are padded to a Padmé length instead (12.6), by OpenMLS as
+/// patched for risala (`crates/openmls/RISALA.md`).
 pub const PADDING_SIZE: usize = 256;
 
 /// The most devices a commit adds (12.6, 6.1). A client that adds more

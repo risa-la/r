@@ -362,7 +362,18 @@ impl PrivateMessage {
             .serialized_len_without_type()
             + authenticated_content.auth.tls_serialized_len();
 
-        let padding_length = if padding_size > 0 {
+        let handshake = authenticated_content
+            .content()
+            .content_type()
+            .is_handshake_message();
+        let padding_length = if padding_size > 0 && handshake {
+            // risala: commits and proposals are padded so that the length
+            // of their PrivateMessageContent is a Padmé length (risala's
+            // spec, 12.6, 12.11): a commit's size shows roughly how large
+            // the group is, and Padmé leaks less of it than blocks of
+            // `padding_size`. Application messages keep the blocks.
+            padme(plaintext_length) - plaintext_length
+        } else if padding_size > 0 {
             // Calculate padding block size.
             // Only the AEAD tag is added.
             let padding_offset = plaintext_length + mac_len;
@@ -403,4 +414,19 @@ pub(crate) struct PrivateContentAad<'a> {
     pub(crate) epoch: GroupEpoch,
     pub(crate) content_type: ContentType,
     pub(crate) authenticated_data: VLByteSlice<'a>,
+}
+
+/// risala: Padmé [PADME] of `len`: for `len` of at least 2, with
+/// E = floor(log2(len)), S = floor(log2(E)) + 1, z = E - S and
+/// m = 2^z - 1, `len + m` with its lowest z bits cleared (risala's spec,
+/// 12.11). 0 and 1 are their own padded lengths.
+fn padme(len: usize) -> usize {
+    if len < 2 {
+        return len;
+    }
+    let e = len.ilog2();
+    let s = e.ilog2() + 1;
+    let z = e - s;
+    let mask = (1usize << z) - 1;
+    (len + mask) & !mask
 }

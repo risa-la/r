@@ -1,10 +1,11 @@
 # openmls, patched for risala
 
-This is openmls 0.9.2 from crates.io, changed in six ways for risala:
+This is openmls 0.9.2 from crates.io, changed in seven ways for risala:
 how it frames a SelfRemove proposal (draft-ietf-mls-extensions), where it
 checks KeyPackage lifetimes, removals in external commits, the
 authenticated data of join proposals, `VerifiableGroupInfo::signer`,
-which is public, and access to the keys of parent nodes. The root Cargo.toml puts it in place
+which is public, access to the keys of parent nodes, and the padding of
+commits and proposals. The root Cargo.toml puts it in place
 of the crates.io release with `[patch.crates-io]`. Each place is marked
 `risala:`.
 
@@ -91,3 +92,19 @@ risala-mls checks them (`checks::CommitView::parent_keys_ok`,
 `checks::parent_keys_ok`) and tests that a commit's view reads its parent
 nodes. Drop the patch if OpenMLS checks HPKE public keys itself, or
 exposes the nodes another way.
+
+## Padding commits and proposals (the spec, 12.6, 12.11)
+
+A commit's size shows roughly how large the group is, so risala pads
+commits and proposals sent as PrivateMessages so that the length of
+their PrivateMessageContent is a Padmé length, which leaks less than
+blocks of a fixed size. Application messages keep the configured
+`padding_size` (256 bytes, 12.9). In
+`src/framing/private_message.rs`,
+`encode_padded_ciphertext_content_detached` pads handshake messages to
+Padmé whenever `padding_size` is not zero. Receiving needs no change,
+since padding is zero bytes MLS strips.
+
+risala-mls tests the lengths (`tests::handshake_padding`). Drop the patch
+if OpenMLS lets the application choose the padding per message.
+
