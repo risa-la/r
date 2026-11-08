@@ -43,12 +43,14 @@ use risala_mls::conversation::RisalaConversation;
 use risala_proto::auth::PublicKey;
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{CommitMessage, GroupInfo, RatchetTree, Welcome};
+use risala_proto::mls::{Ciphertext, CommitMessage, Frank, GroupInfo, RatchetTree, Welcome};
 use risala_proto::names::{Conv, Room, Seq, Uid};
 use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
-use risala_proto::types::{GuestAccess, Role, RoomSetting};
+use risala_proto::types::{Cid, FileUrl, GuestAccess, Role, RoomSetting};
 
-use super::commands::{Fail, Outcome, Reply, fail, not_found, not_supported, room_of, visible};
+use super::commands::{
+    Fail, Outcome, Reply, check_read, fail, not_found, not_supported, room_of, visible,
+};
 use super::identity::unavailable;
 use super::keys::FetchError;
 use super::mls::{CheckedCommit, Device, check_commit, check_init, tree_of};
@@ -57,7 +59,8 @@ use super::state::ConvState;
 use super::{Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::OutLine;
 use crate::store::{
-    EventKind, GroupCommit, GroupInit, GroupMeta, NewEvent, NewWelcome, StoreError, StoredEvent,
+    Appended, EventKind, GroupCommit, GroupInit, GroupMeta, NewEvent, NewWelcome, StoreError,
+    StoredEvent,
 };
 
 /// Runs `f` on the blocking pool.
@@ -113,6 +116,23 @@ impl Inner {
                     .await
             }
             Command::GroupInfo { conv } => self.group_info(uid, reply, conv).await,
+            Command::Enc {
+                conv,
+                epoch,
+                payload,
+                frank,
+                file,
+                cid,
+            } => {
+                let enc = Enc {
+                    epoch,
+                    payload,
+                    frank,
+                    file,
+                    cid,
+                };
+                self.enc(uid, reply, conv, enc).await
+            }
             _ => Err(not_supported()),
         }
     }
@@ -500,6 +520,122 @@ impl Inner {
         }
     }
 
+    /// ENC (12.8).
+    async fn enc(&self, uid: &Uid, reply: &Reply, conv: Conv, enc: Enc) -> Outcome {
+        let key = self.device_key(uid, reply.handle.id())?;
+        let room = match conv {
+            Conv::Room(room) => room,
+            // Step 5: direct conversations.
+            Conv::Uid(_) => return Err(not_supported()),
+        };
+        let mut guard = self.lock_room(&room).await?;
+        let st = &mut *guard;
+        // A message that was already sent gets its seq again (7.6), before
+        // any other check, as for MSG.
+        let now = self.now();
+        if let Some(cid) = &enc.cid {
+            let (conv, from, cid) = (st.key, uid.clone(), cid.clone());
+            if let Some(seq) = self.db(move |s| s.cid_seq(conv, &from, &cid, now)).await? {
+                return Ok(Some(OkResponse::new().with_seq(seq)));
+            }
+        }
+        let member = st.is_member(uid);
+        let info = room_of(st)?;
+        check_read(info, self.asker(uid, member))?;
+        if !member {
+            return Err(forbidden("join the room first"));
+        }
+        let Some(group) = st.group else {
+            return Err(forbidden("the room is not encrypted"));
+        };
+        // Plain members of a room with `send mods` may send ENC too, since
+        // a reaction looks like any other: their devices enforce the
+        // setting (6.2, 12.8, PLAN.md 5, item 38).
+        let gone: Vec<Uid> = {
+            let conv = st.key;
+            self.db(move |s| s.leaf_uids(conv))
+                .await?
+                .into_iter()
+                .filter(|leaf| !st.is_member(leaf) && !info.invites.contains(leaf))
+                .collect()
+        };
+        self.check_enc(st, uid, &key, group, &enc, !gone.is_empty())
+            .await?;
+        self.append_enc(st, uid, enc).await
+    }
+
+    /// The checks of ENC that every conversation has (12.8): the epoch, no
+    /// leaf that must go (`removed` for what the conversation knows, and
+    /// the keys known to have left their key files), the sender's leaf,
+    /// the payload and the `frank` tag.
+    async fn check_enc(
+        &self,
+        st: &ConvState,
+        uid: &Uid,
+        key: &PublicKey,
+        group: GroupMeta,
+        enc: &Enc,
+        removed: bool,
+    ) -> Result<(), Fail> {
+        if enc.epoch != group.epoch {
+            return Err(stale(&format!("the group is in epoch {}", group.epoch)));
+        }
+        let conv = st.key;
+        let (who, k) = (uid.clone(), key.clone());
+        let (removed_key, has_leaf) = self
+            .db(move |s| Ok((s.has_removed_leaf(conv)?, s.has_leaf(conv, &who, &k)?)))
+            .await?;
+        if removed || removed_key {
+            return Err(stale(
+                "the group has a leaf that must be removed; commit its removal first",
+            ));
+        }
+        if !has_leaf {
+            return Err(forbidden("this device has no leaf in the group"));
+        }
+        if !enc.payload.is_long_enough() {
+            return Err(fail(
+                ErrorCode::Invalid,
+                "a payload is at least 48 bytes, the salt and the tag",
+            ));
+        }
+        if enc.frank.is_none() {
+            return Err(fail(ErrorCode::Invalid, "ENC needs the frank tag"));
+        }
+        // M8: files.
+        if enc.file.is_some() {
+            return Err(not_supported());
+        }
+        Ok(())
+    }
+
+    /// Appends an ENC event that passed its checks, sends it and replies
+    /// (12.8).
+    async fn append_enc(&self, st: &mut ConvState, uid: &Uid, enc: Enc) -> Outcome {
+        let event = NewEvent {
+            t: self.now(),
+            from: uid.clone(),
+            kind: EventKind::Enc {
+                epoch: enc.epoch,
+                payload: Some(enc.payload),
+                frank: enc.frank,
+                file: None,
+            },
+            cid: enc.cid,
+        };
+        let (appended, event) = self.append(st, event).await?;
+        match appended {
+            Appended::New(seq) => {
+                Self::broadcast_event(st, &event);
+                self.typing_ended(uid, &st.id);
+                Ok(Some(OkResponse::new().with_seq(seq)))
+            }
+            // Another connection of the same identity sent the same cid
+            // between the check and now.
+            Appended::Duplicate(seq) => Ok(Some(OkResponse::new().with_seq(seq))),
+        }
+    }
+
     /// GROUPINFO (12.5).
     async fn group_info(&self, uid: &Uid, reply: &Reply, conv: Conv) -> Outcome {
         let room = match conv {
@@ -539,6 +675,15 @@ impl Inner {
         });
         Ok(Some(OkResponse::new()))
     }
+}
+
+/// What ENC sends (12.8).
+struct Enc {
+    epoch: u64,
+    payload: Ciphertext,
+    frank: Option<Frank>,
+    file: Option<FileUrl>,
+    cid: Option<Cid>,
 }
 
 /// The SET events of an owner's GroupContextExtensions (12.5): one for

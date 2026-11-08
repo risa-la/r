@@ -380,7 +380,8 @@ impl Inner {
             }
             command @ (Command::Init { .. }
             | Command::Commit { .. }
-            | Command::GroupInfo { .. }) => self.encrypted(uid, reply, command).await,
+            | Command::GroupInfo { .. }
+            | Command::Enc { .. }) => self.encrypted(uid, reply, command).await,
             // Later milestones, including `HISTORY only=commit` and the
             // rest of Section 12.
             _ => Err(not_supported()),

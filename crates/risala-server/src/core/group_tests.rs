@@ -788,3 +788,246 @@ async fn devices_join_by_external_commit() {
         ["ERR not-found no such room"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// ENC (12.8)
+
+impl Device {
+    /// An ENC line with `content`, encrypted under `group`'s current
+    /// history key.
+    pub(super) fn enc(&self, conv: &str, group: &MlsGroup, content: &str) -> String {
+        let (payload, frank) = self.encrypt(group, content);
+        format!(
+            "@frank={frank} enc {conv} {} {payload}",
+            group.epoch().as_u64()
+        )
+    }
+
+    pub(super) fn encrypt(&self, group: &MlsGroup, content: &str) -> (mls::Ciphertext, mls::Frank) {
+        let key = risala_mls::HistoryKey::of_group(group, self.provider.crypto()).unwrap();
+        let sent = risala_mls::encrypt(
+            &self.signer(),
+            &key,
+            group.group_id().as_slice(),
+            group.epoch().as_u64(),
+            content.as_bytes(),
+        )
+        .unwrap();
+        (sent.payload, sent.frank)
+    }
+
+    /// The content of an ENC event line, decrypted with `group`'s current
+    /// history key, from a sender who has a leaf.
+    pub(super) fn read(&self, group: &MlsGroup, line: &str) -> String {
+        let event: risala_proto::server::ServerMessage = line.parse().unwrap();
+        let risala_proto::server::ServerLine::Event(event) = event.line else {
+            panic!("not an event: {line}");
+        };
+        let risala_proto::server::EventBody::Enc(enc) = &event.body else {
+            panic!("not ENC: {line}");
+        };
+        let key = risala_mls::HistoryKey::of_group(group, self.provider.crypto()).unwrap();
+        let unverified = risala_mls::decrypt(
+            &key,
+            group.group_id().as_slice(),
+            enc.epoch,
+            enc.payload.as_ref().unwrap(),
+            enc.frank.as_ref().unwrap(),
+        )
+        .unwrap();
+        let leaves: Vec<PublicKey> = group
+            .members()
+            .map(|m| risala_mls::signer::signature_key(&m.signature_key).unwrap())
+            .collect();
+        let sender = unverified.find_sender(&leaves).unwrap().clone();
+        String::from_utf8(unverified.verify(&sender).unwrap().content).unwrap()
+    }
+}
+
+/// An encrypted room `#r` of alice's device 1, which bob's device 5 has
+/// joined, both in epoch 1.
+struct Pair {
+    a1: Device,
+    c1: Client,
+    ga1: MlsGroup,
+    b5: Device,
+    cb: Client,
+    gb5: MlsGroup,
+}
+
+async fn pair(w: &mut World, send: SendMode) -> Pair {
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let (_, mut ga1) = encrypted_room(w, &a1, &mut c1, HistoryMode::Shared, send).await;
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b5.kp()],
+            ..Changes::default()
+        },
+    );
+    w.ask(&mut c1, &sent.line("#r")).await;
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    let gb5 = b5.join(find(&cb.lines(), "WELCOME"));
+    w.ask(&mut cb, "join #r").await;
+    c1.lines();
+    Pair {
+        a1,
+        c1,
+        ga1,
+        b5,
+        cb,
+        gb5,
+    }
+}
+
+#[tokio::test]
+async fn enc_sends_to_the_room() {
+    let mut w = World::new();
+    let Pair {
+        a1,
+        mut c1,
+        ga1,
+        b5,
+        mut cb,
+        gb5,
+    } = pair(&mut w, SendMode::Mods).await;
+
+    let line = a1.enc("#r", &ga1, "TEXT hello\n");
+    let lines = w
+        .ask(&mut c1, &format!("@cid=q2r8sv0alm3nb7xk;{}", &line[1..]))
+        .await;
+    assert_eq!(lines.last().unwrap(), "OK seq=10");
+    let event = find(&cb.lines(), "ENC #r 1 ").to_owned();
+    assert!(event.contains(";from=alice@example.org;frank="), "{event}");
+    assert_eq!(b5.read(&gb5, &event), "TEXT hello\n");
+    // Sent again with its cid: the same seq, and nothing new.
+    let again = w
+        .ask(&mut c1, &format!("@cid=q2r8sv0alm3nb7xk;{}", &line[1..]))
+        .await;
+    assert_eq!(again, ["OK seq=10"]);
+    assert!(cb.lines().is_empty());
+    // A plain member of a room with `send mods` may send ENC (12.8).
+    let lines = w
+        .ask(&mut cb, &b5.enc("#r", &gb5, "@react=10 TEXT 👍\n"))
+        .await;
+    assert_eq!(lines.last().unwrap(), "OK seq=11");
+    assert_eq!(
+        a1.read(&ga1, find(&c1.lines(), "ENC")),
+        "@react=10 TEXT 👍\n"
+    );
+
+    // The payload and the `frank` tag.
+    let (payload, frank) = a1.encrypt(&ga1, "TEXT hi\n");
+    for (line, error) in [
+        (
+            format!("enc #r 1 {payload}"),
+            "ERR invalid ENC needs the frank tag",
+        ),
+        (
+            format!(
+                "@frank={frank} enc #r 1 {}",
+                mls::Ciphertext::from_bytes(&[1; 47]).unwrap()
+            ),
+            "ERR invalid a payload is at least 48 bytes, the salt and the tag",
+        ),
+        (
+            format!("@frank={frank} enc #r 0 {payload}"),
+            "ERR stale the group is in epoch 1",
+        ),
+    ] {
+        assert_eq!(w.ask(&mut c1, &line).await, [error], "{line}");
+    }
+    // A device of a member with no leaf.
+    let a2 = Device::new(ALICE, 2);
+    let mut c2 = w.connect(&a2);
+    assert_eq!(
+        w.ask(&mut c2, &format!("@frank={frank} enc #r 1 {payload}"))
+            .await,
+        ["ERR forbidden this device has no leaf in the group"]
+    );
+    // HISTORY returns it; DELETE leaves a placeholder without `frank`.
+    let lines = w.ask(&mut c1, "delete #r 10").await;
+    assert_eq!(lines.last().unwrap(), "OK seq=12");
+    let lines = w.ask(&mut c1, "history #r after=9 limit=2").await;
+    assert!(lines[0].ends_with(";deleted ENC #r 1"), "{}", &lines[0]);
+    assert!(!lines[0].contains("frank="));
+    assert!(lines[1].contains(";frank=") && untagged(&lines[1]).starts_with("ENC #r 1 "));
+    // In a room that is not encrypted.
+    w.ask(&mut c1, "join #plain").await;
+    assert_eq!(
+        w.ask(&mut c1, &format!("@frank={frank} enc #plain 1 {payload}"))
+            .await,
+        ["ERR forbidden the room is not encrypted"]
+    );
+}
+
+#[tokio::test]
+async fn enc_waits_for_leaves_that_must_go() {
+    let mut w = World::new();
+    let Pair {
+        a1,
+        mut c1,
+        mut ga1,
+        b5,
+        mut cb,
+        ..
+    } = pair(&mut w, SendMode::All).await;
+
+    // Bob leaves: his leaf must go before anyone sends (12.6).
+    w.ask(&mut cb, "part #r").await;
+    c1.lines();
+    assert_eq!(
+        w.ask(&mut c1, &a1.enc("#r", &ga1, "TEXT hi\n")).await,
+        ["ERR stale the group has a leaf that must be removed; commit its removal first"]
+    );
+    let bob_leaf = Device::leaf(&ga1, &b5.secret.public_key());
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            remove: vec![bob_leaf],
+            ..Changes::default()
+        },
+    );
+    w.ask(&mut c1, &sent.line("#r")).await;
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    assert!(w.ask(&mut c1, &a1.enc("#r", &ga1, "TEXT hi\n")).await[1].starts_with("OK seq="));
+
+    // A key that left alice's key file: her device 3's leaf.
+    let a3 = Device::new(ALICE, 3);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![a3.kp()],
+            ..Changes::default()
+        },
+    );
+    w.ask(&mut c1, &sent.line("#r")).await;
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    let lines = w.ask(&mut c1, &format!("key del {}", key(3))).await;
+    assert_eq!(lines.last().unwrap(), "OK");
+    assert_eq!(
+        w.ask(&mut c1, &a1.enc("#r", &ga1, "TEXT hi\n")).await,
+        ["ERR stale the group has a leaf that must be removed; commit its removal first"]
+    );
+    // Removing it needs no other reason.
+    let leaf = Device::leaf(&ga1, &key(3));
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            remove: vec![leaf],
+            ..Changes::default()
+        },
+    );
+    assert!(
+        w.ask(&mut c1, &sent.line("#r"))
+            .await
+            .last()
+            .unwrap()
+            .starts_with("OK seq=")
+    );
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    assert!(w.ask(&mut c1, &a1.enc("#r", &ga1, "TEXT hi\n")).await[1].starts_with("OK seq="));
+}

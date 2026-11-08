@@ -258,7 +258,7 @@ impl Inner {
     /// A message from `uid` ends its typing notification in the
     /// conversation `id` (8.1), on every device: the next TYPING from any of
     /// them is passed on at once, not held back by the rate limit.
-    fn typing_ended(&self, uid: &Uid, id: &Id) {
+    pub(super) fn typing_ended(&self, uid: &Uid, id: &Id) {
         // The registry and the user's entry are never locked together here,
         // so no lock order is imposed.
         let Some(user) = self.reg().users.get(uid).cloned() else {
@@ -299,11 +299,11 @@ impl Inner {
             return Err(no_message());
         }
         let key = st.key;
-        // M5a: ENC events too.
+        // MSG and ENC events (5.4).
         let event = self
             .db(move |s| s.event(key, target))
             .await?
-            .filter(|e| matches!(e.kind, EventKind::Msg { .. }));
+            .filter(|e| matches!(e.kind, EventKind::Msg { .. } | EventKind::Enc { .. }));
         // Authors may delete their own messages even where they can no
         // longer read, so this comes before the reading rules (5.4).
         let own = event.as_ref().is_some_and(|e| self.is_author(uid, key, e));
