@@ -18,7 +18,7 @@ use gets `ERR not-authenticated` if it is new, and
 | `UNREGISTER <uid>` | 4.9 | | | | ✓ |
 | `CREATE <box> <group-id> <token-hash> [epoch=]` | 5.2, 7.8 | | ✓ | ✓ | |
 | `CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>` | 5.2 | | | | ✓ |
-| `POST <box> <token> <message> [live=] [groupinfo=]` | 5.2 | | ✓ | ✓ | |
+| `POST <box> <token> <message> [live=] [groupinfo=] [next=]` | 5.2 | | ✓ | ✓ | public rooms' PublicMessages (12.6) |
 | `UPLOAD <box> <token> <size>` | 5.6 | | ✓ | | |
 | `REPORT <box> <report>` | 5.8 | | ✓ | ✓ | ✓ |
 | `LIST [after=] [limit=]` | 6.1 | | ✓ | ✓ | ✓ |
@@ -35,7 +35,7 @@ use gets `ERR not-authenticated` if it is new, and
 | `KEYPKG GET <uid>` | 12.5 | | ✓ | ✓ | ✓ |
 | `WELCOME PUT <ref> <welcome>` / `WELCOME GET <ref> [light=]` | 12.8 | | ✓ | ✓ | ✓ |
 | `WELCOME LIST` / `WELCOME DEL <id>` | 12.8 | | | | ✓ |
-| `BLOB <hash> <size> [box=] [token=]` | 12.12 | | ✓ | ✓ | ✓ |
+| `BLOB <hash> <size> [box= token=]` | 12.12 | | ✓ | ✓ | ✓ |
 | `BACKUP PUT <generation> <hash> <key> [files=]` / `BACKUP GET` / `BACKUP DEL` | 12.13 | | | | ✓ |
 | `ADMIN OPS` / `OP <uid>` / `DEOP <uid>` | 10.1 | | | | ✓ |
 | `ADMIN BAN <target> [<reason...>]` / `UNBAN <target>` / `BANS` | 10.2 | | | | ✓ |
@@ -53,7 +53,7 @@ Lines a server can send:
 |---|---|---|
 | `RISALA <version> <host> <nonce> [<message...>]` | greeting | 4.1 |
 | `OK [<key>=<value> ...]` / `ERR <code> [<message...>]` | final response | 3.6 |
-| `POST <box> <message>` | a post, live or in response to FETCH | 5.2, 7.1 |
+| `POST <box> <message> [next=<hash>]` | a post, live or in response to FETCH | 5.2, 7.1 |
 | `ROOM <room> <box> <members> [<topic...>]` | response to LIST and ADMIN ROOMS | 6.1, 10.4 |
 | `GROUPINFO <box> <epoch> <seq> <groupinfo> <tree>` | response to GROUPINFO | 6.1 |
 | `GONE <box> <uid>` | a guest's session ended | 6.1 |

@@ -22,7 +22,8 @@
 - **TLS key exchange:** X25519MLKEM768, value `0x11EC` [ECDHE-MLKEM].
 - **MLS extension types,** from the range for private use:
   - `0xF2A1`, the conversation extension, in the group context (12.4);
-  - `0xF2A2`, the device binding, in KeyPackages and leaf nodes (12.3);
+  - `0xF2A2`, the device binding, in the leaf node of a KeyPackage
+    uploaded with KEYPKG ADD (12.3);
   - `0xF2A3`, the profile, in leaf nodes (12.3).
 - **MLS proposal type:** `self_remove` [MLS-EXT], whose value is not yet
   assigned by IANA; [MLS-EXT] suggests `0x000A`.
@@ -46,7 +47,8 @@
   - the HKDF info strings `risala/1 identity ` and `risala/1 backup `
     followed by the uid (4.8, 12.13), `risala/1 pair new id`,
     `risala/1 pair new key`, `risala/1 pair old id` and
-    `risala/1 pair old key` (4.8), and `risala/1 confirm` (12.10);
+    `risala/1 pair old key` (4.8), `risala/1 confirm` and
+    `risala/1 period seed` (12.10);
   - the associated data `risala/1 pair` (4.8), `risala/1 file` and
     `risala/1 archive` (12.11, 12.13), and the prefix
     `risala/1 backup ` (12.13);

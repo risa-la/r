@@ -94,4 +94,8 @@
   this document.
 - [XWING] Connolly, D., Schwabe, P., and B. Westerbaan, "X-Wing: general-
   purpose hybrid post-quantum KEM", Internet-Draft
-  draft-connolly-cfrg-xwing-kem-06, work in progress.
+  draft-connolly-cfrg-xwing-kem-06, work in progress. Risala uses the
+  version of X-Wing that [MLS-PQ] cites for the suite `0x0020`. Newer
+  drafts of X-Wing exist; implementations pin one with the seed
+  expansion vector of Appendix B, and a different version takes a new
+  version of this document.

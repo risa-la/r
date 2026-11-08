@@ -151,7 +151,12 @@ made by an implementation of this document, which does not exist yet:
   pairing secret, a signed NewDevice and its encryption, and a
   SealedBundle from a fixed X-Wing seed and encapsulation randomness
   (4.8)
-- the send token export and its hash (7.2)
+- an X-Wing key pair expanded from a fixed 32-byte seed, as used for
+  leaf keys and attestation keys (12.2)
+- a chain of period key seeds, and the period key derived from one
+  (12.10)
+- the send token export and its hash, and a commit's POST with its
+  `next` (7.2, 12.6)
 - the group id, epoch, content type and RisalaAAD that a server reads
   from a PrivateMessage and from a PublicMessage (5.2)
 - an RFC 8291 push body and the `NOTIFY` line inside it (9.3)
@@ -184,6 +189,9 @@ can show that they reject them:
   that is not zero, a plain text longer than Padmé of 8 plus its length,
   and a length larger than the plain text (12.11)
 - a franking tag that does not match (12.9)
+- a commit whose `next` is not the hash of the new epoch's send token,
+  a KeyPackage whose lifetime does not cover the commit's `t`, and a
+  DeviceBinding whose `device_id` is not its credential's (12.3, 12.7)
 - a wrapped backup key unwrapped with the wrong generation, uid or
   blob-ref (12.13)
 - a split archive whose later part has a `more` of its own (12.13)
