@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use common::command;
 use risala_proto::mls::{BackupBlob, KeyPackage};
-use risala_server::store::{E2eeStore as _, NewKeyPackage, SqliteStore};
+use risala_server::store::{
+    DirectInit, E2eeStore as _, GroupLeaf, GroupMeta, GroupParts, GroupRecord, GroupStore as _,
+    NewKeyPackage, SqliteStore,
+};
 use risala_server::testing::{TestIdentity, TestServer};
 
 /// A server that hosts `example.org`, with registration open, and lets
@@ -119,6 +122,36 @@ async fn a_deleted_key_takes_its_key_packages() {
     server.stop().await;
 }
 
+/// Starts `who`'s conversation with itself in the store, with a group in
+/// epoch `epoch` that is not MLS: BACKUP ADD checks only that the
+/// identity is in it, and its epoch (12.10). Returns its id.
+fn own_conversation(server: &TestServer, who: &TestIdentity, epoch: u64) -> String {
+    let store = SqliteStore::open(&server.config().database_path()).unwrap();
+    let record = GroupRecord {
+        group_id: vec![1; 32],
+        meta: GroupMeta { epoch, seq: None },
+        group_info: risala_proto::mls::GroupInfo::from_bytes(&[1; 9]).unwrap(),
+        parts: GroupParts {
+            tree: vec![1],
+            context: vec![2],
+            interim_hash: vec![3],
+            confirmation_tag: vec![4],
+        },
+    };
+    let leaf = GroupLeaf {
+        index: 0,
+        uid: who.uid(),
+        key: who.public_key(),
+    };
+    match store
+        .init_direct(&who.uid(), &who.uid(), &record, &[leaf], server.now())
+        .unwrap()
+    {
+        DirectInit::Done(direct) => direct.id.to_string(),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Backups belong to the identity, so a new device reads what another
 /// stored, a page at a time (12.10).
 #[tokio::test]
@@ -126,6 +159,7 @@ async fn backups_over_the_wire() {
     let server = server().await;
     let (alice, mut laptop) = server.register("alice").await;
     let phone = server.new_device(&alice).await;
+    let id = own_conversation(&server, &alice, 2);
     let blob = |epoch: u8| {
         let mut b = [epoch; 84];
         b[..8].copy_from_slice(&[1; 8]);
@@ -134,29 +168,29 @@ async fn backups_over_the_wire() {
     for epoch in 0..3u8 {
         let lines = command(
             &mut laptop,
-            &format!("backup add d7hq2klm {epoch} {}", blob(epoch)),
+            &format!("backup add {id} {epoch} {}", blob(epoch)),
         )
         .await;
         assert_eq!(lines, ["OK"]);
     }
     let mut phone_conn = server.sign_in(&phone).await;
-    let lines = command(&mut phone_conn, "backup get d7hq2klm limit=2").await;
+    let lines = command(&mut phone_conn, &format!("backup get {id} limit=2")).await;
     assert_eq!(
         lines,
         [
-            format!("BACKUP d7hq2klm 0 {}", blob(0)),
-            format!("BACKUP d7hq2klm 1 {}", blob(1)),
+            format!("BACKUP {id} 0 {}", blob(0)),
+            format!("BACKUP {id} 1 {}", blob(1)),
             "OK more=1".into()
         ]
     );
-    let lines = command(&mut phone_conn, "backup get d7hq2klm after=1 limit=2").await;
+    let lines = command(&mut phone_conn, &format!("backup get {id} after=1 limit=2")).await;
     assert_eq!(
         lines,
-        [format!("BACKUP d7hq2klm 2 {}", blob(2)), "OK more=0".into()]
+        [format!("BACKUP {id} 2 {}", blob(2)), "OK more=0".into()]
     );
     assert_eq!(command(&mut phone_conn, "backup del").await, ["OK"]);
     assert_eq!(
-        command(&mut laptop, "backup get d7hq2klm").await,
+        command(&mut laptop, &format!("backup get {id}")).await,
         ["OK more=0"]
     );
     // No Welcomes are pending for a device nobody added.

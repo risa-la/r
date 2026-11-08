@@ -42,8 +42,8 @@ use risala_proto::types::{
 
 pub use admin::{AdminStore, ServerBan};
 pub use e2ee::{
-    BackupAdded, BackupPage, E2eeStore, KeyPackageAdded, KeyPackageCount, NewKeyPackage,
-    PendingWelcome,
+    BackupAdded, BackupCheck, BackupPage, E2eeStore, KeyPackageAdded, KeyPackageCount,
+    NewKeyPackage, PendingWelcome,
 };
 pub use groups::{
     CommitStored, DirectInit, DirectRecord, GroupCommit, GroupInit, GroupLeaf, GroupMeta,

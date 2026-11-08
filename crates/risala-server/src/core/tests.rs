@@ -2402,6 +2402,14 @@ impl crate::store::E2eeStore for Flaky {
     fn relist_keys(&self, u: &Uid, k: &[PublicKey]) -> crate::store::Result<()> {
         self.inner.relist_keys(u, k)
     }
+    fn may_back_up(
+        &self,
+        u: &Uid,
+        c: &risala_proto::names::Id,
+        e: u64,
+    ) -> crate::store::Result<crate::store::BackupCheck> {
+        self.inner.may_back_up(u, c, e)
+    }
     fn add_backup(
         &self,
         u: &Uid,

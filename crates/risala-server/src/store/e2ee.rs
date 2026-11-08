@@ -86,6 +86,19 @@ pub enum BackupAdded {
     Full,
 }
 
+/// The result of [`E2eeStore::may_back_up`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupCheck {
+    /// The identity may store a blob for that epoch.
+    Allowed,
+    /// There is no such conversation, or the identity is not in it and
+    /// has never been in it.
+    NotIn,
+    /// The conversation has no group, or its group is in an earlier
+    /// epoch.
+    LaterEpoch,
+}
+
 /// A page of backup blobs (12.10), oldest epoch first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupPage {
@@ -199,6 +212,17 @@ pub trait E2eeStore {
     fn relist_keys(&self, uid: &Uid, keys: &[PublicKey]) -> Result<()>;
 
     // ---- Backups (12.10) ----
+
+    /// Whether the identity `uid` may store a blob of epoch `epoch` of the
+    /// conversation with id `conv_id` (12.10): only if it is in the
+    /// conversation or has been, and the group has reached the epoch.
+    ///
+    /// An identity has been in a direct conversation if it is one of the
+    /// pair, and in a room if it is a member or invited, has a leaf in
+    /// the group or blobs of the room already, or the room's events show
+    /// that it joined or was invited. Events that expired (10.6) no longer
+    /// show it.
+    fn may_back_up(&self, uid: &Uid, conv_id: &Id, epoch: u64) -> Result<BackupCheck>;
 
     /// Stores the blob of epoch `epoch` of the conversation with id
     /// `conv_id` for the identity `uid` (12.10). If the epoch has a blob

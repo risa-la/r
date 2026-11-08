@@ -9,8 +9,8 @@ use risala_proto::time::Timestamp;
 
 use super::{SqliteStore, corrupt, ms, parse, seq, sql_seq};
 use crate::store::{
-    BackupAdded, BackupPage, ConvKey, E2eeStore, KeyPackageAdded, KeyPackageCount, NewKeyPackage,
-    PendingWelcome, Result, StoreError, random_id,
+    BackupAdded, BackupCheck, BackupPage, ConvKey, E2eeStore, KeyPackageAdded, KeyPackageCount,
+    NewKeyPackage, PendingWelcome, Result, StoreError, random_id,
 };
 
 /// An epoch as SQLite stores it. Epochs from commands are at most 2^63-1
@@ -371,6 +371,53 @@ impl E2eeStore for SqliteStore {
                 delete.execute(params![uid.as_str(), key.to_string()])?;
             }
             Ok(())
+        })
+    }
+
+    fn may_back_up(&self, uid: &Uid, conv_id: &Id, epoch: u64) -> Result<BackupCheck> {
+        let conn = self.conn();
+        let found = conn
+            .prepare_cached(
+                "SELECT c.conv, c.kind = 'direct' AND ?2 IN (c.uid_a, c.uid_b), g.epoch \
+                 FROM conversations c LEFT JOIN groups g ON g.conv = c.conv WHERE c.id = ?1",
+            )?
+            .query_row(params![conv_id.as_str(), uid.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((conv, participant, current)) = found else {
+            return Ok(BackupCheck::NotIn);
+        };
+        // The cheap checks first: the events of a room come last.
+        let been_in = participant
+            || conn
+                .prepare_cached(
+                    "SELECT EXISTS (SELECT 1 FROM members WHERE conv = ?1 AND uid = ?2) \
+                     OR EXISTS (SELECT 1 FROM invites WHERE conv = ?1 AND uid = ?2) \
+                     OR EXISTS (SELECT 1 FROM group_leaves WHERE conv = ?1 AND uid = ?2) \
+                     OR EXISTS (SELECT 1 FROM backups WHERE uid = ?2 AND conv_id = ?3) \
+                     OR EXISTS (SELECT 1 FROM events WHERE conv = ?1 \
+                         AND ((verb = 'JOIN' AND author = ?2) \
+                              OR (verb = 'INVITE' AND subject = ?2)))",
+                )?
+                .query_row(params![conv, uid.as_str(), conv_id.as_str()], |row| {
+                    row.get::<_, bool>(0)
+                })?;
+        if !been_in {
+            return Ok(BackupCheck::NotIn);
+        }
+        let later = match (current, i64::try_from(epoch)) {
+            (Some(current), Ok(epoch)) => epoch > current,
+            _ => true,
+        };
+        Ok(if later {
+            BackupCheck::LaterEpoch
+        } else {
+            BackupCheck::Allowed
         })
     }
 

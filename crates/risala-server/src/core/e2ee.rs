@@ -53,7 +53,16 @@
 //! 12.10 would let it: the identity may still read the conversation's
 //! history, and keeping them needs no bookkeeping. An epoch keeps at most
 //! [`MAX_BACKUP_KEYS_PER_EPOCH`] blobs, one per key id, so that a page,
-//! which always holds every blob of an epoch, stays small.
+//! which always holds every blob of an epoch, stays small. BACKUP ADD is
+//! refused for a conversation the identity has never been in, or an epoch
+//! its group has not reached (12.10; see
+//! [`E2eeStore::may_back_up`](crate::store::E2eeStore::may_back_up)), so
+//! that nobody stores blobs for anything else.
+//!
+//! KEYPKG ADD refuses KeyPackages larger than
+//! [`Limits::max_key_package_bytes`](crate::config::Limits::max_key_package_bytes)
+//! (12.4). ENC and COMMIT have no byte budget yet beyond the line limit:
+//! that comes with the rate limits of M10.
 
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -73,7 +82,9 @@ use super::keys::FetchError;
 use super::state::ConvState;
 use super::{Hub, Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::{ConnId, OutLine};
-use crate::store::{BackupAdded, KeyPackageAdded, NewKeyPackage, NewWelcome, StoreError};
+use crate::store::{
+    BackupAdded, BackupCheck, KeyPackageAdded, NewKeyPackage, NewWelcome, StoreError,
+};
 
 /// The window of `limits.key_package_gets_per_hour` (12.4).
 pub(super) const KEYPKG_GET_WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -483,6 +494,24 @@ impl Inner {
 
     /// BACKUP ADD (12.10).
     async fn backup_add(&self, uid: &Uid, id: Id, epoch: u64, blob: BackupBlob) -> Outcome {
+        // Checked before storing: an identity that has been in a
+        // conversation stays so, and a group's epoch only grows.
+        let (who, conv) = (uid.clone(), id.clone());
+        match self.db(move |s| s.may_back_up(&who, &conv, epoch)).await? {
+            BackupCheck::Allowed => {}
+            BackupCheck::NotIn => {
+                return Err(fail(
+                    ErrorCode::Forbidden,
+                    "you have never been in that conversation",
+                ));
+            }
+            BackupCheck::LaterEpoch => {
+                return Err(fail(
+                    ErrorCode::Forbidden,
+                    "the conversation's group has not reached that epoch",
+                ));
+            }
+        }
         let who = uid.clone();
         let added = self
             .db(move |s| s.add_backup(&who, &id, epoch, &blob, MAX_BACKUP_KEYS_PER_EPOCH))

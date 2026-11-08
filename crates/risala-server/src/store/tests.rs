@@ -1322,6 +1322,57 @@ fn commit_event(from: &str, epoch: u64) -> NewEvent {
 }
 
 #[test]
+fn backups_are_for_conversations_the_identity_has_been_in() {
+    use crate::store::BackupCheck::{Allowed, LaterEpoch, NotIn};
+    let store = SqliteStore::open_in_memory().unwrap();
+    let Created::New(r) = store
+        .create_room(&room("#r"), &uid("a@x.org"), t(0))
+        .unwrap()
+    else {
+        panic!("not created");
+    };
+    let id = r.id.clone();
+    // Before the room has a group, there is no epoch to back up.
+    assert_eq!(
+        store.may_back_up(&uid("a@x.org"), &id, 0).unwrap(),
+        LaterEpoch
+    );
+    // b joins and leaves, c is invited, and INIT ends c's invitation.
+    store
+        .append(r.key, &event("b@x.org", EventKind::Join))
+        .unwrap();
+    let part = EventKind::Part {
+        reason: String::new(),
+    };
+    store.append(r.key, &event("b@x.org", part)).unwrap();
+    let invite = EventKind::Invite {
+        uid: uid("c@x.org"),
+    };
+    store.append(r.key, &event("a@x.org", invite)).unwrap();
+    store
+        .init_group(r.key, &group(1, 2, 10), &[leaf(0, "a@x.org", 1)], &[], true)
+        .unwrap();
+    for who in ["a@x.org", "b@x.org", "c@x.org"] {
+        assert_eq!(
+            store.may_back_up(&uid(who), &id, 2).unwrap(),
+            Allowed,
+            "{who}"
+        );
+        assert_eq!(
+            store.may_back_up(&uid(who), &id, 3).unwrap(),
+            LaterEpoch,
+            "{who}"
+        );
+    }
+    assert_eq!(store.may_back_up(&uid("d@x.org"), &id, 0).unwrap(), NotIn);
+    let unknown: Id = "k3f9q2".parse().unwrap();
+    assert_eq!(
+        store.may_back_up(&uid("a@x.org"), &unknown, 0).unwrap(),
+        NotIn
+    );
+}
+
+#[test]
 fn groups_are_stored_with_their_events() {
     let store = SqliteStore::open_in_memory().unwrap();
     let general = room("#general");

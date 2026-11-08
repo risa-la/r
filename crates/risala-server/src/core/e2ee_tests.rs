@@ -14,7 +14,7 @@ use risala_proto::names::{Identity, Room, Seq, Uid};
 
 use super::tests::{Client, Harness, config, start, timers};
 use super::*;
-use crate::store::{NewKeyPackage, SqliteStore};
+use crate::store::{GroupStore as _, NewKeyPackage, SqliteStore};
 
 /// Hosted here.
 const ALICE: &str = "alice@example.org";
@@ -51,10 +51,57 @@ fn kp_line(who: &str, n: u8) -> String {
 
 /// A hub that hosts `example.org`, where alice is registered with keys 1,
 /// 2 and 3, and bob of `example.net` has signed in before. Bob's key file
-/// lists keys 5 and 6.
+/// lists keys 5 and 6. Alice and Bob have a direct conversation whose
+/// group is in epoch 7, and Alice one with herself in epoch 3.
 struct World {
     h: Harness,
     fetcher: Arc<MemoryFetcher>,
+    /// The id of Alice and Bob's conversation.
+    direct: String,
+    /// The id of Alice's conversation with herself.
+    own: String,
+}
+
+/// A group of `who` as the store keeps it, in epoch `epoch`, without
+/// MLS: these tests do not read it.
+fn fake_group(
+    id: u8,
+    epoch: u64,
+    who: &[(&str, u8)],
+) -> (crate::store::GroupRecord, Vec<crate::store::GroupLeaf>) {
+    let record = crate::store::GroupRecord {
+        group_id: vec![id; 32],
+        meta: crate::store::GroupMeta { epoch, seq: None },
+        group_info: risala_proto::mls::GroupInfo::from_bytes(&[id; 9]).unwrap(),
+        parts: crate::store::GroupParts {
+            tree: vec![id, 1],
+            context: vec![id, 2],
+            interim_hash: vec![id, 3],
+            confirmation_tag: vec![id, 4],
+        },
+    };
+    let leaves = who
+        .iter()
+        .zip(0..)
+        .map(|((w, n), index)| crate::store::GroupLeaf {
+            index,
+            uid: uid(w),
+            key: key(*n),
+        })
+        .collect();
+    (record, leaves)
+}
+
+/// Starts the direct conversation of `a` and `b` in the store.
+fn start_direct(store: &SqliteStore, a: &str, b: &str, id: u8, epoch: u64) -> String {
+    let (record, leaves) = fake_group(id, epoch, &[(a, 1)]);
+    match store
+        .init_direct(&uid(a), &uid(b), &record, &leaves, start())
+        .unwrap()
+    {
+        crate::store::DirectInit::Done(direct) => direct.id.to_string(),
+        other => panic!("{other:?}"),
+    }
 }
 
 impl World {
@@ -77,6 +124,8 @@ impl World {
                 .unwrap();
         }
         store.touch_identity(&uid(BOB), start()).unwrap();
+        let direct = start_direct(&store, ALICE, BOB, 1, 7);
+        let own = start_direct(&store, ALICE, ALICE, 2, 3);
         let store: Arc<dyn Store> = Arc::new(store);
         let fetcher = Arc::new(MemoryFetcher::new());
         fetcher.set(&identity(BOB), vec![key(5), key(6)]);
@@ -91,6 +140,8 @@ impl World {
                 next: 0,
             },
             fetcher,
+            direct,
+            own,
         }
     }
 
@@ -422,71 +473,117 @@ fn blob(key_id: u8, n: u8) -> BackupBlob {
 #[tokio::test]
 async fn backups_belong_to_the_identity() {
     let mut w = World::new();
+    let (d, own) = (w.direct.clone(), w.own.clone());
     let mut a1 = w.device(ALICE, 1);
     let mut a2 = w.device(ALICE, 2);
     let mut bob = w.device(BOB, 5);
     for (epoch, b) in [(0, blob(1, 0)), (1, blob(1, 1)), (1, blob(2, 2))] {
-        w.send(&a1, &format!("backup add k3f9q2 {epoch} {b}")).await;
+        w.send(&a1, &format!("backup add {d} {epoch} {b}")).await;
         assert_eq!(a1.lines(), ["OK"]);
     }
     // The same key id again: the first is kept.
-    w.send(&a2, &format!("backup add k3f9q2 0 {}", blob(1, 9)))
+    w.send(&a2, &format!("backup add {d} 0 {}", blob(1, 9)))
         .await;
     assert_eq!(a2.lines(), ["OK"]);
     let all = [
-        format!("BACKUP k3f9q2 0 {}", blob(1, 0)),
-        format!("BACKUP k3f9q2 1 {}", blob(1, 1)),
-        format!("BACKUP k3f9q2 1 {}", blob(2, 2)),
+        format!("BACKUP {d} 0 {}", blob(1, 0)),
+        format!("BACKUP {d} 1 {}", blob(1, 1)),
+        format!("BACKUP {d} 1 {}", blob(2, 2)),
     ];
-    w.send(&a2, "backup get k3f9q2").await;
+    w.send(&a2, &format!("backup get {d}")).await;
     assert_eq!(a2.lines(), [&all[..], &["OK more=0".into()]].concat());
-    w.send(&bob, "backup get k3f9q2").await;
+    w.send(&bob, &format!("backup get {d}")).await;
     assert_eq!(bob.lines(), ["OK more=0"]);
 
     // Pages of whole epochs.
-    w.send(&a1, "@ref=p backup get k3f9q2 limit=1").await;
+    w.send(&a1, &format!("@ref=p backup get {d} limit=1")).await;
     assert_eq!(
         a1.lines(),
         [format!("@ref=p {}", all[0]), "@ref=p OK more=1".into()]
     );
-    w.send(&a1, "backup get k3f9q2 after=0 limit=1").await;
+    w.send(&a1, &format!("backup get {d} after=0 limit=1"))
+        .await;
     assert_eq!(a1.lines(), [&all[1..], &["OK more=0".into()]].concat());
-    w.send(&a1, "backup get k3f9q2 after=1").await;
+    w.send(&a1, &format!("backup get {d} after=1")).await;
     assert_eq!(a1.lines(), ["OK more=0"]);
 
     // Delete one conversation's, then everything.
-    w.send(&a1, &format!("backup add other 3 {}", blob(1, 3)))
+    w.send(&a1, &format!("backup add {own} 3 {}", blob(1, 3)))
         .await;
-    a1.lines();
-    w.send(&bob, "backup del k3f9q2").await;
+    assert_eq!(a1.lines(), ["OK"]);
+    w.send(&bob, &format!("backup del {d}")).await;
     assert_eq!(bob.lines(), ["OK"]);
-    w.send(&a2, "backup del k3f9q2").await;
+    w.send(&a2, &format!("backup del {d}")).await;
     assert_eq!(a2.lines(), ["OK"]);
-    w.send(&a1, "backup get k3f9q2").await;
+    w.send(&a1, &format!("backup get {d}")).await;
     assert_eq!(a1.lines(), ["OK more=0"]);
-    w.send(&a1, "backup get other").await;
+    w.send(&a1, &format!("backup get {own}")).await;
     assert_eq!(a1.lines().len(), 2);
     w.send(&a1, "backup del").await;
     assert_eq!(a1.lines(), ["OK"]);
-    w.send(&a1, "backup get other").await;
+    w.send(&a1, &format!("backup get {own}")).await;
     assert_eq!(a1.lines(), ["OK more=0"]);
+}
+
+#[tokio::test]
+async fn backups_are_for_the_identitys_conversations_up_to_their_epoch() {
+    let mut w = World::new();
+    let (d, own) = (w.direct.clone(), w.own.clone());
+    let mut a1 = w.device(ALICE, 1);
+    let mut bob = w.device(BOB, 5);
+    let mut carol = w.device("carol@example.org", 9);
+    let never = "ERR forbidden you have never been in that conversation";
+    let later = "ERR forbidden the conversation's group has not reached that epoch";
+    // Up to the current epoch, and not after.
+    for (epoch, reply) in [(7, "OK"), (8, later), (1_u64 << 40, later)] {
+        w.send(&bob, &format!("backup add {d} {epoch} {}", blob(1, 0)))
+            .await;
+        assert_eq!(bob.lines(), [reply], "epoch {epoch}");
+    }
+    // Not someone else's conversation, nor one that does not exist.
+    for conv in [&d, &own, &"k3f9q2".to_owned()] {
+        w.send(&carol, &format!("backup add {conv} 0 {}", blob(1, 0)))
+            .await;
+        assert_eq!(carol.lines(), [never], "{conv}");
+    }
+    w.send(&bob, &format!("backup add {own} 0 {}", blob(1, 0)))
+        .await;
+    assert_eq!(bob.lines(), [never]);
+    // A room without a group has no epoch yet.
+    let general =
+        w.h.hub
+            .inner
+            .lock_room(&"#general".parse().unwrap())
+            .await
+            .unwrap()
+            .id
+            .to_string();
+    w.send(&a1, "join #general").await;
+    a1.lines();
+    w.send(&a1, &format!("backup add {general} 0 {}", blob(1, 0)))
+        .await;
+    assert_eq!(a1.lines(), [later]);
+    w.send(&bob, &format!("backup add {general} 0 {}", blob(1, 0)))
+        .await;
+    assert_eq!(bob.lines(), [never]);
 }
 
 #[tokio::test]
 async fn an_epoch_keeps_a_few_key_ids() {
     let mut w = World::new();
+    let d = w.direct.clone();
     let mut a1 = w.device(ALICE, 1);
     for n in 0..MAX_BACKUP_KEYS_PER_EPOCH as u8 {
-        w.send(&a1, &format!("backup add k3f9q2 7 {}", blob(n, n)))
+        w.send(&a1, &format!("backup add {d} 7 {}", blob(n, n)))
             .await;
         assert_eq!(a1.lines(), ["OK"]);
     }
-    w.send(&a1, &format!("backup add k3f9q2 7 {}", blob(99, 0)))
+    w.send(&a1, &format!("backup add {d} 7 {}", blob(99, 0)))
         .await;
     let lines = a1.lines();
     assert!(lines[0].starts_with("ERR forbidden "), "{lines:?}");
     // One it has is still fine.
-    w.send(&a1, &format!("backup add k3f9q2 7 {}", blob(0, 5)))
+    w.send(&a1, &format!("backup add {d} 7 {}", blob(0, 5)))
         .await;
     assert_eq!(a1.lines(), ["OK"]);
 }
@@ -532,12 +629,13 @@ async fn a_deleted_key_takes_its_key_packages_and_welcomes() {
 #[tokio::test]
 async fn unregister_deletes_key_packages_welcomes_and_backups() {
     let mut w = World::new();
+    let d = w.direct.clone();
     give_each(&w, &[(ALICE, 1), (BOB, 5)]).await;
     let mut a1 = w.device(ALICE, 1);
-    w.send(&a1, &format!("backup add k3f9q2 0 {}", blob(1, 0)))
+    w.send(&a1, &format!("backup add {d} 0 {}", blob(1, 0)))
         .await;
     let mut bob = w.device(BOB, 5);
-    w.send(&bob, &format!("backup add k3f9q2 0 {}", blob(1, 0)))
+    w.send(&bob, &format!("backup add {d} 0 {}", blob(1, 0)))
         .await;
     a1.lines();
     bob.lines();
@@ -546,13 +644,13 @@ async fn unregister_deletes_key_packages_welcomes_and_backups() {
     assert!(devices_of(&w, ALICE).is_empty());
     let page =
         w.h.store
-            .backups(&uid(ALICE), &"k3f9q2".parse().unwrap(), None, 500, 100)
+            .backups(&uid(ALICE), &d.parse().unwrap(), None, 500, 100)
             .unwrap();
     assert!(page.blobs.is_empty());
     // Bob's stay, with the Welcome he still has pending.
     assert_eq!(devices_of(&w, BOB), [key(5)]);
     w.send(&bob, "welcome list").await;
     assert_eq!(bob.lines().len(), 2);
-    w.send(&bob, "backup get k3f9q2").await;
+    w.send(&bob, &format!("backup get {d}")).await;
     assert_eq!(bob.lines().len(), 2);
 }
