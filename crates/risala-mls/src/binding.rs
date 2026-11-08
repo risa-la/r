@@ -25,13 +25,13 @@
 //! room's leaves carry none (12.3).
 
 use openmls::prelude::{Extension, ExtensionType, Extensions, UnknownExtension};
+use risala_proto::auth::SignLabel;
 use risala_proto::names::Uid;
 
 use crate::codec::{DecodeError, Reader, Writer};
-use crate::identity::DeviceId;
-use crate::mldsa::SigningKey;
+use crate::identity::{DeviceId, device_id_of};
+use crate::mldsa::{SigningKey, risala_verify};
 use crate::primitives::HASH_LEN;
-use crate::risala_sign::{KEYPACKAGE_LABEL, risala_sign, risala_verify};
 
 /// The extension type of device bindings (12.3, 15).
 pub const DEVICE_BINDING_EXTENSION_TYPE: u16 = 0xF2A2;
@@ -76,13 +76,12 @@ impl DeviceBinding {
         init_key: &[u8],
         encryption_key: &[u8],
     ) -> DeviceBinding {
-        let signature = risala_sign(
-            device_key,
-            KEYPACKAGE_LABEL,
+        let signature = device_key.risala_sign(
+            SignLabel::KeyPackage,
             &content(uid, init_key, encryption_key),
         );
         DeviceBinding {
-            device_id: DeviceId::of_device_key(device_key.public_key()),
+            device_id: device_key.device_id(),
             signature: signature.to_vec(),
         }
     }
@@ -97,10 +96,10 @@ impl DeviceBinding {
         init_key: &[u8],
         encryption_key: &[u8],
     ) -> bool {
-        DeviceId::of_device_key(device_key) == self.device_id
+        device_id_of(device_key) == Some(self.device_id)
             && risala_verify(
                 device_key,
-                KEYPACKAGE_LABEL,
+                SignLabel::KeyPackage,
                 &content(uid, init_key, encryption_key),
                 &self.signature,
             )
@@ -121,7 +120,7 @@ impl DeviceBinding {
         if r.u8()? != 1 {
             return Err(DecodeError("unknown DeviceBinding version"));
         }
-        let device_id = DeviceId(r.array::<HASH_LEN>()?);
+        let device_id = DeviceId::from_bytes(r.array::<HASH_LEN>()?);
         let signature = r.vector()?.to_vec();
         r.finish()?;
         Ok(DeviceBinding {
@@ -158,10 +157,7 @@ mod tests {
         let device = SigningKey::from_seed([9; 32]);
         let uid: Uid = "alice@example.org".parse().unwrap();
         let binding = DeviceBinding::sign(&device, &uid, b"init", b"enc");
-        assert_eq!(
-            binding.device_id,
-            DeviceId::of_device_key(device.public_key())
-        );
+        assert_eq!(binding.device_id, device.device_id());
         assert!(binding.verify(device.public_key(), &uid, b"init", b"enc"));
         // Any other uid, key or device fails.
         let bob: Uid = "bob@example.org".parse().unwrap();

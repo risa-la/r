@@ -1648,7 +1648,6 @@ mod tests {
     use crate::epochal::{
         GRACE_MS, PERIOD_MS, REVEAL_DELAY_MS, grace_end, period_end, period_start, reveal_from,
     };
-    use crate::identity::DeviceId;
     use crate::primitives::tests::hex;
 
     /// Day 20766, 2026-11-09, at 10:00 UTC.
@@ -1692,10 +1691,7 @@ mod tests {
         /// A device of `uid`, with keys from `seed`, at leaf `index`.
         fn new(uid: &str, seed: u8, index: u32) -> Node {
             let device_key = SigningKey::from_seed([seed; 32]);
-            let identity = RisalaIdentity::device(
-                uid.parse().unwrap(),
-                DeviceId::of_device_key(device_key.public_key()),
-            );
+            let identity = RisalaIdentity::device(uid.parse().unwrap(), device_key.device_id());
             Node::with_identity(identity, device_key, seed, index)
         }
 

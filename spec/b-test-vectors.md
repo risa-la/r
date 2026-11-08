@@ -467,17 +467,18 @@ QR text:
   HUJO3JMOW2P67GISQGWSNHMY7GIUUHWF46OXM5DOL7JGQPQE2IYOMQ
 ```
 
-### B.11 The pairing secret, and a SealedBundle (4.8)
+### B.11 The pairing secret, a SealedNewDevice and a SealedBundle (4.8)
 
-The ids and keys that both devices derive from a pairing secret, and a
-SealedBundle of the IdentityBundle below, sealed to the pairing key
-made from the seed below with the `old_key` of this secret. Sealing is
-randomized, so the SealedBundle is a vector for opening: it MUST open
-to the IdentityBundle.
+The ids and keys that both devices derive from the pairing secret of
+B.9, the SealedNewDevice of B.9's NewDevice under its `new_key`, and a
+SealedBundle of the IdentityBundle below, sealed to B.9's pairing key
+with the `old_key` of the secret. The SealedNewDevice is deterministic.
+Sealing a bundle is randomized, so the SealedBundle is a vector for
+opening: it MUST open to the IdentityBundle.
 
 ```
-secret:            000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-pairing key seed:  0303030303030303030303030303030303030303030303030303030303030303
+secret:            0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d
+pairing key seed:  0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
 uid:               alice@example.org
 master_key:        1312 bytes of 50
 signing_seed:      5151515151515151515151515151515151515151515151515151515151515151
@@ -492,19 +493,23 @@ transfer blob:
   454545454545454545454545454545454545454
 transfer key:      5555555555555555555555555555555555555555555555555555555555555555
 
-new_id:          38395018115278eecb70023050f20bb2
-new_id as a box: ha4vagarkj4o5s3qaiyfb4qlwi
-new_key:         f730c19cdb093a583cf927c2e8dac3c2c45c75ee3f8b89dcd7a1ed16e4ad6931
-old_id:          02cb56f3764824ee4fd02a9b9e1fa29d
-old_id as a box: alfvn43wjaso4t6qfknz4h5ctu
-old_key:         d7bd4cef94c09a4513dbaacbe8b1eaee53ad8dc9283a37be93943ab16e4eeaad
+new_id:          c854d37f9e06fe952b019df462f7ac9a
+new_id as a box: zbkng746a37jkkybtx2gf55mti
+new_key:         db15363076f76137c388ca6c5cf9b285a71fa2aa97e08ff3fb743180932254cd
+old_id:          2b4e42283ec033dc693080f48739d141
+old_id as a box: fnheekb6yaz5y2jqqd2iooorie
+old_key:         82453e23a78a6144c36d79109c5237800c153b8d718946394c817505cbb406aa
+SealedNewDevice of B.9's NewDevice (file sealed-newdevice.bin):
+  36f994ab0290b7f4485cc6d998aa17d6b673ea5ec1777b3ebf9b29afd44af047
 pairing key (file pairing-key.bin):
-  5b8e64e6709228bd7e4ed2942858a210fa08a85e83ee31c65ef17e119f77755c
+  e7e10c8bd0efe134c684d675f52e4bfafa67919659e13eee3aa979350055242c
 IdentityBundle (file identity-bundle.bin):
   40c04e11bfd8584c97bb530366d7fa86d733fc749af0aa479a6a95456d41bc0b
 a SealedBundle of it (file sealed-bundle.bin):
-  4c37b41e80fcc683b3a40d33b17cda822aea9dbd63609814b0c1d46c23920dad
+  9858407629eb82ef947656ab4d1e884cbf3810dd58bebff65b953b5e40998aed
 
+the SealedNewDevice with version 2:                                          rejected
+the SealedNewDevice opened with the new_key of the secret 32 bytes of 01:    rejected
 the SealedBundle with version 2:                                             rejected
 the SealedBundle opened with the old_key of the secret 32 bytes of 01:       rejected
 the SealedBundle opened with the pairing key of seed 32 bytes of 04:         rejected
@@ -796,8 +801,8 @@ Identity and the key log:
   cosignatures, an inclusion and a consistency proof, the files
   `risala/uid/<hash>`, `risala/next` and `risala/key` (4.5), and a
   hand-off request body (4.10)
-- a SealedNewDevice (4.8), and a SealedBundle from a fixed X-Wing seed
-  and encapsulation randomness (4.8)
+- a SealedBundle from a fixed X-Wing seed and encapsulation randomness
+  (4.8)
 
 Lines:
 
@@ -853,7 +858,6 @@ Cases that MUST fail:
   matches but whose key does not, the log's own signature counted as a
   witness, a witnessed checkpoint that is not fresh, and a checkpoint
   with entries after a hand-off (4.5, 4.10)
-- pairing: a SealedNewDevice with a version other than 1 (4.8)
 - a SealedWelcome with padding bytes that are not zero (12.8)
 - an X-Wing key that fails the FIPS 203 check, and an MLS object with
   a cipher suite other than `0x0020` or a version other than `mls10`

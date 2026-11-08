@@ -10,35 +10,18 @@
 //! ```
 
 use openmls::prelude::{BasicCredential, Credential, CredentialType, CredentialWithKey};
+use risala_proto::auth::{PUBLIC_KEY_LEN, PublicKey};
 use risala_proto::names::Uid;
+pub use risala_proto::record::DeviceId;
 
 use crate::codec::{DecodeError, Reader, Writer};
-use crate::primitives::{HASH_LEN, sha384};
+use crate::primitives::HASH_LEN;
 
-/// A device id (4.4): the SHA-384 hash of the device's raw device key.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DeviceId(pub [u8; HASH_LEN]);
-
-impl DeviceId {
-    /// The id of the device whose raw ML-DSA-44 device key is `device_key`.
-    pub fn of_device_key(device_key: &[u8]) -> DeviceId {
-        DeviceId(sha384(device_key))
-    }
-
-    /// The id's bytes.
-    pub fn as_bytes(&self) -> &[u8; HASH_LEN] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for DeviceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DeviceId(")?;
-        for b in &self.0[..8] {
-            write!(f, "{b:02x}")?;
-        }
-        write!(f, "…)")
-    }
+/// The device id (4.4) of the raw device key `device_key`, or `None` if it
+/// is not an ML-DSA-44 public key.
+pub fn device_id_of(device_key: &[u8]) -> Option<DeviceId> {
+    let key: &[u8; PUBLIC_KEY_LEN] = device_key.try_into().ok()?;
+    Some(DeviceId::of(&PublicKey::from_bytes(key)))
 }
 
 /// Who a leaf belongs to (12.3): a uid and, unless it is a guest, the
@@ -116,7 +99,9 @@ impl RisalaIdentity {
         }
         let device_id = match (parsed.is_guest(), device_id.len()) {
             (true, 0) => None,
-            (false, HASH_LEN) => Some(DeviceId(device_id.try_into().expect("48 bytes"))),
+            (false, HASH_LEN) => Some(DeviceId::from_bytes(
+                device_id.try_into().expect("48 bytes"),
+            )),
             _ => return Err(DecodeError("device id does not fit the uid")),
         };
         Ok(RisalaIdentity {
@@ -160,7 +145,7 @@ mod tests {
 
     #[test]
     fn encoding() {
-        let device = DeviceId([7; 48]);
+        let device = DeviceId::from_bytes([7; 48]);
         let id = RisalaIdentity::device(uid("alice@example.org"), device);
         let mut expected = b"\x01\x11alice@example.org\x30".to_vec();
         expected.extend_from_slice(&[7; 48]);
@@ -215,8 +200,11 @@ mod tests {
 
     #[test]
     fn device_ids() {
-        let id = DeviceId::of_device_key(b"key");
-        assert_eq!(id.0, sha384(b"key"));
+        let key = [7; PUBLIC_KEY_LEN];
+        let id = device_id_of(&key).unwrap();
+        assert_eq!(id.as_bytes(), &crate::primitives::sha384(&key));
+        assert_eq!(id, DeviceId::of(&PublicKey::from_bytes(&key)));
         assert!(format!("{id:?}").starts_with("DeviceId("));
+        assert_eq!(device_id_of(&key[1..]), None);
     }
 }

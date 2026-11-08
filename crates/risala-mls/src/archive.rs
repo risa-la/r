@@ -677,7 +677,7 @@ fn decode_conversation(r: &mut Reader<'_>) -> Result<ArchivedConversation, Archi
         let device_id = match (list.vector()?, sender.is_guest()) {
             ([], true) => None,
             (id, false) if id.len() == DEVICE_ID_LEN => {
-                Some(DeviceId(id.try_into().expect("48 bytes")))
+                Some(DeviceId::from_bytes(id.try_into().expect("48 bytes")))
             }
             _ => return Err(ArchiveError::Malformed("device_id")),
         };
@@ -863,7 +863,7 @@ mod tests {
         ArchivedMessage {
             message_id: [seq as u8; 16],
             sender: "bob@example.net".parse().unwrap(),
-            device_id: Some(DeviceId([0xd0u8.wrapping_add(seq as u8); 48])),
+            device_id: Some(DeviceId::from_bytes([0xd0u8.wrapping_add(seq as u8); 48])),
             counter: 100 + seq,
             previous: seq
                 .is_multiple_of(2)

@@ -41,7 +41,7 @@ use crate::checks::PERIOD_MS;
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::crypto::x_wing_public_key_ok;
 use crate::group::{capabilities, has_capabilities};
-use crate::identity::{DeviceId, RisalaIdentity};
+use crate::identity::{RisalaIdentity, device_id_of};
 use crate::mldsa::{KEY_PACKAGE_SCOPE, LeafKey, SigningKey};
 use crate::profile::RisalaProfile;
 use crate::seeded::{Parts, SeededRand};
@@ -198,10 +198,7 @@ pub(crate) fn make_key_package_with<P: OpenMlsProvider>(
     lifetime: Lifetime,
 ) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
     let leaf_key = LeafKey::generate().map_err(|_| NewKeyPackageError::Random)?;
-    let identity = RisalaIdentity::device(
-        uid.clone(),
-        DeviceId::of_device_key(device_key.public_key()),
-    );
+    let identity = RisalaIdentity::device(uid.clone(), device_key.device_id());
     let credential = identity.credential_with_key(leaf_key.public_key());
     let mut profile = profile.clone().with_streak(0);
     if last_resort {
@@ -554,7 +551,8 @@ pub fn check_key_package(
     if !lifetime_acceptable(key_package.life_time(), now) {
         return Err(KeyPackageError::Lifetime);
     }
-    let expected = RisalaIdentity::device(uid.clone(), DeviceId::of_device_key(device_key));
+    let device_id = device_id_of(device_key).ok_or(KeyPackageError::Credential)?;
+    let expected = RisalaIdentity::device(uid.clone(), device_id);
     if identity != expected {
         return Err(KeyPackageError::Credential);
     }

@@ -15,7 +15,6 @@ use crate::checks::{EpochState, JoinExpectation};
 use crate::group::{
     Changes, apply_commit, commit, create_group, join_by_welcome, merge_own_commit, self_remove,
 };
-use crate::identity::DeviceId;
 use crate::keypackage::make_key_package;
 use crate::mldsa::SigningKey;
 use crate::profile::RisalaProfile;
@@ -84,10 +83,7 @@ impl Device {
     }
 
     fn identity(&self) -> RisalaIdentity {
-        RisalaIdentity::device(
-            self.uid.clone(),
-            DeviceId::of_device_key(self.key.public_key()),
-        )
+        RisalaIdentity::device(self.uid.clone(), self.key.device_id())
     }
 
     fn profile(&self) -> RisalaProfile {

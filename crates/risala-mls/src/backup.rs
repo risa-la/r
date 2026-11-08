@@ -735,7 +735,7 @@ mod tests {
                 .map(|seq| ArchivedMessage {
                     message_id: [seq as u8; 16],
                     sender: "alice@example.org".parse().unwrap(),
-                    device_id: Some(crate::identity::DeviceId([4; 48])),
+                    device_id: Some(crate::identity::DeviceId::from_bytes([4; 48])),
                     counter: seq,
                     previous: None,
                     verified: true,

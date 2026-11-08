@@ -27,7 +27,7 @@ fn leaf_of_device(index: u32, who: &str, device: u8, updated: u64) -> LeafView {
     let identity = if uid.is_guest() {
         RisalaIdentity::guest(uid)
     } else {
-        RisalaIdentity::device(uid, DeviceId([device; 48]))
+        RisalaIdentity::device(uid, DeviceId::from_bytes([device; 48]))
     };
     LeafView {
         index: LeafNodeIndex::new(index),
@@ -151,8 +151,10 @@ fn leaves_keep_their_credential_and_key() {
     let conv = room(ConversationKind::PrivateRoom);
     let g = group(&conv);
     let mut other = commit(&g, 2, vec![]);
-    other.path_leaf.as_mut().unwrap().identity =
-        Some(RisalaIdentity::device(uid("p@x.org"), DeviceId([9; 48])));
+    other.path_leaf.as_mut().unwrap().identity = Some(RisalaIdentity::device(
+        uid("p@x.org"),
+        DeviceId::from_bytes([9; 48]),
+    ));
     assert_eq!(check(&g, &other), Err(CommitError::Leaf));
     let mut no_profile = commit(&g, 2, vec![]);
     no_profile.path_leaf.as_mut().unwrap().profile = None;
@@ -191,10 +193,7 @@ fn leaves_keep_their_credential_and_key() {
     for updated in [day + 10 * MIN, day + PERIOD_MS / 2] {
         let g = with_updated(updated);
         assert_eq!(rotate_at(&g, updated), Err(CommitError::Leaf));
-        assert_eq!(
-            rotate_at(&g, day + PERIOD_MS - 1),
-            Err(CommitError::Leaf)
-        );
+        assert_eq!(rotate_at(&g, day + PERIOD_MS - 1), Err(CommitError::Leaf));
         assert_eq!(rotate_at(&g, day + PERIOD_MS), Ok(Verdict::default()));
     }
     // A change in the day's first 10 minutes counts as the day before's,
@@ -805,7 +804,7 @@ fn key_package(provider: &TestProvider, who: &str, seed: u8, updated: u64) -> Ke
 }
 
 fn device_of(seed: u8) -> DeviceId {
-    DeviceId::of_device_key(SigningKey::from_seed([seed; 32]).public_key())
+    SigningKey::from_seed([seed; 32]).device_id()
 }
 
 fn add(key_package: KeyPackage) -> ProposalView {
@@ -898,7 +897,7 @@ fn public_room_adds() {
     let conv = room(ConversationKind::PublicRoom);
     let g = group(&conv);
     let s = T / 1000;
-    let identity = RisalaIdentity::device(uid("n@x.org"), DeviceId([60; 48]));
+    let identity = RisalaIdentity::device(uid("n@x.org"), DeviceId::from_bytes([60; 48]));
     let join = |profile: &RisalaProfile| {
         make_join_key_package_with(
             &provider,
@@ -1160,7 +1159,7 @@ fn crowd(conv: &RisalaConversation, identities: u32, per: u32) -> GroupView {
             let mut l = leaf(i * per + j, &format!("u{i}@x.org"), T);
             l.identity = Some(RisalaIdentity::device(
                 l.uid().unwrap().clone(),
-                DeviceId([j as u8; 48]),
+                DeviceId::from_bytes([j as u8; 48]),
             ));
             leaves.push(l);
         }

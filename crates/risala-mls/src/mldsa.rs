@@ -10,6 +10,7 @@ use libcrux_ml_dsa::ml_dsa_44 as mldsa;
 use openmls_traits::signatures::{Signer, SignerError};
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider, traits};
 use openmls_traits::types::SignatureScheme;
+use risala_proto::auth::{SignLabel, risala_sign_content};
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// The length of an ML-DSA-44 public key.
@@ -58,6 +59,11 @@ impl SigningKey {
         &self.public
     }
 
+    /// The device id (4.4) of the device whose device key this is.
+    pub fn device_id(&self) -> risala_proto::record::DeviceId {
+        risala_proto::record::DeviceId::of(&risala_proto::auth::PublicKey::from_bytes(&self.public))
+    }
+
     /// ML-DSA.Sign over `message`, hedged, with an empty context (12.2).
     /// Falls back to the deterministic variant if the operating system has
     /// no randomness, which verifiers cannot tell apart.
@@ -74,6 +80,23 @@ impl SigningKey {
             .expect("ML-DSA-44 signing with an empty context does not fail");
         Box::new(*signature.as_ref())
     }
+
+    /// RisalaSign(key, label, content) (4.3): ML-DSA.Sign, hedged, over
+    /// the RisalaSignContent that risala-proto encodes.
+    pub fn risala_sign(&self, label: SignLabel, content: &[u8]) -> Box<[u8; SIGNATURE_LEN]> {
+        self.sign(&risala_sign_content(label, content))
+    }
+}
+
+/// RisalaVerify (4.3): whether `signature` is RisalaSign(key, label,
+/// content) for the key whose raw public key is `public_key`.
+pub fn risala_verify(
+    public_key: &[u8],
+    label: SignLabel,
+    content: &[u8],
+    signature: &[u8],
+) -> bool {
+    verify(public_key, &risala_sign_content(label, content), signature)
 }
 
 impl std::fmt::Debug for SigningKey {
@@ -299,6 +322,54 @@ mod tests {
         assert!(!verify(key.public_key(), b"other", &one[..]));
         assert!(!verify(&key.public_key()[1..], b"message", &one[..]));
         assert!(!verify(key.public_key(), b"message", &one[1..]));
+    }
+
+    /// RisalaSign (4.3), over risala-proto's RisalaSignContent.
+    #[test]
+    fn risala_signatures() {
+        let key = SigningKey::from_seed([5; 32]);
+        let label = SignLabel::KeyPackage;
+        let signature = key.risala_sign(label, b"content");
+        assert!(risala_verify(
+            key.public_key(),
+            label,
+            b"content",
+            &signature[..]
+        ));
+        // Another label, content or key fails.
+        assert!(!risala_verify(
+            key.public_key(),
+            SignLabel::Record,
+            b"content",
+            &signature[..]
+        ));
+        assert!(!risala_verify(
+            key.public_key(),
+            label,
+            b"other",
+            &signature[..]
+        ));
+        let other = SigningKey::from_seed([6; 32]);
+        assert!(!risala_verify(
+            other.public_key(),
+            label,
+            b"content",
+            &signature[..]
+        ));
+        // risala-proto's keys verify it, and sign the same bytes.
+        let public = risala_proto::auth::PublicKey::from_bytes(key.public_key());
+        assert!(public.risala_verify(label, b"content", &signature[..]));
+        let proto = risala_proto::auth::SecretKey::from_seed([5; 32]);
+        let theirs = proto.risala_sign_deterministic(label, b"content");
+        assert!(risala_verify(
+            key.public_key(),
+            label,
+            b"content",
+            theirs.as_bytes()
+        ));
+        // It is not an MLS signature: SignWithLabel's content differs.
+        let mls = sign_content(b"keypackage", b"content");
+        assert!(!verify(key.public_key(), &mls, &signature[..]));
     }
 
     #[test]

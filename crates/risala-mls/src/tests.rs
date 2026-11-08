@@ -87,7 +87,7 @@ impl Device {
     }
 
     fn device_id(&self) -> DeviceId {
-        DeviceId::of_device_key(self.device_key.as_ref().unwrap().public_key())
+        self.device_key.as_ref().unwrap().device_id()
     }
 
     fn identity(&self) -> RisalaIdentity {

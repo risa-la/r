@@ -18,8 +18,8 @@
 //! Keys and crypto:
 //!
 //! - [`crypto`]: the OpenMLS provider for cipher suite `0x0020` (12.2).
-//! - [`mldsa`]: ML-DSA-44 keys, and leaf keys (12.3).
-//! - [`risala_sign`]: RisalaSign (4.3), until it moves to `risala-proto`.
+//! - [`mldsa`]: ML-DSA-44 keys, leaf keys (12.3), and RisalaSign (4.3) over
+//!   `risala-proto`'s RisalaSignContent.
 //! - [`primitives`]: SHA-384, HKDF, HMAC, ChaCha20-Poly1305 and MLS's
 //!   labelled functions, for use outside MLS.
 //!
@@ -69,7 +69,6 @@ pub mod mldsa;
 pub mod pairing;
 pub mod primitives;
 pub mod profile;
-pub mod risala_sign;
 mod seeded;
 pub mod token;
 pub mod welcome;
@@ -100,7 +99,7 @@ pub use message::{
 };
 pub use mldsa::{LeafKey, SigningKey};
 pub use pairing::{
-    DeviceKeys, IdentityBundle, NewDevice, NewDeviceContent, PairingCode, PairingError, PairingKey,
+    IdentityBundle, NewDevice, NewDeviceContent, PairingCode, PairingError, PairingKey,
     PairingSecret, Relay, RelayId, SealedBundle,
 };
 pub use profile::RisalaProfile;

@@ -36,7 +36,7 @@
 
 use std::collections::BTreeMap;
 
-use risala_proto::auth::{PublicKey, Signature};
+use risala_proto::auth::{PublicKey, SignLabel, Signature};
 use risala_proto::content::{ContentLine, PeriodSeed};
 use risala_proto::time::Timestamp;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -44,9 +44,8 @@ use zeroize::{Zeroize as _, Zeroizing};
 use crate::aad::Pseudonym;
 use crate::codec::Writer;
 use crate::identity::{DeviceId, RisalaIdentity};
-use crate::mldsa::{PUBLIC_KEY_LEN, SEED_LEN, SIGNATURE_LEN, SigningKey};
+use crate::mldsa::{PUBLIC_KEY_LEN, SEED_LEN, SIGNATURE_LEN, SigningKey, risala_verify};
 use crate::primitives::{HASH_LEN, hkdf_expand, hkdf_extract, sha384};
-use crate::risala_sign::{risala_sign, risala_verify};
 
 /// The length of a period: one UTC day, in milliseconds (12.10).
 pub const PERIOD_MS: u64 = 86_400_000;
@@ -70,12 +69,6 @@ pub const CHAIN_LEN: u32 = 90;
 /// A device that sent in a group in the period before proposes its new
 /// leaf at a random time in the first 12 hours of the period (12.10).
 pub const ROTATE_WITHIN_MS: u64 = 12 * 3_600_000;
-
-/// The RisalaSign label of a PeriodCert (12.10, 15).
-pub const PERIOD_LABEL: &str = "period";
-
-/// The RisalaSign label of an AttestContent (12.10, 15).
-pub const ATTEST_LABEL: &str = "attest";
 
 /// The HKDF label of the chain of seeds (12.10, 15).
 pub const SEED_LABEL: &[u8] = b"risala/1 period seed";
@@ -202,13 +195,13 @@ impl PeriodCert<'_> {
 
     /// RisalaSign(device key, "period", PeriodCert).
     pub fn sign(&self, device_key: &SigningKey) -> Box<[u8; SIGNATURE_LEN]> {
-        risala_sign(device_key, PERIOD_LABEL, &self.encode())
+        device_key.risala_sign(SignLabel::Period, &self.encode())
     }
 
     /// Whether `signature` is this certificate's, by the device key whose
     /// raw public key is `device_key`.
     pub fn verify(&self, device_key: &[u8], signature: &[u8]) -> bool {
-        risala_verify(device_key, PERIOD_LABEL, &self.encode(), signature)
+        risala_verify(device_key, SignLabel::Period, &self.encode(), signature)
     }
 }
 
@@ -245,13 +238,13 @@ impl AttestContent<'_> {
 
     /// RisalaSign(period key, "attest", AttestContent).
     pub fn sign(&self, period_key: &SigningKey) -> Box<[u8; SIGNATURE_LEN]> {
-        risala_sign(period_key, ATTEST_LABEL, &self.encode())
+        period_key.risala_sign(SignLabel::Attest, &self.encode())
     }
 
     /// Whether `signature` is this content's, by the period key whose raw
     /// public key is `period_key`.
     pub fn verify(&self, period_key: &[u8], signature: &[u8]) -> bool {
-        risala_verify(period_key, ATTEST_LABEL, &self.encode(), signature)
+        risala_verify(period_key, SignLabel::Attest, &self.encode(), signature)
     }
 }
 
@@ -711,10 +704,7 @@ mod tests {
 
     fn device(seed: u8) -> (SigningKey, RisalaIdentity) {
         let key = SigningKey::from_seed([seed; 32]);
-        let identity = RisalaIdentity::device(
-            uid("alice@example.org"),
-            DeviceId::of_device_key(key.public_key()),
-        );
+        let identity = RisalaIdentity::device(uid("alice@example.org"), key.device_id());
         (key, identity)
     }
 
@@ -983,25 +973,18 @@ mod tests {
     /// `--nocapture` to print them.
     #[test]
     fn vectors() {
-        use crate::risala_sign::sign_content;
-        use libcrux_ml_dsa::ml_dsa_44 as mldsa;
+        use risala_proto::auth::{SecretKey, risala_sign_content};
 
-        let det_sign = |seed: [u8; 32], label: &str, content: &[u8]| -> Vec<u8> {
-            let pair = mldsa::generate_key_pair(seed);
-            mldsa::sign(
-                &pair.signing_key,
-                &sign_content(label, content),
-                b"",
-                [0; 32],
-            )
-            .unwrap()
-            .as_ref()
-            .to_vec()
+        let det_sign = |seed: [u8; 32], label: SignLabel, content: &[u8]| -> Vec<u8> {
+            SecretKey::from_seed(seed)
+                .risala_sign_deterministic(label, content)
+                .as_bytes()
+                .to_vec()
         };
 
         let device_seed = [0x11; 32];
         let device_key = SigningKey::from_seed(device_seed);
-        let device_id = DeviceId::of_device_key(device_key.public_key());
+        let device_id = device_key.device_id();
         let last_seed = [0x22; 32];
         // A chain from period 20766 (2026-11-09) to 20855.
         let mut ring = PeriodKeyring::new();
@@ -1018,7 +1001,7 @@ mod tests {
             period_key: period_key.public_key(),
         };
         let cert_bytes = cert.encode();
-        let cert_sig = det_sign(device_seed, PERIOD_LABEL, &cert_bytes);
+        let cert_sig = det_sign(device_seed, SignLabel::Period, &cert_bytes);
         assert!(cert.verify(device_key.public_key(), &cert_sig));
 
         let group_id = [0x33; 32];
@@ -1029,7 +1012,7 @@ mod tests {
             leaf_key_hash: sha384(leaf.public_key()),
         };
         let content_bytes = content.encode();
-        let attest_sig = det_sign(*seed, ATTEST_LABEL, &content_bytes);
+        let attest_sig = det_sign(*seed, SignLabel::Attest, &content_bytes);
         assert!(content.verify(period_key.public_key(), &attest_sig));
 
         // The encodings, byte by byte.
@@ -1061,7 +1044,7 @@ mod tests {
         println!("PeriodCert = {}", hex(&cert_bytes));
         println!(
             "RisalaSignContent = {}",
-            hex(&sign_content(PERIOD_LABEL, &cert_bytes))
+            hex(&risala_sign_content(SignLabel::Period, &cert_bytes))
         );
         println!("certificate (deterministic) = {}", hex(&cert_sig));
         println!("== AttestContent");
@@ -1078,20 +1061,13 @@ mod tests {
     /// Appendix B.13: [`vectors`], checked against the appendix.
     #[test]
     fn appendix_b() {
-        use crate::risala_sign::sign_content;
-        use libcrux_ml_dsa::ml_dsa_44 as mldsa;
+        use risala_proto::auth::SecretKey;
 
-        let det_sign = |seed: [u8; 32], label: &str, content: &[u8]| -> Vec<u8> {
-            let pair = mldsa::generate_key_pair(seed);
-            mldsa::sign(
-                &pair.signing_key,
-                &sign_content(label, content),
-                b"",
-                [0; 32],
-            )
-            .unwrap()
-            .as_ref()
-            .to_vec()
+        let det_sign = |seed: [u8; 32], label: SignLabel, content: &[u8]| -> Vec<u8> {
+            SecretKey::from_seed(seed)
+                .risala_sign_deterministic(label, content)
+                .as_bytes()
+                .to_vec()
         };
         let mut ck = crate::appendix::Checker::open("B.13 ");
         let last_seed = [0x22; 32];
@@ -1115,7 +1091,7 @@ mod tests {
         let period_key = SigningKey::from_seed(*seed);
         ck.file("period key", "period-key.bin", period_key.public_key());
         let device_key = SigningKey::from_seed(device_seed);
-        let device_id = DeviceId::of_device_key(device_key.public_key());
+        let device_id = device_key.device_id();
         ck.hex("device id", device_id.as_bytes());
         let cert = PeriodCert {
             uid: "alice@example.org",
@@ -1125,7 +1101,7 @@ mod tests {
         };
         let cert_bytes = cert.encode();
         ck.file("PeriodCert", "periodcert.bin", &cert_bytes);
-        let cert_sig = det_sign(device_seed, PERIOD_LABEL, &cert_bytes);
+        let cert_sig = det_sign(device_seed, SignLabel::Period, &cert_bytes);
         assert!(cert.verify(device_key.public_key(), &cert_sig));
         ck.file("certificate", "period-certificate.bin", &cert_sig);
         let leaf = SigningKey::from_seed([0x44; 32]);
@@ -1136,7 +1112,7 @@ mod tests {
         };
         let content_bytes = content.encode();
         ck.hex("AttestContent", &content_bytes);
-        let attest_sig = det_sign(*seed, ATTEST_LABEL, &content_bytes);
+        let attest_sig = det_sign(*seed, SignLabel::Attest, &content_bytes);
         assert!(content.verify(period_key.public_key(), &attest_sig));
         ck.file("attestation", "attestation.bin", &attest_sig);
         let mut ring = PeriodKeyring::new();
