@@ -11,7 +11,7 @@ use super::StoreError;
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
 pub(super) const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17,
 ];
 
 /// The schema version this build writes.
@@ -507,6 +507,13 @@ INSERT INTO device_keys_v16 (account, uid, key_id, key, listed, label, seen)
     SELECT account, uid, key_id, key, NULL, label, seen FROM device_keys;
 DROP TABLE device_keys;
 ALTER TABLE device_keys_v16 RENAME TO device_keys;
+";
+
+/// Version 17: `room_members.invited_seq` is the seq of the last INVITE
+/// event for the uid (6.4), so that a device can tell an invitee from an
+/// outsider when it joins a room's group (12.6). 0 if none is stored.
+const V17: &str = "
+ALTER TABLE room_members ADD COLUMN invited_seq INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Brings the schema up to [`VERSION`].

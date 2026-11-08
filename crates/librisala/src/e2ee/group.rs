@@ -24,7 +24,6 @@ use risala_proto::auth::PublicKey;
 use risala_proto::mls;
 use risala_proto::names::{Conv, Uid};
 use risala_proto::types::SendMode;
-use rusqlite::{OptionalExtension, params};
 
 use super::{Device, E2eeError, mls};
 use crate::store::e2ee::{GroupRow, GroupState, KeySource};
@@ -75,25 +74,44 @@ pub(crate) fn expected(me: &Uid, row: &ConvRow) -> Option<(ConversationKind, Str
 }
 
 /// Checks a group the device is about to join (12.6, "Joining"): the
-/// conversation extension names the conversation, and in a direct
-/// conversation every leaf is a participant's.
+/// conversation extension names the conversation; in a direct
+/// conversation every leaf is a participant's; and in a room every leaf
+/// belongs to an identity that the room's events show to be a member or
+/// invited at seq `at`, other than `own`, the device's own leaf when it
+/// joins by external commit.
 fn check_joining(
+    tx: &Tx<'_>,
     me: &Uid,
     row: &ConvRow,
     conversation: &RisalaConversation,
     leaves: &[Leaf],
+    (at, own): (u64, Option<&PublicKey>),
 ) -> Result<(), E2eeError> {
     let (kind, name) =
         expected(me, row).ok_or(E2eeError::Rejected("the room's id is not known"))?;
     if conversation.kind != kind || conversation.name != name {
         return Err(E2eeError::Rejected("the group is for another conversation"));
     }
-    if let Conv::Uid(other) = &row.name
-        && leaves.iter().any(|l| l.uid != *me && l.uid != *other)
-    {
-        return Err(E2eeError::Rejected(
-            "a direct conversation's group has an outsider",
-        ));
+    match &row.name {
+        Conv::Uid(other) => {
+            if leaves.iter().any(|l| l.uid != *me && l.uid != *other) {
+                return Err(E2eeError::Rejected(
+                    "a direct conversation's group has an outsider",
+                ));
+            }
+        }
+        Conv::Room(_) => {
+            for leaf in leaves {
+                if Some(&leaf.key) == own {
+                    continue;
+                }
+                if !tx.member_at(row.id, &leaf.uid, at)? {
+                    return Err(E2eeError::Rejected(
+                        "a room's group has a leaf of someone who is not a member",
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -318,7 +336,7 @@ impl Checks<'_> {
         if uid == committer || re_added.contains(&key.as_bytes()[..]) {
             return Ok(true);
         }
-        if self.row.name.is_room() && left_room(tx, self.row, uid)? {
+        if self.row.name.is_room() && tx.left_room(self.row.id, uid)? {
             return Ok(true);
         }
         match tx.key_listed(self.row.account, uid, key)? {
@@ -327,21 +345,6 @@ impl Checks<'_> {
             _ => Err(E2eeError::KeyFiles(vec![uid.clone()])),
         }
     }
-}
-
-/// Whether the room's stored events show that `uid` left, was kicked or
-/// banned, or declined an invitation (12.6).
-fn left_room(tx: &Tx<'_>, row: &ConvRow, uid: &Uid) -> Result<bool, E2eeError> {
-    let member: Option<(Option<bool>, bool)> = tx
-        .conn()
-        .query_row(
-            "SELECT joined, banned FROM room_members WHERE conv = ?1 AND uid = ?2",
-            params![row.id.get(), uid.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(crate::store::StoreError::from)?;
-    Ok(matches!(member, Some((Some(false), _)) | Some((_, true))))
 }
 
 /// The extensions of a group context other than the conversation
@@ -362,7 +365,10 @@ fn split_extensions(
 }
 
 /// The checks of 12.6 on a staged commit from `sender`, in `group` as it
-/// is before the commit.
+/// is before the commit. They need none of the group's secrets, so they
+/// are made on the commit as the group's public part stages it, before
+/// MLS processes it: a commit that fails them is rejected even if MLS
+/// would refuse it too.
 fn check_commit(
     tx: &Tx<'_>,
     checks: &Checks<'_>,
@@ -568,17 +574,15 @@ pub(crate) fn apply_commit(
             added: Vec::new(),
         });
     }
-    let message = wire::commit_from_wire(commit).map_err(|e| E2eeError::Mls(e.to_string()))?;
-    let (added, removed) = {
-        let provider = dev.provider(tx.mls_storage());
-        if g.pending.is_some() {
-            // Another commit came first: this device's own will be
-            // refused as stale (12.5).
-            group
-                .clear_pending_commit(provider.storage())
-                .map_err(mls)?;
-        }
-        let processed = group.process_message(&provider, message).map_err(mls)?;
+    let message = || wire::commit_from_wire(commit).map_err(|e| E2eeError::Mls(e.to_string()));
+    // 12.6 first, on what the commit shows without the group's secrets,
+    // so that one that fails the checks is rejected, never merely refused
+    // by MLS (which would let the device join again).
+    let added = {
+        let processed = group
+            .public_group()
+            .process_message(&*dev.crypto, message()?)
+            .map_err(mls)?;
         let sender = processed.sender().clone();
         let credential = processed.credential().clone();
         let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
@@ -589,10 +593,24 @@ pub(crate) fn apply_commit(
             row,
             fresh,
         };
-        let added = check_commit(tx, &checks, &group, &sender, &credential, &staged)?;
+        check_commit(tx, &checks, &group, &sender, &credential, &staged)?
+    };
+    let removed = {
+        let provider = dev.provider(tx.mls_storage());
+        if g.pending.is_some() {
+            // Another commit came first: this device's own will be
+            // refused as stale (12.5).
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(mls)?;
+        }
+        let processed = group.process_message(&provider, message()?).map_err(mls)?;
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err(E2eeError::Mls("the COMMIT event holds no commit".into()));
+        };
         let removed = staged.self_removed();
         group.merge_staged_commit(&provider, *staged).map_err(mls)?;
-        (added, removed)
+        removed
     };
     if removed {
         let mut left = g.clone();
@@ -792,7 +810,7 @@ pub(crate) fn join_welcome(
                     ))
             })
             .collect::<Result<_, _>>()?;
-        check_joining(&dev.uid, row, &conversation, &leaves)?;
+        check_joining(tx, &dev.uid, row, &conversation, &leaves, (seq, None))?;
         staged.into_group(&provider).map_err(mls)?
     };
     // An earlier group of the conversation, not followed any more, goes.
@@ -811,7 +829,8 @@ pub(crate) fn join_welcome(
 }
 
 /// Makes an external commit to join the conversation's group (12.6), from
-/// GROUPINFO's GroupInfo and tree, after the checks of joining. The group
+/// GROUPINFO's GroupInfo and tree, after the checks of joining as of `at`,
+/// the seq of the COMMIT event that started the GroupInfo's epoch. The group
 /// waits for the commit's answer: it is the device's once its COMMIT event
 /// comes back ([`apply_commit`]), and is forgotten if the server refuses it
 /// ([`commit_refused`]).
@@ -819,8 +838,7 @@ pub(crate) fn external_join(
     tx: &mut Tx<'_>,
     dev: &Device,
     row: &ConvRow,
-    group_info: &mls::GroupInfo,
-    tree: &mls::RatchetTree,
+    (group_info, tree, at): (&mls::GroupInfo, &mls::RatchetTree, u64),
 ) -> Result<Commit, E2eeError> {
     if let Some(old) = tx.group(row.id)? {
         if matches!(old.state, GroupState::Active | GroupState::Rejected) {
@@ -840,7 +858,15 @@ pub(crate) fn external_join(
                 .map_err(mls)?;
         let conversation = RisalaConversation::from_extensions(group.extensions())
             .map_err(|_| E2eeError::Rejected("the group has no conversation extension"))?;
-        check_joining(&dev.uid, row, &conversation, &leaves(&group)?)?;
+        let own = dev.key.public_key();
+        check_joining(
+            tx,
+            &dev.uid,
+            row,
+            &conversation,
+            &leaves(&group)?,
+            (at, Some(&own)),
+        )?;
         let (commit, _, info) = bundle.into_messages();
         let out = Commit {
             commit: wire::commit_to_wire(&commit).map_err(mls)?,

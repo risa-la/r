@@ -179,6 +179,7 @@ enum Body {
     },
     Join,
     Set(String),
+    Invite(Uid),
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,7 @@ impl SConv {
             } => format!("{head};frank={frank} ENC {conv} {epoch} {payload}"),
             Body::Join => format!("{head};id={} JOIN {conv}", self.id),
             Body::Set(s) => format!("{head} SET {conv} {s}"),
+            Body::Invite(u) => format!("{head} INVITE {conv} {u}"),
         }
     }
 }
@@ -654,7 +656,11 @@ impl Net {
                 if !self.convs[c].members.contains(&invitee)
                     && !self.convs[c].invited.contains(&invitee)
                 {
-                    self.convs[c].invited.push(invitee);
+                    self.convs[c].invited.push(invitee.clone());
+                    // The server records the invitation (12.6).
+                    if matches!(self.convs[c].kind, Kind::Room(_)) {
+                        self.push(c, &me, Body::Invite(invitee));
+                    }
                 }
                 let id = self.next_welcome;
                 self.next_welcome += 1;
@@ -1178,8 +1184,9 @@ fn an_encrypted_room_shares_its_history() {
         "never MSG in a room with a group (12.3)"
     );
 
-    // Inviting adds Bob's device to the group (12.6); his device joins by
-    // Welcome once it knows the room's id from INFO.
+    // Inviting adds Bob's device to the group (12.6). His device keeps the
+    // Welcome until it can check the group's leaves against the room's
+    // events, once Bob has joined the room.
     let out = net.devs[a]
         .engine
         .invite(&room, &uid("bob@example.net"))
@@ -1187,18 +1194,22 @@ fn an_encrypted_room_shares_its_history() {
     net.devs[a].absorb(out);
     net.run();
     assert_eq!(net.sent(a, "INVITE"), 0);
+    assert!(net.devs[b].group("#secret").is_none());
+    assert_eq!(net.welcomes[&b].len(), 1);
+    // History is shared: Alice sent the earlier epoch's key (12.9).
+    assert_eq!(net.sent(a, "ENC"), 2);
+
+    // Bob joins the room, and his device joins its group by the Welcome.
+    // He reads what was sent before he was invited, and writes.
+    let out = net.devs[b].engine.join(&room);
+    net.devs[b].absorb(out);
+    net.run();
     assert_eq!(
         net.devs[b].group("#secret").unwrap().state,
         GroupState::Active
     );
-    // History is shared: Alice sent the earlier epoch's key (12.9).
-    assert_eq!(net.sent(a, "ENC"), 2);
-
-    // Bob joins the room, reads what was sent before he was invited, and
-    // writes.
-    let out = net.devs[b].engine.join(&room);
-    net.devs[b].absorb(out);
-    net.run();
+    assert!(net.welcomes[&b].is_empty());
+    assert_eq!(net.sent_to(b, "GROUPINFO", "#secret"), 0);
     use crate::store::e2ee::EncState::Verified;
     assert_eq!(
         net.devs[b].texts("#secret"),
@@ -1609,4 +1620,210 @@ fn a_leaf_with_someone_elses_key_is_not_confirmed() {
         !leaves.iter().any(|l| l.key == carol_key),
         "the leaf with Carol's key stays: {leaves:?}"
     );
+}
+
+impl Net {
+    /// A commit message of conversation `c`, to deliver where it does not
+    /// belong.
+    fn a_commit_of(&self, c: usize) -> mls::CommitMessage {
+        self.convs[c]
+            .events
+            .iter()
+            .find_map(|e| match &e.body {
+                Body::Commit { commit, .. } => Some(commit.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// The server sends a COMMIT event of epoch `epoch` with `commit` in
+    /// conversation `c`, as if `from` sent it.
+    fn forge_commit(&mut self, c: usize, from: &str, epoch: u64, commit: mls::CommitMessage) {
+        self.push(c, &uid(from), Body::Commit { epoch, commit });
+        self.run();
+    }
+
+    /// An encrypted room `name` owned by device `a`, with device `b`'s
+    /// identity invited and joined. Returns the conversation.
+    fn encrypted_room(&mut self, a: usize, b: usize, name: &str) -> usize {
+        use risala_proto::types::{HistoryMode, SendMode};
+        let room: Room = name.parse().unwrap();
+        let c = self.room(a, name);
+        reconnect(self, a);
+        let out = self.devs[a]
+            .engine
+            .encrypt_room(&room, HistoryMode::Shared, SendMode::All)
+            .unwrap();
+        self.devs[a].absorb(out);
+        self.run();
+        let invitee = self.devs[b].uid.clone();
+        let out = self.devs[a].engine.invite(&room, &invitee).unwrap();
+        self.devs[a].absorb(out);
+        self.run();
+        let out = self.devs[b].engine.join(&room);
+        self.devs[b].absorb(out);
+        self.run();
+        assert_eq!(
+            self.devs[b].group(name).unwrap().state,
+            GroupState::Active
+        );
+        c
+    }
+}
+
+#[test]
+fn a_room_group_with_an_outsider_is_not_joined_again() {
+    use risala_proto::types::{HistoryMode, SendMode};
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    let m = net.device("mallory@example.com", 5);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+    let direct = net.conv_of(a, "bob@example.net").unwrap();
+    let c = net.encrypted_room(a, b, "#secret");
+
+    // Mallory makes a group that names the room, and the server hands it
+    // out as the room's group. It then sends Bob's device a commit that
+    // MLS refuses, so that the device would join again (12.6).
+    let id: Id = net.convs[c].id.parse().unwrap();
+    let dev = &net.devs[m];
+    let device = crate::e2ee::Device::new(dev.uid.clone(), dev.key.clone()).unwrap();
+    let (info, tree) = dev
+        .store
+        .write(|tx| {
+            let provider = device.provider(tx.mls_storage());
+            let conversation =
+                risala_mls::RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All);
+            let group =
+                risala_mls::create_group(&provider, &device.signer(), &device.uid, &conversation)
+                    .unwrap();
+            let info = group
+                .export_group_info(&*device.crypto, &device.signer(), false)
+                .unwrap();
+            Ok((
+                wire::group_info_to_wire(&info).unwrap(),
+                wire::tree_to_wire(&group.export_ratchet_tree()).unwrap(),
+            ))
+        })
+        .unwrap()
+        .0;
+    let epoch = net.convs[c].epoch.unwrap() + 1;
+    net.convs[c].group_info = Some(info);
+    net.convs[c].tree = Some(tree);
+    net.convs[c].epoch = Some(0);
+    let junk = net.a_commit_of(direct);
+    net.forge_commit(c, "alice@example.org", epoch, junk);
+
+    // Bob's device does not join a group with a leaf of someone the room's
+    // events do not show as a member or invitee.
+    assert_eq!(net.sent_to(b, "COMMIT", "#secret"), 0);
+    assert_ne!(
+        net.devs[b].group("#secret").unwrap().state,
+        GroupState::Active
+    );
+}
+
+/// Flips the last byte of a commit: its membership tag, which only the
+/// group's members can check.
+fn bad_membership_tag(commit: &mls::CommitMessage) -> mls::CommitMessage {
+    let mut bytes = commit.decode();
+    *bytes.last_mut().unwrap() ^= 1;
+    mls::CommitMessage::from_bytes(&bytes).unwrap()
+}
+
+#[test]
+fn a_commit_that_fails_the_checks_and_mls_is_rejected() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    let c = net.device("carol@example.com", 4);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+
+    // Bob's device adds Carol's to his direct conversation with Alice,
+    // with a membership tag that MLS refuses.
+    let kp = net.packages.get_mut(&c).unwrap().pop().unwrap();
+    let dev = &net.devs[b];
+    let device = crate::e2ee::Device::new(dev.uid.clone(), dev.key.clone()).unwrap();
+    let conv: Conv = "alice@example.org".parse().unwrap();
+    let account = dev.account;
+    let (commit, _) = dev
+        .store
+        .write_with(|tx| {
+            let row = tx.conv_by_name(account, &conv)?.unwrap();
+            let (kp, _) =
+                crate::e2ee::group::checked_key_package(&device, &uid("carol@example.com"), &kp)?;
+            crate::e2ee::group::own_commit(
+                tx,
+                &device,
+                &row,
+                risala_mls::group::Changes {
+                    add: vec![kp],
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let s = net.conv_of(a, "bob@example.net").unwrap();
+    let epoch = net.convs[s].epoch.unwrap() + 1;
+    net.convs[s].epoch = Some(epoch);
+    net.convs[s].group_info = Some(commit.group_info);
+    net.forge_commit(s, "bob@example.net", epoch, bad_membership_tag(&commit.commit));
+
+    // Alice's device rejects it, rather than join again (12.6).
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+    assert_eq!(net.sent_to(a, "GROUPINFO", "bob@example.net"), 0);
+}
+
+#[test]
+fn a_commit_that_skips_an_epoch_is_not_a_reason_to_join_again() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+    let s = net.conv_of(a, "bob@example.net").unwrap();
+
+    // Every event is here, and the server sends a commit two epochs on.
+    let epoch = net.convs[s].epoch.unwrap() + 2;
+    let commit = net.a_commit_of(s);
+    net.forge_commit(s, "alice@example.org", epoch, commit);
+
+    // Nothing expired, so the server left a commit out: Bob's device does
+    // not take whatever group GROUPINFO offers (12.6).
+    assert_eq!(net.sent_to(b, "GROUPINFO", "alice@example.org"), 0);
+    assert_eq!(
+        net.devs[b].group("alice@example.org").unwrap().state,
+        GroupState::Rejected
+    );
+}
+
+#[test]
+fn a_rejected_group_stays_rejected_under_a_new_id() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let _b = net.device("bob@example.net", 2);
+    let c = net.device("carol@example.com", 4);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+    let s = net.conv_of(a, "bob@example.net").unwrap();
+    net.force_external_join(c, s);
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+
+    // The server reports another id for the conversation. The device
+    // discards its history, but not the rejection (12.6).
+    net.convs[s].id = "c9999999".into();
+    reconnect(&mut net, a);
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+    assert_eq!(net.sent_to(a, "GROUPINFO", "bob@example.net"), 0);
 }

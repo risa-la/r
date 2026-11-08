@@ -510,6 +510,13 @@ impl SyncEngine {
             }
             return Ok(());
         }
+        // 12.6: a room's group is checked against the room's events, which
+        // the device sees once it has joined the room and caught up. The
+        // Welcome stays on the server until then.
+        if conv.is_room() && (!row.joined || row.sync_point < row.head.max(w.seq.get())) {
+            self.e2().deferred.push(w);
+            return Ok(());
+        }
         let result = self.e2ee_write(|tx| {
             group::join_welcome(tx, &dev, &row, &w.welcome, &w.tree, w.seq.get())
         })?;
@@ -558,7 +565,8 @@ impl SyncEngine {
         self.e2ee_advance(conv)
     }
 
-    /// Tries the Welcomes that waited for their conversation's id.
+    /// Tries the Welcomes that waited for their conversation's id, or, for
+    /// a room, for the device to join it and catch up (12.6, 12.7).
     fn retry_deferred(&mut self) -> Result<(), SyncError> {
         let Some(e) = self.e2ee.as_mut() else {
             return Ok(());
@@ -619,6 +627,9 @@ impl SyncEngine {
     pub(super) fn e2ee_advance(&mut self, conv: &Conv) -> Result<(), SyncError> {
         if self.e2ee.is_none() {
             return Ok(());
+        }
+        if self.has_deferred(conv) {
+            self.retry_deferred()?;
         }
         if self.has_e2ee() {
             self.apply_commits(conv)?;
@@ -699,17 +710,27 @@ impl SyncEngine {
                     return Ok(());
                 }
                 Ok(Applied::Ahead) => {
-                    // The commit before it expired (7.5, 12.11): join
-                    // again by external commit.
-                    let _ = self.e2ee_write(|tx| group::mark(tx, &row, GroupState::Broken))?;
+                    // The commits before it expired (7.5, 12.11): join
+                    // again by external commit. If every event between is
+                    // here, the server left a commit out, and joining again
+                    // would take whatever group it offers: the device
+                    // stops following the group instead (12.6).
+                    let commit_seq = self.write(|tx| Ok(tx.group(row.id)?.map(|g| g.commit_seq)))?;
+                    let expired = match commit_seq {
+                        Some(from) => self.write(|tx| tx.events_missing(row.id, from, seq))?,
+                        None => false,
+                    };
+                    if expired {
+                        let _ = self.e2ee_write(|tx| group::mark(tx, &row, GroupState::Broken))?;
+                    } else {
+                        warn!(%conv, seq, epoch, "a commit skips an epoch");
+                        self.reject_group(conv, &row)?;
+                    }
                     return Ok(());
                 }
                 Err(E2eeError::Rejected(why)) => {
                     warn!(%conv, seq, why, "a commit fails the checks of 12.6");
-                    let _ = self.e2ee_write(|tx| group::mark(tx, &row, GroupState::Rejected))?;
-                    self.out
-                        .notifications
-                        .push(Notification::GroupRejected { conv: conv.clone() });
+                    self.reject_group(conv, &row)?;
                     return Ok(());
                 }
                 Err(E2eeError::KeyFiles(uids)) => {
@@ -728,6 +749,16 @@ impl SyncEngine {
                 }
             }
         }
+    }
+
+    /// The device stops following the conversation's group for good, and
+    /// warns the user (12.6).
+    fn reject_group(&mut self, conv: &Conv, row: &ConvRow) -> Result<(), SyncError> {
+        let _ = self.e2ee_write(|tx| group::mark(tx, row, GroupState::Rejected))?;
+        self.out
+            .notifications
+            .push(Notification::GroupRejected { conv: conv.clone() });
+        Ok(())
     }
 
     /// Decrypts the conversation's ENC events whose keys are here, and
@@ -763,7 +794,7 @@ impl SyncEngine {
         if !e.welcomes_listed || e.busy.contains(conv) || e.rejoined.contains(conv) {
             return Ok(());
         }
-        if !self.is_live(conv) {
+        if !self.is_live(conv) || self.has_deferred(conv) {
             return Ok(());
         }
         let account = self.account;
@@ -772,6 +803,10 @@ impl SyncEngine {
                 return Ok(false);
             };
             if !row.joined || row.conv_id.is_none() {
+                return Ok(false);
+            }
+            // 12.6: a room's members are checked from its events.
+            if row.name.is_room() && row.sync_point < row.head {
                 return Ok(false);
             }
             let group = tx.group(row.id)?;
@@ -806,18 +841,19 @@ impl SyncEngine {
                 conv: c,
                 group_info,
                 tree,
+                seq,
                 ..
-            } if c == conv => Some((group_info.clone(), tree.clone())),
+            } if c == conv => Some((group_info.clone(), tree.clone(), seq.map_or(0, Seq::get))),
             _ => None,
         });
-        let (Outcome::Ok(_), Some((info, tree))) = (&reply.outcome, found) else {
+        let (Outcome::Ok(_), Some((info, tree, at))) = (&reply.outcome, found) else {
             return Ok(());
         };
         let account = self.account;
         let Some(row) = self.write(|tx| tx.conv_by_name(account, conv))? else {
             return Ok(());
         };
-        match self.e2ee_write(|tx| group::external_join(tx, &dev, &row, &info, &tree))? {
+        match self.e2ee_write(|tx| group::external_join(tx, &dev, &row, (&info, &tree, at)))? {
             Ok(commit) => self.send_commit(conv, commit, Purpose::Join),
             Err(e) => warn!(%conv, error = %e, "joining by external commit"),
         }
@@ -1407,7 +1443,7 @@ impl SyncEngine {
             let mut remove: Vec<LeafNodeIndex> = Vec::new();
             for leaf in &leaves {
                 let gone = tx.key_listed(account, &leaf.uid, &leaf.key)? == Some(false)
-                    || (row.name.is_room() && left(tx, &row, &leaf.uid)?);
+                    || (row.name.is_room() && tx.left_room(row.id, &leaf.uid)?);
                 if gone && leaf.key != dev.key.public_key() {
                     remove.push(leaf.index);
                 }
@@ -1742,20 +1778,6 @@ fn room_setting(tx: &Tx<'_>, row: &ConvRow, key: &str) -> Result<Option<String>,
             |r| r.get(0),
         )
         .optional()?)
-}
-
-/// Whether the room's stored events show that `uid` is no longer a member
-/// or invited (12.6).
-fn left(tx: &Tx<'_>, row: &ConvRow, uid: &Uid) -> Result<bool, StoreError> {
-    let member: Option<(Option<bool>, bool)> = tx
-        .conn()
-        .query_row(
-            "SELECT joined, banned FROM room_members WHERE conv = ?1 AND uid = ?2",
-            params![row.id.get(), uid.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(matches!(member, Some((Some(false), _)) | Some((_, true))))
 }
 
 /// A line of a reply that the encryption engine reads.

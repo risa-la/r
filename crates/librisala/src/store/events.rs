@@ -339,8 +339,17 @@ impl<'a> Tx<'a> {
                 .execute(&format!("DELETE FROM {table} WHERE conv = ?1"), [row.id.0])?;
         }
         // The group belonged to the conversation that is gone (12.5). Its
-        // history keys stay, under that conversation's id.
-        self.forget_group(row.id)?;
+        // history keys stay, under that conversation's id. A group the
+        // device rejected stays rejected: a new id must not let the device
+        // join whatever group the server offers next (12.6).
+        match self.group(row.id)? {
+            Some(mut g) if g.state == super::e2ee::GroupState::Rejected => {
+                self.delete_mls_state(&g.group_id)?;
+                g.pending = None;
+                self.save_group(&g)?;
+            }
+            _ => self.forget_group(row.id)?,
+        }
         if let Some(old) = row.conv_id.take()
             && new_id.as_ref() != Some(&old)
         {
@@ -633,13 +642,83 @@ impl<'a> Tx<'a> {
                 self.member_role(conv, uid.as_str(), role.as_str(), at)?;
                 self.changed(Change::Members { conv });
             }
+            EventBody::Invite { uid, .. } => {
+                // 12.6: an invitee's devices may be in the room's group.
+                self.tx.execute(
+                    "INSERT INTO room_members (conv, uid, invited_seq) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (conv, uid) DO UPDATE
+                         SET invited_seq = MAX(invited_seq, excluded.invited_seq)",
+                    params![conv.0, uid.as_str(), sql(at)],
+                )?;
+            }
             EventBody::Msg(_)
             | EventBody::Delete { .. }
-            | EventBody::Invite { .. }
             | EventBody::Enc(_)
             | EventBody::Commit { .. } => {}
         }
         Ok(())
+    }
+
+    /// Whether the room's stored events show that `uid` is no longer a
+    /// member or invited: it left, was kicked or banned, or declined an
+    /// invitation, and was not invited again since (12.6).
+    pub(crate) fn left_room(&self, conv: ConvId, uid: &Uid) -> Result<bool, StoreError> {
+        Ok(match self.membership(conv, uid)? {
+            Some(m) => m.banned || (m.joined == Some(false) && m.invited_seq <= m.joined_seq),
+            None => false,
+        })
+    }
+
+    /// Whether the room's stored events show that `uid` was a member or
+    /// invited at seq `at` (12.6): it is one now, or its membership changed
+    /// after `at`, so that a later commit is what removes its leaves.
+    pub(crate) fn member_at(&self, conv: ConvId, uid: &Uid, at: u64) -> Result<bool, StoreError> {
+        let Some(m) = self.membership(conv, uid)? else {
+            return Ok(false);
+        };
+        let now = !m.banned && (m.joined == Some(true) || m.invited_seq > m.joined_seq);
+        let changed = m.joined_seq > at || m.ban_seq > at || m.invited_seq > at;
+        Ok(now || changed)
+    }
+
+    /// Whether some event between seqs `after` and `before`, both
+    /// excluded, is not stored: it expired (7.5), as the sync point only
+    /// moves past events that are stored or gone (7.1).
+    pub(crate) fn events_missing(
+        &self,
+        conv: ConvId,
+        after: u64,
+        before: u64,
+    ) -> Result<bool, StoreError> {
+        if before <= after + 1 {
+            return Ok(false);
+        }
+        let stored: i64 = self.tx.query_row(
+            "SELECT COUNT(*) FROM events WHERE conv = ?1 AND seq > ?2 AND seq < ?3",
+            params![conv.0, sql(after), sql(before)],
+            |r| r.get(0),
+        )?;
+        Ok((stored.max(0) as u64) < before - after - 1)
+    }
+
+    fn membership(&self, conv: ConvId, uid: &Uid) -> Result<Option<Membership>, StoreError> {
+        Ok(self
+            .tx
+            .query_row(
+                "SELECT joined, joined_seq, banned, ban_seq, invited_seq FROM room_members
+                 WHERE conv = ?1 AND uid = ?2",
+                params![conv.0, uid.as_str()],
+                |r| {
+                    Ok(Membership {
+                        joined: r.get(0)?,
+                        joined_seq: r.get::<_, i64>(1)?.max(0) as u64,
+                        banned: r.get(2)?,
+                        ban_seq: r.get::<_, i64>(3)?.max(0) as u64,
+                        invited_seq: r.get::<_, i64>(4)?.max(0) as u64,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Sets `joined` or `banned` for a member, unless a later event set it.
@@ -957,6 +1036,15 @@ impl<'a> Tx<'a> {
         )?;
         Ok(())
     }
+}
+
+/// A room member's row, as the stored events and snapshots show it.
+struct Membership {
+    joined: Option<bool>,
+    joined_seq: u64,
+    banned: bool,
+    ban_seq: u64,
+    invited_seq: u64,
 }
 
 /// Turns a message into the placeholder HISTORY sends for a deleted one:
