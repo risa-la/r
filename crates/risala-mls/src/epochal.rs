@@ -600,27 +600,61 @@ impl PeriodKeyring {
 // ---------------------------------------------------------------------------
 // REVEALs seen from others
 
-/// The most REVEALs kept for one device. A device sends at most one per
-/// group and period, and they matter only for the current period and the
-/// one before (see [`RevealRegistry::prune`]).
+/// The most REVEALs kept for one device whose seeds derive no period key
+/// that the device has seen certified. A device sends at most one per
+/// group and period, and they matter only for the period before the
+/// current one (see [`RevealRegistry::prune`]). REVEALs that derive a
+/// certified period key are never pushed out by these.
 pub const MAX_REVEALS_PER_DEVICE: usize = 8;
+
+/// The most certified period keys kept for one device: one a period, and
+/// only the current period and the one before matter.
+const MAX_CERTIFIED_PER_DEVICE: usize = 8;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Revealed {
     period: u32,
     seed: [u8; SEED_LEN],
+    /// The period key the seed derives for its own period, which keys the
+    /// entry: two REVEALs of one period with different seeds are two
+    /// entries, so a forged one never replaces a real one.
+    period_key: Vec<u8>,
+    /// Whether the seed derives a period key that the device has seen
+    /// certified by the device key (12.10). Only the device itself can
+    /// make such a REVEAL.
+    certified: bool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct DeviceReveals {
     /// The encoded RisalaIdentity of the device.
     identity: Vec<u8>,
+    /// In the order they were recorded.
     reveals: Vec<Revealed>,
+    /// Period keys seen in certificates that verified under the device's
+    /// key, by period.
+    certified: Vec<(u32, Vec<u8>)>,
+}
+
+impl DeviceReveals {
+    fn is_certified(&self, revealed: &Revealed) -> bool {
+        self.certified
+            .iter()
+            .any(|(p, key)| seed_derives(&revealed.seed, revealed.period, *p, key))
+    }
 }
 
 /// The REVEALs a device has seen from other devices, in any group (12.10):
 /// an ATTEST whose period key one of them derives is not valid, since one
 /// period key serves all of a device's epochal groups.
+///
+/// In a public room, anyone can join with a credential that names any
+/// identity's device, and send REVEALs in its name. So the registry keeps
+/// REVEALs only of periods that are over, keys each by the period key its
+/// seed derives, and never lets those whose seeds derive a period key seen
+/// in a valid certificate ([`RevealRegistry::note_certified`]) be pushed
+/// out by those that do not: forged REVEALs cannot make a device forget a
+/// real one.
 ///
 /// One registry serves all of the device's groups. It holds only seeds
 /// that are public by design.
@@ -635,13 +669,7 @@ impl RevealRegistry {
         RevealRegistry::default()
     }
 
-    /// Records a REVEAL of `period` with `seed`, sent by a leaf whose
-    /// credential is `identity`. Keeps the newest
-    /// [`MAX_REVEALS_PER_DEVICE`] periods for each device.
-    pub fn record(&mut self, identity: &RisalaIdentity, period: u32, seed: &[u8; SEED_LEN]) {
-        if identity.is_guest() {
-            return;
-        }
+    fn device_mut(&mut self, identity: &RisalaIdentity) -> &mut DeviceReveals {
         let encoded = identity.encode();
         let index = match self.devices.iter().position(|d| d.identity == encoded) {
             Some(i) => i,
@@ -649,23 +677,78 @@ impl RevealRegistry {
                 self.devices.push(DeviceReveals {
                     identity: encoded,
                     reveals: Vec::new(),
+                    certified: Vec::new(),
                 });
                 self.devices.len() - 1
             }
         };
-        let reveals = &mut self.devices[index].reveals;
-        if reveals
+        &mut self.devices[index]
+    }
+
+    /// Records a REVEAL of `period` with `seed`, sent by a leaf whose
+    /// credential is `identity`, read at `now` by the device's clock. A
+    /// REVEAL comes only after its period is over (12.10), so one of the
+    /// current period or a later one is ignored: it could only be forged,
+    /// and would never be pruned. Of those whose seeds derive no certified
+    /// period key, the newest [`MAX_REVEALS_PER_DEVICE`] are kept.
+    pub fn record(
+        &mut self,
+        identity: &RisalaIdentity,
+        period: u32,
+        seed: &[u8; SEED_LEN],
+        now: Timestamp,
+    ) {
+        if identity.is_guest() || period >= period_of(now) {
+            return;
+        }
+        let period_key = SigningKey::from_seed(*seed).public_key().to_vec();
+        let device = self.device_mut(identity);
+        if device
+            .reveals
             .iter()
-            .any(|r| r.period == period && r.seed == *seed)
+            .any(|r| r.period == period && r.period_key == period_key)
         {
             return;
         }
-        reveals.push(Revealed {
+        let mut revealed = Revealed {
             period,
             seed: *seed,
-        });
-        reveals.sort_by_key(|r| std::cmp::Reverse(r.period));
-        reveals.truncate(MAX_REVEALS_PER_DEVICE);
+            period_key,
+            certified: false,
+        };
+        revealed.certified = device.is_certified(&revealed);
+        device.reveals.push(revealed);
+        let uncertified = device.reveals.iter().filter(|r| !r.certified).count();
+        if uncertified > MAX_REVEALS_PER_DEVICE
+            && let Some(oldest) = device.reveals.iter().position(|r| !r.certified)
+        {
+            device.reveals.remove(oldest);
+        }
+    }
+
+    /// Notes that a certificate of `period_key` for `period` verified under
+    /// the device key of the device that `identity` names (12.10), as in a
+    /// valid ATTEST. REVEALs whose seeds derive it are then kept before
+    /// any others.
+    pub fn note_certified(&mut self, identity: &RisalaIdentity, period: u32, period_key: &[u8]) {
+        if identity.is_guest() {
+            return;
+        }
+        let device = self.device_mut(identity);
+        if !device
+            .certified
+            .iter()
+            .any(|(p, key)| *p == period && key[..] == *period_key)
+        {
+            device.certified.push((period, period_key.to_vec()));
+            device.certified.sort_by_key(|(p, _)| std::cmp::Reverse(*p));
+            device.certified.truncate(MAX_CERTIFIED_PER_DEVICE);
+        }
+        for i in 0..device.reveals.len() {
+            if !device.reveals[i].certified && device.is_certified(&device.reveals[i]) {
+                device.reveals[i].certified = true;
+            }
+        }
     }
 
     /// Whether a REVEAL seen from the device of `identity` derives
@@ -679,17 +762,19 @@ impl RevealRegistry {
             .any(|r| seed_derives(&r.seed, r.period, period, period_key))
     }
 
-    /// Forgets REVEALs that can no longer matter: an ATTEST is accepted
-    /// only for the current period or the one before (12.10), and a seed
-    /// derives only its own period and earlier ones, so a REVEAL of a
-    /// period before the one before `now` derives no key that could still
-    /// be accepted.
+    /// Forgets REVEALs and certified keys that can no longer matter: an
+    /// ATTEST is accepted only for the current period or the one before
+    /// (12.10), and a seed derives only its own period and earlier ones,
+    /// so a REVEAL of a period before the one before `now` derives no key
+    /// that could still be accepted.
     pub fn prune(&mut self, now: Timestamp) {
         let oldest = period_of(now).saturating_sub(1);
         for device in &mut self.devices {
             device.reveals.retain(|r| r.period >= oldest);
+            device.certified.retain(|(p, _)| *p >= oldest);
         }
-        self.devices.retain(|d| !d.reveals.is_empty());
+        self.devices
+            .retain(|d| !d.reveals.is_empty() || !d.certified.is_empty());
     }
 }
 
@@ -923,8 +1008,9 @@ mod tests {
 
         // Once the period's key is revealed, directly or by a later seed of
         // the chain, the ATTEST is not valid.
+        let later = at(period_start(period + 4));
         let mut seen = RevealRegistry::new();
-        seen.record(&identity, period + 3, &ring.seed(period + 3).unwrap());
+        seen.record(&identity, period + 3, &ring.seed(period + 3).unwrap(), later);
         assert_eq!(
             check_attest(&attest, &check, &seen),
             Err(AttestError::Revealed)
@@ -935,12 +1021,13 @@ mod tests {
             &identity,
             period - 1,
             &previous_seed(&ring.seed(period).unwrap()),
+            later,
         );
         assert_eq!(check_attest(&attest, &check, &seen), Ok(()));
         // Nor does another device's REVEAL.
         let mut seen = RevealRegistry::new();
         let (_, other) = device(5);
-        seen.record(&other, period, &ring.seed(period).unwrap());
+        seen.record(&other, period, &ring.seed(period).unwrap(), later);
         assert_eq!(check_attest(&attest, &check, &seen), Ok(()));
     }
 
@@ -949,15 +1036,16 @@ mod tests {
         let (_, identity) = device(1);
         let mut ring = PeriodKeyring::new();
         let key = ring.key(10).unwrap();
+        let now = at(period_start(41));
         let mut seen = RevealRegistry::new();
         for p in 10..30 {
-            seen.record(&identity, p, &[p as u8; 32]);
+            seen.record(&identity, p, &[p as u8; 32], now);
         }
-        seen.record(&identity, 40, &ring.seed(40).unwrap());
+        seen.record(&identity, 40, &ring.seed(40).unwrap(), now);
         assert!(seen.derives(&identity, 10, key.public_key()));
-        // Only the newest are kept.
+        // Only the newest uncertified ones are kept.
         assert_eq!(seen.devices[0].reveals.len(), MAX_REVEALS_PER_DEVICE);
-        assert_eq!(seen.devices[0].reveals[0].period, 40);
+        assert_eq!(seen.devices[0].reveals.last().unwrap().period, 40);
         let json = serde_json::to_string(&seen).unwrap();
         let back: RevealRegistry = serde_json::from_str(&json).unwrap();
         assert!(back.derives(&identity, 10, key.public_key()));
@@ -965,6 +1053,97 @@ mod tests {
         assert!(seen.derives(&identity, 10, key.public_key()));
         seen.prune(at(period_start(42)));
         assert!(seen.devices.is_empty());
+    }
+
+    /// A REVEAL comes only after its period, so one of the current period
+    /// or a later one is not recorded: it could only be forged, and would
+    /// never be pruned (CR-M2).
+    #[test]
+    fn reveals_of_periods_not_over() {
+        let (_, identity) = device(1);
+        let mut ring = PeriodKeyring::new();
+        ring.key(100).unwrap();
+        let mut seen = RevealRegistry::new();
+        let during = at(period_start(100) + GRACE_MS);
+        seen.record(&identity, 100, &ring.seed(100).unwrap(), during);
+        seen.record(&identity, 4_000_000_000, &[9; 32], during);
+        assert!(seen.devices.is_empty() || seen.devices[0].reveals.is_empty());
+        seen.record(&identity, 100, &ring.seed(100).unwrap(), at(reveal_from(100)));
+        assert_eq!(seen.devices[0].reveals.len(), 1);
+    }
+
+    /// Forged REVEALs in a device's name, from a public room's leaf whose
+    /// credential names it, cannot push out its real REVEAL, once the
+    /// period key it derives has been seen certified; so a server cannot
+    /// then replay an ATTEST signed with the revealed key (CR-M2).
+    #[test]
+    fn forged_reveals_do_not_push_out_real_ones() {
+        let (device_key, identity) = device(1);
+        let mut ring = PeriodKeyring::new();
+        let period = 20766;
+        let group = b"public room";
+        let leaf = SigningKey::from_seed([3; 32]);
+        let pseudonym = Pseudonym([7; 16]);
+        let attest = ring
+            .attest(
+                &device_key,
+                &identity,
+                group,
+                period,
+                leaf.public_key(),
+                pseudonym,
+            )
+            .unwrap();
+        let noon = at(period_start(period) + PERIOD_MS / 2);
+        let check = AttestCheck {
+            group_id: group,
+            identity: &identity,
+            device_key: device_key.public_key(),
+            leaf_key: leaf.public_key(),
+            post_t: noon,
+            message_pseudonym: Some(pseudonym),
+            now: noon,
+        };
+        let mut seen = RevealRegistry::new();
+        // The device saw the ATTEST, whose certificate verified.
+        assert_eq!(check_attest(&attest, &check, &seen), Ok(()));
+        seen.note_certified(&identity, period, &attest.period_key[..]);
+        // The real REVEAL, after the period.
+        let after = at(reveal_from(period));
+        seen.record(&identity, period, &ring.seed(period).unwrap(), after);
+        // Then a flood of forged ones in the device's name, for the same
+        // period and the one before, and for far future periods.
+        for i in 0..100u8 {
+            seen.record(&identity, period, &[i; 32], after);
+            seen.record(&identity, period - 1, &[i; 32], after);
+            seen.record(&identity, 4_000_000_000 - u32::from(i), &[i; 32], after);
+        }
+        // A server replays the ATTEST with a `t` inside the grace hour: the
+        // REVEAL is still there, so it is not valid.
+        let replay = AttestCheck {
+            post_t: at(grace_end(period) - 1),
+            now: at(grace_end(period) - 1),
+            ..check
+        };
+        assert_eq!(
+            check_attest(&attest, &replay, &seen),
+            Err(AttestError::Revealed)
+        );
+        // Memory stays bounded: the certified REVEAL and at most
+        // MAX_REVEALS_PER_DEVICE forged ones.
+        assert_eq!(seen.devices[0].reveals.len(), MAX_REVEALS_PER_DEVICE + 1);
+        // A REVEAL recorded before its key was seen certified is marked
+        // once it is.
+        let mut later = RevealRegistry::new();
+        later.record(&identity, period, &ring.seed(period).unwrap(), after);
+        later.note_certified(&identity, period, &attest.period_key[..]);
+        for i in 0..100u8 {
+            later.record(&identity, period, &[i; 32], after);
+        }
+        assert_eq!(
+            check_attest(&attest, &replay, &later),
+            Err(AttestError::Revealed)
+        );
     }
 
     /// Test vectors for Appendix B (task V1): a chain of seeds, a

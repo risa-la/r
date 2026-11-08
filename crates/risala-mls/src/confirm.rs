@@ -994,7 +994,13 @@ impl Confirmer {
                             now,
                         ));
                     } else if let ContentLine::Reveal { period, seed } = line {
-                        events.extend(self.on_reveal(device, sender, *period, seed.as_bytes()));
+                        events.extend(self.on_reveal(
+                            device,
+                            sender,
+                            *period,
+                            seed.as_bytes(),
+                            now,
+                        ));
                     }
                 }
             }
@@ -1121,6 +1127,17 @@ impl Confirmer {
                     now,
                 };
                 let result = check_attest(attest, &check, device.reveals);
+                // A certificate that verified under the device key: REVEALs
+                // whose seeds derive its key are then never pushed out by
+                // forged ones (12.10).
+                if !matches!(
+                    result,
+                    Err(AttestError::Guest | AttestError::Certificate)
+                ) {
+                    device
+                        .reveals
+                        .note_certified(&identity, attest.period, &attest.period_key[..]);
+                }
                 Some(self.attest_checked(sender, attest, result, now))
             }
             DeviceStatus::Unknown => {
@@ -1184,10 +1201,11 @@ impl Confirmer {
         sender: u32,
         period: u32,
         seed: &[u8; 32],
+        now: Timestamp,
     ) -> Option<Event> {
         let leaf = self.leaves.get_mut(&sender)?;
         let identity = leaf.identity();
-        device.reveals.record(&identity, period, seed);
+        device.reveals.record(&identity, period, seed, now);
         let mut bad = None;
         for (&q, attested) in leaf.attests.range_mut(..=period).rev() {
             if period - q >= CHAIN_LEN {
