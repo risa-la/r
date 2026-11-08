@@ -42,7 +42,10 @@ pub use group::{
     join_by_external_commit, key_package, stage_welcome,
 };
 pub use history::HistoryKey;
-pub use keypackage::{CheckedKeyPackage, KeyPackageError, check_key_package, lifetime_acceptable};
+pub use keypackage::{
+    CheckedKeyPackage, KeyPackageError, check_key_package, encryption_key_ok, hpke_public_key_ok,
+    lifetime_acceptable,
+};
 pub use message::{Encrypted, Message, MessageError, UnverifiedMessage, decrypt, encrypt};
 pub use signer::{DeviceSigner, credential_with_key};
 pub use wire::WireError;

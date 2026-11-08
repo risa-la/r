@@ -23,11 +23,10 @@ use openmls_traits::random::OpenMlsRand;
 use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 use openmls_traits::types::{
     AeadType, Ciphersuite, CryptoError, ExporterSecret, HashType, HpkeCiphertext, HpkeConfig,
-    HpkeKeyPair, KemOutput, SignatureScheme,
+    HpkeKemType, HpkeKeyPair, KemOutput, SignatureScheme,
 };
-use risala_proto::auth::{PUBLIC_KEY_LEN, PublicKey, SEED_LEN, SIGNATURE_LEN};
+use risala_proto::auth::{PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN};
 use tls_codec::SecretVLBytes;
-use zeroize::Zeroizing;
 
 use crate::CIPHERSUITE;
 
@@ -148,22 +147,13 @@ impl OpenMlsCrypto for RisalaCrypto {
         self.inner.aead_decrypt(alg, key, ct_tag, nonce, aad)
     }
 
-    /// For ML-DSA-44, the private key is the 32-byte seed (App. B). risala
-    /// never calls this: devices sign with [`DeviceSigner`], whose key
-    /// stays out of OpenMLS.
-    ///
-    /// [`DeviceSigner`]: crate::DeviceSigner
+    /// Refused for ML-DSA-44: device keys are made by librisala, and their
+    /// seeds never pass through OpenMLS (12.2).
     fn signature_key_gen(&self, alg: SignatureScheme) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-        if alg != SignatureScheme::MLDSA44 {
-            return self.inner.signature_key_gen(alg);
+        if alg == SignatureScheme::MLDSA44 {
+            return Err(CryptoError::UnsupportedSignatureScheme);
         }
-        let seed: Zeroizing<[u8; SEED_LEN]> = Zeroizing::new(
-            self.inner
-                .random_array()
-                .map_err(|_| CryptoError::InsufficientRandomness)?,
-        );
-        let pair = mldsa::generate_key_pair(*seed);
-        Ok((seed.to_vec(), pair.verification_key.as_slice().to_vec()))
+        self.inner.signature_key_gen(alg)
     }
 
     fn verify_signature(
@@ -186,20 +176,15 @@ impl OpenMlsCrypto for RisalaCrypto {
         }
     }
 
-    /// For ML-DSA-44, `key` is the 32-byte seed, and the signature is the
-    /// deterministic variant. risala signs with [`DeviceSigner`] instead.
+    /// Refused for ML-DSA-44: devices sign with [`DeviceSigner`], which
+    /// signs only MLS content (12.2), and whose key stays out of OpenMLS.
     ///
     /// [`DeviceSigner`]: crate::DeviceSigner
     fn sign(&self, alg: SignatureScheme, data: &[u8], key: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if alg != SignatureScheme::MLDSA44 {
-            return self.inner.sign(alg, data, key);
+        if alg == SignatureScheme::MLDSA44 {
+            return Err(CryptoError::UnsupportedSignatureScheme);
         }
-        let seed: [u8; SEED_LEN] = key.try_into().map_err(|_| CryptoError::InvalidLength)?;
-        let mut pair = mldsa::generate_key_pair(seed);
-        let signature = mldsa::sign(&pair.signing_key, data, b"", [0; 32])
-            .map_err(|_| CryptoError::SigningError);
-        zeroize::Zeroize::zeroize(pair.signing_key.as_ref_mut());
-        Ok(signature?.as_slice().to_vec())
+        self.inner.sign(alg, data, key)
     }
 
     fn hpke_seal(
@@ -210,6 +195,7 @@ impl OpenMlsCrypto for RisalaCrypto {
         aad: &[u8],
         ptxt: &[u8],
     ) -> Result<HpkeCiphertext, CryptoError> {
+        check_hpke_public_key(&config, pk_r)?;
         self.inner.hpke_seal(config, pk_r, info, aad, ptxt)
     }
 
@@ -232,6 +218,7 @@ impl OpenMlsCrypto for RisalaCrypto {
         exporter_context: &[u8],
         exporter_length: usize,
     ) -> Result<(KemOutput, ExporterSecret), CryptoError> {
+        check_hpke_public_key(&config, pk_r)?;
         self.inner.hpke_setup_sender_and_export(
             config,
             pk_r,
@@ -267,6 +254,22 @@ impl OpenMlsCrypto for RisalaCrypto {
     ) -> Result<HpkeKeyPair, CryptoError> {
         self.inner.derive_hpke_keypair(config, ikm)
     }
+}
+
+/// The length of an X-Wing public key: ML-KEM-768's 1184 bytes and
+/// X25519's 32.
+pub const X_WING_PUBLIC_KEY_LEN: usize = 1216;
+
+/// Refuses an X-Wing public key of the wrong length, before libcrux-kem
+/// 0.0.9 slices it and panics on a short one (RUSTSEC-2026-0331). Anyone
+/// can put such a key in a KeyPackage, a leaf or a GroupInfo's
+/// `external_pub`, and OpenMLS does not check its length, so without this a
+/// device that encrypts to it would crash.
+fn check_hpke_public_key(config: &HpkeConfig, pk: &[u8]) -> Result<(), CryptoError> {
+    if config.0 == HpkeKemType::XWingKemDraft6 && pk.len() != X_WING_PUBLIC_KEY_LEN {
+        return Err(CryptoError::InvalidLength);
+    }
+    Ok(())
 }
 
 impl OpenMlsRand for RisalaCrypto {
@@ -342,7 +345,32 @@ impl<S: StorageProvider<CURRENT_VERSION>> OpenMlsProvider for Provider<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use risala_proto::auth::SecretKey;
+    use risala_proto::auth::{SEED_LEN, SecretKey};
+
+    /// A short X-Wing public key, as anyone can put in a KeyPackage, leaf or
+    /// GroupInfo, is an error rather than a panic (RUSTSEC-2026-0331).
+    #[test]
+    fn hpke_refuses_x_wing_keys_of_the_wrong_length() {
+        let crypto = RisalaCrypto::new().unwrap();
+        let pair = crypto.derive_hpke_keypair(CIPHERSUITE.hpke_config(), &[7; 32]).unwrap();
+        assert_eq!(pair.public.len(), X_WING_PUBLIC_KEY_LEN);
+        assert!(crypto.hpke_seal(CIPHERSUITE.hpke_config(), &pair.public, b"", b"", b"hi").is_ok());
+        for len in [0, 10, 1184, X_WING_PUBLIC_KEY_LEN - 1, X_WING_PUBLIC_KEY_LEN + 1] {
+            let pk = vec![1; len];
+            assert_eq!(
+                crypto.hpke_seal(CIPHERSUITE.hpke_config(), &pk, b"", b"", b"hi").err(),
+                Some(CryptoError::InvalidLength),
+                "{len}"
+            );
+            assert_eq!(
+                crypto
+                    .hpke_setup_sender_and_export(CIPHERSUITE.hpke_config(), &pk, b"", b"", 32)
+                    .err(),
+                Some(CryptoError::InvalidLength),
+                "{len}"
+            );
+        }
+    }
 
     #[test]
     fn supports_the_suite() {
@@ -354,18 +382,23 @@ mod tests {
     }
 
     #[test]
-    fn ml_dsa_matches_the_device_key() {
+    fn ml_dsa_verifies_device_signatures_and_never_signs() {
         let crypto = RisalaCrypto::new().unwrap();
-        let (seed, public) = crypto.signature_key_gen(SignatureScheme::MLDSA44).unwrap();
-        let key = SecretKey::from_seed(seed.as_slice().try_into().unwrap());
-        assert_eq!(public, key.public_key().as_bytes());
+        let seed = [9; SEED_LEN];
+        let key = SecretKey::from_seed(seed);
+        let public = key.public_key().as_bytes().to_vec();
 
+        // Only the device signer signs, and only MLS content (12.2).
+        assert_eq!(
+            crypto.signature_key_gen(SignatureScheme::MLDSA44),
+            Err(CryptoError::UnsupportedSignatureScheme)
+        );
         let content = crate::primitives::sign_content("test", b"data");
-        let ours = crypto
-            .sign(SignatureScheme::MLDSA44, &content, &seed)
-            .unwrap();
-        let theirs = key.sign_mls(&content).unwrap();
-        assert_eq!(ours, theirs.as_bytes());
+        assert_eq!(
+            crypto.sign(SignatureScheme::MLDSA44, &content, &seed),
+            Err(CryptoError::UnsupportedSignatureScheme)
+        );
+        let ours = key.sign_mls(&content).unwrap().as_bytes().to_vec();
         assert_eq!(
             crypto.verify_signature(SignatureScheme::MLDSA44, &content, &public, &ours),
             Ok(())

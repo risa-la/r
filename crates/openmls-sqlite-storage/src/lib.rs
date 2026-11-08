@@ -9,7 +9,9 @@
 //!
 //! - The tables come as [`SCHEMA`], for the caller to run as one of its own
 //!   migrations, instead of through refinery. They are the upstream tables
-//!   after its migrations 1 and 2, without the virtual-client tables.
+//!   of its migration 1. Its migration 2 only adds `application_export_tree`
+//!   to a CHECK list, for `extensions-draft`, and the rest add the
+//!   virtual-client tables, so none of them applies.
 //! - The `virtual-clients-draft` and `extensions-draft` features are gone.
 //!   risala uses neither.
 //! - [`MsgPack`] is a binary [`Codec`].

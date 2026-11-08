@@ -9,6 +9,7 @@
 use std::time::SystemTime;
 
 use openmls::prelude::{KeyPackage, KeyPackageVerifyError, Lifetime, ProtocolVersion};
+use openmls::treesync::EncryptionKey;
 use openmls_traits::crypto::OpenMlsCrypto;
 use risala_proto::auth::PublicKey;
 use risala_proto::mls;
@@ -47,6 +48,33 @@ pub enum KeyPackageError {
     /// weeks and one hour.
     #[error("the KeyPackage's lifetime is not acceptable")]
     Lifetime,
+    /// Its init key or its leaf's encryption key is not an X-Wing public
+    /// key of the right length, which would crash whoever encrypts to it
+    /// (see [`crate::crypto::X_WING_PUBLIC_KEY_LEN`]).
+    #[error("the KeyPackage has an HPKE key of the wrong length")]
+    HpkeKey,
+}
+
+/// Whether `key` has the length of an X-Wing public key, the HPKE keys of
+/// the suite (12.2). Init keys, leaves' encryption keys, parent nodes' keys
+/// and a GroupInfo's `external_pub` must all pass, since OpenMLS does not
+/// check their length.
+pub fn hpke_public_key_ok(key: &[u8]) -> bool {
+    key.len() == crate::crypto::X_WING_PUBLIC_KEY_LEN
+}
+
+/// [`hpke_public_key_ok`] for a leaf's or parent node's encryption key,
+/// whose bytes OpenMLS keeps private: they are read from its TLS encoding,
+/// a variable-length vector.
+pub fn encryption_key_ok(key: &EncryptionKey) -> bool {
+    use tls_codec::{DeserializeBytes as _, Serialize as _};
+    let Ok(encoded) = key.tls_serialize_detached() else {
+        return false;
+    };
+    matches!(
+        tls_codec::VLBytes::tls_deserialize_exact_bytes(&encoded),
+        Ok(bytes) if hpke_public_key_ok(bytes.as_slice())
+    )
 }
 
 /// A KeyPackage that passed [`check_key_package`].
@@ -100,6 +128,11 @@ pub fn check_key_package(
     if leaf.signature_key().as_slice() != key.as_bytes() {
         return Err(KeyPackageError::SignatureKey);
     }
+    if !hpke_public_key_ok(key_package.hpke_init_key().as_slice())
+        || !encryption_key_ok(leaf.encryption_key())
+    {
+        return Err(KeyPackageError::HpkeKey);
+    }
     if credential_uid(leaf.credential()).as_deref() != Some(uid.as_str()) {
         return Err(KeyPackageError::Credential);
     }
@@ -115,4 +148,20 @@ pub fn check_key_package(
         not_after: lifetime.not_after(),
         key_package,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::X_WING_PUBLIC_KEY_LEN;
+
+    #[test]
+    fn hpke_keys_must_be_x_wing_sized() {
+        assert!(hpke_public_key_ok(&[1; X_WING_PUBLIC_KEY_LEN]));
+        assert!(encryption_key_ok(&EncryptionKey::from(vec![1; X_WING_PUBLIC_KEY_LEN])));
+        for len in [0, 10, 1184, X_WING_PUBLIC_KEY_LEN - 1, X_WING_PUBLIC_KEY_LEN + 1] {
+            assert!(!hpke_public_key_ok(&vec![1; len]), "{len}");
+            assert!(!encryption_key_ok(&EncryptionKey::from(vec![1; len])), "{len}");
+        }
+    }
 }
