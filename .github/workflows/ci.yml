@@ -54,7 +54,9 @@ jobs:
         run: nix develop --command cargo test --release -p risala-pow -- --include-ignored
 
   # risala-pow on macOS, where the JIT maps its code with MAP_JIT: on
-  # Apple Silicon (aarch64), and on Intel (x86-64) through Rosetta 2.
+  # Apple Silicon (aarch64), and on a real Intel Mac (x86-64). Not under
+  # Rosetta 2, which lets a hardened x86-64 binary make executable memory
+  # even without the allow-jit entitlement, unlike a real Intel Mac.
   # Rust comes from rustup, which the runner image has; the Nix dev shell
   # would bring the whole risala toolchain for one crate.
   #
@@ -68,10 +70,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
-    # The newest Apple Silicon image: GitHub retires old ones, as it did
-    # macos-14.
-    runs-on: macos-latest
+        include:
+          # The newest Apple Silicon image: GitHub retires old ones, as it
+          # did macos-14.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # GitHub's last Intel image.
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -79,9 +86,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
           rustup default stable
-      - name: Rosetta 2
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: softwareupdate --install-rosetta --agree-to-license
       - name: cargo test --release -p risala-pow -- --include-ignored
         run: cargo test --release -p risala-pow --target ${{ matrix.target }} -- --include-ignored
       - name: the hardened runtime, with and without allow-jit
