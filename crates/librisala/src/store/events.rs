@@ -953,12 +953,13 @@ impl<'a> Tx<'a> {
             Option<String>,
             String,
             Option<Vec<u8>>,
+            Option<String>,
         );
         let base: Option<Base> = self
             .tx
             .query_row(
                 &format!(
-                    "SELECT rel, deleted, author, text, verb, message_id FROM events
+                    "SELECT rel, deleted, author, text, verb, message_id, enc FROM events
                      WHERE conv = ?1 AND seq = ?2 AND (verb = 'MSG' OR {DECRYPTED})"
                 ),
                 params![conv.0, sql(n)],
@@ -970,11 +971,12 @@ impl<'a> Tx<'a> {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((rel, deleted, author, text, verb, mid)) = base else {
+        let Some((rel, deleted, author, text, verb, mid, enc)) = base else {
             return Ok(());
         };
         if matches!(rel.as_deref(), Some("edit" | "react")) {
@@ -984,7 +986,9 @@ impl<'a> Tx<'a> {
             (String::new(), None)
         } else {
             // An encrypted edit counts only if it names the message by its
-            // id too (12.8), and only its author's (12.11).
+            // id too (12.8), and only its author's (12.11). A verified
+            // message changes only by a verified edit.
+            let verified = enc.as_deref() == Some("verified");
             let edit: Option<(i64, String)> = self
                 .tx
                 .query_row(
@@ -992,10 +996,11 @@ impl<'a> Tx<'a> {
                         "SELECT seq, text FROM events
                          WHERE conv = ?1 AND target = ?2 AND rel = 'edit' AND deleted = 0
                              AND author = ?3 AND verb = ?4
-                             AND (verb = 'MSG' OR ({DECRYPTED} AND target_mid = ?5))
+                             AND (verb = 'MSG' OR ({DECRYPTED} AND target_mid = ?5
+                                 AND (NOT ?6 OR enc = 'verified')))
                          ORDER BY seq DESC LIMIT 1"
                     ),
-                    params![conv.0, sql(n), author, verb, mid],
+                    params![conv.0, sql(n), author, verb, mid, verified],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -1021,7 +1026,7 @@ impl<'a> Tx<'a> {
             params![conv.0, sql(n)],
         )?;
         // An encrypted reaction counts only if it names the message by its
-        // id too (12.8).
+        // id too (12.8), and on a verified message only if it is verified.
         self.tx.execute(
             "INSERT INTO reactions (conv, target, reaction, count, mine)
              SELECT e.conv, e.target, e.text, COUNT(DISTINCT e.author),
@@ -1030,7 +1035,8 @@ impl<'a> Tx<'a> {
              LEFT JOIN events b ON b.conv = e.conv AND b.seq = e.target
              WHERE e.conv = ?1 AND e.target = ?2 AND e.rel = 'react' AND e.deleted = 0
                  AND (e.verb = 'MSG' OR (e.enc IN ('verified', 'unverified')
-                     AND b.message_id IS NOT NULL AND e.target_mid = b.message_id))
+                     AND b.message_id IS NOT NULL AND e.target_mid = b.message_id
+                     AND (b.enc IS NOT 'verified' OR e.enc = 'verified')))
              GROUP BY e.text",
             params![conv.0, sql(n)],
         )?;

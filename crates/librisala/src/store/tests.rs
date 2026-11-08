@@ -1713,3 +1713,45 @@ fn device_keys_come_oldest_first() {
         .collect();
     assert_eq!(listed, keys);
 }
+
+#[test]
+fn unverified_edits_and_reactions_do_not_change_a_verified_message() {
+    let (store, _, conv) = setup();
+    store_all(
+        &store,
+        conv,
+        &[
+            ev(1, "from=bob@example.net MSG #general lunch?"),
+            ev(2, "from=bob@example.net;edit=1 MSG #general hacked"),
+            ev(3, "from=carol@example.com;react=1 MSG #general 🍕"),
+        ],
+    );
+    // As if they were ENC events: the message verified, its edit and the
+    // reaction not (12.8), all naming it by its id.
+    store
+        .write(|tx| {
+            tx.conn().execute_batch(
+                "UPDATE events SET verb = 'ENC', message_id = x'01', target_mid = x'01',
+                     enc = CASE seq WHEN 1 THEN 'verified' ELSE 'unverified' END;",
+            )?;
+            tx.refresh_message(conv, 1)?;
+            tx.refresh_reactions(conv, 1)
+        })
+        .unwrap();
+    let item = store.message(conv, seq(1)).unwrap().unwrap();
+    assert_eq!(item.text.as_deref(), Some("lunch?"));
+    assert!(item.reactions.is_empty(), "{:?}", item.reactions);
+
+    // Verified ones count.
+    store
+        .write(|tx| {
+            tx.conn()
+                .execute_batch("UPDATE events SET enc = 'verified'")?;
+            tx.refresh_message(conv, 1)?;
+            tx.refresh_reactions(conv, 1)
+        })
+        .unwrap();
+    let item = store.message(conv, seq(1)).unwrap().unwrap();
+    assert_eq!(item.text.as_deref(), Some("hacked"));
+    assert_eq!(item.reactions.len(), 1);
+}
