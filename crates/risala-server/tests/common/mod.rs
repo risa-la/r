@@ -134,10 +134,18 @@ pub async fn join(s: &mut Session, who: &str, room: &str) -> String {
     ok
 }
 
-/// Reads one line from `who` and checks it against the pattern.
+/// Reads one line from `who` and checks it against the pattern, which may
+/// start with `*` as in [`exchange`].
 pub async fn expect(s: &mut Session, who: &str, want: &str) {
     let got = recv(s.client(who)).await;
-    s.check(who, want, &got);
+    if let Some(end) = want.strip_prefix('*') {
+        assert!(
+            got.ends_with(end),
+            "{who}: expected\n  {want}\ngot\n  {got}"
+        );
+    } else {
+        s.check(who, want, &got);
+    }
 }
 
 /// Sends `line` as `who`, and checks that every line up to the final OK or

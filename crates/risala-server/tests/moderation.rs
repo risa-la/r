@@ -1042,3 +1042,143 @@ async fn retention_shortened_by_set_and_admin_set() {
     s.settled().await;
     server.stop().await;
 }
+
+/// A report outlives its dropped room, and the owner of a new room of the
+/// same name is not one of its reviewers (5.8, 10.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_room_of_the_same_name_does_not_inherit_reports() {
+    let server = server().await;
+    let mut s = people(&server, &["alice", "bob", "carol"]).await;
+    join(&mut s, "alice", "#r").await;
+    join(&mut s, "bob", "#r").await;
+    expect(
+        &mut s,
+        "alice",
+        "@seq=2;t={*};from=bob@example.org;id={*} JOIN #r",
+    )
+    .await;
+    exchange(&mut s, "alice", "msg #r rude", &["*", "OK seq=3"]).await;
+    expect(
+        &mut s,
+        "bob",
+        "@seq=3;t={*};from=alice@example.org MSG #r rude",
+    )
+    .await;
+    exchange(&mut s, "bob", "report #r 3", &["OK id={rid}"]).await;
+    expect(&mut s, "alice", "@report={rid};t={*} REPORT #r 3").await;
+    expect(&mut s, "alice", "*MSG #r rude").await;
+    expect(
+        &mut s,
+        "op",
+        "@report={rid};t={*};from=bob@example.org REPORT #r 3",
+    )
+    .await;
+    expect(&mut s, "op", "*MSG #r rude").await;
+    exchange(&mut s, "op", "admin drop #r", &["OK"]).await;
+    expect(&mut s, "alice", "@id={*} DROP #r").await;
+    expect(&mut s, "bob", "@id={*} DROP #r").await;
+
+    // carol makes #r again and owns it.
+    join(&mut s, "carol", "#r").await;
+    exchange(&mut s, "carol", "reports #r", &["OK"]).await;
+    let rid = s.var("rid").to_owned();
+    exchange(
+        &mut s,
+        "carol",
+        &format!("resolve {rid}"),
+        &["ERR not-found{..}"],
+    )
+    .await;
+    // The same seq in the new room is another message, and bob's report
+    // of it is a new report, which carol reviews.
+    exchange(&mut s, "carol", "msg #r two", &["*", "OK seq=2"]).await;
+    exchange(&mut s, "carol", "msg #r three", &["*", "OK seq=3"]).await;
+    join(&mut s, "bob", "#r").await;
+    expect(
+        &mut s,
+        "carol",
+        "@seq=4;t={*};from=bob@example.org;id={*} JOIN #r",
+    )
+    .await;
+    exchange(&mut s, "bob", "report #r 3", &["OK id={rid2}"]).await;
+    assert_ne!(s.var("rid2"), rid);
+    expect(&mut s, "carol", "@report={rid2};t={*} REPORT #r 3").await;
+    expect(
+        &mut s,
+        "carol",
+        "@report={rid2};seq=3;t={*};from=carol@example.org MSG #r three",
+    )
+    .await;
+    expect(
+        &mut s,
+        "op",
+        "@report={rid2};t={*};from=bob@example.org REPORT #r 3",
+    )
+    .await;
+    expect(&mut s, "op", "*MSG #r three").await;
+    exchange(
+        &mut s,
+        "carol",
+        "reports #r",
+        &["*REPORT #r 3", "*MSG #r three", "OK"],
+    )
+    .await;
+    let rid2 = s.var("rid2").to_owned();
+    exchange(&mut s, "carol", &format!("resolve {rid2}"), &["OK"]).await;
+    expect(&mut s, "op", &format!("RESOLVED {rid2}")).await;
+    // The old one is still open, for operators.
+    exchange(
+        &mut s,
+        "op",
+        "admin reports",
+        &["*REPORT #r 3", "*MSG #r rude", "OK"],
+    )
+    .await;
+    s.settled().await;
+    server.stop().await;
+}
+
+/// Reports are rate-limited per uid (5.8), by the hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_are_rate_limited() {
+    let server = TestServer::builder()
+        .identity_domain("example.org")
+        .presence(NO_PRESENCE.0, NO_PRESENCE.1)
+        .manual_clock()
+        .configure(|c| c.limits.reports_per_hour = 2)
+        .start()
+        .await;
+    let (_, alice) = server.register("alice").await;
+    let (_, bob) = server.register("bob").await;
+    let mut s = Session::new();
+    s.add("alice", alice);
+    s.add("bob", bob);
+    join(&mut s, "alice", "#r").await;
+    for n in 2..=5 {
+        exchange(
+            &mut s,
+            "alice",
+            &format!("msg #r m{n}"),
+            &["*", &format!("OK seq={n}")],
+        )
+        .await;
+    }
+    exchange(&mut s, "bob", "report #r 2", &["OK id={*}"]).await;
+    exchange(&mut s, "bob", "report #r 3", &["OK id={*}"]).await;
+    exchange(
+        &mut s,
+        "bob",
+        "report #r 4",
+        &["@retry={*} ERR rate-limited{..}"],
+    )
+    .await;
+    server.advance(Duration::from_secs(60 * 60 + 1));
+    exchange(&mut s, "bob", "report #r 4", &["OK id={*}"]).await;
+    // Each report reached alice, the owner.
+    for _ in 0..3 {
+        expect(&mut s, "alice", "@report={*};t={*} REPORT #r {*}").await;
+        expect(&mut s, "alice", "*").await;
+    }
+    s.settled().await;
+    server.stop().await;
+}

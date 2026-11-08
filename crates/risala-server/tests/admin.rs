@@ -933,3 +933,45 @@ async fn hosted_identities() {
     s.settled().await;
     server.stop().await;
 }
+
+/// A guest in a room from the configuration when it is dropped: its
+/// session ending later records nothing in the new room (4.2, 10.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_in_a_dropped_room() {
+    let server = server().await;
+    let (mut s, _) = people(&server, &["alice"]).await;
+    s.add("sam", server.guest("sam").await);
+    let ok = join(&mut s, "sam", "#general").await;
+    let old_id = value(&ok, "id");
+    exchange(&mut s, "op", "admin drop #general", &["OK"]).await;
+    expect(&mut s, "sam", &format!("@id={old_id} DROP #general")).await;
+    // The new room is empty; the guest is not in it.
+    exchange(&mut s, "sam", "msg #general hi", &["ERR {..}"]).await;
+    let ok = join(&mut s, "alice", "#general").await;
+    assert!(ok.ends_with(" head=1"), "{ok}");
+    // The guest's session ends: no PART in the new room.
+    exchange(&mut s, "op", "admin disconnect ~sam", &["OK"]).await;
+    until_closed(s.client("sam")).await;
+    s.take("sam");
+    exchange(
+        &mut s,
+        "alice",
+        "history #general",
+        &[
+            "@seq=1;t={*};from=alice@example.org;id={*} JOIN #general",
+            "OK id={*} more=0",
+        ],
+    )
+    .await;
+    // A new guest of that name joins the new room as anyone would.
+    s.add("sam", server.guest("sam").await);
+    join(&mut s, "sam", "#general").await;
+    expect(
+        &mut s,
+        "alice",
+        "@seq=2;t={*};from=~sam;id={*} JOIN #general",
+    )
+    .await;
+    s.settled().await;
+    server.stop().await;
+}
