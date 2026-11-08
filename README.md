@@ -212,6 +212,12 @@ The hex digits it prints, after `sha256:`, are the fingerprint.
 [Appendix A of the spec](SPEC.md#appendix-a-using-risala-by-hand) also
 shows how to make a key and sign in with nothing but `openssl`.
 
+## Contributing and security
+
+Bug reports, questions and pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md). Report vulnerabilities privately, as
+described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 Copyright (c) 2026 Risala developers.
