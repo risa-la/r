@@ -20,6 +20,7 @@
 //! The server's checks of commits (12.5) and librisala's group engine are
 //! built on this crate, not in it.
 
+pub mod archive;
 pub mod backup;
 pub mod conversation;
 pub mod crypto;
@@ -35,6 +36,10 @@ pub mod wire;
 pub use openmls;
 pub use openmls_traits;
 
+pub use archive::{
+    ArchiveError, ArchivedConversation, ArchivedMessage, HistoryArchive, SealedArchive,
+    TransferRef, seal_transfer,
+};
 pub use backup::{BackupError, BackupKey, RecoveryKey, RecoveryKeyError};
 pub use conversation::{ConversationError, ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto, verify_ml_dsa_44};
