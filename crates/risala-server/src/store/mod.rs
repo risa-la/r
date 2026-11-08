@@ -34,7 +34,7 @@ use risala_proto::types::{
     Cid, GuestAccess, Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting,
 };
 
-pub use admin::AdminStore;
+pub use admin::{AdminStore, ServerBan};
 pub use messages::MessageStore;
 pub use moderation::ModerationStore;
 pub use reports::ReportStore;

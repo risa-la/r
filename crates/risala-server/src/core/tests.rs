@@ -2141,7 +2141,34 @@ impl crate::store::ReportStore for Flaky {}
 
 // (admin)
 
-impl crate::store::AdminStore for Flaky {}
+impl crate::store::AdminStore for Flaky {
+    fn add_operator(&self, u: &Uid, t: Timestamp) -> crate::store::Result<bool> {
+        self.inner.add_operator(u, t)
+    }
+    fn remove_operator(&self, u: &Uid) -> crate::store::Result<bool> {
+        self.inner.remove_operator(u)
+    }
+    fn server_bans(&self) -> crate::store::Result<Vec<crate::store::ServerBan>> {
+        self.inner.server_bans()
+    }
+    fn add_server_ban(&self, b: &crate::store::ServerBan) -> crate::store::Result<()> {
+        self.pause.at("add_server_ban");
+        self.inner.add_server_ban(b)
+    }
+    fn remove_server_ban(
+        &self,
+        t: &risala_proto::names::ServerBanTarget,
+    ) -> crate::store::Result<bool> {
+        self.inner.remove_server_ban(t)
+    }
+    fn remove_any_hosted_key(
+        &self,
+        u: &Uid,
+        k: &PublicKey,
+    ) -> crate::store::Result<crate::store::KeyChange> {
+        self.inner.remove_any_hosted_key(u, k)
+    }
+}
 
 // (the rest)
 
