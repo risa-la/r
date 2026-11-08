@@ -214,21 +214,7 @@ pub(crate) async fn run(ctx: &Ctx, command: E2eeCommand) -> Res {
         } => {
             let account = online(ctx, &server).await?;
             within(account.wait_synced()).await?;
-            let made = within(account.create_recovery_key()).await?;
-            within(account.wait_synced()).await?;
-            println!("recovery key, shown once; keep it like a password:");
-            println!();
-            println!("    {}", made.key);
-            println!();
-            if let Some(line) = made.key_file_line {
-                println!("add this line to your key file:");
-                println!("{line}");
-                if let Some(old) = made.old_key_file_line {
-                    println!("and remove the previous recovery key's line:");
-                    println!("{old}");
-                }
-            }
-            Ok(())
+            new_recovery_key(&account).await
         }
         E2eeCommand::Recovery {
             command: RecoveryCommand::Restore { server, key },
@@ -248,22 +234,57 @@ pub(crate) async fn run(ctx: &Ctx, command: E2eeCommand) -> Res {
             if client.device_key(&identity).or_else(explain)?.is_none() {
                 within(client.create_device_key(&identity, false)).await?;
             }
-            let account =
+            // 12.10: this device's key goes in, it joins the encrypted
+            // conversations and restores the history keys, and only then
+            // do the lost keys go.
+            let recovered =
                 within(client.recover_identity(&server, &identity, &key.join(" "))).await?;
-            within(account.wait_synced()).await?;
-            // The new device joins the identity's encrypted conversations
-            // by itself (12.6); the history keys come from the backup.
-            match account.restore_backup(&key.join(" ")).await {
-                Ok(n) => println!(
-                    "{} is back on this device; restored {n} history keys",
-                    account.uid()
-                ),
-                Err(e) => {
-                    println!("{} is back on this device", account.uid());
-                    return explain(e);
-                }
+            let account = recovered.account;
+            println!(
+                "{} is back on this device; restored {} history keys",
+                account.uid(),
+                recovered.restored
+            );
+            if !recovered.not_joined.is_empty() {
+                eprintln!(
+                    "risala: could not join {} yet, so the lost devices' keys stay; remove \
+                     them with keys del once it is joined",
+                    recovered.not_joined.join(", ")
+                );
             }
-            Ok(())
+            // The lost devices hold the recovery key used here: make a new
+            // one (12.10).
+            new_recovery_key(&account).await
         }
     }
+}
+
+/// Makes a new recovery key, prints it, and only then keeps it: backups
+/// under it, the old backups and the previous recovery key go (12.10).
+async fn new_recovery_key(account: &librisala::client::Account) -> Res {
+    let made = within(account.create_recovery_key()).await?;
+    println!("recovery key, shown once; keep it like a password:");
+    println!();
+    println!("    {}", made.key);
+    println!();
+    if let Some(line) = &made.key_file_line {
+        println!("add this line to your key file:");
+        println!("{line}");
+        if let Some(old) = &made.old_key_file_line {
+            println!("and remove the previous recovery key's line:");
+            println!("{old}");
+        }
+    }
+    if !made.other_recovery_lines.is_empty() {
+        eprintln!(
+            "risala: these other recovery keys can still sign in as you; remove them with keys \
+             del, or from your key file:"
+        );
+        for line in &made.other_recovery_lines {
+            eprintln!("{line}");
+        }
+    }
+    within(account.finish_recovery_key(&made)).await?;
+    within(account.wait_synced()).await?;
+    Ok(())
 }

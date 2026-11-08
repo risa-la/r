@@ -197,8 +197,9 @@ pub struct DeclinedDevice {
     pub key_file_line: String,
 }
 
-/// A recovery key just made ([`Account::create_recovery_key`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A recovery key just made ([`Account::create_recovery_key`]), to show
+/// the user once, and then keep with [`Account::finish_recovery_key`].
+#[derive(Clone, PartialEq)]
 pub struct NewRecoveryKey {
     /// The key, to show the user once: 52 characters in groups of four
     /// (12.10). The app does not keep it.
@@ -208,8 +209,53 @@ pub struct NewRecoveryKey {
     pub key_file_line: Option<String>,
     /// For an identity the server does not host, the line of the previous
     /// recovery key, which the user removes from the key file; `None` if
-    /// there was none, or KEY DEL removed it.
+    /// there was none, or KEY DEL removes it.
     pub old_key_file_line: Option<String>,
+    /// When this device does not hold the previous recovery key, the key
+    /// file lines of every other key labelled `recovery` (12.10). Offer to
+    /// remove each, with [`Account::remove_key`] or by editing the key
+    /// file, and warn about any that stays: it can still sign in.
+    pub other_recovery_lines: Vec<String>,
+    recovery: RecoveryKey,
+    old: Option<RecoveryKey>,
+    hosted: bool,
+}
+
+impl std::fmt::Debug for NewRecoveryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewRecoveryKey")
+            .field("key", &"…")
+            .field("key_file_line", &self.key_file_line)
+            .field("old_key_file_line", &self.old_key_file_line)
+            .field("other_recovery_lines", &self.other_recovery_lines)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`Client::recover_identity`] did (12.10).
+pub struct Recovered {
+    /// The account, connected.
+    pub account: Account,
+    /// How many history keys were restored from the backups.
+    pub restored: u64,
+    /// Encrypted conversations the device could not join yet. While there
+    /// are any, the lost devices' keys stay in the key file, since in a
+    /// room a device may join only while its identity still has a leaf
+    /// there: remove them later with [`Account::remove_key`].
+    pub not_joined: Vec<String>,
+    /// The key file lines of the lost keys that were removed.
+    pub removed: Vec<String>,
+}
+
+impl std::fmt::Debug for Recovered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recovered")
+            .field("account", &self.account.uid())
+            .field("restored", &self.restored)
+            .field("not_joined", &self.not_joined)
+            .field("removed", &self.removed)
+            .finish()
+    }
 }
 
 /// The id a recovery key is kept under in the key store, beside the
@@ -241,6 +287,12 @@ pub(crate) fn load_recovery_key(
         .load(&recovery_id(identity))
         .map_err(|e| ClientError::from_key_store(&e))?;
     Ok(key.map(|k| RecoveryKey::from_bytes(*keys::key_seed(&k))))
+}
+
+/// A recovery key's key file line, labelled `recovery` (12.10).
+fn recovery_line(public: &PublicKey) -> Result<String, ClientError> {
+    keys::key_line(public, Some("recovery"))
+        .map_err(|_| ClientError::Invalid("recovery key line".into()))
 }
 
 fn parse_recovery(typed: &str) -> Result<RecoveryKey, ClientError> {
@@ -454,17 +506,14 @@ impl Account {
     }
 
     /// Makes a new recovery key (12.10), and returns it to show the user
-    /// once:
+    /// once. Its key goes into the identity's key file with the label
+    /// `recovery`: by KEY ADD if the server hosts the identity, or else as
+    /// a line for the user to add ([`NewRecoveryKey::key_file_line`]).
     ///
-    /// - its key goes into the identity's key file with the label
-    ///   `recovery`: by KEY ADD if the server hosts the identity, or else
-    ///   as a line for the user to add ([`NewRecoveryKey::key_file_line`]),
-    ///   in place of the previous recovery key's;
-    /// - the identity's other devices get it, in its conversation with
-    ///   itself;
-    /// - every history key is backed up under it, and the old backups go.
-    ///
-    /// Needs a connection.
+    /// Nothing is lost if this is the last step taken: the previous
+    /// recovery key, and its backups, stay. Show the key, then call
+    /// [`finish_recovery_key`](Self::finish_recovery_key). Needs a
+    /// connection.
     pub async fn create_recovery_key(&self) -> Result<NewRecoveryKey, ClientError> {
         let identity = self.e2ee_identity()?;
         let keys = self.keys_store()?;
@@ -473,55 +522,126 @@ impl Account {
             message: format!("no randomness: {e}"),
         })?;
         let public = key.signing_key(&identity).public_key();
-        let line = keys::key_line(&public, Some("recovery"))
-            .map_err(|_| ClientError::Invalid("recovery key line".into()))?;
+        let line = recovery_line(&public)?;
         let (k, id) = (keys.clone(), identity.clone());
         let old = blocking(&self.client().runtime().clone(), move || {
             load_recovery_key(&*k, &id)
         })
         .await?;
         let old_public = old.as_ref().map(|o| o.signing_key(&identity).public_key());
-        let old_line = old_public
-            .as_ref()
-            .map(|p| keys::key_line(p, Some("recovery")))
-            .transpose()
-            .map_err(|_| ClientError::Invalid("recovery key line".into()))?;
-        // 4.7: KEY ADD works only for an identity the server hosts.
+        // 4.7: KEY ADD works only for an identity the server hosts. It only
+        // adds a key.
         let hosted = match self.add_key(&line, "recovery").await {
             Ok(_) => true,
             Err(ClientError::Server { .. } | ClientError::Refused { .. }) => false,
             Err(e) => return Err(e),
         };
-        let mut old_key_file_line = None;
-        if let Some(old_line) = old_line
-            && old_public.as_ref() != Some(&public)
-        {
-            if hosted {
-                if let Err(e) = self.remove_key(&old_line).await {
-                    tracing::warn!(error = %e, "removing the previous recovery key");
-                }
+        let old_key_file_line = match &old_public {
+            Some(p) if !hosted && *p != public => Some(recovery_line(p)?),
+            _ => None,
+        };
+        // 12.10: a device that does not hold the previous recovery key
+        // cannot tell which line is its, so it offers to remove them all.
+        let mut other_recovery_lines = Vec::new();
+        if old.is_none() {
+            let others: Vec<PublicKey> = if hosted {
+                self.keys()
+                    .await?
+                    .into_iter()
+                    .filter(|k| k.label == "recovery")
+                    .filter_map(|k| super::identity::parse_public_key(&k.public_key).ok().map(|(k, _)| k))
+                    .collect()
             } else {
-                old_key_file_line = Some(old_line);
+                self.shared()
+                    .store
+                    .device_keys(self.id(), &self.shared().uid)
+                    .map_err(store_err)?
+                    .into_iter()
+                    .filter(|d| d.label.as_deref() == Some("recovery") && d.listed == Some(true))
+                    .map(|d| d.key)
+                    .collect()
+            };
+            for other in others.iter().filter(|k| **k != public) {
+                other_recovery_lines.push(recovery_line(other)?);
             }
         }
-        let (k, id, rk) = (keys.clone(), identity.clone(), key.clone());
-        blocking(&self.client().runtime().clone(), move || {
-            save_recovery_key(&*k, &id, &rk)
-        })
-        .await?;
-        // The old backups go; everything is backed up again under the new
-        // key (12.10).
-        if old.is_some() {
-            self.request(Command::Backup(BackupCommand::Del { id: None }))
-                .await?;
-        }
-        self.e2ee(E2eeOp::SetRecovery(Some(key.clone()))).await?;
-        self.e2ee(E2eeOp::ShareRecovery(key.clone())).await?;
         Ok(NewRecoveryKey {
             key: key.to_display().to_string(),
             key_file_line: (!hosted).then_some(line),
             old_key_file_line,
+            other_recovery_lines,
+            recovery: key,
+            old,
+            hosted,
         })
+    }
+
+    /// Keeps a recovery key made with
+    /// [`create_recovery_key`](Self::create_recovery_key), once it has been
+    /// shown (12.10): this device keeps it and backs up every history key
+    /// under it. Only once those backups are made are the old backups
+    /// deleted, and everything backed up again under it, and the previous
+    /// recovery key removed from the key file, if the server hosts the
+    /// identity. The identity's other devices get it once the key file
+    /// lists it and every device is confirmed. Needs a connection.
+    pub async fn finish_recovery_key(&self, made: &NewRecoveryKey) -> Result<(), ClientError> {
+        let identity = self.e2ee_identity()?;
+        let keys = self.keys_store()?;
+        let (k, id, rk) = (keys, identity.clone(), made.recovery.clone());
+        blocking(&self.client().runtime().clone(), move || {
+            save_recovery_key(&*k, &id, &rk)
+        })
+        .await?;
+        self.e2ee(E2eeOp::SetRecovery(Some(made.recovery.clone())))
+            .await?;
+        self.wait_backed_up(&made.recovery).await?;
+        // The old backups go, and everything is backed up again under the
+        // new key (12.10).
+        self.request(Command::Backup(BackupCommand::Del { id: None }))
+            .await?;
+        self.shared()
+            .store
+            .clear_backed_up(self.id())
+            .map_err(store_err)?;
+        self.e2ee(E2eeOp::SetRecovery(Some(made.recovery.clone())))
+            .await?;
+        self.wait_backed_up(&made.recovery).await?;
+        if made.hosted
+            && let Some(old) = &made.old
+        {
+            let old_public = old.signing_key(&identity).public_key();
+            if old_public != made.recovery.signing_key(&identity).public_key() {
+                self.remove_key(&recovery_line(&old_public)?).await?;
+            }
+        }
+        self.e2ee(E2eeOp::ShareRecovery(made.recovery.clone()))
+            .await
+    }
+
+    /// Waits until every history key is backed up under `recovery`, or
+    /// fails if the backups stop making progress.
+    async fn wait_backed_up(&self, recovery: &RecoveryKey) -> Result<(), ClientError> {
+        let identity = self.e2ee_identity()?;
+        let key_id = recovery.backup_key(&identity).key_id().to_vec();
+        let mut last = u64::MAX;
+        loop {
+            self.wait_synced().await?;
+            let left = self
+                .shared()
+                .store
+                .keys_not_backed_up(self.id(), &key_id)
+                .map_err(store_err)?;
+            if left == 0 {
+                return Ok(());
+            }
+            if left >= last {
+                return Err(ClientError::Invalid(format!(
+                    "{left} history keys could not be backed up under the new recovery key; \
+                     the old backups were kept"
+                )));
+            }
+            last = left;
+        }
     }
 
     /// Restores history keys from the backups made under the recovery key
@@ -621,31 +741,46 @@ fn restore_keys(
     Ok((changes, cascade))
 }
 
+/// How many times [`Client::recover_identity`] waits for the connection to
+/// settle while the device still joins encrypted conversations.
+const JOIN_ROUNDS: usize = 5;
+
 impl Client {
     /// Gets an identity back after every device is lost, with its recovery
-    /// key (12.10): signs in to `server` with the recovery key's own key,
-    /// adds this device's key to the identity with KEY ADD, removes every
-    /// other key but the recovery key's, then signs in again with this
-    /// device's key. Returns the account, connected.
+    /// key (12.10), in the order 12.10 gives:
+    ///
+    /// 1. signs in to `server` with the recovery key's own key, and adds
+    ///    this device's key with KEY ADD;
+    /// 2. signs in again with this device's key, and joins the identity's
+    ///    encrypted conversations (12.6);
+    /// 3. restores the history keys from the backups;
+    /// 4. only then removes every other key but the recovery key's, the
+    ///    lost devices' and any other `recovery` key, since in a room a
+    ///    device may join only while its identity still has a leaf there.
+    ///    If a conversation could not be joined, the keys stay
+    ///    ([`Recovered::not_joined`]).
+    ///
+    /// Then make a new recovery key, as the lost devices hold this one:
+    /// [`Account::create_recovery_key`], show it, and
+    /// [`Account::finish_recovery_key`].
     ///
     /// This works for an identity the server hosts (4.7). For one it does
     /// not host, edit the key file instead, then add the identity as
     /// usual. The device's key must exist already
-    /// ([`create_device_key`](Self::create_device_key)). The new device
-    /// then joins the identity's encrypted conversations (12.6); restore
-    /// the history keys with [`Account::restore_backup`].
+    /// ([`create_device_key`](Self::create_device_key)).
     pub async fn recover_identity(
         &self,
         server: &str,
         identity: &str,
         recovery: &str,
-    ) -> Result<Account, ClientError> {
+    ) -> Result<Recovered, ClientError> {
         let addr = parse_server(server)?;
         let identity: Identity = identity
             .trim()
             .parse()
             .map_err(|_| ClientError::Invalid(format!("identity {identity:?}")))?;
-        let recovery = parse_recovery(recovery)?;
+        let typed = recovery;
+        let recovery = parse_recovery(typed)?;
         let signing = recovery.signing_key(&identity);
         let keys = self.key_store()?;
         let device = keys
@@ -694,28 +829,53 @@ impl Client {
                         .map_err(fail)?,
                 )?;
             }
-            let recovery_public = signing.public_key();
-            for key in listed {
-                if key != device && key != recovery_public {
-                    answered(
-                        &server_name,
-                        session
-                            .key(risala_proto::command::KeyCommand::Del { key })
-                            .await
-                            .map_err(fail)?,
-                    )?;
-                }
-            }
-            Ok::<(), ClientError>(())
+            Ok::<Vec<PublicKey>, ClientError>(listed)
         }
         .await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), session.0.quit("")).await;
-        result?;
+        let listed = result?;
         let (k, id, rk) = (keys, identity.clone(), recovery);
         blocking(self.runtime(), move || save_recovery_key(&*k, &id, &rk)).await?;
         let account = self.add_identity(server, identity.as_str())?;
         account.connect().await?;
-        Ok(account)
+
+        // 12.6: join every encrypted conversation before anything else.
+        let mut pending = Vec::new();
+        for _ in 0..JOIN_ROUNDS {
+            account.wait_synced().await?;
+            let now = account
+                .shared()
+                .store
+                .encryption_pending(account.id())
+                .map_err(store_err)?;
+            let stuck = now == pending;
+            pending = now;
+            if pending.is_empty() || stuck {
+                break;
+            }
+        }
+        let restored = account.restore_backup(typed).await?;
+
+        // 12.10: only then do the lost keys go.
+        let mut removed = Vec::new();
+        if pending.is_empty() {
+            let recovery_public = signing.public_key();
+            for key in listed {
+                if key == device || key == recovery_public {
+                    continue;
+                }
+                let line = keys::key_line(&key, None)
+                    .map_err(|_| ClientError::Invalid("a key file line".into()))?;
+                account.remove_key(&line).await?;
+                removed.push(line);
+            }
+        }
+        Ok(Recovered {
+            account,
+            restored,
+            not_joined: pending.iter().map(ToString::to_string).collect(),
+            removed,
+        })
     }
 }
 

@@ -1209,6 +1209,75 @@ pub(crate) struct DeviceKeyRow {
 }
 
 impl super::Store {
+    /// How many of the account's history keys are not backed up under the
+    /// backup key with `key_id` (12.10).
+    pub(crate) fn keys_not_backed_up(
+        &self,
+        account: AccountId,
+        key_id: &[u8],
+    ) -> Result<u64, StoreError> {
+        self.read(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM history_keys
+                 WHERE account = ?1 AND (backed_up IS NULL OR backed_up != ?2)",
+                params![account.0, key_id],
+                |r| r.get(0),
+            )?;
+            Ok(n.max(0) as u64)
+        })
+    }
+
+    /// Forgets that the account's history keys were backed up, as after
+    /// BACKUP DEL, so that they are backed up again (12.10).
+    pub(crate) fn clear_backed_up(&self, account: AccountId) -> Result<(), StoreError> {
+        self.write(|tx| {
+            tx.conn().execute(
+                "UPDATE history_keys SET backed_up = NULL WHERE account = ?1",
+                [account.0],
+            )?;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// The conversations the account should be in encrypted and whose
+    /// group it does not follow yet: direct conversations and encrypted
+    /// rooms it is in, as SYNC listed them (12.6).
+    pub(crate) fn encryption_pending(&self, account: AccountId) -> Result<Vec<Conv>, StoreError> {
+        self.write(|tx| {
+            let mut out = Vec::new();
+            for row in tx.convs(account)? {
+                if !row.joined || row.conv_id.is_none() {
+                    continue;
+                }
+                let wanted = match &row.name {
+                    Conv::Uid(_) => true,
+                    Conv::Room(_) => {
+                        tx.group(row.id)?.is_some()
+                            || tx
+                                .conn()
+                                .query_row(
+                                    "SELECT value FROM room_settings WHERE conv = ?1 AND key = 'e2ee'",
+                                    [row.id.0],
+                                    |r| r.get::<_, String>(0),
+                                )
+                                .optional()?
+                                .as_deref()
+                                == Some("yes")
+                    }
+                };
+                let active = tx
+                    .group(row.id)?
+                    .is_some_and(|g| g.state == GroupState::Active);
+                if wanted && !active {
+                    out.push(row.name);
+                }
+            }
+            Ok(out)
+        })
+        .map(|(out, _)| out)
+    }
+
     /// The device keys of `uid` that the account has seen in groups and key
     /// files (12.12), in the order it first saw them.
     pub(crate) fn device_keys(

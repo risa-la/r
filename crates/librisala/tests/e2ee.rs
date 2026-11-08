@@ -87,38 +87,68 @@ async fn backups_restore_history_keys() {
 async fn a_recovery_key_gets_the_identity_back() {
     let server = hosted_server(&[], |_| {}).await;
     let alice = registered(&server, "alice").await;
+    let bob = registered(&server, "bob").await;
     let old = alice.device_key().unwrap().unwrap().fingerprint;
+    shared_room(&alice, &bob, "#ours").await;
+    say(&alice, "#ours", "before").await;
+    reads(&bob, "#ours", &["before"]).await;
 
     // The server hosts Alice: KEY ADD put the recovery key's own key in her
     // key file, labelled `recovery` (12.10).
-    let created = within("a recovery key", alice.create_recovery_key())
-        .await
-        .unwrap();
+    let created = new_recovery_key(&alice).await;
     assert_eq!(created.key_file_line, None);
     assert_eq!(created.key.len(), 64, "52 characters in groups of four");
+    assert!(!format!("{created:?}").contains(&created.key));
     let keys = within("KEY LIST", alice.keys()).await.unwrap();
     assert!(keys.iter().any(|k| k.label == "recovery"), "{keys:?}");
     within("stopping", alice.disconnect()).await;
 
-    // Every device is lost. On a new one, the recovery key signs in, adds
-    // the new device's key and removes the others (12.10).
+    // Every device is lost. On a new one, the recovery key signs in and
+    // adds the new device's key; the device joins her encrypted room while
+    // her lost device still has a leaf there, and only then are the lost
+    // keys removed (12.10).
     let (client, addr) = device(&server);
     client
         .create_device_key("alice@chat.test", false)
         .await
         .unwrap();
-    let again = within(
+    let recovered = within(
         "recovering",
         client.recover_identity(&addr, "alice@chat.test", &created.key),
     )
     .await
     .unwrap();
+    assert!(recovered.not_joined.is_empty(), "{recovered:?}");
+    assert_eq!(recovered.removed.len(), 1, "{recovered:?}");
+    let again = recovered.account;
     within("syncing", again.wait_synced()).await.unwrap();
     let keys = within("KEY LIST", again.keys()).await.unwrap();
     assert_eq!(keys.len(), 2, "{keys:?}");
     assert!(keys.iter().any(|k| k.this_device));
     assert!(keys.iter().any(|k| k.label == "recovery"));
     assert!(keys.iter().all(|k| k.fingerprint != old));
+    // The room is hers again.
+    say(&bob, "#ours", "welcome back").await;
+    reads(&again, "#ours", &["before", "welcome back"]).await;
+    say(&again, "#ours", "thanks").await;
+    reads(&bob, "#ours", &["before", "welcome back", "thanks"]).await;
+
+    // A new recovery key replaces the one the lost device holds.
+    let fresh = new_recovery_key(&again).await;
+    let keys = within("KEY LIST", again.keys()).await.unwrap();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert!(fresh.other_recovery_lines.is_empty());
+}
+
+/// A new recovery key of `account`'s, made, shown and kept (12.10).
+async fn new_recovery_key(account: &Account) -> librisala::client::NewRecoveryKey {
+    let made = within("a recovery key", account.create_recovery_key())
+        .await
+        .unwrap();
+    within("keeping it", account.finish_recovery_key(&made))
+        .await
+        .unwrap();
+    made
 }
 
 /// The texts of a conversation's messages in the cache, with how each was
@@ -503,9 +533,7 @@ async fn history_keys_are_backed_up_and_restored() {
     say(&alice, "bob@chat.test", "one").await;
 
     // With a recovery key, every history key is backed up (12.10).
-    let made = within("a recovery key", alice.create_recovery_key())
-        .await
-        .unwrap();
+    let made = new_recovery_key(&alice).await;
     say(&bob, "alice@chat.test", "two").await;
     reads(&alice, "bob@chat.test", &["one", "two"]).await;
     within("syncing", alice.wait_synced()).await.unwrap();
@@ -591,9 +619,7 @@ async fn a_confirmed_device_backs_up_with_the_recovery_key() {
     let alice = registered(&server, "alice").await;
     let bob = registered(&server, "bob").await;
     say(&alice, "bob@chat.test", "one").await;
-    let made = within("a recovery key", alice.create_recovery_key())
-        .await
-        .unwrap();
+    let made = new_recovery_key(&alice).await;
 
     // Confirming a new device sends it the recovery key with the history
     // keys (12.9, 12.10).
@@ -648,9 +674,7 @@ async fn a_confirmed_device_backs_up_with_the_recovery_key() {
 async fn refreshing_shows_what_the_key_file_lists_now() {
     let server = hosted_server(&[], |_| {}).await;
     let alice = registered(&server, "alice").await;
-    within("a recovery key", alice.create_recovery_key())
-        .await
-        .unwrap();
+    new_recovery_key(&alice).await;
     // The recovery key's own key is in the key file, labelled; with no
     // leaf, it shows as the recovery key, not as a device (12.12).
     assert!(
