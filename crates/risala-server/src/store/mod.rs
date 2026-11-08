@@ -16,6 +16,10 @@
 //! what it changes (membership, settings, roles and so on) in one
 //! transaction, so a seq is never lost or used twice (5.2).
 
+mod admin;
+mod messages;
+mod moderation;
+mod reports;
 mod schema;
 mod sqlite;
 
@@ -30,6 +34,10 @@ use risala_proto::types::{
     Cid, GuestAccess, Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting,
 };
 
+pub use admin::AdminStore;
+pub use messages::MessageStore;
+pub use moderation::ModerationStore;
+pub use reports::ReportStore;
 pub use sqlite::SqliteStore;
 
 /// How long a cid protects against a resent message (7.6).
@@ -457,7 +465,12 @@ pub enum BlockAdded {
 /// Persistent storage for the hub.
 ///
 /// Every method blocks. Implementations are shared between threads.
-pub trait Store: Send + Sync + 'static {
+///
+/// M4's methods are in the supertraits [`MessageStore`], [`ModerationStore`],
+/// [`ReportStore`] and [`AdminStore`], one per area of work.
+pub trait Store:
+    MessageStore + ModerationStore + ReportStore + AdminStore + Send + Sync + 'static
+{
     /// Returns the server settings (10.6), first storing `defaults` for any
     /// that are not stored yet. This is how the configuration file's
     /// `[server]` section reaches a new database.

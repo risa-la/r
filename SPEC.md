@@ -1051,6 +1051,13 @@ Deletes message `<seq>`. The author may delete their own messages. In
 rooms, moderators and owners may delete any message (6.3). Only MSG
 and ENC events can be deleted.
 
+The author may delete their own messages in a room even after they can
+no longer read it, for example after leaving a private room or being
+kicked or banned from it. So the server checks whether the sender wrote
+the target before it applies the reading rules of 6.1. A DELETE that
+fails those rules, and does not target a message of the sender's, gets
+`ERR not-found` as usual.
+
 The server records a `DELETE <conv> <seq>` event and MUST erase the
 stored text of the target. The one exception is the copy kept for an
 open report (5.8). What else happens depends on the target:
@@ -1559,7 +1566,9 @@ BANS <room>
   already a member records nothing, and gets a plain `OK`. So a client
   that receives an INVITE for its own account knows the server does not
   count it as a member, and SHOULD send SYNC if it thought it was one.
-- `KICK` removes a member. They may join again.
+- `KICK` removes a member. They may join again. KICK of someone who is
+  not a member gets `ERR not-found`, even if they hold a role. To take
+  the role of someone who has left, use ROLE (6.3) or BAN.
 - `BAN` removes a member, if they are one, and stops them from joining.
   Banning a guest uid has little effect, because guest names get reused.
   A server MAY ban the guest's network address instead.
@@ -2164,7 +2173,10 @@ of these:
   happen to share an address with a spammer, such as at a university or
   on a mobile network, are not affected. Ban identities one at a time or
   by domain instead.
-- **Banning a guest** also closes the guest's connection. BANS lists the
+- **Banning a guest** bans the address it is connected from: the
+  IPv4 address itself, or the IPv6 `/64` that contains it, since one
+  IPv6 user usually holds a whole `/64`. It also closes the guest's
+  connection. BANS lists the
   ban under the address it applies to.
 - **Banning deletes nothing.** Use ADMIN PURGE (10.4) to remove what a
   user has sent.
@@ -2272,6 +2284,8 @@ As in 6.2, keyword and number values ignore trailing spaces, and the
 welcome text keeps them.
 
 - Changes take effect immediately and show in INFO (8.5).
+- Setting `guests` to `no` also ends the sessions of the guests already
+  connected: each gets `BYE`, and leaves its rooms as in 4.2.
 - Shortening `retention` also applies to events already stored.
 - Settings not listed here are left to the server's configuration.
 

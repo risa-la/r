@@ -669,6 +669,17 @@ Open:
       `forbidden`.
     - Certificate names for the SNI check are taken at handshake time.
 
+30. **Decided before building M4** (5.4, 6.4, 10.2, 10.6), confirmed
+    with the user on 2026-11-08:
+    - Authors may DELETE their own messages in a room they can no longer
+      read, for example after leaving a private room or being kicked.
+    - KICK of someone who is not a member gets `not-found`, even if they
+      hold a role. ROLE or BAN takes a departed person's role.
+    - Room BAN of a guest bans the uid only. ADMIN BAN of a connected
+      guest bans its IPv4 address, or the IPv6 `/64` it is in.
+    - `ADMIN SET guests no` ends the sessions of guests already
+      connected, with BYE.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
@@ -684,5 +695,8 @@ Open:
   It builds each file from its own records, so it can only ever serve
   hosted key files. It also writes the key files to a directory, so
   operators can serve them from their own web server instead.
+- **Rooms from the configuration** (M4): ADMIN DROP of a room named in
+  `rooms` creates it again at once, empty and with a new id, so the
+  configuration stays true.
 - **The Apple app** keeps its current deployment targets (iOS 18 and
   macOS 15) for now.

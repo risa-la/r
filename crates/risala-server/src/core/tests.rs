@@ -785,15 +785,8 @@ async fn ping_pong_and_quit() {
 async fn later_commands_are_not_supported() {
     let mut h = Harness::new();
     let mut c = h.guest("sam").await;
-    for cmd in [
-        "roles #general",
-        "delete #general 1",
-        "report #general 1 spam",
-        "related #general 1 2",
-        "@edit=1 msg #general fixed",
-        "@react=1 msg #general 👍",
-        "@file=https://files.example.org/f/x/a.png msg #general look",
-    ] {
+    // Files wait for M8. M4's commands have their own tests.
+    for cmd in ["@file=https://files.example.org/f/x/a.png msg #general look"] {
         h.send(&c, cmd).await;
         assert_eq!(c.lines(), ["ERR not-supported not supported yet"], "{cmd}");
     }
@@ -2132,6 +2125,25 @@ impl Pause {
         self.changed.notify_all();
     }
 }
+
+// M4's store supertraits. Each area adds its delegating methods to its
+// own block.
+
+impl crate::store::MessageStore for Flaky {}
+
+// (moderation)
+
+impl crate::store::ModerationStore for Flaky {}
+
+// (reports)
+
+impl crate::store::ReportStore for Flaky {}
+
+// (admin)
+
+impl crate::store::AdminStore for Flaky {}
+
+// (the rest)
 
 impl Store for Flaky {
     fn load_server_settings(

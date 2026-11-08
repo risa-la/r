@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use risala_proto::command::{Command, Request, RoomPage};
+use risala_proto::command::{AdminCommand, Command, Request, RoomPage};
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{
@@ -339,6 +339,27 @@ impl Inner {
             Command::Block { target } => self.block(uid, reply, target).await,
             Command::Unblock { target } => self.unblock(uid, reply, target).await,
             Command::Blocks => self.blocks(uid, reply).await,
+            // M4, one arm per area so that they can be built apart.
+            command @ (Command::Delete { .. }
+            | Command::Related { .. }
+            | Command::Admin(AdminCommand::Purge { .. })) => {
+                self.messages(uid, reply, command).await
+            }
+            command @ (Command::Set { .. }
+            | Command::Role { .. }
+            | Command::Roles { .. }
+            | Command::Invite { .. }
+            | Command::Kick { .. }
+            | Command::Ban { .. }
+            | Command::Unban { .. }
+            | Command::Bans { .. }) => self.moderation(uid, reply, command).await,
+            command @ (Command::Report { .. }
+            | Command::Reports { .. }
+            | Command::Resolve { .. }
+            | Command::Admin(
+                AdminCommand::Reports | AdminCommand::Rooms(_) | AdminCommand::Drop { .. },
+            )) => self.reports(uid, reply, command).await,
+            Command::Admin(command) => self.admin(uid, reply, command).await,
             // Later milestones, including `HISTORY only=commit` and the
             // rest of Section 12.
             _ => Err(not_supported()),

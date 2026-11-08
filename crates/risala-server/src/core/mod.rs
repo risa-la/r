@@ -62,11 +62,15 @@
 //! a command in progress, and a command finishes even if the network layer
 //! stops waiting for it.
 
+mod admin;
 mod commands;
 mod identity;
 pub mod keys;
+mod messages;
+mod moderation;
 mod presence;
 mod rate;
+mod reports;
 mod social;
 mod state;
 

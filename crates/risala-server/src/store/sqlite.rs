@@ -15,6 +15,11 @@ use risala_proto::server::Attachment;
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, Relation, Role, RoomSetting, ServerSetting};
 
+mod admin;
+mod messages;
+mod moderation;
+mod reports;
+
 use super::schema;
 use super::{
     Appended, BlockAdded, CID_WINDOW_MS, ConvKey, Created, EventKind, HistoryQuery, HostedKey,
