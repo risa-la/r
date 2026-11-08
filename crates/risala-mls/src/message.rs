@@ -58,8 +58,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
-use openmls::group::{MlsGroup, MlsGroupJoinConfig, PastEpochDeletion};
-use openmls::prelude::{LeafNodeIndex, Proposal, Sender, SenderRatchetConfiguration, StagedCommit};
+use openmls::group::{MlsGroup, PastEpochDeletion};
+use openmls::prelude::{LeafNodeIndex, Proposal, Sender, StagedCommit};
 use openmls::storage::OpenMlsProvider;
 use risala_proto::content::{
     Content, ContentLine, Conversation, MAX_CONTENT_LEN, MAX_REASON_LEN, MESSAGE_ID_LEN, MessageId,
@@ -94,8 +94,9 @@ pub const FRANK_LEN: usize = HASH_LEN;
 pub const MAX_CLOCK_DIFFERENCE: Duration = Duration::from_secs(10 * 60);
 
 /// How many epochs past a message's epoch a device may have applied and
-/// still decrypt it (12.9): at most e + 2.
-pub const MAX_PAST_EPOCHS: u64 = 2;
+/// still decrypt it (12.9): at most e + 2. The group's configuration keeps
+/// as many ([`group::MAX_PAST_EPOCHS`]).
+pub const MAX_PAST_EPOCHS: u64 = group::MAX_PAST_EPOCHS as u64;
 
 /// How long after the commit that ended a message's epoch its post may be,
 /// by `t`, for a device to decrypt it (12.9).
@@ -108,7 +109,7 @@ pub const PAST_EPOCH_KEEP: Duration = Duration::from_secs(2 * 60 * 60);
 /// How many generations a device keeps the keys of skipped messages
 /// behind the newest it has seen from a sender, and how far ahead of it it
 /// accepts a message (12.9).
-pub const MAX_GENERATIONS: u32 = 1000;
+pub const MAX_GENERATIONS: u32 = group::MAX_SKIPPED_GENERATIONS;
 
 /// How many gaps a device remembers per leaf, to recognise a late message
 /// that fills one (7.4). Older gaps are forgotten first.
@@ -613,44 +614,6 @@ pub fn note_self_removes(group: &MlsGroup, history: &mut impl MessageHistory) {
 
 // ---------------------------------------------------------------------------
 // Past epochs and skipped messages
-
-/// The sender ratchet limits of 12.9: the keys of skipped messages kept
-/// for at most 1,000 generations behind the newest seen from a sender, and
-/// messages more than 1,000 ahead of it rejected.
-pub fn sender_ratchet_configuration() -> SenderRatchetConfiguration {
-    // OpenMLS counts both limits from its ratchet head, which is one past
-    // the newest generation seen: so 1,001 behind the head is 1,000 behind
-    // the newest, and 999 ahead of the head is 1,000 ahead of it. The
-    // window behind also holds the newest generation's own (used) slot, so
-    // at most 1,000 keys of skipped messages are kept.
-    SenderRatchetConfiguration::new(MAX_GENERATIONS + 1, MAX_GENERATIONS - 1)
-}
-
-// 12.9: the limits belong in the configuration the group is built with
-// (crate::group::join_config and create_group). Until it has them, this
-// sets them on a group as built there.
-/// Sets the sender ratchet limits of 12.9 ([`sender_ratchet_configuration`])
-/// on `group`, keeping the rest of its configuration as
-/// [`group::join_config`] makes it.
-pub fn apply_limits<P: OpenMlsProvider>(
-    provider: &P,
-    group: &mut MlsGroup,
-) -> Result<(), GroupError<P::StorageError>> {
-    let kind = group::conversation(group)
-        .ok_or_else(|| GroupError::Group("no conversation extension".into()))?
-        .kind;
-    let current = group.configuration();
-    let config = MlsGroupJoinConfig::builder()
-        .wire_format_policy(current.wire_format_policy())
-        .padding_size(current.padding_size())
-        .use_ratchet_tree_extension(kind != ConversationKind::PublicRoom)
-        .max_past_epochs(group::MAX_PAST_EPOCHS)
-        .sender_ratchet_configuration(sender_ratchet_configuration())
-        .build();
-    group
-        .set_configuration(provider.storage(), &config)
-        .map_err(GroupError::Storage)
-}
 
 fn within(a: Timestamp, b: Timestamp, limit: Duration) -> bool {
     a.saturating_duration_since(b) <= limit && b.saturating_duration_since(a) <= limit

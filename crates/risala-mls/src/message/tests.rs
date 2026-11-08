@@ -1001,11 +1001,15 @@ fn skipped_generations() {
         mut b,
         ..
     } = direct();
-    apply_limits(&alice.provider, &mut a).unwrap();
-    apply_limits(&bob.provider, &mut b).unwrap();
+    // The limits are those of the configuration every group is made and
+    // joined with.
     assert_eq!(
         *b.configuration().sender_ratchet_configuration(),
-        sender_ratchet_configuration()
+        group::sender_ratchet_configuration()
+    );
+    assert_eq!(
+        *a.configuration().sender_ratchet_configuration(),
+        group::sender_ratchet_configuration()
     );
     assert_eq!(b.configuration().padding_size(), group::PADDING_SIZE);
 

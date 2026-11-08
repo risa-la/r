@@ -175,9 +175,15 @@ pub fn wire_format_policy(kind: ConversationKind) -> WireFormatPolicy {
 }
 
 /// The sender ratchets' limits (12.9): skipped messages' keys for at most
-/// 1,000 generations behind, and nothing more than 1,000 ahead.
+/// 1,000 generations behind the newest seen from a sender, and nothing more
+/// than 1,000 ahead of it.
 pub fn sender_ratchet_configuration() -> SenderRatchetConfiguration {
-    SenderRatchetConfiguration::new(MAX_SKIPPED_GENERATIONS, MAX_SKIPPED_GENERATIONS)
+    // OpenMLS counts both limits from its ratchet head, which is one past
+    // the newest generation seen: so 1,001 behind the head is 1,000 behind
+    // the newest, and 999 ahead of the head is 1,000 ahead of it. The
+    // window behind also holds the newest generation's own (used) slot, so
+    // at most 1,000 keys of skipped messages are kept.
+    SenderRatchetConfiguration::new(MAX_SKIPPED_GENERATIONS + 1, MAX_SKIPPED_GENERATIONS - 1)
 }
 
 /// The configuration of a group of `kind` (12.6, 12.8, 12.9).

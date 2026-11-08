@@ -2291,7 +2291,7 @@ fn past_epochs_and_generations() {
     assert_eq!(MAX_PAST_EPOCHS, 2);
     assert_eq!(
         sender_ratchet_configuration(),
-        openmls::prelude::SenderRatchetConfiguration::new(1000, 1000)
+        openmls::prelude::SenderRatchetConfiguration::new(1001, 999)
     );
     let config = join_config(ConversationKind::PrivateRoom);
     assert_eq!(
