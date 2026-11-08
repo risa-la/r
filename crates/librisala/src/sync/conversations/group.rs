@@ -533,6 +533,23 @@ pub(crate) fn apply_post(
                     note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
                     tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
                     after_commit(tx, cx, conv, &group, post, true, removed_ids, &mut applied)?;
+                    // 12.7: an own authority commit owes answers, or in an
+                    // epochal group an ATTEST, within the hour (C3). Taken
+                    // from the intent: a new extension, adds in a private
+                    // room, or removing another identity's leaves.
+                    let authority = intent.conversation.is_some()
+                        || (conv.kind == ConvKind::Private && !intent.add.is_empty())
+                        || intent.remove.iter().any(|(uid, _)| uid != cx.uid.as_str());
+                    applied.notes.extend(
+                        cx.hooks
+                            .commit_applied(
+                                tx,
+                                conv.id,
+                                super::super::confirm::CommitBy::Own { authority },
+                            )
+                            .into_iter()
+                            .map(|a| Note::Hook(Box::new(a))),
+                    );
                     own_commit_won(tx, cx, conv, &row, &intent, &mut applied)?;
                 } else {
                     // A commit for an epoch it no longer holds: it lost.
@@ -619,6 +636,19 @@ pub(crate) fn apply_post(
                 .find(|o| o.kind == OutboxKind::Commit && o.post.is_some());
             let removed = mls_message::removed_leaves(&commit.staged);
             let removed_ids = removed_identities(&group, &removed);
+            // 12.7: leaf confirmation (C3) challenges a committer that used
+            // authority.
+            let by = match commit.view.committer {
+                risala_mls::checks::Committer::Member(leaf) => {
+                    super::super::confirm::CommitBy::Member {
+                        leaf: leaf.u32(),
+                        authority: verdict.authority,
+                    }
+                }
+                risala_mls::checks::Committer::External => {
+                    super::super::confirm::CommitBy::External
+                }
+            };
             let old_token = SendToken::of_group(&group, cx.crypto.as_ref()).map_err(mls)?;
             let merged =
                 mls_group::apply_commit(&tx.mls(cx.crypto), &mut group, *commit, &mut state)
@@ -643,6 +673,12 @@ pub(crate) fn apply_post(
             tx.set_prev_token(conv.id, old_token.as_bytes())?;
             note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
             after_commit(tx, cx, conv, &group, post, false, removed_ids, &mut applied)?;
+            applied.notes.extend(
+                cx.hooks
+                    .commit_applied(tx, conv.id, by)
+                    .into_iter()
+                    .map(|a| Note::Hook(Box::new(a))),
+            );
         }
         ContentType::Proposal => {
             if post_epoch != epoch {

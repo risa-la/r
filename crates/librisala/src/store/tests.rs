@@ -35,10 +35,11 @@ fn a_new_cache_has_version_1_and_every_area() {
         [
             "accounts",
             "announced",
-            "attestations",
             "backups",
             "blobs",
             "blocks",
+            "confirm_warnings",
+            "confirmers",
             "contacts",
             "conversations",
             "deletes",

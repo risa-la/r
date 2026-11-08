@@ -107,7 +107,6 @@ async fn area_methods_say_they_are_not_implemented() {
         c.join_public_room(account, "#general").await.map(drop),
         "join_public_room",
     );
-    not_implemented(c.leaf_status(conv).map(drop), "leaf_status");
     not_implemented(c.fetch_file(conv, message).await.map(drop), "fetch_file");
     not_implemented(c.backup_now(account).await.map(drop), "backup_now");
     not_implemented(c.handle_push(b"").await.map(drop), "handle_push");

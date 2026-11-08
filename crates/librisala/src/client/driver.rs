@@ -381,6 +381,7 @@ impl Client {
         let hooks: Arc<dyn Hooks> = self.conversation_hooks();
         engines.conversations =
             ConversationEngine::new(config, hooks, self.options().clock.clone());
+        engines.confirm = crate::sync::confirm::ConfirmEngine::new(self.confirm_service());
         let (replies, replies_rx) = mpsc::unbounded_channel();
         let exec = Arc::new(Exec {
             cx: Context {

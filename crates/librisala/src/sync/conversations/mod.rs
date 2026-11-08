@@ -233,6 +233,54 @@ pub(crate) trait Hooks: Send + Sync {
         let _ = (tx, conv);
         Vec::new()
     }
+
+    /// A message passed the checks of 12.9 steps 1 to 5, posted with `t`,
+    /// from `leaf`: leaf confirmation (C3) acts on its CHALLENGE, ANSWER,
+    /// ATTEST and REVEAL lines, and says whether to show it as verified
+    /// (step 6).
+    #[allow(clippy::too_many_arguments)]
+    fn message_received(
+        &self,
+        tx: &mut Tx<'_>,
+        cx: &Ctx<'_>,
+        conv: &ConvRow,
+        leaf: &LeafRow,
+        group: &risala_mls::openmls::group::MlsGroup,
+        message: &risala_mls::message::Decrypted,
+        t: u64,
+    ) -> super::confirm::Received {
+        let _ = (cx, group, message, t);
+        super::confirm::Received {
+            confirmed: self.leaf_confirmed(tx, conv.id, leaf),
+            ..Default::default()
+        }
+    }
+
+    /// A commit was applied, by `by`: leaf confirmation (C3) challenges a
+    /// committer that used authority (12.7, 12.10).
+    fn commit_applied(
+        &self,
+        tx: &mut Tx<'_>,
+        conv: ConversationId,
+        by: super::confirm::CommitBy,
+    ) -> Vec<Action> {
+        let _ = (tx, conv, by);
+        Vec::new()
+    }
+
+    /// A message of this device's (not a live one), from outbox row
+    /// `outbox`, is about to be encrypted and posted: leaf confirmation
+    /// (C3) adds its pending lines to it (12.10).
+    fn outgoing(
+        &self,
+        tx: &mut Tx<'_>,
+        conv: &ConvRow,
+        outbox: i64,
+        body: &[u8],
+    ) -> super::confirm::Outgoing {
+        let _ = (tx, conv, outbox, body);
+        super::confirm::Outgoing::Keep
+    }
 }
 
 /// The hooks of no other area.
@@ -2254,10 +2302,18 @@ fn next_posts(
         .filter(|r| r.state == OutboxState::Queued && !waiting(r))
         .take(POST_BATCH)
     {
-        let body = row
+        let mut body = row
             .body
             .clone()
             .ok_or(EngineError::Invalid("a message with no body".into()))?;
+        // 12.10: pending confirmation lines ride in the message.
+        if row.kind == OutboxKind::Message {
+            match c.hooks.outgoing(tx, conv, row.id, &body) {
+                super::confirm::Outgoing::Keep => {}
+                super::confirm::Outgoing::Replace(b) => body = b,
+                super::confirm::Outgoing::Wait => break,
+            }
+        }
         let (post, epoch) = group::encrypt(tx, c, conv, &body)?;
         tx.update_outbox(row.id, OutboxState::Sent, Some((&post, epoch)), None, None)?;
         out.push(NextPost {

@@ -27,6 +27,9 @@ pub enum Event {
     Identity(super::identity::IdentityEvent),
     /// Conversations and messages (task C2).
     Conversation(super::conversations::ConversationEvent),
+    /// Leaf confirmation: confirmed leaves, impostors and other warnings
+    /// (task C3).
+    Confirm(super::confirm::ConfirmEvent),
     /// Files, transfers and backups (task C4).
     Transfer(super::files::TransferEvent),
 }

@@ -70,8 +70,21 @@ pub(crate) fn receive(
         resync_seq: None,
     });
     // Step 6: shown as verified only if the sender's leaf is confirmed
-    // (12.10).
-    let trust = d.trust(cx.hooks.leaf_confirmed(tx, conv.id, &leaf));
+    // (12.10). Leaf confirmation (C3) acts on the message's lines first,
+    // so that an ANSWER or ATTEST counts for the message that carries it.
+    let received = cx.hooks.message_received(tx, cx, conv, &leaf, group, &d, t);
+    applied.notes.extend(
+        received
+            .actions
+            .into_iter()
+            .map(|a| Note::Hook(Box::new(a))),
+    );
+    let trust = match (received.pinned, received.confirmed) {
+        // 7.3: its ATTEST pinned the pseudonym it was withheld for.
+        (true, true) => Trust::Verified,
+        (true, false) => Trust::Unverified,
+        (false, confirmed) => d.trust(confirmed),
+    };
     let place = d.place(&ext);
     let message = &d.message;
     let message_id = *message.message_id.as_bytes();

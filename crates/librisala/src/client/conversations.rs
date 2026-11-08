@@ -197,6 +197,8 @@ pub struct PublicRoom {
 pub(crate) struct ClientHooks {
     store: Store,
     keys: Arc<dyn KeyStore>,
+    /// Leaf confirmation (task C3).
+    confirm: Arc<crate::sync::confirm::Confirm>,
 }
 
 impl Hooks for ClientHooks {
@@ -218,6 +220,78 @@ impl Hooks for ClientHooks {
         let key = self.keys.load(&key_id?).ok()??;
         let seed = crate::keys::key_seed(&key);
         Some(risala_mls::mldsa::SigningKey::from_seed(*seed))
+    }
+
+    // Leaf confirmation (task C3): see crate::sync::confirm.
+
+    fn leaf_confirmed(
+        &self,
+        tx: &crate::store::Tx<'_>,
+        conv: ConversationId,
+        leaf: &crate::store::conversations::LeafRow,
+    ) -> bool {
+        self.confirm.leaf_confirmed(tx, conv, leaf)
+    }
+
+    fn leaves_changed(
+        &self,
+        tx: &mut crate::store::Tx<'_>,
+        conv: ConversationId,
+    ) -> Vec<crate::sync::Action> {
+        self.confirm.leaves_changed(tx, conv).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "leaf confirmation failed after a commit");
+            Vec::new()
+        })
+    }
+
+    fn commit_applied(
+        &self,
+        tx: &mut crate::store::Tx<'_>,
+        conv: ConversationId,
+        by: crate::sync::confirm::CommitBy,
+    ) -> Vec<crate::sync::Action> {
+        self.confirm
+            .commit_applied(tx, conv, by)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "leaf confirmation failed after a commit");
+                Vec::new()
+            })
+    }
+
+    fn message_received(
+        &self,
+        tx: &mut crate::store::Tx<'_>,
+        _: &crate::sync::conversations::Ctx<'_>,
+        conv: &ConvRow,
+        leaf: &crate::store::conversations::LeafRow,
+        group: &risala_mls::openmls::group::MlsGroup,
+        message: &risala_mls::message::Decrypted,
+        t: u64,
+    ) -> crate::sync::confirm::Received {
+        self.confirm
+            .message_received(tx, conv, group, message, t)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "leaf confirmation failed on a message");
+                crate::sync::confirm::Received {
+                    confirmed: self.confirm.leaf_confirmed(tx, conv.id, leaf),
+                    ..Default::default()
+                }
+            })
+    }
+
+    fn outgoing(
+        &self,
+        tx: &mut crate::store::Tx<'_>,
+        conv: &ConvRow,
+        outbox: i64,
+        body: &[u8],
+    ) -> crate::sync::confirm::Outgoing {
+        self.confirm
+            .outgoing(tx, conv, outbox, body)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "leaf confirmation failed on a message to send");
+                crate::sync::confirm::Outgoing::Keep
+            })
     }
 }
 
@@ -260,6 +334,7 @@ impl Client {
         Arc::new(ClientHooks {
             store: self.store().clone(),
             keys: self.options().keys.clone(),
+            confirm: self.confirm_service(),
         })
     }
 
