@@ -2,11 +2,13 @@
 resolver = "3"
 # crates/openmls-traits is a patched copy of a crates.io release (see
 # [patch.crates-io]), kept out of the workspace's lints.
-exclude = ["crates/risala-proto/fuzz", "crates/risala-pow/fuzz", "crates/openmls-traits"]
+exclude = [
+    "crates/risala-proto/fuzz", "crates/risala-pow/fuzz", "crates/openmls-traits",
+    # M5b: excluded until rewritten (docs/plans/M5b.md)
+]
 members = [
     "crates/risala-proto",
     "crates/risala-server",
-    "crates/librisala", "crates/risala-cli",
     "crates/risala-keyfetch",
     "crates/risala-pow",
     "crates/risala-dev",
