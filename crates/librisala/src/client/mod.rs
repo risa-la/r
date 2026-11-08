@@ -347,11 +347,12 @@ impl Client {
 
     /// Checks whether another process wrote to the cache since the last
     /// check (or since the client was made), using SQLite's
-    /// `PRAGMA data_version`. If so, every [`Timeline`] resets and every
-    /// account's subscribers get [`AccountEvent::CacheChanged`], and this
-    /// returns `true`. Writes by this client do not count. It never waits;
-    /// while this client is writing, it returns `false` and the next call
-    /// tells.
+    /// `PRAGMA data_version`. If so, every [`Timeline`] resets, every
+    /// account's subscribers get [`AccountEvent::CacheChanged`], each
+    /// running account sends what its outbox holds that can go now, such
+    /// as a message the other process queued, and this returns `true`.
+    /// Writes by this client do not count. It never waits; while this
+    /// client is writing, it returns `false` and the next call tells.
     pub fn check_for_external_changes(&self) -> Result<bool, ClientError> {
         let Some(now) = self.inner.store.data_version()? else {
             return Ok(false);
@@ -377,6 +378,7 @@ impl Client {
                     events: vec![AccountEvent::CacheChanged],
                     reload: true,
                 });
+                shared.resume_outbox();
             }
         }
         Ok(changed)

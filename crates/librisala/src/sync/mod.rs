@@ -310,8 +310,11 @@ pub struct Output {
     pub notifications: Vec<Notification>,
     /// Results of the commands the UI asked for.
     pub completed: Vec<Completed>,
-    /// The server asked to wait before sending more messages
-    /// (`rate-limited`). Call [`SyncEngine::resume_outbox`] after this long.
+    /// Call [`SyncEngine::resume_outbox`] after this long: the server asked
+    /// to wait before sending more messages (`rate-limited`), or another
+    /// process's claim on an outbox entry runs out then
+    /// ([`SyncConfig::claim_lease`]), and the entry is this engine's to
+    /// settle if that process has not.
     pub retry_after: Option<Duration>,
     /// Typing and presence, in the order they arrived.
     pub signals: Vec<Signal>,

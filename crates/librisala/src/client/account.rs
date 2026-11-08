@@ -168,6 +168,9 @@ pub(crate) enum Cmd {
         reply: Reply<Answer>,
     },
     Reconnect,
+    /// Send what the outbox holds that can go now, such as entries another
+    /// process sharing the cache queued. Nothing to answer.
+    ResumeOutbox,
     Stop {
         reply: oneshot::Sender<()>,
     },
@@ -275,6 +278,14 @@ impl AccountShared {
             .as_ref()
             .filter(|d| !d.stopping && !d.is_finished())
             .map(|d| d.cmds.clone())
+    }
+
+    /// Asks the running task, if any, to send what the outbox holds that
+    /// can go now.
+    pub(crate) fn resume_outbox(&self) {
+        if let Some(queue) = self.driver_queue() {
+            let _ = queue.send(Cmd::ResumeOutbox);
+        }
     }
 
     /// Runs `f` if the task of `generation` is the account's current one,

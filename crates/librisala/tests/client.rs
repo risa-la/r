@@ -699,3 +699,48 @@ async fn connecting_while_a_disconnect_is_under_way_stays_online() {
     client.shutdown().await;
     server.stop().await;
 }
+
+#[tokio::test]
+async fn a_message_another_process_queued_is_sent_once_noticed() {
+    // A notification extension shares the cache, and queues a reply while
+    // the app is online. The app's connection sends it once the app checks
+    // for changes from other processes.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let server = TestServer::builder().room("#general").start().await;
+    let addr = addr_of(server.addr());
+    let app = Client::open(&path, options(50)).unwrap();
+    app.accept_fingerprint(&addr, &server.fingerprint().to_string())
+        .unwrap();
+    let sam = app.add_guest(&addr, "sam").unwrap();
+    within("connect", sam.connect()).await.unwrap();
+    within("join", sam.join("#general")).await.unwrap();
+    within("sync", sam.wait_synced()).await.unwrap();
+    app.check_for_external_changes().unwrap();
+
+    let extension = Client::open(&path, options(50)).unwrap();
+    let other = extension.account(&addr, "~sam").unwrap().unwrap();
+    let queued = other
+        .conversation("#general")
+        .unwrap()
+        .send("from the extension")
+        .await
+        .unwrap();
+    assert_eq!(queued.status, OutboxStatus::Queued);
+
+    within("noticing the change", async {
+        while !app.check_for_external_changes().unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let entry = within("sent", sam.wait_outbox(queued.id)).await.unwrap();
+    assert!(
+        matches!(entry.status, OutboxStatus::Sent { .. }),
+        "{entry:?}"
+    );
+    assert_eq!(verbs_of(&server, "#general", "~sam").await, ["JOIN", "MSG"]);
+    extension.shutdown().await;
+    app.shutdown().await;
+    server.stop().await;
+}

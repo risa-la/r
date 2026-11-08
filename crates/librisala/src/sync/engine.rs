@@ -1819,7 +1819,9 @@ impl SyncEngine {
     /// transaction (`BEGIN IMMEDIATE`), so that another process sharing the
     /// cache cannot pick them too. An entry another process's connection
     /// sent is left to it while its claim lasts
-    /// ([`SyncConfig::claim_lease`]).
+    /// ([`SyncConfig::claim_lease`]); [`Output::retry_after`] then says
+    /// when the claim runs out, so that the entry is settled even if that
+    /// process went away.
     fn flush_outbox(&mut self) -> Result<(), SyncError> {
         let account = self.account;
         let now = self.now();
@@ -1837,6 +1839,8 @@ impl SyncEngine {
             .iter()
             .filter_map(|(c, l)| Some((c.clone(), l.confirmed.clone()?)))
             .collect();
+        // When the first claim of another process left alone runs out.
+        let mut lapses: Option<Timestamp> = None;
         let to_send = self.write(|tx| {
             let mut to_send = Vec::new();
             for item in tx.outbox_pending(account)? {
@@ -1849,6 +1853,8 @@ impl SyncEngine {
                         && !store.is_own_instance(other)
                         && now.saturating_duration_since(*at) < lease
                     {
+                        let end = at.checked_add(lease).unwrap_or(Timestamp::MAX);
+                        lapses = Some(lapses.map_or(end, |l| l.min(end)));
                         continue;
                     }
                     // Sent on an earlier connection, with no answer. Only an
@@ -1923,6 +1929,9 @@ impl SyncEngine {
             }
             Ok(to_send)
         })?;
+        if let Some(at) = lapses {
+            self.resume_by(now, at);
+        }
         for item in to_send {
             let command = match item.delete {
                 // The id the entry is bound to, so that the server deletes
@@ -1949,6 +1958,12 @@ impl SyncEngine {
             self.issue(command, Pending::Msg { outbox: item.id });
         }
         Ok(())
+    }
+
+    /// Asks to be resumed ([`Output::retry_after`]) by `at` at the latest.
+    fn resume_by(&mut self, now: Timestamp, at: Timestamp) {
+        let wait = at.saturating_duration_since(now);
+        self.out.retry_after = Some(self.out.retry_after.map_or(wait, |w| w.min(wait)));
     }
 }
 

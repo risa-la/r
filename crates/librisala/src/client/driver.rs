@@ -415,7 +415,8 @@ struct Online<'a> {
     /// REPORT and REPORTENC lines whose copies have not arrived yet
     /// (5.8), oldest first, by report id.
     reports: Vec<(Id, Report, Option<Id>)>,
-    /// When to call [`SyncEngine::resume_outbox`] after `rate-limited`.
+    /// When to call [`SyncEngine::resume_outbox`]: the earliest
+    /// [`Output::retry_after`](sync::Output::retry_after) asked for.
     resume_at: Option<Instant>,
 }
 
@@ -684,6 +685,7 @@ impl Online<'_> {
             } => (Input::StopTyping(conv), Ctx::None),
             Cmd::People { op, reply } => (Input::People(op), Ctx::Lines(reply)),
             Cmd::Request { op, reply } => (Input::Request(op), Ctx::Answer(reply)),
+            Cmd::ResumeOutbox => (Input::Resume, Ctx::None),
             Cmd::Reconnect | Cmd::Stop { .. } => return None,
         })
     }
@@ -759,7 +761,9 @@ impl Online<'_> {
             }
         }
         if let Some(wait) = out.retry_after {
-            self.resume_at = Some(Instant::now() + wait);
+            // Waking early is harmless: the engine asks again.
+            let at = Instant::now() + wait;
+            self.resume_at = Some(self.resume_at.map_or(at, |r| r.min(at)));
         }
 
         // Rooms to stop joining again.
@@ -1265,7 +1269,7 @@ pub(crate) async fn offline(shared: &Arc<AccountShared>, cmd: Cmd) {
             let _ = reply.send(Err(ClientError::NotConnected));
         }
         // Nobody sees an offline user type.
-        Cmd::Typing { .. } | Cmd::Reconnect => {}
+        Cmd::Typing { .. } | Cmd::Reconnect | Cmd::ResumeOutbox => {}
         Cmd::Stop { reply } => {
             let _ = reply.send(());
         }

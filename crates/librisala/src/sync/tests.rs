@@ -1218,10 +1218,17 @@ fn a_claim_lapses_after_its_lease() {
     b.expect_msg("hello");
     drop(b);
 
+    // Left alone, but the engine asks to be resumed when the claim runs
+    // out, so that it is settled even if nothing else happens.
+    let out = a.engine.resume_outbox().unwrap();
+    a.absorb(out);
+    a.idle();
+    assert_eq!(a.last.retry_after, Some(a.config.claim_lease));
     a.advance_clock(a.config.claim_lease - Duration::from_secs(1));
     let out = a.engine.resume_outbox().unwrap();
     a.absorb(out);
     a.idle();
+    assert_eq!(a.last.retry_after, Some(Duration::from_secs(1)));
     a.advance_clock(Duration::from_secs(1));
     let out = a.engine.resume_outbox().unwrap();
     a.absorb(out);
