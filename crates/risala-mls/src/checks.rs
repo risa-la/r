@@ -1179,11 +1179,15 @@ fn check_new_leaf(
 /// Whether a leaf may take a new signature key, in a leaf node carried by a
 /// post with `t` (12.3): outside epochal groups, only while its
 /// `leaf_node_source` is still `key_package`; in an epochal group, only if
-/// `t` falls in a later period than the leaf's previous `updated`, which is
-/// at most once a period.
+/// `t` falls in a later period than the leaf's previous `updated` minus 10
+/// minutes. That is once a period, or twice if the first change comes in
+/// the period's first 20 minutes, since `updated` may run up to 10 minutes
+/// ahead of `t`.
 fn signature_key_change_allowed(conversation: &RisalaConversation, old: &LeafView, t: u64) -> bool {
     match conversation.confirm {
-        ConfirmMode::Epochal => t / PERIOD_MS > old.updated() / PERIOD_MS,
+        ConfirmMode::Epochal => {
+            t / PERIOD_MS > old.updated().saturating_sub(UPDATED_SKEW_MS) / PERIOD_MS
+        }
         ConfirmMode::Pairwise => old.from_key_package,
     }
 }

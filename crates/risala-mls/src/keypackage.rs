@@ -37,6 +37,7 @@ use tls_codec::Deserialize as _;
 
 use crate::CIPHERSUITE;
 use crate::binding::DeviceBinding;
+use crate::checks::PERIOD_MS;
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::crypto::x_wing_public_key_ok;
 use crate::group::{capabilities, has_capabilities};
@@ -160,7 +161,10 @@ pub enum NewKeyPackageError<E> {
 /// The profile is shown to the server and to whoever fetches the
 /// KeyPackage with KEYPKG GET, so give it an empty display name: the
 /// device sets its name in its first commit in the group. Its `updated`
-/// should be the current time.
+/// should be the current time. For a last-resort KeyPackage it is moved
+/// back to the start of the period before the one it falls in (12.3), so
+/// that a device added from it may change its signature key at once in an
+/// epochal group.
 pub fn make_key_package<P: OpenMlsProvider>(
     provider: &P,
     device_key: &SigningKey,
@@ -178,6 +182,12 @@ pub fn make_key_package<P: OpenMlsProvider>(
     )
 }
 
+/// A last-resort KeyPackage's `updated` (12.3): the start of the period
+/// (12.10) before the one that `made`, in ms, falls in.
+pub fn last_resort_updated(made: u64) -> u64 {
+    (made / PERIOD_MS).saturating_sub(1) * PERIOD_MS
+}
+
 /// [`make_key_package`] with a given lifetime, for tests.
 pub(crate) fn make_key_package_with<P: OpenMlsProvider>(
     provider: &P,
@@ -193,7 +203,10 @@ pub(crate) fn make_key_package_with<P: OpenMlsProvider>(
         DeviceId::of_device_key(device_key.public_key()),
     );
     let credential = identity.credential_with_key(leaf_key.public_key());
-    let profile = profile.clone().with_streak(0);
+    let mut profile = profile.clone().with_streak(0);
+    if last_resort {
+        profile.updated = last_resort_updated(profile.updated);
+    }
     let extensions = if last_resort {
         vec![last_resort_extension()]
     } else {

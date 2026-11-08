@@ -171,21 +171,51 @@ fn leaves_keep_their_credential_and_key() {
     assert_eq!(check(&fresh, &rotate), Ok(Verdict::default()));
 
     // In an epochal group, only if the post's `t` is in a later period
-    // than the leaf's previous `updated`.
+    // than the leaf's previous `updated` minus 10 minutes (12.3).
     let mut epochal = conv.clone();
     epochal.confirm = ConfirmMode::Epochal;
-    let mut g = group(&epochal);
     let day = T / PERIOD_MS * PERIOD_MS;
-    for leaf in &mut g.leaves {
-        leaf.profile = Some(RisalaProfile::new("", day).unwrap());
-    }
-    let rotate_at = |t| {
-        let mut c = at_time(commit(&g, 2, vec![]), t, 1);
-        c.path_leaf.as_mut().unwrap().signature_key = vec![42; 4];
-        check_commit(&g, &c, &at(t))
+    let with_updated = |updated: u64| {
+        let mut g = group(&epochal);
+        for leaf in &mut g.leaves {
+            leaf.profile = Some(RisalaProfile::new("", updated).unwrap());
+        }
+        g
     };
-    assert_eq!(rotate_at(day + PERIOD_MS - 1), Err(CommitError::Leaf));
-    assert_eq!(rotate_at(day + PERIOD_MS), Ok(Verdict::default()));
+    let rotate_at = |g: &GroupView, t| {
+        let mut c = at_time(commit(g, 2, vec![]), t, 1);
+        c.path_leaf.as_mut().unwrap().signature_key = vec![42; 4];
+        check_commit(g, &c, &at(t))
+    };
+    // Changed at 10 minutes into the day or later: not again that day.
+    for updated in [day + 10 * MIN, day + PERIOD_MS / 2] {
+        let g = with_updated(updated);
+        assert_eq!(rotate_at(&g, updated), Err(CommitError::Leaf));
+        assert_eq!(
+            rotate_at(&g, day + PERIOD_MS - 1),
+            Err(CommitError::Leaf)
+        );
+        assert_eq!(rotate_at(&g, day + PERIOD_MS), Ok(Verdict::default()));
+    }
+    // A change in the day's first 10 minutes counts as the day before's,
+    // so a second one that day is allowed, once 12.3's bounds on
+    // `updated` are met.
+    let g = with_updated(day + 10 * MIN - 1);
+    assert_eq!(rotate_at(&g, day + 10 * MIN), Ok(Verdict::default()));
+    // A clock 10 minutes ahead just before midnight: `updated` is past
+    // midnight, yet the leaf may change its key in the new day.
+    let g = with_updated(day + 5 * MIN);
+    assert_eq!(rotate_at(&g, day + 20 * MIN), Ok(Verdict::default()));
+    // A leaf added from a last-resort KeyPackage made at any time of the
+    // day may change its key at once (12.3).
+    for made in [day, day + 30 * MIN, day + PERIOD_MS - 1] {
+        let g = with_updated(crate::keypackage::last_resort_updated(made));
+        assert_eq!(rotate_at(&g, made), Ok(Verdict::default()));
+    }
+    // The bound in the day before: `updated` 10 minutes before midnight.
+    let g = with_updated(day - 10 * MIN);
+    assert_eq!(rotate_at(&g, day - MIN), Err(CommitError::Leaf));
+    assert_eq!(rotate_at(&g, day), Ok(Verdict::default()));
 }
 
 /// `updated` (12.3): never below the leaf's previous one, and within 10

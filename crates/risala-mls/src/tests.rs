@@ -27,7 +27,8 @@ use crate::group::*;
 use crate::identity::{DeviceId, RisalaIdentity};
 use crate::keypackage::{
     KEY_PACKAGE_LIFETIME, KeyPackageError, check_key_package, has_no_binding, is_last_resort,
-    leaf_binding, make_join_key_package_with, make_key_package, make_key_package_with,
+    last_resort_updated, leaf_binding, make_join_key_package_with, make_key_package,
+    make_key_package_with,
 };
 use crate::mldsa::{LeafKey, SigningKey};
 use crate::profile::RisalaProfile;
@@ -1545,8 +1546,20 @@ fn last_resort_key_packages() {
     let carol = Device::new("carol@example.org", 3);
     let bob = Device::new("bob@example.org", 2);
     let facts = Facts::with(&[&alice, &bob, &carol]);
+    let before = now_ms();
     let last = bob.key_package(true);
     assert_eq!(is_last_resort(&last), Ok(true));
+    // Its `updated` is the start of the period before the one it was made
+    // in (12.3); an ordinary one's is the time it was made.
+    let updated = |kp: &KeyPackage| RisalaProfile::of_leaf(kp.leaf_node()).unwrap().updated;
+    let after = now_ms();
+    let start = updated(&last);
+    assert_eq!(start % PERIOD_MS, 0);
+    assert!(start + PERIOD_MS <= after && before < start + 2 * PERIOD_MS);
+    assert_eq!(last_resort_updated(2 * PERIOD_MS + 5), PERIOD_MS);
+    assert_eq!(last_resort_updated(2 * PERIOD_MS - 1), 0);
+    assert_eq!(last_resort_updated(5), 0);
+    assert!(updated(&bob.key_package(false)) >= before);
 
     // Two groups add Bob with the same last-resort KeyPackage.
     let mut a = alice.create(&RisalaConversation::direct(HOST, BOX, &alice.uid, &bob.uid));
