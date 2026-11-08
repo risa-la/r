@@ -1,21 +1,28 @@
 //! Secret keys this device holds (4.3, PLAN.md 3.4): generating them,
 //! and storing them through a platform trait.
 //!
-//! Owned by task C1 (identity) in docs/plans/M5b.md. What is here is
-//! M5a's store of ML-DSA-44 device keys, which still fits: a key is its
-//! 32-byte seed (4.3), found by an id the app chooses. Apps keep keys in
-//! the platform's store (Keychain, Android Keystore, libsecret) by
-//! implementing [`PlatformKeyStore`], which passes a key as its seed and
-//! so can be written in Swift or Kotlin, and handing it to the client
-//! wrapped in [`PlatformKeys`]. Rust code may implement [`KeyStore`]
-//! directly. [`FileKeyStore`] keeps PEM files for the CLI, and
-//! [`MemoryKeyStore`] keeps keys in memory.
+//! Owned by task C1 (identity) in docs/plans/M5b.md. A key is its 32-byte
+//! seed (4.3), found by an id. Apps keep keys in the platform's store
+//! (Keychain, Android Keystore, libsecret) by implementing
+//! [`PlatformKeyStore`], which passes a key as its seed and so can be
+//! written in Swift or Kotlin, and handing it to the client wrapped in
+//! [`PlatformKeys`]. Rust code may implement [`KeyStore`] directly.
+//! [`FileKeyStore`] keeps PEM files for the CLI, and [`MemoryKeyStore`]
+//! keeps keys in memory.
 //!
-//! Draft-03 gives a device more secrets than its device key (4.3): the
-//! identity's device-signing key, the attestation key (X-Wing), the
-//! current backup key (12.13) and per-group leaf keys (12.3, which
-//! OpenMLS keeps in the cache). C1 decides how they are named here, and
-//! may widen [`KeyStore`] from ML-DSA keys to plain 32-byte seeds.
+//! A device holds these secrets for each identity it holds (4.3), named
+//! by [`KeyNames`] from the identity:
+//!
+//! | Id | Secret |
+//! |---|---|
+//! | `<uid>` | the device key, ML-DSA-44, which signs in (4.6) |
+//! | `<uid>.attest` | the attestation key, X-Wing (12.10) |
+//! | `<uid>.signing` | the identity's device-signing key, ML-DSA-44 (4.4) |
+//! | `<uid>.backup` | the current generation's backup key (12.13) |
+//!
+//! Every one is a 32-byte seed, kept with [`KeyStore::save_seed`]. The
+//! recovery key and the master key are never kept (4.8). Leaf keys are
+//! OpenMLS's, in the cache (12.3).
 
 use std::collections::HashMap;
 use std::fs;
@@ -24,6 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use risala_proto::auth::SecretKey;
+use risala_proto::record::XWingPublicKey;
+use zeroize::Zeroizing;
 
 /// Makes a new ML-DSA-44 key from 32 bytes of the OS's secure random
 /// source (4.3).
@@ -71,9 +80,88 @@ pub trait KeyStore: Send + Sync {
     /// Deletes the key stored under `id`. Deleting a missing key is not
     /// an error.
     fn delete(&self, id: &str) -> Result<(), KeyStoreError>;
+
+    /// The 32-byte seed stored under `id`, if any: of an ML-DSA-44 key, an
+    /// X-Wing key or a symmetric key (4.3). The default goes through
+    /// [`load`](Self::load), which holds every seed as an ML-DSA-44 key.
+    fn load_seed(&self, id: &str) -> Result<Option<Zeroizing<[u8; SEED_LEN]>>, KeyStoreError> {
+        Ok(self.load(id)?.map(|key| key_seed(&key)))
+    }
+
+    /// Stores a 32-byte seed under `id`, replacing any other. The default
+    /// goes through [`save`](Self::save).
+    fn save_seed(&self, id: &str, seed: &[u8; SEED_LEN]) -> Result<(), KeyStoreError> {
+        // from_seed wipes the copy it is given.
+        self.save(id, &SecretKey::from_seed(*seed))
+    }
 }
 
-/// The length of a device key's seed, the ξ of FIPS 204 (App. B).
+/// The ids of an identity's secrets in a [`KeyStore`] (see the [module
+/// docs](self)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyNames {
+    base: String,
+}
+
+impl KeyNames {
+    /// The names for secrets kept under `base`, usually the identity.
+    pub fn new(base: impl Into<String>) -> KeyNames {
+        KeyNames { base: base.into() }
+    }
+
+    /// The base id.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The device key's id: the base itself.
+    pub fn device(&self) -> String {
+        self.base.clone()
+    }
+
+    /// The attestation key's id.
+    pub fn attestation(&self) -> String {
+        format!("{}.attest", self.base)
+    }
+
+    /// The device-signing key's id.
+    pub fn signing(&self) -> String {
+        format!("{}.signing", self.base)
+    }
+
+    /// The backup key's id.
+    pub fn backup(&self) -> String {
+        format!("{}.backup", self.base)
+    }
+
+    /// Every id, for deleting them all.
+    pub fn all(&self) -> [String; 4] {
+        [
+            self.device(),
+            self.attestation(),
+            self.signing(),
+            self.backup(),
+        ]
+    }
+}
+
+/// 32 bytes from the OS's secure random source, wiped when dropped: a new
+/// seed (4.3), a recovery key or a backup key.
+pub fn random_seed() -> Result<Zeroizing<[u8; SEED_LEN]>, getrandom::Error> {
+    let mut seed = Zeroizing::new([0u8; SEED_LEN]);
+    getrandom::fill(&mut *seed)?;
+    Ok(seed)
+}
+
+/// The public key of the X-Wing key with this seed: an attestation key
+/// (12.10), from X-Wing's key generation from a seed [XWING].
+pub fn attestation_public_key(seed: &[u8; SEED_LEN]) -> XWingPublicKey {
+    let key = risala_mls::PairingKey::from_seed(Zeroizing::new(*seed));
+    XWingPublicKey::from_bytes(key.public_key())
+        .expect("X-Wing's key generation makes keys that pass the checks of 12.2")
+}
+
+/// The length of a seed: the ξ of FIPS 204 (App. B), and X-Wing's.
 pub const SEED_LEN: usize = 32;
 
 /// The DER of a seed-only PKCS#8 ML-DSA-44 key before the seed (App. B),
@@ -204,6 +292,20 @@ impl KeyStore for PlatformKeys {
 
     fn delete(&self, id: &str) -> Result<(), KeyStoreError> {
         Ok(self.0.delete(id.to_owned())?)
+    }
+
+    fn load_seed(&self, id: &str) -> Result<Option<Zeroizing<[u8; SEED_LEN]>>, KeyStoreError> {
+        let Some(bytes) = self.0.load(id.to_owned())? else {
+            return Ok(None);
+        };
+        let bytes = Zeroizing::new(bytes);
+        seed_from(&bytes).map(Some).ok_or_else(|| {
+            KeyStoreError::BadKey(format!("{id}: {} bytes, not a 32-byte seed", bytes.len()))
+        })
+    }
+
+    fn save_seed(&self, id: &str, seed: &[u8; SEED_LEN]) -> Result<(), KeyStoreError> {
+        Ok(self.0.save(id.to_owned(), seed.to_vec())?)
     }
 }
 
@@ -693,6 +795,58 @@ pub(crate) mod tests {
             wrapped.load("x@example.org").unwrap().unwrap().public_key(),
             appendix_b().public_key()
         );
+    }
+
+    #[test]
+    fn seeds_round_trip_in_every_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = std::sync::Arc::new(Platform::default());
+        let stores: Vec<Box<dyn KeyStore>> = vec![
+            Box::new(MemoryKeyStore::default()),
+            Box::new(FileKeyStore::new(dir.path())),
+            Box::new(PlatformKeys(platform.clone())),
+        ];
+        let names = KeyNames::new("alice@example.org");
+        for store in &stores {
+            assert!(store.load_seed(&names.backup()).unwrap().is_none());
+            let seed = random_seed().unwrap();
+            store.save_seed(&names.backup(), &seed).unwrap();
+            assert_eq!(*store.load_seed(&names.backup()).unwrap().unwrap(), *seed);
+            for id in names.all() {
+                store.delete(&id).unwrap();
+            }
+            assert!(store.load_seed(&names.backup()).unwrap().is_none());
+        }
+        // A platform store gets the seed itself.
+        PlatformKeys(platform.clone())
+            .save_seed("x.attest", &[7; 32])
+            .unwrap();
+        assert_eq!(platform.0.lock().unwrap()["x.attest"], vec![7; 32]);
+    }
+
+    #[test]
+    fn key_names() {
+        let names = KeyNames::new("alice@example.org");
+        assert_eq!(
+            names.all(),
+            [
+                "alice@example.org",
+                "alice@example.org.attest",
+                "alice@example.org.signing",
+                "alice@example.org.backup"
+            ]
+        );
+        // Every name is one FileKeyStore can hold.
+        for id in names.all() {
+            FileKeyStore::new("/nowhere").path(&id).unwrap();
+        }
+    }
+
+    #[test]
+    fn attestation_keys_come_from_their_seed() {
+        let a = attestation_public_key(&[1; 32]);
+        assert_eq!(a, attestation_public_key(&[1; 32]));
+        assert_ne!(a, attestation_public_key(&[2; 32]));
     }
 
     #[test]
