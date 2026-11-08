@@ -259,72 +259,78 @@ impl ScriptServer {
         register(&state);
         let (count, accepted) = tokio::sync::watch::channel(0);
         let script = Arc::new(script);
-        let accept = {
-            let state = state.clone();
-            tokio::spawn(async move {
-                let mut i = 0;
-                loop {
-                    let tcp = match listener.accept().await {
-                        Ok((tcp, _)) => tcp,
-                        Err(e) => {
-                            // Such as running out of file descriptors: the
-                            // client's connection fails, and so the test.
-                            state
-                                .lock()
-                                .unwrap()
-                                .failures
-                                .push(format!("accept failed: {e}"));
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            continue;
-                        }
-                    };
-                    let n = i;
-                    i += 1;
-                    if n >= conns {
-                        state.lock().unwrap().failures.push(format!(
-                            "unexpected connection #{i}: the script expects {conns}"
-                        ));
-                        drop(tcp);
-                        count.send_replace(i);
-                        continue;
-                    }
-                    count.send_replace(i);
-                    let tls = match acceptor.accept(tcp).await {
-                        Ok(tls) => tls,
-                        Err(e) => {
-                            // Expected when the client refuses the
-                            // certificate, so only a note for the failures.
-                            state
-                                .lock()
-                                .unwrap()
-                                .notes
-                                .push(format!("connection #{i}: the handshake failed: {e}"));
-                            continue;
-                        }
-                    };
-                    let (_, conn) = tls.get_ref();
-                    let peer = Peer {
-                        sni: conn.server_name().map(str::to_owned),
-                        alpn: conn.alpn_protocol().map(<[u8]>::to_vec),
-                        kx_group: conn.negotiated_key_exchange_group().map(|g| g.name()),
-                        stream: BufReader::new(tls),
-                    };
-                    let run = tokio::spawn(script(n, peer));
-                    let watch = {
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = run.await
-                                && e.is_panic()
-                            {
-                                let message = panic_message(&*e.into_panic());
-                                state.lock().unwrap().panics.push((n, message));
+        let accept =
+            {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut i = 0;
+                    loop {
+                        let tcp = match listener.accept().await {
+                            Ok((tcp, _)) => tcp,
+                            Err(e) => {
+                                // Such as running out of file descriptors: the
+                                // client's connection fails, and so the test.
+                                state
+                                    .lock()
+                                    .unwrap()
+                                    .failures
+                                    .push(format!("accept failed: {e}"));
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                continue;
                             }
-                        })
-                    };
-                    state.lock().unwrap().scripts.push(watch);
-                }
-            })
-        };
+                        };
+                        if stray(&tcp).await {
+                            state.lock().unwrap().notes.push(
+                                "a connection that did not start with TLS was ignored".into(),
+                            );
+                            continue;
+                        }
+                        let n = i;
+                        i += 1;
+                        if n >= conns {
+                            state.lock().unwrap().failures.push(format!(
+                                "unexpected connection #{i}: the script expects {conns}"
+                            ));
+                            drop(tcp);
+                            count.send_replace(i);
+                            continue;
+                        }
+                        count.send_replace(i);
+                        let tls =
+                            match acceptor.accept(tcp).await {
+                                Ok(tls) => tls,
+                                Err(e) => {
+                                    // Expected when the client refuses the
+                                    // certificate, so only a note for the failures.
+                                    state.lock().unwrap().notes.push(format!(
+                                        "connection #{i}: the handshake failed: {e}"
+                                    ));
+                                    continue;
+                                }
+                            };
+                        let (_, conn) = tls.get_ref();
+                        let peer = Peer {
+                            sni: conn.server_name().map(str::to_owned),
+                            alpn: conn.alpn_protocol().map(<[u8]>::to_vec),
+                            kx_group: conn.negotiated_key_exchange_group().map(|g| g.name()),
+                            stream: BufReader::new(tls),
+                        };
+                        let run = tokio::spawn(script(n, peer));
+                        let watch = {
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = run.await
+                                    && e.is_panic()
+                                {
+                                    let message = panic_message(&*e.into_panic());
+                                    state.lock().unwrap().panics.push((n, message));
+                                }
+                            })
+                        };
+                        state.lock().unwrap().scripts.push(watch);
+                    }
+                })
+            };
         ScriptServer {
             addr,
             accept,
@@ -430,6 +436,16 @@ fn unregister(state: &Arc<Mutex<State>>) {
     });
 }
 
+/// Whether a new connection sends something other than a TLS handshake
+/// record (type 22) first: another program on the machine probing the
+/// port, as some do with an HTTP request, and not the client. One that
+/// sends nothing, or closes at once, still counts as the client's.
+async fn stray(tcp: &TcpStream) -> bool {
+    let mut first = [0u8; 1];
+    let peeked = tokio::time::timeout(std::time::Duration::from_secs(1), tcp.peek(&mut first));
+    matches!(peeked.await, Ok(Ok(1)) if first[0] != 22)
+}
+
 impl Drop for ScriptServer {
     fn drop(&mut self) {
         self.accept.abort();
@@ -455,6 +471,24 @@ mod tests {
         }
         let mut accepted = server.accepted.clone();
         accepted.wait_for(|n| *n >= 2).await.unwrap();
+        server.done().await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_is_not_tls_is_not_the_client() {
+        let ca = TestCa::new();
+        let server = ScriptServer::start(ca.issue("chat.test"), 1, |_, peer: Peer| async move {
+            peer.close().await;
+        })
+        .await;
+        // Another program on the machine probes the port with HTTP, then
+        // the client connects.
+        let mut probe = TcpStream::connect(server.addr).await.unwrap();
+        probe
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = connect(&ca, &server, &store()).await;
         server.done().await;
     }
 
