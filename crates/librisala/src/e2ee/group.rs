@@ -441,14 +441,6 @@ fn check_commit(
         let (uid, key) = leaf_of(leaf.credential(), leaf.signature_key().as_slice()).ok_or(
             E2eeError::Rejected("an added leaf that is not an identity's device"),
         )?;
-        if let Conv::Uid(other) = &checks.row.name
-            && uid != *checks.me
-            && uid != *other
-        {
-            return Err(E2eeError::Rejected(
-                "a direct conversation gains an outsider",
-            ));
-        }
         // 12.4: the lifetime of a KeyPackage a commit adds.
         if !risala_mls::lifetime_acceptable(
             add.add_proposal().key_package().life_time(),
@@ -461,6 +453,17 @@ fn check_commit(
     }
     if let Some(path) = path {
         added.push(path);
+    }
+    // A direct conversation gains no outsider, whether a commit adds the
+    // leaf or an external commit's path brings it (12.6).
+    if let Conv::Uid(other) = &checks.row.name
+        && added
+            .iter()
+            .any(|(uid, _)| uid != checks.me && uid != other)
+    {
+        return Err(E2eeError::Rejected(
+            "a direct conversation gains an outsider",
+        ));
     }
 
     let mut need = Vec::new();

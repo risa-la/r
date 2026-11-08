@@ -1448,3 +1448,63 @@ fn a_commit_that_adds_an_outsider_is_rejected() {
     // It does not join the group again either (12.6).
     assert_eq!(net.sent_to(a, "GROUPINFO", "bob@example.net"), 0);
 }
+
+impl Net {
+    /// Device `d` joins conversation `c`'s group by external commit,
+    /// whoever it is, as a server that does not check would let it, and
+    /// the commit is sent to the conversation's devices (12.6).
+    fn force_external_join(&mut self, d: usize, c: usize) {
+        let s = &self.convs[c];
+        let info = wire::group_info_from_wire(s.group_info.as_ref().unwrap()).unwrap();
+        let tree = wire::tree_from_wire(s.tree.as_ref().unwrap()).unwrap();
+        let dev = &self.devs[d];
+        let device = crate::e2ee::Device::new(dev.uid.clone(), dev.key.clone()).unwrap();
+        let (commit, _) = dev
+            .store
+            .write(|tx| {
+                let provider = device.provider(tx.mls_storage());
+                let (_, bundle) = risala_mls::join_by_external_commit(
+                    &provider,
+                    &device.signer(),
+                    &device.uid,
+                    info,
+                    tree,
+                )
+                .unwrap();
+                let (commit, _, _) = bundle.into_messages();
+                Ok(wire::commit_to_wire(&commit).unwrap())
+            })
+            .unwrap();
+        let epoch = self.convs[c].epoch.unwrap() + 1;
+        self.convs[c].epoch = Some(epoch);
+        let from = self.devs[d].uid.clone();
+        self.push(c, &from, Body::Commit { epoch, commit });
+        self.run();
+    }
+}
+
+#[test]
+fn an_outsiders_external_commit_to_a_direct_conversation_is_rejected() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    let c = net.device("carol@example.com", 4);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+
+    // Carol's device joins Alice and Bob's group by external commit, which
+    // this server lets through (12.5).
+    let conv = net.conv_of(a, "bob@example.net").unwrap();
+    net.force_external_join(c, conv);
+
+    // Alice's device rejects it: her messages must never reach Carol
+    // (12.6).
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+    let enc_before = net.sent(a, "ENC");
+    net.send(a, "bob@example.net", "secret");
+    assert_eq!(net.sent(a, "ENC"), enc_before);
+    let _ = b;
+}
