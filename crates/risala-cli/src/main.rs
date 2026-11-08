@@ -20,13 +20,14 @@
 //! Rooms: `delete` deletes a message, `info`, `topic` and `set` show and
 //! change settings, `role` and `roles` manage roles, `invite`, `kick`,
 //! `ban`, `unban` and `bans` moderate, and `report`, `reports` and
-//! `resolve` handle reports. `chat` shows notices and reports as they
-//! arrive.
+//! `resolve` handle reports. `admin` has the operators' commands.
+//! `chat` shows notices and reports as they arrive.
 //!
 //! Exit codes: 0 done, 1 failed, 2 bad arguments, 3 needs you to act
 //! first: the server refused (a key it does not accept, a name taken,
 //! registration closed), or a certificate or key needs your decision.
 
+mod admin;
 mod rooms;
 
 use std::io::Write as _;
@@ -187,6 +188,11 @@ enum Command {
     },
     #[command(flatten)]
     Rooms(rooms::RoomCommand),
+    /// Administer the server, as one of its operators (Section 10).
+    Admin {
+        #[command(subcommand)]
+        command: admin::AdminCommand,
+    },
     /// Manage the keys of an identity the server hosts (4.7).
     Keys {
         #[command(subcommand)]
@@ -652,6 +658,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         }
         Command::Chat { server, room } => chat(ctx, &server, &room).await,
         Command::Rooms(command) => rooms::run(ctx, command).await,
+        Command::Admin { command } => admin::run(ctx, command).await,
         Command::Read {
             server,
             conversation,
