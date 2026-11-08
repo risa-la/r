@@ -109,9 +109,9 @@ four writing code at once.
   - d. Content and operators: 5 (except 5.2), 6, 10, 12.11-12.13, 14,
     Appendix D (files, blobs, transfer, backups, reports, moderation,
     the threat model).
-- [~] **S2. Fix round 1.** Fixes go into `spec/`, and new choices into
+- [x] **S2. Fix round 1.** Fixes go into `spec/`, and new choices into
   PLAN.md item 62. Needs S1.
-- [ ] **S3. Review again** with two fresh reviewers over the whole spec,
+- [~] **S3. Review again** with two fresh reviewers over the whole spec,
   then fix. At most three rounds in all; what remains above Low after
   that is listed for the user.
 
@@ -166,12 +166,12 @@ four writing code at once.
   reading group id, epoch, content type and AAD from a message without
   its keys (for the server). Owns `crates/risala-mls/src/` except what
   M2-M4 own.
-- [ ] **M2. Messages** (12.9): RisalaMessage, counters and `previous`
+- [~] **M2. Messages** (12.9): RisalaMessage, counters and `previous`
   for gaps, franking (frank key, the frank in the AAD, constant-time
   checks), MLS padding to 256 bytes, times, past epochs kept for a few
   epochs, deletes. Owns `crates/risala-mls/src/message.rs`. Needs M1,
   P4.
-- [ ] **M3. Confirming leaves** (12.10): pairwise CHALLENGE/ANSWER with
+- [~] **M3. Confirming leaves** (12.10): pairwise CHALLENGE/ANSWER with
   X-Wing and HMAC-SHA-384 under `risala/1 confirm`, confirming senders
   only, the 256-member threshold; PeriodCert, per-period leaf keys, ATTEST and REVEAL. Owns
   `crates/risala-mls/src/confirm.rs` and `epochal.rs`. Needs M1.
