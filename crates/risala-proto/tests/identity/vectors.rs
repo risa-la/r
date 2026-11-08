@@ -13,9 +13,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use risala_proto::auth::{Nonce, SecretKey, SignLabel, challenge_bytes, risala_sign_content};
 use risala_proto::chain::{Chain, NoHandoffs};
-use risala_proto::keyfile::{
-    KeyFile, KeyFileState, NoEntries, Response, log_url, read_key_file,
-};
+use risala_proto::keyfile::{KeyFile, KeyFileState, NoEntries, Response, log_url, read_key_file};
 use risala_proto::names::Identity;
 use risala_proto::pairing::{NewDevice, NewDeviceContent, PairingCode, PairingError};
 use risala_proto::record::{

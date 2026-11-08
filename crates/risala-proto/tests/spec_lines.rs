@@ -121,7 +121,10 @@ fn specific_examples_are_present() {
     assert_eq!(find("anon").dir, Dir::Client);
     assert_eq!(find("@ref=7 fetch").dir, Dir::Client);
     assert_eq!(find("@ref=7 OK more=1").dir, Dir::Server);
-    assert_eq!(find("post ujzdegxdncf32epf3dhodzdoci -").dir, Dir::Client);
+    assert_eq!(
+        find("post ujzdegxdncf32epf3dhodzdoci 3J0nq8V2").dir,
+        Dir::Client
+    );
     assert_eq!(
         find("GROUPINFO ujzdegxdncf32epf3dhodzdoci").dir,
         Dir::Server
