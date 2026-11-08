@@ -3,31 +3,39 @@
 //!
 //! # Commands
 //!
-//! Each command locks its conversation for its whole run, so commits are
-//! put in order by that lock (12.5): the group is read, checked and
-//! written back while nothing else can change it. The checks run in three
-//! steps:
+//! Each command locks its conversation, so commits are put in order by
+//! that lock (12.5): the group is read, checked and written back while
+//! nothing else can change it. COMMIT's checks run in three steps:
 //!
 //! 1. Under the lock, the rules of the conversation that need no MLS: the
 //!    room is visible, encrypted, and the sender may commit at all.
-//! 2. On the blocking pool, everything OpenMLS and the command alone can
-//!    show (`mls`): epoch, validity, the GroupInfo, the committer, the
-//!    kinds of proposals and the size. The group comes back in its new
-//!    epoch, not yet stored.
-//! 3. Under the lock again, the rules that need membership and key files:
-//!    who may be added and removed (12.5, rule 4), and who may join by
+//! 2. On the blocking pool, still under the lock, everything OpenMLS and
+//!    the command alone can show (`mls`): epoch, validity, the GroupInfo,
+//!    the committer, the kinds of proposals and the size. The group comes
+//!    back in its new epoch, not yet stored.
+//! 3. Under the lock, the rules that need membership and key files: who
+//!    may be added and removed (12.5, rule 4), and who may join by
 //!    external commit (12.6).
+//!
+//! Step 3 never waits for a key file while it holds the lock, since a slow
+//! key host would hold up the whole conversation for up to
+//! [`KEY_FETCH_TIMEOUT`]. It runs with the answers it has, noting the key
+//! files it lacks ([`KeyAnswers`]). If it lacks any, the command lets go
+//! of the lock, gets them, takes the lock again, checks step 1 and the
+//! epoch again (`ERR stale` if another commit came first, so that rule 1
+//! still comes before the rest), and runs step 3 again. Membership may
+//! have changed meanwhile, so that it needs other key files: then it goes
+//! round again, at most [`COMMIT_FETCH_ROUNDS`] times.
 //!
 //! The new group is then stored with the COMMIT event, the INVITE and SET
 //! events it causes, and its Welcome, in one transaction, which also
 //! checks that the group is still in the epoch the commit was for. Only
 //! then are the events and Welcomes sent.
 //!
-//! Key files are read while the conversation is locked: for hosted
-//! identities from the store, and for others through the fetcher, from its
-//! cache when that agrees with what the commit claims, and fetched afresh
-//! otherwise. A key file that cannot be had gets `ERR unavailable`, as for
-//! KEYPKG GET.
+//! Key files are read for hosted identities from the store, and for others
+//! through the fetcher, from its cache when that agrees with what the
+//! commit claims, and fetched afresh otherwise. A key file that cannot be
+//! had gets `ERR unavailable`, as for KEYPKG GET.
 //!
 //! # Rooms
 //!
@@ -48,7 +56,7 @@ use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
 use risala_proto::mls::{Ciphertext, CommitMessage, Frank, GroupInfo, RatchetTree, Welcome};
 use risala_proto::names::{Conv, Room, Seq, Uid};
-use risala_proto::server::{OkResponse, ServerLine, ServerMessage};
+use risala_proto::server::{ErrResponse, OkResponse, ServerLine, ServerMessage};
 use risala_proto::types::{Cid, FileUrl, GuestAccess, Role, RoomSetting};
 
 use super::commands::{
@@ -58,7 +66,7 @@ use super::identity::unavailable;
 use super::keys::FetchError;
 use super::mls::{CheckedCommit, Device, check_commit, check_init, tree_of};
 use super::moderation::rights;
-use super::state::{ConvEntry, ConvState, RoomInfo};
+use super::state::{ConvEntry, ConvGuard, ConvState, RoomInfo};
 use super::{Inner, KEY_FETCH_TIMEOUT};
 use crate::handler::OutLine;
 use crate::store::{
@@ -146,12 +154,7 @@ impl Inner {
     /// device that sent the command says, is fetched again, since the
     /// device may have seen a newer one. A file that cannot be had is
     /// `ERR unavailable`.
-    pub(super) async fn key_listed(
-        &self,
-        uid: &Uid,
-        key: &PublicKey,
-        claim: bool,
-    ) -> Result<bool, Fail> {
+    async fn key_listed(&self, uid: &Uid, key: &PublicKey, claim: bool) -> Result<bool, Fail> {
         let Some(identity) = uid.to_identity() else {
             return Ok(false);
         };
@@ -369,7 +372,7 @@ impl Inner {
         Ok(None)
     }
 
-    /// COMMIT (12.5).
+    /// COMMIT (12.5). See the module documentation, "Commands".
     async fn commit(
         &self,
         uid: &Uid,
@@ -381,23 +384,8 @@ impl Inner {
     ) -> Outcome {
         let key = self.device_key(uid, reply.handle.id())?;
         let mut guard = self.lock_conv(uid, &conv).await?;
-        let st = &mut *guard;
-        // Rule 3 for a direct conversation: its participants, which are
-        // the only ones who can name it (5.2).
-        if let Some(info) = st.room_info() {
-            let a = self.asker(uid, st.is_member(uid));
-            if !visible(info, a) {
-                return Err(not_found());
-            }
-            if st.group.is_none() {
-                return Err(forbidden("the room is not encrypted"));
-            }
-            // Rule 3: a member or invitee.
-            if !st.is_member(uid) && !info.invites.contains(uid) {
-                return Err(forbidden("only members and invitees change the group"));
-            }
-        }
-        let conv_key = st.key;
+        self.may_commit(&guard, uid)?;
+        let conv_key = guard.key;
         let record = self
             .db(move |s| s.group(conv_key))
             .await?
@@ -424,27 +412,109 @@ impl Inner {
         })
         .await;
         let (checked, commit, welcome) = checked?;
-        let invited = match st.room_info() {
-            Some(_) => self.check_room_commit(st, uid, &key, &checked).await?,
-            None => {
-                self.check_direct_commit(st, uid, &key, &checked).await?;
-                Vec::new()
+        let mut answers = KeyAnswers::default();
+        for round in 0..=COMMIT_FETCH_ROUNDS {
+            let invited = self.check_member_rules(&guard, uid, &key, &checked, &mut answers);
+            if answers.missing.is_empty() {
+                let invited = invited?;
+                return self
+                    .store_commit(
+                        &mut guard, uid, reply, from_epoch, checked, commit, welcome, invited,
+                    )
+                    .await;
             }
-        };
-        self.store_commit(
-            st, uid, reply, from_epoch, checked, commit, welcome, invited,
-        )
-        .await
+            if round == COMMIT_FETCH_ROUNDS {
+                break;
+            }
+            // Fetched without the lock, then checked again with it.
+            let entry = ConvGuard::mutex(&guard).clone();
+            drop(guard);
+            self.fetch_answers(&mut answers).await?;
+            guard = entry.lock_owned().await;
+            if guard.dropped {
+                return Err(not_found());
+            }
+            self.may_commit(&guard, uid)?;
+            if guard.group.map(|g| g.epoch) != Some(from_epoch) {
+                return Err(stale("another commit came first"));
+            }
+        }
+        Err(unavailable(&FetchError::Failed(
+            "the conversation kept changing while key files were fetched".into(),
+        )))
     }
 
-    /// The rules of a commit in a room that need its membership and key
-    /// files (12.5, 12.6). Returns the identities the commit invites.
-    async fn check_room_commit(
+    /// The rules of COMMIT that need only the conversation (12.5, rule 3):
+    /// a room must be visible and encrypted, and the sender a member or an
+    /// invitee. The participants of a direct conversation are the only ones
+    /// who can name it (5.2).
+    fn may_commit(&self, st: &ConvState, uid: &Uid) -> Result<(), Fail> {
+        let Some(info) = st.room_info() else {
+            return Ok(());
+        };
+        let a = self.asker(uid, st.is_member(uid));
+        if !visible(info, a) {
+            return Err(not_found());
+        }
+        if st.group.is_none() {
+            return Err(forbidden("the room is not encrypted"));
+        }
+        if !st.is_member(uid) && !info.invites.contains(uid) {
+            return Err(forbidden("only members and invitees change the group"));
+        }
+        Ok(())
+    }
+
+    /// The rules of a commit that need the conversation's membership and
+    /// key files (12.5, 12.6), with the key files in `answers`. Returns the
+    /// identities the commit invites. A key file that `answers` lacks is
+    /// noted in it, and the result is then not final.
+    fn check_member_rules(
         &self,
         st: &ConvState,
         uid: &Uid,
         key: &PublicKey,
         checked: &CheckedCommit,
+        answers: &mut KeyAnswers,
+    ) -> Result<Vec<Uid>, Fail> {
+        match st.room_info() {
+            Some(_) => self.check_room_commit(st, uid, key, checked, answers),
+            None => {
+                check_direct_commit(st, uid, key, checked, answers)?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Gets the key files that `answers` lacks, holding no lock. Stops at
+    /// the first that cannot be had: the checks ask for key files in order,
+    /// so that one is what they fail on.
+    async fn fetch_answers(&self, answers: &mut KeyAnswers) -> Result<(), Fail> {
+        for (who, key, claim) in std::mem::take(&mut answers.missing) {
+            let answer = match self.key_listed(&who, &key, claim).await {
+                Ok(listed) => Ok(listed),
+                Err(Fail::Err(e)) => Err(e),
+                Err(e) => return Err(e),
+            };
+            let failed = answer.is_err();
+            answers.known.push(((who, key, claim), answer));
+            if failed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rules of a commit in a room that need its membership and key
+    /// files (12.5, 12.6), as for
+    /// [`check_member_rules`](Self::check_member_rules).
+    fn check_room_commit(
+        &self,
+        st: &ConvState,
+        uid: &Uid,
+        key: &PublicKey,
+        checked: &CheckedCommit,
+        answers: &mut KeyAnswers,
     ) -> Result<Vec<Uid>, Fail> {
         let info = room_of(st)?;
         let a = self.asker(uid, st.is_member(uid));
@@ -454,13 +524,13 @@ impl Inner {
                     "an identity joins by external commit only when it has a leaf",
                 ));
             }
-            if !self.key_listed(uid, key, true).await? {
+            if !answers.listed(uid, key, true)? {
                 return Err(forbidden("the device's key is not in its key file"));
             }
         }
         let mut invited: Vec<Uid> = Vec::new();
         for (target, target_key) in &checked.adds {
-            if !self.key_listed(target, target_key, true).await? {
+            if !answers.listed(target, target_key, true)? {
                 return Err(forbidden(&format!(
                     "a key of {target} that is not in its key file"
                 )));
@@ -482,7 +552,7 @@ impl Inner {
         for removed in checked.removes.iter().filter(|r| !r.justified) {
             let leaf = &removed.leaf;
             let gone = !st.is_member(&leaf.uid) && !info.invites.contains(&leaf.uid);
-            if gone || !self.key_listed(&leaf.uid, &leaf.key, false).await? {
+            if gone || !answers.listed(&leaf.uid, &leaf.key, false)? {
                 continue;
             }
             return Err(forbidden(&format!(
@@ -495,50 +565,6 @@ impl Inner {
         }
         invited.sort();
         Ok(invited)
-    }
-
-    /// The rules of a commit in a direct conversation that need its
-    /// participants and key files (12.5, 12.6): devices of its
-    /// participants only, and no change to its extensions.
-    async fn check_direct_commit(
-        &self,
-        st: &ConvState,
-        uid: &Uid,
-        key: &PublicKey,
-        checked: &CheckedCommit,
-    ) -> Result<(), Fail> {
-        let (a, b) = st.participants().ok_or_else(not_found)?;
-        // A participant may join by external commit with no leaf yet.
-        if checked.external && !self.key_listed(uid, key, true).await? {
-            return Err(forbidden("the device's key is not in its key file"));
-        }
-        for (target, target_key) in &checked.adds {
-            if target != a && target != b {
-                return Err(forbidden(&format!(
-                    "{target} is not a participant of this conversation"
-                )));
-            }
-            if !self.key_listed(target, target_key, true).await? {
-                return Err(forbidden(&format!(
-                    "a key of {target} that is not in its key file"
-                )));
-            }
-        }
-        for removed in checked.removes.iter().filter(|r| !r.justified) {
-            let leaf = &removed.leaf;
-            if self.key_listed(&leaf.uid, &leaf.key, false).await? {
-                return Err(forbidden(&format!(
-                    "no reason to remove a leaf of {}",
-                    leaf.uid
-                )));
-            }
-        }
-        if checked.extensions.is_some() {
-            return Err(forbidden(
-                "only a room's owners change the group's extensions",
-            ));
-        }
-        Ok(())
     }
 
     /// Stores an accepted commit with its events and Welcome, then sends
@@ -820,6 +846,88 @@ impl Inner {
         });
         Ok(Some(OkResponse::new()))
     }
+}
+
+/// How many times COMMIT lets go of its conversation's lock to fetch key
+/// files, before it gives up with `ERR unavailable`. See the module
+/// documentation, "Commands".
+const COMMIT_FETCH_ROUNDS: usize = 3;
+
+/// A lookup in a key file: whether `key` is in the key file of `uid`, where
+/// `claim` is what the commit says ([`Inner::key_listed`]).
+type Lookup = (Uid, PublicKey, bool);
+
+/// Which keys are in their identities' key files (4.4), as far as COMMIT
+/// has fetched them, and which it still needs.
+#[derive(Debug, Default)]
+struct KeyAnswers {
+    /// Each lookup made, with its answer: whether the key is listed, or why
+    /// the key file could not be had.
+    known: Vec<(Lookup, Result<bool, ErrResponse>)>,
+    /// The lookups the checks asked for that are not in `known` yet, in the
+    /// order they asked.
+    missing: Vec<Lookup>,
+}
+
+impl KeyAnswers {
+    /// Whether `key` is in `uid`'s key file. A lookup not made yet is noted
+    /// as missing, and answers `claim`, so that the checks go on and note
+    /// the rest.
+    fn listed(&mut self, uid: &Uid, key: &PublicKey, claim: bool) -> Result<bool, Fail> {
+        let lookup = (uid.clone(), key.clone(), claim);
+        if let Some((_, answer)) = self.known.iter().find(|(l, _)| *l == lookup) {
+            return answer.clone().map_err(Fail::Err);
+        }
+        if !self.missing.contains(&lookup) {
+            self.missing.push(lookup);
+        }
+        Ok(claim)
+    }
+}
+
+/// The rules of a commit in a direct conversation that need its
+/// participants and key files (12.5, 12.6): devices of its participants
+/// only, and no change to its extensions. The key files are in `answers`,
+/// as for [`Inner::check_member_rules`].
+fn check_direct_commit(
+    st: &ConvState,
+    uid: &Uid,
+    key: &PublicKey,
+    checked: &CheckedCommit,
+    answers: &mut KeyAnswers,
+) -> Result<(), Fail> {
+    let (a, b) = st.participants().ok_or_else(not_found)?;
+    // A participant may join by external commit with no leaf yet.
+    if checked.external && !answers.listed(uid, key, true)? {
+        return Err(forbidden("the device's key is not in its key file"));
+    }
+    for (target, target_key) in &checked.adds {
+        if target != a && target != b {
+            return Err(forbidden(&format!(
+                "{target} is not a participant of this conversation"
+            )));
+        }
+        if !answers.listed(target, target_key, true)? {
+            return Err(forbidden(&format!(
+                "a key of {target} that is not in its key file"
+            )));
+        }
+    }
+    for removed in checked.removes.iter().filter(|r| !r.justified) {
+        let leaf = &removed.leaf;
+        if answers.listed(&leaf.uid, &leaf.key, false)? {
+            return Err(forbidden(&format!(
+                "no reason to remove a leaf of {}",
+                leaf.uid
+            )));
+        }
+    }
+    if checked.extensions.is_some() {
+        return Err(forbidden(
+            "only a room's owners change the group's extensions",
+        ));
+    }
+    Ok(())
 }
 
 /// What ENC sends (12.8).

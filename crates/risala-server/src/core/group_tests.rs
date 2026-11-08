@@ -1611,3 +1611,121 @@ async fn unregister_with_purge_reaches_direct_conversations() {
     assert!(lines[1].contains(";frank="), "{}", lines[1]);
     assert!(untagged(&lines[2]).starts_with("DELETE bob@example.net 2"));
 }
+
+// ---------------------------------------------------------------------------
+// Key files fetched for COMMIT (12.5, 12.6)
+
+/// Sends `line` from `c` in a task of its own, for a command that waits.
+fn spawn_send(w: &World, c: &Client, line: &str) -> tokio::task::JoinHandle<()> {
+    let (hub, id) = (w.h.hub.clone(), c.id);
+    let req: risala_proto::command::Request = line.parse().unwrap();
+    tokio::spawn(async move { hub.command(id, req).await })
+}
+
+/// Waits until the fetcher has been asked `n` times in all.
+async fn fetched(w: &World, n: usize) {
+    while w.fetcher.calls().len() < n {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn commits_fetch_key_files_without_holding_up_the_conversation() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let (mut ga1, mut gb5) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+
+    // Alice adds Bob's second device, and Bob's key host is slow.
+    let b6 = Device::new(BOB, 6);
+    let held = w.fetcher.hold(&identity(BOB), vec![key(5), key(6)]);
+    let calls = w.fetcher.calls().len();
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b6.kp()],
+            ..Changes::default()
+        },
+    );
+    let commit = spawn_send(&w, &c1, &sent.line(BOB));
+    fetched(&w, calls + 1).await;
+    // Meanwhile the conversation goes on: these would wait for the commit
+    // if it held the conversation's lock.
+    let meanwhile = async {
+        let lines = w.ask(&mut cb, &b5.enc(ALICE, &gb5, "TEXT hi\n")).await;
+        assert_eq!(lines.last().unwrap(), "OK seq=2");
+        let lines = w.ask(&mut cb, "groupinfo alice@example.org").await;
+        assert!(lines[0].starts_with("GROUPINFO alice@example.org 1 1 "));
+    };
+    tokio::time::timeout(Duration::from_secs(10), meanwhile)
+        .await
+        .expect("the conversation was held up");
+    held.notify_one();
+    commit.await.unwrap();
+    let lines = c1.lines();
+    assert_eq!(
+        short(&lines)[1..],
+        [
+            &format!("COMMIT bob@example.net 2 {}", &sent.commit.as_str()[..12]),
+            "OK seq=3 epoch=2",
+        ]
+    );
+    assert!(untagged(&lines[0]).starts_with("ENC bob@example.net 1 "));
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    b5.apply(&mut gb5, find(&cb.lines(), "COMMIT"));
+
+    // A commit that comes first while the key file is fetched makes this
+    // one stale (rule 1), though its key file would not list the key it
+    // adds (rule 4).
+    let b8 = Device::new(BOB, 8);
+    let held = w.fetcher.hold(&identity(BOB), vec![key(5), key(6)]);
+    let calls = w.fetcher.calls().len();
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b8.kp()],
+            ..Changes::default()
+        },
+    );
+    let commit = spawn_send(&w, &c1, &sent.line(BOB));
+    fetched(&w, calls + 1).await;
+    // Bob refreshes his leaf, which needs no key file.
+    let refresh = b5.commit(&mut gb5, Changes::default());
+    let lines = w.ask(&mut cb, &refresh.line(ALICE)).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=4 epoch=3");
+    held.notify_one();
+    commit.await.unwrap();
+    assert_eq!(
+        c1.lines().last().unwrap(),
+        "ERR stale another commit came first"
+    );
+    ga1.clear_pending_commit(a1.provider.storage()).unwrap();
+    a1.apply(
+        &mut ga1,
+        find(
+            &w.ask(&mut c1, "history bob@example.net after=3").await,
+            "COMMIT",
+        ),
+    );
+
+    // Without the commit in between, the key file decides.
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b8.kp()],
+            ..Changes::default()
+        },
+    );
+    w.fetcher.set(&identity(BOB), vec![key(5), key(6)]);
+    assert_eq!(
+        w.ask(&mut c1, &sent.line(BOB)).await,
+        ["ERR forbidden a key of bob@example.net that is not in its key file"]
+    );
+    w.fetcher.fail(&identity(BOB));
+    assert_eq!(
+        w.ask(&mut c1, &sent.line(BOB)).await,
+        ["@retry=10 ERR unavailable could not get the identity's key file; try again later"]
+    );
+}
