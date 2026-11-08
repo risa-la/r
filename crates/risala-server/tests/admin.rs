@@ -1176,3 +1176,24 @@ async fn hosted_identity_commands_need_hosted_identities() {
     s.settled().await;
     server.stop().await;
 }
+
+/// An operator whose ban covers itself gets its `OK`, then BYE.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_banning_itself_gets_ok_first() {
+    let server = server().await;
+    let (mut s, _) = people(&server, &["alice"]).await;
+    let dan = server.identity("dan@example.com");
+    let mut dan = server.sign_in(&dan).await;
+    join(&mut s, "alice", "#general").await;
+    s.client("op")
+        .send("admin ban *@example.com")
+        .await
+        .unwrap();
+    let lines = until_closed(s.client("op")).await;
+    assert_eq!(lines, ["OK", "BYE banned from this server"]);
+    assert_eq!(
+        until_closed(&mut dan).await,
+        ["BYE banned from this server"]
+    );
+    server.stop().await;
+}

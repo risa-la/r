@@ -655,6 +655,7 @@ async fn room_settings_and_guests() {
     exchange(&mut s, "alice", "set #r guests read", &["OK"]).await;
     exchange(&mut s, "sam", "msg #r hi", &["ERR forbidden{..}"]).await;
     exchange(&mut s, "sam", "@react=5 msg #r 👋", &["ERR forbidden{..}"]).await;
+    exchange(&mut s, "sam", "typing #r", &["ERR forbidden{..}"]).await;
     exchange(
         &mut s,
         "sam",
@@ -1324,6 +1325,64 @@ async fn ban_events_reach_who_could_see_the_room() {
     exchange(&mut s, "carol", "related #priv 1 2", &["ERR not-found{..}"]).await;
     // The room's events are readable by its owner, of course.
     exchange(&mut s, "alice", "related #priv 1 3", &["OK id={*} more=0"]).await;
+    s.settled().await;
+    server.stop().await;
+}
+
+/// KICK and INVITE reach every connection of their target (6.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn kick_reaches_every_device() {
+    let server = server().await;
+    let (bob, bob_laptop) = server.register("bob").await;
+    let (_, alice) = server.register("alice").await;
+    let bob_phone = server.sign_in(&server.new_device(&bob).await).await;
+    let mut s = Session::new();
+    s.add("alice", alice);
+    s.add("laptop", bob_laptop);
+    s.add("phone", bob_phone);
+    join(&mut s, "alice", "#p").await;
+    exchange(&mut s, "alice", "set #p public no", &["*", "OK seq=2"]).await;
+    exchange(
+        &mut s,
+        "alice",
+        "invite #p bob@example.org",
+        &["*", "OK seq=3"],
+    )
+    .await;
+    for who in ["laptop", "phone"] {
+        expect(
+            &mut s,
+            who,
+            "@seq=3;t={*};from=alice@example.org INVITE #p bob@example.org",
+        )
+        .await;
+    }
+    join(&mut s, "laptop", "#p").await;
+    for who in ["alice", "phone"] {
+        expect(
+            &mut s,
+            who,
+            "@seq=4;t={*};from=bob@example.org;id={*} JOIN #p",
+        )
+        .await;
+    }
+    exchange(
+        &mut s,
+        "alice",
+        "kick #p bob@example.org",
+        &["*", "OK seq=5"],
+    )
+    .await;
+    for who in ["laptop", "phone"] {
+        expect(
+            &mut s,
+            who,
+            "@seq=5;t={*};from=alice@example.org KICK #p bob@example.org",
+        )
+        .await;
+    }
+    exchange(&mut s, "alice", "msg #p private again", &["*", "OK seq=6"]).await;
+    exchange(&mut s, "phone", "info #p", &["ERR not-found{..}"]).await;
     s.settled().await;
     server.stop().await;
 }
