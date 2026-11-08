@@ -1581,7 +1581,8 @@ impl SyncEngine {
         let unconfirmed: Vec<Uid> = {
             let mut stmt = tx.conn().prepare_cached(
                 "SELECT DISTINCT l.uid FROM epoch_leaves l
-                 LEFT JOIN device_keys d ON d.account = l.account AND d.key_id = l.key_id
+                 LEFT JOIN device_keys d ON d.account = l.account AND d.uid = l.uid
+                     AND d.key_id = l.key_id
                  WHERE l.account = ?1 AND l.conv_id = ?2 AND l.epoch = ?3
                      AND COALESCE(d.listed, 0) != 1",
             )?;

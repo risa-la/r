@@ -1508,3 +1508,105 @@ fn an_outsiders_external_commit_to_a_direct_conversation_is_rejected() {
     assert_eq!(net.sent(a, "ENC"), enc_before);
     let _ = b;
 }
+
+#[test]
+fn a_key_listed_for_someone_else_does_not_count() {
+    // Bob's second key left his key file, and Mallory's key file lists it
+    // (12.12): it is still not Bob's.
+    let dev = Dev::new("alice@example.org", 1);
+    let (bob, mallory) = (uid("bob@example.net"), uid("mallory@example.com"));
+    let b1 = SecretKey::from_seed([2; 32]).public_key();
+    let b2 = SecretKey::from_seed([3; 32]).public_key();
+    let account = dev.account;
+    let now = 1_000;
+    let listed = dev
+        .store
+        .write(|tx| {
+            tx.note_device_key(account, &bob, &b1)?;
+            tx.note_device_key(account, &bob, &b2)?;
+            tx.key_file_fetched(account, &bob, Some(&[(b1.clone(), None)]), now)?;
+            tx.key_file_fetched(account, &mallory, Some(&[(b2.clone(), None)]), now)?;
+            Ok((
+                tx.key_listed(account, &bob, &b2)?,
+                tx.key_listed(account, &mallory, &b2)?,
+            ))
+        })
+        .unwrap()
+        .0;
+    assert_eq!(listed, (Some(false), Some(true)));
+}
+
+#[test]
+fn a_leaf_with_someone_elses_key_is_not_confirmed() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    let c = net.device("carol@example.com", 4);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+    // Alice's device knows Carol's key from Carol's key file.
+    let carol = uid("carol@example.com");
+    let carol_key = net.devs[c].public();
+    let out = net.devs[a]
+        .engine
+        .key_file(&carol, Some(vec![(carol_key.clone(), None)]))
+        .unwrap();
+    net.devs[a].absorb(out);
+    net.run();
+
+    // Bob's device, misbehaving, adds a leaf with Bob's credential and
+    // Carol's key (12.2).
+    let dev = &net.devs[b];
+    let bob_device = crate::e2ee::Device::new(dev.uid.clone(), dev.key.clone()).unwrap();
+    let imposter = crate::e2ee::Device::new(dev.uid.clone(), net.devs[c].key.clone()).unwrap();
+    let conv: Conv = "alice@example.org".parse().unwrap();
+    let account = dev.account;
+    let (commit, _) = dev
+        .store
+        .write_with(|tx| {
+            let kp = crate::e2ee::group::key_packages(tx, &imposter, 1, false)?.remove(0);
+            let (kp, _) = crate::e2ee::group::checked_key_package(&bob_device, &dev.uid, &kp)?;
+            let row = tx.conv_by_name(account, &conv)?.unwrap();
+            crate::e2ee::group::own_commit(
+                tx,
+                &bob_device,
+                &row,
+                risala_mls::group::Changes {
+                    add: vec![kp],
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    net.handle(
+        b,
+        Outgoing {
+            req: ReqId(9999),
+            command: Command::Commit {
+                conv,
+                commit: commit.commit,
+                group_info: commit.group_info,
+                welcome: None,
+            },
+        },
+    );
+    net.run();
+
+    // Bob's key file does not list that key, so Alice's device sends
+    // nothing to the leaf, and removes it (12.6).
+    let account = net.devs[a].account;
+    let leaves = net.devs[a]
+        .store
+        .write(|tx| {
+            let row = tx
+                .conv_by_name(account, &"bob@example.net".parse().unwrap())?
+                .unwrap();
+            Ok(crate::e2ee::group::current_leaves(tx, &row).unwrap().unwrap())
+        })
+        .unwrap()
+        .0;
+    assert!(
+        !leaves.iter().any(|l| l.key == carol_key),
+        "the leaf with Carol's key stays: {leaves:?}"
+    );
+}

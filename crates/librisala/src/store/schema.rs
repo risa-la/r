@@ -11,7 +11,7 @@ use super::StoreError;
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
 pub(super) const MIGRATIONS: &[&str] = &[
-    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15,
+    V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16,
 ];
 
 /// The schema version this build writes.
@@ -403,7 +403,7 @@ const V13: &str = openmls_sqlite_storage::SCHEMA;
 /// - `epoch_leaves`: the signature keys of each epoch's leaves that the
 ///   device was in, by key id (SHA-384), for 12.8 step 4.
 /// - `device_keys`: device keys the account has seen in groups and key
-///   files (12.8 step 4, 12.12), by key id. `listed` says whether the
+///   files (12.8 step 4, 12.12), by identity and key id (version 16). `listed` says whether the
 ///   identity's key file listed the key when last fetched (NULL: never
 ///   checked). `key_files` says when each identity's key file was last
 ///   fetched and tried.
@@ -485,6 +485,28 @@ CREATE TABLE own_devices (
 /// from before it have NULL, and come first.
 const V15: &str = "
 ALTER TABLE device_keys ADD COLUMN seen INTEGER;
+";
+
+/// Version 16: `device_keys` is keyed by the identity as well as the key
+/// id, so that a key one identity's key file lists never counts as
+/// another's (12.6, 12.12). What earlier versions recorded as listed may
+/// have come from another identity's key file, so every key is checked
+/// again.
+const V16: &str = "
+CREATE TABLE device_keys_v16 (
+    account INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    uid     TEXT NOT NULL,
+    key_id  BLOB NOT NULL,
+    key     BLOB NOT NULL,
+    listed  INTEGER,
+    label   TEXT,
+    seen    INTEGER,
+    PRIMARY KEY (account, uid, key_id)
+) WITHOUT ROWID;
+INSERT INTO device_keys_v16 (account, uid, key_id, key, listed, label, seen)
+    SELECT account, uid, key_id, key, NULL, label, seen FROM device_keys;
+DROP TABLE device_keys;
+ALTER TABLE device_keys_v16 RENAME TO device_keys;
 ";
 
 /// Brings the schema up to [`VERSION`].

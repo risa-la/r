@@ -523,7 +523,9 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Remembers a device key of `uid`, seen in a group or a key file.
+    /// Remembers a device key of `uid`, seen in a group or a key file. A
+    /// key is `uid`'s only by `uid`'s key file (12.12): the same key seen
+    /// with another identity is another row.
     pub(crate) fn note_device_key(
         &mut self,
         account: AccountId,
@@ -566,8 +568,9 @@ impl Tx<'_> {
         for (key, label) in keys {
             self.note_device_key(account, uid, key)?;
             self.conn().execute(
-                "UPDATE device_keys SET listed = 1, label = ?3 WHERE account = ?1 AND key_id = ?2",
-                params![account.0, key_id(key), label],
+                "UPDATE device_keys SET listed = 1, label = ?4
+                 WHERE account = ?1 AND uid = ?2 AND key_id = ?3",
+                params![account.0, uid.as_str(), key_id(key), label],
             )?;
         }
         Ok(())
@@ -1165,10 +1168,12 @@ impl super::Store {
             let mut stmt = conn.prepare_cached(
                 "SELECT d.key, d.label, d.listed,
                      EXISTS (SELECT 1 FROM epoch_leaves l
-                             WHERE l.account = d.account AND l.key_id = d.key_id),
+                             WHERE l.account = d.account AND l.uid = d.uid
+                                 AND l.key_id = d.key_id),
                      o.state
                  FROM device_keys d
                  LEFT JOIN own_devices o ON o.account = d.account AND o.key_id = d.key_id
+                     AND d.uid = (SELECT uid FROM accounts WHERE id = d.account)
                  WHERE d.account = ?1 AND d.uid = ?2 ORDER BY d.seen, d.key_id",
             )?;
             let rows = stmt.query_map(params![account.0, uid.as_str()], |r| {
