@@ -58,8 +58,8 @@ async fn overview_session_and_refs() {
     s.play(&overview.until("OK seq=8813").script()).await;
 
     // The last line of 1.4 is alice reacting, as an identity. A guest
-    // cannot react yet (M4), but a guest joining also makes event 8814,
-    // which is what 3.6 needs to report more=1.
+    // stands in for her here: its JOIN makes event 8814, which is what 3.6
+    // needs to report more=1, and its reaction is 8815.
     let rest = overview.after("OK seq=8813");
     assert_eq!(rest.lines.len(), 1, "{rest:?}");
     assert!(rest.lines[0].contains(";react=8813 MSG #general"));
@@ -75,7 +75,9 @@ async fn overview_session_and_refs() {
          alice S: OK id={id} head=8814
          sam S: @seq=8814;t={*};from=~alice;id={id} JOIN #general
          alice C: @react=8813 msg #general 👋
-         alice S: ERR not-supported{..}",
+         alice S: @seq=8815;t={*};from=~alice;react=8813 MSG #general 👋
+         alice S: OK seq=8815
+         sam S: @seq=8815;t={*};from=~alice;react=8813 MSG #general 👋",
     )
     .await;
 

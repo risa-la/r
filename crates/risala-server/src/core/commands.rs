@@ -13,9 +13,7 @@ use risala_proto::names::{Conv, Id, Name, Room, Seq, Uid};
 use risala_proto::server::{
     ErrResponse, Event, EventBody, OkResponse, Register, ServerLine, ServerMessage, Upload,
 };
-use risala_proto::types::{
-    Cid, DEFAULT_LIMIT, DEFAULT_LIST_LIMIT, FileUrl, InfoRole, Ref, Relation, Role,
-};
+use risala_proto::types::{DEFAULT_LIMIT, DEFAULT_LIST_LIMIT, InfoRole, Ref, Role};
 
 use super::state::{ConvEntry, ConvGuard, ConvState, RoomInfo};
 use super::{Inner, SignIn, SignInRefused, TOKEN_LEN};
@@ -756,117 +754,6 @@ impl Inner {
             Err(e) => tracing::error!(conv = %st.id, "storing a PART failed: {e}"),
         }
         st.remove_member(uid);
-    }
-
-    /// MSG (5.3), in rooms.
-    async fn msg(
-        &self,
-        uid: &Uid,
-        conv: Conv,
-        text: String,
-        relation: Option<Relation>,
-        file: Option<FileUrl>,
-        cid: Option<Cid>,
-    ) -> Outcome {
-        // M3: direct conversations. M4 and later: edits, reactions, files.
-        let Conv::Room(room) = conv else {
-            return Err(not_supported());
-        };
-        if file.is_some() || matches!(relation, Some(Relation::Edit(_) | Relation::React(_))) {
-            return Err(not_supported());
-        }
-        let mut guard = self.lock_room(&room).await?;
-        let st = &mut *guard;
-
-        // A message that was already sent gets its seq again (7.6), before
-        // any other check: the sender may have left since, or the room may
-        // have become private or closed to guests (PLAN.md 5, item 14).
-        let now = self.now();
-        if let Some(cid) = &cid {
-            let earlier = if uid.is_guest() {
-                let reg = self.reg();
-                reg.sessions
-                    .get(uid)
-                    .and_then(|s| s.cids.get(&st.id, cid, now))
-            } else {
-                let (key, from, cid) = (st.key, uid.clone(), cid.clone());
-                self.db(move |s| s.cid_seq(key, &from, &cid, now)).await?
-            };
-            if let Some(seq) = earlier {
-                return Ok(Some(OkResponse::new().with_seq(seq)));
-            }
-        }
-
-        let member = st.is_member(uid);
-        let info = room_of(st)?;
-        check_read(info, self.asker(uid, member))?;
-        if !member {
-            return Err(fail(ErrorCode::Forbidden, "join the room first"));
-        }
-        if uid.is_guest() && !info.settings.guests.allows_write() {
-            return Err(fail(ErrorCode::Forbidden, "guests may not send here"));
-        }
-        if let Some(Relation::Reply(target)) = relation {
-            self.check_target(st, target).await?;
-        }
-
-        let event = NewEvent {
-            t: now,
-            from: uid.clone(),
-            kind: EventKind::Msg {
-                relation,
-                file: None,
-                text,
-            },
-            // Guests' cids are kept per session (7.6).
-            cid: cid.clone().filter(|_| uid.is_identity()),
-        };
-        let (appended, event) = self.append(st, event).await?;
-        match appended {
-            Appended::New(seq) => {
-                Self::broadcast_event(st, &event);
-                self.typing_ended(uid, &st.id);
-                if let Some(cid) = cid
-                    && uid.is_guest()
-                    && let Some(session) = self.reg().sessions.get_mut(uid)
-                {
-                    session.cids.insert(st.id.clone(), cid, seq, now);
-                }
-                Ok(Some(OkResponse::new().with_seq(seq)))
-            }
-            // Another connection of the same identity sent the same cid
-            // between the check above and now.
-            Appended::Duplicate(seq) => Ok(Some(OkResponse::new().with_seq(seq))),
-        }
-    }
-
-    /// A message from `uid` ends its typing notification in the
-    /// conversation `id` (8.1), on every device: the next TYPING from any of
-    /// them is passed on at once, not held back by the rate limit.
-    fn typing_ended(&self, uid: &Uid, id: &Id) {
-        // The registry and the user's entry are never locked together here,
-        // so no lock order is imposed.
-        let Some(user) = self.reg().users.get(uid).cloned() else {
-            return;
-        };
-        let conns: Vec<ConnId> = user.lock().conns.iter().map(|c| c.handle.id()).collect();
-        let mut reg = self.reg();
-        for conn in conns {
-            if let Some(entry) = reg.conns.get_mut(&conn) {
-                entry.typing_ended(id);
-            }
-        }
-    }
-
-    /// Checks the target of `reply`, `edit` or `react` (5.3): a message in
-    /// the same conversation, not deleted, and not an edit or a reaction.
-    async fn check_target(&self, st: &ConvState, target: Seq) -> Result<(), Fail> {
-        let key = st.key;
-        let event = self.db(move |s| s.event(key, target)).await?;
-        match event {
-            Some(e) if !e.deleted && e.is_plain_message() => Ok(()),
-            _ => Err(fail(ErrorCode::NotFound, "no such message")),
-        }
     }
 
     /// SYNC (7.1).

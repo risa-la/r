@@ -891,6 +891,7 @@ impl Inner {
                         expiry: None,
                         ending: false,
                         display_name: String::new(),
+                        started: self.now(),
                     },
                 );
                 Ok(SignIn::New)
@@ -968,3 +969,6 @@ mod social_tests;
 
 #[cfg(test)]
 mod admin_tests;
+
+#[cfg(test)]
+mod messages_tests;

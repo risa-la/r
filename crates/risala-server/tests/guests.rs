@@ -556,7 +556,7 @@ async fn forbidden_and_not_found() {
          S: OK id={id} more=0
 
          C: @edit=3 msg #readonly an edit
-         S: ERR not-supported{..}
+         S: ERR forbidden{..}
          C: read #readonly 3
          S: ERR forbidden{..}",
     )

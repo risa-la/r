@@ -373,6 +373,10 @@ pub(crate) struct GuestSession {
     /// The guest's display name (8.2), escaped; empty if none. It lasts as
     /// long as the session.
     pub(crate) display_name: String,
+    /// When the session started. Messages sent under the name before then
+    /// were another guest's, so this one may not edit or delete them (4.2,
+    /// 5.3, 5.4).
+    pub(crate) started: Timestamp,
 }
 
 impl GuestSession {
