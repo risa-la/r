@@ -6,18 +6,20 @@ use risala_proto::names::BlobRef;
 use risala_proto::time::Timestamp;
 
 use super::{SqliteStore, from_sql_u64, sql_u64};
-use crate::store::{KeyLogStore, LogEntry, Result, millis, parsed};
+use crate::store::{KeyLogStore, LogEntry, Result, fixed, millis, parsed};
 
 /// The key log's tables.
 pub(super) const SCHEMA: &str = "
--- The key log's entries (4.5), by index from 0. A log never removes an
--- entry.
+-- The key log's entries (4.5), by index from 0: each an encoded LogEntry,
+-- a record or a hand-off. A log never removes an entry.
 CREATE TABLE log_entries (
     idx INTEGER PRIMARY KEY CHECK (idx >= 0),
-    uid TEXT NOT NULL,              -- whose record it is
-    record BLOB NOT NULL,           -- the encoded Record (4.4)
-    hash BLOB NOT NULL UNIQUE,      -- its SHA-384 hash: no record twice
-    added INTEGER NOT NULL          -- ms
+    entry BLOB NOT NULL,            -- the encoded LogEntry
+    uid TEXT,                       -- a record's uid; NULL for a hand-off
+    record_hash BLOB UNIQUE CHECK (length(record_hash) = 48), -- SHA-384 of a
+                                    -- record's Record (4.4): no record twice
+    added INTEGER NOT NULL,         -- ms
+    CHECK ((uid IS NULL) = (record_hash IS NULL))
 ) STRICT;
 CREATE INDEX log_entries_uid ON log_entries (uid, idx);
 
@@ -30,8 +32,9 @@ CREATE TABLE log_checkpoints (
     signed INTEGER NOT NULL         -- ms
 ) STRICT;
 
--- The log's number in its origin, <host>/risala-log/<number>, and the seed
--- of its ML-DSA-44 key (4.5). At most one row.
+-- Each log the server has run, by its number in the origin
+-- <host>/risala-log/<number>, with the seed of its ML-DSA-44 key (4.5).
+-- The newest is current; the ones before it handed off (4.10).
 CREATE TABLE log_key (
     number INTEGER PRIMARY KEY CHECK (number >= 1),
     seed BLOB NOT NULL CHECK (length(seed) = 32),
@@ -51,17 +54,15 @@ impl KeyLogStore for SqliteStore {
         self.write(|tx| {
             let first: i64 = tx.query_row("SELECT count(*) FROM log_entries", [], |r| r.get(0))?;
             let mut insert = tx.prepare_cached(
-                "INSERT INTO log_entries (idx, uid, record, hash, added) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO log_entries (idx, entry, uid, record_hash, added)
+                 VALUES (?, ?, ?, ?, ?)",
             )?;
             for (i, entry) in (first..).zip(entries) {
-                let hash = BlobRef::of(&entry.record);
-                insert.execute(params![
-                    i,
-                    entry.uid.as_str(),
-                    entry.record,
-                    &hash.hash()[..],
-                    millis(now)
-                ])?;
+                let (uid, hash) = match &entry.record {
+                    Some((uid, hash)) => (Some(uid.as_str()), Some(&hash.hash()[..])),
+                    None => (None, None),
+                };
+                insert.execute(params![i, entry.entry, uid, hash, millis(now)])?;
             }
             from_sql_u64("log size", first)
         })
@@ -70,17 +71,26 @@ impl KeyLogStore for SqliteStore {
     fn log_entries(&self, start: u64, count: u64) -> Result<Vec<LogEntry>> {
         self.read(|tx| {
             let mut select = tx.prepare_cached(
-                "SELECT uid, record FROM log_entries WHERE idx >= ? ORDER BY idx LIMIT ?",
+                "SELECT entry, uid, record_hash FROM log_entries WHERE idx >= ?
+                 ORDER BY idx LIMIT ?",
             )?;
             let rows = select.query_map(params![sql_u64(start), sql_u64(count)], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
             })?;
             rows.map(|row| {
-                let (uid, record) = row?;
-                Ok(LogEntry {
-                    uid: parsed("uid", &uid)?,
-                    record,
-                })
+                let (entry, uid, hash) = row?;
+                let record = match (uid, hash) {
+                    (Some(uid), Some(hash)) => Some((
+                        parsed("uid", &uid)?,
+                        BlobRef::from_hash(fixed("record hash", &hash)?),
+                    )),
+                    _ => None,
+                };
+                Ok(LogEntry { entry, record })
             })
             .collect()
         })
@@ -91,10 +101,12 @@ impl KeyLogStore for SqliteStore {
 mod tests {
     use super::*;
 
+    /// A record entry of `uid` whose Record is `record` (the entry's
+    /// bytes here are only the Record's, for the test).
     fn entry(uid: &str, record: &[u8]) -> LogEntry {
         LogEntry {
-            uid: uid.parse().unwrap(),
-            record: record.to_vec(),
+            entry: record.to_vec(),
+            record: Some((uid.parse().unwrap(), BlobRef::of(record))),
         }
     }
 
@@ -118,12 +130,24 @@ mod tests {
         assert_eq!(store.log_entries(1, 10).unwrap()[0], first[1]);
         assert_eq!(store.log_entries(0, 2).unwrap(), first);
         assert!(store.log_entries(3, 10).unwrap().is_empty());
+        // A hand-off has no uid (4.5, 4.10).
+        let handoff = LogEntry {
+            entry: b"handoff".to_vec(),
+            record: None,
+        };
+        assert_eq!(
+            store
+                .append_entries(std::slice::from_ref(&handoff), t)
+                .unwrap(),
+            3
+        );
+        assert_eq!(store.log_entries(3, 1).unwrap(), [handoff]);
         // The same record again is refused, and nothing of the batch stays.
         let again = [
             entry("carol@example.org", b"c"),
             entry("alice@example.org", b"m"),
         ];
         assert!(store.append_entries(&again, t).is_err());
-        assert_eq!(store.log_size().unwrap(), 3);
+        assert_eq!(store.log_size().unwrap(), 4);
     }
 }

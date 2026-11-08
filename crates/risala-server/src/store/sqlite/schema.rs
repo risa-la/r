@@ -115,6 +115,7 @@ mod tests {
                 "settings",
                 "token_hashes",
                 "uploads",
+                "used_ids",
                 "welcomes",
             ]
         );

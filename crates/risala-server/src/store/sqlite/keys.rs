@@ -3,7 +3,7 @@
 
 use rusqlite::{OptionalExtension as _, Transaction, params};
 
-use risala_proto::binary::WrappedKey;
+use risala_proto::binary::{WRAPPED_KEY_LEN, WrappedKey};
 use risala_proto::names::{BlobRef, Uid};
 use risala_proto::time::Timestamp;
 
@@ -27,28 +27,32 @@ CREATE INDEX key_packages_device ON key_packages (uid, device, last_resort);
 CREATE UNIQUE INDEX key_packages_last_resort ON key_packages (device) WHERE last_resort = 1;
 CREATE INDEX key_packages_not_after ON key_packages (not_after);
 
--- The KeyPackageRefs a Welcome may be put for (12.8): those KEYPKG GET
--- handed out, for a device, and those of external Add proposals in public
--- rooms, for WELCOME GET.
+-- What a Welcome may be put for (12.8), once each: every time KEYPKG GET
+-- handed out a KeyPackage of a device (a last-resort one may be handed
+-- out many times), and every KeyPackage of an external Add proposal in a
+-- public room, for WELCOME GET.
 CREATE TABLE handed_out (
-    ref BLOB PRIMARY KEY CHECK (length(ref) = 48),
+    id INTEGER PRIMARY KEY,
+    ref BLOB NOT NULL CHECK (length(ref) = 48), -- the KeyPackageRef
     uid TEXT,                       -- the device's identity...
     device BLOB CHECK (length(device) = 48), -- ...and device id, from KEYPKG GET
     box BLOB CHECK (length(box) = 16), -- or the public room of an external proposal
     handed INTEGER NOT NULL,        -- ms; forgotten after retention (7.5)
+    welcomed INTEGER NOT NULL DEFAULT 0, -- a Welcome was put for it
     CHECK ((device IS NULL) != (box IS NULL))
 ) STRICT;
+CREATE INDEX handed_out_ref ON handed_out (ref);
 CREATE INDEX handed_out_device ON handed_out (device);
 
--- Welcomes waiting for their device, or for WELCOME GET (12.8).
+-- Welcomes waiting for their device, or for WELCOME GET (12.8): a
+-- SealedWelcome for a device, the MLSMessage for an external proposal.
 CREATE TABLE welcomes (
     id TEXT PRIMARY KEY,            -- the id the server gave it (3.5)
-    ref BLOB NOT NULL REFERENCES handed_out (ref) ON DELETE CASCADE,
+    handed INTEGER NOT NULL UNIQUE REFERENCES handed_out (id) ON DELETE CASCADE,
     welcome BLOB NOT NULL,          -- the Welcome, or its blob's hash
     is_blob INTEGER NOT NULL DEFAULT 0,
     received INTEGER NOT NULL       -- ms; deleted after retention (7.5)
 ) STRICT;
-CREATE INDEX welcomes_ref ON welcomes (ref);
 
 -- Blobs (12.12). Their bytes are in files named by their hash.
 CREATE TABLE blobs (
@@ -84,12 +88,14 @@ CREATE TABLE uploads (
                                     -- retention counts; NULL until then
 ) STRICT;
 
--- Each identity's backup (12.13).
+-- Each identity's backup (12.13). Its blobs, the first archive's and
+-- those in its list, are kept while it is current (blobs.kept).
 CREATE TABLE backups (
     uid TEXT PRIMARY KEY,
     generation INTEGER NOT NULL CHECK (generation >= 0),
-    hash BLOB NOT NULL CHECK (length(hash) = 48), -- the archive's blob
-    key BLOB NOT NULL CHECK (length(key) = 60), -- the wrapped key
+    hash BLOB NOT NULL CHECK (length(hash) = 48), -- the first archive's blob
+    key BLOB NOT NULL CHECK (length(key) = 61), -- the WrappedKey
+    files BLOB CHECK (length(files) = 48), -- the list's blob, if any
     stored INTEGER NOT NULL         -- ms
 ) STRICT;
 ";
@@ -98,25 +104,30 @@ CREATE TABLE backups (
 fn backup_in(tx: &Transaction<'_>, uid: &Uid) -> Result<Option<BackupRecord>> {
     let row = tx
         .query_row(
-            "SELECT generation, hash, key FROM backups WHERE uid = ?",
+            "SELECT generation, hash, key, files FROM backups WHERE uid = ?",
             [uid.as_str()],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             },
         )
         .optional()?;
-    let Some((generation, hash, key)) = row else {
+    let Some((generation, hash, key, files)) = row else {
         return Ok(None);
     };
+    let key: [u8; WRAPPED_KEY_LEN] = fixed("wrapped key", &key)?;
     Ok(Some(BackupRecord {
         generation: u32::try_from(generation)
             .map_err(|_| StoreError::Corrupt(format!("backup generation {generation}")))?,
         hash: BlobRef::from_hash(fixed("backup hash", &hash)?),
-        key: WrappedKey::from_bytes(fixed("wrapped key", &key)?),
+        key: WrappedKey::from_array(&key),
+        files: files
+            .map(|files| fixed("backup list", &files).map(BlobRef::from_hash))
+            .transpose()?,
     }))
 }
 
@@ -130,29 +141,30 @@ impl KeysStore for SqliteStore {
         uid: &Uid,
         backup: &BackupRecord,
         now: Timestamp,
-    ) -> Result<Option<BlobRef>> {
+    ) -> Result<Option<BackupRecord>> {
         self.write(|tx| {
             let old = backup_in(tx, uid)?;
             tx.execute(
-                "INSERT OR REPLACE INTO backups (uid, generation, hash, key, stored)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO backups (uid, generation, hash, key, files, stored)
+                 VALUES (?, ?, ?, ?, ?, ?)",
                 params![
                     uid.as_str(),
                     backup.generation,
                     &backup.hash.hash()[..],
-                    &backup.key.as_bytes()[..],
+                    backup.key.decode(),
+                    backup.files.as_ref().map(|files| &files.hash()[..]),
                     millis(now)
                 ],
             )?;
-            Ok(old.map(|old| old.hash).filter(|hash| *hash != backup.hash))
+            Ok(old)
         })
     }
 
-    fn delete_backup(&self, uid: &Uid) -> Result<Option<BlobRef>> {
+    fn delete_backup(&self, uid: &Uid) -> Result<Option<BackupRecord>> {
         self.write(|tx| {
             let old = backup_in(tx, uid)?;
             tx.execute("DELETE FROM backups WHERE uid = ?", [uid.as_str()])?;
-            Ok(old.map(|old| old.hash))
+            Ok(old)
         })
     }
 }
@@ -162,10 +174,13 @@ mod tests {
     use super::*;
 
     fn backup(n: u8) -> BackupRecord {
+        let mut key = [n; WRAPPED_KEY_LEN];
+        key[0] = 1;
         BackupRecord {
             generation: u32::from(n),
             hash: BlobRef::of(&[n]),
-            key: WrappedKey::from_bytes([n; 60]),
+            key: WrappedKey::from_array(&key),
+            files: n.is_multiple_of(2).then(|| BlobRef::of(&[n, n])),
         }
     }
 
@@ -177,13 +192,12 @@ mod tests {
         assert_eq!(store.backup(&alice).unwrap(), None);
         assert_eq!(store.put_backup(&alice, &backup(1), t).unwrap(), None);
         assert_eq!(store.backup(&alice).unwrap(), Some(backup(1)));
-        // A new backup replaces the old, whose blob goes (12.13).
+        // A new backup replaces the old, which is returned so that its
+        // blobs can go (12.13).
         let old = store.put_backup(&alice, &backup(2), t).unwrap();
-        assert_eq!(old, Some(backup(1).hash));
+        assert_eq!(old, Some(backup(1)));
         assert_eq!(store.backup(&alice).unwrap(), Some(backup(2)));
-        // The same blob again is not deleted.
-        assert_eq!(store.put_backup(&alice, &backup(2), t).unwrap(), None);
-        assert_eq!(store.delete_backup(&alice).unwrap(), Some(backup(2).hash));
+        assert_eq!(store.delete_backup(&alice).unwrap(), Some(backup(2)));
         assert_eq!(store.delete_backup(&alice).unwrap(), None);
         assert_eq!(store.backup(&alice).unwrap(), None);
     }

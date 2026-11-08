@@ -1,47 +1,57 @@
 //! [`MailboxStore`] on SQLite, and the tables of mailboxes, posts and
 //! public rooms (5.2, 6, 7).
 
-use rusqlite::{OptionalExtension as _, params};
+use rusqlite::{OptionalExtension as _, Transaction, params};
+use sha2::{Digest as _, Sha384};
 
 use risala_proto::mls::GroupId;
 use risala_proto::names::{BoxName, Uid};
 
-use super::{SqliteStore, from_sql_u64};
+use super::{SqliteStore, from_sql_u64, sql_u64};
 use crate::store::{
-    MailboxRecord, MailboxStore, NewMailbox, Result, fixed, millis, parsed, timestamp,
+    Created, MailboxRecord, MailboxStore, NewMailbox, Result, fixed, millis, parsed, timestamp,
 };
 
 /// The mailbox area's tables.
 pub(super) const SCHEMA: &str = "
--- Every mailbox (5.2). A dropped one keeps its row, so that its box and
--- group id are never used again (5.2, 10.4) and its seqs never reused
--- (7.5).
+-- Every box and group id the server has seen, by SHA-384 hash (5.2): a
+-- box is never used again, and a group id gets a new mailbox only as a
+-- move (7.8), even once its mailboxes are gone.
+CREATE TABLE used_ids (
+    kind INTEGER NOT NULL CHECK (kind IN (1, 2)), -- 1 a box, 2 a group id
+    hash BLOB NOT NULL CHECK (length(hash) = 48),
+    PRIMARY KEY (kind, hash)
+) STRICT, WITHOUT ROWID;
+
+-- The mailboxes the server holds (5.2). A dropped or ended one is deleted
+-- (7.5, 10.4); used_ids remembers its box.
 CREATE TABLE mailboxes (
     box BLOB PRIMARY KEY CHECK (length(box) = 16),
-    group_id BLOB NOT NULL UNIQUE,
+    group_id BLOB NOT NULL,         -- shared by the mailboxes a group moved through
+    first_epoch INTEGER NOT NULL DEFAULT 0 CHECK (first_epoch >= 0), -- 0, or a move's (7.8)
+    moved_from BLOB REFERENCES mailboxes (box) ON DELETE SET NULL, -- for TOKEN (7.2, 7.8)
     created INTEGER NOT NULL,       -- ms
-    head INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0), -- the newest seq given out
-    dropped INTEGER                 -- ms when an operator dropped it (10.4)
+    head INTEGER NOT NULL DEFAULT 0 CHECK (head >= 0) -- the newest seq given out
 ) STRICT;
+CREATE INDEX mailboxes_group ON mailboxes (group_id, created);
 
--- The hashes of each mailbox's send tokens (7.2): a set for each of the
--- newest 16 epochs seen.
+-- The sets of send token hashes (7.2), per mailbox and epoch: at most 64
+-- hashes a set, each with when it was added and last used by a post.
 CREATE TABLE token_hashes (
     box BLOB NOT NULL REFERENCES mailboxes (box) ON DELETE CASCADE,
     epoch INTEGER NOT NULL CHECK (epoch >= 0),
     hash BLOB NOT NULL CHECK (length(hash) = 48),
+    added INTEGER NOT NULL,         -- ms
+    used INTEGER,                   -- ms of the last post that used it
     PRIMARY KEY (box, epoch, hash)
 ) STRICT, WITHOUT ROWID;
 
--- Kept posts (5.2), until they expire (7.5), with what the server read
--- from their framing.
+-- Kept posts (5.2), until they expire (7.5): their box, seq, time and
+-- message only (4.2).
 CREATE TABLE posts (
     box BLOB NOT NULL REFERENCES mailboxes (box) ON DELETE CASCADE,
     seq INTEGER NOT NULL CHECK (seq >= 1),
     t INTEGER NOT NULL,             -- ms, when the server accepted it
-    epoch INTEGER NOT NULL,
-    content_type INTEGER NOT NULL,  -- RFC 9420: 1 application, 2 proposal, 3 commit
-    pseudonym BLOB NOT NULL CHECK (length(pseudonym) = 16), -- from its RisalaAAD (7.3)
     message BLOB,                   -- the MLSMessage, or NULL if it is a blob
     blob BLOB CHECK (length(blob) = 48), -- the blob's hash, if it is one (12.12)
     UNIQUE (box, seq),
@@ -62,7 +72,7 @@ CREATE INDEX cids_t ON cids (t);
 
 -- Public rooms (6.1): the public state of each one's group as of its
 -- newest epoch (12.6), and what LIST, INFO and the join checks read from
--- it. A dropped room loses its row, which frees its name (10.4).
+-- it. Deleting the mailbox frees the name (7.5, 10.4).
 CREATE TABLE public_rooms (
     box BLOB PRIMARY KEY REFERENCES mailboxes (box) ON DELETE CASCADE,
     room TEXT NOT NULL UNIQUE,      -- '#name', in lower case
@@ -97,26 +107,82 @@ CREATE TABLE mutes (
 ) STRICT, WITHOUT ROWID;
 ";
 
+/// The kinds of `used_ids`.
+const USED_BOX: i64 = 1;
+const USED_GROUP: i64 = 2;
+
+/// Whether a box or group id (`kind`) with these bytes was seen before.
+fn used(tx: &Transaction<'_>, kind: i64, bytes: &[u8]) -> Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM used_ids WHERE kind = ? AND hash = ?",
+            params![kind, &Sha384::digest(bytes)[..]],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Remembers a box or group id (`kind`) by its hash.
+fn remember(tx: &Transaction<'_>, kind: i64, bytes: &[u8]) -> Result<()> {
+    tx.execute(
+        "INSERT INTO used_ids (kind, hash) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        params![kind, &Sha384::digest(bytes)[..]],
+    )?;
+    Ok(())
+}
+
 impl MailboxStore for SqliteStore {
-    fn create_mailbox(&self, new: &NewMailbox) -> Result<bool> {
+    fn create_mailbox(&self, new: &NewMailbox) -> Result<Created> {
         self.write(|tx| {
-            let added = tx.execute(
-                "INSERT INTO mailboxes (box, group_id, created) VALUES (?, ?, ?)
-                 ON CONFLICT DO NOTHING",
+            let mailbox = &new.mailbox.as_bytes()[..];
+            let group = &new.group_id.as_bytes()[..];
+            if used(tx, USED_BOX, mailbox)? {
+                return Ok(Created::Taken);
+            }
+            let moved_from: Option<Vec<u8>> = if new.first_epoch == 0 {
+                if used(tx, USED_GROUP, group)? {
+                    return Ok(Created::Taken);
+                }
+                None
+            } else {
+                let newest = tx
+                    .query_row(
+                        "SELECT box FROM mailboxes WHERE group_id = ?
+                         ORDER BY created DESC, rowid DESC LIMIT 1",
+                        [group],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match newest {
+                    Some(from) => Some(from),
+                    None => return Ok(Created::NoGroup),
+                }
+            };
+            remember(tx, USED_BOX, mailbox)?;
+            remember(tx, USED_GROUP, group)?;
+            let created = millis(new.created);
+            tx.execute(
+                "INSERT INTO mailboxes (box, group_id, first_epoch, moved_from, created)
+                 VALUES (?, ?, ?, ?, ?)",
                 params![
-                    &new.mailbox.as_bytes()[..],
-                    &new.group_id.as_bytes()[..],
-                    millis(new.created)
+                    mailbox,
+                    group,
+                    sql_u64(new.first_epoch),
+                    moved_from,
+                    created
                 ],
             )?;
-            if added == 0 {
-                return Ok(false);
-            }
             tx.execute(
-                "INSERT INTO token_hashes (box, epoch, hash) VALUES (?, 0, ?)",
-                params![&new.mailbox.as_bytes()[..], &new.token_hash.as_bytes()[..]],
+                "INSERT INTO token_hashes (box, epoch, hash, added) VALUES (?, ?, ?, ?)",
+                params![
+                    mailbox,
+                    sql_u64(new.first_epoch),
+                    &new.token_hash.as_bytes()[..],
+                    created
+                ],
             )?;
-            Ok(true)
+            Ok(Created::Created)
         })
     }
 
@@ -124,26 +190,32 @@ impl MailboxStore for SqliteStore {
         self.read(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT m.group_id, m.head, m.created, r.room
+                    "SELECT m.group_id, m.first_epoch, m.moved_from, m.head, m.created, r.room
                      FROM mailboxes m LEFT JOIN public_rooms r ON r.box = m.box
-                     WHERE m.box = ? AND m.dropped IS NULL",
+                     WHERE m.box = ?",
                     [&mailbox.as_bytes()[..]],
                     |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Option<String>>(5)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((group_id, head, created, room)) = row else {
+            let Some((group_id, first_epoch, moved_from, head, created, room)) = row else {
                 return Ok(None);
             };
             Ok(Some(MailboxRecord {
                 mailbox: *mailbox,
                 group_id: GroupId::from_bytes(fixed("group id", &group_id)?),
+                first_epoch: from_sql_u64("first epoch", first_epoch)?,
+                moved_from: moved_from
+                    .map(|from| fixed("box", &from).map(BoxName::from_bytes))
+                    .transpose()?,
                 head: from_sql_u64("head", head)?,
                 created: timestamp(created)?,
                 room: room.map(|r| parsed("room", &r)).transpose()?,
@@ -173,6 +245,7 @@ mod tests {
         NewMailbox {
             mailbox: BoxName::from_bytes([n; 16]),
             group_id: GroupId::from_bytes([n; 32]),
+            first_epoch: 0,
             token_hash: TokenHash::from_bytes([n; 48]),
             created: "2026-11-09T00:00:00.000Z".parse::<Timestamp>().unwrap(),
         }
@@ -183,10 +256,11 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let first = new_mailbox(1);
         assert_eq!(store.mailbox(&first.mailbox).unwrap(), None);
-        assert!(store.create_mailbox(&first).unwrap());
+        assert_eq!(store.create_mailbox(&first).unwrap(), Created::Created);
         let record = store.mailbox(&first.mailbox).unwrap().unwrap();
         assert_eq!(record.group_id, first.group_id);
-        assert_eq!((record.head, record.room.clone()), (0, None));
+        assert_eq!((record.first_epoch, record.head), (0, 0));
+        assert_eq!((record.moved_from, record.room.clone()), (None, None));
         assert_eq!(record.created, first.created);
 
         // The same box, or the same group id, is taken (5.2).
@@ -194,22 +268,68 @@ mod tests {
             group_id: GroupId::from_bytes([9; 32]),
             ..first.clone()
         };
-        assert!(!store.create_mailbox(&same_box).unwrap());
+        assert_eq!(store.create_mailbox(&same_box).unwrap(), Created::Taken);
         let same_group = NewMailbox {
             mailbox: BoxName::from_bytes([9; 16]),
             ..first.clone()
         };
-        assert!(!store.create_mailbox(&same_group).unwrap());
+        assert_eq!(store.create_mailbox(&same_group).unwrap(), Created::Taken);
         assert_eq!(store.mailbox(&same_group.mailbox).unwrap(), None);
 
-        // A dropped mailbox is gone, and its box and group id stay taken
-        // (10.4).
-        store
-            .conn()
-            .execute("UPDATE mailboxes SET dropped = 1", [])
+        // Its box stays taken once the mailbox is gone (7.5, 10.4), and
+        // only its hash is kept.
+        let conn = store.raw();
+        conn.execute("DELETE FROM mailboxes", []).unwrap();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM used_ids WHERE length(hash) = 48",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
+        assert_eq!(kept, 2);
+        drop(conn);
         assert_eq!(store.mailbox(&first.mailbox).unwrap(), None);
-        assert!(!store.create_mailbox(&first).unwrap());
+        assert_eq!(store.create_mailbox(&first).unwrap(), Created::Taken);
+    }
+
+    /// A group that moves gets a new mailbox with the same group id,
+    /// linked to the newest one it had (7.8).
+    #[test]
+    fn groups_move_to_new_mailboxes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = new_mailbox(1);
+        let moved = |n: u8, epoch: u64| NewMailbox {
+            mailbox: BoxName::from_bytes([n; 16]),
+            first_epoch: epoch,
+            ..first.clone()
+        };
+        // No mailbox of the group yet.
+        assert_eq!(
+            store.create_mailbox(&moved(2, 5)).unwrap(),
+            Created::NoGroup
+        );
+        store.create_mailbox(&first).unwrap();
+        assert_eq!(
+            store.create_mailbox(&moved(2, 5)).unwrap(),
+            Created::Created
+        );
+        let second = store.mailbox(&moved(2, 5).mailbox).unwrap().unwrap();
+        assert_eq!(second.first_epoch, 5);
+        assert_eq!(second.moved_from, Some(first.mailbox));
+        assert_eq!(second.group_id, first.group_id);
+        // A box is never used again, moves included.
+        assert_eq!(store.create_mailbox(&moved(2, 9)).unwrap(), Created::Taken);
+        // The first epoch's set has the hash.
+        let epoch: i64 = store
+            .raw()
+            .query_row(
+                "SELECT epoch FROM token_hashes WHERE box = ?",
+                [&second.mailbox.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch, 5);
     }
 
     #[test]
@@ -220,7 +340,7 @@ mod tests {
         for n in [2, 1] {
             let new = new_mailbox(n);
             store.create_mailbox(&new).unwrap();
-            let conn = store.conn();
+            let conn = store.raw();
             conn.execute(
                 "INSERT INTO public_rooms (box, room, creator, epoch, epoch_seq, group_info, tree)
                  VALUES (?, ?, 'alice@example.org', 0, 0, x'00', x'00')",

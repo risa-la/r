@@ -35,6 +35,7 @@ fn public_room(h: &Harness, n: u8, room: &str, members: &[&str]) -> BoxName {
         .create_mailbox(&NewMailbox {
             mailbox,
             group_id: GroupId::from_bytes([n; 32]),
+            first_epoch: 0,
             token_hash: TokenHash::from_bytes([n; 48]),
             created: T.parse().unwrap(),
         })

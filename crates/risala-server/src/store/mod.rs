@@ -8,7 +8,7 @@
 //! |---|---|---|---|
 //! | [`identity`] | [`IdentityStore`] | 4.6-4.9, 10.5 | `accounts`, `hosted`, `records`, `pairing` |
 //! | [`keylog`] | [`KeyLogStore`] | 4.5 | `log_entries`, `log_checkpoints`, `log_key` |
-//! | [`mailbox`] | [`MailboxStore`] | 5.2, 6.1, 6.4, 7 | `mailboxes`, `token_hashes`, `posts`, `cids`, `public_rooms`, `room_members`, `mutes` |
+//! | [`mailbox`] | [`MailboxStore`] | 5.2, 6.1, 6.4, 7 | `used_ids`, `mailboxes`, `token_hashes`, `posts`, `cids`, `public_rooms`, `room_members`, `mutes` |
 //! | [`keys`] | [`KeysStore`] | 5.6, 12.5, 12.8, 12.12, 12.13 | `key_packages`, `handed_out`, `welcomes`, `blobs`, `blob_puts`, `uploads`, `backups` |
 //! | [`misc`] | [`MiscStore`] | 5.8, 8.3, 9 | `presence`, `push_subscriptions`, `reports`, `report_posts` |
 //! | [`admin`] | [`AdminStore`] | 10 | `settings`, `operators`, `server_bans` |
@@ -26,6 +26,8 @@
 //!   `BLOB`s of their raw bytes, never base64. Uids and rooms are `TEXT`
 //!   in lower case.
 //! - Bearer secrets are stored only as hashes ([`crate::secret`]).
+//! - Nothing links an anonymous or guest connection, or its network
+//!   address, to what it stored (4.2).
 //! - Every method is one transaction, and blocks. The hub calls them on
 //!   the blocking pool.
 
@@ -43,7 +45,7 @@ pub use admin::{AdminStore, ServerSettings};
 pub use identity::IdentityStore;
 pub use keylog::{KeyLogStore, LogEntry};
 pub use keys::{BackupRecord, KeysStore};
-pub use mailbox::{MailboxRecord, MailboxStore, NewMailbox};
+pub use mailbox::{Created, MailboxRecord, MailboxStore, NewMailbox};
 pub use misc::MiscStore;
 pub use sqlite::{SCHEMA_VERSION, SqliteStore};
 
