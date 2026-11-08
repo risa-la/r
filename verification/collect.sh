@@ -134,6 +134,14 @@ step_fuzz_run() {
 
 step_fuzz_cover() {
   use_coverage_toolchain
+  # libFuzzer is C++. Built by a rustup Rust with the dev shell's C++
+  # compiler, the coverage builds need the shell's libstdc++ to run: on a
+  # plain Linux runner the loader does not find it.
+  if command -v c++ >/dev/null; then
+    local cxxlib
+    cxxlib=$(dirname "$(c++ -print-file-name=libstdc++.so.6)")
+    if [ "$cxxlib" != . ]; then export LD_LIBRARY_PATH=$cxxlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}; fi
+  fi
   local dir=$RAW/fuzz
   rm -rf "$dir" && mkdir -p "$dir"
   local host
