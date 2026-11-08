@@ -84,5 +84,9 @@ pub(crate) fn connector(roots: &Roots) -> TlsConnector {
             .with_no_client_auth(),
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // No TLS resumption: each fetch has a TLS session of its own, as
+    // every risala connection does (2.1), so that a session ticket cannot
+    // link one fetch to another.
+    config.resumption = rustls::client::Resumption::disabled();
     TlsConnector::from(Arc::new(config))
 }
