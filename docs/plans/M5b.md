@@ -94,7 +94,7 @@ four writing code at once.
 
 ### S. Spec review (item 59, steps 2 and 3)
 
-- [~] **S1. Review draft-03, round 1.** Four reviewers at once, each on
+- [x] **S1. Review draft-03, round 1.** Four reviewers at once, each on
   one area, against `../soatok-review.md`'s checklist (section 8), the
   decisions in items 51-61, and the spec's own consistency (every
   command in 13 defined where it points, every format specified to the
@@ -109,7 +109,7 @@ four writing code at once.
   - d. Content and operators: 5 (except 5.2), 6, 10, 12.11-12.13, 14,
     Appendix D (files, blobs, transfer, backups, reports, moderation,
     the threat model).
-- [ ] **S2. Fix round 1.** Fixes go into `spec/`, and new choices into
+- [~] **S2. Fix round 1.** Fixes go into `spec/`, and new choices into
   PLAN.md item 62. Needs S1.
 - [ ] **S3. Review again** with two fresh reviewers over the whole spec,
   then fix. At most three rounds in all; what remains above Low after
@@ -117,7 +117,7 @@ four writing code at once.
 
 ### P. `risala-proto`
 
-- [~] **P1. Lines for draft-03.** Rewrite `Command`, `ServerLine` and
+- [x] **P1. Lines for draft-03.** Rewrite `Command`, `ServerLine` and
   their parameter types to the tables in section 13: add ANON, CREATE,
   POST, FOLLOW, UNFOLLOW, FETCH, KEYS PUT, PAIR, MUTE, GROUPINFO,
   WATCH, BLOB, BACKUP, PRESENCE ON/OFF, GONE, DROP, RECORD and the new
@@ -138,14 +138,14 @@ four writing code at once.
   numbers (`risala-fp-1`, 40 digits, `RISALA-FP:`), chain checks
   (extends, forks). Owns `crates/risala-proto/src/keyfile.rs`,
   `fingerprint.rs`, `auth.rs` and new modules for records and pairing.
-- [~] **P3. The key log crate, `crates/risala-keylog`** (4.5): C2SP
+- [x] **P3. The key log crate, `crates/risala-keylog`** (4.5): C2SP
   tlog-checkpoint, signed-note with ML-DSA-44 cosignatures (type
   `0x06`) for the log and its witnesses, tlog-tiles (tile paths,
   hashing, building and reading tiles), inclusion and consistency
   proofs computed from tiles, the witness policy (k of n), and fork
   evidence. Pure library, no I/O beyond traits for fetching tiles.
   Owns the new crate.
-- [ ] **P4. Content lines** (12.9, 5.3-5.8, 8): the lines inside
+- [~] **P4. Content lines** (12.9, 5.3-5.8, 8): the lines inside
   encrypted messages (TEXT with its tags, DELETE, TYPING, READ, REPORT,
   CHALLENGE/ANSWER, ATTEST/REVEAL, BLOCK/UNBLOCK, RECORD/ALERT,
   SIGNINGKEY/BACKUPKEY), as a separate `Content` type with its own
@@ -184,7 +184,7 @@ four writing code at once.
 
 ### SV. `risalad`
 
-- [ ] **SV0. Scaffold.** A new store (schema version 1 for draft-03)
+- [~] **SV0. Scaffold.** A new store (schema version 1 for draft-03)
   and core: connection kinds, the greeting, ANON and GUEST, command
   routing to one module per area below, each replying `not-supported`;
   M5a's core, store and tests removed where draft-03 replaces them.
@@ -215,7 +215,7 @@ four writing code at once.
 
 ### C. librisala and `risala-cli`
 
-- [ ] **C0. Scaffold.** New store (schema version 1), the signed-in
+- [~] **C0. Scaffold.** New store (schema version 1), the signed-in
   connection plus anonymous connections for posting and fetching, the
   client API's shape, module stubs per area below. Needs P1.
 - [ ] **C1. Identity** (4.3-4.9, 12.14): creating an identity with its
