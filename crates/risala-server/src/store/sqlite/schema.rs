@@ -90,11 +90,13 @@ mod tests {
             [
                 "accounts",
                 "backups",
+                "blob_keeps",
                 "blob_puts",
                 "blobs",
                 "cids",
                 "handed_out",
                 "hosted",
+                "key_package_uids",
                 "key_packages",
                 "log_checkpoints",
                 "log_entries",

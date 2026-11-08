@@ -9,7 +9,7 @@
 //! | [`identity`] | [`IdentityStore`] | 4.6-4.9, 10.5 | `accounts`, `hosted`, `records`, `pins`, `pairing` |
 //! | [`keylog`] | [`KeyLogStore`] | 4.5, 4.10 | `log_key`, `log_entries`, `log_checkpoints`, `witness_key`, `witness_logs` |
 //! | [`mailbox`] | [`MailboxStore`] | 5.2, 6.1, 6.4, 7 | `used_ids`, `mailboxes`, `token_hashes`, `posts`, `cids`, `public_rooms`, `room_members`, `mutes` |
-//! | [`keys`] | [`KeysStore`] | 5.6, 12.5, 12.8, 12.12, 12.13 | `key_packages`, `handed_out`, `welcomes`, `blobs`, `blob_puts`, `uploads`, `backups` |
+//! | [`keys`] | [`KeysStore`] | 5.6, 12.5, 12.8, 12.12, 12.13 | `key_packages`, `key_package_uids`, `handed_out`, `welcomes`, `blobs`, `blob_keeps`, `blob_puts`, `uploads`, `backups` |
 //! | [`misc`] | [`MiscStore`] | 5.8, 8.3, 9 | `presence`, `push_subscriptions`, `reports`, `report_posts` |
 //! | [`admin`] | [`AdminStore`] | 10 | `settings`, `operators`, `server_bans` |
 //!
