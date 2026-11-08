@@ -1227,6 +1227,35 @@ Open:
     once hpke-rs-libcrux allows it. The provider never signs with ML-DSA
     itself; only the device signer does.
 
+    Built in risalad as follows, with no spec change:
+    - **Removed keys.** A key file fetched afresh takes the keys it lists
+      off the list of removed keys, as KEY ADD and REGISTER do for hosted
+      identities; otherwise a key that left and came back held up ENC for
+      good in a direct conversation. UNREGISTER marks leaves only for
+      hosted identities: another identity's key file still lists its keys,
+      and its room leaves go because it is no longer a member.
+    - **Direct conversations' participants** are the identities of the
+      pair that the server knows (it has a row for them). The start
+      counts only those; a sign-in that makes an identity known again puts
+      it back in its direct conversations before AUTH's `OK`; and every
+      command on a direct conversation checks that the sender is a
+      participant, in one place. A hosted identity that unregistered gets
+      no registry entry at start.
+    - **Limits.** `limits.max_key_package_bytes`, 64 KiB by default, at
+      least 16 KiB, measured decoded. BACKUP ADD counts an identity as
+      having been in a room if it is a member or invited, has a leaf or
+      blobs there, or the room's events show it joined or was invited.
+      Events that expired under retention no longer show it, a known gap;
+      a dropped room, or one without a group, takes no blobs.
+    - **HPKE keys.** INIT and COMMIT check every leaf's and parent node's
+      key in the tree (the parent's read from its encoding, as OpenMLS
+      keeps it private), `external_pub`, and the init and encryption keys
+      of added KeyPackages. A COMMIT's Welcome must be addressed to
+      exactly the KeyPackage refs it adds.
+    - **Smaller fixes.** KEY DEL and ADMIN DELKEY forget the device in the
+      transaction that removes the key. Guests keep the normal line
+      limits once signed in.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
