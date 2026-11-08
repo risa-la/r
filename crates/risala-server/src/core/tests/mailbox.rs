@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use risala_mls::checks::{CommitPost, History};
 use risala_mls::group::{
     Changes, CommitOutput, commit, create_group, encrypt_application, join_by_welcome,
-    join_proposal, merge_own_commit, own_leaf_key, process_message,
+    join_proposal, merge_own_commit, own_leaf_key, process_message, propose_update,
 };
 use risala_mls::identity::{DeviceId, RisalaIdentity};
 use risala_mls::keypackage::make_join_key_package;
@@ -1722,4 +1722,69 @@ async fn kinds() {
     let p = Pseudonym::from_bytes([1; 16]);
     h.send(&anon, &format!("UNMUTE {m} {p}")).await;
     assert_eq!(anon.lines(), ["ERR wrong-connection"]);
+}
+
+/// Proposals posted on their own in a public room (6.1, 12.6): an Update
+/// comes from its leaf's device's signed-in connection; a proposal is for
+/// the current epoch, and is kept for the commit that applies it.
+#[tokio::test]
+async fn public_room_updates() {
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let mut anon = h.anon().await;
+    let token0 = room.owen.token(&room.o);
+    let update = propose_update(
+        &room.owen.provider,
+        &mut room.o,
+        room.owen.pseudonym,
+        &room.owen.profile(),
+        None,
+    )
+    .unwrap();
+    let message = b64(&update.message);
+    h.send(&anon, &format!("POST {m} {token0} {message}")).await;
+    assert_eq!(
+        anon.lines(),
+        ["ERR forbidden an identity's Update comes from its device's signed-in connection"]
+    );
+    let mut other = h.signed_in_as("owen@example.org");
+    h.send(&other, &format!("POST {m} {token0} {message}"))
+        .await;
+    assert!(other.lines()[0].starts_with("ERR forbidden"));
+    h.send(&room.signed, &format!("POST {m} {token0} {message}"))
+        .await;
+    assert_eq!(room.signed.lines(), ["OK seq=1"]);
+    let stored = h.store.room_group(&m).unwrap().unwrap();
+    assert_eq!(stored.proposals.len(), 1);
+    // Proposals have no next and no groupinfo (5.2).
+    h.send(
+        &room.signed,
+        &format!("POST {m} {token0} {message} next={}", hash([1; 48])),
+    )
+    .await;
+    assert!(room.signed.lines()[0].starts_with("ERR invalid"));
+    // Once restarted, the hub rebuilds the group with its pending
+    // proposal, and the owner's commit that applies it is accepted.
+    h.inner().mailbox.forget_room(&m);
+    let out = room.owen.commit(&mut room.o, Changes::default());
+    h.send(
+        &room.signed,
+        &format!(
+            "POST {m} {token0} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(out.group_info.as_ref().unwrap())
+        ),
+    )
+    .await;
+    assert_eq!(room.signed.lines(), ["OK seq=2"]);
+    assert!(
+        h.store
+            .room_group(&m)
+            .unwrap()
+            .unwrap()
+            .proposals
+            .is_empty()
+    );
 }
