@@ -190,16 +190,16 @@ four writing code at once.
   M5a's core, store and tests removed where draft-03 replaces them.
   Owns `crates/risala-server/src/core/`, `src/store/`. Needs P1, M1's
   framing reader.
-- [~] **SV1. Identity** (4.6-4.9, 10.5): AUTH, REGISTER with a key
+- [x] **SV1. Identity** (4.6-4.9, 10.5): AUTH, REGISTER with a key
   file, KEYS PUT (chain checks, RECORD lines), hosted key files (410
   after UNREGISTER), PAIR PUT/GET (10 minutes), UNREGISTER, ADMIN
   UNREGISTER. Needs SV0, P2.
-- [~] **SV2. The key log on the server** (4.5): appending hosted and
+- [x] **SV2. The key log on the server** (4.5): appending hosted and
   outside records, tiles and checkpoints over HTTPS, the log's ML-DSA
   key, asking witnesses to cosign (C2SP tlog-witness), a checkpoint
   within an hour of a new record and at least daily, and a test
   witness in `risala-dev`. Needs SV0, P3.
-- [~] **SV3. Mailboxes and delivery** (5.2, 6.1, 7): CREATE (both
+- [x] **SV3. Mailboxes and delivery** (5.2, 6.1, 7): CREATE (both
   forms), POST (framing checks, send-token sets for the newest 16
   epochs, pseudonyms, `live`, `groupinfo`, `cid` for 24 hours),
   FOLLOW/UNFOLLOW/FETCH, GROUPINFO and a public room's current tree,
@@ -208,7 +208,7 @@ four writing code at once.
   12.13, 5.6): KEYPKG, WELCOME PUT/GET/LIST/DEL, BLOB and the HTTPS
   blob store, BACKUP, UPLOAD with `del` URLs, bearer secrets stored as
   hashes and compared in constant time. Needs SV0.
-- [~] **SV5. Everything else** (6.1, 8, 9, 5.8, 10): LIST, INFO,
+- [x] **SV5. Everything else** (6.1, 8, 9, 5.8, 10): LIST, INFO,
   PRESENCE/WATCH/WHOIS/MEMBERS, PUSH (RFC 8291 bodies, mailbox and
   account subscriptions), REPORT and the operators' review, the ADMIN
   commands. Needs SV0.
