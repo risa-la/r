@@ -16,7 +16,9 @@
 //!   not get the identity's key file, and the account tries again later
 //!   ([`RefusedKind::Unavailable`]).
 //! - **Registering.** [`Client::register`] creates `<name>@<domain>` on a
-//!   server that hosts identities, with this device's key (4.6).
+//!   server that hosts identities, with this device's key (4.6). The
+//!   account is in the cache, marked pending, before REGISTER is sent;
+//!   if its answer is never seen, signing in settles it.
 //! - **Hosted identities' keys.** [`Account::keys`],
 //!   [`Account::add_key`] and [`Account::remove_key`] (4.7).
 //! - **Deleting.** [`Account::unregister`] (4.8).
@@ -25,6 +27,7 @@
 //! store failures are [`ClientError::Keys`].
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use risala_proto::auth::{PublicKey, SecretKey};
 use risala_proto::command::{Command, KeyCommand};
@@ -35,13 +38,13 @@ use risala_proto::server::{ServerLine, ServerMessage};
 use risala_proto::text::{escape, unescape};
 use tracing::warn;
 
-use super::account::Account;
+use super::account::{Account, AccountShared};
 use super::types::{ClientError, DeviceKey, KeyErrorKind, KeyInfo, RefusedKind, Unregistered};
 use super::{Client, blocking, parse_server};
 use crate::addr::{ServerAddr, TrustStore};
 use crate::conn::keys::{self, KeyStore, KeyStoreError};
 use crate::conn::{self, CommandError, Session, SessionOptions};
-use crate::store::StoreError;
+use crate::store::{AccountId, Store, StoreError};
 
 /// How long QUIT may take after a one-off session.
 const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -265,7 +268,8 @@ impl Client {
     /// an IP address, [`RefusedKind::NameTaken`],
     /// [`RefusedKind::Forbidden`] (closed, banned, or a limit with
     /// `retry_after_secs`), [`RefusedKind::RateLimited`] and
-    /// [`RefusedKind::AuthFailed`].
+    /// [`RefusedKind::AuthFailed`]. A refused REGISTER leaves no account
+    /// behind.
     ///
     /// If the connection drops before REGISTER is answered, the identity
     /// may or may not exist, and the key is kept (4.6). The client
@@ -274,7 +278,24 @@ impl Client {
     /// as usual. If the server refuses the key, the identity was not
     /// created: [`RefusedKind::NotRegistered`], with the key still kept
     /// for the user to decide on. If neither can be learned,
-    /// [`ClientError::Unconfirmed`].
+    /// [`ClientError::Unconfirmed`], and the account is kept with the
+    /// REGISTER pending, as below.
+    ///
+    /// The account is added to the cache, marked as being registered,
+    /// before REGISTER is sent. So if this future is dropped, or the
+    /// process ends, before the answer is handled, the account is there
+    /// with the REGISTER pending, and signing in with the key settles it:
+    /// the next [`Account::connect`] or [`Account::start`] signs in as
+    /// usual if the registration went through. If the server refuses the
+    /// key, it fails with [`RefusedKind::NotRegistered`] and the account
+    /// is removed, the key kept. Calling `register` again for the same
+    /// name settles it the same way, and registers again if it did not go
+    /// through. The work runs on the client's runtime, so a dropped future
+    /// whose process goes on still finishes in the background.
+    ///
+    /// Only one REGISTER for an identity is under way at a time in a
+    /// client: another `register` for it meanwhile fails with
+    /// [`RefusedKind::RegisterPending`], and so does signing in as it.
     pub async fn register(&self, server: &str, name: &str) -> Result<Account, ClientError> {
         let addr = parse_server(server)?;
         let name: Name = name
@@ -287,70 +308,208 @@ impl Client {
                 &conn::Error::NoSni,
             ));
         }
+        self.key_store()?;
+        let client = self.clone();
+        on_runtime(self, async move {
+            // An earlier REGISTER found not to have gone through is
+            // settled first, then this one is sent on a new connection.
+            match client.register_once(&addr, &name, false).await? {
+                Some(account) => Ok(account),
+                None => client
+                    .register_once(&addr, &name, true)
+                    .await?
+                    .ok_or_else(|| pending(&name)),
+            }
+        })
+        .await
+    }
+
+    /// Connects to `addr`, learns its identity domain and registers `name`
+    /// under it, recording that it is pending until the answer is known.
+    ///
+    /// If an earlier REGISTER for it is still pending, from a dropped
+    /// future or an ended process, it signs in instead to settle it, and
+    /// returns the account if it went through, or `None` if it did not,
+    /// to register again. `settled` says this call settled one already.
+    async fn register_once(
+        &self,
+        addr: &ServerAddr,
+        name: &Name,
+        settled: bool,
+    ) -> Result<Option<Account>, ClientError> {
+        let server = addr.to_string();
+        let fail = |e: conn::Error| ClientError::from_sign_in(&server, &e);
         let keys = self.key_store()?;
         let trust: Arc<dyn TrustStore> = Arc::new(self.store().clone());
         let options = self.options().session.clone();
-        let identity = {
-            let addr = addr.clone();
-            on_runtime(self, register_on(addr, trust, options, keys, name)).await?
+        let session = Session::connect(addr, trust.clone(), options.clone())
+            .await
+            .map_err(fail)?;
+        let rt = self.runtime().clone();
+        let store = self.store().clone();
+        let prepared = async {
+            let domain = session.identity_domain().await.map_err(fail)?;
+            let identity = Identity::new(name, &domain);
+            let (k, id) = (keys.clone(), identity.clone());
+            let (key, created) = blocking(&rt, move || load_or_create(&*k, &id)).await?;
+            // Recorded before REGISTER goes, so that its answer is settled
+            // whatever happens next, even after a restart (4.6).
+            let (s, a, uid) = (store.clone(), addr.clone(), identity.to_uid());
+            let (id, earlier) = match blocking(&rt, move || s.begin_register(&a, &uid)).await {
+                Ok(began) => began,
+                Err(e) => {
+                    if created {
+                        delete_key(&rt, &keys, &identity).await;
+                    }
+                    return Err(e.into());
+                }
+            };
+            Ok((domain, identity, key, created, id, earlier))
+        }
+        .await;
+        let (domain, identity, key, created, id, earlier) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                quit(&session).await;
+                return Err(e);
+            }
         };
-        self.add_uid(&addr.to_string(), identity.to_uid())
+        let account = self.handle(id, addr.clone(), identity.to_uid());
+        let Some(_claim) = Claim::new(account.shared()) else {
+            // Another REGISTER for it is under way in this client. Undo
+            // only a mark this call made, after one that ended meanwhile.
+            quit(&session).await;
+            if !earlier {
+                end_register(&rt, &store, id, false).await;
+            }
+            return Err(pending(name));
+        };
+
+        if earlier {
+            if settled {
+                // Pending again since this call settled it: another
+                // process is registering it.
+                quit(&session).await;
+                return Err(pending(name));
+            }
+            // Its answer was lost or never waited for. Sign in on this
+            // connection, whose nonce is unused, to learn whether it went
+            // through (4.5, 4.6).
+            warn!(%identity, "an earlier REGISTER is pending; signing in to settle it");
+            let signed_in = session.auth(&identity, &key).await;
+            quit(&session).await;
+            return match signed_in {
+                Ok(_) => self.registered(addr, &identity).await.map(Some),
+                Err(e) if e.is_auth_failed() => {
+                    end_register(&rt, &store, id, false).await;
+                    Ok(None)
+                }
+                Err(e) => Err(ClientError::Unconfirmed {
+                    uid: identity.to_string(),
+                    message: format!(
+                        "an earlier REGISTER of {identity} got no answer, and signing in to \
+                         check failed ({e}): whether it was registered is not known. The \
+                         account and this device's key for it are kept: connect it later to \
+                         find out"
+                    ),
+                }),
+            };
+        }
+
+        let sent = session.register_under(name, &domain, &key).await;
+        match sent {
+            Ok(_) => {
+                quit(&session).await;
+                self.registered(addr, &identity).await.map(Some)
+            }
+            Err(e) if certainly_not_registered(&e) => {
+                quit(&session).await;
+                end_register(&rt, &store, id, false).await;
+                if created {
+                    delete_key(&rt, &keys, &identity).await;
+                }
+                Err(fail(e))
+            }
+            Err(lost) => {
+                // The answer was lost: the identity may exist, with this key as
+                // its only key. Keep the key, and sign in to find out (4.6).
+                session.close();
+                warn!(error = %lost, %identity, "REGISTER got no answer; signing in to check");
+                match confirm_registration(addr, trust, options, &identity, &key, &lost).await {
+                    Ok(()) => self.registered(addr, &identity).await.map(Some),
+                    Err(e @ ClientError::Refused { .. }) => {
+                        end_register(&rt, &store, id, false).await;
+                        Err(e)
+                    }
+                    // Still pending: signing in settles it later.
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// The account for `identity` on `addr`, whose REGISTER went through:
+    /// no longer pending, and added again if it was removed meanwhile.
+    async fn registered(
+        &self,
+        addr: &ServerAddr,
+        identity: &Identity,
+    ) -> Result<Account, ClientError> {
+        let (store, a, uid) = (self.store().clone(), addr.clone(), identity.to_uid());
+        let id = blocking(self.runtime(), move || {
+            let id = store.account(&a, &uid)?;
+            store.end_register(id, true)?;
+            Ok::<_, StoreError>(id)
+        })
+        .await?;
+        Ok(self.handle(id, addr.clone(), identity.to_uid()))
     }
 }
 
-/// Connects to `addr`, learns its identity domain and registers `name`
-/// under it. Returns the new identity.
-async fn register_on(
-    addr: ServerAddr,
-    trust: Arc<dyn TrustStore>,
-    options: SessionOptions,
-    keys: Arc<dyn KeyStore>,
-    name: Name,
-) -> Result<Identity, ClientError> {
-    let server = addr.to_string();
-    let fail = |e: conn::Error| ClientError::from_sign_in(&server, &e);
-    let session = Session::connect(&addr, trust.clone(), options.clone())
-        .await
-        .map_err(fail)?;
-    let rt = tokio::runtime::Handle::current();
-    let prepared = async {
-        let domain = session.identity_domain().await.map_err(fail)?;
-        let identity = Identity::new(&name, &domain);
-        let (keys, id) = (keys.clone(), identity.clone());
-        let (key, created) = blocking(&rt, move || load_or_create(&*keys, &id)).await?;
-        Ok((domain, identity, key, created))
+/// [`RefusedKind::RegisterPending`] for `name`.
+fn pending(name: &Name) -> ClientError {
+    ClientError::refused(
+        RefusedKind::RegisterPending,
+        format!("a registration of {name} on this server is already under way"),
+    )
+}
+
+/// Marks a REGISTER as under way in this client while it lives, so that
+/// a second one, or signing in, does not run alongside it.
+struct Claim(Arc<AccountShared>);
+
+impl Claim {
+    /// `None` if one is under way already.
+    fn new(shared: &Arc<AccountShared>) -> Option<Claim> {
+        (!shared.registering.swap(true, Ordering::SeqCst)).then(|| Claim(shared.clone()))
     }
-    .await;
-    let (domain, identity, key, created) = match prepared {
-        Ok(p) => p,
-        Err(e) => {
-            quit(&session).await;
-            return Err(e);
-        }
-    };
-    let sent = session.register_under(&name, &domain, &key).await;
-    match sent {
-        Ok(_) => {
-            quit(&session).await;
-            Ok(identity)
-        }
-        Err(e) if certainly_not_registered(&e) => {
-            quit(&session).await;
-            if created {
-                let id = identity.clone();
-                if let Err(e) = blocking(&rt, move || keys.delete(id.as_str())).await {
-                    warn!(error = %e, "deleting the key of a failed registration");
-                }
-            }
-            Err(fail(e))
-        }
-        Err(lost) => {
-            // The answer was lost: the identity may exist, with this key as
-            // its only key. Keep the key, and sign in to find out (4.6).
-            session.close();
-            warn!(error = %lost, %identity, "REGISTER got no answer; signing in to check");
-            confirm_registration(&addr, trust, options, &identity, &key, &lost).await
-        }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.registering.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Settles a pending REGISTER in the cache. A failure is only logged: the
+/// REGISTER then stays pending, and signing in settles it later.
+async fn end_register(
+    rt: &tokio::runtime::Handle,
+    store: &Store,
+    account: AccountId,
+    registered: bool,
+) {
+    let store = store.clone();
+    if let Err(e) = blocking(rt, move || store.end_register(account, registered)).await {
+        warn!(error = %e, "settling a pending REGISTER");
+    }
+}
+
+/// Deletes the device key made for a registration that failed.
+async fn delete_key(rt: &tokio::runtime::Handle, keys: &Arc<dyn KeyStore>, identity: &Identity) {
+    let (keys, id) = (keys.clone(), identity.clone());
+    if let Err(e) = blocking(rt, move || keys.delete(id.as_str())).await {
+        warn!(error = %e, "deleting the key of a failed registration");
     }
 }
 
@@ -378,12 +537,13 @@ async fn confirm_registration(
     identity: &Identity,
     key: &SecretKey,
     lost: &conn::Error,
-) -> Result<Identity, ClientError> {
+) -> Result<(), ClientError> {
     let unconfirmed = |why: String| ClientError::Unconfirmed {
         uid: identity.to_string(),
         message: format!(
             "REGISTER got no answer ({lost}), and {why}: whether {identity} was registered \
-             is not known. This device's key for it is kept: sign in as it later to find out"
+             is not known. The account and this device's key for it are kept: connect it later \
+             to find out"
         ),
     };
     let session = match Session::connect(addr, trust, options).await {
@@ -393,7 +553,7 @@ async fn confirm_registration(
     let signed_in = session.auth(identity, key).await;
     quit(&session).await;
     match signed_in {
-        Ok(_) => Ok(identity.clone()),
+        Ok(_) => Ok(()),
         Err(e) if e.is_auth_failed() => Err(ClientError::refused(
             RefusedKind::NotRegistered,
             format!(

@@ -132,6 +132,21 @@ async fn drive(
             return None;
         }
     };
+    // A REGISTER whose answer was never seen, which signing in settles
+    // (4.6).
+    let mut register_pending = if key.is_some() {
+        let (store, account) = (shared.store.clone(), shared.id);
+        match blocking(&shared.rt, move || store.register_pending(account)).await {
+            Ok(pending) => pending.is_some(),
+            Err(e) => {
+                let error = ClientError::from(e);
+                shared.set_state_for(generation, ConnectionState::Failed { error });
+                return None;
+            }
+        }
+    } else {
+        false
+    };
     let trust: Arc<dyn TrustStore> = Arc::new(shared.store.clone());
     let (supervisor, mut events) = Supervisor::spawn(
         shared.server.clone(),
@@ -154,6 +169,10 @@ async fn drive(
                     SupervisorEvent::SignedIn { uid, session, incoming } => {
                         if let Some(key) = &key {
                             note_accepted(shared, key).await;
+                        }
+                        if register_pending {
+                            end_register(shared, true).await;
+                            register_pending = false;
                         }
                         shared.operator.store(session.is_operator(), Ordering::SeqCst);
                         // A guest's session was resumed or is new (4.2).
@@ -196,7 +215,22 @@ async fn drive(
                     }
                     SupervisorEvent::Failed { error } => {
                         let mut error = ClientError::from_sign_in(&server, &error);
-                        if let (Some(key), ClientError::Refused { kind, message, .. }) =
+                        if let ClientError::Refused { kind, message, .. } = &mut error
+                            && *kind == RefusedKind::AuthFailed
+                            && register_pending
+                        {
+                            // The REGISTER whose answer was never seen did
+                            // not go through (4.6).
+                            let removed = end_register(shared, false).await;
+                            *kind = RefusedKind::NotRegistered;
+                            *message = format!(
+                                "REGISTER of {} got no answer, and {server} then refused to sign \
+                                 in with its key ({message}): it was not registered. {}This \
+                                 device's key for it is kept",
+                                shared.uid,
+                                if removed { "The account was removed. " } else { "" },
+                            );
+                        } else if let (Some(key), ClientError::Refused { kind, message, .. }) =
                             (&key, &mut error)
                             && *kind == RefusedKind::AuthFailed
                             && was_accepted(shared, key).await
@@ -277,6 +311,20 @@ async fn note_accepted(shared: &AccountShared, key: &str) {
     }
 }
 
+/// Settles a REGISTER whose answer was never seen, now that signing in
+/// told whether it went through (4.6): if not, an account added for it
+/// goes. Returns whether it went.
+async fn end_register(shared: &AccountShared, registered: bool) -> bool {
+    let (store, account) = (shared.store.clone(), shared.id);
+    match blocking(&shared.rt, move || store.end_register(account, registered)).await {
+        Ok(removed) => removed,
+        Err(e) => {
+            warn!(error = %e, "settling a pending REGISTER");
+            false
+        }
+    }
+}
+
 /// Whether the server accepted the device key with fingerprint `key`
 /// before, on any connection so far.
 async fn was_accepted(shared: &AccountShared, key: &str) -> bool {
@@ -316,6 +364,12 @@ fn sign_in_for(
                 "UNREGISTER of {identity} got no answer; unregister again to settle it before \
                  signing in"
             ),
+        ));
+    }
+    if shared.registering.load(Ordering::SeqCst) {
+        return Err(ClientError::refused(
+            RefusedKind::RegisterPending,
+            format!("{identity} is being registered; sign in once that is done"),
         ));
     }
     let keys = shared

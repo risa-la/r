@@ -512,7 +512,222 @@ async fn a_lost_register_that_cannot_be_checked_is_unconfirmed() {
         other => panic!("{other:?}"),
     }
     assert!(s.keys.load("bob@example.org").unwrap().is_some());
+    // Kept with the REGISTER pending: signing in settles it later.
+    let accounts = s.client.accounts().unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].uid(), "bob@example.org");
+    assert_eq!(
+        s.client.store().register_pending(accounts[0].id()).unwrap(),
+        Some(true)
+    );
+    s.server.done().await;
+}
+
+/// The first connection of a REGISTER of alice that is cut short: the
+/// server reads REGISTER, tells the test, and never answers.
+async fn register_read(peer: &mut Peer, read: &tokio::sync::Notify) {
+    greet(peer).await;
+    peer.expect("@ref=1 INFO").await;
+    peer.send("@ref=1 OK version=1 register=example.org").await;
+    peer.expect(&format!("@ref=2 REGISTER alice {PUBLIC} {SIGNATURE}"))
+        .await;
+    read.notify_one();
+}
+
+/// Registers alice on a client of its own, on the same cache and keys as
+/// `s.client`, whose runtime ends once the server has read REGISTER, as
+/// when the app is killed before the answer. `s.client` is then the app
+/// started again.
+async fn kill_while_registering(s: &Setup, read: &tokio::sync::Notify) {
+    s.client.import_device_key(ALICE, PEM, false).await.unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let killed = Client::with_store(
+        s.client.store().clone(),
+        ClientOptions {
+            runtime: Some(rt.handle().clone()),
+            ..s.client.options().clone()
+        },
+    )
+    .unwrap();
+    within(async {
+        tokio::select! {
+            biased;
+            () = read.notified() => {}
+            r = killed.register(HOST, "alice") => panic!("answered: {r:?}"),
+        }
+    })
+    .await;
+    rt.shutdown_background();
+    drop(killed);
+    // Recorded before REGISTER went.
+    let accounts = s.client.accounts().unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].uid(), ALICE);
+    assert_eq!(
+        s.client.store().register_pending(accounts[0].id()).unwrap(),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn a_register_cut_short_that_went_through_signs_in() {
+    // 0: REGISTER, which the server carries out, but the app is killed
+    // before the answer. 1: the app, started again, connects.
+    let read = Arc::new(tokio::sync::Notify::new());
+    let notify = read.clone();
+    let s = setup(2, move |i, mut peer| {
+        let notify = notify.clone();
+        async move {
+            if i == 0 {
+                register_read(&mut peer, &notify).await;
+                peer.close().await;
+                return;
+            }
+            signed_in(&mut peer).await;
+            quit(peer).await;
+        }
+    })
+    .await;
+    kill_while_registering(&s, &read).await;
+
+    let alice = s.client.account(HOST, ALICE).unwrap().unwrap();
+    assert_eq!(within(alice.connect()).await.unwrap(), ALICE);
+    within(alice.wait_synced()).await.unwrap();
+    assert_eq!(s.client.store().register_pending(alice.id()).unwrap(), None);
+    within(alice.disconnect()).await;
+    assert_eq!(s.client.accounts().unwrap().len(), 1);
+    assert!(s.keys.load(ALICE).unwrap().is_some());
+    s.server.done().await;
+}
+
+#[tokio::test]
+async fn a_register_cut_short_that_did_not_go_through_is_removed() {
+    // 0: REGISTER, which the server never carries out. 1: the app,
+    // started again, connects, and the server refuses the key.
+    let read = Arc::new(tokio::sync::Notify::new());
+    let notify = read.clone();
+    let s = setup(2, move |i, mut peer| {
+        let notify = notify.clone();
+        async move {
+            if i == 0 {
+                register_read(&mut peer, &notify).await;
+                peer.close().await;
+                return;
+            }
+            greet(&mut peer).await;
+            peer.expect(&auth_line(1)).await;
+            peer.send("@ref=1 ERR auth-failed").await;
+            peer.expect_eof().await;
+        }
+    })
+    .await;
+    kill_while_registering(&s, &read).await;
+
+    let alice = s.client.account(HOST, ALICE).unwrap().unwrap();
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::NotRegistered, None));
+    assert_eq!(err.code(), Some("auth-failed"));
+    assert!(err.is_permanent());
+    assert_eq!(alice.state(), ConnectionState::Failed { error: err });
     assert!(s.client.accounts().unwrap().is_empty());
+    // The user decides about the key.
+    assert!(s.keys.load(ALICE).unwrap().is_some());
+    s.server.done().await;
+}
+
+#[tokio::test]
+async fn registering_again_settles_a_register_cut_short() {
+    // 0: REGISTER, never carried out, and the app is killed. 1: the user
+    // registers again: signing in settles the first. 2: REGISTER again.
+    let read = Arc::new(tokio::sync::Notify::new());
+    let notify = read.clone();
+    let s = setup(3, move |i, mut peer| {
+        let notify = notify.clone();
+        async move {
+            match i {
+                0 => {
+                    register_read(&mut peer, &notify).await;
+                    peer.close().await;
+                }
+                1 => {
+                    greet(&mut peer).await;
+                    peer.expect("@ref=1 INFO").await;
+                    peer.send("@ref=1 OK version=1 register=example.org").await;
+                    peer.expect(&auth_line(2)).await;
+                    peer.send("@ref=2 ERR auth-failed").await;
+                    quit(peer).await;
+                }
+                _ => {
+                    greet(&mut peer).await;
+                    peer.expect("@ref=1 INFO").await;
+                    peer.send("@ref=1 OK version=1 register=example.org").await;
+                    peer.expect(&format!("@ref=2 REGISTER alice {PUBLIC} {SIGNATURE}"))
+                        .await;
+                    peer.send(&format!("@ref=2 OK uid={ALICE}")).await;
+                    quit(peer).await;
+                }
+            }
+        }
+    })
+    .await;
+    kill_while_registering(&s, &read).await;
+
+    let alice = within(s.client.register(HOST, "alice")).await.unwrap();
+    assert_eq!(alice.uid(), ALICE);
+    assert_eq!(s.client.store().register_pending(alice.id()).unwrap(), None);
+    assert_eq!(s.client.accounts().unwrap().len(), 1);
+    s.server.done().await;
+}
+
+#[tokio::test]
+async fn one_register_at_a_time() {
+    // 0: REGISTER, answered once the test says so. 1: a second REGISTER
+    // of the same name meanwhile, which is not sent.
+    let (read, go) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let (notify, wait) = (read.clone(), go.clone());
+    let s = setup(2, move |i, mut peer| {
+        let (notify, wait) = (notify.clone(), wait.clone());
+        async move {
+            if i == 0 {
+                register_read(&mut peer, &notify).await;
+                wait.notified().await;
+                peer.send(&format!("@ref=2 OK uid={ALICE}")).await;
+                quit(peer).await;
+                return;
+            }
+            greet(&mut peer).await;
+            peer.expect("@ref=1 INFO").await;
+            peer.send("@ref=1 OK version=1 register=example.org").await;
+            quit(peer).await;
+        }
+    })
+    .await;
+    s.client.import_device_key(ALICE, PEM, false).await.unwrap();
+    let first = {
+        let client = s.client.clone();
+        tokio::spawn(async move { client.register(HOST, "alice").await })
+    };
+    within(read.notified()).await;
+
+    let err = within(s.client.register(HOST, "alice")).await.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::RegisterPending, None));
+    // Nor does the account sign in meanwhile.
+    let alice = s.client.account(HOST, ALICE).unwrap().unwrap();
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::RegisterPending, None));
+
+    go.notify_one();
+    let alice = within(first).await.unwrap().unwrap();
+    assert_eq!(alice.uid(), ALICE);
+    assert_eq!(s.client.store().register_pending(alice.id()).unwrap(), None);
+    assert_eq!(s.client.accounts().unwrap().len(), 1);
     s.server.done().await;
 }
 
@@ -559,6 +774,8 @@ async fn register_refusals() {
         ]
     );
     assert!(s.keys.load(ALICE).unwrap().is_none());
+    // Refused, so nothing is left pending.
+    assert!(s.client.accounts().unwrap().is_empty());
     s.server.done().await;
 }
 

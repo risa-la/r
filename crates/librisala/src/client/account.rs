@@ -73,6 +73,9 @@ pub(crate) struct AccountShared {
     /// Whether the account was running before an UNREGISTER whose answer
     /// was lost (4.8), to start it again if a later try is refused.
     pub ran_before_unregister: Mutex<Option<bool>>,
+    /// A [`Client::register`](super::Client::register) for the account's
+    /// identity is under way in this client (4.6).
+    pub registering: AtomicBool,
     /// The last sign-in said the identity is an operator (`op=yes`).
     pub operator: AtomicBool,
     next_driver: AtomicU64,
@@ -230,6 +233,7 @@ impl AccountShared {
             presence: Mutex::new(HashMap::new()),
             watching: Mutex::new(Watching::default()),
             ran_before_unregister: Mutex::new(None),
+            registering: AtomicBool::new(false),
             operator: AtomicBool::new(false),
             next_driver: AtomicU64::new(1),
         })

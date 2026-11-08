@@ -131,9 +131,9 @@ pub enum ClientError {
     /// - After [`Client::register`](super::Client::register), the device
     ///   key for `uid` is kept, since if the registration went through it
     ///   is the identity's only key. The client tried to sign in with it
-    ///   and could not tell either. Check later by signing in:
-    ///   [`Client::add_identity`](super::Client::add_identity), then
-    ///   [`Account::connect`](super::Account::connect).
+    ///   and could not tell either. The account is kept with the REGISTER
+    ///   pending: [`Account::connect`](super::Account::connect) later
+    ///   settles it, and removes the account if it did not go through.
     /// - After [`Account::unregister`](super::Account::unregister), the
     ///   account is kept, stopped. Call `unregister` again to find out
     ///   and finish.
@@ -260,6 +260,11 @@ pub enum RefusedKind {
     /// (4.8). Call [`Account::unregister`](super::Account::unregister)
     /// again to settle it.
     UnregisterPending,
+    /// REGISTER of this identity is under way in this client, and its
+    /// answer is not in yet (4.6): wait for
+    /// [`Client::register`](super::Client::register) to return, or, if it
+    /// was dropped, for it to finish in the background.
+    RegisterPending,
 }
 
 impl RefusedKind {
@@ -290,6 +295,7 @@ impl RefusedKind {
             RefusedKind::NotSupported | RefusedKind::NotHosted => "not-supported",
             RefusedKind::NoRegistration
             | RefusedKind::UnregisterPending
+            | RefusedKind::RegisterPending
             | RefusedKind::NoHostname
             | RefusedKind::WrongUid
             | RefusedKind::Guest => return None,

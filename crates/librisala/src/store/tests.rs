@@ -211,6 +211,37 @@ fn accounts() {
 }
 
 #[test]
+fn pending_registrations() {
+    let store = Store::open_in_memory().unwrap();
+    let (bob, carol) = (uid("bob@example.org"), uid("carol@example.org"));
+    // Added for the REGISTER: it goes if refused.
+    let (b, earlier) = store.begin_register(&addr(), &bob).unwrap();
+    assert!(!earlier);
+    assert_eq!(store.register_pending(b).unwrap(), Some(true));
+    // A second one leaves the first as it was.
+    assert_eq!(store.begin_register(&addr(), &bob).unwrap(), (b, true));
+    assert_eq!(store.register_pending(b).unwrap(), Some(true));
+    assert!(store.end_register(b, false).unwrap());
+    assert!(store.accounts().unwrap().is_empty());
+
+    // In the cache before: it stays either way.
+    let c = store.account(&addr(), &carol).unwrap();
+    assert_eq!(store.begin_register(&addr(), &carol).unwrap(), (c, false));
+    assert_eq!(store.register_pending(c).unwrap(), Some(false));
+    assert!(!store.end_register(c, false).unwrap());
+    assert_eq!(store.register_pending(c).unwrap(), None);
+
+    // Registered: it stays, no longer pending.
+    let (b, _) = store.begin_register(&addr(), &bob).unwrap();
+    assert!(!store.end_register(b, true).unwrap());
+    assert_eq!(store.register_pending(b).unwrap(), None);
+    assert_eq!(store.accounts().unwrap().len(), 2);
+    // Nothing pending: nothing happens.
+    assert!(!store.end_register(b, false).unwrap());
+    assert_eq!(store.accounts().unwrap().len(), 2);
+}
+
+#[test]
 fn edits_and_reactions() {
     let (store, _, conv) = setup();
     let changes = store_all(
@@ -963,6 +994,7 @@ fn a_version_4_cache_with_data_migrates() {
     assert_eq!(store.blocks_clock(account).unwrap(), 0);
     assert_eq!(store.accepted_key(account).unwrap(), None);
     assert_eq!(store.unregister_lost(account).unwrap(), None);
+    assert_eq!(store.register_pending(account).unwrap(), None);
     // And they work on the old data.
     let troll: risala_proto::names::BlockTarget = "troll@example.com".parse().unwrap();
     store

@@ -524,6 +524,78 @@ impl Store {
         Ok(())
     }
 
+    /// Whether a REGISTER for the account's identity may have gone through
+    /// with no answer seen yet (4.6): `Some(added)`, saying whether the
+    /// account was added to the cache for it, or `None`.
+    pub fn register_pending(&self, account: AccountId) -> Result<Option<bool>, StoreError> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT register_pending FROM accounts WHERE id = ?1",
+                    [account.0],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten())
+        })
+    }
+
+    /// Records, before REGISTER is sent, that `uid` on `server` is being
+    /// registered, adding the account if it is not in the cache. Returns
+    /// the account, and whether an earlier REGISTER for it was still
+    /// pending, which this leaves as it was. See
+    /// [`register_pending`](Self::register_pending).
+    pub fn begin_register(
+        &self,
+        server: &ServerAddr,
+        uid: &Uid,
+    ) -> Result<(AccountId, bool), StoreError> {
+        let (out, _) = self.write(|tx| {
+            let server = tx.server_id(server)?;
+            let added = tx.conn().execute(
+                "INSERT INTO accounts (server, uid) VALUES (?1, ?2)
+                 ON CONFLICT (server, uid) DO NOTHING",
+                params![server, uid.as_str()],
+            )? == 1;
+            let (id, pending): (i64, Option<bool>) = tx.conn().query_row(
+                "SELECT id, register_pending FROM accounts WHERE server = ?1 AND uid = ?2",
+                params![server, uid.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if pending.is_none() {
+                tx.conn().execute(
+                    "UPDATE accounts SET register_pending = ?2 WHERE id = ?1",
+                    params![id, added],
+                )?;
+            }
+            Ok((AccountId(id), pending.is_some()))
+        })?;
+        Ok(out)
+    }
+
+    /// Settles a pending REGISTER for the account: if `registered`, it
+    /// stays; if not, it goes if it was added for the REGISTER. Returns
+    /// whether it went. Does nothing if none is pending.
+    pub fn end_register(&self, account: AccountId, registered: bool) -> Result<bool, StoreError> {
+        let (removed, _) = self.write(|tx| {
+            if !registered {
+                let removed = tx.conn().execute(
+                    "DELETE FROM accounts WHERE id = ?1 AND register_pending = 1",
+                    [account.0],
+                )?;
+                if removed == 1 {
+                    return Ok(true);
+                }
+            }
+            tx.conn().execute(
+                "UPDATE accounts SET register_pending = NULL WHERE id = ?1",
+                [account.0],
+            )?;
+            Ok(false)
+        })?;
+        Ok(removed)
+    }
+
     /// Records the guest session the account signed in to, or forgets it.
     /// See [`guest_session`](Self::guest_session).
     pub fn set_guest_session(

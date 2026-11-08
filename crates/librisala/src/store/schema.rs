@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -295,6 +295,18 @@ ALTER TABLE outbox ADD COLUMN verb TEXT NOT NULL DEFAULT 'MSG' CHECK (verb IN ('
 /// The entry names the event by its `seq` once sent; this index finds it.
 const V10: &str = "
 CREATE INDEX outbox_sent ON outbox (account, conv, seq) WHERE state = 'sent';
+";
+
+/// Version 11: a REGISTER whose answer is not known yet (4.6).
+///
+/// `accounts.register_pending` is NULL normally. It is set before REGISTER
+/// is sent for the account's identity and cleared once the answer is
+/// known, so that a REGISTER whose answer was lost, never waited for, or
+/// cut short by the process ending is settled later by signing in: 1 if
+/// the account was added for the REGISTER, and goes if it is refused; 0
+/// if the account was in the cache before, and stays.
+const V11: &str = "
+ALTER TABLE accounts ADD COLUMN register_pending INTEGER;
 ";
 
 /// Brings the schema up to [`VERSION`].
