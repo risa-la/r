@@ -767,6 +767,21 @@ Open:
       across the API.
     - `risala admin drop` takes the room twice, like `admin unregister`.
 
+38. **Announcement-only rooms** (3.2, 6.2, 6.3, 8.1, 12.2, 12.5, 12.8,
+    12.11), asked for by the user and confirmed on 2026-11-08:
+    - A new owner-only room setting `send`, `all` (default) or `mods`.
+      Under `mods`, only owners, moderators and operators may send
+      messages.
+    - Plain members and guests may still react, and delete their own
+      messages and reactions (5.4 as everywhere). Replies, edits and
+      TYPING get `forbidden`.
+    - Encrypted rooms: `send` lives in the conversation extension next
+      to `history`, changed by an owner's COMMIT. The server lets plain
+      members send ENC, and devices drop members' non-reactions.
+      Operators without a role count as plain members there.
+    - Milestone: M4 for unencrypted rooms (server, librisala, CLI). The
+      encrypted part is specified now and built in M5a.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable

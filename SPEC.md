@@ -139,6 +139,7 @@ S: SET #general public yes
 S: SET #general guests write
 S: SET #general retention server
 S: SET #general e2ee no
+S: SET #general send all
 S: OK id=k3f9q2 head=8812
 C: history #general before=8812 limit=2
 S: @seq=8810;t=2026-11-06T15:30:11.004Z;from=alice@example.org MSG #general anyone around?
@@ -1471,6 +1472,7 @@ SET <room> <key> [<value...>]
 | `retention` | a number of days, or `server` | `server` | owners |
 | `e2ee` | `yes` or `no` | `no` | nobody: only INIT sets it (12.5) |
 | `history` | `shared` or `joined` | `shared` | owners, in encrypted rooms |
+| `send` | `all` or `mods` | `all` | owners |
 
 - `public yes`: LIST shows the room, and anyone may join.
 - `public no`: LIST does not show the room, and joining takes an
@@ -1503,6 +1505,19 @@ SET <room> <key> [<value...>]
   (12.5), and the server then records the SET event. SET of `history`
   gets `ERR encrypted` in an encrypted room, and `ERR forbidden` in any
   other.
+- `send all`: every member allowed to post may send messages. This is
+  the default.
+- `send mods`: the room is for announcements. Only its owners and
+  moderators, and server operators, may send messages. Plain members,
+  and guests under `guests write`, may still react (5.3), and delete
+  their own messages and reactions (5.4). Anything else they send with
+  MSG, including a reply or an edit, gets `ERR forbidden`, and so does
+  their TYPING (8.1).
+- In an encrypted room, the value of `send` lives in the room's group,
+  like `history`, and an owner changes it with a COMMIT (12.5). The
+  server cannot tell a reaction from a message there, so it lets plain
+  members send ENC, and their devices enforce the setting (12.11). SET
+  of `send` gets `ERR encrypted` in an encrypted room.
 
 Keyword and number values ignore trailing spaces, so `SET #r public yes `
 works. A topic keeps its spaces. An unknown key gets
@@ -1550,10 +1565,11 @@ membership:
 | Action | member | mod | owner |
 |---|---|---|---|
 | Send messages; edit, react to and delete your own | ✓ | ✓ | ✓ |
+| Send messages in a room with `send mods` (6.2) | | ✓ | ✓ |
 | Delete anyone's messages | | ✓ | ✓ |
 | Set `topic` | | ✓ | ✓ |
 | INVITE, KICK, BAN, UNBAN, BANS | | ✓ | ✓ |
-| Set `public`, `guests`, `retention` and `history` | | | ✓ |
+| Set `public`, `guests`, `retention`, `history` and `send` | | | ✓ |
 | ROLE | | | ✓ |
 
 - Moderators may kick and ban only plain members. Owners may act on
@@ -1563,6 +1579,8 @@ membership:
   (`ERR last-owner`), since the room would be left without one.
 - Guests in a room with `guests read` cannot send messages, reactions or
   typing notifications.
+- In a room with `send mods`, plain members and guests can send
+  reactions, but not other messages or typing notifications (6.2).
 - Server operators (Section 10) have owner rights in every room, and may
   join any room without an invitation, except an encrypted one (6.1),
   even one they are banned from.
@@ -1902,7 +1920,8 @@ and has no seq. In a direct conversation, `<conv>` follows the same rule
 as for events (5.2).
 
 Only someone who may send messages in the conversation may send TYPING
-(5.3). Others get `ERR forbidden`. A server MAY drop TYPING that comes
+(5.3). Others get `ERR forbidden`, including plain members of a room
+with `send mods`, who may only react (6.2). A server MAY drop TYPING that comes
 more often than about once a second per conversation; it still replies
 `OK`.
 
@@ -2481,7 +2500,7 @@ of type `0xF2A1` (Section 15). Leaves list this type, and the
 `last_resort` extension type `0x000A` [MLS-EXT], in their capabilities,
 and the group lists `0xF2A1` in its `required_capabilities`. It
 ties the group to one conversation, and holds the room's `history`
-setting (12.9):
+(12.9) and `send` (6.2) settings:
 
 ```
 enum {
@@ -2498,19 +2517,27 @@ enum {
     (255)
 } HistoryMode;
 
+enum {
+    reserved(0),
+    all(1),
+    mods(2),
+    (255)
+} SendMode;
+
 struct {
     ConversationKind kind;
     opaque name<V>;
     HistoryMode history;
+    SendMode send;
 } RisalaConversation;
 ```
 
 - For a direct conversation, `name` is the uids of its two participants
   in lower case, sorted byte by byte and joined by one space. For a
   conversation with yourself, it is your uid alone. `history` is
-  `shared`.
-- For a room, `name` is the room's id (5.1), and `history` is the room's
-  setting.
+  `shared`, and `send` is `all`.
+- For a room, `name` is the room's id (5.1), and `history` and `send`
+  are the room's settings.
 
 ### 12.3. Encrypted Conversations
 
@@ -2619,8 +2646,9 @@ extension, and rejects a group id it has seen before (`ERR invalid`).
 - **A room** must not be encrypted yet (`ERR stale`). The sender must be
   an owner and the room's only member (`ERR forbidden`). Since the
   extension names the room's id, the client gets it from INFO first. The
-  server sets `public` to `no`, `guests` to `none`, `e2ee` to `yes` and
-  `history` to the extension's value, and records a SET event for each,
+  server sets `public` to `no`, `guests` to `none`, `e2ee` to `yes`, and
+  `history` and `send` to the extension's values, and records a SET
+  event for each,
   with the sender as `from`. It also ends the room's pending
   invitations, which were made without the group.
 
@@ -2680,9 +2708,10 @@ all of these hold:
      leaf of an identity that is neither a member nor invited.
    - **GroupContextExtensions** is allowed only in a room, and the
      committer must be an owner. Its extension list is the group's
-     current one, with only the `history` field of the conversation
-     extension changed. The server records `SET <room> history <value>`
-     after the COMMIT event.
+     current one, with only the `history` and `send` fields of the
+     conversation extension changed. The server records
+     `SET <room> history <value>` or `SET <room> send <value>`, for each
+     field that changed, after the COMMIT event.
    - **ExternalInit** is allowed only in an external commit. An external
      commit may hold at most one Remove, and only of the leaf whose
      signature key is the joiner's (12.6).
@@ -2746,8 +2775,8 @@ not check the lifetimes of leaves already in the tree (12.4).
 
 - in a direct conversation, adds a leaf of anyone other than the
   participants, or in a conversation with yourself, of anyone else
-- changes the group's extensions other than the `history` field of the
-  conversation extension
+- changes the group's extensions other than the `history` and `send`
+  fields of the conversation extension
 - changes the credential or signature key of the committer's leaf
 - is an external commit by an identity that had no leaf in the group
   before it, except a participant of a direct conversation
@@ -2922,7 +2951,10 @@ Sends an encrypted message:
   be the group's current epoch, and the group MUST NOT have a leaf that
   must be removed (`ERR stale` for both, see 12.6).
 - The connection's device key MUST have a leaf in the group
-  (`ERR forbidden`). Who may send is otherwise as for MSG (5.3).
+  (`ERR forbidden`). Who may send is otherwise as for MSG (5.3), except
+  that in a room with `send mods` the server also lets plain members
+  send, since a reaction looks like any other ENC. Their devices enforce
+  the setting (12.11).
 - `<payload...>` is the encrypted message in base64 with padding. It
   MUST decode to at least 48 bytes, the salt and the AEAD tag
   (`ERR invalid`). This only catches payloads that cannot be messages:
@@ -3209,6 +3241,12 @@ work differently:
   the rules themselves. They ignore an edit from anyone other than the
   author of its target, a reaction longer than 64 bytes, and a second
   identical reaction from the same person to the same message.
+- **Announcement rooms** (`send mods`, 6.2) are enforced by devices.
+  A device ignores a message that is not a reaction from anyone who is
+  neither an owner nor a moderator of the room, going by the group's
+  `send` value at the message's epoch and by the room's ROLE events.
+  Server operators without a role count as plain members here, since
+  devices cannot see who is an operator.
 - **Deleting** (5.4) works on ENC events. The server erases the payload
   and keeps a placeholder with the `deleted` tag, an empty payload and
   no `frank` tag. It cannot find the message's edits and reactions, so
