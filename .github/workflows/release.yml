@@ -1,0 +1,32 @@
+name: Release
+
+# Pushing a tag v* creates its GitHub release, as github-actions rather
+# than as whoever pushed the tag. The notes are the annotated tag's
+# message. Versions below 1.0.0 are marked as pre-releases.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # actions/checkout fetches a tag as a lightweight one, without
+          # its message. Fetch it again as it is.
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          prerelease=()
+          case "$TAG" in v0.*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" --verify-tag --title "$TAG" \
+            --notes-from-tag "${prerelease[@]}"
