@@ -652,7 +652,8 @@ pub trait Store:
     ) -> Result<KeyChange>;
 
     /// Removes `key` from the hosted identity `uid` (4.7), unless it is the
-    /// last key.
+    /// last key, and in the same transaction does what
+    /// [`E2eeStore::forget_device`] does for it.
     fn delete_hosted_key(&self, uid: &Uid, key: &PublicKey) -> Result<KeyChange>;
 
     /// Deletes what the server keeps about the identity `uid` (4.8): its

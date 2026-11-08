@@ -72,6 +72,21 @@ pub(super) fn add_welcomes_in(
     Ok(ids)
 }
 
+/// [`E2eeStore::forget_device`] in `tx`, for KEY DEL and ADMIN DELKEY,
+/// which remove the key in the same transaction (4.7, 10.5).
+pub(super) fn forget_device_in(tx: &Transaction<'_>, uid: &Uid, key: &PublicKey) -> Result<()> {
+    let device = key.to_string();
+    for sql in [
+        "DELETE FROM key_packages WHERE uid = ? AND device_key = ?",
+        "DELETE FROM pending_welcomes WHERE uid = ? AND device_key = ?",
+        // Its leaves must go before anyone sends again (12.6).
+        "INSERT OR IGNORE INTO removed_keys (uid, device_key) VALUES (?, ?)",
+    ] {
+        tx.execute(sql, params![uid.as_str(), device])?;
+    }
+    prune_welcome_commits(tx)
+}
+
 pub(super) fn prune_welcome_commits(tx: &Transaction<'_>) -> Result<()> {
     tx.execute(
         "DELETE FROM welcome_commits WHERE NOT EXISTS \
@@ -349,18 +364,7 @@ impl E2eeStore for SqliteStore {
     }
 
     fn forget_device(&self, uid: &Uid, key: &PublicKey) -> Result<()> {
-        let device = key.to_string();
-        self.write(|tx| {
-            for sql in [
-                "DELETE FROM key_packages WHERE uid = ? AND device_key = ?",
-                "DELETE FROM pending_welcomes WHERE uid = ? AND device_key = ?",
-                // Its leaves must go before anyone sends again (12.6).
-                "INSERT OR IGNORE INTO removed_keys (uid, device_key) VALUES (?, ?)",
-            ] {
-                tx.execute(sql, params![uid.as_str(), device])?;
-            }
-            prune_welcome_commits(tx)
-        })
+        self.write(|tx| forget_device_in(tx, uid, key))
     }
 
     fn relist_keys(&self, uid: &Uid, keys: &[PublicKey]) -> Result<()> {

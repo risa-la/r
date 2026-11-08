@@ -80,6 +80,8 @@ impl AdminStore for SqliteStore {
             if removed == 0 {
                 return Ok(KeyChange::NotFound);
             }
+            // Its KeyPackages and Welcomes go with it (4.7).
+            super::e2ee::forget_device_in(tx, uid, key)?;
             Ok(KeyChange::Done(hosted_keys_in(tx, uid)?))
         })
     }

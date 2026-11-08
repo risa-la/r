@@ -1322,6 +1322,34 @@ fn commit_event(from: &str, epoch: u64) -> NewEvent {
 }
 
 #[test]
+fn a_deleted_key_takes_its_device_with_it() {
+    use crate::store::{AdminStore as _, E2eeStore as _, NewKeyPackage};
+    let store = SqliteStore::open_in_memory().unwrap();
+    let alice = uid("alice@example.org");
+    store.register(&alice, &key(1), t(0)).unwrap();
+    for n in [2, 3] {
+        store.add_hosted_key(&alice, &key(n), "", 64, t(0)).unwrap();
+        let kp = NewKeyPackage {
+            key_package: risala_proto::mls::KeyPackage::from_bytes(&[n; 6]).unwrap(),
+            kp_ref: vec![n],
+            not_after: t(86_400_000),
+            last_resort: false,
+        };
+        store
+            .add_key_package(&alice, &key(n), &kp, 100, t(0))
+            .unwrap();
+    }
+    let mut both = vec![key(2), key(3)];
+    both.sort_by_key(|k| k.to_string());
+    assert_eq!(store.stored_devices(&alice).unwrap(), both);
+    // In the transaction that removes the key (4.7, 10.5).
+    store.delete_hosted_key(&alice, &key(2)).unwrap();
+    assert_eq!(store.stored_devices(&alice).unwrap(), [key(3)]);
+    store.remove_any_hosted_key(&alice, &key(3)).unwrap();
+    assert!(store.stored_devices(&alice).unwrap().is_empty());
+}
+
+#[test]
 fn backups_are_for_conversations_the_identity_has_been_in() {
     use crate::store::BackupCheck::{Allowed, LaterEpoch, NotIn};
     let store = SqliteStore::open_in_memory().unwrap();

@@ -562,10 +562,9 @@ impl Inner {
             KeyChange::Done(keys) => {
                 let result = self.republish(target, keys).await;
                 respond(reply, "ADMIN", result);
+                // The store deleted its KeyPackages and pending Welcomes
+                // with it (4.7), under `keys_lock`: see `e2ee`.
                 self.close_keys(target, |k| *k == key);
-                // Its KeyPackages and pending Welcomes go (4.7), under
-                // `keys_lock`: see `e2ee`.
-                self.forget_device(target, &key).await;
                 tracing::info!(%target, "key removed by an operator");
                 Ok(None)
             }

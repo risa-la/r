@@ -611,10 +611,10 @@ impl Inner {
                         // 4.7: the connections that used the key are closed,
                         // this one too, after its response.
                         respond(reply, "KEY", result);
+                        // The store deleted its KeyPackages and pending
+                        // Welcomes with it (4.7), under `keys_lock`: see
+                        // `e2ee`.
                         self.close_keys(uid, |k| *k == key);
-                        // Its KeyPackages and pending Welcomes go (4.7),
-                        // under `keys_lock`: see `e2ee`.
-                        self.forget_device(uid, &key).await;
                         Ok(None)
                     }
                     KeyChange::NotFound => Err(fail(ErrorCode::NotFound, "no such key")),

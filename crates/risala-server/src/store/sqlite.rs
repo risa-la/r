@@ -1155,6 +1155,8 @@ impl Store for SqliteStore {
                 "DELETE FROM hosted_keys WHERE uid = ? AND key = ?",
                 params![uid.as_str(), key.to_string()],
             )?;
+            // Its KeyPackages and Welcomes go with it (4.7).
+            e2ee::forget_device_in(tx, uid, key)?;
             Ok(KeyChange::Done(hosted_keys_in(tx, uid)?))
         })
     }
