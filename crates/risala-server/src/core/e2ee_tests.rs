@@ -60,6 +60,8 @@ struct World {
     direct: String,
     /// The id of Alice's conversation with herself.
     own: String,
+    /// The store, as itself, for what only tests do with it.
+    sqlite: Arc<SqliteStore>,
 }
 
 /// A group of `who` as the store keeps it, in epoch `epoch`, without
@@ -126,7 +128,8 @@ impl World {
         store.touch_identity(&uid(BOB), start()).unwrap();
         let direct = start_direct(&store, ALICE, BOB, 1, 7);
         let own = start_direct(&store, ALICE, ALICE, 2, 3);
-        let store: Arc<dyn Store> = Arc::new(store);
+        let sqlite = Arc::new(store);
+        let store: Arc<dyn Store> = sqlite.clone();
         let fetcher = Arc::new(MemoryFetcher::new());
         fetcher.set(&identity(BOB), vec![key(5), key(6)]);
         let keys = KeyServices::shared(fetcher.clone(), Arc::new(NoPublisher));
@@ -142,6 +145,7 @@ impl World {
             fetcher,
             direct,
             own,
+            sqlite,
         }
     }
 
@@ -373,16 +377,16 @@ async fn store_welcome(w: &World, seq: u64, n: u8, tree: &RatchetTree, devices: 
         devices: devices.iter().map(|(who, n)| (uid(who), key(*n))).collect(),
     };
     let seq = Seq::new(seq).unwrap();
-    let ids =
-        w.h.store
-            .add_welcomes(
-                st.key,
-                seq,
-                &welcome.welcome,
-                &welcome.tree,
-                &welcome.devices,
-            )
-            .unwrap();
+    let ids = w
+        .sqlite
+        .add_welcomes(
+            st.key,
+            seq,
+            &welcome.welcome,
+            &welcome.tree,
+            &welcome.devices,
+        )
+        .unwrap();
     w.h.hub.inner.send_welcomes(&st, seq, &welcome, &ids);
 }
 

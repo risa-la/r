@@ -161,20 +161,6 @@ pub trait E2eeStore {
 
     // ---- Welcomes (12.7) ----
 
-    /// Stores the Welcome of the commit whose COMMIT event is `seq` in the
-    /// conversation `conv`, with the ratchet tree of the epoch it started,
-    /// as pending for each of `devices` (12.5, 12.7). Returns each
-    /// device's Welcome id, in the order of `devices`. A device listed
-    /// twice gets one Welcome. Nothing is stored for no devices.
-    fn add_welcomes(
-        &self,
-        conv: ConvKey,
-        seq: Seq,
-        welcome: &Welcome,
-        tree: &RatchetTree,
-        devices: &[(Uid, PublicKey)],
-    ) -> Result<Vec<Id>>;
-
     /// The ids of the Welcomes pending for the device `uid` and `key`, in
     /// the order their commits were stored. Those of conversations that
     /// are being dropped (10.4) are left out.

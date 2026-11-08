@@ -2360,16 +2360,6 @@ impl crate::store::E2eeStore for Flaky {
     fn prune_key_packages(&self, t: Timestamp) -> crate::store::Result<u64> {
         self.inner.prune_key_packages(t)
     }
-    fn add_welcomes(
-        &self,
-        c: ConvKey,
-        s: Seq,
-        w: &risala_proto::mls::Welcome,
-        t: &risala_proto::mls::RatchetTree,
-        d: &[(Uid, PublicKey)],
-    ) -> crate::store::Result<Vec<risala_proto::names::Id>> {
-        self.inner.add_welcomes(c, s, w, t, d)
-    }
     fn pending_welcomes(
         &self,
         u: &Uid,

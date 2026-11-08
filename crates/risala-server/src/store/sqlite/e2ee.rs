@@ -19,10 +19,13 @@ fn sql_epoch(epoch: u64) -> Result<i64> {
     i64::try_from(epoch).map_err(|_| corrupt("epoch", epoch))
 }
 
-/// Deletes the Welcome and tree of each commit that no device has pending
-/// any more (12.7).
-/// Stores a commit's Welcome as pending for each of `devices`, in `tx`
-/// (see [`E2eeStore::add_welcomes`]).
+/// Stores the Welcome of the commit whose COMMIT event is `seq` in the
+/// conversation `conv`, with the ratchet tree of the epoch it started, as
+/// pending for each of `devices`, in `tx` (12.5, 12.7). Returns each
+/// device's Welcome id, in the order of `devices`. A device listed twice
+/// gets one Welcome. Nothing is stored for no devices. COMMIT stores them
+/// in the transaction of the commit
+/// ([`GroupStore::commit_group`](crate::store::GroupStore::commit_group)).
 pub(super) fn add_welcomes_in(
     tx: &Transaction<'_>,
     conv: ConvKey,
@@ -87,6 +90,8 @@ pub(super) fn forget_device_in(tx: &Transaction<'_>, uid: &Uid, key: &PublicKey)
     prune_welcome_commits(tx)
 }
 
+/// Deletes the Welcome and tree of each commit that no device has pending
+/// any more (12.7).
 pub(super) fn prune_welcome_commits(tx: &Transaction<'_>) -> Result<()> {
     tx.execute(
         "DELETE FROM welcome_commits WHERE NOT EXISTS \
@@ -101,6 +106,25 @@ fn key_list(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result
         .query_map(args, |row| row.get::<_, String>(0))?
         .map(|key| parse("device key", &key?))
         .collect()
+}
+
+#[cfg(test)]
+impl SqliteStore {
+    /// [`add_welcomes_in`] in a transaction of its own, for tests that
+    /// need Welcomes without a commit.
+    pub(crate) fn add_welcomes(
+        &self,
+        conv: ConvKey,
+        seq: Seq,
+        welcome: &Welcome,
+        tree: &RatchetTree,
+        devices: &[(Uid, PublicKey)],
+    ) -> Result<Vec<Id>> {
+        if devices.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.write(|tx| add_welcomes_in(tx, conv, seq, welcome, tree, devices))
+    }
 }
 
 impl E2eeStore for SqliteStore {
@@ -243,20 +267,6 @@ impl E2eeStore for SqliteStore {
             let n = tx.execute("DELETE FROM key_packages WHERE not_after <= ?", [ms(now)])?;
             Ok(n as u64)
         })
-    }
-
-    fn add_welcomes(
-        &self,
-        conv: ConvKey,
-        seq: Seq,
-        welcome: &Welcome,
-        tree: &RatchetTree,
-        devices: &[(Uid, PublicKey)],
-    ) -> Result<Vec<Id>> {
-        if devices.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.write(|tx| add_welcomes_in(tx, conv, seq, welcome, tree, devices))
     }
 
     fn pending_welcomes(&self, uid: &Uid, key: &PublicKey) -> Result<Vec<Id>> {
