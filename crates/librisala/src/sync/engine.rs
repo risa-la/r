@@ -746,7 +746,7 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
     // Plumbing
 
-    fn now(&self) -> Timestamp {
+    pub(super) fn now(&self) -> Timestamp {
         self.config.clock.now()
     }
 
@@ -1918,6 +1918,12 @@ impl SyncEngine {
         let mut to_start: Vec<Conv> = Vec::new();
         // Identities whose key files would confirm a group's leaves.
         let mut unconfirmed: Vec<Uid> = Vec::new();
+        // Direct conversations waiting for a device of the other
+        // participant (12.6), and that participant. Their messages are
+        // held once KEYPKG GET found none on this connection.
+        let mut lonely: Vec<(Conv, Uid)> = Vec::new();
+        let me = self.me.clone();
+        let found_none = self.peers_found_none();
         let confirmed: HashMap<Conv, Id> = self
             .convs
             .iter()
@@ -2038,13 +2044,27 @@ impl SyncEngine {
                             continue;
                         }
                         let Some(row) = row else { continue };
-                        match SyncEngine::enc_ready(
+                        let ready = SyncEngine::enc_ready(
                             tx,
+                            &me,
                             &row,
                             item.draft.relation,
                             held.contains(&item.conv),
-                        )? {
+                        )?;
+                        if item.held && !matches!(ready, super::e2ee::EncReady::NoPeer(_)) {
+                            tx.outbox_hold(item.id, false)?;
+                        }
+                        match ready {
                             super::e2ee::EncReady::Go(p) => plan = Some(p),
+                            super::e2ee::EncReady::NoPeer(uid) => {
+                                if found_none.contains(&uid) {
+                                    tx.outbox_hold(item.id, true)?;
+                                }
+                                if !lonely.iter().any(|(c, _)| *c == item.conv) {
+                                    lonely.push((item.conv.clone(), uid));
+                                }
+                                continue;
+                            }
                             super::e2ee::EncReady::Wait => {
                                 if tx.group(row.id)?.is_none() && !item.conv.is_room() {
                                     to_start.push(item.conv.clone());
@@ -2072,6 +2092,9 @@ impl SyncEngine {
             self.start_direct(&conv)?;
         }
         self.check_unconfirmed(unconfirmed)?;
+        for (conv, uid) in lonely {
+            self.ask_peer(&conv, &uid);
+        }
         if let Some(at) = lapses {
             self.resume_by(now, at);
         }
@@ -2122,7 +2145,7 @@ impl SyncEngine {
     }
 
     /// Asks to be resumed ([`Output::retry_after`]) by `at` at the latest.
-    fn resume_by(&mut self, now: Timestamp, at: Timestamp) {
+    pub(super) fn resume_by(&mut self, now: Timestamp, at: Timestamp) {
         let wait = at.saturating_duration_since(now);
         self.out.retry_after = Some(self.out.retry_after.map_or(wait, |w| w.min(wait)));
     }

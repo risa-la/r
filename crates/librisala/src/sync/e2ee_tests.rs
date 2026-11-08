@@ -8,7 +8,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use risala_mls::openmls::group::MlsGroup;
 use risala_mls::openmls::prelude::GroupId;
@@ -42,6 +43,10 @@ struct Dev {
     key_files: VecDeque<Uid>,
     notes: Vec<Notification>,
     recovery: Option<risala_mls::RecoveryKey>,
+    /// The shortest [`Output::retry_after`] asked for.
+    retry: Option<Duration>,
+    /// How far the device's clock is ahead of the real one, in ms.
+    skew: Arc<AtomicU64>,
 }
 
 impl Dev {
@@ -51,7 +56,8 @@ impl Dev {
         let me = uid(me);
         let account = store.account(&server, &me).unwrap();
         let key = Arc::new(SecretKey::from_seed([seed; 32]));
-        let engine = Dev::engine(&store, account, &me, &key);
+        let skew = Arc::new(AtomicU64::new(0));
+        let engine = Dev::engine(&store, account, &me, &key, &skew);
         Dev {
             uid: me,
             key,
@@ -62,14 +68,26 @@ impl Dev {
             key_files: VecDeque::new(),
             notes: Vec::new(),
             recovery: None,
+            retry: None,
+            skew,
         }
     }
 
-    fn engine(store: &Store, account: AccountId, me: &Uid, key: &Arc<SecretKey>) -> SyncEngine {
+    fn engine(
+        store: &Store,
+        account: AccountId,
+        me: &Uid,
+        key: &Arc<SecretKey>,
+        skew: &Arc<AtomicU64>,
+    ) -> SyncEngine {
+        let skew = skew.clone();
         let config = SyncConfig {
             lazy_gap: None,
             fetch_blocks: false,
-            clock: Clock::new(Timestamp::now),
+            clock: Clock::new(move || {
+                let ahead = Duration::from_millis(skew.load(Ordering::Relaxed));
+                Timestamp::now().checked_add(ahead).unwrap()
+            }),
             ..SyncConfig::default()
         };
         let mut engine = SyncEngine::signed_in_as(store.clone(), account, me.clone(), config);
@@ -84,6 +102,15 @@ impl Dev {
         if out.recovery.is_some() {
             self.recovery = out.recovery;
         }
+        if let Some(r) = out.retry_after {
+            self.retry = Some(self.retry.map_or(r, |old| old.min(r)));
+        }
+    }
+
+    /// Moves the device's clock forward by `by`.
+    fn later(&self, by: Duration) {
+        self.skew
+            .fetch_add(by.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn public(&self) -> PublicKey {
@@ -346,7 +373,11 @@ impl Net {
                 let lines: Vec<String> = self
                     .convs
                     .iter()
-                    .filter(|c| c.members.contains(&me) && !c.events.is_empty())
+                    // A direct conversation that INIT started is listed
+                    // with head 0 (7.1).
+                    .filter(|c| {
+                        c.members.contains(&me) && (!c.events.is_empty() || c.epoch.is_some())
+                    })
                     .map(|c| format!("CONV {} {} {} 0", c.name_for(&me), c.id, c.events.len()))
                     .collect();
                 self.reply(d, req, &lines, "OK");
@@ -714,7 +745,7 @@ fn key_packages_are_kept_up() {
 fn reconnect(net: &mut Net, d: usize) {
     let dev = &mut net.devs[d];
     dev.queue.clear();
-    dev.engine = Dev::engine(&dev.store, dev.account, &dev.uid, &dev.key);
+    dev.engine = Dev::engine(&dev.store, dev.account, &dev.uid, &dev.key, &dev.skew);
     let out = dev.engine.start().unwrap();
     dev.absorb(out);
     net.run();
@@ -800,6 +831,137 @@ fn a_message_queued_offline_starts_its_conversation() {
         net.devs[b].texts("alice@example.org"),
         [("written offline".to_owned(), Some(Verified))]
     );
+}
+
+/// Whether outbox entry `id` of device `d` is queued and held (12.6).
+fn held(net: &Net, d: usize, id: crate::store::OutboxId) -> bool {
+    let item = net.devs[d].store.outbox_item(id).unwrap().unwrap();
+    item.state == OutboxState::Queued && item.held
+}
+
+/// Whether outbox entry `id` of device `d` was sent, and is not held.
+fn went(net: &Net, d: usize, id: crate::store::OutboxId) -> bool {
+    let item = net.devs[d].store.outbox_item(id).unwrap().unwrap();
+    matches!(item.state, OutboxState::Sent(_)) && !item.held
+}
+
+impl Net {
+    /// How many times device `d` asked for `uid`'s KeyPackages.
+    fn asked_for(&self, d: usize, uid: &str) -> usize {
+        let want = format!("KEYPKG GET {uid}");
+        self.log
+            .iter()
+            .filter(|(dd, l)| *dd == d && l.contains(&want))
+            .count()
+    }
+
+    /// Takes away the KeyPackages the server holds for device `d`.
+    fn take_packages(&mut self, d: usize) -> (Vec<mls::KeyPackage>, mls::KeyPackage) {
+        (
+            self.packages.remove(&d).unwrap(),
+            self.last_resort.remove(&d).unwrap(),
+        )
+    }
+
+    fn resume(&mut self, d: usize) {
+        let out = self.devs[d].engine.resume_outbox().unwrap();
+        self.devs[d].absorb(out);
+        self.run();
+    }
+}
+
+#[test]
+fn messages_wait_until_the_other_side_has_a_device() {
+    use crate::store::e2ee::EncState::Verified;
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    net.run();
+
+    // Bob has no device yet, so KEYPKG GET finds nothing for him. Alice's
+    // device starts the conversation, but holds her messages: Bob could
+    // never read them (12.6).
+    let one = net.send(a, "bob@example.net", "one");
+    let two = net.send(a, "bob@example.net", "two");
+    assert_eq!(net.sent_to(a, "INIT", "bob@example.net"), 1);
+    assert_eq!(net.sent(a, "ENC"), 0);
+    assert!(held(&net, a, one) && held(&net, a, two));
+    // It asks again later, not at once.
+    assert_eq!(net.asked_for(a, "bob@example.net"), 1);
+    assert!(
+        net.devs[a]
+            .retry
+            .is_some_and(|r| r <= SyncConfig::default().peer_retry)
+    );
+
+    // Bob's first device signs in. SYNC lists the conversation, and the
+    // device joins it by external commit. Alice's device sees the commit
+    // and sends what it held, in order.
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    assert_eq!(net.sent_to(b, "GROUPINFO", "alice@example.org"), 1);
+    assert_eq!(
+        net.devs[b].texts("alice@example.org"),
+        [
+            ("one".to_owned(), Some(Verified)),
+            ("two".to_owned(), Some(Verified))
+        ]
+    );
+    assert!(went(&net, a, one) && went(&net, a, two));
+    assert_eq!(net.asked_for(a, "bob@example.net"), 1);
+}
+
+#[test]
+fn held_messages_go_once_key_packages_appear() {
+    use crate::store::e2ee::EncState::Verified;
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    // The server has no KeyPackages of Bob's device, and the device does
+    // not hear of the new conversation, which has no events.
+    let (packages, last) = net.take_packages(b);
+    let one = net.send(a, "bob@example.net", "one");
+    assert!(held(&net, a, one));
+
+    // Woken before it is time, the device does not ask again.
+    net.resume(a);
+    assert_eq!(net.asked_for(a, "bob@example.net"), 1);
+
+    // Once it is time, it asks again: it adds Bob's device with a Welcome,
+    // then sends.
+    net.packages.insert(b, packages);
+    net.last_resort.insert(b, last);
+    net.devs[a].later(SyncConfig::default().peer_retry);
+    net.resume(a);
+    assert_eq!(net.asked_for(a, "bob@example.net"), 2);
+    assert_eq!(
+        net.devs[b].texts("alice@example.org"),
+        [("one".to_owned(), Some(Verified))]
+    );
+    assert!(went(&net, a, one));
+}
+
+#[test]
+fn held_messages_ask_again_on_each_connection() {
+    use crate::store::e2ee::EncState::Verified;
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    net.run();
+    let (packages, last) = net.take_packages(b);
+    let one = net.send(a, "bob@example.net", "one");
+    assert!(held(&net, a, one));
+
+    // The next connection asks at once.
+    net.packages.insert(b, packages);
+    net.last_resort.insert(b, last);
+    reconnect(&mut net, a);
+    assert_eq!(net.asked_for(a, "bob@example.net"), 2);
+    assert_eq!(
+        net.devs[b].texts("alice@example.org"),
+        [("one".to_owned(), Some(Verified))]
+    );
+    assert!(went(&net, a, one));
 }
 
 #[test]

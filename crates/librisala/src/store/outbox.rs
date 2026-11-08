@@ -105,6 +105,9 @@ impl FailReason {
     }
 }
 
+/// `outbox.error` of a queued entry that is held (12.6).
+const HELD: &str = "held";
+
 /// Who sent an outbox entry that is `sending`: one connection of one
 /// process sharing the cache (7.6).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -151,6 +154,10 @@ pub struct OutboxItem {
     pub delete: Option<Seq>,
     /// Where it is.
     pub state: OutboxState,
+    /// Queued, and held until the other participant of its direct
+    /// conversation has a device in the group (12.6): KEYPKG GET found
+    /// none. Kept as `error = 'held'` on a `queued` entry.
+    pub held: bool,
     /// When it was queued.
     pub created: Timestamp,
     /// When it was first sent, if it was.
@@ -243,6 +250,7 @@ fn finish_item(raw: RawItem) -> Result<OutboxItem, StoreError> {
             file: file.map(|f| parse(&f, "file URL")).transpose()?,
         },
         delete,
+        held: state == OutboxState::Queued && error.as_deref() == Some(HELD),
         state,
         created: time(created)?,
         first_sent: first.map(time).transpose()?,
@@ -461,6 +469,29 @@ impl Tx<'_> {
     /// Puts an entry back in the queue, for example after `rate-limited`.
     pub(crate) fn outbox_requeue(&mut self, id: OutboxId) -> Result<(), StoreError> {
         self.set_state(id, "queued", None, None)
+    }
+
+    /// Marks a queued entry as held until the other side of its direct
+    /// conversation has a device in the group (12.6), or no longer held.
+    /// Reports a change only if there is one.
+    pub(crate) fn outbox_hold(&mut self, id: OutboxId, held: bool) -> Result<(), StoreError> {
+        let changed = if held {
+            self.conn().execute(
+                "UPDATE outbox SET error = ?2 WHERE id = ?1 AND state = 'queued'
+                     AND error IS NOT ?2",
+                params![id.0, HELD],
+            )?
+        } else {
+            self.conn().execute(
+                "UPDATE outbox SET error = NULL WHERE id = ?1 AND state = 'queued'
+                     AND error = ?2",
+                params![id.0, HELD],
+            )?
+        };
+        if changed > 0 {
+            self.changed(Change::Outbox { id });
+        }
+        Ok(())
     }
 
     /// Binds an entry queued without an id to `conv_id`.

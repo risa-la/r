@@ -117,6 +117,11 @@ pub struct SyncConfig {
     /// On by default. Without it, nothing is sent to direct conversations
     /// or encrypted rooms (12.3).
     pub encryption: bool,
+    /// How often to ask KEYPKG GET again for the other participant of a
+    /// direct conversation whose messages are held because none of their
+    /// devices is in its group yet (12.6). Each new connection asks at
+    /// once.
+    pub peer_retry: Duration,
 }
 
 impl Default for SyncConfig {
@@ -129,6 +134,7 @@ impl Default for SyncConfig {
             clock: Clock::system(),
             fetch_blocks: true,
             encryption: true,
+            peer_retry: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -142,6 +148,7 @@ impl fmt::Debug for SyncConfig {
             .field("claim_lease", &self.claim_lease)
             .field("fetch_blocks", &self.fetch_blocks)
             .field("encryption", &self.encryption)
+            .field("peer_retry", &self.peer_retry)
             .finish_non_exhaustive()
     }
 }

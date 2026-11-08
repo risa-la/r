@@ -776,3 +776,48 @@ async fn inviting_adds_every_device() {
         reads(who, "#secret", &["to all of you"]).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_wait_until_the_other_side_has_a_device() {
+    use librisala::client::OutboxStatus;
+    let server = hosted_server(&[], |_| {}).await;
+    let alice = registered(&server, "alice").await;
+    // Bob registers elsewhere, and no device of his has KeyPackages yet.
+    let (bob_id, _raw) = server.register("bob").await;
+
+    // Alice writes. Her device starts the conversation, but holds the
+    // messages until a device of Bob's is in its group (12.6).
+    let conv = alice.conversation("bob@chat.test").unwrap();
+    let mut ids = Vec::new();
+    for text in ["one", "two"] {
+        ids.push(within("queueing", conv.send(text)).await.unwrap().id);
+    }
+    let all_held = || {
+        let outbox = conv.outbox().unwrap();
+        ids.iter().all(|id| {
+            outbox
+                .iter()
+                .any(|e| e.id == *id && e.status == OutboxStatus::Held)
+        })
+    };
+    until("held", &alice.subscribe(), all_held).await;
+    assert!(conv.info().unwrap().unwrap().encrypted);
+    let lines = conv.export().unwrap();
+    assert!(lines.iter().all(|l| !l.contains(" ENC ")), "{lines:?}");
+
+    // Bob's first device comes online and joins the conversation. Alice's
+    // device sends what it held, in order, and Bob reads all of it.
+    let (client, addr) = device(&server);
+    client
+        .import_device_key("bob@chat.test", &bob_id.key().to_pkcs8_pem(), false)
+        .await
+        .unwrap();
+    let bob = client.add_identity(&addr, "bob@chat.test").unwrap();
+    within("signing in", bob.connect()).await.unwrap();
+    reads(&bob, "alice@chat.test", &["one", "two"]).await;
+    for id in ids {
+        let done = within("sending", alice.wait_outbox(id)).await.unwrap();
+        assert!(matches!(done.status, OutboxStatus::Sent { .. }), "{done:?}");
+    }
+    reads(&alice, "bob@chat.test", &["one", "two"]).await;
+}

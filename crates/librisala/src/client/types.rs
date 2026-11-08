@@ -1030,6 +1030,13 @@ pub enum OutboxStatus {
     /// connection. If the account turns out to have left the room, it
     /// fails with [`FailKind::NotInRoom`] instead.
     Queued,
+    /// Waiting to be sent to a direct conversation until a device of the
+    /// other participant can read it (12.6): the server has no KeyPackages
+    /// for any of their devices, as before they first sign in. The device
+    /// asks again from time to time and on each connection, and the
+    /// conversation's messages go in order once a device of theirs is in
+    /// its group. Messages sent before then could never be read there.
+    Held,
     /// Sent, with no answer yet.
     Sending,
     /// The server accepted it as event `seq`. For a DELETE whose message
@@ -1108,6 +1115,7 @@ pub struct OutboxEntry {
 impl From<OutboxItem> for OutboxEntry {
     fn from(item: OutboxItem) -> OutboxEntry {
         let status = match item.state {
+            OutboxState::Queued if item.held => OutboxStatus::Held,
             OutboxState::Queued => OutboxStatus::Queued,
             OutboxState::Sending => OutboxStatus::Sending,
             OutboxState::Sent(seq) => OutboxStatus::Sent { seq: seq.get() },

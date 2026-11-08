@@ -42,6 +42,7 @@ use risala_proto::error::ErrorCode;
 use risala_proto::mls;
 use risala_proto::names::{Conv, Id, Seq, Uid};
 use risala_proto::server::{EventBody, ServerLine, ServerMessage};
+use risala_proto::time::Timestamp;
 use rusqlite::{OptionalExtension, params};
 use tracing::{debug, warn};
 
@@ -122,6 +123,19 @@ pub(super) struct E2ee {
     /// commit refused as `stale`, or one that waited for another, is made
     /// again (12.5, 12.6).
     invites: HashMap<Conv, Vec<(KeyPackage, PublicKey)>>,
+    /// KEYPKG GET on this connection, by identity: for the other
+    /// participant of a direct conversation, whose messages wait until a
+    /// device of theirs is in the group (12.6).
+    peers: HashMap<Uid, PeerAsk>,
+}
+
+/// The last KEYPKG GET for an identity on this connection.
+#[derive(Debug, Clone, Copy)]
+struct PeerAsk {
+    /// When it was sent.
+    at: Timestamp,
+    /// Whether it found KeyPackages; `None` until it is answered.
+    found: Option<bool>,
 }
 
 /// A WELCOME line (12.7).
@@ -208,6 +222,7 @@ impl E2ee {
             to_share: HashSet::new(),
             init_refused: HashSet::new(),
             invites: HashMap::new(),
+            peers: HashMap::new(),
         }
     }
 }
@@ -232,6 +247,9 @@ pub(super) enum EncReady {
     /// Not until these identities' key files confirm the group's leaves
     /// (12.6).
     Unconfirmed(Vec<Uid>),
+    /// Not until a device of this identity, the other participant of the
+    /// direct conversation, is in the group (12.6).
+    NoPeer(Uid),
     /// Never: its target cannot be named (12.8).
     Fail,
 }
@@ -1041,6 +1059,54 @@ impl SyncEngine {
         if !self.e2().asked.insert(uid.clone()) {
             return;
         }
+        self.issue_keypkg_get(conv, uid);
+    }
+
+    /// Asks again for the KeyPackages of `uid`, the other participant of
+    /// `conv`, whose messages wait until a device of theirs is in the
+    /// group (12.6): at once on a new connection, then every
+    /// [`SyncConfig::peer_retry`](super::SyncConfig::peer_retry).
+    pub(super) fn ask_peer(&mut self, conv: &Conv, uid: &Uid) {
+        if !self.has_e2ee() {
+            return;
+        }
+        let now = self.now();
+        let next = match self.e2().peers.get(uid) {
+            None => None,
+            // Its answer is on the way.
+            Some(PeerAsk { found: None, .. }) => return,
+            Some(ask) => ask.at.checked_add(self.config.peer_retry),
+        };
+        if let Some(next) = next
+            && next > now
+        {
+            self.resume_by(now, next);
+            return;
+        }
+        self.e2().asked.insert(uid.clone());
+        self.issue_keypkg_get(conv, uid);
+    }
+
+    /// The identities whose last KEYPKG GET on this connection found no
+    /// KeyPackages to add.
+    pub(super) fn peers_found_none(&self) -> HashSet<Uid> {
+        self.e2ee
+            .as_ref()
+            .map(|e| {
+                e.peers
+                    .iter()
+                    .filter(|(_, a)| a.found == Some(false))
+                    .map(|(u, _)| u.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn issue_keypkg_get(&mut self, conv: &Conv, uid: &Uid) {
+        let at = self.now();
+        self.e2()
+            .peers
+            .insert(uid.clone(), PeerAsk { at, found: None });
         self.issue(
             Command::KeyPkg(KeyPkgCommand::Get { uid: uid.clone() }),
             Pending::E2ee(E2eePending::KeyPkgGet {
@@ -1062,7 +1128,7 @@ impl SyncEngine {
             return Ok(());
         };
         if !matches!(reply.outcome, Outcome::Ok(_)) {
-            return Ok(());
+            return self.peer_answered(uid, purpose, false);
         }
         let mut packages: Vec<(KeyPackage, PublicKey)> = Vec::new();
         for m in &reply.lines {
@@ -1090,9 +1156,24 @@ impl SyncEngine {
                 self.retry_invite(conv)?;
             }
         } else {
-            self.add_devices(conv, packages, purpose)?;
+            let found = !packages.is_empty();
+            self.add_devices(conv, packages, purpose.clone())?;
+            self.peer_answered(uid, purpose, found)?;
         }
         self.check_keys(std::iter::once(uid.clone()))
+    }
+
+    /// Notes the answer to KEYPKG GET for `uid`. Messages that wait for a
+    /// device of theirs are held if it found none, and asked for again
+    /// later (12.6).
+    fn peer_answered(&mut self, uid: &Uid, purpose: Purpose, found: bool) -> Result<(), SyncError> {
+        if purpose != Purpose::Duties {
+            return Ok(());
+        }
+        if let Some(ask) = self.e2().peers.get_mut(uid) {
+            ask.found = Some(found);
+        }
+        if found { Ok(()) } else { self.flush_outbox() }
     }
 
     /// Commits the invitations waiting for `conv`, unless another commit
@@ -1239,7 +1320,8 @@ impl SyncEngine {
     ) -> Result<bool, SyncError> {
         // A KEY line is about 90 bytes: well under 4 MiB per message.
         const PER_MESSAGE: usize = 40_000;
-        let plan = self.write(|tx| SyncEngine::enc_ready(tx, row, None, false))?;
+        let me = self.me.clone();
+        let plan = self.write(|tx| SyncEngine::enc_ready(tx, &me, row, None, false))?;
         let plan = match plan {
             EncReady::Go(plan) => plan,
             other => {
@@ -1459,6 +1541,7 @@ impl SyncEngine {
     /// group yet is started.
     pub(super) fn enc_ready(
         tx: &Tx<'_>,
+        me: &Uid,
         row: &ConvRow,
         relation: Option<risala_proto::types::Relation>,
         held: bool,
@@ -1471,6 +1554,28 @@ impl SyncEngine {
         };
         if g.state != GroupState::Active || g.pending.is_some() || held {
             return Ok(EncReady::Wait);
+        }
+        // 12.6: nothing goes to a direct conversation until a device of
+        // the other participant is in the group, which could never read
+        // what came before.
+        if let Conv::Uid(other) = &row.name
+            && other != me
+        {
+            let present = tx
+                .conn()
+                .prepare_cached(
+                    "SELECT 1 FROM epoch_leaves WHERE account = ?1 AND conv_id = ?2
+                         AND epoch = ?3 AND uid = ?4 LIMIT 1",
+                )?
+                .exists(params![
+                    row.account.get(),
+                    conv_id.as_str(),
+                    sql(g.epoch),
+                    other.as_str()
+                ])?;
+            if !present {
+                return Ok(EncReady::NoPeer(other.clone()));
+            }
         }
         // 12.6: nothing goes while a leaf is not confirmed.
         let unconfirmed: Vec<Uid> = {
