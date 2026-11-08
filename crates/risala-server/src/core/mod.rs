@@ -259,6 +259,9 @@ pub(crate) struct Inner {
     /// which conversations' markers moved since it read them all
     /// ([`ConvState::marker_moved`]).
     markers_moved: AtomicU64,
+    /// Reports (5.8): the lock their lines are sent under, and the rate
+    /// limit.
+    report_book: reports::ReportBook,
 }
 
 impl Hub {
@@ -449,6 +452,7 @@ impl Hub {
                     names_lock: tokio::sync::Mutex::new(()),
                     typing_interval: timers.typing_interval,
                     markers_moved: AtomicU64::new(0),
+                    report_book: reports::ReportBook::new(),
                 }
             }),
         })

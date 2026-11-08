@@ -86,21 +86,23 @@ impl ReportRow {
         Ok(ReportRecord {
             n: u64::try_from(self.n).map_err(|_| corrupt("report number", self.n))?,
             id: parse("report id", &self.id)?,
-            conv_id: parse("conversation id", &self.conv_id)?,
-            room: self.room.as_deref().map(|r| parse("room", r)).transpose()?,
-            reporter: parse("reporter", &self.reporter)?,
-            reason: self.reason,
-            t: time(self.t)?,
-            event: StoredEvent {
-                seq: seq(self.seq)?,
-                t: time(self.ev_t)?,
-                from: parse("author", &self.ev_author)?,
-                kind: EventKind::Msg {
-                    relation,
-                    file,
-                    text: self.ev_text,
+            report: NewReport {
+                conv_id: parse("conversation id", &self.conv_id)?,
+                room: self.room.as_deref().map(|r| parse("room", r)).transpose()?,
+                reporter: parse("reporter", &self.reporter)?,
+                reason: self.reason,
+                t: time(self.t)?,
+                event: StoredEvent {
+                    seq: seq(self.seq)?,
+                    t: time(self.ev_t)?,
+                    from: parse("author", &self.ev_author)?,
+                    kind: EventKind::Msg {
+                        relation,
+                        file,
+                        text: self.ev_text,
+                    },
+                    deleted: false,
                 },
-                deleted: false,
             },
         })
     }

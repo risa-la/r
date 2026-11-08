@@ -10,10 +10,12 @@ use risala_proto::time::Timestamp;
 
 use super::{ConvKey, Result, RoomRecord, StoredEvent};
 
-/// A report to store (5.8).
+/// What a report says (5.8): stored by [`ReportStore::add_report`], and
+/// part of each [`ReportRecord`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewReport {
-    /// The id (5.1) of the reported event's conversation.
+    /// The id (5.1) of the reported event's conversation, which may since
+    /// have been dropped (10.4).
     pub conv_id: Id,
     /// The room's name, or `None` in a direct conversation (M5a).
     pub room: Option<Room>,
@@ -23,8 +25,8 @@ pub struct NewReport {
     pub reason: String,
     /// When the report was made.
     pub t: Timestamp,
-    /// The reported event as it is now: a MSG that is not deleted. Its seq
-    /// is the reported seq.
+    /// The copy of the reported event, as it was when it was reported: a
+    /// MSG that was not deleted. Its seq is the reported seq.
     pub event: StoredEvent,
 }
 
@@ -35,19 +37,8 @@ pub struct ReportRecord {
     pub n: u64,
     /// The report's id.
     pub id: Id,
-    /// The id (5.1) of the reported event's conversation, which may since
-    /// have been dropped (10.4).
-    pub conv_id: Id,
-    /// The room's name, or `None` in a direct conversation (M5a).
-    pub room: Option<Room>,
-    /// Who made the report.
-    pub reporter: Uid,
-    /// Why, escaped; empty if none.
-    pub reason: String,
-    /// When the report was made.
-    pub t: Timestamp,
-    /// The copy of the reported event, as it was when it was reported.
-    pub event: StoredEvent,
+    /// What it says.
+    pub report: NewReport,
 }
 
 /// The result of [`ReportStore::add_report`].

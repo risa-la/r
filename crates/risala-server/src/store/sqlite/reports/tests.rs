@@ -100,12 +100,7 @@ fn a_report_keeps_a_copy_and_is_found_again() {
     );
     let stored = store.report(&id).unwrap().unwrap();
     assert_eq!(stored.id, id);
-    assert_eq!(stored.conv_id, record.id);
-    assert_eq!(stored.room, Some(room("#general")));
-    assert_eq!(stored.reporter, uid("~sam"));
-    assert_eq!(stored.reason, "spam");
-    assert_eq!(stored.t, report.t);
-    assert_eq!(stored.event, report.event);
+    assert_eq!(stored.report, report);
 
     // Another reporter makes another report.
     let other = new_id(
@@ -164,7 +159,7 @@ fn dropping_a_room_keeps_its_reports() {
     );
     assert_eq!(store.room(&room("#general")).unwrap(), None);
     assert_eq!(store.event(record.key, Seq::new(1).unwrap()).unwrap(), None);
-    let left = store.report(&id).unwrap().unwrap();
+    let left = store.report(&id).unwrap().unwrap().report;
     assert_eq!(left.conv_id, record.id);
     assert_eq!(left.room, Some(room("#general")));
     assert_eq!(
@@ -227,7 +222,8 @@ fn migration_4_keeps_open_reports() {
         )
         .unwrap()
         .finish()
-        .unwrap();
+        .unwrap()
+        .report;
     assert_eq!(report.conv_id.as_str(), "c1");
     assert_eq!(report.room, Some(room("#general")));
     assert_eq!(report.event.seq, Seq::new(3).unwrap());
