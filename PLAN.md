@@ -137,11 +137,14 @@ across the FFI boundary.
   - For self-hosted identities, the library helps produce the key file
     line to publish.
   - KEY management, and adding a new device by showing its public key.
-  - Keys are stored through a platform trait: Keychain on Apple
-    platforms, an Android Keystore-wrapped key on Android, and libsecret
-    on Linux. The Secure Enclave cannot hold ML-DSA keys, so keys are
-    software keys that are encrypted or protected at rest. History keys
-    and the recovery key (12.9, 12.10) are stored the same way.
+  - Keys are stored through a platform trait, always under hardware
+    (item 44): the Keychain wrapped by the Secure Enclave on Apple
+    platforms, the Android Keystore (StrongBox where there is one) on
+    Android, and libsecret wrapped by the TPM through `systemd-creds` on
+    Linux. A device without that hardware does not start. The Secure
+    Enclave cannot hold ML-DSA keys, so keys are software keys that are
+    wrapped at rest. History keys, the recovery key (12.9, 12.10) and
+    the cache's SQLCipher key are stored the same way.
 - **Sync engine:** SYNC, then fill gaps with HISTORY, dropping duplicates
   by seq. The cache is keyed by conversation id, so a dropped and
   recreated room starts afresh. Lazy paging backwards, with RELATED for
@@ -178,7 +181,8 @@ across the FFI boundary.
 - **Strings:** the apps share their text through `l10n/` (see
   Decisions), so the same screen says the same thing on every platform.
 - **GNOME:** gtk4-rs and libadwaita, using librisala directly with no
-  FFI. It comes after the phone apps (item 40).
+  FFI. It comes after the phone apps (item 40). Shipped through Nix and
+  native packages, not Flatpak (item 44).
 - **Apple:** a SwiftUI app shared between macOS and iOS, with a
   Notification Service Extension for push.
 - **Android:** Kotlin with Jetpack Compose. Push through FCM, and through
@@ -959,9 +963,11 @@ Open:
       (M6): the Keychain, under a Secure Enclave key where there is one,
       the Android Keystore, under StrongBox where there is one, and
       libsecret on GNOME. The device key's seed and the recovery key are
-      kept the same way. The Secure Enclave and StrongBox cannot hold
-      ML-DSA keys themselves, so they only wrap the stored secrets. The
-      CLI keeps the database key in its private state directory.
+      kept the same way (Linux and the CLI changed by 44). The Secure
+      Enclave and StrongBox cannot hold ML-DSA keys themselves, so they
+      only wrap the stored secrets. The
+      CLI keeps the database key in its private state directory (changed
+      by 44).
     - **How the storage and SQLCipher were built** (implementation only,
       no spec change):
       - The port of `openmls_sqlite_storage` is tested with real groups:
@@ -998,7 +1004,8 @@ Open:
         once. The old file's blocks are freed, not overwritten.
       - The CLI keeps the key as 32 bytes in `cache.key`, made on first
         use, mode 0600; one that others can read is refused, as for
-        device keys. Losing it loses the cache.
+        device keys. Losing it loses the cache. (Replaced by 44: the CLI
+        keeps it under the TPM or the Secure Enclave.)
       - The MLS tables are schema version 12 of the cache. MLS operations
         run in the cache's own write transaction (`BEGIN IMMEDIATE`), on
         a provider whose storage is that transaction, so the MLS state
@@ -1032,6 +1039,45 @@ Open:
     KeyPackages per device and 600 KEYPKG GETs per identity an hour, and
     deletes ended KeyPackages hourly. Uploading a KeyPackage it already
     has stores nothing and replies `OK`.
+
+44. **Keys at rest need hardware** (3.3, 42), decided with the user on
+    2026-11-08. Implementation only, no spec change. It covers the
+    cache's SQLCipher key, the device key's seed, history keys and the
+    recovery key.
+    - **No downgrade.** Every build keeps these secrets under hardware,
+      and a device without it refuses to start rather than fall back to
+      a weaker store such as a plain key file. Each install records how
+      its secrets are protected and refuses to open them with anything
+      weaker later. If the hardware key is lost (a cleared or replaced
+      TPM, a lost Keystore key), the device starts afresh as a new device
+      and recovers through its backups (12.9, 12.10).
+    - **Apple platforms (apps and the CLI on macOS).** A P-256 key in the
+      Secure Enclave wraps each secret (ECIES), and the wrapped value is
+      kept in the Keychain, `AfterFirstUnlockThisDeviceOnly`, with no
+      biometric check, so the notification extension can open the cache.
+      Keeping it in the Keychain means P-256, which is not post-quantum,
+      is never the only layer. Macs without a Secure Enclave (Intel
+      without a T2) are refused.
+    - **Android.** A non-exportable AES-256-GCM Keystore key, in StrongBox
+      where there is one and the TEE otherwise, wraps each secret. The
+      wrapped values are kept in the app's private files, out of backups.
+      The key does not require user authentication, so push works while
+      the phone is locked.
+    - **Linux (the GNOME app and the CLI).** Each secret is wrapped with
+      `systemd-creds --user` bound to the TPM (systemd 256 or newer), and
+      the wrapped value is kept through libsecret's Secret Service
+      (gnome-keyring, KeePassXC, KWallet). A machine without a TPM,
+      without systemd 256 or without a Secret Service refuses to start;
+      the app says what is missing. The host key alone is not enough.
+      The Secret Service cannot say whether it is hardware-backed, so the
+      TPM is what provides that.
+    - **No Flatpak.** The Secret portal is software only and the sandbox
+      cannot reach the TPM or `systemd-creds`, so the GNOME app ships
+      through Nix and native packages instead.
+    - **Tests and CI.** The CLI's tests run against a software TPM
+      (swtpm) and `systemd-creds`, in CI and locally, so the real path
+      is tested. The 0600 `cache.key` and PEM key files of 42 go away;
+      there is no test-only file store.
 
 ## 6. Decisions
 
