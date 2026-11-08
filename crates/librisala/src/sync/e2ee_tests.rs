@@ -24,6 +24,7 @@ use risala_proto::time::Timestamp;
 use super::*;
 use crate::addr::ServerAddr;
 use crate::e2ee::content::Control;
+use risala_mls::RisalaConversation;
 use crate::store::e2ee::GroupState;
 use crate::store::{AccountId, Draft, OutboxState, Store};
 
@@ -1696,7 +1697,7 @@ fn a_room_group_with_an_outsider_is_not_joined_again() {
         .write(|tx| {
             let provider = device.provider(tx.mls_storage());
             let conversation =
-                risala_mls::RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All);
+                RisalaConversation::room(&id, HistoryMode::Shared, SendMode::All);
             let group =
                 risala_mls::create_group(&provider, &device.signer(), &device.uid, &conversation)
                     .unwrap();
@@ -2035,4 +2036,117 @@ fn a_recovery_key_counts_only_while_the_key_file_lists_it() {
     let out = net.devs[a1].engine.accept_recovery_key(true).unwrap();
     net.devs[a1].absorb(out);
     assert_eq!(net.devs[a1].recovery, Some(second));
+}
+
+#[test]
+fn a_welcome_does_not_undo_a_rejection() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    let c = net.device("carol@example.com", 4);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+    let s = net.conv_of(a, "bob@example.net").unwrap();
+    net.force_external_join(c, s);
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+
+    // Bob's device makes a new group for the conversation, adds Alice's
+    // device to it, and the server hands her device the Welcome.
+    let kp = net.packages.get_mut(&a).unwrap().pop().unwrap();
+    let dev = &net.devs[b];
+    let device = crate::e2ee::Device::new(dev.uid.clone(), dev.key.clone()).unwrap();
+    let alice = uid("alice@example.org");
+    let (welcome, tree) = dev
+        .store
+        .write_with(|tx| {
+            let (kp, _) = crate::e2ee::group::checked_key_package(&device, &alice, &kp)?;
+            let provider = device.provider(tx.mls_storage());
+            let conversation = RisalaConversation::direct(&device.uid, &alice);
+            let mut group =
+                risala_mls::create_group(&provider, &device.signer(), &device.uid, &conversation)
+                    .unwrap();
+            let bundle = risala_mls::commit(
+                &provider,
+                &mut group,
+                &device.signer(),
+                risala_mls::group::Changes {
+                    add: vec![kp],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (_, welcome, _) = bundle.into_messages();
+            group.merge_pending_commit(&provider).unwrap();
+            Ok::<_, crate::e2ee::E2eeError>((
+                wire::welcome_to_wire(&welcome.unwrap()).unwrap(),
+                wire::tree_to_wire(&group.export_ratchet_tree()).unwrap(),
+            ))
+        })
+        .unwrap()
+        .0;
+    let n = net.convs[s].events.len() + 1;
+    net.deliver(
+        a,
+        &format!("WELCOME bob@example.net w99 {n} {welcome} {tree}"),
+    );
+    net.run();
+
+    // Alice's device does not join it (12.6).
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+}
+
+#[test]
+fn a_rejected_room_is_not_started_again() {
+    use risala_proto::types::{HistoryMode, SendMode};
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    net.run();
+    let room: Room = "#secret".parse().unwrap();
+    net.room(a, "#secret");
+    reconnect(&mut net, a);
+    let account = net.devs[a].account;
+    net.devs[a]
+        .store
+        .write_with(|tx| {
+            let row = tx.conv_by_name(account, &Conv::Room(room.clone()))?.unwrap();
+            let device =
+                crate::e2ee::Device::new(net.devs[a].uid.clone(), net.devs[a].key.clone())
+                    .unwrap();
+            let conversation = RisalaConversation::room(
+                row.conv_id.as_ref().unwrap(),
+                HistoryMode::Shared,
+                SendMode::All,
+            );
+            crate::e2ee::group::create(tx, &device, &row, &conversation, 0)?;
+            crate::e2ee::group::mark(tx, &row, GroupState::Rejected)
+        })
+        .unwrap();
+
+    // A group the device rejected is not replaced by a new one (12.6).
+    let _ = net.devs[a]
+        .engine
+        .encrypt_room(&room, HistoryMode::Shared, SendMode::All);
+    net.run();
+    assert_eq!(net.sent_to(a, "INIT", "#secret"), 0);
+    assert_eq!(net.devs[a].group("#secret").unwrap().state, GroupState::Rejected);
+
+    // Only the user's reset lets it start again.
+    let out = net.devs[a]
+        .engine
+        .reset_encryption(&Conv::Room(room.clone()))
+        .unwrap();
+    net.devs[a].absorb(out);
+    let out = net.devs[a]
+        .engine
+        .encrypt_room(&room, HistoryMode::Shared, SendMode::All)
+        .unwrap();
+    net.devs[a].absorb(out);
+    net.run();
+    assert_eq!(net.sent_to(a, "INIT", "#secret"), 1);
 }

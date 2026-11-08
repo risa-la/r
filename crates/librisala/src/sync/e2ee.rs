@@ -333,6 +333,25 @@ impl SyncEngine {
         }))
     }
 
+    /// Forgets the group of `conv` that this device rejected (12.6), so
+    /// that it joins or starts the conversation's group again. Only on the
+    /// user's word: the rejected change may be an attack, and joining
+    /// again accepts it. Does nothing if the group was not rejected.
+    pub fn reset_encryption(&mut self, conv: &Conv) -> Result<super::Output, SyncError> {
+        let account = self.account;
+        let reset = self.e2ee_write(|tx| match tx.conv_by_name(account, conv)? {
+            Some(row) => group::reset_rejected(tx, &row),
+            None => Ok(false),
+        })?;
+        if matches!(reset, Ok(true)) && self.e2ee.is_some() {
+            self.e2().rejoined.remove(conv);
+            self.e2().init_refused.remove(conv);
+            self.e2ee_advance(conv)?;
+            self.flush_outbox()?;
+        }
+        Ok(self.finish())
+    }
+
     /// Whether encryption is on for this connection.
     pub(super) fn has_e2ee(&self) -> bool {
         self.e2ee.as_ref().is_some_and(|e| !e.recovery_conn)

@@ -1236,6 +1236,7 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
             E2eeOp::SetRecovery(key) => engine.set_recovery_key(key)?,
             E2eeOp::ShareRecovery(key) => engine.share_recovery_key(&key)?,
             E2eeOp::AcceptRecovery(accept) => engine.accept_recovery_key(accept)?,
+            E2eeOp::ResetEncryption(conv) => engine.reset_encryption(&conv)?,
             E2eeOp::KeyFile(uid, keys) => engine.key_file(&uid, keys)?,
         },
     };

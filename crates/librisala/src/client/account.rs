@@ -210,6 +210,8 @@ pub(crate) enum E2eeOp {
     /// The user's answer about a recovery key another device offered
     /// (12.10).
     AcceptRecovery(bool),
+    /// The user resets a conversation's rejected group (12.6).
+    ResetEncryption(Conv),
     /// An identity's key file, fetched now (12.12): `None` if the fetch
     /// failed.
     KeyFile(Uid, Option<Vec<super::e2ee::KeyFileEntry>>),

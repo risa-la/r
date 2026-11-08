@@ -317,6 +317,20 @@ impl Conversation {
     }
 }
 
+impl Conversation {
+    /// Starts over with a conversation whose encryption stopped
+    /// ([`Notice::EncryptionStopped`](super::Notice::EncryptionStopped)):
+    /// the device joins, or starts, its group again (12.6). Only when the
+    /// user asks: the change the device refused may be an attack, and
+    /// joining again accepts it. Does nothing for a conversation whose
+    /// encryption did not stop. Needs a connection.
+    pub async fn reset_encryption(&self) -> Result<(), ClientError> {
+        self.account()
+            .e2ee(E2eeOp::ResetEncryption(self.conv().clone()))
+            .await
+    }
+}
+
 impl Account {
     pub(crate) async fn e2ee(&self, op: E2eeOp) -> Result<(), ClientError> {
         let (reply, rx) = oneshot::channel();

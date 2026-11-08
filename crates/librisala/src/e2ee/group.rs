@@ -233,10 +233,16 @@ pub(crate) fn create(
     now_ms: i64,
 ) -> Result<Init, E2eeError> {
     if let Some(old) = tx.group(row.id)? {
-        if old.state == GroupState::Active {
-            return Err(E2eeError::Rejected("the conversation has a group"));
+        match old.state {
+            GroupState::Active => {
+                return Err(E2eeError::Rejected("the conversation has a group"));
+            }
+            // 12.6: a rejection is undone only by the user (reset).
+            GroupState::Rejected => {
+                return Err(E2eeError::Rejected("the device rejected this group"));
+            }
+            _ => tx.forget_group(row.id)?,
         }
-        tx.forget_group(row.id)?;
     }
     let (group_id, init) = {
         let provider = dev.provider(tx.mls_storage());
@@ -640,6 +646,20 @@ pub(crate) fn apply_commit(
     })
 }
 
+/// Forgets a group the device rejected, so that it may join or start the
+/// conversation's group again: only on the user's word (12.6). Returns
+/// whether there was one.
+pub(crate) fn reset_rejected(tx: &mut Tx<'_>, row: &ConvRow) -> Result<bool, E2eeError> {
+    if tx
+        .group(row.id)?
+        .is_some_and(|g| g.state == GroupState::Rejected)
+    {
+        tx.forget_group(row.id)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Marks the group `state` after a commit it could not follow (12.6), and
 /// drops a commit of its own that was waiting.
 pub(crate) fn mark(tx: &mut Tx<'_>, row: &ConvRow, state: GroupState) -> Result<(), E2eeError> {
@@ -789,11 +809,14 @@ pub(crate) fn join_welcome(
     tree: &mls::RatchetTree,
     seq: u64,
 ) -> Result<Joined, E2eeError> {
-    if let Some(g) = tx.group(row.id)?
-        && g.state == GroupState::Active
-        && g.commit_seq >= seq
-    {
-        return Ok(Joined::Already);
+    if let Some(g) = tx.group(row.id)? {
+        if g.state == GroupState::Active && g.commit_seq >= seq {
+            return Ok(Joined::Already);
+        }
+        // 12.6: joining another group would undo the rejection.
+        if g.state == GroupState::Rejected {
+            return Err(E2eeError::Rejected("the device rejected this group"));
+        }
     }
     let welcome =
         wire::welcome_from_wire(welcome).map_err(|e| E2eeError::Malformed(e.to_string()))?;
