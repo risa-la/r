@@ -75,7 +75,7 @@ fn samples() -> Vec<String> {
         "WELCOME DEL w1".into(),
         format!("BLOB {blob} 10"),
         format!("BLOB {blob} 10 box={BOX} token={token}"),
-        format!("BACKUP PUT 0 {blob} {}", b64(60)),
+        format!("BACKUP PUT 0 {blob} {}", b64(61)),
         "BACKUP GET".into(),
         "BACKUP DEL".into(),
         "ADMIN OPS".into(),
