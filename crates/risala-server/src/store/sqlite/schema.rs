@@ -111,6 +111,7 @@ mod tests {
                 "public_rooms",
                 "push_subscriptions",
                 "records",
+                "report_holds",
                 "report_posts",
                 "reports",
                 "room_members",

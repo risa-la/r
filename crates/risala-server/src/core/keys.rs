@@ -22,7 +22,8 @@
 //!   and posts, files and blobs against one quota per mailbox (7.5).
 //! - [`device_removed`]: the identity area, when a device leaves an
 //!   identity (12.8).
-//! - [`hold_file`]: reports, which keep the files they name (5.8).
+//! - [`keep_files_for_report`] and [`release_files_for_report`]: reports,
+//!   which keep the files they name until resolved (5.8).
 //! - [`info`]: INFO's `upload`, `blobs` and `files` (8.5).
 
 pub(crate) mod disk;
@@ -37,12 +38,13 @@ use std::time::Duration;
 use risala_mls::{DeviceId, RisalaCrypto};
 use risala_proto::binary::read_blob_list;
 use risala_proto::command::{BackupCommand, BlobPermit, Command, KeyPkgCommand, WelcomeCommand};
+use risala_proto::content::FileUrl;
 use risala_proto::error::ErrorCode;
 use risala_proto::frame::MAX_SERVER_LINE;
 use risala_proto::mls::{
     KeyPackage, KeyPackageRef, OrBlob, PutSecret, RatchetTree, SendToken, Welcome, WelcomeSecret,
 };
-use risala_proto::names::{BlobRef, BoxName, Identity, Uid};
+use risala_proto::names::{BlobRef, BoxName, Id, Identity, Uid};
 use risala_proto::server::{
     ErrResponse, FileOrigin, OkResponse, ServerLine, ServerMessage, Upload,
 };
@@ -1031,26 +1033,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A report keeps the file whose `get` URL is `url` (`hold`), or stops
-/// keeping it (5.8): while any report keeps it, it neither expires nor
-/// goes when its uploader deletes it. Does nothing for a URL that is not
-/// one of this server's. Reports call this.
-#[allow(dead_code, reason = "called by reports (docs/plans/M5b.md, SV5)")]
-pub(crate) async fn hold_file(inner: &Inner, url: &str, hold: bool) -> Result<(), StoreError> {
-    let Some(id) = disk::upload_id_of_get_url(inner, url) else {
-        return Ok(());
-    };
-    let retention = retention_start(inner, inner.now());
-    let file = id.clone();
-    let remove = inner
-        .db(move |store| store.hold_upload(&file, hold, retention))
-        .await?;
-    if remove {
-        disk::remove_upload_file(inner, &id).await;
-    }
-    Ok(())
-}
-
 /// What INFO says about files and blobs (8.5): `upload=`, `blobs=` and
 /// `files=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1260,18 +1242,50 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
 
 /// Keeps the uploaded files behind `urls` that are this server's, even if
 /// their uploader deletes them or they expire, until the report `report`
-/// is resolved (5.8).
+/// is resolved (5.8). Reports call this.
 ///
-/// TODO(SV4): a stub added by SV5 (REPORT) until uploads are built.
-pub(crate) async fn keep_files_for_report(
-    _inner: &Inner,
-    _report: &risala_proto::names::Id,
-    _urls: &[risala_proto::content::FileUrl],
-) {
+/// Only a whole `get` URL counts: its secret part must match, so that a
+/// report cannot keep a file whose URL its sender does not hold. Other
+/// URLs are ignored, and a store failure is logged: the report stands
+/// without the file (5.8 is silent on both).
+pub(crate) async fn keep_files_for_report(inner: &Inner, report: &Id, urls: &[FileUrl]) {
+    for url in urls {
+        let Some((id, secret)) = disk::upload_of_get_url(inner, url.as_str()) else {
+            continue;
+        };
+        let report = report.to_string();
+        let kept = inner
+            .db(move |store| {
+                let matches = store
+                    .upload(&id)?
+                    .is_some_and(|upload| upload.get.matches(secret.as_bytes()));
+                if matches {
+                    store.hold_upload(&report, &id)?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(e) = kept {
+            tracing::error!("keys: keeping a reported file: {e}");
+        }
+    }
 }
 
 /// The report `report` was resolved: the files it kept expire as usual
-/// again (5.8).
-///
-/// TODO(SV4): a stub added by SV5 (RESOLVE) until uploads are built.
-pub(crate) async fn release_files_for_report(_inner: &Inner, _report: &risala_proto::names::Id) {}
+/// again, and those deleted or past retention meanwhile go now (5.8).
+/// RESOLVE calls this.
+pub(crate) async fn release_files_for_report(inner: &Inner, report: &Id) {
+    let retention = retention_start(inner, inner.now());
+    let report = report.to_string();
+    match inner
+        .db(move |store| store.release_uploads(&report, retention))
+        .await
+    {
+        Ok(gone) => {
+            for id in gone {
+                disk::remove_upload_file(inner, &id).await;
+            }
+        }
+        Err(e) => tracing::error!("keys: releasing reported files: {e}"),
+    }
+}

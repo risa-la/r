@@ -1331,7 +1331,30 @@ async fn uploads_expire_from_the_upload_unless_a_report_keeps_them() {
     };
     let (_, kept_get, kept_del) = &urls[0];
     let (_, other_get, _) = &urls[1];
-    keys::hold_file(h.inner(), kept_get, true).await.unwrap();
+    let url = |u: &str| u.parse::<risala_proto::content::FileUrl>().unwrap();
+    let report: risala_proto::names::Id = "r1".parse().unwrap();
+    // A URL with the wrong secret, or of another server, keeps nothing.
+    let forged = format!("{}{}", &kept_get[..kept_get.len() - 4], "aaaa");
+    keys::keep_files_for_report(
+        h.inner(),
+        &report,
+        &[url(&forged), url("https://elsewhere.example/f/a/b")],
+    )
+    .await;
+    let kept_id = rest(kept_get, paths::UPLOAD_GET)
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let held = |h: &Keys| {
+        crate::store::KeysStore::upload(&*h.store, &kept_id)
+            .unwrap()
+            .unwrap()
+            .held
+    };
+    assert_eq!(held(&h), 0);
+    keys::keep_files_for_report(h.inner(), &report, &[url(kept_get), url(kept_get)]).await;
+    assert_eq!(held(&h), 1);
     // Its uploader deletes it, but the report keeps it.
     files
         .delete(&rest(kept_del, paths::UPLOAD_DEL))
@@ -1358,17 +1381,13 @@ async fn uploads_expire_from_the_upload_unless_a_report_keeps_them() {
             .is_ok()
     );
     // Once the report is resolved, it goes.
-    keys::hold_file(h.inner(), kept_get, false).await.unwrap();
+    keys::release_files_for_report(h.inner(), &report).await;
     assert!(
         files
             .upload(&rest(kept_get, paths::UPLOAD_GET))
             .await
             .is_err()
     );
-    // A URL of another server is ignored.
-    keys::hold_file(h.inner(), "https://elsewhere.example/f/a/b", true)
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

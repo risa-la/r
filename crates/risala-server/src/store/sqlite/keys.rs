@@ -149,6 +149,14 @@ CREATE TABLE uploads (
 ) STRICT;
 CREATE INDEX uploads_box ON uploads (box);
 
+-- The uploads each open report keeps (5.8), counted in uploads.held.
+CREATE TABLE report_holds (
+    report TEXT NOT NULL,           -- the report's id
+    upload TEXT NOT NULL REFERENCES uploads (id) ON DELETE CASCADE,
+    PRIMARY KEY (report, upload)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX report_holds_upload ON report_holds (upload);
+
 -- Each identity's backup (12.13). Its blobs, the first archive's and
 -- those in its list, are kept while it is current (blob_keeps).
 CREATE TABLE backups (
@@ -929,22 +937,44 @@ impl KeysStore for SqliteStore {
         })
     }
 
-    fn hold_upload(&self, id: &str, hold: bool, retention: Timestamp) -> Result<bool> {
+    fn hold_upload(&self, report: &str, id: &str) -> Result<()> {
         self.write(|tx| {
-            if hold {
-                tx.execute("UPDATE uploads SET held = held + 1 WHERE id = ?", [id])?;
-                return Ok(false);
-            }
-            tx.execute(
-                "UPDATE uploads SET held = held - 1 WHERE id = ? AND held > 0",
-                [id],
-            )?;
             let n = tx.execute(
-                "DELETE FROM uploads WHERE id = ? AND held = 0
-                 AND (deleted = 1 OR (stored IS NOT NULL AND stored < ?))",
-                params![id, millis(retention)],
+                "INSERT INTO report_holds (report, upload)
+                 SELECT ?1, id FROM uploads WHERE id = ?2 ON CONFLICT DO NOTHING",
+                params![report, id],
             )?;
-            Ok(n > 0)
+            if n > 0 {
+                tx.execute("UPDATE uploads SET held = held + 1 WHERE id = ?", [id])?;
+            }
+            Ok(())
+        })
+    }
+
+    fn release_uploads(&self, report: &str, retention: Timestamp) -> Result<Vec<String>> {
+        self.write(|tx| {
+            let held: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("DELETE FROM report_holds WHERE report = ? RETURNING upload")?;
+                let rows = stmt.query_map([report], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut gone = Vec::new();
+            for id in held {
+                tx.execute(
+                    "UPDATE uploads SET held = held - 1 WHERE id = ? AND held > 0",
+                    [&id],
+                )?;
+                let n = tx.execute(
+                    "DELETE FROM uploads WHERE id = ? AND held = 0
+                     AND (deleted = 1 OR (stored IS NOT NULL AND stored < ?))",
+                    params![&id, millis(retention)],
+                )?;
+                if n > 0 {
+                    gone.push(id);
+                }
+            }
+            Ok(gone)
         })
     }
 
@@ -1460,7 +1490,11 @@ mod tests {
         assert!(!store.claim_upload("a").unwrap());
         assert!(store.upload_stored("a", later(5)).unwrap());
         assert!(store.claim_upload("b").unwrap());
-        store.hold_upload("a", true, t(T0)).unwrap();
+        store.hold_upload("r1", "a").unwrap();
+        store.hold_upload("r1", "a").unwrap();
+        store.hold_upload("r2", "a").unwrap();
+        store.hold_upload("r2", "none").unwrap();
+        assert_eq!(store.upload("a").unwrap().unwrap().held, 2);
         // Held: the uploader's DELETE waits for the report.
         assert!(!store.delete_upload("a").unwrap());
         assert!(store.upload("a").unwrap().unwrap().deleted);
@@ -1475,7 +1509,11 @@ mod tests {
             .unwrap();
         // c never started; b started and may still finish.
         assert_eq!(expired.uploads, ["c"]);
-        assert!(store.hold_upload("a", false, later(0)).unwrap());
+        // Kept until every report that keeps it is resolved.
+        assert!(store.release_uploads("r1", later(0)).unwrap().is_empty());
+        assert!(store.upload("a").unwrap().is_some());
+        assert!(store.release_uploads("r1", later(0)).unwrap().is_empty());
+        assert_eq!(store.release_uploads("r2", later(0)).unwrap(), ["a"]);
         assert_eq!(store.upload("a").unwrap(), None);
         assert!(store.delete_upload("b").unwrap());
     }

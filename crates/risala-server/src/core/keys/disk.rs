@@ -98,11 +98,12 @@ pub(crate) fn blob_hash_of(hex: &str) -> Option<BlobRef> {
     Some(BlobRef::from_hash(hash))
 }
 
-/// The public part of a `get` URL of this server, if `url` is one.
-pub(crate) fn upload_id_of_get_url(inner: &Inner, url: &str) -> Option<String> {
+/// The public and secret parts of a `get` URL of this server, if `url` is
+/// one.
+pub(crate) fn upload_of_get_url(inner: &Inner, url: &str) -> Option<(String, String)> {
     let base = inner.keys.url()?;
     let rest = url.strip_prefix(&base)?.strip_prefix(paths::UPLOAD_GET)?;
-    id_and_secret(rest).map(|(id, _)| id.to_owned())
+    id_and_secret(rest).map(|(id, secret)| (id.to_owned(), secret.to_owned()))
 }
 
 /// Removes a file, logging anything but its being gone already.

@@ -24,6 +24,7 @@
 //! - `blob_puts`: `put` URLs BLOB handed out, for 10 minutes (12.12).
 //! - `uploads`: uploaded files and their `put`, `get` and `del` URLs, by
 //!   the hashes of their secret parts (5.6, Section 14).
+//! - `report_holds`: the uploads each open report keeps (5.8).
 //! - `backups`: each identity's current backup, whose blobs are kept
 //!   while it is current (12.13).
 //!
@@ -421,10 +422,14 @@ pub trait KeysStore {
     /// resolved (5.8).
     fn delete_upload(&self, id: &str) -> Result<bool>;
 
-    /// A report starts keeping the upload `id` (`hold`), or stops (5.8).
-    /// Returns `true` if its bytes are to be removed now: it was deleted,
-    /// or has expired, and nothing keeps it any more.
-    fn hold_upload(&self, id: &str, hold: bool, retention: Timestamp) -> Result<bool>;
+    /// The report `report` keeps the upload `id` until it is resolved
+    /// (5.8). Keeping it twice changes nothing.
+    fn hold_upload(&self, report: &str, id: &str) -> Result<()>;
+
+    /// The report `report` was resolved: the uploads it kept stop being
+    /// kept by it (5.8). Returns those whose bytes are to be removed now:
+    /// deleted, or stored before `retention`, and kept by no other report.
+    fn release_uploads(&self, report: &str, retention: Timestamp) -> Result<Vec<String>>;
 
     // ---- Backups (12.13)
 
