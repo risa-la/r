@@ -17,6 +17,7 @@ use risala_proto::types::{Presence, Role};
 
 use super::Inner;
 use super::commands::{Fail, Outcome, Reply, check_read, fail, not_supported, room_of};
+use super::moderation::{may_send_messages, only_moderators_send};
 use super::state::UserEntry;
 use crate::handler::OutLine;
 use crate::store::{BlockAdded, StoreError};
@@ -94,6 +95,10 @@ impl Inner {
         }
         if uid.is_guest() && !info.settings.guests.allows_write() {
             return Err(fail(ErrorCode::Forbidden, "guests may not send here"));
+        }
+        // Only who may send messages, not just react (6.2, 8.1).
+        if !may_send_messages(info, self.asker(uid, member)) {
+            return Err(only_moderators_send());
         }
         let pass = self
             .reg()

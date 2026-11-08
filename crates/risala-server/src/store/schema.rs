@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -364,6 +364,12 @@ DROP TABLE reports;
 ALTER TABLE reports_v4 RENAME TO reports;
 -- REPORTS <room> (5.8).
 CREATE INDEX reports_conv ON reports (conv_id, n);
+"#;
+
+/// Version 5: announcement-only rooms, the `send` setting (6.2).
+pub(super) const V5: &str = r#"
+ALTER TABLE room_settings
+    ADD COLUMN send TEXT NOT NULL DEFAULT 'all' CHECK (send IN ('all', 'mods'));
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.

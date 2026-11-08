@@ -75,6 +75,7 @@ async fn overview_session_and_refs() {
          alice S: SET #general guests write
          alice S: SET #general retention server
          alice S: SET #general e2ee no
+         alice S: SET #general send all
          alice S: OK id={id} head=8814
          sam S: @seq=8814;t={*};from=~alice;id={id} JOIN #general
          alice C: @react=8813 msg #general 👋
@@ -122,6 +123,7 @@ async fn overview_session_with_guests() {
          alice S: SET #general guests write
          alice S: SET #general retention server
          alice S: SET #general e2ee no
+         alice S: SET #general send all
          alice S: OK id={id} head=1
          bob C: join #general
          bob S: @seq=2;t={*};from=~bob;id={id} JOIN #general
@@ -130,6 +132,7 @@ async fn overview_session_with_guests() {
          bob S: SET #general guests write
          bob S: SET #general retention server
          bob S: SET #general e2ee no
+         bob S: SET #general send all
          bob S: OK id={id} head=2
          alice S: @seq=2;t={*};from=~bob;id={id} JOIN #general
          alice C: msg #general anyone around?
@@ -151,6 +154,7 @@ async fn overview_session_with_guests() {
          sam S: SET #general guests write
          sam S: SET #general retention server
          sam S: SET #general e2ee no
+         sam S: SET #general send all
          sam S: OK id={id} head=5
          alice S: @seq=5;t={*};from=~sam;id={id} JOIN #general
          bob S: @seq=5;t={*};from=~sam;id={id} JOIN #general

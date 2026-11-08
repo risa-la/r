@@ -113,10 +113,10 @@ fn readme_session_directions() {
         .collect();
     let dirs: Vec<Dir> = readme.iter().map(|e| e.dir).collect();
     // The greeting, `guest sam`, OK, `join #general`, the JOIN event,
-    // five SET snapshots, OK, `msg #general hello!`, the MSG event, OK.
+    // six SET snapshots, OK, `msg #general hello!`, the MSG event, OK.
     assert_eq!(
         dirs,
-        [S, C, S, C, S, S, S, S, S, S, S, C, S, S],
+        [S, C, S, C, S, S, S, S, S, S, S, S, C, S, S],
         "{readme:#?}"
     );
     assert!(readme[0].line.starts_with("RISALA 1 "));
@@ -162,6 +162,7 @@ fn specific_examples_are_present() {
     assert_eq!(find("upload 48213").dir, Dir::Client);
     assert_eq!(find("PRESENCE offline").dir, Dir::Server);
     assert_eq!(find("SET #general e2ee no").dir, Dir::Server);
+    assert_eq!(find("SET #general send all").dir, Dir::Server);
     assert_eq!(find("init bob@example.net").dir, Dir::Client);
     assert_eq!(find("COMMIT bob@example.net 1").dir, Dir::Server);
     assert_eq!(find("enc bob@example.net 1").dir, Dir::Client);

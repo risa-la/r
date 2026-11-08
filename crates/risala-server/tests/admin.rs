@@ -446,6 +446,7 @@ async fn admin_set_guests_no_ends_guest_sessions() {
             "*",
             "*",
             "*",
+            "*",
             "OK id={id} members=1 head=5 role=member joined=yes",
         ],
     )
@@ -1047,6 +1048,7 @@ async fn m4_state_survives_a_restart() {
             "SET #p guests read",
             "SET #p retention 7",
             "SET #p e2ee no",
+            "SET #p send all",
             &format!("OK id={id} members=1 head=14 role=owner joined=yes"),
         ],
     )

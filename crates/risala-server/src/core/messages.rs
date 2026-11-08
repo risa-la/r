@@ -35,6 +35,7 @@ use risala_proto::types::{Cid, DEFAULT_LIMIT, FileUrl, MAX_REACTION, Relation, R
 use super::commands::{
     Fail, Outcome, Reply, check_read, fail, gone_is_not_found, not_supported, room_of,
 };
+use super::moderation::{may_send_messages, only_moderators_send};
 use super::state::{ConvState, RoomInfo};
 use super::{Hub, Inner};
 use crate::handler::ConnId;
@@ -165,6 +166,12 @@ impl Inner {
         // Reactions too (6.3).
         if uid.is_guest() && !info.settings.guests.allows_write() {
             return Err(fail(ErrorCode::Forbidden, "guests may not send here"));
+        }
+        // An announcement room: plain members may only react (6.2).
+        if !matches!(relation, Some(Relation::React(_)))
+            && !may_send_messages(info, self.asker(uid, member))
+        {
+            return Err(only_moderators_send());
         }
         match relation {
             None => {}

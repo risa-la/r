@@ -1232,3 +1232,103 @@ async fn bans_in_chunks_agree_with_unban_events() {
     want.push("OK".into());
     assert_eq!(lines, want);
 }
+
+// ---------------------------------------------------------------------------
+// Announcement-only rooms (6.2 `send`, PLAN.md 5, item 38)
+
+#[tokio::test]
+async fn only_owners_set_send() {
+    let mut h = harness();
+    let [mut alice, mut bob] = sign_in(&mut h, [ALICE, BOB]);
+    assert_eq!(
+        last(&h, &mut bob, "set #general send mods").await,
+        "ERR forbidden only owners may do that"
+    );
+    assert_eq!(
+        last(&h, &mut alice, "set #general send mods ").await,
+        "OK seq=9"
+    );
+    h.send(&alice, "info #general").await;
+    assert!(alice.lines().contains(&"SET #general send mods".to_owned()));
+}
+
+#[tokio::test]
+async fn in_an_announcement_room_members_only_react() {
+    let mut h = harness();
+    let [mut alice, mut bob, mut carol] = sign_in(&mut h, [ALICE, BOB, CAROL]);
+    let (mut sam, _) = h.joined("sam", "#general").await;
+    h.send(&carol, "msg #general before").await; // 10
+    assert_eq!(carol.lines().last().unwrap(), "OK seq=10");
+    alice.lines();
+    h.send(&alice, "set #general send mods").await; // 11
+    alice.lines();
+    bob.lines();
+    carol.lines();
+    sam.lines();
+
+    // Owners and moderators post as before.
+    assert_eq!(last(&h, &mut alice, "msg #general news").await, "OK seq=12");
+    assert_eq!(
+        last(&h, &mut bob, "@reply=12 msg #general more").await,
+        "OK seq=13"
+    );
+    h.send(&bob, "typing #general").await;
+    assert_eq!(bob.lines(), ["OK"]);
+    // Plain members and guests may react, and nothing else.
+    let refused = "ERR forbidden only moderators and owners send messages here";
+    for c in [&mut carol, &mut sam] {
+        for line in [
+            "msg #general hello",
+            "@reply=12 msg #general thanks",
+            "@edit=10 msg #general edited",
+            "typing #general",
+        ] {
+            assert_eq!(last(&h, c, line).await, refused, "{line}");
+        }
+    }
+    assert_eq!(
+        last(&h, &mut carol, "@react=12 msg #general 👍").await,
+        "OK seq=14"
+    );
+    assert_eq!(
+        last(&h, &mut sam, "@react=12 msg #general 🎉").await,
+        "OK seq=15"
+    );
+    // They may still delete their own messages and reactions (5.4).
+    assert_eq!(
+        last(&h, &mut carol, "delete #general 14").await,
+        "OK seq=16"
+    );
+    assert_eq!(
+        last(&h, &mut carol, "delete #general 10").await,
+        "OK seq=17"
+    );
+    // An operator, with owner rights, posts too.
+    let [mut op] = sign_in(&mut h, [OP]);
+    h.send(&op, "join #general").await;
+    op.lines();
+    assert_eq!(last(&h, &mut op, "msg #general notice").await, "OK seq=19");
+    // Back to `all`: everyone posts again.
+    h.send(&alice, "set #general send all").await;
+    sam.lines();
+    assert_eq!(last(&h, &mut sam, "msg #general hi").await, "OK seq=21");
+}
+
+#[tokio::test]
+async fn send_survives_a_restart() {
+    let mut h = harness();
+    let [mut alice] = sign_in(&mut h, [ALICE]);
+    assert!(
+        last(&h, &mut alice, "set #general send mods")
+            .await
+            .starts_with("OK seq=")
+    );
+    let mut c = config();
+    c.rooms = strings(&["#general", "#private"]);
+    let mut h = Harness::on(c, h.store.clone(), crate::core::tests::timers());
+    let [mut carol] = sign_in(&mut h, [CAROL]);
+    assert_eq!(
+        last(&h, &mut carol, "msg #general hi").await,
+        "ERR forbidden only moderators and owners send messages here"
+    );
+}

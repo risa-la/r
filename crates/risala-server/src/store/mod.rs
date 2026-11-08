@@ -31,7 +31,8 @@ use risala_proto::names::{BlockTarget, Id, Room, Seq, Uid};
 use risala_proto::server::{Attachment, Event, EventBody, EventMeta, Message};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{
-    Cid, GuestAccess, Relation, Role, RoomRetention, RoomSetting, ServerRetention, ServerSetting,
+    Cid, GuestAccess, Relation, Role, RoomRetention, RoomSetting, SendMode, ServerRetention,
+    ServerSetting,
 };
 
 pub use admin::{AdminStore, ServerBan};
@@ -134,6 +135,8 @@ pub struct RoomSettings {
     pub guests: GuestAccess,
     /// `retention`: the room's own retention period (7.5).
     pub retention: RoomRetention,
+    /// `send`: who may send messages (6.2).
+    pub send: SendMode,
 }
 
 impl RoomSettings {
@@ -145,6 +148,7 @@ impl RoomSettings {
             public: true,
             guests: GuestAccess::Write,
             retention: RoomRetention::Server,
+            send: SendMode::All,
         }
     }
 
@@ -155,22 +159,24 @@ impl RoomSettings {
             RoomSetting::Public(v) => self.public = *v,
             RoomSetting::Guests(v) => self.guests = *v,
             RoomSetting::Retention(v) => self.retention = *v,
+            RoomSetting::Send(v) => self.send = *v,
             // Encrypted rooms (12) are not stored yet.
             RoomSetting::E2ee(_) | RoomSetting::History(_) | RoomSetting::Other { .. } => {}
         }
     }
 
     /// The settings in the order of the snapshot after JOIN and INFO:
-    /// `topic`, `public`, `guests`, `retention`, `e2ee` (1.4, 6.1, 6.2).
-    /// `e2ee` is always `no` until encrypted rooms (12) are supported, and
-    /// `history` exists only in encrypted rooms.
-    pub fn to_settings(&self) -> [RoomSetting; 5] {
+    /// `topic`, `public`, `guests`, `retention`, `e2ee`, `send` (1.4, 6.1,
+    /// 6.2). `e2ee` is always `no` until encrypted rooms (12) are
+    /// supported, and `history` exists only in encrypted rooms.
+    pub fn to_settings(&self) -> [RoomSetting; 6] {
         [
             RoomSetting::Topic(self.topic.clone()),
             RoomSetting::Public(self.public),
             RoomSetting::Guests(self.guests),
             RoomSetting::Retention(self.retention),
             RoomSetting::E2ee(false),
+            RoomSetting::Send(self.send),
         ]
     }
 }

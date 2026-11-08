@@ -27,7 +27,7 @@ use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{Room, Uid};
 use risala_proto::server::{Event, EventBody, OkResponse, ServerMessage};
-use risala_proto::types::{GuestAccess, Role, RoomRetention, RoomSetting};
+use risala_proto::types::{GuestAccess, Role, RoomRetention, RoomSetting, SendMode};
 
 use super::Inner;
 use super::commands::{
@@ -48,6 +48,14 @@ pub(super) fn rights(info: &RoomInfo, a: Asker<'_>) -> Role {
         return Role::Owner;
     }
     info.roles.get(a.uid).copied().unwrap_or(Role::Member)
+}
+
+/// Whether `a`, a member, may send messages other than reactions, and
+/// TYPING, under the room's `send` setting (6.2, 8.1): always under `all`,
+/// and under `mods` only with the rights of a moderator or owner, which
+/// operators have (6.3). Guests' own limit, `guests`, is checked apart.
+pub(super) fn may_send_messages(info: &RoomInfo, a: Asker<'_>) -> bool {
+    info.settings.send == SendMode::All || rights(info, a).can_moderate()
 }
 
 /// Checks that `a` may do what takes `needed` in a room (6.3), and returns
@@ -94,12 +102,24 @@ fn check_not_last_owner(info: &RoomInfo, asker: &Uid, target: &Uid) -> Result<()
     Ok(())
 }
 
+/// `ERR forbidden` for a message or TYPING from a plain member of a room
+/// with `send mods` (6.2).
+pub(super) fn only_moderators_send() -> Fail {
+    fail(
+        ErrorCode::Forbidden,
+        "only moderators and owners send messages here",
+    )
+}
+
 fn needed_for(setting: &RoomSetting) -> Result<Role, Fail> {
     match setting {
         RoomSetting::Topic(_) => Ok(Role::Mod),
-        RoomSetting::Public(_) | RoomSetting::Guests(_) | RoomSetting::Retention(_) => {
-            Ok(Role::Owner)
-        }
+        // M5a: `send` gets `ERR encrypted` in an encrypted room, where a
+        // COMMIT changes it (6.2).
+        RoomSetting::Public(_)
+        | RoomSetting::Guests(_)
+        | RoomSetting::Retention(_)
+        | RoomSetting::Send(_) => Ok(Role::Owner),
         // Only INIT turns encryption on, and nothing turns it off.
         RoomSetting::E2ee(_) => Err(fail(ErrorCode::Forbidden, "e2ee is set by INIT only")),
         // M5a: `ERR encrypted` in an encrypted room, where a COMMIT

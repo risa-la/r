@@ -194,7 +194,7 @@ fn sql_seq(s: Seq) -> i64 {
 // Rooms
 
 const ROOM_COLUMNS: &str = "c.conv, c.id, c.room, c.head, c.created, \
-     s.topic, s.public, s.guests, s.retention \
+     s.topic, s.public, s.guests, s.retention, s.send \
      FROM conversations c JOIN room_settings s ON s.conv = c.conv";
 
 fn room_from_row(row: &Row<'_>) -> rusqlite::Result<RoomRow> {
@@ -208,6 +208,7 @@ fn room_from_row(row: &Row<'_>) -> rusqlite::Result<RoomRow> {
         public: row.get(6)?,
         guests: row.get(7)?,
         retention: row.get(8)?,
+        send: row.get(9)?,
     })
 }
 
@@ -222,6 +223,7 @@ struct RoomRow {
     public: bool,
     guests: String,
     retention: String,
+    send: String,
 }
 
 impl RoomRow {
@@ -270,6 +272,7 @@ impl RoomRow {
                 public: self.public,
                 guests: parse("guests setting", &self.guests)?,
                 retention: parse("retention setting", &self.retention)?,
+                send: parse("send setting", &self.send)?,
             },
             members,
             roles,
@@ -514,6 +517,7 @@ fn apply_effects(tx: &Transaction<'_>, conv: i64, seq: i64, event: &NewEvent) ->
                 RoomSetting::Retention(_) => {
                     "UPDATE room_settings SET retention = ? WHERE conv = ?"
                 }
+                RoomSetting::Send(_) => "UPDATE room_settings SET send = ? WHERE conv = ?",
                 // Encrypted rooms (12) are not stored yet.
                 RoomSetting::E2ee(_) | RoomSetting::History(_) | RoomSetting::Other { .. } => {
                     return Ok(());

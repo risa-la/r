@@ -393,6 +393,7 @@ async fn ban_of_someone_with_an_invitation_and_a_role() {
             "*",
             "*",
             "*",
+            "*",
             "OK id={*} members=2 head=9 role=none joined=no",
         ],
     )
@@ -697,6 +698,7 @@ async fn room_settings_and_guests() {
             "SET #r guests none",
             "SET #r retention server",
             "SET #r e2ee no",
+            "SET #r send all",
             "OK id={*} members=2 head=8 role=owner joined=yes",
         ],
     )
@@ -1035,6 +1037,7 @@ async fn retention_shortened_by_set_and_admin_set() {
             "*",
             "*",
             "SET #r retention 2",
+            "*",
             "*",
             "OK id={id} members=2 head=7 role=owner joined=yes",
         ],
@@ -1387,6 +1390,34 @@ async fn kick_reaches_every_device() {
     }
     exchange(&mut s, "alice", "msg #p private again", &["*", "OK seq=6"]).await;
     exchange(&mut s, "phone", "info #p", &["ERR not-found{..}"]).await;
+    s.settled().await;
+    server.stop().await;
+}
+
+/// An announcement room (6.2 `send mods`): the owner posts, a plain member
+/// may only react, and TYPING is closed to them (PLAN.md 5, item 38).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_announcement_room_over_tls() {
+    let server = server().await;
+    let mut s = people(&server, &["alice", "bob"]).await;
+    join(&mut s, "alice", "#news").await;
+    join(&mut s, "bob", "#news").await;
+    expect(&mut s, "alice", "*JOIN #news").await;
+    exchange(
+        &mut s,
+        "alice",
+        "set #news send mods",
+        &["*SET #news send mods", "OK seq=3"],
+    )
+    .await;
+    expect(&mut s, "bob", "*SET #news send mods").await;
+    exchange(&mut s, "alice", "msg #news launch day", &["*", "OK seq=4"]).await;
+    expect(&mut s, "bob", "*MSG #news launch day").await;
+    for line in ["msg #news great", "typing #news"] {
+        exchange(&mut s, "bob", line, &["ERR forbidden{..}"]).await;
+    }
+    exchange(&mut s, "bob", "@react=4 msg #news 🎉", &["*", "OK seq=5"]).await;
+    expect(&mut s, "alice", "*react=4 MSG #news 🎉").await;
     s.settled().await;
     server.stop().await;
 }

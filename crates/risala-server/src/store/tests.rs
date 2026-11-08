@@ -613,6 +613,7 @@ fn settings_roles_and_bans_follow_events() {
         RoomSetting::Public(false),
         RoomSetting::Guests(GuestAccess::None),
         RoomSetting::Retention(RoomRetention::Days(std::num::NonZeroU32::new(7).unwrap())),
+        RoomSetting::Send(risala_proto::types::SendMode::Mods),
     ] {
         store
             .append(key, &event("alice@example.org", EventKind::Set(setting)))
@@ -638,6 +639,7 @@ fn settings_roles_and_bans_follow_events() {
             public: false,
             guests: GuestAccess::None,
             retention: RoomRetention::Days(std::num::NonZeroU32::new(7).unwrap()),
+            send: risala_proto::types::SendMode::Mods,
         }
     );
     assert_eq!(r.roles, [(bob.clone(), Role::Mod)]);

@@ -265,6 +265,7 @@ pub(super) fn default_settings(room: &str) -> Vec<String> {
         format!("SET {room} guests write"),
         format!("SET {room} retention server"),
         format!("SET {room} e2ee no"),
+        format!("SET {room} send all"),
     ]
 }
 
@@ -867,6 +868,7 @@ async fn join_shows_current_settings() {
             "SET #general guests read".into(),
             "SET #general retention server".into(),
             "SET #general e2ee no".into(),
+            "SET #general send all".into(),
             format!("OK id={id} head=3"),
         ]
     );
@@ -1488,8 +1490,8 @@ async fn sync_lists_the_rooms_of_the_connection() {
     h.send(&sam, "join #general").await;
     let lines = sam.lines();
     let other = value(&lines[0], "id");
-    // #other's JOIN, five SET lines and OK, then #general's JOIN.
-    let general = value(&lines[7], "id");
+    // #other's JOIN, six SET lines and OK, then #general's JOIN.
+    let general = value(&lines[8], "id");
     let (mut bob, _) = h.joined("bob", "#general").await;
     h.send(&bob, "msg #general hi").await;
     sam.lines();
@@ -1523,8 +1525,8 @@ pub(super) async fn in_many_rooms() -> (Harness, Client, usize) {
     sam.lines();
     for room in &rooms {
         h.send(&sam, &format!("join {room}")).await;
-        // The JOIN event, five SET snapshots and the OK.
-        assert_eq!(sam.lines().len(), 7);
+        // The JOIN event, six SET snapshots and the OK.
+        assert_eq!(sam.lines().len(), 8);
     }
     (h, sam, rooms.len())
 }
@@ -2499,6 +2501,7 @@ async fn the_overview_session() {
             "SET #general guests write".into(),
             "SET #general retention server".into(),
             "SET #general e2ee no".into(),
+            "SET #general send all".into(),
             format!("OK id={id} head=4"),
         ]
     );
