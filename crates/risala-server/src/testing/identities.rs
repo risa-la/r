@@ -20,17 +20,19 @@ use tokio::task::JoinHandle;
 
 use super::TempDir;
 use crate::config::CertPair;
-use crate::core::KeyFilePublisher as _;
 use crate::http::{HttpServer, KeyDir, KeyFiles};
+use crate::keyfiles::KeyFilePublisher as _;
 use crate::net::Certificates;
 
 /// One device of an identity, for tests: the identity and the device's
 /// ML-DSA-44 key (4.3-4.5).
 ///
-/// Make one with [`TestServer::identity`](super::TestServer::identity),
-/// [`TestServer::register`](super::TestServer::register) or
+/// Make one with [`TestServer::identity`](super::TestServer::identity) or
 /// [`TestKeyServer::new_identity`], which also publish its key, or with
 /// [`TestIdentity::new`] for a key that nothing lists yet.
+///
+/// Its key files are still draft-02's, one key per line: they become
+/// chains of records (4.4) with the identity area of the server.
 #[derive(Clone)]
 pub struct TestIdentity {
     identity: Identity,
@@ -82,7 +84,7 @@ impl TestIdentity {
         &self.key
     }
 
-    /// The device's public key, as in key files and `KEY ADD` (4.4, 4.7).
+    /// The device's public key, as in key files (4.4).
     pub fn public_key(&self) -> PublicKey {
         self.key.public_key()
     }
@@ -93,26 +95,14 @@ impl TestIdentity {
     }
 
     /// The signature AUTH needs on a connection to `host` whose greeting
-    /// had `nonce` (4.5). `host` is the name the client sent in SNI.
+    /// had `nonce` (4.6). `host` is the name the client sent in SNI.
     pub fn sign(&self, host: &str, nonce: &Nonce) -> Signature {
         self.key.sign_challenge(host, nonce, self.identity.as_str())
     }
 
-    /// The whole `AUTH <identity> <signature>` line (4.5).
+    /// The whole `AUTH <identity> <signature>` line (4.6).
     pub fn auth_line(&self, host: &str, nonce: &Nonce) -> String {
         format!("AUTH {} {}", self.identity, self.sign(host, nonce))
-    }
-
-    /// The whole `REGISTER <name> <key> <signature>` line (4.6), to
-    /// register this identity on a server whose identity domain is its
-    /// domain.
-    pub fn register_line(&self, host: &str, nonce: &Nonce) -> String {
-        format!(
-            "REGISTER {} {} {}",
-            self.identity.name(),
-            self.public_key(),
-            self.sign(host, nonce)
-        )
     }
 }
 

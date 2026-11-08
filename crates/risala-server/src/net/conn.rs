@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use risala_proto::command::{Command, Request};
 use risala_proto::error::ParseError;
-use risala_proto::frame::{LineDecoder, LineLimits, MAX_CLIENT_LINE};
+use risala_proto::frame::LineDecoder;
 use risala_proto::line::{Line, read_ref};
 use risala_proto::server::{ErrResponse, ServerLine, ServerMessage};
 use risala_proto::text::escape;
@@ -134,7 +134,7 @@ where
     H: Handler,
 {
     let id = handle.id();
-    let mut decoder = LineDecoder::new(MAX_CLIENT_LINE);
+    let mut decoder = LineDecoder::with_limits(handle.kind().client_limits());
     let mut buf = vec![0u8; READ_BUF];
     let mut keepalive = Keepalive::new(timers, Instant::now());
     let mut long_line = LongLine::default();
@@ -174,11 +174,14 @@ where
                             if quit {
                                 return Ended::Quit;
                             }
-                            // Once signed in, lines that carry MLS data may
-                            // be long (2.3). Lines already split off keep the
-                            // normal limit they were judged by.
-                            if decoder.limits() != LineLimits::CLIENT && handle.is_signed_in() {
-                                decoder.set_limits(LineLimits::CLIENT);
+                            // The limits follow the connection's kind (2.3):
+                            // a new connection's REGISTER may be 64 KiB, and
+                            // once it has a kind, the lines that carry MLS
+                            // data and key files may be long. Lines already
+                            // split off keep the limit they were judged by.
+                            let limits = handle.kind().client_limits();
+                            if decoder.limits() != limits {
+                                decoder.set_limits(limits);
                             }
                         }
                         Err((e, ref_)) => reply_parse_error(handle, &e, ref_),

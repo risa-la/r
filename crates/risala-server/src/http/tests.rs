@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use super::server::{MAX_REQUEST_HEAD, handle};
 use super::{HttpServer, KeyDir, KeyFiles};
 use crate::config::{CertPair, Config};
-use crate::core::KeyFilePublisher;
+use crate::keyfiles::KeyFilePublisher;
 use crate::net::Certificates;
 
 /// A test CA. Its certificates are written to a directory as PEM files.
@@ -252,7 +252,8 @@ async fn responses() {
 }
 
 /// `risalad`'s listener serves the key files of the identities it hosts,
-/// from its records, and nothing else that is in `key_dir` (4.6).
+/// from its records, and nothing else that is in `key_dir` (4.7). It hosts
+/// none yet, so every name is gone, and the fetcher says so.
 #[tokio::test]
 async fn daemon_runs_the_listener() {
     let tmp = tempfile::tempdir().unwrap();
@@ -272,36 +273,11 @@ async fn daemon_runs_the_listener() {
     config.keys.allow_private = true;
     config.keys.extra_roots = vec![root];
 
-    // alice is hosted. Files for other names are in the key directory
-    // too: one the server wrote for a name it no longer hosts, which it
-    // removes when it starts, and others of the operator's.
-    std::fs::create_dir_all(config.key_dir()).unwrap();
-    {
-        use crate::store::Store as _;
-        let store = crate::store::SqliteStore::open(&config.database_path()).unwrap();
-        let alice: risala_proto::names::Uid = "alice@example.test".parse().unwrap();
-        let now = risala_proto::time::Timestamp::now();
-        store.register(&alice, &key(7), now).unwrap();
-        store
-            .add_hosted_key(&alice, &key(7), "laptop", 64, now)
-            .unwrap();
-    }
-    let stale = config.key_dir().join("bob");
-    std::fs::write(&stale, KeyDir::render(&[entry(8, "old")])).unwrap();
-    let other = config.key_dir().join("carol");
-    std::fs::write(&other, "not a key file\n").unwrap();
-
     let daemon = crate::Daemon::bind(config.clone()).await.unwrap();
     let addr = daemon.http_addrs()[0];
     assert_eq!(daemon.key_dir().dir(), tmp.path().join("state/keys"));
-    // Published at startup, and the stale file is gone.
-    assert_eq!(
-        daemon.key_dir().read(&name("alice")).unwrap(),
-        Some(KeyDir::render(&[entry(7, "laptop")]).into_bytes())
-    );
-    assert!(!stale.exists());
-    assert!(other.exists());
     // A file someone writes to the directory is not served.
+    std::fs::create_dir_all(config.key_dir()).unwrap();
     std::fs::write(
         config.key_dir().join("dave"),
         KeyDir::render(&[entry(9, "x")]),
@@ -320,36 +296,25 @@ async fn daemon_runs_the_listener() {
         resolver: Arc::new(StaticResolver::new().with("example.test", [addr])),
         ..options
     });
-    assert_eq!(
-        fetcher.fetch(&id("alice@example.test"), false).await,
-        Ok(vec![key(7)])
-    );
-    for nobody in ["carol", "dave", "bob"] {
+    for nobody in ["alice", "dave"] {
         let found = fetcher
             .lookup(&id(&format!("{nobody}@example.test")), false)
             .await
             .unwrap();
         assert!(found.gone && found.entries.is_empty(), "{nobody}");
     }
-    // Through the server's trait, as the hub calls it.
+    // Through the server's trait, as the hub calls it: gone is no keys,
+    // and a failure is an error (4.4).
     let fetcher = super::HttpsKeyFetcher(fetcher);
     assert_eq!(
-        crate::core::KeyFetcher::fetch(&fetcher, &id("alice@example.test"), true).await,
-        Ok(crate::core::FetchedKeys {
-            keys: vec![key(7)],
-            cached: false
-        })
-    );
-    // Gone is no keys, and a failure is an error (4.4).
-    assert_eq!(
-        crate::core::KeyFetcher::fetch(&fetcher, &id("bob@example.test"), true).await,
-        Ok(crate::core::FetchedKeys {
+        crate::keyfiles::KeyFetcher::fetch(&fetcher, &id("bob@example.test"), true).await,
+        Ok(crate::keyfiles::FetchedKeys {
             keys: vec![],
             cached: false
         })
     );
     assert!(
-        crate::core::KeyFetcher::fetch(&fetcher, &id("bob@unknown.test"), true)
+        crate::keyfiles::KeyFetcher::fetch(&fetcher, &id("bob@unknown.test"), true)
             .await
             .is_err()
     );

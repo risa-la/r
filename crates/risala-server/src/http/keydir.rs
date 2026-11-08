@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use risala_proto::keyfile::KeyEntry;
 use risala_proto::names::Name;
 
-use crate::core::KeyFilePublisher;
+use crate::keyfiles::KeyFilePublisher;
 
 /// Key files in a directory, `<dir>/<name>`, each replaced atomically.
 ///

@@ -27,11 +27,9 @@ use std::sync::Arc;
 use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
-use crate::core::{
-    BYE_SHUTDOWN, CID_PRUNE_PERIOD, Clock, EXPIRE_PERIOD, Hub, HubError, KEY_PACKAGE_PRUNE_PERIOD,
-    KeyServices, SystemClock, Timers,
-};
+use crate::core::{BYE_SHUTDOWN, Clock, Hub, HubError, SystemClock, Timers};
 use crate::http::{self, HttpServer, KeyDir};
+use crate::keyfiles::KeyServices;
 use crate::net;
 
 /// An error starting or running the server.
@@ -68,8 +66,8 @@ impl std::fmt::Debug for Daemon {
 
 impl Daemon {
     /// Opens the database at [`Config::database_path`] (creating the state
-    /// directory if needed), creates the rooms in `config.rooms`, loads or
-    /// generates the certificates (2.2), sets up key file fetching (4.4)
+    /// directory if needed), loads or generates the certificates (2.2),
+    /// sets up key file fetching (4.4)
     /// and binds every address in `config.listen`, and in `http.listen`
     /// for the HTTPS listener.
     ///
@@ -87,7 +85,7 @@ impl Daemon {
     }
 
     /// [`Daemon::bind`], fetching and publishing key files with `keys`
-    /// (4.4, 4.6) instead of over HTTPS and into `key_dir`, for tests.
+    /// (4.4, 4.7) instead of over HTTPS and into `key_dir`, for tests.
     pub async fn bind_with_keys(config: Config, keys: KeyServices) -> Result<Daemon, RunError> {
         let timers = Timers::from_config(&config);
         Daemon::bind_full(config, timers, Some(keys)).await
@@ -198,25 +196,14 @@ impl Daemon {
     /// Accepts connections until `shutdown` resolves, then says BYE to
     /// every connection (11) and returns once they have closed, or after a
     /// grace period (see [`net::Server::run`]). Then every guest session
-    /// ends, connected or waiting to be resumed, and its guest leaves its
-    /// rooms (4.2) before this returns.
+    /// ends, connected or waiting to be resumed, and its public rooms get
+    /// GONE (4.2) before this returns.
     ///
-    /// Meanwhile, cids older than 24 hours are forgotten every
-    /// [`CID_PRUNE_PERIOD`] (7.6), old events expire every
-    /// [`EXPIRE_PERIOD`] (7.5), KeyPackages whose lifetimes have ended are
-    /// deleted every [`KEY_PACKAGE_PRUNE_PERIOD`] (12.4), and the HTTPS
-    /// listener, if there is one, serves key files. It stops when this
-    /// returns.
+    /// Meanwhile, every area does its background work
+    /// ([`Hub::maintain`]), and the HTTPS listener, if there is one, serves
+    /// key files. Both stop when this returns.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RunError> {
-        let _pruner = AbortOnDrop(tokio::spawn(
-            self.hub.clone().prune_cids_every(CID_PRUNE_PERIOD),
-        ));
-        let _expirer = AbortOnDrop(tokio::spawn(self.hub.clone().expire_every(EXPIRE_PERIOD)));
-        let _key_packages = AbortOnDrop(tokio::spawn(
-            self.hub
-                .clone()
-                .prune_key_packages_every(KEY_PACKAGE_PRUNE_PERIOD),
-        ));
+        let _maintain = AbortOnDrop(tokio::spawn(self.hub.clone().maintain()));
         let _http = self.http.map(|http| {
             AbortOnDrop(tokio::spawn(async move {
                 if let Err(e) = http.run(std::future::pending()).await {
@@ -225,8 +212,8 @@ impl Daemon {
             }))
         });
         let result = self.server.run(shutdown).await;
-        // Sessions do not survive a restart (4.2): the guests waiting to
-        // resume, and those whose connections just closed, leave now.
+        // Sessions do not survive a restart (4.2): those waiting to be
+        // resumed, and those whose connections just closed, end now.
         self.hub.end_guest_sessions(BYE_SHUTDOWN).await;
         result?;
         Ok(())

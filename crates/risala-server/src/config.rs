@@ -2,14 +2,14 @@
 //!
 //! Every field has a default, so an empty file is a working development
 //! server: it listens on port 7472, keeps its database and a generated
-//! self-signed certificate in the current directory, and allows guests.
+//! self-signed certificate in the current directory, and allows
+//! anonymous connections and guests.
 //!
 //! ```toml
 //! hostname = "chat.example.org"
 //! listen = ["[::]:7472"]
 //! state_dir = "/var/lib/risala"
 //! operators = ["alice@example.org"]
-//! rooms = ["#general"]
 //! identity_domain = "example.org"
 //! room_creation = "identities"
 //!
@@ -19,9 +19,10 @@
 //!
 //! [server]
 //! welcome = "Welcome!"
+//! anon = true
 //! guests = true
 //! registration = true
-//! retention = "forever"
+//! retention = 30
 //!
 //! [limits]
 //! registrations_per_hour = 5
@@ -41,6 +42,7 @@ use std::path::{Path, PathBuf};
 
 use risala_proto::frame::{MAX_LONG_SERVER_LINE, MAX_SERVER_LINE};
 use risala_proto::names::{Domain, Identity};
+use risala_proto::types::MIN_RETENTION_DAYS;
 use serde::Deserialize;
 
 /// The whole configuration file.
@@ -58,20 +60,18 @@ pub struct Config {
     /// The server's first operators (10.1). They cannot be removed with
     /// ADMIN DEOP.
     pub operators: Vec<String>,
-    /// Rooms that exist from the start, with no owner. Guests cannot create
-    /// rooms (4.2), so a guests-only server needs at least one. Created at
-    /// startup if missing, never deleted because they left this list.
-    pub rooms: Vec<String>,
-    /// The server's identity domain (4.6): REGISTER creates identities
+    /// The server's identity domain (4.7): REGISTER creates identities
     /// `<name>@<identity_domain>`, which the server hosts, and INFO reports
     /// it (8.5). The server must then publish their key files at
     /// `https://<identity_domain>/.well-known/risala/<name>` (4.3). Without
-    /// it, the server hosts no identities, and REGISTER and KEY get
+    /// it, the server hosts no identities, and REGISTER gets
     /// `ERR not-supported`. Whether REGISTER is open is the server setting
     /// `registration` (10.6), first set from `server.registration`.
     pub identity_domain: Option<String>,
-    /// Who may create a room by joining one that does not exist (6.1).
-    /// Guests never may (4.2).
+    /// Who may create public rooms, with the second form of CREATE (5.2,
+    /// 6.1). Guests never may (4.2). Mailboxes of direct conversations and
+    /// private rooms are not affected: the server cannot tell who creates
+    /// them.
     pub room_creation: RoomCreation,
     /// TLS certificates.
     pub tls: TlsConfig,
@@ -82,7 +82,7 @@ pub struct Config {
     pub limits: Limits,
     /// Fetching key files (4.4).
     pub keys: KeysConfig,
-    /// The HTTPS listener and the key file directory (4.6).
+    /// The HTTPS listener and the key file directory (4.7).
     pub http: HttpConfig,
 }
 
@@ -133,7 +133,7 @@ pub struct HttpConfig {
     pub key_dir: Option<PathBuf>,
 }
 
-/// Who may create rooms by joining them (6.1): `room_creation` in the
+/// Who may create public rooms (5.2, 6.1): `room_creation` in the
 /// configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -141,11 +141,11 @@ pub enum RoomCreation {
     /// Any identity. The default.
     #[default]
     Identities,
-    /// Only identities the server hosts (4.6), and operators.
+    /// Only identities the server hosts (4.7), and operators.
     Hosted,
     /// Only the server's operators (10.1).
     Operators,
-    /// Nobody: rooms come only from `rooms`.
+    /// Nobody: the server has no public rooms.
     Nobody,
 }
 
@@ -178,23 +178,28 @@ pub struct ServerConfig {
     /// The greeting's welcome text, at most 512 bytes, already escaped
     /// (3.4). Empty means none.
     pub welcome: String,
-    /// Whether guests may connect.
+    /// Whether anonymous connections may be opened (4.2). A server that
+    /// allows none cannot carry conversations (8.5).
+    pub anon: bool,
+    /// Whether guests may connect (4.2).
     pub guests: bool,
     /// Whether REGISTER is open (10.6). It takes effect only with an
     /// `identity_domain`.
     pub registration: bool,
-    /// The retention period: a number of days as a string, or `forever`.
-    pub retention: String,
+    /// The retention period, in days (7.5): at least 7, and the spec
+    /// recommends at least 30.
+    pub retention: u32,
 }
 
 /// Limits and timers. Defaults follow the spec where it names a value.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
-    /// Seconds a new connection has to sign in (4.1: at least 120).
+    /// Seconds a new connection has to sign in or become anonymous or a
+    /// guest (4.1: at least 120).
     pub sign_in_secs: u64,
     /// Seconds a guest's session waits to be resumed after its connection
-    /// closes, before it ends and the guest leaves its rooms (4.2). At
+    /// closes, before it ends and its public rooms get GONE (4.2, 6.1). At
     /// least [`MIN_GUEST_RESUME_SECS`].
     pub guest_resume_secs: u64,
     /// Seconds of silence before the server sends PING (11).
@@ -215,26 +220,25 @@ pub struct Limits {
     /// A line sent to many connections is kept once, so this bounds
     /// memory from above.
     pub out_queue_bytes: usize,
-    /// The most events one HISTORY or RELATED page returns, whatever the
-    /// client asks for (7.2).
+    /// The most posts one FETCH returns, whatever the client asks for
+    /// (7.1).
     pub max_page: u64,
     /// The most rooms one LIST page returns (6.1).
     pub max_list: u64,
     /// The most identities REGISTER may create from one network address in
-    /// an hour (13, 14). IPv6 addresses count by their /64. Further
+    /// an hour (4.7, 14). IPv6 addresses count by their /64. Further
     /// REGISTERs get `ERR rate-limited`. 0 means no limit.
     pub registrations_per_hour: u32,
-    /// The most rooms one identity may create, by joining them, in a day
-    /// (6.1, 14), since anyone who controls a domain can make any number
-    /// of identities. Further creations get `ERR rate-limited`. Operators
-    /// are not limited. 0 means no limit.
+    /// The most public rooms one identity may create in a day (5.2, 14),
+    /// since anyone who controls a domain can make any number of
+    /// identities. Further creations get `ERR rate-limited`. Operators are
+    /// not limited. 0 means no limit.
     pub rooms_per_day: u32,
     /// The most reports one identity, or the guests of one network, may
     /// make in an hour (5.8: servers SHOULD rate-limit reports). Guests
     /// count by their address, IPv6 addresses by their /64, since a guest
     /// can take a new name at will. Further REPORTs get `ERR
-    /// rate-limited`. A report repeated, which gets the existing id, does
-    /// not count. 0 means no limit.
+    /// rate-limited`. 0 means no limit.
     pub reports_per_hour: u32,
     /// Seconds after an identity's last connection closes before the
     /// people who share a conversation with it are told it is offline
@@ -245,31 +249,23 @@ pub struct Limits {
     /// them, so that one PRESENCE line covers many users (8.3: up to a few
     /// seconds). At least 1.
     pub presence_batch_ms: u64,
-    /// The least milliseconds between two TYPING notifications one
-    /// connection sends on to a conversation (8.1, 13). Clients repeat
-    /// TYPING about every 4 seconds, so this stops only floods. Those in
-    /// between still get `OK`, but are not passed on. 0 means no limit.
-    pub typing_interval_ms: u64,
-    /// The most blocks one account may have (5.7). BLOCK beyond it gets
-    /// `ERR forbidden`.
-    pub max_blocks: usize,
     /// The most ordinary KeyPackages the server keeps for one device
-    /// (12.4: devices keep about ten). KEYPKG ADD beyond it gets
+    /// (12.5: devices keep about ten). KEYPKG ADD beyond it gets
     /// `ERR forbidden`. A device's last-resort KeyPackage does not count.
     pub max_key_packages: usize,
-    /// The most KEYPKG GET one identity may send in an hour (12.4: servers
+    /// The most KEYPKG GET one identity may send in an hour (12.5: servers
     /// SHOULD rate-limit it, since each one uses KeyPackages up). Further
     /// ones get `ERR rate-limited`. 0 means no limit.
     pub key_package_gets_per_hour: u32,
     /// The largest KeyPackage KEYPKG ADD takes, in bytes once decoded
-    /// (12.4). Larger ones get `ERR too-long`. At least
-    /// [`MIN_KEY_PACKAGE_BYTES`], since 12.4 allows no lower limit.
+    /// (12.5). Larger ones get `ERR too-long`. At least
+    /// [`MIN_KEY_PACKAGE_BYTES`], since 12.5 allows no lower limit.
     pub max_key_package_bytes: usize,
 }
 
-/// The most lines a command's response has besides a full page of events
-/// (HISTORY) or rooms (LIST): the snapshot SETs of JOIN and INFO, the
-/// command's own event, and the final response.
+/// The most lines a command's response has besides a full page of posts
+/// (FETCH) or rooms (LIST): the live posts it causes, and the final
+/// response.
 pub const REPLY_MARGIN: usize = 16;
 
 /// The room a connection's queue keeps for live events from other people
@@ -283,15 +279,12 @@ pub const MIN_SIGN_IN_SECS: u64 = 120;
 /// The least `limits.guest_resume_secs` the spec allows (4.2).
 pub const MIN_GUEST_RESUME_SECS: u64 = 120;
 
-/// The lowest [`Limits::max_key_package_bytes`] may be (12.4).
+/// The lowest [`Limits::max_key_package_bytes`] may be (12.5).
 pub const MIN_KEY_PACKAGE_BYTES: usize = 16 * 1024;
 
 impl Limits {
-    /// The most lines one command's response queues: a full HISTORY or
-    /// LIST page, plus [`REPLY_MARGIN`]. SYNC has a line for every
-    /// conversation the user is in, so it queues them in chunks of fewer
-    /// than this, waiting for [`command_room`](Self::command_room) again
-    /// before each chunk.
+    /// The most lines one command's response queues: a full FETCH or LIST
+    /// page, plus [`REPLY_MARGIN`].
     pub fn reply_lines(&self) -> usize {
         let page = self.max_page.max(self.max_list);
         usize::try_from(page)
@@ -304,8 +297,8 @@ impl Limits {
     /// ([`reply_lines`](Self::reply_lines)) and [`FANOUT_ROOM`] more for
     /// live events that arrive meanwhile.
     ///
-    /// So a client that sends many commands at once, such as a HISTORY
-    /// for every room after SYNC, gets them answered as fast as it reads,
+    /// So a client that sends many commands at once, such as a FETCH for
+    /// every mailbox it follows (7.4), gets them answered as fast as it reads,
     /// and is not dropped as too slow. Live events from other people still
     /// drop a connection whose queue is full.
     pub fn command_room(&self) -> usize {
@@ -335,7 +328,6 @@ impl Default for Config {
             listen: vec![SocketAddr::from(([0, 0, 0, 0], risala_proto::DEFAULT_PORT))],
             state_dir: PathBuf::from("."),
             operators: Vec::new(),
-            rooms: Vec::new(),
             identity_domain: None,
             room_creation: RoomCreation::default(),
             tls: TlsConfig::default(),
@@ -365,9 +357,10 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             welcome: String::new(),
+            anon: true,
             guests: true,
             registration: false,
-            retention: "forever".into(),
+            retention: 30,
         }
     }
 }
@@ -388,8 +381,6 @@ impl Default for Limits {
             reports_per_hour: 30,
             presence_offline_secs: 30,
             presence_batch_ms: 1000,
-            typing_interval_ms: 1000,
-            max_blocks: 1000,
             max_key_packages: 100,
             key_package_gets_per_hour: 600,
             max_key_package_bytes: 64 * 1024,
@@ -465,7 +456,6 @@ impl Config {
             ("max_page", l.max_page),
             ("max_list", l.max_list),
             ("presence_batch_ms", l.presence_batch_ms),
-            ("max_blocks", l.max_blocks as u64),
             ("max_key_packages", l.max_key_packages as u64),
         ] {
             if value == 0 {
@@ -478,9 +468,15 @@ impl Config {
                 l.guest_resume_secs
             ));
         }
+        if self.server.retention < MIN_RETENTION_DAYS {
+            return invalid(format!(
+                "server.retention is {} days, but must be at least {MIN_RETENTION_DAYS} (7.5)",
+                self.server.retention
+            ));
+        }
         if l.max_key_package_bytes < MIN_KEY_PACKAGE_BYTES {
             return invalid(format!(
-                "limits.max_key_package_bytes is {}, but must be at least {MIN_KEY_PACKAGE_BYTES} (12.4)",
+                "limits.max_key_package_bytes is {}, but must be at least {MIN_KEY_PACKAGE_BYTES} (12.5)",
                 l.max_key_package_bytes
             ));
         }
@@ -540,6 +536,12 @@ impl Config {
                     .into(),
             );
         }
+        if self.server.retention < 30 {
+            warnings.push(format!(
+                "server.retention is {} days; the spec recommends at least 30 (7.5)",
+                self.server.retention
+            ));
+        }
         if l.sign_in_secs < MIN_SIGN_IN_SECS {
             warnings.push(format!(
                 "limits.sign_in_secs is {}; the spec recommends at least {MIN_SIGN_IN_SECS} (4.1)",
@@ -549,7 +551,7 @@ impl Config {
         Ok(warnings)
     }
 
-    /// The identity domain (4.6), if the server has one.
+    /// The identity domain (4.7), if the server has one.
     pub fn identity_domain(&self) -> Option<Domain> {
         self.identity_domain.as_deref().and_then(|d| d.parse().ok())
     }
@@ -605,7 +607,9 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert_eq!(c.hostname, "localhost");
         assert_eq!(c.listen[0].port(), 7472);
+        assert!(c.server.anon);
         assert!(c.server.guests);
+        assert_eq!(c.server.retention, 30);
         assert_eq!(c.limits.sign_in_secs, 120);
         assert_eq!(c.limits.guest_resume_secs, 300);
         assert_eq!(c.identity_domain, None);
@@ -615,8 +619,6 @@ mod tests {
         assert_eq!(c.limits.reports_per_hour, 30);
         assert_eq!(c.limits.presence_offline_secs, 30);
         assert_eq!(c.limits.presence_batch_ms, 1000);
-        assert_eq!(c.limits.typing_interval_ms, 1000);
-        assert_eq!(c.limits.max_blocks, 1000);
         assert_eq!(c.limits.max_key_packages, 100);
         assert_eq!(c.limits.key_package_gets_per_hour, 600);
         assert_eq!(c.limits.max_key_package_bytes, 65536);
@@ -662,13 +664,13 @@ mod tests {
             r##"
             hostname = "chat.example.org"
             listen = ["[::]:7000"]
-            rooms = ["#general"]
             [[tls.certs]]
             cert = "a.pem"
             key = "b.pem"
             [server]
+            anon = false
             guests = false
-            retention = "30"
+            retention = 60
             [limits]
             out_queue = 8
             "##,
@@ -676,8 +678,13 @@ mod tests {
         .unwrap();
         assert_eq!(c.listen[0].port(), 7000);
         assert_eq!(c.tls.certs.len(), 1);
+        assert!(!c.server.anon);
         assert!(!c.server.guests);
+        assert_eq!(c.server.retention, 60);
         assert_eq!(c.limits.out_queue, 8);
+        // Draft-02's settings are gone.
+        assert!(Config::parse("rooms = [\"#general\"]").is_err());
+        assert!(Config::parse("[server]\nretention = \"forever\"").is_err());
         assert_eq!(c.limits.idle_ping_secs, 120);
     }
 
@@ -699,10 +706,8 @@ mod tests {
         invalid(|l| l.max_page = 0, "max_page");
         invalid(|l| l.max_list = 0, "max_list");
         invalid(|l| l.presence_batch_ms = 0, "presence_batch_ms");
-        invalid(|l| l.max_blocks = 0, "max_blocks");
         invalid(|l| l.max_key_packages = 0, "max_key_packages");
         assert!(with(|l| l.presence_offline_secs = 0).is_ok());
-        assert!(with(|l| l.typing_interval_ms = 0).is_ok());
         invalid(|l| l.max_key_package_bytes = 16383, "max_key_package_bytes");
         assert!(with(|l| l.max_key_package_bytes = 16384).is_ok());
         invalid(|l| l.guest_resume_secs = 119, "guest_resume_secs");
@@ -750,6 +755,14 @@ mod tests {
         let warnings = with(|l| l.sign_in_secs = 10).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("sign_in_secs"), "{warnings:?}");
+
+        // Retention is at least 7 days, and should be at least 30 (7.5).
+        let mut c = Config::default();
+        c.server.retention = 6;
+        assert!(matches!(c.validate(), Err(ConfigError::Invalid(m)) if m.contains("retention")));
+        c.server.retention = 7;
+        let warnings = c.validate().unwrap();
+        assert!(warnings[0].contains("retention"), "{warnings:?}");
     }
 
     #[test]

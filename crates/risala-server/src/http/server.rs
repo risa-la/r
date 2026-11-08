@@ -41,11 +41,10 @@ pub trait KeyFiles: Send + Sync + 'static {
 }
 
 /// The key files of the identities the hub hosts, made from its records
-/// (4.6): the names it hosts, and nothing else.
+/// (4.7): the names it hosts, and nothing else.
 impl KeyFiles for Hub {
     fn key_file(&self, name: &Name) -> io::Result<Option<Vec<u8>>> {
-        let keys = self.hosted_key_file(name).map_err(io::Error::other)?;
-        Ok(keys.map(|keys| KeyDir::render(&keys).into_bytes()))
+        self.hosted_key_file(name)
     }
 }
 

@@ -6,8 +6,7 @@
 //!
 //! With `--config`, it reads that TOML file (see [`risala_server::config`]).
 //! Without it, it runs a development server: the defaults of an empty
-//! configuration file, plus the room `#general`, so guests have somewhere
-//! to talk. Logging goes to standard error, filtered by `RUST_LOG`
+//! configuration file. Logging goes to standard error, filtered by `RUST_LOG`
 //! (default `info`). SIGINT and SIGTERM shut the server down cleanly.
 
 use std::io::IsTerminal as _;
@@ -26,8 +25,8 @@ Options:
   -c, --config <path>  Read the configuration from this TOML file. Without
                        it, run a development server: listen on port 7472,
                        keep the database and a self-signed certificate in
-                       the current directory, allow guests, and create the
-                       room #general.
+                       the current directory, and allow anonymous
+                       connections and guests.
   -h, --help           Print this help and exit.
   -V, --version        Print the version and exit.
 
@@ -76,10 +75,7 @@ fn set_config(slot: &mut Option<PathBuf>, path: PathBuf) -> Result<(), String> {
 
 /// The configuration of a development server, used without `--config`.
 fn dev_config() -> Config {
-    Config {
-        rooms: vec!["#general".into()],
-        ..Config::default()
-    }
+    Config::default()
 }
 
 fn main() -> ExitCode {
@@ -219,9 +215,9 @@ mod tests {
     }
 
     #[test]
-    fn dev_server_has_a_room() {
+    fn dev_server_is_open() {
         let config = dev_config();
-        assert_eq!(config.rooms, ["#general"]);
+        assert!(config.server.anon);
         assert!(config.server.guests);
     }
 }

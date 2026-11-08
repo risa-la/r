@@ -4,10 +4,10 @@
 //! Owned by task B in docs/plans/M3.md.
 //!
 //! - [`fetch`]: [`HttpsKeyFetcher`], the hub's
-//!   [`KeyFetcher`](crate::core::KeyFetcher) over HTTPS (4.5), built on
+//!   [`KeyFetcher`](crate::keyfiles::KeyFetcher) over HTTPS (4.5), built on
 //!   the `risala-keyfetch` crate.
 //! - [`keydir`]: [`KeyDir`], the hub's
-//!   [`KeyFilePublisher`](crate::core::KeyFilePublisher), which writes
+//!   [`KeyFilePublisher`](crate::keyfiles::KeyFilePublisher), which writes
 //!   hosted identities' key files to a directory (4.6).
 //! - [`server`]: [`HttpServer`], the optional HTTPS listener (`[http]` in
 //!   the configuration), which serves the hosted identities' key files at

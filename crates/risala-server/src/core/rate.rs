@@ -7,6 +7,11 @@
 //! running it on several connections at once does not get around the
 //! limit (4.6).
 
+#![allow(
+    dead_code,
+    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::IpAddr;
@@ -19,7 +24,7 @@ use risala_proto::time::Timestamp;
 /// the address, or the /64 of an IPv6 address, since one host usually
 /// has a whole /64. An IPv4-mapped IPv6 address counts as the IPv4
 /// address.
-pub(super) fn network(ip: IpAddr) -> IpAddr {
+pub(crate) fn network(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -34,7 +39,7 @@ pub(super) fn network(ip: IpAddr) -> IpAddr {
 
 /// At most some number of slots per key in any `window`.
 #[derive(Debug)]
-pub(super) struct WindowLimit<K> {
+pub(crate) struct WindowLimit<K> {
     window: Duration,
     /// When each key took its slots in the last window, oldest first. Keys
     /// with none are forgotten.
@@ -45,7 +50,7 @@ pub(super) struct WindowLimit<K> {
 /// unless [`keep`](Self::keep) was called.
 #[must_use = "a slot is given back when dropped"]
 #[derive(Debug)]
-pub(super) struct Slot<'a, K: Eq + Hash> {
+pub(crate) struct Slot<'a, K: Eq + Hash> {
     limit: &'a WindowLimit<K>,
     key: K,
     at: Timestamp,
@@ -53,7 +58,7 @@ pub(super) struct Slot<'a, K: Eq + Hash> {
 }
 
 impl<K: Eq + Hash + Clone> WindowLimit<K> {
-    pub(super) fn new(window: Duration) -> WindowLimit<K> {
+    pub(crate) fn new(window: Duration) -> WindowLimit<K> {
         WindowLimit {
             window,
             taken: Mutex::new(HashMap::new()),
@@ -67,7 +72,7 @@ impl<K: Eq + Hash + Clone> WindowLimit<K> {
     /// Takes one of `key`'s `max` slots at `now`. Fails with the seconds
     /// until one is free again, at least 1, if all are taken. A `max` of 0
     /// means no limit, and takes nothing.
-    pub(super) fn take(
+    pub(crate) fn take(
         &self,
         key: K,
         max: u32,
@@ -107,7 +112,7 @@ impl<K: Eq + Hash + Clone> WindowLimit<K> {
 impl<K: Eq + Hash> Slot<'_, K> {
     /// The work succeeded: the slot stays taken for the rest of the
     /// window.
-    pub(super) fn keep(mut self) {
+    pub(crate) fn keep(mut self) {
         self.kept = true;
     }
 }

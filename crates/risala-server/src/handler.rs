@@ -17,9 +17,10 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use risala_proto::command::Request;
+use risala_proto::connection::ConnectionKind;
 use risala_proto::error::ErrorCode;
 use risala_proto::frame::LineLimits;
 use risala_proto::server::{ErrResponse, ServerMessage};
@@ -189,9 +190,9 @@ pub struct ConnHandle {
 #[derive(Debug)]
 struct QueueState {
     killed: AtomicBool,
-    /// The connection has signed in, so the network layer takes long lines
-    /// from it (2.3).
-    signed_in: AtomicBool,
+    /// The connection's kind (4.1), as [`kind_code`], which decides the
+    /// limits the network layer applies to its lines (2.3).
+    kind: AtomicU8,
     /// Wakes the network layer when the connection is killed.
     kill: Notify,
     /// The bytes of the lines in the queue.
@@ -200,6 +201,16 @@ struct QueueState {
     max_bytes: usize,
     /// Wakes [`ConnHandle::wait_for_room`] when lines leave the queue.
     drained: Notify,
+}
+
+/// A connection kind as stored in [`QueueState::kind`].
+const fn kind_code(kind: ConnectionKind) -> u8 {
+    match kind {
+        ConnectionKind::New => 0,
+        ConnectionKind::Anonymous => 1,
+        ConnectionKind::Guest => 2,
+        ConnectionKind::SignedIn => 3,
+    }
 }
 
 /// The receiving half of a connection, held by the network layer.
@@ -215,7 +226,7 @@ pub fn conn_channel(id: ConnId, lines: usize, bytes: usize) -> (ConnHandle, Conn
     let (tx, rx) = mpsc::channel(lines);
     let state = Arc::new(QueueState {
         killed: AtomicBool::new(false),
-        signed_in: AtomicBool::new(false),
+        kind: AtomicU8::new(kind_code(ConnectionKind::New)),
         kill: Notify::new(),
         bytes: AtomicUsize::new(0),
         max_bytes: bytes,
@@ -263,17 +274,24 @@ impl ConnHandle {
         self.state.drained.notify_waiters();
     }
 
-    /// Records that the connection has signed in as an identity. From the
-    /// next line on, the network layer takes lines as long as 2.3 allows a
-    /// signed-in client; before, and for guests, which send none of the
-    /// lines that may be long, every line has the normal limit.
-    pub fn set_signed_in(&self) {
-        self.state.signed_in.store(true, Ordering::SeqCst);
+    /// Records the connection's kind (4.1). From the next line on, the
+    /// network layer applies that kind's line limits
+    /// ([`ConnectionKind::client_limits`], 2.3): the normal limit and a
+    /// 64 KiB REGISTER while it is new, long lines for the verbs that carry
+    /// MLS data or key files once it is anonymous, a guest or signed in.
+    pub fn set_kind(&self, kind: ConnectionKind) {
+        self.state.kind.store(kind_code(kind), Ordering::SeqCst);
     }
 
-    /// Whether [`set_signed_in`](Self::set_signed_in) was called.
-    pub fn is_signed_in(&self) -> bool {
-        self.state.signed_in.load(Ordering::SeqCst)
+    /// The kind [`set_kind`](Self::set_kind) last recorded:
+    /// [`ConnectionKind::New`] until then.
+    pub fn kind(&self) -> ConnectionKind {
+        match self.state.kind.load(Ordering::SeqCst) {
+            1 => ConnectionKind::Anonymous,
+            2 => ConnectionKind::Guest,
+            3 => ConnectionKind::SignedIn,
+            _ => ConnectionKind::New,
+        }
     }
 
     /// Whether the connection has been killed or its receiver dropped.
@@ -460,6 +478,16 @@ mod tests {
             message: "x".repeat(2 * MAX_SERVER_LINE),
         });
         assert!(OutLine::new(notice).wire().is_empty());
+    }
+
+    #[test]
+    fn kinds_are_recorded() {
+        let (handle, _rx) = conn_channel(ConnId(1), 4, 1 << 20);
+        assert_eq!(handle.kind(), ConnectionKind::New);
+        for kind in ConnectionKind::ALL {
+            handle.set_kind(kind);
+            assert_eq!(handle.kind(), kind);
+        }
     }
 
     #[test]

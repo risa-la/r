@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use risala_proto::auth::Nonce;
 use risala_proto::command::{Command, Request};
+use risala_proto::connection::ConnectionKind;
 use risala_proto::fingerprint::Fingerprint;
 use risala_proto::server::{Greeting, OkResponse, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
@@ -89,8 +90,10 @@ impl Handler for Stub {
             tokio::time::sleep(self.delay).await;
         }
         let handle = self.handle(conn);
-        if matches!(req.command, Command::Guest { .. }) {
-            handle.set_signed_in();
+        match req.command {
+            Command::Anon => handle.set_kind(ConnectionKind::Anonymous),
+            Command::Guest { .. } => handle.set_kind(ConnectionKind::Guest),
+            _ => {}
         }
         for n in 0..self.lines_per_command {
             let message = format!("{n:04} {}", "x".repeat(1019));
@@ -223,11 +226,10 @@ impl Pipe {
 #[tokio::test(start_paused = true)]
 async fn commands_get_answers_in_order() {
     let mut pipe = Pipe::greeted(Stub::new()).await;
-    pipe.send(b"PING\n@ref=a1 PING x\n@ref=a2 JOIN #general\n")
-        .await;
+    pipe.send(b"PING\n@ref=a1 PING x\n@ref=a2 LIST\n").await;
     pipe.expect("OK verb=ping").await;
     pipe.expect("@ref=a1 OK verb=ping").await;
-    pipe.expect("@ref=a2 OK verb=join").await;
+    pipe.expect("@ref=a2 OK verb=list").await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -252,7 +254,7 @@ async fn bad_lines_get_errors_with_their_ref() {
 
     // Too long: the rest is discarded up to the LF, and the next line
     // works (2.3).
-    let mut long = b"@ref=t1 MSG #general ".to_vec();
+    let mut long = b"@ref=t1 QUIT ".to_vec();
     long.extend(std::iter::repeat_n(
         b'x',
         risala_proto::frame::MAX_CLIENT_LINE,
@@ -270,14 +272,13 @@ async fn bad_lines_get_errors_with_their_ref() {
     pipe.expect("@ref=t3 OK verb=ping").await;
 
     // Not UTF-8, and control characters (2.3).
-    pipe.send(b"@ref=u1 MSG #general \xff\xfe\n").await;
+    pipe.send(b"@ref=u1 QUIT \xff\xfe\n").await;
     pipe.expect_prefix("@ref=u1 ERR bad-syntax ").await;
-    pipe.send(b"@ref=c1 MSG #general a\x01b\n").await;
+    pipe.send(b"@ref=c1 QUIT a\x01b\n").await;
     pipe.expect_prefix("@ref=c1 ERR bad-syntax ").await;
-    pipe.send(b"@ref=c2 MSG #general a\rb\n").await;
+    pipe.send(b"@ref=c2 QUIT a\rb\n").await;
     pipe.expect_prefix("@ref=c2 ERR bad-syntax ").await;
-    pipe.send("@ref=c3 MSG #general a\u{85}b\n".as_bytes())
-        .await;
+    pipe.send("@ref=c3 QUIT a\u{85}b\n".as_bytes()).await;
     pipe.expect_prefix("@ref=c3 ERR bad-syntax ").await;
 
     // CRLF line endings are fine.
@@ -289,7 +290,7 @@ async fn bad_lines_get_errors_with_their_ref() {
     pipe.send(b"@ref=v1 FROBNICATE x\n").await;
     pipe.expect("@ref=v1 ERR unknown-command unknown command FROBNICATE")
         .await;
-    pipe.send(b"@ref=p1 JOIN\n").await;
+    pipe.send(b"@ref=p1 GUEST\n").await;
     pipe.expect_prefix("@ref=p1 ERR bad-syntax ").await;
     pipe.send(b"@ref=p2;=x PING\n").await;
     pipe.expect_prefix("@ref=p2 ERR bad-syntax ").await;
@@ -302,7 +303,7 @@ async fn bad_lines_get_errors_with_their_ref() {
         .await;
     pipe.send(b"@ref= FROBNICATE\n").await;
     pipe.expect_prefix("ERR bad-syntax ").await;
-    pipe.send(b"MSG #general \xff\n").await;
+    pipe.send(b"QUIT \xff\n").await;
     pipe.expect_prefix("ERR bad-syntax ").await;
 
     // None of them reached the handler.
@@ -317,23 +318,42 @@ async fn bad_lines_get_errors_with_their_ref() {
     assert_eq!(refs, ["t2", "t3", "r1"]);
 }
 
-/// Lines that carry MLS data may be long once the connection has signed
-/// in, and not before (2.3).
+/// The line limits follow the connection's kind (2.3): a new connection
+/// may send a REGISTER of up to 64 KiB and no other long line; once it has
+/// a kind, the verbs that carry MLS data and key files may be long, and
+/// REGISTER may not.
 #[tokio::test(start_paused = true)]
-async fn long_lines_once_signed_in() {
+async fn line_limits_follow_the_kind() {
+    use risala_proto::frame::{MAX_CLIENT_LINE, MAX_REGISTER_LINE};
+
     let mut pipe = Pipe::greeted(Stub::new()).await;
-    let data = "A".repeat(2 * risala_proto::frame::MAX_CLIENT_LINE);
+    let data = "A".repeat(2 * MAX_CLIENT_LINE);
+    // A 2420-byte signature in base64 (4.6).
+    let signature = format!("{}AAA=", "A".repeat(3224));
     let keypkg = format!("@ref=k KEYPKG ADD {data}\n");
+    let register = format!("@ref=r REGISTER alice {data} {signature}\n");
+    assert!(register.len() > MAX_CLIENT_LINE && register.len() <= MAX_REGISTER_LINE);
+    let too_big = format!(
+        "@ref=b REGISTER alice {} {signature}\n",
+        "A".repeat(MAX_REGISTER_LINE)
+    );
+
     pipe.send(keypkg.as_bytes()).await;
     pipe.expect("@ref=k ERR too-long too long").await;
-    pipe.send(b"GUEST sam\n").await;
-    pipe.expect("OK verb=guest").await;
+    pipe.send(register.as_bytes()).await;
+    pipe.expect("@ref=r OK verb=register").await;
+    pipe.send(too_big.as_bytes()).await;
+    pipe.expect("@ref=b ERR too-long too long").await;
+
+    pipe.send(b"ANON\n").await;
+    pipe.expect("OK verb=anon").await;
     pipe.send(keypkg.as_bytes()).await;
     pipe.expect("@ref=k OK verb=keypkg").await;
+    pipe.send(register.as_bytes()).await;
+    pipe.expect("@ref=r ERR too-long too long").await;
     // Other verbs keep the normal limit.
-    pipe.send(format!("@ref=m MSG #general {data}\n").as_bytes())
-        .await;
-    pipe.expect("@ref=m ERR too-long too long").await;
+    pipe.send(format!("@ref=p PING {data}\n").as_bytes()).await;
+    pipe.expect("@ref=p ERR too-long too long").await;
 }
 
 #[tokio::test(start_paused = true)]

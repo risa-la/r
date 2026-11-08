@@ -11,7 +11,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject as _;
 
 use crate::config::KeysConfig;
-use crate::core::{FetchError, FetchedKeys, KeyFetcher};
+use crate::keyfiles::{FetchError, FetchedKeys, KeyFetcher};
 
 /// Fetches key files over HTTPS under the rules of 4.4, for the hub's
 /// AUTH (4.5). A key file or a gone answer gives the identity's keys; a
