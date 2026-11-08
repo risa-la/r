@@ -2133,7 +2133,11 @@ impl crate::store::MessageStore for Flaky {}
 
 // (moderation)
 
-impl crate::store::ModerationStore for Flaky {}
+impl crate::store::ModerationStore for Flaky {
+    fn room_bans(&self, c: ConvKey) -> crate::store::Result<Vec<(Uid, String)>> {
+        self.inner.room_bans(c)
+    }
+}
 
 // (reports)
 
