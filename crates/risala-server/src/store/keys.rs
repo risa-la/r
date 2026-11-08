@@ -8,15 +8,19 @@
 //!   until handed out or their lifetime ends (12.5).
 //! - `key_package_uids`: the identities that have uploaded KeyPackages,
 //!   so that KEYPKG GET can tell a uid it does not know (12.5).
-//! - `handed_out`: each handing out of a KeyPackage by KEYPKG GET, and
-//!   each KeyPackage of an external Add proposal in a public room: what a
-//!   Welcome may be put for, once each (12.8).
+//! - `handed_out`: each handing out of a KeyPackage by KEYPKG GET, with
+//!   the hash of its put secret (12.5), and each KeyPackage of an external
+//!   Add proposal that a public room's commit applied, with the device
+//!   that committed it: what a Welcome may be put for, once each (12.8).
+//! - `room_trees`: the ratchet tree of each public-room epoch that such a
+//!   commit started, for WELCOME GET's `tree`, kept 24 hours (12.6, 12.8).
 //! - `welcomes`: Welcomes waiting for their device, or for WELCOME GET,
 //!   until fetched or retention ends (12.8).
 //! - `blobs`: the blobs the server holds, by hash, with when retention
 //!   counts from (12.12). Their bytes live in files.
 //! - `blob_keeps`: what keeps a blob whatever the retention: a current
-//!   backup, or the tree of a public room's current epoch (12.12, 12.13).
+//!   backup, the tree of a public room's current epoch, or the tree of an
+//!   epoch with Welcomes (12.6, 12.12, 12.13).
 //! - `blob_puts`: `put` URLs BLOB handed out, for 10 minutes (12.12).
 //! - `uploads`: uploaded files and their `put`, `get` and `del` URLs, by
 //!   the hashes of their secret parts (5.6, Section 14).
@@ -101,35 +105,87 @@ pub struct HandedKeyPackage {
     pub key_package: Vec<u8>,
 }
 
-/// Whom a Welcome is for (12.8).
+/// What a Welcome may be put for (12.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WelcomeFor {
-    /// A device whose KeyPackage KEYPKG GET handed out: the Welcome is
-    /// sent to it, and kept until WELCOME DEL.
+pub enum Handout {
+    /// A KeyPackage KEYPKG GET handed out: the Welcome goes to its device,
+    /// and is kept until WELCOME DEL.
     Device {
         /// Its identity.
         uid: Uid,
         /// Its device id.
         device: DeviceBytes,
+        /// The hash of the handout's put secret (12.5).
+        secret: SecretHash,
     },
-    /// The KeyPackage of an external Add proposal in a public room: the
-    /// Welcome waits for WELCOME GET.
+    /// The KeyPackage of an external Add proposal that a public room's
+    /// commit applied: the Welcome waits for WELCOME GET.
     Room {
         /// The room's mailbox.
         mailbox: BoxName,
+        /// The epoch the commit started, the Welcome's.
+        epoch: u64,
+        /// The identity of the device that made the commit.
+        committer_uid: Uid,
+        /// Its device id.
+        committer: DeviceBytes,
     },
+}
+
+/// A [`Handout`] as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoutRow {
+    /// Its row, for [`KeysStore::put_welcome`].
+    pub id: i64,
+    /// What it is.
+    pub handout: Handout,
 }
 
 /// What [`KeysStore::put_welcome`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutWelcome {
-    /// Stored, with this id, for this device or room.
-    Stored(WelcomeFor),
-    /// Nothing was handed out with this ref that still waits for a
-    /// Welcome (`ERR not-found`).
+    /// Stored, with this id.
+    Stored(String),
+    /// It replaced the Welcome with this id, which had not been fetched.
+    Replaced(String),
+    /// The handout already has this very Welcome: nothing changed.
+    Same,
+    /// The handout's Welcome has been fetched or deleted, and this is
+    /// another one.
+    Taken,
+    /// The handout is gone (`ERR not-found`).
     NotFound,
     /// The device has too many pending Welcomes (`ERR rate-limited`).
     TooMany,
+}
+
+/// A public room's commit applied external Add proposals (12.6, 12.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomJoins {
+    /// The room's mailbox.
+    pub mailbox: BoxName,
+    /// The epoch the commit started.
+    pub epoch: u64,
+    /// The identity of the device that made the commit.
+    pub committer_uid: Uid,
+    /// Its device id.
+    pub committer: DeviceBytes,
+    /// The KeyPackageRefs of the proposals' KeyPackages.
+    pub refs: Vec<RefBytes>,
+    /// The ratchet tree of `epoch`, or the blob the server made of it.
+    pub tree: OrBlob<Vec<u8>>,
+    /// The tree's size in bytes.
+    pub tree_size: u64,
+}
+
+/// A Welcome for an external proposal's KeyPackage, with the tree of its
+/// epoch (12.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomWelcome {
+    /// The Welcome.
+    pub welcome: StoredWelcome,
+    /// The ratchet tree, or the blob that holds it.
+    pub tree: OrBlob<Vec<u8>>,
 }
 
 /// A pending Welcome (12.8).
@@ -223,6 +279,9 @@ pub struct ExpiryTimes {
     /// Now less the retention period (7.5): Welcomes, blobs and files
     /// stored before it go.
     pub retention: Timestamp,
+    /// Public rooms' trees kept for Welcomes, of commits before this, go
+    /// with their Welcomes (12.6).
+    pub room_trees: Timestamp,
     /// Uploads that UPLOAD made before this and that never started go.
     pub unclaimed: Timestamp,
     /// Uploads that UPLOAD made before this and that never finished go.
@@ -258,11 +317,12 @@ pub trait KeysStore {
     /// Hands out one KeyPackage of each of `devices` of `uid`, at `now`:
     /// its oldest ordinary one whose lifetime has not ended, which is
     /// deleted, or else its last-resort one, which is kept. Each one is
-    /// recorded as handed out, for one Welcome (12.8).
+    /// recorded as handed out, with the hash of the put secret paired
+    /// with its device, for one Welcome (12.5, 12.8).
     fn take_key_packages(
         &self,
         uid: &Uid,
-        devices: &[DeviceBytes],
+        devices: &[(DeviceBytes, SecretHash)],
         now: Timestamp,
     ) -> Result<Vec<HandedKeyPackage>>;
 
@@ -272,26 +332,26 @@ pub trait KeysStore {
 
     // ---- Welcomes (12.8)
 
-    /// Records the KeyPackage `key_package_ref` of an external Add
-    /// proposal in the public room `mailbox`, for one Welcome.
-    fn allow_room_welcome(
-        &self,
-        mailbox: &BoxName,
-        key_package_ref: &RefBytes,
-        now: Timestamp,
-    ) -> Result<()>;
+    /// Records the KeyPackages of a public room's commit that applied
+    /// external Add proposals, each for one Welcome from the committing
+    /// device, and keeps the tree of the epoch it started; a blob tree is
+    /// recorded as a blob, with no mailbox or identity, if it is new.
+    fn add_room_joins(&self, joins: &RoomJoins, now: Timestamp) -> Result<()>;
 
-    /// Stores a Welcome with id `id` for a KeyPackage handed out with
-    /// `key_package_ref` that has none yet, unless its device already has
-    /// `max_pending` Welcomes pending. With `for_room`, only a KeyPackage
-    /// of an external proposal (`Some(true)`) or one KEYPKG GET handed out
-    /// (`Some(false)`) is taken.
+    /// What a Welcome may be put for under `key_package_ref`, newest
+    /// first.
+    fn handouts(&self, key_package_ref: &RefBytes) -> Result<Vec<HandoutRow>>;
+
+    /// Puts a Welcome for the handout `handout`, whose hash (12.12) is
+    /// `digest`: stored with id `id` unless its device already has
+    /// `max_pending` Welcomes pending, or replacing the one it has if that
+    /// has not been fetched (12.8).
     fn put_welcome(
         &self,
-        key_package_ref: &RefBytes,
+        handout: i64,
         id: &str,
         welcome: &OrBlob<Vec<u8>>,
-        for_room: Option<bool>,
+        digest: &[u8; 48],
         max_pending: u64,
         now: Timestamp,
     ) -> Result<PutWelcome>;
@@ -302,9 +362,9 @@ pub trait KeysStore {
     /// Deletes the Welcome `id` if it is pending for the device.
     fn delete_welcome(&self, uid: &Uid, device: &DeviceBytes, id: &str) -> Result<()>;
 
-    /// The Welcome for the KeyPackage of an external proposal, if it has
-    /// arrived.
-    fn room_welcome(&self, key_package_ref: &RefBytes) -> Result<Option<StoredWelcome>>;
+    /// The Welcome for the KeyPackage of an external proposal, with its
+    /// epoch's tree, if it has arrived; it counts as fetched from now on.
+    fn room_welcome(&self, key_package_ref: &RefBytes) -> Result<Option<RoomWelcome>>;
 
     // ---- Blobs (12.12)
 
@@ -389,7 +449,8 @@ pub trait KeysStore {
 
     /// Deletes what has expired at `times`: KeyPackages whose lifetime has
     /// ended, unused `put` URLs, and Welcomes, records of handing out,
-    /// blobs and files past retention. Returns the blobs and files whose
-    /// bytes are to be removed.
+    /// blobs and files past retention, and public rooms' trees past their
+    /// 24 hours with their Welcomes, and the blobs the server made of
+    /// them. Returns the blobs and files whose bytes are to be removed.
     fn expire(&self, times: &ExpiryTimes) -> Result<Expired>;
 }

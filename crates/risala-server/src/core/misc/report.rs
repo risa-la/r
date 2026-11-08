@@ -35,7 +35,7 @@ use risala_proto::content::{Content, ContentLine, FileUrl};
 use risala_proto::error::ErrorCode;
 use risala_proto::mls::Pseudonym;
 use risala_proto::names::{BoxName, Id, Uid};
-use risala_proto::server::{OkResponse, Report, ServerLine};
+use risala_proto::server::{ErrResponse, OkResponse, Report, ServerLine};
 
 use super::super::Inner;
 use super::super::command::{Cx, Reply, err};
@@ -255,10 +255,9 @@ pub(super) async fn report(cx: &Cx, mailbox: BoxName, data: ReportData) -> Reply
         };
         let message = match kept.message {
             Ok(message) => message,
-            Err(blob) => match keys::blob_bytes(inner, &blob).await {
-                Some(bytes) => bytes,
-                None => return Err(err(ErrorCode::NotFound)),
-            },
+            Err(blob) => keys::blob_bytes(inner, &blob, inner.config.files.max_blob)
+                .await
+                .map_err(ErrResponse::from)?,
         };
         match check_post(post, &message) {
             Ok(p) => {

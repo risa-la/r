@@ -5,7 +5,8 @@
 //! from a [`MemoryFetcher`], and the clock stopped at the real time, since
 //! OpenMLS gives KeyPackages lifetimes from the system clock (12.5).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openmls_memory_storage::MemoryStorage;
@@ -13,7 +14,9 @@ use risala_mls::openmls::prelude::MlsMessageOut;
 use risala_mls::{Provider, RisalaProfile, SigningKey};
 use risala_proto::auth::PublicKey;
 use risala_proto::binary::{WRAPPED_KEY_LEN, WrappedKey, write_blob_list};
-use risala_proto::mls::{GroupId, KeyPackage, KeyPackageRef, SendToken, TokenHash, Welcome};
+use risala_proto::mls::{
+    GroupId, KeyPackage, KeyPackageRef, PutSecret, RatchetTree, SendToken, TokenHash, Welcome,
+};
 use risala_proto::names::{BlobRef, BoxName, Identity, Uid};
 use tls_codec::Serialize as _;
 
@@ -22,6 +25,7 @@ use crate::core::keys::disk::{PutTarget, Refused};
 use crate::core::keys::{self, paths};
 use crate::keyfiles::{MemoryFetcher, MemoryPublisher};
 use crate::store::{MailboxStore as _, NewMailbox};
+use crate::testing::{TestChain, TestIdentity, test_log_key};
 
 const FILES: &str = "https://files.example.org";
 const BOX: &str = "ujzdegxdncf32epf3dhodzdoci";
@@ -30,6 +34,8 @@ const BOX: &str = "ujzdegxdncf32epf3dhodzdoci";
 struct Keys {
     h: Harness,
     fetcher: Arc<MemoryFetcher>,
+    /// Each identity's chain, and the devices it lists.
+    chains: Mutex<HashMap<Identity, (TestChain, Vec<TestIdentity>)>>,
     _dir: tempfile::TempDir,
 }
 
@@ -73,6 +79,7 @@ fn keys_with(f: impl FnOnce(&mut Config)) -> Keys {
             next: 0,
         },
         fetcher,
+        chains: Mutex::new(HashMap::new()),
         _dir: dir,
     }
 }
@@ -84,6 +91,7 @@ fn keys() -> Keys {
 /// A device of an identity, with its device key and MLS storage.
 struct Dev {
     uid: Uid,
+    seed: u8,
     key: SigningKey,
     provider: Provider<MemoryStorage>,
 }
@@ -92,9 +100,15 @@ impl Dev {
     fn new(uid: &str, seed: u8) -> Dev {
         Dev {
             uid: uid.parse().unwrap(),
+            seed,
             key: SigningKey::from_seed([seed; 32]),
             provider: Provider::new(MemoryStorage::default()).unwrap(),
         }
+    }
+
+    /// The device id (4.4).
+    fn id(&self) -> [u8; 48] {
+        risala_mls::DeviceId::of_device_key(self.key.public_key()).0
     }
 
     fn public(&self) -> PublicKey {
@@ -139,11 +153,53 @@ impl Keys {
         self.sign_in_from(dev, "203.0.113.7:51000")
     }
 
-    /// The key file of `dev`'s identity lists `devs`.
+    /// The key file of `devs`' identity lists `devs` as its current
+    /// devices (and the first device of its chain, which has no
+    /// KeyPackages): its chain adds the new ones and removes the others,
+    /// so that it still extends the server's pin (4.6).
     fn key_file(&self, devs: &[&Dev]) {
         let identity: Identity = devs[0].uid.clone().try_into().unwrap();
-        self.fetcher
-            .set(&identity, devs.iter().map(|d| d.public()).collect());
+        let mut chains = self.chains.lock().unwrap();
+        let (chain, listed) = chains.entry(identity.clone()).or_insert_with(|| {
+            let log = test_log_key(identity.domain(), 1, [5; 32]);
+            (TestChain::new(identity.as_str(), &log).0, Vec::new())
+        });
+        let gone: Vec<TestIdentity> = listed
+            .iter()
+            .filter(|t| !devs.iter().any(|d| d.public() == t.public_key()))
+            .cloned()
+            .collect();
+        if !gone.is_empty() {
+            chain.remove_devices(&gone.iter().collect::<Vec<_>>());
+            listed.retain(|t| devs.iter().any(|d| d.public() == t.public_key()));
+        }
+        for dev in devs {
+            if !listed.iter().any(|t| t.public_key() == dev.public()) {
+                let key = risala_proto::auth::SecretKey::from_seed([dev.seed; 32]);
+                let added = chain.add_device_with_key("device", key);
+                assert_eq!(added.public_key(), dev.public());
+                listed.push(added);
+            }
+        }
+        self.fetcher.set(&identity, chain.key_file());
+    }
+
+    /// Sends KEYPKG GET for `uid` on `c`, and returns the KeyPackages and
+    /// put secrets of its KEYPKG lines, after checking that it ends with
+    /// `OK`.
+    async fn keypkg_get(&self, c: &mut Client, uid: &str) -> Vec<(String, String)> {
+        self.send(c, &format!("KEYPKG GET {uid}")).await;
+        let mut lines = c.lines();
+        assert_eq!(lines.pop().as_deref(), Some("OK"), "{lines:?}");
+        lines
+            .iter()
+            .map(|line| {
+                let parts: Vec<&str> = line.split(' ').collect();
+                assert_eq!(parts.len(), 4, "{line}");
+                assert_eq!(parts[..2], ["KEYPKG", uid], "{line}");
+                (parts[2].to_owned(), parts[3].to_owned())
+            })
+            .collect()
     }
 
     /// Uploads a KeyPackage of `dev` on `c`, and returns its ref.
@@ -228,9 +284,10 @@ fn sealed(n: u8) -> String {
         .to_string()
 }
 
-/// An MLSMessage holding a Welcome of suite 0x0020, with no secrets.
-fn mls_welcome() -> String {
-    Welcome::from_bytes(&[0, 1, 0, 3, 0, 0x20, 0, 1, 0xaa])
+/// An MLSMessage holding a Welcome of suite 0x0020, with no secrets, and
+/// `n` for a GroupInfo.
+fn mls_welcome(n: u8) -> String {
+    Welcome::from_bytes(&[0, 1, 0, 3, 0, 0x20, 0, 1, n])
         .unwrap()
         .to_string()
 }
@@ -264,12 +321,15 @@ async fn keypackages_are_counted_and_handed_out_once_but_the_last_resort_stays()
     assert_eq!(b.lines(), ["OK count=2 last-resort=yes"]);
 
     let mut anon = h.anon().await;
+    let mut secrets = Vec::new();
     for expected in [&kp1, &kp2, &last, &last] {
-        h.send(&anon, "KEYPKG GET bob@example.net").await;
-        assert_eq!(
-            anon.lines(),
-            [format!("KEYPKG bob@example.net {expected}"), "OK".into()]
-        );
+        let got = h.keypkg_get(&mut anon, "bob@example.net").await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(&got[0].0, expected);
+        // A put secret of 32 bytes, new for each handout (12.5).
+        let secret: PutSecret = got[0].1.parse().unwrap();
+        assert!(!secrets.contains(&secret));
+        secrets.push(secret);
     }
     h.send(&b, "KEYPKG COUNT").await;
     assert_eq!(b.lines(), ["OK count=0 last-resort=yes"]);
@@ -277,11 +337,8 @@ async fn keypackages_are_counted_and_handed_out_once_but_the_last_resort_stays()
     let (newer, _) = bob.key_package(true);
     h.send(&b, &format!("KEYPKG ADD {newer}")).await;
     assert_eq!(b.lines(), ["OK"]);
-    h.send(&anon, "KEYPKG GET bob@example.net").await;
-    assert_eq!(
-        anon.lines(),
-        [format!("KEYPKG bob@example.net {newer}"), "OK".into()]
-    );
+    let got = h.keypkg_get(&mut anon, "bob@example.net").await;
+    assert_eq!(got[0].0, newer);
 }
 
 #[tokio::test]
@@ -290,29 +347,23 @@ async fn keypkg_get_gives_one_for_each_current_device() {
     let laptop = Dev::new("bob@example.net", 1);
     let phone = Dev::new("bob@example.net", 2);
     let gone = Dev::new("bob@example.net", 3);
+    h.key_file(&[&laptop, &phone, &gone]);
     for dev in [&laptop, &phone, &gone] {
         let mut c = h.sign_in(dev);
         h.add_key_package(&mut c, dev, false).await;
         h.add_key_package(&mut c, dev, false).await;
     }
-    // The key file no longer lists the third device.
-    h.key_file(&[&laptop, &phone]);
     let mut anon = h.anon().await;
-    h.send(&anon, "KEYPKG GET bob@example.net").await;
-    let lines = anon.lines();
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines[..2]
-            .iter()
-            .all(|l| l.starts_with("KEYPKG bob@example.net "))
-    );
-    assert_ne!(lines[0], lines[1]);
-    assert_eq!(lines[2], "OK");
+    assert_eq!(h.keypkg_get(&mut anon, "bob@example.net").await.len(), 3);
+    // The key file's chain removes the third device (4.4).
+    h.key_file(&[&laptop, &phone]);
+    let got = h.keypkg_get(&mut anon, "bob@example.net").await;
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_ne!(got[0], got[1]);
     // Keys missing: no current devices, so no lines (12.5).
     let identity: Identity = "bob@example.net".parse().unwrap();
     h.fetcher.gone(&identity);
-    h.send(&anon, "KEYPKG GET bob@example.net").await;
-    assert_eq!(anon.lines(), ["OK"]);
+    assert!(h.keypkg_get(&mut anon, "bob@example.net").await.is_empty());
 }
 
 #[tokio::test]
@@ -339,6 +390,42 @@ async fn keypkg_get_refuses_unknown_uids_and_unreachable_key_files() {
     h.expire().await;
     h.send(&anon, "KEYPKG GET bob@example.net").await;
     assert_eq!(anon.lines(), ["ERR not-found"]);
+}
+
+/// A hosted identity's devices come from the chain the server holds
+/// (4.7), with no key file to fetch; here KEYS PUT adds one from a blob.
+#[tokio::test]
+async fn keypkg_get_reads_a_hosted_identitys_own_chain() {
+    let mut h = keys_with(|c| {
+        c.identity_domain = Some("example.org".into());
+        c.server.registration = true;
+    });
+    let log = h.hub.key_log().unwrap();
+    let (mut chain, first) = TestChain::new("alice@example.org", &log.log);
+    let mut c = h.open("203.0.113.7:51000", Some("chat.example.org"));
+    let nonce = c.raw_lines()[0].split(' ').nth(3).unwrap().parse().unwrap();
+    h.send(&c, &chain.register_line(&first, "chat.example.org", &nonce))
+        .await;
+    assert_eq!(c.lines(), ["OK uid=alice@example.org"]);
+    let alice = Dev::new("alice@example.org", 9);
+    chain.add_device_with_key("phone", risala_proto::auth::SecretKey::from_seed([9; 32]));
+    // KEYS PUT with its records in a blob (4.7, 12.12): one the server
+    // does not hold is not found.
+    let records = risala_proto::record::encode_records(&chain.records()[2..]);
+    let after = chain.records()[1].hash();
+    let missing = BlobRef::of(b"no records");
+    h.send(&c, &format!("KEYS PUT {after} {missing}")).await;
+    assert_eq!(c.lines(), ["ERR not-found no such blob"]);
+    h.mailbox();
+    let mut anon = h.anon().await;
+    let hash = h.store_blob(&mut anon, &records).await;
+    h.send(&c, &format!("KEYS PUT {after} {hash}")).await;
+    let lines = c.lines();
+    assert_eq!(lines.last().map(String::as_str), Some("OK"), "{lines:?}");
+    assert!(lines[0].starts_with("RECORD "), "{lines:?}");
+    let mut a = h.sign_in(&alice);
+    h.add_key_package(&mut a, &alice, false).await;
+    assert_eq!(h.keypkg_get(&mut anon, "alice@example.org").await.len(), 1);
 }
 
 #[tokio::test]
@@ -440,8 +527,13 @@ async fn keypackages_whose_lifetime_ended_are_neither_taken_nor_handed_out() {
 // ---------------------------------------------------------------------------
 // Welcomes (12.8)
 
+/// A put secret no handout has.
+fn stray_secret() -> PutSecret {
+    PutSecret::from_bytes([0x5a; 32])
+}
+
 #[tokio::test]
-async fn welcomes_reach_the_device_once_for_each_handing_out() {
+async fn welcomes_need_the_put_secret_and_reach_the_device() {
     let mut h = keys();
     let bob = Dev::new("bob@example.net", 1);
     let phone = Dev::new("bob@example.net", 2);
@@ -451,27 +543,44 @@ async fn welcomes_reach_the_device_once_for_each_handing_out() {
     let kp_ref = h.add_key_package(&mut b, &bob, false).await;
     let mut alice = h.anon().await;
     // Not handed out yet.
-    h.send(&alice, &format!("WELCOME PUT {kp_ref} {}", sealed(1)))
-        .await;
+    let stray = stray_secret();
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {stray} {}", sealed(1)),
+    )
+    .await;
     assert_eq!(alice.lines(), ["ERR not-found"]);
-    h.send(&alice, "KEYPKG GET bob@example.net").await;
-    alice.lines();
+    let got = h.keypkg_get(&mut alice, "bob@example.net").await;
+    assert_eq!(got.len(), 1);
+    let secret = &got[0].1;
     // A plain MLS Welcome is not taken for a KeyPackage of KEYPKG GET, nor
     // anything that is not a Welcome.
     for bad in [
-        mls_welcome(),
+        mls_welcome(0xaa),
         b64(&[2, 1, 1, 1, 1]),
         b64(&[1, 1, 1, 1, 1, 9, 9]),
     ] {
-        h.send(&alice, &format!("WELCOME PUT {kp_ref} {bad}")).await;
-        let lines = alice.lines();
-        assert!(
-            lines == ["ERR not-found"] || lines == ["ERR invalid"],
-            "{lines:?}"
-        );
+        h.send(&alice, &format!("WELCOME PUT {kp_ref} {secret} {bad}"))
+            .await;
+        assert_eq!(alice.lines(), ["ERR invalid"]);
     }
-    h.send(&alice, &format!("WELCOME PUT {kp_ref} {}", sealed(1)))
-        .await;
+    // Only with the handout's put secret (12.8).
+    for wrong in [stray.to_string(), "-".into()] {
+        let welcome = if wrong == "-" {
+            mls_welcome(0xaa)
+        } else {
+            sealed(1)
+        };
+        h.send(&alice, &format!("WELCOME PUT {kp_ref} {wrong} {welcome}"))
+            .await;
+        assert_eq!(alice.lines(), ["ERR forbidden"], "{wrong}");
+    }
+    assert_eq!(b.lines(), Vec::<String>::new());
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(1)),
+    )
+    .await;
     assert_eq!(alice.lines(), ["OK"]);
     // Sent at once to the device's signed-in connections, not others.
     let line = b.raw_lines();
@@ -479,15 +588,27 @@ async fn welcomes_reach_the_device_once_for_each_handing_out() {
     let id = line[0].split(' ').nth(1).unwrap().to_owned();
     assert_eq!(line[0], format!("WELCOME {id} {}", sealed(1)));
     assert_eq!(p.lines(), Vec::<String>::new());
-    // Once only.
-    h.send(&alice, &format!("WELCOME PUT {kp_ref} {}", sealed(2)))
-        .await;
-    assert_eq!(alice.lines(), ["ERR not-found"]);
+    // The same Welcome again, as after a lost OK, changes nothing.
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(1)),
+    )
+    .await;
+    assert_eq!(alice.lines(), ["OK"]);
+    assert_eq!(b.lines(), Vec::<String>::new());
+    // Another replaces it while it is pending, under the same id.
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(2)),
+    )
+    .await;
+    assert_eq!(alice.lines(), ["OK"]);
+    assert_eq!(b.lines(), [format!("WELCOME {id} {}", sealed(2))]);
     // Kept until the device deletes it.
     h.send(&b, "WELCOME LIST").await;
     assert_eq!(
         b.lines(),
-        [format!("WELCOME {id} {}", sealed(1)), "OK".into()]
+        [format!("WELCOME {id} {}", sealed(2)), "OK".into()]
     );
     h.send(&p, "WELCOME LIST").await;
     assert_eq!(p.lines(), ["OK"]);
@@ -499,6 +620,20 @@ async fn welcomes_reach_the_device_once_for_each_handing_out() {
     assert_eq!(b.lines(), ["OK"]);
     h.send(&b, "WELCOME LIST").await;
     assert_eq!(b.lines(), ["OK"]);
+    // Once fetched, each handout has had its one Welcome.
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(3)),
+    )
+    .await;
+    assert_eq!(alice.lines(), ["ERR forbidden"]);
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(2)),
+    )
+    .await;
+    assert_eq!(alice.lines(), ["OK"]);
+    assert_eq!(b.lines(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -509,18 +644,25 @@ async fn a_last_resort_keypackage_takes_one_welcome_per_handing_out() {
     let mut b = h.sign_in(&bob);
     let kp_ref = h.add_key_package(&mut b, &bob, true).await;
     let mut alice = h.anon().await;
+    let mut secrets = Vec::new();
     for _ in 0..2 {
-        h.send(&alice, "KEYPKG GET bob@example.net").await;
-        alice.lines();
+        let got = h.keypkg_get(&mut alice, "bob@example.net").await;
+        secrets.push(got[0].1.clone());
     }
-    for (n, expected) in [(1, "OK"), (2, "OK"), (3, "ERR not-found")] {
-        h.send(&alice, &format!("WELCOME PUT {kp_ref} {}", sealed(n)))
-            .await;
-        assert_eq!(alice.lines(), [expected], "{n}");
+    for (n, secret) in secrets.iter().enumerate() {
+        let n = u8::try_from(n).unwrap();
+        h.send(
+            &alice,
+            &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(n)),
+        )
+        .await;
+        assert_eq!(alice.lines(), ["OK"], "{n}");
     }
     assert_eq!(b.lines().len(), 2);
     h.send(&b, "WELCOME LIST").await;
-    assert_eq!(b.lines().len(), 2 + 1);
+    let lines = b.lines();
+    assert_eq!(lines.len(), 2 + 1);
+    assert_ne!(lines[0].split(' ').nth(1), lines[1].split(' ').nth(1));
 }
 
 #[tokio::test]
@@ -532,16 +674,22 @@ async fn pending_welcomes_are_limited_and_expire() {
     let r1 = h.add_key_package(&mut b, &bob, false).await;
     let r2 = h.add_key_package(&mut b, &bob, false).await;
     let mut alice = h.anon().await;
-    for _ in 0..2 {
-        h.send(&alice, "KEYPKG GET bob@example.net").await;
-        alice.lines();
-    }
-    h.send(&alice, &format!("WELCOME PUT {r1} {}", sealed(1)))
+    let s1 = h.keypkg_get(&mut alice, "bob@example.net").await[0]
+        .1
+        .clone();
+    let s2 = h.keypkg_get(&mut alice, "bob@example.net").await[0]
+        .1
+        .clone();
+    h.send(&alice, &format!("WELCOME PUT {r1} {s1} {}", sealed(1)))
         .await;
     assert_eq!(alice.lines(), ["OK"]);
-    h.send(&alice, &format!("WELCOME PUT {r2} {}", sealed(2)))
+    h.send(&alice, &format!("WELCOME PUT {r2} {s2} {}", sealed(2)))
         .await;
     assert_eq!(alice.lines(), ["ERR rate-limited"]);
+    // Replacing one does not add to them.
+    h.send(&alice, &format!("WELCOME PUT {r1} {s1} {}", sealed(3)))
+        .await;
+    assert_eq!(alice.lines(), ["OK"]);
     // Not fetched within retention: deleted (12.8).
     h.advance(days(31));
     h.expire().await;
@@ -549,7 +697,7 @@ async fn pending_welcomes_are_limited_and_expire() {
     h.send(&b, "WELCOME LIST").await;
     assert_eq!(b.lines(), ["OK"]);
     // Its handing out is forgotten too: no Welcome can be put for it.
-    h.send(&alice, &format!("WELCOME PUT {r2} {}", sealed(2)))
+    h.send(&alice, &format!("WELCOME PUT {r2} {s2} {}", sealed(2)))
         .await;
     assert_eq!(alice.lines(), ["ERR not-found"]);
 }
@@ -563,10 +711,14 @@ async fn a_removed_device_loses_its_keypackages_and_welcomes() {
     let kp_ref = h.add_key_package(&mut b, &bob, false).await;
     h.add_key_package(&mut b, &bob, true).await;
     let mut alice = h.anon().await;
-    h.send(&alice, "KEYPKG GET bob@example.net").await;
-    alice.lines();
-    h.send(&alice, &format!("WELCOME PUT {kp_ref} {}", sealed(1)))
-        .await;
+    let secret = h.keypkg_get(&mut alice, "bob@example.net").await[0]
+        .1
+        .clone();
+    h.send(
+        &alice,
+        &format!("WELCOME PUT {kp_ref} {secret} {}", sealed(1)),
+    )
+    .await;
     assert_eq!(alice.lines(), ["OK"]);
     keys::device_removed(h.inner(), bob.uid.clone(), bob.key.public_key())
         .await
@@ -578,44 +730,120 @@ async fn a_removed_device_loses_its_keypackages_and_welcomes() {
     assert_eq!(b.lines(), ["OK count=0 last-resort=no"]);
 }
 
+/// The commit of an external proposal in [`BOX`], epoch 5, by `committer`,
+/// with `tree`.
+async fn room_joins(h: &Keys, committer: &Dev, kp_ref: KeyPackageRef, tree: Vec<u8>) {
+    keys::room_joins_committed(
+        h.inner(),
+        BOX.parse().unwrap(),
+        5,
+        committer.uid.clone(),
+        committer.id(),
+        vec![kp_ref],
+        tree,
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
-async fn welcomes_for_external_proposals_wait_for_welcome_get() {
+async fn welcomes_for_external_proposals_come_from_the_committer_with_the_tree() {
     let mut h = keys();
-    let room: BoxName = BOX.parse().unwrap();
+    let bob = Dev::new("bob@example.net", 1);
+    let other = Dev::new("bob@example.net", 2);
+    let mut b = h.sign_in(&bob);
+    let mut o = h.sign_in(&other);
     let kp_ref = KeyPackageRef::from_bytes([7; 48]);
     let mut guest = h.anon().await;
     h.send(&guest, &format!("WELCOME GET {kp_ref}")).await;
     assert_eq!(guest.lines(), ["ERR not-found"]);
-    let mut owner = h.anon().await;
-    h.send(&owner, &format!("WELCOME PUT {kp_ref} {}", mls_welcome()))
+    // Before the commit that applies the proposal, nobody may put it.
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(1)))
         .await;
-    assert_eq!(owner.lines(), ["ERR not-found"]);
-    keys::allow_room_welcome(h.inner(), room, kp_ref)
-        .await
-        .unwrap();
-    // A SealedWelcome is only for KeyPackages of KEYPKG GET.
-    h.send(&owner, &format!("WELCOME PUT {kp_ref} {}", sealed(1)))
+    assert_eq!(b.lines(), ["ERR not-found"]);
+    room_joins(&h, &bob, kp_ref, vec![1, 2, 3]).await;
+    // Only the committing device, with `-` (12.8).
+    let mut anon = h.anon().await;
+    for c in [&mut anon, &mut o] {
+        h.send(c, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(1)))
+            .await;
+        assert_eq!(c.lines(), ["ERR forbidden"]);
+    }
+    h.send(
+        &b,
+        &format!("WELCOME PUT {kp_ref} {} {}", stray_secret(), sealed(1)),
+    )
+    .await;
+    assert_eq!(b.lines(), ["ERR forbidden"]);
+    // An MLSMessage, not a SealedWelcome.
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", sealed(1)))
         .await;
-    assert_eq!(owner.lines(), ["ERR not-found"]);
-    h.send(&owner, &format!("WELCOME PUT {kp_ref} {}", mls_welcome()))
+    assert_eq!(b.lines(), ["ERR invalid"]);
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(1)))
         .await;
-    assert_eq!(owner.lines(), ["OK"]);
-    h.send(&owner, &format!("WELCOME PUT {kp_ref} {}", mls_welcome()))
+    assert_eq!(b.lines(), ["OK"]);
+    // Replaced while it has not been fetched.
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(2)))
         .await;
-    assert_eq!(owner.lines(), ["ERR not-found"]);
+    assert_eq!(b.lines(), ["OK"]);
+    // WELCOME GET gives the tree of its epoch (12.6, 12.8).
     h.send(&guest, &format!("WELCOME GET {kp_ref}")).await;
     let lines = guest.lines();
     assert_eq!(lines.len(), 2);
-    assert!(lines[0].starts_with("WELCOME "), "{lines:?}");
-    assert!(
-        lines[0].ends_with(&format!(" {}", mls_welcome())),
-        "{lines:?}"
+    let id = lines[0].split(' ').nth(1).unwrap();
+    let tree = RatchetTree::from_bytes(&[1, 2, 3]).unwrap();
+    assert_eq!(
+        lines[0],
+        format!("WELCOME {id} {} tree={tree}", mls_welcome(2))
     );
     assert_eq!(lines[1], "OK");
+    // Fetched: only the same Welcome again is taken.
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(3)))
+        .await;
+    assert_eq!(b.lines(), ["ERR forbidden"]);
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(2)))
+        .await;
+    assert_eq!(b.lines(), ["OK"]);
     // Light clients are not built (12.6).
     h.send(&guest, &format!("WELCOME GET {kp_ref} light=yes"))
         .await;
     assert_eq!(guest.lines(), ["ERR not-supported"]);
+    // Kept 24 hours after the commit, then dropped with the tree.
+    h.advance(Duration::from_secs(23 * 3600));
+    h.expire().await;
+    h.send(&guest, &format!("WELCOME GET {kp_ref}")).await;
+    assert_eq!(guest.lines().len(), 2);
+    h.advance(Duration::from_secs(3600 + 1));
+    h.expire().await;
+    h.send(&guest, &format!("WELCOME GET {kp_ref}")).await;
+    assert_eq!(guest.lines(), ["ERR not-found"]);
+}
+
+#[tokio::test]
+async fn a_large_tree_is_a_blob_the_server_keeps_for_its_welcomes() {
+    let mut h = keys();
+    let bob = Dev::new("bob@example.net", 1);
+    let mut b = h.sign_in(&bob);
+    let kp_ref = KeyPackageRef::from_bytes([7; 48]);
+    let tree = vec![7; 10_000];
+    let hash = BlobRef::of(&tree);
+    room_joins(&h, &bob, kp_ref, tree.clone()).await;
+    h.send(&b, &format!("WELCOME PUT {kp_ref} - {}", mls_welcome(1)))
+        .await;
+    assert_eq!(b.lines(), ["OK"]);
+    let mut guest = h.anon().await;
+    h.send(&guest, &format!("WELCOME GET {kp_ref}")).await;
+    let lines = guest.lines();
+    assert!(lines[0].ends_with(&format!(" tree={hash}")), "{lines:?}");
+    let files = h.hub.files();
+    let (path, size) = files.blob(hash).await.unwrap();
+    assert_eq!(size, 10_000);
+    assert_eq!(std::fs::read(&path).unwrap(), tree);
+    // Kept past retention while its Welcomes need it; gone with them.
+    h.advance(Duration::from_secs(24 * 3600 + 1));
+    h.expire().await;
+    assert_eq!(files.blob(hash).await, Err(Refused::NotFound));
+    assert!(!path.exists());
 }
 
 #[tokio::test]
@@ -627,15 +855,16 @@ async fn welcomes_may_be_blobs() {
     let mut b = h.sign_in(&bob);
     let kp_ref = h.add_key_package(&mut b, &bob, false).await;
     let mut alice = h.anon().await;
-    h.send(&alice, "KEYPKG GET bob@example.net").await;
-    alice.lines();
+    let secret = h.keypkg_get(&mut alice, "bob@example.net").await[0]
+        .1
+        .clone();
     // The blob must be stored first.
     let missing = BlobRef::of(b"nothing");
-    h.send(&alice, &format!("WELCOME PUT {kp_ref} {missing}"))
+    h.send(&alice, &format!("WELCOME PUT {kp_ref} {secret} {missing}"))
         .await;
     assert_eq!(alice.lines(), ["ERR not-found"]);
     let hash = h.store_blob(&mut alice, &[1, 2, 3]).await;
-    h.send(&alice, &format!("WELCOME PUT {kp_ref} {hash}"))
+    h.send(&alice, &format!("WELCOME PUT {kp_ref} {secret} {hash}"))
         .await;
     assert_eq!(alice.lines(), ["OK"]);
     assert_eq!(

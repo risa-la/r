@@ -59,7 +59,7 @@ use sha2::{Digest as _, Sha384};
 use super::command::{Cx, Reply, err, misrouted};
 use super::rate::{WindowLimit, network};
 use super::state::{ConnEntry, Device, Who};
-use super::{Inner, admin, keylog, misc};
+use super::{Inner, admin, keylog, keys, misc};
 use crate::config::Config;
 use crate::handler::ConnId;
 use crate::keyfiles::{Body, FetchError, KEY_FETCH_TIMEOUT, UrlBody};
@@ -303,6 +303,23 @@ enum View {
     Missing { why: String, cached: bool },
     /// An outage: nothing is known.
     Outage { why: String, cached: bool },
+}
+
+/// The device ids (4.4) of `identity`'s current devices, for KEYPKG GET
+/// (12.5): none if its keys are missing, and `None` for an outage, when
+/// the server cannot fetch its key file and has no valid cached copy.
+pub(crate) async fn current_devices(
+    inner: &Arc<Inner>,
+    identity: &Identity,
+) -> Option<Vec<[u8; 48]>> {
+    match keys_of(inner, identity, false).await {
+        View::Keys { chain, .. } => Some(chain.devices().keys().map(|id| *id.as_bytes()).collect()),
+        View::Missing { .. } => Some(Vec::new()),
+        View::Outage { why, .. } => {
+            tracing::debug!(%identity, "no current devices: {why}");
+            None
+        }
+    }
 }
 
 /// Whether the server hosts identities at `identity`'s domain (4.7).
@@ -870,12 +887,21 @@ pub(super) fn hosted_key_file(inner: &Inner, name: &Name) -> std::io::Result<Hos
 // ---------------------------------------------------------------------------
 // KEYS PUT (4.7)
 
-/// The bytes of a blob that KEYS PUT names (12.12).
-///
-/// The blob store is the keys area's (SV4); until it is wired in here,
-/// no blob is held, and KEYS PUT with a blob-ref gets `ERR not-found`.
-async fn blob_bytes(_inner: &Arc<Inner>, _hash: &BlobRef) -> Option<Vec<u8>> {
-    None
+/// The most bytes of records KEYS PUT reads from a blob: 4096 records,
+/// the most a chain has (4.4), of up to 4 KiB each. (4.7 sets no limit of
+/// its own; a choice to confirm.)
+pub const MAX_RECORDS_BLOB: u64 = 16 * 1024 * 1024;
+
+/// The bytes of a blob that KEYS PUT names (12.12), from the keys area's
+/// blob store: `ERR not-found` if it holds no such blob, `ERR too-long`
+/// past [`MAX_RECORDS_BLOB`].
+async fn blob_bytes(inner: &Arc<Inner>, hash: &BlobRef) -> Result<Vec<u8>, ErrResponse> {
+    keys::blob_bytes(inner, hash, MAX_RECORDS_BLOB)
+        .await
+        .map_err(|why| match why {
+            keys::NoBlob::NotFound => fail(ErrorCode::NotFound, "no such blob"),
+            why => ErrResponse::from(why),
+        })
 }
 
 /// `KEYS PUT <after> <records>` (4.7).
@@ -889,9 +915,7 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
     };
     let bytes = match records {
         KeysPutRecords::Inline(records) => records.decode(),
-        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash)
-            .await
-            .ok_or_else(|| fail(ErrorCode::NotFound, "no such blob"))?,
+        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash).await?,
     };
     let records = decode(&bytes)?;
     let identity = records[0].content().uid.clone();

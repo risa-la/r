@@ -134,6 +134,36 @@ pub(crate) async fn clear_tmp(inner: &Inner) {
     .await;
 }
 
+/// Writes `bytes` as the file of the blob `hash`, unless it is there
+/// already, through `tmp/` so that the file is never seen half written.
+/// The caller holds [`State::lock_fs`](super::State) and has checked
+/// nothing about `bytes`: the file is named by their hash.
+pub(crate) fn write_blob(keys: &super::State, hash: &BlobRef, bytes: &[u8]) -> io::Result<()> {
+    let path = keys.blob_path(hash);
+    if path.exists() {
+        return Ok(());
+    }
+    let tmp_dir = keys.dir.join("tmp");
+    create_dir(&tmp_dir)?;
+    let tmp = tmp_dir.join(crate::secret::random_token(32).map_err(io::Error::other)?);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&tmp).and_then(|mut file| {
+        io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    });
+    let moved = written.and_then(|()| {
+        create_dir(path.parent().expect("a blob's directory"))?;
+        std::fs::rename(&tmp, &path)
+    });
+    if moved.is_err() {
+        remove_quietly(&tmp);
+    }
+    moved
+}
+
 /// Creates `dir` and its parents, private to the server.
 fn create_dir(dir: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();

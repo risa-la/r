@@ -215,8 +215,14 @@ impl TestChain {
     /// Adds a device labelled `label`, with a `device` record signed by
     /// the device-signing key (4.4), and returns it.
     pub fn add_device(&mut self, label: &str) -> TestIdentity {
+        self.add_device_with_key(label, random_key())
+    }
+
+    /// Adds a device labelled `label` whose device key is `key`, as
+    /// [`add_device`](Self::add_device) does, and returns it.
+    pub fn add_device_with_key(&mut self, label: &str, key: SecretKey) -> TestIdentity {
         self.attestation_keys += 1;
-        let device = TestIdentity::with_key(self.identity.clone(), random_key());
+        let device = TestIdentity::with_key(self.identity.clone(), key);
         let keys = DeviceKeys {
             device_key: device.public_key(),
             attestation_key: xwing(self.attestation_keys),

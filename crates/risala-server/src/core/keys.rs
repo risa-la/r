@@ -9,8 +9,12 @@
 //!
 //! # What other areas call
 //!
-//! - [`allow_room_welcome`]: the mailbox area, for the KeyPackage of an
-//!   external Add proposal in a public room (12.8).
+//! - [`room_joins_committed`]: the mailbox area, when it accepts a public
+//!   room's commit that applies external Add proposals: their KeyPackages
+//!   may then get one Welcome each from the committing device, and the
+//!   tree of the new epoch is kept for WELCOME GET (12.6, 12.8).
+//! - [`blob_bytes`]: the identity area for KEYS PUT, reports, and the
+//!   mailbox area, for the bytes of a blob a line names (12.12).
 //! - [`keep_room_tree`]: the mailbox area, when a public room's tree is a
 //!   blob, so that it is kept while its epoch is current (12.12).
 //! - [`charge_address`] and [`stored_bytes`]: the mailbox area, so that
@@ -34,7 +38,10 @@ use risala_mls::{DeviceId, RisalaCrypto};
 use risala_proto::binary::read_blob_list;
 use risala_proto::command::{BackupCommand, BlobPermit, Command, KeyPkgCommand, WelcomeCommand};
 use risala_proto::error::ErrorCode;
-use risala_proto::mls::{KeyPackage, KeyPackageRef, OrBlob, SendToken, Welcome};
+use risala_proto::frame::MAX_SERVER_LINE;
+use risala_proto::mls::{
+    KeyPackage, KeyPackageRef, OrBlob, PutSecret, RatchetTree, SendToken, Welcome, WelcomeSecret,
+};
 use risala_proto::names::{BlobRef, BoxName, Identity, Uid};
 use risala_proto::server::{
     ErrResponse, FileOrigin, OkResponse, ServerLine, ServerMessage, Upload,
@@ -44,14 +51,13 @@ use risala_proto::time::Timestamp;
 use super::command::{Cx, Reply, err, misrouted};
 use super::rate::{WindowLimit, network};
 use super::state::{ConnEntry, Who};
-use super::{Hub, Inner, mailbox};
+use super::{Hub, Inner, identity, mailbox};
 use crate::config::Config;
 use crate::handler::{ConnHandle, ConnId};
-use crate::keyfiles::KEY_FETCH_TIMEOUT;
-use crate::secret::{SecretHash, random_token};
+use crate::secret::{SecretHash, random_bytes, random_token};
 use crate::store::keys::{
-    AddedKeyPackage, BlobPut, DeviceBytes, NewKeyPackage, PutWelcome, StoredWelcome, UploadRecord,
-    WelcomeFor,
+    AddedKeyPackage, BlobPut, DeviceBytes, Handout, NewKeyPackage, PutWelcome, RoomJoins,
+    StoredWelcome, UploadRecord,
 };
 use crate::store::{BackupRecord, Store, StoreError};
 
@@ -227,8 +233,9 @@ pub(super) async fn handle(cx: &Cx, command: Command) -> Reply {
         Command::KeyPkg(KeyPkgCommand::Get { uid }) => keypkg_get(cx, uid).await,
         Command::Welcome(WelcomeCommand::Put {
             key_package_ref,
+            secret,
             welcome,
-        }) => welcome_put(cx, key_package_ref, welcome).await,
+        }) => welcome_put(cx, key_package_ref, secret, welcome).await,
         Command::Welcome(WelcomeCommand::List) => welcome_list(cx).await,
         Command::Welcome(WelcomeCommand::Del { id }) => welcome_del(cx, id.to_string()).await,
         Command::Welcome(WelcomeCommand::Get {
@@ -369,43 +376,9 @@ async fn keypkg_count(cx: &Cx) -> Reply {
         .with_last_resort(count.last_resort))
 }
 
-/// Why the current devices of an identity are not known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NoDevices {
-    /// It is not an identity the server can have devices for.
-    NotFound,
-    /// Its key file could not be fetched, and no cached copy is still
-    /// valid (4.4).
-    Unavailable,
-}
-
-/// The current devices of `uid` (4.4), from its key file.
-///
-/// TODO(SV1): this reads the draft-02 key file through
-/// [`Inner::key_files`]; the identity area's resolution of draft-03 key
-/// files, checked against the key log, replaces it when it lands.
-pub(crate) async fn current_devices(
-    inner: &Inner,
-    uid: &Uid,
-) -> Result<Vec<DeviceBytes>, NoDevices> {
-    let identity = Identity::try_from(uid.clone()).map_err(|_| NoDevices::NotFound)?;
-    let fetch = inner.key_files.fetcher.fetch_boxed(&identity, false);
-    match tokio::time::timeout(KEY_FETCH_TIMEOUT, fetch).await {
-        Ok(Ok(fetched)) => Ok(fetched
-            .keys
-            .iter()
-            .map(|key| DeviceId::of_device_key(key.as_bytes()).0)
-            .collect()),
-        Ok(Err(e)) => {
-            tracing::debug!("KEYPKG GET: {e}");
-            Err(NoDevices::Unavailable)
-        }
-        Err(_) => Err(NoDevices::Unavailable),
-    }
-}
-
 /// `KEYPKG GET <uid>`: one KeyPackage of each current device of `uid`,
-/// each recorded as handed out, for one Welcome (12.8).
+/// each recorded as handed out with a new put secret, for one Welcome
+/// (12.5, 12.8).
 async fn keypkg_get(cx: &Cx, uid: Uid) -> Reply {
     let inner = &cx.inner;
     let now = inner.now();
@@ -428,9 +401,10 @@ async fn keypkg_get(cx: &Cx, uid: Uid) -> Reply {
     if let Some(slot) = by_uid {
         slot.keep();
     }
-    if uid.is_guest() {
+    let Ok(identity) = Identity::try_from(uid.clone()) else {
+        // A guest has no KeyPackages.
         return Err(err(ErrorCode::NotFound));
-    }
+    };
     // A uid the server does not know: one that has uploaded no KeyPackage
     // within retention. Asking only then also keeps the server from
     // fetching key files from any domain a client names (12.5).
@@ -442,23 +416,35 @@ async fn keypkg_get(cx: &Cx, uid: Uid) -> Reply {
     {
         return Err(err(ErrorCode::NotFound));
     }
-    let devices = match current_devices(inner, &uid).await {
-        Ok(devices) => devices,
-        Err(NoDevices::NotFound) => return Err(err(ErrorCode::NotFound)),
-        Err(NoDevices::Unavailable) => return Err(err(ErrorCode::Unavailable)),
+    // Keys missing give no devices; an outage, `ERR unavailable` (4.4).
+    let Some(devices) = identity::current_devices(inner, &identity).await else {
+        return Err(err(ErrorCode::Unavailable));
     };
+    let mut secrets = Vec::with_capacity(devices.len());
+    let mut handouts = Vec::with_capacity(devices.len());
+    for device in devices {
+        let secret = PutSecret::from_bytes(random_bytes().map_err(internal)?);
+        handouts.push((device, SecretHash::of(secret.as_bytes())));
+        secrets.push((device, secret));
+    }
     let who = uid.clone();
     let handed = cx
-        .db(move |store| store.take_key_packages(&who, &devices, now))
+        .db(move |store| store.take_key_packages(&who, &handouts, now))
         .await?;
     for (i, kp) in handed.into_iter().enumerate() {
         if i > 0 {
             cx.wait_for_room().await;
         }
         let key_package = KeyPackage::from_bytes(&kp.key_package).map_err(internal)?;
+        let secret = secrets
+            .iter()
+            .find(|(device, _)| *device == kp.device)
+            .map(|(_, secret)| secret.clone())
+            .ok_or_else(|| internal("a KeyPackage of a device not asked for"))?;
         cx.send(ServerLine::KeyPkg {
             uid: uid.clone(),
             key_package,
+            secret,
         });
     }
     Ok(OkResponse::new())
@@ -539,75 +525,142 @@ fn device_conns(inner: &Inner, uid: &Uid, device: &DeviceBytes) -> Vec<ConnHandl
         .collect()
 }
 
-/// A stored Welcome as a WELCOME line.
-fn welcome_line(stored: StoredWelcome) -> Result<ServerLine, ErrResponse> {
+/// A stored Welcome as a WELCOME line, with `tree` for WELCOME GET.
+fn welcome_line(
+    stored: StoredWelcome,
+    tree: Option<OrBlob<Vec<u8>>>,
+) -> Result<ServerLine, ErrResponse> {
     let welcome = match stored.welcome {
         OrBlob::Inline(bytes) => OrBlob::Inline(Welcome::from_bytes(&bytes).map_err(internal)?),
         OrBlob::Blob(blob) => OrBlob::Blob(blob),
     };
+    let tree = match tree {
+        Some(OrBlob::Inline(bytes)) => Some(OrBlob::Inline(
+            RatchetTree::from_bytes(&bytes).map_err(internal)?,
+        )),
+        Some(OrBlob::Blob(blob)) => Some(OrBlob::Blob(blob)),
+        None => None,
+    };
     Ok(ServerLine::Welcome {
         id: stored.id.parse().map_err(internal)?,
         welcome,
+        tree,
     })
 }
 
-/// `WELCOME PUT <ref> <welcome>`: only for a KeyPackage handed out by
-/// KEYPKG GET, or one of an external Add proposal in a public room, and
-/// once for each handing out.
+/// `WELCOME PUT <ref> <secret> <welcome>` (12.8): for a KeyPackage that
+/// KEYPKG GET handed out, with the put secret of that handout; or for one
+/// of an external Add proposal that a public room's commit applied, with
+/// `-`, on a signed-in connection of the device that made the commit.
 ///
-/// The kind of `<welcome>` follows from how its KeyPackage was handed out
-/// (12.8): a SealedWelcome is taken only for a KeyPackage of KEYPKG GET,
-/// and an MLSMessage only for one of an external proposal. Anything else
-/// in the line gets `ERR invalid`; a blob is taken for either, since the
-/// server does not read it (12.8 is silent on checking the bytes).
-async fn welcome_put(cx: &Cx, kp_ref: KeyPackageRef, welcome: OrBlob<Welcome>) -> Reply {
+/// The kind of `<welcome>` follows from `<secret>` (12.8): a SealedWelcome
+/// with a put secret, an MLSMessage holding a Welcome with `-`; anything
+/// else in the line gets `ERR invalid`. A blob is taken for either, once
+/// stored, since the server does not read it (12.8 is silent on checking
+/// a blob's bytes).
+///
+/// A ref the server knows, but with a secret that matches none of its
+/// handouts, or `-` from another device, gets `ERR forbidden`. A second,
+/// different Welcome for a handout replaces the first while it has not
+/// been fetched (deleted with WELCOME DEL, or returned by WELCOME GET);
+/// after that it gets `ERR forbidden` too, and the same Welcome again gets
+/// `OK` (12.8 is silent on both; a choice to confirm).
+async fn welcome_put(
+    cx: &Cx,
+    kp_ref: KeyPackageRef,
+    secret: WelcomeSecret,
+    welcome: OrBlob<Welcome>,
+) -> Reply {
     let inner = &cx.inner;
     let now = inner.now();
-    let (stored, for_room) = match welcome {
+    let for_room = matches!(secret, WelcomeSecret::Proposal);
+    let (stored, digest) = match welcome {
         OrBlob::Inline(welcome) => {
             let bytes = welcome.decode();
-            let for_room = if is_sealed_welcome(&bytes) {
-                Some(false)
-            } else if is_mls_welcome(&bytes) {
-                Some(true)
+            let fits = if for_room {
+                is_mls_welcome(&bytes)
             } else {
-                return Err(err(ErrorCode::Invalid));
+                is_sealed_welcome(&bytes)
             };
-            (OrBlob::Inline(bytes), for_room)
+            if !fits {
+                return Err(err(ErrorCode::Invalid));
+            }
+            let digest = *BlobRef::of(&bytes).hash();
+            (OrBlob::Inline(bytes), digest)
         }
         OrBlob::Blob(blob) => {
             let hash = blob;
             if cx.db(move |store| store.blob(&hash)).await?.is_none() {
                 return Err(err(ErrorCode::NotFound));
             }
-            (OrBlob::Blob(blob), None)
+            (OrBlob::Blob(blob), *blob.hash())
         }
+    };
+    let key = *kp_ref.as_bytes();
+    let handouts = cx.db(move |store| store.handouts(&key)).await?;
+    if handouts.is_empty() {
+        return Err(err(ErrorCode::NotFound));
+    }
+    let chosen = match &secret {
+        // Every handout's hash is compared, each in constant time.
+        WelcomeSecret::Put(secret) => handouts
+            .iter()
+            .filter(|row| match &row.handout {
+                Handout::Device { secret: hash, .. } => hash.matches(secret.as_bytes()),
+                Handout::Room { .. } => false,
+            })
+            .fold(None, |found, row| found.or(Some(row))),
+        // The newest commit that applied a proposal with this KeyPackage.
+        WelcomeSecret::Proposal => handouts
+            .iter()
+            .find(|row| matches!(row.handout, Handout::Room { .. }))
+            .filter(|row| match (&row.handout, cx.device()) {
+                (
+                    Handout::Room {
+                        committer_uid,
+                        committer,
+                        ..
+                    },
+                    Some(device),
+                ) => {
+                    device.uid == *committer_uid
+                        && DeviceId::of_device_key(device.key.as_bytes()).0 == *committer
+                }
+                _ => false,
+            }),
+    };
+    let Some(chosen) = chosen.cloned() else {
+        return Err(err(ErrorCode::Forbidden));
     };
     let id = random_token(ID_LEN).map_err(internal)?;
     let max = inner.config.files.max_pending_welcomes;
-    let key = *kp_ref.as_bytes();
     let to_store = stored.clone();
-    let welcome_id = id.clone();
+    let handout = chosen.id;
     let put = cx
-        .db(move |store| store.put_welcome(&key, &welcome_id, &to_store, for_room, max, now))
+        .db(move |store| store.put_welcome(handout, &id, &to_store, &digest, max, now))
         .await?;
-    match put {
-        PutWelcome::NotFound => Err(err(ErrorCode::NotFound)),
-        PutWelcome::TooMany => Err(err(ErrorCode::RateLimited)),
-        PutWelcome::Stored(WelcomeFor::Room { .. }) => Ok(OkResponse::new()),
-        PutWelcome::Stored(WelcomeFor::Device { uid, device }) => {
-            let line = welcome_line(StoredWelcome {
+    let id = match put {
+        PutWelcome::Stored(id) | PutWelcome::Replaced(id) => id,
+        PutWelcome::Same => return Ok(OkResponse::new()),
+        PutWelcome::Taken => return Err(err(ErrorCode::Forbidden)),
+        PutWelcome::NotFound => return Err(err(ErrorCode::NotFound)),
+        PutWelcome::TooMany => return Err(err(ErrorCode::RateLimited)),
+    };
+    if let Handout::Device { uid, device, .. } = chosen.handout {
+        let line = welcome_line(
+            StoredWelcome {
                 id,
                 welcome: stored,
-            })?;
-            for handle in device_conns(inner, &uid, &device) {
-                handle.send(ServerMessage::new(line.clone()));
-            }
-            // TODO(SV5): push to the device's account subscriptions (9.2)
-            // with the reason `welcome`, once the push area is built.
-            Ok(OkResponse::new())
+            },
+            None,
+        )?;
+        for handle in device_conns(inner, &uid, &device) {
+            handle.send(ServerMessage::new(line.clone()));
         }
+        // TODO(SV5): push to the device's account subscriptions (9.2)
+        // with the reason `welcome`, once the push area is built.
     }
+    Ok(OkResponse::new())
 }
 
 /// `WELCOME LIST`: every Welcome pending for this device.
@@ -620,7 +673,7 @@ async fn welcome_list(cx: &Cx) -> Reply {
         if i > 0 {
             cx.wait_for_room().await;
         }
-        cx.send(welcome_line(stored)?);
+        cx.send(welcome_line(stored, None)?);
     }
     Ok(OkResponse::new())
 }
@@ -634,7 +687,7 @@ async fn welcome_del(cx: &Cx, id: String) -> Reply {
 }
 
 /// `WELCOME GET <ref> [light=yes]`: the Welcome for the KeyPackage of an
-/// external proposal.
+/// external proposal, with the tree of its epoch (12.6, 12.8).
 ///
 /// `light=yes` gets `ERR not-supported`: AnnotatedWelcomes are for light
 /// clients, which M5b does not build (12.6, docs/plans/M5b.md).
@@ -644,30 +697,141 @@ async fn welcome_get(cx: &Cx, kp_ref: KeyPackageRef, light: bool) -> Reply {
     }
     let key = *kp_ref.as_bytes();
     match cx.db(move |store| store.room_welcome(&key)).await? {
-        Some(stored) => {
-            cx.send(welcome_line(stored)?);
+        Some(found) => {
+            cx.send(welcome_line(found.welcome, Some(found.tree))?);
             Ok(OkResponse::new())
         }
         None => Err(err(ErrorCode::NotFound)),
     }
 }
 
-/// The KeyPackage `kp_ref` is in an external Add proposal posted to the
-/// public room `mailbox`: one Welcome may be put for it, for WELCOME GET
-/// (12.8). The mailbox area calls this when it accepts the proposal.
+/// How long a public room's tree is kept for the Welcomes of its epoch,
+/// from the commit that started it (12.6: at least 24 hours). The tree
+/// and those Welcomes then go together; their devices join again by a new
+/// proposal. Dropping them at 24 hours rather than at retention is a
+/// choice to confirm: a large room's trees are large.
+pub const ROOM_TREE_KEPT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The longest tree, in base64, that a WELCOME line carries inline; a
+/// longer one is made a blob. With it, a WELCOME line whose Welcome fits
+/// a long client line still fits a long server line (2.3).
+const MAX_INLINE_TREE: usize = MAX_SERVER_LINE / 2;
+
+/// A public room's commit applied external Add proposals (12.6, 12.8):
+/// one Welcome may be put for each KeyPackage in `added`, with `-`, and
+/// only on a signed-in connection of the device that made the commit,
+/// whose identity is `committer_uid` and whose device id (4.4) is
+/// `committer`. `tree` is the ratchet tree of `epoch`, the epoch the
+/// commit started, which WELCOME GET hands out with those Welcomes for
+/// [`ROOM_TREE_KEPT`]; a tree too long for a line becomes a blob that the
+/// server stores itself and counts against nobody.
+///
+/// The mailbox area calls this once it has accepted such a commit, with
+/// the KeyPackageRefs of the proposals' KeyPackages and the tree it
+/// exported after merging the commit (docs/plans/M5b.md, SV3).
 #[allow(
     dead_code,
     reason = "called by the mailbox area (docs/plans/M5b.md, SV3)"
 )]
-pub(crate) async fn allow_room_welcome(
-    inner: &Inner,
+pub(crate) async fn room_joins_committed(
+    inner: &Arc<Inner>,
     mailbox: BoxName,
-    kp_ref: KeyPackageRef,
+    epoch: u64,
+    committer_uid: Uid,
+    committer: DeviceBytes,
+    added: Vec<KeyPackageRef>,
+    tree: Vec<u8>,
 ) -> Result<(), StoreError> {
+    if added.is_empty() {
+        return Ok(());
+    }
     let now = inner.now();
-    inner
-        .db(move |store| store.allow_room_welcome(&mailbox, kp_ref.as_bytes(), now))
+    let tree_size = tree.len() as u64;
+    let inner = inner.clone();
+    tokio::task::spawn_blocking(move || {
+        let keys = &inner.keys;
+        // Under the lock that expiry takes, so that a tree's blob is not
+        // removed between its file and its row.
+        let _guard = keys.lock_fs();
+        let tree = if tree.len().div_ceil(3) * 4 <= MAX_INLINE_TREE {
+            OrBlob::Inline(tree)
+        } else {
+            let hash = BlobRef::of(&tree);
+            disk::write_blob(keys, &hash, &tree)
+                .map_err(|e| StoreError::Setup(format!("storing a tree: {e}")))?;
+            OrBlob::Blob(hash)
+        };
+        let joins = RoomJoins {
+            mailbox,
+            epoch,
+            committer_uid,
+            committer,
+            refs: added.iter().map(|r| *r.as_bytes()).collect(),
+            tree,
+            tree_size,
+        };
+        inner.store.add_room_joins(&joins, now)
+    })
+    .await
+    .map_err(|e| StoreError::Task(e.to_string()))?
+}
+
+/// Why [`blob_bytes`] has no bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoBlob {
+    /// The server does not hold the blob, or it has expired.
+    NotFound,
+    /// It is larger than the caller takes.
+    TooLong,
+    /// The store or the disk failed.
+    Internal,
+}
+
+impl From<NoBlob> for ErrResponse {
+    fn from(why: NoBlob) -> ErrResponse {
+        err(match why {
+            NoBlob::NotFound => ErrorCode::NotFound,
+            NoBlob::TooLong => ErrorCode::TooLong,
+            NoBlob::Internal => ErrorCode::Internal,
+        })
+    }
+}
+
+/// The bytes of the blob `hash` that a line names (12.12), if the server
+/// holds it and it has not expired, and it has at most `max` bytes. The
+/// identity area calls this for KEYS PUT, reports for a post stored as a
+/// blob (5.8), and the mailbox area may for the messages, GroupInfos and
+/// trees its lines name.
+pub(crate) async fn blob_bytes(inner: &Inner, hash: &BlobRef, max: u64) -> Result<Vec<u8>, NoBlob> {
+    let now = inner.now();
+    let start = retention_start(inner, now);
+    let h = *hash;
+    let record = inner
+        .db(move |store| store.blob(&h))
         .await
+        .map_err(|e| {
+            tracing::error!("keys: reading a blob: {e}");
+            NoBlob::Internal
+        })?
+        .ok_or(NoBlob::NotFound)?;
+    if !record.kept && record.stored < start {
+        return Err(NoBlob::NotFound);
+    }
+    if record.size > max {
+        return Err(NoBlob::TooLong);
+    }
+    match tokio::fs::read(inner.keys.blob_path(hash)).await {
+        Ok(bytes) if BlobRef::of(&bytes) == *hash => Ok(bytes),
+        Ok(_) => {
+            tracing::error!("keys: the file of blob {hash} does not hold it");
+            Err(NoBlob::Internal)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(NoBlob::NotFound),
+        Err(e) => {
+            tracing::error!("keys: reading blob {hash}: {e}");
+            Err(NoBlob::Internal)
+        }
+    }
 }
 
 /// The device whose key is `device_key` has left `uid` (4.8): its
@@ -1071,6 +1235,7 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
     let times = crate::store::keys::ExpiryTimes {
         now,
         retention: retention_start(inner, now),
+        room_trees: now.checked_sub(ROOM_TREE_KEPT).unwrap_or(now),
         unclaimed: now.checked_sub(PUT_WINDOW).unwrap_or(now),
         unfinished: now.checked_sub(UNFINISHED_UPLOAD).unwrap_or(now),
     };
@@ -1091,17 +1256,6 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
     })
     .await
     .map_err(|e| StoreError::Task(e.to_string()))?
-}
-
-/// The bytes of the blob `blob`, if the server holds it (12.12), for a
-/// report of a post stored as a blob (5.8).
-///
-/// TODO(SV4): a stub added by SV5 (REPORT) until blobs are built.
-pub(crate) async fn blob_bytes(
-    _inner: &Inner,
-    _blob: &risala_proto::names::BlobRef,
-) -> Option<Vec<u8>> {
-    None
 }
 
 /// Keeps the uploaded files behind `urls` that are this server's, even if
