@@ -796,7 +796,9 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             name,
             label,
         } => {
-            let account = within(client.register(&server, &name)).await?;
+            // Not cut short by WAIT: the library settles a lost answer
+            // itself (4.6), and the session's keepalive bounds the wait.
+            let account = client.register(&server, &name).await.or_else(explain)?;
             let uid = account.uid();
             let line = client
                 .key_line(&uid, label.as_deref().unwrap_or(""))
@@ -826,7 +828,9 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                     uid.trim()
                 ));
             };
-            let done = within(account.unregister(&uid, purge)).await?;
+            // Not cut short by WAIT, which would leave it unsettled
+            // (4.8); the session's keepalive bounds the wait.
+            let done = account.unregister(&uid, purge).await.or_else(explain)?;
             println!("deleted {} from {server}", done.uid);
             eprintln!("risala: removed the account and its cache");
             if done.key_deleted {

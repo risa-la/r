@@ -792,6 +792,71 @@ async fn a_lost_unregister_does_not_sign_in_again() {
 }
 
 #[tokio::test]
+async fn an_unregister_dropped_before_its_answer_does_not_sign_in_again() {
+    // The app, or the CLI's timeout, drops the future while UNREGISTER
+    // waits for its answer, or the process ends then. The identity may be
+    // gone all the same, so the account must not sign in again (4.8).
+    // 0: the running account. 1: UNREGISTER, never answered. 2: the user
+    // tries again, and the server refuses to sign in.
+    let sent = Arc::new(tokio::sync::Notify::new());
+    let notify = sent.clone();
+    let s = setup(3, move |i, mut peer| {
+        let notify = notify.clone();
+        async move {
+            match i {
+                0 => {
+                    signed_in(&mut peer).await;
+                    quit(peer).await;
+                }
+                1 => {
+                    greet(&mut peer).await;
+                    peer.expect(&auth_line(1)).await;
+                    peer.send(&format!("@ref=1 OK uid={ALICE}")).await;
+                    peer.expect("@ref=2 KEY LIST").await;
+                    peer.send(&format!("@ref=2 KEY {PUBLIC}\n@ref=2 OK")).await;
+                    peer.expect(&format!("@ref=3 UNREGISTER {ALICE}")).await;
+                    notify.notify_one();
+                    peer.close().await;
+                }
+                _ => {
+                    greet(&mut peer).await;
+                    peer.expect(&auth_line(1)).await;
+                    peer.send("@ref=1 ERR auth-failed").await;
+                    peer.expect_eof().await;
+                }
+            }
+        }
+    })
+    .await;
+    s.client.import_device_key(ALICE, PEM, false).await.unwrap();
+    let alice = s.client.add_identity(HOST, ALICE).unwrap();
+    within(alice.connect()).await.unwrap();
+    within(alice.wait_synced()).await.unwrap();
+
+    within(async {
+        tokio::select! {
+            biased;
+            () = sent.notified() => {}
+            r = alice.unregister(ALICE, false) => panic!("answered: {r:?}"),
+        }
+    })
+    .await;
+    // Dropped while waiting for the answer.
+    assert_eq!(
+        alice.shared().store.unregister_lost(alice.id()).unwrap(),
+        Some(true)
+    );
+    let err = within(alice.connect()).await.unwrap_err();
+    assert_eq!(refused(&err), (RefusedKind::UnregisterPending, None));
+    assert_eq!(alice.state(), ConnectionState::Failed { error: err });
+
+    let done = within(alice.unregister(ALICE, false)).await.unwrap();
+    assert!(done.hosted && done.key_deleted, "{done:?}");
+    assert!(s.client.accounts().unwrap().is_empty());
+    s.server.done().await;
+}
+
+#[tokio::test]
 async fn a_failed_unregister_starts_the_account_again() {
     let s = setup(3, |i, mut peer| async move {
         match i {

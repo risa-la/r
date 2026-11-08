@@ -490,9 +490,10 @@ impl Store {
         Ok(())
     }
 
-    /// Whether an UNREGISTER of the account was sent and its answer lost
-    /// (4.8): `Some(hosted)`, saying whether the server hosted the
-    /// identity, or `None`.
+    /// Whether an UNREGISTER of the account may have gone through with no
+    /// answer seen (4.8): it was sent, or was about to be, and its answer
+    /// was lost or never waited for. `Some(hosted)`, saying whether the
+    /// server hosted the identity, or `None`.
     pub fn unregister_lost(&self, account: AccountId) -> Result<Option<bool>, StoreError> {
         self.read(|conn| {
             Ok(conn

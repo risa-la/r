@@ -41,6 +41,7 @@ use super::{Client, blocking, parse_server};
 use crate::addr::{ServerAddr, TrustStore};
 use crate::conn::keys::{self, KeyStore, KeyStoreError};
 use crate::conn::{self, CommandError, Session, SessionOptions};
+use crate::store::StoreError;
 
 /// How long QUIT may take after a one-off session.
 const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -590,6 +591,10 @@ impl Account {
     /// [`RefusedKind::UnregisterPending`] until it is settled. Call
     /// `unregister` again to find out and finish: if the server then
     /// refuses to sign in to an identity it hosted, it was deleted.
+    ///
+    /// The cache records this before UNREGISTER is sent, so the same holds
+    /// if this future is dropped, for example by a timeout, or the process
+    /// ends, before the answer.
     pub async fn unregister(&self, uid: &str, purge: bool) -> Result<Unregistered, ClientError> {
         let identity = self.identity()?;
         let typed: Option<Uid> = uid.trim().parse().ok();
@@ -621,14 +626,28 @@ impl Account {
             .expect("poisoned");
         let was_running = ran_before.unwrap_or_else(|| self.is_running());
         self.disconnect().await;
+        // Kept until it is settled, even if this future is dropped.
+        *self
+            .shared()
+            .ran_before_unregister
+            .lock()
+            .expect("poisoned") = Some(was_running);
 
         let addr = self.shared().server.clone();
         let trust: Arc<dyn TrustStore> = Arc::new(self.shared().store.clone());
         let options = self.shared().options.session.clone();
+        // Records, before UNREGISTER goes, that its answer may be lost, so
+        // that nothing signs in again whatever happens next (4.8).
+        let mark: Mark = {
+            let (store, id) = (self.shared().store.clone(), self.id());
+            Box::new(move |hosted| {
+                store.set_unregister_lost(id, Some(hosted || lost_before == Some(true)))
+            })
+        };
         let outcome = {
             let identity = identity.clone();
             on_runtime(&client, async move {
-                Ok(unregister_on(&addr, trust, options, &identity, &key, purge).await)
+                Ok(unregister_on(&addr, trust, options, &identity, &key, purge, mark).await)
             })
             .await?
         };
@@ -659,18 +678,8 @@ impl Account {
                 }
                 return Err(e);
             }
-            Unregistering::Lost { hosted, error } => {
-                let hosted = hosted || lost_before == Some(true);
-                let (store, id) = (self.shared().store.clone(), self.id());
-                blocking(&self.shared().rt, move || {
-                    store.set_unregister_lost(id, Some(hosted))
-                })
-                .await?;
-                *self
-                    .shared()
-                    .ran_before_unregister
-                    .lock()
-                    .expect("poisoned") = Some(was_running);
+            // Recorded before UNREGISTER was sent.
+            Unregistering::Lost { error } => {
                 return Err(ClientError::Unconfirmed {
                     uid: identity.to_string(),
                     message: format!(
@@ -713,11 +722,15 @@ enum Unregistering {
     /// The server refused UNREGISTER: nothing was deleted.
     Refused(ClientError),
     /// UNREGISTER was sent, and its answer lost.
-    Lost { hosted: bool, error: ClientError },
+    Lost { error: ClientError },
 }
 
+/// Records in the cache that an UNREGISTER may have gone through, given
+/// whether the server hosts the identity.
+type Mark = Box<dyn FnOnce(bool) -> Result<(), StoreError> + Send>;
+
 /// Signs in on a connection of its own, asks KEY LIST whether the server
-/// hosts the identity (4.7), and sends UNREGISTER (4.8).
+/// hosts the identity (4.7), calls `mark`, and sends UNREGISTER (4.8).
 async fn unregister_on(
     addr: &ServerAddr,
     trust: Arc<dyn TrustStore>,
@@ -725,6 +738,7 @@ async fn unregister_on(
     identity: &Identity,
     key: &SecretKey,
     purge: bool,
+    mark: Mark,
 ) -> Unregistering {
     let server = addr.to_string();
     let session = match signed_in_session(addr, trust, options, identity, key).await {
@@ -744,6 +758,11 @@ async fn unregister_on(
             return Unregistering::NotSent(e);
         }
     };
+    let rt = tokio::runtime::Handle::current();
+    if let Err(e) = blocking(&rt, move || mark(hosted)).await {
+        quit(&session).await;
+        return Unregistering::NotSent(e.into());
+    }
     let command = Command::Unregister {
         uid: identity.to_uid(),
         purge,
@@ -753,7 +772,6 @@ async fn unregister_on(
             Ok(_) => Unregistering::Done { hosted },
             Err(CommandError::Server(err)) => Unregistering::Refused(refused(&err, &command)),
             Err(e) => Unregistering::Lost {
-                hosted,
                 error: ClientError::from_conn(&server, &e.into()),
             },
         },
@@ -761,7 +779,6 @@ async fn unregister_on(
             Unregistering::NotSent(ClientError::from_conn(&server, &e))
         }
         Err(e) => Unregistering::Lost {
-            hosted,
             error: ClientError::from_conn(&server, &e),
         },
     };
