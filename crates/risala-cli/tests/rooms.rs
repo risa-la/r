@@ -142,7 +142,19 @@ async fn an_operator_reviews_moderates_and_administers() {
     let rooms = ok(state, &["admin", "rooms", &addr]).await;
     assert!(rooms.contains("#general (1 member): be nice"), "{rooms}");
     ok(state, &["admin", "set", &addr, "welcome", "hello", "again"]).await;
-    let out = ok(state, &["admin", "drop", &addr, "#general", "closing"]).await;
+    // The room is typed twice, as a uid to unregister is.
+    let (_, err) = run(
+        state,
+        &["admin", "drop", &addr, "#general", "#genera", "closing"],
+        2,
+    )
+    .await;
+    assert!(err.contains("type the room twice"), "{err}");
+    let out = ok(
+        state,
+        &["admin", "drop", &addr, "#general", "#general", "closing"],
+    )
+    .await;
     assert!(out.contains("dropped #general"), "{out}");
     server.stop().await;
 }

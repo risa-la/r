@@ -44,10 +44,13 @@ pub(crate) enum AdminCommand {
     },
     /// List every room, private ones too (10.4).
     Rooms { server: String },
-    /// Delete a room and all its events, for good (10.4).
+    /// Delete a room and all its events, for good (10.4). Type the room
+    /// twice to confirm.
     Drop {
         server: String,
         room: String,
+        /// The room again.
+        confirm: String,
         /// Why; the words are joined with spaces.
         reason: Vec<String>,
     },
@@ -123,6 +126,17 @@ pub(crate) async fn run(ctx: &Ctx, command: AdminCommand) -> Res {
         | A::Unregister { server, .. }
         | A::Set { server, .. } => server.clone(),
     };
+    // The commands that cannot be undone are typed twice, and checked
+    // before connecting.
+    match &command {
+        A::Drop { room, confirm, .. } if room.trim() != confirm.trim() => {
+            return fail_with(super::USAGE, "type the room twice to confirm");
+        }
+        A::Unregister { uid, confirm, .. } if uid.trim() != confirm.trim() => {
+            return fail_with(super::USAGE, "type the uid twice to confirm");
+        }
+        _ => {}
+    }
     let admin = online(ctx, &server).await?.admin();
     match command {
         A::Ops { .. } => {
@@ -213,10 +227,7 @@ pub(crate) async fn run(ctx: &Ctx, command: AdminCommand) -> Res {
             within(admin.remove_key(&uid, &key.join(" "))).await?;
             println!("key removed from {}", uid.trim());
         }
-        A::Unregister { uid, confirm, .. } => {
-            if uid.trim() != confirm.trim() {
-                return fail_with(super::USAGE, "type the uid twice to confirm");
-            }
+        A::Unregister { uid, .. } => {
             within(admin.unregister(&uid)).await?;
             println!("unregistered {}", uid.trim());
         }
