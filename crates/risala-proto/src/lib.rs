@@ -20,6 +20,8 @@
 //!   12.13).
 //! - [`connection`]: kinds of connection, and their line limits (4.1, 13).
 //! - [`command`]: typed commands, client to server (4-12, 13).
+//! - [`server`]: typed server lines, server to client (4-12, 13), and the
+//!   NOTIFY push body (9.3).
 //! - [`auth`]: the sign-in challenge and ML-DSA-44 keys (4.6, App. B).
 //! - [`keyfile`]: key files (4.4).
 //! - [`fingerprint`]: certificate fingerprints for trust on first use (2.2).
@@ -39,6 +41,7 @@ mod m5a;
 pub mod mls;
 pub mod names;
 mod parse;
+pub mod server;
 pub mod text;
 pub mod time;
 pub mod types;
