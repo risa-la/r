@@ -944,6 +944,9 @@ Open:
       MUST NOT upload KeyPackages with it, so it never joins a group.
       Servers and devices ignore the label, which stays a hint for apps,
       as labels are for people (4.4).
+      Apps may show a `recovery` key as the recovery key rather than as
+      a device only while no group has a leaf with it (12.12), so that
+      whoever controls a key file cannot hide a new device by its label.
     - **Built in M5a.** The spec text for the recovery key restoring the
       identity is written now, and librisala and the CLI build it, so
       M5a's recovery test starts from losing every device.
