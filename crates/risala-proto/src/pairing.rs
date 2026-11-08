@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 
 use crate::auth::{SIGNATURE_LEN, SecretKey, SignLabel};
 use crate::codec::{Reader, Writer};
+use crate::names::ServerAddr;
 use crate::record::{DeviceKeys, RecordError, XWingPublicKey, sha384};
 
 /// The `version` of the pairing structures (4.8).
@@ -37,33 +38,13 @@ pub const XWING_ENC_LEN: usize = 1120;
 /// The start of a pairing QR code's text (4.8, 15).
 pub const PAIR_QR_PREFIX: &str = "RISALA-PAIR:";
 
-/// The longest host name a PairingCode may carry.
-pub const MAX_HOST_LEN: usize = 253;
-
-/// Whether `host` is a server's host name as a PairingCode carries it: a
-/// DNS name in lower case, without a port.
-///
-/// 4.8 says only "the server used for pairing, lower case". A server on
-/// another port than 7472 cannot be named this way; a choice to confirm.
-pub fn is_pairing_host(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= MAX_HOST_LEN
-        && host.split('.').all(|label| {
-            (1..=63).contains(&label.len())
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-        })
-}
-
 /// What a new device's QR code carries (4.8). The secret never reaches
 /// the server; `Debug` leaves it out.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingCode {
-    /// The server used for pairing, in lower case.
-    pub host: String,
+    /// The server used for pairing, as a server address in its one
+    /// written form (2.1, 3.5), which may carry a port.
+    pub host: ServerAddr,
     /// The one-time pairing secret.
     pub secret: Zeroizing<[u8; PAIRING_SECRET_LEN]>,
     /// SHA-384 of the encoded NewDevice ([`NewDevice::keys_hash`]).
@@ -75,7 +56,7 @@ impl PairingCode {
     pub fn encode(&self) -> Zeroizing<Vec<u8>> {
         let mut w = Writer::new();
         w.u8(PAIRING_VERSION)
-            .vector(self.host.as_bytes())
+            .vector(self.host.to_string().as_bytes())
             .fixed(&self.secret[..])
             .fixed(&self.keys_hash);
         Zeroizing::new(w.finish())
@@ -90,9 +71,8 @@ impl PairingCode {
         }
         let host = std::str::from_utf8(r.vector()?)
             .ok()
-            .filter(|h| is_pairing_host(h))
-            .ok_or(RecordError::Malformed("a host name in lower case"))?
-            .to_owned();
+            .and_then(|h| h.parse::<ServerAddr>().ok())
+            .ok_or(RecordError::Malformed("a server address in its one form"))?;
         let secret = Zeroizing::new(*r.fixed::<PAIRING_SECRET_LEN>()?);
         let keys_hash = *r.fixed::<KEYS_HASH_LEN>()?;
         r.end()?;

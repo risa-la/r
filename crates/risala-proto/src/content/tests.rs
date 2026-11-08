@@ -2,6 +2,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::*;
+use crate::names::Domain;
 
 fn b64(n: usize, byte: u8) -> String {
     BASE64.encode(vec![byte; n])
@@ -79,12 +80,14 @@ fn every_verb_round_trips() {
         format!("ALERT {}", hash('b')),
         "RECORDS".to_owned(),
         format!("RECORDS {} {}", hash('c'), hash('d')),
+        "RECORDS -".to_owned(),
         format!("SIGNINGKEY {}", b64(SEED_LEN, 16)),
         format!("BACKUPKEY 2 {}", b64(BACKUP_KEY_LEN, 17)),
         format!("WANT {BOX} 0 -"),
         format!("WANT {BOX} 9120 9200"),
         format!("TRANSFER {}", b64(TRANSFER_REF_LEN, 18)),
         "SERVERS chat.example.org other.example.net".to_owned(),
+        "SERVERS chat.example.org:7000 localhost:7473".to_owned(),
         format!(
             "PIN bob@example.net {} chat.example.net/risala-log/1 {} yes",
             hash('e'),
@@ -463,6 +466,15 @@ fn value_rules() {
         format!("WANT {BOX} 5 5"),
         format!("WANT {BOX} 5 0"),
         "SERVERS 127.0.0.1".to_owned(),
+        // One written form (2.1): lower case, no port 7472, no repeats
+        // (12.9).
+        "SERVERS Chat.example.org".to_owned(),
+        "SERVERS chat.example.org:7472".to_owned(),
+        "SERVERS chat.example.org chat.example.org".to_owned(),
+        "SERVERS [2001:db8::1]:7000".to_owned(),
+        // `-` stands alone (12.9).
+        format!("RECORDS - {}", hash('c')),
+        format!("RECORDS {} -", hash('c')),
         format!(
             "PIN ~sam {} chat.example.net/risala-log/1 {} yes",
             hash('e'),
@@ -526,8 +538,9 @@ fn log_origins() {
 fn names_fold() {
     let parsed = ContentLine::parse(&format!("RECORDS {}", hash('A'))).unwrap();
     assert_eq!(parsed.to_line().unwrap(), format!("RECORDS {}", hash('a')));
-    let parsed = ContentLine::parse("SERVERS Chat.Example.org").unwrap();
-    assert_eq!(parsed.to_line().unwrap(), "SERVERS chat.example.org");
+    // Server addresses are compared byte for byte, so they do not fold
+    // (2.1).
+    assert!(ContentLine::parse("SERVERS Chat.Example.org").is_err());
 }
 
 #[test]

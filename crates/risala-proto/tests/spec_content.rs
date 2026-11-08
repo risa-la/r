@@ -101,24 +101,21 @@ fn instantiate(syntax: &str) -> String {
         ("<pseudonym>", b64(16)),
         ("<seed>", b64(SEED_LEN)),
         ("<target>", "*@example.net".into()),
-        ("<hashes>", format!("{hash} {hash}")),
+        ("<hashes...>", format!("{hash} {hash}")),
         ("<hash>", hash.clone()),
         ("<generation>", "2".into()),
         ("<key>", b64(BACKUP_KEY_LEN)),
         ("<after>", "100".into()),
         ("<before>", "200".into()),
         ("<ref>", b64(TRANSFER_REF_LEN)),
-        ("<hosts>", "chat.example.org other.example.net".into()),
+        ("<hosts...>", "chat.example.org other.example.net:7000".into()),
         ("<uid>", "bob@example.net".into()),
         ("<master>", hash.clone()),
         ("<origin>", "chat.example.net/risala-log/1".into()),
         ("<head>", hash),
         ("<verified>", "yes".into()),
     ];
-    // REPORT's `box` and `target` tags are required (5.8), though the
-    // table writes its tags as optional.
     let mut line = syntax
-        .replace("[@<tags>] REPORT", "@box=<box>;target=<id> REPORT")
         .replace("[@<tags>] ", "")
         .replace(['[', ']'], "");
     for (placeholder, value) in &values {
@@ -179,8 +176,7 @@ fn syntax_lines_match_the_table() {
         }
         let in_table = table.contains(&line)
             || table.iter().any(|t| {
-                // The table writes optional tags as `[@<tags>]`, and 5.8
-                // spells REPORT's tags out.
+                // The table writes optional tags as `[@<tags>]`.
                 t.strip_prefix("[@<tags>] ")
                     .is_some_and(|rest| line.ends_with(rest) && line.starts_with('@'))
             });

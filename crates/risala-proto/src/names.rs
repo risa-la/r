@@ -590,24 +590,151 @@ impl FromStr for BlobRef {
 
 // ---------------------------------------------------------------------------
 
-/// A `risala://` link (15): `risala://<host>[:<port>][/<room>[?g=<group-id>]]`.
+/// The port a server listens on when none is written (2.1).
+pub const DEFAULT_PORT: u16 = 7472;
+
+/// `host = label *( "." label )` (3.5): like a domain, but a single label
+/// such as `localhost` is allowed. At most 253 characters, and the last
+/// label is not all digits, so an IP address is never a host.
+fn host_shape(s: &[u8]) -> Shape {
+    let mut fits = s.len() <= MAX_DOMAIN_LEN;
+    let mut last: &[u8] = &[];
+    for label in s.split(|&b| b == b'.') {
+        fits &= label_shape(label)?;
+        last = label;
+    }
+    if last.iter().all(u8::is_ascii_digit) {
+        return Err("a host's last label must not be all digits");
+    }
+    Ok(fits)
+}
+
+/// A `server` (2.1, 3.5): a server address in its one written form,
+/// `host [":" port]`. The host is in lower case, without a trailing `.`,
+/// and never an IP address; the port is written only when it is not
+/// [`DEFAULT_PORT`], without leading zeros.
 ///
-/// `<room>` is a public room without its `#`, and `<group-id>` the room's
+/// 2.1 says receivers compare server addresses byte for byte and treat
+/// one not in this form as malformed, so parsing does not fold case:
+/// `Chat.example.org`, `chat.example.org:7472` and `chat.example.org:07000`
+/// are all `BadSyntax`. Links (15) fold case before they read a server;
+/// [`Link`] does that itself.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServerAddr {
+    host: Arc<str>,
+    port: u16,
+}
+
+impl ServerAddr {
+    /// A server address from a host and a port, in the one written form.
+    /// The host is folded to lower case and may end with one `.`, which is
+    /// dropped (2.1). `BadSyntax` for an IP address, an invalid host or
+    /// port 0.
+    pub fn new(host: &str, port: u16) -> Result<ServerAddr, ParseError> {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        let host = fold(host)?;
+        finish(host_shape(host.as_bytes()))?;
+        if port == 0 {
+            return Err(ParseError::BadSyntax("a port is 1 to 65535"));
+        }
+        Ok(ServerAddr {
+            host: Arc::from(host),
+            port,
+        })
+    }
+
+    /// The host, in lower case.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port, [`DEFAULT_PORT`] when none is written.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl From<Domain> for ServerAddr {
+    /// A domain on the default port.
+    fn from(domain: Domain) -> ServerAddr {
+        ServerAddr {
+            host: domain.0,
+            port: DEFAULT_PORT,
+        }
+    }
+}
+
+impl fmt::Display for ServerAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.host)?;
+        if self.port != DEFAULT_PORT {
+            write!(f, ":{}", self.port)?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for ServerAddr {
+    type Err = ParseError;
+
+    /// `server = host [ ":" port ]`, `port = %x31-39 *4DIGIT`, 1 to 65535
+    /// and never 7472 (3.5). Upper case is `BadSyntax` (2.1).
+    fn from_str(s: &str) -> Result<ServerAddr, ParseError> {
+        const PORT: ParseError =
+            ParseError::BadSyntax("a server's port is 1 to 65535, never 7472, without leading zeros");
+        let (host, port) = match s.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (s, None),
+        };
+        if !host.is_ascii() {
+            return Err(ParseError::BadSyntax("names must be ASCII"));
+        }
+        if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(ParseError::BadSyntax("a server is written in lower case"));
+        }
+        finish(host_shape(host.as_bytes()))?;
+        let port = match port {
+            None => DEFAULT_PORT,
+            Some(p) => {
+                let b = p.as_bytes();
+                if b.is_empty()
+                    || b.len() > 5
+                    || b[0] == b'0'
+                    || !b.iter().all(u8::is_ascii_digit)
+                {
+                    return Err(PORT);
+                }
+                match p.parse::<u16>() {
+                    Ok(n) if n != DEFAULT_PORT => n,
+                    _ => return Err(PORT),
+                }
+            }
+        };
+        Ok(ServerAddr {
+            host: Arc::from(host),
+            port,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+/// A `risala://` link (15): `risala://<server>[/<room>[?g=<group-id>]]`.
+///
+/// `<server>` is a server address in its one written form (2.1, 3.5),
+/// `<room>` a public room without its `#`, and `<group-id>` the room's
 /// 32-byte group id in lower-case base32 without padding, 52 characters.
 /// A device that follows a link with a group id joins only the group with
 /// that id (6.1).
 ///
-/// Parsing folds the scheme, host and group id to lower case (2.1, 3.5),
-/// and the room as every room is folded. Anything else, such as a `/`
-/// after the host with no room, a query other than one `g`, or a
-/// fragment, is `BadSyntax`: the spec defines no other form, and a link
-/// that says more than this one cannot be followed as it was meant.
+/// Parsing folds ASCII upper case to lower case first, then reads the
+/// link by 15's grammar. Anything else, such as a `/` at the end, a query
+/// other than one `g`, a fragment, user information, an IP address,
+/// `:7472` or an empty part, is `BadSyntax`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Link {
-    /// The server's host, in lower case.
-    pub host: crate::server::Host,
-    /// The server's port, if not the default 7472 (2.1).
-    pub port: Option<u16>,
+    /// The server.
+    pub server: ServerAddr,
     /// The public room the link points to.
     pub room: Option<Room>,
     /// The room's group id, which only a link with a room may carry.
@@ -624,8 +751,7 @@ impl Link {
 
 impl fmt::Display for Link {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(Link::SCHEME)?;
-        crate::server::response::write_authority(f, &self.host, self.port)?;
+        write!(f, "{}{}", Link::SCHEME, self.server)?;
         if let Some(room) = &self.room {
             write!(f, "/{}", room.bare())?;
             if let Some(group_id) = &self.group_id {
@@ -641,16 +767,14 @@ impl FromStr for Link {
 
     fn from_str(s: &str) -> Result<Link, ParseError> {
         const WHAT: ParseError =
-            ParseError::BadSyntax("a link is risala://<host>[:<port>][/<room>[?g=<group-id>]]");
-        let rest = match s.get(..Link::SCHEME.len()) {
-            Some(scheme) if scheme.eq_ignore_ascii_case(Link::SCHEME) => &s[Link::SCHEME.len()..],
-            _ => return Err(WHAT),
-        };
-        let (authority, path) = match rest.split_once('/') {
-            Some((authority, path)) => (authority, Some(path)),
+            ParseError::BadSyntax("a link is risala://<server>[/<room>[?g=<group-id>]]");
+        let s = fold(s)?;
+        let rest = s.strip_prefix(Link::SCHEME).ok_or(WHAT)?;
+        let (server, path) = match rest.split_once('/') {
+            Some((server, path)) => (server, Some(path)),
             None => (rest, None),
         };
-        let (host, port) = crate::server::response::parse_authority(authority).ok_or(WHAT)?;
+        let server: ServerAddr = server.parse().map_err(|_| WHAT)?;
         let (room, group_id) = match path {
             None => (None, None),
             Some(path) => {
@@ -672,8 +796,7 @@ impl FromStr for Link {
             }
         };
         Ok(Link {
-            host,
-            port,
+            server,
             room,
             group_id,
         })
@@ -1262,6 +1385,55 @@ mod tests {
     }
 
     #[test]
+    fn servers() {
+        // 2.1 and 3.5: one written form, compared byte for byte.
+        for s in [
+            "chat.example.org",
+            "chat.example.org:7000",
+            "localhost",
+            "localhost:1",
+            "a.b:65535",
+            "xn--mgbh0fb.example",
+        ] {
+            assert_eq!(ok::<ServerAddr>(s), s);
+        }
+        let server: ServerAddr = "chat.example.org".parse().unwrap();
+        assert_eq!((server.host(), server.port()), ("chat.example.org", 7472));
+        for s in [
+            "",
+            "Chat.example.org",
+            "chat.example.org.",
+            "chat.example.org:7472",
+            "chat.example.org:07000",
+            "chat.example.org:0",
+            "chat.example.org:65536",
+            "chat.example.org:",
+            "chat.example.org:x",
+            "chat.example.org:7000:1",
+            "192.0.2.1",
+            "192.0.2.1:7000",
+            "[2001:db8::1]",
+            "-chat.example.org",
+            "chat..example.org",
+            "chat example.org",
+        ] {
+            syntax::<ServerAddr>(s);
+        }
+        // `new` writes the one form: lower case, no `.` at the end, and
+        // no port when it is 7472.
+        let made = ServerAddr::new("Chat.Example.org.", 7472).unwrap();
+        assert_eq!(made.to_string(), "chat.example.org");
+        assert_eq!(
+            ServerAddr::new("chat.example.org", 7000).unwrap().to_string(),
+            "chat.example.org:7000"
+        );
+        assert!(ServerAddr::new("127.0.0.1", 7000).is_err());
+        assert!(ServerAddr::new("chat.example.org", 0).is_err());
+        let domain: Domain = "example.net".parse().unwrap();
+        assert_eq!(ServerAddr::from(domain).to_string(), "example.net");
+    }
+
+    #[test]
     fn links() {
         // 15's example, and the forms of the grammar.
         let gid = format!("{}q", "a".repeat(51));
@@ -1269,7 +1441,7 @@ mod tests {
             "risala://chat.example.org".to_owned(),
             "risala://chat.example.org/general".to_owned(),
             "risala://chat.example.org:7000/general".to_owned(),
-            "risala://[2001:db8::1]:7000".to_owned(),
+            "risala://localhost:7000".to_owned(),
             format!("risala://chat.example.org/general?g={gid}"),
         ] {
             assert_eq!(ok::<Link>(&s), s);
@@ -1308,6 +1480,14 @@ mod tests {
             "risala://chat.example.org/general#x",
             "risala://chat.example.org?g=aaaa",
             "risala://chat.example.org:0/general",
+            "risala://chat.example.org:7472/general",
+            "risala://chat.example.org:07000/general",
+            "risala://chat.example.org:65536",
+            "risala://[2001:db8::1]:7000",
+            "risala://192.0.2.1",
+            "risala://chat.example.org.",
+            "risala://user@chat.example.org",
+            "risala:///general",
             "risala://chat.example.org/general?g=aaaa",
             &format!("risala://chat.example.org/general?g={}r", "a".repeat(51)),
             &format!("risala://chat.example.org/general?g={gid}&x=1"),

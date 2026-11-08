@@ -740,7 +740,7 @@ fn b9_pairing() {
     let new = NewDevice::sign_deterministic(content.clone(), &new_secret);
     ck.file("NewDevice", "newdevice.bin", new.encoded());
     let code = PairingCode {
-        host: "chat.example.org".into(),
+        host: "chat.example.org".parse().unwrap(),
         secret: Zeroizing::new(seed(0x0d)),
         keys_hash: new.keys_hash(),
     };

@@ -78,7 +78,7 @@ use crate::error::ParseError;
 use crate::frame::is_forbidden_control;
 use crate::line::{Line, LineBuilder, Params, Tags};
 use crate::mls::Pseudonym;
-use crate::names::{BlobRef, BlockTarget, BoxName, Domain, Identity, Seq};
+use crate::names::{BlobRef, BlockTarget, BoxName, Identity, Seq, ServerAddr};
 use crate::parse::{
     bad, last, limit, number, number_u32, opt_tok, parse_tag, required_tag, tag_value, text_max,
     tok,
@@ -333,9 +333,11 @@ pub enum ContentLine {
     /// `ALERT <hash>`: a record of the identity that no device announced,
     /// or a fork (4.5).
     Alert(BlobRef),
-    /// `RECORDS [<hashes>]`: without hashes, asks which records were
-    /// announced; with them, answers (4.5, 12.9).
-    Records(Vec<BlobRef>),
+    /// `RECORDS [<hashes...>]`: `None` (no hashes) asks which records
+    /// were announced; `Some` answers, with the hashes of the records the
+    /// device knows were announced, written `RECORDS -` when it knows of
+    /// none (4.5, 12.9).
+    Records(Option<Vec<BlobRef>>),
     /// `SIGNINGKEY <seed>`: the identity's new device-signing key (4.8).
     SigningKey(SigningSeed),
     /// `BACKUPKEY <generation> <key>`: the backup key of a generation
@@ -359,9 +361,9 @@ pub enum ContentLine {
     },
     /// `TRANSFER <ref>`: history for a WANT, as archives (12.13).
     Transfer(TransferRef),
-    /// `SERVERS <hosts>`: the servers the identity uses, its home first
+    /// `SERVERS <hosts...>`: the servers the identity uses, its home first
     /// (12.13).
-    Servers(Vec<Domain>),
+    Servers(Vec<ServerAddr>),
     /// `PIN <uid> <master> <origin> <head> <verified>`: another identity's
     /// pin and verified mark (4.5, 12.14).
     Pin(Pin),
@@ -616,7 +618,17 @@ impl ContentLine {
             "UNBLOCK" => ContentLine::Unblock(last(p)?),
             "RECORD" => ContentLine::Record(last(p)?),
             "ALERT" => ContentLine::Alert(last(p)?),
-            "RECORDS" => ContentLine::Records(rest(p)?),
+            "RECORDS" => {
+                let mut first = p;
+                match first.opt_token()? {
+                    None => ContentLine::Records(None),
+                    Some("-") => {
+                        first.end()?;
+                        ContentLine::Records(Some(Vec::new()))
+                    }
+                    Some(_) => ContentLine::Records(Some(rest(p)?)),
+                }
+            }
             "SIGNINGKEY" => ContentLine::SigningKey(last(p)?),
             "BACKUPKEY" => {
                 let mut p = p;
@@ -629,9 +641,12 @@ impl ContentLine {
             "WANT" => parse_want(p)?,
             "TRANSFER" => ContentLine::Transfer(last(p)?),
             "SERVERS" => {
-                let hosts = rest(p)?;
+                let hosts: Vec<ServerAddr> = rest(p)?;
                 if hosts.is_empty() {
-                    return Err(bad("SERVERS lists at least one host"));
+                    return Err(bad("SERVERS lists at least one server"));
+                }
+                if hosts.iter().enumerate().any(|(i, h)| hosts[..i].contains(h)) {
+                    return Err(bad("SERVERS lists each server once"));
                 }
                 ContentLine::Servers(hosts)
             }
@@ -771,7 +786,11 @@ impl ContentLine {
             ContentLine::Record(hash) | ContentLine::Alert(hash) => {
                 b.token(hash);
             }
-            ContentLine::Records(hashes) => {
+            ContentLine::Records(None) => {}
+            ContentLine::Records(Some(hashes)) if hashes.is_empty() => {
+                b.token("-");
+            }
+            ContentLine::Records(Some(hashes)) => {
                 for hash in hashes {
                     b.token(hash);
                 }

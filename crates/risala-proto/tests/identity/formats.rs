@@ -424,7 +424,7 @@ fn new_device() -> (NewDevice, PairingCode) {
     };
     let new = NewDevice::sign_deterministic(content, &key(5));
     let code = PairingCode {
-        host: "chat.example.org".into(),
+        host: "chat.example.org".parse().unwrap(),
         secret: Zeroizing::new([0x42; 32]),
         keys_hash: new.keys_hash(),
     };
@@ -456,12 +456,20 @@ fn pairing() {
         "the secret stays out of Debug"
     );
 
-    // A host in upper case, or with a port.
-    let mut bad = code.clone();
-    bad.host = "Chat.example.org".into();
-    assert!(PairingCode::decode(&bad.encode()).is_err());
-    bad.host = "chat.example.org:7472".into();
-    assert!(PairingCode::decode(&bad.encode()).is_err());
+    // A host with a port other than 7472 (2.1, 4.8).
+    let mut ported = code.clone();
+    ported.host = "chat.example.org:7000".parse().unwrap();
+    assert_eq!(PairingCode::decode(&ported.encode()).unwrap(), ported);
+    // A host not in the one written form of a server (2.1): upper case,
+    // the default port written out, an IP address.
+    for host in ["Chat.example.org", "chat.example.org:7472", "192.0.2.1", ""] {
+        let mut w = Writer::new();
+        w.u8(1)
+            .vector(host.as_bytes())
+            .fixed(&code.secret[..])
+            .fixed(&code.keys_hash);
+        assert!(PairingCode::decode(&w.finish()).is_err(), "{host}");
+    }
     let mut v2 = code.encode().to_vec();
     v2[0] = 2;
     assert_eq!(

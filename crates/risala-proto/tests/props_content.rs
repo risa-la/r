@@ -182,6 +182,7 @@ fn content_line() -> impl Strategy<Value = String> {
         1 => block_target().prop_map(|t| format!("UNBLOCK {t}")),
         1 => blob_ref().prop_map(|h| format!("RECORD {h}")),
         1 => blob_ref().prop_map(|h| format!("ALERT {h}")),
+        1 => Just("RECORDS -".to_owned()),
         1 => vec(blob_ref(), 0..4).prop_map(|h| {
             let mut line = "RECORDS".to_owned();
             for h in h {
@@ -194,7 +195,8 @@ fn content_line() -> impl Strategy<Value = String> {
         1 => (any::<u32>(), fixed(32)).prop_map(|(g, k)| format!("BACKUPKEY {g} {k}")),
         1 => want_line(),
         1 => fixed(81).prop_map(|r| format!("TRANSFER {r}")),
-        1 => vec(domain(), 1..4).prop_map(|h| format!("SERVERS {}", h.join(" "))),
+        1 => proptest::collection::btree_set(domain(), 1..4)
+            .prop_map(|h| format!("SERVERS {}", h.into_iter().collect::<Vec<_>>().join(" "))),
         1 => pin_line(),
     ]
 }
