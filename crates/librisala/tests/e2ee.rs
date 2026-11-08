@@ -631,3 +631,28 @@ async fn a_confirmed_device_backs_up_with_the_recovery_key() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refreshing_shows_what_the_key_file_lists_now() {
+    let server = hosted_server(&[], |_| {}).await;
+    let alice = registered(&server, "alice").await;
+    within("a recovery key", alice.create_recovery_key())
+        .await
+        .unwrap();
+    // The recovery key's own key is in the key file, labelled; with no
+    // leaf, it shows as the recovery key, not as a device (12.12).
+    assert!(
+        within("refreshing", alice.refresh_devices("alice@chat.test"))
+            .await
+            .unwrap()
+    );
+    let devices = alice.devices("alice@chat.test").unwrap();
+    assert_eq!(devices.len(), 2, "{devices:?}");
+    assert!(devices.iter().any(|d| d.this_device && !d.recovery));
+    assert!(
+        devices
+            .iter()
+            .any(|d| d.recovery && d.label == "recovery" && d.listed == Some(true)),
+        "{devices:?}"
+    );
+}

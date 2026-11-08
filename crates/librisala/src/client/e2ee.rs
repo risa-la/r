@@ -354,6 +354,32 @@ impl Account {
             .collect())
     }
 
+    /// Fetches `uid`'s key file now (4.4, 12.12), so that
+    /// [`devices`](Self::devices) shows what it lists, as when a key was
+    /// just added or removed. The device acts on it as on its own fetches:
+    /// leaves of keys it no longer lists are removed (12.6). Returns
+    /// whether it could be fetched; a failed fetch changes nothing. Needs
+    /// a connection.
+    pub async fn refresh_devices(&self, uid: &str) -> Result<bool, ClientError> {
+        let uid: Uid = uid
+            .trim()
+            .parse()
+            .map_err(|_| ClientError::Invalid(format!("uid {uid:?}")))?;
+        let identity = uid
+            .to_identity()
+            .ok_or_else(|| ClientError::Invalid(format!("{uid} is a guest")))?;
+        let files: Arc<dyn KeyFiles> = self
+            .shared()
+            .options
+            .key_files
+            .clone()
+            .unwrap_or_else(|| Arc::new(HttpsKeyFiles::new()));
+        let keys = files.fetch(identity).await;
+        let fetched = keys.is_some();
+        self.e2ee(E2eeOp::KeyFile(uid, keys)).await?;
+        Ok(fetched)
+    }
+
     /// Says whether the new device with key fingerprint `fingerprint` is
     /// the user's (12.9). A confirmed device gets every history key this
     /// device holds, so that it reads the whole history, and the recovery

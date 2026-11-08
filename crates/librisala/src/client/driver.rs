@@ -1235,6 +1235,7 @@ fn step(engine: &mut SyncEngine, input: Input) -> Result<(Output, Option<OutboxI
             E2eeOp::ConfirmDevice { key, confirmed } => engine.confirm_device(&key, confirmed)?,
             E2eeOp::SetRecovery(key) => engine.set_recovery_key(key)?,
             E2eeOp::ShareRecovery(key) => engine.share_recovery_key(&key)?,
+            E2eeOp::KeyFile(uid, keys) => engine.key_file(&uid, keys)?,
         },
     };
     Ok((out, None))
