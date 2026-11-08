@@ -91,6 +91,9 @@ in decimal, without a sign or leading zeros:
 number     = "0" / %x31-39 *18DIGIT             ; 0 to 2^63-1
 ```
 
+The grammar admits 19-digit values up to 10^19-1, but a number, seq or
+epoch above 2^63-1 (9223372036854775807) gets `ERR bad-syntax`.
+
 A server MUST reply `ERR bad-syntax` to a command that has too few or
 too many tokens, or that has an option the server does not know.
 
@@ -130,11 +133,14 @@ room       = "#" alnum [ *62( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]
 box        = 25( %x61-7A / %x32-37 )
              ( "a" / "e" / "i" / "m" / "q" / "u" / "y" / "4" )
                                                 ; 16 bytes, base32: a-z 2-7
-seq        = %x31-39 *18DIGIT                   ; 1 to 2^63-1
+seq        = %x31-39 *18DIGIT                   ; 1 to 2^63-1 (3.3)
 position   = "0" / seq                          ; FETCH after, FOLLOW head,
                                                 ; GROUPINFO's seq
 id         = 1*64( alnum / "-" / "_" )          ; report or Welcome id
 blob-ref   = "sha384:" 96( DIGIT / %x61-66 )    ; a blob's hash, lower-case hex
+host       = label *( "." label )               ; a hostname, lower case
+server     = host [ ":" port ]                  ; a server address (2.1)
+port       = %x31-39 *4DIGIT                    ; 1 to 65535, never 7472
 timestamp  = full-date "T" time-hour ":" time-minute ":"
              time-second "." 3DIGIT "Z"         ; RFC 3339, UTC
 ```
@@ -155,6 +161,11 @@ timestamp  = full-date "T" time-hour ":" time-minute ":"
 - A **position** in a mailbox is a seq, or `0` for the place before the
   first post (7.1).
 - A **blob-ref** names a blob, by the SHA-384 hash of its bytes (12.12).
+- A **server** is a server address in its one written form (2.1): a
+  host of at most 253 characters, whose last label is not all digits, so
+  that it is never an IP address, and a port only when it is not the
+  default 7472. Unlike a domain, a host may have a single label, such as
+  `localhost`, for testing.
 - Names and rooms never end with `.`, so a full stop after one in a
   sentence is never part of it.
 - A domain is at most 253 characters long, and its last label MUST NOT
@@ -166,8 +177,11 @@ timestamp  = full-date "T" time-hour ":" time-minute ":"
 
 ### 3.6. Responses
 
-Every command gets exactly one final response: `OK` or `ERR`. The one
-exception is PONG, which gets no response.
+Every command gets exactly one final response: `OK` or `ERR`. The
+exceptions are PONG, which gets no response, and the commands a server
+has not answered when it closes the connection, with BYE or otherwise
+(Section 11), for example after a guest's session is resumed on another
+connection (4.2).
 
 ```
 OK [<key>=<value> ...]
@@ -223,7 +237,7 @@ S: @ref=7 OK more=1
 | `too-long` | The line or one of its parameters is too long, or a file, blob or KeyPackage is too large |
 | `not-authenticated` | The connection is new: the command needs ANON, GUEST, AUTH or REGISTER first (4.1) |
 | `wrong-connection` | The command needs another kind of connection than this one, for example a signed-in one, or an anonymous one (4.1, 13) |
-| `already-authenticated` | This connection is already anonymous, a guest or signed in |
+| `already-authenticated` | ANON, GUEST, AUTH or REGISTER on a connection that is already anonymous, a guest or signed in (13) |
 | `auth-failed` | The signature did not verify against the identity's keys, or the connection's SNI does not name this server (4.6) |
 | `name-taken` | The guest name, identity name, room name or mailbox is already in use |
 | `not-found` | The room, mailbox, user, post or blob does not exist, or is not visible to you |

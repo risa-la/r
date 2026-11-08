@@ -266,6 +266,11 @@ three steps:
    the file's key, type, size and hash (12.11). The text is a caption,
    or the file name if there is no caption.
 
+```
+C: upload ujzdegxdncf32epf3dhodzdoci 3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE= 52311
+S: OK put=https://files.example.org/put/pqk3vdz7m2xwa5hc4ntf6ry2je get=https://files.example.org/f/h7qwn3zc5ka2vmd4xpe6tyr5bu del=https://files.example.org/del/c2mz7wqa4hv5kt3dpr6nx2yfge
+```
+
 Rules:
 
 - **The `put` URL** works for one upload within 10 minutes. The server
@@ -295,8 +300,14 @@ Blocks belong to the account, and the server never sees them. A client
 keeps the list of identities and domains (`*@example.net`, which also
 covers subdomains) that the user has blocked, and shares it with the
 identity's other devices with BLOCK and UNBLOCK lines in the
-conversation with itself (12.9). While the user has blocked someone,
-their devices:
+conversation with itself (12.9). In those lines, `<target>` is a uid
+(3.5) or `*@` followed by a domain:
+
+```abnf
+block-target = uid / "*@" domain
+```
+
+While the user has blocked someone, their devices:
 
 - ignore Welcomes (12.8) that add them to a direct conversation with
   the blocked person, or to a room in which the blocked person already
@@ -366,7 +377,16 @@ REPORT <box> <report>
 
 → `OK id=<id>`
 
-`<report>` is a RisalaReport, in base64 with padding:
+```
+C: report ujzdegxdncf32epf3dhodzdoci AQAAAAAAACPx…
+S: OK id=r7k2qm
+```
+
+`<report>` is a RisalaReport, in base64 with padding, or a blob-ref
+(3.5) naming a blob that holds its bytes without base64 (12.12), for a
+report too large for a line. The server keeps such a blob for as long
+as it keeps the report, and sends operators the report line with the
+same blob-ref.
 
 ```
 struct {
@@ -396,9 +416,9 @@ The server checks that:
 
 Otherwise it replies `ERR invalid`. So the content can only be
 what was posted. The seqs show how many posts lie between the messages,
-which the reporter does not choose. REPORT works on any kind of
-connection: a reporter who is signed in tells the operators who they
-are.
+which the reporter does not choose. REPORT works on anonymous, guest and
+signed-in connections (Section 13): a reporter who is signed in tells
+the operators who they are.
 
 When a report is made, the server keeps copies of the posts it names
 until the report is resolved, even if they expire in the meantime. If

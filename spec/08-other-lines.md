@@ -76,7 +76,8 @@ MEMBERS <room>
   `USER <uid> <presence>` line for each, then `OK`. `<uids>` is one or
   more uids, separated by commas with no spaces. Without `<uids>`, it
   clears the list. A server MAY limit the list, but MUST allow at least
-  1,000 uids.
+  1,000 uids. WATCH may be a long line (2.3), since 1,000 uids do not
+  fit in 8192 bytes.
 - **`WHOIS`** replies `USER <uid> <presence>`, then `OK`, or
   `ERR not-found` for an identity the server does not know.
 - **`MEMBERS`** replies with one `MEMBER <room> <uid> <role> <presence>`
@@ -109,10 +110,17 @@ S: PRESENCE offline carol@example.com
 - Guests have no presence. A guest is a member of a room for as long as
   it has a leaf there (6.1).
 
-WATCH, WHOIS and MEMBERS work on any kind of connection. A client SHOULD
-send WATCH on an anonymous connection that it uses for nothing else
-(4.1), since the list says whom the user talks to. Section 14 says what
-presence still reveals.
+WATCH, WHOIS and MEMBERS work on anonymous, guest and signed-in
+connections (Section 13). A client SHOULD send WATCH on an anonymous
+connection that it uses for nothing else (4.1), since the list says
+whom the user talks to. Section 14 says what presence still reveals.
+
+```
+C: watch alice@example.org,bob@example.net
+S: USER alice@example.org online
+S: USER bob@example.net offline
+S: OK
+```
 
 ### 8.4. Notices
 
@@ -140,13 +148,20 @@ INFO is allowed before signing in. It returns these values:
 | `anon=yes` or `anon=no` | Whether anonymous connections are allowed (4.2). A server that allows none cannot carry conversations |
 | `guests=yes` or `guests=no` | Whether guests are allowed |
 | `register=<domain>` or `register=no` | The identity domain for REGISTER, or `no` if the server offers no registration or it is closed right now |
-| `log=<url>` or `log=no` | The URL prefix of the server's current key log (4.5), or `no` if it keeps none |
+| `log=<url>` or `log=no` | The URL prefix of the server's current key log, `https://` followed by its origin (4.5), or `no` if it keeps none |
 | `log-key=<vkey>` | The signed-note verifier key of that log (4.4), present only with `log=<url>` |
 | `retention=<days>` | How long posts, files and blobs are kept (7.5) |
 | `quota=<bytes>` | The most a mailbox may hold at once, counting its posts, files and blobs (7.5) |
 | `push=yes` or `push=no` | Whether PUSH is supported |
 | `upload=<bytes>` or `upload=no` | The largest file UPLOAD accepts, or `no` if the server offers no uploads (5.6) |
 | `blobs=<url>` | The URL prefix that blobs are fetched from (12.12) |
-| `files=<origins>` | The origins of the server's `get` URLs (5.6), as `https://<host>[:<port>]`, separated by commas. Present only with uploads |
+| `files=<origins>` | The origins of the server's `get` URLs (5.6), separated by commas. Present only with uploads |
+
+Each origin in `files` is `https://`, the host in lower case, and `:`
+and the port only if the port is not 443. A host is a host (3.5), an
+IPv4 address, or an IPv6 address in brackets, as in a URL. A
+device finds the origin of a `get` URL the same way, so that
+`https://files.example.org:443/x` has the origin
+`https://files.example.org`, and compares origins byte for byte.
 
 `INFO <room>` is described in Section 6.1.

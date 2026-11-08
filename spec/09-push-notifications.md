@@ -31,6 +31,14 @@ PUSH LIST
 - **`PUSH LIST`** sends one `PUSH <url> <tag>` line for each of the
   device's account subscriptions, then OK.
 
+```
+C: push add https://push.example.net/w/q8c2Kf7 x7Kq2Lm9 BPLv7Mu8MXeNuZsIjwXGESxN4Q6ECl+wNXnodsPViB3HHjowvzVNQ3gdAyQwbezeAJXJXgnKhCGU2vyDnaDstEM= 7OISsGXIbzgRA8TyyMbgaA==
+S: OK
+C: push list
+S: PUSH https://push.example.net/w/q8c2Kf7 x7Kq2Lm9
+S: OK
+```
+
 There are two kinds of subscription:
 
 - **Mailbox subscriptions,** with `box`, wake the device when a mailbox

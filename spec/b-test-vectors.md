@@ -135,22 +135,42 @@ AUTH alice@example.org 0eS7OdclGDTKyqFlcGMJZOcRDKwNWe46pKczbvw1K6r08d/1QDbNxsCWm
 ```
 
 Test vectors for the formats below will be added. They need values
-made by an implementation of this document, which does not exist yet:
+made by an implementation of this document. Items marked † already have
+values from the first implementation, which will be copied here once
+they have been checked; the rest have none yet.
 
-- RisalaSign (4.3), and the encoding and signature of each kind of
-  Record (4.4), with a LogKey and its `log` line, and a device id
-- a whole key file, valid, and one that fails for each rule of 4.4's
-  parsing and replaying, and a chain's generation (4.4)
-- a key log entry of each type, a checkpoint with the log's ML-DSA-44
-  signature, an inclusion and a consistency proof, a hand-off, and a
-  `risala/uid/` hint (4.5, 4.10)
-- the `<keyfile>` of REGISTER and the `<records>` of KEYS PUT (4.7)
+Identity and the key log:
+
+- RisalaSign (4.3)†, and the encoding and signature of each kind of
+  Record (4.4)†, with a LogKey, its verifier key, key ID and `log`
+  line†, a device id and its short id (12.14)†, and a RecordList (4.4)
+- a whole key file, valid†, and one that fails for each rule of 4.4's
+  parsing and replaying†, and a chain's generation (4.4)†
+- a key log entry of each type† (4.5), a checkpoint with the log's
+  ML-DSA-44 signature and k cosignatures, an inclusion and a
+  consistency proof, the files `risala/uid/<hash>`, `risala/next` and
+  `risala/key` (4.5), and a hand-off request body (4.10)
+- the `<keyfile>` of REGISTER and the `<records>` of KEYS PUT (4.7)†
 - a recovery key in its text form, and the derivation of the master key
-  from it (4.8)
-- a PairingCode and its QR text, the keys and ids derived from the
-  pairing secret, a signed NewDevice and its encryption, and a
-  SealedBundle from a fixed X-Wing seed and encapsulation randomness
+  from it (4.8)†
+- a PairingCode and its QR text†, the keys and ids derived from the
+  pairing secret†, a signed NewDevice† and its SealedNewDevice†, and a
+  SealedBundle from a fixed X-Wing seed and encapsulation randomness†
   (4.8)
+- a safety number, as digits and as QR text (12.14)†
+
+Lines:
+
+- the line grammar: tags, escaping, `ref` echo, the three kinds of
+  parameter, and lines that are too long or get `bad-syntax` (2.3,
+  3.1-3.7), including a number above 2^63-1
+- a server (3.5) with and without a port, and links (Section 15), valid
+  and invalid
+- a box, a PAIR id and a link's group id in base32, with the last
+  character's unused bits (3.5, 4.8, Section 15)
+
+MLS and messages:
+
 - an X-Wing key pair expanded from a fixed 32-byte seed, as used for
   leaf keys and attestation keys (12.2)
 - a chain of period key seeds, and the period key derived from one
@@ -159,6 +179,9 @@ made by an implementation of this document, which does not exist yet:
   `next` (7.2, 12.6)
 - the group id, epoch, content type and RisalaAAD that a server reads
   from a PrivateMessage and from a PublicMessage (5.2)
+- PrivateMessage padding to a multiple of 256 bytes, and Padmé padding
+  of commits and SealedWelcomes, including small lengths (12.6, 12.8,
+  12.9)
 - an RFC 8291 push body and the `NOTIFY` line inside it (9.3)
 - the period number of a given time (12.10)
 - a SealedWelcome, from a fixed KeyPackage, Welcome and HPKE
@@ -168,34 +191,79 @@ made by an implementation of this document, which does not exist yet:
 - a RisalaConversation extension for each kind of conversation (12.4)
 - a RisalaAAD and a RisalaMessage, with its franking tag, and a whole
   application message from a fixed group state (12.9)
+- READ's `<check>` from an `epoch_authenticator` (12.9)
 - a CHALLENGE and ANSWER pair, from a fixed X-Wing seed and
   encapsulation randomness (12.10)
 - a PeriodCert, an AttestContent and their signatures, and a REVEAL
   (12.10)
-- an encrypted file of two chunks with Padmé padding, and a history
-  archive encrypted under its own label (12.11)
-- a HistoryArchive split over two archives with `more`, with an
-  ArchivedFile, a TransferRef, a backup key of a given generation and a
-  WrappedKey (12.13)
-- a safety number, as digits and as QR text (12.14)
+- group checks as decisions: a group state and a post with a commit,
+  and whether the commit is valid, for each group check of 12.7,
+  including the stale-leaf median, `streak` and the bounds on
+  `updated` (12.3, 12.7), since every implementation must reach the
+  same answer (7.2)
+
+Files, history and reports:
+
+- an encrypted file of two chunks with Padmé padding†, and a history
+  archive encrypted under its own label† (12.11)
+- a HistoryArchive with `more`, an ArchivedFile and a TransferRef†, a
+  history split over two archives, a backup key of a given
+  generation† and a WrappedKey† (12.13), and a BACKUP `files` list
+  (12.13)
 - a RisalaReport, and a ReportedPost whose `frank_key` is wrong (5.8)
 
 Each format also needs cases that MUST fail, so that implementations
 can show that they reject them:
 
+- key files: a non-shortest vector length, bytes after a Record's last
+  field, base64 that is not strict, a public key repeated across roles,
+  a `removed` list out of order or with repeats, a `time` that does not
+  increase, a Record over 16 KiB, a `log` line whose `<url>` is not
+  `https://` followed by its origin, and each failing rule of 4.4 (some
+  of these are among the cases above†)
+- the key log: a LogEntry of type 0 or with bytes after it, a
+  checkpoint with an extension line, a cosignature with a zero
+  timestamp, an Ed25519 cosignature, a cosignature whose key ID matches
+  but whose key does not, the log's own signature counted as a
+  witness, a witnessed checkpoint that is not fresh, and a checkpoint
+  with entries after a hand-off (4.5, 4.10)
+- signatures: AUTH over another host or nonce, an ML-DSA signature with
+  a non-empty context string, and RisalaSign with another label (4.3,
+  4.6)
+- a recovery key whose last 4 bits are not zero (4.8)
+- pairing: a NewDevice whose hash is not `keys_hash` or whose signature
+  fails, a `pairing_key` equal to another key, a SealedNewDevice or
+  SealedBundle with a version other than 1, a SealedBundle opened with
+  the wrong `old_key`, and an IdentityBundle whose `hosts` is empty or
+  repeats a server (4.8)
 - a file cut short at a chunk boundary, two chunks swapped, the
   last-chunk flag on a middle chunk, an extra chunk after the last, a
   wrong version byte, an archive decrypted with the file label, padding
   that is not zero, a plain text longer than Padmé of 8 plus its length,
   and a length larger than the plain text (12.11)
 - a franking tag that does not match (12.9)
+- a SealedWelcome with padding bytes that are not zero (12.8)
+- an X-Wing key that fails the FIPS 203 check, and an MLS object with
+  a cipher suite other than `0x0020` or a version other than `mls10`
+  (12.2)
 - a commit whose `next` is not the hash of the new epoch's send token,
-  a KeyPackage whose lifetime does not cover the commit's `t`, and a
-  DeviceBinding whose `device_id` is not its credential's (12.3, 12.7)
+  a KeyPackage whose lifetime does not cover the commit's `t`, one of
+  7261201 seconds, lifetimes just inside and just outside `t` ± 1 hour,
+  a DeviceBinding whose `device_id` is not its credential's, and one
+  with a bad signature (12.3, 12.5, 12.7)
+- an ATTEST outside its period and grace hour, after a REVEAL, or with a
+  wrong `leaf_key_hash`; a REVEAL seed that does not derive the period
+  key; and an ANSWER with a wrong MAC (12.10)
+- a RisalaReport whose context seqs do not increase, or are not below
+  the target's (5.8)
+- archives merged out of seq order, a later archive with another `uid`
+  or `made`, and a split archive whose later part has a `more` of its
+  own (12.13)
 - a wrapped backup key unwrapped with the wrong generation, uid or
-  blob-ref (12.13)
-- a split archive whose later part has a `more` of its own (12.13)
+  blob-ref, and a BACKUP `files` list with a wrong version byte or
+  length (12.13)
 
 For the cipher suite (12.2), implementations run the known-answer tests
 published with X-Wing [XWING], ML-KEM [FIPS203] and ML-DSA [FIPS204],
-and those of RFC 8439 for ChaCha20-Poly1305 and RFC 5869 for HKDF.
+and those of RFC 8439 for ChaCha20-Poly1305 and RFC 5869 for HKDF. The
+X-Wing seed expansion vector above pins the X-Wing version in use (16).

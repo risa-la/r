@@ -4,7 +4,9 @@ Commands a client can send, and the kinds of connection (4.1) that may
 send them. "New" is a connection that has not yet become anonymous, a
 guest or signed in. A connection that sends a command its kind may not
 use gets `ERR not-authenticated` if it is new, and
-`ERR wrong-connection` otherwise.
+`ERR wrong-connection` otherwise, except that ANON, GUEST, AUTH and
+REGISTER on a connection that is no longer new get
+`ERR already-authenticated` (3.7).
 
 | Command | Section | New | Anonymous | Guest | Signed in |
 |---|---|---|---|---|---|

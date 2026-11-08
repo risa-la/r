@@ -42,6 +42,17 @@ hostname and drop one trailing `.` before using it anywhere: in SNI, as
 the key of the trust record (2.2) and in the signed bytes (4.6). So
 `Chat.Example.org.` and `chat.example.org` are the same server.
 
+Wherever this document stores or sends a server address, it is written
+in exactly one way, as a `server` (3.5): the hostname in lower case,
+without a trailing `.`, followed by `:` and the port only if the port is
+not 7472. So `chat.example.org:7472` is written `chat.example.org`. A
+server is never named by an IP address, since SNI cannot carry one.
+This applies to the `host` of a PairingCode, the `hosts` of an
+IdentityBundle (4.8), the `host` of the conversation extension (12.4)
+and of an ArchivedConversation (12.13), SERVERS lines (12.9) and links
+(Section 15). Receivers compare these byte for byte, and treat a value
+not in this form as malformed.
+
 ### 2.2. Verifying the Server
 
 Operators SHOULD use a certificate from a public certificate authority,
@@ -125,8 +136,8 @@ After the TLS handshake, both sides exchange lines.
 - **Long lines.** Lines that carry MLS data, key files or reports
   (Sections 4, 5.8 and 12) may be longer:
   - From a client, a line whose verb is CREATE, KEYPKG, KEYS, PAIR,
-    POST, REPORT or WELCOME may be up to 1 MiB (1048576 bytes)
-    including the LF.
+    POST, REPORT, WATCH or WELCOME may be up to 1 MiB (1048576 bytes)
+    including the LF. WATCH is among them for its list of uids (8.3).
   - From a server, a line whose verb is GROUPINFO, KEYPKG, PAIR, POST,
     REPORT or WELCOME may be up to 1 MiB plus 16384 bytes.
   - Anything larger travels as a blob over HTTPS, and the line carries
@@ -170,5 +181,9 @@ whose ALPN identifier is `risala/1` (2.1).
 - Every binary structure that this document defines to be sent or
   stored on its own starts with a one-byte `version`, which is 1 here.
   Structures that are only signed, MACed or hashed carry the version in
-  their label instead. Text formats, such as key files (4.4), start with
-  a line that names their version.
+  their label instead. Text formats, such as key files (4.4) and the
+  files a key log serves for risala (4.5), start with a line that names
+  their version.
+- Formats that other documents define, such as MLS objects [RFC9420],
+  checkpoints, tiles and entry bundles [TLOG-TILES], and push bodies
+  [RFC8291], carry the versions those documents give them.
