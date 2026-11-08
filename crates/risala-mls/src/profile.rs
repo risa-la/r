@@ -5,6 +5,7 @@
 //!     uint8 version;               // 1
 //!     opaque display_name<V>;      // UTF-8, at most 128 bytes, may be empty
 //!     uint64 updated;              // when the leaf was last committed, in ms
+//!     uint8 streak;                // epochs in a row this leaf has started
 //! } RisalaProfile;
 //! ```
 
@@ -26,18 +27,31 @@ pub const MAX_DISPLAY_NAME_LEN: usize = 128;
 pub struct RisalaProfile {
     /// The display name, which may be empty (8.2).
     pub display_name: String,
-    /// When the leaf's device last committed its own leaf, in ms since
-    /// 1970-01-01T00:00:00Z, by its clock (12.3, 12.7).
+    /// When the leaf's device last committed its own leaf or proposed an
+    /// Update of it, in ms since 1970-01-01T00:00:00Z (12.3, 12.7). In a
+    /// KeyPackage, when the KeyPackage was made.
     pub updated: u64,
+    /// The epochs in a row, up to and including the one the commit starts,
+    /// that this leaf has started with its own commits; 0 in a KeyPackage
+    /// and in an Update proposal (12.3, 12.7).
+    pub streak: u8,
 }
 
 impl RisalaProfile {
-    /// A profile, or `None` if the display name is longer than 128 bytes.
+    /// A profile with `streak` 0, as in a KeyPackage or an Update proposal,
+    /// or `None` if the display name is longer than 128 bytes.
     pub fn new(display_name: &str, updated: u64) -> Option<RisalaProfile> {
         (display_name.len() <= MAX_DISPLAY_NAME_LEN).then(|| RisalaProfile {
             display_name: display_name.to_owned(),
             updated,
+            streak: 0,
         })
+    }
+
+    /// The same profile with `streak` set, for a commit (12.3).
+    pub fn with_streak(mut self, streak: u8) -> RisalaProfile {
+        self.streak = streak;
+        self
     }
 
     /// The extension's data.
@@ -45,7 +59,8 @@ impl RisalaProfile {
         let mut w = Writer::new();
         w.u8(1)
             .vector(self.display_name.as_bytes())
-            .u64(self.updated);
+            .u64(self.updated)
+            .u8(self.streak);
         w.into_bytes()
     }
 
@@ -58,6 +73,7 @@ impl RisalaProfile {
         }
         let name = r.vector()?;
         let updated = r.u64()?;
+        let streak = r.u8()?;
         r.finish()?;
         if name.len() > MAX_DISPLAY_NAME_LEN {
             return Err(DecodeError("display name too long"));
@@ -68,6 +84,7 @@ impl RisalaProfile {
         Ok(RisalaProfile {
             display_name,
             updated,
+            streak,
         })
     }
 
@@ -98,12 +115,21 @@ mod tests {
 
     #[test]
     fn encoding() {
-        let profile = RisalaProfile::new("Alice", 0x0102030405060708).unwrap();
+        let profile = RisalaProfile::new("Alice", 0x0102030405060708)
+            .unwrap()
+            .with_streak(3);
         let encoded = profile.encode();
-        assert_eq!(encoded, b"\x01\x05Alice\x01\x02\x03\x04\x05\x06\x07\x08");
+        assert_eq!(
+            encoded,
+            b"\x01\x05Alice\x01\x02\x03\x04\x05\x06\x07\x08\x03"
+        );
         assert_eq!(RisalaProfile::decode(&encoded), Ok(profile.clone()));
         let empty = RisalaProfile::new("", 0).unwrap();
-        assert_eq!(empty.encode(), b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+        assert_eq!(empty.streak, 0);
+        assert_eq!(
+            empty.encode(),
+            b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        );
 
         let extensions = Extensions::<LeafNode>::single(profile.to_extension()).unwrap();
         assert_eq!(
@@ -122,13 +148,14 @@ mod tests {
 
         let mut long = b"\x01\x40\x81".to_vec();
         long.extend_from_slice(&[b'a'; 129]);
-        long.extend_from_slice(&[0; 8]);
+        long.extend_from_slice(&[0; 9]);
         assert!(RisalaProfile::decode(&long).is_err());
         for bad in [
-            &b"\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..],
-            b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
-            b"\x01\x00\x00\x00\x00\x00\x00\x00\x00",
-            b"\x01\x02\xff\xfe\x00\x00\x00\x00\x00\x00\x00\x00",
+            &b"\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..],
+            b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            // The old layout, without a streak.
+            b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"\x01\x02\xff\xfe\x00\x00\x00\x00\x00\x00\x00\x00\x00",
         ] {
             assert!(RisalaProfile::decode(bad).is_err(), "{bad:?}");
         }

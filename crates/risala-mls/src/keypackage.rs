@@ -5,8 +5,10 @@
 //! - a credential with its RisalaIdentity (12.3), and a fresh leaf key of
 //!   its own, so that each group the device joins gets a different one;
 //! - the leaf's capabilities (12.3) and a profile (12.3);
-//! - a device binding (`0xF2A2`) among its extensions, signed by the
-//!   device key over the uid, the init key and the leaf's encryption key;
+//! - a device binding (`0xF2A2`) among its leaf node's extensions, signed
+//!   by the device key over the uid, the init key and the leaf's encryption
+//!   key, except in a KeyPackage made to join a public room, which has none
+//!   (12.3, 6.1);
 //! - if it is the device's KeyPackage of last resort, the
 //!   `app_data_dictionary` extension (`0x0006`) holding the
 //!   `last_resort_key_package` component (`0x0004`) with empty data
@@ -143,12 +145,17 @@ pub enum NewKeyPackageError<E> {
     /// The leaf key could not be stored.
     #[error("storage: {0:?}")]
     Storage(E),
+    /// OpenMLS made other keys on the second build, so the binding would
+    /// not cover them (see `crate::seeded`).
+    #[error("OpenMLS made other keys on the second build")]
+    Unbound,
 }
 
-/// Makes a KeyPackage of the device whose key is `device_key`, for `uid`
-/// (12.5), with a lifetime of [`KEY_PACKAGE_LIFETIME`] and the leaf's
-/// profile `profile`. `last_resort` marks it as the device's KeyPackage of
-/// last resort.
+/// Makes a KeyPackage of the device whose key is `device_key`, for `uid`,
+/// to upload with KEYPKG ADD (12.5), with a lifetime of
+/// [`KEY_PACKAGE_LIFETIME`], the leaf's profile `profile`, and a device
+/// binding in its leaf node (12.3). `last_resort` marks it as the device's
+/// KeyPackage of last resort.
 ///
 /// The profile is shown to the server and to whoever fetches the
 /// KeyPackage with KEYPKG GET, so give it an empty display name: the
@@ -161,14 +168,37 @@ pub fn make_key_package<P: OpenMlsProvider>(
     profile: &RisalaProfile,
     last_resort: bool,
 ) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
+    make_key_package_with(
+        provider,
+        device_key,
+        uid,
+        profile,
+        last_resort,
+        Lifetime::new(KEY_PACKAGE_LIFETIME),
+    )
+}
+
+/// [`make_key_package`] with a given lifetime, for tests.
+pub(crate) fn make_key_package_with<P: OpenMlsProvider>(
+    provider: &P,
+    device_key: &SigningKey,
+    uid: &Uid,
+    profile: &RisalaProfile,
+    last_resort: bool,
+    lifetime: Lifetime,
+) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
     let leaf_key = LeafKey::generate().map_err(|_| NewKeyPackageError::Random)?;
     let identity = RisalaIdentity::device(
         uid.clone(),
         DeviceId::of_device_key(device_key.public_key()),
     );
     let credential = identity.credential_with_key(leaf_key.public_key());
-    let leaf_extensions =
-        Extensions::single(profile.to_extension()).expect("a profile is valid in a leaf node");
+    let profile = profile.clone().with_streak(0);
+    let extensions = if last_resort {
+        vec![last_resort_extension()]
+    } else {
+        Vec::new()
+    };
     // First the keys, to bind them (see crate::seeded), then the real one.
     let seed = SeededRand::fresh().map_err(|_| NewKeyPackageError::Random)?;
     let scratch = MemoryStorage::default();
@@ -180,8 +210,9 @@ pub fn make_key_package<P: OpenMlsProvider>(
         },
         &leaf_key,
         credential.clone(),
-        leaf_extensions.clone(),
-        Vec::new(),
+        vec![profile.to_extension()],
+        extensions.clone(),
+        lifetime,
     )?;
     let binding = DeviceBinding::sign(
         device_key,
@@ -189,10 +220,6 @@ pub fn make_key_package<P: OpenMlsProvider>(
         first.key_package().hpke_init_key().as_slice(),
         &encryption_key_bytes(first.key_package().leaf_node().encryption_key()),
     );
-    let mut extensions = vec![binding.to_extension()];
-    if last_resort {
-        extensions.push(last_resort_extension());
-    }
     let bundle = build_key_package(
         &Parts {
             crypto: provider.crypto(),
@@ -201,8 +228,59 @@ pub fn make_key_package<P: OpenMlsProvider>(
         },
         &leaf_key,
         credential,
-        leaf_extensions,
+        vec![profile.to_extension(), binding.to_extension()],
         extensions,
+        lifetime,
+    )?;
+    if bundle.key_package().hpke_init_key() != first.key_package().hpke_init_key() {
+        return Err(NewKeyPackageError::Unbound);
+    }
+    leaf_key
+        .store(provider.storage(), KEY_PACKAGE_SCOPE)
+        .map_err(NewKeyPackageError::Storage)?;
+    Ok(NewKeyPackage {
+        key_package: bundle.key_package().clone(),
+        leaf_key,
+    })
+}
+
+/// Makes a KeyPackage to join one public room by external proposal (6.1):
+/// with no device binding, never uploaded with KEYPKG ADD, and a fresh leaf
+/// key, whose credential is `identity`, a device's or a guest's. A
+/// device's leaf carries `profile`; a guest's may carry none (12.3).
+pub fn make_join_key_package<P: OpenMlsProvider>(
+    provider: &P,
+    identity: &RisalaIdentity,
+    profile: Option<&RisalaProfile>,
+) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
+    make_join_key_package_with(
+        provider,
+        identity,
+        profile,
+        Lifetime::new(KEY_PACKAGE_LIFETIME),
+    )
+}
+
+/// [`make_join_key_package`] with a given lifetime, for tests.
+pub(crate) fn make_join_key_package_with<P: OpenMlsProvider>(
+    provider: &P,
+    identity: &RisalaIdentity,
+    profile: Option<&RisalaProfile>,
+    lifetime: Lifetime,
+) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
+    let leaf_key = LeafKey::generate().map_err(|_| NewKeyPackageError::Random)?;
+    let credential = identity.credential_with_key(leaf_key.public_key());
+    let leaf_extensions = profile
+        .map(|p| p.clone().with_streak(0).to_extension())
+        .into_iter()
+        .collect();
+    let bundle = build_key_package(
+        provider,
+        &leaf_key,
+        credential,
+        leaf_extensions,
+        Vec::new(),
+        lifetime,
     )?;
     leaf_key
         .store(provider.storage(), KEY_PACKAGE_SCOPE)
@@ -217,16 +295,19 @@ fn build_key_package<P: OpenMlsProvider>(
     provider: &P,
     leaf_key: &LeafKey,
     credential: openmls::prelude::CredentialWithKey,
-    leaf_extensions: Extensions<openmls::prelude::LeafNode>,
+    leaf_extensions: Vec<Extension>,
     extensions: Vec<Extension>,
+    lifetime: Lifetime,
 ) -> Result<KeyPackageBundle, KeyPackageNewError> {
     KeyPackage::builder()
         .leaf_node_capabilities(capabilities())
-        .leaf_node_extensions(leaf_extensions)
+        .leaf_node_extensions(
+            Extensions::from_vec(leaf_extensions).expect("distinct leaf node extensions"),
+        )
         .key_package_extensions(
             Extensions::from_vec(extensions).expect("distinct KeyPackage extensions"),
         )
-        .key_package_lifetime(Lifetime::new(KEY_PACKAGE_LIFETIME))
+        .key_package_lifetime(lifetime)
         .build(CIPHERSUITE, provider, leaf_key, credential)
 }
 
@@ -280,8 +361,13 @@ pub enum KeyPackageError {
     Dictionary,
 }
 
-/// Whether a KeyPackage's lifetime is acceptable at `now` (12.5): `now` is
-/// within it, and it spans at most 12 weeks and one hour.
+/// How far from a post's `t` a KeyPackage's lifetime may be and still be
+/// acceptable, in ms: an hour (12.5).
+pub const LIFETIME_SKEW_MS: u64 = 60 * 60 * 1000;
+
+/// Whether a KeyPackage's lifetime is acceptable at `now`, by the server's
+/// clock when it is uploaded (12.5): `now` is within it, and it spans at
+/// most 12 weeks and one hour.
 pub fn lifetime_acceptable(lifetime: &Lifetime, now: SystemTime) -> bool {
     let Ok(now) = now.duration_since(SystemTime::UNIX_EPOCH) else {
         return false;
@@ -289,6 +375,19 @@ pub fn lifetime_acceptable(lifetime: &Lifetime, now: SystemTime) -> bool {
     let now = now.as_secs();
     lifetime.not_before() <= now
         && now <= lifetime.not_after()
+        && lifetime.not_after().saturating_sub(lifetime.not_before()) <= MAX_LIFETIME_SPAN
+}
+
+/// Whether a KeyPackage's lifetime is acceptable for a commit that adds it,
+/// against the `t` of the post that carries the commit, in ms, give or take
+/// an hour (12.5, 12.7): some time within an hour of `t` is within it, and
+/// it spans at most 12 weeks and one hour. Never against the device's own
+/// clock, so that every device reaches the same answer.
+pub fn lifetime_acceptable_at(lifetime: &Lifetime, t_ms: u64) -> bool {
+    let not_before = lifetime.not_before().saturating_mul(1000);
+    let not_after = lifetime.not_after().saturating_mul(1000);
+    not_before <= t_ms.saturating_add(LIFETIME_SKEW_MS)
+        && t_ms.saturating_sub(LIFETIME_SKEW_MS) <= not_after
         && lifetime.not_after().saturating_sub(lifetime.not_before()) <= MAX_LIFETIME_SPAN
 }
 
@@ -315,16 +414,13 @@ pub fn read_key_package(bytes: &[u8]) -> Result<KeyPackageIn, KeyPackageError> {
     }
 }
 
-/// The checks of 12.5 and 12.7 on a KeyPackage whose signatures OpenMLS
-/// has verified: the suite, the credential is a RisalaIdentity of a
-/// device (not a guest), the leaf's capabilities and profile, the HPKE
-/// keys, the lifetime at `now`, and the dictionary. Returns the identity.
-///
-/// The device binding is checked by the caller, which knows the device
-/// key (see [`check_binding`]).
+/// The checks of 12.5 and 12.7 on any KeyPackage whose signatures OpenMLS
+/// has verified, other than its lifetime and binding: the suite, a
+/// RisalaIdentity credential, the leaf's capabilities, a profile for a
+/// device's leaf (12.3), the HPKE keys (12.2) and the dictionary. Returns
+/// the identity, and whether it is of last resort.
 pub fn check_key_package_contents(
     key_package: &KeyPackage,
-    now: SystemTime,
 ) -> Result<(RisalaIdentity, bool), KeyPackageError> {
     if key_package.ciphersuite() != CIPHERSUITE {
         return Err(KeyPackageError::CipherSuite);
@@ -332,78 +428,72 @@ pub fn check_key_package_contents(
     let leaf = key_package.leaf_node();
     let identity = RisalaIdentity::from_credential(leaf.credential())
         .map_err(|_| KeyPackageError::Credential)?;
-    if identity.is_guest() {
-        // Guests have no device key to bind with, and join public rooms by
-        // external commit (6.1). A guest KeyPackage for an external
-        // proposal is checked by `check_guest_key_package`.
-        return Err(KeyPackageError::Credential);
-    }
-    check_leaf_parts(key_package, now, true)?;
-    let last_resort = is_last_resort(key_package).map_err(|_| KeyPackageError::Dictionary)?;
-    Ok((identity, last_resort))
-}
-
-/// The checks every KeyPackage gets, a guest's too: capabilities, HPKE keys
-/// and lifetime, and a profile for a device's (12.3).
-fn check_leaf_parts(
-    key_package: &KeyPackage,
-    now: SystemTime,
-    needs_profile: bool,
-) -> Result<(), KeyPackageError> {
-    let leaf = key_package.leaf_node();
     if !has_capabilities(leaf.capabilities()) {
         return Err(KeyPackageError::Capabilities);
     }
-    if needs_profile && RisalaProfile::of_leaf(leaf).is_none() {
-        return Err(KeyPackageError::Profile);
+    match RisalaProfile::from_extensions(leaf.extensions()) {
+        None if identity.is_guest() => {}
+        Some(Ok(_)) => {}
+        _ => return Err(KeyPackageError::Profile),
     }
     if !x_wing_public_key_ok(key_package.hpke_init_key().as_slice())
         || !x_wing_public_key_ok(&encryption_key_bytes(leaf.encryption_key()))
     {
         return Err(KeyPackageError::HpkeKey);
     }
-    if !lifetime_acceptable(key_package.life_time(), now) {
-        return Err(KeyPackageError::Lifetime);
-    }
-    Ok(())
+    let last_resort = is_last_resort(key_package).map_err(|_| KeyPackageError::Dictionary)?;
+    Ok((identity, last_resort))
 }
 
-/// The checks of a guest's KeyPackage in an external Add proposal (6.1):
-/// a guest credential, and [`check_leaf_parts`]. Guests have no binding.
-pub fn check_guest_key_package(
+/// The device binding in a KeyPackage's leaf node, if it has one: `None`
+/// if it has none, an error if it is malformed (12.3).
+pub fn leaf_binding(key_package: &KeyPackage) -> Option<Result<DeviceBinding, DecodeError>> {
+    DeviceBinding::from_extensions(key_package.leaf_node().extensions())
+}
+
+/// Whether a KeyPackage has a binding in the place 12.3 puts it, as far as
+/// a group check can tell without the device key (12.7): one well-formed
+/// binding in its leaf node, none among the KeyPackage's own extensions,
+/// whose `device_id` is the credential's. Whether it verifies is a key
+/// check ([`check_binding`]).
+pub fn binding_fits_credential(
     key_package: &KeyPackage,
-    now: SystemTime,
-) -> Result<RisalaIdentity, KeyPackageError> {
-    if key_package.ciphersuite() != CIPHERSUITE {
-        return Err(KeyPackageError::CipherSuite);
+    identity: &RisalaIdentity,
+) -> Result<(), KeyPackageError> {
+    if DeviceBinding::from_extensions(key_package.extensions()).is_some() {
+        return Err(KeyPackageError::Binding);
     }
-    let identity = RisalaIdentity::from_credential(key_package.leaf_node().credential())
-        .map_err(|_| KeyPackageError::Credential)?;
-    if !identity.is_guest() {
-        return Err(KeyPackageError::Credential);
+    match leaf_binding(key_package) {
+        Some(Ok(binding)) if identity.device_id == Some(binding.device_id) => Ok(()),
+        _ => Err(KeyPackageError::Binding),
     }
-    check_leaf_parts(key_package, now, false)?;
-    Ok(identity)
+}
+
+/// Whether a KeyPackage carries no device binding anywhere, as one that
+/// joins a public room must not (12.3, 6.1).
+pub fn has_no_binding(key_package: &KeyPackage) -> bool {
+    leaf_binding(key_package).is_none()
+        && DeviceBinding::from_extensions(key_package.extensions()).is_none()
 }
 
 /// Whether the KeyPackage's device binding verifies under `device_key`,
-/// the raw key of the device its credential names, over its uid, init key
-/// and leaf encryption key (12.3).
+/// the raw key of the device its credential names, over its uid, its init
+/// key and its leaf's encryption key (12.3). This is a key check (12.7).
 pub fn check_binding(
     key_package: &KeyPackage,
     identity: &RisalaIdentity,
     device_key: &[u8],
 ) -> Result<(), KeyPackageError> {
-    let binding = DeviceBinding::from_extensions(key_package.extensions())
-        .ok_or(KeyPackageError::Binding)?
-        .map_err(|_| KeyPackageError::Binding)?;
-    let ok = identity.device_id == Some(binding.device_id)
-        && binding.verify(
-            device_key,
-            &identity.uid,
-            key_package.hpke_init_key().as_slice(),
-            &encryption_key_bytes(key_package.leaf_node().encryption_key()),
-        );
+    binding_fits_credential(key_package, identity)?;
+    let binding = leaf_binding(key_package)
+        .and_then(Result::ok)
+        .ok_or(KeyPackageError::Binding)?;
+    let ok = binding.verify(
+        device_key,
+        &identity.uid,
+        key_package.hpke_init_key().as_slice(),
+        &encryption_key_bytes(key_package.leaf_node().encryption_key()),
+    );
     if ok {
         Ok(())
     } else {
@@ -428,10 +518,10 @@ pub fn verify_key_package(
 /// The server's checks of KEYPKG ADD (12.5): `bytes` is an MLSMessage
 /// holding a KeyPackage of `mls10` and the suite `0x0020`, whose
 /// credential is a RisalaIdentity of `uid` and the device whose raw device
-/// key is `device_key`, with a device binding by that key over its init
-/// and encryption keys, the capabilities of 12.3, a profile, HPKE keys
-/// that pass the checks of 12.2, valid signatures, and an acceptable
-/// lifetime at `now`.
+/// key is `device_key`, with a device binding in its leaf node by that key
+/// over its init and encryption keys, the capabilities of 12.3, a profile,
+/// HPKE keys that pass the checks of 12.2, valid signatures, and an
+/// acceptable lifetime at `now`, by the server's clock.
 pub fn check_key_package(
     crypto: &impl OpenMlsCrypto,
     bytes: &[u8],
@@ -447,7 +537,10 @@ pub fn check_key_package(
         _ => return Err(KeyPackageError::Malformed),
     }
     let key_package = verify_key_package(crypto, read_key_package(bytes)?)?;
-    let (identity, last_resort) = check_key_package_contents(&key_package, now)?;
+    let (identity, last_resort) = check_key_package_contents(&key_package)?;
+    if !lifetime_acceptable(key_package.life_time(), now) {
+        return Err(KeyPackageError::Lifetime);
+    }
     let expected = RisalaIdentity::device(uid.clone(), DeviceId::of_device_key(device_key));
     if identity != expected {
         return Err(KeyPackageError::Credential);
@@ -500,5 +593,27 @@ mod tests {
             &Lifetime::new(KEY_PACKAGE_LIFETIME),
             now + std::time::Duration::from_secs(KEY_PACKAGE_LIFETIME + 10)
         ));
+    }
+
+    /// Against a post's `t`, give or take an hour, never the clock (12.5).
+    #[test]
+    fn lifetimes_at_a_post() {
+        let hour = 3600;
+        let lifetime = Lifetime::init(1_000_000, 1_000_000 + KEY_PACKAGE_LIFETIME);
+        let ms = |s: u64| s * 1000;
+        for (t, ok) in [
+            (ms(1_000_000), true),
+            (ms(1_000_000 - hour), true),
+            (ms(1_000_000 - hour) - 1, false),
+            (ms(1_000_000 + KEY_PACKAGE_LIFETIME + hour), true),
+            (ms(1_000_000 + KEY_PACKAGE_LIFETIME + hour) + 1, false),
+        ] {
+            assert_eq!(lifetime_acceptable_at(&lifetime, t), ok, "{t}");
+        }
+        // Too long a span is never acceptable.
+        let long = Lifetime::init(1_000_000, 1_000_001 + MAX_LIFETIME_SPAN);
+        assert!(!lifetime_acceptable_at(&long, ms(1_000_100)));
+        let max = Lifetime::init(1_000_000, 1_000_000 + MAX_LIFETIME_SPAN);
+        assert!(lifetime_acceptable_at(&max, ms(1_000_100)));
     }
 }

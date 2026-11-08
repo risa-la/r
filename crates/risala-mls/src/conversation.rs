@@ -111,7 +111,8 @@ pub struct RisalaConversation {
     pub kind: ConversationKind,
     /// The server, in lower case. It never changes.
     pub host: String,
-    /// The mailbox (`box`). It never changes.
+    /// The mailbox (`box`). It changes only when a direct conversation or
+    /// a private room moves to a new mailbox (7.8).
     pub mailbox: [u8; BOX_LEN],
     /// For a direct conversation, the participants' uids, sorted and joined
     /// by a space, or one uid; for a private room, its name; for a public
@@ -167,6 +168,9 @@ pub enum ChangeError {
     /// The committer's role does not allow this change.
     #[error("only {0} may change this")]
     NotAllowed(&'static str),
+    /// A ban that leaves the uid in `owners` or `mods` (6.4).
+    #[error("a ban that leaves the uid in owners or mods")]
+    BanKeepsRole,
 }
 
 fn kind_value(kind: ConversationKind) -> u8 {
@@ -498,6 +502,35 @@ impl RisalaConversation {
         self.bans.contains(uid)
     }
 
+    /// The fields a device compares before it joins a public room again
+    /// (12.7, "Rejoining a public room"): those of `owners`, `mods`,
+    /// `bans`, `guests`, `send` and `topic` in which `other`, the extension
+    /// of the GroupInfo it would join, differs from `self`, the one it
+    /// kept. If any differ in a way no commit it checked explains, it MUST
+    /// NOT join silently.
+    pub fn unexplained_changes(&self, other: &RisalaConversation) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !same_set(&self.owners, &other.owners) {
+            out.push("owners");
+        }
+        if !same_set(&self.mods, &other.mods) {
+            out.push("mods");
+        }
+        if !same_set(&self.bans, &other.bans) {
+            out.push("bans");
+        }
+        if self.guests != other.guests {
+            out.push("guests");
+        }
+        if self.send != other.send {
+            out.push("send");
+        }
+        if self.topic != other.topic {
+            out.push("topic");
+        }
+        out
+    }
+
     /// The extension, for a group context.
     pub fn to_extension(&self) -> Extension {
         Extension::Unknown(CONVERSATION_EXTENSION_TYPE, UnknownExtension(self.encode()))
@@ -533,18 +566,19 @@ impl RisalaConversation {
     }
 
     /// Checks a commit's change from `self`, the extension as of the epoch
-    /// the commit is for, to `new`, by a committer whose uid is `committer`
-    /// (6.2, 6.3, 6.4, 12.4, 12.7).
+    /// the commit is for, to `new`, by a committer with `rights` (6.2, 6.3,
+    /// 6.4, 7.8, 12.4, 12.7). Returns whether the change needed the
+    /// committer's role.
     ///
     /// This covers the extension alone. That a ban also removes the
-    /// identity's leaves, that `guests none` removes the guests', and the
-    /// 256-member threshold are checked with the commit (see
-    /// [`crate::checks`]).
+    /// identity's leaves, that `guests none` removes the guests', the
+    /// 256-member threshold and an impostor repair's restored fields are
+    /// checked with the commit (see [`crate::checks`]).
     pub fn check_change(
         &self,
         new: &RisalaConversation,
-        committer: &Uid,
-    ) -> Result<(), ChangeError> {
+        rights: &ChangeRights,
+    ) -> Result<Change, ChangeError> {
         new.check()?;
         if new.kind != self.kind {
             return Err(ChangeError::Fixed("kind"));
@@ -553,65 +587,118 @@ impl RisalaConversation {
             return Err(ChangeError::Fixed("host"));
         }
         if new.mailbox != self.mailbox {
-            return Err(ChangeError::Fixed("box"));
+            // A move to a new mailbox (7.8): any member, outside public
+            // rooms, in a commit with no other proposal and no other change.
+            if self.kind == ConversationKind::PublicRoom {
+                return Err(ChangeError::Fixed("box"));
+            }
+            let mut rest = new.clone();
+            rest.mailbox = self.mailbox;
+            if !rights.may_move_box || rest != *self {
+                return Err(ChangeError::NotAllowed(
+                    "a commit that changes the box alone",
+                ));
+            }
+            return Ok(Change { used_role: false });
         }
-        let role = self.role(committer);
-        let owner = role == Role::Owner;
-        let mod_or_owner = role >= Role::Mod;
+        let owner = rights.role == Role::Owner;
+        let mod_or_owner = rights.role >= Role::Mod;
+        let mut used_role = false;
+        let mut needs = |allowed: bool, who: &'static str| {
+            used_role = true;
+            if allowed {
+                Ok(())
+            } else {
+                Err(ChangeError::NotAllowed(who))
+            }
+        };
         if new.name != self.name {
             if self.kind != ConversationKind::PrivateRoom {
                 return Err(ChangeError::Fixed("name"));
             }
-            if !owner {
-                return Err(ChangeError::NotAllowed("owners"));
-            }
+            needs(owner, "owners")?;
         }
-        if new.topic != self.topic && !mod_or_owner {
-            return Err(ChangeError::NotAllowed("owners and moderators"));
+        if new.topic != self.topic {
+            needs(mod_or_owner, "owners and moderators")?;
         }
         if new.guests != self.guests {
             if self.kind != ConversationKind::PublicRoom {
                 return Err(ChangeError::Fixed("guests"));
             }
-            if !owner {
-                return Err(ChangeError::NotAllowed("owners"));
-            }
+            needs(owner, "owners")?;
         }
-        if new.send != self.send && !owner {
-            return Err(ChangeError::NotAllowed("owners"));
+        if new.send != self.send {
+            needs(owner, "owners")?;
         }
         if new.confirm != self.confirm {
-            if !owner {
-                return Err(ChangeError::NotAllowed("owners"));
-            }
             if !(self.confirm == ConfirmMode::Pairwise && new.confirm == ConfirmMode::Epochal) {
                 return Err(ChangeError::Fixed(
                     "confirm, except from pairwise to epochal",
                 ));
             }
+            // Anyone, in the commit that takes the room past 256 members
+            // (6.2).
+            if !rights.may_go_epochal {
+                needs(owner, "owners")?;
+            }
         }
-        if (!same_set(&new.owners, &self.owners) || !same_set(&new.mods, &self.mods)) && !owner {
-            return Err(ChangeError::NotAllowed("owners"));
+        if !same_set(&new.owners, &self.owners) || !same_set(&new.mods, &self.mods) {
+            needs(owner, "owners")?;
         }
         if !same_set(&new.bans, &self.bans) {
-            if !mod_or_owner {
-                return Err(ChangeError::NotAllowed("owners and moderators"));
-            }
+            needs(mod_or_owner, "owners and moderators")?;
             // Moderators ban and unban plain members only (6.3, 6.4), by
             // their role as of the epoch the commit is for.
-            let changed = new
-                .bans
-                .iter()
-                .filter(|uid| !self.bans.contains(uid))
-                .chain(self.bans.iter().filter(|uid| !new.bans.contains(uid)));
-            for uid in changed {
+            let added = new.bans.iter().filter(|uid| !self.bans.contains(uid));
+            let lifted = self.bans.iter().filter(|uid| !new.bans.contains(uid));
+            for uid in added.clone().chain(lifted) {
                 if !owner && self.role(uid) != Role::Member {
                     return Err(ChangeError::NotAllowed("owners"));
                 }
             }
+            // A ban takes the uid out of owners and mods (6.4).
+            for uid in added {
+                if new.role(uid) != Role::Member {
+                    return Err(ChangeError::BanKeepsRole);
+                }
+            }
         }
-        Ok(())
+        Ok(Change { used_role })
     }
+}
+
+/// What a committer may change in the conversation extension (6.2, 6.3,
+/// 7.8, 12.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeRights {
+    /// The committer's role, as of the commit's epoch. A moderator counts
+    /// as an owner in a room whose owners have no leaf (6.3).
+    pub role: Role,
+    /// Whether the commit holds no proposal other than this change, so
+    /// that it may move the mailbox, as any member may (7.8).
+    pub may_move_box: bool,
+    /// Whether the commit takes a private room past 256 members, so that
+    /// anyone may change `confirm` to `epochal` in it (6.2).
+    pub may_go_epochal: bool,
+}
+
+impl ChangeRights {
+    /// The rights of a committer with `role`, in an ordinary commit.
+    pub fn of_role(role: Role) -> ChangeRights {
+        ChangeRights {
+            role,
+            may_move_box: false,
+            may_go_epochal: false,
+        }
+    }
+}
+
+/// A change that [`RisalaConversation::check_change`] allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Change {
+    /// Whether only a role allowed it, which makes the commit an authority
+    /// commit (12.7).
+    pub used_role: bool,
 }
 
 fn same_set(a: &[Uid], b: &[Uid]) -> bool {
@@ -782,7 +869,8 @@ mod tests {
         let ok = |change: fn(&mut RisalaConversation), who: &Uid| {
             let mut new = old.clone();
             change(&mut new);
-            old.check_change(&new, who)
+            old.check_change(&new, &ChangeRights::of_role(old.role(who)))
+                .map(|_| ())
         };
         // Topic: owners and moderators.
         let topic = |c: &mut RisalaConversation| c.topic = "new".into();
@@ -802,11 +890,17 @@ mod tests {
         }
         // Bans: moderators only of plain members.
         let ban_member = |c: &mut RisalaConversation| c.bans.push("p@x.org".parse().unwrap());
-        let ban_mod = |c: &mut RisalaConversation| c.bans.push("m@x.org".parse().unwrap());
+        let ban_mod = |c: &mut RisalaConversation| {
+            c.bans.push("m@x.org".parse().unwrap());
+            c.mods.clear();
+        };
         assert_eq!(ok(ban_member, &moderator), Ok(()));
         assert!(ok(ban_member, &member).is_err());
         assert!(ok(ban_mod, &moderator).is_err());
         assert_eq!(ok(ban_mod, &owner), Ok(()));
+        // A ban takes the uid out of owners and mods (6.4).
+        let ban_keeping_role = |c: &mut RisalaConversation| c.bans.push("m@x.org".parse().unwrap());
+        assert_eq!(ok(ban_keeping_role, &owner), Err(ChangeError::BanKeepsRole));
         // Never kind, host or box; confirm only to epochal; not the last
         // owner; guests only in public rooms.
         for change in [
@@ -820,7 +914,8 @@ mod tests {
         }
         let mut epochal = old.clone();
         epochal.confirm = ConfirmMode::Epochal;
-        assert!(epochal.check_change(&old, &owner).is_err());
+        let as_owner = ChangeRights::of_role(Role::Owner);
+        assert!(epochal.check_change(&old, &as_owner).is_err());
 
         let public = RisalaConversation::public_room(
             "chat.example.org",
@@ -831,11 +926,70 @@ mod tests {
         let mut renamed = public.clone();
         renamed.name = "#other".into();
         assert_eq!(
-            public.check_change(&renamed, &owner),
+            public.check_change(&renamed, &as_owner),
             Err(ChangeError::Fixed("name"))
         );
         let mut read = public.clone();
         read.guests = GuestMode::Read;
-        assert_eq!(public.check_change(&read, &owner), Ok(()));
+        assert_eq!(
+            public.check_change(&read, &as_owner),
+            Ok(Change { used_role: true })
+        );
+    }
+
+    /// Moving the mailbox (7.8): any member, alone in its commit, outside
+    /// public rooms.
+    #[test]
+    fn mailbox_moves() {
+        let old = room();
+        let mut moved = old.clone();
+        moved.mailbox = [0x11; 16];
+        let member = ChangeRights {
+            may_move_box: true,
+            ..ChangeRights::of_role(Role::Member)
+        };
+        assert_eq!(
+            old.check_change(&moved, &member),
+            Ok(Change { used_role: false })
+        );
+        // Not with another proposal, nor with another change.
+        assert!(
+            old.check_change(&moved, &ChangeRights::of_role(Role::Owner))
+                .is_err()
+        );
+        let mut and_topic = moved.clone();
+        and_topic.topic = "x".into();
+        assert!(old.check_change(&and_topic, &member).is_err());
+        let public = RisalaConversation::public_room(
+            "chat.example.org",
+            BOX,
+            &"#general".parse().unwrap(),
+            &uid("o@x.org"),
+        );
+        let mut moved = public.clone();
+        moved.mailbox = [0x11; 16];
+        assert_eq!(
+            public.check_change(&moved, &member),
+            Err(ChangeError::Fixed("box"))
+        );
+    }
+
+    /// Anyone moves a room to epochal in the commit that takes it past 256
+    /// members (6.2); otherwise owners only.
+    #[test]
+    fn forced_epochal() {
+        let old = room();
+        let mut epochal = old.clone();
+        epochal.confirm = ConfirmMode::Epochal;
+        let member = ChangeRights::of_role(Role::Member);
+        assert!(old.check_change(&epochal, &member).is_err());
+        let crossing = ChangeRights {
+            may_go_epochal: true,
+            ..member
+        };
+        assert_eq!(
+            old.check_change(&epochal, &crossing),
+            Ok(Change { used_role: false })
+        );
     }
 }

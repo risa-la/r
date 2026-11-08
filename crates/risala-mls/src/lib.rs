@@ -27,9 +27,14 @@
 //!
 //! - [`keypackage`]: making KeyPackages, and the checks of KEYPKG ADD
 //!   (12.5).
-//! - [`group`]: creating groups, joining by Welcome and external commit,
-//!   commits, SelfRemove, and processing posts (12.6-12.8, 6.1).
-//! - [`checks`]: the checks of joining and of every commit (12.7).
+//! - [`group`]: creating groups, joining by Welcome and by a public room's
+//!   join proposal, commits, Update proposals, SelfRemove, resync commits,
+//!   mailbox moves, past epochs, and processing posts (12.6-12.9, 6.1,
+//!   7.8).
+//! - [`checks`]: the checks of joining, and the group and key checks of
+//!   every commit, with the [`History`](checks::History) they look back on
+//!   (12.7).
+//! - [`welcome`]: one sealed Welcome per added device (12.8).
 //! - [`message`]: RisalaMessage, franking, counters, late messages and
 //!   reports (12.9, 5.4, 5.8).
 //! - [`confirm`]: confirming leaves, pairwise by CHALLENGE and ANSWER,
@@ -37,9 +42,11 @@
 //! - [`epochal`]: period keys, ATTEST and REVEAL (12.10). The construction
 //!   still needs an outside review (PLAN.md item 53).
 //!
-//! OpenMLS is patched in two places (`crates/openmls-traits/RISALA.md`,
-//! `crates/openmls/RISALA.md`): the suite's value is `0x0020`, and
-//! SelfRemove is framed with the group's wire format.
+//! OpenMLS is patched (`crates/openmls-traits/RISALA.md`,
+//! `crates/openmls/RISALA.md`): the suite's value is `0x0020`, SelfRemove
+//! is framed with the group's wire format, KeyPackage lifetimes are left to
+//! risala's checks, resync commits remove other leaves, join proposals
+//! carry a RisalaAAD, and a GroupInfo's signer is readable.
 
 pub mod aad;
 pub mod archive;
@@ -64,6 +71,7 @@ pub mod profile;
 pub mod risala_sign;
 mod seeded;
 pub mod token;
+pub mod welcome;
 pub mod wire;
 
 pub use openmls;
@@ -78,6 +86,7 @@ pub use backup::{
     Backup, BackupError, BackupKey, BackupUpload, RecoveryKey, RecoveryKeyError, WrappedKey,
 };
 pub use binding::DeviceBinding;
+pub use checks::{CommitPost, History};
 pub use confirm::{AttestationKey, Confirmer, LeafState};
 pub use conversation::{ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto};

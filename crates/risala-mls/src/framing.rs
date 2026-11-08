@@ -90,9 +90,11 @@ pub struct Framing<'a> {
 }
 
 impl Framing<'_> {
-    /// The RisalaAAD, checked against the content type (12.9).
+    /// The RisalaAAD, checked against the content type and wire format
+    /// (12.9, 5.2): a pseudonym of 16 bytes in a PrivateMessage and none in
+    /// a PublicMessage, and a `frank` in an application message only.
     pub fn aad(&self) -> Result<RisalaAad, AadError> {
-        RisalaAad::decode_for(self.authenticated_data, self.content_type)
+        RisalaAad::decode_for(self.authenticated_data, self.content_type, self.private)
     }
 }
 
@@ -300,6 +302,16 @@ mod tests {
             read_post(&private(3, &aad.encode())),
             Err(PostError::Aad(AadError::WrongFields))
         ));
+        // A PrivateMessage carries a pseudonym, even a commit's (5.2).
+        assert!(matches!(
+            read_post(&private(3, &RisalaAad::public().encode())),
+            Err(PostError::Aad(AadError::WrongFields))
+        ));
+        let commit_aad = RisalaAad::handshake(crate::aad::Pseudonym([1; 16]));
+        assert_eq!(
+            read_post(&private(3, &commit_aad.encode())).unwrap().1,
+            commit_aad
+        );
         // Every truncation fails, and so does a trailing byte.
         for len in 0..bytes.len() {
             assert!(read_message(&bytes[..len]).is_err(), "{len}");
@@ -337,6 +349,7 @@ mod tests {
             2,
             &RisalaAad::handshake(crate::aad::Pseudonym([0; 16])).encode(),
         );
+        assert!(read_post(&bytes).is_ok());
         for i in 0..bytes.len() {
             for v in [0u8, 0x3f, 0x40, 0x7f, 0x80, 0xbf, 0xc0, 0xff] {
                 let mut b = bytes.clone();

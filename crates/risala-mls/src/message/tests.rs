@@ -10,7 +10,7 @@ use risala_proto::content::ContentLine;
 
 use super::*;
 use crate::Provider;
-use crate::checks::JoinExpectation;
+use crate::checks::{CommitPost, History as MlsHistory, JoinExpectation, Verdict};
 use crate::group::{
     Changes, apply_commit, commit, create_group, join_by_welcome, merge_own_commit, self_remove,
 };
@@ -32,6 +32,15 @@ fn t0() -> Timestamp {
 
 fn at(minutes: u64) -> Timestamp {
     t0().checked_add(Duration::from_secs(minutes * 60)).unwrap()
+}
+
+/// The post of a commit, for the group's [`MlsHistory`], which these tests
+/// do not keep.
+fn post(out: &crate::group::CommitOutput) -> CommitPost {
+    CommitPost {
+        t: now_ms(),
+        next: Some(out.next_token_hash),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -103,6 +112,7 @@ impl Device {
             &self.identity(),
             &self.profile(),
             conversation,
+            now_ms(),
         )
         .unwrap()
         .0
@@ -114,7 +124,7 @@ impl Device {
             own_uid: self.uid.clone(),
             public_room: None,
         };
-        join_by_welcome(&self.provider, welcome, None, &expect)
+        join_by_welcome(&self.provider, welcome, None, &expect, now_ms())
             .unwrap()
             .group
     }
@@ -126,10 +136,17 @@ impl Device {
             group,
             self.pseudonym,
             &self.profile(),
+            &MlsHistory::default(),
             changes,
         )
         .unwrap();
-        merge_own_commit(&self.provider, group).unwrap();
+        merge_own_commit(
+            &self.provider,
+            group,
+            &mut MlsHistory::default(),
+            &post(&out),
+        )
+        .unwrap();
         out.message
     }
 
@@ -142,7 +159,18 @@ impl Device {
             panic!("not a commit");
         };
         let removed = removed_leaves(&received.staged);
-        apply_commit(&self.provider, group, *received).unwrap();
+        apply_commit(
+            &self.provider,
+            group,
+            *received,
+            &Verdict::default(),
+            &mut MlsHistory::default(),
+            &CommitPost {
+                t: now_ms(),
+                next: None,
+            },
+        )
+        .unwrap();
         self.history.note_commit(ended, t, &removed);
     }
 
@@ -205,13 +233,20 @@ fn direct() -> Direct {
         &mut a,
         alice.pseudonym,
         &alice.profile(),
+        &MlsHistory::default(),
         Changes {
             add: vec![bob.key_package(), alice2.key_package()],
             ..Changes::default()
         },
     )
     .unwrap();
-    merge_own_commit(&alice.provider, &mut a).unwrap();
+    merge_own_commit(
+        &alice.provider,
+        &mut a,
+        &mut MlsHistory::default(),
+        &post(&out),
+    )
+    .unwrap();
     let welcome = out.welcome.unwrap();
     let b = bob.join(&welcome);
     let a2 = alice2.join(&welcome);
@@ -748,13 +783,20 @@ fn epochal_pseudonyms() {
         &mut o,
         owen.pseudonym,
         &owen.profile(),
+        &MlsHistory::default(),
         Changes {
             add: vec![mia.key_package()],
             ..Changes::default()
         },
     )
     .unwrap();
-    merge_own_commit(&owen.provider, &mut o).unwrap();
+    merge_own_commit(
+        &owen.provider,
+        &mut o,
+        &mut MlsHistory::default(),
+        &post(&out),
+    )
+    .unwrap();
     let mut m = mia.join(&out.welcome.unwrap());
 
     // Nothing is pinned until the leaf's ATTEST is checked (7.3, 12.10).

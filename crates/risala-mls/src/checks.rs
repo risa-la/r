@@ -1,22 +1,29 @@
-//! The checks devices make of every group they join and every commit
-//! they apply (12.7, 6.1-6.4), and that a server makes of a public room's
-//! commits as far as the public state allows (12.6).
+//! The checks devices make of every group they join and every commit they
+//! apply (12.7, 6.1-6.4), and that a server makes of a public room's
+//! commits (12.6).
+//!
+//! A commit gets two kinds of check (12.7):
+//!
+//! - **Group checks** ([`check_commit`]) use only the group's state, the
+//!   commit, the post that carries it (its `t` and `next`, [`CommitPost`]),
+//!   and what the device saw of the group's recent commits ([`History`]).
+//!   Every device that applied the same posts reaches the same answer. A
+//!   commit that fails one is invalid. A server runs the same checks on a
+//!   public room's commits, with `t` from its own clock.
+//! - **Key checks** ([`key_checks`]) use key files and the key log, which
+//!   devices fetch at different times. They never make a commit invalid:
+//!   they only lead to repairs by later commits.
+//!
+//! Some group checks look back up to 16 epochs or 24 hours. A device that
+//! joined since, by Welcome, cannot make them, and applies the commit as it
+//! would one whose key checks it cannot make yet; [`Verdict::unchecked`]
+//! says which (12.7).
 //!
 //! The checks are pure functions over a [`GroupView`], the group as of the
 //! epoch a commit is for, and a [`CommitView`], what the commit does. Both
-//! are read from OpenMLS's types ([`GroupView::of`], [`CommitView::of`]),
-//! by a member's [`MlsGroup`](openmls::group::MlsGroup) or a server's
-//! [`PublicGroup`]. Facts from key files and the key log come through
-//! [`KeyFacts`], which may not know yet (12.7): a removal it cannot check
-//! stands, and an add it cannot check leaves the added leaf unconfirmed.
-//!
-//! Every check depends only on the group, the commit and facts that never
-//! go away, so every device that sees the same commits picks the same
-//! winner (7.2). The one exception is the lifetime of added KeyPackages,
-//! which 12.5 checks against the current time; see [`check_commit`].
+//! are read from OpenMLS's types ([`GroupView::of`], [`CommitView::of`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
 
 use openmls::group::{QueuedProposal, StagedCommit};
 use openmls::prelude::{
@@ -24,17 +31,19 @@ use openmls::prelude::{
 };
 use openmls::treesync::LeafNodeSource;
 use risala_proto::names::{Room, Uid};
+use serde::{Deserialize, Serialize};
 
-use crate::binding::DeviceBinding;
 use crate::conversation::{
-    ConfirmMode, ConversationError, ConversationKind, GuestMode, RisalaConversation, Role,
+    ChangeRights, ConfirmMode, ConversationError, ConversationKind, GuestMode, RisalaConversation,
+    Role,
 };
 use crate::crypto::x_wing_public_key_ok;
 use crate::identity::{DeviceId, RisalaIdentity};
 use crate::keypackage::{
-    KeyPackageError, check_binding, check_guest_key_package, check_key_package_contents,
-    encryption_key_bytes,
+    KeyPackageError, binding_fits_credential, check_binding, check_key_package_contents,
+    encryption_key_bytes, has_no_binding, lifetime_acceptable_at,
 };
+use crate::primitives::HASH_LEN;
 use crate::profile::RisalaProfile;
 
 /// The most identities in a private room (6.1).
@@ -48,34 +57,71 @@ pub const MAX_PUBLIC_LEAVES: usize = 32_768;
 /// The most members a private room may have while it is `pairwise`
 /// (6.2, 12.10).
 pub const MAX_PAIRWISE_MEMBERS: usize = 256;
-/// How much older than the committer's own leaf a leaf's `updated` must
-/// be for anyone to remove it as stale: 35 days, in ms (12.7).
+/// How much older than the group's median `updated` a leaf's must be for
+/// anyone to remove it as stale: 35 days, in ms (12.7).
 pub const STALE_AFTER_MS: u64 = 35 * 24 * 60 * 60 * 1000;
 /// How long a device may go without committing its own leaf in a group:
 /// a week, in ms (12.7).
 pub const REFRESH_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// A period of epochal confirmation, a UTC day, in ms (12.10).
 pub const PERIOD_MS: u64 = 24 * 60 * 60 * 1000;
+/// How far a leaf's new `updated` may be from the `t` of the post that
+/// carries it, and how long after its previous one a leaf may commit again
+/// past its streak: 10 minutes, in ms (12.3, 12.7).
+pub const UPDATED_SKEW_MS: u64 = 10 * 60 * 1000;
+/// The most epochs in a row a leaf may start before it has to wait
+/// (12.7).
+pub const STREAK_LIMIT: u8 = 3;
+/// How many epochs back the group checks look: 16 (12.7).
+pub const LOOKBACK_EPOCHS: u64 = 16;
+/// How far back by `t` an impostor repair undoes, and how long after a
+/// resync commit its stragglers may be removed: 24 hours, in ms (12.7).
+pub const LOOKBACK_MS: u64 = 24 * 60 * 60 * 1000;
+/// How long a public room's leaf must have been quiet to be removed as
+/// inactive by a later leaf of the same device: 48 hours, in ms (12.7).
+pub const INACTIVE_AFTER_MS: u64 = 48 * 60 * 60 * 1000;
+/// The most commits a [`History`] keeps; older ones beyond the look-back
+/// windows are dropped first.
+pub const MAX_HISTORY_COMMITS: usize = 8_192;
 
 /// Whether a fact from a key file or the key log is known yet (12.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fact<T> {
     /// It is known.
     Known(T),
-    /// It could not be fetched right now (4.4). Check again later.
+    /// It could not be fetched right now (4.4), or a record it needs is
+    /// still pending (4.5). Check again later.
     Unknown,
 }
 
-/// What the checks need from key files and the key log (4.4, 4.5). The
-/// caller fetches and caches them.
+/// What the key checks need from key files and the key log (4.4, 4.5). The
+/// caller fetches and caches them. Every fact stays true once it is true,
+/// so devices that fetch later reach the same answer (12.7).
 pub trait KeyFacts {
     /// The raw device key of `uid`'s device `device_id`, if that device is
-    /// current in `uid`'s key file and its record is in the key log (4.5):
+    /// current in `uid`'s key file and its record has been accepted (4.5):
     /// `Known(Some(key))`, or `Known(None)` if it is not.
     fn current_device_key(&self, uid: &Uid, device_id: &DeviceId) -> Fact<Option<Vec<u8>>>;
 
-    /// Whether `uid`'s key file has removed the device `device_id` (4.4).
+    /// Whether `uid`'s chain has removed the device `device_id` by record
+    /// (4.4), as far as the device has accepted it.
     fn device_removed(&self, uid: &Uid, device_id: &DeviceId) -> Fact<bool>;
+
+    /// Whether `uid`'s chain ends with a `retire` record (4.4).
+    fn identity_retired(&self, uid: &Uid) -> Fact<bool>;
+}
+
+/// The post that carries a commit or proposal, as the checks need it
+/// (5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitPost {
+    /// The post's `t`, when the server accepted it, in ms since
+    /// 1970-01-01T00:00:00Z. A server checking a public room's commit uses
+    /// its own clock, which gives the post its `t`.
+    pub t: u64,
+    /// The post's `next`, the SHA-384 hash of the send token of the epoch a
+    /// commit creates (5.2, 12.6). Only commits have one.
+    pub next: Option<[u8; HASH_LEN]>,
 }
 
 /// One leaf of a group.
@@ -92,6 +138,9 @@ pub struct LeafView {
     /// Whether it has not committed since it was added: it still holds the
     /// leaf node of its KeyPackage.
     pub from_key_package: bool,
+    /// The end of its KeyPackage's lifetime, in ms, while it still holds
+    /// its KeyPackage's leaf node (12.5).
+    pub lifetime_end: Option<u64>,
     /// Whether its encryption key passes the checks of 12.2.
     pub encryption_key_ok: bool,
 }
@@ -99,24 +148,61 @@ pub struct LeafView {
 impl LeafView {
     /// Reads a leaf node.
     pub fn of(index: LeafNodeIndex, leaf: &LeafNode) -> LeafView {
+        let lifetime_end = match leaf.leaf_node_source() {
+            LeafNodeSource::KeyPackage(lifetime) => Some(lifetime.not_after().saturating_mul(1000)),
+            _ => None,
+        };
         LeafView {
             index,
             identity: RisalaIdentity::from_credential(leaf.credential()).ok(),
             profile: RisalaProfile::of_leaf(leaf),
             signature_key: leaf.signature_key().as_slice().to_vec(),
-            from_key_package: matches!(leaf.leaf_node_source(), LeafNodeSource::KeyPackage(_)),
+            from_key_package: lifetime_end.is_some(),
+            lifetime_end,
             encryption_key_ok: x_wing_public_key_ok(&encryption_key_bytes(leaf.encryption_key())),
         }
     }
 
-    fn uid(&self) -> Option<&Uid> {
+    /// The leaf's uid.
+    pub fn uid(&self) -> Option<&Uid> {
         self.identity.as_ref().map(|identity| &identity.uid)
+    }
+
+    fn device_id(&self) -> Option<DeviceId> {
+        self.identity
+            .as_ref()
+            .and_then(|identity| identity.device_id)
+    }
+
+    fn is_guest(&self) -> bool {
+        self.identity.as_ref().is_some_and(RisalaIdentity::is_guest)
+    }
+
+    fn updated(&self) -> u64 {
+        self.profile.as_ref().map_or(0, |p| p.updated)
+    }
+
+    /// The `updated` that the stale rule uses (12.7): for a leaf that has
+    /// not committed since it was added, the end of its KeyPackage's
+    /// lifetime if that is later.
+    pub fn stale_updated(&self) -> u64 {
+        self.updated().max(self.lifetime_end.unwrap_or(0))
+    }
+
+    /// Whether this leaf may have committed since `since`, by its own
+    /// `updated`, which stays within 10 minutes of the `t` of each of its
+    /// commits (12.3): a leaf that has never committed, or whose `updated`
+    /// is older, cannot have.
+    fn may_have_committed_since(&self, since: u64) -> bool {
+        !self.from_key_package && self.updated().saturating_add(UPDATED_SKEW_MS) >= since
     }
 }
 
 /// A group as of one epoch: its conversation extension and its leaves.
 #[derive(Debug, Clone)]
 pub struct GroupView {
+    /// The epoch.
+    pub epoch: u64,
     /// The conversation extension, or why it is not acceptable.
     pub conversation: Result<RisalaConversation, ConversationError>,
     /// The leaves, in index order.
@@ -135,6 +221,7 @@ impl GroupView {
             })
             .collect();
         GroupView {
+            epoch: group.group_context().epoch().as_u64(),
             conversation: RisalaConversation::from_extensions(group.group_context().extensions()),
             leaves,
         }
@@ -152,32 +239,498 @@ impl GroupView {
             .filter(move |leaf| leaf.uid() == Some(uid))
     }
 
-    /// The leaves whose profile's `updated` is more than 35 days older than
-    /// `own_updated`, which any member may remove (12.7).
-    pub fn stale_leaves(&self, own_updated: u64) -> Vec<LeafNodeIndex> {
+    /// The group's median `updated` (12.7): the value at position
+    /// floor(n/2), counting from 0, of the sorted `updated` of the leaves
+    /// that carry a profile. `None` if no leaf has one.
+    ///
+    /// 12.7 also says that a leaf that never committed counts the end of
+    /// its KeyPackage's lifetime as its `updated`. That is used for the
+    /// leaf being judged ([`LeafView::stale_updated`]) but not here: a group
+    /// whose leaves were mostly just added would otherwise have a median up
+    /// to 12 weeks in the future, and every leaf that had committed would
+    /// be stale at once.
+    pub fn median_updated(&self) -> Option<u64> {
+        let mut values: Vec<u64> = self
+            .leaves
+            .iter()
+            .filter_map(|leaf| leaf.profile.as_ref().map(|p| p.updated))
+            .collect();
+        values.sort_unstable();
+        values.get(values.len() / 2).copied()
+    }
+
+    /// Whether the leaf is stale: its `updated` is more than 35 days older
+    /// than the group's median `updated` (12.7).
+    pub fn is_stale(&self, leaf: &LeafView) -> bool {
+        self.median_updated()
+            .is_some_and(|median| median.saturating_sub(leaf.stale_updated()) > STALE_AFTER_MS)
+    }
+
+    /// The stale leaves, which any member may remove, at most
+    /// [`max_stale_removals`](Self::max_stale_removals) in a commit (12.7).
+    pub fn stale_leaves(&self) -> Vec<LeafNodeIndex> {
         self.leaves
             .iter()
-            .filter(|leaf| {
-                leaf.profile
-                    .as_ref()
-                    .is_some_and(|profile| is_stale(profile.updated, own_updated))
-            })
+            .filter(|leaf| self.is_stale(leaf))
             .map(|leaf| leaf.index)
             .collect()
     }
-}
 
-fn is_stale(updated: u64, own_updated: u64) -> bool {
-    own_updated.saturating_sub(updated) > STALE_AFTER_MS
+    /// The most stale leaves one commit may remove: max(1, floor(n/10)),
+    /// where n is the number of leaves (12.7).
+    pub fn max_stale_removals(&self) -> usize {
+        (self.leaves.len() / 10).max(1)
+    }
+
+    /// Whether some identity in `owners` has a leaf (6.3). In a room whose
+    /// owners are gone, moderators may do what owners may.
+    fn owner_present(&self, conversation: &RisalaConversation) -> bool {
+        conversation
+            .owners
+            .iter()
+            .any(|uid| self.leaves_of(uid).next().is_some())
+    }
+
+    /// The role of `uid` for what a commit may do, as of this epoch: a
+    /// moderator counts as an owner in a room whose owners are gone (6.3).
+    pub fn effective_role(&self, uid: &Uid) -> Role {
+        let Ok(conversation) = &self.conversation else {
+            return Role::Member;
+        };
+        match conversation.role(uid) {
+            Role::Mod if !self.owner_present(conversation) => Role::Owner,
+            role => role,
+        }
+    }
 }
 
 /// Whether the device should commit a fresh leaf now: its own leaf's
-/// profile says it last committed more than a week ago, by `now_ms` (12.7).
-/// A leaf that has not committed since it joined counts from its
-/// KeyPackage's profile.
+/// profile says it was last committed, or updated through an Update, more
+/// than a week ago, by `now_ms` (12.7).
 pub fn needs_refresh(own_profile: &RisalaProfile, now_ms: u64) -> bool {
     now_ms.saturating_sub(own_profile.updated) > REFRESH_AFTER_MS
 }
+
+// ---------------------------------------------------------------------
+// History
+
+/// How a leaf left a group, for the rule that lets any member add back a
+/// device that had a leaf in the last 16 epochs (12.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Removal {
+    /// By the commit of its own SelfRemove (6.1).
+    SelfRemove,
+    /// By a commit of an owner or moderator who may kick it (6.4).
+    Kick,
+    /// For any other reason, for example a key check.
+    Other,
+}
+
+/// A leaf a commit removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedLeaf {
+    /// Its index.
+    pub index: u32,
+    /// Its uid.
+    pub uid: String,
+    /// Its device id, empty for a guest.
+    pub device_id: Vec<u8>,
+    /// How it was removed.
+    pub how: Removal,
+}
+
+/// A leaf a commit added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddedLeaf {
+    /// Its index.
+    pub index: u32,
+    /// Its uid.
+    pub uid: String,
+    /// Its device id, empty for a guest.
+    pub device_id: Vec<u8>,
+}
+
+/// A commit a device applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRecord {
+    /// The epoch it was for; it started the next one.
+    pub epoch: u64,
+    /// Its post's `t`.
+    pub t: u64,
+    /// The committer's leaf index after the commit (a resync commit's
+    /// joiner has a new one).
+    pub committer: u32,
+    /// The committer's uid.
+    pub committer_uid: String,
+    /// The encoded conversation extension before and after, if it changed.
+    pub extension_change: Option<(Vec<u8>, Vec<u8>)>,
+    /// The leaves it removed.
+    pub removed: Vec<RemovedLeaf>,
+    /// The leaves it added, the joiner of an external commit included.
+    pub added: Vec<AddedLeaf>,
+    /// Whether it was an authority commit (12.7), which an impostor repair
+    /// may undo.
+    pub authority: bool,
+}
+
+/// What a public room's devices remember of the last resync commit
+/// (12.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResyncState {
+    /// The resync commit's `t`.
+    pub t: u64,
+    /// The leaves that have committed or been added since.
+    pub active: BTreeSet<u32>,
+}
+
+/// What a device, or a public room's server, saw of a group's recent
+/// commits and proposals, for the group checks that look back (12.7). The
+/// caller keeps it with the group, and updates it with each commit it
+/// applies ([`crate::group::apply_commit`],
+/// [`crate::group::merge_own_commit`]) and each RESYNC line and Update
+/// proposal it reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// The first epoch whose commit this history holds: the epoch the
+    /// device joined in.
+    pub since_epoch: u64,
+    /// The earliest `t` from which this history holds every commit.
+    pub since_t: u64,
+    /// The leaf that started the current epoch: the committer of the last
+    /// commit, or for a device that joined by Welcome, the GroupInfo's
+    /// signer (12.3). `None` in epoch 0.
+    pub started_by: Option<u32>,
+    /// Recent commits, oldest first, for 16 epochs and 24 hours.
+    pub commits: Vec<CommitRecord>,
+    /// The `t` of the commit that added each leaf added since
+    /// `since_epoch`, by leaf index.
+    pub added_at: BTreeMap<u32, u64>,
+    /// The newest epoch in which each leaf posted RESYNC (12.9), by leaf
+    /// index.
+    pub resyncs: BTreeMap<u32, u64>,
+    /// The `t` of the posts of the current epoch's Update proposals, by
+    /// ProposalRef (12.3).
+    pub update_times: Vec<(Vec<u8>, u64)>,
+    /// In a public room, the last resync commit, for 24 hours (12.7).
+    pub resync: Option<ResyncState>,
+}
+
+/// Whether a group check that looks back could be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup<T> {
+    Known(T),
+    Unknown,
+}
+
+impl History {
+    /// The history of a group this device has just created, in epoch 0, at
+    /// `t`: it holds everything.
+    pub fn created(t: u64) -> History {
+        History {
+            since_epoch: 0,
+            since_t: 0,
+            added_at: BTreeMap::from([(0, t)]),
+            ..History::default()
+        }
+    }
+
+    /// The history of a group this device has just joined by Welcome, in
+    /// `epoch`, whose GroupInfo `started_by` signed, at about `t` (by the
+    /// first post it applies, or its clock), with its own leaf at
+    /// `own_index`. It holds nothing earlier.
+    pub fn joined(epoch: u64, started_by: u32, t: u64, own_index: u32) -> History {
+        History {
+            since_epoch: epoch,
+            since_t: t,
+            started_by: Some(started_by),
+            added_at: BTreeMap::from([(own_index, t)]),
+            ..History::default()
+        }
+    }
+
+    /// Notes that the leaf at `index` posted RESYNC in `epoch` (12.7,
+    /// 12.9).
+    pub fn note_resync(&mut self, index: LeafNodeIndex, epoch: u64) {
+        let entry = self.resyncs.entry(index.u32()).or_insert(epoch);
+        *entry = (*entry).max(epoch);
+    }
+
+    /// Notes the `t` of the post of an Update proposal, by its ProposalRef
+    /// (12.3).
+    pub fn note_update(&mut self, reference: &[u8], t: u64) {
+        if !self.update_times.iter().any(|(r, _)| r == reference) {
+            self.update_times.push((reference.to_vec(), t));
+        }
+    }
+
+    fn update_time(&self, reference: &[u8]) -> Option<u64> {
+        self.update_times
+            .iter()
+            .find(|(r, _)| r == reference)
+            .map(|(_, t)| *t)
+    }
+
+    /// Whether this history holds every commit of the epochs from `epoch`
+    /// on.
+    fn covers_epoch(&self, epoch: u64) -> bool {
+        self.since_epoch <= epoch
+    }
+
+    /// Whether this history holds every commit whose `t` is `t` or later.
+    fn covers_time(&self, t: u64) -> bool {
+        self.since_t <= t
+    }
+
+    /// The first epoch of the last 16, as of `epoch` (12.7).
+    fn lookback_epoch(epoch: u64) -> u64 {
+        epoch.saturating_sub(LOOKBACK_EPOCHS - 1)
+    }
+
+    /// The `t` of the commit that ended `epoch`, if this history holds it
+    /// (12.9).
+    pub fn epoch_end(&self, epoch: u64) -> Option<u64> {
+        self.commits
+            .iter()
+            .rev()
+            .find(|record| record.epoch == epoch)
+            .map(|record| record.t)
+    }
+
+    /// The commits whose committer was the leaf now at `index`, newest
+    /// first, back to the commit that added it.
+    fn commits_by(&self, index: u32) -> Vec<&CommitRecord> {
+        let mut out = Vec::new();
+        for record in self.commits.iter().rev() {
+            if record.committer == index {
+                out.push(record);
+            }
+            // Before this, another leaf held the index; a resync commit's
+            // joiner added itself, and counts.
+            if record.added.iter().any(|a| a.index == index)
+                || record.removed.iter().any(|r| r.index == index)
+            {
+                break;
+            }
+        }
+        out
+    }
+
+    /// When the leaf at `index` was added: `Known(Some(t))`, `Known(None)`
+    /// if it was added before this history starts, which is known to be
+    /// before `t_floor`, or `Unknown`.
+    fn added_time(&self, index: u32, t_floor: u64) -> Lookup<Option<u64>> {
+        match self.added_at.get(&index) {
+            Some(t) => Lookup::Known(Some(*t)),
+            None if self.covers_time(t_floor) => Lookup::Known(None),
+            None => Lookup::Unknown,
+        }
+    }
+
+    /// Whether `uid`'s device may be added back by any member: it had a
+    /// leaf in one of the last 16 epochs, and its last leaf was not removed
+    /// by its SelfRemove or a kick (12.7).
+    fn may_add_back(&self, uid: &Uid, epoch: u64) -> Lookup<bool> {
+        let from = History::lookback_epoch(epoch);
+        let last = self
+            .commits
+            .iter()
+            .rev()
+            .filter(|record| record.epoch >= from)
+            .flat_map(|record| record.removed.iter().rev())
+            .find(|removed| removed.uid == uid.as_str());
+        match last {
+            Some(removed) => Lookup::Known(removed.how == Removal::Other),
+            None if self.covers_epoch(from) => Lookup::Known(false),
+            None => Lookup::Unknown,
+        }
+    }
+
+    /// Whether the leaf at `index` posted RESYNC in one of the last 16
+    /// epochs (12.7).
+    fn posted_resync(&self, index: LeafNodeIndex, epoch: u64) -> Lookup<bool> {
+        let from = History::lookback_epoch(epoch);
+        match self.resyncs.get(&index.u32()) {
+            Some(e) if *e >= from => Lookup::Known(true),
+            _ if self.covers_epoch(from) => Lookup::Known(false),
+            _ => Lookup::Unknown,
+        }
+    }
+
+    /// The commits of the leaf at `index` whose `t` is at most 24 hours
+    /// before `t`, oldest first, for an impostor repair (12.7); none unless
+    /// one of them was an authority commit, since only those make a device
+    /// challenge the leaf and find an impostor.
+    fn repairable_commits(&self, index: u32, t: u64) -> Vec<&CommitRecord> {
+        let from = t.saturating_sub(LOOKBACK_MS);
+        let mut out: Vec<&CommitRecord> = self
+            .commits_by(index)
+            .into_iter()
+            .filter(|record| record.t >= from)
+            .collect();
+        if !out.iter().any(|record| record.authority) {
+            return Vec::new();
+        }
+        out.reverse();
+        out
+    }
+
+    /// Whether the leaf at `index` has committed or been added since this
+    /// history starts.
+    fn active_since_start(&self, index: u32) -> bool {
+        !self.commits_by(index).is_empty() || self.added_at.contains_key(&index)
+    }
+
+    /// Records a commit the device applied, or a public room's server
+    /// accepted: `before` and `after` are the group as of the epoch it was
+    /// for and the one it started, `commit` what it did, `verdict` what its
+    /// checks found, and `post` its post (12.7).
+    pub fn record(
+        &mut self,
+        before: &GroupView,
+        commit: &CommitView,
+        verdict: &Verdict,
+        after: &GroupView,
+        post: &CommitPost,
+    ) {
+        let removed_indices = commit.removed_indices();
+        let old = before.conversation.as_ref().ok();
+        let committer_uid = commit.path_leaf.as_ref().and_then(LeafView::uid).cloned();
+        let mut removed = Vec::new();
+        for index in &removed_indices {
+            let Some(leaf) = before.leaf(*index) else {
+                continue;
+            };
+            let Some(identity) = &leaf.identity else {
+                continue;
+            };
+            let how = if commit.self_removes(*index) {
+                Removal::SelfRemove
+            } else if let (Some(old), Some(committer), Committer::Member(_)) =
+                (old, committer_uid.as_ref(), commit.committer)
+            {
+                if *committer != identity.uid && may_kick(old, before, committer, &identity.uid) {
+                    Removal::Kick
+                } else {
+                    Removal::Other
+                }
+            } else {
+                Removal::Other
+            };
+            removed.push(RemovedLeaf {
+                index: index.u32(),
+                uid: identity.uid.as_str().to_owned(),
+                device_id: identity
+                    .device_id
+                    .map(|d| d.as_bytes().to_vec())
+                    .unwrap_or_default(),
+                how,
+            });
+        }
+        let added: Vec<AddedLeaf> = after
+            .leaves
+            .iter()
+            .filter(|leaf| {
+                before.leaf(leaf.index).is_none() || removed_indices.contains(&leaf.index)
+            })
+            .filter_map(|leaf| {
+                let identity = leaf.identity.as_ref()?;
+                Some(AddedLeaf {
+                    index: leaf.index.u32(),
+                    uid: identity.uid.as_str().to_owned(),
+                    device_id: identity
+                        .device_id
+                        .map(|d| d.as_bytes().to_vec())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+        let committer = match commit.committer {
+            Committer::Member(index) => index.u32(),
+            Committer::External => after
+                .leaves
+                .iter()
+                .find(|leaf| {
+                    !leaf.from_key_package
+                        && added.iter().any(|a| a.index == leaf.index.u32())
+                        && leaf.identity.as_ref()
+                            == commit.path_leaf.as_ref().and_then(|p| p.identity.as_ref())
+                })
+                .map_or(u32::MAX, |leaf| leaf.index.u32()),
+        };
+        let extension_change = match (&before.conversation, &after.conversation) {
+            (Ok(a), Ok(b)) if a != b => Some((a.encode(), b.encode())),
+            _ => None,
+        };
+        for leaf in &removed {
+            self.added_at.remove(&leaf.index);
+            self.resyncs.remove(&leaf.index);
+        }
+        for leaf in &added {
+            self.added_at.insert(leaf.index, post.t);
+        }
+        self.update_times.clear();
+        self.started_by = Some(committer);
+        if verdict.resync {
+            self.resync = Some(ResyncState {
+                t: post.t,
+                active: BTreeSet::from([committer]),
+            });
+        } else if let Some(resync) = &mut self.resync {
+            if post.t.saturating_sub(resync.t) > LOOKBACK_MS {
+                self.resync = None;
+            } else {
+                for leaf in &removed {
+                    resync.active.remove(&leaf.index);
+                }
+                resync.active.insert(committer);
+                resync.active.extend(added.iter().map(|a| a.index));
+            }
+        }
+        self.commits.push(CommitRecord {
+            epoch: before.epoch,
+            t: post.t,
+            committer,
+            committer_uid: committer_uid
+                .map(|u| u.as_str().to_owned())
+                .unwrap_or_default(),
+            extension_change,
+            removed,
+            added,
+            authority: verdict.authority,
+        });
+        self.prune(after.epoch, post.t);
+    }
+
+    /// Drops commits outside both look-back windows, and the oldest beyond
+    /// [`MAX_HISTORY_COMMITS`], after which this history starts later.
+    fn prune(&mut self, epoch: u64, t: u64) {
+        let from_epoch = History::lookback_epoch(epoch);
+        let from_t = t.saturating_sub(LOOKBACK_MS + INACTIVE_AFTER_MS);
+        self.commits
+            .retain(|record| record.epoch >= from_epoch || record.t >= from_t);
+        if self.commits.len() > MAX_HISTORY_COMMITS {
+            let excess = self.commits.len() - MAX_HISTORY_COMMITS;
+            self.commits.drain(..excess);
+            if let Some(oldest) = self.commits.first() {
+                self.since_epoch = self.since_epoch.max(oldest.epoch);
+                self.since_t = self.since_t.max(oldest.t);
+            }
+        }
+    }
+
+    /// The leaf whose commit would start the next epoch's streak count for
+    /// `index`: the `streak` a commit by that leaf must carry (12.3).
+    pub fn expected_streak(&self, index: LeafNodeIndex, previous: u8) -> u8 {
+        if self.started_by == Some(index.u32()) {
+            previous.saturating_add(1)
+        } else {
+            1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Joining
 
 /// Why a group fails the checks of joining (12.7). The device MUST NOT
 /// join it.
@@ -202,9 +755,17 @@ pub enum JoinError {
     /// A guest leaf where guests may not be.
     #[error("a guest leaf where guests may not be")]
     Guest,
+    /// Two leaves of one device, outside a public room.
+    #[error("two leaves of one device")]
+    SameDevice,
     /// The group is over its size limits.
     #[error("the group is over its size limits")]
     TooLarge,
+    /// No leaf has the signature key of the KeyPackage the device was added
+    /// from: someone may have added the device with a key of their own
+    /// (12.7). The device tells the user.
+    #[error("the device's leaf does not have its KeyPackage's key")]
+    NotOwnLeaf,
 }
 
 /// What the joining device expects of a group (12.7).
@@ -238,6 +799,8 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
     {
         return Err(JoinError::NotAParticipant);
     }
+    let mut devices = BTreeSet::new();
+    let mut guests_in_direct = BTreeMap::<&Uid, usize>::new();
     for leaf in &group.leaves {
         let identity = leaf.identity.as_ref().ok_or(JoinError::Leaf)?;
         if (!identity.is_guest() && leaf.profile.is_none()) || !leaf.encryption_key_ok {
@@ -248,11 +811,17 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
         }
         match &participants {
             Some(participants) => {
-                // A guest may be a participant of a direct conversation, to
-                // report (4.2, 5.8), although 12.7 allows guest leaves only
-                // in public rooms; see the report of task M1.
+                // A guest's report conversation: the guest is a named
+                // participant, with exactly one leaf (12.7, 5.8).
                 if !participants.contains(&identity.uid) {
                     return Err(JoinError::NotAParticipant);
+                }
+                if identity.is_guest() {
+                    let count = guests_in_direct.entry(&identity.uid).or_default();
+                    *count += 1;
+                    if *count > 1 {
+                        return Err(JoinError::Guest);
+                    }
                 }
             }
             None => {
@@ -264,6 +833,12 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
                 }
             }
         }
+        if conversation.kind != ConversationKind::PublicRoom
+            && let Some(device_id) = identity.device_id
+            && !devices.insert((&identity.uid, device_id))
+        {
+            return Err(JoinError::SameDevice);
+        }
     }
     if !within_limits(&conversation, group.leaves.iter().filter_map(LeafView::uid)) {
         return Err(JoinError::TooLarge);
@@ -273,7 +848,7 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
 
 /// Whether a group of these leaves' uids is within the limits of 6.1.
 /// Direct conversations have no limits of their own in 6.1: they get a
-/// private room's (see the report of task M1).
+/// private room's.
 fn within_limits<'a>(
     conversation: &RisalaConversation,
     uids: impl Iterator<Item = &'a Uid>,
@@ -291,12 +866,15 @@ fn within_limits<'a>(
     identities.len() <= max_identities && leaves <= max_leaves
 }
 
+// ---------------------------------------------------------------------
+// Commits
+
 /// Who made a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Committer {
     /// A member, by its leaf index as of the commit's epoch.
     Member(LeafNodeIndex),
-    /// A new member, by external commit.
+    /// A device joining by external commit: in risala, a resync commit.
     External,
 }
 
@@ -315,6 +893,15 @@ pub enum ProposalView {
     Remove(LeafNodeIndex),
     /// A SelfRemove of its sender's leaf, by reference.
     SelfRemove(LeafNodeIndex),
+    /// An Update of its sender's leaf, by reference (12.6, 12.10).
+    Update {
+        /// The sender, whose leaf it replaces.
+        sender: LeafNodeIndex,
+        /// The new leaf node.
+        leaf: Box<LeafView>,
+        /// Its ProposalRef, to find the `t` of its post in the [`History`].
+        reference: Vec<u8>,
+    },
     /// A GroupContextExtensions proposal, by value.
     GroupContextExtensions,
     /// An ExternalInit, in an external commit.
@@ -334,11 +921,6 @@ pub struct CommitView {
     /// The committer's new leaf from the commit's path, or `None` if it has
     /// no path.
     pub path_leaf: Option<LeafView>,
-    /// The device binding of the path leaf, which an external commit's
-    /// leaf carries (12.3).
-    pub path_binding: Option<DeviceBinding>,
-    /// The path leaf's encryption key.
-    pub path_encryption_key: Vec<u8>,
     /// The conversation extension of the epoch the commit creates.
     pub new_conversation: Result<RisalaConversation, ConversationError>,
     /// The leaves that have posted a SelfRemove that is pending in the
@@ -366,12 +948,6 @@ impl CommitView {
             // The new leaf's index is not known here; the checks use the
             // committer's.
             path_leaf: path.map(|leaf| LeafView::of(LeafNodeIndex::new(u32::MAX), leaf)),
-            path_binding: path
-                .and_then(|leaf| DeviceBinding::from_extensions(leaf.extensions()))
-                .and_then(Result::ok),
-            path_encryption_key: path
-                .map(|leaf| encryption_key_bytes(leaf.encryption_key()))
-                .unwrap_or_default(),
             new_conversation: RisalaConversation::from_extensions(
                 staged.group_context().extensions(),
             ),
@@ -383,6 +959,38 @@ impl CommitView {
                 })
                 .collect(),
         }
+    }
+
+    /// Every leaf it removes, by Remove or SelfRemove.
+    pub fn removed_indices(&self) -> BTreeSet<LeafNodeIndex> {
+        self.proposals
+            .iter()
+            .filter_map(|p| match p {
+                ProposalView::Remove(i) | ProposalView::SelfRemove(i) => Some(*i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn self_removes(&self, index: LeafNodeIndex) -> bool {
+        self.pending_self_removes.contains(&index)
+            || self
+                .proposals
+                .iter()
+                .any(|p| matches!(p, ProposalView::SelfRemove(i) if *i == index))
+    }
+
+    /// The identities of the leaves it adds from KeyPackages.
+    pub fn added_identities(&self) -> Vec<RisalaIdentity> {
+        self.proposals
+            .iter()
+            .filter_map(|p| match p {
+                ProposalView::Add { key_package, .. } => {
+                    RisalaIdentity::from_credential(key_package.leaf_node().credential()).ok()
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -399,11 +1007,17 @@ fn proposal_view(queued: &QueuedProposal) -> ProposalView {
         },
         (Proposal::Remove(remove), false, _) => ProposalView::Remove(remove.removed()),
         (Proposal::SelfRemove, true, Sender::Member(index)) => ProposalView::SelfRemove(*index),
+        (Proposal::Update(update), true, Sender::Member(index)) => ProposalView::Update {
+            sender: *index,
+            leaf: Box::new(LeafView::of(*index, update.leaf_node())),
+            reference: queued.proposal_reference_ref().as_slice().to_vec(),
+        },
         (Proposal::GroupContextExtensions(_), false, _) => ProposalView::GroupContextExtensions,
         (Proposal::ExternalInit(_), false, _) => ProposalView::ExternalInit,
         (Proposal::Add(_), ..) => ProposalView::NotAllowed("an Add by reference"),
         (Proposal::Remove(_), ..) => ProposalView::NotAllowed("a Remove by reference"),
         (Proposal::SelfRemove, ..) => ProposalView::NotAllowed("a SelfRemove by value"),
+        (Proposal::Update(_), ..) => ProposalView::NotAllowed("an Update by value"),
         (Proposal::GroupContextExtensions(_), ..) => {
             ProposalView::NotAllowed("a GroupContextExtensions by reference")
         }
@@ -419,22 +1033,37 @@ pub enum CommitError {
     /// It has no path.
     #[error("the commit has no path")]
     NoPath,
+    /// Its post has no `next`, or one that is not the hash of the new
+    /// epoch's send token (12.6).
+    #[error("the commit's next token hash is missing or wrong")]
+    NextToken,
     /// It holds a proposal that 12.6 does not allow, or one sent the wrong
     /// way.
     #[error("the commit holds {0}")]
     Proposal(&'static str),
-    /// An external commit outside a public room, or one that adds more
-    /// than the joiner.
-    #[error("an external commit that is not allowed")]
+    /// An external commit that is not a resync commit (12.7).
+    #[error("an external commit that is not a resync commit")]
     External,
     /// The group before the commit is not one this device would be in.
     #[error("the group's conversation extension is not acceptable")]
     Group,
-    /// The committer's leaf changes its credential, or its signature key
-    /// where 12.3 does not allow it, or has no profile, or an encryption
-    /// key that fails the checks of 12.2.
-    #[error("the committer's leaf changes in a way 12.3 does not allow")]
+    /// The committer's leaf, or an Update's, changes its credential, or its
+    /// signature key where 12.3 does not allow it, or has no profile, or an
+    /// encryption key that fails the checks of 12.2.
+    #[error("a leaf changes in a way 12.3 does not allow")]
     Leaf,
+    /// A guest's leaf commits or proposes an Update in a public room, or
+    /// adds someone in its report conversation after the first commit.
+    #[error("a guest's leaf may not do this")]
+    Guest,
+    /// A new `updated` is below the leaf's previous one, or more than 10
+    /// minutes from its post's `t` (12.3).
+    #[error("an updated time out of bounds")]
+    Updated,
+    /// The committer's `streak` is not the one 12.3 gives, or is past 3
+    /// without a reason (12.7).
+    #[error("the commit's streak is wrong or too long")]
+    Streak,
     /// The conversation extension changes in a way the committer may not
     /// make.
     #[error("the commit changes the conversation extension: {0}")]
@@ -442,16 +1071,15 @@ pub enum CommitError {
     /// An added KeyPackage is not acceptable.
     #[error("an added KeyPackage is not acceptable: {0}")]
     KeyPackage(KeyPackageError),
-    /// An added device's key is not a current, logged device of its
-    /// identity, or its binding does not verify under it.
-    #[error("an added device is not a current device of its identity")]
-    NotCurrentDevice,
     /// The committer may not add this identity.
     #[error("the committer may not add this identity")]
     Add,
     /// The committer may not remove this leaf.
     #[error("the committer may not remove this leaf")]
     Remove,
+    /// Two leaves of one device after the commit, outside a public room.
+    #[error("two leaves of one device")]
+    SameDevice,
     /// A ban that leaves the banned identity in the group, `guests none`
     /// that leaves guests, or a commit that leaves a leaf of a banned
     /// identity.
@@ -463,36 +1091,57 @@ pub enum CommitError {
     TooLarge,
 }
 
-/// The result of checks that passed.
+/// What the group checks of a valid commit found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Verdict {
-    /// Added devices whose key file or log could not be fetched: their
-    /// leaves are unconfirmed, and the device sends nothing in the group
-    /// until a later check passes. If one fails, it commits the leaf's
-    /// removal and warns the user (12.7).
-    pub unchecked_adds: Vec<RisalaIdentity>,
-    /// Removed leaves whose only reason was a key file that could not be
-    /// fetched: the removal stands, and the device warns the user (12.7).
-    pub unchecked_removals: Vec<LeafNodeIndex>,
+    /// Leaves that only a key check allows to be removed, outside public
+    /// rooms (12.7): [`key_checks`] checks them.
+    pub key_check_removals: Vec<LeafNodeIndex>,
+    /// Leaves it removes as an impostor repair (12.7). A device that has
+    /// confirmed one tells the user, and names the committer.
+    pub repairs: Vec<LeafNodeIndex>,
+    /// Whether it is a public room's resync commit (12.7).
+    pub resync: bool,
+    /// Whether it is an authority commit (12.7): one that only a role
+    /// allows, that removes leaves of the committer's own identity other
+    /// than its own, or that only an impostor repair allows. Devices
+    /// challenge its committer if they have not confirmed it (12.10).
+    pub authority: bool,
+    /// The group checks that look back which this device could not make,
+    /// since it joined since (12.7). The commit is applied all the same.
+    pub unchecked: Vec<&'static str>,
 }
 
-/// Checks a commit against the group as of the epoch it is for (12.6,
-/// 12.7). `now` is the time to check the lifetimes of added KeyPackages
-/// at.
+/// Why a leaf may be removed (12.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveReason {
+    Own,
+    SelfRemove,
+    Guest,
+    Kick,
+    Stale,
+    Resync,
+    Repair,
+    KeyCheck,
+    Inactive,
+    AfterResync,
+    /// A reason that looks back further than this device saw: the removal
+    /// stands (12.7).
+    Unchecked,
+}
+
+/// Checks a commit against the group as of the epoch it is for, the
+/// device's [`History`], and the post that carries it (12.6, 12.7). These
+/// are the group checks: they decide whether the commit is valid.
 ///
-/// 12.5 says devices check those lifetimes against the current time, as
-/// OpenMLS also does while processing the commit. A device that processes
-/// the commit after a lifetime has ended then rejects a commit that
-/// others applied; see the report of task M1.
-///
-/// The `next_token_hash` of the commit's RisalaAAD is checked separately,
-/// since it needs the next epoch's secrets
-/// ([`crate::group::next_token_hash_ok`]).
+/// That `next` is the hash of the new epoch's send token needs that
+/// epoch's secrets, so [`crate::group::check_received_commit`] checks it;
+/// here it only has to be there.
 pub fn check_commit(
     group: &GroupView,
     commit: &CommitView,
-    facts: &dyn KeyFacts,
-    now: SystemTime,
+    history: &History,
+    post: &CommitPost,
 ) -> Result<Verdict, CommitError> {
     let old = group
         .conversation
@@ -502,33 +1151,39 @@ pub fn check_commit(
         .new_conversation
         .as_ref()
         .map_err(|e| CommitError::Extension(e.to_string()))?;
+    if post.next.is_none() {
+        return Err(CommitError::NextToken);
+    }
     let path_leaf = commit.path_leaf.as_ref().ok_or(CommitError::NoPath)?;
     let path_identity = path_leaf.identity.as_ref().ok_or(CommitError::Leaf)?;
+    let committer_uid = &path_identity.uid;
+    let public = old.kind == ConversationKind::PublicRoom;
+    let t = post.t;
     let mut verdict = Verdict::default();
 
     // Proposal types and how they travel (12.6).
     for proposal in &commit.proposals {
-        if let ProposalView::NotAllowed(what) = proposal {
-            return Err(CommitError::Proposal(what));
+        match proposal {
+            ProposalView::NotAllowed(what) => return Err(CommitError::Proposal(what)),
+            ProposalView::Update { .. } if old.confirm != ConfirmMode::Epochal => {
+                return Err(CommitError::Proposal("an Update outside an epochal group"));
+            }
+            _ => {}
         }
     }
-    let changes_extensions = commit
-        .proposals
-        .iter()
-        .any(|p| matches!(p, ProposalView::GroupContextExtensions));
+    let mut removed: BTreeSet<LeafNodeIndex> = BTreeSet::new();
+    for proposal in &commit.proposals {
+        if let ProposalView::Remove(index) | ProposalView::SelfRemove(index) = proposal
+            && !removed.insert(*index)
+        {
+            return Err(CommitError::Proposal("a leaf removed twice"));
+        }
+    }
 
     // The committer and its leaf (12.3, 12.7).
     let committer_old = match commit.committer {
         Committer::Member(index) => {
             let old_leaf = group.leaf(index).ok_or(CommitError::Leaf)?;
-            if old_leaf.identity.as_ref() != Some(path_identity) {
-                return Err(CommitError::Leaf);
-            }
-            if old_leaf.signature_key != path_leaf.signature_key
-                && !signature_key_change_allowed(old, old_leaf, path_leaf)
-            {
-                return Err(CommitError::Leaf);
-            }
             if commit
                 .proposals
                 .iter()
@@ -538,79 +1193,80 @@ pub fn check_commit(
                     "an ExternalInit in a member's commit",
                 ));
             }
+            if public && old_leaf.is_guest() {
+                return Err(CommitError::Guest);
+            }
+            check_new_leaf(old, old_leaf, path_leaf, t)?;
+            if let Some(new_profile) = &path_leaf.profile {
+                let previous = old_leaf.profile.as_ref().map_or(0, |p| p.streak);
+                let expected = history.expected_streak(index, previous);
+                if new_profile.streak != expected {
+                    return Err(CommitError::Streak);
+                }
+                if expected > STREAK_LIMIT {
+                    let own_removes_only = !commit.proposals.is_empty()
+                        && commit.proposals.iter().all(|p| match p {
+                            ProposalView::Remove(i) | ProposalView::SelfRemove(i) => {
+                                group.leaf(*i).and_then(LeafView::uid) == Some(committer_uid)
+                            }
+                            _ => false,
+                        });
+                    let waited =
+                        new_profile.updated >= old_leaf.updated().saturating_add(UPDATED_SKEW_MS);
+                    if !own_removes_only && !waited {
+                        return Err(CommitError::Streak);
+                    }
+                }
+            }
             Some(old_leaf)
         }
         Committer::External => {
-            check_external(old, commit, path_identity, facts, &mut verdict)?;
+            check_resync(group, old, commit, history, post, &mut verdict)?;
             None
         }
     };
-    if (!path_identity.is_guest() && path_leaf.profile.is_none()) || !path_leaf.encryption_key_ok {
+    if !path_leaf.encryption_key_ok {
         return Err(CommitError::Leaf);
     }
-    let committer_uid = &path_identity.uid;
-    let committer_updated = path_leaf.profile.as_ref().map_or(0, |p| p.updated);
 
-    // The conversation extension (12.4, 6.2, 6.3).
-    if changes_extensions {
-        old.check_change(new, committer_uid)
-            .map_err(|e| CommitError::Extension(e.to_string()))?;
-    } else if new != old {
-        return Err(CommitError::Extension("changed without a proposal".into()));
-    }
-
-    // Removes (12.7, 6.3, 6.4).
-    let mut removed: BTreeSet<LeafNodeIndex> = BTreeSet::new();
+    // Updates (12.3, 12.7, 12.10).
     for proposal in &commit.proposals {
-        if let ProposalView::Remove(index) | ProposalView::SelfRemove(index) = proposal
-            && !removed.insert(*index)
-        {
-            return Err(CommitError::Proposal("a leaf removed twice"));
-        }
-    }
-    let removed_uids: BTreeMap<&Uid, usize> = removed
-        .iter()
-        .filter_map(|i| group.leaf(*i)?.uid())
-        .fold(BTreeMap::new(), |mut counts, uid| {
-            *counts.entry(uid).or_default() += 1;
-            counts
-        });
-    for proposal in &commit.proposals {
-        let ProposalView::Remove(index) = proposal else {
+        let ProposalView::Update {
+            sender,
+            leaf,
+            reference,
+        } = proposal
+        else {
             continue;
         };
-        let leaf = group.leaf(*index).ok_or(CommitError::Remove)?;
-        let identity = leaf.identity.as_ref().ok_or(CommitError::Remove)?;
-        let kicks_all = removed_uids.get(&identity.uid).copied()
-            == Some(group.leaves_of(&identity.uid).count());
-        let allowed = committer_old.is_some() && identity.uid == *committer_uid
-            || commit.pending_self_removes.contains(index)
-            || identity.is_guest()
-            || leaf
-                .profile
-                .as_ref()
-                .is_some_and(|p| is_stale(p.updated, committer_updated))
-            || (commit.committer == Committer::External
-                && identity.uid == *committer_uid
-                && identity.device_id == path_identity.device_id)
-            || (old.kind != ConversationKind::Direct
-                && kicks_all
-                && may_kick(old, committer_uid, &identity.uid));
-        if allowed {
-            continue;
+        let old_leaf = group.leaf(*sender).ok_or(CommitError::Leaf)?;
+        if old_leaf.is_guest() {
+            return Err(CommitError::Guest);
         }
-        let Some(device_id) = identity.device_id else {
-            return Err(CommitError::Remove);
-        };
-        match facts.device_removed(&identity.uid, &device_id) {
-            Fact::Known(true) => {}
-            Fact::Known(false) => return Err(CommitError::Remove),
-            Fact::Unknown => verdict.unchecked_removals.push(*index),
+        match history.update_time(reference) {
+            Some(update_t) => check_new_leaf(old, old_leaf, leaf, update_t)?,
+            None => {
+                // The device has not seen the Update's post, for example
+                // after a restart that lost it: the rest still holds.
+                check_new_leaf(old, old_leaf, leaf, leaf.updated())?;
+                verdict.unchecked.push("the time of an Update proposal");
+            }
         }
+        if leaf.profile.as_ref().is_some_and(|p| p.streak != 0) {
+            return Err(CommitError::Streak);
+        }
+    }
+
+    // Impostor repairs: leaves of another identity that may have commits
+    // to undo (12.7).
+    let repair = RepairScope::of(group, commit, history, committer_uid, t);
+    if !repair.unknown.is_empty() {
+        verdict.unchecked.push("an impostor repair");
     }
 
     // Adds (12.7, 6.1).
-    let mut added_uids: Vec<Uid> = Vec::new();
+    let mut added: Vec<RisalaIdentity> = Vec::new();
+    let mut uses_role = false;
     for proposal in &commit.proposals {
         let ProposalView::Add {
             key_package,
@@ -622,32 +1278,94 @@ pub fn check_commit(
         if commit.committer == Committer::External {
             return Err(CommitError::External);
         }
-        let identity = check_add(
+        let (identity, by_role) = check_add(
+            group,
             old,
             new,
-            group,
+            commit,
+            history,
+            &repair,
             committer_uid,
             key_package,
             *by_external_proposal,
-            facts,
-            now,
+            t,
             &mut verdict,
         )?;
-        added_uids.push(identity.uid);
+        uses_role |= by_role;
+        added.push(identity);
     }
 
-    // The group after the commit.
-    let mut after: Vec<&Uid> = group
+    // Removes (12.7, 6.3, 6.4).
+    let mut stale_left = group.max_stale_removals();
+    let mut removes_own_others = false;
+    if commit.committer != Committer::External {
+        for index in &removed {
+            let leaf = group.leaf(*index).ok_or(CommitError::Remove)?;
+            let reason = removal_reason(
+                group,
+                old,
+                commit,
+                history,
+                &repair,
+                committer_uid,
+                &added,
+                leaf,
+                &removed,
+                &mut stale_left,
+                t,
+                &mut verdict,
+            )?;
+            match reason {
+                RemoveReason::Own if Some(*index) != committer_old.map(|l| l.index) => {
+                    removes_own_others = true;
+                }
+                RemoveReason::Kick => uses_role = true,
+                RemoveReason::Repair => verdict.repairs.push(*index),
+                RemoveReason::KeyCheck => verdict.key_check_removals.push(*index),
+                _ => {}
+            }
+        }
+    }
+
+    // The conversation extension (12.4, 12.7, 6.2-6.4, 7.8).
+    let changes_extensions = commit
+        .proposals
+        .iter()
+        .any(|p| matches!(p, ProposalView::GroupContextExtensions));
+    let mut after: Vec<&LeafView> = group
         .leaves
         .iter()
         .filter(|leaf| !removed.contains(&leaf.index))
-        .filter_map(LeafView::uid)
         .collect();
-    after.extend(added_uids.iter());
+    let mut after_uids: Vec<&Uid> = after.iter().filter_map(|leaf| leaf.uid()).collect();
+    after_uids.extend(added.iter().map(|identity| &identity.uid));
     if commit.committer == Committer::External {
-        after.push(committer_uid);
+        after_uids.push(committer_uid);
     }
-    for uid in &after {
+    if changes_extensions {
+        let crosses_pairwise_limit = old.kind == ConversationKind::PrivateRoom
+            && old.confirm == ConfirmMode::Pairwise
+            && after_uids.iter().collect::<BTreeSet<_>>().len() > MAX_PAIRWISE_MEMBERS;
+        let rights = ChangeRights {
+            role: group.effective_role(committer_uid),
+            may_move_box: commit.proposals.len() == 1,
+            may_go_epochal: crosses_pairwise_limit,
+        };
+        let restored = repair.restore(old, new);
+        let candidate = restored.as_ref().unwrap_or(new);
+        match old.check_change(candidate, &rights) {
+            Ok(change) => uses_role |= change.used_role,
+            Err(e) if repair.unknown.is_empty() => {
+                return Err(CommitError::Extension(e.to_string()));
+            }
+            Err(_) => {}
+        }
+    } else if new != old {
+        return Err(CommitError::Extension("changed without a proposal".into()));
+    }
+
+    // The group after the commit (6.1, 6.2, 6.4, 12.7).
+    for uid in &after_uids {
         if new.is_banned(uid) {
             return Err(CommitError::LeftBehind);
         }
@@ -658,22 +1376,71 @@ pub fn check_commit(
             return Err(CommitError::LeftBehind);
         }
     }
-    if !within_limits(new, after.iter().copied()) {
+    if !public {
+        let mut devices = BTreeSet::new();
+        after.retain(|leaf| leaf.device_id().is_some());
+        let existing = after
+            .iter()
+            .filter_map(|leaf| Some((leaf.uid()?.clone(), leaf.device_id()?)));
+        let new_ones = added
+            .iter()
+            .filter_map(|identity| Some((identity.uid.clone(), identity.device_id?)));
+        for device in existing.chain(new_ones) {
+            if !devices.insert(device) {
+                return Err(CommitError::SameDevice);
+            }
+        }
+    }
+    if !within_limits(new, after_uids.iter().copied()) {
         return Err(CommitError::TooLarge);
     }
     if new.kind == ConversationKind::PrivateRoom && new.confirm == ConfirmMode::Pairwise {
-        let members: BTreeSet<&&Uid> = after.iter().collect();
+        let members: BTreeSet<&&Uid> = after_uids.iter().collect();
         if members.len() > MAX_PAIRWISE_MEMBERS {
             return Err(CommitError::TooLarge);
         }
     }
+    verdict.authority = uses_role || removes_own_others || !verdict.repairs.is_empty();
+    verdict.unchecked.sort_unstable();
+    verdict.unchecked.dedup();
     Ok(verdict)
 }
 
-/// Whether a leaf may commit a new signature key (12.3): once right after
+/// The checks of a leaf's new leaf node, from a commit's path or an
+/// Update, against its old one (12.3, 12.7): the same credential, a
+/// profile for an identity's leaf, an `updated` no lower than before and
+/// within 10 minutes of the `t` of the post that carries it, an encryption
+/// key that passes 12.2, and a new signature key only where 12.3 allows.
+fn check_new_leaf(
+    conversation: &RisalaConversation,
+    old: &LeafView,
+    new: &LeafView,
+    t: u64,
+) -> Result<(), CommitError> {
+    if old.identity != new.identity || !new.encryption_key_ok {
+        return Err(CommitError::Leaf);
+    }
+    match &new.profile {
+        None if old.is_guest() => {}
+        None => return Err(CommitError::Leaf),
+        Some(profile) => {
+            if profile.updated < old.updated() || profile.updated.abs_diff(t) > UPDATED_SKEW_MS {
+                return Err(CommitError::Updated);
+            }
+        }
+    }
+    if old.signature_key != new.signature_key
+        && !signature_key_change_allowed(conversation, old, new)
+    {
+        return Err(CommitError::Leaf);
+    }
+    Ok(())
+}
+
+/// Whether a leaf may take a new signature key (12.3): once right after
 /// joining, while it still holds its KeyPackage's leaf node, which covers
 /// a last-resort KeyPackage; and in an epochal group, in a later period
-/// than its last commit, by the `updated` of the profiles.
+/// than its last commit or Update, by the `updated` of the profiles.
 ///
 /// The leaf's own claims decide, rather than the time a device processes
 /// the commit, so that every device decides alike (7.2). Any leaf that
@@ -698,9 +1465,18 @@ fn signature_key_change_allowed(
 
 /// Whether `committer` may kick `target` from a room (6.3, 6.4): owners
 /// anyone but the last owner, moderators plain members, by their roles as
-/// of the commit's epoch.
-fn may_kick(conversation: &RisalaConversation, committer: &Uid, target: &Uid) -> bool {
-    match (conversation.role(committer), conversation.role(target)) {
+/// of the commit's epoch, a moderator counting as an owner in a room whose
+/// owners are gone.
+fn may_kick(
+    conversation: &RisalaConversation,
+    group: &GroupView,
+    committer: &Uid,
+    target: &Uid,
+) -> bool {
+    if conversation.kind == ConversationKind::Direct {
+        return false;
+    }
+    match (group.effective_role(committer), conversation.role(target)) {
         (Role::Owner, Role::Owner) => conversation.owners.len() > 1,
         (Role::Owner, _) => true,
         (Role::Mod, Role::Member) => true,
@@ -708,453 +1484,560 @@ fn may_kick(conversation: &RisalaConversation, committer: &Uid, target: &Uid) ->
     }
 }
 
-/// The checks of an external commit (12.7): only in public rooms; only the
-/// joiner, a guest if `guests` allows it, never a banned identity; a
-/// device's leaf carries a binding by a current device key.
-fn check_external(
+/// The checks of a resync commit, the only external commit risala has
+/// (12.7): in a public room, by an identity that already has a leaf, with
+/// one ExternalInit and no other proposal than Removes of the GroupInfo's
+/// signer, the leaf that started the current epoch, and of the joiner's own
+/// earlier leaves that are inactive.
+fn check_resync(
+    group: &GroupView,
     conversation: &RisalaConversation,
     commit: &CommitView,
-    joiner: &RisalaIdentity,
-    facts: &dyn KeyFacts,
+    history: &History,
+    post: &CommitPost,
     verdict: &mut Verdict,
 ) -> Result<(), CommitError> {
-    if conversation.kind != ConversationKind::PublicRoom {
-        return Err(CommitError::External);
-    }
-    let inits = commit
-        .proposals
-        .iter()
-        .filter(|p| matches!(p, ProposalView::ExternalInit))
-        .count();
-    if inits != 1
-        || commit.proposals.iter().any(|p| {
-            matches!(
-                p,
-                ProposalView::Add { .. } | ProposalView::GroupContextExtensions
-            )
-        })
+    let joiner = commit
+        .path_leaf
+        .as_ref()
+        .and_then(|leaf| leaf.identity.as_ref())
+        .ok_or(CommitError::Leaf)?;
+    if conversation.kind != ConversationKind::PublicRoom
+        || joiner.is_guest()
+        || group.leaves_of(&joiner.uid).next().is_none()
     {
         return Err(CommitError::External);
     }
     if conversation.is_banned(&joiner.uid) {
         return Err(CommitError::Add);
     }
-    let Some(device_id) = joiner.device_id else {
-        return if conversation.guests == GuestMode::None {
-            Err(CommitError::Add)
-        } else {
-            Ok(())
-        };
-    };
-    let binding = commit
-        .path_binding
-        .as_ref()
-        .ok_or(CommitError::NotCurrentDevice)?;
-    match facts.current_device_key(&joiner.uid, &device_id) {
-        Fact::Known(Some(key)) => {
-            if !binding.verify(&key, &joiner.uid, b"", &commit.path_encryption_key) {
-                return Err(CommitError::NotCurrentDevice);
+    let mut inits = 0;
+    let mut signer_removed = false;
+    let signer = history.started_by.map(LeafNodeIndex::new);
+    for proposal in &commit.proposals {
+        match proposal {
+            ProposalView::ExternalInit => inits += 1,
+            ProposalView::Remove(index) if Some(*index) == signer => signer_removed = true,
+            ProposalView::Remove(index) => {
+                let leaf = group.leaf(*index).ok_or(CommitError::Remove)?;
+                if leaf.identity.as_ref() != Some(joiner) {
+                    return Err(CommitError::Remove);
+                }
+                match inactive(leaf, history, post.t) {
+                    Lookup::Known(true) => {}
+                    Lookup::Known(false) => return Err(CommitError::Remove),
+                    Lookup::Unknown => verdict.unchecked.push("an inactive leaf"),
+                }
             }
+            _ => return Err(CommitError::External),
         }
-        Fact::Known(None) => return Err(CommitError::NotCurrentDevice),
-        Fact::Unknown => verdict.unchecked_adds.push(joiner.clone()),
     }
+    if inits != 1 || !signer_removed || signer.and_then(|s| group.leaf(s)).is_none() {
+        return Err(CommitError::External);
+    }
+    let path = commit.path_leaf.as_ref().ok_or(CommitError::NoPath)?;
+    let profile = path.profile.as_ref().ok_or(CommitError::Leaf)?;
+    if profile.updated.abs_diff(post.t) > UPDATED_SKEW_MS {
+        return Err(CommitError::Updated);
+    }
+    if profile.streak != 1 {
+        return Err(CommitError::Streak);
+    }
+    verdict.resync = true;
     Ok(())
 }
 
-/// The checks of one Add (12.7). Returns the added identity.
+/// Whether a public room's leaf is inactive (12.7): its `updated`, or the
+/// `t` of the commit that added it if later, is more than 48 hours before
+/// `t`.
+fn inactive(leaf: &LeafView, history: &History, t: u64) -> Lookup<bool> {
+    let cutoff = t.saturating_sub(INACTIVE_AFTER_MS);
+    if leaf.updated() >= cutoff {
+        return Lookup::Known(false);
+    }
+    match history.added_time(leaf.index.u32(), cutoff) {
+        Lookup::Known(added) => Lookup::Known(added.is_none_or(|added| added < cutoff)),
+        Lookup::Unknown => Lookup::Unknown,
+    }
+}
+
+/// What an impostor repair may undo (12.7): the commits, at most 24 hours
+/// before the repair's `t`, of the leaves of another identity that the
+/// commit removes.
+struct RepairScope<'a> {
+    /// The repairable leaves this device knows commits of, with those
+    /// commits, oldest first.
+    known: Vec<(LeafNodeIndex, Vec<&'a CommitRecord>)>,
+    /// The removed leaves of another identity that may have committed in
+    /// the window, but whose commits this device does not know, since it
+    /// joined since.
+    unknown: Vec<LeafNodeIndex>,
+}
+
+impl<'a> RepairScope<'a> {
+    fn of(
+        group: &GroupView,
+        commit: &CommitView,
+        history: &'a History,
+        committer: &Uid,
+        t: u64,
+    ) -> RepairScope<'a> {
+        let mut scope = RepairScope {
+            known: Vec::new(),
+            unknown: Vec::new(),
+        };
+        if commit.committer == Committer::External {
+            return scope;
+        }
+        let from = t.saturating_sub(LOOKBACK_MS);
+        for index in commit.removed_indices() {
+            let Some(leaf) = group.leaf(index) else {
+                continue;
+            };
+            if leaf.uid() == Some(committer) || !leaf.may_have_committed_since(from) {
+                continue;
+            }
+            let commits = history.repairable_commits(index.u32(), t);
+            if !commits.is_empty() {
+                scope.known.push((index, commits));
+            } else if !history.covers_time(from) {
+                scope.unknown.push(index);
+            }
+        }
+        scope
+    }
+
+    fn targets(&self, index: LeafNodeIndex) -> Lookup<bool> {
+        if self.known.iter().any(|(i, _)| *i == index) {
+            Lookup::Known(true)
+        } else if self.unknown.contains(&index) {
+            Lookup::Unknown
+        } else {
+            Lookup::Known(false)
+        }
+    }
+
+    /// Whether the repair may add back `uid`'s device `device_id`: a commit
+    /// it undoes removed a leaf of that device.
+    fn may_re_add(&self, uid: &Uid, device_id: &DeviceId) -> Lookup<bool> {
+        let known = self.known.iter().any(|(_, commits)| {
+            commits.iter().any(|record| {
+                record.removed.iter().any(|removed| {
+                    removed.uid == uid.as_str() && removed.device_id == device_id.as_bytes()
+                })
+            })
+        });
+        match (known, self.unknown.is_empty()) {
+            (true, _) => Lookup::Known(true),
+            (false, true) => Lookup::Known(false),
+            (false, false) => Lookup::Unknown,
+        }
+    }
+
+    /// `new` with each field that the repair puts back to the value it had
+    /// before the first of the undone commits that changed it set to
+    /// `old`'s instead, so that the rest is checked as an ordinary change;
+    /// `None` if the repair puts nothing back.
+    fn restore(
+        &self,
+        old: &RisalaConversation,
+        new: &RisalaConversation,
+    ) -> Option<RisalaConversation> {
+        let mut out = new.clone();
+        let mut any = false;
+        for (_, commits) in &self.known {
+            let changes: Vec<(RisalaConversation, RisalaConversation)> = commits
+                .iter()
+                .filter_map(|record| {
+                    let (before, after) = record.extension_change.as_ref()?;
+                    Some((
+                        RisalaConversation::decode(before).ok()?,
+                        RisalaConversation::decode(after).ok()?,
+                    ))
+                })
+                .collect();
+            for field in Field::ALL {
+                let Some((first_before, _)) = changes.iter().find(|(b, a)| !field.same(b, a))
+                else {
+                    continue;
+                };
+                if !field.same(old, new) && field.same(new, first_before) {
+                    field.copy(old, &mut out);
+                    any = true;
+                }
+            }
+        }
+        any.then_some(out)
+    }
+}
+
+/// A field of the conversation extension that an impostor repair may put
+/// back (12.7).
+#[derive(Debug, Clone, Copy)]
+enum Field {
+    Name,
+    Topic,
+    Confirm,
+    Guests,
+    Send,
+    Owners,
+    Mods,
+    Bans,
+}
+
+impl Field {
+    const ALL: [Field; 8] = [
+        Field::Name,
+        Field::Topic,
+        Field::Confirm,
+        Field::Guests,
+        Field::Send,
+        Field::Owners,
+        Field::Mods,
+        Field::Bans,
+    ];
+
+    fn same(self, a: &RisalaConversation, b: &RisalaConversation) -> bool {
+        match self {
+            Field::Name => a.name == b.name,
+            Field::Topic => a.topic == b.topic,
+            Field::Confirm => a.confirm == b.confirm,
+            Field::Guests => a.guests == b.guests,
+            Field::Send => a.send == b.send,
+            Field::Owners => a.owners == b.owners,
+            Field::Mods => a.mods == b.mods,
+            Field::Bans => a.bans == b.bans,
+        }
+    }
+
+    fn copy(self, from: &RisalaConversation, to: &mut RisalaConversation) {
+        match self {
+            Field::Name => to.name.clone_from(&from.name),
+            Field::Topic => to.topic.clone_from(&from.topic),
+            Field::Confirm => to.confirm = from.confirm,
+            Field::Guests => to.guests = from.guests,
+            Field::Send => to.send = from.send,
+            Field::Owners => to.owners.clone_from(&from.owners),
+            Field::Mods => to.mods.clone_from(&from.mods),
+            Field::Bans => to.bans.clone_from(&from.bans),
+        }
+    }
+}
+
+/// Why one leaf may be removed (12.7), or why not.
+#[allow(clippy::too_many_arguments)]
+fn removal_reason(
+    group: &GroupView,
+    conversation: &RisalaConversation,
+    commit: &CommitView,
+    history: &History,
+    repair: &RepairScope<'_>,
+    committer: &Uid,
+    added: &[RisalaIdentity],
+    leaf: &LeafView,
+    removed: &BTreeSet<LeafNodeIndex>,
+    stale_left: &mut usize,
+    t: u64,
+    verdict: &mut Verdict,
+) -> Result<RemoveReason, CommitError> {
+    let identity = leaf.identity.as_ref().ok_or(CommitError::Remove)?;
+    let public = conversation.kind == ConversationKind::PublicRoom;
+    let mut unknown = None;
+    if identity.uid == *committer {
+        return Ok(RemoveReason::Own);
+    }
+    if commit.self_removes(leaf.index) {
+        return Ok(RemoveReason::SelfRemove);
+    }
+    if identity.is_guest() {
+        return Ok(RemoveReason::Guest);
+    }
+    let kicks_all = group
+        .leaves_of(&identity.uid)
+        .all(|l| removed.contains(&l.index));
+    if kicks_all && may_kick(conversation, group, committer, &identity.uid) {
+        return Ok(RemoveReason::Kick);
+    }
+    if *stale_left > 0 && group.is_stale(leaf) {
+        *stale_left -= 1;
+        return Ok(RemoveReason::Stale);
+    }
+    let same_device_added = || {
+        added
+            .iter()
+            .any(|a| a.uid == identity.uid && a.device_id == identity.device_id)
+    };
+    if !public && same_device_added() {
+        match history.posted_resync(leaf.index, group.epoch) {
+            Lookup::Known(true) => return Ok(RemoveReason::Resync),
+            Lookup::Known(false) => {}
+            Lookup::Unknown => unknown = Some("a removal after RESYNC"),
+        }
+    }
+    match repair.targets(leaf.index) {
+        Lookup::Known(true) => return Ok(RemoveReason::Repair),
+        Lookup::Known(false) => {}
+        Lookup::Unknown => unknown = Some("an impostor repair"),
+    }
+    if !public {
+        // Outside public rooms any other leaf, for a key check, which each
+        // device makes afterwards (12.7). A Resync or repair it could not
+        // check is one too.
+        return Ok(RemoveReason::KeyCheck);
+    }
+    // A public room's later leaf of the same device (12.7).
+    let later_copy = group
+        .leaves
+        .iter()
+        .any(|other| other.index != leaf.index && other.identity.as_ref() == Some(identity))
+        || same_device_added();
+    if later_copy {
+        match inactive(leaf, history, t) {
+            Lookup::Known(true) => return Ok(RemoveReason::Inactive),
+            Lookup::Known(false) => {}
+            Lookup::Unknown => unknown = Some("an inactive leaf"),
+        }
+    }
+    // Within 24 hours of a resync commit, its stragglers (12.7). A resync
+    // this device did not see was before its history starts, so a leaf that
+    // has committed or been added since then, or whose `updated` says it
+    // committed since, is no straggler.
+    match &history.resync {
+        Some(resync) if t.saturating_sub(resync.t) <= LOOKBACK_MS => {
+            if !resync.active.contains(&leaf.index.u32()) {
+                return Ok(RemoveReason::AfterResync);
+            }
+        }
+        _ if !history.covers_time(t.saturating_sub(LOOKBACK_MS))
+            && !history.active_since_start(leaf.index.u32())
+            && !leaf
+                .may_have_committed_since(history.since_t.saturating_add(2 * UPDATED_SKEW_MS)) =>
+        {
+            unknown = Some("a removal after a resync");
+        }
+        _ => {}
+    }
+    match unknown {
+        Some(what) => {
+            verdict.unchecked.push(what);
+            Ok(RemoveReason::Unchecked)
+        }
+        None => Err(CommitError::Remove),
+    }
+}
+
+/// The checks of one Add (12.7). Returns the added identity, and whether
+/// only a role allowed it (an invitation).
 #[allow(clippy::too_many_arguments)]
 fn check_add(
+    group: &GroupView,
     old: &RisalaConversation,
     new: &RisalaConversation,
-    group: &GroupView,
+    commit: &CommitView,
+    history: &History,
+    repair: &RepairScope<'_>,
     committer: &Uid,
     key_package: &KeyPackage,
     by_external_proposal: bool,
-    facts: &dyn KeyFacts,
-    now: SystemTime,
+    t: u64,
     verdict: &mut Verdict,
-) -> Result<RisalaIdentity, CommitError> {
-    let guest = RisalaIdentity::from_credential(key_package.leaf_node().credential())
-        .is_ok_and(|identity| identity.is_guest());
-    if guest {
-        // A guest only by external proposal, into a public room that
-        // allows guests (12.7).
-        let identity =
-            check_guest_key_package(key_package, now).map_err(CommitError::KeyPackage)?;
-        if !by_external_proposal
-            || old.kind != ConversationKind::PublicRoom
-            || old.guests == GuestMode::None
-        {
-            return Err(CommitError::Add);
-        }
-        return Ok(identity);
-    }
+) -> Result<(RisalaIdentity, bool), CommitError> {
     let (identity, _last_resort) =
-        check_key_package_contents(key_package, now).map_err(CommitError::KeyPackage)?;
+        check_key_package_contents(key_package).map_err(CommitError::KeyPackage)?;
+    if !lifetime_acceptable_at(key_package.life_time(), t) {
+        return Err(CommitError::KeyPackage(KeyPackageError::Lifetime));
+    }
     let uid = &identity.uid;
     if old.is_banned(uid) || new.is_banned(uid) {
         return Err(CommitError::Add);
     }
-    let allowed = if by_external_proposal {
-        // Anyone not banned may join a public room (6.1).
-        old.kind == ConversationKind::PublicRoom
-    } else if uid == committer {
-        true
-    } else {
-        match old.kind {
-            ConversationKind::Direct => old
-                .direct_participants()
-                .is_some_and(|participants| participants.contains(uid)),
-            _ => group.leaves_of(uid).next().is_some() || old.role(committer) >= Role::Mod,
+    let public = old.kind == ConversationKind::PublicRoom;
+    if public {
+        // Every device joins a public room by itself, by external proposal,
+        // from a KeyPackage with no binding, committed by an identity's
+        // leaf (6.1, 12.3); nobody adds anyone by value.
+        if !by_external_proposal {
+            return Err(CommitError::Add);
         }
-    };
-    if !allowed {
+        if !has_no_binding(key_package) {
+            return Err(CommitError::KeyPackage(KeyPackageError::Binding));
+        }
+        if committer.is_guest() || (identity.is_guest() && old.guests == GuestMode::None) {
+            return Err(CommitError::Add);
+        }
+        return Ok((identity, false));
+    }
+    if by_external_proposal || identity.is_guest() {
         return Err(CommitError::Add);
     }
+    binding_fits_credential(key_package, &identity).map_err(CommitError::KeyPackage)?;
     let device_id = identity.device_id.expect("not a guest");
-    match facts.current_device_key(uid, &device_id) {
-        Fact::Known(Some(key)) => check_binding(key_package, &identity, &key)
-            .map_err(|_| CommitError::NotCurrentDevice)?,
-        Fact::Known(None) => return Err(CommitError::NotCurrentDevice),
-        Fact::Unknown => verdict.unchecked_adds.push(identity.clone()),
+    if uid == committer {
+        return Ok((identity, false));
     }
-    Ok(identity)
+    if old.kind == ConversationKind::Direct {
+        let participant = old
+            .direct_participants()
+            .is_some_and(|participants| participants.contains(uid));
+        // A guest's report conversation: after the commit that adds the
+        // identity's devices, the guest's leaf adds nobody (12.7).
+        if committer.is_guest() && group.leaves_of(uid).next().is_some() {
+            return Err(CommitError::Guest);
+        }
+        return if participant {
+            Ok((identity, false))
+        } else {
+            Err(CommitError::Add)
+        };
+    }
+    // A room.
+    if group.leaves_of(uid).next().is_some() {
+        return Ok((identity, false));
+    }
+    let removed_now = commit.removed_indices();
+    if group
+        .leaves
+        .iter()
+        .any(|leaf| removed_now.contains(&leaf.index) && leaf.identity.as_ref() == Some(&identity))
+    {
+        return Ok((identity, false));
+    }
+    match repair.may_re_add(uid, &device_id) {
+        Lookup::Known(true) => return Ok((identity, false)),
+        Lookup::Known(false) => {}
+        Lookup::Unknown => {
+            verdict.unchecked.push("an impostor repair");
+            return Ok((identity, false));
+        }
+    }
+    match history.may_add_back(uid, group.epoch) {
+        Lookup::Known(true) => return Ok((identity, false)),
+        Lookup::Known(false) => {}
+        Lookup::Unknown => {
+            verdict
+                .unchecked
+                .push("adding back a device of the last 16 epochs");
+            return Ok((identity, false));
+        }
+    }
+    // An invitation: owners and moderators, and only owners for an
+    // identity listed in `owners` or `mods` (12.7).
+    let role = group.effective_role(committer);
+    let listed = old.role(uid) != Role::Member || new.role(uid) != Role::Member;
+    let allowed = if listed {
+        role == Role::Owner
+    } else {
+        role >= Role::Mod
+    };
+    if allowed {
+        Ok((identity, true))
+    } else {
+        Err(CommitError::Add)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Key checks
+
+/// What the key checks of a valid commit found (12.7). None of it makes
+/// the commit invalid; each failure leads to a repair commit after a random
+/// wait of up to 10 minutes, unless another device makes it first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyReport {
+    /// Added devices whose binding does not verify under a current device
+    /// key of the identity, or that were removed by record: the repair
+    /// removes their leaves, for a key check.
+    pub failed_adds: Vec<RisalaIdentity>,
+    /// Added devices whose key file or record is not known yet: their
+    /// leaves are unconfirmed, and the device sends nothing in the group
+    /// until a later check passes.
+    pub unchecked_adds: Vec<RisalaIdentity>,
+    /// Devices removed for a key check that is false, since they are still
+    /// current: the repair adds them again from new KeyPackages.
+    pub failed_removals: Vec<RisalaIdentity>,
+    /// Leaves removed for a key check that could not be made yet: the
+    /// removal stands, and the device warns the user.
+    pub unchecked_removals: Vec<LeafNodeIndex>,
+    /// Whether the committer's device has been removed by record: its leaf
+    /// is repaired as an impostor's.
+    pub committer_removed: bool,
+    /// Whether that could not be checked yet.
+    pub committer_unchecked: bool,
+}
+
+/// The key checks of a commit that passed the group checks (12.7), outside
+/// public rooms, which have none. `group` is the group as of the commit's
+/// epoch.
+pub fn key_checks(
+    group: &GroupView,
+    commit: &CommitView,
+    verdict: &Verdict,
+    facts: &dyn KeyFacts,
+) -> KeyReport {
+    let mut report = KeyReport::default();
+    if group
+        .conversation
+        .as_ref()
+        .is_ok_and(|c| c.kind == ConversationKind::PublicRoom)
+    {
+        return report;
+    }
+    for proposal in &commit.proposals {
+        let ProposalView::Add { key_package, .. } = proposal else {
+            continue;
+        };
+        let Ok(identity) = RisalaIdentity::from_credential(key_package.leaf_node().credential())
+        else {
+            continue;
+        };
+        let Some(device_id) = identity.device_id else {
+            continue;
+        };
+        match (
+            facts.current_device_key(&identity.uid, &device_id),
+            facts.device_removed(&identity.uid, &device_id),
+        ) {
+            (_, Fact::Known(true)) | (Fact::Known(None), _) => report.failed_adds.push(identity),
+            (Fact::Known(Some(key)), _) => {
+                if check_binding(key_package, &identity, &key).is_err() {
+                    report.failed_adds.push(identity);
+                }
+            }
+            (Fact::Unknown, _) => report.unchecked_adds.push(identity),
+        }
+    }
+    if let Committer::Member(index) = commit.committer
+        && let Some(identity) = group.leaf(index).and_then(|leaf| leaf.identity.as_ref())
+        && let Some(device_id) = identity.device_id
+    {
+        match facts.device_removed(&identity.uid, &device_id) {
+            Fact::Known(removed) => report.committer_removed = removed,
+            Fact::Unknown => report.committer_unchecked = true,
+        }
+    }
+    let added = commit.added_identities();
+    for index in &verdict.key_check_removals {
+        let Some(identity) = group.leaf(*index).and_then(|leaf| leaf.identity.clone()) else {
+            continue;
+        };
+        let Some(device_id) = identity.device_id else {
+            continue;
+        };
+        // Added again in the same commit: nothing to repair.
+        if added.contains(&identity) {
+            continue;
+        }
+        match (
+            facts.device_removed(&identity.uid, &device_id),
+            facts.identity_retired(&identity.uid),
+        ) {
+            (Fact::Known(true), _) | (_, Fact::Known(true)) => {}
+            (Fact::Known(false), Fact::Known(false)) => report.failed_removals.push(identity),
+            _ => report.unchecked_removals.push(*index),
+        }
+    }
+    report
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct NoFacts;
-
-    impl KeyFacts for NoFacts {
-        fn current_device_key(&self, _: &Uid, _: &DeviceId) -> Fact<Option<Vec<u8>>> {
-            Fact::Known(None)
-        }
-
-        fn device_removed(&self, _: &Uid, _: &DeviceId) -> Fact<bool> {
-            Fact::Known(false)
-        }
-    }
-
-    fn uid(s: &str) -> Uid {
-        s.parse().unwrap()
-    }
-
-    fn leaf(index: u32, who: &str, updated: u64) -> LeafView {
-        let uid = uid(who);
-        let identity = if uid.is_guest() {
-            RisalaIdentity::guest(uid)
-        } else {
-            RisalaIdentity::device(uid, DeviceId([index as u8; 48]))
-        };
-        LeafView {
-            index: LeafNodeIndex::new(index),
-            identity: Some(identity),
-            profile: Some(RisalaProfile::new("", updated).unwrap()),
-            signature_key: vec![index as u8; 4],
-            from_key_package: false,
-            encryption_key_ok: true,
-        }
-    }
-
-    fn room(kind: ConversationKind) -> RisalaConversation {
-        let owner = uid("o@x.org");
-        let mut conv = match kind {
-            ConversationKind::PublicRoom => {
-                RisalaConversation::public_room("h.org", [0; 16], &"#r".parse().unwrap(), &owner)
-            }
-            _ => RisalaConversation::private_room("h.org", [0; 16], "R", &owner),
-        };
-        conv.mods.push(uid("m@x.org"));
-        conv
-    }
-
-    /// Owner o (leaf 0), moderator m (1), member p (2 and 3).
-    fn group(conv: &RisalaConversation) -> GroupView {
-        GroupView {
-            conversation: Ok(conv.clone()),
-            leaves: vec![
-                leaf(0, "o@x.org", 1000),
-                leaf(1, "m@x.org", 1000),
-                leaf(2, "p@x.org", 1000),
-                leaf(3, "p@x.org", 1000),
-            ],
-        }
-    }
-
-    /// A commit by leaf `by` that refreshes its leaf at time `updated`.
-    fn commit(
-        group: &GroupView,
-        by: u32,
-        updated: u64,
-        proposals: Vec<ProposalView>,
-    ) -> CommitView {
-        let mut path = group.leaf(LeafNodeIndex::new(by)).unwrap().clone();
-        path.profile = Some(RisalaProfile::new("", updated).unwrap());
-        path.from_key_package = false;
-        CommitView {
-            committer: Committer::Member(LeafNodeIndex::new(by)),
-            proposals,
-            path_leaf: Some(path),
-            path_binding: None,
-            path_encryption_key: Vec::new(),
-            new_conversation: group.conversation.clone(),
-            pending_self_removes: Vec::new(),
-        }
-    }
-
-    fn check(group: &GroupView, commit: &CommitView) -> Result<Verdict, CommitError> {
-        check_commit(group, commit, &NoFacts, SystemTime::now())
-    }
-
-    fn remove(indices: &[u32]) -> Vec<ProposalView> {
-        indices
-            .iter()
-            .map(|i| ProposalView::Remove(LeafNodeIndex::new(*i)))
-            .collect()
-    }
-
-    #[test]
-    fn paths_and_proposal_kinds() {
-        let g = group(&room(ConversationKind::PrivateRoom));
-        assert_eq!(
-            check(&g, &commit(&g, 2, 2000, vec![])),
-            Ok(Verdict::default())
-        );
-        let mut no_path = commit(&g, 2, 2000, vec![]);
-        no_path.path_leaf = None;
-        assert_eq!(check(&g, &no_path), Err(CommitError::NoPath));
-        let odd = commit(&g, 2, 2000, vec![ProposalView::NotAllowed("x")]);
-        assert_eq!(check(&g, &odd), Err(CommitError::Proposal("x")));
-        let init = commit(&g, 2, 2000, vec![ProposalView::ExternalInit]);
-        assert!(matches!(check(&g, &init), Err(CommitError::Proposal(_))));
-        // The extension changes only through a proposal.
-        let mut sneaky = commit(&g, 0, 2000, vec![]);
-        sneaky.new_conversation.as_mut().unwrap().topic = "t".into();
-        assert!(matches!(check(&g, &sneaky), Err(CommitError::Extension(_))));
-        let mut topic = sneaky.clone();
-        topic.proposals.push(ProposalView::GroupContextExtensions);
-        assert_eq!(check(&g, &topic), Ok(Verdict::default()));
-        // External commits only in public rooms.
-        let mut external = commit(&g, 2, 2000, vec![ProposalView::ExternalInit]);
-        external.committer = Committer::External;
-        assert_eq!(check(&g, &external), Err(CommitError::External));
-    }
-
-    #[test]
-    fn leaves_keep_their_credential_and_key() {
-        let conv = room(ConversationKind::PrivateRoom);
-        let g = group(&conv);
-        let mut other = commit(&g, 2, 2000, vec![]);
-        other.path_leaf.as_mut().unwrap().identity =
-            Some(RisalaIdentity::device(uid("p@x.org"), DeviceId([9; 48])));
-        assert_eq!(check(&g, &other), Err(CommitError::Leaf));
-        let mut no_profile = commit(&g, 2, 2000, vec![]);
-        no_profile.path_leaf.as_mut().unwrap().profile = None;
-        assert_eq!(check(&g, &no_profile), Err(CommitError::Leaf));
-        let mut bad_key = commit(&g, 2, 2000, vec![]);
-        bad_key.path_leaf.as_mut().unwrap().encryption_key_ok = false;
-        assert_eq!(check(&g, &bad_key), Err(CommitError::Leaf));
-
-        // A new signature key: not in a pairwise group, once the leaf has
-        // committed; yes while it holds its KeyPackage's leaf (12.3).
-        let mut rotate = commit(&g, 2, 2000, vec![]);
-        rotate.path_leaf.as_mut().unwrap().signature_key = vec![42; 4];
-        assert_eq!(check(&g, &rotate), Err(CommitError::Leaf));
-        let mut fresh = g.clone();
-        fresh.leaves[2].from_key_package = true;
-        assert_eq!(check(&fresh, &rotate), Ok(Verdict::default()));
-
-        // In an epochal group, once per period by the profiles' times.
-        let mut epochal = conv.clone();
-        epochal.confirm = ConfirmMode::Epochal;
-        let g = group(&epochal);
-        let same_day = |updated| {
-            let mut c = commit(&g, 2, updated, vec![]);
-            c.path_leaf.as_mut().unwrap().signature_key = vec![42; 4];
-            check(&g, &c)
-        };
-        assert_eq!(same_day(PERIOD_MS - 1), Err(CommitError::Leaf));
-        assert_eq!(same_day(PERIOD_MS), Ok(Verdict::default()));
-    }
-
-    #[test]
-    fn removes_and_kicks() {
-        let conv = room(ConversationKind::PrivateRoom);
-        let g = group(&conv);
-        // Your own leaves, a SelfRemove's, a stale one.
-        assert!(check(&g, &commit(&g, 2, 2000, remove(&[3]))).is_ok());
-        assert_eq!(
-            check(&g, &commit(&g, 0, 2000, remove(&[1]))),
-            Ok(Verdict::default()),
-            "an owner kicks a moderator"
-        );
-        let mut pending = commit(&g, 2, 2000, remove(&[0]));
-        assert_eq!(check(&g, &pending), Err(CommitError::Remove));
-        pending.pending_self_removes.push(LeafNodeIndex::new(0));
-        assert!(check(&g, &pending).is_ok());
-        let stale = 1000 + STALE_AFTER_MS + 1;
-        assert!(check(&g, &commit(&g, 2, stale, remove(&[0]))).is_ok());
-        assert!(check(&g, &commit(&g, 2, stale - 1, remove(&[0]))).is_err());
-        // A kick removes every leaf of the identity.
-        assert!(check(&g, &commit(&g, 1, 2000, remove(&[2, 3]))).is_ok());
-        assert_eq!(
-            check(&g, &commit(&g, 1, 2000, remove(&[2]))),
-            Err(CommitError::Remove)
-        );
-        // Moderators kick plain members only; nobody kicks the last owner.
-        assert_eq!(
-            check(&g, &commit(&g, 1, 2000, remove(&[0]))),
-            Err(CommitError::Remove)
-        );
-        let mut two_owners = conv.clone();
-        two_owners.owners.push(uid("m@x.org"));
-        two_owners.mods.clear();
-        let g2 = group(&two_owners);
-        assert!(check(&g2, &commit(&g2, 1, 2000, remove(&[0]))).is_ok());
-        let g1 = group(&conv);
-        assert_eq!(
-            check(&g1, &commit(&g1, 1, 2000, remove(&[0]))),
-            Err(CommitError::Remove)
-        );
-        // A leaf removed twice.
-        let twice = commit(
-            &g,
-            2,
-            2000,
-            vec![
-                ProposalView::Remove(LeafNodeIndex::new(3)),
-                ProposalView::SelfRemove(LeafNodeIndex::new(3)),
-            ],
-        );
-        assert!(matches!(check(&g, &twice), Err(CommitError::Proposal(_))));
-        // In a direct conversation, nobody is kicked.
-        let direct = RisalaConversation::direct("h.org", [0; 16], &uid("o@x.org"), &uid("p@x.org"));
-        let mut gd = group(&direct);
-        gd.leaves.remove(1);
-        assert_eq!(
-            check(&gd, &commit(&gd, 0, 2000, remove(&[2, 3]))),
-            Err(CommitError::Remove)
-        );
-    }
-
-    #[test]
-    fn guests_and_bans() {
-        let conv = room(ConversationKind::PublicRoom);
-        let mut g = group(&conv);
-        g.leaves.push(leaf(4, "~sam", 1000));
-        // Anyone may remove a guest leaf (6.1).
-        assert!(check(&g, &commit(&g, 2, 2000, remove(&[4]))).is_ok());
-        // Guests none must remove the guests in the same commit.
-        let mut none = commit(&g, 0, 2000, vec![ProposalView::GroupContextExtensions]);
-        none.new_conversation.as_mut().unwrap().guests = GuestMode::None;
-        assert_eq!(check(&g, &none), Err(CommitError::LeftBehind));
-        none.proposals
-            .push(ProposalView::Remove(LeafNodeIndex::new(4)));
-        assert!(check(&g, &none).is_ok());
-        // A ban must remove the identity's leaves.
-        let mut ban = commit(&g, 1, 2000, vec![ProposalView::GroupContextExtensions]);
-        ban.new_conversation
-            .as_mut()
-            .unwrap()
-            .bans
-            .push(uid("p@x.org"));
-        assert_eq!(check(&g, &ban), Err(CommitError::LeftBehind));
-        ban.proposals.extend(remove(&[2, 3]));
-        assert!(check(&g, &ban).is_ok());
-    }
-
-    fn crowd(conv: &RisalaConversation, identities: u32, per: u32) -> GroupView {
-        let mut leaves = vec![leaf(0, "o@x.org", 1000)];
-        for i in 1..identities {
-            for j in 0..per {
-                let mut l = leaf(i * per + j, &format!("u{i}@x.org"), 1000);
-                l.index = LeafNodeIndex::new(i * per + j);
-                leaves.push(l);
-            }
-        }
-        GroupView {
-            conversation: Ok(conv.clone()),
-            leaves,
-        }
-    }
-
-    #[test]
-    fn limits() {
-        let conv = room(ConversationKind::PrivateRoom);
-        // 256 members while pairwise is fine, 257 is not (6.2).
-        let g = crowd(&conv, 256, 1);
-        assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
-        let g = crowd(&conv, 257, 1);
-        assert_eq!(
-            check(&g, &commit(&g, 0, 2000, vec![])),
-            Err(CommitError::TooLarge)
-        );
-        let mut epochal = conv.clone();
-        epochal.confirm = ConfirmMode::Epochal;
-        let g = crowd(&epochal, 257, 1);
-        assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
-        // 1,000 identities and 4,096 leaves in a private room (6.1).
-        let g = crowd(&epochal, 1001, 1);
-        assert_eq!(
-            check(&g, &commit(&g, 0, 2000, vec![])),
-            Err(CommitError::TooLarge)
-        );
-        let g = crowd(&epochal, 400, 11);
-        assert_eq!(
-            check(&g, &commit(&g, 0, 2000, vec![])),
-            Err(CommitError::TooLarge)
-        );
-        let public = room(ConversationKind::PublicRoom);
-        let g = crowd(&public, 1001, 1);
-        assert!(check(&g, &commit(&g, 0, 2000, vec![])).is_ok());
-    }
-
-    #[test]
-    fn joining() {
-        let conv = room(ConversationKind::PrivateRoom);
-        let expect = JoinExpectation {
-            host: "h.org".into(),
-            own_uid: uid("p@x.org"),
-            public_room: None,
-        };
-        let g = group(&conv);
-        assert_eq!(check_join(&g, &expect), Ok(()));
-        let mut other_host = expect.clone();
-        other_host.host = "x.org".into();
-        assert_eq!(
-            check_join(&g, &other_host),
-            Err(JoinError::WrongConversation)
-        );
-        let mut public = expect.clone();
-        public.public_room = Some(("#r".parse().unwrap(), [0; 16]));
-        assert_eq!(check_join(&g, &public), Err(JoinError::WrongConversation));
-        let mut guest = g.clone();
-        guest.leaves.push(leaf(4, "~sam", 1));
-        assert_eq!(check_join(&guest, &expect), Err(JoinError::Guest));
-        let mut banned = g.clone();
-        banned
-            .conversation
-            .as_mut()
-            .unwrap()
-            .bans
-            .push(uid("p@x.org"));
-        assert_eq!(check_join(&banned, &expect), Err(JoinError::Banned));
-        let mut no_profile = g.clone();
-        no_profile.leaves[1].profile = None;
-        assert_eq!(check_join(&no_profile, &expect), Err(JoinError::Leaf));
-        let mut bad_key = g.clone();
-        bad_key.leaves[3].encryption_key_ok = false;
-        assert_eq!(check_join(&bad_key, &expect), Err(JoinError::Leaf));
-        let mut no_identity = g.clone();
-        no_identity.leaves[1].identity = None;
-        assert_eq!(check_join(&no_identity, &expect), Err(JoinError::Leaf));
-        let big = crowd(&conv, 1001, 1);
-        assert_eq!(check_join(&big, &expect), Err(JoinError::TooLarge));
-        // Stale leaves and the weekly refresh.
-        assert_eq!(g.stale_leaves(1000 + STALE_AFTER_MS + 1).len(), 4);
-        assert!(g.stale_leaves(1000 + STALE_AFTER_MS).is_empty());
-    }
-}
+mod tests;

@@ -863,8 +863,10 @@ pub fn receive<P: OpenMlsProvider>(
         RisalaIdentity::from_credential(leaf.credential()).map_err(|_| ReceiveError::Identity)?;
     let message = RisalaMessage::decode(&content).map_err(ReceiveError::Malformed)?;
 
-    // Step 1.
-    let pseudonym = check_pseudonym(confirm, &log, aad.pseudonym).ok_or(ReceiveError::Pseudonym)?;
+    // Step 1. An application message is a PrivateMessage, whose RisalaAAD
+    // always has a pseudonym (12.9).
+    let aad_pseudonym = aad.pseudonym.ok_or(ReceiveError::Pseudonym)?;
+    let pseudonym = check_pseudonym(confirm, &log, aad_pseudonym).ok_or(ReceiveError::Pseudonym)?;
     // Step 2. Never skipped: it is what makes the message key-committing.
     let frank = aad.frank.ok_or(ReceiveError::Frank)?;
     if !message
@@ -896,7 +898,7 @@ pub fn receive<P: OpenMlsProvider>(
     };
 
     if pseudonym == PseudonymCheck::NewlyPinned {
-        log.pseudonym = Some(aad.pseudonym);
+        log.pseudonym = Some(aad_pseudonym);
     }
     history.set_sender(sender, log);
     history.add_seen(message.message_id);

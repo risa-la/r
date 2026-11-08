@@ -9,15 +9,20 @@
 //!
 //! struct {
 //!     opaque uid<V>;
-//!     opaque init_key<V>;          // empty in a leaf node
-//!     opaque encryption_key<V>;    // the leaf's HPKE key
+//!     opaque init_key<V>;          // the KeyPackage's init_key
+//!     opaque encryption_key<V>;    // the leaf node's HPKE key
 //! } DeviceBindingContent;
 //! ```
 //!
 //! `signature` is RisalaSign(device key, "keypackage",
-//! DeviceBindingContent) (4.3). A KeyPackage carries it among its own
-//! extensions, covering its init key; the leaf node of an external commit
-//! carries it among the leaf's extensions, with an empty init key.
+//! DeviceBindingContent) (4.3). Every KeyPackage a device uploads with
+//! KEYPKG ADD carries one among its leaf node's extensions, not the
+//! KeyPackage's own, so that it goes into the group's tree with the leaf.
+//! `device_id` must be the credential's, and the content's `uid` the
+//! credential's uid. Devices and servers check it only where a leaf enters a
+//! group from a KeyPackage, at an Add; later leaf nodes of the same leaf may
+//! carry it unchanged or not at all, and nobody looks at it there. A public
+//! room's leaves carry none (12.3).
 
 use openmls::prelude::{Extension, ExtensionType, Extensions, UnknownExtension};
 use risala_proto::names::Uid;
@@ -62,8 +67,9 @@ fn content(uid: &Uid, init_key: &[u8], encryption_key: &[u8]) -> Vec<u8> {
 }
 
 impl DeviceBinding {
-    /// Binds `init_key` and `encryption_key` to the device whose key is
-    /// `device_key`, for `uid` (12.3). `init_key` is empty for a leaf node.
+    /// Binds a KeyPackage's `init_key` and its leaf node's
+    /// `encryption_key` to the device whose key is `device_key`, for `uid`
+    /// (12.3).
     pub fn sign(
         device_key: &SigningKey,
         uid: &Uid,
@@ -124,7 +130,7 @@ impl DeviceBinding {
         })
     }
 
-    /// The extension, for a KeyPackage or a leaf node.
+    /// The extension, for a KeyPackage's leaf node.
     pub fn to_extension(&self) -> Extension {
         Extension::Unknown(
             DEVICE_BINDING_EXTENSION_TYPE,
@@ -132,8 +138,8 @@ impl DeviceBinding {
         )
     }
 
-    /// Reads the binding from a KeyPackage's or leaf node's extensions:
-    /// `None` if there is none.
+    /// Reads the binding from a leaf node's extensions: `None` if there is
+    /// none.
     pub fn from_extensions<T>(
         extensions: &Extensions<T>,
     ) -> Option<Result<DeviceBinding, DecodeError>> {
@@ -173,7 +179,7 @@ mod tests {
         assert_eq!(&encoded[49..51], &[0x49, 0x74]); // 2420
         assert_eq!(DeviceBinding::decode(&encoded), Ok(binding.clone()));
         let extensions =
-            Extensions::<openmls::prelude::KeyPackage>::single(binding.to_extension()).unwrap();
+            Extensions::<openmls::prelude::LeafNode>::single(binding.to_extension()).unwrap();
         assert_eq!(
             DeviceBinding::from_extensions(&extensions),
             Some(Ok(binding))
