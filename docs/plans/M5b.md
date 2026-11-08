@@ -166,12 +166,12 @@ four writing code at once.
   reading group id, epoch, content type and AAD from a message without
   its keys (for the server). Owns `crates/risala-mls/src/` except what
   M2-M4 own.
-- [~] **M2. Messages** (12.9): RisalaMessage, counters and `previous`
+- [x] **M2. Messages** (12.9): RisalaMessage, counters and `previous`
   for gaps, franking (frank key, the frank in the AAD, constant-time
   checks), MLS padding to 256 bytes, times, past epochs kept for a few
   epochs, deletes. Owns `crates/risala-mls/src/message.rs`. Needs M1,
   P4.
-- [~] **M3. Confirming leaves** (12.10): pairwise CHALLENGE/ANSWER with
+- [x] **M3. Confirming leaves** (12.10): pairwise CHALLENGE/ANSWER with
   X-Wing and HMAC-SHA-384 under `risala/1 confirm`, confirming senders
   only, the 256-member threshold; PeriodCert, per-period leaf keys, ATTEST and REVEAL. Owns
   `crates/risala-mls/src/confirm.rs` and `epochal.rs`. Needs M1.
