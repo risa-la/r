@@ -1519,9 +1519,10 @@ SET <room> <key> [<value...>]
 - `history` exists only in encrypted rooms, and its snapshot SET lines
   leave it out elsewhere. Its value lives in the room's group, where
   devices read and enforce it (12.9). An owner changes it with a COMMIT
-  (12.5), and the server then records the SET event. SET of `history`
-  gets `ERR encrypted` in an encrypted room, and `ERR forbidden` in any
-  other.
+  (12.5), and the server then records the SET event. In an encrypted
+  room, SET of `history` gets `ERR encrypted` from someone with the
+  owner role, and `ERR forbidden` from anyone else. In any other room it
+  gets `ERR forbidden`.
 - `send all`: every member allowed to post may send messages. This is
   the default.
 - `send mods`: the room is for announcements. Only its owners and
@@ -1534,7 +1535,8 @@ SET <room> <key> [<value...>]
   like `history`, and an owner changes it with a COMMIT (12.5). The
   server cannot tell a reaction from a message there, so it lets plain
   members send ENC, and their devices enforce the setting (12.11). SET
-  of `send` gets `ERR encrypted` in an encrypted room.
+  of `send` gets `ERR encrypted` in an encrypted room from someone with
+  the owner role, and `ERR forbidden` from anyone else.
 
 Keyword and number values ignore trailing spaces, so `SET #r public yes `
 works. A topic keeps its spaces. An unknown key gets
@@ -1600,7 +1602,10 @@ membership:
   reactions, but not other messages or typing notifications (6.2).
 - Server operators (Section 10) have owner rights in every room, and may
   join any room without an invitation, except an encrypted one (6.1),
-  even one they are banned from.
+  even one they are banned from. In an encrypted room, only the owner
+  role counts for INIT and for changing the group's extensions (12.5),
+  since devices check the role from the room's events: an operator gives
+  itself the role first.
 
 ```
 ROLE <room> <uid> <role>
@@ -1692,7 +1697,9 @@ SYNC lists every conversation the connection is in, both rooms and direct
 conversations:
 
 - `<id>` is the conversation's id (5.1).
-- `<head>` is the conversation's newest seq.
+- `<head>` is the conversation's newest seq, or `0` if it has no events
+  yet: a direct conversation that INIT started, before its first COMMIT
+  (12.5).
 - `<read>` is the account's read marker (7.4), or `0` if there is none.
   It is always `0` for guests. It covers every READ line for the
   conversation sent to the connection before the CONV line (3.6).
@@ -2665,8 +2672,9 @@ extension, and rejects a group id it has seen before (`ERR invalid`).
 - **A direct conversation** must not have a group yet (`ERR stale`). If
   the conversation does not exist, INIT starts it, under the rules of
   5.1.
-- **A room** must not be encrypted yet (`ERR stale`). The sender must be
-  an owner and the room's only member (`ERR forbidden`). Since the
+- **A room** must not be encrypted yet (`ERR stale`). The sender must
+  hold the owner role (6.3) and be the room's only member
+  (`ERR forbidden`). Since the
   extension names the room's id, the client gets it from INFO first. The
   server sets `public` to `no`, `guests` to `none`, `e2ee` to `yes`, and
   `history` and `send` to the extension's values, and records a SET
@@ -2729,7 +2737,7 @@ all of these hold:
      whose key is no longer in its identity's key file, or, in a room, a
      leaf of an identity that is neither a member nor invited.
    - **GroupContextExtensions** is allowed only in a room, and the
-     committer must be an owner. Its extension list is the group's
+     committer must hold the owner role (6.3). Its extension list is the group's
      current one, with only the `history` and `send` fields of the
      conversation extension changed. The server records
      `SET <room> history <value>` or `SET <room> send <value>`, for each

@@ -1079,6 +1079,18 @@ Open:
       is tested. The 0600 `cache.key` and PEM key files of 42 go away;
       there is no test-only file store.
 
+44. **Found while building M5a's server groups** (6.2, 6.3, 7.1, 12.5),
+    decided with the user on 2026-11-08:
+    - **CONV allows head `0`**, for a direct conversation that INIT
+      started, before its first COMMIT. Otherwise a crash between INIT
+      and COMMIT leaves it out of SYNC.
+    - **Only the owner role counts in encrypted rooms**, for INIT and for
+      changing `history` and `send`, since devices check the role from
+      the room's events and cannot always know who is an operator (as
+      item 38 says for `send`). An operator gives itself the role first.
+    - **SET of `send` or `history` in an encrypted room** gets
+      `forbidden` without the owner role, and `encrypted` with it.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
