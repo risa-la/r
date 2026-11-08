@@ -167,12 +167,12 @@ async fn person(
     let key = generate_device_key().unwrap();
     keys.save(uid, &key).unwrap();
     let signing = risala_mls::mldsa::SigningKey::from_seed(*key_seed(&key));
-    let device = risala_mls::identity::DeviceId::of_device_key(signing.public_key());
+    let device = signing.device_id();
     shared
         .lock()
         .unwrap()
         .devices
-        .insert(uid.to_owned(), device.0.to_vec());
+        .insert(uid.to_owned(), device.as_bytes().to_vec());
     let options = ClientOptions {
         keys,
         ca_verifier: Some(roots_ca_verifier([ca.cert.clone()]).unwrap()),
@@ -190,7 +190,7 @@ async fn person(
             tx.conn().execute(
                 "INSERT INTO identities (uid, device_id, key_id, home, created)
                  VALUES (?1, ?2, ?3, 'chat.test', 0)",
-                rusqlite::params![uid, &device.0[..], uid],
+                rusqlite::params![uid, &device.as_bytes()[..], uid],
             )?;
             Ok(())
         })

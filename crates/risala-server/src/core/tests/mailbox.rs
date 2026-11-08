@@ -14,7 +14,7 @@ use risala_mls::group::{
     join_proposal, merge_own_commit, own_leaf_key, process_message, propose_update,
     sending_pseudonym,
 };
-use risala_mls::identity::{DeviceId, RisalaIdentity};
+use risala_mls::identity::RisalaIdentity;
 use risala_mls::keypackage::make_join_key_package;
 use risala_mls::keypackage::make_key_package;
 use risala_mls::openmls::group::MlsGroup;
@@ -34,6 +34,11 @@ use crate::store::{MailboxStore as _, NewMailbox};
 use risala_proto::error::ErrorCode;
 
 const HOST: &str = "chat.example.org";
+
+/// [`HOST`] as a server address, as the conversation extension holds it.
+fn host() -> risala_proto::names::ServerAddr {
+    HOST.parse().unwrap()
+}
 
 /// One device of an identity, with its own MLS storage, and the history of
 /// each of its groups (12.7).
@@ -62,10 +67,7 @@ impl Dev {
     }
 
     fn identity(&self) -> RisalaIdentity {
-        RisalaIdentity::device(
-            self.uid.clone(),
-            DeviceId::of_device_key(self.key.public_key()),
-        )
+        RisalaIdentity::device(self.uid.clone(), self.key.device_id())
     }
 
     fn profile(&self) -> RisalaProfile {
@@ -124,7 +126,7 @@ impl Dev {
 
     fn join(&self, welcome: &[u8]) -> MlsGroup {
         let expect = risala_mls::checks::JoinExpectation {
-            host: HOST.into(),
+            host: host(),
             own_uid: self.uid.clone(),
             public_room: None,
         };
@@ -216,7 +218,7 @@ impl Direct {
         let alice = Dev::new("alice@example.org", n);
         let bob = Dev::new("bob@example.org", n.wrapping_add(100));
         let m = mailbox(n);
-        let conv = RisalaConversation::direct(HOST, *m.as_bytes(), &alice.uid, &bob.uid);
+        let conv = RisalaConversation::direct(host(), *m.as_bytes(), &alice.uid, &bob.uid);
         let mut a = alice.create(&conv);
         h.send(
             anon,
@@ -346,7 +348,7 @@ async fn post_follow_and_fetch() {
     let m = mailbox(1);
     let alice = Dev::new("alice@example.org", 1);
     let bob = Dev::new("bob@example.org", 2);
-    let conv = RisalaConversation::direct(HOST, *m.as_bytes(), &alice.uid, &bob.uid);
+    let conv = RisalaConversation::direct(host(), *m.as_bytes(), &alice.uid, &bob.uid);
     let mut a = alice.create(&conv);
     h.send(
         &anon,
@@ -501,7 +503,7 @@ async fn post_framing() {
 
     // Another group's message.
     let other = Dev::new("carol@example.org", 7);
-    let conv = RisalaConversation::direct(HOST, [7; 16], &other.uid, &d.bob.uid);
+    let conv = RisalaConversation::direct(host(), [7; 16], &other.uid, &d.bob.uid);
     let mut o = other.create(&conv);
     let foreign = other.send(&mut o, b"x");
     h.send(&anon, &format!("POST {m} {token} {foreign}")).await;
@@ -544,7 +546,7 @@ async fn post_framing() {
     let room: Room = "#general".parse().unwrap();
     let pm = mailbox(8);
     let mut p = owen.create(&RisalaConversation::public_room(
-        HOST,
+        host(),
         *pm.as_bytes(),
         &room,
         &owen.uid,
@@ -1299,7 +1301,7 @@ fn public_state(device: &Dev, group: &MlsGroup) -> (String, String) {
 
 fn public_conv(owner: &Dev, m: BoxName, guests: GuestMode) -> RisalaConversation {
     let room: Room = "#general".parse().unwrap();
-    let mut conv = RisalaConversation::public_room(HOST, *m.as_bytes(), &room, &owner.uid);
+    let mut conv = RisalaConversation::public_room(host(), *m.as_bytes(), &room, &owner.uid);
     conv.guests = guests;
     conv
 }

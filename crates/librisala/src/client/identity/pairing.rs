@@ -19,7 +19,7 @@ use risala_proto::command::{Command, PairCommand};
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{PairId, ServerAddr as WireAddr};
 use risala_proto::pairing::{NewDevice, NewDeviceContent, PairingCode};
-use risala_proto::record::{DeviceKeys, LogKey, Record, RecordBody, RecordContent, XWingPublicKey};
+use risala_proto::record::{DeviceKeys, LogKey, Record, RecordBody, RecordContent};
 use risala_proto::server::ServerLine;
 use zeroize::Zeroizing;
 
@@ -95,8 +95,7 @@ impl Client {
                 attestation_key: attestation_public_key(&attest_seed),
                 label: device_label.to_owned(),
             },
-            pairing_key: XWingPublicKey::from_bytes(pairing_key.public_key())
-                .map_err(pairing_error)?,
+            pairing_key: pairing_key.public().clone(),
         };
         if content.keys.label.len() > risala_proto::record::MAX_DEVICE_LABEL {
             return Err(Error::invalid("device label", device_label));
@@ -104,12 +103,8 @@ impl Client {
         let new_device = NewDevice::sign(content, &device, rnd()?);
         let secret = PairingSecret::generate().map_err(rng)?;
         let relay = secret.relay();
-        let data = relay.seal_new_device(new_device.encoded());
-        let code = PairingCode {
-            host,
-            secret: Zeroizing::new(*secret.as_bytes()),
-            keys_hash: new_device.keys_hash(),
-        };
+        let data = relay.seal_new_device(&new_device);
+        let code = secret.code(host, &new_device);
 
         // The keys wait under a name of their own until the identity is
         // known.
@@ -316,7 +311,7 @@ impl Client {
         self.own_row(&identity)?;
         let code = PairingCode::from_qr_text(qr.trim()).map_err(pairing_error)?;
         let addr = from_wire(&code.host).ok_or_else(|| pairing_error("bad relay host"))?;
-        let secret = PairingSecret::from_bytes(*code.secret);
+        let secret = PairingSecret::of_code(&code);
         let relay = secret.relay();
         let data = self
             .pair(
@@ -327,11 +322,9 @@ impl Client {
             )
             .await?
             .ok_or_else(|| pairing_error("the new device's data is not on the relay"))?;
-        let opened = relay
-            .open_new_device(&data, &code.keys_hash)
-            .map_err(pairing_error)?;
-        let new_device = NewDevice::decode(&opened.encode()).map_err(pairing_error)?;
-        new_device.check(&code).map_err(pairing_error)?;
+        // Decrypts it, and makes risala-proto's checks of a NewDevice
+        // against the code (4.8, step 2).
+        let new_device = relay.open_new_device(&data, &code).map_err(pairing_error)?;
         let (chain, _) = self.own_chain(&identity)?;
         let id = new_device.content().keys.device_id();
         if chain.devices().contains_key(&id) || chain.removed().contains(&id) {

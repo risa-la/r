@@ -36,7 +36,7 @@ use risala_mls::wire::{read_group_info, read_protocol_message, read_tree, tree_t
 use risala_proto::command::PublicRoom;
 use risala_proto::error::ErrorCode;
 use risala_proto::mls::{GroupId, GroupInfo, OrBlob, Pseudonym, RatchetTree, TokenHash};
-use risala_proto::names::{BoxName, Seq, Uid};
+use risala_proto::names::{BoxName, Seq, ServerAddr, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, ServerLine};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{GuestAccess, Role};
@@ -293,7 +293,7 @@ fn escape(topic: &str) -> String {
 fn is_device(who: &Who, identity: &RisalaIdentity) -> bool {
     match (who, identity.device_id) {
         (Who::SignedIn(Device { uid, key }), Some(device_id)) => {
-            *uid == identity.uid && DeviceId::of_device_key(key.as_bytes()) == device_id
+            *uid == identity.uid && DeviceId::of(key) == device_id
         }
         _ => false,
     }
@@ -345,7 +345,13 @@ pub(super) async fn create(
     let group_info = line_bytes(inner, &public.groupinfo, GroupInfo::decode).await?;
     let tree = line_bytes(inner, &public.tree, RatchetTree::decode).await?;
     let crypto = rooms.crypto()?;
-    let host = inner.config.hostname.clone();
+    // The server's address as the extension writes it (12.4): its
+    // hostname, on the default port.
+    let host: ServerAddr = inner
+        .config
+        .hostname
+        .parse()
+        .map_err(|_| invalid("the server's hostname is not a server address"))?;
     let room = public.room.clone();
     let (cache, update) = blocking(move || {
         let (group, storage, signer) = build(&crypto, &group_info, &tree)?;

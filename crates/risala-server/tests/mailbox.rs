@@ -11,7 +11,7 @@ use risala_mls::conversation::RisalaConversation;
 use risala_mls::group::{
     Changes, commit, create_group, encrypt_application, merge_own_commit, own_pseudonym,
 };
-use risala_mls::identity::{DeviceId, RisalaIdentity};
+use risala_mls::identity::RisalaIdentity;
 use risala_mls::keypackage::make_key_package;
 use risala_mls::openmls::group::MlsGroup;
 use risala_mls::openmls_traits::OpenMlsProvider as _;
@@ -62,11 +62,13 @@ async fn two_anonymous_connections() {
     let alice = Dev::new("alice@example.org", 1);
     let bob = Dev::new("bob@example.org", 2);
     let m = BoxName::from_bytes([0x42; 16]);
-    let conv = RisalaConversation::direct(server.hostname(), *m.as_bytes(), &alice.uid, &bob.uid);
-    let identity = RisalaIdentity::device(
-        alice.uid.clone(),
-        DeviceId::of_device_key(alice.key.public_key()),
+    let conv = RisalaConversation::direct(
+        server.hostname().parse().unwrap(),
+        *m.as_bytes(),
+        &alice.uid,
+        &bob.uid,
     );
+    let identity = RisalaIdentity::device(alice.uid.clone(), alice.key.device_id());
     let (mut a, _, mut state) =
         create_group(&alice.provider, &identity, &alice.profile(), &conv).unwrap();
     let gid = GroupId::from_bytes(a.group_id().as_slice().try_into().unwrap());

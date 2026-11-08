@@ -62,7 +62,7 @@ pub(crate) fn receive(
     let leaf = tx.leaf(conv.id, leaf_index)?.unwrap_or(LeafRow {
         leaf: leaf_index,
         uid: uid.clone(),
-        device_id: d.identity.device_id.map(|d| d.0),
+        device_id: d.identity.device_id.map(|d| *d.as_bytes()),
         signature_key: Vec::new(),
         display_name: None,
         updated: None,

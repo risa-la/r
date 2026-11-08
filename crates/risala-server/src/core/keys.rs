@@ -277,7 +277,7 @@ fn signed_in(cx: &Cx) -> Result<(Uid, DeviceBytes, risala_proto::auth::PublicKey
     match cx.device() {
         Some(device) => Ok((
             device.uid.clone(),
-            DeviceId::of_device_key(device.key.as_bytes()).0,
+            *DeviceId::of(&device.key).as_bytes(),
             device.key.clone(),
         )),
         None => Err(err(ErrorCode::WrongConnection)),
@@ -521,7 +521,7 @@ fn device_conns(inner: &Inner, uid: &Uid, device: &DeviceBytes) -> Vec<ConnHandl
         .filter(|conn| {
             !conn.detached
                 && matches!(&conn.who, Who::SignedIn(d)
-                    if DeviceId::of_device_key(d.key.as_bytes()).0 == *device)
+                    if *DeviceId::of(&d.key).as_bytes() == *device)
         })
         .map(|conn| conn.handle.clone())
         .collect()
@@ -626,7 +626,7 @@ async fn welcome_put(
                     Some(device),
                 ) => {
                     device.uid == *committer_uid
-                        && DeviceId::of_device_key(device.key.as_bytes()).0 == *committer
+                        && *DeviceId::of(&device.key).as_bytes() == *committer
                 }
                 _ => false,
             }),
@@ -852,7 +852,11 @@ pub(crate) async fn device_removed(
     uid: Uid,
     device_key: &[u8],
 ) -> Result<(), StoreError> {
-    let device = DeviceId::of_device_key(device_key).0;
+    // A key that is not an ML-DSA-44 key names no device.
+    let Some(device) = risala_mls::identity::device_id_of(device_key) else {
+        return Ok(());
+    };
+    let device = *device.as_bytes();
     inner
         .db(move |store| store.forget_device(&uid, &device))
         .await

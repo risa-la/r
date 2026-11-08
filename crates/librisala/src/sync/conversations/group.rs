@@ -18,7 +18,7 @@ use risala_mls::checks::{EpochState, GroupView, JoinExpectation, Seen};
 use risala_mls::conversation::{ConversationKind, RisalaConversation};
 use risala_mls::framing::{ContentType, read_post};
 use risala_mls::group::{self as mls_group, Changes, Incoming, ProposalKind};
-use risala_mls::identity::{DeviceId, RisalaIdentity};
+use risala_mls::identity::RisalaIdentity;
 use risala_mls::keypackage::{
     check_key_package_contents, lifetime_acceptable_at, read_key_package, verify_key_package,
 };
@@ -95,7 +95,7 @@ pub(crate) fn tree_leaves(group: &MlsGroup) -> Vec<TreeLeaf> {
             Some(TreeLeaf {
                 leaf: leaf.index.u32(),
                 uid: identity.uid,
-                device_id: identity.device_id.map(|d| d.0),
+                device_id: identity.device_id.map(|d| *d.as_bytes()),
                 signature_key: leaf.signature_key,
                 display_name: leaf.profile.as_ref().map(|p| p.display_name.clone()),
                 updated: leaf.profile.as_ref().map(|p| p.updated),
@@ -112,10 +112,7 @@ pub(crate) fn own_identity(cx: &Ctx<'_>) -> Result<RisalaIdentity> {
     let key = cx.device_key.ok_or(EngineError::Invalid(
         "this device's device key is not available".into(),
     ))?;
-    Ok(RisalaIdentity::device(
-        cx.uid.clone(),
-        DeviceId::of_device_key(key.public_key()),
-    ))
+    Ok(RisalaIdentity::device(cx.uid.clone(), key.device_id()))
 }
 
 /// This device's display name for the account (8.2).
@@ -333,7 +330,7 @@ pub(crate) fn build_commit(
         .filter(|leaf| {
             leaf.identity.as_ref().is_some_and(|id| {
                 intent.remove.iter().any(|(uid, device)| {
-                    id.uid.as_str() == uid && id.device_id.map(|d| d.0) == *device
+                    id.uid.as_str() == uid && id.device_id.map(|d| *d.as_bytes()) == *device
                 })
             })
         })
@@ -784,7 +781,7 @@ fn after_commit(
         .filter(|id| {
             !tree
                 .iter()
-                .any(|l| l.uid == id.uid && l.device_id == id.device_id.map(|d| d.0))
+                .any(|l| l.uid == id.uid && l.device_id == id.device_id.map(|d| *d.as_bytes()))
         })
         .collect();
     if conv.state == ConvState::Creating {
@@ -995,7 +992,7 @@ pub(crate) fn join_welcome(tx: &mut Tx<'_>, cx: &Ctx<'_>, sealed: &[u8]) -> Resu
         Err(e) => return Ok(Joined::Refused(e.to_string())),
     };
     let expect = JoinExpectation {
-        host: cx.host.to_owned(),
+        host: cx.host.clone(),
         own_uid: cx.uid.clone(),
         public_room: None,
     };

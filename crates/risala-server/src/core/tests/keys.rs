@@ -108,7 +108,7 @@ impl Dev {
 
     /// The device id (4.4).
     fn id(&self) -> [u8; 48] {
-        risala_mls::DeviceId::of_device_key(self.key.public_key()).0
+        *self.key.device_id().as_bytes()
     }
 
     fn public(&self) -> PublicKey {

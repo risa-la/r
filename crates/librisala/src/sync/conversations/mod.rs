@@ -262,7 +262,7 @@ pub(crate) enum EngineError {
 pub(crate) struct Ctx<'a> {
     pub account: AccountId,
     pub uid: &'a Uid,
-    pub host: &'a str,
+    pub host: &'a risala_proto::names::ServerAddr,
     pub guest: bool,
     pub crypto: &'a Arc<RisalaCrypto>,
     pub hooks: &'a dyn Hooks,
@@ -454,7 +454,9 @@ enum Follow {
 struct Me {
     account: AccountId,
     uid: Uid,
-    host: String,
+    /// The account's server, as the conversation extension writes it
+    /// (3.5, 12.4).
+    host: risala_proto::names::ServerAddr,
     guest: bool,
 }
 
@@ -567,7 +569,11 @@ impl ConversationEngine {
         let me = Me {
             account: row.id,
             uid: row.uid,
-            host: row.server.host().to_string().to_ascii_lowercase(),
+            // In its one written form, with the port unless it is 7472
+            // (3.5); an IP address is not a server there.
+            host: row.server.to_string().parse().map_err(|_| {
+                EngineError::Invalid("the account's server is not a server address (3.5)".into())
+            })?,
             guest: row.kind == AccountKind::Guest,
         };
         self.me = Some(me.clone());
@@ -789,7 +795,7 @@ impl ConversationEngine {
                         kp.leaf_node().credential(),
                     )
                     .ok()?;
-                    let device = identity.device_id?.0;
+                    let device = *identity.device_id?.as_bytes();
                     (identity != own).then(|| (uid.clone(), fetched.clone(), device))
                 })
                 .collect();
@@ -819,7 +825,7 @@ impl ConversationEngine {
                     let made = group::create(
                         tx,
                         c,
-                        |b| RisalaConversation::direct(c.host, b, c.uid, peer),
+                        |b| RisalaConversation::direct(c.host.clone(), b, c.uid, peer),
                         adds,
                     )?;
                     Ok(Some((made.conv, Some(made))))
@@ -829,7 +835,7 @@ impl ConversationEngine {
                     let made = group::create(
                         tx,
                         c,
-                        |b| RisalaConversation::private_room(c.host, b, name, c.uid),
+                        |b| RisalaConversation::private_room(c.host.clone(), b, name, c.uid),
                         adds,
                     )?;
                     Ok(Some((made.conv, Some(made))))
@@ -846,7 +852,7 @@ impl ConversationEngine {
                     let made = group::create(
                         tx,
                         c,
-                        |b| RisalaConversation::direct(c.host, b, c.uid, c.uid),
+                        |b| RisalaConversation::direct(c.host.clone(), b, c.uid, c.uid),
                         adds,
                     )?;
                     Ok(Some((made.conv, Some(made))))

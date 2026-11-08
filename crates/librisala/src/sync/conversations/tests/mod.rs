@@ -100,9 +100,7 @@ impl Net {
             .add_account(&addr, AccountKind::Identity, &uid)
             .unwrap();
         let key = SigningKey::generate().unwrap();
-        let device_id = risala_mls::identity::DeviceId::of_device_key(key.public_key())
-            .0
-            .to_vec();
+        let device_id = key.device_id().as_bytes().to_vec();
         let hooks = Arc::new(TestHooks { key, confirm: true });
         let engine = ConversationEngine::new(config, hooks, Arc::new(self.clock.clone()));
         let d = self.devices.len();

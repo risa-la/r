@@ -296,6 +296,12 @@ impl Client {
             risala_mls::RisalaCrypto::new().map_err(|e| Error::Internal(e.to_string()))?,
         );
         let account = self.account(row.account)?;
+        // The server as the conversation extension writes it (3.5, 12.4).
+        let host: risala_proto::names::ServerAddr = account
+            .server
+            .to_string()
+            .parse()
+            .map_err(|_| Error::invalid("server", account.server.to_string()))?;
         self.store()
             .write_with(|tx| {
                 tx.mark_read(conversation, seq)?;
@@ -304,7 +310,6 @@ impl Client {
                 };
                 let hooks = crate::sync::conversations::NoHooks;
                 let config = crate::sync::conversations::Config::default();
-                let host = account.server.host().to_ascii_lowercase();
                 let cx = crate::sync::conversations::Ctx {
                     account: row.account,
                     uid: &own,

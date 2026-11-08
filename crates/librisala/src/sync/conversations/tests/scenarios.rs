@@ -541,9 +541,7 @@ fn self_lines_from_unconfirmed_leaves_are_ignored() {
     );
     // The second device confirms nobody (12.9).
     let key = SigningKey::generate().unwrap();
-    net.devices[a2].device_id = risala_mls::identity::DeviceId::of_device_key(key.public_key())
-        .0
-        .to_vec();
+    net.devices[a2].device_id = key.device_id().as_bytes().to_vec();
     net.server.signed_in.insert(
         (a2, Slot::SignedIn),
         (
