@@ -197,6 +197,13 @@ fn change(c: TransferChange) -> Change {
     Change::Transfer(c)
 }
 
+/// A blob's hash and its file key (12.13).
+pub type BlobAndKey = ([u8; 48], [u8; 32]);
+
+/// A kept conversation of a pairing transfer or backup: the transfer, the
+/// group id and the encoded HistoryArchive.
+pub type Pending = (i64, Vec<u8>, Vec<u8>);
+
 /// A file row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRow {
@@ -470,10 +477,7 @@ fn report_row(row: &Row<'_>) -> rusqlite::Result<ReportRow> {
         room: row.get::<_, Option<i64>>(4)?.map(ConversationId),
         mailbox: row.get(5)?,
         target: fixed(row.get(6)?)?,
-        context: context
-            .chunks_exact(16)
-            .map(|c| c.try_into().expect("16 bytes"))
-            .collect(),
+        context: context.as_chunks::<16>().0.to_vec(),
         reason: row.get(8)?,
         received: row.get::<_, i64>(9)? as u64,
         resolved: row.get(10)?,
@@ -530,6 +534,7 @@ impl Tx<'_> {
 
     /// Notes the blob a transfer or backup listed for a message's file
     /// (12.13): fetched instead of the `file` URL, for this message only.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_file_blob(
         &mut self,
         conv: ConversationId,
@@ -622,7 +627,7 @@ impl Tx<'_> {
         &self,
         account: AccountId,
         file_hash: &[u8; 48],
-    ) -> Result<Option<([u8; 48], [u8; 32])>, StoreError> {
+    ) -> Result<Option<BlobAndKey>, StoreError> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .conn()
             .query_row(
@@ -976,10 +981,7 @@ impl Tx<'_> {
 
     /// The conversations of pairing transfers still waiting: transfer,
     /// group id and encoded archive.
-    pub(crate) fn transfer_pending(
-        &self,
-        account: AccountId,
-    ) -> Result<Vec<(i64, Vec<u8>, Vec<u8>)>, StoreError> {
+    pub(crate) fn transfer_pending(&self, account: AccountId) -> Result<Vec<Pending>, StoreError> {
         let mut stmt = self.conn().prepare_cached(
             "SELECT p.transfer, p.group_id, p.archive FROM transfer_pending p
              JOIN transfers t ON t.id = p.transfer WHERE t.account = ?1",

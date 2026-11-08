@@ -145,7 +145,7 @@ impl Remote {
                     let Some(hashes) = risala_mls::backup::read_list(bytes) else {
                         return err_response(risala_proto::error::ErrorCode::Invalid);
                     };
-                    named.extend(hashes.iter().map(|h| proto_hex(h)));
+                    named.extend(hashes.iter().map(proto_hex));
                 }
                 if named.iter().any(|h| !s.blobs.contains_key(h)) {
                     return err_response(risala_proto::error::ErrorCode::NotFound);
@@ -1281,26 +1281,300 @@ fn reports_to_operators_carry_franked_posts() {
     assert!(seqs.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(seqs.len(), 3);
     assert_eq!(report.author.as_str(), "alice@example.org");
-    // Each post matches the frank its sender put in the post's RisalaAAD
-    // (12.9), which the server checks (5.8).
-    for post in report.posts() {
-        let row = rows.iter().find(|r| r.seq == Some(post.seq)).unwrap();
-        let body: Vec<u8> = net.devices[a1]
-            .store
-            .write(|tx| {
-                Ok(tx.conn().query_row(
-                    "SELECT body FROM outbox WHERE message_id = ?1",
-                    [&row.message_id[..]],
-                    |r| r.get(0),
-                )?)
-            })
-            .unwrap()
-            .0;
-        let sent = risala_mls::message::RisalaMessage::decode(&body).unwrap();
-        assert!(post.matches(&sent.frank()));
-    }
+    // The server's check (5.8): each post is kept, and its RisalaAAD's
+    // frank matches the reported content under the reported frank key.
+    let mailbox = net.devices[b].store.mailbox_rows(cb).unwrap()[0].mailbox;
+    let (response, _) = net.server.handle(
+        (b, Slot::Anonymous(0)),
+        Command::Fetch {
+            mailbox,
+            after: 0,
+            limit: None,
+            leaf: None,
+        },
+    );
+    let posts: HashMap<u64, Vec<u8>> = response
+        .lines
+        .iter()
+        .filter_map(|l| match &l.line {
+            risala_proto::server::ServerLine::Post(p) => match &p.message {
+                risala_proto::mls::OrBlob::Inline(m) => Some((p.seq?.get(), m.decode())),
+                risala_proto::mls::OrBlob::Blob(_) => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        risala_mls::message::verify_report(&report, |seq| posts.get(&seq).cloned()),
+        Ok(())
+    );
+    // Content that was not posted fails the frank.
+    let mut forged = report.clone();
+    forged.target.content = b"TEXT something else\n".to_vec();
+    assert!(risala_mls::message::verify_report(&forged, |seq| posts.get(&seq).cloned()).is_err());
     assert_eq!(
         risala_mls::message::RisalaReport::decode(&report.encode()).unwrap(),
         report
     );
+}
+
+// ---------------------------------------------------------------------------
+// Push (Section 9)
+
+/// Encrypts `plain` to a subscription as a server does (RFC 8291, 9.3):
+/// one record, padded to 128 bytes, under a fresh key and salt.
+fn push_body(plain: &[u8], ua_public: &[u8], auth: &[u8]) -> Vec<u8> {
+    use aws_lc_rs::{aead, agreement, hmac};
+    let hmac256 = |key: &[u8], parts: &[&[u8]]| -> Vec<u8> {
+        let mut ctx = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, key));
+        for p in parts {
+            ctx.update(p);
+        }
+        ctx.sign().as_ref().to_vec()
+    };
+    let private = agreement::PrivateKey::generate(&agreement::ECDH_P256).unwrap();
+    let as_public = private.compute_public_key().unwrap();
+    let salt = [7u8; 16];
+    let ecdh = agreement::agree(
+        &private,
+        agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, ua_public),
+        (),
+        |s| Ok(s.to_vec()),
+    )
+    .unwrap();
+    let prk_key = hmac256(auth, &[&ecdh]);
+    let ikm = hmac256(
+        &prk_key,
+        &[b"WebPush: info\0", ua_public, as_public.as_ref(), &[1]],
+    );
+    let prk = hmac256(&salt, &[&ikm]);
+    let cek = hmac256(&prk, &[b"Content-Encoding: aes128gcm\0", &[1]]);
+    let nonce = hmac256(&prk, &[b"Content-Encoding: nonce\0", &[1]]);
+    let key =
+        aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, &cek[..16]).unwrap());
+    let mut record = plain.to_vec();
+    record.push(2);
+    record.resize(128, 0);
+    key.seal_in_place_append_tag(
+        aead::Nonce::assume_unique_for_key(nonce[..12].try_into().unwrap()),
+        aead::Aad::empty(),
+        &mut record,
+    )
+    .unwrap();
+    let mut body = salt.to_vec();
+    body.extend_from_slice(&4096u32.to_be_bytes());
+    body.push(65);
+    body.extend_from_slice(as_public.as_ref());
+    body.extend_from_slice(&record);
+    body
+}
+
+fn b64url(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .unwrap()
+}
+
+/// RFC 8291, Section 5: the example push decrypts.
+#[test]
+fn push_bodies_decrypt_as_rfc_8291_says() {
+    let body = b64url(
+        "DGv6ra1nlYgDCS1FRnbzlwAAEABBBP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A_yl95bQpu6cVPTpK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN",
+    );
+    let ua_private = b64url("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94");
+    let auth = b64url("BTBZMqHH6r4Tts7J_aSIgg");
+    assert_eq!(
+        crate::client::push::decrypt(&body, &ua_private, &auth).unwrap(),
+        b"When I grow up, I want to be a watermelon"
+    );
+    assert!(crate::client::push::decrypt(&body, &ua_private, &[0; 16]).is_none());
+    let mut bad = body.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(crate::client::push::decrypt(&bad, &ua_private, &auth).is_none());
+}
+
+fn push_sends(actions: &[Action]) -> Vec<(Target, String, Token)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Send {
+                target,
+                command,
+                token,
+            } => Some((target.clone(), format!("{command:?}"), *token)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn push_subscriptions_follow_the_conversations() {
+    use crate::sync::Engine as _;
+    use crate::sync::push::PushEngine;
+    let (net, [a1, _a2, _b], conv) = Net::alice_bob();
+    let cx = net.cx(a1);
+    let account = cx.account;
+    let mut push = PushEngine::default();
+    for (slot, kind) in [
+        (Slot::SignedIn, ConnectionKind::SignedIn),
+        (Slot::Anonymous(0), ConnectionKind::Anonymous),
+    ] {
+        push.handle(&cx, &Input::Ready { slot, kind });
+    }
+    let tick = |net: &Net, push: &mut PushEngine| {
+        net.clock.advance(10_000);
+        push.handle(
+            &net.cx(a1),
+            &Input::Tick {
+                now: crate::clock::Clock::now(&net.clock),
+            },
+        )
+    };
+    let ok = Response {
+        lines: Vec::new(),
+        end: End::Ok(OkResponse::new()),
+    };
+    // Off: nothing.
+    assert!(push_sends(&tick(&net, &mut push)).is_empty());
+
+    // On, with one URL for three subscriptions: the account's and the two
+    // conversations' (Alice's own and Bob's). The app is asked for more.
+    let store = net.devices[a1].store.clone();
+    store
+        .set_setting(&crate::sync::push::setting(account), Some("on"))
+        .unwrap();
+    let urls = |n: std::ops::Range<u32>| -> Vec<String> {
+        n.map(|i| format!("https://push.example.net/w/{i}"))
+            .collect()
+    };
+    store
+        .write(|tx| tx.add_push_urls(account, &urls(0..1), 0))
+        .unwrap();
+    let actions = tick(&net, &mut push);
+    let sent = push_sends(&actions);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::Emit(crate::client::Event::Transfer(
+            crate::client::files::TransferEvent::PushUrlsNeeded { count: 2, .. }
+        ))
+    )));
+    let mut all = sent;
+    store
+        .write(|tx| tx.add_push_urls(account, &urls(1..3), 0))
+        .unwrap();
+    all.extend(push_sends(&tick(&net, &mut push)));
+    assert_eq!(all.len(), 3, "{all:?}");
+    // The account's on the signed-in connection, without box; each
+    // mailbox's on the connection that follows it, with box (9.1).
+    let mailbox = store.mailbox_rows(conv).unwrap()[0].mailbox;
+    assert!(
+        all.iter()
+            .any(|(t, c, _)| *t == Target::SignedIn && c.contains("mailbox: None"))
+    );
+    assert!(
+        all.iter()
+            .any(|(t, c, _)| *t == Target::Mailbox(mailbox) && c.contains(&mailbox.to_string()))
+    );
+    // Every subscription has its own URL and tag.
+    let subs = store.subscription_rows().unwrap();
+    let tags: std::collections::HashSet<_> = subs.iter().map(|s| s.tag.clone()).collect();
+    assert_eq!(tags.len(), 3);
+    for (_, _, token) in &all {
+        push.handle(
+            &cx,
+            &Input::Reply {
+                slot: Slot::SignedIn,
+                token: *token,
+                response: &ok,
+            },
+        );
+    }
+    let now = crate::clock::Clock::now(&net.clock).unix_millis();
+    for s in store.subscription_rows().unwrap() {
+        assert_eq!(s.state, crate::store::push::SubState::Active);
+        match s.mailbox {
+            // Renewed within a week, well inside retention (9.1).
+            Some(_) => {
+                let renew = s.renew_at.unwrap();
+                assert!(renew > now && renew <= now + crate::sync::push::RENEW_MAX_MS);
+            }
+            None => assert_eq!(s.renew_at, None),
+        }
+    }
+    // Nothing more to do.
+    assert!(push_sends(&tick(&net, &mut push)).is_empty());
+
+    // A push to the conversation's subscription decrypts to it (9.3).
+    let sub = store
+        .subscription_rows()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.mailbox.as_deref() == Some(&mailbox.to_string()))
+        .unwrap();
+    let client = crate::client::Client::with_store(store.clone(), Default::default());
+    let body = push_body(
+        format!("NOTIFY {} message\n", sub.tag).as_bytes(),
+        &sub.p256dh,
+        &sub.auth,
+    );
+    assert_eq!(
+        client.handle_push(&body, None).unwrap(),
+        crate::client::push::PushNotice::Message {
+            account,
+            conversation: conv
+        }
+    );
+    // Another tag inside is not this subscription's.
+    let body = push_body(b"NOTIFY other message\n", &sub.p256dh, &sub.auth);
+    assert!(client.handle_push(&body, None).is_err());
+    // FOLLOW's quiet: only if asked for (9.2).
+    assert_eq!(
+        crate::sync::push::follow_quiet(&store, account, &mailbox),
+        None
+    );
+    client.set_quiet_follows(account, true).unwrap();
+    assert_eq!(
+        crate::sync::push::follow_quiet(&store, account, &mailbox).map(|t| t.to_string()),
+        Some(sub.tag.clone())
+    );
+
+    // Renewed when due.
+    net.clock.advance(crate::sync::push::RENEW_MAX_MS);
+    let sent = push_sends(&tick(&net, &mut push));
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for (_, _, token) in &sent {
+        push.handle(
+            &cx,
+            &Input::Reply {
+                slot: Slot::SignedIn,
+                token: *token,
+                response: &ok,
+            },
+        );
+    }
+
+    // Pushes off for one conversation: its subscription is deleted.
+    store.write(|tx| tx.set_push_off(conv, true)).unwrap();
+    let sent = push_sends(&tick(&net, &mut push));
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].1.contains("Del"), "{sent:?}");
+    push.handle(
+        &cx,
+        &Input::Reply {
+            slot: Slot::SignedIn,
+            token: sent[0].2,
+            response: &ok,
+        },
+    );
+    assert_eq!(store.subscription_rows().unwrap().len(), 2);
+
+    // Push off: every subscription is deleted.
+    store
+        .set_setting(&crate::sync::push::setting(account), None)
+        .unwrap();
+    let sent = push_sends(&tick(&net, &mut push));
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|(_, c, _)| c.contains("Del")));
 }

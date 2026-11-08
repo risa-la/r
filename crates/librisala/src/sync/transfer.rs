@@ -623,6 +623,15 @@ pub(crate) fn apply(
         let mailbox = BoxName::from_bytes(archived.mailbox);
         let ranges = match source {
             Source::Want { .. } => {
+                // The ranges asked for are by mailbox: the archived box
+                // must be one of this conversation's, or a device could
+                // pass another group's messages off as the ones asked for.
+                if tx
+                    .mailbox(account, &mailbox)?
+                    .is_none_or(|m| m.conv != conv.id)
+                {
+                    continue;
+                }
                 let open: Vec<WantRange> = tx.wants(account, &mailbox.to_string())?;
                 if open.is_empty() {
                     continue;
@@ -826,7 +835,7 @@ fn apply_conversation(
         }
     }
     if stored > 0 {
-        tx.touch(conv.id, now.min(u64::MAX))?;
+        tx.touch(conv.id, now)?;
     }
     Ok(stored)
 }

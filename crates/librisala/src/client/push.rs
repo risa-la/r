@@ -212,3 +212,30 @@ impl Client {
         Err(TransferError::BadPush.into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use risala_proto::binary::{PushAuth, PushKey};
+
+    /// A body made by `risalad` (9.3) decrypts here, for every length of
+    /// tag, and the wrong secret does not open it.
+    #[test]
+    fn the_servers_pushes_decrypt() {
+        let keys = crate::sync::push::new_keys().unwrap();
+        let key = PushKey::from_bytes(keys.public);
+        let auth = PushAuth::from_bytes(keys.auth);
+        for tag in ["a", keys.tag.as_str(), &"x".repeat(64)] {
+            for reason in [PushReason::Message, PushReason::Welcome] {
+                let notify = Notify {
+                    tag: tag.parse().unwrap(),
+                    reason: NotifyReason::Known(reason),
+                };
+                let body = risala_server::push::encrypt(&notify, &key, &auth).unwrap();
+                let plain = decrypt(&body, &keys.private, &keys.auth).unwrap();
+                assert_eq!(plain, notify.to_body().into_bytes());
+                assert!(decrypt(&body, &keys.private, &[0; 16]).is_none());
+            }
+        }
+    }
+}
