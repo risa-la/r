@@ -12,12 +12,15 @@
 //!   `risala_proto::mls` (12.2).
 //! - [`history`]: history keys (12.9).
 //! - [`message`]: encrypted messages, the payload of ENC (12.8).
+//! - [`backup`]: recovery keys, backup blobs and the recovery signing key
+//!   (12.10).
 //! - [`primitives`]: the labelled functions of [RFC9420] that risala uses
 //!   outside MLS.
 //!
 //! The server's checks of commits (12.5) and librisala's group engine are
 //! built on this crate, not in it.
 
+pub mod backup;
 pub mod conversation;
 pub mod crypto;
 pub mod group;
@@ -31,6 +34,7 @@ pub mod wire;
 pub use openmls;
 pub use openmls_traits;
 
+pub use backup::{BackupError, BackupKey, RecoveryKey, RecoveryKeyError};
 pub use conversation::{ConversationError, ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto, verify_ml_dsa_44};
 pub use group::{
