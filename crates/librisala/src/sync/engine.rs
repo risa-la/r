@@ -207,6 +207,9 @@ pub struct SyncEngine {
     convs: HashMap<Conv, Live>,
     /// The SYNC in flight, if any.
     syncing: Option<ReqId>,
+    /// A SYNC was answered on this connection, so the cache knows which
+    /// rooms the account is in (7.1).
+    listed: bool,
     /// Send SYNC again once the one in flight is answered.
     want_sync: bool,
     /// Outbox entries sent on this connection and not answered yet.
@@ -253,6 +256,7 @@ impl SyncEngine {
             pending: HashMap::new(),
             convs: HashMap::new(),
             syncing: None,
+            listed: false,
             want_sync: false,
             sending: HashSet::new(),
             ticks: 0,
@@ -1079,6 +1083,7 @@ impl SyncEngine {
         if !newer.is_empty() {
             self.want_sync = true;
         }
+        self.listed = true;
         let account = self.account;
         let guest = self.guest;
         let session_ended = self.session_ended();
@@ -1808,6 +1813,7 @@ impl SyncEngine {
         // A guest's cids count only within its session (7.6).
         let cids_hold = !self.guest || self.resumed;
         let guest = self.guest;
+        let listed = self.listed;
         let claim = self.claim.clone();
         let store = self.store.clone();
         let in_flight = self.sending.clone();
@@ -1866,7 +1872,21 @@ impl SyncEngine {
                 match (&item.conv_id, live) {
                     (Some(bound), Some(id)) if bound == id => {}
                     (Some(bound), None)
-                        if item.delete.is_some() && delete_left(left, stored.as_ref(), bound) => {}
+                        if item.delete.is_some()
+                            && bound_while_left(left, stored.as_ref(), bound) => {}
+                    // A message sent on an earlier connection to a room the
+                    // account has left since, with no answer. The server
+                    // checks its cid before anything else (7.6), so sent
+                    // again it gets the seq it got, or is refused if it
+                    // never got one. Only once SYNC has said the account is
+                    // not in the room: if it is in a room of that name made
+                    // again, the cid would not match there, and the message
+                    // would be posted to the new room.
+                    (Some(bound), None)
+                        if item.delete.is_none()
+                            && item.state == OutboxState::Sending
+                            && listed
+                            && bound_while_left(left, stored.as_ref(), bound) => {}
                     (Some(_), Some(_)) => {
                         // The room was dropped and created again (7.6).
                         tx.outbox_failed(item.id, FailReason::RoomChanged)?;
@@ -1913,16 +1933,19 @@ impl SyncEngine {
     }
 }
 
-/// Whether a DELETE bound to `bound` may be sent for a room that is not
-/// confirmed on this connection (5.4): the cache says the account is not
-/// in the room, and still has the id the DELETE is bound to. Authors may
-/// delete their own messages in rooms they have left, but the server
-/// cannot confirm the room's id to someone who no longer reads it. The
-/// DELETE carries the id it is bound to, and the server deletes nothing
-/// if the room's id is different, so it need not wait for SYNC: if the
-/// account is in the room again, or the room was dropped and created
-/// again, the server's answer is as safe as SYNC's.
-fn delete_left(left: bool, stored: Option<&Id>, bound: &Id) -> bool {
+/// Whether an entry bound to `bound` may be sent for a room that is not
+/// confirmed on this connection: the cache says the account is not in the
+/// room, and still has the id the entry is bound to. The server cannot
+/// confirm the room's id to someone who no longer reads it.
+///
+/// - A DELETE (5.4): authors may delete their own messages in rooms they
+///   have left. The DELETE carries the id it is bound to, and the server
+///   deletes nothing if the room's id is different, so it need not wait
+///   for SYNC: if the account is in the room again, or the room was
+///   dropped and created again, the server's answer is as safe as SYNC's.
+/// - A message already sent, with no answer (7.6): see
+///   [`SyncEngine::flush_outbox`].
+fn bound_while_left(left: bool, stored: Option<&Id>, bound: &Id) -> bool {
     left && stored == Some(bound)
 }
 

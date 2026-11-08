@@ -1900,17 +1900,48 @@ fn tlc_5_a_resent_cid_gets_someone_elses_seq() {
     h.absorb(out);
     h.expect_msg("mine");
     let r = h.reconnect();
-    h.reply(r, &[], "OK");
+    // It joins before SYNC answers: the new id shows the room changed.
     let out = h.engine.join(&"#general".parse().unwrap());
     h.absorb(out);
-    let r = h.expect("JOIN #general");
+    let j = h.expect("JOIN #general");
     h.line(&ev(1, "from=alice@example.org;id=k2 JOIN #general"));
-    h.reply(r, &[], "OK id=k2 head=1");
+    h.reply(j, &[], "OK id=k2 head=1");
+    h.reply(r, &["CONV #general k2 1 0"], "OK");
+    // The JOIN came while SYNC was out, so it asks again.
+    let r = h.expect("SYNC");
+    h.reply(r, &["CONV #general k2 1 0"], "OK");
     h.idle();
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
         OutboxState::Failed(FailReason::RoomChanged)
     );
+
+    // SYNC answers first, listing no such room: the message goes again
+    // with its cid while no room of the name has the account in it. The
+    // server finds no room, and refuses it; the join comes after.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (id, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("mine"))
+        .unwrap();
+    h.absorb(out);
+    let (_, cid) = h.expect_msg("mine");
+    let r = h.reconnect();
+    h.reply(r, &[], "OK");
+    let (m, again) = h.expect_msg("mine");
+    assert_eq!(again, cid);
+    h.reply(m, &[], "ERR not-found");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::Rejected(ErrorCode::NotFound))
+    );
+    let out = h.engine.join(&"#general".parse().unwrap());
+    h.absorb(out);
+    let j = h.expect("JOIN #general");
+    h.line(&ev(1, "from=alice@example.org;id=k2 JOIN #general"));
+    h.reply(j, &[], "OK id=k2 head=1");
+    h.idle();
 }
 
 // ---------------------------------------------------------------------------
@@ -2238,6 +2269,55 @@ fn a_resumed_guests_missing_room_was_left() {
     assert_eq!(
         h.store.outbox_item(msg).unwrap().unwrap().state,
         OutboxState::Failed(FailReason::NotInRoom)
+    );
+}
+
+#[test]
+fn a_message_sent_before_leaving_is_sent_again_after_sync() {
+    // 7.6: a message sent with no answer when the connection dropped, to a
+    // room the account has left since. The server checks the cid before
+    // membership, so it goes again with its cid once SYNC has said the
+    // account is not in the room, and ends as sent or refused rather than
+    // waiting for the resend window to pass.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (id, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("hi"))
+        .unwrap();
+    h.absorb(out);
+    let (_, cid) = h.expect_msg("hi");
+    h.line(&ev(5, "from=alice@example.org PART #general"));
+    assert!(!h.conv("#general").joined);
+    // Not before SYNC answers: the account may be in a room of that name
+    // made again, where the cid would not match.
+    let r = h.reconnect();
+    h.idle();
+    h.reply(r, &[], "OK");
+    let (m, again) = h.expect_msg("hi");
+    assert_eq!(again, cid);
+    h.reply(m, &[], "OK seq=4");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Sent(seq(4))
+    );
+
+    // One that never got through is refused, and fails.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let (id, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("late"))
+        .unwrap();
+    h.absorb(out);
+    h.expect_msg("late");
+    let r = h.reconnect();
+    h.reply(r, &[], "OK");
+    let (m, _) = h.expect_msg("late");
+    h.reply(m, &[], "ERR forbidden you are not in #general");
+    assert_eq!(
+        h.store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Failed(FailReason::Rejected(ErrorCode::Forbidden))
     );
 }
 
