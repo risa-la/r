@@ -232,7 +232,7 @@ four writing code at once.
 - [x] **C3. Confirming leaves** in the engine (12.10). Needs C2, M3.
 - [x] **C4. Transfer, backups, files, push and reports** (4.8,
   12.11-12.13, 9, 5.8). Needs C2, M4.
-- [ ] **C5. `risala-cli` and `risala-dev`** follow the new API, and the
+- [~] **C5. `risala-cli` and `risala-dev`** follow the new API, and the
   end-to-end tests in the goal pass. Needs C1-C4.
 
 ### V. Test vectors
@@ -244,6 +244,6 @@ four writing code at once.
 
 ### R. Code review
 
-- [ ] **R1. Review** of M5b's code, one reviewer per crate, with the same
+- [~] **R1. Review** of M5b's code, one reviewer per crate, with the same
   rules as M5a's review; findings to `/home/humaid/repos/risala-m5b/`.
-- [ ] **R2. Fixes.**
+- [~] **R2. Fixes.**
