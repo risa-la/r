@@ -867,6 +867,26 @@ impl KeysStore for SqliteStore {
         })
     }
 
+    fn keep_own_blob(
+        &self,
+        owner: &str,
+        hash: &BlobRef,
+        size: u64,
+        now: Timestamp,
+    ) -> Result<Vec<BlobRef>> {
+        // Its stored time only moves forward, so that it does not expire
+        // before `owner` keeps it.
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO blobs (hash, size, stored) VALUES (?, ?, ?)
+                 ON CONFLICT (hash) DO UPDATE SET stored = max(stored, excluded.stored)",
+                params![&hash.hash()[..], sql_u64(size), millis(now)],
+            )?;
+            Ok(())
+        })?;
+        self.set_blob_keeps(owner, std::slice::from_ref(hash))
+    }
+
     fn delete_blob(&self, hash: &BlobRef) -> Result<bool> {
         self.write(|tx| Ok(!delete_unkept(tx, std::slice::from_ref(hash))?.is_empty()))
     }

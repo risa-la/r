@@ -436,20 +436,12 @@ impl State {
 
     /// The current log, as a chain's `master` or `log` record names it
     /// (4.4), or `None` if the server keeps no log.
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
     pub(crate) fn current_log(&self) -> Option<LogKey> {
         let side = self.log.as_ref()?;
         Some(lock(&side.logs).current().key.clone())
     }
 
     /// The URL prefix of the current log, `log=` in INFO (8.5).
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
     pub(crate) fn url(&self) -> Option<String> {
         let side = self.log.as_ref()?;
         let n = lock(&side.logs).current().number();
@@ -459,7 +451,7 @@ impl State {
     /// The URL prefix of log `number`, if the server has run it.
     #[allow(
         dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
+        reason = "a handed-off log's URL (4.10); nothing names old logs yet"
     )]
     pub(crate) fn url_of(&self, number: u64) -> Option<String> {
         let side = self.log.as_ref()?;
@@ -471,19 +463,13 @@ impl State {
 
     /// The verifier key of the current log, `log-key=` in INFO (8.5), and
     /// what a key file's `log` line names (4.4).
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
+    #[allow(dead_code, reason = "used by the tests only")]
     pub(crate) fn vkey(&self) -> Option<String> {
         Some(self.current_log()?.vkey())
     }
 
     /// The number of entries in the current log.
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
+    #[allow(dead_code, reason = "used by the tests only")]
     pub(crate) fn size(&self) -> Option<u64> {
         let side = self.log.as_ref()?;
         Some(lock(&side.logs).current().size())
@@ -491,10 +477,6 @@ impl State {
 
     /// Every log the server has run, oldest first. Each one before the
     /// current one has handed off to the next (4.5).
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
     pub(crate) fn logs(&self) -> Vec<LogKey> {
         self.log.as_ref().map_or_else(Vec::new, |side| {
             lock(&side.logs)
@@ -508,20 +490,13 @@ impl State {
     /// The server's own hand-offs, for the chain checks of KEYS PUT
     /// ([`risala_proto::chain::keys_put`]): a chain in one of the server's
     /// logs continues in each later one (4.5).
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
     pub(crate) fn handoffs(&self) -> OwnHandoffs {
         OwnHandoffs { logs: self.logs() }
     }
 
     /// The witness's verifier key, for its operator to publish (4.10), in
     /// witness mode.
-    #[allow(
-        dead_code,
-        reason = "the API of the identity area (SV1) and INFO (SV5)"
-    )]
+    #[allow(dead_code, reason = "used by the tests only")]
     pub(crate) fn witness_vkey(&self) -> Option<String> {
         let w = self.witness.as_ref()?;
         Some(lock(&w.core).vkey().to_string())
@@ -632,10 +607,6 @@ impl LogSide {
 /// The server's own logs as hand-offs (4.5): every log before the current
 /// one handed off to the next.
 #[derive(Debug, Clone)]
-#[allow(
-    dead_code,
-    reason = "the API of the identity area (SV1) and INFO (SV5)"
-)]
 pub(crate) struct OwnHandoffs {
     logs: Vec<LogKey>,
 }
@@ -658,10 +629,6 @@ pub(super) fn conn_closed(_inner: &Arc<Inner>, _id: ConnId, _conn: &ConnEntry) {
 
 /// Where a record is in the key log.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the API of the identity area (SV1) and INFO (SV5)"
-)]
 pub(crate) struct Logged {
     /// The log.
     pub(crate) log: LogKey,
@@ -671,10 +638,6 @@ pub(crate) struct Logged {
 
 /// Why the log did not append records.
 #[derive(Debug, thiserror::Error)]
-#[allow(
-    dead_code,
-    reason = "the API of the identity area (SV1) and INFO (SV5)"
-)]
 pub(crate) enum AppendError {
     /// The server keeps no key log.
     #[error("the server keeps no key log")]
@@ -706,10 +669,6 @@ pub(crate) enum AppendError {
 /// `uid`, and each follows the newest record of `uid` that the host's logs
 /// hold, if they hold any. Records are appended all or none. A witnessed
 /// checkpoint that includes them follows within the hour ([`maintain`]).
-#[allow(
-    dead_code,
-    reason = "the API of the identity area (SV1) and INFO (SV5)"
-)]
 pub(crate) async fn append_records(
     inner: &Arc<Inner>,
     uid: &Identity,
@@ -803,10 +762,6 @@ impl Hub {
 }
 
 /// Where a record is logged, if any of the server's logs holds it.
-#[allow(
-    dead_code,
-    reason = "the API of the identity area (SV1) and INFO (SV5)"
-)]
 pub(crate) async fn index_of(
     inner: &Arc<Inner>,
     hash: risala_proto::names::BlobRef,

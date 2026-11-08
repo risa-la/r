@@ -1083,24 +1083,34 @@ async fn blobs_expire_from_the_last_blob_command_that_named_them() {
     assert!(anon.raw_lines()[0].starts_with("OK put="));
 }
 
+/// A public room's tree too long for GROUPINFO's line is a blob, kept
+/// while it is the room's current tree (12.12).
 #[tokio::test]
 async fn a_public_rooms_current_tree_is_kept() {
-    let mut h = keys();
-    h.mailbox();
-    let mut anon = h.anon().await;
-    let tree = h.store_blob(&mut anon, b"tree").await;
+    let h = keys();
     let room: BoxName = BOX.parse().unwrap();
-    keys::keep_room_tree(h.inner(), room, Some(tree))
+    let tree = keys::room_tree_blob(h.inner(), room, b"tree".to_vec())
         .await
         .unwrap();
-    h.advance(days(60));
-    h.expire().await;
+    assert_eq!(tree, BlobRef::of(b"tree"));
     let files = h.hub.files();
     assert!(files.blob(tree).await.is_ok());
-    // A new epoch's tree is in the line: the old one expires.
-    keys::keep_room_tree(h.inner(), room, None).await.unwrap();
+    h.advance(days(60));
+    h.expire().await;
+    assert!(files.blob(tree).await.is_ok());
+    // A new epoch's tree replaces it: the old one expires with retention.
+    let newer = keys::room_tree_blob(h.inner(), room, b"newer".to_vec())
+        .await
+        .unwrap();
     h.expire().await;
     assert!(files.blob(tree).await.is_err());
+    h.advance(days(60));
+    h.expire().await;
+    assert!(files.blob(newer).await.is_ok());
+    // The room ends.
+    keys::room_ended(h.inner(), room).await.unwrap();
+    h.expire().await;
+    assert!(files.blob(newer).await.is_err());
 }
 
 // ---------------------------------------------------------------------------

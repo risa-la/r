@@ -7,11 +7,6 @@
 //! running it on several connections at once does not get around the
 //! limit (4.6).
 
-#![allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
-
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::net::IpAddr;

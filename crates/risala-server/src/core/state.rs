@@ -27,10 +27,6 @@ use crate::secret::SecretHash;
 
 /// Who a connection acts for: its kind (4.1), with what each kind knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
 pub(crate) enum Who {
     /// Not yet anonymous, a guest or signed in.
     New,
@@ -73,10 +69,6 @@ pub(crate) struct Device {
 }
 
 /// One open connection.
-#[allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
 pub(crate) struct ConnEntry {
     /// Where its lines go.
     pub(crate) handle: ConnHandle,
@@ -96,15 +88,13 @@ pub(crate) struct ConnEntry {
     /// to another connection (4.2): no more of its commands are run.
     pub(crate) detached: bool,
     /// What each area keeps about the connection.
+    #[allow(dead_code, reason = "no area keeps anything per connection yet")]
     pub(crate) areas: AreaConns,
 }
 
 /// What each area keeps about one connection, in the area's own type.
 #[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
+#[allow(dead_code, reason = "no area keeps anything per connection yet")]
 pub(crate) struct AreaConns {
     pub(crate) identity: identity::ConnState,
     pub(crate) keylog: keylog::ConnState,
@@ -208,7 +198,7 @@ impl Registry {
     /// The connections of `uid`, signed in or a guest.
     #[allow(
         dead_code,
-        reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
+        reason = "each area keeps its own index of connections by uid"
     )]
     pub(crate) fn conns_of(&self, uid: &Uid) -> Vec<ConnHandle> {
         self.by_uid

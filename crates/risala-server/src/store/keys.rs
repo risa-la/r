@@ -398,6 +398,17 @@ pub trait KeysStore {
     /// nothing keeps now.
     fn set_blob_keeps(&self, owner: &str, hashes: &[BlobRef]) -> Result<Vec<BlobRef>>;
 
+    /// Records the blob `hash` of `size` bytes, which the server wrote
+    /// itself, as stored at `now`, and makes it the one blob `owner`
+    /// keeps, as [`set_blob_keeps`](Self::set_blob_keeps) does.
+    fn keep_own_blob(
+        &self,
+        owner: &str,
+        hash: &BlobRef,
+        size: u64,
+        now: Timestamp,
+    ) -> Result<Vec<BlobRef>>;
+
     /// Deletes the blob `hash` now, unless something keeps it. Returns
     /// whether it was deleted.
     fn delete_blob(&self, hash: &BlobRef) -> Result<bool>;

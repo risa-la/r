@@ -15,8 +15,9 @@
 //!   tree of the new epoch is kept for WELCOME GET (12.6, 12.8).
 //! - [`blob_bytes`]: the identity area for KEYS PUT, reports, and the
 //!   mailbox area, for the bytes of a blob a line names (12.12).
-//! - [`keep_room_tree`]: the mailbox area, when a public room's tree is a
-//!   blob, so that it is kept while its epoch is current (12.12).
+//! - [`room_tree_blob`] and [`room_ended`]: the mailbox area, when a public
+//!   room's tree is too long for GROUPINFO's line, so that it is a blob
+//!   kept while it is current (12.12).
 //! - [`charge_address`] and [`stored_bytes`]: the mailbox area, so that
 //!   POST, UPLOAD and BLOB count against one window per network address,
 //!   and posts, files and blobs against one quota per mailbox (7.5).
@@ -743,7 +744,7 @@ const MAX_INLINE_TREE: usize = MAX_SERVER_LINE / 2;
 ///
 /// The mailbox area calls this once it has accepted such a commit, with
 /// the KeyPackageRefs of the proposals' KeyPackages and the tree it
-/// exported after merging the commit (docs/plans/M5b.md, SV3).
+/// exported after merging the commit.
 pub(crate) async fn room_joins_committed(
     inner: &Arc<Inner>,
     mailbox: BoxName,
@@ -894,7 +895,7 @@ pub(crate) async fn stored_bytes(inner: &Inner, mailbox: BoxName) -> Result<u64,
 /// within its one quota for posts, files and blobs (7.5): files and blobs
 /// are not expired early, so ones that do not fit beside the others get
 /// `ERR rate-limited`; then the oldest posts expire early to make room,
-/// as a post over the quota makes them (the choice of 7.5 SV3 made).
+/// as a post over the quota makes them (7.5 allows either).
 /// The bytes count against the address's window too, before any post
 /// expires.
 async fn check_quota(cx: &Cx, mailbox: BoxName, size: u64) -> Result<(), ErrResponse> {
@@ -1018,26 +1019,49 @@ async fn upload(cx: &Cx, mailbox: BoxName, token: SendToken, size: u64) -> Reply
         .map_err(internal)
 }
 
-/// The public room `mailbox`'s current tree is the blob `tree`, or is in
-/// its line (`None`): the blob is kept for as long as the epoch is
-/// current, whatever the retention (12.12). Once it is not, retention
-/// counts from the last BLOB that named it. The mailbox area calls this
-/// for each new epoch, and with `None` when the room ends.
-#[allow(
-    dead_code,
-    reason = "called by the mailbox area (docs/plans/M5b.md, SV3)"
-)]
-pub(crate) async fn keep_room_tree(
-    inner: &Inner,
+/// The public room `mailbox`'s current tree, too long for a GROUPINFO line
+/// (12.12), as a blob the server stores itself and counts against nobody.
+/// It is kept for as long as it is the room's current tree, whatever the
+/// retention; once another replaces it, or the room ends
+/// ([`room_ended`]), retention counts from when it was last made. The
+/// mailbox area calls this for GROUPINFO.
+pub(crate) async fn room_tree_blob(
+    inner: &Arc<Inner>,
     mailbox: BoxName,
-    tree: Option<BlobRef>,
-) -> Result<(), StoreError> {
-    let owner = format!("room {}", hex(mailbox.as_bytes()));
-    let kept: Vec<BlobRef> = tree.into_iter().collect();
+    tree: Vec<u8>,
+) -> Result<BlobRef, StoreError> {
+    let now = inner.now();
+    let inner = inner.clone();
+    tokio::task::spawn_blocking(move || {
+        let keys = &inner.keys;
+        // Under the lock that expiry takes, so that the blob is not
+        // removed between its file and its row.
+        let _guard = keys.lock_fs();
+        let hash = BlobRef::of(&tree);
+        disk::write_blob(keys, &hash, &tree)
+            .map_err(|e| StoreError::Setup(format!("storing a tree: {e}")))?;
+        inner
+            .store
+            .keep_own_blob(&room_owner(&mailbox), &hash, tree.len() as u64, now)?;
+        Ok(hash)
+    })
+    .await
+    .map_err(|e| StoreError::Task(e.to_string()))?
+}
+
+/// The public room of `mailbox` has ended: its tree's blob is no longer
+/// kept beyond retention (12.12). The mailbox area calls this.
+pub(crate) async fn room_ended(inner: &Inner, mailbox: BoxName) -> Result<(), StoreError> {
+    let owner = room_owner(&mailbox);
     inner
-        .db(move |store| store.set_blob_keeps(&owner, &kept))
+        .db(move |store| store.set_blob_keeps(&owner, &[]))
         .await
         .map(drop)
+}
+
+/// The owner of a public room's tree blob in the store.
+fn room_owner(mailbox: &BoxName) -> String {
+    format!("room {}", hex(mailbox.as_bytes()))
 }
 
 fn hex(bytes: &[u8]) -> String {

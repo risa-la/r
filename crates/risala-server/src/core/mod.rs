@@ -219,10 +219,6 @@ impl std::fmt::Debug for Hub {
 
 /// Everything the hub holds. Areas reach it through
 /// [`Cx::inner`](command::Cx::inner).
-#[allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
 pub(crate) struct Inner {
     /// The configuration the hub started with.
     pub(crate) config: Config,
@@ -435,10 +431,6 @@ impl Hub {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
 impl Inner {
     /// The registry of connections and guest sessions.
     pub(crate) fn reg(&self) -> MutexGuard<'_, Registry> {

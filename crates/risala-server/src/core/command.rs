@@ -74,10 +74,6 @@ pub(crate) struct Cx {
     replied: AtomicBool,
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the areas as they are built (docs/plans/M5b.md, SV1-SV5)"
-)]
 impl Cx {
     /// Sends a response line, with the command's `ref` (3.6). Returns
     /// `false` if the connection is gone or was too slow.

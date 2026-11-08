@@ -1063,8 +1063,11 @@ async fn one_address_window() {
     let commit = d.commit.parse::<MlsMessage>().unwrap().decode().len() as u64;
     let size = 1_000_000 - commit - 3000;
     let blob = risala_proto::names::BlobRef::of(b"a");
-    h.send(&anon, &format!("BLOB {blob} {size} box={} token={token}", d.m))
-        .await;
+    h.send(
+        &anon,
+        &format!("BLOB {blob} {size} box={} token={token}", d.m),
+    )
+    .await;
     let lines = anon.raw_lines();
     assert!(lines[0].starts_with("OK put="), "{lines:?}");
     let message = d.alice.send(&mut d.a, &[1; 6000]);
@@ -1551,8 +1554,8 @@ async fn public_room_welcomes() {
     let mut room = create_room(&mut h, 1).await;
     let m = room.m;
     let dave = Dev::new("dave@example.org", 4);
-    let made = make_join_key_package(&dave.provider, &dave.identity(), Some(&dave.profile()))
-        .unwrap();
+    let made =
+        make_join_key_package(&dave.provider, &dave.identity(), Some(&dave.profile())).unwrap();
     let context = room.o.public_group().group_context();
     let proposal = b64(&join_proposal::<Provider<MemoryStorage>>(
         &made.key_package,
@@ -1561,11 +1564,9 @@ async fn public_room_welcomes() {
         &made.leaf_key,
     )
     .unwrap());
-    let kp_ref = made
-        .key_package
-        .hash_ref(dave.provider.crypto())
-        .unwrap();
-    let kp_ref = risala_proto::mls::KeyPackageRef::from_bytes(kp_ref.as_slice().try_into().unwrap());
+    let kp_ref = made.key_package.hash_ref(dave.provider.crypto()).unwrap();
+    let kp_ref =
+        risala_proto::mls::KeyPackageRef::from_bytes(kp_ref.as_slice().try_into().unwrap());
     let mut anon = h.anon().await;
     h.send(&anon, &format!("POST {m} - {proposal}")).await;
     assert_eq!(anon.lines(), ["OK seq=1"]);
@@ -1629,13 +1630,8 @@ async fn public_room_welcomes() {
         own_uid: dave.uid.clone(),
         public_room: Some(("#general".parse().unwrap(), *m.as_bytes())),
     };
-    let joined = join_by_welcome(
-        &dave.provider,
-        &out.welcome.unwrap(),
-        Some(&tree),
-        &expect,
-    )
-    .unwrap();
+    let joined =
+        join_by_welcome(&dave.provider, &out.welcome.unwrap(), Some(&tree), &expect).unwrap();
     assert_eq!(joined.group.epoch(), room.o.epoch());
     assert_eq!(
         joined.group.epoch_authenticator().as_slice(),

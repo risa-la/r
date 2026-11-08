@@ -47,10 +47,6 @@ use crate::handler::ConnId;
 use crate::store::{PublicRoomRecord, Store, StoreError};
 
 pub(crate) use presence::signed_in;
-#[allow(
-    unused_imports,
-    reason = "hooks the other areas call as they are built (docs/plans/M5b.md, SV1-SV4)"
-)]
 pub(crate) use push::{
     device_removed, follow_quiet, heard, identity_removed, mailbox_dropped, post_kept, unfollow,
     welcome_arrived,

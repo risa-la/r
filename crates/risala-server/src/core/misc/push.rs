@@ -292,7 +292,6 @@ pub(crate) fn heard(inner: &Inner, conn: ConnId) {
 /// Connection `conn` follows `mailbox` with `quiet=<tag>` (7.1, 9.2): the
 /// mailbox area's FOLLOW calls this. A FOLLOW without `quiet` passes
 /// `None`, which ends an earlier quiet follow of the mailbox.
-#[allow(dead_code, reason = "called by the mailbox area's FOLLOW (SV3)")]
 pub(crate) fn follow_quiet(inner: &Inner, conn: ConnId, mailbox: BoxName, tag: Option<PushTag>) {
     unfollow(inner, conn, &mailbox);
     let Some(tag) = tag else {
@@ -354,7 +353,6 @@ pub(super) fn conn_closed(inner: &Inner, conn: ConnId) {
 /// `mailbox` got a kept post (5.2, 9.2): the mailbox area's POST calls
 /// this once the post is stored. Each of the mailbox's subscriptions gets
 /// a push, unless one is on its way.
-#[allow(dead_code, reason = "called by the mailbox area's POST (SV3)")]
 pub(crate) fn post_kept(inner: &Arc<Inner>, mailbox: BoxName) {
     if !inner.config.push.enabled {
         return;

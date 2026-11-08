@@ -35,6 +35,7 @@ use risala_mls::openmls::prelude::{
 use risala_mls::wire::{read_group_info, read_protocol_message, read_tree, tree_to_bytes};
 use risala_proto::command::PublicRoom;
 use risala_proto::error::ErrorCode;
+use risala_proto::frame::MAX_LONG_SERVER_LINE;
 use risala_proto::mls::{
     GroupId, GroupInfo, KeyPackageRef, OrBlob, Pseudonym, RatchetTree, TokenHash,
 };
@@ -44,10 +45,10 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{GuestAccess, Role};
 use tls_codec::Serialize as _;
 
-use super::super::admin;
 use super::super::command::{Cx, Reply, err};
 use super::super::rate::WindowLimit;
 use super::super::state::{Device, Who};
+use super::super::{admin, keys};
 use super::{PostFraming, line_bytes, may_mute};
 use crate::config::RoomCreation;
 use crate::store::{
@@ -706,24 +707,39 @@ pub(super) async fn group_info(cx: &Cx, mailbox: BoxName) -> Reply {
         .db(move |store| store.room_group(&mailbox))
         .await?
         .ok_or_else(|| err(ErrorCode::NotFound))?;
-    // A tree too large for a line would be a blob (12.12), which the keys
-    // area stores (docs/plans/M5b.md, SV4): until it can, such a room's
-    // GROUPINFO fails.
-    let too_large = |what: &str| {
-        tracing::error!("a public room's {what} is too large for a line");
+    let internal = |what: &str| {
+        tracing::error!("a public room's {what} cannot be sent");
         err(ErrorCode::Internal)
     };
-    let groupinfo =
-        GroupInfo::from_bytes(&stored.group_info).map_err(|_| too_large("GroupInfo"))?;
-    let tree = RatchetTree::from_bytes(&stored.tree).map_err(|_| too_large("tree"))?;
+    let groupinfo = GroupInfo::from_bytes(&stored.group_info).map_err(|_| internal("GroupInfo"))?;
+    // A tree too long for the line is a blob the server keeps (12.12).
+    let tree = if fits_line(stored.group_info.len(), stored.tree.len()) {
+        OrBlob::Inline(RatchetTree::from_bytes(&stored.tree).map_err(|_| internal("tree"))?)
+    } else {
+        OrBlob::Blob(
+            keys::room_tree_blob(&cx.inner, mailbox, stored.tree)
+                .await
+                .map_err(|e| internal(&e.to_string()))?,
+        )
+    };
     cx.send(ServerLine::GroupInfo {
         mailbox,
         epoch: stored.epoch,
         seq: Seq::new(stored.epoch_seq),
         groupinfo: OrBlob::Inline(groupinfo),
-        tree: OrBlob::Inline(tree),
+        tree,
     });
     Ok(OkResponse::new())
+}
+
+/// Whether a GroupInfo and tree of these sizes fit a GROUPINFO line in
+/// base64, with room for the rest of the line (2.3).
+fn fits_line(group_info: usize, tree: usize) -> bool {
+    /// More than `GROUPINFO`, a box, an epoch, a seq and the spaces take.
+    const REST: usize = 256;
+    let base64 = |n: usize| n.div_ceil(3) * 4;
+    base64(group_info) + base64(tree) + REST <= MAX_LONG_SERVER_LINE
+        && base64(tree) <= risala_proto::mls::MAX_BASE64_LEN
 }
 
 /// Checks that the connection's identity may mute in the public room of
@@ -795,6 +811,13 @@ pub(super) async fn unmute(cx: &Cx, mailbox: BoxName, pseudonym: Pseudonym) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_trees_do_not_fit_a_line() {
+        assert!(fits_line(10_000, 500_000));
+        assert!(!fits_line(10_000, 800_000));
+        assert!(!fits_line(800_000, 10_000));
+    }
 
     #[test]
     fn periods_end_at_midnight_utc() {

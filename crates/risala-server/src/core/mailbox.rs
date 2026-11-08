@@ -829,6 +829,7 @@ pub(crate) async fn drop_mailbox(
     let _lock = inner.mailbox.lock(mailbox).await;
     let existed = inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
     inner.mailbox.rooms.forget(&mailbox);
+    keys::room_ended(inner, mailbox).await?;
     misc::mailbox_dropped(inner, mailbox).await;
     if existed {
         let line = OutLine::new(ServerMessage::new(ServerLine::Drop {
@@ -904,6 +905,7 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
         // With its token sets and push subscriptions (7.5).
         inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
         inner.mailbox.rooms.forget(&mailbox);
+        keys::room_ended(inner, mailbox).await?;
         misc::mailbox_dropped(inner, mailbox).await;
     }
     Ok(())
@@ -913,7 +915,11 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
 /// its oldest posts expire early until its posts fit in the rest. Under
 /// the mailbox's lock, so that it does not run within a POST. The keys
 /// area calls this for UPLOAD and BLOB.
-pub(crate) async fn make_room(inner: &Inner, mailbox: BoxName, files: u64) -> Result<(), StoreError> {
+pub(crate) async fn make_room(
+    inner: &Inner,
+    mailbox: BoxName,
+    files: u64,
+) -> Result<(), StoreError> {
     let _lock = inner.mailbox.lock(mailbox).await;
     let max = inner.config.limits.mailbox_quota.saturating_sub(files);
     let expired = inner
