@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use risala_proto::names::{Conv, Id, Seq, Uid};
 use risala_proto::server::{Event, EventBody, ServerLine, ServerMessage};
+use risala_proto::time::Timestamp;
 use risala_proto::types::Relation;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -81,6 +82,9 @@ pub(crate) struct Tx<'a> {
     /// The uid the connection signed in as: the events it sent are the
     /// account's own.
     me: Option<Uid>,
+    /// The time now, for a conversation's activity; the system clock if
+    /// not set.
+    now: Option<Timestamp>,
 }
 
 impl<'a> Tx<'a> {
@@ -89,6 +93,7 @@ impl<'a> Tx<'a> {
             tx,
             changes: Vec::new(),
             me: None,
+            now: None,
         }
     }
 
@@ -99,6 +104,28 @@ impl<'a> Tx<'a> {
     /// then `~sam` is someone else.
     pub(crate) fn signed_in_as(&mut self, me: &Uid) {
         self.me = Some(me.clone());
+    }
+
+    /// Sets the time now, from the caller's clock: a conversation added in
+    /// this transaction counts as active from then. Without it, the system
+    /// clock decides.
+    pub(crate) fn at(&mut self, now: Timestamp) {
+        self.now = Some(now);
+    }
+
+    /// The time now, in Unix milliseconds.
+    fn now_ms(&self) -> i64 {
+        sql(self.now.unwrap_or_else(Timestamp::now).unix_millis())
+    }
+
+    /// Moves a conversation's activity forward to `ms`, for the chat list.
+    /// It never moves back.
+    pub(super) fn bump_activity(&self, conv: ConvId, ms: i64) -> Result<(), StoreError> {
+        self.tx.execute(
+            "UPDATE convs SET activity = ?2 WHERE id = ?1 AND activity < ?2",
+            params![conv.0, ms],
+        )?;
+        Ok(())
     }
 
     /// Commits, and returns the changes made, each once, in order.
@@ -178,9 +205,15 @@ impl<'a> Tx<'a> {
         if let Some(row) = self.conv_by_name(account, name)? {
             return Ok(row);
         }
+        // It is active from when it entered the cache, or from its newest
+        // message queued before then, as for a direct conversation not
+        // started yet.
         self.tx.execute(
-            "INSERT INTO convs (account, name) VALUES (?1, ?2)",
-            params![account.0, name.as_str()],
+            "INSERT INTO convs (account, name, activity) VALUES (?1, ?2, MAX(?3,
+                 COALESCE((SELECT MAX(created) FROM outbox
+                           WHERE account = ?1 AND conv = ?2 AND verb = 'MSG'
+                               AND (rel IS NULL OR rel = 'reply')), 0)))",
+            params![account.0, name.as_str(), self.now_ms()],
         )?;
         let id = ConvId(self.tx.last_insert_rowid());
         self.changed(Change::Conversation { conv: id });
@@ -495,18 +528,26 @@ impl<'a> Tx<'a> {
                     if m.deleted {
                         self.delete_related(conv, n)?;
                     }
+                    // A message moves the conversation up the chat list,
+                    // unless it is hidden as a blocked person's (5.7).
+                    if !self.is_hidden_event(conv, n)? {
+                        self.bump_activity(conv, meta.t.unix_millis() as i64)?;
+                    }
                     self.changed(Change::Inserted { conv, seq });
                 }
                 Some(Relation::Edit(t)) => {
                     self.refresh_message(conv, t.get())?;
-                    self.touch(conv, t.get())?;
+                    self.target_changed(conv, t.get())?;
                 }
                 Some(Relation::React(t)) => {
                     self.refresh_reactions(conv, t.get())?;
-                    self.touch(conv, t.get())?;
+                    self.target_changed(conv, t.get())?;
                 }
             },
-            EventBody::Delete { seq: t, .. } => self.apply_delete(row, *t)?,
+            EventBody::Delete { seq: t, .. } => {
+                self.apply_delete(row, *t)?;
+                self.target_changed(conv, t.get())?;
+            }
             body => {
                 self.apply_state(conv, body, from, n)?;
                 self.changed(Change::Inserted { conv, seq });
@@ -660,6 +701,22 @@ impl<'a> Tx<'a> {
         self.member_role(row.id, &uid, role.as_str(), at)
     }
 
+    /// Whether stored event `seq` is hidden as a blocked person's (5.7).
+    fn is_hidden_event(&self, conv: ConvId, seq: u64) -> Result<bool, StoreError> {
+        Ok(self
+            .tx
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM events e WHERE e.conv = ?1 AND e.seq = ?2 AND {}",
+                    super::people::HIDDEN
+                ),
+                params![conv.0, sql(seq)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Whether a stored DELETE names `seq`.
     fn delete_event_for(&self, conv: ConvId, seq: u64) -> Result<bool, StoreError> {
         Ok(self
@@ -684,6 +741,19 @@ impl<'a> Tx<'a> {
             )
             .optional()?
             .unwrap_or(false))
+    }
+
+    /// Records what a newly stored edit, reaction or DELETE of message
+    /// `target` changed: the target, if it is stored, or else the
+    /// conversation. The new event fills its place in the history either
+    /// way, which an unread count depends on, so something must be told.
+    fn target_changed(&mut self, conv: ConvId, target: u64) -> Result<(), StoreError> {
+        if self.has_event(conv, target)? {
+            self.touch(conv, target)
+        } else {
+            self.changed(Change::Conversation { conv });
+            Ok(())
+        }
     }
 
     /// Records an Updated change for `seq` if it is a stored timeline item.

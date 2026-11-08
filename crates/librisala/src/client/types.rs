@@ -1709,3 +1709,148 @@ pub struct ConnectionInfo {
     /// The same time as on the wire.
     pub since: String,
 }
+
+/// An account, by its server and uid, as [`Client::account`](super::Client::account)
+/// finds it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AccountRef {
+    /// The server address, as [`Account::server`](super::Account::server)
+    /// gives it.
+    pub server: String,
+    /// The account's uid (4.2, 4.3).
+    pub uid: String,
+}
+
+/// What kind of conversation a chat is (5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChatKind {
+    /// A room, such as `#general` (Section 6).
+    Room,
+    /// A direct conversation with one other person, named by their uid.
+    Direct,
+}
+
+/// Where the account's own message is (7.6), for a chat's preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Delivery {
+    /// The server has it. Every message from someone else is sent.
+    Sent,
+    /// In the outbox: queued or sent with no answer yet.
+    Sending,
+    /// In the outbox, and it will not be sent unless the user retries it
+    /// ([`Account::retry_outbox`](super::Account::retry_outbox)).
+    Failed {
+        /// It may have been sent after all, as [`OutboxStatus::Failed`]
+        /// says.
+        maybe_sent: bool,
+    },
+}
+
+/// The newest message of a chat, for its row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatPreview {
+    /// How to show its author (8.2). The uid is shown apart when the name
+    /// looks like a uid, or is the same as the account's own name or, in a
+    /// direct conversation, the other person's. Unlike
+    /// [`Conversation::labels`](super::Conversation::labels), the room's
+    /// other members are not compared.
+    pub from: Label,
+    /// Whether the account sent it.
+    pub own: bool,
+    /// Its current text after edits, unescaped; empty when deleted.
+    pub text: String,
+    /// Whether it was deleted (5.4).
+    pub deleted: bool,
+    /// When the server accepted it, or for a message in the outbox when it
+    /// was queued, in milliseconds since the Unix epoch.
+    pub time_ms: u64,
+    /// For the account's own messages: sent, sending or failed (7.6).
+    /// [`Delivery::Sent`] for everyone else's.
+    pub delivery: Delivery,
+}
+
+/// One conversation in the chat list: see
+/// [`Client::chat_list`](super::Client::chat_list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSummary {
+    /// Opaque, stable and unique across accounts, for a UI to key its rows
+    /// by. Compare it, do not parse it.
+    pub id: String,
+    /// The account it belongs to.
+    pub account: AccountRef,
+    /// A room such as `#general`, or the other person's uid (5.1), as
+    /// [`Account::conversation`](super::Account::conversation) takes it.
+    pub conversation: String,
+    /// A room or a direct conversation.
+    pub kind: ChatKind,
+    /// What to show as its name: a room's name, or the other person's
+    /// label (8.2), whose uid is shown apart when their name looks like a
+    /// uid or is the same as the account's own.
+    pub name: Label,
+    /// A room's topic (6.2), unescaped, as
+    /// [`ConversationInfo::topic`]. Empty for a direct conversation, or
+    /// when it is not known.
+    pub topic: String,
+    /// For a direct conversation, whether the other person is a guest
+    /// (4.2). `false` for a room.
+    pub guest: bool,
+    /// The server the conversation lives on: the account's, since there is
+    /// no federation. Apps show it only when it is not the account's home
+    /// server.
+    pub server: String,
+    /// Whether [`server`](Self::server) is the account's home server. A
+    /// guest's home is the server it is on (4.2). An identity's is the
+    /// server whose name is its domain or under it: `alice@example.org` is
+    /// at home on `example.org` and `chat.example.org`, and not on
+    /// `chat.example.net`. The cache does not record which server hosts an
+    /// identity (4.6), so this is a judgement from the names: an identity
+    /// self-hosted at `example.org` counts as at home on
+    /// `chat.example.org` too.
+    pub home_server: bool,
+    /// The sort key, in milliseconds since the Unix epoch: the newest of
+    /// its newest message's time, when the account's newest message for it
+    /// was queued, and when it entered the cache. Edits, reactions, joins,
+    /// parts and settings do not count, nor messages hidden as a blocked
+    /// person's when they arrived (5.7). It never moves back, not even when
+    /// a message is deleted.
+    pub activity_ms: u64,
+    /// The newest message, if any: see [`ChatPreview`]. Joins, parts and
+    /// settings never are, nor messages hidden as a blocked person's (5.7).
+    pub last: Option<ChatPreview>,
+    /// As [`ConversationInfo::unread`].
+    pub unread: u64,
+    /// Whether the user marked it as a favourite
+    /// ([`Conversation::set_favourite`](super::Conversation::set_favourite)).
+    pub favourite: bool,
+    /// Whether the account is in it, as far as the client knows.
+    pub joined: bool,
+}
+
+/// Which conversations a [`ChatList`](super::ChatList) shows. The default
+/// shows every one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatFilter {
+    /// Only the conversations of accounts on this server, such as
+    /// `chat.example.org`: a group tab.
+    pub server: Option<String>,
+    /// Only those with unread messages.
+    pub unread: bool,
+    /// Only favourites.
+    pub favourites: bool,
+    /// Only rooms.
+    pub rooms: bool,
+}
+
+/// Counts for a [`ChatList`](super::ChatList)'s toggles, across every
+/// conversation, not only the window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ChatCounts {
+    /// How many conversations have unread messages among those the filter
+    /// would show without its [`unread`](ChatFilter::unread) toggle: what
+    /// turning it on would show.
+    pub unread_chats: u64,
+    /// How many conversations the filter shows in all. When the window
+    /// holds fewer, [`ChatList::load_more`](super::ChatList::load_more)
+    /// can add some.
+    pub total: u64,
+}

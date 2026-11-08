@@ -58,6 +58,8 @@ pub(crate) struct AccountShared {
     pub state: watch::Sender<ConnectionState>,
     pub synced: watch::Sender<Synced>,
     pub events: broadcast::Sender<Arc<Batch>>,
+    /// The client's channel for chat lists, which hear of every account.
+    pub chats: broadcast::Sender<Arc<Batch>>,
     pub driver: Mutex<Option<DriverHandle>>,
     /// The signed-in session, for commands outside the sync engine.
     pub session: Mutex<Option<Arc<Session>>>,
@@ -216,6 +218,7 @@ impl AccountShared {
         store: Store,
         options: ClientOptions,
         rt: tokio::runtime::Handle,
+        chats: broadcast::Sender<Arc<Batch>>,
     ) -> Arc<AccountShared> {
         Arc::new(AccountShared {
             id,
@@ -226,6 +229,7 @@ impl AccountShared {
             state: watch::channel(ConnectionState::Offline).0,
             synced: watch::channel(Synced::default()).0,
             events: broadcast::channel(EVENT_CAPACITY).0,
+            chats,
             driver: Mutex::new(None),
             session: Mutex::new(None),
             rt,
@@ -260,8 +264,14 @@ impl AccountShared {
 
     pub fn publish(&self, batch: Batch) {
         if !batch.changes.is_empty() || !batch.events.is_empty() || batch.reload {
-            // No receivers is fine.
-            let _ = self.events.send(Arc::new(batch));
+            let batch = Arc::new(batch);
+            // No receivers is fine. A reload reaches chat lists from the
+            // client instead, once for every account: chat lists are not
+            // tied to the accounts it has handles for.
+            if !batch.changes.is_empty() {
+                let _ = self.chats.send(batch.clone());
+            }
+            let _ = self.events.send(batch);
         }
     }
 
@@ -748,12 +758,34 @@ impl Account {
     /// dismissed.
     pub fn remove_outbox(&self, id: i64) -> Result<(), ClientError> {
         let entry = self.outbox_entry(id)?;
-        self.shared.store.remove_outbox(OutboxId(entry.id))?;
-        self.shared.publish(Batch {
-            reload: false,
-            changes: vec![Change::Outbox { id: OutboxId(id) }],
-            events: vec![AccountEvent::OutboxRemoved { id }],
-        });
+        let changes = self.shared.store.remove_outbox(OutboxId(entry.id))?;
+        driver::publish_changes(&self.shared, changes);
+        Ok(())
+    }
+
+    /// Sends a failed outbox entry again, for example when the user taps
+    /// "retry" (7.6). It goes back in the queue in its place, with its id
+    /// and its cid, so a [`Timeline`] shows it as queued again where it
+    /// was, and it goes out as soon as it can, after the conversation's
+    /// messages before it: one message is in flight per conversation at a
+    /// time (PLAN.md 5, item 41). A message that failed as
+    /// [`FailKind::Unconfirmed`](super::FailKind::Unconfirmed) may have
+    /// been posted already: within 24 hours of its first sending, an
+    /// identity's server sees the same cid and does not post it twice;
+    /// after that, or for a guest whose session ended, it may (7.6). If
+    /// what made it fail still holds, such as the account having left the
+    /// room, it fails again. Fails with [`ClientError::Invalid`] for an
+    /// entry of another account, or one that has not failed.
+    pub fn retry_outbox(&self, id: i64) -> Result<(), ClientError> {
+        let entry = self.outbox_entry(id)?;
+        let (retried, changes) = self.shared.store.retry_outbox(OutboxId(entry.id))?;
+        if !retried {
+            return Err(ClientError::Invalid(format!(
+                "outbox entry {id} has not failed"
+            )));
+        }
+        driver::publish_changes(&self.shared, changes);
+        self.shared.resume_outbox();
         Ok(())
     }
 
@@ -855,6 +887,21 @@ impl Conversation {
 
     fn store(&self) -> &Store {
         &self.account.shared.store
+    }
+
+    /// Marks it as a favourite, or not, for the chat list's favourites
+    /// toggle ([`ChatFilter::favourites`](super::ChatFilter::favourites)).
+    /// Favourites are kept on this device only: the spec has nowhere to
+    /// keep them. Fails with [`ClientError::NotJoined`] for a conversation
+    /// that is not in the cache.
+    pub fn set_favourite(&self, favourite: bool) -> Result<(), ClientError> {
+        let shared = self.account.shared();
+        let Some(conv) = shared.store.conversation_id(shared.id, &self.conv)? else {
+            return Err(ClientError::NotJoined(self.conv.to_string()));
+        };
+        let changes = shared.store.set_favourite(conv, favourite)?;
+        driver::publish_changes(shared, changes);
+        Ok(())
     }
 
     /// Its summary from the cache, if it is there.

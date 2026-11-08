@@ -10,7 +10,7 @@ use risala_proto::types::{Cid, FileUrl, Relation};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::events::{ConvRow, Tx};
-use super::{AccountId, Change, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
+use super::{AccountId, Change, ConvId, OutboxId, Store, StoreError, opt_id, parse, seq, sql};
 
 /// A message to send: MSG's text and tags (5.3, 5.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +269,19 @@ fn query_items(
     Ok(out)
 }
 
+/// The conversation outbox entry `id` is for, if both are in the cache.
+fn outbox_conv(conn: &Connection, id: OutboxId) -> Result<Option<ConvId>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT c.id FROM outbox o JOIN convs c ON c.account = o.account AND c.name = o.conv
+             WHERE o.id = ?1",
+            [id.0],
+            |r| r.get(0),
+        )
+        .optional()?
+        .map(ConvId))
+}
+
 fn query_item(conn: &Connection, id: OutboxId) -> Result<Option<OutboxItem>, StoreError> {
     let raw = conn
         .query_row(
@@ -276,6 +289,25 @@ fn query_item(conn: &Connection, id: OutboxId) -> Result<Option<OutboxItem>, Sto
             [id.0],
             raw_item,
         )
+        .optional()?;
+    raw.map(finish_item).transpose()
+}
+
+/// The account's newest message for `conv` that is not sent yet, not
+/// counting edits and reactions: what a chat list's preview shows.
+pub(super) fn newest_unsent_message(
+    conn: &Connection,
+    account: AccountId,
+    conv: &Conv,
+) -> Result<Option<OutboxItem>, StoreError> {
+    let raw = conn
+        .prepare_cached(&format!(
+            "SELECT {OUTBOX_COLS} FROM outbox
+             WHERE account = ?1 AND conv = ?2 AND state != 'sent' AND verb = 'MSG'
+                 AND (rel IS NULL OR rel = 'reply')
+             ORDER BY id DESC LIMIT 1"
+        ))?
+        .query_row(params![account.0, conv.as_str()], raw_item)
         .optional()?;
     raw.map(finish_item).transpose()
 }
@@ -320,6 +352,14 @@ impl Tx<'_> {
             ],
         )?;
         let id = OutboxId(self.conn().last_insert_rowid());
+        // A message moves the conversation up the chat list; an edit or a
+        // reaction does not.
+        if matches!(draft.relation, None | Some(Relation::Reply(_))) {
+            self.conn().execute(
+                "UPDATE convs SET activity = ?3 WHERE account = ?1 AND name = ?2 AND activity < ?3",
+                params![account.0, conv.as_str(), now.unix_millis() as i64],
+            )?;
+        }
         self.changed(Change::Outbox { id });
         Ok(id)
     }
@@ -536,14 +576,46 @@ impl Store {
     }
 
     /// Removes an outbox entry, for example one that failed and the user
-    /// dismissed. An entry still being sent may yet arrive.
-    pub fn remove_outbox(&self, id: OutboxId) -> Result<(), StoreError> {
-        self.write(|tx| {
+    /// dismissed. An entry still being sent may yet arrive. Returns the
+    /// changes, for the UI: the entry, and its conversation, whose preview
+    /// in the chat list may have been it.
+    pub fn remove_outbox(&self, id: OutboxId) -> Result<Vec<Change>, StoreError> {
+        let ((), changes) = self.write(|tx| {
+            if let Some(conv) = outbox_conv(tx.conn(), id)? {
+                tx.changed(Change::Conversation { conv });
+            }
             tx.conn()
                 .execute("DELETE FROM outbox WHERE id = ?1", [id.0])?;
             tx.changed(Change::Outbox { id });
             Ok(())
         })?;
-        Ok(())
+        Ok(changes)
+    }
+
+    /// Puts a failed entry back in the queue, to be sent again (7.6). It
+    /// keeps its id, its cid and its place: the outbox sends entries in
+    /// the order of their ids, one at a time per conversation (PLAN.md 5,
+    /// item 41). It counts as never sent, so the resend window starts
+    /// again from when it next goes out. Returns `false`, changing
+    /// nothing, for an entry that has not failed. Returns the changes,
+    /// for the UI.
+    pub fn retry_outbox(&self, id: OutboxId) -> Result<(bool, Vec<Change>), StoreError> {
+        self.write(|tx| {
+            let n = tx.conn().execute(
+                "UPDATE outbox SET state = 'queued', seq = NULL, error = NULL, first_sent = NULL,
+                     claim = NULL, claimed_at = NULL
+                 WHERE id = ?1 AND state = 'failed'",
+                [id.0],
+            )?;
+            if n > 0 {
+                tx.changed(Change::Outbox { id });
+            }
+            Ok(n > 0)
+        })
+    }
+
+    /// The conversation an outbox entry is for, if it is in the cache.
+    pub(crate) fn outbox_conversation(&self, id: OutboxId) -> Result<Option<ConvId>, StoreError> {
+        self.read(|conn| outbox_conv(conn, id))
     }
 }

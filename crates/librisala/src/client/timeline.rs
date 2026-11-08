@@ -57,7 +57,9 @@ pub enum TimelineDiff {
 /// at the same index, as it does unless others' messages came in between,
 /// or else a [`Remove`] of the entry and an [`Insert`] among the stored
 /// ones. When it fails, it is updated, and stays until the app removes it
-/// with [`Account::remove_outbox`](super::Account::remove_outbox). Edits
+/// with [`Account::remove_outbox`](super::Account::remove_outbox), or
+/// retries it with [`Account::retry_outbox`](super::Account::retry_outbox),
+/// which updates it to queued again in the same place. Edits
 /// and reactions in the outbox are not shown as items.
 ///
 /// The server sends a message's event before the OK that names it (5.3).

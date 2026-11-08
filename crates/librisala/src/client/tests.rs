@@ -1358,3 +1358,405 @@ async fn a_room_missing_from_a_resumed_session_is_not_joined_again() {
     sam.disconnect().await;
     server.done().await;
 }
+
+/// The next batch of a chat list, or a panic after a while.
+async fn next_chats(list: &ChatList) -> ChatListBatch {
+    tokio::time::timeout(Duration::from_secs(5), list.next())
+        .await
+        .expect("a batch")
+        .expect("not closed")
+}
+
+fn names(items: &[ChatSummary]) -> Vec<String> {
+    items.iter().map(|c| c.conversation.clone()).collect()
+}
+
+#[tokio::test]
+async fn the_chat_list_spans_accounts_newest_first() {
+    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
+    let sam = client.add_guest(SERVER, "sam").unwrap();
+    let alice = client
+        .add_identity("chat.example.net", "alice@example.org")
+        .unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=bob@example.org MSG #general hi")],
+    );
+    store_events(
+        &alice,
+        "#rust",
+        "k2",
+        &[
+            event(2, "from=carol@example.org;id=k2 JOIN #rust"),
+            event(3, "from=carol@example.org MSG #rust ownership\\nis hard"),
+            event(4, "from=carol@example.org;react=3 MSG #rust x"),
+        ],
+    );
+    let list = client.chat_list(ChatFilter::default(), 10).unwrap();
+    let items = list.items();
+    assert_eq!(names(&items), ["#rust", "#general"]);
+    let rust = &items[0];
+    assert_eq!(
+        (rust.account.server.as_str(), rust.account.uid.as_str()),
+        ("chat.example.net", "alice@example.org")
+    );
+    assert_eq!(
+        (rust.kind, rust.guest, rust.home_server),
+        (ChatKind::Room, false, false)
+    );
+    assert_eq!(rust.name.name, "#rust");
+    assert_eq!(rust.activity_ms, 1_800_000_000_003);
+    let last = rust.last.as_ref().unwrap();
+    // The newest message, not the reaction after it.
+    assert_eq!(
+        (last.text.as_str(), last.own),
+        ("ownership\nis hard", false)
+    );
+    assert_eq!(last.from.name, "carol@example.org");
+    assert_eq!((last.delivery, rust.unread), (Delivery::Sent, 1));
+    // A guest is at home where it is.
+    assert!(items[1].home_server);
+    assert_eq!(
+        list.counts(),
+        ChatCounts {
+            unread_chats: 2,
+            total: 2
+        }
+    );
+
+    // A new message moves its row to the top: a remove and an insert.
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(5, "from=bob@example.org MSG #general again")],
+    );
+    let batch = next_chats(&list).await;
+    match batch.diffs.as_slice() {
+        [
+            ChatListDiff::Remove { index: 1 },
+            ChatListDiff::Insert { index: 0, item },
+        ] => {
+            assert_eq!(item.last.as_ref().unwrap().text, "again");
+            assert_eq!(item.unread, 2);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(names(&list.items()), ["#general", "#rust"]);
+
+    // A window of one keeps its size: the row pushed out goes.
+    let one = client.chat_list(ChatFilter::default(), 1).unwrap();
+    assert_eq!(names(&one.items()), ["#general"]);
+    store_events(
+        &alice,
+        "#rust",
+        "k2",
+        &[event(6, "from=carol@example.org MSG #rust borrow")],
+    );
+    match next_chats(&one).await.diffs.as_slice() {
+        [
+            ChatListDiff::Insert { index: 0, item },
+            ChatListDiff::Remove { index: 1 },
+        ] => {
+            assert_eq!(item.conversation, "#rust");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(one.counts().total, 2);
+    one.load_more(5).await.unwrap();
+    match next_chats(&one).await.diffs.as_slice() {
+        [ChatListDiff::Insert { index: 1, item }] => assert_eq!(item.conversation, "#general"),
+        other => panic!("{other:?}"),
+    }
+
+    // Favourites: an update in place, then a filter that shows them.
+    sam.conversation("#general")
+        .unwrap()
+        .set_favourite(true)
+        .unwrap();
+    let batch = next_chats(&one).await;
+    match batch.diffs.as_slice() {
+        [ChatListDiff::Update { index: 1, item }] => assert!(item.favourite),
+        other => panic!("{other:?}"),
+    }
+    one.set_filter(ChatFilter {
+        favourites: true,
+        ..ChatFilter::default()
+    })
+    .await
+    .unwrap();
+    let batch = next_chats(&one).await;
+    match batch.diffs.as_slice() {
+        [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#general"]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        batch.counts,
+        ChatCounts {
+            unread_chats: 1,
+            total: 1
+        }
+    );
+    assert!(matches!(
+        sam.conversation("#nowhere").unwrap().set_favourite(true),
+        Err(ClientError::NotJoined(_))
+    ));
+
+    // A group tab: one server's conversations.
+    let net = client
+        .chat_list(
+            ChatFilter {
+                server: Some("CHAT.example.net".into()),
+                ..ChatFilter::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(names(&net.items()), ["#rust"]);
+    assert!(matches!(
+        client.chat_list(
+            ChatFilter {
+                server: Some("not a server".into()),
+                ..ChatFilter::default()
+            },
+            10
+        ),
+        Err(ClientError::Invalid(_))
+    ));
+
+    // Reading a conversation takes it off the unread toggle.
+    let unread = client
+        .chat_list(
+            ChatFilter {
+                unread: true,
+                ..ChatFilter::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        unread.counts(),
+        ChatCounts {
+            unread_chats: 2,
+            total: 2
+        }
+    );
+    alice
+        .conversation("#rust")
+        .unwrap()
+        .mark_read(6)
+        .await
+        .unwrap();
+    let batch = next_chats(&unread).await;
+    assert_eq!(batch.diffs, [ChatListDiff::Remove { index: 0 }]);
+    assert_eq!(
+        batch.counts,
+        ChatCounts {
+            unread_chats: 1,
+            total: 1
+        }
+    );
+
+    // A removed account's conversations leave.
+    client.remove_account(&alice).await.unwrap();
+    loop {
+        if let [ChatListDiff::Reset { items }] = next_chats(&list).await.diffs.as_slice() {
+            assert_eq!(names(items), ["#general"]);
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn writes_from_another_process_reach_chat_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let extension = Client::open(&path, ClientOptions::default()).unwrap();
+    let sam = extension.add_guest(SERVER, "sam").unwrap();
+    let alice = extension
+        .add_identity("chat.example.net", "alice@example.org")
+        .unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=~bob MSG #general hi")],
+    );
+    // The app shows the chat list before it has a handle to any account.
+    let app = Client::open(&path, ClientOptions::default()).unwrap();
+    let list = app.chat_list(ChatFilter::default(), 10).unwrap();
+    assert_eq!(names(&list.items()), ["#general"]);
+
+    store_events(
+        &alice,
+        "#rust",
+        "k2",
+        &[event(2, "from=carol@example.org MSG #rust hello")],
+    );
+    assert!(app.check_for_external_changes().unwrap());
+    match next_chats(&list).await.diffs.as_slice() {
+        [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#rust", "#general"]),
+        other => panic!("{other:?}"),
+    }
+
+    // With handles to both accounts, it is still one reset.
+    app.accounts().unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(3, "from=~bob MSG #general again")],
+    );
+    assert!(app.check_for_external_changes().unwrap());
+    match next_chats(&list).await.diffs.as_slice() {
+        [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#general", "#rust"]),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), list.next())
+            .await
+            .is_err()
+    );
+}
+
+/// A client whose clock is just after the test events' times, so that
+/// what it queues is newer than what is stored.
+fn clocked_guest() -> Account {
+    let options = ClientOptions {
+        sync: crate::sync::SyncConfig {
+            clock: crate::sync::Clock::new(|| {
+                Timestamp::from_unix_millis(1_800_000_001_000).unwrap()
+            }),
+            ..crate::sync::SyncConfig::default()
+        },
+        ..ClientOptions::default()
+    };
+    let client = Client::open_in_memory(options).unwrap();
+    client.add_guest(SERVER, "sam").unwrap()
+}
+
+#[tokio::test]
+async fn a_failed_message_is_retried_in_its_place() {
+    let sam = clocked_guest();
+    let general = sam.conversation("#general").unwrap();
+    store_events(
+        &sam,
+        "#general",
+        "k1",
+        &[event(1, "from=bob@example.org MSG #general hi")],
+    );
+    let list = sam.client().chat_list(ChatFilter::default(), 10).unwrap();
+    let preview = |list: &ChatList| list.items()[0].last.clone().unwrap();
+
+    let first = general.send("one").await.unwrap();
+    let second = general.send("two").await.unwrap();
+    // The newest message in the outbox is the preview.
+    while preview(&list).text != "two" {
+        next_chats(&list).await;
+    }
+    assert_eq!(
+        (preview(&list).own, preview(&list).delivery),
+        (true, Delivery::Sending)
+    );
+    assert_eq!(list.items()[0].activity_ms, 1_800_000_001_000);
+
+    // Only a failed entry can be retried.
+    assert!(matches!(
+        sam.retry_outbox(first.id),
+        Err(ClientError::Invalid(_))
+    ));
+    write(&sam, |tx| {
+        tx.outbox_failed(crate::store::OutboxId(second.id), FailReason::Unconfirmed)
+    });
+    let timeline = general.timeline(50).unwrap();
+    while preview(&list).delivery == Delivery::Sending {
+        next_chats(&list).await;
+    }
+    assert_eq!(
+        preview(&list).delivery,
+        Delivery::Failed { maybe_sent: true }
+    );
+
+    sam.retry_outbox(second.id).unwrap();
+    // The timeline shows it queued again, where it was, with its id.
+    let next = tokio::time::timeout(Duration::from_secs(5), timeline.next())
+        .await
+        .unwrap()
+        .unwrap();
+    match next.as_slice() {
+        [TimelineDiff::Update { index: 2, item }] => {
+            assert_eq!(item.id, format!("o{}", second.id));
+            assert_eq!(item.outbox.as_ref().unwrap().status, OutboxStatus::Queued);
+        }
+        other => panic!("{other:?}"),
+    }
+    let ids: Vec<i64> = sam.outbox().unwrap().iter().map(|e| e.id).collect();
+    assert_eq!(ids, [first.id, second.id]);
+    while preview(&list).delivery != Delivery::Sending {
+        next_chats(&list).await;
+    }
+    // Entries of another account are not this one's to retry.
+    let other = sam.client().add_guest(SERVER, "kim").unwrap();
+    assert!(matches!(
+        other.retry_outbox(second.id),
+        Err(ClientError::Invalid(_))
+    ));
+}
+
+#[test]
+fn a_direct_chat_is_named_by_the_other_persons_label() {
+    let client = Client::open_in_memory(ClientOptions::default()).unwrap();
+    let alice = client.add_identity(SERVER, "alice@example.org").unwrap();
+    store_events(
+        &alice,
+        "bob@example.org",
+        "d1",
+        &[event(1, "from=bob@example.org MSG bob@example.org hi")],
+    );
+    store_events(
+        &alice,
+        "~kim",
+        "d2",
+        &[event(2, "from=~kim MSG ~kim hello")],
+    );
+    let (account, bob, me) = (
+        alice.id(),
+        "bob@example.org".parse().unwrap(),
+        "alice@example.org".parse().unwrap(),
+    );
+    // Bob calls himself what alice calls herself.
+    write(&alice, |tx| {
+        tx.set_user_name(account, &bob, "Alice")?;
+        tx.set_user_name(account, &me, "Alice")?;
+        Ok(())
+    });
+    let items = client.chat_list(ChatFilter::default(), 10).unwrap().items();
+    assert_eq!(names(&items), ["~kim", "bob@example.org"]);
+    let (kim, bob) = (&items[0], &items[1]);
+    assert_eq!(
+        (kim.kind, kim.guest, kim.topic.as_str()),
+        (ChatKind::Direct, true, "")
+    );
+    assert_eq!(kim.name.name, "~kim");
+    assert_eq!((bob.kind, bob.guest), (ChatKind::Direct, false));
+    let shown = Label {
+        name: "Alice".into(),
+        uid: Some("bob@example.org".into()),
+    };
+    assert_eq!(bob.name, shown);
+    assert_eq!(bob.last.as_ref().unwrap().from, shown);
+    // The rooms toggle leaves them out.
+    let rooms = client
+        .chat_list(
+            ChatFilter {
+                rooms: true,
+                ..ChatFilter::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert!(rooms.items().is_empty());
+    assert_eq!(rooms.counts().total, 0);
+}

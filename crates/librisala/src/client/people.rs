@@ -90,7 +90,7 @@ pub(crate) fn clean_name(name: &str) -> String {
 
 /// A display name as stored (escaped, `''` for none) for the API:
 /// unescaped and cleaned ([`clean_name`]), `None` if empty.
-fn shown_name(escaped: Option<&str>) -> Option<String> {
+pub(crate) fn shown_name(escaped: Option<&str>) -> Option<String> {
     escaped
         .map(|n| clean_name(&unescape(n)))
         .filter(|n| !n.is_empty())

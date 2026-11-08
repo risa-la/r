@@ -1,5 +1,5 @@
 //! The client API apps use (PLAN.md 3.3): [`Client`], [`Account`],
-//! [`Conversation`] and [`Timeline`].
+//! [`Conversation`], [`Timeline`] and [`ChatList`].
 //!
 //! # Shape
 //!
@@ -21,6 +21,12 @@
 //! - A [`Timeline`] is a window on a conversation's messages that tells
 //!   the UI what changed, as [`TimelineDiff`]s: insert, update, remove,
 //!   or reset.
+//! - A [`ChatList`], from [`Client::chat_list`], is the same for the
+//!   conversations of every account, newest activity first, as
+//!   [`ChatSummary`] rows with their newest message, and
+//!   [`ChatListDiff`]s. A [`ChatFilter`] picks a server and the toggles
+//!   unread, favourites and rooms. Favourites are kept on this device
+//!   only ([`Conversation::set_favourite`]).
 //!
 //! The API is made to cross an FFI boundary (UniFFI): handles are cheap
 //! to clone and are used through `&self`, values are owned plain data
@@ -133,8 +139,10 @@
 //! - **Async methods** may be awaited on any executor, not only tokio:
 //!   their work runs on the client's runtime, and their futures only wait
 //!   for it. SQLite work runs on the runtime's blocking threads.
-//! - **Handles** ([`Client`], [`Account`], [`Conversation`], [`Timeline`])
-//!   are `Send` and `Sync`, and cheap to clone.
+//! - **Handles** ([`Client`], [`Account`], [`Conversation`]) are `Send`
+//!   and `Sync`, and cheap to clone. [`Timeline`] and [`ChatList`] are
+//!   `Send` and `Sync`; share one behind an `Arc`, since each change is
+//!   returned by one [`next`](ChatList::next) call.
 //!
 //! Dropping the last handle to a client that made its own runtime stops
 //! that runtime, without waiting for its tasks.
@@ -146,13 +154,14 @@
 //! and timelines hear only of this process's writes. To pick up the
 //! others', call [`Client::check_for_external_changes`] when it matters,
 //! for example when the app comes to the foreground. It is cheap, and if
-//! anything changed it resets every [`Timeline`] and sends
+//! anything changed it resets every [`Timeline`] and [`ChatList`] and sends
 //! [`AccountEvent::CacheChanged`] to subscribers, so the app reads its
 //! conversation list again. [`Timeline::refresh`] resets one timeline
 //! by hand.
 
 mod account;
 mod admin;
+pub(crate) mod chats;
 mod driver;
 mod identity;
 mod people;
@@ -184,18 +193,24 @@ use crate::sync::SyncConfig;
 
 pub use account::{Account, AccountEvents, Conversation};
 pub use admin::Admin;
+pub use chats::{ChatList, ChatListBatch, ChatListDiff};
 pub use people::PresenceWatch;
 pub use timeline::{Timeline, TimelineDiff};
 pub use types::{
-    AccountEvent, BanInfo, ClientError, ConnectionErrorKind, ConnectionInfo, ConnectionState,
-    ConversationInfo, ConversationPage, DEFAULT_PAGE, DeviceKey, DisconnectKind, EventKind,
-    FailKind, KeyErrorKind, KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice,
-    OutboxEntry, OutboxStatus, Presence, ReactionCount, RefusedKind, ReportInfo, ReportedMessage,
-    Role, RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo,
-    Setting, TrustInfo, Unregistered, UserInfo,
+    AccountEvent, AccountRef, BanInfo, ChatCounts, ChatFilter, ChatKind, ChatPreview, ChatSummary,
+    ClientError, ConnectionErrorKind, ConnectionInfo, ConnectionState, ConversationInfo,
+    ConversationPage, DEFAULT_PAGE, Delivery, DeviceKey, DisconnectKind, EventKind, FailKind,
+    KeyErrorKind, KeyInfo, Label, MAX_PAGE, MemberInfo, Message, MessagePage, Notice, OutboxEntry,
+    OutboxStatus, Presence, ReactionCount, RefusedKind, ReportInfo, ReportedMessage, Role,
+    RoleInfo, RoomInfo, RoomList, RoomListing, ServerBanInfo, ServerHello, ServerInfo, Setting,
+    TrustInfo, Unregistered, UserInfo,
 };
 
 use account::AccountShared;
+
+/// How many batches of changes the client keeps for slow chat lists
+/// before they miss some, and read everything again.
+const CHAT_CAPACITY: usize = 4096;
 
 /// Settings for a [`Client`].
 #[derive(Clone)]
@@ -268,6 +283,8 @@ pub(crate) struct ClientInner {
     store: Store,
     options: ClientOptions,
     accounts: Mutex<HashMap<AccountId, Arc<AccountShared>>>,
+    /// Every account's batches with changes to the cache, for chat lists.
+    chats: tokio::sync::broadcast::Sender<Arc<account::Batch>>,
     /// Where the client's tasks run.
     rt: tokio::runtime::Handle,
     /// The cache's data version when last checked, for
@@ -333,6 +350,7 @@ impl Client {
                 store,
                 options,
                 accounts: Mutex::new(HashMap::new()),
+                chats: tokio::sync::broadcast::channel(CHAT_CAPACITY).0,
                 rt,
                 data_version: Mutex::new(data_version),
                 _owned: owned,
@@ -347,10 +365,11 @@ impl Client {
 
     /// Checks whether another process wrote to the cache since the last
     /// check (or since the client was made), using SQLite's
-    /// `PRAGMA data_version`. If so, every [`Timeline`] resets, every
-    /// account's subscribers get [`AccountEvent::CacheChanged`], each
-    /// running account sends what its outbox holds that can go now, such
-    /// as a message the other process queued, and this returns `true`.
+    /// `PRAGMA data_version`. If so, every [`Timeline`] and [`ChatList`]
+    /// resets, every account's subscribers get
+    /// [`AccountEvent::CacheChanged`], each running account sends what its
+    /// outbox holds that can go now, such as a message the other process
+    /// queued, and this returns `true`.
     /// Writes by this client do not count. It never waits; while this
     /// client is writing, it returns `false` and the next call tells.
     pub fn check_for_external_changes(&self) -> Result<bool, ClientError> {
@@ -364,6 +383,12 @@ impl Client {
             changed
         };
         if changed {
+            // Not through the accounts: a process may have a chat list
+            // before it has a handle to any of them.
+            let _ = self.inner.chats.send(Arc::new(account::Batch {
+                reload: true,
+                ..account::Batch::default()
+            }));
             let accounts: Vec<Arc<AccountShared>> = self
                 .inner
                 .accounts
@@ -465,6 +490,7 @@ impl Client {
                     self.inner.store.clone(),
                     self.inner.options.clone(),
                     self.inner.rt.clone(),
+                    self.inner.chats.clone(),
                 )
             })
             .clone();
@@ -481,7 +507,13 @@ impl Client {
         blocking(self.runtime(), move || {
             store.remove_account(id).map_err(ClientError::from)
         })
-        .await
+        .await?;
+        // Its conversations leave every chat list.
+        let _ = self.inner.chats.send(Arc::new(account::Batch {
+            reload: true,
+            ..account::Batch::default()
+        }));
+        Ok(())
     }
 
     /// Connects to `server`, reads its greeting and closes again, to show

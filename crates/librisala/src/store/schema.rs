@@ -10,7 +10,7 @@ use super::StoreError;
 
 /// The migrations, in order. Entry `i` takes the schema from version `i` to
 /// `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
+pub(super) const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12];
 
 /// The schema version this build writes.
 pub(super) const VERSION: u32 = MIGRATIONS.len() as u32;
@@ -307,6 +307,51 @@ CREATE INDEX outbox_sent ON outbox (account, conv, seq) WHERE state = 'sent';
 /// if the account was in the cache before, and stays.
 const V11: &str = "
 ALTER TABLE accounts ADD COLUMN register_pending INTEGER;
+";
+
+/// Version 12: the chat list.
+///
+/// - `convs.activity` orders the chat list, newest first: the newest of
+///   the time of the conversation's newest message (a MSG that is not an
+///   edit or a reaction), the time the account's newest message for it
+///   was queued in the outbox, and when the conversation entered the
+///   cache, in Unix milliseconds. It only moves forward. The writes that
+///   change it keep it up to date in the same transaction. For the rows
+///   that exist already it is worked out from their messages and outbox;
+///   when they entered the cache is not known, so a conversation with
+///   neither gets 0. Messages hidden as a blocked person's (5.7) do not
+///   count, as they do not when stored, so a migrated cache sorts as a
+///   fresh one would. The test for them is `people::HIDDEN` as it is at
+///   this version, copied, so that this migration stays as it shipped.
+/// - `convs.favourite` is 1 for a conversation the user marked as a
+///   favourite. It is local: the spec has nowhere to keep it.
+/// - `outbox_unsent` finds a conversation's newest message not sent yet,
+///   for its preview.
+const V12: &str = "
+ALTER TABLE convs ADD COLUMN activity INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE convs ADD COLUMN favourite INTEGER NOT NULL DEFAULT 0;
+UPDATE convs SET activity = MAX(
+    COALESCE((SELECT MAX(e.t) FROM events e
+              WHERE e.conv = convs.id AND e.verb = 'MSG' AND (e.rel IS NULL OR e.rel = 'reply')
+                  AND NOT (e.own = 0 AND EXISTS (
+                      SELECT 1 FROM convs hc
+                      JOIN accounts ha ON ha.id = hc.account
+                      JOIN blocks b ON b.account = ha.id
+                      WHERE hc.id = e.conv AND ha.hide_blocked = 1
+                          AND substr(hc.name, 1, 1) = '#' AND b.blocked = 1
+                          AND (b.target = e.author
+                              OR (substr(b.target, 1, 2) = '*@' AND instr(e.author, '@') > 0
+                                  AND (substr(e.author, instr(e.author, '@') + 1)
+                                          = substr(b.target, 3)
+                                      OR substr(e.author, 1 - length(b.target))
+                                          = '.' || substr(b.target, 3))))))),
+             0),
+    COALESCE((SELECT MAX(o.created) FROM outbox o
+              WHERE o.account = convs.account AND o.conv = convs.name AND o.verb = 'MSG'
+                  AND (o.rel IS NULL OR o.rel = 'reply')),
+             0));
+CREATE INDEX convs_activity ON convs (activity DESC, id);
+CREATE INDEX outbox_unsent ON outbox (account, conv, id) WHERE state != 'sent';
 ";
 
 /// Brings the schema up to [`VERSION`].
