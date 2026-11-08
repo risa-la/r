@@ -161,7 +161,9 @@ pub fn certificate_fingerprint(cert: &CertificateDer<'_>) -> Result<Fingerprint,
 /// It refuses to replace a record that differs: after a mismatch the user
 /// must delete the record explicitly, with
 /// [`TrustStore::forget`](crate::addr::TrustStore::forget), first. Doing
-/// it again with the same fingerprint is fine.
+/// it again with the same fingerprint is fine. The check and the write are
+/// one step ([`TrustStore::pin_if_unknown`]), so a record written
+/// meanwhile is never replaced.
 ///
 /// The trust store may block (SQLite), so call this off the async
 /// runtime's worker threads, or through `spawn_blocking`.
@@ -170,8 +172,8 @@ pub fn accept_fingerprint(
     addr: &ServerAddr,
     fingerprint: Fingerprint,
 ) -> Result<(), Error> {
-    match trust.get(addr)? {
-        None => Ok(trust.set(addr, TrustRecord::Pinned(fingerprint))?),
+    match trust.pin_if_unknown(addr, fingerprint)? {
+        None => Ok(()),
         Some(TrustRecord::Pinned(fp)) if fp == fingerprint => Ok(()),
         Some(recorded) => Err(TrustError::Mismatch {
             recorded,

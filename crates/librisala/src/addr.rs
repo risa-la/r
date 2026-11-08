@@ -143,6 +143,15 @@ pub trait TrustStore: Send + Sync {
     fn get(&self, addr: &ServerAddr) -> Result<Option<TrustRecord>, TrustStoreError>;
     /// Sets the record for `addr`, replacing any other.
     fn set(&self, addr: &ServerAddr, record: TrustRecord) -> Result<(), TrustStoreError>;
+    /// Records `Pinned(fingerprint)` for `addr` if it has no record, and
+    /// returns the record it had before, if any. The check and the write
+    /// are one step, so that a record written meanwhile, by another
+    /// connection or process, is never replaced.
+    fn pin_if_unknown(
+        &self,
+        addr: &ServerAddr,
+        fingerprint: Fingerprint,
+    ) -> Result<Option<TrustRecord>, TrustStoreError>;
     /// Deletes the record for `addr`, as the user must do explicitly after
     /// a mismatch (2.2).
     fn forget(&self, addr: &ServerAddr) -> Result<(), TrustStoreError>;
@@ -168,6 +177,19 @@ impl TrustStore for MemoryTrustStore {
             .expect("poisoned")
             .insert(addr.clone(), record);
         Ok(())
+    }
+
+    fn pin_if_unknown(
+        &self,
+        addr: &ServerAddr,
+        fingerprint: Fingerprint,
+    ) -> Result<Option<TrustRecord>, TrustStoreError> {
+        let mut records = self.0.lock().expect("poisoned");
+        if let Some(old) = records.get(addr) {
+            return Ok(Some(old.clone()));
+        }
+        records.insert(addr.clone(), TrustRecord::Pinned(fingerprint));
+        Ok(None)
     }
 
     fn forget(&self, addr: &ServerAddr) -> Result<(), TrustStoreError> {
