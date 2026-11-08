@@ -1284,3 +1284,46 @@ async fn removed_guests_leave_once() {
     assert!(answer.last().unwrap().ends_with(" head=10"), "{answer:?}");
     server.stop().await;
 }
+
+/// A BAN of a non-member reaches them only if they could see the room
+/// before it (6.4): always for a public room, never for a private room
+/// they had no invitation or role in.
+#[tokio::test(flavor = "multi_thread")]
+async fn ban_events_reach_who_could_see_the_room() {
+    let server = server().await;
+    let mut s = people(&server, &["alice", "bob", "carol"]).await;
+    join(&mut s, "alice", "#pub").await;
+    exchange(
+        &mut s,
+        "alice",
+        "ban #pub bob@example.org",
+        &["*BAN #pub bob@example.org", "OK seq=2"],
+    )
+    .await;
+    expect(
+        &mut s,
+        "bob",
+        "@seq=2;t={*};from=alice@example.org BAN #pub bob@example.org",
+    )
+    .await;
+    exchange(&mut s, "bob", "join #pub", &["ERR forbidden{..}"]).await;
+    // Already banned and not a member: nothing recorded.
+    exchange(&mut s, "alice", "ban #pub bob@example.org", &["OK"]).await;
+
+    join(&mut s, "alice", "#priv").await;
+    exchange(&mut s, "alice", "set #priv public no", &["*", "OK seq=2"]).await;
+    exchange(
+        &mut s,
+        "alice",
+        "ban #priv carol@example.org",
+        &["*BAN #priv carol@example.org", "OK seq=3"],
+    )
+    .await;
+    // carol hears nothing, and the room stays hidden from her.
+    exchange(&mut s, "carol", "join #priv", &["ERR not-found{..}"]).await;
+    exchange(&mut s, "carol", "related #priv 1 2", &["ERR not-found{..}"]).await;
+    // The room's events are readable by its owner, of course.
+    exchange(&mut s, "alice", "related #priv 1 3", &["OK id={*} more=0"]).await;
+    s.settled().await;
+    server.stop().await;
+}

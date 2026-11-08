@@ -1125,3 +1125,54 @@ async fn m4_state_survives_a_restart() {
     s.settled().await;
     server.stop().await;
 }
+
+/// The commands for hosted identities (10.5) on a server that hosts
+/// none get `not-supported`; ADMIN UNREGISTER of an identity hosted
+/// elsewhere gets `not-found`.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_identity_commands_need_hosted_identities() {
+    let server = TestServer::builder()
+        .key_domains(&["example.net"])
+        .operator("op@example.net")
+        .presence(NO_PRESENCE.0, NO_PRESENCE.1)
+        .start()
+        .await;
+    let op = server.identity("op@example.net");
+    let mut s = Session::new();
+    s.add("op", server.sign_in(&op).await);
+    for line in [
+        "admin keys op@example.net",
+        "admin unregister op@example.net",
+    ] {
+        exchange(&mut s, "op", line, &["ERR not-supported{..}"]).await;
+    }
+    s.settled().await;
+    server.stop().await;
+
+    let server = TestServer::builder()
+        .identity_domain("example.org")
+        .key_domains(&["example.net"])
+        .operator("op@example.net")
+        .presence(NO_PRESENCE.0, NO_PRESENCE.1)
+        .start()
+        .await;
+    let op = server.identity("op@example.net");
+    let mut s = Session::new();
+    s.add("op", server.sign_in(&op).await);
+    exchange(
+        &mut s,
+        "op",
+        "admin unregister op@example.net",
+        &["ERR not-found{..}"],
+    )
+    .await;
+    exchange(
+        &mut s,
+        "op",
+        "admin keys op@example.net",
+        &["ERR not-found{..}"],
+    )
+    .await;
+    s.settled().await;
+    server.stop().await;
+}
