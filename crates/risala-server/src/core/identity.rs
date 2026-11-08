@@ -619,13 +619,6 @@ impl Inner {
                 "type your own identity to delete it",
             ));
         }
-        if purge {
-            // M4: purge=yes deletes every message as if by DELETE (5.4).
-            return Err(fail(
-                ErrorCode::NotSupported,
-                "purge=yes is not supported yet",
-            ));
-        }
         // From here on, the identity may not join rooms or sign in, and
         // its connections start no more commands. They still get the
         // PARTs.
@@ -663,7 +656,7 @@ impl Inner {
         for gate in gates {
             held.push(gate.lock_owned().await);
         }
-        let result = self.forget(uid, &user).await;
+        let result = self.forget(uid, &user, purge).await;
         let done = result.is_ok();
         // Close every connection, this one after its response.
         respond(
@@ -692,9 +685,10 @@ impl Inner {
     }
 
     /// Deletes what the server keeps about `uid` (4.8): its memberships,
-    /// with a PART each, then everything stored, then its roles and
-    /// invitations in memory, and for a hosted identity its key file.
-    async fn forget(&self, uid: &Uid, user: &Arc<UserEntry>) -> Result<(), Fail> {
+    /// with a PART each, then with `purge` every message it sent, as if by
+    /// DELETE, then everything stored, then its roles and invitations in
+    /// memory, and for a hosted identity its key file.
+    async fn forget(&self, uid: &Uid, user: &Arc<UserEntry>, purge: bool) -> Result<(), Fail> {
         // A JOIN under way may add a room after the first pass, but none
         // can start after it, since the user is ending. So this ends.
         loop {
@@ -705,6 +699,10 @@ impl Inner {
             for conv in convs {
                 self.auto_part(conv, uid).await;
             }
+        }
+        if purge {
+            let deleted = self.purge(uid, uid, None).await?;
+            tracing::info!(%uid, deleted, "purged an identity's messages");
         }
         let who = uid.clone();
         let rooms = self.db(move |s| s.rooms_with_role_or_invite(&who)).await?;

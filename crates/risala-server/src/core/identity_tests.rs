@@ -1032,14 +1032,9 @@ async fn unregister_deletes_a_hosted_identity() {
         .unwrap();
 
     w.send(&laptop, "unregister bob@example.net").await;
-    w.send(&laptop, "unregister alice@example.org purge=yes")
-        .await;
     assert_eq!(
         laptop.lines(),
-        [
-            "ERR forbidden type your own identity to delete it",
-            "ERR not-supported purge=yes is not supported yet",
-        ]
+        ["ERR forbidden type your own identity to delete it"]
     );
 
     w.send(&laptop, "@ref=u unregister ALICE@example.org").await;

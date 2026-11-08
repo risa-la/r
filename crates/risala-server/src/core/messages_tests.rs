@@ -9,7 +9,8 @@ use risala_proto::types::{Relation, Role, RoomRetention, RoomSetting};
 use super::tests::{Client, Flaky, Harness, T, config, put, seq, set, start, timers, value};
 use crate::config::Config;
 use crate::store::{
-    ConvKey, EventKind, HistoryQuery, MessageStore, NewEvent, RelatedQuery, SqliteStore, Store,
+    ConvKey, EventKind, HistoryQuery, MessageStore, NewEvent, PurgeQuery, RelatedQuery,
+    SqliteStore, Store,
 };
 
 const ALICE: &str = "alice@example.org";
@@ -671,6 +672,173 @@ async fn expiry_comes_in_batches() {
     h.clock.advance(DAY + Duration::from_millis(1));
     assert_eq!(h.hub.expire_now().await.unwrap(), 1200);
     assert_eq!(stored(&h, "#general"), [format!("1201 {ALICE} MSG")]);
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN PURGE (10.4)
+
+#[tokio::test]
+async fn purge_is_for_operators() {
+    let mut h = Harness::with(with_operator(), |_| {});
+    let mut alice = h.signed_in_as(ALICE);
+    let mut sam = h.guest("sam").await;
+    h.send(&alice, "admin purge ~spam").await;
+    h.send(&sam, "admin purge ~spam").await;
+    assert_eq!(alice.lines(), ["ERR forbidden operators only"]);
+    assert_eq!(sam.lines(), ["ERR forbidden not for guests"]);
+}
+
+#[tokio::test]
+async fn purge_deletes_everything_sent_under_a_name() {
+    let mut c = with_operator();
+    c.rooms.push("#other".into());
+    let mut h = Harness::with(c, |s| {
+        put(s, "#general", "~spam", msg("buy")); // 1
+        put(
+            s,
+            "#general",
+            "~spam",
+            related(Relation::Edit(seq(1)), "buy now"),
+        ); // 2
+        put(s, "#general", ALICE, msg("no")); // 3
+        put(
+            s,
+            "#general",
+            "~spam",
+            related(Relation::React(seq(3)), "😈"),
+        ); // 4
+        put(s, "#general", "~spam", msg("gone")); // 5
+        put(s, "#general", "~spam", EventKind::Delete { target: seq(5) }); // 6
+        put(s, "#other", "~spam", msg("buy")); // 1
+        put(s, "#other", "~spam", EventKind::Part { reason: "x".into() }); // 2
+    });
+    let (mut sam, _) = h.joined("sam", "#general").await; // 7
+    let mut op = h.signed_in_as(OP);
+    sam.lines();
+    h.send(&op, "@ref=p admin purge ~spam").await;
+    assert_eq!(op.lines(), ["@ref=p OK deleted=3"]);
+    // The edit went with its message.
+    assert_eq!(
+        sam.lines(),
+        [
+            format!("@seq=8;t={T};from={OP} DELETE #general 1"),
+            format!("@seq=9;t={T};from={OP} DELETE #general 4"),
+        ]
+    );
+    assert_eq!(
+        stored(&h, "#general")[..5],
+        [
+            "1 ~spam MSG deleted",
+            "2 ~spam MSG deleted",
+            &format!("3 {ALICE} MSG"),
+            "4 ~spam MSG deleted",
+            "5 ~spam MSG deleted",
+        ]
+    );
+    assert_eq!(
+        stored(&h, "#other"),
+        [
+            "1 ~spam MSG deleted".to_owned(),
+            "2 ~spam PART".to_owned(),
+            format!("3 {OP} DELETE")
+        ]
+    );
+    // Nothing left.
+    h.send(&op, "admin purge ~spam").await;
+    h.send(&op, "admin purge ~nobody").await;
+    assert_eq!(op.lines(), ["OK deleted=0", "OK deleted=0"]);
+}
+
+#[tokio::test]
+async fn purge_with_hours_deletes_only_the_last_ones() {
+    let mut h = Harness::with(with_operator(), |s| {
+        let hours = |n: u64| start().checked_sub(Duration::from_secs(n * 3600)).unwrap();
+        put_at(s, "#general", BOB, msg("old"), hours(3));
+        put_at(s, "#general", BOB, msg("recent"), hours(2));
+        put_at(s, "#general", BOB, msg("new"), hours(0));
+    });
+    let mut op = h.signed_in_as(OP);
+    h.send(&op, "admin purge bob@example.net hours=2").await;
+    assert_eq!(op.lines(), ["OK deleted=2"]);
+    assert_eq!(
+        stored(&h, "#general")[..3],
+        [
+            format!("1 {BOB} MSG"),
+            format!("2 {BOB} MSG deleted"),
+            format!("3 {BOB} MSG deleted"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn purge_stops_at_what_was_there() {
+    let h = Harness::with(config(), |s| {
+        s.set_durable(false).unwrap();
+        for n in 0..1100 {
+            put(s, "#general", "~spam", msg(&n.to_string()));
+        }
+    });
+    let spam = "~spam".parse().unwrap();
+    let op = OP.parse().unwrap();
+    assert_eq!(h.hub.inner.purge(&spam, &op, None).await.unwrap(), 1100);
+    let head = h
+        .store
+        .room(&"#general".parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .head;
+    assert_eq!(head, Some(seq(2200)));
+    // The store deletes no message past `upto`.
+    let query = PurgeQuery {
+        author: spam,
+        since: None,
+        upto: seq(1),
+        by: op,
+        now: start(),
+        max: 10,
+    };
+    assert!(
+        h.store
+            .purge(key(&h, "#general"), &query)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// UNREGISTER purge=yes (4.8)
+
+#[tokio::test]
+async fn unregister_with_purge_deletes_every_message() {
+    let mut h = Harness::with(config(), |s| {
+        put(s, "#general", ALICE, msg("before")); // 1
+    });
+    let mut alice = member(&mut h, ALICE, "#general").await; // 2
+    let (mut sam, _) = h.joined("sam", "#general").await; // 3
+    h.send(&alice, "msg #general bye").await; // 4
+    h.send(&sam, "@reply=4 msg #general bye!").await; // 5
+    alice.lines();
+    sam.lines();
+    h.send(&alice, "unregister alice@example.org purge=yes")
+        .await;
+    assert_eq!(
+        alice.lines(),
+        [
+            format!("@seq=6;t={T};from={ALICE} PART #general"),
+            "OK".into(),
+            "<close> BYE identity deleted".into(),
+        ]
+    );
+    assert_eq!(
+        sam.lines(),
+        [
+            format!("@seq=6;t={T};from={ALICE} PART #general"),
+            format!("@seq=7;t={T};from={ALICE} DELETE #general 1"),
+            format!("@seq=8;t={T};from={ALICE} DELETE #general 4"),
+        ]
+    );
+    // The reply stays.
+    assert_eq!(stored(&h, "#general")[4], "5 ~sam MSG");
 }
 
 // ---------------------------------------------------------------------------

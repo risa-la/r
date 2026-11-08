@@ -25,7 +25,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use risala_proto::command::Command;
+use risala_proto::command::{AdminCommand, Command};
 use risala_proto::error::ErrorCode;
 use risala_proto::names::{Conv, Id, Seq, Uid};
 use risala_proto::server::OkResponse;
@@ -37,15 +37,16 @@ use super::state::{ConvState, RoomInfo};
 use super::{Hub, Inner};
 use crate::handler::ConnId;
 use crate::store::{
-    Appended, EventKind, NewEvent, RelatedQuery, RoomSettings, StoreError, StoredEvent,
+    Appended, EventKind, NewEvent, PurgeQuery, RelatedQuery, RoomSettings, StoreError, StoredEvent,
 };
 
 /// How often [`Hub::expire_every`] runs in `risalad` (7.5). Periods are
 /// whole days, so an event outlives its period by at most this.
 pub const EXPIRE_PERIOD: Duration = Duration::from_secs(60 * 60);
 
-/// The most events one store transaction expires, so that transactions
-/// stay short and other commands get the room's lock in between.
+/// The most events one store transaction expires, or deletes in a purge,
+/// so that transactions stay short and other commands get the room's lock
+/// in between.
 const BATCH: usize = 500;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -84,6 +85,9 @@ impl Inner {
                     limit: limit.map_or(DEFAULT_LIMIT, NonZeroU64::get),
                 };
                 self.related(uid, reply, conv, query).await
+            }
+            Command::Admin(AdminCommand::Purge { uid: target, hours }) => {
+                self.admin_purge(uid, &target, hours).await
             }
             _ => Err(not_supported()),
         }
@@ -325,6 +329,78 @@ impl Inner {
         }
         Ok(Some(OkResponse::new().with_id(&id).with_more(page.more)))
     }
+
+    /// `ADMIN PURGE` (10.4).
+    async fn admin_purge(&self, uid: &Uid, target: &Uid, hours: Option<NonZeroU64>) -> Outcome {
+        if !self.is_operator(uid) {
+            return Err(fail(ErrorCode::Forbidden, "operators only"));
+        }
+        let since = hours.and_then(|h| {
+            let secs = h.get().saturating_mul(60 * 60);
+            self.now().checked_sub(Duration::from_secs(secs))
+        });
+        let deleted = self.purge(target, uid, since).await?;
+        tracing::info!(operator = %uid, %target, deleted, "purged messages");
+        Ok(Some(OkResponse::new().with_deleted(deleted)))
+    }
+
+    /// Deletes the messages `author` sent, in every conversation, as DELETE
+    /// does (5.4), with `by` as the `from` of each DELETE event: all of
+    /// them, or with `since`, those sent at or after it. Returns how many
+    /// DELETE events were recorded. For ADMIN PURGE (10.4), and UNREGISTER
+    /// `purge=yes` (4.8), where `by` is `author`.
+    ///
+    /// Takes each room's lock in turn, a batch at a time, so the caller
+    /// must hold none. In each room, it deletes only what was there when it
+    /// started, so it ends even if the author keeps sending.
+    ///
+    /// M5a: direct conversations.
+    pub(super) async fn purge(
+        &self,
+        author: &Uid,
+        by: &Uid,
+        since: Option<Timestamp>,
+    ) -> Result<u64, StoreError> {
+        let who = author.clone();
+        let rooms = self.db(move |s| s.authored_rooms(&who, since)).await?;
+        let mut count = 0;
+        for (key, room) in rooms {
+            let Some(entry) = self.room_entry(&room) else {
+                continue;
+            };
+            let mut upto = None;
+            loop {
+                let mut st = entry.lock().await;
+                // Dropped meanwhile, perhaps created again (10.4): its
+                // messages are gone already.
+                if st.dropped || st.key != key {
+                    break;
+                }
+                let Some(upto) = *upto.get_or_insert(st.head) else {
+                    break;
+                };
+                let query = PurgeQuery {
+                    author: author.clone(),
+                    since,
+                    upto,
+                    by: by.clone(),
+                    now: self.now(),
+                    max: BATCH,
+                };
+                let deletes = self.db(move |s| s.purge(key, &query)).await?;
+                let Some(last) = deletes.last() else {
+                    break;
+                };
+                st.head = Some(last.seq);
+                count += deletes.len() as u64;
+                for event in &deletes {
+                    Self::broadcast_event(&st, event);
+                }
+            }
+        }
+        Ok(count)
+    }
+
     /// The time before which a room's events expire (7.5), or `None` if
     /// they never do: the shorter of the server's period and the room's.
     fn expiry_cutoff(&self, settings: &RoomSettings) -> Option<Timestamp> {
