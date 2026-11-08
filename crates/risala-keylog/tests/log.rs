@@ -28,12 +28,10 @@ struct World {
 impl World {
     fn new() -> World {
         let log = MemoryLog::new(&origin(), &[1; 32]);
-        let mut witnesses: Vec<TestWitness> = (0..3u8)
+        // Witnesses enrol the log from its first checkpoint.
+        let witnesses: Vec<TestWitness> = (0..3u8)
             .map(|i| TestWitness::new(&format!("witness{i}.example/w"), &[10 + i; 32]))
             .collect();
-        for w in &mut witnesses {
-            w.add_log(log.key().verifier());
-        }
         let vkeys: Vec<String> = witnesses.iter().map(|w| w.vkey().to_string()).collect();
         let policy = WitnessPolicy::from_vkeys(&vkeys, 2).unwrap();
         World {
@@ -180,27 +178,21 @@ fn daily_watch_needs_fresh_cosignatures() {
     assert!(
         world
             .policy
-            .verify(&key, served.as_bytes(), Freshness::watching(NOW + 3600))
+            .verify(&key, served.as_bytes(), Freshness::fresh(NOW + 3600))
             .is_ok()
     );
     assert!(matches!(
-        world.policy.verify(
-            &key,
-            served.as_bytes(),
-            Freshness::watching(NOW + 25 * 3600)
-        ),
-        Err(WitnessError::NotEnoughWitnesses { have: 0, need: 2 })
+        world
+            .policy
+            .verify(&key, served.as_bytes(), Freshness::fresh(NOW + 25 * 3600)),
+        Err(WitnessError::NotFresh { fresh: 0, need: 2 })
     ));
     // A new checkpoint, even with nothing added, is fresh again.
     let served = world.publish(NOW + 24 * 3600);
     assert!(
         world
             .policy
-            .verify(
-                &key,
-                served.as_bytes(),
-                Freshness::watching(NOW + 25 * 3600)
-            )
+            .verify(&key, served.as_bytes(), Freshness::fresh(NOW + 25 * 3600))
             .is_ok()
     );
 }
@@ -217,8 +209,8 @@ fn witnesses_refuse_a_forked_log() {
     for i in 0..12u8 {
         forked.append(&[i ^ 0x80]);
     }
-    let mut cp = forked.checkpoint(NOW);
-    let results = forked.witness(&mut cp, &mut world.witnesses, NOW);
+    let mut cp = forked.checkpoint(NOW + 60);
+    let results = forked.witness(&mut cp, &mut world.witnesses, NOW + 60);
     assert!(
         results
             .iter()

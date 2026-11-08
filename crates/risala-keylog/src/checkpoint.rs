@@ -187,13 +187,15 @@ impl SignedCheckpoint {
     }
 }
 
-/// A key log's origin: `<host>/risala-log/<n>`, where `<n>` is a number
-/// from 1 that the operator picks (SPEC 4.5).
+/// A key log's origin: `<host>/risala-log/<n>`, where `<host>` is the
+/// log's hostname in lower case and `<n>` its number: 1 for a host's first
+/// log, and one more for each log a hand-off starts (SPEC 4.5).
 ///
-/// The host must be a DNS name in lower case: letters, digits and hyphens
-/// in labels of 1 to 63 characters, separated by dots, with no port. The
-/// spec says only "its hostname"; insisting on one spelling keeps two
-/// origins from naming one log. (SPEC 4.5; a choice to confirm.)
+/// The host must be a DNS name: letters, digits and hyphens in labels of 1
+/// to 63 characters, separated by dots, with no port and no trailing dot.
+/// SPEC 4.5 says "its hostname in lower case"; ruling out ports, trailing
+/// dots and other spellings keeps two origins from naming one log. (A
+/// choice to confirm.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LogOrigin {
     host: String,
@@ -224,6 +226,18 @@ impl LogOrigin {
     /// The log's number.
     pub fn number(&self) -> u64 {
         self.number
+    }
+
+    /// The origin of the host's next log, which a hand-off from this one
+    /// names (SPEC 4.5, "Hand-offs").
+    pub fn next(&self) -> Option<LogOrigin> {
+        LogOrigin::new(&self.host, self.number.checked_add(1)?).ok()
+    }
+
+    /// The origin of the host's previous log, which must have handed off to
+    /// this one; `None` for log 1.
+    pub fn previous(&self) -> Option<LogOrigin> {
+        LogOrigin::new(&self.host, self.number - 1).ok()
     }
 }
 
@@ -329,6 +343,11 @@ mod tests {
             LogOrigin::new("localhost", 42).unwrap().to_string(),
             "localhost/risala-log/42"
         );
+        assert_eq!(o.previous(), None);
+        let two = o.next().unwrap();
+        assert_eq!(two.to_string(), "chat.example.org/risala-log/2");
+        assert_eq!(two.previous(), Some(o.clone()));
+        assert_eq!(LogOrigin::new("a", u64::MAX).unwrap().next(), None);
         for bad in [
             "chat.example.org/risala-log/0",
             "chat.example.org/risala-log/01",
@@ -342,6 +361,7 @@ mod tests {
             "/risala-log/1",
             "https://chat.example.org/risala-log/1",
             "chat.example.org/risala-log/1/risala-log/1",
+            "chat.example.org./risala-log/1",
         ] {
             assert!(bad.parse::<LogOrigin>().is_err(), "{bad:?}");
         }

@@ -1,11 +1,19 @@
-//! The witness policy (SPEC 4.5): which checkpoints a device treats as
-//! witnessed.
+//! The witness policy (SPEC 4.5, 4.10): which checkpoints a device treats
+//! as witnessed, and which are fresh.
 //!
 //! A checkpoint is witnessed when its log's signature verifies and at
-//! least k of the device's n witnesses have cosigned it. Both are ML-DSA-44
-//! checkpoint cosignatures (type `0x06`). Signatures of any other type,
-//! such as Ed25519, and from keys the device does not know, are ignored,
-//! so they never count towards k.
+//! least k of the device's n witnesses have cosigned it, where k is more
+//! than half of n. Both are ML-DSA-44 checkpoint cosignatures (type
+//! `0x06`) with a timestamp that is not zero. Signatures of any other
+//! type, such as Ed25519, from keys the device does not know, and with a
+//! zero timestamp, are ignored, so they never count towards k.
+//!
+//! A witnessed checkpoint is **fresh** when k of the cosignatures that
+//! count are less than 24 hours old (SPEC 4.5, "Freshness"). Logs get a
+//! new witnessed checkpoint at least daily, so a device whose newest
+//! checkpoint of a log is not fresh treats the log's new records as
+//! pending, and does not count an identity's view as refreshed (SPEC
+//! 4.10).
 
 use std::collections::BTreeSet;
 
@@ -21,9 +29,10 @@ use crate::note::VerifierKey;
 /// allows for messages. (SPEC 4.5 is silent; a choice to confirm.)
 pub const MAX_CLOCK_SKEW: u64 = 600;
 
-/// The age, in seconds, below which a device's daily check wants its own
-/// log's cosignatures (SPEC 4.5, "Watching your own records").
-pub const WATCH_MAX_AGE: u64 = 24 * 60 * 60;
+/// The age, in seconds, below which k cosignatures must be for a
+/// checkpoint to be fresh (SPEC 4.5, "Freshness" and "Watching your own
+/// records", 4.10).
+pub const FRESH_MAX_AGE: u64 = 24 * 60 * 60;
 
 /// A key log's key: a type `0x06` verifier key whose name is the log's
 /// origin, `<host>/risala-log/<n>` (SPEC 4.4, 4.5).
@@ -68,8 +77,9 @@ impl LogKey {
 /// Why a policy or a key is not usable.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PolicyError {
-    /// k is 0, or larger than the number of witnesses.
-    #[error("k must be between 1 and the number of witnesses")]
+    /// k is not more than half the number of witnesses, or is larger
+    /// than it (SPEC 4.5).
+    #[error("k must be more than half the number of witnesses, and at most all of them")]
     BadThreshold,
     /// Two witnesses share a name or a public key, so one witness could
     /// count twice.
@@ -116,8 +126,13 @@ pub enum WitnessError {
     /// The log's signature is dated in the future.
     #[error("the log's signature is dated in the future")]
     FutureLogSignature,
-    /// Fewer than k witnesses of the policy have cosigned it, counting
-    /// only cosignatures that are fresh enough.
+    /// The log's signature has a zero timestamp, which SPEC 4.5 forbids.
+    #[error("the log's signature has a zero timestamp")]
+    ZeroLogTimestamp,
+    /// Fewer than k witnesses of the policy have cosigned it at all,
+    /// whatever the age of their cosignatures. If the device has never
+    /// seen a witnessed checkpoint of the log, its witness list does not
+    /// fit the log (see [`WitnessError::is_witness_list_problem`]).
     #[error("{have} of {need} witnesses have cosigned")]
     NotEnoughWitnesses {
         /// The witnesses whose cosignatures counted.
@@ -125,6 +140,33 @@ pub enum WitnessError {
         /// k.
         need: usize,
     },
+    /// k witnesses have cosigned it, but fewer than k of them in the last
+    /// 24 hours: the log or its witnesses are not keeping up, and the
+    /// log's new records stay pending (SPEC 4.10).
+    #[error("{fresh} of {need} cosignatures are less than 24 hours old")]
+    NotFresh {
+        /// The cosignatures less than 24 hours old.
+        fresh: usize,
+        /// k.
+        need: usize,
+    },
+}
+
+impl WitnessError {
+    /// Whether this error, for a log of which the device has no witnessed
+    /// checkpoint at all, means that the device's witness list does not
+    /// fit the log: fewer than k of its witnesses cosign the log even in
+    /// an old checkpoint. The device then shows the user a configuration
+    /// problem rather than showing the log's records as pending (SPEC 4.5,
+    /// "Witness policy").
+    ///
+    /// `seen_witnessed` says whether the device holds a witnessed
+    /// checkpoint of the log already (a [`LogView`](crate::client::LogView)
+    /// for it). If it does, the list once fitted, and the log or its
+    /// witnesses are only behind.
+    pub fn is_witness_list_problem(&self, seen_witnessed: bool) -> bool {
+        !seen_witnessed && matches!(self, WitnessError::NotEnoughWitnesses { .. })
+    }
 }
 
 /// What a device knows of the time when it checks a checkpoint.
@@ -132,16 +174,17 @@ pub enum WitnessError {
 pub struct Freshness {
     /// The time now, in seconds since 1970.
     pub now: u64,
-    /// The oldest a witness cosignature may be and still count, in
-    /// seconds, if there is a limit.
+    /// If set, at least k counted cosignatures must be younger than this,
+    /// in seconds, or the checkpoint is not fresh.
     pub max_age: Option<u64>,
     /// How far in the future a timestamp may be.
     pub max_future: u64,
 }
 
 impl Freshness {
-    /// Checks at `now`, with no limit on age: for accepting records (SPEC
-    /// 4.5, "Accepting a record", which sets none).
+    /// Checks at `now`, with no limit on age: whether a checkpoint is
+    /// witnessed (SPEC 4.5, "Accepting a record", step 3, which may use an
+    /// older checkpoint, consistent with the newest).
     pub fn at(now: u64) -> Freshness {
         Freshness {
             now,
@@ -150,12 +193,14 @@ impl Freshness {
         }
     }
 
-    /// Checks at `now` for the daily watch of a device's own log, where
-    /// cosignatures must be less than 24 hours old (SPEC 4.5).
-    pub fn watching(now: u64) -> Freshness {
+    /// Checks at `now` that a checkpoint is witnessed and fresh: k of its
+    /// cosignatures less than 24 hours old. For the newest checkpoint a
+    /// device fetches when it refreshes an identity, or watches its own
+    /// (SPEC 4.5, "Freshness" and "Watching your own records").
+    pub fn fresh(now: u64) -> Freshness {
         Freshness {
             now,
-            max_age: Some(WATCH_MAX_AGE),
+            max_age: Some(FRESH_MAX_AGE),
             max_future: MAX_CLOCK_SKEW,
         }
     }
@@ -173,15 +218,15 @@ impl Freshness {
         ts <= self.now.saturating_add(self.max_future)
     }
 
+    /// Whether a cosignature counts at all. One with timestamp zero says
+    /// nothing about being the latest checkpoint [TLOG-COSIGNATURE], and
+    /// SPEC 4.5 has clients ignore it.
     fn counts(&self, ts: u64) -> bool {
-        // A checkpoint cosignature with timestamp zero says nothing about
-        // being the latest checkpoint [TLOG-COSIGNATURE], so it does not
-        // count.
-        ts != 0
-            && self.not_future(ts)
-            && self
-                .max_age
-                .is_none_or(|age| self.now.saturating_sub(ts) < age)
+        ts != 0 && self.not_future(ts)
+    }
+
+    fn is_fresh(&self, ts: u64) -> bool {
+        self.max_age.is_none_or(|age| is_younger(self.now, ts, age))
     }
 }
 
@@ -193,13 +238,16 @@ pub struct WitnessPolicy {
 }
 
 impl WitnessPolicy {
-    /// A policy needing `k` of these witnesses. Each witness may appear
-    /// once, by name and by key.
+    /// A policy needing `k` of these witnesses, where k is more than half
+    /// their number (SPEC 4.5): with each witness enrolling one key per
+    /// origin ever (SPEC 4.10), two keys for one origin cannot both get k
+    /// cosignatures from one list. Each witness may appear once, by name
+    /// and by key.
     pub fn new(
         witnesses: Vec<CosignatureVerifier>,
         k: usize,
     ) -> Result<WitnessPolicy, PolicyError> {
-        if k == 0 || k > witnesses.len() {
+        if k > witnesses.len() || 2 * k <= witnesses.len() {
             return Err(PolicyError::BadThreshold);
         }
         let names: BTreeSet<&str> = witnesses.iter().map(|w| w.name()).collect();
@@ -245,9 +293,13 @@ impl WitnessPolicy {
     ///
     /// 1. its origin is the log's, and it has no extension lines;
     /// 2. no key name and id appear on two signature lines;
-    /// 3. the log's signature verifies and is not dated in the future;
+    /// 3. the log's signature verifies, and its timestamp is neither zero
+    ///    nor in the future;
     /// 4. every signature from a witness of the policy verifies, and at
-    ///    least k of them are fresh as `freshness` says.
+    ///    least k of them have a timestamp that is not zero and not in the
+    ///    future ([`WitnessError::NotEnoughWitnesses`]);
+    /// 5. if `freshness` sets a maximum age, at least k of those are
+    ///    younger ([`WitnessError::NotFresh`]).
     ///
     /// Signatures from keys the policy does not hold are ignored. The log's
     /// own key never counts as a witness, even if the policy lists it.
@@ -277,6 +329,9 @@ impl WitnessPolicy {
         }
 
         let log_timestamp = verify_log_signature(&log.verifier, &signed)?;
+        if log_timestamp == 0 {
+            return Err(WitnessError::ZeroLogTimestamp);
+        }
         if !freshness.not_future(log_timestamp) {
             return Err(WitnessError::FutureLogSignature);
         }
@@ -301,18 +356,29 @@ impl WitnessPolicy {
                 need: self.k,
             });
         }
+        let fresh = cosigned
+            .iter()
+            .filter(|(_, ts)| freshness.is_fresh(*ts))
+            .count();
+        if fresh < self.k {
+            return Err(WitnessError::NotFresh {
+                fresh,
+                need: self.k,
+            });
+        }
         Ok(WitnessedCheckpoint {
             signed,
             log_timestamp,
             cosigned,
+            k: self.k,
         })
     }
 }
 
 /// Verifies a log's own signature on a checkpoint, as a witness does
-/// before it cosigns, and returns its timestamp. Signatures from other
-/// keys are ignored; if the log's key signed more than once, every one
-/// must verify.
+/// before it cosigns, and returns its timestamp: the newest, if the log's
+/// key signed more than once, and zero if any of them is zero. Signatures
+/// from other keys are ignored; every one from the log's key must verify.
 pub fn verify_log_signature(
     log: &CosignatureVerifier,
     signed: &SignedCheckpoint,
@@ -322,7 +388,12 @@ pub fn verify_log_signature(
         let ts = log
             .verify(signed.checkpoint(), sig)
             .map_err(|_| WitnessError::BadSignature(log.name().to_owned()))?;
-        timestamp = Some(timestamp.map_or(ts, |t: u64| t.max(ts)));
+        timestamp = Some(match timestamp {
+            None => ts,
+            Some(0) => 0,
+            Some(_) if ts == 0 => 0,
+            Some(t) => t.max(ts),
+        });
     }
     timestamp.ok_or(WitnessError::NoLogSignature)
 }
@@ -333,6 +404,7 @@ pub struct WitnessedCheckpoint {
     signed: SignedCheckpoint,
     log_timestamp: u64,
     cosigned: Vec<(String, u64)>,
+    k: usize,
 }
 
 impl WitnessedCheckpoint {
@@ -356,12 +428,37 @@ impl WitnessedCheckpoint {
         &self.cosigned
     }
 
+    /// The k of the policy it was checked under.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// When k witnesses had cosigned it: the k-th newest timestamp of the
+    /// cosignatures that counted.
+    pub fn witnessed_at(&self) -> u64 {
+        let mut ts: Vec<u64> = self.cosigned.iter().map(|(_, t)| *t).collect();
+        ts.sort_unstable_by(|a, b| b.cmp(a));
+        ts.get(self.k.saturating_sub(1)).copied().unwrap_or(0)
+    }
+
+    /// Whether, at `now`, k of its cosignatures are less than 24 hours old
+    /// (SPEC 4.5, "Freshness").
+    pub fn is_fresh(&self, now: u64) -> bool {
+        is_younger(now, self.witnessed_at(), FRESH_MAX_AGE)
+    }
+
     /// The signed checkpoint's text, for keeping. Check it again with
     /// [`WitnessPolicy::verify`] and [`Freshness::any`] when reading it
     /// back.
     pub fn to_text(&self) -> String {
         self.signed.to_text()
     }
+}
+
+/// Whether a timestamp is less than `age` seconds before `now`. One in the
+/// future, within the allowed skew, is younger.
+fn is_younger(now: u64, ts: u64, age: u64) -> bool {
+    now.saturating_sub(ts) < age
 }
 
 #[cfg(test)]
@@ -517,19 +614,43 @@ mod tests {
     #[test]
     fn freshness() {
         let s = setup();
-        let day = WATCH_MAX_AGE;
+        let day = FRESH_MAX_AGE;
         let sc = signed(&s, &cp(), &[(0, NOW - day + 1), (1, NOW - day)]);
-        // Any age counts when accepting records.
-        assert!(
-            s.policy
-                .verify_signed(&s.key, sc.clone(), Freshness::at(NOW))
-                .is_ok()
-        );
-        // A day old is too old for the daily watch.
+        // Any age counts for being witnessed.
+        let w = s
+            .policy
+            .verify_signed(&s.key, sc.clone(), Freshness::at(NOW))
+            .unwrap();
+        assert_eq!(w.k(), 2);
+        // But k of them must be less than a day old to be fresh.
+        assert!(!w.is_fresh(NOW));
+        assert!(w.is_fresh(NOW - 1));
         assert_eq!(
-            s.policy.verify_signed(&s.key, sc, Freshness::watching(NOW)),
-            Err(WitnessError::NotEnoughWitnesses { have: 1, need: 2 })
+            s.policy.verify_signed(&s.key, sc, Freshness::fresh(NOW)),
+            Err(WitnessError::NotFresh { fresh: 1, need: 2 })
         );
+        // Not being fresh is not a problem with the witness list; too few
+        // witnesses at any age is, for a log the device has never seen
+        // witnessed.
+        assert!(!WitnessError::NotFresh { fresh: 1, need: 2 }.is_witness_list_problem(false));
+        let few = WitnessError::NotEnoughWitnesses { have: 1, need: 2 };
+        assert!(few.is_witness_list_problem(false));
+        assert!(!few.is_witness_list_problem(true));
+        // Three cosignatures, two of them fresh.
+        let sc = signed(
+            &s,
+            &cp(),
+            &[(0, NOW - 2 * day), (1, NOW - 60), (2, NOW - 120)],
+        );
+        let w = s
+            .policy
+            .verify_signed(&s.key, sc, Freshness::fresh(NOW))
+            .unwrap();
+        assert_eq!(w.witnesses().len(), 3);
+        assert!(w.is_fresh(NOW));
+        assert_eq!(w.witnessed_at(), NOW - 120);
+        assert!(w.is_fresh(NOW + day - 121));
+        assert!(!w.is_fresh(NOW + day - 120));
         // Ten minutes ahead is within the skew, more is not.
         let sc = signed(
             &s,
@@ -560,6 +681,24 @@ mod tests {
             Err(WitnessError::FutureLogSignature)
         );
         assert!(s.policy.verify_signed(&s.key, sc, Freshness::any()).is_ok());
+        // The log's own signature with a zero timestamp.
+        let mut sc = SignedCheckpoint::unsigned(cp());
+        sc.push_signature(s.log.cosign(&cp(), 0, [0; 32])).unwrap();
+        sc.push_signature(s.witnesses[0].cosign(&cp(), NOW, [0; 32]))
+            .unwrap();
+        sc.push_signature(s.witnesses[1].cosign(&cp(), NOW, [0; 32]))
+            .unwrap();
+        assert_eq!(
+            s.policy.verify_signed(&s.key, sc.clone(), Freshness::any()),
+            Err(WitnessError::ZeroLogTimestamp)
+        );
+        // Even next to a signature from the log with a timestamp.
+        sc.push_signature(s.log.cosign(&cp(), NOW, [0; 32]))
+            .unwrap();
+        assert_eq!(
+            s.policy.verify_signed(&s.key, sc, Freshness::any()),
+            Err(WitnessError::DuplicateSignature)
+        );
     }
 
     #[test]
@@ -605,10 +744,33 @@ mod tests {
             WitnessPolicy::new(vs.clone(), 4),
             Err(PolicyError::BadThreshold)
         );
+        // k must be more than half the list.
+        assert_eq!(
+            WitnessPolicy::new(vs.clone(), 1),
+            Err(PolicyError::BadThreshold)
+        );
+        assert!(WitnessPolicy::new(vs.clone(), 3).is_ok());
+        assert!(WitnessPolicy::new(vs[..1].to_vec(), 1).is_ok());
+        assert_eq!(
+            WitnessPolicy::new(vs[..2].to_vec(), 1),
+            Err(PolicyError::BadThreshold)
+        );
+        let four: Vec<CosignatureVerifier> = (0..4u8)
+            .map(|i| {
+                Cosigner::from_seed(&format!("w{i}.example/w"), &[60 + i; 32])
+                    .unwrap()
+                    .verifier()
+            })
+            .collect();
+        assert_eq!(
+            WitnessPolicy::new(four.clone(), 2),
+            Err(PolicyError::BadThreshold)
+        );
+        assert!(WitnessPolicy::new(four, 3).is_ok());
         let mut dup = vs.clone();
         dup.push(vs[0].clone());
         assert_eq!(
-            WitnessPolicy::new(dup, 2),
+            WitnessPolicy::new(dup, 3),
             Err(PolicyError::DuplicateWitness)
         );
         // The same key under another name is one witness, not two.
@@ -616,7 +778,7 @@ mod tests {
         let mut dup = vs.clone();
         dup.push(alias);
         assert_eq!(
-            WitnessPolicy::new(dup, 2),
+            WitnessPolicy::new(dup, 3),
             Err(PolicyError::DuplicateWitness)
         );
 
