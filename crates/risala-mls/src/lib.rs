@@ -40,7 +40,7 @@ pub use archive::{
     ArchiveError, ArchivedConversation, ArchivedMessage, HistoryArchive, SealedArchive,
     TransferRef, seal_transfer,
 };
-pub use backup::{BackupError, BackupKey, RecoveryKey, RecoveryKeyError};
+pub use backup::{Backup, BackupError, BackupKey, RecoveryKey, RecoveryKeyError, WrappedKey};
 pub use conversation::{ConversationError, ConversationKind, RisalaConversation};
 pub use crypto::{Provider, RisalaCrypto, verify_ml_dsa_44};
 pub use file::{BlobRef, BlobRefError, Decryptor, EncryptedFile, Encryptor, FileError, FileKey};
