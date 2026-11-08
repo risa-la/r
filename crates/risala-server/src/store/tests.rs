@@ -898,6 +898,63 @@ fn key_labels_over_64_bytes_are_dropped() {
     assert_eq!(labels(&store), ["", fits.as_str(), ""]);
 }
 
+/// Migration 6 indexes the tables keyed by conversation first by user, so
+/// that SYNC's read markers and forgetting an identity do not scan them.
+#[test]
+fn rows_of_a_user_are_found_by_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("risala.db");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        schema::migrate_with(&mut conn, &schema::MIGRATIONS[..5]).unwrap();
+    }
+    let store = SqliteStore::open(&path).unwrap();
+    let conn = store.conn();
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, schema::MIGRATIONS.len() as i64);
+    let plan = |sql: &str| -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(["alice@example.org"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("; ")
+    };
+    for (sql, index) in [
+        (
+            "SELECT conv, seq FROM read_markers WHERE uid = ?1 ORDER BY conv",
+            "read_markers_uid",
+        ),
+        (
+            "DELETE FROM read_markers WHERE uid = ?1",
+            "read_markers_uid",
+        ),
+        ("DELETE FROM invites WHERE uid = ?1", "invites_uid"),
+        ("DELETE FROM cids WHERE author = ?1", "cids_author"),
+        (
+            "SELECT conv FROM roles WHERE uid = ?1 UNION SELECT conv FROM invites WHERE uid = ?1",
+            "invites_uid",
+        ),
+    ] {
+        let plan = plan(sql);
+        assert!(plan.contains(index), "{sql}: {plan}");
+        assert!(!plan.contains("SCAN"), "{sql}: {plan}");
+    }
+    drop(conn);
+
+    // The indexed reads still give the same answers.
+    let alice = uid("alice@example.org");
+    let r = store.ensure_room(&room("#general"), t(0)).unwrap();
+    store.append(r.key, &msg("~sam", 1, "hello")).unwrap();
+    store.set_read_marker(r.key, &alice, seq(1)).unwrap();
+    assert_eq!(store.read_markers(&alice).unwrap(), [(r.key, seq(1))]);
+    store.forget_identity(&alice, false, t(2)).unwrap();
+    assert!(store.read_markers(&alice).unwrap().is_empty());
+}
+
 #[test]
 fn signing_in_makes_an_identity_known() {
     let store = SqliteStore::open_in_memory().unwrap();

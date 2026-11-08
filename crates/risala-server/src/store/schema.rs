@@ -24,7 +24,7 @@ use super::{Result, StoreError};
 
 /// The migrations, in order. Migration `i` takes the database from version
 /// `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 /// Version 1: the whole protocol.
 const V1: &str = r#"
@@ -370,6 +370,17 @@ CREATE INDEX reports_conv ON reports (conv_id, n);
 pub(super) const V5: &str = r#"
 ALTER TABLE room_settings
     ADD COLUMN send TEXT NOT NULL DEFAULT 'all' CHECK (send IN ('all', 'mods'));
+"#;
+
+/// Version 6: indexes for finding a user's rows in tables keyed by
+/// conversation first.
+pub(super) const V6: &str = r#"
+-- SYNC lists the user's read markers (7.1, 7.4).
+CREATE INDEX read_markers_uid ON read_markers (uid);
+-- Forgetting an identity (4.8) deletes its invitations and cids; listing
+-- the rooms it holds a role or invitation in reads invitations too.
+CREATE INDEX invites_uid ON invites (uid);
+CREATE INDEX cids_author ON cids (author);
 "#;
 
 /// Brings the database up to date. Fails if it is newer than this server.
