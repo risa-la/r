@@ -35,7 +35,10 @@
 //! Key files are read for hosted identities from the store, and for others
 //! through the fetcher, from its cache when that agrees with what the
 //! commit claims, and fetched afresh otherwise. A key file that cannot be
-//! had gets `ERR unavailable`, as for KEYPKG GET.
+//! had gets `ERR unavailable`, as for KEYPKG GET. A key file fetched afresh
+//! also tells the server which keys left it, as at AUTH and KEYPKG GET
+//! (4.4, 12.6): their connections are closed, their KeyPackages and
+//! Welcomes deleted, and their leaves must go before anyone sends ENC.
 //!
 //! # Rooms
 //!
@@ -154,6 +157,11 @@ impl Inner {
     /// device that sent the command says, is fetched again, since the
     /// device may have seen a newer one. A file that cannot be had is
     /// `ERR unavailable`.
+    ///
+    /// A file fetched afresh tells which of the identity's keys are gone,
+    /// as at AUTH and KEYPKG GET (4.4): their connections are closed, and
+    /// their KeyPackages, Welcomes and leaves forgotten. That takes
+    /// `keys_lock`, so the caller must hold no conversation's lock.
     async fn key_listed(&self, uid: &Uid, key: &PublicKey, claim: bool) -> Result<bool, Fail> {
         let Some(identity) = uid.to_identity() else {
             return Ok(false);
@@ -170,6 +178,10 @@ impl Inner {
                 Ok(Err(e)) => return Err(unavailable(&e)),
                 Err(_) => return Err(unavailable(&FetchError::Failed("timed out".into()))),
             };
+            if !fetched.cached {
+                self.close_removed_keys(uid, &fetched.keys);
+                self.forget_unlisted_devices(uid, &fetched.keys).await;
+            }
             let listed = fetched.keys.contains(key);
             if listed == claim || !fetched.cached || refresh {
                 return Ok(listed);

@@ -1729,3 +1729,51 @@ async fn commits_fetch_key_files_without_holding_up_the_conversation() {
         ["@retry=10 ERR unavailable could not get the identity's key file; try again later"]
     );
 }
+
+/// A key file that COMMIT fetches afresh tells the server which keys left
+/// it, as at AUTH and KEYPKG GET (4.4, 12.6).
+#[tokio::test]
+async fn key_files_fetched_for_commit_show_removed_keys() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let (mut ga1, _) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+    // Bob swaps key 5 for 6, and Alice adds his new device.
+    w.fetcher.set(&identity(BOB), vec![key(6)]);
+    let b6 = Device::new(BOB, 6);
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            add: vec![b6.kp()],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line(BOB)).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=2 epoch=2");
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    // Key 5's connection is closed, and its leaf must go before anyone
+    // sends.
+    assert_eq!(
+        cb.lines().last().unwrap(),
+        "<close> BYE this device's key was removed"
+    );
+    assert_eq!(
+        w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await,
+        ["ERR stale the group has a leaf that must be removed; commit its removal first"]
+    );
+    let leaf = Device::leaf(&ga1, &key(5));
+    let sent = a1.commit(
+        &mut ga1,
+        Changes {
+            remove: vec![leaf],
+            ..Changes::default()
+        },
+    );
+    let lines = w.ask(&mut c1, &sent.line(BOB)).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=3 epoch=3");
+    ga1.merge_pending_commit(&a1.provider).unwrap();
+    let lines = w.ask(&mut c1, &a1.enc(BOB, &ga1, "TEXT hi\n")).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=4");
+}

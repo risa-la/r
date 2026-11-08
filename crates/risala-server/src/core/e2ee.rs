@@ -10,10 +10,10 @@
 //! COUNT and both WELCOME commands act for the connection's device. When
 //! a key leaves its identity's key file, the server deletes the device's
 //! KeyPackages and Welcomes (4.7, 12.7): at KEY DEL and ADMIN DELKEY, and
-//! when a key file fetched for AUTH or KEYPKG GET no longer lists it. It
-//! does so holding `keys_lock`, and KEYPKG ADD stores a KeyPackage under
-//! the same lock, after checking that its connection is still signed in,
-//! so none is stored for a key just removed.
+//! when a key file fetched for AUTH, KEYPKG GET or COMMIT no longer lists
+//! it. It does so holding `keys_lock`, and KEYPKG ADD stores a KeyPackage
+//! under the same lock, after checking that its connection is still signed
+//! in, so none is stored for a key just removed.
 //!
 //! # KeyPackages
 //!
