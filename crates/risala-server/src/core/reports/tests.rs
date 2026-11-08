@@ -96,14 +96,24 @@ fn harness() -> Harness {
 }
 
 /// The two lines a reviewer gets for report `id` of event 5 of
-/// `#general` by `~sam` with the reason `spam`, with `from` for
-/// operators.
-fn report_5(id: &str, operator: bool) -> Vec<String> {
+/// `#general`, whose id is `conv`, by `~sam` with the reason `spam`, with
+/// `from` for operators.
+fn report_5(id: &str, conv: &str, operator: bool) -> Vec<String> {
     let from = if operator { ";from=~sam" } else { "" };
     vec![
-        format!("@report={id};t={T}{from} REPORT #general 5 spam"),
-        format!("@report={id};seq=5;t={T};from=~spammer MSG #general cheap pills"),
+        format!("@report={id};id={conv};t={T}{from} REPORT #general 5 spam"),
+        format!("@report={id};id={conv};seq=5;t={T};from=~spammer MSG #general cheap pills"),
     ]
+}
+
+/// The id of `#general` (5.1).
+fn general_id(h: &Harness) -> String {
+    h.store
+        .room(&"#general".parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .id
+        .to_string()
 }
 
 /// Sends `line` on `c` and returns the id in its `OK id=`.
@@ -132,9 +142,10 @@ async fn a_report_reaches_every_reviewer() {
     assert_eq!(id.len(), crate::store::ID_LEN);
     // Owners and moderators, members or not, get it without the reporter;
     // operators with it. Members who are not reviewers get nothing.
-    assert_eq!(alice.lines(), report_5(&id, false));
-    assert_eq!(dave.lines(), report_5(&id, false));
-    assert_eq!(op.lines(), report_5(&id, true));
+    let conv = general_id(&h);
+    assert_eq!(alice.lines(), report_5(&id, &conv, false));
+    assert_eq!(dave.lines(), report_5(&id, &conv, false));
+    assert_eq!(op.lines(), report_5(&id, &conv, true));
     assert_eq!(bob.lines(), none());
 
     // Again: the same id, and nobody is told again.
@@ -151,8 +162,8 @@ async fn a_report_reaches_every_reviewer() {
     assert_eq!(
         op.lines(),
         [
-            format!("@report={other};t={T};from={BOB} REPORT #general 7"),
-            format!("@report={other};seq=7;t={T};from=~spammer;react=5 MSG #general ok"),
+            format!("@report={other};id={conv};t={T};from={BOB} REPORT #general 7"),
+            format!("@report={other};id={conv};seq=7;t={T};from=~spammer;react=5 MSG #general ok"),
         ]
     );
     assert_eq!(alice.lines().len(), 2);
@@ -361,11 +372,16 @@ async fn reports_lists_a_rooms_open_reports() {
     let mut alice = h.signed_in_as(ALICE);
     alice.lines();
     // Tags in one list, the ref first.
+    let conv = general_id(&h);
     let want = [
-        format!("@ref=r;report={first};t={T} REPORT #general 5 spam"),
-        format!("@ref=r;report={first};seq=5;t={T};from=~spammer MSG #general cheap pills"),
-        format!("@ref=r;report={second};t={T} REPORT #general 6"),
-        format!("@ref=r;report={second};seq=6;t={T};from=~spammer MSG #general more pills"),
+        format!("@ref=r;report={first};id={conv};t={T} REPORT #general 5 spam"),
+        format!(
+            "@ref=r;report={first};id={conv};seq=5;t={T};from=~spammer MSG #general cheap pills"
+        ),
+        format!("@ref=r;report={second};id={conv};t={T} REPORT #general 6"),
+        format!(
+            "@ref=r;report={second};id={conv};seq=6;t={T};from=~spammer MSG #general more pills"
+        ),
         "@ref=r OK".to_owned(),
     ];
     h.send(&alice, "@ref=r reports #general").await;
@@ -376,7 +392,7 @@ async fn reports_lists_a_rooms_open_reports() {
     h.send(&op, "reports #general").await;
     assert_eq!(
         op.lines()[0],
-        format!("@report={first};t={T};from=~sam REPORT #general 5 spam")
+        format!("@report={first};id={conv};t={T};from=~sam REPORT #general 5 spam")
     );
     // A room with no open reports.
     h.send(&alice, "reports #private").await;
@@ -419,7 +435,7 @@ async fn a_report_keeps_the_message_as_it_was() {
         .unwrap();
     let mut op = h.signed_in_as(OP);
     h.send(&op, "admin reports").await;
-    let mut want = report_5(&id, true);
+    let mut want = report_5(&id, &general_id(&h), true);
     want.push("OK".into());
     assert_eq!(op.lines(), want);
     // And it can be reported no more.
@@ -609,9 +625,10 @@ async fn dropping_a_room_removes_everyone_and_keeps_reports() {
         format!("@seq=1;t={T};from={BOB};id={new} JOIN #general")
     );
 
-    // The open report stays, for the operators alone.
+    // The open report stays, for the operators alone, with the old room's
+    // id (5.8).
     h.send(&op, "admin reports").await;
-    let mut want = report_5(&id, true);
+    let mut want = report_5(&id, &old, true);
     want.push("OK".into());
     assert_eq!(op.lines(), want);
     h.send(&alice, "reports #general").await;

@@ -597,7 +597,7 @@ async fn purge() {
         "alice",
         "report #b 3 rude",
         &[
-            "@report={rid};t={*} REPORT #b 3 rude",
+            "@report={rid};id={rconv};t={*} REPORT #b 3 rude",
             "*MSG #b two",
             "OK id={rid}",
         ],
@@ -606,13 +606,13 @@ async fn purge() {
     expect(
         &mut s,
         "op",
-        "@report={rid};t={*};from=alice@example.org REPORT #b 3 rude",
+        "@report={rid};id={rconv};t={*};from=alice@example.org REPORT #b 3 rude",
     )
     .await;
     expect(
         &mut s,
         "op",
-        "@report={rid};seq=3;t={*};from=bob@example.org MSG #b two",
+        "@report={rid};id={rconv};seq=3;t={*};from=bob@example.org MSG #b two",
     )
     .await;
 
@@ -684,8 +684,8 @@ async fn purge() {
         "op",
         "admin reports",
         &[
-            "@report={rid};t={*};from=alice@example.org REPORT #b 3 rude",
-            "@report={rid};seq=3;t={*};from=bob@example.org MSG #b two",
+            "@report={rid};id={rconv};t={*};from=alice@example.org REPORT #b 3 rude",
+            "@report={rid};id={rconv};seq=3;t={*};from=bob@example.org MSG #b two",
             "OK",
         ],
     )
@@ -1015,7 +1015,7 @@ async fn m4_state_survives_a_restart() {
         "bob",
         "report #p 13 rude",
         &[
-            "@report={rid};t={*} REPORT #p 13 rude",
+            "@report={rid};id={rconv};t={*} REPORT #p 13 rude",
             "*MSG #p rude",
             "OK id={rid}",
         ],
@@ -1090,7 +1090,7 @@ async fn m4_state_survives_a_restart() {
         "bob",
         "reports #p",
         &[
-            "@report={rid};t={*} REPORT #p 13 rude",
+            "@report={rid};id={rconv};t={*} REPORT #p 13 rude",
             "*MSG #p rude",
             "OK",
         ],

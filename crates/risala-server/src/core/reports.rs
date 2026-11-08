@@ -74,7 +74,7 @@ fn operators_only() -> Fail {
 
 /// The two lines of a report (5.8): the REPORT line, with `from` if
 /// `with_from`, and the copy of the reported event. Both carry the
-/// `report` tag. A room is named by its name; a direct conversation (M5a)
+/// `report` tag, and the `id` tag with the conversation's id. A room is named by its name; a direct conversation (M5a)
 /// by the author, as the reporter sees it.
 fn report_lines(
     id: &Id,
@@ -94,9 +94,13 @@ fn report_lines(
         franking: None,
         reason: report.reason.clone(),
     };
+    // Both carry the conversation's id, so that a report from a room that
+    // was dropped and made again is not taken for one about the new room
+    // (5.8, 10.4).
+    let conv_id = report.conv_id.clone();
     Ok([
-        ServerMessage::report_line(id.clone(), line),
-        ServerMessage::report_copy(id.clone(), copy),
+        ServerMessage::report_line(id.clone(), line).with_report_conv(conv_id.clone()),
+        ServerMessage::report_copy(id.clone(), copy).with_report_conv(conv_id),
     ])
 }
 

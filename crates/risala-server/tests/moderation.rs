@@ -766,15 +766,15 @@ async fn reports_outlive_delete_and_drop() {
     // Owners and mods get the lines without `from`; operators with it.
     for who in ["alice", "bob"] {
         s.play(&format!(
-            "{who} S: @report={{rid}};t={{*}} REPORT #r 6 spam
-             {who} S: @report={{rid}};seq=6;t={{*}};from=~spam MSG #r cheap pills"
+            "{who} S: @report={{rid}};id={{rconv}};t={{*}} REPORT #r 6 spam
+             {who} S: @report={{rid}};id={{rconv}};seq=6;t={{*}};from=~spam MSG #r cheap pills"
         ))
         .await;
     }
     for who in ["op", "op2"] {
         s.play(&format!(
-            "{who} S: @report={{rid}};t={{*}};from=carol@example.org REPORT #r 6 spam
-             {who} S: @report={{rid}};seq=6;t={{*}};from=~spam MSG #r cheap pills"
+            "{who} S: @report={{rid}};id={{rconv}};t={{*}};from=carol@example.org REPORT #r 6 spam
+             {who} S: @report={{rid}};id={{rconv}};seq=6;t={{*}};from=~spam MSG #r cheap pills"
         ))
         .await;
     }
@@ -799,8 +799,8 @@ async fn reports_outlive_delete_and_drop() {
     )
     .await;
     let report = [
-        "@report={rid};t={*} REPORT #r 6 spam",
-        "@report={rid};seq=6;t={*};from=~spam MSG #r cheap pills",
+        "@report={rid};id={rconv};t={*} REPORT #r 6 spam",
+        "@report={rid};id={rconv};seq=6;t={*};from=~spam MSG #r cheap pills",
         "OK",
     ];
     exchange(&mut s, "bob", "reports #r", &report).await;
@@ -823,8 +823,8 @@ async fn reports_outlive_delete_and_drop() {
         "op",
         "admin reports",
         &[
-            "@report={rid};t={*};from=carol@example.org REPORT #r 6 spam",
-            "@report={rid};seq=6;t={*};from=~spam MSG #r cheap pills",
+            "@report={rid};id={rconv};t={*};from=carol@example.org REPORT #r 6 spam",
+            "@report={rid};id={rconv};seq=6;t={*};from=~spam MSG #r cheap pills",
             "OK",
         ],
     )
@@ -883,15 +883,15 @@ async fn retention_shortened_by_set_and_admin_set() {
         "alice",
         "report #r 3 old",
         &[
-            "@report={rid};t={*} REPORT #r 3 old",
-            "@report={rid};seq=3;t={*};from=bob@example.org MSG #r day 0",
+            "@report={rid};id={rconv};t={*} REPORT #r 3 old",
+            "@report={rid};id={rconv};seq=3;t={*};from=bob@example.org MSG #r day 0",
             "OK id={rid}",
         ],
     )
     .await;
     s.play(
-        "op S: @report={rid};t={*};from=alice@example.org REPORT #r 3 old
-         op S: @report={rid};seq=3;t={*};from=bob@example.org MSG #r day 0",
+        "op S: @report={rid};id={rconv};t={*};from=alice@example.org REPORT #r 3 old
+         op S: @report={rid};id={rconv};seq=3;t={*};from=bob@example.org MSG #r day 0",
     )
     .await;
 
@@ -967,8 +967,8 @@ async fn retention_shortened_by_set_and_admin_set() {
         "alice",
         "reports #r",
         &[
-            "@report={rid};t={*} REPORT #r 3 old",
-            "@report={rid};seq=3;t={*};from=bob@example.org MSG #r day 0",
+            "@report={rid};id={rconv};t={*} REPORT #r 3 old",
+            "@report={rid};id={rconv};seq=3;t={*};from=bob@example.org MSG #r day 0",
             "OK",
         ],
     )
@@ -1071,7 +1071,7 @@ async fn a_new_room_of_the_same_name_does_not_inherit_reports() {
     expect(
         &mut s,
         "op",
-        "@report={rid};t={*};from=bob@example.org REPORT #r 3",
+        "@report={rid};id={rconv};t={*};from=bob@example.org REPORT #r 3",
     )
     .await;
     expect(&mut s, "op", "*MSG #r rude").await;
@@ -1103,17 +1103,24 @@ async fn a_new_room_of_the_same_name_does_not_inherit_reports() {
     expect(&mut s, "carol", "*MSG #r three").await;
     exchange(&mut s, "alice", "report #r 3", &["OK id={rid2}"]).await;
     assert_ne!(s.var("rid2"), rid);
-    expect(&mut s, "carol", "@report={rid2};t={*} REPORT #r 3").await;
     expect(
         &mut s,
         "carol",
-        "@report={rid2};seq=3;t={*};from=bob@example.org MSG #r three",
+        "@report={rid2};id={rconv2};t={*} REPORT #r 3",
+    )
+    .await;
+    // It carries the new room's id, not the dropped one's (5.8).
+    assert_ne!(s.var("rconv2"), s.var("rconv"));
+    expect(
+        &mut s,
+        "carol",
+        "@report={rid2};id={rconv2};seq=3;t={*};from=bob@example.org MSG #r three",
     )
     .await;
     expect(
         &mut s,
         "op",
-        "@report={rid2};t={*};from=alice@example.org REPORT #r 3",
+        "@report={rid2};id={rconv2};t={*};from=alice@example.org REPORT #r 3",
     )
     .await;
     expect(&mut s, "op", "*MSG #r three").await;
