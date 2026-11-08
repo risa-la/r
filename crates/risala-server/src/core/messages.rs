@@ -10,9 +10,20 @@
 //! someone is over time (4.2), so a guest is the author only of what it
 //! sent in its current session: see [`Inner::is_author`]. ADMIN PURGE of a
 //! guest uid still covers everything sent under the name (10.4).
+//!
+//! # Retention
+//!
+//! [`Hub::expire_every`] expires old events in the background, and
+//! [`Hub::expire_now`] and [`Inner::expire_all`] run it at once, as after a
+//! change to the server's period (10.6). SET of a room's `retention` holds
+//! the room's lock, and calls [`Inner::expire_conv`] instead (6.2).
+//! Expiry takes each room's lock while it removes events, a batch at a
+//! time, so that a DELETE or reply never meets a target that vanishes
+//! between its check and its event.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use risala_proto::command::Command;
 use risala_proto::error::ErrorCode;
@@ -21,11 +32,23 @@ use risala_proto::server::OkResponse;
 use risala_proto::time::Timestamp;
 use risala_proto::types::{Cid, DEFAULT_LIMIT, FileUrl, MAX_REACTION, Relation, Role};
 
-use super::Inner;
 use super::commands::{Fail, Outcome, Reply, check_read, fail, not_supported, room_of};
 use super::state::{ConvState, RoomInfo};
+use super::{Hub, Inner};
 use crate::handler::ConnId;
-use crate::store::{Appended, EventKind, NewEvent, RelatedQuery, StoredEvent};
+use crate::store::{
+    Appended, EventKind, NewEvent, RelatedQuery, RoomSettings, StoreError, StoredEvent,
+};
+
+/// How often [`Hub::expire_every`] runs in `risalad` (7.5). Periods are
+/// whole days, so an event outlives its period by at most this.
+pub const EXPIRE_PERIOD: Duration = Duration::from_secs(60 * 60);
+
+/// The most events one store transaction expires, so that transactions
+/// stay short and other commands get the room's lock in between.
+const BATCH: usize = 500;
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn no_message() -> Fail {
     fail(ErrorCode::NotFound, "no such message")
@@ -301,5 +324,108 @@ impl Inner {
             reply.line(line);
         }
         Ok(Some(OkResponse::new().with_id(&id).with_more(page.more)))
+    }
+    /// The time before which a room's events expire (7.5), or `None` if
+    /// they never do: the shorter of the server's period and the room's.
+    fn expiry_cutoff(&self, settings: &RoomSettings) -> Option<Timestamp> {
+        let days = settings.retention.effective(self.settings().retention)?;
+        let period = DAY.checked_mul(days.get())?;
+        self.now().checked_sub(period)
+    }
+
+    /// Expires one batch of a conversation's events whose lock the caller
+    /// holds. Returns how many.
+    async fn expire_batch(&self, st: &ConvState) -> Result<u64, StoreError> {
+        let Some(info) = st.room_info() else {
+            return Ok(0);
+        };
+        if st.dropped || st.head.is_none() {
+            return Ok(0);
+        }
+        let Some(before) = self.expiry_cutoff(&info.settings) else {
+            return Ok(0);
+        };
+        let key = st.key;
+        self.db(move |s| s.expire(key, before, BATCH)).await
+    }
+
+    /// Expires a conversation's old events now (7.5), holding the lock the
+    /// caller holds. For SET of a room's `retention` (6.2), which applies
+    /// to events already stored. Returns how many expired.
+    // TODO(M4 rebase): SET of `retention` (6.2) calls this.
+    #[allow(dead_code)]
+    pub(super) async fn expire_conv(&self, st: &ConvState) -> Result<u64, StoreError> {
+        let mut total = 0;
+        loop {
+            let n = self.expire_batch(st).await?;
+            total += n;
+            if n < BATCH as u64 {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Expires old events in every conversation now (7.5): what the
+    /// background task does, and what a change to the server's period
+    /// calls for (10.6). The caller must hold no conversation's lock: each
+    /// is taken in turn, a batch at a time. Returns how many expired. A
+    /// conversation that fails is logged, the others still expire, and
+    /// the first error is returned.
+    pub(super) async fn expire_all(&self) -> Result<u64, StoreError> {
+        let entries: Vec<_> = self
+            .rooms
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let (mut total, mut first_error) = (0, None);
+        for entry in entries {
+            loop {
+                let st = entry.lock().await;
+                match self.expire_batch(&st).await {
+                    Ok(n) => {
+                        total += n;
+                        if n < BATCH as u64 {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(conv = %st.id, "expiring events failed: {e}");
+                        first_error.get_or_insert(e);
+                        break;
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
+    }
+}
+
+impl Hub {
+    /// Expires old events in every conversation now (7.5), under the
+    /// server's retention period and each room's, and returns how many.
+    /// [`expire_every`](Self::expire_every) does this in the background.
+    pub async fn expire_now(&self) -> Result<u64, StoreError> {
+        self.inner.expire_all().await
+    }
+
+    /// Runs [`expire_now`](Self::expire_now) at once and then every
+    /// `period`, until the future is dropped. Failures are logged.
+    pub async fn expire_every(self, period: Duration) {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match self.expire_now().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(events = n, "expired old events"),
+                // Logged per conversation already.
+                Err(_) => {}
+            }
+        }
     }
 }

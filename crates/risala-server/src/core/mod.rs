@@ -96,6 +96,7 @@ pub use keys::{
     FetchError, FetchedKeys, KeyFetcher, KeyFilePublisher, KeyServices, MemoryFetcher,
     MemoryPublisher, NoFetcher, NoPublisher,
 };
+pub use messages::EXPIRE_PERIOD;
 use presence::PresenceBook;
 use state::{ConnEntry, ConvEntry, ConvState, GuestSession, Registry};
 

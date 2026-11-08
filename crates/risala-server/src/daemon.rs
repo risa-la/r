@@ -27,7 +27,9 @@ use std::sync::Arc;
 use risala_proto::fingerprint::Fingerprint;
 
 use crate::config::Config;
-use crate::core::{BYE_SHUTDOWN, CID_PRUNE_PERIOD, Hub, HubError, KeyServices, Timers};
+use crate::core::{
+    BYE_SHUTDOWN, CID_PRUNE_PERIOD, EXPIRE_PERIOD, Hub, HubError, KeyServices, Timers,
+};
 use crate::http::{self, HttpServer, KeyDir};
 use crate::net;
 
@@ -184,12 +186,14 @@ impl Daemon {
     /// rooms (4.2) before this returns.
     ///
     /// Meanwhile, cids older than 24 hours are forgotten every
-    /// [`CID_PRUNE_PERIOD`] (7.6), and the HTTPS listener, if there is
-    /// one, serves key files. It stops when this returns.
+    /// [`CID_PRUNE_PERIOD`] (7.6), old events expire every
+    /// [`EXPIRE_PERIOD`] (7.5), and the HTTPS listener, if there is one,
+    /// serves key files. It stops when this returns.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), RunError> {
         let _pruner = AbortOnDrop(tokio::spawn(
             self.hub.clone().prune_cids_every(CID_PRUNE_PERIOD),
         ));
+        let _expirer = AbortOnDrop(tokio::spawn(self.hub.clone().expire_every(EXPIRE_PERIOD)));
         let _http = self.http.map(|http| {
             AbortOnDrop(tokio::spawn(async move {
                 if let Err(e) = http.run(std::future::pending()).await {

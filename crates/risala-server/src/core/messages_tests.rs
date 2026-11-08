@@ -3,18 +3,21 @@
 
 use std::time::Duration;
 
-use risala_proto::types::{Relation, Role, RoomSetting};
+use risala_proto::time::Timestamp;
+use risala_proto::types::{Relation, Role, RoomRetention, RoomSetting};
 
 use super::tests::{Client, Flaky, Harness, T, config, put, seq, set, start, timers, value};
 use crate::config::Config;
 use crate::store::{
-    ConvKey, EventKind, HistoryQuery, MessageStore, RelatedQuery, SqliteStore, Store,
+    ConvKey, EventKind, HistoryQuery, MessageStore, NewEvent, RelatedQuery, SqliteStore, Store,
 };
 
 const ALICE: &str = "alice@example.org";
 const BOB: &str = "bob@example.net";
 const CAROL: &str = "carol@example.net";
 const OP: &str = "op@example.net";
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn msg(text: &str) -> EventKind {
     EventKind::Msg {
@@ -30,6 +33,18 @@ fn related(relation: Relation, text: &str) -> EventKind {
         file: None,
         text: text.into(),
     }
+}
+
+/// Appends an event straight to the store, at time `t`.
+fn put_at(store: &SqliteStore, room: &str, from: &str, kind: EventKind, t: Timestamp) {
+    let key = store.room(&room.parse().unwrap()).unwrap().unwrap().key;
+    let event = NewEvent {
+        t,
+        from: from.parse().unwrap(),
+        kind,
+        cid: None,
+    };
+    store.append(key, &event).unwrap();
 }
 
 fn with_operator() -> Config {
@@ -508,6 +523,154 @@ async fn related_follows_the_reading_rules() {
         ]
     );
     assert_eq!(value(&bob.lines()[0], "more"), "0");
+}
+
+// ---------------------------------------------------------------------------
+// Retention (7.5)
+
+fn with_retention(server: &str) -> Config {
+    let mut c = config();
+    c.server.retention = server.into();
+    c.rooms.push("#short".into());
+    c
+}
+
+#[tokio::test]
+async fn old_events_expire_in_seq_order() {
+    let day = |n: u32| start().checked_sub(DAY * n).unwrap();
+    let mut h = Harness::with(with_retention("30"), |s| {
+        put_at(s, "#general", ALICE, msg("1"), day(40));
+        put_at(s, "#general", ALICE, msg("2"), day(31));
+        // Not old enough: it stops here, though 4 is older (7.5).
+        put_at(s, "#general", ALICE, msg("3"), day(29));
+        put_at(s, "#general", ALICE, msg("4"), day(35));
+        put_at(s, "#general", ALICE, msg("5"), day(1));
+    });
+    assert_eq!(h.hub.expire_now().await.unwrap(), 2);
+    assert_eq!(
+        stored(&h, "#general"),
+        [
+            format!("3 {ALICE} MSG"),
+            format!("4 {ALICE} MSG"),
+            format!("5 {ALICE} MSG")
+        ]
+    );
+    // Nothing more yet.
+    assert_eq!(h.hub.expire_now().await.unwrap(), 0);
+
+    // Seqs go on from the head.
+    let (mut sam, id) = h.joined("sam", "#general").await;
+    h.send(&sam, "history #general after=0").await;
+    let lines = sam.lines();
+    assert!(lines[0].starts_with("@seq=3;"), "{lines:?}");
+    assert_eq!(lines.last().unwrap(), &format!("OK id={id} more=0"));
+    assert_eq!(value(&lines[3], "seq"), "6");
+
+    // A day later, 3 and 4 have expired.
+    h.clock.advance(DAY * 2);
+    assert_eq!(h.hub.expire_now().await.unwrap(), 2);
+    assert_eq!(stored(&h, "#general")[0], format!("5 {ALICE} MSG"));
+}
+
+#[tokio::test]
+async fn the_shorter_period_applies() {
+    let day = |n: u32| start().checked_sub(DAY * n).unwrap();
+    let days = |n: u32| RoomRetention::Days(std::num::NonZeroU32::new(n).unwrap());
+    let prepare = |s: &SqliteStore| {
+        for room in ["#general", "#short"] {
+            put_at(s, room, ALICE, msg("old"), day(20));
+            put_at(s, room, ALICE, msg("older"), day(8));
+            put_at(s, room, ALICE, msg("new"), day(1));
+        }
+        put_at(
+            s,
+            "#short",
+            ALICE,
+            EventKind::Set(RoomSetting::Retention(days(7))),
+            day(1),
+        );
+        put_at(
+            s,
+            "#general",
+            ALICE,
+            EventKind::Set(RoomSetting::Retention(days(60))),
+            day(1),
+        );
+    };
+    // The server keeps 10 days: #short keeps 7, #general 10.
+    let h = Harness::with(with_retention("10"), prepare);
+    assert_eq!(h.hub.expire_now().await.unwrap(), 3);
+    assert_eq!(stored(&h, "#general").len(), 3);
+    assert_eq!(stored(&h, "#short").len(), 2);
+
+    // Forever: only the room's own period applies.
+    let h = Harness::with(with_retention("forever"), prepare);
+    assert_eq!(h.hub.expire_now().await.unwrap(), 2);
+    assert_eq!(stored(&h, "#general").len(), 4);
+    assert_eq!(stored(&h, "#short").len(), 2);
+}
+
+#[tokio::test]
+async fn nothing_expires_forever() {
+    let h = Harness::with(with_retention("forever"), |s| {
+        put_at(
+            s,
+            "#general",
+            ALICE,
+            msg("old"),
+            Timestamp::from_unix_millis(0).unwrap(),
+        );
+    });
+    assert_eq!(h.hub.expire_now().await.unwrap(), 0);
+    assert_eq!(stored(&h, "#general").len(), 1);
+}
+
+#[tokio::test]
+async fn a_shortened_period_applies_at_the_next_run() {
+    let h = Harness::with(with_retention("30"), |s| {
+        put(s, "#general", ALICE, msg("hi"));
+    });
+    h.clock.advance(DAY * 2);
+    assert_eq!(h.hub.expire_now().await.unwrap(), 0);
+    // As ADMIN SET retention 1 (10.6) would.
+    let one = risala_proto::types::ServerRetention::Days(std::num::NonZeroU32::new(1).unwrap());
+    h.hub.inner.settings.write().unwrap().retention = one;
+    assert_eq!(h.hub.expire_now().await.unwrap(), 1);
+
+    // And SET of a room's retention, under the room's lock (6.2).
+    let h = Harness::with(with_retention("30"), |s| {
+        put(s, "#general", ALICE, msg("hi"));
+    });
+    h.clock.advance(DAY * 2);
+    let entry = h
+        .hub
+        .inner
+        .room_entry(&"#general".parse().unwrap())
+        .unwrap();
+    let mut st = entry.lock().await;
+    st.room_info_mut().unwrap().settings.retention =
+        RoomRetention::Days(std::num::NonZeroU32::new(1).unwrap());
+    assert_eq!(h.hub.inner.expire_conv(&st).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn expiry_comes_in_batches() {
+    let h = Harness::with(with_retention("1"), |s| {
+        s.set_durable(false).unwrap();
+        for n in 0..1200 {
+            put(s, "#general", ALICE, msg(&n.to_string()));
+        }
+        put_at(
+            s,
+            "#general",
+            ALICE,
+            msg("new"),
+            start().checked_add(DAY * 2).unwrap(),
+        );
+    });
+    h.clock.advance(DAY + Duration::from_millis(1));
+    assert_eq!(h.hub.expire_now().await.unwrap(), 1200);
+    assert_eq!(stored(&h, "#general"), [format!("1201 {ALICE} MSG")]);
 }
 
 // ---------------------------------------------------------------------------
