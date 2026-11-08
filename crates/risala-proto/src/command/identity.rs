@@ -5,11 +5,12 @@ use std::fmt;
 use std::str::FromStr;
 
 use super::Command;
-use crate::binary::PairData;
+use crate::binary::{EncodedRecords, PairData};
 use crate::error::ParseError;
 use crate::line::{LineBuilder, Params};
-use crate::names::{Id, PairId};
+use crate::names::{BlobRef, Id, PairId};
 use crate::parse::{last, options, subcommand, tok, unknown_subcommand};
+use crate::record::{Record, RecordError, decode_records};
 
 /// The token that resumes a guest session (4.2), as GUEST carries it: an
 /// [`Id`] that is a secret. Its `Debug` output leaves the token out, so
@@ -41,6 +42,65 @@ impl FromStr for GuestToken {
 impl From<Id> for GuestToken {
     fn from(id: Id) -> GuestToken {
         GuestToken(id)
+    }
+}
+
+/// The `<records>` of KEYS PUT (4.7): the records, encoded as for
+/// REGISTER (a version byte and `Record records<V>`) in base64, or a
+/// blob-ref naming a blob that holds the same bytes without base64
+/// (12.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeysPutRecords {
+    /// The records in base64.
+    Inline(EncodedRecords),
+    /// A blob that holds them.
+    Blob(BlobRef),
+}
+
+impl KeysPutRecords {
+    /// The records of [`Inline`](KeysPutRecords::Inline), decoded; `None`
+    /// for a blob, whose bytes the server fetches and decodes with
+    /// [`decode_records`].
+    pub fn inline_records(&self) -> Option<Result<Vec<Record>, RecordError>> {
+        match self {
+            KeysPutRecords::Inline(records) => Some(decode_records(&records.decode())),
+            KeysPutRecords::Blob(_) => None,
+        }
+    }
+}
+
+impl FromStr for KeysPutRecords {
+    type Err = ParseError;
+
+    /// A blob-ref if it starts with `sha384:` in any case, which base64
+    /// never does, and base64 otherwise.
+    fn from_str(s: &str) -> Result<KeysPutRecords, ParseError> {
+        let blob = s
+            .get(..BlobRef::PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(BlobRef::PREFIX));
+        if blob {
+            s.parse().map(KeysPutRecords::Blob)
+        } else {
+            s.parse().map(KeysPutRecords::Inline)
+        }
+    }
+}
+
+impl fmt::Display for KeysPutRecords {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeysPutRecords::Inline(records) => fmt::Display::fmt(records, f),
+            KeysPutRecords::Blob(blob) => fmt::Display::fmt(blob, f),
+        }
+    }
+}
+
+/// Reads KEYS PUT's `<after>`: `-`, or a blob-ref.
+fn parse_after(s: &str) -> Result<Option<BlobRef>, ParseError> {
+    if s == "-" {
+        Ok(None)
+    } else {
+        s.parse().map(Some)
     }
 }
 
@@ -104,7 +164,11 @@ pub(super) fn parse(verb: &str, p: Params<'_>) -> Option<Result<Command, ParseEr
             })
         },
         "KEYS" => |mut p: Params<'_>| match subcommand(&mut p)?.as_str() {
-            "PUT" => Ok(Command::KeysPut { records: last(p)? }),
+            "PUT" => {
+                let after = parse_after(p.token()?)?;
+                let records = last(p)?;
+                Ok(Command::KeysPut { after, records })
+            }
             word => Err(unknown_subcommand("KEYS", word)),
         },
         "PAIR" => |mut p: Params<'_>| {
@@ -147,8 +211,13 @@ pub(super) fn write(command: &Command, b: &mut LineBuilder) -> bool {
         } => {
             b.token(name).token(records).token(signature);
         }
-        Command::KeysPut { records } => {
-            b.token("PUT").token(records);
+        Command::KeysPut { after, records } => {
+            b.token("PUT");
+            match after {
+                Some(after) => b.token(after),
+                None => b.token("-"),
+            };
+            b.token(records);
         }
         Command::Pair(PairCommand::Put { id, data }) => {
             b.token("PUT").token(id).token(data);

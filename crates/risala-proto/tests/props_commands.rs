@@ -135,7 +135,11 @@ fn command() -> impl Strategy<Value = String> {
         (name(), opt("token", id())).prop_map(|(n, t)| format!("GUEST {n}{t}")),
         (identity(), fixed(2420)).prop_map(|(i, s)| format!("AUTH {i} {s}")),
         (name(), data(), fixed(2420)).prop_map(|(n, k, s)| format!("REGISTER {n} {k} {s}")),
-        data().prop_map(|k| format!("KEYS PUT {k}")),
+        (
+            prop_oneof![Just("-".to_owned()), blob_ref()],
+            prop_oneof![data(), blob_ref()]
+        )
+            .prop_map(|(a, k)| format!("KEYS PUT {a} {k}")),
         (boxname(), data()).prop_map(|(i, d)| format!("PAIR PUT {i} {d}")),
         boxname().prop_map(|i| format!("PAIR GET {i}")),
         uid().prop_map(|u| format!("UNREGISTER {u}")),

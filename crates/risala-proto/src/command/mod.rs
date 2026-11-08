@@ -100,7 +100,7 @@ pub mod mailbox;
 
 pub use account::{BackupCommand, BlobPermit, KeyPkgCommand, PushCommand, WelcomeCommand};
 pub use admin::{AdminCommand, DropTarget};
-pub use identity::{GuestToken, PairCommand};
+pub use identity::{GuestToken, KeysPutRecords, PairCommand};
 pub use mailbox::{CreateForm, PublicRoom};
 
 // ---------------------------------------------------------------------------
@@ -280,11 +280,16 @@ pub enum Command {
         /// The sign-in signature, made with the `device` record's key.
         signature: Signature,
     },
-    /// `KEYS PUT <keyfile>`: updates an identity's records on this
-    /// server (4.7). Replies with RECORD lines.
+    /// `KEYS PUT <after> <records>`: adds records to an identity's chain
+    /// on this server (4.7). Replies with RECORD lines. Allowed on new,
+    /// anonymous and signed-in connections, since records are signed.
     KeysPut {
-        /// The identity's whole chain of records.
-        records: EncodedRecords,
+        /// `<after>`: the hash of the record the first of `records`
+        /// follows, or `None` for `-`, when they start with the chain's
+        /// first record.
+        after: Option<BlobRef>,
+        /// `<records>`: the records, inline or as a blob.
+        records: KeysPutRecords,
     },
 
     // ---- 4.8

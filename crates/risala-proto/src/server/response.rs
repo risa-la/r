@@ -11,6 +11,7 @@ use crate::error::{ErrorCode, ParseError};
 use crate::line::{LineBuilder, Params, Tags, is_token};
 use crate::names::{BoxName, Id, Seq, Uid};
 use crate::parse::{bad, limit, tag_value, tok};
+use crate::record::LogKey;
 use crate::types::{FileUrl, MAX_WELCOME, Retention, parse_u64, parse_yes_no, yes_no};
 
 /// Parses the lines of this module; `None` for any other verb.
@@ -545,6 +546,15 @@ impl OkResponse {
         self.typed("log", str::parse)
     }
 
+    /// `log-key=`: the signed-note verifier key of the server's current
+    /// key log, from INFO (4.4, 8.5). REGISTER's `master` record names
+    /// this log (4.7).
+    pub fn log_key(&self) -> Result<Option<LogKey>, ParseError> {
+        self.typed("log-key", |v| {
+            LogKey::from_vkey(v).map_err(|_| bad("log-key is a key log's verifier key"))
+        })
+    }
+
     /// `retention=`: the retention period in days, from INFO (7.5, 8.5).
     pub fn retention(&self) -> Result<Option<Retention>, ParseError> {
         self.typed("retention", str::parse)
@@ -696,6 +706,11 @@ impl OkResponse {
     /// Sets `log=`.
     pub fn with_log(self, log: &Log) -> OkResponse {
         self.with("log", log)
+    }
+
+    /// Sets `log-key=`.
+    pub fn with_log_key(self, log: &LogKey) -> OkResponse {
+        self.with("log-key", log.vkey())
     }
 
     /// Sets `retention=`.
