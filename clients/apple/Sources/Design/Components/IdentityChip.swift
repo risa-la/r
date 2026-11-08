@@ -76,3 +76,23 @@ struct IdentityChip: View {
         Int(tint.magnitude % UInt(tints.count))
     }
 }
+
+/// The person's identities, overlapping in the order given, the first in front, each
+/// ringed in `ring` so the edges read.
+struct IdentityStack: View {
+    let identities: [Identity]
+    let size: IdentityChip.Size
+    let ring: Color
+
+    var body: some View {
+        HStack(spacing: size == .window ? -8 : -7) {
+            ForEach(Array(identities.enumerated()), id: \.element.id) { index, identity in
+                IdentityChip(identity: identity, size: size)
+                    .background(Circle().fill(ring).padding(-2))
+                    .zIndex(Double(identities.count - index))
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(identities.map(\.name).formatted(.list(type: .and))))
+    }
+}

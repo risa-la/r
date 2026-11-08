@@ -213,6 +213,44 @@ struct CountBlock: View {
     }
 }
 
+/// `@` in bold when something mentions you, else the unread count; nothing when
+/// neither. A lighter mark than `CountBlock`, for results and tabs.
+struct UnreadMark: View {
+    let mentions: Int
+    let unread: Int
+    /// What VoiceOver says for the count, such as "3 unread chats".
+    let unreadLabel: Text
+
+    var body: some View {
+        if mentions > 0 {
+            Text(verbatim: "@").fontWeight(.bold).foregroundStyle(.mention)
+                .accessibilityLabel(Text("\(mentions) mentions"))
+        } else if unread > 0 {
+            Text(count: unread)
+                .fontWeight(.bold).foregroundStyle(.ink)
+                .monospacedDigit()
+                .fixedSize()
+                .accessibilityLabel(unreadLabel)
+        }
+    }
+}
+
+/// The context menu item that adds a chat or a space to the favourites, or removes it.
+struct FavouriteButton: View {
+    let isFavourite: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            if isFavourite {
+                Label("Remove from favourites", systemImage: "star.slash")
+            } else {
+                Label("Add to favourites", systemImage: "star")
+            }
+        }
+    }
+}
+
 /// How long ago something happened, in a row's time column: `now`, `2m`, `1h`, `4d`,
 /// `1w`, `11mo`, `2y`, in the person's language.
 enum ChatTime {

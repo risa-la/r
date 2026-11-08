@@ -41,7 +41,7 @@ struct ModeBar: View {
                     ShortcutHint(text: shortcut)
                         .transition(.opacity)
                 } else {
-                    chips
+                    IdentityStack(identities: identities, size: .large, ring: .panel)
                         .transition(.opacity)
                 }
             }
@@ -110,20 +110,6 @@ struct ModeBar: View {
             }
             .buttonStyle(.plain)
         }
-    }
-
-    /// Overlapping chips, the main identity in front.
-    private var chips: some View {
-        HStack(spacing: -7) {
-            ForEach(Array(identities.enumerated()), id: \.element.id) { index, identity in
-                IdentityChip(identity: identity, isLarge: true)
-                    .background(Circle().fill(.panel).padding(-2))
-                    .zIndex(Double(identities.count - index))
-            }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(
-            Text(identities.map(\.name).formatted(.list(type: .and))))
     }
 }
 

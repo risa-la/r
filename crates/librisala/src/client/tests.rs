@@ -1371,6 +1371,13 @@ fn names(items: &[ChatSummary]) -> Vec<String> {
     items.iter().map(|c| c.conversation.clone()).collect()
 }
 
+fn counts(unread_chats: u64, total: u64) -> ChatCounts {
+    ChatCounts {
+        unread_chats,
+        total,
+    }
+}
+
 #[tokio::test]
 async fn the_chat_list_spans_accounts_newest_first() {
     let client = Client::open_in_memory(ClientOptions::default()).unwrap();
@@ -1418,13 +1425,7 @@ async fn the_chat_list_spans_accounts_newest_first() {
     assert_eq!((last.delivery, rust.unread), (Delivery::Sent, 1));
     // A guest is at home where it is.
     assert!(items[1].home_server);
-    assert_eq!(
-        list.counts(),
-        ChatCounts {
-            unread_chats: 2,
-            total: 2
-        }
-    );
+    assert_eq!(list.counts(), counts(2, 2));
 
     // A new message moves its row to the top: a remove and an insert.
     store_events(
@@ -1492,13 +1493,7 @@ async fn the_chat_list_spans_accounts_newest_first() {
         [ChatListDiff::Reset { items }] => assert_eq!(names(items), ["#general"]),
         other => panic!("{other:?}"),
     }
-    assert_eq!(
-        batch.counts,
-        ChatCounts {
-            unread_chats: 1,
-            total: 1
-        }
-    );
+    assert_eq!(batch.counts, counts(1, 1));
     assert!(matches!(
         sam.conversation("#nowhere").unwrap().set_favourite(true),
         Err(ClientError::NotJoined(_))
@@ -1536,13 +1531,7 @@ async fn the_chat_list_spans_accounts_newest_first() {
             10,
         )
         .unwrap();
-    assert_eq!(
-        unread.counts(),
-        ChatCounts {
-            unread_chats: 2,
-            total: 2
-        }
-    );
+    assert_eq!(unread.counts(), counts(2, 2));
     alice
         .conversation("#rust")
         .unwrap()
@@ -1551,13 +1540,7 @@ async fn the_chat_list_spans_accounts_newest_first() {
         .unwrap();
     let batch = next_chats(&unread).await;
     assert_eq!(batch.diffs, [ChatListDiff::Remove { index: 0 }]);
-    assert_eq!(
-        batch.counts,
-        ChatCounts {
-            unread_chats: 1,
-            total: 1
-        }
-    );
+    assert_eq!(batch.counts, counts(1, 1));
 
     // A removed account's conversations leave.
     client.remove_account(&alice).await.unwrap();

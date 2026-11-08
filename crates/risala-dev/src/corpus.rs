@@ -17,135 +17,48 @@ pub enum Lang {
 
 /// Hosted identities in `busy`: their names and display names. An empty
 /// display name means none, so apps show the uid.
+#[rustfmt::skip]
 pub const HOSTED: &[(&str, &str)] = &[
-    ("aisha", "عائشة المنصوري"),
-    ("omar", "Omar Farouk"),
-    ("layla", "Layla | ليلى"),
-    ("yusuf", "يوسف"),
-    ("sara", "Sara Lindqvist"),
-    ("khalid", "Khalid Al-Hammadi"),
-    ("mariam", "مريم"),
-    ("release-bot", "Release Bot"),
-    ("hamad", "حمد بن راشد"),
-    ("noura", "Noura N."),
-    ("tariq", "Tariq"),
-    ("fatima", "فاطمة الزهراء"),
-    ("james", "James O'Connor"),
-    ("mei", "Mei Chen"),
-    ("zayd", "Zayd 🚲"),
-    ("hessa", "حصة"),
-    ("ali", "علي"),
-    ("priya", "Priya Raman"),
-    ("salem", "Salem"),
-    ("reem", "Reem الريم"),
-    ("idris", ""),
-    ("lucas", "Lucas Moreau"),
-    ("amna", "آمنة"),
-    (
-        "muhammad.s",
-        "Muhammad Abdulrahman Al-Suwaidi bin Khalifa, Head of Community Partnerships (Dubai)",
-    ),
-    (
-        "abdulrahman",
-        "عبد الرحمن بن عبد العزيز آل محمد، منسق الفعاليات والشراكات",
-    ),
-    ("hind", "Hind (mod)"),
-    ("nasser", "ناصر"),
-    ("chloe", "Chloé Dubois"),
+    ("aisha", "عائشة المنصوري"), ("omar", "Omar Farouk"), ("layla", "Layla | ليلى"),
+    ("yusuf", "يوسف"), ("sara", "Sara Lindqvist"), ("khalid", "Khalid Al-Hammadi"),
+    ("mariam", "مريم"), ("release-bot", "Release Bot"), ("hamad", "حمد بن راشد"),
+    ("noura", "Noura N."), ("tariq", "Tariq"), ("fatima", "فاطمة الزهراء"),
+    ("james", "James O'Connor"), ("mei", "Mei Chen"), ("zayd", "Zayd 🚲"), ("hessa", "حصة"),
+    ("ali", "علي"), ("priya", "Priya Raman"), ("salem", "Salem"), ("reem", "Reem الريم"),
+    ("idris", ""), ("lucas", "Lucas Moreau"), ("amna", "آمنة"),
+    ("muhammad.s",
+        "Muhammad Abdulrahman Al-Suwaidi bin Khalifa, Head of Community Partnerships (Dubai)"),
+    ("abdulrahman", "عبد الرحمن بن عبد العزيز آل محمد، منسق الفعاليات والشراكات"),
+    ("hind", "Hind (mod)"), ("nasser", "ناصر"), ("chloe", "Chloé Dubois"),
 ];
 
 /// Guests in `busy`, without the `~`.
+#[rustfmt::skip]
 pub const GUESTS: &[(&str, &str)] = &[
-    ("sam", "Sam"),
-    ("visitor", "زائر"),
-    ("anon42", ""),
-    ("lina", "Lina"),
-    ("ahmed", "أحمد"),
-    ("kai", "Kai"),
-    ("mo", "Mo ✨"),
-    ("dana", "دانة"),
-    ("tom", "Tom"),
-    ("q", ""),
+    ("sam", "Sam"), ("visitor", "زائر"), ("anon42", ""), ("lina", "Lina"), ("ahmed", "أحمد"),
+    ("kai", "Kai"), ("mo", "Mo ✨"), ("dana", "دانة"), ("tom", "Tom"), ("q", ""),
 ];
 
 /// First names for the people of `huge`, with a display name each.
+#[rustfmt::skip]
 pub const FIRST_NAMES: &[(&str, &str)] = &[
-    ("adam", "Adam"),
-    ("amal", "أمل"),
-    ("bilal", "Bilal"),
-    ("dalia", "داليا"),
-    ("elias", "Elias"),
-    ("farah", "فرح"),
-    ("ghada", "غادة"),
-    ("hana", "Hana"),
-    ("ibrahim", "إبراهيم"),
-    ("jana", "Jana"),
-    ("karim", "كريم"),
-    ("lamia", "Lamia"),
-    ("majid", "ماجد"),
-    ("nadia", "Nadia"),
-    ("osama", "أسامة"),
-    ("rana", "Rana"),
-    ("sami", "سامي"),
-    ("talal", "Talal"),
-    ("wafa", "وفاء"),
-    ("yasmin", "Yasmin"),
-    ("ziad", "زياد"),
-    ("anna", "Anna"),
-    ("ben", "Ben"),
-    ("clara", "Clara"),
-    ("david", "David"),
-    ("eva", "Eva"),
-    ("felix", "Felix"),
-    ("grace", "Grace"),
-    ("henry", "Henry"),
+    ("adam", "Adam"), ("amal", "أمل"), ("bilal", "Bilal"), ("dalia", "داليا"), ("elias", "Elias"),
+    ("farah", "فرح"), ("ghada", "غادة"), ("hana", "Hana"), ("ibrahim", "إبراهيم"),
+    ("jana", "Jana"), ("karim", "كريم"), ("lamia", "Lamia"), ("majid", "ماجد"), ("nadia", "Nadia"),
+    ("osama", "أسامة"), ("rana", "Rana"), ("sami", "سامي"), ("talal", "Talal"), ("wafa", "وفاء"),
+    ("yasmin", "Yasmin"), ("ziad", "زياد"), ("anna", "Anna"), ("ben", "Ben"), ("clara", "Clara"),
+    ("david", "David"), ("eva", "Eva"), ("felix", "Felix"), ("grace", "Grace"), ("henry", "Henry"),
     ("iris", "Iris"),
 ];
 
 /// Words that make the names and topics of `huge`'s rooms.
+#[rustfmt::skip]
 pub const ROOM_WORDS: &[&str] = &[
-    "amber",
-    "atlas",
-    "basil",
-    "cedar",
-    "coral",
-    "delta",
-    "dune",
-    "ember",
-    "falcon",
-    "fennel",
-    "garnet",
-    "harbor",
-    "indigo",
-    "jasmine",
-    "juniper",
-    "kestrel",
-    "lagoon",
-    "lantern",
-    "maple",
-    "meadow",
-    "mint",
-    "nomad",
-    "oasis",
-    "olive",
-    "orbit",
-    "palm",
-    "pearl",
-    "pepper",
-    "quartz",
-    "raven",
-    "saffron",
-    "sage",
-    "sandstone",
-    "sumac",
-    "thyme",
-    "tide",
-    "umber",
-    "violet",
-    "wadi",
-    "willow",
-    "zaatar",
-    "zenith",
+    "amber", "atlas", "basil", "cedar", "coral", "delta", "dune", "ember", "falcon", "fennel",
+    "garnet", "harbor", "indigo", "jasmine", "juniper", "kestrel", "lagoon", "lantern", "maple",
+    "meadow", "mint", "nomad", "oasis", "olive", "orbit", "palm", "pearl", "pepper", "quartz",
+    "raven", "saffron", "sage", "sandstone", "sumac", "thyme", "tide", "umber", "violet", "wadi",
+    "willow", "zaatar", "zenith",
 ];
 
 /// What `huge`'s rooms are for.
@@ -373,21 +286,16 @@ pub fn line(rng: &mut Rng, lang: Lang) -> String {
 /// paragraphs in both. `paragraphs` may be more than there are; they then
 /// repeat, which makes messages of several thousand bytes.
 pub fn long_message(rng: &mut Rng, lang: Lang, paragraphs: usize) -> String {
-    let mut out = Vec::new();
-    for i in 0..paragraphs {
-        let set = match lang {
-            Lang::En => LONG_EN,
-            Lang::Ar => LONG_AR,
-            Lang::Mix => {
-                if rng.chance(0.5) {
-                    LONG_EN
-                } else {
-                    LONG_AR
-                }
-            }
-        };
-        out.push(set[i % set.len()]);
-    }
+    let out: Vec<&str> = (0..paragraphs)
+        .map(|i| {
+            let set = match lang {
+                Lang::En => LONG_EN,
+                Lang::Mix if rng.chance(0.5) => LONG_EN,
+                Lang::Ar | Lang::Mix => LONG_AR,
+            };
+            set[i % set.len()]
+        })
+        .collect();
     out.join("\n\n")
 }
 
@@ -397,17 +305,9 @@ pub fn edited(rng: &mut Rng, lang: Lang, old: &str) -> String {
         Lang::Ar => *rng.pick(&[" (تصحيح)", "، أقصد الخميس", " 🙏"]),
         _ => *rng.pick(&[" (fixed)", ", I mean Thursday", " — sorry, typo", "!"]),
     };
-    let mut text = old.trim_end().to_owned();
+    let old = old.trim_end();
     // Keep an edit of a long message within a line's limits.
-    if text.len() > 3000 {
-        let mut cut = 3000;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        text.truncate(cut);
-    }
-    text.push_str(fix);
-    text
+    old[..old.floor_char_boundary(3000)].to_owned() + fix
 }
 
 #[cfg(test)]

@@ -6,9 +6,6 @@ import SwiftUI
 struct SpaceTabs: View {
     let spaces: Spaces
     @Binding var selection: Space.ID?
-    /// Counts for `all`: chats with unread messages, and unread mentions.
-    let allUnread: Int
-    let allMentions: Int
     let showAll: () -> Void
     let toggleFavourite: (Space) -> Void
     /// Room above and below the strip; by default, what the platform's tabs need.
@@ -140,15 +137,17 @@ struct SpaceTabs: View {
     }
 
     private var allTab: some View {
-        tabButton(isSelected: selection == nil) {
+        let unreadChats = spaces.spaces.reduce(0) { $0 + $1.unreadChats }
+        let mentions = spaces.spaces.reduce(0) { $0 + $1.mentions }
+        return tabButton(isSelected: selection == nil) {
             selection = nil
         } label: {
             HStack(spacing: 6) {
                 Text("all")
-                counts(unreadChats: allUnread, mentions: allMentions)
+                counts(unreadChats: unreadChats, mentions: mentions)
             }
         }
-        .accessibilityValue(countsValue(unreadChats: allUnread, mentions: allMentions))
+        .accessibilityValue(countsValue(unreadChats: unreadChats, mentions: mentions))
     }
 
     private func tab(_ space: Space) -> some View {
@@ -172,33 +171,15 @@ struct SpaceTabs: View {
             if isVisible { visible.insert(space.id) } else { visible.remove(space.id) }
         }
         .contextMenu {
-            Button {
-                toggleFavourite(space)
-            } label: {
-                if space.isFavourite {
-                    Label("Remove from favourites", systemImage: "star.slash")
-                } else {
-                    Label("Add to favourites", systemImage: "star")
-                }
-            }
+            FavouriteButton(isFavourite: space.isFavourite) { toggleFavourite(space) }
         }
         .accessibilityValue(tabValue(space))
     }
 
-    /// `@` when something mentions you, else the count of chats with unread messages.
     /// Hidden from VoiceOver, which reads `countsValue` instead.
-    @ViewBuilder
     private func counts(unreadChats: Int, mentions: Int) -> some View {
-        Group {
-            if mentions > 0 {
-                Text(verbatim: "@").foregroundStyle(.mention).fontWeight(.bold)
-            } else if unreadChats > 0 {
-                Text(count: unreadChats)
-                    .foregroundStyle(.ink).fontWeight(.bold)
-                    .monospacedDigit()
-            }
-        }
-        .accessibilityHidden(true)
+        UnreadMark(mentions: mentions, unread: unreadChats, unreadLabel: Text(verbatim: ""))
+            .accessibilityHidden(true)
     }
 
     /// What `counts` shows, in words: VoiceOver reads a bare `@` as "at".

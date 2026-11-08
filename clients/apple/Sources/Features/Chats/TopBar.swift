@@ -12,18 +12,17 @@ struct TopBar: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            IdentityStack(identities: model.spaces.identities.sorted { $0.isMain && !$1.isMain })
+            // Each ringed in the window's surface so the edges read.
+            IdentityStack(
+                identities: model.spaces.identities.sorted { $0.isMain && !$1.isMain },
+                size: .window, ring: .surface
+            )
+            .fixedSize()
             // Empty states show no tabs.
             if !model.hasNoChats, model.state != .disconnected {
                 SpaceTabs(
-                    spaces: model.spaces,
-                    selection: $model.filter.space,
-                    allUnread: model.spaces.spaces.reduce(0) { $0 + $1.unreadChats },
-                    allMentions: model.spaces.spaces.reduce(0) { $0 + $1.mentions },
-                    showAll: showAll,
-                    toggleFavourite: { space in
-                        Task { await model.setFavourite(!space.isFavourite, space: space) }
-                    },
+                    spaces: model.spaces, selection: $model.filter.space, showAll: showAll,
+                    toggleFavourite: model.toggleFavourite,
                     // The bar sets its own height.
                     verticalPadding: 0,
                     pinsEverySpaceTab: true
@@ -35,24 +34,5 @@ struct TopBar: View {
         .padding(.leading, 32 + leadingInset)
         .padding(.trailing, 4)
         .frame(minHeight: height)
-    }
-}
-
-/// The person's identities, overlapping, the main identity in front, each ringed in
-/// the window's surface so the edges read.
-private struct IdentityStack: View {
-    let identities: [Identity]
-
-    var body: some View {
-        HStack(spacing: -8) {
-            ForEach(Array(identities.enumerated()), id: \.element.id) { index, identity in
-                IdentityChip(identity: identity, size: .window)
-                    .background(Circle().fill(.surface).padding(-2))
-                    .zIndex(Double(identities.count - index))
-            }
-        }
-        .fixedSize()
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(identities.map(\.name).formatted(.list(type: .and))))
     }
 }

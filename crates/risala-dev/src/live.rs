@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 
 use risala_proto::command::Command;
 use risala_proto::names::{Conv, Room, Seq};
-use risala_proto::text::escape;
 use risala_proto::types::Relation;
 use risala_server::testing::TestServer;
 
-use crate::actors::Pool;
+use crate::actors::{Pool, part};
 use crate::corpus;
 use crate::plan::{ME, Pid, Plan};
 use crate::rng::Rng;
@@ -128,11 +127,7 @@ pub async fn run(
             }
         });
         for (g, r) in leaving {
-            let part = Command::Part {
-                room: rooms[r].clone(),
-                reason: String::new(),
-            };
-            match pool.call(g, part).await {
+            match pool.call(g, part(&rooms[r])).await {
                 Ok(_) => counts.parts += 1,
                 Err(_) => counts.refused += 1,
             }
@@ -168,7 +163,7 @@ pub async fn run(
                     .is_ok()
                 {
                     counts.joins += 1;
-                    let msg = message(&mut pool, conv, corpus::line(&mut rng, lang), None);
+                    let msg = pool.msg(conv, &corpus::line(&mut rng, lang), None);
                     if pool.call(g, msg).await.is_ok() {
                         counts.posts += 1;
                     }
@@ -206,7 +201,7 @@ pub async fn run(
             let p = &posted[i];
             let text = corpus::edited(&mut rng, plan.rooms[p.room].lang, &p.text);
             let conv = Conv::Room(rooms[p.room].clone());
-            let msg = message(&mut pool, conv, text, Some(Relation::Edit(p.seq)));
+            let msg = pool.msg(conv, &text, Some(Relation::Edit(p.seq)));
             let who = p.who;
             posted.remove(i);
             match pool.call(who, msg).await {
@@ -235,8 +230,8 @@ pub async fn run(
                 continue;
             }
             let who = *rng.pick(&others);
-            let emoji = (*rng.pick(corpus::REACTIONS)).to_owned();
-            let msg = message(&mut pool, conv, emoji, Some(Relation::React(target.seq)));
+            let emoji = rng.pick(corpus::REACTIONS);
+            let msg = pool.msg(conv, emoji, Some(Relation::React(target.seq)));
             match pool.call(who, msg).await {
                 Ok(_) => counts.reactions += 1,
                 Err(_) => counts.refused += 1,
@@ -260,7 +255,7 @@ pub async fn run(
         } else {
             corpus::line(&mut rng, lang)
         };
-        let msg = message(&mut pool, conv, text.clone(), reply.map(Relation::Reply));
+        let msg = pool.msg(conv, &text, reply.map(Relation::Reply));
         match pool.call(who, msg).await {
             Ok(ok) => {
                 if reply.is_some() {
@@ -284,22 +279,7 @@ pub async fn run(
         }
     }
     for (g, r, _) in visits {
-        let part = Command::Part {
-            room: rooms[r].clone(),
-            reason: String::new(),
-        };
-        let _ = pool.call(g, part).await;
+        let _ = pool.call(g, part(&rooms[r])).await;
     }
     pool.quit_all().await;
-}
-
-fn message(pool: &mut Pool<'_>, conv: Conv, text: String, relation: Option<Relation>) -> Command {
-    Command::Msg {
-        conv,
-        text: escape(&text),
-        relation,
-        file: None,
-        cid: Some(pool.cid()),
-        id: None,
-    }
 }

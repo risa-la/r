@@ -40,9 +40,8 @@ final class ChatsViewModel {
     static let retryDelays: [Duration] = [
         .seconds(1), .seconds(2), .seconds(4), .seconds(8), .seconds(16), .seconds(30),
     ]
-    /// What the command line shows with nothing typed, and at most.
+    /// What the command line shows with nothing typed.
     static let recentCount = 5
-    static let commandLimit = 8
     /// The chats one command line search reads; the library reads at most 200 at once.
     static let searchLimit = 200
     private static let logger = Logger(subsystem: "la.risa.apple", category: "chats")
@@ -273,28 +272,31 @@ final class ChatsViewModel {
         // Until a search returns, the rows shown stand in for every chat.
         commandItems = CommandItem.matches(
             command, chats: foundChats.isEmpty ? chats : foundChats, spaces: spaces.spaces,
-            recent: Self.recentCount, limit: Self.commandLimit)
+            recent: Self.recentCount)
     }
 
     // MARK: Favourites
 
-    func setFavourite(_ isFavourite: Bool, for chat: Chat) async {
-        guard let client else { return }
-        do {
-            try await client.setFavourite(isFavourite, for: chat.id)
-        } catch {
-            guard !(error is CancellationError) else { return }
-            Self.logger.error("favourite failed; code=\((error as NSError).code)")
-        }
+    /// Adds the chat to the favourites, or removes it; the change arrives through
+    /// `observe()`.
+    func toggleFavourite(_ chat: Chat) {
+        setFavourite { try await $0.setFavourite(!chat.isFavourite, for: chat.id) }
     }
 
-    func setFavourite(_ isFavourite: Bool, space: Space) async {
+    /// Adds the space to the favourites, or removes it; the change arrives through
+    /// `observeSpaces()`.
+    func toggleFavourite(_ space: Space) {
+        setFavourite { try await $0.setFavourite(!space.isFavourite, space: space.id) }
+    }
+
+    private func setFavourite(_ change: @escaping @Sendable (any ChatClient) async throws -> Void) {
         guard let client else { return }
-        do {
-            try await client.setFavourite(isFavourite, space: space.id)
-        } catch {
-            guard !(error is CancellationError) else { return }
-            Self.logger.error("favourite space failed; code=\((error as NSError).code)")
+        Task {
+            do {
+                try await change(client)
+            } catch {
+                Self.logger.error("favourite failed; code=\((error as NSError).code)")
+            }
         }
     }
 }

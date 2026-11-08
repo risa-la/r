@@ -26,11 +26,8 @@ pub enum Scenario {
 
 impl fmt::Display for Scenario {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Scenario::Empty => "empty",
-            Scenario::Busy => "busy",
-            Scenario::Huge => "huge",
-        })
+        use clap::ValueEnum as _;
+        f.write_str(self.to_possible_value().expect("not skipped").get_name())
     }
 }
 
@@ -39,12 +36,6 @@ pub type Pid = usize;
 
 /// The account the apps sign in as.
 pub const ME: Pid = 0;
-
-/// The account's name, under the identity domain.
-pub const ME_NAME: &str = "me";
-
-/// The account's display name.
-pub const ME_DISPLAY: &str = "Noor";
 
 /// One person in a scenario.
 #[derive(Debug, Clone)]
@@ -162,9 +153,10 @@ const DAY: u64 = 24 * HOUR;
 /// the same plan.
 pub fn build(scenario: Scenario, seed: u64) -> Plan {
     let mut plan = Plan {
+        // The account: `me` under the identity domain.
         people: vec![Person {
-            name: ME_NAME.to_owned(),
-            display: ME_DISPLAY.to_owned(),
+            name: "me".to_owned(),
+            display: "Noor".to_owned(),
             guest: false,
         }],
         rooms: Vec::new(),
@@ -196,22 +188,21 @@ pub fn build(scenario: Scenario, seed: u64) -> Plan {
     plan
 }
 
-/// What a room in `busy` is like.
-struct Spec {
-    name: &'static str,
-    lang: Lang,
-    /// Messages, edits and reactions not counted.
-    messages: usize,
-    unread: usize,
-    /// When its last message was, in minutes before the end.
-    last_min: u64,
-    /// Over how many days its messages are spread.
-    span_days: u64,
-    /// Identities in it besides the owner and the account.
-    members: usize,
-    guests: usize,
-    kind: Kind,
-}
+/// What a room in `busy` is like: name, lang, messages (edits and
+/// reactions not counted), unread, when its last message was (minutes
+/// before the end), over how many days its messages are spread, identities
+/// besides the owner and the account, guests, and kind.
+type Spec = (
+    &'static str,
+    Lang,
+    usize,
+    usize,
+    u64,
+    u64,
+    usize,
+    usize,
+    Kind,
+);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -228,77 +219,51 @@ enum Kind {
     LongTopic,
 }
 
-// A row of the table below, so its fields are its arguments.
-#[allow(clippy::too_many_arguments)]
-const fn spec(
-    name: &'static str,
-    lang: Lang,
-    messages: usize,
-    unread: usize,
-    last_min: u64,
-    span_days: u64,
-    members: usize,
-    guests: usize,
-    kind: Kind,
-) -> Spec {
-    Spec {
-        name,
-        lang,
-        messages,
-        unread,
-        last_min,
-        span_days,
-        members,
-        guests,
-        kind,
-    }
-}
-
 const H: u64 = 60;
 const D: u64 = 24 * H;
 
 #[rustfmt::skip]
 const BUSY: &[Spec] = &[
-    spec("#general", Lang::En, 180, 3, 4, 30, 14, 2, Kind::Plain),
-    spec("#majlis", Lang::Ar, 400, 27, 9, 35, 12, 2, Kind::Plain),
-    spec("#announcements", Lang::Mix, 24, 2, 5 * H, 40, 18, 0, Kind::Announcements),
-    spec("#random", Lang::En, 1300, 1200, 1, 21, 10, 3, Kind::Plain),
-    spec("#qahwa", Lang::Ar, 1080, 1000, 16, 20, 9, 2, Kind::Plain),
-    spec("#bugs", Lang::En, 1040, 999, 45, 25, 8, 1, Kind::Plain),
-    spec("#thursday-football", Lang::Mix, 290, 250, 2 * H, 18, 11, 1, Kind::Plain),
-    spec("#design-critique", Lang::En, 140, 100, 3 * H, 15, 7, 0, Kind::Plain),
-    spec("#release-train", Lang::En, 160, 101, 5 * H, 20, 6, 0, Kind::Plain),
-    spec("#arabic-typography", Lang::Mix, 120, 99, 8 * H, 30, 8, 1, Kind::Plain),
-    spec("#hackspace", Lang::En, 90, 48, 20 * H, 30, 9, 2, Kind::Plain),
-    spec("#iftar-planning", Lang::Ar, 60, 12, 26 * H, 10, 7, 1, Kind::Plain),
-    spec("#book-club", Lang::Mix, 70, 9, 30 * H, 25, 6, 0, Kind::Plain),
-    spec("#rust", Lang::En, 220, 5, 36 * H, 40, 10, 1, Kind::Plain),
-    spec("#family", Lang::Ar, 150, 1, 2 * H, 30, 5, 0, Kind::Plain),
-    spec("#a-room-whose-name-is-long-enough-to-need-truncating-everywhere", Lang::En, 15, 4, 50 * H, 5, 4, 0, Kind::LongTopic),
-    spec("#photography", Lang::En, 40, 0, 60 * H, 30, 6, 0, Kind::Plain),
-    spec("#dubai-meetup", Lang::Mix, 35, 0, 3 * D, 20, 8, 1, Kind::Plain),
-    spec("#quran-study", Lang::Ar, 50, 0, 4 * D, 30, 6, 0, Kind::Plain),
-    spec("#kitchen", Lang::En, 25, 0, 5 * D, 20, 4, 0, Kind::Plain),
-    spec("#travel", Lang::Mix, 30, 0, 6 * D, 25, 5, 1, Kind::Plain),
-    spec("#old-project", Lang::En, 20, 0, 41 * D, 10, 4, 0, Kind::Plain),
-    spec("#off-topic-heated", Lang::En, 60, 7, 2 * D, 6, 6, 1, Kind::Kicked),
-    spec("#new-room", Lang::En, 0, 0, 5 * H, 0, 3, 0, Kind::Plain),
-    spec("#quiet-corner", Lang::Ar, 0, 0, 9 * D, 0, 2, 0, Kind::Plain),
-    spec("#just-created", Lang::Mix, 0, 0, 20, 0, 1, 0, Kind::Plain),
-    spec("#long-reads", Lang::Mix, 12, 2, 7 * H, 6, 4, 0, Kind::Long),
-    spec("#edits-and-reactions", Lang::En, 50, 6, 4 * H, 2, 6, 0, Kind::Lively),
-    spec("#moderation-log", Lang::En, 40, 3, 11 * H, 5, 5, 1, Kind::Deletions),
-    spec("#gaming", Lang::En, 80, 15, 13 * H, 10, 6, 1, Kind::Plain),
-    spec("#music", Lang::Mix, 45, 0, 7 * D, 20, 5, 0, Kind::Plain),
-    spec("#ops-oncall", Lang::En, 200, 64, 30, 7, 5, 0, Kind::Plain),
-    spec("#translations", Lang::Mix, 90, 33, 6 * H, 15, 6, 1, Kind::Plain),
-    spec("#parents", Lang::Ar, 40, 2, 28 * H, 10, 5, 0, Kind::Plain),
-    spec("#climbing", Lang::En, 30, 0, 12 * D, 30, 4, 0, Kind::Plain),
-    spec("#garden", Lang::En, 18, 0, 15 * D, 25, 3, 0, Kind::Plain),
-    spec("#movies", Lang::Mix, 55, 11, 40 * H, 15, 6, 1, Kind::Plain),
-    spec("#jobs", Lang::En, 20, 0, 20 * D, 30, 5, 1, Kind::Plain),
-    spec("#neighbours", Lang::Ar, 75, 0, 2 * D, 30, 7, 0, Kind::Plain),
-    spec("#maktab", Lang::Ar, 110, 18, H, 10, 6, 0, Kind::Plain),
+    ("#general", Lang::En, 180, 3, 4, 30, 14, 2, Kind::Plain),
+    ("#majlis", Lang::Ar, 400, 27, 9, 35, 12, 2, Kind::Plain),
+    ("#announcements", Lang::Mix, 24, 2, 5 * H, 40, 18, 0, Kind::Announcements),
+    ("#random", Lang::En, 1300, 1200, 1, 21, 10, 3, Kind::Plain),
+    ("#qahwa", Lang::Ar, 1080, 1000, 16, 20, 9, 2, Kind::Plain),
+    ("#bugs", Lang::En, 1040, 999, 45, 25, 8, 1, Kind::Plain),
+    ("#thursday-football", Lang::Mix, 290, 250, 2 * H, 18, 11, 1, Kind::Plain),
+    ("#design-critique", Lang::En, 140, 100, 3 * H, 15, 7, 0, Kind::Plain),
+    ("#release-train", Lang::En, 160, 101, 5 * H, 20, 6, 0, Kind::Plain),
+    ("#arabic-typography", Lang::Mix, 120, 99, 8 * H, 30, 8, 1, Kind::Plain),
+    ("#hackspace", Lang::En, 90, 48, 20 * H, 30, 9, 2, Kind::Plain),
+    ("#iftar-planning", Lang::Ar, 60, 12, 26 * H, 10, 7, 1, Kind::Plain),
+    ("#book-club", Lang::Mix, 70, 9, 30 * H, 25, 6, 0, Kind::Plain),
+    ("#rust", Lang::En, 220, 5, 36 * H, 40, 10, 1, Kind::Plain),
+    ("#family", Lang::Ar, 150, 1, 2 * H, 30, 5, 0, Kind::Plain),
+    ("#a-room-whose-name-is-long-enough-to-need-truncating-everywhere", Lang::En, 15, 4, 50 * H, 5, 4, 0, Kind::LongTopic),
+    ("#photography", Lang::En, 40, 0, 60 * H, 30, 6, 0, Kind::Plain),
+    ("#dubai-meetup", Lang::Mix, 35, 0, 3 * D, 20, 8, 1, Kind::Plain),
+    ("#quran-study", Lang::Ar, 50, 0, 4 * D, 30, 6, 0, Kind::Plain),
+    ("#kitchen", Lang::En, 25, 0, 5 * D, 20, 4, 0, Kind::Plain),
+    ("#travel", Lang::Mix, 30, 0, 6 * D, 25, 5, 1, Kind::Plain),
+    ("#old-project", Lang::En, 20, 0, 41 * D, 10, 4, 0, Kind::Plain),
+    ("#off-topic-heated", Lang::En, 60, 7, 2 * D, 6, 6, 1, Kind::Kicked),
+    ("#new-room", Lang::En, 0, 0, 5 * H, 0, 3, 0, Kind::Plain),
+    ("#quiet-corner", Lang::Ar, 0, 0, 9 * D, 0, 2, 0, Kind::Plain),
+    ("#just-created", Lang::Mix, 0, 0, 20, 0, 1, 0, Kind::Plain),
+    ("#long-reads", Lang::Mix, 12, 2, 7 * H, 6, 4, 0, Kind::Long),
+    ("#edits-and-reactions", Lang::En, 50, 6, 4 * H, 2, 6, 0, Kind::Lively),
+    ("#moderation-log", Lang::En, 40, 3, 11 * H, 5, 5, 1, Kind::Deletions),
+    ("#gaming", Lang::En, 80, 15, 13 * H, 10, 6, 1, Kind::Plain),
+    ("#music", Lang::Mix, 45, 0, 7 * D, 20, 5, 0, Kind::Plain),
+    ("#ops-oncall", Lang::En, 200, 64, 30, 7, 5, 0, Kind::Plain),
+    ("#translations", Lang::Mix, 90, 33, 6 * H, 15, 6, 1, Kind::Plain),
+    ("#parents", Lang::Ar, 40, 2, 28 * H, 10, 5, 0, Kind::Plain),
+    ("#climbing", Lang::En, 30, 0, 12 * D, 30, 4, 0, Kind::Plain),
+    ("#garden", Lang::En, 18, 0, 15 * D, 25, 3, 0, Kind::Plain),
+    ("#movies", Lang::Mix, 55, 11, 40 * H, 15, 6, 1, Kind::Plain),
+    ("#jobs", Lang::En, 20, 0, 20 * D, 30, 5, 1, Kind::Plain),
+    ("#neighbours", Lang::Ar, 75, 0, 2 * D, 30, 7, 0, Kind::Plain),
+    ("#maktab", Lang::Ar, 110, 18, H, 10, 6, 0, Kind::Plain),
 ];
 
 fn busy(plan: &mut Plan, seed: u64) {
@@ -310,32 +275,35 @@ fn busy(plan: &mut Plan, seed: u64) {
         .iter()
         .map(|(name, display)| add_person(plan, name, display, true))
         .collect();
-    for (i, s) in BUSY.iter().enumerate() {
+    for (i, &(name, lang, messages, unread, last_min, span_days, n_members, n_guests, kind)) in
+        BUSY.iter().enumerate()
+    {
         let mut rng = Rng::stream(seed, 1000 + i as u64);
         let mut pool = hosted.clone();
         rng.shuffle(&mut pool);
         let owner = pool[0];
         let mut members = vec![owner, ME];
-        members.extend(pool[1..].iter().take(s.members));
+        members.extend(pool[1..].iter().take(n_members));
         let mut gs = guests.clone();
         rng.shuffle(&mut gs);
-        gs.truncate(s.guests);
+        gs.truncate(n_guests);
+        let lively = kind == Kind::Lively;
         let room = RoomShape {
-            name: s.name.to_owned(),
-            lang: s.lang,
+            name: name.to_owned(),
+            lang,
             members,
             guests: gs,
-            messages: s.messages,
-            unread: s.unread,
-            last: s.last_min * MIN + 2 * MIN,
-            span: (s.span_days * DAY).max(HOUR),
-            announcements: s.kind == Kind::Announcements,
-            kicked: s.kind == Kind::Kicked,
-            long: s.kind == Kind::Long,
-            long_topic: s.kind == Kind::LongTopic,
-            edit_rate: if s.kind == Kind::Lively { 0.25 } else { 0.04 },
-            react_rate: if s.kind == Kind::Lively { 0.7 } else { 0.12 },
-            delete_rate: if s.kind == Kind::Deletions { 0.3 } else { 0.02 },
+            messages,
+            unread,
+            last: last_min * MIN + 2 * MIN,
+            span: (span_days * DAY).max(HOUR),
+            announcements: kind == Kind::Announcements,
+            kicked: kind == Kind::Kicked,
+            long: kind == Kind::Long,
+            long_topic: kind == Kind::LongTopic,
+            edit_rate: if lively { 0.25 } else { 0.04 },
+            react_rate: if lively { 0.7 } else { 0.12 },
+            delete_rate: if kind == Kind::Deletions { 0.3 } else { 0.02 },
             topic: true,
         };
         add_room(plan, &mut rng, room);
@@ -348,21 +316,19 @@ const HUGE_GUESTS: usize = 20;
 const HUGE_ROOMS: usize = 3000;
 
 fn huge(plan: &mut Plan, seed: u64) {
-    let mut hosted = Vec::new();
-    for i in 0..HUGE_PEOPLE {
-        let (first, display) = corpus::FIRST_NAMES[i % corpus::FIRST_NAMES.len()];
-        let n = i / corpus::FIRST_NAMES.len();
-        let name = if n == 0 {
-            first.to_owned()
-        } else {
-            format!("{first}{n}")
-        };
-        hosted.push(add_person(plan, &name, display, false));
-    }
-    let mut guests = Vec::new();
-    for i in 0..HUGE_GUESTS {
-        guests.push(add_person(plan, &format!("guest{i}"), "", true));
-    }
+    let hosted: Vec<Pid> = (0..HUGE_PEOPLE)
+        .map(|i| {
+            let (first, display) = corpus::FIRST_NAMES[i % corpus::FIRST_NAMES.len()];
+            let name = match i / corpus::FIRST_NAMES.len() {
+                0 => first.to_owned(),
+                n => format!("{first}{n}"),
+            };
+            add_person(plan, &name, display, false)
+        })
+        .collect();
+    let guests: Vec<Pid> = (0..HUGE_GUESTS)
+        .map(|i| add_person(plan, &format!("guest{i}"), "", true))
+        .collect();
     let mut names = std::collections::HashSet::new();
     for i in 0..HUGE_ROOMS {
         let mut room_rng = Rng::stream(seed, 100_000 + i as u64);
@@ -464,13 +430,11 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
     let owner = s.members[0];
     let n = s.messages;
     let mut items: Vec<Item> = Vec::new();
-    let mut push = |ago: u64, who: Pid, act: Act| {
-        items.push(Item {
-            ago,
-            who,
-            room,
-            act,
-        })
+    let item = |ago: u64, who: Pid, act: Act| Item {
+        ago,
+        who,
+        room,
+        act,
     };
 
     // When each message is sent: gaps of seconds, minutes and hours,
@@ -495,23 +459,27 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
     let first = times.first().copied().unwrap_or(s.last);
     let created = first + rng.range(HOUR, 2 * DAY);
 
-    push(created, owner, Act::Create);
+    items.push(item(created, owner, Act::Create));
     if s.long_topic {
-        push(created - SEC, owner, Act::Topic(corpus::long_topic()));
+        items.push(item(created - SEC, owner, Act::Topic(corpus::long_topic())));
     } else if s.topic {
-        push(created - SEC, owner, Act::Topic(corpus::topic(rng, s.lang)));
+        items.push(item(
+            created - SEC,
+            owner,
+            Act::Topic(corpus::topic(rng, s.lang)),
+        ));
     }
     let mut posters = vec![owner];
     if s.announcements {
-        push(created - 2 * SEC, owner, Act::SendMods);
+        items.push(item(created - 2 * SEC, owner, Act::SendMods));
         if let Some(&m) = s.members.get(2) {
             // After everyone has joined (below), before the first message.
-            push(created - 55 * MIN, owner, Act::Mod(m));
+            items.push(item(created - 55 * MIN, owner, Act::Mod(m)));
             posters.push(m);
         }
     }
     for &m in &s.members[1..] {
-        push(created - rng.range(10 * SEC, 50 * MIN), m, Act::Join);
+        items.push(item(created - rng.range(10 * SEC, 50 * MIN), m, Act::Join));
     }
     if !s.announcements {
         posters = s.members.clone();
@@ -577,19 +545,17 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
         };
         authors[k] = who;
         texts[k] = text.clone();
-        push(times[k], who, Act::Msg { n: k, text, reply });
+        items.push(item(times[k], who, Act::Msg { n: k, text, reply }));
         // Deleted soon after, unless among the unread, so that the
         // count of unread stays as planned. The account is not around to
         // tidy up in a room it is kicked from.
         if k < tail && k + 1 < n && !(s.kicked && who == ME) && rng.chance(s.delete_rate) {
             deleted[k] = true;
-            push(
-                times[k]
-                    .saturating_sub(rng.range(20 * SEC, 5 * MIN))
-                    .max(SEC),
+            items.push(item(
+                before(times[k], rng.range(20 * SEC, 5 * MIN)),
                 who,
                 Act::Delete { target: k },
-            );
+            ));
         }
     }
     // Replies planned before a deletion was decided keep their target;
@@ -600,13 +566,11 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
         }
         if !(s.kicked && authors[k] == ME) && rng.chance(s.edit_rate) {
             let text = corpus::edited(rng, s.lang, &texts[k]);
-            push(
-                times[k]
-                    .saturating_sub(rng.range(30 * SEC, 10 * MIN))
-                    .max(SEC),
+            items.push(item(
+                before(times[k], rng.range(30 * SEC, 10 * MIN)),
                 authors[k],
                 Act::Edit { target: k, text },
-            );
+            ));
         }
         if rng.chance(s.react_rate) {
             for _ in 0..rng.range(1, 4) {
@@ -614,16 +578,14 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
                 if who == authors[k] || (who == ME && (k >= tail || s.kicked)) {
                     continue;
                 }
-                push(
-                    times[k]
-                        .saturating_sub(rng.range(10 * SEC, 30 * MIN))
-                        .max(SEC),
+                items.push(item(
+                    before(times[k], rng.range(10 * SEC, 30 * MIN)),
                     who,
                     Act::React {
                         target: k,
                         emoji: (*rng.pick(corpus::REACTIONS)).to_owned(),
                     },
-                );
+                ));
             }
         }
     }
@@ -643,26 +605,12 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
         let last = *steps.iter().min().expect("not empty");
         // After the room exists, before the guest's first step.
         let join = (first + rng.range(30 * SEC, 10 * MIN)).min(created - SEC);
-        items.push(Item {
-            ago: join,
-            who: g,
-            room,
-            act: Act::Join,
-        });
-        items.push(Item {
-            ago: last.saturating_sub(rng.range(MIN, 2 * HOUR)).max(SEC / 2),
-            who: g,
-            room,
-            act: Act::Part,
-        });
+        items.push(item(join, g, Act::Join));
+        let part = last.saturating_sub(rng.range(MIN, 2 * HOUR)).max(SEC / 2);
+        items.push(item(part, g, Act::Part));
     }
 
-    items.push(Item {
-        ago: 0,
-        who: ME,
-        room,
-        act: Act::Read,
-    });
+    items.push(item(0, ME, Act::Read));
 
     plan.rooms.push(RoomPlan {
         name: s.name,
@@ -675,6 +623,11 @@ fn add_room(plan: &mut Plan, rng: &mut Rng, s: RoomShape) {
         last: s.last,
     });
     plan.items.extend(items);
+}
+
+/// `by` before `t`, but not at or after the end.
+fn before(t: u64, by: u64) -> u64 {
+    t.saturating_sub(by).max(SEC)
 }
 
 #[cfg(test)]
@@ -807,17 +760,13 @@ mod tests {
             with_messages.len() < plan.rooms.len(),
             "no room without messages"
         );
-        assert!(plan.items.iter().any(|i| matches!(i.act, Act::Edit { .. })));
-        assert!(
-            plan.items
-                .iter()
-                .any(|i| matches!(i.act, Act::Delete { .. }))
-        );
-        assert!(
-            plan.items
-                .iter()
-                .any(|i| matches!(i.act, Act::React { .. }))
-        );
+        for wanted in [
+            |a: &Act| matches!(a, Act::Edit { .. }),
+            |a: &Act| matches!(a, Act::Delete { .. }),
+            |a: &Act| matches!(a, Act::React { .. }),
+        ] {
+            assert!(plan.items.iter().any(|i| wanted(&i.act)));
+        }
         assert!(plan.people.iter().any(|p| p.guest));
     }
 }

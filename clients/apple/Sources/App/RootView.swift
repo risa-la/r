@@ -27,7 +27,7 @@ struct RootView: View {
                 PanesView(
                     chats: chats, conversation: conversation, selection: selection,
                     isCommanding: $isCommanding, showsSpaces: $showsSpaces,
-                    isListHidden: $isListHidden)
+                    isListHidden: isListHidden, toggleList: toggleList)
             } else {
                 splitView
             }
@@ -72,11 +72,7 @@ struct RootView: View {
                 // Hudhud in the list column says it already.
                 Color.surface.ignoresSafeArea()
             } else {
-                ConversationView(
-                    model: conversation,
-                    placement: .screen(
-                        identity: conversation.chat.flatMap { chats.spaces.identity($0.identity) })
-                )
+                ConversationView(model: conversation, identity: identity)
             }
         }
     }
@@ -85,18 +81,23 @@ struct RootView: View {
         ChatCommandActions(
             findOrStart: {
                 if usesPanes, isListHidden { isListHidden = false }
-                withAnimation(motion) { isCommanding = true }
+                withAnimation(ChatsView.commandLineMotion(reduceMotion: reduceMotion)) {
+                    isCommanding = true
+                }
             },
-            toggleList: usesPanes
-                ? { withAnimation(reduceMotion ? nil : .snappy) { isListHidden.toggle() } } : nil,
+            toggleList: usesPanes ? { toggleList() } : nil,
             isListHidden: isListHidden,
             closeChat: storedChatID == nil ? nil : { storedChatID = nil }
         )
     }
 
-    /// As the chat list's own command line opens.
-    private var motion: Animation {
-        reduceMotion ? .easeInOut(duration: 0.15) : .spring(response: 0.34, dampingFraction: 0.86)
+    private func toggleList() {
+        withAnimation(reduceMotion ? nil : .snappy) { isListHidden.toggle() }
+    }
+
+    /// The identity you speak as in the open chat.
+    private var identity: Identity? {
+        conversation.chat.flatMap { chats.spaces.identity($0.identity) }
     }
 
     private var selection: Binding<Chat.ID?> {

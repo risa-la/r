@@ -132,7 +132,8 @@ struct ChatsRandomizedTests {
                         ? Snapshot(.loaded, before.chats, isInterrupted: true)
                         : Snapshot(.failed, before.chats))
             default:
-                valid = settled == (reloading ? before : loading.with(state: .idle))
+                let idle = Snapshot(.idle, loading.chats, isInterrupted: loading.isInterrupted)
+                valid = settled == (reloading ? before : idle)
             }
             guard valid, snapshot(model) == settled else {
                 run.fail("Load invariant failed")
@@ -150,10 +151,6 @@ struct ChatsRandomizedTests {
             self.state = state
             self.chats = chats
             self.isInterrupted = isInterrupted
-        }
-
-        func with(state: ChatsViewModel.State) -> Snapshot {
-            Snapshot(state, chats, isInterrupted: isInterrupted)
         }
     }
 

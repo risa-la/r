@@ -385,10 +385,7 @@ impl Client {
         if changed {
             // Not through the accounts: a process may have a chat list
             // before it has a handle to any of them.
-            let _ = self.inner.chats.send(Arc::new(account::Batch {
-                reload: true,
-                ..account::Batch::default()
-            }));
+            self.reload_chat_lists();
             let accounts: Vec<Arc<AccountShared>> = self
                 .inner
                 .accounts
@@ -509,11 +506,17 @@ impl Client {
         })
         .await?;
         // Its conversations leave every chat list.
-        let _ = self.inner.chats.send(Arc::new(account::Batch {
+        self.reload_chat_lists();
+        Ok(())
+    }
+
+    /// Has every chat list read the cache again.
+    fn reload_chat_lists(&self) {
+        let reload = account::Batch {
             reload: true,
             ..account::Batch::default()
-        }));
-        Ok(())
+        };
+        let _ = self.inner.chats.send(Arc::new(reload));
     }
 
     /// Connects to `server`, reads its greeting and closes again, to show
