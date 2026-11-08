@@ -722,7 +722,7 @@ pub(super) async fn mute(
         .unwrap_or(Timestamp::MAX)
         .min(end_of_period(now));
     if !cx
-        .db(move |store| store.mute(&mailbox, &pseudonym, until))
+        .db(move |store| store.set_mute(&mailbox, &pseudonym, until))
         .await?
     {
         return Err(err(ErrorCode::NotFound));
@@ -733,7 +733,7 @@ pub(super) async fn mute(
 /// `UNMUTE <box> <pseudonym>` (6.4).
 pub(super) async fn unmute(cx: &Cx, mailbox: BoxName, pseudonym: Pseudonym) -> Reply {
     may_mute_in(cx, mailbox).await?;
-    cx.db(move |store| store.unmute(&mailbox, &pseudonym))
+    cx.db(move |store| store.remove_mute(&mailbox, &pseudonym))
         .await?;
     Ok(OkResponse::new())
 }

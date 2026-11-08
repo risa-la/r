@@ -328,13 +328,6 @@ pub trait MailboxStore {
     /// Whether `pseudonym` is muted in `mailbox` at `now` (6.4).
     fn muted(&self, mailbox: &BoxName, pseudonym: &Pseudonym, now: Timestamp) -> Result<bool>;
 
-    /// Mutes `pseudonym` in `mailbox` until `until` (6.4, 10.4). Returns
-    /// `false` if the mailbox is gone.
-    fn mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp) -> Result<bool>;
-
-    /// Ends a mute (6.4, 10.4). Returns whether there was one.
-    fn unmute(&self, mailbox: &BoxName, pseudonym: &Pseudonym) -> Result<bool>;
-
     /// The public state of the public room of `mailbox` (12.6).
     fn room_group(&self, mailbox: &BoxName) -> Result<Option<RoomGroup>>;
 

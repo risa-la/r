@@ -17,9 +17,9 @@ use crate::store::mailbox::{
     AddedBy, CID_LIFETIME, MAX_SET_NEXT_HASHES, MAX_SET_TOKEN_HASHES, MAX_SETS,
 };
 use crate::store::{
-    Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom, PostBody,
-    Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomUpdate, StoreError, StoredPost,
-    fixed, millis, parsed, timestamp,
+    Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom,
+    PostBody, Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomUpdate, StoreError,
+    StoredPost, fixed, millis, parsed, timestamp,
 };
 
 /// The mailbox area's tables.
@@ -693,36 +693,6 @@ impl MailboxStore for SqliteStore {
         })
     }
 
-    fn mute(&self, mailbox: &BoxName, pseudonym: &Pseudonym, until: Timestamp) -> Result<bool> {
-        self.write(|tx| {
-            let mailbox = &mailbox.as_bytes()[..];
-            let exists = tx
-                .query_row("SELECT 1 FROM mailboxes WHERE box = ?", [mailbox], |_| {
-                    Ok(())
-                })
-                .optional()?
-                .is_some();
-            if !exists {
-                return Ok(false);
-            }
-            tx.execute(
-                "INSERT INTO mutes (box, pseudonym, until) VALUES (?, ?, ?)
-                 ON CONFLICT (box, pseudonym) DO UPDATE SET until = excluded.until",
-                params![mailbox, &pseudonym.as_bytes()[..], millis(until)],
-            )?;
-            Ok(true)
-        })
-    }
-
-    fn unmute(&self, mailbox: &BoxName, pseudonym: &Pseudonym) -> Result<bool> {
-        self.write(|tx| {
-            Ok(tx.execute(
-                "DELETE FROM mutes WHERE box = ? AND pseudonym = ?",
-                params![&mailbox.as_bytes()[..], &pseudonym.as_bytes()[..]],
-            )? > 0)
-        })
-    }
-
     fn room_group(&self, mailbox: &BoxName) -> Result<Option<RoomGroup>> {
         self.read(|tx| {
             let row = tx
@@ -1392,7 +1362,7 @@ mod tests {
             .add_token(&m.mailbox, 1, &hash(3), t(2 * day))
             .unwrap();
         let pseudonym = Pseudonym::from_bytes([1; 16]);
-        assert!(store.mute(&m.mailbox, &pseudonym, t(day)).unwrap());
+        assert!(store.set_mute(&m.mailbox, &pseudonym, t(day)).unwrap());
         assert!(store.muted(&m.mailbox, &pseudonym, t(0)).unwrap());
 
         let retention = Duration::from_secs(day);
@@ -1418,8 +1388,8 @@ mod tests {
         assert!(store.drop_mailbox(&m.mailbox).unwrap());
         assert!(!store.drop_mailbox(&m.mailbox).unwrap());
         assert_eq!(store.mailbox(&m.mailbox).unwrap(), None);
-        assert!(!store.mute(&m.mailbox, &pseudonym, t(day)).unwrap());
-        assert!(!store.unmute(&m.mailbox, &pseudonym).unwrap());
+        assert!(!store.set_mute(&m.mailbox, &pseudonym, t(day)).unwrap());
+        assert!(!store.remove_mute(&m.mailbox, &pseudonym).unwrap());
     }
 
     /// A public room: its group's state, members and pending proposals,

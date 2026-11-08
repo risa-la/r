@@ -289,7 +289,7 @@ async fn drop_rooms_and_mailboxes() {
     let other = add_mailbox(&h, 2);
     let mut follower = h.anon().await;
     let mut unrelated = h.anon().await;
-    h.inner().mailbox.follow(room, follower.id);
+    h.inner().mailbox.follow(room, follower.id, None, 1000);
     // A push subscription of the room goes with it (10.4).
     let keys = Keys::new();
     h.send(
@@ -405,7 +405,9 @@ async fn settings() {
     h.send(&c, "INFO").await;
     assert_eq!(
         c.lines(),
-        ["OK version=1 anon=no guests=no register=no log=no retention=7 push=yes upload=no"]
+        [
+            "OK version=1 anon=no guests=no register=no log=no retention=7 quota=268435456 push=yes upload=no"
+        ]
     );
     let settings = h.store.settings(&h.inner().settings()).unwrap();
     assert_eq!(settings.retention.days(), 7);

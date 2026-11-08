@@ -41,10 +41,10 @@ use risala_proto::time::Timestamp;
 use risala_proto::types::{DEFAULT_FETCH_LIMIT, MIN_FETCH_LIMIT_CAP, PushTag, Role};
 use tokio::sync::OwnedMutexGuard;
 
-use super::Inner;
 use super::command::{Cx, Reply, err, misrouted};
 use super::rate::{WindowLimit, network};
 use super::state::{ConnEntry, Who};
+use super::{Inner, misc};
 use crate::config::Config;
 use crate::handler::{ConnId, OutLine};
 use crate::store::{
@@ -261,17 +261,6 @@ impl State {
             .by_box
             .get(mailbox)
             .map(|conns| conns.keys().copied().collect())
-            .unwrap_or_default()
-    }
-
-    /// The `quiet` tags of the connections that follow `mailbox`: the push
-    /// subscriptions to hold back meanwhile (9.2).
-    #[allow(dead_code, reason = "for pushes (docs/plans/M5b.md, SV5)")]
-    pub(crate) fn quiet_tags(&self, mailbox: &BoxName) -> Vec<PushTag> {
-        self.follows()
-            .by_box
-            .get(mailbox)
-            .map(|conns| conns.values().flatten().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -697,6 +686,8 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         line = line.with_next(next);
     }
     send_to_followers(inner, &mailbox, &OutLine::new(ServerMessage::new(line)));
+    // A kept post is pushed; a live one is not (5.2, 9.2).
+    misc::post_kept(&cx.inner, mailbox);
     Ok(OkResponse::new().with("seq", seq))
 }
 
@@ -775,12 +766,16 @@ async fn follow(cx: &Cx, mailbox: BoxName, quiet: Option<PushTag>) -> Reply {
     let inner = &cx.inner;
     let _lock = inner.mailbox.lock(mailbox).await;
     let record = self::mailbox(cx, mailbox).await?;
-    if !inner
-        .mailbox
-        .follow(mailbox, cx.conn, quiet, inner.config.limits.max_follows)
-    {
+    if !inner.mailbox.follow(
+        mailbox,
+        cx.conn,
+        quiet.clone(),
+        inner.config.limits.max_follows,
+    ) {
         return Err(err(ErrorCode::Forbidden).with_message("following too many mailboxes"));
     }
+    // The push subscription that `quiet` names is held back meanwhile (9.2).
+    misc::follow_quiet(inner, cx.conn, mailbox, quiet);
     cx.reply_now(Ok(OkResponse::new().with("head", record.head)));
     Ok(OkResponse::new())
 }
@@ -789,6 +784,7 @@ async fn follow(cx: &Cx, mailbox: BoxName, quiet: Option<PushTag>) -> Reply {
 async fn unfollow(cx: &Cx, mailbox: BoxName) -> Reply {
     self::mailbox(cx, mailbox).await?;
     cx.inner.mailbox.unfollow(&mailbox, cx.conn);
+    misc::unfollow(&cx.inner, cx.conn, &mailbox);
     Ok(OkResponse::new())
 }
 
@@ -872,7 +868,10 @@ pub(crate) async fn check_token(
 /// Deletes `mailbox` with its posts, and for a public room the room, and
 /// sends `DROP <box> [<reason...>]` to every connection that follows it
 /// (6.1, 10.4). `reason` is escaped text. Returns whether it existed.
-#[allow(dead_code, reason = "for ADMIN DROP (docs/plans/M5b.md, SV5)")]
+#[allow(
+    dead_code,
+    reason = "ADMIN DROP drops by itself (admin.rs); the tests drop with this"
+)]
 pub(crate) async fn drop_mailbox(
     inner: &Inner,
     mailbox: &BoxName,
@@ -882,6 +881,7 @@ pub(crate) async fn drop_mailbox(
     let _lock = inner.mailbox.lock(mailbox).await;
     let existed = inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
     inner.mailbox.rooms.forget(&mailbox);
+    misc::mailbox_dropped(inner, mailbox).await;
     if existed {
         let line = OutLine::new(ServerMessage::new(ServerLine::Drop {
             mailbox,
@@ -889,7 +889,9 @@ pub(crate) async fn drop_mailbox(
         }));
         send_to_followers(inner, &mailbox, &line);
     }
-    inner.mailbox.forget_mailbox(&mailbox);
+    for conn in inner.mailbox.forget_mailbox(&mailbox) {
+        misc::unfollow(inner, conn, &mailbox);
+    }
     Ok(existed)
 }
 
@@ -951,8 +953,10 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
         if inner.mailbox.followed(&mailbox) {
             continue;
         }
+        // With its token sets and push subscriptions (7.5).
         inner.db(move |store| store.drop_mailbox(&mailbox)).await?;
         inner.mailbox.rooms.forget(&mailbox);
+        misc::mailbox_dropped(inner, mailbox).await;
     }
     Ok(())
 }

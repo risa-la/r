@@ -812,7 +812,7 @@ async fn muted_pseudonyms() {
     let mut d = Direct::new(&h, &mut anon, 1).await;
     let pseudonym = Pseudonym::from_bytes(d.bob.pseudonym.0);
     let until: Timestamp = "2026-11-09T13:00:00.000Z".parse().unwrap();
-    assert!(h.store.mute(&d.m, &pseudonym, until).unwrap());
+    assert!(h.store.set_mute(&d.m, &pseudonym, until).unwrap());
     let message = d.bob.send(&mut d.b, b"spam");
     let line = format!("POST {} {} {message}", d.m, d.bob.token(&d.b));
     h.send(&anon, &line).await;
