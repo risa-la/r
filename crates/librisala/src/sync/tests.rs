@@ -1334,15 +1334,71 @@ fn rate_limits_and_errors() {
         h.store.outbox_item(id).unwrap().unwrap().state,
         OutboxState::Queued
     );
+    // Nothing goes before the time the server gave, whatever asks: not
+    // the held message, and not a later one, which would overtake it.
+    let (later, out) = h
+        .engine
+        .send(&conv("#general"), &Draft::text("later"))
+        .unwrap();
+    h.absorb(out);
+    h.idle();
+    assert_eq!(h.last.retry_after, Some(Duration::from_secs(3)));
+    h.advance_clock(Duration::from_secs(2));
+    let out = h.engine.resume_outbox().unwrap();
+    h.absorb(out);
+    h.idle();
+    assert_eq!(h.last.retry_after, Some(Duration::from_secs(1)));
+    h.advance_clock(Duration::from_secs(1));
     let out = h.engine.resume_outbox().unwrap();
     h.absorb(out);
     let (r, cid2) = h.expect_msg("slow");
     assert_eq!(cid, cid2);
+    // The later one waits for the answer.
+    h.idle();
     h.reply(r, &[], "ERR forbidden read only");
     assert_eq!(
         h.store.outbox_item(id).unwrap().unwrap().state,
         OutboxState::Failed(FailReason::Rejected(ErrorCode::Forbidden))
     );
+    let (r, _) = h.expect_msg("later");
+    h.reply(r, &[], "OK seq=4");
+    assert_eq!(
+        h.store.outbox_item(later).unwrap().unwrap().state,
+        OutboxState::Sent(seq(4))
+    );
+}
+
+#[test]
+fn one_message_per_conversation_is_in_flight() {
+    // Were two in flight and the first turned away with rate-limited, the
+    // second could land first. Other conversations do not wait.
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    let send = |h: &mut H, to: &str, text: &str| {
+        let (id, out) = h.engine.send(&conv(to), &Draft::text(text)).unwrap();
+        h.absorb(out);
+        id
+    };
+    let one = send(&mut h, "#general", "one");
+    let two = send(&mut h, "#general", "two");
+    send(&mut h, "bob@example.net", "hi bob");
+    let (r1, _) = h.expect_msg("one");
+    let (r3, _) = h.expect_msg("hi bob");
+    h.idle();
+    assert_eq!(
+        h.store.outbox_item(two).unwrap().unwrap().state,
+        OutboxState::Queued
+    );
+    h.reply(r1, &[], "OK seq=4");
+    assert_eq!(
+        h.store.outbox_item(one).unwrap().unwrap().state,
+        OutboxState::Sent(seq(4))
+    );
+    let (r2, _) = h.expect_msg("two");
+    h.idle();
+    h.reply(r2, &[], "OK seq=5");
+    h.reply(r3, &[], "OK id=d1 seq=1");
+    h.idle();
 }
 
 #[test]

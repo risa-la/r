@@ -214,6 +214,8 @@ pub struct SyncEngine {
     want_sync: bool,
     /// Outbox entries sent on this connection and not answered yet.
     sending: HashSet<OutboxId>,
+    /// The server answered `rate-limited`: no message goes before this.
+    held_until: Option<Timestamp>,
     /// This connection's claim on the outbox entries it sends (7.6).
     claim: Claim,
     /// Counts the lines and replies handled, to order them.
@@ -259,6 +261,7 @@ impl SyncEngine {
             listed: false,
             want_sync: false,
             sending: HashSet::new(),
+            held_until: None,
             ticks: 0,
             typing_sent: HashMap::new(),
             out: Output::default(),
@@ -1394,6 +1397,7 @@ impl SyncEngine {
         self.sending.remove(&outbox);
         let account = self.account;
         let me = self.me.clone();
+        let now = self.now();
         let retry = self.write(|tx| {
             let Some(item) = tx.outbox_item(outbox)? else {
                 return Ok(None);
@@ -1439,10 +1443,14 @@ impl SyncEngine {
             Ok(None)
         })?;
         if let Some(secs) = retry {
-            let wait = Duration::from_secs(secs);
-            self.out.retry_after = Some(self.out.retry_after.map_or(wait, |w| w.max(wait)));
+            let until = now
+                .checked_add(Duration::from_secs(secs))
+                .unwrap_or(Timestamp::MAX);
+            self.held_until = Some(self.held_until.map_or(until, |h| h.max(until)));
         }
-        Ok(())
+        // The conversation's next message may go now, or once the hold
+        // ends.
+        self.flush_outbox()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1815,6 +1823,13 @@ impl SyncEngine {
     /// Sends every outbox entry that can be sent now, and fails those that
     /// cannot be sent safely any more.
     ///
+    /// Each conversation has at most one message of this connection's in
+    /// flight, sent oldest first, so that a message the server turns away
+    /// with `rate-limited` is not overtaken by a later one it accepts.
+    /// After `rate-limited`, nothing is sent until the time its `retry`
+    /// tag gave, whatever asks for it. An entry another process sent does
+    /// not hold back later ones: it went out already.
+    ///
     /// Picking the entries and marking them as sent is one write
     /// transaction (`BEGIN IMMEDIATE`), so that another process sharing the
     /// cache cannot pick them too. An entry another process's connection
@@ -1839,12 +1854,26 @@ impl SyncEngine {
             .iter()
             .filter_map(|(c, l)| Some((c.clone(), l.confirmed.clone()?)))
             .collect();
+        if let Some(until) = self.held_until {
+            if until > now {
+                self.resume_by(now, until);
+                return Ok(());
+            }
+            self.held_until = None;
+        }
         // When the first claim of another process left alone runs out.
         let mut lapses: Option<Timestamp> = None;
         let to_send = self.write(|tx| {
+            let pending = tx.outbox_pending(account)?;
+            // Conversations with a message of this connection's in flight.
+            let mut busy: HashSet<Conv> = pending
+                .iter()
+                .filter(|item| in_flight.contains(&item.id))
+                .map(|item| item.conv.clone())
+                .collect();
             let mut to_send = Vec::new();
-            for item in tx.outbox_pending(account)? {
-                if in_flight.contains(&item.id) {
+            for item in pending {
+                if in_flight.contains(&item.id) || busy.contains(&item.conv) {
                     continue;
                 }
                 if item.state == OutboxState::Sending {
@@ -1925,6 +1954,7 @@ impl SyncEngine {
                     }
                 }
                 tx.outbox_sending(item.id, &claim, now)?;
+                busy.insert(item.conv.clone());
                 to_send.push(item);
             }
             Ok(to_send)
