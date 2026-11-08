@@ -1971,6 +1971,7 @@ dependencies = [
  "rmp-serde",
  "rusqlite",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 
