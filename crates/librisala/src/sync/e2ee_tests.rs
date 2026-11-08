@@ -1093,3 +1093,68 @@ fn history_keys_are_backed_up_and_restored() {
     );
     let _ = b;
 }
+
+#[test]
+fn a_commit_that_adds_an_outsider_is_rejected() {
+    let mut net = Net::new();
+    let a = net.device("alice@example.org", 1);
+    let b = net.device("bob@example.net", 2);
+    let c = net.device("carol@example.com", 4);
+    net.run();
+    net.send(a, "bob@example.net", "hi");
+
+    // Bob's device, misbehaving, adds Carol's device to his direct
+    // conversation with Alice. This server does not check (12.5).
+    let kp = net.packages.get_mut(&c).unwrap().pop().unwrap();
+    let dev = &net.devs[b];
+    let device = crate::e2ee::Device::new(dev.uid.clone(), dev.key.clone()).unwrap();
+    let conv: Conv = "alice@example.org".parse().unwrap();
+    let account = dev.account;
+    let (commit, _) = dev
+        .store
+        .write_with(|tx| {
+            let row = tx.conv_by_name(account, &conv)?.unwrap();
+            let (kp, _) =
+                crate::e2ee::group::checked_key_package(&device, &uid("carol@example.com"), &kp)?;
+            crate::e2ee::group::own_commit(
+                tx,
+                &device,
+                &row,
+                risala_mls::group::Changes {
+                    add: vec![kp],
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    net.handle(
+        b,
+        Outgoing {
+            req: ReqId(9999),
+            command: Command::Commit {
+                conv,
+                commit: commit.commit,
+                group_info: commit.group_info,
+                welcome: commit.welcome,
+            },
+        },
+    );
+    net.run();
+
+    // Alice's device rejects it, warns, and sends nothing more there
+    // (12.6).
+    assert_eq!(
+        net.devs[a].group("bob@example.net").unwrap().state,
+        GroupState::Rejected
+    );
+    assert!(net.devs[a].notes.contains(&Notification::GroupRejected {
+        conv: "bob@example.net".parse().unwrap()
+    }));
+    let id = net.send(a, "bob@example.net", "after");
+    assert_eq!(
+        net.devs[a].store.outbox_item(id).unwrap().unwrap().state,
+        OutboxState::Queued
+    );
+    // It does not join the group again either (12.6).
+    assert_eq!(net.sent_to(a, "GROUPINFO", "bob@example.net"), 0);
+}
