@@ -52,8 +52,9 @@ controls, and show the uid instead.
 ### 8.3. Presence and Members
 
 Whether an identity is online is the one thing about people that the
-server keeps in the clear. An identity is **online** while it has at
-least one signed-in connection, and **offline** otherwise.
+server can tell others. The server always knows it, from sign-ins. An
+identity is **online** while it has at least one signed-in connection,
+and **offline** otherwise.
 
 ```
 PRESENCE ON
@@ -109,8 +110,9 @@ S: PRESENCE offline carol@example.com
   it has a leaf there (6.1).
 
 WATCH, WHOIS and MEMBERS work on any kind of connection. A client SHOULD
-send WATCH on an anonymous connection, since the list says whom the user
-talks to. Section 14 says what presence still reveals.
+send WATCH on an anonymous connection that it uses for nothing else
+(4.1), since the list says whom the user talks to. Section 14 says what
+presence still reveals.
 
 ### 8.4. Notices
 
@@ -141,6 +143,7 @@ INFO is allowed before signing in. It returns these values:
 | `log=<url>` or `log=no` | The URL prefix of the server's current key log (4.5), or `no` if it keeps none |
 | `log-key=<vkey>` | The signed-note verifier key of that log (4.4), present only with `log=<url>` |
 | `retention=<days>` | How long posts, files and blobs are kept (7.5) |
+| `quota=<bytes>` | The most a mailbox may hold at once, counting its posts, files and blobs (7.5) |
 | `push=yes` or `push=no` | Whether PUSH is supported |
 | `upload=<bytes>` or `upload=no` | The largest file UPLOAD accepts, or `no` if the server offers no uploads (5.6) |
 | `blobs=<url>` | The URL prefix that blobs are fetched from (12.12) |

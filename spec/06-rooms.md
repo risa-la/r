@@ -53,10 +53,11 @@ GROUPINFO <box>
 → `GROUPINFO <box> <epoch> <seq> <groupinfo> <tree>`, then `OK`
 
 Returns a public room's current GroupInfo and ratchet tree, as the
-server holds them (12.6). `<seq>` is the seq of the commit that started
-the epoch, or `0` in epoch 0. `<groupinfo>` and `<tree>` are each base64
-with padding, or a blob-ref (12.12): the tree of a large room is always
-a blob. A mailbox that is not a public room gets `ERR not-found`.
+server holds them (12.6). `<seq>` is a position (3.5): the seq of the
+commit that started the epoch, or `0` in epoch 0. `<groupinfo>` and
+`<tree>` are each base64 with padding, or a blob-ref (12.12): the tree
+of a large room is always a blob. A mailbox that is not a public room
+gets `ERR not-found`.
 
 **Joining a public room.** A device fetches GROUPINFO, checks the group
 as in 12.7, and joins in one of two ways:
@@ -222,8 +223,9 @@ Moderators may kick and ban only plain members. Owners may act on
 anyone except the last owner (6.3).
 
 **Muting.** In a public room, the server can refuse the posts of a
-pseudonym (7.3) without knowing whose it is. An owner or moderator whose
-device sees abuse from a member asks for it:
+pseudonym (7.3). It does not learn from the pseudonym whose it is,
+though it may guess from timing (Section 14). An owner or moderator
+whose device sees abuse from a member asks for it:
 
 ```
 MUTE <box> <pseudonym> [hours=<n>]
@@ -237,8 +239,10 @@ signed-in connection whose identity is an owner or moderator in the
 public room's conversation extension, which the server holds, and has at
 least one leaf in the room's group (`ERR forbidden`). The server refuses
 that pseudonym's posts in that mailbox for `<n>` hours, 24 by default,
-or until UNMUTE. A mute is a stopgap until a moderator's device bans the
-member. A pseudonym belongs to one leaf, so a member who joins again
-with a new leaf has a new one.
+or until UNMUTE, and in any case only until the end of the current
+period (12.10), since a public room is epochal and its pseudonyms last
+one period (7.3). A mute is a stopgap until a moderator's device bans
+the member. A member who joins again with a new leaf, or reaches a new
+period, has a new pseudonym, which a moderator mutes again if needed.
 
 For moderation across a whole server, see Section 10.

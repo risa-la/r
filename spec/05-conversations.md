@@ -44,7 +44,7 @@ no members, no roles and no settings. A private conversation's box is
 known only to its members, and the server cannot tell who they are.
 
 ```
-CREATE <box> <group-id> <token-hash>
+CREATE <box> <group-id> <token-hash> [epoch=<epoch>]
 CREATE <box> <group-id> <token-hash> <room> <groupinfo> <tree>
 ```
 
@@ -56,18 +56,30 @@ padding, and `<token-hash>` the SHA-384 hash of the group's send token
 for epoch 0 (7.2), in base64 with padding.
 
 - **The first form** creates the mailbox of a direct conversation or a
-  private room. It needs an anonymous connection.
+  private room. It needs an anonymous connection, or a guest connection
+  for a guest's report conversation (4.2). With `epoch`, a number
+  greater than 0, it creates the new mailbox of a group that is moving
+  (7.8): the mailbox starts at that epoch, and `<token-hash>` is the
+  hash of that epoch's token.
 - **The second form** creates a public room named `<room>` (6.1). It
   needs a signed-in connection. `<groupinfo>` and `<tree>` are the
-  group's GroupInfo and ratchet tree (12.2), which the server checks as
-  in 12.6: one leaf, whose credential names the connection's identity,
-  and a conversation extension of kind `public_room` that names this
-  server, `<box>` and `<room>`, with that identity as an owner.
+  group's GroupInfo and ratchet tree (12.2), each in base64 with padding
+  or as a blob-ref (12.12), which the server checks as in 12.6: one
+  leaf, whose credential names the connection's identity, and a
+  conversation extension of kind `public_room` that names this server,
+  `<box>` and `<room>`, with that identity as an owner.
 
-A box or group id that the server has seen before gets
-`ERR name-taken`, and so does a room name that is in use. Servers SHOULD
-limit how often one identity creates public rooms, and one connection
-creates mailboxes (`ERR rate-limited`).
+The server replies `ERR name-taken` to a box it has seen before, to a
+room name that is in use, and, without `epoch`, to a group id it has
+seen before. With `epoch`, the group id must be that of a mailbox the
+server holds (`ERR not-found`, 7.8). A server never uses a box again,
+even once its mailbox is gone (7.5, 10.4), and MAY remember boxes and
+group ids by their hashes only.
+
+Servers MUST limit how many mailboxes one connection and one network
+address create (`ERR rate-limited`), and SHOULD limit how often one
+identity creates public rooms. Servers MAY require proof of work for
+CREATE (4.1).
 
 ```
 POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
@@ -79,6 +91,7 @@ Posts an MLS message (12.2) to a mailbox. `<message>` is the MLSMessage
 in base64 with padding, or a blob-ref (12.12) if it is too large for a
 line. `<token>` is the group's send token for the message's epoch, in
 base64 with padding, or `-` for a join of a public room (6.1).
+`<groupinfo>` is base64 with padding, or a blob-ref.
 
 The server reads the group id, epoch, content type and authenticated
 data from the message's framing, which MLS leaves in the clear, and
@@ -89,16 +102,19 @@ checks that:
 2. The message is a PrivateMessage, or, in a public room only, a
    PublicMessage that holds a commit or a proposal. Its cipher suite is
    `0x0020` and its version `mls10` (12.2). Its authenticated data is a
-   RisalaAAD (12.9) with the fields its content type needs
-   (`ERR invalid`).
+   RisalaAAD (12.9) with the fields its content type needs, and a
+   pseudonym of 16 bytes in a PrivateMessage and an empty one in a
+   PublicMessage (`ERR invalid`).
 3. The SHA-384 hash of `<token>` is one of the token hashes it holds for
    the message's epoch (7.2), compared in constant time
    (`ERR stale`). A token of `-` is allowed only for an external commit
    or an external Add proposal in a public room (6.1); anything else
    gets `ERR forbidden`.
 4. The post's pseudonym (7.3) is not muted in this mailbox
-   (`ERR forbidden`), and is within the server's limits
-   (`ERR rate-limited`).
+   (`ERR forbidden`), and the connection and its network address are
+   within the server's limits (`ERR rate-limited`). Limits are not kept
+   per pseudonym, since anyone who holds the token can post under any
+   pseudonym.
 5. In a public room, a commit or proposal passes the checks of 12.6.
 
 The server then gives the post the mailbox's next sequence number,
@@ -110,8 +126,9 @@ follows the mailbox, as an **event line**:
 ```
 
 `t` is when the server accepted it. The line does not repeat the token.
-A commit also gives the server the hash of the next epoch's send token
-(7.2).
+A commit also gives the server a hash of the next epoch's send token
+(7.2). The server stores the post as 4.2 says: with its box, seq, time
+and message only.
 
 With `live=yes`, the post is not kept: it gets no seq, goes only to the
 connections that follow the mailbox now, without `seq`, and is not
@@ -121,8 +138,11 @@ may be live (`ERR invalid`).
 A commit in a public room carries its new GroupInfo as `groupinfo`
 (12.6). A POST MAY carry a `cid` tag (7.6).
 
-The server never learns who sent a post. It learns which connection
-sent it, the pseudonym in it, and when (Section 14).
+The server does not learn from a post who sent it, except a
+PublicMessage, whose sender leaf is in the clear (12.6). It learns
+which connection sent it, the pseudonym in it, and when, and can
+sometimes link these to a sender by timing and network address
+(Section 14).
 
 ### 5.3. Messages
 
@@ -218,7 +238,9 @@ UPLOAD <box> <token> <size>
 Asks to upload a file of `<size>` bytes for the conversation of
 `<box>`. `<token>` is a send token of the group, checked as for POST
 (5.2), so that only members can upload, without saying who they are.
-It needs an anonymous connection. Sharing a file takes three steps:
+It needs an anonymous connection. The file counts against the mailbox's
+quota and the network address's limits (7.5). Sharing a file takes
+three steps:
 
 1. The client encrypts the file (12.11) and sends UPLOAD with the size
    of the result. The server replies with three URLs: `put` to upload
