@@ -1,7 +1,9 @@
 //! An in-memory key log and witness, for tests: the log appends entries,
-//! serves tiles, entry bundles and its hints, signs checkpoints and hands
-//! off to the host's next log; the witness is a [`WitnessCore`] with its
-//! state in memory, by the rules of [TLOG-WITNESS] and SPEC 4.10.
+//! serves tiles, entry bundles, its hints and its key file, signs
+//! checkpoints and hands off to the host's next log; the witness is a
+//! [`WitnessCore`] with its state in memory, by the rules of
+//! [TLOG-WITNESS] and SPEC 4.10, which fetches key files from a
+//! [`KeyFiles`] of its own.
 //!
 //! Both sign with ML-DSA-44's deterministic variant, so that tests are
 //! repeatable. Real logs and witnesses should use the hedged one.
@@ -16,14 +18,16 @@ use crate::checkpoint::{Checkpoint, LogOrigin, SignedCheckpoint};
 use crate::cosig::{CosignatureVerifier, Cosigner};
 use crate::entry::LogEntry;
 use crate::handoff::HandoffRequest;
-use crate::hint::{NEXT_PATH, UidHint, next_body, uid_hint_path};
+use crate::hint::{KEY_PATH, NEXT_PATH, UidHint, log_key_body, next_body, uid_hint_path};
 use crate::merkle::{Hash, leaf_hash};
 use crate::note::{NoteSignature, VerifierKey};
 use crate::proof::{consistency_proof, inclusion_proof, tree_hash};
 use crate::tile::{HashTiles, TILE_WIDTH, TileFetcher, TileId, TileKind, encode_bundle};
 use crate::witness::LogKey;
 pub use crate::witnessing::WitnessRefusal;
-use crate::witnessing::{CoreError, MemoryWitnessStore, WitnessConfig, WitnessCore};
+use crate::witnessing::{
+    CoreError, LogKeyFetcher, MemoryWitnessStore, WitnessConfig, WitnessCore, log_key_url,
+};
 
 /// A key log in memory.
 #[derive(Debug)]
@@ -128,11 +132,20 @@ impl MemoryLog {
         self.handoff.map(next_body)
     }
 
-    /// What the log serves at `path` under its URL prefix: tiles, entry
-    /// bundles and hints. `None` for a 404.
+    /// The body of `risala/key`, the log's key file (SPEC 4.5).
+    pub fn key_file(&self) -> String {
+        log_key_body(&self.key())
+    }
+
+    /// What the log serves at `path` under its URL prefix, which is
+    /// `https://` and its origin: tiles, entry bundles, hints and its key
+    /// file. `None` for a 404.
     pub fn serve(&self, path: &str) -> Option<Vec<u8>> {
         if path == NEXT_PATH {
             return self.next_hint().map(String::into_bytes);
+        }
+        if path == KEY_PATH {
+            return Some(self.key_file().into_bytes());
         }
         if let Some(uid) = self.uids.keys().find(|u| uid_hint_path(u) == path) {
             return self.uid_hint(uid).map(String::into_bytes);
@@ -190,8 +203,9 @@ impl MemoryLog {
     /// Asks each witness to cosign `checkpoint`, as a log does, and adds
     /// their cosignatures to it. A log does not know what a witness last
     /// cosigned, so it starts from old size 0 and follows the witness's
-    /// `409` answer; a witness that does not know a log 1 is asked to enrol
-    /// it, with the log's key. Witnesses that refuse are skipped.
+    /// `409` answer. A log 1 is served at its URL, so that a witness that
+    /// does not know it fetches its key file and enrols it. Witnesses that
+    /// refuse are skipped.
     pub fn witness(
         &self,
         checkpoint: &mut SignedCheckpoint,
@@ -200,6 +214,9 @@ impl MemoryLog {
     ) -> Vec<Result<(), WitnessRefusal>> {
         let mut results = Vec::new();
         for w in witnesses.iter_mut() {
+            if self.origin.number() == 1 {
+                w.serve_log(self);
+            }
             let mut old = 0;
             let result = loop {
                 let proof = match self.consistency_proof(old, checkpoint.checkpoint().size()) {
@@ -214,9 +231,6 @@ impl MemoryLog {
                 match w.add_checkpoint(&req, timestamp) {
                     Ok(sigs) => break Ok(sigs),
                     Err(WitnessRefusal::Conflict(n)) if n != old => old = n,
-                    Err(WitnessRefusal::UnknownLog) if old == 0 && self.origin.number() == 1 => {
-                        break w.enrol(&self.key(), &req, timestamp);
-                    }
                     Err(e) => break Err(e),
                 }
             };
@@ -275,11 +289,42 @@ impl TileFetcher for &MemoryLog {
     }
 }
 
+/// The key files the hosts serve, as one witness sees them: bodies by URL,
+/// and the URLs it fetched, in order.
+#[derive(Clone, Debug, Default)]
+pub struct KeyFiles {
+    files: BTreeMap<String, Vec<u8>>,
+    fetched: Vec<String>,
+}
+
+impl KeyFiles {
+    /// Serves `body` at `url`, or a 404 for `None`.
+    pub fn serve(&mut self, url: &str, body: Option<Vec<u8>>) {
+        match body {
+            Some(body) => self.files.insert(url.to_owned(), body),
+            None => self.files.remove(url),
+        };
+    }
+
+    /// The URLs fetched so far, in order.
+    pub fn fetched(&self) -> &[String] {
+        &self.fetched
+    }
+}
+
+impl LogKeyFetcher for KeyFiles {
+    fn fetch_log_key(&mut self, url: &str) -> Option<Vec<u8>> {
+        self.fetched.push(url.to_owned());
+        self.files.get(url).cloned()
+    }
+}
+
 /// A witness in memory: a [`WitnessCore`] over a [`MemoryWitnessStore`],
-/// signing deterministically.
+/// signing deterministically, that fetches key files from its
+/// [`KeyFiles`].
 #[derive(Debug)]
 pub struct TestWitness {
-    core: WitnessCore<MemoryWitnessStore>,
+    core: WitnessCore<MemoryWitnessStore, KeyFiles>,
 }
 
 fn refusal(e: CoreError<Infallible>) -> WitnessRefusal {
@@ -301,8 +346,26 @@ impl TestWitness {
     pub fn with_config(name: &str, seed: &[u8; 32], config: WitnessConfig) -> TestWitness {
         let cosigner = Cosigner::from_seed(name, seed).expect("a valid name");
         TestWitness {
-            core: WitnessCore::new(cosigner, MemoryWitnessStore::new(), config),
+            core: WitnessCore::new(
+                cosigner,
+                MemoryWitnessStore::new(),
+                KeyFiles::default(),
+                config,
+            ),
         }
+    }
+
+    /// The key files the witness fetches from.
+    pub fn key_files(&mut self) -> &mut KeyFiles {
+        self.core.fetcher_mut()
+    }
+
+    /// Serves `log`'s key file at its URL, as its host does (SPEC 4.5).
+    pub fn serve_log(&mut self, log: &MemoryLog) {
+        self.key_files().serve(
+            &log_key_url(log.origin()),
+            Some(log.key_file().into_bytes()),
+        );
     }
 
     /// The verifier for the witness's cosignatures.
@@ -316,7 +379,7 @@ impl TestWitness {
     }
 
     /// The witness's core.
-    pub fn core(&self) -> &WitnessCore<MemoryWitnessStore> {
+    pub fn core(&self) -> &WitnessCore<MemoryWitnessStore, KeyFiles> {
         &self.core
     }
 
@@ -339,28 +402,15 @@ impl TestWitness {
             .map_err(refusal)
     }
 
-    /// Handles an `add-checkpoint` request that may enrol a log with `key`.
-    pub fn enrol(
-        &mut self,
-        key: &LogKey,
-        req: &AddCheckpoint,
-        timestamp: u64,
-    ) -> Result<Vec<NoteSignature>, WitnessRefusal> {
-        self.core
-            .enrol(key, req, timestamp, [0; 32])
-            .map_err(refusal)
-    }
-
     /// Handles an `add-checkpoint` request body, and returns the response
     /// body: the cosignature's line.
     pub fn add_checkpoint_body(
         &mut self,
         body: &[u8],
-        key: Option<&LogKey>,
         timestamp: u64,
     ) -> Result<String, WitnessRefusal> {
         self.core
-            .add_checkpoint_body(body, key, timestamp, [0; 32])
+            .add_checkpoint_body(body, timestamp, [0; 32])
             .map_err(refusal)
     }
 
@@ -402,83 +452,107 @@ mod tests {
         }
         let cp5 = log.checkpoint(100);
 
-        // A log 1 the witness does not know, without its key.
+        let url = log_key_url(&origin());
+        assert_eq!(url, "https://log.example.org/risala-log/1/risala/key");
+
+        // A log 1 the witness does not know, whose host serves no key
+        // file: 503, and the log tries again later (SPEC 4.10).
         assert_eq!(
             w.add_checkpoint(&req(0, vec![], &cp5), 100),
-            Err(WitnessRefusal::UnknownLog)
+            Err(WitnessRefusal::Unavailable)
         );
-        // Unknown, and not enrolling.
+        assert_eq!(w.key_files().fetched(), [url.clone()]);
+        // Within the minute it does not fetch again.
+        w.serve_log(&log);
         assert_eq!(
-            w.enrol(&log.key(), &req(1, vec![], &cp5), 100),
+            w.add_checkpoint(&req(0, vec![], &cp5), 159),
+            Err(WitnessRefusal::Unavailable)
+        );
+        assert_eq!(w.key_files().fetched().len(), 1);
+        // Unknown, and not enrolling: no fetch.
+        assert_eq!(
+            w.add_checkpoint(&req(1, vec![], &cp5), 160),
             Err(WitnessRefusal::UnknownLog)
         );
-        // Signed by another key under the log's name.
+        assert_eq!(w.key_files().fetched().len(), 1);
+        // Signed by another key under the log's name: the host serves the
+        // log's key, so the signature does not verify.
         let impostor = MemoryLog::new(&origin(), &[4; 32]);
         assert_eq!(
-            w.enrol(&log.key(), &req(0, vec![], &impostor.checkpoint(100)), 100)
+            w.add_checkpoint(&req(0, vec![], &impostor.checkpoint(100)), 160)
                 .map_err(|e| e.status()),
             Err(403)
         );
-        // A key for another origin.
+        // A key file that names another log, or none: 403.
         let other = MemoryLog::new(&"other.example/risala-log/1".parse().unwrap(), &[3; 32]);
+        w.key_files()
+            .serve(&url, Some(other.key_file().into_bytes()));
         assert_eq!(
-            w.enrol(&other.key(), &req(0, vec![], &cp5), 100),
+            w.add_checkpoint(&req(0, vec![], &cp5), 220),
             Err(WitnessRefusal::Forbidden)
         );
+        w.key_files()
+            .serve(&url, Some(b"risala-log-key/1\n".to_vec()));
+        assert_eq!(
+            w.add_checkpoint(&req(0, vec![], &cp5), 280),
+            Err(WitnessRefusal::Forbidden)
+        );
+        w.serve_log(&log);
         // A proof when the old size is 0.
         assert_eq!(
-            w.enrol(&log.key(), &req(0, vec![empty_root()], &cp5), 100),
+            w.add_checkpoint(&req(0, vec![empty_root()], &cp5), 340),
             Err(WitnessRefusal::Unprocessable)
         );
         // The log's signature with a zero timestamp.
         assert_eq!(
-            w.enrol(&log.key(), &req(0, vec![], &log.checkpoint(0)), 100),
+            w.add_checkpoint(&req(0, vec![], &log.checkpoint(0)), 400),
             Err(WitnessRefusal::Forbidden)
         );
-        // Nothing was enrolled by those.
+        // Nothing was enrolled by those, and each fetched the key once.
         assert_eq!(w.latest(&origin().to_string()), None);
+        assert_eq!(w.key_files().fetched().len(), 6);
+        assert!(w.key_files().fetched().iter().all(|u| *u == url));
 
         let body = w
-            .add_checkpoint_body(
-                req(0, vec![], &cp5).to_body().as_bytes(),
-                Some(&log.key()),
-                100,
-            )
+            .add_checkpoint_body(req(0, vec![], &cp5).to_body().as_bytes(), 460)
             .unwrap();
         let sigs = NoteSignature::parse_lines(&body).unwrap();
-        assert_eq!(w.verifier().verify(cp5.checkpoint(), &sigs[0]), Ok(100));
+        assert_eq!(w.verifier().verify(cp5.checkpoint(), &sigs[0]), Ok(460));
         assert_eq!(
             w.latest(&origin().to_string()),
             Some((5, log.root_at(5).unwrap()))
         );
-        // Once enrolled, the key never changes.
+        // Once enrolled, the key never changes, whatever the host serves.
+        w.key_files()
+            .serve(&url, Some(impostor.key_file().into_bytes()));
         assert_eq!(
-            w.enrol(&impostor.key(), &req(5, vec![], &cp5), 200),
+            w.add_checkpoint(&req(5, vec![], &impostor.checkpoint(560)), 560),
             Err(WitnessRefusal::Forbidden)
         );
+        assert_eq!(w.key_files().fetched().len(), 7);
 
         // The log must now say where the witness is.
         log.append(b"x");
-        let cp6 = log.checkpoint(200);
+        let cp6 = log.checkpoint(560);
         assert_eq!(
-            w.add_checkpoint(&req(0, vec![], &cp6), 200),
+            w.add_checkpoint(&req(0, vec![], &cp6), 560),
             Err(WitnessRefusal::Conflict(5))
         );
         assert_eq!(
-            w.add_checkpoint(&req(7, vec![], &cp6), 200),
+            w.add_checkpoint(&req(7, vec![], &cp6), 560),
             Err(WitnessRefusal::BadRequest)
         );
         assert_eq!(
-            w.add_checkpoint(&req(5, vec![empty_root(); 3], &cp6), 200),
+            w.add_checkpoint(&req(5, vec![empty_root(); 3], &cp6), 560),
             Err(WitnessRefusal::Unprocessable)
         );
         // Ten seconds between checkpoints of one log.
         let good = req(5, log.consistency_proof(5, 6).unwrap(), &cp6);
         assert_eq!(
-            w.add_checkpoint(&good, 109),
+            w.add_checkpoint(&good, 469),
             Err(WitnessRefusal::TooManyRequests)
         );
-        assert!(w.add_checkpoint(&good, 110).is_ok());
+        assert!(w.add_checkpoint(&good, 470).is_ok());
 
         // The same size again with another root: a fork, refused.
         let mut fork = MemoryLog::new(&origin(), &[1; 32]);
@@ -486,7 +560,7 @@ mod tests {
             fork.append(&[i + 1]);
         }
         assert_eq!(
-            w.add_checkpoint(&req(6, vec![], &fork.checkpoint(300)), 300),
+            w.add_checkpoint(&req(6, vec![], &fork.checkpoint(660)), 660),
             Err(WitnessRefusal::Unprocessable)
         );
         // And a larger fork, whatever proof the forked log sends.
@@ -494,10 +568,10 @@ mod tests {
         let r = req(
             6,
             fork.consistency_proof(6, 7).unwrap(),
-            &fork.checkpoint(300),
+            &fork.checkpoint(660),
         );
         assert_eq!(
-            w.add_checkpoint(&r, 300),
+            w.add_checkpoint(&r, 660),
             Err(WitnessRefusal::Unprocessable)
         );
         assert_eq!(
@@ -509,10 +583,10 @@ mod tests {
         let text = format!("{}ext\n", cp6.checkpoint().to_text());
         let mut with_ext = SignedCheckpoint::unsigned(Checkpoint::from_text(&text).unwrap());
         with_ext
-            .push_signature(log.cosigner.cosign(with_ext.checkpoint(), 400, [0; 32]))
+            .push_signature(log.cosigner.cosign(with_ext.checkpoint(), 760, [0; 32]))
             .unwrap();
         assert_eq!(
-            w.add_checkpoint(&req(6, vec![], &with_ext), 400),
+            w.add_checkpoint(&req(6, vec![], &with_ext), 760),
             Err(WitnessRefusal::Forbidden)
         );
     }
@@ -553,7 +627,7 @@ mod tests {
         let a2 = log.append_record("a@example.org", b"record 3");
         assert_eq!(
             log.serve(&uid_hint_path("a@example.org")),
-            Some(format!("{a}\n{a2}\n").into_bytes())
+            Some(format!("risala-hint/1\n{a}\n{a2}\n").into_bytes())
         );
         assert_eq!(
             LogEntry::decode(log.entry(a).unwrap()),
@@ -561,7 +635,15 @@ mod tests {
         );
         let next = MemoryLog::new(&origin().next().unwrap(), &[2; 32]);
         let h = log.hand_off(&next.key());
-        assert_eq!(log.serve(NEXT_PATH), Some(format!("{h}\n").into_bytes()));
+        assert_eq!(
+            log.serve(NEXT_PATH),
+            Some(format!("risala-hint/1\n{h}\n").into_bytes())
+        );
+        // The key file (SPEC 4.5).
+        assert_eq!(
+            crate::hint::parse_log_key(&log.serve(KEY_PATH).unwrap(), log.origin()),
+            Ok(log.key())
+        );
         assert_eq!(
             LogEntry::decode(log.entry(h).unwrap()),
             Ok(LogEntry::Handoff(next.key()))

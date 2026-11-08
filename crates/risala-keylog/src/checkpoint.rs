@@ -228,6 +228,13 @@ impl LogOrigin {
         self.number
     }
 
+    /// The log's URL prefix, which is always `https://` followed by its
+    /// origin, so that anyone who knows the origin can find the log (SPEC
+    /// 4.5). The log is served on port 443.
+    pub fn url(&self) -> String {
+        format!("https://{self}")
+    }
+
     /// The origin of the host's next log, which a hand-off from this one
     /// names (SPEC 4.5, "Hand-offs").
     pub fn next(&self) -> Option<LogOrigin> {

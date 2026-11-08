@@ -275,6 +275,13 @@ fn witnesses_enrol_by_the_rules() {
     let log2 = MemoryLog::new(&origin(2), &[2; 32]);
     log1.append_record(UID, b"r");
     publish(&log1, &mut ws, NOW);
+    // Each witness got log 1's key from the host itself (SPEC 4.10).
+    for w in &mut ws {
+        assert_eq!(
+            w.key_files().fetched(),
+            ["https://chat.example.org/risala-log/1/risala/key"]
+        );
+    }
 
     // Log 2 before any hand-off: refused, even with its key.
     let mut log2 = log2;
@@ -288,21 +295,29 @@ fn witnesses_enrol_by_the_rules() {
         ws[0].add_checkpoint(&req2, NOW),
         Err(WitnessRefusal::Forbidden)
     );
+    // Even if the host serves log 2's key: log n > 1 gets its key only
+    // from a hand-off, and the witness fetches only log 1's key file.
+    ws[0].serve_log(&log2);
+    let fetches = ws[0].key_files().fetched().len();
     assert_eq!(
-        ws[0].enrol(&log2.key(), &req2, NOW),
+        ws[0].add_checkpoint(&req2, NOW + 1),
         Err(WitnessRefusal::Forbidden)
     );
-    // Log 1 of the same host under another key: refused.
+    assert_eq!(ws[0].key_files().fetched().len(), fetches);
+    // Log 1 of the same host under another key, even if the host serves
+    // that key now: refused, since the origin has its key for good.
     let other1 = MemoryLog::new(&origin(1), &[9; 32]);
+    ws[0].serve_log(&other1);
     let req = AddCheckpoint {
         old_size: 0,
         proof: vec![],
         checkpoint: other1.checkpoint(NOW + 60),
     };
     assert_eq!(
-        ws[0].enrol(&other1.key(), &req, NOW + 60),
+        ws[0].add_checkpoint(&req, NOW + 60),
         Err(WitnessRefusal::Forbidden)
     );
+    ws[0].serve_log(&log1);
 
     // A hand-off shown before its checkpoint is cosigned: 409, with the
     // witness's size.
@@ -325,14 +340,21 @@ fn witnesses_enrol_by_the_rules() {
     bad.entry = log1.entry(0).unwrap().to_vec();
     assert_eq!(ws[0].handoff(&bad), Err(WitnessRefusal::Unprocessable));
     assert_eq!(
-        ws[0].handoff_body(b"index 1\n\n"),
+        ws[0].handoff_body(b"risala-handoff/1\nindex 1\n\n"),
         Err(WitnessRefusal::BadRequest)
     );
-    // A hand-off from a log the witness does not know.
+    // A good body without its version line does not parse: 400.
+    let body = good.to_body();
+    let unversioned = body.strip_prefix("risala-handoff/1\n").unwrap();
+    assert_eq!(
+        ws[0].handoff_body(unversioned.as_bytes()),
+        Err(WitnessRefusal::BadRequest)
+    );
+    // A hand-off from a log the witness does not know: 403 (SPEC 4.10).
     let stranger = MemoryLog::new(&LogOrigin::new("x.example", 1).unwrap(), &[5; 32]);
     let mut bad = good.clone();
     bad.checkpoint = stranger.checkpoint(NOW);
-    assert_eq!(ws[0].handoff(&bad), Err(WitnessRefusal::UnknownLog));
+    assert_eq!(ws[0].handoff(&bad), Err(WitnessRefusal::Forbidden));
 
     assert_eq!(ws[0].handoff(&good), Ok(()));
     // Log 2 enrols only under the key the hand-off names.
@@ -344,10 +366,6 @@ fn witnesses_enrol_by_the_rules() {
     };
     assert_eq!(
         ws[0].add_checkpoint(&req, NOW + 120),
-        Err(WitnessRefusal::Forbidden)
-    );
-    assert_eq!(
-        ws[0].enrol(&impostor2.key(), &req, NOW + 120),
         Err(WitnessRefusal::Forbidden)
     );
     let req2 = AddCheckpoint {
@@ -363,8 +381,9 @@ fn witnesses_enrol_by_the_rules() {
         proof: vec![],
         checkpoint: log3.checkpoint(NOW + 120),
     };
+    ws[0].serve_log(&log3);
     assert_eq!(
-        ws[0].enrol(&log3.key(), &req3, NOW + 120),
+        ws[0].add_checkpoint(&req3, NOW + 120),
         Err(WitnessRefusal::Forbidden)
     );
 }
@@ -536,7 +555,8 @@ fn witnesses_limit_new_hosts_per_domain() {
             proof: vec![],
             checkpoint: log.checkpoint(now),
         };
-        w.enrol(&log.key(), &req, now).map(|_| ())
+        w.serve_log(&log);
+        w.add_checkpoint(&req, now).map(|_| ())
     };
     assert_eq!(enrol("a.example.org", NOW), Ok(()));
     assert_eq!(enrol("bb.example.org", NOW + 1), Ok(()));

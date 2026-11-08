@@ -133,12 +133,12 @@ proptest! {
     }
 
     #[test]
-    fn hints_never_panic(s in "([0-9]{0,4}\n?){0,8}") {
+    fn hints_never_panic(s in "(risala-hint/1\n)?([0-9]{0,4}\n?){0,8}") {
         if let Ok(h) = UidHint::parse(s.as_bytes()) {
             prop_assert_eq!(h.to_body(), s.clone());
         }
         if let Ok(n) = parse_next(s.as_bytes()) {
-            prop_assert_eq!(format!("{n}\n"), s);
+            prop_assert_eq!(format!("risala-hint/1\n{n}\n"), s);
         }
     }
 
@@ -149,7 +149,7 @@ proptest! {
     }
 
     #[test]
-    fn handoff_requests_never_panic(s in "(index [0-9]{1,3}\n)?([A-Za-z0-9+/=]{0,12}\n){0,3}\n?([a-z0-9+/= ]{0,20}\n){0,4}") {
+    fn handoff_requests_never_panic(s in "(risala-handoff/1\n)?(index [0-9]{1,3}\n)?([A-Za-z0-9+/=]{0,12}\n){0,3}\n?([a-z0-9+/= ]{0,20}\n){0,4}") {
         let _ = HandoffRequest::parse(s.as_bytes());
     }
 

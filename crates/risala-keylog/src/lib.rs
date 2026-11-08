@@ -9,7 +9,8 @@
 //!   checkpoints and witnesses cosign them;
 //! - [`entry`]: the log's entries, `LogEntry`: a key file Record, or a
 //!   hand-off to the host's next log;
-//! - [`hint`]: the log's `risala/uid/<hash>` and `risala/next` hints;
+//! - [`hint`]: the log's `risala/uid/<hash>` and `risala/next` hints, and
+//!   its `risala/key` file;
 //! - [`merkle`] and [`proof`]: the Merkle tree of RFC 6962 with SHA-256,
 //!   and RFC 9162's inclusion and consistency proofs;
 //! - [`tile`]: tiles and entry bundles [TLOG-TILES], built by the server
@@ -22,7 +23,7 @@
 //!   [TLOG-WITNESS];
 //! - [`handoff`]: the body of a witness's `risala/handoff` request;
 //! - [`witnessing`]: a witness for risala key logs (SPEC 4.10), with its
-//!   storage behind a trait;
+//!   storage and its fetching of hosts' log keys behind traits;
 //! - [`testlog`]: an in-memory log and witness, for tests.
 //!
 //! What a Record holds (SPEC 4.4) is not this crate's business: a record
@@ -55,4 +56,4 @@ pub use merkle::{Hash, leaf_hash};
 pub use note::{Note, NoteSignature, VerifierKey};
 pub use tile::{TileFetcher, TileId, TileSet};
 pub use witness::{Freshness, LogKey, WitnessPolicy, WitnessedCheckpoint};
-pub use witnessing::{WitnessConfig, WitnessCore, WitnessStore};
+pub use witnessing::{LogKeyFetcher, WitnessConfig, WitnessCore, WitnessStore};

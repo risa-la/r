@@ -5,6 +5,7 @@
 //! could learn the next log from.
 //!
 //! ```text
+//! risala-handoff/1
 //! index <index of the hand-off entry>
 //! <the encoded LogEntry, base64>
 //! <inclusion proof hash, base64>
@@ -25,6 +26,9 @@ use crate::merkle::Hash;
 
 /// The path of the request, under a witness's URL prefix (SPEC 4.10, 15).
 pub const HANDOFF_PATH: &str = "risala/handoff";
+
+/// The first line of the request body (SPEC 4.10, 15).
+pub const HANDOFF_HEADER: &str = "risala-handoff/1";
 
 /// The most inclusion proof hashes a request may have: one per level of a
 /// tree of 2^64 entries.
@@ -57,7 +61,11 @@ pub enum HandoffRequestError {
 impl HandoffRequest {
     /// The request body.
     pub fn to_body(&self) -> String {
-        let mut s = format!("index {}\n{}\n", self.index, BASE64.encode(&self.entry));
+        let mut s = format!(
+            "{HANDOFF_HEADER}\nindex {}\n{}\n",
+            self.index,
+            BASE64.encode(&self.entry)
+        );
         for h in &self.proof {
             s.push_str(&h.to_base64());
             s.push('\n');
@@ -79,6 +87,11 @@ impl HandoffRequest {
         let head = std::str::from_utf8(&body[..split])
             .map_err(|_| HandoffRequestError::Malformed("not UTF-8"))?;
         let mut lines = head.split('\n');
+        if lines.next() != Some(HANDOFF_HEADER) {
+            return Err(HandoffRequestError::Malformed(
+                "does not start with risala-handoff/1",
+            ));
+        }
         let index = lines
             .next()
             .and_then(|l| l.strip_prefix("index "))
@@ -136,7 +149,7 @@ mod tests {
         for proof in [vec![], vec![leaf_hash(b"a"), leaf_hash(b"b")]] {
             let r = request(proof);
             let body = r.to_body();
-            assert!(body.starts_with("index 2\nAQJlbnRyeQ==\n"));
+            assert!(body.starts_with("risala-handoff/1\nindex 2\nAQJlbnRyeQ==\n"));
             assert_eq!(HandoffRequest::parse(body.as_bytes()), Ok(r));
         }
     }
@@ -146,25 +159,33 @@ mod tests {
         let body = request(vec![leaf_hash(b"a")]).to_body();
         let cp = &body[body.find("\n\n").unwrap() + 2..];
         let hash = leaf_hash(b"a").to_base64();
+        // The version line comes first (SPEC 4.10).
         for bad in [
-            format!("index 02\nAQJlbnRyeQ==\n\n{cp}"),
-            format!("index\nAQJlbnRyeQ==\n\n{cp}"),
-            format!("idx 2\nAQJlbnRyeQ==\n\n{cp}"),
-            format!("index 2\nAQJlbnRyeQ\n\n{cp}"),
-            format!("index 2\nAQJlbnRyeR==\n\n{cp}"),
-            format!("index 2\n\n{cp}"),
-            format!("index 2\nAQJlbnRyeQ==\nAAAA\n\n{cp}"),
-            format!("index 2\nAQJlbnRyeQ==\n{hash}\n{cp}"),
+            format!("index 2\nAQJlbnRyeQ==\n\n{cp}"),
+            format!("risala-handoff/2\nindex 2\nAQJlbnRyeQ==\n\n{cp}"),
+            format!("RISALA-HANDOFF/1\nindex 2\nAQJlbnRyeQ==\n\n{cp}"),
+        ] {
+            assert!(HandoffRequest::parse(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        for bad in [
+            format!("risala-handoff/1\nindex 02\nAQJlbnRyeQ==\n\n{cp}"),
+            format!("risala-handoff/1\nindex\nAQJlbnRyeQ==\n\n{cp}"),
+            format!("risala-handoff/1\nidx 2\nAQJlbnRyeQ==\n\n{cp}"),
+            format!("risala-handoff/1\nindex 2\nAQJlbnRyeQ\n\n{cp}"),
+            format!("risala-handoff/1\nindex 2\nAQJlbnRyeR==\n\n{cp}"),
+            format!("risala-handoff/1\nindex 2\n\n{cp}"),
+            format!("risala-handoff/1\nindex 2\nAQJlbnRyeQ==\nAAAA\n\n{cp}"),
+            format!("risala-handoff/1\nindex 2\nAQJlbnRyeQ==\n{hash}\n{cp}"),
             format!(
-                "index 2\nAQJlbnRyeQ==\n{}\n{cp}",
+                "risala-handoff/1\nindex 2\nAQJlbnRyeQ==\n{}\n{cp}",
                 format!("{hash}\n").repeat(65)
             ),
-            "index 2\nAQJlbnRyeQ==\n\nnot a checkpoint\n".to_owned(),
+            "risala-handoff/1\nindex 2\nAQJlbnRyeQ==\n\nnot a checkpoint\n".to_owned(),
         ] {
             assert!(HandoffRequest::parse(bad.as_bytes()).is_err(), "{bad:?}");
         }
         let max = format!(
-            "index 2\nAQJlbnRyeQ==\n{}\n{cp}",
+            "risala-handoff/1\nindex 2\nAQJlbnRyeQ==\n{}\n{cp}",
             format!("{hash}\n").repeat(64)
         );
         assert!(HandoffRequest::parse(max.as_bytes()).is_ok());

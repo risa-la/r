@@ -6,30 +6,29 @@
 //!
 //! The rules, on top of [TLOG-WITNESS]:
 //!
-//! - **Open enrolment.** A log enrols by sending its first checkpoint, with
-//!   old size 0. Its origin must be `<host>/risala-log/<n>`, and its
-//!   checkpoint signed under an ML-DSA-44 key named after the origin, with
-//!   a timestamp that is not zero. Log 1 of a host enrols only if the
-//!   witness has never enrolled a log of that host; log `n` > 1 only if
-//!   the witness enrolled log `n`-1 and took a hand-off from it to this
-//!   origin and key. No origin ever gets a second key.
+//! - **Enrolment that proves control of the host.** A log enrols by
+//!   sending its first checkpoint, with old size 0. Its origin must be
+//!   `<host>/risala-log/<n>`, and its checkpoint signed under an ML-DSA-44
+//!   key named after the origin, with a timestamp that is not zero. The
+//!   witness gets that key itself: for log 1, from
+//!   `https://<host>/risala-log/1/risala/key`, through a
+//!   [`LogKeyFetcher`], at most once a minute for each origin; for log `n`
+//!   > 1, from the hand-off it took from log `n`-1. Log 1 of a host enrols
+//!   only if the witness has never enrolled a log of that host. No origin
+//!   ever gets a second key.
 //! - **Hand-offs.** Log `n`-1 shows the witness its hand-off entry, the
 //!   last entry of the newest checkpoint the witness cosigned for it, with
 //!   an inclusion proof. From then on the witness cosigns no larger tree of
-//!   log `n`-1.
+//!   log `n`-1. The answers are 400, 409, 422 and 403 (SPEC 4.10).
 //! - **Limits.** By host: how many new hosts under one registered domain
 //!   it enrols, and how fast; and checkpoints of one log no more often
 //!   than every 10 seconds.
 //! - **Cosignatures** are ML-DSA-44 with the time the witness made them,
 //!   never zero.
 //!
-//! Where the public key of log 1 comes from is not in the requests: an
-//! `add-checkpoint` request carries the signed checkpoint but not the key,
-//! and ML-DSA signatures do not give it. [`WitnessCore::enrol`] therefore
-//! takes it from the caller, which must have it from somewhere it trusts
-//! as much as the log's host (for example the host's `INFO log-key=`, SPEC
-//! 8.5, over TLS). Log `n` > 1 needs no such key: it comes from the
-//! hand-off. (SPEC 4.10 is silent; a choice to confirm.)
+//! The fetching itself, HTTPS under the rules for fetching key files (SPEC
+//! 4.4: TLS 1.3, WebPKI, no redirects, 10 seconds, 64 KiB, no
+//! special-purpose addresses), is the caller's: this crate does no I/O.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -42,6 +41,7 @@ use crate::checkpoint::LogOrigin;
 use crate::cosig::{CosignatureVerifier, Cosigner};
 use crate::entry::LogEntry;
 use crate::handoff::HandoffRequest;
+use crate::hint::{KEY_PATH, parse_log_key};
 use crate::merkle::{Hash, empty_root, leaf_hash};
 use crate::note::{NoteSignature, VerifierKey};
 use crate::proof::{verify_consistency, verify_inclusion};
@@ -50,6 +50,46 @@ use crate::witness::{LogKey, verify_log_signature};
 /// How often a witness cosigns checkpoints of one log, at most: once every
 /// this many seconds (SPEC 4.10).
 pub const MIN_INTERVAL: u64 = 10;
+
+/// How often a witness fetches the key file of one origin, at most: once
+/// every this many seconds (SPEC 4.10).
+pub const KEY_FETCH_INTERVAL: u64 = 60;
+
+/// Fetches the key file of a host's first log, for a witness to enrol it
+/// (SPEC 4.10). The server that runs the witness implements it.
+pub trait LogKeyFetcher {
+    /// GETs `url`, which is always `https://<host>/risala-log/1/risala/key`,
+    /// under the rules for fetching key files (SPEC 4.4): HTTPS with TLS
+    /// 1.3, a certificate valid for `<host>` from a public certificate
+    /// authority, no redirects, at most 10 seconds and 64 KiB, and no
+    /// special-purpose addresses. Returns the body of a 200 response, or
+    /// `None` if the file could not be fetched, which the witness answers
+    /// with 503 so that the log tries again later.
+    fn fetch_log_key(&mut self, url: &str) -> Option<Vec<u8>>;
+}
+
+/// A [`LogKeyFetcher`] that fetches nothing, for a witness that takes no
+/// new hosts: every log 1 it does not know gets 503.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoFetch;
+
+impl LogKeyFetcher for NoFetch {
+    fn fetch_log_key(&mut self, _url: &str) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl<F: FnMut(&str) -> Option<Vec<u8>>> LogKeyFetcher for F {
+    fn fetch_log_key(&mut self, url: &str) -> Option<Vec<u8>> {
+        self(url)
+    }
+}
+
+/// The URL a witness fetches the key of `origin`'s log from: the log's URL
+/// prefix and `risala/key` (SPEC 4.5, 4.10).
+pub fn log_key_url(origin: &LogOrigin) -> String {
+    format!("{}/{KEY_PATH}", origin.url())
+}
 
 /// What a witness knows of one log it has enrolled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,8 +258,9 @@ pub enum WitnessRefusal {
     #[error("400 bad request")]
     BadRequest,
     /// 403: the checkpoint is not signed by the log's key as SPEC 4.5
-    /// says, the log may not enrol (SPEC 4.10), or the log has handed off
-    /// and the checkpoint is larger than the hand-off's.
+    /// says, the log may not enrol (SPEC 4.10), its key file is not valid,
+    /// or the log has handed off and the checkpoint is larger than the
+    /// hand-off's. Also a hand-off from a log the witness has not enrolled.
     #[error("403 forbidden")]
     Forbidden,
     /// 404: the witness does not know the log, and the request does not
@@ -240,6 +281,11 @@ pub enum WitnessRefusal {
     /// names no status; a choice to confirm.)
     #[error("429 too many requests")]
     TooManyRequests,
+    /// 503: the witness could not fetch the key file of a log 1 it would
+    /// enrol, or fetched it less than a minute ago (SPEC 4.10); the log
+    /// tries again later.
+    #[error("503 unavailable")]
+    Unavailable,
 }
 
 impl WitnessRefusal {
@@ -252,6 +298,7 @@ impl WitnessRefusal {
             WitnessRefusal::Conflict(_) => 409,
             WitnessRefusal::Unprocessable => 422,
             WitnessRefusal::TooManyRequests => 429,
+            WitnessRefusal::Unavailable => 503,
         }
     }
 }
@@ -294,21 +341,38 @@ impl<E> From<WitnessRefusal> for CoreError<E> {
     }
 }
 
-/// A witness: its ML-DSA-44 key, its store and its limits.
-#[derive(Debug)]
-pub struct WitnessCore<S> {
+/// A witness: its ML-DSA-44 key, its store, how it fetches the keys of
+/// hosts' first logs, and its limits.
+pub struct WitnessCore<S, F = NoFetch> {
     cosigner: Cosigner,
     store: S,
+    fetcher: F,
     config: WitnessConfig,
+    /// When the witness last fetched each origin's key file, in seconds
+    /// since 1970; entries older than [`KEY_FETCH_INTERVAL`] are dropped.
+    fetched: BTreeMap<LogOrigin, u64>,
 }
 
-impl<S: WitnessStore> WitnessCore<S> {
-    /// A witness that cosigns with `cosigner`.
-    pub fn new(cosigner: Cosigner, store: S, config: WitnessConfig) -> WitnessCore<S> {
+impl<S: fmt::Debug, F> fmt::Debug for WitnessCore<S, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WitnessCore")
+            .field("cosigner", &self.cosigner)
+            .field("store", &self.store)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: WitnessStore, F: LogKeyFetcher> WitnessCore<S, F> {
+    /// A witness that cosigns with `cosigner`, and fetches the keys of
+    /// hosts' first logs with `fetcher`.
+    pub fn new(cosigner: Cosigner, store: S, fetcher: F, config: WitnessConfig) -> WitnessCore<S, F> {
         WitnessCore {
             cosigner,
             store,
+            fetcher,
             config,
+            fetched: BTreeMap::new(),
         }
     }
 
@@ -337,53 +401,20 @@ impl<S: WitnessStore> WitnessCore<S> {
         &self.config
     }
 
+    /// The fetcher, to change.
+    pub fn fetcher_mut(&mut self) -> &mut F {
+        &mut self.fetcher
+    }
+
     /// Handles an `add-checkpoint` request at `now`, in seconds since 1970,
-    /// and returns the cosignature to answer with. A log `n` > 1 that the
-    /// witness has taken a hand-off to enrols this way; log 1 of a host
-    /// enrols with [`enrol`](Self::enrol), which supplies its key.
+    /// and returns the cosignature to answer with. A request with old size
+    /// 0 for a log the witness does not know enrols it, with the key the
+    /// witness gets itself (see the module's documentation).
     ///
     /// `rnd` is ML-DSA.Sign's randomness: 32 fresh random bytes.
     pub fn add_checkpoint(
         &mut self,
         req: &AddCheckpoint,
-        now: u64,
-        rnd: [u8; 32],
-    ) -> Result<Vec<NoteSignature>, CoreError<S::Error>> {
-        self.cosign(req, None, now, rnd)
-    }
-
-    /// Handles an `add-checkpoint` request that may enrol a log whose key
-    /// the caller has from elsewhere (see the module's documentation). For
-    /// a log the witness knows, or one it took a hand-off to, the key must
-    /// be the one it holds, or the request gets 403.
-    pub fn enrol(
-        &mut self,
-        key: &LogKey,
-        req: &AddCheckpoint,
-        now: u64,
-        rnd: [u8; 32],
-    ) -> Result<Vec<NoteSignature>, CoreError<S::Error>> {
-        self.cosign(req, Some(key), now, rnd)
-    }
-
-    /// Handles an `add-checkpoint` request body, and returns the response
-    /// body: the cosignature's line. `key` is as for [`enrol`](Self::enrol).
-    pub fn add_checkpoint_body(
-        &mut self,
-        body: &[u8],
-        key: Option<&LogKey>,
-        now: u64,
-        rnd: [u8; 32],
-    ) -> Result<String, CoreError<S::Error>> {
-        let req = AddCheckpoint::parse(body).map_err(|_| WitnessRefusal::BadRequest)?;
-        let sigs = self.cosign(&req, key, now, rnd)?;
-        Ok(sigs.iter().map(NoteSignature::to_line).collect())
-    }
-
-    fn cosign(
-        &mut self,
-        req: &AddCheckpoint,
-        offered: Option<&LogKey>,
         now: u64,
         rnd: [u8; 32],
     ) -> Result<Vec<NoteSignature>, CoreError<S::Error>> {
@@ -393,18 +424,12 @@ impl<S: WitnessStore> WitnessCore<S> {
         let cp = req.checkpoint.checkpoint();
         let origin: LogOrigin = cp.origin().parse().map_err(|_| WitnessRefusal::Forbidden)?;
         let (mut state, enrolling) = match self.store.log(&origin).map_err(CoreError::Store)? {
-            Some(state) => {
-                // One key per origin, ever.
-                if offered.is_some_and(|k| *k != state.key) {
-                    return Err(WitnessRefusal::Forbidden.into());
-                }
-                (state, false)
-            }
+            Some(state) => (state, false),
             None => {
                 if req.old_size != 0 {
                     return Err(WitnessRefusal::UnknownLog.into());
                 }
-                let key = self.enrolment_key(&origin, offered)?;
+                let key = self.enrolment_key(&origin, now)?;
                 let domain = (self.config.registered_domain)(origin.host());
                 let state = LogState {
                     key,
@@ -474,21 +499,30 @@ impl<S: WitnessStore> WitnessCore<S> {
         Ok(vec![self.cosigner.cosign(cp, now, rnd)])
     }
 
+    /// Handles an `add-checkpoint` request body, and returns the response
+    /// body: the cosignature's line.
+    pub fn add_checkpoint_body(
+        &mut self,
+        body: &[u8],
+        now: u64,
+        rnd: [u8; 32],
+    ) -> Result<String, CoreError<S::Error>> {
+        let req = AddCheckpoint::parse(body).map_err(|_| WitnessRefusal::BadRequest)?;
+        let sigs = self.add_checkpoint(&req, now, rnd)?;
+        Ok(sigs.iter().map(NoteSignature::to_line).collect())
+    }
+
     /// The key a log not yet enrolled may enrol with, or why it may not.
     fn enrolment_key(
         &mut self,
         origin: &LogOrigin,
-        offered: Option<&LogKey>,
+        now: u64,
     ) -> Result<LogKey, CoreError<S::Error>> {
         let Some(previous) = origin.previous() else {
             // Log 1: this host has never enrolled a log, since every later
-            // log needs the one before it. Its key must come from the
-            // caller.
-            let key = offered.ok_or(WitnessRefusal::UnknownLog)?;
-            if key.origin() != origin {
-                return Err(WitnessRefusal::Forbidden.into());
-            }
-            return Ok(key.clone());
+            // log needs the one before it. Its key comes from the host's
+            // HTTPS server, so only whoever controls the host can enrol it.
+            return self.fetch_first_key(origin, now);
         };
         // Log n > 1: only with a hand-off from log n-1 to this origin and
         // key.
@@ -498,10 +532,34 @@ impl<S: WitnessStore> WitnessCore<S> {
             .map_err(CoreError::Store)?
             .ok_or(WitnessRefusal::Forbidden)?;
         let handoff = prev.handoff.ok_or(WitnessRefusal::Forbidden)?;
-        if handoff.next.origin() != origin || offered.is_some_and(|k| *k != handoff.next) {
+        if handoff.next.origin() != origin {
             return Err(WitnessRefusal::Forbidden.into());
         }
         Ok(handoff.next)
+    }
+
+    /// Fetches the key of log 1 of a host, at most once a minute for each
+    /// origin (SPEC 4.10): 503 if it could not, or did less than a minute
+    /// ago, and 403 if the file is not a valid key for the origin.
+    fn fetch_first_key(
+        &mut self,
+        origin: &LogOrigin,
+        now: u64,
+    ) -> Result<LogKey, CoreError<S::Error>> {
+        self.fetched
+            .retain(|_, at| at.saturating_add(KEY_FETCH_INTERVAL) > now);
+        // A request within the minute gets 503, not the last answer again:
+        // the witness keeps no answers, and the log tries again later.
+        // (SPEC 4.10 names no answer for it; a choice to confirm.)
+        if self.fetched.contains_key(origin) {
+            return Err(WitnessRefusal::Unavailable.into());
+        }
+        self.fetched.insert(origin.clone(), now);
+        let body = self
+            .fetcher
+            .fetch_log_key(&log_key_url(origin))
+            .ok_or(WitnessRefusal::Unavailable)?;
+        parse_log_key(&body, origin).map_err(|_| WitnessRefusal::Forbidden.into())
     }
 
     /// Handles a hand-off request, `POST <prefix>/risala/handoff` (SPEC
@@ -513,6 +571,8 @@ impl<S: WitnessStore> WitnessCore<S> {
     ///   the checkpoint's last entry, and its inclusion proof verifies
     ///   (otherwise 422).
     ///
+    /// Anything else, such as a log the witness has not enrolled, a
+    /// checkpoint its key did not sign, or a second hand-off, gets 403.
     /// Showing the same hand-off again is accepted again.
     pub fn handoff(&mut self, req: &HandoffRequest) -> Result<(), CoreError<S::Error>> {
         let cp = req.checkpoint.checkpoint();
@@ -521,7 +581,7 @@ impl<S: WitnessStore> WitnessCore<S> {
             .store
             .log(&origin)
             .map_err(CoreError::Store)?
-            .ok_or(WitnessRefusal::UnknownLog)?;
+            .ok_or(WitnessRefusal::Forbidden)?;
         let ts = verify_log_signature(state.key.verifier(), &req.checkpoint)
             .map_err(|_| WitnessRefusal::Forbidden)?;
         if ts == 0 {
@@ -599,5 +659,6 @@ mod tests {
         assert_eq!(e.refusal(), Some(WitnessRefusal::TooManyRequests));
         assert_eq!(CoreError::<Infallible>::Clock.status(), 500);
         assert_eq!(WitnessRefusal::Conflict(3).status(), 409);
+        assert_eq!(WitnessRefusal::Unavailable.status(), 503);
     }
 }
