@@ -188,7 +188,8 @@ async fn person(
         .store()
         .write(|tx| {
             tx.conn().execute(
-                "INSERT INTO identities (uid, device_id, key_id, created) VALUES (?1, ?2, ?3, 0)",
+                "INSERT INTO identities (uid, device_id, key_id, home, created)
+                 VALUES (?1, ?2, ?3, 'chat.test', 0)",
                 rusqlite::params![uid, &device.0[..], uid],
             )?;
             Ok(())
