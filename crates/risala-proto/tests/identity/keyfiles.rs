@@ -24,11 +24,7 @@ fn now() -> Timestamp {
 /// A key file of the builder's chain, every record unlogged.
 fn unlogged(b: &Builder) -> String {
     let chain = Chain::replay(&b.uid, &b.records).unwrap();
-    KeyFile::from_chain(&chain, &|_| None, &|log| {
-        format!("https://{}/risala-log/{}", log.host(), log.number())
-    })
-    .unwrap()
-    .to_text()
+    KeyFile::from_chain(&chain, &|_| None).unwrap().to_text()
 }
 
 /// A log of entries: the builder's records at indices 10, 20, ...
@@ -114,10 +110,7 @@ fn logged_files_are_checked_against_the_log() {
     b.device(1, "laptop").device(2, "phone");
     let chain = Chain::replay(&b.uid, &b.records).unwrap();
     // The first two are logged, the last not yet.
-    let file = KeyFile::from_chain(&chain, &|i| (i < 2).then_some(10 * (i as u64 + 1)), &|_| {
-        URL.to_owned()
-    })
-    .unwrap();
+    let file = KeyFile::from_chain(&chain, &|i| (i < 2).then_some(10 * (i as u64 + 1))).unwrap();
     let text = file.to_text();
     assert!(text.contains(&format!(
         "\n10 {}\n20 {}\n- ",
@@ -377,11 +370,19 @@ fn text_rules() {
 
     // Bad log lines.
     let vkey = log1().vkey();
+    // The URL is always `https://` and the log's origin (4.4, 4.5).
     for url in [
         "http://chat.example.org/l",
         "https://chat.example.org/",
         "https://",
         "chat.example.org",
+        "http://chat.example.org/risala-log/1",
+        "https://chat.example.org/risala-log/1/",
+        "https://chat.example.org/risala-log/2",
+        "https://Chat.example.org/risala-log/1",
+        "https://chat.example.org:443/risala-log/1",
+        "https://keys.example.net/risala-log/1",
+        "https://chat.example.org/logs/risala-log/1",
     ] {
         let t = text.replacen(URL, url, 1);
         assert!(invalid(&t), "{url}");

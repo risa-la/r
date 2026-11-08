@@ -330,7 +330,7 @@ fn ok_values() {
         .with_anon(true)
         .with_guests(false)
         .with_register(&Register::Domain("example.org".parse().unwrap()))
-        .with_log(&Log::Url("https://chat.example.org/log/".into()))
+        .with_log(&Log::Url("https://chat.example.org/risala-log/1".into()))
         .with_retention(Retention::new(30).unwrap())
         .with_push(true)
         .with_upload(Upload::MaxBytes(1 << 20))
@@ -377,7 +377,7 @@ fn ok_values() {
     );
     assert_eq!(
         ok.log(),
-        Ok(Some(Log::Url("https://chat.example.org/log/".into())))
+        Ok(Some(Log::Url("https://chat.example.org/risala-log/1".into())))
     );
     assert_eq!(ok.retention(), Ok(Retention::new(30)));
     assert_eq!(ok.push(), Ok(Some(true)));
@@ -420,6 +420,20 @@ fn ok_values() {
     assert!(ok.retention().is_err());
     assert!(ok.log().is_err());
     assert_eq!(ok.value("unknown"), Some("1"));
+    // `log=` is https:// and the log's origin, exactly (4.5, 8.5).
+    for url in [
+        "https://chat.example.org/log",
+        "https://chat.example.org/risala-log/1/",
+        "https://chat.example.org/risala-log/0",
+        "https://chat.example.org:443/risala-log/1",
+        "https://Chat.example.org/risala-log/1",
+        "HTTPS://chat.example.org/risala-log/1",
+        "http://chat.example.org/risala-log/1",
+    ] {
+        assert!(url.parse::<Log>().is_err(), "{url}");
+    }
+    let log: Log = "https://chat.example.org/risala-log/2".parse().unwrap();
+    assert_eq!(log.origin(), Some("chat.example.org/risala-log/2"));
     assert!(OkResponse::new().with_files(&[]).is_err());
 }
 

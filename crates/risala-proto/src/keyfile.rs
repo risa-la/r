@@ -93,35 +93,30 @@ pub enum KeyFileError {
 pub struct LogLine {
     /// The log.
     pub log: LogKey,
-    /// Its `https` URL prefix [TLOG-TILES], without a `/` at the end.
+    /// Its URL prefix [TLOG-TILES], which is always `https://` followed by
+    /// the log's origin (4.4, 4.5).
     pub url: String,
 }
 
 impl LogLine {
-    /// A `log` line for `log` at `url`, which must be an `https` URL that
-    /// does not end with `/` and holds no space.
-    pub fn new(log: LogKey, url: &str) -> Option<LogLine> {
-        is_log_url(url).then(|| LogLine {
-            log,
-            url: url.to_owned(),
-        })
+    /// The `log` line for `log`, at its URL prefix, `https://` followed
+    /// by its origin (4.4, 4.5).
+    pub fn new(log: LogKey) -> LogLine {
+        let url = log_url(&log);
+        LogLine { log, url }
     }
+}
+
+/// A key log's URL prefix: always `https://` followed by its origin
+/// (4.4, 4.5), so that anyone who knows the origin can find the log.
+pub fn log_url(log: &LogKey) -> String {
+    format!("https://{}", log.origin())
 }
 
 impl fmt::Display for LogLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "log {} {}", self.log.vkey(), self.url)
     }
-}
-
-/// Whether `url` can be a `log` line's URL prefix (4.4): `https://`, then
-/// at least one character, no `/` at the end, and nothing a line may not
-/// hold.
-fn is_log_url(url: &str) -> bool {
-    url.strip_prefix("https://")
-        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
-        && !url.ends_with('/')
-        && !url.contains([' ', '\t', '\r', '\n'])
 }
 
 /// How a key file lists one record (4.4).
@@ -229,13 +224,15 @@ impl KeyFile {
                     let Ok(log) = LogKey::from_vkey(b) else {
                         return invalid(n, "not a key log's verifier key");
                     };
-                    let Some(log_line) = LogLine::new(log, url) else {
-                        return invalid(n, "a log URL is https, without a / at the end");
-                    };
-                    // A new log line starts the records of another log
-                    // (4.4). The same log twice in a row would be one
-                    // log split in two. (4.4 does not say; a choice to
-                    // confirm.)
+                    // The URL is `https://` and the log's origin, byte for
+                    // byte; a file with anything else is invalid (4.4).
+                    let log_line = LogLine::new(log);
+                    if url != log_line.url {
+                        return invalid(n, "a log URL is https:// and the log's origin");
+                    }
+                    // A new log line starts the records of another log,
+                    // and never names the same log as the one before it
+                    // (4.4).
                     if sections.last().is_some_and(|s| s.log.log == log_line.log) {
                         return invalid(n, "a log line names the log before it again");
                     }
@@ -293,22 +290,20 @@ impl KeyFile {
     /// The key file that lists `chain` (4.4), for the identity's host or
     /// owner to publish. `logged` gives the index of each record that its
     /// log holds, by the record's position in the chain; the others are
-    /// listed whole. `url` gives each log's URL prefix. A chain that ends
-    /// with a `log` record also gets a last `log` line, naming the log
-    /// that the next records go into.
+    /// listed whole. Each log's URL prefix is `https://` and its origin
+    /// (4.4). A chain that ends with a `log` record also gets a last `log`
+    /// line, naming the log that the next records go into.
     ///
-    /// Fails if a logged record follows one that is not, or if a URL is
-    /// not a valid `log` line URL.
+    /// Fails if a logged record follows one that is not.
     pub fn from_chain(
         chain: &Chain,
         logged: &dyn Fn(usize) -> Option<u64>,
-        url: &dyn Fn(&LogKey) -> String,
     ) -> Result<KeyFile, KeyFileError> {
         let mut text = format!("{KEY_FILE_HEADER}\n");
         let mut current: Option<&LogKey> = None;
         for (i, (record, log)) in chain.records().iter().zip(chain.placements()).enumerate() {
             if current != Some(log) {
-                text.push_str(&format!("log {} {}\n", log.vkey(), url(log)));
+                text.push_str(&format!("{}\n", LogLine::new(log.clone())));
                 current = Some(log);
             }
             let listing = match logged(i) {
@@ -322,7 +317,7 @@ impl KeyFile {
         }
         if chain.head().record_type() == crate::record::RecordType::Log {
             let log = chain.log();
-            text.push_str(&format!("log {} {}\n", log.vkey(), url(log)));
+            text.push_str(&format!("{}\n", LogLine::new(log.clone())));
         }
         KeyFile::parse(text.as_bytes())
     }

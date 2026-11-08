@@ -13,7 +13,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use risala_proto::auth::{Nonce, SecretKey, SignLabel, challenge_bytes, risala_sign_content};
 use risala_proto::chain::{Chain, NoHandoffs};
-use risala_proto::keyfile::{KeyFile, KeyFileState, NoEntries, Response, read_key_file};
+use risala_proto::keyfile::{
+    KeyFile, KeyFileState, NoEntries, Response, log_url, read_key_file,
+};
 use risala_proto::names::Identity;
 use risala_proto::pairing::{NewDevice, NewDeviceContent, PairingCode, PairingError};
 use risala_proto::record::{
@@ -192,15 +194,11 @@ pub fn fixture() -> Fixture {
     }
 }
 
-fn url(log: &LogKey) -> String {
-    format!("https://{}/risala-log/{}", log.host(), log.number())
-}
-
 /// The key file of the first `n` records, the first `logged` of them by
 /// index (0, 1, 2, ...) and the rest unlogged.
 pub fn key_file(f: &Fixture, n: usize, logged: usize) -> String {
     let chain = Chain::replay(&f.uid, &f.records[..n]).unwrap();
-    KeyFile::from_chain(&chain, &|i| (i < logged).then_some(i as u64), &url)
+    KeyFile::from_chain(&chain, &|i| (i < logged).then_some(i as u64))
         .unwrap()
         .to_text()
 }
@@ -210,7 +208,7 @@ pub fn key_file(f: &Fixture, n: usize, logged: usize) -> String {
 pub fn must_fail(f: &Fixture) -> Vec<(&'static str, String)> {
     let good = key_file(f, 2, 0);
     let b64 = |r: &Record| BASE64.encode(r.encoded());
-    let log_line = format!("log {} {}", f.log.vkey(), url(&f.log));
+    let log_line = format!("log {} {}", f.log.vkey(), log_url(&f.log));
     let header = "risala-keys/1";
     let lines = |records: &[Record]| -> String {
         let mut t = format!("{header}\n{log_line}\n");
@@ -230,8 +228,8 @@ pub fn must_fail(f: &Fixture) -> Vec<(&'static str, String)> {
         (
             "parse 1, a CR before an LF",
             good.replacen(
-                &format!("{}\n", url(&f.log)),
-                &format!("{}\r\n", url(&f.log)),
+                &format!("{}\n", log_url(&f.log)),
+                &format!("{}\r\n", log_url(&f.log)),
                 1,
             ),
         ),
@@ -355,7 +353,7 @@ pub fn must_fail(f: &Fixture) -> Vec<(&'static str, String)> {
     all.push_str(&format!("- {}\n", b64(&after)));
     out.push(("replay 10, a record after a retire record", all));
     let mut misplaced = key_file(f, 7, 0);
-    let second_log = format!("log {} {}\n", f.other_log.vkey(), url(&f.other_log));
+    let second_log = format!("log {} {}\n", f.other_log.vkey(), log_url(&f.other_log));
     misplaced = misplaced.replacen(&second_log, "", 1);
     out.push((
         "replay 11, a record listed under another log than its own",
@@ -405,7 +403,7 @@ pub fn must_fail(f: &Fixture) -> Vec<(&'static str, String)> {
     ));
     out.push((
         "parse 1, a log URL that is not https and its origin",
-        good.replacen(&url(&f.log), "http://chat.example.org/risala-log/1", 1),
+        good.replacen(&log_url(&f.log), "http://chat.example.org/risala-log/1", 1),
     ));
     // In the order of 4.4's rules: parsing, then replaying.
     out.sort_by_key(|(name, _)| {
@@ -569,14 +567,14 @@ fn b4_log_and_device() {
     let f = fixture();
     ck.eq("log origin", f.log.origin());
     ck.hex("log key seed", &seed(0x03));
-    ck.eq("log URL", url(&f.log));
+    ck.eq("log URL", log_url(&f.log));
     ck.gap();
     ck.eq("key ID", format!("{:08x}", f.log.key_id()));
     ck.file("verifier key", "log-vkey.txt", f.log.vkey().as_bytes());
     ck.file(
         "log line",
         "log-line.txt",
-        format!("log {} {}", f.log.vkey(), url(&f.log)).as_bytes(),
+        format!("log {} {}", f.log.vkey(), log_url(&f.log)).as_bytes(),
     );
     assert_eq!(LogKey::from_vkey(&f.log.vkey()).unwrap(), f.log);
     ck.gap();

@@ -714,9 +714,8 @@ pub fn keys_put(
     }
     // The newest record goes into this log, or is a `log` record that
     // names it: moving to another log sends the whole chain, ending with
-    // that record, to the new log before anything is appended there
-    // (4.8). (4.7 says only "the newest of <records> is one that the
-    // chain puts in this server's log"; a choice to confirm.)
+    // that record, to the new log, which appends nothing and answers with
+    // no RECORD lines (4.7, 4.8).
     let newest_here = chain.placements().last() == Some(this_log) || chain.log() == this_log;
     if !newest_here && chain.len() > held_len {
         return Err(KeysPutError::NotThisLog);

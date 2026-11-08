@@ -817,8 +817,19 @@ impl FromStr for Upload {
 pub enum Log {
     /// `no`: the server keeps no key log.
     No,
-    /// The log's `https` URL prefix [TLOG-TILES], as given.
+    /// The log's URL prefix [TLOG-TILES], which is always `https://`
+    /// followed by its origin, `<host>/risala-log/<n>` (4.5, 8.5).
     Url(String),
+}
+
+impl Log {
+    /// The log's origin, for [`Log::Url`].
+    pub fn origin(&self) -> Option<&str> {
+        match self {
+            Log::No => None,
+            Log::Url(url) => url.strip_prefix("https://"),
+        }
+    }
 }
 
 impl fmt::Display for Log {
@@ -833,18 +844,18 @@ impl fmt::Display for Log {
 impl FromStr for Log {
     type Err = ParseError;
 
-    /// `no`, or a token that starts with `https://`, in any case.
+    /// `no`, in any case, or `https://` followed by a log origin (4.5),
+    /// exactly: an origin has one spelling, in lower case and without a
+    /// port, and the URL is the same for everyone who knows it.
     fn from_str(s: &str) -> Result<Log, ParseError> {
         if s.eq_ignore_ascii_case("no") {
             return Ok(Log::No);
         }
-        let https = s
-            .get(..8)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
-        if https && s.len() > 8 && is_token(s) {
-            Ok(Log::Url(s.to_owned()))
-        } else {
-            Err(bad("log is an https URL or no"))
+        match s.strip_prefix("https://") {
+            Some(origin) if crate::record::parse_origin(origin).is_some() => {
+                Ok(Log::Url(s.to_owned()))
+            }
+            _ => Err(bad("log is https:// and a log's origin, or no")),
         }
     }
 }
