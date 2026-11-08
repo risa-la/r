@@ -1331,6 +1331,7 @@ impl SyncEngine {
             && let Ok(Some(id)) = ok.id()
         {
             let joined = ok.joined().ok().flatten().unwrap_or(false);
+            let role = ok.role().ok().flatten();
             let head = ok.head().ok().flatten();
             let floor = self.head_floor(&conv, sent, floor);
             let (account, session_ended) = (self.account, self.session_ended());
@@ -1360,6 +1361,13 @@ impl SyncEngine {
                     }
                     tx.set_joined(&mut row, false)?;
                     left_outbox(tx, session_ended, &row)?;
+                }
+                // 6.2: the account's own role, which an owner or moderator
+                // keeps after leaving.
+                if let Some(role) = role
+                    && row.conv_id.as_ref() == Some(&id)
+                {
+                    tx.set_own_role(&row, role.0)?;
                 }
                 Ok(())
             })?;

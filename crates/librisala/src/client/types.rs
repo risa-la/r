@@ -661,6 +661,15 @@ pub struct ConversationInfo {
     /// A room's settings (6.2) as far as the cache knows, in key order,
     /// the topic included. Empty for a direct conversation.
     pub settings: Vec<Setting>,
+    /// The account's own role in a room (6.3), as far as the cache knows,
+    /// from ROLE events, [`Conversation::members`](super::Conversation::members)
+    /// and [`Conversation::room_info`](super::Conversation::room_info). An
+    /// owner or moderator keeps the role after leaving; otherwise it is
+    /// [`Role::Member`] while the account is in the room. `None` for no
+    /// role and not in the room, and for a direct conversation. JOIN does
+    /// not say it, so after creating a room, ask `room_info` to learn that
+    /// the account owns it.
+    pub role: Option<Role>,
 }
 
 /// One room setting (6.2), such as `public` = `yes`.
@@ -701,6 +710,7 @@ impl From<ConversationSummary> for ConversationInfo {
                     value: unescape(&s.value()).into_owned(),
                 })
                 .collect(),
+            role: c.role.map(Role::of),
         }
     }
 }

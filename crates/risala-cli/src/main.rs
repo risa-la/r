@@ -1246,6 +1246,9 @@ fn summary(c: &ConversationInfo) -> String {
     if c.unread > 0 {
         s.push_str(&format!(", {} unread", c.unread));
     }
+    if let Some(role) = c.role.filter(|r| r.can_moderate()) {
+        s.push_str(&format!(", {role}"));
+    }
     if !c.joined {
         s.push_str(" (left)");
     }

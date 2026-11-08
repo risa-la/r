@@ -625,7 +625,39 @@ impl<'a> Tx<'a> {
              WHERE excluded.role_seq >= room_members.role_seq",
             params![conv.0, uid, role, sql(at)],
         )?;
+        // The account's own role shows in its conversation's summary.
+        let own: Option<i64> = self
+            .tx
+            .query_row(
+                "SELECT 1 FROM convs c JOIN accounts a ON a.id = c.account
+                 WHERE c.id = ?1 AND a.uid = ?2",
+                params![conv.0, uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if own.is_some() {
+            self.changed(Change::Conversation { conv });
+        }
         Ok(())
+    }
+
+    /// Records the account's own role in `row`'s room as INFO said it
+    /// (6.2): `None` for no role and not a member, which is stored as
+    /// `member`. It describes the room now, so it counts as being at the
+    /// newest seq known, as a snapshot does.
+    pub(crate) fn set_own_role(
+        &mut self,
+        row: &ConvRow,
+        role: Option<risala_proto::types::Role>,
+    ) -> Result<(), StoreError> {
+        let at = row.head.max(self.max_seq(row.id)?);
+        let uid: String = self.tx.query_row(
+            "SELECT uid FROM accounts WHERE id = ?1",
+            [row.account.0],
+            |r| r.get(0),
+        )?;
+        let role = role.unwrap_or(risala_proto::types::Role::Member);
+        self.member_role(row.id, &uid, role.as_str(), at)
     }
 
     /// Whether a stored DELETE names `seq`.

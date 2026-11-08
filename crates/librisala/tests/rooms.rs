@@ -115,6 +115,12 @@ async fn a_moderator_invites_kicks_and_bans() {
         .unwrap(),
         None
     );
+    // Her cache learns that she owns the room she made from INFO, since
+    // JOIN does not say.
+    assert_eq!(club.info().unwrap().unwrap().role, Some(Role::Member));
+    let info = within("INFO", club.room_info()).await.unwrap();
+    assert_eq!(info.role, Some(Role::Owner));
+    assert_eq!(club.info().unwrap().unwrap().role, Some(Role::Owner));
     let roles = within("ROLES", club.roles()).await.unwrap();
     let mut roles: Vec<_> = roles.into_iter().map(|r| (r.uid, r.role)).collect();
     roles.sort();
@@ -126,6 +132,10 @@ async fn a_moderator_invites_kicks_and_bans() {
         ]
     );
     let b_club = bob.conversation("#club").unwrap();
+    until("bob learns his role", &bob.subscribe(), || {
+        b_club.info().unwrap().unwrap().role == Some(Role::Moderator)
+    })
+    .await;
     until("bob learns the setting", &bob.subscribe(), || {
         b_club
             .info()

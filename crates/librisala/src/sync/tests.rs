@@ -667,6 +667,48 @@ fn info_checks_the_id() {
 }
 
 #[test]
+fn the_accounts_own_role_is_kept() {
+    // 6.3: the account's role in each room, from INFO, ROLE events and
+    // MEMBERS. An owner or moderator who leaves keeps the role.
+    use risala_proto::types::Role;
+    let mut h = H::new(ALICE);
+    h.joined("k1", 3);
+    assert_eq!(h.conv("#general").role, Some(Role::Member));
+    let room = "#general".parse().unwrap();
+    let out = h.engine.info(&room);
+    h.absorb(out);
+    let r = h.expect("INFO #general");
+    h.reply(r, &[], "OK id=k1 members=2 head=3 role=owner joined=yes");
+    assert_eq!(h.conv("#general").role, Some(Role::Owner));
+    assert!(
+        h.changes
+            .iter()
+            .any(|c| matches!(c, Change::Conversation { .. }))
+    );
+    // A ROLE event about someone else changes nothing of the account's.
+    h.line(&ev(
+        4,
+        "from=alice@example.org ROLE #general bob@example.net mod",
+    ));
+    assert_eq!(h.conv("#general").role, Some(Role::Owner));
+    h.line(&ev(
+        5,
+        "from=bob@example.net ROLE #general alice@example.org mod",
+    ));
+    assert_eq!(h.conv("#general").role, Some(Role::Mod));
+    // Leaving keeps it.
+    h.line(&ev(6, "from=alice@example.org PART #general"));
+    assert!(!h.conv("#general").joined);
+    assert_eq!(h.conv("#general").role, Some(Role::Mod));
+    // INFO says it was taken away since.
+    let out = h.engine.info(&room);
+    h.absorb(out);
+    let r = h.expect("INFO #general");
+    h.reply(r, &[], "OK id=k1 members=1 head=7 role=none joined=no");
+    assert_eq!(h.conv("#general").role, None);
+}
+
+#[test]
 fn own_join_from_another_device() {
     // 6.1: the JOIN's id differs from the stored one.
     let mut h = H::new(ALICE);

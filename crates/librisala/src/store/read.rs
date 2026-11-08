@@ -40,6 +40,12 @@ pub struct ConversationSummary {
     /// A room's settings (6.2), as far as stored events and snapshots
     /// show, in key order. Empty for a direct conversation.
     pub settings: Vec<RoomSetting>,
+    /// The account's own role in a room (6.3), as far as the cache knows:
+    /// `owner` or `mod` as ROLE events, MEMBERS (8.3) and INFO (6.2) last
+    /// said, which an owner or moderator keeps after leaving, or else
+    /// `member` while the account is in the room. `None` otherwise, and
+    /// for a direct conversation.
+    pub role: Option<Role>,
 }
 
 impl ConversationSummary {
@@ -114,7 +120,8 @@ fn summary_sql() -> String {
                 - (SELECT COUNT(*) FROM events e
                    WHERE e.conv = c.id AND e.seq > MAX(c.read, c.sync_point)
                        AND e.seq <= c.head)),
-            (SELECT MAX(seq) FROM events e WHERE e.conv = c.id)
+            (SELECT MAX(seq) FROM events e WHERE e.conv = c.id),
+            (SELECT m.role FROM room_members m WHERE m.conv = c.id AND m.uid = a.uid)
         FROM convs c JOIN accounts a ON a.id = c.account"
     )
 }
@@ -122,21 +129,31 @@ fn summary_sql() -> String {
 type RawSummary = (
     (i64, i64, String, Option<String>, bool),
     (i64, i64, i64, i64, Option<i64>),
+    Option<String>,
 );
 
 fn raw_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawSummary> {
     Ok((
         (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
         (r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?),
+        r.get(10)?,
     ))
 }
 
 fn finish_summary(raw: RawSummary) -> Result<ConversationSummary, StoreError> {
-    let ((id, account, name, conv_id, joined), (sp, head, read, unread, newest)) = raw;
+    let ((id, account, name, conv_id, joined), (sp, head, read, unread, newest), role) = raw;
+    let name: Conv = parse(&name, "conversation")?;
+    let stored: Option<Role> = role.map(|r| parse(&r, "role")).transpose()?;
+    let role = match stored {
+        _ if !name.is_room() => None,
+        Some(r) if r.can_moderate() => Some(r),
+        _ if joined => Some(Role::Member),
+        _ => None,
+    };
     Ok(ConversationSummary {
         id: ConvId(id),
         account: AccountId(account),
-        name: parse(&name, "conversation")?,
+        name,
         conv_id: opt_id(conv_id)?,
         joined,
         sync_point: sp.max(0) as u64,
@@ -145,6 +162,7 @@ fn finish_summary(raw: RawSummary) -> Result<ConversationSummary, StoreError> {
         unread: unread.max(0) as u64,
         newest: newest.map(seq).transpose()?,
         settings: Vec::new(),
+        role,
     })
 }
 
