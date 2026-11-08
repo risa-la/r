@@ -55,7 +55,10 @@ as long as nothing sent on it names the device. So:
   open for its fetches with `leaf`, and uses it for nothing else.
 - A device MUST store the blobs and files that a post or a Welcome
   refers to over an anonymous connection (5.6, 12.12), never over its
-  signed-in one, which would tie the post to the identity.
+  signed-in one, which would tie the post to the identity. The one
+  exception is the blob of a public room's commit that it posts on its
+  signed-in connection (12.6): the commit names its sender anyway, so the
+  device MAY store that blob on the same connection.
 - A device SHOULD use a fresh anonymous connection for each CREATE,
   each KEYPKG GET (12.5) and each WELCOME PUT (12.8), and a separate
   anonymous connection for WATCH (8.3), since each says something about
@@ -64,13 +67,15 @@ as long as nothing sent on it names the device. So:
 Section 14 says what a device's anonymous connections can still reveal
 about each other.
 
-**Proof of work.** A server MAY require a client to solve a
-proof-of-work puzzle before ANON, GUEST or REGISTER succeeds, before
-CREATE, before KEYPKG GET on an anonymous or guest connection (12.5),
-and before an anonymous or guest connection joins a public room (6.1).
-The puzzle, and how it is bound to the connection, are specified
-separately: this paragraph holds the place of that specification, which
-will make proof of work on by default.
+**Proof of work.** A later draft will let a server require a client to
+solve a proof-of-work puzzle before ANON, GUEST or REGISTER succeeds,
+before CREATE, before KEYPKG GET on an anonymous or guest connection
+(12.5), and before an anonymous or guest connection joins a public room
+(6.1), and will make it on by default. It will specify the puzzle, how
+a solution is bound to the connection, how the server announces it, and
+its error code. This paragraph holds the place of that specification.
+Until it exists, a server MUST NOT require proof of work, and the other
+places in this document that mention it describe what it will cover.
 
 Servers SHOULD allow at least 120 seconds to sign in or become
 anonymous.
@@ -83,11 +88,12 @@ ANON
 
 → `OK`
 
-The connection becomes anonymous. It can then use the commands of
-Sections 5 to 7 that the summary in Section 13 marks for anonymous
-connections. The server MAY limit how many anonymous connections one
-network address keeps open, and MUST limit how much each connection and
-each network address posts and stores (5.2, 7.5).
+A server whose `anon` setting is `no` (10.6) replies `ERR forbidden`.
+Otherwise the connection becomes anonymous. It can then use the
+commands of Sections 5 to 7 that the summary in Section 13 marks for
+anonymous connections. The server MAY limit how many anonymous
+connections one network address keeps open, and MUST limit how much
+each connection and each network address posts and stores (5.2, 7.5).
 
 **What the server keeps.** Without Tor (Section 14), a server that
 watches in real time can often link an anonymous connection to a
@@ -158,6 +164,16 @@ connection closes, for example after a network drop:
   GUEST works as it does without one.
 - ADMIN DISCONNECT (10.3) and server bans (10.2) end a guest's session
   at once.
+
+```
+C: guest sam
+S: OK uid=~sam token=k3v9q2m7x8c4p1z6w5r0t2y8b4n6h1d3
+C: guest sam token=k3v9q2m7x8c4p1z6w5r0t2y8b4n6h1d3
+S: OK uid=~sam token=f8w2n5c9x1q7m3z6v4b0k2r8t5y1p7d4 resumed=yes
+```
+
+The second command is sent on a new connection after the first one
+dropped.
 
 The server replies `ERR name-taken` while a session holds the name,
 whether its connection is open or it is waiting to be resumed. A client
@@ -260,20 +276,23 @@ log <vkey> <url>
   line is not a key file of this version, and its identity's keys are
   missing (below).
 - A **`log` line** names a key log (4.5): `<vkey>` is the log's
-  signed-note verifier key [SIGNED-NOTE], and `<url>` its `https` URL
-  prefix [TLOG-TILES], without a `/` at the end. The verifier key is
-  the log's origin, a `+`, the key ID as 8 lower-case hex digits, a `+`,
-  and the base64 with padding of the byte `0x06` followed by the log's
-  1312-byte ML-DSA-44 public key. The key ID is the first 4 bytes of the
-  SHA-256 hash of the origin, an LF, the byte `0x06` and the public key.
-  For example, shortened:
-  `log chat.example.org/risala-log/1+4d1e07a2+BhO3…Zw== https://chat.example.org/risala-log/1`.
-- The second line is a `log` line. Each `log` line names the log that
-  holds the records listed after it, up to the next `log` line. There is
-  another one before the first record that the chain puts in another log
-  (4.5), after a `log` record or at a hand-off. After a `log` record, it
-  may also end the file, to name the log that the next records go into.
-  No `log` line follows another.
+  signed-note verifier key [SIGNED-NOTE], and `<url>` its URL prefix
+  [TLOG-TILES], which is always `https://` followed by the log's origin
+  (4.5), without a `/` at the end. A `log` line whose `<url>` is
+  anything else makes the file invalid. The verifier key is the log's
+  origin, a `+`, the key ID as 8 lower-case hex digits, a `+`, and the
+  base64 with padding of the byte `0x06` followed by the log's 1312-byte
+  ML-DSA-44 public key, 1752 characters that end in one `=`. The key ID
+  is the first 4 bytes of the SHA-256 hash of the origin, an LF, the
+  byte `0x06` and the public key. For example, shortened:
+  `log chat.example.org/risala-log/1+4d1e07a2+BhO3…Zw= https://chat.example.org/risala-log/1`.
+- After the first line, the first line that is not ignored is a `log`
+  line. Each `log` line names the log that holds the records listed
+  after it, up to the next `log` line. There is another one before the
+  first record that the chain puts in another log (4.5), after a `log`
+  record or at a hand-off. After a `log` record, it may also end the
+  file, to name the log that the next records go into. No `log` line
+  follows another, or names the same log as the `log` line before it.
 - A **record line** is `<index> <hash>` for a record that is in the log:
   `<index>` is its position in the log as a number (3.3), and `<hash>`
   its SHA-384 hash as a blob-ref (3.5). Indices increase within each
@@ -338,7 +357,15 @@ struct {
     RecordContent content;
     opaque signature<V>;
 } Record;
+
+struct {
+    uint8 version;               // 1
+    Record records<V>;           // oldest first
+} RecordList;
 ```
+
+A **RecordList** carries records on their own, outside a key file, as
+REGISTER and KEYS PUT do (4.7).
 
 A device's **device id** is the SHA-384 hash of its raw device key. The
 records do this:
@@ -399,15 +426,21 @@ Replaying, record by record, in order:
 5. Every ML-DSA-44 key is 1312 bytes, and every X-Wing key passes the
    checks of 12.2. A LogKey's `key` is 1313 bytes and starts with
    `0x06`, and its `origin` has the form of 4.5. No public key appears
-   twice in the chain, in any role: master keys, device-signing keys,
-   device keys and attestation keys are all different from each other.
-6. A later `master` record names the chain's current log.
+   twice among the chain's master keys, device-signing keys, device keys
+   and attestation keys, whether in the same role or in two of them.
+   LogKeys are not among these roles: a later `master` record repeats
+   the chain's LogKey by design (step 6).
+6. A later `master` record names the log that it is itself listed under
+   (step 11): the log of the chain's newest `master` or `log` record
+   before it, or the later log of the same host that this one handed
+   off to.
 7. A `signing` record's `removed` is not empty, its length is a multiple
    of 48, its ids are sorted in increasing byte order without repeats,
    and each one is a current device.
 8. A `device` record adds a device whose id the chain has never added
-   before, current or removed. Its label is valid UTF-8 of at most 64
-   bytes. After it, at most 64 devices are current.
+   before, current or removed, which step 5 already implies, since a
+   device id is the hash of a device key. Its label is valid UTF-8 of at
+   most 64 bytes. After it, at most 64 devices are current.
 9. A `log` record names another log than the current one.
 10. A `retire` record is the last record.
 11. Each record is listed under a `log` line that names the record's
@@ -420,7 +453,9 @@ clock makes the fetch an outage (below) rather than the file invalid,
 since the reader's clock may be the one that is wrong.
 
 Replaying the chain gives the identity's **current** master key,
-device-signing key, log, devices and generation. Only current devices
+device-signing key, log, devices and generation. The current log is the
+log that the chain's newest record is listed under, or, if that record
+is a `log` record, the log it names. Only current devices
 may sign in, and only their leaves are accepted in groups (12.7).
 
 **Fetching.** A key line is about 110 bytes, and a Record about 5 KiB,
@@ -456,10 +491,11 @@ one of three states:
 - **Keys missing.** A 404 or 410 response, a body larger than 2 MiB, a
   file whose first line is not `risala-keys/1`, a file that is not
   valid, or one whose `<index> <hash>` lines do not match the log. None
-  of these is signed, so none of them removes anything. While an
-  identity's keys are missing, nobody signs in with them, and devices
-  send nothing to the identity and warn their users (12.14), but keep
-  its leaves.
+  of these is signed, so none of them removes a device by record. While
+  an identity's keys are missing, nobody signs in with them, and devices
+  warn their users and treat the identity as 12.14 says: they stop
+  sending in direct conversations with it, and stop trusting its leaves
+  in rooms, until a valid key file is back.
 - **Outage.** Anything else: no response, a DNS or TLS error, a timeout,
   a 5xx response, any other status, including a redirect, a failed fetch
   from the log, or a record time in the future. This says nothing about
@@ -467,9 +503,11 @@ one of three states:
 
 A valid key file replaces a cached copy only if it **extends** it: the
 newest record that the reader holds for the identity is in its chain.
-For a device, that is its head (4.5). A valid key file that does not
-extend it is a **rollback**: a device treats it as a fork (4.5), and a
-server as keys missing (4.6). A device id that a reader has once seen
+For a device, that is its head (4.5). For a device, a valid key file
+that does not extend it is a **rollback** if its chain starts with the
+same master key, which the device treats as a fork, and a **new master
+key** if it starts with another (4.5). A server treats either as keys
+missing (4.6). A device id that a reader has once seen
 removed by record stays removed for that reader, whatever a later key
 file says. Keys missing and outages replace nothing: the reader keeps
 the chain it holds, and a cached copy stays usable until its hour is up.
@@ -510,20 +548,32 @@ struct {
   whose Record has the SHA-384 hash `<hash>`.
 - **Serving.** The log serves its checkpoint, hash tiles and entry
   bundles under its URL prefix as [TLOG-TILES] describes, over HTTPS.
-  It also serves two hints:
-  - `<url>/risala/uid/<hash>`, where `<hash>` is the SHA-256 hash of a
-    uid in lower-case hex: the indices of that uid's entries, as
-    numbers, one per line, in increasing order, each ending with LF; or
-    a 404 response if it has none.
-  - `<url>/risala/next`: the index of the log's hand-off entry, as a
-    number and an LF, once it has one; a 404 response before.
+  Its URL prefix is always `https://` followed by its origin (below),
+  so that anyone who knows a log's origin, from a `log` line, a LogKey
+  or a hand-off entry, can find the log. It also serves three small
+  text files, whose lines each end with LF:
+  - `<url>/risala/uid/<hash>`, where `<hash>` is the SHA-256 hash of
+    the uid in lower case, written as 64 lower-case hex digits: the line
+    `risala-hint/1`, then the indices of that uid's entries in this log,
+    as numbers, one per line, in increasing order; or a 404 response if
+    this log has none. It lists only this log's own entries, never those
+    of an earlier log of the host.
+  - `<url>/risala/next`: the line `risala-hint/1`, then the index of the
+    log's hand-off entry as a number, once it has one; a 404 response
+    before.
+  - `<url>/risala/key`: the line `risala-log-key/1`, then the log's
+    verifier key, as in a `log` line (4.4). Witnesses fetch it to enrol
+    the log (4.10).
   Readers check every index they use with an inclusion proof. A log
   that leaves an entry out of a hint is caught by its identities' own
   devices (Watching, below).
-- **Checkpoints** follow [TLOG-CHECKPOINT]. A log's origin is its
-  hostname in lower case, `/risala-log/` and a number, for example
-  `chat.example.org/risala-log/1`. A host's first log is number 1, and
-  each later one the next number, after a hand-off (below).
+- **Checkpoints** follow [TLOG-CHECKPOINT]. A log's origin is the
+  host (3.5) of its HTTPS server, in lower case and without a port,
+  `/risala-log/` and a number, for example
+  `chat.example.org/risala-log/1`. The log is served on port 443. A
+  host's first log is number 1, and each later one the next number,
+  after a hand-off (below). Checkpoints have no extension lines: readers
+  and witnesses reject a checkpoint that has any.
 - **The log's signature.** The log signs each checkpoint with ML-DSA-44,
   as a timestamped ML-DSA-44 checkpoint signature (signed-note signature
   type `0x06`) [SIGNED-NOTE] [TLOG-COSIGNATURE] over the whole tree,
@@ -571,11 +621,14 @@ with no record of its own for the move. Log `n`+1 holds the records of
 log `n` as the start of those chains, for KEYS PUT (4.7) and for the
 appending rules above, without appending them again. A reader follows a
 hand-off only when the hand-off entry is the last entry of a witnessed
-checkpoint of log `n`, with an inclusion proof. A log `n` > 1 without a
-hand-off from log `n`-1 is not valid: readers ignore it, and witnesses do
-not enrol it (4.10). A host that loses its log's key cannot hand off, and the chains
-in that log can grow no more, so operators MUST keep the key safe and
-backed up (Section 14).
+checkpoint of log `n`, with an inclusion proof, and finds log `n`+1, or
+an earlier log of the host, at `https://` followed by its origin. A
+witnessed checkpoint of log `n` that holds any entry after the hand-off
+entry is a fork of log `n` (Forks, below). A log `n` > 1 without a
+hand-off from log `n`-1 is not valid: readers ignore it, and witnesses
+do not enrol it (4.10). A host that loses its log's key cannot hand
+off, and the chains in that log can grow no more, so operators MUST
+keep the key safe and backed up (Section 14).
 
 **Witness policy.** Each client has a list of witnesses it trusts, as
 signed-note verifier keys, and a number k, which is more than half the
@@ -584,11 +637,18 @@ signature verifies, under the key that the chain or the hand-off names,
 and at least k different witnesses of the list have cosigned it. A
 cosignature counts for a witness of the list only if both its key name
 and its key match, not just its 4-byte key ID, and each witness counts
-once. The log's own signature never counts towards k. Apps ship a
-default list (4.10), and update it with their releases. Users MAY change
-it. A client that finds no checkpoint of a log with k cosignatures from
-its list, even an old one, shows the user that its witness list does not
-fit that log, rather than showing the records as pending.
+once. The log's own signature never counts towards k, and neither does a
+cosignature whose timestamp is more than 10 minutes after the device's
+clock. A witnessed checkpoint is **fresh** when at least k of the
+cosignatures that make it witnessed have timestamps less than 24 hours
+before the device's clock. Accepting a record (below) needs a witnessed
+checkpoint, not a fresh one: freshness matters for refreshing an
+identity's view (Freshness, below) and for watching one's own records.
+Apps ship a default list (4.10), and update it with their releases.
+Users MAY change it. A client that finds no checkpoint of a log with k
+cosignatures from its list, even an old one, shows the user that its
+witness list does not fit that log, rather than showing the records as
+pending.
 
 **Accepting a record.** A device acts on a record of an identity, for
 example by accepting a leaf of a device the record adds (12.7), only
@@ -617,12 +677,15 @@ accepted. The head only moves forward, to a record of a key file that
 extends it, and the pinned log only with an accepted `log` record or
 hand-off.
 
-- A valid key file whose chain does not hold the head is a rollback
-  (4.4), which the device treats as a fork (below).
-- A key file whose chain starts with another master key is a **new
-  master key**: the device stops sending to the identity until the user
-  acknowledges it (12.14). A `master` record that replaces the master
-  key within the same chain is a new master key too.
+- A valid key file whose chain starts with the pinned master key but
+  does not hold the head is a rollback (4.4), which the device treats
+  as a fork (below).
+- A valid key file whose chain starts with another master key is a
+  **new master key**: the device stops sending to the identity until
+  the user acknowledges it, as 12.14 says. A `master` record that
+  replaces the master key within the same chain is a new master key
+  too. A new master key is not a rollback, and is a fork only as rule 2
+  of Forks says.
 
 **Freshness.** Each time a device fetches an identity's key file again
 (12.14), it also:
@@ -630,7 +693,7 @@ hand-off.
 1. fetches the newest checkpoint of the identity's current log,
    following its hand-off (`risala/next`) if it has one, and checks that
    it is witnessed, consistent with the newest one the device has seen,
-   and that k of its cosignatures are less than 24 hours old;
+   and fresh (Witness policy, above);
 2. reads the uid's hint (`risala/uid/`), and checks every entry of the
    uid after its head that the key file does not hold. A logged record
    of the uid that the key file leaves out makes the key file a fork, if
@@ -648,19 +711,26 @@ to groups (12.7) until it is fresh again, but keeps sending to it.
   example because a device signed the same record twice with hedged
   signing, are the same record, and the device uses the one in the log.
 - two `master` records of one uid with an empty `previous`, both in logs
-  of the host whose log the identity's key file names, or both in key
-  files fetched from the identity's URL. A chain in another log, which
-  the identity's key file does not name, is not the identity's.
+  of one host, whose logs refuse a second one (Appending, above). A
+  chain in another log, which the identity's key file does not name, is
+  not the identity's, and a key file whose chain starts with another
+  master key than the pinned one is a new master key (Pinning, above),
+  not a fork.
 - two witnessed checkpoints of one log that are not consistent with each
-  other
+  other, or a witnessed checkpoint that holds entries after the log's
+  hand-off entry (Hand-offs, above)
 - a rollback (4.4)
 
 A fork means that someone has shown two different histories of an
-identity, or a log two different trees. For every identity in a fork,
-including every identity in a log that forked, the device stops sending
-in each conversation where that identity has a leaf, and tells the user,
-until the user resolves it, for example by checking the safety number
-with the person (12.14) and choosing which keys to trust.
+identity, or a log two different trees. Every identity in a fork,
+including every identity in a log that forked, is **forked** for the
+device until its user resolves it, for example by checking the safety
+number with the person (12.14) and choosing which keys to trust. The
+device tells the user, and treats a forked identity as 12.14 says: it
+stops sending in direct conversations with it, and in rooms it stops
+trusting the identity's leaves, and removes them outside public rooms,
+but keeps sending. So nobody can stop a room by forking their own
+chain.
 
 **Watching your own records.** At least one device of each identity MUST
 do the following at least once a day, and every device that comes back
@@ -668,8 +738,8 @@ after more than a day offline MUST do it before it sends anything:
 
 1. fetch the newest checkpoint of its identity's current log, following
    its hand-off if it has one, and check that it is witnessed,
-   consistent with the last one it saw, and that its cosignatures are
-   less than 24 hours old;
+   consistent with the last one it saw, and fresh (Witness policy,
+   above);
 2. read its uid's hint (`risala/uid/`), and fetch every entry it lists
    that the device has not seen;
 3. check those records against its own chain.
@@ -804,11 +874,11 @@ REGISTER <name> <keyfile> <signature>
 
 This creates the identity `<name>@<identity domain>`:
 
-- `<keyfile>` is the identity's first records, in base64 with padding:
-  a one-byte `version` (1) followed by the vector `Record records<V>`.
-  They are a `master` record, which names the server's current log (its
-  `log` and `log-key` in INFO), and one `device` record, for the uid
-  `<name>@<identity domain>`, and must form a valid chain (4.4).
+- `<keyfile>` is the identity's first records, as an encoded RecordList
+  (4.4) in base64 with padding. They are a `master` record, which names
+  the server's current log (its `log` and `log-key` in INFO), and one
+  `device` record, for the uid `<name>@<identity domain>`, and must form
+  a valid chain (4.4).
 - `<signature>` is computed as in Section 4.6 with that uid, using the
   device key of the `device` record. This proves that the client holds
   it.
@@ -848,15 +918,16 @@ KEYS PUT <after> <records>
 its log, then `OK`
 
 Adds records to an identity's chain on this server. `<records>` is one
-or more records that continue the chain, oldest first, encoded as for
-REGISTER, or a blob-ref (3.5) naming a blob that holds the same bytes
-without base64 (12.12). `<after>` is the blob-ref of the record that the
-first of them follows, which the server must already hold, or `-` when
-they start with the chain's first record. A device sends only what the
-server does not have: the records after the newest one it holds, or the
-whole chain to a log that holds none of it yet (4.8). Records are
-signed, so KEYS PUT needs no sign-in, and works on new and anonymous
-connections as well as signed-in ones. The server checks that:
+or more records that continue the chain, oldest first, as an encoded
+RecordList (4.4) in base64 with padding, or a blob-ref (3.5) naming a
+blob that holds the same bytes without base64 (12.12). `<after>` is the
+blob-ref of the record that the first of them follows, which the server
+must already hold, or `-` when they start with the chain's first record.
+A device sends only what the server does not have: the records after the
+newest one it holds, or the whole chain to a log that holds none of it
+yet (4.8). Records are signed, so KEYS PUT needs no sign-in, and works
+on new and anonymous connections as well as signed-in ones. The server
+checks that:
 
 - it holds the record `<after>` names (`ERR not-found`)
 - the chain, made of the records it holds up to `<after>` and then
@@ -865,8 +936,9 @@ connections as well as signed-in ones. The server checks that:
   already holds are skipped, and a different record in the place of one
   it holds is refused (`ERR forbidden`)
 - the newest of `<records>` is one that the chain puts in this server's
-  log (4.4, replaying step 11), and the server either hosts the identity
-  or logs other identities (`ERR not-supported`)
+  log (4.4, replaying step 11), or a `log` record that names this
+  server's log, and the server either hosts the identity or logs other
+  identities (`ERR not-supported`)
 - for an identity it does not host, the identity's key file (4.4), which
   it fetches, names this log in its last `log` line and lists the new
   records, as `-` lines or by hash (`ERR forbidden`). So nobody can put
@@ -875,10 +947,25 @@ connections as well as signed-in ones. The server checks that:
 
 It then appends to its log (4.5) each record that it did not hold and
 that the chain puts in this log. It keeps the records that belong to
-earlier logs of the chain only to check the chain. For an identity it
-hosts, it also publishes the new key file. `<index>` is a record's
-position in the log, and `<hash>` its SHA-384 hash as a blob-ref (3.5).
-Sending records the server already has again gets `OK` and no lines.
+earlier logs of the chain only to check the chain. A chain whose newest
+record is a `log` record naming this log, sent when an identity moves
+here (4.8), has no record for this log yet: the server keeps it to check
+the records that follow, appends nothing, and replies `OK` with no
+`RECORD` lines. For an identity it hosts, it also publishes the new key
+file. `<index>` is a record's position in the log, and `<hash>` its
+SHA-384 hash as a blob-ref (3.5). Sending records the server already
+has again gets `OK` and no lines.
+
+KEYS PUT makes the server check signatures, and sometimes fetch a key
+file, for a client that may not have signed in. A server MUST
+rate-limit it per network address (`ERR rate-limited`), as it does
+REGISTER.
+
+```
+C: keys put sha384:9b71d224… sha384:3a7f0c55…
+S: RECORD 8812 sha384:c41e09d7…
+S: OK
+```
 
 A device keeps each record it signs, exactly as encoded, until the log
 holds it, and resends those same bytes after a lost answer. It never
@@ -932,7 +1019,7 @@ secret that never reaches the server:
 ```
 struct {
     uint8 version;           // 1
-    opaque host<V>;          // the server used for pairing, lower case
+    opaque host<V>;          // the server used for pairing, as a server (3.5)
     opaque secret[32];       // the one-time pairing secret
     opaque keys_hash[48];    // SHA-384 of the encoded NewDevice
 } PairingCode;
@@ -948,7 +1035,12 @@ struct {
     opaque signature<V>;     // RisalaSign(the new device key, "pair", content)
 } NewDevice;
 
-opaque Host<V>;              // a server's hostname, in lower case
+struct {
+    uint8 version;           // 1
+    opaque ciphertext<V>;    // the encrypted NewDevice, with its tag
+} SealedNewDevice;
+
+opaque Host<V>;              // a server address, as a server (3.5)
 
 struct {
     uint8 version;           // 1
@@ -958,7 +1050,7 @@ struct {
     uint32 backup_generation;// the chain's generation (4.4)
     opaque backup_key[32];   // that generation's backup key (12.13)
     opaque record_hash[48];  // SHA-384 of the new device's device record
-    Host hosts<V>;           // the servers the identity uses, its home first (12.13)
+    Host hosts<V>;           // the servers the identity uses, its home first (12.13); not empty, no repeats
     opaque transfer<V>;      // a TransferRef (12.13), or empty
 } IdentityBundle;
 
@@ -984,8 +1076,9 @@ The two messages are protected like this:
 
 - **The NewDevice** is encrypted with ChaCha20-Poly1305 [RFC8439] under
   `new_key`, with a nonce of 12 zero bytes and the ASCII bytes
-  `risala/1 pair` as associated data. The key encrypts this one message
-  only: a device that sends `PAIR PUT new_id` again, for example after a
+  `risala/1 pair` as associated data, and sent as a SealedNewDevice. A
+  receiver rejects one whose `version` is not 1. The key encrypts this
+  one message only: a device that sends `PAIR PUT new_id` again, for example after a
   lost answer, sends the same ciphertext, and to send anything else it
   starts again with a new secret.
 - **The IdentityBundle** is sealed to the new device's `pairing_key`
@@ -1007,14 +1100,27 @@ PAIR GET <id>
 ```
 
 - **`PAIR PUT`** stores `<data>`, base64 with padding, under `<id>` for
-  10 minutes, and replies `OK`. An id that already holds the same data
-  gets `OK` again, and one that holds other data gets `ERR name-taken`.
-  A device whose PAIR PUT gets `name-taken` starts the pairing again
-  with a new secret.
+  10 minutes, and replies `OK`. `<data>` is the encoded SealedNewDevice
+  or SealedBundle. An id that already holds the same data gets `OK`
+  again, and one that holds other data gets `ERR name-taken`. A device
+  whose PAIR PUT of `new_id` gets `name-taken` starts the pairing again
+  with a new secret. One whose PAIR PUT of `old_id` gets it tells its
+  user that someone else answered the pairing first, and that the new
+  device must not be used until it is paired again.
 - **`PAIR GET`** sends `PAIR <id> <data>` and `OK`, or `ERR not-found`
   if nothing is stored under `<id>` yet.
 - Both work on new, anonymous and signed-in connections, since their
-  data is opaque and their ids are secret.
+  data is opaque and their ids are secret. PAIR PUT stores data for
+  clients that need not have signed in, so a server MUST rate-limit it
+  per network address (`ERR rate-limited`).
+
+```
+C: pair put mxrq3bzf5kjw2ahd6uyc4en7ta AQDNnL2v…
+S: OK
+C: pair get kbv4yqz7hd2cm6xw3rnfe5ug3a
+S: PAIR kbv4yqz7hd2cm6xw3rnfe5ug3a AUa1w0Ur…
+S: OK
+```
 
 The pairing then goes:
 
@@ -1024,21 +1130,30 @@ The pairing then goes:
 2. The other device scans it, connects to `host`, and sends
    `PAIR GET new_id`. It decrypts the NewDevice, checks that its SHA-384
    hash is `keys_hash`, that its signature verifies under the device key
-   in it, and that its keys pass the checks of 4.4. It shows the new
-   device's label and asks the user to confirm that it is theirs.
+   in it, that its keys pass the checks of 4.4, and that `pairing_key`
+   is a valid X-Wing key (12.2) that differs from every public key in the
+   chain and from the new device's own device and attestation keys. It
+   shows the new device's label and asks the user to confirm that it is
+   theirs.
 3. It makes a `device` record for the new device, and publishes it: with
    KEYS PUT for an identity the server hosts, or by giving the user the
    new key file to publish, then KEYS PUT to the log.
 4. It sends `PAIR PUT old_id` with the SealedBundle, and announces the
-   new record to the identity's other devices (4.5).
+   new record to the identity's other devices (4.5). If that PAIR PUT
+   gets `name-taken`, someone who saw the QR code answered first (see
+   PAIR PUT above).
 5. The new device polls `PAIR GET old_id` and opens the bundle. It
    fetches its identity's key file, and checks that its chain's current
    master key is `master_key`, that it holds the record whose hash is
    `record_hash`, with the keys the device made, and that
    `backup_generation` is the chain's generation. Its identity's log is
    the one the chain names, which the master key signed, so the server
-   cannot point it at another. It shows that it is waiting until its
-   record is accepted (4.5). It then signs in, uploads KeyPackages
+   cannot point it at another. Whoever saw the QR code can also build a
+   valid bundle, for an identity of their own, so before it signs in or
+   sends anything, the new device shows the uid and the labels of the
+   identity's current devices, and asks the user to confirm that this is
+   their identity. It shows that it is waiting until its record is
+   accepted (4.5). It then signs in, uploads KeyPackages
    (12.5) to each server in `hosts`, and is added to the identity's
    conversations by its other devices (12.7). It fetches the history
    transfer, if there is one (12.13).
@@ -1095,8 +1210,10 @@ sending until each user acknowledges it (12.14).
 outside its host, for example a self-hosted one, can move its records
 to another log. With the recovery key, a device publishes a `log` record
 that names the new log, with KEYS PUT to the old log, then sends the
-whole chain to the new log with `KEYS PUT -`, and publishes the key file
-with the new `log` line. Every device that knows the identity follows
+whole chain, which ends with that `log` record, to the new log with
+`KEYS PUT -`, which appends nothing yet (4.7), and publishes the key
+file with the new `log` line at its end. The next record it makes goes
+into the new log. Every device that knows the identity follows
 the move once it accepts the `log` record. A log that its host hands off
 needs no such record (4.5).
 
@@ -1126,11 +1243,12 @@ expire with retention (7.5). A client SHOULD leave every group the
 identity is in first (6.1), with each of its devices.
 
 **Ending an identity for everyone.** Only a `retire` record (4.4) makes
-other people's devices remove an identity from their conversations
-(12.7). A device publishes one with KEYS PUT, which needs the recovery
-key, before UNREGISTER. A key file that is gone is only an identity's
-keys missing (4.4): contacts stop sending to it and warn, but remove
-nothing.
+other people's devices remove an identity from their conversations for
+good (12.7). A device publishes one with KEYS PUT, which needs the
+recovery key, before UNREGISTER. A key file that is gone is only an
+identity's keys missing (4.4): contacts stop sending to it in direct
+conversations, take its leaves out of private rooms until the file is
+back, and warn (12.14), but its devices are never removed by record.
 
 - **Hosted identities (4.7):** the server also stops serving the
   identity. If its chain ends with a `retire` record, the server keeps
@@ -1154,18 +1272,38 @@ for risala key logs follow [TLOG-WITNESS], with the rules below. Anyone
 MAY run one, and a risala server MAY also act as a witness for other
 servers' logs.
 
-**Enrolment** is open: a log enrols with a witness by sending it its
-first checkpoint, with an `add-checkpoint` request whose old size is 0.
-The witness enrols the log only if all of these hold, and otherwise
-refuses the request with 403:
+**Enrolment** is open to any host that shows it controls its name: a
+log enrols with a witness by sending it its first checkpoint, with an
+`add-checkpoint` request whose old size is 0. An `add-checkpoint`
+request carries no public key, and an ML-DSA-44 signature names its key
+only by a 4-byte key ID, so the witness gets the key as follows:
 
-1. The origin has the form `<host>/risala-log/<n>` (4.5), and the
-   checkpoint is signed as 4.5 says, under an ML-DSA-44 key named after
-   the origin.
-2. For n = 1: the witness has never enrolled a log of `<host>`.
-3. For n > 1: the witness has enrolled log `n`-1 of the same host, and
+- For log 1 of `<host>`, the witness fetches
+  `https://<host>/risala-log/1/risala/key` (4.5), under the rules for
+  fetching key files (4.4): HTTPS with TLS 1.3, a certificate valid for
+  `<host>` from a public certificate authority, no redirects, at most 10
+  seconds and 64 KiB, and no special-purpose addresses. The file names
+  the log's verifier key. So only whoever controls `<host>`'s HTTPS
+  server can enrol its first log, under the same assumption that key
+  files rely on (D.4).
+- For log `n` > 1, the key is the one in the hand-off entry of log
+  `n`-1 that the witness has accepted (below).
+
+The witness enrols the log only if all of these hold:
+
+1. The origin has the form `<host>/risala-log/<n>` (4.5).
+2. The key it got as above has a verifier key whose name is the origin
+   and whose key ID is right (4.4), and the checkpoint's signature
+   verifies under it, as 4.5 says.
+3. For n = 1: the witness has never enrolled a log of `<host>`.
+4. For n > 1: the witness has enrolled log `n`-1 of the same host, and
    has accepted a hand-off from it to this origin and key (below).
-4. The witness has never enrolled another key for the origin.
+5. The witness has never enrolled another key for the origin.
+
+It refuses the request with 403 if any of these fails, and with 503 if
+it could not fetch the key file at all, in which case the log tries
+again later. A witness fetches the key file only for a checkpoint whose
+origin has the right form, and at most once a minute for each origin.
 
 To hand off, the host sends each witness of log `n`-1, before the first
 checkpoint of log `n`, a request:
@@ -1174,14 +1312,26 @@ checkpoint of log `n`, a request:
 POST <witness URL prefix>/risala/handoff
 ```
 
-whose body is, in lines that each end with LF: `index ` and the index of
-the hand-off entry; the encoded LogEntry in base64 with padding; the
-hashes of its inclusion proof, each in base64 with padding; an empty
-line; and the checkpoint of log `n`-1 that includes it, as a signed
-note. The witness accepts it, with 200, if the checkpoint is the newest
-one of log `n`-1 that it cosigned, the entry is a hand-off entry naming
-`<host>/risala-log/<n>`, it is the checkpoint's last entry, and the
-proof verifies. From then on it cosigns no larger tree of log `n`-1.
+whose body is, in lines that each end with LF: `risala-handoff/1`;
+`index ` and the index of the hand-off entry; the encoded LogEntry in
+base64 with padding; the hashes of its inclusion proof, each in base64
+with padding; an empty line; and the checkpoint of log `n`-1 that
+includes it, as a signed note. The witness accepts it, with 200, if the
+checkpoint is the newest one of log `n`-1 that it cosigned, the entry
+is a hand-off entry naming `<host>/risala-log/<n>`, it is the
+checkpoint's last entry, and the proof verifies. From then on it
+cosigns no larger tree of log `n`-1. Otherwise it answers:
+
+- 400 if the body does not parse;
+- 409 if the checkpoint is not the newest one of log `n`-1 that it
+  cosigned, so that the host sends it again with that one;
+- 422 if the entry is not a hand-off entry naming that origin, is not
+  the checkpoint's last entry, or its proof does not verify;
+- 403 if it refuses for any other reason, for example because log `n`-1
+  is not enrolled, or it has already accepted a hand-off from it.
+
+A witness that has accepted a hand-off answers an `add-checkpoint` of a
+larger tree of log `n`-1 with 403.
 
 **Limits.** A witness rate-limits by host: it MAY limit how many new
 hosts under one registered domain it enrols, and how fast, and MAY
@@ -1191,10 +1341,21 @@ seconds. It SHOULD NOT otherwise refuse a log that follows these rules.
 **Cosignatures** are ML-DSA-44 (type `0x06`) [TLOG-COSIGNATURE], with
 the time the witness made them as their timestamp, which is never zero.
 Since every log gets a new witnessed checkpoint at least once a day
-(4.5), a device that finds no cosignature less than 24 hours old knows
-that the log or its witnesses are not keeping up. It then treats the
-log's new records as pending, and does not count the identity's view as
-refreshed (4.5).
+(4.5), a device that finds no fresh checkpoint of a log (4.5) knows that
+the log or its witnesses are not keeping up. It does not count the
+identity's view as refreshed (Freshness, 4.5), but still accepts records
+that a witnessed checkpoint includes.
+
+**A host that lost its name.** Whoever controlled `<host>` when a
+witness enrolled its first log holds that origin at the witness for
+good (rule 5). A host whose name was hijacked at that moment, for
+example by a rogue certificate, cannot get a log of its own witnessed
+there. A witness operator MAY publish a manual procedure that replaces
+an enrolled key after a long waiting period announced in public, such
+as 30 days, during which the old key's owner can object. A device
+checks a log's checkpoints under the key that the chain or the hand-off
+names (4.5), never under one a witness enrolled, so such a replacement
+cannot change which records any device accepts.
 
 **The apps' default list.** Apps ship a list of at least three
 witnesses, run by independent organisations in more than one country,

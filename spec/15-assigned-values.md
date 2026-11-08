@@ -4,13 +4,27 @@
   is not yet registered with IANA.
 - **ALPN identifier:** `risala/1`.
 - **Well-known URI suffix:** `risala` [RFC8615], for key files (4.3).
-- **URI scheme:** `risala://<host>[:<port>][/<room>[?g=<group-id>]]`,
-  where `<room>` is a public room written without its `#`, and
-  `<group-id>` is the room's 32-byte group id in lower-case base32
-  [RFC4648] without padding, 52 characters. For example,
-  `risala://chat.example.org/general` points to `#general`. A device
-  that follows a link with `g` joins only the group with that id (6.1).
-  Private conversations have no links, since their boxes are secret.
+- **URI scheme:** `risala`, for links to servers and public rooms:
+
+  ```abnf
+  link      = "risala://" server [ "/" room-part [ "?g=" group-id ] ]
+  room-part = alnum [ *62( alnum / "." / "_" / "-" ) ( alnum / "_" / "-" ) ]
+                                                ; a room (3.5) without its "#"
+  group-id  = 51( %x61-7A / %x32-37 ) ( "a" / "q" )
+                                                ; 32 bytes in base32: a-z 2-7
+  ```
+
+  `server`, `alnum` and the room grammar are those of 3.5, so the port
+  is left out when it is 7472. `<group-id>` is the room's 32-byte group
+  id in lower-case base32 [RFC4648] without padding: 52 characters carry
+  260 bits, so the last character's four unused bits are zero. A device
+  folds ASCII upper case to lower case, then reads the link by this
+  grammar, and treats anything else as an invalid link: a `/` at the
+  end, another query key, a fragment, user information or an empty
+  part. For example, `risala://chat.example.org/general` points to
+  `#general`. A device that follows a link with `g` joins only the
+  group with that id (6.1). Private conversations have no links, since
+  their boxes are secret.
 - **MLS cipher suite:** `0x0020`, for the algorithms of 12.2: X-Wing
   (HPKE KEM `0x647a`), HKDF-SHA384 (`0x0002`), ChaCha20-Poly1305
   (`0x0003`), SHA-384 and ML-DSA-44. This is the value that
@@ -55,9 +69,12 @@
   - the HPKE `info` and `psk_id` `risala/1 pair` (4.8);
   - the sign-in prefix `risala-auth-1` (4.6), and the safety number label
     `risala-fp-1` (12.14).
-- **Text formats:** the key file's first line `risala-keys/1` (4.4), the
-  QR code prefixes `RISALA-PAIR:` (4.8) and `RISALA-FP:` (12.14), and the
-  key log origin path `/risala-log/<n>` (4.5).
-- **HTTPS paths:** under a key log's URL prefix, `risala/uid/<hash>` and
-  `risala/next` (4.5); under a witness's URL prefix, `risala/handoff`
+- **Text formats:** the key file's first line `risala-keys/1` (4.4); the
+  first lines `risala-hint/1` and `risala-log-key/1` of the files a key
+  log serves (4.5), and `risala-handoff/1` of the hand-off request
+  (4.10); the QR code prefixes `RISALA-PAIR:` (4.8) and `RISALA-FP:`
+  (12.14); and the key log origin path `/risala-log/<n>` (4.5).
+- **HTTPS paths:** under a key log's URL prefix, which is `https://`
+  followed by its origin, `risala/uid/<hash>`, `risala/next` and
+  `risala/key` (4.5); under a witness's URL prefix, `risala/handoff`
   (4.10).
