@@ -36,14 +36,15 @@ risala/
 ├── crates/
 │   ├── risala-proto/      lines, tags, names, escaping, auth bytes; no I/O
 │   ├── risala-server/     the server binary, `risalad`
+│   ├── risala-keyfetch/   fetches key files over HTTPS (4.4), for the server
 │   ├── librisala/         the client library
-│   ├── librisala-ffi/     UniFFI bindings for Kotlin and Swift
+│   ├── librisala-ffi/     planned: UniFFI bindings for Kotlin and Swift
 │   ├── risala-cli/        small terminal client and key tool built on librisala
-│   └── risala-conformance/  black-box tests that can run against any server
+│   └── risala-conformance/  planned: black-box tests that can run against any server
 ├── clients/
-│   ├── gnome/             Rust, gtk4-rs, libadwaita
+│   ├── gnome/             planned: Rust, gtk4-rs, libadwaita
 │   ├── apple/             Swift, SwiftUI (macOS and iOS)
-│   └── android/           Kotlin, Jetpack Compose
+│   └── android/           planned: Kotlin, Jetpack Compose
 └── push-gateway/          later: forwards NOTIFY to APNs and FCM (Appendix C)
 ```
 
@@ -168,9 +169,11 @@ across the FFI boundary.
   NixOS module for the server.
 - **Cross-compiling:** Android and iOS targets need extra Rust standard
   libraries. When we get there, pin a toolchain with `rust-toolchain.toml`
-  and switch the flake to rust-overlay or fenix. Xcode builds stay
-  outside Nix.
-- **CI:** `nix flake check` (fmt, clippy, tests), plus a smoke test that
+  and switch the flake to rust-overlay or fenix. On macOS the flake
+  builds the Apple app too (`nix build .#apple-macos`, `.#apple-ios`),
+  through SweetPad and the host's Xcode. Those builds are not hermetic:
+  Xcode itself stays outside the Nix store (see `clients/apple`).
+- **CI:** `nix flake check` (fmt, clippy, rustdoc, tests), plus a smoke test that
   starts `risalad` and talks to it through `openssl s_client`.
 
 ## 4. Milestones
@@ -562,8 +565,9 @@ Open:
     epochs and never splits one (confirmed with the user).
 
 25. **Found while building key file fetching** (4.4). Key files are
-    fetched with TLS 1.3 only. A failed refetch keeps a cached copy when
-    the host cannot be reached, but any non-200 answer revokes it. Lines
+    fetched with TLS 1.3 only. A failed refetch keeps a cached copy.
+    Which answers count as failed was settled later, in item 28: only a
+    key file (200) or a gone answer (404 or 410) replaces the copy. Lines
     that are not valid UTF-8 are malformed and ignored. The fetcher is
     hand-written (one HTTP/1.1 GET) and trusts Mozilla's roots through
     `webpki-root-certs`, so servers do not depend on their host's CA

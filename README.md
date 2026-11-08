@@ -53,15 +53,18 @@ and in what order.
 
 | Part | Language | What it is |
 |---|---|---|
-| `risalad` | Rust | The server |
+| `risala-proto` | Rust | The protocol's lines, names and keys, with no I/O |
+| `risalad` | Rust | The server (`crates/risala-server`) |
+| `risala-keyfetch` | Rust | Fetches key files over HTTPS for the server (SPEC 4.4) |
 | `librisala` | Rust | The shared client library: connection, identity, sync, history cache, rooms, messages, moderation |
-| GNOME app | Rust, gtk4-rs, libadwaita | Linux client |
-| [`clients/apple`](clients/apple) | Swift, SwiftUI | macOS and iOS client |
-| Android app | Kotlin | Android client |
+| `risala-cli` | Rust | A small terminal client and key tool, built on librisala |
+| [`clients/apple`](clients/apple) | Swift, SwiftUI | macOS and iOS client, just started |
+| GNOME app | Rust, gtk4-rs, libadwaita | Linux client, planned |
+| Android app | Kotlin | Android client, planned |
 
 The apps hold no protocol logic. They show what librisala gives them.
-The Apple and Android apps call librisala through generated bindings,
-and the GNOME app uses it directly.
+The Apple and Android apps will call librisala through generated
+bindings, which do not exist yet. The GNOME app will use it directly.
 
 There is no browser client, by design.
 
