@@ -452,6 +452,28 @@ pub(super) fn check_commit(
             if w.ciphersuite() != CIPHERSUITE {
                 return Err(invalid("the Welcome uses another cipher suite"));
             }
+            // Addressed to exactly the KeyPackages the commit adds, each
+            // once.
+            let mut added = staged
+                .add_proposals()
+                .map(|add| {
+                    let r = add.add_proposal().key_package().hash_ref(crypto);
+                    r.map(|r| r.as_slice().to_vec())
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| invalid("an added KeyPackage cannot be hashed"))?;
+            let mut welcomed: Vec<Vec<u8>> = w
+                .secrets()
+                .iter()
+                .map(|s| s.new_member().as_slice().to_vec())
+                .collect();
+            added.sort();
+            welcomed.sort();
+            if added != welcomed {
+                return Err(invalid(
+                    "the Welcome is not for exactly the KeyPackages the commit adds",
+                ));
+            }
         }
         (true, None) => {}
     }

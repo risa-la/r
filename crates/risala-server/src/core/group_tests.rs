@@ -2226,3 +2226,55 @@ async fn a_hosted_identity_that_unregistered_has_no_entry_after_a_restart() {
     let lines = w.ask(&mut c1, "sync").await;
     assert!(lines[0].starts_with("CONV carol@example.org "), "{lines:?}");
 }
+
+// ---------------------------------------------------------------------------
+// A COMMIT's Welcome (12.5, 12.7)
+
+#[tokio::test]
+async fn a_commits_welcome_is_for_exactly_the_key_packages_it_adds() {
+    let mut w = World::new();
+    let a1 = Device::new(ALICE, 1);
+    let mut c1 = w.connect(&a1);
+    let b5 = Device::new(BOB, 5);
+    let mut cb = w.connect(&b5);
+    let (mut ga1, _) = direct(&mut w, &a1, &mut c1, &b5, &mut cb).await;
+    let (b6, a2) = (Device::new(BOB, 6), Device::new(ALICE, 2));
+    let commit = |g: &mut MlsGroup, add: Vec<KeyPackage>| {
+        let sent = a1.commit(
+            g,
+            Changes {
+                add,
+                ..Changes::default()
+            },
+        );
+        g.clear_pending_commit(a1.provider.storage()).unwrap();
+        sent
+    };
+    // A Welcome for one device more, or one fewer.
+    let one = commit(&mut ga1, vec![b6.kp()]);
+    let two = commit(&mut ga1, vec![b6.kp(), a2.kp()]);
+    for (sent, other) in [(&one, &two), (&two, &one)] {
+        let line = format!(
+            "{} {}",
+            sent.line_without_welcome(BOB),
+            other.welcome.as_ref().unwrap()
+        );
+        assert_eq!(
+            w.ask(&mut c1, &line).await,
+            ["ERR invalid the Welcome is not for exactly the KeyPackages the commit adds"]
+        );
+    }
+    // One for another KeyPackage of the same device.
+    let again = commit(&mut ga1, vec![b6.kp()]);
+    let line = format!(
+        "{} {}",
+        again.line_without_welcome(BOB),
+        one.welcome.as_ref().unwrap()
+    );
+    assert_eq!(
+        w.ask(&mut c1, &line).await,
+        ["ERR invalid the Welcome is not for exactly the KeyPackages the commit adds"]
+    );
+    let lines = w.ask(&mut c1, &one.line(BOB)).await;
+    assert_eq!(lines.last().unwrap(), "OK seq=2 epoch=2");
+}
