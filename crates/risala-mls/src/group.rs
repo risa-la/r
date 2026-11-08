@@ -258,6 +258,10 @@ pub fn create_group<P: OpenMlsProvider>(
     Ok((group, leaf_key))
 }
 
+/// The most devices a commit should add (12.6). A client that adds more
+/// splits them over several commits.
+pub const MAX_ADDS_PER_COMMIT: usize = 256;
+
 /// What a commit changes (12.6, 12.7). Proposals pending in the group,
 /// SelfRemoves and a public room's external Adds, are always committed
 /// too, by reference; nothing else is.
