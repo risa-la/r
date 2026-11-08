@@ -33,9 +33,12 @@ active.
   its members. Withhold, delay and reorder posts, refuse service, drop
   mailboxes and rooms, and mute pseudonyms. Hold back a member's last messages
   unnoticed. Choose which of two concurrent commits wins in a private
-  conversation, and refuse a commit forever. Set the roles and settings
-  that newcomers to a public room see, by accepting a commit that
-  members' devices reject, which they warn about. Swap the group behind
+  conversation, and refuse a commit forever. Split a direct
+  conversation or a private room into branches that each see the other
+  go quiet, which devices warn about but cannot undo. Make a public
+  room's devices resync, and set the roles and settings that newcomers
+  to a public room see, by accepting a commit that members' devices
+  reject, which they warn about. Swap the group behind
   a public room's name, which devices that knew the room notice. Send
   or hold back GONE for guests. Serve an older backup of the same
   generation. Link a device's anonymous connections to its signed-in
@@ -85,8 +88,13 @@ that hosts an identity.
 **A member of a conversation,** including a moderator or owner.
 
 - Can: read and leak the conversation from when it joined. Post invalid
-  commits, which cost others some work (7.2). Within its role, invite,
-  kick, ban, delete and change settings. Remove others' stale leaves,
+  commits, which cost others some work (7.2), and in a public room make
+  every device resync, after which it can be banned (12.7). Remove a
+  leaf by claiming that a key check fails for it, or by repairing it as
+  an impostor, which devices undo and attribute (12.7). Hold a leaf of
+  a device it adds, in that device's name, until devices confirm the
+  leaf or find it out, about an hour after it first uses a role.
+  Within its role, invite, kick, ban, delete and change settings. Remove others' stale leaves,
   within the limits of 12.7. Commit in up to 3 epochs in a row, then
   about once every 10 minutes. Make a transcript that proves nothing to
   others, since members can forge each other's messages for third
@@ -97,7 +105,8 @@ that hosts an identity.
   there, until the group moves (7.8), which it does right after the
   removal.
 - Cannot: post as another member to the other members, make another
-  member's leaf look confirmed, read anything sent after it is removed,
+  member's leaf look confirmed, give a moderator control of an owner's
+  leaf by an invitation, read anything sent after it is removed,
   post or act on a role it has lost after the commit that removed or
   demoted it, or add new identities to a room without a role that
   allows it. Get anyone banned by operators on a report alone. Learn a
@@ -107,12 +116,14 @@ that hosts an identity.
 **A guest,** or anyone who opens anonymous connections.
 
 - Can: join public rooms that allow guests, and post where `guests` is
-  `write`. Open a report conversation with an owner or moderator of such
+  `write`. Join a public room under a credential that names someone
+  else's device, which devices then treat as a guest's leaf. Open a report conversation with an owner or moderator of such
   a room, if they accept it, to send reports (5.8). Use up server
   resources within proof of work, rate limits and quotas.
 - Cannot: take part in private rooms or in other direct conversations,
   send anything but reports in a report conversation, or appear as
-  anything but an unverified guest.
+  anything but an unverified guest. Commit in a public room, or force
+  its devices to join again.
 
 **Someone who steals a device,** or compromises one for a while.
 
@@ -233,14 +244,33 @@ Each risk is marked **Mitigated**, where this document limits it, or
 - **New constructions** (Open until reviewed). Pairwise and epochal
   confirmation, send tokens with "the first valid commit wins", and
   pseudonyms are this document's own, and have not yet been reviewed or
-  formally modelled. So are commit streaks and the stale-leaf median
-  (12.7), and TOKEN and mailbox moves (7.2, 7.8).
+  formally modelled. So are commit streaks and the stale-leaf median,
+  group checks and key checks with their repairs, impostor repairs,
+  RESYNC and resync commits (12.7), chained period seeds (12.10), and
+  `next`, TOKEN and mailbox moves (7.2, 7.8).
 - **Sizes are not yet measured** (Open). The room limits may change once
   ML-DSA and X-Wing have been measured on phones.
 - **Metadata from files, blobs and backups** (Open). The server sees
   uploads per mailbox and who downloads them, the size and timing of
   blobs and backups, and how often an identity moves to a new backup
   generation.
+- **Partitions** (Open). The server can split a direct conversation or
+  a private room into branches. Devices warn when they see posts of
+  their epoch that they cannot decrypt, and an identity's devices
+  compare epochs through read markers (12.7, 7.7), but cannot end the
+  split.
+- **Leaves held by whoever added them** (Mitigated: challenged at their
+  first use of a role, removed and undone within about an hour, 12.7).
+  A member who adds a device can hold its leaf until devices confirm
+  it, and any member can remove a leaf as an impostor, which devices
+  that confirmed it attribute.
+- **Resyncs in public rooms** (Mitigated: only identities commit, from
+  their signed-in connections, and recovery is one commit and batches,
+  12.7). A member's invalid commit makes every device of a public room
+  recover.
+- **Archivers in public rooms** (Open). Anyone can join a public room, so
+  an archiver that timestamps what it sees defeats delayed deniability
+  for it (Section 14).
 - **Withheld tails and commit order** (Mitigated: gaps show once a later
   message arrives, and streaks limit one committer). The server can hold
   back a member's last messages unnoticed, choose between concurrent
@@ -279,7 +309,9 @@ claims that depend on it.
 - **The WebPKI** issues certificates for a domain only to whoever
   controls it, for fetching key files (4.4).
 - **Devices** keep their stored keys and history away from other
-  software, and their clocks within minutes of the right time.
+  software, and their clocks within minutes of the right time, and
+  never more than an hour off, which epochal confirmation needs
+  (12.10).
 
 ### D.5. Changes
 
@@ -302,4 +334,13 @@ claims that depend on it.
   token sets (7.2); per-period pseudonyms, none on PublicMessages, and no
   limits per pseudonym (7.3, 12.10); mailbox moves after removals (7.8);
   quotas and mailbox expiry (7.5); sealed per-device Welcomes (12.8);
-  push delays, padding and expiry (9).
+  push delays, padding and expiry (9). MLS: the next token's hash as
+  POST's `next`, checked by every device (5.2, 12.6); group checks and
+  key checks with repairs, impostor repairs, RESYNC, and resyncing
+  public rooms (12.7); public rooms joined only by proposal, without
+  device bindings, with commits only from the named device (6.1, 12.3,
+  12.6); leaf rotation by Update proposals, a margin before REVEAL, and
+  chained period seeds (12.10); one leaf per device and bindings in the
+  leaf node (12.3); a committer's Welcomes only once it has won (12.8);
+  past-epoch and skipped-key limits, and resends (12.9); read markers
+  that check the epoch (7.7).

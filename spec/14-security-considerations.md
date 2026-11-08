@@ -80,21 +80,35 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     attestation can prove it. A member who publishes a message's hash
     somewhere public before the key comes out, such as in a public log,
     can prove later that it existed while only its sender could have
-    signed it.
-  - A device binding (12.3) shows that a device's KeyPackage was used,
-    and a member can show that its key is in a group's tree. So being in
-    a group is not deniable to someone who has the group's tree, even
-    though what was said is.
+    signed it. Anyone can join a public room, so a bot that joins every
+    public room and timestamps every ATTEST and message it sees defeats
+    delayed deniability for everything it archived.
+  - Public rooms carry no device bindings (12.3), so their public
+    commits tie no leaf key to a device: whose leaf is whose rests only
+    on attestation, which becomes forgeable once the period key is out.
+    The price is that anyone can join a public room under a credential
+    that names someone else's device. Such a leaf never attests, and
+    devices treat it as a guest's (12.10).
+  - Outside public rooms, a device binding (12.3) shows that a device's
+    KeyPackage was used, and a member can show that its key is in a
+    group's tree. So being in such a group is not deniable to someone
+    who has the group's tree, even though what was said is.
   - Sign-in signatures (4.6) give the server proof that a device
     connected at a given time.
   - Pairwise confirmation is deniable only if X-Wing's ciphertexts do
     not show who made them, which rests on the KEM's
     plaintext-awareness.
   - Franking (5.8) proves what a message said, but not who sent it.
-  - Pairwise confirmation, epochal confirmation, send tokens with TOKEN
-    and "the first valid commit wins" (7.2), pseudonyms (7.3) and
-    mailbox moves (7.8) are risala's own constructions. They need a
-    formal model and an outside review before they are relied on.
+  - Pairwise confirmation, epochal confirmation with its chained seeds,
+    send tokens with `next` and TOKEN and "the first valid commit wins"
+    (7.2), the split of commit checks into group checks and key checks
+    with their repairs, impostor repairs, RESYNC and resync commits
+    (12.7), pseudonyms (7.3) and mailbox moves (7.8) are risala's own
+    constructions. They need a formal model and an outside review before
+    they are relied on.
+  - Epochal confirmation assumes that devices' clocks are never off by
+    more than an hour (12.10). Group checks never use a device's clock,
+    only the server's `t` on posts (12.7).
 
 - **What the server learns.** Devices post on anonymous connections
   (4.2), so a post does not say who sent it, except for a public room's
@@ -143,7 +157,9 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   - that a direct conversation or private room moved its mailbox (7.8),
     which shows that a member left or was removed, though not who;
   - in a public room, its members and their display names, the leaf of
-    each light client (12.6), its topic, and who commits. Commits carry
+    each light client (12.6), its topic, and who commits or rotates a
+    leaf key, whose commits and Updates come from their devices'
+    signed-in connections (12.6), as their credentials already say. Commits carry
     no pseudonym (7.3), and pseudonyms change every period, so the
     server does not learn from the posts which are whose. But it sees
     which members' devices rotate their leaf key each day (12.10), which
@@ -182,11 +198,22 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     a kicked member. The committer sees this, the other members do not.
     Commit streaks (12.7) keep one member from winning every epoch on
     its own, but not with the server's help.
+  - It can split a direct conversation or a private room: by showing
+    different devices different commits for the same epoch, by holding
+    a commit back from some of them, or by changing a commit's `next`
+    for some. Each branch then sees the other go quiet. Devices warn
+    when posts of their epoch keep arriving that they cannot decrypt
+    (12.7), and an identity's own devices compare epochs through their
+    read markers (7.7), but the split stands for as long as the server
+    keeps it up, and a group can move only to another mailbox on the
+    same server.
   - In a public room it can accept a commit that members' devices
-    reject. Devices that were in the room warn their users, and do not
-    take the room's new roles silently (12.7). Devices that join the
-    room afterwards cannot tell, so a server can set the roles and
-    settings that newcomers to a public room see.
+    reject, which makes them recover with a resync commit (12.7).
+    Devices that were in the room warn their users, and do not take the
+    room's new roles silently (12.7). Devices that join the room
+    afterwards cannot tell, so a server can set the roles and settings
+    that newcomers to a public room see, and even which group they join
+    under the room's name.
   - It is the authority for public room names, and can make up a room,
     hide one, or put a different group under a name. Devices that know
     the room, or follow a link that carries its group id, notice the
@@ -200,7 +227,48 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
 - **Insiders.** A member can read the conversation, and can leak it. A
   member can post invalid commits, which cost every device some work
   and which devices ignore (7.2); send tokens, limits per connection and
-  per network address, and proof of work bound how many. A member, or
+  per network address, and proof of work bound how many. In a public
+  room the server cannot tell an invalid commit from a valid one, so
+  one invalid commit makes every device recover with a resync commit
+  and batched rejoins (12.7). Only identities' devices commit there,
+  each from its own signed-in connection, so the member who did it is
+  known, and can be banned; guests and anyone not yet a member cannot
+  do it, since they join only by proposal (6.1).
+- **Removals that devices undo.** Whether a commit is valid never
+  depends on key files (12.7), so in a direct conversation or a private
+  room any member can remove any leaf by claiming that a key check
+  fails for it. Every device checks the claim, warns, and adds the
+  device back if it was false, but the device misses what was said in
+  between until its own devices fill the gap (12.13). The same goes for
+  a member who encrypts a commit's path secrets so that a few devices
+  cannot follow: they post RESYNC, and are added back (12.7).
+- **Leaves held by whoever added them.** A device binding covers the
+  keys that others encrypt to, not the leaf's signature key (12.3). So
+  the member who adds a device, or the server that hands out its
+  KeyPackage, can give its leaf a signature key of their own. The
+  server holds no group secrets, so it only keeps the device out with a
+  leaf nobody can use, until the identity's own devices find that leaf
+  unanswering and replace it (12.7). A member
+  who does it holds a leaf in the name of another identity's device,
+  with that identity's role, until devices confirm it (12.10). Devices
+  challenge such a leaf as soon as it uses a role, and the identity's
+  own devices challenge every new leaf of it, so within about an hour
+  devices find it out, remove it, and undo what its commits did in the
+  last 24 hours (12.7). Its messages show as unverified throughout. An
+  invitation never hands a moderator an owner's leaf, since only owners
+  invite owners and moderators. Any member can also make such a repair
+  against a leaf that is not an impostor; devices that had confirmed
+  that leaf then name the member who did it, and its identity adds its
+  device back.
+- **Public rooms.** Anyone can join a public room under a credential
+  that names any device (12.3). Such a leaf never attests, so devices
+  treat it as a guest's, it cannot commit, since the server takes
+  commits only from the device a credential names (12.6), and it cannot
+  push the device it names out of the room, since an earlier leaf of
+  the same device is removed only once it has been inactive for 48
+  hours, while the device itself can remove the copy at once (12.7). An identity in the room can make a resync commit at any
+  time, which removes the last committer's leaf until that device joins
+  again. A member, or
   anyone who joins a public room, can also add useless hashes to a token
   set (7.2), and post under another member's pseudonym, which the
   server cannot tell apart, though members' devices ignore such posts
@@ -246,7 +314,9 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   accepted, a stolen device is current: it can remove its identity's
   other leaves from groups and add itself back. The identity's devices
   show this as an alert (12.7), and its removal stands once the record
-  is accepted, which logs SHOULD witness within a minute (4.5).
+  is accepted, which logs SHOULD witness within a minute (4.5). Devices
+  then remove its leaves, and undo what they did in the last 24 hours,
+  as for an impostor (12.7).
 
 - **Missing key files.** A key file that is gone or invalid is
   unsigned, so it removes nobody (4.4): devices stop sending to the
