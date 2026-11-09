@@ -329,8 +329,10 @@ impl MiscStore for SqliteStore {
         })
     }
 
-    fn add_report(&self, report: &NewReport) -> Result<()> {
+    fn add_report(&self, report: &NewReport, max_reported: u64) -> Result<usize> {
         self.write(|tx| {
+            let mut reported = super::keys::reported_bytes(tx)?;
+            let mut dropped = 0;
             tx.execute(
                 "INSERT INTO reports (id, box, report, t, pseudonym, reporter)
                  VALUES (?, ?, ?, ?, ?, ?)",
@@ -359,15 +361,32 @@ impl MiscStore for SqliteStore {
                     bytes,
                     blob
                 ])?;
-                // The blob stays until the report is resolved.
+                // The blob stays until the report is resolved, if the
+                // bytes reports keep stay within their bound; one another
+                // report keeps already counts (5.8).
                 if let Some(blob) = blob {
+                    let (size, kept): (Option<i64>, bool) = tx.query_row(
+                        "SELECT (SELECT size FROM blobs WHERE hash = ?1),
+                                EXISTS (SELECT 1 FROM blob_keeps
+                                        WHERE hash = ?1 AND owner LIKE 'report %')",
+                        [blob],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let size = size.map_or(Ok(0), |size| super::from_sql_u64("size", size))?;
+                    if !kept && max_reported > 0 && reported.saturating_add(size) > max_reported {
+                        dropped += 1;
+                        continue;
+                    }
+                    if !kept {
+                        reported = reported.saturating_add(size);
+                    }
                     tx.execute(
                         "INSERT INTO blob_keeps (owner, hash) VALUES (?, ?) ON CONFLICT DO NOTHING",
                         params![report_owner(&report.id), blob],
                     )?;
                 }
             }
-            Ok(())
+            Ok(dropped)
         })
     }
 
@@ -414,6 +433,58 @@ mod tests {
 
     fn t(s: &str) -> Timestamp {
         s.parse().unwrap()
+    }
+
+    /// The blobs reports keep are bounded on their own: a blob no report
+    /// keeps yet that would go over the bound is not kept, one another
+    /// report keeps already is, and they count apart from what the server
+    /// stores (5.8, PLAN item 63).
+    #[test]
+    fn reported_blobs_have_their_own_bound() {
+        use crate::store::KeysStore as _;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let blob = |n: u8| risala_proto::names::BlobRef::of(&[n]);
+        for (n, size) in [(1u8, 600i64), (2, 600), (3, 100)] {
+            store
+                .raw()
+                .execute(
+                    "INSERT INTO blobs (hash, size, stored) VALUES (?, ?, 0)",
+                    rusqlite::params![&blob(n).hash()[..], size],
+                )
+                .unwrap();
+        }
+        let report = |id: &str, blobs: &[u8]| NewReport {
+            id: id.parse().unwrap(),
+            mailbox: BoxName::from_bytes([1; 16]),
+            report: "AQID".parse().unwrap(),
+            t: t("2026-11-09T00:00:00.000Z"),
+            pseudonym: Pseudonym::from_bytes([9; 16]),
+            from: None,
+            posts: blobs
+                .iter()
+                .enumerate()
+                .map(|(seq, n)| {
+                    (
+                        seq as u64,
+                        t("2026-11-08T00:00:00.000Z"),
+                        PostBody::Blob(blob(*n)),
+                    )
+                })
+                .collect(),
+        };
+        assert_eq!(store.stored_total().unwrap().stored, 1300);
+        // 600 fit within 1000; the second 600 do not, but 100 more do.
+        assert_eq!(store.add_report(&report("r1", &[1, 2, 3]), 1000).unwrap(), 1);
+        let totals = store.stored_total().unwrap();
+        assert_eq!((totals.stored, totals.reported), (600, 700));
+        // Blob 1 is kept already, so it costs nothing; blob 2 still does
+        // not fit.
+        assert_eq!(store.add_report(&report("r2", &[1, 2]), 1000).unwrap(), 1);
+        // No bound.
+        assert_eq!(store.add_report(&report("r3", &[2]), 0).unwrap(), 0);
+        assert_eq!(store.stored_total().unwrap().reported, 1300);
+        assert!(store.resolve_report(&"r3".parse().unwrap()).unwrap());
+        assert_eq!(store.stored_total().unwrap().reported, 700);
     }
 
     #[test]
@@ -524,7 +595,7 @@ mod tests {
                 ),
             ],
         };
-        store.add_report(&report).unwrap();
+        assert_eq!(store.add_report(&report, 0).unwrap(), 0);
         let open = store.open_reports().unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, report.id);

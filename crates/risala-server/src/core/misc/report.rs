@@ -314,7 +314,19 @@ pub(super) async fn report(cx: &Cx, mailbox: BoxName, data: ReportData) -> Reply
         from: stored.from.clone(),
         posts: copies,
     };
-    cx.db(move |store| store.add_report(&new)).await?;
+    // Blobs and files kept for reports count apart from what the server
+    // stores for conversations, so that reports cannot keep that full,
+    // with their own bound (PLAN item 63; 5.8 is silent on it).
+    let max_reported = inner.config.limits.max_reported_bytes;
+    let dropped = cx
+        .db(move |store| store.add_report(&new, max_reported))
+        .await?;
+    if dropped > 0 {
+        tracing::warn!(
+            "a report's {dropped} blob posts are not kept past retention: \
+             limits.max_reported_bytes is reached"
+        );
+    }
     // Files the posts share stay until the report is resolved (5.8).
     let urls: Vec<FileUrl> = report.posts().flat_map(|p| file_urls(&p.content)).collect();
     if !urls.is_empty() {

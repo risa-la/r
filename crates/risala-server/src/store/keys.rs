@@ -199,6 +199,16 @@ pub struct StoredWelcome {
     pub welcome: OrBlob<Vec<u8>>,
 }
 
+/// What the server stores, from [`KeysStore::stored_total`] (7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoredBytes {
+    /// Blobs, `put` URLs not yet used, uploaded files and kept posts.
+    pub stored: u64,
+    /// The blobs and uploaded files that open reports keep (5.8), which
+    /// nothing else counts.
+    pub reported: u64,
+}
+
 /// A blob the server holds (12.12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRecord {
@@ -391,9 +401,11 @@ pub trait KeysStore {
     /// retention counts from now.
     fn blob_stored(&self, put: &BlobPut, now: Timestamp) -> Result<()>;
 
-    /// The bytes the server stores for everyone: blobs, `put` URLs not
-    /// yet used, uploaded files and kept posts (7.5), for its own cap.
-    fn stored_total(&self) -> Result<u64>;
+    /// The bytes the server stores for everyone (7.5), for its own caps:
+    /// blobs, `put` URLs not yet used, uploaded files and kept posts, apart
+    /// from the blobs and files open reports keep, which count on their own
+    /// (5.8).
+    fn stored_total(&self) -> Result<StoredBytes>;
 
     /// The bytes of files and blobs kept for `mailbox`, and of `put` URLs
     /// for it that are not yet used (7.5).
@@ -440,8 +452,10 @@ pub trait KeysStore {
     fn delete_upload(&self, id: &str) -> Result<bool>;
 
     /// The report `report` keeps the upload `id` until it is resolved
-    /// (5.8). Keeping it twice changes nothing.
-    fn hold_upload(&self, report: &str, id: &str) -> Result<()>;
+    /// (5.8). Keeping it twice changes nothing. An upload no report keeps
+    /// yet is kept only if the bytes reports keep stay within
+    /// `max_reported` (0: no limit); returns whether it is kept.
+    fn hold_upload(&self, report: &str, id: &str, max_reported: u64) -> Result<bool>;
 
     /// The report `report` was resolved: the uploads it kept stop being
     /// kept by it (5.8). Returns those whose bytes are to be removed now:

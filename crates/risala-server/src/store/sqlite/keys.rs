@@ -13,7 +13,7 @@ use crate::secret::SecretHash;
 use crate::store::keys::{
     AddedKeyPackage, BlobPut, BlobRecord, DeviceBytes, Expired, ExpiryTimes, HandedKeyPackage,
     Handout, HandoutRow, KeyPackageCount, NewKeyPackage, PutWelcome, RefBytes, RoomJoins,
-    RoomWelcome, StoredWelcome, UploadRecord,
+    RoomWelcome, StoredBytes, StoredWelcome, UploadRecord,
 };
 use crate::store::{
     BackupRecord, KeysStore, Result, StoreError, coarse, fixed, millis, parsed, timestamp,
@@ -171,6 +171,20 @@ CREATE TABLE backups (
     stored INTEGER NOT NULL         -- ms
 ) STRICT;
 ";
+
+/// The bytes of the blobs and uploaded files that open reports keep
+/// (5.8): blobs kept by a `report ` owner in `blob_keeps`, and uploads
+/// with `held` above 0.
+pub(super) fn reported_bytes(tx: &Transaction<'_>) -> Result<u64> {
+    let total: i64 = tx.query_row(
+        "SELECT (SELECT coalesce(sum(size), 0) FROM blobs WHERE hash IN
+                    (SELECT hash FROM blob_keeps WHERE owner LIKE 'report %'))
+              + (SELECT coalesce(sum(size), 0) FROM uploads WHERE held > 0)",
+        [],
+        |row| row.get(0),
+    )?;
+    from_sql_u64("bytes", total)
+}
 
 /// A blob hash, read back.
 fn blob_ref(what: &str, bytes: &[u8]) -> Result<BlobRef> {
@@ -840,8 +854,9 @@ impl KeysStore for SqliteStore {
         })
     }
 
-    fn stored_total(&self) -> Result<u64> {
+    fn stored_total(&self) -> Result<StoredBytes> {
         self.read(|tx| {
+            let reported = reported_bytes(tx)?;
             let total: i64 = tx.query_row(
                 "SELECT (SELECT coalesce(sum(size), 0) FROM blobs)
                       + (SELECT coalesce(sum(size), 0) FROM blob_puts)
@@ -850,7 +865,10 @@ impl KeysStore for SqliteStore {
                 [],
                 |row| row.get(0),
             )?;
-            from_sql_u64("bytes", total)
+            Ok(StoredBytes {
+                stored: from_sql_u64("bytes", total)?.saturating_sub(reported),
+                reported,
+            })
         })
     }
 
@@ -976,17 +994,31 @@ impl KeysStore for SqliteStore {
         })
     }
 
-    fn hold_upload(&self, report: &str, id: &str) -> Result<()> {
+    fn hold_upload(&self, report: &str, id: &str, max_reported: u64) -> Result<bool> {
         self.write(|tx| {
+            let held: Option<(i64, i64)> = tx
+                .query_row("SELECT size, held FROM uploads WHERE id = ?", [id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()?;
+            let Some((size, held)) = held else {
+                return Ok(false);
+            };
+            // A file another report keeps already counts (5.8).
+            if held == 0
+                && max_reported > 0
+                && reported_bytes(tx)?.saturating_add(from_sql_u64("size", size)?) > max_reported
+            {
+                return Ok(false);
+            }
             let n = tx.execute(
-                "INSERT INTO report_holds (report, upload)
-                 SELECT ?1, id FROM uploads WHERE id = ?2 ON CONFLICT DO NOTHING",
+                "INSERT INTO report_holds (report, upload) VALUES (?, ?) ON CONFLICT DO NOTHING",
                 params![report, id],
             )?;
             if n > 0 {
                 tx.execute("UPDATE uploads SET held = held + 1 WHERE id = ?", [id])?;
             }
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -1537,10 +1569,18 @@ mod tests {
         assert!(!store.claim_upload("a").unwrap());
         assert!(store.upload_stored("a", later(5)).unwrap());
         assert!(store.claim_upload("b").unwrap());
-        store.hold_upload("r1", "a").unwrap();
-        store.hold_upload("r1", "a").unwrap();
-        store.hold_upload("r2", "a").unwrap();
-        store.hold_upload("r2", "none").unwrap();
+        assert!(store.hold_upload("r1", "a", 0).unwrap());
+        assert!(store.hold_upload("r1", "a", 0).unwrap());
+        assert!(store.hold_upload("r2", "a", 0).unwrap());
+        assert!(!store.hold_upload("r2", "none", 0).unwrap());
+        assert_eq!(store.upload("a").unwrap().unwrap().held, 2);
+        // What reports keep has its own bound: a file no report keeps yet
+        // that does not fit is not kept; one another report keeps is.
+        assert_eq!(store.stored_total().unwrap().reported, 10);
+        assert!(!store.hold_upload("r3", "c", 15).unwrap());
+        assert!(store.hold_upload("r3", "a", 15).unwrap());
+        assert!(store.hold_upload("r3", "c", 20).unwrap());
+        assert!(store.release_uploads("r3", later(0)).unwrap().is_empty());
         assert_eq!(store.upload("a").unwrap().unwrap().held, 2);
         // Held: the uploader's DELETE waits for the report.
         assert!(!store.delete_upload("a").unwrap());

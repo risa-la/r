@@ -992,6 +992,38 @@ async fn address_bytes() {
     assert!(anon.lines()[0].starts_with("OK seq="));
 }
 
+/// `limits.max_stored_bytes` is checked on UPLOAD and BLOB only: posts and
+/// commits are never refused for it, however much the server stores (7.5,
+/// PLAN item 63).
+#[tokio::test]
+async fn posts_are_never_refused_for_the_servers_cap() {
+    let mut config = config();
+    config.limits.max_stored_bytes = 2_000;
+    config.limits.post_reserve_bytes = 1_000;
+    config.limits.posts_per_minute = 0;
+    let mut h = Harness::with(config, timers());
+    let mut anon = h.anon().await;
+    let mut d = Direct::new(&h, &mut anon, 1).await;
+    for i in 0..10u8 {
+        let message = d.alice.send(&mut d.a, &[i; 500]);
+        h.send(
+            &anon,
+            &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+        )
+        .await;
+        let lines = anon.lines();
+        assert!(lines[0].starts_with("OK seq="), "{lines:?}");
+    }
+    crate::core::keys::expire(h.inner()).await.unwrap();
+    let message = d.alice.send(&mut d.a, b"after a maintenance round");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert!(anon.lines()[0].starts_with("OK seq="));
+}
+
 /// Over its quota a mailbox's oldest posts expire early, and a post larger
 /// than the quota is refused (7.5).
 #[tokio::test]

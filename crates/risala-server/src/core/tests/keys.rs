@@ -1496,19 +1496,23 @@ async fn blobs_kept_alive_count_against_the_address() {
     assert!(anon.lines()[0].ends_with("ERR rate-limited"));
 }
 
-/// Above `limits.max_stored_bytes`, the server stores nothing more, for
-/// anyone (7.5).
+/// Above `limits.max_stored_bytes`, less the room kept for posts, the
+/// server stores no more files or blobs, for anyone (7.5, PLAN item 63).
 #[tokio::test]
 async fn the_server_stores_at_most_its_cap() {
-    let mut h = keys_with(|c| c.limits.max_stored_bytes = 30_000);
+    let mut h = keys_with(|c| {
+        c.limits.max_stored_bytes = 40_000;
+        c.limits.post_reserve_bytes = 10_000;
+    });
     h.mailbox();
     let mut anon = h.anon().await;
     h.store_blob(&mut anon, &[1; 20_000]).await;
+    // 30,000 bytes are left for files and blobs, not 40,000.
     h.send(
         &anon,
         &format!(
-            "BLOB {} 20000 box={BOX} token={}",
-            BlobRef::of(&[2; 20_000]),
+            "BLOB {} 15000 box={BOX} token={}",
+            BlobRef::of(&[2; 15_000]),
             token()
         ),
     )
@@ -1519,9 +1523,26 @@ async fn the_server_stores_at_most_its_cap() {
     crate::core::keys::expire(h.inner()).await.unwrap();
     let mut far = h.connect_from("198.51.100.9:4000");
     h.send(&far, "ANON").await;
-    h.send(&far, &format!("UPLOAD {BOX} {} 20000", token()))
+    h.send(&far, &format!("UPLOAD {BOX} {} 15000", token()))
         .await;
     assert_eq!(far.lines()[1], "@retry=3600 ERR rate-limited");
+    // And for a signed-in identity's own blobs (12.12).
+    let alice = Dev::new("alice@example.org", 1);
+    let mut a = h.sign_in(&alice);
+    h.send(&a, &format!("BLOB {} 15000", BlobRef::of(&[3; 15_000])))
+        .await;
+    assert!(a.lines().last().unwrap().ends_with("ERR rate-limited"));
+    // What fits still goes in.
+    h.send(
+        &far,
+        &format!(
+            "BLOB {} 5000 box={BOX} token={}",
+            BlobRef::of(&[4; 5_000]),
+            token()
+        ),
+    )
+    .await;
+    assert!(far.lines()[0].starts_with("OK put="));
 }
 
 /// Handouts and Welcomes are stored with their times to the hour only, so

@@ -129,7 +129,7 @@ pub(crate) struct State {
     memory_kib: u64,
     /// The bytes the server stores in all, as of the last maintenance
     /// round, plus what was asked to be stored since
-    /// (`limits.max_stored_bytes`).
+    /// (`limits.max_stored_bytes`), apart from what open reports keep.
     stored: AtomicU64,
 }
 
@@ -152,7 +152,7 @@ impl State {
             identity_bytes: ByteWindow::new(24 * hour),
             memory: Arc::new(Semaphore::new(memory_kib as usize)),
             memory_kib,
-            stored: AtomicU64::new(store.stored_total()?),
+            stored: AtomicU64::new(store.stored_total()?.stored),
         })
     }
 
@@ -1088,25 +1088,53 @@ async fn check_token(cx: &Cx, mailbox: &BoxName, token: &SendToken) -> Result<()
 /// window, which POST, UPLOAD and BLOB share (7.5): `ERR rate-limited`
 /// when it is full. The mailbox area calls this for POST.
 ///
-/// The bytes also count against what the whole server stores
-/// (`limits.max_stored_bytes`): above it, nothing more is stored, for
-/// anyone, until enough expires (`ERR rate-limited`).
+/// The bytes are added to what the whole server stores, but a post is
+/// never refused for `limits.max_stored_bytes`: UPLOAD and BLOB leave
+/// `limits.post_reserve_bytes` of it for posts ([`charge_file`]), so that
+/// conversations go on when files and blobs fill the rest (PLAN item 63).
 pub(crate) fn charge_address(inner: &Inner, ip: IpAddr, bytes: u64) -> Result<(), ErrResponse> {
+    charge_window(inner, ip, bytes)?;
+    inner.keys.stored.fetch_add(bytes, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Counts `bytes` against the window of the network address `ip` only
+/// (7.5).
+fn charge_window(inner: &Inner, ip: IpAddr, bytes: u64) -> Result<(), ErrResponse> {
     let limits = &inner.config.limits;
-    let keys = &inner.keys;
-    let cap = limits.max_stored_bytes;
-    if cap > 0 && keys.stored.load(Ordering::Relaxed).saturating_add(bytes) > cap {
-        tracing::warn!("the server stores limits.max_stored_bytes: refusing more");
-        return Err(rate_limited(60 * 60));
-    }
-    keys.address_bytes
+    inner
+        .keys
+        .address_bytes
         .charge(
             network(ip),
             bytes,
             limits.address_bytes_per_hour,
             inner.now(),
         )
-        .map_err(rate_limited)?;
+        .map_err(rate_limited)
+}
+
+/// Checks that `bytes` more of a file or blob fit within what the whole
+/// server stores (`limits.max_stored_bytes`), less the room kept for posts
+/// (`limits.post_reserve_bytes`): above it, no file or blob is stored, for
+/// anyone, until enough expires (`ERR rate-limited`, 7.5). Then counts
+/// them against `ip`'s window, if there is one, and adds them to what is
+/// stored.
+fn charge_file(inner: &Inner, ip: Option<IpAddr>, bytes: u64) -> Result<(), ErrResponse> {
+    let limits = &inner.config.limits;
+    let keys = &inner.keys;
+    let cap = limits.max_stored_bytes;
+    let room = cap.saturating_sub(limits.post_reserve_bytes);
+    if cap > 0 && keys.stored.load(Ordering::Relaxed).saturating_add(bytes) > room {
+        tracing::warn!(
+            "the server stores limits.max_stored_bytes, less limits.post_reserve_bytes: \
+             refusing files and blobs"
+        );
+        return Err(rate_limited(60 * 60));
+    }
+    if let Some(ip) = ip {
+        charge_window(inner, ip, bytes)?;
+    }
     keys.stored.fetch_add(bytes, Ordering::Relaxed);
     Ok(())
 }
@@ -1136,7 +1164,7 @@ async fn check_quota(cx: &Cx, mailbox: BoxName, size: u64) -> Result<(), ErrResp
     if files > quota {
         return Err(err(ErrorCode::RateLimited));
     }
-    charge_address(&cx.inner, cx.peer.ip(), size)?;
+    charge_file(&cx.inner, Some(cx.peer.ip()), size)?;
     let fits = mailbox::make_room(&cx.inner, mailbox, files)
         .await
         .map_err(internal)?;
@@ -1178,7 +1206,7 @@ async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<MailboxPermit>) 
     // keep any blob forever for nothing.
     let held = hash;
     if let Some(record) = cx.db(move |store| store.blob(&held)).await? {
-        charge_address(inner, cx.peer.ip(), record.size)?;
+        charge_window(inner, cx.peer.ip(), record.size)?;
         let touched = hash;
         if cx.db(move |store| store.touch_blob(&touched, now)).await? {
             return Ok(OkResponse::new().with_exists());
@@ -1196,6 +1224,8 @@ async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<MailboxPermit>) 
                 .identity_bytes
                 .charge(device.uid.clone(), size, max, now)
                 .map_err(rate_limited)?;
+            // The identity's own window, not the address's (12.12).
+            charge_file(inner, None, size)?;
             Some(device.uid.clone())
         }
         (None, None) => return Err(err(ErrorCode::BadSyntax)),
@@ -1513,7 +1543,7 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
         }
         // What the server stores, counted again from the store.
         keys.stored
-            .store(inner.store.stored_total()?, Ordering::Relaxed);
+            .store(inner.store.stored_total()?.stored, Ordering::Relaxed);
         Ok(())
     })
     .await
@@ -1527,26 +1557,33 @@ pub(crate) async fn expire(inner: &Arc<Inner>) -> Result<(), StoreError> {
 /// Only a whole `get` URL counts: its secret part must match, so that a
 /// report cannot keep a file whose URL its sender does not hold. Other
 /// URLs are ignored, and a store failure is logged: the report stands
-/// without the file (5.8 is silent on both).
+/// without the file (5.8 is silent on both). So does a file that would take
+/// what reports keep past `limits.max_reported_bytes`.
 pub(crate) async fn keep_files_for_report(inner: &Inner, report: &Id, urls: &[FileUrl]) {
     for url in urls {
         let Some((id, secret)) = disk::upload_of_get_url(inner, url.as_str()) else {
             continue;
         };
         let report = report.to_string();
+        let max_reported = inner.config.limits.max_reported_bytes;
         let kept = inner
             .db(move |store| {
                 let matches = store
                     .upload(&id)?
                     .is_some_and(|upload| upload.get.matches(secret.as_bytes()));
                 if matches {
-                    store.hold_upload(&report, &id)?;
+                    return store.hold_upload(&report, &id, max_reported);
                 }
-                Ok(())
+                Ok(true)
             })
             .await;
-        if let Err(e) = kept {
-            tracing::error!("keys: keeping a reported file: {e}");
+        match kept {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                "keys: a reported file is not kept past retention: \
+                 limits.max_reported_bytes is reached"
+            ),
+            Err(e) => tracing::error!("keys: keeping a reported file: {e}"),
         }
     }
 }

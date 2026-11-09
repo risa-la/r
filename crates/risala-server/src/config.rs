@@ -473,7 +473,8 @@ pub struct Limits {
     /// The most bytes one network address may store in an hour, counting
     /// POST, UPLOAD and BLOB together (7.5). Further ones get
     /// `ERR rate-limited`. IPv6 addresses count by their /64. 0 means no
-    /// limit.
+    /// limit. At the default of 1 GiB, one address alone takes about 9
+    /// days to fill what the default `max_stored_bytes` leaves files.
     pub address_bytes_per_hour: u64,
     /// The most mailboxes one connection, and one network address, may
     /// create in an hour (5.2). 0 means no limit.
@@ -487,10 +488,25 @@ pub struct Limits {
     /// The most mailboxes one connection may follow (7.1): at least 1,000.
     pub max_follows: usize,
     /// The most bytes the server stores in all: blobs, uploaded files and
-    /// kept posts (7.5). Above it, POST, UPLOAD and BLOB get
-    /// `ERR rate-limited` for everyone until enough expires, so that a few
-    /// addresses cannot fill the disk. 0 means no limit.
+    /// kept posts (7.5), apart from what open reports keep
+    /// (`max_reported_bytes`). It is checked on UPLOAD and BLOB only,
+    /// which get `ERR rate-limited` for everyone once what is stored is
+    /// within `post_reserve_bytes` of it, until enough expires, so that a
+    /// few addresses cannot fill the disk. Posts are never refused for
+    /// it: the reserve keeps room for them, and each mailbox's quota and
+    /// each address's window bound them. 0 means no limit.
     pub max_stored_bytes: u64,
+    /// The bytes of `max_stored_bytes` that UPLOAD and BLOB leave for
+    /// posts, inline ones and commits, so that conversations go on when
+    /// files and blobs have filled the rest (7.5). Less than
+    /// `max_stored_bytes`, unless that is 0.
+    pub post_reserve_bytes: u64,
+    /// The most bytes of blobs and uploaded files that open reports keep
+    /// until they are resolved (5.8), counted apart from
+    /// `max_stored_bytes`. A report whose blobs or files would go over it
+    /// is still made, without keeping those past their retention, and the
+    /// server logs a warning. 0 means no limit.
+    pub max_reported_bytes: u64,
     /// The most bytes of blobs the server reads into memory at once, for
     /// everyone (12.12): a public room's commits, GroupInfos and trees and
     /// KEYS PUT's records. Readers wait for room beyond it. At least 1 MiB.
@@ -664,12 +680,14 @@ impl Default for Limits {
             key_package_gets_per_hour: 600,
             max_key_package_bytes: 64 * 1024,
             mailbox_quota: 4 * 1024 * 1024 * 1024,
-            address_bytes_per_hour: 8 * 1024 * 1024 * 1024,
+            address_bytes_per_hour: 1024 * 1024 * 1024,
             creates_per_hour: 120,
             posts_per_minute: 600,
             commits_per_hour: 600,
             max_follows: 4096,
             max_stored_bytes: 256 * 1024 * 1024 * 1024,
+            post_reserve_bytes: 32 * 1024 * 1024 * 1024,
+            max_reported_bytes: 16 * 1024 * 1024 * 1024,
             blob_memory: 1024 * 1024 * 1024,
             max_room_blob: 16 * 1024 * 1024,
             keys_puts_per_hour: 60,
@@ -775,6 +793,13 @@ impl Config {
             return invalid(format!(
                 "limits.max_key_package_bytes is {}, but must be at least {MIN_KEY_PACKAGE_BYTES} (12.5)",
                 l.max_key_package_bytes
+            ));
+        }
+        if l.max_stored_bytes > 0 && l.post_reserve_bytes >= l.max_stored_bytes {
+            return invalid(format!(
+                "limits.post_reserve_bytes is {}, but must be less than limits.max_stored_bytes ({}), \
+                 or no blob or file could be stored (7.5)",
+                l.post_reserve_bytes, l.max_stored_bytes
             ));
         }
         if l.blob_memory < 1024 * 1024 {

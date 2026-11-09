@@ -177,8 +177,11 @@ pub trait MiscStore {
     /// Deletes the mailbox subscriptions that expired before `now` (9.1).
     fn expire_pushes(&self, now: Timestamp) -> Result<u64>;
 
-    /// Stores a report, with copies of its posts (5.8).
-    fn add_report(&self, report: &NewReport) -> Result<()>;
+    /// Stores a report, with copies of its posts (5.8). The blobs of posts
+    /// that are blobs are kept until it is resolved, those that no report
+    /// keeps yet only while the bytes reports keep stay within
+    /// `max_reported` (0: no limit). Returns how many were not kept.
+    fn add_report(&self, report: &NewReport, max_reported: u64) -> Result<usize>;
 
     /// Every open report, oldest first (5.8).
     fn open_reports(&self) -> Result<Vec<StoredReport>>;
