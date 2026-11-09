@@ -474,7 +474,10 @@ mod tests {
         };
         assert_eq!(store.stored_total().unwrap().stored, 1300);
         // 600 fit within 1000; the second 600 do not, but 100 more do.
-        assert_eq!(store.add_report(&report("r1", &[1, 2, 3]), 1000).unwrap(), 1);
+        assert_eq!(
+            store.add_report(&report("r1", &[1, 2, 3]), 1000).unwrap(),
+            1
+        );
         let totals = store.stored_total().unwrap();
         assert_eq!((totals.stored, totals.reported), (600, 700));
         // Blob 1 is kept already, so it costs nothing; blob 2 still does

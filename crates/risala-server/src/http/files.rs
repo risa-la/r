@@ -120,7 +120,8 @@ impl Pace {
         // A point whose count is at most `moved - need` can no longer
         // decide when the transfer is too slow.
         if let Some(threshold) = self.moved.checked_sub(self.need) {
-            while self.points.len() > 1 && self.points.front().is_some_and(|(_, c)| *c <= threshold) {
+            while self.points.len() > 1 && self.points.front().is_some_and(|(_, c)| *c <= threshold)
+            {
                 self.points.pop_front();
             }
         }
@@ -493,7 +494,10 @@ mod tests {
         let mut pace = Pace::starting(16 * KIB, window, 100 * KIB, t0).unwrap();
         pace.moved_at(50 * KIB as usize, t0 + Duration::from_secs(10));
         assert_eq!(pace.deadline(), Some(t0 + window));
-        assert_eq!(Pace::starting(16 * KIB, window, 0, t0).unwrap().deadline(), None);
+        assert_eq!(
+            Pace::starting(16 * KIB, window, 0, t0).unwrap().deadline(),
+            None
+        );
         assert!(Pace::starting(0, window, 100, t0).is_none());
     }
 }

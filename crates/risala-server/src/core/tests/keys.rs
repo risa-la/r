@@ -1098,7 +1098,10 @@ async fn a_public_rooms_current_tree_is_kept() {
         group_info: vec![1],
         tree: vec![2],
         tree_blob: Some(tree_blob),
-        members: vec![("alice@example.org".parse().unwrap(), risala_proto::types::Role::Owner)],
+        members: vec![(
+            "alice@example.org".parse().unwrap(),
+            risala_proto::types::Role::Owner,
+        )],
         topic: String::new(),
         guests: risala_proto::types::GuestAccess::Write,
         state: Vec::new(),

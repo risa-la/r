@@ -202,7 +202,11 @@ pub struct StoredWelcome {
 /// The owner in `blob_keeps` of the tree blob of the public room of
 /// `mailbox` (12.12), which keeps it while the room's epoch is current.
 pub fn room_tree_owner(mailbox: &BoxName) -> String {
-    let hex: String = mailbox.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = mailbox
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     format!("room {hex}")
 }
 

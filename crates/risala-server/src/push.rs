@@ -672,7 +672,10 @@ mod tests {
         let p = ParsedUrl::parse("https://push.example").unwrap();
         assert_eq!((p.port, p.path.as_str()), (443, "/"));
         let p = ParsedUrl::parse("https://Push.Example./x").unwrap();
-        assert_eq!((p.host.as_str(), p.authority.as_str()), ("push.example", "Push.Example."));
+        assert_eq!(
+            (p.host.as_str(), p.authority.as_str()),
+            ("push.example", "Push.Example.")
+        );
         for bad in [
             "http://push.example/",
             "https://user@push.example/",
