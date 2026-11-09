@@ -4,7 +4,7 @@
     "rust": {
       "root": "crates",
       "extension": ".rs",
-      "exclude": ["crates/openmls-traits/", "/target/", "/fuzz/corpus/", "/fuzz/artifacts/", "/fuzz/coverage/"]
+      "exclude": ["crates/openmls/", "crates/openmls-traits/", "/target/", "/fuzz/corpus/", "/fuzz/artifacts/", "/fuzz/coverage/"]
     },
     "swift": {
       "root": "clients/apple",

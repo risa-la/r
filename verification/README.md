@@ -3,7 +3,7 @@
 The tools behind the site's verification page,
 [risa.la/verification](https://risa.la/verification). The page lists
 every source file of the Rust crates (except the vendored
-`openmls-traits`) and of the Apple client. Beside each line it shows
+`openmls` and `openmls-traits`) and of the Apple client. Beside each line it shows
 every kind of evidence that reaches it, one narrow column each:
 
 | Column | Evidence |
