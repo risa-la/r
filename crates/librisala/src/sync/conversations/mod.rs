@@ -90,6 +90,9 @@ pub(crate) const OLD_MAILBOX_MS: u64 = 24 * 60 * 60 * 1000;
 /// their own.
 pub const SINGLE_USE_SLOT: Slot = Slot::Anonymous(usize::MAX);
 
+/// How many Welcomes in blobs wait for their blob at once (LR-M5).
+const MAX_WELCOME_BLOBS: usize = 4;
+
 /// How many queued messages a conversation posts at once.
 const POST_BATCH: usize = 16;
 
@@ -2325,6 +2328,16 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let me = self.me(cx)?;
+        // LR-M5: anyone who got one of the device's KeyPackages can put
+        // Welcomes that name blobs. A few at a time are fetched; the rest
+        // stay on the server, listed again on the next connection.
+        if let OrBlob::Blob(_) = welcome
+            && !self.welcome_blobs.iter().any(|(i, _)| i == id)
+            && self.welcome_blobs.len() >= MAX_WELCOME_BLOBS
+        {
+            tracing::info!("a Welcome in a blob left for later: too many waiting");
+            return Ok(());
+        }
         let sealed = match welcome {
             OrBlob::Inline(welcome) => welcome.decode(),
             OrBlob::Blob(blob) => match self.get_blob(&me, blob) {

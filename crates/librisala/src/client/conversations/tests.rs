@@ -282,3 +282,58 @@ async fn two_clients_talk_through_the_driver() {
     alice.client.disconnect(alice.account).await.unwrap();
     bob.client.disconnect(bob.account).await.unwrap();
 }
+
+/// LR-M5: blob fetches are bounded: two at a time, a few fetched blobs
+/// kept, and no more bytes held than the largest blob, whatever refs come.
+#[tokio::test]
+async fn blob_fetches_are_bounded() {
+    use crate::client::conversations::BlobFetcher;
+    use crate::client::identity::{Fetched, Https};
+    use crate::sync::conversations::BlobFetch;
+
+    struct Slow {
+        calls: Mutex<usize>,
+        go: tokio::sync::Semaphore,
+        size: usize,
+    }
+    impl Https for Slow {
+        fn get<'a>(&'a self, _: &'a str, _: usize) -> crate::conn::BoxFuture<'a, Fetched> {
+            Box::pin(async move {
+                *self.calls.lock().unwrap() += 1;
+                self.go.acquire().await.unwrap().forget();
+                Fetched::Body(vec![0; self.size])
+            })
+        }
+    }
+    let https = Arc::new(Slow {
+        calls: Mutex::new(0),
+        go: tokio::sync::Semaphore::new(0),
+        size: 100 << 20,
+    });
+    let fetcher = Arc::new(BlobFetcher::new(Some(https.clone())));
+    let refs: Vec<risala_proto::names::BlobRef> = (0..8u8)
+        .map(|i| risala_proto::names::BlobRef::from_hash([i; 48]))
+        .collect();
+    for r in &refs {
+        assert!(matches!(
+            fetcher.get(Some("https://b.test/"), r),
+            BlobFetch::Waiting
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(*https.calls.lock().unwrap(), 2, "two at a time");
+    assert_eq!(fetcher.counts().0, 2);
+    // Each ask starts the next one as a slot frees up.
+    for round in 0..4 {
+        https.go.add_permits(2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for r in &refs {
+            let _ = fetcher.get(Some("https://b.test/"), r);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (in_flight, ready, held) = fetcher.counts();
+        assert!(in_flight <= 2, "round {round}");
+        assert!(ready <= 4, "round {round}");
+        assert!(held <= 256 << 20, "round {round}: {held}");
+    }
+}

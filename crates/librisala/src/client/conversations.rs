@@ -316,23 +316,79 @@ pub(crate) struct ClientHooks {
 /// The most a blob may hold: the tree of the largest public room (12.12).
 const MAX_BLOB: usize = 256 << 20;
 
+/// How many blobs are fetched at once (LR-M5).
+const MAX_IN_FLIGHT: usize = 2;
+
+/// How many fetched blobs are kept until asked for again, for a Welcome
+/// and its tree, or a GroupInfo and its tree, asked for together (LR-M5).
+const MAX_READY: usize = 4;
+
+/// The most bytes of fetched blobs kept at once, besides the newest
+/// (LR-M5).
+const MAX_HELD: usize = MAX_BLOB;
+
 /// Fetches blobs (12.12) from INFO's `blobs` URL prefix over HTTPS, in the
 /// background, for [`Hooks::blob`], which answers `Waiting` until a fetch
 /// is done. The engine checks each blob's hash.
+///
+/// Anyone who can post, or put a Welcome to one of the device's
+/// KeyPackages, can name blobs, so what it does is bounded (LR-M5): at
+/// most [`MAX_IN_FLIGHT`] fetches at once (a ref asked for beyond that
+/// waits for a later ask), each of at most [`MAX_BLOB`] bytes, and at most
+/// [`MAX_READY`] fetched blobs, of [`MAX_HELD`] bytes in all, kept, the
+/// oldest dropped first.
 ///
 /// TODO(C4): the blob store, with its cache and BLOB uploads, is task
 /// C4's; this is the group engine's own seam until it lands.
 pub(crate) struct BlobFetcher {
     https: Option<Arc<dyn crate::client::identity::Https>>,
-    state: std::sync::Mutex<std::collections::HashMap<[u8; 48], BlobState>>,
+    state: std::sync::Mutex<FetchState>,
 }
 
 /// A blob being fetched (`None`), or fetched: its bytes, or `None` if the
 /// fetch failed.
 type BlobState = Option<Option<Vec<u8>>>;
 
+/// What the fetcher holds.
+#[derive(Default)]
+pub(crate) struct FetchState {
+    blobs: std::collections::HashMap<[u8; 48], BlobState>,
+    /// Fetched blobs, oldest first.
+    ready: std::collections::VecDeque<[u8; 48]>,
+    in_flight: usize,
+    held: usize,
+}
+
+impl FetchState {
+    fn done(&mut self, hash: [u8; 48], got: Option<Vec<u8>>) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if let Some(bytes) = &got {
+            self.held += bytes.len();
+            self.ready.push_back(hash);
+        }
+        self.blobs.insert(hash, Some(got));
+        while self.ready.len() > MAX_READY
+            || (self.ready.len() > 1 && self.held > MAX_HELD)
+        {
+            let Some(old) = self.ready.pop_front() else {
+                break;
+            };
+            if let Some(Some(Some(bytes))) = self.blobs.remove(&old) {
+                self.held -= bytes.len();
+            }
+        }
+    }
+}
+
 impl BlobFetcher {
-    fn get(
+    pub(crate) fn new(https: Option<Arc<dyn crate::client::identity::Https>>) -> BlobFetcher {
+        BlobFetcher {
+            https,
+            state: std::sync::Mutex::default(),
+        }
+    }
+
+    pub(crate) fn get(
         self: &Arc<Self>,
         prefix: Option<&str>,
         blob: &risala_proto::names::BlobRef,
@@ -341,24 +397,24 @@ impl BlobFetcher {
             return BlobFetch::Unavailable;
         };
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        match state.get(blob.hash()) {
+        match state.blobs.get(blob.hash()) {
             Some(None) => return BlobFetch::Waiting,
             Some(Some(Some(bytes))) => return BlobFetch::Ready(bytes.clone()),
             Some(Some(None)) => {
-                state.remove(blob.hash());
+                state.blobs.remove(blob.hash());
                 return BlobFetch::Unavailable;
             }
             None => {}
         }
-        // A few recent blobs are kept, for a Welcome and its tree, or a
-        // GroupInfo and its tree, asked for together.
-        if state.len() >= 16 {
-            state.retain(|_, v| v.is_none());
+        // Asked again later, once a fetch is done.
+        if state.in_flight >= MAX_IN_FLIGHT {
+            return BlobFetch::Waiting;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return BlobFetch::Unavailable;
         };
-        state.insert(*blob.hash(), None);
+        state.blobs.insert(*blob.hash(), None);
+        state.in_flight += 1;
         drop(state);
         let url = format!("{prefix}{}", blob.hex());
         let hash = *blob.hash();
@@ -374,9 +430,15 @@ impl BlobFetcher {
             this.state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(hash, Some(got));
+                .done(hash, got);
         });
         BlobFetch::Waiting
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.in_flight, s.ready.len(), s.held)
     }
 }
 
@@ -574,10 +636,7 @@ impl Client {
         Arc::new(ClientHooks {
             store: self.store().clone(),
             keys: self.options().keys.clone(),
-            blobs: Arc::new(BlobFetcher {
-                https: self.options().https.clone(),
-                state: std::sync::Mutex::default(),
-            }),
+            blobs: Arc::new(BlobFetcher::new(self.options().https.clone())),
             confirm: self.confirm_service(),
             clock: self.options().clock.clone(),
             #[cfg(test)]
