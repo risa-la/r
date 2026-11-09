@@ -212,6 +212,96 @@ fn a_committer_removed_by_record_is_removed() {
     assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
 }
 
+/// The commits of this device's outbox in `conv`, done or not, but moves
+/// (7.8).
+fn own_commits(net: &Net, d: usize, conv: ConversationId) -> u32 {
+    net.write(d, |tx| {
+        Ok(tx
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM outbox
+                 WHERE conv = ?1 AND kind = 'commit' AND move_box IS NULL",
+                [conv.0],
+                |r| r.get(0),
+            )
+            .map_err(crate::store::StoreError::from)?)
+    })
+}
+
+/// 12.7, 12.14: a failed check is repaired by exactly one removal commit,
+/// even when the device's upkeep queued a removal of the same leaf by key
+/// file while the repair waited: the repair is not queued again, and
+/// only the removal and the move that follows it (7.8) are posted.
+#[test]
+fn a_failed_check_makes_exactly_one_removal_commit() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    let alice_keys = own_facts(&mut net, alice);
+    net.connect(alice);
+    net.connect(bob);
+    let a = net.job(alice, peer("bob@example.net")).unwrap();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    let mailbox = net.devices[alice].store.mailbox_rows(a).unwrap()[0].mailbox;
+    let commits = |net: &Net| {
+        net.server
+            .posts(&mailbox)
+            .into_iter()
+            .filter(|p| p.1 == risala_mls::framing::ContentType::Commit)
+            .count()
+    };
+    // Alice accepts a record that removed Bob's device; Bob's device then
+    // commits, and fails Alice's committer check.
+    let bob_id: [u8; 48] = net.devices[bob].device_id.clone().try_into().unwrap();
+    alice_keys.remove(&uid("bob@example.net"), &bob_id);
+    net.write(bob, |tx| {
+        group::queue_intent(
+            tx,
+            b,
+            &Intent {
+                new_leaf_key: true,
+                ..Intent::default()
+            },
+            START,
+        )?;
+        Ok(())
+    });
+    net.tick();
+    assert_eq!(checks(&net, alice, a), 1);
+    let before = commits(&net);
+    let queued = own_commits(&net, alice, a);
+    // Meanwhile the upkeep removes the leaves of devices removed by
+    // record (12.14), here before the repair is due.
+    net.write(alice, |tx| {
+        group::queue_intent(
+            tx,
+            a,
+            &Intent {
+                remove: vec![("bob@example.net".into(), Some(bob_id))],
+                ..Intent::default()
+            },
+            START,
+        )?;
+        Ok(())
+    });
+    for _ in 0..5 {
+        net.advance(60 * 1000);
+    }
+    assert!(has_event(&net, alice, |e| matches!(
+        e,
+        ConversationEvent::KeyCheckFailed { conversation, uid, repairing: true }
+            if *conversation == a && uid.as_str() == "bob@example.net"
+    )));
+    assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
+    assert_eq!(commits(&net), before + 2, "the removal, then the move");
+    assert_eq!(
+        own_commits(&net, alice, a),
+        queued + 1,
+        "the repair was not queued again"
+    );
+    assert_eq!(checks(&net, alice, a), 0);
+}
+
 /// LR-C1: a Welcome whose group id is that of a conversation the device
 /// has, but that does not continue it, is refused, and the conversation
 /// stays as it was. Here a device of someone else under Bob's uid (as the

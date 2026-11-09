@@ -30,7 +30,8 @@ use super::{Client, Event, Result};
 use crate::keys::KeyStore;
 use crate::store::Tx;
 use crate::store::conversations::{ConvKind, ConvRow, LeafRow};
-use crate::store::identity::{ContactRow, DeviceState, KeysState, read_own};
+use crate::store::identity::{ContactRow, DeviceRow, DeviceState, KeysState, read_own};
+use crate::store::keychecks::KeyCheckRow;
 use crate::sync::Action;
 use crate::sync::conversations::wire::Intent;
 use crate::sync::conversations::{Job, group};
@@ -242,6 +243,41 @@ fn key_kind(kind: &ConvKind) -> Option<KeyKind> {
         ConvKind::Public => Some(KeyKind::PublicRoom),
         _ => None,
     }
+}
+
+/// The leaves of `uid` that the upkeep removes by the key files (12.14):
+/// those of devices removed by record, or every one but this device's if
+/// `unchecked_room` (a private room's member the device cannot check).
+///
+/// Leaves the engine has a key check for are left out: a failed check is
+/// the engine's to repair (12.7, `sync::conversations::keycheck`), after
+/// its random wait and where the group checks let this device, so that
+/// the same leaf is not removed by two commits. One whose check passes
+/// later is removed here at the next upkeep.
+fn removals_by_key_file(
+    leaves: &[LeafRow],
+    uid: &Uid,
+    devices: &[DeviceRow],
+    unchecked_room: bool,
+    this_device: Option<[u8; 48]>,
+    checks: &[KeyCheckRow],
+) -> Vec<(String, Option<[u8; 48]>)> {
+    leaves
+        .iter()
+        .filter(|l| l.uid == *uid && l.device_id.is_some() && l.device_id != this_device)
+        .filter(|l| {
+            !checks
+                .iter()
+                .any(|c| c.uid == l.uid && Some(c.device_id) == l.device_id)
+        })
+        .filter(|l| {
+            unchecked_room
+                || devices
+                    .iter()
+                    .any(|d| Some(d.device_id) == l.device_id && d.state == DeviceState::Removed)
+        })
+        .map(|l| (l.uid.to_string(), l.device_id))
+        .collect()
 }
 
 impl Client {
@@ -484,6 +520,7 @@ impl Client {
             .store()
             .own_identity(own.as_str())?
             .map(|o| o.device_id);
+        let (checks, _) = self.store().write(|tx| tx.conversation_checks(row.id))?;
 
         // Removals: one identity per commit (12.7).
         for uid in uids.iter().filter(|u| !u.is_guest()) {
@@ -496,17 +533,8 @@ impl Client {
             let devices = self.store().devices(uid.as_str())?;
             let unchecked_room =
                 row.kind == ConvKind::Private && uid != own && unchecked(&contact).is_some();
-            let remove: Vec<(String, Option<[u8; 48]>)> = leaves
-                .iter()
-                .filter(|l| l.uid == *uid && l.device_id.is_some() && l.device_id != this_device)
-                .filter(|l| {
-                    unchecked_room
-                        || devices.iter().any(|d| {
-                            Some(d.device_id) == l.device_id && d.state == DeviceState::Removed
-                        })
-                })
-                .map(|l| (l.uid.to_string(), l.device_id))
-                .collect();
+            let remove =
+                removals_by_key_file(&leaves, uid, &devices, unchecked_room, this_device, &checks);
             if !remove.is_empty() {
                 tracing::info!(conv = %row.id, n = remove.len(), "removing leaves for a key check");
                 self.queue_commit(
@@ -850,6 +878,63 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// 12.14: the upkeep removes the leaves of devices removed by record,
+    /// except this device's and those with a key check in the engine,
+    /// whose failure the engine repairs (12.7), so that one leaf is not
+    /// removed twice.
+    #[test]
+    fn removals_by_key_file_leave_checked_leaves_to_the_engine() {
+        let alice = uid(ALICE);
+        let leaf = |n: u8| LeafRow {
+            leaf: u32::from(n),
+            uid: alice.clone(),
+            device_id: Some([n; 48]),
+            signature_key: vec![n; 4],
+            display_name: None,
+            updated: None,
+            self_removed: false,
+            resync_seq: None,
+        };
+        let leaves = [leaf(1), leaf(3), leaf(4)];
+        let devices = [
+            device(1, DeviceState::Current),
+            device(3, DeviceState::Removed),
+            device(4, DeviceState::Removed),
+        ];
+        let check = |n: u8| KeyCheckRow {
+            conv: ConversationId(1),
+            uid: alice.clone(),
+            device_id: [n; 48],
+            kind: crate::store::keychecks::CheckKind::Committer,
+            signature_key: vec![n; 4],
+            init_key: None,
+            encryption_key: None,
+            binding: None,
+            first_needed: 0,
+            failed: true,
+            repair_at: Some(0),
+            warned: true,
+        };
+        let removed = |checks: &[KeyCheckRow], this: Option<u8>, unchecked: bool| {
+            removals_by_key_file(
+                &leaves,
+                &alice,
+                &devices,
+                unchecked,
+                this.map(|n| [n; 48]),
+                checks,
+            )
+        };
+        let r = |n: u8| (ALICE.to_string(), Some([n; 48]));
+        assert_eq!(removed(&[], None, false), [r(3), r(4)]);
+        // Device 3's leaf failed a check: the engine removes it.
+        assert_eq!(removed(&[check(3)], None, false), [r(4)]);
+        assert_eq!(removed(&[check(3), check(4)], None, false), []);
+        // An identity the device cannot check, in a private room: every
+        // leaf but this device's and the checked ones.
+        assert_eq!(removed(&[check(3)], Some(4), true), [r(1)]);
     }
 
     /// 5.1, 4.8: a device starts the conversation with yourself only when

@@ -258,7 +258,6 @@ impl Tx<'_> {
     }
 
     /// The key checks of one conversation.
-    #[cfg(test)]
     pub(crate) fn conversation_checks(
         &self,
         conv: ConversationId,

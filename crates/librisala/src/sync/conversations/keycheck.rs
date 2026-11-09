@@ -37,6 +37,7 @@ use crate::client::conversations::ConversationEvent;
 use crate::store::Tx;
 use crate::store::conversations::{ConvRow, ConversationId};
 use crate::store::keychecks::{CheckKind, KeyCheckRow};
+use crate::store::messages::OutboxKind;
 use crate::sync::Action;
 
 type Result<T> = std::result::Result<T, EngineError>;
@@ -417,12 +418,19 @@ pub(super) fn recheck(tx: &mut Tx<'_>, cx: &Ctx<'_>) -> Result<Vec<Action>> {
             continue;
         }
         if may_repair(tx, cx, &conv, &row.uid) {
-            let intent = Intent {
-                remove: vec![(row.uid.to_string(), Some(row.device_id))],
-                ..Intent::default()
-            };
-            group::queue_intent(tx, conv.id, &intent, cx.now)?;
-            tracing::info!(conv = %conv.id, uid = %row.uid, "removing a leaf for a check");
+            // One removal per leaf: none if a commit of this device that
+            // removes it is queued already, by an earlier repair or by the
+            // upkeep's removals by key file (12.14).
+            if removal_queued(tx, conv.id, &row)? {
+                tracing::info!(conv = %conv.id, uid = %row.uid, "a removal for a check is queued already");
+            } else {
+                let intent = Intent {
+                    remove: vec![(row.uid.to_string(), Some(row.device_id))],
+                    ..Intent::default()
+                };
+                group::queue_intent(tx, conv.id, &intent, cx.now)?;
+                tracing::info!(conv = %conv.id, uid = %row.uid, "removing a leaf for a check");
+            }
         } else {
             events.push(ConversationEvent::KeyCheckFailed {
                 conversation: conv.id,
@@ -442,6 +450,23 @@ pub(super) fn recheck(tx: &mut Tx<'_>, cx: &Ctx<'_>) -> Result<Vec<Action>> {
         .into_iter()
         .map(|e| Action::Emit(Event::Conversation(e)))
         .collect())
+}
+
+/// Whether a commit of this device that removes `row`'s leaf is queued and
+/// not done.
+fn removal_queued(tx: &Tx<'_>, conv: ConversationId, row: &KeyCheckRow) -> Result<bool> {
+    let uid = row.uid.as_str();
+    Ok(tx.pending_outbox(conv)?.iter().any(|o| {
+        o.kind == OutboxKind::Commit
+            && o.intent
+                .as_deref()
+                .and_then(|i| Intent::decode(i).ok())
+                .is_some_and(|i| {
+                    i.remove
+                        .iter()
+                        .any(|(u, d)| u == uid && *d == Some(row.device_id))
+                })
+    }))
 }
 
 /// Whether a queued commit waits while sending is held: one with a new
