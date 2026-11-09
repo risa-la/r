@@ -392,12 +392,11 @@ pub(crate) fn external_join(
     let ext = view.conversation.clone().map_err(mls)?;
     compare_kept(tx, conv, &ext)?;
     let identity = own_identity(cx)?;
-    // 12.7 says a resync commit removes the GroupInfo's signer and the
-    // device's own earlier leaf. OpenMLS processes no external commit with
-    // more than one Remove (valn0402), so a resync removes the signer only,
-    // and a rejoin one earlier leaf; the device removes the rest in its
-    // next commit, as leaves of its own identity (public_cleanup), which
-    // the group checks allow.
+    // 12.7: an external commit removes at most one leaf, as OpenMLS
+    // (valn0402) and RFC 9420 12.4.3.2 allow: a resync commit the
+    // GroupInfo's signer only, and a rejoin one earlier leaf of its own
+    // identity. The device removes its other earlier leaves in its next
+    // commit, as leaves of its own identity (public_cleanup).
     let own_leaves: Vec<LeafNodeIndex> = match kind {
         External::Resync => Vec::new(),
         External::Rejoin => view
