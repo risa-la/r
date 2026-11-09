@@ -2,7 +2,7 @@
 //! for the apps and the CLI to run against.
 //!
 //! ```sh
-//! risala-dev                 # serve, with state in .dev/
+//! risala-dev                 # serve, with state in .dev/ at the repository's root
 //! risala-dev --reset         # start again from nothing
 //! ```
 //!
@@ -12,7 +12,7 @@
 //! `risala` at it:
 //!
 //! ```sh
-//! risala --data /tmp/alice $(cat .dev/cli-args) create alice laptop
+//! risala --state /tmp/alice $(cat .dev/cli-args) create chat.test alice laptop
 //! ```
 //!
 //! Development only: the log's and witness's keys come from fixed seeds.
@@ -75,13 +75,34 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `.dev/` at the root of the repository this binary was built from.
-fn default_state() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dev")
+/// The root of the risala repository holding the current directory: the
+/// state's default home. Not the directory the binary was built in, which
+/// for `nix run .#dev` is a build sandbox long gone.
+fn repo_root() -> Result<PathBuf, String> {
+    let here = std::env::current_dir().map_err(|e| format!("the current directory: {e}"))?;
+    repo_root_from(&here).ok_or_else(|| {
+        format!(
+            "{} is not inside the risala repository; run from there, or pass --state",
+            here.display()
+        )
+    })
+}
+
+/// The nearest directory from `dir` up that holds the workspace's
+/// `Cargo.toml` and `crates/risala-dev/Cargo.toml`.
+fn repo_root_from(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|d| {
+            d.join("crates/risala-dev/Cargo.toml").is_file() && d.join("Cargo.toml").is_file()
+        })
+        .map(Path::to_path_buf)
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
-    let state = cli.state.unwrap_or_else(default_state);
+    let state = match cli.state {
+        Some(dir) => dir,
+        None => repo_root()?.join(".dev"),
+    };
     if cli.reset && state.exists() {
         std::fs::remove_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
     }
@@ -105,4 +126,27 @@ async fn run(cli: Cli) -> Result<(), String> {
         .map_err(|e| format!("waiting for ctrl-c: {e}"))?;
     world.server.stop().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_root_is_found_from_inside_the_repository() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = crate_dir.parent().unwrap().parent().unwrap();
+        assert_eq!(repo_root_from(crate_dir).as_deref(), Some(root));
+        assert_eq!(
+            repo_root_from(&crate_dir.join("src")).as_deref(),
+            Some(root)
+        );
+        assert_eq!(repo_root_from(root).as_deref(), Some(root));
+    }
+
+    #[test]
+    fn outside_the_repository_there_is_no_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(repo_root_from(dir.path()), None);
+    }
 }
