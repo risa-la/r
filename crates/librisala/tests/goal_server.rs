@@ -368,6 +368,36 @@ async fn the_goal_against_risalad() {
     })
     .await;
 
+    // A public room (6.1): alice creates it, bob's new device joins by
+    // proposal, which alice's laptop commits, and they talk once their
+    // ATTESTs pin their pseudonyms (7.3, 12.10).
+    let plaza = retry("alice creates a public room", || {
+        alice.create_public_room(alice_acc, "#plaza")
+    })
+    .await;
+    let rooms = spare.list_public_rooms(spare_acc, None).await.unwrap();
+    assert!(
+        rooms.iter().any(|r| r.room.as_str() == "#plaza"),
+        "{rooms:?}"
+    );
+    let spare_plaza = retry("bob joins the public room", || {
+        spare.join_public_room(spare_acc, "#plaza")
+    })
+    .await;
+    alice.send_text(plaza, "hello plaza", None).await.unwrap();
+    eventually(120, "bob reads the public room", || {
+        has(&spare, spare_plaza, "hello plaza")
+    })
+    .await;
+    spare
+        .send_text(spare_plaza, "hi from bob", None)
+        .await
+        .unwrap();
+    eventually(120, "alice reads the public room", || {
+        has(&alice, plaza, "hi from bob")
+    })
+    .await;
+
     // Every record each device accepted is in a witnessed checkpoint.
     let mut checked = 0;
     for (c, uids) in [
@@ -381,4 +411,34 @@ async fn the_goal_against_risalad() {
         }
     }
     assert!(checked >= 10, "only {checked} records checked");
+}
+
+/// A public room between two identities whose records the log witnessed:
+/// their messages show once their ATTESTs pin their pseudonyms (6.1, 7.3,
+/// 12.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_public_room_against_risalad() {
+    let env = env().await;
+    let (alice, _alice_uid, _, alice_acc) = new_identity(&env, "alice", "laptop").await;
+    let (bob, _bob_uid, _, bob_acc) = new_identity(&env, "bob", "laptop").await;
+    connect(&alice, alice_acc).await;
+    connect(&bob, bob_acc).await;
+    let plaza = retry("alice creates a public room", || {
+        alice.create_public_room(alice_acc, "#plaza")
+    })
+    .await;
+    let bob_plaza = retry("bob joins the public room", || {
+        bob.join_public_room(bob_acc, "#plaza")
+    })
+    .await;
+    alice.send_text(plaza, "hello plaza", None).await.unwrap();
+    eventually(120, "bob reads the public room", || {
+        has(&bob, bob_plaza, "hello plaza")
+    })
+    .await;
+    bob.send_text(bob_plaza, "hi from bob", None).await.unwrap();
+    eventually(120, "alice reads the public room", || {
+        has(&alice, plaza, "hi from bob")
+    })
+    .await;
 }

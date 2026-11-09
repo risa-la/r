@@ -365,16 +365,19 @@ async fn the_goal_with_the_cli() {
     }
     assert!(n >= 10, "only {n} records checked");
 
-    // A public room, if librisala builds them yet (task C2b).
-    let (ok, _, err) = alice.try_run(&["public", "create", "#plaza"], None).await;
-    if ok {
-        let (ok, _, err) = spare.try_run(&["public", "join", "#plaza"], None).await;
-        assert!(ok, "joining a public room failed: {err}");
-        alice.run(&["send", "#plaza", "hello plaza"]).await;
-        spare
-            .until_text("#plaza", "hello plaza", &[&alice], 10)
-            .await;
-    } else {
-        eprintln!("public rooms: not built yet: {}", err.trim());
-    }
+    // A public room (6.1): alice creates it; bob's new device joins by
+    // proposal while alice's laptop is online to commit it; they talk once
+    // their ATTESTs pin their pseudonyms (7.3, 12.10).
+    alice.retry(&["public", "create", "#plaza"], 5).await;
+    let rooms = spare.run(&["public", "list"]).await;
+    assert!(rooms.contains("#plaza"), "{rooms}");
+    let (joined, _) = tokio::join!(
+        spare.try_run(&["--wait", "30", "public", "join", "#plaza"], None),
+        alice.try_run(&["--wait", "40", "sync"], None),
+    );
+    assert!(joined.0, "joining the public room failed: {}", joined.2);
+    alice.run(&["send", "#plaza", "hello plaza"]).await;
+    spare.until_text("#plaza", "hello plaza", &[&alice], 15).await;
+    spare.run(&["send", "#plaza", "hi from bob"]).await;
+    alice.until_text("#plaza", "hi from bob", &[&spare], 15).await;
 }
