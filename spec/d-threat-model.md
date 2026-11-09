@@ -352,6 +352,11 @@ Each risk is marked **Mitigated**, where this document limits it, or
   remove them, and anyone after 8 days, 12.7). Joins that nobody uses
   count towards a room's limits until then, bounded only by rate limits
   until proof of work is specified (4.1).
+- **Shared network addresses** (Open until proof of work is specified,
+  4.1). Limits per network address are shared by everyone behind one
+  Tor exit or carrier-grade NAT, so one user there can use up the
+  others' share, and an address ban shuts out all of them (10.6,
+  Section 14).
 - **Time windows on the server's clock** (Open). Every time window of
   the group checks runs on the `t` the server gives posts, so that
   devices agree; a server that colludes with a member can shift them

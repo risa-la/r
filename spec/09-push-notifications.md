@@ -16,6 +16,12 @@ PUSH LIST
 
 - **`PUSH ADD`** asks the server to send pushes to `<url>`, an `https`
   URL of at most 512 bytes, and replies `OK`.
+  - `<url>` MUST NOT carry userinfo (`user@` before the host): the
+    server refuses it with `ERR bad-syntax`. A server MAY limit how many
+    pushes it sends to each host, so that its subscriptions cannot flood
+    one. It then compares hosts lower-cased, with port 443 the same as
+    no port, and with a trailing dot dropped, so that nobody gets
+    around the limit by writing one host several ways.
   - `<tag>` is 1 to 64 characters of printable ASCII (%x21-7E), chosen
     by the client, so that it can also be the value of a `quiet` option
     (7.1). It goes inside the encrypted body of every push, so the app

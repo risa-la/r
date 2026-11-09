@@ -564,18 +564,25 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   Other servers can answer abuse from such a server only by banning
   single identities or its whole domain (10.2).
 
-- **Spam and abuse.** The server cannot see who posts, so it limits
-  load per connection and per network address. It does not limit per
+- **Spam and abuse.** The server cannot see who posts, so it limits load
+  per connection and per network address. It does not limit per
   pseudonym, since anyone who holds a group's token can post under any
   pseudonym (5.2). It bounds what anyone can store: mailboxes have
   quotas and end when unused (7.5), token sets are bounded (7.2), and so
-  are push subscriptions (9.1). A later draft will let it require proof
-  of work to open anonymous connections, to become a guest, to register,
-  to create mailboxes, to fetch KeyPackages and to join public rooms
-  (4.1). Until then, only rate limits stand in the way of bots. Room
-  moderators remove spammers with commits, and ask the server to mute a
-  pseudonym in the meantime (6.4). Operators can ban network addresses
-  for anonymous and guest connections (10.2).
+  are push subscriptions (9.1). A cap on what it stores in all covers
+  files and blobs only, and leaves room for posts, so that filling it
+  stops uploads but not conversations (7.5). A later draft will let it
+  require proof of work to open anonymous connections, to become a
+  guest, to register, to create mailboxes, to fetch KeyPackages and to
+  join public rooms (4.1). Until then, only rate limits stand in the way
+  of bots. Room moderators remove spammers with commits, and ask the
+  server to mute a pseudonym in the meantime (6.4). Operators can ban
+  network addresses for anonymous and guest connections (10.2). Limits
+  per network address are shared by everyone behind one, such as the
+  users of a Tor exit or of a carrier-grade NAT, so one of them can use
+  up the others' share, and a ban of the address shuts out all of them
+  (10.6). Proof of work will let a client go on past those limits, but
+  until a later draft specifies it, they are the only bound.
 
 - **Display names** can be used to imitate other people (8.2).
   Bidirectional text controls can make one name look like another, or

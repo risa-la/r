@@ -197,3 +197,13 @@ keeps them.
 - Setting `anon` to `no` closes every anonymous connection with `BYE`.
 - Shortening `retention` also applies to posts already stored.
 - Settings not listed here are left to the server's configuration.
+
+**Limits.** Rate limits and quotas (4.2, 5.2, 7.5) are set in the
+server's configuration too. Those per network address are shared by
+everyone behind one address, such as the users of one Tor exit or of a
+carrier-grade NAT, so operators SHOULD set them with that in mind. A
+later draft will let a client go on past them by proof of work (4.1).
+A server MAY end an HTTPS transfer (5.6, 12.12) that runs slower than a
+minimum rate, for example about 16 KiB a second over 30 seconds,
+besides any overall deadline, so that slow clients cannot hold its
+transfers open.

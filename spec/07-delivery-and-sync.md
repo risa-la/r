@@ -318,6 +318,13 @@ MUST limit:
 - the bytes each network address stores in a sliding window, counting
   POST, UPLOAD and BLOB together (`ERR rate-limited`).
 
+A server MAY also cap what it stores in all. Such a cap applies to
+files and blobs alone (UPLOAD and BLOB, `ERR rate-limited`), and the
+server keeps room beyond it for posts, so that when files and blobs
+fill it, posts and commits still go through, and groups can go on.
+Files and blobs kept for open reports (5.8) count apart, under a bound
+of their own, so that reports cannot fill the server either.
+
 **Mailboxes end.** A mailbox whose posts have all expired, and which no
 connection follows, has had no device of its group online for a whole
 retention period, since devices commit at least weekly (12.7). Its group
