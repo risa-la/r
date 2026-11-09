@@ -109,16 +109,42 @@ fn display_name(net: &Net, d: usize, conv: ConversationId) -> Option<String> {
 #[test]
 fn a_removal_goes_before_a_held_commit() {
     let mut net = Net::new();
-    let alice = net.device("alice", "alice@example.org");
+    let laptop = net.device("laptop", "alice@example.org");
+    let alice = net.device_of("phone", laptop);
     let bob = net.device("bob", "bob@example.net");
-    net.connect(alice);
-    net.connect(bob);
-    // Bob's key file cannot be read: his device is added unchecked, and
-    // Alice's device holds sending.
-    net.keys.set_unknown(&uid("bob@example.net"), true);
-    let (a, _) = direct(&mut net, alice, bob);
+    let tablet = net.device_of("tablet", bob);
+    let alice_keys = super::keychecks::own_facts(&mut net, alice);
+    for d in [laptop, alice, bob] {
+        net.connect(d);
+    }
+    let (l, _) = direct(&mut net, laptop, bob);
+    net.job(
+        laptop,
+        Job::Invite {
+            conv: l,
+            uids: vec![uid("alice@example.org")],
+        },
+    )
+    .unwrap();
+    net.advance(MINUTE);
+    let a = net.same_conv(alice, laptop, l).expect("the phone joined");
+    // Alice's phone can no longer tell Bob's devices (12.7): his tablet,
+    // which her laptop adds, is added unchecked, and the phone holds
+    // sending.
+    alice_keys.set_unknown(&uid("bob@example.net"), true);
+    net.connect(tablet);
+    net.job(
+        laptop,
+        Job::Invite {
+            conv: l,
+            uids: vec![uid("bob@example.net")],
+        },
+    )
+    .unwrap();
+    net.advance(MINUTE);
+    assert_eq!(net.leaves(alice, a).len(), 4);
     assert!(net.write(alice, |tx| Ok(tx.sending_held(a)?)));
-    let bob_id: [u8; 48] = net.devices[bob].device_id.clone().try_into().unwrap();
+    let tablet_id: [u8; 48] = net.devices[tablet].device_id.clone().try_into().unwrap();
     queue(
         &net,
         alice,
@@ -137,19 +163,21 @@ fn a_removal_goes_before_a_held_commit() {
         alice,
         a,
         Intent {
-            remove: vec![("bob@example.net".into(), Some(bob_id))],
+            remove: vec![("bob@example.net".into(), Some(tablet_id))],
             ..Intent::default()
         },
     );
     net.tick();
-    assert_eq!(net.leaves(alice, a), ["alice@example.org"], "removed first");
+    assert_eq!(net.leaves(alice, a).len(), 3, "removed first");
     assert_ne!(display_name(&net, alice, a).as_deref(), Some("Alice"));
     assert_eq!(net.state(alice, a), ConvState::Active);
     // The leaf is gone, and with it the check that held sending: the held
-    // commit is made now, after the removal and its move (7.8).
-    for _ in 0..3 {
+    // commit is made after the removal, once the phone's streak of own
+    // commits lets it (12.7).
+    for _ in 0..15 {
         net.advance(MINUTE);
     }
+    assert!(!net.write(alice, |tx| Ok(tx.sending_held(a)?)));
     assert_eq!(display_name(&net, alice, a).as_deref(), Some("Alice"));
     assert_eq!(net.state(alice, a), ConvState::Active);
 }

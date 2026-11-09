@@ -16,7 +16,7 @@ fn uid(s: &str) -> Uid {
 
 /// Gives device `d` key facts of its own, as another device may have
 /// accepted other records (12.7). Call before it connects.
-fn own_facts(net: &mut Net, d: usize) -> KnownKeys {
+pub(super) fn own_facts(net: &mut Net, d: usize) -> KnownKeys {
     let keys = net.keys.copy();
     let key = SigningKey::generate().unwrap();
     net.devices[d].device_id = key.device_id().as_bytes().to_vec();
