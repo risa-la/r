@@ -626,3 +626,22 @@ impl Client {
         })
     }
 }
+
+impl Client {
+    /// Whether the account has nothing left to send: no post or commit
+    /// queued, in flight or not yet seen back, and no Welcome waiting. For
+    /// tools that connect, act and stop (task C5's `risala`).
+    pub fn is_settled(&self, account: AccountId) -> Result<bool> {
+        let (pending, _) = self.store().write(|tx| {
+            let outbox = tx.account_outbox(account)?.len() as i64;
+            let welcomes: i64 = tx.conn().query_row(
+                "SELECT count(*) FROM welcomes_out w JOIN conversations c ON c.id = w.conv
+                 WHERE c.account = ?1",
+                [account.0],
+                |r| r.get(0),
+            )?;
+            Ok(outbox + welcomes)
+        })?;
+        Ok(pending == 0)
+    }
+}
