@@ -29,6 +29,23 @@ OpenMLS does not support and whose draft just expired; measuring
 ML-DSA and X-Wing on phones (item 59, step 3); the outside review of
 epochal signatures; proof of work (M6a, item 42); the apps (M7).
 
+## Outcome of the overnight run (2026-11-09)
+
+Every task below is done and on `m5b`; nothing is merged into `main`.
+The Goal's end-to-end tests pass against a real `risalad` with its key
+log and a witness, through librisala (`tests/goal_server.rs`) and the
+`risala` binary (`risala-cli/tests/goal.rs`). The spec had three review
+rounds; the bar "nothing above Low" is not fully met: two Medium design
+questions (R-M1, R-M2) are left to the user. Every choice made for the
+user is in PLAN.md item 62, with the spec gaps still open at its end.
+
+Not done in M5b: light clients; leaf rotation by Update proposal in
+librisala (it commits instead); portable fork evidence for a log that
+grows after its hand-off; a review of `risala-cli`; `nix flake check`;
+measuring ML-DSA and X-Wing on phones; the outside review of epochal
+signatures. Apps add no contact devices until a witness policy is set,
+since the default witness list is empty.
+
 ## Decided before starting
 
 On 2026-11-08, with the user:
@@ -246,4 +263,4 @@ four writing code at once.
 
 - [x] **R1. Review** of M5b's code, one reviewer per crate, with the same
   rules as M5a's review; findings to `/home/humaid/repos/risala-m5b/`.
-- [~] **R2. Fixes.**
+- [x] **R2. Fixes.**
