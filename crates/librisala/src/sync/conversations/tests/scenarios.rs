@@ -569,6 +569,7 @@ fn self_lines_from_unconfirmed_leaves_are_ignored() {
             blobs: net.server.blobs.clone(),
             blob_mode: net.blob_mode.clone(),
             hold_puts: net.hold_puts.clone(),
+            fetched: Default::default(),
         }),
         Arc::new(net.clock.clone()),
     );

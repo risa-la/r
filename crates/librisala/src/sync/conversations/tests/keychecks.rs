@@ -43,6 +43,7 @@ pub(super) fn own_facts(net: &mut Net, d: usize) -> KnownKeys {
             blobs: net.server.blobs.clone(),
             blob_mode: net.blob_mode.clone(),
             hold_puts: net.hold_puts.clone(),
+            fetched: Default::default(),
         }),
         Arc::new(net.clock.clone()),
     );

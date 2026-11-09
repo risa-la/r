@@ -1669,7 +1669,23 @@ impl ConversationEngine {
                     .filter(|_| post.message.is_empty())
                     .map(|b| (mb.conv, post.seq, b)))
             })?;
-            if let Some((conv, seq, hash)) = blob {
+            // 12.12: one of this device's own posts that went as a blob is
+            // still in its outbox, so it is not fetched back.
+            let own = match blob {
+                Some((conv, _, hash)) => self.write(cx, me, out, |tx, _| {
+                    Ok(tx
+                        .pending_outbox(conv)?
+                        .into_iter()
+                        .filter_map(|r| r.post)
+                        .find(|p| BlobRef::of(p).hash() == &hash))
+                })?,
+                None => None,
+            };
+            if let (Some((conv, seq, _)), Some(bytes)) = (blob, own) {
+                self.write(cx, me, out, |tx, _| {
+                    Ok(tx.set_post_message(conv, mailbox, seq, &bytes)?)
+                })?;
+            } else if let Some((conv, seq, hash)) = blob {
                 match self.get_blob(me, &BlobRef::from_hash(hash)) {
                     rooms::Got::Bytes(bytes) => {
                         self.write(cx, me, out, |tx, _| {

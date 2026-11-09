@@ -173,6 +173,8 @@ struct TestHooks {
     blob_mode: Arc<std::sync::atomic::AtomicU8>,
     /// While set, PUTs of blobs stay in flight (12.12).
     hold_puts: Arc<std::sync::atomic::AtomicBool>,
+    /// The blobs this device asked the blob store for (12.12).
+    fetched: std::sync::Mutex<Vec<BlobRef>>,
 }
 
 impl Hooks for TestHooks {
@@ -206,6 +208,7 @@ impl Hooks for TestHooks {
     }
 
     fn blob(&self, _: AccountId, _: Option<&str>, blob: &BlobRef) -> BlobFetch {
+        self.fetched.lock().unwrap().push(*blob);
         match self.blob_mode.load(std::sync::atomic::Ordering::SeqCst) {
             0 => match self.blobs.lock().unwrap().get(blob.hash()) {
                 Some(bytes) => BlobFetch::Ready(bytes.clone()),
@@ -319,6 +322,7 @@ impl Net {
             blobs: self.server.blobs.clone(),
             blob_mode: self.blob_mode.clone(),
             hold_puts: self.hold_puts.clone(),
+            fetched: Default::default(),
         });
         let engine =
             ConversationEngine::new(config.clone(), hooks.clone(), Arc::new(self.clock.clone()));

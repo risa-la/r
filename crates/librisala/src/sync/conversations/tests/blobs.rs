@@ -165,3 +165,47 @@ fn a_public_rooms_commit_and_groupinfo_go_by_blobs() {
     assert_eq!(net.epoch(alice, a), 1);
     assert_eq!(net.epoch(bob, b), 1);
 }
+
+/// A device's own post that went as a blob, and comes back as a blob-ref,
+/// is applied from its outbox, not fetched back (12.12).
+#[test]
+fn an_own_post_in_a_blob_is_not_fetched_back() {
+    let mut net = Net::new();
+    let alice = net.device_with("alice", "alice@example.org", config(LIMIT));
+    let bob = net.device("bob", "bob@example.net");
+    net.connect(alice);
+    net.connect(bob);
+    let a = net
+        .job(
+            alice,
+            Job::Direct {
+                peer: "bob@example.net".parse().unwrap(),
+            },
+        )
+        .unwrap();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    // From now on the server sends posts as blob-refs, and Alice's
+    // messages pass her line limit.
+    net.server.blob_posts = true;
+    net.devices[alice].config.line_limit = 2 * 1024;
+    net.restart(alice);
+    net.devices[alice].hooks.fetched.lock().unwrap().clear();
+    let before = blob_commands(&net, alice, Slot::Anonymous(0));
+    net.say(alice, a, "mine");
+    for _ in 0..3 {
+        net.tick();
+    }
+    assert_eq!(blob_commands(&net, alice, Slot::Anonymous(0)), before + 1);
+    assert_eq!(
+        net.texts(bob, b),
+        [("alice@example.org".to_owned(), "mine".to_owned())]
+    );
+    assert!(!net.devices[bob].hooks.fetched.lock().unwrap().is_empty());
+    assert_eq!(*net.devices[alice].hooks.fetched.lock().unwrap(), []);
+    // Applied in order: nothing of it is pending in Alice's outbox.
+    let pending = net.write(alice, |tx| Ok(tx.pending_outbox(a)?));
+    assert!(
+        pending.iter().all(|r| r.kind != OutboxKind::Message),
+        "{pending:?}"
+    );
+}

@@ -791,8 +791,12 @@ async fn a_private_rooms_commit_and_welcome_past_the_line_limit_against_risalad(
     let b = same(&bob, &alice, room).unwrap().id;
 
     ban_all(&alice, room, long_uids(BANS)).await;
-    until("bob applied the commit", || bans(&bob, b) == BANS).await;
-    assert_eq!(bans(&alice, room), BANS);
+    // Each device applies the commit as it comes back in order, Alice's
+    // too, whenever its FETCH gets there.
+    until("bob and alice applied the commit", || {
+        bans(&bob, b) == BANS && bans(&alice, room) == BANS
+    })
+    .await;
 
     // Carol's Welcome carries the GroupInfo, and with it the bans.
     alice
