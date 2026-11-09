@@ -50,21 +50,21 @@ Each one shows less than it may seem to.
   page labels those marks function-level. Proofs that fail or time out
   mark nothing.
 - **TLA+.** The models in [`proofs/`](../proofs/README.md) check the
-  spec, not the code, and only within small bounds. They model draft-02
-  of the spec. A mark in the TLA+ column only says the function cites a
-  section that a model covers. The model `AsWritten.cfg` is expected to
-  find a violation: that is how the findings in `proofs/README.md` were
-  found.
+  spec, not the code, and only within small bounds. They model draft-03,
+  the spec in `spec/`. A mark in the TLA+ column only says the function
+  cites a section that a model covers. The model `AsWritten.cfg` is
+  expected to find a violation: that is how the findings in
+  `proofs/README.md` were found.
 - **Spec sections.** The spec view shows only the latest spec, in
   `spec/`. A comment in the code that names a section, such as `(7.1)`,
   `(12.10, D.4)`, `(B.1 to B.10)` or `Section 13`, is read as that spec's
   section, and so are the sections in a Kani proof's doc comment. A whole
   number counts only for a section with no subsections, such as `(11)`,
   and a group of whole numbers alone only when nothing else is in its
-  parentheses, so `(2 bytes)` cites nothing. The code still cites draft-02's numbers; it moves
-  to draft-03 before this page is published. A TLA+ model of another
-  draft is not placed under its sections, since they are numbered
-  differently: `proofs/sync` models draft-02.
+  parentheses, so `(2 bytes)` cites nothing. A TLA+ model counts, in the
+  spec view and in the TLA+ column, only if it models the same draft as
+  `spec/`, since drafts number their sections differently. The model of
+  draft-02 is kept in `proofs/archive/` and is not listed.
 - **Filled lines.** In the source listing, lines inside a function that
   are not code (braces, `} else {`, comments, blank lines) are drawn
   like the code around them, so that a function reads as one block.

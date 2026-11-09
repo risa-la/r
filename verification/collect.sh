@@ -206,8 +206,8 @@ step_tla() {
   export JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS:--Xmx4g}
   # model folder, config, time limit in seconds
   local runs=(
-    "sync AsWritten.cfg 600"
-    "sync ProposedOneDevice.cfg 1800"
+    "delivery AsWritten.cfg 600"
+    "delivery ProposedOneDevice.cfg 2400"
   )
   for run in "${runs[@]}"; do
     read -r model cfg limit <<<"$run"

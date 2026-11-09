@@ -469,10 +469,12 @@ for (const f of sources.values()) {
 }
 
 // The TLA+ column: lines of functions whose comments cite a section a
-// model covers.
+// model covers. Only models of this draft count, as in the spec view: an
+// older draft numbers its sections differently.
 const tlaHits = new Map<string, Map<number, string[]>>();
 const tlaSections = new Map<string, string[]>(); // section -> model ids
 for (const model of config.tla.models) {
+  if (model.draft !== config.spec.draft) continue;
   for (const s of model.sections) tlaSections.set(s, [...(tlaSections.get(s) ?? []), model.id]);
 }
 if (tlaAny) {

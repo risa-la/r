@@ -16,23 +16,23 @@
   "tla": {
     "models": [
       {
-        "id": "sync",
-        "title": "RisalaSync",
-        "file": "proofs/sync/RisalaSync.tla",
+        "id": "delivery",
+        "title": "RisalaDelivery",
+        "file": "proofs/delivery/RisalaDelivery.tla",
         "readme": "proofs/README.md",
-        "draft": "draft-02",
-        "summary": "How a client keeps its copy of a room in step with the server.",
-        "sections": ["5.2", "5.4", "6.1", "6.4", "7.1", "7.2", "7.5", "7.6", "10.4"],
+        "draft": "draft-03",
+        "summary": "How a device keeps a conversation's mailbox in step with the server: sync points, epochs and send tokens, resends, moves and drops.",
+        "sections": ["5.2", "7.1", "7.2", "7.4", "7.5", "7.6", "7.8", "10.4"],
         "runs": [
           {
             "config": "AsWritten.cfg",
             "expect": "violation",
-            "meaning": "The spec as written. TLC is expected to find a broken property: it is how the five findings in proofs/README.md were found."
+            "meaning": "The spec as written. TLC is expected to find a broken property: it is how the findings in proofs/README.md were found."
           },
           {
             "config": "ProposedOneDevice.cfg",
             "expect": "pass",
-            "meaning": "With every proposed fix, one device: TLC checks every reachable state. Findings 3 and 4 need two devices, which is too large to finish (Proposed.cfg)."
+            "meaning": "With every proposed fix, one device and smaller bounds: TLC checks every reachable state, in about 13 minutes."
           }
         ]
       }

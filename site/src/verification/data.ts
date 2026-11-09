@@ -23,7 +23,7 @@ export const LAYERS: Layer[] = [
   { key: "integration", short: "i", label: "integration", color: "var(--mode)", tip: "lines the tests in tests/ run, spec examples included. a line that ran was not necessarily checked." },
   { key: "fuzz", short: "f", label: "fuzzing", color: "var(--mention)", tip: "lines the saved fuzz corpus reaches. more hours fuzzed grow it." },
   { key: "kani", short: "k", label: "kani", color: "var(--location)", tip: "lines a kani proof reaches. a proof holds for every input within its bounds, for the property it states." },
-  { key: "tla", short: "t", label: "tla+", color: "var(--ink)", tip: "a model of the spec (draft-02), not of this code, checked within small bounds. marks functions that cite a section it covers." },
+  { key: "tla", short: "t", label: "tla+", color: "var(--ink)", tip: "a model of the spec, not of this code, checked within small bounds. marks functions that cite a section it covers." },
 ];
 
 /** Whether results exist for a layer, for code in the given language. */

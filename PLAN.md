@@ -2691,7 +2691,10 @@ Open:
       are read as its numbers. The code still cites draft-02's, and
       moves to draft-03 before this branch is merged. A TLA+ model of
       another draft (`proofs/sync`, draft-02) is named but not placed
-      under sections.
+      under sections. Since 2026-11-09 the code cites draft-03's
+      numbers, and the page lists only `proofs/delivery`, a model of
+      draft-03; the draft-02 model moved to
+      `proofs/archive/draft-02-sync` and is not listed.
     - In the source listing, lines inside a function that are not code
       (braces, `} else {`, comments, blank lines) are drawn like the
       code around them, so a function reads as one block, decided with
