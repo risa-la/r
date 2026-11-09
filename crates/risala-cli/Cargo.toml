@@ -1,6 +1,6 @@
 [package]
 name = "risala-cli"
-description = "A small terminal client and key tool built on librisala"
+description = "A small, scriptable terminal client built on librisala"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,21 +14,15 @@ path = "src/main.rs"
 
 [dependencies]
 librisala.workspace = true
-risala-proto.workspace = true
 tokio.workspace = true
 clap.workspace = true
-tracing.workspace = true
+rustls.workspace = true
 tracing-subscriber.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rcgen.workspace = true
-rustls.workspace = true
-tokio-rustls.workspace = true
-# Reads the cache's file, which has SQLCipher through librisala.
-rusqlite.workspace = true
-risala-server = { path = "../risala-server" }
+# The server with its key log and witness, for the end-to-end tests.
+risala-dev = { path = "../risala-dev" }
 
 [lints]
 workspace = true

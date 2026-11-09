@@ -190,27 +190,11 @@ async fn new_identity(env: &Env, name: &str, label: &str) -> (Client, String, St
     (c, uid, recovery, account)
 }
 
-/// Checks, independently of the device's own checks, that every record
-/// the device accepted of `uid` is in a checkpoint of its log that the
-/// world's witness cosigned: the checkpoint's cosignature verifies under
-/// a policy of that witness (k = 1), and an inclusion proof computed from
-/// the log's tiles verifies against it (4.5). Returns how many it checked.
+/// Checks that every record the device accepted of `uid` is in a
+/// checkpoint of its log that the world's witness cosigned, with an
+/// inclusion proof from the log's tiles (4.5). Returns how many it
+/// checked.
 async fn witnessed_inclusion(env: &Env, c: &Client, uid: &str) -> usize {
-    use librisala::client::identity::{Fetched, Https as _};
-    use risala_keylog::client::{inclusion_tiles, verify_entry};
-    use risala_keylog::{Freshness, LogEntry, LogKey, TileSet, WitnessPolicy};
-
-    async fn get(env: &Env, url: &str) -> Vec<u8> {
-        match env.https.get(url, 1 << 22).await {
-            Fetched::Body(body) => body,
-            other => panic!("{url}: {other:?}"),
-        }
-    }
-    let policy = WitnessPolicy::from_vkeys(std::slice::from_ref(&env.world.witness), 1).unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     let mut checked = 0;
     for r in c
         .store()
@@ -224,23 +208,10 @@ async fn witnessed_inclusion(env: &Env, c: &Client, uid: &str) -> usize {
             "{uid}: an accepted record not witnessed"
         );
         let index = r.log_index.expect("an accepted record has its index");
-        let log = LogKey::from_vkey_str(&r.log.1).unwrap();
-        let prefix = format!("https://{}", r.log.0);
-        let body = get(env, &format!("{prefix}/checkpoint")).await;
-        let witnessed = policy
-            .verify(&log, &body, Freshness::at(now))
-            .expect("a checkpoint the witness cosigned");
-        let checkpoint = witnessed.checkpoint();
-        let size = checkpoint.size();
-        assert!(index < size, "{uid}: record {index} past the checkpoint");
-        let mut tiles = TileSet::new();
-        for tile in inclusion_tiles(index, size) {
-            let data = get(env, &format!("{prefix}/{}", tile.path())).await;
-            tiles.insert(tile, data).unwrap();
-        }
-        let entry = LogEntry::record(&r.record).unwrap().encode();
-        verify_entry(&entry, index, checkpoint, &mut tiles.reader(size))
-            .expect("an inclusion proof that verifies");
+        env.world
+            .check_witnessed(&r.log.0, &r.log.1, index, &r.record)
+            .await
+            .unwrap_or_else(|e| panic!("{uid}, record {index}: {e}"));
         checked += 1;
     }
     checked

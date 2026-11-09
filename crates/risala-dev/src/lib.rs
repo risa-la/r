@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use risala_keyfetch::CertificateDer;
+use risala_keyfetch::{CertificateDer, FetchOptions, KeyFetcher, Roots, StaticResolver, UrlBody};
 use risala_keylog::cosig::Cosigner;
 use risala_keylog::merkle::empty_root;
 use risala_proto::time::Timestamp;
@@ -247,8 +247,8 @@ impl World {
         let mut args = vec![
             "--connect-to".to_owned(),
             self.server.addr().to_string(),
-            "--fingerprint".to_owned(),
-            self.server.fingerprint().to_string(),
+            "--trust".to_owned(),
+            format!("{HOST}={}", self.server.fingerprint()),
             "--witness".to_owned(),
             self.witness.clone(),
         ];
@@ -266,4 +266,72 @@ impl World {
     /// How long the log may take to witness a new record: it makes a
     /// checkpoint at most every 10 seconds.
     pub const LOG_DELAY: Duration = Duration::from_secs(10);
+
+    /// A fetcher for the world's HTTPS: its CAs, its names, private
+    /// addresses allowed.
+    pub fn fetcher(&self) -> KeyFetcher {
+        let mut resolver = StaticResolver::new();
+        for (name, addr) in self.resolves() {
+            resolver.insert(&name, [addr]);
+        }
+        KeyFetcher::new(FetchOptions {
+            roots: Roots::Only(self.roots()),
+            allow_private: true,
+            min_refetch: Duration::ZERO,
+            resolver: std::sync::Arc::new(resolver),
+            ..FetchOptions::default()
+        })
+    }
+
+    /// Checks, independently of any device, that `record` (an encoded
+    /// Record) is entry `index` of the log with origin `origin` and
+    /// verifier key `vkey`, in its newest checkpoint, which this world's
+    /// witness cosigned: the cosignature verifies under a policy of that
+    /// witness (k = 1), and an inclusion proof computed from the log's
+    /// tiles verifies against the checkpoint (4.5).
+    pub async fn check_witnessed(
+        &self,
+        origin: &str,
+        vkey: &str,
+        index: u64,
+        record: &[u8],
+    ) -> Result<(), String> {
+        use risala_keylog::client::{inclusion_tiles, verify_entry};
+        use risala_keylog::{Freshness, LogEntry, LogKey, TileSet, WitnessPolicy};
+
+        let fetcher = self.fetcher();
+        let get = async |url: String| match fetcher.fetch_url(&url, 1 << 22).await {
+            Ok(UrlBody::Ok(body)) => Ok(body),
+            other => Err(format!("{url}: {other:?}")),
+        };
+        let policy = WitnessPolicy::from_vkeys(std::slice::from_ref(&self.witness), 1)
+            .map_err(|e| format!("the policy: {e}"))?;
+        let log = LogKey::from_vkey_str(vkey).map_err(|e| format!("{vkey}: {e}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        let prefix = format!("https://{origin}");
+        let body = get(format!("{prefix}/checkpoint")).await?;
+        let witnessed = policy
+            .verify(&log, &body, Freshness::at(now))
+            .map_err(|e| format!("the checkpoint is not witnessed: {e}"))?;
+        let checkpoint = witnessed.checkpoint();
+        let size = checkpoint.size();
+        if index >= size {
+            return Err(format!("entry {index} is past the checkpoint ({size})"));
+        }
+        let mut tiles = TileSet::new();
+        for tile in inclusion_tiles(index, size) {
+            let data = get(format!("{prefix}/{}", tile.path())).await?;
+            tiles
+                .insert(tile, data)
+                .map_err(|e| format!("a tile: {e}"))?;
+        }
+        let entry = LogEntry::record(record)
+            .map_err(|e| format!("the record: {e}"))?
+            .encode();
+        verify_entry(&entry, index, checkpoint, &mut tiles.reader(size))
+            .map_err(|e| format!("the inclusion proof: {e}"))
+    }
 }

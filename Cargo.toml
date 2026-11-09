@@ -4,8 +4,6 @@ resolver = "3"
 # releases (see [patch.crates-io]), kept out of the workspace's lints.
 exclude = [
     "crates/risala-proto/fuzz", "crates/risala-pow/fuzz", "crates/openmls-traits", "crates/openmls",
-    # M5b: excluded until rewritten (docs/plans/M5b.md)
-    "crates/risala-cli",
 ]
 members = [
     "crates/risala-proto",
@@ -17,6 +15,7 @@ members = [
     "crates/risala-server",
     "crates/librisala",
     "crates/risala-dev",
+    "crates/risala-cli",
 ]
 
 [workspace.package]
