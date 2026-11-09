@@ -2097,6 +2097,21 @@ fn public_room_resync() {
     .conversation
     .unwrap();
     assert!(kept.unexplained_changes(&theirs).is_empty());
+    // OpenMLS takes no external commit with two Removes (valn0402), so a
+    // resync commit removes only the signer; Erin's earlier leaf goes in
+    // her next commit (12.7).
+    let erin_leaf = e.own_leaf_index();
+    let two = external_commit(
+        &erin.again().provider,
+        &erin.identity(),
+        &erin.profile_at(t),
+        &group_info,
+        &tree,
+        &public_expect(&erin),
+        External::Resync,
+        &[erin_leaf],
+    );
+    assert!(matches!(two, Err(GroupError::Group(_))));
     let erin2 = erin.again();
     let resync = external_commit(
         &erin2.provider,
@@ -2140,8 +2155,19 @@ fn public_room_resync() {
     let _ = dave_leaf;
 
     // Owen's device cannot follow either. Owen, an owner, rejoins by
-    // external commit, removing his own earlier leaf (12.7).
+    // external commit, removing his own earlier leaf (12.7), and only one.
     let (group_info, tree) = public_state(&erin2, &r);
+    let two = external_commit(
+        &owen.again().provider,
+        &owen.identity(),
+        &owen.profile_at(t),
+        &group_info,
+        &tree,
+        &public_expect(&owen),
+        External::Rejoin,
+        &[owen_leaf, r.own_leaf_index()],
+    );
+    assert!(matches!(two, Err(GroupError::Group(_))));
     let owen2 = owen.again();
     let rejoin = external_commit(
         &owen2.provider,
@@ -2200,7 +2226,9 @@ fn public_room_resync() {
 /// What a server does with a public room's commit (12.6): it holds the
 /// public group, built from the GroupInfo and tree without checking leaf
 /// lifetimes, checks each commit with the same functions as the devices,
-/// and keeps the new state and history.
+/// and keeps the new state and history. The tree holds a leaf whose
+/// KeyPackage has expired by the clock, so this fails if the patch to
+/// `PublicGroup::from_external` is dropped (crates/openmls/RISALA.md).
 #[test]
 fn server_checks_public_commits() {
     use openmls::prelude::ProcessedMessageContent;

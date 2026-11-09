@@ -1357,10 +1357,12 @@ fn may_act_on_role(committer: Role, target: Role) -> bool {
 /// ExternalInit, adding only the committer's own leaf:
 ///
 /// - a resync commit, by an identity that has a leaf before it, removes
-///   the leaf that started the epoch, and may remove leaves of its own
-///   identity, and nothing else;
-/// - a rejoin, by an identity listed in `owners` or `mods`, removes only
-///   leaves of its own identity.
+///   the leaf that started the epoch, and nothing else;
+/// - a rejoin, by an identity listed in `owners` or `mods`, removes at
+///   most one leaf, of its own identity.
+///
+/// OpenMLS refuses an external commit with more than one Remove before
+/// these checks run (valn0402), as RFC 9420 (12.4.3.2) allows.
 fn check_external(
     group: &GroupView,
     conversation: &RisalaConversation,

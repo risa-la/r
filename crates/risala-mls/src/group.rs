@@ -1173,14 +1173,22 @@ pub struct ExternalJoin {
 
 /// Makes an external commit for a public room (12.7), against GROUPINFO's
 /// GroupInfo and tree, checked as 12.7 says, that adds this device's own
-/// leaf and removes `own_leaves`, earlier leaves of its own identity:
+/// leaf and removes at most one other leaf, as RFC 9420 (12.4.3.2) and
+/// OpenMLS allow (valn0402):
 ///
 /// - [`External::Resync`]: for a room whose devices could not apply a
-///   commit that the server accepted. It also removes the GroupInfo's
-///   signer, the leaf whose commit could not be applied. `identity` must be
-///   an identity's that has a leaf in the room.
+///   commit that the server accepted. It removes the GroupInfo's signer,
+///   the leaf whose commit could not be applied, so `own_leaves` must be
+///   empty, or name only that leaf. `identity` must be an identity's that
+///   has a leaf in the room.
 /// - [`External::Rejoin`]: an owner's or moderator's, whose join proposal
-///   no commit applied within 30 minutes. It removes nothing else.
+///   no commit applied within 30 minutes. It removes `own_leaves`, at most
+///   one earlier leaf of its own identity.
+///
+/// The device removes its other earlier leaves in its next commit, as
+/// leaves of its own identity. A second removal is refused with
+/// [`GroupError::Group`] before anything is stored, since every member
+/// would reject the commit.
 ///
 /// Before calling it, compare the GroupInfo's extension with the one kept
 /// for the room ([`RisalaConversation::unexplained_changes`]).
@@ -1210,6 +1218,13 @@ pub fn external_commit<P: OpenMlsProvider>(
     let mut removals: Vec<LeafNodeIndex> = own_leaves.to_vec();
     if kind == External::Resync && !removals.contains(&signer) {
         removals.push(signer);
+    }
+    // OpenMLS processes no external commit with more than one Remove
+    // (valn0402), as RFC 9420 (12.4.3.2) allows (12.7).
+    if removals.len() > 1 {
+        return Err(GroupError::Group(
+            "an external commit removes at most one leaf".into(),
+        ));
     }
     let tree = read_tree(tree)?;
     let leaf_key = LeafKey::generate().map_err(|_| GroupError::Random)?;
