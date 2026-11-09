@@ -177,6 +177,16 @@ pub enum ConversationEvent {
         /// Whether this device removes the leaf.
         repairing: bool,
     },
+    /// A key check has waited 2 hours on a key file that this device
+    /// cannot read (4.4, 12.7). An outage never fails a check: nothing is
+    /// removed for it, and while the leaf is an added one, sending stays
+    /// held. The check goes on once the key file can be read.
+    KeyFileUnavailable {
+        /// The conversation.
+        conversation: ConversationId,
+        /// The identity whose key file cannot be read.
+        uid: Uid,
+    },
     /// A commit removed leaves for a check whose reason this device could
     /// not see (12.7): the removal stands, and the user is told who made
     /// it.
@@ -591,6 +601,11 @@ impl Hooks for ClientHooks {
         device: &risala_mls::identity::DeviceId,
     ) -> Option<Option<Vec<u8>>> {
         super::members::device_key_of(tx, uid, device)
+    }
+
+    /// Never read, or an outage at the last fetch (4.4, 12.7).
+    fn key_file_unreadable(&self, tx: &crate::store::Tx<'_>, uid: &Uid) -> bool {
+        super::members::key_file_unreadable(tx, uid)
     }
 
     /// Not while another device of the identity is current (task C5).

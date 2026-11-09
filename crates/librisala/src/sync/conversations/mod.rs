@@ -226,7 +226,8 @@ pub(crate) trait Hooks: Send + Sync {
 
     /// The device key of `uid`'s device `device`, if the device knows:
     /// `Some(Some(key))` for a current, logged device, `Some(None)` for one
-    /// that is not, `None` if it cannot tell yet (4.4, 4.5). Task C1.
+    /// that is not, `None` if it cannot tell yet, its key file never read
+    /// (4.4, 4.5). Task C1. Only the first is added (12.5, 12.14).
     fn device_key_of(
         &self,
         tx: &Tx<'_>,
@@ -244,6 +245,14 @@ pub(crate) trait Hooks: Send + Sync {
     fn start_self_conversation(&self, tx: &Tx<'_>, uid: &Uid) -> bool {
         let _ = (tx, uid);
         true
+    }
+
+    /// Whether `uid`'s key file cannot be read now (4.4): never read, or
+    /// its last fetch an outage. A key check waiting on it stays pending
+    /// and never fails for time; only a pending record does (12.7).
+    fn key_file_unreadable(&self, tx: &Tx<'_>, uid: &Uid) -> bool {
+        let _ = (tx, uid);
+        false
     }
 
     /// Facts from key files and the key log, for the checks of 12.7. Task

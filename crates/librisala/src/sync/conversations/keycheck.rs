@@ -10,9 +10,13 @@
 //!   no messages, no typing, and no commit with a new conversation
 //!   extension. Repairs and other commits still go. The same holds from a
 //!   failed check until its removal is queued, which then goes first.
-//! - **Checking again.** [`recheck`] runs every minute: a check whose facts
-//!   are now known passes or fails; one whose record is still pending 2
-//!   hours after the device first needed it fails.
+//! - **Checking again.** [`recheck`] runs every minute: a check whose
+//!   facts are now known passes or fails; one whose record is still
+//!   pending 2 hours after the device first needed it fails. A key file
+//!   that cannot be read never fails a check: the check stays pending,
+//!   and the user is warned after 2 hours. A committer counts as checked
+//!   as far as the records accepted go, so its check never fails for
+//!   time either.
 //! - **Repairs.** A failed check is repaired after a random wait of up to
 //!   10 minutes, unless another device has made it first: the leaf is
 //!   removed, for a check, where the group checks let this device
@@ -325,20 +329,29 @@ pub(super) fn record_own(
 }
 
 /// What a check finds now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Passed,
     Failed,
+    /// Waiting on a record that is pending (4.5): fails 2 hours after the
+    /// device first needed it.
     Pending,
+    /// Waiting on a key file that cannot be read (4.4), or a committer's,
+    /// which counts as checked as far as the records accepted go: never
+    /// fails for time (12.7).
+    Waiting,
 }
 
-fn evaluate(tx: &Tx<'_>, cx: &Ctx<'_>, row: &KeyCheckRow) -> Outcome {
+/// What `row`'s facts say now, without the 2 hours.
+fn facts_now(tx: &Tx<'_>, cx: &Ctx<'_>, row: &KeyCheckRow) -> Outcome {
     let facts = cx.hooks.key_facts(tx, cx.account);
     let device = risala_mls::identity::DeviceId::from_bytes(row.device_id);
     let outcome = match row.kind {
         CheckKind::Committer => match facts.device_removed(&row.uid, &device) {
             Fact::Known(true) => Outcome::Failed,
             Fact::Known(false) => Outcome::Passed,
-            Fact::Unknown => Outcome::Pending,
+            // 12.7: "as far as the device has accepted it".
+            Fact::Unknown => Outcome::Waiting,
         },
         CheckKind::Add => match (
             facts.current_device_key(&row.uid, &device),
@@ -356,12 +369,23 @@ fn evaluate(tx: &Tx<'_>, cx: &Ctx<'_>, row: &KeyCheckRow) -> Outcome {
         },
     };
     match outcome {
-        // 12.7: still pending 2 hours after the device first needed it.
-        Outcome::Pending if cx.now >= row.first_needed.saturating_add(PENDING_LIMIT_MS) => {
-            Outcome::Failed
-        }
+        // 12.7: an outage never fails a check.
+        Outcome::Pending if cx.hooks.key_file_unreadable(tx, &row.uid) => Outcome::Waiting,
         other => other,
     }
+}
+
+fn evaluate(tx: &Tx<'_>, cx: &Ctx<'_>, row: &KeyCheckRow) -> Outcome {
+    match facts_now(tx, cx, row) {
+        // 12.7: a record still pending 2 hours after the device first
+        // needed it.
+        Outcome::Pending if past_limit(cx, row) => Outcome::Failed,
+        other => other,
+    }
+}
+
+fn past_limit(cx: &Ctx<'_>, row: &KeyCheckRow) -> bool {
+    cx.now >= row.first_needed.saturating_add(PENDING_LIMIT_MS)
 }
 
 /// Whether an added leaf's KeyPackage binding verifies under `key`
@@ -410,6 +434,18 @@ pub(super) fn recheck(tx: &mut Tx<'_>, cx: &Ctx<'_>) -> Result<Vec<Action>> {
                 Outcome::Passed => tx.clear_check(&row)?,
                 Outcome::Failed => fail(tx, cx, &conv, &row, &mut events)?,
                 Outcome::Pending => {}
+                // 12.7: nothing is removed for an outage; the user is told
+                // once it has lasted 2 hours.
+                Outcome::Waiting => {
+                    if !row.warned && past_limit(cx, &row) {
+                        tracing::info!(conv = %conv.id, uid = %row.uid, "a key check waits on a key file it cannot read");
+                        events.push(ConversationEvent::KeyFileUnavailable {
+                            conversation: conv.id,
+                            uid: row.uid.clone(),
+                        });
+                        tx.set_check_warned(&row)?;
+                    }
+                }
             }
             continue;
         }

@@ -270,9 +270,10 @@ fn read_kp(cx: &Ctx<'_>, bytes: &[u8]) -> Option<KeyPackage> {
 /// A KeyPackage fetched with KEYPKG GET, read and checked as far as the
 /// group can (12.5, 12.7): valid MLS, of the suite, a device's credential
 /// of `uid`, a profile, and a lifetime acceptable for a commit posted
-/// now ([`lifetime_ok_to_post`]). Its binding is
-/// checked against the key file through the hooks; one that cannot be
-/// checked yet is accepted, and the added leaf stays unconfirmed (12.7).
+/// now ([`lifetime_ok_to_post`]). Its binding is checked against the key
+/// file through the hooks. One of an identity whose key file was never
+/// read is refused (12.5, 12.14): the upkeep adds the device once it is
+/// read.
 pub(crate) fn check_fetched(
     tx: &Tx<'_>,
     cx: &Ctx<'_>,
@@ -286,10 +287,14 @@ pub(crate) fn check_fetched(
         return None;
     }
     let device = identity.device_id?;
-    if let Some(key) = cx.hooks.device_key_of(tx, cx.account, uid, &device) {
-        // `None`: not a current device of the identity.
-        let key = key?;
-        risala_mls::keypackage::check_binding(&kp, &identity, &key).ok()?;
+    match cx.hooks.device_key_of(tx, cx.account, uid, &device) {
+        Some(key) => {
+            // `None`: not a current device of the identity.
+            let key = key?;
+            risala_mls::keypackage::check_binding(&kp, &identity, &key).ok()?;
+        }
+        None if cx.hooks.enforce_key_checks() => return None,
+        None => {}
     }
     Some(kp)
 }

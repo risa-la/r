@@ -751,6 +751,9 @@ pub(crate) fn apply(
         .unwrap_or_else(|| ContactRow::new(uid.as_str()));
     contact.fetched = Some(now);
     contact.next_check = Some(next_check(now));
+    // 12.7: while the key file cannot be read, a key check waiting on it
+    // stays pending, and never fails for time.
+    contact.outage = matches!(verified, Verified::Outage(_) | Verified::Unread { .. });
     let found = match verified {
         Verified::Outage(why) => {
             tracing::debug!(%uid, %why, "key file fetch: outage");

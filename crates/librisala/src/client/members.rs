@@ -96,15 +96,15 @@ impl KeyFacts for TxFacts<'_> {
         }
     }
 
+    /// As far as this device has accepted the identity's records (12.7):
+    /// a device pending, or not in the key file as last read, has not been
+    /// removed by any of them. Unknown only while the key file was never
+    /// read.
     fn device_removed(&self, uid: &Uid, device_id: &MlsDeviceId) -> Fact<bool> {
-        if uid.is_guest() {
+        if self.contact(uid).is_none() {
             return Fact::Unknown;
         }
-        match self.device(uid, device_id) {
-            Some(DeviceState::Removed) => Fact::Known(true),
-            Some(DeviceState::Current) => Fact::Known(false),
-            _ => Fact::Unknown,
-        }
+        Fact::Known(self.device(uid, device_id) == Some(DeviceState::Removed))
     }
 
     fn identity_retired(&self, uid: &Uid) -> Fact<bool> {
@@ -139,10 +139,14 @@ impl KeyFacts for TxFacts<'_> {
 ///   accepted (4.5);
 /// - `Some(None)`: not to be added: removed by record, pending, not in the
 ///   key file as last read, or of an identity whose keys are missing or
-///   that is forked (12.14). The device is added later, once its record
-///   is accepted, by [`Client::maintain`];
-/// - `None`: the key file could not be read at all yet (an outage, 4.4):
-///   the KeyPackage is added, and its leaf stays unconfirmed (12.7).
+///   that is forked, even if its key file was never read (12.14). The
+///   device is added later, once its record is accepted, by
+///   [`Client::maintain`];
+/// - `None`: the key file was never read (an outage, 4.4): not added
+///   either, until it is (12.5, 12.14).
+///
+/// During an outage after a good read, the devices of that read still
+/// count.
 pub(crate) fn device_key_of(
     tx: &Tx<'_>,
     uid: &Uid,
@@ -152,11 +156,12 @@ pub(crate) fn device_key_of(
         return None;
     }
     let contact = tx.contact(uid.as_str()).ok().flatten()?;
-    if contact.keys == KeysState::Unknown {
-        return None;
-    }
+    // A known fork refuses, whether or not a key file was read.
     if unchecked(&contact).is_some() {
         return Some(None);
+    }
+    if contact.keys == KeysState::Unknown {
+        return None;
     }
     let row = tx.devices(uid.as_str()).ok().and_then(|devices| {
         devices
@@ -167,6 +172,20 @@ pub(crate) fn device_key_of(
         row.filter(|d| d.state == DeviceState::Current)
             .map(|d| d.device_key),
     )
+}
+
+/// Whether `uid`'s key file cannot be read now (4.4): never read, or its
+/// last fetch was an outage. A key check waiting on it stays pending, and
+/// never fails for time (12.7). A guest has no key file to wait for.
+pub(crate) fn key_file_unreadable(tx: &Tx<'_>, uid: &Uid) -> bool {
+    if uid.is_guest() {
+        return false;
+    }
+    match tx.contact(uid.as_str()) {
+        Ok(Some(c)) => c.keys == KeysState::Unknown || c.outage,
+        Ok(None) => true,
+        Err(_) => true,
+    }
 }
 
 /// Whether this device starts the conversation with yourself of `uid`,
@@ -331,22 +350,23 @@ impl Client {
 
     /// Before starting a conversation with `uid` or inviting it: fetches
     /// its key file if the device has never read it, and refuses an
-    /// identity that sending is stopped for, or whose key file was read
-    /// and whose devices may not be added: stale, or not accepted yet
-    /// (4.5, 12.7, 12.14). Also
-    /// makes sure the device has read its own identity's key file, whose
-    /// other devices join too.
+    /// identity that sending is stopped for, whose key file it still
+    /// cannot read, or whose key file was read and whose devices may not
+    /// be added: stale, or not accepted yet (4.5, 12.5, 12.7, 12.14).
+    /// Also makes sure the device has read its own identity's key file,
+    /// whose other devices join too.
     pub(crate) async fn prepare_members(&self, account: AccountId, uids: &[Uid]) -> Result<()> {
         let own = self.account(account)?.uid;
         for uid in uids.iter().chain(std::iter::once(&own)) {
             if uid.is_guest() {
                 continue;
             }
-            let fetched = self
+            // Never read, or only ever an outage: read it now.
+            let read = self
                 .store()
                 .contact(uid.as_str())?
-                .is_some_and(|c| c.fetched.is_some());
-            if !fetched {
+                .is_some_and(|c| c.keys != KeysState::Unknown);
+            if !read {
                 self.refresh_identity(uid.as_str()).await?;
             }
             if *uid == own {
@@ -360,12 +380,19 @@ impl Client {
                 }
                 .into());
             }
-            // While its key file could never be read (an outage, 4.4), the
-            // devices are added unchecked, as C2 chose, and stay
-            // unconfirmed (12.7). Once it was read, they must be addable.
+            // 12.5, 12.14: an identity whose key file this device has never
+            // read is never added; its devices could be anyone's. Devices
+            // of an earlier good read still count during an outage.
             let read = contact
                 .as_ref()
                 .is_some_and(|c| c.keys != KeysState::Unknown);
+            #[cfg(test)]
+            let enforced = !self.options().skip_key_checks;
+            #[cfg(not(test))]
+            let enforced = true;
+            if !read && enforced {
+                return Err(IdentityError::KeyFileUnavailable(uid.clone()).into());
+            }
             if read && !self.may_add_devices(uid.as_str())? {
                 return Err(IdentityError::NotAccepted(uid.clone()).into());
             }
@@ -851,7 +878,8 @@ mod tests {
 
     /// 12.7: a current device's key is known; a removed one is known not
     /// to be current and to be removed; a pending or unknown one is not
-    /// known yet, so a check waits rather than fails.
+    /// known yet to be current, so a check waits rather than fails, but is
+    /// known not to be removed by any record accepted.
     #[test]
     fn key_facts_follow_accepted_records() {
         let store = store(KeysState::Keys, false);
@@ -868,13 +896,15 @@ mod tests {
                 assert_eq!(facts.current_device_key(&alice, &id(9)), Fact::Unknown);
                 assert_eq!(facts.device_removed(&alice, &id(1)), Fact::Known(false));
                 assert_eq!(facts.device_removed(&alice, &id(3)), Fact::Known(true));
-                assert_eq!(facts.device_removed(&alice, &id(2)), Fact::Unknown);
+                assert_eq!(facts.device_removed(&alice, &id(2)), Fact::Known(false));
+                assert_eq!(facts.device_removed(&alice, &id(9)), Fact::Known(false));
                 assert_eq!(facts.forked_or_missing(&alice), Fact::Known(false));
                 // Nobody else is known.
                 let bob = uid("bob@example.org");
                 assert_eq!(facts.current_device_key(&bob, &id(1)), Fact::Unknown);
                 assert_eq!(facts.forked_or_missing(&bob), Fact::Unknown);
                 assert_eq!(facts.identity_retired(&bob), Fact::Unknown);
+                assert_eq!(facts.device_removed(&bob, &id(1)), Fact::Unknown);
                 Ok(())
             })
             .unwrap();
@@ -900,9 +930,9 @@ mod tests {
         }
     }
 
-    /// 12.5, 12.7: a fetched KeyPackage is added only for a current
-    /// device, and checked against its key; while the key file could not
-    /// be read at all, it is added unchecked.
+    /// 12.5, 12.7, 12.14: a fetched KeyPackage is added only for a current
+    /// device, and checked against its key; while the key file was never
+    /// read, the device cannot tell, and adds nothing.
     #[test]
     fn keypackage_devices_must_be_current() {
         let alice = uid(ALICE);
@@ -925,11 +955,53 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // An outage only: added, unconfirmed.
+        // Never read: it cannot tell.
         let store = super::tests::store(KeysState::Unknown, false);
         store
             .write(|tx| {
                 assert_eq!(device_key_of(tx, &alice, &id(1)), None);
+                Ok(())
+            })
+            .unwrap();
+        // Never read, but its log is known to fork: refused.
+        let store = super::tests::store(KeysState::Unknown, true);
+        store
+            .write(|tx| {
+                assert_eq!(device_key_of(tx, &alice, &id(1)), Some(None));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 12.14: an outage after a good read keeps the devices of that read;
+    /// the key file counts as unreadable, so that checks waiting on it do
+    /// not fail for time (12.7).
+    #[test]
+    fn an_outage_after_a_good_read_keeps_cached_devices() {
+        let alice = uid(ALICE);
+        let store = store(KeysState::Keys, false);
+        store
+            .write(|tx| {
+                assert!(!key_file_unreadable(tx, &alice));
+                let mut c = tx.contact(ALICE)?.unwrap();
+                c.outage = true;
+                tx.put_contact(&c)?;
+                assert!(key_file_unreadable(tx, &alice));
+                assert_eq!(device_key_of(tx, &alice, &id(1)), Some(Some(vec![1; 1312])));
+                assert_eq!(
+                    TxFacts::new(tx).current_device_key(&alice, &id(1)),
+                    Fact::Known(Some(vec![1; 1312]))
+                );
+                // Never read, or unknown: unreadable. A guest has no file.
+                assert!(key_file_unreadable(tx, &uid("bob@example.org")));
+                assert!(!key_file_unreadable(tx, &uid("~guest")));
+                Ok(())
+            })
+            .unwrap();
+        let store = super::tests::store(KeysState::Unknown, false);
+        store
+            .write(|tx| {
+                assert!(key_file_unreadable(tx, &alice));
                 Ok(())
             })
             .unwrap();

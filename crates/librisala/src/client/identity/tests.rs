@@ -625,6 +625,70 @@ async fn a_record_not_in_the_log_makes_the_keys_missing() {
     );
 }
 
+/// 12.5, 12.14: a device never adds an identity whose key file it has
+/// never read: starting a conversation or inviting it fails with "key file
+/// unavailable", and is tried again at the next attempt. Once read, an
+/// outage keeps the devices of that read. A known fork refuses.
+#[tokio::test]
+async fn adding_an_identity_needs_its_key_file_read() {
+    let s = Setup::new().await;
+    let (_alice, uid, _) = s.identity("alice").await;
+    let (bob, _, _) = s.identity("bob").await;
+    let account = bob.accounts().unwrap()[0].id;
+    let alice: Uid = uid.parse().unwrap();
+    let url = format!("https://{DOMAIN}/.well-known/risala/alice");
+    s.world()
+        .overrides
+        .insert(url.clone(), Fetched::Status(503));
+    let refused = bob
+        .prepare_members(account, std::slice::from_ref(&alice))
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::Identity(IdentityError::KeyFileUnavailable(u))) if *u == alice),
+        "{refused:?}"
+    );
+    assert!(bob.store().contact(&uid).unwrap().unwrap().outage);
+    // The next attempt reads it again.
+    s.world().overrides.clear();
+    bob.prepare_members(account, std::slice::from_ref(&alice))
+        .await
+        .unwrap();
+    assert!(!bob.store().contact(&uid).unwrap().unwrap().outage);
+    // An outage after a good read: the devices of that read count.
+    s.world()
+        .overrides
+        .insert(url.clone(), Fetched::Status(503));
+    bob.refresh_identity(&uid).await.unwrap();
+    assert!(bob.store().contact(&uid).unwrap().unwrap().outage);
+    bob.prepare_members(account, std::slice::from_ref(&alice))
+        .await
+        .unwrap();
+    // A fork known, even of a key file never read, refuses.
+    let (carol_client, carol, _) = s.identity("carol").await;
+    drop(carol_client);
+    bob.store()
+        .write(|tx| {
+            let mut c = ContactRow::new(&carol);
+            c.forked = true;
+            tx.put_contact(&c)
+        })
+        .unwrap();
+    let carol: Uid = carol.parse().unwrap();
+    let refused = bob
+        .prepare_members(account, std::slice::from_ref(&carol))
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(Error::Identity(IdentityError::Stopped {
+                reason: StopReason::Fork,
+                ..
+            }))
+        ),
+        "{refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn pairing_a_device() {
     let s = Setup::new().await;

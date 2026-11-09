@@ -86,6 +86,11 @@ pub enum IdentityError {
     /// missing, so the operation cannot check them (4.5).
     #[error("the records of {0} are not accepted yet")]
     NotAccepted(Uid),
+    /// The identity's key file has never been read: every fetch so far was
+    /// an outage (4.4). Its devices are not added until it is read (12.5,
+    /// 12.14); try later.
+    #[error("the key file of {0} is unavailable; try later")]
+    KeyFileUnavailable(Uid),
     /// The device is not a current device of the identity.
     #[error("no such device")]
     NoSuchDevice,

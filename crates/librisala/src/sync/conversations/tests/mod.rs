@@ -38,8 +38,10 @@ const START: u64 = 1_794_182_400_000;
 /// The device keys of the test devices, as their key files would give
 /// them (4.4), for the key checks of 12.7: a registered device is current,
 /// with its key, and never removed; an identity marked unknown has its
-/// facts unknown, as when its key file cannot be read or its record is
-/// pending (4.5).
+/// facts unknown, as when its key file was never read or its record is
+/// pending (4.5). One marked unreadable has a key file that cannot be read
+/// now (4.4): with unknown, never read; without, read before, its devices
+/// cached.
 #[derive(Clone, Default)]
 pub(crate) struct KnownKeys(Arc<std::sync::Mutex<KnownKeysInner>>);
 
@@ -47,6 +49,7 @@ pub(crate) struct KnownKeys(Arc<std::sync::Mutex<KnownKeysInner>>);
 struct KnownKeysInner {
     keys: std::collections::HashMap<(String, [u8; 48]), Vec<u8>>,
     unknown: std::collections::HashSet<String>,
+    unreadable: std::collections::HashSet<String>,
     removed: std::collections::HashSet<(String, [u8; 48])>,
 }
 
@@ -69,6 +72,22 @@ impl KnownKeys {
         }
     }
 
+    /// Makes an identity's key file unreadable, an outage (4.4), or
+    /// readable again.
+    pub(crate) fn set_unreadable(&self, uid: &Uid, unreadable: bool) {
+        let mut inner = self.0.lock().unwrap();
+        if unreadable {
+            inner.unreadable.insert(uid.to_string());
+        } else {
+            inner.unreadable.remove(uid.as_str());
+        }
+    }
+
+    /// Whether an identity's key file cannot be read now.
+    pub(crate) fn unreadable(&self, uid: &Uid) -> bool {
+        self.0.lock().unwrap().unreadable.contains(uid.as_str())
+    }
+
     /// Removes a device by record (4.4).
     pub(crate) fn remove(&self, uid: &Uid, device: &[u8; 48]) {
         let mut inner = self.0.lock().unwrap();
@@ -83,6 +102,7 @@ impl KnownKeys {
         KnownKeys(Arc::new(std::sync::Mutex::new(KnownKeysInner {
             keys: inner.keys.clone(),
             unknown: inner.unknown.clone(),
+            unreadable: inner.unreadable.clone(),
             removed: inner.removed.clone(),
         })))
     }
@@ -179,6 +199,10 @@ impl Hooks for TestHooks {
 
     fn key_facts<'a>(&'a self, _: &'a Tx<'_>, _: AccountId) -> Box<dyn KeyFacts + 'a> {
         Box::new(self.keys.clone())
+    }
+
+    fn key_file_unreadable(&self, _: &Tx<'_>, uid: &Uid) -> bool {
+        self.keys.unreadable(uid)
     }
 
     fn blob(&self, _: AccountId, _: Option<&str>, blob: &BlobRef) -> BlobFetch {

@@ -102,6 +102,9 @@ CREATE TABLE devices (
 --   user acknowledges it (4.5, 12.14). forked stops sending (4.5).
 -- - keys is the last fetch's state (4.4): 'unknown' before any, 'keys',
 --   or 'missing', with why in missing. An outage changes neither.
+-- - outage is set while the last fetch was an outage, or read nothing
+--   from the log (4.4, 4.5): a key check that waits on the key file then
+--   never fails for time (12.7).
 -- - fetched is the last fetch, refreshed the last time the identity's
 --   view passed the freshness checks of 4.5 (7 days without makes it
 --   stale), and next_check when it is next due (12.14), all in ms.
@@ -126,7 +129,8 @@ CREATE TABLE contacts (
     refreshed       INTEGER,
     next_check      INTEGER,
     witness_problem INTEGER NOT NULL DEFAULT 0,
-    pending         INTEGER NOT NULL DEFAULT 0
+    pending         INTEGER NOT NULL DEFAULT 0,
+    outage          INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 
 -- Lines for the conversation with yourself (12.9) that the identity area
@@ -307,6 +311,9 @@ pub struct ContactRow {
     pub witness_problem: bool,
     /// How many records of its key file are pending.
     pub pending: u64,
+    /// Whether the last fetch was an outage, or read nothing from the log
+    /// (4.4, 4.5): the key file cannot be read now.
+    pub outage: bool,
 }
 
 impl ContactRow {
@@ -328,6 +335,7 @@ impl ContactRow {
             next_check: None,
             witness_problem: false,
             pending: 0,
+            outage: false,
         }
     }
 }
@@ -430,7 +438,7 @@ pub(crate) fn read_own(conn: &Connection, uid: &str) -> Result<Option<OwnRow>, S
 
 const CONTACT_COLUMNS: &str = "uid, master_key, log_origin, head, head_index, pin_master, \
     pin_origin, verified, new_master_key, forked, keys, missing, fetched, refreshed, \
-    next_check, witness_problem, pending";
+    next_check, witness_problem, pending, outage";
 
 pub(crate) fn read_contact(conn: &Connection, uid: &str) -> Result<Option<ContactRow>, StoreError> {
     let row = conn
@@ -457,6 +465,7 @@ pub(crate) fn read_contact(conn: &Connection, uid: &str) -> Result<Option<Contac
                         row.get::<_, Option<i64>>(14)?,
                         row.get::<_, bool>(15)?,
                         row.get::<_, i64>(16)?,
+                        row.get::<_, bool>(17)?,
                     ),
                 ))
             },
@@ -475,7 +484,7 @@ pub(crate) fn read_contact(conn: &Connection, uid: &str) -> Result<Option<Contac
         forked,
         keys,
         missing,
-        (fetched, refreshed, next_check, witness_problem, pending),
+        (fetched, refreshed, next_check, witness_problem, pending, outage),
     )) = row
     else {
         return Ok(None);
@@ -506,6 +515,7 @@ pub(crate) fn read_contact(conn: &Connection, uid: &str) -> Result<Option<Contac
         next_check: opt_u64(next_check),
         witness_problem,
         pending: pending as u64,
+        outage,
     }))
 }
 
@@ -664,7 +674,7 @@ impl Tx<'_> {
             &format!(
                 "INSERT OR REPLACE INTO contacts ({CONTACT_COLUMNS})
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17)"
+                         ?16, ?17, ?18)"
             ),
             params![
                 c.uid,
@@ -684,6 +694,7 @@ impl Tx<'_> {
                 opt_i64(c.next_check),
                 c.witness_problem,
                 c.pending as i64,
+                c.outage,
             ],
         )?;
         self.changed(Change::Identity(IdentityChange::Contact(c.uid.clone())));

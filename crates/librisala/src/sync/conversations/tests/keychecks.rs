@@ -65,76 +65,311 @@ fn has_event(net: &Net, d: usize, f: impl Fn(&ConversationEvent) -> bool) -> boo
     })
 }
 
+/// Alice's laptop and Bob in a direct conversation, and Alice's phone,
+/// with key facts of its own, joined to it by the laptop.
+struct Three {
+    net: Net,
+    laptop: usize,
+    phone: usize,
+    bob: usize,
+    /// The conversation on the laptop, the phone and Bob's device.
+    a: ConversationId,
+    p: ConversationId,
+    b: ConversationId,
+    phone_keys: KnownKeys,
+}
+
+fn three(before_join: impl FnOnce(&mut Net, &KnownKeys, usize)) -> Three {
+    let mut net = Net::new();
+    let laptop = net.device("laptop", "alice@example.org");
+    let phone = net.device_of("phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    let phone_keys = own_facts(&mut net, phone);
+    before_join(&mut net, &phone_keys, phone);
+    net.connect(laptop);
+    for d in 3..net.devices.len() {
+        net.connect(d);
+    }
+    net.connect(bob);
+    let a = net.job(laptop, peer("bob@example.net")).unwrap();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    net.connect(phone);
+    net.job(
+        laptop,
+        Job::Invite {
+            conv: a,
+            uids: vec![uid("alice@example.org")],
+        },
+    )
+    .unwrap();
+    net.advance(60 * 1000);
+    let p = net.same_conv(phone, laptop, a).expect("the phone joined");
+    Three {
+        net,
+        laptop,
+        phone,
+        bob,
+        a,
+        p,
+        b,
+        phone_keys,
+    }
+}
+
+/// Bob's second device, connected, and added by Alice's laptop, which
+/// knows it.
+fn add_bob_tablet(t: &mut Three) -> usize {
+    let tablet = t.net.device_of("tablet", t.bob);
+    // Its record is in Bob's key file, for the phone too, once it reads.
+    let key = SigningKey::from_seed(*t.net.devices[tablet].hooks.key.seed());
+    t.phone_keys.add(&uid("bob@example.net"), &key);
+    t.net.connect(tablet);
+    t.net
+        .job(
+            t.laptop,
+            Job::Invite {
+                conv: t.a,
+                uids: vec![uid("bob@example.net")],
+            },
+        )
+        .unwrap();
+    t.net.advance(60 * 1000);
+    tablet
+}
+
+fn held(net: &Net, d: usize, conv: ConversationId) -> bool {
+    net.devices[d]
+        .store
+        .write_with(|tx| -> Result<_, EngineError> { Ok(tx.sending_held(conv)?) })
+        .unwrap()
+        .0
+}
+
 /// 12.7: a leaf added while the device could not check it holds sending:
-/// nothing is posted while it is unchecked. A record still pending 2 hours
-/// later counts as failed, and the leaf is removed, for a check; then
-/// sending goes on, and the removed leaf never read what was held.
+/// nothing is posted while it is unchecked. Here Bob's new device's record
+/// is pending for the phone, whose key file of Bob reads. Still pending 2
+/// hours later, it counts as failed, and the leaf is removed, for a check;
+/// then sending goes on, and the removed leaf never read what was held.
 #[test]
 fn an_unchecked_add_holds_sending_and_is_removed_after_two_hours() {
-    let mut net = Net::new();
-    let alice = net.device("alice", "alice@example.org");
-    let bob = net.device("bob", "bob@example.net");
-    net.connect(alice);
-    net.connect(bob);
-    // Bob's key file cannot be read: his device is added unchecked.
-    net.keys.set_unknown(&uid("bob@example.net"), true);
-    let a = net.job(alice, peer("bob@example.net")).unwrap();
-    let b = net.same_conv(bob, alice, a).expect("bob joined");
-    assert!(has_event(&net, alice, |e| matches!(
+    let mut t = three(|_, _, _| {});
+    t.phone_keys.set_unknown(&uid("bob@example.net"), true);
+    let tablet = add_bob_tablet(&mut t);
+    let tb = t
+        .net
+        .same_conv(tablet, t.laptop, t.a)
+        .expect("tablet joined");
+    let (net, phone, p, b) = (&mut t.net, t.phone, t.p, t.b);
+    assert_eq!(net.leaves(phone, p).len(), 4);
+    assert!(has_event(net, phone, |e| matches!(
         e,
-        ConversationEvent::SendingHeld { conversation } if *conversation == a
+        ConversationEvent::SendingHeld { conversation } if *conversation == p
     )));
-    assert_eq!(checks(&net, alice, a), 1);
-    net.say(alice, a, "not for an unchecked leaf");
+    assert_eq!(checks(net, phone, p), 1);
+    net.say(phone, p, "not for an unchecked leaf");
     net.advance(30 * 60 * 1000);
-    assert!(net.texts(bob, b).is_empty(), "nothing was posted");
+    assert!(net.texts(tablet, tb).is_empty(), "nothing was posted");
+    assert!(net.texts(t.bob, b).is_empty(), "nothing was posted");
     // Still pending 2 hours after it was first needed: failed, repaired.
     for _ in 0..10 {
         net.advance(10 * 60 * 1000);
     }
-    assert!(has_event(&net, alice, |e| matches!(
+    assert!(has_event(net, phone, |e| matches!(
         e,
         ConversationEvent::KeyCheckFailed { conversation, uid, repairing: true }
-            if *conversation == a && uid.as_str() == "bob@example.net"
+            if *conversation == p && uid.as_str() == "bob@example.net"
     )));
-    assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
-    assert_eq!(net.state(bob, b), ConvState::Left);
+    assert_eq!(net.leaves(phone, p).len(), 3, "the tablet's leaf is gone");
+    assert_eq!(net.state(tablet, tb), ConvState::Left);
     assert!(
-        net.texts(bob, b).is_empty(),
+        net.texts(tablet, tb).is_empty(),
         "the removed leaf read nothing"
     );
     // The check goes with the leaf, at the next look.
     net.advance(61 * 1000);
-    assert_eq!(checks(&net, alice, a), 0);
-    assert!(has_event(&net, alice, |e| matches!(
+    assert_eq!(checks(net, phone, p), 0);
+    assert!(has_event(net, phone, |e| matches!(
         e,
-        ConversationEvent::SendingResumed { conversation } if *conversation == a
+        ConversationEvent::SendingResumed { conversation } if *conversation == p
+    )));
+    // Then the move that follows a removal (7.8), and what was held.
+    for _ in 0..15 {
+        net.advance(60 * 1000);
+    }
+    assert!(net.texts(t.bob, b).contains(&(
+        "alice@example.org".into(),
+        "not for an unchecked leaf".into()
     )));
 }
 
 /// 12.7: once the facts are known and the check passes, sending goes on.
 #[test]
 fn sending_goes_on_once_the_add_is_checked() {
+    let mut t = three(|_, _, _| {});
+    t.phone_keys.set_unknown(&uid("bob@example.net"), true);
+    let tablet = add_bob_tablet(&mut t);
+    let tb = t.net.same_conv(tablet, t.laptop, t.a).unwrap();
+    let (net, phone, p) = (&mut t.net, t.phone, t.p);
+    net.say(phone, p, "hello");
+    net.advance(2 * 60 * 1000);
+    assert!(net.texts(tablet, tb).is_empty());
+    // The tablet's record is accepted now.
+    t.phone_keys.set_unknown(&uid("bob@example.net"), false);
+    net.advance(61 * 1000);
+    assert_eq!(
+        net.texts(tablet, tb),
+        [("alice@example.org".into(), "hello".into())]
+    );
+    assert_eq!(checks(net, phone, p), 0);
+    assert_eq!(net.leaves(phone, p).len(), 4, "nobody was removed");
+}
+
+/// 12.5, 12.14: a device never adds an identity whose key file it has
+/// never read: the direct conversation is not made, and Bob gets nothing.
+#[test]
+fn an_outage_on_first_contact_refuses_the_add() {
     let mut net = Net::new();
     let alice = net.device("alice", "alice@example.org");
     let bob = net.device("bob", "bob@example.net");
     net.connect(alice);
     net.connect(bob);
     net.keys.set_unknown(&uid("bob@example.net"), true);
-    let a = net.job(alice, peer("bob@example.net")).unwrap();
-    let b = net.same_conv(bob, alice, a).unwrap();
-    net.say(alice, a, "hello");
-    net.advance(2 * 60 * 1000);
-    assert!(net.texts(bob, b).is_empty());
-    // Bob's record is accepted now.
+    net.keys.set_unreadable(&uid("bob@example.net"), true);
+    let made = net.job(alice, peer("bob@example.net"));
+    assert!(made.is_err(), "{made:?}");
+    net.advance(60 * 1000);
+    assert!(net.convs(bob).is_empty(), "Bob was not added");
+    // Once the key file is read, it works.
     net.keys.set_unknown(&uid("bob@example.net"), false);
-    net.advance(61 * 1000);
+    net.keys.set_unreadable(&uid("bob@example.net"), false);
+    let a = net.job(alice, peer("bob@example.net")).unwrap();
+    assert!(net.same_conv(bob, alice, a).is_some());
+}
+
+/// 12.14: during an outage after a good read, the devices of that read
+/// are added and checked as before: nothing waits.
+#[test]
+fn an_outage_after_a_good_read_keeps_cached_devices() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    net.connect(alice);
+    net.connect(bob);
+    net.keys.set_unreadable(&uid("bob@example.net"), true);
+    let a = net.job(alice, peer("bob@example.net")).unwrap();
+    let b = net.same_conv(bob, alice, a).expect("Bob was added");
+    assert_eq!(checks(&net, alice, a), 0);
+    assert!(!held(&net, alice, a));
+    net.say(alice, a, "hello");
+    net.advance(60 * 1000);
     assert_eq!(
         net.texts(bob, b),
         [("alice@example.org".into(), "hello".into())]
     );
-    assert_eq!(checks(&net, alice, a), 0);
-    assert_eq!(net.leaves(alice, a).len(), 2, "nobody was removed");
+}
+
+/// 12.7: an outage never fails a check. The phone cannot read Bob's key
+/// file and never could: the tablet's add stays pending past 2 hours,
+/// sending stays held, the user is warned once, and nothing is removed.
+/// Once the file is read, the check passes and sending goes on.
+#[test]
+fn an_outage_past_two_hours_warns_and_removes_no_added_leaf() {
+    let mut t = three(|_, _, _| {});
+    t.phone_keys.set_unknown(&uid("bob@example.net"), true);
+    t.phone_keys.set_unreadable(&uid("bob@example.net"), true);
+    let tablet = add_bob_tablet(&mut t);
+    let tb = t.net.same_conv(tablet, t.laptop, t.a).unwrap();
+    let (net, phone, p) = (&mut t.net, t.phone, t.p);
+    net.say(phone, p, "after the outage");
+    for _ in 0..30 {
+        net.advance(10 * 60 * 1000);
+    }
+    let warnings = net
+        .events(phone)
+        .iter()
+        .filter(|e| {
+            matches!(e, Event::Conversation(ConversationEvent::KeyFileUnavailable {
+                conversation, uid
+            }) if *conversation == p && uid.as_str() == "bob@example.net")
+        })
+        .count();
+    assert_eq!(warnings, 1, "warned once");
+    assert!(!has_event(net, phone, |e| matches!(
+        e,
+        ConversationEvent::KeyCheckFailed { .. }
+    )));
+    assert_eq!(net.leaves(phone, p).len(), 4, "nothing removed");
+    assert!(held(net, phone, p), "sending still held");
+    assert!(net.texts(tablet, tb).is_empty());
+    // The key file is read again: the check passes.
+    t.phone_keys.set_unknown(&uid("bob@example.net"), false);
+    t.phone_keys.set_unreadable(&uid("bob@example.net"), false);
+    net.advance(61 * 1000);
+    assert_eq!(checks(net, phone, p), 0);
+    assert_eq!(
+        net.texts(tablet, tb),
+        [("alice@example.org".into(), "after the outage".into())]
+    );
+}
+
+/// 12.7: a committer counts as checked as far as the records accepted go.
+/// The phone cannot read Bob's key file and never could: Bob's commit
+/// leaves a check pending past 2 hours, the user is warned once, and Bob
+/// is not removed, nor his messages hidden, nor the phone's sending held.
+#[test]
+fn an_outage_past_two_hours_warns_and_removes_no_committer() {
+    let mut t = three(|_, _, _| {});
+    t.phone_keys.set_unknown(&uid("bob@example.net"), true);
+    t.phone_keys.set_unreadable(&uid("bob@example.net"), true);
+    let (net, phone, p, b) = (&mut t.net, t.phone, t.p, t.b);
+    net.write(t.bob, |tx| {
+        group::queue_intent(
+            tx,
+            b,
+            &Intent {
+                new_leaf_key: true,
+                ..Intent::default()
+            },
+            START,
+        )?;
+        Ok(())
+    });
+    net.tick();
+    net.advance(60 * 1000);
+    assert_eq!(checks(net, phone, p), 1, "the committer's check waits");
+    assert!(!held(net, phone, p));
+    for _ in 0..30 {
+        net.advance(10 * 60 * 1000);
+    }
+    let warnings = net
+        .events(phone)
+        .iter()
+        .filter(|e| {
+            matches!(e, Event::Conversation(ConversationEvent::KeyFileUnavailable {
+                conversation, uid
+            }) if *conversation == p && uid.as_str() == "bob@example.net")
+        })
+        .count();
+    assert_eq!(warnings, 1, "warned once");
+    assert!(!has_event(net, phone, |e| matches!(
+        e,
+        ConversationEvent::KeyCheckFailed { .. }
+    )));
+    assert_eq!(net.leaves(phone, p).len(), 3, "nothing removed");
+    net.say(t.bob, b, "still here");
+    net.advance(60 * 1000);
+    assert!(
+        net.texts(phone, p)
+            .contains(&("bob@example.net".into(), "still here".into())),
+        "not hidden"
+    );
+    net.say(phone, p, "and so am I");
+    net.advance(60 * 1000);
+    assert!(
+        net.texts(t.bob, b)
+            .contains(&("alice@example.org".into(), "and so am I".into())),
+        "not held"
+    );
 }
 
 /// 12.7: an add that fails the checks of a device that did not make it,
