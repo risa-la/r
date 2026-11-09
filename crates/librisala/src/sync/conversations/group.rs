@@ -1603,6 +1603,8 @@ pub(crate) fn join_welcome(
         tx.set_conversation_info(existing.id, &ext.name, &ext.topic, room.as_deref())?;
         tx.set_state(existing.id, ConvState::Active)?;
         tx.sync_leaves(existing.id, &tree_leaves(&group))?;
+        // 12.7, Joining: the leaves already there are checked as Adds.
+        super::keycheck::record_joined(tx, cx, existing.id, &group)?;
         tx.used_key_package(cx.account, &reference)?;
         tx.set_joined(existing.id, cx.now)?;
         let mailbox = box_of(&ext);
@@ -1648,6 +1650,8 @@ pub(crate) fn join_welcome(
     let wait = super::random_below(cx.config.max_follow_wait_ms)?;
     tx.add_mailbox(conv, &mailbox, true, 0, Some(cx.now + wait))?;
     tx.sync_leaves(conv, &tree_leaves(&group))?;
+    // 12.7, Joining: the leaves already there are checked as Adds.
+    super::keycheck::record_joined(tx, cx, conv, &group)?;
     tx.used_key_package(cx.account, &reference)?;
     tx.set_joined(conv, cx.now)?;
     if joined.last_resort {

@@ -1,6 +1,6 @@
 //! The group engine's upkeep (task R2):
 //!
-//! - every minute, the key checks of 12.7 that wait on facts, and their
+//! - every ten seconds, the key checks of 12.7 that wait on facts, and their
 //!   repairs ([`super::keycheck::recheck`], LR-C2);
 //! - every ten minutes, past epochs' secrets deleted by the clock, 2 hours
 //!   after the commit that ended each (12.9, LR-H1); outbox rows done or

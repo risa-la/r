@@ -10,7 +10,10 @@
 //!   no messages, no typing, and no commit with a new conversation
 //!   extension. Repairs and other commits still go. The same holds from a
 //!   failed check until its removal is queued, which then goes first.
-//! - **Checking again.** [`recheck`] runs every minute: a check whose
+//! - **Joining** ([`record_joined`]): a device that joins by Welcome runs
+//!   the Adds check on every leaf already there, and holds sending until
+//!   each passes (12.7, Joining).
+//! - **Checking again.** [`recheck`] runs every few seconds: a check whose
 //!   facts are now known passes or fails; one whose record is still
 //!   pending 2 hours after the device first needed it fails. A key file
 //!   that cannot be read never fails a check: the check stays pending,
@@ -50,8 +53,9 @@ type Result<T> = std::result::Result<T, EngineError>;
 /// (12.7): a log must witness a record within an hour (4.5).
 pub(crate) const PENDING_LIMIT_MS: u64 = 2 * 60 * 60 * 1000;
 
-/// How often [`recheck`] runs.
-pub(crate) const RECHECK_EVERY_MS: u64 = 60 * 1000;
+/// How often [`recheck`] runs: often enough that a key file read just
+/// now releases sending soon, for instance after joining.
+pub(crate) const RECHECK_EVERY_MS: u64 = 10 * 1000;
 
 fn emit(applied: &mut Applied, event: ConversationEvent) {
     applied
@@ -328,6 +332,58 @@ pub(super) fn record_own(
     Ok(())
 }
 
+/// Runs the Adds key check on every leaf already in a group this device
+/// has just joined by Welcome (12.7, Joining), outside public rooms: each
+/// leaf whose device it cannot show current yet is noted, and the device
+/// sends nothing in the group until the check passes. One that fails is
+/// repaired at the next [`recheck`], as for an Add. Returns whether
+/// sending is held.
+pub(super) fn record_joined(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: ConversationId,
+    group: &MlsGroup,
+) -> Result<bool> {
+    if !cx.hooks.enforce_key_checks() {
+        return Ok(false);
+    }
+    let view = GroupView::of(group.public_group(), &EpochState::default());
+    let public = view
+        .conversation
+        .as_ref()
+        .is_ok_and(|c| c.kind == risala_mls::conversation::ConversationKind::PublicRoom);
+    if public {
+        return Ok(false);
+    }
+    let own = group.own_leaf_index();
+    for leaf in view.leaves.iter().filter(|l| l.index != own) {
+        let Some(identity) = &leaf.identity else {
+            continue;
+        };
+        let Some(device_id) = identity.device_id else {
+            continue;
+        };
+        let row = KeyCheckRow {
+            conv,
+            uid: identity.uid.clone(),
+            device_id: *device_id.as_bytes(),
+            kind: CheckKind::Joined,
+            signature_key: leaf.signature_key.clone(),
+            init_key: None,
+            encryption_key: None,
+            binding: None,
+            first_needed: cx.now,
+            failed: false,
+            repair_at: None,
+            warned: false,
+        };
+        if facts_now(tx, cx, &row) != Outcome::Passed {
+            tx.note_unchecked(&row)?;
+        }
+    }
+    Ok(tx.sending_held(conv)?)
+}
+
 /// What a check finds now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
@@ -353,11 +409,15 @@ fn facts_now(tx: &Tx<'_>, cx: &Ctx<'_>, row: &KeyCheckRow) -> Outcome {
             // 12.7: "as far as the device has accepted it".
             Fact::Unknown => Outcome::Waiting,
         },
-        CheckKind::Add => match (
+        CheckKind::Add | CheckKind::Joined => match (
             facts.current_device_key(&row.uid, &device),
             facts.device_removed(&row.uid, &device),
         ) {
             (_, Fact::Known(true)) | (Fact::Known(None), _) => Outcome::Failed,
+            // A leaf already in the tree when the device joined: the tree
+            // no longer holds the init key its binding covers (12.3), so
+            // its device being current is what can be checked.
+            (Fact::Known(Some(_)), _) if row.kind == CheckKind::Joined => Outcome::Passed,
             (Fact::Known(Some(key)), _) => {
                 if binding_ok(row, &key) {
                     Outcome::Passed
@@ -414,7 +474,7 @@ pub(super) fn recheck(tx: &mut Tx<'_>, cx: &Ctx<'_>) -> Result<Vec<Action>> {
     let mut held_before = std::collections::BTreeSet::new();
     for row in &rows {
         // As [`Tx::sending_held`] counts them.
-        if (row.kind == CheckKind::Add && !row.failed) || row.repair_at.is_some() {
+        if (row.kind != CheckKind::Committer && !row.failed) || row.repair_at.is_some() {
             held_before.insert(row.conv);
         }
     }

@@ -750,9 +750,11 @@ impl Client {
 
     /// Reads again the key files of identities with a key check the
     /// engine could not make yet (12.7): a device added under a record this
-    /// device has not read. The engine checks again every minute from the
-    /// cache, and holds sending in the group meanwhile. At most every 30
-    /// seconds for each identity.
+    /// device has not read, a leaf there when this device joined, or a key
+    /// file it could not read (an outage, which the upkeep retries). The
+    /// engine checks again every ten seconds from the cache, and holds
+    /// sending in the group meanwhile where a leaf could read it. At most
+    /// every 30 seconds for each identity.
     async fn read_for_checks(&self, account: AccountId) -> Result<()> {
         let (rows, _) = self.store().write(|tx| tx.key_checks(account))?;
         let mut uids: Vec<Uid> = rows

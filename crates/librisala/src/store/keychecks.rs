@@ -13,20 +13,23 @@ pub const SCHEMA: &str = r#"
 -- Key checks of 12.7 that a device could not make yet, or that failed
 -- (LR-C2). kind is 'add' (a leaf added by a commit: init_key,
 -- encryption_key and binding are its KeyPackage's, to check the binding
--- once the device's record is accepted) or 'committer' (whether the
--- committer's device was removed by record). signature_key is the leaf's
--- when it was found, so that a repair is skipped once the leaf is gone or
--- replaced. first_needed is when the device first needed a record for it:
--- still pending 2 hours later, the check fails. state is 'unchecked' (the
--- device sends nothing in the group while an add is) or 'failed' (a repair
--- is due at repair_at, and nothing is sent until it is queued; or, where
--- the device may not make it, the leaf's messages are hidden). warned
--- once the user was told.
+-- once the device's record is accepted), 'joined' (a leaf already in the
+-- group when this device joined it by Welcome: its device must be
+-- current, since the tree no longer holds what its binding covers) or
+-- 'committer' (whether the committer's device was removed by record).
+-- signature_key is the leaf's when it was found, so that a repair is
+-- skipped once the leaf is gone or replaced. first_needed is when the
+-- device first needed a record for it: a record still pending 2 hours
+-- later fails the check, while a key file that cannot be read never does.
+-- state is 'unchecked' (the device sends nothing in the group while an
+-- add or joined check is) or 'failed' (a repair is due at repair_at, and
+-- nothing is sent until it is queued; or, where the device may not make
+-- it, the leaf's messages are hidden). warned once the user was told.
 CREATE TABLE key_checks (
     conv           INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     uid            TEXT NOT NULL,
     device_id      BLOB NOT NULL,
-    kind           TEXT NOT NULL CHECK (kind IN ('add', 'committer')),
+    kind           TEXT NOT NULL CHECK (kind IN ('add', 'joined', 'committer')),
     signature_key  BLOB NOT NULL,
     init_key       BLOB,
     encryption_key BLOB,
@@ -52,6 +55,10 @@ CREATE TABLE engine_timers (
 pub(crate) enum CheckKind {
     /// A leaf a commit added: its binding, under a current device.
     Add,
+    /// A leaf already in the group when this device joined it by Welcome
+    /// (12.7, Joining): its device, current. The tree no longer holds the
+    /// KeyPackage's init key, which its binding covers.
+    Joined,
     /// A commit's committer: whether its device was removed by record.
     Committer,
 }
@@ -60,6 +67,7 @@ impl CheckKind {
     fn as_str(self) -> &'static str {
         match self {
             CheckKind::Add => "add",
+            CheckKind::Joined => "joined",
             CheckKind::Committer => "committer",
         }
     }
@@ -67,6 +75,7 @@ impl CheckKind {
     fn parse(s: &str) -> Result<CheckKind, StoreError> {
         match s {
             "add" => Ok(CheckKind::Add),
+            "joined" => Ok(CheckKind::Joined),
             "committer" => Ok(CheckKind::Committer),
             other => Err(StoreError::Corrupt(format!("key check kind {other:?}"))),
         }
@@ -272,16 +281,17 @@ impl Tx<'_> {
     }
 
     /// Whether the device sends nothing in the conversation (12.7): a leaf
-    /// was added that it could not check yet, or one failed a check and
-    /// its removal is still to be queued. Once queued, the removal commit
-    /// goes before any message.
+    /// was added, or was there when it joined, that it could not check
+    /// yet, or one failed a check and its removal is still to be queued.
+    /// Once queued, the removal commit goes before any message.
     pub(crate) fn sending_held(&self, conv: ConversationId) -> Result<bool, StoreError> {
         Ok(self
             .conn()
             .query_row(
                 "SELECT 1 FROM key_checks
                  WHERE conv = ?1
-                   AND ((kind = 'add' AND state = 'unchecked') OR repair_at IS NOT NULL)
+                   AND ((kind IN ('add', 'joined') AND state = 'unchecked')
+                        OR repair_at IS NOT NULL)
                  LIMIT 1",
                 [conv.0],
                 |_| Ok(()),

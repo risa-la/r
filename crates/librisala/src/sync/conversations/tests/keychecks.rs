@@ -372,6 +372,74 @@ fn an_outage_past_two_hours_warns_and_removes_no_committer() {
     );
 }
 
+/// 12.7, Joining: a device that joins by Welcome checks every leaf already
+/// there, and sends nothing until each passes: here Bob's record is
+/// pending for the phone when it joins.
+#[test]
+fn a_joiner_holds_sending_until_the_leaves_there_pass() {
+    let mut t = three(|_, keys, _| keys.set_unknown(&uid("bob@example.net"), true));
+    let (net, phone, p, b) = (&mut t.net, t.phone, t.p, t.b);
+    assert!(has_event(net, phone, |e| matches!(
+        e,
+        ConversationEvent::SendingHeld { conversation } if *conversation == p
+    )));
+    assert_eq!(checks(net, phone, p), 1, "Bob's leaf only");
+    net.say(phone, p, "from the phone");
+    net.advance(60 * 1000);
+    assert!(
+        !net.texts(t.bob, b)
+            .iter()
+            .any(|(_, text)| text == "from the phone"),
+        "held"
+    );
+    // Bob's record is accepted now.
+    t.phone_keys.set_unknown(&uid("bob@example.net"), false);
+    net.advance(61 * 1000);
+    assert_eq!(checks(net, phone, p), 0);
+    assert!(has_event(net, phone, |e| matches!(
+        e,
+        ConversationEvent::SendingResumed { conversation } if *conversation == p
+    )));
+    assert!(
+        net.texts(t.bob, b)
+            .contains(&("alice@example.org".into(), "from the phone".into()))
+    );
+    assert_eq!(net.leaves(phone, p).len(), 3);
+}
+
+/// 12.7, Joining: a leaf already in the group whose device is not current
+/// for the joiner, a device under Bob's uid that his key file does not
+/// list, fails the check, and the joiner removes it, for a check.
+#[test]
+fn a_joiner_removes_a_fake_leaf_already_there() {
+    let mut t = three(|net, _, _| {
+        // Known to the laptop and to Bob's device, not to the phone.
+        net.device("fake", "bob@example.net");
+    });
+    let (net, phone, p, a) = (&mut t.net, t.phone, t.p, t.a);
+    assert_eq!(net.leaves(t.laptop, a).len(), 4, "the fake was added");
+    for _ in 0..3 {
+        net.advance(60 * 1000);
+    }
+    assert!(has_event(net, phone, |e| matches!(
+        e,
+        ConversationEvent::KeyCheckFailed { conversation, uid, repairing: true }
+            if *conversation == p && uid.as_str() == "bob@example.net"
+    )));
+    assert_eq!(net.leaves(phone, p).len(), 3, "the fake is gone");
+    assert_eq!(net.leaves(t.laptop, a).len(), 3);
+    let fake_id = net.devices[3].device_id.clone();
+    assert!(
+        !net.devices[phone]
+            .store
+            .leaf_rows(p)
+            .unwrap()
+            .iter()
+            .any(|l| l.device_id.map(|d| d.to_vec()) == Some(fake_id.clone()))
+    );
+    assert_eq!(checks(net, phone, p), 0);
+}
+
 /// 12.7: an add that fails the checks of a device that did not make it,
 /// here of a device that device has seen removed by record, is repaired by
 /// it: the leaf is removed for a check, and the user told.

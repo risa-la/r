@@ -2477,6 +2477,12 @@ impl ConversationEngine {
                 out.push(Action::Emit(Event::Conversation(
                     ConversationEvent::Joined { conversation: conv },
                 )));
+                // 12.7, Joining: held until the leaves there are checked.
+                if self.write(cx, &me, out, |tx, _| Ok(tx.sending_held(conv)?))? {
+                    out.push(Action::Emit(Event::Conversation(
+                        ConversationEvent::SendingHeld { conversation: conv },
+                    )));
+                }
                 // 5.1: one direct conversation per pair.
                 let left = self.write(cx, &me, out, |tx, c| group::keep_one_direct(tx, c, conv))?;
                 if let Some(left) = left {
