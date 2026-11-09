@@ -1,6 +1,6 @@
 [package]
 name = "risala-dev"
-description = "A local risala server filled with development data"
+description = "A local risala server with its key log and a witness, for development and tests"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -9,21 +9,23 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "risala-dev"
 path = "src/main.rs"
 
 [dependencies]
 risala-proto.workspace = true
+risala-keylog.workspace = true
+risala-keyfetch.workspace = true
 risala-server = { path = "../risala-server" }
 tokio.workspace = true
 clap.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tracing-subscriber.workspace = true
-
-[dev-dependencies]
+rcgen.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

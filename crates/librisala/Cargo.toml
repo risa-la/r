@@ -55,6 +55,10 @@ openmls_traits.workspace = true
 # push bodies, decrypted by the client (client/push.rs).
 risala-server = { path = "../risala-server" }
 risala-keylog.workspace = true
+# The server with its key log and witness, for the end-to-end tests
+# (tests/goal_server.rs).
+risala-dev = { path = "../risala-dev" }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

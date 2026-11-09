@@ -5,7 +5,7 @@ resolver = "3"
 exclude = [
     "crates/risala-proto/fuzz", "crates/risala-pow/fuzz", "crates/openmls-traits", "crates/openmls",
     # M5b: excluded until rewritten (docs/plans/M5b.md)
-    "crates/risala-cli", "crates/risala-dev",
+    "crates/risala-cli",
 ]
 members = [
     "crates/risala-proto",
@@ -16,6 +16,7 @@ members = [
     "crates/risala-keylog",
     "crates/risala-server",
     "crates/librisala",
+    "crates/risala-dev",
 ]
 
 [workspace.package]
