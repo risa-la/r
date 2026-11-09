@@ -211,8 +211,15 @@ enum Command {
 #[derive(Subcommand)]
 enum Pair {
     /// On the new device: prints the QR text, then waits for a device of
-    /// the identity to accept it, and joins the identity.
-    New { server: String, label: String },
+    /// the identity to accept it; prints the identity and its devices,
+    /// and joins it once you confirm on standard input (4.8, step 5).
+    New {
+        server: String,
+        label: String,
+        /// Join without asking: you have checked the identity elsewhere.
+        #[arg(long)]
+        yes: bool,
+    },
     /// On a device of the identity: accepts the new device whose QR text
     /// this is, and sends it the history (12.13) unless `--no-history`.
     Accept {
@@ -654,12 +661,29 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             // KeyPackages and the conversation with yourself (12.5, 5.1).
             ctx.settle(new.account, Duration::from_secs(3)).await;
         }
-        Command::Pair(Pair::New { server, label }) => {
+        Command::Pair(Pair::New { server, label, yes }) => {
             let offer = c.start_pairing(&server, &label).await.map_err(err)?;
             println!("{}", offer.qr);
             let _ = std::io::stdout().flush();
-            let own = c.finish_pairing().await.map_err(err)?;
-            println!("{}", own.uid);
+            // 4.8, step 5: whoever saw the QR code can answer it with an
+            // identity of their own, so the user confirms the identity.
+            let shown = c.finish_pairing().await.map_err(err)?;
+            println!("{}", shown.uid);
+            for d in &shown.devices {
+                let this = if d.this_device { "\tthis" } else { "" };
+                println!("\t{}\t{}{this}", d.short, d.label);
+            }
+            let _ = std::io::stdout().flush();
+            if !yes {
+                eprint!("join {}? [y/N] ", shown.uid);
+                let mut answer = String::new();
+                let _ = std::io::stdin().lock().read_line(&mut answer);
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    c.decline_pairing().map_err(err)?;
+                    return Err("declined".into());
+                }
+            }
+            let own = c.accept_pairing().await.map_err(err)?;
             ctx.until_accepted(own.uid.as_str()).await?;
             let account = c
                 .accounts()

@@ -256,7 +256,7 @@ async fn the_goal_with_the_cli() {
     // A third device, paired by QR text (4.8): `pair new` prints the QR
     // text and waits; `pair accept` on alice's laptop answers it.
     let mut pairing = phone
-        .command(&["pair", "new", HOST, "phone"])
+        .command(&["pair", "new", HOST, "phone", "--yes"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -377,7 +377,11 @@ async fn the_goal_with_the_cli() {
     );
     assert!(joined.0, "joining the public room failed: {}", joined.2);
     alice.run(&["send", "#plaza", "hello plaza"]).await;
-    spare.until_text("#plaza", "hello plaza", &[&alice], 15).await;
+    spare
+        .until_text("#plaza", "hello plaza", &[&alice], 15)
+        .await;
     spare.run(&["send", "#plaza", "hi from bob"]).await;
-    alice.until_text("#plaza", "hi from bob", &[&spare], 15).await;
+    alice
+        .until_text("#plaza", "hi from bob", &[&spare], 15)
+        .await;
 }

@@ -275,7 +275,11 @@ async fn the_goal_against_risalad() {
     let request = alice.scan_pairing(&alice_uid, &offer.qr).await.unwrap();
     assert_eq!(request.label, "phone");
     alice.confirm_pairing(&alice_uid, true).await.unwrap();
-    let own = phone.finish_pairing().await.unwrap();
+    // The phone shows the identity and its devices to confirm (4.8).
+    let shown = phone.finish_pairing().await.unwrap();
+    assert_eq!(shown.uid.to_string(), alice_uid);
+    assert!(shown.devices.iter().any(|d| d.label == "laptop"));
+    let own = phone.accept_pairing().await.unwrap();
     assert_eq!(own.uid.to_string(), alice_uid);
     let phone_acc = phone.accounts().unwrap()[0].id;
     connect(&phone, phone_acc).await;
