@@ -563,6 +563,21 @@ impl Tx<'_> {
     }
 
     /// Notes where a file's decrypted copy is, or that fetching it failed.
+    /// Forgets where a fetched file was saved, once it was deleted
+    /// (LR-M3).
+    pub(crate) fn forget_saved_file(
+        &mut self,
+        conv: ConversationId,
+        message_id: &[u8; 16],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE files SET path = NULL WHERE conv = ?1 AND message_id = ?2",
+            params![conv.0, &message_id[..]],
+        )?;
+        self.changed(change(TransferChange::File(conv, *message_id)));
+        Ok(())
+    }
+
     pub(crate) fn set_file_fetched(
         &mut self,
         conv: ConversationId,
@@ -1168,6 +1183,40 @@ impl Store {
             ))?;
             let rows = stmt.query_map(params![account.0], file_row)?;
             Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Saved copies of fetched files to delete (LR-M3): their message was
+    /// deleted (5.4), or the device is no longer in their conversation.
+    /// Conversation, message and path.
+    pub fn saved_files_to_remove(
+        &self,
+        account: AccountId,
+    ) -> Result<Vec<(ConversationId, [u8; 16], String)>, StoreError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT f.conv, f.message_id, f.path FROM files f
+                 JOIN conversations c ON c.id = f.conv
+                 LEFT JOIN messages m ON m.conv = f.conv AND m.message_id = f.message_id
+                 WHERE c.account = ?1 AND f.path IS NOT NULL
+                   AND (m.deleted = 1 OR c.state IN ('left', 'dropped', 'failed'))",
+            )?;
+            let rows = stmt.query_map(params![account.0], |r| {
+                Ok((
+                    ConversationId(r.get(0)?),
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (conv, id, path) = row?;
+                let id: [u8; 16] = id
+                    .try_into()
+                    .map_err(|_| StoreError::Corrupt("a message id".into()))?;
+                out.push((conv, id, path));
+            }
+            Ok(out)
         })
     }
 

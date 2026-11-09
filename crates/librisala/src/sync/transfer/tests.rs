@@ -1019,7 +1019,32 @@ fn files_are_shared_fetched_checked_and_deleted() {
     let info = block_on(net.jobs(b).fetch_file(cb, &id, false)).unwrap();
     assert!(info.on_server);
     assert_eq!(info.media_type.as_deref(), Some("image/png"));
-    assert_eq!(std::fs::read(info.path.unwrap()).unwrap(), photo);
+    let saved = info.path.unwrap();
+    assert_eq!(std::fs::read(&saved).unwrap(), photo);
+    // LR-M3: in the account's private directory, readable by this user
+    // only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&saved), 0o600);
+        assert_eq!(mode(saved.parent().unwrap()), 0o700);
+        // A link planted where the file goes is never followed.
+        let target = net.downloads.path().join("elsewhere");
+        std::fs::write(&target, b"theirs").unwrap();
+        std::fs::remove_file(&saved).unwrap();
+        std::os::unix::fs::symlink(&target, &saved).unwrap();
+        let info = block_on(net.jobs(b).fetch_file(cb, &id, false)).unwrap();
+        assert_eq!(info.path.as_deref(), Some(saved.as_path()));
+        assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
+        assert!(!std::fs::symlink_metadata(&saved).unwrap().file_type().is_symlink());
+        // A directory others may use is refused.
+        let open = net.downloads.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(crate::client::files::private_dir(&open).is_err());
+        assert!(crate::client::files::private_dir(&target).is_err());
+    }
 
     // A file swapped on the server fails the hash, and nothing is saved.
     {
@@ -1047,6 +1072,13 @@ fn files_are_shared_fetched_checked_and_deleted() {
     );
     block_on(net.jobs(a1).delete_files()).unwrap();
     assert!(net.remote.0.lock().unwrap().files.is_empty());
+    // LR-M3: Bob's saved copy goes with the message (5.4).
+    net.jobs(b).remove_saved_files().unwrap();
+    assert!(!saved.exists());
+    assert_eq!(
+        net.devices[b].store.file_row(cb, &id).unwrap().unwrap().path,
+        None
+    );
     let row = net.devices[a1].store.file_row(conv, &id).unwrap().unwrap();
     assert_eq!(row.state, "deleted");
     assert!(

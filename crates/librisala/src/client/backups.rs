@@ -631,6 +631,9 @@ impl Jobs {
 
     /// Everything due, once. Errors are logged; the next run tries again.
     pub(crate) async fn run_due(&self) {
+        if let Err(e) = self.remove_saved_files() {
+            tracing::info!(error = %e, "removing saved files failed");
+        }
         if self.is_guest() {
             return;
         }

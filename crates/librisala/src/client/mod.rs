@@ -94,8 +94,11 @@ pub struct ClientOptions {
     /// [`files::TlsFileHttps`] with `ca_verifier`, or the platform's CA
     /// check (task C4).
     pub file_https: Option<Arc<dyn files::FileHttps>>,
-    /// Where fetched files are saved. `None` uses `risala-files` in the
-    /// system's temporary directory (task C4).
+    /// Where fetched files are saved, decrypted: a directory private to
+    /// this user, with one of the same for each account in it (LR-M3).
+    /// `None` uses `risala-files` beside the cache's file, or, for a cache
+    /// in memory, a new private directory in the system's temporary
+    /// directory. A directory that is not private to this user is refused.
     pub download_dir: Option<std::path::PathBuf>,
     /// For tests that run without key files: the group engine does not
     /// act on the key checks of 12.7 (task R2). Never in a build for use.
@@ -150,6 +153,8 @@ struct Inner {
     events: broadcast::Sender<Event>,
     /// The accounts' running connections and engines (task C2).
     running: driver::Running,
+    /// Where fetched files go, once chosen (LR-M3).
+    downloads: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Client {
@@ -186,6 +191,7 @@ impl Client {
                 options,
                 events,
                 running: driver::Running::default(),
+                downloads: std::sync::OnceLock::new(),
             }),
         }
     }

@@ -63,6 +63,14 @@ impl Client {
     pub async fn remove_account(&self, id: AccountId) -> Result<()> {
         self.disconnect(id).await?;
         self.blocking(move |c| Ok(c.store().remove_account(id)?))
-            .await
+            .await?;
+        // The files it saved go with it (LR-M3).
+        let dir = self.downloads_base().join(id.0.to_string());
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, "could not delete an account's saved files"),
+        }
+        Ok(())
     }
 }

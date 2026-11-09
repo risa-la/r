@@ -616,14 +616,35 @@ impl Jobs {
         })
     }
 
-    /// Writes a fetched file into the download directory, under the
-    /// conversation and message, readable by this user only.
+    /// Writes a fetched file into the account's download directory, under
+    /// the conversation and message, readable by this user only (LR-M3).
     fn save(&self, conv: ConversationId, message: &[u8; 16], plain: &[u8]) -> Result<PathBuf> {
-        std::fs::create_dir_all(&self.downloads).map_err(StoreError::from)?;
+        private_dir(&self.downloads).map_err(StoreError::from)?;
         let name = format!("{}-{}", conv.get(), MessageId(*message));
         let path = self.downloads.join(name);
         write_private(&path, plain).map_err(StoreError::from)?;
         Ok(path)
+    }
+
+    /// Deletes the saved copies of files whose message was deleted (5.4),
+    /// or whose conversation this device is no longer in (LR-M3).
+    pub(crate) fn remove_saved_files(&self) -> Result<()> {
+        for (conv, message, path) in self.store.saved_files_to_remove(self.account)? {
+            let path = PathBuf::from(path);
+            // Only what this area saved, in the account's directory.
+            if path.parent() == Some(self.downloads.as_path()) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::info!(error = %e, "could not delete a saved file; will retry");
+                        continue;
+                    }
+                }
+            }
+            self.write(|tx| Ok(tx.forget_saved_file(conv, &message)?))?;
+        }
+        Ok(())
     }
 
     /// Deletes, with their `del` URLs, the files this device shared whose
@@ -656,11 +677,20 @@ pub(crate) fn on_origins(origins: &[String], url: &FileUrl) -> bool {
         .any(|o| o.contains(url))
 }
 
-/// Writes `bytes` to a new file at `path`, mode 0600 on Unix.
+/// Writes `bytes` to a new file at `path`, mode 0600 on Unix. Whatever is
+/// at `path` already, a file saved before or a link someone planted, is
+/// removed first, never followed: the file is created anew, with
+/// `O_CREAT | O_EXCL`, which fails rather than follow a link put in its
+/// place meanwhile (LR-M3).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -671,7 +701,85 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// Makes `dir` a directory private to this user, mode 0700, with its
+/// parent if that is missing; or checks that it is one: a directory, not a
+/// link, owned by this user, that nobody else may use (LR-M3).
+pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                private_dir(parent)?;
+            }
+            match builder.create(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    let refuse = |why: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{}: {why}", dir.display()),
+        ))
+    };
+    if !meta.file_type().is_dir() {
+        return refuse("not a directory of its own");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.mode() & 0o077 != 0 {
+            return refuse("others may use it");
+        }
+        // The process's own user, where the system tells it without
+        // unsafe code. Elsewhere, a directory of another user's with mode
+        // 0700 lets this one write nothing in it anyway.
+        #[cfg(target_os = "linux")]
+        if let Ok(me) = std::fs::metadata("/proc/self")
+            && meta.uid() != me.uid()
+        {
+            return refuse("owned by another user");
+        }
+    }
+    Ok(())
+}
+
 impl Client {
+    /// Where fetched files go, for every account (LR-M3): the options'
+    /// directory, or `risala-files` beside the cache's file, or for a cache
+    /// in memory a new directory in the system's temporary directory, with
+    /// a random name. Each account has a directory of its own in it, made
+    /// private when a file is saved.
+    pub(crate) fn downloads_base(&self) -> PathBuf {
+        self.inner
+            .downloads
+            .get_or_init(|| {
+                if let Some(dir) = &self.options().download_dir {
+                    return dir.clone();
+                }
+                if let Some(cache) = self.store().path()
+                    && let Some(parent) = cache.parent()
+                {
+                    return parent.join("risala-files");
+                }
+                let name: [u8; 16] = risala_mls::primitives::random().unwrap_or([0; 16]);
+                let hex: String = name.iter().map(|b| format!("{b:02x}")).collect();
+                std::env::temp_dir().join(format!("risala-files-{hex}"))
+            })
+            .clone()
+    }
+
     /// The HTTPS client for files and blobs: the options' or one with the
     /// options' CA check, else the platform's.
     pub(crate) fn file_https(&self) -> Arc<dyn FileHttps> {
@@ -703,11 +811,7 @@ impl Client {
             clock: self.options().clock.clone(),
             keys: self.options().keys.clone(),
             events: self.inner.events.clone(),
-            downloads: self
-                .options()
-                .download_dir
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join("risala-files")),
+            downloads: self.downloads_base().join(account.0.to_string()),
             max_blob: ARCHIVE_BLOB,
         })
     }

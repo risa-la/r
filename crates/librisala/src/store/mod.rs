@@ -164,6 +164,8 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
     /// The connection for reads, on a file. In memory, reads use `conn`.
     reader: Option<Arc<Mutex<Connection>>>,
+    /// The file, if the cache is on one.
+    path: Option<std::path::PathBuf>,
 }
 
 impl fmt::Debug for Store {
@@ -197,7 +199,13 @@ impl Store {
         reader.pragma_update(None, "query_only", "ON")?;
         reader.pragma_update(None, "foreign_keys", "ON")?;
         store.reader = Some(Arc::new(Mutex::new(reader)));
+        store.path = Some(path.to_path_buf());
         Ok(store)
+    }
+
+    /// The cache's file, if it is on one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Copies the WAL into the cache and truncates it to nothing, so that
@@ -235,6 +243,7 @@ impl Store {
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
             reader: None,
+            path: None,
         })
     }
 
