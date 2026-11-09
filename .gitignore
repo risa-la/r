@@ -63,8 +63,8 @@ xcuserdata/
 *~
 .DS_Store
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code: local settings and worktrees
+.claude/
 
 # Site (Astro)
 site/node_modules/
