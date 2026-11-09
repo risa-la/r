@@ -94,8 +94,16 @@ test("section citations", () => {
   assert.deepEqual(sectionsInComment("see Section 2.2 for the verifier"), ["2.2"]);
   assert.deepEqual(sectionsInComment("(7.1 step 3)"), ["7.1"]);
   assert.deepEqual(sectionsInComment("rust (MSRV) is 1.95, x.y (not)"), []);
+  assert.deepEqual(sectionsInComment("keepalive (11), the port is 7472 (15)"), ["11", "15"]);
+  assert.deepEqual(sectionsInComment("an entry's type (SPEC 4.5, 15)"), ["4.5", "15"]);
+  assert.deepEqual(sectionsInComment("may not send it (Section 13), and Section 14"), ["13", "14"]);
+  assert.deepEqual(sectionsInComment("by up to an hour (12.10, D.4)"), ["12.10", "D.4"]);
+  assert.deepEqual(sectionsInComment("a length (2 bytes), a pair (0, 1)"), ["0", "1"]);
+  assert.deepEqual(sectionsInComment("RFC 9420 Section 12.4.3.2, (2.1.3)"), []);
   assert.deepEqual(expandSections(["3.1-3.3", "12.11"]), ["3.1", "3.2", "3.3", "12.11"]);
   assert.deepEqual(expandSections(["6.1-7.3"]), ["6.1", "7.3"]);
+  assert.deepEqual(sectionsInComment("test vectors (B.1 to B.3), and (3.1 – 3.2)"), ["B.1-B.3", "3.1-3.2"]);
+  assert.deepEqual(expandSections(["B.1-B.3"]), ["B.1", "B.2", "B.3"]);
   assert.deepEqual(citationsIn(["a", "// b (4.5)", 'c("(9.9)")'], 10), [{ line: 12, sections: ["4.5"] }]);
 });
 

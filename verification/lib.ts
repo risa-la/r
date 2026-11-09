@@ -140,29 +140,37 @@ export function commentOf(line: string): string | undefined {
   return block ? block[1] : undefined;
 }
 
-const SECTION = String.raw`\d{1,2}\.\d{1,2}(?:\s*[-–]\s*\d{1,2}\.\d{1,2})?`;
+// A section number: 7.1, an appendix's D.4, or a whole section such as 13
+// that has no subsections. Never part of a longer number, such as an RFC's
+// 2.1.3.
+const NUM = String.raw`(?:\d{1,2}(?:\.\d{1,2})?|[A-Z]\.\d{1,2})(?!\.?\d)`;
+const SECTION = String.raw`${NUM}(?:\s*(?:[-–]|to)\s*${NUM})?`;
 
 /**
  * The spec sections a comment cites: groups in parentheses made of
  * section numbers, such as "(7.1)", "(5.6, 12.11)" or "(SPEC 3.1-3.3)", and
- * "Section 2.2" or "SPEC 4.5" anywhere. Ranges are kept as written.
+ * "Section 2.2" or "SPEC 4.5" anywhere. Ranges are kept as written. Whole
+ * numbers, such as "(11)" or "(4.5, 15)", are returned too; a group of
+ * whole numbers alone counts only when nothing else is in its parentheses,
+ * so "(2 bytes)" cites nothing. The caller keeps the numbers the spec has.
  */
 export function sectionsInComment(comment: string): string[] {
   const found: string[] = [];
-  const group = new RegExp(String.raw`\(\s*(?:SPEC\s+|spec\s+|[Ss]ections?\s+|§\s*)?(${SECTION}(?:\s*(?:,|and)\s*(?:${SECTION}))*)\b[^()]*\)`, "g");
+  const group = new RegExp(String.raw`\(\s*(SPEC\s+|spec\s+|[Ss]ections?\s+|§\s*)?(${SECTION}(?:\s*(?:,|and)\s*(?:${SECTION}))*)\b([^()]*)\)`, "g");
   for (const m of comment.matchAll(group)) {
-    for (const s of m[1].matchAll(new RegExp(SECTION, "g"))) found.push(s[0].replace(/\s+/g, ""));
+    if (!m[1] && !m[2].includes(".") && m[3].trim()) continue;
+    for (const s of m[2].matchAll(new RegExp(SECTION, "g"))) found.push(s[0].replace(/\s*(?:[-–]|to)\s*/, "-"));
   }
   const named = new RegExp(String.raw`(?:SPEC|[Ss]ection|§)\s*(${SECTION})`, "g");
-  for (const m of comment.matchAll(named)) found.push(m[1].replace(/\s+/g, ""));
+  for (const m of comment.matchAll(named)) found.push(m[1].replace(/\s*(?:[-–]|to)\s*/, "-"));
   return [...new Set(found)];
 }
 
-/** Ranges such as 3.1-3.3 become 3.1, 3.2, 3.3. */
+/** Ranges such as 3.1-3.3, or B.1-B.3, become 3.1, 3.2, 3.3. */
 export function expandSections(sections: string[]): string[] {
   const out = new Set<string>();
   for (const s of sections) {
-    const m = s.match(/^(\d+)\.(\d+)[-–](\d+)\.(\d+)$/);
+    const m = s.match(/^(\d+|[A-Z])\.(\d+)-(\d+|[A-Z])\.(\d+)$/);
     if (m && m[1] === m[3] && Number(m[4]) >= Number(m[2]) && Number(m[4]) - Number(m[2]) < 30) {
       for (let k = Number(m[2]); k <= Number(m[4]); k++) out.add(`${m[1]}.${k}`);
     } else if (m) {

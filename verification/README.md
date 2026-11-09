@@ -57,8 +57,11 @@ Each one shows less than it may seem to.
   found.
 - **Spec sections.** The spec view shows only the latest spec, in
   `spec/`. A comment in the code that names a section, such as `(7.1)`,
-  is read as that spec's section, and so are the sections in a Kani
-  proof's doc comment. The code still cites draft-02's numbers; it moves
+  `(12.10, D.4)`, `(B.1 to B.10)` or `Section 13`, is read as that spec's
+  section, and so are the sections in a Kani proof's doc comment. A whole
+  number counts only for a section with no subsections, such as `(11)`,
+  and a group of whole numbers alone only when nothing else is in its
+  parentheses, so `(2 bytes)` cites nothing. The code still cites draft-02's numbers; it moves
   to draft-03 before this page is published. A TLA+ model of another
   draft is not placed under its sections, since they are numbered
   differently: `proofs/sync` models draft-02.

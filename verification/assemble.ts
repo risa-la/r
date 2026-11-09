@@ -437,13 +437,17 @@ function specText(): string {
 const specMd = specText();
 const sections = specSections(specMd);
 const sectionIds = new Set(sections.map((s) => s.num));
+// A whole number cites a section only when it has no subsections, as 13
+// does: "(1)" in a comment is more often a count than chapter 1.
+const citable = (x: string) =>
+  sectionIds.has(x) && (x.includes(".") || !sections.some((s) => s.num.startsWith(`${x}.`)));
 
 // A proof's doc may name a section without parentheses ("the set of 2.3").
 // Bare numbers count there, if they are sections of the spec.
 for (const h of harnesses) {
   const bare = [...h.doc.matchAll(/(?<![\d.])\d{1,2}\.\d{1,2}(?![\d.]\d)/g)].map((m) => m[0]);
   const all = expandSections([...h.sections, ...bare]);
-  h.sections = all.filter((x) => sectionIds.has(x));
+  h.sections = all.filter(citable);
 }
 
 // Every citation of a section in a comment, in non-test and test code.
@@ -458,7 +462,7 @@ for (const f of sources.values()) {
   if (f.lang !== "rust") continue;
   for (const c of citationsIn(f.lines)) {
     for (const section of expandSections(c.sections)) {
-      if (!sectionIds.has(section)) continue;
+      if (!citable(section)) continue;
       citations.push({ section, path: f.path, line: c.line, test: isTestLine(f, c.line) });
     }
   }
