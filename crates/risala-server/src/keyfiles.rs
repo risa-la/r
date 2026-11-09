@@ -244,6 +244,8 @@ struct MemoryState {
     logs: HashMap<String, LogServer>,
     /// Key logs whose fetches fail, by URL prefix.
     failing_logs: Vec<String>,
+    /// Key logs whose fetches wait to be let through, by URL prefix.
+    held_logs: HashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 /// A [`KeyFetcher`] with key files and key logs in memory, for tests. It
@@ -350,6 +352,16 @@ impl MemoryFetcher {
     pub fn fail_log(&self, url: &str) {
         self.state().failing_logs.push(url.to_owned());
     }
+
+    /// Each fetch from the key log at the URL prefix `url` waits until the
+    /// returned [`Notify`](tokio::sync::Notify) is notified once for it.
+    pub fn hold_log(&self, url: &str) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.state()
+            .held_logs
+            .insert(url.to_owned(), notify.clone());
+        notify
+    }
 }
 
 impl KeyFetcher for MemoryFetcher {
@@ -387,6 +399,15 @@ impl KeyFetcher for MemoryFetcher {
     }
 
     async fn fetch_log(&self, url: &str) -> Result<UrlBody, FetchError> {
+        let held = self
+            .state()
+            .held_logs
+            .iter()
+            .find(|(prefix, _)| url.starts_with(prefix.as_str()))
+            .map(|(_, notify)| notify.clone());
+        if let Some(notify) = held {
+            notify.notified().await;
+        }
         let state = self.state();
         let found = state.logs.iter().find_map(|(prefix, serve)| {
             Some((

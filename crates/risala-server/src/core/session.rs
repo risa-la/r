@@ -26,6 +26,7 @@ use risala_proto::names::{Id, Name, Uid};
 use risala_proto::server::{Greeting, Host, OkResponse, ServerMessage};
 
 use super::command::{Cx, Reply, err};
+use super::rate::network;
 use super::state::{ConnEntry, GuestSession, Who};
 use super::{Inner, admin, identity, keylog, keys, mailbox, misc};
 use crate::handler::{ConnHandle, ConnId, ConnInfo};
@@ -287,6 +288,21 @@ pub(super) async fn guest(cx: &Cx, name: &Name, token: Option<&GuestToken>) -> R
         Some(_) => return Err(err(ErrorCode::NameTaken)),
         // A token that matches no session is ignored (4.2).
         None => {
+            // So many sessions per network address, those waiting to be
+            // resumed included, since each holds a name and outlives its
+            // connection (4.2).
+            let max = cx.inner.config.limits.guests_per_address;
+            let net = network(ip);
+            if max > 0
+                && reg
+                    .sessions
+                    .values()
+                    .filter(|s| network(s.address) == net)
+                    .count()
+                    >= max
+            {
+                return Err(err(ErrorCode::RateLimited).with_retry(60));
+            }
             reg.sessions.insert(
                 uid.clone(),
                 GuestSession {

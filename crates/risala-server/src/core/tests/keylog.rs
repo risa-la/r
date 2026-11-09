@@ -120,12 +120,16 @@ fn log1_key_file() -> String {
 /// `chat.example.org` from a [`MemoryFetcher`] that serves it, to enrol it
 /// (4.10).
 fn witness_hub(clock: &Arc<ManualClock>) -> Hub {
+    witness_hub_with(clock, Arc::new(MemoryFetcher::new()))
+}
+
+/// [`witness_hub`], fetching with `fetcher`.
+fn witness_hub_with(clock: &Arc<ManualClock>, fetcher: Arc<MemoryFetcher>) -> Hub {
     let mut c = config();
     c.hostname = "witness-b.test".into();
     c.witness.enabled = true;
     let store = SqliteStore::open_in_memory().unwrap();
     store.witness_seed(HUB_W_SEED, T.parse().unwrap()).unwrap();
-    let fetcher = MemoryFetcher::new();
     let file = log1_key_file();
     fetcher.serve_log(&format!("https://{}", origin(1)), move |path| {
         (path == "risala/key").then(|| file.clone().into_bytes())
@@ -135,7 +139,7 @@ fn witness_hub(clock: &Arc<ManualClock>) -> Hub {
         Arc::new(store),
         clock.clone(),
         timers(),
-        KeyServices::shared(Arc::new(fetcher), Arc::new(NoPublisher)),
+        KeyServices::shared(fetcher, Arc::new(NoPublisher)),
     )
     .unwrap()
 }
@@ -806,6 +810,73 @@ async fn the_witness_answers_by_the_rules() {
             .await,
         None
     );
+}
+
+/// The witness fetches a new host's key without holding the lock every
+/// cosignature needs, so a slow host holds up no other log; and it
+/// fetches each origin's key at most once a minute (4.10).
+#[tokio::test]
+async fn the_witness_fetches_new_keys_outside_its_lock() {
+    let clock = Arc::new(ManualClock::new(T.parse().unwrap()));
+    let fetcher = Arc::new(MemoryFetcher::new());
+    let witness = witness_hub_with(&clock, fetcher.clone());
+    let ask = |body: Vec<u8>| {
+        let w = witness.clone();
+        async move {
+            w.witness_request("/risala-witness/add-checkpoint", body)
+                .await
+                .unwrap()
+                .status
+        }
+    };
+    // Log 1 of chat.example.org enrols.
+    let mut log = risala_keylog::testlog::MemoryLog::new(&origin(1).parse().unwrap(), &LOG_SEED);
+    let enrol = AddCheckpoint {
+        old_size: 0,
+        proof: vec![],
+        checkpoint: log.checkpoint(now(&witness)),
+    };
+    assert_eq!(ask(enrol.to_body().into_bytes()).await, 200);
+    clock.advance(Duration::from_secs(11));
+    log.append(b"x");
+    let wrong = AddCheckpoint {
+        old_size: 1,
+        proof: vec![],
+        checkpoint: log.checkpoint(now(&witness)),
+    }
+    .to_body()
+    .into_bytes();
+    // A slow host's first log.
+    let slow = Cosigner::from_seed("slow.example/risala-log/1", &[3; 32]).unwrap();
+    let cp = risala_keylog::Checkpoint::new(slow.name(), 0, risala_keylog::merkle::empty_root())
+        .unwrap();
+    let mut sc = risala_keylog::SignedCheckpoint::unsigned(cp);
+    sc.push_signature(slow.cosign(sc.checkpoint(), now(&witness), [0; 32]))
+        .unwrap();
+    let slow_body = AddCheckpoint {
+        old_size: 0,
+        proof: vec![],
+        checkpoint: sc,
+    }
+    .to_body()
+    .into_bytes();
+    fetcher.serve_log("https://slow.example/risala-log/1", |_| None);
+    let held = fetcher.hold_log("https://slow.example/risala-log/1");
+    let both = async {
+        tokio::join!(ask(slow_body.clone()), async {
+            // Meanwhile another log is answered, and the same origin again
+            // gets 503 at once rather than a second fetch.
+            let answers = (ask(wrong.clone()).await, ask(slow_body.clone()).await);
+            held.notify_one();
+            answers
+        })
+    };
+    let (slow_answer, (other, again)) = tokio::time::timeout(Duration::from_secs(10), both)
+        .await
+        .expect("the witness held its lock across a key fetch");
+    assert_eq!((other, again), (409, 503));
+    // The slow host serves no key file: 503, and its log tries again.
+    assert_eq!(slow_answer, 503);
 }
 
 #[test]

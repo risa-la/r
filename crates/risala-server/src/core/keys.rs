@@ -201,14 +201,36 @@ impl Hub {
 #[derive(Debug)]
 pub(crate) struct ByteWindow<K> {
     window: Duration,
-    taken: Mutex<HashMap<K, VecDeque<(Timestamp, u64)>>>,
+    taken: Mutex<ByteTaken<K>>,
+}
+
+/// What each key of a [`ByteWindow`] took, with its running sum. Only the
+/// key in hand is pruned at each call, and every key now and then.
+#[derive(Debug)]
+struct ByteTaken<K> {
+    keys: HashMap<K, (VecDeque<(Timestamp, u64)>, u64)>,
+    calls: u64,
 }
 
 impl<K: Eq + Hash + Clone> ByteWindow<K> {
     pub(crate) fn new(window: Duration) -> ByteWindow<K> {
         ByteWindow {
             window,
-            taken: Mutex::new(HashMap::new()),
+            taken: Mutex::new(ByteTaken {
+                keys: HashMap::new(),
+                calls: 0,
+            }),
+        }
+    }
+
+    /// Drops what left the window from `taken`, and from its sum.
+    fn prune(&self, taken: &mut (VecDeque<(Timestamp, u64)>, u64), now: Timestamp) {
+        while let Some((t, n)) = taken.0.front().copied() {
+            if now.saturating_duration_since(t) < self.window {
+                break;
+            }
+            taken.0.pop_front();
+            taken.1 = taken.1.saturating_sub(n);
         }
     }
 
@@ -220,22 +242,21 @@ impl<K: Eq + Hash + Clone> ByteWindow<K> {
             return Ok(());
         }
         let mut all = self.taken.lock().unwrap_or_else(|e| e.into_inner());
-        all.retain(|_, taken| {
-            while taken
-                .front()
-                .is_some_and(|(t, _)| now.saturating_duration_since(*t) >= self.window)
-            {
-                taken.pop_front();
-            }
-            !taken.is_empty()
-        });
-        let taken = all.entry(key).or_default();
-        let used: u64 = taken.iter().map(|(_, n)| n).sum();
+        all.calls += 1;
+        if all.calls.is_multiple_of(super::rate::SWEEP_EVERY) {
+            all.keys.retain(|_, taken| {
+                self.prune(taken, now);
+                !taken.0.is_empty()
+            });
+        }
+        let taken = all.keys.entry(key).or_default();
+        self.prune(taken, now);
+        let used = taken.1;
         if used.saturating_add(bytes) > max {
             // Wait until enough of the oldest has left the window.
             let mut left = used.saturating_add(bytes).saturating_sub(max);
             let mut until = now;
-            for (t, n) in taken.iter() {
+            for (t, n) in taken.0.iter() {
                 until = *t;
                 left = left.saturating_sub(*n);
                 if left == 0 {
@@ -245,7 +266,8 @@ impl<K: Eq + Hash + Clone> ByteWindow<K> {
             let waited = now.saturating_duration_since(until);
             return Err(self.window.saturating_sub(waited).as_secs().max(1));
         }
-        taken.push_back((now, bytes));
+        taken.0.push_back((now, bytes));
+        taken.1 = used.saturating_add(bytes);
         Ok(())
     }
 }

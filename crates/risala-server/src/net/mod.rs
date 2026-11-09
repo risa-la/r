@@ -22,7 +22,7 @@ mod tests;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,9 +41,8 @@ pub use tls::Certificates;
 
 /// The most connections open at once, counting those still in their TLS
 /// handshake. Connections over the limit are closed as soon as they are
-/// accepted.
-///
-/// This is one global cap for now. Limits per address come in M9.
+/// accepted. Each network address also has its own cap,
+/// `limits.connections_per_address` (4.2).
 pub const MAX_CONNECTIONS: usize = 10_000;
 
 /// How long a client has to finish the TLS handshake.
@@ -88,6 +87,9 @@ pub struct Server<H> {
     room: CommandRoom,
     handshake_timeout: Duration,
     max_connections: usize,
+    /// The most connections one network address may have open; 0 for no
+    /// limit.
+    pub(crate) per_address: usize,
 }
 
 impl<H> std::fmt::Debug for Server<H> {
@@ -141,6 +143,7 @@ impl<H: Handler> Server<H> {
             },
             handshake_timeout: HANDSHAKE_TIMEOUT,
             max_connections: MAX_CONNECTIONS,
+            per_address: config.limits.connections_per_address,
         })
     }
 
@@ -189,6 +192,8 @@ impl<H: Handler> Server<H> {
             handshake_timeout: self.handshake_timeout,
             permits: Arc::new(Semaphore::new(self.max_connections)),
             max_connections: self.max_connections,
+            per_address: self.per_address,
+            addresses: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             registry: Mutex::new(Registry::default()),
             stop: stop_rx,
@@ -251,6 +256,9 @@ struct Shared<H> {
     handshake_timeout: Duration,
     permits: Arc<Semaphore>,
     max_connections: usize,
+    /// The most connections per network address, and how many each has.
+    per_address: usize,
+    addresses: Mutex<HashMap<IpAddr, usize>>,
     next_id: AtomicU64,
     registry: Mutex<Registry>,
     stop: watch::Receiver<bool>,
@@ -286,18 +294,74 @@ async fn accept_loop<H: Handler>(listener: TcpListener, shared: Arc<Shared<H>>) 
             tracing::warn!("too many connections, closing a new one");
             continue;
         };
+        let Some(slot) = AddressSlot::take(&shared, peer.ip()) else {
+            tracing::debug!(
+                target: ADDRESSES,
+                %peer,
+                "too many connections from one address"
+            );
+            continue;
+        };
         let _ = tcp.set_nodelay(true);
-        tokio::spawn(connection(shared.clone(), tcp, peer, permit));
+        tokio::spawn(connection(shared.clone(), tcp, peer, (permit, slot)));
     }
 }
 
-/// One connection, from TCP accept to close. Holds its permit until the
-/// end.
+/// The `tracing` target of events that name a network address, so that
+/// they can be turned on apart from the rest (4.2: addresses are not
+/// logged by default).
+pub const ADDRESSES: &str = "risala_server::addresses";
+
+/// One of a network address's connections, counted until dropped.
+struct AddressSlot<H> {
+    shared: Arc<Shared<H>>,
+    key: IpAddr,
+}
+
+impl<H> AddressSlot<H> {
+    /// Counts a connection from `peer`, unless its network has its fill
+    /// (4.2). IPv6 addresses count by their /64.
+    fn take(shared: &Arc<Shared<H>>, peer: IpAddr) -> Option<AddressSlot<H>> {
+        let key = crate::core::rate::network(peer);
+        let mut counts = shared.addresses.lock().unwrap_or_else(|e| e.into_inner());
+        let n = counts.entry(key).or_default();
+        if shared.per_address > 0 && *n >= shared.per_address {
+            if *n == 0 {
+                counts.remove(&key);
+            }
+            return None;
+        }
+        *n += 1;
+        Some(AddressSlot {
+            shared: shared.clone(),
+            key,
+        })
+    }
+}
+
+impl<H> Drop for AddressSlot<H> {
+    fn drop(&mut self) {
+        let mut counts = self
+            .shared
+            .addresses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = counts.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// One connection, from TCP accept to close. Holds its permit and its
+/// address's slot until the end.
 async fn connection<H: Handler>(
     shared: Arc<Shared<H>>,
     tcp: TcpStream,
     peer: SocketAddr,
-    _permit: OwnedSemaphorePermit,
+    _held: (OwnedSemaphorePermit, AddressSlot<H>),
 ) {
     let mut stop = shared.stop.clone();
     let handshake = tokio::time::timeout(shared.handshake_timeout, shared.acceptor.accept(tcp));
@@ -307,12 +371,12 @@ async fn connection<H: Handler>(
             Ok(Err(e)) => {
                 match tls::handshake_failure(&e) {
                     Some(reason) => tracing::info!(reason, "TLS handshake refused"),
-                    None => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
+                    None => tracing::debug!(target: ADDRESSES, %peer, error = %e, "TLS handshake failed"),
                 }
                 return;
             }
             Err(_) => {
-                tracing::debug!(%peer, "TLS handshake timed out");
+                tracing::debug!(target: ADDRESSES, %peer, "TLS handshake timed out");
                 return;
             }
         },
@@ -333,7 +397,8 @@ async fn connection<H: Handler>(
         }
         registry.conns.insert(id, handle.clone());
     }
-    tracing::debug!(conn = id.0, %peer, ?sni, ?alpn, "connected");
+    tracing::debug!(target: ADDRESSES, conn = id.0, %peer, "connected");
+    tracing::debug!(conn = id.0, ?sni, ?alpn, "connected");
 
     let sni_certified = sni.as_deref().is_some_and(|name| shared.certs.serves(name));
     let info = ConnInfo {

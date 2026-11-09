@@ -31,7 +31,10 @@
 //! fetches their key files for real: it trusts the key server's test CA
 //! through `[keys] extra_roots`, may fetch from `127.0.0.1` through
 //! `[keys] allow_private`, and sends each domain to its listener with a
-//! test resolver. [`TestServer::auth`] sends AUTH (4.6) for one.
+//! test resolver. [`TestServer::auth`] sends AUTH (4.6) for one. The
+//! resolver also sends the server's own hostname to its own HTTPS
+//! listener, when `http.listen` names a port, so that a witness can fetch
+//! its own log's key (4.10).
 //!
 //! Their chains name a log of their own domain, which nothing serves, so
 //! their key files list every record unlogged (4.4).
@@ -330,6 +333,10 @@ impl TestServerBuilder {
 /// publishing into its `key_dir`: `[keys]` as configured, with the key
 /// server's resolver, and no limit on refetching (see the [module
 /// documentation](self)).
+///
+/// The resolver also sends the server's own hostname to its own HTTPS
+/// listener, when `http.listen` names a port, so that its witness can
+/// fetch the key of its own log as it would another host's (4.10).
 async fn key_services(config: &Config, keys: &TestKeyServer) -> KeyServices {
     let keys_config = config.keys.clone();
     let mut options =
@@ -337,7 +344,17 @@ async fn key_services(config: &Config, keys: &TestKeyServer) -> KeyServices {
             .await
             .expect("reading [keys]")
             .expect("reading the test CA");
-    options.resolver = std::sync::Arc::new(keys.resolver());
+    let mut resolver = keys.resolver();
+    if let Some(listen) = config.http.listen.first().filter(|a| a.port() != 0)
+        && !keys.serves(&config.hostname)
+    {
+        let mut own = *listen;
+        if own.ip().is_unspecified() {
+            own.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+        }
+        resolver.insert(&config.hostname, [own]);
+    }
+    options.resolver = std::sync::Arc::new(resolver);
     options.min_refetch = Duration::ZERO;
     let fetcher = HttpsKeyFetcher(risala_keyfetch::KeyFetcher::new(options));
     KeyServices::shared(

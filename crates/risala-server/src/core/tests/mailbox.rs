@@ -2117,16 +2117,14 @@ async fn blob_posts_are_read_only_to_their_framing() {
     h.send(&anon, &format!("POST {} {token} {junk}", d.m)).await;
     assert!(anon.lines()[0].starts_with("ERR invalid"));
     // A wrong token: refused, but the slot is used up all the same.
-    let wrong = d.bob.token(&d.b).replace('A', "B");
-    let wrong = if wrong == token {
-        token.replace('B', "C")
-    } else {
-        wrong
-    };
+    let wrong = risala_proto::mls::SendToken::from_bytes([9; 32]).to_string();
+    assert_ne!(wrong, token);
     h.send(&anon, &format!("POST {} {wrong} {blob}", d.m)).await;
-    assert!(anon.lines()[0].starts_with("ERR"));
+    let lines = anon.lines();
+    assert!(lines[0].starts_with("ERR"), "{lines:?}");
     h.send(&anon, &format!("POST {} {token} {blob}", d.m)).await;
-    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+    let lines = anon.lines();
+    assert!(lines[0].ends_with("ERR rate-limited"), "{lines:?}");
 }
 
 /// The framing of a PrivateMessage in a blob, from its first bytes: the

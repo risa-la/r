@@ -99,10 +99,16 @@ fn main() -> ExitCode {
         }
     };
 
+    // Events that name network addresses stay off unless their target is
+    // named on its own (4.2: addresses are not logged by default), even
+    // with `RUST_LOG=debug`.
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let named = std::env::var("RUST_LOG").is_ok_and(|v| v.contains(risala_server::net::ADDRESSES));
+    if !named && let Ok(off) = format!("{}=off", risala_server::net::ADDRESSES).parse() {
+        filter = filter.add_directive(off);
+    }
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         // No colour codes in files or the journal.
         .with_ansi(std::io::stderr().is_terminal())

@@ -15,7 +15,10 @@
 //! its way gets one, after a random delay of its own of up to
 //! `push_delay`, and no sooner than `push_interval` after the last push to
 //! the subscription or to its URL. Posts that arrive meanwhile go into
-//! that push.
+//! that push. Each host gets at most `push.per_host_per_second` pushes a
+//! second, whatever their paths, and at most `push.max_in_flight` pushes
+//! are on their way at once, so that subscriptions cannot point the server
+//! at a host to flood it (9.1).
 //!
 //! Before it sends, the server checks whether the device is reading:
 //!
@@ -36,8 +39,11 @@
 //! sends the next one when the next post arrives.
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
 
 use risala_proto::command::{MailboxPermit, PushCommand};
 use risala_proto::error::ErrorCode;
@@ -49,6 +55,7 @@ use tokio::time::Instant;
 
 use super::super::Inner;
 use super::super::command::{Cx, Reply, err};
+use super::super::rate::{WindowLimit, network};
 use super::super::state::Who;
 use crate::config::Config;
 use crate::handler::ConnId;
@@ -79,6 +86,22 @@ const PRIVATE_GROUP_LEAVES: usize = 4_096;
 pub(crate) struct State {
     transport: RwLock<Arc<dyn PushTransport>>,
     timing: Mutex<Timing>,
+    /// Pushes on their way, for everyone (`push.max_in_flight`).
+    in_flight: Arc<Semaphore>,
+    /// Mailbox subscriptions added per network address in the last hour
+    /// (`push.adds_per_hour`).
+    adds: WindowLimit<IpAddr>,
+}
+
+/// The window of the limit on pushes per host.
+const HOST_WINDOW: Duration = Duration::from_secs(1);
+
+/// The host and port of a push URL, `https://<host>[:<port>]/...`, in lower
+/// case: pushes to it count together, whatever their paths (9.1).
+fn url_host(url: &str) -> String {
+    let rest = url.strip_prefix("https://").unwrap_or(url);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    rest[..end].to_ascii_lowercase()
 }
 
 /// What the pusher remembers between pushes.
@@ -88,6 +111,9 @@ struct Timing {
     subs: HashMap<i64, SubTiming>,
     /// When each URL last got a push (9.2: one every 10 seconds).
     urls: HashMap<String, Instant>,
+    /// For each host, when its current second began and how many pushes
+    /// it has had in it (9.1).
+    hosts: HashMap<String, (Instant, u32)>,
     /// How many mailbox subscriptions each connection added (9.1).
     added: HashMap<ConnId, usize>,
     /// The connections that follow each mailbox with each `quiet` tag
@@ -121,6 +147,8 @@ impl State {
         State {
             transport: RwLock::new(transport),
             timing: Mutex::default(),
+            in_flight: Arc::new(Semaphore::new(config.push.max_in_flight.max(1))),
+            adds: WindowLimit::new(Duration::from_secs(60 * 60)),
         }
     }
 
@@ -179,10 +207,13 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
                         PRIVATE_GROUP_LEAVES
                     };
                     let retention = cx.inner.settings().retention;
+                    // To the day, up: the time it was made or renewed is
+                    // not kept more finely (4.2).
                     let expires = cx
                         .inner
                         .now()
-                        .checked_add(Duration::from_secs(u64::from(retention.days()) * 86_400));
+                        .checked_add(Duration::from_secs(u64::from(retention.days()) * 86_400))
+                        .map(end_of_day);
                     (
                         PushTarget::Mailbox(mailbox),
                         cx.inner.config.push.max_per_mailbox.max(least),
@@ -211,6 +242,21 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
                     return Err(err(ErrorCode::RateLimited));
                 }
             }
+            // So many mailbox subscriptions per network address an hour.
+            let slot = if is_mailbox {
+                cx.inner
+                    .misc
+                    .push
+                    .adds
+                    .take(
+                        network(cx.peer.ip()),
+                        cx.inner.config.push.adds_per_hour,
+                        cx.inner.now(),
+                    )
+                    .map_err(|retry| err(ErrorCode::RateLimited).with_retry(retry))?
+            } else {
+                None
+            };
             let sub = NewPushSubscription {
                 target,
                 url,
@@ -222,6 +268,11 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
             match cx.db(move |store| store.add_push(&sub, max)).await? {
                 PushAdded::TooMany => Err(err(ErrorCode::RateLimited)),
                 added => {
+                    if added == PushAdded::Added
+                        && let Some(slot) = slot
+                    {
+                        slot.keep();
+                    }
                     if is_mailbox && added == PushAdded::Added {
                         *cx.inner
                             .misc
@@ -439,6 +490,14 @@ pub(crate) async fn mailbox_dropped(inner: &Inner, mailbox: BoxName) {
 // ---------------------------------------------------------------------------
 // Sending
 
+/// The end of the day (UTC) `t` is in, or `t` if it is the start of one.
+fn end_of_day(t: risala_proto::time::Timestamp) -> risala_proto::time::Timestamp {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let ms = t.unix_millis().div_ceil(DAY).saturating_mul(DAY);
+    risala_proto::time::Timestamp::from_unix_millis(ms)
+        .unwrap_or(risala_proto::time::Timestamp::MAX)
+}
+
 /// A random delay of up to `max`.
 fn random_delay(max: Duration) -> Duration {
     let ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
@@ -514,15 +573,24 @@ async fn deliver(inner: &Arc<Inner>, id: i64, reason: PushReason) -> Option<Dura
     // One push every push_interval to each URL, whichever subscriptions it
     // belongs to: wait for the URL, check that the device is not reading,
     // then take the URL's turn, unless another push took it meanwhile.
+    let host = url_host(sub.url.as_str());
+    let per_host = inner.config.push.per_host_per_second.max(1);
+    // When the URL's or its host's next turn is, if not now.
+    let turn = |timing: &Timing, now: Instant| {
+        let url = timing
+            .urls
+            .get(sub.url.as_str())
+            .map(|last| *last + inner.timers.push_interval)
+            .filter(|at| *at > now);
+        let host = timing
+            .hosts
+            .get(&host)
+            .filter(|(start, n)| *start + HOST_WINDOW > now && *n >= per_host)
+            .map(|(start, _)| *start + HOST_WINDOW);
+        url.max(host)
+    };
     loop {
-        let wait = {
-            let timing = inner.misc.push.timing();
-            timing
-                .urls
-                .get(sub.url.as_str())
-                .map(|last| *last + inner.timers.push_interval)
-                .filter(|at| *at > Instant::now())
-        };
+        let wait = turn(&inner.misc.push.timing(), Instant::now());
         if let Some(at) = wait {
             tokio::time::sleep_until(at).await;
             continue;
@@ -534,14 +602,20 @@ async fn deliver(inner: &Arc<Inner>, id: i64, reason: PushReason) -> Option<Dura
         }
         let now = Instant::now();
         let mut timing = inner.misc.push.timing();
-        if timing
-            .urls
-            .get(sub.url.as_str())
-            .is_some_and(|last| *last + inner.timers.push_interval > now)
-        {
+        if turn(&timing, now).is_some() {
             continue;
         }
         timing.urls.insert(sub.url.as_str().to_owned(), now);
+        if timing.hosts.len() >= 4096 {
+            timing
+                .hosts
+                .retain(|_, (start, _)| *start + HOST_WINDOW > now);
+        }
+        let count = timing.hosts.entry(host.clone()).or_insert((now, 0));
+        if count.0 + HOST_WINDOW <= now {
+            *count = (now, 0);
+        }
+        count.1 += 1;
         let t = timing.subs.entry(id).or_default();
         t.last_sent = Some(now);
         // Posts from now on go into the next push.
@@ -625,7 +699,11 @@ async fn send(inner: &Arc<Inner>, sub: PushSubscription, reason: PushReason) -> 
         body,
         urgency: notify.urgency(),
     };
-    let result = inner.misc.push.transport().send(&request).await;
+    // At most so many pushes on their way at once (9.1).
+    let result = {
+        let _turn = inner.misc.push.in_flight.clone().acquire_owned().await;
+        inner.misc.push.transport().send(&request).await
+    };
     let id = sub.id;
     match result {
         Ok(200..=299) => {

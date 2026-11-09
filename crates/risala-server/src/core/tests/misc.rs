@@ -1159,3 +1159,109 @@ async fn reports_of_blob_posts() {
     assert_eq!(op.lines().last().unwrap(), "OK");
     assert_eq!(kept(&h), 0);
 }
+
+/// Pushes to one host count together, whatever their paths, and one
+/// network address may add only so many mailbox subscriptions an hour
+/// (9.1). A mailbox subscription's expiry is kept to the day (4.2).
+#[tokio::test]
+async fn pushes_are_limited_per_host_and_adds_per_address() {
+    let mut config = config();
+    config.push.per_host_per_second = 2;
+    config.push.adds_per_hour = 5;
+    let (mut h, recorder) = push_harness(config);
+    let mailbox = add_mailbox(&h, 1);
+    let keys = Keys::new();
+    let add = |url: &str| {
+        format!(
+            "PUSH ADD {url} t {} {} box={mailbox} token={}",
+            keys.key,
+            keys.auth,
+            token_of(&mailbox)
+        )
+    };
+    let mut anon = h.anon().await;
+    for i in 0..5 {
+        h.send(&anon, &add(&format!("https://victim.example/p/{i}")))
+            .await;
+        assert_eq!(anon.lines(), ["OK"]);
+    }
+    // The address has added its five this hour, on any connection.
+    let mut other = h.anon().await;
+    h.send(&other, &add("https://victim.example/p/5")).await;
+    assert!(other.lines()[0].ends_with("ERR rate-limited"));
+    let expires: i64 = h
+        .store
+        .raw()
+        .query_row("SELECT max(expires) FROM push_subscriptions", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(expires % 86_400_000, 0);
+
+    // One post: five pushes to the host, two a second.
+    misc::post_kept(h.inner(), mailbox);
+    wait(300).await;
+    assert_eq!(recorder.take().len(), 2);
+    wait(1000).await;
+    assert_eq!(recorder.take().len(), 2);
+    wait(1000).await;
+    assert_eq!(recorder.take().len(), 1);
+}
+
+/// Answers each push after a pause, and counts how many were on their way
+/// at once.
+struct Slow {
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+    sent: std::sync::atomic::AtomicUsize,
+}
+
+impl PushTransport for Slow {
+    fn send<'a>(&'a self, _: &'a PushRequest) -> BoxFuture<'a, Result<u16, SendError>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        Box::pin(async move {
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(n, SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.now.fetch_sub(1, SeqCst);
+            self.sent.fetch_add(1, SeqCst);
+            Ok(201)
+        })
+    }
+}
+
+/// At most `push.max_in_flight` pushes are on their way at once (9.1).
+#[tokio::test]
+async fn pushes_in_flight_are_limited() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut config = config();
+    config.push.max_in_flight = 2;
+    let h = Harness::with(config, push_timers());
+    let slow = Arc::new(Slow {
+        now: Default::default(),
+        most: Default::default(),
+        sent: Default::default(),
+    });
+    h.inner().misc.push.set_transport(slow.clone());
+    let mut h = h;
+    let mailbox = add_mailbox(&h, 1);
+    let keys = Keys::new();
+    let mut anon = h.anon().await;
+    for i in 0..6 {
+        h.send(
+            &anon,
+            &format!(
+                "PUSH ADD https://h{i}.example/p t {} {} box={mailbox} token={}",
+                keys.key,
+                keys.auth,
+                token_of(&mailbox)
+            ),
+        )
+        .await;
+    }
+    assert_eq!(anon.lines(), ["OK"; 6]);
+    misc::post_kept(h.inner(), mailbox);
+    wait(800).await;
+    assert_eq!(slow.sent.load(SeqCst), 6);
+    assert_eq!(slow.most.load(SeqCst), 2);
+}

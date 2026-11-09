@@ -38,7 +38,29 @@ pub(crate) struct WindowLimit<K> {
     window: Duration,
     /// When each key took its slots in the last window, oldest first. Keys
     /// with none are forgotten.
-    taken: Mutex<HashMap<K, VecDeque<Timestamp>>>,
+    taken: Mutex<Taken<K>>,
+}
+
+/// The slots of a [`WindowLimit`]: only the key in hand is pruned at each
+/// call, and every key once every [`SWEEP_EVERY`] calls, so that a call
+/// does not cost a scan of every key.
+#[derive(Debug)]
+struct Taken<K> {
+    keys: HashMap<K, VecDeque<Timestamp>>,
+    calls: u64,
+}
+
+/// How many calls go between pruning every key of a limit.
+pub(crate) const SWEEP_EVERY: u64 = 1024;
+
+/// Drops what is older than `window` from the front of `times`.
+fn prune(times: &mut VecDeque<Timestamp>, window: Duration, now: Timestamp) {
+    while times
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= window)
+    {
+        times.pop_front();
+    }
 }
 
 /// A slot taken by [`WindowLimit::take`]. It is given back when dropped,
@@ -56,11 +78,14 @@ impl<K: Eq + Hash + Clone> WindowLimit<K> {
     pub(crate) fn new(window: Duration) -> WindowLimit<K> {
         WindowLimit {
             window,
-            taken: Mutex::new(HashMap::new()),
+            taken: Mutex::new(Taken {
+                keys: HashMap::new(),
+                calls: 0,
+            }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<K, VecDeque<Timestamp>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Taken<K>> {
         self.taken.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -77,18 +102,17 @@ impl<K: Eq + Hash + Clone> WindowLimit<K> {
             return Ok(None);
         }
         let mut all = self.lock();
-        // Forget what is older than the window, everywhere, so the map
-        // holds only the last window's slots.
-        all.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|t| now.saturating_duration_since(*t) >= self.window)
-            {
-                times.pop_front();
-            }
-            !times.is_empty()
-        });
-        let times = all.entry(key.clone()).or_default();
+        // Now and then, forget what is older than the window everywhere, so
+        // that the map holds only about the last window's slots.
+        all.calls += 1;
+        if all.calls.is_multiple_of(SWEEP_EVERY) {
+            all.keys.retain(|_, times| {
+                prune(times, self.window, now);
+                !times.is_empty()
+            });
+        }
+        let times = all.keys.entry(key.clone()).or_default();
+        prune(times, self.window, now);
         if times.len() >= max as usize {
             let oldest = times.front().copied().unwrap_or(now);
             let waited = now.saturating_duration_since(oldest);
@@ -116,12 +140,12 @@ impl<K: Eq + Hash> Drop for Slot<'_, K> {
     fn drop(&mut self) {
         if !self.kept {
             let mut all = self.limit.taken.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(times) = all.get_mut(&self.key) {
+            if let Some(times) = all.keys.get_mut(&self.key) {
                 if let Some(i) = times.iter().rposition(|t| *t == self.at) {
                     times.remove(i);
                 }
                 if times.is_empty() {
-                    all.remove(&self.key);
+                    all.keys.remove(&self.key);
                 }
             }
         }
@@ -152,5 +176,21 @@ mod tests {
         assert!(limit.take("a", 2, much_later).unwrap().is_some());
         // No limit.
         assert!(limit.take("a", 0, t0).unwrap().is_none());
+    }
+
+    #[test]
+    fn keys_are_forgotten_now_and_then() {
+        let limit = WindowLimit::new(Duration::from_secs(10));
+        let t0: Timestamp = "2026-11-07T00:00:00.000Z".parse().unwrap();
+        for n in 0..100u32 {
+            limit.take(n, 5, t0).unwrap().unwrap().keep();
+        }
+        assert_eq!(limit.lock().keys.len(), 100);
+        let later = t0.checked_add(Duration::from_secs(20)).unwrap();
+        for _ in 0..SWEEP_EVERY {
+            limit.take(1000, 0, later).unwrap();
+            limit.take(1000, u32::MAX, later).unwrap();
+        }
+        assert!(limit.lock().keys.is_empty());
     }
 }

@@ -292,3 +292,25 @@ async fn kinds_reach_the_network_layer() {
     // The greeting's nonce waits for AUTH or REGISTER (4.6).
     assert!(reg.conns[&c.id].nonce.is_some());
 }
+
+/// One network address may hold only so many guest sessions, those
+/// waiting to be resumed included (4.2).
+#[tokio::test]
+async fn guest_sessions_per_address() {
+    let mut config = config();
+    config.limits.guests_per_address = 2;
+    let mut h = Harness::with(config, timers());
+    let (a, _) = h.guest("ann").await;
+    h.guest("ben").await;
+    let mut c = h.connect();
+    h.send(&c, "GUEST cat").await;
+    assert_eq!(c.lines(), ["@retry=60 ERR rate-limited"]);
+    // A session waiting to be resumed still counts.
+    h.close(a).await;
+    h.send(&c, "GUEST cat").await;
+    assert_eq!(c.lines(), ["@retry=60 ERR rate-limited"]);
+    // Another address has its own.
+    let mut far = h.connect_from("198.51.100.9:4000");
+    h.send(&far, "GUEST cat").await;
+    assert!(far.lines()[0].starts_with("OK uid=~cat"));
+}

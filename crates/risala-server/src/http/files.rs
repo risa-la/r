@@ -14,7 +14,9 @@
 //! body goes to a temporary file, and is moved into place only once it is
 //! complete and checked, so nothing is served half-written. Bodies and
 //! downloads are streamed: each read or write may wait at most
-//! [`IDLE_TIMEOUT`], however long the whole takes.
+//! [`IDLE_TIMEOUT`], and the whole must keep up at least [`MIN_RATE`]
+//! ([`transfer_deadline`]), so that slow clients cannot hold the
+//! listener's connections for hours.
 //!
 //! Answers: `201` for a stored body, `204` for a deletion, `400` for a
 //! body of the wrong length or hash, `404` for a URL that leads nowhere
@@ -38,6 +40,18 @@ use crate::secret::ct_eq;
 /// The longest a body or download may stall: each read or write must make
 /// progress within this.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The slowest a whole body or download may go, in bytes a second, after
+/// [`TRANSFER_GRACE`].
+pub const MIN_RATE: u64 = 64 * 1024;
+
+/// The time every transfer has besides what [`MIN_RATE`] gives it.
+pub const TRANSFER_GRACE: Duration = Duration::from_secs(60);
+
+/// How long a body or download of `size` bytes may take in all.
+pub fn transfer_deadline(size: u64) -> Duration {
+    TRANSFER_GRACE.saturating_add(Duration::from_secs(size / MIN_RATE))
+}
 
 /// The size of each read and write while streaming.
 const CHUNK: usize = 64 * 1024;
@@ -174,7 +188,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             _ => method_not_allowed("PUT"),
         }
     };
-    tracing::debug!(%peer, status = status.status, "HTTPS request for a blob or file");
+    tracing::debug!(target: crate::net::ADDRESSES, %peer, status = status.status, "HTTPS request for a blob or file");
     if status.status != 200 {
         respond(stream, &status).await;
     }
@@ -220,8 +234,10 @@ async fn download<S: AsyncWrite + Unpin>(
         }
         within(stream.shutdown()).await
     };
-    if let Err(e) = sent.await {
-        tracing::debug!("sending a blob or file: {e}");
+    match tokio::time::timeout(transfer_deadline(size), sent).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!("sending a blob or file: {e}"),
+        Err(_) => tracing::debug!("sending a blob or file: too slow"),
     }
     SENT
 }
@@ -295,7 +311,9 @@ async fn put<S: AsyncRead + AsyncWrite + Unpin>(
         }
         within(file.sync_all()).await
     };
-    let result = received.await;
+    let result = tokio::time::timeout(transfer_deadline(length), received)
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
     drop(file);
     let status = match result {
         Err(e) => {

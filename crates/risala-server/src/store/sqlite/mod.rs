@@ -218,3 +218,26 @@ fn private_files(path: &Path) -> std::io::Result<()> {
 fn private_files(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MailboxStore as _;
+
+    /// A database on disk reads on connections of their own, which do not
+    /// wait for the writer, and cannot write.
+    #[test]
+    fn reads_do_not_wait_for_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(&dir.path().join("db")).unwrap();
+        assert_eq!(store.readers.len(), READERS);
+        let mailbox = risala_proto::names::BoxName::from_bytes([1; 16]);
+        // The writer is busy: a read still goes through.
+        let writer = store.raw();
+        assert_eq!(store.mailbox(&mailbox).unwrap(), None);
+        drop(writer);
+        let written = store.reader().execute("DELETE FROM mailboxes", []);
+        assert!(written.is_err(), "a reader wrote");
+        store.checkpoint().unwrap();
+    }
+}

@@ -350,37 +350,77 @@ impl Run {
 /// The server as a witness.
 struct WitnessSide {
     core: Mutex<WitnessCore<StoreWitness, HubLogKeys>>,
+    /// The key files of first logs fetched for enrolments, by URL, until
+    /// the witness takes them (4.10).
+    fetched: Prefetched,
+    /// When each origin's key was last fetched for an enrolment, in
+    /// seconds since 1970: at most once a minute each (4.10).
+    fetching: Mutex<HashMap<LogOrigin, u64>>,
+    fetcher: Arc<dyn DynKeyFetcher>,
 }
 
-/// How the witness fetches the key file of a host's first log (4.10):
-/// through the hub's key fetcher, under the rules for fetching key files
-/// (4.4). The witness calls it on the blocking pool, holding its lock, for
-/// at most [`KEY_FETCH_TIMEOUT`](crate::keyfiles::KEY_FETCH_TIMEOUT), and
-/// at most once a minute for each origin.
-struct HubLogKeys(Arc<dyn DynKeyFetcher>);
+/// Key files of first logs fetched before the witness's lock is taken.
+type Prefetched = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+/// How the witness gets the key file of a host's first log (4.10): the
+/// file [`WitnessSide::prefetch`] fetched, through the hub's key fetcher
+/// under the rules for fetching key files (4.4), before the witness's
+/// lock was taken. The witness's own call, under its lock, fetches
+/// nothing, so that a slow host holds up no other log's cosignature.
+struct HubLogKeys(Prefetched);
 
 impl LogKeyFetcher for HubLogKeys {
     fn fetch_log_key(&mut self, url: &str) -> Option<Vec<u8>> {
-        let handle = tokio::runtime::Handle::try_current().ok()?;
-        let fetch = tokio::time::timeout(
-            crate::keyfiles::KEY_FETCH_TIMEOUT,
-            self.0.fetch_log_boxed(url),
-        );
-        match handle.block_on(fetch) {
-            Ok(Ok(crate::keyfiles::UrlBody::Ok(body))) => Some(body),
-            Ok(Ok(_)) => {
-                tracing::info!(url, "no log key file to enrol (4.10)");
-                None
-            }
-            Ok(Err(e)) => {
-                tracing::info!(url, error = %e, "fetching a log key file failed (4.10)");
-                None
-            }
-            Err(_) => {
-                tracing::info!(url, "fetching a log key file timed out (4.10)");
-                None
+        lock(&self.0).remove(url)
+    }
+}
+
+impl WitnessSide {
+    /// For an `add-checkpoint` that would enrol a host's first log (old
+    /// size 0, log 1, an origin the witness does not know), fetches the
+    /// log's key file now, before the witness's lock, at most once a
+    /// minute for each origin. Returns `false` if this request must wait:
+    /// another fetched the key within the minute, and gets 503.
+    async fn prefetch(&self, inner: &Inner, req: &AddCheckpoint, now: u64) -> bool {
+        let Ok(origin) = req.checkpoint.checkpoint().origin().parse::<LogOrigin>() else {
+            return true;
+        };
+        if req.old_size != 0 || origin.previous().is_some() {
+            return true;
+        }
+        let name = origin.to_string();
+        match inner.db(move |store| store.witness_log(&name)).await {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "reading a witness log");
+                return true;
             }
         }
+        {
+            let mut fetching = lock(&self.fetching);
+            fetching.retain(|_, at| {
+                at.saturating_add(risala_keylog::witnessing::KEY_FETCH_INTERVAL) > now
+            });
+            if fetching.contains_key(&origin) {
+                return false;
+            }
+            fetching.insert(origin.clone(), now);
+        }
+        let url = risala_keylog::witnessing::log_key_url(&origin);
+        let fetch = tokio::time::timeout(
+            crate::keyfiles::KEY_FETCH_TIMEOUT,
+            self.fetcher.fetch_log_boxed(&url),
+        );
+        match fetch.await {
+            Ok(Ok(crate::keyfiles::UrlBody::Ok(body))) => {
+                lock(&self.fetched).insert(url, body);
+            }
+            Ok(Ok(_)) => tracing::info!(url, "no log key file to enrol (4.10)"),
+            Ok(Err(e)) => tracing::info!(url, error = %e, "fetching a log key file failed (4.10)"),
+            Err(_) => tracing::info!(url, "fetching a log key file timed out (4.10)"),
+        }
+        true
     }
 }
 
@@ -418,15 +458,19 @@ impl State {
                 let seed = store.witness_seed(random_seed()?, now)?;
                 let cosigner = Cosigner::from_seed(&name, &seed)
                     .map_err(|e| StoreError::Setup(format!("witness key: {e}")))?;
+                let fetched = Prefetched::default();
                 let core = WitnessCore::new(
                     cosigner,
                     StoreWitness(store.clone()),
-                    HubLogKeys(fetcher),
+                    HubLogKeys(fetched.clone()),
                     CoreConfig::default(),
                 );
                 tracing::info!(vkey = %core.vkey(), "acting as a key log witness (4.10)");
                 Some(WitnessSide {
                     core: Mutex::new(core),
+                    fetched,
+                    fetching: Mutex::new(HashMap::new()),
+                    fetcher,
                 })
             }
             None => None,
@@ -1286,17 +1330,27 @@ impl Hub {
             risala_keylog::handoff::HANDOFF_PATH => true,
             _ => return Some(Answer::status(404)),
         };
+        let now = secs(inner.now());
+        let req = if handoff {
+            None
+        } else {
+            let Ok(req) = AddCheckpoint::parse(&body) else {
+                return Some(Answer::status(400));
+            };
+            // A new host's key, fetched before the lock (4.10).
+            let witness = inner.keylog.witness.as_ref().expect("checked above");
+            if !witness.prefetch(&inner, &req, now).await {
+                return Some(Answer::status(503));
+            }
+            Some(req)
+        };
         let task = tokio::task::spawn_blocking(move || {
             let witness = inner.keylog.witness.as_ref().expect("checked above");
-            let now = secs(inner.now());
-            if handoff {
+            let Some(req) = req else {
                 return match lock(&witness.core).handoff_body(&body) {
                     Ok(()) => Answer::ok(TEXT, Vec::new()),
                     Err(e) => refusal(&e),
                 };
-            }
-            let Ok(req) = AddCheckpoint::parse(&body) else {
-                return Answer::status(400);
             };
             let Ok(rnd) = crate::secret::random_bytes() else {
                 return Answer::status(500);

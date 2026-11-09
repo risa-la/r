@@ -85,6 +85,17 @@ pub const MAX_HTTP_CONNECTIONS: usize = 1024;
 /// as soon as they are accepted.
 pub const MAX_HTTP_PER_ADDRESS: usize = 16;
 
+/// The most HTTPS connections open at once from one IPv6 /48, since a
+/// /48 holds 65,536 /64s.
+pub const MAX_HTTP_PER_48: usize = 64;
+
+/// The most connections that may be sending or receiving blobs and files
+/// at once (5.6, 12.12): the rest of [`MAX_HTTP_CONNECTIONS`] stays for
+/// key files, log tiles and the witness (4.3, 4.5, 4.10), so that slow
+/// transfers cannot keep devices from checking keys. Further blob and file
+/// requests get 503.
+pub const MAX_HTTP_TRANSFERS: usize = MAX_HTTP_CONNECTIONS * 3 / 4;
+
 /// The most bytes of request head (request line and headers).
 pub const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
@@ -179,6 +190,7 @@ impl HttpServer {
             keys: self.keys,
             files: self.files,
             permits: Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS)),
+            transfers: Arc::new(Semaphore::new(MAX_HTTP_TRANSFERS)),
             per_address: Mutex::new(HashMap::new()),
         });
         let mut background = JoinSet::new();
@@ -201,7 +213,10 @@ struct Shared {
     keys: Arc<dyn KeyFiles>,
     files: Option<Files>,
     permits: Arc<Semaphore>,
-    /// How many connections each network address has open.
+    /// Connections sending or receiving blobs and files.
+    transfers: Arc<Semaphore>,
+    /// How many connections each network address, and each IPv6 /48, has
+    /// open.
     per_address: Mutex<HashMap<IpAddr, usize>>,
 }
 
@@ -214,25 +229,41 @@ fn address_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The IPv6 /48 an address is in, for the wider count; none for IPv4.
+fn wide_key(ip: IpAddr) -> Option<IpAddr> {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => Some(IpAddr::V6((u128::from(v6) & !((1u128 << 80) - 1)).into())),
+        IpAddr::V4(_) => None,
+    }
+}
+
 /// One of an address's connections, counted until it is dropped.
 struct AddressSlot {
     shared: Arc<Shared>,
-    key: IpAddr,
+    keys: Vec<IpAddr>,
 }
 
 impl AddressSlot {
-    /// Counts a connection from `peer`, unless it has its fill.
+    /// Counts a connection from `peer`, unless its address or its /48 has
+    /// its fill.
     fn take(shared: &Arc<Shared>, peer: IpAddr) -> Option<AddressSlot> {
-        let key = address_key(peer);
+        let mut keys = vec![(address_key(peer), MAX_HTTP_PER_ADDRESS)];
+        if let Some(wide) = wide_key(peer) {
+            keys.push((wide, MAX_HTTP_PER_48));
+        }
         let mut counts = shared.per_address.lock().unwrap_or_else(|e| e.into_inner());
-        let n = counts.entry(key).or_default();
-        if *n >= MAX_HTTP_PER_ADDRESS {
+        if keys
+            .iter()
+            .any(|(key, max)| counts.get(key).copied().unwrap_or(0) >= *max)
+        {
             return None;
         }
-        *n += 1;
+        for (key, _) in &keys {
+            *counts.entry(*key).or_default() += 1;
+        }
         Some(AddressSlot {
             shared: shared.clone(),
-            key,
+            keys: keys.into_iter().map(|(key, _)| key).collect(),
         })
     }
 }
@@ -244,10 +275,12 @@ impl Drop for AddressSlot {
             .per_address
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = counts.get_mut(&self.key) {
-            *n -= 1;
-            if *n == 0 {
-                counts.remove(&self.key);
+        for key in &self.keys {
+            if let Some(n) = counts.get_mut(key) {
+                *n -= 1;
+                if *n == 0 {
+                    counts.remove(key);
+                }
             }
         }
     }
@@ -273,7 +306,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     continue;
                 };
                 let Some(slot) = AddressSlot::take(&shared, peer.ip()) else {
-                    tracing::debug!(%peer, "too many HTTPS connections from one address");
+                    tracing::debug!(target: crate::net::ADDRESSES, %peer, "too many HTTPS connections from one address");
                     continue;
                 };
                 conns.spawn(connection(shared.clone(), tcp, peer, (permit, slot)));
@@ -294,11 +327,11 @@ async fn connection(
     let mut tls = match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, handshake).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
-            tracing::debug!(%peer, error = %e, "HTTPS handshake failed");
+            tracing::debug!(target: crate::net::ADDRESSES, %peer, error = %e, "HTTPS handshake failed");
             return;
         }
         Err(_) => {
-            tracing::debug!(%peer, "HTTPS handshake timed out");
+            tracing::debug!(target: crate::net::ADDRESSES, %peer, "HTTPS handshake timed out");
             return;
         }
     };
@@ -307,15 +340,22 @@ async fn connection(
             // Blobs and files: their bodies and downloads are streamed, so
             // they write their own responses (12.12, 5.6).
             Some(files) if super::files::claims(&request.path) => {
-                super::files::serve(&mut tls, &request, body, files, peer).await;
-                return;
+                match shared.transfers.clone().try_acquire_owned() {
+                    Ok(_transfer) => {
+                        super::files::serve(&mut tls, &request, body, files, peer).await;
+                        return;
+                    }
+                    // The other connections are kept for key files, log
+                    // tiles and the witness.
+                    Err(_) => Response::error(503, "Service Unavailable"),
+                }
             }
             _ => route(&request, &shared.keys).await,
         },
         Ok(Err(response)) => response,
         Err(_) => Response::error(408, "Request Timeout"),
     };
-    tracing::debug!(%peer, status = response.status, "HTTPS request");
+    tracing::debug!(target: crate::net::ADDRESSES, %peer, status = response.status, "HTTPS request");
     let _ = tokio::time::timeout(HTTP_TIMEOUT, async {
         tls.write_all(&response.to_bytes()).await?;
         tls.shutdown().await
@@ -639,6 +679,20 @@ mod tests {
         assert_eq!(key("203.0.113.7"), "203.0.113.7");
         assert_eq!(key("::ffff:203.0.113.7"), "203.0.113.7");
         assert_eq!(key("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::");
+        let wide = |s: &str| wide_key(s.parse().unwrap()).map(|k| k.to_string());
+        assert_eq!(wide("2001:db8:1:2:3:4:5:6").unwrap(), "2001:db8:1::");
+        assert_eq!(wide("203.0.113.7"), None);
+        assert_eq!(wide("::ffff:203.0.113.7"), None);
+    }
+
+    #[test]
+    fn transfers_keep_a_minimum_rate() {
+        use super::super::files::{MIN_RATE, TRANSFER_GRACE, transfer_deadline};
+        assert_eq!(transfer_deadline(0), TRANSFER_GRACE);
+        // A 256 MiB blob: about 68 minutes, not 33 hours.
+        let big = transfer_deadline(256 * 1024 * 1024);
+        assert_eq!(big, TRANSFER_GRACE + Duration::from_secs(4096));
+        assert_eq!(MIN_RATE, 64 * 1024);
     }
 
     #[test]

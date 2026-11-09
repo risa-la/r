@@ -1156,3 +1156,30 @@ async fn connections_are_capped() {
     }
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn connections_are_capped_per_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Running::start_with(&test_config(dir.path()), |s| s.per_address = 2);
+    let first = server.client(ClientOptions::default()).await;
+    let _second = server.client(ClientOptions::default()).await;
+    // A third from the same address is closed at once (4.2).
+    assert!(TestClient::connect(server.addr).await.is_err());
+    first.close().await.unwrap();
+    let stub = server.stub.clone();
+    wait_until(|| stub.closed().len() == 1).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TestClient::connect(server.addr).await {
+            Ok(_) => break,
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the address's slot was never freed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    server.shutdown().await;
+}

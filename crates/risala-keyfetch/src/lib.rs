@@ -851,10 +851,13 @@ fn split_url(url: &str) -> Option<(&str, Option<u16>, &str)> {
         Some((host, port)) => (host, Some(port.parse().ok()?)),
         None => (authority, None),
     };
+    // A last label of digits only is an IPv4 address, not a domain name.
+    let last = host.trim_end_matches('.').rsplit('.').next().unwrap_or("");
     let valid = !host.is_empty()
         && host
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && !last.bytes().all(|b| b.is_ascii_digit());
     valid.then_some((host, port, path))
 }
 
@@ -914,6 +917,9 @@ mod url_tests {
             "https:///a",
             "https://user@example.org/a",
             "https://[::1]/a",
+            "https://203.0.113.7/a",
+            "https://203.0.113.7:8443/a",
+            "https://0x7f.1/a",
             "https://example.org:x/a",
             "https://example.org/a?b",
             "https://example.org/a b",
