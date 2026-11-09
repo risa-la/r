@@ -2380,6 +2380,87 @@ Open:
       the server cannot know outside public rooms (at least 4,096).
     - 12.9: no limit on the number of content lines (16,384).
 
+63. **Found by the review of M5b before merging** (5.1, 6.1, 7.1, 7.5,
+    9.1, 12.5, 12.7, 12.12, 12.14, 14), decided with the user on
+    2026-11-09. The review's High findings are already fixed on `m5b`
+    (a leaving device re-adding its own devices, CLI text printed raw,
+    the blob-memory deadlock, FETCH reading past its budget, `nix run
+    .#dev`). The Medium findings, to fix:
+    - **Key-file outages** (12.5, 12.14). A device never adds an
+      identity whose key file it has never read: the invitation or
+      direct conversation fails with "key file unavailable, try later"
+      and the upkeep retries. Devices cached from an earlier good read
+      still work during an outage. A known log fork refuses too.
+    - **An outage never fails a check** (12.7). Only a pending record
+      times out after 2 hours. While a key file cannot be read, the
+      check stays pending: sending stays held for added leaves,
+      committers count as checked as far as records are accepted, the
+      user is warned after 2 hours, and nothing is removed for it.
+    - **Joining checks the tree** (12.7, Joining). A device that joins
+      by Welcome runs the Adds key check on every leaf already there,
+      and holds sending until each passes. The spec says so.
+    - **Removals go first** (12.7). Repairs and removals by record or by
+      check go before any other queued commit and are never held;
+      held commits are rebuilt after them.
+    - **Deletes from a less trusted leaf** (5.4, 12.10): as for edits, a
+      DELETE removes a message only when its leaf is at least as
+      trusted as the message's. Otherwise the message shows as deleted
+      but unconfirmed, the DELETE applies once its leaf is confirmed, and
+      it is dropped if the leaf is an impostor.
+    - **Large commits as blobs** (12.12): librisala sends any commit,
+      GroupInfo or tree too long for a line as a blob over an anonymous
+      connection, now, tested against risalad past the limit.
+    - **Own commits are checked** (12.5, 12.7): a device runs the group
+      checks on its own commit before posting it, with lifetimes
+      against the time it posts and the hour's margin taken inward, and
+      fetches again any KeyPackage that fails.
+    - **One Remove per external commit** (12.7). The spec follows
+      OpenMLS (RFC 9420 12.4.3.2): a resync commit removes only the
+      GroupInfo's signer, and the device's own earlier leaf goes in its
+      next commit. `risala_mls::group::external_commit` refuses a second
+      removal; RISALA.md and the docs say so. No new OpenMLS patch.
+    - **Storage cap** (7.5, 10): `max_stored_bytes` applies to BLOB and
+      UPLOAD only, with a reserve so inline posts and commits always
+      fit; the per-address window is lowered (about 1 GiB an hour); blobs
+      kept for reports count separately, with their own bound.
+    - **GROUPINFO** (6.1, 12.12): the server stores a public room's tree
+      blob once per epoch, when it applies the commit; GROUPINFO returns
+      it with no writes, and its reads count against blob memory.
+    - **KEYS PUT** (4.7): its rate-limit slot is used as soon as a blob is
+      read, whatever follows.
+    - **Shared addresses** (2.1, 4.2, 10, 14): per-address limits stay as
+      the free tier; past them a client may go on by proof of work
+      (item 42), wired in with risala-pow in M6a. Until then the
+      defaults go up about four times, and 10 and 14 say what one Tor
+      exit or carrier NAT shares.
+    - **HTTPS transfers and push hosts** (9.1, 12.12): transfers keep a
+      running minimum rate (about 16 KiB/s over 30 seconds) besides the
+      overall deadline; push URLs are parsed (host lower-cased, default
+      port, trailing dot dropped) and those with userinfo refused, so the
+      per-host limit holds. Tested over a real connection.
+    - **CLI addressing**: a uid only ever means the direct conversation
+      with that identity; rooms are named by number or `#name`.
+    - **CLI exit codes**: `Client::is_settled` also waits for pending
+      KEYS PUT, KeyPackage uploads and an outgoing transfer, and a
+      command fails with a clear message when they have not landed by
+      its timeout. The goal test's retries go.
+    - **CLI witness policy**: `risala witness show|set|clear`; a saved
+      policy changes only through it; `--witness-k` alone is an error;
+      `--ca`, `--resolve` and `--short-waits` print a warning, and so
+      does a policy naming risala-dev's fixed-seed witness.
+    - **No commits while leaving** (6.1): a leaving device makes no
+      commit but its own leave commit; repairs and the weekly fresh-leaf
+      commit skip conversations it is leaving.
+    - **A lone device leaves locally** (6.1): when no other identity has a
+      leaf, a device leaving forgets the group (UNFOLLOW, its keys and
+      the conversation deleted) and makes no commit.
+    - **A direct peer who left** (5.1, 6.1, 12.7) is never added back by
+      itself. When the peer leaves, the remaining side leaves too,
+      locally, and shows the conversation as left by the peer, so one
+      direct conversation per pair shows; talking again starts a new
+      one. A peer removed for a check or after a recovery is still added
+      back. The spec says so.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
