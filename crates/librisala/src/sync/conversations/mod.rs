@@ -405,7 +405,8 @@ pub(crate) trait Hooks: Send + Sync {
     }
 }
 
-/// How a blob's PUT went ([`Hooks::blob_put`]).
+/// How a blob's PUT went: what the group engine's hooks answer when it
+/// asks after a blob it is storing (12.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlobPut {
     /// Still going: ask again later.
