@@ -508,6 +508,12 @@ async fn a_witness_list_that_does_not_fit_the_log() {
     // k must be more than half the list (4.5).
     assert!(c.set_witness_policy(&others, 1).is_err());
     assert!(c.set_witness_policy(&others, 4).is_err());
+    assert_eq!(c.witness_policy().unwrap(), (others, 2));
+    // Cleared, the default list applies again (4.10).
+    c.clear_witness_policy().unwrap();
+    let (list, k) = crate::sync::keylog::DEFAULT_WITNESSES;
+    let list: Vec<String> = list.iter().map(|s| (*s).to_owned()).collect();
+    assert_eq!(c.witness_policy().unwrap(), (list, k));
 }
 
 #[tokio::test]

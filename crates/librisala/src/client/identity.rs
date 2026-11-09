@@ -758,6 +758,15 @@ impl Client {
         Ok(())
     }
 
+    /// Forgets the witness policy set with
+    /// [`set_witness_policy`](Self::set_witness_policy), for the apps'
+    /// default list (4.10).
+    pub fn clear_witness_policy(&self) -> Result<()> {
+        let (_, changes) = self.store().write(|tx| tx.clear_witnesses())?;
+        self.emit_changes(changes);
+        Ok(())
+    }
+
     /// The forks found and not yet resolved of `uid` (4.5), as hashes of
     /// what shows them, for display.
     pub fn forks(&self, uid: &str) -> Result<Vec<BlobRef>> {

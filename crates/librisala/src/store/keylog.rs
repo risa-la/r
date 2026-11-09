@@ -340,6 +340,15 @@ impl Tx<'_> {
         self.changed(Change::KeyLog(KeyLogChange::Witnesses));
         Ok(())
     }
+
+    /// Forgets the witness policy, for the apps' default (4.10).
+    pub(crate) fn clear_witnesses(&mut self) -> Result<(), StoreError> {
+        self.conn().execute("DELETE FROM witnesses", [])?;
+        self.conn()
+            .execute("DELETE FROM settings WHERE key = ?1", [WITNESS_K_SETTING])?;
+        self.changed(Change::KeyLog(KeyLogChange::Witnesses));
+        Ok(())
+    }
 }
 
 impl Store {
