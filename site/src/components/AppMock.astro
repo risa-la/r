@@ -97,9 +97,57 @@ const timeline: Entry[] = [
   },
 ];
 
-// Lit cells of the typing indicator's 4×2 grid, one frame of it.
-const typingDots = [0, 1, 2, 3, 4, 5, 6, 7].map((cell) => [1, 6].includes(cell));
+// The typing indicator's frames, as TypingIndicator.swift makes them: 24 frames of
+// two or three lit cells in a 4×2 grid, from SplitMix seeded with 11, one every 0.2s.
+// A cell lit in the last frame shows at 45%.
+function typingFrames(): Set<number>[] {
+  const mask = (1n << 64n) - 1n;
+  let state = 11n;
+  const next = () => {
+    state = (state + 0x9e3779b97f4a7c15n) & mask;
+    let value = state;
+    value = ((value ^ (value >> 30n)) * 0xbf58476d1ce4e5b9n) & mask;
+    value = ((value ^ (value >> 27n)) * 0x94d049bb133111ebn) & mask;
+    return value ^ (value >> 31n);
+  };
+  const frames: Set<number>[] = [];
+  let previous = new Set<number>();
+  while (frames.length < 24) {
+    const count = next() % 3n === 0n ? 3 : 2;
+    const lit = new Set<number>();
+    while (lit.size < count) {
+      const cell = Number(next() % 8n);
+      if (!previous.has(cell)) lit.add(cell);
+    }
+    const key = [...lit].sort().join();
+    if (frames.slice(-4).some((f) => [...f].sort().join() === key)) continue;
+    frames.push(lit);
+    previous = lit;
+  }
+  return frames;
+}
+const frames = typingFrames();
+const tickMs = 200;
+const shade = { lit: "var(--ink)", trail: "color-mix(in srgb, var(--ink) 45%, transparent)" };
+// One animation per cell, stepping through the frames. Under Reduce Motion the
+// indicator holds frame 3, as the app does.
+const typingCss = [0, 1, 2, 3, 4, 5, 6, 7]
+  .map((cell) => {
+    const stops = frames.map((frame, i) => {
+      const before = frames[(i + frames.length - 1) % frames.length];
+      const color = frame.has(cell) ? shade.lit : before.has(cell) ? shade.trail : "var(--dot-off)";
+      return `${Math.floor((i * 100000) / frames.length) / 1000}%{background:${color}}`;
+    });
+    return (
+      `@keyframes typing-${cell}{${stops.join("")}}` +
+      `.mock .dots i:nth-child(${cell + 1}){animation:typing-${cell} ${frames.length * tickMs}ms step-end infinite}`
+    );
+  })
+  .join("");
+const heldFrame = frames[3];
 ---
+
+<style is:inline set:html={`@media (prefers-reduced-motion: no-preference){${typingCss}}`}></style>
 
 <div class="mock" role="img" aria-label="The risala Mac app: a list of chats beside the open #general room, with a draft reply being typed.">
   <div class="window" aria-hidden="true">
@@ -172,8 +220,8 @@ const typingDots = [0, 1, 2, 3, 4, 5, 6, 7].map((cell) => [1, 6].includes(cell))
                         {row.typing ? (
                           <span class="preview typing">
                             <span class="dots">
-                              {typingDots.map((lit) => (
-                                <i class:list={{ lit }} />
+                              {[0, 1, 2, 3, 4, 5, 6, 7].map((cell) => (
+                                <i class:list={{ lit: heldFrame.has(cell) }} />
                               ))}
                             </span>
                             {row.preview}
@@ -272,7 +320,9 @@ const typingDots = [0, 1, 2, 3, 4, 5, 6, 7].map((cell) => [1, 6].includes(cell))
         <div class="bottom">
           <div class="typing-line">
             <span class="dots">
-              {typingDots.map((_, i) => <i class:list={{ lit: [3, 4].includes(i) }} />)}
+              {[0, 1, 2, 3, 4, 5, 6, 7].map((cell) => (
+                <i class:list={{ lit: heldFrame.has(cell) }} />
+              ))}
             </span>
             noor is typing
           </div>
@@ -634,14 +684,22 @@ const typingDots = [0, 1, 2, 3, 4, 5, 6, 7].map((cell) => [1, 6].includes(cell))
     grid-template-columns: repeat(4, 3px);
     gap: 1.5px;
   }
+  .dots {
+    --dot-off: color-mix(in srgb, var(--text-tertiary) 30%, transparent);
+  }
   .dots i {
     width: 3px;
     height: 3px;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--text-tertiary) 30%, transparent);
+    background: var(--dot-off);
   }
   .dots i.lit {
     background: var(--ink);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dots i {
+      animation: none !important;
+    }
   }
 
   .modebar {
