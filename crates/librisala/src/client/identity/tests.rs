@@ -856,6 +856,32 @@ async fn recovering_an_identity() {
         1
     );
     assert_eq!(new.restorable_backup_generation(&uid).unwrap(), Some(0));
+
+    // LR-M6: a removal after the recovery moves the chain on, not the
+    // generation to restore, which is the one before this device's own
+    // recovery record.
+    let phone = s.client();
+    let offer = phone.start_pairing(HOST, "phone").await.unwrap();
+    let request = new.scan_pairing(&uid, &offer.qr).await.unwrap();
+    new.confirm_pairing(&uid, false).await.unwrap();
+    phone.finish_pairing().await.unwrap();
+    phone.accept_pairing().await.unwrap();
+    new.refresh_identity(&uid).await.unwrap();
+    new.remove_device(&uid, request.device, &recovery)
+        .await
+        .unwrap();
+    new.refresh_identity(&uid).await.unwrap();
+    assert_eq!(
+        new.store()
+            .own_identity(&uid)
+            .unwrap()
+            .unwrap()
+            .backup_generation,
+        2
+    );
+    assert_eq!(new.restorable_backup_generation(&uid).unwrap(), Some(0));
+    // A device that was not recovered has nothing to restore this way.
+    assert_eq!(phone.restorable_backup_generation(&uid).unwrap(), None);
 }
 
 #[tokio::test]

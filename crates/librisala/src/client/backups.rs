@@ -413,15 +413,16 @@ impl Jobs {
         Ok(Some(BackupKey::from_bytes(own.backup_generation, *seed)))
     }
 
-    /// The generation a recovered identity may restore: the one current
-    /// just before its newest `signing` record, from the chain this device
-    /// accepted, never from the server (12.13), as the identity area (C1)
-    /// computes it.
+    /// The generation a recovered identity may restore (12.13, step 1):
+    /// the one current just before this device's own recovery record, from
+    /// the records this device has accepted, never from the server.
     fn restorable_generation(&self) -> Result<Option<u32>> {
         let identity = self.identity()?;
+        let Some(own) = self.store.own_identity(identity.as_str())? else {
+            return Ok(None);
+        };
         let rows = self.store.records(identity.as_str())?;
-        Ok(crate::sync::identity::kept_chain(&identity, &rows, false)
-            .and_then(|chain| chain.generation().checked_sub(1)))
+        Ok(generation_before_recovery(&identity, &rows, &own.device_id))
     }
 
     /// Makes a backup now (12.13): archives of everything, with the files
@@ -653,6 +654,38 @@ impl Jobs {
             tracing::info!(error = %e, "making a backup failed");
         }
     }
+}
+
+/// The generation current just before this device's recovery record
+/// (12.13, step 1; LR-M6), from accepted records only: `recover` makes a
+/// `signing` record that removes every device, signed by this device, then
+/// this device's `device` record. Records made later, such as a removal
+/// or another recovery, do not move it. `None` if this device was not
+/// added by a recovery, or its records are not accepted yet.
+pub(crate) fn generation_before_recovery(
+    uid: &risala_proto::names::Identity,
+    rows: &[crate::store::identity::RecordRow],
+    device: &[u8; 48],
+) -> Option<u32> {
+    use risala_proto::record::{Record, RecordBody};
+    let mut accepted: Vec<&crate::store::identity::RecordRow> =
+        rows.iter().filter(|r| r.accepted).collect();
+    accepted.sort_by_key(|r| r.position);
+    let own = accepted.iter().position(|r| {
+        Record::decode(&r.record).is_ok_and(|rec| {
+            matches!(&rec.content().body, RecordBody::Device(k) if k.device_id().as_bytes() == device)
+        })
+    })?;
+    let recovery = own.checked_sub(1)?;
+    let row = accepted[recovery];
+    let is_signing = Record::decode(&row.record)
+        .is_ok_and(|rec| matches!(rec.content().body, RecordBody::Signing { .. }));
+    if !row.mine || !is_signing {
+        return None;
+    }
+    let before: Vec<crate::store::identity::RecordRow> =
+        accepted[..recovery].iter().map(|r| (*r).clone()).collect();
+    crate::sync::identity::kept_chain(uid, &before, true).map(|chain| chain.generation())
 }
 
 /// The account's worker: does the area's work when the cache changes, and

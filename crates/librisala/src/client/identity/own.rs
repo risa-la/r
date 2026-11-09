@@ -643,15 +643,19 @@ impl Client {
     }
 
     /// The generation whose backup a recovered identity may restore: the
-    /// one current just before its newest `signing` record, from the
-    /// chain the device has accepted, never from the server (12.13).
+    /// one current just before this device's own recovery record, from the
+    /// records the device has accepted, never from the server (12.13).
     pub fn restorable_backup_generation(&self, uid: &str) -> Result<Option<u32>> {
         let identity = parse_identity(uid)?;
+        let own = self.own_row(&identity)?;
         let rows = self.store().records(identity.as_str())?;
-        let Some(chain) = kept_chain(&identity, &rows, false) else {
-            return Ok(None);
-        };
-        Ok(chain.generation().checked_sub(1))
+        // LR-M6: accepted records only, and the generation before this
+        // device's own recovery record, whatever came after it.
+        Ok(crate::client::backups::generation_before_recovery(
+            &identity,
+            &rows,
+            &own.device_id,
+        ))
     }
 
     /// Deletes everything the server keeps about the account's identity
