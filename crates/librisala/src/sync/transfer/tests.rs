@@ -882,6 +882,78 @@ fn transfers_apply_only_asked_ranges_and_never_replace() {
             .to_vec();
     assert_eq!(apply_want(&net, a2, c2, changed).messages, 0);
     assert_eq!(net.texts(a2, c2), ["one", "not asked for"]);
+    // LR-H2: confirming the sender's leaf never shows the copied message
+    // as verified by this device (12.13).
+    let copied = net.devices[a2]
+        .store
+        .message_rows(c2)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.message_id == [9; 16])
+        .unwrap();
+    assert!(copied.restored);
+    let leaf = copied.leaf.expect("matched to the sender's leaf");
+    net.devices[a2]
+        .store
+        .write(|tx| tx.mark_leaf_verified(c2, leaf, 0))
+        .unwrap();
+    let rows = net.devices[a2].store.message_rows(c2).unwrap();
+    assert!(!rows.iter().find(|m| m.message_id == [9; 16]).unwrap().verified);
+    assert!(rows.iter().find(|m| m.message_id != [9; 16]).unwrap().verified);
+    // LR-H3: a transfer's edit and DELETE of a message the device received
+    // itself are not applied; those of a copied one are.
+    let held = archived.messages[0].message_id;
+    let mut edit = archived.messages[0].clone();
+    edit.message_id = [10; 16];
+    edit.seq = 51;
+    edit.content = risala_proto::content::Content::new(vec![ContentLine::Text(Text {
+        target: Some(risala_proto::content::Target::Edit(
+            risala_proto::content::MessageId::from_bytes(held),
+        )),
+        ..Text::new("edited by the transfer")
+    })])
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut delete = archived.messages[0].clone();
+    delete.message_id = [11; 16];
+    delete.seq = 52;
+    delete.content = risala_proto::content::Content::new(vec![ContentLine::Delete {
+        id: risala_proto::content::MessageId::from_bytes(held),
+    }])
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut delete_copied = delete.clone();
+    delete_copied.message_id = [12; 16];
+    delete_copied.seq = 53;
+    delete_copied.content = risala_proto::content::Content::new(vec![ContentLine::Delete {
+        id: risala_proto::content::MessageId::from_bytes([9; 16]),
+    }])
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    net.devices[a2]
+        .store
+        .write(|tx| {
+            tx.add_want(
+                a2_account,
+                &mailbox,
+                WantRange {
+                    after: 50,
+                    before: None,
+                },
+                0,
+            )
+        })
+        .unwrap();
+    let mut more = archived.clone();
+    more.messages = vec![edit, delete, delete_copied];
+    apply_want(&net, a2, c2, more);
+    assert_eq!(net.texts(a2, c2), ["one"]);
+    let rows = net.devices[a2].store.message_rows(c2).unwrap();
+    assert!(!rows.iter().any(|m| m.message_id == [10; 16]));
+    assert!(!rows.iter().find(|m| m.message_id == held).unwrap().deleted);
     // A conversation the device is not in is not applied.
     let mut other = archived;
     other.group_id = vec![7; 32];

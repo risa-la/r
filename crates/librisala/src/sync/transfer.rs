@@ -719,12 +719,16 @@ fn apply_conversation(
                         None => (None, None, None),
                     };
                     // 12.13: an edit or reaction whose target the device
-                    // neither holds nor gets in this transfer is ignored.
-                    if let Some(target) = edit_of.or(react_to)
-                        && !in_transfer.contains(&target)
-                        && tx.message(conv.id, &target)?.is_none()
-                    {
-                        break;
+                    // neither holds nor gets in this transfer is ignored,
+                    // and so is one whose target it received itself: a
+                    // transfer never changes a message the device holds
+                    // (LR-H3).
+                    if let Some(target) = edit_of.or(react_to) {
+                        match tx.message(conv.id, &target)? {
+                            None if !in_transfer.contains(&target) => break,
+                            Some(held) if !held.restored => break,
+                            _ => {}
+                        }
                     }
                     let inserted = tx.insert_message(
                         conv.id,
@@ -777,7 +781,11 @@ fn apply_conversation(
                     let room = matches!(conv.kind, ConvKind::Private | ConvKind::Public);
                     let with_role =
                         room && ext.as_ref().is_some_and(|e| e.role(&m.sender) >= Role::Mod);
+                    // Only of a message that was itself copied: one the
+                    // device received is never changed by a transfer
+                    // (12.13, LR-H3).
                     if let Some(target) = tx.message(conv.id, id.as_bytes())?
+                        && target.restored
                         && (target.sender == m.sender || with_role)
                     {
                         tx.erase_message(conv.id, id.as_bytes())?;

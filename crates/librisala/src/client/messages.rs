@@ -50,8 +50,13 @@ pub struct Message {
     /// The message it replies to (5.3), if that is one the device has and
     /// may quote.
     pub reply_to: Option<MessageId>,
-    /// Whether it was edited (5.3).
+    /// Whether it was edited (5.3), by an edit as trusted as the message.
     pub edited: bool,
+    /// The text of a newer edit that may not replace `text`: from a leaf
+    /// this device has not confirmed while the message is verified, or
+    /// copied by a transfer or backup while the message was received here
+    /// (12.7, 12.13). Apps show it apart, as an unverified edit.
+    pub unverified_edit: Option<String>,
     /// Reactions, with how many of each.
     pub reactions: Vec<(String, u32)>,
 }
@@ -70,6 +75,19 @@ pub struct Gap {
 
 fn timestamp(ms: u64) -> Timestamp {
     Timestamp::from_unix_millis(ms).unwrap_or(Timestamp::MAX)
+}
+
+/// Whether this device checked a message itself: it sent it, or received
+/// it from a leaf it confirmed (12.10), not by transfer or backup (12.13).
+fn checked_here(row: &MessageRow) -> bool {
+    row.own || (row.verified && !row.restored)
+}
+
+/// Whether `edit` may replace the text of `original` (12.7, 12.13): an
+/// edit this device checked always; otherwise only if the original was not
+/// checked here either, and a copied edit only of a copied message.
+fn edit_may_replace(original: &MessageRow, edit: &MessageRow) -> bool {
+    checked_here(edit) || (!checked_here(original) && (original.restored || !edit.restored))
 }
 
 /// Puts a conversation's rows together into messages (5.3): edits from
@@ -91,13 +109,30 @@ fn assemble(rows: &[MessageRow], direct: bool) -> Vec<Message> {
             .iter()
             .filter(|r| r.edit_of == Some(row.message_id) && r.sender == row.sender && !r.deleted)
             .collect();
-        let latest = edits
-            .iter()
-            .max_by_key(|r| (r.seq.unwrap_or(u64::MAX), r.sent));
+        let newest = |list: &[&MessageRow]| -> Option<MessageRow> {
+            list.iter()
+                .max_by_key(|r| (r.seq.unwrap_or(u64::MAX), r.sent))
+                .map(|r| (*r).clone())
+        };
+        // 12.7, 12.13: an edit replaces the text only if it is as trusted
+        // as the message: a verified or own message only by a verified or
+        // own edit, and a message received here never by a copied one.
+        let (trusted, untrusted): (Vec<&MessageRow>, Vec<&MessageRow>) =
+            edits.iter().partition(|e| edit_may_replace(row, e));
+        let latest = newest(&trusted);
+        let unverified_edit = newest(&untrusted)
+            .filter(|u| {
+                latest.as_ref().is_none_or(|l| {
+                    (u.seq.unwrap_or(u64::MAX), u.sent) > (l.seq.unwrap_or(u64::MAX), l.sent)
+                })
+            })
+            .filter(|_| !row.deleted)
+            .and_then(|u| u.text);
         let text = if row.deleted {
             None
         } else {
             latest
+                .as_ref()
                 .and_then(|r| r.text.clone())
                 .or_else(|| row.text.clone())
         };
@@ -134,7 +169,8 @@ fn assemble(rows: &[MessageRow], direct: bool) -> Vec<Message> {
             hidden: row.hidden,
             text,
             reply_to: reply_to.map(MessageId),
-            edited: !edits.is_empty(),
+            edited: latest.is_some(),
+            unverified_edit,
             reactions: reactions.into_iter().collect(),
         });
     }
@@ -412,5 +448,60 @@ mod tests {
         assert_eq!(shown[0].reactions, vec![("+1".to_owned(), 1)]);
         // A reply to an edit is shown without the quote (5.3).
         assert_eq!(shown[1].reply_to, None);
+    }
+
+    /// LR-H3: an edit from a leaf this device has not confirmed, or one
+    /// copied by a transfer, never replaces the text of a message it
+    /// verified itself; it is shown apart, as an unverified edit (12.7,
+    /// 12.13).
+    #[test]
+    fn edits_never_replace_verified_text_with_less_trusted_text() {
+        let a = "alice@example.org";
+        let mut original = row(1, a);
+        original.verified = true;
+        // An unconfirmed leaf of Alice's identity edits it.
+        let mut forged = row(2, a);
+        forged.edit_of = Some([1; 16]);
+        forged.text = Some("forged".into());
+        let shown = assemble(&[original.clone(), forged.clone()], false);
+        assert_eq!(shown[0].text.as_deref(), Some("text 1"));
+        assert!(shown[0].verified);
+        assert!(!shown[0].edited);
+        assert_eq!(shown[0].unverified_edit.as_deref(), Some("forged"));
+        // A copied edit from a transfer, even one flagged as verified by
+        // the device that sent it.
+        let mut copied = row(3, a);
+        copied.edit_of = Some([1; 16]);
+        copied.text = Some("copied".into());
+        copied.restored = true;
+        copied.verified = true;
+        let shown = assemble(&[original.clone(), copied], false);
+        assert_eq!(shown[0].text.as_deref(), Some("text 1"));
+        assert_eq!(shown[0].unverified_edit.as_deref(), Some("copied"));
+        // Even an unverified message received here is not changed by a
+        // transfer.
+        let mut plain = original.clone();
+        plain.verified = false;
+        let mut copied = row(3, a);
+        copied.edit_of = Some([1; 16]);
+        copied.text = Some("copied".into());
+        copied.restored = true;
+        let shown = assemble(&[plain, copied], false);
+        assert_eq!(shown[0].text.as_deref(), Some("text 1"));
+        // A verified edit replaces it; a later unverified one is shown
+        // apart.
+        let mut good = row(4, a);
+        good.edit_of = Some([1; 16]);
+        good.text = Some("good".into());
+        good.verified = true;
+        let shown = assemble(&[original.clone(), good.clone(), forged.clone()], false);
+        assert_eq!(shown[0].text.as_deref(), Some("good"));
+        assert!(shown[0].edited);
+        assert_eq!(shown[0].unverified_edit, None, "older than the verified edit");
+        let mut later = forged;
+        later.seq = Some(9);
+        let shown = assemble(&[original, good, later], false);
+        assert_eq!(shown[0].text.as_deref(), Some("good"));
+        assert_eq!(shown[0].unverified_edit.as_deref(), Some("forged"));
     }
 }

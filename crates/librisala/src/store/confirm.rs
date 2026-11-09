@@ -415,7 +415,8 @@ impl Tx<'_> {
 
     /// Shows a leaf's messages after `since_seq` as verified: it was
     /// confirmed, and they were signed with the key it was confirmed for
-    /// (12.10).
+    /// (12.10). Messages copied by transfer or restored from a backup keep
+    /// the sending device's flag, never this device's (12.13).
     pub(crate) fn mark_leaf_verified(
         &mut self,
         conv: ConversationId,
@@ -424,7 +425,8 @@ impl Tx<'_> {
     ) -> Result<(), StoreError> {
         let n = self.conn().execute(
             "UPDATE messages SET verified = 1
-             WHERE conv = ?1 AND leaf = ?2 AND own = 0 AND verified = 0 AND seq > ?3",
+             WHERE conv = ?1 AND leaf = ?2 AND own = 0 AND verified = 0 AND restored = 0
+               AND seq > ?3",
             params![conv.0, leaf, since_seq as i64],
         )?;
         if n > 0 {
