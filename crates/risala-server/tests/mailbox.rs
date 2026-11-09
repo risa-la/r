@@ -69,8 +69,14 @@ async fn two_anonymous_connections() {
         &bob.uid,
     );
     let identity = RisalaIdentity::device(alice.uid.clone(), alice.key.device_id());
-    let (mut a, _, mut state) =
-        create_group(&alice.provider, &identity, &alice.profile(), &conv).unwrap();
+    let (mut a, _, mut state) = create_group(
+        &alice.provider,
+        &identity,
+        &alice.profile(),
+        &conv,
+        Timestamp::now(),
+    )
+    .unwrap();
     let gid = GroupId::from_bytes(a.group_id().as_slice().try_into().unwrap());
     let hash0 = TokenHash::from_bytes(alice.token(&a).hash());
 
@@ -83,9 +89,16 @@ async fn two_anonymous_connections() {
     assert_eq!(reader.expect_line().await.unwrap(), "@ref=f OK head=0");
 
     // Alice adds Bob: the commit, with its next (5.2, 7.2).
-    let kp = make_key_package(&bob.provider, &bob.key, &bob.uid, &bob.profile(), false)
-        .unwrap()
-        .key_package;
+    let kp = make_key_package(
+        &bob.provider,
+        &bob.key,
+        &bob.uid,
+        &bob.profile(),
+        false,
+        Timestamp::now(),
+    )
+    .unwrap()
+    .key_package;
     let token0 = alice.token(&a);
     let out = commit(
         &alice.provider,

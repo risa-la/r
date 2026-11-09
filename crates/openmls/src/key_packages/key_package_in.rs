@@ -147,7 +147,7 @@ impl KeyPackageIn {
     /// lifetimes against the time of the post that carries them, so that
     /// every device reaches the same answer however late it processes the
     /// commit (the spec, 12.5). A lifetime must still be present.
-    pub(crate) fn validate_without_lifetime(
+    pub fn validate_without_lifetime(
         self,
         crypto: &impl OpenMlsCrypto,
         protocol_version: ProtocolVersion,

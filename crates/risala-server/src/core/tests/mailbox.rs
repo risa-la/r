@@ -75,9 +75,16 @@ impl Dev {
     }
 
     fn key_package(&self) -> KeyPackage {
-        make_key_package(&self.provider, &self.key, &self.uid, &self.profile(), false)
-            .unwrap()
-            .key_package
+        make_key_package(
+            &self.provider,
+            &self.key,
+            &self.uid,
+            &self.profile(),
+            false,
+            Timestamp::now(),
+        )
+        .unwrap()
+        .key_package
     }
 
     fn state(&self, group: &MlsGroup) -> EpochState {
@@ -100,6 +107,7 @@ impl Dev {
             &self.identity(),
             &self.profile(),
             conversation,
+            Timestamp::now(),
         )
         .unwrap();
         self.set_state(&group, state);
@@ -1479,6 +1487,7 @@ fn join(device: &Dev, identity: &RisalaIdentity, room: &PublicRoomSetup) -> Stri
         &device.provider,
         identity,
         (!identity.is_guest()).then(|| device.profile()).as_ref(),
+        Timestamp::now(),
     )
     .unwrap();
     let context = room.o.public_group().group_context();
@@ -1601,8 +1610,13 @@ async fn public_room_welcomes() {
     let mut room = create_room(&mut h, 1).await;
     let m = room.m;
     let dave = Dev::new("dave@example.org", 4);
-    let made =
-        make_join_key_package(&dave.provider, &dave.identity(), Some(&dave.profile())).unwrap();
+    let made = make_join_key_package(
+        &dave.provider,
+        &dave.identity(),
+        Some(&dave.profile()),
+        Timestamp::now(),
+    )
+    .unwrap();
     let context = room.o.public_group().group_context();
     let proposal = b64(&join_proposal::<Provider<MemoryStorage>>(
         &made.key_package,

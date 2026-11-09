@@ -2,8 +2,8 @@
 //! 12.12, 12.13).
 //!
 //! These tests run the hub with a files directory of their own, key files
-//! from a [`MemoryFetcher`], and the clock stopped at the real time, since
-//! OpenMLS gives KeyPackages lifetimes from the system clock (12.5).
+//! from a [`MemoryFetcher`], and the clock stopped at the real time, at
+//! which the devices make their KeyPackages (12.5).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -124,6 +124,7 @@ impl Dev {
             &self.uid,
             &profile,
             last_resort,
+            Timestamp::now(),
         )
         .unwrap()
         .key_package;

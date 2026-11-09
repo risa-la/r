@@ -43,6 +43,10 @@ fn host() -> risala_proto::names::ServerAddr {
 const BOX: [u8; 16] = [0x42; 16];
 const HOUR: u64 = 60 * 60 * 1000;
 
+fn ts(ms: u64) -> risala_proto::time::Timestamp {
+    risala_proto::time::Timestamp::from_unix_millis(ms).unwrap()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -116,6 +120,7 @@ impl Device {
             &self.uid,
             &profile,
             last_resort,
+            ts(now_ms()),
         )
         .unwrap()
         .key_package
@@ -184,6 +189,7 @@ impl Device {
             &self.identity(),
             &self.profile_at(t),
             conversation,
+            ts(t),
         )
         .unwrap();
         self.set_state(&group, state);
@@ -1703,6 +1709,7 @@ fn join_room(
         &group_info,
         &tree,
         &public_expect(device),
+        ts(now_ms()),
     )
     .unwrap();
     // A PublicMessage from a new member, with an empty RisalaAAD (6.1).
@@ -1895,6 +1902,7 @@ fn public_room_welcome_trees() {
             &group_info,
             &tree,
             &public_expect(device),
+            ts(now_ms()),
         )
         .unwrap();
         owen.propose_in(&mut o, &join.message, now_ms());
@@ -2328,6 +2336,7 @@ fn sqlite_storage() {
             &bob.uid,
             &RisalaProfile::new("", now_ms()).unwrap(),
             true,
+            ts(now_ms()),
         )
         .unwrap()
         .key_package;
@@ -2493,6 +2502,7 @@ fn x_wing_keys_of_parent_nodes() {
             &forged,
             &tree,
             &public_expect(&dave),
+            ts(now_ms()),
         ),
         Err(GroupError::Join(crate::checks::JoinError::Leaf))
     ));

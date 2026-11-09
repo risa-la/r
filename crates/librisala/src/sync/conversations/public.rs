@@ -185,6 +185,7 @@ pub(crate) fn start_join(
         &state.group_info,
         &state.tree,
         &expect,
+        group::ts(cx.now),
     )
     .map_err(mls)?;
     let conv = match conv {

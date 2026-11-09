@@ -33,6 +33,7 @@ use openmls::treesync::EncryptionKey;
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::crypto::OpenMlsCrypto;
 use risala_proto::names::Uid;
+use risala_proto::time::Timestamp;
 use tls_codec::Deserialize as _;
 
 use crate::CIPHERSUITE;
@@ -156,7 +157,8 @@ pub enum NewKeyPackageError<E> {
 /// to upload with KEYPKG ADD (12.5), with a lifetime of
 /// [`KEY_PACKAGE_LIFETIME`], the leaf's profile `profile`, and a device
 /// binding in its leaf node (12.3). `last_resort` marks it as the device's
-/// KeyPackage of last resort.
+/// KeyPackage of last resort. `now` is the device's time, from which the
+/// lifetime is counted ([`key_package_lifetime`]).
 ///
 /// The profile is shown to the server and to whoever fetches the
 /// KeyPackage with KEYPKG GET, so give it an empty display name: the
@@ -171,6 +173,7 @@ pub fn make_key_package<P: OpenMlsProvider>(
     uid: &Uid,
     profile: &RisalaProfile,
     last_resort: bool,
+    now: Timestamp,
 ) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
     make_key_package_with(
         provider,
@@ -178,8 +181,18 @@ pub fn make_key_package<P: OpenMlsProvider>(
         uid,
         profile,
         last_resort,
-        Lifetime::new(KEY_PACKAGE_LIFETIME),
+        key_package_lifetime(now),
     )
+}
+
+/// The lifetime of a KeyPackage made at `now` (12.5): from an hour before
+/// `now`, for clocks that run slow, to [`KEY_PACKAGE_LIFETIME`] after it.
+/// As OpenMLS's `Lifetime::new`, but from the caller's clock rather than
+/// the system's, so that a client with a replaced clock stamps its own
+/// time.
+pub fn key_package_lifetime(now: Timestamp) -> Lifetime {
+    let now = now.unix_millis() / 1000;
+    Lifetime::init(now.saturating_sub(60 * 60), now + KEY_PACKAGE_LIFETIME)
 }
 
 /// A last-resort KeyPackage's `updated` (12.3): the start of the period
@@ -257,18 +270,15 @@ pub(crate) fn make_key_package_with<P: OpenMlsProvider>(
 /// Makes a KeyPackage to join one public room by external proposal (6.1):
 /// with no device binding, never uploaded with KEYPKG ADD, and a fresh leaf
 /// key, whose credential is `identity`, a device's or a guest's. A
-/// device's leaf carries `profile`; a guest's may carry none (12.3).
+/// device's leaf carries `profile`; a guest's may carry none (12.3). Its
+/// lifetime is counted from `now` ([`key_package_lifetime`]).
 pub fn make_join_key_package<P: OpenMlsProvider>(
     provider: &P,
     identity: &RisalaIdentity,
     profile: Option<&RisalaProfile>,
+    now: Timestamp,
 ) -> Result<NewKeyPackage, NewKeyPackageError<P::StorageError>> {
-    make_join_key_package_with(
-        provider,
-        identity,
-        profile,
-        Lifetime::new(KEY_PACKAGE_LIFETIME),
-    )
+    make_join_key_package_with(provider, identity, profile, key_package_lifetime(now))
 }
 
 /// [`make_join_key_package`] with a given lifetime, for tests.
@@ -511,12 +521,17 @@ pub fn check_binding(
     }
 }
 
-/// Verifies a KeyPackage's signatures with OpenMLS.
+/// Verifies a KeyPackage's signatures with OpenMLS. It must have a
+/// lifetime, but the lifetime is not checked against any clock here: the
+/// caller checks it against its own time, a server's with
+/// [`lifetime_acceptable`] and a device's against a post's `t` with
+/// [`lifetime_acceptable_at`] (12.5), never against the system's clock
+/// behind the caller's back.
 pub fn verify_key_package(
     crypto: &impl OpenMlsCrypto,
     key_package: KeyPackageIn,
 ) -> Result<KeyPackage, KeyPackageError> {
-    match key_package.validate(crypto, ProtocolVersion::Mls10) {
+    match key_package.validate_without_lifetime(crypto, ProtocolVersion::Mls10) {
         Ok(key_package) => Ok(key_package),
         Err(KeyPackageVerifyError::LifetimeError(_) | KeyPackageVerifyError::MissingLifetime) => {
             Err(KeyPackageError::Lifetime)
@@ -591,18 +606,20 @@ mod tests {
 
     #[test]
     fn lifetimes() {
-        let now = SystemTime::now();
-        assert!(lifetime_acceptable(
-            &Lifetime::new(KEY_PACKAGE_LIFETIME),
-            now
-        ));
+        let made = Timestamp::from_unix_millis(1_800_000_000_123).unwrap();
+        let lifetime = key_package_lifetime(made);
+        assert_eq!(lifetime.not_before(), 1_800_000_000 - 3600);
+        assert_eq!(lifetime.not_after(), 1_800_000_000 + KEY_PACKAGE_LIFETIME);
+        let now = made.to_system_time();
+        let secs = std::time::Duration::from_secs;
+        assert!(lifetime_acceptable(&lifetime, now));
+        assert!(lifetime_acceptable(&lifetime, now - secs(3600)));
+        assert!(!lifetime_acceptable(&lifetime, now - secs(3601)));
+        let long = Lifetime::init(lifetime.not_before(), lifetime.not_after() + 1);
+        assert!(!lifetime_acceptable(&long, now));
         assert!(!lifetime_acceptable(
-            &Lifetime::new(KEY_PACKAGE_LIFETIME + 1),
-            now
-        ));
-        assert!(!lifetime_acceptable(
-            &Lifetime::new(KEY_PACKAGE_LIFETIME),
-            now + std::time::Duration::from_secs(KEY_PACKAGE_LIFETIME + 10)
+            &lifetime,
+            now + secs(KEY_PACKAGE_LIFETIME + 10)
         ));
     }
 

@@ -42,7 +42,10 @@ leaves already in a tree.
 
 - `KeyPackageIn::validate_without_lifetime` is `validate` without the
   clock; `AddProposalIn::validate` uses it, so incoming Add proposals,
-  by value or in join proposals, are not checked against the clock.
+  by value or in join proposals, are not checked against the clock. It is
+  public, so that risala-mls verifies the KeyPackages it reads with it and
+  checks their lifetimes against its caller's time (a server's clock, or
+  a post's `t`), never the system clock behind its back.
 - `PublicGroup::validate_add_proposals` validates the added leaf node with
   `LeafNodeLifetimePolicy::Skip`.
 - `PublicGroup::from_external` skips the lifetimes of the tree's leaves,

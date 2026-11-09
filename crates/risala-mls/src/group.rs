@@ -56,6 +56,7 @@ use openmls_memory_storage::MemoryStorage;
 use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::random::OpenMlsRand;
 use openmls_traits::storage::StorageProvider as _;
+use risala_proto::time::Timestamp;
 
 use crate::CIPHERSUITE;
 use crate::aad::{
@@ -74,7 +75,8 @@ use crate::conversation::{
 use crate::framing::{ContentType, GROUP_ID_LEN};
 use crate::identity::RisalaIdentity;
 use crate::keypackage::{
-    APP_DATA_DICTIONARY_EXTENSION, NewKeyPackageError, is_last_resort, make_join_key_package,
+    APP_DATA_DICTIONARY_EXTENSION, NewKeyPackageError, is_last_resort, key_package_lifetime,
+    make_join_key_package,
 };
 use crate::mldsa::{KEY_PACKAGE_SCOPE, LeafKey};
 use crate::primitives::{HASH_LEN, ct_eq};
@@ -383,12 +385,14 @@ fn own_handshake_aad<E>(
 /// Creates the group of a new conversation (12.6): a new random 32-byte
 /// group id, this device the only member with a new leaf key, and
 /// `conversation` in the group context. The leaf key is stored with the
-/// group, and the [`EpochState`] is the first epoch's.
+/// group, and the [`EpochState`] is the first epoch's. The leaf's lifetime
+/// is counted from `now`, the device's time ([`key_package_lifetime`]).
 pub fn create_group<P: OpenMlsProvider>(
     provider: &P,
     identity: &RisalaIdentity,
     profile: &RisalaProfile,
     conversation: &RisalaConversation,
+    now: Timestamp,
 ) -> Result<(MlsGroup, LeafKey, EpochState), GroupError<P::StorageError>> {
     conversation
         .check()
@@ -417,6 +421,7 @@ pub fn create_group<P: OpenMlsProvider>(
         .max_past_epochs(MAX_PAST_EPOCHS)
         .sender_ratchet_configuration(sender_ratchet_configuration())
         .padding_size(PADDING_SIZE)
+        .lifetime(key_package_lifetime(now))
         .build(
             provider,
             &leaf_key,
@@ -1079,7 +1084,7 @@ pub struct JoinRequest {
 /// device's or a guest's, and whose leaf carries `profile` (a guest's may
 /// carry none), and the proposal. Once a full client commits it, fetch the
 /// Welcome with `WELCOME GET` and join with [`join_by_welcome`] and the
-/// room's tree.
+/// room's tree. The KeyPackage's lifetime is counted from `now`.
 pub fn join_public_room<P: OpenMlsProvider>(
     provider: &P,
     identity: &RisalaIdentity,
@@ -1087,6 +1092,7 @@ pub fn join_public_room<P: OpenMlsProvider>(
     group_info: &[u8],
     tree: &[u8],
     expect: &JoinExpectation,
+    now: Timestamp,
 ) -> Result<JoinRequest, GroupError<P::StorageError>> {
     let scratch = MemoryStorage::default();
     let public =
@@ -1100,7 +1106,7 @@ pub fn join_public_room<P: OpenMlsProvider>(
     {
         return Err(JoinError::WrongConversation.into());
     }
-    let made = make_join_key_package(provider, identity, profile).map_err(|e| match e {
+    let made = make_join_key_package(provider, identity, profile, now).map_err(|e| match e {
         NewKeyPackageError::Storage(e) => GroupError::Storage(e),
         NewKeyPackageError::Random => GroupError::Random,
         other => GroupError::Mls(other.to_string()),

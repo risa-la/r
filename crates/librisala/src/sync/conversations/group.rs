@@ -46,7 +46,7 @@ fn mls(e: impl std::fmt::Display) -> EngineError {
     EngineError::Mls(e.to_string())
 }
 
-fn ts(ms: u64) -> Timestamp {
+pub(crate) fn ts(ms: u64) -> Timestamp {
     Timestamp::from_unix_millis(ms).unwrap_or(Timestamp::MAX)
 }
 
@@ -181,7 +181,8 @@ pub(crate) fn create(
     let profile =
         RisalaProfile::new(&name, cx.now).ok_or(EngineError::Invalid("display name".into()))?;
     let (group, _, state) =
-        mls_group::create_group(&tx.mls(cx.crypto), &identity, &profile, &ext).map_err(mls)?;
+        mls_group::create_group(&tx.mls(cx.crypto), &identity, &profile, &ext, ts(cx.now))
+            .map_err(mls)?;
     let token_hash = SendToken::of_group(&group, cx.crypto.as_ref())
         .map_err(mls)?
         .hash();
@@ -1405,6 +1406,7 @@ pub(crate) fn make_key_packages(
             cx.uid,
             &profile,
             resort,
+            ts(cx.now),
         )
         .map_err(mls)?;
         let reference = made.key_package.hash_ref(cx.crypto.as_ref()).map_err(mls)?;

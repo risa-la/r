@@ -37,6 +37,10 @@ fn at(minutes: u64) -> Timestamp {
     t0().checked_add(Duration::from_secs(minutes * 60)).unwrap()
 }
 
+fn now() -> Timestamp {
+    Timestamp::from_unix_millis(now_ms()).unwrap()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -95,7 +99,7 @@ impl Device {
 
     fn key_package(&self) -> openmls::prelude::KeyPackage {
         let profile = RisalaProfile::new("", now_ms()).unwrap();
-        make_key_package(&self.provider, &self.key, &self.uid, &profile, false)
+        make_key_package(&self.provider, &self.key, &self.uid, &profile, false, now())
             .unwrap()
             .key_package
     }
@@ -106,6 +110,7 @@ impl Device {
             &self.identity(),
             &self.profile(),
             conversation,
+            now(),
         )
         .unwrap()
         .0
