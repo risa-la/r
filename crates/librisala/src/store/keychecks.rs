@@ -122,8 +122,18 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
 }
 
 fn finish(raw: Raw) -> Result<KeyCheckRow, StoreError> {
-    let (conv, uid, device, kind, signature_key, [init_key, encryption_key, binding], first, state, repair_at, warned) =
-        raw;
+    let (
+        conv,
+        uid,
+        device,
+        kind,
+        signature_key,
+        [init_key, encryption_key, binding],
+        first,
+        state,
+        repair_at,
+        warned,
+    ) = raw;
     Ok(KeyCheckRow {
         conv: ConversationId(conv),
         uid: uid

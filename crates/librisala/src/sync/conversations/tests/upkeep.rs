@@ -249,15 +249,13 @@ fn kept_deletes_are_bounded_and_expire() {
                 .map_err(crate::store::StoreError::from)?)
         })
     };
-    assert_eq!(
-        count(&net),
-        crate::store::messages::MAX_KEPT_DELETES as i64
-    );
+    assert_eq!(count(&net), crate::store::messages::MAX_KEPT_DELETES as i64);
     // The newest are the ones kept.
     let mut newest = [0u8; 16];
     newest[..4].copy_from_slice(&299u32.to_be_bytes());
     assert_eq!(
-        net.write(alice, |tx| Ok(tx.kept_deletes(a, &newest)?)).len(),
+        net.write(alice, |tx| Ok(tx.kept_deletes(a, &newest)?))
+            .len(),
         1
     );
     for _ in 0..9 {

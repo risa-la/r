@@ -215,10 +215,9 @@ impl Store {
     /// next one finishes it.
     pub(crate) fn checkpoint(&self) -> Result<(), StoreError> {
         let conn = self.lock();
-        let _: (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
+        let _: (i64, i64, i64) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         Ok(())
     }
 

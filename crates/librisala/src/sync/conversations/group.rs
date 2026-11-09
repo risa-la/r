@@ -1188,7 +1188,10 @@ fn continues(
         .filter(|i| *i != group.own_leaf_index())
         .and_then(|i| view.leaf(i))
         .ok_or("signed by no other leaf")?;
-    let identity = signer.identity.as_ref().ok_or("a signer with no identity")?;
+    let identity = signer
+        .identity
+        .as_ref()
+        .ok_or("a signer with no identity")?;
     let known = crate::store::conversations::read::leaves(tx.conn(), existing.id)
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -1533,8 +1536,8 @@ pub(crate) fn make_update(
     // LR-M2: an Update's new leaf key is never kept in the outbox; C3
     // rotates leaf keys by commit.
     let profile = own_profile(tx, cx, &group, None)?;
-    let made = mls_group::propose_update(&tx.mls(cx.crypto), &mut group, &profile, None)
-        .map_err(mls)?;
+    let made =
+        mls_group::propose_update(&tx.mls(cx.crypto), &mut group, &profile, None).map_err(mls)?;
     tx.set_outbox_reference(row.id, &made.reference)?;
     Ok((made.message, group.epoch().as_u64()))
 }

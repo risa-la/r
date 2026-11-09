@@ -839,8 +839,10 @@ impl Tx<'_> {
             let mut stmt = self
                 .conn()
                 .prepare_cached("SELECT id, line FROM self_lines WHERE uid = ?1 ORDER BY id")?;
-            stmt.query_map([uid], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?
+            stmt.query_map([uid], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
         };
         let mut lines = Vec::new();
         for (id, line) in rows {

@@ -96,7 +96,10 @@ fn an_unchecked_add_holds_sending_and_is_removed_after_two_hours() {
     )));
     assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
     assert_eq!(net.state(bob, b), ConvState::Left);
-    assert!(net.texts(bob, b).is_empty(), "the removed leaf read nothing");
+    assert!(
+        net.texts(bob, b).is_empty(),
+        "the removed leaf read nothing"
+    );
     // The check goes with the leaf, at the next look.
     net.advance(61 * 1000);
     assert_eq!(checks(&net, alice, a), 0);
@@ -267,10 +270,6 @@ fn a_welcome_reusing_a_known_group_id_is_refused() {
     assert_eq!(after.peer, before.peer);
     assert_eq!(after.epoch, 0, "no epoch from the Welcome");
     assert_eq!(net.leaves(alice, a).len(), 2);
-    assert_eq!(
-        net.convs(alice).len(),
-        1,
-        "and no new conversation from it"
-    );
+    assert_eq!(net.convs(alice).len(), 1, "and no new conversation from it");
     assert_eq!(net.texts(alice, a).len(), 1);
 }

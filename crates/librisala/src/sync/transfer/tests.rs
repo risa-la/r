@@ -921,8 +921,19 @@ fn transfers_apply_only_asked_ranges_and_never_replace() {
         .write(|tx| tx.mark_leaf_verified(c2, leaf, 0))
         .unwrap();
     let rows = net.devices[a2].store.message_rows(c2).unwrap();
-    assert!(!rows.iter().find(|m| m.message_id == [9; 16]).unwrap().verified);
-    assert!(rows.iter().find(|m| m.message_id != [9; 16]).unwrap().verified);
+    assert!(
+        !rows
+            .iter()
+            .find(|m| m.message_id == [9; 16])
+            .unwrap()
+            .verified
+    );
+    assert!(
+        rows.iter()
+            .find(|m| m.message_id != [9; 16])
+            .unwrap()
+            .verified
+    );
     // LR-H3: a transfer's edit and DELETE of a message the device received
     // itself are not applied; those of a copied one are.
     let held = archived.messages[0].message_id;
@@ -1037,7 +1048,12 @@ fn files_are_shared_fetched_checked_and_deleted() {
         let info = block_on(net.jobs(b).fetch_file(cb, &id, false)).unwrap();
         assert_eq!(info.path.as_deref(), Some(saved.as_path()));
         assert_eq!(std::fs::read(&target).unwrap(), b"theirs");
-        assert!(!std::fs::symlink_metadata(&saved).unwrap().file_type().is_symlink());
+        assert!(
+            !std::fs::symlink_metadata(&saved)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         // A directory others may use is refused.
         let open = net.downloads.path().join("open");
         std::fs::create_dir(&open).unwrap();
@@ -1076,7 +1092,12 @@ fn files_are_shared_fetched_checked_and_deleted() {
     net.jobs(b).remove_saved_files().unwrap();
     assert!(!saved.exists());
     assert_eq!(
-        net.devices[b].store.file_row(cb, &id).unwrap().unwrap().path,
+        net.devices[b]
+            .store
+            .file_row(cb, &id)
+            .unwrap()
+            .unwrap()
+            .path,
         None
     );
     let row = net.devices[a1].store.file_row(conv, &id).unwrap().unwrap();

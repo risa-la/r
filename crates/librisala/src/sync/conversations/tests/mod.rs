@@ -6,8 +6,8 @@ mod keychecks;
 mod public;
 mod recovery;
 mod scenarios;
-mod upkeep;
 pub(crate) mod server;
+mod upkeep;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -257,11 +257,8 @@ impl Net {
             blobs: self.server.blobs.clone(),
             blob_mode: self.blob_mode.clone(),
         });
-        let engine = ConversationEngine::new(
-            config.clone(),
-            hooks.clone(),
-            Arc::new(self.clock.clone()),
-        );
+        let engine =
+            ConversationEngine::new(config.clone(), hooks.clone(), Arc::new(self.clock.clone()));
         let d = self.devices.len();
         self.server
             .signed_in

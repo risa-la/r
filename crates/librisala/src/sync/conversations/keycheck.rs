@@ -51,7 +51,9 @@ pub(crate) const RECHECK_EVERY_MS: u64 = 60 * 1000;
 fn emit(applied: &mut Applied, event: ConversationEvent) {
     applied
         .notes
-        .push(Note::Hook(Box::new(Action::Emit(Event::Conversation(event)))));
+        .push(Note::Hook(Box::new(Action::Emit(Event::Conversation(
+            event,
+        )))));
 }
 
 /// What the device itself saw that explains a removal for a check (12.7):
@@ -125,8 +127,7 @@ fn may_repair(tx: &Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow, target: &Uid) -> bool {
     let Ok(group) = group::load(tx, cx, &conv.group_id) else {
         return false;
     };
-    GroupView::of(group.public_group(), &EpochState::default())
-        .may_remove_for_check(cx.uid, target)
+    GroupView::of(group.public_group(), &EpochState::default()).may_remove_for_check(cx.uid, target)
 }
 
 /// Marks a check failed: the repair after a random wait where this device
@@ -445,7 +446,11 @@ pub(super) fn recheck(tx: &mut Tx<'_>, cx: &Ctx<'_>) -> Result<Vec<Action>> {
 
 /// Whether a queued commit waits while sending is held: one with a new
 /// conversation extension would tell the unchecked leaf what it changes.
-pub(super) fn commit_held(tx: &Tx<'_>, conv: ConversationId, intent: Option<&[u8]>) -> Result<bool> {
+pub(super) fn commit_held(
+    tx: &Tx<'_>,
+    conv: ConversationId,
+    intent: Option<&[u8]>,
+) -> Result<bool> {
     let changes_extension = intent
         .and_then(|i| Intent::decode(i).ok())
         .is_some_and(|i| i.conversation.is_some() || i.display_name.is_some());

@@ -648,7 +648,12 @@ async fn pairing_a_device() {
             .iter()
             .any(|d| d.this_device && d.label == "phone" && d.id == request.device)
     );
-    assert!(shown.devices.iter().any(|d| !d.this_device && d.label == "laptop"));
+    assert!(
+        shown
+            .devices
+            .iter()
+            .any(|d| !d.this_device && d.label == "laptop")
+    );
     assert!(phone.store().own_identity(&uid).unwrap().is_none());
     assert!(phone.accounts().unwrap().is_empty());
     let joined = phone.accept_pairing().await.unwrap();
@@ -700,11 +705,11 @@ fn self_conversation(client: &Client, uid: &str, leaves: &[(u32, [u8; 48])]) -> 
     client
         .store()
         .write(|tx| {
-            let account: i64 = tx.conn().query_row(
-                "SELECT id FROM accounts WHERE uid = ?1",
-                [uid],
-                |r| r.get(0),
-            )?;
+            let account: i64 =
+                tx.conn()
+                    .query_row("SELECT id FROM accounts WHERE uid = ?1", [uid], |r| {
+                        r.get(0)
+                    })?;
             tx.conn().execute(
                 "INSERT INTO conversations (account, group_id, kind, pseudonym, created)
                  VALUES (?1, ?2, 'self', ?3, 0)",
@@ -787,12 +792,7 @@ async fn removing_a_device() {
     // The new keys go to the other devices (4.8, step 3), once the
     // conversation with yourself holds none but current, confirmed ones
     // (12.9): here, once the phone's leaf is gone from it.
-    let laptop_id = alice
-        .store()
-        .own_identity(&uid)
-        .unwrap()
-        .unwrap()
-        .device_id;
+    let laptop_id = alice.store().own_identity(&uid).unwrap().unwrap().device_id;
     self_conversation(&alice, &uid, &[(0, laptop_id)]);
     let lines = alice.take_self_lines(&uid).unwrap();
     assert!(
@@ -1129,12 +1129,7 @@ async fn keys_from_the_conversation_with_yourself() {
         .unwrap()
         .unwrap()
         .device_id;
-    let laptop_id = alice
-        .store()
-        .own_identity(&uid)
-        .unwrap()
-        .unwrap()
-        .device_id;
+    let laptop_id = alice.store().own_identity(&uid).unwrap().unwrap().device_id;
     let conv = self_conversation(
         &alice,
         &uid,

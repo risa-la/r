@@ -497,7 +497,10 @@ mod tests {
         let shown = assemble(&[original.clone(), good.clone(), forged.clone()], false);
         assert_eq!(shown[0].text.as_deref(), Some("good"));
         assert!(shown[0].edited);
-        assert_eq!(shown[0].unverified_edit, None, "older than the verified edit");
+        assert_eq!(
+            shown[0].unverified_edit, None,
+            "older than the verified edit"
+        );
         let mut later = forged;
         later.seq = Some(9);
         let shown = assemble(&[original, good, later], false);

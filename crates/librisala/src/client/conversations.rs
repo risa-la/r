@@ -367,9 +367,7 @@ impl FetchState {
             self.ready.push_back(hash);
         }
         self.blobs.insert(hash, Some(got));
-        while self.ready.len() > MAX_READY
-            || (self.ready.len() > 1 && self.held > MAX_HELD)
-        {
+        while self.ready.len() > MAX_READY || (self.ready.len() > 1 && self.held > MAX_HELD) {
             let Some(old) = self.ready.pop_front() else {
                 break;
             };

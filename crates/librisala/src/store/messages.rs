@@ -668,9 +668,7 @@ impl Tx<'_> {
             params![conv.0, id],
         )?;
         self.conn().execute(
-            &format!(
-                "UPDATE outbox SET body = NULL WHERE conv = ?1 AND message_id IN ({targets})"
-            ),
+            &format!("UPDATE outbox SET body = NULL WHERE conv = ?1 AND message_id IN ({targets})"),
             params![conv.0, id],
         )?;
         self.conn().execute(

@@ -386,7 +386,9 @@ fn deletes_are_secure_and_the_wal_is_truncated() {
         .unwrap()
         .0;
     assert_eq!(on, 1);
-    store.set_setting("secret", Some(&"x".repeat(4096))).unwrap();
+    store
+        .set_setting("secret", Some(&"x".repeat(4096)))
+        .unwrap();
     store.set_setting("secret", None).unwrap();
     let wal = dir.path().join("cache.db-wal");
     assert!(std::fs::metadata(&wal).unwrap().len() > 0);
