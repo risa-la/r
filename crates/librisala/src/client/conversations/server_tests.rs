@@ -188,16 +188,22 @@ async fn device_knowing(server: &World, who: &TestIdentity, known: &[&TestIdenti
         })
         .unwrap();
     accept(&client, known);
-    let identity: Identity = uid.parse().unwrap();
+    let d = Device { client, account };
+    connect(&d, who).await;
+    d
+}
+
+/// Signs a device of `who` in, again after [`Client::disconnect`].
+async fn connect(d: &Device, who: &TestIdentity) {
+    let identity: Identity = who.uid().to_string().parse().unwrap();
     let plan = ConnectionPlan::identity(
         Arc::new(IdentitySignIn::new(identity, who.key().clone())),
         1,
     );
-    client
-        .connect_with(account, plan, None, config())
+    d.client
+        .connect_with(d.account, plan, None, config())
         .await
         .unwrap();
-    Device { client, account }
 }
 
 /// A guest, `~<name>` (4.2).
@@ -396,6 +402,197 @@ async fn a_direct_conversation_and_a_private_room_with_two_devices_against_risal
         texts(&laptop, room) == ["room message"] && texts(&phone, pr) == ["room message"]
     })
     .await;
+
+    for d in [&laptop, &phone, &bob] {
+        d.client.disconnect(d.account).await.unwrap();
+    }
+    server.server.stop().await;
+}
+
+/// Device `d`'s conversation in the group of `other`'s `conv`, if it has
+/// one, with its state.
+fn same(
+    d: &Device,
+    other: &Device,
+    conv: ConversationId,
+) -> Option<crate::store::conversations::ConvRow> {
+    let group = other
+        .client
+        .store()
+        .conversation_row(conv)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    d.client
+        .store()
+        .conversation_rows(d.account)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.group_id == group)
+}
+
+/// Whether device `d` is in the group of `other`'s `conv`.
+fn in_group(d: &Device, other: &Device, conv: ConversationId) -> bool {
+    same(d, other, conv).is_some_and(|r| r.state.in_group())
+}
+
+/// 6.1, 12.7: an identity of two devices leaves a direct conversation and
+/// a private room. While the leaving device waits for its SelfRemove to be
+/// committed, its upkeep does not add its other device back; once Bob's
+/// device has committed it, Bob's upkeep does not add Alice's devices
+/// back to the direct conversation either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_identity_that_leaves_stays_out_against_risalad() {
+    use crate::store::conversations::ConvState;
+
+    let server = server().await;
+    let alice_id = server.identity("alice@example.org");
+    let phone_id = server.key_server().new_device(&alice_id);
+    let bob_id = server.identity("bob@example.net");
+    let all = [&alice_id, &phone_id, &bob_id];
+    let laptop = device_knowing(&server, &alice_id, &all).await;
+    let phone = device_knowing(&server, &phone_id, &all).await;
+    let bob = device_knowing(&server, &bob_id, &all).await;
+    for d in [&laptop, &phone, &bob] {
+        uploaded(d).await;
+    }
+    let mut direct = None;
+    for _ in 0..100 {
+        match laptop
+            .client
+            .direct(laptop.account, "bob@example.net")
+            .await
+        {
+            Ok(c) => {
+                direct = Some(c);
+                break;
+            }
+            Err(e) if e.to_string().contains("not-found") => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let direct = direct.expect("started");
+    let room = tokio::time::timeout(
+        Duration::from_secs(60),
+        laptop
+            .client
+            .create_private_room(laptop.account, "planning"),
+    )
+    .await
+    .expect("in time")
+    .unwrap();
+    laptop.client.invite(room, "bob@example.net").await.unwrap();
+    until("everyone is in both", || {
+        [direct, room].iter().all(|c| {
+            in_group(&phone, &laptop, *c)
+                && same(&bob, &laptop, *c).is_some_and(|r| leaves(&bob, r.id) == 3)
+        })
+    })
+    .await;
+    let b = same(&bob, &laptop, direct).unwrap().id;
+    let br = same(&bob, &laptop, room).unwrap().id;
+    // Bob commits in both, so that the laptop's next commits are not held
+    // by the streak limit (12.7).
+    let epoch = |c| {
+        laptop
+            .client
+            .store()
+            .conversation_row(c)
+            .unwrap()
+            .unwrap()
+            .epoch
+    };
+    let before = (epoch(direct), epoch(room));
+    bob.client
+        .set_display_name(bob.account, "Bob")
+        .await
+        .unwrap();
+    until("the laptop applied bob's commits", || {
+        epoch(direct) > before.0 && epoch(room) > before.1
+    })
+    .await;
+
+    // Bob is away, so nobody commits the SelfRemoves yet: the laptop's
+    // commits remove the phone, and the laptop waits, leaving.
+    bob.client.disconnect(bob.account).await.unwrap();
+    laptop.client.leave(direct).await.unwrap();
+    laptop.client.leave(room).await.unwrap();
+    let leaving = |c| {
+        laptop
+            .client
+            .store()
+            .conversation_row(c)
+            .unwrap()
+            .unwrap()
+            .state
+            == ConvState::Leaving
+    };
+    until("the phone is out of both, and the laptop leaving", || {
+        !in_group(&phone, &laptop, direct)
+            && !in_group(&phone, &laptop, room)
+            && leaving(direct)
+            && leaving(room)
+    })
+    .await;
+    // The upkeep stands down while a commit of the device is pending:
+    // run it once none is, so that it acts on the conversation it leaves.
+    let committing_on = |d: &Device, c| {
+        d.client
+            .store()
+            .write(|tx| tx.pending_outbox(c))
+            .unwrap()
+            .0
+            .iter()
+            .any(|o| o.kind == crate::store::messages::OutboxKind::Commit)
+    };
+    let committing = |c| committing_on(&laptop, c);
+    until("the laptop has no commit pending", || !committing(direct)).await;
+    for _ in 0..3 {
+        laptop.client.maintain(laptop.account).await.unwrap();
+        phone.client.maintain(phone.account).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!in_group(&phone, &laptop, direct), "the phone came back");
+    assert!(!in_group(&phone, &laptop, room), "the phone came back");
+    assert!(leaving(direct) && leaving(room));
+    // Nor did it queue a commit to add it: made after its SelfRemove, MLS
+    // refuses it, and it would hold the SelfRemove back for good. And 7.8:
+    // a leaving device makes no move; the move follows the commit of its
+    // SelfRemove, by another member.
+    for c in [direct, room] {
+        assert!(!committing(c), "a leaving device queued a commit");
+    }
+
+    // Bob's device comes back and commits the SelfRemoves: Alice has left
+    // both, and stays out.
+    connect(&bob, &bob_id).await;
+    until("bob committed both SelfRemoves", || {
+        leaves(&bob, b) == 1
+            && leaves(&bob, br) == 1
+            && !in_group(&laptop, &laptop, direct)
+            && !in_group(&laptop, &laptop, room)
+    })
+    .await;
+    // Bob's device moves both groups (7.8); its upkeep then runs.
+    until("bob has no commit pending", || {
+        !committing_on(&bob, b) && !committing_on(&bob, br)
+    })
+    .await;
+    for _ in 0..3 {
+        bob.client.maintain(bob.account).await.unwrap();
+        laptop.client.maintain(laptop.account).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(leaves(&bob, b), 1, "alice's devices were added back");
+    assert_eq!(leaves(&bob, br), 1, "alice's devices were added back");
+    for c in [direct, room] {
+        assert!(!in_group(&laptop, &laptop, c));
+        assert!(!in_group(&phone, &laptop, c));
+    }
 
     for d in [&laptop, &phone, &bob] {
         d.client.disconnect(d.account).await.unwrap();

@@ -754,3 +754,87 @@ fn two_direct_conversations_become_one() {
     );
     assert_eq!(active[0].group_id, low);
 }
+
+#[test]
+fn an_identity_that_left_is_not_added_back() {
+    let mut net = Net::new();
+    let a1 = net.device("alice1", "alice@example.org");
+    let a2 = net.device("alice2", "alice@example.org");
+    let b = net.device("bob", "bob@example.net");
+    for d in [a1, a2, b] {
+        net.connect(d);
+    }
+    let alice: Uid = "alice@example.org".parse().unwrap();
+    let conv = net
+        .job(
+            a1,
+            Job::Direct {
+                peer: "bob@example.net".parse().unwrap(),
+            },
+        )
+        .unwrap();
+    let c2 = net.same_conv(a2, a1, conv).unwrap();
+    let cb = net.same_conv(b, a1, conv).unwrap();
+    assert_eq!(net.leaves(b, cb).len(), 3);
+
+    // Bob is away: nobody commits alice's SelfRemove yet. Alice's first
+    // device leaves: a commit that removes her other device, then a
+    // SelfRemove (6.1).
+    net.disconnect(b);
+    let now = net.clock.now().unix_millis();
+    net.write(a1, |tx| group::leave(tx, conv, &alice, now));
+    net.tick();
+    assert_eq!(net.state(a1, conv), ConvState::Leaving);
+    assert_eq!(net.state(a2, c2), ConvState::Left);
+    // While it is leaving, the device adds nobody: not its identity's
+    // other device back, by any job.
+    let device = net.devices[a2].device_id.as_slice().try_into().unwrap();
+    for job in [
+        Job::Invite {
+            conv,
+            uids: vec![alice.clone()],
+        },
+        Job::Replace {
+            conv,
+            uid: alice.clone(),
+            device,
+        },
+    ] {
+        assert!(net.job(a1, job).is_err());
+    }
+    net.advance(60_000);
+    assert_eq!(net.state(a2, c2), ConvState::Left);
+
+    // Bob commits the SelfRemove: alice has left, and his device does not
+    // add her devices back (6.1, 12.7).
+    net.connect(b);
+    net.advance(60_000);
+    net.advance(60_000);
+    assert_eq!(net.state(a1, conv), ConvState::Left);
+    assert_eq!(net.leaves(b, cb), vec!["bob@example.net".to_owned()]);
+    assert!(net.devices[b].store.departed(cb, &alice).unwrap());
+    let replace = net.write(b, |tx| {
+        let row = tx.conversation(cb)?;
+        crate::sync::conversations::recovery::may_add_back(tx, &row, &alice)
+    });
+    assert!(!replace);
+
+    // To talk again, either starts a new direct conversation: the one she
+    // left does not count, and the new one is kept (5.1).
+    let again = net
+        .job(
+            b,
+            Job::Direct {
+                peer: alice.clone(),
+            },
+        )
+        .unwrap();
+    assert_ne!(again, cb);
+    net.tick();
+    for d in [a1, a2] {
+        let c = net.same_conv(d, b, again).expect("alice's devices joined");
+        assert_eq!(net.state(d, c), ConvState::Active);
+    }
+    assert_eq!(net.state(b, again), ConvState::Active);
+    assert_eq!(net.leaves(b, again).len(), 3);
+}

@@ -1016,6 +1016,16 @@ impl ConversationEngine {
         };
         uids.sort();
         uids.dedup();
+        // 6.1: a device that is leaving a group adds nobody to it, and
+        // fetches no KeyPackages for it.
+        if let Job::Invite { conv, .. } | Job::Replace { conv, .. } | Job::ReplaceAll { conv, .. } =
+            &job
+        {
+            let conv = *conv;
+            if self.write(cx, &me, out, |tx, _| group::leaving(tx, conv))? {
+                return Err(EngineError::Invalid("leaving the conversation".into()));
+            }
+        }
         if let Job::Direct { peer } = &job
             && *peer == me.uid
         {
@@ -1145,11 +1155,7 @@ impl ConversationEngine {
                         )));
                     }
                     // 5.1: at most one direct conversation per pair.
-                    if let Some(existing) = tx.conversations_of(c.account)?.into_iter().find(|r| {
-                        r.kind == ConvKind::Direct
-                            && r.peer.as_ref() == Some(peer)
-                            && r.state.in_group()
-                    }) {
+                    if let Some(existing) = group::direct_with(tx, c.account, peer, None)? {
                         return Ok(Some((existing.id, None)));
                     }
                     let adds = kps_of(&|_| true);
@@ -1747,10 +1753,15 @@ impl ConversationEngine {
                     if own && !removed.is_empty() {
                         // 7.8: the device that removed a leaf moves the
                         // group, once its removal has won. Public rooms do
-                        // not move.
+                        // not move. A device that is leaving does not: the
+                        // move follows the commit of its SelfRemove, by
+                        // another member (6.1).
                         let r = self.write(cx, me, out, |tx, c| {
                             let row = tx.conversation(conv)?;
-                            if row.kind != ConvKind::Public && row.state.in_group() {
+                            if row.kind != ConvKind::Public
+                                && row.state.in_group()
+                                && !group::leaving(tx, conv)?
+                            {
                                 group::queue_intent(
                                     tx,
                                     conv,

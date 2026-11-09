@@ -23,18 +23,33 @@ use risala_proto::command::{Command, KeyPkgCommand};
 /// A day, in ms.
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Whether this device may add devices of `uid` back to `row`'s group by
+/// itself (6.1, 12.7): not while it is leaving the group, not while a leaf
+/// of `uid` has posted a SelfRemove that no commit has applied, and not
+/// once `uid` has left.
+pub(crate) fn may_add_back(tx: &Tx<'_>, row: &ConvRow, uid: &Uid) -> Result<bool, EngineError> {
+    if group::leaving(tx, row.id)? || tx.departed(row.id, uid)? {
+        return Ok(false);
+    }
+    let leaves = crate::store::conversations::read::leaves(tx.conn(), row.id)?;
+    Ok(!leaves.iter().any(|l| l.uid == *uid && l.self_removed))
+}
+
 /// Whether this device may remove a leaf of `uid` in `row`'s group and add
 /// its device again (12.7): always for its own identity and in a direct
 /// conversation; in a private room, an owner's leaf only by an owner, a
 /// moderator's by an owner or moderator, and a plain member's by anyone
 /// while that identity keeps another leaf, otherwise (an invitation) by an
-/// owner or moderator.
+/// owner or moderator. Never where [`may_add_back`] says no.
 pub(crate) fn may_replace(
     tx: &Tx<'_>,
     cx: &Ctx<'_>,
     row: &ConvRow,
     uid: &Uid,
 ) -> Result<bool, EngineError> {
+    if !may_add_back(tx, row, uid)? {
+        return Ok(false);
+    }
     if uid == cx.uid {
         return Ok(true);
     }
@@ -213,7 +228,11 @@ impl ConversationEngine {
         let jobs = self.write(cx, me, out, |tx, c| {
             let mut jobs = Vec::new();
             for row in tx.conversations_of(c.account)? {
-                if row.state != ConvState::Active || row.kind == ConvKind::Public {
+                // 6.1: a device that is leaving puts no device back.
+                if row.state != ConvState::Active
+                    || row.kind == ConvKind::Public
+                    || group::leaving(tx, row.id)?
+                {
                     continue;
                 }
                 let Ok(group) = group::load(tx, c, &row.group_id) else {
@@ -287,7 +306,7 @@ impl ConversationEngine {
     ) -> bool {
         self.write(cx, me, out, |tx, c| {
             let row = tx.conversation(conv)?;
-            if !row.state.in_group() {
+            if !row.state.in_group() || !may_add_back(tx, &row, uid)? {
                 return Ok(false);
             }
             if uid == c.uid {

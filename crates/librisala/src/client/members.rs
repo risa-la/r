@@ -474,7 +474,11 @@ impl Client {
     ///   Other identities' new devices are added by their own devices, so
     ///   that members do not race to add the same device.
     ///
-    /// Nothing is done while a commit of this device is pending there.
+    /// Nothing is done while a commit of this device is pending there, nor
+    /// once this device is leaving: leaving removes the identity's other
+    /// leaves, which must not be added back (6.1). An identity that left
+    /// is not added back either, nor one with a SelfRemove pending (6.1,
+    /// 12.7).
     async fn reconcile(&self, account: AccountId, own: &Uid, row: &ConvRow) -> Result<()> {
         let leaves = self.store().leaf_rows(row.id)?;
         let readers = self.read_new_members(own, row).await?;
@@ -486,12 +490,18 @@ impl Client {
         ) {
             return Ok(());
         }
-        let (pending, _) = self.store().write(|tx| {
-            Ok(tx
-                .pending_outbox(row.id)?
-                .iter()
-                .any(|o| o.kind == crate::store::messages::OutboxKind::Commit))
-        })?;
+        let (pending, _) = self
+            .store()
+            .write_with(|tx| {
+                Ok::<_, crate::sync::conversations::EngineError>(
+                    group::leaving(tx, row.id)?
+                        || tx
+                            .pending_outbox(row.id)?
+                            .iter()
+                            .any(|o| o.kind == crate::store::messages::OutboxKind::Commit),
+                )
+            })
+            .map_err(super::Error::from)?;
         if pending {
             return Ok(());
         }
@@ -553,8 +563,14 @@ impl Client {
         for uid in uids.iter().filter(|u| !u.is_guest()) {
             let has_leaf = leaves.iter().any(|l| l.uid == *uid);
             let ours = uid == own;
-            let returning_peer = row.kind == ConvKind::Direct && !has_leaf;
-            if !(ours || returning_peer) || !may_act_on(uid) {
+            // 12.7: a direct peer with no leaf left comes back, after a
+            // recovery (4.8) or a removal for a check; one that left (6.1)
+            // does not, and starts a new conversation to talk again.
+            let returning_peer =
+                row.kind == ConvKind::Direct && !has_leaf && !self.store().departed(row.id, uid)?;
+            // 12.7: none while the identity has a SelfRemove pending.
+            let self_removing = leaves.iter().any(|l| l.uid == *uid && l.self_removed);
+            if !(ours || returning_peer) || self_removing || !may_act_on(uid) {
                 continue;
             }
             if !self.may_add_devices(uid.as_str())? {

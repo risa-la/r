@@ -300,6 +300,25 @@ pub(crate) fn has_pending_commit(tx: &Tx<'_>, conv: ConversationId) -> Result<bo
         .any(|o| o.kind == OutboxKind::Commit && o.post.is_some()))
 }
 
+/// Whether this device is leaving the conversation (6.1): it is in the
+/// Leaving state, or its commit that removes its identity's other leaves
+/// before the SelfRemove is queued or pending.
+pub(crate) fn leaving(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
+    Ok(tx.conversation(conv)?.state == ConvState::Leaving || leaving_commit_queued(tx, conv)?)
+}
+
+/// Whether this device's commit that removes its identity's other leaves
+/// before its SelfRemove is queued or pending (6.1).
+fn leaving_commit_queued(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
+    Ok(tx.pending_outbox(conv)?.iter().any(|o| {
+        o.kind == OutboxKind::Commit
+            && o.intent
+                .as_deref()
+                .and_then(|i| Intent::decode(i).ok())
+                .is_some_and(|i| i.then == Then::SelfRemove)
+    }))
+}
+
 /// What [`build_commit`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Built {
@@ -347,6 +366,21 @@ pub(crate) fn build_commit(
     if conv.kind == ConvKind::Public {
         public_cleanup(&view, own, cx, &mut remove);
     }
+    // 6.1: leaving removes every other leaf of the identity, as the group
+    // is when the commit is made, not only those it had when the user
+    // left; and while the device leaves, no commit of it adds a device of
+    // its identity back, or the identity would stay through it.
+    let leaving = intent.then == Then::SelfRemove || leaving(tx, conv.id)?;
+    if intent.then == Then::SelfRemove {
+        for leaf in &view.leaves {
+            if leaf.index != own
+                && leaf.identity.as_ref().is_some_and(|id| id.uid == *cx.uid)
+                && !remove.contains(&leaf.index)
+            {
+                remove.push(leaf.index);
+            }
+        }
+    }
     let mut add = Vec::new();
     for fetched in &intent.add {
         let Some(kp) = read_kp(cx, &fetched.key_package) else {
@@ -355,6 +389,9 @@ pub(crate) fn build_commit(
         let Ok(identity) = RisalaIdentity::from_credential(kp.leaf_node().credential()) else {
             continue;
         };
+        if leaving && identity.uid == *cx.uid {
+            continue;
+        }
         // A device that has a leaf already, which this commit does not
         // remove, is not added twice (12.7, one leaf per device).
         let present = view
@@ -944,8 +981,30 @@ fn after_commit(
         tx.set_state(conv.id, ConvState::Active)?;
     }
     if conv.state == ConvState::Leaving {
-        // The SelfRemove belongs to its epoch: post it again (6.1).
-        queue_self_remove(tx, conv.id, cx.now)?;
+        // 6.1: a commit that added a device of the identity meanwhile does
+        // not keep it in: its leaf is removed before the SelfRemove, as
+        // when the user left.
+        let own_index = group.own_leaf_index().u32();
+        let others: Vec<(String, Option<[u8; 48]>)> = tree
+            .iter()
+            .filter(|l| l.uid == *cx.uid && l.leaf != own_index)
+            .map(|l| (l.uid.to_string(), l.device_id))
+            .collect();
+        if others.is_empty() {
+            // The SelfRemove belongs to its epoch: post it again (6.1).
+            queue_self_remove(tx, conv.id, cx.now)?;
+        } else if !leaving_commit_queued(tx, conv.id)? {
+            queue_intent(
+                tx,
+                conv.id,
+                &Intent {
+                    remove: others,
+                    then: Then::SelfRemove,
+                    ..Intent::default()
+                },
+                cx.now,
+            )?;
+        }
     }
     applied.notes.push(Note::Committed {
         conv: conv.id,
@@ -960,7 +1019,7 @@ fn after_commit(
 /// otherwise the SelfRemove alone.
 pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<()> {
     let row = tx.conversation(conv)?;
-    if !row.state.in_group() || row.state == ConvState::Leaving {
+    if !row.state.in_group() || leaving(tx, conv)? {
         return Ok(());
     }
     let own_leaves: Vec<(String, Option<[u8; 48]>)> =
@@ -1000,10 +1059,12 @@ pub(crate) fn keep_one_direct(
     if row.kind != ConvKind::Direct {
         return Ok(None);
     }
-    let other = tx.conversations_of(cx.account)?.into_iter().find(|r| {
-        r.id != conv && r.kind == ConvKind::Direct && r.peer == row.peer && r.state.in_group()
-    });
-    let Some(other) = other else { return Ok(None) };
+    let Some(peer) = &row.peer else {
+        return Ok(None);
+    };
+    let Some(other) = direct_with(tx, cx.account, peer, Some(conv))? else {
+        return Ok(None);
+    };
     let higher = if other.group_id < row.group_id {
         row.id
     } else {
@@ -1011,6 +1072,28 @@ pub(crate) fn keep_one_direct(
     };
     leave(tx, higher, cx.uid, cx.now)?;
     Ok(Some(higher))
+}
+
+/// The direct conversation with `peer` that this device is in, other than
+/// `except` (5.1). One that `peer` has left does not count: nobody adds
+/// its devices back (6.1, 12.7), so it starts a new one to talk again.
+pub(crate) fn direct_with(
+    tx: &Tx<'_>,
+    account: crate::store::AccountId,
+    peer: &Uid,
+    except: Option<ConversationId>,
+) -> Result<Option<ConvRow>> {
+    for r in tx.conversations_of(account)? {
+        if Some(r.id) != except
+            && r.kind == ConvKind::Direct
+            && r.peer.as_ref() == Some(peer)
+            && r.state.in_group()
+            && !tx.departed(r.id, peer)?
+        {
+            return Ok(Some(r));
+        }
+    }
+    Ok(None)
 }
 
 /// Queues a SelfRemove, made when it is posted (6.1).

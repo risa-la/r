@@ -741,15 +741,16 @@ impl Client {
     /// mailbox, and adds `uid`'s devices and its own other devices.
     pub async fn direct(&self, account: AccountId, uid: &str) -> Result<ConversationId> {
         let peer: Uid = uid.parse().map_err(|_| Error::invalid("uid", uid))?;
-        let existing = self
-            .store()
-            .conversation_rows(account)?
-            .into_iter()
-            .find(|r| {
-                r.kind == ConvKind::Direct && r.peer.as_ref() == Some(&peer) && r.state.in_group()
-            });
-        if let Some(row) = existing {
-            return Ok(row.id);
+        // One that the peer left does not count: a new one is started
+        // (6.1, 12.7).
+        for r in self.store().conversation_rows(account)? {
+            if r.kind == ConvKind::Direct
+                && r.peer.as_ref() == Some(&peer)
+                && r.state.in_group()
+                && !self.store().departed(r.id, &peer)?
+            {
+                return Ok(r.id);
+            }
         }
         // Task C5: the peer's key file read and its devices addable (12.7).
         self.prepare_members(account, std::slice::from_ref(&peer))
