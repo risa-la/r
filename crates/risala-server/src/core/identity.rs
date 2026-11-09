@@ -254,6 +254,8 @@ async fn auth(cx: &Cx, identity: &Identity, signature: &Signature) -> Reply {
     };
     // An AUTH that may make the server fetch a key file uses up a slot of
     // its address's limit, given back if the file was cached (4.4, 4.6).
+    // Limits per network address are the free tier: past them a client
+    // will go on by proof of work, from M6a (PLAN items 42 and 63).
     let slot = if at_identity_domain(&cx.inner, identity) {
         None
     } else {

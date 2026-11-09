@@ -320,7 +320,9 @@ struct AddressSlot<H> {
 
 impl<H> AddressSlot<H> {
     /// Counts a connection from `peer`, unless its network has its fill
-    /// (4.2). IPv6 addresses count by their /64.
+    /// (4.2). IPv6 addresses count by their /64. Limits per network
+    /// address are the free tier: past them a client will go on by proof of
+    /// work, from M6a (PLAN items 42 and 63).
     fn take(shared: &Arc<Shared<H>>, peer: IpAddr) -> Option<AddressSlot<H>> {
         let key = crate::core::rate::network(peer);
         let mut counts = shared.addresses.lock().unwrap_or_else(|e| e.into_inner());

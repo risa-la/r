@@ -393,6 +393,13 @@ pub struct ServerConfig {
 }
 
 /// Limits and timers. Defaults follow the spec where it names a value.
+///
+/// Limits per network address (an IPv4 address, or an IPv6 /64) are set
+/// for many people behind one address, as behind a Tor exit or a carrier
+/// NAT (2.1, 4.2, 14): connections, guests, room joins and pending
+/// proposals, KEYS PUT and AUTHs that fetch key files. They are the free
+/// tier; past them a client will go on by proof of work, from M6a (PLAN
+/// items 42 and 63).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -690,14 +697,14 @@ impl Default for Limits {
             max_reported_bytes: 16 * 1024 * 1024 * 1024,
             blob_memory: 1024 * 1024 * 1024,
             max_room_blob: 16 * 1024 * 1024,
-            keys_puts_per_hour: 60,
+            keys_puts_per_hour: 240,
             log_outside_identities: true,
             outside_identities_per_day: 100,
-            connections_per_address: 64,
-            guests_per_address: 16,
-            fetching_auths_per_hour: 120,
-            joins_per_hour: 30,
-            pending_per_address: 8,
+            connections_per_address: 256,
+            guests_per_address: 64,
+            fetching_auths_per_hour: 480,
+            joins_per_hour: 120,
+            pending_per_address: 32,
         }
     }
 }

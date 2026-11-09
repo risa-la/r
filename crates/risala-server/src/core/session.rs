@@ -290,7 +290,9 @@ pub(super) async fn guest(cx: &Cx, name: &Name, token: Option<&GuestToken>) -> R
         None => {
             // So many sessions per network address, those waiting to be
             // resumed included, since each holds a name and outlives its
-            // connection (4.2).
+            // connection (4.2). Limits per network address are the free
+            // tier: past them a client will go on by proof of work, from
+            // M6a (PLAN items 42 and 63).
             let max = cx.inner.config.limits.guests_per_address;
             let net = network(ip);
             if max > 0

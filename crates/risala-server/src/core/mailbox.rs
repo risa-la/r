@@ -694,7 +694,9 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     };
     // Join proposals, which need no membership, have a limit of their own
     // per network address, far below that of posts (6.1, 12.6); kept once
-    // the post's other limits pass.
+    // the post's other limits pass. Limits per network address are the
+    // free tier: past them a client will go on by proof of work, from M6a
+    // (PLAN items 42 and 63).
     let join_slot = if matches!(post.token, PostToken::Join)
         && framing.sender == Some(Sender::NewMemberProposal)
     {
@@ -716,7 +718,8 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         }
     }
     // At most so many proposals from one network address pending in one
-    // epoch of a public room (12.6).
+    // epoch of a public room (12.6); proof of work past it comes in M6a
+    // (PLAN items 42 and 63).
     let proposal_from = (public_room && framing.content_type == ContentType::Proposal)
         .then(|| network(cx.peer.ip()));
     if let Some(from) = proposal_from
