@@ -1,9 +1,7 @@
 // The spec, section by section, with what checks each one: example lines
 // the spec tests replay, the TLA+ model, Kani proofs, and the comments in
-// code and tests that cite it. One tab per draft: the published one, and
-// the one the code implements and cites.
+// code and tests that cite it.
 
-import { useState } from "react";
 import { DATA, fileUrl, useJson } from "./data";
 import type { SpecData, SpecSection, Summary } from "./types";
 import { Crumbs, Loading, NoResults } from "./ui";
@@ -11,7 +9,6 @@ import { Crumbs, Loading, NoResults } from "./ui";
 export default function SpecView() {
   const spec = useJson<SpecData>(`${DATA}/spec.json`);
   const summary = useJson<Summary>(`${DATA}/summary.json`);
-  const [tab, setTab] = useState<string | undefined>(undefined);
   if (spec.state === "loading" || summary.state === "loading") return <Loading />;
   const s = summary.state === "ready" ? summary.data : undefined;
   if (spec.state === "missing") {
@@ -27,8 +24,6 @@ export default function SpecView() {
     );
   }
   const data = spec.data;
-  // The code's draft first: it is the one with citations to show.
-  const current = data.drafts.find((d) => d.id === tab) ?? data.drafts.find((d) => d.id === data.codeDraft) ?? data.drafts[0];
   return (
     <section className="panel v-spec">
       <div className="panel-head">
@@ -36,27 +31,14 @@ export default function SpecView() {
       </div>
       <div className="panel-body">
         <h1 className="v-title">by spec section</h1>
-        <p className="v-banner note">
-          <strong>{data.codeDraft} is what the code implements.</strong> {data.codeNote}
+        <p className="v-lede">
+          each section of the spec ({data.draft}) with what checks it. citations are comments in the code that name a
+          section, such as (7.1).
         </p>
-        <div className="v-tabs" role="tablist" aria-label="Drafts">
-          {data.drafts.map((d) => (
-            <button
-              key={d.id}
-              type="button"
-              role="tab"
-              aria-selected={d.id === current?.id}
-              className="button"
-              onClick={() => setTab(d.id)}
-            >
-              {d.id} {d.published ? "· published" : d.id === data.codeDraft ? "· in the code" : ""}
-            </button>
-          ))}
-        </div>
-        {current && current.id !== data.codeDraft && (
+        {data.otherModels.length > 0 && (
           <p className="v-note">
-            code and test citations, and kani proofs, use {data.codeDraft}'s numbers, so they are listed under that tab.
-            this tab shows the published draft's examples and models.
+            {data.otherModels.map((m) => `${m.title} models ${m.draft}`).join("; ")}, whose sections are numbered
+            differently, so {data.otherModels.length === 1 ? "it is" : "they are"} not listed here.
           </p>
         )}
         <div className="v-spec-key label" aria-hidden="true">
@@ -77,8 +59,8 @@ export default function SpecView() {
           </span>
         </div>
       </div>
-      <ul className="v-sections" role="tabpanel">
-        {current?.sections.map((sec) => (
+      <ul className="v-sections">
+        {data.sections.map((sec) => (
           <SectionRow key={sec.num} sec={sec} summary={s} />
         ))}
       </ul>

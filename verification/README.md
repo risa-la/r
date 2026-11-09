@@ -49,11 +49,17 @@ Each one shows less than it may seem to.
   section that a model covers. The model `AsWritten.cfg` is expected to
   find a violation: that is how the findings in `proofs/README.md` were
   found.
-- **Spec drafts.** The code cites draft-02's section numbers, such as
-  `(7.1)`, while it moves to draft-03 (PLAN.md item 59). The published
-  spec in `spec/` is draft-03. The spec view lists both; citations and
-  Kani proofs attach to draft-02, which assemble.ts reads from git
-  (`git show 4634b6ff:SPEC.md`).
+- **Spec sections.** The spec view shows only the latest spec, in
+  `spec/`. A comment in the code that names a section, such as `(7.1)`,
+  is read as that spec's section, and so are the sections in a Kani
+  proof's doc comment. The code still cites draft-02's numbers; it moves
+  to draft-03 before this page is published. A TLA+ model of another
+  draft is named in the view but not placed under its sections, since
+  they are numbered differently: `proofs/sync` models draft-02.
+- **Filled lines.** In the source listing, lines inside a function that
+  are not code (braces, `} else {`, comments, blank lines) are drawn
+  like the code around them, so that a function reads as one block.
+  They are never counted, and the details for such a line say so.
 
 ## How the data flows
 

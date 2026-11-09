@@ -789,17 +789,6 @@ li.bad {
 
 /* The spec view ----------------------------------------------------------- */
 
-.v-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 14px;
-}
-.v-tabs .button[aria-selected="true"] {
-  color: var(--on-ink);
-  background: var(--ink);
-  font-weight: 700;
-}
 .v-spec-key {
   display: flex;
   flex-wrap: wrap;

@@ -2617,11 +2617,15 @@ Open:
       proofs) is listed but left out of the percentages.
     - The site's navigation links the page, and the front page shows a
       summary of its numbers.
-    - Made while building it: the code still cites draft-02's section
-      numbers, so the spec view has a tab per draft. Draft-02's text
-      comes from git (`4634b6ff:SPEC.md`), and code citations, Kani
-      proofs and the TLA+ model are matched against it. Draft-03's
-      tab counts the example lines the spec tests read. When the code
-      moves to draft-03, change `verification/config.json`.
+    - The spec view shows only the latest spec, `spec/`, decided with
+      the user on 2026-11-09. Code citations and Kani proofs' sections
+      are read as its numbers. The code still cites draft-02's, and
+      moves to draft-03 before this branch is merged. A TLA+ model of
+      another draft (`proofs/sync`, draft-02) is named but not placed
+      under sections.
+    - In the source listing, lines inside a function that are not code
+      (braces, `} else {`, comments, blank lines) are drawn like the
+      code around them, so a function reads as one block, decided with
+      the user on 2026-11-09. They are never counted.
     - Kani 0.68.0's coverage mode gives line coverage for all 40
       proofs, so no proof falls back to function-level marks today.
