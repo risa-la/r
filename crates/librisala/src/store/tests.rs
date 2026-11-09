@@ -43,6 +43,7 @@ fn a_new_cache_has_version_1_and_every_area() {
             "conversations",
             "deletes",
             "devices",
+            "engine_timers",
             "epoch_ends",
             "epoch_pseudonyms",
             "file_blobs",
@@ -53,6 +54,7 @@ fn a_new_cache_has_version_1_and_every_area() {
             "held_welcomes",
             "identities",
             "joins",
+            "key_checks",
             "key_packages",
             "leaf_confirmations",
             "leaves",
@@ -107,7 +109,8 @@ fn a_new_cache_has_version_1_and_every_area() {
             "mls",
             "confirm",
             "transfer",
-            "push"
+            "push",
+            "keychecks"
         ]
     );
 }
@@ -365,4 +368,28 @@ fn writes_report_their_changes_once() {
         .read(|c| Ok(c.query_row("SELECT count(*) FROM servers", [], |r| r.get(0))?))
         .unwrap();
     assert_eq!(servers, 0);
+}
+
+/// LR-M1: deleted rows are zeroed in the file, and a checkpoint leaves no
+/// WAL frames behind (12.9, 5.4).
+#[test]
+fn deletes_are_secure_and_the_wal_is_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.db");
+    let store = Store::open(&path, &DatabaseKey::for_tests()).unwrap();
+    let on: i64 = store
+        .write_with(|tx| -> Result<i64, StoreError> {
+            Ok(tx
+                .conn()
+                .query_row("PRAGMA secure_delete", [], |r| r.get(0))?)
+        })
+        .unwrap()
+        .0;
+    assert_eq!(on, 1);
+    store.set_setting("secret", Some(&"x".repeat(4096))).unwrap();
+    store.set_setting("secret", None).unwrap();
+    let wal = dir.path().join("cache.db-wal");
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+    store.checkpoint().unwrap();
+    assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
 }

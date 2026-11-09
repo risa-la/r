@@ -555,6 +555,10 @@ fn self_lines_from_unconfirmed_leaves_are_ignored() {
             ..Config::immediate()
         },
         Arc::new(TestHooks {
+            keys: {
+                net.keys.add(&"alice@example.org".parse().unwrap(), &key);
+                net.keys.clone()
+            },
             key,
             confirm: false,
             blobs: net.server.blobs.clone(),

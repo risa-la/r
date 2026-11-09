@@ -151,6 +151,58 @@ pub enum ConversationEvent {
         /// The added device's identity, if known.
         uid: Option<Uid>,
     },
+    /// A leaf was added that this device could not check yet (12.7): it
+    /// sends nothing in the conversation until the check passes or fails,
+    /// since that leaf would read it. Queued messages wait.
+    SendingHeld {
+        /// The conversation.
+        conversation: ConversationId,
+    },
+    /// The key checks that held sending are done: queued messages go.
+    SendingResumed {
+        /// The conversation.
+        conversation: ConversationId,
+    },
+    /// A key check failed (12.7): an added device's binding does not
+    /// verify under a current device of its identity, it was removed by
+    /// record, or its record was still pending 2 hours on; or a
+    /// committer's device was removed by record. With `repairing`, the
+    /// device removes the leaf after a random wait; without, the checks do
+    /// not let it, and what the leaf sends is hidden.
+    KeyCheckFailed {
+        /// The conversation.
+        conversation: ConversationId,
+        /// The identity of the leaf.
+        uid: Uid,
+        /// Whether this device removes the leaf.
+        repairing: bool,
+    },
+    /// A commit removed leaves for a check whose reason this device could
+    /// not see (12.7): the removal stands, and the user is told who made
+    /// it.
+    RemovalUnchecked {
+        /// The conversation.
+        conversation: ConversationId,
+        /// Who made the commit, if a member did.
+        by: Option<Uid>,
+    },
+    /// Another leaf of the own identity removed a leaf of it whose device
+    /// is still current, without adding it again: it may be a stolen
+    /// device racing its own removal (12.7, 4.8). Told as for ALERT.
+    OwnLeafRemoved {
+        /// The conversation.
+        conversation: ConversationId,
+    },
+    /// A Welcome named the group of a conversation this device has, but
+    /// does not continue it: a later epoch, the same kind and members,
+    /// and signed by a leaf this device knew in it. It was refused, and
+    /// the conversation is unchanged (12.7, 12.8).
+    WelcomeForKnownGroupRefused {
+        /// The conversation.
+        conversation: ConversationId,
+        /// Why.
+        reason: String,
+    },
     /// A guest wants to report something to this identity, an owner or
     /// moderator of a public room here (5.8, 12.7). Accept with
     /// [`Client::accept_report`], or decline with
@@ -256,6 +308,9 @@ pub(crate) struct ClientHooks {
     confirm: Arc<crate::sync::confirm::Confirm>,
     /// The time, for C4's lines.
     clock: Arc<dyn crate::clock::Clock>,
+    /// Whether the engine acts on the key checks of 12.7 (task R2):
+    /// always, except in tests without key files.
+    enforce_key_checks: bool,
 }
 
 /// The most a blob may hold: the tree of the largest public room (12.12).
@@ -326,6 +381,10 @@ impl BlobFetcher {
 }
 
 impl Hooks for ClientHooks {
+    fn enforce_key_checks(&self) -> bool {
+        self.enforce_key_checks
+    }
+
     /// WANT, TRANSFER and REPORT go to transfers and reports (C4).
     fn content_line(
         &self,
@@ -521,6 +580,10 @@ impl Client {
             }),
             confirm: self.confirm_service(),
             clock: self.options().clock.clone(),
+            #[cfg(test)]
+            enforce_key_checks: !self.options().skip_key_checks,
+            #[cfg(not(test))]
+            enforce_key_checks: true,
         })
     }
 

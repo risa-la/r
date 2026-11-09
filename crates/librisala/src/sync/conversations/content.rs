@@ -88,7 +88,11 @@ pub(crate) fn receive(
     let place = d.place(&ext);
     let message = &d.message;
     let message_id = *message.message_id.as_bytes();
-    let hidden = is_blocked(&tx.blocks(cx.account)?, &uid);
+    // 5.7, and 12.7: a leaf that failed a key check this device may not
+    // repair, or has not yet, is hidden as an identity it cannot check.
+    let hidden = is_blocked(&tx.blocks(cx.account)?, &uid)
+        || (!leaf.signature_key.is_empty()
+            && tx.leaf_hidden_by_check(conv.id, &leaf.signature_key)?);
 
     if trust == Trust::Withheld {
         // An epochal group's new pseudonym: nothing is shown until leaf

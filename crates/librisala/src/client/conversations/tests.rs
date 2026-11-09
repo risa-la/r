@@ -180,6 +180,8 @@ async fn person(
             connect_to: Some(addr),
             ..Default::default()
         },
+        // Without key files: the key checks of 12.7 could never pass.
+        skip_key_checks: true,
         ..ClientOptions::default()
     };
     let client = Client::open_in_memory(options).unwrap();

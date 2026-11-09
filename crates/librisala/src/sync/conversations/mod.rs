@@ -39,9 +39,11 @@
 
 pub(crate) mod content;
 pub(crate) mod group;
+mod keycheck;
 pub(crate) mod public;
 mod recovery;
 mod rooms;
+mod upkeep;
 pub(crate) mod wire;
 
 use recovery::may_replace;
@@ -226,6 +228,13 @@ pub(crate) trait Hooks: Send + Sync {
         Box::new(UnknownFacts)
     }
 
+    /// Whether the engine acts on the key checks of 12.7: holds sending
+    /// while an added leaf is unchecked, and repairs failed checks (task
+    /// R2). Always, except for tests that run without key files.
+    fn enforce_key_checks(&self) -> bool {
+        true
+    }
+
     /// Whether this device has confirmed a leaf (12.10). Task C3: this is
     /// the seam of leaf confirmation. Until it is built, no leaf is
     /// confirmed: messages show as unverified, and the lines of the
@@ -383,6 +392,16 @@ pub(crate) enum EngineError {
     /// accepts it (12.7).
     #[error("a report conversation from {0}, held for the user")]
     Hold(Uid),
+    /// A Welcome for the group of a conversation the device has, that does
+    /// not continue it (LR-C1): refused, and the transaction rolled back so
+    /// that the old group stays.
+    #[error("a Welcome for a known group that does not continue it: {reason}")]
+    KnownGroup {
+        /// The conversation.
+        conv: ConversationId,
+        /// Why.
+        reason: String,
+    },
     /// The server changed a public room in a way no commit the device
     /// checked explains: it joins again only if the user accepts (12.7).
     #[error("the server changed the room: {fields:?}")]
@@ -740,6 +759,8 @@ pub struct ConversationEngine {
     welcomes_listed: bool,
     self_requested: bool,
     last_refresh_check: u64,
+    /// Upkeep's times and the timers it saved (task R2).
+    upkeep: upkeep::Upkeep,
 }
 
 impl std::fmt::Debug for ConversationEngine {
@@ -799,6 +820,7 @@ impl ConversationEngine {
             welcomes_listed: false,
             self_requested: false,
             last_refresh_check: 0,
+            upkeep: upkeep::Upkeep::default(),
         }
     }
 
@@ -2344,6 +2366,16 @@ impl ConversationEngine {
                 tracing::info!(%why, "a Welcome refused");
                 true
             }
+            Err(EngineError::KnownGroup { conv, reason }) => {
+                tracing::warn!(%conv, %reason, "a Welcome for a known group refused");
+                out.push(Action::Emit(Event::Conversation(
+                    ConversationEvent::WelcomeForKnownGroupRefused {
+                        conversation: conv,
+                        reason,
+                    },
+                )));
+                true
+            }
             Err(EngineError::Hold(guest)) => {
                 // 12.7: a guest's report conversation waits for the user.
                 let held = self.write(cx, &me, out, |tx, c| {
@@ -2428,13 +2460,17 @@ impl ConversationEngine {
                 Pending::ServerInfo,
             );
         }
-        // Timers first: what they queue is posted in the same step.
+        // Upkeep and timers first: what they queue is posted in the same
+        // step.
+        self.upkeep(cx, &me, now, out)?;
         self.timers_due(cx, &me, now, out)?;
         if self.conversing() {
             self.follow_due(cx, &me, now, out)?;
             self.post_due(cx, &me, out)?;
             self.welcomes_due(cx, &me, now, out)?;
         }
+        // LR-M4: the timers that no other state brings back, kept.
+        self.save_timers(cx, &me, out);
         Ok(())
     }
 
@@ -2916,6 +2952,10 @@ fn next_posts(
             return Ok(Vec::new());
         }
         let row = row.clone();
+        // 12.7: a new extension waits while sending is held.
+        if row.post.is_none() && keycheck::commit_held(tx, conv.id, row.intent.as_deref())? {
+            return Ok(Vec::new());
+        }
         // A commit made for an earlier epoch lost: make it again.
         if row.post.is_none() || row.epoch != Some(epoch) {
             match group::build_commit(tx, c, conv, &row)? {
@@ -3014,6 +3054,11 @@ fn next_posts(
     // No messages until the conversation is created, while it has a
     // last-resort leaf key (12.5), or once it is leaving (6.1).
     if conv.state != ConvState::Active || conv.last_resort {
+        return Ok(Vec::new());
+    }
+    // 12.7: nothing while a leaf added by a commit the device could not
+    // check is unconfirmed, since that leaf would read it.
+    if tx.sending_held(conv.id)? {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();

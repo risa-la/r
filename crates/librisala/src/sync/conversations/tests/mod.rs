@@ -2,9 +2,11 @@
 //! [`server`]: direct conversations, private rooms, the conversation with
 //! yourself, commits racing for an epoch, leaving, gaps and catching up.
 
+mod keychecks;
 mod public;
 mod recovery;
 mod scenarios;
+mod upkeep;
 pub(crate) mod server;
 
 use std::collections::VecDeque;
@@ -29,10 +31,113 @@ use server::FakeServer;
 /// The time the tests start at: 2026-11-09.
 const START: u64 = 1_794_182_400_000;
 
+/// The device keys of the test devices, as their key files would give
+/// them (4.4), for the key checks of 12.7: a registered device is current,
+/// with its key, and never removed; an identity marked unknown has its
+/// facts unknown, as when its key file cannot be read or its record is
+/// pending (4.5).
+#[derive(Clone, Default)]
+pub(crate) struct KnownKeys(Arc<std::sync::Mutex<KnownKeysInner>>);
+
+#[derive(Default)]
+struct KnownKeysInner {
+    keys: std::collections::HashMap<(String, [u8; 48]), Vec<u8>>,
+    unknown: std::collections::HashSet<String>,
+    removed: std::collections::HashSet<(String, [u8; 48])>,
+}
+
+impl KnownKeys {
+    /// Registers a device's key.
+    pub(crate) fn add(&self, uid: &Uid, key: &SigningKey) {
+        self.0.lock().unwrap().keys.insert(
+            (uid.to_string(), *key.device_id().as_bytes()),
+            key.public_key().to_vec(),
+        );
+    }
+
+    /// Makes an identity's facts unknown, or known again.
+    pub(crate) fn set_unknown(&self, uid: &Uid, unknown: bool) {
+        let mut inner = self.0.lock().unwrap();
+        if unknown {
+            inner.unknown.insert(uid.to_string());
+        } else {
+            inner.unknown.remove(uid.as_str());
+        }
+    }
+
+    /// Removes a device by record (4.4).
+    pub(crate) fn remove(&self, uid: &Uid, device: &[u8; 48]) {
+        let mut inner = self.0.lock().unwrap();
+        inner.keys.remove(&(uid.to_string(), *device));
+        inner.removed.insert((uid.to_string(), *device));
+    }
+
+    /// A copy that no longer follows this one: what one device has
+    /// accepted of key files, which another may not have (12.7).
+    pub(crate) fn copy(&self) -> KnownKeys {
+        let inner = self.0.lock().unwrap();
+        KnownKeys(Arc::new(std::sync::Mutex::new(KnownKeysInner {
+            keys: inner.keys.clone(),
+            unknown: inner.unknown.clone(),
+            removed: inner.removed.clone(),
+        })))
+    }
+
+    /// What [`Hooks::device_key_of`] answers.
+    pub(crate) fn device_key_of(&self, uid: &Uid, device: &DeviceId) -> Option<Option<Vec<u8>>> {
+        let inner = self.0.lock().unwrap();
+        if inner.unknown.contains(uid.as_str()) {
+            return None;
+        }
+        Some(
+            inner
+                .keys
+                .get(&(uid.to_string(), *device.as_bytes()))
+                .cloned(),
+        )
+    }
+}
+
+impl KeyFacts for KnownKeys {
+    fn current_device_key(&self, uid: &Uid, device: &DeviceId) -> Fact<Option<Vec<u8>>> {
+        match self.device_key_of(uid, device) {
+            Some(key) => Fact::Known(key),
+            None => Fact::Unknown,
+        }
+    }
+
+    fn device_removed(&self, uid: &Uid, device: &DeviceId) -> Fact<bool> {
+        let inner = self.0.lock().unwrap();
+        if inner.unknown.contains(uid.as_str()) {
+            return Fact::Unknown;
+        }
+        Fact::Known(
+            inner
+                .removed
+                .contains(&(uid.to_string(), *device.as_bytes())),
+        )
+    }
+
+    fn identity_retired(&self, uid: &Uid) -> Fact<bool> {
+        if self.0.lock().unwrap().unknown.contains(uid.as_str()) {
+            return Fact::Unknown;
+        }
+        Fact::Known(false)
+    }
+
+    fn forked_or_missing(&self, uid: &Uid) -> Fact<bool> {
+        if self.0.lock().unwrap().unknown.contains(uid.as_str()) {
+            return Fact::Unknown;
+        }
+        Fact::Known(false)
+    }
+}
+
 /// The hooks of a test device: its device key, and every leaf confirmed,
 /// so that the lines of the conversation with yourself count.
 struct TestHooks {
     key: SigningKey,
+    keys: KnownKeys,
     confirm: bool,
     blobs: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 48], Vec<u8>>>>,
     /// What the blob store answers: 0 the blob, 1 waiting, 2 none.
@@ -46,6 +151,20 @@ impl Hooks for TestHooks {
 
     fn leaf_confirmed(&self, _: &Tx<'_>, _: ConversationId, _: &LeafRow) -> bool {
         self.confirm
+    }
+
+    fn device_key_of(
+        &self,
+        _: &Tx<'_>,
+        _: AccountId,
+        uid: &Uid,
+        device: &DeviceId,
+    ) -> Option<Option<Vec<u8>>> {
+        self.keys.device_key_of(uid, device)
+    }
+
+    fn key_facts<'a>(&'a self, _: &'a Tx<'_>, _: AccountId) -> Box<dyn KeyFacts + 'a> {
+        Box::new(self.keys.clone())
     }
 
     fn blob(&self, _: AccountId, _: Option<&str>, blob: &BlobRef) -> BlobFetch {
@@ -66,6 +185,9 @@ struct Device {
     store: Store,
     account: AccountId,
     engine: ConversationEngine,
+    /// The engine's hooks and settings, to start it again (LR-M4).
+    hooks: Arc<TestHooks>,
+    config: Config,
     device_id: Vec<u8>,
     events: Vec<Event>,
     online: bool,
@@ -86,6 +208,7 @@ struct Net {
     queue: VecDeque<(usize, Owned)>,
     clock: ManualClock,
     blob_mode: Arc<std::sync::atomic::AtomicU8>,
+    keys: KnownKeys,
 }
 
 impl Net {
@@ -96,6 +219,7 @@ impl Net {
             queue: VecDeque::new(),
             clock: ManualClock::new(START),
             blob_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            keys: KnownKeys::default(),
         }
     }
 
@@ -123,13 +247,21 @@ impl Net {
         let account = store.add_account(&addr, kind, &uid).unwrap();
         let key = SigningKey::generate().unwrap();
         let device_id = key.device_id().as_bytes().to_vec();
+        if !uid.is_guest() {
+            self.keys.add(&uid, &key);
+        }
         let hooks = Arc::new(TestHooks {
+            keys: self.keys.clone(),
             key,
             confirm: true,
             blobs: self.server.blobs.clone(),
             blob_mode: self.blob_mode.clone(),
         });
-        let engine = ConversationEngine::new(config, hooks, Arc::new(self.clock.clone()));
+        let engine = ConversationEngine::new(
+            config.clone(),
+            hooks.clone(),
+            Arc::new(self.clock.clone()),
+        );
         let d = self.devices.len();
         self.server
             .signed_in
@@ -140,6 +272,8 @@ impl Net {
             store,
             account,
             engine,
+            hooks,
+            config,
             device_id,
             events: Vec::new(),
             online: false,
@@ -179,6 +313,19 @@ impl Net {
             Owned::Ready(Slot::Anonymous(0), ConnectionKind::Anonymous),
         ));
         self.run();
+    }
+
+    /// Starts a device's engine again, as after the app was killed: what
+    /// it kept in memory is gone, the cache stays (LR-M4).
+    fn restart(&mut self, d: usize) {
+        self.disconnect(d);
+        let dev = &mut self.devices[d];
+        dev.engine = ConversationEngine::new(
+            dev.config.clone(),
+            dev.hooks.clone(),
+            Arc::new(self.clock.clone()),
+        );
+        self.connect(d);
     }
 
     /// Takes a device's connections down.

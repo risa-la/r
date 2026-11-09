@@ -106,6 +106,8 @@ fn client(server: &World, keys: Arc<MemoryKeyStore>) -> Client {
             ..Default::default()
         },
         https: Some(Arc::new(KeyFetcherHttps(fetcher))),
+        // Without key files: the key checks of 12.7 could never pass.
+        skip_key_checks: true,
         ..ClientOptions::default()
     };
     let client = Client::open_in_memory(options).unwrap();

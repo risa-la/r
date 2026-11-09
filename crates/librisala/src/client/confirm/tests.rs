@@ -225,6 +225,8 @@ impl World {
                 ..Default::default()
             },
             clock: Arc::new(self.clock.clone()),
+            // Without key files: the key checks of 12.7 could never pass.
+            skip_key_checks: true,
             ..ClientOptions::default()
         };
         let client = Client::open_in_memory(options).unwrap();

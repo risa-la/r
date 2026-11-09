@@ -39,6 +39,7 @@ pub const PARTS: &[(&str, &str)] = &[
     ("confirm", super::confirm::SCHEMA),
     ("transfer", super::transfer::SCHEMA),
     ("push", super::push::SCHEMA),
+    ("keychecks", super::keychecks::SCHEMA),
 ];
 
 /// Creates the schema in a new database, or checks the version of an

@@ -53,6 +53,7 @@ mod cipher;
 pub mod confirm;
 pub mod conversations;
 pub mod identity;
+pub mod keychecks;
 pub mod keylog;
 pub mod messages;
 pub(crate) mod mls;
@@ -199,6 +200,20 @@ impl Store {
         Ok(store)
     }
 
+    /// Copies the WAL into the cache and truncates it to nothing, so that
+    /// frames holding deleted keys and text do not stay in it (12.9, 5.4;
+    /// LR-M1). Run after deleting secrets, and on the engines' ten-minute
+    /// tick. A checkpoint that readers hold back is not an error: the
+    /// next one finishes it.
+    pub(crate) fn checkpoint(&self) -> Result<(), StoreError> {
+        let conn = self.lock();
+        let _: (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        Ok(())
+    }
+
     /// A cache in memory, for tests and short-lived tools. It is never
     /// written to disk, so it has no key.
     pub fn open_in_memory() -> Result<Store, StoreError> {
@@ -212,6 +227,10 @@ impl Store {
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Deleted keys and text are overwritten with zeros, not left in
+        // free pages (12.9, 5.4; LR-M1). What the WAL still holds goes at
+        // the next checkpoint, see [`Store::checkpoint`].
+        conn.pragma_update(None, "secure_delete", "ON")?;
         schema::create(&mut conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),

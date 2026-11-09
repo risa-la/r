@@ -301,6 +301,16 @@ impl FakeServer {
             .unwrap_or_default()
     }
 
+    /// Keeps a post that a device made earlier, with the server's time
+    /// `t`, as a server that held it back would hand it out late. Returns
+    /// its seq.
+    pub fn inject_post(&mut self, mailbox: &BoxName, t: u64, message: Vec<u8>) -> u64 {
+        let m = self.mailboxes.get_mut(&mailbox.to_string()).unwrap();
+        let seq = m.posts.len() as u64 + 1;
+        m.posts.push((seq, t, message, None));
+        seq
+    }
+
     /// How many KeyPackages a device has here.
     pub fn key_package_count(&self, uid: &str, device: &[u8]) -> usize {
         self.key_packages

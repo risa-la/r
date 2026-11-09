@@ -556,6 +556,9 @@ pub(crate) fn apply_post(
                         .map(mls_message::removed_leaves)
                         .unwrap_or_default();
                     let removed_ids = removed_identities(&group, &removed);
+                    // 12.7: devices this commit added unchecked hold sending
+                    // too (LR-C2).
+                    super::keycheck::record_own(tx, cx, conv, &group, &state, &mut applied)?;
                     let old_token = SendToken::of_group(&group, cx.crypto.as_ref()).map_err(mls)?;
                     let merged =
                         mls_group::merge_own_commit(&tx.mls(cx.crypto), &mut group, &mut state)
@@ -672,26 +675,39 @@ pub(crate) fn apply_post(
                     return Ok(applied);
                 }
             };
-            // The key checks never make it invalid (12.7); their repairs
-            // are the identity area's (task C1).
+            // The key checks never make it invalid (12.7); the engine acts
+            // on what they find (LR-C2).
             {
-                let facts = cx.hooks.key_facts(tx, cx.account);
-                let seen = Seen {
-                    own_uid: cx.uid,
-                    resyncs: &[],
-                    impostors: &[],
+                let (resyncs, impostors) = super::keycheck::seen_leaves(tx, conv.id)?;
+                let report = {
+                    let facts = cx.hooks.key_facts(tx, cx.account);
+                    let seen = Seen {
+                        own_uid: cx.uid,
+                        resyncs: &resyncs,
+                        impostors: &impostors,
+                    };
+                    mls_group::check_received_keys(
+                        &group,
+                        &commit,
+                        &state,
+                        &verdict,
+                        facts.as_ref(),
+                        &seen,
+                    )
                 };
-                let report = mls_group::check_received_keys(
-                    &group,
-                    &commit,
-                    &state,
-                    &verdict,
-                    facts.as_ref(),
-                    &seen,
-                );
                 if report != risala_mls::checks::KeyReport::default() {
                     tracing::info!(?report, "a commit whose key checks need a repair");
                 }
+                let view = GroupView::of(group.public_group(), &state);
+                super::keycheck::record_received(
+                    tx,
+                    cx,
+                    conv,
+                    &view,
+                    &commit.view,
+                    &report,
+                    &mut applied,
+                )?;
             }
             // 12.7: a resync commit undoes a commit this device applied
             // without trouble: possible abuse, by whoever made it.
@@ -789,6 +805,15 @@ pub(crate) fn apply_post(
         }
         ContentType::Application => {
             let mut log = MessageLog::new(tx.conn(), conv.id);
+            // 12.9: past epochs that the clock says are gone, before the
+            // message is decrypted.
+            mls_message::expire_past_epochs_by_clock(
+                &tx.mls(cx.crypto),
+                &mut group,
+                &log,
+                ts(cx.now),
+            )
+            .map_err(mls)?;
             let received = mls_message::receive(
                 &tx.mls(cx.crypto),
                 &mut group,
@@ -845,6 +870,18 @@ fn note_commit(
     let mut log = MessageLog::new(tx.conn(), conv);
     log.note_commit(merged, ts(t), ts(cx.now));
     mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(t)).map_err(mls)?;
+    log.finish()?;
+    Ok(())
+}
+
+/// Deletes the secrets of the group's past epochs, with their
+/// skipped-message keys, 2 hours after this device applied the commit that
+/// ended each, by its own clock, whatever posts arrive (12.9; LR-H1).
+pub(crate) fn expire_by_clock(tx: &mut Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<()> {
+    let mut group = load(tx, cx, &conv.group_id)?;
+    let log = MessageLog::new(tx.conn(), conv.id);
+    mls_message::expire_past_epochs_by_clock(&tx.mls(cx.crypto), &mut group, &log, ts(cx.now))
+        .map_err(mls)?;
     log.finish()?;
     Ok(())
 }
@@ -1112,6 +1149,60 @@ pub(crate) fn epoch_check(tx: &Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<[
         .ok_or(EngineError::Mls("a short epoch authenticator".into()))
 }
 
+/// Whether a Welcome for the group of `existing`, a conversation the
+/// device has, continues it (LR-C1; 12.7, 12.8 say nothing of this case,
+/// so the device trusts the server least): its epoch is later than the
+/// newest the device applied; it is the same kind of conversation, with
+/// the same participants for a direct conversation or the conversation
+/// with yourself; and its GroupInfo was signed by another leaf whose
+/// identity, device and signature key the device knew in the group. Only
+/// a member can sign with such a key, and a member could add a device of
+/// its own anyway; the server cannot.
+fn continues(
+    tx: &Tx<'_>,
+    cx: &Ctx<'_>,
+    existing: &ConvRow,
+    group: &MlsGroup,
+    ext: &RisalaConversation,
+    state: &EpochState,
+) -> std::result::Result<(), String> {
+    let epoch = group.epoch().as_u64();
+    if epoch <= existing.epoch {
+        return Err(format!(
+            "epoch {epoch} is not after the newest applied, {}",
+            existing.epoch
+        ));
+    }
+    if conv_kind(ext, cx.uid) != existing.kind {
+        return Err("another kind of conversation".into());
+    }
+    if matches!(existing.kind, ConvKind::Direct | ConvKind::WithYourself)
+        && peer_of(ext, cx.uid) != existing.peer
+    {
+        return Err("other participants".into());
+    }
+    let view = GroupView::of(group.public_group(), state);
+    let signer = state
+        .started_by
+        .map(LeafNodeIndex::new)
+        .filter(|i| *i != group.own_leaf_index())
+        .and_then(|i| view.leaf(i))
+        .ok_or("signed by no other leaf")?;
+    let identity = signer.identity.as_ref().ok_or("a signer with no identity")?;
+    let known = crate::store::conversations::read::leaves(tx.conn(), existing.id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|l| {
+            l.signature_key == signer.signature_key
+                && l.uid == identity.uid
+                && l.device_id == identity.device_id.map(|d| *d.as_bytes())
+        });
+    if !known {
+        return Err("signed by a leaf this device did not know in the group".into());
+    }
+    Ok(())
+}
+
 /// What [`join_welcome`] did.
 #[derive(Debug)]
 pub(crate) enum Joined {
@@ -1191,8 +1282,19 @@ pub(crate) fn join_welcome(
     if let Some(existing) = tx.conversation_by_group(cx.account, group.group_id().as_slice())? {
         // 12.7: a device whose leaf was replaced from a new KeyPackage
         // (RESYNC, a stale leaf, a refused Welcome) is welcomed into a group
-        // it has: the conversation goes on from the Welcome's epoch. The
-        // Welcome wrote the group over the old one; the old leaf's key goes.
+        // it has: the conversation goes on from the Welcome's epoch, but
+        // only if the Welcome continues the group it had (LR-C1). Anyone
+        // who has seen a group id, the server first, can make a group with
+        // it. Otherwise the transaction rolls back, which keeps the old
+        // group, and the Welcome is refused.
+        if let Err(reason) = continues(tx, cx, &existing, &group, &ext, &joined.state) {
+            return Err(EngineError::KnownGroup {
+                conv: existing.id,
+                reason,
+            });
+        }
+        // The Welcome wrote the group over the old one; the old leaf's key
+        // goes.
         let new_key = group
             .own_leaf_node()
             .map(|l| l.signature_key().as_slice().to_vec());
@@ -1420,29 +1522,6 @@ pub(crate) fn takes_reports(tx: &Tx<'_>, cx: &Ctx<'_>) -> Result<bool> {
     Ok(false)
 }
 
-/// Queues an Update proposal of this device's own leaf in an epochal
-/// group (12.10), with `new_key` as its new leaf key if there is one. It
-/// is made when it is posted, in the epoch the group is then in, and on a
-/// public room's signed-in connection (12.6). For leaf confirmation (task
-/// C3), which decides when a period's new leaf key takes effect.
-#[allow(dead_code)]
-pub(crate) fn queue_update(
-    tx: &mut Tx<'_>,
-    conv: ConversationId,
-    new_key: Option<&risala_mls::mldsa::LeafKey>,
-    now: u64,
-) -> Result<i64> {
-    Ok(tx.queue_outbox(
-        conv,
-        OutboxKind::Update,
-        &NewOutbox {
-            body: new_key.map(|k| k.seed().to_vec()),
-            ..NewOutbox::default()
-        },
-        now,
-    )?)
-}
-
 /// Makes the Update proposal of an outbox row, to post now (12.10).
 pub(crate) fn make_update(
     tx: &mut Tx<'_>,
@@ -1451,18 +1530,11 @@ pub(crate) fn make_update(
     row: &OutboxRow,
 ) -> Result<(Vec<u8>, u64)> {
     let mut group = load(tx, cx, &conv.group_id)?;
-    let new_key = match &row.body {
-        Some(seed) => Some(risala_mls::mldsa::LeafKey::from_seed(
-            seed.as_slice()
-                .try_into()
-                .map_err(|_| EngineError::Invalid("a leaf key seed".into()))?,
-        )),
-        None => None,
-    };
+    // LR-M2: an Update's new leaf key is never kept in the outbox; C3
+    // rotates leaf keys by commit.
     let profile = own_profile(tx, cx, &group, None)?;
-    let made =
-        mls_group::propose_update(&tx.mls(cx.crypto), &mut group, &profile, new_key.as_ref())
-            .map_err(mls)?;
+    let made = mls_group::propose_update(&tx.mls(cx.crypto), &mut group, &profile, None)
+        .map_err(mls)?;
     tx.set_outbox_reference(row.id, &made.reference)?;
     Ok((made.message, group.epoch().as_u64()))
 }

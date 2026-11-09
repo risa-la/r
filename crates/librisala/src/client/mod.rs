@@ -97,6 +97,10 @@ pub struct ClientOptions {
     /// Where fetched files are saved. `None` uses `risala-files` in the
     /// system's temporary directory (task C4).
     pub download_dir: Option<std::path::PathBuf>,
+    /// For tests that run without key files: the group engine does not
+    /// act on the key checks of 12.7 (task R2). Never in a build for use.
+    #[cfg(test)]
+    pub(crate) skip_key_checks: bool,
 }
 
 impl Default for ClientOptions {
@@ -113,6 +117,8 @@ impl Default for ClientOptions {
             https: None,
             file_https: None,
             download_dir: None,
+            #[cfg(test)]
+            skip_key_checks: false,
         }
     }
 }

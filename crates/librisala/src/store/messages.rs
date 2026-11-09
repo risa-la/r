@@ -86,8 +86,8 @@ CREATE TABLE gaps (
 -- next its next hash, welcome the Welcome, intent what it does so that it
 -- can be made again if it loses, 7.2), 'proposal' (a SelfRemove, posted
 -- again in each new epoch until applied, 6.1), 'update' (an Update
--- proposal of the own leaf in an epochal group, body the seed of its new
--- leaf key if it has one, groupinfo its ProposalRef once made, 12.10), 'external' (an external commit to a public room, already
+-- proposal of the own leaf in an epochal group, groupinfo its ProposalRef
+-- once made, 12.10; no seed is ever kept here, LR-M2), 'external' (an external commit to a public room, already
 -- merged here, posted with the token `-`, 12.7). epoch is the epoch post
 -- was made for. state: 'queued', 'sent' (POST in flight), 'posted' (OK
 -- seq=), 'done' (applied in order: won, or seen), 'lost' (a commit that
@@ -114,7 +114,9 @@ CREATE TABLE outbox (
     not_before INTEGER,
     created    INTEGER NOT NULL,
     move_box   TEXT,
-    moved      INTEGER NOT NULL DEFAULT 0
+    moved      INTEGER NOT NULL DEFAULT 0,
+    -- When it was first seen done or lost, for purge_outbox (LR-M2).
+    done_at    INTEGER
 );
 CREATE INDEX outbox_conv ON outbox (conv, state);
 
@@ -647,6 +649,23 @@ impl Tx<'_> {
         message_id: &[u8; 16],
     ) -> Result<(), StoreError> {
         let id = &message_id[..];
+        // 5.4, LR-M2: this device's own copies of what it sent go too: not
+        // yet posted, it is not sent; posting, only the post is kept.
+        let targets = "SELECT message_id FROM messages
+             WHERE conv = ?1 AND own = 1 AND (message_id = ?2 OR edit_of = ?2 OR react_to = ?2)";
+        self.conn().execute(
+            &format!(
+                "DELETE FROM outbox WHERE conv = ?1 AND state IN ('queued', 'done', 'lost')
+                   AND message_id IN ({targets})"
+            ),
+            params![conv.0, id],
+        )?;
+        self.conn().execute(
+            &format!(
+                "UPDATE outbox SET body = NULL WHERE conv = ?1 AND message_id IN ({targets})"
+            ),
+            params![conv.0, id],
+        )?;
         self.conn().execute(
             "UPDATE messages SET deleted = 1, text = NULL, content = NULL, frank_key = NULL
              WHERE conv = ?1 AND (message_id = ?2 OR edit_of = ?2 OR react_to = ?2)",
@@ -860,9 +879,14 @@ impl Tx<'_> {
         let Some(conv) = conv else {
             return Ok(());
         };
+        // Once posted and applied, or lost, the RisalaMessage and the
+        // intent are not needed again: they go at once, and the row a day
+        // later (LR-M2, [`Tx::purge_outbox`]).
         self.conn().execute(
             "UPDATE outbox SET state = ?2, seq = coalesce(?3, seq), not_before = ?4,
-                    attempts = attempts + (?2 = 'sent')
+                    attempts = attempts + (?2 = 'sent'),
+                    body = CASE WHEN ?2 IN ('done', 'lost') THEN NULL ELSE body END,
+                    intent = CASE WHEN ?2 IN ('done', 'lost') THEN NULL ELSE intent END
              WHERE id = ?1",
             params![
                 id,
@@ -917,6 +941,22 @@ impl Tx<'_> {
     }
 
     /// The outbox row whose last post is `post`, if any.
+    /// Deletes outbox rows that have been done or lost for `keep` ms
+    /// (LR-M2): long enough for a post to come back from the mailbox and
+    /// be matched to its row; after that the mailbox's sync point is past
+    /// it (7.4). Rows are stamped with `now` the first time this sees them
+    /// done, so run it every few minutes. Returns how many went.
+    pub(crate) fn purge_outbox(&mut self, now: u64, keep: u64) -> Result<usize, StoreError> {
+        self.conn().execute(
+            "UPDATE outbox SET done_at = ?1 WHERE state IN ('done', 'lost') AND done_at IS NULL",
+            [now as i64],
+        )?;
+        Ok(self.conn().execute(
+            "DELETE FROM outbox WHERE state IN ('done', 'lost') AND done_at <= ?1",
+            [now.saturating_sub(keep) as i64],
+        )?)
+    }
+
     pub(crate) fn outbox_by_post(
         &self,
         conv: ConversationId,

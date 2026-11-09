@@ -272,6 +272,7 @@ impl Commands for DeviceCommands {
 struct C4Hooks {
     key: SigningKey,
     clock: ManualClock,
+    keys: crate::sync::conversations::tests::KnownKeys,
 }
 
 impl Hooks for C4Hooks {
@@ -281,6 +282,24 @@ impl Hooks for C4Hooks {
 
     fn leaf_confirmed(&self, _: &Tx<'_>, _: ConversationId, _: &LeafRow) -> bool {
         true
+    }
+
+    fn device_key_of(
+        &self,
+        _: &Tx<'_>,
+        _: AccountId,
+        uid: &Uid,
+        device: &risala_mls::identity::DeviceId,
+    ) -> Option<Option<Vec<u8>>> {
+        self.keys.device_key_of(uid, device)
+    }
+
+    fn key_facts<'a>(
+        &'a self,
+        _: &'a Tx<'_>,
+        _: AccountId,
+    ) -> Box<dyn risala_mls::checks::KeyFacts + 'a> {
+        Box::new(self.keys.clone())
     }
 
     fn content_line(
@@ -333,6 +352,7 @@ struct Net {
     queue: VecDeque<(usize, Owned)>,
     clock: ManualClock,
     downloads: tempfile::TempDir,
+    keys: crate::sync::conversations::tests::KnownKeys,
 }
 
 impl Net {
@@ -344,6 +364,7 @@ impl Net {
             queue: VecDeque::new(),
             clock: ManualClock::new(START),
             downloads: tempfile::tempdir().unwrap(),
+            keys: Default::default(),
         }
     }
 
@@ -359,9 +380,11 @@ impl Net {
             .unwrap();
         let key = SigningKey::generate().unwrap();
         let device_id = *key.device_id().as_bytes();
+        self.keys.add(&uid, &key);
         let hooks = Arc::new(C4Hooks {
             key,
             clock: self.clock.clone(),
+            keys: self.keys.clone(),
         });
         let engine = ConversationEngine::new(
             Config {
