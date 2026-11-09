@@ -859,3 +859,29 @@ async fn a_public_rooms_commit_and_groupinfo_past_the_line_limit_against_risalad
     }
     server.server.stop().await;
 }
+
+/// `Client::unsettled` waits for the KeyPackages a device uploads when it
+/// signs in (12.5): once it says none are left, another identity can start
+/// a direct conversation with it at the first try.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settled_means_key_packages_are_on_the_server_against_risalad() {
+    let server = server().await;
+    let alice_id = server.identity("alice@example.org");
+    let bob_id = server.identity("bob@example.net");
+    let all = [&alice_id, &bob_id];
+    let alice = device_knowing(&server, &alice_id, &all).await;
+    let bob = device_knowing(&server, &bob_id, &all).await;
+    until("bob's KeyPackages are uploaded", || {
+        bob.client.is_settled(bob.account).unwrap()
+    })
+    .await;
+    assert!(!bob.client.unsettled(bob.account).unwrap().key_packages);
+    alice
+        .client
+        .direct(alice.account, "bob@example.net")
+        .await
+        .expect("bob's KeyPackages are on the server");
+    // After disconnecting, nothing is known of them, and nothing waits.
+    bob.client.disconnect(bob.account).await.unwrap();
+    assert!(!bob.client.unsettled(bob.account).unwrap().key_packages);
+}

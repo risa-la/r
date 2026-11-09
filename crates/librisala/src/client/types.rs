@@ -73,6 +73,34 @@ impl From<crate::store::AccountRow> for Account {
     }
 }
 
+/// What an account has still to get to its servers
+/// ([`Client::unsettled`](crate::Client::unsettled)), for tools that
+/// connect, act and stop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unsettled {
+    /// Posts and commits queued, in flight or not yet seen back.
+    pub outbox: usize,
+    /// Welcomes not yet sent (12.8).
+    pub welcomes: usize,
+    /// Whether the identity has records its log does not hold yet: KEYS
+    /// PUT is still to succeed (4.7).
+    pub records: bool,
+    /// Whether this device's KeyPackages are still to be counted or
+    /// uploaded since it signed in, or failed to be (12.5). Known only
+    /// while the account is connected; `false` otherwise.
+    pub key_packages: bool,
+    /// History transfers other devices asked for with WANT and not yet
+    /// sent (12.13).
+    pub transfers: usize,
+}
+
+impl Unsettled {
+    /// Whether nothing is left.
+    pub fn is_empty(&self) -> bool {
+        *self == Unsettled::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

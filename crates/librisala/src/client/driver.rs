@@ -153,6 +153,15 @@ impl Exec {
         value
     }
 
+    /// Reads the conversation engine, if no one holds it now.
+    pub(crate) fn try_conversations<T>(
+        &self,
+        f: impl FnOnce(&ConversationEngine) -> T,
+    ) -> Option<T> {
+        let engines = self.engines.try_lock().ok()?;
+        Some(f(&engines.conversations))
+    }
+
     /// Gives every engine a tick now, so that what an API call queued is
     /// sent at once.
     pub(crate) async fn kick(&self) {

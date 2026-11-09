@@ -25,7 +25,7 @@ use risala_proto::content::ContentLine;
 use risala_proto::names::{Identity, Uid};
 
 use super::identity::{IdentityError, IdentityEvent};
-use super::types::{AccountId, ConversationId};
+use super::types::{AccountId, ConversationId, Unsettled};
 use super::{Client, Event, Result};
 use crate::keys::KeyStore;
 use crate::store::Tx;
@@ -751,21 +751,50 @@ impl Client {
 }
 
 impl Client {
-    /// Whether the account has nothing left to send: no post or commit
-    /// queued, in flight or not yet seen back, and no Welcome waiting. For
-    /// tools that connect, act and stop (task C5's `risala`).
+    /// Whether the account has nothing left to send: see
+    /// [`unsettled`](Self::unsettled). For tools that connect, act and
+    /// stop (task C5's `risala`).
     pub fn is_settled(&self, account: AccountId) -> Result<bool> {
-        let (pending, _) = self.store().write(|tx| {
-            let outbox = tx.account_outbox(account)?.len() as i64;
+        Ok(self.unsettled(account)?.is_empty())
+    }
+
+    /// What the account has still to get to its servers: posts and
+    /// commits queued, in flight or not yet seen back; Welcomes waiting;
+    /// the identity's records its log does not hold yet (KEYS PUT, 4.7);
+    /// KeyPackages not yet uploaded since signing in (12.5); and history
+    /// asked for with WANT and not yet sent (12.13).
+    pub fn unsettled(&self, account: AccountId) -> Result<Unsettled> {
+        let uid = self.account(account)?.uid;
+        let ((outbox, welcomes, transfers), _) = self.store().write(|tx| {
+            let outbox = tx.account_outbox(account)?.len();
             let welcomes: i64 = tx.conn().query_row(
                 "SELECT count(*) FROM welcomes_out w JOIN conversations c ON c.id = w.conv
                  WHERE c.account = ?1",
                 [account.0],
                 |r| r.get(0),
             )?;
-            Ok(outbox + welcomes)
+            let transfers = tx.want_requests(account)?.len();
+            Ok((outbox, welcomes as usize, transfers))
         })?;
-        Ok(pending == 0)
+        let records = self
+            .store()
+            .records(uid.as_str())?
+            .iter()
+            .any(|r| r.mine && r.log_index.is_none());
+        // Busy engines count as not settled yet; the caller asks again.
+        let key_packages = match self.running().exec(account) {
+            Some(exec) => exec
+                .try_conversations(|e| e.key_packages_pending())
+                .unwrap_or(true),
+            None => false,
+        };
+        Ok(Unsettled {
+            outbox,
+            welcomes,
+            records,
+            key_packages,
+            transfers,
+        })
     }
 }
 
@@ -1009,5 +1038,65 @@ mod tests {
             let line = ContentLine::parse(text).unwrap();
             assert_eq!(is_identity_line(&line), expected, "{text}");
         }
+    }
+
+    /// What is left to send counts the identity's records its log does
+    /// not hold yet (KEYS PUT, 4.7) and WANTs not answered (12.13); an
+    /// account that is not connected has no KeyPackages to wait for.
+    #[test]
+    fn unsettled_counts_unlogged_records_and_wants() {
+        use crate::store::transfer::WantRange;
+        let client = Client::open_in_memory(crate::ClientOptions::default()).unwrap();
+        let account = client.add_identity_account("chat.test", ALICE).unwrap().id;
+        assert_eq!(client.unsettled(account).unwrap(), Unsettled::default());
+        assert!(client.is_settled(account).unwrap());
+
+        // The row as KEYS PUT leaves it: the log's index once logged.
+        let set = |mine: bool, index: Option<i64>| {
+            client
+                .store()
+                .write(|tx| {
+                    tx.conn().execute(
+                        "INSERT INTO records (uid, hash, position, type, record, time,
+                             log_origin, log_vkey, log_index, mine)
+                         VALUES (?1, zeroblob(48), 0, 'master', x'00', 0, 'log', 'vkey', ?2, ?3)
+                         ON CONFLICT (uid, hash) DO UPDATE
+                         SET log_index = excluded.log_index, mine = excluded.mine",
+                        rusqlite::params![ALICE, index, mine],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        set(true, None);
+        assert!(client.unsettled(account).unwrap().records);
+        assert!(!client.is_settled(account).unwrap());
+        set(true, Some(7));
+        assert!(client.is_settled(account).unwrap());
+        // Another device's record, not logged yet, is not this one's to send.
+        set(false, None);
+        assert!(client.is_settled(account).unwrap());
+
+        client
+            .store()
+            .write(|tx| {
+                tx.add_want_request(
+                    account,
+                    "box",
+                    WantRange {
+                        after: 0,
+                        before: None,
+                    },
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            client.unsettled(account).unwrap(),
+            Unsettled {
+                transfers: 1,
+                ..Unsettled::default()
+            }
+        );
     }
 }

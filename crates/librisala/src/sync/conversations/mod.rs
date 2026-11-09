@@ -825,6 +825,9 @@ pub struct ConversationEngine {
     refetched: HashMap<(ConversationId, Uid), (u64, u32)>,
     started: bool,
     welcomes_listed: bool,
+    /// Whether KEYPKG COUNT answered since the last sign-in, and every
+    /// KEYPKG ADD it led to was taken (12.5): for `Client::unsettled`.
+    key_packages_done: bool,
     self_requested: bool,
     last_refresh_check: u64,
     /// Upkeep's times and the timers it saved (task R2).
@@ -889,10 +892,25 @@ impl ConversationEngine {
             refetched: HashMap::new(),
             started: false,
             welcomes_listed: false,
+            key_packages_done: false,
             self_requested: false,
             last_refresh_check: 0,
             upkeep: upkeep::Upkeep::default(),
         }
+    }
+
+    /// Whether this device's KeyPackages are still to be counted or
+    /// uploaded since it signed in (12.5), or failed to be. A guest has
+    /// none.
+    pub(crate) fn key_packages_pending(&self) -> bool {
+        if self.me.as_ref().is_some_and(|me| me.guest) {
+            return false;
+        }
+        !self.key_packages_done
+            || self
+                .inflight
+                .values()
+                .any(|p| matches!(p, Pending::KeyPkgCount | Pending::KeyPkgAdd))
     }
 
     fn crypto(&self) -> Result<Arc<RisalaCrypto>, EngineError> {
@@ -1393,6 +1411,7 @@ impl ConversationEngine {
         match kind {
             ConnectionKind::SignedIn => {
                 self.welcomes_listed = false;
+                self.key_packages_done = false;
                 self.send(
                     out,
                     Target::SignedIn,
@@ -2140,6 +2159,7 @@ impl ConversationEngine {
                 })?;
             }
             Pending::KeyPkgCount => {
+                self.key_packages_done = matches!(response.end, End::Ok(_));
                 if let End::Ok(ok) = &response.end {
                     let count = ok.count().ok().flatten().unwrap_or(0);
                     let last_resort = ok.last_resort().ok().flatten().unwrap_or(false);
@@ -2168,6 +2188,10 @@ impl ConversationEngine {
             Pending::KeyPkgAdd => {
                 if let End::Err(e) = &response.end {
                     tracing::warn!(code = %e.code, "KEYPKG ADD refused");
+                }
+                // Not uploaded: counted and made again at the next sign-in.
+                if !matches!(response.end, End::Ok(_)) {
+                    self.key_packages_done = false;
                 }
             }
             Pending::KeyPkgGet { job, uid } => self.job_reply(cx, job, uid, response, out),
