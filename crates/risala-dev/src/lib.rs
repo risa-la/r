@@ -39,6 +39,16 @@ const LOG_SEED: [u8; 32] = [21; 32];
 /// The seed of the witness's key (development only).
 const WITNESS_SEED: [u8; 32] = [22; 32];
 
+/// The witness's verifier key (4.5), the same in every world: it comes
+/// from a fixed seed, so anyone can sign as this witness. `risala` warns
+/// when a witness policy names it.
+pub fn witness_vkey() -> String {
+    Cosigner::from_seed(&format!("{HOST}/risala-witness"), &WITNESS_SEED)
+        .expect("the witness key")
+        .vkey()
+        .to_string()
+}
+
 /// What to start.
 #[derive(Debug, Clone, Default)]
 pub struct WorldOptions {
@@ -145,10 +155,7 @@ impl World {
             .expect("the log key")
             .vkey()
             .to_string();
-        let witness = Cosigner::from_seed(&format!("{HOST}/risala-witness"), &WITNESS_SEED)
-            .expect("the witness key")
-            .vkey()
-            .to_string();
+        let witness = witness_vkey();
         let marker = dir.join("world");
         let fresh = !marker.exists();
         let w = witness.clone();
