@@ -17,7 +17,7 @@
 //! [`IDLE_TIMEOUT`], the whole must keep up at least [`MIN_RATE`]
 //! ([`transfer_deadline`]), and at every moment the last
 //! `files.min_rate_secs` must have moved `files.min_rate` bytes a second
-//! ([`Pace`], 10.6), so that slow clients cannot hold the listener's
+//! (`Pace`, 10.6), so that slow clients cannot hold the listener's
 //! transfer slots for long.
 //!
 //! Answers: `201` for a stored body, `204` for a deletion, `400` for a
@@ -47,7 +47,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The slowest a whole body or download may go on average, in bytes a
 /// second, after [`TRANSFER_GRACE`], for its overall deadline. A running
-/// minimum ([`Pace`]) applies besides.
+/// minimum (`files.min_rate`) applies besides.
 pub const MIN_RATE: u64 = 64 * 1024;
 
 /// The time every transfer has besides what [`MIN_RATE`] gives it.
