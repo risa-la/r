@@ -1808,10 +1808,14 @@ Open:
     The full findings, with every option the reviewers gave, are kept
     outside the repository in `/home/humaid/repos/risala-m5b/`: the
     reviews (`review-*.md`), the fixers' and coders' choices
-    (`choices-*.md`) and the run's notes (`STATE.md`). Draft-03 had
-    three reviews: round 1 by area, round 2 for security and
-    consistency, round 3 a final one. The codes in parentheses (S-H6,
-    D-M3 and so on) are the reviewers' finding numbers.
+    (`choices-*.md`), the code reviews (`code-review-*.md`), the gaps
+    the coders found in the spec (`spec-problems.md`) and the run's
+    notes (`STATE.md`). Draft-03 had three reviews: round 1 by area,
+    round 2 for security and consistency, round 3 a final one. The codes
+    in parentheses (S-H6, D-M3 and so on) are the reviewers' finding
+    numbers; C1 to C5, SV0 to SV6, M1 to M4 and the like name the coding
+    task that made a choice, and R2 the fixes after the code reviews
+    (whose findings are LR-, SR- and so on).
 
     **Choices that change something the user decided.** Each of these
     goes back on, or narrows, an earlier item. They are in the spec now,
@@ -1934,8 +1938,67 @@ Open:
       direct conversation can take up to 10 minutes to reach the other
       side.
     - **A server with a key log logs outside identities whose chains
-      name it** (4.7; code, SV1), with no switch to refuse. Item 60 let
-      a server refuse.
+      name it** (4.7; code, SV1, R2). SV1 left no switch to refuse,
+      against item 60; R2 added one (`limits.log_outside_identities`, on
+      by default; off, such a KEYS PUT gets `ERR not-supported`), so
+      item 60's choice is back. It also caps new outside identities at
+      100 a day per registered domain.
+
+    The client and review work (C2b to C5, R2) added these, which are
+    in the code, not the spec:
+
+    - **Daily leaf rotation is by commit in librisala** (12.10; C3).
+      The spec rotates leaves in large rooms by Update proposals (the
+      bullet above). librisala's epochal groups instead make the day's
+      new leaf key with a commit of their own, at a planned time or
+      before the period's first message. The Update path, with others
+      batching and the 30-minute fallback, is not built, so a large room
+      gets a commit per active sender per day, as item 60 had.
+    - **With no witnesses set, nobody is added** (4.5, 4.10; C1, C5).
+      The apps ship with an empty witness list (below), so no record is
+      ever accepted, and devices add only accepted devices. Until a
+      witness policy is set, an app can add nobody to any conversation.
+      This keeps the rule but makes the 2-of-3 default unusable out of
+      the box until independent witnesses run. Development setups and
+      risala-cli set one (`--witness`, `--witness-k`).
+    - **Only an identity's own devices add its new devices** (12.14;
+      C5). 12.14 says any member's device adds an identity's devices
+      that have no leaf, where the Adds checks let it. librisala lets
+      only the identity's own devices do so, and, in a direct
+      conversation, the other participant once the identity has no leaf
+      left (after a recovery). Why: so that members do not race to add
+      the same device. Cost: in a private room nobody re-adds an
+      identity with no leaf left, which R-M1's options below assume an
+      owner or moderator does. Alternative: every member adds, after a
+      random wait.
+    - **risalad keeps times to the hour** (7.5, 14; R2, SR-M2, SR-L5).
+      Mailbox creation and last activity, token-hash use, KeyPackage
+      handouts and Welcome receipt are kept to the hour, and push
+      expiry to the day, so a seized store says less about when people
+      were active. Retention may then run up to an hour late. Posts'
+      times and cids stay exact, since devices are sent them.
+    - **A resent message's ATTEST is remade** (12.9, 12.10; M1d, C3).
+      12.9 says a message's fields are fixed once written, and a message
+      sent again after `ERR stale` keeps its `frank`. But an ATTEST must
+      carry the pseudonym of the epoch it is posted in, so risala-mls
+      remakes it, which changes the content and the `frank`; the message
+      id, counter, `previous`, time and frank key stay. Alternative:
+      drop the ATTEST and attest in the next message.
+    - **File downloads accept classical key exchange** (2.1, 5.6; C4).
+      librisala's HTTPS client for files and blobs uses rustls's default
+      groups, X25519MLKEM768 first but classical ones too, since `get`
+      URLs may be on object stores or CDNs; key-file fetches
+      (risala-keyfetch) already did the same, since a key file may be on
+      any web server. Only chat connections are post-quantum only (2.1).
+      Files and key files are encrypted or signed, so what a later
+      quantum attacker could learn is which ones a device fetched.
+      Alternative: post-quantum only for all HTTPS too.
+    - **M5a's seeded scenarios and bots are gone** (C5). They spoke
+      M5a's plain-text lines (JOIN, MSG), which librisala no longer
+      does. risala-dev is now a library and binary that serves risalad
+      as `chat.test`, with its key log, a witness, HTTPS and a test CA,
+      for librisala's and the CLI's end-to-end tests. Alternative:
+      rebuild seeding on librisala.
 
     **Open decisions.** Round 3 left two findings that need the user.
     The spec now states each risk plainly, but the design is unchanged
@@ -2005,7 +2068,8 @@ Open:
       old. k must be more than half the list; the default stays 2 of 3.
       **The apps ship with an empty witness list** (C1), since no
       independent witnesses run yet, so every log shows "witness list
-      does not fit" until one is set.
+      does not fit", and no record is accepted, until one is set (see
+      above). Accepting a record needs no fresh checkpoint (R2a).
     - **Stale identities** (4.5; I-M14). After 7 days without a fresh
       checkpoint, an identity is shown as stale: no new devices of it
       are added, and sending goes on.
@@ -2024,7 +2088,10 @@ Open:
     - **Pairing** (4.8; I-M13, S-L1, C1). The IdentityBundle travels
       sealed under the QR code's secret. The new device shows the uid
       and the identity's current devices and asks the user to confirm,
-      and finishes only once its record is witnessed (up to 10 minutes).
+      within 10 minutes of opening the bundle (LR-H4), and finishes only
+      once its record is witnessed (up to 10 minutes). A relay named by
+      an IP address is refused (C1b). The history sent at pairing covers
+      only conversations on the home server, where its blobs are (C4).
     - **New lines in the conversation with yourself** (12.9): RECORDS
       (which records each device knows), SERVERS (the identity's
       servers; the first is home) and PIN (server pins, shared across
@@ -2065,10 +2132,47 @@ Open:
       commit removes at most a tenth of the leaves that way. A device
       that sees the server accept a commit it holds invalid tells the
       user, and rejoins only if they choose.
+    - **Public rooms in librisala** (6.1, 12.7; C2b). A joiner learns
+      that its proposal was committed by asking GROUPINFO after each
+      commit it sees, and every 5 minutes, then fetches its Welcome. A
+      resync commit removes only the GroupInfo's signer, since OpenMLS
+      takes no external commit with two Removes; the device's earlier
+      leaf goes in its next commit. A device stuck on a commit tells the
+      user, waits up to 10 minutes, then resyncs if the server is one
+      epoch ahead and otherwise joins again by proposal; it stops only
+      on a change of roles or settings it cannot explain, until the user
+      accepts it. Every full-client commit also clears the device's own
+      earlier leaves, copies, and joins never used for 8 days. Guests
+      never commit or propose Updates.
+    - **A Welcome to a group the device already has** (12.7, 12.8;
+      C2b, LR-C1) is taken only if it continues that group: a later
+      epoch, the same kind and participants, and a signer that was a
+      leaf the device knew. Otherwise it is refused and the old group
+      stays. Cost: a re-add by a member who joined, or rotated its leaf
+      key, while this device was away is refused.
+    - **Sending waits for key checks** (12.7; LR-C2, C5). A device sends
+      no messages in a group while a leaf added there is unchecked
+      against its key file, or a failed check's removal is not yet
+      queued (repairs and other commits still go); a check pending for 2
+      hours counts as failed. A device that is pending or missing from
+      the key file as last read is "unknown", not failed, since the copy
+      may be old; the key file is read again at once when a group's
+      members change. While a key file has never been readable (an
+      outage), a fetched KeyPackage is added unchecked and its leaf
+      stays unconfirmed, which trusts the server more than refusing
+      would.
+    - **Repairs by key file** (12.14; C5). Any member removes the leaves
+      of devices removed by record, and in a private room those of an
+      identity it cannot check, within the owners' and moderators' rule,
+      one identity per commit, on a 5-minute upkeep timer.
     - **RESYNC** (12.7; M-M5). A device that cannot process a commit
       asks, with a RESYNC line, to be replaced. librisala asks only once
       it sees a post of the next epoch it cannot read, so a junk commit
-      does not make every member ask (C2).
+      does not make every member ask (C2). A RESYNC is answered by the
+      leaf's own identity, or, if it has no other leaf, by the other
+      participant of a direct conversation or an owner or moderator of a
+      private room; the request moves to the conversation with yourself
+      after an hour (C2b).
     - **Splits** (7.7; M-M9). READ carries a short check of the epoch,
       which an identity's own devices compare.
     - **Epochal signatures** (12.10; M-M6). REVEAL comes no earlier than
@@ -2077,11 +2181,21 @@ Open:
     - **Past epochs** (12.9; K-H3, S-M6). Their messages are read for at
       most an hour after the commit that ended them, and their secrets
       are deleted 2 hours after it.
-    - **Confirmation in code** (M3). A sender that never answers stays
-      unconfirmed; a wrong answer makes it an impostor.
+    - **Confirmation in code** (M3, C3, R2a). A sender that never
+      answers stays unconfirmed; a wrong answer makes it an impostor,
+      but an answer to a challenge already replaced is ignored.
+      CHALLENGE, ANSWER, ATTEST and REVEAL lines are added to a message
+      just before it is encrypted, so they are bound to the key it is
+      posted with. An Add of an owner's or moderator's device by someone
+      else counts as using authority, and so does a moderator's DELETE.
+      Any member removes an impostor after a random wait, within the
+      owners' and moderators' rule, never in a public room. Not built:
+      the impostor rule for a new own leaf that sends without ATTEST,
+      and offering to undo an impostor's changes.
     - **OpenMLS is vendored** (`crates/openmls`, 0.9.2) with marked
-      patches, so SelfRemove travels as a PrivateMessage and a resync
-      may remove other leaves. `last_resort` needed no patch.
+      patches, so SelfRemove travels as a PrivateMessage, a resync may
+      remove another leaf, and commits and proposals are padded to a
+      Padmé length (R2a). `last_resort` needed no patch.
 
     *Metadata, mailboxes and push.*
     - **Sealed Welcomes** (12.8; D-H1, S-H4). Outside public rooms each
@@ -2095,18 +2209,37 @@ Open:
       librisala keeps one anonymous connection, since spreading out
       helps little without Tor. Devices follow and fetch in ways that
       are hard to link (random order and waits), and never resume TLS
-      sessions.
+      sessions. In public rooms (C2b), an identity's join proposal and
+      its WELCOME GET each take a connection of their own, GROUPINFO
+      goes on the anonymous connection that follows the room, and
+      commits and Updates on the signed-in one.
+    - **Key files of public-room members** (12.10, 12.14; C5). A device
+      reads each member's key file once, when the member appears, so it
+      can check their ATTEST. 12.14 asks only for senders it has
+      confirmed. Cost: a device's address reaches the domain of everyone
+      in the rooms it joins.
     - **What the server keeps** (4.2; D-H5, SV0): no address for an
       anonymous or guest connection beyond the connection, posts with
       mailbox, seq, time and message only, and mailboxes and group ids
       only as hashes. Logs leave addresses out by default.
-    - **Quotas** (5.2; D-H6, SV3). Over a mailbox's quota the server
-      expires the oldest posts early rather than refusing new ones, so
-      one member cannot block a group.
+    - **Quotas** (5.2, 7.5; D-H6, SV3, SV6, R2). Over a mailbox's quota
+      the server expires the oldest posts early rather than refusing new
+      ones, so one member cannot block a group. One quota now counts
+      posts, files and blobs together; files and blobs never expire
+      early, and one that does not fit is refused. R2 spared commits and
+      proposals too, since devices need them to follow: once they alone
+      fill a mailbox, it takes nothing new until retention frees room,
+      so one member can still block a mailbox for a retention period,
+      within the commit rate limit.
     - **Push** (9; D-M4, D-M8, R-L12). Each push waits a random time of
       up to 10 seconds, and notices are padded. Subscriptions last one
       retention period, devices renew them weekly, and subscribing to a
-      mailbox needs one of its send tokens.
+      mailbox needs one of its send tokens, from any set the mailbox
+      still keeps, so a member removed recently can renew for a while
+      (P1f). The limit per mailbox is never below 4,096 (32,768 in a
+      public room), since the server cannot tell a private room from a
+      direct conversation. The app hands librisala its push gateway
+      URLs, and `quiet=` is off by default (C4).
 
     *Content, files, transfer and backups.*
     - **Files in transfers and backups** (12.13; K-M9) are encrypted
@@ -2114,13 +2247,38 @@ Open:
     - **WANT** (12.13; K-M1). A device that fell behind asks its other
       devices for a range; what comes back fills only the gaps, shown as
       copied.
+    - **Transfers in librisala** (12.13; C4, LR-H3). WANT, TRANSFER
+      and their blobs go through the home server, so only gaps in
+      conversations there are filled. A device asks only once FETCH
+      shows posts expired, not yet after being added to a group again.
+      A copied message keeps the sender's `verified` only as "vouched
+      for by" the device that sent it. A transfer's edit, reaction or
+      DELETE applies only to copied messages, and a newer edit less
+      trusted than its message is shown apart.
+    - **Backups are per device** (12.13; C4). The user turns them on
+      for a device, which then makes one at most daily; several devices
+      with backups on each replace the backup. A device that moves the
+      generation, or sees it move, makes one at once. Restored
+      conversations wait until the device is added to them again.
+    - **Downloads** (5.6, 12.11; C4, LR-M3) are saved, only once every
+      check passes, in a private directory under the client's cache,
+      and deleted with their message or conversation. A moderator's
+      DELETE erases the message on the uploader's device too, which then
+      deletes the file with its `del` URL, although 5.6 says a
+      moderator's DELETE cannot remove a file.
     - **No forward secrecy between backups** (K-M6): whoever gets the
       recovery key reads every backup the server kept.
     - **Download origins** (8.5; K-M4). Devices download files without
       asking only from the origins the conversation's server lists.
     - **Reports** (5.8; K-M7, R-L9). The operators' copy carries the
       post's pseudonym, so they can mute it. Operators MUST NOT ban on
-      reports alone, and SHOULD NOT mute on a single one.
+      reports alone, and SHOULD NOT mute on a single one. librisala
+      sends a report to operators on the anonymous connection that
+      follows the room, so they do not learn who reported (C4). A device
+      takes a guest's report conversation only if its identity owns or
+      moderates a public room on that server that allows guests, and
+      joins only once the user accepts (C2b). A REPORT uses its rate
+      limit slot whatever the outcome (R2).
     - **Roles** (6.3; K-M2, K-L2). A ban takes the identity off `owners`
       and `mods`. When no owner has a leaf, moderators may do what
       owners may.
@@ -2132,18 +2290,95 @@ Open:
       least 7. Anonymous connections are on by default. `room_creation`
       now covers public rooms only.
     - **risalad runs the key log and can be a witness** (SV2), with the
-      hand-off to a new log set in its configuration.
-    - **Default limits** (SV3, SV4), per connection and per address: 256
-      MiB per mailbox, 100 MiB uploads, 600 posts a minute and 120 new
-      mailboxes an hour.
+      hand-off to a new log set in its configuration. The witness
+      fetches each log's key from the host's own log
+      (`/risala-log/1/risala/key`), so the `[witness] logs` setting is
+      gone (P1d).
+    - **Default limits** (SV3, SV4, SV6): 4 GiB per mailbox, counting
+      posts, files and blobs; 8 GiB stored per address an hour; 100 MiB
+      uploads; and, per connection and per address, 600 posts a minute
+      and 120 new mailboxes an hour.
+    - **R2's limits** (SR-H1 to SR-M11). The server review added about
+      fifteen limits against floods and running out of memory or disk,
+      each in risalad's configuration: 256 GiB stored in all, 1 GiB of
+      blobs in memory, 64 connections and 16 guests per address (IPv6
+      /64), KEYS PUTs and sign-ins that fetch a key file per hour, 100
+      new outside identities a day per domain, 30 join proposals an hour
+      and 8 pending per room epoch per address, and push subscriptions
+      and sending rates. The table, with the constants, is in
+      `choices-code.md`, section R2.
+    - **Public-room trees** (6.1, 12.6; SV4b, C2b) are inline only up
+      to 8 KiB, so the tree of any room with two or more leaves comes as
+      a blob, and joining needs an HTTPS fetch. Trees and room Welcomes
+      are dropped 24 hours after their commit.
+    - **No conversations on IP-address servers** (6.1; M1d). The room
+      extension names the server, so an account on a server named by an
+      IP address cannot create conversations.
     - **KEYPKG GET** answers only for uids that uploaded KeyPackages
       within retention, so it never fetches key files from a domain a
       client names (SV4).
+
+    *Clients and tools* (C5).
+    - **risala-cli** runs one command per call: it connects, acts, and
+      stays until what it queued is sent. `pair accept` needs no prompt
+      (running it is the user's confirmation) and sends the history
+      unless `--no-history`; `pair new` shows the identity and its
+      devices and asks before joining, unless `--yes`. Not built yet:
+      guests, reports, push, blocks, edits, reactions, deletes, roles.
+    - **A new device does not start a conversation with yourself**
+      (5.1, 4.8) while another device of its identity is current; it
+      waits to be added, so a paired device does not make a second one.
 
     Still to check: the C2SP tag that has ML-DSA-44 cosignatures; which
     X-Wing draft draft-ietf-mls-pq-ciphersuites cites (Section 16 still
     names -06); and the light-client structures copied from
     draft-ietf-mls-partial-02, byte for byte.
+
+    **Spec gaps found while building, not yet settled.** The coders
+    listed these in `spec-problems.md`; the spec still leaves each open.
+    The code's answer is in parentheses.
+
+    - 12.7: a resync commit removes the bad committer's leaf and the
+      device's earlier one, but OpenMLS takes no external commit with
+      two Removes, and removing another's leaf in an external commit
+      departs from RFC 9420 (12.4.3.2) without saying so (earlier leaf
+      in the next commit; OpenMLS patched for the other).
+    - 12.9 vs 12.10: a resent message's fields are fixed, yet its ATTEST
+      must carry the new epoch's pseudonym (ATTEST remade, above).
+    - 12.7 vs 12.9: a leaf that does not answer within an hour is an
+      impostor, so a device offline when added is removed, while the
+      conversation with yourself allows 24 hours.
+    - 12.10: a new challenge replaces the old, and a wrong answer makes
+      an impostor, so an honest late answer to the old one reads as
+      wrong (ignored).
+    - 6.1, 12.8: how a joiner learns its join proposal was committed
+      (GROUPINFO after each commit).
+    - 12.8: "fetched" is undefined for a device's Welcome, also sent
+      live, and for a room's Welcome taken by WELCOME GET (a device's
+      WELCOME DEL; a WELCOME GET does not freeze a room's Welcome).
+    - 12.7, 12.8: what a device does with a Welcome for a group id it
+      already has (only one that continues the group, above).
+    - 7.5: early expiry should spare commits and proposals, and say what
+      happens once they fill the quota (refused until retention frees
+      room).
+    - 12.13: archives keep edits and DELETEs to apply "as on receipt",
+      while a transfer "never replaces or changes a message it holds"
+      (never changes a message the device received itself).
+    - 12.13, 4.8: which server holds a TransferRef's blobs (the home
+      server).
+    - 4.8, 12.13: the IdentityBundle names no sending device, yet copied
+      messages are shown by that device's label.
+    - 12.13: how the "one device of the identity" that makes backups is
+      chosen (each device with backups on).
+    - 12.13, 7.8: how a device archives messages of a mailbox it forgot
+      after a move (left out).
+    - 5.6 vs 5.4: whether the uploader's device deletes its file after a
+      moderator's DELETE (it does).
+    - 12.2: the X-Wing key check does not list a GroupInfo's
+      `external_pub`.
+    - 9.1: the per-mailbox push limit depends on a group's size, which
+      the server cannot know outside public rooms (at least 4,096).
+    - 12.9: no limit on the number of content lines (16,384).
 
 ## 6. Decisions
 
