@@ -1,0 +1,897 @@
+---
+// The Mac client's window, redrawn in HTML and CSS with made-up chats: the top bar
+// of identities and space tabs, the chat list pane, and an open room. Sizes, colors
+// and type follow clients/apple (PanesView, ChatRow, MessageRow, MessageComposer).
+// A picture: screen readers get the label, not the mock data.
+import listIcon from "@phosphor-icons/core/assets/regular/list.svg?raw";
+import expandIcon from "@phosphor-icons/core/assets/regular/arrows-out-simple.svg?raw";
+import closeIcon from "@phosphor-icons/core/assets/regular/x.svg?raw";
+import sendIcon from "@phosphor-icons/core/assets/bold/arrow-up-bold.svg?raw";
+
+type Tint = "ink" | "mode" | "location" | "presence" | "mention" | "wax";
+type Chip = "lina" | "guest";
+
+const tabs: { name: string; chip: Chip; favourite: boolean; mark?: string; markTint?: Tint }[] = [
+  { name: "example", chip: "lina", favourite: true, mark: "2", markTint: "ink" },
+  { name: "makers", chip: "lina", favourite: true, mark: "@", markTint: "mention" },
+  { name: "hudhud", chip: "guest", favourite: false },
+  { name: "nightowls", chip: "lina", favourite: false },
+];
+
+type Row = {
+  room: boolean;
+  name: string;
+  tint: Tint;
+  chip?: Chip;
+  online?: boolean;
+  preview: string;
+  typing?: boolean;
+  time: string;
+  unread?: number;
+  mention?: boolean;
+  selected?: boolean;
+};
+const sections: { title: string; filters?: boolean; rows: Row[] }[] = [
+  {
+    title: "today",
+    filters: true,
+    rows: [
+      { room: true, name: "general", tint: "ink", chip: "lina", preview: "omar: right, every device checks each commit itself", time: "now", selected: true },
+      { room: false, name: "Noor", tint: "ink", online: true, preview: "see you at the meetup?", time: "4m", unread: 1 },
+      { room: true, name: "design", tint: "ink", chip: "lina", preview: "yusuf: @lina can you check the new icons?", time: "18m", unread: 2, mention: true },
+      { room: true, name: "release", tint: "ink", chip: "lina", preview: "rashid is typing", typing: true, time: "1h", unread: 2 },
+      { room: false, name: "Karim", tint: "mode", preview: "you: sent you the key file", time: "3h" },
+    ],
+  },
+  {
+    title: "this week",
+    rows: [
+      { room: true, name: "hudhud", tint: "ink", chip: "guest", preview: "mariam: spotted one on the balcony", time: "2d" },
+      { room: false, name: "Sara", tint: "mention", preview: "thanks!", time: "5d" },
+    ],
+  },
+];
+
+type Entry =
+  | { kind: "day"; label: string; isNew?: boolean }
+  | { kind: "event"; time: string; text: string }
+  | {
+      kind: "message";
+      time?: string;
+      author?: string;
+      tint?: Tint;
+      reply?: string;
+      text: string;
+      reactions?: { emoji: string; count: number; mine?: boolean }[];
+      thread?: string;
+    };
+const timeline: Entry[] = [
+  { kind: "day", label: "today" },
+  { kind: "message", time: "09:12", author: "Omar", tint: "location", text: "morning! draft-03 is up: the zero-trust redesign" },
+  {
+    kind: "message",
+    text: "membership, roles and keys are now checked on your devices, not by the server",
+    reactions: [
+      { emoji: "🎉", count: 4, mine: true },
+      { emoji: "👀", count: 2 },
+    ],
+  },
+  { kind: "message", time: "09:14", author: "Lina", tint: "mode", text: "reading it now" },
+  { kind: "event", time: "09:16", text: "noor joined" },
+  { kind: "day", label: "new", isNew: true },
+  {
+    kind: "message",
+    time: "09:21",
+    author: "Yusuf",
+    tint: "presence",
+    reply: "omar: membership, roles and keys are now checked on your devices, not by the server",
+    text: "so the server can't add someone to a private room?",
+  },
+  {
+    kind: "message",
+    time: "09:22",
+    author: "Omar",
+    tint: "location",
+    text: "right, every device checks each commit itself. a server that tries gets caught",
+    thread: "3 replies · last 09:30",
+  },
+];
+
+// Lit cells of the typing indicator's 4×2 grid, one frame of it.
+const typingDots = [0, 1, 2, 3, 4, 5, 6, 7].map((cell) => [1, 6].includes(cell));
+---
+
+<div class="mock" role="img" aria-label="The risala Mac app: a list of chats beside the open #general room, with a draft reply being typed.">
+  <div class="window" aria-hidden="true">
+    <div class="topbar">
+      <span class="lights"><i></i><i></i><i></i></span>
+      <span class="stack">
+        <span class="chip window lina">L</span>
+        <span class="chip window guest">~</span>
+      </span>
+      <span class="tabs">
+        <span class="tab selected">all <b class="mention">@</b></span>
+        {
+          tabs.map((t, i) => (
+            <>
+              {i > 0 && tabs[i - 1].favourite && !t.favourite && <span class="tab-rule" />}
+              <span class="tab">
+                <span class:list={["chip", t.chip]}>{t.chip === "guest" ? "~" : "L"}</span>
+                <span class:list={[{ other: !t.favourite }]}>{t.name}</span>
+                {t.mark && <b style={`color: var(--${t.markTint})`}>{t.mark}</b>}
+              </span>
+            </>
+          ))
+        }
+      </span>
+      <span class="all-spaces">4 spaces <span>›</span></span>
+    </div>
+
+    <div class="panes">
+      <section class="pane list-pane">
+        <header class="pane-head">
+          <span class="icon" set:html={listIcon} />
+          <span class="pane-title">chats</span>
+        </header>
+        <div class="list">
+          {
+            sections.map((section) => (
+              <>
+                <div class="section-line">
+                  <span>{section.title}</span>
+                  <i />
+                  {section.filters && (
+                    <span class="filters">
+                      <span class="mention">@ 1</span>
+                      <span>
+                        unread <span class="ink">3</span>
+                      </span>
+                      <span>favs</span>
+                      <span>rooms</span>
+                    </span>
+                  )}
+                </div>
+                {section.rows.map((row) => (
+                  <div class:list={["row", { selected: row.selected, unread: row.unread }]}>
+                    <span class:list={["mark", row.room ? "room" : "person"]} style={`--tint: var(--${row.tint})`}>
+                      {row.room ? "#" : row.name[0]}
+                      {row.online && <span class="online" />}
+                    </span>
+                    <span class="row-text">
+                      <span class="row-line">
+                        <span class="name">{row.name}</span>
+                        {row.chip && <span class:list={["chip", row.chip]}>{row.chip === "guest" ? "~" : "L"}</span>}
+                        <span
+                          class="time"
+                          style={row.mention ? "color: var(--mention)" : row.unread ? "color: var(--ink)" : undefined}
+                        >
+                          {row.time}
+                        </span>
+                      </span>
+                      <span class="row-line">
+                        {row.typing ? (
+                          <span class="preview typing">
+                            <span class="dots">
+                              {typingDots.map((lit) => (
+                                <i class:list={{ lit }} />
+                              ))}
+                            </span>
+                            {row.preview}
+                          </span>
+                        ) : (
+                          <span class="preview">{row.preview}</span>
+                        )}
+                        {row.mention ? (
+                          <span class="count" style="background: var(--mention)">
+                            @
+                          </span>
+                        ) : (
+                          row.unread && <span class="count">{row.unread}</span>
+                        )}
+                      </span>
+                    </span>
+                  </div>
+                ))}
+              </>
+            ))
+          }
+        </div>
+        <div class="modebar">
+          <span class="chevron">›</span>
+          <span class="prompt">find or start</span>
+          <span class="shortcut">⌘K</span>
+        </div>
+      </section>
+
+      <section class="pane chat-pane focused">
+        <header class="pane-head">
+          <span class="pane-mark">#</span>
+          <span class="pane-title">general</span>
+          <span class="pane-meta">12 here</span>
+          <span class="controls">
+            <span class="icon" set:html={expandIcon} />
+            <span class="icon" set:html={closeIcon} />
+          </span>
+        </header>
+        <div class="timeline">
+          {
+            timeline.map((entry, i) => {
+              const continues = entry.kind === "message" && !entry.author;
+              const style = i === 0 ? "" : continues ? "margin-top: 2px" : "margin-top: 16px";
+              if (entry.kind === "day")
+                return (
+                  <div class:list={["divider", { new: entry.isNew }]} style={style}>
+                    <i />
+                    <span>{entry.label}</span>
+                  </div>
+                );
+              if (entry.kind === "event")
+                return (
+                  <div class="message" style={style}>
+                    <span class="gutter">{entry.time}</span>
+                    <span class="event">{entry.text}</span>
+                  </div>
+                );
+              return (
+                <div class="message" style={style}>
+                  <span class="gutter">{entry.time}</span>
+                  <div class="body">
+                    {entry.reply && (
+                      <span class="reply">
+                        <span>┌</span>
+                        <span class="clip">{entry.reply}</span>
+                      </span>
+                    )}
+                    {entry.author && (
+                      <span class="author" style={`color: var(--${entry.tint})`}>
+                        {entry.author}
+                      </span>
+                    )}
+                    <p>{entry.text}</p>
+                    {entry.thread && (
+                      <span class="thread">
+                        <span>└─</span> {entry.thread}
+                      </span>
+                    )}
+                    {entry.reactions && (
+                      <span class="reactions">
+                        {entry.reactions.map((r) => (
+                          <span class:list={["reaction", { mine: r.mine }]}>
+                            <b>{r.emoji}</b>
+                            <span>{r.count}</span>
+                          </span>
+                        ))}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })
+          }
+        </div>
+        <div class="bottom">
+          <div class="typing-line">
+            <span class="dots">
+              {typingDots.map((_, i) => <i class:list={{ lit: [3, 4].includes(i) }} />)}
+            </span>
+            noor is typing
+          </div>
+          <div class="composer">
+            <span class="mode">INS</span>
+            <span class="chip large lina">L</span>
+            <span class="chevron">›</span>
+            <span class="draft">nice, the deniability part reads well<span class="caret" /></span>
+            <span class="send" set:html={sendIcon} />
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<style>
+  .mock {
+    container-type: inline-size;
+    /* The system face, as the app uses for names and messages; no system-ui, which
+       some Linux setups resolve to a serif. */
+    --system:
+      -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+  .window {
+    display: flex;
+    flex-direction: column;
+    height: 560px;
+    overflow: hidden;
+    border: 1px solid var(--rule);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow:
+      0 1px 2px color-mix(in srgb, #000 8%, transparent),
+      0 18px 40px -12px color-mix(in srgb, #000 22%, transparent);
+    cursor: default;
+    user-select: none;
+  }
+
+  /* Identity chips: an initial in its tint, or a dashed ~ for a guest name. */
+  .chip {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1;
+  }
+  .chip.lina {
+    color: var(--mode);
+    background: color-mix(in srgb, var(--mode) 20%, transparent);
+  }
+  .chip.guest {
+    color: var(--text-secondary);
+    border: 1px dashed var(--text-tertiary);
+  }
+  .chip.large {
+    width: 22px;
+    height: 22px;
+    font-size: 12px;
+  }
+  .chip.window {
+    width: 28px;
+    height: 28px;
+    font-size: 12px;
+    box-shadow: 0 0 0 2px var(--surface);
+  }
+  .chip.window.lina {
+    background: color-mix(in srgb, var(--mode) 20%, var(--surface));
+  }
+  .chip.window.guest {
+    width: 24px;
+    height: 24px;
+    background: var(--surface);
+  }
+
+  /* The bar across the window, beside the window buttons. */
+  .topbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 44px;
+    padding: 0 12px 0 14px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .lights {
+    display: flex;
+    gap: 8px;
+    margin-right: 22px;
+  }
+  .lights i {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #ff5f57;
+  }
+  .lights i:nth-child(2) {
+    background: #febc2e;
+  }
+  .lights i:nth-child(3) {
+    background: #28c840;
+  }
+  .stack {
+    display: flex;
+    align-items: center;
+  }
+  .stack .guest {
+    margin-left: -8px;
+  }
+  .tabs {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    overflow: hidden;
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  }
+  .tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    color: var(--text);
+  }
+  .tab .other {
+    color: var(--text-tertiary);
+  }
+  .tab.selected {
+    font-weight: 700;
+    color: var(--location);
+    background: color-mix(in srgb, var(--location) 18%, transparent);
+  }
+  .tab-rule {
+    flex: none;
+    width: 1px;
+    height: 18px;
+    margin: 0 6px;
+    background: var(--rule);
+  }
+  .mention {
+    color: var(--mention);
+  }
+  .ink {
+    color: var(--ink);
+  }
+  .all-spaces {
+    flex: none;
+    padding: 5px 12px;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    color: var(--ink);
+  }
+  .all-spaces span {
+    color: var(--text-tertiary);
+  }
+
+  /* The list pane beside the chat pane. */
+  .panes {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    gap: 8px;
+    padding: 0 8px 8px;
+  }
+  .pane {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    background: var(--panel);
+  }
+  .pane.focused {
+    border-color: color-mix(in srgb, var(--text-tertiary) 45%, transparent);
+  }
+  .list-pane {
+    flex: none;
+    width: 320px;
+  }
+  .chat-pane {
+    flex: 1;
+  }
+  .pane-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 38px;
+    padding: 0 10px 0 14px;
+    font-family: var(--system);
+    font-size: 12px;
+  }
+  .icon {
+    display: grid;
+    color: var(--text-secondary);
+  }
+  .icon :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+  .pane-title {
+    color: var(--text);
+  }
+  .pane-mark {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .pane-meta {
+    color: var(--text-tertiary);
+  }
+  .controls {
+    display: flex;
+    gap: 14px;
+    margin-left: auto;
+    padding-right: 6px;
+  }
+  .controls .icon {
+    color: var(--text-tertiary);
+  }
+
+  .list {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .section-line {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 20px 6px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+  }
+  .section-line i {
+    flex: 1;
+    height: 1px;
+    background: var(--rule);
+  }
+  .filters {
+    display: flex;
+    gap: 12px;
+    color: var(--text-secondary);
+  }
+  .filters .mention {
+    color: var(--mention);
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 0 8px;
+    padding: 10px 12px;
+    border-radius: 10px;
+  }
+  .row.selected {
+    background: color-mix(in srgb, var(--ink) 14%, transparent);
+  }
+  .mark {
+    position: relative;
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 9px;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--tint);
+    background: color-mix(in srgb, var(--tint) 18%, transparent);
+  }
+  .mark.person {
+    border-radius: 50%;
+  }
+  .online {
+    position: absolute;
+    right: -1px;
+    bottom: -1px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--presence);
+    box-shadow: 0 0 0 2px var(--panel);
+  }
+  .row-text {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+  }
+  .row-line {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+  .name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--system);
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+  .row.unread .name {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .time {
+    margin-left: auto;
+    padding-left: 3px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  .preview {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--system);
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  .row.unread .preview {
+    color: var(--text-secondary);
+  }
+  .preview.typing {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--ink);
+  }
+  .count {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1.3;
+    color: var(--on-ink);
+    background: var(--ink);
+  }
+
+  /* The typing indicator: a 4×2 grid of dots, some lit. */
+  .dots {
+    flex: none;
+    display: grid;
+    grid-template-columns: repeat(4, 3px);
+    gap: 1.5px;
+  }
+  .dots i {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--text-tertiary) 30%, transparent);
+  }
+  .dots i.lit {
+    background: var(--ink);
+  }
+
+  .modebar {
+    position: relative;
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 40px;
+    margin: 6px 8px 8px;
+    padding: 0 12px;
+    border: 1px solid var(--rule);
+    border-radius: 12px;
+  }
+  /* The list fades out above the command line, as in the app. */
+  .modebar::before {
+    content: "";
+    position: absolute;
+    left: -8px;
+    right: -8px;
+    bottom: calc(100% + 7px);
+    height: 24px;
+    background: linear-gradient(to bottom, transparent, var(--panel));
+    pointer-events: none;
+  }
+  .chevron {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .prompt {
+    flex: 1;
+    font-size: 14px;
+    color: var(--text-tertiary);
+  }
+  .shortcut {
+    padding: 0 6px;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+
+  /* The open room. */
+  .timeline {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 12px 16px 14px;
+    /* Older messages are scrolled away above. */
+    mask-image: linear-gradient(to bottom, transparent, #000 28px);
+  }
+  .divider {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+  .divider i {
+    flex: 1;
+    height: 1px;
+    background: var(--rule);
+  }
+  .divider.new {
+    color: var(--ink);
+  }
+  .divider.new i {
+    background: color-mix(in srgb, var(--ink) 35%, transparent);
+  }
+  .message {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .gutter {
+    flex: none;
+    width: 5ch;
+    font-size: 13px;
+    color: var(--text-tertiary);
+  }
+  .body {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: start;
+    font-family: var(--system);
+    font-size: 13px;
+    line-height: 1.4;
+  }
+  .body p {
+    margin: 0;
+    max-width: none;
+    color: var(--text);
+  }
+  .author {
+    font-weight: 600;
+  }
+  .event {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  .reply {
+    display: flex;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  .clip {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .thread {
+    padding-top: 2px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink);
+  }
+  .reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding-top: 6px;
+  }
+  .reaction {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 24px;
+    padding: 0 8px;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-tertiary);
+    background: color-mix(in srgb, var(--rule) 45%, transparent);
+  }
+  .reaction.mine {
+    font-weight: 700;
+    color: var(--ink);
+    border-color: color-mix(in srgb, var(--ink) 40%, transparent);
+    background: color-mix(in srgb, var(--ink) 18%, transparent);
+  }
+
+  .bottom {
+    flex: none;
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 16px 14px;
+  }
+  .typing-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .composer {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 44px;
+    padding: 9px 14px 9px 9px;
+    border: 1px solid color-mix(in srgb, var(--ink) 50%, transparent);
+    border-radius: 14px;
+    background: var(--panel);
+  }
+  .mode {
+    padding: 3px 7px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.6px;
+    color: var(--on-ink);
+    background: var(--presence);
+  }
+  .draft {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--system);
+    font-size: 13px;
+    color: var(--text);
+  }
+  .caret {
+    display: inline-block;
+    width: 1.5px;
+    height: 1.1em;
+    margin-left: 1px;
+    vertical-align: text-bottom;
+    background: var(--ink);
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .caret {
+      animation: none;
+    }
+  }
+  .send {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    color: var(--on-ink);
+    background: var(--ink);
+  }
+  .send :global(svg) {
+    width: 13px;
+    height: 13px;
+  }
+
+  /* Narrow: the chat pane alone, as when the list is hidden. */
+  @container (max-width: 760px) {
+    .list-pane,
+    .all-spaces {
+      display: none;
+    }
+  }
+  @container (max-width: 480px) {
+    .window {
+      height: 520px;
+    }
+    .lights {
+      margin-right: 4px;
+    }
+    .controls,
+    .pane-meta {
+      display: none;
+    }
+  }
+</style>

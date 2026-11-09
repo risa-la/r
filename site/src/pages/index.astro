@@ -1,39 +1,33 @@
 ---
-import { getCollection } from "astro:content";
 import Base from "../layouts/Base.astro";
 import Breadcrumb from "../components/Breadcrumb.astro";
+import AppMock from "../components/AppMock.astro";
 import Glyph from "../components/Glyph.astro";
-import Transcript from "../components/Transcript.astro";
-import { REPO_URL, docOrder, docTitle, docVersion } from "../docs";
+import { REPO_URL } from "../docs";
+import shieldStar from "@phosphor-icons/core/assets/bold/shield-star-bold.svg?raw";
+import swap from "@phosphor-icons/core/assets/bold/swap-bold.svg?raw";
+import clockCountdown from "@phosphor-icons/core/assets/bold/clock-countdown-bold.svg?raw";
+import personSimpleRun from "@phosphor-icons/core/assets/bold/person-simple-run-bold.svg?raw";
+import cubeTransparent from "@phosphor-icons/core/assets/bold/cube-transparent-bold.svg?raw";
+import hardDrives from "@phosphor-icons/core/assets/bold/hard-drives-bold.svg?raw";
+import appleLogo from "@phosphor-icons/core/assets/bold/apple-logo-bold.svg?raw";
+import googlePlayLogo from "@phosphor-icons/core/assets/bold/google-play-logo-bold.svg?raw";
+import linuxLogo from "@phosphor-icons/core/assets/bold/linux-logo-bold.svg?raw";
 
-const docs = (await getCollection("docs"))
-  .sort((a, b) => docOrder(a.id, b.id))
-  .map((doc) => ({
-    id: doc.id,
-    title: docTitle(doc.id, doc.body),
-    version: docVersion(doc.body),
-  }));
-
-const session = [
-  "$ nix shell github:risa-la/r#risala",
-  "$ risala guest chat.example.org sam",
-  "signed in to chat.example.org as ~sam",
-  "$ risala join chat.example.org #general",
-  "joined #general (1 events stored)",
-  "$ risala send chat.example.org #general hello!",
-  "sent to #general as 2",
-  "$ risala log chat.example.org #general",
-  "[1] 05:39 * ~sam joined",
-  "[2] 05:39 <~sam> hello!",
+const features: { icon: string; tint: "ink" | "mode" | "location" | "mention" | "presence"; title: string; text: string }[] = [
+  { icon: shieldStar, tint: "ink", title: "Everything encrypted", text: "Direct conversations, private rooms and public rooms all use MLS, with a new key for every message. Messages are deniable: one that leaks does not prove who wrote it." },
+  { icon: swap, tint: "mode", title: "Zero trust in the server", text: "Devices check membership, roles and keys themselves. The server carries messages without learning who sent them, or who is in a private conversation." },
+  { icon: clockCountdown, tint: "ink", title: "No history on the server", text: "Encrypted messages wait only until devices fetch them. History moves between your own devices, with an optional backup only your recovery key opens." },
+  { icon: personSimpleRun, tint: "mention", title: "Portable identity", text: "alice@example.org is whoever controls a key file on example.org, and every key is in a log that public witnesses check." },
+  { icon: cubeTransparent, tint: "presence", title: "Post-quantum", text: "ML-KEM hybrid key exchange in TLS, X-Wing in MLS, and ML-DSA signatures for identities and devices." },
+  { icon: hardDrives, tint: "location", title: "Independent servers", text: "No federation, and no server is special. Private rooms of up to 1,000 members, public rooms of up to 10,000." },
 ];
 
-const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" | "presence"; title: string; text: string }[] = [
-  { glyph: "◆", tint: "ink", title: "Everything encrypted", text: "Direct conversations, private rooms and public rooms all use MLS, with a new key for every message. Messages are deniable: one that leaks does not prove who wrote it." },
-  { glyph: "!", tint: "mode", title: "Zero trust in the server", text: "Devices check membership, roles and keys themselves. The server carries messages without learning who sent them, or who is in a private conversation." },
-  { glyph: "↺", tint: "ink", title: "No history on the server", text: "Encrypted messages wait only until devices fetch them. History moves between your own devices, with an optional backup only your recovery key opens." },
-  { glyph: "@", tint: "mention", title: "Portable identity", text: "alice@example.org is whoever controls a key file on example.org, and every key is in a log that public witnesses check." },
-  { glyph: "Q", tint: "presence", title: "Post-quantum", text: "ML-KEM hybrid key exchange in TLS, X-Wing in MLS, and ML-DSA signatures for identities and devices." },
-  { glyph: "#", tint: "location", title: "Independent servers", text: "No federation, and no server is special. Private rooms of up to 1,000 members, public rooms of up to 10,000." },
+// Not released yet: these render as placeholders, not links.
+const stores = [
+  { logo: appleLogo, store: "App Store", platforms: "iPhone, iPad and Mac" },
+  { logo: googlePlayLogo, store: "Google Play", platforms: "Android" },
+  { logo: linuxLogo, store: "Linux", platforms: "desktop" },
 ];
 ---
 
@@ -46,7 +40,7 @@ const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" |
         <p>
           Rooms, direct conversations, guests, replies and reactions, with every conversation
           end-to-end encrypted, public rooms included. The server keeps no history and does not
-          learn who sends what. The spec is at draft-03, a design that the code is being moved to.
+          learn who sends what.
         </p>
         <div class="actions">
           <a class="button primary" href="/spec/">▲ read the spec</a>
@@ -61,7 +55,7 @@ const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" |
         {
           features.map((f) => (
             <li>
-              <Glyph symbol={f.glyph} tint={f.tint} />
+              <Glyph icon={f.icon} tint={f.tint} />
               <div>
                 <strong>{f.title}</strong>
                 <span>{f.text}</span>
@@ -73,30 +67,28 @@ const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" |
     </section>
 
     <section class="panel">
-      <div class="panel-head"><Breadcrumb parts={[{ label: "try it" }]} /></div>
-      <div class="panel-body"><Transcript lines={session} /></div>
-    </section>
-
-    <section class="panel docs">
-      <div class="panel-head"><Breadcrumb parts={[{ label: "documents" }]} /></div>
-      <div class="columns label" aria-hidden="true">
-        <span>id / title</span>
-        <span>version</span>
+      <div class="panel-head"><Breadcrumb parts={[{ label: "apps" }]} /></div>
+      <div class="panel-body apps">
+        <div class="apps-lead">
+          <strong>coming soon</strong>
+          <span>Apps for Apple devices, Android and Linux are on the way.</span>
+        </div>
+        <AppMock />
+        <ul class="stores">
+          {
+            stores.map((s) => (
+              <li class="store" aria-label={`${s.store}, ${s.platforms}: coming soon`}>
+                <span class="store-logo" aria-hidden="true" set:html={s.logo} />
+                <span class="store-name" aria-hidden="true">
+                  <small>{s.platforms}</small>
+                  <strong>{s.store}</strong>
+                </span>
+                <span class="soon" aria-hidden="true">soon</span>
+              </li>
+            ))
+          }
+        </ul>
       </div>
-      <ul>
-        {
-          docs.map((doc) => (
-            <li>
-              <a href={`/${doc.id}/`}>
-                <Glyph symbol="§" />
-                <span class="id">{doc.id}</span>
-                <span class="title">{doc.title}</span>
-                <span class="version">{doc.version}</span>
-              </a>
-            </li>
-          ))
-        }
-      </ul>
     </section>
   </div>
 </Base>
@@ -163,46 +155,71 @@ const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" |
     font-size: 12px;
     color: var(--text-tertiary);
   }
-  .columns,
-  .docs a {
+  .apps {
     display: grid;
-    grid-template-columns: var(--glyph) 14ch 1fr auto;
-    gap: 0 12px;
+    gap: 16px;
+  }
+  .apps-lead {
+    display: grid;
+  }
+  .apps-lead strong {
+    font-size: 15px;
+    font-weight: 800;
+  }
+  .apps-lead span {
+    font-size: 12px;
+    color: var(--text-tertiary);
+  }
+  ul.stores {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: var(--inline);
+    padding: 0;
+  }
+  .store {
+    display: flex;
     align-items: center;
+    gap: 12px;
+    min-height: 56px;
+    padding: 8px 14px;
+    border: 1px dashed var(--rule);
+    border-radius: var(--row-radius);
+    background: color-mix(in srgb, var(--text) 4%, transparent);
   }
-  .columns {
-    padding: 4px calc(var(--panel-padding) + var(--row-padding));
-    border-bottom: 1px solid var(--rule);
+  .store-logo {
+    display: grid;
+    color: var(--text-secondary);
   }
-  .columns span:first-child {
-    grid-column: 2 / 4;
+  .store-logo :global(svg) {
+    width: 24px;
+    height: 24px;
+  }
+  .store-name {
+    display: grid;
+    flex: 1;
+    line-height: 1.3;
+  }
+  .store-name small {
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+  .store-name strong {
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .soon {
+    flex: none;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--mention);
+    background: color-mix(in srgb, var(--mention) 16%, transparent);
   }
   ul {
     list-style: none;
     margin: 0;
     padding: var(--inline);
-  }
-  .docs a {
-    padding: var(--row-padding);
-    border-radius: var(--row-radius);
-    color: var(--text);
-    text-decoration: none;
-  }
-  .docs a:hover {
-    background: color-mix(in srgb, var(--ink) 9%, transparent);
-  }
-  .id {
-    color: var(--mode);
-  }
-  .title {
-    font-weight: 700;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .version {
-    color: var(--text-tertiary);
-    font-size: 12px;
   }
   @media (max-width: 640px) {
     .intro {
@@ -216,18 +233,6 @@ const features: { glyph: string; tint: "ink" | "mode" | "location" | "mention" |
     }
     .actions {
       justify-content: center;
-    }
-    .columns {
-      display: none;
-    }
-    .docs a {
-      grid-template-columns: var(--glyph) 1fr auto;
-    }
-    .title {
-      white-space: normal;
-    }
-    .id {
-      display: none;
     }
   }
 </style>
