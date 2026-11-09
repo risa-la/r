@@ -1595,7 +1595,9 @@ device **confirms** a leaf when it has made sure that the leaf belongs
 to the device named in its credential, a current, logged device of that
 identity (4.5). Until then the leaf is **unconfirmed**, and its messages
 are shown as unverified. Once it is confirmed, so are its earlier
-messages, since they were signed by the same leaf key.
+messages, since they were signed by the same leaf key, and its edits
+and DELETEs that waited for it take effect (5.3, 5.4). Those of a leaf
+found to be an impostor (12.7) never do.
 
 Confirmation must convince the members of a group, and nobody else.
 Signing the leaf key with the device key would convince anyone who sees

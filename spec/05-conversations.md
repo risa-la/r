@@ -203,7 +203,9 @@ messages use to refer to it. It may carry at most one of these tags:
 - `edit=<id>` replaces the text of message `<id>`. Devices ignore an
   edit from anyone other than the author of `<id>`. Clients show the
   text of the newest edit in the original's place, and MAY show every
-  earlier version.
+  earlier version. An edit from a leaf less trusted than the message's
+  (5.4) does not replace its text until that leaf is confirmed; clients
+  MAY show it apart, as an unverified edit.
 - `react=<id>` reacts to message `<id>`. The text is the reaction,
   usually a single emoji, and MUST be at most 64 bytes. Devices ignore a
   longer one, and a second identical reaction from the same person to
@@ -235,6 +237,14 @@ A DELETE line in a message asks every device to delete message `<id>`
 of the same conversation. Devices act on it only if its sender is the
 author of `<id>`, or, in a room, an owner or moderator both at the epoch
 of the DELETE and at its place in the order of posts (6.3, 12.9).
+
+A DELETE also needs a leaf at least as trusted as the message's: one
+that the device has confirmed (12.10), unless the device shows the
+message as unverified too. Otherwise a leaf that another member planted
+under the author's credential could erase what the author really wrote
+(12.7). The device then shows the message as deleted but unconfirmed,
+and keeps its text. It acts on the DELETE once the DELETE's leaf is
+confirmed, and drops it if that leaf is found to be an impostor (12.7).
 
 Devices that act on it erase the stored text of the target, and of its
 edits and reactions, and show a placeholder in its place. Deleting an
