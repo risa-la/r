@@ -692,6 +692,9 @@ pub(crate) fn generation_before_recovery(
 /// every 30 seconds, until the account disconnects.
 pub(crate) async fn worker(jobs: Jobs, mut events: broadcast::Receiver<Event>) {
     let mut new_generation = false;
+    // Task C5: the first run waits for the account's connections, so that
+    // what needs one does not fail and wait out its back-off.
+    wait_connected(&jobs, &mut events, Duration::from_secs(10)).await;
     loop {
         if std::mem::take(&mut new_generation)
             && let Err(e) = jobs.backup_for_new_generation().await
@@ -706,6 +709,14 @@ pub(crate) async fn worker(jobs: Jobs, mut events: broadcast::Receiver<Event>) {
                 () = &mut wait => break,
                 event = events.recv() => match event {
                     Ok(Event::Changed(change)) if wakes_worker(&change) => break,
+                    // Task C5: a connection came up, so what failed for
+                    // want of one runs now rather than in 30 seconds.
+                    Ok(Event::Connection(e))
+                        if e.account == jobs.account
+                            && e.state == crate::client::ConnectionState::Ready =>
+                    {
+                        break;
+                    }
                     // 4.8, 12.13: C1 tells this device's account that it
                     // moved the identity to a new generation.
                     Ok(Event::Identity(IdentityEvent::NewGeneration { uid, .. }))
@@ -722,6 +733,31 @@ pub(crate) async fn worker(jobs: Jobs, mut events: broadcast::Receiver<Event>) {
         // Let a burst of changes settle.
         tokio::time::sleep(Duration::from_millis(200)).await;
         while events.try_recv().is_ok() {}
+    }
+}
+
+/// Waits until the account's signed-in and anonymous connections (or its
+/// guest connection) are up, for at most `max`.
+async fn wait_connected(jobs: &Jobs, events: &mut broadcast::Receiver<Event>, max: Duration) {
+    use crate::conn::Slot;
+    let (mut signed_in, mut anonymous) = (false, false);
+    let deadline = tokio::time::Instant::now() + max;
+    while !(signed_in && anonymous) {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Ok(Event::Connection(e)))
+                if e.account == jobs.account
+                    && e.state == crate::client::ConnectionState::Ready =>
+            {
+                match e.slot {
+                    Slot::SignedIn => signed_in = true,
+                    Slot::Anonymous(_) => anonymous = true,
+                    Slot::Guest => (signed_in, anonymous) = (true, true),
+                    _ => {}
+                }
+            }
+            Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return,
+        }
     }
 }
 
