@@ -163,15 +163,18 @@ interface LineProps {
   stripes: string[];
   tint: string;
   test: boolean;
+  // No tool sees it (a type, an import): drawn in grey.
+  idle: boolean;
   target: boolean;
   // Lines hidden from here on, for the row that stands for them.
   fold?: number;
 }
 
-const Line = memo(function Line({ n, text, html, stripes, tint, test, target, fold }: LineProps) {
+const Line = memo(function Line({ n, text, html, stripes, tint, test, idle, target, fold }: LineProps) {
   let cls = "ln";
   if (tint) cls += ` t-${tint}`;
   if (test) cls += " test";
+  if (idle) cls += " idle";
   if (target) cls += " target";
   if (fold) cls += " fold";
   return (
@@ -325,6 +328,7 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
           stripes={stripes[k]}
           tint={tints[k]}
           test={tests[k]}
+          idle={measured && !tests[k] && !display[k]}
           target={!!target && k + 1 >= target[0] && k + 1 <= target[1]}
           fold={end && end - k}
         />,
@@ -332,7 +336,7 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
       if (end) k = end - 1;
     }
     return out;
-  }, [lines, html, stripes, tints, tests, target, closed]);
+  }, [lines, html, stripes, tints, tests, display, measured, target, closed]);
 
   // A line's row, or the row of the fold that hides it.
   const rowOf = (n: number) => {

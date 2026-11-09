@@ -551,6 +551,11 @@ a.row:hover {
 .ln.test .num {
   opacity: 0.55;
 }
+/* Nothing can check it (a type, an import): its shape stays, its colour goes. */
+.ln.idle .src {
+  filter: grayscale(1);
+  opacity: 0.7;
+}
 .ln.test .gut {
   background:
     repeating-linear-gradient(135deg, color-mix(in srgb, var(--rule) 70%, transparent) 0 1px, transparent 1px 5px),
