@@ -2437,6 +2437,70 @@ async fn join_proposals_are_limited_per_address() {
     assert!(anon.lines()[0].ends_with("ERR rate-limited"));
 }
 
+/// A tree too long for GROUPINFO's line is stored as a blob once per epoch,
+/// when the room is created and when a commit is applied; GROUPINFO then
+/// sends its hash and writes nothing (6.1, 12.12, PLAN item 63).
+#[tokio::test]
+async fn long_trees_are_blobs_made_once_an_epoch() {
+    use crate::store::KeysStore as _;
+    use risala_proto::names::BlobRef;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    // Every tree is too long for the line, on this thread.
+    super::super::mailbox::room::test_hooks::INLINE_TREE.with(|max| max.set(Some(0)));
+    let tree_of = |group: &MlsGroup| tree_to_bytes(&group.export_ratchet_tree());
+    let file = |hash: &BlobRef| std::fs::read(dir.path().join("files/blobs").join(hash.hex()));
+    let PublicRoomSetup {
+        owen,
+        mut o,
+        m,
+        mut signed,
+    } = create_room(&mut h, 1).await;
+    let mut anon = h.anon().await;
+    let tree = BlobRef::of(&tree_of(&o));
+    h.send(&anon, &format!("GROUPINFO {m}")).await;
+    let lines = anon.lines();
+    assert!(lines[0].starts_with(&format!("GROUPINFO {m} 0 0 ")));
+    assert!(lines[0].ends_with(&format!(" {tree}")));
+    assert_eq!(lines[1], "OK");
+    assert_eq!(file(&tree).unwrap(), tree_of(&o));
+    // A commit makes the next epoch's tree blob.
+    let token0 = owen.token(&o);
+    let out = owen.commit(&mut o, Changes::default());
+    h.send(
+        &signed,
+        &format!(
+            "POST {m} {token0} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(out.group_info.as_ref().unwrap())
+        ),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["OK seq=1"]);
+    owen.merge(&mut o, &out);
+    let gi = b64(out.group_info.as_ref().unwrap());
+    let newer = BlobRef::of(&tree_of(&o));
+    assert_ne!(newer, tree);
+    assert_eq!(file(&newer).unwrap(), tree_of(&o));
+    let changes = h.store.raw().total_changes();
+    for _ in 0..3 {
+        h.send(&anon, &format!("GROUPINFO {m}")).await;
+        assert_eq!(
+            anon.lines(),
+            [format!("GROUPINFO {m} 1 1 {gi} {newer}"), "OK".into()]
+        );
+    }
+    // GROUPINFO wrote nothing.
+    assert_eq!(h.store.raw().total_changes(), changes);
+    // The current tree is kept past retention; the last epoch's is not.
+    h.clock.advance(Duration::from_secs(60 * 24 * 60 * 60));
+    crate::core::keys::expire(h.inner()).await.unwrap();
+    assert!(h.store.blob(&newer).unwrap().unwrap().kept);
+    assert_eq!(h.store.blob(&tree).unwrap(), None);
+    assert!(file(&tree).is_err());
+}
+
 /// A harness whose blobs share 1 MiB of `limits.blob_memory`, with its
 /// clock at the system's time, and its files in `dir`.
 fn small_blob_memory(dir: &tempfile::TempDir) -> Harness {

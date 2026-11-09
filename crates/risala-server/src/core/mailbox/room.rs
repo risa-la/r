@@ -52,7 +52,7 @@ use tls_codec::Serialize as _;
 use super::super::command::{Cx, Reply, err};
 use super::super::rate::WindowLimit;
 use super::super::state::{Device, Who};
-use super::super::{admin, keys};
+use super::super::{Inner, admin, keys};
 use super::{PostFraming, blob_of, line_bytes, may_mute, reserve_lines};
 use crate::config::RoomCreation;
 use crate::store::{
@@ -401,6 +401,7 @@ fn room_update(
         epoch: group.group_context().epoch().as_u64(),
         group_info,
         tree: tree_to_bytes(&group.export_ratchet_tree()),
+        tree_blob: None,
         members: members.into_iter().collect(),
         topic: escape(&conversation.topic),
         guests: match conversation.guests {
@@ -544,6 +545,8 @@ pub(super) async fn create(
         ))
     })
     .await?;
+    let mut update = update;
+    store_tree_blob(&cx.inner, &mut update).await?;
     let new = NewMailbox {
         mailbox,
         group_id,
@@ -921,9 +924,22 @@ fn commit_error(e: CommitError) -> ErrResponse {
 
 /// `GROUPINFO <box>` (6.1): a public room's current GroupInfo and ratchet
 /// tree.
+///
+/// It writes nothing: a tree too long for the line is the blob the server
+/// stored when it applied the epoch's commit ([`store_tree_blob`]), and the
+/// GroupInfo and an inline tree count against `limits.blob_memory` while
+/// they are read and sent (12.12, PLAN item 63).
 pub(super) async fn group_info(cx: &Cx, mailbox: BoxName) -> Reply {
+    let inner = &cx.inner;
+    let size = cx
+        .db(move |store| store.room_group_info_size(&mailbox))
+        .await?
+        .ok_or_else(|| err(ErrorCode::NotFound))?;
+    let _held = keys::hold_memory(inner, size)
+        .await
+        .map_err(ErrResponse::from)?;
     let stored = cx
-        .db(move |store| store.room_group(&mailbox))
+        .db(move |store| store.room_group_info(&mailbox))
         .await?
         .ok_or_else(|| err(ErrorCode::NotFound))?;
     let internal = |what: &str| {
@@ -931,15 +947,11 @@ pub(super) async fn group_info(cx: &Cx, mailbox: BoxName) -> Reply {
         err(ErrorCode::Internal)
     };
     let groupinfo = GroupInfo::from_bytes(&stored.group_info).map_err(|_| internal("GroupInfo"))?;
-    // A tree too long for the line is a blob the server keeps (12.12).
-    let tree = if fits_line(stored.group_info.len(), stored.tree.len()) {
-        OrBlob::Inline(RatchetTree::from_bytes(&stored.tree).map_err(|_| internal("tree"))?)
-    } else {
-        OrBlob::Blob(
-            keys::room_tree_blob(&cx.inner, mailbox, stored.tree)
-                .await
-                .map_err(|e| internal(&e.to_string()))?,
-        )
+    let tree = match stored.tree {
+        OrBlob::Inline(tree) => {
+            OrBlob::Inline(RatchetTree::from_bytes(&tree).map_err(|_| internal("tree"))?)
+        }
+        OrBlob::Blob(hash) => OrBlob::Blob(hash),
     };
     cx.send(ServerLine::GroupInfo {
         mailbox,
@@ -951,14 +963,51 @@ pub(super) async fn group_info(cx: &Cx, mailbox: BoxName) -> Reply {
     Ok(OkResponse::new())
 }
 
+/// Stores the tree of `update` as a blob if it is too long for GROUPINFO's
+/// line with its GroupInfo (6.1, 12.12), once per epoch, when the commit
+/// that starts it is applied, or when the room is created. The store keeps
+/// it while the epoch is current.
+pub(super) async fn store_tree_blob(
+    inner: &Arc<Inner>,
+    update: &mut RoomUpdate,
+) -> Result<(), ErrResponse> {
+    update.tree_blob = None;
+    if fits_line(update.group_info.len(), update.tree.len()) {
+        return Ok(());
+    }
+    let tree = std::mem::take(&mut update.tree);
+    let (tree, hash) = keys::store_room_tree(inner, tree).await.map_err(|e| {
+        tracing::error!("storing a public room's tree: {e}");
+        err(ErrorCode::Internal)
+    })?;
+    update.tree = tree;
+    update.tree_blob = Some(hash);
+    Ok(())
+}
+
 /// Whether a GroupInfo and tree of these sizes fit a GROUPINFO line in
 /// base64, with room for the rest of the line (2.3).
 fn fits_line(group_info: usize, tree: usize) -> bool {
     /// More than `GROUPINFO`, a box, an epoch, a seq and the spaces take.
     const REST: usize = 256;
     let base64 = |n: usize| n.div_ceil(3) * 4;
+    #[cfg(test)]
+    if let Some(max) = test_hooks::INLINE_TREE.with(std::cell::Cell::get) {
+        return base64(tree) <= max;
+    }
     base64(group_info) + base64(tree) + REST <= MAX_LONG_SERVER_LINE
         && base64(tree) <= risala_proto::mls::MAX_BASE64_LEN
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    thread_local! {
+        /// The longest tree in base64 that a GROUPINFO line carries on this
+        /// thread, instead of what a line holds, so that a test can make a
+        /// tree that is a blob without a group of hundreds of leaves.
+        pub(crate) static INLINE_TREE: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
 }
 
 /// Checks that the connection's identity may mute in the public room of

@@ -29,7 +29,7 @@
 
 use std::time::Duration;
 
-use risala_proto::mls::{GroupId, Pseudonym, TokenHash};
+use risala_proto::mls::{GroupId, OrBlob, Pseudonym, TokenHash};
 use risala_proto::names::{BlobRef, BoxName, Room, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{GuestAccess, Role};
@@ -182,6 +182,21 @@ pub struct RoomGroup {
     pub state: Vec<u8>,
 }
 
+/// What GROUPINFO sends of a public room (6.1): its epoch, the seq that
+/// started it, its GroupInfo, and its tree, inline or as the blob the
+/// server stored when it applied the commit (12.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomGroupInfo {
+    /// The group's current epoch.
+    pub epoch: u64,
+    /// The seq of the commit that started the epoch, or 0 in epoch 0.
+    pub epoch_seq: u64,
+    /// The current GroupInfo, an MLSMessage.
+    pub group_info: Vec<u8>,
+    /// The current ratchet tree, or its blob.
+    pub tree: OrBlob<Vec<u8>>,
+}
+
 /// A public room's group as of a new epoch, or as created (6.1, 12.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomUpdate {
@@ -191,6 +206,10 @@ pub struct RoomUpdate {
     pub group_info: Vec<u8>,
     /// Its ratchet tree.
     pub tree: Vec<u8>,
+    /// The blob that holds the tree, when it is too long for GROUPINFO's
+    /// line (6.1, 12.12): the server stored it when it applied the commit,
+    /// and keeps it while the epoch is current.
+    pub tree_blob: Option<BlobRef>,
     /// Each uid with a leaf in the group, identity or guest, once, with its
     /// role in the conversation extension (6.3).
     pub members: Vec<(Uid, Role)>,
@@ -361,6 +380,15 @@ pub trait MailboxStore {
 
     /// The public state of the public room of `mailbox` (12.6).
     fn room_group(&self, mailbox: &BoxName) -> Result<Option<RoomGroup>>;
+
+    /// The bytes [`room_group_info`](Self::room_group_info) would read of
+    /// the public room of `mailbox`: its GroupInfo, and its tree unless
+    /// that is a blob.
+    fn room_group_info_size(&self, mailbox: &BoxName) -> Result<Option<u64>>;
+
+    /// What GROUPINFO sends of the public room of `mailbox` (6.1): it reads
+    /// the tree only if it is not a blob, and writes nothing.
+    fn room_group_info(&self, mailbox: &BoxName) -> Result<Option<RoomGroupInfo>>;
 
     /// The role of `uid` in the public room of `mailbox`, if it has a leaf
     /// in its group (6.3, 6.4).

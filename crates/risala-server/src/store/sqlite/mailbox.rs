@@ -6,20 +6,21 @@ use sha2::{Digest as _, Sha384};
 
 use std::time::Duration;
 
-use risala_proto::mls::{GroupId, Pseudonym, TokenHash};
+use risala_proto::mls::{GroupId, OrBlob, Pseudonym, TokenHash};
 use risala_proto::names::{BlobRef, BoxName, Room, Uid};
 use risala_proto::time::Timestamp;
 use risala_proto::types::Role;
 
 use super::{SqliteStore, from_sql_u64, sql_u64};
 use crate::secret::ct_eq;
+use crate::store::keys::room_tree_owner;
 use crate::store::mailbox::{
     AddedBy, CID_LIFETIME, MAX_SET_NEXT_HASHES, MAX_SET_TOKEN_HASHES, MAX_SETS, post_line_bytes,
 };
 use crate::store::{
     Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom,
-    PostBody, Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomUpdate, StoreError,
-    StoredPost, coarse, fixed, millis, parsed, timestamp,
+    PostBody, Posted, PublicRoomRecord, Result, RoomChange, RoomGroup, RoomGroupInfo, RoomUpdate,
+    StoreError, StoredPost, coarse, fixed, millis, parsed, timestamp,
 };
 
 /// The mailbox area's tables.
@@ -105,8 +106,9 @@ CREATE TABLE public_rooms (
     epoch_seq INTEGER NOT NULL,     -- the seq of the commit that began the epoch, 0 in epoch 0
     group_info BLOB NOT NULL,       -- the GroupInfo, or its blob's hash
     group_info_is_blob INTEGER NOT NULL DEFAULT 0,
-    tree BLOB NOT NULL,             -- the ratchet tree, or its blob's hash
-    tree_is_blob INTEGER NOT NULL DEFAULT 0,
+    tree BLOB NOT NULL,             -- the ratchet tree
+    tree_blob BLOB CHECK (length(tree_blob) = 48), -- the hash of the blob the server made
+                                    -- of it, when too long for GROUPINFO's line (12.12)
     members INTEGER NOT NULL DEFAULT 1, -- identities and guests with a leaf (6.1)
     topic TEXT NOT NULL DEFAULT '', -- escaped, from the conversation extension (6.2)
     guests TEXT NOT NULL DEFAULT 'write' CHECK (guests IN ('none', 'read', 'write')),
@@ -330,15 +332,17 @@ fn store_room_group(
     epoch_seq: u64,
 ) -> Result<()> {
     let members = group.members.len() as i64;
+    let tree_blob = group.tree_blob.as_ref().map(|hash| &hash.hash()[..]);
     tx.execute(
         "UPDATE public_rooms SET epoch = ?, epoch_seq = ?, group_info = ?, tree = ?,
-             members = ?, topic = ?, guests = ?, epoch_state = ?
+             tree_blob = ?, members = ?, topic = ?, guests = ?, epoch_state = ?
          WHERE box = ?",
         params![
             sql_u64(group.epoch),
             sql_u64(epoch_seq),
             &group.group_info,
             &group.tree,
+            tree_blob,
             members,
             &group.topic,
             group.guests.to_string(),
@@ -346,6 +350,17 @@ fn store_room_group(
             mailbox
         ],
     )?;
+    // The tree's blob is kept while the epoch is current, and the last
+    // one's from now on expires with retention, from when it was made
+    // (12.12).
+    let owner = room_tree_owner(&BoxName::from_bytes(fixed("box", mailbox)?));
+    tx.execute("DELETE FROM blob_keeps WHERE owner = ?", [&owner])?;
+    if let Some(hash) = tree_blob {
+        tx.execute(
+            "INSERT INTO blob_keeps (owner, hash) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            params![owner, hash],
+        )?;
+    }
     tx.execute("DELETE FROM room_proposals WHERE box = ?", [mailbox])?;
     tx.execute("DELETE FROM room_members WHERE box = ?", [mailbox])?;
     let mut insert =
@@ -761,6 +776,57 @@ impl MailboxStore for SqliteStore {
                 tree,
                 proposals,
                 state,
+            }))
+        })
+    }
+
+    fn room_group_info_size(&self, mailbox: &BoxName) -> Result<Option<u64>> {
+        self.read(|tx| {
+            let size: Option<i64> = tx
+                .query_row(
+                    "SELECT length(group_info)
+                          + CASE WHEN tree_blob IS NULL THEN length(tree) ELSE 0 END
+                     FROM public_rooms WHERE box = ?",
+                    [&mailbox.as_bytes()[..]],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            size.map(|size| from_sql_u64("size", size)).transpose()
+        })
+    }
+
+    fn room_group_info(&self, mailbox: &BoxName) -> Result<Option<RoomGroupInfo>> {
+        self.read(|tx| {
+            let row = tx
+                .query_row(
+                    "SELECT epoch, epoch_seq, group_info, tree_blob,
+                            CASE WHEN tree_blob IS NULL THEN tree END
+                     FROM public_rooms WHERE box = ?",
+                    [&mailbox.as_bytes()[..]],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((epoch, epoch_seq, group_info, tree_blob, tree)) = row else {
+                return Ok(None);
+            };
+            let tree = match (tree_blob, tree) {
+                (Some(hash), _) => OrBlob::Blob(BlobRef::from_hash(fixed("tree blob", &hash)?)),
+                (None, Some(tree)) => OrBlob::Inline(tree),
+                (None, None) => return Err(StoreError::Corrupt("a public room's tree".into())),
+            };
+            Ok(Some(RoomGroupInfo {
+                epoch: from_sql_u64("epoch", epoch)?,
+                epoch_seq: from_sql_u64("epoch seq", epoch_seq)?,
+                group_info,
+                tree,
             }))
         })
     }
@@ -1570,6 +1636,7 @@ mod tests {
             epoch,
             group_info: vec![epoch as u8; 3],
             tree: vec![epoch as u8; 5],
+            tree_blob: None,
             members,
             topic: "hello\\sthere".into(),
             guests: GuestAccess::Read,

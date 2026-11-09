@@ -48,7 +48,8 @@ pub use keylog::{CheckpointRow, KeyLogStore, LogEntry, LogKeyRow, LoggedRecord, 
 pub use keys::{BackupRecord, KeysStore};
 pub use mailbox::{
     Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom,
-    PostBody, Posted, PublicRoomRecord, RoomChange, RoomGroup, RoomUpdate, StoredPost,
+    PostBody, Posted, PublicRoomRecord, RoomChange, RoomGroup, RoomGroupInfo, RoomUpdate,
+    StoredPost,
 };
 pub use misc::{
     MiscStore, NewPushSubscription, NewReport, PushAdded, PushSubscription, PushTarget,

@@ -15,9 +15,10 @@
 //!   tree of the new epoch is kept for WELCOME GET (12.6, 12.8).
 //! - [`blob_bytes`]: the identity area for KEYS PUT, and [`reserve`] the
 //!   mailbox area, for the bytes of the blobs a line names (12.12).
-//! - [`room_tree_blob`] and [`room_ended`]: the mailbox area, when a public
-//!   room's tree is too long for GROUPINFO's line, so that it is a blob
-//!   kept while it is current (12.12).
+//! - [`store_room_tree`] and [`room_ended`]: the mailbox area, when a
+//!   public room's commit makes a tree too long for GROUPINFO's line, so
+//!   that it is a blob kept while it is current (12.12), and
+//!   [`hold_memory`] for what GROUPINFO reads (6.1).
 //! - [`charge_address`] and [`stored_bytes`]: the mailbox area, so that
 //!   POST, UPLOAD and BLOB count against one window per network address,
 //!   and posts, files and blobs against one quota per mailbox (7.5).
@@ -1291,17 +1292,17 @@ async fn upload(cx: &Cx, mailbox: BoxName, token: SendToken, size: u64) -> Reply
         .map_err(internal)
 }
 
-/// The public room `mailbox`'s current tree, too long for a GROUPINFO line
-/// (12.12), as a blob the server stores itself and counts against nobody.
-/// It is kept for as long as it is the room's current tree, whatever the
-/// retention; once another replaces it, or the room ends
-/// ([`room_ended`]), retention counts from when it was last made. The
-/// mailbox area calls this for GROUPINFO.
-pub(crate) async fn room_tree_blob(
+/// Stores a public room's tree, too long for a GROUPINFO line (12.12), as
+/// a blob the server makes itself and counts against nobody, and hands the
+/// tree back with its hash. The mailbox area calls this once per epoch,
+/// when it applies the commit, and the store keeps the blob while the
+/// epoch is current ([`RoomUpdate::tree_blob`](crate::store::RoomUpdate));
+/// once another replaces it, or the room ends ([`room_ended`]), retention
+/// counts from when it was made.
+pub(crate) async fn store_room_tree(
     inner: &Arc<Inner>,
-    mailbox: BoxName,
     tree: Vec<u8>,
-) -> Result<BlobRef, StoreError> {
+) -> Result<(Vec<u8>, BlobRef), StoreError> {
     let now = inner.now();
     let inner = inner.clone();
     tokio::task::spawn_blocking(move || {
@@ -1312,10 +1313,8 @@ pub(crate) async fn room_tree_blob(
         let hash = BlobRef::of(&tree);
         disk::write_blob(keys, &hash, &tree)
             .map_err(|e| StoreError::Setup(format!("storing a tree: {e}")))?;
-        inner
-            .store
-            .keep_own_blob(&room_owner(&mailbox), &hash, tree.len() as u64, now)?;
-        Ok(hash)
+        inner.store.store_own_blob(&hash, tree.len() as u64, now)?;
+        Ok((tree, hash))
     })
     .await
     .map_err(|e| StoreError::Task(e.to_string()))?
@@ -1324,20 +1323,37 @@ pub(crate) async fn room_tree_blob(
 /// The public room of `mailbox` has ended: its tree's blob is no longer
 /// kept beyond retention (12.12). The mailbox area calls this.
 pub(crate) async fn room_ended(inner: &Inner, mailbox: BoxName) -> Result<(), StoreError> {
-    let owner = room_owner(&mailbox);
+    let owner = crate::store::keys::room_tree_owner(&mailbox);
     inner
         .db(move |store| store.set_blob_keeps(&owner, &[]))
         .await
         .map(drop)
 }
 
-/// The owner of a public room's tree blob in the store.
-fn room_owner(mailbox: &BoxName) -> String {
-    format!("room {}", hex(mailbox.as_bytes()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Takes `bytes` of room in `limits.blob_memory` for something a command
+/// reads from the store whole that is not a blob, such as a public room's
+/// GroupInfo and tree for GROUPINFO (6.1), waiting until it fits. Hold
+/// what it returns while the bytes are in use. More than all of
+/// `limits.blob_memory` gets [`NoBlob::TooLong`].
+pub(crate) async fn hold_memory(
+    inner: &Inner,
+    bytes: u64,
+) -> Result<Option<OwnedSemaphorePermit>, NoBlob> {
+    let keys = &inner.keys;
+    let kib = bytes.div_ceil(1024);
+    if kib == 0 {
+        return Ok(None);
+    }
+    if kib > keys.memory_kib {
+        return Err(NoBlob::TooLong);
+    }
+    let kib = u32::try_from(kib).map_err(|_| NoBlob::TooLong)?;
+    keys.memory
+        .clone()
+        .acquire_many_owned(kib)
+        .await
+        .map(Some)
+        .map_err(|_| NoBlob::Internal)
 }
 
 /// What INFO says about files and blobs (8.5): `upload=`, `blobs=` and

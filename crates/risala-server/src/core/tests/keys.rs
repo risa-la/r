@@ -1085,24 +1085,63 @@ async fn blobs_expire_from_the_last_blob_command_that_named_them() {
     assert!(anon.raw_lines()[0].starts_with("OK put="));
 }
 
-/// A public room's tree too long for GROUPINFO's line is a blob, kept
-/// while it is the room's current tree (12.12).
+/// A public room's tree too long for GROUPINFO's line is a blob the server
+/// stores when it applies the commit, kept while it is the room's current
+/// tree (12.12).
 #[tokio::test]
 async fn a_public_rooms_current_tree_is_kept() {
+    use crate::store::{NewPost, NewRoom, RoomChange, RoomUpdate};
     let h = keys();
     let room: BoxName = BOX.parse().unwrap();
-    let tree = keys::room_tree_blob(h.inner(), room, b"tree".to_vec())
+    let update = |epoch: u64, tree_blob: BlobRef| RoomUpdate {
+        epoch,
+        group_info: vec![1],
+        tree: vec![2],
+        tree_blob: Some(tree_blob),
+        members: vec![("alice@example.org".parse().unwrap(), risala_proto::types::Role::Owner)],
+        topic: String::new(),
+        guests: risala_proto::types::GuestAccess::Write,
+        state: Vec::new(),
+    };
+    let (_, tree) = keys::store_room_tree(h.inner(), b"tree".to_vec())
         .await
         .unwrap();
     assert_eq!(tree, BlobRef::of(b"tree"));
+    let new = NewMailbox {
+        mailbox: room,
+        group_id: GroupId::from_bytes([1; 32]),
+        first_epoch: 0,
+        token_hash: token().hash(),
+        created: h.inner().now(),
+        moved_from: None,
+    };
+    let new_room = NewRoom {
+        room: "#general".parse().unwrap(),
+        creator: "alice@example.org".parse().unwrap(),
+        group: update(0, tree),
+    };
+    h.store.create_room(&new, &new_room).unwrap();
     let files = h.hub.files();
     assert!(files.blob(tree).await.is_ok());
     h.advance(days(60));
     h.expire().await;
     assert!(files.blob(tree).await.is_ok());
     // A new epoch's tree replaces it: the old one expires with retention.
-    let newer = keys::room_tree_blob(h.inner(), room, b"newer".to_vec())
+    let (_, newer) = keys::store_room_tree(h.inner(), b"newer".to_vec())
         .await
+        .unwrap();
+    h.store
+        .add_post(&NewPost {
+            mailbox: room,
+            t: h.inner().now(),
+            message: crate::store::PostBody::Inline(vec![3]),
+            token: None,
+            next: None,
+            cid: None,
+            quota: u64::MAX,
+            room: Some(RoomChange::Commit(update(1, newer))),
+            handshake: true,
+        })
         .unwrap();
     h.expire().await;
     assert!(files.blob(tree).await.is_err());

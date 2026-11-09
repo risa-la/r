@@ -199,6 +199,13 @@ pub struct StoredWelcome {
     pub welcome: OrBlob<Vec<u8>>,
 }
 
+/// The owner in `blob_keeps` of the tree blob of the public room of
+/// `mailbox` (12.12), which keeps it while the room's epoch is current.
+pub fn room_tree_owner(mailbox: &BoxName) -> String {
+    let hex: String = mailbox.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    format!("room {hex}")
+}
+
 /// What the server stores, from [`KeysStore::stored_total`] (7.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StoredBytes {
@@ -417,15 +424,9 @@ pub trait KeysStore {
     fn set_blob_keeps(&self, owner: &str, hashes: &[BlobRef]) -> Result<Vec<BlobRef>>;
 
     /// Records the blob `hash` of `size` bytes, which the server wrote
-    /// itself, as stored at `now`, and makes it the one blob `owner`
-    /// keeps, as [`set_blob_keeps`](Self::set_blob_keeps) does.
-    fn keep_own_blob(
-        &self,
-        owner: &str,
-        hash: &BlobRef,
-        size: u64,
-        now: Timestamp,
-    ) -> Result<Vec<BlobRef>>;
+    /// itself, as stored at `now`, counted against nobody. If the server
+    /// held it already, retention counts from now.
+    fn store_own_blob(&self, hash: &BlobRef, size: u64, now: Timestamp) -> Result<()>;
 
     /// Deletes the blob `hash` now, unless something keeps it. Returns
     /// whether it was deleted.

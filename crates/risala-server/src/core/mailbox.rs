@@ -22,7 +22,7 @@
 //!
 //! Public rooms' groups, which the server checks (12.6), are in [`room`].
 
-mod room;
+pub(super) mod room;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -48,7 +48,8 @@ use super::{Inner, keys, misc};
 use crate::config::Config;
 use crate::handler::{ConnId, OutLine};
 use crate::store::{
-    Created, MailboxRecord, NewMailbox, NewPost, PostBody, Posted, Store, StoreError, StoredPost,
+    Created, MailboxRecord, NewMailbox, NewPost, PostBody, Posted, RoomChange, Store, StoreError,
+    StoredPost,
 };
 
 /// The window of the limits on CREATE, commits and TOKEN, and on the bytes
@@ -784,6 +785,17 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         let line = Post::live(now, mailbox, post.message);
         send_to_followers(inner, &mailbox, &OutLine::new(ServerMessage::new(line)));
         return Ok(OkResponse::new());
+    }
+    // A commit's tree too long for GROUPINFO's line is stored as a blob
+    // now, once for the epoch, so that GROUPINFO writes nothing (6.1,
+    // 12.12).
+    let mut room = room;
+    if let Some(room::CheckedPost {
+        change: RoomChange::Commit(update),
+        ..
+    }) = room.as_mut()
+    {
+        room::store_tree_blob(&cx.inner, update).await?;
     }
     // One quota for the mailbox's posts, files and blobs (7.5): its posts
     // take what its files and blobs leave.
