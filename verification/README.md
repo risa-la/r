@@ -18,10 +18,16 @@ A line nothing reaches is tinted red. Test code (`tests/`,
 `#[cfg(test)]` modules, fuzz targets, Kani proofs) is listed but left
 out of the percentages.
 
+The front page leads with one number: the share of code lines that a
+unit test, integration test, fuzz input or Kani proof reaches. Below it,
+each kind of evidence opens on its tests, targets, proofs or model runs,
+and each crate opens on its files.
+
 `/verification/spec` lists each section of the spec with its evidence:
 the example lines the tests parse, the TLA+ model, the Kani proofs that
-restate its rules, and the code that cites it. The front page shows a
-summary of the numbers.
+restate its rules, and the code that cites it. Its number is the share of
+sections without subsections that a test, example line, proof or model
+covers; citations in code alone do not count.
 
 ## What each kind of evidence proves
 
@@ -54,8 +60,8 @@ Each one shows less than it may seem to.
   is read as that spec's section, and so are the sections in a Kani
   proof's doc comment. The code still cites draft-02's numbers; it moves
   to draft-03 before this page is published. A TLA+ model of another
-  draft is named in the view but not placed under its sections, since
-  they are numbered differently: `proofs/sync` models draft-02.
+  draft is not placed under its sections, since they are numbered
+  differently: `proofs/sync` models draft-02.
 - **Filled lines.** In the source listing, lines inside a function that
   are not code (braces, `} else {`, comments, blank lines) are drawn
   like the code around them, so that a function reads as one block.
@@ -84,8 +90,7 @@ Each one shows less than it may seem to.
    highlight the code in the browser.
 
 Any part of the raw results may be missing. That kind of evidence is
-then marked as having no results, and with none at all the page says so
-in a banner.
+then marked as having no results, and with none at all the page says so.
 
 ## Running it locally
 

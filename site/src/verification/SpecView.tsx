@@ -1,74 +1,51 @@
 // The spec, section by section, with what checks each one: example lines
 // the spec tests replay, the TLA+ model, Kani proofs, and the comments in
-// code and tests that cite it.
+// code and tests that cite it. A section without subsections counts as
+// checked when a test, an example line, a proof or a model covers it;
+// citations in code alone do not count.
 
 import { DATA, fileUrl, useJson } from "./data";
 import type { SpecData, SpecSection, Summary } from "./types";
-import { Crumbs, Loading, NoResults } from "./ui";
+import { Crumbs, Hero, Loading, NoResults } from "./ui";
+
+const checked = (s: SpecSection) =>
+  s.examples.client + s.examples.server > 0 || s.tests.length > 0 || s.kani.length > 0 || s.tla.length > 0;
+
+/** The sections without subsections: headings that only group others are not counted. */
+const leaves = (all: SpecSection[]) => all.filter((s, k) => !all[k + 1]?.num.startsWith(`${s.num}.`));
 
 export default function SpecView() {
   const spec = useJson<SpecData>(`${DATA}/spec.json`);
   const summary = useJson<Summary>(`${DATA}/summary.json`);
   if (spec.state === "loading" || summary.state === "loading") return <Loading />;
   const s = summary.state === "ready" ? summary.data : undefined;
-  if (spec.state === "missing") {
-    return (
-      <section className="panel">
-        <div className="panel-head">
-          <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: "spec" }]} />
-        </div>
-        <div className="panel-body">
-          <NoResults summary={undefined} />
-        </div>
-      </section>
-    );
-  }
-  const data = spec.data;
+  const data = spec.state === "ready" ? spec.data : undefined;
+  const counted = new Set(data ? leaves(data.sections) : []);
   return (
     <section className="panel v-spec">
-      <div className="panel-head">
+      <div className="panel-head v-head">
         <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: "spec" }]} />
+        {data && <span className="label">{data.draft}</span>}
       </div>
-      <div className="panel-body">
-        <h1 className="v-title">by spec section</h1>
-        <p className="v-lede">
-          each section of the spec ({data.draft}) with what checks it. citations are comments in the code that name a
-          section, such as (7.1).
-        </p>
-        {data.otherModels.length > 0 && (
-          <p className="v-note">
-            {data.otherModels.map((m) => `${m.title} models ${m.draft}`).join("; ")}, whose sections are numbered
-            differently, so {data.otherModels.length === 1 ? "it is" : "they are"} not listed here.
-          </p>
-        )}
-        <div className="v-spec-key label" aria-hidden="true">
-          <span>
-            <b className="badge ex">c / s</b> example lines, client / server
-          </span>
-          <span>
-            <b className="badge tla">tla+</b> model
-          </span>
-          <span>
-            <b className="badge kani">kani</b> proofs
-          </span>
-          <span>
-            <b className="badge code">code</b> citations in code
-          </span>
-          <span>
-            <b className="badge test">tests</b> citations in tests
-          </span>
-        </div>
-      </div>
-      <ul className="v-sections">
-        {data.sections.map((sec) => (
-          <SectionRow key={sec.num} sec={sec} summary={s} />
-        ))}
-      </ul>
+      <Hero
+        tally={data && { covered: [...counted].filter(checked).length, total: counted.size }}
+        label="sections checked"
+        title="sections without subsections that a test, an example line, a kani proof or a tla+ model covers. citations in code alone do not count."
+      >
+        {!data && <NoResults />}
+      </Hero>
+      {data && (
+        <ul className="v-sections">
+          {data.sections.map((sec) => (
+            <SectionRow key={sec.num} sec={sec} summary={s} unchecked={counted.has(sec) && !checked(sec)} />
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
 
-function SectionRow({ sec, summary }: { sec: SpecSection; summary: Summary | undefined }) {
+function SectionRow({ sec, summary, unchecked }: { sec: SpecSection; summary: Summary | undefined; unchecked: boolean }) {
   const ex = sec.examples.client + sec.examples.server;
   const models = sec.tla.map((id) => summary?.tla.models.find((m) => m.id === id)?.title ?? id);
   const proofs = sec.kani.map((k) => summary?.kani[k]).filter((p) => p !== undefined);
@@ -79,35 +56,31 @@ function SectionRow({ sec, summary }: { sec: SpecSection; summary: Summary | und
       <span className="title">{sec.title}</span>
       <span className="badges">
         {ex > 0 && (
-          <b className="badge ex" title={`${sec.examples.client} client and ${sec.examples.server} server example lines`}>
-            {sec.examples.client} / {sec.examples.server}
+          <b className="badge ex" title={`${sec.examples.client} client, ${sec.examples.server} server`}>
+            examples {ex}
           </b>
         )}
         {models.length > 0 && <b className="badge tla">tla+ {models.join(", ")}</b>}
         {proofs.length > 0 && <b className="badge kani">kani {proofs.length}</b>}
-        {sec.code.length > 0 && <b className="badge code">code {sec.code.length}</b>}
         {sec.tests.length > 0 && <b className="badge test">tests {sec.tests.length}</b>}
+        {sec.code.length > 0 && <b className="badge code">code {sec.code.length}</b>}
       </span>
     </>
   );
   return (
-    <li className={`depth-${sec.depth}`}>
+    <li className={`depth-${sec.depth}${unchecked ? " none" : ""}`}>
       {expandable ? (
         <details>
           <summary className="row">{head}</summary>
           <div className="more">
             {proofs.length > 0 && (
               <Cites
-                label="kani proofs"
+                label="kani"
                 items={proofs.map((p) => ({ href: fileUrl(p.path, p.line), text: p.id, note: p.status === "success" ? "" : p.status }))}
               />
             )}
-            {sec.code.length > 0 && (
-              <Cites label="cited in code" items={sec.code.map(([p, l]) => ({ href: fileUrl(p, l), text: `${p}:${l}` }))} />
-            )}
-            {sec.tests.length > 0 && (
-              <Cites label="cited in tests" items={sec.tests.map(([p, l]) => ({ href: fileUrl(p, l), text: `${p}:${l}` }))} />
-            )}
+            {sec.tests.length > 0 && <Cites label="tests" items={sec.tests.map(([p, l]) => ({ href: fileUrl(p, l), text: `${p}:${l}` }))} />}
+            {sec.code.length > 0 && <Cites label="code" items={sec.code.map(([p, l]) => ({ href: fileUrl(p, l), text: `${p}:${l}` }))} />}
           </div>
         </details>
       ) : (

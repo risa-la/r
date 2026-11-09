@@ -7,24 +7,10 @@
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, SyntheticEvent } from "react";
-import {
-  DATA,
-  LAYERS,
-  REPO_URL,
-  type Layer,
-  count,
-  date,
-  fileUrl,
-  githubUrl,
-  hasLayer,
-  pct,
-  readToggles,
-  saveToggles,
-  useJson,
-} from "./data";
+import { DATA, LAYERS, type Layer, count, fileUrl, githubUrl, hasLayer, pct, readToggles, saveToggles, useJson } from "./data";
 import { highlight } from "./highlight";
-import type { FileData, LayerKey, LineEntry, Summary } from "./types";
-import { Bar, Crumbs, Loading, NoResults } from "./ui";
+import type { FileData, LayerKey, LineEntry, Summary, Tally } from "./types";
+import { Bar, Crumbs, Hero, Loading, NoResults } from "./ui";
 
 type Toggles = Record<LayerKey, boolean>;
 
@@ -38,9 +24,9 @@ export default function FileView({ path }: { path: string }) {
         <div className="panel-head">
           <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: path }]} />
         </div>
-        <div className="panel-body">
-          <NoResults summary={undefined} />
-        </div>
+        <p className="v-hero-foot label">
+          <NoResults />
+        </p>
       </section>
     );
   }
@@ -304,81 +290,28 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
 
   return (
     <>
-      <section className="panel v-file-head">
-        <div className="panel-head">
-          <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: "src" }]} />
+      <section className="panel">
+        <div className="panel-head v-head">
+          <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: file.crate }]} />
+          <a href={githubUrl(commit, file.path)}>github ↗</a>
         </div>
-        <div className="panel-body">
-          <h1 className="v-path">{file.path}</h1>
-          <dl className="v-meta">
-            <div>
-              <dt className="label">{swift ? "client" : "crate"}</dt>
-              <dd>{file.crate}</dd>
-            </div>
-            <div>
-              <dt className="label">lines</dt>
-              <dd>{count(lines.length)}</dd>
-            </div>
-            <div>
-              <dt className="label">results for</dt>
-              <dd>
-                {commit ? (
-                  <a href={`${REPO_URL}/commit/${commit}`}>{commit.slice(0, 10)}</a>
-                ) : (
-                  "-"
-                )}
-                {summary?.generated ? ` · ${date(summary.generated)}` : ""}
-              </dd>
-            </div>
-            <div>
-              <dt className="label">source</dt>
-              <dd>
-                <a href={githubUrl(commit, file.path)}>github{commit ? "" : " (main)"}</a>
-              </dd>
-            </div>
-          </dl>
-          {file.test && <p className="v-note">this whole file is test code: it is shown muted and left out of the percentages.</p>}
-          <NoResults summary={summary} lang={file.lang} />
-        </div>
-      </section>
-
-      <section className="panel v-legend-panel">
-        <div className="v-legend">
-          <div className="v-toggles" role="group" aria-label="Layers">
-            {layers.map((l) => (
-              <LayerToggle key={l.key} layer={l} on={on[l.key]} onClick={() => toggle(l.key)} value={entry ? pct(entry.tally[l.key]) : "-"} has={hasLayer(summary, l.key, file.lang)} tally={entry?.tally[l.key]} />
-            ))}
-          </div>
-          <div className="v-legend-key label">
-            <span>
-              <i className="key s-h" /> reached
-            </span>
-            <span>
-              <i className="key s-m" /> code, not reached
-            </span>
-            {!swift && (
-              <span>
-                <i className="key s-p" /> proof covered the region, missed the line
-              </span>
-            )}
-            <span>
-              <i className="key row-x" /> nothing reaches it
-            </span>
-            <span>
-              <i className="key row-test" /> test code
-            </span>
-          </div>
-          <p className="v-legend-text">
-            one stripe per layer beside the line number. the line is tinted by the strongest layer that reaches it: kani,
-            then fuzzing, then integration, then unit tests.
-            {!swift && " the tla+ stripe marks functions that cite a spec section the model covers: the model checks the spec, not this code."}{" "}
-            hover or tap a line for details.
-          </p>
-          <div className="v-legend-actions">
-            <button className="button" type="button" onClick={nextMiss} disabled={!misses.length}>
-              {misses.length ? `next of ${count(misses.length)} unreached ↓` : measured ? "no unreached lines" : "no coverage to search"}
+        <h1 className="v-path">{file.path}</h1>
+        {file.test ? (
+          <p className="v-hero-foot label">test code, not counted</p>
+        ) : (
+          <Hero tally={entry?.tally.any} label="lines checked" title="code lines a unit test, integration test, fuzz input or kani proof reaches.">
+            {!summary && <NoResults />}
+          </Hero>
+        )}
+        <div className="v-toggles" role="group" aria-label="Layers">
+          {layers.map((l) => (
+            <LayerToggle key={l.key} layer={l} on={on[l.key]} onClick={() => toggle(l.key)} has={hasLayer(summary, l.key, file.lang)} tally={entry?.tally[l.key]} />
+          ))}
+          {measured && (
+            <button className="button v-next" type="button" onClick={nextMiss} disabled={!misses.length} title="the next line nothing reaches">
+              {misses.length ? `↓ ${count(misses.length)} unreached` : "✓ 0 unreached"}
             </button>
-          </div>
+          )}
         </div>
       </section>
 
@@ -403,13 +336,15 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
   );
 }
 
-function LayerToggle({ layer, on, onClick, value, has, tally }: { layer: Layer; on: boolean; onClick: () => void; value: string; has: boolean; tally: { covered: number; total: number } | undefined }) {
+function LayerToggle({ layer, on, onClick, has, tally }: { layer: Layer; on: boolean; onClick: () => void; has: boolean; tally: Tally | undefined }) {
+  // The TLA+ model checks the spec, not the code: no share of lines.
+  const lines = layer.key !== "tla";
   return (
-    <button type="button" className="v-toggle" aria-pressed={on} onClick={onClick} style={{ ["--c" as string]: layer.color }}>
+    <button type="button" className="v-toggle" aria-pressed={on} onClick={onClick} title={layer.tip} style={{ ["--c" as string]: layer.color }}>
       <span className="sw" aria-hidden="true" />
       <span className="name">{layer.label}</span>
-      {layer.key !== "tla" && <Bar tally={tally} color={layer.color} />}
-      <span className="val">{has ? value : "no results"}</span>
+      {lines && has && <Bar tally={tally} color={layer.color} />}
+      {lines && <span className="val">{has ? pct(tally) : "-"}</span>}
     </button>
   );
 }
@@ -440,8 +375,9 @@ function Details({
     if (row && ref.current) ref.current.style.top = `${row.offsetTop + row.offsetHeight + 4}px`;
   }, [n]);
 
-  const hits = (v: number | undefined, has: boolean) =>
-    !has ? <span className="dim">no results</span> : v === undefined ? <span className="dim">not code it measures</span> : v > 0 ? <strong>{count(v)} hits</strong> : <span className="miss">not reached</span>;
+  const none = <span className="dim">-</span>;
+  const miss = <span className="miss">✗</span>;
+  const hits = (v: number | undefined, has: boolean) => (!has || v === undefined ? none : v > 0 ? <strong>✓ {count(v)}</strong> : miss);
 
   const fuzz = entry?.f;
   const proofs = entry?.k ?? [];
@@ -452,8 +388,7 @@ function Details({
     <div ref={ref} className={`v-details${pinned ? " pinned" : ""}`} role={pinned ? "dialog" : "tooltip"} aria-label={`line ${n}`}>
       <div className="dh">
         <strong>line {n}</strong>
-        {test && <span className="label">test code, not counted</span>}
-        {filled && !test && <span className="label">not code: drawn like the code around it, not counted</span>}
+        {(test || filled) && <span className="label">not counted</span>}
         {pinned && (
           <button type="button" className="close" onClick={onClose} aria-label="Close">
             ×
@@ -461,67 +396,50 @@ function Details({
         )}
       </div>
       <dl>
-        <Row layer={LAYERS[0]} label={swift ? "swift unit tests" : "unit tests"}>
-          {hits(entry?.u, hasLayer(summary, "unit", swift ? "swift" : "rust"))}
-        </Row>
+        <Row layer={LAYERS[0]}>{hits(entry?.u, hasLayer(summary, "unit", swift ? "swift" : "rust"))}</Row>
         {!swift && (
           <>
             <Row layer={LAYERS[1]}>{hits(entry?.i, hasLayer(summary, "integration"))}</Row>
             <Row layer={LAYERS[2]}>
-              {!hasLayer(summary, "fuzz") ? (
-                <span className="dim">no results</span>
-              ) : fuzz === undefined ? (
-                <span className="dim">not in a fuzzed binary</span>
-              ) : fuzz.length ? (
-                fuzz.map((t) => summary?.fuzz[t]).filter(Boolean).map((t) => `${t!.crate}/${t!.target}`).join(", ")
-              ) : (
-                <span className="miss">no target reaches it</span>
-              )}
+              {!hasLayer(summary, "fuzz") || fuzz === undefined
+                ? none
+                : fuzz.length
+                  ? fuzz.map((t) => summary?.fuzz[t]).filter(Boolean).map((t) => `${t!.crate}/${t!.target}`).join(", ")
+                  : miss}
             </Row>
             <Row layer={LAYERS[3]}>
-              {!hasLayer(summary, "kani") ? (
-                <span className="dim">no results</span>
-              ) : proofs.length || missed.length ? (
+              {!hasLayer(summary, "kani") || !(proofs.length || missed.length) ? (
+                none
+              ) : (
                 <>
                   <ProofList ids={proofs} summary={summary} pinned={pinned} />
                   {missed.length > 0 && (
-                    <div className="sub">
-                      <span className="label">covered the region, missed this line:</span>
+                    <div className="sub" title="covered the region, missed this line">
+                      <span className="miss">✗ </span>
                       <ProofList ids={missed} summary={summary} pinned={pinned} />
                     </div>
                   )}
                 </>
-              ) : (
-                <span className="dim">no proof reaches it</span>
               )}
             </Row>
             <Row layer={LAYERS[4]}>
-              {!hasLayer(summary, "tla") ? (
-                <span className="dim">no results</span>
-              ) : entry?.t?.length ? (
-                <>
-                  sections {entry.t.join(", ")}
-                  {models.length > 0 && ` · model ${models.map((m) => m.title).join(", ")}`}
-                  <div className="sub label">the model checks the spec, not this code.</div>
-                </>
-              ) : (
-                <span className="dim">no modelled section cited</span>
-              )}
+              {!hasLayer(summary, "tla") || !entry?.t?.length
+                ? none
+                : `§${entry.t.join(" §")}${models.length ? ` · ${models.map((m) => m.title).join(", ")}` : ""}`}
             </Row>
           </>
         )}
       </dl>
-      {!pinned && <div className="hint label">click to pin</div>}
     </div>
   );
 }
 
-function Row({ layer, label, children }: { layer: Layer; label?: string; children: ReactNode }) {
+function Row({ layer, children }: { layer: Layer; children: ReactNode }) {
   return (
     <div className="dr" style={{ ["--c" as string]: layer.color }}>
-      <dt>
+      <dt title={layer.tip}>
         <span className="sw" aria-hidden="true" />
-        {label ?? layer.label}
+        {layer.label}
       </dt>
       <dd>{children}</dd>
     </div>
@@ -538,7 +456,7 @@ function ProofList({ ids, summary, pinned }: { ids: number[]; summary: Summary |
           <li key={k}>
             {pinned ? <a href={fileUrl(p.path, p.line)}>{p.id}</a> : p.id}
             {p.status !== "success" && <span className="miss"> ({p.status})</span>}
-            {p.coverage === "function" && <span className="dim"> (function-level, approximate)</span>}
+            {p.coverage === "function" && <span className="dim" title="function-level coverage, approximate"> ≈</span>}
           </li>
         );
       })}
