@@ -7,8 +7,9 @@
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode, SyntheticEvent } from "react";
-import { DATA, LAYERS, type Layer, count, fileUrl, githubUrl, hasLayer, pct, readToggles, saveToggles, useJson } from "./data";
+import { DATA, LAYERS, type Layer, count, fileUrl, githubUrl, hasLayer, pct, ratio, readToggles, saveToggles, useJson } from "./data";
 import { highlight } from "./highlight";
+import { Frame } from "./Tree";
 import type { FileData, LayerKey, LineEntry, Summary, Tally } from "./types";
 import { Bar, Crumbs, Hero, Loading, NoResults } from "./ui";
 
@@ -18,19 +19,26 @@ export default function FileView({ path }: { path: string }) {
   const summary = useJson<Summary>(`${DATA}/summary.json`);
   const file = useJson<FileData>(encodeURI(`${DATA}/files/${path}.json`));
   if (summary.state === "loading" || file.state === "loading") return <Loading />;
+  const s = summary.state === "ready" ? summary.data : undefined;
   if (file.state === "missing") {
     return (
-      <section className="panel">
-        <div className="panel-head">
-          <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: path }]} />
-        </div>
-        <p className="v-hero-foot label">
-          <NoResults />
-        </p>
-      </section>
+      <Frame summary={s} current={path}>
+        <section className="panel">
+          <div className="panel-head">
+            <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: path }]} />
+          </div>
+          <p className="v-hero-foot label">
+            <NoResults />
+          </p>
+        </section>
+      </Frame>
     );
   }
-  return <Source file={file.data} summary={summary.state === "ready" ? summary.data : undefined} />;
+  return (
+    <Frame summary={s} current={path}>
+      <Source file={file.data} summary={s} />
+    </Frame>
+  );
 }
 
 // Per line, the state of each stripe, in LAYERS order: h reached, m seen
@@ -124,6 +132,22 @@ function tintOf(e: LineEntry | undefined, on: Toggles, test: boolean): string {
   return code ? "x" : "";
 }
 
+// A run of this many comment lines shows its first and last line only,
+// until opened, so that a file opens on code rather than its docs.
+const FOLD = 10;
+
+/** The hidden middle of each long run of comment lines, as first and last line. */
+function foldsOf(lines: string[]): [number, number][] {
+  const out: [number, number][] = [];
+  let start = 0;
+  for (let k = 0; k <= lines.length; k++) {
+    if (k < lines.length && /^\s*\/\//.test(lines[k])) continue;
+    if (k - start >= FOLD) out.push([start + 2, k - 1]);
+    start = k + 1;
+  }
+  return out;
+}
+
 function parseHash(): [number, number] | undefined {
   const m = location.hash.match(/^#L(\d+)(?:-L?(\d+))?$/);
   if (!m) return undefined;
@@ -140,19 +164,28 @@ interface LineProps {
   tint: string;
   test: boolean;
   target: boolean;
+  // Lines hidden from here on, for the row that stands for them.
+  fold?: number;
 }
 
-const Line = memo(function Line({ n, text, html, stripes, tint, test, target }: LineProps) {
+const Line = memo(function Line({ n, text, html, stripes, tint, test, target, fold }: LineProps) {
   let cls = "ln";
   if (tint) cls += ` t-${tint}`;
   if (test) cls += " test";
   if (target) cls += " target";
+  if (fold) cls += " fold";
   return (
-    <div id={`L${n}`} data-n={n} className={cls}>
+    <div {...(fold ? { id: `F${n}`, "data-fold": n, title: `${n}-${n + fold - 1}` } : { id: `L${n}`, "data-n": n })} className={cls}>
       <span className="gut">
-        <a className="num" href={`#L${n}`}>
-          {n}
-        </a>
+        {fold ? (
+          <button type="button" className="num" aria-expanded="false" aria-label={`lines ${n} to ${n + fold - 1}`}>
+            …
+          </button>
+        ) : (
+          <a className="num" href={`#L${n}`}>
+            {n}
+          </a>
+        )}
         <span className="stripes" aria-hidden="true">
           {stripes.map((s, k) => (
             <span key={k} className={`s s-${LAYERS[k].short} ${s}`} />
@@ -225,6 +258,26 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
   // #L12 and #L12-L20 mark lines; the browser looked for them before they
   // existed, so scroll once they do.
   const [target, setTarget] = useState(parseHash);
+  const folds = useMemo(() => foldsOf(lines), [lines]);
+  const [opened, setOpened] = useState<ReadonlySet<number>>(new Set());
+  const open = (a: number) => setOpened((prev) => new Set(prev).add(a));
+  // Closed folds by first hidden line. One the target falls in is open, and
+  // stays so.
+  const touches = useCallback((a: number, b: number) => !!target && target[0] <= b && target[1] >= a, [target]);
+  const closed = useMemo(
+    () => new Map(folds.filter(([a, b]) => !opened.has(a) && !touches(a, b))),
+    [folds, opened, touches],
+  );
+  useEffect(() => {
+    for (const [a, b] of folds) if (touches(a, b)) open(a);
+  }, [folds, touches]);
+  // A line to scroll to once its fold has opened.
+  const pending = useRef<number | null>(null);
+  useEffect(() => {
+    if (pending.current === null) return;
+    document.getElementById(`L${pending.current}`)?.scrollIntoView({ block: "center" });
+    pending.current = null;
+  }, [closed]);
   useEffect(() => {
     const onHash = () => setTarget(parseHash());
     addEventListener("hashchange", onHash);
@@ -249,36 +302,52 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
     if (n !== hover) setHover(n);
   };
   const onClick = (e: SyntheticEvent) => {
+    const fold = (e.target as Element).closest("[data-fold]");
+    if (fold) {
+      setPinned(null);
+      return open(Number(fold.getAttribute("data-fold")));
+    }
     if ((e.target as Element).closest("a")) return;
     const n = lineAt(e.target);
     if (n !== null) setPinned((p) => (p === n ? null : n));
   };
 
-  const rows = useMemo(
-    () =>
-      lines.map((text, k) => (
+  const rows = useMemo(() => {
+    const out: ReactNode[] = [];
+    for (let k = 0; k < lines.length; k++) {
+      const end = closed.get(k + 1);
+      out.push(
         <Line
           key={k}
           n={k + 1}
-          text={text}
+          text={lines[k]}
           html={html[k]}
           stripes={stripes[k]}
           tint={tints[k]}
           test={tests[k]}
           target={!!target && k + 1 >= target[0] && k + 1 <= target[1]}
-        />
-      )),
-    [lines, html, stripes, tints, tests, target],
-  );
+          fold={end && end - k}
+        />,
+      );
+      if (end) k = end - 1;
+    }
+    return out;
+  }, [lines, html, stripes, tints, tests, target, closed]);
 
+  // A line's row, or the row of the fold that hides it.
+  const rowOf = (n: number) => {
+    const fold = [...closed].find(([a, b]) => n >= a && n <= b);
+    return document.getElementById(fold ? `F${fold[0]}` : `L${n}`);
+  };
   const nextMiss = () => {
     if (!misses.length) return;
     // The first one below the middle of the window, wrapping round.
     const mid = innerHeight / 2;
-    const n =
-      misses.find((m) => (document.getElementById(`L${m}`)?.getBoundingClientRect().top ?? 0) > mid) ?? misses[0];
+    const n = misses.find((m) => (rowOf(m)?.getBoundingClientRect().top ?? 0) > mid) ?? misses[0];
     location.hash = `#L${n}`;
-    document.getElementById(`L${n}`)?.scrollIntoView({ block: "center" });
+    const el = document.getElementById(`L${n}`);
+    if (el) el.scrollIntoView({ block: "center" });
+    else pending.current = n;
   };
 
   const entry = summary?.files.find((f) => f.path === file.path);
@@ -299,9 +368,7 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
         {file.test ? (
           <p className="v-hero-foot label">test code, not counted</p>
         ) : (
-          <Hero tally={entry?.tally.any} label="lines checked" title="code lines a unit test, integration test, fuzz input or kani proof reaches.">
-            {!summary && <NoResults />}
-          </Hero>
+          <Hero tally={entry?.tally.any} label="lines checked" title="code lines a unit test, integration test, fuzz input or kani proof reaches." />
         )}
         <div className="v-toggles" role="group" aria-label="Layers">
           {layers.map((l) => (
@@ -337,14 +404,19 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
 }
 
 function LayerToggle({ layer, on, onClick, has, tally }: { layer: Layer; on: boolean; onClick: () => void; has: boolean; tally: Tally | undefined }) {
-  // The TLA+ model checks the spec, not the code: no share of lines.
+  // The TLA+ model checks the spec, not the code: no share of lines. Nor
+  // does a layer without data here.
   const lines = layer.key !== "tla";
   return (
     <button type="button" className="v-toggle" aria-pressed={on} onClick={onClick} title={layer.tip} style={{ ["--c" as string]: layer.color }}>
       <span className="sw" aria-hidden="true" />
       <span className="name">{layer.label}</span>
-      {lines && has && <Bar tally={tally} color={layer.color} />}
-      {lines && <span className="val">{has ? pct(tally) : "-"}</span>}
+      {lines && has && ratio(tally) !== undefined && (
+        <>
+          <Bar tally={tally} color={layer.color} />
+          <span className="val">{pct(tally)}</span>
+        </>
+      )}
     </button>
   );
 }

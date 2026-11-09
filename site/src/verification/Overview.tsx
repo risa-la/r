@@ -1,12 +1,12 @@
 // The verification overview: one number, the share of code lines some
 // check reaches, then what makes it up. Each kind of check opens on its
-// tests, targets, proofs or model runs; each crate opens on its files.
+// tests, targets, proofs or model runs. The source tree is in Tree.tsx.
 
-import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
-import { DATA, LAYERS, REPO_URL, type Layer, count, date, duration, fileUrl, hasLayer, shortPath, useJson } from "./data";
-import type { FileSummary, Summary, TestStatus } from "./types";
-import { Bar, Crumbs, Glyph, Hero, Loading, NoResults, Pct } from "./ui";
+import { DATA, LAYERS, REPO_URL, type Layer, count, date, duration, fileUrl, hasLayer, useJson } from "./data";
+import { Frame } from "./Tree";
+import type { Summary, TestStatus } from "./types";
+import { Bar, Crumbs, Glyph, Hero, Loading, Pct } from "./ui";
 
 export default function Overview() {
   const load = useJson<Summary>(`${DATA}/summary.json`);
@@ -15,7 +15,7 @@ export default function Overview() {
   const measured = s && (s.has.unit || s.has.integration || s.has.fuzz || s.has.kani);
   const bad = s ? failures(s) : 0;
   return (
-    <>
+    <Frame summary={s} home>
       <section className="panel">
         <div className="panel-head v-head">
           <Crumbs parts={[{ label: "verification" }]} />
@@ -26,9 +26,7 @@ export default function Overview() {
           label="lines checked"
           title="code lines a unit test, integration test, fuzz input or kani proof reaches. test code is not counted."
         >
-          {!s ? (
-            <NoResults />
-          ) : (
+          {s && (
             <>
               {s.commit && <a href={`${REPO_URL}/commit/${s.commit}`}>{s.commit.slice(0, 10)}</a>}
               <span>{date(s.generated)}</span>
@@ -39,8 +37,7 @@ export default function Overview() {
         </Hero>
         {s && <Checks summary={s} />}
       </section>
-      {s && <Files summary={s} />}
-    </>
+    </Frame>
   );
 }
 
@@ -167,9 +164,9 @@ function Check({ layer, s, score, children }: { layer: Layer; s: Summary; score?
         <span className="sw" aria-hidden="true" />
         {layer.label}
       </span>
-      {lines ? <Bar tally={has ? s.totals[layer.key] : undefined} color={layer.color} /> : <span />}
+      {lines || !has ? <Bar tally={has ? s.totals[layer.key] : undefined} color={layer.color} /> : <span />}
       {lines ? <Pct tally={has ? s.totals[layer.key] : undefined} /> : <span />}
-      <span className="score">{has ? score : <NoResults />}</span>
+      <span className="score">{has && score}</span>
     </>
   );
   return (
@@ -183,54 +180,5 @@ function Check({ layer, s, score, children }: { layer: Layer; s: Summary; score?
         <div className="row">{row}</div>
       )}
     </li>
-  );
-}
-
-function Files({ summary }: { summary: Summary }) {
-  const [query, setQuery] = useState("");
-  const groups = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const map = new Map<string, FileSummary[]>();
-    for (const f of summary.files) {
-      if (q && !f.path.toLowerCase().includes(q)) continue;
-      map.set(f.crate, [...(map.get(f.crate) ?? []), f]);
-    }
-    return [...map.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [summary, query]);
-  const crateTally = new Map(summary.crates.map((c) => [c.name, c.tally.any]));
-  const any = "var(--text-secondary)";
-  return (
-    <section className="panel v-files" id="files">
-      <div className="panel-head v-head">
-        <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: "source" }]} />
-        <input type="search" spellCheck={false} value={query} onChange={(e) => setQuery(e.target.value)} placeholder="filter" aria-label="filter files" />
-      </div>
-      {groups.map(([crate, files]) => (
-        <details key={crate} open={!!query.trim()}>
-          <summary className="row">
-            <span className="crate">{crate}</span>
-            <Bar tally={crateTally.get(crate)} color={any} />
-            <Pct tally={crateTally.get(crate)} />
-          </summary>
-          <ul>
-            {files.map((f) => (
-              <li key={f.path}>
-                <a className={`row${f.test ? " test" : ""}`} href={fileUrl(f.path)}>
-                  <span className="path">{shortPath(f)}</span>
-                  {f.test ? (
-                    <span className="label">test</span>
-                  ) : (
-                    <>
-                      <Bar tally={f.tally.any} color={any} />
-                      <Pct tally={f.tally.any} />
-                    </>
-                  )}
-                </a>
-              </li>
-            ))}
-          </ul>
-        </details>
-      ))}
-    </section>
   );
 }

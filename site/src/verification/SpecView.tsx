@@ -6,7 +6,8 @@
 
 import { DATA, fileUrl, useJson } from "./data";
 import type { SpecData, SpecSection, Summary } from "./types";
-import { Crumbs, Hero, Loading, NoResults } from "./ui";
+import { Frame } from "./Tree";
+import { Crumbs, Hero, Loading } from "./ui";
 
 const checked = (s: SpecSection) =>
   s.examples.client + s.examples.server > 0 || s.tests.length > 0 || s.kani.length > 0 || s.tla.length > 0;
@@ -22,7 +23,8 @@ export default function SpecView() {
   const data = spec.state === "ready" ? spec.data : undefined;
   const counted = new Set(data ? leaves(data.sections) : []);
   return (
-    <section className="panel v-spec">
+    <Frame summary={s}>
+      <section className="panel v-spec">
       <div className="panel-head v-head">
         <Crumbs parts={[{ label: "verification", href: "/verification/" }, { label: "spec" }]} />
         {data && <span className="label">{data.draft}</span>}
@@ -31,9 +33,7 @@ export default function SpecView() {
         tally={data && { covered: [...counted].filter(checked).length, total: counted.size }}
         label="sections checked"
         title="sections without subsections that a test, an example line, a kani proof or a tla+ model covers. citations in code alone do not count."
-      >
-        {!data && <NoResults />}
-      </Hero>
+      />
       {data && (
         <ul className="v-sections">
           {data.sections.map((sec) => (
@@ -41,7 +41,8 @@ export default function SpecView() {
           ))}
         </ul>
       )}
-    </section>
+      </section>
+    </Frame>
   );
 }
 
@@ -63,7 +64,11 @@ function SectionRow({ sec, summary, unchecked }: { sec: SpecSection; summary: Su
         {models.length > 0 && <b className="badge tla">tla+ {models.join(", ")}</b>}
         {proofs.length > 0 && <b className="badge kani">kani {proofs.length}</b>}
         {sec.tests.length > 0 && <b className="badge test">tests {sec.tests.length}</b>}
-        {sec.code.length > 0 && <b className="badge code">code {sec.code.length}</b>}
+        {sec.code.length > 0 && (
+          <b className="badge code" title="places in the code that cite it. not a check.">
+            code {sec.code.length}
+          </b>
+        )}
       </span>
     </>
   );

@@ -37,29 +37,34 @@ export function Glyph({ symbol, tint = "ink" }: { symbol: string; tint?: string 
   );
 }
 
-/** A thin bar for a share of lines. Empty when there is nothing to count. */
+/** A thin bar for a share of lines, or "no data" when there is nothing to count. */
 export function Bar({ tally, color }: { tally: Tally | undefined; color: string }) {
   const r = ratio(tally);
+  if (r === undefined) return <span className="v-bar none label">no data</span>;
   return (
-    <span className="v-bar" title={tally ? `${tally.covered.toLocaleString("en")} / ${tally.total.toLocaleString("en")}` : undefined}>
-      <span className="track">{r !== undefined && <span className="fill" style={{ width: `${r * 100}%`, background: color }} />}</span>
+    <span className="v-bar" title={`${tally!.covered.toLocaleString("en")} / ${tally!.total.toLocaleString("en")}`}>
+      <span className="track">
+        <span className="fill" style={{ width: `${r * 100}%`, background: color }} />
+      </span>
     </span>
   );
 }
 
+/** A share of lines; blank without data, where the bar says so. */
 export function Pct({ tally }: { tally: Tally | undefined }) {
-  return <span className="v-pct">{pct(tally)}</span>;
+  return <span className="v-pct">{ratio(tally) === undefined ? "" : pct(tally)}</span>;
 }
 
 /** A page's one number, its bar, and a line of small print under it. */
 export function Hero({ tally, label, title, children }: { tally: Tally | undefined; label: string; title: string; children?: ReactNode }) {
+  const none = ratio(tally) === undefined;
   return (
     <div className="v-hero">
       <div className="v-hero-num" title={title}>
-        <span className="v-big">{pct(tally)}</span>
-        <span className="label">{label}</span>
+        <span className={`v-big${none ? " none" : ""}`}>{none ? "no data" : pct(tally)}</span>
+        {!none && <span className="label">{label}</span>}
       </div>
-      <Bar tally={tally} color="var(--ink)" />
+      {!none && <Bar tally={tally} color="var(--ink)" />}
       {children && <div className="v-hero-foot label">{children}</div>}
     </div>
   );

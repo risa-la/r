@@ -28,6 +28,15 @@
   min-width: 0;
 }
 
+/* The source tree on the left of every page; see the media queries at the end. */
+.v-frame,
+.v-main {
+  display: grid;
+  gap: var(--panel-inset);
+  align-items: start;
+  min-width: 0;
+}
+
 .v-noscript {
   margin: 0;
   padding: var(--panel-padding);
@@ -80,8 +89,8 @@
   flex: none;
   font-size: 13px;
 }
-.v-head input {
-  width: min(24ch, 45%);
+.v-tree input {
+  width: 100%;
   min-height: 28px;
   padding: 0 10px;
   font: inherit;
@@ -147,6 +156,12 @@
   overflow: hidden;
   background: color-mix(in srgb, var(--text) 9%, transparent);
 }
+/* Nothing to count: not the same as none of it reached. */
+.v-bar.none {
+  justify-content: center;
+  font-size: 11px;
+  white-space: nowrap;
+}
 .v-bar .fill {
   position: absolute;
   inset: 0 auto 0 0;
@@ -180,6 +195,10 @@
   line-height: 1;
   letter-spacing: -0.03em;
   font-variant-numeric: tabular-nums;
+}
+.v-big.none {
+  font-size: 28px;
+  color: var(--text-tertiary);
 }
 .v-hero-num .label {
   font-size: 14px;
@@ -237,7 +256,7 @@ a.row:hover {
 }
 /* Something to open: a chevron that turns. */
 .v-checks summary.row > :first-child::before,
-.v-files summary.row > :first-child::before {
+.v-tree summary.row > :first-child::before {
   content: "▸";
   display: inline-block;
   font-weight: 400;
@@ -246,7 +265,7 @@ a.row:hover {
   transition: transform 0.15s;
 }
 .v-checks details[open] > summary.row > :first-child::before,
-.v-files details[open] > summary.row > :first-child::before {
+.v-tree details[open] > summary.row > :first-child::before {
   transform: rotate(90deg);
 }
 
@@ -311,34 +330,45 @@ a.row:hover {
   color: var(--text-tertiary);
 }
 
-/* Files -------------------------------------------------------------------- */
+/* The source tree ----------------------------------------------------------- */
 
-.v-files details {
+.v-tree .row {
+  grid-template-columns: minmax(0, 1fr) 40px 6ch;
+  gap: 8px;
+}
+.v-tree details {
   border-top: 1px solid var(--rule);
   padding: 4px var(--inline);
 }
-.v-files .crate {
+.v-tree .crate {
   font-weight: 700;
-}
-.v-files ul {
-  list-style: none;
-  margin: 0;
-  padding: 0 0 var(--inline) 1.4ch;
-}
-.v-files a.row {
-  padding-top: 2px;
-  padding-bottom: 2px;
-  font-size: 12px;
-}
-.v-files .path {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.v-files a.test {
+.v-tree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 var(--inline) 1.4ch;
+}
+.v-tree a.row {
+  padding-top: 2px;
+  padding-bottom: 2px;
+  font-size: 12px;
+}
+.v-tree .path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.v-tree a.test {
   color: var(--text-tertiary);
 }
-.v-files a.test .label {
+.v-tree a[aria-current] {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+.v-tree a.test .label {
   grid-column: 2 / -1;
 }
 
@@ -532,6 +562,27 @@ a.row:hover {
 .ln.target {
   box-shadow: inset 0 0 0 1px var(--ink);
 }
+/* A long comment, folded: its first hidden line fading out, then its last. */
+.ln.fold {
+  cursor: pointer;
+}
+.ln.fold .num {
+  padding: 0 8px 0 0;
+  font: inherit;
+  font-weight: 800;
+  text-align: right;
+  color: var(--ink);
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+.ln.fold .src {
+  -webkit-mask-image: linear-gradient(to bottom, #000 10%, transparent 95%);
+  mask-image: linear-gradient(to bottom, #000 10%, transparent 95%);
+}
+.ln.fold:hover .num {
+  color: var(--ink);
+}
 .ln.target .num {
   color: var(--ink);
   font-weight: 700;
@@ -629,8 +680,13 @@ a.row:hover {
 .badge.kani {
   --c: var(--location);
 }
+/* Citations in code are not evidence: outlined, not filled. */
 .badge.code {
-  --c: var(--mention);
+  --c: var(--text-tertiary);
+  font-weight: 400;
+  background: none;
+  box-shadow: inset 0 0 0 1px var(--rule);
+  cursor: help;
 }
 .badge.test {
   --c: var(--presence);
@@ -692,14 +748,35 @@ a.row:hover {
   overflow-wrap: anywhere;
 }
 
+/* Wide screens: the tree on the left, sticky, scrolling on its own. */
+@media (min-width: 961px) {
+  .v-frame.tree {
+    grid-template-columns: var(--sidebar) minmax(0, 1fr);
+  }
+  .v-tree {
+    position: sticky;
+    top: var(--topbar);
+    max-height: calc(100vh - var(--topbar) - var(--panel-inset));
+    display: flex;
+    flex-direction: column;
+  }
+  .v-tree .list {
+    position: relative;
+    overflow-y: auto;
+  }
+}
+/* Narrow ones: the tree under the overview, and on no other page. */
+@media (max-width: 960px) {
+  .v-frame:not(.home) .v-tree {
+    display: none;
+  }
+  .v-frame.home .v-tree {
+    order: 1;
+  }
+}
+
 /* Phones: no sideways page scroll. The code still scrolls in its panel. */
 @media (max-width: 640px) {
-  .v-head:has(input) {
-    flex-wrap: wrap;
-  }
-  .v-head input {
-    width: 100%;
-  }
   .v-checks .row {
     grid-template-columns: minmax(0, 1fr) 7ch;
     gap: 2px 12px;
@@ -713,9 +790,6 @@ a.row:hover {
     grid-row: 3;
     text-align: left;
     padding-left: 1.4ch;
-  }
-  .v-files .row {
-    grid-template-columns: minmax(0, 1fr) 40px 7ch;
   }
   .v-rows {
     font-size: 12px;
