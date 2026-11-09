@@ -103,20 +103,6 @@ impl Device {
         out
     }
 
-    /// Runs `risala` until it succeeds, up to `tries` times.
-    async fn retry(&self, args: &[&str], tries: usize) -> String {
-        let mut last = String::new();
-        for _ in 0..tries {
-            let (ok, out, err) = self.try_run(args, None).await;
-            if ok {
-                return out;
-            }
-            last = err;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        panic!("risala {args:?} kept failing: {last}");
-    }
-
     /// The texts of a conversation, after receiving for a few seconds.
     async fn texts(&self, conversation: &str) -> Vec<String> {
         let (ok, out, _) = self
@@ -206,11 +192,21 @@ async fn the_goal_with_the_cli() {
     let qr = theirs.lines().nth(1).unwrap();
     alice.run(&["verify", "bob@example.org", qr]).await;
 
-    // A direct conversation.
-    alice.retry(&["direct", "bob@example.org"], 15).await;
+    // A direct conversation, which `send` starts. A private room named
+    // like bob's uid is never what the uid names: it is `#bob@example.org`.
+    // `create` waited for bob's KeyPackages to reach the server, so the
+    // first try works.
+    alice.run(&["room", "create", "bob@example.org"]).await;
     alice
         .run(&["send", "bob@example.org", "hello", "bob"])
         .await;
+    let direct = alice.run(&["direct", "bob@example.org"]).await;
+    let list = alice.run(&["list"]).await;
+    let line = format!("{}\tdirect\tbob@example.org\t", direct.trim());
+    assert!(list.lines().any(|l| l.starts_with(&line)), "{list}");
+    let hello = "hello bob".to_owned();
+    assert!(!alice.texts("#bob@example.org").await.contains(&hello));
+    assert!(alice.texts("bob@example.org").await.contains(&hello));
     bob.until_text("alice@example.org", "hello bob", &[&alice], 10)
         .await;
     bob.run(&["send", "alice@example.org", "hello alice"]).await;
@@ -218,16 +214,31 @@ async fn the_goal_with_the_cli() {
         .until_text("bob@example.org", "hello alice", &[&bob], 10)
         .await;
 
-    // A private room.
-    alice.run(&["room", "create", "garden"]).await;
-    alice
-        .run(&["room", "invite", "garden", "bob@example.org"])
+    // A send that cannot settle in its time fails, and what it queued is
+    // sent on the next run.
+    let (ok, _, err) = alice
+        .try_run(
+            &["--wait", "0", "send", "bob@example.org", "sent later"],
+            None,
+        )
         .await;
-    alice.run(&["send", "garden", "welcome"]).await;
-    bob.until_text("garden", "welcome", &[&alice], 10).await;
-    bob.run(&["send", "garden", "thanks"]).await;
-    alice.until_text("garden", "thanks", &[&bob], 10).await;
-    let members = alice.run(&["room", "members", "garden"]).await;
+    assert!(!ok, "a send with no time to settle succeeded");
+    assert!(err.contains("1 message or commit"), "{err}");
+    bob.until_text("alice@example.org", "sent later", &[&alice], 10)
+        .await;
+
+    // A private room, named with `#`; a bare name is refused.
+    alice.run(&["room", "create", "garden"]).await;
+    let (ok, _, err) = alice.try_run(&["send", "garden", "hi"], None).await;
+    assert!(!ok && err.contains("#garden"), "{err}");
+    alice
+        .run(&["room", "invite", "#garden", "bob@example.org"])
+        .await;
+    alice.run(&["send", "#garden", "welcome"]).await;
+    bob.until_text("#garden", "welcome", &[&alice], 10).await;
+    bob.run(&["send", "#garden", "thanks"]).await;
+    alice.until_text("#garden", "thanks", &[&bob], 10).await;
+    let members = alice.run(&["room", "members", "#garden"]).await;
     assert!(members.contains("bob@example.org"), "{members}");
 
     // A file in the direct conversation (5.6, 12.11).
@@ -289,7 +300,7 @@ async fn the_goal_with_the_cli() {
     phone
         .until_text("bob@example.org", "hello bob", &[&alice], 15)
         .await;
-    phone.until_text("garden", "welcome", &[&alice], 10).await;
+    phone.until_text("#garden", "welcome", &[&alice], 10).await;
     phone
         .run(&["send", "bob@example.org", "from the phone"])
         .await;
@@ -302,7 +313,7 @@ async fn the_goal_with_the_cli() {
     bob.run(&["name", "Bob"]).await;
     for _ in 0..10 {
         alice.run(&["--wait", "5", "sync"]).await;
-        let members = alice.run(&["room", "members", "garden"]).await;
+        let members = alice.run(&["room", "members", "#garden"]).await;
         if members
             .lines()
             .any(|l| l.starts_with("bob@example.org") && l.ends_with("\tBob"))
@@ -368,7 +379,7 @@ async fn the_goal_with_the_cli() {
     // A public room (6.1): alice creates it; bob's new device joins by
     // proposal while alice's laptop is online to commit it; they talk once
     // their ATTESTs pin their pseudonyms (7.3, 12.10).
-    alice.retry(&["public", "create", "#plaza"], 5).await;
+    alice.run(&["public", "create", "#plaza"]).await;
     let rooms = spare.run(&["public", "list"]).await;
     assert!(rooms.contains("#plaza"), "{rooms}");
     let (joined, _) = tokio::join!(

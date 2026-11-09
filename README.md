@@ -104,14 +104,34 @@ For example, two people talking:
 A=$(cat .dev/cli-args)
 risala --state /tmp/alice $A --short-waits create chat.test alice laptop
 risala --state /tmp/bob $A --short-waits create chat.test bob laptop
-risala --state /tmp/alice $A --short-waits direct bob@example.org
 risala --state /tmp/alice $A --short-waits send bob@example.org hello
 risala --state /tmp/bob $A --short-waits read alice@example.org --sync
+risala --state /tmp/alice $A --short-waits room create garden
+risala --state /tmp/alice $A --short-waits room invite '#garden' bob@example.org
+risala --state /tmp/alice $A --short-waits send '#garden' welcome
 ```
 
+A uid names only the direct conversation with that identity, and `send`
+starts it if there is none; rooms are named `#name` (quoted, for the
+shell) or by their number from `risala list`.
+
 `--short-waits` cuts the protocol's random waits of up to 10 minutes to a
-second. M5a's seeded scenarios talked in plain text, which the current
-protocol has no commands for; they come back once rebuilt on librisala.
+second. It, `--ca` and `--resolve` weaken what the client checks or
+hides, so each run that has them prints a warning.
+
+The witness policy is kept in the state directory. `--witness` from
+`.dev/cli-args` saves it when `create`, `pair new` or `recover` sets up a
+new state directory; after that the option must match it, and only
+`risala witness set` or `risala witness clear` change it (`risala witness
+show` prints it). risala-dev's witness key comes from a fixed seed, so
+`risala` warns on every run while the policy names it.
+
+Commands that send stay connected until what they sent has reached the
+server, for at most `--wait` seconds (20 by default), and exit with 1 if
+it has not; it goes out on the next run.
+
+M5a's seeded scenarios talked in plain text, which the current protocol
+has no commands for; they come back once rebuilt on librisala.
 
 ### Model checking with Kani
 
