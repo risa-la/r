@@ -97,6 +97,14 @@ const MAX_WELCOME_BLOBS: usize = 4;
 /// How many queued messages a conversation posts at once.
 const POST_BATCH: usize = 16;
 
+/// How often a commit fetches an identity's KeyPackages again, at most,
+/// when the ones it had were out of their lifetime (12.5).
+const REFETCHES: u32 = 3;
+
+/// How long after fetching an identity's KeyPackages again for a commit
+/// it may do so once more.
+const REFETCH_EVERY_MS: u64 = 10 * 60 * 1000;
+
 /// The group engine's settings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -810,6 +818,11 @@ pub struct ConversationEngine {
     /// that a server that refuses every Welcome cannot loop the group
     /// through commits (12.8).
     readded: HashSet<(ConversationId, [u8; 48])>,
+    /// Identities whose KeyPackages were fetched again for a commit, as
+    /// out of their lifetime when it was made (12.5): when, and how often,
+    /// so that a device whose KeyPackages never fit cannot use up the
+    /// identity's KeyPackages.
+    refetched: HashMap<(ConversationId, Uid), (u64, u32)>,
     started: bool,
     welcomes_listed: bool,
     self_requested: bool,
@@ -873,6 +886,7 @@ impl ConversationEngine {
             uploads: HashMap::new(),
             blob_waits: HashMap::new(),
             readded: HashSet::new(),
+            refetched: HashMap::new(),
             started: false,
             welcomes_listed: false,
             self_requested: false,
@@ -2671,12 +2685,14 @@ impl ConversationEngine {
                 continue;
             }
             // 12.12: posts made already, whose blobs are being stored.
+            let mut refetch = Vec::new();
             let posts = match self.blob_waits.remove(&conv.id) {
                 Some(posts) => Ok(posts),
                 None => self.write(cx, me, out, |tx, c| {
-                    next_posts(tx, c, &conv, now, signed_in)
+                    next_posts(tx, c, &conv, now, signed_in, &mut refetch)
                 }),
             };
+            self.refetch(cx, conv.id, refetch, now, out);
             let posts = match posts {
                 Ok(posts) => posts,
                 Err(e) => {
@@ -2823,6 +2839,35 @@ impl ConversationEngine {
             }
         }
         Ok(())
+    }
+
+    /// Fetches again the KeyPackages of identities whose devices a commit
+    /// left out, as out of their lifetime (12.5), and adds those devices
+    /// that still have no leaf: up to [`REFETCHES`] times for each, at most
+    /// every [`REFETCH_EVERY_MS`].
+    fn refetch(
+        &mut self,
+        cx: &Context,
+        conv: ConversationId,
+        uids: Vec<Uid>,
+        now: u64,
+        out: &mut Vec<Action>,
+    ) {
+        let mut due = Vec::new();
+        for uid in uids {
+            let (at, n) = self.refetched.entry((conv, uid.clone())).or_insert((0, 0));
+            if *n >= REFETCHES || (*n > 0 && now < at.saturating_add(REFETCH_EVERY_MS)) {
+                tracing::info!(%conv, %uid, "not fetching KeyPackages again yet");
+                continue;
+            }
+            *at = now;
+            *n += 1;
+            due.push(uid);
+        }
+        if !due.is_empty() {
+            let (_, actions) = self.start(cx, Job::Invite { conv, uids: due });
+            out.extend(actions);
+        }
     }
 
     fn welcomes_due(
@@ -3060,12 +3105,16 @@ struct CreateMove {
 /// commit to make from an intent, or a SelfRemove, or up to
 /// [`POST_BATCH`] messages. Nothing while a commit or a post is waiting to
 /// be applied (7.2).
+///
+/// Identities whose added KeyPackages were out of their lifetime go in
+/// `refetch` (12.5).
 fn next_posts(
     tx: &mut Tx<'_>,
     c: &Ctx<'_>,
     conv: &ConvRow,
     now: u64,
     signed_in: bool,
+    refetch: &mut Vec<Uid>,
 ) -> Result<Vec<NextPost>, EngineError> {
     let mut rows = tx.pending_outbox(conv.id)?;
     let waiting = |r: &OutboxRow| r.not_before.is_some_and(|t| t > now);
@@ -3128,18 +3177,51 @@ fn next_posts(
         return Ok(Vec::new());
     }
     let (token, epoch) = group::send_token(tx, c, conv)?;
-    if let Some(row) = rows.iter().find(|r| r.kind == OutboxKind::Commit) {
+    // A commit made for this epoch is pending in the group, and may have
+    // reached the server already: it goes before any other.
+    let built = |r: &OutboxRow| r.post.is_some() && r.epoch == Some(epoch);
+    // 6.1: a leaving device makes no commit but its own leave commit. MLS
+    // refuses its commits once its SelfRemove is pending, and a refused
+    // commit would hold the outbox, and the leave, for good.
+    if group::leaving(tx, conv.id)? {
+        for r in rows
+            .iter()
+            .filter(|r| r.kind == OutboxKind::Commit && !group::leave_row(r) && !built(r))
+        {
+            tracing::info!(conv = %conv.id, "a commit dropped: the device is leaving");
+            tx.update_outbox(r.id, OutboxState::Lost, None, None, None)?;
+        }
+        rows.retain(|r| r.kind != OutboxKind::Commit || group::leave_row(r) || built(r));
+    }
+    // 12.7: then removals, by record or for a check, and repairs, which
+    // are never held; then the others in order. A commit held while
+    // sending is held is made again after them.
+    let commits: Vec<&OutboxRow> = rows
+        .iter()
+        .filter(|r| r.kind == OutboxKind::Commit)
+        .collect();
+    let chosen = commits
+        .iter()
+        .find(|r| built(r))
+        .or_else(|| {
+            commits
+                .iter()
+                .find(|r| group::removal_row(r) && !waiting(r))
+        })
+        .or_else(|| commits.first());
+    if let Some(row) = chosen {
         if waiting(row) {
             return Ok(Vec::new());
         }
-        let row = row.clone();
+        let row = (*row).clone();
+        let rebuild = !built(&row);
         // 12.7: a new extension waits while sending is held.
-        if row.post.is_none() && keycheck::commit_held(tx, conv.id, row.intent.as_deref())? {
+        if rebuild && keycheck::commit_held(tx, conv.id, row.intent.as_deref())? {
             return Ok(Vec::new());
         }
         // A commit made for an earlier epoch lost: make it again.
-        if row.post.is_none() || row.epoch != Some(epoch) {
-            match group::build_commit(tx, c, conv, &row)? {
+        if rebuild {
+            match group::build_commit(tx, c, conv, &row, refetch)? {
                 group::Built::Made => {}
                 group::Built::Nothing => return Ok(Vec::new()),
                 group::Built::WaitUntil(t) => {

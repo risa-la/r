@@ -374,6 +374,11 @@ impl FakeServer {
             .map_or(0, Vec::len)
     }
 
+    /// Forgets a device's KeyPackages, as once their lifetimes end.
+    pub fn drop_key_packages(&mut self, uid: &str, device: &[u8]) {
+        self.key_packages.remove(&(uid.to_owned(), device.to_vec()));
+    }
+
     /// Forgets a connection, as when it closes.
     pub fn close(&mut self, conn: ConnId) {
         for m in self.mailboxes.values_mut() {

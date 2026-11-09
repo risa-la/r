@@ -474,8 +474,9 @@ impl Client {
     ///   Other identities' new devices are added by their own devices, so
     ///   that members do not race to add the same device.
     ///
-    /// Nothing is done while a commit of this device is pending there, nor
-    /// once this device is leaving: leaving removes the identity's other
+    /// No removal is queued while a removal of this device is pending
+    /// there, and no add while any commit of it is (12.7); nothing once
+    /// this device is leaving: leaving removes the identity's other
     /// leaves, which must not be added back (6.1). An identity that left
     /// is not added back either, nor one with a SelfRemove pending (6.1,
     /// 12.7).
@@ -490,19 +491,25 @@ impl Client {
         ) {
             return Ok(());
         }
-        let (pending, _) = self
+        // 12.7: removals go before other queued commits, so only a pending
+        // removal holds the next; adds wait for every commit.
+        let ((leaving, removing, pending), _) = self
             .store()
             .write_with(|tx| {
-                Ok::<_, crate::sync::conversations::EngineError>(
-                    group::leaving(tx, row.id)?
-                        || tx
-                            .pending_outbox(row.id)?
-                            .iter()
-                            .any(|o| o.kind == crate::store::messages::OutboxKind::Commit),
-                )
+                let outbox = tx.pending_outbox(row.id)?;
+                let commits = || {
+                    outbox
+                        .iter()
+                        .filter(|o| o.kind == crate::store::messages::OutboxKind::Commit)
+                };
+                Ok::<_, crate::sync::conversations::EngineError>((
+                    group::leaving(tx, row.id)?,
+                    commits().any(group::removal_row),
+                    commits().next().is_some(),
+                ))
             })
             .map_err(super::Error::from)?;
-        if pending {
+        if leaving || removing {
             return Ok(());
         }
         let (owners, mods) = match self.extension(row) {
@@ -560,6 +567,9 @@ impl Client {
         }
 
         // Adds.
+        if pending {
+            return Ok(());
+        }
         for uid in uids.iter().filter(|u| !u.is_guest()) {
             let has_leaf = leaves.iter().any(|l| l.uid == *uid);
             let ours = uid == own;

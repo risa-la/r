@@ -74,18 +74,12 @@ fn past_epochs_go_two_hours_after_their_commit_by_the_clock() {
     net.disconnect(bob);
     let early = encrypted(&mut net, bob, b, "early");
     let late = encrypted(&mut net, bob, b, "late");
-    // Alice commits: the epoch is past.
+    // Alice commits a fresh leaf: the epoch is past. (Not a new signature
+    // key: her leaf has committed already, so 12.3 does not allow one in a
+    // pairwise group, and her device would not post it.)
     let now = net.clock.now().unix_millis();
     net.write(alice, |tx| {
-        group::queue_intent(
-            tx,
-            a,
-            &Intent {
-                new_leaf_key: true,
-                ..Intent::default()
-            },
-            now,
-        )?;
+        group::queue_intent(tx, a, &Intent::default(), now)?;
         Ok(())
     });
     net.tick();

@@ -20,11 +20,12 @@ use risala_mls::framing::{ContentType, read_post};
 use risala_mls::group::{self as mls_group, Changes, Incoming, ProposalKind};
 use risala_mls::identity::RisalaIdentity;
 use risala_mls::keypackage::{
-    check_key_package_contents, lifetime_acceptable_at, read_key_package, verify_key_package,
+    LIFETIME_SKEW_MS, check_key_package_contents, lifetime_acceptable_at, read_key_package,
+    verify_key_package,
 };
 use risala_mls::message::{self as mls_message, MessageHistory as _, PostInfo, ReceiveError};
 use risala_mls::openmls::group::MlsGroup;
-use risala_mls::openmls::prelude::{GroupId, KeyPackage, LeafNodeIndex};
+use risala_mls::openmls::prelude::{GroupId, KeyPackage, LeafNodeIndex, Lifetime, Sender};
 use risala_mls::openmls_traits::OpenMlsProvider as _;
 use risala_mls::profile::RisalaProfile;
 use risala_mls::token::SendToken;
@@ -268,7 +269,8 @@ fn read_kp(cx: &Ctx<'_>, bytes: &[u8]) -> Option<KeyPackage> {
 
 /// A KeyPackage fetched with KEYPKG GET, read and checked as far as the
 /// group can (12.5, 12.7): valid MLS, of the suite, a device's credential
-/// of `uid`, a profile, and a lifetime acceptable now. Its binding is
+/// of `uid`, a profile, and a lifetime acceptable for a commit posted
+/// now ([`lifetime_ok_to_post`]). Its binding is
 /// checked against the key file through the hooks; one that cannot be
 /// checked yet is accepted, and the added leaf stays unconfirmed (12.7).
 pub(crate) fn check_fetched(
@@ -279,7 +281,8 @@ pub(crate) fn check_fetched(
 ) -> Option<KeyPackage> {
     let kp = read_kp(cx, bytes)?;
     let (identity, _) = check_key_package_contents(&kp).ok()?;
-    if &identity.uid != uid || !lifetime_acceptable_at(kp.life_time(), cx.now) {
+    // 12.5: as the commit that adds it will be checked (`build_commit`).
+    if &identity.uid != uid || !lifetime_ok_to_post(kp.life_time(), cx.now) {
         return None;
     }
     let device = identity.device_id?;
@@ -310,13 +313,96 @@ pub(crate) fn leaving(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
 /// Whether this device's commit that removes its identity's other leaves
 /// before its SelfRemove is queued or pending (6.1).
 fn leaving_commit_queued(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
-    Ok(tx.pending_outbox(conv)?.iter().any(|o| {
-        o.kind == OutboxKind::Commit
-            && o.intent
-                .as_deref()
-                .and_then(|i| Intent::decode(i).ok())
-                .is_some_and(|i| i.then == Then::SelfRemove)
-    }))
+    Ok(tx.pending_outbox(conv)?.iter().any(leave_row))
+}
+
+/// The intent of an outbox row, if it is a commit.
+fn commit_intent(row: &OutboxRow) -> Option<Intent> {
+    if row.kind != OutboxKind::Commit {
+        return None;
+    }
+    Intent::decode(row.intent.as_deref()?).ok()
+}
+
+/// Whether an outbox row is this device's leave commit, which removes its
+/// identity's other leaves before its SelfRemove (6.1): the one commit a
+/// leaving device makes.
+pub(crate) fn leave_row(row: &OutboxRow) -> bool {
+    commit_intent(row).is_some_and(|i| i.then == Then::SelfRemove)
+}
+
+/// Whether an intent is a removal (12.7): it removes leaves, by record,
+/// for a check, to replace them or to leave, and changes neither the
+/// conversation extension nor a display name, nor moves the mailbox. Such
+/// commits go before any other that is queued, and are never held.
+pub(crate) fn is_removal(intent: &Intent) -> bool {
+    !intent.remove.is_empty()
+        && intent.conversation.is_none()
+        && intent.display_name.is_none()
+        && !intent.move_box
+}
+
+/// Whether an outbox row is a commit whose intent is a removal.
+pub(crate) fn removal_row(row: &OutboxRow) -> bool {
+    commit_intent(row).is_some_and(|i| is_removal(&i))
+}
+
+/// Whether no other identity has a leaf in the group (6.1): nobody could
+/// commit this device's SelfRemove, so it leaves by itself.
+pub(crate) fn lone(tx: &Tx<'_>, conv: ConversationId, own: &Uid) -> Result<bool> {
+    Ok(!crate::store::conversations::read::leaves(tx.conn(), conv)?
+        .iter()
+        .any(|l| l.uid != *own))
+}
+
+/// Forgets a group that this device leaves by itself (6.1): with no other
+/// identity in it, no commit could remove its leaf. Its MLS state and leaf
+/// key are deleted, what it had queued is dropped, and the conversation is
+/// left, as when the device is removed; the engine then unfollows its
+/// mailboxes. Messages stay, as for any conversation left.
+pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()> {
+    let row = tx.conversation(conv)?;
+    if !row.state.in_group() {
+        return Ok(());
+    }
+    {
+        let storage = tx.mls_storage();
+        let storage_err = |e| EngineError::Mls(format!("{e:?}"));
+        let group =
+            MlsGroup::load(&storage, &GroupId::from_slice(&row.group_id)).map_err(storage_err)?;
+        if let Some(mut group) = group {
+            if group.is_active()
+                && let Some(leaf) = group.own_leaf_node()
+            {
+                risala_mls::mldsa::LeafKey::delete(
+                    &storage,
+                    &row.group_id,
+                    leaf.signature_key().as_slice(),
+                )
+                .map_err(storage_err)?;
+            }
+            group.delete(&storage).map_err(storage_err)?;
+        }
+    }
+    for o in tx.pending_outbox(conv)? {
+        tx.update_outbox(o.id, OutboxState::Lost, None, None, None)?;
+    }
+    tx.set_state(conv, ConvState::Left)?;
+    tracing::info!(%conv, "left a conversation by itself: no other identity is in it");
+    Ok(())
+}
+
+/// Whether a KeyPackage's lifetime is acceptable for a commit this device
+/// posts now (12.5, 12.7): every device checks it against the `t` of the
+/// commit's post, give or take an hour, and the server gives the post its
+/// `t`. So this device takes the hour inward instead: the lifetime must
+/// hold from an hour before its clock to an hour after.
+pub(crate) fn lifetime_ok_to_post(lifetime: &Lifetime, now_ms: u64) -> bool {
+    let not_before = lifetime.not_before().saturating_mul(1000);
+    let not_after = lifetime.not_after().saturating_mul(1000);
+    not_before.saturating_add(LIFETIME_SKEW_MS) <= now_ms
+        && now_ms.saturating_add(LIFETIME_SKEW_MS) <= not_after
+        && lifetime_acceptable_at(lifetime, now_ms)
 }
 
 /// What [`build_commit`] did.
@@ -334,11 +420,20 @@ pub(crate) enum Built {
 
 /// Makes the commit of an outbox row from its intent, against the group
 /// as it is, and leaves it pending (7.2).
+///
+/// The commit passes the same group checks as a received one (12.7),
+/// against the time this device posts it, or it is not posted: a device
+/// that posted a commit the others hold invalid would merge it alone, and
+/// split from the group. An added KeyPackage whose lifetime does not hold
+/// now, with the hour's margin taken inward ([`lifetime_ok_to_post`]), is
+/// left out, and its identity goes in `refetch`, whose KeyPackages the
+/// engine fetches again (12.5).
 pub(crate) fn build_commit(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
     row: &OutboxRow,
+    refetch: &mut Vec<Uid>,
 ) -> Result<Built> {
     let intent = Intent::decode(row.intent.as_deref().unwrap_or_default())
         .map_err(|e| EngineError::Invalid(e.to_string()))?;
@@ -398,9 +493,19 @@ pub(crate) fn build_commit(
             .leaves
             .iter()
             .any(|leaf| leaf.identity.as_ref() == Some(&identity) && !remove.contains(&leaf.index));
-        if !present {
-            add.push(kp);
+        if present {
+            continue;
         }
+        // 12.5: fetched a while ago, and over or not yet in its lifetime
+        // as of the post.
+        if !lifetime_ok_to_post(kp.life_time(), cx.now) {
+            tracing::info!(conv = %conv.id, uid = %identity.uid, "an added KeyPackage is out of its lifetime; fetching again");
+            if !refetch.contains(&identity.uid) {
+                refetch.push(identity.uid.clone());
+            }
+            continue;
+        }
+        add.push(kp);
     }
     let conversation = match &intent.conversation {
         Some(bytes) => Some(
@@ -483,6 +588,25 @@ pub(crate) fn build_commit(
         },
     )
     .map_err(mls)?;
+    // 12.7: the group checks, as every other member will make them, with
+    // this device's clock for the post's `t`.
+    let checked = {
+        let staged = group
+            .pending_commit()
+            .ok_or(EngineError::Mls("no pending commit".into()))?;
+        let commit = risala_mls::checks::CommitView::of(&Sender::Member(own), staged);
+        risala_mls::checks::check_commit(
+            &view,
+            &commit,
+            &state.post(cx.now, Some(out.next_token_hash)),
+        )
+    };
+    if let Err(e) = checked {
+        tracing::warn!(conv = %conv.id, error = %e, "this device's commit fails the group checks; not posted");
+        mls_group::discard_own_commit(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
+        tx.update_outbox(row.id, OutboxState::Lost, None, None, None)?;
+        return Ok(Built::Nothing);
+    }
     let epoch = group.epoch().as_u64();
     tx.set_outbox_commit(
         row.id,
