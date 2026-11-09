@@ -256,6 +256,19 @@ impl Client {
     }
 
     pub(crate) fn row_sending_stopped(&self, row: &ConvRow) -> Result<Option<StopReason>> {
+        Ok(self.stopped_by(row)?.map(|(_, reason)| reason))
+    }
+
+    /// Refuses to send in a conversation whose sending is stopped (12.14).
+    pub(crate) fn check_sending(&self, row: &ConvRow) -> Result<()> {
+        match self.stopped_by(row)? {
+            Some((uid, reason)) => Err(IdentityError::Stopped { uid, reason }.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The first identity that stops sending in a conversation, and why.
+    fn stopped_by(&self, row: &ConvRow) -> Result<Option<(Uid, StopReason)>> {
         let Some(kind) = key_kind(&row.kind) else {
             return Ok(None);
         };
@@ -271,42 +284,10 @@ impl Client {
         };
         uids.sort();
         uids.dedup();
-        for uid in uids.iter().filter(|u| !u.is_guest() && **u != own) {
-            let contact = self.store().contact(uid.as_str())?;
-            if let SendCheck::Stop(reason) = send_check(contact.as_ref(), kind) {
-                return Ok(Some(reason));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Refuses to send in a conversation whose sending is stopped (12.14).
-    pub(crate) fn check_sending(&self, row: &ConvRow) -> Result<()> {
-        if let (Some(reason), Some(uid)) = (self.row_sending_stopped(row)?, self.stopped_uid(row)?)
-        {
-            return Err(IdentityError::Stopped { uid, reason }.into());
-        }
-        Ok(())
-    }
-
-    fn stopped_uid(&self, row: &ConvRow) -> Result<Option<Uid>> {
-        let kind = key_kind(&row.kind);
-        let own = self.account(row.account)?.uid;
-        let uids: Vec<Uid> = match (&row.kind, &row.peer) {
-            (ConvKind::Direct, Some(peer)) => vec![peer.clone()],
-            _ => self
-                .store()
-                .leaf_rows(row.id)?
-                .into_iter()
-                .map(|l| l.uid)
-                .collect(),
-        };
         for uid in uids.into_iter().filter(|u| !u.is_guest() && *u != own) {
             let contact = self.store().contact(uid.as_str())?;
-            if let Some(kind) = kind
-                && let SendCheck::Stop(_) = send_check(contact.as_ref(), kind)
-            {
-                return Ok(Some(uid));
+            if let SendCheck::Stop(reason) = send_check(contact.as_ref(), kind) {
+                return Ok(Some((uid, reason)));
             }
         }
         Ok(None)
@@ -314,7 +295,9 @@ impl Client {
 
     /// Before starting a conversation with `uid` or inviting it: fetches
     /// its key file if the device has never read it, and refuses an
-    /// identity whose devices may not be added (4.5, 12.7, 12.14). Also
+    /// identity that sending is stopped for, or whose key file was read
+    /// and whose devices may not be added: stale, or not accepted yet
+    /// (4.5, 12.7, 12.14). Also
     /// makes sure the device has read its own identity's key file, whose
     /// other devices join too.
     pub(crate) async fn prepare_members(&self, account: AccountId, uids: &[Uid]) -> Result<()> {
@@ -341,7 +324,13 @@ impl Client {
                 }
                 .into());
             }
-            if !self.may_add_devices(uid.as_str())? {
+            // While its key file could never be read (an outage, 4.4), the
+            // devices are added unchecked, as C2 chose, and stay
+            // unconfirmed (12.7). Once it was read, they must be addable.
+            let read = contact
+                .as_ref()
+                .is_some_and(|c| c.keys != KeysState::Unknown);
+            if read && !self.may_add_devices(uid.as_str())? {
                 return Err(IdentityError::NotAccepted(uid.clone()).into());
             }
         }
