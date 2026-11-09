@@ -765,10 +765,15 @@ checks:
   Each is one of:
   - a **resync commit** (below), by an identity that had a leaf in the
     group before it: it removes the leaf that made the commit that
-    started the epoch, which signed the GroupInfo, and may remove leaves
-    of its own identity, and nothing else;
+    started the epoch, which signed the GroupInfo, and nothing else;
   - a **rejoin** (below), by an identity listed in `owners` or `mods`:
-    it removes only leaves of its own identity.
+    it removes at most one leaf, of its own identity.
+
+  An external commit removes at most one leaf, as Section 12.4.3.2 of
+  [RFC9420] allows. That section lets it remove only the joiner's own
+  earlier leaf; a resync commit removes another identity's instead,
+  which departs from [RFC9420], and the checks above bound what it may
+  remove.
 - **Size.** The group stays within the limits of 6.1. A direct
   conversation holds at most 128 leaves, one for each current device of
   its participants, which have at most 64 each (4.4). In a private room,
@@ -974,7 +979,9 @@ then in batches:
    GroupInfo the server holds, after the comparison that "Rejoining a
    public room" requires (below). It removes the leaf that made the
    commit the devices could not apply, which is the GroupInfo's signer,
-   and its own earlier leaf, and nothing else.
+   and nothing else: an external commit removes at most one leaf
+   (above). The device removes its own earlier leaf in its next commit,
+   as in step 3.
 2. Every other device that cannot follow joins again by external
    proposal, as for a first join (6.1). Full clients commit these
    proposals as 6.1 says, at most 256 devices in a commit.
@@ -1004,7 +1011,8 @@ commit join proposals, so a room whose only full client online is
 hostile could keep everyone else out. An owner or moderator whose join
 proposal no commit has applied within 30 minutes MAY join again by an
 external commit instead, a **rejoin**, which adds only its own leaf and
-may remove its identity's earlier leaves (above). The server checks the
+may remove one earlier leaf of its identity (above); it removes any
+other in its next commit. The server checks the
 role in the conversation extension it holds, and that the commit comes
 from the device that its credential names (12.6). The owner or
 moderator can then commit the waiting proposals, and ban whoever kept
