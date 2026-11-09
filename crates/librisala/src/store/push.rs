@@ -127,7 +127,7 @@ fn sub_row(row: &Row<'_>) -> rusqlite::Result<SubscriptionRow> {
     })
 }
 
-/// A new subscription, for [`Tx::add_subscription`]. Its `Debug` leaves
+/// A new subscription, for `Tx::add_subscription`. Its `Debug` leaves
 /// out the keys, the secret and the URL (LR-L1).
 #[derive(Clone)]
 pub struct NewSubscription<'a> {

@@ -36,7 +36,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// database on disk.
 pub const READERS: usize = 4;
 
-/// The store on a SQLite database (see the [module](self) docs).
+/// The store on a SQLite database (see the docs of the private module
+/// `store::sqlite`).
 #[derive(Debug)]
 pub struct SqliteStore {
     conn: Mutex<Connection>,

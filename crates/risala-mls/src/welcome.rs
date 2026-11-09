@@ -34,7 +34,7 @@ use crate::framing::{CIPHER_SUITE, MLS10};
 /// The HPKE info of a sealed Welcome (12.8, 15).
 pub const WELCOME_INFO: &[u8] = b"risala/1 welcome";
 
-/// The MLSMessage wire format of a Welcome [RFC9420].
+/// The MLSMessage wire format of a Welcome \[RFC9420\].
 const WIRE_FORMAT_WELCOME: u16 = 3;
 
 /// Why a Welcome could not be split, sealed or opened (12.8).

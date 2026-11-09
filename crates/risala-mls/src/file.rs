@@ -76,7 +76,7 @@ pub const BLOB_REF_PREFIX: &str = "sha384:";
 /// The length of a blob-ref's text: the prefix and 96 hex digits.
 pub const BLOB_REF_TEXT_LEN: usize = BLOB_REF_PREFIX.len() + 2 * HASH_LEN;
 
-/// Padmé [PADME] of `len` (12.11): for `len` of at least 2, with
+/// Padmé \[PADME\] of `len` (12.11): for `len` of at least 2, with
 /// E = floor(log2(len)), S = floor(log2(E)) + 1, z = E - S and
 /// m = 2^z - 1, `len + m` with its lowest z bits cleared. 0 and 1 are
 /// their own padded lengths. `None` if the result does not fit 64 bits.
@@ -671,7 +671,7 @@ mod tests {
     }
 
     /// Padmé by its definition, with floating point avoided: the published
-    /// algorithm [PADME] spelled out.
+    /// algorithm \[PADME\] spelled out.
     fn padme_reference(l: u64) -> u64 {
         if l < 2 {
             return l;

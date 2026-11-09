@@ -154,7 +154,7 @@ pub fn random_seed() -> Result<Zeroizing<[u8; SEED_LEN]>, getrandom::Error> {
 }
 
 /// The public key of the X-Wing key with this seed: an attestation key
-/// (12.10), from X-Wing's key generation from a seed [XWING].
+/// (12.10), from X-Wing's key generation from a seed \[XWING\].
 pub fn attestation_public_key(seed: &[u8; SEED_LEN]) -> XWingPublicKey {
     let key = risala_mls::PairingKey::from_seed(Zeroizing::new(*seed));
     XWingPublicKey::from_bytes(key.public_key())

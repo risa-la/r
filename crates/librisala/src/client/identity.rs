@@ -15,7 +15,7 @@
 //! checkpoint seen, hand-offs, and the uid's hint (4.4, 4.5). What it
 //! learns ends in one of the three states of 4.4, with pins on the master
 //! key and log, a head that only moves forward, forks and rollbacks, and
-//! devices that once removed stay removed. See [`verify`].
+//! devices that once removed stay removed. See `verify`.
 //!
 //! # For the conversations area (task C2)
 //!
@@ -509,7 +509,7 @@ impl Client {
     /// An identity the device cannot check stops only direct
     /// conversations; a new master key stops direct conversations and
     /// private rooms, and warns in public rooms (see
-    /// [`send_check`](crate::sync::identity::send_check)). An identity the
+    /// [`send_check`]). An identity the
     /// device never fetched is not stopped by this: the conversations area
     /// fetches it first with [`contact`](Self::contact).
     pub fn send_check(&self, uid: &str, kind: ConversationKind) -> Result<SendCheck> {

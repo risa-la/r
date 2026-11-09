@@ -33,7 +33,7 @@
 //!   and processing posts (12.6-12.9, 6.1, 7.3, 7.8).
 //! - [`checks`]: the checks of joining, and the group and key checks of
 //!   every commit, which depend only on the group's state in the epoch
-//!   ([`EpochState`](checks::EpochState)), the commit and its posts
+//!   ([`EpochState`]), the commit and its posts
 //!   (12.7).
 //! - [`welcome`]: one sealed Welcome per added device (12.8).
 //! - [`message`]: RisalaMessage, franking, counters, late messages and

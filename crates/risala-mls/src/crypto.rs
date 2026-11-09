@@ -241,7 +241,7 @@ pub const X_WING_PUBLIC_KEY_LEN: usize = 1216;
 /// The length of an ML-KEM-768 encapsulation key.
 const ML_KEM_768_PUBLIC_KEY_LEN: usize = 1184;
 
-/// ML-KEM's modulus q [FIPS203].
+/// ML-KEM's modulus q \[FIPS203\].
 const ML_KEM_Q: u16 = 3329;
 
 /// Whether `key` is an X-Wing public key that may be encrypted to (12.2):

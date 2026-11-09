@@ -7,7 +7,7 @@
 //!
 //! # Layout
 //!
-//! - [`command`](self::command): [`Cx`](command::Cx), what a handler
+//! - `command`: `Cx`, what a handler
 //!   gets, and the routing table from commands to areas.
 //! - `state`: the registry of connections, their kinds (4.1) and guest
 //!   sessions, and the per-connection state of every area.
@@ -15,20 +15,20 @@
 //!   (4.1, 4.2), PING, PONG and QUIT (11), and clean-up after a
 //!   connection closes.
 //! - One module per area, each with its commands' handlers, its own
-//!   state ([`State`](identity::State), loaded at start), its own
-//!   per-connection state ([`ConnState`](identity::ConnState)), a hook for
+//!   state (`State`, loaded at start), its own
+//!   per-connection state (`ConnState`), a hook for
 //!   closed connections and a background task (`maintain`):
-//!   - [`identity`]: AUTH, REGISTER, KEYS PUT, PAIR, UNREGISTER, ADMIN
+//!   - `identity`: AUTH, REGISTER, KEYS PUT, PAIR, UNREGISTER, ADMIN
 //!     UNREGISTER, hosted key files (4.6-4.9, 10.5).
-//!   - [`keylog`]: the key log (4.5), which has no commands.
-//!   - [`mailbox`]: CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW,
+//!   - `keylog`: the key log (4.5), which has no commands.
+//!   - `mailbox`: CREATE, POST, GROUPINFO, MUTE, UNMUTE, FOLLOW,
 //!     UNFOLLOW, FETCH, TOKEN, GONE and DROP lines, moves, retention
 //!     (5.2, 6.1, 6.4, 7).
-//!   - [`keys`]: KEYPKG, WELCOME, BLOB, BACKUP, UPLOAD (5.6, 12.5, 12.8,
+//!   - `keys`: KEYPKG, WELCOME, BLOB, BACKUP, UPLOAD (5.6, 12.5, 12.8,
 //!     12.12, 12.13).
-//!   - [`misc`]: INFO, LIST, PRESENCE, WATCH, WHOIS, MEMBERS, PUSH,
+//!   - `misc`: INFO, LIST, PRESENCE, WATCH, WHOIS, MEMBERS, PUSH,
 //!     REPORT, RESOLVE (5.8, 6.1, 8, 9).
-//!   - [`admin`]: the ADMIN commands but ADMIN UNREGISTER (Section 10),
+//!   - `admin`: the ADMIN commands but ADMIN UNREGISTER (Section 10),
 //!     operators and bans.
 //! - `rate`: limits over a sliding window, for any area.
 //!
@@ -39,7 +39,7 @@
 //! command finishes even if the network layer stops waiting for it. The
 //! clean-up after a connection closes takes the gate too. The registry is
 //! behind a plain mutex, never held across an `await` (see `state`).
-//! Store calls run on the blocking pool ([`Inner::db`]).
+//! Store calls run on the blocking pool (`Inner::db`).
 
 pub(crate) mod admin;
 pub(crate) mod command;

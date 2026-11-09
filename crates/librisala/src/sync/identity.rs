@@ -3,9 +3,9 @@
 //!
 //! Owned by task C1 in docs/plans/M5b.md.
 //!
-//! - **The conversation with yourself** (12.9): [`handle_self_line`]
+//! - **The conversation with yourself** (12.9): `handle_self_line`
 //!   takes RECORD, ALERT, RECORDS, SIGNINGKEY, BACKUPKEY and PIN lines
-//!   that arrived there, and [`queue_line`] queues lines to send, which
+//!   that arrived there, and `queue_line` queues lines to send, which
 //!   the conversations engine (task C2) takes with
 //!   [`Client::take_self_lines`](crate::Client::take_self_lines).
 //! - **Chains as kept** ([`kept_chain`]): the device's own identities'

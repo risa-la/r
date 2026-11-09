@@ -26,7 +26,7 @@
 //!   NOTIFY push body (9.3).
 //! - [`auth`]: the sign-in challenge, RisalaSign and ML-DSA-44 keys (4.3,
 //!   4.6, App. B).
-//! - [`codec`]: the TLS presentation language of [RFC9420], for risala's
+//! - [`codec`]: the TLS presentation language of \[RFC9420\], for risala's
 //!   own binary structures.
 //! - [`record`]: key file records, key log entries and the record payload
 //!   of REGISTER and KEYS PUT (4.4, 4.5, 4.7).

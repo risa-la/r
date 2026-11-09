@@ -418,7 +418,7 @@ impl ConvRowRaw {
     }
 }
 
-/// A new conversation, for [`Tx::insert_conversation`].
+/// A new conversation, for `Tx::insert_conversation`.
 #[derive(Debug, Clone)]
 pub struct NewConversation<'a> {
     /// The account.
@@ -646,7 +646,7 @@ impl LeafRaw {
     }
 }
 
-/// A leaf as the group's tree has it, for [`Tx::sync_leaves`].
+/// A leaf as the group's tree has it, for `Tx::sync_leaves`.
 #[derive(Debug, Clone)]
 pub struct TreeLeaf {
     /// Its index.

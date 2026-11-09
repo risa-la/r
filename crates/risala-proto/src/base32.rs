@@ -1,4 +1,4 @@
-//! Base32 of any length [RFC4648], without padding: recovery keys (4.8),
+//! Base32 of any length \[RFC4648\], without padding: recovery keys (4.8),
 //! short device ids and QR codes (4.8, 12.14).
 
 const LOWER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";

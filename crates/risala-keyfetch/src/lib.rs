@@ -11,7 +11,7 @@
 //!   ([`Roots`]);
 //! - no redirects;
 //! - at most 10 seconds and 2 MiB
-//!   ([`MAX_KEY_FILE_BYTES`](risala_proto::keyfile::MAX_KEY_FILE_BYTES));
+//!   ([`MAX_KEY_FILE_BYTES`]);
 //! - an optional guard against special-purpose addresses ([`guard`]),
 //!   checked on every address it connects to, which servers must use;
 //! - a cache of up to an hour, with an explicit refetch for "fetch again

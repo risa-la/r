@@ -9,7 +9,7 @@
 //!   TRANSFER line this device asked for, and the IdentityBundle's
 //!   transfer at pairing ([`Client::receive_pairing_transfer`]), are
 //!   fetched, opened and applied under 12.13's rules
-//!   ([`crate::sync::transfer::apply`]). The old device builds the
+//!   (`crate::sync::transfer::apply`). The old device builds the
 //!   pairing transfer with [`Client::pairing_transfer`], for the identity
 //!   area (task C1) to put in the IdentityBundle.
 //! - **Backups.** Once the user turns them on ([`Client::set_backups`]),

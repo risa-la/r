@@ -4,19 +4,19 @@
 //! Owned by task C4 in docs/plans/M5b.md.
 //!
 //! - **Lines.** The group engine hands this area WANT, TRANSFER and REPORT
-//!   lines ([`content_line`]), and posts that expired before the device
-//!   fetched them ([`posts_expired`]), which it asks the identity's other
+//!   lines (`content_line`), and posts that expired before the device
+//!   fetched them (`posts_expired`), which it asks the identity's other
 //!   devices for with WANT. What needs HTTPS (fetching a transfer's blobs,
 //!   building and storing archives) is kept in the cache, for the account's
 //!   worker in [`crate::client::backups`] to do.
-//! - **Archives.** [`collect`] reads the messages to archive from the
+//! - **Archives.** `collect` reads the messages to archive from the
 //!   cache, for a backup, a transfer at pairing or an answer to a WANT.
-//! - **Applying.** [`apply`] stores the messages of an opened transfer or
+//! - **Applying.** `apply` stores the messages of an opened transfer or
 //!   backup under the rules of 12.13: only groups the device is in (or,
 //!   at pairing and after recovery, joins later), only ranges asked for
 //!   with WANT, never replacing a message it holds, shown as copied or
 //!   restored.
-//! - **Received messages.** [`note_message`] keeps what a message's
+//! - **Received messages.** `note_message` keeps what a message's
 //!   RisalaMessage held besides its content (counter, `previous`, the
 //!   sender's device), which archives carry.
 

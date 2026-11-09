@@ -1,7 +1,7 @@
 //! Recovery keys and backups (4.8, 12.13).
 //!
 //! - A **recovery key** is 32 random bytes, shown once when an identity
-//!   is made, as 52 characters of lower-case base32 [RFC4648] in groups of
+//!   is made, as 52 characters of lower-case base32 \[RFC4648\] in groups of
 //!   four (4.8). People type it back ignoring case, spaces and `-`.
 //! - An identity's backup **generation** is its key file chain's (4.4):
 //!   the number of `signing` records plus the number of `master` records
@@ -184,7 +184,7 @@ impl fmt::Debug for RecoveryKey {
     }
 }
 
-/// Lower-case base32 [RFC4648] without padding.
+/// Lower-case base32 \[RFC4648\] without padding.
 pub(crate) fn base32_lower(bytes: &[u8]) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(bytes.len().div_ceil(5) * 8));
     let mut bits: u32 = 0;
@@ -617,7 +617,7 @@ mod tests {
 
     /// Backup keys, checked against HKDF written out with HMAC: for one
     /// block, HKDF-Expand(prk, info, L) is the first L bytes of
-    /// HMAC(prk, info || 0x01) [RFC5869], and HKDF-Extract("", ikm) is
+    /// HMAC(prk, info || 0x01) \[RFC5869\], and HKDF-Extract("", ikm) is
     /// HMAC(48 zero bytes, ikm).
     #[test]
     fn key_derivation() {

@@ -1,7 +1,7 @@
 //! The primitives of cipher suite `0x0020` that risala uses outside MLS
 //! itself (12.9-12.13): SHA-384, HKDF-SHA384, HMAC-SHA-384 and
 //! ChaCha20-Poly1305, from the same libcrux crates as the provider, and the
-//! labelled functions of [RFC9420] built from them.
+//! labelled functions of \[RFC9420\] built from them.
 
 use tls_codec::{Serialize as _, TlsSerialize, TlsSize, VLBytes};
 use zeroize::Zeroizing;
@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 /// The length of a SHA-384 hash, and of HKDF-SHA384's PRK.
 pub const HASH_LEN: usize = 48;
 
-/// The key, nonce and tag lengths of ChaCha20-Poly1305 [RFC8439].
+/// The key, nonce and tag lengths of ChaCha20-Poly1305 \[RFC8439\].
 pub const AEAD_KEY_LEN: usize = libcrux_chacha20poly1305::KEY_LEN;
 pub const AEAD_NONCE_LEN: usize = libcrux_chacha20poly1305::NONCE_LEN;
 pub const AEAD_TAG_LEN: usize = libcrux_chacha20poly1305::TAG_LEN;
@@ -22,7 +22,7 @@ pub fn sha384(data: &[u8]) -> [u8; HASH_LEN] {
     <sha2::Sha384 as sha2::Digest>::digest(data).into()
 }
 
-/// HKDF-Extract with SHA-384 [RFC5869].
+/// HKDF-Extract with SHA-384 \[RFC5869\].
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; HASH_LEN]> {
     let mut prk = Zeroizing::new([0; HASH_LEN]);
     libcrux_hkdf::extract(libcrux_hkdf::Algorithm::Sha384, &mut prk[..], salt, ikm)
@@ -30,7 +30,7 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; HASH_LEN]> {
     prk
 }
 
-/// HKDF-Expand with SHA-384 [RFC5869], filling `okm`.
+/// HKDF-Expand with SHA-384 \[RFC5869\], filling `okm`.
 ///
 /// `prk` must be at least 48 bytes, and `okm` at most 255 times that. The
 /// callers in this crate pass fixed lengths that are.
@@ -39,13 +39,13 @@ pub fn hkdf_expand(prk: &[u8], info: &[u8], okm: &mut [u8]) {
         .expect("PRK and output lengths are fixed by the callers");
 }
 
-/// HMAC-SHA-384 [RFC2104].
+/// HMAC-SHA-384 \[RFC2104\].
 pub fn hmac_sha384(key: &[u8], data: &[u8]) -> [u8; HASH_LEN] {
     let tag = libcrux_hmac::hmac(libcrux_hmac::Algorithm::Sha384, key, data, None);
     tag.try_into().expect("HMAC-SHA-384 gives 48 bytes")
 }
 
-/// ChaCha20-Poly1305 encryption [RFC8439]: the ciphertext followed by the
+/// ChaCha20-Poly1305 encryption \[RFC8439\]: the ciphertext followed by the
 /// 16-byte tag.
 pub fn seal(
     key: &[u8; AEAD_KEY_LEN],
@@ -59,7 +59,7 @@ pub fn seal(
     out
 }
 
-/// ChaCha20-Poly1305 decryption [RFC8439] of a ciphertext that ends in its
+/// ChaCha20-Poly1305 decryption \[RFC8439\] of a ciphertext that ends in its
 /// tag, or `None` if it does not verify.
 pub fn open(
     key: &[u8; AEAD_KEY_LEN],
@@ -107,7 +107,7 @@ pub fn sign_content(label: &str, content: &[u8]) -> Vec<u8> {
 /// HKDF-Expand(secret, KDFLabel, out.len()), where KDFLabel holds the
 /// length, `"MLS 1.0 " + label` and `context`.
 ///
-/// `label` is bytes, since the test vectors of [RFC9420] have labels that
+/// `label` is bytes, since the test vectors of \[RFC9420\] have labels that
 /// are not UTF-8. `out` is at most 65535 bytes.
 pub fn expand_with_label(secret: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
     #[derive(TlsSerialize, TlsSize)]

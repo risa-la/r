@@ -504,7 +504,7 @@ pub struct GapRow {
     pub expired: bool,
 }
 
-/// A new message, for [`Tx::insert_message`].
+/// A new message, for `Tx::insert_message`.
 #[derive(Debug, Clone, Default)]
 pub struct NewMessage<'a> {
     /// The message id.

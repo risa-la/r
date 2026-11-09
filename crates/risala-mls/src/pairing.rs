@@ -17,7 +17,7 @@
 //! ciphertext is wrapped in a SealedNewDevice with a version byte. It is
 //! signed by the new device key (RisalaSign, label `pair`) and carries a
 //! new X-Wing **pairing key**. The [`IdentityBundle`] is sealed to that key
-//! with HPKE [RFC9180] in mode_psk, with 12.2's KEM, KDF and AEAD (X-Wing
+//! with HPKE \[RFC9180\] in mode_psk, with 12.2's KEM, KDF and AEAD (X-Wing
 //! `0x647a`, HKDF-SHA384 `0x0002`, ChaCha20-Poly1305 `0x0003`), info and
 //! psk_id `risala/1 pair`, an empty aad, and `old_key` as the psk. So
 //! opening it takes both the QR code's secret and the private pairing key,

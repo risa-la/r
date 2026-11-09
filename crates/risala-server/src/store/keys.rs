@@ -263,7 +263,7 @@ pub struct UploadRecord {
     pub deleted: bool,
 }
 
-/// What [`KeysStore::expire`] deleted, whose bytes are to be removed.
+/// What [`KeysStore::expire_keys`] deleted, whose bytes are to be removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Expired {
     /// Blobs.
@@ -272,7 +272,7 @@ pub struct Expired {
     pub uploads: Vec<String>,
 }
 
-/// What [`KeysStore::expire`] counts from.
+/// What [`KeysStore::expire_keys`] counts from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiryTimes {
     /// Now: KeyPackages whose lifetime ended and `put` URLs past their

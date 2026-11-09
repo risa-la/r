@@ -291,7 +291,7 @@ pub enum Origin {
     },
 }
 
-/// What [`Tx::message_meta`] keeps of a message.
+/// What `Tx::message_meta` keeps of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageMeta {
     /// The RisalaMessage's counter.

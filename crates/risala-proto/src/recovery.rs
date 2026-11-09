@@ -7,7 +7,7 @@
 //! seed = HKDF-Expand(HKDF-Extract("", recovery key), "risala/1 identity " || uid, 32)
 //! ```
 //!
-//! with SHA-384 [RFC5869]. Clients show the recovery key as 52
+//! with SHA-384 \[RFC5869\]. Clients show the recovery key as 52
 //! characters of lower-case base32 in groups of four.
 
 use std::fmt;

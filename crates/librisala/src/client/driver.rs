@@ -19,7 +19,7 @@
 //! - **Time**: every engine gets an [`Input::Tick`] each second.
 //! - **Events** engines emit go to [`Client::subscribe`].
 //!
-//! The API reaches a running account's engines through [`Exec`], to start
+//! The API reaches a running account's engines through `Exec`, to start
 //! jobs and to make the engines send at once what an API call queued.
 
 use std::collections::HashMap;

@@ -12,7 +12,7 @@
 //! - [`server`]: [`HttpServer`], the optional HTTPS listener (`[http]` in
 //!   the configuration), which serves the hosted identities' key files at
 //!   `/.well-known/risala/<name>`, made from the hub's records, and the
-//!   hub's key log and witness ([`keylog`]).
+//!   hub's key log and witness (`keylog`).
 //! - [`files`]: the listener's blobs and uploaded files (5.6, 12.12).
 
 pub mod fetch;

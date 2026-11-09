@@ -16,7 +16,7 @@
 //! waiting for KeyPackages, and random waits.
 //!
 //! - **Receiving.** Posts are kept, then applied in seq order once every
-//!   earlier one is ([`group::apply_post`]); the sync point moves only
+//!   earlier one is (`group::apply_post`); the sync point moves only
 //!   forward (7.4).
 //! - **Sending.** Everything to post goes through the outbox. A
 //!   conversation posts only once its mailbox is followed and caught up,
@@ -27,15 +27,15 @@
 //!   they are posted (12.9).
 //! - **Jobs.** Starting a conversation or inviting someone needs
 //!   KeyPackages first (KEYPKG GET, one fresh anonymous connection per
-//!   identity). [`ConversationEngine::start`] begins a [`Job`]; its end
+//!   identity). `ConversationEngine::start` begins a [`Job`]; its end
 //!   is reported as [`ConversationEvent::JobDone`].
 //!
 //! # Seams
 //!
-//! [`Hooks`] is what the engine needs from other areas: the device key and
+//! `Hooks` is what the engine needs from other areas: the device key and
 //! key facts (task C1), whether a leaf is confirmed and the lines of leaf
 //! confirmation (task C3), and the lines of transfers and reports (task
-//! C4). [`content::queue_lines`] is how those areas send lines.
+//! C4). `content::queue_lines` is how those areas send lines.
 
 pub(crate) mod content;
 pub(crate) mod group;
@@ -367,7 +367,7 @@ pub(crate) trait Hooks: Send + Sync {
     }
 }
 
-/// What [`Hooks::blob`] has of a blob.
+/// What `Hooks::blob` has of a blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobFetch {
     /// Its bytes.

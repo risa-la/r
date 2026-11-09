@@ -8,22 +8,22 @@
 //! Each group's state is risala-mls's [`Confirmer`], kept in the cache
 //! (store/confirm.rs) and driven from two places:
 //!
-//! - **The group engine's hooks** ([`super::conversations::Hooks`]), inside
+//! - **The group engine's hooks** (`super::conversations::Hooks`), inside
 //!   the transaction that applies a post: after each commit or join the
 //!   Confirmer gets the group's leaves and, for an authority commit, its
-//!   committer ([`Confirm::commit_applied`], [`Confirm::leaves_changed`]);
-//!   each message it applies ([`Confirm::message_received`]), which also
+//!   committer (`Confirm::commit_applied`, `Confirm::leaves_changed`);
+//!   each message it applies (`Confirm::message_received`), which also
 //!   says whether to show it as verified (12.9 step 6); and each message
 //!   about to be posted, which carries the pending lines
-//!   ([`Confirm::outgoing`]), piggy-backed as 12.10 asks.
+//!   (`Confirm::outgoing`), piggy-backed as 12.10 asks.
 //! - **[`ConfirmEngine`]**, on the driver's ticks: deadlines (impostors,
 //!   the 24 hours of the conversation with yourself), lines that rode in no
 //!   message and are now due on their own, REVEALs, the daily leaf
 //!   rotation of epochal groups, and removing impostors after a random
 //!   wait (12.7).
 //!
-//! The device's own keys come through [`OwnKeys`], and what it knows of
-//! other devices through [`Directory`]: the identity area (task C1)
+//! The device's own keys come through `OwnKeys`, and what it knows of
+//! other devices through `Directory`: the identity area (task C1)
 //! provides both.
 
 use std::sync::{Arc, OnceLock};
@@ -1059,7 +1059,7 @@ fn has_pending(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
     }))
 }
 
-/// The engine of this area, for one account: what [`Confirm`] does on the
+/// The engine of this area, for one account: what `Confirm` does on the
 /// clock. The rest happens in the group engine's hooks.
 #[derive(Debug, Default)]
 pub struct ConfirmEngine {

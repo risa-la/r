@@ -2,7 +2,7 @@
 //! and deleting the ones this device shared when their message is
 //! deleted. This module also holds what task C4's area shares: its errors
 //! and events, the HTTPS client for files and blobs ([`FileHttps`]), and
-//! [`Jobs`], the area's work for one account, which the account's worker
+//! `Jobs`, the area's work for one account, which the account's worker
 //! ([`super::backups`]) and the API run.
 //!
 //! Owned by task C4.

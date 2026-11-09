@@ -1,11 +1,11 @@
-//! The TLS presentation language as [RFC9420] uses it, for risala's own
+//! The TLS presentation language as \[RFC9420\] uses it, for risala's own
 //! binary structures: key file records (4.4), key log entries (4.5),
 //! pairing messages (4.8) and safety numbers (12.14).
 //!
 //! Variable-size vectors (`opaque x<V>`) carry their length as an
-//! [RFC9420] variable-length integer: two bits that give the length of
+//! \[RFC9420\] variable-length integer: two bits that give the length of
 //! the integer (1, 2 or 4 bytes; `0b11` is invalid), then the value.
-//! [`Reader`] insists on the shortest form, as [RFC9420] 2.1.2 requires,
+//! [`Reader`] insists on the shortest form, as \[RFC9420\] 2.1.2 requires,
 //! so that every structure has exactly one encoding and its hash is
 //! well defined.
 
