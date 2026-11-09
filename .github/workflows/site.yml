@@ -51,7 +51,7 @@ jobs:
         working-directory: site
     steps:
       # All history: the page lists the sources of the commit that was
-      # verified, and assemble.ts reads draft-02 of the spec from git.
+      # verified, which may be older than this one.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0

@@ -12,14 +12,7 @@
       "exclude": ["/.build/", "/DerivedData/"]
     }
   },
-  "spec": {
-    "published": { "draft": "draft-03", "dir": "spec" },
-    "code": {
-      "draft": "draft-02",
-      "git": "4634b6ff:SPEC.md",
-      "note": "The code cites draft-02's section numbers: it implements draft-02 while it moves to draft-03 (PLAN.md item 59)."
-    }
-  },
+  "spec": { "draft": "draft-03", "dir": "spec" },
   "tla": {
     "models": [
       {

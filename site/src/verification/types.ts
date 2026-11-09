@@ -106,6 +106,8 @@ export interface FileData {
   crate: string;
   test: boolean;
   testRanges: [number, number][];
+  // Each function's first and last line, nested ones merged.
+  blocks?: [number, number][];
   source: string;
   lines: Record<string, LineEntry>;
 }
@@ -122,7 +124,8 @@ export interface SpecSection {
 }
 
 export interface SpecData {
-  codeDraft: string;
-  codeNote: string;
-  drafts: { id: string; published: boolean; sections: SpecSection[] }[];
+  draft: string;
+  // TLA+ models of another draft: their sections are numbered differently.
+  otherModels: { id: string; title: string; draft: string }[];
+  sections: SpecSection[];
 }

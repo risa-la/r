@@ -62,6 +62,58 @@ function stripesOf(e: LineEntry | undefined): string[] {
   ];
 }
 
+// Lines inside a function that are not code themselves (a closing brace,
+// `} else {`, a comment, a blank line) take the look of the code around
+// them, so that a function reads as one block rather than broken stripes.
+// Per layer, a gap counts as reached when the code on both sides is (or
+// the one side, at a function's edge). Filled lines are only drawn: they
+// are not counted, not searched as unreached, and the details say so.
+function fillGaps(file: FileData, count: number): { shown: (LineEntry | undefined)[]; filled: boolean[] } {
+  const shown: (LineEntry | undefined)[] = [];
+  const filled: boolean[] = [];
+  for (let n = 1; n <= count; n++) {
+    shown.push(file.lines[n]);
+    filled.push(false);
+  }
+  for (const [a, b] of file.blocks ?? []) {
+    const anchors: number[] = [];
+    for (let n = a; n <= b; n++) if (file.lines[n]) anchors.push(n);
+    if (!anchors.length) continue;
+    let k = 0;
+    for (let n = a; n <= Math.min(b, count); n++) {
+      if (file.lines[n]) {
+        while (k < anchors.length && anchors[k] <= n) k++;
+        continue;
+      }
+      const before = k > 0 ? file.lines[anchors[k - 1]] : undefined;
+      const after = k < anchors.length ? file.lines[anchors[k]] : undefined;
+      shown[n - 1] = merge(before, after);
+      filled[n - 1] = true;
+    }
+  }
+  return { shown, filled };
+}
+
+/** What a gap between two lines shows: what both show, or the one side. */
+function merge(x: LineEntry | undefined, y: LineEntry | undefined): LineEntry {
+  if (!x || !y) return { ...(x ?? y) };
+  const num = (p: number | undefined, q: number | undefined) =>
+    p === undefined ? q : q === undefined ? p : Math.min(p, q);
+  const list = (p: number[] | undefined, q: number[] | undefined) =>
+    p === undefined ? q : q === undefined ? p : p.filter((v) => q.includes(v));
+  const out: LineEntry = {};
+  const u = num(x.u, y.u);
+  const i = num(x.i, y.i);
+  const f = list(x.f, y.f);
+  const k = list(x.k, y.k);
+  if (u !== undefined) out.u = u;
+  if (i !== undefined) out.i = i;
+  if (f !== undefined) out.f = f;
+  if (k?.length) out.k = k;
+  if (x.t?.length && y.t?.length) out.t = x.t;
+  return out;
+}
+
 // The tint ladder. TLA+ is not on it: the model checks the spec, not this
 // code.
 const LADDER: [LayerKey, keyof LineEntry][] = [
@@ -141,7 +193,8 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
     [file],
   );
   const tests = useMemo(() => lines.map((_, k) => isTest(k + 1)), [lines, isTest]);
-  const stripes = useMemo(() => lines.map((_, k) => stripesOf(file.lines[k + 1])), [lines, file]);
+  const { shown: display, filled } = useMemo(() => fillGaps(file, lines.length), [file, lines]);
+  const stripes = useMemo(() => display.map((e) => stripesOf(e)), [display]);
   const swift = file.lang === "swift";
   // The Swift client has unit tests only; its other columns would always be empty.
   const layers = swift ? LAYERS.filter((l) => l.key === "unit") : LAYERS;
@@ -153,8 +206,8 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
       saveToggles(next);
       return next;
     });
-  const tints = useMemo(() => lines.map((_, k) => tintOf(file.lines[k + 1], on, tests[k])), [lines, file, on, tests]);
-  const misses = useMemo(() => tints.flatMap((t, k) => (t === "x" ? [k + 1] : [])), [tints]);
+  const tints = useMemo(() => display.map((e, k) => tintOf(e, on, tests[k])), [display, on, tests]);
+  const misses = useMemo(() => tints.flatMap((t, k) => (t === "x" && !filled[k] ? [k + 1] : [])), [tints, filled]);
   const measured = useMemo(
     () => Object.values(file.lines).some((e) => e.u !== undefined || e.i !== undefined || e.f !== undefined),
     [file],
@@ -337,6 +390,7 @@ function Source({ file, summary }: { file: FileData; summary: Summary | undefine
           <Details
             n={shown}
             entry={file.lines[shown]}
+            filled={filled[shown - 1]}
             test={tests[shown - 1]}
             summary={summary}
             swift={swift}
@@ -363,6 +417,7 @@ function LayerToggle({ layer, on, onClick, value, has, tally }: { layer: Layer; 
 function Details({
   n,
   entry,
+  filled,
   test,
   summary,
   swift,
@@ -371,6 +426,7 @@ function Details({
 }: {
   n: number;
   entry: LineEntry | undefined;
+  filled: boolean;
   test: boolean;
   summary: Summary | undefined;
   swift: boolean;
@@ -397,6 +453,7 @@ function Details({
       <div className="dh">
         <strong>line {n}</strong>
         {test && <span className="label">test code, not counted</span>}
+        {filled && !test && <span className="label">not code: drawn like the code around it, not counted</span>}
         {pinned && (
           <button type="button" className="close" onClick={onClose} aria-label="Close">
             ×

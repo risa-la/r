@@ -10,15 +10,13 @@ import { Bar, Crumbs, Glyph, Loading, NoResults, Panel, Pct } from "./ui";
 
 export default function Overview() {
   const summary = useJson<Summary>(`${DATA}/summary.json`);
-  const spec = useJson<{ codeNote: string; codeDraft: string }>(`${DATA}/spec.json`);
   if (summary.state === "loading") return <Loading />;
   const s = summary.state === "ready" ? summary.data : undefined;
-  const codeNote = spec.state === "ready" ? spec.data.codeNote : undefined;
   return (
     <>
       <Head summary={s} />
       {s && <Totals summary={s} />}
-      <Limits codeNote={codeNote} />
+      <Limits />
       {s && <Tests summary={s} />}
       {s && <Crates summary={s} />}
       {s && <Proofs summary={s} />}
@@ -124,7 +122,7 @@ function Totals({ summary }: { summary: Summary }) {
   );
 }
 
-function Limits({ codeNote }: { codeNote: string | undefined }) {
+function Limits() {
   return (
     <Panel crumbs="what each method shows">
       <ul className="v-limits">
@@ -164,16 +162,19 @@ function Limits({ codeNote }: { codeNote: string | undefined }) {
           <div>
             <strong>tla+ checks a model of the spec, not the code</strong>
             <span>
-              the model follows draft-02 and is checked within small bounds (a few devices, a few messages). a line in
-              the tla+ column only cites a section the model covers.
+              the model was written against draft-02 and is checked within small bounds (a few devices, a few
+              messages). a line in the tla+ column only cites a section the model covers.
             </span>
           </div>
         </li>
         <li>
-          <Glyph symbol="§" tint="mode" />
+          <Glyph symbol="}" tint="mode" />
           <div>
-            <strong>the code cites draft-02</strong>
-            <span>{codeNote ?? "the code cites draft-02's section numbers, while the published spec is draft-03."}</span>
+            <strong>only code lines are counted</strong>
+            <span>
+              in the source listing, braces, comments and blank lines inside a function are drawn like the code around
+              them, so a function reads as one block. they are not counted in any percentage.
+            </span>
           </div>
         </li>
       </ul>

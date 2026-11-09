@@ -15,7 +15,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -32,7 +31,6 @@ import {
   xccovLines,
   normalisePath,
   docAbove,
-  type Section,
 } from "./lib.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -48,8 +46,6 @@ function arg(name: string, env: string, fallback: string): string {
 const ROOT = arg("--root", "VERIFY_ROOT", path.resolve(HERE, ".."));
 const RAW = arg("--raw", "VERIFY_RAW", path.join(ROOT, "target/verification/raw"));
 const OUT = arg("--out", "VERIFY_OUT", path.resolve(HERE, "../site/public/verification-data"));
-// The checkout this script is in, for git: the draft the code cites.
-const REPO = path.resolve(HERE, "..");
 
 const config = JSON.parse(fs.readFileSync(path.join(HERE, "config.json"), "utf8"));
 
@@ -427,17 +423,10 @@ for (const model of config.tla.models) {
 
 // Spec citations and the spec view -------------------------------------------
 
-/** Sections of the draft the code cites, from git. */
-function codeDraftText(): string | undefined {
-  try {
-    return execFileSync("git", ["-C", REPO, "show", config.spec.code.git], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  } catch {
-    return undefined;
-  }
-}
-
-function publishedDraftText(): string {
-  const dir = path.join(ROOT, config.spec.published.dir);
+// The spec is the latest draft, in spec/. The code's citations, such as
+// "(7.1)", are read as its section numbers.
+function specText(): string {
+  const dir = path.join(ROOT, config.spec.dir);
   const names = fs
     .readdirSync(dir)
     .filter((n) => n.endsWith(".md"))
@@ -445,20 +434,17 @@ function publishedDraftText(): string {
   return names.map((n) => fs.readFileSync(path.join(dir, n), "utf8").trimEnd() + "\n").join("\n");
 }
 
-const codeDraft = codeDraftText();
-const codeSections = codeDraft ? specSections(codeDraft) : [];
-const codeSectionIds = new Set(codeSections.map((s) => s.num));
+const specMd = specText();
+const sections = specSections(specMd);
+const sectionIds = new Set(sections.map((s) => s.num));
 
 // A proof's doc may name a section without parentheses ("the set of 2.3").
-// Bare numbers count there, if they are sections of the draft the code
-// cites.
+// Bare numbers count there, if they are sections of the spec.
 for (const h of harnesses) {
   const bare = [...h.doc.matchAll(/(?<![\d.])\d{1,2}\.\d{1,2}(?![\d.]\d)/g)].map((m) => m[0]);
   const all = expandSections([...h.sections, ...bare]);
-  h.sections = codeSectionIds.size ? all.filter((x) => codeSectionIds.has(x)) : h.sections;
+  h.sections = all.filter((x) => sectionIds.has(x));
 }
-const published = publishedDraftText();
-const publishedSections = specSections(published);
 
 // Every citation of a section in a comment, in non-test and test code.
 interface Citation {
@@ -472,7 +458,7 @@ for (const f of sources.values()) {
   if (f.lang !== "rust") continue;
   for (const c of citationsIn(f.lines)) {
     for (const section of expandSections(c.sections)) {
-      if (codeSectionIds.size && !codeSectionIds.has(section)) continue;
+      if (!sectionIds.has(section)) continue;
       citations.push({ section, path: f.path, line: c.line, test: isTestLine(f, c.line) });
     }
   }
@@ -505,6 +491,28 @@ if (tlaAny) {
 }
 
 // Per file -------------------------------------------------------------------
+
+// Each function's lines, from its first region to its last, with nested
+// functions (closures) merged into the one around them. The page fills the
+// lines in them that are not code (braces, `} else {`, comments, blank
+// lines) to look like the code around them, so that a function reads as
+// one block. They are never counted.
+const spansByFile = new Map<string, [number, number][]>();
+for (const fn of fnSpans) {
+  const list = spansByFile.get(fn.path) ?? [];
+  list.push([fn.start, fn.end]);
+  spansByFile.set(fn.path, list);
+}
+function blocksOf(rel: string): [number, number][] {
+  const spans = (spansByFile.get(rel) ?? []).sort((a, b) => a[0] - b[0]);
+  const out: [number, number][] = [];
+  for (const [a, b] of spans) {
+    const last = out[out.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
 
 type Layer = "unit" | "integration" | "fuzz" | "kani" | "tla";
 const LAYERS: Layer[] = ["unit", "integration", "fuzz", "kani", "tla"];
@@ -588,6 +596,7 @@ for (const f of sources.values()) {
     crate: f.crate,
     test: f.test,
     testRanges: f.testRanges,
+    blocks: blocksOf(f.path),
     source: f.text,
     lines,
   };
@@ -608,12 +617,14 @@ for (const f of sources.values()) {
 
 // The spec view --------------------------------------------------------------
 
-function sectionView(sections: Section[], draft: string, withExamples: boolean, text: string) {
-  const examples = withExamples ? specExamples(text) : new Map();
+// A TLA+ model is listed under a section only if it models this draft: a
+// model of an older draft numbers its sections differently.
+function sectionView() {
+  const examples = specExamples(specMd);
   return sections.map((s) => {
-    const cites = draft === config.spec.code.draft ? citations.filter((c) => c.section === s.num) : [];
-    const models = config.tla.models.filter((m: any) => m.draft === draft && m.sections.includes(s.num)).map((m: any) => m.id);
-    const proofs = draft === config.spec.code.draft ? harnesses.flatMap((h, i) => (h.sections.includes(s.num) ? [i] : [])) : [];
+    const cites = citations.filter((c) => c.section === s.num);
+    const models = config.tla.models.filter((m: any) => m.draft === config.spec.draft && m.sections.includes(s.num)).map((m: any) => m.id);
+    const proofs = harnesses.flatMap((h, i) => (h.sections.includes(s.num) ? [i] : []));
     return {
       num: s.num,
       title: s.title,
@@ -628,24 +639,10 @@ function sectionView(sections: Section[], draft: string, withExamples: boolean, 
 }
 
 const spec = {
-  codeDraft: config.spec.code.draft,
-  codeNote: config.spec.code.note,
-  drafts: [
-    {
-      id: config.spec.published.draft,
-      published: true,
-      sections: sectionView(publishedSections, config.spec.published.draft, true, published),
-    },
-    ...(codeDraft && config.spec.code.draft !== config.spec.published.draft
-      ? [
-          {
-            id: config.spec.code.draft,
-            published: false,
-            sections: sectionView(codeSections, config.spec.code.draft, false, codeDraft),
-          },
-        ]
-      : []),
-  ],
+  draft: config.spec.draft,
+  // Models of another draft, which the view names but cannot place.
+  otherModels: config.tla.models.filter((m: any) => m.draft !== config.spec.draft).map((m: any) => ({ id: m.id, title: m.title, draft: m.draft })),
+  sections: sectionView(),
 };
 fs.writeFileSync(path.join(OUT, "spec.json"), JSON.stringify(spec));
 
