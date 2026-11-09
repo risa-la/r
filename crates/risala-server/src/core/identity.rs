@@ -968,7 +968,9 @@ fn keys_put_error(e: KeysPutError) -> ErrResponse {
 ///
 /// It is limited per network address (`limits.keys_puts_per_hour`), and a
 /// slot is used up by every KEYS PUT whose records decode, since the
-/// server then checks their signatures. For an identity it does not host,
+/// server then checks their signatures, and by every one that names a blob
+/// the server reads, whatever follows, since reading it costs the server
+/// too (PLAN item 63). For an identity it does not host,
 /// the server fetches the key file before it takes the lock that every
 /// chain change holds, so that a slow key server holds up nobody else; it
 /// then checks again under the lock against the chain held by then.
@@ -982,7 +984,9 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
     };
     let limits = &inner.config.limits;
     let now = inner.now();
-    let slot = inner
+    // Limits per network address are the free tier: past them a client
+    // will go on by proof of work, from M6a (PLAN items 42 and 63).
+    let mut slot = inner
         .identity
         .keys_puts
         .take(network(cx.peer.ip()), limits.keys_puts_per_hour, now)
@@ -991,7 +995,14 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
     // held, to the end of the command (12.12).
     let (bytes, _held) = match records {
         KeysPutRecords::Inline(records) => (records.decode(), None),
-        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash).await?.into_parts(),
+        KeysPutRecords::Blob(hash) => {
+            let read = blob_bytes(inner, hash).await?.into_parts();
+            // Read: the slot is used, whether or not the records decode.
+            if let Some(slot) = slot.take() {
+                slot.keep();
+            }
+            read
+        }
     };
     let records = decode(&bytes)?;
     if let Some(slot) = slot {

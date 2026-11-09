@@ -1112,6 +1112,29 @@ async fn keys_put_is_rate_limited() {
     assert_eq!(far.lines(), ["OK", "OK"]);
 }
 
+/// A KEYS PUT whose records are a blob uses up its slot once the server
+/// has read the blob, even if the blob holds no records (4.7, PLAN item
+/// 63); one whose blob the server does not hold does not.
+#[tokio::test]
+async fn keys_put_uses_a_slot_for_any_blob_read() {
+    let mut config = id_config();
+    config.limits.keys_puts_per_hour = 2;
+    let mut ids = Ids::with(config);
+    let mut anon = ids.h.anon().await;
+    let missing = risala_proto::names::BlobRef::of(b"not held");
+    for _ in 0..3 {
+        ids.h.send(&anon, &format!("KEYS PUT - {missing}")).await;
+        assert!(anon.lines()[0].starts_with("ERR not-found"));
+    }
+    let junk = hold_blob(&ids.h, b"no records here", None);
+    for _ in 0..2 {
+        ids.h.send(&anon, &format!("KEYS PUT - {junk}")).await;
+        assert!(anon.lines()[0].starts_with("ERR invalid"));
+    }
+    ids.h.send(&anon, &format!("KEYS PUT - {junk}")).await;
+    assert!(anon.lines()[0].ends_with("ERR rate-limited"));
+}
+
 /// The server logs so many new outside identities a day per registered
 /// domain, and none if it logs only those it hosts (4.5, 4.7).
 #[tokio::test]
