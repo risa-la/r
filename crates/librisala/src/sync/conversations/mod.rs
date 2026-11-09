@@ -2205,7 +2205,14 @@ impl ConversationEngine {
                         // then posts again. If the post was for an older
                         // epoch, catching up shows it.
                         let (token, epoch) = group::send_token(tx, c, &conv_row)?;
-                        let token_repair = match (row.epoch, tx.prev_token(conv)?) {
+                        // 7.2: TOKEN gets `ERR forbidden` in a public room,
+                        // whose commits the server checks; catch up instead.
+                        let prev = if conv_row.kind == ConvKind::Public {
+                            None
+                        } else {
+                            tx.prev_token(conv)?
+                        };
+                        let token_repair = match (row.epoch, prev) {
                             (Some(e), Some(prev)) if e == epoch && epoch > 0 => {
                                 Some((epoch - 1, prev, token.hash()))
                             }
