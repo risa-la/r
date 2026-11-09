@@ -203,6 +203,11 @@ across the FFI boundary.
   builds the Apple app too (`nix build .#apple-macos`, `.#apple-ios`),
   through SweetPad and the host's Xcode. Those builds are not hermetic:
   Xcode itself stays outside the Nix store (see `clients/apple`).
+- **Packages:** the flake exports the packages, an overlay and a NixOS
+  module for `risalad`. For Debian, Ubuntu and Fedora we host our own
+  apt and dnf repositories (see Decisions), built in CI with a pinned
+  toolchain inside each release's container, by `cargo-deb` and
+  `cargo-generate-rpm`, and published as signed static files.
 - **CI:** `nix flake check` (fmt, clippy, rustdoc, tests), Kani,
   risala-pow's JIT against its interpreter on x86-64, ARM and macOS
   runners, and a smoke test that starts `risalad` and talks to it through
@@ -1797,6 +1802,9 @@ Open:
   and the newest GNOME platform and libadwaita. Apps may use their
   newest APIs freely, and raise the minimum when a new release comes
   out.
+  The GNOME app is the exception once it ships in our apt and dnf
+  repositories: it then targets the libadwaita of the oldest release we
+  ship it on (see Linux packages).
 - **Hosted key files** (M3): `risalad` has an optional HTTPS listener
   that serves `/.well-known/risala/<name>`, and later the upload URLs.
   It builds each file from its own records, so it can only ever serve
@@ -1844,3 +1852,39 @@ Open:
     23–32% slower on x86-64. A hash is held back by mispredicted loop
     exits, which stall both nonces at once, and hyperthreading already
     gives 1.44× per core. Solvers use every hardware thread instead.
+- **Linux packages**, decided with the user on 2026-11-09:
+  - **Nix:** the flake is the way in for Nix users, with packages, an
+    overlay and a NixOS module.
+  - **Our own apt and dnf repositories**, signed static files that we
+    host, not a Launchpad PPA or COPR. Launchpad builds with Ubuntu's
+    own rustc, which is older than our minimum.
+  - **Releases:** the two current Fedora releases, the two newest Debian
+    stable releases, and Ubuntu's two newest LTS releases plus its newest
+    non-LTS release. Debian 12 and Ubuntu 24.04 are left out for now:
+    their systemd is older than 256, which the clients need (item 45).
+    That leaves Debian 13 and Ubuntu 26.04 and 26.10 today; Debian 14
+    and Ubuntu 28.04 fill the gaps when they ship.
+  - **Architectures:** x86_64 and aarch64 from the first release.
+  - **What ships:** `risalad` and `risala-cli` first; the GNOME app goes
+    into the same repositories once it exists.
+  - **OpenSSL:** the packages link the distribution's libcrypto
+    (`OPENSSL_NO_VENDOR`, as Nix does), so OpenSSL fixes reach users
+    from the distribution without a rebuild of ours.
+  - **Signing:** the repositories' primary key stays offline. Packages
+    and metadata are signed with a subkey, kept encrypted in this
+    repository with sops. A keyring package (`risala-archive-keyring`,
+    `risala-release`) installs the public key, so the key can be rotated.
+    Whatever decrypts the subkey can sign packages, so only the release
+    job gets that key. To revisit later.
+  - **The server package** brings a systemd unit, a system user, a
+    config file in `/etc` that upgrades leave alone, and a restart on
+    upgrade.
+  - **Tested in CI on every release and architecture we target:** install
+    from the published repository into a clean system, upgrade from the
+    previous published version, and run the smoke test after each.
+  - **The GNOME app** targets the libadwaita of the oldest release we
+    ship it on, not the newest (see Minimum OS versions).
+  - **Later:** a version scheme under which pre-releases sort correctly
+    for apt and dnf, and a Nix binary cache.
+  - **No AppImage.** It would still need systemd 256 and a TPM, so it
+    reaches few more machines, and it has no signed update path.
