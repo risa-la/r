@@ -182,6 +182,15 @@ impl Exec {
     }
 
     async fn reply(&self, id: EngineId, slot: Slot, token: Token, response: &Response) {
+        match &response.end {
+            End::Err(e) => {
+                tracing::debug!(engine = ?id, ?slot, code = %e.code, msg = %e.message, "a command was refused")
+            }
+            End::Unparseable(why) => {
+                tracing::debug!(engine = ?id, ?slot, why, "a command got no reply")
+            }
+            End::Ok(_) => {}
+        }
         let mut engines = self.engines.lock().await;
         let actions = engine(&mut engines, id).handle(
             &self.cx,
@@ -240,6 +249,7 @@ impl Exec {
     }
 
     fn send(&self, id: EngineId, target: Target, command: Command, token: Token) {
+        tracing::trace!(engine = ?id, verb = command.verb(), "sending a command");
         if let Target::Own(kind) = target {
             let (addr, trust, options, replies) = (
                 self.addr.clone(),
@@ -375,7 +385,7 @@ impl Client {
                 ConnectionPlan::guest(Arc::new(GuestSignIn::resuming(name, session)))
             }
         };
-        self.connect_with(account, plan, guest, Config::default())
+        self.connect_with(account, plan, guest, self.options().conversations.clone())
             .await
     }
 
@@ -434,6 +444,9 @@ impl Client {
         ];
         // Task C4: files, transfers and backups.
         tasks.extend(self.spawn_transfer_worker(account, exec.clone()));
+        // Task C5: the identity area's upkeep, and groups' devices by key
+        // files (4.5, 12.14).
+        tasks.push(self.spawn_maintenance(account));
         let this = RunningAccount {
             connections,
             exec,

@@ -31,6 +31,9 @@ const MAX_HEAD: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct TlsFileHttps {
     verifier: CaVerifier,
+    /// Where some hosts are reached instead of through DNS, for tests and
+    /// development servers.
+    hosts: Arc<std::collections::HashMap<String, std::net::SocketAddr>>,
 }
 
 impl std::fmt::Debug for TlsFileHttps {
@@ -43,7 +46,21 @@ impl TlsFileHttps {
     /// A client that checks certificates with `verifier`, such as the
     /// platform's CA check.
     pub fn new(verifier: CaVerifier) -> TlsFileHttps {
-        TlsFileHttps { verifier }
+        TlsFileHttps {
+            verifier,
+            hosts: Arc::default(),
+        }
+    }
+
+    /// The same client, reaching each named host at the address given
+    /// instead of through DNS: for tests and development servers. The
+    /// certificate is still checked against the host's name.
+    pub fn connect_to(
+        mut self,
+        hosts: impl IntoIterator<Item = (String, std::net::SocketAddr)>,
+    ) -> TlsFileHttps {
+        self.hosts = Arc::new(hosts.into_iter().collect());
+        self
     }
 
     fn config(&self) -> Result<rustls::ClientConfig, HttpError> {
@@ -74,9 +91,11 @@ impl TlsFileHttps {
         let name = ServerName::try_from(target.host.clone())
             .map_err(|e| HttpError::Failed(e.to_string()))?;
         let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
-            let tcp = TcpStream::connect((target.host.as_str(), target.port))
-                .await
-                .map_err(|e| HttpError::Failed(e.to_string()))?;
+            let tcp = match self.hosts.get(&target.host) {
+                Some(addr) => TcpStream::connect(addr).await,
+                None => TcpStream::connect((target.host.as_str(), target.port)).await,
+            }
+            .map_err(|e| HttpError::Failed(e.to_string()))?;
             connector
                 .connect(name, tcp)
                 .await

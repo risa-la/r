@@ -224,6 +224,14 @@ pub(crate) trait Hooks: Send + Sync {
         None
     }
 
+    /// Whether this device starts the conversation with yourself, having
+    /// found none (5.1): not while the identity has another current
+    /// device, which adds this one to its own (12.7). Task C5.
+    fn start_self_conversation(&self, tx: &Tx<'_>, uid: &Uid) -> bool {
+        let _ = (tx, uid);
+        true
+    }
+
     /// Facts from key files and the key log, for the checks of 12.7. Task
     /// C1.
     fn key_facts<'a>(&'a self, tx: &'a Tx<'_>, account: AccountId) -> Box<dyn KeyFacts + 'a> {
@@ -2440,7 +2448,8 @@ impl ConversationEngine {
             Ok(tx
                 .conversations_of(c.account)?
                 .iter()
-                .any(|r| r.kind == ConvKind::WithYourself && r.state.in_group()))
+                .any(|r| r.kind == ConvKind::WithYourself && r.state.in_group())
+                || !c.hooks.start_self_conversation(tx, c.uid))
         })?;
         self.self_requested = true;
         if !has {

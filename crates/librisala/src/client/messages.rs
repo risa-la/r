@@ -200,7 +200,7 @@ impl Client {
 
     /// Queues lines to send in a conversation, and lets the engine send
     /// them.
-    async fn send_lines(
+    pub(crate) async fn send_lines(
         &self,
         conversation: ConversationId,
         lines: Vec<ContentLine>,
@@ -210,6 +210,9 @@ impl Client {
         if !row.state.in_group() {
             return Err(Error::Conversation(ConversationError::NotInGroup));
         }
+        // Task C5: nothing goes to an identity that sending is stopped for
+        // (12.14).
+        self.check_sending(&row)?;
         let own = self.account(row.account)?.uid;
         let now = self.options().clock.now().unix_millis();
         let (id, _) = self

@@ -455,6 +455,12 @@ impl Hooks for ClientHooks {
     ) -> Vec<crate::sync::Action> {
         use risala_proto::content::ContentLine as L;
         match line {
+            // The identity area's lines of the conversation with yourself
+            // (C1, 12.9), wired by task C5.
+            line if super::members::is_identity_line(line) => {
+                let now = self.clock.now().unix_millis();
+                super::members::self_line(tx, self.keys.as_ref(), conv, leaf, line, now)
+            }
             L::Want { .. } | L::Transfer(_) | L::Report(_) => {
                 let now = self.clock.now().unix_millis();
                 crate::sync::transfer::content_line(tx, conv, leaf, line, now).unwrap_or_else(|e| {
@@ -500,6 +506,33 @@ impl Hooks for ClientHooks {
         blob: &risala_proto::names::BlobRef,
     ) -> BlobFetch {
         self.blobs.get(prefix, blob)
+    }
+
+    /// Whether a fetched KeyPackage's device is current, from the identity
+    /// area's tables (C1, wired by task C5).
+    fn device_key_of(
+        &self,
+        tx: &crate::store::Tx<'_>,
+        _: AccountId,
+        uid: &Uid,
+        device: &risala_mls::identity::DeviceId,
+    ) -> Option<Option<Vec<u8>>> {
+        super::members::device_key_of(tx, uid, device)
+    }
+
+    /// Not while another device of the identity is current (task C5).
+    fn start_self_conversation(&self, tx: &crate::store::Tx<'_>, uid: &Uid) -> bool {
+        super::members::start_self_conversation(tx, uid)
+    }
+
+    /// The key facts of 12.7, from the identity area's tables (C1, wired
+    /// by task C5).
+    fn key_facts<'a>(
+        &'a self,
+        tx: &'a crate::store::Tx<'_>,
+        _: AccountId,
+    ) -> Box<dyn risala_mls::checks::KeyFacts + 'a> {
+        Box::new(super::members::TxFacts::new(tx))
     }
 
     fn device_key(&self, _: AccountId, uid: &Uid) -> Option<risala_mls::mldsa::SigningKey> {
@@ -650,14 +683,22 @@ impl Client {
             .conversation_rows(account)?
             .into_iter()
             .filter(|r| r.state != ConvState::Failed)
-            .map(|r| summary(self.store(), r))
+            .map(|r| self.summary(r))
             .collect()
     }
 
     /// One conversation.
     pub fn conversation(&self, id: ConversationId) -> Result<ConversationSummary> {
         let row = self.conv_row(id)?;
-        summary(self.store(), row)
+        self.summary(row)
+    }
+
+    fn summary(&self, row: ConvRow) -> Result<ConversationSummary> {
+        // Task C5: sending stopped by the identity area (12.14).
+        let stopped = self.row_sending_stopped(&row)?.is_some();
+        let mut s = summary(self.store(), row)?;
+        s.sending_stopped = stopped;
+        Ok(s)
     }
 
     pub(crate) fn conv_row(&self, id: ConversationId) -> Result<ConvRow> {
@@ -668,7 +709,7 @@ impl Client {
 
     /// Starts a job on a connected account's group engine, and waits for
     /// it to end.
-    async fn run_job(&self, account: AccountId, job: Job) -> Result<ConversationId> {
+    pub(crate) async fn run_job(&self, account: AccountId, job: Job) -> Result<ConversationId> {
         let exec = self.exec(account)?;
         let mut events = self.subscribe();
         let id = exec.with_conversations(|e, cx| e.start(cx, job)).await;
@@ -710,6 +751,9 @@ impl Client {
         if let Some(row) = existing {
             return Ok(row.id);
         }
+        // Task C5: the peer's key file read and its devices addable (12.7).
+        self.prepare_members(account, std::slice::from_ref(&peer))
+            .await?;
         self.run_job(account, Job::Direct { peer }).await
     }
 
@@ -904,7 +948,7 @@ impl Client {
     }
 
     /// The conversation extension of a group (12.4).
-    fn extension(&self, row: &ConvRow) -> Result<RisalaConversation> {
+    pub(crate) fn extension(&self, row: &ConvRow) -> Result<RisalaConversation> {
         let crypto =
             Arc::new(risala_mls::RisalaCrypto::new().map_err(|e| Error::Internal(e.to_string()))?);
         self.store()
@@ -955,6 +999,9 @@ impl Client {
         if role < GroupRole::Mod || (invitee >= GroupRole::Mod && role < GroupRole::Owner) {
             return Err(Error::Conversation(ConversationError::NotAllowed));
         }
+        // Task C5: the invitee's key file read and its devices addable.
+        self.prepare_members(row.account, std::slice::from_ref(&uid))
+            .await?;
         self.run_job(
             row.account,
             Job::Invite {

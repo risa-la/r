@@ -50,6 +50,7 @@ mod error;
 mod event;
 pub mod files;
 pub mod identity;
+mod members;
 pub mod messages;
 pub mod push;
 pub mod reports;
@@ -104,6 +105,14 @@ pub struct ClientOptions {
     /// act on the key checks of 12.7 (task R2). Never in a build for use.
     #[cfg(test)]
     pub(crate) skip_key_checks: bool,
+    /// The group engine's waits (7.2, 7.4, 12.8). The defaults are the
+    /// spec's random waits of up to 10 minutes; tests and development
+    /// tools shorten them.
+    pub conversations: crate::sync::conversations::Config,
+    /// How often a connected account runs the identity area's
+    /// maintenance and checks its groups' devices against key files
+    /// (4.5, 12.14): every 5 minutes by default (task C5).
+    pub maintenance_every: std::time::Duration,
 }
 
 impl Default for ClientOptions {
@@ -122,6 +131,8 @@ impl Default for ClientOptions {
             download_dir: None,
             #[cfg(test)]
             skip_key_checks: false,
+            conversations: crate::sync::conversations::Config::default(),
+            maintenance_every: std::time::Duration::from_secs(5 * 60),
         }
     }
 }
