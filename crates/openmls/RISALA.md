@@ -53,16 +53,29 @@ leaves already in a tree.
 
 risala-mls checks the lifetimes itself (`checks::check_commit`); its tests
 show that a commit whose added KeyPackage has expired by the clock, but not
-at the post's time, is accepted.
+at the post's time, is accepted. `tests::server_checks_public_commits`
+loads a public room's tree holding a leaf whose KeyPackage has expired by
+the clock through `PublicGroup::from_external`, so it fails if that patch
+is dropped.
 
 ## Removals in external commits (the spec, 12.7)
 
 `ExternalCommitBuilder::with_removals` adds Remove proposals for other
 leaves. A resync commit removes the leaf whose commit the room's devices
 could not apply, which RFC 9420 does not foresee: it lets an external
-commit remove only the joiner's own earlier leaf. Processing needs no
-change, since OpenMLS leaves the check of external commits' removals to
-the application, which risala-mls makes.
+commit remove only the joiner's own earlier leaf (12.4.3.2). Processing
+needs no change for that one Remove, since OpenMLS leaves the check of
+whose leaf an external commit removes to the application, which
+risala-mls makes (`checks::check_external`).
+
+OpenMLS still refuses an external commit with more than one Remove
+(valn0402, in `PublicGroup::stage_commit`), as RFC 9420 allows, and this
+patch does not change that. So a resync commit removes only the
+GroupInfo's signer, a rejoin at most one earlier leaf of its own
+identity, and the device removes any other earlier leaf in its next
+commit. `with_removals` builds a commit with two, which every member
+rejects; `risala_mls::group::external_commit` refuses to, and its tests
+(`tests::public_room_resync`) check that.
 
 ## Join proposals with authenticated data (the spec, 12.9, 6.1)
 

@@ -126,10 +126,12 @@ impl ExternalCommitBuilder {
 
     /// risala: has the external commit remove these leaves too, by value.
     /// RFC 9420 lets an external commit remove only the joiner's own earlier
-    /// leaf; risala's resync commit also removes the leaf whose commit the
-    /// room's devices could not apply (the spec, 12.7), and the members
+    /// leaf; risala's resync commit removes the leaf whose commit the room's
+    /// devices could not apply instead (the spec, 12.7), and the members
     /// check that it removes nothing else. OpenMLS leaves that check to the
-    /// application when it processes an external commit.
+    /// application when it processes an external commit, but refuses one
+    /// with more than one Remove (valn0402), so pass at most one leaf: a
+    /// commit with two is built, and every member rejects it.
     pub fn with_removals(mut self, removals: Vec<LeafNodeIndex>) -> Self {
         self.removals = removals;
         self

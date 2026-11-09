@@ -108,9 +108,10 @@ openmls_sqlite_storage = { path = "crates/openmls-sqlite-storage" }
 # value draft-ietf-mls-pq-ciphersuites-07 requests, not OpenMLS's placeholder
 # 0x0052 (SPEC 12.2, 15). See crates/openmls-traits/RISALA.md.
 openmls_traits = { path = "crates/openmls-traits" }
-# openmls 0.9.2 with one change: a SelfRemove proposal is framed with the
-# group's wire format, so it is a PrivateMessage outside public rooms (SPEC
-# 12.6). See crates/openmls/RISALA.md.
+# openmls 0.9.2 with seven changes, for SelfRemove framing, KeyPackage
+# lifetimes, removals in external commits, join proposals' authenticated
+# data, the GroupInfo's signer, parent nodes' keys and padding (SPEC 12.2,
+# 12.5, 12.6, 12.7). See crates/openmls/RISALA.md.
 openmls = { path = "crates/openmls" }
 
 [workspace.lints.rust]
