@@ -361,6 +361,7 @@ impl Client {
         if pending && let Err(e) = self.refresh_identity(a.uid.as_str()).await {
             tracing::info!(error = %e, "reading the own key file failed; will retry");
         }
+        self.read_for_checks(account).await?;
         self.send_self_lines(account).await?;
         for row in self.store().conversation_rows(account)? {
             if !row.state.in_group() {
@@ -662,7 +663,36 @@ impl Client {
             return Ok(());
         }
         let own = self.account(account)?.uid;
-        self.read_new_members(&own, &row).await.map(drop)
+        self.read_new_members(&own, &row).await?;
+        self.read_for_checks(account).await
+    }
+
+    /// Reads again the key files of identities with a key check the
+    /// engine could not make yet (12.7): a device added under a record this
+    /// device has not read. The engine checks again every minute from the
+    /// cache, and holds sending in the group meanwhile. At most every 30
+    /// seconds for each identity.
+    async fn read_for_checks(&self, account: AccountId) -> Result<()> {
+        let (rows, _) = self.store().write(|tx| tx.key_checks(account))?;
+        let mut uids: Vec<Uid> = rows
+            .into_iter()
+            .filter(|r| !r.failed && !r.uid.is_guest())
+            .map(|r| r.uid)
+            .collect();
+        uids.sort();
+        uids.dedup();
+        let now = self.now_ms();
+        for uid in uids {
+            let recent = self
+                .store()
+                .contact(uid.as_str())?
+                .and_then(|c| c.fetched)
+                .is_some_and(|t| now.saturating_sub(t) < 30_000);
+            if !recent && let Err(e) = self.refresh_identity(uid.as_str()).await {
+                tracing::info!(error = %e, "reading a key file for a key check failed; will retry");
+            }
+        }
+        Ok(())
     }
 }
 
