@@ -127,6 +127,48 @@ fn config() -> Config {
 /// A device of `who`, signed in with its device key, which its key store
 /// holds under the `key_id` of an `identities` row.
 async fn device(server: &World, who: &TestIdentity) -> Device {
+    device_knowing(server, who, &[]).await
+}
+
+/// Takes the devices of `known` as current in a client's cache, as if
+/// their records were witnessed and accepted (4.5), and not due for a
+/// fetch: the test key server logs nothing, and a device adds only devices
+/// whose records it has accepted (12.5, 12.7; wired by task C5).
+fn accept(client: &Client, known: &[&TestIdentity]) {
+    use crate::store::identity::{ContactRow, DeviceRow, DeviceState, KeysState};
+    let now = crate::clock::Clock::now(&crate::clock::SystemClock).unix_millis();
+    client
+        .store()
+        .write(|tx| {
+            for who in known {
+                let uid = who.uid().to_string();
+                let mut c = tx.contact(&uid)?.unwrap_or_else(|| ContactRow::new(&uid));
+                c.keys = KeysState::Keys;
+                c.fetched = Some(now);
+                c.refreshed = Some(now);
+                c.next_check = Some(now + 365 * 24 * 3600 * 1000);
+                c.pending = 0;
+                tx.put_contact(&c)?;
+                let key = who.public_key();
+                tx.put_devices(
+                    &uid,
+                    &[DeviceRow {
+                        device_id: *risala_proto::record::DeviceId::of(&key).as_bytes(),
+                        device_key: key.as_bytes().to_vec(),
+                        attestation_key: Vec::new(),
+                        label: "test".into(),
+                        added: 0,
+                        state: DeviceState::Current,
+                    }],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// [`device`], knowing the devices of `known` as accepted ([`accept`]).
+async fn device_knowing(server: &World, who: &TestIdentity, known: &[&TestIdentity]) -> Device {
     let uid = who.uid().to_string();
     let keys = Arc::new(MemoryKeyStore::default());
     keys.save(&uid, who.key()).unwrap();
@@ -145,6 +187,7 @@ async fn device(server: &World, who: &TestIdentity) -> Device {
             Ok(())
         })
         .unwrap();
+    accept(&client, known);
     let identity: Identity = uid.parse().unwrap();
     let plan = ConnectionPlan::identity(
         Arc::new(IdentitySignIn::new(identity, who.key().clone())),
@@ -256,9 +299,10 @@ async fn a_direct_conversation_and_a_private_room_with_two_devices_against_risal
     let alice_id = server.identity("alice@example.org");
     let phone_id = server.key_server().new_device(&alice_id);
     let bob_id = server.identity("bob@example.net");
-    let laptop = device(&server, &alice_id).await;
-    let phone = device(&server, &phone_id).await;
-    let bob = device(&server, &bob_id).await;
+    let all = [&alice_id, &phone_id, &bob_id];
+    let laptop = device_knowing(&server, &alice_id, &all).await;
+    let phone = device_knowing(&server, &phone_id, &all).await;
+    let bob = device_knowing(&server, &bob_id, &all).await;
     for d in [&laptop, &phone, &bob] {
         uploaded(d).await;
     }
