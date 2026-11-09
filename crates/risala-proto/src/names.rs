@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn box_grammar() {
-        // The spec's example box (1.4, 3.6).
+        // The spec's example box (1.3, 3.6).
         let b: BoxName = "ujzdegxdncf32epf3dhodzdoci".parse().unwrap();
         assert_eq!(b.to_string(), "ujzdegxdncf32epf3dhodzdoci");
         assert_eq!(ok::<BoxName>("UJZDEGXDNCF32EPF3DHODZDOCI"), b.to_string());

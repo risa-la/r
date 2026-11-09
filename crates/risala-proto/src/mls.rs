@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn send_tokens_are_secret() {
-        // The send token of the spec's example (1.4).
+        // The send token of the spec's example (1.3).
         let s = "3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE=";
         let token: SendToken = s.parse().unwrap();
         assert_eq!(token.to_string(), s);
