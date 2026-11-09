@@ -965,25 +965,20 @@ async fn fetch(
     let limits = &cx.inner.config.limits;
     let cap = limits.max_page.max(MIN_FETCH_LIMIT_CAP);
     let limit = limit.unwrap_or(DEFAULT_FETCH_LIMIT).min(cap);
-    let (posts, mut more) = cx
-        .db(move |store| store.posts(&mailbox, after, limit))
-        .await?;
     // A page stops once its lines pass a budget of bytes, with `more=1`,
-    // so that a page of long posts never overflows the connection's queue
-    // (7.1 lets the server return fewer posts than asked for).
+    // so that a page of long posts never overflows the connection's queue,
+    // and the store reads no post past it, so that a FETCH holds no more
+    // than about the budget while it waits for room (7.1 lets the server
+    // return fewer posts than asked for).
     let budget = fetch_budget(limits);
-    let mut queued = 0;
+    let (posts, more) = cx
+        .db(move |store| store.posts(&mailbox, after, limit, budget))
+        .await?;
     for (i, post) in posts.into_iter().enumerate() {
-        let size = post_line_bytes(&post);
         if i > 0 {
-            if queued + size > budget {
-                more = true;
-                break;
-            }
             // Room for one long line, as KEYPKG GET and WELCOME LIST wait.
             cx.wait_for_room().await;
         }
-        queued += size;
         cx.send(post_line(mailbox, post)?);
     }
     Ok(OkResponse::new().with("more", u8::from(more)))
@@ -991,18 +986,8 @@ async fn fetch(
 
 /// The most bytes of POST lines one FETCH queues (7.1): half of what a
 /// connection's queue holds, and at most 8 MiB.
-fn fetch_budget(limits: &crate::config::Limits) -> usize {
-    (limits.out_queue_bytes / 2).min(8 * 1024 * 1024)
-}
-
-/// About how many bytes the POST line of `post` takes: its message in
-/// base64, and room for the rest of the line.
-fn post_line_bytes(post: &StoredPost) -> usize {
-    const REST: usize = 256;
-    match &post.message {
-        PostBody::Inline(bytes) => bytes.len().div_ceil(3) * 4 + REST,
-        PostBody::Blob(_) => REST,
-    }
+fn fetch_budget(limits: &crate::config::Limits) -> u64 {
+    (u64::try_from(limits.out_queue_bytes).unwrap_or(u64::MAX) / 2).min(8 * 1024 * 1024)
 }
 
 /// A kept post as a POST line (5.2).

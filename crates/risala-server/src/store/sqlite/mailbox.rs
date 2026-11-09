@@ -14,7 +14,7 @@ use risala_proto::types::Role;
 use super::{SqliteStore, from_sql_u64, sql_u64};
 use crate::secret::ct_eq;
 use crate::store::mailbox::{
-    AddedBy, CID_LIFETIME, MAX_SET_NEXT_HASHES, MAX_SET_TOKEN_HASHES, MAX_SETS,
+    AddedBy, CID_LIFETIME, MAX_SET_NEXT_HASHES, MAX_SET_TOKEN_HASHES, MAX_SETS, post_line_bytes,
 };
 use crate::store::{
     Created, Expired, KeptPost, MailboxRecord, MailboxStore, NewMailbox, NewPost, NewRoom,
@@ -626,28 +626,58 @@ impl MailboxStore for SqliteStore {
         })
     }
 
-    fn posts(&self, mailbox: &BoxName, after: u64, limit: u64) -> Result<(Vec<StoredPost>, bool)> {
+    fn posts(
+        &self,
+        mailbox: &BoxName,
+        after: u64,
+        limit: u64,
+        budget: u64,
+    ) -> Result<(Vec<StoredPost>, bool)> {
         self.read(|tx| {
-            let mut select = tx.prepare_cached(
-                "SELECT seq, t, message, blob, next FROM posts
+            let box_ = &mailbox.as_bytes()[..];
+            // First the page's end, from the lengths of the messages alone,
+            // so that no post past the budget is read: `length` of a BLOB
+            // does not read it (7.1).
+            let mut lengths = tx.prepare_cached(
+                "SELECT seq, length(message) FROM posts
                  WHERE box = ? AND seq > ? ORDER BY seq LIMIT ?",
             )?;
-            let rows = select.query_map(
-                params![
-                    &mailbox.as_bytes()[..],
-                    sql_u64(after),
-                    sql_u64(limit.saturating_add(1))
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                        row.get::<_, Option<Vec<u8>>>(4)?,
-                    ))
-                },
+            let mut rows = lengths.query(params![
+                box_,
+                sql_u64(after),
+                sql_u64(limit.saturating_add(1))
+            ])?;
+            let (mut last, mut taken, mut bytes, mut more) = (None, 0u64, 0u64, false);
+            while let Some(row) = rows.next()? {
+                let inline = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
+                let size = post_line_bytes(u64::try_from(inline).unwrap_or(0));
+                // The first post always comes, however long, so that a
+                // page moves on.
+                if taken == limit || (taken > 0 && bytes.saturating_add(size) > budget) {
+                    more = true;
+                    break;
+                }
+                last = Some(row.get::<_, i64>(0)?);
+                taken += 1;
+                bytes = bytes.saturating_add(size);
+            }
+            drop(rows);
+            let Some(last) = last else {
+                return Ok((Vec::new(), false));
+            };
+            let mut select = tx.prepare_cached(
+                "SELECT seq, t, message, blob, next FROM posts
+                 WHERE box = ? AND seq > ? AND seq <= ? ORDER BY seq",
             )?;
+            let rows = select.query_map(params![box_, sql_u64(after), last], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })?;
             let mut posts = Vec::new();
             for row in rows {
                 let (seq, t, message, blob, next) = row?;
@@ -667,8 +697,6 @@ impl MailboxStore for SqliteStore {
                         .transpose()?,
                 });
             }
-            let more = posts.len() as u64 > limit;
-            posts.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
             Ok((posts, more))
         })
     }
@@ -991,7 +1019,7 @@ mod tests {
     }
 
     fn seqs(store: &SqliteStore, mailbox: &BoxName) -> Vec<u64> {
-        let (posts, more) = store.posts(mailbox, 0, 1000).unwrap();
+        let (posts, more) = store.posts(mailbox, 0, 1000, u64::MAX).unwrap();
         assert!(!more);
         posts.iter().map(|p| p.seq).collect()
     }
@@ -1151,6 +1179,45 @@ mod tests {
         assert_eq!(room.room.unwrap().as_str(), "#room1");
     }
 
+    /// A page of posts stops at its budget of bytes, with more, and the
+    /// first post comes however long it is; blob posts count as short
+    /// lines (7.1).
+    #[test]
+    fn posts_stop_at_the_budget() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let m = new_mailbox(1);
+        store.create_mailbox(&m).unwrap();
+        for i in 1..=10 {
+            assert_eq!(
+                store.add_post(&post(m.mailbox, i, 3000)).unwrap(),
+                Posted::Seq(i)
+            );
+        }
+        let line = post_line_bytes(3000);
+        let seqs = |after, limit, budget| {
+            let (posts, more) = store.posts(&m.mailbox, after, limit, budget).unwrap();
+            (posts.iter().map(|p| p.seq).collect::<Vec<_>>(), more)
+        };
+        // Three lines' worth, and a byte short of four: three posts.
+        assert_eq!(seqs(0, 50, 4 * line - 1), (vec![1, 2, 3], true));
+        assert_eq!(seqs(0, 50, 4 * line), (vec![1, 2, 3, 4], true));
+        // The limit still cuts first.
+        assert_eq!(seqs(0, 2, 4 * line), (vec![1, 2], true));
+        // A budget too small for one post: the first comes, alone.
+        assert_eq!(seqs(4, 50, 1), (vec![5], true));
+        // The end of the mailbox within the budget: no more.
+        assert_eq!(seqs(7, 50, 4 * line), (vec![8, 9, 10], false));
+        assert_eq!(seqs(10, 50, 1), (vec![], false));
+        // Blob posts take a short line each.
+        let mut blob = post(m.mailbox, 11, 0);
+        blob.message = PostBody::Blob(BlobRef::from_hash([4; 48]));
+        assert_eq!(store.add_post(&blob).unwrap(), Posted::Seq(11));
+        assert_eq!(
+            seqs(9, 50, line + post_line_bytes(0)),
+            (vec![10, 11], false)
+        );
+    }
+
     /// Posts get the next seq; a commit's next goes into the next epoch's
     /// set and stays with the post; the token is marked used; a cid finds
     /// its post (5.2, 7.2, 7.6).
@@ -1187,16 +1254,22 @@ mod tests {
         assert_eq!(record.head, 2);
         assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 30);
 
-        let (posts, more) = store.posts(&m.mailbox, 0, 1).unwrap();
+        let (posts, more) = store.posts(&m.mailbox, 0, 1, u64::MAX).unwrap();
         assert!(more);
         assert_eq!(posts[0].seq, 1);
         assert_eq!(posts[0].t, t(1));
         assert_eq!(posts[0].next, Some(hash(5)));
         assert_eq!(posts[0].message, PostBody::Inline(vec![7; 10]));
-        let (posts, more) = store.posts(&m.mailbox, 1, 50).unwrap();
+        let (posts, more) = store.posts(&m.mailbox, 1, 50, u64::MAX).unwrap();
         assert!(!more);
         assert_eq!((posts.len(), posts[0].next), (1, None));
-        assert!(store.posts(&m.mailbox, 2, 50).unwrap().0.is_empty());
+        assert!(
+            store
+                .posts(&m.mailbox, 2, 50, u64::MAX)
+                .unwrap()
+                .0
+                .is_empty()
+        );
 
         assert_eq!(
             store.cid_post(&m.mailbox, &"c".repeat(16), t(0)).unwrap(),
@@ -1216,7 +1289,7 @@ mod tests {
         blob.message = PostBody::Blob(BlobRef::from_hash([4; 48]));
         assert_eq!(store.add_post(&blob).unwrap(), Posted::Seq(3));
         assert_eq!(
-            store.posts(&m.mailbox, 2, 1).unwrap().0[0].message,
+            store.posts(&m.mailbox, 2, 1, u64::MAX).unwrap().0[0].message,
             blob.message
         );
         assert_eq!(store.mailbox_bytes(&m.mailbox).unwrap(), 30);

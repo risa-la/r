@@ -136,6 +136,14 @@ impl PostBody {
     }
 }
 
+/// About how many bytes a post takes in a POST line (5.2), from the length
+/// of its message if it is kept inline, and 0 if it is a blob: the message
+/// in base64, and room for the rest of the line.
+pub fn post_line_bytes(inline: u64) -> u64 {
+    const REST: u64 = 256;
+    inline.div_ceil(3).saturating_mul(4).saturating_add(REST)
+}
+
 /// A post, as kept (4.2, 5.2): its seq, time and message, and a commit's
 /// `next`. Nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,8 +333,19 @@ pub trait MailboxStore {
     fn add_post(&self, post: &NewPost) -> Result<Posted>;
 
     /// The earliest `limit` posts of `mailbox` whose seq is greater than
-    /// `after`, in ascending order, and whether there are more (7.1).
-    fn posts(&self, mailbox: &BoxName, after: u64, limit: u64) -> Result<(Vec<StoredPost>, bool)>;
+    /// `after`, in ascending order, and whether there are more (7.1): no
+    /// more of them than fit in `budget` bytes of POST lines, as
+    /// [`post_line_bytes`] counts them, but always the first. A post past
+    /// the budget is not read at all, so that one FETCH holds about its
+    /// budget, whatever its limit (7.1 lets the server return fewer posts
+    /// than asked for).
+    fn posts(
+        &self,
+        mailbox: &BoxName,
+        after: u64,
+        limit: u64,
+        budget: u64,
+    ) -> Result<(Vec<StoredPost>, bool)>;
 
     /// The bytes of the posts `mailbox` keeps (7.5).
     fn mailbox_bytes(&self, mailbox: &BoxName) -> Result<u64>;
