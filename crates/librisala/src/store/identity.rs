@@ -157,6 +157,9 @@ CREATE TABLE pairings (
     new_device   BLOB NOT NULL,
     record       BLOB,
     sealed       BLOB,
+    -- The new device's opened IdentityBundle, until the user confirms the
+    -- identity (4.8 step 5); its pairing key is gone by then.
+    bundle       BLOB,
     created      INTEGER NOT NULL
 );
 ";
@@ -329,8 +332,8 @@ impl ContactRow {
     }
 }
 
-/// A pairing in progress (4.8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A pairing in progress (4.8). Its `Debug` leaves out the secrets.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairingRow {
     /// Its id.
     pub id: i64,
@@ -356,6 +359,20 @@ pub struct PairingRow {
     pub sealed: Option<Vec<u8>>,
     /// When it started, in ms.
     pub created: u64,
+}
+
+impl std::fmt::Debug for PairingRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingRow")
+            .field("id", &self.id)
+            .field("new", &self.new)
+            .field("uid", &self.uid)
+            .field("host", &self.host)
+            .field("key_id", &self.key_id)
+            .field("label", &self.label)
+            .field("created", &self.created)
+            .finish_non_exhaustive()
+    }
 }
 
 fn hash_of(bytes: Vec<u8>) -> Result<BlobRef, StoreError> {
@@ -814,18 +831,103 @@ impl Tx<'_> {
     }
 
     /// Takes the lines queued for the conversation with yourself of
-    /// `uid`, oldest first.
+    /// `uid`, oldest first. SIGNINGKEY and BACKUPKEY stay queued until
+    /// [`Tx::self_keys_may_go`] says they may go (12.9; LR-C3).
     pub(crate) fn take_self_lines(&mut self, uid: &str) -> Result<Vec<String>, StoreError> {
-        let lines = {
+        let keys = self.self_keys_may_go(uid)?;
+        let rows = {
             let mut stmt = self
                 .conn()
-                .prepare_cached("SELECT line FROM self_lines WHERE uid = ?1 ORDER BY id")?;
-            stmt.query_map([uid], |row| row.get(0))?
-                .collect::<Result<Vec<String>, _>>()?
+                .prepare_cached("SELECT id, line FROM self_lines WHERE uid = ?1 ORDER BY id")?;
+            stmt.query_map([uid], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
         };
-        self.conn()
-            .execute("DELETE FROM self_lines WHERE uid = ?1", [uid])?;
+        let mut lines = Vec::new();
+        for (id, line) in rows {
+            let key = line.starts_with("SIGNINGKEY ") || line.starts_with("BACKUPKEY ");
+            if key && !keys {
+                continue;
+            }
+            self.conn()
+                .execute("DELETE FROM self_lines WHERE id = ?1", [id])?;
+            lines.push(line);
+        }
         Ok(lines)
+    }
+
+    /// Whether SIGNINGKEY and BACKUPKEY may go in the conversation with
+    /// yourself of `uid` now (12.9, 4.8; LR-C3). Every leaf there reads
+    /// them, so only while:
+    ///
+    /// - no record of the own chain is pending: a removal this device is
+    ///   carrying out has been accepted first (4.5, 4.8);
+    /// - the identity has a conversation with yourself, and every leaf in
+    ///   it other than this device's is a device of the identity that is
+    ///   current, by the chain the device has accepted, and that leaf
+    ///   confirmation (12.10) has confirmed with the leaf's current key.
+    ///
+    /// The cache's leaves are the group's as of the newest commit applied,
+    /// so a removed device's leaf is gone from them only once the commit
+    /// that removed it has won (7.2).
+    pub(crate) fn self_keys_may_go(&self, uid: &str) -> Result<bool, StoreError> {
+        let pending: bool = self.conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM records WHERE uid = ?1 AND accepted = 0)",
+            [uid],
+            |r| r.get(0),
+        )?;
+        if pending {
+            return Ok(false);
+        }
+        let own: Option<Vec<u8>> = self
+            .conn()
+            .query_row(
+                "SELECT device_id FROM identities WHERE uid = ?1",
+                [uid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(own) = own else {
+            return Ok(false);
+        };
+        let convs: Vec<i64> = {
+            let mut stmt = self.conn().prepare(
+                "SELECT c.id FROM conversations c JOIN accounts a ON a.id = c.account
+                 WHERE a.uid = ?1 AND c.kind = 'self'
+                   AND c.state IN ('creating', 'active', 'leaving')",
+            )?;
+            stmt.query_map([uid], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if convs.is_empty() {
+            return Ok(false);
+        }
+        for conv in convs {
+            // Leaves that are not this device's and are not a current,
+            // confirmed device of the identity.
+            let bad: bool = self.conn().query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM leaves l
+                    WHERE l.conv = ?1
+                      AND NOT (l.uid = ?2 AND l.device_id = ?3)
+                      AND (l.uid <> ?2
+                           OR l.device_id IS NULL
+                           OR NOT EXISTS (
+                               SELECT 1 FROM devices d
+                               WHERE d.uid = ?2 AND d.device_id = l.device_id
+                                 AND d.state = 'current')
+                           OR NOT EXISTS (
+                               SELECT 1 FROM leaf_confirmations f
+                               WHERE f.conv = l.conv AND f.leaf = l.leaf
+                                 AND f.signature_key = l.signature_key
+                                 AND f.state = 'confirmed')))",
+                params![conv, uid, own],
+                |r| r.get(0),
+            )?;
+            if bad {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Adds a pairing in progress, and returns its id.
@@ -866,6 +968,43 @@ impl Tx<'_> {
     }
 
     /// Deletes a pairing, which wipes its secrets from the cache.
+    /// Keeps the new device's opened IdentityBundle until the user
+    /// confirms the identity, and deletes the pairing key that opened it
+    /// (4.8 step 5). The user has the pairing's 10 minutes from now.
+    pub(crate) fn set_pairing_bundle(
+        &mut self,
+        id: i64,
+        bundle: &[u8],
+        now: u64,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE pairings SET bundle = ?2, pairing_seed = NULL, created = ?3 WHERE id = ?1",
+            params![id, bundle, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the pairing key of a pairing: its bundle was opened, or
+    /// failed to open.
+    pub(crate) fn forget_pairing_key(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE pairings SET pairing_seed = NULL WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// The opened IdentityBundle of a pairing, if it has one.
+    pub(crate) fn pairing_bundle(&self, id: i64) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row("SELECT bundle FROM pairings WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
     pub(crate) fn delete_pairing(&mut self, id: i64) -> Result<(), StoreError> {
         self.conn()
             .execute("DELETE FROM pairings WHERE id = ?1", [id])?;

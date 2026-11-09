@@ -637,7 +637,21 @@ async fn pairing_a_device() {
     assert!(alice.scan_pairing(&uid, &bad).await.is_err());
 
     alice.confirm_pairing(&uid, false).await.unwrap();
-    let joined = phone.finish_pairing().await.unwrap();
+    // The phone shows the identity and its devices to confirm, and holds
+    // nothing of it before (4.8 step 5; LR-H4).
+    let shown = phone.finish_pairing().await.unwrap();
+    assert_eq!(shown.uid.as_str(), uid);
+    assert_eq!(shown.devices.len(), 2);
+    assert!(
+        shown
+            .devices
+            .iter()
+            .any(|d| d.this_device && d.label == "phone" && d.id == request.device)
+    );
+    assert!(shown.devices.iter().any(|d| !d.this_device && d.label == "laptop"));
+    assert!(phone.store().own_identity(&uid).unwrap().is_none());
+    assert!(phone.accounts().unwrap().is_empty());
+    let joined = phone.accept_pairing().await.unwrap();
     assert_eq!(joined.uid.as_str(), uid);
     assert_eq!(joined.device, request.device);
 
@@ -679,6 +693,43 @@ async fn pairing_a_device() {
 }
 
 /// Alice on a laptop with a paired phone.
+/// Puts a conversation with yourself of `uid` in `client`'s cache, with a
+/// leaf for each device, those of other devices confirmed (12.10), as the
+/// group engine and leaf confirmation keep them. Returns its id.
+fn self_conversation(client: &Client, uid: &str, leaves: &[(u32, [u8; 48])]) -> i64 {
+    client
+        .store()
+        .write(|tx| {
+            let account: i64 = tx.conn().query_row(
+                "SELECT id FROM accounts WHERE uid = ?1",
+                [uid],
+                |r| r.get(0),
+            )?;
+            tx.conn().execute(
+                "INSERT INTO conversations (account, group_id, kind, pseudonym, created)
+                 VALUES (?1, ?2, 'self', ?3, 0)",
+                rusqlite::params![account, &[7u8; 32][..], &[0u8; 16][..]],
+            )?;
+            let conv = tx.conn().last_insert_rowid();
+            for (leaf, device) in leaves {
+                let key = vec![*leaf as u8; 32];
+                tx.conn().execute(
+                    "INSERT INTO leaves (conv, leaf, uid, device_id, signature_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![conv, leaf, uid, &device[..], key],
+                )?;
+                tx.conn().execute(
+                    "INSERT INTO leaf_confirmations (conv, leaf, signature_key, state)
+                     VALUES (?1, ?2, ?3, 'confirmed')",
+                    rusqlite::params![conv, leaf, key],
+                )?;
+            }
+            Ok(conv)
+        })
+        .unwrap()
+        .0
+}
+
 async fn alice_with_phone(s: &Setup) -> (Client, Client, String, String, DeviceId) {
     let (alice, uid, recovery) = s.identity("alice").await;
     alice.refresh_identity(&uid).await.unwrap();
@@ -687,6 +738,7 @@ async fn alice_with_phone(s: &Setup) -> (Client, Client, String, String, DeviceI
     let request = alice.scan_pairing(&uid, &offer.qr).await.unwrap();
     alice.confirm_pairing(&uid, false).await.unwrap();
     phone.finish_pairing().await.unwrap();
+    phone.accept_pairing().await.unwrap();
     alice.refresh_identity(&uid).await.unwrap();
     (alice, phone, uid, recovery, request.device)
 }
@@ -732,7 +784,16 @@ async fn removing_a_device() {
         let phone = devices.iter().find(|d| d.id == phone_id).unwrap();
         assert!(phone.removed, "{devices:?}");
     }
-    // The new keys go to the other devices (4.8, step 3).
+    // The new keys go to the other devices (4.8, step 3), once the
+    // conversation with yourself holds none but current, confirmed ones
+    // (12.9): here, once the phone's leaf is gone from it.
+    let laptop_id = alice
+        .store()
+        .own_identity(&uid)
+        .unwrap()
+        .unwrap()
+        .device_id;
+    self_conversation(&alice, &uid, &[(0, laptop_id)]);
     let lines = alice.take_self_lines(&uid).unwrap();
     assert!(
         lines
@@ -1031,12 +1092,55 @@ async fn keys_from_the_conversation_with_yourself() {
     alice.scan_pairing(&uid, &offer.qr).await.unwrap();
     alice.confirm_pairing(&uid, false).await.unwrap();
     tablet.finish_pairing().await.unwrap();
+    tablet.accept_pairing().await.unwrap();
     alice.take_self_lines(&uid).unwrap();
     drop(phone);
+    // The laptop's conversation with yourself, with the phone's and the
+    // tablet's leaves, both confirmed (12.10).
+    let tablet_id = tablet
+        .store()
+        .own_identity(&uid)
+        .unwrap()
+        .unwrap()
+        .device_id;
+    let laptop_id = alice
+        .store()
+        .own_identity(&uid)
+        .unwrap()
+        .unwrap()
+        .device_id;
+    let conv = self_conversation(
+        &alice,
+        &uid,
+        &[(0, laptop_id), (1, phone_id.0), (2, tablet_id)],
+    );
 
     alice
         .remove_device(&uid, phone_id, &recovery)
         .await
+        .unwrap();
+    // LR-C3, 12.9: the new device-signing key and backup key never reach
+    // the removed phone: not while the record is pending, nor once it is
+    // accepted while the phone's leaf is still in the conversation with
+    // yourself, only once the commit that removed it has won.
+    let lines = alice.take_self_lines(&uid).unwrap();
+    assert!(!lines.iter().any(|l| matches!(
+        l,
+        ContentLine::SigningKey(_) | ContentLine::BackupKey { .. }
+    )));
+    alice.refresh_identity(&uid).await.unwrap();
+    let lines = alice.take_self_lines(&uid).unwrap();
+    assert!(!lines.iter().any(|l| matches!(
+        l,
+        ContentLine::SigningKey(_) | ContentLine::BackupKey { .. }
+    )));
+    alice
+        .store()
+        .write(|tx| {
+            tx.conn()
+                .execute("DELETE FROM leaves WHERE conv = ?1 AND leaf = 1", [conv])?;
+            Ok(())
+        })
         .unwrap();
     let lines = alice.take_self_lines(&uid).unwrap();
     // Before the signing record is accepted, the tablet ignores the keys.
@@ -1099,6 +1203,7 @@ async fn keys_from_the_conversation_with_yourself() {
     tablet.scan_pairing(&uid, &offer.qr).await.unwrap();
     tablet.confirm_pairing(&uid, false).await.unwrap();
     watch.finish_pairing().await.unwrap();
+    watch.accept_pairing().await.unwrap();
 }
 
 #[tokio::test]
@@ -1193,6 +1298,37 @@ async fn pairing_needs_a_named_server() {
         phone.start_pairing("127.0.0.1", "phone").await,
         Err(Error::Invalid { .. })
     ));
+}
+
+/// LR-H4, 4.8 step 5: someone who saw the QR code answers first with a
+/// bundle of an identity of their own. The new device shows that identity
+/// and its devices before it takes anything; the user refuses, and the
+/// device holds nothing of it.
+#[tokio::test]
+async fn a_bundle_for_another_identity_is_shown_and_can_be_refused() {
+    let s = Setup::new().await;
+    let (_alice, alice_uid, _) = s.identity("alice").await;
+    let (mallory, mallory_uid, _) = s.identity("mallory").await;
+    mallory.refresh_identity(&mallory_uid).await.unwrap();
+    let phone = s.client();
+    let offer = phone.start_pairing(HOST, "phone").await.unwrap();
+    // Mallory photographed the code, and answers first.
+    mallory.scan_pairing(&mallory_uid, &offer.qr).await.unwrap();
+    mallory.confirm_pairing(&mallory_uid, false).await.unwrap();
+    let shown = phone.finish_pairing().await.unwrap();
+    assert_eq!(shown.uid.as_str(), mallory_uid);
+    assert_ne!(shown.uid.as_str(), alice_uid);
+    assert!(shown.devices.iter().any(|d| d.label == "laptop"));
+    // Nothing is taken, and nothing signs in, before the user confirms.
+    assert!(phone.store().own_identity(&mallory_uid).unwrap().is_none());
+    assert!(phone.accounts().unwrap().is_empty());
+    phone.decline_pairing().unwrap();
+    assert!(phone.store().latest_pairing(true, None).unwrap().is_none());
+    assert!(matches!(
+        phone.accept_pairing().await,
+        Err(Error::Identity(IdentityError::Pairing(_)))
+    ));
+    assert!(phone.store().own_identity(&mallory_uid).unwrap().is_none());
 }
 
 #[tokio::test]

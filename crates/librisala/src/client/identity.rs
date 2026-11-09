@@ -121,6 +121,12 @@ pub enum IdentityEvent {
     },
     /// A device to pair asks to be confirmed (4.8, step 2).
     PairingRequest(PairingRequest),
+    /// This device, being paired, waits until its record is accepted
+    /// (4.5, 4.8 step 5) before it shows the identity to confirm.
+    PairingWaiting {
+        /// The identity the bundle names.
+        uid: Uid,
+    },
     /// An identity has a new master key, or a new log: sending stops
     /// outside public rooms until the user acknowledges it (12.14).
     NewMasterKey {
@@ -254,6 +260,30 @@ pub struct SafetyNumber {
 pub struct PairingOffer {
     /// The QR text, `RISALA-PAIR:` and base32.
     pub qr: String,
+}
+
+/// The identity a new device is about to take, for the user to confirm
+/// (4.8, step 5): whoever saw the QR code could have answered with a
+/// bundle of an identity of their own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingIdentity {
+    /// The identity.
+    pub uid: Uid,
+    /// Its current devices, by its accepted records, this one among them.
+    pub devices: Vec<PairingDevice>,
+}
+
+/// A device of the identity a new device is about to take (4.8, step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingDevice {
+    /// Its id.
+    pub id: DeviceId,
+    /// Its short id (12.14).
+    pub short: String,
+    /// Its label.
+    pub label: String,
+    /// Whether it is this device.
+    pub this_device: bool,
 }
 
 /// A new device asking to be paired, after scanning its QR code (4.8,
@@ -531,9 +561,12 @@ impl Client {
 
     /// Takes the lines this area has queued for the conversation with
     /// yourself of `uid` (12.9): RECORD, ALERT, RECORDS, SIGNINGKEY,
-    /// BACKUPKEY and PIN. The conversations area sends them; it sends
-    /// SIGNINGKEY and BACKUPKEY only while every leaf there is confirmed
-    /// (12.9), and keeps them until then.
+    /// BACKUPKEY and PIN. The conversations area sends them. SIGNINGKEY
+    /// and BACKUPKEY are returned only while no record of the chain is
+    /// pending and every other leaf of the conversation with yourself is a
+    /// current, confirmed device of the identity, so never to a device
+    /// whose removal has not yet won (12.9, 4.8); until then they stay
+    /// queued.
     pub fn take_self_lines(&self, uid: &str) -> Result<Vec<ContentLine>> {
         let identity = parse_identity(uid)?;
         let (lines, changes) = self

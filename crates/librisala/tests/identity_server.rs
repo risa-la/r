@@ -249,7 +249,10 @@ async fn identities_against_risalad() {
     let request = laptop.scan_pairing(&uid, &offer.qr).await.unwrap();
     assert_eq!(request.label, "phone");
     laptop.confirm_pairing(&uid, false).await.unwrap();
-    let joined = phone.finish_pairing().await.unwrap();
+    // The phone shows the identity to confirm before it takes it (4.8).
+    let shown = phone.finish_pairing().await.unwrap();
+    assert_eq!(shown.uid.to_string(), uid);
+    let joined = phone.accept_pairing().await.unwrap();
     assert_eq!(joined.uid.to_string(), uid);
     until(&phone, &uid, |c| {
         c.devices.len() == 2 && c.devices.iter().all(|d| d.accepted)

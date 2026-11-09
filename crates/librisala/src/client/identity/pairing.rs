@@ -25,7 +25,8 @@ use zeroize::Zeroizing;
 
 use super::own::record_time;
 use super::{
-    IdentityError, OwnIdentity, PairingOffer, PairingRequest, parse_identity, rnd, to_uid,
+    IdentityError, IdentityEvent, OwnIdentity, PairingDevice, PairingIdentity, PairingOffer,
+    PairingRequest, parse_identity, rnd, to_uid,
 };
 use crate::addr::ServerAddr;
 use crate::client::servers::server_addr;
@@ -158,11 +159,18 @@ impl Client {
 
     /// Waits, for as long as the pairing lasts, for the other device to
     /// finish the pairing started with [`start_pairing`](Self::start_pairing)
-    /// (4.8, step 5): opens the IdentityBundle, fetches the identity's key
-    /// file and checks the bundle against it, and returns the identity
-    /// this device now holds. Its record may still be pending (4.5); the
-    /// device signs in once the server's key file has it.
-    pub async fn finish_pairing(&self) -> Result<OwnIdentity> {
+    /// (4.8, step 5): opens the IdentityBundle, deletes the pairing key,
+    /// fetches the identity's key file and checks the bundle against the
+    /// records this device has accepted (4.5), waiting while this device's
+    /// record is pending ([`IdentityEvent::PairingWaiting`]).
+    ///
+    /// It does not take the identity yet: whoever saw the QR code can also
+    /// build a valid bundle, for an identity of their own. It returns the
+    /// uid and the labels of the identity's current devices, for the user
+    /// to confirm that this is their identity with
+    /// [`accept_pairing`](Self::accept_pairing), or to refuse with
+    /// [`decline_pairing`](Self::decline_pairing). Nothing signs in before.
+    pub async fn finish_pairing(&self) -> Result<PairingIdentity> {
         let row = self
             .store()
             .latest_pairing(true, None)?
@@ -195,23 +203,26 @@ impl Client {
             }
             tokio::time::sleep(POLL).await;
         };
-        self.finish_with(&row, &relay, &data).await
+        self.open_with(&row, &relay, &data).await
     }
 
-    async fn finish_with(
+    /// Opens the bundle, and checks it against the accepted records.
+    async fn open_with(
         &self,
         row: &PairingRow,
         relay: &Relay,
         data: &[u8],
-    ) -> Result<OwnIdentity> {
+    ) -> Result<PairingIdentity> {
         let seed: [u8; 32] = row
             .pairing_seed
             .as_deref()
             .and_then(|s| s.try_into().ok())
             .ok_or_else(|| pairing_error("bad pairing key"))?;
-        let bundle = relay
-            .open_bundle(data, &PairingKey::from_seed(Zeroizing::new(seed)))
-            .map_err(pairing_error)?;
+        let opened = relay.open_bundle(data, &PairingKey::from_seed(Zeroizing::new(seed)));
+        // The pairing key goes as soon as it has been used, whatever the
+        // checks find (4.8).
+        self.store().write(|tx| tx.forget_pairing_key(row.id))?;
+        let bundle = opened.map_err(pairing_error)?;
         let new_device = NewDevice::decode(&row.new_device).map_err(pairing_error)?;
         let uid = bundle.uid.clone();
         if self.store().own_identity(uid.as_str())?.is_some() {
@@ -221,46 +232,87 @@ impl Client {
             ));
         }
 
-        // Check the bundle against the identity's key file (4.8, step 5).
-        // The other device logged the record just before it sent the
-        // bundle, so the device waits, while the pairing lasts, until the
-        // log has witnessed it and the key file can be read up to it.
+        // Check the bundle against the identity's key file (4.8, step 5),
+        // as far as this device has accepted its records (4.5). The other
+        // device logged the record just before it sent the bundle, so the
+        // device waits, while the pairing lasts, until the log has
+        // witnessed it and the key file can be read up to it.
         let ours = &new_device.content().keys;
-        let holds = |chain: &risala_proto::chain::Chain| {
-            chain.records().iter().any(|r| {
-                r.hash().hash() == &bundle.record_hash
-                    && matches!(&r.content().body, RecordBody::Device(k) if k == ours)
-            })
-        };
         let mut chain = None;
+        let mut told = false;
         for _ in 0..PAIRING_TTL_MS / POLL.as_millis() as u64 {
             self.refresh_uid(&uid).await?;
             let rows = self.store().records(uid.as_str())?;
-            let read = crate::sync::identity::kept_chain(&uid, &rows, false);
-            if read.as_ref().is_some_and(holds) {
+            let read = crate::sync::identity::kept_chain(&uid, &rows, true);
+            if read.as_ref().is_some_and(|c| holds(c, &bundle, ours)) {
                 chain = read;
                 break;
             }
+            if !told
+                && crate::sync::identity::kept_chain(&uid, &rows, false)
+                    .as_ref()
+                    .is_some_and(|c| holds(c, &bundle, ours))
+            {
+                told = true;
+                self.emit_identity(IdentityEvent::PairingWaiting { uid: to_uid(&uid) });
+            }
             tokio::time::sleep(POLL).await;
         }
-        let chain = chain
-            .ok_or_else(|| pairing_error("the key file does not hold this device's record"))?;
-        if chain.master_key().as_bytes()[..] != bundle.master_key[..] {
-            return Err(pairing_error(
-                "the bundle's master key is not the key file's",
+        let chain = chain.ok_or_else(|| {
+            pairing_error("the accepted key file does not hold this device's record")
+        })?;
+        check_bundle(&chain, &bundle)?;
+        let devices = chain
+            .devices()
+            .iter()
+            .map(|(id, d)| PairingDevice {
+                short: id.short(),
+                label: d.keys.label.clone(),
+                this_device: d.keys == *ours,
+                id: DeviceId(*id.as_bytes()),
+            })
+            .collect();
+        let now = self.now_ms();
+        self.store()
+            .write(|tx| tx.set_pairing_bundle(row.id, &bundle.encode(), now))?;
+        Ok(PairingIdentity {
+            uid: to_uid(&uid),
+            devices,
+        })
+    }
+
+    /// Takes the identity that [`finish_pairing`](Self::finish_pairing)
+    /// showed, once the user has confirmed that it is theirs (4.8, step
+    /// 5): this device holds its keys, and its accounts sign in and get
+    /// the history transfer. The bundle is checked again against the
+    /// records this device has accepted.
+    pub async fn accept_pairing(&self) -> Result<OwnIdentity> {
+        let row = self
+            .store()
+            .latest_pairing(true, None)?
+            .ok_or_else(|| pairing_error("no pairing in progress"))?;
+        let bundle = self
+            .store()
+            .write(|tx| tx.pairing_bundle(row.id))?
+            .0
+            .ok_or_else(|| pairing_error("the pairing is not finished"))?;
+        let bundle = IdentityBundle::decode(&bundle).map_err(pairing_error)?;
+        let new_device = NewDevice::decode(&row.new_device).map_err(pairing_error)?;
+        let uid = bundle.uid.clone();
+        if self.store().own_identity(uid.as_str())?.is_some() {
+            return Err(Error::invalid(
+                "identity, already on this device",
+                uid.as_str(),
             ));
         }
-        if bundle.backup.generation() != chain.generation() {
-            return Err(pairing_error(
-                "the bundle's generation is not the key file's",
-            ));
-        }
-        let signing = SecretKey::from_seed(*bundle.signing_seed);
-        if signing.public_key() != *chain.signing_key() {
-            return Err(pairing_error(
-                "the bundle's device-signing key is not current",
-            ));
-        }
+        let ours = &new_device.content().keys;
+        let rows = self.store().records(uid.as_str())?;
+        let chain = crate::sync::identity::kept_chain(&uid, &rows, true)
+            .filter(|c| holds(c, &bundle, ours))
+            .ok_or_else(|| {
+                pairing_error("the accepted key file does not hold this device's record")
+            })?;
+        check_bundle(&chain, &bundle)?;
 
         let key_id = row.key_id.clone().ok_or_else(|| pairing_error("no keys"))?;
         let names = KeyNames::new(&key_id);
@@ -309,6 +361,21 @@ impl Client {
             uid: to_uid(&uid),
             device: DeviceId(*ours.device_id().as_bytes()),
         })
+    }
+
+    /// Refuses the identity that [`finish_pairing`](Self::finish_pairing)
+    /// showed (4.8, step 5): the pairing and this device's new keys go.
+    pub fn decline_pairing(&self) -> Result<()> {
+        let Some(row) = self.store().latest_pairing(true, None)? else {
+            return Ok(());
+        };
+        self.store().write(|tx| tx.delete_pairing(row.id))?;
+        if let Some(key_id) = &row.key_id {
+            for id in KeyNames::new(key_id).all() {
+                self.options().keys.delete(&id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reads a new device's QR text on a device of `uid` (4.8, step 2):
@@ -508,6 +575,37 @@ impl Client {
         }
         Ok(())
     }
+}
+
+/// Whether `chain` holds the new device's own `device` record, the one
+/// the bundle names (4.8, step 5).
+fn holds(chain: &risala_proto::chain::Chain, bundle: &IdentityBundle, ours: &DeviceKeys) -> bool {
+    chain.records().iter().any(|r| {
+        r.hash().hash() == &bundle.record_hash
+            && matches!(&r.content().body, RecordBody::Device(k) if k == ours)
+    })
+}
+
+/// The bundle's keys are the key file's: its master key, its generation and
+/// its current device-signing key (4.8, step 5).
+fn check_bundle(chain: &risala_proto::chain::Chain, bundle: &IdentityBundle) -> Result<()> {
+    if chain.master_key().as_bytes()[..] != bundle.master_key[..] {
+        return Err(pairing_error(
+            "the bundle's master key is not the key file's",
+        ));
+    }
+    if bundle.backup.generation() != chain.generation() {
+        return Err(pairing_error(
+            "the bundle's generation is not the key file's",
+        ));
+    }
+    let signing = SecretKey::from_seed(*bundle.signing_seed);
+    if signing.public_key() != *chain.signing_key() {
+        return Err(pairing_error(
+            "the bundle's device-signing key is not current",
+        ));
+    }
+    Ok(())
 }
 
 /// A server address as librisala keeps it, in the one written form of 2.1
