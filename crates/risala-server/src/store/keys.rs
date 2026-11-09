@@ -199,9 +199,10 @@ pub struct StoredWelcome {
     pub welcome: OrBlob<Vec<u8>>,
 }
 
-/// The owner in `blob_keeps` of the tree blob of the public room of
-/// `mailbox` (12.12), which keeps it while the room's epoch is current.
-pub fn room_tree_owner(mailbox: &BoxName) -> String {
+/// The owner in `blob_keeps` of the blobs the server made of the public
+/// room of `mailbox`'s tree and GroupInfo (12.12), which keeps them while
+/// the room's epoch is current.
+pub fn room_blob_owner(mailbox: &BoxName) -> String {
     let hex: String = mailbox
         .as_bytes()
         .iter()

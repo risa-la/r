@@ -1096,6 +1096,7 @@ async fn a_public_rooms_current_tree_is_kept() {
     let update = |epoch: u64, tree_blob: BlobRef| RoomUpdate {
         epoch,
         group_info: vec![1],
+        group_info_blob: None,
         tree: vec![2],
         tree_blob: Some(tree_blob),
         members: vec![(
@@ -1106,7 +1107,7 @@ async fn a_public_rooms_current_tree_is_kept() {
         guests: risala_proto::types::GuestAccess::Write,
         state: Vec::new(),
     };
-    let (_, tree) = keys::store_room_tree(h.inner(), b"tree".to_vec())
+    let (_, tree) = keys::store_room_blob(h.inner(), b"tree".to_vec())
         .await
         .unwrap();
     assert_eq!(tree, BlobRef::of(b"tree"));
@@ -1130,7 +1131,7 @@ async fn a_public_rooms_current_tree_is_kept() {
     h.expire().await;
     assert!(files.blob(tree).await.is_ok());
     // A new epoch's tree replaces it: the old one expires with retention.
-    let (_, newer) = keys::store_room_tree(h.inner(), b"newer".to_vec())
+    let (_, newer) = keys::store_room_blob(h.inner(), b"newer".to_vec())
         .await
         .unwrap();
     h.store

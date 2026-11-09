@@ -789,16 +789,16 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
         send_to_followers(inner, &mailbox, &OutLine::new(ServerMessage::new(line)));
         return Ok(OkResponse::new());
     }
-    // A commit's tree too long for GROUPINFO's line is stored as a blob
-    // now, once for the epoch, so that GROUPINFO writes nothing (6.1,
-    // 12.12).
+    // A commit's tree or GroupInfo too long for GROUPINFO's line is
+    // stored as a blob now, once for the epoch, so that GROUPINFO writes
+    // nothing (6.1, 12.12).
     let mut room = room;
     if let Some(room::CheckedPost {
         change: RoomChange::Commit(update),
         ..
     }) = room.as_mut()
     {
-        room::store_tree_blob(&cx.inner, update).await?;
+        room::store_room_blobs(&cx.inner, update).await?;
     }
     // One quota for the mailbox's posts, files and blobs (7.5): its posts
     // take what its files and blobs leave.

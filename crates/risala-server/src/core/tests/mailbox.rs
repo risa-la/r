@@ -2501,6 +2501,124 @@ async fn long_trees_are_blobs_made_once_an_epoch() {
     assert!(file(&tree).is_err());
 }
 
+/// A GroupInfo too long for GROUPINFO's line, as a room whose extension
+/// lists many bans has, is stored as a blob once per epoch beside the tree,
+/// and kept while the epoch is current; GROUPINFO sends its hash and
+/// writes nothing (6.1, 12.12).
+#[tokio::test]
+async fn long_group_infos_are_blobs_made_once_an_epoch() {
+    use crate::store::KeysStore as _;
+    use risala_proto::names::BlobRef;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    // Every GroupInfo is too long for the line, on this thread; trees are
+    // as long as they are.
+    super::super::mailbox::room::test_hooks::INLINE_GROUP_INFO.with(|max| max.set(Some(0)));
+    let file = |hash: &BlobRef| std::fs::read(dir.path().join("files/blobs").join(hash.hex()));
+    let PublicRoomSetup {
+        owen,
+        mut o,
+        m,
+        mut signed,
+    } = create_room(&mut h, 1).await;
+    let mut anon = h.anon().await;
+    h.send(&anon, &format!("GROUPINFO {m}")).await;
+    let lines = anon.lines();
+    let (_, tree) = public_state(&owen, &o);
+    let created = lines[0]
+        .strip_prefix(&format!("GROUPINFO {m} 0 0 sha384:"))
+        .and_then(|rest| rest.strip_suffix(&format!(" {tree}")))
+        .unwrap_or_else(|| panic!("{lines:?}"))
+        .to_owned();
+    assert_eq!(lines[1], "OK");
+    assert!(file(&format!("sha384:{created}").parse().unwrap()).is_ok());
+    // A commit makes the next epoch's GroupInfo blob.
+    let token0 = owen.token(&o);
+    let out = owen.commit(&mut o, Changes::default());
+    let group_info = out.group_info.clone().unwrap();
+    h.send(
+        &signed,
+        &format!(
+            "POST {m} {token0} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(&group_info)
+        ),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["OK seq=1"]);
+    owen.merge(&mut o, &out);
+    let (_, tree) = public_state(&owen, &o);
+    let blob = BlobRef::of(&group_info);
+    assert_eq!(file(&blob).unwrap(), group_info);
+    let changes = h.store.raw().total_changes();
+    for _ in 0..3 {
+        h.send(&anon, &format!("GROUPINFO {m}")).await;
+        assert_eq!(
+            anon.lines(),
+            [format!("GROUPINFO {m} 1 1 {blob} {tree}"), "OK".into()]
+        );
+    }
+    // GROUPINFO wrote nothing.
+    assert_eq!(h.store.raw().total_changes(), changes);
+    // Kept past retention while current; the room's end lets it go.
+    h.clock.advance(Duration::from_secs(60 * 24 * 60 * 60));
+    crate::core::keys::expire(h.inner()).await.unwrap();
+    assert!(h.store.blob(&blob).unwrap().unwrap().kept);
+    let old: BlobRef = format!("sha384:{created}").parse().unwrap();
+    assert_eq!(h.store.blob(&old).unwrap(), None);
+    crate::core::keys::room_ended(h.inner(), m).await.unwrap();
+    crate::core::keys::expire(h.inner()).await.unwrap();
+    assert_eq!(h.store.blob(&blob).unwrap(), None);
+    assert!(file(&blob).is_err());
+}
+
+/// A GroupInfo and a tree both too long for the line are both blobs, both
+/// kept while the epoch is current (6.1, 12.12).
+#[tokio::test]
+async fn long_group_infos_and_trees_are_both_blobs() {
+    use crate::store::KeysStore as _;
+    use risala_proto::names::BlobRef;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    let hooks = &super::super::mailbox::room::test_hooks::INLINE_GROUP_INFO;
+    hooks.with(|max| max.set(Some(0)));
+    super::super::mailbox::room::test_hooks::INLINE_TREE.with(|max| max.set(Some(0)));
+    let PublicRoomSetup {
+        owen,
+        mut o,
+        m,
+        mut signed,
+    } = create_room(&mut h, 1).await;
+    let token0 = owen.token(&o);
+    let out = owen.commit(&mut o, Changes::default());
+    let group_info = out.group_info.clone().unwrap();
+    h.send(
+        &signed,
+        &format!(
+            "POST {m} {token0} {} next={} groupinfo={}",
+            b64(&out.message),
+            hash(out.next_token_hash),
+            b64(&group_info)
+        ),
+    )
+    .await;
+    assert_eq!(signed.lines(), ["OK seq=1"]);
+    owen.merge(&mut o, &out);
+    let gi = BlobRef::of(&group_info);
+    let tree = BlobRef::of(&tree_to_bytes(&o.export_ratchet_tree()));
+    let mut anon = h.anon().await;
+    h.send(&anon, &format!("GROUPINFO {m}")).await;
+    assert_eq!(
+        anon.lines(),
+        [format!("GROUPINFO {m} 1 1 {gi} {tree}"), "OK".into()]
+    );
+    h.clock.advance(Duration::from_secs(60 * 24 * 60 * 60));
+    crate::core::keys::expire(h.inner()).await.unwrap();
+    assert!(h.store.blob(&gi).unwrap().unwrap().kept);
+    assert!(h.store.blob(&tree).unwrap().unwrap().kept);
+}
+
 /// A harness whose blobs share 1 MiB of `limits.blob_memory`, with its
 /// clock at the system's time, and its files in `dir`.
 fn small_blob_memory(dir: &tempfile::TempDir) -> Harness {

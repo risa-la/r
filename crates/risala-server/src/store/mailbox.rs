@@ -183,7 +183,7 @@ pub struct RoomGroup {
 }
 
 /// What GROUPINFO sends of a public room (6.1): its epoch, the seq that
-/// started it, its GroupInfo, and its tree, inline or as the blob the
+/// started it, its GroupInfo and its tree, each inline or as the blob the
 /// server stored when it applied the commit (12.12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomGroupInfo {
@@ -191,8 +191,8 @@ pub struct RoomGroupInfo {
     pub epoch: u64,
     /// The seq of the commit that started the epoch, or 0 in epoch 0.
     pub epoch_seq: u64,
-    /// The current GroupInfo, an MLSMessage.
-    pub group_info: Vec<u8>,
+    /// The current GroupInfo, an MLSMessage, or its blob.
+    pub group_info: OrBlob<Vec<u8>>,
     /// The current ratchet tree, or its blob.
     pub tree: OrBlob<Vec<u8>>,
 }
@@ -204,6 +204,10 @@ pub struct RoomUpdate {
     pub epoch: u64,
     /// Its GroupInfo, an MLSMessage.
     pub group_info: Vec<u8>,
+    /// The blob that holds the GroupInfo, when it is too long for
+    /// GROUPINFO's line (6.1, 12.12), as in a room whose extension lists
+    /// many bans: stored and kept as [`tree_blob`](Self::tree_blob) is.
+    pub group_info_blob: Option<BlobRef>,
     /// Its ratchet tree.
     pub tree: Vec<u8>,
     /// The blob that holds the tree, when it is too long for GROUPINFO's
@@ -382,12 +386,13 @@ pub trait MailboxStore {
     fn room_group(&self, mailbox: &BoxName) -> Result<Option<RoomGroup>>;
 
     /// The bytes [`room_group_info`](Self::room_group_info) would read of
-    /// the public room of `mailbox`: its GroupInfo, and its tree unless
-    /// that is a blob.
+    /// the public room of `mailbox`: its GroupInfo and its tree, each
+    /// unless it is a blob.
     fn room_group_info_size(&self, mailbox: &BoxName) -> Result<Option<u64>>;
 
     /// What GROUPINFO sends of the public room of `mailbox` (6.1): it reads
-    /// the tree only if it is not a blob, and writes nothing.
+    /// the GroupInfo and the tree only if they are not blobs, and writes
+    /// nothing.
     fn room_group_info(&self, mailbox: &BoxName) -> Result<Option<RoomGroupInfo>>;
 
     /// The role of `uid` in the public room of `mailbox`, if it has a leaf

@@ -15,9 +15,10 @@
 //!   tree of the new epoch is kept for WELCOME GET (12.6, 12.8).
 //! - [`blob_bytes`]: the identity area for KEYS PUT, and [`reserve`] the
 //!   mailbox area, for the bytes of the blobs a line names (12.12).
-//! - [`store_room_tree`] and [`room_ended`]: the mailbox area, when a
-//!   public room's commit makes a tree too long for GROUPINFO's line, so
-//!   that it is a blob kept while it is current (12.12), and
+//! - [`store_room_blob`] and [`room_ended`]: the mailbox area, when a
+//!   public room's commit makes a tree or GroupInfo too long for
+//!   GROUPINFO's line, so that it is a blob kept while it is current
+//!   (12.12), and
 //!   [`hold_memory`] for what GROUPINFO reads (6.1).
 //! - [`charge_address`] and [`stored_bytes`]: the mailbox area, so that
 //!   POST, UPLOAD and BLOB count against one window per network address,
@@ -1292,16 +1293,17 @@ async fn upload(cx: &Cx, mailbox: BoxName, token: SendToken, size: u64) -> Reply
         .map_err(internal)
 }
 
-/// Stores a public room's tree, too long for a GROUPINFO line (12.12), as
-/// a blob the server makes itself and counts against nobody, and hands the
-/// tree back with its hash. The mailbox area calls this once per epoch,
-/// when it applies the commit, and the store keeps the blob while the
-/// epoch is current ([`RoomUpdate::tree_blob`](crate::store::RoomUpdate));
-/// once another replaces it, or the room ends ([`room_ended`]), retention
-/// counts from when it was made.
-pub(crate) async fn store_room_tree(
+/// Stores a public room's tree or GroupInfo, too long for a GROUPINFO line
+/// (12.12), as a blob the server makes itself and counts against nobody,
+/// and hands the bytes back with their hash. The mailbox area calls this
+/// once per epoch, when it applies the commit or creates the room, and the
+/// store keeps the blob while the epoch is current
+/// ([`RoomUpdate::tree_blob`](crate::store::RoomUpdate) and
+/// `group_info_blob`); once another replaces it, or the room ends
+/// ([`room_ended`]), retention counts from when it was made.
+pub(crate) async fn store_room_blob(
     inner: &Arc<Inner>,
-    tree: Vec<u8>,
+    bytes: Vec<u8>,
 ) -> Result<(Vec<u8>, BlobRef), StoreError> {
     let now = inner.now();
     let inner = inner.clone();
@@ -1310,20 +1312,21 @@ pub(crate) async fn store_room_tree(
         // Under the lock that expiry takes, so that the blob is not
         // removed between its file and its row.
         let _guard = keys.lock_fs();
-        let hash = BlobRef::of(&tree);
-        disk::write_blob(keys, &hash, &tree)
-            .map_err(|e| StoreError::Setup(format!("storing a tree: {e}")))?;
-        inner.store.store_own_blob(&hash, tree.len() as u64, now)?;
-        Ok((tree, hash))
+        let hash = BlobRef::of(&bytes);
+        disk::write_blob(keys, &hash, &bytes)
+            .map_err(|e| StoreError::Setup(format!("storing a public room's blob: {e}")))?;
+        inner.store.store_own_blob(&hash, bytes.len() as u64, now)?;
+        Ok((bytes, hash))
     })
     .await
     .map_err(|e| StoreError::Task(e.to_string()))?
 }
 
-/// The public room of `mailbox` has ended: its tree's blob is no longer
-/// kept beyond retention (12.12). The mailbox area calls this.
+/// The public room of `mailbox` has ended: the blobs of its tree and
+/// GroupInfo are no longer kept beyond retention (12.12). The mailbox area
+/// calls this.
 pub(crate) async fn room_ended(inner: &Inner, mailbox: BoxName) -> Result<(), StoreError> {
-    let owner = crate::store::keys::room_tree_owner(&mailbox);
+    let owner = crate::store::keys::room_blob_owner(&mailbox);
     inner
         .db(move |store| store.set_blob_keeps(&owner, &[]))
         .await

@@ -13,7 +13,7 @@ use risala_proto::types::Role;
 
 use super::{SqliteStore, from_sql_u64, sql_u64};
 use crate::secret::ct_eq;
-use crate::store::keys::room_tree_owner;
+use crate::store::keys::room_blob_owner;
 use crate::store::mailbox::{
     AddedBy, CID_LIFETIME, MAX_SET_NEXT_HASHES, MAX_SET_TOKEN_HASHES, MAX_SETS, post_line_bytes,
 };
@@ -104,8 +104,9 @@ CREATE TABLE public_rooms (
     creator TEXT NOT NULL,          -- the identity that created it
     epoch INTEGER NOT NULL CHECK (epoch >= 0),
     epoch_seq INTEGER NOT NULL,     -- the seq of the commit that began the epoch, 0 in epoch 0
-    group_info BLOB NOT NULL,       -- the GroupInfo, or its blob's hash
-    group_info_is_blob INTEGER NOT NULL DEFAULT 0,
+    group_info BLOB NOT NULL,       -- the GroupInfo
+    group_info_blob BLOB CHECK (length(group_info_blob) = 48), -- the hash of the blob the
+                                    -- server made of it, when too long for GROUPINFO's line
     tree BLOB NOT NULL,             -- the ratchet tree
     tree_blob BLOB CHECK (length(tree_blob) = 48), -- the hash of the blob the server made
                                     -- of it, when too long for GROUPINFO's line (12.12)
@@ -333,14 +334,16 @@ fn store_room_group(
 ) -> Result<()> {
     let members = group.members.len() as i64;
     let tree_blob = group.tree_blob.as_ref().map(|hash| &hash.hash()[..]);
+    let group_info_blob = group.group_info_blob.as_ref().map(|hash| &hash.hash()[..]);
     tx.execute(
-        "UPDATE public_rooms SET epoch = ?, epoch_seq = ?, group_info = ?, tree = ?,
-             tree_blob = ?, members = ?, topic = ?, guests = ?, epoch_state = ?
+        "UPDATE public_rooms SET epoch = ?, epoch_seq = ?, group_info = ?, group_info_blob = ?,
+             tree = ?, tree_blob = ?, members = ?, topic = ?, guests = ?, epoch_state = ?
          WHERE box = ?",
         params![
             sql_u64(group.epoch),
             sql_u64(epoch_seq),
             &group.group_info,
+            group_info_blob,
             &group.tree,
             tree_blob,
             members,
@@ -350,12 +353,12 @@ fn store_room_group(
             mailbox
         ],
     )?;
-    // The tree's blob is kept while the epoch is current, and the last
-    // one's from now on expires with retention, from when it was made
-    // (12.12).
-    let owner = room_tree_owner(&BoxName::from_bytes(fixed("box", mailbox)?));
+    // The tree's and the GroupInfo's blobs are kept while the epoch is
+    // current, and the last epoch's from now on expire with retention,
+    // from when they were made (12.12).
+    let owner = room_blob_owner(&BoxName::from_bytes(fixed("box", mailbox)?));
     tx.execute("DELETE FROM blob_keeps WHERE owner = ?", [&owner])?;
-    if let Some(hash) = tree_blob {
+    for hash in [tree_blob, group_info_blob].into_iter().flatten() {
         tx.execute(
             "INSERT INTO blob_keeps (owner, hash) VALUES (?, ?) ON CONFLICT DO NOTHING",
             params![owner, hash],
@@ -784,7 +787,7 @@ impl MailboxStore for SqliteStore {
         self.read(|tx| {
             let size: Option<i64> = tx
                 .query_row(
-                    "SELECT length(group_info)
+                    "SELECT CASE WHEN group_info_blob IS NULL THEN length(group_info) ELSE 0 END
                           + CASE WHEN tree_blob IS NULL THEN length(tree) ELSE 0 END
                      FROM public_rooms WHERE box = ?",
                     [&mailbox.as_bytes()[..]],
@@ -799,34 +802,37 @@ impl MailboxStore for SqliteStore {
         self.read(|tx| {
             let row = tx
                 .query_row(
-                    "SELECT epoch, epoch_seq, group_info, tree_blob,
-                            CASE WHEN tree_blob IS NULL THEN tree END
+                    "SELECT epoch, epoch_seq, group_info_blob,
+                            CASE WHEN group_info_blob IS NULL THEN group_info END,
+                            tree_blob, CASE WHEN tree_blob IS NULL THEN tree END
                      FROM public_rooms WHERE box = ?",
                     [&mailbox.as_bytes()[..]],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, i64>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
                             row.get::<_, Option<Vec<u8>>>(3)?,
                             row.get::<_, Option<Vec<u8>>>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((epoch, epoch_seq, group_info, tree_blob, tree)) = row else {
+            let Some((epoch, epoch_seq, group_info_blob, group_info, tree_blob, tree)) = row else {
                 return Ok(None);
             };
-            let tree = match (tree_blob, tree) {
-                (Some(hash), _) => OrBlob::Blob(BlobRef::from_hash(fixed("tree blob", &hash)?)),
-                (None, Some(tree)) => OrBlob::Inline(tree),
-                (None, None) => return Err(StoreError::Corrupt("a public room's tree".into())),
-            };
+            let or_blob =
+                |what: &str, blob: Option<Vec<u8>>, bytes: Option<Vec<u8>>| match (blob, bytes) {
+                    (Some(hash), _) => Ok(OrBlob::Blob(BlobRef::from_hash(fixed(what, &hash)?))),
+                    (None, Some(bytes)) => Ok(OrBlob::Inline(bytes)),
+                    (None, None) => Err(StoreError::Corrupt(format!("a public room's {what}"))),
+                };
             Ok(Some(RoomGroupInfo {
                 epoch: from_sql_u64("epoch", epoch)?,
                 epoch_seq: from_sql_u64("epoch seq", epoch_seq)?,
-                group_info,
-                tree,
+                group_info: or_blob("GroupInfo", group_info_blob, group_info)?,
+                tree: or_blob("tree", tree_blob, tree)?,
             }))
         })
     }
@@ -1635,6 +1641,7 @@ mod tests {
         let group = |epoch: u64, members: Vec<(Uid, Role)>| RoomUpdate {
             epoch,
             group_info: vec![epoch as u8; 3],
+            group_info_blob: None,
             tree: vec![epoch as u8; 5],
             tree_blob: None,
             members,
