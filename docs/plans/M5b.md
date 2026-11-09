@@ -224,7 +224,7 @@ four writing code at once.
   watching, RECORD/ALERT), pairing by QR text, recovery, removing a
   device, safety numbers, pins on master keys and logs. Needs C0, P2,
   P3.
-- [~] **C2. Conversations** (5, 6, 7, 12.6-12.9): the group engine on
+- [x] **C2. Conversations** (5, 6, 7, 12.6-12.9): the group engine on
   mailboxes, posting with tokens and pseudonyms, first valid commit
   wins, Welcomes, membership and roles in the group, PART, deletes,
   gaps, profiles, topics, typing and read markers, blocks, guests in
