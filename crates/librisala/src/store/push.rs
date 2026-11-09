@@ -76,7 +76,8 @@ impl SubState {
 }
 
 /// A push subscription row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Its `Debug` leaves out the keys, the secret and the URL (LR-L1).
+#[derive(Clone, PartialEq, Eq)]
 pub struct SubscriptionRow {
     /// Its id.
     pub id: i64,
@@ -126,8 +127,9 @@ fn sub_row(row: &Row<'_>) -> rusqlite::Result<SubscriptionRow> {
     })
 }
 
-/// A new subscription, for [`Tx::add_subscription`].
-#[derive(Debug, Clone)]
+/// A new subscription, for [`Tx::add_subscription`]. Its `Debug` leaves
+/// out the keys, the secret and the URL (LR-L1).
+#[derive(Clone)]
 pub struct NewSubscription<'a> {
     /// The account.
     pub account: AccountId,
@@ -145,6 +147,27 @@ pub struct NewSubscription<'a> {
     pub auth: &'a [u8],
     /// The P-256 private key.
     pub private_key: &'a [u8],
+}
+
+impl std::fmt::Debug for SubscriptionRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubscriptionRow")
+            .field("id", &self.id)
+            .field("account", &self.account)
+            .field("conv", &self.conv)
+            .field("state", &self.state)
+            .field("renew_at", &self.renew_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for NewSubscription<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewSubscription")
+            .field("account", &self.account)
+            .field("conv", &self.conv)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Tx<'_> {

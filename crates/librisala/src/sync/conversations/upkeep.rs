@@ -4,8 +4,9 @@
 //!   repairs ([`super::keycheck::recheck`], LR-C2);
 //! - every ten minutes, past epochs' secrets deleted by the clock, 2 hours
 //!   after the commit that ended each (12.9, LR-H1); outbox rows done or
-//!   lost for a day deleted (LR-M2); and the WAL truncated, so that what
-//!   was deleted does not stay in it (LR-M1);
+//!   lost for a day deleted (LR-M2); DELETEs whose target never came
+//!   forgotten after retention (LR-L3); and the WAL truncated, so that
+//!   what was deleted does not stay in it (LR-M1);
 //! - after a restart, the timers that the spec relies on, brought back
 //!   from the groups and the cache (LR-M4): pending proposals to commit
 //!   (6.1), leaves that asked with RESYNC to replace (12.7), and, from the
@@ -75,6 +76,13 @@ impl ConversationEngine {
                 if purged > 0 {
                     tracing::debug!(purged, "outbox rows purged");
                 }
+                // LR-L3: a DELETE whose target has not come within
+                // retention, and a day, never will.
+                tx.expire_deletes(
+                    c.now
+                        .saturating_sub(c.config.retention_ms)
+                        .saturating_sub(DAY_MS),
+                )?;
                 Ok(())
             })?;
             if let Err(e) = cx.store.checkpoint() {

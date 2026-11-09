@@ -220,3 +220,48 @@ fn the_resync_escalation_survives_a_restart() {
     assert!(net.epoch(laptop, direct) > before, "the laptop replaced it");
     assert_eq!(net.epoch(phone, p), net.epoch(laptop, direct));
 }
+
+/// LR-L3, 5.4: DELETEs whose target has not arrived are kept within
+/// bounds: the newest few hundred per sender, and none past retention.
+#[test]
+fn kept_deletes_are_bounded_and_expire() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    net.connect(alice);
+    net.connect(bob);
+    let (a, _) = direct(&mut net, alice, bob);
+    let bob_uid = net.devices[bob].uid.clone();
+    let now = net.clock.now().unix_millis();
+    net.write(alice, |tx| {
+        for i in 0..300u32 {
+            let mut target = [0u8; 16];
+            target[..4].copy_from_slice(&i.to_be_bytes());
+            tx.keep_delete(a, &target, &bob_uid, false, now + u64::from(i))?;
+        }
+        Ok(())
+    });
+    let count = |net: &Net| -> i64 {
+        net.write(alice, |tx| {
+            Ok(tx
+                .conn()
+                .query_row("SELECT count(*) FROM deletes", [], |r| r.get(0))
+                .map_err(crate::store::StoreError::from)?)
+        })
+    };
+    assert_eq!(
+        count(&net),
+        crate::store::messages::MAX_KEPT_DELETES as i64
+    );
+    // The newest are the ones kept.
+    let mut newest = [0u8; 16];
+    newest[..4].copy_from_slice(&299u32.to_be_bytes());
+    assert_eq!(
+        net.write(alice, |tx| Ok(tx.kept_deletes(a, &newest)?)).len(),
+        1
+    );
+    for _ in 0..9 {
+        net.advance(24 * HOUR);
+    }
+    assert_eq!(count(&net), 0);
+}

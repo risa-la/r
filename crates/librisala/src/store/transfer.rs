@@ -204,8 +204,9 @@ pub type BlobAndKey = ([u8; 48], [u8; 32]);
 /// group id and the encoded HistoryArchive.
 pub type Pending = (i64, Vec<u8>, Vec<u8>);
 
-/// A file row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A file row. Its `Debug` leaves out the blob key and the `del` URL
+/// (LR-L1).
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileRow {
     /// The conversation.
     pub conv: ConversationId,
@@ -227,6 +228,17 @@ pub struct FileRow {
     pub blob: Option<([u8; 48], [u8; 32])>,
     /// `shared`, `fetched`, `failed` or `deleted`.
     pub state: String,
+}
+
+impl std::fmt::Debug for FileRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileRow")
+            .field("conv", &self.conv)
+            .field("size", &self.size)
+            .field("media_type", &self.media_type)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 const FILE_COLUMNS: &str =

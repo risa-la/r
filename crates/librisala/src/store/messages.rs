@@ -60,11 +60,14 @@ CREATE TABLE seen (
 -- DELETEs whose target has not arrived yet (5.4): applied when it does.
 -- by is the deleting identity, by_role whether it held a role that may
 -- delete others' messages.
+-- kept is the `t` of the post that carried it: at most MAX_KEPT_DELETES
+-- are kept per sender, and none past retention (LR-L3).
 CREATE TABLE deletes (
     conv    INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     target  BLOB NOT NULL,
     by      TEXT NOT NULL,
     by_role INTEGER NOT NULL,
+    kept    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (conv, target, by)
 ) WITHOUT ROWID;
 
@@ -284,6 +287,10 @@ fn finish_message((mut row, sender): (MessageRow, String)) -> Result<MessageRow,
     row.sender = parse(&sender, "uid")?;
     Ok(row)
 }
+
+/// The most DELETEs whose target has not arrived that one sender keeps in
+/// a conversation (5.4; LR-L3).
+pub(crate) const MAX_KEPT_DELETES: usize = 256;
 
 /// An outbox row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -675,20 +682,38 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Keeps a DELETE whose target has not arrived (5.4).
+    /// Keeps a DELETE whose target has not arrived (5.4), from a post with
+    /// `t`. Any member can send DELETEs for ids that never come, so each
+    /// sender keeps at most [`MAX_KEPT_DELETES`] in a conversation, the
+    /// newest (LR-L3).
     pub(crate) fn keep_delete(
         &mut self,
         conv: ConversationId,
         target: &[u8; 16],
         by: &Uid,
         by_role: bool,
+        t: u64,
     ) -> Result<(), StoreError> {
         self.conn().execute(
-            "INSERT INTO deletes (conv, target, by, by_role) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO deletes (conv, target, by, by_role, kept) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT DO UPDATE SET by_role = max(by_role, excluded.by_role)",
-            params![conv.0, &target[..], by.as_str(), by_role],
+            params![conv.0, &target[..], by.as_str(), by_role, t as i64],
+        )?;
+        self.conn().execute(
+            "DELETE FROM deletes WHERE conv = ?1 AND by = ?2 AND target NOT IN (
+                 SELECT target FROM deletes WHERE conv = ?1 AND by = ?2
+                 ORDER BY kept DESC, target LIMIT ?3)",
+            params![conv.0, by.as_str(), MAX_KEPT_DELETES as i64],
         )?;
         Ok(())
+    }
+
+    /// Forgets kept DELETEs from posts before `before`: their targets
+    /// would have expired from the mailbox by now (7.5; LR-L3).
+    pub(crate) fn expire_deletes(&mut self, before: u64) -> Result<usize, StoreError> {
+        Ok(self
+            .conn()
+            .execute("DELETE FROM deletes WHERE kept < ?1", [before as i64])?)
     }
 
     /// The DELETEs kept for `target`: who, and whether with a role.

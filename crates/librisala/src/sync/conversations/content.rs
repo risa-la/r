@@ -197,7 +197,7 @@ pub(crate) fn receive(
                 break;
             }
             ContentLine::Delete { id } => {
-                delete(tx, conv, &ext, &uid, id.as_bytes())?;
+                delete(tx, conv, &ext, &uid, id.as_bytes(), t)?;
             }
             ContentLine::Resync { mailbox: None, seq } => {
                 // 12.7: replace the leaf, after a random wait.
@@ -250,6 +250,7 @@ fn delete(
     ext: &risala_mls::conversation::RisalaConversation,
     by: &Uid,
     target: &[u8; 16],
+    t: u64,
 ) -> Result<()> {
     let room = matches!(conv.kind, ConvKind::Private | ConvKind::Public);
     let with_role = room && ext.role(by) >= Role::Mod;
@@ -259,7 +260,7 @@ fn delete(
                 tx.erase_message(conv.id, target)?;
             }
         }
-        None => tx.keep_delete(conv.id, target, by, with_role)?,
+        None => tx.keep_delete(conv.id, target, by, with_role, t)?,
     }
     Ok(())
 }
