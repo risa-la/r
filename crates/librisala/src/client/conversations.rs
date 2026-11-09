@@ -24,7 +24,7 @@ use crate::keys::KeyStore;
 use crate::store::Store;
 use crate::store::conversations::{ConvKind, ConvRow, ConvState};
 use crate::sync::conversations::wire::Intent;
-use crate::sync::conversations::{EngineError, Hooks, Job, JobId, content, group};
+use crate::sync::conversations::{BlobFetch, EngineError, Hooks, Job, JobId, content, group};
 
 /// The conversation area's errors.
 #[derive(Debug, thiserror::Error)]
@@ -250,10 +250,79 @@ pub struct PublicRoom {
 pub(crate) struct ClientHooks {
     store: Store,
     keys: Arc<dyn KeyStore>,
+    /// The blob store (12.12): blobs fetched over HTTPS in the background.
+    blobs: Arc<BlobFetcher>,
     /// Leaf confirmation (task C3).
     confirm: Arc<crate::sync::confirm::Confirm>,
     /// The time, for C4's lines.
     clock: Arc<dyn crate::clock::Clock>,
+}
+
+/// The most a blob may hold: the tree of the largest public room (12.12).
+const MAX_BLOB: usize = 256 << 20;
+
+/// Fetches blobs (12.12) from INFO's `blobs` URL prefix over HTTPS, in the
+/// background, for [`Hooks::blob`], which answers `Waiting` until a fetch
+/// is done. The engine checks each blob's hash.
+///
+/// TODO(C4): the blob store, with its cache and BLOB uploads, is task
+/// C4's; this is the group engine's own seam until it lands.
+pub(crate) struct BlobFetcher {
+    https: Option<Arc<dyn crate::client::identity::Https>>,
+    state: std::sync::Mutex<std::collections::HashMap<[u8; 48], BlobState>>,
+}
+
+/// A blob being fetched (`None`), or fetched: its bytes, or `None` if the
+/// fetch failed.
+type BlobState = Option<Option<Vec<u8>>>;
+
+impl BlobFetcher {
+    fn get(
+        self: &Arc<Self>,
+        prefix: Option<&str>,
+        blob: &risala_proto::names::BlobRef,
+    ) -> BlobFetch {
+        let (Some(prefix), Some(https)) = (prefix, self.https.clone()) else {
+            return BlobFetch::Unavailable;
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.get(blob.hash()) {
+            Some(None) => return BlobFetch::Waiting,
+            Some(Some(Some(bytes))) => return BlobFetch::Ready(bytes.clone()),
+            Some(Some(None)) => {
+                state.remove(blob.hash());
+                return BlobFetch::Unavailable;
+            }
+            None => {}
+        }
+        // A few recent blobs are kept, for a Welcome and its tree, or a
+        // GroupInfo and its tree, asked for together.
+        if state.len() >= 16 {
+            state.retain(|_, v| v.is_none());
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return BlobFetch::Unavailable;
+        };
+        state.insert(*blob.hash(), None);
+        drop(state);
+        let url = format!("{prefix}{}", blob.hex());
+        let hash = *blob.hash();
+        let this = self.clone();
+        handle.spawn(async move {
+            let got = match https.get(&url, MAX_BLOB).await {
+                crate::client::identity::Fetched::Body(body) => Some(body),
+                other => {
+                    tracing::info!(%url, ?other, "a blob could not be fetched");
+                    None
+                }
+            };
+            this.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(hash, Some(got));
+        });
+        BlobFetch::Waiting
+    }
 }
 
 impl Hooks for ClientHooks {
@@ -303,6 +372,15 @@ impl Hooks for ClientHooks {
         mailbox: &risala_proto::names::BoxName,
     ) -> Option<risala_proto::types::PushTag> {
         crate::sync::push::follow_quiet(store, account, mailbox)
+    }
+
+    fn blob(
+        &self,
+        _: AccountId,
+        prefix: Option<&str>,
+        blob: &risala_proto::names::BlobRef,
+    ) -> BlobFetch {
+        self.blobs.get(prefix, blob)
     }
 
     fn device_key(&self, _: AccountId, uid: &Uid) -> Option<risala_mls::mldsa::SigningKey> {
@@ -437,6 +515,10 @@ impl Client {
         Arc::new(ClientHooks {
             store: self.store().clone(),
             keys: self.options().keys.clone(),
+            blobs: Arc::new(BlobFetcher {
+                https: self.options().https.clone(),
+                state: std::sync::Mutex::default(),
+            }),
             confirm: self.confirm_service(),
             clock: self.options().clock.clone(),
         })
@@ -1025,5 +1107,7 @@ impl Client {
     }
 }
 
+#[cfg(test)]
+mod server_tests;
 #[cfg(test)]
 mod tests;

@@ -1,7 +1,8 @@
 //! An in-memory server for the group engine's tests: the mailbox, token,
 //! KeyPackage and Welcome commands of 5.2, 7.1, 7.2, 12.5 and 12.8, as far
-//! as the engine uses them. It stands in for `risalad` until its mailbox
-//! and Welcome areas (tasks SV3, SV4) land on `m5b`.
+//! as the engine uses them, with knobs that `risalad` has not (refused
+//! Welcomes, posts as blob-refs, GONE on demand). The same paths run
+//! against `risalad` in `client/conversations/server_tests.rs`.
 //!
 //! It checks what a server can check without a group's secrets: framing,
 //! group ids, token hashes per epoch, `next` on commits only. Public rooms
@@ -702,6 +703,7 @@ impl FakeServer {
                 }
                 End::Ok(ok().with_more(false))
             }
+            Command::Info { room: None } => End::Ok(ok()),
             Command::Info { room: Some(name) } => {
                 match self
                     .mailboxes

@@ -43,7 +43,16 @@ impl ConversationEngine {
     /// The bytes of an inline value or a blob (12.12), from
     /// [`super::Hooks::blob`], whose hash is checked here.
     pub(super) fn get_blob(&self, me: &Me, blob: &BlobRef) -> Got {
-        match self.hooks.blob(me.account, blob) {
+        if !self.info_answered {
+            // INFO is asked on the next step, or in flight: wait for it.
+            self.need_info
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return Got::Waiting;
+        }
+        match self
+            .hooks
+            .blob(me.account, self.blob_prefix.as_deref(), blob)
+        {
             BlobFetch::Ready(bytes) => {
                 if BlobRef::of(&bytes) == *blob {
                     Got::Bytes(bytes)
@@ -170,6 +179,7 @@ impl ConversationEngine {
             _ => None,
         };
         let Some(mailbox) = mailbox else {
+            tracing::info!(end = ?response.end, %room, "INFO of a room");
             out.push(job_done(
                 job,
                 None,
@@ -191,8 +201,13 @@ impl ConversationEngine {
         );
     }
 
-    /// The room in a GROUPINFO answer, its blobs fetched.
-    fn room_state(&self, me: &Me, response: &Response) -> Result<Option<RoomState>, String> {
+    /// The room in a GROUPINFO answer, its blobs fetched: `Ok(Err(box))`
+    /// while a blob is being fetched.
+    fn room_state(
+        &self,
+        me: &Me,
+        response: &Response,
+    ) -> Result<Result<RoomState, BoxName>, String> {
         if let End::Err(e) = &response.end {
             return Err(format!("GROUPINFO: {}", e.code));
         }
@@ -208,7 +223,7 @@ impl ConversationEngine {
                 let info = self.resolve(me, groupinfo, |g| g.decode());
                 let tree = self.resolve(me, tree, |t| t.decode());
                 return match (info, tree) {
-                    (Got::Bytes(group_info), Got::Bytes(tree)) => Ok(Some(RoomState {
+                    (Got::Bytes(group_info), Got::Bytes(tree)) => Ok(Ok(RoomState {
                         mailbox: *mailbox,
                         epoch: *epoch,
                         seq: seq.map_or(0, |s| s.get()),
@@ -218,7 +233,7 @@ impl ConversationEngine {
                     (Got::Unavailable, _) | (_, Got::Unavailable) => {
                         Err("the room's tree is a blob, and there is no blob store".into())
                     }
-                    _ => Ok(None),
+                    _ => Ok(Err(*mailbox)),
                 };
             }
         }
@@ -234,7 +249,19 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let me = self.me(cx)?;
-        let state = self.room_state(&me, response);
+        let state = match self.room_state(&me, response) {
+            // 12.12: asked again once the blob is in, on a later tick.
+            Ok(Err(mailbox)) => {
+                if let RoomPurpose::Check { conv } = &purpose {
+                    self.join_inflight.remove(conv);
+                }
+                self.groupinfo_waits.push((purpose, mailbox));
+                return Ok(());
+            }
+            Ok(Ok(state)) => Ok(Some(state)),
+            Err(e) => Err(e),
+        };
+        tracing::debug!(?purpose, epoch = ?state.as_ref().ok().and_then(|s| s.as_ref()).map(|s| s.epoch), "GROUPINFO");
         match purpose {
             RoomPurpose::Join {
                 job,
@@ -280,6 +307,7 @@ impl ConversationEngine {
                     Some(join) => public::check_join(tx, c, &join, &state).map(Some),
                     None => Ok(None),
                 });
+                tracing::debug!(?step, "a join checked");
                 match step {
                     Ok(Some(JoinStep::Wait)) | Ok(None) => {}
                     Ok(Some(JoinStep::Fetch(reference))) => {
@@ -404,6 +432,7 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) {
         let now = self.now();
+        tracing::debug!(end = ?response.end, "a join proposal posted");
         match &response.end {
             End::Ok(_) => {
                 self.join_checks
@@ -437,6 +466,7 @@ impl ConversationEngine {
     ) -> Result<(), EngineError> {
         self.join_inflight.remove(&conv);
         let me = self.me(cx)?;
+        tracing::debug!(end = ?response.end, lines = ?response.lines.iter().map(|l| l.line.verb()).collect::<Vec<_>>(), "WELCOME GET");
         let found = response.lines.iter().find_map(|l| match &l.line {
             ServerLine::Welcome {
                 welcome,
@@ -446,18 +476,44 @@ impl ConversationEngine {
             _ => None,
         });
         let Some((welcome, tree)) = found else {
+            tracing::debug!("no Welcome with a tree yet");
             // Not there yet: look again after the next commit or poll.
             self.join_checks
                 .insert(conv, self.now() + self.config.join_poll_ms);
             return Ok(());
         };
-        let (Got::Bytes(welcome), Got::Bytes(tree)) = (
+        self.public_welcome(cx, &me, conv, welcome, tree, out)
+    }
+
+    /// Joins by a public room's Welcome and the tree of its epoch, once
+    /// their blobs are in (12.8, 12.12).
+    fn public_welcome(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        welcome: OrBlob<risala_proto::mls::Welcome>,
+        tree: OrBlob<TreeText>,
+        out: &mut Vec<Action>,
+    ) -> Result<(), EngineError> {
+        let me = me.clone();
+        let (got_welcome, got_tree) = (
             self.resolve(&me, &welcome, |w| w.decode()),
             self.resolve(&me, &tree, |t| t.decode()),
-        ) else {
-            self.join_checks
-                .insert(conv, self.now() + self.config.join_poll_ms);
-            return Ok(());
+        );
+        let (welcome, tree) = match (got_welcome, got_tree) {
+            (Got::Bytes(w), Got::Bytes(t)) => (w, t),
+            (Got::Unavailable, _) | (_, Got::Unavailable) => {
+                tracing::info!("a public room's Welcome or tree is a blob, and no blob store");
+                self.join_checks
+                    .insert(conv, self.now() + self.config.join_poll_ms);
+                return Ok(());
+            }
+            _ => {
+                // Asked again on a later tick.
+                self.welcome_waits.insert(conv, (welcome, tree));
+                return Ok(());
+            }
         };
         let joined = self.write(cx, &me, out, |tx, c| {
             let Some(join) = tx.join_of(conv)? else {
@@ -506,6 +562,24 @@ impl ConversationEngine {
         now: u64,
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
+        // 12.12: Welcomes and GroupInfos whose blobs were being fetched.
+        let waits: Vec<_> = self.welcome_waits.drain().collect();
+        for (conv, (welcome, tree)) in waits {
+            self.public_welcome(cx, me, conv, welcome, tree, out)?;
+        }
+        let waits: Vec<_> = std::mem::take(&mut self.groupinfo_waits);
+        for (purpose, mailbox) in waits {
+            if let RoomPurpose::Check { conv } = &purpose {
+                self.join_inflight.insert(*conv);
+            }
+            let target = self.room_target(me, &mailbox);
+            self.send(
+                out,
+                target,
+                Command::GroupInfo { mailbox },
+                Pending::GroupInfo { purpose },
+            );
+        }
         let joins = self.write(cx, me, out, |tx, c| Ok(tx.joins(c.account)?))?;
         for join in joins {
             if self.join_inflight.contains(&join.conv) {

@@ -1196,9 +1196,7 @@ pub(crate) fn join_welcome(
         let new_key = group
             .own_leaf_node()
             .map(|l| l.signature_key().as_slice().to_vec());
-        let own_device = cx
-            .device_key
-            .map(|k| *k.device_id().as_bytes());
+        let own_device = cx.device_key.map(|k| *k.device_id().as_bytes());
         for leaf in crate::store::conversations::read::leaves(tx.conn(), existing.id)? {
             if leaf.uid == *cx.uid
                 && leaf.device_id == own_device

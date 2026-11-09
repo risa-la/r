@@ -48,7 +48,7 @@ impl Hooks for TestHooks {
         self.confirm
     }
 
-    fn blob(&self, _: AccountId, blob: &BlobRef) -> BlobFetch {
+    fn blob(&self, _: AccountId, _: Option<&str>, blob: &BlobRef) -> BlobFetch {
         match self.blob_mode.load(std::sync::atomic::Ordering::SeqCst) {
             0 => match self.blobs.lock().unwrap().get(blob.hash()) {
                 Some(bytes) => BlobFetch::Ready(bytes.clone()),

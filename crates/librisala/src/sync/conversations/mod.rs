@@ -338,9 +338,11 @@ pub(crate) trait Hooks: Send + Sync {
     /// server's SV4b): it fetches the blob from INFO's `blobs` URL prefix,
     /// and answers [`BlobFetch::Waiting`] until it has it, when the engine
     /// asks again on a later tick. The engine checks the hash itself. It is
-    /// called outside a transaction of the cache.
-    fn blob(&self, account: AccountId, blob: &BlobRef) -> BlobFetch {
-        let _ = (account, blob);
+    /// called outside a transaction of the cache. `prefix` is INFO's
+    /// `blobs` URL prefix (8.5), if the server offers blobs; the blob's URL
+    /// is it followed by [`BlobRef::hex`].
+    fn blob(&self, account: AccountId, prefix: Option<&str>, blob: &BlobRef) -> BlobFetch {
+        let _ = (account, prefix, blob);
         BlobFetch::Unavailable
     }
 }
@@ -642,6 +644,7 @@ enum Pending {
     WelcomeGet {
         conv: ConversationId,
     },
+    ServerInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +715,21 @@ pub struct ConversationEngine {
     branch_warned: HashSet<ConversationId>,
     /// Mailboxes whose next post waits for its blob (12.12).
     blob_waiting: HashSet<BoxName>,
+    /// Mailboxes not to FOLLOW again before a time, after a refusal.
+    follow_backoff: HashMap<BoxName, u64>,
+    /// INFO's `blobs` URL prefix (8.5, 12.12), once INFO has answered.
+    blob_prefix: Option<String>,
+    /// Public rooms' Welcomes whose blobs are being fetched (12.12).
+    welcome_waits:
+        HashMap<ConversationId, (OrBlob<WelcomeText>, OrBlob<risala_proto::mls::RatchetTree>)>,
+    /// GROUPINFO answers whose blobs are being fetched, to ask again.
+    groupinfo_waits: Vec<(RoomPurpose, BoxName)>,
+    /// Whether INFO was sent on a connection that is up.
+    info_asked: bool,
+    /// Whether INFO answered.
+    info_answered: bool,
+    /// Whether a blob-ref came before INFO's `blobs` prefix was known.
+    need_info: std::sync::atomic::AtomicBool,
     /// Welcomes whose blob is being fetched (12.12).
     welcome_blobs: Vec<(risala_proto::names::Id, BlobRef)>,
     /// Devices added again after a refused WELCOME PUT, once each, so
@@ -768,6 +786,13 @@ impl ConversationEngine {
             replacing: HashSet::new(),
             branch_warned: HashSet::new(),
             blob_waiting: HashSet::new(),
+            follow_backoff: HashMap::new(),
+            blob_prefix: None,
+            welcome_waits: HashMap::new(),
+            groupinfo_waits: Vec::new(),
+            info_asked: false,
+            info_answered: false,
+            need_info: std::sync::atomic::AtomicBool::new(false),
             welcome_blobs: Vec::new(),
             readded: HashSet::new(),
             started: false,
@@ -1823,6 +1848,9 @@ impl ConversationEngine {
                     if e.code == ErrorCode::NotFound {
                         tracing::info!(%mailbox, "a mailbox the server does not have");
                     }
+                    // Not again at once: a refused FOLLOW is retried later.
+                    self.follow_backoff
+                        .insert(mailbox, now + self.config.retry_ms.max(1_000));
                 }
                 End::Unparseable(_) => {
                     self.follows.remove(&mailbox);
@@ -2070,6 +2098,17 @@ impl ConversationEngine {
             } => self.on_room_info(job, room, new_group, response, out),
             Pending::GroupInfo { purpose } => self.on_group_info(cx, purpose, response, out)?,
             Pending::JoinPost { conv } => self.on_join_post(conv, response, out),
+            Pending::ServerInfo => match &response.end {
+                End::Ok(ok) => {
+                    self.info_answered = true;
+                    self.blob_prefix = ok.blobs().map(str::to_owned);
+                    if let Ok(Some(retention)) = ok.retention() {
+                        self.config.retention_ms =
+                            u64::from(retention.days()) * 24 * 60 * 60 * 1000;
+                    }
+                }
+                _ => self.info_asked = false,
+            },
             Pending::WelcomeGet { conv } => self.on_welcome_get(cx, conv, response, out)?,
         }
         Ok(())
@@ -2104,7 +2143,7 @@ impl ConversationEngine {
             if row.kind == ConvKind::Public || !row.state.in_group() {
                 return Ok(false);
             }
-            Ok(may_replace(tx, c, &row, &uid)?)
+            may_replace(tx, c, &row, &uid)
         })?;
         if allowed {
             let (_, actions) = self.start(cx, Job::Replace { conv, uid, device });
@@ -2366,6 +2405,22 @@ impl ConversationEngine {
     fn pump(&mut self, cx: &Context, out: &mut Vec<Action>) -> Result<(), EngineError> {
         let me = self.me(cx)?;
         let now = self.now();
+        // 8.5: where blobs are fetched (12.12), and the retention period
+        // that the own identity's stale leaves are judged by (12.7): asked
+        // once, by an identity's device, or by a guest's once a blob-ref
+        // comes.
+        if self.conversing()
+            && !self.info_asked
+            && (!me.guest || self.need_info.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.info_asked = true;
+            self.send(
+                out,
+                Target::Conversing,
+                Command::Info { room: None },
+                Pending::ServerInfo,
+            );
+        }
         // Timers first: what they queue is posted in the same step.
         self.timers_due(cx, &me, now, out)?;
         if self.conversing() {
@@ -2384,6 +2439,15 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let mailboxes = self.write(cx, me, out, |tx, c| Ok(tx.account_mailboxes(c.account)?))?;
+        // A mailbox whose CREATE is in flight does not exist yet.
+        let creating: HashSet<ConversationId> = self
+            .inflight
+            .values()
+            .filter_map(|p| match p {
+                Pending::Create { conv, .. } => Some(*conv),
+                _ => None,
+            })
+            .collect();
         let mut to_follow = Vec::new();
         for mb in &mailboxes {
             if let Some(at) = mb.unfollow_at
@@ -2408,7 +2472,14 @@ impl ConversationEngine {
             if self.follows.contains_key(&mb.mailbox) {
                 continue;
             }
-            if mb.follow_after.is_some_and(|t| t > now) {
+            if mb.follow_after.is_some_and(|t| t > now) || creating.contains(&mb.conv) {
+                continue;
+            }
+            if self
+                .follow_backoff
+                .get(&mb.mailbox)
+                .is_some_and(|t| *t > now)
+            {
                 continue;
             }
             to_follow.push(mb.mailbox);
