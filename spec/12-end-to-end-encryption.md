@@ -1140,6 +1140,15 @@ and the device tells its user to try again later; an Add it owes under
 the rules above it tries again later by itself. During an outage, it
 still adds devices of the chain it holds from an earlier read (4.4).
 
+An identity that left a group (6.1) is not added back by these rules.
+In a direct conversation, a participant who left never is: the
+remaining participant's devices leave too, without a commit (6.1), and
+show the conversation as left by the other participant. Talking again
+starts a new direct conversation (5.1). In a private room, coming back
+takes a new invitation (6.1). A participant whose leaves were removed
+for a check, or replaced after a recovery (4.8), did not leave, and is
+added back as above.
+
 **Replacing stale leaves.** A device that has been offline for longer
 than retention cannot catch up from the server (7.5). Its leaves are
 replaced, so that it gets back in by Welcome. A leaf's **activity time**

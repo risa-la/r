@@ -32,7 +32,9 @@ Devices keep at most one direct conversation for each pair of
 identities on a server, and one conversation with yourself. If they find
 two, for example because both people started one at about the same time,
 they keep the one whose group id is lower, compared byte by byte, and
-leave the other (6.1).
+leave the other (6.1). A direct conversation that either participant
+has left does not count: once one leaves, both sides leave it (6.1),
+and talking again starts a new one.
 
 ### 5.2. Mailboxes and Posts
 

@@ -132,8 +132,26 @@ identity as having left once they have seen both, and do not add its
 devices back meanwhile (12.7). A device whose identity has no other
 leaves in the group sends only the SelfRemove.
 
+From the moment it starts to leave, a device makes no commit in the
+group other than its leave commit: no repairs, no weekly fresh leaf
+(12.7), and no commits of others' proposals. Others' devices make
+those.
+
+Where nobody else would commit its leave, a device leaves **locally**,
+with no commit and no SelfRemove: in a group that has no leaf of another
+identity, such as a room that everyone else has left, and in a direct
+conversation that the other participant has left (below). It stops
+following the mailbox with UNFOLLOW (7.1), and deletes the group's keys
+and the conversation.
+
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
-private room, coming back always takes a new invitation.
+private room, coming back always takes a new invitation. In a direct
+conversation, the other participant's devices leave too, without a
+commit, once they have seen the SelfRemove, and show the conversation
+as left by that participant; talking again starts a new direct
+conversation (5.1, 12.7). Since nobody commits that SelfRemove, the
+leaving device does not wait for a commit there: once it has posted it,
+it forgets the group, as a device that leaves locally does.
 
 **Guests.** When a guest's session ends (4.2), the server sends
 `GONE <box> <uid>` to the connections that follow each public room the
