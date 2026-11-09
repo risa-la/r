@@ -1496,7 +1496,9 @@ pub(crate) fn welcome_refs(welcome: &[u8]) -> Result<Vec<Vec<u8>>> {
 pub(crate) fn period_pseudonym(tx: &mut Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<Pseudonym> {
     let period = risala_mls::epochal::period_of(ts(cx.now));
     if tx.public_state(conv.id)?.pseudonym_period == i64::from(period) {
-        return Ok(Pseudonym(conv.pseudonym));
+        // The stored one, not `conv`'s: leaf confirmation (C3) picks a new
+        // one when the leaf key changes, and `conv` may be older (C5).
+        return Ok(Pseudonym(tx.conversation(conv.id)?.pseudonym));
     }
     let pseudonym = Pseudonym::generate().map_err(|_| EngineError::Random)?;
     tx.set_pseudonym(conv.id, &pseudonym.0, period)?;

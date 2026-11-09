@@ -3094,8 +3094,14 @@ fn next_posts(
             .body
             .clone()
             .ok_or(EngineError::Invalid("a message with no body".into()))?;
-        // 12.10: pending confirmation lines ride in the message.
+        // 12.10: pending confirmation lines ride in the message. In a
+        // public room, the period's pseudonym is settled first, so that
+        // the ATTEST leaf confirmation (C3) writes carries the pseudonym
+        // the message is sent with (7.3; task C5).
         if row.kind == OutboxKind::Message {
+            if public {
+                group::period_pseudonym(tx, c, conv)?;
+            }
             match c.hooks.outgoing(tx, conv, row.id, &body) {
                 super::confirm::Outgoing::Keep => {}
                 super::confirm::Outgoing::Replace(b) => body = b,
