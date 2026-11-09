@@ -987,9 +987,11 @@ async fn keys_put_command(cx: &Cx, after: Option<&BlobRef>, records: &KeysPutRec
         .keys_puts
         .take(network(cx.peer.ip()), limits.keys_puts_per_hour, now)
         .map_err(|retry| err(ErrorCode::RateLimited).with_retry(retry))?;
-    let bytes = match records {
-        KeysPutRecords::Inline(records) => records.decode(),
-        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash).await?.bytes,
+    // A blob's bytes count against `limits.blob_memory` while they are
+    // held, to the end of the command (12.12).
+    let (bytes, _held) = match records {
+        KeysPutRecords::Inline(records) => (records.decode(), None),
+        KeysPutRecords::Blob(hash) => blob_bytes(inner, hash).await?.into_parts(),
     };
     let records = decode(&bytes)?;
     if let Some(slot) = slot {

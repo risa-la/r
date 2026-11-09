@@ -13,8 +13,8 @@
 //!   room's commit that applies external Add proposals: their KeyPackages
 //!   may then get one Welcome each from the committing device, and the
 //!   tree of the new epoch is kept for WELCOME GET (12.6, 12.8).
-//! - [`blob_bytes`]: the identity area for KEYS PUT, reports, and the
-//!   mailbox area, for the bytes of a blob a line names (12.12).
+//! - [`blob_bytes`]: the identity area for KEYS PUT, and [`reserve`] the
+//!   mailbox area, for the bytes of the blobs a line names (12.12).
 //! - [`room_tree_blob`] and [`room_ended`]: the mailbox area, when a public
 //!   room's tree is too long for GROUPINFO's line, so that it is a blob
 //!   kept while it is current (12.12).
@@ -908,10 +908,117 @@ async fn live_blob(
     Ok(record)
 }
 
+/// Room in `limits.blob_memory` for every blob one command reads whole
+/// (12.12), taken at once by [`reserve`], and handed out by
+/// [`read`](Self::read) to the reads.
+///
+/// A command never waits for blob memory while it holds some: one that
+/// held one blob's room while it waited for the next could wait forever
+/// on others doing the same, since the semaphore serves waiters in turn,
+/// and then every blob read on the server would wait too. So a command
+/// learns the sizes of the blobs it names first, and waits once, for
+/// their total.
+#[derive(Debug, Default)]
+pub(crate) struct BlobMemory {
+    /// Each blob found when the room was taken, and its KiB.
+    blobs: Vec<(BlobRef, u32)>,
+    /// The room not yet handed to a read.
+    held: Option<OwnedSemaphorePermit>,
+}
+
+/// Takes room in `limits.blob_memory` for the blobs `blobs` names, each
+/// with at most its `max` bytes, waiting until all of them fit at once.
+/// A blob named twice is read twice, and counts twice.
+///
+/// A blob the server does not hold, or that is too long, takes no room
+/// here: [`BlobMemory::read`] answers for it where the command reads it,
+/// so that the command's checks keep their order. A command whose blobs
+/// add up to more than `limits.blob_memory` gets [`NoBlob::TooLong`]: it
+/// could never fit (12.12 sets no limit for a command's blobs together; a
+/// choice to confirm).
+pub(crate) async fn reserve(
+    inner: &Inner,
+    blobs: impl IntoIterator<Item = (BlobRef, u64)>,
+) -> Result<BlobMemory, NoBlob> {
+    let keys = &inner.keys;
+    let cap = keys.memory_kib.saturating_mul(1024);
+    let mut found = Vec::new();
+    let mut total: u64 = 0;
+    for (hash, max) in blobs {
+        match live_blob(inner, &hash, max.min(cap)).await {
+            Ok(record) => {
+                let kib = record.size.div_ceil(1024).max(1);
+                total = total.saturating_add(kib);
+                found.push((hash, u32::try_from(kib).map_err(|_| NoBlob::TooLong)?));
+            }
+            Err(NoBlob::NotFound | NoBlob::TooLong) => {}
+            Err(NoBlob::Internal) => return Err(NoBlob::Internal),
+        }
+    }
+    if total > keys.memory_kib {
+        return Err(NoBlob::TooLong);
+    }
+    let held = match u32::try_from(total).map_err(|_| NoBlob::TooLong)? {
+        0 => None,
+        kib => Some(
+            keys.memory
+                .clone()
+                .acquire_many_owned(kib)
+                .await
+                .map_err(|_| NoBlob::Internal)?,
+        ),
+    };
+    Ok(BlobMemory { blobs: found, held })
+}
+
+impl BlobMemory {
+    /// The bytes of the blob `hash` that a line names (12.12), if the
+    /// server holds it and it has not expired, and it has at most `max`
+    /// bytes, in the room [`reserve`] took for it. It never waits for
+    /// room: a blob that had none when the room was taken was not held
+    /// then, and is [`NoBlob::NotFound`].
+    pub(crate) async fn read(
+        &mut self,
+        inner: &Inner,
+        hash: &BlobRef,
+        max: u64,
+    ) -> Result<BlobBytes, NoBlob> {
+        let keys = &inner.keys;
+        live_blob(inner, hash, max.min(keys.memory_kib.saturating_mul(1024))).await?;
+        let at = self
+            .blobs
+            .iter()
+            .position(|(h, _)| h == hash)
+            .ok_or(NoBlob::NotFound)?;
+        let (_, kib) = self.blobs.swap_remove(at);
+        let held = self
+            .held
+            .as_mut()
+            .and_then(|held| held.split(kib as usize))
+            .ok_or(NoBlob::Internal)?;
+        match tokio::fs::read(keys.blob_path(hash)).await {
+            Ok(bytes) if BlobRef::of(&bytes) == *hash => Ok(BlobBytes {
+                bytes,
+                held: Some(held),
+            }),
+            Ok(_) => {
+                tracing::error!("keys: the file of blob {hash} does not hold it");
+                Err(NoBlob::Internal)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(NoBlob::NotFound),
+            Err(e) => {
+                tracing::error!("keys: reading blob {hash}: {e}");
+                Err(NoBlob::Internal)
+            }
+        }
+    }
+}
+
 /// The bytes of the blob `hash` that a line names (12.12), if the server
-/// holds it and it has not expired, and it has at most `max` bytes. The
-/// identity area calls this for KEYS PUT, and the mailbox area for a
-/// public room's commits, GroupInfos and trees.
+/// holds it and it has not expired, and it has at most `max` bytes: for a
+/// command that reads one blob whole. The identity area calls this for
+/// KEYS PUT; the mailbox area, which reads more than one, uses
+/// [`reserve`].
 ///
 /// Every caller's blobs share `limits.blob_memory`: a reader waits until
 /// the blob fits beside the others in memory, so that many large blobs
@@ -921,30 +1028,10 @@ pub(crate) async fn blob_bytes(
     hash: &BlobRef,
     max: u64,
 ) -> Result<BlobBytes, NoBlob> {
-    let keys = &inner.keys;
-    let record = live_blob(inner, hash, max.min(keys.memory_kib.saturating_mul(1024))).await?;
-    let kib = u32::try_from(record.size.div_ceil(1024).max(1)).map_err(|_| NoBlob::TooLong)?;
-    let held = keys
-        .memory
-        .clone()
-        .acquire_many_owned(kib)
+    reserve(inner, [(*hash, max)])
+        .await?
+        .read(inner, hash, max)
         .await
-        .map_err(|_| NoBlob::Internal)?;
-    match tokio::fs::read(keys.blob_path(hash)).await {
-        Ok(bytes) if BlobRef::of(&bytes) == *hash => Ok(BlobBytes {
-            bytes,
-            held: Some(held),
-        }),
-        Ok(_) => {
-            tracing::error!("keys: the file of blob {hash} does not hold it");
-            Err(NoBlob::Internal)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(NoBlob::NotFound),
-        Err(e) => {
-            tracing::error!("keys: reading blob {hash}: {e}");
-            Err(NoBlob::Internal)
-        }
-    }
 }
 
 /// The first `n` bytes of the blob `hash` that a line names (12.12), at

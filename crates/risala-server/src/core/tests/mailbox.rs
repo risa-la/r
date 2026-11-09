@@ -2404,3 +2404,108 @@ async fn join_proposals_are_limited_per_address() {
     h.send(&anon, &format!("POST {m} - {more}")).await;
     assert!(anon.lines()[0].ends_with("ERR rate-limited"));
 }
+
+/// A harness whose blobs share 1 MiB of `limits.blob_memory`, with its
+/// clock at the system's time, and its files in `dir`.
+fn small_blob_memory(dir: &tempfile::TempDir) -> Harness {
+    let mut config = config();
+    config.state_dir = dir.path().to_owned();
+    config.limits.blob_memory = 1024 * 1024;
+    let h = Harness::with(config, timers());
+    h.clock.set(Timestamp::now());
+    h
+}
+
+/// `CREATE <box> <group-id> <token-hash> #general <groupinfo> <tree>`,
+/// with mailbox `n`.
+fn create_line(n: u8, groupinfo: &impl std::fmt::Display, tree: &impl std::fmt::Display) -> String {
+    format!(
+        "CREATE {} {} {} #general {groupinfo} {tree}",
+        mailbox(n),
+        GroupId::from_bytes([n; 32]),
+        hash([6; 48])
+    )
+}
+
+/// The blobs one command reads whole take their room in
+/// `limits.blob_memory` at once, so that no command waits for room while
+/// it holds some (12.12): CREATEs that each name a blob as both GroupInfo
+/// and tree, let in together, all finish, and a CREATE whose blobs could
+/// never fit together gets `ERR too-long` rather than waiting forever.
+#[tokio::test]
+async fn blob_memory_is_taken_once_per_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    let all = hold_blob(&h, &vec![1; 1024 * 1024], None);
+    let part = hold_blob(&h, &vec![2; 400 * 1024], None);
+    let most = hold_blob(&h, &vec![3; 600 * 1024], None);
+    let owen = Dev::new("owen@example.org", 1);
+    let mut first = owen.sign_in(&mut h);
+    let mut second = owen.sign_in(&mut h);
+
+    // 600 KiB twice is more than the 1 MiB there is: taking 600 KiB and
+    // then waiting for 600 more would wait forever.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        h.send(&first, &create_line(1, &most, &most)),
+    )
+    .await
+    .expect("blob memory deadlocked");
+    let lines = first.lines();
+    assert_eq!(lines, ["ERR too-long"], "{lines:?}");
+
+    // Everything is held while both CREATEs start; then it is let go at
+    // once. Each takes 800 KiB: had either taken 400 KiB and then waited
+    // for 400 more, both would wait forever.
+    let held = crate::core::keys::blob_bytes(h.inner(), &all, u64::MAX)
+        .await
+        .unwrap();
+    let (one, two) = (create_line(2, &part, &part), create_line(3, &part, &part));
+    let creates = async { tokio::join!(h.send(&first, &one), h.send(&second, &two)) };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(creates, release)
+    })
+    .await
+    .expect("blob memory deadlocked");
+    // Neither is a group, but both were read and checked.
+    for c in [&mut first, &mut second] {
+        let lines = c.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("ERR invalid"), "{lines:?}");
+    }
+    // And the memory is all free again.
+    let again = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::core::keys::blob_bytes(h.inner(), &all, u64::MAX),
+    )
+    .await
+    .expect("blob memory left held");
+    assert!(again.is_ok());
+}
+
+/// A public room's POST takes room for its message's blob and its
+/// GroupInfo's at once (12.12): when they could never fit together, it
+/// gets `ERR too-long`, without holding the message while it waits.
+#[tokio::test]
+async fn public_posts_take_blob_memory_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    let room = create_room(&mut h, 1).await;
+    let message = hold_blob(&h, &vec![7; 600 * 1024], Some(&room.m));
+    let groupinfo = hold_blob(&h, &vec![8; 600 * 1024], Some(&room.m));
+    let mut signed = room.signed;
+    let line = format!(
+        "POST {} {} {message} next={} groupinfo={groupinfo}",
+        room.m,
+        room.owen.token(&room.o),
+        hash([9; 48])
+    );
+    tokio::time::timeout(Duration::from_secs(30), h.send(&signed, &line))
+        .await
+        .expect("blob memory deadlocked");
+    assert_eq!(signed.lines(), ["ERR too-long"]);
+}

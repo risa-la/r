@@ -35,7 +35,7 @@ use risala_proto::error::ErrorCode;
 use risala_proto::mls::{
     GroupId, GroupInfo, MlsMessage, OrBlob, PostToken, Pseudonym, SendToken, TokenHash,
 };
-use risala_proto::names::{BoxName, Seq, Uid};
+use risala_proto::names::{BlobRef, BoxName, Seq, Uid};
 use risala_proto::server::{ErrResponse, OkResponse, Post, ServerLine, ServerMessage};
 use risala_proto::time::Timestamp;
 use risala_proto::types::{DEFAULT_FETCH_LIMIT, MIN_FETCH_LIMIT_CAP, PushTag, Role};
@@ -466,18 +466,43 @@ fn aad_pseudonym(aad: &risala_mls::RisalaAad) -> Option<[u8; 16]> {
 /// The bytes of a public room's message, GroupInfo or tree in a line,
 /// which the server reads whole to check them (12.6): decoded, or read
 /// from its blob in the keys area's store (12.12), up to
-/// `limits.max_room_blob`: `ERR not-found` if the server holds no such
-/// blob, `ERR too-long` past the limit.
+/// `limits.max_room_blob`, in the room `memory` took for it: `ERR
+/// not-found` if the server holds no such blob, `ERR too-long` past the
+/// limit.
 pub(super) async fn line_bytes<T>(
     inner: &Inner,
+    memory: &mut keys::BlobMemory,
     value: &OrBlob<T>,
     decode: impl FnOnce(&T) -> Vec<u8>,
 ) -> Result<keys::BlobBytes, ErrResponse> {
     match value {
         OrBlob::Inline(inline) => Ok(keys::BlobBytes::inline(decode(inline))),
-        OrBlob::Blob(blob) => keys::blob_bytes(inner, blob, inner.config.limits.max_room_blob)
+        OrBlob::Blob(blob) => memory
+            .read(inner, blob, inner.config.limits.max_room_blob)
             .await
             .map_err(no_blob),
+    }
+}
+
+/// Room in `limits.blob_memory` for the values of `values` that are
+/// blobs, which the command then reads with [`line_bytes`]: taken once
+/// for them all, so that the command never waits for room while it holds
+/// some (12.12).
+pub(super) async fn reserve_lines(
+    inner: &Inner,
+    values: impl IntoIterator<Item = Option<BlobRef>>,
+) -> Result<keys::BlobMemory, ErrResponse> {
+    let max = inner.config.limits.max_room_blob;
+    keys::reserve(inner, values.into_iter().flatten().map(|blob| (blob, max)))
+        .await
+        .map_err(no_blob)
+}
+
+/// The blob a line's value names, if it is one.
+pub(super) fn blob_of<T>(value: &OrBlob<T>) -> Option<BlobRef> {
+    match value {
+        OrBlob::Inline(_) => None,
+        OrBlob::Blob(blob) => Some(*blob),
     }
 }
 
@@ -532,28 +557,43 @@ pub(super) fn private_message_stub(prefix: &[u8], size: u64) -> Option<Vec<u8>> 
 /// message. A message in a blob is not read whole otherwise: only its
 /// first bytes, so that POST never holds a large blob for a message it
 /// does not check.
+///
+/// With them, the room in `limits.blob_memory` for every blob the post
+/// reads whole: the message's, and in a public room its GroupInfo's,
+/// which 12.6's checks read after the framing's. Both are taken at once,
+/// so that POST never waits for room while it holds some (12.12).
 async fn post_bytes(
     inner: &Inner,
-    message: &OrBlob<MlsMessage>,
+    post: &PostCommand,
     public_room: bool,
-) -> Result<keys::BlobBytes, ErrResponse> {
-    let OrBlob::Blob(blob) = message else {
-        return line_bytes(inner, message, MlsMessage::decode).await;
+) -> Result<(keys::BlobBytes, keys::BlobMemory), ErrResponse> {
+    let message = &post.message;
+    let groupinfo = post.groupinfo.as_ref().filter(|_| public_room);
+    let framing_only = match message {
+        OrBlob::Inline(inline) => Some(keys::BlobBytes::inline(MlsMessage::decode(inline))),
+        OrBlob::Blob(blob) => {
+            let (prefix, size) = keys::blob_prefix(inner, blob, FRAMING_PREFIX)
+                .await
+                .map_err(no_blob)?;
+            if prefix.len() as u64 == size {
+                Some(keys::BlobBytes::inline(prefix))
+            } else if let Some(stub) = private_message_stub(&prefix, size) {
+                Some(keys::BlobBytes::inline(stub))
+            } else if !public_room {
+                // Not a PrivateMessage, and outside a public room a post is one.
+                return Err(err(ErrorCode::Invalid).with_message("not a PrivateMessage"));
+            } else {
+                None
+            }
+        }
     };
-    let (prefix, size) = keys::blob_prefix(inner, blob, FRAMING_PREFIX)
-        .await
-        .map_err(no_blob)?;
-    if prefix.len() as u64 == size {
-        return Ok(keys::BlobBytes::inline(prefix));
-    }
-    if let Some(stub) = private_message_stub(&prefix, size) {
-        return Ok(keys::BlobBytes::inline(stub));
-    }
-    if !public_room {
-        // Not a PrivateMessage, and outside a public room a post is one.
-        return Err(err(ErrorCode::Invalid).with_message("not a PrivateMessage"));
-    }
-    line_bytes(inner, message, MlsMessage::decode).await
+    let whole = framing_only.is_none().then(|| blob_of(message)).flatten();
+    let mut memory = reserve_lines(inner, [whole, groupinfo.and_then(blob_of)]).await?;
+    let bytes = match framing_only {
+        Some(bytes) => bytes,
+        None => line_bytes(inner, &mut memory, message, MlsMessage::decode).await?,
+    };
+    Ok((bytes, memory))
 }
 
 /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
@@ -597,9 +637,8 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     if blob {
         inner.mailbox.posts.take(cx, limits.posts_per_minute, now)?;
     }
-    let (bytes, _held) = post_bytes(inner, &post.message, public_room)
-        .await?
-        .into_parts();
+    let (bytes, mut memory) = post_bytes(inner, &post, public_room).await?;
+    let (bytes, _held) = bytes.into_parts();
     // 2. The framing.
     let framing = read_framing(&bytes, &record.group_id)?;
     let invalid = |what: &str| Err(err(ErrorCode::Invalid).with_message(what));
@@ -726,7 +765,9 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     // 5. A public room's commits and proposals.
     let room = if public_room && !framing.private {
         let groupinfo = match &post.groupinfo {
-            Some(groupinfo) => Some(line_bytes(inner, groupinfo, GroupInfo::decode).await?),
+            Some(groupinfo) => {
+                Some(line_bytes(inner, &mut memory, groupinfo, GroupInfo::decode).await?)
+            }
             None => None,
         };
         let (groupinfo, _held_info) = match groupinfo.map(keys::BlobBytes::into_parts) {
