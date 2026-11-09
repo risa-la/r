@@ -472,3 +472,14 @@ claims that depend on it.
   stated (Section 14); epochal leaf rotation near midnight and after a
   last-resort KeyPackage (12.3); a mailbox push subscription needs a
   send token (9.1).
+- **draft-03, implementation review** (2026-11-09): an outage fails no
+  key check, and nobody adds an identity whose key file they have never
+  read; a device joining by Welcome checks the leaves already there;
+  repairs and removals go first; devices check their own commits before
+  posting; an external commit removes at most one leaf (12.5, 12.7,
+  12.14); DELETEs and edits from a less trusted leaf wait for it (5.3,
+  5.4, 12.10); a leaving device makes no other commit, a lone device
+  leaves without one, and a direct participant who left is not added
+  back (5.1, 6.1, 12.7); a storage cap that spares posts (7.5); push
+  URLs without userinfo, and hosts compared one way (9.1); limits per
+  network address, and slow transfers (10.6, Section 14).
