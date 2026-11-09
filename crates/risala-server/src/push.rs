@@ -470,10 +470,23 @@ fn parse_status(head: &[u8]) -> Result<u16, SendError> {
     code.parse().map_err(|_| bad())
 }
 
+/// The host and port a push URL leads to, `<host> <port>`, for the limit
+/// on pushes per host (9.1): the name in lower case without a trailing
+/// dot, or the address, an IPv6 one in its usual form, and the port, 443
+/// if the URL names none. So `HTTPS://Push.Example.:443/a` and
+/// `https://push.example/b` share a host. A URL with user info, or one
+/// that names no usable host or port, is an error: PUSH ADD refuses it
+/// with `ERR bad-syntax`.
+pub fn push_host(url: &str) -> Result<String, SendError> {
+    let url = ParsedUrl::parse(url)?;
+    Ok(format!("{} {}", url.host, url.port))
+}
+
 /// The parts of a push URL a request needs.
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedUrl {
-    /// The host, without brackets: a name in lower case, or an address.
+    /// The host, without brackets: a name in lower case without a
+    /// trailing dot, or an address, an IPv6 one in its usual form.
     host: String,
     /// The port, 443 unless the URL names one.
     port: u16,
@@ -497,18 +510,22 @@ impl ParsedUrl {
         }
         let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
             let (addr, after) = v6.split_once(']').ok_or(SendError::Url("bad IPv6"))?;
-            addr.parse::<std::net::Ipv6Addr>()
+            let addr = addr
+                .parse::<std::net::Ipv6Addr>()
                 .map_err(|_| SendError::Url("bad IPv6"))?;
             let port = match after {
                 "" => None,
                 p => Some(p.strip_prefix(':').ok_or(SendError::Url("bad port"))?),
             };
-            (addr.to_owned(), port)
+            (addr.to_string(), port)
         } else {
-            match authority.split_once(':') {
-                Some((host, port)) => (host.to_ascii_lowercase(), Some(port)),
-                None => (authority.to_ascii_lowercase(), None),
-            }
+            let (host, port) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            // `push.example.` is `push.example` (9.1).
+            let host = host.strip_suffix('.').unwrap_or(host);
+            (host.to_ascii_lowercase(), port)
         };
         if host.is_empty() {
             return Err(SendError::Url("no host"));
@@ -654,14 +671,49 @@ mod tests {
         assert_eq!((p.host.as_str(), p.port), ("::1", 9));
         let p = ParsedUrl::parse("https://push.example").unwrap();
         assert_eq!((p.port, p.path.as_str()), (443, "/"));
+        let p = ParsedUrl::parse("https://Push.Example./x").unwrap();
+        assert_eq!((p.host.as_str(), p.authority.as_str()), ("push.example", "Push.Example."));
         for bad in [
             "http://push.example/",
             "https://user@push.example/",
             "https://push.example:0/",
             "https://push.example:x/",
             "https:///x",
+            "https://./x",
         ] {
             assert!(ParsedUrl::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Pushes to one host count together, however its URLs write it
+    /// (9.1).
+    #[test]
+    fn push_hosts() {
+        let host = |url: &str| push_host(url).unwrap();
+        for same in [
+            "https://victim.example/a",
+            "HTTPS://victim.example/b",
+            "https://VICTIM.example/c?x",
+            "https://victim.example:443/d",
+            "https://victim.example./e",
+            "https://Victim.Example.:443",
+            "https://victim.example#f",
+        ] {
+            assert_eq!(host(same), "victim.example 443", "{same}");
+        }
+        assert_eq!(host("https://victim.example:8443/"), "victim.example 8443");
+        assert_eq!(host("https://[2001:DB8:0::1]/"), "2001:db8::1 443");
+        assert_eq!(host("https://[2001:db8::1]:443/"), "2001:db8::1 443");
+        assert_eq!(host("https://192.0.2.1:443/"), "192.0.2.1 443");
+        for bad in [
+            "https://user@victim.example/",
+            "https://user:pass@victim.example/",
+            "https://@victim.example/",
+            "https://victim.example:0/",
+            "https://victim.example:0443/",
+            "https://[2001:db8::1/",
+        ] {
+            assert!(push_host(bad).is_err(), "{bad}");
         }
     }
 

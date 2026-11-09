@@ -96,12 +96,12 @@ pub(crate) struct State {
 /// The window of the limit on pushes per host.
 const HOST_WINDOW: Duration = Duration::from_secs(1);
 
-/// The host and port of a push URL, `https://<host>[:<port>]/...`, in lower
-/// case: pushes to it count together, whatever their paths (9.1).
+/// The host and port of a push URL, however the URL writes them
+/// ([`crate::push::push_host`]): pushes to it count together, whatever
+/// their paths (9.1). PUSH ADD refuses URLs it cannot parse, so the raw
+/// text stands in only for one stored before that.
 fn url_host(url: &str) -> String {
-    let rest = url.strip_prefix("https://").unwrap_or(url);
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    rest[..end].to_ascii_lowercase()
+    crate::push::push_host(url).unwrap_or_else(|_| url.to_ascii_lowercase())
 }
 
 /// What the pusher remembers between pushes.
@@ -183,6 +183,17 @@ pub(super) async fn handle(cx: &Cx, command: PushCommand) -> Reply {
             auth,
             permit,
         } => {
+            // A URL with user info would get around the limit per host:
+            // `https://a@victim/` is `victim` (9.1). One with no usable
+            // host or port could never be pushed to.
+            if let Err(e) = crate::push::push_host(url.as_str()) {
+                let why = match e {
+                    crate::push::SendError::Url(why) => why,
+                    _ => "not a usable push URL",
+                };
+                tracing::debug!("PUSH ADD refused: {why}");
+                return Err(err(ErrorCode::BadSyntax).with_message(why));
+            }
             if !crate::push::valid_key(&key) {
                 return Err(err(ErrorCode::Invalid).with_message("not a P-256 public key"));
             }

@@ -1160,9 +1160,11 @@ async fn reports_of_blob_posts() {
     assert_eq!(kept(&h), 0);
 }
 
-/// Pushes to one host count together, whatever their paths, and one
-/// network address may add only so many mailbox subscriptions an hour
-/// (9.1). A mailbox subscription's expiry is kept to the day (4.2).
+/// Pushes to one host count together, whatever their paths and however
+/// their URLs write the host (lower case, port 443 or none, a trailing
+/// dot), a URL with user info is refused, and one network address may add
+/// only so many mailbox subscriptions an hour (9.1). A mailbox
+/// subscription's expiry is kept to the day (4.2).
 #[tokio::test]
 async fn pushes_are_limited_per_host_and_adds_per_address() {
     let mut config = config();
@@ -1180,9 +1182,21 @@ async fn pushes_are_limited_per_host_and_adds_per_address() {
         )
     };
     let mut anon = h.anon().await;
-    for i in 0..5 {
-        h.send(&anon, &add(&format!("https://victim.example/p/{i}")))
-            .await;
+    for url in [
+        "https://user@victim.example/p/0",
+        "https://a:b@victim.example/p/0",
+    ] {
+        h.send(&anon, &add(url)).await;
+        assert_eq!(anon.lines(), ["ERR bad-syntax user info"]);
+    }
+    for url in [
+        "https://victim.example/p/0",
+        "HTTPS://Victim.Example/p/1",
+        "https://victim.example:443/p/2",
+        "https://victim.example./p/3",
+        "https://VICTIM.EXAMPLE.:443/p/4",
+    ] {
+        h.send(&anon, &add(url)).await;
         assert_eq!(anon.lines(), ["OK"]);
     }
     // The address has added its five this hour, on any connection.
