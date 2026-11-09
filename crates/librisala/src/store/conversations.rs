@@ -124,6 +124,16 @@ CREATE TABLE leaves (
     PRIMARY KEY (conv, leaf)
 ) WITHOUT ROWID;
 
+-- Identities that left a group (6.1): a leaf of theirs that had posted a
+-- SelfRemove was removed, and they kept no leaf. Nobody adds their
+-- devices back by themselves (12.7); the row goes once they have a leaf
+-- again, by an invitation.
+CREATE TABLE departed (
+    conv INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    uid  TEXT NOT NULL,
+    PRIMARY KEY (conv, uid)
+) WITHOUT ROWID;
+
 -- What the group checks need of each group's current epoch (12.3,
 -- 12.7): risala-mls's EpochState, as JSON.
 CREATE TABLE group_state (
@@ -793,6 +803,21 @@ pub(crate) mod read {
         )
     }
 
+    pub fn departed(
+        conn: &rusqlite::Connection,
+        conv: ConversationId,
+        uid: &Uid,
+    ) -> Result<bool, StoreError> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM departed WHERE conv = ?1 AND uid = ?2",
+                params![conv.0, uid.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub fn leaf(
         conn: &rusqlite::Connection,
         conv: ConversationId,
@@ -1328,10 +1353,35 @@ impl Tx<'_> {
                 )?;
             }
         }
+        // 6.1: an identity whose leaf that posted a SelfRemove is gone, and
+        // that keeps no leaf, has left; one with a leaf is back.
+        for o in old.iter().filter(|o| o.self_removed) {
+            let kept = tree
+                .iter()
+                .any(|l| l.leaf == o.leaf && l.uid == o.uid && l.device_id == o.device_id);
+            if !kept && !tree.iter().any(|l| l.uid == o.uid) {
+                self.conn().execute(
+                    "INSERT OR IGNORE INTO departed (conv, uid) VALUES (?1, ?2)",
+                    params![conv.0, o.uid.as_str()],
+                )?;
+            }
+        }
+        for leaf in tree {
+            self.conn().execute(
+                "DELETE FROM departed WHERE conv = ?1 AND uid = ?2",
+                params![conv.0, leaf.uid.as_str()],
+            )?;
+        }
         if changed {
             self.changed(Change::Conversation(ConversationChange::Members(conv)));
         }
         Ok(changed)
+    }
+
+    /// Whether `uid` left the conversation (6.1), and has no leaf there
+    /// since.
+    pub(crate) fn departed(&self, conv: ConversationId, uid: &Uid) -> Result<bool, StoreError> {
+        read::departed(self.conn(), conv, uid)
     }
 
     /// One leaf.
@@ -1829,6 +1879,12 @@ impl Store {
     /// A conversation's leaves.
     pub fn leaf_rows(&self, id: ConversationId) -> Result<Vec<LeafRow>, StoreError> {
         self.read(|conn| read::leaves(conn, id))
+    }
+
+    /// Whether `uid` left the conversation (6.1), and has no leaf there
+    /// since.
+    pub fn departed(&self, conv: ConversationId, uid: &Uid) -> Result<bool, StoreError> {
+        self.read(|conn| read::departed(conn, conv, uid))
     }
 
     /// The account's blocks (5.7).

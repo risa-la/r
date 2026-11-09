@@ -42,6 +42,7 @@ fn a_new_cache_has_version_1_and_every_area() {
             "contacts",
             "conversations",
             "deletes",
+            "departed",
             "devices",
             "engine_timers",
             "epoch_ends",
