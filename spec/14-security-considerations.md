@@ -453,6 +453,13 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   key file or log differently can also disagree about such a removal,
   and one may add the identity back while another removes it again
   (12.7), which each device shows.
+  An outage is different: it fails no check, however long it lasts
+  (12.7), so nobody who can block a key file gets a leaf removed by it.
+  But for as long as it lasts, nobody who has never read the file can
+  add the identity, and a device that cannot check a leaf just added
+  sends no messages in that group, and warns after 2 hours. So whoever
+  can block a key file can stall a conversation, visibly, but not take
+  anyone out of it.
 
 - **Losing every leaf in a private room.** In a direct conversation,
   either participant's devices add the other's. In a private room, an

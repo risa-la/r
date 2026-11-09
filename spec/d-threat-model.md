@@ -82,11 +82,15 @@ that hosts an identity.
   another host, which only safety numbers catch (Section 14). Sign in as
   the identity on servers that have not seen it before, and use its
   account there. Stop the identity from signing in to servers that have
-  no cached key file.
+  no cached key file. By an outage, keep devices that have never read
+  the key file from adding the identity, and devices that cannot check
+  a newly added device from sending in that group, for as long as it
+  lasts (12.7).
 - Cannot: change the keys of an identity that a device already knows
   unseen: a new chain is a new master key, a fork or a rollback, and
   devices stop trusting it until their users act (4.5, 12.14). Add a
-  device unseen by the identity's own devices. Make anyone remove the
+  device unseen by the identity's own devices. Get a leaf removed by an
+  outage, which fails no check (12.7). Make anyone remove the
   identity from a direct conversation for good, which takes a `retire`
   record (4.9). Sign a record of an existing chain without its keys.
 

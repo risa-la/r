@@ -384,6 +384,13 @@ and a time is within it:
   that carries the commit (5.2), give or take an hour, never against
   their own clocks (12.6, 12.7). So every device reaches the same
   answer, however late it processes the commit.
+- When a device makes such a commit, it does not know its post's `t`
+  yet. It checks the lifetime against its own clock at the time it
+  posts, with the hour taken inward: a time at least an hour after
+  `not_before` and at least an hour before `not_after`. So the commit
+  passes wherever the server's `t` falls within an hour of the device's
+  clock. A KeyPackage that fails, it leaves out, and fetches the
+  device's KeyPackage again (12.7).
 
 A leaf keeps its KeyPackage's lifetime until its device commits a fresh
 leaf (12.7), which has none [RFC9420]. So the lifetime can end while the
@@ -608,6 +615,13 @@ Leaves that the device cannot confirm yet are allowed: they stay
 unverified until it does (12.10). A device ignores a Welcome from a
 group in which someone the user has blocked has a leaf (5.7).
 
+Outside public rooms, a device that joins by Welcome then makes the
+Adds key check (below) on every leaf of another device already in the
+group, as if the commit that welcomed it had added each one, and sends
+no messages in the group until each passes. One that fails it repairs
+as an add that failed (below). Otherwise a leaf planted before the
+device joined would be checked only when it sends (12.10).
+
 **A guest's report conversation** (5.8) is a direct conversation whose
 participants are a guest uid and an identity. The guest's device
 creates it, with its throwaway leaf as the only leaf of the guest, and
@@ -652,6 +666,13 @@ Every time window of the group checks therefore runs on the server's
 `t`, which a server could set to suit a member (Section 14). Devices
 SHOULD warn their user when the `t` of a commit that reaches them as it
 is posted (5.2) differs from their own clock by more than an hour.
+
+A device MUST run the group checks on its own commit before it posts
+it, as every other member will, and MUST NOT post one that fails. Since
+its post's `t` is not known yet, it checks time windows against its own
+clock at the time it posts, and KeyPackage lifetimes with the hour
+taken inward (12.5). A commit rebuilt later, for example after another
+commit won the epoch, is checked again.
 
 Below, an identity **has a leaf** if the group keeps a leaf of it after
 the commit, and n is the number of leaves before the commit. The group
@@ -826,14 +847,22 @@ record in a log, stays true once it is true, so devices that fetch later
 reach the same answer. But a record that is still pending 2 hours after
 the device first needed it counts as failed: a log must witness a record
 within an hour (4.5), and otherwise whoever controls a log could keep a
-group waiting for ever. Until a check passes or fails:
+group waiting for ever. An outage (4.4) never fails a check, however
+long it lasts: anyone on the network path can cause one, and a check
+that failed for it would let them have honest leaves removed. Until a
+check passes or fails:
 
 - **A removal it could not check** stands, and the device warns the user
   that a leaf was removed for a reason it could not check. Removing a
   leaf never lets anyone new read.
 - **A leaf added by a commit it could not check** is unconfirmed, and
-  the device sends nothing in the group while it is, since that leaf
-  would read it.
+  the device sends no messages in the group while it is, since that
+  leaf would read it.
+- **A committer it could not check** counts as checked as far as the
+  records the device has accepted go: the device acts on its commits
+  and lines unless one of those records removed its device.
+- **During an outage,** the device warns its user once a check has
+  waited 2 hours, and removes nothing for it.
 
 When a key check fails, the device warns the user, and, after a random
 wait of up to 10 minutes, unless another device has done so first,
@@ -860,6 +889,12 @@ do not, as for a plain member's device and a leaf of an owner, it warns
 its user, hides what the leaf sends, as for an identity it cannot check
 (12.14), and keeps sending; the leaf's own identity, or an owner or
 moderator as the Removes checks allow, makes the repair.
+
+Repairs, and removals of leaves removed by record or for a check, go
+before any other commit the device has queued for the group, and the
+device never holds them back, for a key check or anything else: a
+removal never lets anyone new read. A commit it was holding back it
+builds again after them, and checks again (above).
 
 **Leaves that use authority.** Whoever adds a device builds its leaf
 from the device's KeyPackage, and the device binding does not cover the
@@ -1097,6 +1132,13 @@ once seen removed by record, and none while the identity is stale (4.5),
 forked (4.5) or its keys are missing (4.4), or while the identity has a
 SelfRemove in the group that no commit has applied yet (6.1). In a
 public room, devices join by themselves (6.1), and nobody adds them.
+
+A device MUST NOT add an identity whose key file it has never read. If
+it cannot read it, for example during an outage (4.4), starting a direct
+conversation with that identity or inviting it to a private room fails,
+and the device tells its user to try again later; an Add it owes under
+the rules above it tries again later by itself. During an outage, it
+still adds devices of the chain it holds from an earlier read (4.4).
 
 **Replacing stale leaves.** A device that has been offline for longer
 than retention cannot catch up from the server (7.5). Its leaves are
@@ -2159,7 +2201,9 @@ A device does not take the server's word for which keys belong to whom:
   removed by record, and adds devices that have none, where the Adds
   checks of 12.7 let it. In a public
   room, devices join by themselves (6.1), and their leaves carry no
-  device binding to check (12.10). An outage changes nothing.
+  device binding to check (12.10). An outage changes nothing: the
+  device goes on with the chain it holds, never fails a check for it,
+  and never adds an identity whose key file it has never read (12.7).
 - An identity other than the device's own whose keys are missing
   (4.4), or that is forked (4.5), is one the device cannot check. Until
   a valid key file is back, or the user resolves the fork, the device
