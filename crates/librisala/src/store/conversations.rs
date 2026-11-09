@@ -1378,6 +1378,20 @@ impl Tx<'_> {
         Ok(changed)
     }
 
+    /// Notes that `uid` left the conversation (6.1): in a direct
+    /// conversation, its SelfRemove, which nobody commits there.
+    pub(crate) fn mark_departed(
+        &mut self,
+        conv: ConversationId,
+        uid: &Uid,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO departed (conv, uid) VALUES (?1, ?2)",
+            params![conv.0, uid.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// Whether `uid` left the conversation (6.1), and has no leaf there
     /// since.
     pub(crate) fn departed(&self, conv: ConversationId, uid: &Uid) -> Result<bool, StoreError> {

@@ -174,7 +174,18 @@ fn pending_proposals_are_committed_after_a_restart() {
     let bob = net.device("bob", "bob@example.net");
     net.connect(alice);
     net.connect(bob);
-    let (a, b) = direct(&mut net, alice, bob);
+    // A room: in a direct conversation nobody commits a SelfRemove (6.1).
+    let a = net
+        .job(
+            alice,
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec![net.devices[bob].uid.clone()],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, alice, a).unwrap();
     let now = net.clock.now().unix_millis();
     net.write(bob, |tx| {
         tx.set_state(b, ConvState::Leaving)?;

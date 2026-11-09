@@ -288,13 +288,16 @@ fn leaving_with_self_remove() {
     let conv = net
         .job(
             a,
-            Job::Direct {
-                peer: "bob@example.net".parse().unwrap(),
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec!["bob@example.net".parse().unwrap()],
             },
         )
         .unwrap();
+    net.tick();
     let cb = net.same_conv(b, a, conv).unwrap();
-    // Bob leaves: a SelfRemove, which alice commits (6.1).
+    // Bob leaves the room: a SelfRemove, which alice commits (6.1). (In a
+    // direct conversation nobody commits it: both sides leave locally.)
     let now = net.clock.now().unix_millis();
     net.write(b, |tx| {
         tx.set_state(cb, ConvState::Leaving)?;
@@ -780,41 +783,24 @@ fn an_identity_that_left_is_not_added_back() {
     let cb = net.same_conv(b, a1, conv).unwrap();
     assert_eq!(net.leaves(b, cb).len(), 3);
 
-    // Bob is away: nobody commits alice's SelfRemove yet. Alice's first
-    // device leaves: a commit that removes her other device, then a
-    // SelfRemove (6.1).
+    // Bob is away. Alice's first device leaves: a commit that removes her
+    // other device, then a SelfRemove, which nobody commits in a direct
+    // conversation: the device forgets the group once it has posted it
+    // (6.1).
     net.disconnect(b);
     let now = net.clock.now().unix_millis();
     net.write(a1, |tx| group::leave(tx, conv, &alice, now));
     net.tick();
-    assert_eq!(net.state(a1, conv), ConvState::Leaving);
-    assert_eq!(net.state(a2, c2), ConvState::Left);
-    // While it is leaving, the device adds nobody: not its identity's
-    // other device back, by any job.
-    let device = net.devices[a2].device_id.as_slice().try_into().unwrap();
-    for job in [
-        Job::Invite {
-            conv,
-            uids: vec![alice.clone()],
-        },
-        Job::Replace {
-            conv,
-            uid: alice.clone(),
-            device,
-        },
-    ] {
-        assert!(net.job(a1, job).is_err());
-    }
     net.advance(60_000);
+    assert_eq!(net.state(a1, conv), ConvState::Left);
     assert_eq!(net.state(a2, c2), ConvState::Left);
 
-    // Bob commits the SelfRemove: alice has left, and his device does not
-    // add her devices back (6.1, 12.7).
+    // Bob's device sees the SelfRemove: Alice has left, and Bob's side
+    // leaves too, by itself; nobody adds her devices back (5.1, 6.1, 12.7).
     net.connect(b);
     net.advance(60_000);
     net.advance(60_000);
-    assert_eq!(net.state(a1, conv), ConvState::Left);
-    assert_eq!(net.leaves(b, cb), vec!["bob@example.net".to_owned()]);
+    assert_eq!(net.state(b, cb), ConvState::Left);
     assert!(net.devices[b].store.departed(cb, &alice).unwrap());
     let replace = net.write(b, |tx| {
         let row = tx.conversation(cb)?;

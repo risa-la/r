@@ -652,11 +652,30 @@ pub(crate) fn commit_lost(
 pub(crate) struct Applied {
     /// Things to tell the engine.
     pub notes: Vec<Note>,
+    /// The commit left this device with no other identity in the group, as
+    /// it leaves or once a direct conversation's peer has left: it forgets
+    /// the group ([`leave_locally`], 6.1) once the commit is applied.
+    pub leave_locally: bool,
 }
 
 /// Applies one post of a mailbox, the next after its sync point (7.2,
 /// 7.4, 12.9).
 pub(crate) fn apply_post(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: &ConvRow,
+    mailbox: &MailboxRow,
+    post: &PostRow,
+) -> Result<Applied> {
+    let mut applied = apply_one(tx, cx, conv, mailbox, post)?;
+    if applied.leave_locally {
+        leave_locally(tx, conv.id)?;
+        applied.notes.push(Note::Removed { conv: conv.id });
+    }
+    Ok(applied)
+}
+
+fn apply_one(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
@@ -757,6 +776,16 @@ pub(crate) fn apply_post(
                 tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
                 if let Some(id) = row.message_id {
                     tx.message_posted(conv.id, &id, post.seq, post_epoch, post.t)?;
+                }
+                // 6.1: in a direct conversation nobody commits the
+                // SelfRemove; the other participant's devices leave once
+                // they see it, and so does this one, once it is posted in
+                // the epoch the device holds.
+                if row.kind == OutboxKind::Proposal
+                    && conv.kind == ConvKind::Direct
+                    && post_epoch == epoch
+                {
+                    applied.leave_locally = true;
                 }
             }
             // Merged when it was made; the server took it (12.7).
@@ -952,6 +981,18 @@ pub(crate) fn apply_post(
                         ProposalKind::SelfRemove => {
                             if let Some(sender) = sender {
                                 tx.mark_self_removed(conv.id, sender.u32())?;
+                                // 5.1, 6.1: the other participant leaves a
+                                // direct conversation; nobody commits that,
+                                // and this side leaves too, by itself.
+                                if conv.kind == ConvKind::Direct
+                                    && let Some(peer) = &conv.peer
+                                    && tx
+                                        .leaf(conv.id, sender.u32())?
+                                        .is_some_and(|l| l.uid == *peer)
+                                {
+                                    tx.mark_departed(conv.id, peer)?;
+                                    applied.leave_locally = true;
+                                }
                             }
                             let mut log = MessageLog::new(tx.conn(), conv.id);
                             mls_message::note_self_removes(&group, &mut log);
@@ -1104,7 +1145,18 @@ fn after_commit(
     if conv.state == ConvState::Creating {
         tx.set_state(conv.id, ConvState::Active)?;
     }
-    if conv.state == ConvState::Leaving {
+    // 5.1, 6.1: once a direct conversation's peer has left, nobody adds it
+    // back, so this side leaves too, by itself: talking again starts a new
+    // conversation. A peer removed for a check, or after a recovery, has
+    // not left, and is added back (12.7). A device that is leaving, and
+    // finds nobody else left to commit its SelfRemove, does the same.
+    let peer_left = match (&conv.kind, &conv.peer) {
+        (ConvKind::Direct, Some(peer)) => tx.departed(conv.id, peer)?,
+        _ => false,
+    };
+    if (peer_left || conv.state == ConvState::Leaving) && lone(tx, conv.id, cx.uid)? {
+        applied.leave_locally = true;
+    } else if conv.state == ConvState::Leaving {
         // 6.1: a commit that added a device of the identity meanwhile does
         // not keep it in: its leaf is removed before the SelfRemove, as
         // when the user left.
@@ -1140,11 +1192,21 @@ fn after_commit(
 
 /// Leaves a conversation (6.1): a commit that removes this identity's
 /// other leaves, if it has any, followed by a SelfRemove once it wins;
-/// otherwise the SelfRemove alone.
-pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<()> {
+/// otherwise the SelfRemove alone. In a direct conversation nobody commits
+/// that SelfRemove: the device forgets the group once it has posted it.
+/// Where no other identity has a leaf, nobody would commit the leave: the
+/// device leaves locally at once ([`leave_locally`]), with no commit and
+/// no SelfRemove. Returns whether it has left already.
+pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<bool> {
     let row = tx.conversation(conv)?;
     if !row.state.in_group() || leaving(tx, conv)? {
-        return Ok(());
+        return Ok(false);
+    }
+    // 6.1: where no other identity has a leaf, nobody would commit the
+    // leave: the device leaves locally, with no commit and no SelfRemove.
+    if lone(tx, conv, own)? {
+        leave_locally(tx, conv)?;
+        return Ok(true);
     }
     let own_leaves: Vec<(String, Option<[u8; 48]>)> =
         crate::store::conversations::read::leaves(tx.conn(), conv)?
@@ -1168,7 +1230,7 @@ pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) 
         tx.set_state(conv, ConvState::Leaving)?;
         queue_self_remove(tx, conv, now)?;
     }
-    Ok(())
+    Ok(false)
 }
 
 /// 5.1: devices keep one direct conversation per pair of identities. If
@@ -1200,7 +1262,8 @@ pub(crate) fn keep_one_direct(
 
 /// The direct conversation with `peer` that this device is in, other than
 /// `except` (5.1). One that `peer` has left does not count: nobody adds
-/// its devices back (6.1, 12.7), so it starts a new one to talk again.
+/// its devices back (6.1, 12.7), and this side leaves it too, by itself
+/// (`after_commit`), so a new one is started to talk again.
 pub(crate) fn direct_with(
     tx: &Tx<'_>,
     account: crate::store::AccountId,
@@ -1298,8 +1361,13 @@ fn own_commit_won(
         }
     }
     if intent.then == Then::SelfRemove {
-        tx.set_state(conv.id, ConvState::Leaving)?;
-        queue_self_remove(tx, conv.id, cx.now)?;
+        if lone(tx, conv.id, cx.uid)? {
+            // 6.1: nobody else to commit the SelfRemove.
+            applied.leave_locally = true;
+        } else {
+            tx.set_state(conv.id, ConvState::Leaving)?;
+            queue_self_remove(tx, conv.id, cx.now)?;
+        }
     }
     applied.notes.push(Note::Won);
     Ok(())

@@ -2585,6 +2585,25 @@ impl ConversationEngine {
                 _ => None,
             })
             .collect();
+        // 6.1: the mailboxes of a conversation the device is no longer in,
+        // removed or left by itself, are not followed any more.
+        let gone: Vec<BoxName> = self
+            .follows
+            .iter()
+            .filter(|(b, f)| {
+                matches!(f, Follow::Following { .. }) && !mailboxes.iter().any(|m| m.mailbox == **b)
+            })
+            .map(|(b, _)| *b)
+            .collect();
+        for mailbox in gone {
+            self.follows.remove(&mailbox);
+            self.send(
+                out,
+                Target::Mailbox(mailbox),
+                Command::Unfollow { mailbox },
+                Pending::Unfollow,
+            );
+        }
         let mut to_follow = Vec::new();
         for mb in &mailboxes {
             if let Some(at) = mb.unfollow_at
@@ -2991,7 +3010,7 @@ impl ConversationEngine {
                 // commits its SelfRemove (6.1).
                 if !queued
                     && group.pending_proposals().next().is_some()
-                    && row.state != ConvState::Leaving
+                    && !group::leaving(tx, conv)?
                 {
                     group::queue_intent(
                         tx,
@@ -3053,7 +3072,11 @@ impl ConversationEngine {
             let refresh_after = self.config.refresh_after_ms;
             self.write(cx, me, out, |tx, c| {
                 for row in tx.conversations_of(c.account)? {
-                    if row.state != ConvState::Active || !tx.pending_outbox(row.id)?.is_empty() {
+                    // 6.1: none in a conversation the device is leaving.
+                    if row.state != ConvState::Active
+                        || !tx.pending_outbox(row.id)?.is_empty()
+                        || group::leaving(tx, row.id)?
+                    {
                         continue;
                     }
                     let Ok(group) = group::load(tx, c, &row.group_id) else {

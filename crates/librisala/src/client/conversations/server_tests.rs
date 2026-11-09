@@ -448,9 +448,10 @@ fn in_group(d: &Device, other: &Device, conv: ConversationId) -> bool {
 
 /// 6.1, 12.7: an identity of two devices leaves a direct conversation and
 /// a private room. While the leaving device waits for its SelfRemove to be
-/// committed, its upkeep does not add its other device back; once Bob's
-/// device has committed it, Bob's upkeep does not add Alice's devices
-/// back to the direct conversation either.
+/// committed in the room, its upkeep does not add its other device back;
+/// once Bob's device has committed it, Bob's upkeep does not add Alice's
+/// devices back. In the direct conversation nobody commits the SelfRemove:
+/// both sides leave it, and Bob's shows it as left by Alice (5.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_identity_that_leaves_stays_out_against_risalad() {
     use crate::store::conversations::ConvState;
@@ -524,8 +525,10 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
     })
     .await;
 
-    // Bob is away, so nobody commits the SelfRemoves yet: the laptop's
-    // commits remove the phone, and the laptop waits, leaving.
+    // Bob is away, so nobody commits the room's SelfRemove yet: the
+    // laptop's commits remove the phone, and the laptop waits, leaving the
+    // room. In the direct conversation nobody commits it at all: the
+    // laptop forgets the group once it has posted it (6.1).
     bob.client.disconnect(bob.account).await.unwrap();
     laptop.client.leave(direct).await.unwrap();
     laptop.client.leave(room).await.unwrap();
@@ -542,7 +545,7 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
     until("the phone is out of both, and the laptop leaving", || {
         !in_group(&phone, &laptop, direct)
             && !in_group(&phone, &laptop, room)
-            && leaving(direct)
+            && !in_group(&laptop, &laptop, direct)
             && leaving(room)
     })
     .await;
@@ -558,7 +561,7 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
             .any(|o| o.kind == crate::store::messages::OutboxKind::Commit)
     };
     let committing = |c| committing_on(&laptop, c);
-    until("the laptop has no commit pending", || !committing(direct)).await;
+    until("the laptop has no commit pending", || !committing(room)).await;
     for _ in 0..3 {
         laptop.client.maintain(laptop.account).await.unwrap();
         phone.client.maintain(phone.account).await.unwrap();
@@ -567,7 +570,7 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!in_group(&phone, &laptop, direct), "the phone came back");
     assert!(!in_group(&phone, &laptop, room), "the phone came back");
-    assert!(leaving(direct) && leaving(room));
+    assert!(!in_group(&laptop, &laptop, direct) && leaving(room));
     // Nor did it queue a commit to add it: made after its SelfRemove, MLS
     // refuses it, and it would hold the SelfRemove back for good. And 7.8:
     // a leaving device makes no move; the move follows the commit of its
@@ -576,17 +579,25 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
         assert!(!committing(c), "a leaving device queued a commit");
     }
 
-    // Bob's device comes back and commits the SelfRemoves: Alice has left
-    // both, and stays out.
+    // Bob's device comes back: it commits the room's SelfRemove, and
+    // leaves the direct conversation by itself, as Alice did. Alice has
+    // left both, and stays out.
     connect(&bob, &bob_id).await;
-    until("bob committed both SelfRemoves", || {
-        leaves(&bob, b) == 1
-            && leaves(&bob, br) == 1
-            && !in_group(&laptop, &laptop, direct)
-            && !in_group(&laptop, &laptop, room)
-    })
+    let bob_in = |c| {
+        bob.client
+            .store()
+            .conversation_row(c)
+            .unwrap()
+            .unwrap()
+            .state
+            .in_group()
+    };
+    until(
+        "bob committed the room's SelfRemove, and left the other",
+        || !bob_in(b) && leaves(&bob, br) == 1 && !in_group(&laptop, &laptop, room),
+    )
     .await;
-    // Bob's device moves both groups (7.8); its upkeep then runs.
+    // Bob's device moves the room (7.8); its upkeep then runs.
     until("bob has no commit pending", || {
         !committing_on(&bob, b) && !committing_on(&bob, br)
     })
@@ -597,8 +608,14 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(leaves(&bob, b), 1, "alice's devices were added back");
+    assert!(!bob_in(b), "bob's side came back");
     assert_eq!(leaves(&bob, br), 1, "alice's devices were added back");
+    // 5.1, 6.1: Bob's side of the direct conversation left it too, and
+    // shows it as left by Alice; the room, which Bob is still in, stays.
+    let summary = bob.client.conversation(b).unwrap();
+    assert!(!summary.active && summary.left_by_peer, "{summary:?}");
+    let summary = bob.client.conversation(br).unwrap();
+    assert!(summary.active && !summary.left_by_peer, "{summary:?}");
     for c in [direct, room] {
         assert!(!in_group(&laptop, &laptop, c));
         assert!(!in_group(&phone, &laptop, c));

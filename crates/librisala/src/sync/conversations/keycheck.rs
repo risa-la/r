@@ -417,7 +417,10 @@ pub(super) fn recheck(tx: &mut Tx<'_>, cx: &Ctx<'_>) -> Result<Vec<Action>> {
         if at > cx.now {
             continue;
         }
-        if may_repair(tx, cx, &conv, &row.uid) {
+        if group::leaving(tx, conv.id)? {
+            // 6.1: a leaving device makes no commit but its leave commit.
+            tracing::info!(conv = %conv.id, uid = %row.uid, "no repair: leaving the conversation");
+        } else if may_repair(tx, cx, &conv, &row.uid) {
             // One removal per leaf: none if a commit of this device that
             // removes it is queued already, by an earlier repair or by the
             // upkeep's removals by key file (12.14).

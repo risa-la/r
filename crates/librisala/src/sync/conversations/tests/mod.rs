@@ -5,6 +5,7 @@
 mod blobs;
 mod deletes;
 mod keychecks;
+mod leaving;
 mod own_commits;
 mod public;
 mod recovery;

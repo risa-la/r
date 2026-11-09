@@ -265,6 +265,9 @@ pub struct ConversationSummary {
     pub sending_stopped: bool,
     /// Whether the device is still in it.
     pub active: bool,
+    /// A direct conversation that the peer left (6.1): the device left it
+    /// too, by itself. Talking again starts a new one.
+    pub left_by_peer: bool,
 }
 
 /// A member of a conversation (12.7).
@@ -709,6 +712,10 @@ fn summary(store: &Store, row: ConvRow) -> Result<ConversationSummary> {
         (ConvKind::Direct, Some(peer)) => peer.to_string(),
         _ => row.name.clone(),
     };
+    let left_by_peer = match (&row.kind, &row.peer) {
+        (ConvKind::Direct, Some(peer)) if !row.state.in_group() => store.departed(row.id, peer)?,
+        _ => false,
+    };
     Ok(ConversationSummary {
         id: row.id,
         account: row.account,
@@ -720,6 +727,7 @@ fn summary(store: &Store, row: ConvRow) -> Result<ConversationSummary> {
         last_activity: row.last_activity.and_then(Timestamp::from_unix_millis),
         sending_stopped: false,
         active: row.state.in_group(),
+        left_by_peer,
     })
 }
 
@@ -812,8 +820,8 @@ impl Client {
     /// mailbox, and adds `uid`'s devices and its own other devices.
     pub async fn direct(&self, account: AccountId, uid: &str) -> Result<ConversationId> {
         let peer: Uid = uid.parse().map_err(|_| Error::invalid("uid", uid))?;
-        // One that the peer left does not count: a new one is started
-        // (6.1, 12.7).
+        // One that the peer left does not count: this side leaves it too,
+        // and a new one is started (5.1, 6.1, 12.7).
         for r in self.store().conversation_rows(account)? {
             if r.kind == ConvKind::Direct
                 && r.peer.as_ref() == Some(&peer)
@@ -1043,14 +1051,25 @@ impl Client {
     }
 
     /// Leaves a conversation (6.1): a commit that removes this identity's
-    /// other leaves, if it has any, then a SelfRemove.
+    /// other leaves, if it has any, then a SelfRemove. In a direct
+    /// conversation nobody commits it: the device forgets the group once
+    /// it has posted it, and so do the other participant's. Where no other
+    /// identity has a leaf, the device leaves locally at once, with no
+    /// commit and no SelfRemove.
     pub async fn leave(&self, conversation: ConversationId) -> Result<()> {
         let row = self.conv_row(conversation)?;
         let own = self.own_uid(row.account)?;
         let now = self.options().clock.now().unix_millis();
-        self.store()
+        let (left, changes) = self
+            .store()
             .write_with(|tx| group::leave(tx, conversation, &own, now))
             .map_err(Error::from)?;
+        self.emit_changes(changes);
+        if left {
+            self.emit(Event::Conversation(ConversationEvent::Left {
+                conversation,
+            }));
+        }
         self.kick(row.account).await;
         Ok(())
     }
