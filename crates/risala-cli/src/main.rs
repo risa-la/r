@@ -24,7 +24,12 @@
 //! and `--short-waits` reach a development server such as `risala-dev`'s,
 //! which prints them.
 //!
+//! Text from other people and servers is printed with its control
+//! characters, bidi controls among them, shown as `\u{..}` (see `shown`).
+//!
 //! Exit codes: 0 done, 1 failed, 2 bad arguments.
+
+mod shown;
 
 use std::io::{BufRead as _, Write as _};
 use std::net::SocketAddr;
@@ -35,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use librisala::client::conversations::{ConversationKind, ConversationSummary};
+use librisala::client::identity::PairingIdentity;
 use librisala::client::types::{AccountKind, ConversationId, MessageId};
 use librisala::client::{ConnectionState, identity::KeyFetcherHttps};
 use librisala::conn::Slot;
@@ -43,6 +49,8 @@ use librisala::keys::FileKeyStore;
 use librisala::store::{AccountId, DatabaseKey, Store, StoreError};
 use librisala::{Client, ClientOptions, Event};
 use rustls::pki_types::pem::PemObject as _;
+
+use crate::shown::{Shown, shown};
 
 /// How long to wait for a connection to sign in.
 const SIGN_IN: Duration = Duration::from_secs(30);
@@ -278,7 +286,8 @@ fn main() -> ExitCode {
     match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("risala: {e}");
+            // Errors can carry the server's text (11) or a peer's names.
+            eprintln!("risala: {}", Shown(&e));
             ExitCode::FAILURE
         }
     }
@@ -622,7 +631,7 @@ fn print_conversations(client: &Client, account: AccountId) -> Res {
             "{}\t{}\t{}\t{}{stopped}",
             c.id,
             kind(c.kind),
-            c.name,
+            Shown(&c.name),
             c.unread
         );
     }
@@ -653,7 +662,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 .create_identity(&server, &name, &label)
                 .await
                 .map_err(err)?;
-            println!("{}", new.uid);
+            println!("{}", shown(&new.uid));
             println!("{}", new.recovery_key.as_str());
             let _ = std::io::stdout().flush();
             ctx.until_accepted(new.uid.as_str()).await?;
@@ -667,15 +676,11 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let _ = std::io::stdout().flush();
             // 4.8, step 5: whoever saw the QR code can answer it with an
             // identity of their own, so the user confirms the identity.
-            let shown = c.finish_pairing().await.map_err(err)?;
-            println!("{}", shown.uid);
-            for d in &shown.devices {
-                let this = if d.this_device { "\tthis" } else { "" };
-                println!("\t{}\t{}{this}", d.short, d.label);
-            }
-            let _ = std::io::stdout().flush();
+            let identity = c.finish_pairing().await.map_err(err)?;
+            let _ = show_pairing(&mut std::io::stdout().lock(), &identity);
             if !yes {
-                eprint!("join {}? [y/N] ", shown.uid);
+                eprint!("{}", pairing_question(&identity));
+                let _ = std::io::stderr().flush();
                 let mut answer = String::new();
                 let _ = std::io::stdin().lock().read_line(&mut answer);
                 if !matches!(answer.trim(), "y" | "Y" | "yes") {
@@ -700,7 +705,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let uid = c.account(account).map_err(err)?.uid;
             ctx.online(account).await?;
             let request = c.scan_pairing(uid.as_str(), &qr).await.map_err(err)?;
-            println!("{}\t{}", request.short, request.label);
+            println!("{}\t{}", Shown(&request.short), Shown(&request.label));
             c.confirm_pairing(uid.as_str(), !no_history)
                 .await
                 .map_err(err)?;
@@ -709,7 +714,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         Command::Recover { server, uid, label } => {
             let key = Ctx::recovery_key()?;
             let own = c.recover(&server, &uid, &key, &label).await.map_err(err)?;
-            println!("{}\t{}", own.uid, own.device);
+            println!("{}\t{}", shown(&own.uid), own.device);
             ctx.until_accepted(own.uid.as_str()).await?;
             let account = c
                 .accounts()
@@ -745,9 +750,9 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         }
         Command::Whoami => {
             for own in c.own_identities().map_err(err)? {
-                println!("{}\t{}", own.uid, own.device);
+                println!("{}\t{}", shown(&own.uid), own.device);
                 for d in c.identity_devices(own.uid.as_str()).map_err(err)? {
-                    println!("\t{}\t{}\t{}", d.short, device_state(&d), d.label);
+                    print_device(&d);
                 }
             }
         }
@@ -758,22 +763,23 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 c.contact(&uid).await
             }
             .map_err(err)?;
+            // `KeysStatus::Missing` carries text from the fetch.
             println!(
-                "{}\t{:?}\t{}\t{}",
-                contact.uid,
-                contact.keys,
+                "{}\t{}\t{}\t{}",
+                shown(&contact.uid),
+                shown(format_args!("{:?}", contact.keys)),
                 if contact.verified {
                     "verified"
                 } else {
                     "unverified"
                 },
                 match contact.stopped {
-                    Some(r) => format!("stopped: {r:?}"),
+                    Some(r) => shown(format_args!("stopped: {r:?}")),
                     None => "sending".into(),
                 }
             );
             for d in &contact.devices {
-                println!("\t{}\t{}\t{}", d.short, device_state(d), d.label);
+                print_device(d);
             }
         }
         Command::Safety { uid } => {
@@ -826,11 +832,11 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let conv = ctx.conversation(account, &room)?;
             for m in c.members(conv).map_err(err)? {
                 println!(
-                    "{}\t{:?}\t{}\t{}",
-                    m.uid,
-                    m.role,
+                    "{}\t{}\t{}\t{}",
+                    shown(&m.uid),
+                    shown(format_args!("{:?}", m.role)),
                     m.devices,
-                    m.display_name.unwrap_or_default()
+                    Shown(m.display_name.as_deref().unwrap_or_default())
                 );
             }
         }
@@ -838,7 +844,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             let account = ctx.account()?;
             ctx.online(account).await?;
             for r in c.list_public_rooms(account, None).await.map_err(err)? {
-                println!("{}\t{}\t{}", r.room, r.members, r.topic);
+                println!("{}\t{}\t{}", shown(&r.room), r.members, Shown(&r.topic));
             }
         }
         Command::Public(PublicCommand::Create { room }) => {
@@ -905,18 +911,19 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 if m.edited {
                     flags.push("edited");
                 }
+                // The text stays escaped as on the wire (3.4), one line.
                 let _ = writeln!(
                     out,
                     "{}\t{}\t{}\t{}\t{}",
                     m.id,
                     m.sent,
-                    m.sender,
+                    shown(&m.sender),
                     if flags.is_empty() {
                         "-".into()
                     } else {
                         flags.join(",")
                     },
-                    m.text.unwrap_or_default()
+                    Shown(m.text.as_deref().unwrap_or_default())
                 );
             }
         }
@@ -945,7 +952,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             ctx.online(account).await?;
             let info = c.fetch_file(conv, message).await.map_err(err)?;
             match info.path {
-                Some(path) => println!("{}\t{}", path.display(), info.size),
+                Some(path) => println!("{}\t{}", shown(path.display()), info.size),
                 None => return Err("the file was not saved".into()),
             }
         }
@@ -974,11 +981,80 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
     Ok(())
 }
 
+/// One of an identity's devices, under its uid: short id, state, label.
+fn print_device(d: &librisala::client::identity::Device) {
+    println!(
+        "\t{}\t{}\t{}",
+        Shown(&d.short),
+        device_state(d),
+        Shown(&d.label)
+    );
+}
+
+/// Prints the identity a new device is about to take, and its devices
+/// (4.8, step 5). Their labels are the answering identity's, which may not
+/// be the user's: whoever saw the QR code can answer.
+fn show_pairing(out: &mut impl std::io::Write, identity: &PairingIdentity) -> std::io::Result<()> {
+    writeln!(out, "{}", shown(&identity.uid))?;
+    for d in &identity.devices {
+        let this = if d.this_device { "\tthis" } else { "" };
+        writeln!(out, "\t{}\t{}{this}", Shown(&d.short), Shown(&d.label))?;
+    }
+    out.flush()
+}
+
+/// The question that asks the user to confirm the identity (4.8, step 5),
+/// repeating its uid so that nothing printed before can stand in for it.
+fn pairing_question(identity: &PairingIdentity) -> String {
+    format!("join {}? [y/N] ", shown(&identity.uid))
+}
+
 fn device_state(d: &librisala::client::identity::Device) -> &'static str {
     match (d.removed, d.accepted, d.this_device) {
         (true, _, _) => "removed",
         (false, true, true) => "current,this",
         (false, true, false) => "current",
         (false, false, _) => "pending",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librisala::client::identity::PairingDevice;
+    use librisala::client::types::DeviceId;
+
+    fn identity(labels: &[&str]) -> PairingIdentity {
+        PairingIdentity {
+            uid: "mallory@example.org".parse().unwrap(),
+            devices: labels
+                .iter()
+                .enumerate()
+                .map(|(i, label)| PairingDevice {
+                    id: DeviceId([i as u8; 48]),
+                    short: format!("abcdefg{i}"),
+                    label: (*label).to_owned(),
+                    this_device: i == 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// A label that moves the cursor up, clears the uid's line and writes
+    /// another uid over it (4.8, step 5) is printed escaped.
+    #[test]
+    fn pairing_labels_are_printed_escaped() {
+        let evil = "x\u{1b}[2A\u{1b}[2K\ralice@example.org\u{9b}K\u{202e}";
+        let shown = identity(&["phone", evil]);
+        let mut out = Vec::new();
+        show_pairing(&mut out, &shown).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "mallory@example.org\n\tabcdefg0\tphone\tthis\n\tabcdefg1\t\
+             x\\u{1b}[2A\\u{1b}[2K\\u{d}alice@example.org\\u{9b}K\\u{202e}\n"
+        );
+        assert!(!out.contains(['\u{1b}', '\r', '\u{9b}', '\u{202e}']));
+        assert_eq!(pairing_question(&shown), "join mallory@example.org? [y/N] ");
     }
 }
