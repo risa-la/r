@@ -14,9 +14,11 @@
 //! body goes to a temporary file, and is moved into place only once it is
 //! complete and checked, so nothing is served half-written. Bodies and
 //! downloads are streamed: each read or write may wait at most
-//! [`IDLE_TIMEOUT`], and the whole must keep up at least [`MIN_RATE`]
-//! ([`transfer_deadline`]), so that slow clients cannot hold the
-//! listener's connections for hours.
+//! [`IDLE_TIMEOUT`], the whole must keep up at least [`MIN_RATE`]
+//! ([`transfer_deadline`]), and at every moment the last
+//! `files.min_rate_secs` must have moved `files.min_rate` bytes a second
+//! ([`Pace`], 10.6), so that slow clients cannot hold the listener's
+//! transfer slots for long.
 //!
 //! Answers: `201` for a stored body, `204` for a deletion, `400` for a
 //! body of the wrong length or hash, `404` for a URL that leads nowhere
@@ -25,12 +27,14 @@
 //! that was used, `411` without a
 //! `Content-Length`, and `405` for another method.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha384};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::time::Instant;
 
 use super::server::Request;
 use crate::core::keys::disk::{Files, PutTarget, Refused, blob_hash_of};
@@ -41,8 +45,9 @@ use crate::secret::ct_eq;
 /// progress within this.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The slowest a whole body or download may go, in bytes a second, after
-/// [`TRANSFER_GRACE`].
+/// The slowest a whole body or download may go on average, in bytes a
+/// second, after [`TRANSFER_GRACE`], for its overall deadline. A running
+/// minimum ([`Pace`]) applies besides.
 pub const MIN_RATE: u64 = 64 * 1024;
 
 /// The time every transfer has besides what [`MIN_RATE`] gives it.
@@ -55,6 +60,107 @@ pub fn transfer_deadline(size: u64) -> Duration {
 
 /// The size of each read and write while streaming.
 const CHUNK: usize = 64 * 1024;
+
+/// A running minimum rate for one transfer (10.6, PLAN item 63): at every
+/// moment, the bytes moved in the last `window` must be at least `rate`
+/// a second over it, or all that is left if that is less. The overall
+/// deadline ([`transfer_deadline`]) alone would let a client that reads
+/// slowly hold a slot for over an hour.
+#[derive(Debug)]
+pub(crate) struct Pace {
+    window: Duration,
+    /// The bytes each window must move.
+    need: u64,
+    /// The bytes moved so far.
+    moved: u64,
+    /// When the bytes moved reached each count, oldest first: only those
+    /// that may still decide the deadline, at most about one a
+    /// [`granule`](Self::granule).
+    points: VecDeque<(Instant, u64)>,
+}
+
+impl Pace {
+    /// The pace of a transfer of `size` bytes starting now, or none if
+    /// `rate` is 0.
+    pub(crate) fn new(rate: u64, window: Duration, size: u64) -> Option<Pace> {
+        Pace::starting(rate, window, size, Instant::now())
+    }
+
+    fn starting(rate: u64, window: Duration, size: u64, now: Instant) -> Option<Pace> {
+        if rate == 0 {
+            return None;
+        }
+        let per_window = u128::from(rate) * window.as_millis() / 1000;
+        let need = u64::try_from(per_window).unwrap_or(u64::MAX).min(size);
+        Some(Pace {
+            window,
+            need,
+            moved: 0,
+            points: VecDeque::from([(now, 0)]),
+        })
+    }
+
+    /// Progress closer together than this counts as one point.
+    fn granule(&self) -> Duration {
+        self.window / 32
+    }
+
+    /// `n` more bytes moved at `now`.
+    fn moved_at(&mut self, n: usize, now: Instant) {
+        self.moved = self.moved.saturating_add(n as u64);
+        let granule = self.granule();
+        let several = self.points.len() > 1;
+        match self.points.back_mut() {
+            // The first point is when the transfer started, and stays so.
+            Some((at, count)) if several && now.saturating_duration_since(*at) < granule => {
+                *count = self.moved;
+            }
+            _ => self.points.push_back((now, self.moved)),
+        }
+        // A point whose count is at most `moved - need` can no longer
+        // decide when the transfer is too slow.
+        if let Some(threshold) = self.moved.checked_sub(self.need) {
+            while self.points.len() > 1 && self.points.front().is_some_and(|(_, c)| *c <= threshold) {
+                self.points.pop_front();
+            }
+        }
+    }
+
+    /// When the transfer is too slow if nothing more moves: a window after
+    /// the earliest point with more than `moved - need` bytes.
+    fn deadline(&self) -> Option<Instant> {
+        if self.need == 0 {
+            return None;
+        }
+        let threshold = self.moved.checked_sub(self.need);
+        self.points
+            .iter()
+            .find(|(_, count)| threshold.is_none_or(|t| *count > t))
+            .map(|(at, _)| *at + self.window)
+    }
+}
+
+/// Runs one read or write of a transfer: it fails if it makes no progress
+/// within [`IDLE_TIMEOUT`], or by the time `pace` says the transfer is too
+/// slow. `bytes` says how many bytes its result moved.
+async fn paced<T>(
+    pace: &mut Option<Pace>,
+    io: impl Future<Output = std::io::Result<T>>,
+    bytes: impl FnOnce(&T) -> usize,
+) -> std::io::Result<T> {
+    let idle = Instant::now() + IDLE_TIMEOUT;
+    let until = match pace.as_ref().and_then(Pace::deadline) {
+        Some(deadline) => deadline.min(idle),
+        None => idle,
+    };
+    let done = tokio::time::timeout_at(until, io)
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    if let Some(pace) = pace {
+        pace.moved_at(bytes(&done), Instant::now());
+    }
+    Ok(done)
+}
 
 /// Whether `path` is one of blobs and files.
 pub(crate) fn claims(path: &str) -> bool {
@@ -152,7 +258,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         match method {
             "GET" | "HEAD" => match blob_hash_of(hex) {
                 Some(hash) => match files.blob(hash).await {
-                    Ok((file, size)) => download(stream, file, size, method == "HEAD").await,
+                    Ok((file, size)) => download(stream, file, size, method == "HEAD", files).await,
                     Err(r) => refused(r),
                 },
                 None => NOT_FOUND,
@@ -162,7 +268,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     } else if let Some(rest) = path.strip_prefix(paths::UPLOAD_GET) {
         match method {
             "GET" | "HEAD" => match files.upload(rest).await {
-                Ok((file, size)) => download(stream, file, size, method == "HEAD").await,
+                Ok((file, size)) => download(stream, file, size, method == "HEAD", files).await,
                 Err(r) => refused(r),
             },
             _ => method_not_allowed("GET, HEAD"),
@@ -203,6 +309,7 @@ async fn download<S: AsyncWrite + Unpin>(
     file: PathBuf,
     size: u64,
     head_only: bool,
+    files: &Files,
 ) -> Head {
     let mut file = match tokio::fs::File::open(&file).await {
         Ok(file) => file,
@@ -217,6 +324,8 @@ async fn download<S: AsyncWrite + Unpin>(
         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\n\
          X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
     );
+    let (rate, window) = files.min_rate();
+    let mut pace = Pace::new(rate, window, if head_only { 0 } else { size });
     let sent = async {
         within(stream.write_all(head.as_bytes())).await?;
         if !head_only {
@@ -228,7 +337,7 @@ async fn download<S: AsyncWrite + Unpin>(
                 if n == 0 {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
-                within(stream.write_all(&buf[..n])).await?;
+                paced(&mut pace, stream.write_all(&buf[..n]), |()| n).await?;
                 left -= n as u64;
             }
         }
@@ -289,6 +398,8 @@ async fn put<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let mut hasher = Sha384::new();
+    let (rate, window) = files.min_rate();
+    let mut pace = Pace::new(rate, window, length.saturating_sub(body.len() as u64));
     let received = async {
         let mut left = length;
         let mut buf = vec![0u8; CHUNK];
@@ -303,7 +414,7 @@ async fn put<S: AsyncRead + AsyncWrite + Unpin>(
                 break;
             }
             let want = usize::try_from(left.min(CHUNK as u64)).unwrap_or(CHUNK);
-            let n = within(stream.read(&mut buf[..want])).await?;
+            let n = paced(&mut pace, stream.read(&mut buf[..want]), |n| *n).await?;
             if n == 0 {
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
             }
@@ -335,4 +446,54 @@ async fn put<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let _ = tokio::fs::remove_file(&tmp).await;
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KIB: u64 = 1024;
+
+    /// A transfer is too slow once the last window moved less than the
+    /// rate over it: 16 KiB a second over 30 seconds is 480 KiB a window.
+    #[test]
+    fn pace_keeps_a_running_minimum() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let window = s(30);
+        let mut pace = Pace::starting(16 * KIB, window, 10_000 * KIB, t0).unwrap();
+        // Nothing yet: the first 480 KiB are due 30 seconds in.
+        assert_eq!(pace.deadline(), Some(t0 + s(30)));
+        // Fast at first: 1 MiB in the first second, then nothing more is
+        // due until a window after the point past which 480 KiB still
+        // count, here the first second.
+        pace.moved_at(1024 * KIB as usize, t0 + s(1));
+        assert_eq!(pace.deadline(), Some(t0 + s(31)));
+        // A trickle afterwards does not keep it alive: 1 KiB a second for
+        // 29 seconds leaves the deadline where it was.
+        for i in 2..=30 {
+            pace.moved_at(KIB as usize, t0 + s(i));
+        }
+        assert_eq!(pace.deadline(), Some(t0 + s(31)));
+        // At 16 KiB a second it goes on for as long as it keeps that up.
+        let mut pace = Pace::starting(16 * KIB, window, 10_000 * KIB, t0).unwrap();
+        for i in 1..=300 {
+            pace.moved_at(16 * KIB as usize, t0 + s(i));
+            assert!(pace.deadline().unwrap() > t0 + s(i), "{i}");
+        }
+        assert!(pace.points.len() <= 40, "{}", pace.points.len());
+    }
+
+    /// A transfer smaller than a window's bytes must finish within the
+    /// window; one of no bytes has no deadline; a rate of 0 is no pace.
+    #[test]
+    fn pace_of_small_transfers() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(30);
+        let mut pace = Pace::starting(16 * KIB, window, 100 * KIB, t0).unwrap();
+        pace.moved_at(50 * KIB as usize, t0 + Duration::from_secs(10));
+        assert_eq!(pace.deadline(), Some(t0 + window));
+        assert_eq!(Pace::starting(16 * KIB, window, 0, t0).unwrap().deadline(), None);
+        assert!(Pace::starting(0, window, 100, t0).is_none());
+    }
 }

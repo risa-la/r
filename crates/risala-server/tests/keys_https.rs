@@ -28,8 +28,16 @@ fn token() -> SendToken {
 
 /// A server with an HTTPS listener and the mailbox [`BOX`].
 async fn server() -> TestServer {
+    server_with(|_| {}).await
+}
+
+/// [`server`], with `f` applied to its configuration.
+async fn server_with(f: impl FnOnce(&mut risala_server::config::Config)) -> TestServer {
     TestServer::builder()
-        .configure(|c| c.http.listen = vec!["127.0.0.1:0".parse().unwrap()])
+        .configure(|c| {
+            c.http.listen = vec!["127.0.0.1:0".parse().unwrap()];
+            f(c);
+        })
         .prepare(|store| {
             store
                 .create_mailbox(&NewMailbox {
@@ -132,10 +140,8 @@ fn target(url: &str) -> (SocketAddr, String) {
     )
 }
 
-/// Sends one HTTP/1.1 request to `url` with `headers` and `body`, and
-/// reads the whole response.
-async fn request(method: &str, url: &str, headers: &[&str], body: &[u8]) -> Response {
-    let (addr, path) = target(url);
+/// A TLS connection over `tcp` to the test server.
+async fn tls(tcp: TcpStream) -> tokio_rustls::client::TlsStream<TcpStream> {
     let provider = risala_keyfetch::provider();
     let config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -143,11 +149,17 @@ async fn request(method: &str, url: &str, headers: &[&str], body: &[u8]) -> Resp
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
         .with_no_client_auth();
-    let tcp = TcpStream::connect(addr).await.unwrap();
-    let mut tls = TlsConnector::from(Arc::new(config))
+    TlsConnector::from(Arc::new(config))
         .connect(ServerName::try_from("localhost").unwrap(), tcp)
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Sends one HTTP/1.1 request to `url` with `headers` and `body`, and
+/// reads the whole response.
+async fn request(method: &str, url: &str, headers: &[&str], body: &[u8]) -> Response {
+    let (addr, path) = target(url);
+    let mut tls = tls(TcpStream::connect(addr).await.unwrap()).await;
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
     for header in headers {
         head.push_str(header);
@@ -316,5 +328,124 @@ async fn files_are_uploaded_downloaded_and_deleted_over_https() {
     assert_eq!(request("DELETE", &del_url, &[], b"").await.status, 204);
     assert_eq!(request("GET", &get_url, &[], b"").await.status, 404);
     assert_eq!(request("DELETE", &del_url, &[], b"").await.status, 404);
+    server.stop().await;
+}
+
+/// Stores `bytes` as a blob over HTTPS, and returns the URL to get it.
+async fn store_blob(anon: &mut TestClient, bytes: &[u8]) -> String {
+    let hash = BlobRef::of(bytes);
+    let blob = format!("BLOB {hash} {} box={BOX} token={}", bytes.len(), token());
+    let url = value(&command(anon, &blob).await, "put");
+    let r = put(&url, bytes).await;
+    assert_eq!(r.status, 201, "{}", r.head);
+    let base = url.split("/blob/").next().unwrap();
+    format!("{base}/blobs/{}", hash.hex())
+}
+
+/// An upload that keeps below `files.min_rate` over `files.min_rate_secs`
+/// is cut off, well before its overall deadline; one that keeps up is
+/// not (10.6, 12.12, PLAN item 63).
+#[tokio::test]
+async fn slow_uploads_are_cut_off() {
+    let server = server_with(|c| {
+        c.files.min_rate = 64 * 1024;
+        c.files.min_rate_secs = 1;
+    })
+    .await;
+    let mut anon = server.anon().await;
+    let bytes = vec![7u8; 1024 * 1024];
+    let hash = BlobRef::of(&bytes);
+    let blob = format!("BLOB {hash} {} box={BOX} token={}", bytes.len(), token());
+    let url = value(&command(&mut anon, &blob).await, "put");
+    // 1 KiB every 100 ms: 10 KiB a second.
+    let (addr, path) = target(&url);
+    let stream = tls(TcpStream::connect(addr).await.unwrap()).await;
+    let (mut rx, mut tx) = tokio::io::split(stream);
+    let head = format!(
+        "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        bytes.len()
+    );
+    tx.write_all(head.as_bytes()).await.unwrap();
+    let trickle = tokio::spawn(async move {
+        for _ in 0..200 {
+            if tx.write_all(&[7u8; 1024]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+    let started = std::time::Instant::now();
+    let mut answer = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rx.read_to_end(&mut answer),
+    )
+    .await
+    .expect("cut off within 10 seconds")
+    .ok();
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    trickle.abort();
+    // At full speed it is taken.
+    let url = value(&command(&mut anon, &blob).await, "put");
+    assert_eq!(put(&url, &bytes).await.status, 201);
+    server.stop().await;
+}
+
+/// A download that keeps below `files.min_rate` is cut off, and its
+/// transfer slot freed; while every transfer slot is taken, blob and file
+/// requests get 503 but key files are still served; a reader that keeps
+/// up gets the whole blob (10.6, 12.12, PLAN item 63).
+#[tokio::test]
+async fn slow_downloads_are_cut_off_and_free_their_slot() {
+    let server = server_with(|c| {
+        c.files.min_rate = 1024 * 1024;
+        c.files.min_rate_secs = 1;
+        c.files.max_transfers = 1;
+    })
+    .await;
+    let mut anon = server.anon().await;
+    // More than the socket buffers on both sides hold.
+    let big: Vec<u8> = (0..24 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let big_url = store_blob(&mut anon, &big).await;
+    let small_url = store_blob(&mut anon, b"a small blob").await;
+    // A reader that keeps up.
+    let r = request("GET", &big_url, &[], b"").await;
+    assert_eq!(r.status, 200);
+    assert!(r.body == big, "{} bytes", r.body.len());
+
+    // A reader that reads nothing, with a small receive buffer.
+    let (addr, path) = target(&big_url);
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(8 * 1024).unwrap();
+    let mut slow = tls(socket.connect(addr).await.unwrap()).await;
+    slow.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    slow.flush().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // It holds the one transfer slot: other blobs get 503, key files do
+    // not.
+    assert_eq!(request("GET", &small_url, &[], b"").await.status, 503);
+    let base = small_url.split("/blobs/").next().unwrap();
+    let key_file = format!("{base}/.well-known/risala/nobody");
+    assert_eq!(request("GET", &key_file, &[], b"").await.status, 404);
+    // Within a few seconds it is cut off, and the slot is free again.
+    let started = std::time::Instant::now();
+    loop {
+        let r = request("GET", &small_url, &[], b"").await;
+        if r.status == 200 {
+            assert_eq!(r.body, b"a small blob");
+            break;
+        }
+        assert_eq!(r.status, 503);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the slow reader still holds its slot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    drop(slow);
     server.stop().await;
 }

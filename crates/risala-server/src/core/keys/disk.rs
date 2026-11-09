@@ -183,6 +183,23 @@ impl Files {
         self.inner.now()
     }
 
+    /// The running minimum rate of transfers over HTTPS, in bytes a
+    /// second, and the time it is averaged over (`files.min_rate` and
+    /// `files.min_rate_secs`, 10.6).
+    pub(crate) fn min_rate(&self) -> (u64, std::time::Duration) {
+        let files = &self.inner.config.files;
+        (
+            files.min_rate,
+            std::time::Duration::from_secs(files.min_rate_secs.max(1)),
+        )
+    }
+
+    /// The most connections that may transfer blobs and files at once
+    /// (`files.max_transfers`).
+    pub(crate) fn max_transfers(&self) -> usize {
+        self.inner.config.files.max_transfers
+    }
+
     async fn db<T: Send + 'static>(
         &self,
         f: impl FnOnce(&dyn crate::store::Store) -> crate::store::Result<T> + Send + 'static,

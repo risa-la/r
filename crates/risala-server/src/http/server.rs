@@ -90,10 +90,10 @@ pub const MAX_HTTP_PER_ADDRESS: usize = 16;
 pub const MAX_HTTP_PER_48: usize = 64;
 
 /// The most connections that may be sending or receiving blobs and files
-/// at once (5.6, 12.12): the rest of [`MAX_HTTP_CONNECTIONS`] stays for
-/// key files, log tiles and the witness (4.3, 4.5, 4.10), so that slow
-/// transfers cannot keep devices from checking keys. Further blob and file
-/// requests get 503.
+/// at once (5.6, 12.12), and the default of `files.max_transfers`: the
+/// rest of [`MAX_HTTP_CONNECTIONS`] stays for key files, log tiles and the
+/// witness (4.3, 4.5, 4.10), so that slow transfers cannot keep devices
+/// from checking keys. Further blob and file requests get 503.
 pub const MAX_HTTP_TRANSFERS: usize = MAX_HTTP_CONNECTIONS * 3 / 4;
 
 /// The most bytes of request head (request line and headers).
@@ -188,9 +188,14 @@ impl HttpServer {
         let shared = Arc::new(Shared {
             acceptor: self.acceptor,
             keys: self.keys,
-            files: self.files,
             permits: Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS)),
-            transfers: Arc::new(Semaphore::new(MAX_HTTP_TRANSFERS)),
+            transfers: Arc::new(Semaphore::new(
+                self.files
+                    .as_ref()
+                    .map_or(MAX_HTTP_TRANSFERS, Files::max_transfers)
+                    .min(MAX_HTTP_TRANSFERS),
+            )),
+            files: self.files,
             per_address: Mutex::new(HashMap::new()),
         });
         let mut background = JoinSet::new();

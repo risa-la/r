@@ -266,6 +266,23 @@ pub struct FilesConfig {
     /// The most Welcomes pending for one device (12.8). More get
     /// `ERR rate-limited`.
     pub max_pending_welcomes: u64,
+    /// The slowest a blob or file may go over HTTPS, upload or download,
+    /// in bytes a second averaged over `min_rate_secs`, besides the
+    /// deadline for the whole transfer (10.6, 12.12): a client that keeps
+    /// below it is cut off, so that slow clients cannot hold the
+    /// listener's transfer slots for long. A transfer smaller than
+    /// `min_rate * min_rate_secs` bytes must finish within
+    /// `min_rate_secs`. 0 turns it off.
+    pub min_rate: u64,
+    /// The seconds [`min_rate`](Self::min_rate) is averaged over: at
+    /// least 1.
+    pub min_rate_secs: u64,
+    /// The most HTTPS connections that may send or receive blobs and
+    /// files at once; further blob and file requests get 503. At most
+    /// [`MAX_HTTP_TRANSFERS`](crate::http::server::MAX_HTTP_TRANSFERS), so
+    /// that the rest of the listener's connections stay for key files, log
+    /// tiles and the witness (4.3, 4.5, 4.10).
+    pub max_transfers: usize,
 }
 
 /// The least [`FilesConfig::max_blob`] may be: 256 MiB (12.12).
@@ -282,6 +299,9 @@ impl Default for FilesConfig {
             max_backup: 16 * 1024 * 1024 * 1024,
             max_backup_blobs: 100_000,
             max_pending_welcomes: 1000,
+            min_rate: 16 * 1024,
+            min_rate_secs: 30,
+            max_transfers: crate::http::server::MAX_HTTP_TRANSFERS,
         }
     }
 }
@@ -890,6 +910,17 @@ impl Config {
         {
             return invalid(format!(
                 "files.url {url:?} is not https://<host> or https://<host>:<port>"
+            ));
+        }
+        if f.min_rate_secs == 0 {
+            return invalid("files.min_rate_secs must be at least 1".into());
+        }
+        let most = crate::http::server::MAX_HTTP_TRANSFERS;
+        if !(1..=most).contains(&f.max_transfers) {
+            return invalid(format!(
+                "files.max_transfers is {}, but must be 1 to {most}, so that HTTPS connections \
+                 stay for key files, log tiles and the witness",
+                f.max_transfers
             ));
         }
         for (name, value) in [
