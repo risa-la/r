@@ -645,3 +645,189 @@ impl Client {
         Ok(pending == 0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::store::identity::{DeviceRow, OwnRow};
+
+    const ALICE: &str = "alice@example.org";
+
+    fn device(n: u8, state: DeviceState) -> DeviceRow {
+        DeviceRow {
+            device_id: [n; 48],
+            device_key: vec![n; 1312],
+            attestation_key: vec![n; 1216],
+            label: format!("device {n}"),
+            added: 1,
+            state,
+        }
+    }
+
+    fn uid(s: &str) -> Uid {
+        s.parse().unwrap()
+    }
+
+    /// A store that knows `ALICE` with `keys`, and her devices 1 (current),
+    /// 2 (pending) and 3 (removed).
+    fn store(keys: KeysState, forked: bool) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .write(|tx| {
+                let mut c = ContactRow::new(ALICE);
+                c.keys = keys;
+                c.forked = forked;
+                tx.put_contact(&c)?;
+                tx.put_devices(
+                    ALICE,
+                    &[
+                        device(1, DeviceState::Current),
+                        device(2, DeviceState::Pending),
+                        device(3, DeviceState::Removed),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store
+    }
+
+    fn id(n: u8) -> MlsDeviceId {
+        MlsDeviceId::from_bytes([n; 48])
+    }
+
+    /// 12.7: a current device's key is known; a removed one is known not
+    /// to be current and to be removed; a pending or unknown one is not
+    /// known yet, so a check waits rather than fails.
+    #[test]
+    fn key_facts_follow_accepted_records() {
+        let store = store(KeysState::Keys, false);
+        let alice = uid(ALICE);
+        store
+            .write(|tx| {
+                let facts = TxFacts::new(tx);
+                assert_eq!(
+                    facts.current_device_key(&alice, &id(1)),
+                    Fact::Known(Some(vec![1; 1312]))
+                );
+                assert_eq!(facts.current_device_key(&alice, &id(2)), Fact::Unknown);
+                assert_eq!(facts.current_device_key(&alice, &id(3)), Fact::Known(None));
+                assert_eq!(facts.current_device_key(&alice, &id(9)), Fact::Unknown);
+                assert_eq!(facts.device_removed(&alice, &id(1)), Fact::Known(false));
+                assert_eq!(facts.device_removed(&alice, &id(3)), Fact::Known(true));
+                assert_eq!(facts.device_removed(&alice, &id(2)), Fact::Unknown);
+                assert_eq!(facts.forked_or_missing(&alice), Fact::Known(false));
+                // Nobody else is known.
+                let bob = uid("bob@example.org");
+                assert_eq!(facts.current_device_key(&bob, &id(1)), Fact::Unknown);
+                assert_eq!(facts.forked_or_missing(&bob), Fact::Unknown);
+                assert_eq!(facts.identity_retired(&bob), Fact::Unknown);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 12.14: a fork or missing keys is a fact the checks know; an
+    /// identity whose key file was never read is not.
+    #[test]
+    fn forks_and_missing_keys_are_facts() {
+        let alice = uid(ALICE);
+        for (keys, forked, expected) in [
+            (KeysState::Keys, true, Fact::Known(true)),
+            (KeysState::Missing("gone".into()), false, Fact::Known(true)),
+            (KeysState::Unknown, false, Fact::Unknown),
+        ] {
+            let store = store(keys, forked);
+            store
+                .write(|tx| {
+                    assert_eq!(TxFacts::new(tx).forked_or_missing(&alice), expected);
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    /// 12.5, 12.7: a fetched KeyPackage is added only for a current
+    /// device, and checked against its key; while the key file could not
+    /// be read at all, it is added unchecked.
+    #[test]
+    fn keypackage_devices_must_be_current() {
+        let alice = uid(ALICE);
+        let store = store(KeysState::Keys, false);
+        store
+            .write(|tx| {
+                assert_eq!(device_key_of(tx, &alice, &id(1)), Some(Some(vec![1; 1312])));
+                assert_eq!(device_key_of(tx, &alice, &id(2)), Some(None));
+                assert_eq!(device_key_of(tx, &alice, &id(3)), Some(None));
+                assert_eq!(device_key_of(tx, &alice, &id(9)), Some(None));
+                assert_eq!(device_key_of(tx, &uid("bob@example.org"), &id(1)), None);
+                Ok(())
+            })
+            .unwrap();
+        // Forked: nothing is added.
+        let store = super::tests::store(KeysState::Keys, true);
+        store
+            .write(|tx| {
+                assert_eq!(device_key_of(tx, &alice, &id(1)), Some(None));
+                Ok(())
+            })
+            .unwrap();
+        // An outage only: added, unconfirmed.
+        let store = super::tests::store(KeysState::Unknown, false);
+        store
+            .write(|tx| {
+                assert_eq!(device_key_of(tx, &alice, &id(1)), None);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 5.1, 4.8: a device starts the conversation with yourself only when
+    /// no other device of its identity is current.
+    #[test]
+    fn a_paired_device_waits_to_be_added() {
+        let alice = uid(ALICE);
+        let store = store(KeysState::Keys, false);
+        let own = |n: u8| OwnRow {
+            uid: ALICE.into(),
+            device_id: [n; 48],
+            key_id: ALICE.into(),
+            home: "chat.test".into(),
+            backup_generation: 1,
+            created: 1,
+            told_full: false,
+        };
+        // This device is 2; device 1 is current: wait.
+        store
+            .write(|tx| {
+                tx.add_own(&own(2))?;
+                assert!(!start_self_conversation(tx, &alice));
+                Ok(())
+            })
+            .unwrap();
+        // Alone (1 is current, and this is 1): start it.
+        let store = super::tests::store(KeysState::Keys, false);
+        store
+            .write(|tx| {
+                tx.add_own(&own(1))?;
+                assert!(start_self_conversation(tx, &alice));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 12.9: only the identity area's lines are routed to it.
+    #[test]
+    fn identity_lines() {
+        let lines = [
+            ("RECORDS -", true),
+            ("TEXT hello", false),
+            ("TYPING", false),
+        ];
+        for (text, expected) in lines {
+            let line = ContentLine::parse(text).unwrap();
+            assert_eq!(is_identity_line(&line), expected, "{text}");
+        }
+    }
+}
