@@ -450,6 +450,10 @@ impl Client {
     ///
     /// Nothing is done while a commit of this device is pending there.
     async fn reconcile(&self, account: AccountId, own: &Uid, row: &ConvRow) -> Result<()> {
+        let leaves = self.store().leaf_rows(row.id)?;
+        let readers = self.read_new_members(own, row).await?;
+        // Public rooms have no key checks: devices join by themselves
+        // (6.1, 12.7).
         if !matches!(
             row.kind,
             ConvKind::Direct | ConvKind::Private | ConvKind::WithYourself
@@ -465,7 +469,6 @@ impl Client {
         if pending {
             return Ok(());
         }
-        let leaves = self.store().leaf_rows(row.id)?;
         let (owners, mods) = match self.extension(row) {
             Ok(ext) => (ext.owners.clone(), ext.mods.clone()),
             Err(_) => return Ok(()),
@@ -486,28 +489,11 @@ impl Client {
                 || (mods.contains(uid) && my_role >= GroupRole::Mod)
                 || (!owners.contains(uid) && !mods.contains(uid))
         };
-        let mut uids: Vec<Uid> = leaves.iter().map(|l| l.uid.clone()).collect();
-        if let Some(peer) = &row.peer {
-            uids.push(peer.clone());
-        }
-        uids.push(own.clone());
-        uids.sort();
-        uids.dedup();
+        let uids = readers;
         let this_device = self
             .store()
             .own_identity(own.as_str())?
             .map(|o| o.device_id);
-        // Members whose key file this device never read: read it now
-        // (12.14), so that their devices can be checked.
-        for uid in uids.iter().filter(|u| !u.is_guest()) {
-            let fetched = self
-                .store()
-                .contact(uid.as_str())?
-                .is_some_and(|c| c.fetched.is_some());
-            if !fetched && let Err(e) = self.refresh_identity(uid.as_str()).await {
-                tracing::info!(error = %e, "reading a member's key file failed; will retry");
-            }
-        }
 
         // Removals: one identity per commit (12.7).
         for uid in uids.iter().filter(|u| !u.is_guest()) {
@@ -589,6 +575,37 @@ impl Client {
         Ok(())
     }
 
+    /// Reads the key file of each member of a conversation that this
+    /// device never read (12.14), so that their devices can be checked
+    /// and, in a public room, their ATTESTs (12.10). Later fetches are the
+    /// identity area's daily ones. In a public room this reads every
+    /// member once; 12.14 asks only for senders, so a choice to confirm.
+    /// Returns the members' identities, with the own one and a direct
+    /// conversation's peer.
+    async fn read_new_members(&self, own: &Uid, row: &ConvRow) -> Result<Vec<Uid>> {
+        let mut uids: Vec<Uid> = self
+            .store()
+            .leaf_rows(row.id)?
+            .into_iter()
+            .map(|l| l.uid)
+            .chain(row.peer.clone())
+            .chain(std::iter::once(own.clone()))
+            .filter(|u| !u.is_guest())
+            .collect();
+        uids.sort();
+        uids.dedup();
+        for uid in &uids {
+            let fetched = self
+                .store()
+                .contact(uid.as_str())?
+                .is_some_and(|c| c.fetched.is_some());
+            if !fetched && let Err(e) = self.refresh_identity(uid.as_str()).await {
+                tracing::info!(error = %e, "reading a member's key file failed; will retry");
+            }
+        }
+        Ok(uids)
+    }
+
     /// Queues a commit and lets the engine send it.
     async fn queue_commit(&self, row: &ConvRow, intent: Intent) -> Result<()> {
         let now = self.now_ms();
@@ -605,25 +622,58 @@ impl Client {
     /// [`maintenance_every`](super::ClientOptions::maintenance_every),
     /// for as long as the account runs and the client lives.
     pub(crate) fn spawn_maintenance(&self, account: AccountId) -> tokio::task::JoinHandle<()> {
+        use crate::store::Change;
+        use crate::store::conversations::ConversationChange;
+        use tokio::sync::broadcast::error::RecvError;
+
         let weak = std::sync::Arc::downgrade(&self.inner);
         let every = self
             .options()
             .maintenance_every
             .max(std::time::Duration::from_secs(1));
+        let mut events = self.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(every);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                // A group's members changed: read the new members' key
+                // files at once, before their first messages need them
+                // (12.10, 12.14); everything else on the timer.
+                let changed = tokio::select! {
+                    _ = interval.tick() => None,
+                    event = events.recv() => match event {
+                        Ok(Event::Changed(Change::Conversation(
+                            ConversationChange::Members(conv),
+                        ))) => Some(conv),
+                        Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => return,
+                    },
+                };
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
                 let client = Client { inner };
-                if let Err(e) = client.maintain(account).await {
+                let result = match changed {
+                    None => client.maintain(account).await,
+                    Some(conv) => client.members_changed(account, conv).await,
+                };
+                if let Err(e) = result {
                     tracing::info!(error = %e, "account upkeep failed; will retry");
                 }
             }
         })
+    }
+
+    /// A conversation's members changed: reads the key files of new ones.
+    async fn members_changed(&self, account: AccountId, conv: ConversationId) -> Result<()> {
+        let Some(row) = self.store().conversation_row(conv)? else {
+            return Ok(());
+        };
+        if row.account != account {
+            return Ok(());
+        }
+        let own = self.account(account)?.uid;
+        self.read_new_members(&own, &row).await.map(drop)
     }
 }
 
