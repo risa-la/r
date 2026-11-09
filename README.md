@@ -49,8 +49,8 @@ and in what order.
 | `risalad` | Rust | The server (`crates/risala-server`) |
 | `risala-keyfetch` | Rust | Fetches key files over HTTPS for the server (spec 4.4) |
 | `librisala` | Rust | The shared client library: connection, identity, sync, history cache, rooms, messages, moderation |
-| `risala-cli` | Rust | A small terminal client and key tool, built on librisala |
-| `risala-dev` | Rust | A local server filled with development data, for the apps |
+| `risala-cli` | Rust | A small, scriptable terminal client, built on librisala |
+| `risala-dev` | Rust | A local server with its key log and a witness, for the apps, the CLI and tests |
 | [`clients/apple`](clients/apple) | Swift, SwiftUI | macOS and iOS client, just started |
 | GNOME app | Rust, gtk4-rs, libadwaita | Linux client, planned |
 | Android app | Kotlin | Android client, planned |
@@ -82,41 +82,36 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-### Development data
+### Development server
 
-`risala-dev` runs a local server filled with realistic conversations,
-for the apps and the CLI to run against. Run it from the repository root:
-
-```
-nix run .#dev -- busy            # or: cargo run -p risala-dev -- busy
-nix run .#dev -- busy --live     # bots keep posting, editing, reacting and joining
-nix run .#dev -- huge --reset    # delete the state and seed again
-```
-
-The scenarios are `empty` (the account, in no conversation), `busy`
-(about 40 rooms: Arabic, English and mixed text, very long names and
-messages, 0 to 1,200 unread, edits, reactions, deletions, an
-announcements room, rooms with no messages, and a room the account is
-kicked from the first time it comes online) and `huge` (3,000 rooms).
-They are made from a fixed seed, so every run looks the same, and seeded
-through the protocol with the server's clock set back, so history has
-real dates over several weeks.
-
-State lives in `.dev/`, which git ignores: the database and certificate,
-and for clients `.dev/me.json` (the server's address, its fingerprint and
-the account, `me@risala.test`) and `.dev/me.pem` (the account's device
-key). Later runs serve the same state, so an app's cache and pinned
-fingerprint stay valid; after `--reset`, clear them. The server listens
-on `127.0.0.1:7473` as `localhost`, which the iOS simulator reaches. For a
-phone, add `--listen 0.0.0.0 --hostname <mac>.local`. On start it prints
-what to point a client at, including the `risala-cli` commands to sign
-in:
+`risala-dev` runs a local `risalad` named `chat.test` that hosts
+identities at `example.org`, keeps their key log, witnesses it, and
+serves the log, key files, files and blobs over HTTPS. Run it from the
+repository root:
 
 ```
-risala --state /tmp/risala-dev-cli trust localhost:7473 <fingerprint from me.json>
-risala --state /tmp/risala-dev-cli login localhost:7473 me@risala.test --key .dev/me.pem
-risala --state /tmp/risala-dev-cli sync
+nix run .#dev                    # or: cargo run -p risala-dev
+nix run .#dev -- --reset         # delete the state and start again
 ```
+
+State lives in `.dev/`, which git ignores: the database, the test CA and
+certificates, and `.dev/cli-args`, the options that point `risala` at
+the server (where it listens, its fingerprint, the CAs, the names and the
+witness). The chat server listens on `127.0.0.1:7473`, HTTPS on 7474.
+For example, two people talking:
+
+```
+A=$(cat .dev/cli-args)
+risala --state /tmp/alice $A --short-waits create chat.test alice laptop
+risala --state /tmp/bob $A --short-waits create chat.test bob laptop
+risala --state /tmp/alice $A --short-waits direct bob@example.org
+risala --state /tmp/alice $A --short-waits send bob@example.org hello
+risala --state /tmp/bob $A --short-waits read alice@example.org --sync
+```
+
+`--short-waits` cuts the protocol's random waits of up to 10 minutes to a
+second. M5a's seeded scenarios talked in plain text, which the current
+protocol has no commands for; they come back once rebuilt on librisala.
 
 ### Model checking with Kani
 

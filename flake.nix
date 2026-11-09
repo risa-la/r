@@ -115,8 +115,8 @@
                 cp target/*/release/deps/*.rlib $out/lib/
               '';
             };
-            # A local server filled with development data (README,
-            # "Development data"). Its tests run in checks.tests.
+            # A local server with its key log and a witness (README,
+            # "Development server"). Its tests run in checks.tests.
             risala-dev = rustPlatform.buildRustPackage {
               pname = "risala-dev";
               inherit version src cargoDeps;
@@ -126,7 +126,7 @@
               ];
               doCheck = false;
               meta = {
-                description = "A local risala server filled with development data";
+                description = "A local risala server with its key log and a witness";
                 license = lib.licenses.asl20;
                 mainProgram = "risala-dev";
               };
@@ -134,12 +134,12 @@
             default = config.packages.risalad;
           };
 
-          # `nix run .#dev -- busy`, from the root of the repository, where
-          # it keeps its state in .dev/.
+          # `nix run .#dev`, from the root of the repository, where it keeps
+          # its state in .dev/.
           apps.dev = {
             type = "app";
             program = lib.getExe config.packages.risala-dev;
-            meta.description = "A local risala server filled with development data";
+            meta.description = "A local risala server with its key log and a witness";
           };
 
           checks = {
