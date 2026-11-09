@@ -561,6 +561,7 @@ fn self_lines_from_unconfirmed_leaves_are_ignored() {
             },
             key,
             confirm: false,
+            distrust: Default::default(),
             blobs: net.server.blobs.clone(),
             blob_mode: net.blob_mode.clone(),
         }),

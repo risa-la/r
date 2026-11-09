@@ -2,6 +2,7 @@
 //! [`server`]: direct conversations, private rooms, the conversation with
 //! yourself, commits racing for an epoch, leaving, gaps and catching up.
 
+mod deletes;
 mod keychecks;
 mod public;
 mod recovery;
@@ -139,6 +140,9 @@ struct TestHooks {
     key: SigningKey,
     keys: KnownKeys,
     confirm: bool,
+    /// Devices whose leaves this device has not confirmed, despite
+    /// `confirm` (12.10).
+    distrust: std::sync::Mutex<std::collections::HashSet<[u8; 48]>>,
     blobs: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 48], Vec<u8>>>>,
     /// What the blob store answers: 0 the blob, 1 waiting, 2 none.
     blob_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -149,8 +153,11 @@ impl Hooks for TestHooks {
         Some(SigningKey::from_seed(*self.key.seed()))
     }
 
-    fn leaf_confirmed(&self, _: &Tx<'_>, _: ConversationId, _: &LeafRow) -> bool {
+    fn leaf_confirmed(&self, _: &Tx<'_>, _: ConversationId, leaf: &LeafRow) -> bool {
         self.confirm
+            && leaf
+                .device_id
+                .is_none_or(|d| !self.distrust.lock().unwrap().contains(&d))
     }
 
     fn device_key_of(
@@ -254,6 +261,7 @@ impl Net {
             keys: self.keys.clone(),
             key,
             confirm: true,
+            distrust: Default::default(),
             blobs: self.server.blobs.clone(),
             blob_mode: self.blob_mode.clone(),
         });

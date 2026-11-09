@@ -57,6 +57,11 @@ pub struct Message {
     /// copied by a transfer or backup while the message was received here
     /// (12.7, 12.13). Apps show it apart, as an unverified edit.
     pub unverified_edit: Option<String>,
+    /// Whether a DELETE from a leaf this device has not confirmed asks to
+    /// delete it (5.4, 12.10): apps show it as deleted but unconfirmed.
+    /// The DELETE applies once its leaf is confirmed, and is dropped if the
+    /// leaf turns out an impostor.
+    pub delete_unconfirmed: bool,
     /// Reactions, with how many of each.
     pub reactions: Vec<(String, u32)>,
 }
@@ -77,23 +82,22 @@ fn timestamp(ms: u64) -> Timestamp {
     Timestamp::from_unix_millis(ms).unwrap_or(Timestamp::MAX)
 }
 
-/// Whether this device checked a message itself: it sent it, or received
-/// it from a leaf it confirmed (12.10), not by transfer or backup (12.13).
-fn checked_here(row: &MessageRow) -> bool {
-    row.own || (row.verified && !row.restored)
-}
-
 /// Whether `edit` may replace the text of `original` (12.7, 12.13): an
 /// edit this device checked always; otherwise only if the original was not
 /// checked here either, and a copied edit only of a copied message.
 fn edit_may_replace(original: &MessageRow, edit: &MessageRow) -> bool {
-    checked_here(edit) || (!checked_here(original) && (original.restored || !edit.restored))
+    edit.checked_here() || (!original.checked_here() && (original.restored || !edit.restored))
 }
 
 /// Puts a conversation's rows together into messages (5.3): edits from
 /// the author only, the newest shown; reactions counted once per person
-/// and text; deleted messages without text.
-fn assemble(rows: &[MessageRow], direct: bool) -> Vec<Message> {
+/// and text; deleted messages without text. `unconfirmed` are the
+/// messages that a DELETE from a leaf not yet confirmed asks to delete.
+fn assemble(
+    rows: &[MessageRow],
+    direct: bool,
+    unconfirmed: &std::collections::BTreeSet<[u8; 16]>,
+) -> Vec<Message> {
     let by_id: BTreeMap<[u8; 16], &MessageRow> = rows.iter().map(|r| (r.message_id, r)).collect();
     let mut out = Vec::new();
     for row in rows {
@@ -171,6 +175,7 @@ fn assemble(rows: &[MessageRow], direct: bool) -> Vec<Message> {
             reply_to: reply_to.map(MessageId),
             edited: latest.is_some(),
             unverified_edit,
+            delete_unconfirmed: !row.deleted && unconfirmed.contains(&row.message_id),
             reactions: reactions.into_iter().collect(),
         });
     }
@@ -188,7 +193,8 @@ impl Client {
     ) -> Result<Vec<Message>> {
         let row = self.conv_row(conversation)?;
         let rows = self.store().message_rows(conversation)?;
-        let mut all = assemble(&rows, row.kind == ConvKind::Direct);
+        let unconfirmed = self.store().unconfirmed_deletes(conversation)?;
+        let mut all = assemble(&rows, row.kind == ConvKind::Direct, &unconfirmed);
         if let Some(before) = before
             && let Some(i) = all.iter().position(|m| m.id == before)
         {
@@ -444,7 +450,11 @@ mod tests {
         again.text = Some("+1".into());
         let mut reply = row(6, b);
         reply.reply_to = Some([2; 16]);
-        let shown = assemble(&[row(1, a), edit, forged, like, again, reply], true);
+        let shown = assemble(
+            &[row(1, a), edit, forged, like, again, reply],
+            true,
+            &Default::default(),
+        );
         assert_eq!(shown.len(), 2);
         assert_eq!(shown[0].text.as_deref(), Some("fixed"));
         assert!(shown[0].edited);
@@ -466,7 +476,11 @@ mod tests {
         let mut forged = row(2, a);
         forged.edit_of = Some([1; 16]);
         forged.text = Some("forged".into());
-        let shown = assemble(&[original.clone(), forged.clone()], false);
+        let shown = assemble(
+            &[original.clone(), forged.clone()],
+            false,
+            &Default::default(),
+        );
         assert_eq!(shown[0].text.as_deref(), Some("text 1"));
         assert!(shown[0].verified);
         assert!(!shown[0].edited);
@@ -478,7 +492,7 @@ mod tests {
         copied.text = Some("copied".into());
         copied.restored = true;
         copied.verified = true;
-        let shown = assemble(&[original.clone(), copied], false);
+        let shown = assemble(&[original.clone(), copied], false, &Default::default());
         assert_eq!(shown[0].text.as_deref(), Some("text 1"));
         assert_eq!(shown[0].unverified_edit.as_deref(), Some("copied"));
         // Even an unverified message received here is not changed by a
@@ -489,7 +503,7 @@ mod tests {
         copied.edit_of = Some([1; 16]);
         copied.text = Some("copied".into());
         copied.restored = true;
-        let shown = assemble(&[plain, copied], false);
+        let shown = assemble(&[plain, copied], false, &Default::default());
         assert_eq!(shown[0].text.as_deref(), Some("text 1"));
         // A verified edit replaces it; a later unverified one is shown
         // apart.
@@ -497,7 +511,11 @@ mod tests {
         good.edit_of = Some([1; 16]);
         good.text = Some("good".into());
         good.verified = true;
-        let shown = assemble(&[original.clone(), good.clone(), forged.clone()], false);
+        let shown = assemble(
+            &[original.clone(), good.clone(), forged.clone()],
+            false,
+            &Default::default(),
+        );
         assert_eq!(shown[0].text.as_deref(), Some("good"));
         assert!(shown[0].edited);
         assert_eq!(
@@ -506,8 +524,27 @@ mod tests {
         );
         let mut later = forged;
         later.seq = Some(9);
-        let shown = assemble(&[original, good, later], false);
+        let shown = assemble(&[original, good, later], false, &Default::default());
         assert_eq!(shown[0].text.as_deref(), Some("good"));
         assert_eq!(shown[0].unverified_edit.as_deref(), Some("forged"));
+    }
+
+    /// 5.4, 12.10: a message that a DELETE from an unconfirmed leaf asks to
+    /// delete keeps its text, and is flagged as deleted but unconfirmed.
+    #[test]
+    fn a_delete_from_an_unconfirmed_leaf_is_shown_apart() {
+        let a = "alice@example.org";
+        let mut original = row(1, a);
+        original.verified = true;
+        let unconfirmed = [[1; 16]].into_iter().collect();
+        let shown = assemble(&[original.clone(), row(2, a)], false, &unconfirmed);
+        assert_eq!(shown[0].text.as_deref(), Some("text 1"));
+        assert!(shown[0].delete_unconfirmed);
+        assert!(!shown[1].delete_unconfirmed);
+        // Once deleted, it is no longer unconfirmed.
+        original.deleted = true;
+        original.text = None;
+        let shown = assemble(&[original], false, &unconfirmed);
+        assert!(!shown[0].delete_unconfirmed);
     }
 }

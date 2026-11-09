@@ -18,6 +18,7 @@ use risala_proto::time::Timestamp;
 use super::group::{self, Applied};
 use super::{Ctx, EngineError, Note};
 use crate::store::Tx;
+use crate::store::confirm::{LeafConfirmation, LeafConfirmationRow};
 use crate::store::conversations::{ConvKind, ConvRow, ConversationId, LeafRow, is_blocked};
 use crate::store::messages::{NewMessage, NewOutbox, OutboxKind};
 
@@ -186,10 +187,15 @@ pub(crate) fn receive(
                         message.previous.map(|p| *p.as_bytes()),
                         d.identity.device_id.map(|d| *d.as_bytes()),
                     )?;
-                    // A DELETE that arrived first (5.4).
-                    for (by, with_role) in tx.kept_deletes(conv.id, &message_id)? {
-                        if by == uid || with_role {
+                    // A DELETE that arrived first (5.4): one from a leaf
+                    // this device had not confirmed erases only a message
+                    // that is not verified either (12.10).
+                    for kept in tx.kept_deletes(conv.id, &message_id)? {
+                        if (kept.by == uid || kept.by_role)
+                            && (kept.waits_for.is_none() || !verified)
+                        {
                             tx.erase_message(conv.id, &message_id)?;
+                            break;
                         }
                     }
                 }
@@ -197,7 +203,7 @@ pub(crate) fn receive(
                 break;
             }
             ContentLine::Delete { id } => {
-                delete(tx, conv, &ext, &uid, id.as_bytes(), t)?;
+                delete(tx, conv, &ext, &leaf, verified, id.as_bytes(), t)?;
             }
             ContentLine::Resync { mailbox: None, seq } => {
                 // 12.7: replace the leaf, after a random wait.
@@ -239,28 +245,88 @@ fn may_send(ext: &risala_mls::conversation::RisalaConversation, uid: &Uid) -> bo
     ext.send != SendMode::Mods || ext.role(uid) >= Role::Mod
 }
 
-/// A DELETE (5.4): by the author, or in a room by an owner or moderator
-/// at the message's epoch and at its place in the order of posts. This
-/// device applies posts in order, so the extension it holds is the one at
-/// the DELETE's place; the message's own epoch is almost always the same
-/// one.
+/// A DELETE (5.4) from `leaf`, `verified` if this device had confirmed
+/// it: by the author, or in a room by an owner or moderator at the
+/// message's epoch and at its place in the order of posts. This device
+/// applies posts in order, so the extension it holds is the one at the
+/// DELETE's place; the message's own epoch is almost always the same one.
+///
+/// As for edits, a DELETE erases a message only if its leaf is at least as
+/// trusted as the message's (12.10): one from a leaf this device has not
+/// confirmed waits, while the message shows as deleted but unconfirmed,
+/// until the leaf is confirmed, and goes if the leaf turns out an impostor
+/// ([`settle_deletes`]).
 fn delete(
     tx: &mut Tx<'_>,
     conv: &ConvRow,
     ext: &risala_mls::conversation::RisalaConversation,
-    by: &Uid,
+    leaf: &LeafRow,
+    verified: bool,
     target: &[u8; 16],
     t: u64,
 ) -> Result<()> {
+    let by = &leaf.uid;
     let room = matches!(conv.kind, ConvKind::Private | ConvKind::Public);
     let with_role = room && ext.role(by) >= Role::Mod;
+    let waits_for = if verified {
+        None
+    } else {
+        // 12.10: nothing from a leaf found an impostor, and nothing that
+        // could not wait for a leaf the device does not know.
+        let impostor = tx.leaf_confirmations(conv.id)?.iter().any(|c| {
+            c.leaf == leaf.leaf
+                && c.signature_key == leaf.signature_key
+                && c.state == LeafConfirmation::Impostor
+        });
+        if impostor || leaf.signature_key.is_empty() {
+            return Ok(());
+        }
+        Some((leaf.leaf, leaf.signature_key.as_slice()))
+    };
     match tx.message(conv.id, target)? {
         Some(m) => {
-            if m.sender == *by || with_role {
+            if m.deleted || !(m.sender == *by || with_role) {
+                return Ok(());
+            }
+            if waits_for.is_none() || !m.checked_here() {
                 tx.erase_message(conv.id, target)?;
+            } else {
+                tx.keep_delete(conv.id, target, by, with_role, waits_for, t)?;
             }
         }
-        None => tx.keep_delete(conv.id, target, by, with_role, t)?,
+        None => tx.keep_delete(conv.id, target, by, with_role, waits_for, t)?,
+    }
+    Ok(())
+}
+
+/// Settles the DELETEs that wait for leaves this device had not confirmed
+/// (5.4, 12.10), from the leaves' states as leaf confirmation (C3) wrote
+/// them: those of a leaf now confirmed with the same key apply, and those
+/// of a leaf found an impostor, or no longer in the tree with that key, go.
+pub(crate) fn settle_deletes(
+    tx: &mut Tx<'_>,
+    conv: ConversationId,
+    leaves: &[LeafConfirmationRow],
+) -> Result<()> {
+    for (leaf, key) in tx.delete_leaves(conv)? {
+        let state = leaves
+            .iter()
+            .find(|l| l.leaf == leaf && l.signature_key == key)
+            .map(|l| l.state);
+        match state {
+            Some(LeafConfirmation::Unconfirmed) => {}
+            Some(LeafConfirmation::Confirmed) => {
+                for (target, by, by_role) in tx.confirm_deletes(conv, leaf, &key)? {
+                    if let Some(m) = tx.message(conv, &target)?
+                        && !m.deleted
+                        && (m.sender == by || by_role)
+                    {
+                        tx.erase_message(conv, &target)?;
+                    }
+                }
+            }
+            Some(LeafConfirmation::Impostor) | None => tx.drop_deletes(conv, leaf, &key)?,
+        }
     }
     Ok(())
 }

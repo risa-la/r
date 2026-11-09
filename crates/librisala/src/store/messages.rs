@@ -57,18 +57,24 @@ CREATE TABLE seen (
     PRIMARY KEY (conv, message_id)
 ) WITHOUT ROWID;
 
--- DELETEs whose target has not arrived yet (5.4): applied when it does.
--- by is the deleting identity, by_role whether it held a role that may
--- delete others' messages.
--- kept is the `t` of the post that carried it: at most MAX_KEPT_DELETES
--- are kept per sender, and none past retention (LR-L3).
+-- DELETEs not yet applied (5.4): their target has not arrived, or it
+-- is more trusted than the DELETE's leaf (12.10). by is the deleting
+-- identity, by_role whether it held a role that may delete others'
+-- messages. leaf and leaf_key are the DELETE's leaf and its signature
+-- key when this device had not confirmed it: the DELETE then waits for
+-- that leaf to be confirmed, and goes if it turns out an impostor or
+-- leaves the tree with that key. leaf_key is empty for a DELETE from a
+-- confirmed leaf. kept is the `t` of the post that carried it: at most
+-- MAX_KEPT_DELETES are kept per sender, and none past retention (LR-L3).
 CREATE TABLE deletes (
-    conv    INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    target  BLOB NOT NULL,
-    by      TEXT NOT NULL,
-    by_role INTEGER NOT NULL,
-    kept    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (conv, target, by)
+    conv     INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    target   BLOB NOT NULL,
+    by       TEXT NOT NULL,
+    by_role  INTEGER NOT NULL,
+    kept     INTEGER NOT NULL DEFAULT 0,
+    leaf     INTEGER,
+    leaf_key BLOB NOT NULL DEFAULT x'',
+    PRIMARY KEY (conv, target, by, leaf_key)
 ) WITHOUT ROWID;
 
 -- Gaps in a leaf's messages (7.4): counters not received, and whether
@@ -286,6 +292,27 @@ fn message_row(row: &Row<'_>) -> rusqlite::Result<(MessageRow, String)> {
 fn finish_message((mut row, sender): (MessageRow, String)) -> Result<MessageRow, StoreError> {
     row.sender = parse(&sender, "uid")?;
     Ok(row)
+}
+
+impl MessageRow {
+    /// Whether this device checked the message itself: it sent it, or
+    /// received it from a leaf it had confirmed (12.10), not by transfer or
+    /// backup (12.13). Only as trusted an edit or DELETE changes it.
+    pub fn checked_here(&self) -> bool {
+        self.own || (self.verified && !self.restored)
+    }
+}
+
+/// A DELETE kept until its target arrives or its leaf is confirmed (5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeptDelete {
+    /// The deleting identity.
+    pub by: Uid,
+    /// Whether it held a role that may delete others' messages.
+    pub by_role: bool,
+    /// The DELETE's leaf and signature key, if this device had not
+    /// confirmed it (12.10).
+    pub waits_for: Option<(u32, Vec<u8>)>,
 }
 
 /// The most DELETEs whose target has not arrived that one sender keeps in
@@ -680,29 +707,48 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Keeps a DELETE whose target has not arrived (5.4), from a post with
-    /// `t`. Any member can send DELETEs for ids that never come, so each
-    /// sender keeps at most [`MAX_KEPT_DELETES`] in a conversation, the
-    /// newest (LR-L3).
+    /// Keeps a DELETE whose target has not arrived, or that waits for its
+    /// leaf to be confirmed (5.4, 12.10), from a post with `t`.
+    /// `waits_for` is the DELETE's leaf and signature key, if this device
+    /// has not confirmed it. Any member can send DELETEs for ids that never
+    /// come, so each sender keeps at most [`MAX_KEPT_DELETES`] in a
+    /// conversation, the newest (LR-L3).
     pub(crate) fn keep_delete(
         &mut self,
         conv: ConversationId,
         target: &[u8; 16],
         by: &Uid,
         by_role: bool,
+        waits_for: Option<(u32, &[u8])>,
         t: u64,
     ) -> Result<(), StoreError> {
+        let (leaf, key) = match waits_for {
+            Some((leaf, key)) => (Some(leaf), key),
+            None => (None, &[][..]),
+        };
         self.conn().execute(
-            "INSERT INTO deletes (conv, target, by, by_role, kept) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO deletes (conv, target, by, by_role, kept, leaf, leaf_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT DO UPDATE SET by_role = max(by_role, excluded.by_role)",
-            params![conv.0, &target[..], by.as_str(), by_role, t as i64],
+            params![
+                conv.0,
+                &target[..],
+                by.as_str(),
+                by_role,
+                t as i64,
+                leaf,
+                key
+            ],
         )?;
         self.conn().execute(
-            "DELETE FROM deletes WHERE conv = ?1 AND by = ?2 AND target NOT IN (
-                 SELECT target FROM deletes WHERE conv = ?1 AND by = ?2
-                 ORDER BY kept DESC, target LIMIT ?3)",
+            "DELETE FROM deletes WHERE conv = ?1 AND by = ?2 AND (target, leaf_key) NOT IN (
+                 SELECT target, leaf_key FROM deletes WHERE conv = ?1 AND by = ?2
+                 ORDER BY kept DESC, target, leaf_key LIMIT ?3)",
             params![conv.0, by.as_str(), MAX_KEPT_DELETES as i64],
         )?;
+        if waits_for.is_some() {
+            self.changed(Change::Message(MessageChange::Messages(conv)));
+        }
         Ok(())
     }
 
@@ -714,24 +760,99 @@ impl Tx<'_> {
             .execute("DELETE FROM deletes WHERE kept < ?1", [before as i64])?)
     }
 
-    /// The DELETEs kept for `target`: who, and whether with a role.
+    /// The DELETEs kept for `target`.
     pub(crate) fn kept_deletes(
         &self,
         conv: ConversationId,
         target: &[u8; 16],
-    ) -> Result<Vec<(Uid, bool)>, StoreError> {
-        let mut stmt = self
-            .conn()
-            .prepare_cached("SELECT by, by_role FROM deletes WHERE conv = ?1 AND target = ?2")?;
+    ) -> Result<Vec<KeptDelete>, StoreError> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT by, by_role, leaf, leaf_key FROM deletes WHERE conv = ?1 AND target = ?2",
+        )?;
         let rows = stmt.query_map(params![conv.0, &target[..]], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, Option<u32>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (by, role) = row?;
-            out.push((parse(&by, "uid")?, role));
+            let (by, by_role, leaf, key) = row?;
+            out.push(KeptDelete {
+                by: parse(&by, "uid")?,
+                by_role,
+                waits_for: leaf.filter(|_| !key.is_empty()).map(|l| (l, key)),
+            });
         }
         Ok(out)
+    }
+
+    /// The leaves, with their signature keys, that kept DELETEs wait for
+    /// (12.10).
+    pub(crate) fn delete_leaves(
+        &self,
+        conv: ConversationId,
+    ) -> Result<Vec<(u32, Vec<u8>)>, StoreError> {
+        let mut stmt = self.conn().prepare_cached(
+            "SELECT DISTINCT leaf, leaf_key FROM deletes
+             WHERE conv = ?1 AND leaf IS NOT NULL AND length(leaf_key) > 0",
+        )?;
+        let rows = stmt.query_map([conv.0], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The DELETEs that waited for a leaf, now confirmed with `key`
+    /// (12.10): they count as from a confirmed leaf from now on. Returns
+    /// each one's target, sender, and whether it held a role.
+    pub(crate) fn confirm_deletes(
+        &mut self,
+        conv: ConversationId,
+        leaf: u32,
+        key: &[u8],
+    ) -> Result<Vec<([u8; 16], Uid, bool)>, StoreError> {
+        let mut out = Vec::new();
+        {
+            let mut stmt = self.conn().prepare_cached(
+                "SELECT target, by, by_role FROM deletes
+                 WHERE conv = ?1 AND leaf = ?2 AND leaf_key = ?3",
+            )?;
+            let rows = stmt.query_map(params![conv.0, leaf, key], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+            })?;
+            for row in rows {
+                let (target, by, by_role) = row?;
+                let target = opt_fixed(Some(target))?.unwrap_or_default();
+                out.push((target, parse(&by, "uid")?, by_role));
+            }
+        }
+        // Where one from a confirmed leaf is kept already, it stays.
+        self.conn().execute(
+            "UPDATE OR IGNORE deletes SET leaf = NULL, leaf_key = x''
+             WHERE conv = ?1 AND leaf = ?2 AND leaf_key = ?3",
+            params![conv.0, leaf, key],
+        )?;
+        self.drop_deletes(conv, leaf, key)?;
+        Ok(out)
+    }
+
+    /// Drops the DELETEs that wait for a leaf with `key` (12.10): it is an
+    /// impostor, or it will never be confirmed with that key.
+    pub(crate) fn drop_deletes(
+        &mut self,
+        conv: ConversationId,
+        leaf: u32,
+        key: &[u8],
+    ) -> Result<(), StoreError> {
+        let n = self.conn().execute(
+            "DELETE FROM deletes WHERE conv = ?1 AND leaf = ?2 AND leaf_key = ?3",
+            params![conv.0, leaf, key],
+        )?;
+        if n > 0 {
+            self.changed(Change::Message(MessageChange::Messages(conv)));
+        }
+        Ok(())
     }
 
     /// Records a gap in a leaf's messages (7.4).
@@ -1165,6 +1286,32 @@ impl Store {
     /// not yet posted last.
     pub fn message_rows(&self, conv: ConversationId) -> Result<Vec<MessageRow>, StoreError> {
         self.read(|conn| read::messages(conn, conv))
+    }
+
+    /// The messages of a conversation that a DELETE from a leaf this
+    /// device has not confirmed asks to delete (5.4, 12.10): shown as
+    /// deleted but unconfirmed, until the leaf is confirmed or found an
+    /// impostor.
+    pub fn unconfirmed_deletes(
+        &self,
+        conv: ConversationId,
+    ) -> Result<std::collections::BTreeSet<[u8; 16]>, StoreError> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT DISTINCT d.target FROM deletes d
+                 JOIN messages m ON m.conv = d.conv AND m.message_id = d.target
+                 WHERE d.conv = ?1 AND length(d.leaf_key) > 0 AND m.deleted = 0
+                   AND (d.by = m.sender OR d.by_role)",
+            )?;
+            let rows = stmt.query_map([conv.0], |r| r.get::<_, Vec<u8>>(0))?;
+            let mut out = std::collections::BTreeSet::new();
+            for row in rows {
+                if let Some(id) = opt_fixed(Some(row?))? {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        })
     }
 
     /// The gaps of a conversation (7.4).

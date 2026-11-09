@@ -543,6 +543,9 @@ impl Confirm {
             });
         }
         tx.set_leaf_confirmations(conv, &rows)?;
+        // 5.4: DELETEs that waited for a leaf now confirmed apply, and those
+        // of an impostor or a leaf gone are dropped.
+        content::settle_deletes(tx, conv, &rows)?;
         tx.set_confirmer(
             conv,
             &json!(c)?,

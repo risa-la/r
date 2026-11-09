@@ -38,6 +38,7 @@ fn own_facts(net: &mut Net, d: usize) -> KnownKeys {
             keys: keys.clone(),
             key,
             confirm: true,
+            distrust: Default::default(),
             blobs: net.server.blobs.clone(),
             blob_mode: net.blob_mode.clone(),
         }),

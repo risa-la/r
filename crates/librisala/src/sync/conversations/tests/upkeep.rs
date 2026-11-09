@@ -237,7 +237,7 @@ fn kept_deletes_are_bounded_and_expire() {
         for i in 0..300u32 {
             let mut target = [0u8; 16];
             target[..4].copy_from_slice(&i.to_be_bytes());
-            tx.keep_delete(a, &target, &bob_uid, false, now + u64::from(i))?;
+            tx.keep_delete(a, &target, &bob_uid, false, None, now + u64::from(i))?;
         }
         Ok(())
     });
