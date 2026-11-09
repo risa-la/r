@@ -136,8 +136,22 @@ impl ConversationEngine {
             }
             Ok(made) => made,
         };
-        // TODO(C4): a tree too large for a line goes as a blob (12.12); a
-        // new room's tree has one leaf.
+        // 12.12: a new room's GroupInfo and tree hold one leaf, and fit a
+        // line. Its mailbox does not exist yet, so no blob could be stored
+        // with its box and a send token (12.12) anyway: one too long fails.
+        if super::blobs::as_blobs(&[info.len(), tree.len()], self.config.line_limit).contains(&true)
+        {
+            self.write(cx, me, out, |tx, _| {
+                tx.set_state(made.conv, ConvState::Failed)?;
+                Ok(())
+            })?;
+            out.push(job_done(
+                id,
+                None,
+                Some("CREATE: the room's GroupInfo and tree do not fit a line".into()),
+            ));
+            return Ok(());
+        }
         let groupinfo =
             GroupInfoText::from_bytes(&info).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let tree = TreeText::from_bytes(&tree).map_err(|e| EngineError::Invalid(e.to_string()))?;

@@ -39,8 +39,10 @@ fn own_facts(net: &mut Net, d: usize) -> KnownKeys {
             key,
             confirm: true,
             distrust: Default::default(),
+            puts: Default::default(),
             blobs: net.server.blobs.clone(),
             blob_mode: net.blob_mode.clone(),
+            hold_puts: net.hold_puts.clone(),
         }),
         Arc::new(net.clock.clone()),
     );

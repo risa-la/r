@@ -2,6 +2,7 @@
 //! [`server`]: direct conversations, private rooms, the conversation with
 //! yourself, commits racing for an epoch, leaving, gaps and catching up.
 
+mod blobs;
 mod deletes;
 mod keychecks;
 mod public;
@@ -143,9 +144,13 @@ struct TestHooks {
     /// Devices whose leaves this device has not confirmed, despite
     /// `confirm` (12.10).
     distrust: std::sync::Mutex<std::collections::HashSet<[u8; 48]>>,
+    /// PUTs of blobs in flight (12.12).
+    puts: std::sync::Mutex<std::collections::HashMap<BlobRef, Vec<u8>>>,
     blobs: Arc<std::sync::Mutex<std::collections::HashMap<[u8; 48], Vec<u8>>>>,
     /// What the blob store answers: 0 the blob, 1 waiting, 2 none.
     blob_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// While set, PUTs of blobs stay in flight (12.12).
+    hold_puts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Hooks for TestHooks {
@@ -184,6 +189,26 @@ impl Hooks for TestHooks {
             _ => BlobFetch::Unavailable,
         }
     }
+
+    /// The PUT lands in the server's blob store, unless PUTs are held
+    /// (12.12).
+    fn put_blob(&self, _: &str, blob: &BlobRef, bytes: Arc<Vec<u8>>) {
+        assert_eq!(BlobRef::of(&bytes), *blob);
+        self.puts.lock().unwrap().insert(*blob, bytes.to_vec());
+    }
+
+    fn blob_put(&self, blob: &BlobRef) -> BlobPut {
+        if self.hold_puts.load(std::sync::atomic::Ordering::SeqCst) {
+            return BlobPut::Waiting;
+        }
+        match self.puts.lock().unwrap().remove(blob) {
+            Some(bytes) => {
+                self.blobs.lock().unwrap().insert(*blob.hash(), bytes);
+                BlobPut::Done
+            }
+            None => BlobPut::Failed,
+        }
+    }
 }
 
 struct Device {
@@ -215,6 +240,7 @@ struct Net {
     queue: VecDeque<(usize, Owned)>,
     clock: ManualClock,
     blob_mode: Arc<std::sync::atomic::AtomicU8>,
+    hold_puts: Arc<std::sync::atomic::AtomicBool>,
     keys: KnownKeys,
 }
 
@@ -226,6 +252,7 @@ impl Net {
             queue: VecDeque::new(),
             clock: ManualClock::new(START),
             blob_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            hold_puts: Arc::default(),
             keys: KnownKeys::default(),
         }
     }
@@ -262,8 +289,10 @@ impl Net {
             key,
             confirm: true,
             distrust: Default::default(),
+            puts: Default::default(),
             blobs: self.server.blobs.clone(),
             blob_mode: self.blob_mode.clone(),
+            hold_puts: self.hold_puts.clone(),
         });
         let engine =
             ConversationEngine::new(config.clone(), hooks.clone(), Arc::new(self.clock.clone()));

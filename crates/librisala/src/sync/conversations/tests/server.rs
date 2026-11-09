@@ -121,6 +121,61 @@ pub struct FakeServer {
     pub blob_posts: bool,
     /// The blob store: bytes by hash.
     pub blobs: std::sync::Arc<std::sync::Mutex<HashMap<[u8; 48], Vec<u8>>>>,
+    /// How many BLOBs answered with a put URL (12.12).
+    pub blob_commands: usize,
+}
+
+impl FakeServer {
+    /// `command`, with the blobs its blob-refs name in place (12.12):
+    /// `ERR not-found` for one the server does not hold.
+    fn inline_blobs(&self, command: Command) -> Result<Command, End> {
+        let blobs = self.blobs.lock().unwrap();
+        let get = |b: &risala_proto::names::BlobRef| {
+            blobs
+                .get(b.hash())
+                .cloned()
+                .ok_or_else(|| err(ErrorCode::NotFound))
+        };
+        Ok(match command {
+            Command::Post {
+                mailbox,
+                token,
+                message,
+                live,
+                groupinfo,
+                next,
+                cid,
+            } => Command::Post {
+                mailbox,
+                token,
+                message: match message {
+                    OrBlob::Blob(b) => OrBlob::Inline(
+                        risala_proto::mls::MlsMessage::from_bytes(&get(&b)?).unwrap(),
+                    ),
+                    inline => inline,
+                },
+                live,
+                groupinfo: match groupinfo {
+                    Some(OrBlob::Blob(b)) => Some(OrBlob::Inline(
+                        risala_proto::mls::GroupInfo::from_bytes(&get(&b)?).unwrap(),
+                    )),
+                    other => other,
+                },
+                next,
+                cid,
+            },
+            Command::Welcome(WelcomeCommand::Put {
+                key_package_ref,
+                secret,
+                welcome: OrBlob::Blob(b),
+            }) => Command::Welcome(WelcomeCommand::Put {
+                key_package_ref,
+                secret,
+                welcome: OrBlob::Inline(risala_proto::mls::Welcome::from_bytes(&get(&b)?).unwrap()),
+            }),
+            command => command,
+        })
+    }
 }
 
 fn ok() -> OkResponse {
@@ -167,6 +222,7 @@ impl FakeServer {
             refuse_welcomes: 0,
             blob_posts: false,
             blobs: Default::default(),
+            blob_commands: 0,
         }
     }
 
@@ -338,7 +394,35 @@ impl FakeServer {
         };
         let mut lines = Vec::new();
         let mut live = Vec::new();
+        // 12.12: blob-refs in a POST or WELCOME PUT stand for the blobs'
+        // bytes, which BLOB and the hooks' PUT stored.
+        let command = match self.inline_blobs(command) {
+            Ok(command) => command,
+            Err(end) => {
+                return (Response { lines, end }, live);
+            }
+        };
         let end = match command {
+            Command::Blob { hash, permit, .. } => {
+                let member = permit.as_ref().is_some_and(|p| {
+                    self.mailboxes.get(&p.mailbox.to_string()).is_some_and(|m| {
+                        m.tokens
+                            .values()
+                            .any(|set| set.contains(&sha384(p.token.as_bytes())))
+                    })
+                });
+                if !member {
+                    err(ErrorCode::Forbidden)
+                } else if self.blobs.lock().unwrap().contains_key(hash.hash()) {
+                    End::Ok(ok().with_exists())
+                } else {
+                    self.blob_commands += 1;
+                    End::Ok(
+                        ok().with_put_url(&format!("https://chat.example.org/put/{}", hash.hex()))
+                            .unwrap(),
+                    )
+                }
+            }
             Command::Create {
                 mailbox,
                 group_id,

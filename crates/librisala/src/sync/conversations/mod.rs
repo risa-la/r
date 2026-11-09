@@ -37,6 +37,7 @@
 //! confirmation (task C3), and the lines of transfers and reports (task
 //! C4). `content::queue_lines` is how those areas send lines.
 
+mod blobs;
 pub(crate) mod content;
 pub(crate) mod group;
 mod keycheck;
@@ -59,7 +60,7 @@ use risala_mls::checks::{Fact, KeyFacts};
 use risala_mls::conversation::RisalaConversation;
 use risala_mls::identity::DeviceId;
 use risala_mls::mldsa::SigningKey;
-use risala_proto::command::{Command, CreateForm, KeyPkgCommand, WelcomeCommand};
+use risala_proto::command::{Command, CreateForm, KeyPkgCommand, MailboxPermit, WelcomeCommand};
 use risala_proto::connection::ConnectionKind;
 use risala_proto::content::ContentLine;
 use risala_proto::error::ErrorCode;
@@ -137,6 +138,10 @@ pub struct Config {
     /// How long a RESYNC may go unanswered before the device asks its own
     /// devices with `RESYNC <box> <seq>` (12.7): an hour.
     pub resync_escalate_ms: u64,
+    /// The longest POST or WELCOME PUT line, LF included, that carries its
+    /// MLS objects inline; past it, they go as blobs (2.3, 12.12). The
+    /// long-line limit of 2.3, 1 MiB; tests lower it.
+    pub line_limit: usize,
 }
 
 impl Default for Config {
@@ -155,6 +160,7 @@ impl Default for Config {
             retention_ms: 7 * 24 * 60 * 60 * 1000,
             move_fallback_ms: 10 * 60 * 1000,
             resync_escalate_ms: 60 * 60 * 1000,
+            line_limit: risala_proto::frame::MAX_LONG_CLIENT_LINE,
         }
     }
 }
@@ -365,6 +371,32 @@ pub(crate) trait Hooks: Send + Sync {
         let _ = (account, prefix, blob);
         BlobFetch::Unavailable
     }
+
+    /// Stores a blob of this device's (12.12), a commit, GroupInfo or
+    /// Welcome too long for a line: an HTTP PUT of `bytes` to `url`, the
+    /// `put` URL that BLOB answered, in the background. The engine asks how
+    /// it went with [`Hooks::blob_put`] on later steps. Called outside a
+    /// transaction of the cache.
+    fn put_blob(&self, url: &str, blob: &BlobRef, bytes: Arc<Vec<u8>>) {
+        let _ = (url, blob, bytes);
+    }
+
+    /// How the PUT of `blob` that [`Hooks::put_blob`] started went.
+    fn blob_put(&self, blob: &BlobRef) -> BlobPut {
+        let _ = blob;
+        BlobPut::Failed
+    }
+}
+
+/// How a blob's PUT went ([`Hooks::blob_put`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobPut {
+    /// Still going: ask again later.
+    Waiting,
+    /// The server has it.
+    Done,
+    /// It failed, or no PUT of it is known.
+    Failed,
 }
 
 /// What `Hooks::blob` has of a blob.
@@ -675,6 +707,12 @@ enum Pending {
         conv: ConversationId,
     },
     ServerInfo,
+    /// BLOB for a blob of this device's (12.12), with its bytes for the
+    /// PUT.
+    Blob {
+        blob: BlobRef,
+        bytes: Arc<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,6 +800,12 @@ pub struct ConversationEngine {
     need_info: std::sync::atomic::AtomicBool,
     /// Welcomes whose blob is being fetched (12.12).
     welcome_blobs: Vec<(risala_proto::names::Id, BlobRef)>,
+    /// Blobs of this device's being stored for its posts and Welcomes
+    /// (12.12).
+    uploads: HashMap<BlobRef, blobs::Upload>,
+    /// Posts made and waiting for their blobs to be stored, by
+    /// conversation (12.12). Their outbox rows stay sent.
+    blob_waits: HashMap<ConversationId, Vec<NextPost>>,
     /// Devices added again after a refused WELCOME PUT, once each, so
     /// that a server that refuses every Welcome cannot loop the group
     /// through commits (12.8).
@@ -826,6 +870,8 @@ impl ConversationEngine {
             info_answered: false,
             need_info: std::sync::atomic::AtomicBool::new(false),
             welcome_blobs: Vec::new(),
+            uploads: HashMap::new(),
+            blob_waits: HashMap::new(),
             readded: HashSet::new(),
             started: false,
             welcomes_listed: false,
@@ -2019,6 +2065,7 @@ impl ConversationEngine {
             Pending::Post { conv, outbox, live } => {
                 self.on_post_reply(cx, &me, conv, outbox, live, response, out)?;
             }
+            Pending::Blob { blob, bytes } => self.on_blob_reply(blob, bytes, response),
             Pending::Create { job, conv } => match &response.end {
                 End::Ok(_) => {
                     if let Some(job) = job {
@@ -2623,9 +2670,13 @@ impl ConversationEngine {
             if !self.caught_up(&mailbox.mailbox) {
                 continue;
             }
-            let posts = self.write(cx, me, out, |tx, c| {
-                next_posts(tx, c, &conv, now, signed_in)
-            });
+            // 12.12: posts made already, whose blobs are being stored.
+            let posts = match self.blob_waits.remove(&conv.id) {
+                Some(posts) => Ok(posts),
+                None => self.write(cx, me, out, |tx, c| {
+                    next_posts(tx, c, &conv, now, signed_in)
+                }),
+            };
             let posts = match posts {
                 Ok(posts) => posts,
                 Err(e) => {
@@ -2633,7 +2684,8 @@ impl ConversationEngine {
                     continue;
                 }
             };
-            for p in posts {
+            let mut posts = posts.into_iter();
+            while let Some(p) = posts.next() {
                 let token = SendTokenText::from_bytes(*p.token.as_bytes());
                 if let Some(create) = p.create {
                     let next = p
@@ -2664,16 +2716,79 @@ impl ConversationEngine {
                     );
                     continue;
                 }
-                let message = MlsMessage::from_bytes(&p.post)
-                    .map_err(|e| EngineError::Invalid(e.to_string()))?;
-                // TODO(C4): a commit or GroupInfo too large for a line goes
-                // as a blob (12.12), stored over an anonymous connection.
-                let groupinfo = match &p.groupinfo {
-                    Some(g) => Some(OrBlob::Inline(
+                // 12.12: a commit or GroupInfo too long for a line goes as a
+                // blob, stored first over the anonymous connection that
+                // follows the mailbox (6.1, 12.6). An external commit has no
+                // send token of the group's epoch to store one with, so it
+                // goes inline whatever its length, and the server refuses
+                // it if too long (12.7: the device then joins by proposal).
+                let groupinfo_len = p.groupinfo.as_ref().map_or(0, Vec::len);
+                let as_blob = if p.external {
+                    vec![false, false]
+                } else {
+                    blobs::as_blobs(&[p.post.len(), groupinfo_len], self.config.line_limit)
+                };
+                let message_blob = as_blob[0].then(|| Arc::new(p.post.clone()));
+                let groupinfo_blob = p
+                    .groupinfo
+                    .as_ref()
+                    .filter(|_| as_blob[1])
+                    .map(|g| Arc::new(g.clone()));
+                let stored: Vec<(BlobRef, Arc<Vec<u8>>)> = [&message_blob, &groupinfo_blob]
+                    .into_iter()
+                    .flatten()
+                    .map(|b| (BlobRef::of(b), b.clone()))
+                    .collect();
+                if !stored.is_empty() {
+                    let permit = MailboxPermit {
+                        mailbox: mailbox.mailbox,
+                        token: token.clone(),
+                    };
+                    match self.blobs_stored(out, &permit, &stored) {
+                        blobs::Blobs::Stored => {}
+                        // Posted on a later step, as made, once stored; the
+                        // posts after it wait too, to keep their order.
+                        blobs::Blobs::Waiting => {
+                            let waiting = std::iter::once(p).chain(posts).collect();
+                            self.blob_waits.insert(conv.id, waiting);
+                            break;
+                        }
+                        // Made again later: the group may have moved on.
+                        blobs::Blobs::Failed => {
+                            let back: Vec<i64> = std::iter::once(p.outbox)
+                                .chain(posts.map(|p| p.outbox))
+                                .collect();
+                            let retry = now + self.config.retry_ms.max(1_000);
+                            self.write(cx, me, out, |tx, _| {
+                                for id in back {
+                                    tx.update_outbox(
+                                        id,
+                                        OutboxState::Queued,
+                                        None,
+                                        None,
+                                        Some(retry),
+                                    )?;
+                                }
+                                Ok(())
+                            })?;
+                            break;
+                        }
+                    }
+                }
+                let message = match &message_blob {
+                    Some(b) => OrBlob::Blob(BlobRef::of(b)),
+                    None => OrBlob::Inline(
+                        MlsMessage::from_bytes(&p.post)
+                            .map_err(|e| EngineError::Invalid(e.to_string()))?,
+                    ),
+                };
+                let groupinfo = match (&p.groupinfo, &groupinfo_blob) {
+                    (_, Some(b)) => Some(OrBlob::Blob(BlobRef::of(b))),
+                    (Some(g), None) => Some(OrBlob::Inline(
                         risala_proto::mls::GroupInfo::from_bytes(g)
                             .map_err(|e| EngineError::Invalid(e.to_string()))?,
                     )),
-                    None => None,
+                    (None, None) => None,
                 };
                 let command = Command::Post {
                     mailbox: mailbox.mailbox,
@@ -2682,7 +2797,7 @@ impl ConversationEngine {
                     } else {
                         PostToken::Send(token)
                     },
-                    message: OrBlob::Inline(message),
+                    message,
                     live: p.live,
                     groupinfo,
                     next: p.next.map(TokenHash::from_bytes),
@@ -2742,8 +2857,41 @@ impl ConversationEngine {
             let Ok(reference) = <[u8; 48]>::try_from(w.reference.as_slice()) else {
                 continue;
             };
-            let welcome = WelcomeText::from_bytes(&w.welcome)
-                .map_err(|e| EngineError::Invalid(e.to_string()))?;
+            // 12.8, 12.12: a Welcome too long for a line, one that carries a
+            // large private room's tree, goes as a blob of its own, stored
+            // with the group's mailbox and send token.
+            let welcome = if blobs::as_blobs(&[w.welcome.len()], self.config.line_limit)[0] {
+                let permit = self.write(cx, me, out, |tx, c| {
+                    let row = tx.conversation(w.conv)?;
+                    let (token, _) = group::send_token(tx, c, &row)?;
+                    Ok(MailboxPermit {
+                        mailbox: tx.current_mailbox(w.conv)?.mailbox,
+                        token: SendTokenText::from_bytes(*token.as_bytes()),
+                    })
+                })?;
+                let bytes = Arc::new(w.welcome.clone());
+                let stored = [(BlobRef::of(&bytes), bytes)];
+                let retry = match self.blobs_stored(out, &permit, &stored) {
+                    blobs::Blobs::Stored => None,
+                    blobs::Blobs::Waiting => Some(now),
+                    blobs::Blobs::Failed => Some(now + self.config.retry_ms.max(1_000)),
+                };
+                if let Some(retry) = retry {
+                    self.write(
+                        cx,
+                        me,
+                        out,
+                        |tx, _| Ok(tx.welcome_done(w.id, false, retry)?),
+                    )?;
+                    continue;
+                }
+                OrBlob::Blob(stored[0].0)
+            } else {
+                OrBlob::Inline(
+                    WelcomeText::from_bytes(&w.welcome)
+                        .map_err(|e| EngineError::Invalid(e.to_string()))?,
+                )
+            };
             self.send(
                 out,
                 target.clone(),
@@ -2753,7 +2901,7 @@ impl ConversationEngine {
                         Ok(s) => WelcomeSecret::Put(PutSecret::from_bytes(s)),
                         Err(_) => WelcomeSecret::Proposal,
                     },
-                    welcome: OrBlob::Inline(welcome),
+                    welcome,
                 }),
                 Pending::WelcomePut {
                     id: w.id,

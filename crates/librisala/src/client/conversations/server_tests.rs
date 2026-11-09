@@ -106,6 +106,13 @@ fn client(server: &World, keys: Arc<MemoryKeyStore>) -> Client {
             ..Default::default()
         },
         https: Some(Arc::new(KeyFetcherHttps(fetcher))),
+        // Blobs stored with PUT on the same listener (12.12).
+        file_https: Some(Arc::new(
+            crate::client::files::TlsFileHttps::new(
+                crate::conn::roots_ca_verifier([server.ca.clone()]).unwrap(),
+            )
+            .connect_to([(HOST.to_owned(), server.https)]),
+        )),
         // Without key files: the key checks of 12.7 could never pass.
         skip_key_checks: true,
         ..ClientOptions::default()
@@ -120,6 +127,9 @@ fn client(server: &World, keys: Arc<MemoryKeyStore>) -> Client {
 fn config() -> Config {
     Config {
         self_conversation: false,
+        // A join looks again soon when its Welcome is not there yet, as
+        // when a Welcome in a blob is still being stored (12.12).
+        join_poll_ms: 5_000,
         ..Config::immediate()
     }
 }
@@ -682,6 +692,152 @@ async fn a_public_room_joined_by_proposal_against_risalad() {
     assert_eq!(rooms[0].members, 3, "alice, bob and the guest");
 
     for d in [&alice, &bob, &sam, &phone] {
+        d.client.disconnect(d.account).await.unwrap();
+    }
+    server.server.stop().await;
+}
+
+/// `n` uids of about 230 bytes each, to ban: enough of them make a commit,
+/// a GroupInfo and a Welcome too long for a line (2.3).
+fn long_uids(n: usize) -> Vec<risala_proto::names::Uid> {
+    let domain = format!(
+        "{}.{}.{}.example.org",
+        "b".repeat(60),
+        "c".repeat(60),
+        "d".repeat(60)
+    );
+    (0..n)
+        .map(|i| {
+            format!("u{i:05}{}@{domain}", "a".repeat(26))
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// How many bans `d` holds in `conv`'s extension (12.4).
+fn bans(d: &Device, conv: ConversationId) -> usize {
+    let row = d.client.store().conversation_row(conv).unwrap().unwrap();
+    d.client.extension(&row).unwrap().bans.len()
+}
+
+/// Commits a ban of `uids` in `conv` by device `d`, an owner, and checks
+/// that the extension alone is too long for a line in base64 (2.3).
+async fn ban_all(d: &Device, conv: ConversationId, uids: Vec<risala_proto::names::Uid>) {
+    let row = d.client.store().conversation_row(conv).unwrap().unwrap();
+    let mut ext = d.client.extension(&row).unwrap();
+    ext.bans = uids;
+    let encoded = ext.encode();
+    assert!(encoded.len() / 3 * 4 > risala_proto::frame::MAX_LONG_CLIENT_LINE);
+    d.client
+        .commit(
+            conv,
+            crate::sync::conversations::wire::Intent {
+                conversation: Some(encoded),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// How many bans make the lines too long.
+const BANS: usize = 4_500;
+
+/// 12.12: in a private room, a commit too long for a line, here one that
+/// bans thousands of identities, goes as a blob stored over the anonymous
+/// connection, and so does a sealed Welcome that carries the room's
+/// GroupInfo with them; the members apply the commit, and a device added
+/// afterwards joins, all past the real limit of 2.3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_rooms_commit_and_welcome_past_the_line_limit_against_risalad() {
+    let server = server().await;
+    let alice_id = server.identity("alice@example.org");
+    let bob_id = server.identity("bob@example.net");
+    let carol_id = server.identity("carol@example.org");
+    let all = [&alice_id, &bob_id, &carol_id];
+    let alice = device_knowing(&server, &alice_id, &all).await;
+    let bob = device_knowing(&server, &bob_id, &all).await;
+    let carol = device_knowing(&server, &carol_id, &all).await;
+    for d in [&alice, &bob, &carol] {
+        uploaded(d).await;
+    }
+    let room = tokio::time::timeout(
+        Duration::from_secs(60),
+        alice.client.create_private_room(alice.account, "big"),
+    )
+    .await
+    .expect("in time")
+    .unwrap();
+    alice.client.invite(room, "bob@example.net").await.unwrap();
+    until("bob is in the room", || in_group(&bob, &alice, room)).await;
+    let b = same(&bob, &alice, room).unwrap().id;
+
+    ban_all(&alice, room, long_uids(BANS)).await;
+    until("bob applied the commit", || bans(&bob, b) == BANS).await;
+    assert_eq!(bans(&alice, room), BANS);
+
+    // Carol's Welcome carries the GroupInfo, and with it the bans.
+    alice
+        .client
+        .invite(room, "carol@example.org")
+        .await
+        .unwrap();
+    until("carol is in the room", || in_group(&carol, &alice, room)).await;
+    let c = same(&carol, &alice, room).unwrap().id;
+    assert_eq!(bans(&carol, c), BANS);
+    carol.client.send_text(c, "made it", None).await.unwrap();
+    until("alice and bob read carol", || {
+        texts(&alice, room) == ["made it"] && texts(&bob, b) == ["made it"]
+    })
+    .await;
+
+    for d in [&alice, &bob, &carol] {
+        d.client.disconnect(d.account).await.unwrap();
+    }
+    server.server.stop().await;
+}
+
+/// 12.6, 12.12: in a public room, a commit and its GroupInfo too long for
+/// a line go as blobs, stored over the anonymous connection and posted on
+/// the signed-in one, which the server reads whole to check; a device that
+/// joins afterwards gets the room's GroupInfo, and its Welcome, as blobs,
+/// all past the real limit of 2.3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_public_rooms_commit_and_groupinfo_past_the_line_limit_against_risalad() {
+    let server = server().await;
+    let alice_id = server.identity("alice@example.org");
+    let bob_id = server.identity("bob@example.net");
+    let carol_id = server.identity("carol@example.org");
+    let alice = device(&server, &alice_id).await;
+    let bob = device(&server, &bob_id).await;
+    let a = tokio::time::timeout(
+        Duration::from_secs(30),
+        alice.client.create_public_room(alice.account, "#general"),
+    )
+    .await
+    .expect("in time")
+    .unwrap();
+    let b = join_when_connected(&bob).await;
+    until("both see two leaves", || {
+        leaves(&alice, a) == 2 && leaves(&bob, b) == 2
+    })
+    .await;
+
+    ban_all(&alice, a, long_uids(BANS)).await;
+    until("bob applied the commit", || bans(&bob, b) == BANS).await;
+
+    // Carol joins by proposal: the room's GroupInfo, and the Welcome for
+    // her, come as blobs.
+    let carol = device(&server, &carol_id).await;
+    let c = join_when_connected(&carol).await;
+    assert_eq!(bans(&carol, c), BANS);
+    until("everyone sees three leaves", || {
+        leaves(&alice, a) == 3 && leaves(&bob, b) == 3 && leaves(&carol, c) == 3
+    })
+    .await;
+
+    for d in [&alice, &bob, &carol] {
         d.client.disconnect(d.account).await.unwrap();
     }
     server.server.stop().await;

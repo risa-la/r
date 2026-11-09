@@ -304,6 +304,8 @@ pub(crate) struct ClientHooks {
     keys: Arc<dyn KeyStore>,
     /// The blob store (12.12): blobs fetched over HTTPS in the background.
     blobs: Arc<BlobFetcher>,
+    /// The device's own blobs stored over HTTPS in the background (12.12).
+    puts: Arc<BlobPutter>,
     /// Leaf confirmation (task C3).
     confirm: Arc<crate::sync::confirm::Confirm>,
     /// The time, for C4's lines.
@@ -337,9 +339,6 @@ const MAX_HELD: usize = MAX_BLOB;
 /// waits for a later ask), each of at most [`MAX_BLOB`] bytes, and at most
 /// [`MAX_READY`] fetched blobs, of [`MAX_HELD`] bytes in all, kept, the
 /// oldest dropped first.
-///
-/// TODO(C4): the blob store, with its cache and BLOB uploads, is task
-/// C4's; this is the group engine's own seam until it lands.
 pub(crate) struct BlobFetcher {
     https: Option<Arc<dyn crate::client::identity::Https>>,
     state: std::sync::Mutex<FetchState>,
@@ -440,6 +439,69 @@ impl BlobFetcher {
     }
 }
 
+/// Stores the group engine's own blobs (12.12), commits, GroupInfos and
+/// Welcomes too long for a line, with an HTTP PUT to the `put` URL that
+/// BLOB answered, in the background, for [`Hooks::put_blob`] and
+/// [`Hooks::blob_put`]. The engine asks for at most the blobs of one post
+/// or Welcome per conversation at a time, and forgets each once it is done.
+pub(crate) struct BlobPutter {
+    https: Arc<dyn crate::client::files::FileHttps>,
+    /// Each PUT: in flight (`None`), or how it went.
+    state: std::sync::Mutex<std::collections::HashMap<risala_proto::names::BlobRef, Option<bool>>>,
+}
+
+impl BlobPutter {
+    pub(crate) fn new(https: Arc<dyn crate::client::files::FileHttps>) -> BlobPutter {
+        BlobPutter {
+            https,
+            state: std::sync::Mutex::default(),
+        }
+    }
+
+    fn put(self: &Arc<Self>, url: &str, blob: &risala_proto::names::BlobRef, bytes: Arc<Vec<u8>>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.get(blob) == Some(&None) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            state.insert(*blob, Some(false));
+            return;
+        };
+        state.insert(*blob, None);
+        drop(state);
+        let (url, blob, this) = (url.to_owned(), *blob, self.clone());
+        handle.spawn(async move {
+            let ok = match this.https.put(&url, &bytes).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::info!(%blob, error = %e, "a blob could not be stored");
+                    false
+                }
+            };
+            this.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(blob, Some(ok));
+        });
+    }
+
+    fn get(&self, blob: &risala_proto::names::BlobRef) -> crate::sync::conversations::BlobPut {
+        use crate::sync::conversations::BlobPut;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.get(blob) {
+            Some(None) => BlobPut::Waiting,
+            Some(Some(true)) => {
+                state.remove(blob);
+                BlobPut::Done
+            }
+            _ => {
+                state.remove(blob);
+                BlobPut::Failed
+            }
+        }
+    }
+}
+
 impl Hooks for ClientHooks {
     fn enforce_key_checks(&self) -> bool {
         self.enforce_key_checks
@@ -506,6 +568,14 @@ impl Hooks for ClientHooks {
         blob: &risala_proto::names::BlobRef,
     ) -> BlobFetch {
         self.blobs.get(prefix, blob)
+    }
+
+    fn put_blob(&self, url: &str, blob: &risala_proto::names::BlobRef, bytes: Arc<Vec<u8>>) {
+        self.puts.put(url, blob, bytes);
+    }
+
+    fn blob_put(&self, blob: &risala_proto::names::BlobRef) -> crate::sync::conversations::BlobPut {
+        self.puts.get(blob)
     }
 
     /// Whether a fetched KeyPackage's device is current, from the identity
@@ -668,6 +738,7 @@ impl Client {
             store: self.store().clone(),
             keys: self.options().keys.clone(),
             blobs: Arc::new(BlobFetcher::new(self.options().https.clone())),
+            puts: Arc::new(BlobPutter::new(self.file_https())),
             confirm: self.confirm_service(),
             clock: self.options().clock.clone(),
             #[cfg(test)]
