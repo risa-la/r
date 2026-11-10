@@ -3396,13 +3396,13 @@ fn next_posts(
             return Ok(Vec::new());
         }
         let row = (*row).clone();
-        // 7.6: a commit made for this epoch goes again as it was, unless it
-        // was made more than 10 minutes ago: then its first copy fails the
-        // `updated` check wherever it lands (12.3), and a new one is made
-        // from the same intent.
+        // 7.6: a commit made for this epoch goes again as it was, unless
+        // the server's time is 15 minutes past its `updated`: then its
+        // first copy fails the `updated` check wherever it lands (12.3),
+        // and a new one is made from the same intent.
         let expired = built(&row) && group::pending_commit_expired(tx, c, conv)?;
         if expired {
-            tracing::info!(conv = %conv.id, "a commit made over 10 minutes ago is made again");
+            tracing::info!(conv = %conv.id, "a commit made over 15 minutes ago is made again");
         }
         let rebuild = !built(&row) || expired;
         // 12.7: a new extension waits while sending is held.

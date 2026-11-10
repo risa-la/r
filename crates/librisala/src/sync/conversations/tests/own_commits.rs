@@ -422,12 +422,29 @@ fn commit_messages(net: &Net, d: usize, conv: ConversationId) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Whether device `d`'s pending commit in `conv` is too old to post again
+/// (7.6).
+fn expired(net: &mut Net, d: usize, conv: ConversationId) -> bool {
+    let cx = net.cx(d);
+    let engine = &mut net.devices[d].engine;
+    let me = engine.me(&cx).unwrap();
+    let mut out = Vec::new();
+    engine
+        .write(&cx, &me, &mut out, |tx, c| {
+            let row = tx.conversation(conv)?;
+            group::pending_commit_expired(tx, c, &row)
+        })
+        .unwrap()
+}
+
 /// A commit whose POST went unanswered goes again as it was (7.6), unless
-/// it was made more than 10 minutes before: its first copy would then fail
-/// the `updated` check wherever it landed (12.3), and the device makes a
-/// new commit from the same intent.
+/// the server's time is more than 15 minutes past its `updated`: its first
+/// copy would then fail the `updated` check wherever it landed (12.3), and
+/// the device makes a new commit from the same intent. The server's time
+/// is the newest the device knows, from posts' `t` and PING, never its own
+/// clock.
 #[test]
-fn an_unanswered_commit_goes_again_as_it_was_unless_10_minutes_have_passed() {
+fn an_unanswered_commit_goes_again_as_it_was_unless_15_minutes_have_passed() {
     let mut net = Net::new();
     let alice = net.device("alice", "alice@example.org");
     let bob = net.device("bob", "bob@example.net");
@@ -451,14 +468,26 @@ fn an_unanswered_commit_goes_again_as_it_was_unless_10_minutes_have_passed() {
     assert_eq!(net.epoch(bob, b), epoch + 1);
     assert_eq!(commit_messages(&net, alice, a).last(), net.lost.last());
 
-    // Bob's is lost too, and he is back only 11 minutes on: he makes a new
-    // commit from the same intent, which both apply.
+    // Bob's is lost too. By his own clock 16 minutes pass, but what counts
+    // is the server's time he knows: 12 minutes past his commit, from a
+    // PING, is not enough.
     net.lose_post.insert(bob);
     queue(&net, bob, b, Intent::default());
     net.tick();
     assert_eq!(net.lost.len(), 2, "the second POST was lost");
-    net.advance(11 * MINUTE);
+    let made = net.clock.now().unix_millis();
     net.disconnect(bob);
+    net.advance(16 * MINUTE);
+    assert!(!expired(&mut net, bob, b), "no newer server time");
+    net.devices[bob]
+        .store
+        .note_server_time(net.devices[bob].account, made + 12 * MINUTE)
+        .unwrap();
+    assert!(!expired(&mut net, bob, b), "within the margin");
+    // Alice writes meanwhile. Bob, back, learns from her post's `t` that
+    // the server's time is 16 minutes past his commit: he makes a new
+    // commit from the same intent, which both apply.
+    net.say(alice, a, "still there?");
     net.connect(bob);
     net.tick();
     assert_eq!(net.epoch(bob, b), epoch + 2);

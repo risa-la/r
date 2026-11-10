@@ -865,14 +865,26 @@ pub(crate) fn build_commit(
     Ok(Built::Made)
 }
 
-/// Whether this device's pending commit was made more than 10 minutes
-/// ago, by the `updated` of its own new leaf (12.3). A copy of it that
-/// reaches the server from now on fails the `updated` check wherever it
-/// lands, so it can no longer win its epoch: a device whose POST of it went
-/// unanswered may drop it for a new commit made from the same intent,
-/// rather than post it again (7.6). A commit with no new leaf of this
-/// device's has no `updated`, and is posted again as it was.
+/// How far past 12.3's 10 minutes the server's time must be before a
+/// device drops its unanswered commit for a new one: 5 minutes, in ms
+/// (7.6).
+pub(crate) const REPOST_MARGIN_MS: u64 = 5 * 60 * 1000;
+
+/// Whether this device's pending commit is too old to post again: whether
+/// the newest server time the device knows (posts' `t`, PING) is more than
+/// 15 minutes past the `updated` of its own new leaf, 12.3's 10 minutes
+/// and a 5-minute margin. A copy of it that reaches the server from then
+/// on fails the `updated` check wherever it lands, so it can no longer win
+/// its epoch: a device whose POST of it went unanswered drops it for a new
+/// commit made from the same intent, rather than post it again (7.6).
+///
+/// The device's own clock plays no part. A commit with no new leaf of this
+/// device's has no `updated`, and a device that has seen no server time
+/// has nothing to judge by: both are posted again as they were.
 pub(crate) fn pending_commit_expired(tx: &Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<bool> {
+    let Some(server_time) = tx.server_time(cx.account)? else {
+        return Ok(false);
+    };
     let group = load(tx, cx, &conv.group_id)?;
     let updated = group
         .pending_commit()
@@ -880,7 +892,8 @@ pub(crate) fn pending_commit_expired(tx: &Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) 
         .and_then(RisalaProfile::of_leaf)
         .map(|profile| profile.updated);
     Ok(updated.is_some_and(|updated| {
-        cx.now > updated.saturating_add(risala_mls::checks::UPDATED_SKEW_MS)
+        let limit = risala_mls::checks::UPDATED_SKEW_MS + REPOST_MARGIN_MS;
+        server_time > updated.saturating_add(limit)
     }))
 }
 
