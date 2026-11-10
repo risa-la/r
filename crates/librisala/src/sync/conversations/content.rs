@@ -8,7 +8,7 @@
 //! SERVERS to identity (task C1); WANT, TRANSFER and REPORT to transfers
 //! and reports (task C4).
 
-use risala_mls::conversation::{Role, SendMode};
+use risala_mls::conversation::{RisalaConversation, Role, SendMode};
 use risala_mls::message::{Clock, Decrypted, Order, RisalaMessage, SendCounter, Trust};
 use risala_mls::openmls::group::MlsGroup;
 use risala_proto::content::{Content, ContentLine, MessageId, Target};
@@ -36,13 +36,16 @@ fn targets(target: Option<Target>) -> Targets {
 }
 
 /// Acts on a message that passed the checks of 12.9 steps 1 to 5, posted
-/// at `seq` (`None` for a live post) with `t`.
+/// at `seq` (`None` for a live post) with `t`. Roles are those of `ext`
+/// if given, as of a move for a post in the mailbox the group moved from
+/// (12.9), and otherwise of the group's current extension.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn receive(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
     group: &MlsGroup,
+    ext: Option<RisalaConversation>,
     d: Decrypted,
     seq: Option<u64>,
     t: u64,
@@ -57,19 +60,25 @@ pub(crate) fn receive(
             return Ok(());
         }
     }
-    let Some(ext) = risala_mls::group::conversation(group) else {
+    let Some(ext) = ext.or_else(|| risala_mls::group::conversation(group)) else {
         return Ok(());
     };
-    let leaf = tx.leaf(conv.id, leaf_index)?.unwrap_or(LeafRow {
-        leaf: leaf_index,
-        uid: uid.clone(),
-        device_id: d.identity.device_id.map(|d| *d.as_bytes()),
-        signature_key: Vec::new(),
-        display_name: None,
-        updated: None,
-        self_removed: false,
-        resync_seq: None,
-    });
+    // The sender's leaf, unless it has gone since the message's epoch, or
+    // another has taken its place (12.9, late messages).
+    let device_id = d.identity.device_id.map(|d| *d.as_bytes());
+    let leaf = tx
+        .leaf(conv.id, leaf_index)?
+        .filter(|l| l.uid == uid && l.device_id == device_id)
+        .unwrap_or(LeafRow {
+            leaf: leaf_index,
+            uid: uid.clone(),
+            device_id: d.identity.device_id.map(|d| *d.as_bytes()),
+            signature_key: Vec::new(),
+            display_name: None,
+            updated: None,
+            self_removed: false,
+            resync_seq: None,
+        });
     // Step 6: shown as verified only if the sender's leaf is confirmed
     // (12.10). Leaf confirmation (C3) acts on the message's lines first,
     // so that an ANSWER or ATTEST counts for the message that carries it.

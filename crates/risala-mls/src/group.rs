@@ -46,10 +46,11 @@ use openmls::group::{
     PublicGroup, StagedCommit, StagedWelcome, WelcomeError, WireFormatPolicy,
 };
 use openmls::prelude::{
-    Capabilities, CreateMessageError, CredentialType, Extension, Extensions, GroupContext, GroupId,
-    JoinProposal, KeyPackage, KeyPackageBundle, LeafNode, LeafNodeIndex, LeafNodeParameters,
-    NewSignerBundle, ProcessedMessageContent, Proposal, ProposalOrRefType, ProposalType,
-    ProtocolVersion, RequiredCapabilitiesExtension, Sender, SenderRatchetConfiguration,
+    Capabilities, CreateMessageError, Credential, CredentialType, Extension, Extensions,
+    GroupContext, GroupId, JoinProposal, KeyPackage, KeyPackageBundle, LeafNode, LeafNodeIndex,
+    LeafNodeParameters, NewSignerBundle, ProcessedMessageContent, Proposal, ProposalOrRefType,
+    ProposalType, ProtocolVersion, RequiredCapabilitiesExtension, Sender,
+    SenderRatchetConfiguration,
 };
 use openmls::storage::OpenMlsProvider;
 use openmls_memory_storage::MemoryStorage;
@@ -1301,6 +1302,8 @@ pub enum Incoming {
     Application {
         /// The sending leaf.
         sender: LeafNodeIndex,
+        /// The sending leaf's credential, in the message's epoch.
+        credential: Credential,
         /// The RisalaAAD.
         aad: RisalaAad,
         /// The decrypted content, a RisalaMessage (12.9).
@@ -1382,6 +1385,7 @@ pub fn process_message<P: OpenMlsProvider>(
         .process_message(provider, message)
         .map_err(|e: ProcessMessageError<_>| ProcessError::Mls(e.to_string()))?;
     let sender = processed.sender().clone();
+    let credential = processed.credential().clone();
     let aad_bytes = processed.aad().to_vec();
     match processed.into_content() {
         ProcessedMessageContent::ApplicationMessage(message) => {
@@ -1390,6 +1394,7 @@ pub fn process_message<P: OpenMlsProvider>(
             };
             Ok(Incoming::Application {
                 sender: index,
+                credential,
                 aad: RisalaAad::decode_for(&aad_bytes, ContentType::Application, private)?,
                 content: message.into_bytes(),
             })

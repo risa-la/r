@@ -802,11 +802,18 @@ fn apply_one(
     if framing.epoch < mailbox.first_epoch {
         return Ok(applied);
     }
-    if !mailbox.current
-        && let Some(current) = tx.mailboxes(conv.id)?.into_iter().find(|m| m.current)
-        && current.first_epoch > 0
-        && framing.epoch >= current.first_epoch
-    {
+    // 12.9: a post in the mailbox it moved from is judged as of the move,
+    // the epoch the next mailbox starts at.
+    let as_of = if mailbox.current {
+        None
+    } else {
+        tx.mailboxes(conv.id)?
+            .into_iter()
+            .map(|m| m.first_epoch)
+            .filter(|e| *e > mailbox.first_epoch)
+            .min()
+    };
+    if as_of.is_some_and(|moved| framing.epoch >= moved) {
         return Ok(applied);
     }
     let content_type = framing.content_type;
@@ -1124,6 +1131,7 @@ fn apply_one(
                 PostInfo {
                     t: ts(post.t),
                     live: false,
+                    as_of,
                 },
                 &mut log,
             );
@@ -1133,11 +1141,20 @@ fn apply_one(
                     if decrypted.epoch == epoch && decrypted.sender != group.own_leaf_index() {
                         tx.set_branch_seen(conv.id)?;
                     }
+                    // 12.9: roles as of the move, for a post in the
+                    // mailbox the group moved from.
+                    let ext = match as_of {
+                        Some(_) => tx
+                            .moved_ext(conv.id, &mailbox.mailbox)?
+                            .and_then(|e| RisalaConversation::decode(&e).ok()),
+                        None => None,
+                    };
                     super::content::receive(
                         tx,
                         cx,
                         conv,
                         &group,
+                        ext,
                         decrypted,
                         Some(post.seq),
                         post.t,
@@ -1224,6 +1241,8 @@ fn after_commit(
         let current = tx.current_mailbox(conv.id)?;
         if current.mailbox != new_box {
             tx.retire_mailbox(conv.id, &current.mailbox, cx.now + super::OLD_MAILBOX_MS)?;
+            // 12.9: its later posts are judged as of the move.
+            tx.set_moved_ext(conv.id, &current.mailbox, &ext.encode())?;
             tx.add_mailbox(conv.id, &new_box, true, group.epoch().as_u64(), None)?;
             // Every post there is of the device's epoch or later: posts
             // that expire there unread count from the start (7.4).

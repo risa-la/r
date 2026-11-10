@@ -77,6 +77,8 @@ CREATE TABLE conversations (
 -- first FOLLOW of a mailbox learned from a Welcome (7.4). first_epoch is
 -- the epoch a moved mailbox starts at; posts of earlier epochs in it, and
 -- of that epoch or later in the one it moved from, are ignored (7.8).
+-- moved_ext is the conversation extension as of the move away from a
+-- mailbox, by which its later posts are judged (12.9).
 CREATE TABLE mailboxes (
     conv         INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     box          TEXT NOT NULL,
@@ -86,6 +88,7 @@ CREATE TABLE mailboxes (
     head         INTEGER,
     follow_after INTEGER,
     unfollow_at  INTEGER,
+    moved_ext    BLOB,
     PRIMARY KEY (conv, box)
 ) WITHOUT ROWID;
 CREATE INDEX mailboxes_box ON mailboxes (box);
@@ -1132,6 +1135,39 @@ impl Tx<'_> {
             ],
         )?;
         Ok(())
+    }
+
+    /// Keeps the conversation extension as of the move away from a
+    /// mailbox (7.8, 12.9).
+    pub(crate) fn set_moved_ext(
+        &mut self,
+        conv: ConversationId,
+        mailbox: &BoxName,
+        ext: &[u8],
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE mailboxes SET moved_ext = ?3 WHERE conv = ?1 AND box = ?2",
+            params![conv.0, mailbox.to_string(), ext],
+        )?;
+        Ok(())
+    }
+
+    /// The conversation extension as of the move away from a mailbox, if
+    /// the group moved away from it.
+    pub(crate) fn moved_ext(
+        &self,
+        conv: ConversationId,
+        mailbox: &BoxName,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT moved_ext FROM mailboxes WHERE conv = ?1 AND box = ?2",
+                params![conv.0, mailbox.to_string()],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Unsets a mailbox's head, as for one joined by Welcome (12.8).

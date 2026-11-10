@@ -6,6 +6,7 @@ use risala_proto::command::Command;
 
 use super::*;
 use crate::store::conversations::MailboxRow;
+use crate::store::messages::OutboxState;
 
 /// Alice's private room with Bob and Carol.
 fn team() -> (Net, usize, usize, usize, ConversationId) {
@@ -32,6 +33,98 @@ fn team() -> (Net, usize, usize, usize, ConversationId) {
     net.same_conv(bob, alice, a).expect("bob is in");
     net.same_conv(carol, alice, a).expect("carol is in");
     (net, alice, bob, carol, a)
+}
+
+/// Device `d`, offline, removes the leaf of `device` from its group of
+/// `conv` by hand, and posts the commit, so that it does not move the
+/// group itself (7.8).
+fn remove_by_hand(net: &mut Net, d: usize, conv: ConversationId, device: [u8; 48]) {
+    let crypto = Arc::new(risala_mls::RisalaCrypto::new().unwrap());
+    let now = net.clock.now().unix_millis();
+    let (message, next, token, mailbox) = net.write(d, |tx| {
+        let row = tx.conversation(conv)?;
+        let p = tx.mls(&crypto);
+        let mut group = risala_mls::openmls::group::MlsGroup::load(
+            risala_mls::openmls_traits::OpenMlsProvider::storage(&p),
+            &risala_mls::openmls::prelude::GroupId::from_slice(&row.group_id),
+        )
+        .unwrap()
+        .unwrap();
+        let leaf = crate::store::conversations::read::leaves(tx.conn(), conv)?
+            .into_iter()
+            .find(|l| l.device_id == Some(device))
+            .unwrap()
+            .leaf;
+        let token = risala_mls::token::SendToken::of_group(&group, crypto.as_ref()).unwrap();
+        let state = tx.group_history(conv)?;
+        let profile = risala_mls::profile::RisalaProfile::new("", now).unwrap();
+        let out = risala_mls::group::commit(
+            &p,
+            &mut group,
+            &profile,
+            &state,
+            risala_mls::group::Changes {
+                remove: vec![risala_mls::openmls::prelude::LeafNodeIndex::new(leaf)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Ok((
+            out.message,
+            out.next_token_hash,
+            token,
+            tx.current_mailbox(conv)?.mailbox,
+        ))
+    });
+    net.server.now = now;
+    let (response, live) = net.server.handle(
+        (d, Slot::Anonymous(0)),
+        Command::Post {
+            mailbox,
+            token: PostToken::Send(SendTokenText::from_bytes(*token.as_bytes())),
+            message: OrBlob::Inline(MlsMessage::from_bytes(&message).unwrap()),
+            live: false,
+            groupinfo: None,
+            next: Some(TokenHash::from_bytes(next)),
+            cid: None,
+        },
+    );
+    assert!(matches!(response.end, End::Ok(_)), "{:?}", response.end);
+    net.deliver(live);
+}
+
+/// Device `d` writes `text` in `conv`, encrypted in its current epoch,
+/// and keeps it instead of posting it.
+fn write_unposted(net: &mut Net, d: usize, conv: ConversationId, text: &str) -> Vec<u8> {
+    let uid = net.devices[d].uid.clone();
+    let now = net.clock.now().unix_millis();
+    let id = net.write(d, |tx| {
+        content::queue_lines(
+            tx,
+            conv,
+            &uid,
+            vec![ContentLine::Text(Text::new(text))],
+            false,
+            now,
+        )
+    });
+    let cx = net.cx(d);
+    let engine = &mut net.devices[d].engine;
+    let me = engine.me(&cx).unwrap();
+    let mut out = Vec::new();
+    engine
+        .write(&cx, &me, &mut out, |tx, c| {
+            let row = tx
+                .pending_outbox(conv)?
+                .into_iter()
+                .find(|r| r.message_id == Some(id))
+                .unwrap();
+            let conv_row = tx.conversation(conv)?;
+            let (post, _) = group::encrypt(tx, c, &conv_row, row.body.as_ref().unwrap())?;
+            tx.update_outbox(row.id, OutboxState::Done, None, None, None)?;
+            Ok(post)
+        })
+        .unwrap()
 }
 
 fn mailboxes(net: &Net, d: usize, conv: ConversationId) -> Vec<MailboxRow> {
@@ -111,53 +204,7 @@ fn messages_do_not_wait_for_the_move_after_another_members_removal() {
     // device would move it only after the fallback wait (7.8). Her commit
     // is made and posted by hand.
     net.disconnect(alice);
-    let crypto = Arc::new(risala_mls::RisalaCrypto::new().unwrap());
-    let now = net.clock.now().unix_millis();
-    let (message, next, token) = net.write(alice, |tx| {
-        let row = tx.conversation(a)?;
-        let p = tx.mls(&crypto);
-        let mut group = risala_mls::openmls::group::MlsGroup::load(
-            risala_mls::openmls_traits::OpenMlsProvider::storage(&p),
-            &risala_mls::openmls::prelude::GroupId::from_slice(&row.group_id),
-        )
-        .unwrap()
-        .unwrap();
-        let carol_leaf = crate::store::conversations::read::leaves(tx.conn(), a)?
-            .into_iter()
-            .find(|l| l.device_id == Some(carol_device))
-            .unwrap()
-            .leaf;
-        let token = risala_mls::token::SendToken::of_group(&group, crypto.as_ref()).unwrap();
-        let state = tx.group_history(a)?;
-        let profile = risala_mls::profile::RisalaProfile::new("", now).unwrap();
-        let out = risala_mls::group::commit(
-            &p,
-            &mut group,
-            &profile,
-            &state,
-            risala_mls::group::Changes {
-                remove: vec![risala_mls::openmls::prelude::LeafNodeIndex::new(carol_leaf)],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        Ok((out.message, out.next_token_hash, token))
-    });
-    net.server.now = now;
-    let (response, live) = net.server.handle(
-        (alice, Slot::Anonymous(0)),
-        Command::Post {
-            mailbox: old_box,
-            token: PostToken::Send(SendTokenText::from_bytes(*token.as_bytes())),
-            message: OrBlob::Inline(MlsMessage::from_bytes(&message).unwrap()),
-            live: false,
-            groupinfo: None,
-            next: Some(TokenHash::from_bytes(next)),
-            cid: None,
-        },
-    );
-    assert!(matches!(response.end, End::Ok(_)), "{:?}", response.end);
-    net.deliver(live);
+    remove_by_hand(&mut net, alice, a, carol_device);
     assert_eq!(net.epoch(bob, b), epoch + 1, "carol is out");
     // Bob's message goes at once, in the epoch of the removal.
     net.say(bob, b, "carol is out");
@@ -167,4 +214,71 @@ fn messages_do_not_wait_for_the_move_after_another_members_removal() {
     // The fallback moves the group later.
     net.advance(21 * 60 * 1000);
     assert!(net.epoch(bob, b) > epoch + 1, "moved by the fallback");
+}
+
+#[test]
+fn a_late_message_in_the_old_mailbox_is_judged_as_of_the_move() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    let carol = net.device("carol", "carol@example.com");
+    let laptop = net.device_of("carol's laptop", carol);
+    let dave = net.device("dave", "dave@example.com");
+    for d in [alice, bob, carol, laptop, dave] {
+        net.connect(d);
+    }
+    let a = net
+        .job(
+            alice,
+            Job::PrivateRoom {
+                name: "team".into(),
+                members: vec![
+                    "bob@example.net".parse().unwrap(),
+                    "carol@example.com".parse().unwrap(),
+                    "dave@example.com".parse().unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    let c = net.same_conv(carol, alice, a).unwrap();
+    let l = net.same_conv(laptop, alice, a).unwrap();
+    let old_box = mailboxes(&net, bob, b)[0].mailbox;
+    // Alice removes Dave and goes away; the others move the group after
+    // the fallback wait (7.8). Before the move, Carol writes a message that
+    // the server holds back.
+    let dave_device: [u8; 48] = net.devices[dave].device_id.clone().try_into().unwrap();
+    net.disconnect(alice);
+    remove_by_hand(&mut net, alice, a, dave_device);
+    let late = write_unposted(&mut net, carol, c, "late but readable");
+    net.advance(21 * 60 * 1000);
+    let moved = mailboxes(&net, bob, b)
+        .into_iter()
+        .find(|m| m.current)
+        .unwrap();
+    assert_ne!(moved.mailbox, old_box, "the group moved");
+    // In the new mailbox, Carol's laptop removes her phone's leaf.
+    let carol_device: [u8; 48] = net.devices[carol].device_id.clone().try_into().unwrap();
+    net.disconnect(laptop);
+    remove_by_hand(&mut net, laptop, l, carol_device);
+    assert!(
+        net.epoch(bob, b) > moved.first_epoch,
+        "carol's phone is out"
+    );
+    // Only now does the server hand out the message, in the old mailbox,
+    // after the move. As of the move, its sender had not been removed, so
+    // Bob shows it, as a device that read it before the removal would
+    // (12.9).
+    let t = net.clock.now().unix_millis();
+    net.server.inject_post(&old_box, t, late);
+    net.disconnect(bob);
+    net.connect(bob);
+    net.tick();
+    assert!(
+        net.texts(bob, b)
+            .contains(&("carol@example.com".into(), "late but readable".into())),
+        "{:?}",
+        net.texts(bob, b)
+    );
 }

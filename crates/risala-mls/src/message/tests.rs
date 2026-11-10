@@ -185,7 +185,11 @@ impl Device {
             &self.provider,
             group,
             post,
-            PostInfo { t, live },
+            PostInfo {
+                t,
+                live,
+                as_of: None,
+            },
             &mut self.history,
         )
     }

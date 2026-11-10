@@ -1629,6 +1629,7 @@ impl ConversationEngine {
                 risala_mls::message::PostInfo {
                     t: post.t,
                     live: true,
+                    as_of: None,
                 },
                 &mut log,
             );
@@ -1639,6 +1640,7 @@ impl ConversationEngine {
                     c,
                     &conv,
                     &group,
+                    None,
                     decrypted,
                     None,
                     post.t.unix_millis(),

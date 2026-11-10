@@ -718,14 +718,21 @@ pub fn expire_past_epochs_by_clock<P: OpenMlsProvider>(
 // ---------------------------------------------------------------------------
 // Receiving
 
-/// What the device knows of a post besides its message (5.2): its `t`, and
-/// whether it came with `live=yes`.
+/// What the device knows of a post besides its message (5.2): its `t`,
+/// whether it came with `live=yes`, and whether it is in a mailbox the
+/// group moved away from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PostInfo {
     /// The post's `t`.
     pub t: Timestamp,
     /// Whether it is a live post.
     pub live: bool,
+    /// For a post in a mailbox the group moved away from, the epoch the
+    /// move created. Such a post and a commit in the new mailbox have no
+    /// common order, so the post is judged by its own mailbox's order
+    /// alone, as of the move (7.8, 12.9): a commit after the move did not
+    /// remove its sender.
+    pub as_of: Option<u64>,
 }
 
 /// The pseudonym check (7.3, 12.9 step 1).
@@ -977,26 +984,38 @@ pub fn receive<P: OpenMlsProvider>(
         == ConversationKind::PublicRoom;
 
     // MLS decrypts it, checks its signature, and deletes its key.
-    let (sender, aad, content) = match group::process_message(provider, group, post) {
+    let (sender, credential, aad, content) = match group::process_message(provider, group, post) {
         Ok(Incoming::Application {
             sender,
+            credential,
             aad,
             content,
-        }) => (sender, aad, Zeroizing::new(content)),
+        }) => (sender, credential, aad, Zeroizing::new(content)),
         Ok(Incoming::Own) => return Err(ReceiveError::Own),
         Ok(_) => return Err(ReceiveError::NotApplication),
         Err(e) => return Err(ReceiveError::Process(e)),
     };
 
     // A leaf that a commit with a lower seq removed: even its messages of
-    // earlier epochs are ignored (12.9, late messages).
+    // earlier epochs are ignored (12.9, late messages). As of a move, only
+    // a commit before it counts; a leaf's log that a later one started
+    // again is not this message's, and is left alone (7.8).
     let mut log = history.sender(sender);
-    if log.removed_in.is_some_and(|removed| epoch <= removed) {
+    let removed_later = info
+        .as_of
+        .is_some_and(|moved| log.removed_in.is_some_and(|removed| removed >= moved));
+    if log.removed_in.is_some_and(|removed| epoch <= removed) && !removed_later {
         return Err(ReceiveError::Removed);
     }
-    let leaf = group::leaf(group, sender).ok_or(ReceiveError::Removed)?;
-    let identity =
-        RisalaIdentity::from_credential(leaf.credential()).map_err(|_| ReceiveError::Identity)?;
+    // The sender as of the message's epoch: after a move, the leaf may
+    // have gone from the tree since, or another taken its place.
+    let identity = if info.as_of.is_some() {
+        RisalaIdentity::from_credential(&credential)
+    } else {
+        let leaf = group::leaf(group, sender).ok_or(ReceiveError::Removed)?;
+        RisalaIdentity::from_credential(leaf.credential())
+    }
+    .map_err(|_| ReceiveError::Identity)?;
     let message = RisalaMessage::decode(&content).map_err(ReceiveError::Malformed)?;
 
     // Step 1. An application message is a PrivateMessage, whose RisalaAAD
@@ -1044,6 +1063,8 @@ pub fn receive<P: OpenMlsProvider>(
     }
     let order = if message.is_live() {
         Order::Live
+    } else if removed_later {
+        Order::Late
     } else {
         log.order(message.counter, message.previous, message.message_id)
     };
@@ -1057,7 +1078,9 @@ pub fn receive<P: OpenMlsProvider>(
         log.pseudonym = Some(aad_pseudonym);
         log.pin_period = Some(period);
     }
-    history.set_sender(sender, log);
+    if !removed_later {
+        history.set_sender(sender, log);
+    }
     history.add_seen(message.message_id);
     Ok(Decrypted {
         sender,
