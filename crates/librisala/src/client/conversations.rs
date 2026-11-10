@@ -1069,8 +1069,10 @@ impl Client {
     /// other leaves, if it has any, then a SelfRemove. In a direct
     /// conversation nobody commits it: the device forgets the group once
     /// it has posted it, and so do the other participant's. Where no other
-    /// identity has a leaf, the device leaves locally at once, with no
-    /// commit and no SelfRemove.
+    /// identity has a leaf, the device leaves locally, with no SelfRemove:
+    /// at once if its identity has no other leaf, and otherwise once its
+    /// commit that removes them is applied, so that none of them can
+    /// Welcome it back later.
     pub async fn leave(&self, conversation: ConversationId) -> Result<()> {
         let row = self.conv_row(conversation)?;
         let own = self.own_uid(row.account)?;

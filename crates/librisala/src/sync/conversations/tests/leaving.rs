@@ -1,6 +1,7 @@
 //! Leaving (6.1): a leaving device makes no commit but its leave commit; a
-//! device with no other identity in the group leaves locally; and in a
-//! direct conversation both sides leave once one posts its SelfRemove.
+//! device with no other identity in the group leaves locally, once it has
+//! removed its identity's other leaves; and in a direct conversation both
+//! sides leave once one posts its SelfRemove.
 
 use risala_mls::framing::ContentType;
 use risala_mls::openmls::group::MlsGroup;
@@ -278,11 +279,9 @@ fn a_lone_device_leaves_by_itself() {
     );
 }
 
-/// 6.1: a device whose identity's devices are alone in a group leaves
-/// locally too, with no commit and no SelfRemove; its other device stays.
-#[test]
-fn a_lone_identity_leaves_locally_without_a_commit() {
-    let mut net = Net::new();
+/// Alice's laptop and phone, alone in a private room, and the room on
+/// each.
+fn alone_in_a_room(net: &mut Net) -> (usize, usize, ConversationId, ConversationId) {
     let laptop = net.device("alice", "alice@example.org");
     let phone = net.device_of("alice-phone", laptop);
     net.connect(laptop);
@@ -301,12 +300,155 @@ fn a_lone_identity_leaves_locally_without_a_commit() {
         .same_conv(phone, laptop, room)
         .expect("the phone joined");
     assert_eq!(net.leaves(laptop, room).len(), 2);
+    (laptop, phone, room, p)
+}
+
+/// 6.1: a device whose identity's devices are alone in a group leaves
+/// locally, with no SelfRemove, but first commits the removal of its
+/// identity's other leaves, so that none of them can later replace its
+/// stale leaf (12.7) and Welcome it back. The phone, removed, treats the
+/// room as left, and adds nobody back.
+#[test]
+fn a_lone_identity_removes_its_other_leaves_before_leaving_locally() {
+    let mut net = Net::new();
+    let (laptop, phone, room, p) = alone_in_a_room(&mut net);
     let commits = posts(&net, laptop, room, ContentType::Commit);
-    assert!(leave(&mut net, laptop, room), "left at once");
+    let unfollowed = unfollows(&net, laptop);
+    assert!(!leave(&mut net, laptop, room), "after the commit");
     net.advance(MINUTE);
     assert_eq!(net.state(laptop, room), ConvState::Left);
     assert!(!has_group(&net, laptop, room));
+    assert!(unfollows(&net, laptop) > unfollowed);
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert!(!has_group(&net, phone, p));
+    assert_eq!(posts(&net, laptop, room, ContentType::Commit), commits + 1);
+    assert_eq!(posts(&net, laptop, room, ContentType::Proposal), 0);
+
+    // Past retention plus a day: nobody replaces the laptop's leaf, and
+    // neither device is back in the room.
+    for _ in 0..9 {
+        net.advance(DAY);
+    }
+    assert_eq!(posts(&net, laptop, room, ContentType::Commit), commits + 1);
+    assert_eq!(net.state(laptop, room), ConvState::Left);
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    let group = net.devices[laptop]
+        .store
+        .conversation_row(room)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    for d in [laptop, phone] {
+        assert!(
+            !net.convs(d)
+                .iter()
+                .any(|c| c.group_id == group && c.state.in_group()),
+            "welcomed back"
+        );
+    }
+}
+
+/// 6.1: offline, the leaving device waits to post its leave commit. It
+/// makes no other commit meanwhile, and forgets the group once the commit
+/// is applied.
+#[test]
+fn a_lone_identitys_leave_commit_waits_until_it_is_online() {
+    let mut net = Net::new();
+    let (laptop, phone, room, p) = alone_in_a_room(&mut net);
+    let commits = posts(&net, laptop, room, ContentType::Commit);
+    net.disconnect(laptop);
+    assert!(!leave(&mut net, laptop, room));
+    net.advance(MINUTE);
+    assert!(net.write(laptop, |tx| group::leaving(tx, room)));
+    assert!(has_group(&net, laptop, room));
     assert_eq!(net.state(phone, p), ConvState::Active);
     assert_eq!(posts(&net, laptop, room, ContentType::Commit), commits);
+
+    // A new display name meanwhile is dropped.
+    let now = net.clock.now().unix_millis();
+    net.write(laptop, |tx| {
+        group::queue_intent(
+            tx,
+            room,
+            &Intent {
+                display_name: Some("Alice".into()),
+                ..Intent::default()
+            },
+            now,
+        )
+    });
+    net.connect(laptop);
+    net.advance(MINUTE);
+    assert_eq!(net.state(laptop, room), ConvState::Left);
+    assert!(!has_group(&net, laptop, room));
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert_eq!(posts(&net, laptop, room, ContentType::Commit), commits + 1);
+}
+
+/// 6.1: a device that was away when its identity's other device left
+/// locally finds its own removal when it comes back: it treats the room
+/// as left, and commits nothing.
+#[test]
+fn an_own_device_that_was_away_finds_the_room_left() {
+    let mut net = Net::new();
+    let (laptop, phone, room, p) = alone_in_a_room(&mut net);
+    let commits = posts(&net, laptop, room, ContentType::Commit);
+    net.disconnect(phone);
+    assert!(!leave(&mut net, laptop, room));
+    net.advance(MINUTE);
+    assert_eq!(net.state(laptop, room), ConvState::Left);
+    assert_eq!(posts(&net, laptop, room, ContentType::Commit), commits + 1);
+
+    net.connect(phone);
+    for _ in 0..3 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert!(!has_group(&net, phone, p));
+    assert_eq!(queued_commits(&net, phone, p), 0);
+    assert_eq!(posts(&net, laptop, room, ContentType::Commit), commits + 1);
     assert_eq!(posts(&net, laptop, room, ContentType::Proposal), 0);
+}
+
+/// 5.1, 6.1: once Bob leaves a direct conversation, Alice's devices leave
+/// too, by themselves, but one of them first removes the other's leaf;
+/// both show the conversation as left by Bob.
+#[test]
+fn own_devices_remove_each_other_when_the_peer_leaves() {
+    let mut net = Net::new();
+    let laptop = net.device("alice", "alice@example.org");
+    let phone = net.device_of("alice-phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, phone, bob] {
+        net.connect(d);
+    }
+    let a = net
+        .job(
+            laptop,
+            Job::Direct {
+                peer: uid("bob@example.net"),
+            },
+        )
+        .unwrap();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    let commits = posts(&net, laptop, a, ContentType::Commit);
+
+    assert!(!leave(&mut net, bob, b), "after the SelfRemove");
+    for _ in 0..3 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.state(bob, b), ConvState::Left);
+    let bob_uid = uid("bob@example.net");
+    for (d, c) in [(laptop, a), (phone, p)] {
+        assert_eq!(net.state(d, c), ConvState::Left);
+        assert!(!has_group(&net, d, c));
+        assert!(net.devices[d].store.departed(c, &bob_uid).unwrap());
+        assert_eq!(queued_commits(&net, d, c), 0);
+    }
+    // Both may have posted a leave commit for the epoch; the first won and
+    // removed the other device, whose commit was not made again.
+    let after = posts(&net, laptop, a, ContentType::Commit);
+    assert!((commits + 1..=commits + 2).contains(&after), "{after}");
 }
