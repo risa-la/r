@@ -352,6 +352,16 @@ fn expire_all(net: &mut Net, d: usize, conv: ConversationId) {
     net.server.expire(&mailbox, head);
 }
 
+fn left(net: &Net, d: usize, conv: ConversationId) -> bool {
+    net.events(d).iter().any(|e| {
+        matches!(
+            e,
+            Event::Conversation(ConversationEvent::Left { conversation })
+                if *conversation == conv
+        )
+    })
+}
+
 /// 7.4, 12.7: a device that finds a gap asks its own devices at once with
 /// `RESYNC <box> <seq>`; the laptop replaces its leaf without waiting for
 /// the leaf to go stale, or for an hour, and the Welcome brings it back.
@@ -384,4 +394,135 @@ fn a_lost_device_asks_its_own_devices_and_is_welcomed_back() {
         net.texts(phone, p)
             .contains(&("bob@example.net".into(), "welcome back".into()))
     );
+}
+
+/// 6.1, 7.5: the user leaves a conversation the device has lost. It is
+/// left locally at once, marked departed, and the Welcome that answers the
+/// RESYNC the device sent before is refused.
+#[test]
+fn a_lost_conversation_the_user_leaves_is_left_for_good() {
+    let (mut net, laptop, phone, bob, a) = own_devices_and_bob();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    net.disconnect(phone);
+    net.say(bob, b, "while you were away");
+    expire_all(&mut net, laptop, a);
+    // The laptop, which read everything, is away when the phone asks.
+    net.disconnect(laptop);
+    net.connect(phone);
+    net.tick();
+    assert_eq!(net.state(phone, p), ConvState::Lost);
+    let own = net.devices[phone].uid.clone();
+    let now = net.clock.now().unix_millis();
+    assert!(net.write(phone, |tx| group::leave(tx, p, &own, now)));
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert!(net.devices[phone].store.departed(p, &own).unwrap());
+    // The laptop comes back and answers the RESYNC: the phone refuses the
+    // Welcome back.
+    let before = net.epoch(laptop, a);
+    let seen = net.events(phone).len();
+    net.connect(laptop);
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert!(
+        net.epoch(laptop, a) > before,
+        "the laptop replaced the phone's leaf"
+    );
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert!(!net.events(phone)[seen..].iter().any(|e| matches!(
+        e,
+        Event::Conversation(ConversationEvent::Joined { conversation }) if *conversation == p
+    )));
+}
+
+/// 6.1, 7.5: a device whose SelfRemove waits for a commit, and that finds
+/// posts expired unread, leaves locally rather than being lost: it is
+/// marked departed and told it left, not that it cannot follow.
+#[test]
+fn a_lost_device_that_was_leaving_leaves_locally() {
+    let (mut net, alice, bob, carol, a) = team();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    net.disconnect(bob);
+    net.disconnect(carol);
+    let own = net.devices[alice].uid.clone();
+    let now = net.clock.now().unix_millis();
+    assert!(!net.write(alice, |tx| group::leave(tx, a, &own, now)));
+    net.tick();
+    assert_eq!(net.state(alice, a), ConvState::Leaving);
+    // Bob commits the SelfRemove while Alice is away, and says goodbye;
+    // all of it expires before Alice is back.
+    net.disconnect(alice);
+    net.connect(bob);
+    net.tick();
+    net.say(bob, b, "bye alice");
+    expire_all(&mut net, alice, a);
+    net.connect(alice);
+    net.tick();
+    assert_eq!(net.state(alice, a), ConvState::Left);
+    assert!(net.devices[alice].store.departed(a, &own).unwrap());
+    assert!(left(&net, alice, a));
+    assert!(!cannot_follow(&net, alice, a));
+}
+
+/// 6.1, 7.5: a public room the user leaves while the device cannot follow
+/// it is not joined again.
+#[test]
+fn a_lost_public_room_the_user_leaves_is_not_joined_again() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device_with(
+        "bob",
+        "bob@example.net",
+        Config {
+            self_conversation: false,
+            max_commit_wait_ms: 10 * 60 * 1000,
+            ..Config::immediate()
+        },
+    );
+    net.connect(alice);
+    net.connect(bob);
+    let room: Room = "#general".parse().unwrap();
+    let a = net
+        .job(alice, Job::PublicRoom { room: room.clone() })
+        .expect("created");
+    let b = net
+        .job_over(
+            bob,
+            Job::JoinPublic {
+                room,
+                new_group: false,
+            },
+            5,
+        )
+        .expect("joined");
+    net.disconnect(bob);
+    let now = net.clock.now().unix_millis();
+    net.write(alice, |tx| {
+        group::queue_intent(tx, a, &Intent::default(), now)?;
+        Ok(())
+    });
+    net.tick();
+    expire_all(&mut net, alice, a);
+    net.connect(bob);
+    net.tick();
+    assert!(cannot_follow(&net, bob, b));
+    assert_eq!(net.state(bob, b), ConvState::Lost);
+    let own = net.devices[bob].uid.clone();
+    let now = net.clock.now().unix_millis();
+    assert!(net.write(bob, |tx| group::leave(tx, b, &own, now)));
+    let posts = |net: &Net| {
+        net.server
+            .log
+            .iter()
+            .filter(|((d, _), verb)| *d == bob && verb == "POST")
+            .count()
+    };
+    let before = posts(&net);
+    for _ in 0..12 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(bob, b), ConvState::Left);
+    assert_eq!(posts(&net), before, "no join proposal");
+    assert!(!net.devices[bob].engine.stuck.contains_key(&b));
 }

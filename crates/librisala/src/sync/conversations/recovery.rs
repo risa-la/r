@@ -73,6 +73,16 @@ pub(crate) fn may_replace(
     })
 }
 
+/// What became of a group the device can no longer follow
+/// ([`cannot_follow`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Gap {
+    /// It is lost, until a Welcome or joining again brings it back.
+    Lost,
+    /// It was leaving, and has left, locally (6.1).
+    Left,
+}
+
 /// Marks `conv` as a group the device can no longer follow (7.4, 7.5):
 /// posts after its sync point expired before it applied them, and it
 /// cannot tell whether they held commits. Its commits made for the epoch
@@ -85,12 +95,21 @@ pub(crate) fn may_replace(
 /// gap, and they replace its leaf without waiting for it to go stale; or
 /// other members do after 35 days. A Welcome brings it back, as for a new
 /// device (7.5, 12.7).
+///
+/// A device that was leaving the group leaves it locally instead, for
+/// good ([`group::leave_for_good`]): it forgets the conversation, marks it
+/// departed and refuses Welcomes back (6.1).
 pub(super) fn cannot_follow(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: ConversationId,
     seq: u64,
-) -> Result<(), EngineError> {
+) -> Result<Gap, EngineError> {
+    if group::leaving(tx, conv)? {
+        group::leave_for_good(tx, conv, cx.uid)?;
+        tracing::info!(%conv, "posts expired unread while leaving: left the group locally");
+        return Ok(Gap::Left);
+    }
     let row = tx.conversation(conv)?;
     for o in tx.pending_outbox(conv)? {
         if o.kind == OutboxKind::Commit
@@ -109,7 +128,7 @@ pub(super) fn cannot_follow(
     if matches!(row.kind, ConvKind::Direct | ConvKind::Private) {
         ask_own_devices(tx, cx, conv, seq)?;
     }
-    Ok(())
+    Ok(Gap::Lost)
 }
 
 /// Asks the identity's other devices to replace this device's leaf in
@@ -149,18 +168,27 @@ impl ConversationEngine {
     /// After [`cannot_follow`]: tells the user, and in a public room joins
     /// again by proposal, after a random wait (6.1). It goes the way of a
     /// room it cannot follow (12.7), but never makes a resync commit: the
-    /// commits it missed may have been valid.
+    /// commits it missed may have been valid. A device that has left
+    /// instead tells the user that it left.
     pub(super) fn lost(
         &mut self,
         cx: &Context,
         me: &Me,
         conv: ConversationId,
+        gap: Gap,
         out: &mut Vec<Action>,
     ) {
         self.move_timers.remove(&conv);
         self.proposal_timers.remove(&conv);
         self.unprocessable.remove(&conv);
         self.resync_since.remove(&conv);
+        if gap == Gap::Left {
+            // 6.1: it was leaving, and has left.
+            out.push(Action::Emit(Event::Conversation(ConversationEvent::Left {
+                conversation: conv,
+            })));
+            return;
+        }
         out.push(Action::Emit(Event::Conversation(
             ConversationEvent::CannotFollow { conversation: conv },
         )));

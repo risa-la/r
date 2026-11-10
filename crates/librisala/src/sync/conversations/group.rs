@@ -435,10 +435,12 @@ fn leave_alone(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Re
 /// identity in it, no commit could remove its leaf. Its MLS state and leaf
 /// key are deleted, what it had queued is dropped, and the conversation is
 /// left, as when the device is removed; the engine then unfollows its
-/// mailboxes. Messages stay, as for any conversation left.
+/// mailboxes. Messages stay, as for any conversation left. A conversation
+/// the device can no longer follow (7.5), whose group is forgotten
+/// already, is left too.
 pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()> {
     let row = tx.conversation(conv)?;
-    if !row.state.in_group() {
+    if !row.state.in_group() && row.state != ConvState::Lost {
         return Ok(());
     }
     {
@@ -464,8 +466,26 @@ pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()>
         tx.update_outbox(o.id, OutboxState::Lost, None, None, None)?;
     }
     tx.set_state(conv, ConvState::Left)?;
-    tracing::info!(%conv, "left a conversation by itself: no other identity is in it");
+    tracing::info!(%conv, "left a conversation by itself");
     Ok(())
+}
+
+/// Leaves locally ([`leave_locally`]) a group in which this device's leaf
+/// may stay (6.1, 7.5): one it can no longer follow. The own identity is
+/// marked departed, so that the device refuses Welcomes back into the
+/// group ([`join_welcome`]): none of its leaves could be removed first,
+/// and a device that replaces the stale leaf would otherwise bring it
+/// back.
+pub(crate) fn leave_for_good(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid) -> Result<()> {
+    leave_locally(tx, conv)?;
+    tx.mark_departed(conv, own)?;
+    Ok(())
+}
+
+/// Whether this device left `conv` by itself, its leaf perhaps still in
+/// the group, and refuses Welcomes back ([`leave_for_good`]).
+pub(crate) fn left_for_good(tx: &Tx<'_>, conv: &ConvRow, own: &Uid) -> Result<bool> {
+    Ok(conv.state == ConvState::Left && tx.departed(conv.id, own)?)
 }
 
 /// Whether a KeyPackage's lifetime is acceptable for a commit this device
@@ -1315,9 +1335,16 @@ fn after_commit(
 /// Where nobody else would commit the leave ([`alone`]), the device leaves
 /// locally ([`leave_locally`]), with no SelfRemove: at once if its
 /// identity has no other leaf, and otherwise once its commit that removes
-/// them is applied. Returns whether it has left already.
+/// them is applied. A conversation the device can no longer follow (7.5)
+/// is left locally at once, for good ([`leave_for_good`]): it has no group
+/// to post a SelfRemove or a commit in. Returns whether it has left
+/// already.
 pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<bool> {
     let row = tx.conversation(conv)?;
+    if row.state == ConvState::Lost {
+        leave_for_good(tx, conv, own)?;
+        return Ok(true);
+    }
     if !row.state.in_group() || leaving(tx, conv)? {
         return Ok(false);
     }
@@ -1667,6 +1694,17 @@ pub(crate) fn join_welcome(
         return Ok(Joined::Refused("someone the user blocked is in it".into()));
     }
     if let Some(existing) = tx.conversation_by_group(cx.account, group.group_id().as_slice())? {
+        // 6.1, 7.5: a group this device left by itself, its leaf perhaps
+        // still in it, is left for good: a device that replaced that leaf
+        // does not bring it back. A public room is joined again only by
+        // proposal, which the user asks for.
+        if existing.kind != ConvKind::Public && left_for_good(tx, &existing, cx.uid)? {
+            mls_group::forget_group(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
+            tx.used_key_package(cx.account, &reference)?;
+            return Ok(Joined::Refused(
+                "a Welcome back into a conversation this device has left".into(),
+            ));
+        }
         // 12.7: a device whose leaf was replaced from a new KeyPackage
         // (RESYNC, a stale leaf, a refused Welcome) is welcomed into a group
         // it has: the conversation goes on from the Welcome's epoch, but

@@ -2100,8 +2100,8 @@ impl ConversationEngine {
                             // nor in a mailbox the group moved away from,
                             // whose commits it has all applied (7.8).
                             if !joined && mb.current && tx.conversation(mb.conv)?.state.in_group() {
-                                recovery::cannot_follow(tx, c, mb.conv, to + 1)?;
-                                lost = Some(mb.conv);
+                                let gap = recovery::cannot_follow(tx, c, mb.conv, to + 1)?;
+                                lost = Some((mb.conv, gap));
                             }
                             tx.set_sync(mb.conv, &mailbox, to, None)?;
                             // 12.13: ask the identity's other devices (C4).
@@ -2121,8 +2121,8 @@ impl ConversationEngine {
                 // A conversation it can no longer follow takes no post:
                 // they go, unread, and the mailbox is no longer followed.
                 self.advance(cx, &me, &mailbox, out)?;
-                if let Some(conv) = lost {
-                    self.lost(cx, &me, conv, out);
+                if let Some((conv, gap)) = lost {
+                    self.lost(cx, &me, conv, gap, out);
                     return Ok(());
                 }
                 if more {

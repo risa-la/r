@@ -367,6 +367,12 @@ impl ConversationEngine {
                     return Ok(());
                 };
                 self.stuck.remove(&conv);
+                // 6.1: the user left it meanwhile.
+                if self.write(cx, &me, out, |tx, c| {
+                    group::left_for_good(tx, &tx.conversation(conv)?, c.uid)
+                })? {
+                    return Ok(());
+                }
                 // 12.7: a full client of an identity resyncs a room whose
                 // bad commit is still the newest; otherwise someone has, or
                 // the device is a guest's, and it joins again by proposal.
@@ -654,6 +660,14 @@ impl ConversationEngine {
             .map(|(c, (e, _))| (*c, *e))
             .collect();
         for (conv, epoch) in due {
+            // 6.1: a room the user left while the device could not follow
+            // it is not joined again.
+            if self.write(cx, me, out, |tx, c| {
+                group::left_for_good(tx, &tx.conversation(conv)?, c.uid)
+            })? {
+                self.stuck.remove(&conv);
+                continue;
+            }
             self.stuck.insert(conv, (epoch, u64::MAX));
             let mailbox = self.write(cx, me, out, |tx, _| Ok(tx.current_mailbox(conv).ok()))?;
             let Some(mb) = mailbox else { continue };
