@@ -291,14 +291,14 @@ struct {
   `bans` holds at most 10,000 uids, the member limit of the largest
   room (6.1).
 
-The rules on the lists, like the rest of this section, are format
-rules: an extension that breaks one is not well formed. Everyone who reads an extension checks them, wherever it
-comes from: a device that joins by Welcome or by external commit
-(12.7), a device that applies a commit (12.7) or checks its own before
-posting it, and the server, in a new public room's CREATE (5.2) and in
-every commit it checks in a public room (12.6). Since `bans` may be
-long, implementations find repeats with a hash set or by sorting, not by
-comparing every pair.
+The rules on the lists, like the rest of this section, are format rules:
+an extension that breaks one is not well formed. Everyone who reads an
+extension checks them, wherever it comes from: a device that joins by
+Welcome or by external commit (12.7), a device that applies a commit
+(12.7) or checks its own before posting it, and the server, in a new
+public room's CREATE (5.2) and in every commit it checks in a public
+room (12.6). Since `bans` may be long, implementations find repeats with
+a hash set or by sorting, not by comparing every pair.
 
 The group context has exactly two extensions: `required_capabilities`
 first, which lists the extension types `0xF2A1`, `0xF2A2` and `0xF2A3`,
@@ -1024,18 +1024,18 @@ conversation or a private room:
   lines from others: that member may be cutting devices out on purpose.
 
 **Devices that found a gap.** A device that finds that posts after its
-sync point expired before it applied them can no longer follow the
-group either (7.4, 7.5). Outside public rooms, it sends
-`RESYNC <box> <seq>` in the conversation with itself at once, where
-`<seq>` is the first seq it found after the gap, or the head if every
-post up to the head had expired (12.9). A device of the same identity
-that reads it replaces that leaf as above, after a random wait of up to
-10 minutes and unless another has done so first, without waiting for
-the leaf to go stale (below). Only the identity's own
-devices read that line, so a leaf whose identity has no other leaf in
-the group is replaced only once it is stale. A device that cannot
-follow the conversation with itself cannot send the line at all, and
-its own devices replace its leaves there and elsewhere as stale ones.
+sync point expired before it applied them can no longer follow the group
+either (7.4, 7.5). Outside public rooms, it sends `RESYNC <box> <seq>`
+in the conversation with itself at once, where `<seq>` is the first seq
+it found after the gap, or the head if every post up to the head had
+expired (12.9). A device of the same identity that reads it replaces
+that leaf as above, after a random wait of up to 10 minutes and unless
+another has done so first, without waiting for the leaf to go stale
+(below). Only the identity's own devices read that line, so a leaf whose
+identity has no other leaf in the group is replaced only once it is
+stale. A device that cannot follow the conversation with itself cannot
+send the line at all, and its own devices replace its leaves there and
+elsewhere as stale ones.
 
 The server orders the posts, so it can also show different devices
 different commits for the same epoch, and split the group with no
@@ -1232,9 +1232,8 @@ if that is later; but never later than the `t` of the commit's post.
 A device that finds it has fallen behind (7.4) uploads fresh
 KeyPackages, sends `RESYNC <box> <seq>` where it can (above), and waits
 to be added again. Once it is back in the conversation with yourself,
-it asks its identity's other devices for
-what it missed with WANT lines, which they answer with transfers
-(12.13).
+it asks its identity's other devices for what it missed with WANT
+lines, which they answer with transfers (12.13).
 
 **Refreshing keys.** A device MUST commit a fresh leaf of its own, with
 a commit that has no proposals, in each group where its leaf has not
@@ -1545,10 +1544,11 @@ message by where it falls in that order, not only by its epoch:
   is the one that sent the message in its epoch. A later commit may put
   another leaf at the same index, or remove that one too, so a device
   keeps every removal it may still need, not only the newest at each
-  index: every removal made since the oldest past epoch whose secrets
-  it still holds, and after a move (below), every one made in the old
-  mailbox up to the move, for as long as it follows that mailbox. A removal in the new mailbox, which
-  does not count for a post in the old one, never hides one that does.
+  index: every removal made since the oldest past epoch whose secrets it
+  still holds, and after a move (below), every one made in the old
+  mailbox up to the move, for as long as it follows that mailbox. A
+  removal in the new mailbox, which does not count for a post in the old
+  one, never hides one that does.
 - A line that depends on a role, such as a DELETE of someone else's
   message (5.4), or a TEXT line or typing in a room with `send mods`
   (6.2), counts only if its sender has the role both in the extension
