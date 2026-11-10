@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use risala_mls::conversation::{MAX_BANS, RisalaConversation, Role as GroupRole};
+use risala_mls::conversation::{
+    ConversationError as ExtensionError, RisalaConversation, Role as GroupRole,
+};
 use risala_proto::content::ContentLine;
 use risala_proto::types::Role;
 
@@ -49,6 +51,11 @@ pub enum ConversationError {
     /// Lift a ban first.
     #[error("a room bans at most 10,000 identities")]
     TooManyBans,
+    /// A change past the size limit: a room's owners, moderators, bans
+    /// and topic take at most 512 KiB together (12.4), which long uids can
+    /// reach before the ban cap. Lift bans, or take roles away, first.
+    #[error("a room's owners, moderators, bans and topic take at most 512 KiB")]
+    TooLarge,
 }
 
 impl From<EngineError> for Error {
@@ -729,21 +736,63 @@ impl Hooks for ClientHooks {
     }
 }
 
+/// `new`, an extension this device made by changing the group's, if it
+/// is well formed (12.4). Devices refuse a commit whose extension breaks
+/// a format rule, so a change that would is refused here, before any
+/// commit is made: past the ban cap or the size limit with an error of
+/// its own, since the user can make room; anything else is a bug.
+fn checked(new: RisalaConversation) -> Result<RisalaConversation> {
+    match new.check() {
+        Ok(()) => Ok(new),
+        Err(ExtensionError::TooManyBans) => {
+            Err(Error::Conversation(ConversationError::TooManyBans))
+        }
+        Err(ExtensionError::TooLong(_)) => Err(Error::Conversation(ConversationError::TooLarge)),
+        Err(e) => Err(Error::Internal(format!(
+            "a change made the conversation extension malformed: {e}"
+        ))),
+    }
+}
+
 /// The extension after a ban of `uid` (6.4): `uid` added to `bans`, if it
-/// is not there yet, and taken out of `owners` and `mods`. Devices refuse
-/// a commit that leaves more than 10,000 uids in `bans`, so a ban past
-/// that is refused here, before any commit is made.
+/// is not there yet, and taken out of `owners` and `mods`. A ban past
+/// 10,000 uids, or past 512 KiB, is refused ([`checked`]).
 fn banned(ext: &RisalaConversation, uid: &Uid) -> Result<RisalaConversation> {
     let mut new = ext.clone();
     new.owners.retain(|u| u != uid);
     new.mods.retain(|u| u != uid);
     if !new.bans.contains(uid) {
-        if new.bans.len() >= MAX_BANS {
-            return Err(Error::Conversation(ConversationError::TooManyBans));
-        }
         new.bans.push(uid.clone());
     }
-    Ok(new)
+    checked(new)
+}
+
+/// The extension with `uid`'s role set to `role` (6.3). Leaving no owner
+/// is not allowed, and a role past 512 KiB is refused ([`checked`]).
+fn with_role(ext: &RisalaConversation, uid: &Uid, role: Role) -> Result<RisalaConversation> {
+    let mut new = ext.clone();
+    new.owners.retain(|u| u != uid);
+    new.mods.retain(|u| u != uid);
+    match role {
+        Role::Owner => new.owners.push(uid.clone()),
+        Role::Mod => new.mods.push(uid.clone()),
+        _ => {}
+    }
+    if new.owners.is_empty() {
+        return Err(Error::Conversation(ConversationError::NotAllowed));
+    }
+    checked(new)
+}
+
+/// The extension with the topic `topic` (6.2), which is at most 512
+/// bytes. A topic past the extension's 512 KiB is refused ([`checked`]).
+fn with_topic(ext: &RisalaConversation, topic: &str) -> Result<RisalaConversation> {
+    if topic.len() > risala_mls::conversation::MAX_TOPIC_LEN {
+        return Err(Error::invalid("topic", topic));
+    }
+    let mut new = ext.clone();
+    new.topic = topic.to_owned();
+    checked(new)
 }
 
 fn summary(store: &Store, row: ConvRow) -> Result<ConversationSummary> {
@@ -1211,17 +1260,7 @@ impl Client {
         if ext.role(&own) != GroupRole::Owner || uid.is_guest() {
             return Err(Error::Conversation(ConversationError::NotAllowed));
         }
-        let mut new = ext.clone();
-        new.owners.retain(|u| *u != uid);
-        new.mods.retain(|u| *u != uid);
-        match role {
-            Role::Owner => new.owners.push(uid),
-            Role::Mod => new.mods.push(uid),
-            _ => {}
-        }
-        if new.owners.is_empty() {
-            return Err(Error::Conversation(ConversationError::NotAllowed));
-        }
+        let new = with_role(&ext, &uid, role)?;
         self.commit(
             conversation,
             Intent {
@@ -1235,7 +1274,9 @@ impl Client {
     /// Sets a room's topic (6.2), by an owner or moderator.
     pub async fn set_topic(&self, conversation: ConversationId, topic: &str) -> Result<()> {
         let row = self.conv_row(conversation)?;
-        if topic.len() > 512 || !matches!(row.kind, ConvKind::Private | ConvKind::Public) {
+        if topic.len() > risala_mls::conversation::MAX_TOPIC_LEN
+            || !matches!(row.kind, ConvKind::Private | ConvKind::Public)
+        {
             return Err(Error::invalid("topic", topic));
         }
         let ext = self.extension(&row)?;
@@ -1243,8 +1284,7 @@ impl Client {
         if ext.role(&own) < GroupRole::Mod {
             return Err(Error::Conversation(ConversationError::NotAllowed));
         }
-        let mut new = ext;
-        new.topic = topic.to_owned();
+        let new = with_topic(&ext, topic)?;
         self.commit(
             conversation,
             Intent {

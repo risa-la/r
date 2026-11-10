@@ -311,6 +311,36 @@ fn lifetimes_for_an_own_commit() {
 #[test]
 fn a_commit_past_the_bans_cap_is_not_posted() {
     use risala_mls::conversation::MAX_BANS;
+    commit_is_not_posted(|ext| {
+        let mut over = ext.clone();
+        over.bans = (0..=MAX_BANS)
+            .map(|i| uid(&format!("b{i}@x.org")))
+            .collect();
+        over
+    });
+}
+
+/// 12.4: so is a commit whose extension is longer than 512 KiB, well under
+/// the ban cap.
+#[test]
+fn a_commit_past_512_kib_is_not_posted() {
+    use risala_mls::conversation::{MAX_BANS, MAX_EXTENSION_LEN};
+    commit_is_not_posted(|ext| {
+        let domain = ["a", "b", "c"].map(|c| c.repeat(63)).join(".");
+        let mut over = ext.clone();
+        let mut n = 0;
+        while over.encoded_len() <= MAX_EXTENSION_LEN {
+            over.bans.push(uid(&format!("u{n:05}@{domain}.org")));
+            n += 1;
+        }
+        assert!(over.bans.len() < MAX_BANS);
+        over
+    });
+}
+
+/// That alice's commit of the extension `over` makes of her new room's
+/// fails her own checks: she does not post it, and drops it.
+fn commit_is_not_posted(over: impl FnOnce(&RisalaConversation) -> RisalaConversation) {
     let mut net = Net::new();
     let alice = net.device("alice", "alice@example.org");
     net.connect(alice);
@@ -356,10 +386,7 @@ fn a_commit_past_the_bans_cap_is_not_posted() {
     };
     let before = commits(&net);
     let epoch = net.epoch(alice, room);
-    let mut over = ext.clone();
-    over.bans = (0..=MAX_BANS)
-        .map(|i| uid(&format!("b{i}@x.org")))
-        .collect();
+    let over = over(&ext);
     let now = net.clock.now().unix_millis();
     net.write(alice, |tx| {
         group::queue_intent(

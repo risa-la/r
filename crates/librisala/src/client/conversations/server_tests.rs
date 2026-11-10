@@ -179,6 +179,16 @@ fn accept(client: &Client, known: &[&TestIdentity]) {
 
 /// [`device`], knowing the devices of `known` as accepted ([`accept`]).
 async fn device_knowing(server: &World, who: &TestIdentity, known: &[&TestIdentity]) -> Device {
+    device_knowing_with(server, who, known, config()).await
+}
+
+/// [`device_knowing`], with the group engine's `config`.
+async fn device_knowing_with(
+    server: &World,
+    who: &TestIdentity,
+    known: &[&TestIdentity],
+    config: Config,
+) -> Device {
     let uid = who.uid().to_string();
     let keys = Arc::new(MemoryKeyStore::default());
     keys.save(&uid, who.key()).unwrap();
@@ -199,19 +209,24 @@ async fn device_knowing(server: &World, who: &TestIdentity, known: &[&TestIdenti
         .unwrap();
     accept(&client, known);
     let d = Device { client, account };
-    connect(&d, who).await;
+    connect_with(&d, who, config).await;
     d
 }
 
 /// Signs a device of `who` in, again after [`Client::disconnect`].
 async fn connect(d: &Device, who: &TestIdentity) {
+    connect_with(d, who, config()).await;
+}
+
+/// [`connect`], with the group engine's `config`.
+async fn connect_with(d: &Device, who: &TestIdentity, config: Config) {
     let identity: Identity = who.uid().to_string().parse().unwrap();
     let plan = ConnectionPlan::identity(
         Arc::new(IdentitySignIn::new(identity, who.key().clone())),
         1,
     );
     d.client
-        .connect_with(d.account, plan, None, config())
+        .connect_with(d.account, plan, None, config)
         .await
         .unwrap();
 }
@@ -714,8 +729,8 @@ async fn a_public_room_joined_by_proposal_against_risalad() {
     server.server.stop().await;
 }
 
-/// `n` uids of about 230 bytes each, to ban: enough of them make a commit,
-/// a GroupInfo and a Welcome too long for a line (2.3).
+/// `n` uids of 227 bytes each, to ban: enough of them make the extension
+/// nearly as long as it may be, 512 KiB (12.4).
 fn long_uids(n: usize) -> Vec<risala_proto::names::Uid> {
     let domain = format!(
         "{}.{}.{}.example.org",
@@ -739,13 +754,16 @@ fn bans(d: &Device, conv: ConversationId) -> usize {
 }
 
 /// Commits a ban of `uids` in `conv` by device `d`, an owner, and checks
-/// that the extension alone is too long for a line in base64 (2.3).
+/// that the extension is within 512 KiB (12.4), but that two of it are
+/// too long for a line in base64 (2.3), as a public room's commit and its
+/// GroupInfo are.
 async fn ban_all(d: &Device, conv: ConversationId, uids: Vec<risala_proto::names::Uid>) {
     let row = d.client.store().conversation_row(conv).unwrap().unwrap();
     let mut ext = d.client.extension(&row).unwrap();
     ext.bans = uids;
     let encoded = ext.encode();
-    assert!(encoded.len() / 3 * 4 > risala_proto::frame::MAX_LONG_CLIENT_LINE);
+    assert!(encoded.len() <= risala_mls::conversation::MAX_EXTENSION_LEN);
+    assert!(2 * encoded.len() / 3 * 4 > risala_proto::frame::MAX_LONG_CLIENT_LINE);
     d.client
         .commit(
             conv,
@@ -758,14 +776,16 @@ async fn ban_all(d: &Device, conv: ConversationId, uids: Vec<risala_proto::names
         .unwrap();
 }
 
-/// How many bans make the lines too long.
-const BANS: usize = 4_500;
+/// How many bans make the extension nearly 512 KiB (12.4).
+const BANS: usize = 2_250;
 
 /// 12.12: in a private room, a commit too long for a line, here one that
 /// bans thousands of identities, goes as a blob stored over the anonymous
 /// connection, and so does a sealed Welcome that carries the room's
 /// GroupInfo with them; the members apply the commit, and a device added
-/// afterwards joins, all past the real limit of 2.3.
+/// afterwards joins. The extension's 512 KiB (12.4) keeps a small room's
+/// commit within the long-line limit of 2.3, so alice's limit is lowered
+/// to 256 KiB; the server takes the blobs as it would larger ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_private_rooms_commit_and_welcome_past_the_line_limit_against_risalad() {
     let server = server().await;
@@ -773,7 +793,11 @@ async fn a_private_rooms_commit_and_welcome_past_the_line_limit_against_risalad(
     let bob_id = server.identity("bob@example.net");
     let carol_id = server.identity("carol@example.org");
     let all = [&alice_id, &bob_id, &carol_id];
-    let alice = device_knowing(&server, &alice_id, &all).await;
+    let lowered = Config {
+        line_limit: 256 * 1024,
+        ..config()
+    };
+    let alice = device_knowing_with(&server, &alice_id, &all, lowered).await;
     let bob = device_knowing(&server, &bob_id, &all).await;
     let carol = device_knowing(&server, &carol_id, &all).await;
     for d in [&alice, &bob, &carol] {
@@ -820,10 +844,10 @@ async fn a_private_rooms_commit_and_welcome_past_the_line_limit_against_risalad(
 }
 
 /// 12.6, 12.12: in a public room, a commit and its GroupInfo too long for
-/// a line go as blobs, stored over the anonymous connection and posted on
-/// the signed-in one, which the server reads whole to check; a device that
-/// joins afterwards gets the room's GroupInfo, and its Welcome, as blobs,
-/// all past the real limit of 2.3.
+/// a line together, past the real limit of 2.3, go as blobs, stored over
+/// the anonymous connection and posted on the signed-in one, which the
+/// server reads whole to check; a device that joins afterwards gets the
+/// room's GroupInfo and its Welcome, with the bans.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_public_rooms_commit_and_groupinfo_past_the_line_limit_against_risalad() {
     let server = server().await;
@@ -848,8 +872,8 @@ async fn a_public_rooms_commit_and_groupinfo_past_the_line_limit_against_risalad
     ban_all(&alice, a, long_uids(BANS)).await;
     until("bob applied the commit", || bans(&bob, b) == BANS).await;
 
-    // Carol joins by proposal: the room's GroupInfo, and the Welcome for
-    // her, come as blobs.
+    // Carol joins by proposal, from the room's GroupInfo, and her Welcome
+    // carries the bans.
     let carol = device(&server, &carol_id).await;
     let c = join_when_connected(&carol).await;
     assert_eq!(bans(&carol, c), BANS);

@@ -375,3 +375,93 @@ fn a_ban_past_the_cap_is_refused() {
     // Banning one already banned changes nothing.
     assert_eq!(super::banned(&full, &uid("b0@x.org")).unwrap(), full);
 }
+
+/// 12.4: the conversation extension is at most 512 KiB, which long uids
+/// reach well before the ban cap. A ban, a role or a topic that would pass
+/// it is refused with its own error before any commit is made; up to it,
+/// each is fine.
+#[test]
+fn a_change_past_512_kib_is_refused() {
+    use super::ConversationError;
+    use risala_mls::conversation::{MAX_BANS, MAX_EXTENSION_LEN, RisalaConversation};
+    use risala_proto::names::Uid;
+    use risala_proto::types::Role;
+    let uid = |s: &str| -> Uid { s.parse().unwrap() };
+    // Distinct uids of 202 bytes, 204 encoded.
+    let long = |n: usize| -> Uid {
+        let domain = ["a", "b", "c"].map(|c| c.repeat(63)).join(".");
+        uid(&format!("u{n:05}@{domain}.org"))
+    };
+    let too_large = |r: Result<RisalaConversation>| {
+        let err = r.unwrap_err();
+        assert!(
+            matches!(err, Error::Conversation(ConversationError::TooLarge)),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "a room's owners, moderators, bans and topic take at most 512 KiB"
+        );
+    };
+    let mut base = RisalaConversation::private_room(
+        "chat.example.org".parse().unwrap(),
+        [0; 16],
+        "big",
+        &uid("o@x.org"),
+    );
+    base.mods.push(uid("m@x.org"));
+    // Bans of long uids until one more would not fit.
+    let mut n = 0;
+    while base.encoded_len() + 204 <= MAX_EXTENSION_LEN {
+        base.bans.push(long(n));
+        n += 1;
+    }
+    assert!(base.bans.len() < MAX_BANS);
+    assert!(MAX_EXTENSION_LEN - base.encoded_len() < 204);
+
+    // A ban of one more long uid passes it; a ban that also takes a role
+    // away makes room for the uid, but not for a long one.
+    too_large(super::banned(&base, &long(n)));
+    let mut with_long_mod = base.clone();
+    with_long_mod.bans.pop();
+    with_long_mod.mods.push(long(n - 1));
+    let moved = super::banned(&with_long_mod, &long(n - 1)).unwrap();
+    assert!(moved.mods.iter().all(|u| *u != long(n - 1)));
+    assert_eq!(moved.bans, base.bans);
+
+    // A role, the same.
+    too_large(super::with_role(&base, &long(n), Role::Mod));
+    too_large(super::with_role(&base, &long(n), Role::Owner));
+    let promoted = super::with_role(&base, &uid("m@x.org"), Role::Owner).unwrap();
+    assert_eq!(promoted.owners.len(), 2);
+    assert!(super::with_role(&base, &uid("m@x.org"), Role::Member).is_ok());
+    // Not the last owner, at any size.
+    assert!(matches!(
+        super::with_role(&base, &uid("o@x.org"), Role::Member),
+        Err(Error::Conversation(ConversationError::NotAllowed))
+    ));
+
+    // With a ban lifted, a topic fills the extension to exactly 512 KiB,
+    // and no further. An empty topic takes 1 byte, and one of 64 bytes or
+    // more 2 and its text.
+    let mut room = base.clone();
+    room.bans.pop();
+    let fill = "t".repeat(MAX_EXTENSION_LEN - room.encoded_len() - 1);
+    assert!((64..=512).contains(&fill.len()));
+    let full = super::with_topic(&room, &fill).unwrap();
+    assert_eq!(full.encoded_len(), MAX_EXTENSION_LEN);
+    too_large(super::with_topic(&room, &format!("{fill}t")));
+    // A topic over 512 bytes is refused as such, whatever the size.
+    assert!(matches!(
+        super::with_topic(
+            &RisalaConversation::private_room(
+                "chat.example.org".parse().unwrap(),
+                [0; 16],
+                "small",
+                &uid("o@x.org"),
+            ),
+            &"t".repeat(513)
+        ),
+        Err(Error::Invalid { .. })
+    ));
+}
