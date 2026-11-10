@@ -2503,6 +2503,100 @@ async fn external_commits_refuse_blob_refs() {
     assert_eq!(dave_conn.lines(), ["OK seq=4"]);
 }
 
+/// The ban cap and unique uids are format rules of the conversation
+/// extension (12.4, PLAN item 67), which the server checks through
+/// risala-mls: it refuses a public room's commit whose extension lists
+/// more than 10,000 uids in `bans`, or a uid twice in `owners`, `mods` or
+/// `bans`, and takes one with exactly 10,000 bans.
+#[tokio::test]
+async fn public_room_commits_keep_the_extension_format() {
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let base = risala_mls::group::conversation(&room.o).unwrap();
+    let uids = |n: usize| -> Vec<Uid> {
+        (0..n)
+            .map(|i| format!("u{i}@x.example").parse().unwrap())
+            .collect()
+    };
+    let twice = |uid: &str| -> Vec<Uid> { vec![uid.parse().unwrap(), uid.parse().unwrap()] };
+    let refusals = [
+        (
+            "bans",
+            uids(risala_mls::conversation::MAX_BANS + 1),
+            "more than 10,000 uids in bans",
+        ),
+        (
+            "owners",
+            twice("owen@example.org"),
+            "a uid twice in one list",
+        ),
+        ("mods", twice("mo@example.org"), "a uid twice in one list"),
+        ("bans", twice("eve@example.org"), "a uid twice in one list"),
+        (
+            "bans",
+            {
+                let mut long = uids(risala_mls::conversation::MAX_BANS);
+                long[risala_mls::conversation::MAX_BANS - 1] = "u0@x.example".parse().unwrap();
+                long
+            },
+            "a uid twice in one list",
+        ),
+    ];
+    for (list, uids, why) in refusals {
+        let mut conv = base.clone();
+        match list {
+            "owners" => conv.owners = uids,
+            "mods" => conv.mods = uids,
+            _ => conv.bans = uids,
+        }
+        let line = commit_conversation(&h, &mut room, conv).await;
+        assert!(line.starts_with("ERR forbidden"), "{list}: {line}");
+        assert!(line.contains(why), "{list}: {line}");
+    }
+    // At the cap, it is taken.
+    let mut conv = base;
+    conv.bans = uids(risala_mls::conversation::MAX_BANS);
+    assert_eq!(commit_conversation(&h, &mut room, conv).await, "OK seq=1");
+}
+
+/// The owner's commit of `conversation` to the room, posted with its
+/// message and GroupInfo as blobs, since a long extension does not fit a
+/// line (12.12); merged if the server takes it, and dropped if not.
+/// Returns the server's response.
+async fn commit_conversation(
+    h: &Harness,
+    room: &mut PublicRoomSetup,
+    conversation: RisalaConversation,
+) -> String {
+    let token = room.owen.token(&room.o);
+    let changes = Changes {
+        conversation: Some(conversation),
+        ..Changes::default()
+    };
+    let out = room.owen.commit(&mut room.o, changes);
+    let message = hold_blob(h, &out.message, Some(&room.m));
+    let info = hold_blob(h, out.group_info.as_ref().unwrap(), Some(&room.m));
+    h.send(
+        &room.signed,
+        &format!(
+            "POST {} {token} {message} next={} groupinfo={info}",
+            room.m,
+            hash(out.next_token_hash)
+        ),
+    )
+    .await;
+    let lines = room.signed.lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    if lines[0].starts_with("OK") {
+        room.owen.merge(&mut room.o, &out);
+    } else {
+        room.o
+            .clear_pending_commit(room.owen.provider.storage())
+            .unwrap();
+    }
+    lines[0].clone()
+}
+
 /// Dave's resync commit against the room's GROUPINFO, as a POST line.
 async fn resync_commit(
     h: &Harness,
