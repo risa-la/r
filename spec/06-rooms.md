@@ -183,7 +183,7 @@ is no SET command.
 | `send` | `all` or `mods` | `all` | owners |
 | `confirm` | `pairwise` or `epochal` | `pairwise` in private rooms, `epochal` in public ones | owners, from `pairwise` to `epochal` only; anyone, in the commit that takes the room past 256 identities |
 | `owners`, `mods` | lists of uids | the creator is the only owner | owners (6.3) |
-| `bans` | a list of uids | empty | owners, moderators (6.4) |
+| `bans` | a list of at most 10,000 uids | empty | owners, moderators (6.4) |
 
 - `guests none`: guests cannot join. `guests read`: guests may join, and
   devices ignore their TEXT lines and typing. `guests write`: guests may
@@ -267,6 +267,9 @@ Owners and moderators moderate with commits:
   pseudonym instead (below), or ask an operator to ban its network
   address (10.2).
 - **Unban** is a commit that takes a uid out of `bans`.
+- **At most 10,000 bans,** the member limit of the largest room (6.1).
+  Devices refuse a commit that leaves more uids in `bans`, and in public
+  rooms the server refuses it too (12.4, 12.6).
 - **Kicking a moderator.** A kick leaves roles as they are, since a
   kicked member may be invited back. An owner who kicks a moderator for
   abuse SHOULD take them out of `mods` in the same commit.

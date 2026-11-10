@@ -286,6 +286,8 @@ struct {
 - In a room, `owners` holds at least one uid. In a direct conversation
   the lists are empty. Every uid in `owners`, `mods` and `bans` is an
   identity, not a guest. A uid is in at most one of `owners` and `mods`.
+  `bans` holds at most 10,000 uids, the member limit of the largest
+  room (6.1).
 
 The group context has exactly two extensions: `required_capabilities`
 first, which lists the extension types `0xF2A1`, `0xF2A2` and `0xF2A3`,
@@ -765,7 +767,8 @@ checks:
 - **Extensions.** A GroupContextExtensions proposal changes only the
   fields of the conversation extension that the committer may change
   (6.2, 6.3), and the other extension is unchanged. A commit that adds a
-  uid to `bans` also takes it out of `owners` and `mods` (6.4). In a
+  uid to `bans` also takes it out of `owners` and `mods` (6.4), and
+  leaves at most 10,000 uids in `bans` (12.4). In a
   direct conversation or a private room, any member may instead change
   `box` alone, to move the mailbox, in a commit with no other proposal,
   and the new `box` is the one that 7.8 derives from the epoch the
