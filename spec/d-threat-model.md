@@ -485,3 +485,43 @@ claims that depend on it.
   back (5.1, 6.1, 12.7); a storage cap that spares posts (7.5); push
   URLs without userinfo, and hosts compared one way (9.1); limits per
   network address, and slow transfers (10.6, Section 14).
+- **draft-03, delivery model** (2026-11-10): a model of delivery found
+  three problems, now fixed: a device that finds that posts after its
+  sync point expired unread can no longer follow the group, and applies
+  nothing after the gap (`GapLost`, 7.4, 7.5); the server ends only a
+  mailbox created more than a retention period ago (`EndAfterUse`,
+  7.5); and a commit whose POST went unanswered is posted again as it
+  was, not made anew (`SameCommit`, 7.6). Three wordings: FETCH repeats
+  after the page's last seq (7.4), FOLLOW's head counts expired posts
+  (7.1), and late posts after a move are judged by the old mailbox's
+  order (12.9). Also: messages do not wait for a move (7.8); a device
+  that leaves locally first removes its own other leaves (6.1); a
+  device joining by Welcome checks only that each leaf's device is
+  current (12.7); `bans` holds at most 10,000 uids (6.4, 12.4); an
+  external commit and a new public room's CREATE must fit in a line,
+  and the server can link a Welcome blob to its mailbox (2.3, 5.2,
+  12.12, Section 14).
+- **draft-03, delivery follow-up** (2026-11-10): a device that finds a
+  gap asks its own devices at once with RESYNC, and posts that expired
+  before it joined, or in a mailbox the group moved from, are not a gap
+  (7.4, 7.5, 12.7); a leave keeps trying, a lost leave or one that
+  fails its checks leaves locally, removing one's own leaves first
+  applies in every kind of group, and the alert for a removed own device
+  covers leaves (6.1, 12.7); the ban cap and unique uids are format
+  rules that everyone checks (12.4); across a move, every removal made
+  in the old mailbox counts there (12.9); a commit too old to win may be
+  dropped for a new one (7.6); the server refuses a blob-ref in CREATE
+  and in an external commit (5.2, 12.12).
+- **draft-03, measured limits and leaving** (2026-11-10): an external
+  commit is used only if it fits in a line, since each node of the
+  joiner's copath resolution adds 1,188 bytes, and a device joins by
+  proposal otherwise (6.1, 12.7, 12.12); a POST with the token `-`
+  carries no blob-ref (5.2); the conversation extension is at most
+  512 KiB, with its uids in lower case (12.4); LEAVE, by which a device
+  that left locally asks its own devices to leave for it, and a device
+  that left refuses Welcomes only from its own devices (6.1, 12.9);
+  RESYNC and LEAVE match any box the group has had (12.9); the server's
+  time on PING (Section 11), by which devices judge a commit's age
+  (7.6) and when to delete a past epoch's secrets, so that every device
+  decides alike, across a move too, in place of a day's grace there
+  (7.8, 12.9, Section 14).
