@@ -112,7 +112,10 @@ risala --state /tmp/alice $A --short-waits send '#garden' welcome
 
 A uid names only the direct conversation with that identity, and `send`
 starts it if there is none; rooms are named `#name` (quoted, for the
-shell) or by their number from `risala list`.
+shell) or by their number from `risala list`. `list` prints each
+conversation's number, kind, name, unread count and state: `active`,
+`joining`, `leaving`, `lost` (posts expired before the device read them)
+or `left`.
 
 `--short-waits` cuts the protocol's random waits of up to 10 minutes to a
 second. It, `--ca` and `--resolve` weaken what the client checks or

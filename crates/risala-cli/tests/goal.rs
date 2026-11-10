@@ -203,7 +203,11 @@ async fn the_goal_with_the_cli() {
     let direct = alice.run(&["direct", "bob@example.org"]).await;
     let list = alice.run(&["list"]).await;
     let line = format!("{}\tdirect\tbob@example.org\t", direct.trim());
-    assert!(list.lines().any(|l| l.starts_with(&line)), "{list}");
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with(&line) && l.split('\t').nth(4) == Some("active")),
+        "{list}"
+    );
     let hello = "hello bob".to_owned();
     assert!(!alice.texts("#bob@example.org").await.contains(&hello));
     assert!(alice.texts("bob@example.org").await.contains(&hello));
@@ -348,10 +352,9 @@ async fn the_goal_with_the_cli() {
     for _ in 0..40 {
         alice.run(&["--wait", "5", "sync"]).await;
         let list = spare.run(&["--wait", "5", "sync"]).await;
-        if list
-            .lines()
-            .any(|l| l.contains("\tdirect\talice@example.org"))
-        {
+        if list.lines().any(|l| {
+            l.contains("\tdirect\talice@example.org\t") && l.split('\t').nth(4) == Some("active")
+        }) {
             joined = true;
             break;
         }

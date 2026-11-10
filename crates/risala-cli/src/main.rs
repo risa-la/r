@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
-use librisala::client::conversations::{ConversationKind, ConversationSummary};
+use librisala::client::conversations::{ConversationKind, ConversationState, ConversationSummary};
 use librisala::client::identity::PairingIdentity;
 use librisala::client::types::{AccountKind, ConversationId, MessageId, SendingHold, Unsettled};
 use librisala::client::{ConnectionState, identity::KeyFetcherHttps};
@@ -188,7 +188,8 @@ enum Command {
     Verify { uid: String, qr: Option<String> },
     /// Connect and receive for `--wait` seconds, then list conversations.
     Sync,
-    /// List conversations, from the cache: number, kind, name, unread.
+    /// List conversations, from the cache: number, kind, name, unread, and
+    /// state: active, joining, leaving, lost or left (6.1, 7.5).
     List,
     /// Start the direct conversation with an identity, or find it (5.1).
     /// Prints its number.
@@ -1061,20 +1062,50 @@ fn unsettled_text(left: &Unsettled) -> String {
     parts.join(", ")
 }
 
+fn state(s: ConversationState) -> &'static str {
+    match s {
+        ConversationState::Active => "active",
+        ConversationState::Joining => "joining",
+        ConversationState::Leaving => "leaving",
+        ConversationState::Lost => "lost",
+        ConversationState::Left => "left",
+    }
+}
+
+/// One line of `list`: number, kind, name, unread, state, and `stopped`
+/// if sending is stopped for someone in it (12.14). The name comes from
+/// the group, so it is shown escaped.
+fn conversation_line(
+    number: i64,
+    k: ConversationKind,
+    name: &str,
+    unread: u64,
+    s: ConversationState,
+    stopped: bool,
+) -> String {
+    let stopped = if stopped { "\tstopped" } else { "" };
+    format!(
+        "{number}\t{}\t{}\t{unread}\t{}{stopped}",
+        kind(k),
+        Shown(name),
+        state(s)
+    )
+}
+
 fn print_conversations(client: &Client, account: AccountId) -> Res {
     let mut out = std::io::stdout().lock();
     for c in client.conversations(account).map_err(err)? {
-        if !c.state.in_group() {
-            continue;
-        }
-        let stopped = if c.sending_stopped { "\tstopped" } else { "" };
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}{stopped}",
-            c.id,
-            kind(c.kind),
-            Shown(&c.name),
-            c.unread
+            "{}",
+            conversation_line(
+                c.id.get(),
+                c.kind,
+                &c.name,
+                c.unread,
+                c.state,
+                c.sending_stopped
+            )
         );
     }
     Ok(())
@@ -1524,6 +1555,44 @@ mod tests {
         );
         assert!(!out.contains(['\u{1b}', '\r', '\u{9b}', '\u{202e}']));
         assert_eq!(pairing_question(&shown), "join mallory@example.org? [y/N] ");
+    }
+
+    /// `list` shows each conversation's state, after the unread count,
+    /// and the name from the group escaped (6.1, 7.5).
+    #[test]
+    fn list_lines_show_the_state_and_escape_the_name() {
+        assert_eq!(
+            conversation_line(
+                3,
+                ConversationKind::PrivateRoom,
+                "team\u{1b}[2K\tx",
+                2,
+                ConversationState::Active,
+                false
+            ),
+            "3\troom\tteam\\u{1b}[2K\\u{9}x\t2\tactive"
+        );
+        assert_eq!(
+            conversation_line(
+                4,
+                ConversationKind::Direct,
+                "bob@example.org",
+                0,
+                ConversationState::Leaving,
+                true
+            ),
+            "4\tdirect\tbob@example.org\t0\tleaving\tstopped"
+        );
+        for (s, word) in [
+            (ConversationState::Joining, "joining"),
+            (ConversationState::Lost, "lost"),
+            (ConversationState::Left, "left"),
+        ] {
+            assert_eq!(
+                conversation_line(5, ConversationKind::PublicRoom, "#general", 0, s, false),
+                format!("5\tpublic\t#general\t0\t{word}")
+            );
+        }
     }
 
     fn entry(number: i64, kind: ConversationKind, name: &str, room: Option<&str>) -> Entry {
