@@ -8,8 +8,7 @@
 //!   commit of each epoch wins (7.2), messages are read (12.9).
 //! - [`join_welcome`]: a sealed Welcome (12.8).
 //!
-//! The group checks and their [`History`](risala_mls::checks::History) are
-//! `risala_mls::checks`'s, and messages are read by
+//! The group checks are `risala_mls::checks`'s, and messages are read by
 //! `risala_mls::message::receive`, with the cache's [`MessageLog`] as its
 //! history.
 
