@@ -2576,3 +2576,187 @@ fn handshake_padding() {
         0
     );
 }
+
+/// The length of `n` bytes in base64 with padding, as on a line.
+fn base64_len(n: usize) -> usize {
+    n.div_ceil(3) * 4
+}
+
+/// The size of the largest external commit and its GroupInfo, against the
+/// 1 MiB line that they must fit, with no blob (2.3, 12.12): in the
+/// largest public room, 32,768 leaves (6.1), with blank parent nodes.
+///
+/// An external commit's path encrypts a path secret to every node in the
+/// resolution of each node of the joiner's copath: one HPKE ciphertext
+/// each, about 1,187 bytes with X-Wing. A full tree needs 15, but a blank
+/// parent node is replaced by the leaves below it. Owen's room here has
+/// 32,767 leaves, added in one commit by value, so only his own direct path
+/// is filled:
+///
+/// - **Edge**: another device of Owen's rejoins without removing anything
+///   and takes the last leaf, 32,767. Its copath resolves to 16,384 nodes:
+///   the left half's root, on Owen's path, and every leaf of the right
+///   half but its own.
+/// - **All blank**: it rejoins removing Owen's leaf 0, which blanks Owen's
+///   path, and takes leaf 0. Every parent node is blank, so it encrypts to
+///   all 32,766 other leaves: the most any external commit there carries.
+///
+/// The full tree, with every parent node filled, is computed from those
+/// two: the same 15 path nodes, with one ciphertext each.
+///
+/// Measured on 2026-11-10, release build, in 275 s:
+///
+/// | | external commit | POST line, base64 | of 1 MiB |
+/// |---|---|---|---|
+/// | full tree (computed) | 44,900 bytes | about 65,200 bytes | 0.06 |
+/// | edge, 16,384 ciphertexts | 19,491,281 bytes | about 26.0 MB | 24.8 |
+/// | all blank, 32,766 ciphertexts | 38,953,106 bytes | about 51.9 MB | 49.5 |
+///
+/// Each ciphertext adds 1,188 bytes, so a POST line holds an external
+/// commit with at most about 620 of them. The GroupInfo, without the
+/// tree, is 3,936 bytes, the room's and the joiner's alike; 10,000 bans in
+/// the extension add 208,893 bytes with short uids (`user9999@example.org`)
+/// and 2,880,003 with the longest (286 bytes). The tree that GROUPINFO
+/// serves is 247,665,096 bytes.
+#[test]
+#[ignore = "slow: builds a room of 32,767 leaves; run with --release"]
+fn largest_external_commit() {
+    use crate::checks::MAX_PUBLIC_LEAVES;
+    use crate::conversation::MAX_BANS;
+    use std::time::Instant;
+    const LINE: usize = 1_048_576;
+    // A smaller power of two, to try the test out.
+    let n: usize = std::env::var("RISALA_LEAVES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_PUBLIC_LEAVES);
+    let depth = n.trailing_zeros() as usize;
+    let start = Instant::now();
+    let (owen, mut o, conv) = public_room(GuestMode::None);
+    // n - 2 more devices, of 9,999 more identities: 10,000 in all (6.1).
+    let scratch = Provider::new(MemoryStorage::default()).unwrap();
+    let profile = RisalaProfile::new("", now_ms()).unwrap();
+    let key_packages: Vec<KeyPackage> = (0..n - 2)
+        .map(|i| {
+            let mut seed = [7u8; 32];
+            seed[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let uid = uid(&format!("m{}@example.org", i % 9_999));
+            make_key_package(
+                &scratch,
+                &SigningKey::from_seed(seed),
+                &uid,
+                &profile,
+                false,
+                ts(now_ms()),
+            )
+            .unwrap()
+            .key_package
+        })
+        .collect();
+    drop(scratch);
+    eprintln!("{:?}: {} KeyPackages", start.elapsed(), key_packages.len());
+    let leaf_key = own_leaf_key(&owen.provider, &o).unwrap();
+    o.commit_builder()
+        .propose_adds(key_packages)
+        .force_self_update(true)
+        .load_psks(owen.provider.storage())
+        .unwrap()
+        .build(
+            owen.provider.rand(),
+            owen.provider.crypto(),
+            &leaf_key,
+            |_| true,
+        )
+        .unwrap()
+        .stage_commit(&owen.provider)
+        .unwrap();
+    o.merge_pending_commit(&owen.provider).unwrap();
+    assert_eq!(o.members().count(), n - 1);
+    let (group_info, tree) = public_state(&owen, &o);
+    eprintln!("{:?}: the room", start.elapsed());
+
+    let owen_leaf = o.own_leaf_index();
+    let mut sizes = Vec::new();
+    for (name, own_leaves) in [("edge", vec![]), ("all blank", vec![owen_leaf])] {
+        let device = Device::new("owen@example.org", 99);
+        let join = external_commit(
+            &device.provider,
+            &device.identity(),
+            &device.profile(),
+            &group_info,
+            &tree,
+            &public_expect(&device),
+            External::Rejoin,
+            &own_leaves,
+        )
+        .unwrap();
+        assert_eq!(join.group.members().count(), n - own_leaves.len());
+        eprintln!(
+            "{:?}: {name}: leaf {}, commit {} bytes, its GroupInfo {} bytes",
+            start.elapsed(),
+            join.group.own_leaf_index().u32(),
+            join.message.len(),
+            join.group_info.len()
+        );
+        sizes.push((join.message.len(), join.group_info.len()));
+    }
+    // Per ciphertext, from the two: the edge encrypts to n / 2 nodes, all
+    // blank to n - 2, and a full tree to one per level.
+    let (edge, blank) = (sizes[0].0, sizes[1].0);
+    let per_ciphertext = (blank - edge) as f64 / (n - 2 - n / 2) as f64;
+    let full = edge as f64 - (n / 2 - depth) as f64 * per_ciphertext;
+
+    // The extension at its limit: 10,000 bans (12.4), of the longest uids
+    // and of short ones.
+    let longest = |i: usize| {
+        let name = format!("{i:05}{}", "n".repeat(27));
+        let domain = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        uid(&format!("{name}@{domain}"))
+    };
+    let mut banned = conv.clone();
+    banned.bans = (0..MAX_BANS).map(longest).collect();
+    assert_eq!(
+        banned.bans[0].as_str().len(),
+        risala_proto::names::MAX_UID_LEN
+    );
+    let longest_growth = banned.encode().len() - conv.encode().len();
+    banned.bans = (0..MAX_BANS)
+        .map(|i| uid(&format!("user{i}@example.org")))
+        .collect();
+    let short_growth = banned.encode().len() - conv.encode().len();
+
+    let line = |commit: usize, group_info: usize| {
+        // POST <box> - <message> groupinfo=<groupinfo> next=<hash>, about
+        // 120 bytes besides the two.
+        base64_len(commit) + base64_len(group_info) + 120
+    };
+    eprintln!(
+        "the room's GroupInfo (GROUPINFO): {} bytes",
+        group_info.len()
+    );
+    eprintln!("the room's tree (GROUPINFO): {} bytes", tree.len());
+    eprintln!("per ciphertext: {per_ciphertext:.1} bytes");
+    for (name, commit) in [
+        ("full tree (computed)", full as usize),
+        ("edge", edge),
+        ("all blank", blank),
+    ] {
+        let gi = sizes[0].1;
+        eprintln!(
+            "{name}: commit {commit} bytes, POST line about {} bytes ({:.2} of 1 MiB)",
+            line(commit, gi),
+            line(commit, gi) as f64 / LINE as f64
+        );
+    }
+    eprintln!(
+        "10,000 bans add {longest_growth} bytes to each GroupInfo with the longest uids, \
+         {short_growth} with short ones"
+    );
+    eprintln!("{:?}: done", start.elapsed());
+}
