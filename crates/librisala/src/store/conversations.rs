@@ -93,6 +93,16 @@ CREATE TABLE mailboxes (
 ) WITHOUT ROWID;
 CREATE INDEX mailboxes_box ON mailboxes (box);
 
+-- Every mailbox each conversation's group has had (7.8), kept after a
+-- mailbox stops being followed, so that a line naming a box from before
+-- a move (RESYNC, LEAVE: 6.1, 12.7) still finds the group.
+CREATE TABLE group_boxes (
+    conv INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    box  TEXT NOT NULL,
+    PRIMARY KEY (conv, box)
+) WITHOUT ROWID;
+CREATE INDEX group_boxes_box ON group_boxes (box);
+
 -- Posts received or fetched but not yet applied, by mailbox and seq
 -- (7.2, 7.4). They are applied in seq order once every earlier one has
 -- been, then deleted. next is a commit's (5.2). blob is the hash of a
@@ -1057,7 +1067,8 @@ impl Tx<'_> {
     // ---- mailboxes
 
     /// Adds a mailbox to a conversation. A current one makes every other
-    /// one old.
+    /// one old. The box is kept among the group's boxes for good
+    /// ([`Tx::conversation_by_box`]).
     pub(crate) fn add_mailbox(
         &mut self,
         conv: ConversationId,
@@ -1082,7 +1093,30 @@ impl Tx<'_> {
                 follow_after.map(|t| t as i64)
             ],
         )?;
+        self.conn().execute(
+            "INSERT INTO group_boxes (conv, box) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![conv.0, mailbox.to_string()],
+        )?;
         Ok(())
+    }
+
+    /// The account's conversation whose group has had `mailbox` as a
+    /// mailbox, now or before a move (7.8), even one no longer followed.
+    pub(crate) fn conversation_by_box(
+        &self,
+        account: AccountId,
+        mailbox: &BoxName,
+    ) -> Result<Option<ConversationId>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT g.conv FROM group_boxes g JOIN conversations c ON c.id = g.conv
+                 WHERE c.account = ?1 AND g.box = ?2",
+                params![account.0, mailbox.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .map(ConversationId))
     }
 
     /// A conversation's mailboxes, the current one first.
@@ -1981,5 +2015,60 @@ mod tests {
         assert!(is_blocked(&blocks, &uid("bob@chat.example.net")));
         assert!(!is_blocked(&blocks, &uid("bob@example.org")));
         assert!(!is_blocked(&blocks, &uid("bob@badexample.net")));
+    }
+
+    #[test]
+    fn a_group_is_found_by_any_box_it_has_had() {
+        use crate::store::settings::AccountKind;
+        let store = Store::open_in_memory().unwrap();
+        let server = "chat.example.org".parse().unwrap();
+        let alice: Uid = "alice@example.org".parse().unwrap();
+        let account = store
+            .add_account(&server, AccountKind::Identity, &alice)
+            .unwrap();
+        let other = store
+            .add_account(
+                &server,
+                AccountKind::Identity,
+                &"bob@example.org".parse().unwrap(),
+            )
+            .unwrap();
+        let first: BoxName = "ujzdegxdncf32epf3dhodzdoci".parse().unwrap();
+        let second: BoxName = "aaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let unknown: BoxName = "bbbbbbbbbbbbbbbbbbbbbbbbba".parse().unwrap();
+        let (conv, _) = store
+            .write(|tx| {
+                let conv = tx.insert_conversation(&NewConversation {
+                    account,
+                    group_id: b"group",
+                    kind: ConvKind::Private,
+                    room: None,
+                    name: "",
+                    topic: "",
+                    peer: None,
+                    epoch: 0,
+                    pseudonym: [0; 16],
+                    state: ConvState::Active,
+                    last_resort: false,
+                    now: 0,
+                })?;
+                tx.add_mailbox(conv, &first, true, 0, None)?;
+                // 7.8: the group moves, and stops following the old box.
+                tx.add_mailbox(conv, &second, true, 3, None)?;
+                tx.remove_mailbox(conv, &first)?;
+                Ok(conv)
+            })
+            .unwrap();
+        store
+            .write(|tx| {
+                assert!(tx.mailbox(account, &first)?.is_none());
+                assert_eq!(tx.conversation_by_box(account, &first)?, Some(conv));
+                assert_eq!(tx.conversation_by_box(account, &second)?, Some(conv));
+                assert_eq!(tx.conversation_by_box(account, &unknown)?, None);
+                // Another account's boxes are its own.
+                assert_eq!(tx.conversation_by_box(other, &first)?, None);
+                Ok(())
+            })
+            .unwrap();
     }
 }
