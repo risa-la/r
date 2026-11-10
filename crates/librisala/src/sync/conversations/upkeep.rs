@@ -2,8 +2,10 @@
 //!
 //! - every ten seconds, the key checks of 12.7 that wait on facts, and their
 //!   repairs ([`super::keycheck::recheck`], LR-C2);
-//! - every ten minutes, past epochs' secrets deleted by the clock, 2 hours
-//!   after the commit that ended each (12.9, LR-H1); outbox rows done or
+//! - every ten minutes, past epochs' secrets deleted 2 hours after the
+//!   commit that ended each, by the server's time as of a catch-up of their
+//!   mailboxes, and a mailbox followed since before then fetched again to
+//!   catch it up (12.9, LR-H1); outbox rows done or
 //!   lost for a day deleted (LR-M2); DELETEs whose target never came
 //!   forgotten after retention (LR-L3); and the WAL truncated, so that
 //!   what was deleted does not stay in it (LR-M1);
