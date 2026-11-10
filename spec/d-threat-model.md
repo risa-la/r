@@ -280,7 +280,9 @@ Each risk is marked **Mitigated**, where this document limits it, or
   sealed per device and sent at random times, 12.8). The server sees
   whose KeyPackages are fetched, how many devices an identity has, which
   device gets a Welcome, and whose presence is watched, and, from timing
-  and size, roughly which devices were added to a group together.
+  and size, roughly which devices were added to a group together. A
+  Welcome too large for a line is a blob stored under its group's
+  mailbox, which ties the device it is for to that mailbox (12.12).
 - **Push timing** (Mitigated: independent random delays, 9.2). Push
   services and gateways see which devices are woken together.
 - **Sizes of private conversations** (Open). The server sees roughly how

@@ -162,6 +162,11 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     several identities' devices that arrive within minutes of each other,
     with about the same size, still suggest that those identities were
     added to one group;
+  - for a Welcome too large for a line, which mailbox it belongs to. Its
+    blob is stored with the box and token of the group's mailbox
+    (12.12), and its blob-ref goes to the welcomed device, so the server
+    can link that device to the mailbox. Only the Welcomes of large
+    groups are blobs;
   - whose KeyPackages someone asked for (12.5), and whose presence
     someone watches (8.3);
   - that an identity has an account on the server: sign-ins, KeyPackages,
