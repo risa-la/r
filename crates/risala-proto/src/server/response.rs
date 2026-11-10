@@ -10,8 +10,9 @@ use crate::command::GuestToken;
 use crate::error::{ErrorCode, ParseError};
 use crate::line::{LineBuilder, Params, Tags, is_token};
 use crate::names::{BoxName, Id, Seq, Uid};
-use crate::parse::{bad, limit, tag_value, tok};
+use crate::parse::{bad, limit, parse_tag, tag_value, tok};
 use crate::record::LogKey;
+use crate::time::Timestamp;
 use crate::types::{FileUrl, MAX_WELCOME, Retention, parse_u64, parse_yes_no, yes_no};
 
 /// Parses the lines of this module; `None` for any other verb.
@@ -22,7 +23,7 @@ pub(super) fn parse(
 ) -> Option<Result<ServerLine, ParseError>> {
     Some(match verb {
         "RISALA" => Greeting::parse(p).map(ServerLine::Greeting),
-        "OK" => OkResponse::parse(p).map(ServerLine::Ok),
+        "OK" => OkResponse::parse(tags, p).map(ServerLine::Ok),
         "ERR" => ErrResponse::parse(tags, p).map(ServerLine::Err),
         _ => return None,
     })
@@ -297,11 +298,15 @@ pub(crate) fn write_authority(
 /// # Ok::<(), risala_proto::error::ParseError>(())
 /// ```
 ///
+/// The `t` tag, which the server puts on the OK to a client's PING (3.2,
+/// 11), is kept apart from the values: [`OkResponse::t`].
+///
 /// `Debug` leaves out the value of `token=`, a guest session's secret
 /// (4.2), so that a response written to a log does not give it away.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct OkResponse {
     values: Vec<(String, String)>,
+    t: Option<Timestamp>,
 }
 
 /// The keys whose values [`OkResponse`]'s `Debug` leaves out.
@@ -323,6 +328,7 @@ impl fmt::Debug for OkResponse {
             .collect();
         f.debug_struct("OkResponse")
             .field("values", &values)
+            .field("t", &self.t)
             .finish()
     }
 }
@@ -381,6 +387,20 @@ impl OkResponse {
         Ok(())
     }
 
+    /// Sets the `t` tag: the server's time when it sent the line, on the
+    /// OK to a client's PING (3.2, 11).
+    pub fn with_t(mut self, t: Timestamp) -> OkResponse {
+        self.t = Some(t);
+        self
+    }
+
+    /// The `t` tag: the server's time when it sent the line, on the OK to
+    /// a client's PING (3.2, 11). Devices learn the server's time from it,
+    /// as from posts' `t` (7.6, 12.9).
+    pub fn t(&self) -> Option<Timestamp> {
+        self.t
+    }
+
     /// Removes the value `key`. Returns whether it was there.
     pub fn remove(&mut self, key: &str) -> bool {
         let before = self.values.len();
@@ -411,16 +431,20 @@ impl OkResponse {
         self.values.is_empty()
     }
 
-    fn parse(p: Params<'_>) -> Result<OkResponse, ParseError> {
+    fn parse(tags: &Tags, p: Params<'_>) -> Result<OkResponse, ParseError> {
+        let t = parse_tag(tags, "t")?;
         let values = p
             .options()?
             .iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
-        Ok(OkResponse { values })
+        Ok(OkResponse { values, t })
     }
 
     fn write(&self, b: &mut LineBuilder) {
+        if let Some(t) = self.t {
+            b.tag("t", t);
+        }
         for (key, value) in &self.values {
             b.option(key, value);
         }

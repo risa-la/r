@@ -52,6 +52,7 @@ fn every_line() -> Vec<String> {
         "RISALA 1 chat.example.org 6f1c0a9e4b2d4c8f9a7e3b5d1c2f4a6e".into(),
         "OK".into(),
         "OK seq=9121".into(),
+        format!("@t={T} OK"),
         "OK uid=~sam token=k3f9q2abcdefghij resumed=yes".into(),
         "ERR not-found".into(),
         "@retry=30 ERR rate-limited slow down".into(),
@@ -94,7 +95,7 @@ fn every_line() -> Vec<String> {
         format!("CONNECTION ~sam 203.0.113.7:51000 {T}"),
         format!("CONNECTION alice@example.org [2001:db8::1]:51000 {T}"),
         format!("CONNECTION alice@example.org 2001:db8::1 {T}"),
-        "PING x".into(),
+        format!("@t={T} PING x"),
         "BYE".into(),
         "BYE shutting down".into(),
     ]
@@ -269,7 +270,11 @@ fn bad_lines() {
         format!("CONNECTION - 203.0.113 {T}"),
         "CONNECTION - 203.0.113.7".into(),
         "PING".into(),
-        "PING a b".into(),
+        format!("@t={T} PING"),
+        format!("@t={T} PING a b"),
+        "PING x".into(),
+        "@t=yesterday PING x".into(),
+        "@t=yesterday OK".into(),
     ] {
         syntax(&s);
     }
@@ -307,6 +312,38 @@ fn unknown_verbs_are_kept() {
     };
     assert!(!line.tags().has("ref"));
     assert_eq!(msg.line.verb(), "FOO");
+}
+
+/// The server's PING and the OK to a client's PING carry the server's
+/// time in `t` (3.2, 11): required on PING, and read on any OK.
+#[test]
+fn ping_and_its_ok_carry_t() {
+    let t: crate::time::Timestamp = T.parse().unwrap();
+    let msg = rt(&format!("@t={T} PING k3j9"));
+    assert_eq!(
+        msg.line,
+        ServerLine::Ping {
+            token: "k3j9".into(),
+            t
+        }
+    );
+    let msg = rt(&format!("@ref=4;t={T} OK"));
+    let ServerLine::Ok(ok) = msg.line else {
+        panic!("{msg:?}")
+    };
+    assert_eq!(ok.t(), Some(t));
+    assert!(ok.is_empty(), "t is a tag, not a value");
+    assert_eq!(OkResponse::new().with_t(t), ok);
+    assert_eq!(
+        ServerMessage::new(OkResponse::new().with_t(t).with_seq(Seq::new(9).unwrap()))
+            .to_line()
+            .to_string(),
+        format!("@t={T} OK seq=9")
+    );
+    let ServerLine::Ok(ok) = parse("OK").unwrap().line else {
+        unreachable!()
+    };
+    assert_eq!(ok.t(), None);
 }
 
 #[test]
@@ -522,7 +559,7 @@ fn final_responses() {
         let msg = parse(&s).unwrap();
         assert_eq!(
             msg.line.is_final(),
-            s.starts_with("OK") || s.contains("ERR "),
+            s.starts_with("OK") || s.contains(" OK") || s.contains("ERR "),
             "{s}"
         );
     }

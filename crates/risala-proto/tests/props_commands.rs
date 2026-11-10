@@ -305,17 +305,23 @@ fn server_line() -> impl Strategy<Value = String> {
     prop_oneof![
         (any::<u32>(), "[a-z0-9]{1,10}\\.[a-z]{2,4}", hex, opt_text())
             .prop_map(|(v, h, n, m)| format!("RISALA {v} {h} {n}{m}")),
-        vec(("[a-z][a-z0-9-]{0,8}", token()), 0..4).prop_map(|kv| {
-            let values: Vec<String> = kv.iter().map(|(k, v)| format!(" {k}={v}")).collect();
-            let mut seen = std::collections::HashSet::new();
-            let values: String = values
-                .into_iter()
-                .zip(&kv)
-                .filter(|(_, (k, _))| seen.insert(k.clone()))
-                .map(|(s, _)| s)
-                .collect();
-            format!("OK{values}")
-        }),
+        (
+            proptest::option::of(timestamp()),
+            vec(("[a-z][a-z0-9-]{0,8}", token()), 0..4)
+        )
+            .prop_map(|(t, kv)| {
+                let values: Vec<String> = kv.iter().map(|(k, v)| format!(" {k}={v}")).collect();
+                let mut seen = std::collections::HashSet::new();
+                let values: String = values
+                    .into_iter()
+                    .zip(&kv)
+                    .filter(|(_, (k, _))| seen.insert(k.clone()))
+                    .map(|(s, _)| s)
+                    .collect();
+                // The OK to PING carries the server's time (11).
+                let t = t.map_or(String::new(), |t| format!("@t={t} "));
+                format!("{t}OK{values}")
+            }),
         (
             proptest::option::of(0..=i64::MAX as u64),
             "[a-z][a-z0-9-]{0,15}",
@@ -396,7 +402,7 @@ fn server_line() -> impl Strategy<Value = String> {
                 };
                 format!("CONNECTION {u} {a} {t}")
             }),
-        token().prop_map(|t| format!("PING {t}")),
+        (timestamp(), token()).prop_map(|(t, k)| format!("@t={t} PING {k}")),
         opt_text().prop_map(|t| format!("BYE{t}")),
     ]
 }

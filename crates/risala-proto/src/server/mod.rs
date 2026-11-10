@@ -80,7 +80,7 @@ use crate::error::ParseError;
 use crate::line::{Line, LineBuilder, Params, Tags};
 use crate::mls::{GroupInfo, KeyPackage, OrBlob, PutSecret, RatchetTree, Welcome};
 use crate::names::{BlobRef, BoxName, Id, PairId, Room, Seq, ServerBanTarget, Uid};
-use crate::parse::{bad, parse_tag, required_text};
+use crate::parse::{bad, parse_tag, required_tag, required_text};
 use crate::time::Timestamp;
 use crate::types::{Presence, PushTag, PushUrl, Ref, Role};
 
@@ -151,7 +151,7 @@ impl ServerMessage {
             .or_else(|| mailbox::parse(&verb, tags, p))
             .or_else(|| account::parse(&verb, p))
             .or_else(|| admin::parse(&verb, p))
-            .or_else(|| parse_other(&verb, p));
+            .or_else(|| parse_other(&verb, tags, p));
         let line = match parsed {
             Some(line) => line?,
             None => {
@@ -435,6 +435,10 @@ pub enum ServerLine {
     Ping {
         /// The token.
         token: String,
+        /// The `t` tag: the server's time when it sent the line (3.2, 11).
+        /// Devices learn the server's time from it, as from posts' `t`
+        /// (7.6, 12.9).
+        t: Timestamp,
     },
     /// `BYE [<message...>]`: the server is closing the connection (11).
     Bye {
@@ -518,16 +522,21 @@ impl From<Report> for ServerLine {
 // ---------------------------------------------------------------------------
 // NOTICE (8.4), PING and BYE (11)
 
-fn parse_other(verb: &str, mut p: Params<'_>) -> Option<Result<ServerLine, ParseError>> {
+fn parse_other(
+    verb: &str,
+    tags: &Tags,
+    mut p: Params<'_>,
+) -> Option<Result<ServerLine, ParseError>> {
     let mut parse = || -> Result<ServerLine, ParseError> {
         Ok(match verb {
             "NOTICE" => ServerLine::Notice {
                 message: required_text(p, "NOTICE has a message")?,
             },
             "PING" => {
+                let t = required_tag(tags, "t")?;
                 let token = p.token()?.to_owned();
                 p.end()?;
-                ServerLine::Ping { token }
+                ServerLine::Ping { token, t }
             }
             "BYE" => ServerLine::Bye {
                 message: p.text().to_owned(),
@@ -543,8 +552,8 @@ fn write_other(line: &ServerLine, b: &mut LineBuilder) -> bool {
         ServerLine::Notice { message } => {
             b.text(message);
         }
-        ServerLine::Ping { token } => {
-            b.token(token);
+        ServerLine::Ping { token, t } => {
+            b.tag("t", t).token(token);
         }
         ServerLine::Bye { message } => {
             b.text(message);

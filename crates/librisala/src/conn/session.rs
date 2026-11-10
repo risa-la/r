@@ -925,7 +925,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
         match msg.line {
             ServerLine::Ok(ok) => self.finish(msg.ref_, End::Ok(ok)),
             ServerLine::Err(err) => self.finish(msg.ref_, End::Err(err)),
-            ServerLine::Ping { token } => {
+            ServerLine::Ping { token, .. } => {
                 // Answer straight away (11). PONG gets no response.
                 let pong = Request::new(Command::Pong { token });
                 match pong.try_to_line() {
