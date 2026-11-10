@@ -470,7 +470,7 @@ fn aad_pseudonym(aad: &risala_mls::RisalaAad) -> Option<[u8; 16]> {
 /// `limits.max_room_blob`, in the room `memory` took for it: `ERR
 /// not-found` if the server holds no such blob, `ERR too-long` past the
 /// limit.
-pub(super) async fn line_bytes<T>(
+async fn line_bytes<T>(
     inner: &Inner,
     memory: &mut keys::BlobMemory,
     value: &OrBlob<T>,
@@ -486,19 +486,11 @@ pub(super) async fn line_bytes<T>(
 }
 
 /// Room in `limits.blob_memory` for the values of `values` that are
-/// blobs, which the command then reads with [`line_bytes`]: taken once
-/// for them all, so that the command never waits for room while it holds
-/// some (12.12).
-pub(super) async fn reserve_lines(
-    inner: &Inner,
-    values: impl IntoIterator<Item = Option<BlobRef>>,
-) -> Result<keys::BlobMemory, ErrResponse> {
-    reserve_lines_and(inner, values, 0).await
-}
-
-/// As [`reserve_lines`], with room besides for `other` bytes the command
-/// reads whole from the store, such as a public room's tree, in the same
-/// reservation ([`keys::BlobMemory::hold`]).
+/// blobs, which the command then reads with [`line_bytes`], and besides
+/// for `other` bytes the command reads whole from the store, such as a
+/// public room's tree ([`keys::BlobMemory::hold`]): taken once for them
+/// all, so that the command never waits for room while it holds some
+/// (12.12).
 async fn reserve_lines_and(
     inner: &Inner,
     values: impl IntoIterator<Item = Option<BlobRef>>,
@@ -512,7 +504,7 @@ async fn reserve_lines_and(
 }
 
 /// The blob a line's value names, if it is one.
-pub(super) fn blob_of<T>(value: &OrBlob<T>) -> Option<BlobRef> {
+fn blob_of<T>(value: &OrBlob<T>) -> Option<BlobRef> {
     match value {
         OrBlob::Inline(_) => None,
         OrBlob::Blob(blob) => Some(*blob),
@@ -586,11 +578,16 @@ async fn post_bytes(
     let message = &post.message;
     let groupinfo = post.groupinfo.as_ref().filter(|_| public_room);
     let framing_only = match message {
-        OrBlob::Inline(inline) => Some(keys::BlobBytes::inline(MlsMessage::decode(inline))),
+        OrBlob::Inline(inline) => {
+            let bytes = MlsMessage::decode(inline);
+            refuse_external_blobs(post, &bytes)?;
+            Some(keys::BlobBytes::inline(bytes))
+        }
         OrBlob::Blob(blob) => {
             let (prefix, size) = keys::blob_prefix(inner, blob, FRAMING_PREFIX)
                 .await
                 .map_err(no_blob)?;
+            refuse_external_blobs(post, &prefix)?;
             if prefix.len() as u64 == size {
                 Some(keys::BlobBytes::inline(prefix))
             } else if let Some(stub) = private_message_stub(&prefix, size) {
@@ -617,6 +614,41 @@ async fn post_bytes(
         None => line_bytes(inner, &mut memory, message, MlsMessage::decode).await?,
     };
     Ok((bytes, memory))
+}
+
+/// `ERR bad-syntax` for an external commit whose message or GroupInfo is
+/// a blob-ref: the device that makes one holds no token to store blobs
+/// with, so both must fit in the line (12.2, 12.6, 12.12; PLAN item 67).
+/// `start` is the message's first bytes, from which this reads its
+/// sender, so that the server reserves and reads none of its blobs.
+fn refuse_external_blobs(post: &PostCommand, start: &[u8]) -> Result<(), ErrResponse> {
+    let blobs =
+        matches!(post.message, OrBlob::Blob(_)) || matches!(post.groupinfo, Some(OrBlob::Blob(_)));
+    if blobs && is_external_commit(start) {
+        return Err(err(ErrorCode::BadSyntax)
+            .with_message("an external commit and its GroupInfo fit in the line"));
+    }
+    Ok(())
+}
+
+/// Whether `start`, the first bytes of an MLSMessage, begins a
+/// PublicMessage whose sender is a new member's external commit (RFC 9420,
+/// 6): version and wire format, group id, epoch, then sender type
+/// `new_member_commit(4)`. [`read_framing`] reads the same field.
+fn is_external_commit(start: &[u8]) -> bool {
+    // version (2 bytes), then wire_format mls_public_message (2).
+    if start.get(2..4) != Some(&[0, 1][..]) {
+        return false;
+    }
+    let Some((len, took)) = start.get(4..).and_then(keys::varint) else {
+        return false;
+    };
+    // group_id, then epoch (8 bytes).
+    let sender_type = 4usize
+        .checked_add(took)
+        .and_then(|at| at.checked_add(len))
+        .and_then(|at| at.checked_add(8));
+    sender_type.and_then(|at| start.get(at)) == Some(&4)
 }
 
 /// Whether `bytes` start as an MLSMessage of `mls10` that is a

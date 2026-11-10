@@ -2395,6 +2395,114 @@ async fn public_room_resync_commits() {
     assert_eq!(dave_conn.lines(), ["ERR stale"]);
 }
 
+/// A new public room's GroupInfo and tree fit in CREATE's line: the
+/// creator holds no token to store blobs with, since the mailbox does not
+/// exist yet, so a blob-ref for either gets `ERR bad-syntax`, whether the
+/// server holds the blob or not (5.2, 12.12, PLAN item 67).
+#[tokio::test]
+async fn creates_refuse_blob_refs() {
+    use risala_proto::mls::{GroupInfo, RatchetTree};
+    let mut h = harness_now();
+    let owen = Dev::new("owen@example.org", 1);
+    let m = mailbox(1);
+    let o = owen.create(&public_conv(&owen, m, GuestMode::Write));
+    let (group_info, tree) = public_state(&owen, &o);
+    let info_blob = hold_blob(&h, &group_info.parse::<GroupInfo>().unwrap().decode(), None);
+    let tree_blob = hold_blob(&h, &tree.parse::<RatchetTree>().unwrap().decode(), None);
+    let missing = risala_proto::names::BlobRef::of(b"no such blob");
+    let line = |info: &dyn std::fmt::Display, tree: &dyn std::fmt::Display| {
+        format!(
+            "CREATE {m} {} {} #general {info} {tree}",
+            gid(&o),
+            owen.token_hash(&o)
+        )
+    };
+    let refused = "ERR bad-syntax a new public room's GroupInfo and tree fit in the line";
+    let mut signed = owen.sign_in(&mut h);
+    for bad in [
+        line(&info_blob, &tree),
+        line(&group_info, &tree_blob),
+        line(&info_blob, &tree_blob),
+        line(&group_info, &missing),
+    ] {
+        h.send(&signed, &bad).await;
+        assert_eq!(signed.lines(), [refused], "{bad}");
+    }
+    // Nothing was created, and the same room inline is.
+    assert!(h.store.mailbox(&m).unwrap().is_none());
+    h.send(&signed, &line(&group_info, &tree)).await;
+    assert_eq!(signed.lines(), ["OK"]);
+}
+
+/// An external commit and its GroupInfo fit in POST's line: the device
+/// that makes one holds no token of the epoch to store blobs with, so a
+/// blob-ref for either gets `ERR bad-syntax`, whether the server holds the
+/// blob or not, before the server reads any of it (12.2, 12.6, 12.12,
+/// PLAN item 67).
+#[tokio::test]
+async fn external_commits_refuse_blob_refs() {
+    use risala_proto::mls::GroupInfo;
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let mut anon = h.anon().await;
+    let dave = Dev::new("dave@example.org", 4);
+    let dave_join = join(&dave, &dave.identity(), &room);
+    h.send(&anon, &format!("POST {m} - {dave_join}")).await;
+    assert_eq!(anon.lines(), ["OK seq=1"]);
+    take_proposal(&mut room, &dave_join);
+    commit_pending(&h, &mut room, 2).await;
+    // A member's commit may name blobs (12.12).
+    let token = room.owen.token(&room.o);
+    let out = room.owen.commit(&mut room.o, Changes::default());
+    let message_blob = hold_blob(&h, &out.message, Some(&m));
+    let info_blob = hold_blob(&h, out.group_info.as_ref().unwrap(), Some(&m));
+    h.send(
+        &room.signed,
+        &format!(
+            "POST {m} {token} {message_blob} next={} groupinfo={info_blob}",
+            hash(out.next_token_hash)
+        ),
+    )
+    .await;
+    assert_eq!(room.signed.lines(), ["OK seq=3"]);
+    room.owen.merge(&mut room.o, &out);
+    let resync = resync_commit(&h, &mut anon, &dave, &room).await;
+    // POST <box> - <message> next=<hash> groupinfo=<groupinfo>
+    let words: Vec<&str> = resync.split(' ').collect();
+    let (message, next) = (words[3], words[4]);
+    let group_info = words[5].strip_prefix("groupinfo=").unwrap();
+    let message_blob = hold_blob(
+        &h,
+        &message.parse::<MlsMessage>().unwrap().decode(),
+        Some(&m),
+    );
+    let info_blob = hold_blob(
+        &h,
+        &group_info.parse::<GroupInfo>().unwrap().decode(),
+        Some(&m),
+    );
+    let missing = risala_proto::names::BlobRef::of(b"no such blob");
+    let line = |message: &dyn std::fmt::Display, info: &dyn std::fmt::Display| {
+        format!("POST {m} - {message} {next} groupinfo={info}")
+    };
+    let refused = "ERR bad-syntax an external commit and its GroupInfo fit in the line";
+    let mut dave_conn = dave.sign_in(&mut h);
+    for bad in [
+        line(&message_blob, &group_info),
+        line(&message, &info_blob),
+        line(&message_blob, &info_blob),
+        line(&message, &missing),
+    ] {
+        h.send(&dave_conn, &bad).await;
+        assert_eq!(dave_conn.lines(), [refused], "{bad}");
+    }
+    // Inline, it is taken.
+    assert_eq!(line(&message, &group_info), resync);
+    h.send(&dave_conn, &resync).await;
+    assert_eq!(dave_conn.lines(), ["OK seq=4"]);
+}
+
 /// Dave's resync commit against the room's GROUPINFO, as a POST line.
 async fn resync_commit(
     h: &Harness,
@@ -2679,63 +2787,48 @@ fn small_blob_memory(dir: &tempfile::TempDir) -> Harness {
     h
 }
 
-/// `CREATE <box> <group-id> <token-hash> #general <groupinfo> <tree>`,
-/// with mailbox `n`.
-fn create_line(n: u8, groupinfo: &impl std::fmt::Display, tree: &impl std::fmt::Display) -> String {
-    format!(
-        "CREATE {} {} {} #general {groupinfo} {tree}",
-        mailbox(n),
-        GroupId::from_bytes([n; 32]),
-        hash([6; 48])
-    )
-}
-
 /// The blobs one command reads whole take their room in
 /// `limits.blob_memory` at once, so that no command waits for room while
-/// it holds some (12.12): CREATEs that each name a blob as both GroupInfo
-/// and tree, let in together, all finish, and a CREATE whose blobs could
-/// never fit together gets `ERR too-long` rather than waiting forever.
+/// it holds some (12.12): public rooms' POSTs that each name a blob as
+/// both message and GroupInfo, let in together, all finish. One whose
+/// blobs could never fit together gets `ERR too-long` rather than waiting
+/// forever (`public_posts_take_blob_memory_once`).
 #[tokio::test]
 async fn blob_memory_is_taken_once_per_command() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = small_blob_memory(&dir);
+    let mut one = create_room_with(&mut h, 1, "#one", |_| {}).await;
+    let mut two = create_room_with(&mut h, 2, "#two", |_| {}).await;
     let all = hold_blob(&h, &vec![1; 1024 * 1024], None);
     let part = hold_blob(&h, &vec![2; 400 * 1024], None);
-    let most = hold_blob(&h, &vec![3; 600 * 1024], None);
-    let owen = Dev::new("owen@example.org", 1);
-    let mut first = owen.sign_in(&mut h);
-    let mut second = owen.sign_in(&mut h);
+    let line = |room: &PublicRoomSetup| {
+        format!(
+            "POST {} {} {part} next={} groupinfo={part}",
+            room.m,
+            room.owen.token(&room.o),
+            hash([9; 48])
+        )
+    };
 
-    // 600 KiB twice is more than the 1 MiB there is: taking 600 KiB and
-    // then waiting for 600 more would wait forever.
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        h.send(&first, &create_line(1, &most, &most)),
-    )
-    .await
-    .expect("blob memory deadlocked");
-    let lines = first.lines();
-    assert_eq!(lines, ["ERR too-long"], "{lines:?}");
-
-    // Everything is held while both CREATEs start; then it is let go at
-    // once. Each takes 800 KiB: had either taken 400 KiB and then waited
-    // for 400 more, both would wait forever.
+    // Everything is held while both POSTs start; then it is let go at
+    // once. Each takes 800 KiB and its room's state: had either taken
+    // 400 KiB and then waited for 400 more, both would wait forever.
     let held = crate::core::keys::blob_bytes(h.inner(), &all, u64::MAX)
         .await
         .unwrap();
-    let (one, two) = (create_line(2, &part, &part), create_line(3, &part, &part));
-    let creates = async { tokio::join!(h.send(&first, &one), h.send(&second, &two)) };
+    let (first, second) = (line(&one), line(&two));
+    let posts = async { tokio::join!(h.send(&one.signed, &first), h.send(&two.signed, &second)) };
     let release = async {
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(held);
     };
     tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(creates, release)
+        tokio::join!(posts, release)
     })
     .await
     .expect("blob memory deadlocked");
-    // Neither is a group, but both were read and checked.
-    for c in [&mut first, &mut second] {
+    // Neither is a commit, but both were read and checked.
+    for c in [&mut one.signed, &mut two.signed] {
         let lines = c.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("ERR invalid"), "{lines:?}");

@@ -544,9 +544,11 @@ pub struct Limits {
     /// everyone (12.12): a public room's commits, GroupInfos and trees and
     /// KEYS PUT's records. Readers wait for room beyond it. At least 1 MiB.
     pub blob_memory: u64,
-    /// The largest blob a public room's commit or proposal, GroupInfo or
-    /// tree may be (6.1, 12.12), since the server reads these whole to
-    /// check them. Other posts' blobs are not read, only their framing.
+    /// The largest blob a public room's commit or proposal, or a commit's
+    /// GroupInfo, may be (6.1, 12.12), since the server reads these whole
+    /// to check them. Other posts' blobs are not read, only their framing.
+    /// A new room's GroupInfo and tree, and an external commit with its
+    /// GroupInfo, are never blobs (PLAN item 67).
     pub max_room_blob: u64,
     /// The most KEYS PUT one network address may send in an hour (4.7: a
     /// server MUST rate-limit it per network address). 0 means no limit.

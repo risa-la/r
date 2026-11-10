@@ -53,7 +53,7 @@ use super::super::command::{Cx, Reply, err};
 use super::super::rate::WindowLimit;
 use super::super::state::{Device, Who};
 use super::super::{Inner, admin, keys};
-use super::{PostFraming, blob_of, line_bytes, may_mute, reserve_lines};
+use super::{PostFraming, may_mute};
 use crate::config::RoomCreation;
 use crate::store::{
     Created, MailboxRecord, NewMailbox, NewRoom, RoomChange, RoomGroup, RoomUpdate,
@@ -441,6 +441,15 @@ pub(super) async fn create(
     public: PublicRoom,
 ) -> Reply {
     let inner = &cx.inner;
+    // The GroupInfo and tree fit in the line: the device holds no token
+    // to store blobs with, since the mailbox does not exist yet (5.2,
+    // 12.12; PLAN item 67).
+    let (OrBlob::Inline(group_info), OrBlob::Inline(tree)) = (&public.groupinfo, &public.tree)
+    else {
+        return Err(err(ErrorCode::BadSyntax)
+            .with_message("a new public room's GroupInfo and tree fit in the line"));
+    };
+    let (group_info, tree) = (GroupInfo::decode(group_info), RatchetTree::decode(tree));
     let Who::SignedIn(device) = cx.who.clone() else {
         return Err(err(ErrorCode::WrongConnection));
     };
@@ -474,17 +483,6 @@ pub(super) async fn create(
         .mailbox
         .creates
         .take(cx, inner.config.limits.creates_per_hour, now)?;
-    // Room for both blobs at once, so that CREATE never waits for room
-    // while it holds some (12.12).
-    let mut memory =
-        reserve_lines(inner, [blob_of(&public.groupinfo), blob_of(&public.tree)]).await?;
-    let (group_info, _held_info) =
-        line_bytes(inner, &mut memory, &public.groupinfo, GroupInfo::decode)
-            .await?
-            .into_parts();
-    let (tree, _held_tree) = line_bytes(inner, &mut memory, &public.tree, RatchetTree::decode)
-        .await?
-        .into_parts();
     let crypto = rooms.crypto()?;
     // The server's address as the extension writes it (12.4): its
     // hostname, on the default port.
