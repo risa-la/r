@@ -47,7 +47,7 @@ cannot see them.
 |---|---|---|---|
 | `ref` | client | tag value, at most 64 bytes | Matches a response to its command (3.6) |
 | `seq` | server | sequence number | The post's position in its mailbox (5.2) |
-| `t` | server | timestamp | When the server accepted the post or report |
+| `t` | server | timestamp | When the server accepted the post or report, or, on PING and its `OK`, when it sent the line (Section 11) |
 | `from` | server | uid | On a report: who made it, if they were signed in (5.8) |
 | `cid` | client | tag value, at most 64 bytes | Client post id for safe resending (7.6) |
 | `retry` | server | seconds | With `ERR rate-limited` or `ERR unavailable`: when to try again |

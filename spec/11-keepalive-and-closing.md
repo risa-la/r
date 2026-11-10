@@ -4,7 +4,7 @@
 PING [<token>]
 ```
 
-→ `OK`
+→ `OK`, with the tag `t`
 
 A client can send PING to check that the connection works.
 
@@ -17,6 +17,23 @@ timer, including an empty one or one the server cannot parse. Part of a
 line does not reset it, and a line that is too long counts once its LF
 arrives. This lets the server notice dead connections, which matters for
 deciding when to push.
+
+The server tags its `PING <token>` line, and the `OK` it sends for a
+client's PING, with `t`, its time when it sent the line (3.2):
+
+```
+S: @t=2026-11-10T09:00:00.000Z PING k3j9w2
+C: PONG k3j9w2
+C: PING
+S: @t=2026-11-10T09:00:04.512Z OK
+```
+
+**Server time.** For each server, the **server time** a device knows
+is the newest `t` it has seen from that server, on a post or on a PING
+or its `OK`. It never goes backwards. Devices judge by it, and not by
+their own clocks, the age of a commit they made (7.6) and when to
+delete a past epoch's secrets (12.9), so that a device whose clock is
+wrong, or that was offline, decides as the others do.
 
 ```
 QUIT [<message...>]
