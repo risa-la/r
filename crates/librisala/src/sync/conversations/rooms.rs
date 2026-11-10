@@ -572,7 +572,7 @@ impl ConversationEngine {
                 // Fetch again from the commit that started the Welcome's
                 // epoch.
                 if self.follows.contains_key(&mb.mailbox) {
-                    self.fetch(&mb.mailbox, mb.sync_point, out);
+                    self.fetch(cx, &mb.mailbox, mb.sync_point, out);
                 }
             }
             Ok(None) => {}

@@ -1,6 +1,6 @@
-//! The engine's upkeep (task R2): past epochs deleted by the clock (12.9,
-//! LR-H1), the outbox purged (LR-M2), and timers brought back after a
-//! restart (LR-M4), against the in-memory server.
+//! The engine's upkeep (task R2): past epochs deleted 2 hours on by the
+//! server's time (12.9, LR-H1), the outbox purged (LR-M2), and timers
+//! brought back after a restart (LR-M4), against the in-memory server.
 
 use super::*;
 
@@ -56,12 +56,15 @@ fn encrypted(net: &mut Net, d: usize, conv: ConversationId, text: &str) -> Vec<u
         .unwrap()
 }
 
-/// LR-H1, 12.9: a device deletes a past epoch's secrets 2 hours after it
-/// applied the commit that ended it, by its own clock, whatever posts
-/// arrive: a late message of that epoch that the posts alone would still
-/// let it read is unreadable then.
+/// LR-H1, 12.9: whatever posts arrive, a device deletes a past epoch's
+/// secrets once it has caught up the epoch's mailbox as of a server time
+/// more than 2 hours past the commit that ended it. Its own clock plays no
+/// part: hours on by the clock alone, a late message of the epoch is still
+/// read. A PING gives the server's time; the device, following the quiet
+/// mailbox, fetches it again to catch it up, and the secrets go: a late
+/// message that the posts alone would still let it read is unreadable.
 #[test]
-fn past_epochs_go_two_hours_after_their_commit_by_the_clock() {
+fn past_epochs_go_two_hours_after_their_commit_by_the_servers_time() {
     let mut net = Net::new();
     let alice = net.device("alice", "alice@example.org");
     let bob = net.device("bob", "bob@example.net");
@@ -69,10 +72,11 @@ fn past_epochs_go_two_hours_after_their_commit_by_the_clock() {
     net.connect(bob);
     let (a, b) = direct(&mut net, alice, bob);
     let epoch = net.epoch(alice, a);
-    // Bob's device encrypts two messages in this epoch, which the server
-    // holds back.
+    // Bob's device encrypts three messages in this epoch, which the
+    // server holds back.
     net.disconnect(bob);
     let early = encrypted(&mut net, bob, b, "early");
+    let held = encrypted(&mut net, bob, b, "held");
     let late = encrypted(&mut net, bob, b, "late");
     // Alice commits a fresh leaf: the epoch is past. (Not a new signature
     // key: her leaf has committed already, so 12.3 does not allow one in a
@@ -98,16 +102,33 @@ fn past_epochs_go_two_hours_after_their_commit_by_the_clock() {
         net.texts(alice, a),
         [("bob@example.net".into(), "early".into())]
     );
-    // Two hours on, by the device's clock, the epoch's secrets are gone,
-    // although the post's `t` alone would still let it be read.
+    // Two hours on by the clock, with no newer server time, it is still
+    // read.
     for _ in 0..13 {
         net.advance(10 * MINUTE);
     }
     net.server
-        .inject_post(&mailbox, commit_t + 2 * MINUTE, late);
+        .inject_post(&mailbox, commit_t + 2 * MINUTE, held);
     net.restart(alice);
     net.tick();
-    assert_eq!(net.texts(alice, a).len(), 1, "the late one is unreadable");
+    assert_eq!(net.texts(alice, a).len(), 2, "the held one is read");
+    // A PING gives the server's time, 2 hours on. At the next upkeep the
+    // device fetches the mailbox, and the epoch's secrets go, although the
+    // post's `t` alone would still let it be read.
+    let account = net.devices[alice].account;
+    let now = net.clock.now().unix_millis();
+    net.devices[alice]
+        .store
+        .note_server_time(account, now)
+        .unwrap();
+    net.advance(10 * MINUTE);
+    let caught_up = net.devices[alice].store.mailbox_rows(a).unwrap()[0].caught_up;
+    assert_eq!(caught_up, Some(now), "caught up as of the PING's time");
+    net.server
+        .inject_post(&mailbox, commit_t + 3 * MINUTE, late);
+    net.restart(alice);
+    net.tick();
+    assert_eq!(net.texts(alice, a).len(), 2, "the late one is unreadable");
 }
 
 /// LR-M2: what this device sent does not stay in the outbox: the

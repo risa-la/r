@@ -676,13 +676,18 @@ struct JobState {
 /// A command in flight, by its token.
 #[derive(Debug, Clone)]
 enum Pending {
+    /// `known` is the newest server time the device knew when it sent the
+    /// command, in ms: a reply that leaves it caught up catches the
+    /// mailbox up as of that time (12.9).
     Follow {
         mailbox: BoxName,
+        known: Option<u64>,
     },
     Unfollow,
     Fetch {
         mailbox: BoxName,
         after: u64,
+        known: Option<u64>,
     },
     Post {
         conv: ConversationId,
@@ -1562,7 +1567,7 @@ impl ConversationEngine {
                             .map(|_| mb.sync_point))
                     })?;
                     if let Some(sync) = behind {
-                        self.fetch(&post.mailbox, sync, out);
+                        self.fetch(cx, &post.mailbox, sync, out);
                     }
                 }
             }
@@ -1751,6 +1756,42 @@ impl ConversationEngine {
         }
     }
 
+    /// A FOLLOW or FETCH sent when the newest server time the device knew
+    /// was `known` showed every post of `mailbox` up to the server's
+    /// newest, `newest`. If the device has applied them all, it has caught
+    /// the mailbox up as of `known`, and deletes the past epochs that the
+    /// 2-hour limit then puts past (12.9). It may not have, while a post
+    /// waits for its blob (12.12).
+    fn caught_up_as_of(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        mailbox: &BoxName,
+        known: Option<u64>,
+        newest: u64,
+        out: &mut Vec<Action>,
+    ) -> Result<(), EngineError> {
+        let Some(known) = known else {
+            return Ok(());
+        };
+        self.write(cx, me, out, |tx, c| {
+            let Some(mb) = tx.mailbox(c.account, mailbox)? else {
+                return Ok(());
+            };
+            if mb.sync_point < newest {
+                return Ok(());
+            }
+            tx.set_caught_up(mb.conv, mailbox, known)?;
+            let row = tx.conversation(mb.conv)?;
+            if (row.state.in_group() || row.state == ConvState::Leaving)
+                && let Err(e) = group::expire_caught_up(tx, c, &row)
+            {
+                tracing::debug!(conv = %row.id, error = %e, "no past epochs to expire");
+            }
+            Ok(())
+        })
+    }
+
     /// Acts on what a step noted.
     fn notes(&mut self, cx: &Context, me: &Me, notes: Vec<Note>, out: &mut Vec<Action>) {
         let now = self.now();
@@ -1922,7 +1963,12 @@ impl ConversationEngine {
         }
     }
 
-    fn fetch(&mut self, mailbox: &BoxName, sync_point: u64, out: &mut Vec<Action>) {
+    /// The newest server time the device knows, in ms (7.6, 12.9).
+    fn known_time(&self, cx: &Context) -> Option<u64> {
+        cx.store.server_time(cx.account).ok().flatten()
+    }
+
+    fn fetch(&mut self, cx: &Context, mailbox: &BoxName, sync_point: u64, out: &mut Vec<Action>) {
         let jitter = random_below(self.config.fetch_jitter).unwrap_or(0);
         let after = sync_point.saturating_sub(jitter);
         if let Some(Follow::Following {
@@ -1949,6 +1995,7 @@ impl ConversationEngine {
             Pending::Fetch {
                 mailbox: *mailbox,
                 after,
+                known: self.known_time(cx),
             },
         );
     }
@@ -1967,7 +2014,7 @@ impl ConversationEngine {
         let me = self.me(cx)?;
         let now = self.now();
         match pending {
-            Pending::Follow { mailbox } => match &response.end {
+            Pending::Follow { mailbox, known } => match &response.end {
                 End::Ok(ok) => {
                     let head = ok.head().ok().flatten().unwrap_or(0);
                     self.follows.insert(
@@ -2003,7 +2050,7 @@ impl ConversationEngine {
                         }
                     }
                     match sync.map(|(sync, _)| sync) {
-                        Some(sync) if sync < head => self.fetch(&mailbox, sync, out),
+                        Some(sync) if sync < head => self.fetch(cx, &mailbox, sync, out),
                         Some(_) => {
                             self.advance(cx, &me, &mailbox, out)?;
                             if let Some(Follow::Following { caught_up, .. }) =
@@ -2011,6 +2058,8 @@ impl ConversationEngine {
                             {
                                 *caught_up = true;
                             }
+                            // 12.9: every post up to the head is applied.
+                            self.caught_up_as_of(cx, &me, &mailbox, known, head, out)?;
                         }
                         None => {}
                     }
@@ -2029,7 +2078,11 @@ impl ConversationEngine {
                 }
             },
             Pending::Unfollow => {}
-            Pending::Fetch { mailbox, after } => {
+            Pending::Fetch {
+                mailbox,
+                after,
+                known,
+            } => {
                 if let Some(Follow::Following { fetching, .. }) = self.follows.get_mut(&mailbox) {
                     *fetching = false;
                 }
@@ -2144,6 +2197,7 @@ impl ConversationEngine {
                         Pending::Fetch {
                             mailbox,
                             after: last,
+                            known: self.known_time(cx),
                         },
                     );
                     if let Some(Follow::Following { fetching, .. }) = self.follows.get_mut(&mailbox)
@@ -2161,13 +2215,16 @@ impl ConversationEngine {
                             .map(|_| mb.sync_point))
                     })?;
                     match hole {
-                        Some(sync) => self.fetch(&mailbox, sync, out),
+                        Some(sync) => self.fetch(cx, &mailbox, sync, out),
                         None => {
                             if let Some(Follow::Following { caught_up, .. }) =
                                 self.follows.get_mut(&mailbox)
                             {
                                 *caught_up = true;
                             }
+                            // 12.9: the page shows every post up to the
+                            // server's newest.
+                            self.caught_up_as_of(cx, &me, &mailbox, known, last, out)?;
                             if joined {
                                 // 12.8: caught up once since joining; from
                                 // now on, posts that expire unread count.
@@ -2492,7 +2549,7 @@ impl ConversationEngine {
                 if let Some(mb) =
                     self.write(cx, me, out, |tx, _| Ok(tx.current_mailbox(conv).ok()))?
                 {
-                    self.fetch(&mb.mailbox, mb.sync_point, out);
+                    self.fetch(cx, &mb.mailbox, mb.sync_point, out);
                 }
             }
             None => {}
@@ -2755,7 +2812,7 @@ impl ConversationEngine {
                     // was followed, go now.
                     let row = tx.conversation(mb.conv)?;
                     if (row.state.in_group() || row.state == ConvState::Leaving)
-                        && let Err(e) = group::expire_by_clock(tx, c, &row)
+                        && let Err(e) = group::expire_caught_up(tx, c, &row)
                     {
                         tracing::debug!(conv = %row.id, error = %e, "no past epochs to expire");
                     }
@@ -2789,7 +2846,10 @@ impl ConversationEngine {
                     mailbox,
                     quiet: self.hooks.follow_quiet(&cx.store, cx.account, &mailbox),
                 },
-                Pending::Follow { mailbox },
+                Pending::Follow {
+                    mailbox,
+                    known: self.known_time(cx),
+                },
             );
         }
         Ok(())

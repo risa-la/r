@@ -151,12 +151,10 @@ CREATE TABLE sender_logs (
 
 -- The t of the commits that ended recent epochs (12.9, late messages),
 -- and of the epochs before each move whose old mailbox is followed.
--- applied is when, by the device's clock, it applied that commit.
 CREATE TABLE epoch_ends (
-    conv    INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    epoch   INTEGER NOT NULL,
-    t       INTEGER,
-    applied INTEGER,
+    conv  INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    epoch INTEGER NOT NULL,
+    t     INTEGER NOT NULL,
     PRIMARY KEY (conv, epoch)
 ) WITHOUT ROWID;
 
@@ -1542,39 +1540,12 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             .query_row(
                 "SELECT t FROM epoch_ends WHERE conv = ?1 AND epoch = ?2",
                 params![self.conv.0, epoch as i64],
-                |r| r.get::<_, Option<i64>>(0),
+                |r| r.get::<_, i64>(0),
             )
             .optional()
             .ok()
             .flatten()
-            .flatten()
             .and_then(|t| risala_proto::time::Timestamp::from_unix_millis(t as u64))
-    }
-
-    fn epoch_applied(&self, epoch: u64) -> Option<risala_proto::time::Timestamp> {
-        self.conn
-            .query_row(
-                "SELECT applied FROM epoch_ends WHERE conv = ?1 AND epoch = ?2",
-                params![self.conv.0, epoch as i64],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .flatten()
-            .and_then(|t| risala_proto::time::Timestamp::from_unix_millis(t as u64))
-    }
-
-    fn set_epoch_applied(&mut self, epoch: u64, now: risala_proto::time::Timestamp) {
-        let r = self
-            .conn
-            .execute(
-                "INSERT INTO epoch_ends (conv, epoch, applied) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (conv, epoch) DO UPDATE SET applied = excluded.applied",
-                params![self.conv.0, epoch as i64, now.unix_millis() as i64],
-            )
-            .map(drop);
-        self.keep(r);
     }
 
     fn epoch_pseudonym(

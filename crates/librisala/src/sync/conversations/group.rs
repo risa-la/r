@@ -1327,15 +1327,6 @@ fn apply_one(
         }
         ContentType::Application => {
             let mut log = MessageLog::new(tx.conn(), conv.id);
-            // 12.9: past epochs that the clock says are gone, before the
-            // message is decrypted.
-            mls_message::expire_past_epochs_by_clock(
-                &tx.mls(cx.crypto),
-                &mut group,
-                &log,
-                ts(cx.now),
-            )
-            .map_err(mls)?;
             let received = mls_message::receive(
                 &tx.mls(cx.crypto),
                 &mut group,
@@ -1400,22 +1391,55 @@ fn note_commit(
     t: u64,
 ) -> Result<()> {
     let mut log = MessageLog::new(tx.conn(), conv);
-    log.note_commit(merged, ts(t), ts(cx.now));
+    log.note_commit(merged, ts(t));
     mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(t), None).map_err(mls)?;
     log.finish()?;
     Ok(())
 }
 
 /// Deletes the secrets of the group's past epochs, with their
-/// skipped-message keys, 2 hours after this device applied the commit that
-/// ended each, by its own clock, whatever posts arrive (12.9; LR-H1).
-pub(crate) fn expire_by_clock(tx: &mut Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<()> {
+/// skipped-message keys, that the 2-hour limit of 12.9 puts past, whatever
+/// posts arrive (LR-H1): those whose every mailbox the device still follows
+/// was caught up as of a server time more than 2 hours past the commit that
+/// ended them, and those of mailboxes it no longer follows. The device's
+/// own clock plays no part.
+///
+/// Returns the mailboxes to fetch again, with their sync points: those
+/// whose catch-up as of the newest server time the device knows would
+/// delete an epoch they keep.
+pub(crate) fn expire_caught_up(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: &ConvRow,
+) -> Result<Vec<(BoxName, u64)>> {
     let mut group = load(tx, cx, &conv.group_id)?;
+    // Each mailbox carries the epochs from its first to the next one's
+    // (7.8); the current one, the newest, carries the rest.
+    let mut boxes = tx.mailboxes(conv.id)?;
+    boxes.sort_by_key(|m| m.first_epoch);
+    let followed: Vec<mls_message::Followed> = boxes
+        .iter()
+        .enumerate()
+        .map(|(i, m)| mls_message::Followed {
+            epochs: m.first_epoch..boxes.get(i + 1).map_or(u64::MAX, |n| n.first_epoch),
+            caught_up: m.caught_up.map(ts),
+        })
+        .collect();
+    let server_time = tx.server_time(cx.account)?.map(ts);
     let log = MessageLog::new(tx.conn(), conv.id);
-    mls_message::expire_past_epochs_by_clock(&tx.mls(cx.crypto), &mut group, &log, ts(cx.now))
-        .map_err(mls)?;
+    let stale = mls_message::expire_past_epochs_caught_up(
+        &tx.mls(cx.crypto),
+        &mut group,
+        &log,
+        &followed,
+        server_time,
+    )
+    .map_err(mls)?;
     log.finish()?;
-    Ok(())
+    Ok(stale
+        .into_iter()
+        .map(|i| (boxes[i].mailbox, boxes[i].sync_point))
+        .collect())
 }
 
 /// The identities of leaves, for the move of 7.8.

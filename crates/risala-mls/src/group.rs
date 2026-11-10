@@ -88,10 +88,10 @@ use crate::wire::{WireError, read_group_info, read_protocol_message, read_tree, 
 /// How many past epochs a device keeps the secrets of, at most (12.9).
 /// [`crate::message::expire_past_epochs`] deletes them sooner, an hour
 /// after the commit that ended them by the posts' `t`, and
-/// [`crate::message::expire_past_epochs_by_clock`] 2 hours after the device
-/// applied it. The last epochs of a mailbox the group moved away from stay
-/// besides, while the device follows it (12.9,
-/// [`crate::message::MessageHistory::moves`]).
+/// [`crate::message::expire_past_epochs_caught_up`] once the server's time
+/// is 2 hours past that commit as of a catch-up of their mailbox. The last
+/// epochs of a mailbox the group moved away from stay besides, while the
+/// device follows it (12.9, [`crate::message::MessageHistory::moves`]).
 pub const MAX_PAST_EPOCHS: usize = 2;
 
 /// How many generations behind the newest one a device keeps the keys of

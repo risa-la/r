@@ -143,11 +143,6 @@ impl Device {
 
     /// Processes and applies another device's commit, noting it with `t`.
     fn apply(&mut self, group: &mut MlsGroup, message: &[u8], t: Timestamp) {
-        self.apply_now(group, message, t, t);
-    }
-
-    /// The same, applied at `now` by the device's clock.
-    fn apply_now(&mut self, group: &mut MlsGroup, message: &[u8], t: Timestamp, now: Timestamp) {
         let Incoming::Commit(received) =
             group::process_message(&self.provider, group, message).unwrap()
         else {
@@ -155,7 +150,7 @@ impl Device {
         };
         let applied =
             apply_commit(&self.provider, group, *received, &mut EpochState::default()).unwrap();
-        self.history.note_commit(&applied, t, now);
+        self.history.note_commit(&applied, t);
     }
 
     /// Writes a message at `t0`.
@@ -516,10 +511,21 @@ fn derived_pseudonyms() {
     );
 }
 
-/// Past epochs' secrets go 2 hours after the device applied the commit that
-/// ended them, by its own clock, whatever posts arrive (12.9).
+/// The one mailbox of a group that has not moved, caught up as of
+/// `caught_up`.
+fn one_mailbox(caught_up: Option<Timestamp>) -> Vec<Followed> {
+    vec![Followed {
+        epochs: 0..u64::MAX,
+        caught_up,
+    }]
+}
+
+/// Past epochs' secrets go once the device has caught up their mailbox as
+/// of a server time more than 2 hours past the commit that ended them,
+/// whatever posts arrive (12.9). A newer server time alone does not delete
+/// them: the device fetches the mailbox again.
 #[test]
-fn past_epochs_by_clock() {
+fn past_epochs_go_2_hours_on_by_a_catch_up() {
     let Direct {
         mut alice,
         mut bob,
@@ -530,12 +536,29 @@ fn past_epochs_by_clock() {
     let (_, x1) = alice.send(&mut a, "x1");
     let (_, x2) = alice.send(&mut a, "x2");
     let commit = alice.commit(&mut a, Changes::default());
-    bob.apply_now(&mut b, &commit, t0(), t0());
-    // Within 2 hours by the clock: kept.
-    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(120)).unwrap();
+    bob.apply(&mut b, &commit, t0());
+    let expire = |bob: &mut Device, b: &mut MlsGroup, caught_up, server_time| {
+        expire_past_epochs_caught_up(
+            &bob.provider,
+            b,
+            &bob.history,
+            &one_mailbox(caught_up),
+            server_time,
+        )
+        .unwrap()
+    };
+    // The server's time is 2 hours on, but the mailbox was caught up
+    // earlier: kept, and the mailbox is to be fetched again.
+    assert_eq!(expire(&mut bob, &mut b, None, Some(at(121))), [0].into());
+    assert_eq!(
+        expire(&mut bob, &mut b, Some(at(60)), Some(at(121))),
+        [0].into()
+    );
+    // Caught up exactly 2 hours on: kept, and nothing to fetch.
+    assert!(expire(&mut bob, &mut b, Some(at(120)), Some(at(120))).is_empty());
     bob.receive_at(&mut b, &x1, at(10), false).unwrap();
-    // After: gone, though the posts' `t` would allow the message.
-    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(121)).unwrap();
+    // Caught up after: gone, though the post's `t` would allow it.
+    assert!(expire(&mut bob, &mut b, Some(at(121)), Some(at(121))).is_empty());
     assert!(matches!(
         bob.receive_at(&mut b, &x2, at(10), false),
         Err(ReceiveError::Process(_))
@@ -991,8 +1014,10 @@ fn a_moves_epochs_are_kept_while_its_mailbox_is_followed() {
     }
 }
 
-/// Once a device stops following the old mailbox, a day after the move,
-/// the secrets of its last epochs go (12.9).
+/// The old mailbox's last epochs are judged by catch-ups of the old
+/// mailbox alone: those of the new one never delete them, and once the
+/// device stops following the old mailbox, a day after the move, they go
+/// (12.9).
 #[test]
 fn a_moves_epochs_go_once_its_mailbox_is_not_followed() {
     let Direct {
@@ -1007,11 +1032,41 @@ fn a_moves_epochs_go_once_its_mailbox_is_not_followed() {
     let moving = alice.commit(&mut a, Changes::default());
     bob.apply_and_expire(&mut b, &moving, t0());
     let moved = bob.note_move(&mut b, t0());
-    // Kept past the 2 hours of the clock while the mailbox is followed.
-    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(180)).unwrap();
+    // The new mailbox caught up 3 hours on, the old one not since the
+    // move: kept, and the old one is to be fetched.
+    let both = |old| {
+        vec![
+            Followed {
+                epochs: 0..moved,
+                caught_up: old,
+            },
+            Followed {
+                epochs: moved..u64::MAX,
+                caught_up: Some(at(180)),
+            },
+        ]
+    };
+    let stale = expire_past_epochs_caught_up(
+        &bob.provider,
+        &mut b,
+        &bob.history,
+        &both(Some(t0())),
+        Some(at(180)),
+    )
+    .unwrap();
+    assert_eq!(stale, [0].into());
     bob.receive_as_of(&mut b, &x1, at(30), moved).unwrap();
+    // No longer followed: gone, with no catch-up.
     bob.history.set_moves(Vec::new());
-    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(24 * 60)).unwrap();
+    let stale = expire_past_epochs_caught_up(
+        &bob.provider,
+        &mut b,
+        &bob.history,
+        &both(None)[1..],
+        Some(at(180)),
+    )
+    .unwrap();
+    assert!(stale.is_empty());
     assert!(matches!(
         bob.receive_as_of(&mut b, &x2, at(30), moved),
         Err(ReceiveError::Process(_))
@@ -1690,4 +1745,42 @@ fn appendix_b_report() {
         !wrong.matches(&franks[0]),
     );
     ck.finish();
+}
+
+/// While the old mailbox is followed, its last epochs go once the old
+/// mailbox itself has been caught up as of a server time 2 hours past the
+/// commit that ended them (12.9).
+#[test]
+fn a_moves_epochs_go_once_the_old_mailbox_is_caught_up_2_hours_on() {
+    let Direct {
+        mut alice,
+        mut bob,
+        mut a,
+        mut b,
+        ..
+    } = direct();
+    let (_, x1) = alice.send(&mut a, "x1");
+    let moving = alice.commit(&mut a, Changes::default());
+    bob.apply_and_expire(&mut b, &moving, t0());
+    let moved = bob.note_move(&mut b, t0());
+    let old = |caught_up| {
+        vec![
+            Followed {
+                epochs: 0..moved,
+                caught_up: Some(caught_up),
+            },
+            Followed {
+                epochs: moved..u64::MAX,
+                caught_up: None,
+            },
+        ]
+    };
+    let stale =
+        expire_past_epochs_caught_up(&bob.provider, &mut b, &bob.history, &old(at(121)), None)
+            .unwrap();
+    assert!(stale.is_empty());
+    assert!(matches!(
+        bob.receive_as_of(&mut b, &x1, at(30), moved),
+        Err(ReceiveError::Process(_))
+    ));
 }

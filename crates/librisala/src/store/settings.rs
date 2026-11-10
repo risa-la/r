@@ -176,18 +176,21 @@ impl Tx<'_> {
     /// The newest server time the device knows for the server of
     /// `account`, in ms (7.6, 12.9), or `None` if it has seen none.
     pub(crate) fn server_time(&self, account: AccountId) -> Result<Option<u64>, StoreError> {
-        let t: Option<i64> = self
-            .conn()
-            .query_row(
-                "SELECT s.time FROM servers s JOIN accounts a ON a.server = s.id
-                 WHERE a.id = ?1",
-                params![account.0],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        Ok(t.map(|t| t as u64))
+        server_time(self.conn(), account)
     }
+}
+
+fn server_time(conn: &Connection, account: AccountId) -> Result<Option<u64>, StoreError> {
+    let t: Option<i64> = conn
+        .query_row(
+            "SELECT s.time FROM servers s JOIN accounts a ON a.server = s.id
+             WHERE a.id = ?1",
+            params![account.0],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(t.map(|t| t as u64))
 }
 
 impl From<StoreError> for TrustStoreError {
@@ -329,6 +332,12 @@ impl Store {
     pub fn note_server_time(&self, account: AccountId, t: u64) -> Result<(), StoreError> {
         self.write(|tx| tx.note_server_time(account, t))?;
         Ok(())
+    }
+
+    /// The newest server time the device knows for the server of
+    /// `account`, in ms (7.6, 12.9), or `None` if it has seen none.
+    pub fn server_time(&self, account: AccountId) -> Result<Option<u64>, StoreError> {
+        self.read(|conn| server_time(conn, account))
     }
 
     /// Every account, in the order they were added.

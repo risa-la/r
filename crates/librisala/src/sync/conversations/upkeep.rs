@@ -63,13 +63,20 @@ impl ConversationEngine {
         }
         if now >= self.upkeep.last_ten + TEN_MINUTES_MS {
             self.upkeep.last_ten = now;
-            self.write(cx, me, out, |tx, c| {
+            let stale = self.write(cx, me, out, |tx, c| {
+                // 12.9: past epochs go 2 hours on by the server's time, as
+                // of a catch-up of their mailboxes; a mailbox followed
+                // since before that time is fetched again.
+                let mut stale = Vec::new();
                 for row in tx.conversations_of(c.account)? {
                     if !row.state.in_group() && row.state != ConvState::Leaving {
                         continue;
                     }
-                    if let Err(e) = group::expire_by_clock(tx, c, &row) {
-                        tracing::debug!(conv = %row.id, error = %e, "no past epochs to expire");
+                    match group::expire_caught_up(tx, c, &row) {
+                        Ok(boxes) => stale.extend(boxes),
+                        Err(e) => {
+                            tracing::debug!(conv = %row.id, error = %e, "no past epochs to expire");
+                        }
                     }
                 }
                 let purged = tx.purge_outbox(c.now, DAY_MS)?;
@@ -83,8 +90,13 @@ impl ConversationEngine {
                         .saturating_sub(c.config.retention_ms)
                         .saturating_sub(DAY_MS),
                 )?;
-                Ok(())
+                Ok(stale)
             })?;
+            for (mailbox, sync_point) in stale {
+                if self.caught_up(&mailbox) {
+                    self.fetch(cx, &mailbox, sync_point, out);
+                }
+            }
             if let Err(e) = cx.store.checkpoint() {
                 tracing::debug!(error = %e, "a checkpoint could not finish");
             }

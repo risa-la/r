@@ -407,3 +407,87 @@ fn devices_agree_on_a_late_message_whatever_they_apply_first() {
     net.advance(24 * 60 * 60 * 1000 + 60_000);
     assert!(moves(&net).is_empty());
 }
+
+/// A device that was offline for more than 2 hours, from just after a
+/// removal to well after the move that came within the hour of it, reads a
+/// late post in the old mailbox as the others do. Past epochs go by the
+/// posts' `t` alone, judged in the old mailbox as of the move, never by
+/// the device's own clock (12.9).
+#[test]
+fn a_device_offline_across_a_move_reads_a_late_post_as_the_others_do() {
+    const MINUTE: u64 = 60 * 1000;
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    let carol = net.device("carol", "carol@example.com");
+    let dave = net.device("dave", "dave@example.com");
+    let erin = net.device("erin", "erin@example.net");
+    for d in [alice, bob, carol, dave, erin] {
+        net.connect(d);
+    }
+    let a = net
+        .job(
+            alice,
+            Job::PrivateRoom {
+                name: "team".into(),
+                members: vec![
+                    "bob@example.net".parse().unwrap(),
+                    "carol@example.com".parse().unwrap(),
+                    "dave@example.com".parse().unwrap(),
+                    "erin@example.net".parse().unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    let c = net.same_conv(carol, alice, a).unwrap();
+    let e = net.same_conv(erin, alice, a).unwrap();
+    let old_box = mailboxes(&net, bob, b)[0].mailbox;
+    // Carol writes a message that the server holds back. Alice removes
+    // Dave and goes away, so the others move the group after the fallback
+    // wait (7.8). Bob applies the removal and goes offline at once.
+    let late = write_unposted(&mut net, carol, c, "late but readable");
+    let dave_device: [u8; 48] = net.devices[dave].device_id.clone().try_into().unwrap();
+    net.disconnect(alice);
+    remove_by_hand(&mut net, alice, a, dave_device);
+    let epoch = net.epoch(bob, b);
+    net.disconnect(bob);
+    net.advance(21 * MINUTE);
+    let moved = mailboxes(&net, erin, e)
+        .into_iter()
+        .find(|m| m.current)
+        .unwrap();
+    assert_ne!(moved.mailbox, old_box, "the group moved");
+    assert_eq!(net.epoch(bob, b), epoch, "bob has not seen the move");
+    // Within the hour of the removal, the server hands out Carol's message
+    // in the old mailbox, after the move, and Erin reads it.
+    net.advance(9 * MINUTE);
+    let t = net.clock.now().unix_millis();
+    net.server.inject_post(&old_box, t, late);
+    net.disconnect(erin);
+    net.connect(erin);
+    net.tick();
+    let readable = (
+        "carol@example.com".to_owned(),
+        "late but readable".to_owned(),
+    );
+    assert!(net.texts(erin, e).contains(&readable));
+    // Bob's app runs on, offline, for more than 2 hours: its upkeep runs
+    // with no connection. Then he is back, and reads it too.
+    net.clock.advance(2 * 60 * MINUTE + 10 * MINUTE);
+    let cx = net.cx(bob);
+    let now = net.clock.now();
+    let actions = net.devices[bob].engine.handle(&cx, &Input::Tick { now });
+    assert!(
+        actions.iter().all(|a| !matches!(a, Action::Send { .. })),
+        "offline"
+    );
+    net.connect(bob);
+    net.tick();
+    assert!(
+        net.texts(bob, b).contains(&readable),
+        "{:?}",
+        net.texts(bob, b)
+    );
+}

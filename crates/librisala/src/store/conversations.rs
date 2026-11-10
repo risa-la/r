@@ -78,7 +78,10 @@ CREATE TABLE conversations (
 -- the epoch a moved mailbox starts at; posts of earlier epochs in it, and
 -- of that epoch or later in the one it moved from, are ignored (7.8).
 -- moved_ext is the conversation extension as of the move away from a
--- mailbox, by which its later posts are judged (12.9).
+-- mailbox, by which its later posts are judged (12.9). caught_up is the
+-- newest server time the device knew, in ms, when it sent a FOLLOW or
+-- FETCH there after whose reply it had applied every post up to the
+-- server's newest: the 2-hour limit on past epochs is judged by it (12.9).
 CREATE TABLE mailboxes (
     conv         INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     box          TEXT NOT NULL,
@@ -89,6 +92,7 @@ CREATE TABLE mailboxes (
     follow_after INTEGER,
     unfollow_at  INTEGER,
     moved_ext    BLOB,
+    caught_up    INTEGER,
     PRIMARY KEY (conv, box)
 ) WITHOUT ROWID;
 CREATE INDEX mailboxes_box ON mailboxes (box);
@@ -501,6 +505,10 @@ pub struct MailboxRow {
     pub follow_after: Option<u64>,
     /// An old mailbox, to unfollow at this time (7.8).
     pub unfollow_at: Option<u64>,
+    /// The newest server time the device knew when it sent a FOLLOW or
+    /// FETCH here after whose reply it had applied every post up to the
+    /// server's newest (12.9).
+    pub caught_up: Option<u64>,
 }
 
 fn mailbox_row(row: &Row<'_>) -> rusqlite::Result<MailboxRaw> {
@@ -513,6 +521,7 @@ fn mailbox_row(row: &Row<'_>) -> rusqlite::Result<MailboxRaw> {
         row.get(5)?,
         row.get(6)?,
         row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -525,10 +534,21 @@ type MailboxRaw = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<i64>,
 );
 
 fn into_mailbox(raw: MailboxRaw) -> Result<MailboxRow, StoreError> {
-    let (conv, mailbox, current, first_epoch, sync_point, head, follow_after, unfollow_at) = raw;
+    let (
+        conv,
+        mailbox,
+        current,
+        first_epoch,
+        sync_point,
+        head,
+        follow_after,
+        unfollow_at,
+        caught_up,
+    ) = raw;
     Ok(MailboxRow {
         conv: ConversationId(conv),
         mailbox: parse(&mailbox, "box")?,
@@ -538,11 +558,12 @@ fn into_mailbox(raw: MailboxRaw) -> Result<MailboxRow, StoreError> {
         head: head.map(|h| h as u64),
         follow_after: follow_after.map(|t| t as u64),
         unfollow_at: unfollow_at.map(|t| t as u64),
+        caught_up: caught_up.map(|t| t as u64),
     })
 }
 
 const MAILBOX_COLUMNS: &str =
-    "conv, box, current, first_epoch, sync_point, head, follow_after, unfollow_at";
+    "conv, box, current, first_epoch, sync_point, head, follow_after, unfollow_at, caught_up";
 
 /// A post waiting to be applied (7.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -787,7 +808,7 @@ pub(crate) mod read {
         query_all(
             conn,
             "SELECT m.conv, m.box, m.current, m.first_epoch, m.sync_point, m.head,
-                    m.follow_after, m.unfollow_at
+                    m.follow_after, m.unfollow_at, m.caught_up
              FROM mailboxes m JOIN conversations c ON c.id = m.conv
              WHERE c.account = ?1 AND c.state IN ('creating', 'active', 'leaving', 'joining')
              ORDER BY m.conv, m.current DESC",
@@ -804,7 +825,7 @@ pub(crate) mod read {
     ) -> Result<Option<MailboxRow>, StoreError> {
         conn.query_row(
             "SELECT m.conv, m.box, m.current, m.first_epoch, m.sync_point, m.head,
-                    m.follow_after, m.unfollow_at
+                    m.follow_after, m.unfollow_at, m.caught_up
              FROM mailboxes m JOIN conversations c ON c.id = m.conv
              WHERE c.account = ?1 AND m.box = ?2",
             params![account.0, mailbox.to_string()],
@@ -1167,6 +1188,22 @@ impl Tx<'_> {
                 sync_point as i64,
                 head.map(|h| h as i64)
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Notes that the device caught a mailbox up as of the server time
+    /// `t`, in ms (12.9). It never goes back.
+    pub(crate) fn set_caught_up(
+        &mut self,
+        conv: ConversationId,
+        mailbox: &BoxName,
+        t: u64,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE mailboxes SET caught_up = max(coalesce(caught_up, 0), ?3)
+             WHERE conv = ?1 AND box = ?2",
+            params![conv.0, mailbox.to_string(), t as i64],
         )?;
         Ok(())
     }
