@@ -615,12 +615,18 @@ Leaves that the device cannot confirm yet are allowed: they stay
 unverified until it does (12.10). A device ignores a Welcome from a
 group in which someone the user has blocked has a leaf (5.7).
 
-Outside public rooms, a device that joins by Welcome then makes the
-Adds key check (below) on every leaf of another device already in the
-group, as if the commit that welcomed it had added each one, and sends
-no messages in the group until each passes. One that fails it repairs
-as an add that failed (below). Otherwise a leaf planted before the
-device joined would be checked only when it sends (12.10).
+Outside public rooms, a device that joins by Welcome then checks every
+leaf of another device already in the group: that its device is a
+current device (4.4) of the credential's identity, whose record the
+device has accepted (4.5), and which it has never seen removed by
+record. It cannot check the leaf's device binding, which covers the
+init key of the KeyPackage the leaf came from (12.3), since the tree
+no longer holds that key. The members present when the leaf was added
+checked its binding (below), and confirmation (12.10) catches the
+rest. The device sends no messages in the group until each leaf
+passes, and one that fails it repairs as an add that failed (below).
+Otherwise a leaf planted before the device joined would be checked
+only when it sends (12.10).
 
 **A guest's report conversation** (5.8) is a direct conversation whose
 participants are a guest uid and an identity. The guest's device

@@ -349,6 +349,10 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   did it, and its identity adds its device back where the Adds checks
   let it. Calling a leaf an impostor gives no power to undo what it
   did, so a member cannot reverse an owner's moderation that way.
+  A device that joins by Welcome cannot check the device bindings of
+  the leaves already in the group, since the tree no longer holds the
+  init keys they cover (12.7). For those leaves it relies on the members
+  that were present when each was added, and on confirmation (12.10).
 - **Public rooms.** Anyone can join a public room under a credential
   that names any device (12.3). Such a leaf never attests, so devices
   treat it as a guest's. It cannot commit or propose an Update, since
