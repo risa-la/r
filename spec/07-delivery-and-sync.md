@@ -150,9 +150,12 @@ every commit that carries a valid token. Devices then decide:
 - **A committer checks that it won.** After the `OK` of its commit, a
   device fetches the posts before it. If an earlier commit for the same
   epoch is valid, its own lost: it applies the winner, and makes its
-  change again if it is still needed. Until it knows that its commit
-  won, it MUST NOT send Welcomes for it (12.8), nor post anything in the
-  epoch it creates, which would be lost with it.
+  change again if it is still needed. It also judges its own commit as
+  it lands, by the group checks with its post's `t` (12.7), as every
+  other device does: if the commit fails them, it lost, though it passed
+  them when posted. Until it knows that its commit won, it MUST NOT send
+  Welcomes for it (12.8), nor post anything in the epoch it creates,
+  which would be lost with it.
 
 This holds only if the server shows every device the same posts in the
 same order. A server that shows different devices different commits for
@@ -399,16 +402,20 @@ make resending safe:
   meanwhile could not apply the first one, and would apply its new one,
   which lost, and so leave the group without knowing it.
 - **Unless it is too old.** A commit's `updated` must be within 10
-  minutes of its post's `t` (12.3). So once the server time the device
-  knows (Section 11) is more than 10 minutes past its commit's
-  `updated`, any copy of the commit that reaches the server from then
-  on, including a first POST that was held up on the way, fails that
-  check wherever it lands, and cannot win the epoch; and the device's
-  own checks would not let it post it again (12.7). The device judges
-  this by the server's time, not its own clock, which may differ. If
-  the commit has not arrived once that server time is more than 15
-  minutes past its `updated`, a margin of 5 minutes, the device MAY drop
-  it and its state, and make a new one if the change is still needed.
+  minutes of its post's `t` (12.3). So once the server's time is more
+  than 10 minutes past a commit's `updated`, any copy of it that
+  reaches the server, including a first POST that was held up on the
+  way, fails that check wherever it lands, and cannot win the epoch. A
+  device cannot know the server's time when it posts, so it may post
+  such a copy again. It judges its own commit as it lands, by the same
+  checks and the post's `t`, as everyone does (7.2): a copy that fails
+  them has lost, and the device makes a new commit if the change is
+  still needed. Once the server time it knows (Section 11) is more than
+  15 minutes past its commit's `updated`, a margin of 5 minutes, and
+  the commit has not arrived, the device MAY drop it and its state
+  without posting it again, and make a new one if the change is still
+  needed. It judges this by the server's time, not its own clock, which
+  may differ.
 
 Devices also ignore a message whose `message_id` they have already seen
 in the group (12.9), so a post that went through twice shows once.

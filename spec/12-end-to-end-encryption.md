@@ -692,12 +692,16 @@ Every time window of the group checks therefore runs on the server's
 SHOULD warn their user when the `t` of a commit that reaches them as it
 is posted (5.2) differs from their own clock by more than an hour.
 
-A device MUST run the group checks on its own commit before it posts
-it, as every other member will, and MUST NOT post one that fails. Since
-its post's `t` is not known yet, it checks time windows against its own
-clock at the time it posts, and KeyPackage lifetimes with the hour
-taken inward (12.5). A commit rebuilt later, for example after another
-commit won the epoch, is checked again.
+A device MUST run the group checks on its own commit before it posts it,
+as every other member will, and MUST NOT post one that fails. Since its
+post's `t` is not known yet, it checks time windows against its own
+clock at the time it posts, and KeyPackage lifetimes with the hour taken
+inward (12.5). A commit rebuilt later, for example after another commit
+won the epoch, is checked again. A commit that passed these checks may
+still fail when it lands, for example a copy posted again more than 10
+minutes after it was made (7.6). The device judges it then by the group
+checks with its post's `t`, as every other member does, and one that
+fails has lost (7.2).
 
 Below, an identity **has a leaf** if the group keeps a leaf of it after
 the commit, and n is the number of leaves before the commit. The group
@@ -1589,17 +1593,20 @@ message by where it falls in that order, not only by its epoch:
 - Whatever posts arrive, a device MUST also delete a past epoch's
   secrets, with its skipped-message keys, once both hold: the server
   time it knows (Section 11) is more than 2 hours past the `t` of the
-  commit that ended the epoch, and it has since caught up the epoch's
-  mailbox, that is, a FOLLOW or FETCH it sent after it learned that
-  time found no post after its sync point (7.4). Otherwise a group that
-  goes quiet would keep them on the device. Any post the device has not
-  applied by then was accepted after that time, more than an hour after
-  the commit, so the limit above makes it unreadable on every device.
-  So this rule too gives every device the same result, whenever it
-  fetched and whatever its own clock says. A device does not delete
-  them by its own clock. A server can still show a post to some devices
-  in time and to others too late, but that changes only what devices
-  show, never which commit is valid (12.7).
+  commit that ended the epoch, and since it learned that time, a FOLLOW
+  or FETCH it sent has shown it every post of the epoch's mailbox up to
+  the server's newest, FOLLOW's head or the last post of a FETCH that
+  says `more=0` (7.1, 7.4), and it has applied them all. Otherwise a
+  group that goes quiet would keep them on the device, so a device that
+  has followed a mailbox since before that time sends a FETCH after its
+  sync point once the time passes. Any post the device has not applied
+  by then was accepted after that reply, more than an hour after the
+  commit, and the limit above makes it unreadable on every device. So
+  this rule too gives every device the same result, whenever it fetched
+  and whatever its own clock says. A device does not delete them by its
+  own clock. A server can still show a post to some devices in time and
+  to others too late, but that changes only what devices show, never
+  which commit is valid (12.7).
 - Within an epoch, a device keeps the keys of skipped messages for at
   most 1,000 generations behind the newest it has seen from each
   sender, and rejects a message more than 1,000 generations ahead of
