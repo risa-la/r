@@ -1,11 +1,11 @@
 # openmls, patched for risala
 
-This is openmls 0.9.2 from crates.io, changed in seven ways for risala:
+This is openmls 0.9.2 from crates.io, changed in eight ways for risala:
 how it frames a SelfRemove proposal (draft-ietf-mls-extensions), where it
 checks KeyPackage lifetimes, removals in external commits, the
 authenticated data of join proposals, `VerifiableGroupInfo::signer`,
-which is public, access to the keys of parent nodes, and the padding of
-commits and proposals. The root Cargo.toml puts it in place
+which is public, access to the keys of parent nodes, the padding of
+commits and proposals, and deleting chosen past epochs. The root Cargo.toml puts it in place
 of the crates.io release with `[patch.crates-io]`. Each place is marked
 `risala:`.
 
@@ -124,3 +124,22 @@ since padding is zero bytes MLS strips.
 risala-mls tests the lengths (`tests::handshake_padding`). Drop the patch
 if OpenMLS lets the application choose the padding per message.
 
+## Deleting chosen past epochs (the spec, 12.9)
+
+After a move (7.8), a device keeps the secrets of the old mailbox's last
+epochs for as long as it follows that mailbox, a day, while the group
+goes on in the new one; it deletes newer past epochs as usual. OpenMLS
+deletes past epochs only oldest first, by count or by time.
+
+- `MlsGroup::retain_past_epoch_secrets` deletes the past epochs for which
+  a function returns false, whatever their place, through
+  `MessageSecretsStore::retain_past_epochs`.
+
+risala-mls deletes past epochs only through it
+(`message::expire_past_epochs`), and grows the group's
+`PastEpochDeletionPolicy::MaxEpochs` while it keeps a move's epochs, so
+that merging a commit does not push them out. Its tests
+(`message::tests::a_moves_epochs_are_kept_while_its_mailbox_is_followed`)
+read a late message of a move's epoch after more commits than 12.9's two
+past epochs. Drop the patch if OpenMLS lets the application choose which
+past epochs to delete.

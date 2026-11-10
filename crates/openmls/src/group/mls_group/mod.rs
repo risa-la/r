@@ -893,6 +893,22 @@ impl MlsGroup {
         Ok(())
     }
 
+    /// risala: deletes the secrets of the past epochs for which `keep`
+    /// returns false, with the keys kept for their skipped messages, and
+    /// keeps the others, whatever their age or place. [`Self::delete_past_epoch_secrets`]
+    /// deletes only the oldest.
+    pub fn retain_past_epoch_secrets<Provider: OpenMlsProvider>(
+        &mut self,
+        provider: &Provider,
+        keep: impl FnMut(u64) -> bool,
+    ) -> Result<(), DeletePastEpochSecretsError<Provider::StorageError>> {
+        self.message_secrets_store.retain_past_epochs(keep);
+        provider
+            .storage()
+            .write_message_secrets(self.group_id(), &self.message_secrets_store)?;
+        Ok(())
+    }
+
     /// Returns a reference to the proposal store.
     pub fn proposal_store(&self) -> &ProposalStore {
         self.public_group.proposal_store()
