@@ -2706,8 +2706,9 @@ fn largest_external_commit() {
     let per_ciphertext = (blank - edge) as f64 / (n - 2 - n / 2) as f64;
     let full = edge as f64 - (n / 2 - depth) as f64 * per_ciphertext;
 
-    // The extension at its limit: 10,000 bans (12.4), of the longest uids
-    // and of short ones.
+    // 10,000 bans, the ban cap (12.4), of the longest uids and of short
+    // ones. The longest came to 2.9 MB, which is why the extension is now
+    // at most 512 KiB as well (PLAN item 68); this measures it as it was.
     let longest = |i: usize| {
         let name = format!("{i:05}{}", "n".repeat(27));
         let domain = format!(

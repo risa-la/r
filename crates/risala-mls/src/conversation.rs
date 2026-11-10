@@ -34,7 +34,7 @@ use openmls::prelude::{
 };
 use risala_proto::names::{Room, ServerAddr, Uid};
 
-use crate::codec::{DecodeError, Reader, Writer};
+use crate::codec::{DecodeError, Reader, Writer, vector_len};
 
 /// The extension type of the conversation extension (12.4, 15).
 pub const CONVERSATION_EXTENSION_TYPE: u16 = 0xF2A1;
@@ -55,6 +55,12 @@ pub const MAX_PRIVATE_NAME_LEN: usize = 128;
 /// The most uids `bans` may hold: the member limit of the largest rooms,
 /// public ones (6.1, 6.4, 12.4).
 pub const MAX_BANS: usize = crate::checks::MAX_PUBLIC_IDENTITIES;
+
+/// The longest the encoded extension may be, in bytes (12.4): 512 KiB.
+/// With [`MAX_BANS`], it bounds `owners`, `mods` and `bans` together
+/// whatever the uids' lengths, since 10,000 bans of the longest uids come
+/// to 2.9 MB (PLAN item 68).
+pub const MAX_EXTENSION_LEN: usize = 512 * 1024;
 
 /// The kind of conversation a group belongs to (12.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,6 +162,13 @@ pub enum ConversationError {
     /// The extension is well formed, but breaks a rule of 12.4.
     #[error("the conversation extension is not acceptable: {0}")]
     Invalid(&'static str),
+    /// More than [`MAX_BANS`] uids in `bans` (6.4, 12.4).
+    #[error("the conversation extension is not acceptable: more than 10,000 uids in bans")]
+    TooManyBans,
+    /// The encoded extension, of this many bytes, is longer than
+    /// [`MAX_EXTENSION_LEN`] (12.4).
+    #[error("the conversation extension is not acceptable: {0} bytes encoded, more than 512 KiB")]
+    TooLong(usize),
 }
 
 /// Why a change to the conversation extension is not allowed (6.2, 6.3,
@@ -215,6 +228,9 @@ fn write_uids(w: &mut Writer, uids: &[Uid]) {
     w.vector(&inner.into_bytes());
 }
 
+/// Reads a uid in its canonical form, lower case, as credentials have it
+/// (12.3, 12.4): one that is only in upper or mixed case is not read,
+/// since a [`Uid`] could not tell it from its canonical form.
 fn read_uid(bytes: &[u8]) -> Result<Uid, DecodeError> {
     let text = std::str::from_utf8(bytes).map_err(|_| DecodeError("uid is not UTF-8"))?;
     let uid: Uid = text.parse().map_err(|_| DecodeError("not a uid"))?;
@@ -222,6 +238,11 @@ fn read_uid(bytes: &[u8]) -> Result<Uid, DecodeError> {
         return Err(DecodeError("uid not in lower case"));
     }
     Ok(uid)
+}
+
+/// The length of a list of uids, as [`write_uids`] writes it.
+fn uids_len(uids: &[Uid]) -> usize {
+    vector_len(uids.iter().map(|uid| vector_len(uid.as_str().len())).sum())
 }
 
 fn read_uids(bytes: &[u8]) -> Result<Vec<Uid>, DecodeError> {
@@ -320,6 +341,19 @@ impl RisalaConversation {
         }
     }
 
+    /// The length of the extension's data, [`encode`](Self::encode)'s,
+    /// without encoding it.
+    pub fn encoded_len(&self) -> usize {
+        let fixed = 1 + 1 + BOX_LEN + 3; // version, kind, box, the modes
+        fixed
+            + vector_len(self.host.to_string().len())
+            + vector_len(self.name.len())
+            + vector_len(self.topic.len())
+            + uids_len(&self.owners)
+            + uids_len(&self.mods)
+            + uids_len(&self.bans)
+    }
+
     /// The extension's data.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
@@ -340,8 +374,14 @@ impl RisalaConversation {
 
     /// Reads the extension's data: exactly one RisalaConversation of
     /// version 1, with values its enums define, UTF-8 text, a host that is
-    /// a server address in its one written form (3.5) and uids in lower
-    /// case. Whether it is well formed is [`check`](Self::check)'s.
+    /// a server address in its one written form (3.5) and uids in their
+    /// canonical form, lower case (12.4). Whether it is well formed is
+    /// [`check`](Self::check)'s.
+    ///
+    /// The rule on uids' case is a format rule of 12.4 like those `check`
+    /// makes, and is made here because a [`Uid`] is always in lower case:
+    /// a value that `decode` returns, or that is built from [`Uid`]s,
+    /// keeps it.
     pub fn decode(bytes: &[u8]) -> Result<RisalaConversation, DecodeError> {
         let mut r = Reader::new(bytes);
         if r.u8()? != 1 {
@@ -397,14 +437,22 @@ impl RisalaConversation {
         })
     }
 
-    /// Checks that the extension is well formed (12.4, 6.2).
+    /// Checks that the extension is well formed (12.4, 6.2): among the
+    /// rules, at most [`MAX_BANS`] uids in `bans`, and at most
+    /// [`MAX_EXTENSION_LEN`] bytes encoded. That uids are in lower case,
+    /// the other rule on the lists' encoding, holds of every [`Uid`], and
+    /// [`decode`](Self::decode) refuses anything else.
     pub fn check(&self) -> Result<(), ConversationError> {
         let invalid = |why| Err(ConversationError::Invalid(why));
         if self.topic.len() > MAX_TOPIC_LEN {
             return invalid("topic longer than 512 bytes");
         }
         if self.bans.len() > MAX_BANS {
-            return invalid("more than 10,000 uids in bans");
+            return Err(ConversationError::TooManyBans);
+        }
+        let len = self.encoded_len();
+        if len > MAX_EXTENSION_LEN {
+            return Err(ConversationError::TooLong(len));
         }
         for list in [&self.owners, &self.mods, &self.bans] {
             if list.iter().any(Uid::is_guest) {
@@ -564,6 +612,11 @@ impl RisalaConversation {
         let Extension::Unknown(CONVERSATION_EXTENSION_TYPE, data) = second else {
             return Err(ConversationError::Missing);
         };
+        // Too long is refused before it is read: decoding is strict, so its
+        // bytes are what `encode` would make of it.
+        if data.0.len() > MAX_EXTENSION_LEN {
+            return Err(ConversationError::TooLong(data.0.len()));
+        }
         let conversation = RisalaConversation::decode(&data.0)?;
         conversation.check()?;
         Ok(conversation)
@@ -1067,10 +1120,7 @@ mod tests {
             assert_eq!(RisalaConversation::decode(&full.encode()).unwrap(), full);
             let mut over = full.clone();
             over.bans.push(uid("one-more@x.org"));
-            assert_eq!(
-                over.check(),
-                Err(ConversationError::Invalid("more than 10,000 uids in bans"))
-            );
+            assert_eq!(over.check(), Err(ConversationError::TooManyBans));
             // Decoding reads it; checking refuses it.
             assert_eq!(RisalaConversation::decode(&over.encode()).unwrap(), over);
         }
@@ -1111,10 +1161,10 @@ mod tests {
         );
         let mut past = to_cap.clone();
         past.bans.push(uid("q@x.org"));
-        assert!(matches!(
+        assert_eq!(
             to_cap.check_change(&past, &as_owner),
-            Err(ChangeError::Invalid(ConversationError::Invalid(_)))
-        ));
+            Err(ChangeError::Invalid(ConversationError::TooManyBans))
+        );
         // Swapping one ban for another at the cap, and lifting one, are
         // fine: the order of `bans` does not matter.
         let mut swapped = to_cap.clone();
@@ -1128,5 +1178,167 @@ mod tests {
         let mut reordered = to_cap.clone();
         reordered.bans.reverse();
         assert!(to_cap.unexplained_changes(&reordered).is_empty());
+    }
+
+    /// The extension's data with `conversation` in place of the encoded
+    /// extension, as a group context has it.
+    fn context_with(conversation: Vec<u8>) -> Extensions<GroupContext> {
+        Extensions::from_vec(vec![
+            Extension::RequiredCapabilities(crate::group::required_capabilities()),
+            Extension::Unknown(CONVERSATION_EXTENSION_TYPE, UnknownExtension(conversation)),
+        ])
+        .unwrap()
+    }
+
+    /// `encoded_len` is the length of `encode`'s bytes, across the lengths
+    /// at which a vector's length takes more bytes.
+    #[test]
+    fn encoded_len_is_encode_len() {
+        let mut conv = room();
+        assert_eq!(conv.encoded_len(), conv.encode().len());
+        for topic in [0, 63, 64, 512] {
+            conv.topic = "t".repeat(topic);
+            assert_eq!(conv.encoded_len(), conv.encode().len(), "{topic}");
+        }
+        // The list's own length passes 64 bytes, then 16,384.
+        for n in [0, 1, 7, 8, 9, 1_500, 1_700, MAX_BANS] {
+            conv.bans = uids(n);
+            assert_eq!(conv.encoded_len(), conv.encode().len(), "{n}");
+        }
+        let ported = RisalaConversation::direct(
+            server("chat.example.org:7000"),
+            BOX,
+            &uid("a@x.org"),
+            &uid("b@x.org"),
+        );
+        assert_eq!(ported.encoded_len(), ported.encode().len());
+    }
+
+    /// The `n`th of a set of distinct uids of 202 bytes each.
+    fn long_uid(n: usize) -> Uid {
+        let domain = ["a", "b", "c"].map(|c| c.repeat(63)).join(".");
+        uid(&format!("u{n:05}@{domain}.org"))
+    }
+
+    /// `base` with long uids in the list `pick` chooses, and a topic, so
+    /// that it is exactly `MAX_EXTENSION_LEN` bytes encoded.
+    fn at_the_limit(
+        base: RisalaConversation,
+        pick: fn(&mut RisalaConversation) -> &mut Vec<Uid>,
+    ) -> RisalaConversation {
+        let mut conv = base;
+        conv.topic.clear();
+        let mut n = 0;
+        // Fill the list while more than 100 bytes stay free after the next
+        // uid, then the rest with the topic: 1 byte of it now, and 2 and
+        // its text once it is 64 bytes or more.
+        while conv.encoded_len() + 204 + 100 <= MAX_EXTENSION_LEN {
+            pick(&mut conv).push(long_uid(n));
+            n += 1;
+        }
+        let free = MAX_EXTENSION_LEN - conv.encoded_len();
+        conv.topic = "t".repeat(free - 1);
+        assert!((64..=MAX_TOPIC_LEN).contains(&conv.topic.len()));
+        assert_eq!(conv.encoded_len(), MAX_EXTENSION_LEN);
+        conv
+    }
+
+    /// The encoded extension is at most 512 KiB (12.4, PLAN item 68),
+    /// whichever lists make it long, well under the ban cap: one byte more
+    /// is refused, by `check` and by `from_extensions` before it reads it.
+    #[test]
+    fn the_extension_is_at_most_512_kib() {
+        assert_eq!(MAX_EXTENSION_LEN, 524_288);
+        let public = RisalaConversation::public_room(
+            server("chat.example.org"),
+            BOX,
+            &"#general".parse().unwrap(),
+            &uid("o@x.org"),
+        );
+        let picks: [fn(&mut RisalaConversation) -> &mut Vec<Uid>; 3] =
+            [|c| &mut c.bans, |c| &mut c.mods, |c| &mut c.owners];
+        for (i, pick) in picks.into_iter().enumerate() {
+            for base in [room(), public.clone()] {
+                let full = at_the_limit(base, pick);
+                assert!(full.bans.len() < MAX_BANS);
+                assert_eq!(full.check(), Ok(()), "{i}");
+                let bytes = full.encode();
+                assert_eq!(bytes.len(), MAX_EXTENSION_LEN);
+                assert_eq!(
+                    RisalaConversation::from_extensions(&context_with(bytes)),
+                    Ok(full.clone())
+                );
+
+                let mut over = full.clone();
+                over.topic.push('t');
+                let too_long = ConversationError::TooLong(MAX_EXTENSION_LEN + 1);
+                assert_eq!(over.check(), Err(too_long.clone()), "{i}");
+                assert_eq!(
+                    RisalaConversation::from_extensions(&context_with(over.encode())),
+                    Err(too_long)
+                );
+                // A commit to it is refused, even by an owner.
+                assert_eq!(
+                    full.check_change(&over, &ChangeRights::of_role(Role::Owner)),
+                    Err(ChangeError::Invalid(ConversationError::TooLong(
+                        MAX_EXTENSION_LEN + 1
+                    )))
+                );
+            }
+        }
+        // Bytes past the limit are refused before they are read: these
+        // would not decode at all.
+        assert_eq!(
+            RisalaConversation::from_extensions(&context_with(vec![0; MAX_EXTENSION_LEN + 1])),
+            Err(ConversationError::TooLong(MAX_EXTENSION_LEN + 1))
+        );
+        // 10,000 bans of the longest uids are far past it.
+        let mut longest = public;
+        longest.bans = (0..MAX_BANS).map(long_uid).collect();
+        assert!(matches!(
+            longest.check(),
+            Err(ConversationError::TooLong(len)) if len > 2_000_000
+        ));
+    }
+
+    /// Uids in `owners`, `mods` and `bans` are in canonical lower case, as
+    /// in credentials (12.4, PLAN item 68): one with upper case anywhere,
+    /// in any list, is refused, though it names a uid that is there.
+    #[test]
+    fn uids_are_in_lower_case() {
+        let mut conv = room();
+        conv.bans.push(uid("b@x.org"));
+        let bytes = conv.encode();
+        assert_eq!(
+            RisalaConversation::from_extensions(&context_with(bytes.clone())),
+            Ok(conv.clone())
+        );
+        for (canonical, other) in [
+            ("o@x.org", "O@x.org"),
+            ("o@x.org", "o@X.org"),
+            ("m@x.org", "m@x.Org"),
+            ("b@x.org", "B@X.ORG"),
+        ] {
+            let at = bytes
+                .windows(canonical.len())
+                .position(|w| w == canonical.as_bytes())
+                .unwrap();
+            let mut bad = bytes.clone();
+            bad[at..at + canonical.len()].copy_from_slice(other.as_bytes());
+            assert_eq!(
+                RisalaConversation::decode(&bad),
+                Err(DecodeError("uid not in lower case")),
+                "{other}"
+            );
+            assert_eq!(
+                RisalaConversation::from_extensions(&context_with(bad)),
+                Err(ConversationError::Malformed(DecodeError(
+                    "uid not in lower case"
+                ))),
+                "{other}"
+            );
+        }
+        // Parsing folds case, so a uid built from text is canonical.
+        assert_eq!(uid("O@X.org").as_str(), "o@x.org");
     }
 }

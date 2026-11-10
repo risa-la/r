@@ -64,6 +64,19 @@ pub(crate) fn write_varint(out: &mut Vec<u8>, len: usize) {
     }
 }
 
+/// The length of a variable-size vector of `len` bytes, its length in
+/// its shortest form included, as [`Writer::vector`] writes it.
+pub(crate) fn vector_len(len: usize) -> usize {
+    let prefix = if len < 1 << 6 {
+        1
+    } else if len < 1 << 14 {
+        2
+    } else {
+        4
+    };
+    prefix + len
+}
+
 /// Reads values off the front of a byte slice.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Reader<'a> {
@@ -177,6 +190,7 @@ mod tests {
             let mut out = Vec::new();
             write_varint(&mut out, len);
             assert_eq!(out, encoded, "{len}");
+            assert_eq!(vector_len(len), encoded.len() + len, "{len}");
             let mut reader = Reader::new(encoded);
             assert_eq!(reader.varint(), Ok(len));
             reader.finish().unwrap();
