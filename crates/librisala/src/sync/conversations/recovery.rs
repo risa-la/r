@@ -80,14 +80,16 @@ pub(crate) fn may_replace(
 /// back (7.2). Its group, of no more use, is forgotten with its leaf key,
 /// as when it is removed. Until it is back it applies and posts nothing
 /// there, and follows none of its mailboxes: in a public room it joins
-/// again (6.1); in other conversations its leaf is replaced, by its
-/// identity's other devices once the leaf is stale and by other members'
-/// after 35 days, and a Welcome brings it back, as for a new device
-/// (7.5, 12.7).
+/// again (6.1); in other conversations it asks its identity's other
+/// devices at once with `RESYNC <box> <seq>`, `seq` the first after the
+/// gap, and they replace its leaf without waiting for it to go stale; or
+/// other members do after 35 days. A Welcome brings it back, as for a new
+/// device (7.5, 12.7).
 pub(super) fn cannot_follow(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: ConversationId,
+    seq: u64,
 ) -> Result<(), EngineError> {
     let row = tx.conversation(conv)?;
     for o in tx.pending_outbox(conv)? {
@@ -104,6 +106,42 @@ pub(super) fn cannot_follow(
     }
     tx.set_state(conv, ConvState::Lost)?;
     tracing::info!(%conv, "posts expired unread: the device can no longer follow the group");
+    if matches!(row.kind, ConvKind::Direct | ConvKind::Private) {
+        ask_own_devices(tx, cx, conv, seq)?;
+    }
+    Ok(())
+}
+
+/// Asks the identity's other devices to replace this device's leaf in
+/// `conv`'s group (12.7): `RESYNC <box> <seq>` in the conversation with
+/// yourself, `seq` the post since which this device cannot follow the
+/// group. Nothing if the device is in no conversation with itself.
+fn ask_own_devices(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: ConversationId,
+    seq: u64,
+) -> Result<(), EngineError> {
+    let mailbox = tx.current_mailbox(conv)?.mailbox;
+    let Some(own) = tx
+        .conversations_of(cx.account)?
+        .into_iter()
+        .find(|r| r.kind == ConvKind::WithYourself && r.state.in_group())
+    else {
+        return Ok(());
+    };
+    let seq = Seq::new(seq).ok_or(EngineError::Invalid("seq".into()))?;
+    content::queue_lines(
+        tx,
+        own.id,
+        cx.uid,
+        vec![ContentLine::Resync {
+            mailbox: Some(mailbox),
+            seq,
+        }],
+        false,
+        cx.now,
+    )?;
     Ok(())
 }
 
@@ -266,29 +304,7 @@ impl ConversationEngine {
             .collect();
         for (conv, seq) in due {
             self.resync_since.remove(&conv);
-            let r = self.write(cx, me, out, |tx, c| {
-                let mailbox = tx.current_mailbox(conv)?.mailbox;
-                let Some(own) = tx
-                    .conversations_of(c.account)?
-                    .into_iter()
-                    .find(|r| r.kind == ConvKind::WithYourself && r.state.in_group())
-                else {
-                    return Ok(());
-                };
-                let seq = Seq::new(seq).ok_or(EngineError::Invalid("seq".into()))?;
-                content::queue_lines(
-                    tx,
-                    own.id,
-                    c.uid,
-                    vec![ContentLine::Resync {
-                        mailbox: Some(mailbox),
-                        seq,
-                    }],
-                    false,
-                    c.now,
-                )?;
-                Ok(())
-            });
+            let r = self.write(cx, me, out, |tx, c| ask_own_devices(tx, c, conv, seq));
             if let Err(e) = r {
                 tracing::warn!(error = %e, "could not ask the own devices to resync");
             }

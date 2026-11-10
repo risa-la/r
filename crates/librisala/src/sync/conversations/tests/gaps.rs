@@ -319,3 +319,69 @@ fn a_public_room_lost_to_expired_posts_is_joined_again_by_proposal() {
         "no external commit"
     );
 }
+
+/// Alice's laptop and phone, in their conversation with themselves and in
+/// a direct conversation with Bob.
+fn own_devices_and_bob() -> (Net, usize, usize, usize, ConversationId) {
+    let mut net = Net::new();
+    let laptop = net.device("laptop", "alice@example.org");
+    let phone = net.device_of("phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, phone, bob] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    net.same_conv(phone, laptop, me).expect("the phone is in");
+    let a = net
+        .job(
+            laptop,
+            Job::Direct {
+                peer: "bob@example.net".parse().unwrap(),
+            },
+        )
+        .unwrap();
+    net.same_conv(phone, laptop, a).expect("the phone is in");
+    net.same_conv(bob, laptop, a).expect("bob is in");
+    (net, laptop, phone, bob, a)
+}
+
+/// Expires every post of the current mailbox of device `d`'s `conv`.
+fn expire_all(net: &mut Net, d: usize, conv: ConversationId) {
+    let mailbox = current_box(net, d, conv);
+    let head = net.server.posts(&mailbox).last().unwrap().0;
+    net.server.expire(&mailbox, head);
+}
+
+/// 7.4, 12.7: a device that finds a gap asks its own devices at once with
+/// `RESYNC <box> <seq>`; the laptop replaces its leaf without waiting for
+/// the leaf to go stale, or for an hour, and the Welcome brings it back.
+#[test]
+fn a_lost_device_asks_its_own_devices_and_is_welcomed_back() {
+    let (mut net, laptop, phone, bob, a) = own_devices_and_bob();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    net.disconnect(phone);
+    net.say(bob, b, "while you were away");
+    expire_all(&mut net, laptop, a);
+    let before = net.epoch(laptop, a);
+    let started = net.clock.now().unix_millis();
+    net.connect(phone);
+    net.tick();
+    assert!(cannot_follow(&net, phone, p));
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert!(
+        net.epoch(laptop, a) > before,
+        "the laptop replaced the phone's leaf"
+    );
+    assert!(net.clock.now().unix_millis() - started < 60 * 60 * 1000);
+    assert_eq!(net.state(phone, p), ConvState::Active);
+    assert_eq!(net.epoch(phone, p), net.epoch(laptop, a));
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    net.say(bob, b, "welcome back");
+    assert!(
+        net.texts(phone, p)
+            .contains(&("bob@example.net".into(), "welcome back".into()))
+    );
+}

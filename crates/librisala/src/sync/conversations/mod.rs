@@ -2100,7 +2100,7 @@ impl ConversationEngine {
                             // nor in a mailbox the group moved away from,
                             // whose commits it has all applied (7.8).
                             if !joined && mb.current && tx.conversation(mb.conv)?.state.in_group() {
-                                recovery::cannot_follow(tx, c, mb.conv)?;
+                                recovery::cannot_follow(tx, c, mb.conv, to + 1)?;
                                 lost = Some(mb.conv);
                             }
                             tx.set_sync(mb.conv, &mailbox, to, None)?;
