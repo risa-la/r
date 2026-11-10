@@ -2682,6 +2682,73 @@ Open:
     - **librisala's cache schema stays at version 1**, changed in place,
       until the first release; development caches are wiped.
 
+68. **Points raised by item 67's work**, settled on 2026-11-10. The user
+    decided the first eight; they asked that the rest take the
+    recommended answer or be decided by Claude, building it right rather
+    than taking shortcuts. Those are marked *(decided by Claude)*.
+
+    *External commits and the conversation extension.*
+    - **An external commit is used only if it fits a line.** Measured
+      (risala-mls `largest_external_commit`): each blank node in the
+      joiner's copath resolution adds 1,188 bytes, so a 1 MiB POST line
+      holds about 620; the worst case at 32,768 leaves is 39 MB. When it
+      does not fit, a device rejoins a public room by external proposal,
+      as joins already do, and in a private group sends RESYNC to its
+      own devices (12.7). No blob for external commits; item 66 stands.
+    - **The encoded conversation extension is at most 512 KiB**, a
+      format rule (12.4), besides the 10,000-ban cap. It bounds owners,
+      mods and bans together whatever the uids' lengths: 10,000 bans of
+      the longest uids came to 2.9 MB.
+    - **Uids in `owners`, `mods` and `bans` are in canonical lower
+      case**, as in credentials; anything else fails the format check
+      (12.4).
+
+    *Leaving.*
+    - **A device that leaves locally while its own other devices remain
+      in the group tells them to leave**: it posts `LEAVE <box>` in the
+      conversation with itself, and one of its own devices makes the
+      normal leave commit, which also removes the dead leaf (6.1, 12.9).
+      This covers a lost device and a leave commit that failed its
+      checks. Own devices act on it only from a confirmed own device.
+    - **A device that left refuses Welcomes only from its own
+      identity's devices**; an invitation from another member is
+      accepted, as after any leave (6.1).
+    - **`leave()` cancels a join or rejoin** in progress and forgets the
+      room *(recommended)*.
+    - **The conversation list shows a state**: active, leaving, lost or
+      left, in place of `active` alone, and the CLI's `list` shows it.
+
+    *Clocks and late posts.*
+    - **The 10-minute repost rule uses server time**: a commit's age is
+      judged by the newest server time the device knows (posts' `t`,
+      PING), and a new commit is made only after 15 minutes, a 5-minute
+      margin (7.6).
+    - **The 2-hour limit on past epochs is judged by server time too**:
+      a device deletes a past epoch's secrets once it has seen a post
+      whose `t` is 2 hours past the commit that ended it, not by its own
+      clock. A device that was offline then decides like the others,
+      which closes the one case item 67 left open across a move (12.9)
+      *(decided by Claude)*.
+    - **RESYNC matches any box the group has had**: own devices keep the
+      group's past boxes, so a lost device's RESYNC or LEAVE that names
+      a box from before a move still finds the group *(decided by
+      Claude)*. Where no own device is left in the group, or the device
+      is lost in the conversation with itself too, the stale-leaf rules
+      remain the fallback.
+    - **A RESYNC after every post up to the head expired uses the head
+      as its seq** *(recommended)*.
+
+    *The server.*
+    - **5.2 names what the server sees**: a POST with token `-` (an
+      external commit or proposal) may not carry a blob-ref, `ERR
+      bad-syntax` *(recommended)*. An inline one too long for a line
+      gets `ERR too-long`.
+    - **`https_connections_per_prefix`**, default 64, 0 for no limit,
+      replaces the fixed cap per IPv6 /48.
+
+    *The spec.*
+    - **Appendix D.5 gets entries** for items 66 to 68 *(recommended)*.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
