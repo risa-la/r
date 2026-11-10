@@ -45,6 +45,9 @@ aws-lc-rs.workspace = true
 openmls_memory_storage = { version = "0.6", features = ["draft-ietf-mls-pq-ciphersuites"] }
 
 [dev-dependencies]
+# Commits and groups whose conversation extension breaks 12.4's rules, to
+# test that the server refuses them.
+risala-mls = { workspace = true, features = ["testing"] }
 # Paused time for the keepalive tests.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

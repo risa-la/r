@@ -2574,6 +2574,157 @@ async fn public_room_commits_keep_the_extension_format() {
     assert_eq!(commit_conversation(&h, &mut room, conv).await, "OK seq=1");
 }
 
+/// The encoded extension is at most 512 KiB, and the uids in `owners`,
+/// `mods` and `bans` are in lower case: format rules of 12.4 (PLAN item
+/// 68), which the server checks in a public room's commits through
+/// risala-mls. One byte past the limit is refused, well under the ban cap,
+/// and exactly at it is taken; a uid in upper case is refused in each
+/// list, though it names the same identity.
+#[tokio::test]
+async fn public_room_commits_keep_the_extension_short_and_lower_case() {
+    use risala_mls::conversation::MAX_BANS;
+    let mut h = harness_now();
+    let mut room = create_room(&mut h, 1).await;
+    let base = risala_mls::group::conversation(&room.o).unwrap();
+    let full = at_extension_limit(&base);
+    assert!(full.bans.len() < MAX_BANS);
+    let mut over = full.clone();
+    over.topic.push('t');
+    let line = commit_conversation(&h, &mut room, over.clone()).await;
+    assert!(line.starts_with("ERR forbidden"), "{line}");
+    assert!(line.contains("more than 512 KiB"), "{line}");
+    // The rule is on the bytes: those of `mods` count as `bans`' do.
+    let mut mods = over.clone();
+    mods.mods = std::mem::take(&mut mods.bans);
+    let line = commit_conversation(&h, &mut room, mods).await;
+    assert!(line.contains("more than 512 KiB"), "{line}");
+    assert_eq!(
+        commit_conversation(&h, &mut room, full.clone()).await,
+        "OK seq=1"
+    );
+
+    // In lower case only, in owners, mods and bans.
+    let mut conv = risala_mls::group::conversation(&room.o).unwrap();
+    conv.topic.clear();
+    conv.bans.truncate(1);
+    conv.mods.push("mo@example.org".parse().unwrap());
+    assert_eq!(
+        commit_conversation(&h, &mut room, conv.clone()).await,
+        "OK seq=2"
+    );
+    let bytes = conv.encode();
+    for (canonical, other) in [
+        ("owen@example.org", "Owen@example.org"),
+        ("mo@example.org", "mo@EXAMPLE.org"),
+        (conv.bans[0].as_str(), &conv.bans[0].as_str().to_uppercase()),
+    ] {
+        let line = commit_extension_data(&h, &mut room, with_bytes(&bytes, canonical, other)).await;
+        assert!(line.starts_with("ERR forbidden"), "{other}: {line}");
+        assert!(line.contains("uid not in lower case"), "{other}: {line}");
+    }
+    // As it was, it is taken.
+    assert_eq!(
+        commit_extension_data(&h, &mut room, bytes).await,
+        "OK seq=3"
+    );
+}
+
+/// A new public room's CREATE keeps the format rules of 12.4 too (5.2,
+/// PLAN items 67 and 68): at most 10,000 bans, at most 512 KiB encoded,
+/// and uids in lower case. Each one broken gets `ERR invalid`, and nothing
+/// is created; a room at the limits is.
+#[tokio::test]
+async fn creates_keep_the_extension_format() {
+    use risala_mls::conversation::{ConversationKind, MAX_BANS};
+    let mut h = harness_now();
+    let owen = Dev::new("owen@example.org", 1);
+    let m = mailbox(1);
+    let mut signed = owen.sign_in(&mut h);
+    let base = public_conv(&owen, m, GuestMode::Write);
+    let create = async |h: &Harness, signed: &mut Client, data: Vec<u8>| {
+        let (group, _, state) = risala_mls::group::create_group_with_extension_data(
+            &owen.provider,
+            &owen.identity(),
+            &owen.profile(),
+            ConversationKind::PublicRoom,
+            data,
+            Timestamp::now(),
+        )
+        .unwrap();
+        owen.set_state(&group, state);
+        let (group_info, tree) = public_state(&owen, &group);
+        h.send(
+            signed,
+            &format!(
+                "CREATE {m} {} {} #general {group_info} {tree}",
+                gid(&group),
+                owen.token_hash(&group)
+            ),
+        )
+        .await;
+        let lines = signed.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines[0].clone()
+    };
+    let full = at_extension_limit(&base);
+    let mut over = full.clone();
+    over.topic.push('t');
+    let mut banned = base.clone();
+    banned.bans = (0..=MAX_BANS)
+        .map(|i| format!("u{i}@x.example").parse().unwrap())
+        .collect();
+    let bytes = base.encode();
+    for (data, why) in [
+        (over.encode(), "more than 512 KiB"),
+        (banned.encode(), "more than 10,000 uids in bans"),
+        (
+            with_bytes(&bytes, "owen@example.org", "owen@Example.org"),
+            "uid not in lower case",
+        ),
+    ] {
+        let line = create(&h, &mut signed, data).await;
+        assert!(line.starts_with("ERR invalid"), "{why}: {line}");
+        assert!(line.contains(why), "{why}: {line}");
+        assert!(h.store.mailbox(&m).unwrap().is_none());
+    }
+    assert_eq!(create(&h, &mut signed, full.encode()).await, "OK");
+}
+
+/// `conversation` with long uids added to `bans` and a topic, so that it
+/// is exactly 512 KiB encoded (12.4).
+fn at_extension_limit(conversation: &RisalaConversation) -> RisalaConversation {
+    use risala_mls::conversation::MAX_EXTENSION_LEN;
+    let domain = ["a", "b", "c"].map(|c| c.repeat(63)).join(".");
+    let mut conv = conversation.clone();
+    conv.topic.clear();
+    let mut n = 0;
+    // Each uid takes 204 bytes; leave 100 to 304 for the topic, whose
+    // length takes 2 bytes once it is 64 or more, and 1 when it is empty.
+    while conv.encoded_len() + 204 + 100 <= MAX_EXTENSION_LEN {
+        conv.bans
+            .push(format!("u{n:05}@{domain}.org").parse().unwrap());
+        n += 1;
+    }
+    conv.topic = "t".repeat(MAX_EXTENSION_LEN - conv.encoded_len() - 1);
+    assert_eq!(conv.encoded_len(), MAX_EXTENSION_LEN);
+    conv
+}
+
+/// `bytes` with the one `from` in it replaced by `to`, of the same length.
+fn with_bytes(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+    assert_eq!(from.len(), to.len());
+    let at: Vec<usize> = bytes
+        .windows(from.len())
+        .enumerate()
+        .filter(|(_, w)| *w == from.as_bytes())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "{from}");
+    let mut out = bytes.to_vec();
+    out[at[0]..at[0] + from.len()].copy_from_slice(to.as_bytes());
+    out
+}
+
 /// The owner's commit of `conversation` to the room, posted with its
 /// message and GroupInfo as blobs, since a long extension does not fit a
 /// line (12.12); merged if the server takes it, and dropped if not.
@@ -2589,6 +2740,35 @@ async fn commit_conversation(
         ..Changes::default()
     };
     let out = room.owen.commit(&mut room.o, changes);
+    post_own_commit(h, room, token, out).await
+}
+
+/// [`commit_conversation`], with the extension's data as it is, well
+/// formed or not.
+async fn commit_extension_data(h: &Harness, room: &mut PublicRoomSetup, data: Vec<u8>) -> String {
+    let token = room.owen.token(&room.o);
+    let state = room.owen.state(&room.o);
+    let out = risala_mls::group::commit_with_extension_data(
+        &room.owen.provider,
+        &mut room.o,
+        &room.owen.profile(),
+        &state,
+        Changes::default(),
+        data,
+    )
+    .unwrap();
+    post_own_commit(h, room, token, out).await
+}
+
+/// Posts the owner's commit `out` with `token`, its message and GroupInfo
+/// as blobs; merges it if the server takes it, and drops it if not.
+/// Returns the server's response.
+async fn post_own_commit(
+    h: &Harness,
+    room: &mut PublicRoomSetup,
+    token: String,
+    out: CommitOutput,
+) -> String {
     let message = hold_blob(h, &out.message, Some(&room.m));
     let info = hold_blob(h, out.group_info.as_ref().unwrap(), Some(&room.m));
     h.send(
