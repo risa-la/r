@@ -397,3 +397,45 @@ fn deletes_are_secure_and_the_wal_is_truncated() {
     store.checkpoint().unwrap();
     assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
 }
+
+/// The server time the device knows is the newest it has seen, for each
+/// server, whichever account saw it, and never goes back (7.6, 12.9).
+#[test]
+fn server_time_is_the_newest_seen_per_server() {
+    let store = Store::open_in_memory().unwrap();
+    let chat: ServerAddr = "chat.example.org".parse().unwrap();
+    let other: ServerAddr = "other.example.org".parse().unwrap();
+    let alice = store
+        .add_account(
+            &chat,
+            AccountKind::Identity,
+            &"alice@example.org".parse().unwrap(),
+        )
+        .unwrap();
+    let sam = store
+        .add_account(&chat, AccountKind::Guest, &"~sam".parse().unwrap())
+        .unwrap();
+    let bob = store
+        .add_account(
+            &other,
+            AccountKind::Identity,
+            &"bob@example.net".parse().unwrap(),
+        )
+        .unwrap();
+    let time = |account| {
+        store
+            .write_with(|tx| tx.server_time(account))
+            .map_err(|e: StoreError| e)
+            .unwrap()
+            .0
+    };
+    assert_eq!(time(alice), None);
+    store.note_server_time(alice, 2_000).unwrap();
+    store.note_server_time(sam, 1_000).unwrap();
+    assert_eq!(time(alice), Some(2_000));
+    assert_eq!(time(sam), Some(2_000), "the same server");
+    assert_eq!(time(bob), None, "another server");
+    store.note_server_time(bob, 500).unwrap();
+    assert_eq!(time(bob), Some(500));
+    assert_eq!(time(alice), Some(2_000));
+}

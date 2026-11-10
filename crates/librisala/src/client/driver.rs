@@ -306,6 +306,19 @@ impl Exec {
         }
     }
 
+    /// Keeps the server's time from a PING or the OK to one (11): the
+    /// engines judge commits' age and past epochs by it (7.6, 12.9). Posts'
+    /// `t` is kept by the conversations engine as it takes them.
+    fn server_time(&self, t: risala_proto::time::Timestamp) {
+        if let Err(e) = self
+            .cx
+            .store
+            .note_server_time(self.cx.account, t.unix_millis())
+        {
+            tracing::debug!(error = %e, "could not keep the server's time");
+        }
+    }
+
     /// A connection closed: the commands in flight on it get no reply.
     fn closed(&self, slot: Slot) {
         self.sessions
@@ -646,6 +659,7 @@ async fn read(exec: Arc<Exec>, slot: Slot, mut incoming: mpsc::Receiver<Incoming
                     None => tracing::debug!(?slot, %ref_, "a reply no engine asked for"),
                 }
             }
+            Incoming::ServerTime(t) => exec.server_time(t),
         }
     }
     // The queue ended: the connection closed.

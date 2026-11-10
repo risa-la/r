@@ -17,6 +17,7 @@ use risala_proto::names::{Domain, Identity, Name, Uid};
 use risala_proto::server::{
     ErrResponse, Greeting, OkResponse, Register, ServerLine, ServerMessage,
 };
+use risala_proto::time::Timestamp;
 use risala_proto::types::Ref;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -166,6 +167,11 @@ pub enum Incoming {
         /// The response.
         response: Response,
     },
+    /// The server's time, from the `t` of its PING or of the OK to the
+    /// session's own keepalive PING (3.2, 11), placed where that line
+    /// arrived. The device learns the server's time from it, as from
+    /// posts' `t` (7.6, 12.9).
+    ServerTime(Timestamp),
 }
 
 impl Incoming {
@@ -173,7 +179,7 @@ impl Incoming {
     pub fn into_line(self) -> Option<ServerMessage> {
         match self {
             Incoming::Line(msg) => Some(msg),
-            Incoming::Reply { .. } => None,
+            Incoming::Reply { .. } | Incoming::ServerTime(_) => None,
         }
     }
 }
@@ -925,7 +931,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
         match msg.line {
             ServerLine::Ok(ok) => self.finish(msg.ref_, End::Ok(ok)),
             ServerLine::Err(err) => self.finish(msg.ref_, End::Err(err)),
-            ServerLine::Ping { token, .. } => {
+            ServerLine::Ping { token, t } => {
                 // Answer straight away (11). PONG gets no response.
                 let pong = Request::new(Command::Pong { token });
                 match pong.try_to_line() {
@@ -934,6 +940,7 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
                     }
                     Err(e) => tracing::debug!(error = %e, "cannot answer PING"),
                 }
+                self.queue_time(t);
                 Ok(())
             }
             ServerLine::Greeting(_) => {
@@ -962,6 +969,15 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
         }
         pending.lines.push(msg);
         Ok(())
+    }
+
+    /// Queues the server's time. Unlike a line, it is only a hint, which
+    /// the next post or PING gives again: when the queue is full it is
+    /// dropped, and the connection stays.
+    fn queue_time(&mut self, t: Timestamp) {
+        if self.incoming.try_send(Incoming::ServerTime(t)).is_err() {
+            tracing::debug!("the server's time is dropped: the queue is full");
+        }
     }
 
     fn queue(&mut self, msg: Incoming) -> Result<(), CloseReason> {
@@ -1006,7 +1022,15 @@ impl<S: AsyncRead + AsyncWrite> Reader<S> {
             end,
         };
         match pending.reply {
-            ReplyTo::Keepalive => Ok(()),
+            ReplyTo::Keepalive => match &response.end {
+                End::Ok(ok) => {
+                    if let Some(t) = ok.t() {
+                        self.queue_time(t);
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
             ReplyTo::Waiter(reply) => {
                 let _ = reply.send(Ok(response));
                 Ok(())

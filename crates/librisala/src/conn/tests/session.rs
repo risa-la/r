@@ -92,6 +92,7 @@ fn show(item: Incoming) -> Vec<String> {
             out.push(format!("reply {ref_} {end}"));
             out
         }
+        Incoming::ServerTime(t) => vec![format!("time {t}")],
     }
 }
 
@@ -538,19 +539,67 @@ async fn server_ping_is_answered_with_pong() {
     let addr = chat_test();
     let (server, trust, ca) = run(&addr, |_, mut peer| async move {
         peer.greet().await;
-        peer.send("PING abc123").await;
+        peer.send("@t=2026-11-10T09:00:00.000Z PING abc123").await;
         peer.expect("PONG abc123").await;
-        peer.send("PING x").await;
+        peer.send("@t=2026-11-10T09:02:00.000Z PING x").await;
         peer.expect("PONG x").await;
+        // A PING without its `t` does not parse, and is ignored (2.3).
+        peer.send("PING y").await;
         peer.send("NOTICE done").await;
         peer.expect_eof().await;
     })
     .await;
     let session = open(&addr, &server, &trust, &ca, |_| {}).await.unwrap();
     let mut incoming = session.take_incoming().unwrap();
-    // PINGs are not passed on.
-    let notice = line(incoming.recv().await.unwrap());
-    assert_eq!(notice.to_line().to_string(), "NOTICE done");
+    // PINGs are not passed on as lines, only their time (11).
+    let mut shown = Vec::new();
+    for _ in 0..3 {
+        shown.extend(show(incoming.recv().await.unwrap()));
+    }
+    assert_eq!(
+        shown,
+        [
+            "time 2026-11-10T09:00:00.000Z",
+            "time 2026-11-10T09:02:00.000Z",
+            "NOTICE done"
+        ]
+    );
+    drop(session);
+    server.done().await;
+}
+
+/// The OK to the session's own keepalive PING gives the server's time
+/// (11), placed where it arrived.
+#[tokio::test]
+async fn keepalive_ok_gives_the_servers_time() {
+    let addr = chat_test();
+    let (server, trust, ca) = run(&addr, |_, mut peer| async move {
+        peer.greet().await;
+        peer.expect("@ref=1 PING").await;
+        peer.send("NOTICE before").await;
+        peer.send("@ref=1;t=2026-11-10T09:00:00.000Z OK").await;
+        peer.send("NOTICE after").await;
+        peer.expect_eof().await;
+    })
+    .await;
+    let session = open(&addr, &server, &trust, &ca, |o| {
+        o.ping_after = Duration::from_millis(50);
+    })
+    .await
+    .unwrap();
+    let mut incoming = session.take_incoming().unwrap();
+    let mut shown = Vec::new();
+    for _ in 0..3 {
+        shown.extend(show(incoming.recv().await.unwrap()));
+    }
+    assert_eq!(
+        shown,
+        [
+            "NOTICE before",
+            "time 2026-11-10T09:00:00.000Z",
+            "NOTICE after"
+        ]
+    );
     drop(session);
     server.done().await;
 }

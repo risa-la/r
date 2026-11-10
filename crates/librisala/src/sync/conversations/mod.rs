@@ -1584,6 +1584,8 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         self.write(cx, me, out, |tx, c| {
+            // 7.6, 12.9: every post's `t` is the server's time.
+            tx.note_server_time(c.account, t)?;
             if let Some(mb) = tx.mailbox(c.account, mailbox)? {
                 tx.keep_post(
                     mb.conv,
@@ -1611,6 +1613,7 @@ impl ConversationEngine {
         out: &mut Vec<Action>,
     ) -> Result<(), EngineError> {
         let notes = self.write(cx, me, out, |tx, c| {
+            tx.note_server_time(c.account, post.t.unix_millis())?;
             let Some(mb) = tx.mailbox(c.account, &post.mailbox)? else {
                 return Ok(Vec::new());
             };

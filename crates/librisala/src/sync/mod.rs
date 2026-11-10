@@ -272,7 +272,7 @@ mod tests {
             ("OK", Area::Connection),
             ("ERR internal", Area::Connection),
             ("NOTICE hi", Area::Connection),
-            ("PING x", Area::Connection),
+            ("@t=2026-11-10T09:00:00.000Z PING x", Area::Connection),
             ("BYE", Area::Connection),
             ("FROB x", Area::Connection),
             (

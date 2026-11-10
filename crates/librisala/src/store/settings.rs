@@ -13,10 +13,13 @@ use crate::addr::{PinChange, Replaced, ServerAddr, TrustRecord, TrustStore, Trus
 
 /// This area's part of the schema.
 pub(crate) const SCHEMA: &str = "
--- Servers by address (ServerAddr's display form).
+-- Servers by address (ServerAddr's display form). time is the newest
+-- server time the device has seen there, in ms: the newest t of any post,
+-- or of a PING or the OK to one (3.2, 11). It never goes back (7.6, 12.9).
 CREATE TABLE servers (
     id   INTEGER PRIMARY KEY,
-    addr TEXT NOT NULL UNIQUE
+    addr TEXT NOT NULL UNIQUE,
+    time INTEGER
 );
 
 -- How each server was verified (2.2). No row: nothing yet. 'ca' has no
@@ -153,6 +156,40 @@ impl Tx<'_> {
     }
 }
 
+impl Tx<'_> {
+    /// Notes `t`, in ms, a time the server of `account` stamped on a post,
+    /// a PING or the OK to one (3.2, 11). The server time the device knows
+    /// is the newest it has seen, and never goes back (7.6, 12.9).
+    pub(crate) fn note_server_time(
+        &mut self,
+        account: AccountId,
+        t: u64,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE servers SET time = max(coalesce(time, 0), ?2)
+             WHERE id = (SELECT server FROM accounts WHERE id = ?1)",
+            params![account.0, t as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The newest server time the device knows for the server of
+    /// `account`, in ms (7.6, 12.9), or `None` if it has seen none.
+    pub(crate) fn server_time(&self, account: AccountId) -> Result<Option<u64>, StoreError> {
+        let t: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT s.time FROM servers s JOIN accounts a ON a.server = s.id
+                 WHERE a.id = ?1",
+                params![account.0],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(t.map(|t| t as u64))
+    }
+}
+
 impl From<StoreError> for TrustStoreError {
     fn from(e: StoreError) -> TrustStoreError {
         TrustStoreError(e.to_string())
@@ -283,6 +320,15 @@ impl Store {
             Ok(AccountId(id))
         })?;
         Ok(id)
+    }
+
+    /// Notes `t`, in ms, a time the server of `account` stamped on a PING
+    /// or the OK to one (3.2, 11). The server time the device knows is the
+    /// newest it has seen, posts' `t` included, and never goes back (7.6,
+    /// 12.9).
+    pub fn note_server_time(&self, account: AccountId, t: u64) -> Result<(), StoreError> {
+        self.write(|tx| tx.note_server_time(account, t))?;
+        Ok(())
     }
 
     /// Every account, in the order they were added.
