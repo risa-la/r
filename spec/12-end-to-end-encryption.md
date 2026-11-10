@@ -505,7 +505,7 @@ outside the group can, and refuses one that fails:
    posted on the signed-in one, which ties the two connections together.
    That tells the server nothing the commit does not, since the commit
    names its sender. An external commit cannot be a blob, and must fit
-   in a line (12.12).
+   in a line; one sent as a blob-ref gets `ERR bad-syntax` (12.12).
 5. **A commit carries the new GroupInfo,** with the `external_pub`
    extension and no `ratchet_tree` extension, as the option
    `groupinfo=<groupinfo>` of POST. Its group context must be the one
@@ -2036,7 +2036,9 @@ BLOB <hash> <size> [box=<box> token=<token>]
   whose mailbox does not exist yet. An external commit with its
   GroupInfo, and a new public room's GroupInfo and tree, MUST fit in
   the line that carries them (2.3). A line that does not gets
-  `ERR too-long`.
+  `ERR too-long`. The server refuses a blob-ref in their place with
+  `ERR bad-syntax`: for `<groupinfo>` or `<tree>` in CREATE (5.2), and
+  for the message or `groupinfo` of an external commit.
 - The client sends the blob in an HTTP PUT request to the `put` URL,
   which works for one upload within 10 minutes. The server MUST reject a
   body whose length differs from `<size>`, or whose SHA-384 hash differs

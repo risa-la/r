@@ -71,7 +71,8 @@ for epoch 0 (7.2), in base64 with padding.
   needs a signed-in connection. `<groupinfo>` and `<tree>` are the
   group's GroupInfo and ratchet tree (12.2), each in base64 with
   padding: the device cannot store them as blobs, since the mailbox
-  does not exist yet, so they must fit in the line (12.12). The server
+  does not exist yet, so they must fit in the line (12.12). A blob-ref
+  in their place gets `ERR bad-syntax`. The server
   checks them as in 12.6: one leaf, whose credential names the
   connection's identity, and a well-formed conversation extension
   (12.4) of kind `public_room` that names this server, `<box>` and
