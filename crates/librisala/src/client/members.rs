@@ -25,13 +25,14 @@ use risala_proto::content::ContentLine;
 use risala_proto::names::{Identity, Uid};
 
 use super::identity::{IdentityError, IdentityEvent};
-use super::types::{AccountId, ConversationId, Unsettled};
+use super::types::{AccountId, ConversationId, SendingHold, Unsettled};
 use super::{Client, Event, Result};
 use crate::keys::KeyStore;
 use crate::store::Tx;
 use crate::store::conversations::{ConvKind, ConvRow, LeafRow};
 use crate::store::identity::{ContactRow, DeviceRow, DeviceState, KeysState, read_own};
-use crate::store::keychecks::KeyCheckRow;
+use crate::store::keychecks::{CheckKind, KeyCheckRow};
+use crate::store::messages::{OutboxKind, OutboxState};
 use crate::sync::Action;
 use crate::sync::conversations::wire::Intent;
 use crate::sync::conversations::{Job, group};
@@ -788,14 +789,34 @@ impl Client {
     }
 
     /// What the account has still to get to its servers: posts and
-    /// commits queued, in flight or not yet seen back; Welcomes waiting;
-    /// the identity's records its log does not hold yet (KEYS PUT, 4.7);
-    /// KeyPackages not yet uploaded since signing in (12.5); and history
-    /// asked for with WANT and not yet sent (12.13).
+    /// commits queued, in flight or not yet seen back, and of them the
+    /// messages that wait while their conversation's sending is held;
+    /// Welcomes waiting; the identity's records its log does not hold yet
+    /// (KEYS PUT, 4.7); KeyPackages not yet uploaded since signing in
+    /// (12.5); and history asked for with WANT and not yet sent (12.13).
     pub fn unsettled(&self, account: AccountId) -> Result<Unsettled> {
         let uid = self.account(account)?.uid;
-        let ((outbox, welcomes, transfers), _) = self.store().write(|tx| {
-            let outbox = tx.account_outbox(account)?.len();
+        let ((outbox, held, welcomes, transfers), _) = self.store().write(|tx| {
+            let rows = tx.account_outbox(account)?;
+            let mut held_convs = std::collections::HashMap::new();
+            let mut held = 0;
+            for row in &rows {
+                if !matches!(row.kind, OutboxKind::Message | OutboxKind::Live)
+                    || row.state != OutboxState::Queued
+                {
+                    continue;
+                }
+                let is_held = match held_convs.get(&row.conv) {
+                    Some(is_held) => *is_held,
+                    None => {
+                        let is_held = tx.sending_held(row.conv)?;
+                        held_convs.insert(row.conv, is_held);
+                        is_held
+                    }
+                };
+                held += usize::from(is_held);
+            }
+            let outbox = rows.len();
             let welcomes: i64 = tx.conn().query_row(
                 "SELECT count(*) FROM welcomes_out w JOIN conversations c ON c.id = w.conv
                  WHERE c.account = ?1",
@@ -803,7 +824,7 @@ impl Client {
                 |r| r.get(0),
             )?;
             let transfers = tx.want_requests(account)?.len();
-            Ok((outbox, welcomes as usize, transfers))
+            Ok((outbox, held, welcomes as usize, transfers))
         })?;
         let records = self
             .store()
@@ -819,10 +840,33 @@ impl Client {
         };
         Ok(Unsettled {
             outbox,
+            held,
             welcomes,
             records,
             key_packages,
             transfers,
+        })
+    }
+
+    /// Why `conversation` sends no messages for now, if it does not
+    /// (12.7): a leaf it could not check yet, or one that failed its check
+    /// and is still to be removed. Messages queued meanwhile wait, and go
+    /// once the hold ends.
+    pub fn sending_hold(&self, conversation: ConversationId) -> Result<Option<SendingHold>> {
+        let (checks, _) = self.store().write(|tx| {
+            if !tx.sending_held(conversation)? {
+                return Ok(Vec::new());
+            }
+            tx.conversation_checks(conversation)
+        })?;
+        let repair = checks.iter().find(|c| c.repair_at.is_some());
+        let unchecked = checks
+            .iter()
+            .find(|c| !c.failed && matches!(c.kind, CheckKind::Add | CheckKind::Joined));
+        Ok(match (repair, unchecked) {
+            (Some(c), _) => Some(SendingHold::Repair { uid: c.uid.clone() }),
+            (None, Some(c)) => Some(SendingHold::KeyCheck { uid: c.uid.clone() }),
+            (None, None) => None,
         })
     }
 }
@@ -1117,6 +1161,83 @@ mod tests {
     /// What is left to send counts the identity's records its log does
     /// not hold yet (KEYS PUT, 4.7) and WANTs not answered (12.13); an
     /// account that is not connected has no KeyPackages to wait for.
+    /// Messages queued in a conversation whose sending is held count as
+    /// held besides queued, and the hold says why (12.7, PLAN item 66): a
+    /// leaf still to be checked, then one that failed and is to be
+    /// removed.
+    #[test]
+    fn held_sending_is_told_apart() {
+        use crate::store::conversations::{ConvState, NewConversation};
+        use crate::store::messages::NewOutbox;
+        let client = Client::open_in_memory(crate::ClientOptions::default()).unwrap();
+        let account = client.add_identity_account("chat.test", ALICE).unwrap().id;
+        let bob = uid("bob@example.org");
+        let (conv, _) = client
+            .store()
+            .write(|tx| {
+                let conv = tx.insert_conversation(&NewConversation {
+                    account,
+                    group_id: &[1; 32],
+                    kind: ConvKind::Private,
+                    room: None,
+                    name: "garden",
+                    topic: "",
+                    peer: None,
+                    epoch: 1,
+                    pseudonym: [0; 16],
+                    state: ConvState::Active,
+                    last_resort: false,
+                    now: 0,
+                })?;
+                let message = NewOutbox {
+                    message_id: Some([1; 16]),
+                    body: Some(vec![1]),
+                    ..NewOutbox::default()
+                };
+                tx.queue_outbox(conv, OutboxKind::Message, &message, 0)?;
+                Ok(conv)
+            })
+            .unwrap();
+        let left = client.unsettled(account).unwrap();
+        assert_eq!((left.outbox, left.held), (1, 0));
+        assert_eq!(client.sending_hold(conv).unwrap(), None);
+
+        let check = KeyCheckRow {
+            conv,
+            uid: bob.clone(),
+            device_id: [2; 48],
+            kind: CheckKind::Add,
+            signature_key: vec![2],
+            init_key: None,
+            encryption_key: None,
+            binding: None,
+            first_needed: 0,
+            failed: false,
+            repair_at: None,
+            warned: false,
+        };
+        client
+            .store()
+            .write(|tx| tx.note_unchecked(&check))
+            .unwrap();
+        let left = client.unsettled(account).unwrap();
+        assert_eq!((left.outbox, left.held), (1, 1));
+        assert!(!client.is_settled(account).unwrap());
+        assert_eq!(
+            client.sending_hold(conv).unwrap(),
+            Some(SendingHold::KeyCheck { uid: bob.clone() })
+        );
+        client
+            .store()
+            .write(|tx| tx.fail_check(&check, Some(10)))
+            .unwrap();
+        assert_eq!(
+            client.sending_hold(conv).unwrap(),
+            Some(SendingHold::Repair { uid: bob })
+        );
+        assert_eq!(client.unsettled(account).unwrap().held, 1);
+    }
+
     #[test]
     fn unsettled_counts_unlogged_records_and_wants() {
         use crate::store::transfer::WantRange;

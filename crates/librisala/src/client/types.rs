@@ -80,6 +80,10 @@ impl From<crate::store::AccountRow> for Account {
 pub struct Unsettled {
     /// Posts and commits queued, in flight or not yet seen back.
     pub outbox: usize,
+    /// Of `outbox`, the messages queued in conversations whose sending is
+    /// held ([`SendingHold`]). They go once the hold ends: held is not
+    /// failed.
+    pub held: usize,
     /// Welcomes not yet sent (12.8).
     pub welcomes: usize,
     /// Whether the identity has records its log does not hold yet: KEYS
@@ -99,6 +103,26 @@ impl Unsettled {
     pub fn is_empty(&self) -> bool {
         *self == Unsettled::default()
     }
+}
+
+/// Why a conversation sends no messages for now (12.7)
+/// ([`Client::sending_hold`](crate::Client::sending_hold)). Messages
+/// queued meanwhile wait, and go once the hold ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendingHold {
+    /// A leaf of `uid` that this device could not check yet, since it
+    /// waits for the identity's key file: at most 2 hours, after which the
+    /// check fails and the leaf is removed (12.7).
+    KeyCheck {
+        /// The identity of the leaf.
+        uid: Uid,
+    },
+    /// A leaf of `uid` failed its key check, and its removal is still to
+    /// be queued. The removal goes first, then the messages (12.7).
+    Repair {
+        /// The identity of the leaf.
+        uid: Uid,
+    },
 }
 
 #[cfg(test)]
