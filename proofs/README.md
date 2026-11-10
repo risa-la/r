@@ -78,7 +78,10 @@ It checks eight properties:
 | `AtMostOnce` | Resending with a cid never creates a second copy (7.6). |
 | `ConversationGoesOn` | A conversation ends for a device only if an operator dropped one of its mailboxes (10.4). |
 
-The constant `Fixes` turns on proposed spec changes:
+The constant `Fixes` turns on the spec changes that TLC's findings led
+to (below). They were proposals when the model was written, and are in
+the spec since PLAN.md item 66; with `Fixes = {}` the model follows
+draft-03 as it was before them.
 
 | Fix | Change |
 |---|---|
@@ -91,9 +94,9 @@ Run it, one run at a time:
 ```
 cd proofs/delivery
 export JAVA_TOOL_OPTIONS=-Xmx4g   # cap TLC's memory
-tlc -workers 1 -config AsWritten.cfg RisalaDelivery.tla           # the spec as written
-tlc -workers 1 -config ProposedOneDevice.cfg RisalaDelivery.tla   # with all fixes
-tlc -workers 1 -config Proposed.cfg RisalaDelivery.tla            # with all fixes, two devices
+tlc -workers 1 -config AsWritten.cfg RisalaDelivery.tla           # draft-03 before item 66
+tlc -workers 1 -config ProposedOneDevice.cfg RisalaDelivery.tla   # with all fixes, as the spec is now
+tlc -workers 1 -config Proposed.cfg RisalaDelivery.tla            # the same, two devices
 ```
 
 TLC stops at the first property that fails and prints the steps that
@@ -103,8 +106,14 @@ and with several workers, TLC can take most of a machine's memory.
 
 ## Results
 
-Starting from the spec as written (`Fixes = {}`) and turning on one fix
-at a time, TLC finds the three problems below, each a shortest trace
+These results are history: they are for draft-03 as it was before PLAN.md
+item 66, which put the three fixes into the spec (7.4, 7.5, 7.6), with
+the three wordings under "Found while modelling" (7.1, 7.4, 12.9). The
+configuration names keep the old terms: `AsWritten.cfg` is the text
+before item 66, and the `Proposed` ones are the spec as it is now.
+
+Starting from the spec as written then (`Fixes = {}`) and turning on one
+fix at a time, TLC finds the three problems below, each a shortest trace
 with one device, in under 30 seconds. The constants are those of
 `AsWritten.cfg`.
 
@@ -170,16 +179,17 @@ with every fix): the device's post there gets `ERR stale`, and its TOKEN,
 checked against the old mailbox's set, puts the hash back. That needs
 two moves, so the one-device run, with one move, does not cover it.
 
-The Rust code already does what two of the fixes ask: `librisala`
-posts a commit it has built again rather than a new one, and the server
-ends only mailboxes that have not been created, nor had a post, within
-the retention period. Its FETCH handling moves the sync point over a gap
-and goes on applying posts, as in finding 1.
+When the model was written, the Rust code already did what two of the
+fixes ask: `librisala` posts a commit it has built again rather than a
+new one, and the server ends only mailboxes that have not been created,
+nor had a post, within the retention period. `librisala`'s FETCH
+handling moved the sync point over a gap and went on applying posts, as
+in finding 1; item 66 has it stop at the gap.
 
 ### Found while modelling
 
 These came from reading the spec closely for the model. TLC does not
-check them.
+check them. Item 66 put each suggested wording into the spec.
 
 - **FETCH's loop.** 7.4 says to send `FETCH <box> after=F` and repeat
   while the response says `more=1`, but not with what `after`. The
