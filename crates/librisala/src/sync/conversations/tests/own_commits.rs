@@ -496,3 +496,39 @@ fn an_unanswered_commit_goes_again_as_it_was_unless_15_minutes_have_passed() {
     assert_ne!(landed.last(), net.lost.last(), "a new commit");
     assert!(!landed.contains(&net.lost[1]));
 }
+
+/// A device that knows no server time past its commit's `updated` posts
+/// it again as it was (7.6), even long after. If the server's time had
+/// passed it by more than 10 minutes, the copy fails the `updated` check
+/// as it lands (12.3): for this device as for the others, which ignore it.
+/// It lost, and the device makes a new commit from the same intent, rather
+/// than apply its own and split from the group.
+#[test]
+fn a_commit_posted_again_too_late_fails_its_own_checks_as_it_lands() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    net.connect(alice);
+    net.connect(bob);
+    let (a, b) = direct(&mut net, alice, bob);
+    let epoch = net.epoch(alice, a);
+    net.lose_post.insert(bob);
+    queue(&net, bob, b, Intent::default());
+    net.tick();
+    assert_eq!(net.lost.len(), 1, "the POST was lost");
+    // Back 16 minutes on, with no post or PING since: the same commit.
+    net.disconnect(bob);
+    net.advance(16 * MINUTE);
+    net.connect(bob);
+    net.tick();
+    let landed = commit_messages(&net, bob, b);
+    assert!(landed.contains(&net.lost[0]), "posted again as it was");
+    assert_ne!(landed.last(), net.lost.last(), "then a new one");
+    assert_eq!(net.epoch(alice, a), epoch + 1);
+    assert_eq!(net.epoch(bob, b), epoch + 1);
+    net.say(alice, a, "one group");
+    assert!(
+        net.texts(bob, b)
+            .contains(&("alice@example.org".into(), "one group".into()))
+    );
+}

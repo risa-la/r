@@ -1006,6 +1006,24 @@ fn apply_one(
             // Already decided: it lost, and its intent was queued again.
             OutboxKind::Commit if matches!(row.state, OutboxState::Lost | OutboxState::Done) => {}
             OutboxKind::Commit => {
+                // 12.3, 7.6: the device judges its own commit as the others
+                // do, by its post's `t`. One posted again after the server's
+                // time passed its `updated` by more than 10 minutes, which
+                // the device could not see from the server times it knew,
+                // fails the `updated` check wherever it lands: it lost, and
+                // is made again from its intent.
+                if post_epoch == epoch
+                    && let Some(staged) = group.pending_commit()
+                {
+                    let view = mls_group::view(&group, &state, cx.crypto.as_ref());
+                    let own = Sender::Member(group.own_leaf_index());
+                    let commit = risala_mls::checks::CommitView::of(&own, staged);
+                    if let Err(e) = risala_mls::checks::check_commit(&view, &commit, &commit_post) {
+                        tracing::warn!(conv = %conv.id, error = %e, seq = post.seq, "this device's commit fails the group checks as it landed; it lost");
+                        commit_lost(tx, cx, conv, &row)?;
+                        return Ok(applied);
+                    }
+                }
                 if post_epoch == epoch && group.pending_commit().is_some() {
                     let intent = row
                         .intent
