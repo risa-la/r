@@ -137,16 +137,41 @@ group other than its leave commit: no repairs, no weekly fresh leaf
 (12.7), and no commits of others' proposals. Others' devices make
 those.
 
+A leave keeps trying. A device that is offline, or whose posts do not
+go through, tries again each time it is online, and shows the
+conversation as leaving until it has left. Its leave commit is posted
+again as 7.6 says, or made again in the new epoch if another commit
+won. A device that falls behind past retention before then can no
+longer follow the group (7.5), and its leave is lost: it leaves
+locally (below).
+
+A device MUST NOT post a leave commit that fails its own group checks
+(12.7). If its leave commit fails them, it does not give up the leave:
+it leaves locally (below), SHOULD still post its SelfRemove if it holds
+the group's current epoch, so that others' devices remove its leaf, and
+logs a warning with the check that failed.
+
 Where nobody else would commit its leave, a device leaves **locally**,
 with no SelfRemove: in a group that has no leaf of another identity,
 such as a room that everyone else has left, and in a direct
-conversation that the other participant has left (below). In a group
-that has no leaf of another identity, it first commits, as its leave
-commit, the removal of the leaves of its identity's other devices, if
-there are any, and waits until that commit has won (7.2). Otherwise one
-of them would later replace its leaf as stale, and so Welcome the
-device back (12.7). It then stops following the mailbox with UNFOLLOW
-(7.1), and deletes the group's keys and the conversation.
+conversation that the other participant has left (below). A device
+that can no longer follow a group (7.5) leaves it locally too, if it
+was leaving it or its user leaves it then, since it can neither commit
+nor post there. In a group that has no leaf of another identity,
+whatever its kind, public rooms included, a device that leaves locally
+first commits, as its leave commit, the removal of the leaves of its
+identity's other devices, if there are any, and waits until that
+commit has won (7.2). So its identity leaves with all its devices, as
+in any leave, and, outside public rooms, none of them later replaces
+its leaf as stale, and so Welcomes the device back (12.7). It then
+stops following the mailbox with UNFOLLOW (7.1), and deletes the
+group's keys and the conversation.
+
+A device that leaves locally a group it cannot follow cannot remove its
+identity's other leaves first. It forgets the group as above, keeps a
+mark that it has left the conversation, and ignores later Welcomes to
+that group (12.8), such as one from a device of its own identity that
+replaces its leaf (12.7).
 
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
 private room, coming back always takes a new invitation. In a direct

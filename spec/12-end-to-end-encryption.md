@@ -816,6 +816,10 @@ A device that sees a commit by a leaf of its own identity that removes
 another leaf of its identity, whose device is still current, without
 adding that device again in the same commit, tells the user, as for
 ALERT (4.5): it may be a stolen device racing its own removal (4.8).
+This holds for a leave commit too (6.1), which removes every other leaf
+of the identity. A removed device cannot tell a leave from a theft, so
+it words the alert for both, for example: "your device X left C and
+removed this device; if that wasn't you, it may be stolen".
 
 **Key checks.** Outside public rooms, after it applies a commit, a
 device checks:
@@ -1194,7 +1198,8 @@ if that is later; but never later than the `t` of the commit's post.
   device that fell behind joins again by itself (6.1). A device that
   leaves locally therefore first removes the leaves of its identity's
   other devices (6.1), so that none of them replaces its own leaf, and
-  so brings it back.
+  so brings it back. One that leaves a group it can no longer follow
+  cannot, and ignores such a Welcome instead (6.1).
 - **By anyone, after 35 days.** A leaf is **stale** if its activity time
   is more than 35 days before the group's median activity time. The
   median is taken over every leaf that carries a profile, as the group
