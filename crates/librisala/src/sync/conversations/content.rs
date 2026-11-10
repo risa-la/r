@@ -392,10 +392,12 @@ fn self_line(
             seq,
         } => {
             // 12.7: replace the sending device's leaf in that group, if
-            // this device holds it.
-            if let Some(mb) = tx.mailbox(cx.account, mailbox)? {
+            // this device holds it. The box may be one the group had
+            // before a move, which a device that lost the group still
+            // names (7.8).
+            if let Some(conv) = tx.conversation_by_box(cx.account, mailbox)? {
                 applied.notes.push(Note::OwnResync {
-                    conv: mb.conv,
+                    conv,
                     seq: seq.get(),
                     device: leaf.device_id,
                 });

@@ -668,3 +668,91 @@ fn a_lost_public_room_the_user_leaves_is_not_joined_again() {
     assert_eq!(posts(&net), before, "no join proposal");
     assert!(!net.devices[bob].engine.stuck.contains_key(&b));
 }
+
+/// 12.7: own devices keep every box the group has had, so a lost device's
+/// RESYNC that names the box from before a move still finds the group,
+/// even once the old mailbox is no longer followed (7.8).
+#[test]
+fn a_resync_naming_a_box_from_before_a_move_finds_the_group() {
+    let mut net = Net::new();
+    let laptop = net.device("laptop", "alice@example.org");
+    let phone = net.device_of("phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    let carol = net.device("carol", "carol@example.com");
+    for d in [laptop, phone, bob, carol] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    net.same_conv(phone, laptop, me).expect("the phone is in");
+    let a = net
+        .job(
+            laptop,
+            Job::PrivateRoom {
+                name: "team".into(),
+                members: vec![
+                    "bob@example.net".parse().unwrap(),
+                    "carol@example.com".parse().unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let p = net.same_conv(phone, laptop, a).expect("the phone is in");
+    let old_box = current_box(&net, phone, p);
+    // The phone goes away. The laptop removes Carol, and the group moves
+    // (7.8).
+    net.disconnect(phone);
+    let carol_device: [u8; 48] = net.devices[carol].device_id.clone().try_into().unwrap();
+    let now = net.clock.now().unix_millis();
+    net.write(laptop, |tx| {
+        group::queue_intent(
+            tx,
+            a,
+            &Intent {
+                remove: vec![("carol@example.com".into(), Some(carol_device))],
+                ..Intent::default()
+            },
+            now,
+        )?;
+        Ok(())
+    });
+    net.tick();
+    assert_ne!(current_box(&net, laptop, a), old_box, "the group moved");
+    // A day on, the laptop no longer follows the old mailbox, and its posts
+    // expire before the phone is back.
+    for _ in 0..25 {
+        net.advance(60 * 60 * 1000);
+    }
+    assert!(
+        net.devices[laptop]
+            .store
+            .mailbox_rows(a)
+            .unwrap()
+            .iter()
+            .all(|m| m.mailbox != old_box),
+        "no longer followed"
+    );
+    let head = net.server.posts(&old_box).last().unwrap().0;
+    net.server.expire(&old_box, head);
+    let before = net.epoch(laptop, a);
+    // The phone finds the gap, and asks with RESYNC naming the old box: the
+    // laptop finds the group by it and replaces the phone's leaf.
+    net.connect(phone);
+    net.tick();
+    assert!(cannot_follow(&net, phone, p));
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert!(
+        net.epoch(laptop, a) > before,
+        "the laptop replaced the phone's leaf"
+    );
+    assert_eq!(net.state(phone, p), ConvState::Active);
+    assert_eq!(net.epoch(phone, p), net.epoch(laptop, a));
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    net.say(bob, b, "welcome back");
+    assert!(
+        net.texts(phone, p)
+            .contains(&("bob@example.net".into(), "welcome back".into()))
+    );
+}
