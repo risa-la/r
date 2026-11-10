@@ -253,7 +253,7 @@ enum { reserved(0), pairwise(1), epochal(2), (255) } ConfirmMode;
 enum { reserved(0), none(1), read(2), write(3), (255) } GuestMode;
 enum { reserved(0), all(1), mods(2), (255) } SendMode;
 
-opaque Uid<V>;
+opaque Uid<V>;                   // a uid in lower case (3.5)
 
 struct {
     uint8 version;               // 1
@@ -286,19 +286,23 @@ struct {
   compared byte for byte (12.7).
 - In a room, `owners` holds at least one uid. In a direct conversation
   the lists are empty. Every uid in `owners`, `mods` and `bans` is an
-  identity, not a guest. A uid is in at most one of `owners` and `mods`,
-  and appears at most once in each of `owners`, `mods` and `bans`.
-  `bans` holds at most 10,000 uids, the member limit of the largest
-  room (6.1).
+  identity, not a guest, written in lower case as in a credential
+  (12.3). A uid is in at most one of `owners` and `mods`, and appears
+  at most once in each of `owners`, `mods` and `bans`. `bans` holds at
+  most 10,000 uids, the member limit of the largest room (6.1).
+- The encoded RisalaConversation is at most 512 KiB (524288 bytes).
+  This bounds the three lists together, whatever their uids' lengths:
+  10,000 bans of the longest uids would take about 2.9 MB.
 
-The rules on the lists, like the rest of this section, are format rules:
-an extension that breaks one is not well formed. Everyone who reads an
-extension checks them, wherever it comes from: a device that joins by
-Welcome or by external commit (12.7), a device that applies a commit
-(12.7) or checks its own before posting it, and the server, in a new
-public room's CREATE (5.2) and in every commit it checks in a public
-room (12.6). Since `bans` may be long, implementations find repeats with
-a hash set or by sorting, not by comparing every pair.
+The rules on the lists and the size, like the rest of this section, are
+format rules: an extension that breaks one, such as one with a uid in
+upper case, is not well formed. Everyone who reads an extension checks
+them, wherever it comes from: a device that joins by Welcome or by
+external commit (12.7), a device that applies a commit (12.7) or checks
+its own before posting it, and the server, in a new public room's CREATE
+(5.2) and in every commit it checks in a public room (12.6). Since
+`bans` may be long, implementations find repeats with a hash set or by
+sorting, not by comparing every pair.
 
 The group context has exactly two extensions: `required_capabilities`
 first, which lists the extension types `0xF2A1`, `0xF2A2` and `0xF2A3`,
@@ -2049,14 +2053,14 @@ BLOB <hash> <size> [box=<box> token=<token>]
   stores there only blobs that belong to the account, such as backups
   and history transfers (12.13), and never one that a post or a Welcome
   names (4.1).
-- So a device that holds no send token the server can check cannot
-  store a blob for a group: one that makes an external commit (12.7),
-  which is not a member yet, and one that creates a public room (5.2),
-  whose mailbox does not exist yet. An external commit with its
-  GroupInfo, and a new public room's GroupInfo and tree, MUST fit in
-  the line that carries them (2.3). A device makes an external commit
-  only if it fits, and otherwise joins by proposal (12.7). A line that
-  does not fit gets `ERR too-long`. The server refuses a blob-ref in their place with
+- So a device that holds no send token the server can check cannot store
+  a blob for a group: one that makes an external commit (12.7), which is
+  not a member yet, and one that creates a public room (5.2), whose
+  mailbox does not exist yet. An external commit with its GroupInfo, and
+  a new public room's GroupInfo and tree, MUST fit in the line that
+  carries them (2.3). A device makes an external commit only if it fits,
+  and otherwise joins by proposal (12.7). A line that does not fit gets
+  `ERR too-long`. The server refuses a blob-ref in their place with
   `ERR bad-syntax`: for `<groupinfo>` or `<tree>` in CREATE, and for
   `<message>` or `groupinfo` in a POST with the token `-`, which an
   external commit or an external proposal has (5.2).
