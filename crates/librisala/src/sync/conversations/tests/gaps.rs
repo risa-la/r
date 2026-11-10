@@ -543,6 +543,41 @@ fn a_lost_device_that_leaves_has_its_own_devices_leave_and_nobody_is_welcomed_ba
     );
 }
 
+/// 6.1: a device that left for good still accepts an invitation from
+/// another member, as after any leave.
+#[test]
+fn a_device_that_left_for_good_accepts_an_invitation_from_another_member() {
+    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
+    let (p, l) = phone_lost_and_left(&mut net, laptop, phone, bob, b);
+    let alice = net.devices[phone].uid.clone();
+    net.connect(laptop);
+    for _ in 0..5 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
+    // Bob invites Alice again: both her devices are back.
+    net.job(
+        bob,
+        Job::Invite {
+            conv: b,
+            uids: vec![alice.clone()],
+        },
+    )
+    .unwrap();
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(phone, p), ConvState::Active);
+    assert_eq!(net.state(laptop, l), ConvState::Active);
+    assert!(!net.devices[phone].store.departed(p, &alice).unwrap());
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    net.say(bob, b, "welcome back");
+    assert!(
+        net.texts(phone, p)
+            .contains(&("bob@example.net".into(), "welcome back".into()))
+    );
+}
+
 /// 6.1, 7.5: a device whose SelfRemove waits for a commit, and that finds
 /// posts expired unread, leaves locally rather than being lost: it is
 /// marked departed and told it left, not that it cannot follow.

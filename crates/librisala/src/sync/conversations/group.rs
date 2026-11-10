@@ -472,9 +472,10 @@ pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()>
 /// Leaves locally ([`leave_locally`]) a group in which this device's leaf
 /// may stay (6.1, 7.5): one it can no longer follow, or one whose leave
 /// commit failed its own checks. The own identity is marked departed, so
-/// that the device refuses Welcomes back into the group
-/// ([`join_welcome`]): none of its leaves could be removed first, and a
-/// device that replaces the stale leaf would otherwise bring it back. Where its identity's other devices remain in the
+/// that the device refuses Welcomes back into the group from its own
+/// identity's devices ([`join_welcome`]): none of its leaves could be
+/// removed first, and one that replaces the stale leaf would otherwise
+/// bring it back. Where its identity's other devices remain in the
 /// group, it tells them to leave too ([`tell_own_devices`]).
 pub(crate) fn leave_for_good(
     tx: &mut Tx<'_>,
@@ -1751,6 +1752,20 @@ fn continues(
     Ok(())
 }
 
+/// Whether a Welcome into `group` comes from a device of the identity
+/// `own` (6.1): its epoch was started by a leaf of `own`, which signed the
+/// Welcome's GroupInfo. A signer that cannot be found counts as one, so
+/// that such a Welcome is refused.
+fn welcomed_by_own(group: &MlsGroup, state: &EpochState, own: &Uid) -> bool {
+    let Some(signer) = state.started_by else {
+        return true;
+    };
+    tree_leaves(group)
+        .into_iter()
+        .find(|l| l.leaf == signer)
+        .is_none_or(|l| l.uid == *own)
+}
+
 /// What [`join_welcome`] did.
 #[derive(Debug)]
 pub(crate) enum Joined {
@@ -1829,10 +1844,14 @@ pub(crate) fn join_welcome(
     }
     if let Some(existing) = tx.conversation_by_group(cx.account, group.group_id().as_slice())? {
         // 6.1, 7.5: a group this device left by itself, its leaf perhaps
-        // still in it, is left for good: a device that replaced that leaf
-        // does not bring it back. A public room is joined again only by
-        // proposal, which the user asks for.
-        if existing.kind != ConvKind::Public && left_for_good(tx, &existing, cx.uid)? {
+        // still in it, is left for good: a device of its own identity that
+        // replaced that leaf does not bring it back. An invitation from
+        // another member is accepted, as after any leave. A public room is
+        // joined again only by proposal, which the user asks for.
+        if existing.kind != ConvKind::Public
+            && left_for_good(tx, &existing, cx.uid)?
+            && welcomed_by_own(&group, &joined.state, cx.uid)
+        {
             mls_group::forget_group(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
             tx.used_key_package(cx.account, &reference)?;
             return Ok(Joined::Refused(
