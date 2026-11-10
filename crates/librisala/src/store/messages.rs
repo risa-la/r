@@ -133,8 +133,9 @@ CREATE INDEX outbox_conv ON outbox (conv, state);
 -- risala-mls's SenderLog. pseudonym is the pinned one; last_counter and
 -- last_id the highest counter seen and its message; gaps the counters
 -- missing below it, as pairs of u64; left_group whether it posted a
--- SelfRemove; removed_in the newest epoch a commit removing a leaf at this
--- index ended.
+-- SelfRemove; removals the epochs that commits removing a leaf at this
+-- index ended, oldest first, as u64s: the newest, and while a mailbox the
+-- group moved from is followed, the newest before that move (12.9).
 CREATE TABLE sender_logs (
     conv         INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     leaf         INTEGER NOT NULL,
@@ -144,11 +145,12 @@ CREATE TABLE sender_logs (
     last_id      BLOB,
     gaps         BLOB NOT NULL,
     left_group   INTEGER NOT NULL DEFAULT 0,
-    removed_in   INTEGER,
+    removals     BLOB NOT NULL DEFAULT x'',
     PRIMARY KEY (conv, leaf)
 ) WITHOUT ROWID;
 
--- The t of the commits that ended recent epochs (12.9, late messages).
+-- The t of the commits that ended recent epochs (12.9, late messages),
+-- and of the epochs before each move whose old mailbox is followed.
 -- applied is when, by the device's clock, it applied that commit.
 CREATE TABLE epoch_ends (
     conv    INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -158,8 +160,9 @@ CREATE TABLE epoch_ends (
     PRIMARY KEY (conv, epoch)
 ) WITHOUT ROWID;
 
--- The derived pseudonyms of the leaves of recent past epochs, outside
--- public rooms (7.3), to check their late messages (12.9).
+-- The derived pseudonyms of the leaves of recent past epochs, and of the
+-- epochs before each move whose old mailbox is followed, outside public
+-- rooms (7.3), to check their late messages (12.9).
 CREATE TABLE epoch_pseudonyms (
     conv      INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     epoch     INTEGER NOT NULL,
@@ -1367,6 +1370,35 @@ fn encode_gaps(gaps: &[(u64, u64)]) -> Vec<u8> {
         .collect()
 }
 
+/// A list of epochs as a JSON array, for `json_each` in SQL.
+fn json_list(epochs: &[u64]) -> String {
+    let items: Vec<String> = epochs.iter().map(u64::to_string).collect();
+    format!("[{}]", items.join(","))
+}
+
+fn encode_removals(removals: &[u64]) -> Vec<u8> {
+    removals.iter().flat_map(|e| e.to_be_bytes()).collect()
+}
+
+fn decode_removals(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_be_bytes(*c))
+        .collect()
+}
+
+impl MessageLog<'_> {
+    /// The epochs that [`MessageHistory::moves`] keep, as a list for SQL.
+    ///
+    /// [`MessageHistory::moves`]: risala_mls::message::MessageHistory::moves
+    fn moved_epochs(&self) -> Vec<u64> {
+        use risala_mls::message::MessageHistory as _;
+        self.moves().iter().flat_map(|m| m.epochs()).collect()
+    }
+}
+
 fn decode_gaps(bytes: &[u8]) -> Vec<(u64, u64)> {
     bytes
         .as_chunks::<16>()
@@ -1417,13 +1449,13 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             Option<Vec<u8>>,
             Vec<u8>,
             bool,
-            Option<i64>,
+            Vec<u8>,
             Option<i64>,
         );
         let row: Option<Row> = self
             .conn
             .query_row(
-                "SELECT pseudonym, last_counter, last_id, gaps, left_group, removed_in, pin_period
+                "SELECT pseudonym, last_counter, last_id, gaps, left_group, removals, pin_period
                  FROM sender_logs WHERE conv = ?1 AND leaf = ?2",
                 params![self.conv.0, leaf.u32()],
                 |r| {
@@ -1440,7 +1472,7 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             )
             .optional()
             .unwrap_or_default();
-        let Some((pseudonym, counter, id, gaps, left, removed_in, pin_period)) = row else {
+        let Some((pseudonym, counter, id, gaps, left, removals, pin_period)) = row else {
             return risala_mls::message::SenderLog::default();
         };
         let fixed16 = |b: Vec<u8>| <[u8; 16]>::try_from(b.as_slice()).ok();
@@ -1455,7 +1487,7 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             },
             gaps: decode_gaps(&gaps),
             left,
-            removed_in: removed_in.map(|e| e as u64),
+            removals: decode_removals(&removals),
         }
     }
 
@@ -1468,12 +1500,12 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
             .conn
             .execute(
                 "INSERT INTO sender_logs (conv, leaf, pseudonym, last_counter, last_id, gaps,
-                                          left_group, removed_in, pin_period)
+                                          left_group, removals, pin_period)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (conv, leaf) DO UPDATE SET pseudonym = excluded.pseudonym,
                     last_counter = excluded.last_counter, last_id = excluded.last_id,
                     gaps = excluded.gaps, left_group = excluded.left_group,
-                    removed_in = excluded.removed_in, pin_period = excluded.pin_period",
+                    removals = excluded.removals, pin_period = excluded.pin_period",
                 params![
                     self.conv.0,
                     leaf.u32(),
@@ -1482,7 +1514,7 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
                     log.last.map(|(_, id)| id.as_bytes().to_vec()),
                     encode_gaps(&log.gaps),
                     log.left,
-                    log.removed_in.map(|e| e as i64),
+                    encode_removals(&log.removals),
                     log.pin_period.map(|p| p as i64),
                 ],
             )
@@ -1566,16 +1598,48 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
                     .map(drop);
             }
         }
-        // A device holds the secrets of at most 2 past epochs (12.9).
+        // A device holds the secrets of at most 2 past epochs (12.9),
+        // besides those of the moves it follows.
+        let kept = self.moved_epochs();
         let r = r.and_then(|_| {
             self.conn
                 .execute(
-                    "DELETE FROM epoch_pseudonyms WHERE conv = ?1 AND epoch + 2 < ?2",
-                    params![self.conv.0, epoch],
+                    "DELETE FROM epoch_pseudonyms WHERE conv = ?1 AND epoch + 2 < ?2
+                       AND epoch NOT IN (SELECT value FROM json_each(?3))",
+                    params![self.conv.0, epoch, json_list(&kept)],
                 )
                 .map(drop)
         });
         self.keep(r);
+    }
+
+    fn moves(&self) -> Vec<risala_mls::message::Moved> {
+        // As apply_one judges a post in a mailbox the group moved from:
+        // as of the epoch the next mailbox starts at (12.9).
+        let mut stmt = match self.conn.prepare_cached(
+            "SELECT o.first_epoch,
+                    (SELECT min(n.first_epoch) FROM mailboxes n
+                     WHERE n.conv = o.conv AND n.first_epoch > o.first_epoch)
+             FROM mailboxes o WHERE o.conv = ?1 AND o.current = 0
+             ORDER BY o.first_epoch",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![self.conv.0], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+        });
+        let Ok(rows) = rows else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| match r {
+            Ok((from, Some(to))) => Some(risala_mls::message::Moved {
+                from: from as u64,
+                to: to as u64,
+            }),
+            _ => None,
+        })
+        .collect()
     }
 
     fn set_epoch_end(&mut self, epoch: u64, t: risala_proto::time::Timestamp) {
@@ -1587,10 +1651,12 @@ impl risala_mls::message::MessageHistory for MessageLog<'_> {
                 params![self.conv.0, epoch as i64, t.unix_millis() as i64],
             )
             .and_then(|_| {
-                // The rules of 12.9 look back two epochs; keep 16.
+                // The rules of 12.9 look back two epochs; keep 16, and
+                // those of the moves followed.
                 self.conn.execute(
-                    "DELETE FROM epoch_ends WHERE conv = ?1 AND epoch + 16 < ?2",
-                    params![self.conv.0, epoch as i64],
+                    "DELETE FROM epoch_ends WHERE conv = ?1 AND epoch + 16 < ?2
+                       AND epoch NOT IN (SELECT value FROM json_each(?3))",
+                    params![self.conv.0, epoch as i64, json_list(&self.moved_epochs())],
                 )
             })
             .map(drop);

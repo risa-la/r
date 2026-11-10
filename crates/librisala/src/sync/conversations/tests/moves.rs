@@ -2,11 +2,12 @@
 //! move.
 
 use risala_mls::framing::ContentType;
+use risala_mls::message::{MessageHistory, Moved, SenderLog};
 use risala_proto::command::Command;
 
 use super::*;
 use crate::store::conversations::MailboxRow;
-use crate::store::messages::OutboxState;
+use crate::store::messages::{MessageLog, OutboxState};
 
 /// Alice's private room with Bob and Carol.
 fn team() -> (Net, usize, usize, usize, ConversationId) {
@@ -281,4 +282,128 @@ fn a_late_message_in_the_old_mailbox_is_judged_as_of_the_move() {
         "{:?}",
         net.texts(bob, b)
     );
+}
+
+/// Two devices that apply a late post in the old mailbox and the new
+/// mailbox's commits in different orders agree on reading it: each keeps
+/// the secrets of the old mailbox's last epochs while it follows it, and
+/// judges the post as of the move (12.9).
+#[test]
+fn devices_agree_on_a_late_message_whatever_they_apply_first() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    let carol = net.device("carol", "carol@example.com");
+    let dave = net.device("dave", "dave@example.com");
+    let erin = net.device("erin", "erin@example.net");
+    for d in [alice, bob, carol, dave, erin] {
+        net.connect(d);
+    }
+    let a = net
+        .job(
+            alice,
+            Job::PrivateRoom {
+                name: "team".into(),
+                members: vec![
+                    "bob@example.net".parse().unwrap(),
+                    "carol@example.com".parse().unwrap(),
+                    "dave@example.com".parse().unwrap(),
+                    "erin@example.net".parse().unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    let c = net.same_conv(carol, alice, a).unwrap();
+    let e = net.same_conv(erin, alice, a).unwrap();
+    let old_box = mailboxes(&net, bob, b)[0].mailbox;
+    // Carol writes a message that the server holds back.
+    let late = write_unposted(&mut net, carol, c, "late but readable");
+    // Alice removes Dave, then moves the group (7.8).
+    let dave_device: [u8; 48] = net.devices[dave].device_id.clone().try_into().unwrap();
+    let now = net.clock.now().unix_millis();
+    net.write(alice, |tx| {
+        group::queue_intent(
+            tx,
+            a,
+            &Intent {
+                remove: vec![("dave@example.com".into(), Some(dave_device))],
+                ..Intent::default()
+            },
+            now,
+        )?;
+        Ok(())
+    });
+    net.tick();
+    let moved = mailboxes(&net, bob, b)
+        .into_iter()
+        .find(|m| m.current)
+        .unwrap();
+    assert_ne!(moved.mailbox, old_box, "the group moved");
+    assert_eq!(net.epoch(erin, e), moved.first_epoch);
+    // Only now does the server hand out Carol's message, in the old
+    // mailbox. Erin fetches it at once, two epochs after its own.
+    net.server.inject_post(&old_box, now, late);
+    let readable = (
+        "carol@example.com".to_owned(),
+        "late but readable".to_owned(),
+    );
+    net.disconnect(erin);
+    net.connect(erin);
+    net.tick();
+    assert!(
+        net.texts(erin, e).contains(&readable),
+        "{:?}",
+        net.texts(erin, e)
+    );
+    // Bob first applies two more commits, in the new mailbox, and only
+    // then fetches the old one. As of the move, the message is as readable
+    // for him as for Erin.
+    for (d, conv) in [(carol, c), (bob, b)] {
+        let now = net.clock.now().unix_millis();
+        net.write(d, |tx| {
+            group::queue_intent(tx, conv, &Intent::default(), now)?;
+            Ok(())
+        });
+        net.tick();
+    }
+    assert_eq!(net.epoch(bob, b), moved.first_epoch + 2);
+    assert!(!net.texts(bob, b).contains(&readable));
+    net.disconnect(bob);
+    net.connect(bob);
+    net.tick();
+    assert!(
+        net.texts(bob, b).contains(&readable),
+        "{:?}",
+        net.texts(bob, b)
+    );
+
+    // The store lists the move while the old mailbox is followed, and keeps
+    // a slot's removals as risala-mls gives them; a day on, the move goes.
+    let moves = |net: &Net| net.write(bob, |tx| Ok(MessageLog::new(tx.conn(), b).moves()));
+    assert_eq!(
+        moves(&net),
+        vec![Moved {
+            from: 0,
+            to: moved.first_epoch
+        }]
+    );
+    let removals = net.write(bob, |tx| {
+        let leaf = risala_mls::openmls::prelude::LeafNodeIndex::new(40);
+        let mut log = MessageLog::new(tx.conn(), b);
+        log.set_sender(
+            leaf,
+            SenderLog {
+                removals: vec![3, 9],
+                ..SenderLog::default()
+            },
+        );
+        let removals = log.sender(leaf).removals;
+        log.finish()?;
+        Ok(removals)
+    });
+    assert_eq!(removals, vec![3, 9]);
+    net.advance(24 * 60 * 60 * 1000 + 60_000);
+    assert!(moves(&net).is_empty());
 }

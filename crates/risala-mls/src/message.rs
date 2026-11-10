@@ -41,7 +41,11 @@
 //! what [`group::apply_commit`] or [`group::merge_own_commit`] returned,
 //! the commit's `t` and its own clock; after applying any post,
 //! [`expire_past_epochs`]; and from time to time, whatever arrives,
-//! [`expire_past_epochs_by_clock`].
+//! [`expire_past_epochs_by_clock`]. After a move (7.8), the history lists
+//! the mailboxes the group moved from that the device still follows
+//! ([`MessageHistory::moves`]); the caller calls [`expire_past_epochs`]
+//! once it has noted the move, so that the old mailbox's last epochs stay
+//! for as long as it follows it.
 //!
 //! **Franking makes messages key-committing.** ChaCha20-Poly1305 is not
 //! key-committing, so without the frank a sender could make one ciphertext
@@ -56,9 +60,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use openmls::group::{MlsGroup, PastEpochDeletion};
+use openmls::group::{MlsGroup, PastEpochDeletionPolicy};
 use openmls::prelude::{LeafNodeIndex, Proposal, Sender, StagedCommit};
 use openmls::storage::OpenMlsProvider;
 use risala_proto::content::{
@@ -450,10 +454,69 @@ pub struct SenderLog {
     pub gaps: Vec<(u64, u64)>,
     /// Whether the leaf has posted a SelfRemove (12.9).
     pub left: bool,
+    /// The epochs that commits removing a leaf at this index ended, oldest
+    /// first. A message of the newest such epoch or earlier from this
+    /// index is from a removed leaf (12.9, late messages). Older removals
+    /// are kept while a mailbox the group moved from is followed
+    /// ([`MessageHistory::moves`]): a late post there is judged by the
+    /// newest removal before the move, even if the index was used again
+    /// and removed again after it.
+    pub removals: Vec<u64>,
+}
+
+impl SenderLog {
     /// The newest epoch that a commit removing a leaf at this index ended.
-    /// A message of that epoch or earlier from this index is from a
-    /// removed leaf (12.9, late messages).
-    pub removed_in: Option<u64>,
+    pub fn removed_in(&self) -> Option<u64> {
+        self.removals.last().copied()
+    }
+
+    /// The newest epoch that a commit removing a leaf at this index ended,
+    /// among those before a move that created epoch `moved` (7.8, 12.9).
+    pub fn removed_before(&self, moved: u64) -> Option<u64> {
+        self.removals.iter().rev().copied().find(|r| *r < moved)
+    }
+}
+
+/// A mailbox the group moved away from, which the device still follows,
+/// for a day after the move (7.8). A post there that comes after the move
+/// is judged as of the move (12.9), so the device keeps what that needs
+/// for as long as it follows the mailbox: the secrets of the epochs before
+/// the move, and the removals before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Moved {
+    /// The first epoch whose posts the mailbox holds: the epoch of the move
+    /// to it, or 0.
+    pub from: u64,
+    /// The epoch that the move away from it created.
+    pub to: u64,
+}
+
+impl Moved {
+    /// The past epochs whose messages a post in the mailbox may still
+    /// carry, as of the move: the last two before it (12.9), and none
+    /// before the mailbox's first.
+    pub fn epochs(&self) -> std::ops::Range<u64> {
+        self.to.saturating_sub(MAX_PAST_EPOCHS).max(self.from)..self.to
+    }
+}
+
+/// The past epochs that the mailboxes in `moves` keep (12.9).
+fn moved_epochs(moves: &[Moved]) -> BTreeSet<u64> {
+    moves.iter().flat_map(Moved::epochs).collect()
+}
+
+/// Drops the removals of a leaf's log that no rule needs any more: the
+/// newest is kept, and for each move in `moves`, the newest before it
+/// (12.9).
+fn prune_removals(removals: &mut Vec<u64>, moves: &[Moved]) {
+    let newest = removals.last().copied();
+    let needed: BTreeSet<u64> = moves
+        .iter()
+        .filter_map(|m| removals.iter().rev().copied().find(|r| *r < m.to))
+        .chain(newest)
+        .collect();
+    removals.retain(|r| needed.contains(r));
+    removals.dedup();
 }
 
 /// What a device remembers about a group's messages, for the checks of
@@ -482,8 +545,17 @@ pub trait MessageHistory {
     /// outside public rooms (7.3), if the device kept that epoch's.
     fn epoch_pseudonym(&self, epoch: u64, leaf: LeafNodeIndex) -> Option<Pseudonym>;
     /// Keeps the pseudonyms of an epoch that has ended, for as long as the
-    /// device keeps its secrets (12.9). Older ones may go.
+    /// device keeps its secrets (12.9). Older ones may go, but not those of
+    /// the epochs that [`Self::moves`] keep.
     fn set_epoch_pseudonyms(&mut self, pseudonyms: EpochPseudonyms);
+    /// The mailboxes the group moved away from that the device still
+    /// follows (7.8), oldest first. While it does, the device keeps the
+    /// secrets of the epochs before each move ([`Moved::epochs`]), their
+    /// ends and pseudonyms, and the removals before it, so that it judges
+    /// a late post there as of the move however many commits it has
+    /// applied since (12.9). [`MessageHistory::set_epoch_end`] keeps those
+    /// epochs' ends too.
+    fn moves(&self) -> Vec<Moved>;
 
     /// Notes a commit the device applied, at `now` by its own clock, whose
     /// post has `t`, from what applying it returned. The logs of the leaves
@@ -495,11 +567,15 @@ pub trait MessageHistory {
         self.set_epoch_end(ended_epoch, t);
         self.set_epoch_applied(ended_epoch, now);
         self.set_epoch_pseudonyms(applied.pseudonyms.clone());
+        let moves = self.moves();
         for &leaf in &applied.removed {
+            let mut removals = self.sender(leaf).removals;
+            removals.push(ended_epoch);
+            prune_removals(&mut removals, &moves);
             self.set_sender(
                 leaf,
                 SenderLog {
-                    removed_in: Some(ended_epoch),
+                    removals,
                     ..SenderLog::default()
                 },
             );
@@ -526,6 +602,15 @@ pub struct MemoryHistory {
     epoch_ends: BTreeMap<u64, Timestamp>,
     epoch_applied: BTreeMap<u64, Timestamp>,
     pseudonyms: BTreeMap<u64, EpochPseudonyms>,
+    moves: Vec<Moved>,
+}
+
+impl MemoryHistory {
+    /// Sets the mailboxes the group moved away from that the device still
+    /// follows ([`MessageHistory::moves`]).
+    pub fn set_moves(&mut self, moves: Vec<Moved>) {
+        self.moves = moves;
+    }
 }
 
 impl MessageHistory for MemoryHistory {
@@ -551,10 +636,12 @@ impl MessageHistory for MemoryHistory {
 
     fn set_epoch_end(&mut self, epoch: u64, t: Timestamp) {
         self.epoch_ends.insert(epoch, t);
-        // Only the last few are ever needed (MAX_PAST_EPOCHS).
-        while self.epoch_ends.len() > 16 {
-            self.epoch_ends.pop_first();
-        }
+        // Only the last few are ever needed (MAX_PAST_EPOCHS), and those
+        // of the moves followed.
+        let kept = moved_epochs(&self.moves);
+        let oldest = epoch.saturating_sub(16);
+        self.epoch_ends
+            .retain(|e, _| *e >= oldest || kept.contains(e));
     }
 
     fn epoch_applied(&self, epoch: u64) -> Option<Timestamp> {
@@ -575,8 +662,14 @@ impl MessageHistory for MemoryHistory {
     fn set_epoch_pseudonyms(&mut self, pseudonyms: EpochPseudonyms) {
         // Messages of at most MAX_PAST_EPOCHS past epochs are read (12.9).
         let oldest = pseudonyms.epoch.saturating_sub(MAX_PAST_EPOCHS - 1);
+        let kept = moved_epochs(&self.moves);
         self.pseudonyms.insert(pseudonyms.epoch, pseudonyms);
-        self.pseudonyms.retain(|epoch, _| *epoch >= oldest);
+        self.pseudonyms
+            .retain(|epoch, _| *epoch >= oldest || kept.contains(epoch));
+    }
+
+    fn moves(&self) -> Vec<Moved> {
+        self.moves.clone()
     }
 }
 
@@ -641,18 +734,39 @@ pub fn past_epoch_readable(
 /// Deletes the secrets of every past epoch that a post with `t` puts past
 /// the limits of 12.9, with the keys kept for its skipped messages. Call it
 /// after applying each post, of any kind; [`receive`] calls it itself.
+/// `as_of` is [`PostInfo::as_of`]: for a post in a mailbox the group moved
+/// away from, the epoch the move created.
 ///
 /// So a device holds the secrets of at most 2 past epochs, and of none for
-/// more than an hour after the commit that ended it.
+/// more than an hour after the commit that ended it, besides those of the
+/// mailboxes the group moved away from ([`MessageHistory::moves`]). Those
+/// are judged by their own mailbox's order alone, as of the move: only a
+/// post there deletes them, by the same limits counted from the move, and
+/// otherwise they go once the device stops following the mailbox (12.9).
+/// So every device decides alike whether it can read a late post there,
+/// whatever it applied in the new mailbox first.
 pub fn expire_past_epochs<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
     history: &impl MessageHistory,
     t: Timestamp,
+    as_of: Option<u64>,
 ) -> Result<(), GroupError<P::StorageError>> {
+    let moves = history.moves();
+    if let Some(moved) = as_of {
+        let theirs: BTreeSet<u64> = moves
+            .iter()
+            .filter(|m| m.to == moved)
+            .flat_map(Moved::epochs)
+            .collect();
+        return keep_past_epochs(provider, group, &moves, |epoch| {
+            !theirs.contains(&epoch)
+                || past_epoch_readable(epoch, moved, t, history.epoch_end(epoch))
+        });
+    }
     let current = group.epoch().as_u64();
-    // Past epochs are stored newest last, and end in order, so the ones
-    // to keep are the newest `keep`.
+    let kept = moved_epochs(&moves);
+    // Past epochs end in order, so the ones to keep are the newest `keep`.
     let mut keep = 0;
     for back in 1..=MAX_PAST_EPOCHS {
         let Some(epoch) = current.checked_sub(back) else {
@@ -663,25 +777,39 @@ pub fn expire_past_epochs<P: OpenMlsProvider>(
         }
         keep = back;
     }
-    keep_past_epochs(provider, group, keep)
+    keep_past_epochs(provider, group, &moves, |epoch| {
+        epoch + keep >= current || kept.contains(&epoch)
+    })
 }
 
-/// Keeps the secrets of the newest `keep` past epochs of `group`, with their
-/// skipped messages' keys, and deletes the rest.
+/// Keeps the secrets of the past epochs of `group` for which `keep` is
+/// true, with their skipped messages' keys, and deletes the rest. While
+/// `moves` keep epochs, the group may hold that many more past epochs, and
+/// one besides: merging a commit adds the epoch it ended before the device
+/// expires past epochs again, and OpenMLS would push the oldest out, the
+/// moves' own.
 fn keep_past_epochs<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
-    keep: u64,
+    moves: &[Moved],
+    keep: impl FnMut(u64) -> bool,
 ) -> Result<(), GroupError<P::StorageError>> {
-    let keep = usize::try_from(keep).expect("at most 2");
-    // A cut-off before any secret was stored deletes nothing by time; the
-    // count does the work.
     group
-        .delete_past_epoch_secrets(
-            provider,
-            PastEpochDeletion::before_timestamp(SystemTime::UNIX_EPOCH).max_past_epochs(keep),
-        )
-        .map_err(|e| GroupError::Mls(e.to_string()))
+        .retain_past_epoch_secrets(provider, keep)
+        .map_err(|e| GroupError::Mls(e.to_string()))?;
+    let kept = moved_epochs(moves).len();
+    let max = if kept == 0 {
+        group::MAX_PAST_EPOCHS
+    } else {
+        group::MAX_PAST_EPOCHS + 1 + kept
+    };
+    let policy = PastEpochDeletionPolicy::MaxEpochs(max);
+    if *group.past_epoch_deletion_policy() != policy {
+        group
+            .set_past_epoch_deletion_policy(provider, policy)
+            .map_err(|e| GroupError::Mls(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Deletes the secrets of every past epoch whose ending commit the device
@@ -692,6 +820,10 @@ fn keep_past_epochs<P: OpenMlsProvider>(
 /// the device. A past epoch whose ending the device has no time for goes
 /// too. This depends on when the device fetched, so it changes only what
 /// devices show, never which commit is valid.
+///
+/// The epochs of the mailboxes the group moved away from stay while the
+/// device follows them ([`MessageHistory::moves`]), and go with the next
+/// call once it stops.
 pub fn expire_past_epochs_by_clock<P: OpenMlsProvider>(
     provider: &P,
     group: &mut MlsGroup,
@@ -699,6 +831,8 @@ pub fn expire_past_epochs_by_clock<P: OpenMlsProvider>(
     now: Timestamp,
 ) -> Result<(), GroupError<P::StorageError>> {
     let current = group.epoch().as_u64();
+    let moves = history.moves();
+    let kept = moved_epochs(&moves);
     let mut keep = 0;
     for back in 1..=MAX_PAST_EPOCHS {
         let Some(epoch) = current.checked_sub(back) else {
@@ -712,7 +846,9 @@ pub fn expire_past_epochs_by_clock<P: OpenMlsProvider>(
         }
         keep = back;
     }
-    keep_past_epochs(provider, group, keep)
+    keep_past_epochs(provider, group, &moves, |epoch| {
+        epoch + keep >= current || kept.contains(&epoch)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -971,11 +1107,13 @@ pub fn receive<P: OpenMlsProvider>(
     // Live posts have no seq and reach only the devices online, so only
     // stored posts move the limits, which every device must reach alike.
     if !info.live {
-        expire_past_epochs(provider, group, history, info.t)?;
+        expire_past_epochs(provider, group, history, info.t, info.as_of)?;
     }
     note_self_removes(group, history);
     let current = group.epoch().as_u64();
-    if !past_epoch_readable(epoch, current, info.t, history.epoch_end(epoch)) {
+    // 12.9: after a move, judged as of the move.
+    let applied = info.as_of.map_or(current, |moved| moved.min(current));
+    if !past_epoch_readable(epoch, applied, info.t, history.epoch_end(epoch)) {
         return Err(ReceiveError::TooOld);
     }
     let public = group::conversation(group)
@@ -998,15 +1136,20 @@ pub fn receive<P: OpenMlsProvider>(
 
     // A leaf that a commit with a lower seq removed: even its messages of
     // earlier epochs are ignored (12.9, late messages). As of a move, only
-    // a commit before it counts; a leaf's log that a later one started
-    // again is not this message's, and is left alone (7.8).
+    // a commit before it counts, even if the index was used again and
+    // removed again since; a leaf's log that a later one started again is
+    // not this message's, and is left alone (7.8).
     let mut log = history.sender(sender);
-    let removed_later = info
-        .as_of
-        .is_some_and(|moved| log.removed_in.is_some_and(|removed| removed >= moved));
-    if log.removed_in.is_some_and(|removed| epoch <= removed) && !removed_later {
+    let removed = match info.as_of {
+        Some(moved) => log.removed_before(moved),
+        None => log.removed_in(),
+    };
+    if removed.is_some_and(|removed| epoch <= removed) {
         return Err(ReceiveError::Removed);
     }
+    let removed_later = info
+        .as_of
+        .is_some_and(|moved| log.removed_in().is_some_and(|removed| removed >= moved));
     // The sender as of the message's epoch: after a move, the leaf may
     // have gone from the tree since, or another taken its place.
     let identity = if info.as_of.is_some() {

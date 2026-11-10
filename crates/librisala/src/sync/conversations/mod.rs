@@ -2743,8 +2743,16 @@ impl ConversationEngine {
                         Pending::Unfollow,
                     );
                 }
-                self.write(cx, me, out, |tx, _| {
+                self.write(cx, me, out, |tx, c| {
                     tx.remove_mailbox(mb.conv, &mb.mailbox)?;
+                    // 12.9: the secrets of its last epochs, kept while it
+                    // was followed, go now.
+                    let row = tx.conversation(mb.conv)?;
+                    if (row.state.in_group() || row.state == ConvState::Leaving)
+                        && let Err(e) = group::expire_by_clock(tx, c, &row)
+                    {
+                        tracing::debug!(conv = %row.id, error = %e, "no past epochs to expire");
+                    }
                     Ok(())
                 })?;
                 continue;

@@ -89,7 +89,9 @@ use crate::wire::{WireError, read_group_info, read_protocol_message, read_tree, 
 /// [`crate::message::expire_past_epochs`] deletes them sooner, an hour
 /// after the commit that ended them by the posts' `t`, and
 /// [`crate::message::expire_past_epochs_by_clock`] 2 hours after the device
-/// applied it.
+/// applied it. The last epochs of a mailbox the group moved away from stay
+/// besides, while the device follows it (12.9,
+/// [`crate::message::MessageHistory::moves`]).
 pub const MAX_PAST_EPOCHS: usize = 2;
 
 /// How many generations behind the newest one a device keeps the keys of

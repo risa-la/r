@@ -918,7 +918,16 @@ fn apply_one(
                     tx.set_prev_token(conv.id, old_token.as_bytes())?;
                     note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
                     tx.update_outbox(row.id, OutboxState::Done, None, Some(post.seq), None)?;
-                    after_commit(tx, cx, conv, &group, post, true, removed_ids, &mut applied)?;
+                    after_commit(
+                        tx,
+                        cx,
+                        conv,
+                        &mut group,
+                        post,
+                        true,
+                        removed_ids,
+                        &mut applied,
+                    )?;
                     // 12.7: an own authority commit owes answers, or in an
                     // epochal group an ATTEST, within the hour (C3). Taken
                     // from the intent: a new extension, adds in a private
@@ -1124,7 +1133,16 @@ fn apply_one(
             // 12.8: another leaf commits in this device's epoch.
             tx.set_branch_seen(conv.id)?;
             note_commit(tx, cx, conv.id, &mut group, &merged, post.t)?;
-            after_commit(tx, cx, conv, &group, post, false, removed_ids, &mut applied)?;
+            after_commit(
+                tx,
+                cx,
+                conv,
+                &mut group,
+                post,
+                false,
+                removed_ids,
+                &mut applied,
+            )?;
             applied.notes.extend(
                 cx.hooks
                     .commit_applied(tx, conv.id, by)
@@ -1255,7 +1273,7 @@ fn note_commit(
 ) -> Result<()> {
     let mut log = MessageLog::new(tx.conn(), conv);
     log.note_commit(merged, ts(t), ts(cx.now));
-    mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(t)).map_err(mls)?;
+    mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(t), None).map_err(mls)?;
     log.finish()?;
     Ok(())
 }
@@ -1288,7 +1306,7 @@ fn after_commit(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     conv: &ConvRow,
-    group: &MlsGroup,
+    group: &mut MlsGroup,
     post: &PostRow,
     own: bool,
     removed: Vec<RisalaIdentity>,
@@ -1310,6 +1328,13 @@ fn after_commit(
             // 12.9: its later posts are judged as of the move.
             tx.set_moved_ext(conv.id, &current.mailbox, &ext.encode())?;
             tx.add_mailbox(conv.id, &new_box, true, group.epoch().as_u64(), None)?;
+            // 12.9: the secrets of the old mailbox's last epochs stay while
+            // it is followed, whatever the group commits meanwhile in the
+            // new one.
+            let log = MessageLog::new(tx.conn(), conv.id);
+            mls_message::expire_past_epochs(&tx.mls(cx.crypto), group, &log, ts(post.t), None)
+                .map_err(mls)?;
+            log.finish()?;
             // Every post there is of the device's epoch or later: posts
             // that expire there unread count from the start (7.4).
             if let Some(mb) = tx.mailbox(cx.account, &new_box)? {

@@ -197,6 +197,45 @@ impl Device {
     fn receive(&mut self, group: &mut MlsGroup, post: &[u8]) -> Received {
         self.receive_at(group, post, t0(), false)
     }
+
+    /// Receives a stored post at `t` in a mailbox the group moved away
+    /// from, by a move that created epoch `moved` (12.9).
+    fn receive_as_of(
+        &mut self,
+        group: &mut MlsGroup,
+        post: &[u8],
+        t: Timestamp,
+        moved: u64,
+    ) -> Received {
+        receive(
+            &self.provider,
+            group,
+            post,
+            PostInfo {
+                t,
+                live: false,
+                as_of: Some(moved),
+            },
+            &mut self.history,
+        )
+    }
+
+    /// Applies another device's commit, with `t`, and expires past epochs
+    /// as a device does after each post.
+    fn apply_and_expire(&mut self, group: &mut MlsGroup, message: &[u8], t: Timestamp) {
+        self.apply(group, message, t);
+        expire_past_epochs(&self.provider, group, &self.history, t, None).unwrap();
+    }
+
+    /// Notes that the commit just applied moved the group, so that the
+    /// device follows the old mailbox (7.8), as a device does once it has
+    /// noted the move.
+    fn note_move(&mut self, group: &mut MlsGroup, t: Timestamp) -> u64 {
+        let moved = group.epoch().as_u64();
+        self.history.set_moves(vec![Moved { from: 0, to: moved }]);
+        expire_past_epochs(&self.provider, group, &self.history, t, None).unwrap();
+        moved
+    }
 }
 
 /// A direct conversation between Alice, with two devices, and Bob.
@@ -886,11 +925,161 @@ fn removed_leaf() {
         },
     );
     bob.apply(&mut b, &commit, t0());
-    assert_eq!(bob.history.sender(leaf).removed_in, Some(1));
+    assert_eq!(bob.history.sender(leaf).removed_in(), Some(1));
     assert!(matches!(
         bob.receive(&mut b, &late),
         Err(ReceiveError::Removed)
     ));
+}
+
+/// After a move (7.8), a device keeps the secrets of the old mailbox's
+/// last epochs while it follows it, so that it decides whether it can read
+/// a late post there as of the move, as a device that read the post before
+/// any later commit does (12.9).
+#[test]
+fn a_moves_epochs_are_kept_while_its_mailbox_is_followed() {
+    let Direct {
+        mut alice,
+        mut alice2,
+        mut bob,
+        mut a,
+        mut a2,
+        mut b,
+        ..
+    } = direct();
+    // Two late messages of the epoch before the move, which the server
+    // hands out in the old mailbox after it.
+    let e = a.epoch().as_u64();
+    let (_, x1) = alice.send(&mut a, "x1");
+    let (_, x2) = alice.send(&mut a, "x2");
+    let (_, x3) = alice.send(&mut a, "x3");
+    let moving = alice.commit(&mut a, Changes::default());
+    for (device, group) in [(&mut bob, &mut b), (&mut alice2, &mut a2)] {
+        device.apply_and_expire(group, &moving, t0());
+    }
+    let moved = bob.note_move(&mut b, t0());
+    assert_eq!(alice2.note_move(&mut a2, t0()), moved);
+
+    // Alice's second device reads the first at once.
+    let got = alice2.receive_as_of(&mut a2, &x1, at(30), moved).unwrap();
+    assert_eq!(got.epoch, e);
+
+    // Bob first applies three commits in the new mailbox, more than the two
+    // past epochs of 12.9, and a post there two hours on.
+    for minutes in [10, 20, 30] {
+        let commit = alice.commit(&mut a, Changes::default());
+        bob.apply_and_expire(&mut b, &commit, at(minutes));
+    }
+    let (_, later) = alice.send(&mut a, "later");
+    bob.receive_at(&mut b, &later, at(120), false).unwrap();
+    assert_eq!(b.epoch().as_u64(), moved + 3);
+    // He reads it too: as of the move, its epoch is the one before.
+    let got = bob.receive_as_of(&mut b, &x1, at(30), moved).unwrap();
+    assert_eq!(got.epoch, e);
+
+    // A post in the old mailbox more than an hour after the move puts the
+    // epoch past the limit: for both, and its secrets go.
+    for (device, group) in [(&mut bob, &mut b), (&mut alice2, &mut a2)] {
+        assert!(matches!(
+            device.receive_as_of(group, &x2, at(61), moved),
+            Err(ReceiveError::TooOld)
+        ));
+        assert!(matches!(
+            device.receive_as_of(group, &x3, at(30), moved),
+            Err(ReceiveError::Process(_))
+        ));
+    }
+}
+
+/// Once a device stops following the old mailbox, a day after the move,
+/// the secrets of its last epochs go (12.9).
+#[test]
+fn a_moves_epochs_go_once_its_mailbox_is_not_followed() {
+    let Direct {
+        mut alice,
+        mut bob,
+        mut a,
+        mut b,
+        ..
+    } = direct();
+    let (_, x1) = alice.send(&mut a, "x1");
+    let (_, x2) = alice.send(&mut a, "x2");
+    let moving = alice.commit(&mut a, Changes::default());
+    bob.apply_and_expire(&mut b, &moving, t0());
+    let moved = bob.note_move(&mut b, t0());
+    // Kept past the 2 hours of the clock while the mailbox is followed.
+    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(180)).unwrap();
+    bob.receive_as_of(&mut b, &x1, at(30), moved).unwrap();
+    bob.history.set_moves(Vec::new());
+    expire_past_epochs_by_clock(&bob.provider, &mut b, &bob.history, at(24 * 60)).unwrap();
+    assert!(matches!(
+        bob.receive_as_of(&mut b, &x2, at(30), moved),
+        Err(ReceiveError::Process(_))
+    ));
+}
+
+/// A late post in the old mailbox from a leaf removed before the move is
+/// refused, even if its index was used again and removed again after the
+/// move: the slot's log keeps both removals while the mailbox is followed
+/// (12.9).
+#[test]
+fn a_late_message_from_a_leaf_removed_before_the_move_stays_refused() {
+    let Direct {
+        alice,
+        mut alice2,
+        mut bob,
+        mut a,
+        mut a2,
+        mut b,
+        ..
+    } = direct();
+    let alice3 = Device::new("alice@example.org", 12);
+    let (_, late) = alice2.send(&mut a2, "too late");
+    let e = a2.epoch().as_u64();
+    let slot = a2.own_leaf_index();
+    // Alice removes her second device, then moves the group.
+    let removal = alice.commit(
+        &mut a,
+        Changes {
+            remove: vec![slot],
+            ..Changes::default()
+        },
+    );
+    bob.apply_and_expire(&mut b, &removal, t0());
+    let moving = alice.commit(&mut a, Changes::default());
+    bob.apply_and_expire(&mut b, &moving, t0());
+    let moved = bob.note_move(&mut b, t0());
+    // In the new mailbox, a third device takes the slot, and is removed.
+    let adding = alice.commit(
+        &mut a,
+        Changes {
+            add: vec![alice3.key_package()],
+            ..Changes::default()
+        },
+    );
+    bob.apply_and_expire(&mut b, &adding, at(5));
+    assert!(group::leaf(&b, slot).is_some(), "the slot is used again");
+    let removal = alice.commit(
+        &mut a,
+        Changes {
+            remove: vec![slot],
+            ..Changes::default()
+        },
+    );
+    bob.apply_and_expire(&mut b, &removal, at(10));
+    assert_eq!(bob.history.sender(slot).removals, vec![e, moved + 1]);
+    // As of the move, the leaf had been removed.
+    assert!(matches!(
+        bob.receive_as_of(&mut b, &late, at(20), moved),
+        Err(ReceiveError::Removed)
+    ));
+    // Once the old mailbox is not followed, the next removal keeps only
+    // the newest.
+    bob.history.set_moves(Vec::new());
+    let mut removals = bob.history.sender(slot).removals;
+    removals.push(moved + 5);
+    prune_removals(&mut removals, &[]);
+    assert_eq!(removals, vec![moved + 5]);
 }
 
 #[test]
