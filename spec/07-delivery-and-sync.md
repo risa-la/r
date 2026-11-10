@@ -392,6 +392,11 @@ do not move: their box is public, and anyone not banned may join.
   after removing someone for abuse, who is the member most likely to
   flood the old mailbox. A group MAY also move at other times, for
   example when its mailbox is flooded.
+- **Messages do not wait.** After another member's removal, a device
+  sends its messages in the current epoch at once, in the mailbox the
+  group is in, and does not hold them back until a move has won. The
+  removed member cannot read them, and sees only that the group talks,
+  as it could until the move anyway.
 - **How.** The device makes a commit in the epoch that the removal
   created, or a later one, holding one GroupContextExtensions proposal
   that changes only the `box` of the conversation extension (12.4), and
