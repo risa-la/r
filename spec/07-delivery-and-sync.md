@@ -244,7 +244,22 @@ A device catches up like this:
 every post after L up to the head has expired (step 2), posts after the
 sync point expired before the device applied them. The device cannot
 tell whether they included commits, so it treats the group as one it
-can no longer follow (7.5), and applies nothing after the gap.
+can no longer follow (7.5), and applies nothing after the gap. Two
+gaps do not count:
+
+- **Posts that expired before the device joined.** A device that joins
+  a group by Welcome (12.8) has no sync point in its mailbox until its
+  first catch-up there, which fetches with `after=0`. Posts that expired
+  before the first one that comes back, or before the head if none
+  does, are not a gap: the device applies only the posts of its
+  Welcome's epoch and later, and its sync point starts from there as
+  step 2 says.
+- **A gap in a mailbox the group has moved away from.** Once the device
+  has applied a move (7.8), it follows the group's commits in the new
+  mailbox. A gap in the old one can lose only late messages of earlier
+  epochs there (12.9), which the device shows as expired.
+
+Any other gap counts.
 
 Each message carries its sender's counter and the id of the sender's
 previous message (12.9). So devices notice a gap in a sender's messages
@@ -303,11 +318,22 @@ reports do not expire (5.8).
 A device that finds that posts after its sync point expired before it
 applied them cannot tell whether it missed commits, and so can no
 longer follow the group (7.4). This happens to a device that has been
-offline for longer than the retention period. In a public room it joins
-again (6.1). In other conversations, its identity's other
-devices replace its leaf at once, and other members' devices after 35
-days (12.7): the device then gets a Welcome, as a new device does, and
-asks its own devices for what it missed (12.13).
+offline for longer than the retention period, or whose mailbox's posts
+expired early under a quota (below). In a public room it joins again
+(6.1). In other conversations, it asks its own devices at once: it
+sends `RESYNC <box> <seq>` in the conversation with itself (12.9),
+where `<box>` is the mailbox it found the gap in, and `<seq>` the first
+seq it found after the gap, or the head if every post up to the head
+had expired (7.4). Its identity's other devices then replace
+its leaf, without waiting for the leaf to go stale (12.7). If it cannot
+follow the conversation with itself either, it cannot ask, and its own
+devices replace its leaf once it is stale; if its identity has no other
+device in the group, only other members' devices replace it, after 35
+days (12.7). Either way, the device then gets a Welcome, as a new
+device does, and asks its own devices for what it missed (12.13).
+A device that is leaving the group, or whose user leaves it while the
+device cannot follow it, sends no RESYNC, and leaves locally instead
+(6.1).
 
 Retention is also the limit of what the server holds: once a post has
 expired, nobody can fetch it, even with every key.

@@ -1007,6 +1007,20 @@ conversation or a private room:
 - Devices tell the user when one member's commits keep leading to RESYNC
   lines from others: that member may be cutting devices out on purpose.
 
+**Devices that found a gap.** A device that finds that posts after its
+sync point expired before it applied them can no longer follow the
+group either (7.4, 7.5). Outside public rooms, it sends
+`RESYNC <box> <seq>` in the conversation with itself at once, where
+`<seq>` is the first seq it found after the gap, or the head if every
+post up to the head had expired (12.9). A device of the same identity
+that reads it replaces that leaf as above, after a random wait of up to
+10 minutes and unless another has done so first, without waiting for
+the leaf to go stale (below). Only the identity's own
+devices read that line, so a leaf whose identity has no other leaf in
+the group is replaced only once it is stale. A device that cannot
+follow the conversation with itself cannot send the line at all, and
+its own devices replace its leaves there and elsewhere as stale ones.
+
 The server orders the posts, so it can also show different devices
 different commits for the same epoch, and split the group with no
 member's help (7.2). A device that, an hour after it applied a commit,
@@ -1199,8 +1213,9 @@ if that is later; but never later than the `t` of the commit's post.
   (6.1).
 
 A device that finds it has fallen behind (7.4) uploads fresh
-KeyPackages, and waits to be added again. Once it is back in the
-conversation with yourself, it asks its identity's other devices for
+KeyPackages, sends `RESYNC <box> <seq>` where it can (above), and waits
+to be added again. Once it is back in the conversation with yourself,
+it asks its identity's other devices for
 what it missed with WANT lines, which they answer with transfers
 (12.13).
 
@@ -1606,8 +1621,12 @@ For example, a reply as it appears inside the encryption:
 In `RESYNC <seq>`, `<seq>` is the seq of the commit that the device
 could not process (12.7), in decimal. In the conversation with yourself,
 `RESYNC <box> <seq>` asks the identity's other devices to replace the
-sending device's leaf in the group of that box. A device acts on it only
-if it holds a group with that box and a commit at that seq.
+sending device's leaf in the group of that box. There `<seq>` is either
+the seq of a commit that the device could not process, or, for a device
+that found a gap (7.4), the first seq it found after the gap, or the
+head (7.1) if every post up to it had expired. A device acts on it
+only if it holds a group whose mailbox has that box, now or before a
+move (7.8), and has applied the posts there up to that seq.
 
 In `REFETCH <hash>`, `<hash>` is the SHA-384 hash of a record of the
 sender's identity, as a blob-ref (3.5). A device sends it once it has
