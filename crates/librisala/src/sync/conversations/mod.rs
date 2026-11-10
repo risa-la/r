@@ -804,6 +804,9 @@ pub struct ConversationEngine {
     /// Public rooms this device cannot follow: the epoch it holds, and
     /// when to resync or join again (12.7).
     stuck: HashMap<ConversationId, (u64, u64)>,
+    /// Joining rooms whose rejoin by external commit was too large for a
+    /// line, and the epoch it was made in (12.7): not made again in it.
+    rejoin_too_large: HashMap<ConversationId, u64>,
     /// When any member moves the mailbox after another's removal, and the
     /// box it was in then (7.8).
     move_timers: HashMap<ConversationId, (u64, BoxName)>,
@@ -897,6 +900,7 @@ impl ConversationEngine {
             join_checks: HashMap::new(),
             join_inflight: HashSet::new(),
             stuck: HashMap::new(),
+            rejoin_too_large: HashMap::new(),
             move_timers: HashMap::new(),
             replacing: HashSet::new(),
             branch_warned: HashSet::new(),

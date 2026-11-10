@@ -266,10 +266,15 @@ fn an_owner_whose_proposal_nobody_commits_rejoins_by_external_commit() {
     );
 }
 
-#[test]
-fn a_room_whose_server_took_an_invalid_commit_is_resynced() {
-    let mut net = Net::new();
-    let (alice, bob, a, b) = room_with_two(&mut net);
+/// Alice's `#general` with Bob, where Mallory joined and then posted a
+/// commit whose `next` is wrong: the server took it (it cannot check
+/// `next`), and the members cannot apply it (12.7). Returns Alice, Bob,
+/// their conversations, the epoch they hold, and how long the server's log
+/// was before the invalid commit.
+fn room_with_an_invalid_commit(
+    net: &mut Net,
+) -> (usize, usize, ConversationId, ConversationId, u64, usize) {
+    let (alice, bob, a, b) = room_with_two(net);
     // Mallory joins, then posts a commit whose `next` is wrong: the server
     // takes it (it cannot check `next`), and the members cannot (12.7).
     let mallory = net.device("mallory", "mallory@example.com");
@@ -327,6 +332,7 @@ fn a_room_whose_server_took_an_invalid_commit_is_resynced() {
         Ok(risala_mls::token::SendToken::of_group(&group, crypto.as_ref()).unwrap())
     });
     net.server.now = net.clock.now().unix_millis();
+    let logged = net.server.log.len();
     let (response, live) = net.server.handle(
         (mallory, Slot::SignedIn),
         Command::Post {
@@ -343,6 +349,13 @@ fn a_room_whose_server_took_an_invalid_commit_is_resynced() {
     );
     assert!(matches!(response.end, End::Ok(_)), "{:?}", response.end);
     net.deliver(live);
+    (alice, bob, a, b, epoch, logged)
+}
+
+#[test]
+fn a_room_whose_server_took_an_invalid_commit_is_resynced() {
+    let mut net = Net::new();
+    let (alice, bob, a, b, epoch, _) = room_with_an_invalid_commit(&mut net);
     // The members tell their users, and recover: one resync commit, and the
     // other joins again by proposal (12.7).
     for d in [alice, bob] {
@@ -468,4 +481,94 @@ fn leaving_a_room_while_joining_it_gives_the_join_up() {
     assert!(net.leaves(alice, a).contains(&"bob@example.net".to_owned()));
     assert_eq!(asked(&net), before);
     assert_eq!(net.state(bob, b), ConvState::Left);
+}
+
+/// External commits that would not fit in a line, on this thread: every
+/// one, while the room's other posts stay inline (12.7, 12.12).
+fn external_commits_too_large() {
+    crate::sync::conversations::public::test_hooks::EXTERNAL_LINE_LIMIT
+        .with(|limit| limit.set(Some(0)));
+}
+
+/// The POSTs that device `d` made on its signed-in connection: its commits
+/// in a public room, external ones included (12.6).
+fn signed_in_posts(net: &Net, d: usize) -> usize {
+    net.server
+        .log
+        .iter()
+        .filter(|((dd, s), verb)| *dd == d && *s == Slot::SignedIn && verb == "POST")
+        .count()
+}
+
+/// 12.7: a resync commit that would not fit in a line is not posted: the
+/// device joins again by external proposal, as the others do. Here every
+/// member's would be too large, so nobody in the group is left to commit
+/// the proposals, and the room waits.
+#[test]
+fn a_resync_commit_too_large_for_a_line_is_not_posted() {
+    let mut net = Net::new();
+    external_commits_too_large();
+    let (alice, bob, a, b, _, logged) = room_with_an_invalid_commit(&mut net);
+    for _ in 0..5 {
+        net.advance(60_000);
+    }
+    let since = |d: usize, slot: Slot| {
+        net.server.log[logged..]
+            .iter()
+            .filter(|((dd, s), verb)| *dd == d && *s == slot && verb == "POST")
+            .count()
+    };
+    for (d, conv) in [(alice, a), (bob, b)] {
+        assert_eq!(since(d, Slot::SignedIn), 0, "no external commit");
+        assert!(since(d, SINGLE_USE_SLOT) >= 1, "a join proposal");
+        assert_eq!(net.state(d, conv), ConvState::Joining);
+    }
+}
+
+/// 12.7: an owner's rejoin that would not fit in a line is not posted: the
+/// device keeps waiting for its join proposal, and tells its user why,
+/// once. It does not make it again in the same epoch.
+#[test]
+fn a_rejoin_too_large_for_a_line_is_not_posted() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    net.connect(alice);
+    net.job(alice, Job::PublicRoom { room: room() })
+        .expect("created");
+    net.disconnect(alice);
+    let phone = net.device_of("phone", alice);
+    net.connect(phone);
+    external_commits_too_large();
+    net.job_over(
+        phone,
+        Job::JoinPublic {
+            room: room(),
+            new_group: false,
+        },
+        0,
+    )
+    .unwrap_err();
+    for _ in 0..60 {
+        net.advance(60_000);
+    }
+    let conv = net
+        .convs(phone)
+        .into_iter()
+        .find(|c| c.kind == ConvKind::Public)
+        .unwrap();
+    assert_eq!(conv.state, ConvState::Joining, "still waiting");
+    assert_eq!(signed_in_posts(&net, phone), 0, "no external commit");
+    assert_eq!(net.server.room(ROOM), Some((1, 0)));
+    let told = net
+        .events(phone)
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Conversation(ConversationEvent::RejoinTooLarge { conversation })
+                    if *conversation == conv.id
+            )
+        })
+        .count();
+    assert_eq!(told, 1);
 }
