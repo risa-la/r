@@ -397,6 +397,15 @@ make resending safe:
   looked, and win the epoch. A device that had made a new commit
   meanwhile could not apply the first one, and would apply its new one,
   which lost, and so leave the group without knowing it.
+- **Unless it is too old.** A commit's `updated` must be within 10
+  minutes of its post's `t` (12.3). So once more than 10 minutes have
+  passed since a device made a commit, by the `t` of the posts it
+  receives, any copy of it that reaches the server from then on,
+  including a first POST that was held up on the way, fails that check
+  wherever it lands, and cannot win the epoch; and the device's own
+  checks would not let it post it again (12.7). If the commit has not
+  arrived by then, the device MAY drop it and its state, and make a new
+  one if the change is still needed.
 
 Devices also ignore a message whose `message_id` they have already seen
 in the group (12.9), so a post that went through twice shows once.
