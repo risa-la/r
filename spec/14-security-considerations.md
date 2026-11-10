@@ -171,7 +171,14 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
     (12.14). Every device fetches its contacts' key files daily, so this
     shows who is in touch with whom, which sealed sending otherwise
     hides. The host of a self-hosted identity's key file learns the
-    same;
+    same. After each new record, REFETCH (12.9) and nudges (12.8) make
+    contacts fetch within minutes of each other, which ties their
+    addresses to the identity more closely than fetches spread over
+    the day;
+  - after a recovery (4.8), whose uids someone asked KeyPackages for,
+    and which devices then got small Welcomes: the nudges (12.8). Fresh
+    connections and random waits blur this, but on a quiet server it
+    suggests who the recovered identity's contacts are;
   - roughly how many devices a direct conversation or private room has,
     from the size of its commits and Welcomes, and from the followers and
     push subscriptions of its mailbox;
@@ -432,7 +439,12 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   show this as an alert (12.7), and its removal stands once the record
   is accepted, which logs SHOULD witness within a minute (4.5). Devices
   then remove its leaves, as for an impostor, and the identity's other
-  devices undo what it did, within the identity's role (12.7).
+  devices undo what it did, within the identity's role (12.7). A user
+  who lost every device recovers instead (4.8), and has no leaf left to
+  remove the stolen ones with. Its contacts remove them once they fetch
+  the key file: within minutes for those it nudges (12.8), and for the
+  rest at their daily fetch, which devices MUST make (12.14). Until
+  then, the stolen devices still read what those contacts send.
 
 - **Missing key files and forks.** A key file that is gone or invalid is
   unsigned, so it removes no device by record (4.4). Devices cannot

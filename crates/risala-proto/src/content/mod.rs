@@ -4,7 +4,7 @@
 //! A [`Content`] is one or more lines in the format of Section 3, each
 //! ending in LF, that only the conversation's members can read: TEXT
 //! (5.3), DELETE (5.4), TYPING (8.1), REPORT (5.8), CHALLENGE and ANSWER,
-//! ATTEST and REVEAL (12.10), RESYNC (12.7), and the lines of the
+//! ATTEST and REVEAL (12.10), RESYNC (12.7), REFETCH (4.5, 12.14), and the lines of the
 //! conversation with yourself: READ (7.7), RESYNC with a box (12.7), BLOCK and UNBLOCK (5.7), RECORD, ALERT and
 //! RECORDS (4.5), SIGNINGKEY and BACKUPKEY (4.8, 12.13), WANT, TRANSFER
 //! and SERVERS (12.13), and PIN (4.5, 12.14).
@@ -332,6 +332,10 @@ pub enum ContentLine {
         /// The seq of the commit the device could not process.
         seq: Seq,
     },
+    /// `REFETCH <hash>`: the sender's identity has a new record, so members
+    /// fetch its key file soon rather than at their daily fetch (4.5,
+    /// 12.14).
+    Refetch(BlobRef),
     /// `READ <box> <seq> <check>`: the sending device has shown mailbox
     /// `<box>` up to `<seq>` (7.7).
     Read {
@@ -532,6 +536,7 @@ pub const VERBS: &[&str] = &[
     "ATTEST",
     "REVEAL",
     "RESYNC",
+    "REFETCH",
     "READ",
     "BLOCK",
     "UNBLOCK",
@@ -622,6 +627,7 @@ impl ContentLine {
                     }
                 }
             }
+            "REFETCH" => ContentLine::Refetch(last(p)?),
             "READ" => {
                 let mut p = p;
                 let mailbox = tok(&mut p)?;
@@ -715,6 +721,7 @@ impl ContentLine {
             ContentLine::Attest { .. } => "ATTEST",
             ContentLine::Reveal { .. } => "REVEAL",
             ContentLine::Resync { .. } => "RESYNC",
+            ContentLine::Refetch(_) => "REFETCH",
             ContentLine::Read { .. } => "READ",
             ContentLine::Block(_) => "BLOCK",
             ContentLine::Unblock(_) => "UNBLOCK",
@@ -805,7 +812,7 @@ impl ContentLine {
             ContentLine::Block(target) | ContentLine::Unblock(target) => {
                 b.token(target);
             }
-            ContentLine::Record(hash) | ContentLine::Alert(hash) => {
+            ContentLine::Refetch(hash) | ContentLine::Record(hash) | ContentLine::Alert(hash) => {
                 b.token(hash);
             }
             ContentLine::Records(None) => {}
@@ -876,6 +883,8 @@ impl ContentLine {
     /// - `RESYNC <seq>` counts only in direct conversations and private
     ///   rooms, and `RESYNC <box> <seq>` only in the conversation with
     ///   yourself (12.7). Public rooms resync by external commit instead.
+    /// - REFETCH counts only in direct conversations and private rooms
+    ///   (12.14). Public rooms have no key checks.
     /// - READ, BLOCK, UNBLOCK, RECORD, ALERT, RECORDS, SIGNINGKEY,
     ///   BACKUPKEY, WANT, TRANSFER, SERVERS and PIN count only in the
     ///   conversation with yourself.
@@ -915,7 +924,7 @@ impl ContentLine {
             ContentLine::Attest { .. } | ContentLine::Reveal { .. } => {
                 place.conversation.confirm() == ConfirmMode::Epochal
             }
-            ContentLine::Resync { mailbox: None, .. } => {
+            ContentLine::Resync { mailbox: None, .. } | ContentLine::Refetch(_) => {
                 matches!(place.conversation, Direct | PrivateRoom(_))
             }
             ContentLine::Resync {

@@ -74,6 +74,7 @@ fn every_verb_round_trips() {
         format!("READ {BOX} 9120 {}", b64(EPOCH_CHECK_LEN, 19)),
         "RESYNC 9121".to_owned(),
         format!("RESYNC {BOX} 9121"),
+        format!("REFETCH {}", hash('a')),
         "BLOCK spam@example.net".to_owned(),
         "UNBLOCK *@example.net".to_owned(),
         format!("RECORD {}", hash('a')),
@@ -409,6 +410,8 @@ fn arity() {
         format!("RESYNC {BOX} 1 2"),
         "BLOCK".to_owned(),
         "RECORD".to_owned(),
+        "REFETCH".to_owned(),
+        format!("REFETCH {} {}", hash('a'), hash('b')),
         format!("BACKUPKEY {}", b64(32, 1)),
         format!("WANT {BOX} 1"),
         "SERVERS".to_owned(),
@@ -715,7 +718,7 @@ fn hand_built_lines_are_checked() {
 
 fn sample_lines() -> Vec<ContentLine> {
     let content: Content = format!(
-        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nRESYNC 1\nRESYNC {BOX} 1\nREAD {BOX} 1 {check}\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
+        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nRESYNC 1\nRESYNC {BOX} 1\nREFETCH {h}\nREAD {BOX} 1 {check}\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
         id = id(1),
         ct = b64(CHALLENGE_LEN, 1),
         mac = b64(48, 1),
@@ -764,15 +767,23 @@ fn where_lines_count() {
     assert_eq!(allowed(Place::new(WithYourself)), with_yourself);
     assert_eq!(
         allowed(Place::new(Direct)),
-        ["TEXT", "DELETE", "REPORT", "CHALLENGE", "ANSWER", "RESYNC"]
+        [
+            "TEXT",
+            "DELETE",
+            "REPORT",
+            "CHALLENGE",
+            "ANSWER",
+            "RESYNC",
+            "REFETCH"
+        ]
     );
     assert_eq!(
         allowed(Place::new(PrivateRoom(ConfirmMode::Pairwise))),
-        ["TEXT", "DELETE", "CHALLENGE", "ANSWER", "RESYNC"]
+        ["TEXT", "DELETE", "CHALLENGE", "ANSWER", "RESYNC", "REFETCH"]
     );
     assert_eq!(
         allowed(Place::new(PrivateRoom(ConfirmMode::Epochal))),
-        ["TEXT", "DELETE", "ATTEST", "REVEAL", "RESYNC"]
+        ["TEXT", "DELETE", "ATTEST", "REVEAL", "RESYNC", "REFETCH"]
     );
     // Public rooms resync by external commit, not RESYNC (12.7).
     assert_eq!(

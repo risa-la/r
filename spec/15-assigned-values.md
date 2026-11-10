@@ -58,7 +58,7 @@
   - the RisalaSign labels `record` (4.4), `pair` (4.8), `keypackage`
     (12.3), `period` and `attest` (12.10), each signed with the prefix
     `risala/1 ` (4.3);
-  - the HPKE info string `risala/1 welcome` (12.8);
+  - the HPKE info strings `risala/1 welcome` and `risala/1 nudge` (12.8);
   - the HKDF info strings `risala/1 identity ` and `risala/1 backup `
     followed by the uid (4.8, 12.13), `risala/1 pair new id`,
     `risala/1 pair new key`, `risala/1 pair old id` and

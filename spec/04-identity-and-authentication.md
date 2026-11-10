@@ -751,15 +751,18 @@ since it last did so, at least once a week, or a random sample of them
 every day (Section 14).
 
 A device announces each record it makes to the identity's other devices,
-with RECORD in the conversation with itself (12.9). A record of its uid
-that no device announced within 24 hours after the first witnessed
-checkpoint that included it, or a fork, means that someone else may
-control the identity. The device tells the user, and sends `ALERT`
-(12.9) in the conversation with itself, so that every device of the
-identity tells the user too. A device that comes back after more than a
-day offline may have missed RECORD lines, so it first asks its own
-devices with RECORDS (12.9), and alerts only for records that none of
-them knows.
+with RECORD in the conversation with itself (12.9). Once it has accepted
+the record itself, it also sends REFETCH (12.9) in each direct
+conversation and private room it is in, so that its contacts fetch the
+key file within minutes rather than at their daily fetch (12.14). A
+record of its uid that no device announced within 24 hours after the
+first witnessed checkpoint that included it, or a fork, means that
+someone else may control the identity. The device tells the user, and
+sends `ALERT` (12.9) in the conversation with itself, so that every
+device of the identity tells the user too. A device that comes back
+after more than a day offline may have missed RECORD lines, so it first
+asks its own devices with RECORDS (12.9), and alerts only for records
+that none of them knows.
 
 The log lists every uid whose records it holds. Section 14 says what
 that reveals.
@@ -1193,9 +1196,11 @@ the generation before, if there is one (12.13), and makes a new backup
 in the new generation; the backup also names the servers its
 conversations live on. Without a backup, the
 user names them. Once its records are accepted, it signs in to each,
-uploads KeyPackages, and the other participant of each direct
-conversation adds it (12.7). Private rooms are another matter. The
-`signing` record removes every old device by record, and members'
+uploads KeyPackages, and nudges its contacts (12.8), so that they fetch
+its key file within minutes rather than at their daily fetch (12.14).
+The other participant of each direct conversation then removes the old
+devices and adds the new one (12.7). Private rooms are another matter.
+The `signing` record removes every old device by record, and members'
 devices remove those leaves, after which the identity has no leaf left
 there. A private room then takes it back only by an owner's or
 moderator's Add, and an owner's for an identity listed in `owners`. In
@@ -1212,8 +1217,10 @@ device-signing key, and the chain's current log. The chain moves to the
 next generation, whose backup key is derived from the new recovery key
 (12.13). The device then proceeds as in steps 3 to 5 of removing a
 device, and shows the new recovery key once, as at creation. Every
-contact sees a new master key (4.5), which clears "verified" and stops
-sending until each user acknowledges it (12.14).
+contact sees a new master key (4.5) when the REFETCH line that follows
+the record (4.5) makes it fetch the key file, or at its daily fetch at
+the latest, which clears "verified" and stops sending until each user
+acknowledges it (12.14).
 
 **Moving to another log.** An identity whose key file names a log
 outside its host, for example a self-hosted one, can move its records

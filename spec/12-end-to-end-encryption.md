@@ -1355,6 +1355,47 @@ again (12.7). The server deletes Welcomes that
 are not fetched within its retention period, and the pending Welcomes of
 a device that has been removed.
 
+**Nudges.** A device that has recovered its identity after losing every
+device (4.8) has no leaf in any group, so it cannot send REFETCH (12.9).
+Its contacts would otherwise learn of the recovery only at their daily
+fetch (12.14), and until then the old devices, which may be in someone
+else's hands, keep their leaves. So once it has accepted its records
+(4.5), the device nudges, for each conversation of the backup it
+restored (12.13), the identities other than its own that sent its three
+most recent messages: in a direct conversation that is the other
+participant, and in a room any one member who fetches removes the old
+devices' leaves (12.14). It MAY also nudge identities its user names.
+For each identity, on that conversation's server, it:
+
+1. sends KEYPKG GET for the identity's uid (12.5);
+2. for each KeyPackage handed out, after a random wait of its own of up
+   to 10 minutes, sends WELCOME PUT with that KeyPackage's ref and put
+   secret, and a KeyNudge as `<welcome>`, sealed as a Welcome is
+   (above) but with the info `risala/1 nudge`.
+
+It sends these on fresh anonymous connections (4.1), as a committer
+sends Welcomes.
+
+```
+struct {
+    uint8 version;               // 1
+    opaque uid<V>;               // the recovered identity, in lower case
+} KeyNudge;
+```
+
+The server cannot tell a nudge from a Welcome except by its size, and
+handles it as one. A device that cannot open a sealed Welcome with the
+info `risala/1 welcome` tries `risala/1 nudge`. If that opens it, the
+KeyNudge's `version` is 1, `uid` is a uid (3.5) and the bytes after it
+are all zero, it is a nudge; otherwise the device ignores it. Either
+way, it deletes it with WELCOME DEL and treats the KeyPackage as used.
+A nudge is not signed, and anyone can send one for any uid, so it gives
+the device only a reason to fetch: for an identity it shares a direct
+conversation or a private room with, it fetches the key file as 12.14
+says, and then removes and adds leaves as after any fetch (12.7). It
+ignores a nudge for any other uid, and shows the user nothing for a
+nudge itself.
+
 ### 12.9. Messages
 
 Everything a device posts carries, as the MLS `authenticated_data`, a
@@ -1512,6 +1553,7 @@ the table does not allow them. Also:
 | `CHALLENGE <leaf> <ciphertext>`, `ANSWER <leaf> <mac>` | groups whose `confirm` is `pairwise` | 12.10 |
 | `ATTEST <period> <period-key> <certificate> <attestation> <pseudonym>`, `REVEAL <period> <seed>` | groups whose `confirm` is `epochal` | 12.10 |
 | `RESYNC <seq>` | direct conversations and private rooms | 12.7 |
+| `REFETCH <hash>` | direct conversations and private rooms | 4.5, 12.14 |
 | `READ <box> <seq> <check>`, `RESYNC <box> <seq>` | the conversation with yourself | 7.7, 12.7 |
 | `BLOCK <target>`, `UNBLOCK <target>` | the conversation with yourself | 5.7 |
 | `RECORD <hash>`, `ALERT <hash>`, `RECORDS [<hashes...>]` | the conversation with yourself | 4.5 |
@@ -1545,6 +1587,14 @@ could not process (12.7), in decimal. In the conversation with yourself,
 `RESYNC <box> <seq>` asks the identity's other devices to replace the
 sending device's leaf in the group of that box. A device acts on it only
 if it holds a group with that box and a commit at that seq.
+
+In `REFETCH <hash>`, `<hash>` is the SHA-384 hash of a record of the
+sender's identity, as a blob-ref (3.5). A device sends it once it has
+accepted a record that it made itself (4.5), in each direct
+conversation and private room it is in, so that the other members fetch
+its identity's key file within minutes rather than at their next daily
+fetch (12.14). A device ignores REFETCH from a leaf of its own identity,
+whose records reach it with RECORD.
 
 The lines of the conversation with yourself:
 
@@ -2203,11 +2253,24 @@ A device does not take the server's word for which keys belong to whom:
 
 - It fetches key files itself, under the rules of 4.4, and checks every
   record it acts on against the key log (4.5).
-- It SHOULD fetch the key file again at least once a day for each
+- It MUST fetch the key file again at least once a day for each
   identity it shares a direct conversation or a private room with, and
   for each sender in a public room whose leaf it has confirmed in the
   current period (12.10). It spreads these fetches over the day at
   random times, and checks the identity's freshness each time (4.5).
+- It also fetches an identity's key file within minutes, rather than at
+  its next daily fetch, when a leaf of that identity sends REFETCH (12.9)
+  in a direct conversation or a private room, unless the device already
+  holds the record that the line names, and when it gets a nudge (12.8)
+  for an identity it shares a direct conversation or a private room
+  with. It waits a random time of up to 5 minutes first, so that a
+  room's members do not all fetch at once, then fetches without using a
+  cached copy (4.4), and fetches each identity at most once every 10
+  minutes for these reasons. Neither the line nor the nudge proves
+  anything: a device takes from them only a reason to fetch, and acts
+  only on what the key file says. Public rooms have no key checks
+  (12.10), so REFETCH is not sent there, and their members catch up at
+  their daily fetch.
 - After a fetch, outside public rooms, it removes the leaves of devices
   removed by record, and adds devices that have none, where the Adds
   checks of 12.7 let it. In a public
