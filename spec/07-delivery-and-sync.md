@@ -489,7 +489,7 @@ do not move: their box is public, and anyone not banned may join.
   and posts there from the move's epoch on. It keeps following the old
   mailbox for a day, for messages of earlier epochs that arrive late,
   then unfollows it, deletes its push subscription for it (9.1), and
-  deletes the secrets it kept for those epochs (12.9). In
+  deletes any secrets it still holds for those epochs (12.9). In
   the old mailbox, devices ignore posts for the move's epoch and later,
   and judge the other posts that come after the move by the old
   mailbox's order alone (12.9).

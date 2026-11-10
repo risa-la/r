@@ -39,9 +39,13 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   own key, which devices delete once they have used it (12.9), and
   devices delete a past epoch's secrets once they have applied the third
   epoch after it, once posts arrive more than an hour after the commit
-  that ended it, and in any case 2 hours after they applied that
-  commit, by their own clocks (12.9). So a device stolen
-  today does not decrypt what the server stored earlier. Commits give
+  that ended it, and in any case once they have caught up after the
+  server's time has passed 2 hours after that commit (12.9). So a
+  device stolen today does not decrypt what the server stored earlier.
+  A device that has been offline since keeps the secrets of its last 2
+  past epochs until it next catches up, since it judges by the server's
+  time and not its own clock; they decrypt only messages of those
+  epochs that it has not received, since it deleted each key it used. Commits give
   post-compromise security: once a device has committed a fresh leaf,
   which it does at least weekly (12.7), keys stolen earlier do not
   decrypt new messages. Healing is as frequent as commits, not every

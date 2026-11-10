@@ -1587,22 +1587,26 @@ message by where it falls in that order, not only by its epoch:
   past either limit. These rules depend only on the posts, so every
   device reaches the same result.
 - Whatever posts arrive, a device MUST also delete a past epoch's
-  secrets, with its skipped-message keys, 2 hours after it applied the
-  commit that ended the epoch, by its own clock. Otherwise a group that
-  goes quiet, or a server that holds back later posts, would keep them
-  on the device. A late message that it can then no longer decrypt is
-  unreadable, as above. This depends on when a device fetched, so it
-  can make a message unreadable on one device and not on another, but
-  it changes only what devices show, never which commit is valid
-  (12.7). After a move, the old mailbox's last epochs are kept longer
-  (below).
+  secrets, with its skipped-message keys, once both hold: the server
+  time it knows (Section 11) is more than 2 hours past the `t` of the
+  commit that ended the epoch, and it has since caught up the epoch's
+  mailbox, that is, a FOLLOW or FETCH it sent after it learned that
+  time found no post after its sync point (7.4). Otherwise a group that
+  goes quiet would keep them on the device. Any post the device has not
+  applied by then was accepted after that time, more than an hour after
+  the commit, so the limit above makes it unreadable on every device.
+  So this rule too gives every device the same result, whenever it
+  fetched and whatever its own clock says. A device does not delete
+  them by its own clock. A server can still show a post to some devices
+  in time and to others too late, but that changes only what devices
+  show, never which commit is valid (12.7).
 - Within an epoch, a device keeps the keys of skipped messages for at
   most 1,000 generations behind the newest it has seen from each
   sender, and rejects a message more than 1,000 generations ahead of
   it, or ahead of generation 0 if it has seen none from that sender.
   With the rules above, a device holds the secrets of at most 2 past
-  epochs, and of none for more than 2 hours after it applied the commit
-  that ended it, except for a day after a move (below).
+  epochs of each mailbox, and, once it has caught up, of none whose
+  ending commit is more than 2 hours old by the server's time.
 - After a move (7.8), a post in the old mailbox that comes after the
   move has no place in the new mailbox's order. A device judges it by
   the old mailbox's order alone, as of the move: the commits that count
@@ -1610,19 +1614,18 @@ message by where it falls in that order, not only by its epoch:
   new one, whether it has applied them yet or not. So the rules that
   depend only on the posts give every device the same result, whichever
   mailbox it read first.
-- For the same reason, a device keeps the secrets of the old mailbox's
-  last epochs, with their skipped-message keys, for as long as it
-  follows the old mailbox, a day after it applied the move (7.8), and
-  deletes them when it stops, rather than 2 hours after the commits
-  that ended them. These are the past epochs whose secrets it still
-  holds when it applies the move: at most the 2 before the move's
-  epoch, since the move's epoch is the newest that counts in the old
-  mailbox. So whether a late post there can be read does not depend on
-  when each device fetched it after the move. The limits above still
-  apply to them, judged by the old mailbox's order alone: posts in the
-  old mailbox can put them past a limit, and the device then deletes
-  them at once, but commits in the new mailbox cannot. It holds these
-  secrets besides those of at most 2 past epochs of the new mailbox.
+- For the same reason, the old mailbox's last epochs, whose secrets a
+  device still holds when it applies the move, are judged by the old
+  mailbox alone: by its posts, and by catching up there after the
+  server time passes 2 hours after the commit that ended each. These
+  are at most the 2 epochs before the move's, since the move's epoch is
+  the newest that counts in the old mailbox. Posts in the old mailbox
+  can put them past a limit, and the device then deletes them at once,
+  but commits in the new mailbox cannot. So whether a late post there
+  can be read does not depend on when each device fetched it, or
+  applied the move. A device deletes them at the latest when it stops
+  following the old mailbox (7.8). It holds them besides the secrets of
+  at most 2 past epochs of the new mailbox.
 
 The content is one or more lines in UTF-8, in the format of Section 3,
 each ending in LF. The rules of 2.3 for characters apply to these lines,
