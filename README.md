@@ -31,11 +31,10 @@ messages without learning who sent them, and keeps no history.
   to 10,000, with guests.
 
 The protocol is defined in the spec ([`spec/`](spec/)), now at draft-03.
-Anything in it may still change. Draft-03 is a design: the code here
-still implements most of draft-02, which had plaintext public rooms and
-history kept on the server, and is being moved to draft-03 (PLAN.md,
-item 59). Its new constructions, such as deniable leaf confirmation,
-epochal signatures and send tokens, have not been reviewed yet.
+Anything in it may still change. The code here follows draft-03
+(PLAN.md, M5b). Its new constructions, such as deniable leaf
+confirmation, epochal signatures and send tokens, have not been
+reviewed yet.
 
 ## This repository
 
@@ -258,8 +257,8 @@ cargo run -p risala-server -- --config risalad.toml
 it down cleanly: every connection gets `BYE server shutting down`.
 
 **Connecting.** Clients need TLS 1.3 with the post-quantum key exchange
-X25519MLKEM768 (Section 2.1 of the spec). Today's `risalad` still speaks
-draft-02, so `risala-cli` is the client to use with it. To look at a
+X25519MLKEM768 (Section 2.1 of the spec). Today's `risalad` speaks
+draft-03, and `risala-cli` is the client to use with it. To look at a
 server from a terminal, `openssl` 3.5 or later works:
 
 ```
