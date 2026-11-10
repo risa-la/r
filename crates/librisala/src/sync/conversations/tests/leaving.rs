@@ -513,3 +513,52 @@ fn a_leave_commit_that_fails_its_own_checks_still_leaves() {
     assert_eq!(net.state(phone, p), ConvState::Active);
     assert_eq!(net.epoch(bob, b), net.epoch(phone, p));
 }
+
+/// 6.1: in a public room too, a device that leaves first removes its
+/// identity's other leaves, in a commit the server takes, then posts its
+/// SelfRemove, which Alice commits.
+#[test]
+fn a_device_leaving_a_public_room_removes_its_other_leaves_first() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let laptop = net.device("bob", "bob@example.net");
+    let phone = net.device_of("bob-phone", laptop);
+    for d in [alice, laptop, phone] {
+        net.connect(d);
+    }
+    let room: Room = "#general".parse().unwrap();
+    let a = net
+        .job(alice, Job::PublicRoom { room: room.clone() })
+        .expect("created");
+    let mut joined = Vec::new();
+    for d in [laptop, phone] {
+        joined.push(
+            net.job_over(
+                d,
+                Job::JoinPublic {
+                    room: room.clone(),
+                    new_group: false,
+                },
+                5,
+            )
+            .expect("joined"),
+        );
+    }
+    let (l, p) = (joined[0], joined[1]);
+    net.tick();
+    assert_eq!(net.leaves(alice, a).len(), 3);
+    let commits = posts(&net, alice, a, ContentType::Commit);
+
+    assert!(!leave(&mut net, laptop, l));
+    for _ in 0..12 {
+        net.advance(MINUTE);
+    }
+    assert!(
+        posts(&net, alice, a, ContentType::Commit) >= commits + 2,
+        "the leave commit, then Alice's commit of the SelfRemove"
+    );
+    assert_eq!(net.state(laptop, l), ConvState::Left);
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
+    assert_eq!(net.state(alice, a), ConvState::Active);
+}
