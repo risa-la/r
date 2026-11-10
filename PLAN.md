@@ -2560,6 +2560,66 @@ Open:
       REFETCH, and risala-mls and librisala build nudges, as part of
       M5b's "the code follows".
 
+66. **Open points from M5b's merge, and the draft-03 delivery model's
+    findings**, decided with the user on 2026-11-10. The agents that
+    fixed item 63 raised points of their own, and the TLA+ model of
+    draft-03 (`proofs/delivery`) found three problems and three
+    ambiguities. Settled:
+
+    *Membership and keys.*
+    - **Leaving locally removes own leaves first** (6.1). A device that
+      leaves locally, in a group with no leaf of another identity, first
+      commits the removal of its own other devices' leaves, then forgets
+      the group, so that none of them can Welcome it back later.
+    - **A joiner checks only what it can** (12.7). The device binding
+      covers the KeyPackage's init key, which the tree no longer holds,
+      so a device that joins by Welcome checks only that each leaf's
+      device is current and not removed. The members present when a leaf
+      was added checked its binding, and confirmation (12.10) catches the
+      rest. Text only; the code already does this.
+    - **Bans are capped at 10,000 uids**, the largest room's member
+      limit (6.4). Devices refuse a commit that leaves more in `bans`,
+      and risala-mls finds duplicate uids with a hash set, not in
+      quadratic time.
+
+    *Blobs and the server.*
+    - **BLOB keeps needing box and token** (12.12). The spec says that an
+      external commit and a new public room's CREATE, which cannot store
+      blobs, must fit a line (`ERR too-long` otherwise), and 14 says the
+      server can link a Welcome blob to the group's mailbox.
+    - **risalad counts a public room's tree in blob memory**: a public
+      POST reads it under the command's one reservation, as the
+      GroupInfo and message are.
+    - **Per-address limits stay as they are**: posts, commits, creates,
+      reports, KEYPKG GET and HTTPS connections. Operators tune them.
+    - **A report over `max_reported_bytes` is still accepted**, and its
+      blobs and files are kept only for retention, with a warning in the
+      log, as the code does.
+
+    *Delivery.*
+    - **Messages do not wait for a move** (7.8). After another member's
+      removal, a device sends its queued messages in the current epoch
+      at once. The removed member cannot read them, and sees only that
+      the group talks, as it could until the move anyway.
+    - **The model's three fixes go into the spec:** a device that finds
+      that posts after its sync point expired unread treats the group as
+      one it can no longer follow (7.5) and applies nothing after the gap
+      (7.4, `GapLost`); the server ends only a mailbox created more than
+      a retention period ago (7.5, `EndAfterUse`); and a device whose
+      POST of a commit went unanswered posts the same commit again, not
+      a new one, and keeps its state until a commit for that epoch has
+      been applied (7.6, `SameCommit`). librisala must stop applying
+      posts after a gap; risalad and librisala already do the other two.
+    - **The model's three wordings go into the spec:** FETCH repeats with
+      `after=` the last seq of the page (7.4); FOLLOW's head is the
+      newest seq the server has given out, or `0` if none (7.1); and a
+      post in the old mailbox that comes after a move is judged by the
+      old mailbox's order alone, as of the move (12.9).
+
+    *The CLI.*
+    - **`send` into a group whose sending is held exits 0**, printing
+      that the message is queued and why. Held is not failed.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
