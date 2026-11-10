@@ -286,9 +286,19 @@ struct {
   compared byte for byte (12.7).
 - In a room, `owners` holds at least one uid. In a direct conversation
   the lists are empty. Every uid in `owners`, `mods` and `bans` is an
-  identity, not a guest. A uid is in at most one of `owners` and `mods`.
+  identity, not a guest. A uid is in at most one of `owners` and `mods`,
+  and appears at most once in each of `owners`, `mods` and `bans`.
   `bans` holds at most 10,000 uids, the member limit of the largest
   room (6.1).
+
+The rules on the lists, like the rest of this section, are format
+rules: an extension that breaks one is not well formed. Everyone who reads an extension checks them, wherever it
+comes from: a device that joins by Welcome or by external commit
+(12.7), a device that applies a commit (12.7) or checks its own before
+posting it, and the server, in a new public room's CREATE (5.2) and in
+every commit it checks in a public room (12.6). Since `bans` may be
+long, implementations find repeats with a hash set or by sorting, not by
+comparing every pair.
 
 The group context has exactly two extensions: `required_capabilities`
 first, which lists the extension types `0xF2A1`, `0xF2A2` and `0xF2A3`,
@@ -470,7 +480,8 @@ outside the group can, and refuses one that fails:
    state, which in a public room is all of them but the path secrets and
    the confirmation tag: who may add and remove whom, and how many,
    which fields of the conversation extension change and by whom, bans
-   (by the uids in credentials), the `guests` setting, the size limits
+   (by the uids in credentials), that the conversation extension stays
+   well formed (12.4), the `guests` setting, the size limits
    of 6.1, external commits only as resync commits and rejoins (12.7),
    signature key changes, the `updated` (against its own clock, which
    gives the post its `t`) and `streak` of the committer, of each Update
@@ -769,8 +780,9 @@ checks:
 - **Extensions.** A GroupContextExtensions proposal changes only the
   fields of the conversation extension that the committer may change
   (6.2, 6.3), and the other extension is unchanged. A commit that adds a
-  uid to `bans` also takes it out of `owners` and `mods` (6.4), and
-  leaves at most 10,000 uids in `bans` (12.4). In a
+  uid to `bans` also takes it out of `owners` and `mods` (6.4), and the
+  extension it leaves is well formed (12.4), which caps `bans` at
+  10,000 uids and allows no uid twice in a list. In a
   direct conversation or a private room, any member may instead change
   `box` alone, to move the mailbox, in a commit with no other proposal,
   and the new `box` is the one that 7.8 derives from the epoch the

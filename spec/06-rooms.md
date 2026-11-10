@@ -292,9 +292,12 @@ Owners and moderators moderate with commits:
   pseudonym instead (below), or ask an operator to ban its network
   address (10.2).
 - **Unban** is a commit that takes a uid out of `bans`.
-- **At most 10,000 bans,** the member limit of the largest room (6.1).
-  Devices refuse a commit that leaves more uids in `bans`, and in public
-  rooms the server refuses it too (12.4, 12.6).
+- **At most 10,000 bans,** the member limit of the largest room (6.1),
+  and no uid twice in `owners`, `mods` or `bans`. These are format rules
+  of the conversation extension (12.4): devices refuse a commit that
+  breaks them, and a group that breaks them when they join (12.7), and
+  in public rooms the server refuses such a commit or CREATE too (5.2,
+  12.6).
 - **Kicking a moderator.** A kick leaves roles as they are, since a
   kicked member may be invited back. An owner who kicks a moderator for
   abuse SHOULD take them out of `mods` in the same commit.

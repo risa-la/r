@@ -73,9 +73,9 @@ for epoch 0 (7.2), in base64 with padding.
   padding: the device cannot store them as blobs, since the mailbox
   does not exist yet, so they must fit in the line (12.12). The server
   checks them as in 12.6: one leaf, whose credential names the
-  connection's identity, and a conversation extension of kind
-  `public_room` that names this server, `<box>` and `<room>`, with that
-  identity as an owner. As for a commit's (12.6), the GroupInfo carries
+  connection's identity, and a well-formed conversation extension
+  (12.4) of kind `public_room` that names this server, `<box>` and
+  `<room>`, with that identity as an owner. As for a commit's (12.6), the GroupInfo carries
   the `external_pub` extension and no `ratchet_tree` extension, its
   group context's tree hash is that of `<tree>`, and its signer is the
   one leaf (`ERR invalid`).
