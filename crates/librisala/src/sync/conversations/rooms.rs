@@ -614,6 +614,22 @@ impl ConversationEngine {
             );
         }
         let joins = self.write(cx, me, out, |tx, c| Ok(tx.joins(c.account)?))?;
+        // 6.1: a join the user gave up by leaving the room ends its job.
+        let given_up: Vec<ConversationId> = self
+            .join_jobs
+            .keys()
+            .filter(|conv| !joins.iter().any(|j| j.conv == **conv))
+            .copied()
+            .collect();
+        for conv in given_up {
+            let left = self.write(cx, me, out, |tx, _| {
+                Ok(tx.conversation(conv)?.state == ConvState::Left)
+            })?;
+            if left && let Some(job) = self.join_jobs.remove(&conv) {
+                self.join_checks.remove(&conv);
+                out.push(job_done(job, None, Some("left while joining".into())));
+            }
+        }
         for join in joins {
             if self.join_inflight.contains(&join.conv) {
                 continue;

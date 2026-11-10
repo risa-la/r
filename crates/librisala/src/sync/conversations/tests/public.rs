@@ -386,3 +386,86 @@ fn a_room_whose_server_took_an_invalid_commit_is_resynced() {
             .contains(&("alice@example.org".into(), "back again".into()))
     );
 }
+
+/// 6.1: leaving a public room while joining it gives the join up: the room
+/// is left, the join's leaf key forgotten, and its job ends. When Alice
+/// commits the proposal later, Bob does not fetch the Welcome.
+#[test]
+fn leaving_a_room_while_joining_it_gives_the_join_up() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    net.connect(alice);
+    let a = net
+        .job(alice, Job::PublicRoom { room: room() })
+        .expect("created");
+    // Alice is away: nobody commits Bob's join proposal.
+    net.disconnect(alice);
+    let bob = net.device("bob", "bob@example.net");
+    net.connect(bob);
+    let cx = net.cx(bob);
+    let (job, actions) = net.devices[bob].engine.start(
+        &cx,
+        Job::JoinPublic {
+            room: room(),
+            new_group: false,
+        },
+    );
+    net.act(bob, actions);
+    net.run();
+    net.tick();
+    let b = net
+        .convs(bob)
+        .into_iter()
+        .find(|c| c.kind == ConvKind::Public)
+        .unwrap()
+        .id;
+    assert_eq!(net.state(bob, b), ConvState::Joining);
+    let join = net.write(bob, |tx| Ok(tx.join_of(b)?)).expect("a join");
+    let leaf_key = risala_mls::keypackage::read_key_package(&join.key_package)
+        .unwrap()
+        .unverified_credential()
+        .signature_key
+        .as_slice()
+        .to_vec();
+    let has_leaf_key = |net: &Net| {
+        net.write(bob, |tx| {
+            Ok(risala_mls::mldsa::LeafKey::load(
+                &tx.mls_storage(),
+                risala_mls::mldsa::KEY_PACKAGE_SCOPE,
+                &leaf_key,
+            )
+            .unwrap()
+            .is_some())
+        })
+    };
+    assert!(has_leaf_key(&net));
+
+    let own = net.devices[bob].uid.clone();
+    let now = net.clock.now().unix_millis();
+    assert!(net.write(bob, |tx| group::leave(tx, b, &own, now)));
+    net.tick();
+    assert_eq!(net.state(bob, b), ConvState::Left);
+    assert!(net.write(bob, |tx| Ok(tx.join_of(b)?)).is_none());
+    assert!(!has_leaf_key(&net));
+    assert_eq!(
+        net.job_result(bob, job),
+        Some(Err("left while joining".into()))
+    );
+
+    // Alice commits the proposal; Bob asks for no Welcome and stays out.
+    let asked = |net: &Net| {
+        net.server
+            .log
+            .iter()
+            .filter(|((d, _), verb)| *d == bob && (verb == "GROUPINFO" || verb == "WELCOME"))
+            .count()
+    };
+    let before = asked(&net);
+    net.connect(alice);
+    for _ in 0..12 {
+        net.advance(60_000);
+    }
+    assert!(net.leaves(alice, a).contains(&"bob@example.net".to_owned()));
+    assert_eq!(asked(&net), before);
+    assert_eq!(net.state(bob, b), ConvState::Left);
+}

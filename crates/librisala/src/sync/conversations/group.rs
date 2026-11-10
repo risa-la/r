@@ -435,11 +435,12 @@ fn leave_alone(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Re
 /// key are deleted, what it had queued is dropped, and the conversation is
 /// left, as when the device is removed; the engine then unfollows its
 /// mailboxes. Messages stay, as for any conversation left. A conversation
-/// the device can no longer follow (7.5), whose group is forgotten
-/// already, is left too.
+/// the device can no longer follow (7.5), or a public room it is joining
+/// ([`cancel_join`]), which have no group or a forgotten one, are left
+/// too.
 pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()> {
     let row = tx.conversation(conv)?;
-    if !row.state.in_group() && row.state != ConvState::Lost {
+    if !row.state.in_group() && !matches!(row.state, ConvState::Lost | ConvState::Joining) {
         return Ok(());
     }
     {
@@ -525,6 +526,30 @@ fn tell_own_devices(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) 
     )?;
     tracing::info!(%conv, "asked the identity's other devices to leave the group");
     Ok(())
+}
+
+/// Gives up joining a public room, for the first time or again after the
+/// device could not follow it (6.1, 12.7), as the user leaves it: the
+/// join's KeyPackage is forgotten with its keys, so that a Welcome from a
+/// commit that added it can no longer be opened, and the room is left
+/// for good ([`leave_for_good`]), so that the device does not join it
+/// again by itself. A leaf the join already got stays in the room until
+/// it is stale (12.7).
+fn cancel_join(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<()> {
+    if let Some(join) = tx.join_of(conv)? {
+        match read_key_package(&join.key_package) {
+            Ok(kp) => risala_mls::keypackage::forget_join_key_package(
+                &tx.mls_storage(),
+                &join.reference,
+                kp.unverified_credential().signature_key.as_slice(),
+            )
+            .map_err(|e| EngineError::Mls(format!("{e:?}")))?,
+            Err(e) => tracing::warn!(%conv, error = %e, "the join's KeyPackage cannot be read"),
+        }
+        tx.delete_join(join.id)?;
+    }
+    tracing::info!(%conv, "left a public room while joining it");
+    leave_for_good(tx, conv, own, now)
 }
 
 /// Whether this device left `conv` by itself, its leaf perhaps still in
@@ -1472,12 +1497,17 @@ fn after_commit(
 /// identity has no other leaf, and otherwise once its commit that removes
 /// them is applied. A conversation the device can no longer follow (7.5)
 /// is left locally at once, for good ([`leave_for_good`]): it has no group
-/// to post a SelfRemove or a commit in. Returns whether it has left
-/// already.
+/// to post a SelfRemove or a commit in. So is a public room the device is
+/// joining, or joining again: the join is given up ([`cancel_join`]).
+/// Returns whether it has left already.
 pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<bool> {
     let row = tx.conversation(conv)?;
     if row.state == ConvState::Lost {
         leave_for_good(tx, conv, own, now)?;
+        return Ok(true);
+    }
+    if row.state == ConvState::Joining {
+        cancel_join(tx, conv, own, now)?;
         return Ok(true);
     }
     if !row.state.in_group() || leaving(tx, conv)? {
