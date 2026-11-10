@@ -1220,6 +1220,11 @@ fn after_commit(
         if current.mailbox != new_box {
             tx.retire_mailbox(conv.id, &current.mailbox, cx.now + super::OLD_MAILBOX_MS)?;
             tx.add_mailbox(conv.id, &new_box, true, group.epoch().as_u64(), None)?;
+            // Every post there is of the device's epoch or later: posts
+            // that expire there unread count from the start (7.4).
+            if let Some(mb) = tx.mailbox(cx.account, &new_box)? {
+                tx.set_sync(conv.id, &new_box, mb.sync_point, Some(mb.head.unwrap_or(0)))?;
+            }
             applied.notes.push(Note::Moved {
                 conv: conv.id,
                 mailbox: new_box,
@@ -1685,6 +1690,9 @@ pub(crate) fn join_welcome(
         if tx.current_mailbox(existing.id).map(|m| m.mailbox).ok() != Some(mailbox) {
             tx.add_mailbox(existing.id, &mailbox, true, epoch, None)?;
         }
+        // 12.8: posts that expired before the Welcome are of earlier epochs
+        // (7.4); the engine sets the head again if it has caught up.
+        tx.forget_head(existing.id, &mailbox)?;
         if joined.last_resort {
             tx.set_last_resort(existing.id)?;
             queue_intent(

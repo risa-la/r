@@ -373,7 +373,11 @@ impl ConversationEngine {
                 let resync = !me.guest && state.epoch == epoch + 1;
                 let r = self.write(cx, &me, out, |tx, c| {
                     let (room, _) = public::room_of(tx, conv)?;
-                    if resync {
+                    // 7.5: a room lost to posts that expired unread is
+                    // joined again by proposal: the commits it missed may
+                    // have been valid, and a resync commit would undo one.
+                    let lost = tx.conversation(conv)?.state == ConvState::Lost;
+                    if resync && !lost {
                         public::external_join(tx, c, conv, &room, &state, External::Resync)?;
                         Ok(None)
                     } else {
@@ -389,6 +393,15 @@ impl ConversationEngine {
                     }
                     Ok(None) => {}
                     Err(e) => {
+                        // 12.7: a room it lost (7.5) that the server changed
+                        // waits for the user, who may accept the change and
+                        // join again, rather than asking again.
+                        let lost = self
+                            .write(cx, &me, out, |tx, _| Ok(tx.conversation(conv)?.state))
+                            .is_ok_and(|s| s == ConvState::Lost);
+                        if lost && matches!(e, EngineError::RoomChanged { .. }) {
+                            self.stuck.insert(conv, (epoch, u64::MAX));
+                        }
                         self.room_error(&e, out);
                         tracing::warn!(error = %e, "could not resync a public room");
                     }
@@ -617,6 +630,22 @@ impl ConversationEngine {
                     purpose: RoomPurpose::Check { conv: join.conv },
                 },
             );
+        }
+        // 6.1, 7.5: a public room this device can no longer follow is
+        // joined again, also after the engine started again.
+        let lost: Vec<(ConversationId, u64)> = self.write(cx, me, out, |tx, c| {
+            Ok(tx
+                .conversations_of(c.account)?
+                .into_iter()
+                .filter(|r| r.kind == ConvKind::Public && r.state == ConvState::Lost)
+                .map(|r| (r.id, r.epoch))
+                .collect())
+        })?;
+        for (conv, epoch) in lost {
+            if !self.stuck.contains_key(&conv) {
+                let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
+                self.stuck.insert(conv, (epoch, now + wait));
+            }
         }
         let due: Vec<(ConversationId, u64)> = self
             .stuck

@@ -39,6 +39,15 @@ struct Mailbox {
     tokens: HashMap<u64, HashSet<[u8; 48]>>,
     followers: HashSet<ConnId>,
     room: Option<FakeRoom>,
+    /// How many of its oldest posts have expired (7.5).
+    expired: u64,
+}
+
+impl Mailbox {
+    /// The seq of the newest post given out, or 0 (7.1).
+    fn head(&self) -> u64 {
+        self.expired + self.posts.len() as u64
+    }
 }
 
 /// A public room's group as the server holds it (12.6).
@@ -336,7 +345,7 @@ impl FakeServer {
                 for r in added {
                     fresh.added.insert(r, new_epoch);
                 }
-                fresh.epoch_seq = m.posts.len() as u64 + 1;
+                fresh.epoch_seq = m.expired + m.posts.len() as u64 + 1;
                 *room = fresh;
                 None
             }
@@ -362,9 +371,18 @@ impl FakeServer {
     /// its seq.
     pub fn inject_post(&mut self, mailbox: &BoxName, t: u64, message: Vec<u8>) -> u64 {
         let m = self.mailboxes.get_mut(&mailbox.to_string()).unwrap();
-        let seq = m.posts.len() as u64 + 1;
+        let seq = m.head() + 1;
         m.posts.push((seq, t, message, None));
         seq
+    }
+
+    /// Expires a mailbox's posts up to `seq`, oldest first, as retention
+    /// does (7.5). Their seqs are not used again.
+    pub fn expire(&mut self, mailbox: &BoxName, seq: u64) {
+        let m = self.mailboxes.get_mut(&mailbox.to_string()).unwrap();
+        let before = m.posts.len();
+        m.posts.retain(|p| p.0 > seq);
+        m.expired += (before - m.posts.len()) as u64;
     }
 
     /// How many KeyPackages a device has here.
@@ -511,6 +529,7 @@ impl FakeServer {
                                 tokens,
                                 followers: HashSet::new(),
                                 room,
+                                expired: 0,
                             });
                             End::Ok(ok())
                         }
@@ -591,7 +610,7 @@ impl FakeServer {
                                     }
                                     End::Ok(ok())
                                 } else {
-                                    let seq = m.posts.len() as u64 + 1;
+                                    let seq = m.head() + 1;
                                     let next = next.map(|n| *n.as_bytes());
                                     if let Some(n) = next {
                                         m.tokens.entry(epoch + 1).or_default().insert(n);
@@ -614,7 +633,7 @@ impl FakeServer {
                 None => err(ErrorCode::NotFound),
                 Some(m) => {
                     m.followers.insert(conn);
-                    End::Ok(ok().with_head(m.posts.len() as u64))
+                    End::Ok(ok().with_head(m.head()))
                 }
             },
             Command::Unfollow { mailbox } => {

@@ -1,8 +1,9 @@
-//! Recovery paths of the group engine (7.8, 12.7, 12.8): replacing stale
-//! leaves, `RESYNC <box> <seq>` to the identity's other devices, who
-//! replaces a leaf that asked with RESYNC, the move by any member after
-//! another's removal, and the warning that the device may have joined a
-//! branch of the group that nobody follows.
+//! Recovery paths of the group engine (7.4, 7.5, 7.8, 12.7, 12.8):
+//! replacing stale leaves, `RESYNC <box> <seq>` to the identity's other
+//! devices, who replaces a leaf that asked with RESYNC, the move by any
+//! member after another's removal, groups the device can no longer follow
+//! after posts expired unread, and the warning that the device may have
+//! joined a branch of the group that nobody follows.
 
 use risala_mls::checks::{EpochState, GroupView, own_leaves_to_replace};
 use risala_mls::conversation::Role;
@@ -17,6 +18,7 @@ use crate::client::Event;
 use crate::client::conversations::ConversationEvent;
 use crate::store::Tx;
 use crate::store::conversations::{ConvKind, ConvRow, ConvState, ConversationId};
+use crate::store::messages::{OutboxKind, OutboxState};
 use crate::sync::{Action, Context};
 use risala_proto::command::{Command, KeyPkgCommand};
 
@@ -71,7 +73,92 @@ pub(crate) fn may_replace(
     })
 }
 
+/// Marks `conv` as a group the device can no longer follow (7.4, 7.5):
+/// posts after its sync point expired before it applied them, and it
+/// cannot tell whether they held commits. Its commits made for the epoch
+/// it holds are dropped, and their intents queued again for when it is
+/// back (7.2). Its group, of no more use, is forgotten with its leaf key,
+/// as when it is removed. Until it is back it applies and posts nothing
+/// there, and follows none of its mailboxes: in a public room it joins
+/// again (6.1); in other conversations its leaf is replaced, by its
+/// identity's other devices once the leaf is stale and by other members'
+/// after 35 days, and a Welcome brings it back, as for a new device
+/// (7.5, 12.7).
+pub(super) fn cannot_follow(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: ConversationId,
+) -> Result<(), EngineError> {
+    let row = tx.conversation(conv)?;
+    for o in tx.pending_outbox(conv)? {
+        if o.kind == OutboxKind::Commit
+            && o.post.is_some()
+            && !matches!(o.state, OutboxState::Lost | OutboxState::Done)
+        {
+            group::commit_lost(tx, cx, &row, &o)?;
+        }
+    }
+    if let Ok(mut old) = group::load(tx, cx, &row.group_id) {
+        mls_group::forget_group(&tx.mls(cx.crypto), &mut old)
+            .map_err(|e| EngineError::Mls(e.to_string()))?;
+    }
+    tx.set_state(conv, ConvState::Lost)?;
+    tracing::info!(%conv, "posts expired unread: the device can no longer follow the group");
+    Ok(())
+}
+
 impl ConversationEngine {
+    /// After [`cannot_follow`]: tells the user, and in a public room joins
+    /// again by proposal, after a random wait (6.1). It goes the way of a
+    /// room it cannot follow (12.7), but never makes a resync commit: the
+    /// commits it missed may have been valid.
+    pub(super) fn lost(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        out: &mut Vec<Action>,
+    ) {
+        self.move_timers.remove(&conv);
+        self.proposal_timers.remove(&conv);
+        self.unprocessable.remove(&conv);
+        self.resync_since.remove(&conv);
+        out.push(Action::Emit(Event::Conversation(
+            ConversationEvent::CannotFollow { conversation: conv },
+        )));
+        let row = self.write(cx, me, out, |tx, _| Ok(tx.conversation(conv)?));
+        if let Ok(row) = row
+            && row.kind == ConvKind::Public
+            && !self.stuck.contains_key(&conv)
+        {
+            let wait = super::random_below(self.config.max_commit_wait_ms).unwrap_or(0);
+            self.stuck.insert(conv, (row.epoch, self.now() + wait));
+        }
+    }
+
+    /// After a Welcome into `conv`: a mailbox the device already follows
+    /// and has caught up in needs no first catch-up, so posts that expire
+    /// unread there count from now on (7.4, 12.8).
+    pub(super) fn welcomed(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        out: &mut Vec<Action>,
+    ) -> Result<(), EngineError> {
+        let Some(mb) = self.write(cx, me, out, |tx, _| Ok(tx.current_mailbox(conv).ok()))? else {
+            return Ok(());
+        };
+        if mb.head.is_none() && self.caught_up(&mb.mailbox) {
+            self.joined_heads.remove(&mb.mailbox);
+            self.write(cx, me, out, |tx, _| {
+                tx.set_sync(conv, &mb.mailbox, mb.sync_point, Some(mb.sync_point))?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// 12.8: a day after joining by Welcome, a device that has seen no post
     /// in its epoch from any other leaf, while posts arrive that it cannot
     /// decrypt, tells the user that it may have joined a branch nobody

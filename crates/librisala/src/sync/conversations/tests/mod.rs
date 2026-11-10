@@ -4,6 +4,7 @@
 
 mod blobs;
 mod deletes;
+mod gaps;
 mod keychecks;
 mod leaving;
 mod own_commits;

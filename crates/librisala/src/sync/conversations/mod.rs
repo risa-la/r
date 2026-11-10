@@ -767,6 +767,10 @@ pub struct ConversationEngine {
     me: Option<Me>,
     ready: BTreeMap<Slot, ConnectionKind>,
     follows: HashMap<BoxName, Follow>,
+    /// The heads that FOLLOW reported for mailboxes the device has not yet
+    /// caught up in since it joined by Welcome, whose cached head stays
+    /// unset until it has (7.4, 12.8).
+    joined_heads: HashMap<BoxName, u64>,
     inflight: HashMap<Token, Pending>,
     next_token: u64,
     jobs: HashMap<JobId, JobState>,
@@ -871,6 +875,7 @@ impl ConversationEngine {
             me: None,
             ready: BTreeMap::new(),
             follows: HashMap::new(),
+            joined_heads: HashMap::new(),
             inflight: HashMap::new(),
             next_token: 1,
             jobs: HashMap::new(),
@@ -1976,10 +1981,20 @@ impl ConversationEngine {
                             tx.drop_posts(mb.conv, &mailbox)?;
                             sync = 0;
                         }
-                        tx.set_sync(mb.conv, &mailbox, sync, Some(head))?;
-                        Ok(Some(sync))
+                        // 12.8: a mailbox joined by Welcome keeps no head
+                        // until the device has caught up there once.
+                        let joined = mb.head.is_none() && sync < head;
+                        tx.set_sync(mb.conv, &mailbox, sync, (!joined).then_some(head))?;
+                        Ok(Some((sync, joined)))
                     })?;
-                    match sync {
+                    if let Some((_, joined)) = sync {
+                        if joined {
+                            self.joined_heads.insert(mailbox, head);
+                        } else {
+                            self.joined_heads.remove(&mailbox);
+                        }
+                    }
+                    match sync.map(|(sync, _)| sync) {
                         Some(sync) if sync < head => self.fetch(&mailbox, sync, out),
                         Some(_) => {
                             self.advance(cx, &me, &mailbox, out)?;
@@ -2023,8 +2038,11 @@ impl ConversationEngine {
                 let Some((l, head)) = before else {
                     return Ok(());
                 };
+                // 12.8: posts that expired before the device joined by
+                // Welcome are none of its business.
+                let joined = head.is_none();
+                let head = head.or_else(|| self.joined_heads.get(&mailbox).copied());
                 let mut last = after;
-                let mut first_after_l = None;
                 for line in &response.lines {
                     if let ServerLine::Post(post) = &line.line
                         && post.mailbox == mailbox
@@ -2032,9 +2050,6 @@ impl ConversationEngine {
                     {
                         let seq = seq.get();
                         last = last.max(seq);
-                        if seq > l {
-                            first_after_l = Some(first_after_l.map_or(seq, |f: u64| f.min(seq)));
-                        }
                         let message = match &post.message {
                             OrBlob::Inline(m) => (m.decode(), None),
                             OrBlob::Blob(b) => (Vec::new(), Some(*b.hash())),
@@ -2051,20 +2066,41 @@ impl ConversationEngine {
                         )?;
                     }
                 }
-                self.advance(cx, &me, &mailbox, out)?;
-                // Posts that expired (7.4): the first post after L is later
-                // than L + 1, or none is left up to the head.
+                // Posts that expired (7.4): the first post after L, of this
+                // page or kept from an earlier one, is later than L + 1, or
+                // none is left up to the head. Found before any post is
+                // applied, since what follows the gap may not be.
+                let first_after_l = self.write(cx, &me, out, |tx, c| {
+                    Ok(match tx.mailbox(c.account, &mailbox)? {
+                        Some(mb) => tx.first_kept_seq(mb.conv, &mailbox)?,
+                        None => None,
+                    })
+                })?;
                 let expired_to = match first_after_l {
                     Some(f) if f > l + 1 => Some(f - 1),
                     None if !more => head.filter(|h| *h > l),
                     _ => None,
                 };
+                let mut lost = None;
                 if let Some(to) = expired_to {
-                    let asked = self.write(cx, &me, out, |tx, c| {
+                    let (asked, conv) = self.write(cx, &me, out, |tx, c| {
                         let mut asked = Vec::new();
+                        let mut lost = None;
                         if let Some(mb) = tx.mailbox(c.account, &mailbox)?
                             && mb.sync_point < to
                         {
+                            // 7.4, 7.5: the device cannot tell whether the
+                            // expired posts held commits, so it can no
+                            // longer follow the group, and applies nothing
+                            // after the gap: the first commit it would see
+                            // for its epoch may have lost to one that
+                            // expired. Not for posts from before it joined,
+                            // nor in a mailbox the group moved away from,
+                            // whose commits it has all applied (7.8).
+                            if !joined && mb.current && tx.conversation(mb.conv)?.state.in_group() {
+                                recovery::cannot_follow(tx, c, mb.conv)?;
+                                lost = Some(mb.conv);
+                            }
                             tx.set_sync(mb.conv, &mailbox, to, None)?;
                             // 12.13: ask the identity's other devices (C4).
                             asked = c.hooks.posts_expired(
@@ -2075,10 +2111,17 @@ impl ConversationEngine {
                                 to + 1,
                             );
                         }
-                        Ok(asked)
+                        Ok((asked, lost))
                     })?;
                     out.extend(asked);
-                    self.advance(cx, &me, &mailbox, out)?;
+                    lost = conv;
+                }
+                // A conversation it can no longer follow takes no post:
+                // they go, unread, and the mailbox is no longer followed.
+                self.advance(cx, &me, &mailbox, out)?;
+                if let Some(conv) = lost {
+                    self.lost(cx, &me, conv, out);
+                    return Ok(());
                 }
                 if more {
                     self.send(
@@ -2116,6 +2159,18 @@ impl ConversationEngine {
                                 self.follows.get_mut(&mailbox)
                             {
                                 *caught_up = true;
+                            }
+                            if joined {
+                                // 12.8: caught up once since joining; from
+                                // now on, posts that expire unread count.
+                                let head = self.joined_heads.remove(&mailbox).unwrap_or(0);
+                                self.write(cx, &me, out, |tx, c| {
+                                    if let Some(mb) = tx.mailbox(c.account, &mailbox)? {
+                                        let head = head.max(mb.sync_point);
+                                        tx.set_sync(mb.conv, &mailbox, mb.sync_point, Some(head))?;
+                                    }
+                                    Ok(())
+                                })?;
                             }
                         }
                     }
@@ -2494,6 +2549,7 @@ impl ConversationEngine {
                 out.push(Action::Emit(Event::Conversation(
                     ConversationEvent::Joined { conversation: conv },
                 )));
+                self.welcomed(cx, &me, conv, out)?;
                 // 12.7, Joining: held until the leaves there are checked.
                 if self.write(cx, &me, out, |tx, _| Ok(tx.sending_held(conv)?))? {
                     out.push(Action::Emit(Event::Conversation(

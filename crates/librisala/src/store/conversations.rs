@@ -28,7 +28,9 @@ pub(crate) const SCHEMA: &str = "
 -- PART, 'left' once removed, 'dropped' after DROP (6.1), 'failed' if
 -- creating it failed, 'joining' while a public room's join proposal
 -- waits for its commit and Welcome, or while the device joins a public
--- room again that it could not follow (6.1, 12.7). last_resort: joined
+-- room again that it could not follow (6.1, 12.7), 'lost' once posts
+-- expired before the device applied them, until a Welcome or joining
+-- again brings it back (7.4, 7.5). last_resort: joined
 -- with a last-resort KeyPackage, so it must commit a new leaf key before
 -- it sends (12.5). prev_token is the send token of the epoch before the
 -- current one, for TOKEN (7.2). kept_ext is a public room's conversation
@@ -56,7 +58,7 @@ CREATE TABLE conversations (
     read_seq      INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT 'active'
                   CHECK (state IN ('creating', 'active', 'leaving', 'left', 'dropped', 'failed',
-                                   'joining')),
+                                   'joining', 'lost')),
     last_resort   INTEGER NOT NULL DEFAULT 0,
     created       INTEGER NOT NULL,
     last_activity INTEGER,
@@ -272,6 +274,12 @@ pub enum ConvState {
     /// Joining a public room by proposal, or again after the device could
     /// not follow it (6.1, 12.7).
     Joining,
+    /// Posts after its sync point expired before the device applied them,
+    /// so it can no longer follow the group (7.4, 7.5). Its group is
+    /// forgotten; it applies and posts nothing there, and follows none of
+    /// its mailboxes. A Welcome makes it active again; a public room is
+    /// joined again (6.1).
+    Lost,
 }
 
 impl ConvState {
@@ -284,6 +292,7 @@ impl ConvState {
             ConvState::Dropped => "dropped",
             ConvState::Failed => "failed",
             ConvState::Joining => "joining",
+            ConvState::Lost => "lost",
         }
     }
 
@@ -296,6 +305,7 @@ impl ConvState {
             "dropped" => ConvState::Dropped,
             "failed" => ConvState::Failed,
             "joining" => ConvState::Joining,
+            "lost" => ConvState::Lost,
             other => return Err(StoreError::Corrupt(format!("conversation state {other:?}"))),
         })
     }
@@ -470,7 +480,9 @@ pub struct MailboxRow {
     pub first_epoch: u64,
     /// The sync point (7.4).
     pub sync_point: u64,
-    /// The head FOLLOW last reported.
+    /// The head FOLLOW last reported. Unset in a mailbox the device joined
+    /// by Welcome until it has caught up there once: posts that expired
+    /// before that are from before it joined (7.4, 12.8).
     pub head: Option<u64>,
     /// Not to be followed before this time.
     pub follow_after: Option<u64>,
@@ -1118,6 +1130,19 @@ impl Tx<'_> {
                 sync_point as i64,
                 head.map(|h| h as i64)
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Unsets a mailbox's head, as for one joined by Welcome (12.8).
+    pub(crate) fn forget_head(
+        &mut self,
+        conv: ConversationId,
+        mailbox: &BoxName,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "UPDATE mailboxes SET head = NULL WHERE conv = ?1 AND box = ?2",
+            params![conv.0, mailbox.to_string()],
         )?;
         Ok(())
     }

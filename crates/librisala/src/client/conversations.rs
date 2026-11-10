@@ -121,6 +121,15 @@ pub enum ConversationEvent {
         /// The conversation.
         conversation: ConversationId,
     },
+    /// Posts that this device had not applied expired on the server, so it
+    /// cannot tell whether they held commits, and can no longer follow the
+    /// conversation (7.4, 7.5). It applies and posts nothing there until
+    /// its leaf is replaced and a Welcome brings it back (12.7), or, in a
+    /// public room, until it has joined again (6.1).
+    CannotFollow {
+        /// The conversation.
+        conversation: ConversationId,
+    },
     /// The server accepted a commit in a public room that this device holds
     /// invalid (12.7). The device resyncs the room or joins it again.
     InvalidCommitAccepted {
