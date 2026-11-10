@@ -26,6 +26,8 @@
 //! [`RisalaConversation::check_change`] that a commit changes only what its
 //! committer may (6.2, 6.3, 6.4).
 
+use std::collections::HashSet;
+
 use openmls::prelude::{
     Extension, ExtensionType, Extensions, GroupContext, RequiredCapabilitiesExtension,
     UnknownExtension,
@@ -49,6 +51,10 @@ pub const MAX_TOPIC_LEN: usize = 512;
 
 /// The longest private room name, in bytes (12.4).
 pub const MAX_PRIVATE_NAME_LEN: usize = 128;
+
+/// The most uids `bans` may hold: the member limit of the largest rooms,
+/// public ones (6.1, 6.4, 12.4).
+pub const MAX_BANS: usize = crate::checks::MAX_PUBLIC_IDENTITIES;
 
 /// The kind of conversation a group belongs to (12.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -397,6 +403,9 @@ impl RisalaConversation {
         if self.topic.len() > MAX_TOPIC_LEN {
             return invalid("topic longer than 512 bytes");
         }
+        if self.bans.len() > MAX_BANS {
+            return invalid("more than 10,000 uids in bans");
+        }
         for list in [&self.owners, &self.mods, &self.bans] {
             if list.iter().any(Uid::is_guest) {
                 return invalid("a guest in owners, mods or bans");
@@ -404,13 +413,13 @@ impl RisalaConversation {
             // 12.4 does not say so, but a list that names a uid twice has
             // no use, and two encodings of the same lists could tell
             // devices apart.
-            for (i, uid) in list.iter().enumerate() {
-                if list[..i].contains(uid) {
-                    return invalid("a uid twice in one list");
-                }
+            let mut seen = HashSet::with_capacity(list.len());
+            if !list.iter().all(|uid| seen.insert(uid)) {
+                return invalid("a uid twice in one list");
             }
         }
-        if self.owners.iter().any(|uid| self.mods.contains(uid)) {
+        let owners: HashSet<&Uid> = self.owners.iter().collect();
+        if self.mods.iter().any(|uid| owners.contains(uid)) {
             return invalid("a uid in both owners and mods");
         }
         match self.kind {
@@ -644,8 +653,10 @@ impl RisalaConversation {
             needs(mod_or_owner, "owners and moderators")?;
             // Moderators ban and unban plain members only (6.3, 6.4), by
             // their role as of the epoch the commit is for.
-            let added = new.bans.iter().filter(|uid| !self.bans.contains(uid));
-            let lifted = self.bans.iter().filter(|uid| !new.bans.contains(uid));
+            let (old_bans, new_bans): (HashSet<&Uid>, HashSet<&Uid>) =
+                (self.bans.iter().collect(), new.bans.iter().collect());
+            let added = new.bans.iter().filter(|uid| !old_bans.contains(uid));
+            let lifted = self.bans.iter().filter(|uid| !new_bans.contains(uid));
             for uid in added.clone().chain(lifted) {
                 if !owner && self.role(uid) != Role::Member {
                     return Err(ChangeError::NotAllowed("owners"));
@@ -696,8 +707,14 @@ pub struct Change {
     pub used_role: bool,
 }
 
+/// Whether two lists hold the same uids, in any order. Lists that pass
+/// [`RisalaConversation::check`] name no uid twice.
 fn same_set(a: &[Uid], b: &[Uid]) -> bool {
-    a.len() == b.len() && a.iter().all(|uid| b.contains(uid))
+    if a.len() != b.len() {
+        return false;
+    }
+    let b: HashSet<&Uid> = b.iter().collect();
+    a.iter().all(|uid| b.contains(uid))
 }
 
 /// Whether two `required_capabilities` extensions list the same things in
@@ -1024,5 +1041,92 @@ mod tests {
             old.check_change(&epochal, &crossing),
             Ok(Change { used_role: false })
         );
+    }
+
+    /// `n` distinct identities' uids.
+    fn uids(n: usize) -> Vec<Uid> {
+        (0..n).map(|i| uid(&format!("u{i}@x.org"))).collect()
+    }
+
+    /// `bans` holds at most 10,000 uids, the largest room's member limit
+    /// (6.4, 12.4): the extension is well formed up to the cap, round
+    /// trips, and is not one past it, in a public room or a private one.
+    #[test]
+    fn bans_are_capped() {
+        assert_eq!(MAX_BANS, 10_000);
+        let public = RisalaConversation::public_room(
+            server("chat.example.org"),
+            BOX,
+            &"#general".parse().unwrap(),
+            &uid("o@x.org"),
+        );
+        for base in [room(), public] {
+            let mut full = base.clone();
+            full.bans = uids(MAX_BANS);
+            assert_eq!(full.check(), Ok(()));
+            assert_eq!(RisalaConversation::decode(&full.encode()).unwrap(), full);
+            let mut over = full.clone();
+            over.bans.push(uid("one-more@x.org"));
+            assert_eq!(
+                over.check(),
+                Err(ConversationError::Invalid("more than 10,000 uids in bans"))
+            );
+            // Decoding reads it; checking refuses it.
+            assert_eq!(RisalaConversation::decode(&over.encode()).unwrap(), over);
+        }
+    }
+
+    /// A uid twice in a long list is found, wherever it is.
+    #[test]
+    fn duplicates_in_long_lists() {
+        let mut conv = room();
+        conv.bans = uids(MAX_BANS);
+        conv.bans[MAX_BANS - 1] = uid("u0@x.org");
+        assert_eq!(
+            conv.check(),
+            Err(ConversationError::Invalid("a uid twice in one list"))
+        );
+        let mut conv = room();
+        conv.mods = uids(5_000);
+        conv.owners.push(uid("u4999@x.org"));
+        assert_eq!(
+            conv.check(),
+            Err(ConversationError::Invalid("a uid in both owners and mods"))
+        );
+    }
+
+    /// A commit that would leave more than 10,000 uids in `bans` is not
+    /// allowed (6.4), even to an owner; one that takes it to the cap is,
+    /// and so is an unban from the cap.
+    #[test]
+    fn a_ban_past_the_cap_is_refused() {
+        let as_owner = ChangeRights::of_role(Role::Owner);
+        let mut old = room();
+        old.bans = uids(MAX_BANS - 1);
+        let mut to_cap = old.clone();
+        to_cap.bans.push(uid("p@x.org"));
+        assert_eq!(
+            old.check_change(&to_cap, &as_owner),
+            Ok(Change { used_role: true })
+        );
+        let mut past = to_cap.clone();
+        past.bans.push(uid("q@x.org"));
+        assert!(matches!(
+            to_cap.check_change(&past, &as_owner),
+            Err(ChangeError::Invalid(ConversationError::Invalid(_)))
+        ));
+        // Swapping one ban for another at the cap, and lifting one, are
+        // fine: the order of `bans` does not matter.
+        let mut swapped = to_cap.clone();
+        swapped.bans[0] = uid("q@x.org");
+        swapped.bans.reverse();
+        assert!(to_cap.check_change(&swapped, &as_owner).is_ok());
+        let mut lifted = to_cap.clone();
+        lifted.bans.pop();
+        assert!(to_cap.check_change(&lifted, &as_owner).is_ok());
+        assert_eq!(to_cap.unexplained_changes(&swapped), ["bans"]);
+        let mut reordered = to_cap.clone();
+        reordered.bans.reverse();
+        assert!(to_cap.unexplained_changes(&reordered).is_empty());
     }
 }

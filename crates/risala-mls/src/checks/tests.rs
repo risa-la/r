@@ -622,6 +622,49 @@ fn guests_and_bans() {
     assert!(check(&g, &ban).is_ok());
 }
 
+/// Devices refuse a commit that leaves more than 10,000 uids in `bans`
+/// (6.4): a ban that reaches the cap is valid, one past it is not, and
+/// commits that leave a full list alone still are.
+#[test]
+fn bans_are_capped() {
+    use crate::conversation::MAX_BANS;
+    for kind in [ConversationKind::PublicRoom, ConversationKind::PrivateRoom] {
+        let mut conv = room(kind);
+        conv.bans = (0..MAX_BANS - 1)
+            .map(|i| uid(&format!("b{i}@x.org")))
+            .collect();
+        let g = group(&conv);
+        let ban = |g: &GroupView, who: &str, leaves: &[u32]| {
+            let mut ban = commit(g, 0, vec![ProposalView::GroupContextExtensions]);
+            ban.proposals.extend(remove(leaves));
+            ban.new_conversation.as_mut().unwrap().bans.push(uid(who));
+            ban
+        };
+        // The 10,000th ban.
+        assert!(check(&g, &ban(&g, "p@x.org", &[2, 3])).is_ok());
+        // At the cap, nobody more, not even by an owner.
+        let mut full = conv.clone();
+        full.bans.push(uid("p@x.org"));
+        let gf = view(
+            &full,
+            vec![
+                leaf(0, "o@x.org", T),
+                leaf(1, "m@x.org", T),
+                leaf(2, "q@x.org", T),
+            ],
+        );
+        assert!(matches!(
+            check(&gf, &ban(&gf, "q@x.org", &[2])),
+            Err(CommitError::Extension(_))
+        ));
+        // Other commits go on, and an unban makes room again.
+        assert!(check(&gf, &commit(&gf, 2, vec![])).is_ok());
+        let mut unban = commit(&gf, 0, vec![ProposalView::GroupContextExtensions]);
+        unban.new_conversation.as_mut().unwrap().bans.remove(0);
+        assert!(check(&gf, &unban).is_ok());
+    }
+}
+
 /// A room whose owners are gone: moderators act as owners (6.3).
 #[test]
 fn ownerless_rooms() {

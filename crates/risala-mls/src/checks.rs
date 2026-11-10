@@ -23,7 +23,7 @@
 //! [`EpochState`]: which leaf started the epoch, and the `t` of the posts
 //! of the epoch's proposals.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use openmls::group::{QueuedProposal, StagedCommit};
 use openmls::messages::group_info::VerifiableGroupInfo;
@@ -603,12 +603,14 @@ pub fn check_join(group: &GroupView, expect: &JoinExpectation) -> Result<(), Joi
     }
     let mut devices = BTreeSet::new();
     let mut guests_in_direct = BTreeMap::<&Uid, usize>::new();
+    // Up to 10,000 bans against up to 32,768 leaves (6.1, 6.4).
+    let bans: HashSet<&Uid> = conversation.bans.iter().collect();
     for leaf in &group.leaves {
         let identity = leaf.identity.as_ref().ok_or(JoinError::Leaf)?;
         if (!identity.is_guest() && leaf.profile.is_none()) || !leaf.encryption_key_ok {
             return Err(JoinError::Leaf);
         }
-        if conversation.is_banned(&identity.uid) {
+        if bans.contains(&identity.uid) {
             return Err(JoinError::Banned);
         }
         match &participants {
@@ -1188,9 +1190,11 @@ pub fn check_commit(
         return Err(CommitError::Extension("changed without a proposal".into()));
     }
 
-    // The group after the commit (6.1, 6.2, 6.4, 12.7).
+    // The group after the commit (6.1, 6.2, 6.4, 12.7). Up to 10,000 bans
+    // against up to 10,000 identities.
+    let bans: HashSet<&Uid> = new.bans.iter().collect();
     for uid in &after_uids {
-        if new.is_banned(uid) {
+        if bans.contains(uid) {
             return Err(CommitError::LeftBehind);
         }
         if uid.is_guest()
