@@ -580,14 +580,12 @@ async fn post_bytes(
     let framing_only = match message {
         OrBlob::Inline(inline) => {
             let bytes = MlsMessage::decode(inline);
-            refuse_external_blobs(post, &bytes)?;
             Some(keys::BlobBytes::inline(bytes))
         }
         OrBlob::Blob(blob) => {
             let (prefix, size) = keys::blob_prefix(inner, blob, FRAMING_PREFIX)
                 .await
                 .map_err(no_blob)?;
-            refuse_external_blobs(post, &prefix)?;
             if prefix.len() as u64 == size {
                 Some(keys::BlobBytes::inline(prefix))
             } else if let Some(stub) = private_message_stub(&prefix, size) {
@@ -616,39 +614,21 @@ async fn post_bytes(
     Ok((bytes, memory))
 }
 
-/// `ERR bad-syntax` for an external commit whose message or GroupInfo is
-/// a blob-ref: the device that makes one holds no token to store blobs
-/// with, so both must fit in the line (12.2, 12.6, 12.12; PLAN item 67).
-/// `start` is the message's first bytes, from which this reads its
-/// sender, so that the server reserves and reads none of its blobs.
-fn refuse_external_blobs(post: &PostCommand, start: &[u8]) -> Result<(), ErrResponse> {
+/// `ERR bad-syntax` for a POST with the token `-`, an external commit or
+/// proposal (6.1), whose message or GroupInfo is a blob-ref: the device
+/// that posts one holds no token of the epoch to store blobs with, so
+/// both fit in the line (5.2, 12.12; PLAN items 67 and 68). The token is
+/// what the server sees of the line itself, so this needs no blob, and
+/// covers external proposals as well as commits. One inline but too long
+/// for a line has had `ERR too-long` already.
+fn refuse_join_blobs(post: &PostCommand) -> Result<(), ErrResponse> {
     let blobs =
         matches!(post.message, OrBlob::Blob(_)) || matches!(post.groupinfo, Some(OrBlob::Blob(_)));
-    if blobs && is_external_commit(start) {
+    if blobs && matches!(post.token, PostToken::Join) {
         return Err(err(ErrorCode::BadSyntax)
-            .with_message("an external commit and its GroupInfo fit in the line"));
+            .with_message("a post with - fits in the line, with no blob-ref"));
     }
     Ok(())
-}
-
-/// Whether `start`, the first bytes of an MLSMessage, begins a
-/// PublicMessage whose sender is a new member's external commit (RFC 9420,
-/// 6): version and wire format, group id, epoch, then sender type
-/// `new_member_commit(4)`. [`read_framing`] reads the same field.
-fn is_external_commit(start: &[u8]) -> bool {
-    // version (2 bytes), then wire_format mls_public_message (2).
-    if start.get(2..4) != Some(&[0, 1][..]) {
-        return false;
-    }
-    let Some((len, took)) = start.get(4..).and_then(keys::varint) else {
-        return false;
-    };
-    // group_id, then epoch (8 bytes).
-    let sender_type = 4usize
-        .checked_add(took)
-        .and_then(|at| at.checked_add(len))
-        .and_then(|at| at.checked_add(8));
-    sender_type.and_then(|at| start.get(at)) == Some(&4)
 }
 
 /// Whether `bytes` start as an MLSMessage of `mls10` that is a
@@ -661,6 +641,9 @@ fn is_public_message(bytes: &[u8]) -> bool {
 /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
 /// [next=<hash>]` (5.2), with the checks in the spec's order.
 async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
+    // Like the line's own syntax, before anything else, the cid included:
+    // no such post was ever taken.
+    refuse_join_blobs(&post)?;
     let inner = &cx.inner;
     let mailbox = post.mailbox;
     let _lock = inner.mailbox.lock(mailbox).await;

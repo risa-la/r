@@ -2434,20 +2434,34 @@ async fn creates_refuse_blob_refs() {
     assert_eq!(signed.lines(), ["OK"]);
 }
 
-/// An external commit and its GroupInfo fit in POST's line: the device
-/// that makes one holds no token of the epoch to store blobs with, so a
-/// blob-ref for either gets `ERR bad-syntax`, whether the server holds the
-/// blob or not, before the server reads any of it (12.2, 12.6, 12.12,
-/// PLAN item 67).
+/// A POST with the token `-`, an external commit or proposal (6.1), fits
+/// in its line: the device that posts one holds no token of the epoch to
+/// store blobs with, so a blob-ref for its message or GroupInfo gets `ERR
+/// bad-syntax`, whether the server holds the blob or not, before the
+/// server reads any of it (5.2, 12.12, PLAN items 67 and 68). The rule is
+/// the token's, which is what the server sees, so it covers both.
 #[tokio::test]
-async fn external_commits_refuse_blob_refs() {
+async fn joins_refuse_blob_refs() {
     use risala_proto::mls::GroupInfo;
+    let refused = "ERR bad-syntax a post with - fits in the line, with no blob-ref";
     let mut h = harness_now();
     let mut room = create_room(&mut h, 1).await;
     let m = room.m;
     let mut anon = h.anon().await;
+    let missing = risala_proto::names::BlobRef::of(b"no such blob");
     let dave = Dev::new("dave@example.org", 4);
     let dave_join = join(&dave, &dave.identity(), &room);
+    // An external proposal, as a blob, held or not, is refused; inline, it
+    // is taken.
+    let join_blob = hold_blob(
+        &h,
+        &dave_join.parse::<MlsMessage>().unwrap().decode(),
+        Some(&m),
+    );
+    for bad in [&join_blob, &missing] {
+        h.send(&anon, &format!("POST {m} - {bad}")).await;
+        assert_eq!(anon.lines(), [refused], "{bad}");
+    }
     h.send(&anon, &format!("POST {m} - {dave_join}")).await;
     assert_eq!(anon.lines(), ["OK seq=1"]);
     take_proposal(&mut room, &dave_join);
@@ -2482,22 +2496,23 @@ async fn external_commits_refuse_blob_refs() {
         &group_info.parse::<GroupInfo>().unwrap().decode(),
         Some(&m),
     );
-    let missing = risala_proto::names::BlobRef::of(b"no such blob");
     let line = |message: &dyn std::fmt::Display, info: &dyn std::fmt::Display| {
         format!("POST {m} - {message} {next} groupinfo={info}")
     };
-    let refused = "ERR bad-syntax an external commit and its GroupInfo fit in the line";
     let mut dave_conn = dave.sign_in(&mut h);
     for bad in [
         line(&message_blob, &group_info),
         line(&message, &info_blob),
         line(&message_blob, &info_blob),
         line(&message, &missing),
+        line(&missing, &group_info),
+        // Even to a mailbox that does not exist: no blob is looked for.
+        format!("POST {} - {message_blob}", mailbox(9)),
     ] {
         h.send(&dave_conn, &bad).await;
         assert_eq!(dave_conn.lines(), [refused], "{bad}");
     }
-    // Inline, it is taken.
+    // Inline, the external commit is taken.
     assert_eq!(line(&message, &group_info), resync);
     h.send(&dave_conn, &resync).await;
     assert_eq!(dave_conn.lines(), ["OK seq=4"]);

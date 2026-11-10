@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use risala_proto::frame::{MAX_CLIENT_LINE, MAX_REGISTER_LINE};
+use risala_proto::frame::{MAX_CLIENT_LINE, MAX_LONG_CLIENT_LINE, MAX_REGISTER_LINE};
 use risala_server::testing::{Proxy, TestClient, TestServer};
 
 /// `n` bytes of zeros in base64 with padding.
@@ -93,6 +93,46 @@ async fn line_limits_follow_the_kind() {
         client.expect_line().await.unwrap(),
         "@ref=r ERR too-long too long"
     );
+    // The connection still works.
+    client.send("@ref=x PING").await.unwrap();
+    assert_eq!(client.expect_line().await.unwrap(), "@ref=x OK");
+    server.stop().await;
+}
+
+/// A POST with the token `-`, an external commit or proposal, fits in its
+/// line (5.2, PLAN item 68): inline but past the long-line limit it gets
+/// `ERR too-long`, and with a blob-ref `ERR bad-syntax`, before the server
+/// looks for the mailbox or the blob. With a send token, a blob-ref goes
+/// on to the mailbox, which does not exist.
+#[tokio::test]
+async fn a_post_with_no_token_fits_in_the_line() {
+    let server = TestServer::start().await;
+    let mut client = server.connect().await;
+    client.expect_line().await.unwrap();
+    client.send("ANON").await.unwrap();
+    assert_eq!(client.expect_line().await.unwrap(), "OK");
+
+    let blob = risala_proto::names::BlobRef::of(b"an external commit");
+    let long = format!("@ref=l POST {BOX} - {}", b64(MAX_LONG_CLIENT_LINE * 3 / 4));
+    assert!(long.len() > MAX_LONG_CLIENT_LINE);
+    for (line, reply) in [
+        (long, "@ref=l ERR too-long too long".to_owned()),
+        (
+            format!("@ref=b POST {BOX} - {blob}"),
+            "@ref=b ERR bad-syntax a post with - fits in the line, with no blob-ref".to_owned(),
+        ),
+        (
+            format!("@ref=g POST {BOX} - {} groupinfo={blob}", b64(64)),
+            "@ref=g ERR bad-syntax a post with - fits in the line, with no blob-ref".to_owned(),
+        ),
+        (
+            format!("@ref=t POST {BOX} {} {blob}", b64(32)),
+            "@ref=t ERR not-found".to_owned(),
+        ),
+    ] {
+        client.send(&line).await.unwrap();
+        assert_eq!(client.expect_line().await.unwrap(), reply);
+    }
     // The connection still works.
     client.send("@ref=x PING").await.unwrap();
     assert_eq!(client.expect_line().await.unwrap(), "@ref=x OK");
