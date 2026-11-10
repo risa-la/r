@@ -420,6 +420,12 @@ pub struct ServerConfig {
 /// proposals, KEYS PUT and AUTHs that fetch key files. They are the free
 /// tier; past them a client will go on by proof of work, from M6a (PLAN
 /// items 42 and 63).
+///
+/// The other limits that count by address, alone or with the connection
+/// or identity, keep their defaults as they are (PLAN item 66): posts,
+/// commits, creates and guests' reports, and KEYPKG GET, which counts by
+/// identity. Operators tune them to their users. HTTPS connections per
+/// address have a fixed limit, `MAX_HTTP_PER_ADDRESS` in `http::server`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -532,7 +538,7 @@ pub struct Limits {
     /// until they are resolved (5.8), counted apart from
     /// `max_stored_bytes`. A report whose blobs or files would go over it
     /// is still made, without keeping those past their retention, and the
-    /// server logs a warning. 0 means no limit.
+    /// server logs a warning (PLAN item 66). 0 means no limit.
     pub max_reported_bytes: u64,
     /// The most bytes of blobs the server reads into memory at once, for
     /// everyone (12.12): a public room's commits, GroupInfos and trees and
