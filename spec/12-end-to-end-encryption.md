@@ -1539,6 +1539,13 @@ message by where it falls in that order, not only by its epoch:
   With the rules above, a device holds the secrets of at most 2 past
   epochs, and of none for more than 2 hours after it applied the commit
   that ended it.
+- After a move (7.8), a post in the old mailbox that comes after the
+  move has no place in the new mailbox's order. A device judges it by
+  the old mailbox's order alone, as of the move: the commits that count
+  above are those up to the move in the old mailbox, never those in the
+  new one, whether it has applied them yet or not. So the rules that
+  depend only on the posts give every device the same result, whichever
+  mailbox it read first.
 
 The content is one or more lines in UTF-8, in the format of Section 3,
 each ending in LF. The rules of 2.3 for characters apply to these lines,

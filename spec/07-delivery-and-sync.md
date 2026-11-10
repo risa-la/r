@@ -15,7 +15,9 @@ FETCH <box> after=<position> [limit=<n>] [leaf=<n>]
 
 - **`FOLLOW`** sends the connection every new post of the mailbox from
   now on, as event lines (5.2), and replies `OK head=<position>`, where
-  `<position>` (3.5) is the mailbox's newest seq, or `0` if it has none.
+  `<position>` (3.5) is the newest seq the server has given out in the
+  mailbox, even if that post has expired (7.5), or `0` if it has given
+  out none.
   The `OK` agrees with the live posts as 3.6 says: every post newer than
   the head reaches the connection live. `quiet` names a push
   subscription that the server holds back while this connection
@@ -224,15 +226,15 @@ A device catches up like this:
 1. Open an anonymous connection, and send FOLLOW for each of its
    mailboxes, in a random order.
 2. For each mailbox, let L be its sync point. If L is less than the
-   head that FOLLOW reported, send `FETCH <box> after=F`, and repeat
-   while the response says `more=1`. F is L less a random number of
-   posts, from 0 to 20, and not less than 0, so that the sync points a
-   device sends do not single it out. The posts up to L that come back
-   are duplicates (step 3). After each page, the sync point moves
-   forward to the last seq in it, and on over any stored posts that directly
-   follow. If the response holds no post after L and says `more=0`,
-   every post after L up to the head has expired (7.5), and the sync
-   point moves to that head.
+   head that FOLLOW reported, send `FETCH <box> after=F`, and while the
+   response says `more=1`, repeat it with `after=` the last seq of the
+   page. F is L less a random number of posts, from 0 to 20, and not
+   less than 0, so that the sync points a device sends do not single it
+   out. The posts up to L that come back are duplicates (step 3). After
+   each page, the sync point moves forward to the last seq in it, and on
+   over any stored posts that directly follow. If the response holds no
+   post after L and says `more=0`, every post after L up to the head has
+   expired (7.5), and the sync point moves to that head.
 3. Live posts may arrive in the meantime. A duplicate has the same seq
    as the post already received, so it can be dropped. A live post moves
    the sync point only if it directly follows it.
@@ -449,7 +451,9 @@ do not move: their box is public, and anyone not banned may join.
   and posts there from the move's epoch on. It keeps following the old
   mailbox for a day, for messages of earlier epochs that arrive late,
   then unfollows it, and deletes its push subscription for it (9.1). In
-  the old mailbox, devices ignore posts for the move's epoch and later.
+  the old mailbox, devices ignore posts for the move's epoch and later,
+  and judge the other posts that come after the move by the old
+  mailbox's order alone (12.9).
   The device that made a move follows both mailboxes until it knows
   whether its move won. A move that lost leaves a new mailbox that no
   one uses, which ends as 7.5 says.
