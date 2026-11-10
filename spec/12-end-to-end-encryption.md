@@ -818,6 +818,18 @@ checks:
   earlier leaf; a resync commit removes another identity's instead,
   which departs from [RFC9420], and the checks above bound what it may
   remove.
+
+  An external commit cannot be a blob (12.12), so a device uses one
+  only if it fits in a line with its GroupInfo (2.3). Its path is
+  encrypted to every node in the resolution of the joiner's copath,
+  and each takes an HPKE ciphertext of 1,188 bytes, so a line of 1 MiB
+  holds about 620 of them: a tree with many blank nodes there, after
+  many removals, can need far more, up to 39 MB in the largest public
+  room. A device whose external commit would not fit does not post it.
+  Instead, it joins the room again by external proposal (6.1), and an
+  owner or moderator waits for its proposal to be committed. Outside
+  public rooms, a device that cannot follow a group never uses an
+  external commit: it sends RESYNC to its own devices (below).
 - **Size.** The group stays within the limits of 6.1. A direct
   conversation holds at most 128 leaves, one for each current device of
   its participants, which have at most 64 each (4.4). In a private room,
@@ -1057,7 +1069,12 @@ then in batches:
    commit the devices could not apply, which is the GroupInfo's signer,
    and nothing else: an external commit removes at most one leaf
    (above). The device removes its own earlier leaf in its next commit,
-   as in step 3.
+   as in step 3. A resync commit that would not fit in a line (above)
+   is not posted, and the device joins again as in step 2. Every
+   device's resync commit would be about as large, so the room then goes
+   on only if a full client that could apply the commit commits the join
+   proposals. Devices whose proposals no commit has applied within 30
+   minutes tell their users that the room could not be resynced.
 2. Every other device that cannot follow joins again by external
    proposal, as for a first join (6.1). Full clients commit these
    proposals as 6.1 says, at most 256 devices in a commit.
@@ -1092,7 +1109,9 @@ other in its next commit. The server checks the
 role in the conversation extension it holds, and that the commit comes
 from the device that its credential names (12.6). The owner or
 moderator can then commit the waiting proposals, and ban whoever kept
-them out.
+them out. A rejoin that would not fit in a line (above) is not posted:
+the owner or moderator keeps waiting for its proposal, and its device
+tells the user why.
 
 **Rejoining a public room.** For each public room it is in, a device
 keeps the conversation extension of the newest epoch that it applied
@@ -2035,8 +2054,9 @@ BLOB <hash> <size> [box=<box> token=<token>]
   which is not a member yet, and one that creates a public room (5.2),
   whose mailbox does not exist yet. An external commit with its
   GroupInfo, and a new public room's GroupInfo and tree, MUST fit in
-  the line that carries them (2.3). A line that does not gets
-  `ERR too-long`. The server refuses a blob-ref in their place with
+  the line that carries them (2.3). A device makes an external commit
+  only if it fits, and otherwise joins by proposal (12.7). A line that
+  does not fit gets `ERR too-long`. The server refuses a blob-ref in their place with
   `ERR bad-syntax`: for `<groupinfo>` or `<tree>` in CREATE (5.2), and
   for the message or `groupinfo` of an external commit.
 - The client sends the blob in an HTTP PUT request to the `put` URL,
