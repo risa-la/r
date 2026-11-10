@@ -7,6 +7,7 @@ mod deletes;
 mod gaps;
 mod keychecks;
 mod leaving;
+mod moves;
 mod own_commits;
 mod public;
 mod recovery;

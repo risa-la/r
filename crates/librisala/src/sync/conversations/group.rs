@@ -352,6 +352,11 @@ pub(crate) fn removal_row(row: &OutboxRow) -> bool {
     commit_intent(row).is_some_and(|i| is_removal(&i))
 }
 
+/// Whether an outbox row is a commit that moves the mailbox (7.8).
+pub(crate) fn move_row(row: &OutboxRow) -> bool {
+    commit_intent(row).is_some_and(|i| i.move_box)
+}
+
 /// Whether no other identity has a leaf in the group (6.1): nobody could
 /// commit this device's SelfRemove, so it leaves by itself.
 pub(crate) fn lone(tx: &Tx<'_>, conv: ConversationId, own: &Uid) -> Result<bool> {

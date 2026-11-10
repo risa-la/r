@@ -3344,7 +3344,28 @@ fn next_posts(
                 .find(|r| group::removal_row(r) && !waiting(r))
         })
         .or_else(|| commits.first());
-    if let Some(row) = chosen {
+    // 7.8: messages do not wait for a move. Those queued before it go
+    // first, in the current epoch, which the removed member cannot read;
+    // it sees only that the group talks, as it could until the move. A
+    // move made already may have reached the server, and goes first.
+    let messages_before = chosen
+        .filter(|r| group::move_row(r) && !built(r))
+        .map(|r| r.id)
+        .filter(|id| {
+            conv.state == ConvState::Active
+                && !conv.last_resort
+                && rows.iter().any(|r| {
+                    r.id < *id
+                        && matches!(r.kind, OutboxKind::Message | OutboxKind::Live)
+                        && r.state == OutboxState::Queued
+                        && !waiting(r)
+                })
+        });
+    let messages_before = match messages_before {
+        Some(id) if !tx.sending_held(conv.id)? => Some(id),
+        _ => None,
+    };
+    if let Some(row) = chosen.filter(|_| messages_before.is_none()) {
         if waiting(row) {
             return Ok(Vec::new());
         }
@@ -3464,6 +3485,7 @@ fn next_posts(
         .iter()
         .filter(|r| matches!(r.kind, OutboxKind::Message | OutboxKind::Live))
         .filter(|r| r.state == OutboxState::Queued && !waiting(r))
+        .filter(|r| messages_before.is_none_or(|id| r.id < id))
         .take(POST_BATCH)
     {
         let mut body = row
