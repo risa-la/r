@@ -465,3 +465,94 @@ fn a_change_past_512_kib_is_refused() {
         Err(Error::Invalid { .. })
     ));
 }
+
+/// 6.1, 7.5: the chat list shows where the device is in each conversation:
+/// a leave commit queued is leaving as much as a SelfRemove waiting, and
+/// a conversation the operator dropped is left.
+#[test]
+fn the_list_shows_each_conversations_state() {
+    use super::ConversationState;
+    use crate::store::conversations::{ConvKind, ConvState, NewConversation};
+    use crate::store::messages::{NewOutbox, OutboxKind};
+    use crate::store::settings::AccountKind;
+    use crate::sync::conversations::wire::{Intent, Then};
+
+    let store = Store::open_in_memory().unwrap();
+    let alice: risala_proto::names::Uid = "alice@example.org".parse().unwrap();
+    let account = store
+        .add_account(
+            &"chat.example.org".parse().unwrap(),
+            AccountKind::Identity,
+            &alice,
+        )
+        .unwrap();
+    let mut convs = Vec::new();
+    for (i, state) in [
+        ConvState::Creating,
+        ConvState::Active,
+        ConvState::Active,
+        ConvState::Leaving,
+        ConvState::Joining,
+        ConvState::Lost,
+        ConvState::Left,
+        ConvState::Dropped,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (conv, _) = store
+            .write(|tx| {
+                tx.insert_conversation(&NewConversation {
+                    account,
+                    group_id: &[i as u8],
+                    kind: ConvKind::Private,
+                    room: None,
+                    name: "team",
+                    topic: "",
+                    peer: None,
+                    epoch: 0,
+                    pseudonym: [0; 16],
+                    state,
+                    last_resort: false,
+                    now: 0,
+                })
+            })
+            .unwrap();
+        convs.push(conv);
+    }
+    // The second active one has its leave commit queued.
+    let intent = Intent {
+        remove: vec![(alice.to_string(), Some([1; 48]))],
+        then: Then::SelfRemove,
+        ..Intent::default()
+    };
+    store
+        .write(|tx| {
+            tx.queue_outbox(
+                convs[2],
+                OutboxKind::Commit,
+                &NewOutbox {
+                    intent: Some(intent.encode()),
+                    ..NewOutbox::default()
+                },
+                0,
+            )
+        })
+        .unwrap();
+    let states: Vec<ConversationState> = convs
+        .iter()
+        .map(|c| {
+            let row = store.conversation_row(*c).unwrap().unwrap();
+            super::summary(&store, row).unwrap().state
+        })
+        .collect();
+    use ConversationState::*;
+    assert_eq!(
+        states,
+        [Active, Active, Leaving, Leaving, Joining, Lost, Left, Left]
+    );
+    assert_eq!(
+        states.iter().map(|s| s.in_group()).collect::<Vec<_>>(),
+        [true, true, true, true, false, false, false, false]
+    );
+}

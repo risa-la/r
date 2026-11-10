@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use librisala::client::ConnectionState;
-use librisala::client::conversations::ConversationKind;
+use librisala::client::conversations::{ConversationKind, ConversationState};
 use librisala::client::identity::{Contact, KeyFetcherHttps};
 use librisala::client::types::ConversationId;
 use librisala::conn::{SessionOptions, Slot};
@@ -173,7 +173,7 @@ fn find(
     c.conversations(account)
         .unwrap()
         .into_iter()
-        .find(|s| s.kind == kind && s.name == name && s.active)
+        .find(|s| s.kind == kind && s.name == name && s.state == ConversationState::Active)
         .map(|s| s.id)
 }
 

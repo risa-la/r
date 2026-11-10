@@ -976,16 +976,7 @@ impl Tx<'_> {
         &self,
         conv: ConversationId,
     ) -> Result<Vec<OutboxRow>, StoreError> {
-        let mut stmt = self.conn().prepare_cached(&format!(
-            "SELECT {OUTBOX_COLUMNS} FROM outbox
-             WHERE conv = ?1 AND state IN ('queued', 'sent', 'posted') ORDER BY id"
-        ))?;
-        let rows = stmt.query_map([conv.0], outbox_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(finish_outbox(row?)?);
-        }
-        Ok(out)
+        read::pending_outbox(self.conn(), conv)
     }
 
     /// Every outbox row of the account that is not done.
@@ -1253,6 +1244,22 @@ pub(crate) mod read {
         Ok(out)
     }
 
+    pub fn pending_outbox(
+        conn: &rusqlite::Connection,
+        conv: ConversationId,
+    ) -> Result<Vec<OutboxRow>, StoreError> {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {OUTBOX_COLUMNS} FROM outbox
+             WHERE conv = ?1 AND state IN ('queued', 'sent', 'posted') ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([conv.0], outbox_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(finish_outbox(row?)?);
+        }
+        Ok(out)
+    }
+
     pub fn gaps(
         conn: &rusqlite::Connection,
         conv: ConversationId,
@@ -1315,6 +1322,14 @@ impl Store {
             }
             Ok(out)
         })
+    }
+
+    /// A conversation's outbox rows that are not done, oldest first.
+    pub(crate) fn pending_outbox_rows(
+        &self,
+        conv: ConversationId,
+    ) -> Result<Vec<OutboxRow>, StoreError> {
+        self.read(|conn| read::pending_outbox(conn, conv))
     }
 
     /// The gaps of a conversation (7.4).

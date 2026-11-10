@@ -271,6 +271,46 @@ impl From<ConvKind> for ConversationKind {
     }
 }
 
+/// Where this device is in a conversation, for the chat list (6.1, 7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConversationState {
+    /// In the group: it reads and sends there.
+    Active,
+    /// Joining a public room by proposal, for the first time or again
+    /// after it could not follow it (6.1, 12.7).
+    Joining,
+    /// Leaving (6.1): its leave commit or SelfRemove has not won yet. It
+    /// keeps trying while the device is offline.
+    Leaving,
+    /// It can no longer follow the group: posts expired before it read
+    /// them (7.5). A Welcome, or joining a public room again, brings it
+    /// back; or the user leaves it.
+    Lost,
+    /// No longer in the group: it left, was removed, or the operator
+    /// dropped its mailbox (6.1, 10.4).
+    Left,
+}
+
+impl ConversationState {
+    /// The state of `row`, given its outbox rows not yet done.
+    fn of(row: &ConvRow, pending: &[crate::store::messages::OutboxRow]) -> ConversationState {
+        match row.state {
+            // 6.1: a leave commit queued is leaving too.
+            _ if group::is_leaving(row.state, pending) => ConversationState::Leaving,
+            ConvState::Leaving => ConversationState::Leaving,
+            ConvState::Creating | ConvState::Active => ConversationState::Active,
+            ConvState::Joining => ConversationState::Joining,
+            ConvState::Lost => ConversationState::Lost,
+            ConvState::Left | ConvState::Dropped | ConvState::Failed => ConversationState::Left,
+        }
+    }
+
+    /// Whether the device is in the group, leaving it or not.
+    pub fn in_group(self) -> bool {
+        matches!(self, ConversationState::Active | ConversationState::Leaving)
+    }
+}
+
 /// A conversation, for the chat list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSummary {
@@ -293,8 +333,8 @@ pub struct ConversationSummary {
     pub last_activity: Option<Timestamp>,
     /// Whether sending is stopped for someone in it (4.5, 12.14).
     pub sending_stopped: bool,
-    /// Whether the device is still in it.
-    pub active: bool,
+    /// Where the device is in it.
+    pub state: ConversationState,
     /// A direct conversation that the peer left (6.1): the device left it
     /// too, by itself. Talking again starts a new one.
     pub left_by_peer: bool,
@@ -820,7 +860,7 @@ fn summary(store: &Store, row: ConvRow) -> Result<ConversationSummary> {
         unread,
         last_activity: row.last_activity.and_then(Timestamp::from_unix_millis),
         sending_stopped: false,
-        active: row.state.in_group(),
+        state: ConversationState::of(&row, &store.pending_outbox_rows(row.id)?),
         left_by_peer,
     })
 }

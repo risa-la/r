@@ -592,7 +592,8 @@ async fn a_wrong_answer_makes_an_impostor_who_is_removed() {
 
     // Alice removes the leaf; Bob is out of the conversation.
     w.advance_until(&[&alice, &bob], 2 * MIN, 15, || {
-        !bob.client.conversation(bconv).unwrap().active
+        bob.client.conversation(bconv).unwrap().state
+            == crate::client::conversations::ConversationState::Left
             && !alice
                 .client
                 .leaf_status(conv)

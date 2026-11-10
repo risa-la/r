@@ -16,7 +16,7 @@ use risala_proto::names::Identity;
 use risala_server::testing::{TestIdentity, TestServer};
 
 use super::super::*;
-use super::{ConversationKind, ConversationSummary};
+use super::{ConversationKind, ConversationState, ConversationSummary};
 use crate::client::identity::KeyFetcherHttps;
 use crate::conn::{ConnectionPlan, GuestSignIn, IdentitySignIn};
 use crate::keyfetch::KeyFetcher;
@@ -628,9 +628,15 @@ async fn an_identity_that_leaves_stays_out_against_risalad() {
     // 5.1, 6.1: Bob's side of the direct conversation left it too, and
     // shows it as left by Alice; the room, which Bob is still in, stays.
     let summary = bob.client.conversation(b).unwrap();
-    assert!(!summary.active && summary.left_by_peer, "{summary:?}");
+    assert!(
+        summary.state == ConversationState::Left && summary.left_by_peer,
+        "{summary:?}"
+    );
     let summary = bob.client.conversation(br).unwrap();
-    assert!(summary.active && !summary.left_by_peer, "{summary:?}");
+    assert!(
+        summary.state == ConversationState::Active && !summary.left_by_peer,
+        "{summary:?}"
+    );
     for c in [direct, room] {
         assert!(!in_group(&laptop, &laptop, c));
         assert!(!in_group(&phone, &laptop, c));

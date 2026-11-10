@@ -311,7 +311,15 @@ pub(crate) fn has_pending_commit(tx: &Tx<'_>, conv: ConversationId) -> Result<bo
 /// Leaving state, or its commit that removes its identity's other leaves
 /// before the SelfRemove is queued or pending.
 pub(crate) fn leaving(tx: &Tx<'_>, conv: ConversationId) -> Result<bool> {
-    Ok(tx.conversation(conv)?.state == ConvState::Leaving || leaving_commit_queued(tx, conv)?)
+    Ok(is_leaving(
+        tx.conversation(conv)?.state,
+        &tx.pending_outbox(conv)?,
+    ))
+}
+
+/// [`leaving`], from the conversation's state and its pending outbox rows.
+pub(crate) fn is_leaving(state: ConvState, pending: &[OutboxRow]) -> bool {
+    state == ConvState::Leaving || pending.iter().any(leave_row)
 }
 
 /// Whether this device's commit that removes its identity's other leaves

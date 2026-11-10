@@ -924,7 +924,7 @@ impl From<&ConversationSummary> for Entry {
             kind: c.kind,
             name: c.name.clone(),
             room: c.room.as_ref().map(ToString::to_string),
-            active: c.active,
+            active: c.state.in_group(),
         }
     }
 }
@@ -1064,7 +1064,7 @@ fn unsettled_text(left: &Unsettled) -> String {
 fn print_conversations(client: &Client, account: AccountId) -> Res {
     let mut out = std::io::stdout().lock();
     for c in client.conversations(account).map_err(err)? {
-        if !c.active {
+        if !c.state.in_group() {
             continue;
         }
         let stopped = if c.sending_stopped { "\tstopped" } else { "" };
