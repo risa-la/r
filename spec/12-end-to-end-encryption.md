@@ -1529,7 +1529,14 @@ be read.
 message by where it falls in that order, not only by its epoch:
 
 - A device MUST ignore a message from a leaf that a commit with a lower
-  seq has removed, even if the message is of an earlier epoch.
+  seq has removed, even if the message is of an earlier epoch. The leaf
+  is the one that sent the message in its epoch. A later commit may put
+  another leaf at the same index, or remove that one too, so a device
+  keeps every removal it may still need, not only the newest at each
+  index: every removal made since the oldest past epoch whose secrets
+  it still holds, and after a move (below), every one made in the old
+  mailbox up to the move, for as long as it follows that mailbox. A removal in the new mailbox, which
+  does not count for a post in the old one, never hides one that does.
 - A line that depends on a role, such as a DELETE of someone else's
   message (5.4), or a TEXT line or typing in a room with `send mods`
   (6.2), counts only if its sender has the role both in the extension
@@ -1551,14 +1558,15 @@ message by where it falls in that order, not only by its epoch:
   unreadable, as above. This depends on when a device fetched, so it
   can make a message unreadable on one device and not on another, but
   it changes only what devices show, never which commit is valid
-  (12.7).
+  (12.7). After a move, the old mailbox's last epochs are kept longer
+  (below).
 - Within an epoch, a device keeps the keys of skipped messages for at
   most 1,000 generations behind the newest it has seen from each
   sender, and rejects a message more than 1,000 generations ahead of
   it, or ahead of generation 0 if it has seen none from that sender.
   With the rules above, a device holds the secrets of at most 2 past
   epochs, and of none for more than 2 hours after it applied the commit
-  that ended it.
+  that ended it, except for a day after a move (below).
 - After a move (7.8), a post in the old mailbox that comes after the
   move has no place in the new mailbox's order. A device judges it by
   the old mailbox's order alone, as of the move: the commits that count
@@ -1566,6 +1574,19 @@ message by where it falls in that order, not only by its epoch:
   new one, whether it has applied them yet or not. So the rules that
   depend only on the posts give every device the same result, whichever
   mailbox it read first.
+- For the same reason, a device keeps the secrets of the old mailbox's
+  last epochs, with their skipped-message keys, for as long as it
+  follows the old mailbox, a day after it applied the move (7.8), and
+  deletes them when it stops, rather than 2 hours after the commits
+  that ended them. These are the past epochs whose secrets it still
+  holds when it applies the move: at most the 2 before the move's
+  epoch, since the move's epoch is the newest that counts in the old
+  mailbox. So whether a late post there can be read does not depend on
+  when each device fetched it after the move. The limits above still
+  apply to them, judged by the old mailbox's order alone: posts in the
+  old mailbox can put them past a limit, and the device then deletes
+  them at once, but commits in the new mailbox cannot. It holds these
+  secrets besides those of at most 2 past epochs of the new mailbox.
 
 The content is one or more lines in UTF-8, in the format of Section 3,
 each ending in LF. The rules of 2.3 for characters apply to these lines,

@@ -476,7 +476,8 @@ do not move: their box is public, and anyone not banned may join.
 - **Following.** A device that applies a move follows the new mailbox,
   and posts there from the move's epoch on. It keeps following the old
   mailbox for a day, for messages of earlier epochs that arrive late,
-  then unfollows it, and deletes its push subscription for it (9.1). In
+  then unfollows it, deletes its push subscription for it (9.1), and
+  deletes the secrets it kept for those epochs (12.9). In
   the old mailbox, devices ignore posts for the move's epoch and later,
   and judge the other posts that come after the move by the old
   mailbox's order alone (12.9).
