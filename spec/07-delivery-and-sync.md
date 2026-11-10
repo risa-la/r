@@ -238,9 +238,11 @@ A device catches up like this:
    the sync point only if it directly follows it.
 4. Apply the posts in seq order (7.2), decrypting messages as 12.9 says.
 
-If the first post returned after L is later than L + 1, the posts in
-between have expired. If they include commits, the device can no longer
-follow the group (7.5).
+**Gaps.** If the first post returned after L is later than L + 1, or
+every post after L up to the head has expired (step 2), posts after the
+sync point expired before the device applied them. The device cannot
+tell whether they included commits, so it treats the group as one it
+can no longer follow (7.5), and applies nothing after the gap.
 
 Each message carries its sender's counter and the id of the sender's
 previous message (12.9). So devices notice a gap in a sender's messages
@@ -296,9 +298,11 @@ post that is not old enough, even if a later one has an older time. The
 sequence numbers of expired posts are never reused. Copies kept for open
 reports do not expire (5.8).
 
-A device that has been offline for longer than the retention period
-misses commits, and cannot follow its groups any more. In a public room
-it joins again (6.1). In other conversations, its identity's other
+A device that finds that posts after its sync point expired before it
+applied them cannot tell whether it missed commits, and so can no
+longer follow the group (7.4). This happens to a device that has been
+offline for longer than the retention period. In a public room it joins
+again (6.1). In other conversations, its identity's other
 devices replace its leaf at once, and other members' devices after 35
 days (12.7): the device then gets a Welcome, as a new device does, and
 asks its own devices for what it missed (12.13).
@@ -325,13 +329,16 @@ fill it, posts and commits still go through, and groups can go on.
 Files and blobs kept for open reports (5.8) count apart, under a bound
 of their own, so that reports cannot fill the server either.
 
-**Mailboxes end.** A mailbox whose posts have all expired, and which no
-connection follows, has had no device of its group online for a whole
-retention period, since devices commit at least weekly (12.7). Its group
-cannot go on there. The server MAY delete such a mailbox, with its token
-sets and push subscriptions. It never uses the box again (5.2). Deleting
-a public room's mailbox ends the room and frees its name, as ADMIN DROP
-does (10.4).
+**Mailboxes end.** A mailbox that was created more than a retention
+period ago, whose posts have all expired, and which no connection
+follows, has had no device of its group online for a whole retention
+period, since devices commit at least weekly (12.7). Its group cannot
+go on there. The server MAY delete such a mailbox, with its token sets
+and push subscriptions, but no mailbox created more recently, even one
+with no posts: a device that moves a group creates the new mailbox
+before it follows it or posts there (7.8). The server never uses the
+box again (5.2). Deleting a public room's mailbox ends the room and
+frees its name, as ADMIN DROP does (10.4).
 
 ### 7.6. Resending Safely
 
@@ -350,8 +357,18 @@ make resending safe:
   is usually followed by a new one. So a device SHOULD NOT send a cid
   again on another connection. On the new connection, it fetches the
   mailbox to see whether the post arrived instead (7.4), and if it did
-  not, posts the message again, encrypted afresh, with a new cid or
-  none. For a commit, the fetch also says whether it won (7.2).
+  not, posts it again, with a new cid or none: a message encrypted
+  afresh, and a commit as it was (below). For a commit, the fetch also
+  says whether it won (7.2).
+- **A commit is posted again as it was.** A device whose POST of a
+  commit went unanswered, and which finds that the commit has not
+  arrived, posts the same commit again, not a new one. It keeps the
+  commit's state, which it needs to apply the commit, until a commit
+  for that epoch has been applied: its own, or one that came before it
+  (7.2). The first POST may still reach the server after the device has
+  looked, and win the epoch. A device that had made a new commit
+  meanwhile could not apply the first one, and would apply its new one,
+  which lost, and so leave the group without knowing it.
 
 Devices also ignore a message whose `message_id` they have already seen
 in the group (12.9), so a post that went through twice shows once.
