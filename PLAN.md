@@ -2465,6 +2465,75 @@ Open:
       one. A peer removed for a check or after a recovery is still added
       back. The spec says so.
 
+64. **Answers to item 62**, decided with the user on 2026-11-09. Item
+    62's choices that change an earlier decision, and its two open
+    findings, are settled as follows. Its other design choices and spec
+    gaps are accepted unless the user flags one; the gaps go into the
+    spec as the code does them.
+
+    *The open findings.*
+    - **R-M1: A and B now.** A: a device warns a sole owner of a room
+      with no moderator and suggests adding one, and before a recovery
+      lists the rooms the user owns alone and will lose. B: for missing
+      keys only (not forks, not removal by record), devices in a room
+      hide the identity's leaves and keep sending, and remove them only
+      once the keys have been missing for 7 days. C (a member list in
+      the room's extension) is not planned.
+    - **R-M2: the reviewer's fix.** In rooms, a new master key behaves
+      like missing keys: warn, hide the new key's leaves, keep sending.
+      Only the identity's own devices, or an owner or moderator whose
+      user acknowledged, add devices under the new key. Direct
+      conversations still stop until the user acknowledges. This changes
+      item 60's answer for rooms.
+
+    *Item 62's changes to earlier decisions.*
+    - **Kept as in the spec:** forks and missing keys no longer stop
+      rooms, and a missing key file takes an identity out of private
+      rooms (softened by R-M1's B); owners and moderators are removed
+      for a check only by their own kind or above (round 3's rule); no
+      rate limits per pseudonym; public-room commits go on the signed-in
+      connection; pseudonyms change every epoch outside public rooms;
+      every device joins a public room by external proposal;
+      confirmation covers own new leaves and leaves that use authority;
+      Welcomes wait up to 10 minutes each; a server with a key log logs
+      outside identities by default, with the switch and the daily cap.
+    - **Public rooms' roles are fixed before M6.** The server must not
+      be able to change a public room's roles, bans or settings by
+      committing in someone's name, without bringing back the device
+      binding that undid deniability. Item 51 holds for public rooms
+      again once this is designed; until then the spec states the risk.
+    - **Proof of work is specified now**, not left to a later draft: the
+      puzzle goes into draft-03 (4.1, item 42) and is on by default, as
+      item 42 decided. M6a then builds it into risalad and librisala.
+    - **Large rooms rotate leaves by Update proposals**, as the spec
+      says; librisala builds the Update path (others batch, 30-minute
+      fallback) in M6, replacing its daily commit.
+
+    *Item 62's code choices.*
+    - **Who adds an identity's devices:** its own devices; and, where it
+      has no leaf left, the other participant of a direct conversation,
+      or in a private room an owner's or moderator's device, an owner's
+      for an owner, offered to their users (matching R-M1). The spec's
+      "any member" goes.
+    - **Witnesses:** the rule stays (nobody is added without accepted
+      records). Independent witnesses run, and the apps ship a default
+      list, before M7.
+    - **Kept:** risalad keeps times to the hour; a resent message's
+      ATTEST is remade (the spec says the ATTEST and `frank` may change on
+      resend, nothing else).
+    - **HTTPS is post-quantum only.** librisala's HTTPS for files,
+      blobs, backups and key files refuses classical key exchange, like
+      chat connections; hosts that cannot offer X25519MLKEM768 do not
+      work. risalad's HTTPS side (key files, blobs, uploads, backups)
+      may sit behind an nginx reverse proxy, with certificates from the
+      ACME service (Let's Encrypt) and OpenSSL 3.5 or later for
+      X25519MLKEM768: risalad serves plain HTTP on a local address,
+      takes the client's address from the proxy only when the proxy is
+      trusted (for the per-address limits), and the NixOS module (M10)
+      sets this up. The chat port keeps its own TLS.
+    - **Seeding comes back in M6**, rebuilt on librisala, so the apps
+      have rooms and bots to show in development.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
