@@ -138,11 +138,15 @@ group other than its leave commit: no repairs, no weekly fresh leaf
 those.
 
 Where nobody else would commit its leave, a device leaves **locally**,
-with no commit and no SelfRemove: in a group that has no leaf of another
-identity, such as a room that everyone else has left, and in a direct
-conversation that the other participant has left (below). It stops
-following the mailbox with UNFOLLOW (7.1), and deletes the group's keys
-and the conversation.
+with no SelfRemove: in a group that has no leaf of another identity,
+such as a room that everyone else has left, and in a direct
+conversation that the other participant has left (below). In a group
+that has no leaf of another identity, it first commits, as its leave
+commit, the removal of the leaves of its identity's other devices, if
+there are any, and waits until that commit has won (7.2). Otherwise one
+of them would later replace its leaf as stale, and so Welcome the
+device back (12.7). It then stops following the mailbox with UNFOLLOW
+(7.1), and deletes the group's keys and the conversation.
 
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
 private room, coming back always takes a new invitation. In a direct

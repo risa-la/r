@@ -1166,7 +1166,10 @@ if that is later; but never later than the `t` of the commit's post.
   rooms, starting with the conversation with yourself. Both are allowed
   for one's own leaves, and removing a leaf never lets anyone new read,
   so relying on INFO's retention here is safe. In a public room, the
-  device that fell behind joins again by itself (6.1).
+  device that fell behind joins again by itself (6.1). A device that
+  leaves locally therefore first removes the leaves of its identity's
+  other devices (6.1), so that none of them replaces its own leaf, and
+  so brings it back.
 - **By anyone, after 35 days.** A leaf is **stale** if its activity time
   is more than 35 days before the group's median activity time. The
   median is taken over every leaf that carries a profile, as the group
