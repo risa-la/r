@@ -145,7 +145,9 @@ impl Daemon {
             // at the origin `files.url` names, or else at the hostname and
             // the listener's port.
             let http = http.map(|http| {
-                let http = http.with_per_address(config.limits.https_connections_per_address);
+                let http = http
+                    .with_per_address(config.limits.https_connections_per_address)
+                    .with_per_prefix(config.limits.https_connections_per_prefix);
                 let port = http.local_addrs().first().map_or(443, SocketAddr::port);
                 let url = match port {
                     443 => format!("https://{}", hub.config().hostname),

@@ -86,10 +86,10 @@ pub const MAX_HTTP_CONNECTIONS: usize = 1024;
 /// are accepted.
 pub const DEFAULT_HTTP_PER_ADDRESS: usize = 16;
 
-/// The most HTTPS connections open at once from one IPv6 /48, since a
-/// /48 holds 65,536 /64s. It holds whatever
-/// `limits.https_connections_per_address` is.
-pub const MAX_HTTP_PER_48: usize = 64;
+/// The default of `limits.https_connections_per_prefix`: the most HTTPS
+/// connections open at once from one IPv6 /48, since a /48 holds 65,536
+/// /64s, each of which counts as an address.
+pub const DEFAULT_HTTP_PER_PREFIX: usize = 64;
 
 /// The most connections that may be sending or receiving blobs and files
 /// at once (5.6, 12.12), and the default of `files.max_transfers`: the
@@ -118,6 +118,7 @@ pub struct HttpServer {
     keys: Arc<dyn KeyFiles>,
     files: Option<Files>,
     per_address: usize,
+    per_prefix: usize,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -165,16 +166,25 @@ impl HttpServer {
             keys,
             files: None,
             per_address: DEFAULT_HTTP_PER_ADDRESS,
+            per_prefix: DEFAULT_HTTP_PER_PREFIX,
         })
     }
 
     /// Allows at most `max` HTTPS connections open at once from one
     /// network address, an IPv6 address counting by its /64
     /// (`limits.https_connections_per_address`); 0 means no limit. The
-    /// default is [`DEFAULT_HTTP_PER_ADDRESS`]. An IPv6 /48 has at most
-    /// [`MAX_HTTP_PER_48`] whatever this is.
+    /// default is [`DEFAULT_HTTP_PER_ADDRESS`].
     pub fn with_per_address(mut self, max: usize) -> HttpServer {
         self.per_address = max;
+        self
+    }
+
+    /// Allows at most `max` HTTPS connections open at once from one IPv6
+    /// /48, whatever each of its addresses has
+    /// (`limits.https_connections_per_prefix`); 0 means no limit. The
+    /// default is [`DEFAULT_HTTP_PER_PREFIX`].
+    pub fn with_per_prefix(mut self, max: usize) -> HttpServer {
+        self.per_prefix = max;
         self
     }
 
@@ -210,8 +220,7 @@ impl HttpServer {
                     .min(MAX_HTTP_TRANSFERS),
             )),
             files: self.files,
-            per_address_max: self.per_address,
-            per_address: Mutex::new(HashMap::new()),
+            counts: Arc::new(ConnectionCounts::new(self.per_address, self.per_prefix)),
         });
         let mut background = JoinSet::new();
         for listener in listeners {
@@ -235,12 +244,8 @@ struct Shared {
     permits: Arc<Semaphore>,
     /// Connections sending or receiving blobs and files.
     transfers: Arc<Semaphore>,
-    /// The most connections one network address may have open; 0 means
-    /// no limit.
-    per_address_max: usize,
-    /// How many connections each network address, and each IPv6 /48, has
-    /// open.
-    per_address: Mutex<HashMap<IpAddr, usize>>,
+    /// The connections open from each network address and IPv6 /48.
+    counts: Arc<ConnectionCounts>,
 }
 
 /// The network a connection counts against: the address, or the /64 of
@@ -260,35 +265,68 @@ fn wide_key(ip: IpAddr) -> Option<IpAddr> {
     }
 }
 
+/// A network a connection counts against: an address or prefix, with
+/// its length in bits, since the /48 of an address and the /64 at its
+/// start are written alike.
+type NetworkKey = (IpAddr, u8);
+
+/// How many HTTPS connections each network address (an IPv6 /64), and
+/// each IPv6 /48, has open, and the most each may have.
+struct ConnectionCounts {
+    /// The most for one address; 0 means no limit.
+    per_address: usize,
+    /// The most for one IPv6 /48; 0 means no limit.
+    per_prefix: usize,
+    counts: Mutex<HashMap<NetworkKey, usize>>,
+}
+
+impl ConnectionCounts {
+    fn new(per_address: usize, per_prefix: usize) -> ConnectionCounts {
+        ConnectionCounts {
+            per_address,
+            per_prefix,
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<NetworkKey, usize>> {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// One of an address's connections, counted until it is dropped.
 struct AddressSlot {
-    shared: Arc<Shared>,
-    keys: Vec<IpAddr>,
+    counts: Arc<ConnectionCounts>,
+    keys: Vec<NetworkKey>,
 }
 
 impl AddressSlot {
     /// Counts a connection from `peer`, unless its address or its /48 has
     /// its fill.
-    fn take(shared: &Arc<Shared>, peer: IpAddr) -> Option<AddressSlot> {
+    fn take(counts: &Arc<ConnectionCounts>, peer: IpAddr) -> Option<AddressSlot> {
         let mut keys = Vec::new();
-        if shared.per_address_max > 0 {
-            keys.push((address_key(peer), shared.per_address_max));
+        if counts.per_address > 0 {
+            let key = address_key(peer);
+            let bits = if key.is_ipv6() { 64 } else { 32 };
+            keys.push(((key, bits), counts.per_address));
         }
-        if let Some(wide) = wide_key(peer) {
-            keys.push((wide, MAX_HTTP_PER_48));
+        if counts.per_prefix > 0
+            && let Some(wide) = wide_key(peer)
+        {
+            keys.push(((wide, 48), counts.per_prefix));
         }
-        let mut counts = shared.per_address.lock().unwrap_or_else(|e| e.into_inner());
+        let mut open = counts.lock();
         if keys
             .iter()
-            .any(|(key, max)| counts.get(key).copied().unwrap_or(0) >= *max)
+            .any(|(key, max)| open.get(key).copied().unwrap_or(0) >= *max)
         {
             return None;
         }
         for (key, _) in &keys {
-            *counts.entry(*key).or_default() += 1;
+            *open.entry(*key).or_default() += 1;
         }
         Some(AddressSlot {
-            shared: shared.clone(),
+            counts: counts.clone(),
             keys: keys.into_iter().map(|(key, _)| key).collect(),
         })
     }
@@ -296,16 +334,12 @@ impl AddressSlot {
 
 impl Drop for AddressSlot {
     fn drop(&mut self) {
-        let mut counts = self
-            .shared
-            .per_address
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut open = self.counts.lock();
         for key in &self.keys {
-            if let Some(n) = counts.get_mut(key) {
+            if let Some(n) = open.get_mut(key) {
                 *n -= 1;
                 if *n == 0 {
-                    counts.remove(key);
+                    open.remove(key);
                 }
             }
         }
@@ -331,7 +365,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     tracing::warn!("too many HTTPS connections, closing a new one");
                     continue;
                 };
-                let Some(slot) = AddressSlot::take(&shared, peer.ip()) else {
+                let Some(slot) = AddressSlot::take(&shared.counts, peer.ip()) else {
                     tracing::debug!(target: crate::net::ADDRESSES, %peer, "too many HTTPS connections from one address");
                     continue;
                 };
@@ -709,6 +743,52 @@ mod tests {
         assert_eq!(wide("2001:db8:1:2:3:4:5:6").unwrap(), "2001:db8:1::");
         assert_eq!(wide("203.0.113.7"), None);
         assert_eq!(wide("::ffff:203.0.113.7"), None);
+    }
+
+    /// Each address (an IPv6 /64) and each IPv6 /48 has its own count and
+    /// limit, 0 being none, and a slot counts again once dropped. The /64
+    /// at the start of a /48 is written as the /48 is, and is counted apart
+    /// from it.
+    #[test]
+    fn connections_count_by_address_and_prefix() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let counts = Arc::new(ConnectionCounts::new(2, 3));
+        let take = |s: &str| AddressSlot::take(&counts, ip(s));
+        // Two from the /64 at the start of 2001:db8:1::/48, and no third.
+        let first = [
+            take("2001:db8:1::1").unwrap(),
+            take("2001:db8:1::2").unwrap(),
+        ];
+        assert!(take("2001:db8:1::3").is_none());
+        // One more from another /64 of the /48, then the /48 is full.
+        let other = take("2001:db8:1:2::1").unwrap();
+        assert!(take("2001:db8:1:3::1").is_none());
+        // Another /48 is not, nor IPv4, which has no /48.
+        let elsewhere = take("2001:db8:2::1").unwrap();
+        let v4 = [take("203.0.113.7").unwrap(), take("203.0.113.7").unwrap()];
+        assert!(take("::ffff:203.0.113.7").is_none());
+        drop(other);
+        let again = take("2001:db8:1:3::1").unwrap();
+        drop((first, again, elsewhere, v4));
+        assert!(counts.lock().is_empty());
+
+        // 0: no limit on the /48, then on the address.
+        let counts = Arc::new(ConnectionCounts::new(1, 0));
+        let held: Vec<_> = (0..100)
+            .map(|i| AddressSlot::take(&counts, ip(&format!("2001:db8:1:{i:x}::1"))).unwrap())
+            .collect();
+        assert!(AddressSlot::take(&counts, ip("2001:db8:1::2")).is_none());
+        drop(held);
+        let counts = Arc::new(ConnectionCounts::new(0, 2));
+        let held = [
+            AddressSlot::take(&counts, ip("2001:db8:1::1")).unwrap(),
+            AddressSlot::take(&counts, ip("2001:db8:1::1")).unwrap(),
+        ];
+        assert!(AddressSlot::take(&counts, ip("2001:db8:1:5::1")).is_none());
+        let v4: Vec<_> = (0..100)
+            .map(|_| AddressSlot::take(&counts, ip("203.0.113.7")).unwrap())
+            .collect();
+        drop((held, v4));
     }
 
     #[test]

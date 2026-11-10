@@ -424,8 +424,9 @@ pub struct ServerConfig {
 /// The other limits that count by address, alone or with the connection
 /// or identity, keep their defaults as they are (PLAN item 66): posts,
 /// commits, creates and guests' reports, KEYPKG GET, which counts by
-/// identity, and HTTPS connections (`https_connections_per_address`,
-/// PLAN item 67). Operators tune them to their users.
+/// identity, and HTTPS connections (`https_connections_per_address` and
+/// `https_connections_per_prefix`, PLAN items 67 and 68). Operators tune
+/// them to their users.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -570,11 +571,17 @@ pub struct Limits {
     /// The most HTTPS connections one network address may have open at
     /// once, to the `[http]` listener (4.3, 5.6, 12.12), so that one
     /// client that opens connections and sends nothing cannot take them
-    /// all. IPv6 addresses count by their /64, and an IPv6 /48 has at most
-    /// [`MAX_HTTP_PER_48`](crate::http::server::MAX_HTTP_PER_48) whatever
-    /// this is. Others are closed as soon as they are accepted. 0 means no
-    /// limit.
+    /// all. IPv6 addresses count by their /64; see also
+    /// `https_connections_per_prefix`. Others are closed as soon as they
+    /// are accepted. 0 means no limit.
     pub https_connections_per_address: usize,
+    /// The most HTTPS connections one IPv6 /48 may have open at once, to
+    /// the `[http]` listener, whatever each of its addresses has: a /48
+    /// holds 65,536 /64s, each of which `https_connections_per_address`
+    /// counts as an address. IPv4 addresses have no such prefix. Others
+    /// are closed as soon as they are accepted. 0 means no limit (PLAN
+    /// item 68).
+    pub https_connections_per_prefix: usize,
     /// The most guest sessions one network address may have at once,
     /// those waiting to be resumed included (4.2). Further GUESTs get
     /// `ERR rate-limited`. 0 means no limit.
@@ -739,6 +746,7 @@ impl Default for Limits {
             outside_identities_per_day: 100,
             connections_per_address: 256,
             https_connections_per_address: crate::http::server::DEFAULT_HTTP_PER_ADDRESS,
+            https_connections_per_prefix: crate::http::server::DEFAULT_HTTP_PER_PREFIX,
             guests_per_address: 64,
             fetching_auths_per_hour: 480,
             joins_per_hour: 120,
@@ -1069,6 +1077,10 @@ mod tests {
         assert_eq!(c.limits.max_key_packages, 100);
         assert_eq!(c.limits.key_package_gets_per_hour, 600);
         assert_eq!(c.limits.max_key_package_bytes, 65536);
+        assert_eq!(c.limits.https_connections_per_address, 16);
+        assert_eq!(c.limits.https_connections_per_prefix, 64);
+        let c = Config::parse("[limits]\nhttps_connections_per_prefix = 0").unwrap();
+        assert_eq!(c.limits.https_connections_per_prefix, 0);
     }
 
     #[test]

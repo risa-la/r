@@ -459,20 +459,20 @@ async fn put_url(server: &TestServer) -> String {
     value(&command(&mut anon, &blob).await, "put")
 }
 
+/// Whether the server closed `tcp` at once, rather than waiting for its
+/// handshake.
+async fn closed_at_once(tcp: &mut TcpStream) -> bool {
+    let mut byte = [0u8; 1];
+    let read =
+        tokio::time::timeout(std::time::Duration::from_millis(300), tcp.read(&mut byte)).await;
+    matches!(read, Ok(Ok(0) | Err(_)))
+}
+
 /// `limits.https_connections_per_address` caps the HTTPS connections one
 /// address may hold open: past it, a new one is closed at once, and once
 /// one goes another may come (PLAN item 67).
 #[tokio::test]
 async fn https_connections_per_address_is_configured() {
-    /// Whether the server closed `tcp` at once, rather than waiting for
-    /// its handshake.
-    async fn closed_at_once(tcp: &mut TcpStream) -> bool {
-        let mut byte = [0u8; 1];
-        let read =
-            tokio::time::timeout(std::time::Duration::from_millis(300), tcp.read(&mut byte)).await;
-        matches!(read, Ok(Ok(0) | Err(_)))
-    }
-
     let capped = server_with(|c| c.limits.https_connections_per_address = 2).await;
     let (addr, _) = target(&put_url(&capped).await);
     let mut idle = vec![
@@ -503,4 +503,59 @@ async fn https_connections_per_address_is_configured() {
     }
     drop(idle);
     server.stop().await;
+}
+
+/// `limits.https_connections_per_prefix` caps the HTTPS connections one
+/// IPv6 /48 may hold open, whatever each address has, and 0 lifts it
+/// (PLAN item 68). Over `::1`, whose /48 is its own: skipped where the
+/// host has no IPv6 loopback.
+#[tokio::test]
+async fn https_connections_per_prefix_is_configured() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("no IPv6 loopback, skipped");
+        return;
+    }
+    let on_v6 = |url: &str| {
+        let (addr, _) = target(url);
+        SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()))
+    };
+    // Tighter than the address's limit, which stays at its default.
+    let capped = server_with(|c| {
+        c.http.listen = vec!["[::1]:0".parse().unwrap()];
+        c.limits.https_connections_per_prefix = 2;
+    })
+    .await;
+    let addr = on_v6(&put_url(&capped).await);
+    let mut idle = vec![
+        TcpStream::connect(addr).await.unwrap(),
+        TcpStream::connect(addr).await.unwrap(),
+    ];
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    assert!(closed_at_once(&mut extra).await);
+    for tcp in &mut idle {
+        assert!(!closed_at_once(tcp).await);
+    }
+    drop(idle.pop());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut next = TcpStream::connect(addr).await.unwrap();
+    assert!(!closed_at_once(&mut next).await);
+    drop((idle, next));
+    capped.stop().await;
+
+    // With both at 0, more than either default may be open.
+    let open = server_with(|c| {
+        c.http.listen = vec!["[::1]:0".parse().unwrap()];
+        c.limits.https_connections_per_address = 0;
+        c.limits.https_connections_per_prefix = 0;
+    })
+    .await;
+    let addr = on_v6(&put_url(&open).await);
+    let mut idle = Vec::new();
+    for _ in 0..70 {
+        idle.push(TcpStream::connect(addr).await.unwrap());
+    }
+    // Connections are accepted in order, so the last is past any cap.
+    assert!(!closed_at_once(idle.last_mut().unwrap()).await);
+    drop(idle);
+    open.stop().await;
 }
