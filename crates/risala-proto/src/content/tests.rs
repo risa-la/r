@@ -74,6 +74,7 @@ fn every_verb_round_trips() {
         format!("READ {BOX} 9120 {}", b64(EPOCH_CHECK_LEN, 19)),
         "RESYNC 9121".to_owned(),
         format!("RESYNC {BOX} 9121"),
+        format!("LEAVE {BOX}"),
         format!("REFETCH {}", hash('a')),
         "BLOCK spam@example.net".to_owned(),
         "UNBLOCK *@example.net".to_owned(),
@@ -408,6 +409,8 @@ fn arity() {
         format!("READ {BOX} 1 {} x", b64(EPOCH_CHECK_LEN, 1)),
         "RESYNC".to_owned(),
         format!("RESYNC {BOX} 1 2"),
+        "LEAVE".to_owned(),
+        format!("LEAVE {BOX} 1"),
         "BLOCK".to_owned(),
         "RECORD".to_owned(),
         "REFETCH".to_owned(),
@@ -462,6 +465,7 @@ fn value_rules() {
         "RESYNC x".to_owned(),
         format!("RESYNC {BOX} 0"),
         "RESYNC general 1".to_owned(),
+        "LEAVE general".to_owned(),
         "BLOCK ~sam".to_owned(),
         format!("SIGNINGKEY {}", b64(33, 1)),
         format!("TRANSFER {}", b64(80, 1)),
@@ -718,7 +722,7 @@ fn hand_built_lines_are_checked() {
 
 fn sample_lines() -> Vec<ContentLine> {
     let content: Content = format!(
-        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nRESYNC 1\nRESYNC {BOX} 1\nREFETCH {h}\nREAD {BOX} 1 {check}\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
+        "TEXT hi\nDELETE {id}\nTYPING\n@box={BOX};target={id} REPORT\nCHALLENGE 1 {ct}\nANSWER 1 {mac}\nATTEST 1 {pk} {sig} {sig} {ps}\nREVEAL 1 {seed}\nRESYNC 1\nRESYNC {BOX} 1\nLEAVE {BOX}\nREFETCH {h}\nREAD {BOX} 1 {check}\nBLOCK a@b.org\nUNBLOCK a@b.org\nRECORD {h}\nALERT {h}\nRECORDS\nSIGNINGKEY {seed}\nBACKUPKEY 0 {seed}\nWANT {BOX} 0 -\nTRANSFER {tr}\nSERVERS b.org\nPIN a@b.org {h} b.org/risala-log/1 {h} no\nFROB\n",
         id = id(1),
         ct = b64(CHALLENGE_LEN, 1),
         mac = b64(48, 1),
@@ -749,6 +753,7 @@ fn where_lines_count() {
     use Conversation::*;
     let ourselves = [
         "RESYNC",
+        "LEAVE",
         "READ",
         "BLOCK",
         "UNBLOCK",
@@ -850,7 +855,7 @@ fn content_allowed() {
 }
 
 #[test]
-fn resync_and_read_check() {
+fn resync_leave_and_read_check() {
     // `RESYNC <seq>` in the group, `RESYNC <box> <seq>` with yourself
     // (12.9).
     let ContentLine::Resync { mailbox, seq } = round_trip("RESYNC 9121") else {
@@ -872,6 +877,17 @@ fn resync_and_read_check() {
     assert!(!resync(None).allowed_in(with_yourself));
     assert!(resync(Some(BOX.parse().unwrap())).allowed_in(with_yourself));
     assert!(!resync(Some(BOX.parse().unwrap())).allowed_in(direct));
+
+    // `LEAVE <box>` only with yourself (6.1).
+    let ContentLine::Leave { mailbox } = round_trip(&format!("LEAVE {BOX}")) else {
+        panic!()
+    };
+    assert_eq!(mailbox.to_string(), BOX);
+    let leave = ContentLine::Leave { mailbox };
+    assert!(leave.allowed_in(with_yourself));
+    assert!(!leave.allowed_in(direct));
+    assert!(!leave.allowed_in(Place::new(Conversation::PrivateRoom(ConfirmMode::Pairwise))));
+    assert!(!leave.allowed_in(Place::new(Conversation::PublicRoom)));
 
     // READ's check is the first 8 bytes of the epoch_authenticator.
     let authenticator: Vec<u8> = (1..=48).collect();

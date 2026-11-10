@@ -332,6 +332,14 @@ pub enum ContentLine {
         /// The seq of the commit the device could not process.
         seq: Seq,
     },
+    /// `LEAVE <box>` in the conversation with yourself: the sending device
+    /// left the group of that box locally, its leaf perhaps still there,
+    /// and asks the identity's other devices to leave it for the whole
+    /// identity with the usual leave commit (6.1, 12.7).
+    Leave {
+        /// The mailbox of the group, now or before a move.
+        mailbox: BoxName,
+    },
     /// `REFETCH <hash>`: the sender's identity has a new record, so members
     /// fetch its key file soon rather than at their daily fetch (4.5,
     /// 12.14).
@@ -627,6 +635,7 @@ impl ContentLine {
                     }
                 }
             }
+            "LEAVE" => ContentLine::Leave { mailbox: last(p)? },
             "REFETCH" => ContentLine::Refetch(last(p)?),
             "READ" => {
                 let mut p = p;
@@ -721,6 +730,7 @@ impl ContentLine {
             ContentLine::Attest { .. } => "ATTEST",
             ContentLine::Reveal { .. } => "REVEAL",
             ContentLine::Resync { .. } => "RESYNC",
+            ContentLine::Leave { .. } => "LEAVE",
             ContentLine::Refetch(_) => "REFETCH",
             ContentLine::Read { .. } => "READ",
             ContentLine::Block(_) => "BLOCK",
@@ -801,6 +811,9 @@ impl ContentLine {
                     b.token(mailbox);
                 }
                 b.token(seq);
+            }
+            ContentLine::Leave { mailbox } => {
+                b.token(mailbox);
             }
             ContentLine::Read {
                 mailbox,
@@ -883,6 +896,7 @@ impl ContentLine {
     /// - `RESYNC <seq>` counts only in direct conversations and private
     ///   rooms, and `RESYNC <box> <seq>` only in the conversation with
     ///   yourself (12.7). Public rooms resync by external commit instead.
+    /// - LEAVE counts only in the conversation with yourself (6.1).
     /// - REFETCH counts only in direct conversations and private rooms
     ///   (12.14). Public rooms have no key checks.
     /// - READ, BLOCK, UNBLOCK, RECORD, ALERT, RECORDS, SIGNINGKEY,
@@ -930,6 +944,7 @@ impl ContentLine {
             ContentLine::Resync {
                 mailbox: Some(_), ..
             }
+            | ContentLine::Leave { .. }
             | ContentLine::Read { .. }
             | ContentLine::Block(_)
             | ContentLine::Unblock(_)
