@@ -1195,8 +1195,14 @@ pub(super) async fn run_maintenance(inner: &Inner) -> Result<(), StoreError> {
     }
     // A mailbox whose posts have all expired, and that nobody follows, has
     // had no device of its group online for a retention period: it ends,
-    // and its box is never used again (7.5).
-    let before = now.checked_sub(retention).unwrap_or(Timestamp::MIN);
+    // and its box is never used again (7.5). Only one created more than a
+    // retention period ago, so that a new mailbox is not ended before its
+    // group uses it (7.5, `EndAfterUse` in `proofs/delivery`): the store
+    // keeps its creation and newest post to the hour, rounded down, so
+    // the hour is added back.
+    let before = now
+        .checked_sub(retention + Duration::from_millis(crate::store::COARSE))
+        .unwrap_or(Timestamp::MIN);
     let idle = inner.db(move |store| store.idle_mailboxes(before)).await?;
     for mailbox in idle {
         let _lock = inner.mailbox.lock(mailbox).await;

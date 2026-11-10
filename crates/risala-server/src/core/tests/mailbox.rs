@@ -1221,6 +1221,55 @@ async fn retention() {
     assert_eq!(anon.lines(), ["ERR name-taken"]);
 }
 
+/// The server ends only a mailbox created more than a retention period
+/// ago (7.5, `EndAfterUse` in `proofs/delivery`), though it keeps times to
+/// the hour; and FOLLOW's head stays the newest seq given out after every
+/// post has expired (7.1).
+#[tokio::test]
+async fn mailboxes_end_only_after_a_retention_period() {
+    let mut h = Harness::new();
+    let mut anon = h.anon().await;
+    let day = Duration::from_secs(24 * 60 * 60);
+    let retention = day * 30;
+    // Late in an hour, which the store keeps rounded down.
+    h.clock.advance(Duration::from_secs(59 * 60));
+    let m = mailbox(1);
+    let create = format!(
+        "CREATE {m} {} {}",
+        GroupId::from_bytes([1; 32]),
+        hash([1; 48])
+    );
+    h.send(&anon, &create).await;
+    assert_eq!(anon.lines(), ["OK"]);
+    // A second short of a retention period: kept.
+    h.clock.advance(retention - Duration::from_secs(1));
+    run_maintenance(h.inner()).await.unwrap();
+    assert!(h.store.mailbox(&m).unwrap().is_some());
+    // An hour later: ended.
+    h.clock.advance(Duration::from_secs(60 * 60));
+    run_maintenance(h.inner()).await.unwrap();
+    assert!(h.store.mailbox(&m).unwrap().is_none());
+
+    // A followed mailbox whose posts have all expired keeps its head.
+    let mut d = Direct::new(&h, &mut anon, 2).await;
+    let message = d.alice.send(&mut d.a, b"hello");
+    h.send(
+        &anon,
+        &format!("POST {} {} {message}", d.m, d.alice.token(&d.a)),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK seq=2"]);
+    h.send(&anon, &format!("FOLLOW {}", d.m)).await;
+    assert_eq!(anon.lines(), ["OK head=2"]);
+    h.clock.advance(retention + day);
+    run_maintenance(h.inner()).await.unwrap();
+    h.send(&anon, &format!("FETCH {} after=0", d.m)).await;
+    assert_eq!(anon.lines(), ["OK more=0"]);
+    let mut other = h.anon().await;
+    h.send(&other, &format!("FOLLOW {}", d.m)).await;
+    assert_eq!(other.lines(), ["OK head=2"]);
+}
+
 /// FOLLOW's OK agrees with the live posts (3.6): posts sent to the
 /// connection before it are at most its head, and those after it newer.
 #[tokio::test]
