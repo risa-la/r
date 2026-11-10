@@ -304,3 +304,80 @@ fn lifetimes_for_an_own_commit() {
         assert_eq!(group::lifetime_ok_to_post(&lifetime, now), ok, "{now}");
     }
 }
+
+/// 6.4: a commit whose extension leaves more than 10,000 uids in `bans`
+/// fails the group checks that the others would make, so the device does
+/// not post it, and drops it.
+#[test]
+fn a_commit_past_the_bans_cap_is_not_posted() {
+    use risala_mls::conversation::MAX_BANS;
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    net.connect(alice);
+    let room = net
+        .job(
+            alice,
+            Job::PrivateRoom {
+                name: "big".into(),
+                members: Vec::new(),
+            },
+        )
+        .unwrap();
+    net.tick();
+    let ext = {
+        let cx = net.cx(alice);
+        let group_id = net.devices[alice]
+            .store
+            .conversation_row(room)
+            .unwrap()
+            .unwrap()
+            .group_id;
+        let mut out = Vec::new();
+        net.devices[alice]
+            .engine
+            .write(
+                &cx,
+                &net.devices[alice].engine.me.clone().unwrap(),
+                &mut out,
+                |tx, c| {
+                    let g = group::load(tx, c, &group_id)?;
+                    Ok(risala_mls::group::conversation(&g).unwrap())
+                },
+            )
+            .unwrap()
+    };
+    let mailbox = net.devices[alice].store.mailbox_rows(room).unwrap()[0].mailbox;
+    let commits = |net: &Net| {
+        net.server
+            .posts(&mailbox)
+            .into_iter()
+            .filter(|p| p.1 == ContentType::Commit)
+            .count()
+    };
+    let before = commits(&net);
+    let epoch = net.epoch(alice, room);
+    let mut over = ext.clone();
+    over.bans = (0..=MAX_BANS)
+        .map(|i| uid(&format!("b{i}@x.org")))
+        .collect();
+    let now = net.clock.now().unix_millis();
+    net.write(alice, |tx| {
+        group::queue_intent(
+            tx,
+            room,
+            &Intent {
+                conversation: Some(over.encode()),
+                ..Intent::default()
+            },
+            now,
+        )
+    });
+    net.advance(MINUTE);
+    assert_eq!(commits(&net), before, "not posted");
+    assert_eq!(net.epoch(alice, room), epoch);
+    let pending = net.write(alice, |tx| Ok(tx.pending_outbox(room)?));
+    assert!(
+        !pending.iter().any(|o| o.kind == OutboxKind::Commit),
+        "dropped, not kept queued"
+    );
+}

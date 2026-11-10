@@ -337,3 +337,41 @@ async fn blob_fetches_are_bounded() {
         assert!(held <= 256 << 20, "round {round}: {held}");
     }
 }
+
+/// 6.4: a ban fills `bans` up to 10,000 uids, and a ban past that is
+/// refused with its own error before any commit is made. Banning a uid
+/// that is banned already adds nothing, so it is fine at the cap.
+#[test]
+fn a_ban_past_the_cap_is_refused() {
+    use super::ConversationError;
+    use risala_mls::conversation::{MAX_BANS, RisalaConversation};
+    use risala_proto::names::Uid;
+    let uid = |s: &str| -> Uid { s.parse().unwrap() };
+    let mut ext = RisalaConversation::private_room(
+        "chat.example.org".parse().unwrap(),
+        [0; 16],
+        "big",
+        &uid("o@x.org"),
+    );
+    ext.mods.push(uid("m@x.org"));
+    ext.bans = (0..MAX_BANS - 1)
+        .map(|i| uid(&format!("b{i}@x.org")))
+        .collect();
+
+    // The 10,000th ban, of a moderator, takes it out of `mods`.
+    let full = super::banned(&ext, &uid("m@x.org")).unwrap();
+    assert_eq!(full.bans.len(), MAX_BANS);
+    assert!(full.mods.is_empty());
+    assert_eq!(full.check(), Ok(()));
+
+    // One more is refused.
+    let err = super::banned(&full, &uid("p@x.org")).unwrap_err();
+    assert!(
+        matches!(err, Error::Conversation(ConversationError::TooManyBans)),
+        "{err}"
+    );
+    assert_eq!(err.to_string(), "a room bans at most 10,000 identities");
+
+    // Banning one already banned changes nothing.
+    assert_eq!(super::banned(&full, &uid("b0@x.org")).unwrap(), full);
+}

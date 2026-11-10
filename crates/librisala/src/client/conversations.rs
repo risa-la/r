@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use risala_mls::conversation::{RisalaConversation, Role as GroupRole};
+use risala_mls::conversation::{MAX_BANS, RisalaConversation, Role as GroupRole};
 use risala_proto::content::ContentLine;
 use risala_proto::types::Role;
 
@@ -45,6 +45,10 @@ pub enum ConversationError {
     /// The group engine failed.
     #[error("{0}")]
     Engine(String),
+    /// A ban past the cap: a room bans at most 10,000 identities (6.4).
+    /// Lift a ban first.
+    #[error("a room bans at most 10,000 identities")]
+    TooManyBans,
 }
 
 impl From<EngineError> for Error {
@@ -716,6 +720,23 @@ impl Hooks for ClientHooks {
     }
 }
 
+/// The extension after a ban of `uid` (6.4): `uid` added to `bans`, if it
+/// is not there yet, and taken out of `owners` and `mods`. Devices refuse
+/// a commit that leaves more than 10,000 uids in `bans`, so a ban past
+/// that is refused here, before any commit is made.
+fn banned(ext: &RisalaConversation, uid: &Uid) -> Result<RisalaConversation> {
+    let mut new = ext.clone();
+    new.owners.retain(|u| u != uid);
+    new.mods.retain(|u| u != uid);
+    if !new.bans.contains(uid) {
+        if new.bans.len() >= MAX_BANS {
+            return Err(Error::Conversation(ConversationError::TooManyBans));
+        }
+        new.bans.push(uid.clone());
+    }
+    Ok(new)
+}
+
 fn summary(store: &Store, row: ConvRow) -> Result<ConversationSummary> {
     let unread = store
         .message_rows(row.id)?
@@ -1152,15 +1173,10 @@ impl Client {
             .filter(|l| l.uid == uid)
             .map(|l| (l.uid.to_string(), l.device_id))
             .collect();
-        let conversation_ext = ban.then(|| {
-            let mut new = ext.clone();
-            new.owners.retain(|u| *u != uid);
-            new.mods.retain(|u| *u != uid);
-            if !new.bans.contains(&uid) {
-                new.bans.push(uid.clone());
-            }
-            new.encode()
-        });
+        let conversation_ext = match ban {
+            true => Some(banned(&ext, &uid)?.encode()),
+            false => None,
+        };
         self.commit(
             conversation,
             Intent {
