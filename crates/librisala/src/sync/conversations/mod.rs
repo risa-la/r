@@ -506,6 +506,9 @@ pub(crate) enum Note {
     },
     /// This device was removed from the group.
     Removed { conv: ConversationId },
+    /// This device left the group by itself, as another device of its
+    /// identity asked (6.1, `LEAVE <box>`).
+    Left { conv: ConversationId },
     /// Proposals are pending: commit them after a random wait (6.1).
     Proposals { conv: ConversationId },
     /// A post of a later epoch that the device cannot read (12.7).
@@ -1896,7 +1899,7 @@ impl ConversationEngine {
                         out.extend(actions);
                     }
                 }
-                Note::Removed { conv } => {
+                Note::Removed { conv } | Note::Left { conv } => {
                     out.push(Action::Emit(Event::Conversation(ConversationEvent::Left {
                         conversation: conv,
                     })));

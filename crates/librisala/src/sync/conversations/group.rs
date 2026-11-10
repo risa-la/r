@@ -474,10 +474,55 @@ pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()>
 /// commit failed its own checks. The own identity is marked departed, so
 /// that the device refuses Welcomes back into the group
 /// ([`join_welcome`]): none of its leaves could be removed first, and a
-/// device that replaces the stale leaf would otherwise bring it back.
-pub(crate) fn leave_for_good(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid) -> Result<()> {
+/// device that replaces the stale leaf would otherwise bring it back. Where its identity's other devices remain in the
+/// group, it tells them to leave too ([`tell_own_devices`]).
+pub(crate) fn leave_for_good(
+    tx: &mut Tx<'_>,
+    conv: ConversationId,
+    own: &Uid,
+    now: u64,
+) -> Result<()> {
+    tell_own_devices(tx, conv, own, now)?;
     leave_locally(tx, conv)?;
     tx.mark_departed(conv, own)?;
+    Ok(())
+}
+
+/// Tells the identity's other devices that this device leaves `conv`
+/// locally, its leaf perhaps still in the group (6.1): `LEAVE <box>` in
+/// the conversation with yourself. One of them makes the usual leave
+/// commit ([`leave`]), which removes this device's leaf with the
+/// identity's others, so that the identity leaves with all its devices.
+/// Nothing if no other leaf of the identity is in the group as this
+/// device last knew it, for the conversation with yourself itself, or if
+/// the device is in no conversation with itself: the stale-leaf rules
+/// remain for those (12.7).
+fn tell_own_devices(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<()> {
+    let row = tx.conversation(conv)?;
+    if row.kind == ConvKind::WithYourself || own_leaves(tx, conv, own)?.len() <= 1 {
+        return Ok(());
+    }
+    let Ok(mailbox) = tx.current_mailbox(conv) else {
+        return Ok(());
+    };
+    let Some(with_yourself) = tx
+        .conversations_of(row.account)?
+        .into_iter()
+        .find(|r| r.kind == ConvKind::WithYourself && r.state.in_group())
+    else {
+        return Ok(());
+    };
+    super::content::queue_lines(
+        tx,
+        with_yourself.id,
+        own,
+        vec![risala_proto::content::ContentLine::Leave {
+            mailbox: mailbox.mailbox,
+        }],
+        false,
+        now,
+    )?;
+    tracing::info!(%conv, "asked the identity's other devices to leave the group");
     Ok(())
 }
 
@@ -505,7 +550,7 @@ fn leave_after_failed_commit(
             None
         }
     };
-    leave_for_good(tx, conv.id, cx.uid)?;
+    leave_for_good(tx, conv.id, cx.uid, cx.now)?;
     let Some((post, epoch)) = self_remove else {
         return Ok(None);
     };
@@ -1431,7 +1476,7 @@ fn after_commit(
 pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) -> Result<bool> {
     let row = tx.conversation(conv)?;
     if row.state == ConvState::Lost {
-        leave_for_good(tx, conv, own)?;
+        leave_for_good(tx, conv, own, now)?;
         return Ok(true);
     }
     if !row.state.in_group() || leaving(tx, conv)? {

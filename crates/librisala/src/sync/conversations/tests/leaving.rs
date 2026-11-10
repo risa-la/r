@@ -562,3 +562,86 @@ fn a_device_leaving_a_public_room_removes_its_other_leaves_first() {
     assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
     assert_eq!(net.state(alice, a), ConvState::Active);
 }
+
+/// 6.1: a LEAVE that names a box the group had before a move, which no
+/// device follows any more, still finds the group: the laptop leaves it,
+/// with the phone and the identity.
+#[test]
+fn a_leave_that_names_a_box_from_before_a_move_finds_the_group() {
+    let mut net = Net::new();
+    let laptop = net.device("alice", "alice@example.org");
+    let phone = net.device_of("alice-phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    let carol = net.device("carol", "carol@example.com");
+    for d in [laptop, phone, bob, carol] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    let pm = net.same_conv(phone, laptop, me).expect("the phone is in");
+    let a = net
+        .job(
+            laptop,
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec![uid("bob@example.net"), uid("carol@example.com")],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    let mailbox = |net: &Net, d: usize, conv: ConversationId| {
+        net.devices[d]
+            .store
+            .mailbox_rows(conv)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.current)
+            .unwrap()
+            .mailbox
+    };
+    let old_box = mailbox(&net, laptop, a);
+    // The laptop removes Carol, and the group moves (7.8). A day later,
+    // the old box is no longer followed.
+    let carol_device: [u8; 48] = net.devices[carol].device_id.clone().try_into().unwrap();
+    let now = net.clock.now().unix_millis();
+    net.write(laptop, |tx| {
+        group::queue_intent(
+            tx,
+            a,
+            &Intent {
+                remove: vec![("carol@example.com".into(), Some(carol_device))],
+                ..Intent::default()
+            },
+            now,
+        )?;
+        Ok(())
+    });
+    for _ in 0..25 {
+        net.advance(MINUTE);
+    }
+    assert_ne!(mailbox(&net, laptop, a), old_box, "moved");
+    net.advance(DAY + MINUTE);
+    net.tick();
+    assert!(
+        net.devices[laptop]
+            .store
+            .mailbox_rows(a)
+            .unwrap()
+            .iter()
+            .all(|m| m.mailbox != old_box)
+    );
+    // The phone asks with the old box.
+    net.lines(
+        phone,
+        pm,
+        vec![ContentLine::Leave { mailbox: old_box }],
+        false,
+    );
+    for _ in 0..5 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.state(laptop, a), ConvState::Left);
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
+}

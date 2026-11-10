@@ -106,7 +106,7 @@ pub(super) fn cannot_follow(
     seq: u64,
 ) -> Result<Gap, EngineError> {
     if group::leaving(tx, conv)? {
-        group::leave_for_good(tx, conv, cx.uid)?;
+        group::leave_for_good(tx, conv, cx.uid, cx.now)?;
         tracing::info!(%conv, "posts expired unread while leaving: left the group locally");
         return Ok(Gap::Left);
     }

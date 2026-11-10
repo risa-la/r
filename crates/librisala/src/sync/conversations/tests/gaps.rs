@@ -397,10 +397,12 @@ fn a_lost_device_asks_its_own_devices_and_is_welcomed_back() {
 }
 
 /// 6.1, 7.5: the user leaves a conversation the device has lost. It is
-/// left locally at once, marked departed, and the Welcome that answers the
-/// RESYNC the device sent before is refused.
+/// left locally at once, marked departed, and a Welcome back from a device
+/// of its own identity is refused: here the laptop's, which answers the
+/// RESYNC the phone sent before, while the phone's LEAVE waits for it to be
+/// online. Once it is, the laptop leaves too.
 #[test]
-fn a_lost_conversation_the_user_leaves_is_left_for_good() {
+fn a_lost_conversation_the_user_leaves_refuses_a_welcome_back_from_an_own_device() {
     let (mut net, laptop, phone, bob, a) = own_devices_and_bob();
     let p = net.same_conv(phone, laptop, a).unwrap();
     let b = net.same_conv(bob, laptop, a).unwrap();
@@ -412,15 +414,15 @@ fn a_lost_conversation_the_user_leaves_is_left_for_good() {
     net.connect(phone);
     net.tick();
     assert_eq!(net.state(phone, p), ConvState::Lost);
+    // The user leaves while the phone is offline: its LEAVE waits.
+    net.disconnect(phone);
     let own = net.devices[phone].uid.clone();
     let now = net.clock.now().unix_millis();
     assert!(net.write(phone, |tx| group::leave(tx, p, &own, now)));
     assert_eq!(net.state(phone, p), ConvState::Left);
     assert!(net.devices[phone].store.departed(p, &own).unwrap());
-    // The laptop comes back and answers the RESYNC: the phone refuses the
-    // Welcome back.
+    // The laptop comes back and answers the RESYNC.
     let before = net.epoch(laptop, a);
-    let seen = net.events(phone).len();
     net.connect(laptop);
     for _ in 0..3 {
         net.advance(60_000);
@@ -429,11 +431,116 @@ fn a_lost_conversation_the_user_leaves_is_left_for_good() {
         net.epoch(laptop, a) > before,
         "the laptop replaced the phone's leaf"
     );
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    // The phone refuses the Welcome, and posts its LEAVE: the laptop leaves
+    // the direct conversation, and so does Bob, as for any leave.
+    let seen = net.events(phone).len();
+    net.connect(phone);
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
     assert_eq!(net.state(phone, p), ConvState::Left);
     assert!(!net.events(phone)[seen..].iter().any(|e| matches!(
         e,
         Event::Conversation(ConversationEvent::Joined { conversation }) if *conversation == p
     )));
+    assert_eq!(net.state(laptop, a), ConvState::Left);
+    assert!(left(&net, laptop, a));
+    assert_eq!(net.state(bob, b), ConvState::Left);
+    assert!(net.devices[bob].store.departed(b, &own).unwrap());
+}
+
+/// Bob's private room with Alice's laptop and phone, which share their
+/// conversation with themselves.
+fn bobs_room_with_own_devices() -> (Net, usize, usize, usize, ConversationId) {
+    let mut net = Net::new();
+    let laptop = net.device("laptop", "alice@example.org");
+    let phone = net.device_of("phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, phone, bob] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    net.same_conv(phone, laptop, me).expect("the phone is in");
+    let b = net
+        .job(
+            bob,
+            Job::PrivateRoom {
+                name: "team".into(),
+                members: vec!["alice@example.org".parse().unwrap()],
+            },
+        )
+        .unwrap();
+    net.tick();
+    net.same_conv(laptop, bob, b).expect("the laptop is in");
+    net.same_conv(phone, bob, b).expect("the phone is in");
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    (net, laptop, phone, bob, b)
+}
+
+/// The phone finds posts of Bob's room expired unread while the laptop is
+/// away, and the user leaves the room on it: it leaves locally for good,
+/// and posts `LEAVE <box>` to the laptop. Returns the phone's and the
+/// laptop's conversations.
+fn phone_lost_and_left(
+    net: &mut Net,
+    laptop: usize,
+    phone: usize,
+    bob: usize,
+    b: ConversationId,
+) -> (ConversationId, ConversationId) {
+    let p = net.same_conv(phone, bob, b).unwrap();
+    let l = net.same_conv(laptop, bob, b).unwrap();
+    net.disconnect(phone);
+    net.say(bob, b, "while you were away");
+    expire_all(net, bob, b);
+    net.disconnect(laptop);
+    net.connect(phone);
+    net.tick();
+    assert_eq!(net.state(phone, p), ConvState::Lost);
+    let own = net.devices[phone].uid.clone();
+    let now = net.clock.now().unix_millis();
+    assert!(net.write(phone, |tx| group::leave(tx, p, &own, now)));
+    net.tick();
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    (p, l)
+}
+
+/// 6.1: a lost device leaves, and tells the laptop with LEAVE, which makes
+/// the usual leave commit: it removes the phone's leaf, and Bob commits the
+/// laptop's SelfRemove. The RESYNC the phone sent when it found the gap is
+/// not answered, so nobody Welcomes anyone back, and Alice has left.
+#[test]
+fn a_lost_device_that_leaves_has_its_own_devices_leave_and_nobody_is_welcomed_back() {
+    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
+    let (p, l) = phone_lost_and_left(&mut net, laptop, phone, bob, b);
+    let alice = net.devices[phone].uid.clone();
+    let epoch = net.epoch(bob, b);
+    let seen = net.events(phone).len();
+    net.connect(laptop);
+    for _ in 0..5 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(laptop, l), ConvState::Left);
+    assert!(left(&net, laptop, l));
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
+    assert_eq!(net.state(bob, b), ConvState::Active);
+    assert!(net.devices[bob].store.departed(b, &alice).unwrap());
+    assert!(
+        net.epoch(bob, b) >= epoch + 2,
+        "the laptop's leave commit, then Bob's commit of its SelfRemove"
+    );
+    for _ in 0..10 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert_eq!(net.state(laptop, l), ConvState::Left);
+    assert!(
+        !net.events(phone)[seen..]
+            .iter()
+            .any(|e| matches!(e, Event::Conversation(ConversationEvent::Joined { .. })))
+    );
 }
 
 /// 6.1, 7.5: a device whose SelfRemove waits for a commit, and that finds
