@@ -2620,6 +2620,68 @@ Open:
     - **`send` into a group whose sending is held exits 0**, printing
       that the message is queued and why. Held is not failed.
 
+67. **Points raised by item 66's work**, decided with the user on
+    2026-11-10. Item 66's spec, delivery, leaving and server agents
+    raised these. Settled:
+
+    *A device that finds a gap (7.4, 7.5).*
+    - **It asks its own devices at once**: a lost device sends
+      `RESYNC <box> <seq>` with the first seq it found after the gap, and
+      its own devices replace its leaf and Welcome it back without
+      waiting for the leaf to go stale. 7.4 and 12.7 extend RESYNC's
+      `<seq>` to this case.
+    - **What is not a gap:** posts that expired before the device joined
+      by Welcome, and a gap in a mailbox the group has moved away from.
+      The spec says so, as the code does.
+    - **A lost device that is leaving, or whose user leaves a lost
+      conversation, leaves locally**: it forgets the conversation, marks
+      it departed, and refuses Welcomes back.
+    - **Late posts across a move (12.9):** a device keeps the secrets of
+      the old mailbox's last epochs for as long as it follows the old
+      mailbox, a day after the move, so that every device decides alike
+      whether it can read a late post there. A slot's log keeps every
+      removal made while the old mailbox is followed, not only the
+      newest.
+
+    *Leaving (6.1, 12.7).*
+    - **A leave commit keeps trying** while the device is offline, and
+      the conversation shows as leaving; one that falls behind past
+      retention is lost, and leaves locally (above).
+    - **Removing own leaves first applies in every kind of group**,
+      public rooms included.
+    - **A leave commit that fails the device's own checks** no longer
+      drops the leave: the device leaves locally, posts its SelfRemove if
+      it can, and logs a warning.
+    - **The alert for a removed own device stays for leaves**, worded for
+      both cases: "your device X left C and removed this device; if that
+      wasn't you, it may be stolen".
+
+    *The conversation extension (12.4).*
+    - **The ban cap and unique uids are format rules**: at most 10,000
+      uids in `bans`, and no uid twice in `owners`, `mods` or `bans`.
+      Everyone checks them everywhere, joiners and the server included,
+      as risala-mls does.
+
+    *Commits and blobs.*
+    - **A commit reposted more than 10 minutes after it was made** may be
+      dropped for a new one (7.6): its first copy fails 12.3's
+      `updated` check wherever it lands.
+    - **Large external commits are measured first**: a test builds the
+      largest external commit and GroupInfo at the room limits and
+      records their size. Decide only if they don't fit a line.
+    - **risalad refuses a blob-ref** in CREATE and in an external commit
+      (`ERR bad-syntax`).
+    - **A command that could never fit in `blob_memory`** gets
+      `ERR too-long`, now including a public room's state.
+
+    *Server and CLI.*
+    - **HTTPS connections per address become a config option**,
+      `https_connections_per_address`, default 16.
+    - **`send` and `send-file` into a held group exit 0**, with the
+      reason on stderr and the message id alone on stdout.
+    - **librisala's cache schema stays at version 1**, changed in place,
+      until the first release; development caches are wiped.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
