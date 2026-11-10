@@ -426,6 +426,11 @@ pub trait Handler: Send + Sync + 'static {
     /// The connection is gone. A guest session starts waiting to be
     /// resumed here (4.2).
     fn closed(&self, conn: ConnId) -> impl Future<Output = ()> + Send;
+
+    /// The server's time, as it stamps posts (3.2). A PING carries it in
+    /// `t` (11), so it must come from the same clock as posts' `t`: a post
+    /// accepted after a PING is never stamped earlier than it.
+    fn now(&self) -> Timestamp;
 }
 
 #[cfg(test)]

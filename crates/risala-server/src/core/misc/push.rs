@@ -678,6 +678,7 @@ async fn reading(inner: &Arc<Inner>, sub: &PushSubscription) -> bool {
                     if let Some(conn) = reg.conns.get(id) {
                         conn.handle.send(ServerMessage::new(ServerLine::Ping {
                             token: "push".into(),
+                            t: inner.now(),
                         }));
                     }
                 }

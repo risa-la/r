@@ -119,7 +119,7 @@ fn built(command: &Command) -> bool {
 
 /// What the hub answers `request` on a connection of `kind`: the error of
 /// Section 13 if the kind may not send it, `forbidden` for ADMIN from
-/// someone who is not an operator (Section 10), `OK` for PING, and
+/// someone who is not an operator (Section 10), `OK` for PING (with `t`), and
 /// `not-supported` for every area's commands that are not built yet.
 /// `None` for the identity and keys areas', which their own tests check,
 /// and the misc and admin areas' (see [`built`]): they get past the kind
@@ -176,11 +176,18 @@ async fn every_command_on_every_kind() {
             h.send(conn, &format!("@ref=k {line}")).await;
             let lines = conn.lines();
             match expected(&request, *kind, *operator) {
-                Some(want) => assert_eq!(
-                    lines,
-                    [format!("@ref=k {want}")],
-                    "{line} on {kind} (operator: {operator})"
-                ),
+                Some(want) => {
+                    // The OK to PING carries the server's time (11).
+                    let tags = match request.command {
+                        Command::Ping { .. } => format!("@ref=k;t={}", h.inner().now()),
+                        _ => "@ref=k".into(),
+                    };
+                    assert_eq!(
+                        lines,
+                        [format!("{tags} {want}")],
+                        "{line} on {kind} (operator: {operator})"
+                    )
+                }
                 None => {
                     let last = lines.last().expect("a final response");
                     for refused in ["not-authenticated", "wrong-connection"] {

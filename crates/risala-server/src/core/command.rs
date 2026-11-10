@@ -166,7 +166,8 @@ pub(super) async fn route(inner: &Arc<Inner>, id: ConnId, req: Request) {
             cx.handle.close(None);
             return;
         }
-        Command::Ping { .. } => Ok(OkResponse::new()),
+        // 11: the OK carries the server's time, as its own PING does.
+        Command::Ping { .. } => Ok(OkResponse::new().with_t(cx.inner.now())),
         Command::Anon => session::anon(&cx).await,
         Command::Guest { name, token } => session::guest(&cx, &name, token.as_ref()).await,
         Command::Admin(admin) => route_admin(&cx, admin).await,

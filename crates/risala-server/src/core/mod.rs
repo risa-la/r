@@ -511,6 +511,10 @@ impl Handler for Hub {
         self.inner.open(info, conn);
     }
 
+    fn now(&self) -> Timestamp {
+        self.inner.now()
+    }
+
     fn command(
         &self,
         conn: ConnId,

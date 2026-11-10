@@ -804,7 +804,10 @@ async fn quiet_followers_that_are_alive_hold_pushes_back() {
     // holds the push back.
     misc::post_kept(h.inner(), mailbox);
     wait(50).await;
-    assert_eq!(reader.lines(), ["PING push"]);
+    assert_eq!(
+        reader.lines(),
+        [format!("@t={} PING push", h.inner().now())]
+    );
     h.send(&reader, "PONG push").await;
     wait(150).await;
     assert!(recorder.take().is_empty());
@@ -813,7 +816,10 @@ async fn quiet_followers_that_are_alive_hold_pushes_back() {
     wait(150).await;
     misc::post_kept(h.inner(), mailbox);
     wait(50).await;
-    assert_eq!(reader.lines(), ["PING push"]);
+    assert_eq!(
+        reader.lines(),
+        [format!("@t={} PING push", h.inner().now())]
+    );
     wait(150).await;
     assert_eq!(recorder.take().len(), 1);
 

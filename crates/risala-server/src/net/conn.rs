@@ -164,8 +164,15 @@ where
                     };
                     match req {
                         Ok(req) => {
-                            if let Some(ended) =
-                                wait_for_room(handle, room, &mut keepalive, &mut stop, writer).await
+                            if let Some(ended) = wait_for_room(
+                                handle,
+                                handler,
+                                room,
+                                &mut keepalive,
+                                &mut stop,
+                                writer,
+                            )
+                            .await
                             {
                                 return ended;
                             }
@@ -197,7 +204,7 @@ where
             _ = &mut *writer => return Ended::Writer,
             _ = stop.wait_for(|stopping| *stopping) => return Ended::Shutdown,
             () = tokio::time::sleep_until(deadline) => {
-                if let Some(ended) = keepalive_expired(handle, &mut keepalive) {
+                if let Some(ended) = keepalive_expired(handle, handler, &mut keepalive) {
                     return ended;
                 }
             }
@@ -221,8 +228,9 @@ where
 /// Waits until the queue has `room` for a command's response (see
 /// [`read_loop`]). Returns why the connection should stop reading instead,
 /// if it should.
-async fn wait_for_room(
+async fn wait_for_room<H: Handler>(
     handle: &ConnHandle,
+    handler: &H,
     room: CommandRoom,
     keepalive: &mut Keepalive,
     stop: &mut watch::Receiver<bool>,
@@ -235,7 +243,7 @@ async fn wait_for_room(
             _ = &mut *writer => return Some(Ended::Writer),
             _ = stop.wait_for(|stopping| *stopping) => return Some(Ended::Shutdown),
             () = tokio::time::sleep_until(deadline) => {
-                if let Some(ended) = keepalive_expired(handle, keepalive) {
+                if let Some(ended) = keepalive_expired(handle, handler, keepalive) {
                     return Some(ended);
                 }
             }
@@ -247,11 +255,16 @@ async fn wait_for_room(
 
 /// Called when the keepalive deadline may have passed: sends PING, or
 /// gives up with BYE (11).
-fn keepalive_expired(handle: &ConnHandle, keepalive: &mut Keepalive) -> Option<Ended> {
+fn keepalive_expired<H: Handler>(
+    handle: &ConnHandle,
+    handler: &H,
+    keepalive: &mut Keepalive,
+) -> Option<Ended> {
     match keepalive.expired(Instant::now()) {
         Some(Expired::Ping) => {
             handle.send(ServerMessage::new(ServerLine::Ping {
                 token: ping_token(),
+                t: handler.now(),
             }));
             None
         }

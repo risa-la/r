@@ -68,6 +68,10 @@ impl Stub {
 }
 
 impl Handler for Stub {
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
+    }
+
     fn open(&self, info: ConnInfo, conn: ConnHandle) {
         let host = info.sni.clone().unwrap_or_else(|| "localhost".into());
         conn.send(ServerMessage::new(Greeting {
@@ -215,6 +219,17 @@ impl Pipe {
         line
     }
 
+    /// Reads the next line, which must be the server's PING with its `t`
+    /// (11). Returns the token.
+    async fn expect_ping(&mut self) -> String {
+        let line = self.expect_prefix("@t=").await;
+        let (t, token) = line["@t=".len()..]
+            .split_once(" PING ")
+            .unwrap_or_else(|| panic!("{line:?} is not a PING"));
+        assert!(t.parse::<Timestamp>().is_ok(), "{line:?}");
+        token.to_owned()
+    }
+
     /// Waits for the server to close, and checks `closed` ran once.
     async fn expect_end(mut self) {
         assert_eq!(self.line().await, None);
@@ -360,9 +375,10 @@ async fn line_limits_follow_the_kind() {
 async fn ping_then_bye_after_silence() {
     let mut pipe = Pipe::greeted(Stub::new()).await;
     let start = Instant::now();
-    let ping = pipe.expect_prefix("PING ").await;
+    // It carries the server's time (11).
+    let token = pipe.expect_ping().await;
     assert_eq!(start.elapsed(), TIMERS.idle_ping);
-    assert_eq!(ping.len(), "PING ".len() + 16);
+    assert_eq!(token.len(), 16);
     pipe.expect("BYE ping timeout").await;
     assert_eq!(start.elapsed(), TIMERS.idle_ping + TIMERS.ping_timeout);
     pipe.expect_end().await;
@@ -385,12 +401,12 @@ async fn any_line_resets_the_timers() {
 
     // The PING comes 120 seconds after the last line. Answering it, even
     // late, starts both timers again.
-    let ping = pipe.expect_prefix("PING ").await;
+    let token = pipe.expect_ping().await;
     assert_eq!(last.elapsed(), TIMERS.idle_ping);
     tokio::time::sleep(Duration::from_secs(59)).await;
-    pipe.send(format!("PONG {}\n", &ping[5..]).as_bytes()).await;
+    pipe.send(format!("PONG {token}\n").as_bytes()).await;
     let pong = Instant::now();
-    pipe.expect_prefix("PING ").await;
+    pipe.expect_ping().await;
     assert_eq!(pong.elapsed(), TIMERS.idle_ping);
 
     // A bad line counts too.
@@ -398,7 +414,7 @@ async fn any_line_resets_the_timers() {
     pipe.send(b"\x01\n").await;
     pipe.expect_prefix("ERR bad-syntax").await;
     let bad = Instant::now();
-    pipe.expect_prefix("PING ").await;
+    pipe.expect_ping().await;
     assert_eq!(bad.elapsed(), TIMERS.idle_ping);
     pipe.expect("BYE ping timeout").await;
     let stub = pipe.stub.clone();
@@ -431,14 +447,14 @@ async fn a_long_line_resets_the_timers_only_at_its_end() {
     tokio::time::sleep(Duration::from_secs(30)).await;
     pipe.send(&[b'x'; 100]).await;
     // Nothing complete has arrived since the greeting.
-    pipe.expect_prefix("PING ").await;
+    pipe.expect_ping().await;
     assert_eq!(start.elapsed(), TIMERS.idle_ping);
 
     // The LF ends the line: both timers start again.
     tokio::time::sleep(Duration::from_secs(10)).await;
     pipe.send(b"xx\n").await;
     let lf = Instant::now();
-    pipe.expect_prefix("PING ").await;
+    pipe.expect_ping().await;
     assert_eq!(lf.elapsed(), TIMERS.idle_ping);
     pipe.expect("BYE ping timeout").await;
     pipe.expect_end().await;

@@ -155,6 +155,7 @@ async fn two_anonymous_connections() {
     reader.send(&format!("UNFOLLOW {m}")).await.unwrap();
     assert_eq!(reader.expect_line().await.unwrap(), "OK");
     reader.send("PING").await.unwrap();
-    assert_eq!(reader.expect_line().await.unwrap(), "OK");
+    let ok = reader.expect_line().await.unwrap();
+    assert!(ok.starts_with("@t=") && ok.ends_with(" OK"), "{ok}");
     server.stop().await;
 }

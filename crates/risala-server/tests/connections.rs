@@ -95,7 +95,8 @@ async fn line_limits_follow_the_kind() {
     );
     // The connection still works.
     client.send("@ref=x PING").await.unwrap();
-    assert_eq!(client.expect_line().await.unwrap(), "@ref=x OK");
+    let ok = client.expect_line().await.unwrap();
+    assert!(ok.starts_with("@ref=x;t=") && ok.ends_with(" OK"), "{ok}");
     server.stop().await;
 }
 
@@ -168,7 +169,8 @@ async fn a_guest_resumes_after_a_dropped_connection() {
     let (mut back, new_token) = server.guest_session("sam", Some(&token)).await;
     assert_ne!(new_token, token);
     back.send("PING").await.unwrap();
-    assert_eq!(back.expect_line().await.unwrap(), "OK");
+    let ok = back.expect_line().await.unwrap();
+    assert!(ok.starts_with("@t=") && ok.ends_with(" OK"), "{ok}");
     assert_eq!(server.hub().guest_sessions().len(), 1);
 
     // The other connection is still new, and can be a guest of its own.

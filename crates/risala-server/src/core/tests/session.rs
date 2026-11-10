@@ -195,7 +195,7 @@ async fn resuming_takes_the_session_from_its_connection() {
         assert!(session.expiry.is_none());
     }
     h.send(&second, "ping").await;
-    assert_eq!(second.lines(), ["OK"]);
+    assert_eq!(second.lines(), [format!("@t={} OK", h.inner().now())]);
 }
 
 /// Once the resume period is over, the session ends and the name is free
@@ -250,7 +250,15 @@ async fn ping_pong_and_quit() {
     h.send(&c, "ping").await;
     h.send(&c, "@ref=p PING token").await;
     h.send(&c, "PONG token").await;
-    assert_eq!(c.lines(), ["OK", "@ref=p OK"]);
+    // The OK carries the server's time, as posts do (11, 3.2).
+    let t = h.inner().now();
+    assert_eq!(
+        c.lines(),
+        [format!("@t={t} OK"), format!("@ref=p;t={t} OK")]
+    );
+    h.clock.advance(Duration::from_secs(5));
+    h.send(&c, "PING").await;
+    assert_eq!(c.lines(), [format!("@t={} OK", h.inner().now())]);
     h.send(&c, "@ref=q quit see you").await;
     assert_eq!(c.lines(), ["@ref=q OK", "<close>"]);
 }
@@ -264,7 +272,7 @@ async fn new_connections_have_a_time_to_choose_a_kind() {
     let mut anon = h.anon().await;
     let mut pinging = h.connect();
     h.send(&pinging, "ping").await;
-    assert_eq!(pinging.lines(), ["OK"]);
+    assert_eq!(pinging.lines(), [format!("@t={} OK", h.inner().now())]);
     tokio::time::sleep(Duration::from_secs(119)).await;
     assert!(idle.lines().is_empty());
     tokio::time::sleep(Duration::from_secs(2)).await;

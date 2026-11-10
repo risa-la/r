@@ -29,7 +29,8 @@ async fn register_auth_and_keys_put() {
     let (mut alice, mut chain, device) = server.register("alice").await;
     let mut again = server.sign_in(&device).await;
     again.send("PING").await.unwrap();
-    assert_eq!(again.expect_line().await.unwrap(), "OK");
+    let ok = again.expect_line().await.unwrap();
+    assert!(ok.starts_with("@t=") && ok.ends_with(" OK"), "{ok}");
 
     let phone = chain.add_device("phone");
     alice.send(&chain.keys_put_line(2)).await.unwrap();
