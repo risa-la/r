@@ -1233,8 +1233,9 @@ if that is later; but never later than the `t` of the commit's post.
   device that fell behind joins again by itself (6.1). A device that
   leaves locally therefore first removes the leaves of its identity's
   other devices (6.1), so that none of them replaces its own leaf, and
-  so brings it back. One that leaves a group it can no longer follow
-  cannot, and ignores such a Welcome instead (6.1).
+  so brings it back. One that cannot, because it can no longer follow
+  the group or its leave commit failed its checks, asks them with LEAVE
+  to leave for it, and ignores such a Welcome from them (6.1).
 - **By anyone, after 35 days.** A leaf is **stale** if its activity time
   is more than 35 days before the group's median activity time. The
   median is taken over every leaf that carries a profile, as the group
@@ -1651,7 +1652,7 @@ the table does not allow them. Also:
 | `ATTEST <period> <period-key> <certificate> <attestation> <pseudonym>`, `REVEAL <period> <seed>` | groups whose `confirm` is `epochal` | 12.10 |
 | `RESYNC <seq>` | direct conversations and private rooms | 12.7 |
 | `REFETCH <hash>` | direct conversations and private rooms | 4.5, 12.14 |
-| `READ <box> <seq> <check>`, `RESYNC <box> <seq>` | the conversation with yourself | 7.7, 12.7 |
+| `READ <box> <seq> <check>`, `RESYNC <box> <seq>`, `LEAVE <box>` | the conversation with yourself | 6.1, 7.7, 12.7 |
 | `BLOCK <target>`, `UNBLOCK <target>` | the conversation with yourself | 5.7 |
 | `RECORD <hash>`, `ALERT <hash>`, `RECORDS [<hashes...>]` | the conversation with yourself | 4.5 |
 | `SIGNINGKEY <seed>`, `BACKUPKEY <generation> <key>` | the conversation with yourself | 4.8, 12.13 |
@@ -1685,9 +1686,31 @@ could not process (12.7), in decimal. In the conversation with yourself,
 sending device's leaf in the group of that box. There `<seq>` is either
 the seq of a commit that the device could not process, or, for a device
 that found a gap (7.4), the first seq it found after the gap, or the
-head (7.1) if every post up to it had expired. A device acts on it
-only if it holds a group whose mailbox has that box, now or before a
-move (7.8), and has applied the posts there up to that seq.
+head (7.1) if every post up to it had expired.
+
+In the conversation with yourself, `LEAVE <box>` says that the sending
+device has left the group of that box locally, without removing its
+identity's other leaves there, and asks the identity's other devices to
+leave it for the identity (6.1). A device that acts on it, after a
+random wait of up to 10 minutes and unless a leave by another device of
+its identity has removed its leaf first, leaves the group as 6.1 says,
+and tells its user that the identity left the conversation from the
+sending device. A device that is already leaving the group goes on as
+it was.
+
+A device acts on `RESYNC <box> <seq>` or `LEAVE <box>` only from a
+confirmed leaf of its own identity (below), and only if it holds a group
+whose mailbox has that box now, or had it before any move (7.8). So
+devices keep each group's earlier boxes for as long as they hold the
+group, since a device that cannot follow a group may not have seen its
+last moves. For RESYNC in the group's current mailbox, the device first
+applies the posts there up to that seq. In a mailbox the group has moved
+away from, it has applied every post that counts (above), and acts at
+once. A device ignores LEAVE for the conversation with yourself itself.
+Where no device of the identity can act on the line, because none of
+them is in that group or the sender cannot post in the conversation
+with yourself either, the sender's leaf is replaced or removed once it
+is stale (12.7).
 
 In `REFETCH <hash>`, `<hash>` is the SHA-384 hash of a record of the
 sender's identity, as a blob-ref (3.5). A device sends it once it has

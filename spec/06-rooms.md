@@ -150,8 +150,9 @@ locally (below).
 A device MUST NOT post a leave commit that fails its own group checks
 (12.7). If its leave commit fails them, it does not give up the leave:
 it leaves locally (below), SHOULD still post its SelfRemove if it holds
-the group's current epoch, so that others' devices remove its leaf, and
-logs a warning with the check that failed.
+the group's current epoch, so that others' devices remove its leaf,
+asks its own other devices to leave for it with LEAVE (below), and logs
+a warning with the check that failed.
 
 Where nobody else would commit its leave, a device leaves **locally**,
 with no SelfRemove: in a group that has no leaf of another identity,
@@ -170,10 +171,24 @@ stops following the mailbox with UNFOLLOW (7.1), and deletes the
 group's keys and the conversation.
 
 A device that leaves locally a group it cannot follow cannot remove its
-identity's other leaves first. It forgets the group as above, keeps a
-mark that it has left the conversation, and ignores later Welcomes to
-that group (12.8), such as one from a device of its own identity that
-replaces its leaf (12.7).
+identity's other leaves first, and nor can one whose leave commit failed
+its checks (above). If its identity's other devices still have leaves in
+the group, as far as it knows, it asks them to leave for it: it posts
+`LEAVE <box>` in the conversation with yourself (12.9), where `<box>` is
+the group's mailbox as it last knew it. One of them then leaves the
+group as this section says, on the identity's behalf: its leave commit
+removes every other leaf of the identity, the sender's leaf among them,
+or, in a group with no leaf of another identity, it leaves locally,
+after first removing those leaves. So the identity leaves with all its
+devices, as in any leave. Where none of them can act on it (12.9), the
+sender's leaf is replaced or removed once it is stale (12.7).
+
+The device itself forgets the group as above, and keeps a mark that it
+has left the conversation. It then ignores Welcomes to that group (12.8)
+whose GroupInfo is signed by a leaf of its own identity, such as one
+from a device of its own that replaced its leaf before reading LEAVE
+(12.7). A Welcome from a member of another identity is an invitation,
+as after any leave, and the device shows it as one.
 
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
 private room, coming back always takes a new invitation. In a direct

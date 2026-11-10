@@ -332,7 +332,9 @@ in the group, only other members' devices replace it, after 35 days
 (12.7). Either way, the device then gets a Welcome, as a new device
 does, and asks its own devices for what it missed (12.13). A device that
 is leaving the group, or whose user leaves it while the device cannot
-follow it, sends no RESYNC, and leaves locally instead (6.1).
+follow it, sends no RESYNC. It leaves locally instead, and, if its
+identity's other devices are in the group, sends `LEAVE <box>` so that
+they leave it too (6.1).
 
 Retention is also the limit of what the server holds: once a post has
 expired, nobody can fetch it, even with every key.
