@@ -400,6 +400,55 @@ pub fn create_group<P: OpenMlsProvider>(
     conversation
         .check()
         .map_err(|e| GroupError::Group(e.to_string()))?;
+    create_group_with(
+        provider,
+        identity,
+        profile,
+        conversation.kind,
+        group_context_extensions(conversation),
+        now,
+    )
+}
+
+/// [`create_group`], with the conversation extension's data as it is,
+/// well formed or not, in a group of `kind`: for tests of what others
+/// refuse. Only with the `testing` feature.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn create_group_with_extension_data<P: OpenMlsProvider>(
+    provider: &P,
+    identity: &RisalaIdentity,
+    profile: &RisalaProfile,
+    kind: ConversationKind,
+    data: Vec<u8>,
+    now: Timestamp,
+) -> Result<(MlsGroup, LeafKey, EpochState), GroupError<P::StorageError>> {
+    let extensions = extensions_with_data(data);
+    create_group_with(provider, identity, profile, kind, extensions, now)
+}
+
+/// A group context's extensions with `data` as the conversation
+/// extension's, as it is.
+#[cfg(feature = "testing")]
+fn extensions_with_data(data: Vec<u8>) -> Extensions<GroupContext> {
+    Extensions::from_vec(vec![
+        Extension::RequiredCapabilities(required_capabilities()),
+        Extension::Unknown(
+            crate::conversation::CONVERSATION_EXTENSION_TYPE,
+            openmls::prelude::UnknownExtension(data),
+        ),
+    ])
+    .expect("two extensions of different types")
+}
+
+fn create_group_with<P: OpenMlsProvider>(
+    provider: &P,
+    identity: &RisalaIdentity,
+    profile: &RisalaProfile,
+    kind: ConversationKind,
+    extensions: Extensions<GroupContext>,
+    now: Timestamp,
+) -> Result<(MlsGroup, LeafKey, EpochState), GroupError<P::StorageError>> {
     let id: [u8; GROUP_ID_LEN] = provider
         .rand()
         .random_array()
@@ -408,7 +457,6 @@ pub fn create_group<P: OpenMlsProvider>(
     leaf_key
         .store(provider.storage(), &id)
         .map_err(GroupError::Storage)?;
-    let kind = conversation.kind;
     let group = MlsGroup::builder()
         .ciphersuite(CIPHERSUITE)
         .with_group_id(GroupId::from_slice(&id))
@@ -418,7 +466,7 @@ pub fn create_group<P: OpenMlsProvider>(
                 .expect("a profile is a leaf extension"),
         )
         .map_err(mls)?
-        .with_group_context_extensions(group_context_extensions(conversation))
+        .with_group_context_extensions(extensions)
         .with_wire_format_policy(wire_format_policy(kind))
         .use_ratchet_tree_extension(kind != ConversationKind::PublicRoom)
         .max_past_epochs(MAX_PAST_EPOCHS)
@@ -496,6 +544,42 @@ pub fn commit<P: OpenMlsProvider>(
     state: &EpochState,
     changes: Changes,
 ) -> Result<CommitOutput, GroupError<P::StorageError>> {
+    commit_with(provider, group, profile, state, changes, None)
+}
+
+/// [`commit`] of `changes` and of the conversation extension's data
+/// `data`, as it is, well formed or not: for tests of what others refuse.
+/// `changes` has no conversation extension and no move. Only with the
+/// `testing` feature.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn commit_with_extension_data<P: OpenMlsProvider>(
+    provider: &P,
+    group: &mut MlsGroup,
+    profile: &RisalaProfile,
+    state: &EpochState,
+    changes: Changes,
+    data: Vec<u8>,
+) -> Result<CommitOutput, GroupError<P::StorageError>> {
+    if changes.conversation.is_some() || changes.move_box {
+        return Err(GroupError::Group(
+            "the extension's data is the only change to it".into(),
+        ));
+    }
+    let extensions = extensions_with_data(data);
+    commit_with(provider, group, profile, state, changes, Some(extensions))
+}
+
+/// [`commit`], with `extensions`, if any, in place of those of the
+/// changes' conversation extension.
+fn commit_with<P: OpenMlsProvider>(
+    provider: &P,
+    group: &mut MlsGroup,
+    profile: &RisalaProfile,
+    state: &EpochState,
+    changes: Changes,
+    extensions: Option<Extensions<GroupContext>>,
+) -> Result<CommitOutput, GroupError<P::StorageError>> {
     let current =
         conversation(group).ok_or_else(|| GroupError::Group("no conversation extension".into()))?;
     let kind = current.kind;
@@ -551,9 +635,10 @@ pub fn commit<P: OpenMlsProvider>(
         .force_self_update(true)
         .consume_proposal_store(!move_box)
         .leaf_node_parameters(leaf_parameters(&profile));
-    if let Some(conversation) = new_conversation {
+    let extensions = extensions.or_else(|| new_conversation.as_ref().map(group_context_extensions));
+    if let Some(extensions) = extensions {
         builder = builder
-            .propose_group_context_extensions(group_context_extensions(&conversation))
+            .propose_group_context_extensions(extensions)
             .map_err(|e: CreateCommitError| mls(e))?;
     }
     let builder = builder

@@ -37,6 +37,12 @@ hpke-rs-libcrux = "0.7"
 # libcrux-kem that hpke-rs-libcrux and openmls_libcrux_crypto use.
 libcrux-kem = "=0.0.9"
 
+[features]
+# Hidden helpers for other crates' tests: groups and commits with a
+# conversation extension that need not be well formed, to test that it is
+# refused (risala-server's tests).
+testing = []
+
 [dev-dependencies]
 # The patched port in crates/openmls-sqlite-storage (see the root Cargo.toml).
 openmls_sqlite_storage.workspace = true
