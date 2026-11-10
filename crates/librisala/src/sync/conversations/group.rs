@@ -471,11 +471,11 @@ pub(crate) fn leave_locally(tx: &mut Tx<'_>, conv: ConversationId) -> Result<()>
 }
 
 /// Leaves locally ([`leave_locally`]) a group in which this device's leaf
-/// may stay (6.1, 7.5): one it can no longer follow. The own identity is
-/// marked departed, so that the device refuses Welcomes back into the
-/// group ([`join_welcome`]): none of its leaves could be removed first,
-/// and a device that replaces the stale leaf would otherwise bring it
-/// back.
+/// may stay (6.1, 7.5): one it can no longer follow, or one whose leave
+/// commit failed its own checks. The own identity is marked departed, so
+/// that the device refuses Welcomes back into the group
+/// ([`join_welcome`]): none of its leaves could be removed first, and a
+/// device that replaces the stale leaf would otherwise bring it back.
 pub(crate) fn leave_for_good(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid) -> Result<()> {
     leave_locally(tx, conv)?;
     tx.mark_departed(conv, own)?;
@@ -486,6 +486,33 @@ pub(crate) fn leave_for_good(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid) -
 /// the group, and refuses Welcomes back ([`leave_for_good`]).
 pub(crate) fn left_for_good(tx: &Tx<'_>, conv: &ConvRow, own: &Uid) -> Result<bool> {
     Ok(conv.state == ConvState::Left && tx.departed(conv.id, own)?)
+}
+
+/// A leave commit that fails this device's own group checks (6.1, 12.7):
+/// the leave is not dropped. The device makes its SelfRemove, if it can,
+/// for another member to commit, then leaves locally for good
+/// ([`leave_for_good`]), and logs a warning. Returns the SelfRemove's
+/// outbox row, to post now.
+fn leave_after_failed_commit(
+    tx: &mut Tx<'_>,
+    cx: &Ctx<'_>,
+    conv: &ConvRow,
+) -> Result<Option<(i64, Vec<u8>)>> {
+    tracing::warn!(conv = %conv.id, "the leave commit fails this device's own group checks; leaving locally, with a SelfRemove if one can be made");
+    let self_remove = match make_self_remove(tx, cx, conv) {
+        Ok(made) => Some(made),
+        Err(e) => {
+            tracing::warn!(conv = %conv.id, error = %e, "no SelfRemove could be made");
+            None
+        }
+    };
+    leave_for_good(tx, conv.id, cx.uid)?;
+    let Some((post, epoch)) = self_remove else {
+        return Ok(None);
+    };
+    let id = tx.queue_outbox(conv.id, OutboxKind::Proposal, &NewOutbox::default(), cx.now)?;
+    tx.update_outbox(id, OutboxState::Sent, Some((&post, epoch)), None, None)?;
+    Ok(Some((id, post)))
 }
 
 /// Whether a KeyPackage's lifetime is acceptable for a commit this device
@@ -501,8 +528,16 @@ pub(crate) fn lifetime_ok_to_post(lifetime: &Lifetime, now_ms: u64) -> bool {
         && lifetime_acceptable_at(lifetime, now_ms)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes this device's commits fail its own group checks, which it
+    /// cannot be brought to otherwise: risala-mls makes commits that pass
+    /// them (tests only).
+    pub(crate) static FAIL_OWN_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What [`build_commit`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Built {
     /// The commit is made, and pending.
     Made,
@@ -512,6 +547,10 @@ pub(crate) enum Built {
     /// once its `updated` can be 10 minutes after its previous one, at
     /// this time (12.7, streaks).
     WaitUntil(u64),
+    /// The leave commit failed this device's own checks: it has left
+    /// locally, and this SelfRemove, in the outbox row given, is to post
+    /// now ([`leave_after_failed_commit`]).
+    LeftWith(i64, Vec<u8>),
 }
 
 /// Makes the commit of an outbox row from its intent, against the group
@@ -710,17 +749,24 @@ pub(crate) fn build_commit(
             &state.post(cx.now, Some(out.next_token_hash)),
         )
     };
+    #[cfg(test)]
+    let checked = match FAIL_OWN_CHECKS.get() {
+        true => Err(risala_mls::checks::CommitError::Leaf),
+        false => checked,
+    };
     if let Err(e) = checked {
         tracing::warn!(conv = %conv.id, error = %e, "this device's commit fails the group checks; not posted");
         mls_group::discard_own_commit(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
         tx.update_outbox(row.id, OutboxState::Lost, None, None, None)?;
         // 6.1: removing leaves of its own identity is always allowed, so
-        // this should not happen to a leave commit. If it does where
-        // nobody else would commit the leave, the device still leaves,
-        // locally, rather than stay in a group its user has left.
-        if intent.then == Then::SelfRemove && alone(tx, conv.id, cx.uid)? {
-            tracing::warn!(conv = %conv.id, "leaving locally without removing the identity's other leaves");
-            leave_locally(tx, conv.id)?;
+        // this should not happen to a leave commit. If it does, the device
+        // still leaves, locally, rather than stay in a group its user has
+        // left.
+        if intent.then == Then::SelfRemove {
+            return Ok(match leave_after_failed_commit(tx, cx, conv)? {
+                Some((id, post)) => Built::LeftWith(id, post),
+                None => Built::Nothing,
+            });
         }
         return Ok(Built::Nothing);
     }

@@ -452,3 +452,64 @@ fn own_devices_remove_each_other_when_the_peer_leaves() {
     let after = posts(&net, laptop, a, ContentType::Commit);
     assert!((commits + 1..=commits + 2).contains(&after), "{after}");
 }
+
+/// 6.1: a leave commit that fails the device's own group checks does not
+/// drop the leave: the laptop leaves locally for good, and posts its
+/// SelfRemove, which Bob or the phone commits.
+#[test]
+fn a_leave_commit_that_fails_its_own_checks_still_leaves() {
+    let mut net = Net::new();
+    let laptop = net.device("alice", "alice@example.org");
+    let phone = net.device_of("alice-phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, phone, bob] {
+        net.connect(d);
+    }
+    let a = net
+        .job(
+            laptop,
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec![uid("bob@example.net")],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    let proposals = posts(&net, laptop, a, ContentType::Proposal);
+    let commits = posts(&net, laptop, a, ContentType::Commit);
+
+    // The laptop leaves, and its leave commit, which would remove the
+    // phone's leaf, fails its own checks. (The others are away meanwhile,
+    // since every device here would fail its checks.)
+    net.disconnect(bob);
+    net.disconnect(phone);
+    group::FAIL_OWN_CHECKS.set(true);
+    let own = uid("alice@example.org");
+    assert!(!leave(&mut net, laptop, a));
+    group::FAIL_OWN_CHECKS.set(false);
+    assert_eq!(net.state(laptop, a), ConvState::Left);
+    assert!(!has_group(&net, laptop, a));
+    assert!(net.devices[laptop].store.departed(a, &own).unwrap());
+    assert_eq!(queued_commits(&net, laptop, a), 0);
+    assert_eq!(posts(&net, laptop, a, ContentType::Commit), commits);
+    assert_eq!(
+        posts(&net, laptop, a, ContentType::Proposal),
+        proposals + 1,
+        "its SelfRemove is posted"
+    );
+
+    // Bob or the phone commits it: the laptop's leaf is gone, the phone's
+    // stays.
+    net.connect(bob);
+    net.connect(phone);
+    for _ in 0..3 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.leaves(bob, b).len(), 2);
+    assert_eq!(net.leaves(phone, p).len(), 2);
+    assert_eq!(net.state(phone, p), ConvState::Active);
+    assert_eq!(net.epoch(bob, b), net.epoch(phone, p));
+}

@@ -2384,6 +2384,16 @@ impl ConversationEngine {
                 return Ok(());
             };
             let conv_row = tx.conversation(conv)?;
+            // 6.1: the SelfRemove of a device that has left meanwhile, by
+            // itself, is not posted again: it has no group to make it in.
+            if conv_row.state == ConvState::Left {
+                let state = match &response.end {
+                    End::Ok(_) => OutboxState::Done,
+                    _ => OutboxState::Lost,
+                };
+                tx.update_outbox(outbox, state, None, None, None)?;
+                return Ok(());
+            }
             match &response.end {
                 End::Ok(ok) => {
                     if live {
@@ -3385,6 +3395,21 @@ fn next_posts(
                 group::Built::WaitUntil(t) => {
                     tx.update_outbox(row.id, OutboxState::Queued, None, None, Some(t))?;
                     return Ok(Vec::new());
+                }
+                // 6.1: a leave commit that failed this device's own checks;
+                // it has left, and posts its SelfRemove if it made one.
+                group::Built::LeftWith(outbox, post) => {
+                    return Ok(vec![NextPost {
+                        outbox,
+                        post,
+                        token,
+                        next: None,
+                        live: false,
+                        create: None,
+                        groupinfo: None,
+                        external: false,
+                        signed_in: false,
+                    }]);
                 }
             }
         }
