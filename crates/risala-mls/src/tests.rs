@@ -501,6 +501,28 @@ fn key_packages_and_keypkg_add() {
     .unwrap()
     .key_package;
     assert!(has_no_binding(&join));
+    // A join given up forgets the KeyPackage's private keys (6.1).
+    let reference = join.hash_ref(&crypto).unwrap();
+    let leaf_key = join.leaf_node().signature_key().as_slice().to_vec();
+    let stored = |p: &Provider<MemoryStorage>| {
+        use openmls_traits::storage::StorageProvider as _;
+        let bundle: Option<openmls::prelude::KeyPackageBundle> =
+            p.storage().key_package(&reference).unwrap();
+        (
+            bundle.is_some(),
+            LeafKey::load(p.storage(), crate::mldsa::KEY_PACKAGE_SCOPE, &leaf_key)
+                .unwrap()
+                .is_some(),
+        )
+    };
+    assert_eq!(stored(&alice.provider), (true, true));
+    crate::keypackage::forget_join_key_package(
+        alice.provider.storage(),
+        reference.as_slice(),
+        &leaf_key,
+    )
+    .unwrap();
+    assert_eq!(stored(&alice.provider), (false, false));
     assert_eq!(
         check_key_package(&crypto, &to_bytes(&join.into()), &alice.uid, &key, now).err(),
         Some(KeyPackageError::Binding)

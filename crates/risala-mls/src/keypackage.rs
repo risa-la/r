@@ -32,6 +32,7 @@ use openmls::storage::OpenMlsProvider;
 use openmls::treesync::EncryptionKey;
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::crypto::OpenMlsCrypto;
+use openmls_traits::storage::{CURRENT_VERSION, StorageProvider};
 use risala_proto::names::Uid;
 use risala_proto::time::Timestamp;
 use tls_codec::Deserialize as _;
@@ -41,7 +42,7 @@ use crate::binding::DeviceBinding;
 use crate::checks::PERIOD_MS;
 use crate::codec::{DecodeError, Reader, Writer};
 use crate::crypto::x_wing_public_key_ok;
-use crate::group::{capabilities, has_capabilities};
+use crate::group::{GroupError, capabilities, has_capabilities};
 use crate::identity::{RisalaIdentity, device_id_of};
 use crate::mldsa::{KEY_PACKAGE_SCOPE, LeafKey, SigningKey};
 use crate::profile::RisalaProfile;
@@ -309,6 +310,24 @@ pub(crate) fn make_join_key_package_with<P: OpenMlsProvider>(
         key_package: bundle.key_package().clone(),
         leaf_key,
     })
+}
+
+/// Deletes the private keys of a join KeyPackage that will not be used,
+/// as when the user leaves a public room while joining it (6.1): the
+/// KeyPackage's own, kept by its KeyPackageRef `reference`, and the leaf
+/// key whose public key is `signature_key`. A KeyPackage made by
+/// [`make_join_key_package`] has no others.
+pub fn forget_join_key_package<S: StorageProvider<CURRENT_VERSION>>(
+    storage: &S,
+    reference: &[u8],
+    signature_key: &[u8],
+) -> Result<(), GroupError<S::Error>> {
+    let reference =
+        crate::welcome::key_package_ref(reference).map_err(|e| GroupError::Group(e.0.into()))?;
+    storage
+        .delete_key_package(&reference)
+        .map_err(GroupError::Storage)?;
+    LeafKey::delete(storage, KEY_PACKAGE_SCOPE, signature_key).map_err(GroupError::Storage)
 }
 
 pub(crate) fn build_key_package<P: OpenMlsProvider>(

@@ -245,7 +245,7 @@ fn unpad(plain: &[u8]) -> Result<&[u8], WelcomeError> {
 }
 
 /// A KeyPackageRef from its bytes.
-fn key_package_ref(bytes: &[u8]) -> Result<KeyPackageRef, DecodeError> {
+pub(crate) fn key_package_ref(bytes: &[u8]) -> Result<KeyPackageRef, DecodeError> {
     use tls_codec::Deserialize as _;
     let mut w = Writer::new();
     w.vector(bytes);
