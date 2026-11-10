@@ -25,9 +25,12 @@
 //! connected until what they queued has reached the server, for at most
 //! `--wait` seconds, and fail if it has not: messages and commits, Welcomes,
 //! the identity's new records (KEYS PUT), the device's KeyPackages and
-//! history other devices asked for. It is sent on the next run. `sync`
-//! stays for `--wait` seconds, to receive. Output is one record per line,
-//! fields separated by tabs.
+//! history other devices asked for. It is sent on the next run. A message
+//! that waits because its conversation's sending is held (12.7), as while
+//! a new device's key check waits up to 2 hours for its key file, is not
+//! a failure: `send` and `send-file` say it is queued, and why, and exit
+//! 0. `sync` stays for `--wait` seconds, to receive. Output is one record
+//! per line, fields separated by tabs.
 //!
 //! The options `--connect-to`, `--trust`, `--ca`, `--resolve`, `--witness`
 //! and `--short-waits` reach a development server such as `risala-dev`'s,
@@ -57,7 +60,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use librisala::client::conversations::{ConversationKind, ConversationSummary};
 use librisala::client::identity::PairingIdentity;
-use librisala::client::types::{AccountKind, ConversationId, MessageId, Unsettled};
+use librisala::client::types::{AccountKind, ConversationId, MessageId, SendingHold, Unsettled};
 use librisala::client::{ConnectionState, identity::KeyFetcherHttps};
 use librisala::conn::Slot;
 use librisala::keyfetch::{CertificateDer, FetchOptions, KeyFetcher, Roots, StaticResolver};
@@ -204,7 +207,12 @@ enum Command {
     Name { name: String },
     /// Leave a conversation (6.1): a number, a uid or #room.
     Leave { conversation: String },
-    /// Send a message.
+    /// Send a message. Prints its id.
+    ///
+    /// Held is not failed: if the conversation's sending is held (12.7),
+    /// as while a new device's key check waits for its key file, the
+    /// message stays queued, `send` says why on standard error, and exits
+    /// 0. It goes out on a later run once the hold ends.
     Send {
         /// A conversation's number; a uid, for the direct conversation with
         /// that identity, started if there is none; or #name, for a room.
@@ -226,6 +234,9 @@ enum Command {
         sync: bool,
     },
     /// Send a file (5.6, 12.11). Prints the message's id.
+    ///
+    /// A message held by its conversation (12.7) is queued, not failed, as
+    /// with `send`.
     SendFile {
         /// A number, a uid (started if there is none) or #room.
         conversation: String,
@@ -725,6 +736,24 @@ impl Ctx {
     /// Stays connected at least `min`, and then until what was queued has
     /// reached the server, for at most `--wait`; fails if it has not.
     async fn settle(&self, account: AccountId, min: Duration) -> Res {
+        self.settle_or_held(account, min, None).await
+    }
+
+    /// As [`settle`](Self::settle), after queuing a message in `conv`
+    /// (`send`, `send-file`): messages that wait only because their
+    /// conversation's sending is held (12.7) are not a failure, since they
+    /// go once the hold ends. Says so on standard error, and why.
+    async fn settle_message(&self, account: AccountId, conv: ConversationId) -> Res {
+        self.settle_or_held(account, Duration::ZERO, Some(conv))
+            .await
+    }
+
+    async fn settle_or_held(
+        &self,
+        account: AccountId,
+        min: Duration,
+        message_in: Option<ConversationId>,
+    ) -> Res {
         let start = Instant::now();
         let max = self.wait.max(min);
         loop {
@@ -736,6 +765,13 @@ impl Ctx {
                 let left = self.client.unsettled(account).map_err(err)?;
                 if left.is_empty() {
                     return Ok(());
+                }
+                if let Some(conv) = message_in {
+                    let hold = self.client.sending_hold(conv).map_err(err)?;
+                    if let Some(note) = held_note(&left, hold.as_ref()) {
+                        eprintln!("risala: {note}");
+                        return Ok(());
+                    }
                 }
                 return Err(format!(
                     "not everything reached the server within {} seconds: {}; \
@@ -952,17 +988,59 @@ fn find(all: &[Entry], own: &str, named: &Named) -> Res<Option<i64>> {
     }
 }
 
+/// What `send` says when all that is left at the end of its wait is
+/// messages held by their conversation's sending (12.7): queued, not
+/// failed. `hold` is why the conversation just sent to holds them, if it
+/// does. `None` if anything else is left, which is a failure.
+fn held_note(left: &Unsettled, hold: Option<&SendingHold>) -> Option<String> {
+    let only_held = left.held > 0
+        && left.held == left.outbox
+        && Unsettled {
+            outbox: 0,
+            held: 0,
+            ..left.clone()
+        }
+        .is_empty();
+    if !only_held {
+        return None;
+    }
+    let later = "it goes out on a later run once the hold ends, such as `risala sync`";
+    Some(match hold {
+        Some(SendingHold::KeyCheck { uid }) => format!(
+            "the message is queued: sending in this conversation is held until a device \
+             of {} passes its key check (12.7), for at most 2 hours; {later}",
+            Shown(uid.as_str())
+        ),
+        Some(SendingHold::Repair { uid }) => format!(
+            "the message is queued: sending in this conversation is held until a device \
+             of {}, which failed its key check, is removed (12.7); {later}",
+            Shown(uid.as_str())
+        ),
+        None => format!(
+            "{} queued in conversations whose sending is held (12.7); {later}",
+            if left.held == 1 {
+                "1 message is".to_owned()
+            } else {
+                format!("{} messages are", left.held)
+            }
+        ),
+    })
+}
+
 /// What has not reached the server yet, for the error.
 fn unsettled_text(left: &Unsettled) -> String {
     let count =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut parts = Vec::new();
     if left.outbox > 0 {
-        parts.push(count(
-            left.outbox,
-            "message or commit",
-            "messages or commits",
-        ));
+        let mut outbox = count(left.outbox, "message or commit", "messages or commits");
+        if left.held > 0 {
+            outbox.push_str(&format!(
+                " ({} held: their conversation's sending is held, 12.7)",
+                left.held
+            ));
+        }
+        parts.push(outbox);
     }
     if left.welcomes > 0 {
         parts.push(count(left.welcomes, "Welcome", "Welcomes"));
@@ -1269,7 +1347,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 .await
                 .map_err(err)?;
             println!("{id}");
-            ctx.settle(account, Duration::ZERO).await?;
+            ctx.settle_message(account, conv).await?;
         }
         Command::Read {
             conversation,
@@ -1330,7 +1408,7 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
                 .await
                 .map_err(err)?;
             println!("{id}");
-            ctx.settle(account, Duration::ZERO).await?;
+            ctx.settle_message(account, conv).await?;
         }
         Command::Fetch {
             conversation,
@@ -1605,10 +1683,72 @@ mod tests {
         assert!(risala_dev::witness_vkey().starts_with(DEV_WITNESS));
     }
 
+    /// A send that leaves only held messages is not a failure: it says
+    /// they are queued, and why, with the uid printed safely. Anything else
+    /// left still is (PLAN item 66).
+    #[test]
+    fn held_messages_are_queued_not_failed() {
+        let uid: librisala::client::types::Uid = "bob@example.org".parse().unwrap();
+        let held = Unsettled {
+            outbox: 1,
+            held: 1,
+            ..Unsettled::default()
+        };
+        let check = SendingHold::KeyCheck { uid: uid.clone() };
+        let note = held_note(&held, Some(&check)).unwrap();
+        assert!(note.starts_with("the message is queued: "), "{note}");
+        assert!(note.contains("a device of bob@example.org passes its key check"));
+        assert!(note.contains("at most 2 hours"));
+        let repair = SendingHold::Repair { uid };
+        let note = held_note(&held, Some(&repair)).unwrap();
+        assert!(note.contains("failed its key check, is removed"), "{note}");
+        // Held elsewhere, from an earlier run: this message went out.
+        let two = Unsettled {
+            outbox: 2,
+            held: 2,
+            ..Unsettled::default()
+        };
+        let note = held_note(&two, None).unwrap();
+        assert!(
+            note.starts_with("2 messages are queued in conversations"),
+            "{note}"
+        );
+
+        // Anything not held is still a failure.
+        assert_eq!(held_note(&Unsettled::default(), None), None);
+        let more = Unsettled {
+            outbox: 2,
+            held: 1,
+            ..Unsettled::default()
+        };
+        assert_eq!(held_note(&more, Some(&check)), None);
+        for other in [
+            Unsettled {
+                welcomes: 1,
+                ..held.clone()
+            },
+            Unsettled {
+                records: true,
+                ..held.clone()
+            },
+            Unsettled {
+                key_packages: true,
+                ..held.clone()
+            },
+            Unsettled {
+                transfers: 1,
+                ..held.clone()
+            },
+        ] {
+            assert_eq!(held_note(&other, Some(&check)), None, "{other:?}");
+        }
+    }
+
     #[test]
     fn unsettled_is_said() {
         let left = Unsettled {
-            outbox: 1,
+            outbox: 2,
+            held: 1,
             welcomes: 2,
             records: true,
             key_packages: true,
@@ -1616,7 +1756,8 @@ mod tests {
         };
         assert_eq!(
             unsettled_text(&left),
-            "1 message or commit, 2 Welcomes, the identity's new records (KEYS PUT), \
+            "2 messages or commits (1 held: their conversation's sending is held, 12.7), \
+             2 Welcomes, the identity's new records (KEYS PUT), \
              this device's KeyPackages, 1 history transfer another device asked for"
         );
     }

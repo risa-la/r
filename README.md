@@ -127,7 +127,11 @@ show` prints it). risala-dev's witness key comes from a fixed seed, so
 
 Commands that send stay connected until what they sent has reached the
 server, for at most `--wait` seconds (20 by default), and exit with 1 if
-it has not; it goes out on the next run.
+it has not; it goes out on the next run. A message held by its
+conversation is not a failure: while sending in a group is held (12.7),
+as when a new device's key check waits up to 2 hours for its key file,
+`risala send` exits with 0 and says on standard error that the message
+is queued, and why. It goes out on a later run once the hold ends.
 
 M5a's seeded scenarios talked in plain text, which the current protocol
 has no commands for; they come back once rebuilt on librisala.
