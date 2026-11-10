@@ -273,6 +273,11 @@ struct Net {
     blob_mode: Arc<std::sync::atomic::AtomicU8>,
     hold_puts: Arc<std::sync::atomic::AtomicBool>,
     keys: KnownKeys,
+    /// Devices whose next POST is lost: it never reaches the server, and
+    /// the connection it was sent on drops (7.6).
+    lose_post: std::collections::HashSet<usize>,
+    /// The messages of the POSTs lost so far.
+    lost: Vec<Vec<u8>>,
 }
 
 impl Net {
@@ -285,6 +290,8 @@ impl Net {
             blob_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             hold_puts: Arc::default(),
             keys: KnownKeys::default(),
+            lose_post: Default::default(),
+            lost: Vec::new(),
         }
     }
 
@@ -479,6 +486,23 @@ impl Net {
                         Target::Watch => Slot::Watch,
                         Target::Own(_) => SINGLE_USE_SLOT,
                     };
+                    if let Command::Post { message, .. } = &command
+                        && self.lose_post.remove(&d)
+                    {
+                        // Lost on the way, with the connection: no answer.
+                        if let OrBlob::Inline(message) = message {
+                            self.lost.push(message.decode());
+                        }
+                        self.server.close((d, slot));
+                        self.queue.push_back((d, Owned::Closed(slot)));
+                        let response = Response {
+                            lines: Vec::new(),
+                            end: End::Unparseable("the connection closed".into()),
+                        };
+                        self.queue
+                            .push_back((d, Owned::Reply(slot, token, response)));
+                        continue;
+                    }
                     self.server.now = self.clock.now().unix_millis();
                     let (response, live) = self.server.handle((d, slot), command);
                     for ((to, s), line) in live {

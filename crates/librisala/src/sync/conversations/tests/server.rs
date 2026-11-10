@@ -369,6 +369,14 @@ impl FakeServer {
     /// Keeps a post that a device made earlier, with the server's time
     /// `t`, as a server that held it back would hand it out late. Returns
     /// its seq.
+    /// The messages of a mailbox's posts, by seq.
+    pub fn messages(&self, mailbox: &BoxName) -> Vec<(u64, Vec<u8>)> {
+        self.mailboxes
+            .get(&mailbox.to_string())
+            .map(|m| m.posts.iter().map(|p| (p.0, p.2.clone())).collect())
+            .unwrap_or_default()
+    }
+
     pub fn inject_post(&mut self, mailbox: &BoxName, t: u64, message: Vec<u8>) -> u64 {
         let m = self.mailboxes.get_mut(&mailbox.to_string()).unwrap();
         let seq = m.head() + 1;

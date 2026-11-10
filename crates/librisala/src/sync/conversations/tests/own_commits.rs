@@ -381,3 +381,62 @@ fn a_commit_past_the_bans_cap_is_not_posted() {
         "dropped, not kept queued"
     );
 }
+
+/// The commit posts of a conversation's mailbox, by seq.
+fn commit_messages(net: &Net, d: usize, conv: ConversationId) -> Vec<Vec<u8>> {
+    let mailbox = net.devices[d].store.mailbox_rows(conv).unwrap()[0].mailbox;
+    let kinds: std::collections::HashMap<u64, ContentType> =
+        net.server.posts(&mailbox).into_iter().collect();
+    net.server
+        .messages(&mailbox)
+        .into_iter()
+        .filter(|(seq, _)| kinds.get(seq) == Some(&ContentType::Commit))
+        .map(|(_, m)| m)
+        .collect()
+}
+
+/// A commit whose POST went unanswered goes again as it was (7.6), unless
+/// it was made more than 10 minutes before: its first copy would then fail
+/// the `updated` check wherever it landed (12.3), and the device makes a
+/// new commit from the same intent.
+#[test]
+fn an_unanswered_commit_goes_again_as_it_was_unless_10_minutes_have_passed() {
+    let mut net = Net::new();
+    let alice = net.device("alice", "alice@example.org");
+    let bob = net.device("bob", "bob@example.net");
+    net.connect(alice);
+    net.connect(bob);
+    let (a, b) = direct(&mut net, alice, bob);
+    let epoch = net.epoch(alice, a);
+
+    // Alice's POST is lost with her connection; she is back 5 minutes on,
+    // finds that it did not arrive, and posts the same commit.
+    net.lose_post.insert(alice);
+    queue(&net, alice, a, Intent::default());
+    net.tick();
+    assert_eq!(net.lost.len(), 1, "the first POST was lost");
+    assert_eq!(net.epoch(alice, a), epoch);
+    net.advance(5 * MINUTE);
+    net.disconnect(alice);
+    net.connect(alice);
+    net.tick();
+    assert_eq!(net.epoch(alice, a), epoch + 1);
+    assert_eq!(net.epoch(bob, b), epoch + 1);
+    assert_eq!(commit_messages(&net, alice, a).last(), net.lost.last());
+
+    // Bob's is lost too, and he is back only 11 minutes on: he makes a new
+    // commit from the same intent, which both apply.
+    net.lose_post.insert(bob);
+    queue(&net, bob, b, Intent::default());
+    net.tick();
+    assert_eq!(net.lost.len(), 2, "the second POST was lost");
+    net.advance(11 * MINUTE);
+    net.disconnect(bob);
+    net.connect(bob);
+    net.tick();
+    assert_eq!(net.epoch(bob, b), epoch + 2);
+    assert_eq!(net.epoch(alice, a), epoch + 2);
+    let landed = commit_messages(&net, bob, b);
+    assert_ne!(landed.last(), net.lost.last(), "a new commit");
+    assert!(!landed.contains(&net.lost[1]));
+}

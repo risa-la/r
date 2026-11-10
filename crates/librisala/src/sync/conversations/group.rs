@@ -787,6 +787,25 @@ pub(crate) fn build_commit(
     Ok(Built::Made)
 }
 
+/// Whether this device's pending commit was made more than 10 minutes
+/// ago, by the `updated` of its own new leaf (12.3). A copy of it that
+/// reaches the server from now on fails the `updated` check wherever it
+/// lands, so it can no longer win its epoch: a device whose POST of it went
+/// unanswered may drop it for a new commit made from the same intent,
+/// rather than post it again (7.6). A commit with no new leaf of this
+/// device's has no `updated`, and is posted again as it was.
+pub(crate) fn pending_commit_expired(tx: &Tx<'_>, cx: &Ctx<'_>, conv: &ConvRow) -> Result<bool> {
+    let group = load(tx, cx, &conv.group_id)?;
+    let updated = group
+        .pending_commit()
+        .and_then(|staged| staged.update_path_leaf_node())
+        .and_then(RisalaProfile::of_leaf)
+        .map(|profile| profile.updated);
+    Ok(updated.is_some_and(|updated| {
+        cx.now > updated.saturating_add(risala_mls::checks::UPDATED_SKEW_MS)
+    }))
+}
+
 /// Drops this device's pending commit, which lost or was refused, and
 /// queues its intent again if it is still needed (7.2).
 pub(crate) fn commit_lost(
