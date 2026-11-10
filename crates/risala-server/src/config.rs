@@ -423,9 +423,9 @@ pub struct ServerConfig {
 ///
 /// The other limits that count by address, alone or with the connection
 /// or identity, keep their defaults as they are (PLAN item 66): posts,
-/// commits, creates and guests' reports, and KEYPKG GET, which counts by
-/// identity. Operators tune them to their users. HTTPS connections per
-/// address have a fixed limit, `MAX_HTTP_PER_ADDRESS` in `http::server`.
+/// commits, creates and guests' reports, KEYPKG GET, which counts by
+/// identity, and HTTPS connections (`https_connections_per_address`,
+/// PLAN item 67). Operators tune them to their users.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -564,6 +564,14 @@ pub struct Limits {
     /// once (4.2). IPv6 addresses count by their /64. Others are closed as
     /// soon as they are accepted. 0 means no limit.
     pub connections_per_address: usize,
+    /// The most HTTPS connections one network address may have open at
+    /// once, to the `[http]` listener (4.3, 5.6, 12.12), so that one
+    /// client that opens connections and sends nothing cannot take them
+    /// all. IPv6 addresses count by their /64, and an IPv6 /48 has at most
+    /// [`MAX_HTTP_PER_48`](crate::http::server::MAX_HTTP_PER_48) whatever
+    /// this is. Others are closed as soon as they are accepted. 0 means no
+    /// limit.
+    pub https_connections_per_address: usize,
     /// The most guest sessions one network address may have at once,
     /// those waiting to be resumed included (4.2). Further GUESTs get
     /// `ERR rate-limited`. 0 means no limit.
@@ -727,6 +735,7 @@ impl Default for Limits {
             log_outside_identities: true,
             outside_identities_per_day: 100,
             connections_per_address: 256,
+            https_connections_per_address: crate::http::server::DEFAULT_HTTP_PER_ADDRESS,
             guests_per_address: 64,
             fetching_auths_per_hour: 480,
             joins_per_hour: 120,

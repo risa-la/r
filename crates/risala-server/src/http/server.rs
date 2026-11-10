@@ -79,14 +79,16 @@ pub const KEY_FILE_PREFIX: &str = "/.well-known/risala/";
 /// they are accepted.
 pub const MAX_HTTP_CONNECTIONS: usize = 1024;
 
-/// The most HTTPS connections open at once from one network address (an
-/// IPv6 address counts by its /64), so that one client that opens
-/// connections and sends nothing cannot take them all. Others are closed
-/// as soon as they are accepted.
-pub const MAX_HTTP_PER_ADDRESS: usize = 16;
+/// The default of `limits.https_connections_per_address`: the most HTTPS
+/// connections open at once from one network address (an IPv6 address
+/// counts by its /64), so that one client that opens connections and
+/// sends nothing cannot take them all. Others are closed as soon as they
+/// are accepted.
+pub const DEFAULT_HTTP_PER_ADDRESS: usize = 16;
 
 /// The most HTTPS connections open at once from one IPv6 /48, since a
-/// /48 holds 65,536 /64s.
+/// /48 holds 65,536 /64s. It holds whatever
+/// `limits.https_connections_per_address` is.
 pub const MAX_HTTP_PER_48: usize = 64;
 
 /// The most connections that may be sending or receiving blobs and files
@@ -115,6 +117,7 @@ pub struct HttpServer {
     reload: bool,
     keys: Arc<dyn KeyFiles>,
     files: Option<Files>,
+    per_address: usize,
 }
 
 impl std::fmt::Debug for HttpServer {
@@ -161,7 +164,18 @@ impl HttpServer {
             reload,
             keys,
             files: None,
+            per_address: DEFAULT_HTTP_PER_ADDRESS,
         })
+    }
+
+    /// Allows at most `max` HTTPS connections open at once from one
+    /// network address, an IPv6 address counting by its /64
+    /// (`limits.https_connections_per_address`); 0 means no limit. The
+    /// default is [`DEFAULT_HTTP_PER_ADDRESS`]. An IPv6 /48 has at most
+    /// [`MAX_HTTP_PER_48`] whatever this is.
+    pub fn with_per_address(mut self, max: usize) -> HttpServer {
+        self.per_address = max;
+        self
     }
 
     /// Also stores and serves the hub's blobs and files (5.6, 12.12).
@@ -196,6 +210,7 @@ impl HttpServer {
                     .min(MAX_HTTP_TRANSFERS),
             )),
             files: self.files,
+            per_address_max: self.per_address,
             per_address: Mutex::new(HashMap::new()),
         });
         let mut background = JoinSet::new();
@@ -220,6 +235,9 @@ struct Shared {
     permits: Arc<Semaphore>,
     /// Connections sending or receiving blobs and files.
     transfers: Arc<Semaphore>,
+    /// The most connections one network address may have open; 0 means
+    /// no limit.
+    per_address_max: usize,
     /// How many connections each network address, and each IPv6 /48, has
     /// open.
     per_address: Mutex<HashMap<IpAddr, usize>>,
@@ -252,7 +270,10 @@ impl AddressSlot {
     /// Counts a connection from `peer`, unless its address or its /48 has
     /// its fill.
     fn take(shared: &Arc<Shared>, peer: IpAddr) -> Option<AddressSlot> {
-        let mut keys = vec![(address_key(peer), MAX_HTTP_PER_ADDRESS)];
+        let mut keys = Vec::new();
+        if shared.per_address_max > 0 {
+            keys.push((address_key(peer), shared.per_address_max));
+        }
         if let Some(wide) = wide_key(peer) {
             keys.push((wide, MAX_HTTP_PER_48));
         }

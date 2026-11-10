@@ -127,7 +127,7 @@ async fn listener_serves_published_key_files() {
 /// that sends nothing cannot take them all (slowloris).
 #[tokio::test]
 async fn connections_are_limited_per_address() {
-    use super::server::MAX_HTTP_PER_ADDRESS;
+    use super::server::DEFAULT_HTTP_PER_ADDRESS;
     use tokio::net::TcpStream;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -151,7 +151,7 @@ async fn connections_are_limited_per_address() {
     }
 
     let mut idle = Vec::new();
-    for _ in 0..MAX_HTTP_PER_ADDRESS {
+    for _ in 0..DEFAULT_HTTP_PER_ADDRESS {
         idle.push(TcpStream::connect(addr).await.unwrap());
     }
     let mut extra = TcpStream::connect(addr).await.unwrap();

@@ -449,3 +449,58 @@ async fn slow_downloads_are_cut_off_and_free_their_slot() {
     drop(slow);
     server.stop().await;
 }
+
+/// The `put` URL BLOB gives for a small blob, without opening an HTTPS
+/// connection.
+async fn put_url(server: &TestServer) -> String {
+    let mut anon = server.anon().await;
+    let hash = BlobRef::of(b"a blob");
+    let blob = format!("BLOB {hash} 6 box={BOX} token={}", token());
+    value(&command(&mut anon, &blob).await, "put")
+}
+
+/// `limits.https_connections_per_address` caps the HTTPS connections one
+/// address may hold open: past it, a new one is closed at once, and once
+/// one goes another may come (PLAN item 67).
+#[tokio::test]
+async fn https_connections_per_address_is_configured() {
+    /// Whether the server closed `tcp` at once, rather than waiting for
+    /// its handshake.
+    async fn closed_at_once(tcp: &mut TcpStream) -> bool {
+        let mut byte = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(300), tcp.read(&mut byte)).await;
+        matches!(read, Ok(Ok(0) | Err(_)))
+    }
+
+    let capped = server_with(|c| c.limits.https_connections_per_address = 2).await;
+    let (addr, _) = target(&put_url(&capped).await);
+    let mut idle = vec![
+        TcpStream::connect(addr).await.unwrap(),
+        TcpStream::connect(addr).await.unwrap(),
+    ];
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    assert!(closed_at_once(&mut extra).await);
+    for tcp in &mut idle {
+        assert!(!closed_at_once(tcp).await);
+    }
+    drop(idle.pop());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut next = TcpStream::connect(addr).await.unwrap();
+    assert!(!closed_at_once(&mut next).await);
+    drop((idle, next));
+    capped.stop().await;
+
+    // The default allows more than two.
+    let server = server().await;
+    let (addr, _) = target(&put_url(&server).await);
+    let mut idle = Vec::new();
+    for _ in 0..3 {
+        idle.push(TcpStream::connect(addr).await.unwrap());
+    }
+    for tcp in &mut idle {
+        assert!(!closed_at_once(tcp).await);
+    }
+    drop(idle);
+    server.stop().await;
+}
