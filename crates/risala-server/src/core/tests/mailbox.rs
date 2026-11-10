@@ -2701,6 +2701,69 @@ async fn blob_memory_is_taken_once_per_command() {
     assert!(again.is_ok());
 }
 
+/// A public room's POST reads the room's state from the store, its tree
+/// with it, in the same room in `limits.blob_memory` as its blobs (12.12,
+/// PLAN item 66): a message's blob that would fit by itself but not beside
+/// the state gets `ERR too-long`, and a commit waits for room for the
+/// state while the memory is held elsewhere, then goes through.
+#[tokio::test]
+async fn public_posts_count_the_room_state_in_blob_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    let PublicRoomSetup {
+        owen,
+        mut o,
+        m,
+        mut signed,
+    } = create_room(&mut h, 1).await;
+    let state = h.store.room_group(&m).unwrap().unwrap();
+    assert!(state.tree.len() > 1024, "{}", state.tree.len());
+    let state_kib = state.size().div_ceil(1024) as usize;
+    // Not a PrivateMessage, so read whole: 1 KiB more than the state
+    // leaves of the 1 MiB.
+    let message = hold_blob(&h, &vec![7; (1024 - state_kib + 1) * 1024], Some(&m));
+    let token0 = owen.token(&o);
+    let out = owen.commit(&mut o, Changes::default());
+    let group_info = b64(out.group_info.as_ref().unwrap());
+    let line = format!(
+        "POST {m} {token0} {message} next={} groupinfo={group_info}",
+        hash([9; 48])
+    );
+    tokio::time::timeout(Duration::from_secs(30), h.send(&signed, &line))
+        .await
+        .expect("blob memory deadlocked");
+    assert_eq!(signed.lines(), ["ERR too-long"]);
+
+    // With all but the state's room less 1 KiB held elsewhere, an inline
+    // commit waits for the state's room, and goes through once it is let
+    // go.
+    let rest = hold_blob(&h, &vec![3; (1024 - state_kib + 1) * 1024], None);
+    let held = crate::core::keys::blob_bytes(h.inner(), &rest, u64::MAX)
+        .await
+        .unwrap();
+    let line = format!(
+        "POST {m} {token0} {} next={} groupinfo={group_info}",
+        b64(&out.message),
+        hash(out.next_token_hash),
+    );
+    let done = std::cell::Cell::new(false);
+    let post = async {
+        h.send(&signed, &line).await;
+        done.set(true);
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!done.get(), "the commit did not wait for blob memory");
+        drop(held);
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(post, release)
+    })
+    .await
+    .expect("blob memory deadlocked");
+    assert_eq!(signed.lines(), ["OK seq=1"]);
+}
+
 /// A public room's POST takes room for its message's blob and its
 /// GroupInfo's at once (12.12): when they could never fit together, it
 /// gets `ERR too-long`, without holding the message while it waits.

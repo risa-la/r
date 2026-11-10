@@ -783,6 +783,22 @@ impl MailboxStore for SqliteStore {
         })
     }
 
+    fn room_group_size(&self, mailbox: &BoxName) -> Result<Option<u64>> {
+        self.read(|tx| {
+            let size: Option<i64> = tx
+                .query_row(
+                    "SELECT length(group_info) + length(tree) + length(epoch_state)
+                          + (SELECT coalesce(sum(length(message)), 0)
+                             FROM room_proposals WHERE box = ?1)
+                     FROM public_rooms WHERE box = ?1",
+                    [&mailbox.as_bytes()[..]],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            size.map(|size| from_sql_u64("size", size)).transpose()
+        })
+    }
+
     fn room_group_info_size(&self, mailbox: &BoxName) -> Result<Option<u64>> {
         self.read(|tx| {
             let size: Option<i64> = tx
@@ -1694,6 +1710,15 @@ mod tests {
         let state = store.room_group(&m.mailbox).unwrap().unwrap();
         assert_eq!(state.proposals, [vec![1, 2, 3], vec![], vec![4; 300]]);
         assert_eq!(state.state, vec![9; 300 % 7]);
+        assert_eq!(
+            store.room_group_size(&m.mailbox).unwrap(),
+            Some(state.size())
+        );
+        assert_eq!(state.size(), 3 + 5 + 303 + 300 % 7);
+        assert_eq!(
+            store.room_group_size(&new_mailbox(2).mailbox).unwrap(),
+            None
+        );
 
         let mut commit = post(m.mailbox, 2, 1);
         commit.room = Some(RoomChange::Commit(group(

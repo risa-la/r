@@ -578,8 +578,24 @@ pub(super) async fn create(
     }
 }
 
+/// A commit or proposal posted to a public room, for [`check_post`].
+pub(super) struct PostToRoom<'a> {
+    pub(super) framing: &'a PostFraming,
+    /// The bytes of the room's state as stored, which POST took room for
+    /// in `limits.blob_memory` with its blobs, under the mailbox's lock.
+    pub(super) state_size: u64,
+    pub(super) message: Vec<u8>,
+    pub(super) group_info: Option<Vec<u8>>,
+    pub(super) next: Option<TokenHash>,
+    pub(super) now: Timestamp,
+}
+
 /// The checks of 12.6 on a commit or proposal posted to a public room, as a
 /// PublicMessage, after the checks of 5.2's points 1 to 4.
+///
+/// The room's state is read whole from the store, its tree with it, in
+/// the room `memory` took for it with the post's blobs (12.12, PLAN item
+/// 66), so that POST never waits for room while it holds some.
 ///
 /// A post that fails them leaves the group as it was, and it goes back
 /// into memory: OpenMLS checks a message without changing the group, and
@@ -587,18 +603,29 @@ pub(super) async fn create(
 pub(super) async fn check_post(
     cx: &Cx,
     record: &MailboxRecord,
-    framing: &PostFraming,
-    message: Vec<u8>,
-    group_info: Option<Vec<u8>>,
-    next: Option<TokenHash>,
-    now: Timestamp,
+    memory: &mut keys::BlobMemory,
+    post: PostToRoom<'_>,
 ) -> Result<CheckedPost, ErrResponse> {
+    let PostToRoom {
+        framing,
+        state_size,
+        message,
+        group_info,
+        next,
+        now,
+    } = post;
     let mailbox = record.mailbox;
     let rooms = &cx.inner.mailbox.rooms;
+    let _held_state = memory.hold(state_size).map_err(ErrResponse::from)?;
     let stored = cx
         .db(move |store| store.room_group(&mailbox))
         .await?
         .ok_or_else(|| err(ErrorCode::NotFound))?;
+    if stored.size() > state_size {
+        // The mailbox's lock keeps the state as it was sized.
+        tracing::error!("a public room's state grew under its mailbox's lock");
+        return Err(err(ErrorCode::Internal));
+    }
     // 1. For the current epoch.
     if framing.epoch != stored.epoch {
         return Err(err(ErrorCode::Stale));

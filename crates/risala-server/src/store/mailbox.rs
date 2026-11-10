@@ -182,6 +182,15 @@ pub struct RoomGroup {
     pub state: Vec<u8>,
 }
 
+impl RoomGroup {
+    /// The bytes [`MailboxStore::room_group`] reads: the GroupInfo, the
+    /// tree, the proposals and the epoch state.
+    pub fn size(&self) -> u64 {
+        let proposals: usize = self.proposals.iter().map(Vec::len).sum();
+        (self.group_info.len() + self.tree.len() + proposals + self.state.len()) as u64
+    }
+}
+
 /// What GROUPINFO sends of a public room (6.1): its epoch, the seq that
 /// started it, its GroupInfo and its tree, each inline or as the blob the
 /// server stored when it applied the commit (12.12).
@@ -384,6 +393,12 @@ pub trait MailboxStore {
 
     /// The public state of the public room of `mailbox` (12.6).
     fn room_group(&self, mailbox: &BoxName) -> Result<Option<RoomGroup>>;
+
+    /// The bytes [`room_group`](Self::room_group) would read of the public
+    /// room of `mailbox` ([`RoomGroup::size`]), without reading them, so
+    /// that a POST can take room in `limits.blob_memory` for them first
+    /// (12.12).
+    fn room_group_size(&self, mailbox: &BoxName) -> Result<Option<u64>>;
 
     /// The bytes [`room_group_info`](Self::room_group_info) would read of
     /// the public room of `mailbox`: its GroupInfo and its tree, each

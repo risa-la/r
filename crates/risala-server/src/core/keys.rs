@@ -911,8 +911,10 @@ async fn live_blob(
 }
 
 /// Room in `limits.blob_memory` for every blob one command reads whole
-/// (12.12), taken at once by [`reserve`], and handed out by
-/// [`read`](Self::read) to the reads.
+/// (12.12), and for what else it reads whole from the store, such as a
+/// public room's tree: taken at once by [`reserve`] or [`reserve_with`],
+/// and handed out by [`read`](Self::read) and [`hold`](Self::hold) to the
+/// reads.
 ///
 /// A command never waits for blob memory while it holds some: one that
 /// held one blob's room while it waited for the next could wait forever
@@ -924,6 +926,8 @@ async fn live_blob(
 pub(crate) struct BlobMemory {
     /// Each blob found when the room was taken, and its KiB.
     blobs: Vec<(BlobRef, u32)>,
+    /// The KiB taken for reads that are not blobs, not yet handed out.
+    other_kib: u32,
     /// The room not yet handed to a read.
     held: Option<OwnedSemaphorePermit>,
 }
@@ -942,10 +946,24 @@ pub(crate) async fn reserve(
     inner: &Inner,
     blobs: impl IntoIterator<Item = (BlobRef, u64)>,
 ) -> Result<BlobMemory, NoBlob> {
+    reserve_with(inner, blobs, 0).await
+}
+
+/// As [`reserve`], with room besides for `other` bytes that the command
+/// reads whole from the store and are not blobs, which
+/// [`BlobMemory::hold`] then hands out: all of it is taken at once, so
+/// that the command never waits for room while it holds some. Its total
+/// over all of `limits.blob_memory` gets [`NoBlob::TooLong`].
+pub(crate) async fn reserve_with(
+    inner: &Inner,
+    blobs: impl IntoIterator<Item = (BlobRef, u64)>,
+    other: u64,
+) -> Result<BlobMemory, NoBlob> {
     let keys = &inner.keys;
     let cap = keys.memory_kib.saturating_mul(1024);
     let mut found = Vec::new();
-    let mut total: u64 = 0;
+    let other_kib = other.div_ceil(1024);
+    let mut total: u64 = other_kib;
     for (hash, max) in blobs {
         match live_blob(inner, &hash, max.min(cap)).await {
             Ok(record) => {
@@ -970,10 +988,36 @@ pub(crate) async fn reserve(
                 .map_err(|_| NoBlob::Internal)?,
         ),
     };
-    Ok(BlobMemory { blobs: found, held })
+    Ok(BlobMemory {
+        blobs: found,
+        other_kib: u32::try_from(other_kib).map_err(|_| NoBlob::TooLong)?,
+        held,
+    })
 }
 
 impl BlobMemory {
+    /// Room for `bytes` that the command reads whole from the store, out of
+    /// what [`reserve_with`] took for such reads: hold it while the bytes
+    /// are in use. It never waits: more than is left there is
+    /// [`NoBlob::Internal`], since the command learned the size under the
+    /// same lock it reads under.
+    pub(crate) fn hold(&mut self, bytes: u64) -> Result<Option<OwnedSemaphorePermit>, NoBlob> {
+        let kib = bytes.div_ceil(1024);
+        if kib == 0 {
+            return Ok(None);
+        }
+        let kib = u32::try_from(kib)
+            .ok()
+            .filter(|kib| *kib <= self.other_kib)
+            .ok_or(NoBlob::Internal)?;
+        self.other_kib -= kib;
+        self.held
+            .as_mut()
+            .and_then(|held| held.split(kib as usize))
+            .map(Some)
+            .ok_or(NoBlob::Internal)
+    }
+
     /// The bytes of the blob `hash` that a line names (12.12), if the
     /// server holds it and it has not expired, and it has at most `max`
     /// bytes, in the room [`reserve`] took for it. It never waits for

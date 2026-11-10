@@ -493,8 +493,20 @@ pub(super) async fn reserve_lines(
     inner: &Inner,
     values: impl IntoIterator<Item = Option<BlobRef>>,
 ) -> Result<keys::BlobMemory, ErrResponse> {
+    reserve_lines_and(inner, values, 0).await
+}
+
+/// As [`reserve_lines`], with room besides for `other` bytes the command
+/// reads whole from the store, such as a public room's tree, in the same
+/// reservation ([`keys::BlobMemory::hold`]).
+async fn reserve_lines_and(
+    inner: &Inner,
+    values: impl IntoIterator<Item = Option<BlobRef>>,
+    other: u64,
+) -> Result<keys::BlobMemory, ErrResponse> {
     let max = inner.config.limits.max_room_blob;
-    keys::reserve(inner, values.into_iter().flatten().map(|blob| (blob, max)))
+    let blobs = values.into_iter().flatten().map(|blob| (blob, max));
+    keys::reserve_with(inner, blobs, other)
         .await
         .map_err(no_blob)
 }
@@ -559,15 +571,18 @@ pub(super) fn private_message_stub(prefix: &[u8], size: u64) -> Option<Vec<u8>> 
 /// first bytes, so that POST never holds a large blob for a message it
 /// does not check.
 ///
-/// With them, the room in `limits.blob_memory` for every blob the post
-/// reads whole: the message's, and in a public room its GroupInfo's,
-/// which 12.6's checks read after the framing's. Both are taken at once,
-/// so that POST never waits for room while it holds some (12.12).
+/// With them, the room in `limits.blob_memory` for everything the post
+/// reads whole: the message's blob, and in a public room its GroupInfo's
+/// blob and, for a PublicMessage, the room's state as stored, whose
+/// `room_state` bytes 12.6's checks read after the framing
+/// ([`room::check_post`]). All are taken at once, so that POST never
+/// waits for room while it holds some (12.12).
 async fn post_bytes(
     inner: &Inner,
     post: &PostCommand,
-    public_room: bool,
+    room_state: Option<u64>,
 ) -> Result<(keys::BlobBytes, keys::BlobMemory), ErrResponse> {
+    let public_room = room_state.is_some();
     let message = &post.message;
     let groupinfo = post.groupinfo.as_ref().filter(|_| public_room);
     let framing_only = match message {
@@ -589,12 +604,26 @@ async fn post_bytes(
         }
     };
     let whole = framing_only.is_none().then(|| blob_of(message)).flatten();
-    let mut memory = reserve_lines(inner, [whole, groupinfo.and_then(blob_of)]).await?;
+    // Only a PublicMessage is checked against the room's state: a message
+    // read whole is not a PrivateMessage, so it is one or invalid.
+    let checked = match &framing_only {
+        Some(bytes) => is_public_message(bytes),
+        None => true,
+    };
+    let state = room_state.filter(|_| checked).unwrap_or(0);
+    let mut memory = reserve_lines_and(inner, [whole, groupinfo.and_then(blob_of)], state).await?;
     let bytes = match framing_only {
         Some(bytes) => bytes,
         None => line_bytes(inner, &mut memory, message, MlsMessage::decode).await?,
     };
     Ok((bytes, memory))
+}
+
+/// Whether `bytes` start as an MLSMessage of `mls10` that is a
+/// PublicMessage (RFC 9420, 6), which a public room's checks read the
+/// room's state for (12.6).
+fn is_public_message(bytes: &[u8]) -> bool {
+    bytes.get(..4) == Some(&[0, 1, 0, 1][..])
 }
 
 /// `POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>]
@@ -611,7 +640,10 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     let since = now
         .checked_sub(crate::store::mailbox::CID_LIFETIME)
         .unwrap_or(Timestamp::MIN);
-    let (record, seen) = cx
+    // A public room's state as stored, which its checks read whole, is
+    // sized here, under the mailbox's lock, so that POST takes room for it
+    // with the rest (12.12).
+    let (record, seen, room_state) = cx
         .db({
             let cid = cid.clone();
             move |store| {
@@ -620,7 +652,13 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
                     (Some(_), Some(cid)) => store.cid_post(&mailbox, cid, since)?,
                     _ => None,
                 };
-                Ok((record, seen))
+                let room_state = match &record {
+                    Some(record) if record.room.is_some() && seen.is_none() => {
+                        store.room_group_size(&mailbox)?
+                    }
+                    _ => None,
+                };
+                Ok((record, seen, room_state))
             }
         })
         .await?;
@@ -638,7 +676,12 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     if blob {
         inner.mailbox.posts.take(cx, limits.posts_per_minute, now)?;
     }
-    let (bytes, mut memory) = post_bytes(inner, &post, public_room).await?;
+    let room_state = if public_room {
+        Some(room_state.ok_or_else(|| err(ErrorCode::NotFound))?)
+    } else {
+        None
+    };
+    let (bytes, mut memory) = post_bytes(inner, &post, room_state).await?;
     let (bytes, _held) = bytes.into_parts();
     // 2. The framing.
     let framing = read_framing(&bytes, &record.group_id)?;
@@ -778,7 +821,15 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
             Some((bytes, held)) => (Some(bytes), held),
             None => (None, None),
         };
-        Some(room::check_post(cx, &record, &framing, bytes, groupinfo, post.next, now).await?)
+        let checked = room::PostToRoom {
+            framing: &framing,
+            state_size: room_state.unwrap_or(0),
+            message: bytes,
+            group_info: groupinfo,
+            next: post.next,
+            now,
+        };
+        Some(room::check_post(cx, &record, &mut memory, checked).await?)
     } else {
         None
     };
