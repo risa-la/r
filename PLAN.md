@@ -2534,6 +2534,32 @@ Open:
     - **Seeding comes back in M6**, rebuilt on librisala, so the apps
       have rooms and bots to show in development.
 
+65. **Contacts learn of key changes at once**, decided with the user on
+    2026-11-10. A shared review pointed out that the daily re-fetch of
+    contacts' key files was only a SHOULD, and that nothing made contacts
+    fetch when an identity changed its recovery key or recovered after
+    losing every device. Commits already did it for removing or adding
+    one device. Settled (4.5, 4.8, 12.8, 12.9, 12.14, 14, 15):
+    - **The daily fetch is a MUST** (12.14).
+    - **REFETCH `<hash>`**, a new line in direct conversations and
+      private rooms: a device sends it once it has accepted a record it
+      made. Members fetch that identity's key file after a random wait
+      of up to 5 minutes, without the cache, at most once every 10
+      minutes for each identity. Not in public rooms, which have no key
+      checks.
+    - **Nudges after a recovery:** the recovered device has no leaf, so
+      it sends a KeyNudge (its uid) through KEYPKG GET and WELCOME PUT,
+      sealed like a Welcome with the HPKE info `risala/1 nudge`, to the
+      senders of the three most recent messages of each conversation in
+      its backup. That needs no change to the backup format: in a direct
+      conversation it reaches the other participant, and in a room any
+      member who fetches removes the old devices. Nudges are unsigned and
+      only trigger a fetch. The server can tell them from Welcomes by
+      size, and may guess the recovered identity's contacts (14).
+    - **Code:** risala-proto parses REFETCH. librisala sends and acts on
+      REFETCH, and risala-mls and librisala build nudges, as part of
+      M5b's "the code follows".
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
