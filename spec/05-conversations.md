@@ -120,10 +120,17 @@ POST <box> <token> <message> [live=yes] [groupinfo=<groupinfo>] [next=<hash>]
 Posts an MLS message (12.2) to a mailbox. `<message>` is the MLSMessage
 in base64 with padding, or a blob-ref (12.12) if it is too large for a
 line. `<token>` is the group's send token for the message's epoch, in
-base64 with padding, or `-` for a join of a public room (6.1).
-`<groupinfo>` is base64 with padding, or a blob-ref. `<hash>` is the
-SHA-384 hash of the send token of the epoch that a commit creates, in
-base64 with padding (7.2, 12.6).
+base64 with padding, or `-` for an external commit or an external Add
+proposal in a public room (6.1, 12.7). `<groupinfo>` is base64 with
+padding, or a blob-ref. `<hash>` is the SHA-384 hash of the send token
+of the epoch that a commit creates, in base64 with padding (7.2, 12.6).
+
+A POST with the token `-` comes from a device that is not a member
+yet, which cannot store blobs (12.12). So its `<message>` and
+`<groupinfo>` MUST be in the line. A blob-ref in either gets
+`ERR bad-syntax`, and a line too long to hold them gets `ERR too-long`
+(2.3). The server tells this from the line alone, before it reads the
+message.
 
 The server reads the group id, epoch, content type and authenticated
 data from the message's framing, which MLS leaves in the clear, and
