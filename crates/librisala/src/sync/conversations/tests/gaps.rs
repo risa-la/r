@@ -690,6 +690,51 @@ fn an_invitation_back_after_leaving_for_good_is_held_until_accepted() {
     );
 }
 
+/// 6.1: accepting one invitation back into a conversation forgets the
+/// others held into that conversation, which can no longer be joined, but
+/// keeps what is held for anything else, such as a guest's report offer.
+#[test]
+fn accepting_an_invitation_forgets_the_others_into_that_conversation() {
+    use crate::store::conversations::Held;
+    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
+    let (p, _, invitation) = invited_back(&mut net, laptop, phone, bob, b);
+    let first = held(&net, phone).remove(0);
+    let account = net.devices[phone].account;
+    let now = net.clock.now().unix_millis();
+    let (second, offer) = net.write(phone, |tx| {
+        let mut other = first.welcome.clone();
+        other.push(0);
+        let second = tx.hold_welcome(
+            account,
+            &other,
+            &first.reference,
+            &Held::Invitation {
+                conv: p,
+                by: "carol@example.com".parse().unwrap(),
+            },
+            now,
+        )?;
+        let offer = tx.hold_welcome(
+            account,
+            b"an offer",
+            b"its ref",
+            &Held::Report {
+                guest: "guest-1@example.org".parse().unwrap(),
+            },
+            now,
+        )?;
+        Ok((second, offer))
+    });
+    assert_eq!(held(&net, phone).len(), 3);
+    let cx = net.cx(phone);
+    let (joined, actions) = net.devices[phone].engine.accept_held(&cx, invitation);
+    net.act(phone, actions);
+    net.run();
+    assert_eq!(joined, Ok(p));
+    let left: Vec<i64> = held(&net, phone).iter().map(|h| h.id).collect();
+    assert_eq!(left, [offer], "not {second}");
+}
+
 /// 6.1, 12.8: a declined invitation is forgotten, with its KeyPackage's
 /// private keys, and the device stays out.
 #[test]
