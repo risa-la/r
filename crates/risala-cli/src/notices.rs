@@ -20,11 +20,19 @@
 //! - typing and presence: they mean nothing once the run ends;
 //! - a group job's end: the command that started it waits for it, and
 //!   fails with its error;
-//!
-//! Only the conversation area's events are told so far.
+//! - pairing steps: `pair` prints its own;
+//! - a new generation: the backups area acts on it by itself;
+//! - confirmed and attested leaves: routine, and `read` shows what is
+//!   verified;
+//! - progress, backups made and push URLs: `fetch` and `backup` print
+//!   their results, and the CLI has no push.
 
+use librisala::client::confirm::{ConfirmEvent, ConfirmKind};
 use librisala::client::conversations::{ConversationEvent, ConversationKind, ConversationSummary};
+use librisala::client::files::TransferEvent;
+use librisala::client::identity::IdentityEvent;
 use librisala::client::types::ConversationId;
+use librisala::proto::time::Timestamp;
 use librisala::{Client, Event};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, oneshot};
@@ -96,6 +104,10 @@ impl Printer {
         let conv = |id| Conv::of(id, client.conversation(id).ok().as_ref());
         if let Some(line) = notice(event, &conv) {
             self.line(&line);
+        }
+        // 2.2: told once, so it is dismissed once printed.
+        if let Event::PinReplaced { server, .. } = event {
+            let _ = client.dismiss_pin_notice(&server.to_string());
         }
     }
 
@@ -187,10 +199,13 @@ impl std::fmt::Display for Conv {
 pub fn notice(event: &Event, conv: &dyn Fn(ConversationId) -> Conv) -> Option<String> {
     let text = match event {
         Event::Changed(_) | Event::Connection(_) => None,
-        Event::Conversation(e) => conversation(e, conv),
-        Event::PinReplaced { .. } | Event::Identity(_) | Event::Confirm(_) | Event::Transfer(_) => {
-            None
+        Event::PinReplaced { server, change } => {
+            Some(pin_replaced(&server.to_string(), &change.old, &change.new))
         }
+        Event::Conversation(e) => conversation(e, conv),
+        Event::Identity(e) => identity(e),
+        Event::Confirm(e) => confirm(e, &conv(e.conversation)),
+        Event::Transfer(e) => transfer(e),
     }?;
     Some(escaped(&text))
 }
@@ -416,11 +431,177 @@ fn invited(invitation: i64, c: &Conv, by: &str) -> String {
     )
 }
 
+fn identity(e: &IdentityEvent) -> Option<String> {
+    use IdentityEvent as E;
+    Some(match e {
+        E::PairingRequest(_) | E::PairingWaiting { .. } | E::NewGeneration { .. } => return None,
+        E::Alert { uid } => alert(uid.as_str()),
+        E::NewMasterKey { uid } => new_master_key(uid.as_str()),
+        E::Fork { uid } => fork(uid.as_str()),
+        E::WitnessListProblem { uid } => witness_list_problem(uid.as_str()),
+        E::ChainFilling { uid } => chain_filling(uid.as_str()),
+    })
+}
+
+fn alert(uid: &str) -> String {
+    format!(
+        "someone else may control {uid}: a record of it that none of its devices \
+         announced, a fork of it, or an ALERT from another of its devices (4.5); check \
+         its devices with `risala identity {uid} --refresh`, and remove one that is not \
+         yours with `risala remove-device`"
+    )
+}
+
+fn new_master_key(uid: &str) -> String {
+    format!(
+        "{uid} has a new master key or a new key log (12.14): sending to {uid} stops \
+         outside public rooms until you acknowledge it, which risala-cli cannot do yet; \
+         compare safety numbers with `risala safety {uid}`"
+    )
+}
+
+fn fork(uid: &str) -> String {
+    format!(
+        "{uid}'s keys forked: two different histories of them were shown (4.5), so \
+         sending to {uid} stops until you resolve it, which risala-cli cannot do yet; \
+         compare safety numbers with `risala safety {uid}`"
+    )
+}
+
+fn witness_list_problem(uid: &str) -> String {
+    format!(
+        "no checkpoint of the key log that holds {uid} has enough cosignatures from your \
+         witnesses: the witness list does not fit that log (4.5); see it with \
+         `risala witness show`, and change it with `risala witness set`"
+    )
+}
+
+fn chain_filling(uid: &str) -> String {
+    format!(
+        "{uid}'s chain has passed 3,072 of its 4,096 records (4.4): it is time to move to \
+         a new identity"
+    )
+}
+
+fn confirm(e: &ConfirmEvent, c: &Conv) -> Option<String> {
+    let who = format!("a device of {} (leaf {})", e.uid, e.leaf);
+    Some(match &e.kind {
+        ConfirmKind::Confirmed | ConfirmKind::Attested { .. } => return None,
+        ConfirmKind::Impostor { reason } => impostor(c, &who, reason),
+        ConfirmKind::Unanswered => format!(
+            "in {c}, {who} has not answered its challenge within 24 hours (12.9); if that \
+             device is lost, remove it with `risala remove-device`"
+        ),
+        ConfirmKind::InvalidAttestation { reason } => format!(
+            "in {c}, an attestation from {who} was not valid, or came too late (12.10): \
+             {reason}"
+        ),
+        ConfirmKind::BadReveal { period } => format!(
+            "in {c}, {who} revealed a key for {} that does not match the one it attested \
+             with, so it does not give the deniability the group expects (12.10)",
+            day(*period)
+        ),
+        ConfirmKind::RevealMissing { period } => format!(
+            "in {c}, {who} has not revealed its key for {}, well after it was due (12.10)",
+            day(*period)
+        ),
+        ConfirmKind::DeviceNotCurrent => format!(
+            "in {c}, {who} names a device that is not a current device of its identity, \
+             so it cannot be confirmed (12.10)"
+        ),
+        ConfirmKind::BadAttestationKey => format!(
+            "in {c}, {who} has an attestation key that fails its check (12.2), so it \
+             cannot be confirmed"
+        ),
+    })
+}
+
+fn impostor(c: &Conv, who: &str, reason: &str) -> String {
+    format!(
+        "in {c}, {who} is an impostor ({reason}): what it sends is shown unconfirmed, and \
+         this device removes it after a random wait where it may, unless another does \
+         first (12.7)"
+    )
+}
+
+/// A period, a UTC day numbered from 1970-01-01, as a date.
+fn day(period: u32) -> String {
+    match Timestamp::from_unix_millis(u64::from(period) * 86_400_000) {
+        Some(t) => t.to_string().chars().take(10).collect(),
+        None => format!("day {period}"),
+    }
+}
+
+fn transfer(e: &TransferEvent) -> Option<String> {
+    use TransferEvent as E;
+    Some(match e {
+        E::Progress { .. } | E::BackupMade { .. } | E::PushUrlsNeeded { .. } => return None,
+        E::TransferApplied {
+            messages,
+            waiting,
+            missing,
+            ignored,
+            ..
+        } => transfer_applied(*messages, *waiting, *missing, *ignored),
+        E::TransferFailed { error, .. } => {
+            format!("the history another device sent could not be used (12.13): {error}")
+        }
+        E::Report { report, .. } => format!(
+            "a member sent you report {report}, as an owner or moderator of a room (5.8); \
+             risala-cli cannot show reports yet"
+        ),
+        E::OperatorReport { line, mailbox, .. } => format!(
+            "a report to the server's operators, on the posts in mailbox {mailbox} (5.8): \
+             {line}"
+        ),
+    })
+}
+
+fn transfer_applied(messages: usize, waiting: usize, missing: usize, ignored: usize) -> String {
+    let mut text = format!(
+        "history from another device: {}",
+        count(messages, "message", "messages")
+    );
+    if waiting > 0 {
+        text.push_str(&format!(
+            ", and {} kept until this device joins them",
+            count(waiting, "conversation", "conversations")
+        ));
+    }
+    if missing > 0 || ignored > 0 {
+        text.push_str(&format!(
+            "; part of the history is missing (12.13): {} could not be fetched or opened, \
+             and {} had messages out of order",
+            count(missing, "archive", "archives"),
+            count(ignored, "conversation", "conversations")
+        ));
+    }
+    text
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// 2.2: shows the old fingerprint and the new one.
+fn pin_replaced(
+    server: &str,
+    old: &impl std::fmt::Display,
+    new: &impl std::fmt::Display,
+) -> String {
+    format!(
+        "{server} showed a CA-valid certificate with another key, which replaced its pin \
+         (2.2): it was {old}, and is {new}; whoever can get a certificate for the name, \
+         such as by taking over its DNS, could be behind the change"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use librisala::addr::ServerAddr;
     use librisala::client::types::Uid;
+    use librisala::proto::fingerprint::Fingerprint;
     use librisala::store::{AccountId, AccountKind, Store};
 
     fn conv(number: i64, kind: ConversationKind, name: &str, room: Option<&str>) -> Conv {
@@ -582,9 +763,89 @@ mod tests {
     }
 
     #[test]
+    fn periods_are_dates() {
+        assert_eq!(day(0), "1970-01-01");
+        assert_eq!(day(20_403), "2025-11-11");
+    }
+
+    #[test]
+    fn a_transfer_says_what_is_missing() {
+        assert_eq!(
+            transfer_applied(1, 0, 0, 0),
+            "history from another device: 1 message"
+        );
+        assert_eq!(
+            transfer_applied(12, 2, 1, 0),
+            "history from another device: 12 messages, and 2 conversations kept until this \
+             device joins them; part of the history is missing (12.13): 1 archive could not \
+             be fetched or opened, and 0 conversations had messages out of order"
+        );
+    }
+
+    #[test]
+    fn a_replaced_pin_shows_both_fingerprints() {
+        let event = Event::PinReplaced {
+            server: ServerAddr::new("chat.example.org", 7472).unwrap(),
+            change: librisala::addr::PinChange {
+                old: Fingerprint::from_bytes([1; 32]),
+                new: Fingerprint::from_bytes([2; 32]),
+            },
+        };
+        let text = notice(&event, &no_conv).unwrap();
+        assert!(
+            text.starts_with("chat.example.org showed a CA-valid certificate"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("it was sha256:{}", "01".repeat(32))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("and is sha256:{}", "02".repeat(32))),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn identity_notices_say_what_to_do() {
+        let uid: Uid = "alice@example.org".parse().unwrap();
+        let text = notice(
+            &Event::Identity(IdentityEvent::Alert { uid: uid.clone() }),
+            &no_conv,
+        )
+        .unwrap();
+        assert!(
+            text.starts_with("someone else may control alice@example.org"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`risala identity alice@example.org --refresh`"),
+            "{text}"
+        );
+        let text = notice(
+            &Event::Identity(IdentityEvent::WitnessListProblem { uid: uid.clone() }),
+            &no_conv,
+        )
+        .unwrap();
+        assert!(text.contains("`risala witness set`"), "{text}");
+        let skipped = Event::Identity(IdentityEvent::NewGeneration { uid, generation: 2 });
+        assert_eq!(notice(&skipped, &no_conv), None);
+    }
+
+    #[test]
     fn routine_events_are_not_told() {
         let account = account();
         for event in [
+            Event::Transfer(TransferEvent::Progress {
+                message: None,
+                done: 1,
+                total: 2,
+            }),
+            Event::Transfer(TransferEvent::BackupMade {
+                account,
+                generation: 1,
+            }),
+            Event::Transfer(TransferEvent::PushUrlsNeeded { account, count: 1 }),
             Event::Conversation(ConversationEvent::Presence {
                 account,
                 uids: vec!["bob@example.org".parse().unwrap()],
@@ -607,6 +868,17 @@ mod tests {
         "x\\u{1b}[2A\\u{1b}[2K\\u{d}risala invitation accept 9\\u{a}\\u{9}\\u{9b}K\\u{202e}y";
 
     #[test]
+    fn text_from_others_is_escaped() {
+        let event = Event::Transfer(TransferEvent::TransferFailed {
+            account: account(),
+            error: EVIL.into(),
+        });
+        let text = notice(&event, &no_conv).unwrap();
+        assert!(text.ends_with(&format!("(12.13): {EVIL_SHOWN}")), "{text}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+    }
+
+    #[test]
     fn names_from_others_are_escaped() {
         let evil = conv(3, ConversationKind::PrivateRoom, EVIL, None);
         let lines = [
@@ -615,6 +887,11 @@ mod tests {
             escaped(&dropped(&evil, EVIL)),
             escaped(&room_changed(&evil, &[EVIL.to_owned()])),
             escaped(&known_group_welcome(&evil, EVIL)),
+            escaped(&impostor(
+                &evil,
+                "a device of bob@example.org (leaf 2)",
+                EVIL,
+            )),
         ];
         for line in lines {
             assert!(
