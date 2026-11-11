@@ -14,7 +14,8 @@
 //! # What is kept
 //!
 //! The store keeps mailboxes, token hashes, posts, cids, public rooms,
-//! their members and mutes ([`MailboxStore`]), and nothing about the
+//! their members and mutes
+//! ([`MailboxStore`](crate::store::MailboxStore)), and nothing about the
 //! connections or addresses that made them (4.2). Which connections follow
 //! which mailboxes, and the counts behind the limits per connection and
 //! per network address, are kept in memory only, for the life of the
