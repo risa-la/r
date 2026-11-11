@@ -1406,18 +1406,31 @@ fn key_checks_of_removals() {
 
 /// A device that sees a leaf of its own identity remove another of its
 /// identity's current devices, without adding it again, tells the user
-/// (12.7).
+/// (12.7), in public rooms too, which have no key checks: a leave commit
+/// there removes the identity's other leaves (6.1).
 #[test]
 fn own_identity_removals() {
-    let g = group(&room(ConversationKind::PrivateRoom));
-    let c = commit(&g, 2, remove(&[3]));
-    let verdict = check(&g, &c).unwrap();
     let as_p = uid("p@x.org");
     let seen = Seen {
         own_uid: &as_p,
         resyncs: &[],
         impostors: &[],
     };
+    let public = group(&room(ConversationKind::PublicRoom));
+    let c = commit(&public, 2, remove(&[3]));
+    let verdict = check(&public, &c).unwrap();
+    let report = key_checks(&public, &c, &verdict, &Facts::none(), &seen);
+    assert_eq!(
+        report,
+        KeyReport {
+            own_removed_by_own: vec![idx(3)],
+            ..KeyReport::default()
+        },
+        "the alert alone"
+    );
+    let g = group(&room(ConversationKind::PrivateRoom));
+    let c = commit(&g, 2, remove(&[3]));
+    let verdict = check(&g, &c).unwrap();
     let report = key_checks(&g, &c, &verdict, &Facts::none(), &seen);
     assert_eq!(report.own_removed_by_own, vec![idx(3)]);
     let gone = Facts {

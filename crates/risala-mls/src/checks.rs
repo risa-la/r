@@ -1654,8 +1654,10 @@ pub struct KeyReport {
 }
 
 /// The key checks of a commit that passed the group checks (12.7), outside
-/// public rooms, which have none. `group` is the group as of the commit's
-/// epoch, and `seen` what the device itself saw.
+/// public rooms, which have none, and, in every kind of group, the removals
+/// of the device's own identity's current devices by that identity, which
+/// the user is told of. `group` is the group as of the commit's epoch, and
+/// `seen` what the device itself saw.
 pub fn key_checks(
     group: &GroupView,
     commit: &CommitView,
@@ -1664,6 +1666,33 @@ pub fn key_checks(
     seen: &Seen<'_>,
 ) -> KeyReport {
     let mut report = KeyReport::default();
+    let added = commit.added_identities();
+    let committer = match commit.committer {
+        Committer::Member(index) => group.leaf(index).and_then(|leaf| leaf.identity.as_ref()),
+        Committer::External => None,
+    };
+    // Removals of the device's own identity's leaves by its own identity
+    // (12.7): fine, but suspicious if the device is still current. This is
+    // not a key check: it holds in public rooms too, where leave commits
+    // remove the identity's other leaves (6.1).
+    if let Some(committer) = committer
+        && committer.uid == *seen.own_uid
+    {
+        for index in commit.removed_indices() {
+            let Some(identity) = group.leaf(index).and_then(|leaf| leaf.identity.as_ref()) else {
+                continue;
+            };
+            let Some(device_id) = identity.device_id else {
+                continue;
+            };
+            if identity == committer || identity.uid != *seen.own_uid || added.contains(identity) {
+                continue;
+            }
+            if let Fact::Known(Some(_)) = facts.current_device_key(&identity.uid, &device_id) {
+                report.own_removed_by_own.push(index);
+            }
+        }
+    }
     if group
         .conversation
         .as_ref()
@@ -1695,37 +1724,12 @@ pub fn key_checks(
             (Fact::Unknown, _) => report.unchecked_adds.push(identity),
         }
     }
-    let committer = match commit.committer {
-        Committer::Member(index) => group.leaf(index).and_then(|leaf| leaf.identity.as_ref()),
-        Committer::External => None,
-    };
     if let Some(identity) = committer
         && let Some(device_id) = identity.device_id
     {
         match facts.device_removed(&identity.uid, &device_id) {
             Fact::Known(removed) => report.committer_removed = removed,
             Fact::Unknown => report.committer_unchecked = true,
-        }
-    }
-    let added = commit.added_identities();
-    // Removals of the device's own identity's leaves by its own identity
-    // (12.7): fine, but suspicious if the device is still current.
-    if let Some(committer) = committer
-        && committer.uid == *seen.own_uid
-    {
-        for index in commit.removed_indices() {
-            let Some(identity) = group.leaf(index).and_then(|leaf| leaf.identity.as_ref()) else {
-                continue;
-            };
-            let Some(device_id) = identity.device_id else {
-                continue;
-            };
-            if identity == committer || identity.uid != *seen.own_uid || added.contains(identity) {
-                continue;
-            }
-            if let Fact::Known(Some(_)) = facts.current_device_key(&identity.uid, &device_id) {
-                report.own_removed_by_own.push(index);
-            }
         }
     }
     for index in &verdict.check_removals {
