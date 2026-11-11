@@ -506,9 +506,6 @@ pub(crate) enum Note {
     },
     /// This device was removed from the group.
     Removed { conv: ConversationId },
-    /// This device left the group by itself, as another device of its
-    /// identity asked (6.1, `LEAVE <box>`).
-    Left { conv: ConversationId },
     /// Proposals are pending: commit them after a random wait (6.1).
     Proposals { conv: ConversationId },
     /// A post of a later epoch that the device cannot read (12.7).
@@ -539,6 +536,10 @@ pub(crate) enum Note {
         seq: u64,
         device: Option<[u8; 48]>,
     },
+    /// Another device of this identity left the group of `conv` locally,
+    /// and asks this device to leave it for the identity (6.1, `LEAVE
+    /// <box>`): after a random wait (12.9).
+    OwnLeave { conv: ConversationId },
     /// A read marker moved (7.7).
     Read,
     /// A READ's epoch check differs: the server may have split the group
@@ -793,6 +794,9 @@ pub struct ConversationEngine {
     /// (12.9): the box and seq named. In the group's current mailbox the
     /// device first applies the posts there up to that seq.
     own_resyncs: HashMap<(ConversationId, u32), (BoxName, u64)>,
+    /// When to leave groups that another device of the identity asked it
+    /// to leave with `LEAVE <box>` (6.1, 12.9).
+    leave_timers: HashMap<ConversationId, u64>,
     /// Commits this device could not process, per conversation: the epoch
     /// it holds and the commit's seq (12.7).
     unprocessable: HashMap<ConversationId, (u64, u64)>,
@@ -897,6 +901,7 @@ impl ConversationEngine {
             proposal_timers: HashMap::new(),
             resync_timers: HashMap::new(),
             own_resyncs: HashMap::new(),
+            leave_timers: HashMap::new(),
             unprocessable: HashMap::new(),
             resynced: HashSet::new(),
             resync_since: HashMap::new(),
@@ -1845,6 +1850,12 @@ impl ConversationEngine {
                         self.own_resyncs.insert((conv, leaf), (mailbox, seq));
                     }
                 }
+                Note::OwnLeave { conv } => {
+                    // 12.9: after a random wait, as for RESYNC, so that the
+                    // identity's devices seldom race.
+                    let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
+                    self.leave_timers.entry(conv).or_insert(now + wait);
+                }
                 Note::JoinCheck { conv } => {
                     self.join_checks.insert(conv, now);
                 }
@@ -1956,7 +1967,7 @@ impl ConversationEngine {
                         out.extend(actions);
                     }
                 }
-                Note::Removed { conv } | Note::Left { conv } => {
+                Note::Removed { conv } => {
                     out.push(Action::Emit(Event::Conversation(ConversationEvent::Left {
                         conversation: conv,
                     })));

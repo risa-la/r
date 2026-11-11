@@ -408,7 +408,8 @@ fn self_line(
             // 6.1: another device of this identity left that group
             // locally, its leaf perhaps still there. This device leaves it
             // for the identity, with the usual leave commit, which removes
-            // that leaf too. The box may be one from before a move.
+            // that leaf too, after a random wait (12.9). The box may be one
+            // from before a move.
             let Some(target) = tx.conversation_by_box(cx.account, mailbox)? else {
                 return Ok(());
             };
@@ -416,9 +417,7 @@ fn self_line(
                 return Ok(());
             }
             tracing::info!(conv = %target, "another device of this identity left the group: leaving it too");
-            if group::leave(tx, target, cx.uid, cx.now)? {
-                applied.notes.push(Note::Left { conv: target });
-            }
+            applied.notes.push(Note::OwnLeave { conv: target });
         }
         other => {
             applied.notes.extend(

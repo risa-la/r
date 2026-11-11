@@ -13,8 +13,8 @@
 //!   from the groups and the cache (LR-M4): pending proposals to commit
 //!   (6.1), leaves that asked with RESYNC to replace (12.7), and, from the
 //!   `engine_timers` table, the RESYNC escalation, the commits this device
-//!   could not process, the RESYNCs of the own identity's devices (12.9),
-//!   and the 7.8 move fallback.
+//!   could not process, the RESYNCs and LEAVEs of the own identity's
+//!   devices (12.9), and the 7.8 move fallback.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -202,6 +202,13 @@ impl ConversationEngine {
                 self.own_resyncs.entry(key).or_insert((mailbox, seq));
             }
         }
+        for e in pairs("leave") {
+            if let (Some(c), Some(at)) = (num(&e, 0), num(&e, 1)) {
+                self.leave_timers
+                    .entry(ConversationId(c as i64))
+                    .or_insert(at);
+            }
+        }
         for e in pairs("move") {
             if let (Some(c), Some(at), Some(mailbox)) = (
                 num(&e, 0),
@@ -254,11 +261,20 @@ impl ConversationEngine {
             .into_iter()
             .map(|((c, leaf), (at, b, seq))| json!([c, leaf, at, b, seq]))
             .collect();
+        let leaves: Vec<Value> = self
+            .leave_timers
+            .iter()
+            .map(|(c, at)| (c.0, *at))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(c, at)| json!([c, at]))
+            .collect();
         let timers = json!({
             "unprocessable": sorted(&self.unprocessable),
             "resync_since": sorted(&self.resync_since),
             "resynced": resynced.into_iter().map(|c| json!([c])).collect::<Vec<_>>(),
             "own_resync": own_resyncs,
+            "leave": leaves,
             "move": moves,
         })
         .to_string();

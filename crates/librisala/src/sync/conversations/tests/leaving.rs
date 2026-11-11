@@ -645,3 +645,83 @@ fn a_leave_that_names_a_box_from_before_a_move_finds_the_group() {
     assert_eq!(net.state(phone, p), ConvState::Left);
     assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
 }
+
+/// 6.1, 12.9: own devices wait a random time of up to 10 minutes before
+/// they act on LEAVE, as on RESYNC, so that they seldom race. The first to
+/// act leaves for the identity, and its leave commit removes the others'
+/// leaves; one whose wait ends after that does nothing. The wait outlives
+/// a restart (LR-M4).
+#[test]
+fn own_devices_wait_before_acting_on_leave() {
+    let mut net = Net::new();
+    let laptop = net.device("alice", "alice@example.org");
+    let tablet = net.device_of("alice-tablet", laptop);
+    let phone = net.device_of("alice-phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, tablet, phone, bob] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    let pm = net.same_conv(phone, laptop, me).expect("the phone is in");
+    net.same_conv(tablet, laptop, me).expect("the tablet is in");
+    let a = net
+        .job(
+            laptop,
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec![uid("bob@example.net")],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let t = net.same_conv(tablet, laptop, a).unwrap();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    assert_eq!(net.leaves(bob, b).len(), 4);
+    for d in [laptop, tablet] {
+        net.devices[d].engine.config.max_commit_wait_ms = 10 * MINUTE;
+    }
+    // The phone has left locally, and asks its own devices.
+    let mailbox = net.devices[phone].store.mailbox_rows(p).unwrap()[0].mailbox;
+    let asked = net.clock.now().unix_millis();
+    net.lines(phone, pm, vec![ContentLine::Leave { mailbox }], false);
+    for (d, conv) in [(laptop, a), (tablet, t)] {
+        let at = net.devices[d].engine.leave_timers[&conv];
+        assert!(at <= asked + 10 * MINUTE, "a wait of up to 10 minutes");
+        assert_eq!(net.state(d, conv), ConvState::Active, "not at once");
+    }
+    // The draws, made known: the laptop's wait ends first.
+    net.devices[laptop]
+        .engine
+        .leave_timers
+        .insert(a, asked + 3 * MINUTE);
+    net.devices[tablet]
+        .engine
+        .leave_timers
+        .insert(t, asked + 8 * MINUTE);
+    net.advance(2 * MINUTE);
+    assert_eq!(net.state(laptop, a), ConvState::Active);
+    net.restart(tablet);
+    assert_eq!(
+        net.devices[tablet].engine.leave_timers.get(&t),
+        Some(&(asked + 8 * MINUTE)),
+        "kept through a restart"
+    );
+    for _ in 0..10 {
+        net.advance(MINUTE);
+    }
+    // The laptop left, and its leave commit removed the tablet's and the
+    // phone's leaves; the tablet's wait ended after, and it made no leave
+    // of its own.
+    assert_eq!(net.state(laptop, a), ConvState::Left);
+    assert_eq!(net.state(tablet, t), ConvState::Left);
+    assert!(net.devices[tablet].engine.leave_timers.is_empty());
+    assert_eq!(queued_commits(&net, tablet, t), 0);
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
+    assert!(
+        net.devices[bob]
+            .store
+            .departed(b, &uid("alice@example.org"))
+            .unwrap()
+    );
+}

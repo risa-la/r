@@ -1,6 +1,7 @@
-//! Recovery paths of the group engine (7.4, 7.5, 7.8, 12.7, 12.8):
+//! Recovery paths of the group engine (6.1, 7.4, 7.5, 7.8, 12.7, 12.8):
 //! replacing stale leaves, `RESYNC <box> <seq>` to the identity's other
-//! devices, who replaces a leaf that asked with RESYNC, the move by any
+//! devices, who replaces a leaf that asked with RESYNC, leaving a group for
+//! the identity after `LEAVE <box>` from one of its devices, the move by any
 //! member after another's removal, groups the device can no longer follow
 //! after posts expired unread, and the warning that the device may have
 //! joined a branch of the group that nobody follows.
@@ -321,6 +322,27 @@ impl ConversationEngine {
                 }
                 Ok(())
             })?;
+        }
+
+        // 6.1, 12.9: leave a group that another device of the identity
+        // left locally, unless a leave by another of them has removed this
+        // device's leaf first. One already leaving goes on as it was.
+        let due: Vec<ConversationId> = self
+            .leave_timers
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(c, _)| *c)
+            .collect();
+        for conv in due {
+            self.leave_timers.remove(&conv);
+            let left = self.write(cx, me, out, |tx, c| group::leave(tx, conv, c.uid, c.now));
+            match left {
+                Ok(true) => out.push(Action::Emit(Event::Conversation(ConversationEvent::Left {
+                    conversation: conv,
+                }))),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(%conv, error = %e, "could not leave for the identity"),
+            }
         }
 
         // 12.7: a RESYNC nobody acted on within an hour goes to the own
