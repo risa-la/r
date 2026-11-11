@@ -188,7 +188,11 @@ has left the conversation. It then ignores Welcomes to that group (12.8)
 whose GroupInfo is signed by a leaf of its own identity, such as one
 from a device of its own that replaced its leaf before reading LEAVE
 (12.7). A Welcome from a member of another identity is an invitation,
-as after any leave, and the device shows it as one.
+as after any leave: the device shows it as one, and joins only if the
+user accepts it. One that the user has not answered within the
+server's retention period (8.5) is forgotten, as the server forgets the
+Welcomes it holds (12.8), with its KeyPackage unless that is of last
+resort (12.5).
 
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
 private room, coming back always takes a new invitation. In a direct
