@@ -363,6 +363,12 @@ Each risk is marked **Mitigated**, where this document limits it, or
   the group checks runs on the `t` the server gives posts, so that
   devices agree; a server that colludes with a member can shift them
   (Section 14).
+- **Past epochs until a catch-up** (Open). A device deletes a past
+  epoch's secrets once it has caught up past 2 hours after the commit
+  that ended it, by the server's time (12.9). A server that withholds
+  posts, or holds back its time, keeps them on devices longer, where a
+  device stolen meanwhile decrypts the messages of those epochs that it
+  had not received (Section 14).
 - **Archivers in public rooms** (Open). Anyone can join a public room, so
   an archiver that timestamps what it sees defeats delayed deniability
   for it (Section 14).
@@ -531,4 +537,10 @@ claims that depend on it.
   commit anyway, in place of joining by proposal, so that a large room
   whose server took a bad commit can still be resynced; a POST with the
   token `-` may name blobs only there, in a public room (4.1, 5.2, 6.1,
-  12.6, 12.7, 12.12, Section 14).
+  12.6, 12.7, 12.12, Section 14); a Welcome from another member into a
+  group the device left for good is an invitation that the user answers
+  (6.1); own devices act on LEAVE after a random wait, as on RESYNC,
+  and tell their users that the identity left from the device that
+  asked (12.9); a RESYNC after every post up to the head expired names
+  the head (7.5, 12.9); and devices tell their users when a public room
+  cannot be resynced (12.7).
