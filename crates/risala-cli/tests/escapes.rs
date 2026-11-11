@@ -3,7 +3,8 @@
 //!
 //! Whoever saw a new device's QR code can answer it with an identity of
 //! their own (4.8, step 5). Its device labels must not be able to rewrite
-//! what the new device prints before it asks the user to confirm.
+//! what the new device prints before it asks the user to confirm. Nor
+//! may a room's name rewrite the notices printed while a command runs.
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::Path;
@@ -109,4 +110,53 @@ async fn labels_with_escapes_are_printed_escaped() {
     );
     assert!(err.contains("risala: declined"), "{err}");
     no_controls(&err);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notices_name_rooms_escaped() {
+    let world = World::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mallory = root.path().join("mallory");
+    let bob = root.path().join("bob");
+    for (state, name) in [(&mallory, "mallory"), (&bob, "bob")] {
+        let (ok, _, err) = run(risala(&world, state, &["create", HOST, name, "laptop"])).await;
+        assert!(ok, "create {name} failed: {err}");
+    }
+
+    let (ok, _, err) = run(risala(&world, &mallory, &["room", "create", EVIL])).await;
+    assert!(ok, "room create failed: {err}");
+    let room = format!("#{EVIL}");
+    let (ok, _, err) = run(risala(
+        &world,
+        &mallory,
+        &["room", "invite", &room, "bob@example.org"],
+    ))
+    .await;
+    assert!(ok, "room invite failed: {err}");
+
+    // Bob's device joins by the Welcome, and says so on standard error
+    // only; standard output is `sync`'s list, as ever.
+    let mut told = None;
+    for _ in 0..10 {
+        let (ok, out, err) = run(risala(&world, &bob, &["--wait", "5", "sync"])).await;
+        assert!(ok, "sync failed: {err}");
+        assert!(out.lines().all(|l| !l.starts_with("risala:")), "{out}");
+        no_controls(&out);
+        no_controls(&err);
+        if let Some(line) = err.lines().find(|l| l.starts_with("risala: joined ")) {
+            told = Some((line.to_owned(), out));
+            break;
+        }
+    }
+    let (line, out) = told.expect("bob's device never said it joined the room");
+    let n = out
+        .lines()
+        .find(|l| l.contains(EVIL_SHOWN))
+        .and_then(|l| l.split('\t').next())
+        .expect("the room in the list")
+        .to_owned();
+    assert_eq!(
+        line,
+        format!("risala: joined conversation {n} (#{EVIL_SHOWN}): read it with `risala read {n}`")
+    );
 }
