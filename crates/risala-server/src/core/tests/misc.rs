@@ -1115,13 +1115,16 @@ fn report_lines_parse_back() {
 /// A reported post that is a blob is checked from its first bytes, which
 /// hold the franking tag, and the report keeps the blob until it is
 /// resolved (5.8, 12.12).
-#[tokio::test]
-async fn reports_of_blob_posts() {
-    let mut h = Harness::with(report_config(30), timers());
-    let mailbox = add_mailbox(&h, 1);
-    let key = [4; 32];
-    let content: &[u8] = b"TEXT big\n";
-    let tag: [u8; 48] = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA384, &key), content)
+/// Posts at seq 1 of `mailbox` a franked message held as a blob, of
+/// 200,000 bytes, whose content `content` is franked with `key`. Returns
+/// the blob's hash.
+fn add_blob_post(
+    h: &Harness,
+    mailbox: &risala_proto::names::BoxName,
+    key: &[u8; 32],
+    content: &[u8],
+) -> Vec<u8> {
+    let tag: [u8; 48] = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA384, key), content)
         .as_ref()
         .try_into()
         .unwrap();
@@ -1131,7 +1134,7 @@ async fn reports_of_blob_posts() {
     w.vector(&[4; 32]).u64(7).u8(1).vector(&aad.encode());
     w.vector(b"sender").vector(&[0x55; 200_000]);
     let message = w.finish();
-    let blob = hold_blob(&h, &message, Some(&mailbox));
+    let blob = hold_blob(h, &message, Some(mailbox));
     h.store
         .raw()
         .execute(
@@ -1139,6 +1142,28 @@ async fn reports_of_blob_posts() {
             rusqlite::params![&mailbox.as_bytes()[..], &blob.hash()[..]],
         )
         .unwrap();
+    blob.hash().to_vec()
+}
+
+/// How many reports keep the blob of `hash`.
+fn blob_kept(h: &Harness, hash: &[u8]) -> i64 {
+    h.store
+        .raw()
+        .query_row(
+            "SELECT count(*) FROM blob_keeps WHERE hash = ?",
+            [hash],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn reports_of_blob_posts() {
+    let mut h = Harness::with(report_config(30), timers());
+    let mailbox = add_mailbox(&h, 1);
+    let key = [4; 32];
+    let content: &[u8] = b"TEXT big\n";
+    let hash = add_blob_post(&h, &mailbox, &key, content);
     let mut reporter = h.anon().await;
     let wrong = report_b64((1, [5; 32], content), &[], "b@x.org", "");
     h.send(&reporter, &format!("REPORT {mailbox} {wrong}"))
@@ -1149,21 +1174,31 @@ async fn reports_of_blob_posts() {
     let lines = reporter.lines();
     assert!(lines[0].starts_with("OK id="), "{lines:?}");
     let id = value(&lines[0], "id");
-    let kept = |h: &Harness| -> i64 {
-        h.store
-            .raw()
-            .query_row(
-                "SELECT count(*) FROM blob_keeps WHERE hash = ?",
-                [&blob.hash()[..]],
-                |r| r.get(0),
-            )
-            .unwrap()
-    };
-    assert_eq!(kept(&h), 1);
+    assert_eq!(blob_kept(&h, &hash), 1);
     let mut op = h.signed_in_as("op@example.org");
     h.send(&op, &format!("RESOLVE {id}")).await;
     assert_eq!(op.lines().last().unwrap(), "OK");
-    assert_eq!(kept(&h), 0);
+    assert_eq!(blob_kept(&h, &hash), 0);
+}
+
+/// A report whose blobs would take what is kept for reports past
+/// `max_reported_bytes` is still made, and answered `OK`; its blobs are
+/// kept only until they expire (5.8, 7.5, PLAN item 66).
+#[tokio::test]
+async fn a_report_past_the_bound_is_still_made() {
+    let mut config = report_config(30);
+    config.limits.max_reported_bytes = 1000;
+    let mut h = Harness::with(config, timers());
+    let mailbox = add_mailbox(&h, 1);
+    let key = [4; 32];
+    let content: &[u8] = b"TEXT big\n";
+    let hash = add_blob_post(&h, &mailbox, &key, content);
+    let mut reporter = h.anon().await;
+    let ok = report_b64((1, key, content), &[], "b@x.org", "");
+    h.send(&reporter, &format!("REPORT {mailbox} {ok}")).await;
+    let lines = reporter.lines();
+    assert!(lines[0].starts_with("OK id="), "{lines:?}");
+    assert_eq!(blob_kept(&h, &hash), 0, "not kept past its retention");
 }
 
 /// Pushes to one host count together, whatever their paths and however
