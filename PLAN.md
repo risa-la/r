@@ -2749,6 +2749,38 @@ Open:
     *The spec.*
     - **Appendix D.5 gets entries** for items 66 to 68 *(recommended)*.
 
+69. **Points raised by item 68's work**, settled on 2026-11-11. The user
+    decided the first; the rest are *(decided by Claude)*, as the user
+    asked for small points.
+    - **A public room's resync or rejoin commit too large for a line goes
+      as a blob on the signed-in connection.** Public-room commits
+      already go there (item 64), where the poster is known, so storing
+      a blob there links nothing new. Without it, a large public room
+      whose server took a commit no client can apply could never
+      recover: no resync commit fits a line (up to 39 MB), and joins by
+      proposal wait for a client that applied the bad commit. This is
+      the one exception to item 66's rule that external commits carry
+      no blob: 5.2's token `-` rule holds on anonymous and guest
+      connections, and in public rooms a signed-in connection may name
+      blobs it stored with BLOB.
+    - **A Welcome into a group the device left for good, from another
+      member, is held as an invitation** that the user accepts or
+      declines; it is never joined on its own. From the Welcome alone, an
+      invitation and another member's replacement of the device's stale
+      leaf look the same, and the user left that group.
+    - **Own devices wait a random time of up to 10 minutes before acting
+      on LEAVE**, as on RESYNC, so that they seldom race (12.9). The code
+      follows the spec.
+    - **A lost device whose posts all expired up to the head names the
+      head in RESYNC**, not the head plus one, as item 68 says.
+    - **Devices tell their users when a public room cannot be resynced**:
+      when no proposal of theirs is committed within 30 minutes after a
+      failed resync, as the spec says.
+    - **`joining` is a fifth state** in the conversation list, for a
+      public room being joined or rejoined.
+    - **A server that withholds posts keeps past epochs' secrets on
+      devices longer**, until they catch up; accepted, as 14 says.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
