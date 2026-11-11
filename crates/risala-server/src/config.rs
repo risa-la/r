@@ -288,6 +288,10 @@ pub struct FilesConfig {
 /// The least [`FilesConfig::max_blob`] may be: 256 MiB (12.12).
 pub const MIN_MAX_BLOB: u64 = 256 * 1024 * 1024;
 
+/// The least `limits.max_room_blob` a server may set (12.12): it holds the
+/// largest resync commit of a public room (12.7).
+pub const MIN_ROOM_BLOB: u64 = 40 * 1024 * 1024;
+
 impl Default for FilesConfig {
     fn default() -> Self {
         FilesConfig {
@@ -551,7 +555,8 @@ pub struct Limits {
     /// A new room's GroupInfo and tree are never blobs, nor is a post with
     /// the token `-` (an external commit or proposal) or its GroupInfo,
     /// except on a signed-in connection to a public room, where a device
-    /// posts its external commits (PLAN items 67 to 69).
+    /// posts its external commits (PLAN items 67 to 69). At least 40 MiB,
+    /// which holds the largest resync commit (12.7, 12.12).
     pub max_room_blob: u64,
     /// The most KEYS PUT one network address may send in an hour (4.7: a
     /// server MUST rate-limit it per network address). 0 means no limit.
@@ -741,7 +746,7 @@ impl Default for Limits {
             post_reserve_bytes: 32 * 1024 * 1024 * 1024,
             max_reported_bytes: 16 * 1024 * 1024 * 1024,
             blob_memory: 1024 * 1024 * 1024,
-            max_room_blob: 16 * 1024 * 1024,
+            max_room_blob: 64 * 1024 * 1024,
             keys_puts_per_hour: 240,
             log_outside_identities: true,
             outside_identities_per_day: 100,
@@ -983,6 +988,21 @@ impl Config {
                 self.limits.mailbox_quota
             ));
         }
+        if l.max_room_blob < MIN_ROOM_BLOB {
+            warnings.push(format!(
+                "limits.max_room_blob is {}; a large public room's resync commit, up to \
+                 {MIN_ROOM_BLOB} bytes, would then be refused, and the room could not recover \
+                 (12.7, 12.12)",
+                l.max_room_blob
+            ));
+        }
+        if l.blob_memory < l.max_room_blob {
+            warnings.push(format!(
+                "limits.blob_memory is {}, less than limits.max_room_blob ({}): a public room's \
+                 commits that large could never be read (12.12)",
+                l.blob_memory, l.max_room_blob
+            ));
+        }
         if self.server.retention < 30 {
             warnings.push(format!(
                 "server.retention is {} days; the spec recommends at least 30 (7.5)",
@@ -1221,6 +1241,22 @@ mod tests {
         let warnings = with(|l| l.sign_in_secs = 10).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("sign_in_secs"), "{warnings:?}");
+
+        // A room blob limit below 12.12's 40 MiB works, but a large room's
+        // resync commit would be refused; and blob memory below it could
+        // never read one.
+        assert_eq!(Config::default().limits.max_room_blob, 64 * 1024 * 1024);
+        let warnings = with(|l| l.max_room_blob = MIN_ROOM_BLOB - 1).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("max_room_blob"), "{warnings:?}");
+        assert!(
+            with(|l| l.max_room_blob = MIN_ROOM_BLOB)
+                .unwrap()
+                .is_empty()
+        );
+        let warnings = with(|l| l.blob_memory = 32 * 1024 * 1024).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("blob_memory"), "{warnings:?}");
 
         // Retention is at least 7 days, and should be at least 30 (7.5).
         let mut c = Config::default();

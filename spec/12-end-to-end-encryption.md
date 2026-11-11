@@ -1210,8 +1210,9 @@ still adds devices of the chain it holds from an earlier read (4.4).
 
 An identity that left a group (6.1) is not added back by these rules.
 In a direct conversation, a participant who left never is: the
-remaining participant's devices leave too, without a commit (6.1), and
-show the conversation as left by the other participant. Talking again
+remaining participant's devices leave too, locally, without committing
+the SelfRemove (6.1), and show the conversation as left by the other
+participant. Talking again
 starts a new direct conversation (5.1). In a private room, coming back
 takes a new invitation (6.1). A participant whose leaves were removed
 for a check, or replaced after a recovery (4.8), did not leave, and is
@@ -2108,7 +2109,10 @@ BLOB <hash> <size> [box=<box> token=<token>]
   be uploaded.
 - A blob larger than the server allows gets `ERR too-long`. A server
   MUST allow blobs of at least 256 MiB, which holds the tree of the
-  largest public room.
+  largest public room. The server reads a public room's commit or
+  proposal, and a commit's GroupInfo, whole to check them (12.6), and
+  MAY allow less for these, but not less than 40 MiB, which holds the
+  largest resync commit (12.7).
 
 ```
 C: BLOB sha384:5d0c9a1e… 2483211 box=ujzdegxdncf32epf3dhodzdoci token=3J0nq8V2yXcY7Hq5uWmZ1aRk0tPpL9eBvC4sD6fG8hE=
