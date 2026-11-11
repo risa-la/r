@@ -196,10 +196,13 @@ resort (12.5).
 
 Devices ignore messages from a leaf that has posted a SelfRemove. In a
 private room, coming back always takes a new invitation. In a direct
-conversation, the other participant's devices leave too, without a
-commit, once they have seen the SelfRemove, and show the conversation
-as left by that participant; talking again starts a new direct
-conversation (5.1, 12.7). Since nobody commits that SelfRemove, the
+conversation, the other participant's devices leave too, once they have
+seen the SelfRemove, and nobody commits it. They leave locally, as in a
+group with no leaf of another identity (above): a device first commits
+the removal of its identity's other leaves, if there are any, so that
+none of them Welcomes it back later. They show the conversation as left
+by that participant; talking again starts a new direct conversation
+(5.1, 12.7). Since nobody commits that SelfRemove, the
 leaving device does not wait for a commit there: once it has posted it,
 it forgets the group, as a device that leaves locally does.
 
