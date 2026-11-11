@@ -220,8 +220,9 @@ enum Command {
     ///
     /// Held is not failed: if the conversation's sending is held (12.7),
     /// as while a new device's key check waits for its key file, the
-    /// message stays queued, `send` says why on standard error, and exits
-    /// 0. It goes out on a later run once the hold ends.
+    /// message stays queued: `send` waits the whole `--wait` in case the
+    /// hold ends, then says why on standard error, and exits 0. It goes
+    /// out on a later run once the hold ends.
     Send {
         /// A conversation's number; a uid, for the direct conversation with
         /// that identity, started if there is none; or #name, for a room.
