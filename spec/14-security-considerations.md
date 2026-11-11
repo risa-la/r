@@ -196,12 +196,15 @@ still do, and the risks it accepts. Appendix D sums it up by adversary.
   - in a public room, its members and their display names, the leaf of
     each light client (12.6), its topic, and who commits or rotates a
     leaf key, whose commits and Updates come from their devices'
-    signed-in connections (12.6), as their credentials already say. Commits carry
-    no pseudonym (7.3), and pseudonyms change every period, so the
-    server does not learn from the posts which are whose. But it sees
-    which members' devices rotate their leaf key each day (12.10), which
-    is roughly who sent the day before, and in a quiet room it can often
-    tie a new pseudonym to the commit made just before its first post;
+    signed-in connections (12.6), as their credentials already say. The
+    blobs of a commit too large for a line, an external one's included,
+    may be stored on the same connection (4.1, 12.12), which ties
+    nothing further to the identity. Commits carry no pseudonym (7.3),
+    and pseudonyms change every period, so the server does not learn
+    from the posts which are whose. But it sees which members' devices
+    rotate their leaf key each day (12.10), which is roughly who sent
+    the day before, and in a quiet room it can often tie a new pseudonym
+    to the commit made just before its first post;
   - that an identity is online whenever it has a signed-in connection.
     Others learn it only if the identity turned presence on, which is
     off by default (8.3);

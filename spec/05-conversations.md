@@ -126,11 +126,16 @@ padding, or a blob-ref. `<hash>` is the SHA-384 hash of the send token
 of the epoch that a commit creates, in base64 with padding (7.2, 12.6).
 
 A POST with the token `-` comes from a device that is not a member
-yet, which cannot store blobs (12.12). So its `<message>` and
-`<groupinfo>` MUST be in the line. A blob-ref in either gets
-`ERR bad-syntax`, and a line too long to hold them gets `ERR too-long`
-(2.3). The server tells this from the line alone, before it reads the
-message.
+yet, which holds no send token to store blobs with (12.12). So its
+`<message>` and `<groupinfo>` MUST be in the line, with one exception:
+a public room's external commit (12.7), which a device posts on its
+signed-in connection (12.6), may name blobs that the device stored with
+BLOB on that connection, without `box` and `token` (12.12), when the
+commit or its GroupInfo is too large for a line. A blob-ref in a POST
+with the token `-` on an anonymous or guest connection, or to a mailbox
+that is not a public room's, gets `ERR bad-syntax`, and a line too long
+to hold them gets `ERR too-long` (2.3). The server tells this from the
+line, the connection and the mailbox, before it reads the message.
 
 The server reads the group id, epoch, content type and authenticated
 data from the message's framing, which MLS leaves in the clear, and

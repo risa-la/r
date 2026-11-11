@@ -56,9 +56,11 @@ as long as nothing sent on it names the device. So:
 - A device MUST store the blobs and files that a post or a Welcome
   refers to over an anonymous connection (5.6, 12.12), never over its
   signed-in one, which would tie the post to the identity. The one
-  exception is the blob of a public room's commit that it posts on its
-  signed-in connection (12.6): the commit names its sender anyway, so the
-  device MAY store that blob on the same connection.
+  exception is for the blobs of a public room's commit that it posts on
+  its signed-in connection (12.6): the commit names its sender anyway,
+  so the device MAY store them on the same connection. Those of an
+  external commit (12.7) it stores there, since it holds no send token
+  to store them with elsewhere (12.12).
 - A device SHOULD use a fresh anonymous connection for each CREATE,
   each KEYPKG GET (12.5) and each WELCOME PUT (12.8), and a separate
   anonymous connection for WATCH (8.3), since each says something about

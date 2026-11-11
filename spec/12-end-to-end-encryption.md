@@ -87,8 +87,9 @@ Every conversation uses one MLS cipher suite, `0x0020` [MLS-PQ]:
   encoded as the data of a `ratchet_tree` extension (the
   `optional<Node>` vector of [RFC9420]), in base64 with padding. Each
   of them may instead be a blob-ref, naming a blob that holds the same
-  bytes without base64 (12.12), except in an external commit and a new
-  public room's CREATE, which must fit in their lines.
+  bytes without base64 (12.12), except in a new public room's CREATE,
+  and in a POST with the token `-` on an anonymous or guest connection,
+  which must fit in their lines (5.2).
 
 ### 12.3. Credentials and Leaf Keys
 
@@ -509,7 +510,10 @@ outside the group can, and refuses one that fails:
    posted on the signed-in one, which ties the two connections together.
    That tells the server nothing the commit does not, since the commit
    names its sender. An external commit is posted with the token `-`,
-   and so cannot be a blob, and must fit in a line (5.2, 12.12).
+   and its device holds no send token to store blobs with, so the blobs
+   of one too large for a line are stored on the signed-in connection
+   itself, by BLOB without `box` and `token` (5.2, 12.12), which ties
+   nothing further.
 5. **A commit carries the new GroupInfo,** with the `external_pub`
    extension and no `ratchet_tree` extension, as the option
    `groupinfo=<groupinfo>` of POST. Its group context must be the one
@@ -827,17 +831,16 @@ checks:
   which departs from [RFC9420], and the checks above bound what it may
   remove.
 
-  An external commit cannot be a blob (12.12), so a device uses one
-  only if it fits in a line with its GroupInfo (2.3). Its path is
-  encrypted to every node in the resolution of the joiner's copath,
-  and each takes an HPKE ciphertext of 1,188 bytes, so a line of 1 MiB
-  holds about 620 of them: a tree with many blank nodes there, after
-  many removals, can need far more, up to 39 MB in the largest public
-  room. A device whose external commit would not fit does not post it.
-  Instead, it joins the room again by external proposal (6.1), and an
-  owner or moderator waits for its proposal to be committed. Outside
-  public rooms, a device that cannot follow a group never uses an
-  external commit: it sends RESYNC to its own devices (below).
+  An external commit's path is encrypted to every node in the
+  resolution of the joiner's copath, and each takes an HPKE ciphertext
+  of 1,188 bytes, so a line of 1 MiB (2.3) holds about 620 of them: a
+  tree with many blank nodes there, after many removals, can need far
+  more, up to 39 MB in the largest public room. An external commit or
+  its GroupInfo too large for a line goes as a blob (12.12), which the
+  device stores on the signed-in connection that it posts the commit on
+  (5.2, 12.6), since it holds no send token to store one with as members
+  do. Outside public rooms, a device that cannot follow a group never
+  uses an external commit: it sends RESYNC to its own devices (below).
 - **Size.** The group stays within the limits of 6.1. A direct
   conversation holds at most 128 leaves, one for each current device of
   its participants, which have at most 64 each (4.4). In a private room,
@@ -1077,11 +1080,9 @@ then in batches:
    commit the devices could not apply, which is the GroupInfo's signer,
    and nothing else: an external commit removes at most one leaf
    (above). The device removes its own earlier leaf in its next commit,
-   as in step 3. A resync commit that would not fit in a line (above)
-   is not posted, and the device joins again as in step 2. Every
-   device's resync commit would be about as large, so the room then goes
-   on only if a full client that could apply the commit commits the join
-   proposals. Devices whose proposals no commit has applied within 30
+   as in step 3. A resync commit too large for a line goes as blobs
+   (above). A device whose resync commit the server refuses joins again
+   as in step 2. Devices whose proposals no commit has applied within 30
    minutes tell their users that the room could not be resynced.
 2. Every other device that cannot follow joins again by external
    proposal, as for a first join (6.1). Full clients commit these
@@ -1117,9 +1118,8 @@ other in its next commit. The server checks the
 role in the conversation extension it holds, and that the commit comes
 from the device that its credential names (12.6). The owner or
 moderator can then commit the waiting proposals, and ban whoever kept
-them out. A rejoin that would not fit in a line (above) is not posted:
-the owner or moderator keeps waiting for its proposal, and its device
-tells the user why.
+them out. A rejoin too large for a line goes as blobs, as any external
+commit (above).
 
 **Rejoining a public room.** For each public room it is in, a device
 keeps the conversation extension of the newest epoch that it applied
@@ -2082,21 +2082,25 @@ BLOB <hash> <size> [box=<box> token=<token>]
   and are checked as for POST (5.2), so that only members of some group
   can store blobs. The blob counts against that mailbox's quota and the
   network address's limits (7.5). On a signed-in connection they are not
-  needed, and the blob counts against the identity's limits. A device
-  stores there only blobs that belong to the account, such as backups
-  and history transfers (12.13), and never one that a post or a Welcome
-  names (4.1).
+  needed, and the blob counts against the identity's limits, whether
+  the server holds it already or not. A device stores there blobs that
+  belong to the account, such as backups and history transfers (12.13),
+  and of those that a post names, only the blobs of a public room's
+  commit, which it posts on that connection (4.1, 12.6).
 - So a device that holds no send token the server can check cannot store
-  a blob for a group: one that makes an external commit (12.7), which is
-  not a member yet, and one that creates a public room (5.2), whose
-  mailbox does not exist yet. An external commit with its GroupInfo, and
-  a new public room's GroupInfo and tree, MUST fit in the line that
-  carries them (2.3). A device makes an external commit only if it fits,
-  and otherwise joins by proposal (12.7). A line that does not fit gets
+  a blob for a group on an anonymous or guest connection: one that makes
+  an external commit (12.7), which is not a member yet, and one that
+  creates a public room (5.2), whose mailbox does not exist yet. An
+  external commit goes on the signed-in connection anyway (12.6), so its
+  device stores there the commit or GroupInfo that is too large for a
+  line, and names them in the POST with the token `-` (5.2). A new
+  public room's GroupInfo and tree MUST fit in the line that carries
+  them (2.3), and so MUST a POST with the token `-` on an anonymous or
+  guest connection, an external proposal. A line that does not fit gets
   `ERR too-long`. The server refuses a blob-ref in their place with
   `ERR bad-syntax`: for `<groupinfo>` or `<tree>` in CREATE, and for
-  `<message>` or `groupinfo` in a POST with the token `-`, which an
-  external commit or an external proposal has (5.2).
+  `<message>` or `groupinfo` in a POST with the token `-`, unless it
+  comes on a signed-in connection to a public room's mailbox (5.2).
 - The client sends the blob in an HTTP PUT request to the `put` URL,
   which works for one upload within 10 minutes. The server MUST reject a
   body whose length differs from `<size>`, or whose SHA-384 hash differs

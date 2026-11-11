@@ -525,3 +525,10 @@ claims that depend on it.
   (7.6) and when to delete a past epoch's secrets, so that every device
   decides alike, across a move too, in place of a day's grace there
   (7.8, 12.9, Section 14).
+- **draft-03, large public rooms recover** (2026-11-11): a public
+  room's resync commit or rejoin too large for a line goes as blobs that
+  the device stores on its signed-in connection, where it posts the
+  commit anyway, in place of joining by proposal, so that a large room
+  whose server took a bad commit can still be resynced; a POST with the
+  token `-` may name blobs only there, in a public room (4.1, 5.2, 6.1,
+  12.6, 12.7, 12.12, Section 14).

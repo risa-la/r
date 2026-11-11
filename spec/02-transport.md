@@ -141,8 +141,9 @@ After the TLS handshake, both sides exchange lines.
   - From a server, a line whose verb is GROUPINFO, KEYPKG, PAIR, POST,
     REPORT or WELCOME may be up to 1 MiB plus 16384 bytes.
   - Anything larger travels as a blob over HTTPS, and the line carries
-    its hash instead (12.12), except an external commit and a new
-    public room's CREATE, which must fit (12.12).
+    its hash instead (12.12), except a new public room's CREATE, and a
+    POST with the token `-` on an anonymous or guest connection, which
+    must fit (5.2, 12.12).
   - The data that makes these lines long always comes after the verb.
     So the start of every line, up to the end of its verb, MUST fit the
     normal limit, tags included. A receiver can then tell from the first

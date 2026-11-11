@@ -72,9 +72,9 @@ Every device joins this way, full client or light client (12.6),
 identity or guest. External commits are used only to resync a room that
 its devices could not follow, and for owners and moderators to get back
 in when nobody commits their proposals (12.7), so that nobody else who
-is not yet a member can force the room's devices to join again. Even
-then, a device uses one only if it fits in a line, and otherwise joins
-by proposal (12.7).
+is not yet a member can force the room's devices to join again. A
+device posts one on its signed-in connection, as blobs if it is too
+large for a line (12.6, 12.12).
 
 A device remembers the group id of each public room it has joined, by
 host and room name. Before it joins a room of the same name again, or
