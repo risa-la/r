@@ -24,7 +24,7 @@ use super::types::{AccountId, ConversationId, Room, Timestamp, Uid};
 use super::{Client, Error, Event, Result};
 use crate::keys::KeyStore;
 use crate::store::Store;
-use crate::store::conversations::{ConvKind, ConvRow, ConvState};
+use crate::store::conversations::{ConvKind, ConvRow, ConvState, Held};
 use crate::sync::conversations::wire::Intent;
 use crate::sync::conversations::{BlobFetch, EngineError, Hooks, Job, JobId, content, group};
 
@@ -245,6 +245,25 @@ pub enum ConversationEvent {
         /// The guest.
         guest: Uid,
     },
+    /// A member invites this device back into a conversation it left for
+    /// good, as a device that could no longer follow it or whose leave
+    /// failed its checks (6.1). It is held, not joined, until the user
+    /// accepts it with [`Client::accept_invitation`] or declines it with
+    /// [`Client::decline_invitation`]: from the Welcome alone it cannot be
+    /// told from that member's replacement of this device's leaf, and the
+    /// user left. [`Client::invitations`] lists those held; one not
+    /// answered within the server's retention period expires, as the
+    /// server's Welcomes do (12.8).
+    Invited {
+        /// The account.
+        account: AccountId,
+        /// The invitation.
+        invitation: i64,
+        /// The conversation it leads back into.
+        conversation: ConversationId,
+        /// Who sent it.
+        by: Uid,
+    },
 }
 
 /// The kind of a conversation (5.1).
@@ -338,6 +357,20 @@ pub struct ConversationSummary {
     /// A direct conversation that the peer left (6.1): the device left it
     /// too, by itself. Talking again starts a new one.
     pub left_by_peer: bool,
+}
+
+/// An invitation held for the user (6.1): see
+/// [`ConversationEvent::Invited`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invitation {
+    /// Its id.
+    pub id: i64,
+    /// The conversation it leads back into.
+    pub conversation: ConversationId,
+    /// Who sent it.
+    pub by: Uid,
+    /// When it arrived.
+    pub received: Option<Timestamp>,
 }
 
 /// A member of a conversation (12.7).
@@ -1130,19 +1163,81 @@ impl Client {
     /// Accepts a guest's report conversation
     /// ([`ConversationEvent::ReportOffered`]), and joins it (12.7).
     pub async fn accept_report(&self, account: AccountId, offer: i64) -> Result<ConversationId> {
+        self.held(account, offer, false)?;
         let exec = self.exec(account)?;
-        exec.with_conversations(|e, cx| e.accept_report(cx, offer))
+        exec.with_conversations(|e, cx| e.accept_held(cx, offer))
             .await
             .map_err(|e| Error::Conversation(ConversationError::Failed(e)))
     }
 
-    /// Declines a guest's report conversation (12.7).
-    pub fn decline_report(&self, offer: i64) -> Result<()> {
-        self.store()
-            .write_with(|tx| {
-                tx.drop_held_welcome(offer)?;
-                Ok::<_, EngineError>(())
+    /// Declines a guest's report conversation (12.7): its Welcome, and the
+    /// KeyPackage it is for, are forgotten.
+    pub fn decline_report(&self, account: AccountId, offer: i64) -> Result<()> {
+        self.forget_held(account, offer, false)
+    }
+
+    /// The invitations held for the user, oldest first (6.1): see
+    /// [`ConversationEvent::Invited`].
+    pub fn invitations(&self, account: AccountId) -> Result<Vec<Invitation>> {
+        Ok(self
+            .store()
+            .held_welcome_rows(account)?
+            .into_iter()
+            .filter_map(|h| match h.held {
+                Held::Invitation { conv, by } => Some(Invitation {
+                    id: h.id,
+                    conversation: conv,
+                    by,
+                    received: Timestamp::from_unix_millis(h.received),
+                }),
+                Held::Report { .. } => None,
             })
+            .collect())
+    }
+
+    /// Accepts an invitation back into a conversation this device left for
+    /// good ([`ConversationEvent::Invited`]), and joins it (6.1).
+    pub async fn accept_invitation(
+        &self,
+        account: AccountId,
+        invitation: i64,
+    ) -> Result<ConversationId> {
+        self.held(account, invitation, true)?;
+        let exec = self.exec(account)?;
+        exec.with_conversations(|e, cx| e.accept_held(cx, invitation))
+            .await
+            .map_err(|e| Error::Conversation(ConversationError::Failed(e)))
+    }
+
+    /// Declines an invitation back into a conversation this device left
+    /// for good (6.1): its Welcome, and the KeyPackage it is for, are
+    /// forgotten. The device's leaf, if the invitation added one, does
+    /// nothing, and is removed once it is stale (12.7).
+    pub fn decline_invitation(&self, account: AccountId, invitation: i64) -> Result<()> {
+        self.forget_held(account, invitation, true)
+    }
+
+    /// A Welcome held for the user: an invitation, or a report offer.
+    fn held(
+        &self,
+        account: AccountId,
+        id: i64,
+        invitation: bool,
+    ) -> Result<crate::store::conversations::HeldWelcome> {
+        self.store()
+            .held_welcome_rows(account)?
+            .into_iter()
+            .find(|h| h.id == id && matches!(h.held, Held::Invitation { .. }) == invitation)
+            .ok_or_else(|| {
+                let what = if invitation { "invitation" } else { "offer" };
+                Error::Conversation(ConversationError::Failed(format!("no such {what}")))
+            })
+    }
+
+    fn forget_held(&self, account: AccountId, id: i64, invitation: bool) -> Result<()> {
+        let held = self.held(account, id, invitation)?;
+        self.store()
+            .write_with(|tx| group::forget_held(tx, &held))
             .map_err(Error::from)?;
         Ok(())
     }

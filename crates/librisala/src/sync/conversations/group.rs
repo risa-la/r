@@ -35,8 +35,8 @@ use super::wire::{Fetched, Intent, Then};
 use super::{Ctx, EngineError, Note};
 use crate::store::Tx;
 use crate::store::conversations::{
-    ConvKind, ConvRow, ConvState, ConversationId, MailboxRow, NewConversation, PostRow, TreeLeaf,
-    is_blocked,
+    ConvKind, ConvRow, ConvState, ConversationId, Held, HeldWelcome, MailboxRow, NewConversation,
+    PostRow, TreeLeaf, is_blocked,
 };
 use crate::store::messages::{MessageLog, NewOutbox, OutboxKind, OutboxRow, OutboxState};
 
@@ -1845,18 +1845,16 @@ fn continues(
     Ok(())
 }
 
-/// Whether a Welcome into `group` comes from a device of the identity
-/// `own` (6.1): its epoch was started by a leaf of `own`, which signed the
-/// Welcome's GroupInfo. A signer that cannot be found counts as one, so
-/// that such a Welcome is refused.
-fn welcomed_by_own(group: &MlsGroup, state: &EpochState, own: &Uid) -> bool {
-    let Some(signer) = state.started_by else {
-        return true;
-    };
+/// The identity that sent a Welcome into `group` (6.1): that of the leaf
+/// that started its epoch, which signed the Welcome's GroupInfo. None if
+/// that leaf cannot be found, which counts as the device's own identity,
+/// so that such a Welcome back into a group it left is refused.
+fn welcomed_by(group: &MlsGroup, state: &EpochState) -> Option<Uid> {
+    let signer = state.started_by?;
     tree_leaves(group)
         .into_iter()
         .find(|l| l.leaf == signer)
-        .is_none_or(|l| l.uid == *own)
+        .map(|l| l.uid)
 }
 
 /// What [`join_welcome`] did.
@@ -1873,14 +1871,16 @@ pub(crate) enum Joined {
 /// its group if it passes the checks of 12.7 and is not refused for a
 /// block (5.7) (12.8).
 ///
-/// A guest's report conversation (12.7) is joined only if the user accepts
-/// it, `accept_report`: until then this fails with [`EngineError::Hold`],
-/// which rolls the transaction back, and the caller holds the Welcome.
+/// A guest's report conversation (12.7), and an invitation back into a
+/// conversation the device left for good (6.1), are joined only once the
+/// user accepts the held Welcome, `accepted`: until then this fails with
+/// [`EngineError::Hold`], which rolls the transaction back, and the caller
+/// holds the Welcome.
 pub(crate) fn join_welcome(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
     sealed: &[u8],
-    accept_report: bool,
+    accepted: bool,
 ) -> Result<Joined> {
     let candidates = tx.key_package_refs(cx.account)?;
     let opened = risala_mls::welcome::open_sealed_welcome(&tx.mls(cx.crypto), sealed, &candidates);
@@ -1920,8 +1920,11 @@ pub(crate) fn join_welcome(
                 "a guest's report conversation this device does not take".into(),
             ));
         }
-        if !accept_report {
-            return Err(EngineError::Hold(guest));
+        if !accepted {
+            return Err(EngineError::Hold {
+                reference,
+                held: Held::Report { guest },
+            });
         }
     }
     // 5.7: a direct conversation with someone blocked, or a room in which
@@ -1938,18 +1941,32 @@ pub(crate) fn join_welcome(
     if let Some(existing) = tx.conversation_by_group(cx.account, group.group_id().as_slice())? {
         // 6.1, 7.5: a group this device left by itself, its leaf perhaps
         // still in it, is left for good: a device of its own identity that
-        // replaced that leaf does not bring it back. An invitation from
-        // another member is accepted, as after any leave. A public room is
-        // joined again only by proposal, which the user asks for.
-        if existing.kind != ConvKind::Public
-            && left_for_good(tx, &existing, cx.uid)?
-            && welcomed_by_own(&group, &joined.state, cx.uid)
-        {
-            mls_group::forget_group(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
-            tx.used_key_package(cx.account, &reference)?;
-            return Ok(Joined::Refused(
-                "a Welcome back into a conversation this device has left".into(),
-            ));
+        // replaced that leaf does not bring it back. A Welcome from another
+        // member is an invitation, held for the user: it cannot be told
+        // from that member's replacement of the stale leaf, and the user
+        // left. A public room is joined again only by proposal, which the
+        // user asks for.
+        if existing.kind != ConvKind::Public && left_for_good(tx, &existing, cx.uid)? {
+            match welcomed_by(&group, &joined.state) {
+                Some(by) if by != *cx.uid => {
+                    if !accepted {
+                        return Err(EngineError::Hold {
+                            reference,
+                            held: Held::Invitation {
+                                conv: existing.id,
+                                by,
+                            },
+                        });
+                    }
+                }
+                _ => {
+                    mls_group::forget_group(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
+                    tx.used_key_package(cx.account, &reference)?;
+                    return Ok(Joined::Refused(
+                        "a Welcome back into a conversation this device has left".into(),
+                    ));
+                }
+            }
         }
         // 12.7: a device whose leaf was replaced from a new KeyPackage
         // (RESYNC, a stale leaf, a refused Welcome) is welcomed into a group
@@ -2057,6 +2074,16 @@ pub(crate) fn join_welcome(
         )?;
     }
     Ok(Joined::Joined { conv })
+}
+
+/// Forgets a held Welcome that the user declined, or that expired (6.1,
+/// 12.8): its KeyPackage's private keys, unless it is of last resort, and
+/// the Welcome. The server deleted it once it was held.
+pub(crate) fn forget_held(tx: &mut Tx<'_>, held: &HeldWelcome) -> Result<()> {
+    risala_mls::keypackage::forget_key_package(&tx.mls_storage(), &held.reference).map_err(mls)?;
+    tx.used_key_package(held.account, &held.reference)?;
+    tx.drop_held_welcome(held.id)?;
+    Ok(())
 }
 
 /// Makes `n` ordinary KeyPackages and, if `last_resort`, one of last

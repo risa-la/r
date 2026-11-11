@@ -202,14 +202,21 @@ CREATE TABLE room_groups (
     PRIMARY KEY (account, room)
 ) WITHOUT ROWID;
 
--- Welcomes to a guest's report conversation (12.7, 5.8), held until the
--- user accepts or declines them: the server's id, the sealed Welcome, and
--- the guest.
+-- Welcomes held until the user accepts or declines them, deleted from
+-- the server once held: kind 'report', to a guest's report conversation
+-- (12.7, 5.8), sender the guest; and kind 'invitation', back into conv, a
+-- conversation the device left for good (6.1), sender the identity whose
+-- leaf signed the Welcome's GroupInfo. ref is the KeyPackageRef the sealed
+-- Welcome is for, whose private keys go when it is declined or expires
+-- (12.8).
 CREATE TABLE held_welcomes (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     account  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    kind     TEXT NOT NULL CHECK (kind IN ('report', 'invitation')),
     welcome  BLOB NOT NULL,
-    guest    TEXT NOT NULL,
+    ref      BLOB NOT NULL,
+    sender   TEXT NOT NULL,
+    conv     INTEGER REFERENCES conversations(id) ON DELETE CASCADE,
     received INTEGER NOT NULL
 );
 
@@ -608,7 +615,26 @@ pub struct JoinRow {
     pub added_seq: Option<u64>,
 }
 
-/// A Welcome to a guest's report conversation, held for the user (12.7).
+/// Why a Welcome is held for the user, and who sent it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// A guest's report conversation (5.8, 12.7).
+    Report {
+        /// The guest who made the conversation.
+        guest: Uid,
+    },
+    /// An invitation back into a conversation this device left for good
+    /// (6.1): from the Welcome alone, it cannot be told from another
+    /// member's replacement of the device's leaf.
+    Invitation {
+        /// The conversation.
+        conv: ConversationId,
+        /// The identity whose leaf signed the Welcome's GroupInfo.
+        by: Uid,
+    },
+}
+
+/// A Welcome held until the user accepts or declines it (6.1, 12.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldWelcome {
     /// Its id.
@@ -617,9 +643,11 @@ pub struct HeldWelcome {
     pub account: AccountId,
     /// The sealed Welcome.
     pub welcome: Vec<u8>,
-    /// The guest who made the conversation.
-    pub guest: Uid,
-    /// When it arrived.
+    /// The KeyPackageRef it is for.
+    pub reference: Vec<u8>,
+    /// Why it is held.
+    pub held: Held,
+    /// When it arrived, by the device's clock.
     pub received: u64,
 }
 
@@ -738,6 +766,16 @@ fn query_all<T, R>(
 /// Reads shared by [`Tx`] and [`Store`].
 pub(crate) mod read {
     use super::*;
+
+    pub fn held_welcomes(
+        conn: &rusqlite::Connection,
+        account: AccountId,
+    ) -> Result<Vec<HeldWelcome>, StoreError> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {HELD_COLUMNS} FROM held_welcomes WHERE account = ?1 ORDER BY id"
+        ))?;
+        stmt.query_map([account.0], held_row)?.map(|r| r?).collect()
+    }
 
     pub fn conversation(
         conn: &rusqlite::Connection,
@@ -1903,13 +1941,14 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Holds a Welcome to a guest's report conversation for the user
-    /// (12.7). Returns its id; the same Welcome is held once.
+    /// Holds a Welcome for the user (6.1, 12.7), for the KeyPackage
+    /// `reference`. Returns its id; the same Welcome is held once.
     pub(crate) fn hold_welcome(
         &mut self,
         account: AccountId,
         welcome: &[u8],
-        guest: &Uid,
+        reference: &[u8],
+        held: &Held,
         now: u64,
     ) -> Result<i64, StoreError> {
         let existing: Option<i64> = self
@@ -1923,9 +1962,22 @@ impl Tx<'_> {
         if let Some(id) = existing {
             return Ok(id);
         }
+        let (kind, sender, conv) = match held {
+            Held::Report { guest } => ("report", guest, None),
+            Held::Invitation { conv, by } => ("invitation", by, Some(conv.0)),
+        };
         self.conn().execute(
-            "INSERT INTO held_welcomes (account, welcome, guest, received) VALUES (?1, ?2, ?3, ?4)",
-            params![account.0, welcome, guest.as_str(), now as i64],
+            "INSERT INTO held_welcomes (account, kind, welcome, ref, sender, conv, received)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                account.0,
+                kind,
+                welcome,
+                reference,
+                sender.as_str(),
+                conv,
+                now as i64
+            ],
         )?;
         Ok(self.conn().last_insert_rowid())
     }
@@ -1934,12 +1986,17 @@ impl Tx<'_> {
     pub(crate) fn held_welcome(&self, id: i64) -> Result<Option<HeldWelcome>, StoreError> {
         self.conn()
             .query_row(
-                "SELECT id, account, welcome, guest, received FROM held_welcomes WHERE id = ?1",
+                &format!("SELECT {HELD_COLUMNS} FROM held_welcomes WHERE id = ?1"),
                 [id],
                 held_row,
             )
             .optional()?
             .transpose()
+    }
+
+    /// The Welcomes held for the user, oldest first.
+    pub(crate) fn held_welcomes(&self, account: AccountId) -> Result<Vec<HeldWelcome>, StoreError> {
+        read::held_welcomes(self.conn(), account)
     }
 
     /// Deletes a held Welcome.
@@ -1974,18 +2031,35 @@ fn join_row(r: &Row<'_>) -> rusqlite::Result<Result<JoinRow, StoreError>> {
     }))
 }
 
+const HELD_COLUMNS: &str = "id, account, kind, welcome, ref, sender, conv, received";
+
 fn held_row(r: &Row<'_>) -> rusqlite::Result<Result<HeldWelcome, StoreError>> {
-    let guest: String = r.get(3)?;
-    let guest = match parse(&guest, "uid") {
-        Ok(g) => g,
+    let kind: String = r.get(2)?;
+    let sender: String = r.get(5)?;
+    let sender: Uid = match parse(&sender, "uid") {
+        Ok(u) => u,
         Err(e) => return Ok(Err(e)),
+    };
+    let conv: Option<i64> = r.get(6)?;
+    let held = match (kind.as_str(), conv) {
+        ("report", _) => Held::Report { guest: sender },
+        ("invitation", Some(conv)) => Held::Invitation {
+            conv: ConversationId(conv),
+            by: sender,
+        },
+        _ => {
+            return Ok(Err(StoreError::Corrupt(format!(
+                "held Welcome kind {kind}"
+            ))));
+        }
     };
     Ok(Ok(HeldWelcome {
         id: r.get(0)?,
         account: AccountId(r.get(1)?),
-        welcome: r.get(2)?,
-        guest,
-        received: r.get::<_, i64>(4)? as u64,
+        welcome: r.get(3)?,
+        reference: r.get(4)?,
+        held,
+        received: r.get::<_, i64>(7)? as u64,
     }))
 }
 
@@ -2036,6 +2110,11 @@ impl Store {
     /// The account's blocks (5.7).
     pub fn block_rows(&self, account: AccountId) -> Result<Vec<String>, StoreError> {
         self.read(|conn| read::blocks(conn, account))
+    }
+
+    /// The Welcomes held for the user, oldest first (6.1, 12.7).
+    pub fn held_welcome_rows(&self, account: AccountId) -> Result<Vec<HeldWelcome>, StoreError> {
+        self.read(|conn| read::held_welcomes(conn, account))
     }
 }
 

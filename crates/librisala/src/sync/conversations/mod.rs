@@ -76,7 +76,9 @@ use crate::client::Event;
 use crate::client::conversations::ConversationEvent;
 use crate::clock::{Clock, SystemClock};
 use crate::conn::{End, Response, SingleUse, Slot};
-use crate::store::conversations::{ConvKind, ConvRow, ConvState, ConversationId, LeafRow, PostRow};
+use crate::store::conversations::{
+    ConvKind, ConvRow, ConvState, ConversationId, Held, LeafRow, PostRow,
+};
 use crate::store::messages::{OutboxKind, OutboxRow, OutboxState};
 use crate::store::{AccountId, AccountKind, Change, StoreError, Tx};
 
@@ -449,10 +451,17 @@ pub(crate) enum EngineError {
     /// No randomness.
     #[error("no randomness")]
     Random,
-    /// A Welcome to a guest's report conversation, to hold until the user
-    /// accepts it (12.7).
-    #[error("a report conversation from {0}, held for the user")]
-    Hold(Uid),
+    /// A Welcome to hold until the user accepts or declines it: to a
+    /// guest's report conversation (12.7), or an invitation back into a
+    /// conversation the device left for good (6.1). The transaction is
+    /// rolled back, so that the KeyPackage's keys stay for the Welcome.
+    #[error("a Welcome held for the user: {held:?}")]
+    Hold {
+        /// The KeyPackageRef the Welcome is for.
+        reference: Vec<u8>,
+        /// Why it is held.
+        held: crate::store::conversations::Held,
+    },
     /// A Welcome for the group of a conversation the device has, that does
     /// not continue it (LR-C1): refused, and the transaction rolled back so
     /// that the old group stays.
@@ -2666,25 +2675,7 @@ impl ConversationEngine {
         });
         let delete = match joined {
             Ok(group::Joined::Joined { conv }) => {
-                out.push(Action::Emit(Event::Conversation(
-                    ConversationEvent::Joined { conversation: conv },
-                )));
-                self.welcomed(cx, &me, conv, out)?;
-                // 12.7, Joining: held until the leaves there are checked.
-                if self.write(cx, &me, out, |tx, _| Ok(tx.sending_held(conv)?))? {
-                    out.push(Action::Emit(Event::Conversation(
-                        ConversationEvent::SendingHeld { conversation: conv },
-                    )));
-                }
-                // 5.1: one direct conversation per pair.
-                let left = self.write(cx, &me, out, |tx, c| group::keep_one_direct(tx, c, conv))?;
-                if let Some(left) = left {
-                    tracing::info!(%left, "left a second direct conversation with the same identity");
-                }
-                let actions = self.write(cx, &me, out, |tx, _| {
-                    Ok(self.hooks.leaves_changed(tx, conv))
-                })?;
-                out.extend(actions);
+                self.after_welcome(cx, &me, conv, out)?;
                 true
             }
             Ok(group::Joined::Refused(why)) => {
@@ -2701,18 +2692,26 @@ impl ConversationEngine {
                 )));
                 true
             }
-            Err(EngineError::Hold(guest)) => {
-                // 12.7: a guest's report conversation waits for the user.
-                let held = self.write(cx, &me, out, |tx, c| {
-                    Ok(tx.hold_welcome(c.account, &sealed, &guest, c.now)?)
+            Err(EngineError::Hold { reference, held }) => {
+                // 12.7: a guest's report conversation waits for the user;
+                // 6.1: so does an invitation back into a conversation the
+                // device left for good.
+                let id = self.write(cx, &me, out, |tx, c| {
+                    Ok(tx.hold_welcome(c.account, &sealed, &reference, &held, c.now)?)
                 })?;
-                out.push(Action::Emit(Event::Conversation(
-                    ConversationEvent::ReportOffered {
+                out.push(Action::Emit(Event::Conversation(match held {
+                    Held::Report { guest } => ConversationEvent::ReportOffered {
                         account: me.account,
-                        offer: held,
+                        offer: id,
                         guest,
                     },
-                )));
+                    Held::Invitation { conv, by } => ConversationEvent::Invited {
+                        account: me.account,
+                        invitation: id,
+                        conversation: conv,
+                        by,
+                    },
+                })));
                 true
             }
             Err(e) => {
@@ -2730,6 +2729,84 @@ impl ConversationEngine {
             );
         }
         Ok(())
+    }
+
+    /// After joining `conv` by a Welcome (12.8), at once or once the user
+    /// accepted it: tells the app, and does what follows a join.
+    fn after_welcome(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        out: &mut Vec<Action>,
+    ) -> Result<(), EngineError> {
+        out.push(Action::Emit(Event::Conversation(
+            ConversationEvent::Joined { conversation: conv },
+        )));
+        self.welcomed(cx, me, conv, out)?;
+        // 12.7, Joining: held until the leaves there are checked.
+        if self.write(cx, me, out, |tx, _| Ok(tx.sending_held(conv)?))? {
+            out.push(Action::Emit(Event::Conversation(
+                ConversationEvent::SendingHeld { conversation: conv },
+            )));
+        }
+        // 5.1: one direct conversation per pair.
+        let left = self.write(cx, me, out, |tx, c| group::keep_one_direct(tx, c, conv))?;
+        if let Some(left) = left {
+            tracing::info!(%left, "left a second direct conversation with the same identity");
+        }
+        let actions = self.write(cx, me, out, |tx, _| Ok(self.hooks.leaves_changed(tx, conv)))?;
+        out.extend(actions);
+        Ok(())
+    }
+
+    /// Joins by a Welcome held for the user, which the user accepted: a
+    /// guest's report conversation (12.7), or an invitation back into a
+    /// conversation this device left for good (6.1). Other invitations
+    /// held for the same conversation are of no more use, and forgotten.
+    pub(crate) fn accept_held(
+        &mut self,
+        cx: &Context,
+        id: i64,
+    ) -> (Result<ConversationId, String>, Vec<Action>) {
+        let mut out = Vec::new();
+        let result = self.accept_held_inner(cx, id, &mut out);
+        if let Err(e) = self.pump(cx, &mut out) {
+            tracing::warn!(error = %e, "the group engine failed to send");
+        }
+        (result, out)
+    }
+
+    fn accept_held_inner(
+        &mut self,
+        cx: &Context,
+        id: i64,
+        out: &mut Vec<Action>,
+    ) -> Result<ConversationId, String> {
+        let me = self.me(cx).map_err(|e| e.to_string())?;
+        let joined = self
+            .write(cx, &me, out, |tx, c| {
+                let Some(held) = tx.held_welcome(id)?.filter(|h| h.account == c.account) else {
+                    return Ok(Err("no such Welcome is held".to_owned()));
+                };
+                let joined = group::join_welcome(tx, c, &held.welcome, true)?;
+                tx.drop_held_welcome(id)?;
+                Ok(match joined {
+                    group::Joined::Joined { conv } => {
+                        for other in tx.held_welcomes(c.account)? {
+                            if matches!(other.held, Held::Invitation { conv: o, .. } if o == conv) {
+                                group::forget_held(tx, &other)?;
+                            }
+                        }
+                        Ok(conv)
+                    }
+                    group::Joined::Refused(why) => Err(why),
+                })
+            })
+            .map_err(|e| e.to_string())??;
+        self.after_welcome(cx, &me, joined, out)
+            .map_err(|e| e.to_string())?;
+        Ok(joined)
     }
 
     fn maybe_self_conversation(

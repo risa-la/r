@@ -5,7 +5,8 @@
 //! - every ten minutes, past epochs' secrets deleted 2 hours after the
 //!   commit that ended each, by the server's time as of a catch-up of their
 //!   mailboxes, and a mailbox followed since before then fetched again to
-//!   catch it up (12.9, LR-H1); outbox rows done or
+//!   catch it up (12.9, LR-H1); Welcomes held for the user that expired
+//!   after the retention period forgotten (6.1, 12.8); outbox rows done or
 //!   lost for a day deleted (LR-M2); DELETEs whose target never came
 //!   forgotten after retention (LR-L3); and the WAL truncated, so that
 //!   what was deleted does not stay in it (LR-M1);
@@ -85,6 +86,15 @@ impl ConversationEngine {
                 let purged = tx.purge_outbox(c.now, DAY_MS)?;
                 if purged > 0 {
                     tracing::debug!(purged, "outbox rows purged");
+                }
+                // 12.8: a Welcome held for the user, an invitation or a
+                // report offer, expires after the retention period, as the
+                // server's do, with its KeyPackage's keys (6.1).
+                for held in tx.held_welcomes(c.account)? {
+                    if c.now >= held.received.saturating_add(c.config.retention_ms) {
+                        tracing::info!(id = held.id, "a held Welcome expired");
+                        group::forget_held(tx, &held)?;
+                    }
                 }
                 // LR-L3: a DELETE whose target has not come within
                 // retention, and a day, never will.

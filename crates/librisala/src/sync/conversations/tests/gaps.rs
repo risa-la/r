@@ -569,19 +569,24 @@ fn a_lost_device_that_leaves_has_its_own_devices_leave_and_nobody_is_welcomed_ba
     );
 }
 
-/// 6.1: a device that left for good still accepts an invitation from
-/// another member, as after any leave.
-#[test]
-fn a_device_that_left_for_good_accepts_an_invitation_from_another_member() {
-    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
-    let (p, l) = phone_lost_and_left(&mut net, laptop, phone, bob, b);
+/// The phone has left Bob's room for good and the laptop has left it too;
+/// Bob invites Alice again. Returns the phone's and the laptop's
+/// conversations, and the id of the invitation the phone holds.
+fn invited_back(
+    net: &mut Net,
+    laptop: usize,
+    phone: usize,
+    bob: usize,
+    b: ConversationId,
+) -> (ConversationId, ConversationId, i64) {
+    let (p, l) = phone_lost_and_left(net, laptop, phone, bob, b);
     let alice = net.devices[phone].uid.clone();
     net.connect(laptop);
     for _ in 0..5 {
         net.advance(60_000);
     }
     assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
-    // Bob invites Alice again: both her devices are back.
+    let seen = net.events(phone).len();
     net.job(
         bob,
         Job::Invite {
@@ -593,8 +598,92 @@ fn a_device_that_left_for_good_accepts_an_invitation_from_another_member() {
     for _ in 0..3 {
         net.advance(60_000);
     }
-    assert_eq!(net.state(phone, p), ConvState::Active);
+    let invitation = net.events(phone)[seen..]
+        .iter()
+        .find_map(|e| match e {
+            Event::Conversation(ConversationEvent::Invited {
+                invitation,
+                conversation,
+                by,
+                ..
+            }) if *conversation == p && by.as_str() == "bob@example.net" => Some(*invitation),
+            _ => None,
+        })
+        .expect("the phone was told of the invitation");
+    (p, l, invitation)
+}
+
+/// The Welcomes device `d` holds for its user.
+fn held(net: &Net, d: usize) -> Vec<crate::store::conversations::HeldWelcome> {
+    net.devices[d]
+        .store
+        .held_welcome_rows(net.devices[d].account)
+        .unwrap()
+}
+
+/// Whether device `d` can still open the held Welcome `held` with its
+/// KeyPackage's private keys, and counts that KeyPackage as unused.
+fn has_key_package(net: &Net, d: usize, held: &crate::store::conversations::HeldWelcome) -> bool {
+    let account = net.devices[d].account;
+    let crypto = Arc::new(risala_mls::RisalaCrypto::new().unwrap());
+    net.write(d, |tx| {
+        let opened = risala_mls::welcome::open_sealed_welcome(
+            &tx.mls(&crypto),
+            &held.welcome,
+            std::slice::from_ref(&held.reference),
+        );
+        let listed = tx
+            .key_package_refs(account)?
+            .iter()
+            .any(|r| *r == held.reference);
+        Ok(opened.is_ok() && listed)
+    })
+}
+
+/// 6.1: a Welcome from another member into a group the device left for
+/// good is an invitation, held for the user and never joined on its own:
+/// it cannot be told from that member's replacement of the device's leaf.
+/// The laptop, which left in the usual way, is back at once, as after any
+/// leave. Accepting the invitation joins.
+#[test]
+fn an_invitation_back_after_leaving_for_good_is_held_until_accepted() {
+    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
+    let (p, l, invitation) = invited_back(&mut net, laptop, phone, bob, b);
+    let alice = net.devices[phone].uid.clone();
     assert_eq!(net.state(laptop, l), ConvState::Active);
+    // Held, not joined.
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert!(net.devices[phone].store.departed(p, &alice).unwrap());
+    let holds = held(&net, phone);
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].id, invitation);
+    assert!(has_key_package(&net, phone, &holds[0]));
+    assert_eq!(
+        net.server
+            .pending_welcomes(&alice, &net.devices[phone].device_id),
+        0,
+        "deleted from the server once held"
+    );
+    net.say(bob, b, "are you there?");
+    assert!(
+        net.texts(phone, p)
+            .iter()
+            .all(|(_, t)| t != "are you there?")
+    );
+    // Accepted, it is joined.
+    let cx = net.cx(phone);
+    let (joined, actions) = net.devices[phone].engine.accept_held(&cx, invitation);
+    net.act(phone, actions);
+    net.run();
+    assert_eq!(joined, Ok(p));
+    assert!(held(&net, phone).is_empty());
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(phone, p), ConvState::Active);
     assert!(!net.devices[phone].store.departed(p, &alice).unwrap());
     assert_eq!(net.leaves(bob, b).len(), 3);
     net.say(bob, b, "welcome back");
@@ -602,6 +691,55 @@ fn a_device_that_left_for_good_accepts_an_invitation_from_another_member() {
         net.texts(phone, p)
             .contains(&("bob@example.net".into(), "welcome back".into()))
     );
+}
+
+/// 6.1, 12.8: a declined invitation is forgotten, with its KeyPackage's
+/// private keys, and the device stays out.
+#[test]
+fn a_declined_invitation_is_forgotten() {
+    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
+    let (p, _, invitation) = invited_back(&mut net, laptop, phone, bob, b);
+    let holds = held(&net, phone);
+    assert_eq!(holds.len(), 1);
+    assert!(has_key_package(&net, phone, &holds[0]));
+    net.write(phone, |tx| {
+        let held = tx.held_welcome(invitation)?.unwrap();
+        group::forget_held(tx, &held)
+    });
+    assert!(held(&net, phone).is_empty());
+    assert!(!has_key_package(&net, phone, &holds[0]));
+    net.say(bob, b, "are you there?");
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert!(
+        net.texts(phone, p)
+            .iter()
+            .all(|(_, t)| t != "are you there?")
+    );
+    // Nothing is left to accept.
+    let cx = net.cx(phone);
+    let (joined, _) = net.devices[phone].engine.accept_held(&cx, invitation);
+    assert!(joined.is_err());
+}
+
+/// 12.8: an invitation the user does not answer expires after the
+/// retention period, as the server's Welcomes do, with its KeyPackage's
+/// keys.
+#[test]
+fn an_invitation_not_answered_expires_after_retention() {
+    let (mut net, laptop, phone, bob, b) = bobs_room_with_own_devices();
+    let (p, _, _) = invited_back(&mut net, laptop, phone, bob, b);
+    let holds = held(&net, phone);
+    let retention = net.devices[phone].engine.config.retention_ms;
+    net.advance(retention - 20 * 60_000);
+    net.advance(10 * 60_000);
+    assert_eq!(held(&net, phone).len(), 1, "not yet");
+    net.advance(20 * 60_000);
+    assert!(held(&net, phone).is_empty());
+    assert!(!has_key_package(&net, phone, &holds[0]));
+    assert_eq!(net.state(phone, p), ConvState::Left);
 }
 
 /// 6.1, 7.5: a device whose SelfRemove waits for a commit, and that finds

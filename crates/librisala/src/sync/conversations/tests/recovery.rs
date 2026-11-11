@@ -350,7 +350,7 @@ fn a_guests_report_conversation_waits_for_an_owner_to_accept_it() {
         })
         .expect("offered");
     let cx = net.cx(alice);
-    let (joined, actions) = net.devices[alice].engine.accept_report(&cx, offer);
+    let (joined, actions) = net.devices[alice].engine.accept_held(&cx, offer);
     net.act(alice, actions);
     net.run();
     let a = joined.expect("accepted");
