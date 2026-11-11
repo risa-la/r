@@ -2089,11 +2089,10 @@ BLOB <hash> <size> [box=<box> token=<token>]
   commit, which it posts on that connection (4.1, 12.6).
 - So a device that holds no send token the server can check cannot store
   a blob for a group on an anonymous or guest connection: one that makes
-  an external commit (12.7), which is not a member yet, and one that
-  creates a public room (5.2), whose mailbox does not exist yet. An
-  external commit goes on the signed-in connection anyway (12.6), so its
-  device stores there the commit or GroupInfo that is too large for a
-  line, and names them in the POST with the token `-` (5.2). A new
+  an external commit (12.7), which is not a member yet. An external
+  commit goes on the signed-in connection anyway (12.6), so its device
+  stores there the commit or GroupInfo that is too large for a line,
+  and names them in the POST with the token `-` (5.2). A new
   public room's GroupInfo and tree MUST fit in the line that carries
   them (2.3), and so MUST a POST with the token `-` on an anonymous or
   guest connection, an external proposal. A line that does not fit gets
