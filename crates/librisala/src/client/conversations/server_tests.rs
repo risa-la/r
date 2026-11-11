@@ -37,6 +37,15 @@ struct World {
 }
 
 async fn server() -> World {
+    server_with(|b| b).await
+}
+
+/// [`server`], with `f` applied to the test server's builder.
+async fn server_with(
+    f: impl FnOnce(
+        risala_server::testing::TestServerBuilder,
+    ) -> risala_server::testing::TestServerBuilder,
+) -> World {
     let dir = tempfile::tempdir().unwrap();
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -60,7 +69,7 @@ async fn server() -> World {
         .unwrap()
         .port();
     let https = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let server = TestServer::builder()
+    let server = f(TestServer::builder())
         .hostname(HOST)
         .key_domains(&["example.org", "example.net"])
         .configure(move |c| {
@@ -91,6 +100,15 @@ struct Device {
 }
 
 fn client(server: &World, keys: Arc<MemoryKeyStore>) -> Client {
+    client_on(server, keys, Arc::new(crate::clock::SystemClock))
+}
+
+/// [`client`], on `clock`.
+fn client_on(
+    server: &World,
+    keys: Arc<MemoryKeyStore>,
+    clock: Arc<dyn crate::clock::Clock>,
+) -> Client {
     // Key files from the test key server; blobs from the server's HTTPS
     // listener.
     let mut options = server.key_server().fetch_options();
@@ -115,6 +133,7 @@ fn client(server: &World, keys: Arc<MemoryKeyStore>) -> Client {
         )),
         // Without key files: the key checks of 12.7 could never pass.
         skip_key_checks: true,
+        clock,
         ..ClientOptions::default()
     };
     let client = Client::open_in_memory(options).unwrap();
@@ -189,10 +208,28 @@ async fn device_knowing_with(
     known: &[&TestIdentity],
     config: Config,
 ) -> Device {
+    device_on(
+        server,
+        who,
+        known,
+        config,
+        Arc::new(crate::clock::SystemClock),
+    )
+    .await
+}
+
+/// [`device_knowing_with`], on `clock`.
+async fn device_on(
+    server: &World,
+    who: &TestIdentity,
+    known: &[&TestIdentity],
+    config: Config,
+    clock: Arc<dyn crate::clock::Clock>,
+) -> Device {
     let uid = who.uid().to_string();
     let keys = Arc::new(MemoryKeyStore::default());
     keys.save(&uid, who.key()).unwrap();
-    let client = client(server, keys);
+    let client = client_on(server, keys, clock);
     let account = client.add_identity_account(HOST, &uid).unwrap().id;
     let signing = risala_mls::mldsa::SigningKey::from_seed(*crate::keys::key_seed(who.key()));
     let device = signing.device_id();
@@ -732,6 +769,115 @@ async fn a_public_room_joined_by_proposal_against_risalad() {
     for d in [&alice, &bob, &sam, &phone] {
         d.client.disconnect(d.account).await.unwrap();
     }
+    server.server.stop().await;
+}
+
+/// The system's clock, moved on by as much as a test asks: a device's
+/// time, which keeps step with a test server's manual clock.
+#[derive(Debug, Default)]
+struct AheadClock(std::sync::atomic::AtomicU64);
+
+impl AheadClock {
+    fn advance(&self, by: Duration) {
+        self.0
+            .fetch_add(by.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl crate::clock::Clock for AheadClock {
+    fn now(&self) -> risala_proto::time::Timestamp {
+        let now = crate::clock::SystemClock.now().unix_millis();
+        let ahead = self.0.load(std::sync::atomic::Ordering::SeqCst);
+        risala_proto::time::Timestamp::from_unix_millis(now + ahead).unwrap()
+    }
+}
+
+/// An owner whose join proposal nobody commits for 30 minutes rejoins by
+/// external commit (12.7). Here the commit and its GroupInfo are too large
+/// for the device's line, so it stores them as blobs on its signed-in
+/// connection, without box and token, and posts the commit there with `-`
+/// naming them: `risalad` reads and checks them, and counts them against
+/// the identity (5.2, 12.6, 12.12, PLAN item 69).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owners_rejoin_too_large_for_a_line_goes_as_blobs_against_risalad() {
+    use crate::clock::Clock as _;
+    let server = server_with(|b| b.manual_clock()).await;
+    server.follow_system_clock();
+    let alice_id = server.identity("alice@example.org");
+    let phone_id = server.key_server().new_device(&alice_id);
+    let alice = device(&server, &alice_id).await;
+    // Signed in once its KeyPackages are up.
+    uploaded(&alice).await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        alice.client.create_public_room(alice.account, "#general"),
+    )
+    .await
+    .expect("in time")
+    .unwrap();
+    // Alice's only full client goes away.
+    alice.client.disconnect(alice.account).await.unwrap();
+
+    // Her phone, whose lines carry at most 4 KiB inline: an external
+    // commit, with its path and GroupInfo, is far larger.
+    let clock = Arc::new(AheadClock::default());
+    let lowered = Config {
+        line_limit: 4096,
+        ..config()
+    };
+    let phone = device_on(&server, &phone_id, &[], lowered, clock.clone()).await;
+    uploaded(&phone).await;
+    let joining = tokio::spawn({
+        let client = phone.client.clone();
+        let account = phone.account;
+        async move { client.join_public_room(account, "#general").await }
+    });
+    until("the phone's join is proposed", || {
+        assert!(!joining.is_finished(), "the join ended early");
+        find(&phone, |c| {
+            c.kind == ConversationKind::PublicRoom && c.state == ConversationState::Joining
+        })
+        .is_some()
+    })
+    .await;
+    // Blobs the server stored for the identity, not for a mailbox.
+    let identity_blobs = || -> i64 {
+        let db = rusqlite::Connection::open_with_flags(
+            server.state_dir().join("risala.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT count(*) FROM blobs WHERE uid = ?1 AND box IS NULL",
+            [alice_id.uid().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(identity_blobs(), 0);
+    // Nobody commits its proposal for 30 minutes, by the server's time and
+    // the phone's.
+    let ahead = Duration::from_secs(31 * 60);
+    server.advance(ahead);
+    clock.advance(ahead);
+    assert!(clock.now() >= server.now());
+    let p = tokio::time::timeout(Duration::from_secs(60), joining)
+        .await
+        .expect("in time")
+        .unwrap()
+        .expect("rejoined");
+    until("the phone is in the room", || {
+        phone.client.conversation(p).unwrap().state == ConversationState::Active
+    })
+    .await;
+    // The commit and its GroupInfo, stored on the signed-in connection.
+    let stored = identity_blobs();
+    assert!(
+        stored >= 2,
+        "{stored} blobs stored on the signed-in connection"
+    );
+
+    phone.client.disconnect(phone.account).await.unwrap();
     server.server.stop().await;
 }
 
