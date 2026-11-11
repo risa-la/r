@@ -207,14 +207,6 @@ pub enum ConversationEvent {
         /// The identity whose key file cannot be read.
         uid: Uid,
     },
-    /// An owner's or moderator's rejoin by external commit would not fit
-    /// in a line (12.7, 12.12), as in a large room's tree with many blank
-    /// nodes: it is not posted, and the device keeps waiting for its join
-    /// proposal to be committed.
-    RejoinTooLarge {
-        /// The conversation.
-        conversation: ConversationId,
-    },
     /// A commit removed leaves for a check whose reason this device could
     /// not see (12.7): the removal stands, and the user is told who made
     /// it.
