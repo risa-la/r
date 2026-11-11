@@ -204,6 +204,12 @@ enum Command {
     /// Public rooms (6.1).
     #[command(subcommand)]
     Public(PublicCommand),
+    /// Invitations back into conversations this device left for good, as
+    /// one it could no longer follow (6.1). They are held, not joined,
+    /// until you accept or decline them, and expire after the server's
+    /// retention period.
+    #[command(subcommand)]
+    Invitation(InvitationCommand),
     /// Set the display name shown in every group (8.2): a commit in each.
     Name { name: String },
     /// Leave a conversation (6.1): a number, a uid or #room.
@@ -321,6 +327,18 @@ enum WitnessCommand {
     },
     /// Forget the saved policy, for the default list (4.10).
     Clear,
+}
+
+#[derive(Subcommand)]
+enum InvitationCommand {
+    /// List the invitations held: id, conversation number, and who sent
+    /// it.
+    List,
+    /// Accept an invitation, by its id, and join. Prints the
+    /// conversation's number.
+    Accept { id: i64 },
+    /// Decline an invitation, by its id: it is forgotten.
+    Decline { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -1352,6 +1370,21 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
             println!("{}", conv);
             ctx.settle(account, Duration::from_secs(1)).await?;
         }
+        Command::Invitation(InvitationCommand::List) => {
+            for i in c.invitations(ctx.account()?).map_err(err)? {
+                println!("{}\t{}\t{}", i.id, i.conversation.get(), shown(&i.by));
+            }
+        }
+        Command::Invitation(InvitationCommand::Accept { id }) => {
+            let account = ctx.account()?;
+            ctx.online(account).await?;
+            let conv = c.accept_invitation(account, id).await.map_err(err)?;
+            println!("{}", conv);
+            ctx.settle(account, Duration::from_secs(1)).await?;
+        }
+        Command::Invitation(InvitationCommand::Decline { id }) => {
+            c.decline_invitation(ctx.account()?, id).map_err(err)?;
+        }
         Command::Name { name } => {
             let account = ctx.account()?;
             ctx.online(account).await?;
@@ -1747,6 +1780,19 @@ mod tests {
     }
 
     /// risala-dev's witness key is the one `risala` warns of.
+    #[test]
+    fn invitations_are_answered_by_id() {
+        for args in [
+            &["risala", "invitation", "list"][..],
+            &["risala", "invitation", "accept", "3"],
+            &["risala", "invitation", "decline", "3"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        assert!(Cli::try_parse_from(["risala", "invitation", "accept", "bob"]).is_err());
+        assert!(Cli::try_parse_from(["risala", "invitation", "decline"]).is_err());
+    }
+
     #[test]
     fn dev_witness_is_risala_devs() {
         assert!(risala_dev::witness_vkey().starts_with(DEV_WITNESS));
