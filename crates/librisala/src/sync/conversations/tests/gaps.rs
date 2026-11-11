@@ -632,10 +632,7 @@ fn has_key_package(net: &Net, d: usize, held: &crate::store::conversations::Held
             &held.welcome,
             std::slice::from_ref(&held.reference),
         );
-        let listed = tx
-            .key_package_refs(account)?
-            .iter()
-            .any(|r| *r == held.reference);
+        let listed = tx.key_package_refs(account)?.contains(&held.reference);
         Ok(opened.is_ok() && listed)
     })
 }
