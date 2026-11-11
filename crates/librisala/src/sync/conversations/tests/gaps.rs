@@ -362,9 +362,31 @@ fn left(net: &Net, d: usize, conv: ConversationId) -> bool {
     })
 }
 
+/// The `RESYNC <box> <seq>` requests device `d` holds from its own
+/// devices, waiting for their random wait (12.9): the box and seq each
+/// named, by conversation.
+fn resyncs_held(net: &Net, d: usize) -> Vec<(ConversationId, BoxName, u64)> {
+    let mut held: Vec<_> = net.devices[d]
+        .engine
+        .own_resyncs
+        .iter()
+        .map(|((conv, _), (mailbox, seq))| (*conv, *mailbox, *seq))
+        .collect();
+    held.sort_by_key(|(c, _, s)| (c.0, *s));
+    held
+}
+
+/// Device `d` waits up to 10 minutes before it replaces a leaf that asked
+/// with RESYNC, as outside tests (12.7).
+fn real_commit_wait(net: &mut Net, d: usize) {
+    net.devices[d].engine.config.max_commit_wait_ms = 10 * 60 * 1000;
+}
+
 /// 7.4, 12.7: a device that finds a gap asks its own devices at once with
 /// `RESYNC <box> <seq>`; the laptop replaces its leaf without waiting for
 /// the leaf to go stale, or for an hour, and the Welcome brings it back.
+/// Every post up to the head expired, so the RESYNC names the head (7.5,
+/// 12.9), which the laptop has applied.
 #[test]
 fn a_lost_device_asks_its_own_devices_and_is_welcomed_back() {
     let (mut net, laptop, phone, bob, a) = own_devices_and_bob();
@@ -372,13 +394,17 @@ fn a_lost_device_asks_its_own_devices_and_is_welcomed_back() {
     let b = net.same_conv(bob, laptop, a).unwrap();
     net.disconnect(phone);
     net.say(bob, b, "while you were away");
+    let mailbox = current_box(&net, laptop, a);
+    let head = net.server.posts(&mailbox).last().unwrap().0;
     expire_all(&mut net, laptop, a);
     let before = net.epoch(laptop, a);
     let started = net.clock.now().unix_millis();
+    real_commit_wait(&mut net, laptop);
     net.connect(phone);
     net.tick();
     assert!(cannot_follow(&net, phone, p));
-    for _ in 0..3 {
+    assert_eq!(resyncs_held(&net, laptop), [(a, mailbox, head)]);
+    for _ in 0..11 {
         net.advance(60_000);
     }
     assert!(
@@ -755,4 +781,92 @@ fn a_resync_naming_a_box_from_before_a_move_finds_the_group() {
         net.texts(phone, p)
             .contains(&("bob@example.net".into(), "welcome back".into()))
     );
+}
+
+/// 7.4, 12.9: a RESYNC that names the first seq found after a gap, a post
+/// the server still keeps. The laptop holds it through a restart.
+#[test]
+fn a_lost_device_names_the_first_post_after_the_gap() {
+    let (mut net, laptop, phone, bob, a) = own_devices_and_bob();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    net.disconnect(phone);
+    net.say(bob, b, "expired");
+    expire_all(&mut net, laptop, a);
+    net.say(bob, b, "kept");
+    let mailbox = current_box(&net, laptop, a);
+    let kept = net.server.posts(&mailbox).last().unwrap().0;
+    real_commit_wait(&mut net, laptop);
+    net.connect(phone);
+    net.tick();
+    assert!(cannot_follow(&net, phone, p));
+    assert_eq!(resyncs_held(&net, laptop), [(a, mailbox, kept)]);
+    // The request outlives a restart of the laptop's app (LR-M4), and is
+    // then answered.
+    let before = net.epoch(laptop, a);
+    net.restart(laptop);
+    assert_eq!(resyncs_held(&net, laptop), [(a, mailbox, kept)]);
+    for _ in 0..11 {
+        net.advance(60_000);
+    }
+    assert!(resyncs_held(&net, laptop).is_empty());
+    assert!(
+        net.epoch(laptop, a) > before,
+        "the laptop replaced the phone's leaf"
+    );
+    assert_eq!(net.state(phone, p), ConvState::Active);
+}
+
+/// 12.9: for a RESYNC in the group's current mailbox, an own device first
+/// applies the posts there up to its seq. One naming a seq past the head
+/// waits until that post is in; one naming the head, as a device whose
+/// posts all expired sends, is acted on at once.
+#[test]
+fn a_resync_waits_for_the_posts_up_to_its_seq() {
+    let (mut net, laptop, phone, bob, a) = own_devices_and_bob();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let me = net
+        .convs(phone)
+        .into_iter()
+        .find(|c| c.kind == ConvKind::WithYourself)
+        .unwrap()
+        .id;
+    let mailbox = current_box(&net, laptop, a);
+    let head = net.server.posts(&mailbox).last().unwrap().0;
+    let before = net.epoch(laptop, a);
+    net.lines(
+        phone,
+        me,
+        vec![ContentLine::Resync {
+            mailbox: Some(mailbox),
+            seq: risala_proto::names::Seq::new(head + 1).unwrap(),
+        }],
+        false,
+    );
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.epoch(laptop, a), before, "seq {} is not in", head + 1);
+    // Bob's message is that post: the laptop applies it, then acts.
+    net.say(bob, b, "hello");
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    let after = net.epoch(laptop, a);
+    assert!(after > before, "the laptop replaced the phone's leaf");
+    // The head itself is applied already.
+    let head = net.server.posts(&mailbox).last().unwrap().0;
+    net.lines(
+        phone,
+        me,
+        vec![ContentLine::Resync {
+            mailbox: Some(mailbox),
+            seq: risala_proto::names::Seq::new(head).unwrap(),
+        }],
+        false,
+    );
+    for _ in 0..3 {
+        net.advance(60_000);
+    }
+    assert!(net.epoch(laptop, a) > after, "replaced again");
 }

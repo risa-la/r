@@ -531,9 +531,11 @@ pub(crate) enum Note {
     /// A leaf asked to be replaced (12.7).
     Resync { conv: ConversationId, leaf: u32 },
     /// Another device of this identity asked to be replaced in a group
-    /// (12.7, `RESYNC <box> <seq>`).
+    /// (12.7, `RESYNC <box> <seq>`), naming `mailbox`, which may be one the
+    /// group had before a move.
     OwnResync {
         conv: ConversationId,
+        mailbox: BoxName,
         seq: u64,
         device: Option<[u8; 48]>,
     },
@@ -787,6 +789,10 @@ pub struct ConversationEngine {
     proposal_timers: HashMap<ConversationId, u64>,
     /// When to replace leaves that asked with RESYNC (12.7).
     resync_timers: HashMap<(ConversationId, u32), u64>,
+    /// For leaves of the own identity that asked with `RESYNC <box> <seq>`
+    /// (12.9): the box and seq named. In the group's current mailbox the
+    /// device first applies the posts there up to that seq.
+    own_resyncs: HashMap<(ConversationId, u32), (BoxName, u64)>,
     /// Commits this device could not process, per conversation: the epoch
     /// it holds and the commit's seq (12.7).
     unprocessable: HashMap<ConversationId, (u64, u64)>,
@@ -890,6 +896,7 @@ impl ConversationEngine {
             next_job: 1,
             proposal_timers: HashMap::new(),
             resync_timers: HashMap::new(),
+            own_resyncs: HashMap::new(),
             unprocessable: HashMap::new(),
             resynced: HashSet::new(),
             resync_since: HashMap::new(),
@@ -1812,11 +1819,16 @@ impl ConversationEngine {
                     let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
                     self.resync_timers.entry((conv, leaf)).or_insert(now + wait);
                 }
-                Note::OwnResync { conv, seq, device } => {
+                Note::OwnResync {
+                    conv,
+                    mailbox,
+                    seq,
+                    device,
+                } => {
                     // 12.7: another device of this identity cannot follow
-                    // the group of `conv` since the commit at `seq`:
-                    // replace its leaf there, after a random wait.
-                    let _ = seq;
+                    // the group of `conv` since `seq`: replace its leaf
+                    // there, after a random wait, and once this device has
+                    // applied the posts up to `seq` (12.9).
                     let leaf = device.and_then(|device| {
                         self.write(cx, me, out, |tx, c| {
                             Ok(crate::store::conversations::read::leaves(tx.conn(), conv)?
@@ -1830,6 +1842,7 @@ impl ConversationEngine {
                     if let Some(leaf) = leaf {
                         let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
                         self.resync_timers.entry((conv, leaf)).or_insert(now + wait);
+                        self.own_resyncs.insert((conv, leaf), (mailbox, seq));
                     }
                 }
                 Note::JoinCheck { conv } => {
@@ -2137,13 +2150,17 @@ impl ConversationEngine {
                         None => None,
                     })
                 })?;
-                let expired_to = match first_after_l {
-                    Some(f) if f > l + 1 => Some(f - 1),
-                    None if !more => head.filter(|h| *h > l),
+                // The posts up to `to` expired, and `found` is the first
+                // seq the device found after them, or the head if every
+                // post up to it expired: the seq that RESYNC names (7.5,
+                // 12.9).
+                let expired = match first_after_l {
+                    Some(f) if f > l + 1 => Some((f - 1, f)),
+                    None if !more => head.filter(|h| *h > l).map(|h| (h, h)),
                     _ => None,
                 };
                 let mut lost = None;
-                if let Some(to) = expired_to {
+                if let Some((to, found)) = expired {
                     let (asked, conv) = self.write(cx, &me, out, |tx, c| {
                         let mut asked = Vec::new();
                         let mut lost = None;
@@ -2159,7 +2176,7 @@ impl ConversationEngine {
                             // nor in a mailbox the group moved away from,
                             // whose commits it has all applied (7.8).
                             if !joined && mb.current && tx.conversation(mb.conv)?.state.in_group() {
-                                let gap = recovery::cannot_follow(tx, c, mb.conv, to + 1)?;
+                                let gap = recovery::cannot_follow(tx, c, mb.conv, found)?;
                                 lost = Some((mb.conv, gap));
                             }
                             tx.set_sync(mb.conv, &mailbox, to, None)?;
@@ -3261,7 +3278,11 @@ impl ConversationEngine {
             .map(|(k, _)| *k)
             .collect();
         for (conv, leaf) in due {
+            if !self.resync_applied(cx, me, conv, leaf, out) {
+                continue;
+            }
             self.resync_timers.remove(&(conv, leaf));
+            self.own_resyncs.remove(&(conv, leaf));
             if me.guest || !self.replacing.insert((conv, leaf)) {
                 continue;
             }

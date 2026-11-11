@@ -398,6 +398,7 @@ fn self_line(
             if let Some(conv) = tx.conversation_by_box(cx.account, mailbox)? {
                 applied.notes.push(Note::OwnResync {
                     conv,
+                    mailbox: *mailbox,
                     seq: seq.get(),
                     device: leaf.device_id,
                 });

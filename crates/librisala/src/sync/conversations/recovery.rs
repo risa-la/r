@@ -91,8 +91,9 @@ pub(super) enum Gap {
 /// as when it is removed. Until it is back it applies and posts nothing
 /// there, and follows none of its mailboxes: in a public room it joins
 /// again (6.1); in other conversations it asks its identity's other
-/// devices at once with `RESYNC <box> <seq>`, `seq` the first after the
-/// gap, and they replace its leaf without waiting for it to go stale; or
+/// devices at once with `RESYNC <box> <seq>`, `seq` the first it found
+/// after the gap, or the head if every post up to it expired, and they
+/// replace its leaf without waiting for it to go stale; or
 /// other members do after 35 days. A Welcome brings it back, as for a new
 /// device (7.5, 12.7).
 ///
@@ -133,8 +134,9 @@ pub(super) fn cannot_follow(
 
 /// Asks the identity's other devices to replace this device's leaf in
 /// `conv`'s group (12.7): `RESYNC <box> <seq>` in the conversation with
-/// yourself, `seq` the post since which this device cannot follow the
-/// group. Nothing if the device is in no conversation with itself.
+/// yourself, `seq` the commit this device could not process, or the first
+/// seq it found after a gap, or the head if every post up to it expired
+/// (7.5, 12.9). Nothing if the device is in no conversation with itself.
 fn ask_own_devices(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
@@ -421,6 +423,37 @@ impl ConversationEngine {
             out.extend(actions);
         }
         Ok(())
+    }
+
+    /// Whether this device has applied what it must before it replaces a
+    /// leaf of its own identity that asked with `RESYNC <box> <seq>`
+    /// (12.9): in the group's current mailbox, every post up to that seq,
+    /// which is the head itself when the asking device found every post up
+    /// to the head expired. In a mailbox the group has moved away from, it
+    /// has applied every post that counts, and acts at once. Always for a
+    /// RESYNC in the group, and once the device is no longer in the group,
+    /// where [`Self::answers_resync`] says no.
+    pub(super) fn resync_applied(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        leaf: u32,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        let Some((mailbox, seq)) = self.own_resyncs.get(&(conv, leaf)).copied() else {
+            return true;
+        };
+        self.write(cx, me, out, |tx, c| {
+            if !tx.conversation(conv)?.state.in_group() {
+                return Ok(true);
+            }
+            Ok(match tx.mailbox(c.account, &mailbox)? {
+                Some(mb) if mb.conv == conv && mb.current => mb.sync_point >= seq,
+                _ => true,
+            })
+        })
+        .unwrap_or(true)
     }
 
     /// Whether this device replaces a leaf that asked with RESYNC (12.7):

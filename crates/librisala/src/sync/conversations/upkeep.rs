@@ -13,7 +13,8 @@
 //!   from the groups and the cache (LR-M4): pending proposals to commit
 //!   (6.1), leaves that asked with RESYNC to replace (12.7), and, from the
 //!   `engine_timers` table, the RESYNC escalation, the commits this device
-//!   could not process, and the 7.8 move fallback.
+//!   could not process, the RESYNCs of the own identity's devices (12.9),
+//!   and the 7.8 move fallback.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -186,6 +187,21 @@ impl ConversationEngine {
                 self.resynced.insert(ConversationId(c as i64));
             }
         }
+        for e in pairs("own_resync") {
+            if let (Some(c), Some(leaf), Some(at), Some(mailbox), Some(seq)) = (
+                num(&e, 0),
+                num(&e, 1).and_then(|l| u32::try_from(l).ok()),
+                num(&e, 2),
+                e.get(3)
+                    .and_then(Value::as_str)
+                    .and_then(|b| b.parse::<BoxName>().ok()),
+                num(&e, 4),
+            ) {
+                let key = (ConversationId(c as i64), leaf);
+                self.resync_timers.entry(key).or_insert(at);
+                self.own_resyncs.entry(key).or_insert((mailbox, seq));
+            }
+        }
         for e in pairs("move") {
             if let (Some(c), Some(at), Some(mailbox)) = (
                 num(&e, 0),
@@ -225,10 +241,24 @@ impl ConversationEngine {
             .into_iter()
             .map(|(c, (at, b))| json!([c, at, b]))
             .collect();
+        // 12.9: a RESYNC from an own device, read once from the
+        // conversation with yourself.
+        let own_resyncs: Vec<Value> = self
+            .own_resyncs
+            .iter()
+            .filter_map(|((c, leaf), (b, seq))| {
+                let at = self.resync_timers.get(&(*c, *leaf))?;
+                Some(((c.0, *leaf), (*at, b.to_string(), *seq)))
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|((c, leaf), (at, b, seq))| json!([c, leaf, at, b, seq]))
+            .collect();
         let timers = json!({
             "unprocessable": sorted(&self.unprocessable),
             "resync_since": sorted(&self.resync_since),
             "resynced": resynced.into_iter().map(|c| json!([c])).collect::<Vec<_>>(),
+            "own_resync": own_resyncs,
             "move": moves,
         })
         .to_string();
