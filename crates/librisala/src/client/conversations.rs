@@ -20,7 +20,7 @@ use risala_mls::conversation::{
 use risala_proto::content::ContentLine;
 use risala_proto::types::Role;
 
-use super::types::{AccountId, ConversationId, Room, Timestamp, Uid};
+use super::types::{AccountId, ConversationId, DeviceId, Room, Timestamp, Uid};
 use super::{Client, Error, Event, Result};
 use crate::keys::KeyStore;
 use crate::store::Store;
@@ -106,6 +106,19 @@ pub enum ConversationEvent {
     Left {
         /// The conversation.
         conversation: ConversationId,
+    },
+    /// The identity left the conversation from another of its devices
+    /// (6.1, 12.9): that device left it locally, without removing the
+    /// identity's other leaves, and asked its own devices with `LEAVE
+    /// <box>` to leave it for the identity. This device acts on it: it
+    /// leaves the conversation too, as the user had left it here, and
+    /// [`Left`](Self::Left) follows once it has.
+    LeftFromOwnDevice {
+        /// The conversation.
+        conversation: ConversationId,
+        /// The device the identity left it from, as its confirmed leaf
+        /// named it.
+        device: Option<DeviceId>,
     },
     /// An operator dropped the conversation's mailbox (6.1, 10.4).
     Dropped {

@@ -7,6 +7,7 @@ use risala_mls::framing::ContentType;
 use risala_mls::openmls::group::MlsGroup;
 use risala_mls::openmls::prelude::GroupId;
 
+use crate::client::types::DeviceId;
 use crate::store::keychecks::{CheckKind, KeyCheckRow};
 
 use super::*;
@@ -646,6 +647,21 @@ fn a_leave_that_names_a_box_from_before_a_move_finds_the_group() {
     assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
 }
 
+/// What device `d` told its user of `conv` being left from another device
+/// of the identity (6.1, 12.9): the device named, for each time.
+fn told_left_from(net: &Net, d: usize, conv: ConversationId) -> Vec<Option<DeviceId>> {
+    net.events(d)
+        .iter()
+        .filter_map(|e| match e {
+            Event::Conversation(ConversationEvent::LeftFromOwnDevice {
+                conversation,
+                device,
+            }) if *conversation == conv => Some(*device),
+            _ => None,
+        })
+        .collect()
+}
+
 /// 6.1, 12.9: own devices wait a random time of up to 10 minutes before
 /// they act on LEAVE, as on RESYNC, so that they seldom race. The first to
 /// act leaves for the identity, and its leave commit removes the others'
@@ -686,26 +702,28 @@ fn own_devices_wait_before_acting_on_leave() {
     let asked = net.clock.now().unix_millis();
     net.lines(phone, pm, vec![ContentLine::Leave { mailbox }], false);
     for (d, conv) in [(laptop, a), (tablet, t)] {
-        let at = net.devices[d].engine.leave_timers[&conv];
+        let (at, _) = net.devices[d].engine.leave_timers[&conv];
         assert!(at <= asked + 10 * MINUTE, "a wait of up to 10 minutes");
         assert_eq!(net.state(d, conv), ConvState::Active, "not at once");
     }
     // The draws, made known: the laptop's wait ends first.
+    let phone_device: [u8; 48] = net.devices[phone].device_id.clone().try_into().unwrap();
     net.devices[laptop]
         .engine
         .leave_timers
-        .insert(a, asked + 3 * MINUTE);
+        .insert(a, (asked + 3 * MINUTE, Some(phone_device)));
     net.devices[tablet]
         .engine
         .leave_timers
-        .insert(t, asked + 8 * MINUTE);
+        .insert(t, (asked + 8 * MINUTE, Some(phone_device)));
     net.advance(2 * MINUTE);
     assert_eq!(net.state(laptop, a), ConvState::Active);
+    assert!(told_left_from(&net, laptop, a).is_empty(), "not yet");
     net.restart(tablet);
     assert_eq!(
         net.devices[tablet].engine.leave_timers.get(&t),
-        Some(&(asked + 8 * MINUTE)),
-        "kept through a restart"
+        Some(&(asked + 8 * MINUTE, Some(phone_device))),
+        "kept through a restart, with the device that asked"
     );
     for _ in 0..10 {
         net.advance(MINUTE);
@@ -717,6 +735,13 @@ fn own_devices_wait_before_acting_on_leave() {
     assert_eq!(net.state(tablet, t), ConvState::Left);
     assert!(net.devices[tablet].engine.leave_timers.is_empty());
     assert_eq!(queued_commits(&net, tablet, t), 0);
+    // The laptop, which acted, told its user that the identity left from
+    // the phone; the tablet, which did not, told nothing of the kind.
+    assert_eq!(
+        told_left_from(&net, laptop, a),
+        [Some(DeviceId(phone_device))]
+    );
+    assert!(told_left_from(&net, tablet, t).is_empty());
     assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
     assert!(
         net.devices[bob]
@@ -724,4 +749,68 @@ fn own_devices_wait_before_acting_on_leave() {
             .departed(b, &uid("alice@example.org"))
             .unwrap()
     );
+}
+
+/// 12.9: a device that is already leaving the group when its wait on a
+/// LEAVE ends goes on as it was: it makes no second leave, and does not
+/// tell its user that the identity left from the device that asked, since
+/// the user is leaving here already.
+#[test]
+fn a_device_already_leaving_goes_on_as_it_was_on_leave() {
+    let mut net = Net::new();
+    let laptop = net.device("alice", "alice@example.org");
+    let phone = net.device_of("alice-phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, phone, bob] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    let pm = net.same_conv(phone, laptop, me).expect("the phone is in");
+    let a = net
+        .job(
+            laptop,
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec![uid("bob@example.net")],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    assert_eq!(net.leaves(bob, b).len(), 3);
+    net.devices[laptop].engine.config.max_commit_wait_ms = 10 * MINUTE;
+    // The phone asks; the laptop will act 5 minutes on.
+    let mailbox = net.devices[phone].store.mailbox_rows(p).unwrap()[0].mailbox;
+    let asked = net.clock.now().unix_millis();
+    net.lines(phone, pm, vec![ContentLine::Leave { mailbox }], false);
+    let phone_device: [u8; 48] = net.devices[phone].device_id.clone().try_into().unwrap();
+    net.devices[laptop]
+        .engine
+        .leave_timers
+        .insert(a, (asked + 5 * MINUTE, Some(phone_device)));
+    // Meanwhile the user leaves on the laptop. Bob is away, so nobody
+    // commits its SelfRemove, and it is still leaving when the wait ends.
+    net.disconnect(bob);
+    assert!(!leave(&mut net, laptop, a));
+    for _ in 0..3 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.state(laptop, a), ConvState::Leaving);
+    let proposals = posts(&net, laptop, a, ContentType::Proposal);
+    for _ in 0..5 {
+        net.advance(MINUTE);
+    }
+    assert!(net.devices[laptop].engine.leave_timers.is_empty());
+    assert_eq!(net.state(laptop, a), ConvState::Leaving);
+    assert_eq!(queued_commits(&net, laptop, a), 0, "no second leave");
+    assert_eq!(posts(&net, laptop, a, ContentType::Proposal), proposals);
+    assert!(told_left_from(&net, laptop, a).is_empty());
+    // Bob comes back and commits the SelfRemove: the identity has left.
+    net.connect(bob);
+    for _ in 0..15 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.state(laptop, a), ConvState::Left);
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
 }

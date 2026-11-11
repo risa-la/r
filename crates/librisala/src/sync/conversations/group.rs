@@ -1592,6 +1592,26 @@ pub(crate) fn leave(tx: &mut Tx<'_>, conv: ConversationId, own: &Uid, now: u64) 
     Ok(false)
 }
 
+/// Leaves `conv` for the identity, as another device of it asked with
+/// `LEAVE <box>` (6.1, 12.9), as [`leave`] does. Nothing if this device is
+/// no longer there, as when a leave by another device of the identity
+/// removed its leaf first, nor if it is leaving already, which goes on as
+/// it was. Returns `None` if it did not act, and otherwise whether it has
+/// left already.
+pub(crate) fn leave_for_identity(
+    tx: &mut Tx<'_>,
+    conv: ConversationId,
+    own: &Uid,
+    now: u64,
+) -> Result<Option<bool>> {
+    let state = tx.conversation(conv)?.state;
+    let there = state.in_group() || matches!(state, ConvState::Lost | ConvState::Joining);
+    if !there || leaving(tx, conv)? {
+        return Ok(None);
+    }
+    leave(tx, conv, own, now).map(Some)
+}
+
 /// 5.1: devices keep one direct conversation per pair of identities. If
 /// `conv` is a second one, the one whose group id is lower stays, and this
 /// device leaves the other. Returns the one it leaves, if any.

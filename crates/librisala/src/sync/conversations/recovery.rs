@@ -17,6 +17,7 @@ use super::{
 };
 use crate::client::Event;
 use crate::client::conversations::ConversationEvent;
+use crate::client::types::DeviceId;
 use crate::store::Tx;
 use crate::store::conversations::{ConvKind, ConvRow, ConvState, ConversationId};
 use crate::store::messages::{OutboxKind, OutboxState};
@@ -326,21 +327,34 @@ impl ConversationEngine {
 
         // 6.1, 12.9: leave a group that another device of the identity
         // left locally, unless a leave by another of them has removed this
-        // device's leaf first. One already leaving goes on as it was.
-        let due: Vec<ConversationId> = self
+        // device's leaf first, and tell the user that the identity left it
+        // from that device. One already leaving goes on as it was.
+        let due: Vec<(ConversationId, Option<[u8; 48]>)> = self
             .leave_timers
             .iter()
-            .filter(|(_, at)| **at <= now)
-            .map(|(c, _)| *c)
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(c, (_, device))| (*c, *device))
             .collect();
-        for conv in due {
+        for (conv, device) in due {
             self.leave_timers.remove(&conv);
-            let left = self.write(cx, me, out, |tx, c| group::leave(tx, conv, c.uid, c.now));
-            match left {
-                Ok(true) => out.push(Action::Emit(Event::Conversation(ConversationEvent::Left {
-                    conversation: conv,
-                }))),
-                Ok(false) => {}
+            let acted = self.write(cx, me, out, |tx, c| {
+                group::leave_for_identity(tx, conv, c.uid, c.now)
+            });
+            match acted {
+                Ok(Some(left)) => {
+                    out.push(Action::Emit(Event::Conversation(
+                        ConversationEvent::LeftFromOwnDevice {
+                            conversation: conv,
+                            device: device.map(DeviceId),
+                        },
+                    )));
+                    if left {
+                        out.push(Action::Emit(Event::Conversation(ConversationEvent::Left {
+                            conversation: conv,
+                        })));
+                    }
+                }
+                Ok(None) => {}
                 Err(e) => tracing::warn!(%conv, error = %e, "could not leave for the identity"),
             }
         }

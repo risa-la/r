@@ -20,6 +20,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use risala_proto::names::BoxName;
 use serde_json::{Value, json};
 
@@ -227,9 +229,15 @@ impl ConversationEngine {
         }
         for e in pairs("leave") {
             if let (Some(c), Some(at)) = (num(&e, 0), num(&e, 1)) {
+                // The device that asked, if known, to tell the user (6.1).
+                let device = e
+                    .get(2)
+                    .and_then(Value::as_str)
+                    .and_then(|d| BASE64.decode(d).ok())
+                    .and_then(|d| <[u8; 48]>::try_from(d).ok());
                 self.leave_timers
                     .entry(ConversationId(c as i64))
-                    .or_insert(at);
+                    .or_insert((at, device));
             }
         }
         for e in pairs("move") {
@@ -292,6 +300,15 @@ impl ConversationEngine {
                 .map(|(c, at)| json!([c, at]))
                 .collect()
         };
+        // 6.1, 12.9: a LEAVE from an own device, with that device.
+        let leaves: Vec<Value> = self
+            .leave_timers
+            .iter()
+            .map(|(c, (at, device))| (c.0, (*at, device.map(|d| BASE64.encode(d)))))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .map(|(c, (at, device))| json!([c, at, device]))
+            .collect();
         let mut resyncing: Vec<i64> = self.resyncing.iter().map(|c| c.0).collect();
         resyncing.sort_unstable();
         let timers = json!({
@@ -299,7 +316,7 @@ impl ConversationEngine {
             "resync_since": sorted(&self.resync_since),
             "resynced": resynced.into_iter().map(|c| json!([c])).collect::<Vec<_>>(),
             "own_resync": own_resyncs,
-            "leave": by_conv(&self.leave_timers),
+            "leave": leaves,
             "resyncing": resyncing.into_iter().map(|c| json!([c])).collect::<Vec<_>>(),
             "resync_failed": by_conv(&self.resync_failed),
             "move": moves,

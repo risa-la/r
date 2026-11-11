@@ -545,10 +545,13 @@ pub(crate) enum Note {
         seq: u64,
         device: Option<[u8; 48]>,
     },
-    /// Another device of this identity left the group of `conv` locally,
-    /// and asks this device to leave it for the identity (6.1, `LEAVE
-    /// <box>`): after a random wait (12.9).
-    OwnLeave { conv: ConversationId },
+    /// Another device of this identity, `device`, left the group of `conv`
+    /// locally, and asks this device to leave it for the identity (6.1,
+    /// `LEAVE <box>`): after a random wait (12.9).
+    OwnLeave {
+        conv: ConversationId,
+        device: Option<[u8; 48]>,
+    },
     /// A read marker moved (7.7).
     Read,
     /// A READ's epoch check differs: the server may have split the group
@@ -804,8 +807,9 @@ pub struct ConversationEngine {
     /// device first applies the posts there up to that seq.
     own_resyncs: HashMap<(ConversationId, u32), (BoxName, u64)>,
     /// When to leave groups that another device of the identity asked it
-    /// to leave with `LEAVE <box>` (6.1, 12.9).
-    leave_timers: HashMap<ConversationId, u64>,
+    /// to leave with `LEAVE <box>` (6.1, 12.9), and that device, which the
+    /// user is told the identity left from.
+    leave_timers: HashMap<ConversationId, (u64, Option<[u8; 48]>)>,
     /// Commits this device could not process, per conversation: the epoch
     /// it holds and the commit's seq (12.7).
     unprocessable: HashMap<ConversationId, (u64, u64)>,
@@ -1870,11 +1874,13 @@ impl ConversationEngine {
                         self.own_resyncs.insert((conv, leaf), (mailbox, seq));
                     }
                 }
-                Note::OwnLeave { conv } => {
+                Note::OwnLeave { conv, device } => {
                     // 12.9: after a random wait, as for RESYNC, so that the
                     // identity's devices seldom race.
                     let wait = random_below(self.config.max_commit_wait_ms).unwrap_or(0);
-                    self.leave_timers.entry(conv).or_insert(now + wait);
+                    self.leave_timers
+                        .entry(conv)
+                        .or_insert((now + wait, device));
                 }
                 Note::JoinCheck { conv } => {
                     self.join_checks.insert(conv, now);

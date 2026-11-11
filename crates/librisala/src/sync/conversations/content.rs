@@ -417,7 +417,10 @@ fn self_line(
                 return Ok(());
             }
             tracing::info!(conv = %target, "another device of this identity left the group: leaving it too");
-            applied.notes.push(Note::OwnLeave { conv: target });
+            applied.notes.push(Note::OwnLeave {
+                conv: target,
+                device: leaf.device_id,
+            });
         }
         other => {
             applied.notes.extend(
