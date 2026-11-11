@@ -31,7 +31,7 @@ use librisala::client::confirm::{ConfirmEvent, ConfirmKind};
 use librisala::client::conversations::{ConversationEvent, ConversationKind, ConversationSummary};
 use librisala::client::files::TransferEvent;
 use librisala::client::identity::IdentityEvent;
-use librisala::client::types::ConversationId;
+use librisala::client::types::{ConversationId, DeviceId};
 use librisala::proto::time::Timestamp;
 use librisala::{Client, Event};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -253,6 +253,10 @@ fn conversation(e: &ConversationEvent, conv: &dyn Fn(ConversationId) -> Conv) ->
             removal_unchecked(&conv(*conversation), by.as_ref().map(|u| u.as_str()))
         }
         E::OwnLeafRemoved { conversation } => own_leaf_removed(&conv(*conversation)),
+        E::LeftFromOwnDevice {
+            conversation,
+            device,
+        } => left_from_own_device(&conv(*conversation), device.as_ref()),
         E::WelcomeForKnownGroupRefused {
             conversation,
             reason,
@@ -406,6 +410,17 @@ fn own_leaf_removed(c: &Conv) -> String {
          another, without adding them again; if that wasn't you, that device may be \
          stolen: check your devices with `risala whoami`, and remove one that is not \
          yours with `risala remove-device`"
+    )
+}
+
+fn left_from_own_device(c: &Conv, device: Option<&DeviceId>) -> String {
+    let from = device.map_or_else(
+        || "another device of yours".to_owned(),
+        |d| format!("your device {d}"),
+    );
+    format!(
+        "you left {c} from {from}, so this device leaves it too (6.1, 12.9); if that \
+         wasn't you, check your devices with `risala whoami`"
     )
 }
 
@@ -677,6 +692,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("`risala remove-device`"), "{text}");
+    }
+
+    #[test]
+    fn leaving_from_another_own_device_names_it() {
+        let device = DeviceId([0xab; 48]);
+        assert_eq!(
+            left_from_own_device(&garden(), Some(&device)),
+            "you left conversation 3 (#garden) from your device abababababababab, so this \
+             device leaves it too (6.1, 12.9); if that wasn't you, check your devices with \
+             `risala whoami`"
+        );
+        assert!(
+            left_from_own_device(&garden(), None)
+                .starts_with("you left conversation 3 (#garden) from another device of yours")
+        );
     }
 
     #[test]
