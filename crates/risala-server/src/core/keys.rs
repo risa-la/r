@@ -1247,12 +1247,25 @@ async fn blob(cx: &Cx, hash: BlobRef, size: u64, permit: Option<MailboxPermit>) 
         (None, None) => return Err(err(ErrorCode::BadSyntax)),
     };
     // A blob the server holds lives on from now (12.12). That keeps its
-    // bytes stored for another retention period, so it counts against the
-    // address's window as storing it would (7.5): otherwise anyone could
+    // bytes stored for another retention period, so it counts as storing
+    // it would (7.5): against the address's window, or on a signed-in
+    // connection with no mailbox, the identity's. Otherwise anyone could
     // keep any blob forever for nothing.
     let held = hash;
     if let Some(record) = cx.db(move |store| store.blob(&held)).await? {
-        charge_window(inner, cx.peer.ip(), record.size)?;
+        match (&mailbox, cx.device()) {
+            (None, Some(device)) => inner
+                .keys
+                .identity_bytes
+                .charge(
+                    device.uid.clone(),
+                    record.size,
+                    inner.config.files.identity_bytes_per_day,
+                    now,
+                )
+                .map_err(rate_limited)?,
+            _ => charge_window(inner, cx.peer.ip(), record.size)?,
+        }
         let touched = hash;
         if cx.db(move |store| store.touch_blob(&touched, now)).await? {
             return Ok(OkResponse::new().with_exists());

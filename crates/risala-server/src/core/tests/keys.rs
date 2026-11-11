@@ -1539,6 +1539,46 @@ async fn blobs_kept_alive_count_against_the_address() {
     assert!(anon.lines()[0].ends_with("ERR rate-limited"));
 }
 
+/// On a signed-in connection with no mailbox, a BLOB counts against the
+/// identity's limits (12.12), for a blob the server holds already too,
+/// and not against the address's window: as for a public room's
+/// external commit, whose blobs its device stores there (PLAN item 69).
+#[tokio::test]
+async fn signed_in_blobs_count_against_the_identity() {
+    let mut h = keys_with(|c| {
+        c.limits.address_bytes_per_hour = 25_000;
+        c.files.identity_bytes_per_day = 25_000;
+    });
+    h.mailbox();
+    let mut anon = h.anon().await;
+    let bytes = vec![3; 10_000];
+    let hash = h.store_blob(&mut anon, &bytes).await;
+    // From the same address: the identity's 25,000 bytes, not the
+    // address's 15,000 left.
+    let mut alice = h.signed_in_as("alice@example.org");
+    let held = format!("BLOB {hash} 10000");
+    for _ in 0..2 {
+        h.send(&alice, &held).await;
+        assert_eq!(alice.lines(), ["OK exists=yes"]);
+    }
+    h.send(&alice, &held).await;
+    assert!(alice.lines()[0].ends_with("ERR rate-limited"));
+    // A new blob counts there too.
+    h.send(&alice, &format!("BLOB {} 6000", BlobRef::of(b"new")))
+        .await;
+    assert!(alice.lines()[0].ends_with("ERR rate-limited"));
+    h.send(&alice, &format!("BLOB {} 4000", BlobRef::of(b"new")))
+        .await;
+    assert!(alice.raw_lines()[0].starts_with("OK put="));
+    // The address's window took none of it.
+    h.send(
+        &anon,
+        &format!("BLOB {hash} 10000 box={BOX} token={}", token()),
+    )
+    .await;
+    assert_eq!(anon.lines(), ["OK exists=yes"]);
+}
+
 /// Above `limits.max_stored_bytes`, less the room kept for posts, the
 /// server stores no more files or blobs, for anyone (7.5, PLAN item 63).
 #[tokio::test]
