@@ -562,6 +562,25 @@ fn a_device_leaving_a_public_room_removes_its_other_leaves_first() {
     assert_eq!(net.state(phone, p), ConvState::Left);
     assert_eq!(net.leaves(alice, a), ["alice@example.org"]);
     assert_eq!(net.state(alice, a), ConvState::Active);
+    // 12.7: the phone, removed by the laptop's leave commit, tells its
+    // user, in a public room too; the laptop does not.
+    assert_eq!(told_own_leaf_removed(&net, phone, p), 1);
+    assert_eq!(told_own_leaf_removed(&net, laptop, l), 0);
+}
+
+/// How often device `d` told its user that another device of the identity
+/// removed this one from `conv` (12.7).
+fn told_own_leaf_removed(net: &Net, d: usize, conv: ConversationId) -> usize {
+    net.events(d)
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Conversation(ConversationEvent::OwnLeafRemoved { conversation })
+                    if *conversation == conv
+            )
+        })
+        .count()
 }
 
 /// 6.1: a LEAVE that names a box the group had before a move, which no
@@ -742,6 +761,8 @@ fn own_devices_wait_before_acting_on_leave() {
         [Some(DeviceId(phone_device))]
     );
     assert!(told_left_from(&net, tablet, t).is_empty());
+    // The tablet, removed by the laptop's leave commit, was alerted (12.7).
+    assert_eq!(told_own_leaf_removed(&net, tablet, t), 1);
     assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
     assert!(
         net.devices[bob]

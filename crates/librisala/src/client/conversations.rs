@@ -240,8 +240,12 @@ pub enum ConversationEvent {
         by: Option<Uid>,
     },
     /// Another leaf of the own identity removed a leaf of it whose device
-    /// is still current, without adding it again: it may be a stolen
-    /// device racing its own removal (12.7, 4.8). Told as for ALERT.
+    /// is still current, without adding it again (12.7), in any kind of
+    /// conversation. A leave commit does so (6.1), and so may a stolen
+    /// device racing its own removal (4.8), which the removed device cannot
+    /// tell apart: told as for ALERT, worded for both, such as "your device
+    /// X left C and removed this device; if that wasn't you, it may be
+    /// stolen".
     OwnLeafRemoved {
         /// The conversation.
         conversation: ConversationId,
