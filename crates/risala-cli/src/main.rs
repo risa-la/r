@@ -212,7 +212,9 @@ enum Command {
     Invitation(InvitationCommand),
     /// Set the display name shown in every group (8.2): a commit in each.
     Name { name: String },
-    /// Leave a conversation (6.1): a number, a uid or #room.
+    /// Leave a conversation (6.1): a number, a uid or #room. A public room
+    /// being joined, or a conversation this device can no longer follow,
+    /// is given up too.
     Leave { conversation: String },
     /// Send a message. Prints its id.
     ///
@@ -806,11 +808,22 @@ impl Ctx {
     /// A conversation in the cache, by number, uid or `#room` (see the
     /// module docs).
     fn conversation(&self, account: AccountId, name: &str) -> Res<ConversationId> {
+        self.conversation_among(account, name, Among::InGroup)
+    }
+
+    /// As [`conversation`](Self::conversation), among the conversations
+    /// that `among` says.
+    fn conversation_among(
+        &self,
+        account: AccountId,
+        name: &str,
+        among: Among,
+    ) -> Res<ConversationId> {
         let named = named(name)?;
         let own = self.client.account(account).map_err(err)?.uid;
         let all = self.client.conversations(account).map_err(err)?;
         let entries: Vec<Entry> = all.iter().map(Entry::from).collect();
-        match find(&entries, own.as_str(), &named)? {
+        match find(&entries, own.as_str(), &named, among)? {
             Some(n) => Ok(all
                 .iter()
                 .find(|c| c.id.get() == n)
@@ -933,7 +946,7 @@ struct Entry {
     name: String,
     /// A public room's address.
     room: Option<String>,
-    active: bool,
+    state: ConversationState,
 }
 
 impl From<&ConversationSummary> for Entry {
@@ -943,7 +956,27 @@ impl From<&ConversationSummary> for Entry {
             kind: c.kind,
             name: c.name.clone(),
             room: c.room.as_ref().map(ToString::to_string),
-            active: c.state.in_group(),
+            state: c.state,
+        }
+    }
+}
+
+/// Which conversations a uid or a room's name may find; a number finds
+/// any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Among {
+    /// Those the device is in, leaving them or not.
+    InGroup,
+    /// Any it has not left: a public room being joined, and one it can no
+    /// longer follow, too, which `leave` gives up (6.1, 7.5).
+    NotLeft,
+}
+
+impl Among {
+    fn has(self, state: ConversationState) -> bool {
+        match self {
+            Among::InGroup => state.in_group(),
+            Among::NotLeft => state != ConversationState::Left,
         }
     }
 }
@@ -956,9 +989,10 @@ impl From<&ConversationSummary> for Entry {
 /// conversation with yourself for `own`, whatever the rooms are called;
 /// the newest if there are several, as after a peer left one (6.1). A
 /// room is `#` and a private room's name, or a public room's address.
-fn find(all: &[Entry], own: &str, named: &Named) -> Res<Option<i64>> {
+/// Either finds only the conversations that `among` says.
+fn find(all: &[Entry], own: &str, named: &Named, among: Among) -> Res<Option<i64>> {
     let is_room = |c: &Entry, room: &str| {
-        c.active
+        among.has(c.state)
             && match c.kind {
                 ConversationKind::PrivateRoom => room.strip_prefix('#') == Some(c.name.as_str()),
                 ConversationKind::PublicRoom => c.room.as_deref() == Some(room),
@@ -973,7 +1007,7 @@ fn find(all: &[Entry], own: &str, named: &Named) -> Res<Option<i64>> {
         Named::Uid(uid) => Ok(all
             .iter()
             .filter(|c| {
-                c.active
+                among.has(c.state)
                     && if own == uid {
                         c.kind == ConversationKind::WithYourself
                     } else {
@@ -1393,7 +1427,9 @@ async fn command(ctx: &Ctx, command: Command) -> Res {
         }
         Command::Leave { conversation } => {
             let account = ctx.account()?;
-            let conv = ctx.conversation(account, &conversation)?;
+            // 6.1, 7.5: a public room being joined, or a conversation the
+            // device can no longer follow, is left too.
+            let conv = ctx.conversation_among(account, &conversation, Among::NotLeft)?;
             ctx.online(account).await?;
             c.leave(conv).await.map_err(err)?;
             ctx.settle(account, Duration::from_secs(1)).await?;
@@ -1634,12 +1670,12 @@ mod tests {
             kind,
             name: name.to_owned(),
             room: room.map(str::to_owned),
-            active: true,
+            state: ConversationState::Active,
         }
     }
 
     fn found(all: &[Entry], name: &str) -> Res<Option<i64>> {
-        find(all, "alice@example.org", &named(name)?)
+        find(all, "alice@example.org", &named(name)?, Among::InGroup)
     }
 
     /// A private room named like a uid is never what the uid names: the
@@ -1665,7 +1701,7 @@ mod tests {
         // left does not count.
         all.push(entry(7, ConversationKind::Direct, "bob@example.org", None));
         assert_eq!(found(&all, "bob@example.org"), Ok(Some(7)));
-        all.last_mut().unwrap().active = false;
+        all.last_mut().unwrap().state = ConversationState::Left;
         assert_eq!(found(&all, "bob@example.org"), Ok(Some(5)));
         // A uid is written in its canonical form.
         assert_eq!(
@@ -1677,6 +1713,34 @@ mod tests {
         // Numbers name any conversation.
         assert_eq!(found(&all, "2"), Ok(Some(2)));
         assert!(found(&all, "9").is_err());
+    }
+
+    /// `leave` finds, by name, a public room being joined and a
+    /// conversation the device can no longer follow, which it gives up
+    /// (6.1, 7.5); other commands find neither, and none finds one left.
+    #[test]
+    fn leave_finds_joining_and_lost_conversations() {
+        let mut all = vec![
+            entry(3, ConversationKind::PublicRoom, "Plaza", Some("#plaza")),
+            entry(5, ConversationKind::Direct, "bob@example.org", None),
+            entry(6, ConversationKind::Direct, "carol@example.org", None),
+        ];
+        all[0].state = ConversationState::Joining;
+        all[1].state = ConversationState::Lost;
+        all[2].state = ConversationState::Left;
+        let leaving = |name: &str| {
+            find(
+                &all,
+                "alice@example.org",
+                &named(name).unwrap(),
+                Among::NotLeft,
+            )
+        };
+        assert_eq!(leaving("#plaza"), Ok(Some(3)));
+        assert_eq!(leaving("bob@example.org"), Ok(Some(5)));
+        assert_eq!(leaving("carol@example.org"), Ok(None));
+        assert!(found(&all, "#plaza").is_err());
+        assert_eq!(found(&all, "bob@example.org"), Ok(None));
     }
 
     /// Rooms are named `#name`, or by number; a bare name is refused, with
