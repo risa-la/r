@@ -548,9 +548,10 @@ pub struct Limits {
     /// The largest blob a public room's commit or proposal, or a commit's
     /// GroupInfo, may be (6.1, 12.12), since the server reads these whole
     /// to check them. Other posts' blobs are not read, only their framing.
-    /// A new room's GroupInfo and tree, and a post with the token `-` (an
-    /// external commit or proposal) and its GroupInfo, are never blobs
-    /// (PLAN items 67 and 68).
+    /// A new room's GroupInfo and tree are never blobs, nor is a post with
+    /// the token `-` (an external commit or proposal) or its GroupInfo,
+    /// except on a signed-in connection to a public room, where a device
+    /// posts its external commits (PLAN items 67 to 69).
     pub max_room_blob: u64,
     /// The most KEYS PUT one network address may send in an hour (4.7: a
     /// server MUST rate-limit it per network address). 0 means no limit.

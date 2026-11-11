@@ -2435,14 +2435,16 @@ async fn creates_refuse_blob_refs() {
 }
 
 /// A POST with the token `-`, an external commit or proposal (6.1), fits
-/// in its line: the device that posts one holds no token of the epoch to
-/// store blobs with, so a blob-ref for its message or GroupInfo gets `ERR
-/// bad-syntax`, whether the server holds the blob or not, before the
-/// server reads any of it (5.2, 12.12, PLAN items 67 and 68). The rule is
-/// the token's, which is what the server sees, so it covers both.
+/// in its line on an anonymous or guest connection: the device that posts
+/// one holds no token of the epoch to store blobs with, so a blob-ref for
+/// its message or GroupInfo gets `ERR bad-syntax`, whether the server
+/// holds the blob or not, before the server reads any of it (5.2, 12.12,
+/// PLAN items 67 and 68). The rule is the token's, which is what the
+/// server sees, so it covers both. A signed-in connection may name blobs
+/// in a public room only (PLAN item 69): to any other mailbox it gets
+/// `ERR bad-syntax` too.
 #[tokio::test]
 async fn joins_refuse_blob_refs() {
-    use risala_proto::mls::GroupInfo;
     let refused = "ERR bad-syntax a post with - fits in the line, with no blob-ref";
     let mut h = harness_now();
     let mut room = create_room(&mut h, 1).await;
@@ -2466,58 +2468,200 @@ async fn joins_refuse_blob_refs() {
     assert_eq!(anon.lines(), ["OK seq=1"]);
     take_proposal(&mut room, &dave_join);
     commit_pending(&h, &mut room, 2).await;
-    // A member's commit may name blobs (12.12).
-    let token = room.owen.token(&room.o);
-    let out = room.owen.commit(&mut room.o, Changes::default());
-    let message_blob = hold_blob(&h, &out.message, Some(&m));
-    let info_blob = hold_blob(&h, out.group_info.as_ref().unwrap(), Some(&m));
-    h.send(
-        &room.signed,
-        &format!(
-            "POST {m} {token} {message_blob} next={} groupinfo={info_blob}",
-            hash(out.next_token_hash)
-        ),
-    )
-    .await;
-    assert_eq!(room.signed.lines(), ["OK seq=3"]);
-    room.owen.merge(&mut room.o, &out);
-    let resync = resync_commit(&h, &mut anon, &dave, &room).await;
-    // POST <box> - <message> next=<hash> groupinfo=<groupinfo>
-    let words: Vec<&str> = resync.split(' ').collect();
-    let (message, next) = (words[3], words[4]);
-    let group_info = words[5].strip_prefix("groupinfo=").unwrap();
-    let message_blob = hold_blob(
-        &h,
-        &message.parse::<MlsMessage>().unwrap().decode(),
-        Some(&m),
-    );
-    let info_blob = hold_blob(
-        &h,
-        &group_info.parse::<GroupInfo>().unwrap().decode(),
-        Some(&m),
-    );
+    let resync = ExternalAsBlobs::new(&h, &mut anon, &dave, &mut room, 3).await;
+    let (message_blob, info_blob) = (&resync.message_blob, &resync.info_blob);
+    let (message, group_info) = (&resync.message, &resync.group_info);
     let line = |message: &dyn std::fmt::Display, info: &dyn std::fmt::Display| {
-        format!("POST {m} - {message} {next} groupinfo={info}")
+        format!("POST {m} - {message} {} groupinfo={info}", resync.next)
     };
+    let all = [
+        line(message_blob, group_info),
+        line(message, info_blob),
+        line(message_blob, info_blob),
+        line(message, &missing),
+        line(&missing, group_info),
+    ];
+    // Anonymous and guest connections, and the signed-in one to a mailbox
+    // that is not a public room's.
+    let (mut guest, _) = h.guest("sam").await;
+    for c in [&mut anon, &mut guest] {
+        for bad in all
+            .iter()
+            .chain([&format!("POST {} - {message_blob}", mailbox(9))])
+        {
+            h.send(c, bad).await;
+            assert_eq!(c.lines(), [refused], "{bad}");
+        }
+    }
+    let direct = Direct::new(&h, &mut anon, 7).await;
     let mut dave_conn = dave.sign_in(&mut h);
     for bad in [
-        line(&message_blob, &group_info),
-        line(&message, &info_blob),
-        line(&message_blob, &info_blob),
-        line(&message, &missing),
-        line(&missing, &group_info),
-        // Even to a mailbox that does not exist: no blob is looked for.
-        format!("POST {} - {message_blob}", mailbox(9)),
+        format!("POST {} - {message_blob}", direct.m),
+        format!("POST {} - {message} groupinfo={info_blob}", direct.m),
     ] {
         h.send(&dave_conn, &bad).await;
         assert_eq!(dave_conn.lines(), [refused], "{bad}");
     }
-    // Inline, the external commit is taken.
-    assert_eq!(line(&message, &group_info), resync);
-    h.send(&dave_conn, &resync).await;
+    // On the signed-in connection, a mailbox that does not exist is not
+    // found, and no blob is looked for.
+    h.send(&dave_conn, &format!("POST {} - {missing}", mailbox(9)))
+        .await;
+    assert_eq!(dave_conn.lines(), ["ERR not-found"]);
+    // In the public room, a blob the server does not hold is not found.
+    h.send(&dave_conn, &line(message, &missing)).await;
+    assert_eq!(dave_conn.lines(), ["ERR not-found no such blob"]);
+    // Inline or as blobs, the external commit is taken (below,
+    // `external_commits_may_be_blobs_signed_in`).
+    assert_eq!(line(message, group_info), resync.inline);
+    h.send(&dave_conn, &line(message_blob, info_blob)).await;
     assert_eq!(dave_conn.lines(), ["OK seq=4"]);
 }
 
+/// A resync commit by `dave`, against the room's GroupInfo once its owner
+/// has committed in seq `seq`, so that it removes the owner's leaf: inline,
+/// and its message and GroupInfo held as blobs, as if `dave`'s device had
+/// stored them with BLOB on its signed-in connection (12.12).
+struct ExternalAsBlobs {
+    /// The POST line, inline.
+    inline: String,
+    message: String,
+    group_info: String,
+    next: String,
+    message_blob: risala_proto::names::BlobRef,
+    info_blob: risala_proto::names::BlobRef,
+}
+
+impl ExternalAsBlobs {
+    async fn new(
+        h: &Harness,
+        anon: &mut Client,
+        dave: &Dev,
+        room: &mut PublicRoomSetup,
+        seq: u64,
+    ) -> ExternalAsBlobs {
+        use risala_proto::mls::GroupInfo;
+        let token = room.owen.token(&room.o);
+        let out = room.owen.commit(&mut room.o, Changes::default());
+        h.send(
+            &room.signed,
+            &format!(
+                "POST {} {token} {} next={} groupinfo={}",
+                room.m,
+                b64(&out.message),
+                hash(out.next_token_hash),
+                b64(out.group_info.as_ref().unwrap())
+            ),
+        )
+        .await;
+        assert_eq!(room.signed.lines(), [format!("OK seq={seq}")]);
+        room.owen.merge(&mut room.o, &out);
+        let inline = resync_commit(h, anon, dave, room).await;
+        // POST <box> - <message> next=<hash> groupinfo=<groupinfo>
+        let words: Vec<&str> = inline.split(' ').collect();
+        let (message, next) = (words[3].to_owned(), words[4].to_owned());
+        let group_info = words[5].strip_prefix("groupinfo=").unwrap().to_owned();
+        let message_blob = hold_blob(h, &message.parse::<MlsMessage>().unwrap().decode(), None);
+        let info_blob = hold_blob(h, &group_info.parse::<GroupInfo>().unwrap().decode(), None);
+        ExternalAsBlobs {
+            inline,
+            message,
+            group_info,
+            next,
+            message_blob,
+            info_blob,
+        }
+    }
+}
+
+/// A public room's external commit too large for a line goes as blobs on
+/// the signed-in connection that posts it (5.2, 12.6, 12.12, PLAN item
+/// 69): the server reads the commit and its GroupInfo whole from their
+/// blobs and checks them as it would inline, the device it comes from
+/// included. Each may be a blob alone; both are in
+/// `joins_refuse_blob_refs`.
+#[tokio::test]
+async fn external_commits_may_be_blobs_signed_in() {
+    for message_as_blob in [true, false] {
+        let mut h = harness_now();
+        let mut room = create_room(&mut h, 1).await;
+        let m = room.m;
+        let mut anon = h.anon().await;
+        let dave = Dev::new("dave@example.org", 4);
+        let dave_join = join(&dave, &dave.identity(), &room);
+        h.send(&anon, &format!("POST {m} - {dave_join}")).await;
+        assert_eq!(anon.lines(), ["OK seq=1"]);
+        take_proposal(&mut room, &dave_join);
+        commit_pending(&h, &mut room, 2).await;
+        let mut dave_conn = dave.sign_in(&mut h);
+        let r = ExternalAsBlobs::new(&h, &mut anon, &dave, &mut room, 3).await;
+        let line = if message_as_blob {
+            format!(
+                "POST {m} - {} {} groupinfo={}",
+                r.message_blob, r.next, r.group_info
+            )
+        } else {
+            format!(
+                "POST {m} - {} {} groupinfo={}",
+                r.message, r.next, r.info_blob
+            )
+        };
+        // The checks of 12.6 run on the commit read whole: from another
+        // identity's signed-in connection than the one its credential
+        // names, it is refused.
+        h.send(&room.signed, &line).await;
+        let lines = room.signed.lines();
+        assert!(lines[0].starts_with("ERR forbidden"), "{lines:?}");
+        h.send(&dave_conn, &line).await;
+        assert_eq!(dave_conn.lines(), ["OK seq=4"]);
+        // The post names the blob, or holds the message.
+        h.send(&anon, &format!("FETCH {m} after=3")).await;
+        let lines = anon.lines();
+        let message = if message_as_blob {
+            r.message_blob.to_string()
+        } else {
+            r.message.clone()
+        };
+        assert!(
+            lines[0].starts_with("@seq=4;") && lines[0].contains(&format!(" {message} ")),
+            "{lines:?}"
+        );
+        // The server applied it: the room is in the resync commit's epoch.
+        h.send(&anon, &format!("GROUPINFO {m}")).await;
+        let lines = anon.lines();
+        let words: Vec<&str> = lines[0].split(' ').collect();
+        assert_eq!(words[2..4], ["3", "4"], "{lines:?}");
+    }
+}
+
+/// An external commit's blobs take their room in `limits.blob_memory`
+/// with the room's state, as a member's commit's do (12.12, PLAN items 66
+/// and 69): one that would fit by itself but not beside the state gets
+/// `ERR too-long`.
+#[tokio::test]
+async fn external_commit_blobs_count_the_room_state_in_blob_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = small_blob_memory(&dir);
+    let room = create_room(&mut h, 1).await;
+    let m = room.m;
+    let state = h.store.room_group(&m).unwrap().unwrap();
+    let state_kib = state.size().div_ceil(1024) as usize;
+    // Not a PrivateMessage, so read whole: 1 KiB more than the state
+    // leaves of the 1 MiB.
+    let message = hold_blob(&h, &vec![7; (1024 - state_kib + 1) * 1024], None);
+    let dave = Dev::new("dave@example.org", 4);
+    let mut dave_conn = dave.sign_in(&mut h);
+    let line = format!("POST {m} - {message}");
+    tokio::time::timeout(Duration::from_secs(30), h.send(&dave_conn, &line))
+        .await
+        .expect("blob memory deadlocked");
+    assert_eq!(dave_conn.lines(), ["ERR too-long"]);
+    // One that fits beside the state is read, and found not to be an MLS
+    // message at all.
+    let small = hold_blob(&h, &vec![7; 600 * 1024], None);
+    h.send(&dave_conn, &format!("POST {m} - {small}")).await;
+    let lines = dave_conn.lines();
+    assert!(lines[0].starts_with("ERR invalid"), "{lines:?}");
+}
 /// The ban cap and unique uids are format rules of the conversation
 /// extension (12.4, PLAN item 67), which the server checks through
 /// risala-mls: it refuses a public room's commit whose extension lists

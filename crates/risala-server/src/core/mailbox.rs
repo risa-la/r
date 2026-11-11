@@ -621,6 +621,12 @@ async fn post_bytes(
 /// what the server sees of the line itself, so this needs no blob, and
 /// covers external proposals as well as commits. One inline but too long
 /// for a line has had `ERR too-long` already.
+///
+/// The one exception is a signed-in connection's post to a public room:
+/// a device posts its external commits there, and stores their blobs on
+/// that connection (5.2, 12.6, 12.12; PLAN item 69). [`handle_post`]
+/// calls this for any other connection before anything else, and for a
+/// signed-in one once it knows the mailbox is not a public room's.
 fn refuse_join_blobs(post: &PostCommand) -> Result<(), ErrResponse> {
     let blobs =
         matches!(post.message, OrBlob::Blob(_)) || matches!(post.groupinfo, Some(OrBlob::Blob(_)));
@@ -642,8 +648,11 @@ fn is_public_message(bytes: &[u8]) -> bool {
 /// [next=<hash>]` (5.2), with the checks in the spec's order.
 async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
     // Like the line's own syntax, before anything else, the cid included:
-    // no such post was ever taken.
-    refuse_join_blobs(&post)?;
+    // no such post was ever taken. A signed-in connection may name blobs
+    // with `-` in a public room, which only its mailbox shows (below).
+    if !matches!(cx.who, Who::SignedIn(_)) {
+        refuse_join_blobs(&post)?;
+    }
     let inner = &cx.inner;
     let mailbox = post.mailbox;
     let _lock = inner.mailbox.lock(mailbox).await;
@@ -677,6 +686,11 @@ async fn handle_post(cx: &Cx, post: PostCommand) -> Reply {
             }
         })
         .await?;
+    // As above, before the cid: outside a public room, a post with `-`
+    // names no blob on a signed-in connection either (5.2).
+    if record.as_ref().is_some_and(|record| record.room.is_none()) {
+        refuse_join_blobs(&post)?;
+    }
     if let Some(seq) = seen {
         return Ok(OkResponse::new().with("seq", seq));
     }
