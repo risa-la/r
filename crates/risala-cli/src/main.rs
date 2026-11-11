@@ -48,6 +48,7 @@
 //!
 //! Exit codes: 0 done, 1 failed, 2 bad arguments.
 
+mod notices;
 mod shown;
 
 use std::io::{BufRead as _, Write as _};
@@ -70,6 +71,7 @@ use librisala::store::{AccountId, DatabaseKey, Store, StoreError};
 use librisala::{Client, ClientOptions, Event};
 use rustls::pki_types::pem::PemObject as _;
 
+use crate::notices::Notices;
 use crate::shown::{Shown, shown};
 
 /// How long to wait for a connection to sign in.
@@ -697,6 +699,8 @@ async fn run(cli: Cli) -> Result<(), Fail> {
     ) {
         warn_dev_witness(&client);
     }
+    // Before any command connects, so that no notice is missed.
+    let notices = Notices::start(&client);
     let ctx = Ctx {
         client,
         account: cli.account,
@@ -706,6 +710,7 @@ async fn run(cli: Cli) -> Result<(), Fail> {
     for a in ctx.client.accounts().unwrap_or_default() {
         let _ = ctx.client.disconnect(a.id).await;
     }
+    notices.stop().await;
     Ok(result?)
 }
 
