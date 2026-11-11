@@ -458,9 +458,8 @@ impl RisalaConversation {
             if list.iter().any(Uid::is_guest) {
                 return invalid("a guest in owners, mods or bans");
             }
-            // 12.4 does not say so, but a list that names a uid twice has
-            // no use, and two encodings of the same lists could tell
-            // devices apart.
+            // 12.4: no uid twice in one list, a format rule. Found with a
+            // hash set, in linear time, since bans hold up to 10,000 (6.4).
             let mut seen = HashSet::with_capacity(list.len());
             if !list.iter().all(|uid| seen.insert(uid)) {
                 return invalid("a uid twice in one list");

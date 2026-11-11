@@ -2635,8 +2635,9 @@ fn base64_len(n: usize) -> usize {
 }
 
 /// The size of the largest external commit and its GroupInfo, against the
-/// 1 MiB line that they must fit, with no blob (2.3, 12.12): in the
-/// largest public room, 32,768 leaves (6.1), with blank parent nodes.
+/// 1 MiB line (2.3), past which a public room's resync commit or rejoin
+/// goes as blobs on the signed-in connection (12.7, 12.12): in the largest
+/// public room, 32,768 leaves (6.1), with blank parent nodes.
 ///
 /// An external commit's path encrypts a path secret to every node in the
 /// resolution of each node of the joiner's copath: one HPKE ciphertext
