@@ -491,3 +491,66 @@ fn a_device_offline_across_a_move_reads_a_late_post_as_the_others_do() {
         net.texts(bob, b)
     );
 }
+
+/// 7.4: posts that expired unread in a mailbox the group has moved away
+/// from are not a gap. The device has applied every commit there, the
+/// move included (7.8), so it goes on following the group, and asks
+/// nobody to replace its leaf.
+#[test]
+fn posts_expired_in_the_mailbox_moved_from_are_not_a_gap() {
+    let (mut net, alice, bob, carol, a) = team();
+    let b = net.same_conv(bob, alice, a).unwrap();
+    let old_box = mailboxes(&net, alice, a)[0].mailbox;
+    let carol_device: [u8; 48] = net.devices[carol].device_id.clone().try_into().unwrap();
+    // Two messages of Alice's, written before the move, that the server
+    // holds back.
+    let first = write_unposted(&mut net, alice, a, "held back");
+    let second = write_unposted(&mut net, alice, a, "late");
+    // Alice removes Carol, and the group moves (7.8).
+    let now = net.clock.now().unix_millis();
+    net.write(alice, |tx| {
+        group::queue_intent(
+            tx,
+            a,
+            &Intent {
+                remove: vec![("carol@example.com".into(), Some(carol_device))],
+                ..Intent::default()
+            },
+            now,
+        )?;
+        Ok(())
+    });
+    net.tick();
+    let current = mailboxes(&net, bob, b)
+        .into_iter()
+        .find(|m| m.current)
+        .unwrap()
+        .mailbox;
+    assert_ne!(current, old_box, "the group moved");
+    // While Bob is away, the server hands both out late in the old
+    // mailbox, and the first expires before Bob reads it.
+    net.disconnect(bob);
+    let t = net.clock.now().unix_millis();
+    let seq = net.server.inject_post(&old_box, t, first);
+    net.server.inject_post(&old_box, t, second);
+    net.server.expire(&old_box, seq);
+    net.connect(bob);
+    net.tick();
+    assert!(
+        mailboxes(&net, bob, b)
+            .iter()
+            .any(|m| m.mailbox == old_box && m.sync_point > seq),
+        "Bob read the old mailbox past the gap"
+    );
+    assert_eq!(net.state(bob, b), ConvState::Active);
+    assert!(!net.events(bob).iter().any(|e| matches!(
+        e,
+        Event::Conversation(ConversationEvent::CannotFollow { conversation }) if *conversation == b
+    )));
+    // It goes on in the group.
+    net.say(alice, a, "still here");
+    assert!(
+        net.texts(bob, b)
+            .contains(&("alice@example.org".into(), "still here".into()))
+    );
+}
