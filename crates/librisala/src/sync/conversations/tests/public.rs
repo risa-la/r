@@ -483,53 +483,101 @@ fn leaving_a_room_while_joining_it_gives_the_join_up() {
     assert_eq!(net.state(bob, b), ConvState::Left);
 }
 
-/// External commits that would not fit in a line, on this thread: every
-/// one, while the room's other posts stay inline (12.7, 12.12).
+/// External commits too large for a line, on this thread: every one,
+/// while the room's other posts stay inline (12.7, 12.12).
 fn external_commits_too_large() {
     crate::sync::conversations::public::test_hooks::EXTERNAL_LINE_LIMIT
         .with(|limit| limit.set(Some(0)));
 }
 
-/// The POSTs that device `d` made on its signed-in connection: its commits
-/// in a public room, external ones included (12.6).
-fn signed_in_posts(net: &Net, d: usize) -> usize {
-    net.server
-        .log
+/// How many times device `d` sent `verb` on `slot` since the server's log
+/// was `since` long.
+fn sent(net: &Net, since: usize, d: usize, slot: Slot, verb: &str) -> usize {
+    net.server.log[since..]
         .iter()
-        .filter(|((dd, s), verb)| *dd == d && *s == Slot::SignedIn && verb == "POST")
+        .filter(|((dd, s), v)| *dd == d && *s == slot && v == verb)
         .count()
 }
 
-/// 12.7: a resync commit that would not fit in a line is not posted: the
-/// device joins again by external proposal, as the others do. Here every
-/// member's would be too large, so nobody in the group is left to commit
-/// the proposals, and the room waits.
+/// How many BLOBs device `d` sent on anonymous connections since the
+/// server's log was `since` long.
+fn anonymous_blobs(net: &Net, since: usize, d: usize) -> usize {
+    net.server.log[since..]
+        .iter()
+        .filter(|((dd, s), v)| *dd == d && matches!(s, Slot::Anonymous(_)) && v == "BLOB")
+        .count()
+}
+
+/// 12.7, 12.12: a resync commit too large for a line goes as blobs, which
+/// the device stores on its signed-in connection, where it posts the
+/// commit with `-` naming them (PLAN item 69). The room recovers as from
+/// one inline: an external commit too large for a line cannot be posted
+/// any other way here.
 #[test]
-fn a_resync_commit_too_large_for_a_line_is_not_posted() {
+fn a_resync_commit_too_large_for_a_line_goes_as_blobs() {
     let mut net = Net::new();
     external_commits_too_large();
+    let (alice, bob, a, b, epoch, logged) = room_with_an_invalid_commit(&mut net);
+    for _ in 0..5 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(alice, a), ConvState::Active);
+    assert_eq!(net.state(bob, b), ConvState::Active);
+    assert_eq!(net.epoch(alice, a), net.epoch(bob, b));
+    assert!(net.epoch(alice, a) > epoch + 1);
+    // Whoever resynced stored the commit and its GroupInfo on its
+    // signed-in connection, and none of it on an anonymous one.
+    let resynced: Vec<usize> = [alice, bob]
+        .into_iter()
+        .filter(|&d| sent(&net, logged, d, Slot::SignedIn, "BLOB") > 0)
+        .collect();
+    assert!(!resynced.is_empty(), "a resync commit as blobs");
+    for d in resynced {
+        assert!(sent(&net, logged, d, Slot::SignedIn, "BLOB") >= 2);
+        assert!(sent(&net, logged, d, Slot::SignedIn, "POST") >= 1);
+        assert_eq!(anonymous_blobs(&net, logged, d), 0);
+    }
+}
+
+/// 12.7: an external commit whose blobs the server will not store goes as
+/// one it refused: the device joins again by external proposal. Here every
+/// member's would be refused, so nobody in the group is left to commit the
+/// proposals, and the room waits.
+#[test]
+fn a_resync_commit_whose_blobs_are_refused_joins_by_proposal() {
+    let mut net = Net::new();
+    external_commits_too_large();
+    // The room's other posts are inline: only the resync commits' BLOBs
+    // are refused.
+    net.server.refuse_blobs = true;
     let (alice, bob, a, b, _, logged) = room_with_an_invalid_commit(&mut net);
     for _ in 0..5 {
         net.advance(60_000);
     }
-    let since = |d: usize, slot: Slot| {
-        net.server.log[logged..]
-            .iter()
-            .filter(|((dd, s), verb)| *dd == d && *s == slot && verb == "POST")
-            .count()
-    };
     for (d, conv) in [(alice, a), (bob, b)] {
-        assert_eq!(since(d, Slot::SignedIn), 0, "no external commit");
-        assert!(since(d, SINGLE_USE_SLOT) >= 1, "a join proposal");
+        assert_eq!(
+            sent(&net, logged, d, Slot::SignedIn, "POST"),
+            0,
+            "no external commit"
+        );
+        assert!(
+            sent(&net, logged, d, SINGLE_USE_SLOT, "POST") >= 1,
+            "a join proposal"
+        );
         assert_eq!(net.state(d, conv), ConvState::Joining);
     }
+    assert!(
+        [alice, bob]
+            .into_iter()
+            .any(|d| sent(&net, logged, d, Slot::SignedIn, "BLOB") > 0),
+        "a resync commit's blobs, refused"
+    );
 }
 
-/// 12.7: an owner's rejoin that would not fit in a line is not posted: the
-/// device keeps waiting for its join proposal, and tells its user why,
-/// once. It does not make it again in the same epoch.
+/// 12.7: an owner's rejoin too large for a line goes as blobs on the
+/// signed-in connection, as a resync commit does (PLAN item 69).
 #[test]
-fn a_rejoin_too_large_for_a_line_is_not_posted() {
+fn an_owners_rejoin_too_large_for_a_line_goes_as_blobs() {
     let mut net = Net::new();
     let alice = net.device("alice", "alice@example.org");
     net.connect(alice);
@@ -539,6 +587,7 @@ fn a_rejoin_too_large_for_a_line_is_not_posted() {
     let phone = net.device_of("phone", alice);
     net.connect(phone);
     external_commits_too_large();
+    let logged = net.server.log.len();
     net.job_over(
         phone,
         Job::JoinPublic {
@@ -548,7 +597,7 @@ fn a_rejoin_too_large_for_a_line_is_not_posted() {
         0,
     )
     .unwrap_err();
-    for _ in 0..60 {
+    for _ in 0..40 {
         net.advance(60_000);
     }
     let conv = net
@@ -556,19 +605,9 @@ fn a_rejoin_too_large_for_a_line_is_not_posted() {
         .into_iter()
         .find(|c| c.kind == ConvKind::Public)
         .unwrap();
-    assert_eq!(conv.state, ConvState::Joining, "still waiting");
-    assert_eq!(signed_in_posts(&net, phone), 0, "no external commit");
-    assert_eq!(net.server.room(ROOM), Some((1, 0)));
-    let told = net
-        .events(phone)
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                Event::Conversation(ConversationEvent::RejoinTooLarge { conversation })
-                    if *conversation == conv.id
-            )
-        })
-        .count();
-    assert_eq!(told, 1);
+    assert_eq!(conv.state, ConvState::Active);
+    assert_eq!(net.server.room(ROOM), Some((2, 1)));
+    assert_eq!(sent(&net, logged, phone, Slot::SignedIn, "BLOB"), 2);
+    assert!(sent(&net, logged, phone, Slot::SignedIn, "POST") >= 1);
+    assert_eq!(anonymous_blobs(&net, logged, phone), 0);
 }

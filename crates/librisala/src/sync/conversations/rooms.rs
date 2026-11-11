@@ -20,7 +20,7 @@ use risala_proto::mls::{
 use risala_proto::names::{BlobRef, BoxName, Room, Uid};
 use risala_proto::server::ServerLine;
 
-use super::public::{self, ExternalJoin, JoinStep, RoomState, StartJoin};
+use super::public::{self, JoinStep, RoomState, StartJoin};
 use super::{
     BlobFetch, ConversationEngine, EngineError, Intent, JobId, Me, Pending, RoomPurpose, Target,
     group, job_done, random_below,
@@ -342,34 +342,16 @@ impl ConversationEngine {
                     Ok(Some(JoinStep::Propose(proposal))) => {
                         self.post_join(&me, conv, &state.mailbox, &proposal, out)?;
                     }
-                    // 12.7: a rejoin too large for a line was not used in
-                    // this epoch; the proposal keeps waiting.
-                    Ok(Some(JoinStep::Rejoin))
-                        if self.rejoin_too_large.get(&conv) == Some(&state.epoch) => {}
+                    // 12.7: an owner's or moderator's rejoin, as blobs on
+                    // the signed-in connection if too large for a line.
                     Ok(Some(JoinStep::Rejoin)) => {
                         let r = self.write(cx, &me, out, |tx, c| {
                             let (room, _) = public::room_of(tx, conv)?;
                             public::external_join(tx, c, conv, &room, &state, External::Rejoin)
                         });
-                        match r {
-                            Ok(ExternalJoin::Queued) => {
-                                self.rejoin_too_large.remove(&conv);
-                            }
-                            // Not posted: the owner or moderator keeps
-                            // waiting for its proposal, and is told why. It
-                            // tries again in a later epoch, whose tree may
-                            // be smaller.
-                            Ok(ExternalJoin::TooLarge) => {
-                                if self.rejoin_too_large.insert(conv, state.epoch).is_none() {
-                                    out.push(Action::Emit(Event::Conversation(
-                                        ConversationEvent::RejoinTooLarge { conversation: conv },
-                                    )));
-                                }
-                            }
-                            Err(e) => {
-                                self.room_error(&e, out);
-                                tracing::warn!(error = %e, "could not rejoin a public room");
-                            }
+                        if let Err(e) = r {
+                            self.room_error(&e, out);
+                            tracing::warn!(error = %e, "could not rejoin a public room");
                         }
                     }
                     Err(e) => {
@@ -403,14 +385,10 @@ impl ConversationEngine {
                     // joined again by proposal: the commits it missed may
                     // have been valid, and a resync commit would undo one.
                     let lost = tx.conversation(conv)?.state == ConvState::Lost;
-                    // 12.7: a resync commit too large for a line is not
-                    // used: the device joins again by proposal, as the
-                    // others do.
-                    if resync
-                        && !lost
-                        && public::external_join(tx, c, conv, &room, &state, External::Resync)?
-                            == ExternalJoin::Queued
-                    {
+                    // 12.7: a resync commit too large for a line goes as
+                    // blobs on the signed-in connection that posts it.
+                    if resync && !lost {
+                        public::external_join(tx, c, conv, &room, &state, External::Resync)?;
                         return Ok(None);
                     }
                     match public::start_join(tx, c, &room, &state, Some(conv), false)? {

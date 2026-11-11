@@ -804,9 +804,6 @@ pub struct ConversationEngine {
     /// Public rooms this device cannot follow: the epoch it holds, and
     /// when to resync or join again (12.7).
     stuck: HashMap<ConversationId, (u64, u64)>,
-    /// Joining rooms whose rejoin by external commit was too large for a
-    /// line, and the epoch it was made in (12.7): not made again in it.
-    rejoin_too_large: HashMap<ConversationId, u64>,
     /// When any member moves the mailbox after another's removal, and the
     /// box it was in then (7.8).
     move_timers: HashMap<ConversationId, (u64, BoxName)>,
@@ -900,7 +897,6 @@ impl ConversationEngine {
             join_checks: HashMap::new(),
             join_inflight: HashSet::new(),
             stuck: HashMap::new(),
-            rejoin_too_large: HashMap::new(),
             move_timers: HashMap::new(),
             replacing: HashSet::new(),
             branch_warned: HashSet::new(),
@@ -2445,7 +2441,7 @@ impl ConversationEngine {
         let now = self.now();
         let retry = now + self.config.retry_ms;
         let mut repair = None;
-        let mut rejoin = false;
+        let mut refused_external = false;
         self.write(cx, me, out, |tx, c| {
             let Some(row) = tx.outbox_row(outbox)? else {
                 return Ok(());
@@ -2477,9 +2473,7 @@ impl ConversationEngine {
                 // 12.7: a refused external commit: join by proposal.
                 End::Err(e) if row.kind == OutboxKind::External => {
                     tracing::info!(code = %e.code, "the server refused an external commit");
-                    tx.update_outbox(outbox, OutboxState::Lost, None, None, None)?;
-                    public::external_lost(tx, c, conv)?;
-                    rejoin = true;
+                    refused_external = true;
                 }
                 // A commit already decided, when its post came back or a
                 // winner was applied first, is not made again twice.
@@ -2558,9 +2552,8 @@ impl ConversationEngine {
             }
             None => {}
         }
-        if rejoin {
-            let epoch = self.write(cx, me, out, |tx, _| Ok(tx.conversation(conv)?.epoch))?;
-            self.stuck.insert(conv, (epoch, now));
+        if refused_external {
+            self.external_not_posted(cx, me, conv, outbox, out)?;
         }
         // 12.7: an external commit the server took: the device is in.
         if matches!(response.end, End::Ok(_))
@@ -2581,6 +2574,26 @@ impl ConversationEngine {
                 self.join_jobs.insert(conv, job);
             }
         }
+        Ok(())
+    }
+
+    /// 12.7: an external commit that the server refused, or whose blobs
+    /// could not be stored: the group it made is of no use, and the device
+    /// looks at the room again at once, to join by proposal.
+    fn external_not_posted(
+        &mut self,
+        cx: &Context,
+        me: &Me,
+        conv: ConversationId,
+        outbox: i64,
+        out: &mut Vec<Action>,
+    ) -> Result<(), EngineError> {
+        let epoch = self.write(cx, me, out, |tx, c| {
+            tx.update_outbox(outbox, OutboxState::Lost, None, None, None)?;
+            public::external_lost(tx, c, conv)?;
+            Ok(tx.conversation(conv)?.epoch)
+        })?;
+        self.stuck.insert(conv, (epoch, self.now()));
         Ok(())
     }
 
@@ -2956,15 +2969,16 @@ impl ConversationEngine {
                 // 12.12: a commit or GroupInfo too long for a line goes as a
                 // blob, stored first over the anonymous connection that
                 // follows the mailbox (6.1, 12.6). An external commit has no
-                // send token of the group's epoch to store one with, so it
-                // goes inline whatever its length, and the server refuses
-                // it if too long (12.7: the device then joins by proposal).
+                // send token of the group's epoch to store one with: its
+                // blobs go on the signed-in connection that posts it (4.1,
+                // 5.2, 12.7).
                 let groupinfo_len = p.groupinfo.as_ref().map_or(0, Vec::len);
-                let as_blob = if p.external {
-                    vec![false, false]
+                let limit = if p.external {
+                    public::external_line_limit(self.config.line_limit)
                 } else {
-                    blobs::as_blobs(&[p.post.len(), groupinfo_len], self.config.line_limit)
+                    self.config.line_limit
                 };
+                let as_blob = blobs::as_blobs(&[p.post.len(), groupinfo_len], limit);
                 let message_blob = as_blob[0].then(|| Arc::new(p.post.clone()));
                 let groupinfo_blob = p
                     .groupinfo
@@ -2977,17 +2991,29 @@ impl ConversationEngine {
                     .map(|b| (BlobRef::of(b), b.clone()))
                     .collect();
                 if !stored.is_empty() {
-                    let permit = MailboxPermit {
-                        mailbox: mailbox.mailbox,
-                        token: token.clone(),
+                    let on = if p.external {
+                        blobs::BlobsOn::SignedIn
+                    } else {
+                        blobs::BlobsOn::Mailbox(MailboxPermit {
+                            mailbox: mailbox.mailbox,
+                            token: token.clone(),
+                        })
                     };
-                    match self.blobs_stored(out, &permit, &stored) {
+                    match self.blobs_stored(out, &on, &stored) {
                         blobs::Blobs::Stored => {}
                         // Posted on a later step, as made, once stored; the
                         // posts after it wait too, to keep their order.
                         blobs::Blobs::Waiting => {
                             let waiting = std::iter::once(p).chain(posts).collect();
                             self.blob_waits.insert(conv.id, waiting);
+                            break;
+                        }
+                        // 12.7: an external commit is made for the epoch the
+                        // server held then, and posted once. One whose blobs
+                        // could not be stored goes as one the server
+                        // refused: the device joins by proposal.
+                        blobs::Blobs::Failed if p.external => {
+                            self.external_not_posted(cx, me, conv.id, p.outbox, out)?;
                             break;
                         }
                         // Made again later: the group may have moved on.
@@ -3137,7 +3163,8 @@ impl ConversationEngine {
                 })?;
                 let bytes = Arc::new(w.welcome.clone());
                 let stored = [(BlobRef::of(&bytes), bytes)];
-                let retry = match self.blobs_stored(out, &permit, &stored) {
+                let retry = match self.blobs_stored(out, &blobs::BlobsOn::Mailbox(permit), &stored)
+                {
                     blobs::Blobs::Stored => None,
                     blobs::Blobs::Waiting => Some(now),
                     blobs::Blobs::Failed => Some(now + self.config.retry_ms.max(1_000)),

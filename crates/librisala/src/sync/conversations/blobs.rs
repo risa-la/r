@@ -3,7 +3,9 @@
 //! group's tree. Each is stored first with BLOB on the anonymous or guest
 //! connection that follows the group's mailbox, with its `box` and a send
 //! token of the group, and an HTTP PUT of its bytes; the POST or WELCOME
-//! PUT then names it by its blob-ref.
+//! PUT then names it by its blob-ref. A public room's external commit,
+//! whose device holds no send token, has its blobs stored on the signed-in
+//! connection that posts it, without `box` and `token` (4.1, 5.2, 12.6).
 //!
 //! What stores a blob is a small state machine per blob, [`Upload`]: BLOB
 //! in flight, then the PUT in flight in the hooks, then stored. Posts whose
@@ -50,6 +52,18 @@ pub(super) enum Blobs {
     Failed,
 }
 
+/// Where this device stores a post's or Welcome's blobs (4.1, 12.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BlobsOn {
+    /// The anonymous or guest connection that follows the permit's
+    /// mailbox, with the permit: a member's posts and Welcomes.
+    Mailbox(MailboxPermit),
+    /// The signed-in connection, with no permit, counted against the
+    /// identity: a public room's external commit, which that connection
+    /// posts, and whose device holds no send token (5.2, 12.6).
+    SignedIn,
+}
+
 /// The length of `n` bytes in base64 with padding.
 fn base64_len(n: usize) -> usize {
     n.div_ceil(3) * 4
@@ -79,12 +93,11 @@ pub(super) fn as_blobs(sizes: &[usize], limit: usize) -> Vec<bool> {
 impl ConversationEngine {
     /// Whether the server holds each of `blobs`, this device's, which the
     /// next POST or WELCOME PUT names (12.12). Starts storing those it does
-    /// not hold yet: BLOB on the anonymous or guest connection that follows
-    /// the mailbox `permit` names, with `permit`, then a PUT by the hooks.
+    /// not hold yet: BLOB where `on` says, then a PUT by the hooks.
     pub(super) fn blobs_stored(
         &mut self,
         out: &mut Vec<Action>,
-        permit: &MailboxPermit,
+        on: &BlobsOn,
         blobs: &[(BlobRef, Arc<Vec<u8>>)],
     ) -> Blobs {
         let mut all = Blobs::Stored;
@@ -100,13 +113,19 @@ impl ConversationEngine {
                 },
                 Some(state) => *state,
                 None => {
+                    let (target, permit) = match on {
+                        BlobsOn::Mailbox(permit) => {
+                            (Target::Mailbox(permit.mailbox), Some(permit.clone()))
+                        }
+                        BlobsOn::SignedIn => (Target::SignedIn, None),
+                    };
                     self.send(
                         out,
-                        Target::Mailbox(permit.mailbox),
+                        target,
                         Command::Blob {
                             hash: *blob,
                             size: bytes.len() as u64,
-                            permit: Some(permit.clone()),
+                            permit,
                         },
                         Pending::Blob {
                             blob: *blob,

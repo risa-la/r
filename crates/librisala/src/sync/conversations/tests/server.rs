@@ -132,6 +132,8 @@ pub struct FakeServer {
     pub blobs: std::sync::Arc<std::sync::Mutex<HashMap<[u8; 48], Vec<u8>>>>,
     /// How many BLOBs answered with a put URL (12.12).
     pub blob_commands: usize,
+    /// Refuse every BLOB with `ERR rate-limited`.
+    pub refuse_blobs: bool,
 }
 
 impl FakeServer {
@@ -232,6 +234,7 @@ impl FakeServer {
             blob_posts: false,
             blobs: Default::default(),
             blob_commands: 0,
+            refuse_blobs: false,
         }
     }
 
@@ -425,6 +428,26 @@ impl FakeServer {
         };
         let mut lines = Vec::new();
         let mut live = Vec::new();
+        // 5.2: a POST with `-` names blobs only on a signed-in connection,
+        // to a public room's mailbox (PLAN item 69).
+        if let Command::Post {
+            mailbox,
+            token: PostToken::Join,
+            message,
+            groupinfo,
+            ..
+        } = &command
+            && (matches!(message, OrBlob::Blob(_)) || matches!(groupinfo, Some(OrBlob::Blob(_))))
+        {
+            let public = self
+                .mailboxes
+                .get(&mailbox.to_string())
+                .is_some_and(|m| m.room.is_some());
+            if conn.1 != crate::conn::Slot::SignedIn || !public {
+                let end = err(ErrorCode::BadSyntax);
+                return (Response { lines, end }, live);
+            }
+        }
         // 12.12: blob-refs in a POST or WELCOME PUT stand for the blobs'
         // bytes, which BLOB and the hooks' PUT stored.
         let command = match self.inline_blobs(command) {
@@ -435,15 +458,20 @@ impl FakeServer {
         };
         let end = match command {
             Command::Blob { hash, permit, .. } => {
-                let member = permit.as_ref().is_some_and(|p| {
-                    self.mailboxes.get(&p.mailbox.to_string()).is_some_and(|m| {
+                // 12.12: a member of some group, or a signed-in device,
+                // whose blobs count against its identity.
+                let member = match &permit {
+                    Some(p) => self.mailboxes.get(&p.mailbox.to_string()).is_some_and(|m| {
                         m.tokens
                             .values()
                             .any(|set| set.contains(&sha384(p.token.as_bytes())))
-                    })
-                });
+                    }),
+                    None => conn.1 == crate::conn::Slot::SignedIn,
+                };
                 if !member {
                     err(ErrorCode::Forbidden)
+                } else if self.refuse_blobs {
+                    err(ErrorCode::RateLimited)
                 } else if self.blobs.lock().unwrap().contains_key(hash.hash()) {
                     End::Ok(ok().with_exists())
                 } else {

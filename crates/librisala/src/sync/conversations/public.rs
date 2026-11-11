@@ -365,25 +365,13 @@ pub(crate) fn join_by_welcome(
     Ok(row.id)
 }
 
-/// What [`external_join`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExternalJoin {
-    /// The commit is merged and queued.
-    Queued,
-    /// The commit and its GroupInfo would not fit in a line, and an
-    /// external commit cannot be a blob (12.7, 12.12): nothing is queued,
-    /// and the device joins by proposal instead. The group it could not
-    /// follow is forgotten.
-    TooLarge,
-}
-
 /// Makes an external commit to a public room (12.7), merged at once, and
 /// queues it to post with the token `-`, `groupinfo=` and `next=` on the
 /// signed-in connection: a resync commit, which removes the leaf that
 /// signed the GroupInfo, or an owner's or moderator's rejoin. Either
-/// removes this device's earlier leaves. If it would not fit in a line, it
-/// is not used ([`ExternalJoin::TooLarge`]); if the server refuses it, the
-/// device joins by proposal instead ([`external_lost`]).
+/// removes this device's earlier leaves. If it is too large for a line,
+/// it goes as blobs stored on that connection (4.1, 12.12); if the server
+/// refuses it, the device joins by proposal instead ([`external_lost`]).
 pub(crate) fn external_join(
     tx: &mut Tx<'_>,
     cx: &Ctx<'_>,
@@ -391,7 +379,7 @@ pub(crate) fn external_join(
     room: &str,
     state: &RoomState,
     kind: External,
-) -> Result<ExternalJoin> {
+) -> Result<()> {
     if cx.guest {
         return Err(EngineError::Invalid(
             "only an identity's device commits externally".into(),
@@ -436,24 +424,7 @@ pub(crate) fn external_join(
         &own_leaves,
     )
     .map_err(mls)?;
-    let mut group = made.group;
-    // 12.7, 12.12: an external commit cannot be a blob, so it is used only
-    // if it fits in a line with its GroupInfo. Each blank node in the
-    // joiner's copath resolution adds an HPKE ciphertext to its path.
-    let limit = cx.config.line_limit;
-    #[cfg(test)]
-    let limit = test_hooks::EXTERNAL_LINE_LIMIT
-        .with(std::cell::Cell::get)
-        .unwrap_or(limit);
-    if super::blobs::as_blobs(&[made.message.len(), made.group_info.len()], limit).contains(&true) {
-        tracing::info!(
-            conv = %conv,
-            bytes = made.message.len() + made.group_info.len(),
-            "an external commit too large for a line is not used"
-        );
-        mls_group::forget_group(&tx.mls(cx.crypto), &mut group).map_err(mls)?;
-        return Ok(ExternalJoin::TooLarge);
-    }
+    let group = made.group;
     let ext = mls_group::conversation(&group)
         .ok_or(EngineError::Mls("no conversation extension".into()))?;
     tx.set_group_history(conv, &made.state)?;
@@ -482,7 +453,18 @@ pub(crate) fn external_join(
         },
         cx.now,
     )?;
-    Ok(ExternalJoin::Queued)
+    Ok(())
+}
+
+/// The longest line that carries an external commit inline: `limit`, the
+/// engine's, except where a test lowers it for external commits alone.
+/// Past it, the commit or its GroupInfo goes as a blob (12.7, 12.12).
+pub(crate) fn external_line_limit(limit: usize) -> usize {
+    #[cfg(test)]
+    let limit = test_hooks::EXTERNAL_LINE_LIMIT
+        .with(std::cell::Cell::get)
+        .unwrap_or(limit);
+    limit
 }
 
 /// The server refused an external commit: the group it made is of no use,
@@ -511,8 +493,9 @@ pub(crate) fn room_of(tx: &Tx<'_>, conv: ConversationId) -> Result<(String, BoxN
 pub(crate) mod test_hooks {
     thread_local! {
         /// A line limit for external commits alone, so that a test can
-        /// find one too large without building a room of thousands of
-        /// leaves, while the room's other posts stay inline (tests only).
+        /// make one too large for a line without building a room of
+        /// thousands of leaves, while the room's other posts stay inline
+        /// (tests only).
         pub(crate) static EXTERNAL_LINE_LIMIT: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
     }
