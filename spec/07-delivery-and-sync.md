@@ -359,7 +359,9 @@ files and blobs alone (UPLOAD and BLOB, `ERR rate-limited`), and the
 server keeps room beyond it for posts, so that when files and blobs
 fill it, posts and commits still go through, and groups can go on.
 Files and blobs kept for open reports (5.8) count apart, under a bound
-of their own, so that reports cannot fill the server either.
+of their own, so that reports cannot fill the server either. Past that
+bound, the server still makes the report, but keeps the report's files
+and blobs only until they expire, and logs that it did so.
 
 **Mailboxes end.** A mailbox that was created more than a retention
 period ago, whose posts have all expired, and which no connection

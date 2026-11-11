@@ -478,9 +478,11 @@ until the report is resolved, even if they expire in the meantime. If
 the content of a post it names has a TEXT line whose `file` is a `get`
 URL of this server (5.6), the server keeps that file too, even if its
 uploader deletes it or it expires. The content is in the clear in the
-report, so the server can read the URL. It SHOULD discard these copies
-once the report is resolved, and MAY close reports on its own after a
-time it chooses. Servers SHOULD rate-limit reports.
+report, so the server can read the URL. Files and blobs kept for reports
+have a bound of their own, past which they are kept only until they
+expire (7.5). The server SHOULD discard these copies once the report is
+resolved, and MAY close reports on its own after a time it chooses.
+Servers SHOULD rate-limit reports.
 
 Operators receive each report as one line:
 
