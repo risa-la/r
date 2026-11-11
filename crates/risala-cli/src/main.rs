@@ -32,6 +32,15 @@
 //! 0. `sync` stays for `--wait` seconds, to receive. Output is one record
 //! per line, fields separated by tabs.
 //!
+//! While connected, every command prints on standard error what the
+//! device tells its user, one line each after `risala: `: that it joined
+//! or left a conversation, that an invitation waits for an answer, that
+//! another device of the identity removed this one, that a key check
+//! failed or waits for a key file, that a group may have split, and so on.
+//! Each line says what happened, names conversations by their number,
+//! and says what you can do, such as `risala invitation accept 3` (see
+//! `notices`). Standard output is only the command's own.
+//!
 //! The options `--connect-to`, `--trust`, `--ca`, `--resolve`, `--witness`
 //! and `--short-waits` reach a development server such as `risala-dev`'s,
 //! which prints them. `--ca`, `--resolve` and `--short-waits` weaken what
@@ -90,6 +99,8 @@ type Res<T = ()> = Result<T, String>;
     about = "A small, scriptable terminal client for risala",
     after_help = "Conversations: a number from `list`, a uid for the direct conversation \
                   with that identity, or #name for a room.\n\n\
+                  While connected, commands print what the device tells you, such as an \
+                  invitation or a failed key check, on standard error, one line each.\n\n\
                   Exit codes: 0 done, 1 failed, 2 bad arguments."
 )]
 struct Cli {
@@ -189,6 +200,11 @@ enum Command {
     /// with the QR text scanned from the other person's device (12.14).
     Verify { uid: String, qr: Option<String> },
     /// Connect and receive for `--wait` seconds, then list conversations.
+    ///
+    /// What the device tells you meanwhile, such as an invitation, a
+    /// failed key check or another device of yours that removed this one,
+    /// is printed on standard error, one line each, as by every command
+    /// that connects.
     Sync,
     /// List conversations, from the cache: number, kind, name, unread, and
     /// state: active, joining, leaving, lost or left (6.1, 7.5).

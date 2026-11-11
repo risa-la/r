@@ -136,6 +136,19 @@ as when a new device's key check waits up to 2 hours for its key file,
 `risala send` exits with 0 and says on standard error that the message
 is queued, and why. It goes out on a later run once the hold ends.
 
+While connected, every command prints on standard error what the device
+tells its user, one line each, such as
+
+```
+risala: invitation 4 back into conversation 3 (#garden) from bob@example.org (6.1): accept it with `risala invitation accept 4`, or decline it with `risala invitation decline 4`
+```
+
+and the same for a conversation joined or left, a key check that failed
+or waits for a key file, another device of the identity that removed
+this one, a group that may have split, and the other warnings of the
+spec. Text from others in them is escaped as on standard output, which
+stays the command's own.
+
 M5a's seeded scenarios talked in plain text, which the current protocol
 has no commands for; they come back once rebuilt on librisala.
 
