@@ -544,6 +544,7 @@ pub const VERBS: &[&str] = &[
     "ATTEST",
     "REVEAL",
     "RESYNC",
+    "LEAVE",
     "REFETCH",
     "READ",
     "BLOCK",
