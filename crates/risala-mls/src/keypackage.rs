@@ -330,6 +330,32 @@ pub fn forget_join_key_package<S: StorageProvider<CURRENT_VERSION>>(
     LeafKey::delete(storage, KEY_PACKAGE_SCOPE, signature_key).map_err(GroupError::Storage)
 }
 
+/// Deletes the private keys of a KeyPackage whose Welcome the device will
+/// not join, as for an invitation the user declined or that expired
+/// (6.1, 12.8): the KeyPackage's own, kept by its KeyPackageRef
+/// `reference`, and its leaf key. A last-resort KeyPackage is kept, since
+/// further Welcomes may use it (12.5). Returns whether the keys were
+/// deleted; a KeyPackage not in storage has none.
+pub fn forget_key_package<S: StorageProvider<CURRENT_VERSION>>(
+    storage: &S,
+    reference: &[u8],
+) -> Result<bool, GroupError<S::Error>> {
+    let hash_ref =
+        crate::welcome::key_package_ref(reference).map_err(|e| GroupError::Group(e.0.into()))?;
+    let bundle: Option<KeyPackageBundle> = storage
+        .key_package(&hash_ref)
+        .map_err(GroupError::Storage)?;
+    let Some(bundle) = bundle else {
+        return Ok(false);
+    };
+    if is_last_resort(bundle.key_package()).unwrap_or(false) {
+        return Ok(false);
+    }
+    let signature_key = bundle.key_package().leaf_node().signature_key().as_slice();
+    forget_join_key_package(storage, reference, signature_key)?;
+    Ok(true)
+}
+
 pub(crate) fn build_key_package<P: OpenMlsProvider>(
     provider: &P,
     leaf_key: &LeafKey,

@@ -527,6 +527,36 @@ fn key_packages_and_keypkg_add() {
         check_key_package(&crypto, &to_bytes(&join.into()), &alice.uid, &key, now).err(),
         Some(KeyPackageError::Binding)
     );
+    // An invitation declined forgets its KeyPackage's private keys, but
+    // not a last-resort one's, which further Welcomes use (6.1, 12.5).
+    let has_keys = |p: &Provider<MemoryStorage>, kp: &KeyPackage| {
+        use openmls_traits::storage::StorageProvider as _;
+        let reference = kp.hash_ref(&crypto).unwrap();
+        let bundle: Option<openmls::prelude::KeyPackageBundle> =
+            p.storage().key_package(&reference).unwrap();
+        let leaf_key = kp.leaf_node().signature_key().as_slice();
+        (
+            bundle.is_some(),
+            LeafKey::load(p.storage(), crate::mldsa::KEY_PACKAGE_SCOPE, leaf_key)
+                .unwrap()
+                .is_some(),
+        )
+    };
+    let forget = |kp: &KeyPackage| {
+        crate::keypackage::forget_key_package(
+            alice.provider.storage(),
+            kp.hash_ref(&crypto).unwrap().as_slice(),
+        )
+        .unwrap()
+    };
+    let ordinary = alice.key_package(false);
+    let resort = alice.key_package(true);
+    assert_eq!(has_keys(&alice.provider, &ordinary), (true, true));
+    assert!(forget(&ordinary));
+    assert_eq!(has_keys(&alice.provider, &ordinary), (false, false));
+    assert!(!forget(&ordinary), "nothing left to forget");
+    assert!(!forget(&resort));
+    assert_eq!(has_keys(&alice.provider, &resort), (true, true));
     // A flipped byte anywhere fails, one way or another.
     for at in [10, bytes.len() / 2, bytes.len() - 10] {
         let mut bad = bytes.clone();
