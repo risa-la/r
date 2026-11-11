@@ -542,5 +542,9 @@ claims that depend on it.
   (6.1); own devices act on LEAVE after a random wait, as on RESYNC,
   and tell their users that the identity left from the device that
   asked (12.9); a RESYNC after every post up to the head expired names
-  the head (7.5, 12.9); and devices tell their users when a public room
-  cannot be resynced (12.7).
+  the head (7.5, 12.9); devices tell their users when a public room
+  cannot be resynced (12.7); a server reads a public room's commits and
+  GroupInfos as blobs of at least 40 MiB, which holds the largest
+  resync commit (12.12); and a direct conversation's remaining devices
+  remove their identity's other leaves before they leave locally, as in
+  any local leave (6.1, 12.7).
