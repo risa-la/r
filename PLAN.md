@@ -2781,6 +2781,33 @@ Open:
     - **A server that withholds posts keeps past epochs' secrets on
       devices longer**, until they catch up; accepted, as 14 says.
 
+70. **Found by the audit of items 66 to 69**, settled on 2026-11-11
+    *(decided by Claude)*. An audit checked each decision of items 66 to
+    69 against the spec, the code and the tests. It fixed small gaps
+    itself, among them the alert for an own device's removal, which was
+    never raised in public rooms, and `risala leave` by name, which could
+    not find a room still being joined. It also added the notice that
+    the identity left a conversation from another own device, raised by
+    a device that acts on LEAVE. Three points remained:
+    - **A server reads a public room's commits and GroupInfos as blobs
+      of at least 40 MiB** (12.12), which holds the largest resync commit
+      (39 MB, 12.7). risalad's `max_room_blob` was 16 MiB, so item 69's
+      recovery would still have failed on a default server. Its default
+      is now 64 MiB, and the server warns when it is set below 40 MiB, or
+      when `blob_memory` is smaller than it.
+    - **A direct conversation's remaining devices remove their own
+      identity's other leaves before they leave locally**, as in any
+      local leave (item 66): the code did so, and 6.1 and 12.7 still
+      said "without a commit". The spec now says what the code does. The
+      removal raises the alert for an own device's removal, worded for
+      leaves since item 67.
+    - **The CLI shows conversation events**: commands that wait on the
+      client print each event the user should be told of (an
+      invitation, an own device's removal, a room that could not be
+      resynced, a failed key check, and so on) on stderr, with remote
+      text escaped. Before, everything the spec says to tell the user
+      reached a CLI user only through `list`'s states.
+
 ## 6. Decisions
 
 - **Minimum Rust version:** the newest rustc in the current NixOS stable
