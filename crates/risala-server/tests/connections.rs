@@ -136,7 +136,8 @@ async fn a_post_with_no_token_fits_in_the_line() {
     }
     // The connection still works.
     client.send("@ref=x PING").await.unwrap();
-    assert_eq!(client.expect_line().await.unwrap(), "@ref=x OK");
+    let ok = client.expect_line().await.unwrap();
+    assert!(ok.starts_with("@ref=x;t=") && ok.ends_with(" OK"), "{ok}");
     server.stop().await;
 }
 
