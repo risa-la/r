@@ -611,3 +611,79 @@ fn an_owners_rejoin_too_large_for_a_line_goes_as_blobs() {
     assert!(sent(&net, logged, phone, Slot::SignedIn, "POST") >= 1);
     assert_eq!(anonymous_blobs(&net, logged, phone), 0);
 }
+
+/// How often device `d` was told that `conv` could not be resynced.
+fn told_could_not_resync(net: &Net, d: usize, conv: ConversationId) -> usize {
+    net.events(d)
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Conversation(ConversationEvent::CouldNotResync { conversation })
+                    if *conversation == conv
+            )
+        })
+        .count()
+}
+
+/// 12.7: devices whose resync failed, here because the server refuses
+/// every external commit, join again by proposal. Nobody in the group is
+/// left to commit the proposals, so once 30 minutes have passed without a
+/// commit of theirs, each tells its user, once, that the room could not be
+/// resynced, and keeps waiting.
+#[test]
+fn a_room_that_cannot_be_resynced_is_told_after_30_minutes() {
+    let mut net = Net::new();
+    net.server.refuse_external_commits = true;
+    let (alice, bob, a, b, _, logged) = room_with_an_invalid_commit(&mut net);
+    let refused = net.server.log[logged..]
+        .iter()
+        .filter(|((_, s), verb)| *s == Slot::SignedIn && verb == "POST")
+        .count();
+    assert!(refused >= 2, "both tried a resync commit");
+    for _ in 0..25 {
+        net.advance(60_000);
+    }
+    for (d, conv) in [(alice, a), (bob, b)] {
+        assert_eq!(net.state(d, conv), ConvState::Joining);
+        assert_eq!(told_could_not_resync(&net, d, conv), 0, "not yet");
+    }
+    for _ in 0..10 {
+        net.advance(60_000);
+    }
+    for (d, conv) in [(alice, a), (bob, b)] {
+        assert_eq!(told_could_not_resync(&net, d, conv), 1);
+    }
+    for _ in 0..40 {
+        net.advance(60_000);
+    }
+    for (d, conv) in [(alice, a), (bob, b)] {
+        assert_eq!(net.state(d, conv), ConvState::Joining, "still waiting");
+        assert_eq!(told_could_not_resync(&net, d, conv), 1, "told once");
+    }
+}
+
+/// 12.7: a resync commit that loses the race to another device's fails
+/// too, and its device joins again by proposal; the winner commits the
+/// proposal, so nobody is told that the room could not be resynced, not
+/// even after a restart, which brings back what the engine keeps of
+/// resyncs (LR-M4).
+#[test]
+fn a_resync_that_another_device_won_is_not_told() {
+    let mut net = Net::new();
+    let (alice, bob, a, b, _, _) = room_with_an_invalid_commit(&mut net);
+    for _ in 0..5 {
+        net.advance(60_000);
+    }
+    assert_eq!(net.state(alice, a), ConvState::Active);
+    assert_eq!(net.state(bob, b), ConvState::Active);
+    net.restart(bob);
+    for _ in 0..40 {
+        net.advance(60_000);
+    }
+    for (d, conv) in [(alice, a), (bob, b)] {
+        assert_eq!(told_could_not_resync(&net, d, conv), 0);
+        assert!(net.devices[d].engine.resync_failed.is_empty());
+        assert!(net.devices[d].engine.resyncing.is_empty());
+    }
+}

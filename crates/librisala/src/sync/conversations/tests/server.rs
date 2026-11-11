@@ -126,6 +126,8 @@ pub struct FakeServer {
     public_welcomes: HashMap<Vec<u8>, (String, Vec<u8>, u64)>,
     /// Refuse the next this many WELCOME PUTs with `ERR forbidden`.
     pub refuse_welcomes: usize,
+    /// Refuse every external commit in a public room with `ERR forbidden`.
+    pub refuse_external_commits: bool,
     /// Send posts as blob-refs (12.12), with their bytes in `blobs`.
     pub blob_posts: bool,
     /// The blob store: bytes by hash.
@@ -231,6 +233,7 @@ impl FakeServer {
             stale_next: HashSet::new(),
             public_welcomes: HashMap::new(),
             refuse_welcomes: 0,
+            refuse_external_commits: false,
             blob_posts: false,
             blobs: Default::default(),
             blob_commands: 0,
@@ -281,6 +284,7 @@ impl FakeServer {
         groupinfo: Option<Vec<u8>>,
     ) -> Option<End> {
         use risala_mls::openmls::prelude::{ProcessedMessageContent, Sender};
+        let refuse_external = self.refuse_external_commits;
         let crypto = &self.crypto;
         let m = self.mailboxes.get_mut(mailbox)?;
         let room = m.room.as_mut()?;
@@ -314,6 +318,9 @@ impl FakeServer {
                 let external = matches!(sender, Sender::NewMemberCommit);
                 if token_is_join != external {
                     return Some(err(ErrorCode::Invalid));
+                }
+                if external && refuse_external {
+                    return Some(err(ErrorCode::Forbidden));
                 }
                 // 12.6, point 4: from a signed-in connection.
                 if conn.1 != crate::conn::Slot::SignedIn {

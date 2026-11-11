@@ -29,8 +29,13 @@ use crate::client::Event;
 use crate::client::conversations::ConversationEvent;
 use crate::conn::{End, Response, SingleUse};
 use crate::store::conversations::{ConvKind, ConvState, ConversationId};
-use crate::store::messages::OutboxState;
+use crate::store::messages::{OutboxKind, OutboxState};
 use crate::sync::{Action, Context};
+
+/// How long after a failed resync the device waits for a commit of its
+/// join proposal before it tells the user that the room could not be
+/// resynced (12.7): 30 minutes.
+pub(super) const RESYNC_NOTICE_MS: u64 = 30 * 60 * 1000;
 
 /// What a blob-ref or an inline value comes to (12.12).
 pub(crate) enum Got {
@@ -379,6 +384,13 @@ impl ConversationEngine {
                 // bad commit is still the newest; otherwise someone has, or
                 // the device is a guest's, and it joins again by proposal.
                 let resync = !me.guest && state.epoch == epoch + 1;
+                // 12.7: the room still stands at the bad commit's epoch,
+                // which no resync has undone. A room lost to posts that
+                // expired unread (7.5) is no resync's.
+                let unresynced = state.epoch == epoch + 1
+                    && self.write(cx, &me, out, |tx, _| {
+                        Ok(tx.conversation(conv)?.state != ConvState::Lost)
+                    })?;
                 let r = self.write(cx, &me, out, |tx, c| {
                     let (room, _) = public::room_of(tx, conv)?;
                     // 7.5: a room lost to posts that expired unread is
@@ -398,9 +410,27 @@ impl ConversationEngine {
                 });
                 match r {
                     Ok(Some(proposal)) => {
+                        // 12.7: the resync failed: this device's resync
+                        // commit was not used, or a guest's device could
+                        // make none.
+                        if unresynced {
+                            let now = self.now();
+                            self.resync_failed.entry(conv).or_insert(now);
+                        }
                         self.post_join(&me, conv, &state.mailbox, &proposal, out)?
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if unresynced
+                            && self.write(cx, &me, out, |tx, _| {
+                                Ok(tx
+                                    .pending_outbox(conv)?
+                                    .iter()
+                                    .any(|o| o.kind == OutboxKind::External))
+                            })?
+                        {
+                            self.resyncing.insert(conv);
+                        }
+                    }
                     Err(e) => {
                         // 12.7: a room it lost (7.5) that the server changed
                         // waits for the user, who may accept the change and
@@ -562,6 +592,7 @@ impl ConversationEngine {
         match joined {
             Ok(Some((conv, mb))) => {
                 self.join_checks.remove(&conv);
+                self.resync_failed.remove(&conv);
                 out.push(Action::Emit(Event::Conversation(
                     ConversationEvent::Joined { conversation: conv },
                 )));
@@ -655,6 +686,27 @@ impl ConversationEngine {
                     purpose: RoomPurpose::Check { conv: join.conv },
                 },
             );
+        }
+        // 12.7: a resync that failed, after which no commit has applied
+        // this device's join proposal within 30 minutes: the user is told
+        // that the room could not be resynced. One whose proposal was
+        // committed, or that has joined or left, needs no word.
+        let due: Vec<ConversationId> = self
+            .resync_failed
+            .iter()
+            .filter(|(_, since)| now >= **since + RESYNC_NOTICE_MS)
+            .map(|(c, _)| *c)
+            .collect();
+        for conv in due {
+            self.resync_failed.remove(&conv);
+            let waiting = self.write(cx, me, out, |tx, _| {
+                Ok(tx.join_of(conv)?.is_some_and(|j| j.added_epoch.is_none()))
+            })?;
+            if waiting {
+                out.push(Action::Emit(Event::Conversation(
+                    ConversationEvent::CouldNotResync { conversation: conv },
+                )));
+            }
         }
         // 6.1, 7.5: a public room this device can no longer follow is
         // joined again, also after the engine started again.

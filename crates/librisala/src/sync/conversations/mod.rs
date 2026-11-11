@@ -823,6 +823,15 @@ pub struct ConversationEngine {
     /// Public rooms this device cannot follow: the epoch it holds, and
     /// when to resync or join again (12.7).
     stuck: HashMap<ConversationId, (u64, u64)>,
+    /// Public rooms whose resync commit this device has queued or posted,
+    /// and the server has not yet answered (12.7).
+    resyncing: HashSet<ConversationId>,
+    /// Public rooms whose resync failed, and when: this device's resync
+    /// commit was not used or the server refused it, or, as a guest's, it
+    /// could make none, and it joins again by proposal. If no commit has
+    /// applied its proposal 30 minutes on, the user is told that the room
+    /// could not be resynced (12.7).
+    resync_failed: HashMap<ConversationId, u64>,
     /// When any member moves the mailbox after another's removal, and the
     /// box it was in then (7.8).
     move_timers: HashMap<ConversationId, (u64, BoxName)>,
@@ -918,6 +927,8 @@ impl ConversationEngine {
             join_checks: HashMap::new(),
             join_inflight: HashSet::new(),
             stuck: HashMap::new(),
+            resyncing: HashSet::new(),
+            resync_failed: HashMap::new(),
             move_timers: HashMap::new(),
             replacing: HashSet::new(),
             branch_warned: HashSet::new(),
@@ -2479,10 +2490,12 @@ impl ConversationEngine {
         let retry = now + self.config.retry_ms;
         let mut repair = None;
         let mut refused_external = false;
+        let mut external = false;
         self.write(cx, me, out, |tx, c| {
             let Some(row) = tx.outbox_row(outbox)? else {
                 return Ok(());
             };
+            external = row.kind == OutboxKind::External;
             let conv_row = tx.conversation(conv)?;
             // 6.1: the SelfRemove of a device that has left meanwhile, by
             // itself, is not posted again: it has no group to make it in.
@@ -2592,6 +2605,11 @@ impl ConversationEngine {
         if refused_external {
             self.external_not_posted(cx, me, conv, outbox, out)?;
         }
+        // 12.7: an external commit the server took ends a failed resync.
+        if external && matches!(response.end, End::Ok(_)) {
+            self.resyncing.remove(&conv);
+            self.resync_failed.remove(&conv);
+        }
         // 12.7: an external commit the server took: the device is in.
         if matches!(response.end, End::Ok(_))
             && let Some(job) = self.join_jobs.remove(&conv)
@@ -2630,7 +2648,12 @@ impl ConversationEngine {
             public::external_lost(tx, c, conv)?;
             Ok(tx.conversation(conv)?.epoch)
         })?;
-        self.stuck.insert(conv, (epoch, self.now()));
+        let now = self.now();
+        self.stuck.insert(conv, (epoch, now));
+        // A resync commit that was not posted is a resync that failed.
+        if self.resyncing.remove(&conv) {
+            self.resync_failed.entry(conv).or_insert(now);
+        }
         Ok(())
     }
 

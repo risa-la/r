@@ -207,6 +207,16 @@ pub enum ConversationEvent {
         /// The identity whose key file cannot be read.
         uid: Uid,
     },
+    /// A public room could not be resynced (12.7): the server took a
+    /// commit this device could not apply, its resync failed, as a resync
+    /// commit that could not be used or that the server refused, and no
+    /// commit has applied its join proposal within 30 minutes. The room
+    /// goes on for this device only once a full client that could apply
+    /// that commit commits the join proposals; the device keeps waiting.
+    CouldNotResync {
+        /// The conversation.
+        conversation: ConversationId,
+    },
     /// A commit removed leaves for a check whose reason this device could
     /// not see (12.7): the removal stands, and the user is told who made
     /// it.
