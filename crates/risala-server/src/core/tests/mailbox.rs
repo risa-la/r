@@ -2775,8 +2775,8 @@ async fn public_room_commits_keep_the_extension_short_and_lower_case() {
 
 /// A new public room's CREATE keeps the format rules of 12.4 too (5.2,
 /// PLAN items 67 and 68): at most 10,000 bans, at most 512 KiB encoded,
-/// and uids in lower case. Each one broken gets `ERR invalid`, and nothing
-/// is created; a room at the limits is.
+/// no uid twice in one list, and uids in lower case. Each one broken gets
+/// `ERR invalid`, and nothing is created; a room at the limits is.
 #[tokio::test]
 async fn creates_keep_the_extension_format() {
     use risala_mls::conversation::{ConversationKind, MAX_BANS};
@@ -2817,10 +2817,16 @@ async fn creates_keep_the_extension_format() {
     banned.bans = (0..=MAX_BANS)
         .map(|i| format!("u{i}@x.example").parse().unwrap())
         .collect();
+    let mut twice = base.clone();
+    twice.bans = vec![
+        "eve@example.org".parse().unwrap(),
+        "eve@example.org".parse().unwrap(),
+    ];
     let bytes = base.encode();
     for (data, why) in [
         (over.encode(), "more than 512 KiB"),
         (banned.encode(), "more than 10,000 uids in bans"),
+        (twice.encode(), "a uid twice in one list"),
         (
             with_bytes(&bytes, "owen@example.org", "owen@Example.org"),
             "uid not in lower case",
