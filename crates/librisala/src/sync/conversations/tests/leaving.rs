@@ -456,7 +456,8 @@ fn own_devices_remove_each_other_when_the_peer_leaves() {
 
 /// 6.1: a leave commit that fails the device's own group checks does not
 /// drop the leave: the laptop leaves locally for good, and posts its
-/// SelfRemove, which Bob or the phone commits.
+/// SelfRemove, which Bob or the phone commits. With no conversation with
+/// yourself, it cannot ask the phone to leave too, and the phone stays.
 #[test]
 fn a_leave_commit_that_fails_its_own_checks_still_leaves() {
     let mut net = Net::new();
@@ -513,6 +514,59 @@ fn a_leave_commit_that_fails_its_own_checks_still_leaves() {
     assert_eq!(net.leaves(phone, p).len(), 2);
     assert_eq!(net.state(phone, p), ConvState::Active);
     assert_eq!(net.epoch(bob, b), net.epoch(phone, p));
+}
+
+/// 6.1, 12.9: a device whose leave commit failed its own checks, and so
+/// could not remove its identity's other leaves, asks them to leave for it
+/// with LEAVE in the conversation with yourself. The phone, which was
+/// away, reads it, leaves after its wait, and tells its user that the
+/// identity left from the laptop: the identity leaves with all its
+/// devices.
+#[test]
+fn a_leave_commit_that_fails_its_own_checks_asks_own_devices_to_leave() {
+    let mut net = Net::new();
+    let laptop = net.device("alice", "alice@example.org");
+    let phone = net.device_of("alice-phone", laptop);
+    let bob = net.device("bob", "bob@example.net");
+    for d in [laptop, phone, bob] {
+        net.connect(d);
+    }
+    let me = net.job(laptop, Job::WithYourself).unwrap();
+    net.same_conv(phone, laptop, me).expect("the phone is in");
+    let a = net
+        .job(
+            laptop,
+            Job::PrivateRoom {
+                name: "planning".into(),
+                members: vec![uid("bob@example.net")],
+            },
+        )
+        .unwrap();
+    net.tick();
+    let b = net.same_conv(bob, laptop, a).unwrap();
+    let p = net.same_conv(phone, laptop, a).unwrap();
+    assert_eq!(net.leaves(bob, b).len(), 3);
+
+    net.disconnect(bob);
+    net.disconnect(phone);
+    group::FAIL_OWN_CHECKS.set(true);
+    assert!(!leave(&mut net, laptop, a));
+    group::FAIL_OWN_CHECKS.set(false);
+    assert_eq!(net.state(laptop, a), ConvState::Left);
+
+    // The phone comes back, and reads the LEAVE.
+    net.connect(bob);
+    net.connect(phone);
+    for _ in 0..25 {
+        net.advance(MINUTE);
+    }
+    assert_eq!(net.state(phone, p), ConvState::Left);
+    assert_eq!(net.leaves(bob, b), ["bob@example.net"]);
+    let laptop_device: [u8; 48] = net.devices[laptop].device_id.clone().try_into().unwrap();
+    assert_eq!(
+        told_left_from(&net, phone, p),
+        [Some(DeviceId(laptop_device))]
+    );
 }
 
 /// 6.1: in a public room too, a device that leaves first removes its
